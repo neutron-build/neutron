@@ -53,8 +53,11 @@ pub(crate) const XACT_BODY_LEN: usize = 10;
 /// wired but cannot fire today: M8's fail-loud boundary refuses collection
 /// mutators inside a transaction, so its hook only ever returns
 /// `XACT_AUTOCOMMIT` — the bit takes its seat now because renumbering
-/// later would corrupt every body written in between. `Fts`, `Vector` and
-/// `Cdc` sit unused until their slices land (the same reason).
+/// later would corrupt every body written in between. `Vector` is enlisted
+/// by the S63 vector slice (2026-08-26: tagged vector.wal records, the
+/// recovery filter, and the S7 gate). `Fts` and `Cdc` sit unused until
+/// their slices land (the same reason; CDC is decided fire-and-forget, FTS
+/// design-never).
 #[allow(dead_code)]
 #[derive(Copy, Clone, Default, PartialEq, Eq)]
 pub(crate) struct EnlistedSet(u16);

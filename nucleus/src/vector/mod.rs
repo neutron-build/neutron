@@ -1041,6 +1041,18 @@ impl HnswIndex {
         self.deleted.insert(id);
     }
 
+    /// The vector stored under `id`, if the node exists. Read-only accessor
+    /// for callers that need the payload before mutating the node — a
+    /// transaction capturing an undo record for a delete, for instance.
+    pub fn vector_of(&self, id: u64) -> Option<Vector> {
+        self.nodes.get(&id).map(|n| n.vector.clone())
+    }
+
+    /// Whether `id` carries a delete tombstone.
+    pub fn is_deleted(&self, id: u64) -> bool {
+        self.deleted.contains(&id)
+    }
+
     /// Number of indexed vectors (including deleted).
     pub fn len(&self) -> usize {
         self.nodes.len()

@@ -410,18 +410,44 @@ impl Executor {
     // ── Vector indexes (owned by the executor, not a store type) ────────────
 
     /// Record that this transaction is about to replace or drop the vector
-    /// index `name`. Must be called *before* the mutation, and while not
-    /// holding the `vector_indexes` write guard.
-    pub(super) fn cross_model_touch_vector(&self, name: &str) {
+    /// index `name` (a DDL-frequency event: whole-index before-image). Must
+    /// be called *before* the mutation, and while not holding the
+    /// `vector_indexes` write guard. Returns the coordinating id the WAL
+    /// records for this write must carry (S63): the transaction's `xid`
+    /// inside an explicit transaction, `XACT_AUTOCOMMIT` outside one.
+    pub(super) fn cross_model_touch_vector(&self, name: &str) -> u64 {
         let session = self.current_session();
         let mut guard = session.cross_model.lock();
-        let Some(cm) = guard.as_mut() else { return };
+        let Some(cm) = guard.as_mut() else {
+            return XACT_AUTOCOMMIT;
+        };
+        cm.enlisted.enlist(Model::Vector);
         for_each_level!(cm, lvl, {
             if lvl.vector.is_none() {
                 lvl.vector = Some(self.vector_indexes.read().clone());
             }
             lvl.vector_touched.insert(name.to_string());
         });
+        cm.xid
+    }
+
+    /// Enlist the vector model for a ROW-level write and return the
+    /// coordinating id its WAL record must carry (S63). No before-image is
+    /// captured here, deliberately: the SQL-layer rollback already rebuilds
+    /// a derived-dirty table's vector indexes from the committed image
+    /// (`rebuild_table_derived_state`), and a second, cheaper undo mechanism
+    /// beside it would be exactly the drifted-duplicate shape this codebase
+    /// keeps catching itself in. This touch exists for the DURABLE half —
+    /// enlistment drives the tagged record, the COMMIT-record body, and the
+    /// S7 checkpoint gate.
+    pub(super) fn cross_model_enlist_vector_row(&self) -> u64 {
+        let session = self.current_session();
+        let mut guard = session.cross_model.lock();
+        let Some(cm) = guard.as_mut() else {
+            return XACT_AUTOCOMMIT;
+        };
+        cm.enlisted.enlist(Model::Vector);
+        cm.xid
     }
 
     // ── Streams ─────────────────────────────────────────────────────────────

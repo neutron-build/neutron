@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 346205; Source Rust files: 306; Top-level modules: 53.
-- Declared unit tests: 4787; Declared integration tests: 452; Ignored tests: 53.
+- Source LOC: 346565; Source Rust files: 306; Top-level modules: 53.
+- Declared unit tests: 4790; Declared integration tests: 452; Ignored tests: 53.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 4,622 passing tests, 0 failing.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
@@ -908,9 +908,14 @@ to fail.
 
 Still open in this milestone:
 
-- The S63 programme closed 2026-08-26 with this surface map: streams, KV strings,
-  documents, graph, timeseries, datalog, blob **crash-atomic** with the SQL commit
-  (three-direction crash proof per model, 0 findings); columnar and KV collections
+- The S63 programme closed 2026-08-26 with this surface map — vector added
+  2026-08-26 (Batch 6, design note
+  `_internal/v20/VECTOR_S63_DESIGN.local.md`, decided by the ratified rule:
+  tagged opcodes in the existing append mechanism, no new WAL format):
+  streams, KV strings, documents, graph, timeseries, datalog, blob, and now
+  VECTOR **crash-atomic** with the SQL commit (three-direction crash proof
+  per model, 0 findings; vector's crash leg runs in
+  `probe_crossmodel_atomicity`); columnar and KV collections
   plumbed but gated behind the M8 refusal (no before-image design yet — escalated,
   with the process-global-tag race documented); geo out (verified writer-less);
   CDC determined fire-and-forget (NU-107 product call). The shared commit record and
@@ -919,10 +924,15 @@ Still open in this milestone:
   retention pin so routine WAL pruning cannot drop acknowledged enlisted writes, and
   per-log TOCTOU re-checks (192fb3e2/8fea4c99: the KV in-flight `quiesce_mark`, and
   the horizon held whenever any tagged log declines or fails its checkpoint) — is
-  built for all of those. Remaining outside the programme: **vector** (escalated —
-  its WAL has no statement framing to tag; needs a design) and **FTS**
+  built for all of those. Remaining outside the programme: **FTS** only
   (design-never: the index snapshot beats the WAL at startup, so tagging the log
-  cannot decide replay — recorded in the landing commits). For those two the NU-006
+  cannot decide replay — recorded in the landing commits). Vector joined the
+  atomic set 2026-08-26: tagged INSERT/DELETE/CREATE records (0x06/0x07/0x08,
+  same field framing + a trailing xact id), the committed-set recovery filter,
+  the id-floor seed, row-path enlistment (in-memory rollback stays the SQL
+  layer's derived-state rebuild — no second undo mechanism), and the S7
+  checkpoint gate; `Model::Vector` (bit 4) was pre-reserved so no on-disk
+  numbering changed. For those two the NU-006
   commit order still governs: specialty logs are fsynced BEFORE the SQL WAL, which
   makes the partial deterministically the safe half — an orphaned specialty write
   rather than a durable SQL commit referencing records that were never written — but

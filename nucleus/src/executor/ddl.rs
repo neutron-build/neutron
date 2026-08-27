@@ -2452,7 +2452,7 @@ impl Executor {
                         }
                     }
 
-                    self.cross_model_touch_vector(&index_name);
+                    let vec_xact = self.cross_model_touch_vector(&index_name);
                     self.vector_indexes.write().insert(
                         index_name.clone(),
                         VectorIndexEntry {
@@ -2478,6 +2478,7 @@ impl Executor {
                         };
                         let mut wal_err = wal
                             .log_create_index(
+                                Some(vec_xact),
                                 &index_name,
                                 vec_dims as u32,
                                 metric_byte,
@@ -2491,7 +2492,7 @@ impl Executor {
                                 break;
                             }
                             let metadata = pk.map(|p| p.to_string()).unwrap_or_default();
-                            if let Err(e) = wal.log_insert(&index_name, *node, v, &metadata) {
+                            if let Err(e) = wal.log_insert(Some(vec_xact), &index_name, *node, v, &metadata) {
                                 wal_err = Some(format!(
                                     "backfill insert for '{index_name}/{node}' ({e})"
                                 ));
@@ -2539,6 +2540,9 @@ impl Executor {
                         }
                     }
 
+                    // Enlist for the in-memory whole-index rollback image;
+                    // IvfFlat writes no WAL records (rebuild-on-reopen), so
+                    // there is no id to thread.
                     self.cross_model_touch_vector(&index_name);
                     self.vector_indexes.write().insert(
                         index_name.clone(),

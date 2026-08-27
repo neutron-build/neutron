@@ -1162,9 +1162,13 @@ impl Executor {
             // Vector indexes: WAL + snapshot recovery
             let vec_dir = dir.join("vector");
             std::fs::create_dir_all(&vec_dir).ok();
-            if let Some((wal, state)) =
-                Self::open_durable("Vector", &vec_dir, vector::VectorWal::open(&vec_dir))
-            {
+            let mut vec_state_max_xact = 0u64;
+            if let Some((wal, state)) = Self::open_durable(
+                "Vector",
+                &vec_dir,
+                vector::VectorWal::open(&vec_dir, &committed_xacts),
+            ) {
+                vec_state_max_xact = state.max_xact_id;
                 // Load table/column/pk metadata from sidecar JSON. New format is
                 // a (table, column, pk_column) triple; fall back to the old
                 // (table, column) pair (which had no pk_column) for compatibility.
@@ -1330,9 +1334,14 @@ impl Executor {
                 exec.streams_wal = Some(wal);
                 xact_floor = xact_floor.max(state.max_xact_id);
             }
+            // The vector log's surviving tagged records pin the floor too
+            // (S63 vector slice) — max_xact_id was captured above even when
+            // the executor kept the wal handle.
+            xact_floor = xact_floor.max(vec_state_max_xact);
             // Seed the XactId counter above every id a surviving record
             // could reference: tagged KV, collections, doc, graph,
-            // timeseries, datalog, columnar, blob, CDC and streams records,
+            // timeseries, datalog, columnar, blob, CDC, streams and vector
+            // records,
             // and COMMIT-record bodies. All sources are needed — any one
             // alone is lowerable by reclaim (segment pruning, log
             // compaction) — and together they are exactly the ids a future
@@ -4907,6 +4916,13 @@ impl Executor {
         let Some(ref wal) = self.vector_wal else {
             return Ok(());
         };
+        // S7 re-check (S63 vector slice): a snapshot is a fold of live
+        // memory, committed-by-construction, so an open enlisted transaction
+        // must decline — its uncommitted row writes would be baked in and
+        // survive a rollback they were never entitled to.
+        if self.any_open_enlisted_txn_or_busy() {
+            return Err(Self::specialty_checkpoint_declined());
+        }
         // Hold the read lock across `checkpoint` so the borrowed HNSW indexes
         // stay live while they serialize; vector writes take the write lock and
         // block briefly, matching the other subsystem checkpoints.
@@ -5074,10 +5090,10 @@ impl Executor {
         }
         // Vector index WAL: HNSW inserts/deletes log one record each;
         // snapshot every live HNSW index (IvfFlat rebuilds from base-table
-        // data, never logged here).
-        if let Err(e) = self.checkpoint_vector_wal() {
-            tracing::warn!("Vector WAL checkpoint failed: {e}");
-        }
+        // data, never logged here). In the TAGGED set (S63 vector slice): a
+        // snapshot is committed-by-construction, so it takes the S7
+        // decline-on-open-transaction gate like every other tagged log.
+        all_tagged_ok &= tagged_ok("Vector", self.checkpoint_vector_wal());
         // TimeSeries retention (T1.3): purge points older than the configured
         // TS_RETENTION policy BEFORE snapshotting, so the WAL is truncated to
         // the retained state and old data does not grow the store forever.
@@ -5100,7 +5116,7 @@ impl Executor {
         } else {
             tracing::warn!(
                 "Specialty checkpoint pass incomplete: a tagged log \
-                 (streams/kv/doc/graph/datalog/ts/columnar/blob) failed or declined; SQL WAL \
+                 (streams/kv/doc/graph/datalog/ts/columnar/blob/vector) failed or declined; SQL WAL \
                  pruning held at the last fully-folded horizon"
             );
         }
@@ -7753,7 +7769,11 @@ impl Executor {
         }
         drop(indexes);
         for (idx_name, row_id, v, pk) in wal_inserts {
-            if let Err(e) = self.wal_log_vector_insert(&idx_name, row_id, &v, pk) {
+            // Row-level enlistment (S63): tag the record with the
+            // coordinating id. The in-memory rollback half is the SQL
+            // layer's derived-state rebuild, not a second undo mechanism.
+            let xact = self.cross_model_enlist_vector_row();
+            if let Err(e) = self.wal_log_vector_insert(Some(xact), &idx_name, row_id, &v, pk) {
                 // A failed append fails the statement, and the in-memory
                 // insert is rolled back to match the WAL — which never
                 // recorded this node. Left live, memory diverges from what
@@ -7819,6 +7839,7 @@ impl Executor {
     /// failed, not a line in a log nobody reads. (NU-048)
     fn wal_log_vector_insert(
         &self,
+        xact: Option<u64>,
         index_name: &str,
         id: u64,
         vector: &[f32],
@@ -7828,7 +7849,7 @@ impl Executor {
             // The pk (decimal u64) rides in the record's metadata so replay
             // can rebuild the pk -> node registry from delta records.
             let metadata = pk.map(|p| p.to_string()).unwrap_or_default();
-            wal.log_insert(index_name, id, vector, &metadata)
+            wal.log_insert(xact, index_name, id, vector, &metadata)
                 .map_err(|e| {
                     ExecError::Runtime(format!(
                         "vector index {index_name}: row {id} was indexed in memory but its WAL \
@@ -7840,9 +7861,14 @@ impl Executor {
     }
 
     /// Log a vector delete to WAL (no-op if WAL is not configured).
-    fn wal_log_vector_delete(&self, index_name: &str, id: u64) -> Result<(), ExecError> {
+    fn wal_log_vector_delete(
+        &self,
+        xact: Option<u64>,
+        index_name: &str,
+        id: u64,
+    ) -> Result<(), ExecError> {
         if let Some(ref wal) = self.vector_wal {
-            wal.log_delete(index_name, id).map_err(|e| {
+            wal.log_delete(xact, index_name, id).map_err(|e| {
                 ExecError::Runtime(format!(
                     "vector index {index_name}: row {id} was removed in memory but its WAL \
                      append failed ({e}); a restart would resurrect it"
@@ -7866,7 +7892,8 @@ impl Executor {
             .pk_col_for_incremental(table_name, table_def)
             .and_then(|pc| Self::stable_row_id(row, pc));
         let mut indexes = self.vector_indexes.write();
-        let mut wal_deletes: Vec<(String, u64)> = Vec::new();
+        let mut wal_deletes: Vec<String> = Vec::new();
+        let mut wal_deletes_nodes: Vec<u64> = Vec::new();
         for (idx_name, entry) in indexes.iter_mut() {
             if entry.table_name != table_name {
                 continue;
@@ -7909,7 +7936,8 @@ impl Executor {
                         row_position as u64
                     };
                     hnsw.mark_deleted(id);
-                    wal_deletes.push((idx_name.clone(), id));
+                    wal_deletes.push(idx_name.clone());
+                    wal_deletes_nodes.push(id);
                 }
                 VectorIndexKind::IvfFlat(ivf) => {
                     ivf.mark_deleted(row_position);
@@ -7917,8 +7945,12 @@ impl Executor {
             }
         }
         drop(indexes);
-        for (idx_name, id) in wal_deletes {
-            self.wal_log_vector_delete(&idx_name, id)?;
+        for (idx_name, id) in wal_deletes.into_iter().zip(wal_deletes_nodes) {
+            // Row-level enlistment (S63): the tagged record; the in-memory
+            // rollback half is the derived-state rebuild (see the insert
+            // path's comment).
+            let xact = self.cross_model_enlist_vector_row();
+            self.wal_log_vector_delete(Some(xact), &idx_name, id)?;
         }
         Ok(())
     }

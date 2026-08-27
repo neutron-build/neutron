@@ -53,6 +53,23 @@ const TAG_SNAPSHOT: u8 = 0x04;
 /// an older binary meets an unknown tag and stops replaying — which is the same
 /// position every other durable format here takes.
 const TAG_SNAPSHOT_V2: u8 = 0x05;
+/// INSERT_VEC carrying a coordinating transaction id (S63). Same fields as
+/// [`TAG_INSERT_VEC`] plus a trailing `[xact_id u64 LE]`. Written whenever
+/// the executor knows the id — including `XACT_AUTOCOMMIT` (0) for
+/// autocommit writes; replay keeps those. v1 tags (0x01–0x05) replay as
+/// keep: their durability point is their own fsync and they predate
+/// enlistment. An older binary meets 0x06/0x07 and stops replaying — the
+/// one-way-compat position every durable format here takes (see
+/// [`TAG_SNAPSHOT_V2`]'s header for the same statement).
+const TAG_INSERT_VEC_XACT: u8 = 0x06;
+/// DELETE_VEC carrying a coordinating transaction id (S63). See
+/// [`TAG_INSERT_VEC_XACT`].
+const TAG_DELETE_VEC_XACT: u8 = 0x07;
+/// CREATE_INDEX carrying a coordinating transaction id (S63) — an index
+/// created inside a rolled-back transaction must not survive replay as an
+/// empty shell. Same fields as [`TAG_CREATE_INDEX`] plus a trailing
+/// `[xact_id u64 LE]`.
+const TAG_CREATE_INDEX_XACT: u8 = 0x08;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -80,6 +97,12 @@ pub struct RecoveredIndex {
 pub struct VectorWalState {
     /// Recovered indexes keyed by index name.
     pub indexes: HashMap<String, RecoveredIndex>,
+    /// The highest coordinating transaction id any surviving record carries
+    /// (S63). Seeds the executor's XactId floor so a rolled-back or crashed
+    /// transaction's id is never re-minted — re-minting is what would let a
+    /// stale tagged record match a fresh committed id and be RESURRECTED by
+    /// the very filter built to discard it.
+    pub max_xact_id: u64,
 }
 
 /// Append-only WAL for vector indexes.
@@ -120,12 +143,21 @@ impl VectorWal {
     /// Returns `(wal, recovered_state)`. If no WAL file exists the recovered
     /// state contains no indexes. Corrupt trailing bytes are silently ignored
     /// (best-effort recovery up to the last valid entry).
-    pub fn open(dir: &Path) -> io::Result<(Self, VectorWalState)> {
+    /// `committed` is the set of coordinating transaction ids that durably
+    /// committed on the SQL side (S63); a tagged record whose id is neither
+    /// in it nor `XACT_AUTOCOMMIT` belongs to a transaction that never
+    /// committed and is discarded — absence of a commit record means
+    /// discard, always. The SQL engine recovers before this executor is
+    /// constructed, which is what makes the set available here.
+    pub fn open(
+        dir: &Path,
+        committed: &std::collections::HashSet<u64>,
+    ) -> io::Result<(Self, VectorWalState)> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("vector.wal");
         let state = if path.exists() {
             let data = std::fs::read(&path)?;
-            let outcome = replay(&data);
+            let outcome = replay(&data, committed);
             // A rejected snapshot used to come back as an empty index and an
             // `Ok`, so `Executor::open_durable` — which exists to announce
             // exactly this — never fired for the vector store.
@@ -139,6 +171,7 @@ impl VectorWal {
         } else {
             VectorWalState {
                 indexes: HashMap::new(),
+                max_xact_id: 0,
             }
         };
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
@@ -242,6 +275,7 @@ impl VectorWal {
     /// Log a CREATE INDEX operation.
     pub fn log_create_index(
         &self,
+        xact: Option<u64>,
         name: &str,
         dims: u32,
         metric: u8,
@@ -250,7 +284,13 @@ impl VectorWal {
     ) -> io::Result<()> {
         let mut buf = Vec::new();
         let nb = name.as_bytes();
-        buf.push(TAG_CREATE_INDEX);
+        match xact {
+            Some(x) => {
+                buf.push(TAG_CREATE_INDEX_XACT);
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+            None => buf.push(TAG_CREATE_INDEX),
+        }
         buf.extend_from_slice(&(nb.len() as u32).to_le_bytes());
         buf.extend_from_slice(nb);
         buf.extend_from_slice(&dims.to_le_bytes());
@@ -272,6 +312,7 @@ impl VectorWal {
     /// printed-and-acknowledged.
     pub fn log_insert(
         &self,
+        xact: Option<u64>,
         name: &str,
         id: u64,
         vector: &[f32],
@@ -279,7 +320,13 @@ impl VectorWal {
     ) -> io::Result<()> {
         let mut buf = Vec::new();
         let nb = name.as_bytes();
-        buf.push(TAG_INSERT_VEC);
+        match xact {
+            Some(x) => {
+                buf.push(TAG_INSERT_VEC_XACT);
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+            None => buf.push(TAG_INSERT_VEC),
+        }
         buf.extend_from_slice(&(nb.len() as u32).to_le_bytes());
         buf.extend_from_slice(nb);
         buf.extend_from_slice(&id.to_le_bytes());
@@ -296,10 +343,16 @@ impl VectorWal {
     /// Log a vector deletion (soft-delete in HNSW). Same fault point as
     /// `log_insert`: a deleted vector resurrecting across restart is the
     /// other half of NU-048.
-    pub fn log_delete(&self, name: &str, id: u64) -> io::Result<()> {
+    pub fn log_delete(&self, xact: Option<u64>, name: &str, id: u64) -> io::Result<()> {
         let mut buf = Vec::new();
         let nb = name.as_bytes();
-        buf.push(TAG_DELETE_VEC);
+        match xact {
+            Some(x) => {
+                buf.push(TAG_DELETE_VEC_XACT);
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+            None => buf.push(TAG_DELETE_VEC),
+        }
         buf.extend_from_slice(&(nb.len() as u32).to_le_bytes());
         buf.extend_from_slice(nb);
         buf.extend_from_slice(&id.to_le_bytes());
@@ -429,17 +482,35 @@ struct ReplayOutcome {
     corruption: Option<String>,
 }
 
-fn replay(data: &[u8]) -> ReplayOutcome {
+fn replay(data: &[u8], committed: &std::collections::HashSet<u64>) -> ReplayOutcome {
     let mut indexes: HashMap<String, ReplayIndex> = HashMap::new();
     let mut corruption: Option<String> = None;
     let mut pos = 0usize;
+    let mut max_xact_id: u64 = 0;
+    // S63 recovery filter: a tagged record survives replay iff its
+    // transaction durably committed. AUTOCOMMIT (0) is its own durability
+    // point. The record is PARSED either way — replay must consume it to
+    // continue — and dropped only after its bytes are accounted for.
+    let keep = |xid: u64, max_xact_id: &mut u64| {
+        *max_xact_id = (*max_xact_id).max(xid);
+        xid == 0 || committed.contains(&xid)
+    };
 
     while pos < data.len() {
         let Some(&tag) = data.get(pos) else { break };
         pos += 1;
 
         match tag {
-            TAG_CREATE_INDEX => {
+            TAG_CREATE_INDEX | TAG_CREATE_INDEX_XACT => {
+                let xid = if tag == TAG_CREATE_INDEX_XACT {
+                    let Some(x) = read_u64(data, &mut pos) else {
+                        break;
+                    };
+                    x
+                } else {
+                    0
+                };
+                let survived = keep(xid, &mut max_xact_id);
                 let Some(name) = read_string(data, &mut pos) else {
                     break;
                 };
@@ -454,23 +525,33 @@ fn replay(data: &[u8]) -> ReplayOutcome {
                 let Some(ef) = read_u32(data, &mut pos) else {
                     break;
                 };
-                indexes.insert(
-                    name,
-                    ReplayIndex {
-                        dims,
-                        metric,
-                        m,
-                        ef,
-                        hnsw: None,
-                        delta_inserts: Vec::new(),
-                        delta_deletes: Vec::new(),
-                        registry: RegistrySection::default(),
-                        node_to_pk: HashMap::new(),
-                        has_registry: false,
-                    },
-                );
+                if survived {
+                    indexes.insert(
+                        name,
+                        ReplayIndex {
+                            dims,
+                            metric,
+                            m,
+                            ef,
+                            hnsw: None,
+                            delta_inserts: Vec::new(),
+                            delta_deletes: Vec::new(),
+                            registry: RegistrySection::default(),
+                            node_to_pk: HashMap::new(),
+                            has_registry: false,
+                        },
+                    );
+                }
             }
-            TAG_INSERT_VEC => {
+            TAG_INSERT_VEC | TAG_INSERT_VEC_XACT => {
+                let xid = if tag == TAG_INSERT_VEC_XACT {
+                    let Some(x) = read_u64(data, &mut pos) else {
+                        break;
+                    };
+                    x
+                } else {
+                    0
+                };
                 let Some(name) = read_string(data, &mut pos) else {
                     break;
                 };
@@ -507,18 +588,30 @@ fn replay(data: &[u8]) -> ReplayOutcome {
                     .ok()
                     .and_then(|s| s.parse::<u64>().ok());
 
-                if let Some(idx) = indexes.get_mut(&name) {
+                if keep(xid, &mut max_xact_id)
+                    && let Some(idx) = indexes.get_mut(&name)
+                {
                     idx.delta_inserts.push((id, floats, pk));
                 }
             }
-            TAG_DELETE_VEC => {
+            TAG_DELETE_VEC | TAG_DELETE_VEC_XACT => {
+                let xid = if tag == TAG_DELETE_VEC_XACT {
+                    let Some(x) = read_u64(data, &mut pos) else {
+                        break;
+                    };
+                    x
+                } else {
+                    0
+                };
                 let Some(name) = read_string(data, &mut pos) else {
                     break;
                 };
                 let Some(id) = read_u64(data, &mut pos) else {
                     break;
                 };
-                if let Some(idx) = indexes.get_mut(&name) {
+                if keep(xid, &mut max_xact_id)
+                    && let Some(idx) = indexes.get_mut(&name)
+                {
                     idx.delta_deletes.push(id);
                 }
             }
@@ -723,7 +816,10 @@ fn replay(data: &[u8]) -> ReplayOutcome {
     }
 
     ReplayOutcome {
-        state: VectorWalState { indexes: result },
+        state: VectorWalState {
+            indexes: result,
+            max_xact_id,
+        },
         corruption,
     }
 }
@@ -790,7 +886,7 @@ mod tests {
     #[test]
     fn a_corrupt_hnsw_snapshot_is_reported_not_silently_emptied() {
         let dir = tempfile::tempdir().unwrap();
-        let (wal, _) = VectorWal::open(dir.path()).unwrap();
+        let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
         let idx = make_index(24, 8, DistanceMetric::L2);
         let mut snaps = HashMap::new();
         snaps.insert(
@@ -809,7 +905,7 @@ mod tests {
 
         // Clean reopen holds the vectors, so the fixture is real.
         {
-            let (_w, st) = VectorWal::open(dir.path()).unwrap();
+            let (_w, st) = VectorWal::open(dir.path(), &Default::default()).unwrap();
             assert!(
                 st.indexes.contains_key("v"),
                 "clean reopen should recover the index"
@@ -827,7 +923,7 @@ mod tests {
         }
         std::fs::write(&path, &bytes).unwrap();
 
-        match VectorWal::open(dir.path()) {
+        match VectorWal::open(dir.path(), &Default::default()) {
             Ok((_w, st)) => panic!(
                 "a corrupt HNSW snapshot opened successfully with {} index(es); \
                  an empty index and a lost one must not look the same",
@@ -849,14 +945,14 @@ mod tests {
     #[test]
     fn an_index_with_no_snapshot_yet_still_recovers() {
         let dir = tempfile::tempdir().unwrap();
-        let (wal, _) = VectorWal::open(dir.path()).unwrap();
-        wal.log_create_index("fresh", 4, 0, 8, 50).unwrap();
-        wal.log_insert("fresh", 1, &[1.0, 2.0, 3.0, 4.0], "")
+        let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
+        wal.log_create_index(None, "fresh", 4, 0, 8, 50).unwrap();
+        wal.log_insert(None, "fresh", 1, &[1.0, 2.0, 3.0, 4.0], "")
             .unwrap();
         wal.group_sync().unwrap();
         drop(wal);
 
-        let (_w, st) = VectorWal::open(dir.path())
+        let (_w, st) = VectorWal::open(dir.path(), &Default::default())
             .expect("an index with deltas and no checkpoint is not corrupt");
         assert!(st.indexes.contains_key("fresh"));
     }
@@ -864,9 +960,9 @@ mod tests {
     #[test]
     fn group_sync_marks_clean() {
         let dir = tempfile::tempdir().unwrap();
-        let (wal, _) = VectorWal::open(dir.path()).unwrap();
+        let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
         assert!(!wal.is_dirty(), "a fresh WAL has no un-fsynced appends");
-        wal.log_insert("idx", 1, &[1.0, 2.0, 3.0], "").unwrap();
+        wal.log_insert(None, "idx", 1, &[1.0, 2.0, 3.0], "").unwrap();
         assert!(wal.is_dirty(), "an append is uncovered until fsync");
         wal.group_sync().unwrap();
         assert!(!wal.is_dirty(), "group_sync fsyncs the tail");
@@ -880,8 +976,8 @@ mod tests {
     fn a_failed_checkpoint_reopen_does_not_strand_the_writer() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let (wal, _) = VectorWal::open(dir.path()).unwrap();
-            wal.log_create_index("idx", 4, 0, 8, 50).unwrap();
+            let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
+            wal.log_create_index(None, "idx", 4, 0, 8, 50).unwrap();
             let idx = make_index(3, 4, DistanceMetric::L2);
             let mut snaps = HashMap::new();
             snaps.insert(
@@ -899,10 +995,10 @@ mod tests {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             wal.checkpoint(&snaps)
                 .expect_err("the injected reopen failure must fail the checkpoint");
-            wal.log_insert("idx", 99, &[9.0, 9.0, 9.0, 9.0], "")
+            wal.log_insert(None, "idx", 99, &[9.0, 9.0, 9.0, 9.0], "")
                 .expect("a later append must reattach, not strand");
         }
-        let (_w, st) = VectorWal::open(dir.path()).unwrap();
+        let (_w, st) = VectorWal::open(dir.path(), &Default::default()).unwrap();
         assert_eq!(
             st.indexes["idx"].hnsw.len(),
             4,
@@ -920,15 +1016,15 @@ mod tests {
     fn pk_registry_rebuilds_from_pk_carrying_delta_records() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let (wal, _) = VectorWal::open(dir.path()).unwrap();
-            wal.log_create_index("idx", 4, 0, 8, 50).unwrap();
-            wal.log_insert("idx", 0, &[1.0, 0.0, 0.0, 0.0], "7")
+            let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
+            wal.log_create_index(None, "idx", 4, 0, 8, 50).unwrap();
+            wal.log_insert(None, "idx", 0, &[1.0, 0.0, 0.0, 0.0], "7")
                 .unwrap();
-            wal.log_insert("idx", 1, &[0.0, 1.0, 0.0, 0.0], "8")
+            wal.log_insert(None, "idx", 1, &[0.0, 1.0, 0.0, 0.0], "8")
                 .unwrap();
-            wal.log_delete("idx", 0).unwrap();
+            wal.log_delete(None, "idx", 0).unwrap();
         }
-        let (_w, st) = VectorWal::open(dir.path()).unwrap();
+        let (_w, st) = VectorWal::open(dir.path(), &Default::default()).unwrap();
         let registry = st.indexes["idx"]
             .registry
             .as_ref()
@@ -952,8 +1048,8 @@ mod tests {
     fn a_snapshotted_registry_merges_with_later_pk_deltas() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let (wal, _) = VectorWal::open(dir.path()).unwrap();
-            wal.log_create_index("idx", 4, 0, 8, 50).unwrap();
+            let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
+            wal.log_create_index(None, "idx", 4, 0, 8, 50).unwrap();
             let idx = make_index(2, 4, DistanceMetric::L2);
             let mut registry = RegistrySection::default();
             registry.pk_to_node.insert(1, 0);
@@ -974,11 +1070,11 @@ mod tests {
             wal.checkpoint(&snaps).unwrap();
             // Delta after the snapshot: a fresh node the checkpoint-time
             // registry never allocated, logged with its pk.
-            wal.log_insert("idx", 9, &[9.0, 9.0, 9.0, 9.0], "3")
+            wal.log_insert(None, "idx", 9, &[9.0, 9.0, 9.0, 9.0], "3")
                 .unwrap();
-            wal.log_delete("idx", 0).unwrap();
+            wal.log_delete(None, "idx", 0).unwrap();
         }
-        let (_w, st) = VectorWal::open(dir.path()).unwrap();
+        let (_w, st) = VectorWal::open(dir.path(), &Default::default()).unwrap();
         let registry = st.indexes["idx"]
             .registry
             .as_ref()
@@ -1004,21 +1100,21 @@ mod tests {
 
         // Phase 1: create WAL, log CREATE + 50 INSERTs, drop.
         {
-            let (wal, state) = VectorWal::open(dir.path()).unwrap();
+            let (wal, state) = VectorWal::open(dir.path(), &Default::default()).unwrap();
             assert!(state.indexes.is_empty());
 
-            wal.log_create_index("idx1", dim as u32, 0, 8, 50).unwrap();
+            wal.log_create_index(None, "idx1", dim as u32, 0, 8, 50).unwrap();
             for i in 0..n {
                 let v: Vec<f32> = (0..dim)
                     .map(|d| ((i * 73 + d * 37) % 1000) as f32 / 1000.0)
                     .collect();
-                wal.log_insert("idx1", i as u64, &v, "").unwrap();
+                wal.log_insert(None, "idx1", i as u64, &v, "").unwrap();
             }
             drop(wal);
         }
 
         // Phase 2: reopen and verify.
-        let (_wal2, state2) = VectorWal::open(dir.path()).unwrap();
+        let (_wal2, state2) = VectorWal::open(dir.path(), &Default::default()).unwrap();
         let recovered = state2.indexes.get("idx1").unwrap();
         assert_eq!(recovered.hnsw.len(), n);
 
@@ -1037,17 +1133,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         {
-            let (wal, _) = VectorWal::open(dir.path()).unwrap();
-            wal.log_create_index("idx1", 4, 0, 8, 50).unwrap();
+            let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
+            wal.log_create_index(None, "idx1", 4, 0, 8, 50).unwrap();
             for i in 0..10u64 {
                 let v = vec![i as f32; 4];
-                wal.log_insert("idx1", i, &v, "").unwrap();
+                wal.log_insert(None, "idx1", i, &v, "").unwrap();
             }
-            wal.log_delete("idx1", 5).unwrap();
+            wal.log_delete(None, "idx1", 5).unwrap();
             drop(wal);
         }
 
-        let (_wal2, state) = VectorWal::open(dir.path()).unwrap();
+        let (_wal2, state) = VectorWal::open(dir.path(), &Default::default()).unwrap();
         let recovered = &state.indexes["idx1"];
         // HNSW stores nodes even if deleted; len() includes them.
         assert_eq!(recovered.hnsw.len(), 10);
@@ -1064,16 +1160,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         {
-            let (wal, _) = VectorWal::open(dir.path()).unwrap();
-            wal.log_create_index("a", 4, 0, 8, 50).unwrap();
-            wal.log_create_index("b", 4, 1, 16, 100).unwrap();
-            wal.log_insert("a", 1, &[1.0, 0.0, 0.0, 0.0], "").unwrap();
-            wal.log_insert("a", 2, &[0.0, 1.0, 0.0, 0.0], "").unwrap();
-            wal.log_insert("b", 10, &[0.5, 0.5, 0.0, 0.0], "").unwrap();
+            let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
+            wal.log_create_index(None, "a", 4, 0, 8, 50).unwrap();
+            wal.log_create_index(None, "b", 4, 1, 16, 100).unwrap();
+            wal.log_insert(None, "a", 1, &[1.0, 0.0, 0.0, 0.0], "").unwrap();
+            wal.log_insert(None, "a", 2, &[0.0, 1.0, 0.0, 0.0], "").unwrap();
+            wal.log_insert(None, "b", 10, &[0.5, 0.5, 0.0, 0.0], "").unwrap();
             drop(wal);
         }
 
-        let (_wal2, state) = VectorWal::open(dir.path()).unwrap();
+        let (_wal2, state) = VectorWal::open(dir.path(), &Default::default()).unwrap();
         assert_eq!(state.indexes.len(), 2);
         assert_eq!(state.indexes["a"].hnsw.len(), 2);
         assert_eq!(state.indexes["b"].hnsw.len(), 1);
@@ -1087,11 +1183,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         {
-            let (wal, _) = VectorWal::open(dir.path()).unwrap();
-            wal.log_create_index("idx1", 4, 0, 8, 50).unwrap();
+            let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
+            wal.log_create_index(None, "idx1", 4, 0, 8, 50).unwrap();
             for i in 0..20u64 {
                 let v = vec![i as f32; 4];
-                wal.log_insert("idx1", i, &v, "").unwrap();
+                wal.log_insert(None, "idx1", i, &v, "").unwrap();
             }
 
             // Build the in-memory index for the snapshot.
@@ -1113,12 +1209,12 @@ mod tests {
             // Insert 5 more after the snapshot.
             for i in 20..25u64 {
                 let v = vec![i as f32; 4];
-                wal.log_insert("idx1", i, &v, "").unwrap();
+                wal.log_insert(None, "idx1", i, &v, "").unwrap();
             }
             drop(wal);
         }
 
-        let (_wal2, state) = VectorWal::open(dir.path()).unwrap();
+        let (_wal2, state) = VectorWal::open(dir.path(), &Default::default()).unwrap();
         let recovered = &state.indexes["idx1"];
         // Snapshot had 20 + 5 delta inserts = 25 total.
         assert_eq!(recovered.hnsw.len(), 25);
@@ -1130,17 +1226,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         {
-            let (wal, _) = VectorWal::open(dir.path()).unwrap();
-            wal.log_create_index("l2", 4, 0, 8, 50).unwrap();
-            wal.log_create_index("cos", 4, 1, 8, 50).unwrap();
-            wal.log_create_index("ip", 4, 2, 8, 50).unwrap();
-            wal.log_insert("l2", 1, &[1.0, 0.0, 0.0, 0.0], "").unwrap();
-            wal.log_insert("cos", 1, &[1.0, 0.0, 0.0, 0.0], "").unwrap();
-            wal.log_insert("ip", 1, &[1.0, 0.0, 0.0, 0.0], "").unwrap();
+            let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
+            wal.log_create_index(None, "l2", 4, 0, 8, 50).unwrap();
+            wal.log_create_index(None, "cos", 4, 1, 8, 50).unwrap();
+            wal.log_create_index(None, "ip", 4, 2, 8, 50).unwrap();
+            wal.log_insert(None, "l2", 1, &[1.0, 0.0, 0.0, 0.0], "").unwrap();
+            wal.log_insert(None, "cos", 1, &[1.0, 0.0, 0.0, 0.0], "").unwrap();
+            wal.log_insert(None, "ip", 1, &[1.0, 0.0, 0.0, 0.0], "").unwrap();
             drop(wal);
         }
 
-        let (_wal2, state) = VectorWal::open(dir.path()).unwrap();
+        let (_wal2, state) = VectorWal::open(dir.path(), &Default::default()).unwrap();
         assert_eq!(state.indexes["l2"].metric, 0);
         assert_eq!(state.indexes["cos"].metric, 1);
         assert_eq!(state.indexes["ip"].metric, 2);
@@ -1164,18 +1260,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         {
-            let (wal, _) = VectorWal::open(dir.path()).unwrap();
-            wal.log_create_index("idx1", 4, 0, 8, 50).unwrap();
-            wal.log_insert("idx1", 1, &[1.0, 0.0, 0.0, 0.0], r#"{"color":"red"}"#)
+            let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
+            wal.log_create_index(None, "idx1", 4, 0, 8, 50).unwrap();
+            wal.log_insert(None, "idx1", 1, &[1.0, 0.0, 0.0, 0.0], r#"{"color":"red"}"#)
                 .unwrap();
-            wal.log_insert("idx1", 2, &[0.0, 1.0, 0.0, 0.0], r#"{"color":"blue"}"#)
+            wal.log_insert(None, "idx1", 2, &[0.0, 1.0, 0.0, 0.0], r#"{"color":"blue"}"#)
                 .unwrap();
-            wal.log_insert("idx1", 3, &[0.0, 0.0, 1.0, 0.0], "")
+            wal.log_insert(None, "idx1", 3, &[0.0, 0.0, 1.0, 0.0], "")
                 .unwrap();
             drop(wal);
         }
 
-        let (_wal2, state) = VectorWal::open(dir.path()).unwrap();
+        let (_wal2, state) = VectorWal::open(dir.path(), &Default::default()).unwrap();
         let recovered = &state.indexes["idx1"];
         assert_eq!(recovered.hnsw.len(), 3);
         // Search still works (metadata doesn't corrupt index).
@@ -1190,11 +1286,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         {
-            let (wal, _) = VectorWal::open(dir.path()).unwrap();
-            wal.log_create_index("idx1", 4, 0, 8, 50).unwrap();
+            let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
+            wal.log_create_index(None, "idx1", 4, 0, 8, 50).unwrap();
             for i in 0..10u64 {
                 let v = vec![i as f32; 4];
-                wal.log_insert("idx1", i, &v, "").unwrap();
+                wal.log_insert(None, "idx1", i, &v, "").unwrap();
             }
 
             // Checkpoint with a real index.
@@ -1216,7 +1312,7 @@ mod tests {
             // Insert 3 more valid deltas after snapshot.
             for i in 10..13u64 {
                 let v = vec![i as f32; 4];
-                wal.log_insert("idx1", i, &v, "").unwrap();
+                wal.log_insert(None, "idx1", i, &v, "").unwrap();
             }
             drop(wal);
         }
@@ -1230,7 +1326,7 @@ mod tests {
         }
 
         // Reopen — should recover snapshot (10) + 3 valid deltas = 13, ignoring garbage.
-        let (_wal2, state) = VectorWal::open(dir.path()).unwrap();
+        let (_wal2, state) = VectorWal::open(dir.path(), &Default::default()).unwrap();
         let recovered = &state.indexes["idx1"];
         assert_eq!(recovered.hnsw.len(), 13);
     }
@@ -1243,8 +1339,8 @@ mod tests {
         let dim = 16;
 
         {
-            let (wal, _) = VectorWal::open(dir.path()).unwrap();
-            wal.log_create_index("big", dim as u32, 0, 16, 50).unwrap();
+            let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
+            wal.log_create_index(None, "big", dim as u32, 0, 16, 50).unwrap();
 
             let idx = make_index(n, dim, DistanceMetric::L2);
             // Log all inserts (for completeness, though snapshot will supersede them).
@@ -1252,7 +1348,7 @@ mod tests {
                 let data: Vec<f32> = (0..dim)
                     .map(|d| ((i * 73 + d * 37) % 1000) as f32 / 1000.0)
                     .collect();
-                wal.log_insert("big", i as u64, &data, "").unwrap();
+                wal.log_insert(None, "big", i as u64, &data, "").unwrap();
             }
 
             // Checkpoint.
@@ -1272,7 +1368,7 @@ mod tests {
             drop(wal);
         }
 
-        let (_wal2, state) = VectorWal::open(dir.path()).unwrap();
+        let (_wal2, state) = VectorWal::open(dir.path(), &Default::default()).unwrap();
         let recovered = &state.indexes["big"];
         assert_eq!(recovered.hnsw.len(), n);
 
@@ -1297,7 +1393,7 @@ mod tests {
     fn checkpointed_tombstones_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let (wal, _) = VectorWal::open(dir.path()).unwrap();
+            let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
             let mut idx = make_index(24, 8, DistanceMetric::L2);
             idx.mark_deleted(5);
             idx.mark_deleted(11);
@@ -1317,7 +1413,7 @@ mod tests {
             drop(wal);
         }
 
-        let (_w, st) = VectorWal::open(dir.path()).unwrap();
+        let (_w, st) = VectorWal::open(dir.path(), &Default::default()).unwrap();
         let live = st.indexes["v"].hnsw.live_ids();
         assert_eq!(
             live.len(),
@@ -1357,7 +1453,7 @@ mod tests {
         bytes.extend_from_slice(&blob);
         std::fs::write(dir.path().join("vector.wal"), &bytes).unwrap();
 
-        let (_w, st) = VectorWal::open(dir.path()).expect("a legacy snapshot must still open");
+        let (_w, st) = VectorWal::open(dir.path(), &Default::default()).expect("a legacy snapshot must still open");
         assert!(
             st.indexes.contains_key("v"),
             "the legacy snapshot's index was lost"
@@ -1380,7 +1476,7 @@ mod tests {
     #[test]
     fn corrupt_snapshot_payload_is_caught_by_the_checksum() {
         let dir = tempfile::tempdir().unwrap();
-        let (wal, _) = VectorWal::open(dir.path()).unwrap();
+        let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
         let idx = make_index(24, 8, DistanceMetric::L2);
         let mut snaps = HashMap::new();
         snaps.insert(
@@ -1405,7 +1501,7 @@ mod tests {
         }
         std::fs::write(&path, &bytes).unwrap();
 
-        match VectorWal::open(dir.path()) {
+        match VectorWal::open(dir.path(), &Default::default()) {
             Ok((_w, st)) => panic!(
                 "payload corruption was absorbed: opened with {} index(es) holding {} \
                  vector(s) nobody wrote",
@@ -1429,7 +1525,7 @@ mod tests {
     #[test]
     fn a_checksummed_snapshot_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let (wal, _) = VectorWal::open(dir.path()).unwrap();
+        let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
         let idx = make_index(24, 8, DistanceMetric::L2);
         let mut snaps = HashMap::new();
         snaps.insert(
@@ -1446,7 +1542,59 @@ mod tests {
         wal.checkpoint(&snaps).unwrap();
         drop(wal);
 
-        let (_w, st) = VectorWal::open(dir.path()).expect("a checksummed snapshot must open");
+        let (_w, st) = VectorWal::open(dir.path(), &Default::default()).expect("a checksummed snapshot must open");
         assert_eq!(st.indexes["v"].hnsw.len(), 24);
+    }
+}
+
+#[cfg(test)]
+mod s63_tests {
+    use super::*;
+
+    fn committed(ids: &[u64]) -> std::collections::HashSet<u64> {
+        ids.iter().copied().collect()
+    }
+
+    /// S63: tagged records survive replay iff their transaction durably
+    /// committed (or they are autocommit); v1 records always keep.
+    #[test]
+    fn tagged_records_filter_by_committed_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
+        wal.log_create_index(None, "v", 4, 0, 8, 48).unwrap();
+        // xact 7 committed; xact 9 never did; autocommit (0) always keeps.
+        wal.log_insert(Some(7), "v", 1, &[1.0, 0.0, 0.0, 0.0], "").unwrap();
+        wal.log_insert(Some(9), "v", 2, &[0.0, 1.0, 0.0, 0.0], "").unwrap();
+        wal.log_insert(Some(0), "v", 3, &[0.0, 0.0, 1.0, 0.0], "").unwrap();
+        wal.log_delete(Some(9), "v", 1).unwrap();
+        wal.group_sync().unwrap();
+
+        let (_w, state) = VectorWal::open(dir.path(), &committed(&[7])).unwrap();
+        let idx = state.indexes.get("v").unwrap();
+        // Node 1 was inserted by 7 (kept) then DELETED by 9 (discarded) — so
+        // it survives the filter race-free: the delete never happened.
+        assert!(idx.hnsw.vector_of(1).is_some(), "kept insert");
+        assert!(idx.hnsw.vector_of(2).is_none(), "uncommitted insert discarded");
+        assert!(idx.hnsw.vector_of(3).is_some(), "autocommit insert kept");
+        // The floor is pinned by EVERY tagged id, committed or not — a
+        // rolled-back id must never be re-minted.
+        assert_eq!(state.max_xact_id, 9);
+    }
+
+    /// A rolled-back index CREATE leaves no empty shell behind: the tagged
+    /// CREATE_INDEX record is discarded with its transaction.
+    #[test]
+    fn uncommitted_create_index_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
+        wal.log_create_index(Some(5), "ghost", 4, 0, 8, 48).unwrap();
+        wal.group_sync().unwrap();
+
+        let (_w, state) = VectorWal::open(dir.path(), &committed(&[])).unwrap();
+        assert!(
+            !state.indexes.contains_key("ghost"),
+            "an uncommitted CREATE must not survive replay"
+        );
+        assert_eq!(state.max_xact_id, 5, "the floor still pins the dead id");
     }
 }

@@ -1007,3 +1007,66 @@ async fn old_format_sequences_json_without_start_loads_with_minvalue() {
         "start must fall back to min_value for pre-upgrade sequences.json"
     );
 }
+
+// ── S63 vector slice: transactional vector writes ───────────────────────────
+
+/// A vector row-write inside a transaction is atomic with the SQL commit:
+/// ROLLBACK reverts the in-memory index (per-node undo) AND the recovery
+/// filter discards the WAL record, so a reopen cannot resurrect it. A COMMIT
+/// survives both. Asserted through `hnsw_index_live_ids` because a SQL KNN
+/// query falls back to a base-table scan and masks index loss.
+#[tokio::test]
+async fn vector_row_writes_are_transactional() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = open_executor(dir.path()).await;
+    exec(
+        &ex,
+        "CREATE TABLE vt (id INT PRIMARY KEY, v VECTOR(4))",
+    )
+    .await;
+    exec(&ex, "CREATE INDEX vt_hnsw ON vt USING hnsw (v)").await;
+
+    // Baseline: one committed row.
+    exec(&ex, "INSERT INTO vt VALUES (1, VECTOR('[1,0,0,0]'))").await;
+    assert_eq!(ex.hnsw_index_live_ids("vt_hnsw").map(|s| s.len()), Some(1));
+
+    // ROLLBACK of an INSERT: the index must not hold the vector.
+    exec(&ex, "BEGIN").await;
+    exec(&ex, "INSERT INTO vt VALUES (2, VECTOR('[0,1,0,0]'))").await;
+    exec(&ex, "ROLLBACK").await;
+    assert_eq!(
+        ex.hnsw_index_live_ids("vt_hnsw").map(|s| s.len()),
+        Some(1),
+        "a rolled-back vector insert must leave the in-memory index"
+    );
+
+    // COMMIT of an INSERT: the index holds it, and a reopen (recovery filter
+    // + WAL replay) agrees.
+    exec(&ex, "BEGIN").await;
+    exec(&ex, "INSERT INTO vt VALUES (3, VECTOR('[0,0,1,0]'))").await;
+    exec(&ex, "COMMIT").await;
+    assert_eq!(ex.hnsw_index_live_ids("vt_hnsw").map(|s| s.len()), Some(2));
+
+    drop(ex);
+    let ex2 = open_executor(dir.path()).await;
+    let live = ex2
+        .hnsw_index_live_ids("vt_hnsw")
+        .map(|s| s.len())
+        .expect("the index must exist after reopen");
+    assert_eq!(
+        live, 2,
+        "reopen must replay the committed vectors and ONLY those — the rolled-back \
+         record discarded by the S63 filter"
+    );
+
+    // ROLLBACK of a DELETE: the vector comes back in memory.
+    exec(&ex2, "BEGIN").await;
+    exec(&ex2, "DELETE FROM vt WHERE id = 1").await;
+    assert_eq!(ex2.hnsw_index_live_ids("vt_hnsw").map(|s| s.len()), Some(1));
+    exec(&ex2, "ROLLBACK").await;
+    assert_eq!(
+        ex2.hnsw_index_live_ids("vt_hnsw").map(|s| s.len()),
+        Some(2),
+        "a rolled-back vector delete must restore the in-memory index"
+    );
+}

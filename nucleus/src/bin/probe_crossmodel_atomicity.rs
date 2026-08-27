@@ -99,7 +99,9 @@ fn scalar_i64(res: &[ExecResult], sql: &str) -> Result<i64, String> {
 /// - "graph_crash"/"graph_commit" are the GRAPH_ADD_NODE twins;
 /// - "ts_crash"/"ts_commit" are the TS_INSERT twins;
 /// - "dl_crash"/"dl_commit" are the DATALOG_ASSERT twins;
-/// - "blob_crash"/"blob_commit" are the BLOB_STORE twins.
+/// - "blob_crash"/"blob_commit" are the BLOB_STORE twins;
+/// - "vec_crash"/"vec_commit" are the vector-row twins (an HNSW-indexed
+///   VECTOR column: the index's WAL record and the SQL row commit together).
 fn child_main(dir: &str, mode: &str) -> ! {
     std::panic::set_hook(Box::new(|_| {}));
     let rt = tokio::runtime::Runtime::new().expect("child rt");
@@ -116,6 +118,14 @@ fn child_main(dir: &str, mode: &str) -> ! {
         step("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v TEXT)")
             .await
             .map_err(|e: ExecError| e.to_string())?;
+        if mode == "vec_crash" || mode == "vec_commit" {
+            step("CREATE TABLE IF NOT EXISTS vt (id INTEGER PRIMARY KEY, v VECTOR(4))")
+                .await
+                .map_err(|e: ExecError| e.to_string())?;
+            step("CREATE INDEX IF NOT EXISTS vt_hnsw ON vt USING hnsw (v)")
+                .await
+                .map_err(|e: ExecError| e.to_string())?;
+        }
         step("BEGIN").await.map_err(|e| e.to_string())?;
         step("INSERT INTO t (id, v) VALUES (1, 'xm')")
             .await
@@ -148,6 +158,11 @@ fn child_main(dir: &str, mode: &str) -> ! {
             }
             "blob_crash" | "blob_commit" => {
                 step("SELECT BLOB_STORE('xm_b', '74786e')")
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            "vec_crash" | "vec_commit" => {
+                step("INSERT INTO vt (id, v) VALUES (1, VECTOR('[1,0,0,0]'))")
                     .await
                     .map_err(|e| e.to_string())?;
             }
@@ -196,6 +211,11 @@ fn child_main(dir: &str, mode: &str) -> ! {
                     .await
                     .map_err(|e| e.to_string())?;
             }
+            "vec_commit" => {
+                step("INSERT INTO vt (id, v) VALUES (2, VECTOR('[0,1,0,0]'))")
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
             _ => {}
         }
         Ok::<(), String>(())
@@ -222,6 +242,44 @@ fn recover_and_check(dir: &Path, expect_rows: i64, expect_len: i64) -> Result<()
     if len != expect_len {
         return Err(format!(
             "stream entries: expected {expect_len}, recovered {len}"
+        ));
+    }
+    Ok(())
+}
+
+/// The vector twin: SQL rows in `vt` AND live HNSW nodes must both reflect
+/// exactly the committed writes. The index is asserted through
+/// `hnsw_index_live_ids` because a SQL KNN query falls back to a base-table
+/// scan and masks index state entirely.
+fn recover_and_check_vec(
+    dir: &Path,
+    expect_t: i64,
+    expect_vt: i64,
+    expect_live: usize,
+) -> Result<(), String> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("rt: {e}"))?;
+    let ex = build_executor(dir)?;
+    let rows = rt.block_on(execute(&ex, "SELECT COUNT(*) FROM t"))?;
+    let rows_t = scalar_i64(&rows, "COUNT(*)")?;
+    if rows_t != expect_t {
+        return Err(format!(
+            "SQL rows (t): expected {expect_t}, recovered {rows_t}"
+        ));
+    }
+    let rows = rt.block_on(execute(&ex, "SELECT COUNT(*) FROM vt"))?;
+    let rows_vt = scalar_i64(&rows, "COUNT(*)")?;
+    if rows_vt != expect_vt {
+        return Err(format!(
+            "SQL rows (vt): expected {expect_vt}, recovered {rows_vt}"
+        ));
+    }
+    let live = ex
+        .hnsw_index_live_ids("vt_hnsw")
+        .map(|ids| ids.len())
+        .ok_or_else(|| "index vt_hnsw did not recover".to_string())?;
+    if live != expect_live {
+        return Err(format!(
+            "live HNSW nodes: expected {expect_live}, recovered {live} — the tagged              vector record survived a transaction that never committed"
         ));
     }
     Ok(())
@@ -615,6 +673,20 @@ fn main() {
             }),
             pass_msg: "commit direction: committed txn (row + tagged BLOB_STORE) and \
                  autocommit BLOB_STORE all survive reopen",
+        },
+        Scenario {
+            mode: "vec_crash",
+            label: "vector",
+            check: Box::new(|dir| recover_and_check_vec(dir, 0, 0, 0)),
+            pass_msg: "crash before the commit record -> SQL row gone AND vector.wal's \
+                 tagged record discarded (atomic discard)",
+        },
+        Scenario {
+            mode: "vec_commit",
+            label: "vector",
+            check: Box::new(|dir| recover_and_check_vec(dir, 1, 2, 2)),
+            pass_msg: "commit direction: committed txn (row + tagged vector insert) and \
+                 autocommit vector insert all survive reopen",
         },
     ];
 

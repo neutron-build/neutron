@@ -40,7 +40,7 @@ power failure loses up to `wal.checkpoint_interval_secs` (default **300 s**,
 | FTS — table index (`USING FTS`, `@@`, `BM25`) | n/a — derived from rows | rebuilt from base rows at startup | **yes** (rebuilt from committed rows on abort) | n/a — the rows are the SQL commit | **enforced** (rows go through table policies) |
 | FTS — document store (`FTS_*`) | fsync (**2026-08-18**, NU-006) | yes, via `fts_index.json` (see below) | partial (undo log, best-effort) | **no** | yes (refused while RLS active) |
 | Geo | **none** | n/a — no state | n/a | n/a | n/a (pure functions) |
-| Vector (HNSW) | fsync | yes | yes, **session-scoped** | **no** | decorative (see below) |
+| Vector (HNSW) | fsync | yes — **transaction-tagged** (2026-08-26, S63 vector slice: row writes commit/roll back/discard with the SQL transaction) | yes, **session-scoped** | **yes** for row writes (tagged records + recovery filter) | decorative (see below) |
 | Vector (IvfFlat) | **none** (rebuilt) | rebuilt from base rows | via rebuild | n/a | decorative |
 | Time series | fsync | yes | yes, **session-scoped** | **no** | yes |
 | Columnar *store* (`COLUMNAR_*`) | fsync (**2026-08-18**, NU-006) | yes | **refused inside a transaction** (2026-08-19) | **no** | yes |
@@ -84,15 +84,20 @@ fails if enforcement ever lands so the claim is updated with it.
 
 1. **Crash-atomicity across the SQL transaction is per-surface.** The S63
    programme (2026-08-21..26) made **streams, KV strings, documents, graph,
-   timeseries, datalog, and blob** atomic end to end: their records are
-   tagged with the coordinating transaction id and recovery discards tagged
-   records whose COMMIT never landed (`probe_crossmodel_atomicity`).
-   **Columnar and collections-KV refuse writes inside transactions outright**
-   (no rollback before-image yet), so they cannot produce uncommitted
-   records. **FTS, vector, and CDC** still append at *statement* time with no
-   transaction notion — killing the server mid-transaction leaves the SQL row
-   rolled back and those surfaces' writes from the same transaction present
-   and permanent. (CDC's semantics are the open NU-107 product call.)
+   timeseries, datalog, blob, and vector** atomic end to end: their records
+   are tagged with the coordinating transaction id and recovery discards
+   tagged records whose COMMIT never landed (`probe_crossmodel_atomicity`,
+   which crash-probes all eight in both directions). Vector joined
+   2026-08-26: an HNSW-indexed VECTOR column's row writes are tagged
+   (vector.wal opcodes 0x06/0x07/0x08), filtered at replay, and gated at
+   checkpoint; the in-memory rollback half is the SQL layer's
+   derived-state rebuild. **Columnar and collections-KV refuse writes inside
+   transactions outright** (no rollback before-image yet), so they cannot
+   produce uncommitted records. **FTS and CDC** still append at *statement*
+   time with no transaction notion — killing the server mid-transaction
+   leaves the SQL row rolled back and those surfaces' writes from the same
+   transaction present and permanent. (CDC is DECIDED fire-and-forget,
+   permanently; FTS is design-never.)
 
 2. **~~A ROLLBACK in one session destroys other sessions' committed specialty
    writes.~~ FIXED (M8).** The stores are still process-global, but `BEGIN` no
