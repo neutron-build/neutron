@@ -287,6 +287,11 @@ impl Database {
 
     /// Execute a query and return just the rows (convenience for SELECT).
     /// If the SQL contains multiple statements, returns rows from the last SELECT.
+    ///
+    /// Embedded consumers always get MATERIALIZED rows (N29): this is a
+    /// single-process API with no wire to buffer, so streaming buys nothing
+    /// here — a stream would only move the waiting. `SET stream_results = on`
+    /// applies to server sessions, not to this handle.
     pub async fn query(&self, sql: &str) -> Result<Vec<Row>, ExecError> {
         let results = self.executor.execute(sql).await?;
         for result in results.into_iter().rev() {
