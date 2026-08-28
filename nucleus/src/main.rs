@@ -67,7 +67,7 @@ enum Commands {
         #[arg(short, long, default_value = "nucleus_data")]
         data: PathBuf,
 
-        /// Path to a nucleus.toml config file. Defaults to <data-dir>/nucleus.toml.
+        /// Path to a neutron.toml config file. Defaults to <data-dir>/neutron.toml.
         /// Use this to keep configuration outside the data directory, or to point
         /// one binary at different configs. A path given here must exist —
         /// startup fails rather than silently falling back to defaults, because
@@ -636,10 +636,18 @@ async fn cmd_start(cfg: StartConfig) {
     // An explicit --config is REQUIRED to load: if the operator named a file,
     // silently falling back to defaults would apply a configuration they did
     // not ask for, and the symptom (a setting that "does nothing") is the
-    // hardest kind to diagnose. The implicit <data>/nucleus.toml stays
+    // hardest kind to diagnose. The implicit <data>/neutron.toml stays
     // best-effort, since not having one is the normal case.
     let explicit_config = config.is_some();
-    let config_path = config.unwrap_or_else(|| data.join("nucleus.toml"));
+    // `neutron.toml` — the FRAMEWORK's name. This was `nucleus.toml` (the
+    // database) from the day implicit config loading was written, so the
+    // documented drop-a-neutron.toml-in-your-data-dir feature never once
+    // worked: the file sat there unread while the server ran defaults, and
+    // every "config knob does nothing" report on that path was this typo
+    // (found 2026-08-27 while diagnosing per-INSERT latency — flush_os had
+    // also never been configurable implicitly, compounding with the
+    // validator gap fixed the same day).
+    let config_path = config.unwrap_or_else(|| data.join("neutron.toml"));
     let mut config = match NucleusConfig::load(&config_path) {
         Ok(cfg) => {
             // `NucleusConfig::load` already overlays NUCLEUS_* env vars.
@@ -684,7 +692,7 @@ async fn cmd_start(cfg: StartConfig) {
         data_override.as_deref(),
         if memory { Some(true) } else { None },
         // Like host/port/data above, treat the clap default as "unspecified"
-        // so NUCLEUS_MAX_MEMORY_MB / nucleus.toml can drive the budget when
+        // so NUCLEUS_MAX_MEMORY_MB / neutron.toml can drive the budget when
         // --max-memory isn't explicitly passed.
         if max_memory != 512 {
             Some(max_memory)
@@ -865,6 +873,9 @@ async fn cmd_start(cfg: StartConfig) {
     // containerized server was the real exposure this guard exists for.
     let cluster_listen = cluster_listen || env_var_truthy("NUCLEUS_CLUSTER_LISTEN");
     let cluster_engaged = join.is_some() || replicate_from.is_some();
+    // Same engagement disjunction the listener guard uses, for the
+    // replicator attachment below.
+    let cluster_transport_engaged = cluster_engaged || cluster_listen;
     if (cluster_engaged || cluster_listen)
         && !is_loopback_host(&host)
         && cluster_token.is_none()
@@ -1634,8 +1645,21 @@ async fn cmd_start(cfg: StartConfig) {
         transport.register_peer(peer_id, &addr).await;
     }
 
-    // Attach the replicator to the executor (set_raft_replicator works post-construction).
-    executor.set_raft_replicator(raft_replicator.clone());
+    // Attach the replicator to the executor — but ONLY when clustering or
+    // replication is actually engaged (2026-08-27). Until this gate, every
+    // single-node server with a data directory ran every DML through Raft
+    // propose: an fsynced log append plus a hard-state rewrite (two more
+    // fsyncs) per statement, for machinery Option A has already decided is
+    // unsupported and experimental. A standalone server executes DML
+    // locally exactly as it did before Raft existed; the replication
+    // env-var is the same escape hatch the listener guard uses.
+    let replicate_enabled =
+        cluster_transport_engaged || env_var_truthy("NUCLEUS_EXPERIMENTAL_REPLICATION");
+    if replicate_enabled {
+        executor.set_raft_replicator(raft_replicator.clone());
+    } else {
+        executor.set_cluster_mode(false);
+    }
 
     // Spawn apply task: execute committed SQL from followers on this node.
     let executor_for_apply = executor.clone();
@@ -1676,21 +1700,29 @@ async fn cmd_start(cfg: StartConfig) {
     });
 
     // Spawn Raft tick loop: heartbeats every 100 ms, election timeout every 50 ms.
-    let replicator_for_tick = raft_replicator.clone();
-    tokio::spawn(async move {
-        let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_millis(100));
-        let mut election_interval = tokio::time::interval(std::time::Duration::from_millis(50));
-        loop {
-            tokio::select! {
-                _ = heartbeat_interval.tick() => {
-                    replicator_for_tick.tick_heartbeat().await;
-                }
-                _ = election_interval.tick() => {
-                    replicator_for_tick.tick_election().await;
+    // Only when the replicator is engaged (same gate as attachment): a
+    // single-node server that is not clustering still RE-ELECTS itself on
+    // every election timeout otherwise — a term bump plus two fsyncs
+    // (hardstate rewrite + directory sync) every ~150-300 ms, forever, for
+    // machinery nothing uses (profiled 2026-08-27).
+    if replicate_enabled {
+        let replicator_for_tick = raft_replicator.clone();
+        tokio::spawn(async move {
+            let mut heartbeat_interval =
+                tokio::time::interval(std::time::Duration::from_millis(100));
+            let mut election_interval = tokio::time::interval(std::time::Duration::from_millis(50));
+            loop {
+                tokio::select! {
+                    _ = heartbeat_interval.tick() => {
+                        replicator_for_tick.tick_heartbeat().await;
+                    }
+                    _ = election_interval.tick() => {
+                        replicator_for_tick.tick_election().await;
+                    }
                 }
             }
-        }
-    });
+        });
+    }
 
     // Legacy cluster heartbeat loop for non-Raft connectivity checks (every 5s).
     let transport_for_hb = transport.clone();

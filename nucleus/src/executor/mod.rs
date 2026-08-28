@@ -474,6 +474,12 @@ pub struct Executor {
     /// Wrapped in RwLock so it can be set after Arc construction (transport init order).
     #[cfg(feature = "server")]
     raft_replicator: parking_lot::RwLock<Option<Arc<crate::distributed::RaftReplicator>>>,
+    /// Whether this executor was booted in cluster mode (engaged join /
+    /// replication / seed listen). Gates the security-DDL replication guard:
+    /// a single-node server has no replicator AND no divergence risk, so it
+    /// must keep executing security DDL locally — the guard is for clusters
+    /// whose replicator has been lost.
+    cluster_mode: std::sync::atomic::AtomicBool,
     /// Optional follower read manager for consistent follower reads.
     #[cfg(feature = "server")]
     follower_read_mgr: Option<Arc<parking_lot::RwLock<crate::distributed::FollowerReadManager>>>,
@@ -962,6 +968,7 @@ impl Executor {
             cluster: None,
             #[cfg(feature = "server")]
             raft_replicator: parking_lot::RwLock::new(None),
+            cluster_mode: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "server")]
             follower_read_mgr: None,
             sessions: parking_lot::RwLock::new(HashMap::new()),
@@ -2918,6 +2925,15 @@ impl Executor {
     #[cfg(feature = "server")]
     pub fn set_raft_replicator(&self, replicator: Arc<crate::distributed::RaftReplicator>) {
         *self.raft_replicator.write() = Some(replicator);
+        self.cluster_mode
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Declare explicitly whether this executor runs in cluster mode when no
+    /// replicator will be attached (single-node servers). See the field's doc.
+    pub fn set_cluster_mode(&self, on: bool) {
+        self.cluster_mode
+            .store(on, std::sync::atomic::Ordering::Release);
     }
 
     /// Wire the distributed pub/sub router to the Raft replicator so incoming
@@ -4464,21 +4480,18 @@ impl Executor {
         {
             wal.group_sync().map_err(io_err)?;
         }
-        // CDC last *within this function*, so the specialty logs whose changes
-        // it describes are durable before it is. Note what that does and does
-        // not buy: it orders CDC against the other specialty models only. The
-        // whole block still runs BEFORE the SQL WAL is forced (deliberately --
-        // see the ordering rationale at the call site), so after a crash in
-        // that window the feed can still be ahead of the SQL rows it describes.
-        // That is the pre-existing orphan trade-off, not something this
-        // introduces, and it is the substance of the still-open question of
-        // whether CDC is transactional at all (NU-107). What changes here is
-        // only that a CDC ack now means fsynced rather than page-cached.
-        if let Some(ref wal) = self.cdc_wal
-            && wal.is_dirty()
-        {
-            wal.group_sync().map_err(io_err)?;
-        }
+        // CDC is deliberately NOT synced here (2026-08-27). The block below
+        // used to fsync cdc.wal on every COMMIT — measured as 91% of a
+        // single-row INSERT's total time (4ms of a 4.4ms insert at
+        // sync_mode=none; see tests/insert_breakdown.rs) — for a model that
+        // is DECIDED fire-and-forget (NU-107): consumers must treat events as
+        // notifications, not commit confirmations, and the feed may already
+        // run ahead of or behind the SQL rows it describes across a crash
+        // (RESIDUAL_RISKS entry 1). A per-statement drive barrier buys none
+        // of the semantics that decision allows and taxes every write to
+        // pay for it. CDC's durability is its checkpoint
+        // (`checkpoint_cdc_wal`, the periodic specialty pass) — the same
+        // crash window every fire-and-forget notification system has.
         Ok(())
     }
 
@@ -6327,7 +6340,9 @@ impl Executor {
                                 }
                             }
                         } else {
-                            if has_security_ddl {
+                            if has_security_ddl
+                                && self.cluster_mode.load(std::sync::atomic::Ordering::Acquire)
+                            {
                                 return Err(ExecError::Runtime(
                                     "security catalog changes require an active Raft replicator"
                                         .into(),

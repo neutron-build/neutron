@@ -888,7 +888,28 @@ impl NucleusConfig {
             &mut errors,
             "wal.sync_mode",
             &self.wal.sync_mode,
-            &["fsync", "fdatasync", "async", "none", "off"],
+            // Mirrors `SyncMode::from_str` exactly. `flush_os` was missing
+            // from this list from the day it was implemented, so every
+            // flush_os config was rejected here and silently fell back to
+            // the default (fsync) on the implicit path — the exact
+            // "knob that does nothing" failure this check exists to prevent
+            // (found 2026-08-27 while diagnosing per-INSERT latency).
+            // Mirrors `SyncMode::from_str` exactly. `flush_os` was missing
+            // from this list from the day it was implemented, so every
+            // flush_os config was rejected here and silently fell back to
+            // the default (fsync) on the implicit path — the exact
+            // "knob that does nothing" failure this check exists to prevent
+            // (found 2026-08-27 while diagnosing per-INSERT latency).
+            &[
+                "fsync",
+                "fdatasync",
+                "flush_os",
+                "flush-os",
+                "os",
+                "async",
+                "none",
+                "off",
+            ],
         );
         check_enum(
             &mut errors,
@@ -1105,6 +1126,34 @@ mod tests {
     /// The Batch 2 config keys parse from TOML and default to the behavior
     /// that shipped before they existed: slow-query off, spill unlimited,
     /// WAL-growth WARN every 10th skipped pass.
+    /// `wal.sync_mode` validation must accept every spelling
+    /// `SyncMode::from_str` accepts. `flush_os` was missing from the list,
+    /// so the mode existed, was documented, and could never be configured.
+    #[test]
+    fn wal_sync_mode_validator_accepts_every_mode_spelling() {
+        for accepted in [
+            "fsync",
+            "fdatasync",
+            "flush_os",
+            "flush-os",
+            "os",
+            "async",
+            "none",
+            "off",
+        ] {
+            let cfg: NucleusConfig =
+                toml::from_str(&format!("[wal]\nsync_mode = \"{accepted}\"\n")).expect(accepted);
+            assert_eq!(
+                cfg.validate(),
+                Ok(()),
+                "wal.sync_mode={accepted:?} must validate; SyncMode::from_str accepts it"
+            );
+        }
+        // And an actual typo still fails loudly.
+        let bad: NucleusConfig = toml::from_str("[wal]\nsync_mode = \"flushoos\"\n").unwrap();
+        assert!(bad.validate().is_err());
+    }
+
     #[test]
     fn test_batch2_knobs_parse_and_default() {
         assert_eq!(ServerConfig::default().slow_query_log_ms, 0);
