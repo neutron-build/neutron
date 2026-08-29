@@ -674,6 +674,34 @@ impl MvccMemoryEngine {
         Ok(tbl.scan_visible(snapshot, &self.txn_mgr))
     }
 
+    /// Enumerate EVERY row version with its version index, each flagged with
+    /// its visibility under `snapshot` (the same check `scan_visible`
+    /// applies). Index BUILDING needs both halves: the raw list feeds the
+    /// unique-probe's `version_map` (a liveness-rechecking SUPERSET is
+    /// sound), while `idx.map` — served by `index_lookup_sync` with NO
+    /// visibility filtering — may only ever contain live rows. Dead versions
+    /// landing there made point lookups return them alongside their
+    /// successors (found by probe_index_coherence, 2026-08-28).
+    pub fn scan_versions_with_visibility(
+        &self,
+        table: &str,
+        snapshot: &Snapshot,
+    ) -> Result<Vec<(usize, Arc<Row>, bool)>, MvccError> {
+        let tbl = self.get_table(table)?;
+        let rows = tbl.rows.read();
+        let no_aborts = self.txn_mgr.has_no_aborts();
+        let xmin = snapshot.xmin;
+        Ok(rows
+            .iter()
+            .enumerate()
+            .map(|(vidx, r)| {
+                let visible = r.version.is_visible_fast(xmin, no_aborts)
+                    || r.version.is_visible(snapshot, &self.txn_mgr);
+                (vidx, Arc::clone(&r.data), visible)
+            })
+            .collect())
+    }
+
     /// Scan returning only the row data (no version indices).
     pub fn scan_rows(&self, table: &str, snapshot: &Snapshot) -> Result<Vec<Row>, MvccError> {
         Ok(self
@@ -2747,7 +2775,7 @@ impl StorageEngine for MvccStorageAdapter {
         index_name: &str,
         col_idx: usize,
     ) -> Result<(), StorageError> {
-        let (txn_id, snap, auto) = self.current_or_auto()?;
+        let (txn_id, _snap, auto) = self.current_or_auto()?;
 
         // Build AND install while holding the indexes write lock. Scanning
         // outside it left a window where a concurrent insert's per-row index
@@ -2765,25 +2793,53 @@ impl StorageEngine for MvccStorageAdapter {
             // deadlocked the concurrency probe).
             let mut tnames = self.table_idx_names.write();
             let mut indexes = self.indexes.write();
+            // Build from EVERY version, split by consumer:
+            //
+            // - `version_map` (unique-key probe candidates) takes the raw
+            //   list. The probe re-checks each candidate's committed/deleted
+            //   status, so a SUPERSET is sound — and a superset is REQUIRED:
+            //   the probe trusts version_map absence, so a snapshot build that
+            //   missed a just-committed row let a concurrent same-key INSERT
+            //   through. That hole used to force `mark_mutated` here,
+            //   permanently disabling the assisted probe for any table
+            //   indexed after load — every INSERT then paid a full-table O(n)
+            //   scan for its uniqueness check (measured 4.0-4.8ms per insert
+            //   on a 250K-row table vs ~150us with the probe, 2026-08-27; the
+            //   entire "SQLite is 4000x faster at INSERT" finding was this).
+            //
+            // - `idx.map` (the rows `index_lookup_sync` hands back with NO
+            //   visibility filtering) takes only versions LIVE under a
+            //   snapshot taken HERE, inside the locks. Loading dead versions
+            //   made point lookups return a row and its UPDATE-successor
+            //   twice (probe_index_coherence, 2026-08-28). The snapshot is
+            //   safe precisely because it is taken under the locks: any txn
+            //   that committed before it is visible-and-enumerated; any txn
+            //   still in flight holds versions the raw list covers for
+            //   version_map, and its per-row maintenance (which needs these
+            //   same locks) applies to map right after install. Nothing is
+            //   missed and nothing dead leaks in.
+            let mut read_txn = self
+                .engine
+                .txn_mgr()
+                .try_begin(IsolationLevel::Snapshot)
+                .map_err(|_| StorageError::TransactionIdExhausted)?;
+            let snap = read_txn.snapshot.clone();
             let results = self
                 .engine
-                .scan(table, &snap)
+                .scan_versions_with_visibility(table, &snap)
                 .map_err(|e| StorageError::TableNotFound(e.to_string()))?;
+            self.engine.txn_mgr().abort(&mut read_txn);
             let mut map: std::collections::BTreeMap<Value, HashMap<usize, Row>> =
                 std::collections::BTreeMap::new();
             let mut version_map: HashMap<Value, Vec<usize>> = HashMap::new();
-            for (version_idx, row) in &results {
+            for (version_idx, row, visible) in &results {
                 let val = row.get(col_idx).cloned().unwrap_or(Value::Null);
-                map.entry(val.clone())
-                    .or_default()
-                    .insert(*version_idx, (**row).clone());
+                if *visible {
+                    map.entry(val.clone())
+                        .or_default()
+                        .insert(*version_idx, (**row).clone());
+                }
                 version_map.entry(val).or_default().push(*version_idx);
-            }
-            if !results.is_empty() {
-                // A late index build's snapshot can miss rows committed after
-                // the snapshot began — only an index born with the table (or
-                // on an empty table) is provably complete for the probe.
-                self.mark_mutated(table);
             }
             indexes.insert(
                 index_name.to_string(),
