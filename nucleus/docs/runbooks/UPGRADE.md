@@ -6,11 +6,30 @@ a cluster, and distributed mode is unsupported (see
 
 ## Status of this procedure
 
-**Written, never executed.** Nucleus has had one release (0.1.0) and the
-versioned-asset release path landed with this milestone, so no two releases
-have yet been installed on the same host. The steps below follow the on-disk
-compatibility rules the engine actually enforces; treat the first real upgrade
-as the test of this document and correct it afterwards.
+**First executed 2026-08-31**, upgrading a 28 GB instance from 0.1.8 to 1.0.0.
+It worked, and it taught the document one thing it did not say.
+
+### Budget for recovery, and do not let anything kill it
+
+The engine restores its catalog and replays its log BEFORE it binds the port,
+and that window scales with the data directory. The 28 GB instance logged
+`Restored 64 table(s) from catalog` within four seconds and then took
+**3 minutes 15 seconds** to reach `Listening on 0.0.0.0:5432`, running at
+14-18% CPU throughout. Nothing in the log marks the difference between "still
+recovering" and "hung" — CPU usage is the signal.
+
+Consequences to plan for:
+
+- **The container is UNHEALTHY during recovery.** The image's healthcheck ran
+  out its start period 110 seconds before the port opened. Anything that
+  replaces unhealthy containers will kill a database that is mid-recovery, and
+  restarting recovery does not make it finish sooner. Check that before you
+  upgrade anything large. (The image default is now a 15-minute start period.)
+- **Dependent apps error for the whole window** and recover on their own. The
+  Observe app logged connection-refused every few seconds and its last error
+  is timestamped the same second the port opened. No restart was needed.
+- Take the outage window from the data size, not from how long the binary
+  takes to swap. The swap is seconds; the recovery is minutes.
 
 ## 1. Decide whether the upgrade is reversible
 

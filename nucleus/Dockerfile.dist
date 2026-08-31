@@ -43,7 +43,25 @@ VOLUME ["/data"]
 EXPOSE 5432 5433 5434 6379
 
 # LIVENESS ONLY — see the note in `Dockerfile`.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+# START PERIOD IS SIZED FOR RECOVERY, NOT FOR STARTUP. The engine restores its
+# catalog and replays its log BEFORE it binds the port, and how long that takes
+# scales with the data directory. Measured 2026-08-31 on the first real upgrade
+# ever performed: a 28 GB instance logged "Restored 64 table(s) from catalog"
+# almost immediately and then took 3m15s to reach "Listening on 0.0.0.0:5432" —
+# working the whole time, at 14-18% CPU.
+#
+# At the previous --start-period=20s that instance was marked UNHEALTHY about
+# 110 seconds before it finished, and the failure mode of that is not cosmetic:
+# an orchestrator configured to replace unhealthy containers kills a database
+# that is mid-recovery, which restarts recovery, which is killed again. The
+# bigger the database, the more certain the loop — so the default has to cover
+# the slow case, and a probe that fails for longer than necessary during
+# startup costs nothing, while a database that is never allowed to finish
+# recovering costs everything.
+#
+# 15m is deliberately generous rather than fitted to the one measurement above;
+# `--retries` still catches an engine that dies after the window.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15m --retries=3 \
     CMD ["nucleus", "status", "--host", "127.0.0.1:5432"]
 
 ENTRYPOINT ["nucleus"]
