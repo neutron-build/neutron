@@ -29,7 +29,30 @@ impl Executor {
             match item {
                 SelectItem::UnnamedExpr(expr) => {
                     let value = self.eval_const_expr(expr)?;
-                    columns.push((format!("{expr}"), projected_column_type(expr, &value, &[])));
+                    // `default_output_name`, not the rendered expression. Every
+                    // other projection path in the executor already names columns
+                    // this way; this one — the FROM-less `SELECT f(x)` — rendered
+                    // the whole call including its arguments, so
+                    // `SELECT STREAM_XRANGE('ship:run-1', 0, …)` came back as a
+                    // column literally named
+                    // `STREAM_XRANGE('ship:run-1', 0, 9007199254740991, 1000000)`
+                    // where PostgreSQL names it `stream_xrange`.
+                    //
+                    // That was a compatibility bug on its own, and it was also
+                    // the source of a permanent stream of "row description
+                    // disagrees" warnings: Describe derives the label from the
+                    // parsed statement and got `stream_xrange`, execution got the
+                    // rendered text, and the two could never agree. Naming them
+                    // the same way is the fix for both; silencing the warning
+                    // would have left a client still seeing the wrong label.
+                    //
+                    // Only function calls, identifiers and nested expressions
+                    // change: `SELECT 1+1` and `SELECT 'hi'` fall through to the
+                    // same rendered text they produced before.
+                    columns.push((
+                        super::helpers::default_output_name(expr),
+                        projected_column_type(expr, &value, &[]),
+                    ));
                     row.push(value);
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {

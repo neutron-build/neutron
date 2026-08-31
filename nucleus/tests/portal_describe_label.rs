@@ -248,5 +248,57 @@ async fn a_bound_portals_column_label_may_change_without_refusing_the_rows() {
         1,
         "one projection item must be described exactly once, got {names:?}"
     );
+    assert_eq!(
+        names[0], "stream_xrange",
+        "Describe names a function-call column after the function"
+    );
     assert_eq!(rows, 1, "the stream's single entry must come back");
+}
+
+/// The name EXECUTION gives a function-call column, which is a different
+/// derivation from the one Describe uses and has to be pinned separately.
+///
+/// This has to go over the SIMPLE query protocol. On the extended protocol the
+/// RowDescription a client receives comes from Describe, so an extended-protocol
+/// test cannot see execution's naming at all — the first version of this
+/// assertion lived in the test above and passed with the fix reverted, because
+/// it was reading Describe's answer twice.
+///
+/// PostgreSQL calls this column `stream_xrange`. Execution used to render the
+/// whole call, arguments included:
+/// `STREAM_XRANGE('p:s', 0, 9007199254740991, 1000000)`. A client asking for
+/// `stream_xrange` found no such column, and because Describe already derived
+/// the short name, the two sides could never agree — which is what turned the
+/// row-description mismatch into a warning on every single query rather than an
+/// exceptional event.
+#[tokio::test]
+async fn execution_names_a_function_call_column_after_the_function() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = start(tmp.path()).await;
+    let mut c = Conn::connect(server.port).await;
+
+    c.simple("SELECT STREAM_XADD('p:s', 'f', 'v')").await;
+
+    let mut body = "SELECT STREAM_XRANGE('p:s', 0, 9007199254740991, 1000000)"
+        .as_bytes()
+        .to_vec();
+    body.push(0);
+    c.send(b'Q', &body).await;
+
+    let mut names = Vec::new();
+    loop {
+        let msg = c.read_msg().await;
+        match msg.tag {
+            b'T' => names = row_description_names(&msg.body),
+            b'E' => panic!("simple query failed: {}", err(&msg)),
+            b'Z' => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        names,
+        vec!["stream_xrange".to_string()],
+        "execution must name a function-call column after the function, as \
+         PostgreSQL does — not render the call with its arguments"
+    );
 }

@@ -5,6 +5,31 @@ Notable changes to the Nucleus engine. Format follows
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-08-31
+
+### Fixed
+
+- **A function-call column was named with its arguments.**
+  `SELECT STREAM_XRANGE('k', 0, 9007199254740991, 1000000)` returned a column
+  literally named `STREAM_XRANGE('k', 0, 9007199254740991, 1000000)`.
+  PostgreSQL names it `stream_xrange`, and so does this engine's Describe —
+  every other projection path already routed through `default_output_name`.
+  The FROM-less `SELECT f(x)` path was the one that did not, and rendered the
+  whole expression instead.
+
+  It was a client-visible compatibility bug on its own: anything reading that
+  column by name found no such column. It was also why 1.0.1's row-description
+  mismatch could never stop being reported — Describe derived the short name
+  and execution the long one, so the two disagreed on every execution of every
+  such statement, forever. Teploy Ship logged 546 of those warnings in 75
+  seconds. Naming both sides the same way fixes the compatibility bug and
+  retires the warning together; silencing the warning alone would have left
+  clients still seeing the wrong name.
+
+  Only function calls, identifiers, compound identifiers and nested
+  expressions change. `SELECT 1+1` and `SELECT 'hi'` keep the text they
+  produced before.
+
 ## [1.0.1] - 2026-08-31
 
 ### Fixed
