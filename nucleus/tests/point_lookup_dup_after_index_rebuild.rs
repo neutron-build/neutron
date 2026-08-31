@@ -58,7 +58,10 @@ async fn point_lookup_dup_after_index_rebuild() {
         let mut sorted = scan.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(scan, sorted, "duplicate visible versions after step {i}: {sql}");
+        assert_eq!(
+            scan, sorted,
+            "duplicate visible versions after step {i}: {sql}"
+        );
 
         for id in &scan {
             let got = ids_of(&ex, &format!("SELECT id FROM t WHERE id = {id}")).await;

@@ -5,6 +5,32 @@ Notable changes to the Nucleus engine. Format follows
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-08-31
+
+### Fixed
+
+- **A bound portal whose column LABEL changed on binding had its rows refused.**
+  1.0.0 added a guard that refuses to stream DataRows the description already
+  sent does not describe — the right guard, and it stays. But portal Describe
+  recorded its column names as FINAL, and a label derived from an expression
+  containing a parameter is not final until that parameter is bound. Statement
+  Describe had always reasoned this way; the portal path had not.
+
+  Found in production within a minute of the first 1.0.0 rollout, by nothing in
+  the test suite. Teploy Ship polls `SELECT STREAM_XRANGE($1, 0, …)` every few
+  seconds; the portal was described as `stream_xrange` and executed as
+  `STREAM_XRANGE('ship:run-…', 0, …)`. Same column count, same type, rows
+  decodable either way — and every poll was refused.
+
+  A count or type disagreement is still an error: that is the property that
+  decides whether a client decodes rows against the wrong columns. Only a name
+  mismatch is downgraded, and only for a portal that actually bound parameters.
+
+  The regression test speaks the protocol directly and has to. `prepare()` in
+  the common Rust driver issues Describe(STATEMENT), which has always marked
+  its names provisional — a test built on it passes with this fix reverted,
+  which is how the first version of this test was caught proving nothing.
+
 ## [1.0.0] - 2026-08-31
 
 ### Upgrade notes

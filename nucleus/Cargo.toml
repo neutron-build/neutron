@@ -6,7 +6,7 @@
 # below stay `nucleus`: every in-tree `use nucleus::` and the installed
 # server binary are unchanged.
 name = "nucleusdb"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 autobins = false
 description = "The definitive database engine"

@@ -2150,7 +2150,32 @@ impl ExtendedQueryHandler for NucleusHandler {
             )
         };
 
-        self.record_described_fields(client, &portal.statement.statement.sql, &fields, false)?;
+        // Portal Describe binds parameters, so the TYPES are final — but a
+        // column LABEL derived from an expression containing a parameter is
+        // not, for the same reason the statement-level path says so above.
+        // Found in production on the first 1.0.0 rollout: Ship polls
+        // `SELECT STREAM_XRANGE($1, 0, …)`, whose column this path described as
+        // `stream_xrange` while execution labelled it with the substituted
+        // expression, `STREAM_XRANGE('ship:run-…', 0, …)`. Same count, same
+        // type, different label — and declaring the label final turned a
+        // cosmetic disagreement into a refused read every four seconds.
+        //
+        // Provisional only downgrades a NAME mismatch to a warning; a count or
+        // type disagreement is still refused, and that is the property that
+        // decides whether a client decodes rows against the wrong columns.
+        // parameter_len() is the count of BOUND parameters, not
+        // `statement.parameter_types`, which holds the types a client DECLARED
+        // in Parse. Drivers routinely declare none and let the server infer —
+        // Ship's does, and so does the raw client in
+        // tests/portal_describe_label.rs, which is how the first version of
+        // this fix was caught reading the wrong field and changing nothing.
+        let names_provisional = portal.parameter_len() > 0;
+        self.record_described_fields(
+            client,
+            &portal.statement.statement.sql,
+            &fields,
+            names_provisional,
+        )?;
         Ok(DescribePortalResponse::new(fields))
     }
 
@@ -4804,7 +4829,10 @@ fn ast_mentions_side_effecting_fn(stmts: &[sqlparser::ast::Statement]) -> bool {
                 // The last part is the bare name: `pg_catalog.kv_incr` and
                 // `kv_incr` are the same function to the registry.
                 if let Some(name) = f.name.0.last() {
-                    let ident = name.as_ident().map(|i| i.value.as_str()).unwrap_or_default();
+                    let ident = name
+                        .as_ident()
+                        .map(|i| i.value.as_str())
+                        .unwrap_or_default();
                     if statically_described_fn_type(&ident.to_ascii_uppercase()).is_some() {
                         return ControlFlow::Break(());
                     }
