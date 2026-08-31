@@ -102,7 +102,7 @@ async fn late_index_does_not_disable_the_unique_probe() {
     // 200 us limit on a shared CI runner, failing the release for a machine
     // being busy rather than for anything about the engine. Measuring the same
     // workload twice on the same machine cancels the machine out.
-    let mut warm_and_time = |ex: &Arc<Executor>, id_base: i64, cat: &str| {
+    let warm_and_time = |ex: &Arc<Executor>, id_base: i64, cat: &str| {
         let ex = ex.clone();
         let cat = cat.to_string();
         async move {
