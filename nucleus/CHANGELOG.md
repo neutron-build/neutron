@@ -5,6 +5,40 @@ Notable changes to the Nucleus engine. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **The RowDescription a client received did not always describe the DataRows
+  that followed it.** In the extended query protocol Describe derives the schema
+  and Execute produces the rows; Nucleus derived the schema by executing the
+  statement capped at zero rows, and applied that cap by appending `" LIMIT 0"`
+  to the SQL text. Any statement that already ended in its own row cap
+  (`LIMIT`, `FETCH FIRST`) or in `FOR UPDATE` produced a probe that did not
+  parse, and the failure path answered with ZERO fields while Execute streamed
+  full-width rows. `(SELECT …)` and `/* comment */ SELECT …` were routed away
+  from the probe entirely by a text-prefix test and got zero fields too. And
+  `SHOW transaction_isolation` became `SHOW transaction_isolation LIMIT 0`, so
+  the client was told the column was named `transaction_isolation.LIMIT`.
+
+  Measured over 24 tables read concurrently for ten seconds: 20,800 of 125,419
+  statements were answered with a description that did not describe their rows.
+  A client reading fields positionally throws; one reading by name decodes a
+  valid row with fields missing and reports nothing.
+
+  The cap is now applied to the parsed statement, routing reads the parsed
+  statement, and the portal Describe reuses the same AST Execute will run.
+  Independently of that, Execute now refuses to send rows whose column count
+  disagrees with the description already sent, so any residual divergence is an
+  error the client sees rather than a wrong answer it decodes. Prisma's
+  connection probe panicked against every release through 0.1.8 and now passes.
+
+- **`execute_statements_with_session` inherited the session's plan-cache key.**
+  It is the one executor entry point that does not parse on the way in, so it
+  could not refresh the key for the statement it was running, and a cached plan
+  carries its own projection — a statement run under the previous statement's
+  key returns that statement's COLUMNS. Latent (every live caller seeded the
+  slot first) until the Describe probe was routed through it. The key is now a
+  parameter.
+
 ## [0.1.8] - 2026-08-21
 
 A security release, cut the same day as 0.1.7 because two authorization fixes

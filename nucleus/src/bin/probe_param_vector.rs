@@ -52,7 +52,7 @@ async fn main() {
     }
     println!("substituted SQL:   {}", stmts[0]);
     let ast_result = ex
-        .execute_statements_with_session(1, stmts)
+        .execute_statements_with_session(1, stmts, None)
         .await
         .expect("ast exec");
     let ast_d = first_float(&ast_result).expect("ast float");

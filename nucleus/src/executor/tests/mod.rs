@@ -45,6 +45,7 @@ mod test_admin;
 mod test_aggregate_overflow_checked; // QPP-4 family: aggregate overflow errors on every path
 mod test_alter_policy; // N14: ALTER POLICY and policy introspection
 mod test_ast_cache_utf8; // AST-cache literal extraction must be UTF-8-safe (WIR-4 family)
+mod test_ast_route_plan_key; // the pre-parsed route must not inherit a plan-cache key
 mod test_audit_events; // N18: durable security audit events
 mod test_cache_coherence; // M2: cache + specialty-index invalidation oracle
 mod test_call_pipeline; // EXE-1/5 + PRC-1/3/4/5/7: the CALL pipeline end-to-end
