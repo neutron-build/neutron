@@ -94,41 +94,62 @@ async fn late_index_does_not_disable_the_unique_probe() {
             .unwrap();
         base = end + 1;
     }
+    // BASELINE, taken before the index exists and over the same loaded table.
+    // The defect this test guards is a COLLAPSE — the probe being swapped for
+    // an O(n) scan — so the claim is a ratio, not a wall-clock number. Asserting
+    // an absolute threshold made this test a function of how loaded the runner
+    // was: it measured 39 us/insert on a developer laptop and 212 us against a
+    // 200 us limit on a shared CI runner, failing the release for a machine
+    // being busy rather than for anything about the engine. Measuring the same
+    // workload twice on the same machine cancels the machine out.
+    let mut warm_and_time = |ex: &Arc<Executor>, id_base: i64, cat: &str| {
+        let ex = ex.clone();
+        let cat = cat.to_string();
+        async move {
+            for i in 0..20 {
+                ex.execute(&format!(
+                    "INSERT INTO li VALUES ({}, '{cat}', 2.0)",
+                    id_base + i
+                ))
+                .await
+                .unwrap();
+            }
+            let t0 = std::time::Instant::now();
+            let n = 500;
+            for i in 0..n {
+                ex.execute(&format!(
+                    "INSERT INTO li VALUES ({}, '{cat}', 3.0)",
+                    id_base + 100 + i
+                ))
+                .await
+                .unwrap();
+            }
+            t0.elapsed().as_micros() as f64 / n as f64
+        }
+    };
+
+    let before_us = warm_and_time(&ex, 9_000_000, "c1").await;
+
     // The index under test: created AFTER the load, on a non-key column.
     ex.execute("CREATE INDEX li_cat ON li(cat)").await.unwrap();
 
-    // Warm, then timed single inserts.
-    for i in 0..20 {
-        ex.execute(&format!(
-            "INSERT INTO li VALUES ({}00000, 'c1', 2.0)",
-            90 + i
-        ))
-        .await
-        .unwrap();
-    }
-    let t0 = std::time::Instant::now();
-    let n = 500;
-    for i in 0..n {
-        ex.execute(&format!(
-            "INSERT INTO li VALUES ({}00000, 'c2', 3.0)",
-            200 + i
-        ))
-        .await
-        .unwrap();
-    }
-    let per_us = t0.elapsed().as_micros() as f64 / n as f64;
-    println!("late-index insert: {per_us:.0} us/insert");
-    // Pre-fix: ~1000+ us (50K-row scan per insert). Post-fix: ~30 us.
-    // 200us separates with margin both ways and tolerates CI noise.
+    let after_us = warm_and_time(&ex, 20_000_000, "c2").await;
+
+    let ratio = after_us / before_us.max(1.0);
+    println!("late-index insert: {before_us:.0} us before, {after_us:.0} us after (x{ratio:.1})");
+    // Pre-fix the index turned every insert into a 50K-row scan: 4.0-4.8ms
+    // against ~150us, a 25-30x collapse. Post-fix the two are within noise of
+    // each other. 5x is far below the defect and far above the run-to-run
+    // spread of two measurements taken seconds apart on one machine.
     assert!(
-        per_us < 200.0,
+        ratio < 5.0,
         "insert latency collapsed after CREATE INDEX on a loaded table: \
-         {per_us:.0} us/insert — the unique probe is disabled again"
+         {before_us:.0} us -> {after_us:.0} us (x{ratio:.1}) — the unique probe is disabled again"
     );
 
-    // And the index still answers.
-    // The index still answers: 500 bulk-load rows carry cat='c2' (i % 100)
-    // plus the n rows just inserted.
+    // The index still answers: 500 bulk-load rows carry cat='c2' (i % 100),
+    // plus the 20 warm-up and 500 timed rows the post-index measurement wrote
+    // under that same category.
     let r = ex
         .execute("SELECT COUNT(*) FROM li WHERE cat = 'c2'")
         .await
@@ -136,5 +157,5 @@ async fn late_index_does_not_disable_the_unique_probe() {
     let nucleus::executor::ExecResult::Select { rows, .. } = &r[0] else {
         panic!("expected rows");
     };
-    assert_eq!(rows[0][0], nucleus::types::Value::Int64(500 + n));
+    assert_eq!(rows[0][0], nucleus::types::Value::Int64(500 + 20 + 500));
 }
