@@ -4118,11 +4118,24 @@ impl Executor {
 
     /// Execute pre-parsed statements within a specific session's scope.
     /// This is the AST-fast-path for the extended query protocol — avoids re-parsing.
+    ///
+    /// `plan_cache_key` is the normalized key for the FIRST statement, and the
+    /// caller must supply it (or `None`) rather than leaving it to whatever the
+    /// session's hint slot happens to hold. Every other entry point parses on
+    /// the way in and so refreshes the slot for the statement it is about to
+    /// run; this one does not parse, and inheriting the slot meant a statement
+    /// could execute under the PREVIOUS statement's plan-cache key. That is not
+    /// a stale-plan nuisance — a cached plan carries its own projection, so the
+    /// caller gets the other statement's COLUMNS. Reproduced through the
+    /// Describe probe: `SELECT id, name_22 FROM tbl_22 …` was described as
+    /// `["id", "name_7"]`. Setting the slot here, unconditionally, is what
+    /// makes the borrowed key impossible instead of unlikely.
     #[cfg(feature = "server")]
     pub fn execute_statements_with_session<'a>(
         &'a self,
         session_id: u64,
         statements: Vec<Statement>,
+        plan_cache_key: Option<String>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Vec<ExecResult>, ExecError>> + Send + 'a>,
     > {
@@ -4132,6 +4145,7 @@ impl Executor {
         // outlived the statement and the connection that made them.
         self.uncorrelated_subquery_cache.write().clear();
         let session = self.get_session(session_id);
+        *session.plan_cache_key_hint.lock() = plan_cache_key;
         let guard_sess = session.clone();
         Box::pin(CURRENT_SESSION.scope(
             session,

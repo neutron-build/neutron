@@ -13,6 +13,9 @@ pub mod error_codec;
 pub mod kv_fast_path;
 pub mod overload;
 
+#[cfg(test)]
+mod tests_row_description;
+
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::IpAddr;
@@ -614,6 +617,32 @@ pub struct NucleusHandler {
     cancel_keys: parking_lot::RwLock<std::collections::HashMap<i32, (SecretKey, u64)>>,
     /// Per-session cancel signal, raced against query execution.
     cancel_notifies: parking_lot::RwLock<std::collections::HashMap<u64, Arc<tokio::sync::Notify>>>,
+
+    // ── Describe/Execute reconciliation ──────────────────────────────────
+    /// The row description most recently sent to each session, with the SQL it
+    /// was derived from. Read back at Execute so a description that does not
+    /// describe the DataRows about to follow it can never reach a client.
+    /// See `reconcile_described_schema`.
+    described_fields: parking_lot::RwLock<std::collections::HashMap<u64, DescribedFields>>,
+}
+
+/// The row description most recently sent on a session, the statement text it
+/// was derived from, and whether its column NAMES were provisional.
+///
+/// The text is the guard: a client that describes one statement and executes
+/// another must be left alone, not failed on a record that never belonged to
+/// the statement being run.
+///
+/// Names are provisional for a statement-level Describe, which happens before
+/// Bind. An unaliased expression is named after its own text, so
+/// `SELECT EXISTS(… WHERE nspname = $1)` is necessarily named with a NULL in
+/// it at Describe and with the bound value at Execute. That difference is the
+/// protocol working, not a defect, and it is what Prisma's connection probe
+/// does on every startup.
+struct DescribedFields {
+    sql: String,
+    names_provisional: bool,
+    columns: Vec<(String, Type)>,
 }
 
 impl NucleusHandler {
@@ -647,6 +676,7 @@ impl NucleusHandler {
             lo_next_oid: parking_lot::Mutex::new(FIRST_LO_OID),
             cancel_keys: parking_lot::RwLock::new(std::collections::HashMap::new()),
             cancel_notifies: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            described_fields: parking_lot::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -717,6 +747,7 @@ impl NucleusHandler {
             lo_next_oid: parking_lot::Mutex::new(FIRST_LO_OID),
             cancel_keys: parking_lot::RwLock::new(std::collections::HashMap::new()),
             cancel_notifies: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            described_fields: parking_lot::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1062,8 +1093,42 @@ impl NucleusHandler {
             ))));
         }
 
-        let fut = self.executor.execute_with_session(session_id, sql);
+        self.run_with_session_limits(
+            session_id,
+            self.executor.execute_with_session(session_id, sql),
+        )
+        .await
+    }
 
+    /// Execute PRE-PARSED statements within a session, under the same cancel
+    /// and statement-timeout envelope as [`Self::execute_sql_session`].
+    ///
+    /// Used by the Describe schema probe, which builds its statement by capping
+    /// a parsed AST rather than by rewriting SQL text, and so has no string to
+    /// hand to the text entry point (and no reason to pay a second parse).
+    async fn execute_statements_session(
+        &self,
+        session_id: u64,
+        statements: Vec<sqlparser::ast::Statement>,
+    ) -> PgWireResult<Vec<ExecResult>> {
+        self.run_with_session_limits(
+            session_id,
+            self.executor
+                .execute_statements_with_session(session_id, statements, None),
+        )
+        .await
+    }
+
+    /// Run an executor future under this session's cancel signal and
+    /// statement timeout.
+    async fn run_with_session_limits<F>(
+        &self,
+        session_id: u64,
+        fut: F,
+    ) -> PgWireResult<Vec<ExecResult>>
+    where
+        F: std::future::Future<Output = Result<Vec<ExecResult>, ExecError>> + Send,
+    {
         // Race execution against a wire CancelRequest for this session.
         // `biased` checks the cancel signal first so a cancel that arrived
         // while execution was inside a blocking (non-yielding) region still
@@ -1234,20 +1299,18 @@ impl NucleusHandler {
         substitute_positional_placeholders(sql, &replacements)
     }
 
-    /// Try to execute using the cached AST with parameter substitution.
-    /// Returns `Err(())` on any issue (type conversion, etc.) — caller falls back to string path.
-    #[allow(clippy::type_complexity)]
-    fn try_ast_execute<'a>(
-        executor: &'a Arc<Executor>,
-        session_id: u64,
+    /// Clone the cached AST and substitute this portal's bound parameters into
+    /// it, with no round trip through SQL text.
+    ///
+    /// Shared by Execute and by the Describe schema probe so both derive their
+    /// schema from the same AST — the description a client is handed and the
+    /// rows that follow it should not come from two different derivations of
+    /// the statement if that can be avoided.
+    fn substituted_statements(
+        executor: &Arc<Executor>,
         cached_ast: &[sqlparser::ast::Statement],
         portal: &Portal<ParsedStatement>,
-    ) -> Result<
-        std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<Vec<ExecResult>, ExecError>> + Send + 'a>,
-        >,
-        (),
-    > {
+    ) -> Vec<sqlparser::ast::Statement> {
         let param_count = portal.parameter_len();
         let mut param_values = Vec::with_capacity(param_count);
 
@@ -1279,8 +1342,28 @@ impl NucleusHandler {
         for stmt in &mut statements {
             crate::executor::param_subst::substitute_params_in_stmt(stmt, &param_values);
         }
+        statements
+    }
 
-        Ok(executor.execute_statements_with_session(session_id, statements))
+    /// Execute using the cached AST with parameter substitution.
+    #[allow(clippy::type_complexity)]
+    fn try_ast_execute<'a>(
+        executor: &'a Arc<Executor>,
+        session_id: u64,
+        cached_ast: &[sqlparser::ast::Statement],
+        portal: &Portal<ParsedStatement>,
+    ) -> Result<
+        std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<ExecResult>, ExecError>> + Send + 'a>,
+        >,
+        (),
+    > {
+        let statements = Self::substituted_statements(executor, cached_ast, portal);
+        Ok(executor.execute_statements_with_session(
+            session_id,
+            statements,
+            portal.statement.statement.plan_cache_key.clone(),
+        ))
     }
 
     /// Convert a postgres text parameter to a Nucleus Value based on the type hint.
@@ -1961,7 +2044,7 @@ impl ExtendedQueryHandler for NucleusHandler {
         // Try to determine result columns by examining the query.
         // For SELECT statements, we can execute with dummy values to get the
         // schema. For non-SELECT statements, return no data.
-        let fields = if is_select_query(sql) {
+        let fields = if statement_returns_rows(stmt.statement.ast.as_deref(), sql) {
             // Statement-level Describe happens BEFORE Bind, so placeholders
             // are unbound. Probe with NULL in their place — NULL comparisons
             // yield no rows but the result SCHEMA is identical, which is all
@@ -1986,6 +2069,9 @@ impl ExtendedQueryHandler for NucleusHandler {
             describe_returning_fields(stmt.statement.ast.as_deref(), &self.executor, None)
         };
 
+        // Statement-level Describe: parameters are not bound yet, so any column
+        // named after an expression containing one is provisionally named.
+        self.record_described_fields(client, &stmt.statement.sql, &fields, true)?;
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
 
@@ -2002,20 +2088,39 @@ impl ExtendedQueryHandler for NucleusHandler {
     {
         let sql = &portal.statement.statement.sql;
 
-        let fields = if is_select_query(sql) {
-            // With bound parameters available, we can try to determine columns
-            // more accurately by substituting and executing.
-            let substituted =
-                Self::substitute_parameters_with_executor(sql, portal, Some(&self.executor))?;
+        let fields = if statement_returns_rows(portal.statement.statement.ast.as_deref(), sql) {
             let session_id = self.session_id_from_client(client)?;
-            match self
-                .describe_select_columns(
-                    session_id,
-                    &substituted,
-                    Some(&portal.result_column_format),
-                )
-                .await
-            {
+            let formats = Some(&portal.result_column_format);
+            // Prefer the AST Execute will use: clone the cached statement and
+            // substitute the bound parameters into it, exactly as
+            // `try_ast_execute` does. Describing off a re-rendered SQL STRING
+            // meant the description and the rows came from two different
+            // renderings of one statement — and cost a second parse on the
+            // hottest path a driver has.
+            //
+            // Statements naming a side-effecting function are described
+            // statically instead, and that analysis reads text, so those keep
+            // the string path. `mentions_side_effecting_fn` runs on the
+            // unsubstituted SQL: a parameter VALUE that happens to spell a
+            // function call is data, not a call.
+            let cached_ast = portal.statement.statement.ast.as_deref();
+            let cols = match cached_ast {
+                Some(ast) if !mentions_side_effecting_fn(sql) => {
+                    let stmts = Self::substituted_statements(&self.executor, ast, portal);
+                    self.describe_probe_columns(session_id, stmts, formats)
+                        .await
+                }
+                _ => {
+                    let substituted = Self::substitute_parameters_with_executor(
+                        sql,
+                        portal,
+                        Some(&self.executor),
+                    )?;
+                    self.describe_select_columns(session_id, &substituted, formats)
+                        .await
+                }
+            };
+            match cols {
                 Ok(cols) => cols,
                 Err(e) => {
                     tracing::warn!("Failed to describe SELECT columns: {e}");
@@ -2030,6 +2135,7 @@ impl ExtendedQueryHandler for NucleusHandler {
             )
         };
 
+        self.record_described_fields(client, &portal.statement.statement.sql, &fields, false)?;
         Ok(DescribePortalResponse::new(fields))
     }
 
@@ -2126,15 +2232,12 @@ impl ExtendedQueryHandler for NucleusHandler {
         // AST fast path: if we have a cached AST, substitute parameters directly
         // in the AST and execute without re-parsing.
         let results = if let Some(ref cached_ast) = parsed_stmt.ast {
-            // Pre-populate the plan cache key hint from the Parse phase so that
-            // execute_query() can look up cached plans without the expensive
-            // query.to_string() + normalize_sql_for_cache() round-trip.
-            if let Some(ref key) = parsed_stmt.plan_cache_key {
-                // Named session, not the ambient one: this runs before the
-                // session scope is entered.
-                self.executor
-                    .set_plan_cache_key_hint_for(session_id, key.clone());
-            }
+            // The plan-cache key from the Parse phase rides INTO the executor
+            // as an argument (see `try_ast_execute`), so `execute_query()` can
+            // skip the expensive query.to_string() + normalize_sql_for_cache()
+            // round-trip. It used to be dropped in the session's hint slot here
+            // and picked up later; anything else that reached the executor in
+            // between picked it up instead.
             match Self::try_ast_execute(&self.executor, session_id, cached_ast, portal) {
                 Ok(fut) => fut.await.map_err(exec_error_to_pgwire),
                 Err(_) => {
@@ -2181,6 +2284,7 @@ impl ExtendedQueryHandler for NucleusHandler {
             // result set has exactly n rows. Handing pgwire the full set lets it
             // do the suspension it already implements correctly.
             let _ = max_rows;
+            self.reconcile_described_fields(session_id, &parsed_stmt.sql, &result)?;
             let bytes_est = Self::estimate_result_bytes(&result);
             if bytes_est > 0 {
                 self.executor.metrics().bytes_sent.inc_by(bytes_est);
@@ -2333,7 +2437,7 @@ impl CopyHandler for NucleusHandler {
                 .copy_insert_statement(&state.table, state.columns.as_deref(), rows)
                 .map_err(exec_error_to_pgwire)?;
             self.executor
-                .execute_statements_with_session(state.session_id, vec![statement])
+                .execute_statements_with_session(state.session_id, vec![statement], None)
                 .await
                 .map_err(exec_error_to_pgwire)?;
         }
@@ -2375,6 +2479,7 @@ impl NucleusHandler {
     pub fn cleanup_session(&self, peer_addr: &str) {
         if let Some(session_id) = self.session_registry.write().remove(peer_addr) {
             self.executor.drop_session(session_id);
+            self.described_fields.write().remove(&session_id);
         }
         self.sasl_registry.write().remove(peer_addr);
         // Clean up any dangling COPY state from abrupt disconnects.
@@ -2825,25 +2930,151 @@ impl NucleusHandler {
         self.compressor.decompress_if_needed(data, is_compressed)
     }
 
-    /// Try to determine the result columns for a SELECT query.
+    /// Remember the row description just handed to this session, with the SQL
+    /// it describes.
+    fn record_described_fields<C>(
+        &self,
+        client: &C,
+        sql: &str,
+        fields: &[FieldInfo],
+        names_provisional: bool,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo,
+    {
+        let session_id = self.session_id_from_client(client)?;
+        let record = DescribedFields {
+            sql: sql.to_owned(),
+            names_provisional,
+            columns: fields
+                .iter()
+                .map(|f| (f.name().to_string(), f.datatype().clone()))
+                .collect(),
+        };
+        self.described_fields.write().insert(session_id, record);
+        Ok(())
+    }
+
+    /// Refuse to stream DataRows that the description already sent does not
+    /// describe.
     ///
-    /// This executes a `LIMIT 0` version of the query to retrieve schema
-    /// information without actually fetching data. Falls back to an empty
-    /// column list on any error.
+    /// In the extended protocol the RowDescription comes from Describe and the
+    /// DataRows come from Execute — two separate derivations of one statement's
+    /// schema. When they disagree the client cannot tell: a description that is
+    /// too narrow makes a positional reader index past the end of its field
+    /// list, and one that is too wide, or merely misnamed, decodes a valid row
+    /// into a row with fields missing and NOTHING is reported anywhere. That
+    /// silent half is the dangerous one — it has already turned a live work
+    /// queue into one that reported nothing was due.
+    ///
+    /// `zero_row_probe` removes the known ways the two derivations can diverge.
+    /// This check makes the whole CLASS non-silent: any future divergence,
+    /// whatever produces it, becomes an error the client sees instead of rows
+    /// it will decode wrongly. It compares only what the client decodes with —
+    /// column names, order, count and advertised type — and only when the
+    /// recorded description belongs to the statement now executing, so a client
+    /// that describes one statement and executes another is left alone rather
+    /// than failed on a stale record.
+    fn reconcile_described_fields(
+        &self,
+        session_id: u64,
+        sql: &str,
+        result: &ExecResult,
+    ) -> PgWireResult<()> {
+        let columns: &[(String, DataType)] = match result {
+            ExecResult::Select { columns, .. } => columns,
+            ExecResult::SelectStream { columns, .. } => columns,
+            // Nothing row-shaped follows, so there is nothing to decode wrongly.
+            _ => return Ok(()),
+        };
+        let guard = self.described_fields.read();
+        let Some(record) = guard.get(&session_id) else {
+            return Ok(());
+        };
+        if record.sql != sql {
+            return Ok(());
+        }
+        let described = &record.columns;
+        // COUNT is the only thing whose disagreement guarantees the client
+        // decodes wrongly: too few fields and a positional reader runs off the
+        // end of its list, too many and it silently drops the columns it was
+        // never told about. That is a hard refusal.
+        //
+        // A same-count difference in NAME or advertised TYPE still puts every
+        // value in the right slot, so it is reported and let through rather
+        // than turned into a failed statement — except for a name difference
+        // under a description whose names were not provisional, which is the
+        // silent-relabel case and has no benign reading.
+        let count_matches = described.len() == columns.len();
+        let names_match = count_matches
+            && described
+                .iter()
+                .zip(columns.iter())
+                .all(|((dn, _), (cn, _))| dn == cn);
+        let types_match = count_matches
+            && described
+                .iter()
+                .zip(columns.iter())
+                .all(|((_, dt), (_, ct))| *dt == data_type_to_pg(ct));
+        if names_match && types_match {
+            return Ok(());
+        }
+        let names_provisional = record.names_provisional;
+        let described_cols: Vec<String> = described
+            .iter()
+            .map(|(n, t)| format!("{n}:{}", t.oid()))
+            .collect();
+        drop(guard);
+        let actual_cols: Vec<String> = columns
+            .iter()
+            .map(|(n, t)| format!("{n}:{}", data_type_to_pg(t).oid()))
+            .collect();
+        if count_matches && (names_match || names_provisional) {
+            tracing::warn!(
+                sql,
+                described = ?described_cols,
+                actual = ?actual_cols,
+                "row description disagrees with the rows it precedes on column                  name or type"
+            );
+            return Ok(());
+        }
+        tracing::error!(
+            sql,
+            described = ?described_cols,
+            actual = ?actual_cols,
+            "row description does not describe the rows it precedes"
+        );
+        Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_owned(),
+            "XX000".to_owned(), // internal_error
+            format!(
+                "row description mismatch: this statement was described as \
+                 {described_cols:?} but produced {actual_cols:?}; refusing to \
+                 send rows a client would decode against the wrong columns"
+            ),
+        ))))
+    }
+
+    /// Try to determine the result columns for a row-returning statement.
+    ///
+    /// Executes a ZERO-ROW version of the statement to retrieve schema
+    /// information without fetching data. Falls back to an empty column list
+    /// on any error.
     ///
     /// Statements that invoke side-effecting scalar functions are described
-    /// STATICALLY instead: `LIMIT 0` does not stop projection evaluation, so
-    /// probe-executing `SELECT KV_SETNX(...)` here fired the write at
+    /// STATICALLY instead: a zero-row cap does not stop projection evaluation,
+    /// so probe-executing `SELECT KV_SETNX(...)` here fired the write at
     /// Describe time and again at Execute — the client's Execute then saw
     /// the second evaluation (KV_SETNX false with the key actually set).
     ///
     /// The probe runs on the describing CLIENT's session. And on ANY probe
-    /// failure — including the parse failure a statement already ending in
-    /// its own LIMIT produces (`… LIMIT 5 LIMIT 0` is invalid SQL) — no
-    /// fields are returned and nothing else executes: the former fallback
-    /// executed the ORIGINAL statement here, running side effects at
+    /// failure no fields are returned and nothing else executes: the former
+    /// fallback executed the ORIGINAL statement here, running side effects at
     /// Describe time under session 0, the bootstrap superuser, outside the
     /// client's identity and RLS.
+    ///
+    /// The cap is applied to the parsed statement, never to its text — see
+    /// [`zero_row_probe`] for why that distinction is the whole bug.
     async fn describe_select_columns(
         &self,
         session_id: u64,
@@ -2856,8 +3087,27 @@ impl NucleusHandler {
             return Ok(fields);
         }
 
-        let probe_sql = format!("{trimmed} LIMIT 0");
-        let result = match self.execute_sql_session(session_id, &probe_sql).await {
+        // Parse through the AST cache — the Describe path runs on every
+        // parameterized query a driver sends, so it must not pay a full parse.
+        let Ok((stmts, _)) = self.executor.parse_with_ast_cache_keyed(trimmed) else {
+            return Ok(Vec::new());
+        };
+        self.describe_probe_columns(session_id, stmts, formats)
+            .await
+    }
+
+    /// Derive the row description for an already-parsed statement by executing
+    /// it capped at zero rows. See [`zero_row_probe`].
+    async fn describe_probe_columns(
+        &self,
+        session_id: u64,
+        stmts: Vec<sqlparser::ast::Statement>,
+        formats: Option<&Format>,
+    ) -> Result<Vec<FieldInfo>, PgWireError> {
+        let Some(probe) = zero_row_probe(stmts) else {
+            return Ok(Vec::new());
+        };
+        let result = match self.execute_statements_session(session_id, probe).await {
             Ok(r) => r,
             Err(_) => return Ok(Vec::new()),
         };
@@ -4187,6 +4437,85 @@ fn mark_param(expr: &sqlparser::ast::Expr, ty: Type, out: &mut [Option<Type>]) {
 }
 
 /// Check if a SQL string is a SELECT query (or similar data-returning query).
+/// Cap a parsed statement at zero rows so it can be executed as a schema probe.
+///
+/// Returns `None` when this statement has no row description to derive.
+///
+/// The cap is applied to the PARSED statement; the probe is never produced by
+/// appending text, and that distinction is the entire point of this function.
+///
+/// Appending `" LIMIT 0"` is what this replaces, and it desynchronized the
+/// RowDescription from the DataRows for a large, ordinary class of SQL. Three
+/// families, all reproduced against a running server:
+///
+/// - The probe stopped parsing. `… LIMIT 5 LIMIT 0`, `… FOR UPDATE LIMIT 0`
+///   and `… FETCH FIRST 2 ROWS ONLY LIMIT 0` are not SQL, so the probe failed
+///   and Describe answered with ZERO fields while Execute streamed full-width
+///   DataRows underneath it. A client indexing its field list positionally
+///   (node-postgres, `result.js`) throws on the first column; one that reads by
+///   name sees an object with nothing in it.
+/// - The probe parsed as a DIFFERENT statement. `SHOW transaction_isolation`
+///   became `SHOW transaction_isolation LIMIT 0`, a variable named
+///   `transaction_isolation.LIMIT`, and the client was handed that as the
+///   column name for a correctly-valued row — a silent relabel, no error
+///   anywhere.
+/// - The cap was swallowed. A statement ending in a `--` comment absorbed the
+///   appended text, so the "zero-row" probe executed the whole query.
+///
+/// Structural capping removes all three at once: whatever the statement's
+/// spelling, the probe is the same statement with its row cap set to zero.
+fn zero_row_probe(
+    mut stmts: Vec<sqlparser::ast::Statement>,
+) -> Option<Vec<sqlparser::ast::Statement>> {
+    use sqlparser::ast::{Expr, LimitClause, Statement, Value};
+
+    if stmts.len() != 1 {
+        // A multi-statement text has no single row description. Describing the
+        // first statement's columns over the last statement's rows is exactly
+        // the desync this function exists to prevent.
+        return None;
+    }
+    match stmts.remove(0) {
+        Statement::Query(mut q) => {
+            q.limit_clause = Some(LimitClause::LimitOffset {
+                limit: Some(Expr::Value(Value::Number("0".into(), false).into())),
+                offset: None,
+                limit_by: Vec::new(),
+            });
+            // FETCH and FOR UPDATE would both fight the cap: FETCH is a second
+            // row limit, and a lock has no business being taken by a schema
+            // probe that returns no rows.
+            q.fetch = None;
+            q.locks.clear();
+            Some(vec![Statement::Query(q)])
+        }
+        // Row-returning statements whose grammar has nowhere to put a cap. They
+        // are read-only and return at most a handful of rows, so the probe runs
+        // them unchanged — which is strictly what the text-append path could
+        // not do.
+        stmt @ Statement::ShowVariable { .. } => Some(vec![stmt]),
+        _ => None,
+    }
+}
+
+/// Whether this statement is described by probing for its row schema.
+///
+/// Decided on the PARSED statement when one is available. The text-prefix test
+/// below is a fallback for statements that never parsed, and on its own it was
+/// wrong in both directions: `(SELECT …)` and `/* comment */ SELECT …` are
+/// row-returning and did not start with `SELECT`, so both were routed to the
+/// RETURNING-clause describer and answered with zero fields while Execute sent
+/// their rows.
+fn statement_returns_rows(ast: Option<&[sqlparser::ast::Statement]>, sql: &str) -> bool {
+    match ast {
+        Some([stmt]) => matches!(
+            stmt,
+            sqlparser::ast::Statement::Query(_) | sqlparser::ast::Statement::ShowVariable { .. }
+        ),
+        _ => is_select_query(sql),
+    }
+}
+
 fn is_select_query(sql: &str) -> bool {
     let trimmed = sql.trim().to_uppercase();
     trimmed.starts_with("SELECT")
