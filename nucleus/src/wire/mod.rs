@@ -2107,8 +2107,23 @@ impl ExtendedQueryHandler for NucleusHandler {
             let cols = match cached_ast {
                 Some(ast) if !mentions_side_effecting_fn(sql) => {
                     let stmts = Self::substituted_statements(&self.executor, ast, portal);
-                    self.describe_probe_columns(session_id, stmts, formats)
-                        .await
+                    // Second gate, on the tree rather than the text. The scan
+                    // above cannot see through a comment placed between a
+                    // function name and its arguments; this can, and a probe
+                    // that executes a side effect is the one failure this whole
+                    // path must not have.
+                    if ast_mentions_side_effecting_fn(&stmts) {
+                        let substituted = Self::substitute_parameters_with_executor(
+                            sql,
+                            portal,
+                            Some(&self.executor),
+                        )?;
+                        self.describe_select_columns(session_id, &substituted, formats)
+                            .await
+                    } else {
+                        self.describe_probe_columns(session_id, stmts, formats)
+                            .await
+                    }
                 }
                 _ => {
                     let substituted = Self::substitute_parameters_with_executor(
@@ -4764,6 +4779,43 @@ fn statically_described_fn_type(name: &str) -> Option<DataType> {
         .or_else(|| crate::executor::extension_scalar_return_type(name))
 }
 
+/// The AST twin of [`mentions_side_effecting_fn`], and the one that decides.
+///
+/// The textual scan below looks for an identifier followed by optional
+/// WHITESPACE and then `(`. A comment sits in exactly that gap and is not
+/// whitespace, so `kv_incr /* */ ('k')` reads as a bare identifier and the
+/// statement is judged side-effect free. That hole was harmless only for as
+/// long as the probe could not parse such statements anyway: the zero-row cap
+/// used to be appended to the SQL text, `… LIMIT 1 LIMIT 0` did not parse, and
+/// the probe never ran. Applying the cap to the parsed statement fixed that
+/// desync and, in doing so, removed the accident that was standing in for this
+/// check — so Describe began EXECUTING the call, firing the side effect before
+/// the client's Execute and running it as the session that prepared it.
+///
+/// Lexical tricks are endless and the parser has already done the work, so ask
+/// the tree: a call is a call whatever sits between the name and its arguments.
+fn ast_mentions_side_effecting_fn(stmts: &[sqlparser::ast::Statement]) -> bool {
+    use sqlparser::ast::Expr;
+    use std::ops::ControlFlow;
+
+    stmts.iter().any(|stmt| {
+        sqlparser::ast::visit_expressions(stmt, |e| {
+            if let Expr::Function(f) = e {
+                // The last part is the bare name: `pg_catalog.kv_incr` and
+                // `kv_incr` are the same function to the registry.
+                if let Some(name) = f.name.0.last() {
+                    let ident = name.as_ident().map(|i| i.value.as_str()).unwrap_or_default();
+                    if statically_described_fn_type(&ident.to_ascii_uppercase()).is_some() {
+                        return ControlFlow::Break(());
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        })
+        .is_break()
+    })
+}
+
 fn mentions_side_effecting_fn(sql: &str) -> bool {
     let upper = sql.to_ascii_uppercase();
     let bytes = upper.as_bytes();
@@ -4803,10 +4855,6 @@ fn describe_static_fields(sql: &str, formats: Option<&Format>) -> Option<Vec<Fie
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
 
-    if !mentions_side_effecting_fn(sql) {
-        return None;
-    }
-
     let fallback = || {
         Some(vec![FieldInfo::new(
             "result".into(),
@@ -4817,7 +4865,23 @@ fn describe_static_fields(sql: &str, formats: Option<&Format>) -> Option<Vec<Fie
         )])
     };
 
-    let Ok(stmts) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else {
+    // Parse BEFORE deciding. The textual scan cannot see a call whose name is
+    // separated from its arguments by a comment, and this function is the only
+    // thing standing between Describe and executing that call — every caller
+    // that gets `None` here falls through to the probe, which executes. So the
+    // decision is made on the tree when there is one, and on the text only when
+    // the statement does not parse at all (where there is nothing else to ask,
+    // and the probe would fail on it anyway).
+    let parsed = Parser::parse_sql(&PostgreSqlDialect {}, sql).ok();
+    let side_effecting = mentions_side_effecting_fn(sql)
+        || parsed
+            .as_deref()
+            .is_some_and(ast_mentions_side_effecting_fn);
+    if !side_effecting {
+        return None;
+    }
+
+    let Some(stmts) = parsed else {
         return fallback();
     };
     let Some(Statement::Query(query)) = stmts.into_iter().next() else {
