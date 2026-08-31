@@ -25,6 +25,15 @@ Two facts that decide the choice:
    rejects inserts that rely on a `SERIAL` default. Use it for migration across
    format changes, never as your only backup.
 
+3. **`nucleus dump` does not work at all on a database holding a columnar
+   table.** Measured 2026-08-31 on v0.1.8 and on HEAD: the presence of a single
+   `engine = 'mergetree'` or `'replacing_mergetree'` table fails the WHOLE dump
+   with `storage error: table '<name>' not found in storage`. Isolated with a
+   control — a heap-only directory dumps fine, and adding one `mergetree` table
+   breaks it. So for any database that uses the columnar engine, the physical
+   snapshot (§1/§2) is the only backup there is, and the "logical dump" escape
+   hatch that [ROLLBACK.md §2.1](ROLLBACK.md) offers is not available.
+
 ## 1. Online backup of a running server (preferred)
 
 The running server snapshots itself; the coordination happens inside the
