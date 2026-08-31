@@ -5,6 +5,30 @@ Notable changes to the Nucleus engine. Format follows
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-31
+
+### Upgrade notes
+
+- **Upgrading to 1.0.0 is a one-way door if you use the KV model inside a SQL
+  transaction.** The on-disk page format is unchanged (`DB_FORMAT_VERSION` is
+  still 2), so the engine will *not* stop an operator putting the 0.1.8 binary
+  back — and [`ROLLBACK.md`](docs/runbooks/ROLLBACK.md) tells you to try exactly
+  that first. Do not, without reading the next paragraph.
+
+  S63 gave the KV write-ahead log four transaction-tagged record types
+  (`0x06`-`0x09`), written only when a KV mutation participates in a
+  coordinating SQL transaction; a KV write outside one still appends the legacy
+  untagged record, which 0.1.8 reads correctly. 0.1.8's replay has no case for
+  the new tags and its fallthrough is `RecordStep::Stop` — it treats the first
+  tagged record as the end of the log and **silently discards every KV record
+  after it**. No error, no warning, and the SQL side opens fine, so the loss is
+  invisible until someone reads a missing key.
+
+  A physical snapshot taken under 0.1.8 still restores into 1.0.0 (the format
+  version governs compatibility, and it did not move), so the pre-upgrade backup
+  remains the honest way back. Take one. The intended path from 1.0.0 is to fix
+  forward.
+
 ### Fixed
 
 - **The RowDescription a client received did not always describe the DataRows

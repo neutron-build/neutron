@@ -20,6 +20,28 @@ If you do not know, try §1 first: the old binary **refuses** to open a
 newer-format directory rather than corrupting it, so a failed §1 costs you a
 restart, not your data.
 
+## Exception: 1.0.0 → 0.1.8 is not a binary swap
+
+That "try §1 first" advice is safe only because the format version is the thing
+that changes when the on-disk layout changes. Once, it wasn't.
+
+1.0.0 kept `DB_FORMAT_VERSION` at 2 — the page format genuinely did not move —
+while S63 added four transaction-tagged record types to the **KV write-ahead
+log**. 0.1.8 has no case for those tags and its replay fallthrough is
+`RecordStep::Stop`, so it reads the first tagged record as end-of-log and
+silently drops every KV record after it. The version check cannot catch this:
+the number it compares did not change.
+
+Tagged records appear only where a KV mutation runs inside a coordinating SQL
+transaction. If nothing in your workload does that, §1 is safe. If you are not
+certain it doesn't, treat this as §2 and restore the pre-upgrade snapshot — a
+0.1.8 physical snapshot restores into either build, because the format version
+is what governs that.
+
+The general lesson, which applies to the next release too: **§1 is only sound
+when no on-disk vocabulary changed without the format version changing.** Check
+that, not just the constant.
+
 ## 1. Same format version — binary swap
 
 ```bash

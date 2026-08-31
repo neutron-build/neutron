@@ -1566,16 +1566,20 @@ async fn computed_vector_columns_describe_their_real_type() {
         .unwrap();
     assert_eq!(*stmt.columns()[0].type_(), Type::INT4);
 
-    // The shape every SDK's vector search actually sends. WIR-6 removed the
-    // Describe fallback that executed the original statement when the
-    // LIMIT-0 probe failed to parse: this query ends in `LIMIT $3`, the
-    // NULL-substituted probe becomes `… LIMIT NULL LIMIT 0`, and re-running
-    // the original is exactly the execute-at-Describe behavior the removal
-    // forbids (it fired side effects and ran as session 0, the bootstrap
-    // superuser). The trade is deliberate and escalated: a statement whose
-    // probe cannot parse now describes ZERO columns — clients that need
-    // typed describes for trailing-LIMIT statements need a smarter probe
-    // strategy, which is a behavior decision, not a patch.
+    // The shape every SDK's vector search actually sends. This is the
+    // "smarter probe strategy" WIR-6 said was needed and deferred.
+    //
+    // WIR-6 applied the zero-row cap by appending `" LIMIT 0"` to the SQL
+    // *text*, so this statement — which ends in its own `LIMIT $3` — produced
+    // `… LIMIT NULL LIMIT 0`, which does not parse. Rather than fall back to
+    // executing the original at Describe (a real side-effect hazard: it ran as
+    // session 0, the bootstrap superuser), WIR-6 took the escalated trade and
+    // described ZERO columns.
+    //
+    // The cap is now applied to the parsed statement instead of its text, so
+    // there is no unparseable probe to fall back from and no trade left to
+    // make: the columns are described, and nothing is executed at Describe.
+    // A client reading these fields positionally used to throw here.
     let stmt = client
         .prepare(
             "SELECT id, VECTOR_DISTANCE(embedding, VECTOR($1), $2) AS score, metadata \
@@ -1585,9 +1589,19 @@ async fn computed_vector_columns_describe_their_real_type() {
         .unwrap();
     assert_eq!(
         stmt.columns().len(),
-        0,
-        "an unparseable probe must not fall back to executing the original at Describe"
+        3,
+        "a trailing-LIMIT statement must describe the rows Execute will send"
     );
+    // A TEXT column describes as VARCHAR — Nucleus's long-standing wire
+    // mapping, unchanged here, and indistinguishable to a client.
+    assert_eq!(*stmt.columns()[0].type_(), Type::VARCHAR);
+    assert_eq!(
+        *stmt.columns()[1].type_(),
+        Type::FLOAT8,
+        "score described as {:?}",
+        stmt.columns()[1].type_()
+    );
+    assert_eq!(*stmt.columns()[2].type_(), Type::JSONB);
 
     server.abort();
 }

@@ -122,7 +122,10 @@ jobs:
           assert bom["specVersion"] == "1.5", bom["specVersion"]
           comps = bom.get("components", [])
           assert len(comps) > 200, f"only {len(comps)} components — graph looks truncated"
-          assert bom["metadata"]["component"]["name"] == "nucleus"
+          # The crate publishes as `nucleusdb` — bare `nucleus` is taken on
+          # crates.io. The lib and binary are still named `nucleus`; only the
+          # package name, which is what the SBOM describes, differs.
+          assert bom["metadata"]["component"]["name"] == "nucleusdb", bom["metadata"]["component"]["name"]
           missing = [c["name"] for c in comps if not c.get("hashes")]
           print(f"{len(comps)} components, {len(missing)} without hashes")
           PY
