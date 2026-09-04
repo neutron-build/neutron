@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"mime"
 	"net/smtp"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -25,6 +26,10 @@ type Outgoing struct {
 	Text    string
 	HTML    string
 
+	// Attachments are carried as multipart/mixed parts after the body.
+	// Callers sanitize nothing; render() strips anything header-hostile.
+	Attachments []Attachment
+
 	// InReplyTo is the Message-ID of the message being answered. Setting it
 	// is what makes a reply thread in the recipient's client rather than
 	// starting a new conversation.
@@ -33,6 +38,13 @@ type Outgoing struct {
 	// References is the parent's References chain plus its Message-ID.
 	// ReplyTo populates this correctly; setting it by hand is rarely right.
 	References []string
+}
+
+// Attachment is one binary file carried by an outgoing message.
+type Attachment struct {
+	Filename    string
+	ContentType string // empty falls back to application/octet-stream
+	Data        []byte
 }
 
 // SMTPConfig describes the submission server.
@@ -132,6 +144,14 @@ func (s *Sender) Send(ctx context.Context, msg *Outgoing) (messageID string, err
 	return messageID, nil
 }
 
+// Render builds the complete RFC 5322 bytes for this message with a freshly
+// minted Message-ID. Callers that submit raw MIME to a provider API (Gmail's
+// raw upload, JMAP) get the same multipart/alternative handling as SMTP,
+// including an HTML part when set.
+func (msg *Outgoing) Render() ([]byte, error) {
+	return msg.render(newMessageID(msg.From.Email))
+}
+
 // render builds the RFC 5322 message.
 func (msg *Outgoing) render(messageID string) ([]byte, error) {
 	var b strings.Builder
@@ -163,11 +183,54 @@ func (msg *Outgoing) render(messageID string) ([]byte, error) {
 		}
 	}
 
+	// The body part is rendered first so it can nest unchanged inside a
+	// multipart/mixed wrapper when attachments exist.
+	bodyPart, err := msg.renderBodyPart()
+	if err != nil {
+		return nil, err
+	}
+	if len(msg.Attachments) == 0 {
+		b.WriteString(bodyPart)
+		return []byte(b.String()), nil
+	}
+
+	mixedBoundary, err := newBoundary()
+	if err != nil {
+		return nil, err
+	}
+	b.WriteString("Content-Type: multipart/mixed; boundary=\"" + mixedBoundary + "\"\r\n\r\n")
+	b.WriteString("This is a multi-part message in MIME format.\r\n")
+	b.WriteString("--" + mixedBoundary + "\r\n")
+	b.WriteString(bodyPart)
+	for _, att := range msg.Attachments {
+		b.WriteString("--" + mixedBoundary + "\r\n")
+		b.WriteString("Content-Type: " + sanitizeMIMEValue(att.ContentType, "application/octet-stream") + "\r\n")
+		b.WriteString("Content-Disposition: attachment; filename=\"" + sanitizeFilename(att.Filename) + "\"\r\n")
+		b.WriteString("Content-Transfer-Encoding: base64\r\n\r\n")
+		enc := base64.StdEncoding.EncodeToString(att.Data)
+		for i := 0; i < len(enc); i += 76 {
+			end := i + 76
+			if end > len(enc) {
+				end = len(enc)
+			}
+			b.WriteString(enc[i:end])
+			b.WriteString("\r\n")
+		}
+	}
+	b.WriteString("--" + mixedBoundary + "--\r\n")
+
+	return []byte(b.String()), nil
+}
+
+// renderBodyPart renders the textual body (plain, html, or alternative) as a
+// self-contained MIME part: its own Content-Type header plus content.
+func (msg *Outgoing) renderBodyPart() (string, error) {
+	var b strings.Builder
 	switch {
 	case msg.HTML != "" && msg.Text != "":
 		boundary, err := newBoundary()
 		if err != nil {
-			return nil, err
+			return "", err
 		}
 		b.WriteString("Content-Type: multipart/alternative; boundary=\"" + boundary + "\"\r\n\r\n")
 		// Least-rich part first: a client picks the last part it can
@@ -188,8 +251,48 @@ func (msg *Outgoing) render(messageID string) ([]byte, error) {
 		b.WriteString("Content-Type: text/plain; charset=utf-8\r\n\r\n")
 		b.WriteString(msg.Text + "\r\n")
 	}
+	return b.String(), nil
+}
 
-	return []byte(b.String()), nil
+// sanitizeMIMEValue strips header-hostile bytes and falls back to def when
+// empty. ContentType values must be a clean type/subtype token; anything
+// that does not survive cleaning intact falls back rather than shipping a
+// mangled value.
+func sanitizeMIMEValue(value, def string) string {
+	value = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || r == '\r' || r == '\n' || r == '"' {
+			return -1
+		}
+		return r
+	}, strings.TrimSpace(value))
+	if !mimeTokenRe.MatchString(value) {
+		return def
+	}
+	return value
+}
+
+var mimeTokenRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9!#$&^_.+-]*/[a-zA-Z0-9][a-zA-Z0-9!#$&^_.+-]*$`)
+
+// sanitizeFilename reduces an attachment name to something safe to quote in
+// a Content-Disposition header: no control characters, quotes, slashes, or
+// backslashes, basename only, capped length, with a fallback name.
+func sanitizeFilename(name string) string {
+	name = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || r == '"' || r == '\'' || r == '\\' || r == '/' || r == ':' {
+			return -1
+		}
+		return r
+	}, name)
+	if i := strings.LastIndexByte(name, '.'); i > 0 && i == len(name)-1 {
+		name = name[:i]
+	}
+	if len(name) > 200 {
+		name = name[len(name)-200:]
+	}
+	if strings.TrimSpace(name) == "" {
+		name = "attachment"
+	}
+	return name
 }
 
 // newMessageID mints an RFC 5322 Message-ID.
