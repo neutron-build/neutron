@@ -300,8 +300,6 @@ impl super::Executor {
         table_def: &crate::catalog::TableDef,
         row: &[Value],
     ) -> Vec<GateKey> {
-        use crate::catalog::TableConstraint;
-
         // ReplacingMergeTree keeps multiple versions per key on purpose.
         if crate::columnar::replacing_config(table_name).is_some() {
             return Vec::new();
@@ -310,20 +308,13 @@ impl super::Executor {
             return Vec::new();
         }
 
+        // `unique_col_sets` enumerates constraints first (in declaration
+        // order) and then UNIQUE indexes, so its position doubles as a stable
+        // per-table discriminator: a constraint keeps the slot id it always
+        // had, and an index gets one past the constraint range that no
+        // constraint can reach.
         let mut slots = Vec::new();
-        for (cid, constraint) in table_def.constraints.iter().enumerate() {
-            let columns = match constraint {
-                TableConstraint::PrimaryKey { columns, .. }
-                | TableConstraint::Unique { columns, .. } => columns,
-                _ => continue,
-            };
-            let indices: Vec<usize> = columns
-                .iter()
-                .filter_map(|c| table_def.column_index(c))
-                .collect();
-            if indices.len() != columns.len() {
-                continue;
-            }
+        for (cid, indices) in self.unique_col_sets(table_name, table_def).into_iter().enumerate() {
             let key: Vec<Value> = indices
                 .iter()
                 .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))

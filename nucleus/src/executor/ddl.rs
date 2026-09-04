@@ -631,6 +631,7 @@ impl Executor {
     pub async fn rebuild_persistent_indexes(&self) {
         let started = std::time::Instant::now();
         let mut rebuilt = 0usize;
+        let mut unique = 0usize;
         let mut failed = 0usize;
         for table in self.catalog.table_names().await {
             let Some(table_def) = self.catalog.get_table(&table).await else {
@@ -658,6 +659,17 @@ impl Executor {
                     Ok(()) => {
                         self.btree_indexes
                             .insert((table.clone(), column.clone()), index.name.clone());
+                        // `IndexDef.unique` round-trips through catalog.json
+                        // but nothing re-asserted it here, so the reopened
+                        // process rebuilt the B-tree and enforcement silently
+                        // depended on whichever catalogue happened to be
+                        // loaded. Count it explicitly: a UNIQUE index that
+                        // comes back as anything else is a durability bug we
+                        // want visible in the startup log, not a silent
+                        // degradation to a plain index.
+                        if index.unique {
+                            unique += 1;
+                        }
                         rebuilt += 1;
                     }
                     Err(e) => {
@@ -677,7 +689,7 @@ impl Executor {
         if rebuilt > 0 || failed > 0 {
             tracing::info!(
                 target: "nucleus::startup",
-                "rebuilt {rebuilt} storage index(es) in {:.1}s ({failed} failed)",
+                "rebuilt {rebuilt} storage index(es) in {:.1}s ({unique} unique, {failed} failed)",
                 started.elapsed().as_secs_f64()
             );
         }
@@ -2401,6 +2413,43 @@ impl Executor {
             Some(col) => self.column_analyzer(&table_name, col).await,
             None => crate::fts::Analyzer::default(),
         };
+
+        // A UNIQUE index is a promise about rows already in the table as much
+        // as about rows to come. Building it over duplicates and enforcing it
+        // only on later writes leaves a table that permanently violates its
+        // own declared constraint — and that nothing can repair, because every
+        // future statement trips over a duplicate it did not create. Refuse
+        // here, before any index state or catalog entry is registered, so a
+        // refused index leaves no trace.
+        if create_index.unique {
+            let indices: Vec<usize> = columns
+                .iter()
+                .filter_map(|c| table_def.column_index(c))
+                .collect();
+            if indices.len() == columns.len() {
+                let mut seen: std::collections::HashSet<Vec<Value>> = HashSet::new();
+                for row in self.storage_for(&table_name).scan(&table_name).await? {
+                    let key: Vec<Value> =
+                        indices.iter().map(|&i| row[i].clone()).collect();
+                    // NULL is never equal to NULL, so repeated NULLs are legal.
+                    if key.iter().any(|v| matches!(v, Value::Null)) {
+                        continue;
+                    }
+                    if !seen.insert(key.clone()) {
+                        let cols = columns.join(", ");
+                        let vals = key
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(ExecError::ConstraintViolation(format!(
+                            "could not create unique index \"{index_name}\" on \
+                             \"{table_name}\" ({cols}): key ({vals}) is duplicated"
+                        )));
+                    }
+                }
+            }
+        }
 
         // Register the index in the catalog
         let index_def = crate::catalog::IndexDef {
