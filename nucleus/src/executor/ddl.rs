@@ -3878,20 +3878,27 @@ impl Executor {
                     let constraint_name = name.to_string();
                     let mut updated = (*table_def).clone();
                     let original_len = updated.constraints.len();
-                    let removed_unique_columns =
-                        updated
-                            .constraints
-                            .iter()
-                            .find_map(|constraint| match constraint {
-                                crate::catalog::TableConstraint::PrimaryKey { name, columns }
-                                | crate::catalog::TableConstraint::Unique { name, columns }
-                                    if name.as_deref() == Some(constraint_name.as_str()) =>
-                                {
-                                    Some(columns.clone())
-                                }
-                                _ => None,
-                            });
-                    if let Some(columns) = &removed_unique_columns {
+                    // `(is_primary_key, columns)` for the PRIMARY KEY / UNIQUE
+                    // constraint being dropped — the only kinds that carry a
+                    // backing index. The flag selects that index's implicit
+                    // name, which is derived from the *table*, not from the
+                    // constraint's own name.
+                    let removed_unique_columns = updated.constraints.iter().find_map(|constraint| {
+                        match constraint {
+                            crate::catalog::TableConstraint::PrimaryKey { name, columns }
+                                if name.as_deref() == Some(constraint_name.as_str()) =>
+                            {
+                                Some((true, columns.clone()))
+                            }
+                            crate::catalog::TableConstraint::Unique { name, columns }
+                                if name.as_deref() == Some(constraint_name.as_str()) =>
+                            {
+                                Some((false, columns.clone()))
+                            }
+                            _ => None,
+                        }
+                    });
+                    if let Some((_, columns)) = &removed_unique_columns {
                         let dependent = self.catalog.list_tables().await.into_iter().any(|table| {
                             table.constraints.iter().any(|constraint| {
                                 matches!(
@@ -3934,16 +3941,36 @@ impl Executor {
                         // IF EXISTS: silently succeed
                     } else {
                         self.catalog.update_table(updated).await?;
-                        // Drop any backing index that matches the constraint name.
-                        if let Err(_e) = self.catalog.drop_index(&constraint_name).await {
-                            // Index may not exist (e.g., CHECK constraints have no backing index).
+                        // Drop the backing index the constraint created.
+                        //
+                        // `create_implicit_unique_indexes` names that index
+                        // after the table — `{table}_pkey` for a PRIMARY KEY,
+                        // `{table}_{cols}_key` for a UNIQUE — and only uses the
+                        // constraint's own name when that constraint carried
+                        // one, so a named PK's index (`t_pkey`) need not share
+                        // the constraint's name (`my_pk`). Dropping by name
+                        // alone left it behind: the catalog kept a UNIQUE index
+                        // over those columns, and `unique_col_sets` kept
+                        // enforcing a constraint the user had just dropped.
+                        // Both spellings go.
+                        let mut backing_index_names = vec![constraint_name.clone()];
+                        if let Some((is_primary_key, columns)) = &removed_unique_columns {
+                            backing_index_names.push(if *is_primary_key {
+                                format!("{table_name}_pkey")
+                            } else {
+                                format!("{}_{}_key", table_name, columns.join("_"))
+                            });
                         }
-                        self.btree_indexes
-                            .retain(|_, name| name != &constraint_name);
-                        let _ = self
-                            .storage_for(&table_name)
-                            .drop_index(&constraint_name)
-                            .await;
+                        for index_name in &backing_index_names {
+                            if let Err(_e) = self.catalog.drop_index(index_name).await {
+                                // Index may not exist (e.g., CHECK constraints have no backing index).
+                            }
+                            self.btree_indexes.retain(|_, name| name != index_name);
+                            let _ = self
+                                .storage_for(&table_name)
+                                .drop_index(index_name)
+                                .await;
+                        }
                     }
                 }
                 _ => {
