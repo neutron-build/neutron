@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/neutron-build/neutron/mail"
@@ -330,6 +331,33 @@ func TestAttachmentAcceptsABlobIDAsThePart(t *testing.T) {
 	rc.Close()
 }
 
+func TestDownloadStripsTheProviderPrefixFromIDs(t *testing.T) {
+	// Every other Email/get in this adapter sends nativeID(id). If the
+	// download path sent the prefixed form the server would find nothing.
+	var sent string
+	a := downloadAdapter(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			body, _ := io.ReadAll(r.Body)
+			sent = string(body)
+			_, _ = w.Write([]byte(`{"methodResponses":[["Email/get",{"list":[{"blobId":"b"}]},"0"]]}`))
+			return
+		}
+		_, _ = w.Write([]byte("raw"))
+	})
+
+	rc, err := a.Raw(context.Background(), "n:jmap:m1")
+	if err != nil {
+		t.Fatalf("Raw: %v", err)
+	}
+	rc.Close()
+	if strings.Contains(sent, "n:jmap:m1") {
+		t.Errorf("sent the prefixed id to the server: %s", sent)
+	}
+	if !strings.Contains(sent, `"m1"`) {
+		t.Errorf("native id missing from request: %s", sent)
+	}
+}
+
 func TestAttachmentUnknownPartIsNotFound(t *testing.T) {
 	a := downloadAdapter(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"methodResponses":[["Email/get",{"list":[{"attachments":[]}]},"0"]]}`))
@@ -352,6 +380,7 @@ func TestDownloadMapsStatusesToSharedErrors(t *testing.T) {
 		{"unauthorized", http.StatusUnauthorized, mail.ErrReauthRequired},
 		{"forbidden", http.StatusForbidden, mail.ErrReauthRequired},
 		{"missing blob", http.StatusNotFound, mail.ErrNotFound},
+		{"throttled", http.StatusTooManyRequests, mail.ErrRateLimited},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a := downloadAdapter(t, func(w http.ResponseWriter, r *http.Request) {

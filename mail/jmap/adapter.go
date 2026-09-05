@@ -625,6 +625,9 @@ func (a *Adapter) download(ctx context.Context, blobID, mimeType, name string) (
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
 		resp.Body.Close()
 		return nil, fmt.Errorf("jmap: download rejected the token: %w", mail.ErrReauthRequired)
+	case resp.StatusCode == http.StatusTooManyRequests:
+		resp.Body.Close()
+		return nil, fmt.Errorf("jmap: download throttled: %w", mail.ErrRateLimited)
 	case resp.StatusCode == http.StatusNotFound:
 		resp.Body.Close()
 		return nil, fmt.Errorf("jmap: %w: blob %s", mail.ErrNotFound, blobID)
@@ -638,7 +641,7 @@ func (a *Adapter) download(ctx context.Context, blobID, mimeType, name string) (
 func (a *Adapter) blobFor(ctx context.Context, id mail.MessageID) (string, error) {
 	res, err := a.call(ctx, [3]any{"Email/get", map[string]any{
 		"accountId":  a.accountID,
-		"ids":        []string{string(id)},
+		"ids":        []string{nativeID(id)},
 		"properties": []string{"blobId"},
 	}, "0"})
 	if err != nil {
@@ -664,7 +667,7 @@ func (a *Adapter) Raw(ctx context.Context, id mail.MessageID) (io.ReadCloser, er
 	if err != nil {
 		return nil, err
 	}
-	return a.download(ctx, blob, "message/rfc822", string(id)+".eml")
+	return a.download(ctx, blob, "message/rfc822", nativeID(id)+".eml")
 }
 
 // Attachment downloads one part of a message.
@@ -676,7 +679,7 @@ func (a *Adapter) Raw(ctx context.Context, id mail.MessageID) (io.ReadCloser, er
 func (a *Adapter) Attachment(ctx context.Context, id mail.MessageID, partID string) (io.ReadCloser, error) {
 	res, err := a.call(ctx, [3]any{"Email/get", map[string]any{
 		"accountId":  a.accountID,
-		"ids":        []string{string(id)},
+		"ids":        []string{nativeID(id)},
 		"properties": []string{"attachments"},
 	}, "0"})
 	if err != nil {
