@@ -32,6 +32,17 @@ type Scheduler struct {
 	Tokens  TokenSource
 	Resolve Resolver
 
+	// Include reports whether an account should be background-synced at
+	// all. The engine has no product concept of "paused mailbox"; the app
+	// supplies one backed by its own sync_enabled flag. Manual sync
+	// endpoints are NOT gated by this — an explicit request is explicit.
+	Include func(Account) bool
+
+	// AfterSync observes every attempted scheduled run. Applications use it
+	// to publish freshness/error state and derive product data immediately
+	// after new envelopes land instead of waiting for an unrelated timer.
+	AfterSync func(context.Context, Account, []SyncReport, error)
+
 	// Interval is how often each account is synced. Defaults to 5 minutes.
 	//
 	// Polling rather than IMAP IDLE is deliberate for the general case:
@@ -52,6 +63,12 @@ type Scheduler struct {
 	mu      sync.Mutex
 	backoff map[AccountID]time.Time
 	rng     *rand.Rand
+
+	// Wake plumbing: provider notifications deduplicate into wakePend and
+	// one signal token; the run loop serves whatever is pending.
+	wakeMu   sync.Mutex
+	wakePend map[AccountID]struct{}
+	wakeSig  chan struct{}
 }
 
 // NewScheduler builds a scheduler over an engine.
@@ -69,6 +86,8 @@ func NewScheduler(store Store, eng *Engine, adapters func(AccountID) (Adapter, b
 		Jitter:      true,
 		backoff:     map[AccountID]time.Time{},
 		rng:         rand.New(rand.NewSource(time.Now().UnixNano())),
+		wakePend:    map[AccountID]struct{}{},
+		wakeSig:     make(chan struct{}, 1),
 	}
 }
 
@@ -98,8 +117,85 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			return ctx.Err()
 		case <-ticker.C:
 			s.RunOnce(ctx)
+		case <-s.wakeSig:
+			s.runWakes(ctx)
 		}
 	}
+}
+
+// Wake asks for one off-schedule sync of an account. It exists for provider
+// change notifications (Gmail Pub/Sub, Graph webhooks, IMAP IDLE, JMAP
+// EventSource): those are lossy, duplicated hints, so a wake only schedules
+// the normal durable incremental sync — the notification payload is never
+// treated as mailbox state.
+//
+// Bursts for one account coalesce into a single pending sync, and a wake
+// arriving while that account is already syncing queues one subsequent run
+// rather than being discarded. Non-blocking, and safe before and while Run
+// is active; eligibility (Include, reauth, rate-limit backoff) is applied
+// when the wake is served, so a wake can never override the safety rules.
+func (s *Scheduler) Wake(acct AccountID) {
+	s.wakeMu.Lock()
+	if _, dup := s.wakePend[acct]; dup {
+		s.wakeMu.Unlock()
+		return
+	}
+	s.wakePend[acct] = struct{}{}
+	s.wakeMu.Unlock()
+	select {
+	case s.wakeSig <- struct{}{}:
+	default: // a token is already queued; it will drain this pending set
+	}
+}
+
+// runWakes serves pending wake-ups. Unlike a scheduled pass these respond to
+// an actual change hint, so the startup jitter is skipped; everything else
+// about a scheduled run — concurrency bound, AfterSync, failure handling —
+// is identical.
+func (s *Scheduler) runWakes(ctx context.Context) {
+	s.wakeMu.Lock()
+	pending := make([]AccountID, 0, len(s.wakePend))
+	for id := range s.wakePend {
+		pending = append(pending, id)
+	}
+	s.wakePend = map[AccountID]struct{}{}
+	s.wakeMu.Unlock()
+	if len(pending) == 0 {
+		return
+	}
+
+	accounts, err := s.store.Accounts(ctx)
+	if err != nil {
+		s.log.ErrorContext(ctx, "could not list accounts for wake", "err", err)
+		return
+	}
+	byID := make(map[AccountID]Account, len(accounts))
+	for _, a := range accounts {
+		byID[a.ID] = a
+	}
+
+	sem := make(chan struct{}, s.Concurrency)
+	var wg sync.WaitGroup
+	for _, id := range pending {
+		acct, known := byID[id]
+		if !known {
+			continue // vanished between notification and service
+		}
+		if s.Include != nil && !s.Include(acct) {
+			continue
+		}
+		if !s.eligible(acct) {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			s.syncOne(ctx, acct, true)
+		}()
+	}
+	wg.Wait()
 }
 
 // RunOnce syncs every eligible account once, respecting the concurrency bound.
@@ -115,6 +211,9 @@ func (s *Scheduler) RunOnce(ctx context.Context) {
 
 	for _, a := range accounts {
 		acct := a
+		if s.Include != nil && !s.Include(acct) {
+			continue
+		}
 		if !s.eligible(acct) {
 			continue
 		}
@@ -124,7 +223,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			s.syncOne(ctx, acct)
+			s.syncOne(ctx, acct, false)
 		}()
 	}
 	wg.Wait()
@@ -145,10 +244,13 @@ func (s *Scheduler) eligible(a Account) bool {
 	return !backingOff || time.Now().After(until)
 }
 
-func (s *Scheduler) syncOne(ctx context.Context, a Account) {
+func (s *Scheduler) syncOne(ctx context.Context, a Account, immediate bool) {
 	ad, release, err := s.adapterFor(ctx, a.ID)
 	if err != nil {
 		s.handleFailure(ctx, a.ID, err)
+		if s.AfterSync != nil {
+			s.AfterSync(ctx, a, nil, err)
+		}
 		return
 	}
 	if ad == nil {
@@ -156,7 +258,7 @@ func (s *Scheduler) syncOne(ctx context.Context, a Account) {
 	}
 	defer release()
 
-	if s.Jitter {
+	if s.Jitter && !immediate {
 		// Spread the load so many accounts on one provider do not arrive
 		// in the same instant.
 		s.mu.Lock()
@@ -172,7 +274,13 @@ func (s *Scheduler) syncOne(ctx context.Context, a Account) {
 	reports, err := s.eng.SyncAccount(ctx, a.ID, ad)
 	if err != nil {
 		s.handleFailure(ctx, a.ID, err)
+		if s.AfterSync != nil {
+			s.AfterSync(ctx, a, reports, err)
+		}
 		return
+	}
+	if s.AfterSync != nil {
+		s.AfterSync(ctx, a, reports, nil)
 	}
 
 	s.mu.Lock()

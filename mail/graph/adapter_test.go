@@ -3,6 +3,7 @@ package graph
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,12 @@ import (
 
 	"github.com/neutron-build/neutron/mail"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
 
 func serve(t *testing.T, handler http.HandlerFunc) *Adapter {
 	t.Helper()
@@ -117,6 +124,33 @@ func TestNextLinkPagesBeforeDeltaLink(t *testing.T) {
 	}
 	if changes.Next != "https://page2" {
 		t.Errorf("Next = %q, want the nextLink", changes.Next)
+	}
+}
+
+func TestMailboxesFollowsEveryNextLink(t *testing.T) {
+	var paths []string
+	a := New(&http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		paths = append(paths, r.URL.String())
+		body := `{"value":[{"id":"inbox","displayName":"Inbox","wellKnownName":"inbox"}],"@odata.nextLink":"https://graph.test/page2"}`
+		if len(paths) == 2 {
+			body = `{"value":[{"id":"archive","displayName":"Archive","wellKnownName":"archive"}]}`
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})})
+
+	boxes, err := a.Mailboxes(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(boxes) != 2 || boxes[0].ID != "inbox" || boxes[1].ID != "archive" {
+		t.Fatalf("mailboxes = %+v, want both pages", boxes)
+	}
+	if len(paths) != 2 || paths[1] != "https://graph.test/page2" {
+		t.Fatalf("requests = %v, want nextLink page", paths)
 	}
 }
 

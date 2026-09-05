@@ -19,13 +19,24 @@ import (
 
 // Adapter implements mail.Adapter over an IMAP session.
 type Adapter struct {
-	conn  *Conn
-	boxes map[mail.MailboxID]string // canonical id -> native folder name
+	conn      *Conn
+	boxes     map[mail.MailboxID]string // canonical id -> native folder name
+	locations map[mail.MessageID]location
+}
+
+type location struct {
+	box         mail.MailboxID
+	uidValidity uint32
+	uid         uint32
 }
 
 // New wraps an authenticated connection.
 func New(conn *Conn) *Adapter {
-	return &Adapter{conn: conn, boxes: map[mail.MailboxID]string{}}
+	return &Adapter{
+		conn:      conn,
+		boxes:     map[mail.MailboxID]string{},
+		locations: map[mail.MessageID]location{},
+	}
 }
 
 func (a *Adapter) Provider() mail.Provider { return mail.ProviderIMAP }
@@ -37,9 +48,10 @@ func (a *Adapter) Close() error            { return a.conn.Close() }
 // server reports a different value, every UID the mirror holds is
 // meaningless and the mailbox has to be refetched.
 type cursor struct {
-	UIDValidity uint32 `json:"uidvalidity"`
-	ModSeq      uint64 `json:"modseq,omitempty"`
-	UIDNext     uint32 `json:"uidnext,omitempty"`
+	UIDValidity uint32                    `json:"uidvalidity"`
+	ModSeq      uint64                    `json:"modseq,omitempty"`
+	UIDNext     uint32                    `json:"uidnext,omitempty"`
+	UIDs        map[uint32]mail.MessageID `json:"uids"`
 }
 
 func (c cursor) encode() mail.Cursor {
@@ -119,30 +131,53 @@ func (a *Adapter) Sync(ctx context.Context, box mail.MailboxID, cur mail.Cursor)
 		return &mail.Changes{Reset: true, Next: next.encode()}, nil
 	}
 
-	if !hadCursor {
-		changes, err := a.fullScan(ctx, box)
+	// Cursors written before UID identities were persisted cannot safely
+	// resolve VANISHED UIDs to canonical message IDs. Rebuild the map from an
+	// authoritative scan before using incremental QRESYNC again.
+	if !hadCursor || prev.UIDs == nil {
+		changes, uids, err := a.fullScan(ctx, box)
 		if err != nil {
 			return nil, err
 		}
+		next.UIDs = uids
+		a.rememberUIDs(box, uidValidity, uids)
 		changes.Next = next.encode()
 		return changes, nil
 	}
 
 	if a.conn.Supports("CONDSTORE") && prev.ModSeq > 0 {
-		changes, err := a.incremental(ctx, box, prev)
+		changes, uids, err := a.incremental(ctx, box, prev)
 		if err != nil {
 			return nil, err
 		}
+		next.UIDs = uids
+		a.rememberUIDs(box, uidValidity, uids)
 		changes.Next = next.encode()
 		return changes, nil
 	}
 
-	changes, err := a.fullScan(ctx, box)
+	changes, uids, err := a.fullScan(ctx, box)
 	if err != nil {
 		return nil, err
 	}
+	next.UIDs = uids
+	a.rememberUIDs(box, uidValidity, uids)
 	changes.Next = next.encode()
 	return changes, nil
+}
+
+func (a *Adapter) rememberUIDs(box mail.MailboxID, uidValidity uint32, uids map[uint32]mail.MessageID) {
+	if a.locations == nil {
+		a.locations = map[mail.MessageID]location{}
+	}
+	for id, loc := range a.locations {
+		if loc.box == box {
+			delete(a.locations, id)
+		}
+	}
+	for uid, id := range uids {
+		a.locations[id] = location{box: box, uidValidity: uidValidity, uid: uid}
+	}
 }
 
 // fullScan enumerates the mailbox.
@@ -150,33 +185,40 @@ func (a *Adapter) Sync(ctx context.Context, box mail.MailboxID, cur mail.Cursor)
 // Complete is set so the engine knows the listing is authoritative and can
 // delete anything it holds that is absent here — the only way to observe a
 // deletion on a server with no QRESYNC.
-func (a *Adapter) fullScan(ctx context.Context, box mail.MailboxID) (*mail.Changes, error) {
-	envs, err := a.fetchRange(ctx, box, "1:*", "")
+func (a *Adapter) fullScan(ctx context.Context, box mail.MailboxID) (*mail.Changes, map[uint32]mail.MessageID, error) {
+	envs, uids, _, err := a.fetchRangeWithVanished(ctx, box, "1:*", "")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	changes := &mail.Changes{Complete: true}
+	changes := &mail.Changes{EnumerationStart: true, Complete: true}
 	for i := range envs {
 		e := envs[i]
 		changes.Changes = append(changes.Changes, mail.Change{
 			Kind: mail.ChangeCreated, ID: e.ID, Envelope: &e,
 		})
 	}
-	return changes, nil
+	return changes, uids, nil
 }
 
 // incremental fetches only messages modified since the stored MODSEQ.
-func (a *Adapter) incremental(ctx context.Context, box mail.MailboxID, prev cursor) (*mail.Changes, error) {
+func (a *Adapter) incremental(ctx context.Context, box mail.MailboxID, prev cursor) (*mail.Changes, map[uint32]mail.MessageID, error) {
 	modifier := fmt.Sprintf(" (CHANGEDSINCE %d", prev.ModSeq)
 	if a.conn.Supports("QRESYNC") {
 		modifier += " VANISHED"
 	}
 	modifier += ")"
 
-	envs, vanished, err := a.fetchRangeWithVanished(ctx, box, "1:*", modifier)
+	envs, fetched, vanishedUIDs, err := a.fetchRangeWithVanished(ctx, box, "1:*", modifier)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	uids := make(map[uint32]mail.MessageID, len(prev.UIDs)+len(fetched))
+	for uid, id := range prev.UIDs {
+		uids[uid] = id
+	}
+	for uid, id := range fetched {
+		uids[uid] = id
 	}
 
 	changes := &mail.Changes{}
@@ -186,35 +228,51 @@ func (a *Adapter) incremental(ctx context.Context, box mail.MailboxID, prev curs
 			Kind: mail.ChangeUpdated, ID: e.ID, Envelope: &e,
 		})
 	}
-	for _, id := range vanished {
+	for _, id := range resolveVanished(box, prev.UIDValidity, vanishedUIDs, uids) {
 		changes.Changes = append(changes.Changes, mail.Change{
 			Kind: mail.ChangeDestroyed, ID: id,
 		})
+	}
+	for _, uid := range vanishedUIDs {
+		delete(uids, uid)
 	}
 
 	// Without QRESYNC, CHANGEDSINCE reports modifications but never
 	// deletions, so this page cannot be treated as authoritative.
 	changes.Complete = false
-	return changes, nil
+	return changes, uids, nil
+}
+
+func resolveVanished(box mail.MailboxID, uidValidity uint32, vanished []uint32, known map[uint32]mail.MessageID) []mail.MessageID {
+	ids := make([]mail.MessageID, 0, len(vanished))
+	for _, uid := range vanished {
+		if id, ok := known[uid]; ok {
+			ids = append(ids, id)
+		} else {
+			ids = append(ids, positionalID(box, uidValidity, uid))
+		}
+	}
+	return ids
 }
 
 func (a *Adapter) fetchRange(ctx context.Context, box mail.MailboxID, set, modifier string) ([]mail.Envelope, error) {
-	envs, _, err := a.fetchRangeWithVanished(ctx, box, set, modifier)
+	envs, _, _, err := a.fetchRangeWithVanished(ctx, box, set, modifier)
 	return envs, err
 }
 
 const fetchItems = "(UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE BODYSTRUCTURE)"
 
-func (a *Adapter) fetchRangeWithVanished(ctx context.Context, box mail.MailboxID, set, modifier string) ([]mail.Envelope, []mail.MessageID, error) {
+func (a *Adapter) fetchRangeWithVanished(ctx context.Context, box mail.MailboxID, set, modifier string) ([]mail.Envelope, map[uint32]mail.MessageID, []uint32, error) {
 	resp, err := a.conn.exec(ctx, "UID FETCH %s %s%s", set, fetchItems, modifier)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	var (
 		envs     []mail.Envelope
-		vanished []mail.MessageID
+		vanished []uint32
 	)
+	uids := map[uint32]mail.MessageID{}
 	for _, line := range resp {
 		if len(line) < 2 {
 			continue
@@ -226,9 +284,7 @@ func (a *Adapter) fetchRangeWithVanished(ctx context.Context, box mail.MailboxID
 				if t.kind != tokenAtom {
 					continue
 				}
-				for _, uid := range expandUIDSet(t.text) {
-					vanished = append(vanished, positionalID(box, a.conn.uidValidity, uid))
-				}
+				vanished = append(vanished, expandUIDSet(t.text)...)
 			}
 			continue
 		}
@@ -239,9 +295,21 @@ func (a *Adapter) fetchRangeWithVanished(ctx context.Context, box mail.MailboxID
 		env, ok := a.parseFetch(box, line[3])
 		if ok {
 			envs = append(envs, env)
+			if uid, ok := fetchUID(line[3]); ok {
+				uids[uid] = env.ID
+			}
 		}
 	}
-	return envs, vanished, nil
+	return envs, uids, vanished, nil
+}
+
+func fetchUID(items token) (uint32, bool) {
+	uid, ok := items.find("UID")
+	if !ok {
+		return 0, false
+	}
+	n, ok := uid.int()
+	return uint32(n), ok && n >= 0 && n <= int64(^uint32(0))
 }
 
 // parseFetch turns one FETCH item list into an envelope.
@@ -554,40 +622,33 @@ func (a *Adapter) Attachment(ctx context.Context, id mail.MessageID, partID stri
 
 // uidFor resolves a canonical identity back to a UID in the selected mailbox.
 func (a *Adapter) uidFor(ctx context.Context, id mail.MessageID) (uint32, error) {
-	envs, err := a.fetchRange(ctx, mail.MailboxID(a.conn.selected), "1:*", "")
+	if loc, ok := a.locations[id]; ok {
+		if a.conn.selected != a.native(loc.box) {
+			uidValidity, _, err := a.conn.Select(ctx, a.native(loc.box), true)
+			if err != nil {
+				return 0, err
+			}
+			if uidValidity != loc.uidValidity {
+				delete(a.locations, id)
+				return 0, fmt.Errorf("imap: %w: UIDVALIDITY changed for %s", mail.ErrNotFound, loc.box)
+			}
+		}
+		return loc.uid, nil
+	}
+	_, uids, _, err := a.fetchRangeWithVanished(ctx, mail.MailboxID(a.conn.selected), "1:*", "")
 	if err != nil {
 		return 0, err
 	}
-	for i := range envs {
-		if envs[i].ID == id {
-			// The identity is derived from the same FETCH, so re-deriving
-			// the UID means finding which one produced it.
-			if uid, ok := a.uidOf(ctx, envs[i]); ok {
-				return uid, nil
-			}
-		}
+	if uid, ok := uidForIdentity(id, uids); ok {
+		return uid, nil
 	}
 	return 0, fmt.Errorf("imap: %w: message %s", mail.ErrNotFound, id)
 }
 
-// uidOf finds the UID whose envelope matches, by searching on the Message-ID
-// header when one exists.
-func (a *Adapter) uidOf(ctx context.Context, env mail.Envelope) (uint32, bool) {
-	if env.MessageIDHeader == "" {
-		return 0, false
-	}
-	resp, err := a.conn.exec(ctx, `UID SEARCH HEADER Message-ID %s`, quote(env.MessageIDHeader))
-	if err != nil {
-		return 0, false
-	}
-	for _, line := range resp {
-		if len(line) < 2 || !line[1].atomEq("SEARCH") {
-			continue
-		}
-		for _, t := range line[2:] {
-			if n, ok := t.int(); ok {
-				return uint32(n), true
-			}
+func uidForIdentity(id mail.MessageID, uids map[uint32]mail.MessageID) (uint32, bool) {
+	for uid, candidate := range uids {
+		if candidate == id {
+			return uid, true
 		}
 	}
 	return 0, false

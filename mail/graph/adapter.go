@@ -94,27 +94,30 @@ func statusError(resp *http.Response) error {
 
 // Mailboxes lists mail folders.
 func (a *Adapter) Mailboxes(ctx context.Context) ([]mail.Mailbox, error) {
-	var out struct {
-		Value []struct {
-			ID             string `json:"id"`
-			DisplayName    string `json:"displayName"`
-			ParentFolderID string `json:"parentFolderId"`
-			WellKnownName  string `json:"wellKnownName"`
-		} `json:"value"`
-	}
-	if err := a.get(ctx, "/me/mailFolders?$top=200", &out); err != nil {
-		return nil, err
-	}
-
-	boxes := make([]mail.Mailbox, 0, len(out.Value))
-	for _, f := range out.Value {
-		boxes = append(boxes, mail.Mailbox{
-			ID:       mail.MailboxID(f.ID),
-			Name:     f.DisplayName,
-			Role:     roleFrom(f.WellKnownName),
-			ParentID: mail.MailboxID(f.ParentFolderID),
-			Native:   f.ID,
-		})
+	var boxes []mail.Mailbox
+	for endpoint := "/me/mailFolders?$top=200"; endpoint != ""; {
+		var out struct {
+			Value []struct {
+				ID             string `json:"id"`
+				DisplayName    string `json:"displayName"`
+				ParentFolderID string `json:"parentFolderId"`
+				WellKnownName  string `json:"wellKnownName"`
+			} `json:"value"`
+			NextLink string `json:"@odata.nextLink"`
+		}
+		if err := a.get(ctx, endpoint, &out); err != nil {
+			return nil, err
+		}
+		for _, f := range out.Value {
+			boxes = append(boxes, mail.Mailbox{
+				ID:       mail.MailboxID(f.ID),
+				Name:     f.DisplayName,
+				Role:     roleFrom(f.WellKnownName),
+				ParentID: mail.MailboxID(f.ParentFolderID),
+				Native:   f.ID,
+			})
+		}
+		endpoint = out.NextLink
 	}
 	return boxes, nil
 }
@@ -165,7 +168,7 @@ func (a *Adapter) Sync(ctx context.Context, box mail.MailboxID, cur mail.Cursor)
 		return nil, err
 	}
 
-	changes := &mail.Changes{More: out.NextLink != ""}
+	changes := &mail.Changes{More: out.NextLink != "", EnumerationStart: initial}
 	if out.NextLink != "" {
 		changes.Next = mail.Cursor(out.NextLink)
 	} else {
@@ -233,18 +236,19 @@ type graphMessage struct {
 
 func (m graphMessage) toEnvelope() mail.Envelope {
 	env := mail.Envelope{
-		ID:              mail.NativeMessageID(mail.ProviderGraph, m.ID),
-		ThreadID:        mail.ThreadID(m.ConversationID),
-		Subject:         m.Subject,
-		Preview:         m.BodyPreview,
-		ReceivedAt:      m.ReceivedDateTime,
-		SentAt:          m.SentDateTime,
-		HasAttachment:   m.HasAttachments,
-		MessageIDHeader: m.InternetMessageID,
-		To:              recipients(m.ToRecipients),
-		Cc:              recipients(m.CcRecipients),
-		Bcc:             recipients(m.BccRecipients),
-		ReplyTo:         recipients(m.ReplyTo),
+		ID:                 mail.NativeMessageID(mail.ProviderGraph, m.ID),
+		ThreadID:           mail.ThreadID(m.ConversationID),
+		Subject:            m.Subject,
+		Preview:            m.BodyPreview,
+		ReceivedAt:         m.ReceivedDateTime,
+		SentAt:             m.SentDateTime,
+		HasAttachment:      m.HasAttachments,
+		MessageIDHeader:    m.InternetMessageID,
+		To:                 recipients(m.ToRecipients),
+		Cc:                 recipients(m.CcRecipients),
+		Bcc:                recipients(m.BccRecipients),
+		ReplyTo:            recipients(m.ReplyTo),
+		MailboxIDsComplete: true,
 	}
 	if m.From != nil {
 		env.From = recipients([]graphRecipient{*m.From})

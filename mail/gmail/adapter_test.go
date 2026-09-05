@@ -1,12 +1,17 @@
 package gmail
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/neutron-build/neutron/mail"
 	"google.golang.org/api/gmail/v1"
 	"google.golang.org/api/googleapi"
+	"google.golang.org/api/option"
 )
 
 func TestRoleFromReservedLabelIDs(t *testing.T) {
@@ -202,5 +207,60 @@ func TestNativeIDStripsThePrefix(t *testing.T) {
 	id := mail.NativeMessageID(mail.ProviderGmail, "18c9f0a")
 	if got := nativeID(id); got != "18c9f0a" {
 		t.Errorf("nativeID = %q, want 18c9f0a", got)
+	}
+}
+
+func TestInitialCursorPreservesPageAndHistory(t *testing.T) {
+	cur := encodeInitialCursor("page/token+with=chars", 987654321)
+	page, history, err := decodeInitialCursor(cur)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page != "page/token+with=chars" || history != 987654321 {
+		t.Fatalf("decoded cursor = %q/%d", page, history)
+	}
+	if _, _, err := decodeInitialCursor("gmail-initial:not-base64"); err == nil {
+		t.Fatal("malformed initial cursor was accepted")
+	}
+}
+
+func TestIncrementalHistoryPaginationPreservesTokenAndDefersCursor(t *testing.T) {
+	var tokens []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokens = append(tokens, r.URL.Query().Get("pageToken"))
+		w.Header().Set("Content-Type", "application/json")
+		if len(tokens) == 1 {
+			_, _ = fmt.Fprint(w, `{"historyId":"200","nextPageToken":"next/token"}`)
+			return
+		}
+		_, _ = fmt.Fprint(w, `{"historyId":"250"}`)
+	}))
+	defer server.Close()
+
+	adapter, err := New(context.Background(), option.WithEndpoint(server.URL+"/"), option.WithoutAuthentication())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := adapter.Sync(context.Background(), "INBOX", "100")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.More || first.Next == "200" {
+		t.Fatalf("first page cursor = %q, More = %v; history cursor advanced before the final page", first.Next, first.More)
+	}
+	page, start, err := decodeHistoryCursor(first.Next)
+	if err != nil || page != "next/token" || start != 100 {
+		t.Fatalf("in-progress cursor = %q/%d, err %v", page, start, err)
+	}
+
+	last, err := adapter.Sync(context.Background(), "INBOX", first.Next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last.More || last.Next != "250" {
+		t.Fatalf("last page cursor = %q, More = %v; want final history 250", last.Next, last.More)
+	}
+	if len(tokens) != 2 || tokens[1] != "next/token" {
+		t.Fatalf("page tokens sent = %v", tokens)
 	}
 }

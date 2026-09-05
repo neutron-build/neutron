@@ -15,7 +15,72 @@ func adapterFor(t *testing.T, handler http.HandlerFunc) *Adapter {
 	t.Helper()
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
-	return &Adapter{http: srv.Client(), apiURL: srv.URL, accountID: "acct", token: "tok"}
+	return &Adapter{http: srv.Client(), apiURL: srv.URL, downloadURL: srv.URL + "/download/{accountId}/{blobId}/{name}?type={type}", accountID: "acct", token: "tok"}
+}
+
+func TestInitialSyncPaginatesPastServerLimit(t *testing.T) {
+	page := 0
+	a := adapterFor(t, func(w http.ResponseWriter, r *http.Request) {
+		page++
+		if page == 1 {
+			_, _ = w.Write([]byte(`{"methodResponses":[["Email/query",{"ids":["m1"],"position":0,"total":2},"0"],["Email/get",{"state":"s1","list":[{"id":"m1","threadId":"t","mailboxIds":{"box":true},"keywords":{}}]},"1"]]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"methodResponses":[["Email/query",{"ids":["m2"],"position":1,"total":2},"0"],["Email/get",{"state":"s2","list":[{"id":"m2","threadId":"t","mailboxIds":{"box":true},"keywords":{}}]},"1"]]}`))
+	})
+
+	first, err := a.Sync(context.Background(), "box", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.More || first.Next != "jmap-initial:1" || len(first.Changes) != 1 {
+		t.Fatalf("first page = %+v", first)
+	}
+	second, err := a.Sync(context.Background(), "box", first.Next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.More || second.Next != "s2" || len(second.Changes) != 1 {
+		t.Fatalf("second page = %+v", second)
+	}
+}
+
+func TestRawAndAttachmentDownloadAdvertisedBlobs(t *testing.T) {
+	a := adapterFor(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			if r.Header.Get("Authorization") != "Bearer tok" {
+				t.Error("download omitted bearer token")
+			}
+			_, _ = w.Write([]byte("blob:" + r.URL.EscapedPath()))
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), `"properties":["blobId"]`) {
+			_, _ = w.Write([]byte(`{"methodResponses":[["Email/get",{"list":[{"blobId":"raw/id"}]},"0"]]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"methodResponses":[["Email/get",{"list":[{"attachments":[{"partId":"2","blobId":"part/id","type":"application/pdf","name":"a file.pdf"}]}]},"0"]]}`))
+	})
+
+	raw, err := a.Raw(context.Background(), mail.NativeMessageID(mail.ProviderJMAP, "m1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawBytes, _ := io.ReadAll(raw)
+	raw.Close()
+	if !strings.Contains(string(rawBytes), "/raw%2Fid/message.eml") {
+		t.Errorf("raw URL was not template-expanded safely: %s", rawBytes)
+	}
+
+	part, err := a.Attachment(context.Background(), mail.NativeMessageID(mail.ProviderJMAP, "m1"), "2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	partBytes, _ := io.ReadAll(part)
+	part.Close()
+	if !strings.Contains(string(partBytes), "/part%2Fid/a%20file.pdf") {
+		t.Errorf("attachment URL was not template-expanded safely: %s", partBytes)
+	}
 }
 
 func TestCannotCalculateChangesBecomesAReset(t *testing.T) {
@@ -217,161 +282,26 @@ func TestDecodeEmailsBuildsCanonicalEnvelopes(t *testing.T) {
 	}
 }
 
-// downloadAdapter wires both the API and the download template at one server,
-// so a test can answer Email/get and serve blob bytes from the same handler.
-func downloadAdapter(t *testing.T, handler http.HandlerFunc) *Adapter {
-	t.Helper()
-	srv := httptest.NewServer(handler)
-	t.Cleanup(srv.Close)
-	return &Adapter{
-		http:        srv.Client(),
-		apiURL:      srv.URL,
-		downloadURL: srv.URL + "/dl/{accountId}/{blobId}/{name}?type={type}",
-		accountID:   "acct",
-		token:       "tok",
-	}
-}
-
-func TestExpandDownloadEscapesEveryPlaceholder(t *testing.T) {
-	// A blob id is server-chosen and a filename comes from the sender, so
-	// neither may be pasted into a URL raw. A '/' that survives would move
-	// the request to a different path entirely.
-	a := &Adapter{
-		accountID:   "acct",
-		downloadURL: "https://h/dl/{accountId}/{blobId}/{name}?type={type}",
-	}
-	got, err := a.expandDownload("b/1", "text/plain", "q&a report.txt")
-	if err != nil {
-		t.Fatalf("expandDownload: %v", err)
-	}
-	// '&' is escaped too: the template may put a filename in the query, and a
-	// sender-chosen name must not be able to start a new parameter there.
-	want := "https://h/dl/acct/b%2F1/q%26a%20report.txt?type=text%2Fplain"
-	if got != want {
-		t.Errorf("expandDownload =\n  %s\nwant\n  %s", got, want)
-	}
-}
-
-func TestExpandDownloadWithoutATemplateIsAnError(t *testing.T) {
-	a := &Adapter{accountID: "acct"}
-	if _, err := a.expandDownload("blob", "text/plain", "f.txt"); err == nil {
-		t.Error("expected an error when the session advertised no downloadUrl")
-	}
-}
-
-func TestRawDownloadsTheMessageBlob(t *testing.T) {
-	a := downloadAdapter(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			_, _ = w.Write([]byte(`{"methodResponses":[["Email/get",{"list":[{"blobId":"blob-9"}]},"0"]]}`))
-			return
+func TestEscapeTemplateValueIsSafeInPathAndQuery(t *testing.T) {
+	// The template decides where a value lands, so it has to be safe in both
+	// positions. url.PathEscape is not: it leaves '&', '=' and '+' intact,
+	// and an attachment filename comes from whoever sent the mail.
+	for _, tc := range []struct{ in, want string }{
+		{"raw/id", "raw%2Fid"},
+		{"a&x=y.txt", "a%26x%3Dy.txt"},
+		{"q a+b.txt", "q%20a%2Bb.txt"},
+		{"plain-name_1.txt", "plain-name_1.txt"},
+	} {
+		if got := escapeTemplateValue(tc.in); got != tc.want {
+			t.Errorf("escapeTemplateValue(%q) = %q, want %q", tc.in, got, tc.want)
 		}
-		if r.URL.Path != "/dl/acct/blob-9/m1.eml" {
-			t.Errorf("download path = %s", r.URL.Path)
-		}
-		if got := r.Header.Get("Authorization"); got != "Bearer tok" {
-			t.Errorf("Authorization = %q", got)
-		}
-		_, _ = w.Write([]byte("From: a@b\r\n\r\nhi"))
-	})
-
-	rc, err := a.Raw(context.Background(), "m1")
-	if err != nil {
-		t.Fatalf("Raw: %v", err)
-	}
-	defer rc.Close()
-	body, _ := io.ReadAll(rc)
-	if string(body) != "From: a@b\r\n\r\nhi" {
-		t.Errorf("body = %q", body)
-	}
-}
-
-func TestAttachmentResolvesPartToBlob(t *testing.T) {
-	a := downloadAdapter(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			_, _ = w.Write([]byte(`{"methodResponses":[["Email/get",{"list":[{"attachments":[
-				{"partId":"2","blobId":"blob-2","type":"application/pdf","name":"invoice.pdf"}]}]},"0"]]}`))
-			return
-		}
-		if r.URL.Path != "/dl/acct/blob-2/invoice.pdf" {
-			t.Errorf("download path = %s", r.URL.Path)
-		}
-		if got := r.URL.Query().Get("type"); got != "application/pdf" {
-			t.Errorf("type = %q", got)
-		}
-		_, _ = w.Write([]byte("%PDF-1.4"))
-	})
-
-	rc, err := a.Attachment(context.Background(), "m1", "2")
-	if err != nil {
-		t.Fatalf("Attachment: %v", err)
-	}
-	defer rc.Close()
-	body, _ := io.ReadAll(rc)
-	if string(body) != "%PDF-1.4" {
-		t.Errorf("body = %q", body)
-	}
-}
-
-func TestAttachmentAcceptsABlobIDAsThePart(t *testing.T) {
-	// A caller holding a blob id from an earlier Body should not have to
-	// re-fetch the message just to name the part.
-	a := downloadAdapter(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			_, _ = w.Write([]byte(`{"methodResponses":[["Email/get",{"list":[{"attachments":[
-				{"partId":"2","blobId":"blob-2","type":"text/plain","name":"a.txt"}]}]},"0"]]}`))
-			return
-		}
-		_, _ = w.Write([]byte("ok"))
-	})
-
-	rc, err := a.Attachment(context.Background(), "m1", "blob-2")
-	if err != nil {
-		t.Fatalf("Attachment by blob id: %v", err)
-	}
-	rc.Close()
-}
-
-func TestDownloadStripsTheProviderPrefixFromIDs(t *testing.T) {
-	// Every other Email/get in this adapter sends nativeID(id). If the
-	// download path sent the prefixed form the server would find nothing.
-	var sent string
-	a := downloadAdapter(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			body, _ := io.ReadAll(r.Body)
-			sent = string(body)
-			_, _ = w.Write([]byte(`{"methodResponses":[["Email/get",{"list":[{"blobId":"b"}]},"0"]]}`))
-			return
-		}
-		_, _ = w.Write([]byte("raw"))
-	})
-
-	rc, err := a.Raw(context.Background(), "n:jmap:m1")
-	if err != nil {
-		t.Fatalf("Raw: %v", err)
-	}
-	rc.Close()
-	if strings.Contains(sent, "n:jmap:m1") {
-		t.Errorf("sent the prefixed id to the server: %s", sent)
-	}
-	if !strings.Contains(sent, `"m1"`) {
-		t.Errorf("native id missing from request: %s", sent)
-	}
-}
-
-func TestAttachmentUnknownPartIsNotFound(t *testing.T) {
-	a := downloadAdapter(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"methodResponses":[["Email/get",{"list":[{"attachments":[]}]},"0"]]}`))
-	})
-
-	_, err := a.Attachment(context.Background(), "m1", "nope")
-	if !isErr(err, mail.ErrNotFound) {
-		t.Errorf("err = %v, want ErrNotFound", err)
 	}
 }
 
 func TestDownloadMapsStatusesToSharedErrors(t *testing.T) {
-	// The download endpoint is a separate HTTP surface from the API, so its
-	// failures have to reach the engine as the same errors the API's do.
+	// Downloads are a second HTTP surface from the API. Its failures have to
+	// reach the engine as the same errors, or the recovery and backoff paths
+	// are skipped for arriving on the wrong socket.
 	for _, tc := range []struct {
 		name   string
 		status int
@@ -379,20 +309,32 @@ func TestDownloadMapsStatusesToSharedErrors(t *testing.T) {
 	}{
 		{"unauthorized", http.StatusUnauthorized, mail.ErrReauthRequired},
 		{"forbidden", http.StatusForbidden, mail.ErrReauthRequired},
-		{"missing blob", http.StatusNotFound, mail.ErrNotFound},
 		{"throttled", http.StatusTooManyRequests, mail.ErrRateLimited},
+		{"missing blob", http.StatusNotFound, mail.ErrNotFound},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			a := downloadAdapter(t, func(w http.ResponseWriter, r *http.Request) {
-				if r.Method == http.MethodPost {
-					_, _ = w.Write([]byte(`{"methodResponses":[["Email/get",{"list":[{"blobId":"b"}]},"0"]]}`))
+			a := adapterFor(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					w.WriteHeader(tc.status)
 					return
 				}
-				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(`{"methodResponses":[["Email/get",{"list":[{"blobId":"b"}]},"0"]]}`))
 			})
-			if _, err := a.Raw(context.Background(), "m1"); !isErr(err, tc.want) {
+			_, err := a.Raw(context.Background(), mail.NativeMessageID(mail.ProviderJMAP, "m1"))
+			if !isErr(err, tc.want) {
 				t.Errorf("err = %v, want %v", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestAttachmentUnknownPartIsNotFound(t *testing.T) {
+	a := adapterFor(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"methodResponses":[["Email/get",{"list":[{"attachments":[]}]},"0"]]}`))
+	})
+
+	_, err := a.Attachment(context.Background(), mail.NativeMessageID(mail.ProviderJMAP, "m1"), "nope")
+	if !isErr(err, mail.ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
 	}
 }

@@ -50,11 +50,18 @@ type Changes struct {
 	Changes []Change
 	Next    Cursor
 
+	// EnumerationStart marks the first page of an authoritative full
+	// listing. Complete marks its final page. Keeping both boundaries lets
+	// the engine avoid sweeping when MaxPages splits an enumeration across
+	// two scheduled runs and the earlier pages' seen-set is no longer in
+	// memory.
+	EnumerationStart bool
+
 	// More reports that the provider has further pages. The caller should
 	// sync again with Next rather than waiting for the next poll.
 	More bool
 
-	// Complete reports that these changes enumerate the mailbox in full, so
+	// Complete reports that this is the final page of a full enumeration, so
 	// anything the store holds for it and this listing omits has been
 	// deleted at the provider.
 	//

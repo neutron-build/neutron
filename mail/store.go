@@ -166,9 +166,6 @@ func (s *PgStore) SetNeedsReauth(ctx context.Context, id AccountID, needs bool) 
 // ---------------------------------------------------------------------------
 
 func (s *PgStore) PutMailboxes(ctx context.Context, acct AccountID, boxes []Mailbox) error {
-	if len(boxes) == 0 {
-		return nil
-	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("mail: put mailboxes: %w", err)
@@ -184,6 +181,92 @@ func (s *PgStore) PutMailboxes(ctx context.Context, acct AccountID, boxes []Mail
 			string(acct), string(b.ID), b.Name, string(b.Role), string(b.ParentID), b.Native)
 		if err != nil {
 			return fmt.Errorf("mail: put mailbox %s: %w", b.ID, err)
+		}
+	}
+
+	wanted := make(map[MailboxID]bool, len(boxes))
+	for _, b := range boxes {
+		wanted[b.ID] = true
+	}
+	staleSet := map[MailboxID]bool{}
+	for _, query := range []string{
+		`SELECT id FROM mail_mailboxes WHERE account_id = $1`,
+		`SELECT mailbox_id FROM mail_sync_state WHERE account_id = $1`,
+		`SELECT mailbox_id FROM mail_message_mailboxes WHERE account_id = $1`,
+	} {
+		rows, err := tx.Query(ctx, query, string(acct))
+		if err != nil {
+			return fmt.Errorf("mail: list stored mailbox state: %w", err)
+		}
+		for rows.Next() {
+			var id MailboxID
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return fmt.Errorf("mail: scan stored mailbox state: %w", err)
+			}
+			// The empty ID is reserved for account-level provider cursors.
+			if id != "" && !wanted[id] {
+				staleSet[id] = true
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+	}
+	stale := make([]MailboxID, 0, len(staleSet))
+	for id := range staleSet {
+		stale = append(stale, id)
+	}
+
+	for _, box := range stale {
+		messageRows, err := tx.Query(ctx,
+			`SELECT message_id FROM mail_message_mailboxes WHERE account_id = $1 AND mailbox_id = $2`,
+			string(acct), string(box))
+		if err != nil {
+			return fmt.Errorf("mail: list messages in stale mailbox %s: %w", box, err)
+		}
+		var ids []MessageID
+		for messageRows.Next() {
+			var id MessageID
+			if err := messageRows.Scan(&id); err != nil {
+				messageRows.Close()
+				return err
+			}
+			ids = append(ids, id)
+		}
+		if err := messageRows.Err(); err != nil {
+			messageRows.Close()
+			return err
+		}
+		messageRows.Close()
+
+		for _, stmt := range []string{
+			`DELETE FROM mail_message_mailboxes WHERE account_id = $1 AND mailbox_id = $2`,
+			`DELETE FROM mail_sync_state WHERE account_id = $1 AND mailbox_id = $2`,
+			`DELETE FROM mail_mailboxes WHERE account_id = $1 AND id = $2`,
+		} {
+			if _, err := tx.Exec(ctx, stmt, string(acct), string(box)); err != nil {
+				return fmt.Errorf("mail: remove stale mailbox %s: %w", box, err)
+			}
+		}
+		for _, id := range ids {
+			var remaining int
+			if err := tx.QueryRow(ctx,
+				`SELECT COUNT(*) FROM mail_message_mailboxes WHERE account_id = $1 AND message_id = $2`,
+				string(acct), string(id)).Scan(&remaining); err != nil {
+				return err
+			}
+			if remaining != 0 {
+				continue
+			}
+			if _, err := tx.Exec(ctx, `DELETE FROM mail_bodies WHERE account_id = $1 AND message_id = $2`, string(acct), string(id)); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `DELETE FROM mail_messages WHERE account_id = $1 AND id = $2`, string(acct), string(id)); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit(ctx)
@@ -269,13 +352,12 @@ func (s *PgStore) PutEnvelopes(ctx context.Context, acct AccountID, envs []Envel
 			return fmt.Errorf("mail: put envelope %s: %w", e.ID, err)
 		}
 
-		// Mailbox membership is replaced wholesale rather than diffed: the
-		// provider's list is authoritative, and a message that has moved
-		// must not keep its old membership row.
-		if _, err := tx.Exec(ctx,
-			`DELETE FROM mail_message_mailboxes WHERE account_id = $1 AND message_id = $2`,
-			string(acct), string(e.ID)); err != nil {
-			return fmt.Errorf("mail: clear mailboxes for %s: %w", e.ID, err)
+		if e.MailboxIDsComplete {
+			if _, err := tx.Exec(ctx,
+				`DELETE FROM mail_message_mailboxes WHERE account_id = $1 AND message_id = $2`,
+				string(acct), string(e.ID)); err != nil {
+				return fmt.Errorf("mail: clear mailboxes for %s: %w", e.ID, err)
+			}
 		}
 		for _, box := range e.MailboxIDs {
 			if _, err := tx.Exec(ctx,

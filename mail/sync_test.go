@@ -97,6 +97,41 @@ func (m *memStore) SetNeedsReauth(_ context.Context, id AccountID, needs bool) e
 func (m *memStore) PutMailboxes(_ context.Context, acct AccountID, boxes []Mailbox) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	wanted := make(map[MailboxID]bool, len(boxes))
+	for _, box := range boxes {
+		wanted[box.ID] = true
+	}
+	for _, old := range m.mailboxes[acct] {
+		if wanted[old.ID] {
+			continue
+		}
+		delete(m.cursors[acct], old.ID)
+		for id, memberships := range m.members[acct] {
+			delete(memberships, old.ID)
+			if len(memberships) == 0 {
+				delete(m.messages[acct], id)
+				delete(m.members[acct], id)
+				delete(m.bodies[acct], id)
+			}
+		}
+	}
+	for box := range m.cursors[acct] {
+		if box != "" && !wanted[box] {
+			delete(m.cursors[acct], box)
+		}
+	}
+	for id, memberships := range m.members[acct] {
+		for box := range memberships {
+			if !wanted[box] {
+				delete(memberships, box)
+			}
+		}
+		if len(memberships) == 0 {
+			delete(m.messages[acct], id)
+			delete(m.members[acct], id)
+			delete(m.bodies[acct], id)
+		}
+	}
 	m.mailboxes[acct] = boxes
 	return nil
 }
@@ -127,7 +162,9 @@ func (m *memStore) PutEnvelopes(_ context.Context, acct AccountID, envs []Envelo
 			e.Fingerprint = ComputeFingerprint(&e)
 		}
 		m.messages[acct][e.ID] = &e
-		m.members[acct][e.ID] = map[MailboxID]bool{}
+		if e.MailboxIDsComplete || m.members[acct][e.ID] == nil {
+			m.members[acct][e.ID] = map[MailboxID]bool{}
+		}
 		for _, b := range e.MailboxIDs {
 			m.members[acct][e.ID][b] = true
 		}
@@ -285,6 +322,10 @@ type scriptedAdapter struct {
 	// seenCursors records what the engine passed in, so tests can assert
 	// the cursor actually round-trips rather than being recomputed.
 	seenCursors []Cursor
+
+	// bodyCalls counts fetches per message, so a test can tell "prefetched
+	// once" from "re-downloaded on every sync".
+	bodyCalls map[MessageID]int
 }
 
 func (a *scriptedAdapter) Provider() Provider { return ProviderIMAP }
@@ -320,6 +361,10 @@ func (a *scriptedAdapter) Envelopes(_ context.Context, ids []MessageID) ([]Envel
 }
 
 func (a *scriptedAdapter) Body(_ context.Context, id MessageID) (*Body, error) {
+	if a.bodyCalls == nil {
+		a.bodyCalls = map[MessageID]int{}
+	}
+	a.bodyCalls[id]++
 	return &Body{MessageID: id, Text: "body of " + string(id)}, nil
 }
 
@@ -544,6 +589,73 @@ func TestMessageInTwoMailboxesSurvivesRemovalFromOne(t *testing.T) {
 	}
 }
 
+func TestIMAPSyncAcrossMailboxesMergesMemberships(t *testing.T) {
+	eng, store, acct := setup(t)
+	id := HeaderMessageID("<shared@example.com>")
+	inbox := Envelope{ID: id, MailboxIDs: []MailboxID{"INBOX"}, MessageIDHeader: "<shared@example.com>"}
+	archive := inbox
+	archive.MailboxIDs = []MailboxID{"Archive"}
+	ad := &scriptedAdapter{
+		boxes: []Mailbox{{ID: "INBOX"}, {ID: "Archive"}},
+		pages: []*Changes{
+			{Changes: []Change{created(inbox)}, Next: "inbox-cursor"},
+			{Changes: []Change{created(archive)}, Next: "archive-cursor"},
+		},
+	}
+
+	if _, err := eng.SyncAccount(context.Background(), acct, ad); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Envelope(context.Background(), acct, id); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.members[acct][id]) != 2 {
+		t.Fatalf("memberships = %v, want INBOX and Archive", store.members[acct][id])
+	}
+	ad.call = 0
+	ad.pages = []*Changes{{Changes: []Change{{Kind: ChangeDestroyed, ID: id}}, Next: "inbox-2"}}
+	if _, err := eng.SyncMailbox(context.Background(), acct, "INBOX", ad); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Envelope(context.Background(), acct, id); err != nil {
+		t.Fatalf("message was deleted while Archive membership remained: %v", err)
+	}
+}
+
+func TestSyncAccountReconcilesDeletedProviderMailboxes(t *testing.T) {
+	eng, store, acct := setup(t)
+	ctx := context.Background()
+	if err := store.PutMailboxes(ctx, acct, []Mailbox{{ID: "INBOX"}, {ID: "Deleted"}}); err != nil {
+		t.Fatal(err)
+	}
+	shared := envelope("shared", "INBOX")
+	shared.MailboxIDs = []MailboxID{"INBOX", "Deleted"}
+	staleOnly := envelope("stale", "Deleted")
+	if err := store.PutEnvelopes(ctx, acct, []Envelope{shared, staleOnly}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutCursor(ctx, acct, "Deleted", "stale-cursor"); err != nil {
+		t.Fatal(err)
+	}
+
+	ad := &scriptedAdapter{boxes: []Mailbox{{ID: "INBOX"}}, pages: []*Changes{{Next: "inbox-cursor"}}}
+	if _, err := eng.SyncAccount(ctx, acct, ad); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Envelope(ctx, acct, shared.ID); err != nil {
+		t.Fatalf("shared message was deleted with stale mailbox: %v", err)
+	}
+	if store.members[acct][shared.ID]["Deleted"] {
+		t.Error("stale mailbox membership survived reconciliation")
+	}
+	if _, err := store.Envelope(ctx, acct, staleOnly.ID); !errors.Is(err, ErrNoStore) {
+		t.Error("message orphaned by mailbox deletion survived")
+	}
+	if cur, _ := store.Cursor(ctx, acct, "Deleted"); cur != "" {
+		t.Errorf("stale cursor = %q, want empty", cur)
+	}
+}
+
 func TestMessageIsDeletedWhenItLeavesItsLastMailbox(t *testing.T) {
 	eng, store, acct := setup(t)
 	e := envelope("1", "INBOX")
@@ -635,9 +747,10 @@ func TestCompleteListingSweepsMessagesThatVanished(t *testing.T) {
 	eng, store, acct := setup(t)
 	ad := &scriptedAdapter{
 		pages: []*Changes{{
-			Changes:  []Change{created(envelope("1", "INBOX")), created(envelope("2", "INBOX"))},
-			Next:     "c1",
-			Complete: true,
+			Changes:          []Change{created(envelope("1", "INBOX")), created(envelope("2", "INBOX"))},
+			Next:             "c1",
+			EnumerationStart: true,
+			Complete:         true,
 		}},
 	}
 	if _, err := eng.SyncMailbox(context.Background(), acct, "INBOX", ad); err != nil {
@@ -650,9 +763,10 @@ func TestCompleteListingSweepsMessagesThatVanished(t *testing.T) {
 	// Message 2 is gone at the provider; the next enumeration omits it.
 	ad.call = 0
 	ad.pages = []*Changes{{
-		Changes:  []Change{created(envelope("1", "INBOX"))},
-		Next:     "c2",
-		Complete: true,
+		Changes:          []Change{created(envelope("1", "INBOX"))},
+		Next:             "c2",
+		EnumerationStart: true,
+		Complete:         true,
 	}}
 
 	rep, err := eng.SyncMailbox(context.Background(), acct, "INBOX", ad)
@@ -676,9 +790,10 @@ func TestIncompleteListingNeverSweeps(t *testing.T) {
 	eng, store, acct := setup(t)
 	ad := &scriptedAdapter{
 		pages: []*Changes{{
-			Changes:  []Change{created(envelope("1", "INBOX")), created(envelope("2", "INBOX"))},
-			Next:     "c1",
-			Complete: true,
+			Changes:          []Change{created(envelope("1", "INBOX")), created(envelope("2", "INBOX"))},
+			Next:             "c1",
+			EnumerationStart: true,
+			Complete:         true,
 		}},
 	}
 	if _, err := eng.SyncMailbox(context.Background(), acct, "INBOX", ad); err != nil {
@@ -710,9 +825,10 @@ func TestTruncatedEnumerationDoesNotSweep(t *testing.T) {
 	eng, store, acct := setup(t)
 	ad := &scriptedAdapter{
 		pages: []*Changes{{
-			Changes:  []Change{created(envelope("1", "INBOX")), created(envelope("2", "INBOX"))},
-			Next:     "c1",
-			Complete: true,
+			Changes:          []Change{created(envelope("1", "INBOX")), created(envelope("2", "INBOX"))},
+			Next:             "c1",
+			EnumerationStart: true,
+			Complete:         true,
 		}},
 	}
 	if _, err := eng.SyncMailbox(context.Background(), acct, "INBOX", ad); err != nil {
@@ -722,7 +838,7 @@ func TestTruncatedEnumerationDoesNotSweep(t *testing.T) {
 	eng.MaxPages = 1
 	ad.call = 0
 	ad.pages = []*Changes{
-		{Changes: []Change{created(envelope("1", "INBOX"))}, Next: "p1", More: true, Complete: true},
+		{Changes: []Change{created(envelope("1", "INBOX"))}, Next: "p1", More: true, EnumerationStart: true},
 		{Changes: []Change{created(envelope("2", "INBOX"))}, Next: "p2", Complete: true},
 	}
 
@@ -735,6 +851,30 @@ func TestTruncatedEnumerationDoesNotSweep(t *testing.T) {
 	}
 	if store.count(acct) != 2 {
 		t.Errorf("stored %d messages, want 2; a truncated run swept live mail", store.count(acct))
+	}
+}
+
+func TestResumedFinalEnumerationPageDoesNotSweepEarlierPages(t *testing.T) {
+	eng, store, acct := setup(t)
+	ad := &scriptedAdapter{pages: []*Changes{{
+		Changes: []Change{created(envelope("1", "INBOX")), created(envelope("2", "INBOX"))},
+		Next:    "initial-next", More: true, EnumerationStart: true,
+	}}}
+	eng.MaxPages = 1
+	if _, err := eng.SyncMailbox(context.Background(), acct, "INBOX", ad); err != nil {
+		t.Fatal(err)
+	}
+
+	ad.call = 0
+	ad.pages = []*Changes{{
+		Changes: []Change{created(envelope("3", "INBOX"))},
+		Next:    "live-state", Complete: true,
+	}}
+	if _, err := eng.SyncMailbox(context.Background(), acct, "INBOX", ad); err != nil {
+		t.Fatal(err)
+	}
+	if store.count(acct) != 3 {
+		t.Fatalf("resumed final page swept earlier pages; count = %d", store.count(acct))
 	}
 }
 
@@ -870,3 +1010,82 @@ type rejectingAdapter struct{ scriptedAdapter }
 func (a *rejectingAdapter) Apply(context.Context, Operation) error {
 	return errors.New("provider rejected the operation")
 }
+
+// --- body prefetch -----------------------------------------------------------
+
+// Prefetch is what makes opening a message a database read instead of a live
+// round trip to the provider. Without it mail_bodies fills only when someone
+// opens something, so the first open of every message is slow — and "first
+// open" is every message a person has not read yet.
+func TestPrefetchStoresBodiesDuringSync(t *testing.T) {
+	eng, store, acct := setup(t)
+	eng.FetchBodies = true
+	ad := &scriptedAdapter{
+		boxes: []Mailbox{{ID: "INBOX", Name: "INBOX", Role: RoleInbox}},
+		pages: []*Changes{{
+			Changes: []Change{created(envelope("1", "INBOX")), created(envelope("2", "INBOX"))},
+			Next:    "cursor-1",
+		}},
+	}
+	if _, err := eng.SyncMailbox(context.Background(), acct, "INBOX", ad); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"1", "2"} {
+		mid := NativeMessageID(ProviderIMAP, id)
+		body, err := store.Body(context.Background(), acct, mid)
+		if err != nil {
+			t.Fatalf("message %s has no cached body: %v", id, err)
+		}
+		if body.Text != "body of "+string(mid) {
+			t.Errorf("message %s body = %q", id, body.Text)
+		}
+	}
+}
+
+// The engine's own default stays off — it is a library, and bodies are what
+// make a mirror unbounded. Only the server opts in.
+func TestPrefetchIsOffByDefault(t *testing.T) {
+	eng, store, acct := setup(t)
+	ad := &scriptedAdapter{
+		boxes: []Mailbox{{ID: "INBOX", Name: "INBOX", Role: RoleInbox}},
+		pages: []*Changes{{Changes: []Change{created(envelope("1", "INBOX"))}, Next: "c"}},
+	}
+	if _, err := eng.SyncMailbox(context.Background(), acct, "INBOX", ad); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Body(context.Background(), acct, NativeMessageID(ProviderIMAP, "1")); err == nil {
+		t.Fatal("a body was prefetched with FetchBodies off")
+	}
+	if len(ad.bodyCalls) != 0 {
+		t.Fatalf("adapter was asked for %d bodies with prefetch off", len(ad.bodyCalls))
+	}
+}
+
+// THE ONE THAT PAYS FOR THE FEATURE. An envelope is upserted again on every
+// flag change — a read receipt, a star, a move — and a body never changes.
+// Re-downloading one already held is most of the cost of having prefetch on,
+// and it lands exactly when someone is reading their mail.
+func TestPrefetchDoesNotRefetchABodyItAlreadyHas(t *testing.T) {
+	eng, _, acct := setup(t)
+	eng.FetchBodies = true
+	mid := NativeMessageID(ProviderIMAP, "1")
+
+	ad := &scriptedAdapter{
+		boxes: []Mailbox{{ID: "INBOX", Name: "INBOX", Role: RoleInbox}},
+		pages: []*Changes{
+			{Changes: []Change{created(envelope("1", "INBOX"))}, Next: "c1"},
+			{Changes: []Change{{Kind: ChangeUpdated, ID: mid, Envelope: ptrEnvelope(envelope("1", "INBOX"))}}, Next: "c2"},
+			{Changes: []Change{{Kind: ChangeUpdated, ID: mid, Envelope: ptrEnvelope(envelope("1", "INBOX"))}}, Next: "c3"},
+		},
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := eng.SyncMailbox(context.Background(), acct, "INBOX", ad); err != nil {
+			t.Fatalf("sync %d: %v", i, err)
+		}
+	}
+	if n := ad.bodyCalls[mid]; n != 1 {
+		t.Fatalf("body fetched %d times across three syncs, want 1", n)
+	}
+}
+
+func ptrEnvelope(e Envelope) *Envelope { return &e }

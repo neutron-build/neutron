@@ -111,7 +111,7 @@ test would have found that.
 
 ## Status
 
-153 Go tests and 16 TypeScript tests, all passing, including the live oracle
+169 Go tests and 16 TypeScript tests, all passing, including the live oracle
 against GreenMail and the store suite against a real Nucleus.
 
 **Gmail and Graph have never been run against live servers.** They are written

@@ -1,9 +1,118 @@
 package imap
 
 import (
+	"bufio"
+	"context"
+	"fmt"
+	"net"
 	"strings"
 	"testing"
+
+	"github.com/neutron-build/neutron/mail"
 )
+
+func TestVanishedUIDResolvesCanonicalStoredIdentity(t *testing.T) {
+	want := mail.HeaderMessageID("<canonical@example.com>")
+	ids := resolveVanished("INBOX", 44, []uint32{7}, map[uint32]mail.MessageID{7: want})
+	if len(ids) != 1 || ids[0] != want {
+		t.Fatalf("VANISHED resolved to %v, want %s", ids, want)
+	}
+}
+
+func TestCursorRoundTripsUIDIdentityMap(t *testing.T) {
+	want := mail.HeaderMessageID("<canonical@example.com>")
+	decoded, ok := decodeCursor(cursor{UIDValidity: 44, ModSeq: 9, UIDs: map[uint32]mail.MessageID{7: want}}.encode())
+	if !ok || decoded.UIDs[7] != want {
+		t.Fatalf("decoded cursor = %+v, ok %v", decoded, ok)
+	}
+}
+
+func TestLegacyCursorForcesCompatibilityFullScan(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+
+	commands := make(chan string, 2)
+	serverErr := make(chan error, 1)
+	go func() {
+		defer server.Close()
+		reader := bufio.NewReader(server)
+		for i := 0; i < 2; i++ {
+			command, err := reader.ReadString('\n')
+			if err != nil {
+				serverErr <- err
+				return
+			}
+			commands <- command
+			tag := strings.Fields(command)[0]
+			if i == 0 {
+				_, err = fmt.Fprintf(server, "* OK [UIDVALIDITY 44] UIDs valid\r\n* OK [HIGHESTMODSEQ 10] Highest\r\n%s OK examined\r\n", tag)
+			} else {
+				_, err = fmt.Fprintf(server, "%s OK fetched\r\n", tag)
+			}
+			if err != nil {
+				serverErr <- err
+				return
+			}
+		}
+		serverErr <- nil
+	}()
+
+	conn := &Conn{
+		raw:  client,
+		dec:  newDecoder(client),
+		caps: map[string]bool{"CONDSTORE": true},
+	}
+	a := New(conn)
+	old := mail.Cursor(`{"uidvalidity":44,"modseq":9,"uidnext":8}`)
+	changes, err := a.Sync(context.Background(), "INBOX", old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+	close(commands)
+	var got []string
+	for command := range commands {
+		got = append(got, command)
+	}
+	if len(got) != 2 || !strings.Contains(got[1], "UID FETCH 1:*") || strings.Contains(got[1], "CHANGEDSINCE") {
+		t.Fatalf("commands = %q, want full FETCH without CHANGEDSINCE", got)
+	}
+	if !changes.EnumerationStart || !changes.Complete {
+		t.Fatalf("changes = %+v, want authoritative compatibility scan", changes)
+	}
+	next, ok := decodeCursor(changes.Next)
+	if !ok || next.UIDs == nil {
+		t.Fatalf("next cursor = %+v, ok %v; UID map was not rebuilt", next, ok)
+	}
+}
+
+func TestMessageWithoutMessageIDRetainsFetchableUID(t *testing.T) {
+	tokens, err := tokenize(`(UID 7 ENVELOPE (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL))`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Adapter{conn: &Conn{uidValidity: 44}}
+	env, ok := a.parseFetch("INBOX", tokens[0])
+	if !ok || !mail.IsPositional(env.ID) {
+		t.Fatalf("parsed envelope = %+v, ok %v; want positional identity", env, ok)
+	}
+	uid, ok := fetchUID(tokens[0])
+	if !ok {
+		t.Fatal("FETCH UID was discarded")
+	}
+	got, ok := uidForIdentity(env.ID, map[uint32]mail.MessageID{uid: env.ID})
+	if !ok || got != 7 {
+		t.Fatalf("positional identity resolved to UID %d, ok %v; want 7", got, ok)
+	}
+	a.conn.selected = "INBOX"
+	a.rememberUIDs("INBOX", 44, map[uint32]mail.MessageID{7: env.ID})
+	got, err = a.uidFor(context.Background(), env.ID)
+	if err != nil || got != 7 {
+		t.Fatalf("adapter resolved positional identity to UID %d, err %v; want 7", got, err)
+	}
+}
 
 func TestTokenizeFlatResponse(t *testing.T) {
 	toks, err := tokenize(`* 12 FETCH (UID 4827 RFC822.SIZE 44827)`)

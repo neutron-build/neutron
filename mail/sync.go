@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 )
 
@@ -18,8 +19,14 @@ type Engine struct {
 	log   *slog.Logger
 
 	// FetchBodies makes the engine fetch and store a body for every message
-	// it sees. Off by default: bodies are what make a mirror unbounded, and
-	// the useful default is to fetch them on demand.
+	// it sees, so opening one is a database read rather than a live round trip
+	// to the provider.
+	//
+	// The zero value is off, because an unbounded mirror is the wrong default
+	// for a library: bodies are what make one unbounded. The SERVER turns it on
+	// (see mail.go), because a single-operator install holds a few hundred
+	// messages and the alternative is that every message is slow exactly once,
+	// which is every message a person has not read yet.
 	FetchBodies bool
 
 	// MaxPages bounds how many pages one Sync call will walk before
@@ -27,6 +34,15 @@ type Engine struct {
 	// stored cursor on the next call, so progress is never lost — the bound
 	// exists so one enormous mailbox cannot starve every other account.
 	MaxPages int
+
+	accountLocks sync.Map // AccountID -> *sync.Mutex
+}
+
+func (e *Engine) lockAccount(acct AccountID) func() {
+	value, _ := e.accountLocks.LoadOrStore(acct, &sync.Mutex{})
+	mu := value.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 // NewEngine builds an engine over a store.
@@ -61,6 +77,8 @@ type SyncReport struct {
 // Mailbox discovery runs first, so a folder created since the last sync is
 // picked up in the same pass rather than on the one after.
 func (e *Engine) SyncAccount(ctx context.Context, acct AccountID, ad Adapter) ([]SyncReport, error) {
+	unlock := e.lockAccount(acct)
+	defer unlock()
 	a, err := e.store.Account(ctx, acct)
 	if err != nil {
 		return nil, err
@@ -125,6 +143,7 @@ func (e *Engine) SyncMailbox(ctx context.Context, acct AccountID, box MailboxID,
 		seen            = map[MessageID]bool{}
 		enumerating     bool
 		ranToCompletion bool
+		finalComplete   bool
 	)
 
 	for page := 0; page < e.MaxPages; page++ {
@@ -158,9 +177,10 @@ func (e *Engine) SyncMailbox(ctx context.Context, acct AccountID, box MailboxID,
 		}
 
 		rep.Pages++
-		if changes.Complete {
+		if changes.EnumerationStart {
 			enumerating = true
 		}
+		finalComplete = changes.Complete
 		if err := e.apply(ctx, acct, box, ad, changes, rep, seen); err != nil {
 			return nil, err
 		}
@@ -179,7 +199,7 @@ func (e *Engine) SyncMailbox(ctx context.Context, acct AccountID, box MailboxID,
 		}
 	}
 
-	if enumerating && ranToCompletion {
+	if enumerating && ranToCompletion && finalComplete {
 		swept, err := e.sweepAbsent(ctx, acct, box, seen)
 		if err != nil {
 			return nil, err
@@ -302,7 +322,18 @@ func (e *Engine) apply(ctx context.Context, acct AccountID, box MailboxID, ad Ad
 
 	if e.FetchBodies {
 		for i := range upsert {
+			// A body never changes, and an envelope is upserted again for
+			// every flag change — a read receipt, a star, a move. Without this
+			// check the first sync after someone reads their mail re-downloads
+			// each message they touched, which is most of the cost of having
+			// prefetch on at all.
+			if _, err := e.store.Body(ctx, acct, upsert[i].ID); err == nil {
+				continue
+			}
 			if err := e.fetchBody(ctx, acct, ad, upsert[i].ID); err != nil {
+				// Warn and continue: a body that will not fetch is served
+				// on demand later, and one unreadable message must not stop
+				// the sync that carries every other one.
 				e.log.WarnContext(ctx, "body fetch failed",
 					"account", acct, "message", upsert[i].ID, "err", err)
 			}
@@ -350,6 +381,8 @@ func (e *Engine) Body(ctx context.Context, acct AccountID, id MessageID, ad Adap
 // make the mirror briefly the source of truth. If the provider rejects the
 // operation, nothing local changed.
 func (e *Engine) Apply(ctx context.Context, acct AccountID, op Operation, ad Adapter) error {
+	unlock := e.lockAccount(acct)
+	defer unlock()
 	if err := ad.Apply(ctx, op); err != nil {
 		return e.classify(ctx, acct, err)
 	}

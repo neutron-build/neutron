@@ -113,6 +113,11 @@ type Envelope struct {
 	ThreadID   ThreadID
 	MailboxIDs []MailboxID
 
+	// MailboxIDsComplete says the provider returned the message's complete
+	// membership set. IMAP FETCH only describes the selected mailbox, while
+	// Gmail, JMAP, and Graph return authoritative memberships.
+	MailboxIDsComplete bool
+
 	From    []Address
 	To      []Address
 	Cc      []Address

@@ -127,7 +127,7 @@ func TestIntegrationUpsertReplacesMailboxMembership(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	second := Envelope{ID: id, MailboxIDs: []MailboxID{"Archive"}, Subject: "after"}
+	second := Envelope{ID: id, MailboxIDs: []MailboxID{"Archive"}, MailboxIDsComplete: true, Subject: "after"}
 	if err := s.PutEnvelopes(ctx, acct, []Envelope{second}); err != nil {
 		t.Fatal(err)
 	}
@@ -141,6 +141,64 @@ func TestIntegrationUpsertReplacesMailboxMembership(t *testing.T) {
 	}
 	if got.Subject != "after" {
 		t.Errorf("Subject = %q, want the updated value", got.Subject)
+	}
+}
+
+func TestIntegrationPartialMembershipUpsertPreservesOtherMailboxes(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	acct := seedAccount(t, s)
+	id := HeaderMessageID("<imap-shared@example.com>")
+
+	if err := s.PutEnvelopes(ctx, acct, []Envelope{{ID: id, MailboxIDs: []MailboxID{"INBOX"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutEnvelopes(ctx, acct, []Envelope{{ID: id, MailboxIDs: []MailboxID{"Archive"}}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Envelope(ctx, acct, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.MailboxIDs) != 2 {
+		t.Fatalf("MailboxIDs = %v, want both IMAP memberships", got.MailboxIDs)
+	}
+}
+
+func TestIntegrationMailboxReconciliationRemovesStaleState(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	acct := seedAccount(t, s)
+	if err := s.PutMailboxes(ctx, acct, []Mailbox{{ID: "INBOX"}, {ID: "Deleted"}}); err != nil {
+		t.Fatal(err)
+	}
+	shared := HeaderMessageID("<shared-reconcile@example.com>")
+	orphan := HeaderMessageID("<orphan-reconcile@example.com>")
+	if err := s.PutEnvelopes(ctx, acct, []Envelope{
+		{ID: shared, MailboxIDs: []MailboxID{"INBOX", "Deleted"}},
+		{ID: orphan, MailboxIDs: []MailboxID{"Deleted"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutCursor(ctx, acct, "Deleted", "stale"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutMailboxes(ctx, acct, []Mailbox{{ID: "INBOX"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.Envelope(ctx, acct, shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.MailboxIDs) != 1 || got.MailboxIDs[0] != "INBOX" {
+		t.Errorf("shared memberships = %v, want [INBOX]", got.MailboxIDs)
+	}
+	if _, err := s.Envelope(ctx, acct, orphan); !errors.Is(err, ErrNoStore) {
+		t.Error("message orphaned by stale mailbox survived")
+	}
+	if cur, err := s.Cursor(ctx, acct, "Deleted"); err != nil || cur != "" {
+		t.Errorf("stale cursor = %q, err %v", cur, err)
 	}
 }
 
