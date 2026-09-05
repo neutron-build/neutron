@@ -25,10 +25,11 @@ const (
 
 // Adapter is a JMAP client bound to one account.
 type Adapter struct {
-	http      *http.Client
-	apiURL    string
-	accountID string
-	token     string
+	http        *http.Client
+	apiURL      string
+	downloadURL string
+	accountID   string
+	token       string
 }
 
 // Config describes how to reach a JMAP server.
@@ -45,7 +46,11 @@ type Config struct {
 }
 
 type session struct {
-	APIURL          string            `json:"apiUrl"`
+	APIURL string `json:"apiUrl"`
+	// DownloadURL is a template with {accountId}, {blobId}, {type} and {name}
+	// placeholders (RFC 8620 §1.6.2). It is the only way to reach blob bytes,
+	// so raw messages and attachments both go through it.
+	DownloadURL     string            `json:"downloadUrl"`
 	PrimaryAccounts map[string]string `json:"primaryAccounts"`
 }
 
@@ -84,7 +89,13 @@ func Dial(ctx context.Context, cfg Config) (*Adapter, error) {
 		return nil, fmt.Errorf("jmap: session lists no primary mail account")
 	}
 
-	return &Adapter{http: hc, apiURL: s.APIURL, accountID: acct, token: cfg.Token}, nil
+	return &Adapter{
+		http:        hc,
+		apiURL:      s.APIURL,
+		downloadURL: s.DownloadURL,
+		accountID:   acct,
+		token:       cfg.Token,
+	}, nil
 }
 
 func (a *Adapter) Provider() mail.Provider { return mail.ProviderJMAP }
@@ -540,17 +551,159 @@ func (a *Adapter) Body(ctx context.Context, id mail.MessageID) (*mail.Body, erro
 	return body, nil
 }
 
-// Raw downloads the original message via the blob download endpoint.
+// escapeTemplateValue percent-encodes everything outside RFC 3986's unreserved
+// set.
 //
-// Not implemented: the download URL is a per-session template from the
-// session resource, and nothing in the mirror needs the raw bytes when
-// Body already returns parsed content.
-func (a *Adapter) Raw(ctx context.Context, id mail.MessageID) (io.ReadCloser, error) {
-	return nil, fmt.Errorf("jmap: raw message download not implemented")
+// The template alone decides whether a placeholder lands in the path or the
+// query, so a value has to be safe in both. url.PathEscape is not: it leaves
+// '&', '=' and '+' intact, and an attachment filename is chosen by whoever
+// sent the mail — "a&x=y.txt" dropped into a query position would append a
+// parameter to someone else's URL.
+func escapeTemplateValue(s string) string {
+	const unreserved = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~"
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; strings.IndexByte(unreserved, c) >= 0 {
+			b.WriteByte(c)
+		} else {
+			fmt.Fprintf(&b, "%%%02X", s[i])
+		}
+	}
+	return b.String()
 }
 
+// expandDownload fills the session's download template (RFC 8620 §1.6.2).
+//
+// Every placeholder is substituted percent-encoded: a blob id is server-chosen
+// and a filename comes from the sender, so neither can be trusted to be path-
+// or query-safe. The template decides where each value lands, which is why the
+// server hands one out instead of the client assembling a URL.
+func (a *Adapter) expandDownload(blobID, mimeType, name string) (string, error) {
+	if a.downloadURL == "" {
+		return "", fmt.Errorf("jmap: session advertises no downloadUrl")
+	}
+	if blobID == "" {
+		return "", fmt.Errorf("jmap: no blob id to download")
+	}
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	if name == "" {
+		name = "download"
+	}
+	r := strings.NewReplacer(
+		"{accountId}", escapeTemplateValue(a.accountID),
+		"{blobId}", escapeTemplateValue(blobID),
+		"{type}", escapeTemplateValue(mimeType),
+		"{name}", escapeTemplateValue(name),
+	)
+	return r.Replace(a.downloadURL), nil
+}
+
+// download fetches one blob and hands back the undrained body.
+//
+// The caller closes it; on any non-200 this closes it here, since a reader the
+// caller never receives would otherwise leak the connection.
+func (a *Adapter) download(ctx context.Context, blobID, mimeType, name string) (io.ReadCloser, error) {
+	endpoint, err := a.expandDownload(blobID, mimeType, name)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.token)
+
+	resp, err := a.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("jmap: download: %w", err)
+	}
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		return resp.Body, nil
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		resp.Body.Close()
+		return nil, fmt.Errorf("jmap: download rejected the token: %w", mail.ErrReauthRequired)
+	case resp.StatusCode == http.StatusNotFound:
+		resp.Body.Close()
+		return nil, fmt.Errorf("jmap: %w: blob %s", mail.ErrNotFound, blobID)
+	default:
+		resp.Body.Close()
+		return nil, fmt.Errorf("jmap: download: unexpected status %d", resp.StatusCode)
+	}
+}
+
+// blobFor returns the message's own blob id — the RFC822 bytes as received.
+func (a *Adapter) blobFor(ctx context.Context, id mail.MessageID) (string, error) {
+	res, err := a.call(ctx, [3]any{"Email/get", map[string]any{
+		"accountId":  a.accountID,
+		"ids":        []string{string(id)},
+		"properties": []string{"blobId"},
+	}, "0"})
+	if err != nil {
+		return "", err
+	}
+	var out struct {
+		List []struct {
+			BlobID string `json:"blobId"`
+		} `json:"list"`
+	}
+	if err := json.Unmarshal(res[0], &out); err != nil {
+		return "", fmt.Errorf("jmap: decode blobId: %w", err)
+	}
+	if len(out.List) == 0 {
+		return "", fmt.Errorf("jmap: %w: message %s", mail.ErrNotFound, id)
+	}
+	return out.List[0].BlobID, nil
+}
+
+// Raw downloads the original RFC822 message through the blob endpoint.
+func (a *Adapter) Raw(ctx context.Context, id mail.MessageID) (io.ReadCloser, error) {
+	blob, err := a.blobFor(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return a.download(ctx, blob, "message/rfc822", string(id)+".eml")
+}
+
+// Attachment downloads one part of a message.
+//
+// JMAP addresses attachments by blob, not by part, so the part id is resolved
+// against the message's own attachment list first. Matching accepts either the
+// part id or the blob id: callers that kept a blob id from a previous Body
+// should not have to re-fetch to use it.
 func (a *Adapter) Attachment(ctx context.Context, id mail.MessageID, partID string) (io.ReadCloser, error) {
-	return nil, fmt.Errorf("jmap: attachment download not implemented")
+	res, err := a.call(ctx, [3]any{"Email/get", map[string]any{
+		"accountId":  a.accountID,
+		"ids":        []string{string(id)},
+		"properties": []string{"attachments"},
+	}, "0"})
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		List []struct {
+			Attachments []struct {
+				PartID string `json:"partId"`
+				BlobID string `json:"blobId"`
+				Type   string `json:"type"`
+				Name   string `json:"name"`
+			} `json:"attachments"`
+		} `json:"list"`
+	}
+	if err := json.Unmarshal(res[0], &out); err != nil {
+		return nil, fmt.Errorf("jmap: decode attachments: %w", err)
+	}
+	if len(out.List) == 0 {
+		return nil, fmt.Errorf("jmap: %w: message %s", mail.ErrNotFound, id)
+	}
+	for _, at := range out.List[0].Attachments {
+		if at.PartID == partID || (at.BlobID != "" && at.BlobID == partID) {
+			return a.download(ctx, at.BlobID, at.Type, at.Name)
+		}
+	}
+	return nil, fmt.Errorf("jmap: %w: part %s of message %s", mail.ErrNotFound, partID, id)
 }
 
 // Apply pushes a mutation via Email/set.
