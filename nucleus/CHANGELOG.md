@@ -5,6 +5,46 @@ Notable changes to the Nucleus engine. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Row-level locking for `FOR UPDATE` / `FOR SHARE`, with `SKIP LOCKED` and
+  `NOWAIT`.** The clause was previously either silently dropped (early) or
+  refused (`SKIP LOCKED`/`NOWAIT`) while plain `FOR UPDATE` was let through
+  as "advisory" — a behavioral examination of a real job-queue driver proved
+  that unsafe: two workers claimed 50 jobs and produced 51 deliveries, one
+  row twice. Row locks are now real: keyed by (table, primary-key tuple),
+  taken at PostgreSQL's LockRows position (after WHERE/ORDER BY, before
+  LIMIT), held by session and released at COMMIT, ROLLBACK, autocommit
+  statement end, and session teardown. `SKIP LOCKED` walks candidates in
+  result order filling the `offset + limit` budget, so a worker skips a
+  peer's held rows and still fills its LIMIT; `NOWAIT` (and plain-`FOR
+  UPDATE` timeout) reports `55P03 lock_not_available`. Joins, set
+  operations, DISTINCT, GROUP BY, aggregates, window functions, and tables
+  without a primary key are refused by name rather than approximately
+  locked. Locking queries bypass every result/plan/subquery cache and
+  streaming fast path. The claim shape `UPDATE ... WHERE id IN (SELECT ...
+  FOR UPDATE SKIP LOCKED LIMIT n)` is honoured, including with a
+  parameterized LIMIT. Note: sqlparser 0.61 requires `LIMIT` before the
+  locking clause; `... LIMIT 5 FOR UPDATE SKIP LOCKED` is accepted and
+  `... FOR UPDATE SKIP LOCKED LIMIT 5` is a parse error.
+
+### Fixed
+
+- **Parameterized LIMIT/OFFSET inside scalar subqueries.** A `$n` in a
+  LIMIT position inside `IN (SELECT ...)` had no inferred wire type (the
+  parameter walker stopped at the subquery border), decoded as TEXT, and
+  was refused as "LIMIT/OFFSET must be non-negative integer". The walker
+  now enters IN/scalar/EXISTS subqueries and types such parameters INT8;
+  a quoted integer is accepted as a bound, matching PostgreSQL's coercion
+  of unknown-typed literals.
+- **The plan cache replayed a stale LIMIT across prepared-statement
+  executions.** `EXECUTE take(3)` followed by `EXECUTE take(0)` returned
+  three rows for LIMIT 0: both EXECUTEs share one normalized cache key
+  and the cached plan bakes the limit value. Plan reuse now requires the
+  current LIMIT/OFFSET pair to equal the cached plan's baked pair. An
+  operand the planner cannot resolve (e.g. `LIMIT 'nope'`) routes to the
+  AST path, preserving the error instead of silently returning every row.
+
 ## [1.0.2] - 2026-08-31
 
 ### Fixed

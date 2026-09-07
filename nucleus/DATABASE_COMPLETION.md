@@ -24,10 +24,10 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 347488; Source Rust files: 308; Top-level modules: 53.
-- Declared unit tests: 4797; Declared integration tests: 455; Ignored tests: 53.
+- Source LOC: 348973; Source Rust files: 309; Top-level modules: 53.
+- Declared unit tests: 4818; Declared integration tests: 457; Ignored tests: 53.
   These are static declarations, not executed-test claims.
-- The most recent full library run executed 4,622 passing tests, 0 failing.
+- The most recent full library run executed 4,794 passing tests, 0 failing.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
   families, specialty indexes, encryption, TLS, embedded mode, physical backup v1, probes, Raft
   state-machine/runtime scaffolding, trusted SCRAM identities, role assumption, and RLS enforcement
@@ -99,6 +99,59 @@ Goal: close known semantic holes before expanding interfaces.
 - [x] Finish MVCC garbage collection/vacuum behavior for long snapshots and high churn.
 - [x] Add deterministic transaction-ID exhaustion/wraparound behavior.
 - [x] Ensure query caches and specialty indexes invalidate on every relevant DDL/DML transition.
+- [x] Implement row-level locking for `FOR UPDATE` / `FOR SHARE` with `SKIP LOCKED` and `NOWAIT`.
+      **Closed 2026-09-07.** The clause went through three eras. First it was parsed and silently
+      dropped — the guarantee-removal class. Then it was converted to a loud `0A000` refusal for
+      `SKIP LOCKED`/`NOWAIT`, while plain `FOR UPDATE`/`FOR SHARE` were allowed through on a
+      comment's claim that "the isolation the engine already provides is a stronger guarantee".
+      A behavioral examination of the PostgresQueueDriver substrate (2026-09-07, omi-rss exam)
+      disproved that claim with the driver itself: two workers, fifty jobs, clause stripped,
+      literal LIMIT — 51 deliveries for 50 jobs, one row `attempts=2`. Table-granularity 2PL does
+      not make an ignored plain FOR UPDATE safe, and snapshot reads do not substitute for row
+      locks; the clause is load-bearing for every SQL job queue.
+      Now enforced: `RowLockManager` (`src/storage/lock_manager.rs`) holds per-(table,
+      primary-key-tuple) locks by session — the key tuple, not a hash, so `Int32(7)` and
+      `Int64(7)` are one row by construction. Locks are taken in `executor::row_locks` at
+      PostgreSQL's LockRows position (after WHERE and ORDER BY, before LIMIT) on the
+      pre-projection row, so the primary key is lockable whether or not the SELECT list asked
+      for it. `SKIP LOCKED` walks the candidate rows in result order filling the statement's
+      `offset + limit` budget — a held row is skipped and its slot passes to the next
+      candidate, and rows past the budget are neither locked nor returned; `NOWAIT` and
+      plain-`FOR UPDATE` timeouts report `55P03 lock_not_available`; plain `FOR UPDATE` waits
+      bounded by `lock_timeout` and acquires in sorted key order so single-statement claims
+      cannot deadlock each other. Locks are held by session and released at COMMIT, ROLLBACK,
+      autocommit statement end, and session teardown — the unique-key gate's lifecycle.
+      Refused by name, never approximately locked: joins/set operations/DISTINCT/GROUP BY/
+      aggregates/window functions, and tables without a primary key (no identity to lock
+      with). Locking queries decline every cache and fast path that bypasses the AST row
+      pipeline — plan execution, streaming scans, top-K truncation, index-only scans, the
+      query result cache, and the non-correlated IN-subquery cache (a cached replay would
+      hand out a row set without taking its locks — the double-delivery defect reintroduced
+      by an optimization). The claim shape `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE
+      SKIP LOCKED LIMIT n)` locks through the same path, including as a prepared statement
+      with a parameterized LIMIT. Acceptance evidence: `executor::tests::test_row_locks`
+      (16 tests, each with its control) — two workers drain fifty jobs with exactly 50
+      deliveries, zero overlap, no `attempts=2` row; `storage::lock_manager::row_lock_tests`
+      (10 tests) covers identity, re-entrancy, timeout, and wake-on-release. Known limit:
+      sqlparser 0.61 rejects `FOR UPDATE` before `LIMIT` in clause order (upstream grammar);
+      `LIMIT n FOR UPDATE ...` order is accepted and is what the driver emits.
+- [x] Resolve `$n` placeholders in LIMIT/OFFSET and keep the plan cache honest across
+      different bound values.
+      **Closed 2026-09-07 (same exam).** Two independent defects made the canonical claim
+      query unrunnable. A LIMIT-position parameter inside a scalar subquery
+      (`... IN (SELECT ... LIMIT $4)`) had no inferred wire type — the inference walker
+      stopped at the subquery border — decoded as TEXT, and the const evaluator refused it.
+      The walker now enters `IN`/scalar/`EXISTS` subqueries and marks LIMIT/OFFSET
+      parameters INT8, and a quoted integer is accepted as a bound (`LIMIT '5'`, PG's
+      own coercion for unknown-typed literals) while anything else keeps its refusal.
+      Separately, the plan cache replayed a stale LIMIT: `EXECUTE take(3)` followed by
+      `EXECUTE take(0)` returned three rows for LIMIT 0, because both EXECUTEs share one
+      normalized cache key and the cached plan bakes the limit value. Plan reuse now
+      requires the current LIMIT/OFFSET pair to equal the baked pair, and an operand the
+      planner cannot resolve routes to the AST path so the "must be non-negative integer"
+      refusal still fires instead of silently returning every row. Pinned by
+      `a_bound_limit_parameter_limits`, `a_bound_limit_parameter_inside_the_claim_subquery_limits`,
+      `a_non_integer_limit_parameter_errors`, and `a_quoted_integer_literal_limits`.
 
 Evidence:
 
