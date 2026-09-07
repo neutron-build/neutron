@@ -44,10 +44,14 @@
     "test": "pnpm run build && node --test --experimental-test-isolation=none \"dist/**/*.test.js\""
   },
   "peerDependencies": {
-    "@neutron-build/ai": "^0.1.0"
+    "@neutron-build/ai": "^0.1.0",
+    "postgres": "^3.4.7"
   },
   "peerDependenciesMeta": {
     "@neutron-build/ai": {
+      "optional": true
+    },
+    "postgres": {
       "optional": true
     }
   },
@@ -55,6 +59,7 @@
     "@neutron-build/ai": "workspace:^",
     "@neutron-build/nucleus": "workspace:^",
     "@types/node": "^22.10.7",
+    "postgres": "^3.4.7",
     "typescript": "^5.7.2"
   },
   "publishConfig": {

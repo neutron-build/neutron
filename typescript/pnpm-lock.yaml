@@ -581,6 +581,9 @@ importers:
       '@types/node':
         specifier: ^22.10.7
         version: 22.19.11
+      postgres:
+        specifier: ^3.4.7
+        version: 3.4.8
       typescript:
         specifier: ^5.7.2
         version: 5.7.2

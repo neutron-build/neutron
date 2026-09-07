@@ -13,6 +13,9 @@ export type { EventStore } from "./store.js";
 export { NucleusEventStore } from "./nucleus-store.js";
 export type { StreamsLike } from "./nucleus-store.js";
 
+export { PostgresEventStore } from "./postgres-store.js";
+export type { PostgresLike } from "./postgres-store.js";
+
 export { Lease, LeaseManager, executeRunExclusive } from "./lease.js";
 export type { ExecuteRunExclusiveOptions, KVLike, LeaseManagerOptions } from "./lease.js";
 

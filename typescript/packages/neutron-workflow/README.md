@@ -79,6 +79,28 @@ dependencies; a Nucleus client just fits. Leases make ticks idempotent,
 so run as many scheduler processes as you like. Crash recovery is free:
 a dead executor's lease expires and the next claimer replays the log.
 
+## Running on Postgres
+
+```ts
+import postgres from "postgres";
+import { LeaseManager, PostgresEventStore, Scheduler, createEventsHandler } from "@neutron-build/workflow";
+
+const sql = postgres(process.env.DATABASE_URL!);
+const store = new PostgresEventStore(sql);   // event log keyed (run_id, seq) — append-only
+await store.connect();                       // idempotent DDL (also runs lazily on first use)
+const leases = new LeaseManager(store);      // the same lease/heartbeat pattern, on PG rows
+```
+
+Events insert `ON CONFLICT (run_id, seq) DO NOTHING` — the primary key
+enforces the first-writer-wins dedupe the EventStore contract requires,
+so two executors racing a lease can never corrupt a log. The store also
+implements the lease primitives, so a `LeaseManager` over it gives the
+same acquire/heartbeat/steal semantics as the Nucleus KV driver, with
+all time math on the database clock. Structurally typed — `postgres` is
+an optional peer dependency, and the driver targets the PostgreSQL wire
+semantics (transactions, `ON CONFLICT`, row-level `UPDATE ... RETURNING`)
+so it runs unchanged on Nucleus once its SQL subset catches up.
+
 ## Agent approvals that survive weeks
 
 With `@neutron-build/ai` installed (optional peer):
