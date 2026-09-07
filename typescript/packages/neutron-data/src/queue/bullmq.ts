@@ -1,4 +1,4 @@
-import type { Job, JobHandler, QueueDriver } from "./index.js";
+import type { Job, JobHandler, QueueDriver, ScheduleOptions } from "./index.js";
 import { lazyImport } from "../internal/lazy-import.js";
 
 export interface BullMqQueueDriverOptions {
@@ -12,8 +12,18 @@ interface RedisLikeConnection {
   quit(): Promise<unknown>;
 }
 
+interface BullMqRepeatOptions {
+  pattern?: string;
+  key?: string;
+}
+
 interface BullMqQueueLike {
-  add(name: string, payload: unknown): Promise<{ id: string | number | undefined }>;
+  add(
+    name: string,
+    payload: unknown,
+    opts?: { repeat?: BullMqRepeatOptions }
+  ): Promise<{ id: string | number | undefined }>;
+  removeRepeatable(name: string, repeatOpts: BullMqRepeatOptions): Promise<unknown>;
   close(): Promise<void>;
 }
 
@@ -34,6 +44,7 @@ type BullMqQueueCtor = new (
 
 export class BullMqQueueDriver implements QueueDriver {
   private readonly handlers = new Map<string, JobHandler<unknown>>();
+  private readonly schedules = new Map<string, { pattern: string }>();
   private worker: BullMqWorkerLike | null = null;
 
   constructor(
@@ -69,6 +80,26 @@ export class BullMqQueueDriver implements QueueDriver {
     }
     await this.queue.close();
     await this.connection.quit();
+  }
+
+  async schedule(
+    id: string,
+    pattern: string,
+    payload: unknown,
+    _opts?: ScheduleOptions
+  ): Promise<void> {
+    const repeat = { pattern, key: id };
+    await this.queue.add(id, payload, { repeat });
+    this.schedules.set(id, { pattern });
+  }
+
+  async unschedule(id: string): Promise<void> {
+    const known = this.schedules.get(id);
+    if (!known) {
+      return;
+    }
+    await this.queue.removeRepeatable(id, { pattern: known.pattern, key: id });
+    this.schedules.delete(id);
   }
 
   private async ensureWorker(): Promise<void> {

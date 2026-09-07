@@ -56,12 +56,19 @@ export {
   type Job,
   type JobHandler,
   type DeadLetter,
+  type ScheduleOptions,
 } from "./queue/index.js";
 export {
   BullMqQueueDriver,
   createBullMqQueueDriver,
   type BullMqQueueDriverOptions,
 } from "./queue/bullmq.js";
+export {
+  PostgresQueueDriver,
+  createPostgresQueueDriver,
+  type PostgresQueueDriverOptions,
+  type PostgresQueueSql,
+} from "./queue/postgres.js";
 
 export {
   createJobs,

@@ -14,11 +14,23 @@ interface MockJob {
 class MockBullMqQueue {
   private jobs: Map<string, MockJob> = new Map();
   private idCounter = 1;
+  readonly addCalls: Array<{ name: string; payload: unknown; opts?: unknown }> = [];
+  readonly removeRepeatableCalls: Array<{ name: string; repeatOpts: unknown }> = [];
 
-  async add(name: string, payload: unknown): Promise<{ id: string | number | undefined }> {
+  async add(
+    name: string,
+    payload: unknown,
+    opts?: { repeat?: unknown }
+  ): Promise<{ id: string | number | undefined }> {
     const id = String(this.idCounter++);
     this.jobs.set(id, { id, name, data: payload, timestamp: Date.now() });
+    this.addCalls.push({ name, payload, opts });
     return { id };
+  }
+
+  async removeRepeatable(name: string, repeatOpts: unknown): Promise<boolean> {
+    this.removeRepeatableCalls.push({ name, repeatOpts });
+    return true;
   }
 
   async close(): Promise<void> {
@@ -203,4 +215,85 @@ test("BullMqQueueDriver handles multiple job types", async () => {
   assert.ok(handlers.has("sms-called"));
 
   await driver.close();
+});
+
+test("BullMqQueueDriver.schedule maps to a native repeatable keyed by id", async () => {
+  const queue = new MockBullMqQueue();
+  const connection = new MockRedisConnection();
+  const driver = new BullMqQueueDriver(
+    queue as any,
+    MockBullMqWorker as any,
+    {},
+    "test-queue",
+    connection as any
+  );
+
+  await driver.schedule("nightly-report", "0 3 * * *", { kind: "report" });
+
+  assert.equal(queue.addCalls.length, 1);
+  assert.equal(queue.addCalls[0].name, "nightly-report");
+  assert.deepEqual(queue.addCalls[0].opts, {
+    repeat: { pattern: "0 3 * * *", key: "nightly-report" },
+  });
+  assert.deepEqual(queue.addCalls[0].payload, { kind: "report" });
+});
+
+test("BullMqQueueDriver.unschedule removes the repeatable with the same opts used to add it", async () => {
+  const queue = new MockBullMqQueue();
+  const connection = new MockRedisConnection();
+  const driver = new BullMqQueueDriver(
+    queue as any,
+    MockBullMqWorker as any,
+    {},
+    "test-queue",
+    connection as any
+  );
+
+  await driver.schedule("nightly-report", "0 3 * * *", null);
+  await driver.unschedule("nightly-report");
+
+  assert.equal(queue.removeRepeatableCalls.length, 1);
+  assert.equal(queue.removeRepeatableCalls[0].name, "nightly-report");
+  assert.deepEqual(queue.removeRepeatableCalls[0].repeatOpts, {
+    pattern: "0 3 * * *",
+    key: "nightly-report",
+  });
+});
+
+test("BullMqQueueDriver.unschedule is a no-op for an unknown id", async () => {
+  const queue = new MockBullMqQueue();
+  const connection = new MockRedisConnection();
+  const driver = new BullMqQueueDriver(
+    queue as any,
+    MockBullMqWorker as any,
+    {},
+    "test-queue",
+    connection as any
+  );
+
+  await driver.unschedule("never-scheduled");
+
+  assert.equal(queue.removeRepeatableCalls.length, 0);
+});
+
+test("BullMqQueueDriver.schedule twice replaces the remembered pattern", async () => {
+  const queue = new MockBullMqQueue();
+  const connection = new MockRedisConnection();
+  const driver = new BullMqQueueDriver(
+    queue as any,
+    MockBullMqWorker as any,
+    {},
+    "test-queue",
+    connection as any
+  );
+
+  await driver.schedule("ticker", "*/5 * * * *", null);
+  await driver.schedule("ticker", "0 * * * *", null);
+  await driver.unschedule("ticker");
+
+  assert.equal(queue.removeRepeatableCalls.length, 1);
+  assert.deepEqual(queue.removeRepeatableCalls[0].repeatOpts, {
+    pattern: "0 * * * *",
+    key: "ticker",
+  });
 });

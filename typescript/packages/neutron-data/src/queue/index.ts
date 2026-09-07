@@ -1,3 +1,7 @@
+import cronParser from "cron-parser";
+
+const { parseExpression } = cronParser;
+
 export interface Job<TPayload = unknown> {
   id: string;
   name: string;
@@ -13,10 +17,33 @@ export interface DeadLetter<TPayload = unknown> {
   error: unknown;
 }
 
+export interface ScheduleOptions {
+  /**
+   * Queue the recurring job should be enqueued on. Only the Postgres driver
+   * honors this today; other drivers ignore it.
+   */
+  queue?: string;
+}
+
 export interface QueueDriver {
   add<TPayload = unknown>(name: string, payload: TPayload): Promise<Job<TPayload>>;
   process<TPayload = unknown>(name: string, handler: JobHandler<TPayload>): Promise<void>;
+  /**
+   * Register or replace a recurring job identified by `id`, firing on the
+   * cron `pattern` (five or six fields; six-field patterns add a leading
+   * seconds field). The fired job's name is `id`.
+   *
+   * Durability is driver-specific: the Postgres driver persists schedules in
+   * the `neutron_schedules` table, the BullMQ driver uses its native
+   * repeatables, and the InMemory driver is dev-only — schedules vanish on
+   * restart and missed windows are not caught up.
+   */
+  schedule(id: string, pattern: string, payload: unknown, opts?: ScheduleOptions): Promise<void>;
+  /** Remove a schedule previously registered with `schedule()`. */
+  unschedule(id: string): Promise<void>;
 }
+
+type CronInterval = ReturnType<typeof parseExpression<false>>;
 
 const MAX_ATTEMPTS = 3;
 const RETRY_BACKOFF_MS = 10;
@@ -27,6 +54,8 @@ export class InMemoryQueueDriver implements QueueDriver {
   private jobs: Job<any>[] = [];
   private draining = false;
   private deadLettersInternal: DeadLetter<any>[] = [];
+  private scheduleTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private scheduleIds = new Set<string>();
 
   get deadLetters(): DeadLetter<any>[] {
     return [...this.deadLettersInternal];
@@ -88,6 +117,67 @@ export class InMemoryQueueDriver implements QueueDriver {
         }
         await new Promise((resolve) => setTimeout(resolve, RETRY_BACKOFF_MS));
       }
+    }
+  }
+
+  async schedule(
+    id: string,
+    pattern: string,
+    payload: unknown,
+    _opts?: ScheduleOptions
+  ): Promise<void> {
+    const interval = parseExpression(pattern);
+    this.clearSchedule(id);
+    this.scheduleIds.add(id);
+    this.armSchedule(id, interval, payload);
+  }
+
+  async unschedule(id: string): Promise<void> {
+    this.scheduleIds.delete(id);
+    this.clearSchedule(id);
+  }
+
+  /**
+   * Dev-only: clears all pending schedule timers. Jobs already queued or
+   * mid-flight are unaffected.
+   */
+  close(): void {
+    for (const id of [...this.scheduleTimers.keys()]) {
+      this.clearSchedule(id);
+    }
+  }
+
+  private armSchedule(
+    id: string,
+    interval: CronInterval,
+    payload: unknown
+  ): void {
+    const delay = Math.max(0, interval.next().toDate().getTime() - Date.now());
+    const timer = setTimeout(() => {
+      this.scheduleTimers.delete(id);
+      if (!this.scheduleIds.has(id)) {
+        return;
+      }
+      this.jobs.push({
+        id: `sched-${id}-${Date.now()}`,
+        name: id,
+        payload,
+        createdAt: Date.now(),
+      });
+      void this.drain();
+      this.armSchedule(id, interval, payload);
+    }, delay);
+    if (typeof timer.unref === "function") {
+      timer.unref();
+    }
+    this.scheduleTimers.set(id, timer);
+  }
+
+  private clearSchedule(id: string): void {
+    const timer = this.scheduleTimers.get(id);
+    if (timer) {
+      clearTimeout(timer);
+      this.scheduleTimers.delete(id);
     }
   }
 }
