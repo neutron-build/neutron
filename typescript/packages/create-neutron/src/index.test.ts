@@ -167,7 +167,7 @@ function resolveDependencyVersions(targetDir: string): {
 } {
   const workspaceRoot = findWorkspaceRoot(path.dirname(targetDir));
   if (!workspaceRoot) {
-    return { neutron: "latest", neutronCli: "latest" };
+    return { neutron: "^0.2.2", neutronCli: "^0.2.3" };
   }
   return { neutron: "workspace:*", neutronCli: "workspace:*" };
 }
@@ -495,14 +495,14 @@ describe("findWorkspaceRoot", () => {
 // ---------------------------------------------------------------------------
 
 describe("resolveDependencyVersions", () => {
-  it("returns latest when outside a workspace", () => {
+  it("returns the pinned release pair when outside a workspace", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cn-deps-"));
     try {
       const targetDir = path.join(tmpDir, "my-app");
       fs.mkdirSync(targetDir, { recursive: true });
       const result = resolveDependencyVersions(targetDir);
-      assert.equal(result.neutron, "latest");
-      assert.equal(result.neutronCli, "latest");
+      assert.match(result.neutron, /^\^/);
+      assert.match(result.neutronCli, /^\^/);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -810,6 +810,21 @@ describe("scaffoldProject (real export)", () => {
       } finally {
         fs.rmSync(targetDir, { recursive: true, force: true });
       }
+    }
+  });
+
+  it("pins the released dependency pair when scaffolding outside a workspace", async () => {
+    // The external path is where every `latest`-floating site came from.
+    const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "cn-external-"));
+    try {
+      await scaffoldProject({ targetDir, template: "basic", runtime: "preact" });
+      const pkg = JSON.parse(fs.readFileSync(path.join(targetDir, "package.json"), "utf8"));
+      assert.notEqual(pkg.dependencies["@neutron-build/core"], "latest");
+      assert.notEqual(pkg.dependencies["@neutron-build/cli"], "latest");
+      assert.match(pkg.dependencies["@neutron-build/core"], /^\^/);
+      assert.match(pkg.dependencies["@neutron-build/cli"], /^\^/);
+    } finally {
+      fs.rmSync(targetDir, { recursive: true, force: true });
     }
   });
 

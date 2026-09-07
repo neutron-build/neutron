@@ -160,16 +160,21 @@ export function isTemplateName(value: string): value is TemplateName {
   return TEMPLATE_NAMES.includes(value as TemplateName);
 }
 
+// Updated at each release. An external scaffold must start on the released
+// pair, not float on `latest` — every site that drifted onto an untested
+// combination was created by that fallback.
+const PINNED_DEPENDENCY_VERSIONS = {
+  neutron: "^0.2.2",
+  neutronCli: "^0.2.3",
+};
+
 function resolveDependencyVersions(targetDir: string): {
   neutron: string;
   neutronCli: string;
 } {
   const workspaceRoot = findWorkspaceRoot(path.dirname(targetDir));
   if (!workspaceRoot) {
-    return {
-      neutron: "latest",
-      neutronCli: "latest",
-    };
+    return { ...PINNED_DEPENDENCY_VERSIONS };
   }
 
   return {

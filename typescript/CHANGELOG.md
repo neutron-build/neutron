@@ -4,6 +4,53 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [core 0.2.2, cli 0.2.3, create-neutron 0.1.5] - 2026-09-07
+
+### Fixed
+
+- **A root `not-found.tsx` could render at `/` in place of the index page —
+  on the client only.** A `not-found.tsx` carries its directory's path, so a
+  root one is path `/` and collides with the index route. The server trie has
+  always skipped such routes; the client route manifest never emitted the
+  flag that lets the client do the same, so hydration picked whichever of the
+  two the build happened to list first. Ordering was the only thing keeping a
+  404 page from rendering at `/`. The manifest now carries `isNotFound` and
+  the client skips those routes, mirroring the server. Older route tables
+  omit the flag, which reads as false — the previous behaviour.
+
+- **`neutron-ts build` and every other command died at module load if the
+  published create-neutron was stale.** cli@0.2.2's init command imports
+  named exports from create-neutron; the published 0.1.3 tree had neither
+  the exports field nor the built file. init is now a dynamic import, so
+  scaffolding code is never on the path of build, dev or preview, and
+  create-neutron 0.1.4+ publishes a real entry.
+
+### Changed
+
+- **JSX settings are derived from the declared runtime; `vite.config.ts` is
+  optional.** `runtime` is declared once, in neutron.config.ts; the JSX
+  transform is now derived from it (resolveRuntimeJsx) instead of being
+  restated per project. A project needs no Vite plugin to compile JSX.
+  `@preact/preset-vite` remains useful in dev for HMR and devtools.
+
+- **The build warns when a project registers `neutronPlugin()` in its own
+  vite.config.** The CLI injects its own configured instance; the project's
+  copy resolves from the project's `@neutron-build/core`, which is often
+  older than the CLI's, and whichever instance answers first decides route
+  semantics. dev drops the duplicate; build only warns for now — silently
+  dropping it would move version-skewed projects onto different route
+  semantics. Aligning versions first, then the dedupe follows.
+
+- **The five templates are identical and register no plugin, and CI builds
+  every one of them.** Previously four templates told you to register
+  `neutronPlugin()` and one did not, and nothing ever compiled a scaffold —
+  which is how the docs template shipped unbuildable. Templates keep the
+  Preact plugin for dev niceties only. External scaffolds also now pin the
+  released dependency pair instead of `latest`, which is where every
+  floating site came from.
+
+## [core 0.2.1] - 2026-09-07
+
 ### Added
 
 - **`not-found.tsx` renders a 404 through the app's layout chain.** A
