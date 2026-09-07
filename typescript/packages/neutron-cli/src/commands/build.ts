@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import { createHash } from "node:crypto";
 import { build as viteBuild, loadConfigFromFile, mergeConfig, createServer } from "vite";
 import { neutronPlugin, CLIENT_ROUTE_QUERY } from "@neutron-build/core/vite";
-import { runtimeEsbuild } from "../lib/vite-shared.js";
+import { runtimeEsbuild, warnOnDuplicateCorePlugin } from "../lib/vite-shared.js";
 import {
   discoverRoutes,
   adapterCloudflare,
@@ -53,15 +53,6 @@ export async function build(): Promise<void> {
   const runtime = resolveRuntime(neutronConfig);
   // JSX comes from the declared runtime, so a project needs no Vite plugin of
   // its own to compile it: the fact is stated once, in neutron.config.ts.
-  //
-  // NOT done here yet: stripping a project's duplicate `neutronPlugin()` the
-  // way dev.ts does. It is the right end state, but the two instances
-  // currently emit different route tables, and dropping the duplicate changes
-  // a `not-found.tsx` route's path in the CLIENT manifest from its file path
-  // to its directory path. The manifest does not carry `isNotFound`, which
-  // core/router.ts relies on to keep such a route out of the trie, so the
-  // client matcher would let it shadow that directory's index route. Fix the
-  // manifest first, then dedupe here.
   const esbuildJsx = runtimeEsbuild(runtime);
   const runtimeAliases = resolveRuntimeAliases(runtime);
   const runtimeNoExternal = resolveRuntimeNoExternal(runtime);
@@ -164,6 +155,14 @@ export async function build(): Promise<void> {
   );
 
   const userConfig = loadedConfig?.config || {};
+  // A project that also registers neutronPlugin() in its own vite.config gets
+  // two instances, and Vite's mergeConfig concatenates rather than replaces.
+  // Worse, the project's copy is imported from ITS @neutron-build/core, which
+  // is often an older version than this CLI's, so which one answers for the
+  // route manifest decides real behaviour. dev.ts drops the duplicate; build
+  // cannot follow until versions are aligned, because dropping it silently
+  // switches a skewed project onto different route semantics. Say so instead.
+  warnOnDuplicateCorePlugin(userConfig.plugins);
 
   // CSS Modules: pin scoped class names to a deterministic function of (local
   // name, file path). The static/app pages are pre-rendered by a Vite *dev* SSR

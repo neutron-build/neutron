@@ -32,6 +32,7 @@ interface RouteRegistration {
   path?: string;
   parentId?: string | null;
   isLayout?: boolean;
+  isNotFound?: boolean;
   mode?: "static" | "app";
   hasLoader?: boolean;
   load?: () => Promise<unknown>;
@@ -47,6 +48,15 @@ interface RouteInfo {
   load: () => Promise<RouteModule>;
   parentId: string | null;
   isLayout: boolean;
+  /**
+   * A `not-found.tsx` carries its DIRECTORY's path, so on the client it is
+   * indistinguishable by path from that directory's index route. The server
+   * trie keeps it out for the same reason (see core/router.ts); this router
+   * must skip it too, or a 404 page shadows the page it was meant to cover.
+   * Older route tables omit the flag, which reads as false — the previous
+   * behaviour.
+   */
+  isNotFound: boolean;
   /**
    * Emitted into the route table by the build. The client cannot derive
    * either: `mode` lives in server-side route config, and `loader` is stripped
@@ -229,7 +239,7 @@ async function handleIncomingDataUpdate(data: LoaderData): Promise<void> {
 
 function findRoute(pathname: string): RouteInfo | null {
   for (const route of routes) {
-    if (route.isLayout) continue;
+    if (route.isLayout || route.isNotFound) continue;
     if (matchPath(route.path, pathname)) {
       return route;
     }
@@ -823,6 +833,7 @@ export function registerRoutes(routeMap: Record<string, RouteRegistration | Rout
         : async () => normalizeRouteModule(registration),
     parentId: registration.parentId ?? null,
     isLayout: registration.isLayout === true,
+    isNotFound: registration.isNotFound === true,
     mode: registration.mode,
     hasLoader: registration.hasLoader,
   }));

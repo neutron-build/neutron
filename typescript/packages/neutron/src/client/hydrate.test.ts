@@ -36,6 +36,7 @@ interface RouteReg {
   path?: string;
   parentId?: string | null;
   isLayout?: boolean;
+  isNotFound?: boolean;
   mode?: "static" | "app";
   hasLoader?: boolean;
   default: ComponentType;
@@ -756,5 +757,35 @@ describe("hydrate — document click interceptor", () => {
     await flush();
     expect(booted.app.querySelector("main .title")?.textContent).toBe("About");
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("hydrate — a not-found route never shadows the page it covers", () => {
+  // A `not-found.tsx` carries its DIRECTORY's path, so on the client it
+  // collides by path with that directory's index route. Only the isNotFound
+  // flag separates them; before the build emitted it, whichever route came
+  // first in the manifest won.
+  it("renders the index route at /, even when not-found is listed first", async () => {
+    history.replaceState({}, "", "/");
+    const { app } = await bootRouter({
+      pathname: "/",
+      routeId: "route:index",
+      routes: ({ h }) => ({
+        "route:not-found": {
+          path: "/",
+          mode: "app",
+          isNotFound: true,
+          default: () => h("p", null, "four oh four"),
+        },
+        "route:index": {
+          path: "/",
+          mode: "app",
+          default: () => h("p", null, "the real home page"),
+        },
+      }),
+    });
+
+    expect(app.textContent).toContain("the real home page");
+    expect(app.textContent).not.toContain("four oh four");
   });
 });
