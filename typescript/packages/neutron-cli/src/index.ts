@@ -6,7 +6,9 @@ import { start } from "./commands/start.js";
 import { deployCheck } from "./commands/deploy-check.js";
 import { worker } from "./commands/worker.js";
 import { releaseCheck } from "./commands/release-check.js";
-import { init } from "./commands/init.js";
+// `init` is NOT imported here. It pulls in create-neutron (templates and
+// scaffolding), which every other command has no use for — a static import
+// makes an unresolvable scaffolder break `build` and `dev` at module load.
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -34,9 +36,11 @@ async function main() {
     case "worker":
       await worker();
       break;
-    case "init":
+    case "init": {
+      const { init } = await import("./commands/init.js");
       await init();
       break;
+    }
     default:
       console.log(`Neutron TypeScript CLI
 
