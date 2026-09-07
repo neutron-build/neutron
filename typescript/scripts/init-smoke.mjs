@@ -23,6 +23,7 @@ const BOOT_TEMPLATE = "basic";
 const PORT = 3141;
 const ORIGIN = `http://127.0.0.1:${PORT}`;
 const READINESS_TIMEOUT_MS = 60000;
+const BUILD_TIMEOUT_MS = 300000;
 const INSTALL_TIMEOUT_MS = 300000;
 
 const workspaceRoot = process.cwd();
@@ -232,6 +233,34 @@ function scaffold(template) {
   return projectName;
 }
 
+/**
+ * Build a scaffolded template the way a user would.
+ *
+ * Scaffolding proved the files land; it never proved they compile. That gap is
+ * why the `docs` template shipped unbuildable: its config differed from the
+ * others and nothing ever ran `build` on it.
+ */
+function buildScaffold(projectName) {
+  const projectDir = path.join(workspaceRoot, "examples", projectName);
+  console.log(`[init] building examples/${projectName}`);
+  run("node", [path.join(workspaceRoot, "packages", "neutron-cli", "dist", "index.js"), "build"], {
+    cwd: projectDir,
+    timeout: BUILD_TIMEOUT_MS,
+  });
+  const dist = path.join(projectDir, "dist");
+  check(fs.existsSync(dist), `[init] build produced no dist/ (${projectName})`);
+  const pages = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith(".html")) pages.push(full);
+    }
+  };
+  walk(dist);
+  check(pages.length > 0, `[init] build emitted no HTML (${projectName})`);
+}
+
 async function main() {
   const projectName = scaffold(BOOT_TEMPLATE);
   for (const template of TEMPLATES.filter((name) => name !== BOOT_TEMPLATE)) {
@@ -242,6 +271,12 @@ async function main() {
   run("pnpm", ["install", "--no-frozen-lockfile", "--reporter", "append-only"], {
     timeout: INSTALL_TIMEOUT_MS,
   });
+
+  // Every template must BUILD, not just scaffold. Cheap next to the install
+  // that already happened, and it is the check that was missing.
+  for (const template of TEMPLATES) {
+    buildScaffold(`init-smoke-${template}`);
+  }
 
   console.log(`[init] Starting dev server for ${projectName} (${ORIGIN})`);
   const child = startDevServer(projectName);
