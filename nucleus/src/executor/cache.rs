@@ -490,6 +490,17 @@ impl Executor {
             "GDPR_",
             // Encrypted index lookup
             "ENCRYPTED_LOOKUP(",
+            // Row-locking clauses. The executor's cache check reads only the
+            // TOP-LEVEL query's `locks`; a clause nested in a CTE body or a
+            // FROM-subquery would pass that flag, and a cached replay serves
+            // rows without taking the locks the clause promises — the
+            // silent-guarantee-drop class. Text match is deliberately coarse:
+            // a false positive (the phrase inside a string literal) only
+            // skips the cache.
+            "FOR UPDATE",
+            "FOR SHARE",
+            "FOR NO KEY UPDATE",
+            "FOR KEY SHARE",
         ];
         for pat in STATEFUL_PATTERNS {
             if upper.contains(pat) {

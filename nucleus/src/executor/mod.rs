@@ -148,6 +148,7 @@ pub mod param_subst;
 mod policy;
 mod project;
 mod query;
+mod row_locks;
 pub(crate) mod row_batch;
 mod scalar_fns;
 mod scan_stream;
@@ -436,6 +437,11 @@ pub struct Executor {
     /// quoted in slow-query log lines so two slow statements can be told
     /// apart in a busy log.
     next_query_id: AtomicU64,
+    /// Row-level locks for `FOR UPDATE` / `FOR SHARE` clauses, held by session
+    /// id and released at COMMIT / ROLLBACK / autocommit statement end / session
+    /// teardown — the same lifecycle as the unique-key gate. See
+    /// `executor::row_locks` and `storage::lock_manager::RowLockManager`.
+    row_locks: crate::storage::lock_manager::RowLockManager,
     /// The most recent statement that crossed the session's
     /// `slow_query_log_ms` threshold: `(query_id, duration_ms, statement)`.
     /// Mirrors the WARN log line for tests and embedded introspection.
@@ -642,23 +648,6 @@ pub struct Executor {
     policy_gen: AtomicU64,
 }
 
-/// Refuse row-locking clauses the engine does not honour.
-///
-/// `FOR UPDATE ... SKIP LOCKED` is how essentially every SQL job queue claims
-/// work — it is the clause that stops two workers taking the same row. The
-/// parser accepts it into `Query::locks` and the executor has never read that
-/// field, so the clause was silently discarded: the query still returned the
-/// row, the application still looked correct, and the queue handed each job to
-/// as many workers as happened to poll at the same moment. A guarantee that is
-/// accepted and then dropped is worse than one that was never offered, because
-/// nothing anywhere reports its absence.
-///
-/// `NOWAIT` is refused for the same reason — it asks to fail rather than block,
-/// and silently blocking instead inverts the caller's intent.
-///
-/// Plain `FOR UPDATE`/`FOR SHARE` are allowed through: they are advisory
-/// pessimistic hints, and the isolation the engine already provides is a
-/// stronger guarantee than ignoring them would imply.
 /// Fold `FETCH FIRST/NEXT n ROWS ONLY` into the LIMIT the executor actually reads.
 ///
 /// sqlparser populates `Query::fetch` for the PostgreSQL dialect, and nothing on
@@ -672,13 +661,10 @@ pub struct Executor {
 /// entire table, and the row that should have started page two reappeared on
 /// every page.
 ///
-/// Same class as the `FOR UPDATE SKIP LOCKED` case that
-/// `reject_unsupported_row_locks` exists to refuse -- a clause parsed and then
-/// discarded -- which is why this sits beside it and runs at the same point.
-///
 /// `WITH TIES` and `PERCENT` are refused rather than approximated: both change
 /// WHICH rows come back, so quietly substituting a plain LIMIT would be the same
-/// defect this fixes, one layer down.
+/// guarantee-dropping defect `FOR UPDATE SKIP LOCKED` once embodied (that clause
+/// is now honoured — see `executor::row_locks`), one layer down.
 /// Walk a query body folding `FETCH` on every nested query. See
 /// [`normalize_fetch_into_limit`].
 fn normalize_fetch_in_set_expr(body: &mut ast::SetExpr) -> Result<(), ExecError> {
@@ -729,9 +715,10 @@ fn normalize_fetch_in_table_factor(factor: &mut ast::TableFactor) -> Result<(), 
 /// `CLUSTER BY` and `DISTRIBUTE BY` are ordering and distribution requests that
 /// silently did nothing.
 ///
-/// Refusing is the established answer here -- the same one
-/// `reject_unsupported_row_locks` gives `FOR UPDATE SKIP LOCKED` -- because a
-/// clause that carries a guarantee must not be accepted unless it is honoured.
+/// Refusing is the established answer here — it is the same answer
+/// `FOR UPDATE SKIP LOCKED` received for years before row locks were
+/// implemented (`executor::row_locks`) — because a clause that carries a
+/// guarantee must not be accepted unless it is honoured.
 fn reject_ignored_select_clauses(query: &ast::Query) -> Result<(), ExecError> {
     fn check(body: &ast::SetExpr) -> Result<(), ExecError> {
         match body {
@@ -831,26 +818,6 @@ fn normalize_fetch_into_limit(query: &mut ast::Query) -> Result<(), ExecError> {
     Ok(())
 }
 
-fn reject_unsupported_row_locks(query: &ast::Query) -> Result<(), ExecError> {
-    for lock in &query.locks {
-        if let Some(nonblock) = &lock.nonblock {
-            let clause = match nonblock {
-                ast::NonBlock::SkipLocked => "SKIP LOCKED",
-                ast::NonBlock::Nowait => "NOWAIT",
-            };
-            return Err(ExecError::Unsupported(format!(
-                "{clause} is not implemented. It was previously parsed and ignored, \
-                 which silently removed the guarantee the clause exists to provide \
-                 — a claim query using it would hand the same row to concurrent \
-                 workers. Serialize the claim with an explicit transaction at \
-                 SERIALIZABLE isolation, or use a single-claimer design, until \
-                 row-level lock skipping is supported."
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// RAII decrement for [`Executor::enter_call`] — releases the recursion
 /// slot on every exit path, including `?` early-returns and panics.
 struct CallDepthGuard<'a>(&'a AtomicU32);
@@ -895,6 +862,7 @@ impl Executor {
             self_ref: std::sync::OnceLock::new(),
             catalog,
             unique_gate: unique_gate::UniqueGate::new(),
+            row_locks: crate::storage::lock_manager::RowLockManager::new(),
             meta_load_failed: AtomicBool::new(false),
             storage,
             table_engines: parking_lot::RwLock::new(HashMap::new()),
@@ -3242,6 +3210,9 @@ impl Executor {
         // by a session that no longer exists and every other inserter of those
         // keys would wait out the full timeout, forever.
         self.release_unique_slots(id);
+        // Same for its FOR UPDATE row locks: an abandoned session must not
+        // park claimable rows behind it forever.
+        self.release_row_locks(id);
         self.storage.drop_storage_session(id);
     }
 
@@ -3281,6 +3252,9 @@ impl Executor {
         if let Some(cm) = cross_model {
             self.cross_model_revert(cm.base, cm.fts_ops);
         }
+        // And the same for any FOR UPDATE row locks the returned connection
+        // was still holding.
+        self.release_row_locks(id);
 
         // Collect info about what will be cleared
         if !session.prepared_stmts.read().await.is_empty() {
@@ -6486,9 +6460,20 @@ impl Executor {
                 ));
             }
         }
+        // Row locks live until the transaction ends — COMMIT/ROLLBACK release
+        // them — except in autocommit, where the statement IS the transaction
+        // and its locks must go when it does. The depth counter keeps an
+        // inner statement (procedure body, trigger) from releasing the outer
+        // statement's locks while it is still running; only the outermost
+        // boundary releases, and only when no explicit transaction is active.
+        let session = self.current_session();
+        session.statement_depth.fetch_add(1, Ordering::SeqCst);
         let result = self.execute_statement_inner(stmt).await;
+        let back = session.statement_depth.fetch_sub(1, Ordering::SeqCst);
+        if back == 1 && !session.txn_active.load(Ordering::SeqCst) {
+            self.release_row_locks(unique_gate::gate_session_id());
+        }
         if result.is_err() {
-            let session = self.current_session();
             let mut tx = session.txn_state.write().await;
             if tx.active {
                 tx.aborted = true;
@@ -6643,14 +6628,14 @@ impl Executor {
         let result = match stmt {
             Statement::Query(query) => {
                 // A row-locking clause changes what a query GUARANTEES, not just
-                // how fast it runs, so accepting one that is not implemented is
-                // not a harmless omission. `SELECT ... FOR UPDATE SKIP LOCKED`
-                // is how every job queue claims work: it is the thing that stops
-                // two workers taking the same row. Parsed-and-ignored, the query
-                // still returns the row, the app still looks correct, and the
-                // queue delivers each job to as many workers as happen to poll
-                // together. Refuse it instead.
-                reject_unsupported_row_locks(&query)?;
+                // how fast it runs. `FOR UPDATE`/`FOR SHARE` (with optional
+                // `SKIP LOCKED` / `NOWAIT`) is now honoured: rows are locked at
+                // emission, inside `execute_query_planned`, so nested claims
+                // (`UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED)`)
+                // lock through the same path as top-level ones. The streaming
+                // shortcuts below bypass the row pipeline those locks live in,
+                // so a locking query declines them.
+                let has_row_locks = !query.locks.is_empty();
 
                 // FETCH FIRST/NEXT is parsed into a field no execution path
                 // reads; fold it into the LIMIT that every path does read.
@@ -6668,7 +6653,9 @@ impl Executor {
                 // streamed query bypasses the materialized cache. Non-wire
                 // consumers collapse it at the materialization boundary.
                 #[cfg(feature = "server")]
-                if let Some(stream) = self.try_streaming_scan(&query).await? {
+                if !has_row_locks
+                    && let Some(stream) = self.try_streaming_scan(&query).await?
+                {
                     return Ok(stream);
                 }
 
@@ -6678,7 +6665,9 @@ impl Executor {
                 // would return MemoryExceeded. Falls through (None) for every
                 // shape it does not handle, and never engages without a limit.
                 #[cfg(feature = "server")]
-                if let Some(stream) = self.try_streaming_aggregate(&query).await? {
+                if !has_row_locks
+                    && let Some(stream) = self.try_streaming_aggregate(&query).await?
+                {
                     return Ok(stream);
                 }
 
@@ -6687,7 +6676,9 @@ impl Executor {
                 // so a large SELECT DISTINCT completes under a budget. Falls
                 // through (None) for every shape it does not handle.
                 #[cfg(feature = "server")]
-                if let Some(stream) = self.try_streaming_distinct(&query).await? {
+                if !has_row_locks
+                    && let Some(stream) = self.try_streaming_distinct(&query).await?
+                {
                     return Ok(stream);
                 }
 
@@ -6697,15 +6688,20 @@ impl Executor {
                 // materialized hash-join build would return MemoryExceeded. Falls
                 // through (None) for every shape it does not handle.
                 #[cfg(feature = "server")]
-                if let Some(stream) = self.try_streaming_join(&query).await? {
+                if !has_row_locks
+                    && let Some(stream) = self.try_streaming_join(&query).await?
+                {
                     return Ok(stream);
                 }
 
                 // Query result cache: check for a cached result before executing.
                 // Only cache deterministic SELECT queries (no RANDOM(), NOW(), etc.)
-                // and only outside of transactions.
+                // and only outside of transactions. A locking query is never
+                // cacheable: a replay serves rows without taking the locks the
+                // clause promises, from a snapshot the claim already consumed.
                 let sql_text = query.to_string();
-                let cacheable = !in_txn
+                let cacheable = !has_row_locks
+                    && !in_txn
                     && !Self::query_cache_disabled()
                     && !self.any_table_secured()
                     && Self::query_result_is_cacheable(&sql_text);

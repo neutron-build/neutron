@@ -196,6 +196,9 @@ impl Executor {
         // session's constraint check will now see the rows and report the
         // duplicate itself. Released only after the commit, never before.
         self.release_unique_slots(super::unique_gate::gate_session_id());
+        // Same instant, same reason: the rows this transaction locked with
+        // FOR UPDATE are now claimable by whoever was waiting on them.
+        self.release_row_locks(super::unique_gate::gate_session_id());
         txn.active = false;
         sess.txn_active
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -265,6 +268,9 @@ impl Executor {
         // Rolled back: the rows this transaction was holding keys for no longer
         // exist, so the keys are free.
         self.release_unique_slots(super::unique_gate::gate_session_id());
+        // Rolled back: the rows it locked with FOR UPDATE never changed, so
+        // they are claimable again immediately.
+        self.release_row_locks(super::unique_gate::gate_session_id());
         txn.active = false;
         sess.txn_active
             .store(false, std::sync::atomic::Ordering::SeqCst);

@@ -1181,13 +1181,40 @@ impl Executor {
     }
 
     /// Extract a usize from a constant expression (planner-only, returns Option).
+    ///
+    /// Accepts a quoted number for the same reason `expr_to_usize` does: the
+    /// planner and the executor must agree on whether a LIMIT exists, or the
+    /// plan path would bake in "no limit" for `LIMIT '5'` and return every
+    /// row the AST path truncates.
     pub(super) fn plan_expr_to_usize(&self, expr: &Expr) -> Option<usize> {
+        Self::plan_literal_to_usize(expr)
+    }
+
+    /// Static twin of [`Self::plan_expr_to_usize`] for call sites that hold no
+    /// executor (plan-cache reuse, eligibility checks).
+    fn plan_literal_to_usize(expr: &Expr) -> Option<usize> {
         match expr {
             Expr::Value(v) => match &v.value {
                 ast::Value::Number(n, _) => n.parse::<usize>().ok(),
+                ast::Value::SingleQuotedString(s) | ast::Value::DoubleQuotedString(s) => {
+                    s.trim().parse::<usize>().ok()
+                }
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    /// The `(limit, offset)` pair a query's LIMIT/OFFSET clauses resolve to
+    /// for plan purposes — the same extraction `plan_query` bakes into a
+    /// `PlanNode::Limit`, so the two must not drift.
+    fn plan_limit_values(query: &ast::Query) -> (Option<usize>, Option<usize>) {
+        match &query.limit_clause {
+            Some(ast::LimitClause::LimitOffset { limit, offset, .. }) => (
+                limit.as_ref().and_then(Self::plan_literal_to_usize),
+                offset.as_ref().and_then(|o| Self::plan_literal_to_usize(&o.value)),
+            ),
+            _ => (None, None),
         }
     }
 
@@ -1936,6 +1963,32 @@ impl Executor {
         // which dedups before ordering/limiting.
         if select.distinct.is_some() && query.limit_clause.is_some() {
             return false;
+        }
+        // LIMIT/OFFSET an operand of which the planner cannot resolve a bound
+        // must not reach the plan path: plan_query builds no Limit node for
+        // it, the plan would return every row, and the refusal the AST path
+        // raises ("LIMIT/OFFSET must be non-negative integer") would never
+        // happen. `LIMIT NULL` is LIMIT ALL (no bound — fine); a quoted
+        // integer is a bound (an untyped wire parameter in a LIMIT position
+        // decodes as text); a placeholder or a non-integer routes out.
+        // `OFFSET n LIMIT m` (OffsetCommaLimit) is excluded too — plan_query
+        // reads only the LimitOffset shape.
+        if let Some(lc) = &query.limit_clause {
+            let operands: Vec<&Expr> = match lc {
+                ast::LimitClause::LimitOffset { limit, offset, .. } => limit
+                    .iter()
+                    .chain(offset.iter().map(|o| &o.value))
+                    .collect(),
+                ast::LimitClause::OffsetCommaLimit { .. } => return false,
+            };
+            for e in operands {
+                if let Expr::Value(v) = e
+                    && !matches!(v.value, ast::Value::Null)
+                    && Self::plan_literal_to_usize(e).is_none()
+                {
+                    return false;
+                }
+            }
         }
         // Projection expressions must be evaluable by the plan path.
         for item in &select.projection {
@@ -5636,6 +5689,14 @@ impl Executor {
         Box::pin(async move {
             let mut query = query;
             Self::resolve_group_by_ordinals(&mut query)?;
+            // Row locks (`FOR UPDATE` / `FOR SHARE` [+ `SKIP LOCKED` |
+            // `NOWAIT`]): validated here — inside the reentrant query path, so
+            // a top-level SELECT and the `IN (subquery)` of a claiming UPDATE
+            // pass the same gate — and applied to the emitted rows below,
+            // between ORDER BY and LIMIT (PostgreSQL's LockRows position).
+            // Every shortcut in this function that bypasses the AST row
+            // pipeline declines to serve a locking query.
+            let lock_ctx = super::row_locks::lock_context(self, &query).await?;
             let saved_plan_cache_key_hint = plan_cache_key;
             // Every optimization below can bypass ordinary row materialization.
             // Until it consumes secured scans directly, route RLS queries through
@@ -5672,6 +5733,7 @@ impl Executor {
             // is unnecessary. GROUP BY queries need ORDER BY handling and go through
             // the normal path (which has its own fast aggregate call).
             if !rls_guarded
+                && lock_ctx.is_none()
                 && let SetExpr::Select(ref select) = *query.body
                 && matches!(&select.group_by, ast::GroupByExpr::Expressions(e, _) if e.is_empty())
                 && query.order_by.is_none()
@@ -5686,6 +5748,7 @@ impl Executor {
             // GROUP BY, HAVING, DISTINCT), bypass plan cache and plan executor entirely.
             // Directly calls index_lookup → saves 2 plan clones + 2 write lock acqs.
             if !rls_guarded
+                && lock_ctx.is_none()
                 && !self.privileges_enforced_for_session()
                 && let SetExpr::Select(ref select) = *query.body
                 && select.from.len() == 1
@@ -5765,6 +5828,7 @@ impl Executor {
                 let planned_query = normalized.as_ref().unwrap_or(&query);
                 if use_plan
                     && !rls_guarded
+                    && lock_ctx.is_none()
                     && !self.privileges_enforced_for_session()
                     && let SetExpr::Select(ref select) = *planned_query.body
                     && Self::query_eligible_for_plan(select, planned_query)
@@ -5791,7 +5855,8 @@ impl Executor {
                         // otherwise the cached plan would keep the previously-planned
                         // query's literals there. Re-plan from the current AST when not.
                         if Self::plan_reuse_is_literal_safe(planned_query, select)
-                            && let Some(reused) = Self::try_reuse_plan(cached, select)
+                            && let Some(reused) =
+                                Self::try_reuse_plan(cached, select, planned_query)
                         {
                             crate::bench_hooks::record_plan(0);
                             Some(reused)
@@ -5936,7 +6001,7 @@ impl Executor {
                 _ => None,
             };
             let result = self
-                .execute_set_expr(*query.body, &cte_tables, &order_by_cols)
+                .execute_set_expr(*query.body, &cte_tables, &order_by_cols, lock_ctx.is_some())
                 .await?;
 
             let mut exec_result = match result {
@@ -5972,9 +6037,13 @@ impl Executor {
                     mut rows,
                     projection,
                 } => {
-                    // Try vector index optimization: ORDER BY VECTOR_DISTANCE(...) LIMIT k
+                    // Try vector index optimization: ORDER BY VECTOR_DISTANCE(...) LIMIT k.
+                    // A locking query declines: the optimization reorders and
+                    // truncates before locks could be evaluated against the
+                    // rows the scan actually emitted.
                     let mut used_vec_index = false;
-                    if let Some(ref ob) = order_by
+                    if lock_ctx.is_none()
+                        && let Some(ref ob) = order_by
                         && let Some(optimized) =
                             self.try_vector_index_scan(ob, &limit_clause, &rows, &col_meta)
                     {
@@ -5984,7 +6053,16 @@ impl Executor {
 
                     // Fall back to standard ORDER BY + LIMIT if vector index not used
                     if !used_vec_index {
-                        let top_k = self.extract_top_k(limit_clause.as_ref());
+                        // A locking query sorts the FULL row set: top-K
+                        // truncation would decide which rows get locked before
+                        // SKIP LOCKED had its say, so a worker would receive
+                        // fewer rows than LIMIT promises whenever a peer held
+                        // part of the top-K.
+                        let top_k = if lock_ctx.is_some() {
+                            None
+                        } else {
+                            self.extract_top_k(limit_clause.as_ref())
+                        };
                         let col_pairs: Vec<(String, DataType)> = col_meta
                             .iter()
                             .map(|c| (c.name.clone(), c.dtype.clone()))
@@ -6056,6 +6134,48 @@ impl Executor {
                                 Some(&projection),
                                 top_k,
                             )?;
+                        }
+
+                        // Row locks, at PostgreSQL's LockRows position: after
+                        // WHERE and ORDER BY, before LIMIT. SKIP LOCKED drops
+                        // held rows here, so LIMIT then keeps the first n
+                        // UNLOCKED rows; plain FOR UPDATE blocks per row;
+                        // NOWAIT refuses with 55P03. The pre-projection rows
+                        // are what get locked, so the primary key is present
+                        // whether or not the SELECT list asked for it.
+                        if let Some(ctx) = &lock_ctx {
+                            // The fill budget for SKIP LOCKED and the lock
+                            // horizon for the waiting modes alike: only rows
+                            // that can still be emitted are locked. A skipping
+                            // clause KEEPS trying past held rows until the
+                            // budget is full (the walk in `apply_row_locks`),
+                            // so a worker fills its LIMIT instead of returning
+                            // short whenever a peer holds part of the top.
+                            let limit_hint = limit_clause.as_ref().and_then(|lc| {
+                                let (l, o) = match lc {
+                                    ast::LimitClause::LimitOffset { limit, offset, .. } => (
+                                        limit.as_ref().and_then(|e| self.expr_to_usize(e).ok().flatten()),
+                                        offset
+                                            .as_ref()
+                                            .and_then(|o| self.expr_to_usize(&o.value).ok().flatten()),
+                                    ),
+                                    ast::LimitClause::OffsetCommaLimit { offset, limit } => (
+                                        self.expr_to_usize(limit).ok().flatten(),
+                                        self.expr_to_usize(offset).ok().flatten(),
+                                    ),
+                                };
+                                // `LIMIT NULL` is LIMIT ALL: an operand that
+                                // resolves to no bound must not collapse the
+                                // budget to zero, or a locking query would
+                                // lock nothing.
+                                match (l, o) {
+                                    (Some(l), Some(o)) => Some(l.saturating_add(o)),
+                                    (Some(x), None) | (None, Some(x)) => Some(x),
+                                    (None, None) => None,
+                                }
+                            });
+                            self.apply_row_locks(ctx, &col_meta, &mut rows, limit_hint)
+                                .await?;
                         }
 
                         // Apply LIMIT/OFFSET — needed even after heap sort since the heap
@@ -6162,13 +6282,14 @@ impl Executor {
         body: SetExpr,
         cte_tables: &'a CteTableMap,
         order_by_cols: &'a [String],
+        row_locks: bool,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<SelectResult, ExecError>> + Send + 'a>,
     > {
         Box::pin(async move {
             match body {
                 SetExpr::Select(select) => {
-                    self.execute_select_inner_with_ctes(&select, cte_tables, order_by_cols)
+                    self.execute_select_inner_with_ctes(&select, cte_tables, order_by_cols, row_locks)
                         .await
                 }
                 SetExpr::SetOperation {
@@ -6179,8 +6300,10 @@ impl Executor {
                 } => {
                     // An outer ORDER BY does not apply to individual set-operation
                     // branches, so sub-branches receive no order-by constraint.
-                    let left_result = self.execute_set_expr(*left, cte_tables, &[]).await?;
-                    let right_result = self.execute_set_expr(*right, cte_tables, &[]).await?;
+                    // A locking clause cannot sit on a set operation (rejected
+                    // in `lock_context`), so the arms are never locking.
+                    let left_result = self.execute_set_expr(*left, cte_tables, &[], false).await?;
+                    let right_result = self.execute_set_expr(*right, cte_tables, &[], false).await?;
 
                     let (left_cols, left_rows) = self.select_result_to_rows(left_result)?;
                     let (right_cols, right_rows) = self.select_result_to_rows(right_result)?;
@@ -6374,7 +6497,7 @@ impl Executor {
                     if is_all {
                         // Execute base case (left side of UNION ALL)
                         let base_result = self
-                            .execute_set_expr(*left.clone(), &cte_tables, &[])
+                            .execute_set_expr(*left.clone(), &cte_tables, &[], false)
                             .await?;
                         let (base_cols, base_rows) = self.select_result_to_rows(base_result)?;
                         // Apply CTE alias column names if provided
@@ -6404,7 +6527,7 @@ impl Executor {
                             cte_tables.insert(cte_name.clone(), (col_meta.clone(), working_rows));
                             // Execute recursive part (right side of UNION ALL)
                             let rec_result = self
-                                .execute_set_expr(*right.clone(), &cte_tables, &[])
+                                .execute_set_expr(*right.clone(), &cte_tables, &[], false)
                                 .await?;
                             let (_rec_cols, new_rows) = self.select_result_to_rows(rec_result)?;
                             if new_rows.is_empty() {
@@ -8563,6 +8686,7 @@ impl Executor {
         select: &ast::Select,
         cte_tables: &CteTableMap,
         order_by_cols: &[String],
+        row_locks: bool,
     ) -> Result<SelectResult, ExecError> {
         // Window functions are not allowed in WHERE / HAVING (PostgreSQL):
         // they are computed after the row set is chosen, so they cannot filter
@@ -8591,7 +8715,10 @@ impl Executor {
         // Columnar fast-aggregate (before any row scan)
         // Intercepts COUNT(*) / SUM / AVG / GROUP BY on ColumnarStorageEngine tables.
         // Returns None if the engine doesn't support it or the pattern is unsupported.
+        // A locking query declines: the shortcut bypasses the row pipeline its
+        // locks are applied in.
         if self.read_fast_paths_permitted()
+            && !row_locks
             && let Some(fast) = self.try_columnar_fast_aggregate(select, cte_tables)?
         {
             return Ok(SelectResult::Projected(fast));
@@ -8601,7 +8728,11 @@ impl Executor {
         // (SELECT list + WHERE) are covered by a single B-tree index, return
         // results directly from the index without any heap/table access.
         // This achieves 1.5-2x speedup for covering index queries.
+        // A locking query declines: the scan projects away every column but
+        // the covered one, and the primary key the lock is keyed on is usually
+        // not that column.
         if self.read_fast_paths_permitted()
+            && !row_locks
             && select.from.len() == 1
             && select.from[0].joins.is_empty()
             && let TableFactor::Table {
@@ -10123,12 +10254,27 @@ impl Executor {
     /// LIMIT/OFFSET operand evaluation. `None` = no bound: Postgres treats
     /// `LIMIT NULL` as LIMIT ALL and `OFFSET NULL` as OFFSET 0 (Prisma's
     /// findUnique emits exactly that shape).
+    ///
+    /// `Text` that names a non-negative integer is accepted: an untyped wire
+    /// parameter in a LIMIT position decodes as text when inference has no
+    /// column to borrow a type from (the queue driver's
+    /// `... IN (SELECT ... LIMIT $4)` shape — the parameter sits inside a
+    /// scalar subquery the inference walker historically did not enter), and
+    /// Postgres accepts `LIMIT '5'` for the same reason: an unknown-typed
+    /// literal coerces to the integer the position requires. Anything that
+    /// does not name a non-negative integer is still the error it always was.
     pub(super) fn expr_to_usize(&self, expr: &Expr) -> Result<Option<usize>, ExecError> {
         let val = self.eval_const_expr(expr)?;
         match val {
             Value::Int32(n) if n >= 0 => Ok(Some(n as usize)),
             Value::Int64(n) if n >= 0 => Ok(Some(n as usize)),
             Value::Null => Ok(None),
+            Value::Text(ref s) => match s.trim().parse::<usize>() {
+                Ok(n) => Ok(Some(n)),
+                Err(_) => Err(ExecError::Unsupported(
+                    "LIMIT/OFFSET must be non-negative integer".into(),
+                )),
+            },
             _ => Err(ExecError::Unsupported(
                 "LIMIT/OFFSET must be non-negative integer".into(),
             )),
@@ -10167,12 +10313,39 @@ impl Executor {
     fn try_reuse_plan(
         mut cached_plan: planner::PlanNode,
         select: &ast::Select,
+        query: &ast::Query,
     ) -> Option<planner::PlanNode> {
         // Joins ARE reusable now (see `transplant_join_sides`); what is not is
         // a comma FROM that reached here un-desugared, since the plan tree has
         // no node corresponding to `from[1..]`.
         if select.from.len() != 1 {
             return None;
+        }
+        // LIMIT/OFFSET agreement. The transplant re-binds only the WHERE; the
+        // cached plan keeps the Limit node (and the early-exit counts pushed
+        // into its scans) baked from whichever execution populated the entry.
+        // The plan-cache key parameterizes EXECUTE arguments — "EXECUTE
+        // take(3)" and "EXECUTE take(0)" share one key — so a hit can carry
+        // the WRONG limit: take(3) followed by take(0) replayed three rows
+        // for LIMIT 0. Reuse only on exact agreement; a mismatch re-plans
+        // from the current AST (the entry is not overwritten on hit, so each
+        // value change re-plans exactly once).
+        let (cur_limit, cur_offset) = Self::plan_limit_values(query);
+        match &cached_plan {
+            planner::PlanNode::Limit {
+                limit: baked_limit,
+                offset: baked_offset,
+                ..
+            } => {
+                if *baked_limit != cur_limit || *baked_offset != cur_offset {
+                    return None;
+                }
+            }
+            _ => {
+                if cur_limit.is_some() || cur_offset.is_some() {
+                    return None;
+                }
+            }
         }
         let where_expr = select.selection.clone();
         if Self::transplant_scan_exprs(&mut cached_plan, &where_expr) {

@@ -352,6 +352,343 @@ impl LockManager {
 /// Shared handle.
 pub type SharedLockManager = Arc<LockManager>;
 
+/// One row's lock identity: the base table name plus the row's primary-key
+/// values, in constraint order. Not a hash — the actual key tuple, keyed by
+/// `Value`'s hand-written `Hash`/`Eq` so `Int32(1)` and `Int64(1)` are the
+/// same row by construction. A hash could collide and make SKIP LOCKED skip a
+/// row nobody holds; the tuple cannot.
+pub type RowLockKey = (String, Vec<crate::types::Value>);
+
+/// What a non-blocking attempt on one row found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowTry {
+    /// The lock is now held by `session` (it was free, or already ours).
+    Acquired,
+    /// Another live transaction holds it.
+    HeldElsewhere,
+}
+
+/// Row-level transaction locks for `FOR UPDATE` / `FOR SHARE` clauses.
+///
+/// This is deliberately NOT part of [`LockManager`]. That table is the
+/// SERIALIZABLE strict-2PL machinery: wait-die, ages, upgrade kills — a
+/// discipline for transactions that opted into locking as their isolation.
+/// Row locks answer a different question for every isolation level: "may this
+/// session's transaction proceed with THIS row while another holds it". A
+/// READ COMMITTED claim query is the primary customer, so the row table has
+/// its own, simpler protocol:
+///
+/// - **Plain `FOR UPDATE`** blocks until the holder's transaction ends, with
+///   the same `lock_timeout` bound (default 10s) and the same `55P03
+///   lock_not_available` failure the table manager reports — a timeout is not
+///   a conflict the client can win by retrying.
+/// - **`SKIP LOCKED` / `NOWAIT`** never wait, so they can never deadlock and
+///   never time out; one reports the row as skipped, the other as `55P03`.
+///
+/// # Deadlock posture
+///
+/// A single statement takes all of its row locks in sorted `(table, key)`
+/// order (the executor sorts before acquiring), so two statements — the claim
+/// shape — cannot wait on each other: both climb the same total order. Two
+/// *statements of one transaction* can still cross (statement one holds row A,
+/// the other transaction's statement holds row B, statement two wants B), and
+/// no ordering rule inside one statement can prevent that. The honest answer
+/// is the bound: plain `FOR UPDATE` gives up after `lock_timeout` with 55P03,
+/// exactly the escape hatch PostgreSQL exposes. `SKIP LOCKED` — the clause
+/// queues actually use — is immune by construction because it does not wait.
+///
+/// # Lifecycle
+///
+/// Locks are held by session id and released at COMMIT, ROLLBACK, the end of
+/// an autocommit statement, and session teardown — the same points that
+/// release the unique-key gate. An abandoned session must not park rows
+/// forever.
+pub struct RowLockManager {
+    held: Mutex<RowHeld>,
+    /// Woken on every release so waiters re-check.
+    released: Notify,
+    timeout_ms: AtomicU64,
+}
+
+#[derive(Default)]
+struct RowHeld {
+    /// Row key → the session holding it.
+    owner: HashMap<RowLockKey, u64>,
+    /// Session → the keys it holds, for release.
+    by_session: HashMap<u64, Vec<RowLockKey>>,
+}
+
+impl Default for RowLockManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RowLockManager {
+    pub fn new() -> Self {
+        Self {
+            held: Mutex::new(RowHeld::default()),
+            released: Notify::new(),
+            timeout_ms: AtomicU64::new(DEFAULT_LOCK_TIMEOUT_MS),
+        }
+    }
+
+    /// Set the plain-`FOR UPDATE` wait bound. 0 disables it (wait forever).
+    pub fn set_timeout_ms(&self, ms: u64) {
+        self.timeout_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// The error a plain `FOR UPDATE` waiter reports on timeout, and a
+    /// `NOWAIT` acquisition reports immediately. The `lock_not_available`
+    /// prefix is what the wire error codec keys SQLSTATE 55P03 on.
+    fn lock_not_available(key: &RowLockKey, waited_ms: u64) -> StorageError {
+        StorageError::Io(format!(
+            "lock_not_available: could not lock row in table '{}' (key {:?}) \
+             after {waited_ms}ms: another transaction holds it (NOWAIT was \
+             requested, or lock_timeout was reached)",
+            key.0, key.1
+        ))
+    }
+
+    /// Attempt one row lock without waiting. Re-entrant: a key this session
+    /// already holds is `Acquired` again — a transaction re-reading its own
+    /// locked rows must not skip or fail them.
+    pub fn try_lock(&self, session: u64, key: &RowLockKey) -> RowTry {
+        let mut held = self.held.lock();
+        match held.owner.get(key) {
+            None => {
+                held.owner.insert(key.clone(), session);
+                held.by_session
+                    .entry(session)
+                    .or_default()
+                    .push(key.clone());
+                RowTry::Acquired
+            }
+            Some(&owner) if owner == session => RowTry::Acquired,
+            Some(_) => RowTry::HeldElsewhere,
+        }
+    }
+
+    /// Acquire one row lock for plain `FOR UPDATE`, waiting until the holder's
+    /// transaction ends. Bounded by the timeout; the failure is 55P03, not a
+    /// serialization failure, for the same reason the table manager's is: a
+    /// held row is not a conflict a retry can win.
+    pub async fn lock(&self, session: u64, key: &RowLockKey) -> Result<(), StorageError> {
+        if self.try_lock(session, key) == RowTry::Acquired {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let budget = self.timeout_ms.load(Ordering::Relaxed);
+        loop {
+            // Register interest BEFORE the next try, so a release landing
+            // between the failed try and the await cannot be missed.
+            let woken = self.released.notified();
+            if self.try_lock(session, key) == RowTry::Acquired {
+                return Ok(());
+            }
+            if budget == 0 {
+                woken.await;
+                continue;
+            }
+            let elapsed = started.elapsed().as_millis() as u64;
+            if elapsed >= budget {
+                return Err(Self::lock_not_available(key, elapsed));
+            }
+            let remaining = std::time::Duration::from_millis(budget - elapsed);
+            // A timeout here is not itself the answer — the lock may have been
+            // released in the same instant — so fall through to one more
+            // try_lock and let the elapsed check decide.
+            let _ = tokio::time::timeout(remaining, woken).await;
+        }
+    }
+
+    /// Release every row lock `session` holds. Called at COMMIT, ROLLBACK,
+    /// autocommit statement end and session teardown. Idempotent.
+    pub fn release_session(&self, session: u64) {
+        let keys = {
+            let mut held = self.held.lock();
+            match held.by_session.remove(&session) {
+                Some(keys) => {
+                    for k in &keys {
+                        if held.owner.get(k) == Some(&session) {
+                            held.owner.remove(k);
+                        }
+                    }
+                    keys
+                }
+                None => return,
+            }
+        };
+        if !keys.is_empty() {
+            self.released.notify_waiters();
+        }
+    }
+
+    /// Rows currently locked, across all sessions. Test/observability.
+    #[cfg(test)]
+    pub fn held_count(&self) -> usize {
+        self.held.lock().owner.len()
+    }
+
+    /// Whether `session` currently holds any row lock. Test/observability.
+    #[cfg(test)]
+    pub fn holds_any(&self, session: u64) -> bool {
+        self.held
+            .lock()
+            .by_session
+            .get(&session)
+            .is_some_and(|v| !v.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod row_lock_tests {
+    use super::*;
+    use crate::types::Value;
+
+    fn key(id: i64) -> RowLockKey {
+        ("jobs".to_string(), vec![Value::Int64(id)])
+    }
+
+    #[tokio::test]
+    async fn a_free_row_locks_immediately() {
+        let lm = RowLockManager::new();
+        assert_eq!(lm.try_lock(1, &key(7)), RowTry::Acquired);
+        assert!(lm.holds_any(1));
+        assert_eq!(lm.held_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn another_session_sees_the_row_held() {
+        let lm = RowLockManager::new();
+        assert_eq!(lm.try_lock(1, &key(7)), RowTry::Acquired);
+        assert_eq!(lm.try_lock(2, &key(7)), RowTry::HeldElsewhere);
+    }
+
+    #[tokio::test]
+    async fn the_holder_reacquires_its_own_row() {
+        let lm = RowLockManager::new();
+        assert_eq!(lm.try_lock(1, &key(7)), RowTry::Acquired);
+        assert_eq!(
+            lm.try_lock(1, &key(7)),
+            RowTry::Acquired,
+            "re-locking own rows must be a no-op, not a skip"
+        );
+        lm.release_session(1);
+        assert_eq!(
+            lm.held_count(),
+            0,
+            "the double-take must not leak a second entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn different_keys_do_not_conflict() {
+        let lm = RowLockManager::new();
+        assert_eq!(lm.try_lock(1, &key(7)), RowTry::Acquired);
+        assert_eq!(lm.try_lock(2, &key(8)), RowTry::Acquired);
+    }
+
+    /// Integer widths are one row: `Int32(1)` and `Int64(1)` are the same
+    /// primary key, and the lock identity must agree with that or two claims
+    /// of "the same" row would serialize against nothing.
+    #[tokio::test]
+    async fn integer_widths_are_the_same_row() {
+        let lm = RowLockManager::new();
+        assert_eq!(
+            lm.try_lock(1, &("t".to_string(), vec![Value::Int32(7)])),
+            RowTry::Acquired
+        );
+        assert_eq!(
+            lm.try_lock(2, &("t".to_string(), vec![Value::Int64(7)])),
+            RowTry::HeldElsewhere,
+            "Int32(7) and Int64(7) are the same primary key"
+        );
+    }
+
+    /// Tables are part of the identity: row 7 of `a` and row 7 of `b` are
+    /// different rows.
+    #[tokio::test]
+    async fn same_key_in_different_tables_is_a_different_row() {
+        let lm = RowLockManager::new();
+        assert_eq!(
+            lm.try_lock(1, &("a".to_string(), vec![Value::Int64(7)])),
+            RowTry::Acquired
+        );
+        assert_eq!(
+            lm.try_lock(2, &("b".to_string(), vec![Value::Int64(7)])),
+            RowTry::Acquired
+        );
+    }
+
+    #[tokio::test]
+    async fn release_session_frees_the_rows() {
+        let lm = RowLockManager::new();
+        assert_eq!(lm.try_lock(1, &key(7)), RowTry::Acquired);
+        assert_eq!(lm.try_lock(1, &key(8)), RowTry::Acquired);
+        lm.release_session(1);
+        assert_eq!(lm.held_count(), 0);
+        assert!(!lm.holds_any(1));
+        // And the rows are lockable again — no stale entry survives release.
+        assert_eq!(lm.try_lock(2, &key(7)), RowTry::Acquired);
+    }
+
+    #[tokio::test]
+    async fn plain_lock_blocks_then_proceeds_after_release() {
+        let lm = Arc::new(RowLockManager::new());
+        assert_eq!(lm.try_lock(1, &key(7)), RowTry::Acquired);
+        let lm2 = lm.clone();
+        let k = key(7);
+        let waiter = tokio::spawn(async move { lm2.lock(2, &k).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "the waiter must be blocked, not failed"
+        );
+        lm.release_session(1);
+        waiter
+            .await
+            .unwrap()
+            .expect("a released row must be grantable");
+    }
+
+    /// A waiter must not miss a release that lands between its failed try and
+    /// its await — the notified-before-try ordering.
+    #[tokio::test]
+    async fn a_release_during_the_wait_wakes_the_waiter() {
+        let lm = Arc::new(RowLockManager::new());
+        assert_eq!(lm.try_lock(1, &key(7)), RowTry::Acquired);
+        let lm2 = lm.clone();
+        let k = key(7);
+        let waiter = tokio::spawn(async move { lm2.lock(2, &k).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        lm.release_session(1);
+        waiter
+            .await
+            .unwrap()
+            .expect("release during wait must grant, not time out");
+    }
+
+    #[tokio::test]
+    async fn a_plain_wait_gives_up_after_the_timeout() {
+        let lm = RowLockManager::new();
+        lm.set_timeout_ms(60);
+        assert_eq!(lm.try_lock(1, &key(7)), RowTry::Acquired);
+        let started = std::time::Instant::now();
+        let err = lm
+            .lock(2, &key(7))
+            .await
+            .expect_err("a held row must time out, not hang");
+        let waited = started.elapsed();
+        assert!(
+            err.to_string().contains("lock_not_available"),
+            "the failure must be the 55P03 wording, got: {err}"
+        );
+        assert!(waited >= std::time::Duration::from_millis(50));
+        assert!(waited < std::time::Duration::from_secs(5));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

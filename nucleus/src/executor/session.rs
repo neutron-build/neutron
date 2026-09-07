@@ -291,6 +291,12 @@ pub struct Session {
     /// executor's long loops check it cooperatively and abort with SQLSTATE
     /// 57014. Cleared at each statement start.
     pub(super) cancel_requested: AtomicBool,
+    /// Nesting depth of `execute_statement` on this session. Statements run
+    /// re-entrantly (stored procedures, triggers, function bodies execute
+    /// statements inside statements); row locks taken by an autocommit
+    /// statement are released when the OUTERMOST statement ends, so an inner
+    /// statement must not release the outer one's locks mid-flight.
+    pub(super) statement_depth: AtomicU64,
     /// Normalized SQL key computed by `parse_with_ast_cache` for THIS session's
     /// current top-level statement, consumed by `execute_query_planned`.
     ///
@@ -355,6 +361,7 @@ impl Session {
             executing: AtomicBool::new(false),
             stream_capable_consumer: AtomicBool::new(false),
             cancel_requested: AtomicBool::new(false),
+            statement_depth: AtomicU64::new(0),
             plan_cache_key_hint: parking_lot::Mutex::new(None),
         }
     }

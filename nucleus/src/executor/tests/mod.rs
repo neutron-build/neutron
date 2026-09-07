@@ -88,7 +88,7 @@ mod test_replacing_engine_recovery; // replacing_mergetree engine metadata must 
 mod test_rls;
 mod test_rls_fail_closed; // M5: unsupported policy expressions / specialty calls fail closed
 mod test_rls_surfaces; // M5: adversarial alternate-surface RLS exfiltration matrix
-mod test_row_locks;
+mod test_row_locks; // FOR UPDATE / SKIP LOCKED / NOWAIT row locks + parameterized LIMIT (queue claims)
 mod test_s33_executor_edges; // S33-11/S33-14: hash-join decline + SIMD case-insensitive binding
 mod test_scalar_fns;
 mod test_semi_anti_joins; // QPP-1a/QPP-12: SEMI/ANTI refusals + hash-join residual propagation

@@ -4318,6 +4318,21 @@ fn walk_expr_for_params(
             walk_expr_for_params(left, tables, out);
             walk_expr_for_params(right, tables, out);
         }
+        // Scalar subqueries — `IN (SELECT ... LIMIT $n)` above all: the job
+        // queue claim shape. The walker used to stop at the subquery border,
+        // so a LIMIT-position parameter had no column to borrow a type from,
+        // defaulted to TEXT, and the driver's integer bind arrived as `'5'`.
+        // Walking the inner query marks LIMIT/OFFSET parameters INT8 (see
+        // `walk_query_for_params`), so they decode as the integers they are.
+        Expr::InSubquery { subquery, .. } => {
+            walk_query_for_params(subquery, tables, out);
+        }
+        Expr::Subquery(subquery) => {
+            walk_query_for_params(subquery, tables, out);
+        }
+        Expr::Exists { subquery, .. } => {
+            walk_query_for_params(subquery, tables, out);
+        }
         Expr::Function(func) => {
             // Known Nucleus scalar extensions: advertise proper types for
             // their placeholder args instead of the blanket TEXT default.

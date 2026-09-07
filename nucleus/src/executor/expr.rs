@@ -1653,6 +1653,16 @@ impl Executor {
                 negated,
             } => {
                 let val = self.eval_row_expr(expr, row, col_meta)?;
+                // A locking subquery (`... IN (SELECT ... FOR UPDATE ...)`,
+                // the job-queue claim shape) must NEVER be served from this
+                // cache: a hit hands the caller a row set whose locks were
+                // taken by a DIFFERENT statement — possibly another session's,
+                // since the map is process-wide and cleared only at each
+                // top-level statement start — without taking any locks. That
+                // is the double-delivery defect row locks exist to prevent,
+                // reintroduced by an optimization. Re-read and re-lock every
+                // time; re-entrant locks make the per-row cost harmless.
+                let lockable = !subquery.locks.is_empty();
                 // Cache key is the canonical text of the subquery before
                 // outer-ref substitution, PLUS the principal it was evaluated
                 // for. The map is one process-wide table shared by every wire
@@ -1666,7 +1676,8 @@ impl Executor {
                 let subquery_text = format!("{subquery}");
                 let cache_key = format!("{}\u{1}{subquery_text}", self.rls_cache_principal());
                 // Check if we already have the result of this non-correlated subquery cached.
-                if let Some(cached) = self
+                if !lockable
+                    && let Some(cached) = self
                     .uncorrelated_subquery_cache
                     .read()
                     .get(&cache_key)
@@ -1689,7 +1700,7 @@ impl Executor {
                 // Only cache if non-correlated (resolved query text == original).
                 // Compare the TEXT, not `cache_key`, which now carries a
                 // principal prefix that `resolved_key` does not.
-                if subquery_text == resolved_key {
+                if !lockable && subquery_text == resolved_key {
                     self.uncorrelated_subquery_cache
                         .write()
                         .insert(cache_key, values.clone());
