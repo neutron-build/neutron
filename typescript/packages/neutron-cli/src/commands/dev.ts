@@ -5,6 +5,7 @@ import { createServer, loadConfigFromFile, mergeConfig } from "vite";
 import {
   neutronPlugin,
 } from "@neutron-build/core/vite";
+import { runtimeEsbuild, stripCliOwnedPlugins } from "../lib/vite-shared.js";
 import {
   prepareContentCollections,
   prepareRouteTypes,
@@ -29,6 +30,7 @@ export async function dev(): Promise<void> {
   // Ordered: jsx-dev-runtime / jsx-runtime / hooks before bare preact so Vite
   // does not prefix-match `preact` onto export-map-only subpaths.
   const preactAliases = vitePreactAliases(preactSsr, runtimeAliases);
+  const esbuildJsx = runtimeEsbuild(runtime);
 
   // Parse CLI args
   const args = process.argv.slice(3);
@@ -73,17 +75,11 @@ export async function dev(): Promise<void> {
 
   const userConfig = loadedConfig?.config || {};
 
-  // Strip plugins that the CLI will add to avoid duplicates from mergeConfig concatenation
-  const cliPluginNames = new Set(["neutron:core"]);
-  const filteredPlugins = (userConfig.plugins || []).filter((plugin: unknown) => {
-    if (plugin && typeof plugin === "object" && "name" in plugin) {
-      return !cliPluginNames.has((plugin as { name: string }).name);
-    }
-    return true;
-  });
+  const filteredPlugins = stripCliOwnedPlugins(userConfig.plugins);
 
   const server = await createServer(
     mergeConfig({ ...userConfig, plugins: filteredPlugins }, {
+      esbuild: esbuildJsx,
       // Prevent Vite's resolveConfig from loading vite.config.ts a second time.
       // We already loaded it above via loadConfigFromFile and merged the result.
       // Without this, plugins (including @prefresh/vite) are instantiated twice,

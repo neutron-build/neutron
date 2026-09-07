@@ -91,6 +91,7 @@ export {
   defineConfig,
   resolveRuntime,
   resolveRuntimeAliases,
+  resolveRuntimeJsx,
   resolveRuntimeNoExternal,
   type NeutronConfig,
   type NeutronImageConfig,

@@ -163,3 +163,26 @@ export function resolveRuntimeNoExternal(runtime: NeutronRuntime): string[] {
     "react-dom/server.browser",
   ];
 }
+
+/**
+ * esbuild JSX settings for a runtime.
+ *
+ * The runtime is declared once, in neutron.config.ts. Everything derivable
+ * from it should be derived here rather than restated by each project — the
+ * automatic JSX runtime needs only an import source, so a project needs no
+ * Vite plugin to compile JSX. Projects previously carried
+ * `@preact/preset-vite` for this; that plugin remains useful in dev for HMR
+ * and devtools, but it is no longer required for a correct build.
+ *
+ * react-compat keeps `react` as the import source because its aliases
+ * (see resolveRuntimeAliases) already point react/jsx-runtime at Preact's.
+ */
+export function resolveRuntimeJsx(runtime: NeutronRuntime): {
+  jsx: "automatic";
+  jsxImportSource: string;
+} {
+  return {
+    jsx: "automatic",
+    jsxImportSource: runtime === "react-compat" ? "react" : "preact",
+  };
+}
