@@ -46,5 +46,27 @@ For a media-controlled island:
 />
 ```
 
+## Prerendered markup is not reconciled
+
+Hydration attaches listeners to the markup the build produced; it does not
+diff attributes against the first client render. Whatever an island rendered
+at build time sticks until state changes it, and a static build has no URL,
+no `localStorage`, and no viewport. Anything derived from those must start
+unresolved on the server and on the first client render alike, then fill in
+after mount:
+
+```tsx
+function Nav() {
+  // "" at build time and on the first client render; the real path after mount.
+  const [path, setPath] = useState("");
+  useEffect(() => setPath(location.pathname), []);
+  return <a class={path === "/docs" ? "active" : ""} href="/docs">Docs</a>;
+}
+```
+
+Reading `location.pathname` in the initial state keeps the build-time value on
+every page (the same prerendered `active` class everywhere). This does not show
+up in `neutron dev`, where nothing is prerendered, so check a production build.
+
 Use app mode instead when navigation state, loaders, and actions belong to the
 whole route rather than a few isolated controls.
