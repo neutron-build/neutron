@@ -144,6 +144,18 @@ type Adapter interface {
 	Close() error
 }
 
+// MailboxSelector is implemented by adapters whose message reads only work
+// against a currently selected mailbox (IMAP). Mid-sync one is selected; on a
+// freshly dialed connection nothing is, and strict servers answer UID FETCH
+// with "command not valid in this state". The engine calls SelectMailbox with
+// the mailbox the store says holds the message before Body, and consumers
+// reaching Raw or Attachment directly should call Engine.Locate first.
+// Adapters with account-global message IDs (Gmail, Graph, JMAP) do not
+// implement it and are never asked.
+type MailboxSelector interface {
+	SelectMailbox(ctx context.Context, box MailboxID) error
+}
+
 // Errors that the sync engine treats specially. Adapters should wrap these
 // rather than inventing equivalents, because the engine's recovery path
 // branches on them.

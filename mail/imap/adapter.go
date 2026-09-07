@@ -620,6 +620,18 @@ func (a *Adapter) Attachment(ctx context.Context, id mail.MessageID, partID stri
 	return nil, fmt.Errorf("imap: %w: part %s of %s", mail.ErrNotFound, partID, id)
 }
 
+// SelectMailbox implements mail.MailboxSelector: it selects the mailbox that
+// holds the message about to be read, so Body, Raw and Attachment work on a
+// connection that has not synced anything yet. Read-only, like a sync, so a
+// following mutation still goes through the read-write reselect in Apply.
+func (a *Adapter) SelectMailbox(ctx context.Context, box mail.MailboxID) error {
+	if a.conn.selected == a.native(box) {
+		return nil
+	}
+	_, _, err := a.conn.Select(ctx, a.native(box), true)
+	return err
+}
+
 // uidFor resolves a canonical identity back to a UID in the selected mailbox.
 func (a *Adapter) uidFor(ctx context.Context, id mail.MessageID) (uint32, error) {
 	if loc, ok := a.locations[id]; ok {

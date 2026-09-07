@@ -77,8 +77,13 @@ const CREATE_JOBS = `CREATE TABLE IF NOT EXISTS neutron_jobs (
   done_at timestamptz
 )`;
 
-const CREATE_JOBS_INDEX =
+const CREATE_JOBS_INDEX_PARTIAL =
   "CREATE INDEX IF NOT EXISTS neutron_jobs_ready ON neutron_jobs (priority, run_at) WHERE status = 'pending'";
+// Fallback when the server rejects predicate (partial) indexes — e.g. Nucleus
+// today. The claim query's WHERE already filters status, so the plain index
+// stays correct; the partial form is only a size optimization.
+const CREATE_JOBS_INDEX_PLAIN =
+  "CREATE INDEX IF NOT EXISTS neutron_jobs_ready ON neutron_jobs (priority, run_at)";
 
 const CREATE_SCHEDULES = `CREATE TABLE IF NOT EXISTS neutron_schedules (
   id uuid PRIMARY KEY,
@@ -128,7 +133,11 @@ export class PostgresQueueDriver implements QueueDriver {
     this.workerId =
       options.workerId ?? `${this.queueName}:${hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`;
     this.pollIntervalMs = options.pollIntervalMs ?? 2000;
-    this.batchSize = options.batchSize ?? 10;
+    const batchSize = options.batchSize ?? 10;
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 1000) {
+      throw new Error("batchSize must be an integer between 1 and 1000");
+    }
+    this.batchSize = batchSize;
     this.leaseMs = options.leaseMs ?? 60_000;
     this.maxAttempts = options.maxAttempts ?? 5;
     this.backoffBaseMs = options.backoffBaseMs ?? 1000;
@@ -207,7 +216,11 @@ export class PostgresQueueDriver implements QueueDriver {
     if (!this.ready) {
       this.ready = (async () => {
         await this.sql.unsafe(CREATE_JOBS);
-        await this.sql.unsafe(CREATE_JOBS_INDEX);
+        try {
+          await this.sql.unsafe(CREATE_JOBS_INDEX_PARTIAL);
+        } catch {
+          await this.sql.unsafe(CREATE_JOBS_INDEX_PLAIN);
+        }
         await this.sql.unsafe(CREATE_SCHEDULES);
       })();
     }
@@ -296,6 +309,9 @@ export class PostgresQueueDriver implements QueueDriver {
       return;
     }
     const names = [...this.handlers.keys()];
+    // batchSize is constructor-validated (integer 1..1000) and inlined as a
+    // literal: parameterized LIMIT is not resolved by every wire-compatible
+    // server (Nucleus today), and the value is never user input.
     const claimed = await this.sql.unsafe<ClaimedJobRow>(
       `UPDATE neutron_jobs SET status = 'active', locked_at = now(), locked_by = $1,
          attempts = attempts + 1
@@ -304,11 +320,11 @@ export class PostgresQueueDriver implements QueueDriver {
          WHERE queue = $2 AND status = 'pending' AND run_at <= now()
            AND name = ANY($3::text[])
          ORDER BY priority, run_at
+         LIMIT ${this.batchSize}
          FOR UPDATE SKIP LOCKED
-         LIMIT $4
        )
        RETURNING id, name, payload, attempts, max_attempts, created_at`,
-      [this.workerId, this.queueName, names, this.batchSize]
+      [this.workerId, this.queueName, names]
     );
     for (const row of claimed) {
       await this.runClaimed(row);

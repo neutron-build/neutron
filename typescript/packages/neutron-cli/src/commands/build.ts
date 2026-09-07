@@ -173,8 +173,14 @@ export async function build(): Promise<void> {
 
   // Build client assets. For static-only sites (no app routes), create a
   // temporary CSS-only entry so Vite still extracts stylesheets without
-  // requiring an index.html entry point.
-  if (appRouteCount > 0 || hasIslands) {
+  // requiring an index.html entry point. Static sites WITH islands take the
+  // same branch: neutronPlugin only supplies a Rollup entry for app routes,
+  // so the app-bundle build below would fall back to Vite's default
+  // `index.html` entry and die with UNRESOLVED_ENTRY. Their island code is
+  // built by the dedicated islands pass further down, and going through the
+  // CSS-extraction build is what lets route- and layout-level stylesheets
+  // reach a prerendered islands page at all.
+  if (appRouteCount > 0) {
     console.log("Building client bundle...");
     await viteBuild(
       mergeConfig(userConfig, {
@@ -561,6 +567,10 @@ export async function build(): Promise<void> {
   const staticRoutes = pageRoutes.filter((r) => r.config.mode === "static");
   let renderedCount = 0;
   let skippedCount = 0;
+  // Routes that threw while rendering. Distinct from skips (no component, no
+  // getStaticPaths): a skip is a choice, a render error is a broken page, and
+  // a build that shipped one must not report success.
+  let renderErrorCount = 0;
 
   for (const route of staticRoutes) {
     try {
@@ -813,7 +823,7 @@ export async function build(): Promise<void> {
       renderedCount++;
     } catch (error) {
       console.error(`  Error rendering ${route.path}:`, error);
-      skippedCount++;
+      renderErrorCount++;
     }
   }
 
@@ -844,6 +854,13 @@ export async function build(): Promise<void> {
   }
 
   console.log(`\nRendered ${renderedCount} pages, skipped ${skippedCount}.`);
+  if (renderErrorCount > 0) {
+    console.error(
+      `\nBuild failed: ${renderErrorCount} route${renderErrorCount === 1 ? "" : "s"} threw while rendering ` +
+        `(see "Error rendering" above). The output in ${outputDir} is incomplete.`
+    );
+    process.exit(1);
+  }
   console.log(`\nBuild complete!`);
   console.log(`Output: ${outputDir}`);
 }

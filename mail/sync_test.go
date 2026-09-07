@@ -241,6 +241,19 @@ func (m *memStore) Body(_ context.Context, acct AccountID, id MessageID) (*Body,
 	return b, nil
 }
 
+func (m *memStore) MessageMailboxes(_ context.Context, acct AccountID, id MessageID) ([]MailboxID, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var boxes []MailboxID
+	for box := range m.members[acct][id] {
+		boxes = append(boxes, box)
+	}
+	if len(boxes) == 0 {
+		return nil, ErrNoStore
+	}
+	return boxes, nil
+}
+
 func (m *memStore) Cursor(_ context.Context, acct AccountID, box MailboxID) (Cursor, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -973,6 +986,50 @@ func TestBodyIsFetchedLazilyAndThenCached(t *testing.T) {
 	}
 	if _, err := store.Body(context.Background(), acct, e.ID); err != nil {
 		t.Error("lazily fetched body was not cached")
+	}
+}
+
+// selectingAdapter stands in for IMAP: a body read fails unless the mailbox
+// holding the message was selected first.
+type selectingAdapter struct {
+	scriptedAdapter
+	selected MailboxID
+	selects  []MailboxID
+}
+
+func (a *selectingAdapter) SelectMailbox(_ context.Context, box MailboxID) error {
+	a.selected = box
+	a.selects = append(a.selects, box)
+	return nil
+}
+
+func (a *selectingAdapter) Body(ctx context.Context, id MessageID) (*Body, error) {
+	if a.selected == "" {
+		return nil, errors.New("NO command not valid in this state")
+	}
+	return a.scriptedAdapter.Body(ctx, id)
+}
+
+func TestBodySelectsTheMessagesMailboxOnAFreshConnection(t *testing.T) {
+	eng, _, acct := setup(t)
+	e := envelope("1", "Archive")
+	synced := &scriptedAdapter{pages: []*Changes{{Changes: []Change{created(e)}, Next: "c1"}}}
+	if _, err := eng.SyncMailbox(context.Background(), acct, "Archive", synced); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second, freshly dialed adapter has nothing selected.
+	fresh := &selectingAdapter{}
+	if _, err := eng.Body(context.Background(), acct, e.ID, fresh); err != nil {
+		t.Fatalf("body on a fresh connection: %v", err)
+	}
+	if len(fresh.selects) != 1 || fresh.selects[0] != "Archive" {
+		t.Errorf("expected one SELECT of Archive before the fetch, got %v", fresh.selects)
+	}
+
+	// Locate is a no-op for adapters with global message IDs.
+	if err := eng.Locate(context.Background(), acct, e.ID, &scriptedAdapter{}); err != nil {
+		t.Errorf("Locate on a non-selecting adapter: %v", err)
 	}
 }
 

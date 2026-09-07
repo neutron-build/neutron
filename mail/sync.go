@@ -363,6 +363,9 @@ func (e *Engine) Body(ctx context.Context, acct AccountID, id MessageID, ad Adap
 		return nil, err
 	}
 
+	if err := e.Locate(ctx, acct, id, ad); err != nil {
+		return nil, e.classify(ctx, acct, err)
+	}
 	body, err = ad.Body(ctx, id)
 	if err != nil {
 		return nil, e.classify(ctx, acct, err)
@@ -371,6 +374,29 @@ func (e *Engine) Body(ctx context.Context, acct AccountID, id MessageID, ad Adap
 		return nil, err
 	}
 	return body, nil
+}
+
+// Locate prepares an adapter to read one message when its protocol needs a
+// mailbox selected first (see MailboxSelector). It is a no-op for adapters
+// that do not care, and for stores that cannot say where a message lives.
+// Body calls it; callers going straight to Raw or Attachment should too.
+func (e *Engine) Locate(ctx context.Context, acct AccountID, id MessageID, ad Adapter) error {
+	sel, ok := ad.(MailboxSelector)
+	if !ok {
+		return nil
+	}
+	loc, ok := e.store.(MessageLocator)
+	if !ok {
+		return nil
+	}
+	boxes, err := loc.MessageMailboxes(ctx, acct, id)
+	if errors.Is(err, ErrNoStore) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return sel.SelectMailbox(ctx, boxes[0])
 }
 
 // Apply pushes a mutation to the provider and then refreshes the affected

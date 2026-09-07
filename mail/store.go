@@ -57,6 +57,16 @@ type Store interface {
 // provider is a reason to delete.
 var ErrNoStore = errors.New("mail: not present in local store")
 
+// MessageLocator is implemented by stores that can say which mailboxes hold a
+// message. It is optional so that Store implementations outside this module
+// keep compiling; PgStore implements it, and the engine uses it to satisfy a
+// MailboxSelector adapter before a body fetch.
+type MessageLocator interface {
+	// MessageMailboxes returns every mailbox the message is filed in, or
+	// ErrNoStore when the message is not mirrored locally.
+	MessageMailboxes(ctx context.Context, acct AccountID, id MessageID) ([]MailboxID, error)
+}
+
 // PgStore is the Nucleus-backed Store.
 type PgStore struct {
 	pool *pgxpool.Pool
@@ -604,6 +614,32 @@ func (s *PgStore) Body(ctx context.Context, acct AccountID, id MessageID) (*Body
 // ---------------------------------------------------------------------------
 // Sync state
 // ---------------------------------------------------------------------------
+
+func (s *PgStore) MessageMailboxes(ctx context.Context, acct AccountID, id MessageID) ([]MailboxID, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT mailbox_id FROM mail_message_mailboxes
+		  WHERE account_id = $1 AND message_id = $2 ORDER BY mailbox_id`,
+		string(acct), string(id))
+	if err != nil {
+		return nil, fmt.Errorf("mail: message mailboxes: %w", err)
+	}
+	defer rows.Close()
+	var boxes []MailboxID
+	for rows.Next() {
+		var box string
+		if err := rows.Scan(&box); err != nil {
+			return nil, fmt.Errorf("mail: message mailboxes: %w", err)
+		}
+		boxes = append(boxes, MailboxID(box))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("mail: message mailboxes: %w", err)
+	}
+	if len(boxes) == 0 {
+		return nil, ErrNoStore
+	}
+	return boxes, nil
+}
 
 func (s *PgStore) Cursor(ctx context.Context, acct AccountID, box MailboxID) (Cursor, error) {
 	var cur string
