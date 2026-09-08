@@ -500,6 +500,80 @@ impl Default for LoggingConfig {
 // NucleusConfig (top-level)
 // ---------------------------------------------------------------------------
 
+/// Per-session / per-connection resource limits.
+///
+/// These bound LOGICAL growth — maps and registries that live as long as a
+/// session and grow through client actions. They are not a memory-leak
+/// backstop: Rust ownership plus session teardown already reclaim memory on
+/// disconnect. They are what keeps ONE pathological session from growing a
+/// shared structure (row locks, auth-failure table) or its own (prepared
+/// statements, portals, cursors, LISTEN channels, large-object descriptors)
+/// without bound while connected. Overruns are client-visible rejections:
+/// SQLSTATE 54000 for per-session handles, 53200 for row-lock exhaustion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LimitsConfig {
+    /// Row locks (FOR UPDATE / FOR SHARE) one session's transaction may hold
+    /// at once. Past the limit, locking acquisitions fail with 53200 until
+    /// the transaction commits or rolls back.
+    #[serde(default = "default_max_row_locks_per_session")]
+    pub max_row_locks_per_session: usize,
+    /// SQL-level PREPARE statements and extended-query named statements one
+    /// session may hold. Past the limit, PREPARE / Parse fails with 54000.
+    #[serde(default = "default_max_prepared_statements_per_session")]
+    pub max_prepared_statements_per_session: usize,
+    /// Extended-query named portals (Bind) one connection may hold.
+    #[serde(default = "default_max_portals_per_session")]
+    pub max_portals_per_session: usize,
+    /// SQL-level cursors (DECLARE) one session may hold.
+    #[serde(default = "default_max_cursors_per_session")]
+    pub max_cursors_per_session: usize,
+    /// Channels one connection may LISTEN on.
+    #[serde(default = "default_max_listen_channels_per_session")]
+    pub max_listen_channels_per_session: usize,
+    /// Large-object descriptors one connection may hold open (lo_open).
+    #[serde(default = "default_max_large_objects_per_session")]
+    pub max_large_objects_per_session: usize,
+    /// Source IPs tracked in the failed-authentication table.
+    #[serde(default = "default_max_auth_failure_entries")]
+    pub max_auth_failure_entries: usize,
+}
+
+fn default_max_row_locks_per_session() -> usize {
+    100_000
+}
+fn default_max_prepared_statements_per_session() -> usize {
+    1024
+}
+fn default_max_portals_per_session() -> usize {
+    1024
+}
+fn default_max_cursors_per_session() -> usize {
+    1024
+}
+fn default_max_listen_channels_per_session() -> usize {
+    1024
+}
+fn default_max_large_objects_per_session() -> usize {
+    1024
+}
+fn default_max_auth_failure_entries() -> usize {
+    10_000
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_row_locks_per_session: default_max_row_locks_per_session(),
+            max_prepared_statements_per_session: default_max_prepared_statements_per_session(),
+            max_portals_per_session: default_max_portals_per_session(),
+            max_cursors_per_session: default_max_cursors_per_session(),
+            max_listen_channels_per_session: default_max_listen_channels_per_session(),
+            max_large_objects_per_session: default_max_large_objects_per_session(),
+            max_auth_failure_entries: default_max_auth_failure_entries(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct NucleusConfig {
     #[serde(default)]
@@ -512,6 +586,8 @@ pub struct NucleusConfig {
     pub pool: PoolConfig,
     #[serde(default)]
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub limits: LimitsConfig,
     #[serde(default)]
     pub replication: ReplicationConfig,
     #[serde(default)]
@@ -622,6 +698,59 @@ impl NucleusConfig {
                 parsed_env::<usize>(&mut warnings, "NUCLEUS_SERVER_MAX_CONNECTIONS", &v)
         {
             self.server.max_connections = n;
+        }
+
+        // limits
+        if let Ok(v) = env::var("NUCLEUS_LIMITS_MAX_ROW_LOCKS_PER_SESSION")
+            && let Some(n) =
+                parsed_env::<usize>(&mut warnings, "NUCLEUS_LIMITS_MAX_ROW_LOCKS_PER_SESSION", &v)
+        {
+            self.limits.max_row_locks_per_session = n;
+        }
+        if let Ok(v) = env::var("NUCLEUS_LIMITS_MAX_PREPARED_STATEMENTS_PER_SESSION")
+            && let Some(n) = parsed_env::<usize>(
+                &mut warnings,
+                "NUCLEUS_LIMITS_MAX_PREPARED_STATEMENTS_PER_SESSION",
+                &v,
+            )
+        {
+            self.limits.max_prepared_statements_per_session = n;
+        }
+        if let Ok(v) = env::var("NUCLEUS_LIMITS_MAX_PORTALS_PER_SESSION")
+            && let Some(n) =
+                parsed_env::<usize>(&mut warnings, "NUCLEUS_LIMITS_MAX_PORTALS_PER_SESSION", &v)
+        {
+            self.limits.max_portals_per_session = n;
+        }
+        if let Ok(v) = env::var("NUCLEUS_LIMITS_MAX_CURSORS_PER_SESSION")
+            && let Some(n) =
+                parsed_env::<usize>(&mut warnings, "NUCLEUS_LIMITS_MAX_CURSORS_PER_SESSION", &v)
+        {
+            self.limits.max_cursors_per_session = n;
+        }
+        if let Ok(v) = env::var("NUCLEUS_LIMITS_MAX_LISTEN_CHANNELS_PER_SESSION")
+            && let Some(n) = parsed_env::<usize>(
+                &mut warnings,
+                "NUCLEUS_LIMITS_MAX_LISTEN_CHANNELS_PER_SESSION",
+                &v,
+            )
+        {
+            self.limits.max_listen_channels_per_session = n;
+        }
+        if let Ok(v) = env::var("NUCLEUS_LIMITS_MAX_LARGE_OBJECTS_PER_SESSION")
+            && let Some(n) = parsed_env::<usize>(
+                &mut warnings,
+                "NUCLEUS_LIMITS_MAX_LARGE_OBJECTS_PER_SESSION",
+                &v,
+            )
+        {
+            self.limits.max_large_objects_per_session = n;
+        }
+        if let Ok(v) = env::var("NUCLEUS_LIMITS_MAX_AUTH_FAILURE_ENTRIES")
+            && let Some(n) =
+                parsed_env::<usize>(&mut warnings, "NUCLEUS_LIMITS_MAX_AUTH_FAILURE_ENTRIES", &v)
+        {
+            self.limits.max_auth_failure_entries = n;
         }
 
         // storage
@@ -840,6 +969,23 @@ impl NucleusConfig {
                 "server.max_connections must be at least 1 (got 0): the server would refuse every connection"
                     .to_string(),
             );
+        }
+        // A zero limit would disable the bound it configures, and every one of
+        // these exists precisely because the unbounded behavior was the bug.
+        for (name, value) in [
+            ("limits.max_row_locks_per_session", self.limits.max_row_locks_per_session),
+            ("limits.max_prepared_statements_per_session", self.limits.max_prepared_statements_per_session),
+            ("limits.max_portals_per_session", self.limits.max_portals_per_session),
+            ("limits.max_cursors_per_session", self.limits.max_cursors_per_session),
+            ("limits.max_listen_channels_per_session", self.limits.max_listen_channels_per_session),
+            ("limits.max_large_objects_per_session", self.limits.max_large_objects_per_session),
+            ("limits.max_auth_failure_entries", self.limits.max_auth_failure_entries),
+        ] {
+            if value == 0 {
+                errors.push(format!(
+                    "{name} must be at least 1 (got 0): 0 would remove the bound, and the unbounded behavior is what this limit exists to prevent"
+                ));
+            }
         }
         if self.pool.min_idle > self.server.max_connections {
             errors.push(format!(
@@ -1510,6 +1656,7 @@ port = 5555
             },
             wal: WalConfig::default(),
             pool: PoolConfig::default(),
+            limits: LimitsConfig::default(),
             cache: CacheConfig {
                 enabled: true,
                 max_memory_mb: 128,

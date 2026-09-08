@@ -348,6 +348,10 @@ impl Executor {
                 generation: gen_at_miss,
             },
         );
+        // Length via the guard already held — re-acquiring this RwLock for a
+        // read on the same thread would deadlock (parking_lot is not
+        // re-entrant).
+        self.metrics.query_cache_entries.set(cache.len() as i64);
     }
 
     /// Invalidate all cached queries (called after any write operation).
@@ -359,6 +363,7 @@ impl Executor {
         self.cache_write_gen.fetch_add(1, Ordering::Release);
         let mut cache = self.query_cache.write();
         cache.clear();
+        self.metrics.query_cache_entries.set(0);
     }
 
     /// Get query cache entry count and hit info.

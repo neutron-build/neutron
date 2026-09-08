@@ -1450,11 +1450,30 @@ async fn cmd_start(cfg: StartConfig) {
         }
     }
     let resolved_password_for_resp = resolved_password.clone();
+    // Per-session resource limits (memory hygiene): row locks via the
+    // executor, statements/portals/LISTEN/large objects via the wire handler.
+    // Both default sanely; config exists so an operator with a legitimately
+    // larger workload can raise them instead of living on rejections.
+    executor.set_max_row_locks_per_session(config.limits.max_row_locks_per_session);
+    executor.set_session_statement_limits(
+        config.limits.max_prepared_statements_per_session,
+        config.limits.max_cursors_per_session,
+    );
+    let wire_limits = nucleus::wire::WireLimits {
+        max_prepared_statements_per_session: config.limits.max_prepared_statements_per_session,
+        max_portals_per_session: config.limits.max_portals_per_session,
+        max_listen_channels_per_session: config.limits.max_listen_channels_per_session,
+        max_large_objects_per_session: config.limits.max_large_objects_per_session,
+        max_auth_failure_entries: config.limits.max_auth_failure_entries,
+    };
     let handler = if let Some(ref bootstrap_password) = resolved_password {
         executor.set_bootstrap_password(bootstrap_password).await;
-        Arc::new(NucleusHandler::with_catalog_auth(executor.clone()))
+        Arc::new(
+            NucleusHandler::with_catalog_auth(executor.clone())
+                .with_wire_limits(wire_limits),
+        )
     } else {
-        Arc::new(NucleusHandler::new(executor.clone()))
+        Arc::new(NucleusHandler::new(executor.clone()).with_wire_limits(wire_limits))
     };
     let handler_ref = handler.clone();
     let server = Arc::new(NucleusServer::new(handler));

@@ -308,6 +308,11 @@ impl AstCache {
     pub fn clear(&mut self) {
         self.entries.clear();
     }
+
+    /// Current entry count (occupancy gauge for the bounded cache).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 /// Bounded global prepared statement cache with LRU eviction.
@@ -348,6 +353,11 @@ impl GlobalPreparedCache {
     /// Clear every cached prepared statement.
     pub fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    /// Current entry count (occupancy gauge for the bounded cache).
+    pub fn len(&self) -> usize {
+        self.entries.len()
     }
 
     /// Insert a prepared statement. Evicts the least-accessed entry if full.
@@ -433,5 +443,10 @@ impl PlanCache {
     /// Clear all cached plans (called on DDL).
     pub fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    /// Current entry count (occupancy gauge for the bounded cache).
+    pub fn len(&self) -> usize {
+        self.entries.len()
     }
 }

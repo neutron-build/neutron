@@ -260,7 +260,7 @@ impl Executor {
                         break;
                     }
                     let key = key_of(&row);
-                    if self.row_locks.try_lock(session, &key) == RowTry::Acquired {
+                    if self.row_locks.try_lock(session, &key)? == RowTry::Acquired {
                         kept.push(row);
                     }
                 }
@@ -268,7 +268,7 @@ impl Executor {
             }
             Some(ast::NonBlock::Nowait) => {
                 for key in &keys {
-                    if self.row_locks.try_lock(session, key) == RowTry::HeldElsewhere {
+                    if self.row_locks.try_lock(session, key)? == RowTry::HeldElsewhere {
                         // The `lock_not_available` wording is what the wire
                         // codec maps to SQLSTATE 55P03, PostgreSQL's code for
                         // exactly this refusal.
@@ -295,6 +295,9 @@ impl Executor {
                 }
             }
         }
+        self.metrics
+            .row_locks_held
+            .set(self.row_locks.held_count() as i64);
         Ok(())
     }
 
@@ -303,5 +306,8 @@ impl Executor {
     /// releases the unique-key gate and the storage table locks.
     pub(crate) fn release_row_locks(&self, session: u64) {
         self.row_locks.release_session(session);
+        self.metrics
+            .row_locks_held
+            .set(self.row_locks.held_count() as i64);
     }
 }

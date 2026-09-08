@@ -53,7 +53,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -408,7 +408,22 @@ pub struct RowLockManager {
     /// Woken on every release so waiters re-check.
     released: Notify,
     timeout_ms: AtomicU64,
+    /// Per-session row-lock count limit. A transaction may hold at most this
+    /// many rows locked at once; an acquisition past the limit is refused with
+    /// the `too_many_row_locks` error (SQLSTATE 53200 via the wire codec).
+    ///
+    /// Locks are only released at transaction end, so without a bound one
+    /// session in one long transaction can grow the lock table without limit
+    /// — each entry is a full key tuple, not a pointer. PostgreSQL bounds its
+    /// lock table the same way (`max_locks_per_transaction`, exhausted →
+    /// 53200 "out of shared memory").
+    max_locks_per_session: AtomicUsize,
 }
+
+/// Default per-session row-lock limit. Generous against real claim workloads
+/// (queue claims lock in the tens to hundreds), while 100k key tuples is a
+/// few MB — a real ceiling on the per-session footprint, not a paper one.
+pub const DEFAULT_MAX_ROW_LOCKS_PER_SESSION: usize = 100_000;
 
 #[derive(Default)]
 struct RowHeld {
@@ -430,7 +445,27 @@ impl RowLockManager {
             held: Mutex::new(RowHeld::default()),
             released: Notify::new(),
             timeout_ms: AtomicU64::new(DEFAULT_LOCK_TIMEOUT_MS),
+            max_locks_per_session: AtomicUsize::new(DEFAULT_MAX_ROW_LOCKS_PER_SESSION),
         }
+    }
+
+    /// Set the per-session row-lock limit. Applied to acquisitions after this
+    /// call; already-held locks are untouched.
+    pub fn set_max_locks_per_session(&self, n: usize) {
+        self.max_locks_per_session.store(n, Ordering::Relaxed);
+    }
+
+    /// The error reported when a session's lock count is at the limit. The
+    /// `too_many_row_locks` prefix is what the wire error codec keys SQLSTATE
+    /// 53200 (out_of_memory) on — PostgreSQL's class for lock-table
+    /// exhaustion, and not a retryable conflict.
+    fn too_many_row_locks(session: u64, held: usize, limit: usize) -> StorageError {
+        StorageError::Io(format!(
+            "too_many_row_locks: session {session} already holds {held} row locks \
+             (limit {limit}); the transaction must commit or roll back before \
+             locking more rows (raise limits.max_row_locks_per_session if this \
+             is a legitimate workload)"
+        ))
     }
 
     /// Set the plain-`FOR UPDATE` wait bound. 0 disables it (wait forever).
@@ -452,20 +487,27 @@ impl RowLockManager {
 
     /// Attempt one row lock without waiting. Re-entrant: a key this session
     /// already holds is `Acquired` again — a transaction re-reading its own
-    /// locked rows must not skip or fail them.
-    pub fn try_lock(&self, session: u64, key: &RowLockKey) -> RowTry {
+    /// locked rows must not skip or fail them. A NEW key past the session's
+    /// lock limit is an error, not a skip: `SKIP LOCKED` semantics must never
+    /// silently swallow a resource refusal.
+    pub fn try_lock(&self, session: u64, key: &RowLockKey) -> Result<RowTry, StorageError> {
+        let limit = self.max_locks_per_session.load(Ordering::Relaxed);
         let mut held = self.held.lock();
         match held.owner.get(key) {
             None => {
+                let already = held.by_session.get(&session).map_or(0, Vec::len);
+                if already >= limit {
+                    return Err(Self::too_many_row_locks(session, already, limit));
+                }
                 held.owner.insert(key.clone(), session);
                 held.by_session
                     .entry(session)
                     .or_default()
                     .push(key.clone());
-                RowTry::Acquired
+                Ok(RowTry::Acquired)
             }
-            Some(&owner) if owner == session => RowTry::Acquired,
-            Some(_) => RowTry::HeldElsewhere,
+            Some(&owner) if owner == session => Ok(RowTry::Acquired),
+            Some(_) => Ok(RowTry::HeldElsewhere),
         }
     }
 
@@ -474,7 +516,7 @@ impl RowLockManager {
     /// serialization failure, for the same reason the table manager's is: a
     /// held row is not a conflict a retry can win.
     pub async fn lock(&self, session: u64, key: &RowLockKey) -> Result<(), StorageError> {
-        if self.try_lock(session, key) == RowTry::Acquired {
+        if self.try_lock(session, key)? == RowTry::Acquired {
             return Ok(());
         }
         let started = std::time::Instant::now();
@@ -483,7 +525,7 @@ impl RowLockManager {
             // Register interest BEFORE the next try, so a release landing
             // between the failed try and the await cannot be missed.
             let woken = self.released.notified();
-            if self.try_lock(session, key) == RowTry::Acquired {
+            if self.try_lock(session, key)? == RowTry::Acquired {
                 return Ok(());
             }
             if budget == 0 {
@@ -525,9 +567,17 @@ impl RowLockManager {
     }
 
     /// Rows currently locked, across all sessions. Test/observability.
-    #[cfg(test)]
     pub fn held_count(&self) -> usize {
         self.held.lock().owner.len()
+    }
+
+    /// Row locks one session currently holds. Test/observability.
+    pub fn session_held_count(&self, session: u64) -> usize {
+        self.held
+            .lock()
+            .by_session
+            .get(&session)
+            .map_or(0, Vec::len)
     }
 
     /// Whether `session` currently holds any row lock. Test/observability.
@@ -553,7 +603,7 @@ mod row_lock_tests {
     #[tokio::test]
     async fn a_free_row_locks_immediately() {
         let lm = RowLockManager::new();
-        assert_eq!(lm.try_lock(1, &key(7)), RowTry::Acquired);
+        assert_eq!(lm.try_lock(1, &key(7)).unwrap(), RowTry::Acquired);
         assert!(lm.holds_any(1));
         assert_eq!(lm.held_count(), 1);
     }
@@ -561,16 +611,16 @@ mod row_lock_tests {
     #[tokio::test]
     async fn another_session_sees_the_row_held() {
         let lm = RowLockManager::new();
-        assert_eq!(lm.try_lock(1, &key(7)), RowTry::Acquired);
-        assert_eq!(lm.try_lock(2, &key(7)), RowTry::HeldElsewhere);
+        assert_eq!(lm.try_lock(1, &key(7)).unwrap(), RowTry::Acquired);
+        assert_eq!(lm.try_lock(2, &key(7)).unwrap(), RowTry::HeldElsewhere);
     }
 
     #[tokio::test]
     async fn the_holder_reacquires_its_own_row() {
         let lm = RowLockManager::new();
-        assert_eq!(lm.try_lock(1, &key(7)), RowTry::Acquired);
+        assert_eq!(lm.try_lock(1, &key(7)).unwrap(), RowTry::Acquired);
         assert_eq!(
-            lm.try_lock(1, &key(7)),
+            lm.try_lock(1, &key(7)).unwrap(),
             RowTry::Acquired,
             "re-locking own rows must be a no-op, not a skip"
         );
@@ -585,8 +635,8 @@ mod row_lock_tests {
     #[tokio::test]
     async fn different_keys_do_not_conflict() {
         let lm = RowLockManager::new();
-        assert_eq!(lm.try_lock(1, &key(7)), RowTry::Acquired);
-        assert_eq!(lm.try_lock(2, &key(8)), RowTry::Acquired);
+        assert_eq!(lm.try_lock(1, &key(7)).unwrap(), RowTry::Acquired);
+        assert_eq!(lm.try_lock(2, &key(8)).unwrap(), RowTry::Acquired);
     }
 
     /// Integer widths are one row: `Int32(1)` and `Int64(1)` are the same
@@ -596,11 +646,11 @@ mod row_lock_tests {
     async fn integer_widths_are_the_same_row() {
         let lm = RowLockManager::new();
         assert_eq!(
-            lm.try_lock(1, &("t".to_string(), vec![Value::Int32(7)])),
+            lm.try_lock(1, &("t".to_string(), vec![Value::Int32(7)])).unwrap(),
             RowTry::Acquired
         );
         assert_eq!(
-            lm.try_lock(2, &("t".to_string(), vec![Value::Int64(7)])),
+            lm.try_lock(2, &("t".to_string(), vec![Value::Int64(7)])).unwrap(),
             RowTry::HeldElsewhere,
             "Int32(7) and Int64(7) are the same primary key"
         );
@@ -612,11 +662,11 @@ mod row_lock_tests {
     async fn same_key_in_different_tables_is_a_different_row() {
         let lm = RowLockManager::new();
         assert_eq!(
-            lm.try_lock(1, &("a".to_string(), vec![Value::Int64(7)])),
+            lm.try_lock(1, &("a".to_string(), vec![Value::Int64(7)])).unwrap(),
             RowTry::Acquired
         );
         assert_eq!(
-            lm.try_lock(2, &("b".to_string(), vec![Value::Int64(7)])),
+            lm.try_lock(2, &("b".to_string(), vec![Value::Int64(7)])).unwrap(),
             RowTry::Acquired
         );
     }
@@ -624,19 +674,19 @@ mod row_lock_tests {
     #[tokio::test]
     async fn release_session_frees_the_rows() {
         let lm = RowLockManager::new();
-        assert_eq!(lm.try_lock(1, &key(7)), RowTry::Acquired);
-        assert_eq!(lm.try_lock(1, &key(8)), RowTry::Acquired);
+        assert_eq!(lm.try_lock(1, &key(7)).unwrap(), RowTry::Acquired);
+        assert_eq!(lm.try_lock(1, &key(8)).unwrap(), RowTry::Acquired);
         lm.release_session(1);
         assert_eq!(lm.held_count(), 0);
         assert!(!lm.holds_any(1));
         // And the rows are lockable again — no stale entry survives release.
-        assert_eq!(lm.try_lock(2, &key(7)), RowTry::Acquired);
+        assert_eq!(lm.try_lock(2, &key(7)).unwrap(), RowTry::Acquired);
     }
 
     #[tokio::test]
     async fn plain_lock_blocks_then_proceeds_after_release() {
         let lm = Arc::new(RowLockManager::new());
-        assert_eq!(lm.try_lock(1, &key(7)), RowTry::Acquired);
+        assert_eq!(lm.try_lock(1, &key(7)).unwrap(), RowTry::Acquired);
         let lm2 = lm.clone();
         let k = key(7);
         let waiter = tokio::spawn(async move { lm2.lock(2, &k).await });
@@ -657,7 +707,7 @@ mod row_lock_tests {
     #[tokio::test]
     async fn a_release_during_the_wait_wakes_the_waiter() {
         let lm = Arc::new(RowLockManager::new());
-        assert_eq!(lm.try_lock(1, &key(7)), RowTry::Acquired);
+        assert_eq!(lm.try_lock(1, &key(7)).unwrap(), RowTry::Acquired);
         let lm2 = lm.clone();
         let k = key(7);
         let waiter = tokio::spawn(async move { lm2.lock(2, &k).await });
@@ -673,7 +723,7 @@ mod row_lock_tests {
     async fn a_plain_wait_gives_up_after_the_timeout() {
         let lm = RowLockManager::new();
         lm.set_timeout_ms(60);
-        assert_eq!(lm.try_lock(1, &key(7)), RowTry::Acquired);
+        assert_eq!(lm.try_lock(1, &key(7)).unwrap(), RowTry::Acquired);
         let started = std::time::Instant::now();
         let err = lm
             .lock(2, &key(7))
@@ -686,6 +736,80 @@ mod row_lock_tests {
         );
         assert!(waited >= std::time::Duration::from_millis(50));
         assert!(waited < std::time::Duration::from_secs(5));
+    }
+
+    // ── per-session lock-count limit ──────────────────────────────────────
+
+    /// The limit is on DISTINCT keys: re-acquiring rows the session already
+    /// holds is free, or a claim query re-reading its own locked rows would
+    /// burn budget on every pass.
+    #[tokio::test]
+    async fn re_locking_owned_rows_does_not_consume_budget() {
+        let lm = RowLockManager::new();
+        lm.set_max_locks_per_session(2);
+        assert_eq!(lm.try_lock(1, &key(1)).unwrap(), RowTry::Acquired);
+        assert_eq!(lm.try_lock(1, &key(1)).unwrap(), RowTry::Acquired);
+        assert_eq!(lm.try_lock(1, &key(2)).unwrap(), RowTry::Acquired);
+        assert_eq!(
+            lm.session_held_count(1),
+            2,
+            "re-locks must not add entries"
+        );
+    }
+
+    /// A session at its limit is REFUSED, not skipped: `SKIP LOCKED` treats an
+    /// entry as claimable-by-no-one when it returns HeldElsewhere, so a
+    /// resource refusal surfacing as a skip would silently return fewer rows
+    /// with no error anywhere. Control: another session under its own limit
+    /// locks freely.
+    #[tokio::test]
+    async fn an_acquisition_past_the_limit_is_refused_not_skipped() {
+        let lm = RowLockManager::new();
+        lm.set_max_locks_per_session(3);
+        for i in 1..=3 {
+            assert_eq!(lm.try_lock(1, &key(i)).unwrap(), RowTry::Acquired);
+        }
+        let err = lm
+            .try_lock(1, &key(4))
+            .expect_err("the 4th distinct row must be refused");
+        assert!(
+            err.to_string().contains("too_many_row_locks"),
+            "got: {err}"
+        );
+        // Control: session 2 has its own budget.
+        assert_eq!(lm.try_lock(2, &key(4)).unwrap(), RowTry::Acquired);
+        // And the refused lock took no entry.
+        assert_eq!(lm.held_count(), 4);
+        assert_eq!(lm.session_held_count(1), 3);
+    }
+
+    /// The plain (blocking) acquisition path enforces the same limit — the
+    /// cap must not be bypassable by choosing the waiting mode.
+    #[tokio::test]
+    async fn the_plain_lock_path_enforces_the_limit() {
+        let lm = RowLockManager::new();
+        lm.set_max_locks_per_session(1);
+        assert_eq!(lm.try_lock(1, &key(1)).unwrap(), RowTry::Acquired);
+        let err = lm
+            .lock(1, &key(2))
+            .await
+            .expect_err("a second distinct row must be refused");
+        assert!(
+            err.to_string().contains("too_many_row_locks"),
+            "got: {err}"
+        );
+    }
+
+    /// Release makes budget available again — the limit tracks held locks,
+    /// not acquisitions over the session's lifetime.
+    #[tokio::test]
+    async fn release_restores_budget() {
+        let lm = RowLockManager::new();
+        lm.set_max_locks_per_session(1);
+        assert_eq!(lm.try_lock(1, &key(1)).unwrap(), RowTry::Acquired);
+        assert!(lm.try_lock(1, &key(2)).is_err());
+        lm.release_session(1);
+        assert_eq!(lm.try_lock(1, &key(2)).unwrap(), RowTry::Acquired);
     }
 }
 

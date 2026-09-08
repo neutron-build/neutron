@@ -53,6 +53,10 @@ use pgwire::api::{
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::cancel::CancelRequest;
 use pgwire::messages::copy::{CopyData, CopyDone};
+use pgwire::messages::extendedquery::{
+    Bind, BindComplete, Close, CloseComplete, Parse, ParseComplete, TARGET_TYPE_BYTE_PORTAL,
+    TARGET_TYPE_BYTE_STATEMENT,
+};
 use pgwire::messages::response::{CommandComplete, NotificationResponse};
 use pgwire::messages::startup::{Authentication, PasswordMessageFamily, SecretKey};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
@@ -228,10 +232,23 @@ pub enum AuthMethod {
 /// Tracks failed authentication attempts per source IP to prevent brute-force
 /// attacks.  After [`MAX_FAILED_ATTEMPTS`] failures from the same IP within
 /// [`LOCKOUT_SECS`] seconds, subsequent attempts are rejected immediately.
+///
+/// The table itself is bounded: entries are only removed on successful auth
+/// from the same IP, so an internet scanner cycling source addresses (easy
+/// over IPv6) would otherwise grow one entry per address forever. At
+/// capacity, expired entries are pruned; if none are expired, the oldest is
+/// dropped — a brand-new attacker IP displacing a stale one never weakens a
+/// live lockout, because a lockout that matters is by definition recent.
 struct LoginRateLimiter {
     /// Map from source IP → (failure_count, last_failure_instant).
     attempts: parking_lot::Mutex<std::collections::HashMap<IpAddr, (u32, std::time::Instant)>>,
+    /// Maximum number of tracked IPs.
+    capacity: usize,
 }
+
+/// Default bound on the auth-failure table. ~40 bytes an entry makes the
+/// default table well under half a megabyte at full occupancy.
+const DEFAULT_MAX_AUTH_FAILURE_ENTRIES: usize = 10_000;
 
 impl LoginRateLimiter {
     /// Maximum consecutive failures before lockout.
@@ -242,6 +259,14 @@ impl LoginRateLimiter {
     fn new() -> Self {
         Self {
             attempts: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            capacity: DEFAULT_MAX_AUTH_FAILURE_ENTRIES,
+        }
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            attempts: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            capacity: capacity.max(1),
         }
     }
 
@@ -260,6 +285,22 @@ impl LoginRateLimiter {
     /// Record a failed authentication attempt from `ip`.
     fn record_failure(&self, ip: IpAddr) {
         let mut attempts = self.attempts.lock();
+        if attempts.len() >= self.capacity && !attempts.contains_key(&ip) {
+            // Prune expired records first — entries outside the lockout
+            // window no longer represent anything the limiter would act on.
+            attempts.retain(|_, (_, last)| last.elapsed().as_secs() < Self::LOCKOUT_SECS);
+            // Still full: drop the least-recently-failing IP. Lockouts are
+            // time-boxed, so the entry with the OLDEST last-failure instant is
+            // the least useful one held.
+            if attempts.len() >= self.capacity
+                && let Some(oldest) = attempts
+                    .iter()
+                    .min_by_key(|(_, (_, last))| *last)
+                    .map(|(k, _)| *k)
+            {
+                attempts.remove(&oldest);
+            }
+        }
         let entry = attempts.entry(ip).or_insert((0, std::time::Instant::now()));
         // Reset the counter if the lockout window has elapsed.
         if entry.1.elapsed().as_secs() >= Self::LOCKOUT_SECS {
@@ -273,6 +314,12 @@ impl LoginRateLimiter {
     /// Clear the failure record for `ip` (called on successful auth).
     fn clear(&self, ip: IpAddr) {
         self.attempts.lock().remove(&ip);
+    }
+
+    /// Current entry count (test/observability).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.attempts.lock().len()
     }
 }
 
@@ -555,6 +602,61 @@ struct CopyInProgress {
 // Handler
 // ============================================================================
 
+/// Per-connection resource limits for the wire layer.
+///
+/// Every structure these bound is per-session state a client grows through
+/// explicit protocol actions (Parse/Bind, LISTEN, lo_open) and that lives
+/// until the matching release action or disconnect — so a bound is what
+/// separates "a session has state" from "a session has unbounded state".
+/// Overruns are REJECTIONS (SQLSTATE 54000), not evictions: these are
+/// client-addressable handles, and silently dropping one turns the client's
+/// next use into a confusing "not found" instead of an actionable refusal.
+#[derive(Debug, Clone, Copy)]
+pub struct WireLimits {
+    /// Named prepared statements (extended-query Parse) per connection,
+    /// counting also the SQL-level PREPARE map enforced by the executor.
+    pub max_prepared_statements_per_session: usize,
+    /// Named portals (extended-query Bind) per connection.
+    pub max_portals_per_session: usize,
+    /// Channels one connection may LISTEN on. Each channel holds a broadcast
+    /// buffer with capacity 256, so this bounds real memory, not just counters.
+    pub max_listen_channels_per_session: usize,
+    /// Large-object descriptors one connection may hold open via lo_open.
+    pub max_large_objects_per_session: usize,
+    /// Tracked IPs in the failed-auth table (see [`LoginRateLimiter`]).
+    pub max_auth_failure_entries: usize,
+}
+
+impl Default for WireLimits {
+    fn default() -> Self {
+        Self {
+            max_prepared_statements_per_session: DEFAULT_MAX_PREPARED_STATEMENTS,
+            max_portals_per_session: DEFAULT_MAX_PREPARED_STATEMENTS,
+            max_listen_channels_per_session: DEFAULT_MAX_LISTEN_CHANNELS,
+            max_large_objects_per_session: DEFAULT_MAX_LARGE_OBJECTS,
+            max_auth_failure_entries: DEFAULT_MAX_AUTH_FAILURE_ENTRIES,
+        }
+    }
+}
+
+/// Default per-connection named-statement/portal cap. Named statements are
+/// client-addressable protocol state; real pools hold single digits.
+pub const DEFAULT_MAX_PREPARED_STATEMENTS: usize = 1024;
+/// Default per-connection LISTEN-channel cap.
+pub const DEFAULT_MAX_LISTEN_CHANNELS: usize = 1024;
+/// Default per-connection open large-object descriptor cap.
+pub const DEFAULT_MAX_LARGE_OBJECTS: usize = 1024;
+
+/// Extended-query (named statement/portal) usage for one connection. The
+/// pgwire crate's per-connection `MemPortalStore` is an unbounded BTreeMap
+/// with no `len()` surface, so the handler keeps its own count at the
+/// override points (`on_parse`/`on_bind`/`on_close`).
+#[derive(Debug, Default, Clone, Copy)]
+struct ExtendedQueryCounts {
+    statements: usize,
+    portals: usize,
+}
+
 /// The Nucleus query handler. Implements startup authentication, simple query,
 /// and extended query (prepared statement) processing.
 ///
@@ -585,6 +687,14 @@ pub struct NucleusHandler {
     max_query_size: usize,
     /// Rate limiter for failed authentication attempts (brute-force protection).
     login_rate_limiter: LoginRateLimiter,
+    /// Per-connection resource limits (statements/portals/LISTEN/large objects).
+    limits: WireLimits,
+    /// Named statement/portal counts per peer, enforcing
+    /// `limits.max_prepared_statements_per_session` /
+    /// `limits.max_portals_per_session` against the otherwise-unbounded
+    /// per-connection pgwire portal store. Removed in `cleanup_session`.
+    extended_query_counts:
+        parking_lot::Mutex<HashMap<String, ExtendedQueryCounts>>,
 
     // ── LISTEN/NOTIFY ────────────────────────────────────────────────────
     /// Shared notification registry: channel → broadcast sender.
@@ -669,6 +779,8 @@ impl NucleusHandler {
             statement_timeout_secs: Self::DEFAULT_STATEMENT_TIMEOUT_SECS,
             max_query_size: Self::DEFAULT_MAX_QUERY_SIZE,
             login_rate_limiter: LoginRateLimiter::new(),
+            limits: WireLimits::default(),
+            extended_query_counts: parking_lot::Mutex::new(HashMap::new()),
             notification_registry: Arc::new(NotificationRegistry::new(256)),
             notify_state: parking_lot::Mutex::new(std::collections::HashMap::new()),
             connection_pids: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -740,6 +852,8 @@ impl NucleusHandler {
             statement_timeout_secs: Self::DEFAULT_STATEMENT_TIMEOUT_SECS,
             max_query_size: Self::DEFAULT_MAX_QUERY_SIZE,
             login_rate_limiter: LoginRateLimiter::new(),
+            limits: WireLimits::default(),
+            extended_query_counts: parking_lot::Mutex::new(HashMap::new()),
             notification_registry: Arc::new(NotificationRegistry::new(256)),
             notify_state: parking_lot::Mutex::new(std::collections::HashMap::new()),
             connection_pids: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -768,6 +882,32 @@ impl NucleusHandler {
     /// Active authentication method for this handler.
     pub fn auth_method(&self) -> AuthMethod {
         self.auth_method
+    }
+
+    /// Override the per-connection wire resource limits (builder form, applied
+    /// by the server bootstrap from `limits.*` config).
+    pub fn with_wire_limits(mut self, limits: WireLimits) -> Self {
+        self.limits = limits;
+        self.login_rate_limiter = LoginRateLimiter::with_capacity(limits.max_auth_failure_entries);
+        self
+    }
+
+    /// The 54000 refusal for a per-connection statement/portal cap.
+    fn too_many_extended_query_objects(kind: &str, held: usize, limit: usize) -> PgWireError {
+        let mut info = ErrorInfo::new(
+            "ERROR".to_owned(),
+            "54000".to_owned(),
+            format!(
+                "too_many_{kind}: this connection already holds {held} {kind} (limit {limit}); \
+                 close one before opening another, or raise \
+                 limits.max_prepared_statements_per_session"
+            ),
+        );
+        info.hint = Some(format!(
+            "Close with the Close message (or DEALLOCATE for SQL-level PREPARE) \
+             before preparing more; {held}/{limit} in use."
+        ));
+        PgWireError::UserError(Box::new(info))
     }
 
     async fn handle_scram_password_message<C>(
@@ -1744,6 +1884,7 @@ impl SimpleQueryHandler for NucleusHandler {
             && !rls_active
             && let Some(lo_result) = self.try_handle_large_object(&peer_addr_str, query)
         {
+            let lo_result = lo_result.map_err(exec_error_to_pgwire)?;
             let resp = Self::build_response(lo_result, None)?;
             self.flush_pending_notifications(client).await?;
             return Ok(vec![resp]);
@@ -1759,7 +1900,8 @@ impl SimpleQueryHandler for NucleusHandler {
             let trimmed_upper = query.trim().to_uppercase();
             if trimmed_upper.starts_with("LISTEN ") {
                 let channel = query.trim()[7..].trim().trim_end_matches(';').trim();
-                self.handle_listen(&peer_addr_str, channel);
+                self.handle_listen(&peer_addr_str, channel)
+                    .map_err(exec_error_to_pgwire)?;
             } else if trimmed_upper.starts_with("UNLISTEN ") {
                 let channel = query.trim()[9..].trim().trim_end_matches(';').trim();
                 self.handle_unlisten(&peer_addr_str, channel);
@@ -2022,6 +2164,156 @@ impl ExtendedQueryHandler for NucleusHandler {
         self.query_parser.clone()
     }
 
+    /// Bound the per-connection named-statement count.
+    ///
+    /// The default `on_parse` inserts into the connection's portal store —
+    /// pgwire's `MemPortalStore`, an unbounded BTreeMap with no `len()` — so
+    /// a client that Parses N distinct names without Close grows it for the
+    /// life of the connection. This override counts NEW names (a re-Parse of
+    /// an existing name replaces in place and is always allowed) and refuses
+    /// with 54000 past `limits.max_prepared_statements_per_session`. The
+    /// unnamed statement is not counted: it is self-replacing.
+    async fn on_parse<C>(&self, client: &mut C, message: Parse) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        use pgwire::api::DEFAULT_NAME;
+        let name = message.name.as_deref().unwrap_or(DEFAULT_NAME);
+        if name != DEFAULT_NAME {
+            let peer = client.socket_addr().to_string();
+            let store = client.portal_store();
+            let is_new = store.get_statement(name).is_none();
+            let mut counts = self.extended_query_counts.lock();
+            let entry = counts.entry(peer).or_default();
+            if is_new && entry.statements >= self.limits.max_prepared_statements_per_session {
+                let (held, limit) = (entry.statements, self.limits.max_prepared_statements_per_session);
+                drop(counts);
+                return Err(Self::too_many_extended_query_objects(
+                    "prepared_statements",
+                    held,
+                    limit,
+                ));
+            }
+            if is_new {
+                entry.statements += 1;
+            }
+        }
+        // The trait default body, inlined: pgwire's StoredStatement::parse is
+        // pub(crate), so this reproduces it via the public `new` constructor.
+        let parser = self.query_parser();
+        let types = message
+            .type_oids
+            .iter()
+            .map(|oid| Type::from_oid(*oid))
+            .collect::<Vec<_>>();
+        let statement = parser
+            .parse_sql(client, &message.query, &types)
+            .await?;
+        let stmt = StoredStatement::new(name.to_owned(), statement, types);
+        client.portal_store().put_statement(Arc::new(stmt));
+        client
+            .send(PgWireBackendMessage::ParseComplete(ParseComplete::new()))
+            .await?;
+        Ok(())
+    }
+
+    /// Bound the per-connection named-portal count. Same shape as
+    /// [`Self::on_parse`]: pgwire removes the unnamed portal itself after
+    /// Execute, so only named portals are counted.
+    async fn on_bind<C>(&self, client: &mut C, message: Bind) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        use pgwire::api::DEFAULT_NAME;
+        let portal_name = message
+            .portal_name
+            .as_deref()
+            .unwrap_or(DEFAULT_NAME);
+        if portal_name != DEFAULT_NAME {
+            let peer = client.socket_addr().to_string();
+            let store = client.portal_store();
+            let is_new = store.get_portal(portal_name).is_none();
+            let mut counts = self.extended_query_counts.lock();
+            let entry = counts.entry(peer).or_default();
+            if is_new && entry.portals >= self.limits.max_portals_per_session {
+                let (held, limit) = (entry.portals, self.limits.max_portals_per_session);
+                drop(counts);
+                return Err(Self::too_many_extended_query_objects(
+                    "portals",
+                    held,
+                    limit,
+                ));
+            }
+            if is_new {
+                entry.portals += 1;
+            }
+        }
+        // The trait default body, inlined (no `_on_bind` to delegate to).
+        let statement_name = message.statement_name.as_deref().unwrap_or(DEFAULT_NAME);
+        if let Some(statement) = client.portal_store().get_statement(statement_name) {
+            let portal = Portal::try_new(&message, statement)?;
+            client.portal_store().put_portal(Arc::new(portal));
+            client
+                .send(PgWireBackendMessage::BindComplete(BindComplete::new()))
+                .await?;
+            Ok(())
+        } else {
+            Err(PgWireError::StatementNotFound(statement_name.to_owned()))
+        }
+    }
+
+    /// Keep the per-connection counts honest when the client closes a named
+    /// statement or portal. The trait default body is inlined with the
+    /// decrement added; a Close for a name that never existed decrements
+    /// nothing.
+    async fn on_close<C>(&self, client: &mut C, message: Close) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        use pgwire::api::DEFAULT_NAME;
+        let name = message.name.as_deref().unwrap_or(DEFAULT_NAME);
+        if name != DEFAULT_NAME {
+            let peer = client.socket_addr().to_string();
+            let existed = match message.target_type {
+                TARGET_TYPE_BYTE_STATEMENT => client.portal_store().get_statement(name).is_some(),
+                TARGET_TYPE_BYTE_PORTAL => client.portal_store().get_portal(name).is_some(),
+                _ => false,
+            };
+            if existed {
+                let mut counts = self.extended_query_counts.lock();
+                if let Some(entry) = counts.get_mut(&peer) {
+                    match message.target_type {
+                        TARGET_TYPE_BYTE_STATEMENT => entry.statements = entry.statements.saturating_sub(1),
+                        TARGET_TYPE_BYTE_PORTAL => entry.portals = entry.portals.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        match message.target_type {
+            TARGET_TYPE_BYTE_STATEMENT => {
+                client.portal_store().rm_statement(name);
+            }
+            TARGET_TYPE_BYTE_PORTAL => {
+                client.portal_store().rm_portal(name);
+            }
+            _ => {}
+        }
+        client
+            .send(PgWireBackendMessage::CloseComplete(CloseComplete::new()))
+            .await?;
+        Ok(())
+    }
+
     async fn do_describe_statement<C>(
         &self,
         client: &mut C,
@@ -2234,6 +2526,7 @@ impl ExtendedQueryHandler for NucleusHandler {
             && !rls_active
             && let Some(lo_result) = self.try_handle_large_object(&peer_addr_str, &parsed_stmt.sql)
         {
+            let lo_result = lo_result.map_err(exec_error_to_pgwire)?;
             self.flush_pending_notifications(client).await?;
             return Self::build_response(lo_result, Some(&portal.result_column_format));
         }
@@ -2246,7 +2539,8 @@ impl ExtendedQueryHandler for NucleusHandler {
                     .trim()
                     .trim_end_matches(';')
                     .trim();
-                self.handle_listen(&peer_addr_str, channel);
+                self.handle_listen(&peer_addr_str, channel)
+                    .map_err(exec_error_to_pgwire)?;
             } else if trimmed_upper.starts_with("UNLISTEN ") {
                 let channel = parsed_stmt.sql.trim()[9..]
                     .trim()
@@ -2543,6 +2837,9 @@ impl NucleusHandler {
         }
         // Clean up large object descriptors.
         self.lo_state.lock().remove(peer_addr);
+        // And the named statement/portal counters: the connection's pgwire
+        // portal store dies with the socket, so the counts must not outlive it.
+        self.extended_query_counts.lock().remove(peer_addr);
     }
 
     // ====================================================================
@@ -2561,14 +2858,29 @@ impl NucleusHandler {
         pid
     }
 
-    /// Register a LISTEN on `channel` for the connection identified by `peer_addr`.
-    fn handle_listen(&self, peer_addr: &str, channel: &str) {
+    /// Register a LISTEN on `channel` for the connection identified by
+    /// `peer_addr`. Refused once the connection listens on
+    /// `limits.max_listen_channels_per_session` channels — each LISTEN holds a
+    /// receiver AND a registry broadcast sender (a 256-slot buffer), so the
+    /// cap bounds real memory per connection, not just a counter.
+    fn handle_listen(&self, peer_addr: &str, channel: &str) -> Result<(), ExecError> {
         let mut map = self.notify_state.lock();
         let state = map
             .entry(peer_addr.to_string())
             .or_insert_with(|| ConnectionNotifyState {
                 receivers: HashMap::new(),
             });
+        if !state.receivers.contains_key(channel)
+            && state.receivers.len() >= self.limits.max_listen_channels_per_session
+        {
+            return Err(ExecError::Unsupported(format!(
+                "too_many_listen_channels: this connection already listens on {} channels \
+                 (limit {}); UNLISTEN one before listening to more, or raise \
+                 limits.max_listen_channels_per_session",
+                state.receivers.len(),
+                self.limits.max_listen_channels_per_session
+            )));
+        }
         // Subscribe once, at LISTEN time, and keep that receiver: it is the
         // only one that will observe notifications sent from now on. A repeated
         // LISTEN on the same channel must NOT re-subscribe — that would discard
@@ -2577,6 +2889,7 @@ impl NucleusHandler {
             .receivers
             .entry(channel.to_string())
             .or_insert_with(|| self.notification_registry.listen(channel));
+        Ok(())
     }
 
     /// Unregister a LISTEN on `channel` (or all channels with `*`).
@@ -2680,7 +2993,11 @@ impl NucleusHandler {
     /// Public for `probe_blob`'s large-object phase, which drives this exact
     /// string-parsing surface (argument decoding included) rather than the
     /// private per-function methods.
-    pub fn try_handle_large_object(&self, peer_addr: &str, sql: &str) -> Option<ExecResult> {
+    pub fn try_handle_large_object(
+        &self,
+        peer_addr: &str,
+        sql: &str,
+    ) -> Option<Result<ExecResult, ExecError>> {
         let trimmed = sql.trim();
         // Fast rejection: must start with "SELECT lo_" (case-insensitive).
         if trimmed.len() < 12 {
@@ -2705,10 +3022,9 @@ impl NucleusHandler {
                     .map(|a| a.trim().trim_matches('\''))
                     .collect()
             };
-
             match func_name.as_str() {
                 "lo_creat" | "lo_create" => {
-                    return Some(self.lo_creat(peer_addr));
+                    return Some(Ok(self.lo_creat(peer_addr)));
                 }
                 "lo_open" => {
                     if args.len() >= 2
@@ -2720,7 +3036,7 @@ impl NucleusHandler {
                 }
                 "lo_close" => {
                     if let Some(fd) = args.first().and_then(|a| a.parse::<i32>().ok()) {
-                        return Some(self.lo_close(peer_addr, fd));
+                        return Some(Ok(self.lo_close(peer_addr, fd)));
                     }
                 }
                 "lo_read" => {
@@ -2728,7 +3044,7 @@ impl NucleusHandler {
                         && let (Ok(fd), Ok(len)) =
                             (args[0].parse::<i32>(), args[1].parse::<usize>())
                     {
-                        return Some(self.lo_read(peer_addr, fd, len));
+                        return Some(Ok(self.lo_read(peer_addr, fd, len)));
                     }
                 }
                 "lo_write" => {
@@ -2736,12 +3052,12 @@ impl NucleusHandler {
                         && let Ok(fd) = args[0].parse::<i32>()
                     {
                         let data = args[1];
-                        return Some(self.lo_write(peer_addr, fd, data.as_bytes()));
+                        return Some(Ok(self.lo_write(peer_addr, fd, data.as_bytes())));
                     }
                 }
                 "lo_unlink" => {
                     if let Some(oid) = args.first().and_then(|a| a.parse::<u32>().ok()) {
-                        return Some(self.lo_unlink(oid));
+                        return Some(Ok(self.lo_unlink(oid)));
                     }
                 }
                 _ => {}
@@ -2783,19 +3099,32 @@ impl NucleusHandler {
     }
 
     /// lo_open — open an existing large object, return a file descriptor.
-    fn lo_open(&self, peer_addr: &str, oid: u32, mode: i32) -> ExecResult {
+    /// Refused with 54000 once the connection holds
+    /// `limits.max_large_objects_per_session` descriptors: they live until
+    /// lo_close or disconnect, and a client looping lo_open without close
+    /// grows the per-connection map without bound otherwise.
+    fn lo_open(&self, peer_addr: &str, oid: u32, mode: i32) -> Result<ExecResult, ExecError> {
         let key = lo_blob_key(oid);
         // Verify the object exists.
         if !self.executor.blob_store_exists(&key) {
-            return ExecResult::Select {
+            return Ok(ExecResult::Select {
                 columns: vec![("lo_open".to_string(), DataType::Int32)],
                 rows: vec![vec![Value::Int32(-1)]],
-            };
+            });
         }
         let mut map = self.lo_state.lock();
         let state = map
             .entry(peer_addr.to_string())
             .or_insert_with(LargeObjectState::new);
+        if state.descriptors.len() >= self.limits.max_large_objects_per_session {
+            return Err(ExecError::Unsupported(format!(
+                "too_many_large_objects: this connection already has {} large objects open \
+                 (limit {}); lo_close one before opening another, or raise \
+                 limits.max_large_objects_per_session",
+                state.descriptors.len(),
+                self.limits.max_large_objects_per_session
+            )));
+        }
         let fd = state.allocate_fd();
         state.descriptors.insert(
             fd,
@@ -2806,10 +3135,10 @@ impl NucleusHandler {
                 mode,
             },
         );
-        ExecResult::Select {
+        Ok(ExecResult::Select {
             columns: vec![("lo_open".to_string(), DataType::Int32)],
             rows: vec![vec![Value::Int32(fd)]],
-        }
+        })
     }
 
     /// lo_close — close a large object descriptor.
@@ -6755,7 +7084,7 @@ mod security_tests {
     #[test]
     fn handler_listen_registers_channel() {
         let handler = NucleusHandler::new(make_executor());
-        handler.handle_listen("peer1", "my_channel");
+        handler.handle_listen("peer1", "my_channel").unwrap();
         let state = handler.notify_state.lock();
         let conn = state.get("peer1").unwrap();
         assert!(conn.receivers.contains_key("my_channel"));
@@ -6764,8 +7093,8 @@ mod security_tests {
     #[test]
     fn handler_unlisten_removes_channel() {
         let handler = NucleusHandler::new(make_executor());
-        handler.handle_listen("peer1", "ch1");
-        handler.handle_listen("peer1", "ch2");
+        handler.handle_listen("peer1", "ch1").unwrap();
+        handler.handle_listen("peer1", "ch2").unwrap();
         handler.handle_unlisten("peer1", "ch1");
         let state = handler.notify_state.lock();
         let conn = state.get("peer1").unwrap();
@@ -6776,9 +7105,9 @@ mod security_tests {
     #[test]
     fn handler_unlisten_star_removes_all() {
         let handler = NucleusHandler::new(make_executor());
-        handler.handle_listen("peer1", "ch1");
-        handler.handle_listen("peer1", "ch2");
-        handler.handle_listen("peer1", "ch3");
+        handler.handle_listen("peer1", "ch1").unwrap();
+        handler.handle_listen("peer1", "ch2").unwrap();
+        handler.handle_listen("peer1", "ch3").unwrap();
         handler.handle_unlisten("peer1", "*");
         let state = handler.notify_state.lock();
         let conn = state.get("peer1").unwrap();
@@ -6788,8 +7117,8 @@ mod security_tests {
     #[test]
     fn handler_notify_returns_listener_count() {
         let handler = NucleusHandler::new(make_executor());
-        handler.handle_listen("peer1", "events");
-        handler.handle_listen("peer2", "events");
+        handler.handle_listen("peer1", "events").unwrap();
+        handler.handle_listen("peer2", "events").unwrap();
         let count = handler.handle_notify("peer1", "events", "test");
         // At least 2 listeners registered (our 2 handle_listen calls).
         assert!(count >= 2);
@@ -6802,7 +7131,7 @@ mod security_tests {
     #[test]
     fn handler_stored_receiver_sees_notification_sent_after_listen() {
         let handler = NucleusHandler::new(make_executor());
-        handler.handle_listen("peer1", "events");
+        handler.handle_listen("peer1", "events").unwrap();
         // Sent by a different connection, after the LISTEN.
         assert!(handler.handle_notify("peer2", "events", "hello") >= 1);
 
@@ -6823,9 +7152,9 @@ mod security_tests {
     #[test]
     fn handler_repeat_listen_does_not_discard_queued_notifications() {
         let handler = NucleusHandler::new(make_executor());
-        handler.handle_listen("peer1", "events");
+        handler.handle_listen("peer1", "events").unwrap();
         handler.handle_notify("peer2", "events", "first");
-        handler.handle_listen("peer1", "events");
+        handler.handle_listen("peer1", "events").unwrap();
 
         let mut state = handler.notify_state.lock();
         let conn = state.get_mut("peer1").unwrap();
@@ -6839,9 +7168,9 @@ mod security_tests {
     #[test]
     fn handler_notification_sent_before_listen_is_not_delivered() {
         let handler = NucleusHandler::new(make_executor());
-        handler.handle_listen("other", "events");
+        handler.handle_listen("other", "events").unwrap();
         handler.handle_notify("peer2", "events", "too_early");
-        handler.handle_listen("peer1", "events");
+        handler.handle_listen("peer1", "events").unwrap();
 
         let mut state = handler.notify_state.lock();
         let conn = state.get_mut("peer1").unwrap();
@@ -6891,7 +7220,7 @@ mod security_tests {
     #[test]
     fn handler_cleanup_removes_notify_state() {
         let handler = NucleusHandler::new(make_executor());
-        handler.handle_listen("peer1", "ch");
+        handler.handle_listen("peer1", "ch").unwrap();
         handler.cleanup_session("peer1");
         assert!(!handler.notify_state.lock().contains_key("peer1"));
         assert!(!handler.connection_pids.read().contains_key("peer1"));
@@ -6975,7 +7304,7 @@ mod security_tests {
         let executor = make_executor();
         let handler = NucleusHandler::new(executor.clone());
         let oid = lo_int(handler.lo_creat("peer1")) as u32;
-        let fd = lo_int(handler.lo_open("peer1", oid, INV_READ | INV_WRITE));
+        let fd = lo_int(handler.lo_open("peer1", oid, INV_READ | INV_WRITE).unwrap());
         assert!(fd > 0);
 
         // The object disappears underneath an open descriptor.
@@ -7002,7 +7331,7 @@ mod security_tests {
         let executor = make_executor();
         let handler = NucleusHandler::new(executor.clone());
         let oid = lo_int(handler.lo_creat("peer1")) as u32;
-        let fd = lo_int(handler.lo_open("peer1", oid, INV_READ | INV_WRITE));
+        let fd = lo_int(handler.lo_open("peer1", oid, INV_READ | INV_WRITE).unwrap());
         executor.blob_store_delete(&lo_blob_key(oid));
 
         assert_eq!(
@@ -7024,10 +7353,10 @@ mod security_tests {
         let executor = make_executor();
         let handler = NucleusHandler::new(executor.clone());
         let oid = lo_int(handler.lo_creat("peer1")) as u32;
-        let fd = lo_int(handler.lo_open("peer1", oid, INV_READ | INV_WRITE));
+        let fd = lo_int(handler.lo_open("peer1", oid, INV_READ | INV_WRITE).unwrap());
         assert_eq!(lo_int(handler.lo_write("peer1", fd, b"PAYLOAD")), 7);
 
-        let read_fd = lo_int(handler.lo_open("peer1", oid, INV_READ));
+        let read_fd = lo_int(handler.lo_open("peer1", oid, INV_READ).unwrap());
         match handler.lo_read("peer1", read_fd, 100) {
             ExecResult::Select { rows, .. } => {
                 assert_eq!(rows[0][0], Value::Bytea(b"PAYLOAD".to_vec()))
@@ -7065,7 +7394,7 @@ mod security_tests {
             _ => panic!("expected select"),
         };
         // Open it.
-        let fd = match handler.lo_open("peer1", oid, INV_READ | INV_WRITE) {
+        let fd = match handler.lo_open("peer1", oid, INV_READ | INV_WRITE).unwrap() {
             ExecResult::Select { rows, .. } => match rows[0][0] {
                 Value::Int32(fd) => fd,
                 _ => panic!("expected fd"),
@@ -7094,7 +7423,7 @@ mod security_tests {
             },
             _ => panic!("expected select"),
         };
-        let fd = match handler.lo_open("peer1", oid, INV_READ | INV_WRITE) {
+        let fd = match handler.lo_open("peer1", oid, INV_READ | INV_WRITE).unwrap() {
             ExecResult::Select { rows, .. } => match rows[0][0] {
                 Value::Int32(fd) => fd,
                 _ => panic!("expected fd"),
@@ -7113,7 +7442,7 @@ mod security_tests {
 
         // Close and reopen to reset offset.
         handler.lo_close("peer1", fd);
-        let fd2 = match handler.lo_open("peer1", oid, INV_READ) {
+        let fd2 = match handler.lo_open("peer1", oid, INV_READ).unwrap() {
             ExecResult::Select { rows, .. } => match rows[0][0] {
                 Value::Int32(fd) => fd,
                 _ => panic!("expected fd"),
@@ -7151,7 +7480,7 @@ mod security_tests {
         };
         assert_eq!(result, 0);
         // Opening it should fail now.
-        let fd = match handler.lo_open("peer1", oid, INV_READ) {
+        let fd = match handler.lo_open("peer1", oid, INV_READ).unwrap() {
             ExecResult::Select { rows, .. } => match rows[0][0] {
                 Value::Int32(fd) => fd,
                 _ => panic!("expected fd"),
@@ -7172,7 +7501,7 @@ mod security_tests {
             _ => panic!("expected select"),
         };
         // Open write-only.
-        let fd = match handler.lo_open("peer1", oid, INV_WRITE) {
+        let fd = match handler.lo_open("peer1", oid, INV_WRITE).unwrap() {
             ExecResult::Select { rows, .. } => match rows[0][0] {
                 Value::Int32(fd) => fd,
                 _ => panic!("expected fd"),
@@ -7191,7 +7520,7 @@ mod security_tests {
     #[test]
     fn lo_open_nonexistent_returns_minus_one() {
         let handler = NucleusHandler::new(make_executor());
-        let fd = match handler.lo_open("peer1", 999_999, INV_READ) {
+        let fd = match handler.lo_open("peer1", 999_999, INV_READ).unwrap() {
             ExecResult::Select { rows, .. } => match rows[0][0] {
                 Value::Int32(fd) => fd,
                 _ => panic!("expected fd"),
@@ -7208,7 +7537,7 @@ mod security_tests {
         let handler = NucleusHandler::new(make_executor());
         let result = handler.try_handle_large_object("peer1", "SELECT lo_creat(-1)");
         assert!(result.is_some());
-        match result.unwrap() {
+        match result.unwrap().unwrap() {
             ExecResult::Select { columns, rows } => {
                 assert_eq!(columns[0].0, "lo_creat");
                 assert!(rows.len() == 1);
@@ -7247,7 +7576,7 @@ mod security_tests {
             },
             _ => panic!("expected select"),
         };
-        handler.lo_open("peer1", oid, INV_READ);
+        handler.lo_open("peer1", oid, INV_READ).unwrap();
         assert!(handler.lo_state.lock().contains_key("peer1"));
         handler.cleanup_session("peer1");
         assert!(!handler.lo_state.lock().contains_key("peer1"));
@@ -7259,6 +7588,358 @@ mod security_tests {
     fn lo_blob_key_format() {
         assert_eq!(lo_blob_key(12345), "_lo/12345");
         assert_eq!(lo_blob_key(0), "_lo/0");
+    }
+
+    // ── Per-session resource caps (memory-bounding pass) ────────────────
+    //
+    // Each cap exists because the structure beneath it grew per protocol
+    // action with no bound until disconnect. The tests churn each surface
+    // PAST its cap and assert the refusal plus the map staying at the bound,
+    // with controls for the "release makes room" half.
+
+    /// A minimal in-memory pgwire client: real `MemPortalStore` (the exact
+    /// unbounded structure the caps defend), a socket address, a message
+    /// sink. Implements just enough of the pgwire traits for the
+    /// `on_parse`/`on_bind`/`on_close` overrides to run against it.
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct MockExtendedClient {
+        addr: std::net::SocketAddr,
+        store: pgwire::api::store::MemPortalStore<ParsedStatement>,
+        sent: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl MockExtendedClient {
+        fn new() -> Self {
+            Self {
+                addr: "127.0.0.1:55555".parse().unwrap(),
+                store: pgwire::api::store::MemPortalStore::new(),
+                sent: parking_lot::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ClientInfo for MockExtendedClient {
+        fn socket_addr(&self) -> std::net::SocketAddr {
+            self.addr
+        }
+        fn is_secure(&self) -> bool {
+            false
+        }
+        fn protocol_version(&self) -> pgwire::messages::ProtocolVersion {
+            pgwire::messages::ProtocolVersion::PROTOCOL3_0
+        }
+        fn set_protocol_version(&mut self, _: pgwire::messages::ProtocolVersion) {}
+        fn pid_and_secret_key(&self) -> (i32, SecretKey) {
+            (0, SecretKey::I32(0))
+        }
+        fn set_pid_and_secret_key(&mut self, _: i32, _: SecretKey) {}
+        fn state(&self) -> PgWireConnectionState {
+            PgWireConnectionState::ReadyForQuery
+        }
+        fn set_state(&mut self, _: PgWireConnectionState) {}
+        fn transaction_status(&self) -> pgwire::messages::response::TransactionStatus {
+            pgwire::messages::response::TransactionStatus::Idle
+        }
+        fn set_transaction_status(&mut self, _: pgwire::messages::response::TransactionStatus) {}
+        fn metadata(&self) -> &HashMap<String, String> {
+            static EMPTY: std::sync::OnceLock<HashMap<String, String>> =
+                std::sync::OnceLock::new();
+            EMPTY.get_or_init(HashMap::new)
+        }
+        fn metadata_mut(&mut self) -> &mut HashMap<String, String> {
+            unreachable!("extended-query caps do not touch metadata")
+        }
+        fn sni_server_name(&self) -> Option<&str> {
+            None
+        }
+        fn client_certificates<'a>(
+            &self,
+        ) -> Option<&[pgwire::tokio::tokio_rustls::rustls::pki_types::CertificateDer<'a>]> {
+            None
+        }
+    }
+
+    impl ClientPortalStore for MockExtendedClient {
+        type PortalStore = pgwire::api::store::MemPortalStore<ParsedStatement>;
+        fn portal_store(&self) -> &Self::PortalStore {
+            &self.store
+        }
+    }
+
+    impl Sink<PgWireBackendMessage> for MockExtendedClient {
+        type Error = std::io::Error;
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn start_send(
+            self: Pin<&mut Self>,
+            item: PgWireBackendMessage,
+        ) -> Result<(), std::io::Error> {
+            let name = match item {
+                PgWireBackendMessage::ParseComplete(_) => "ParseComplete",
+                PgWireBackendMessage::BindComplete(_) => "BindComplete",
+                PgWireBackendMessage::CloseComplete(_) => "CloseComplete",
+                PgWireBackendMessage::ErrorResponse(e) => {
+                    let code = e
+                        .fields
+                        .iter()
+                        .find(|(k, _)| *k == b'C')
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_default();
+                    self.sent.lock().push(format!("Error:{code}"));
+                    return Ok(());
+                }
+                other => {
+                    self.sent
+                        .lock()
+                        .push(std::format!("{:?}", std::mem::discriminant(&other)));
+                    return Ok(());
+                }
+            };
+            self.sent.lock().push(name.to_string());
+            Ok(())
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn capped_handler() -> NucleusHandler {
+        NucleusHandler::new(make_executor()).with_wire_limits(WireLimits {
+            max_prepared_statements_per_session: 4,
+            max_portals_per_session: 3,
+            max_listen_channels_per_session: 3,
+            max_large_objects_per_session: 3,
+            max_auth_failure_entries: 8,
+        })
+    }
+
+    fn parse_msg(name: &str, sql: &str) -> Parse {
+        Parse::new(Some(name.to_string()), sql.to_string(), vec![])
+    }
+
+    /// Named statements are refused past the cap, re-Parse of an existing
+    /// name is free, and Close makes room — the counts track the store, not
+    /// some lifetime total.
+    #[tokio::test]
+    async fn named_statement_churn_is_bounded() {
+        let handler = capped_handler();
+        let mut client = MockExtendedClient::new();
+        for i in 0..4 {
+            handler
+                .on_parse(&mut client, parse_msg(&format!("s{i}"), "SELECT 1"))
+                .await
+                .expect("within the cap");
+        }
+        let err = handler
+            .on_parse(&mut client, parse_msg("s4", "SELECT 1"))
+            .await
+            .expect_err("the 5th distinct name must be refused");
+        match &err {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "54000", "got: {info}");
+                assert!(info.message.contains("too_many_prepared_statements"));
+            }
+            other => panic!("expected UserError, got {other:?}"),
+        }
+        assert_eq!(
+            handler.extended_query_counts.lock().get("127.0.0.1:55555").map(|c| c.statements),
+            Some(4),
+            "the count must sit at the cap, not past it"
+        );
+        // Control: re-Parsing an EXISTING name replaces in place — no growth,
+        // no refusal.
+        handler
+            .on_parse(&mut client, parse_msg("s0", "SELECT 2"))
+            .await
+            .expect("replacing an existing name is not growth");
+        // Control: Close one → room again.
+        handler
+            .on_close(
+                &mut client,
+                Close::new(TARGET_TYPE_BYTE_STATEMENT, Some("s0".to_string())),
+            )
+            .await
+            .unwrap();
+        handler
+            .on_parse(&mut client, parse_msg("s5", "SELECT 1"))
+            .await
+            .expect("Close must make room");
+        // Disconnect hygiene: teardown clears the counters.
+        handler.cleanup_session("127.0.0.1:55555");
+        assert!(handler.extended_query_counts.lock().is_empty());
+    }
+
+    /// Named portals are refused past their own cap. The unnamed statement is
+    /// Bind-able without counting.
+    #[tokio::test]
+    async fn named_portal_churn_is_bounded() {
+        let handler = capped_handler();
+        let mut client = MockExtendedClient::new();
+        handler
+            .on_parse(&mut client, parse_msg("s", "SELECT 1"))
+            .await
+            .unwrap();
+        for i in 0..3 {
+            handler
+                .on_bind(
+                    &mut client,
+                    Bind::new(
+                        Some(format!("p{i}")),
+                        Some("s".to_string()),
+                        vec![],
+                        vec![],
+                        vec![],
+                    ),
+                )
+                .await
+                .expect("within the cap");
+        }
+        let err = handler
+            .on_bind(
+                &mut client,
+                Bind::new(Some("p3".to_string()), Some("s".to_string()), vec![], vec![], vec![]),
+            )
+            .await
+            .expect_err("the 4th distinct portal must be refused");
+        match &err {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "54000");
+                assert!(info.message.contains("too_many_portals"));
+            }
+            other => panic!("expected UserError, got {other:?}"),
+        }
+        // Control: the unnamed portal is self-replacing and never counted.
+        handler
+            .on_bind(&mut client, Bind::new(None, Some("s".to_string()), vec![], vec![], vec![]))
+            .await
+            .expect("the unnamed portal is not counted");
+        assert_eq!(
+            handler
+                .extended_query_counts
+                .lock()
+                .get("127.0.0.1:55555")
+                .map(|c| c.portals),
+            Some(3)
+        );
+    }
+
+    /// LISTEN channels per connection are capped: each holds a broadcast
+    /// buffer, so this is a memory bound, not a bookkeeping nicety. Re-LISTEN
+    /// of a held channel is free; UNLISTEN makes room; teardown clears both
+    /// the per-connection state and the registry channel.
+    #[test]
+    fn listen_channel_churn_is_bounded() {
+        let handler = capped_handler();
+        for i in 0..3 {
+            handler
+                .handle_listen("peer1", &format!("ch{i}"))
+                .expect("within the cap");
+        }
+        let err = handler
+            .handle_listen("peer1", "ch3")
+            .expect_err("the 4th distinct channel must be refused");
+        assert!(
+            err.to_string().contains("too_many_listen_channels"),
+            "got: {err}"
+        );
+        // Control: repeating a held channel is not growth.
+        handler.handle_listen("peer1", "ch0").unwrap();
+        // Control: UNLISTEN makes room.
+        handler.handle_unlisten("peer1", "ch0");
+        handler.handle_listen("peer1", "ch3").unwrap();
+        // And the receivers map sits at the cap, not past it.
+        assert_eq!(
+            handler.notify_state.lock().get("peer1").map(|s| s.receivers.len()),
+            Some(3)
+        );
+        // Teardown: connection state AND registry channels both clear.
+        handler.cleanup_session("peer1");
+        assert!(handler.notify_state.lock().is_empty());
+        assert_eq!(handler.notification_registry.channels.len(), 0);
+    }
+
+    /// Large-object descriptors per connection are capped; lo_close frees a
+    /// slot; teardown clears the map.
+    #[test]
+    fn large_object_open_churn_is_bounded() {
+        let handler = capped_handler();
+        let oid = match handler.lo_creat("peer1") {
+            ExecResult::Select { rows, .. } => match rows[0][0] {
+                Value::Int32(oid) => oid as u32,
+                _ => panic!("expected oid"),
+            },
+            _ => panic!("expected select"),
+        };
+        let mut fds = Vec::new();
+        for _ in 0..3 {
+            let fd = match handler.lo_open("peer1", oid, INV_READ).unwrap() {
+                ExecResult::Select { rows, .. } => match rows[0][0] {
+                    Value::Int32(fd) => fd,
+                    _ => panic!("expected fd"),
+                },
+                _ => panic!("expected select"),
+            };
+            fds.push(fd);
+        }
+        let err = handler
+            .lo_open("peer1", oid, INV_READ)
+            .expect_err("the 4th open descriptor must be refused");
+        assert!(
+            err.to_string().contains("too_many_large_objects"),
+            "got: {err}"
+        );
+        // Control: closing one frees exactly one slot.
+        handler.lo_close("peer1", fds[0]);
+        handler.lo_open("peer1", oid, INV_READ).unwrap();
+        // At the bound, not past it.
+        assert_eq!(
+            handler
+                .lo_state
+                .lock()
+                .get("peer1")
+                .map(|s| s.descriptors.len()),
+            Some(3)
+        );
+        handler.cleanup_session("peer1");
+        assert!(handler.lo_state.lock().is_empty());
+    }
+
+    /// The failed-auth table is bounded across distinct source IPs — an
+    /// IPv6-range scanner must not grow it forever. At capacity it keeps the
+    /// entries that matter (recent failures) and sheds the stalest.
+    #[test]
+    fn auth_failure_table_is_bounded_across_distinct_ips() {
+        let handler = capped_handler();
+        let limiter = &handler.login_rate_limiter;
+        for i in 0..20u32 {
+            let ip: IpAddr = format!("2001:db8::{i}").parse().unwrap();
+            limiter.record_failure(ip);
+        }
+        assert_eq!(limiter.len(), 8, "the table must sit at its capacity");
+        // A recent heavy failure still locks out: fill from one IP after the
+        // table is full — the prune path must keep it honest.
+        let attacker: IpAddr = "198.51.100.7".parse().unwrap();
+        for _ in 0..5 {
+            limiter.record_failure(attacker);
+        }
+        assert!(limiter.is_locked_out(attacker));
+        limiter.clear(attacker);
+        assert!(!limiter.is_locked_out(attacker));
     }
 
     // ── Describe must not execute side-effecting scalar functions ──

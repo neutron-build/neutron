@@ -479,7 +479,8 @@ fn phase_lo_minimal() {
 
     fn call(h: &NucleusHandler, sql: &str) -> Value {
         match h.try_handle_large_object("p", sql) {
-            Some(ExecResult::Select { rows, .. }) => rows[0][0].clone(),
+            Some(Ok(ExecResult::Select { rows, .. })) => rows[0][0].clone(),
+            Some(Err(e)) => panic!("lo_ call failed: {e}"),
             _ => panic!("not an lo_ call"),
         }
     }
@@ -608,11 +609,12 @@ fn phase_large_objects(seed: u64, _cache: usize, perturb: bool) -> usize {
     // the wire handler uses, and pull the single cell out.
     fn lo_call(handler: &NucleusHandler, sql: &str) -> Result<Value, String> {
         match handler.try_handle_large_object("probe_peer", sql) {
-            Some(ExecResult::Select { rows, .. }) => rows
+            Some(Ok(ExecResult::Select { rows, .. })) => rows
                 .into_iter()
                 .next()
                 .and_then(|r| r.into_iter().next())
                 .ok_or_else(|| "empty lo_ result".to_string()),
+            Some(Err(e)) => Err(format!("lo_ call failed: {e}")),
             _ => Err(format!("not an lo_ call: {sql}")),
         }
     }

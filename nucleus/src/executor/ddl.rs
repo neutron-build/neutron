@@ -4351,6 +4351,27 @@ impl Executor {
         statement: Statement,
     ) -> Result<ExecResult, ExecError> {
         let sql = statement.to_string();
+        let sess = self.current_session();
+        // Per-session prepared-statement limit: prepared statements live until
+        // DEALLOCATE or disconnect, so without a bound one session accumulates
+        // them without limit. Replacement of an existing name is always
+        // allowed — it does not grow the map. Refused with the
+        // `too_many_prepared_statements` wording the wire codec maps to
+        // SQLSTATE 54000 (program_limit_exceeded).
+        {
+            let prepared = sess.prepared_stmts.read().await;
+            let limit = self
+                .max_prepared_stmts_per_session
+                .load(std::sync::atomic::Ordering::Acquire);
+            if !prepared.contains_key(name) && prepared.len() >= limit {
+                return Err(ExecError::Unsupported(format!(
+                    "too_many_prepared_statements: session already holds {} prepared \
+                     statements (limit {limit}); DEALLOCATE one before preparing another, or \
+                     raise limits.max_prepared_statements_per_session",
+                    prepared.len()
+                )));
+            }
+        }
         // Check global cache first — reuse if identical SQL was already parsed.
         // Uses write lock because get() bumps the LRU access counter.
         let prepared = {
@@ -4367,7 +4388,9 @@ impl Executor {
                 }
             }
         };
-        let sess = self.current_session();
+        self.metrics
+            .prepared_cache_entries
+            .set(self.global_prepared_cache.read().len() as i64);
         sess.prepared_stmts
             .write()
             .await

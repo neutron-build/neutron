@@ -324,6 +324,25 @@ pub struct MetricsRegistry {
     /// Tables currently held under at least one lock.
     pub locks_held: Gauge,
 
+    // ── Bounded-structure occupancy (memory hygiene) ─────────────────────
+    //
+    // Every structure here has a cap; these gauges make its occupancy visible
+    // BEFORE the cap bites, so "approaching the limit" and "sitting at it" are
+    // different dashboards. A gauge pinned at its cap means the workload is
+    // living on rejection/eviction, not that the server is leaking.
+    /// Live executor sessions (wire connections; bounded by max_connections).
+    pub sessions_active: Gauge,
+    /// Row locks currently held across all sessions (per-session cap).
+    pub row_locks_held: Gauge,
+    /// Entries in the query-plan cache (LRU, capped).
+    pub plan_cache_entries: Gauge,
+    /// Entries in the AST cache (LRU, capped).
+    pub ast_cache_entries: Gauge,
+    /// Entries in the query result cache (TTL, capped).
+    pub query_cache_entries: Gauge,
+    /// Entries in the global prepared-statement cache (LRU, capped).
+    pub prepared_cache_entries: Gauge,
+
     // Histograms
     pub query_duration: Histogram,
     /// How long lock acquisition blocked, for waits that actually blocked.
@@ -445,6 +464,30 @@ impl MetricsRegistry {
                 "nucleus_locks_held",
                 "Tables currently held under at least one serializable lock",
             ),
+            sessions_active: Gauge::new(
+                "nucleus_sessions_active",
+                "Live executor sessions (one per connection; bounded by max_connections)",
+            ),
+            row_locks_held: Gauge::new(
+                "nucleus_row_locks_held",
+                "FOR UPDATE / FOR SHARE row locks currently held across all sessions",
+            ),
+            plan_cache_entries: Gauge::new(
+                "nucleus_plan_cache_entries",
+                "Entries in the bounded query-plan cache",
+            ),
+            ast_cache_entries: Gauge::new(
+                "nucleus_ast_cache_entries",
+                "Entries in the bounded AST cache",
+            ),
+            query_cache_entries: Gauge::new(
+                "nucleus_query_cache_entries",
+                "Entries in the bounded query result cache",
+            ),
+            prepared_cache_entries: Gauge::new(
+                "nucleus_prepared_cache_entries",
+                "Entries in the bounded global prepared-statement cache",
+            ),
             query_duration: Histogram::query_duration(),
             lock_wait_duration: Histogram::new(
                 "nucleus_lock_wait_duration_seconds",
@@ -545,6 +588,12 @@ impl MetricsRegistry {
         ));
 
         render_gauge(&mut out, &self.locks_held);
+        render_gauge(&mut out, &self.sessions_active);
+        render_gauge(&mut out, &self.row_locks_held);
+        render_gauge(&mut out, &self.plan_cache_entries);
+        render_gauge(&mut out, &self.ast_cache_entries);
+        render_gauge(&mut out, &self.query_cache_entries);
+        render_gauge(&mut out, &self.prepared_cache_entries);
 
         // Histograms
         for h in [&self.query_duration, &self.lock_wait_duration] {
@@ -626,6 +675,12 @@ impl MetricsRegistry {
         ));
 
         add_gauge(&mut rows, &self.locks_held);
+        add_gauge(&mut rows, &self.sessions_active);
+        add_gauge(&mut rows, &self.row_locks_held);
+        add_gauge(&mut rows, &self.plan_cache_entries);
+        add_gauge(&mut rows, &self.ast_cache_entries);
+        add_gauge(&mut rows, &self.query_cache_entries);
+        add_gauge(&mut rows, &self.prepared_cache_entries);
 
         for h in [&self.query_duration, &self.lock_wait_duration] {
             rows.push((
@@ -835,13 +890,13 @@ mod tests {
         reg.active_connections.set(3);
 
         let rows = reg.as_rows();
-        // 30 counters + 8 gauges + 1 uptime + 2 histograms = 41.
+        // 30 counters + 14 gauges + 1 uptime + 2 histograms = 47.
         // The count is asserted deliberately: `as_rows` is SHOW METRICS, and a
         // metric added to the registry but not to the render/rows lists is
         // silently invisible to every operator — the same declared-but-unwired
         // shape as the rest of this engine. Update this number ONLY alongside
         // adding the metric to both `render_prometheus` and `as_rows`.
-        assert_eq!(rows.len(), 41);
+        assert_eq!(rows.len(), 47);
 
         // Check a counter row
         let qt = rows

@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
 
@@ -331,6 +331,17 @@ impl ExecResult {
 /// this is roughly one warning per 50 minutes of a held gate.
 const SKIP_WARN_EVERY: u64 = 10;
 
+/// Default per-session cap on SQL-level prepared statements. Sized far above
+/// any real pool/ORM usage (double-digit named statements) while bounding the
+/// per-session map at ~thousands of ASTs. Overridable via
+/// `limits.max_prepared_statements_per_session`.
+pub(crate) const DEFAULT_MAX_PREPARED_STMTS: usize = 1024;
+
+/// Default per-session cap on open cursors. Each cursor materializes its full
+/// row set, so this bounds both map growth and per-cursor memory pressure.
+/// Overridable via `limits.max_cursors_per_session`.
+pub(crate) const DEFAULT_MAX_CURSORS: usize = 1024;
+
 /// The executor holds shared catalog/storage state and per-session state.
 ///
 /// Session-specific state (transactions, cursors, prepared statements, settings)
@@ -523,6 +534,19 @@ pub struct Executor {
     /// that have not SET their own. 0 (the default) keeps the log off until a
     /// session opts in. Configurable via `server.slow_query_log_ms`.
     default_slow_query_ms: AtomicU64,
+    /// Per-session cap on SQL-level prepared statements (PREPARE … DEALLOCATE).
+    /// The per-session map lives until disconnect, so a bound is what keeps a
+    /// pathological session from growing it without limit. Applied as a
+    /// rejection (54000), not eviction: a prepared name is client-visible
+    /// state, and silently dropping it would turn EXECUTE into "not found".
+    /// Configurable via `limits.max_prepared_statements_per_session`.
+    max_prepared_stmts_per_session: AtomicUsize,
+    /// Per-session cap on open cursors (DECLARE … CLOSE). Same lifetime and
+    /// same reject-not-evict reasoning as the prepared-statement cap; cursors
+    /// are additionally the most memory-dense per-session object because each
+    /// materializes its whole row set. Configurable via
+    /// `limits.max_cursors_per_session`.
+    max_cursors_per_session: AtomicUsize,
     /// Default session for backward-compatible `execute()` (embedded mode).
     default_session: Arc<Session>,
     /// In-memory key-value store for KV SQL functions (kv_get, kv_set, kv_del, etc.).
@@ -947,6 +971,8 @@ impl Executor {
             specialty_checkpoint_warns: AtomicU64::new(0),
             specialty_skip_warn_every: AtomicU64::new(SKIP_WARN_EVERY),
             default_slow_query_ms: AtomicU64::new(0),
+            max_prepared_stmts_per_session: AtomicUsize::new(DEFAULT_MAX_PREPARED_STMTS),
+            max_cursors_per_session: AtomicUsize::new(DEFAULT_MAX_CURSORS),
             default_session: Arc::new(Session::new()),
             kv_store: Arc::new(crate::kv::KvStore::new()),
             columnar_store: parking_lot::RwLock::new(crate::columnar::ColumnarStore::new()),
@@ -2548,6 +2574,27 @@ impl Executor {
         self.query_memory.limit()
     }
 
+    /// Set the per-session row-lock limit after construction (the row-lock
+    /// twin of [`Self::set_query_memory_limit`]: the executor is already
+    /// behind an `Arc` when config is applied). A session whose transaction
+    /// holds this many row locks is refused further locking acquisitions with
+    /// SQLSTATE 53200 — the lock table is bounded per session, so one
+    /// connection cannot grow it without limit inside a long transaction.
+    pub fn set_max_row_locks_per_session(&self, n: usize) {
+        self.row_locks.set_max_locks_per_session(n);
+    }
+
+    /// Set the per-session prepared-statement and cursor caps after
+    /// construction. Statements/cursors past the cap are REJECTED (54000),
+    /// matching PostgreSQL's stance that client-named session state is the
+    /// client's responsibility to release.
+    pub fn set_session_statement_limits(&self, prepared: usize, cursors: usize) {
+        self.max_prepared_stmts_per_session
+            .store(prepared, Ordering::Release);
+        self.max_cursors_per_session
+            .store(cursors, Ordering::Release);
+    }
+
     /// Record a weak self-reference so `&self` methods can recover an owned
     /// `Arc<Executor>` (see [`Executor::arc_self`]). Call this once, right after the
     /// executor is wrapped in an `Arc` at a server/embedded entry point. Idempotent;
@@ -2845,6 +2892,24 @@ impl Executor {
         self
     }
 
+    /// Override the entry caps of the three bounded statement caches (plan,
+    /// AST, global prepared). The defaults (1024 / 4096 / 4096) are
+    /// production-sized; this exists for operators with a legitimately larger
+    /// working set and for tests that need eviction to happen in bounded
+    /// time. `0` keeps the default for that cache.
+    pub fn with_cache_entry_caps(mut self, plan: usize, ast: usize, prepared: usize) -> Self {
+        if plan > 0 {
+            self.plan_cache = parking_lot::RwLock::new(PlanCache::new(plan));
+        }
+        if ast > 0 {
+            self.ast_cache = parking_lot::RwLock::new(AstCache::new(ast));
+        }
+        if prepared > 0 {
+            self.global_prepared_cache = parking_lot::RwLock::new(GlobalPreparedCache::new(prepared));
+        }
+        self
+    }
+
     /// Set the global memory allocator budget in bytes.
     /// All subsystems (cache, FTS, KV, columnar, etc.) share this budget.
     pub fn with_allocator_budget(self, budget_bytes: usize) -> Self {
@@ -3051,6 +3116,9 @@ impl Executor {
         let id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
         self.sessions.write().insert(id, Arc::new(Session::new()));
         self.storage.create_storage_session(id);
+        self.metrics
+            .sessions_active
+            .set(self.sessions.read().len() as i64);
         id
     }
 
@@ -3214,6 +3282,9 @@ impl Executor {
         // park claimable rows behind it forever.
         self.release_row_locks(id);
         self.storage.drop_storage_session(id);
+        self.metrics
+            .sessions_active
+            .set(self.sessions.read().len() as i64);
     }
 
     /// Reset a session for connection reuse (pool return).
@@ -4035,6 +4106,25 @@ impl Executor {
         self.global_prepared_cache.write().clear();
         self.uncorrelated_subquery_cache.write().clear();
         *self.current_session().plan_cache_key_hint.lock() = None;
+        self.record_cache_gauges();
+    }
+
+    /// Refresh the bounded-cache occupancy gauges. Called at every mutation
+    /// funnel (insert or wholesale clear) so `nucleus_*_cache_entries` shows
+    /// occupancy as it approaches the cap, not after it has mattered.
+    pub(crate) fn record_cache_gauges(&self) {
+        self.metrics
+            .plan_cache_entries
+            .set(self.plan_cache.read().len() as i64);
+        self.metrics
+            .ast_cache_entries
+            .set(self.ast_cache.read().len() as i64);
+        self.metrics
+            .query_cache_entries
+            .set(self.query_cache.read().len() as i64);
+        self.metrics
+            .prepared_cache_entries
+            .set(self.global_prepared_cache.read().len() as i64);
     }
 
     /// Take (consume) the plan cache key hint stored by `parse_with_ast_cache`.
@@ -7051,6 +7141,7 @@ impl Executor {
             self.plan_cache.write().clear();
             self.ast_cache.write().clear();
             self.query_cache_invalidate_all();
+            self.record_cache_gauges();
             #[cfg(feature = "server")]
             {
                 // Force STORAGE durable BEFORE the catalog. The catalog is

@@ -60,6 +60,7 @@ impl Executor {
             self.plan_cache.write().clear();
             self.ast_cache.write().clear();
             self.query_cache_invalidate_all();
+            self.record_cache_gauges();
             if let Err(e) = self
                 .storage
                 .flush_schema()

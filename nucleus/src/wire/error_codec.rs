@@ -58,6 +58,10 @@ pub enum ErrorCode {
     InternalError,
     /// Generic runtime error
     RuntimeError,
+    /// A per-session resource limit was reached (prepared statements, cursors,
+    /// listen channels, large-object descriptors). PostgreSQL class 54000
+    /// `program_limit_exceeded`.
+    ProgramLimitExceeded,
     /// Insufficient resources (memory pressure, etc.)
     InsufficientResources,
     /// The data directory's filesystem is out of usable space
@@ -119,7 +123,21 @@ impl ErrorCodec for PgWireErrorCodec {
                 ),
             ),
             ExecError::Unsupported(msg) => {
-                ErrorDetails::new(ErrorCode::FeatureNotSupported, msg.clone())
+                // Per-session resource caps surface as Unsupported with stable
+                // `too_many_*` prefixes; they are resource refusals (54000),
+                // not unimplemented features (0A000) — a client must not read
+                // "too many prepared statements" as "this engine cannot do
+                // prepared statements" and fall back to unparsed SQL forever.
+                let code = if msg.starts_with("too_many_prepared_statements")
+                    || msg.starts_with("too_many_cursors")
+                    || msg.starts_with("too_many_listen_channels")
+                    || msg.starts_with("too_many_large_objects")
+                {
+                    ErrorCode::ProgramLimitExceeded
+                } else {
+                    ErrorCode::FeatureNotSupported
+                };
+                ErrorDetails::new(code, msg.clone())
             }
             ExecError::PermissionDenied(msg) => {
                 ErrorDetails::new(ErrorCode::InsufficientPrivilege, msg.clone())
@@ -171,6 +189,11 @@ impl ErrorCodec for PgWireErrorCodec {
                     // classified XX000, which tells a driver nothing. 25P02 is
                     // what PostgreSQL sends and what clients act on.
                     ErrorCode::InFailedSqlTransaction
+                } else if msg.contains("too_many_row_locks") {
+                    // Per-session lock-table exhaustion: 53200
+                    // (out_of_memory), the class PostgreSQL uses when
+                    // `max_locks_per_transaction` is spent.
+                    ErrorCode::InsufficientResources
                 } else if msg.contains("lock_not_available") {
                     ErrorCode::LockNotAvailable
                 } else if msg.contains("write conflict")
@@ -237,6 +260,7 @@ impl ErrorCodec for PgWireErrorCodec {
             ErrorCode::InsufficientResources => "53200".to_string(),
             ErrorCode::DiskFull => "53100".to_string(),
             ErrorCode::ReadOnlySqlTransaction => "25006".to_string(),
+            ErrorCode::ProgramLimitExceeded => "54000".to_string(),
         }
     }
 }
@@ -267,7 +291,21 @@ impl ErrorCodec for BinaryErrorCodec {
                 ),
             ),
             ExecError::Unsupported(msg) => {
-                ErrorDetails::new(ErrorCode::FeatureNotSupported, msg.clone())
+                // Per-session resource caps surface as Unsupported with stable
+                // `too_many_*` prefixes; they are resource refusals (54000),
+                // not unimplemented features (0A000) — a client must not read
+                // "too many prepared statements" as "this engine cannot do
+                // prepared statements" and fall back to unparsed SQL forever.
+                let code = if msg.starts_with("too_many_prepared_statements")
+                    || msg.starts_with("too_many_cursors")
+                    || msg.starts_with("too_many_listen_channels")
+                    || msg.starts_with("too_many_large_objects")
+                {
+                    ErrorCode::ProgramLimitExceeded
+                } else {
+                    ErrorCode::FeatureNotSupported
+                };
+                ErrorDetails::new(code, msg.clone())
             }
             ExecError::PermissionDenied(msg) => {
                 ErrorDetails::new(ErrorCode::InsufficientPrivilege, msg.clone())
@@ -319,6 +357,11 @@ impl ErrorCodec for BinaryErrorCodec {
                     // classified XX000, which tells a driver nothing. 25P02 is
                     // what PostgreSQL sends and what clients act on.
                     ErrorCode::InFailedSqlTransaction
+                } else if msg.contains("too_many_row_locks") {
+                    // Per-session lock-table exhaustion: 53200
+                    // (out_of_memory), the class PostgreSQL uses when
+                    // `max_locks_per_transaction` is spent.
+                    ErrorCode::InsufficientResources
                 } else if msg.contains("lock_not_available") {
                     ErrorCode::LockNotAvailable
                 } else if msg.contains("write conflict")
@@ -383,6 +426,7 @@ impl ErrorCodec for BinaryErrorCodec {
             ErrorCode::InsufficientResources => "5002".to_string(),
             ErrorCode::DiskFull => "5003".to_string(),
             ErrorCode::ReadOnlySqlTransaction => "5004".to_string(),
+            ErrorCode::ProgramLimitExceeded => "5005".to_string(),
         }
     }
 }
@@ -592,5 +636,48 @@ mod tests {
         assert_eq!(codec.code_to_string(ErrorCode::SyntaxError), "1001");
         assert_eq!(codec.code_to_string(ErrorCode::UniqueViolation), "2001");
         assert_eq!(codec.code_to_string(ErrorCode::InternalError), "5000");
+    }
+
+    /// Per-session resource caps are refusals about LIMITS, not about
+    /// capability. 54000 (program_limit_exceeded) tells a client "you are
+    /// holding too much"; 0A000 would tell it "this engine cannot do this",
+    /// which is false and sends drivers down permanent fallbacks. Each prefix
+    /// the enforcement sites emit must map, and only the `too_many_*` family
+    /// may map — an ordinary Unsupported message must stay 0A000 (control).
+    #[test]
+    fn session_resource_caps_map_to_54000_not_0a000() {
+        let codec = PgWireErrorCodec;
+        let caps = [
+            "too_many_prepared_statements: session already holds 1024 prepared \
+             statements (limit 1024)",
+            "too_many_cursors: session already has 1024 open cursors (limit 1024)",
+            "too_many_listen_channels: connection listens on 1024 channels (limit 1024)",
+            "too_many_large_objects: session has 1024 large objects open (limit 1024)",
+        ];
+        for msg in caps {
+            let details = codec.encode(&ExecError::Unsupported(msg.to_string()));
+            assert_eq!(codec.code_to_string(details.code), "54000", "msg: {msg}");
+        }
+        // Control: an ordinary unsupported-feature refusal stays 0A000.
+        let plain = codec.encode(&ExecError::Unsupported(
+            "SELECT ... INTO is not implemented".to_string(),
+        ));
+        assert_eq!(codec.code_to_string(plain.code), "0A000");
+    }
+
+    /// Row-lock exhaustion is 53200 (out_of_memory) — PostgreSQL's class for
+    /// `max_locks_per_transaction` exhaustion — and must not collide with
+    /// 55P03 lock_not_available: 55P03 means "another transaction holds this
+    /// row", which a client could act on by waiting; a session at its own
+    /// lock budget is not that.
+    #[test]
+    fn row_lock_exhaustion_maps_to_53200_not_55p03() {
+        let codec = PgWireErrorCodec;
+        let err = ExecError::Storage(crate::storage::StorageError::Io(
+            "too_many_row_locks: session 7 already holds 100000 row locks (limit 100000)"
+                .to_string(),
+        ));
+        let details = codec.encode(&err);
+        assert_eq!(codec.code_to_string(details.code), "53200");
     }
 }

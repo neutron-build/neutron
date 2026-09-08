@@ -1188,6 +1188,26 @@ impl Executor {
         match result {
             ExecResult::Select { columns, rows } => {
                 let sess = self.current_session();
+                // Per-session cursor limit: cursors materialize their whole
+                // row set and live until CLOSE or disconnect — the most
+                // memory-dense per-session object there is. Replacement of an
+                // existing name does not grow the map and is always allowed.
+                // Refused with the `too_many_cursors` wording the wire codec
+                // maps to SQLSTATE 54000 (program_limit_exceeded).
+                {
+                    let cursors = sess.cursors.read().await;
+                    let limit = self
+                        .max_cursors_per_session
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    if !cursors.contains_key(&cursor_name) && cursors.len() >= limit {
+                        return Err(ExecError::Unsupported(format!(
+                            "too_many_cursors: session already has {} open cursors (limit \
+                             {limit}); CLOSE one before declaring another, or raise \
+                             limits.max_cursors_per_session",
+                            cursors.len()
+                        )));
+                    }
+                }
                 let mut cursors = sess.cursors.write().await;
                 cursors.insert(
                     cursor_name.clone(),

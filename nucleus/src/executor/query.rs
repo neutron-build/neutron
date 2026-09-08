@@ -5881,6 +5881,9 @@ impl Executor {
                         // was already bumped by get()).
                         if !cache_was_hit {
                             self.plan_cache.write().insert(cache_key, plan.clone());
+                            self.metrics
+                                .plan_cache_entries
+                                .set(self.plan_cache.read().len() as i64);
                         }
                         // The plan path signals "I cannot run this shape, use the
                         // AST path" by erroring, and it does so with more kinds
@@ -11521,6 +11524,9 @@ impl Executor {
         self.ast_cache
             .write()
             .insert(norm_key, ast.clone(), literals.len());
+        self.metrics
+            .ast_cache_entries
+            .set(self.ast_cache.read().len() as i64);
         Ok((ast, key))
     }
 
