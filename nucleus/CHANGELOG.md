@@ -7,6 +7,39 @@ Notable changes to the Nucleus engine. Format follows
 
 ### Added
 
+- **Per-session resource limits — the memory-bounding pass.** An audit of
+  every map/cache/registry that grows per session, per statement, or per
+  cached plan found the tiered/columnar/metrics surfaces already bounded but
+  several long-running-server surfaces unbounded. All are now capped
+  (defaults overridable via the new `[limits]` config section and
+  `NUCLEUS_LIMITS_*` env vars): row locks per session's transaction
+  (100,000; overrun is `53200 too_many_row_locks`, released at
+  COMMIT/ROLLBACK/autocommit/teardown), SQL `PREPARE` statements and
+  extended-query named Parse statements (1024; `54000`), named portals
+  (Bind; 1024; `54000`), SQL cursors (1024; `54000`), LISTEN channels per
+  connection (1024; `54000` — each channel holds a 256-slot broadcast
+  buffer, so this bounds real memory), open large-object descriptors
+  (1024; `54000`), and the failed-auth table across distinct source IPs
+  (10,000; sheds stalest at capacity, live lockouts never shed). The
+  pgwire crate's per-connection portal store is an unbounded BTreeMap with
+  no length surface, so the handler overrides
+  `on_parse`/`on_bind`/`on_close` to count named statements/portals and
+  refuse past the cap; re-creating an existing name is free, Close/Bind
+  unnamed are handled exactly as pgwire's defaults do. Client-addressable
+  handles are rejected, never silently evicted (evicting one would turn
+  the client's next use into a spurious "not found"); caches keep their
+  existing eviction. Existing verified bounds unchanged: plan cache 1024
+  (LFU), AST cache 4096 (LFU), global prepared cache 4096 (LFU), query
+  result cache 1000 entries / 1 MB per result / 30 s TTL; plan/AST/prepared
+  caps now overridable via `Executor::with_cache_entry_caps`. New gauges
+  (`nucleus_sessions_active`, `nucleus_row_locks_held`,
+  `nucleus_{plan,ast,query,prepared}_cache_entries`) expose occupancy
+  before caps bite; `SHOW METRICS` and the Prometheus endpoint carry them.
+  Operating posture documented in
+  `docs/runbooks/RESOURCE_LIMITS.md`: in-process limits bound logical
+  growth; an external hard cap (container limit / systemd `MemoryMax`) is
+  the leak backstop, and an OOM-kill restart is the real test of WAL
+  crash recovery.
 - **Row-level locking for `FOR UPDATE` / `FOR SHARE`, with `SKIP LOCKED` and
   `NOWAIT`.** The clause was previously either silently dropped (early) or
   refused (`SKIP LOCKED`/`NOWAIT`) while plain `FOR UPDATE` was let through

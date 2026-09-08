@@ -79,6 +79,12 @@ query's working set. There is **no spill-to-disk** — the engine materialises
 result sets, so a query that does not fit in the budget cannot be made to fit
 by waiting.
 
+53200 with `too_many_row_locks` in the message is a different budget: the
+session's transaction holds `limits.max_row_locks_per_session` (default
+100,000) FOR UPDATE rows. Commit or roll back the holding transaction —
+retrying cannot win, and the holder keeps its locks until the transaction
+ends. See [RESOURCE_LIMITS.md](RESOURCE_LIMITS.md).
+
 ## 3. Database growing without bound / vacuum not reclaiming
 
 Cause: an abandoned `BEGIN` pins the MVCC snapshot horizon, so `VACUUM` cannot

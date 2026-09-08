@@ -5,8 +5,8 @@ Multi-model database engine. One pgwire endpoint, multiple data models, unified 
 SQL, Key-Value, Columnar, Vector, Timeseries, Document, Full-Text Search, Graph, Geo, Blob, Datalog, Streams, CDC and Pub/Sub — all reached through standard SQL function calls over a single PostgreSQL-compatible connection. No secondary ports, no secondary protocols, no secondary clients. The RESP (Redis) wire protocol is also supported for KV.
 
 Current size, re-measured by `scripts/metrics.sh` on every doc check:
-348,973 lines of Rust across 309 files, with 5,275 declared tests
-(4,818 unit + 457 integration). Declared counts are static declarations, not
+350,614 lines of Rust across 310 files, with 5,297 declared tests
+(4,840 unit + 457 integration). Declared counts are static declarations, not
 executed-run claims; the current full library run is recorded in
 [DATABASE_COMPLETION.md](DATABASE_COMPLETION.md).
 
@@ -135,6 +135,14 @@ COMMIT;
 Container, systemd unit and k3s manifests live in [deploy/](deploy/), each with
 an explicit statement of what has been verified versus only written.
 Operational procedures are in [docs/runbooks/](docs/runbooks/).
+
+**Operating memory, honestly:** in-process limits (per-session row-lock,
+statement, portal, cursor, LISTEN and large-object caps — see
+[docs/runbooks/RESOURCE_LIMITS.md](docs/runbooks/RESOURCE_LIMITS.md)) bound
+logical growth from connected sessions; they are not a leak backstop. Run an
+external hard cap (container memory limit / systemd `MemoryMax`) alongside
+them — it is what converts a true leak into a kill-and-restart, and an
+OOM-kill restart is the real-world test of the WAL crash-recovery path.
 
 ## Architecture
 
