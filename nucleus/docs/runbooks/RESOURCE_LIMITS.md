@@ -183,3 +183,24 @@ non-budgeted structures (~20–30%); the RSS watchdog (`nucleus_memory_rss_bytes
 vs `nucleus_memory_limit_bytes`, writes refused at critical pressure when
 `server.reject_writes_on_memory_critical` is on) degrades gracefully first,
 and the external cap catches what nothing in-process catches.
+
+## Disk Admission and Validation (2026-09-08)
+
+The compatibility validation run hit two independent resource gates: physical
+volume free space was 2.78% (12.8 GiB), below the unchanged 3% read-only watermark,
+so write/DDL admission returned SQLSTATE `53100`; build artifacts measured
+28.8 GB against the 25 GB build-size ceiling. These are recorded observations,
+not a fresh free-space measurement. Memory/cache caps above do not resolve them.
+
+Actual unchanged application migrations stopped before application DDL; live
+event-store, queue and lease setup were also blocked. A setup refusal proves the
+admission guard fired, not migration compatibility, concurrent lease correctness
+or constraint/rollback/user-isolation behavior. See `../../DATABASE_COMPLETION.md`
+for the separate transactional catalog/DO blocker and local verification bounds.
+
+Before retrying, obtain owner-approved safe capacity remediation and remeasure
+both gates. Do not lower the disk watermark, raise the build ceiling or remove
+data merely to pass validation. Identify ownership and active use before proposing
+any artifact removal; preserve shared data and recovery material. Rerun unchanged
+write/conformance suites only after adequate headroom is established. No cleanup
+or threshold change was performed as part of this documentation update.

@@ -24,10 +24,10 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 350945; Source Rust files: 310; Top-level modules: 53.
-- Declared unit tests: 4850; Declared integration tests: 457; Ignored tests: 53.
+- Source LOC: 351290; Source Rust files: 310; Top-level modules: 53.
+- Declared unit tests: 4854; Declared integration tests: 457; Ignored tests: 53.
   These are static declarations, not executed-test claims.
-- The most recent full library run executed 4,826 passing tests, 0 failing
+- The most recent full library run executed 4,830 passing tests, 0 failing
   (8 ignored, all classified).
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
   families, specialty indexes, encryption, TLS, embedded mode, physical backup v1, probes, Raft
@@ -153,6 +153,98 @@ Goal: close known semantic holes before expanding interfaces.
       refusal still fires instead of silently returning every row. Pinned by
       `a_bound_limit_parameter_limits`, `a_bound_limit_parameter_inside_the_claim_subquery_limits`,
       `a_non_integer_limit_parameter_errors`, and `a_quoted_integer_literal_limits`.
+
+### Remaining SQL compatibility work
+
+`make_interval` accepts PostgreSQL's seven arguments (`years`, `months`,
+`weeks`, `days`, `hours`, `mins`, `secs`), defaulting omitted arguments to zero.
+Positional arguments may precede named arguments (`=>`); duplicate,
+unknown, or positional-after-named bindings are rejected. The first six accept
+32-bit integers (including integer text inputs); seconds accept numeric inputs
+and round to microseconds, ties to even. Explicit NULL produces NULL. Component
+overflow, nonfinite seconds, aggregate modifiers, and unsupported input types
+are errors. Named arguments to other built-ins remain unsupported. This is not
+general PostgreSQL function overload/coercion support. The legacy `:=` spelling
+is not supported by this path and is rejected.
+
+`ON CONFLICT DO UPDATE ... WHERE` evaluates the predicate against the existing
+row and `EXCLUDED` candidate before assignments. FALSE/NULL performs no update
+and emits no RETURNING row; evaluation errors propagate. This is essential for
+database-clock conditional lease acquisition, not merely query filtering.
+
+`DO` / PL/pgSQL remains rejected, including migration wrappers using
+`EXCEPTION WHEN duplicate_object THEN NULL`. Supporting the parser alone is
+insufficient: ordinary table/constraint DDL currently updates the shared catalog,
+whereas executor transaction/savepoint rollback tracks rows and security policy
+state, not table-definition before-images. Safe migration support requires
+transactional catalog visibility, rollback and durable publication, plus precise
+exception matching; a wrapper must not discard handlers or retain aborted DDL.
+
+Source-checked 2026-09-07; these gaps are not closed by the row-lock or
+parameterized-LIMIT implementations above.
+
+#### Compatibility verification update (2026-09-08)
+
+Partial compatibility edits remain uncommitted at base `e27ae6c1`, separate from
+the previously pushed row-lock and resource-limit work. Conditional-upsert refusal
+now preserves RETURNING column metadata even when it returns no rows. Focused
+interval tests passed 4/4; live read-only interval/error probes passed with SCRAM
+and verified TLS. These are not full PostgreSQL parity or concurrent lease proof.
+
+The default/server library test child finished with 4,830 passing, 0 failing and
+8 ignored in 1298.60 seconds (21m39s), after its Cargo parent was signalled at the
+900-second wrapper timeout. The test result is complete; the wrapper result is
+still TIMEOUT, not a clean Cargo exit. Strict default/all-target and core/lib
+Clippy, formatting, unsafe-policy and metrics checks passed locally. No new CI run
+exists for this dirty tree; Linux-only FFI and bench-tools execution were not
+validated by these macOS default-target gates.
+
+The unchanged migration `0000` statement 29 still rejects `DO` with SQLSTATE
+`42601`. The transactional catalog/DDL limitation above is source-confirmed;
+live catalog-rollback setup was blocked, not newly demonstrated. The actual
+Drizzle migrator over unchanged `0000`-`0006` stopped before application DDL with
+`53100`: physical volume free space was 2.78% (12.8 GiB), below the unchanged 3%
+read-only watermark. Later migrations, application constraints/CRUD, rollback and
+user isolation were not reached. Event-store write tests and concurrent lease
+setup were likewise blocked; queue tests were 12 unit passes and 5 live failures,
+not a current conformance pass. Prior live passes are historical only.
+
+The build-size gate also failed: 28.8 GB against its 25 GB ceiling. See
+`docs/runbooks/RESOURCE_LIMITS.md` for the validation prerequisite. Historical SDK
+vector failures, TS server-size/security-cache CI failures and full-regression
+format failure remain unresolved by these local engine checks. No Nucleus 1.0.3
+release or infrastructure upgrade occurred in this wave; release/application
+readiness is not established. After safe disk remediation and transactional
+catalog/DO implementation, rerun unchanged migrations, constraints, rollback,
+user isolation and real queue/event-store conformance. Application cutover also
+requires backup/restore and rollback rehearsal; unit counts do not close it.
+
+- [ ] **Locking-clause order.** Trigger: a client emits
+      `SELECT ... FOR UPDATE SKIP LOCKED LIMIT n` (including nested/prepared
+      queue claims). `src/sql/mod.rs::parse` delegates to sqlparser 0.61;
+      its query grammar parses LIMIT/OFFSET before locking clauses and does not
+      revisit LIMIT afterwards. Current mitigation: emit
+      `SELECT ... LIMIT n FOR UPDATE SKIP LOCKED`, as the queue driver does;
+      unsupported order fails parsing rather than dropping locks. Acceptance:
+      both orders must produce equivalent results and lock behavior through
+      simple and extended pgwire, including parameterized LIMIT/OFFSET in claim
+      subqueries; two workers must drain exactly once with no overlap. Preserve
+      NOWAIT/SKIP LOCKED and malformed-clause refusals. Fixing this must not use
+      textual clause shuffling that changes nested queries or quoted strings.
+- [ ] **Partial/predicate indexes.** Trigger: migrations issue
+      `CREATE [UNIQUE] INDEX ... WHERE ...`, commonly for pending queue jobs.
+      `src/executor/ddl.rs::execute_create_index` explicitly refuses a predicate
+      before constructing an index; the existing
+      `test_row_locks::partial_index_is_refused_not_silently_widened` pins that
+      mitigation. Use a full non-unique index only when its size/cost is acceptable;
+      a full UNIQUE index is NOT a semantic substitute for partial uniqueness.
+      Acceptance: persist/reload predicates, build only matching rows, maintain
+      membership across INSERT/UPDATE/DELETE and rollback/restart, and use the
+      index only when query predicates imply its predicate (otherwise fall back).
+      Differential indexed-versus-scan tests must cover NULL/three-valued logic,
+      prepared predicates, EXPLAIN, and concurrent partial-UNIQUE enforcement.
+      Unsupported predicate forms must remain explicit refusals, never full
+      indexes silently created under a partial-index name.
 
 Evidence:
 
