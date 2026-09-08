@@ -1,8 +1,9 @@
 # Resource limits — what the engine bounds itself, and what it cannot
 
-Every long-lived structure that grows through client actions has an in-process
-cap, configurable in `neutron.toml` under `[limits]` (or `NUCLEUS_LIMITS_*`
-env vars). This page is the operator's map of those caps: what each bounds,
+Several long-lived structures that grow through client actions have in-process
+caps, configurable in `nucleus.toml` under `[limits]` (or `NUCLEUS_LIMITS_*`
+env vars). This is not a complete memory bound; the unique-key gate remains
+uncapped (see Remaining Work). This page maps the caps: what each bounds,
 what a client sees when one bites, and what an operator should do about it.
 
 The honest posture first: **these limits bound logical growth, not total
@@ -40,8 +41,45 @@ to the client; eviction is not an error:
 | Query plan cache | 1024 entries | least-accessed evicted; cleared on DDL |
 | AST cache | 4096 entries | least-accessed evicted; cleared on DDL |
 | Global prepared-statement cache | 4096 entries | least-accessed evicted |
-| Query result cache | 1000 entries, 1 MB/result, 30 s TTL | invalidated on every write |
+| Query result cache | 1000 entries, 1 MiB/result, 64 MiB total estimated bytes, 30 s TTL | `limits.max_query_cache_bytes`; oldest-inserted eviction, invalidated on writes |
 | KV cache tier | `cache.max_memory_mb` | byte-budgeted LRU+TTL |
+
+### Query-result byte budget
+
+Implemented and verified 2026-09-07. `cargo test --lib query_cache_budget`
+passes all 10 cache/config regressions (including four isolated env cases).
+The full library run passes 4826 tests, with 8 ignored. The regression suite is
+`executor::cache::query_cache_budget_tests`; config coverage is
+`config::tests::query_cache_budget_*`. These gates verify logical accounting,
+not an RSS ceiling or long-running workload memory behavior.
+
+```toml
+[limits]
+max_query_cache_bytes = 67108864 # 64 MiB, shared across sessions per executor
+```
+
+`NUCLEUS_LIMITS_MAX_QUERY_CACHE_BYTES` overrides TOML. Zero is rejected at
+startup, not interpreted as unlimited or disabled, matching the other `[limits]`
+keys. Embedded callers use `Executor::with_query_cache_max_bytes`; it clears
+existing cached results and rejects zero with a panic. A positive budget smaller
+than a result simply makes that result bypass caching; the query still succeeds.
+The existing 1 MiB/result and 1000-entry caps continue to apply independently.
+
+Accounting uses `executor/cache.rs::estimate_result_size` for both byte caps:
+column-name lengths, estimated value payload sizes (JSON uses serialized text
+length), and fixed per-value/row/result overheads. Each entry retains its charge;
+the total is derived from those charges under the cache lock, with replacement
+removed before capacity eviction. It is **not serialized storage size, measured
+heap allocation, or an upper bound on RSS**. Map keys/buckets, spare capacity,
+allocator overhead, and result clones returned to queries are not included.
+
+TTL is lazy: an expired entry is a miss, but remains retained and charged until
+replacement, oldest-inserted eviction, or invalidation/clear actually removes it.
+There is no background result-cache TTL sweep. Clear/invalidation resets both
+entry and byte gauges; a rejected stale-generation insertion changes neither.
+The budget is separate from the KV cache budget and is not reserved from or
+included in the buffer-pool-plus-KV startup validation against
+`server.max_memory_mb`. Allow for it when sizing the external memory cap.
 
 ## Why rejection for handles, eviction for caches
 
@@ -70,6 +108,7 @@ nucleus_row_locks_held             # FOR UPDATE rows held across all sessions
 nucleus_plan_cache_entries         # plan cache occupancy (cap 1024)
 nucleus_ast_cache_entries          # AST cache occupancy (cap 4096)
 nucleus_query_cache_entries        # result cache occupancy (cap 1000)
+nucleus_query_cache_estimated_bytes # retained result estimate, including expired entries
 nucleus_prepared_cache_entries     # global prepared cache occupancy (cap 4096)
 ```
 
@@ -91,8 +130,39 @@ SESSIONS` / `SHOW SUBSYSTEM_HEALTH`) or raise the specific limit.
   the failure table via source-IP rotation; at capacity the table sheds the
   stalest entries, and a live lockout (5 failures within 30 s from one IP)
   is never the one shed — lockouts are recent by definition.
-- Every limit validates `>= 1`; `0` is rejected at startup because it would
-  remove the bound whose absence was the original defect.
+- Every `[limits]` value validates `>= 1`; `0` is rejected at startup, not
+  treated as an unlimited sentinel.
+
+## Remaining Work
+
+### Unique-key gate cap and workload analysis
+
+Open, source-checked 2026-09-07: `src/executor/unique_gate.rs::Held` has
+`owner` and `by_session` maps without an acquisition cap. The row-lock cap does
+not cover these UNIQUE/PRIMARY KEY reservations. This is a logical growth risk,
+not evidence of a leak: guards release statement slots, and transaction/session
+teardown releases retained slots.
+
+**Trigger:** large multi-row INSERT/UPDATE statements or long transactions
+touching many distinct unique keys, especially with multiple unique constraints
+or concurrent sessions. Also measure release latency: `release` retains a
+session's list using `keys.contains`, a nested membership scan whose actual cost
+depends on held/new key counts; no workload complexity estimate is asserted here.
+
+**Current mitigation:** keep bulk transactions/batches small; commit/rollback
+promptly, limit connections, and retain the external RSS backstop. The default
+10 s conflict-wait timeout limits waiting, not the number of held slots. Do not
+disable the gate: it protects check-then-write uniqueness on the paged engines.
+
+**Acceptance:** measure retained slot counts, estimated/allocated bytes and
+acquisition/release latency for single/multi-constraint bulk writes and concurrent
+long transactions on the serving buffered-disk path. Use that evidence to select
+a configurable cap and explicit resource-exhaustion response. Tests must prove
+boundary/re-entrant acquisition, refusal without partial reservations or duplicate
+writes, preservation of previously held transaction slots, and reclamation on
+statement failure, COMMIT, ROLLBACK and disconnect. Include a concurrent duplicate
+key control and a bounded-churn occupancy test. This work remains separate from
+the implemented row-lock cap and query-result byte budget above.
 
 ## The external backstop, concretely
 

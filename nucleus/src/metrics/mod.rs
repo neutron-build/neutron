@@ -340,6 +340,7 @@ pub struct MetricsRegistry {
     pub ast_cache_entries: Gauge,
     /// Entries in the query result cache (TTL, capped).
     pub query_cache_entries: Gauge,
+    pub query_cache_estimated_bytes: Gauge,
     /// Entries in the global prepared-statement cache (LRU, capped).
     pub prepared_cache_entries: Gauge,
 
@@ -484,6 +485,10 @@ impl MetricsRegistry {
                 "nucleus_query_cache_entries",
                 "Entries in the bounded query result cache",
             ),
+            query_cache_estimated_bytes: Gauge::new(
+                "nucleus_query_cache_estimated_bytes",
+                "Estimated retained query result bytes, not allocated RAM",
+            ),
             prepared_cache_entries: Gauge::new(
                 "nucleus_prepared_cache_entries",
                 "Entries in the bounded global prepared-statement cache",
@@ -593,6 +598,7 @@ impl MetricsRegistry {
         render_gauge(&mut out, &self.plan_cache_entries);
         render_gauge(&mut out, &self.ast_cache_entries);
         render_gauge(&mut out, &self.query_cache_entries);
+        render_gauge(&mut out, &self.query_cache_estimated_bytes);
         render_gauge(&mut out, &self.prepared_cache_entries);
 
         // Histograms
@@ -680,6 +686,7 @@ impl MetricsRegistry {
         add_gauge(&mut rows, &self.plan_cache_entries);
         add_gauge(&mut rows, &self.ast_cache_entries);
         add_gauge(&mut rows, &self.query_cache_entries);
+        add_gauge(&mut rows, &self.query_cache_estimated_bytes);
         add_gauge(&mut rows, &self.prepared_cache_entries);
 
         for h in [&self.query_duration, &self.lock_wait_duration] {
@@ -890,13 +897,13 @@ mod tests {
         reg.active_connections.set(3);
 
         let rows = reg.as_rows();
-        // 30 counters + 14 gauges + 1 uptime + 2 histograms = 47.
+        // 30 counters + 15 gauges + 1 uptime + 2 histograms = 48.
         // The count is asserted deliberately: `as_rows` is SHOW METRICS, and a
         // metric added to the registry but not to the render/rows lists is
         // silently invisible to every operator — the same declared-but-unwired
         // shape as the rest of this engine. Update this number ONLY alongside
         // adding the metric to both `render_prometheus` and `as_rows`.
-        assert_eq!(rows.len(), 47);
+        assert_eq!(rows.len(), 48);
 
         // Check a counter row
         let qt = rows

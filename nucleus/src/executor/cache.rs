@@ -274,6 +274,16 @@ impl Executor {
     /// Maximum number of entries in the query result cache.
     const QUERY_CACHE_MAX_ENTRIES: usize = 1000;
 
+    /// Set the total retained-result estimate budget (default 64 MiB).
+    /// Clears existing entries. Zero is rejected, as in server [limits].
+    /// Panics if `bytes` is zero; this is not a whole-process RAM limit.
+    pub fn with_query_cache_max_bytes(mut self, bytes: usize) -> Self {
+        assert!(bytes > 0, "query cache byte budget must be at least 1");
+        self.query_cache_max_bytes = bytes;
+        self.query_cache_invalidate_all();
+        self
+    }
+
     /// Check the query cache for a cached SELECT result.
     /// Returns `Some(ExecResult)` on cache hit, `None` on miss.
     /// Entries expire after `QUERY_CACHE_TTL_SECS` seconds (default 30).
@@ -298,7 +308,7 @@ impl Executor {
 
     /// Store a SELECT result in the query cache.
     /// Bounded to `QUERY_CACHE_MAX_ENTRIES` entries (evicts oldest on overflow).
-    /// Skips results larger than `QUERY_CACHE_MAX_RESULT_BYTES` (1 MB).
+    /// Skips results larger than the per-result or total byte budget.
     ///
     /// `gen_at_miss` must be the generation snapshot taken at the time of the
     /// cache miss (before query execution). If the write generation has advanced
@@ -311,8 +321,10 @@ impl Executor {
         rows: &[Row],
         gen_at_miss: u64,
     ) {
-        // Don't cache result sets larger than 1 MB
-        if Self::estimate_result_size(columns, rows) > Self::QUERY_CACHE_MAX_RESULT_BYTES {
+        let estimated_bytes = Self::estimate_result_size(columns, rows);
+        if estimated_bytes > Self::QUERY_CACHE_MAX_RESULT_BYTES
+            || estimated_bytes > self.query_cache_max_bytes
+        {
             return;
         }
         // If a write happened while this query was executing, skip the store.
@@ -329,14 +341,21 @@ impl Executor {
         if now_gen != gen_at_miss {
             return;
         }
-        // Evict oldest entries if at capacity
-        if cache.len() >= Self::QUERY_CACHE_MAX_ENTRIES {
+        // Derive the retained charge under the same lock as every mutation.
+        // Expired entries still own their payload and remain charged until removed.
+        cache.remove(&key);
+        let mut retained_bytes: usize = cache.values().map(|e| e.estimated_bytes).sum();
+        // Replacement is removed first so it never evicts an unrelated entry
+        // merely because the entry-count cap was already full.
+        while cache.len() >= Self::QUERY_CACHE_MAX_ENTRIES
+            || retained_bytes > self.query_cache_max_bytes - estimated_bytes
+        {
             let oldest_key = cache
                 .iter()
                 .min_by_key(|(_, e)| e.inserted_at)
                 .map(|(k, _)| k.clone());
             if let Some(ok) = oldest_key {
-                cache.remove(&ok);
+                retained_bytes -= cache.remove(&ok).unwrap().estimated_bytes;
             }
         }
         cache.insert(
@@ -344,6 +363,7 @@ impl Executor {
             QueryCacheEntry {
                 columns: columns.to_vec(),
                 rows: rows.to_vec(),
+                estimated_bytes,
                 inserted_at: std::time::Instant::now(),
                 generation: gen_at_miss,
             },
@@ -352,6 +372,9 @@ impl Executor {
         // read on the same thread would deadlock (parking_lot is not
         // re-entrant).
         self.metrics.query_cache_entries.set(cache.len() as i64);
+        self.metrics
+            .query_cache_estimated_bytes
+            .set((retained_bytes + estimated_bytes) as i64);
     }
 
     /// Invalidate all cached queries (called after any write operation).
@@ -364,6 +387,7 @@ impl Executor {
         let mut cache = self.query_cache.write();
         cache.clear();
         self.metrics.query_cache_entries.set(0);
+        self.metrics.query_cache_estimated_bytes.set(0);
     }
 
     /// Get query cache entry count and hit info.
@@ -515,10 +539,10 @@ impl Executor {
         true
     }
 
-    /// Estimate the in-memory byte size of a result set (columns + rows).
-    /// Used to enforce the 1 MB cache limit — avoids storing huge results
-    /// that would bloat memory. The estimate is approximate but errs on
-    /// the side of overestimation.
+    /// Logical result charge shared by the per-entry and total cache budgets.
+    /// Counts column names, value payloads (JSON's serialized length), and fixed
+    /// overhead estimates. Not an upper bound on allocations: excludes map/key
+    /// storage, spare capacity, allocator overhead, and clones served to callers.
     fn estimate_result_size(columns: &[(String, DataType)], rows: &[Row]) -> usize {
         // Column metadata overhead
         let col_size: usize = columns
@@ -553,5 +577,197 @@ impl Executor {
             Value::Vector(v) => 24 + v.len() * 4,
             Value::Interval { .. } => 24,
         }
+    }
+}
+
+#[cfg(test)]
+mod query_cache_budget_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn executor(budget: usize) -> Executor {
+        Executor::new(
+            std::sync::Arc::new(crate::catalog::Catalog::new()),
+            std::sync::Arc::new(crate::storage::MemoryEngine::new()),
+        )
+        .with_query_cache_max_bytes(budget)
+    }
+
+    // One text column and one text row: 17 + (24 + len + 24) + 64.
+    fn put(ex: &Executor, key: &str, len: usize) {
+        ex.query_cache_put(
+            key,
+            &[("v".into(), DataType::Text)],
+            &[vec![Value::Text("x".repeat(len))]],
+            ex.cache_write_gen.load(Ordering::Acquire),
+        );
+    }
+
+    fn assert_charge(ex: &Executor, count: usize, bytes: usize) {
+        let cache = ex.query_cache.read();
+        assert_eq!(cache.len(), count);
+        assert_eq!(
+            cache.values().map(|e| e.estimated_bytes).sum::<usize>(),
+            bytes
+        );
+        assert_eq!(ex.metrics.query_cache_entries.get(), count as i64);
+        assert_eq!(ex.metrics.query_cache_estimated_bytes.get(), bytes as i64);
+        assert!(bytes <= ex.query_cache_max_bytes);
+    }
+
+    fn age(ex: &Executor, key: &str, seconds: u64) {
+        // Resolve session-sensitive keys before locking the cache, like production.
+        let key = ex.query_cache_key(key);
+        ex.query_cache.write().get_mut(&key).unwrap().inserted_at =
+            Instant::now() - Duration::from_secs(seconds);
+    }
+
+    #[test]
+    fn total_budget_evicts_oldest_until_the_result_fits() {
+        let ex = executor(600);
+        for (key, seconds) in [("old", 20), ("middle", 10), ("new", 5)] {
+            put(&ex, key, 71); // 200 bytes each, exactly at the budget.
+            age(&ex, key, seconds);
+        }
+        assert_charge(&ex, 3, 600);
+        // Hits do not change the existing oldest-inserted eviction policy.
+        assert!(ex.query_cache_get("old").is_some());
+        put(&ex, "large", 271); // 400 bytes requires TWO evictions.
+        assert_charge(&ex, 2, 600);
+        assert!(ex.query_cache_get("old").is_none());
+        assert!(ex.query_cache_get("middle").is_none());
+        assert!(ex.query_cache_get("new").is_some());
+        assert!(ex.query_cache_get("large").is_some());
+    }
+
+    #[test]
+    fn replacement_releases_the_old_charge_before_eviction() {
+        let ex = executor(500);
+        put(&ex, "other", 71);
+        age(&ex, "other", 20);
+        put(&ex, "replace", 71);
+        put(&ex, "replace", 171); // 200 + 300 fits without evicting other.
+        assert_charge(&ex, 2, 500);
+        assert!(ex.query_cache_get("other").is_some());
+        put(&ex, "replace", 1);
+        assert_charge(&ex, 2, 330);
+        put(&ex, "replace", 371); // Now replacement alone fills the budget.
+        assert_charge(&ex, 1, 500);
+        assert!(ex.query_cache_get("other").is_none());
+    }
+
+    #[test]
+    fn entry_cap_and_replacement_at_capacity_remain_bounded() {
+        let ex = executor(64 * 1024 * 1024);
+        for i in 0..1000 {
+            put(&ex, &format!("key{i}"), 1);
+        }
+        assert_charge(&ex, 1000, 130_000);
+        age(&ex, "key0", 20);
+        put(&ex, "key999", 2);
+        assert_charge(&ex, 1000, 130_001);
+        assert!(ex.query_cache_get("key0").is_some());
+        put(&ex, "overflow", 1);
+        assert_charge(&ex, 1000, 130_001);
+        assert!(ex.query_cache_get("key0").is_none());
+    }
+
+    #[tokio::test]
+    async fn oversize_results_bypass_without_failing_queries_or_evicting() {
+        let ex = executor(200);
+        put(&ex, "keep", 71);
+        put(&ex, "oversize", 72);
+        put(&ex, "keep", 72); // A bypass is not a mutation, even for the same key.
+        assert_charge(&ex, 1, 200);
+        assert!(ex.query_cache_get("oversize").is_none());
+        let result = ex.execute("SELECT 'payload' AS v").await.unwrap();
+        assert!(matches!(&result[0], ExecResult::Select { rows, .. }
+            if rows == &vec![vec![Value::Text("payload".into())]]));
+        let ex = ex.with_query_cache_max_bytes(1);
+        let result = ex.execute("SELECT 123 AS v").await.unwrap();
+        assert!(matches!(&result[0], ExecResult::Select { rows, .. } if rows.len() == 1));
+        assert_charge(&ex, 0, 0);
+
+        let ex = executor(2 * 1024 * 1024);
+        put(&ex, "per-entry-boundary", 1_048_576 - 129);
+        assert_charge(&ex, 1, 1_048_576);
+        put(&ex, "per-entry-oversize", 1_048_576 - 128);
+        assert_charge(&ex, 1, 1_048_576);
+        assert!(ex.query_cache_get("per-entry-oversize").is_none());
+    }
+
+    #[test]
+    fn expiration_remains_charged_until_eviction_or_clear() {
+        let ex = executor(400);
+        put(&ex, "expired", 71);
+        age(&ex, "expired", 31);
+        assert!(ex.query_cache_get("expired").is_none());
+        assert_charge(&ex, 1, 200); // Lazy TTL does not release retained payload.
+        put(&ex, "live", 71);
+        put(&ex, "next", 71);
+        assert_charge(&ex, 2, 400);
+        let expired_key = ex.query_cache_key("expired");
+        assert!(!ex.query_cache.read().contains_key(&expired_key));
+        ex.clear_all_query_caches();
+        assert_charge(&ex, 0, 0);
+    }
+
+    #[tokio::test]
+    async fn invalidation_clear_and_stale_generation_release_or_preserve_charge() {
+        let ex = executor(400);
+        ex.execute("CREATE TABLE t (id INT)").await.unwrap();
+        put(&ex, "before-write", 71);
+        let stale_gen = ex.cache_write_gen.load(Ordering::Acquire);
+        ex.execute("INSERT INTO t VALUES (1)").await.unwrap();
+        assert_charge(&ex, 0, 0);
+        put(&ex, "after-write", 71);
+        ex.query_cache_put("stale", &[], &[], stale_gen);
+        assert_charge(&ex, 1, 200);
+        ex.query_cache_invalidate_all();
+        assert_charge(&ex, 0, 0);
+        put(&ex, "before-clear", 71);
+        ex.clear_all_query_caches();
+        assert_charge(&ex, 0, 0);
+        put(&ex, "before-resize", 71);
+        let ex = ex.with_query_cache_max_bytes(100);
+        assert_charge(&ex, 0, 0);
+        assert!(
+            ex.metrics
+                .render_prometheus()
+                .contains("nucleus_query_cache_estimated_bytes 0")
+        );
+        assert!(ex.metrics.as_rows().iter().any(|(name, kind, value)| name
+            == "nucleus_query_cache_estimated_bytes"
+            && kind == "gauge"
+            && value == "0"));
+    }
+
+    #[test]
+    fn concurrent_inserts_and_invalidations_preserve_the_budget() {
+        let ex = executor(600);
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let ex = &ex;
+                scope.spawn(move || {
+                    for i in 0..100 {
+                        put(ex, &format!("{worker}:{i}"), 71);
+                        if i % 7 == 0 {
+                            ex.query_cache_invalidate_all();
+                        }
+                    }
+                });
+            }
+        });
+        ex.record_cache_gauges();
+        let count = ex.query_cache_len();
+        assert_charge(&ex, count, count * 200);
+        ex.clear_all_query_caches();
+        assert_charge(&ex, 0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "query cache byte budget must be at least 1")]
+    fn zero_embedded_budget_is_rejected() {
+        executor(0);
     }
 }

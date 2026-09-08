@@ -592,8 +592,9 @@ pub struct Executor {
     /// Retention engine for compliance_* SQL functions (PII/retention/GDPR).
     retention_engine: parking_lot::RwLock<crate::compliance::RetentionEngine>,
     /// Query result cache: normalized SQL hash → (columns, rows, inserted_at).
-    /// Bounded to max 1000 entries. Invalidated on writes.
+    /// Bounded by entry count and estimated result bytes. Invalidated on writes.
     query_cache: parking_lot::RwLock<HashMap<String, QueryCacheEntry>>,
+    query_cache_max_bytes: usize,
     /// View dependency tracking: table_name → set of view names that reference it.
     /// Used to prevent DROP TABLE when views depend on it.
     view_deps: parking_lot::RwLock<HashMap<String, HashSet<String>>>,
@@ -1011,6 +1012,7 @@ impl Executor {
             procedure_engine: parking_lot::RwLock::new(crate::procedures::ProcedureEngine::new()),
             retention_engine: parking_lot::RwLock::new(crate::compliance::RetentionEngine::new()),
             query_cache: parking_lot::RwLock::new(HashMap::new()),
+            query_cache_max_bytes: 64 * 1024 * 1024,
             cache_write_gen: AtomicU64::new(0),
             view_deps: parking_lot::RwLock::new(HashMap::new()),
             mv_deps: RwLock::new(HashMap::new()),
@@ -4119,9 +4121,16 @@ impl Executor {
         self.metrics
             .ast_cache_entries
             .set(self.ast_cache.read().len() as i64);
-        self.metrics
-            .query_cache_entries
-            .set(self.query_cache.read().len() as i64);
+        {
+            let cache = self.query_cache.read();
+            self.metrics.query_cache_entries.set(cache.len() as i64);
+            self.metrics.query_cache_estimated_bytes.set(
+                cache
+                    .values()
+                    .map(|entry| entry.estimated_bytes)
+                    .sum::<usize>() as i64,
+            );
+        }
         self.metrics
             .prepared_cache_entries
             .set(self.global_prepared_cache.read().len() as i64);

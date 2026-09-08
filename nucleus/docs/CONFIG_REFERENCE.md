@@ -107,6 +107,7 @@ falls back to its default.
 | `max_listen_channels_per_session` | `usize` | `1024` | `NUCLEUS_LIMITS_MAX_LISTEN_CHANNELS_PER_SESSION` | Channels one connection may LISTEN on. |
 | `max_large_objects_per_session` | `usize` | `1024` | `NUCLEUS_LIMITS_MAX_LARGE_OBJECTS_PER_SESSION` | Large-object descriptors one connection may hold open (lo_open). |
 | `max_auth_failure_entries` | `usize` | `10_000` | `NUCLEUS_LIMITS_MAX_AUTH_FAILURE_ENTRIES` | Source IPs tracked in the failed-authentication table. |
+| `max_query_cache_bytes` | `usize` | `64 * 1024 * 1024` | `NUCLEUS_LIMITS_MAX_QUERY_CACHE_BYTES` | Total retained query-result estimate in bytes (64 MiB), separate from cache.max_memory_mb (KV tier). Oldest entries evict; oversize results bypass caching. Not allocated RAM or an RSS cap. Must be at least 1. |
 
 ## `[nucleus]`
 
@@ -172,6 +173,7 @@ probe hooks, not supported configuration.
 | `NUCLEUS_LIMITS_MAX_LISTEN_CHANNELS_PER_SESSION` | `src/config/mod.rs` |
 | `NUCLEUS_LIMITS_MAX_PORTALS_PER_SESSION` | `src/config/mod.rs` |
 | `NUCLEUS_LIMITS_MAX_PREPARED_STATEMENTS_PER_SESSION` | `src/config/mod.rs` |
+| `NUCLEUS_LIMITS_MAX_QUERY_CACHE_BYTES` | `src/config/mod.rs` |
 | `NUCLEUS_LIMITS_MAX_ROW_LOCKS_PER_SESSION` | `src/config/mod.rs` |
 | `NUCLEUS_LOGGING_FILE` | `src/config/mod.rs` |
 | `NUCLEUS_LOGGING_FORMAT` | `src/config/mod.rs` |

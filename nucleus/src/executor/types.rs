@@ -197,6 +197,8 @@ pub(crate) struct FtsIndexEntry {
 pub(crate) struct QueryCacheEntry {
     pub columns: Vec<(String, DataType)>,
     pub rows: Vec<Row>,
+    /// Fixed charge from estimate_result_size, not allocated RAM.
+    pub estimated_bytes: usize,
     pub inserted_at: std::time::Instant,
     /// Write generation at the time this entry was inserted.
     /// If the executor's `cache_write_gen` has advanced past this value,

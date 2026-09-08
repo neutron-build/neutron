@@ -500,7 +500,7 @@ impl Default for LoggingConfig {
 // NucleusConfig (top-level)
 // ---------------------------------------------------------------------------
 
-/// Per-session / per-connection resource limits.
+/// Session, connection, and shared-cache resource limits.
 ///
 /// These bound LOGICAL growth — maps and registries that live as long as a
 /// session and grow through client actions. They are not a memory-leak
@@ -536,6 +536,11 @@ pub struct LimitsConfig {
     /// Source IPs tracked in the failed-authentication table.
     #[serde(default = "default_max_auth_failure_entries")]
     pub max_auth_failure_entries: usize,
+    /// Total retained query-result estimate in bytes (64 MiB), separate from
+    /// cache.max_memory_mb (KV tier). Oldest entries evict; oversize results
+    /// bypass caching. Not allocated RAM or an RSS cap. Must be at least 1.
+    #[serde(default = "default_max_query_cache_bytes")]
+    pub max_query_cache_bytes: usize,
 }
 
 fn default_max_row_locks_per_session() -> usize {
@@ -559,6 +564,9 @@ fn default_max_large_objects_per_session() -> usize {
 fn default_max_auth_failure_entries() -> usize {
     10_000
 }
+fn default_max_query_cache_bytes() -> usize {
+    64 * 1024 * 1024
+}
 
 impl Default for LimitsConfig {
     fn default() -> Self {
@@ -570,6 +578,7 @@ impl Default for LimitsConfig {
             max_listen_channels_per_session: default_max_listen_channels_per_session(),
             max_large_objects_per_session: default_max_large_objects_per_session(),
             max_auth_failure_entries: default_max_auth_failure_entries(),
+            max_query_cache_bytes: default_max_query_cache_bytes(),
         }
     }
 }
@@ -751,6 +760,12 @@ impl NucleusConfig {
                 parsed_env::<usize>(&mut warnings, "NUCLEUS_LIMITS_MAX_AUTH_FAILURE_ENTRIES", &v)
         {
             self.limits.max_auth_failure_entries = n;
+        }
+        if let Ok(v) = env::var("NUCLEUS_LIMITS_MAX_QUERY_CACHE_BYTES")
+            && let Some(n) =
+                parsed_env::<usize>(&mut warnings, "NUCLEUS_LIMITS_MAX_QUERY_CACHE_BYTES", &v)
+        {
+            self.limits.max_query_cache_bytes = n;
         }
 
         // storage
@@ -970,20 +985,44 @@ impl NucleusConfig {
                     .to_string(),
             );
         }
-        // A zero limit would disable the bound it configures, and every one of
-        // these exists precisely because the unbounded behavior was the bug.
+        // Resource limits must be positive; zero is not an unlimited sentinel.
         for (name, value) in [
-            ("limits.max_row_locks_per_session", self.limits.max_row_locks_per_session),
-            ("limits.max_prepared_statements_per_session", self.limits.max_prepared_statements_per_session),
-            ("limits.max_portals_per_session", self.limits.max_portals_per_session),
-            ("limits.max_cursors_per_session", self.limits.max_cursors_per_session),
-            ("limits.max_listen_channels_per_session", self.limits.max_listen_channels_per_session),
-            ("limits.max_large_objects_per_session", self.limits.max_large_objects_per_session),
-            ("limits.max_auth_failure_entries", self.limits.max_auth_failure_entries),
+            (
+                "limits.max_row_locks_per_session",
+                self.limits.max_row_locks_per_session,
+            ),
+            (
+                "limits.max_prepared_statements_per_session",
+                self.limits.max_prepared_statements_per_session,
+            ),
+            (
+                "limits.max_portals_per_session",
+                self.limits.max_portals_per_session,
+            ),
+            (
+                "limits.max_cursors_per_session",
+                self.limits.max_cursors_per_session,
+            ),
+            (
+                "limits.max_listen_channels_per_session",
+                self.limits.max_listen_channels_per_session,
+            ),
+            (
+                "limits.max_large_objects_per_session",
+                self.limits.max_large_objects_per_session,
+            ),
+            (
+                "limits.max_auth_failure_entries",
+                self.limits.max_auth_failure_entries,
+            ),
+            (
+                "limits.max_query_cache_bytes",
+                self.limits.max_query_cache_bytes,
+            ),
         ] {
             if value == 0 {
                 errors.push(format!(
-                    "{name} must be at least 1 (got 0): 0 would remove the bound, and the unbounded behavior is what this limit exists to prevent"
+                    "{name} must be at least 1 (got 0): zero is not a supported resource limit"
                 ));
             }
         }
@@ -1864,6 +1903,63 @@ port = 5555
     #[test]
     fn default_config_is_valid() {
         assert_eq!(NucleusConfig::default().validate(), Ok(()));
+    }
+
+    #[test]
+    fn query_cache_budget_defaults_toml_and_validation() {
+        let default = NucleusConfig::from_toml("[limits]\nmax_cursors_per_session = 3").unwrap();
+        assert_eq!(default.limits.max_query_cache_bytes, 64 * 1024 * 1024);
+        assert_eq!(
+            LimitsConfig::default().max_query_cache_bytes,
+            64 * 1024 * 1024
+        );
+        let mut cfg = NucleusConfig::from_toml("[limits]\nmax_query_cache_bytes = 123").unwrap();
+        assert_eq!(cfg.limits.max_query_cache_bytes, 123);
+        assert_eq!(cfg.validate(), Ok(()));
+        cfg.limits.max_query_cache_bytes = 0;
+        assert_flags(&cfg, "limits.max_query_cache_bytes");
+        cfg.limits.max_query_cache_bytes = 1;
+        assert_eq!(cfg.validate(), Ok(()));
+        assert!(NucleusConfig::from_toml("[limits]\nmax_query_cache_bytes = -1").is_err());
+    }
+
+    #[test]
+    fn query_cache_budget_env_override() {
+        // Run environment cases in child processes, not by mutating the parallel
+        // library test runner's environment.
+        const CHILD: &str = "QUERY_CACHE_BUDGET_ENV_TEST_CHILD";
+        const KEY: &str = "NUCLEUS_LIMITS_MAX_QUERY_CACHE_BYTES";
+        if let Ok(case) = env::var(CHILD) {
+            let mut cfg =
+                NucleusConfig::from_toml("[limits]\nmax_query_cache_bytes = 123").unwrap();
+            let warnings = cfg.apply_env_overrides();
+            match case.as_str() {
+                "456" => assert_eq!(cfg.limits.max_query_cache_bytes, 456),
+                "0" => {
+                    assert_eq!(cfg.limits.max_query_cache_bytes, 0);
+                    assert_flags(&cfg, "limits.max_query_cache_bytes");
+                }
+                _ => {
+                    assert_eq!(cfg.limits.max_query_cache_bytes, 123);
+                    assert!(warnings.iter().any(|w| w.contains(KEY)));
+                }
+            }
+            return;
+        }
+        for case in ["456", "0", "invalid", "-1"] {
+            let output = std::process::Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "config::tests::query_cache_budget_env_override",
+                    "--nocapture",
+                ])
+                .env(CHILD, case)
+                .env(KEY, case)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "case {case}: {output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
     }
 
     /// A realistic hand-written config must also pass.
