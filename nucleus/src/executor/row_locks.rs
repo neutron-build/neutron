@@ -129,8 +129,7 @@ pub(crate) async fn lock_context(
             && nonblock.is_some_and(|prior| &prior != nb)
         {
             return Err(ExecError::Unsupported(
-                "conflicting SKIP LOCKED / NOWAIT options in one locking clause set"
-                    .into(),
+                "conflicting SKIP LOCKED / NOWAIT options in one locking clause set".into(),
             ));
         }
         nonblock = nonblock.or(lock.nonblock);
@@ -272,14 +271,14 @@ impl Executor {
                         // The `lock_not_available` wording is what the wire
                         // codec maps to SQLSTATE 55P03, PostgreSQL's code for
                         // exactly this refusal.
-                        return Err(ExecError::Storage(
-                            crate::storage::StorageError::Io(format!(
+                        return Err(ExecError::Storage(crate::storage::StorageError::Io(
+                            format!(
                                 "lock_not_available: row in table '{}' could not be \
                                  locked (key {:?}): NOWAIT was requested and another \
                                  transaction holds it",
                                 key.0, key.1
-                            )),
-                        ));
+                            ),
+                        )));
                     }
                 }
             }

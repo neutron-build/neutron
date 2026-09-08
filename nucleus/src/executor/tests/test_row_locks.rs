@@ -38,11 +38,9 @@ async fn seed_jobs(ex: &Executor, n: i64) {
         .await
         .unwrap();
     for i in 1..=n {
-        ex.execute(&format!(
-            "INSERT INTO jobs VALUES ({i}, 'pending', 0)"
-        ))
-        .await
-        .unwrap();
+        ex.execute(&format!("INSERT INTO jobs VALUES ({i}, 'pending', 0)"))
+            .await
+            .unwrap();
     }
 }
 
@@ -59,7 +57,9 @@ fn claimed_ids(res: &[ExecResult]) -> Vec<i64> {
                 ref other => panic!("non-integer id: {other:?}"),
             })
             .collect(),
-        ExecResult::Command { rows_affected: 0, .. } => Vec::new(),
+        ExecResult::Command {
+            rows_affected: 0, ..
+        } => Vec::new(),
         other => panic!("claim must return rows, got {other:?}"),
     }
 }
@@ -204,7 +204,8 @@ async fn two_workers_drain_fifty_jobs_exactly_once() {
         unreachable!()
     };
     assert_eq!(
-        rows[0][0], Value::Int32(0),
+        rows[0][0],
+        Value::Int32(0),
         "no row may be attempted twice; SUM={:?}",
         rows[0][1]
     );
@@ -342,12 +343,9 @@ async fn for_share_locks_the_rows_it_returns() {
     let a = ex.create_session();
     ex.execute_with_session(a, "BEGIN").await.unwrap();
     let got = claimed_ids(
-        &ex.execute_with_session(
-            a,
-            "SELECT id FROM jobs WHERE id = 1 FOR SHARE",
-        )
-        .await
-        .unwrap(),
+        &ex.execute_with_session(a, "SELECT id FROM jobs WHERE id = 1 FOR SHARE")
+            .await
+            .unwrap(),
     );
     assert_eq!(got, vec![1]);
 
@@ -356,10 +354,7 @@ async fn for_share_locks_the_rows_it_returns() {
         .execute_with_session(b, "SELECT id FROM jobs WHERE id = 1 FOR SHARE NOWAIT")
         .await
         .expect_err("a FOR SHARE row is held; NOWAIT must refuse");
-    assert!(
-        err.to_string().contains("lock_not_available"),
-        "got: {err}"
-    );
+    assert!(err.to_string().contains("lock_not_available"), "got: {err}");
     ex.execute_with_session(a, "COMMIT").await.unwrap();
 }
 
@@ -368,9 +363,15 @@ async fn for_share_locks_the_rows_it_returns() {
 #[tokio::test]
 async fn unsupported_lock_shapes_are_refused_by_name() {
     let ex = test_executor();
-    ex.execute("CREATE TABLE lk (id INT PRIMARY KEY, v INT)").await.unwrap();
-    ex.execute("CREATE TABLE other_lk (id INT PRIMARY KEY, lk_id INT)").await.unwrap();
-    ex.execute("CREATE TABLE keyless (id INT, v INT)").await.unwrap();
+    ex.execute("CREATE TABLE lk (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    ex.execute("CREATE TABLE other_lk (id INT PRIMARY KEY, lk_id INT)")
+        .await
+        .unwrap();
+    ex.execute("CREATE TABLE keyless (id INT, v INT)")
+        .await
+        .unwrap();
 
     let join = ex
         .execute("SELECT lk.id FROM lk JOIN other_lk ON other_lk.lk_id = lk.id FOR UPDATE")
@@ -394,10 +395,7 @@ async fn unsupported_lock_shapes_are_refused_by_name() {
         .execute("SELECT v FROM lk GROUP BY v FOR UPDATE")
         .await
         .expect_err("FOR UPDATE with GROUP BY must be refused");
-    assert!(
-        grp.to_string().contains("GROUP BY"),
-        "got: {grp}"
-    );
+    assert!(grp.to_string().contains("GROUP BY"), "got: {grp}");
 
     let keyless = ex
         .execute("SELECT * FROM keyless FOR UPDATE")
@@ -422,10 +420,7 @@ async fn skip_locked_on_a_keyless_table_is_refused_not_ignored() {
         .execute("SELECT id FROM nok FOR UPDATE SKIP LOCKED")
         .await
         .expect_err("a keyless table cannot honour a row lock");
-    assert!(
-        err.to_string().contains("primary key"),
-        "got: {err}"
-    );
+    assert!(err.to_string().contains("primary key"), "got: {err}");
 }
 
 /// Plain FOR UPDATE on an ordinary keyed table is accepted and locks — kept
@@ -480,7 +475,11 @@ async fn a_bound_limit_parameter_limits() {
         exec(&ex, &format!("INSERT INTO lim VALUES ({i})")).await;
     }
 
-    exec(&ex, "PREPARE take(INT) AS SELECT id FROM lim ORDER BY id LIMIT $1").await;
+    exec(
+        &ex,
+        "PREPARE take(INT) AS SELECT id FROM lim ORDER BY id LIMIT $1",
+    )
+    .await;
     let res = exec(&ex, "EXECUTE take(3)").await;
     assert_eq!(
         rows(&res[0]).len(),
@@ -533,10 +532,7 @@ async fn a_non_integer_limit_parameter_errors() {
         .execute("SELECT id FROM lim2 LIMIT 'nope'")
         .await
         .expect_err("a non-integer literal LIMIT must fail too");
-    assert!(
-        err.to_string().contains("LIMIT"),
-        "got: {err}"
-    );
+    assert!(err.to_string().contains("LIMIT"), "got: {err}");
 }
 
 /// PostgreSQL accepts `LIMIT '5'` — an unknown-typed literal coerces to the

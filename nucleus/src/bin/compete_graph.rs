@@ -510,7 +510,12 @@ fn measure_sync_costs(dir: &std::path::Path) -> (f64, Option<f64>) {
         let t0 = Instant::now();
         // Not `File::sync_all`: on macOS that IS `F_FULLFSYNC`, so it cannot
         // measure the cheaper call. This is the raw syscall.
-        unsafe { libc::fsync(f.as_raw_fd()) };
+        // SAFETY: f owns this live descriptor for the duration of the call.
+        assert_eq!(
+            unsafe { libc::fsync(f.as_raw_fd()) },
+            0,
+            "fsync probe failed"
+        );
         plain.push(t0.elapsed());
     }
 
@@ -520,7 +525,12 @@ fn measure_sync_costs(dir: &std::path::Path) -> (f64, Option<f64>) {
         for _ in 0..n {
             f.write_all(&payload).expect("write sync probe");
             let t0 = Instant::now();
-            unsafe { libc::fcntl(f.as_raw_fd(), libc::F_FULLFSYNC) };
+            // SAFETY: f owns this live descriptor; F_FULLFSYNC takes no third argument.
+            assert_eq!(
+                unsafe { libc::fcntl(f.as_raw_fd(), libc::F_FULLFSYNC) },
+                0,
+                "F_FULLFSYNC probe failed"
+            );
             v.push(t0.elapsed());
         }
         v.sort();

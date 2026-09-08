@@ -711,8 +711,11 @@ impl NucleusConfig {
 
         // limits
         if let Ok(v) = env::var("NUCLEUS_LIMITS_MAX_ROW_LOCKS_PER_SESSION")
-            && let Some(n) =
-                parsed_env::<usize>(&mut warnings, "NUCLEUS_LIMITS_MAX_ROW_LOCKS_PER_SESSION", &v)
+            && let Some(n) = parsed_env::<usize>(
+                &mut warnings,
+                "NUCLEUS_LIMITS_MAX_ROW_LOCKS_PER_SESSION",
+                &v,
+            )
         {
             self.limits.max_row_locks_per_session = n;
         }

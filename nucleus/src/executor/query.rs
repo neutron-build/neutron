@@ -1212,7 +1212,9 @@ impl Executor {
         match &query.limit_clause {
             Some(ast::LimitClause::LimitOffset { limit, offset, .. }) => (
                 limit.as_ref().and_then(Self::plan_literal_to_usize),
-                offset.as_ref().and_then(|o| Self::plan_literal_to_usize(&o.value)),
+                offset
+                    .as_ref()
+                    .and_then(|o| Self::plan_literal_to_usize(&o.value)),
             ),
             _ => (None, None),
         }
@@ -6157,10 +6159,12 @@ impl Executor {
                             let limit_hint = limit_clause.as_ref().and_then(|lc| {
                                 let (l, o) = match lc {
                                     ast::LimitClause::LimitOffset { limit, offset, .. } => (
-                                        limit.as_ref().and_then(|e| self.expr_to_usize(e).ok().flatten()),
-                                        offset
+                                        limit
                                             .as_ref()
-                                            .and_then(|o| self.expr_to_usize(&o.value).ok().flatten()),
+                                            .and_then(|e| self.expr_to_usize(e).ok().flatten()),
+                                        offset.as_ref().and_then(|o| {
+                                            self.expr_to_usize(&o.value).ok().flatten()
+                                        }),
                                     ),
                                     ast::LimitClause::OffsetCommaLimit { offset, limit } => (
                                         self.expr_to_usize(limit).ok().flatten(),
@@ -6292,8 +6296,13 @@ impl Executor {
         Box::pin(async move {
             match body {
                 SetExpr::Select(select) => {
-                    self.execute_select_inner_with_ctes(&select, cte_tables, order_by_cols, row_locks)
-                        .await
+                    self.execute_select_inner_with_ctes(
+                        &select,
+                        cte_tables,
+                        order_by_cols,
+                        row_locks,
+                    )
+                    .await
                 }
                 SetExpr::SetOperation {
                     op,
@@ -6306,7 +6315,9 @@ impl Executor {
                     // A locking clause cannot sit on a set operation (rejected
                     // in `lock_context`), so the arms are never locking.
                     let left_result = self.execute_set_expr(*left, cte_tables, &[], false).await?;
-                    let right_result = self.execute_set_expr(*right, cte_tables, &[], false).await?;
+                    let right_result = self
+                        .execute_set_expr(*right, cte_tables, &[], false)
+                        .await?;
 
                     let (left_cols, left_rows) = self.select_result_to_rows(left_result)?;
                     let (right_cols, right_rows) = self.select_result_to_rows(right_result)?;

@@ -283,6 +283,7 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
                 _ => None,
             };
             match name.as_str() {
+                "MAKE_INTERVAL" | "PG_CATALOG.MAKE_INTERVAL" => DataType::Interval,
                 "COUNT" => DataType::Int64,
                 "AVG"
                     if matches!(

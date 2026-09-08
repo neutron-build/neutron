@@ -1678,10 +1678,10 @@ impl Executor {
                 // Check if we already have the result of this non-correlated subquery cached.
                 if !lockable
                     && let Some(cached) = self
-                    .uncorrelated_subquery_cache
-                    .read()
-                    .get(&cache_key)
-                    .cloned()
+                        .uncorrelated_subquery_cache
+                        .read()
+                        .get(&cache_key)
+                        .cloned()
                 {
                     return Ok(Self::in_three_valued(&val, &cached, *negated));
                 }

@@ -1469,10 +1469,7 @@ async fn cmd_start(cfg: StartConfig) {
     };
     let handler = if let Some(ref bootstrap_password) = resolved_password {
         executor.set_bootstrap_password(bootstrap_password).await;
-        Arc::new(
-            NucleusHandler::with_catalog_auth(executor.clone())
-                .with_wire_limits(wire_limits),
-        )
+        Arc::new(NucleusHandler::with_catalog_auth(executor.clone()).with_wire_limits(wire_limits))
     } else {
         Arc::new(NucleusHandler::new(executor.clone()).with_wire_limits(wire_limits))
     };

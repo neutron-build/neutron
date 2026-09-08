@@ -215,13 +215,13 @@ impl Default for KvStore {
 /// Drop-safe closer of the S63 collections tag bracket; see
 /// [`KvStore::collections_xact_guard`].
 pub struct CollectionsXactGuard<'a> {
-    store: &'a KvStore,
+    _store: &'a KvStore,
 }
 
 impl Drop for CollectionsXactGuard<'_> {
     fn drop(&mut self) {
         #[cfg(feature = "server")]
-        if let Some(wal) = self.store.collections.wal() {
+        if let Some(wal) = self._store.collections.wal() {
             wal.reset_xact_tag();
         }
     }
@@ -477,6 +477,8 @@ impl KvStore {
         xact: u64,
         apply_on_wal_error: bool,
     ) -> Result<(), std::io::Error> {
+        #[cfg(not(feature = "server"))]
+        let _ = (xact, apply_on_wal_error);
         #[cfg(feature = "server")]
         let _wal_op = self.wal_begin_op();
         #[cfg(feature = "server")]
@@ -549,6 +551,8 @@ impl KvStore {
         xact: u64,
         apply_on_wal_error: bool,
     ) -> Result<bool, std::io::Error> {
+        #[cfg(not(feature = "server"))]
+        let _ = (xact, apply_on_wal_error);
         #[cfg(feature = "server")]
         let _wal_op = self.wal_begin_op();
         #[cfg(feature = "server")]
@@ -2093,11 +2097,13 @@ impl KvStore {
     /// `collections_wal`'s header for why lifting also needs a race-free
     /// attribution design.
     pub fn collections_xact_guard(&self, xact: u64) -> CollectionsXactGuard<'_> {
+        #[cfg(not(feature = "server"))]
+        let _ = xact;
         #[cfg(feature = "server")]
         if let Some(wal) = self.collections.wal() {
             wal.set_xact_tag(xact);
         }
-        CollectionsXactGuard { store: self }
+        CollectionsXactGuard { _store: self }
     }
 
     /// Access the collections WAL (if any) — the second durable log this store

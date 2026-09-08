@@ -693,8 +693,7 @@ pub struct NucleusHandler {
     /// `limits.max_prepared_statements_per_session` /
     /// `limits.max_portals_per_session` against the otherwise-unbounded
     /// per-connection pgwire portal store. Removed in `cleanup_session`.
-    extended_query_counts:
-        parking_lot::Mutex<HashMap<String, ExtendedQueryCounts>>,
+    extended_query_counts: parking_lot::Mutex<HashMap<String, ExtendedQueryCounts>>,
 
     // ── LISTEN/NOTIFY ────────────────────────────────────────────────────
     /// Shared notification registry: channel → broadcast sender.
@@ -2189,7 +2188,10 @@ impl ExtendedQueryHandler for NucleusHandler {
             let mut counts = self.extended_query_counts.lock();
             let entry = counts.entry(peer).or_default();
             if is_new && entry.statements >= self.limits.max_prepared_statements_per_session {
-                let (held, limit) = (entry.statements, self.limits.max_prepared_statements_per_session);
+                let (held, limit) = (
+                    entry.statements,
+                    self.limits.max_prepared_statements_per_session,
+                );
                 drop(counts);
                 return Err(Self::too_many_extended_query_objects(
                     "prepared_statements",
@@ -2209,9 +2211,7 @@ impl ExtendedQueryHandler for NucleusHandler {
             .iter()
             .map(|oid| Type::from_oid(*oid))
             .collect::<Vec<_>>();
-        let statement = parser
-            .parse_sql(client, &message.query, &types)
-            .await?;
+        let statement = parser.parse_sql(client, &message.query, &types).await?;
         let stmt = StoredStatement::new(name.to_owned(), statement, types);
         client.portal_store().put_statement(Arc::new(stmt));
         client
@@ -2231,10 +2231,7 @@ impl ExtendedQueryHandler for NucleusHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         use pgwire::api::DEFAULT_NAME;
-        let portal_name = message
-            .portal_name
-            .as_deref()
-            .unwrap_or(DEFAULT_NAME);
+        let portal_name = message.portal_name.as_deref().unwrap_or(DEFAULT_NAME);
         if portal_name != DEFAULT_NAME {
             let peer = client.socket_addr().to_string();
             let store = client.portal_store();
@@ -2245,9 +2242,7 @@ impl ExtendedQueryHandler for NucleusHandler {
                 let (held, limit) = (entry.portals, self.limits.max_portals_per_session);
                 drop(counts);
                 return Err(Self::too_many_extended_query_objects(
-                    "portals",
-                    held,
-                    limit,
+                    "portals", held, limit,
                 ));
             }
             if is_new {
@@ -2292,7 +2287,9 @@ impl ExtendedQueryHandler for NucleusHandler {
                 let mut counts = self.extended_query_counts.lock();
                 if let Some(entry) = counts.get_mut(&peer) {
                     match message.target_type {
-                        TARGET_TYPE_BYTE_STATEMENT => entry.statements = entry.statements.saturating_sub(1),
+                        TARGET_TYPE_BYTE_STATEMENT => {
+                            entry.statements = entry.statements.saturating_sub(1)
+                        }
                         TARGET_TYPE_BYTE_PORTAL => entry.portals = entry.portals.saturating_sub(1),
                         _ => {}
                     }
@@ -7644,8 +7641,7 @@ mod security_tests {
         }
         fn set_transaction_status(&mut self, _: pgwire::messages::response::TransactionStatus) {}
         fn metadata(&self) -> &HashMap<String, String> {
-            static EMPTY: std::sync::OnceLock<HashMap<String, String>> =
-                std::sync::OnceLock::new();
+            static EMPTY: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
             EMPTY.get_or_init(HashMap::new)
         }
         fn metadata_mut(&mut self) -> &mut HashMap<String, String> {
@@ -7757,7 +7753,11 @@ mod security_tests {
             other => panic!("expected UserError, got {other:?}"),
         }
         assert_eq!(
-            handler.extended_query_counts.lock().get("127.0.0.1:55555").map(|c| c.statements),
+            handler
+                .extended_query_counts
+                .lock()
+                .get("127.0.0.1:55555")
+                .map(|c| c.statements),
             Some(4),
             "the count must sit at the cap, not past it"
         );
@@ -7812,7 +7812,13 @@ mod security_tests {
         let err = handler
             .on_bind(
                 &mut client,
-                Bind::new(Some("p3".to_string()), Some("s".to_string()), vec![], vec![], vec![]),
+                Bind::new(
+                    Some("p3".to_string()),
+                    Some("s".to_string()),
+                    vec![],
+                    vec![],
+                    vec![],
+                ),
             )
             .await
             .expect_err("the 4th distinct portal must be refused");
@@ -7825,7 +7831,10 @@ mod security_tests {
         }
         // Control: the unnamed portal is self-replacing and never counted.
         handler
-            .on_bind(&mut client, Bind::new(None, Some("s".to_string()), vec![], vec![], vec![]))
+            .on_bind(
+                &mut client,
+                Bind::new(None, Some("s".to_string()), vec![], vec![], vec![]),
+            )
             .await
             .expect("the unnamed portal is not counted");
         assert_eq!(
@@ -7864,7 +7873,11 @@ mod security_tests {
         handler.handle_listen("peer1", "ch3").unwrap();
         // And the receivers map sits at the cap, not past it.
         assert_eq!(
-            handler.notify_state.lock().get("peer1").map(|s| s.receivers.len()),
+            handler
+                .notify_state
+                .lock()
+                .get("peer1")
+                .map(|s| s.receivers.len()),
             Some(3)
         );
         // Teardown: connection state AND registry channels both clear.

@@ -646,11 +646,13 @@ mod row_lock_tests {
     async fn integer_widths_are_the_same_row() {
         let lm = RowLockManager::new();
         assert_eq!(
-            lm.try_lock(1, &("t".to_string(), vec![Value::Int32(7)])).unwrap(),
+            lm.try_lock(1, &("t".to_string(), vec![Value::Int32(7)]))
+                .unwrap(),
             RowTry::Acquired
         );
         assert_eq!(
-            lm.try_lock(2, &("t".to_string(), vec![Value::Int64(7)])).unwrap(),
+            lm.try_lock(2, &("t".to_string(), vec![Value::Int64(7)]))
+                .unwrap(),
             RowTry::HeldElsewhere,
             "Int32(7) and Int64(7) are the same primary key"
         );
@@ -662,11 +664,13 @@ mod row_lock_tests {
     async fn same_key_in_different_tables_is_a_different_row() {
         let lm = RowLockManager::new();
         assert_eq!(
-            lm.try_lock(1, &("a".to_string(), vec![Value::Int64(7)])).unwrap(),
+            lm.try_lock(1, &("a".to_string(), vec![Value::Int64(7)]))
+                .unwrap(),
             RowTry::Acquired
         );
         assert_eq!(
-            lm.try_lock(2, &("b".to_string(), vec![Value::Int64(7)])).unwrap(),
+            lm.try_lock(2, &("b".to_string(), vec![Value::Int64(7)]))
+                .unwrap(),
             RowTry::Acquired
         );
     }
@@ -750,11 +754,7 @@ mod row_lock_tests {
         assert_eq!(lm.try_lock(1, &key(1)).unwrap(), RowTry::Acquired);
         assert_eq!(lm.try_lock(1, &key(1)).unwrap(), RowTry::Acquired);
         assert_eq!(lm.try_lock(1, &key(2)).unwrap(), RowTry::Acquired);
-        assert_eq!(
-            lm.session_held_count(1),
-            2,
-            "re-locks must not add entries"
-        );
+        assert_eq!(lm.session_held_count(1), 2, "re-locks must not add entries");
     }
 
     /// A session at its limit is REFUSED, not skipped: `SKIP LOCKED` treats an
@@ -772,10 +772,7 @@ mod row_lock_tests {
         let err = lm
             .try_lock(1, &key(4))
             .expect_err("the 4th distinct row must be refused");
-        assert!(
-            err.to_string().contains("too_many_row_locks"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("too_many_row_locks"), "got: {err}");
         // Control: session 2 has its own budget.
         assert_eq!(lm.try_lock(2, &key(4)).unwrap(), RowTry::Acquired);
         // And the refused lock took no entry.
@@ -794,10 +791,7 @@ mod row_lock_tests {
             .lock(1, &key(2))
             .await
             .expect_err("a second distinct row must be refused");
-        assert!(
-            err.to_string().contains("too_many_row_locks"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("too_many_row_locks"), "got: {err}");
     }
 
     /// Release makes budget available again — the limit tracks held locks,

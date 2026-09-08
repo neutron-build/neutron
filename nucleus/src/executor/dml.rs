@@ -516,6 +516,22 @@ impl Executor {
                                     // Build combined row: [existing..., excluded(new)...]
                                     let mut combined_row = existing.clone();
                                     combined_row.extend(row.iter().cloned());
+                                    // A refused conflict update neither writes nor contributes a
+                                    // RETURNING row. In particular, an unexpired lease is not stolen.
+                                    if let Some(predicate) = &do_update.selection {
+                                        match self.eval_row_expr(
+                                            predicate,
+                                            &combined_row,
+                                            &augmented_meta,
+                                        )? {
+                                            Value::Bool(true) => {}
+                                            Value::Bool(false) | Value::Null => break,
+                                            _ => return Err(ExecError::Runtime(
+                                                "ON CONFLICT DO UPDATE WHERE requires a boolean"
+                                                    .into(),
+                                            )),
+                                        }
+                                    }
                                     for assign in &do_update.assignments {
                                         let col_name = match &assign.target {
                                             ast::AssignmentTarget::ColumnName(name) => {
@@ -796,9 +812,7 @@ impl Executor {
             }
         }
 
-        if let Some(items) = returning.as_ref()
-            && !returned_rows.is_empty()
-        {
+        if let Some(items) = returning.as_ref() {
             Ok(ExecResult::Select {
                 columns: Self::returning_result_columns(items, &col_meta),
                 rows: returned_rows,

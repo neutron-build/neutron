@@ -4,6 +4,165 @@
 
 use super::*;
 
+#[tokio::test]
+async fn make_interval_components_and_named_binding() {
+    let ex = test_executor();
+    for sql in [
+        "SELECT make_interval(1, 2, 3, 4, 5, 6, 7.25)",
+        "SELECT pg_catalog.make_interval(secs => 7.25, mins => 6, hours => 5, days => 4, weeks => 3, months => 2, years => 1)",
+        "SELECT make_interval(1, 2, weeks => 3, days => 4, hours => 5, mins => 6, secs => 7.25)",
+    ] {
+        let result = exec(&ex, sql).await;
+        assert_eq!(
+            scalar(&result[0]),
+            &Value::Interval {
+                months: 14,
+                days: 25,
+                microseconds: 18_367_250_000
+            }
+        );
+    }
+    for (sql, expected) in [
+        (
+            "SELECT make_interval()",
+            Value::Interval {
+                months: 0,
+                days: 0,
+                microseconds: 0,
+            },
+        ),
+        (
+            "SELECT make_interval(SECS => -1.25)",
+            Value::Interval {
+                months: 0,
+                days: 0,
+                microseconds: -1_250_000,
+            },
+        ),
+        (
+            "SELECT make_interval(secs => 0.0000005)",
+            Value::Interval {
+                months: 0,
+                days: 0,
+                microseconds: 0,
+            },
+        ),
+        (
+            "SELECT make_interval(secs => 0.0000015)",
+            Value::Interval {
+                months: 0,
+                days: 0,
+                microseconds: 2,
+            },
+        ),
+        ("SELECT make_interval(secs => NULL)", Value::Null),
+        (
+            "SELECT make_interval(days => '2', \"secs\" => '-0.0000015')",
+            Value::Interval {
+                months: 0,
+                days: 2,
+                microseconds: -2,
+            },
+        ),
+    ] {
+        assert_eq!(scalar(&exec(&ex, sql).await[0]), &expected, "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn make_interval_rejects_invalid_binding_and_overflow() {
+    let ex = test_executor();
+    for sql in [
+        "SELECT make_interval(secs => 1, secs => 2)",
+        "SELECT make_interval(1, years => 2)",
+        "SELECT make_interval(secs => 1, 2)",
+        "SELECT make_interval(seconds => 1)",
+        "SELECT make_interval(secs := 1)",
+        "SELECT make_interval(\"SECS\" => 1)",
+        "SELECT make_interval(secs => NULL, bogus => 1)",
+        "SELECT make_interval(1,2,3,4,5,6,7,8)",
+        "SELECT make_interval(*)",
+        "SELECT make_interval(DISTINCT 1)",
+        "SELECT make_interval(years => 1.5)",
+        "SELECT make_interval(secs => true)",
+        "SELECT make_interval(years => 2147483647)",
+        "SELECT make_interval(weeks => 2147483647)",
+        "SELECT make_interval(hours => 2147483647, secs => 9000000000000)",
+        "SELECT make_interval(secs => 'NaN')",
+        "SELECT make_interval(secs => 'Infinity')",
+        "SELECT make_interval(secs => 9223372036854.776)",
+        "SELECT make_interval(secs => -9223372036855)",
+        "SELECT abs(secs => 1)",
+    ] {
+        assert!(ex.execute(sql).await.is_err(), "accepted {sql}");
+    }
+}
+
+#[tokio::test]
+async fn make_interval_prepared_lease_and_rollback() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE interval_lease (id INT PRIMARY KEY, expires_at TIMESTAMP)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO interval_lease VALUES (1, TIMESTAMP '2026-01-01')",
+    )
+    .await;
+    exec(&ex, "PREPARE renew_interval(INT) AS UPDATE interval_lease SET expires_at = TIMESTAMP '2026-01-01' + make_interval(secs => $1) WHERE id = 1 RETURNING expires_at").await;
+    exec(&ex, "BEGIN").await;
+    let result = exec(&ex, "EXECUTE renew_interval(30)").await;
+    assert_eq!(
+        scalar(&result[0]),
+        &Value::Timestamp(crate::types::parse_timestamp("2026-01-01 00:00:30").unwrap())
+    );
+    exec(&ex, "ROLLBACK").await;
+    let result = exec(&ex, "SELECT expires_at FROM interval_lease").await;
+    assert_eq!(
+        scalar(&result[0]),
+        &Value::Timestamp(crate::types::parse_timestamp("2026-01-01 00:00:00").unwrap())
+    );
+}
+
+#[tokio::test]
+async fn make_interval_conflict_lease_predicate() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE conditional_lease (key TEXT PRIMARY KEY, token TEXT, expires_at TIMESTAMPTZ)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO conditional_lease VALUES ('key', 'a', now() + make_interval(secs => 30))",
+    )
+    .await;
+    for predicate in ["conditional_lease.expires_at <= now()", "false", "NULL"] {
+        let result = exec(&ex, &format!("INSERT INTO conditional_lease VALUES ('key', 'b', now() + make_interval(secs => 30)) ON CONFLICT (key) DO UPDATE SET token = EXCLUDED.token WHERE {predicate} RETURNING token")).await;
+        assert!(rows(&result[0]).is_empty(), "{predicate}");
+        assert_eq!(
+            scalar(&exec(&ex, "SELECT token FROM conditional_lease").await[0]),
+            &Value::Text("a".into())
+        );
+    }
+    for predicate in ["1", "1 / 0 = 0", "missing_column = 1"] {
+        assert!(ex.execute(&format!("INSERT INTO conditional_lease VALUES ('key', 'b', now() + make_interval(secs => 30)) ON CONFLICT (key) DO UPDATE SET token = EXCLUDED.token WHERE {predicate} RETURNING token")).await.is_err(), "accepted {predicate}");
+        assert_eq!(
+            scalar(&exec(&ex, "SELECT token FROM conditional_lease").await[0]),
+            &Value::Text("a".into())
+        );
+    }
+    exec(
+        &ex,
+        "UPDATE conditional_lease SET expires_at = now() - make_interval(secs => 1)",
+    )
+    .await;
+    let result = exec(&ex, "INSERT INTO conditional_lease VALUES ('key', 'b', now() + make_interval(secs => 30)) ON CONFLICT (key) DO UPDATE SET token = EXCLUDED.token, expires_at = EXCLUDED.expires_at WHERE conditional_lease.expires_at <= now() AND EXCLUDED.token = 'b' RETURNING token").await;
+    assert_eq!(scalar(&result[0]), &Value::Text("b".into()));
+}
+
 // ======================================================================
 // Scalar function tests
 // ======================================================================

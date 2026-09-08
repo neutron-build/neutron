@@ -126,6 +126,9 @@ impl Executor {
             )));
         }
 
+        if matches!(fname, "MAKE_INTERVAL" | "PG_CATALOG.MAKE_INTERVAL") {
+            return self.eval_make_interval(func, row, col_meta);
+        }
         let args = self.extract_fn_args(func, row, col_meta)?;
 
         // SECURITY ORDERING: strip the schema qualifier BEFORE any policy check
@@ -6786,6 +6789,125 @@ impl Executor {
             // the "never NULL" contract the caller indexes against.
             _ => Ok(Value::Array(Vec::new())),
         }
+    }
+
+    fn eval_make_interval(
+        &self,
+        func: &ast::Function,
+        row: &Row,
+        col_meta: &[ColMeta],
+    ) -> Result<Value, ExecError> {
+        let invalid =
+            || ExecError::Unsupported("make_interval: invalid arguments or modifiers".into());
+        let overflow = || ExecError::Runtime("make_interval: interval out of range".into());
+        let ast::FunctionArguments::List(list) = &func.args else {
+            return Err(invalid());
+        };
+        if !matches!(func.parameters, ast::FunctionArguments::None)
+            || func.filter.is_some()
+            || func.over.is_some()
+            || func.null_treatment.is_some()
+            || !func.within_group.is_empty()
+            || list.duplicate_treatment.is_some()
+            || !list.clauses.is_empty()
+            || list.args.len() > 7
+        {
+            return Err(invalid());
+        }
+        let names = ["years", "months", "weeks", "days", "hours", "mins", "secs"];
+        let mut expressions = [None; 7];
+        let mut named = false;
+        // Validate the entire binding before evaluating anything, including NULLs.
+        for (position, arg) in list.args.iter().enumerate() {
+            let (index, expr) = match arg {
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) if !named => {
+                    (position, expr)
+                }
+                ast::FunctionArg::Named {
+                    name,
+                    arg: ast::FunctionArgExpr::Expr(expr),
+                    operator:
+                        ast::FunctionArgOperator::RightArrow | ast::FunctionArgOperator::Assignment,
+                }
+                | ast::FunctionArg::ExprNamed {
+                    name: ast::Expr::Identifier(name),
+                    arg: ast::FunctionArgExpr::Expr(expr),
+                    operator:
+                        ast::FunctionArgOperator::RightArrow | ast::FunctionArgOperator::Assignment,
+                } => {
+                    named = true;
+                    let normalized = if name.quote_style.is_some() {
+                        name.value.clone()
+                    } else {
+                        name.value.to_ascii_lowercase()
+                    };
+                    let index = names
+                        .iter()
+                        .position(|n| *n == normalized)
+                        .ok_or_else(invalid)?;
+                    (index, expr)
+                }
+                _ => return Err(invalid()),
+            };
+            if expressions[index].replace(expr).is_some() {
+                return Err(invalid());
+            }
+        }
+        let mut integers = [0i32; 6];
+        let mut seconds = 0.0f64;
+        let mut null = false;
+        for (index, expr) in expressions.into_iter().enumerate() {
+            let Some(expr) = expr else { continue };
+            let value = self.eval_row_expr(expr, row, col_meta)?;
+            if matches!(value, Value::Null) {
+                null = true;
+                continue;
+            }
+            if index == 6 {
+                seconds = match value {
+                    Value::Int32(n) => f64::from(n),
+                    Value::Int64(n) => n as f64,
+                    Value::Float64(n) => n,
+                    Value::Numeric(n) => n.to_string().parse().map_err(|_| overflow())?,
+                    Value::Text(n) => n.parse().map_err(|_| invalid())?,
+                    _ => return Err(invalid()),
+                };
+            } else {
+                integers[index] = match value {
+                    Value::Int32(n) => n,
+                    Value::Int64(n) => i32::try_from(n).map_err(|_| overflow())?,
+                    Value::Text(n) => n.parse().map_err(|_| invalid())?,
+                    _ => return Err(invalid()),
+                };
+            }
+        }
+        if null {
+            return Ok(Value::Null);
+        }
+        let [years, months, weeks, days, hours, mins] = integers;
+        let months = years
+            .checked_mul(12)
+            .and_then(|n| n.checked_add(months))
+            .ok_or_else(overflow)?;
+        let days = weeks
+            .checked_mul(7)
+            .and_then(|n| n.checked_add(days))
+            .ok_or_else(overflow)?;
+        // PostgreSQL rounds float8 seconds to the nearest microsecond, ties to even.
+        let micros = (seconds * 1_000_000.0).round_ties_even();
+        if !micros.is_finite() || micros < i64::MIN as f64 || micros >= -(i64::MIN as f64) {
+            return Err(overflow());
+        }
+        let microseconds = i64::from(hours)
+            .checked_mul(3_600_000_000)
+            .and_then(|n| n.checked_add(i64::from(mins) * 60_000_000))
+            .and_then(|n| n.checked_add(micros as i64))
+            .ok_or_else(overflow)?;
+        Ok(Value::Interval {
+            months,
+            days,
+            microseconds,
+        })
     }
 
     pub(super) fn extract_fn_args(

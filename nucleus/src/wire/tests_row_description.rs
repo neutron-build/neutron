@@ -221,9 +221,11 @@ async fn describe_matches_the_rows_it_precedes() {
     // `id` is the PRIMARY KEY: the FOR UPDATE shape in SHAPES is now honoured
     // as a real row lock, and a keyless table is refused ("no identity to
     // lock with") rather than silently returning unlocked rows.
-    let setup =
-        simple_query(&mut client, "CREATE TABLE rd_t (id INT PRIMARY KEY, label TEXT, n INT)")
-            .await;
+    let setup = simple_query(
+        &mut client,
+        "CREATE TABLE rd_t (id INT PRIMARY KEY, label TEXT, n INT)",
+    )
+    .await;
     assert!(setup.errors.is_empty(), "setup: {:?}", setup.errors);
     for i in 0..5 {
         let r = simple_query(

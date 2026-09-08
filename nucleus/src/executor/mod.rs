@@ -148,8 +148,8 @@ pub mod param_subst;
 mod policy;
 mod project;
 mod query;
-mod row_locks;
 pub(crate) mod row_batch;
+mod row_locks;
 mod scalar_fns;
 mod scan_stream;
 mod schema_types;
@@ -1289,9 +1289,10 @@ impl Executor {
 
             // CDC log: WAL-backed crash-recovery. Opened before the XactId
             // floor is taken so its tagged records can feed the seed (S63).
-            let mut cdc_floor = 0u64;
+            #[cfg(not(feature = "server"))]
+            let cdc_floor = 0u64;
             #[cfg(feature = "server")]
-            {
+            let cdc_floor = {
                 let cdc_dir = dir.join("cdc");
                 std::fs::create_dir_all(&cdc_dir).ok();
                 if let Some((wal, state)) = Self::open_durable(
@@ -1305,9 +1306,9 @@ impl Executor {
                     let rebuilt = crate::reactive::cdc_wal::rebuild_cdc_log(&state);
                     *exec.cdc_log.write() = rebuilt;
                     exec.cdc_wal = Some(wal);
-                    cdc_floor = exec.cdc_wal.as_ref().map_or(0, |w| w.max_xact_id());
                 }
-            }
+                exec.cdc_wal.as_ref().map_or(0, |w| w.max_xact_id())
+            };
 
             // Streams: WAL-backed crash-recovery. The committed set comes
             // from storage recovery, which ran before this executor was
@@ -2772,6 +2773,9 @@ impl Executor {
         // The address of a local approximates the current stack pointer.
         let probe = 0u8;
         let sp = &probe as *const u8 as usize;
+        // SAFETY: pthread_self identifies this live thread. All output pointers
+        // refer to aligned local storage; stack addresses are never dereferenced.
+        // A successfully initialized attribute object is destroyed on every path.
         unsafe {
             #[cfg(target_os = "macos")]
             {
@@ -2787,7 +2791,9 @@ impl Executor {
                 }
                 let mut base = std::ptr::null_mut();
                 let mut size = 0usize;
-                if libc::pthread_attr_getstack(&attr, &mut base, &mut size) != 0 {
+                let result = libc::pthread_attr_getstack(&attr, &mut base, &mut size);
+                libc::pthread_attr_destroy(&mut attr);
+                if result != 0 {
                     return None;
                 }
                 Some(sp.saturating_sub(base as usize))
@@ -2907,7 +2913,8 @@ impl Executor {
             self.ast_cache = parking_lot::RwLock::new(AstCache::new(ast));
         }
         if prepared > 0 {
-            self.global_prepared_cache = parking_lot::RwLock::new(GlobalPreparedCache::new(prepared));
+            self.global_prepared_cache =
+                parking_lot::RwLock::new(GlobalPreparedCache::new(prepared));
         }
         self
     }
@@ -6752,9 +6759,7 @@ impl Executor {
                 // streamed query bypasses the materialized cache. Non-wire
                 // consumers collapse it at the materialization boundary.
                 #[cfg(feature = "server")]
-                if !has_row_locks
-                    && let Some(stream) = self.try_streaming_scan(&query).await?
-                {
+                if !has_row_locks && let Some(stream) = self.try_streaming_scan(&query).await? {
                     return Ok(stream);
                 }
 
@@ -6764,8 +6769,7 @@ impl Executor {
                 // would return MemoryExceeded. Falls through (None) for every
                 // shape it does not handle, and never engages without a limit.
                 #[cfg(feature = "server")]
-                if !has_row_locks
-                    && let Some(stream) = self.try_streaming_aggregate(&query).await?
+                if !has_row_locks && let Some(stream) = self.try_streaming_aggregate(&query).await?
                 {
                     return Ok(stream);
                 }
@@ -6775,9 +6779,7 @@ impl Executor {
                 // so a large SELECT DISTINCT completes under a budget. Falls
                 // through (None) for every shape it does not handle.
                 #[cfg(feature = "server")]
-                if !has_row_locks
-                    && let Some(stream) = self.try_streaming_distinct(&query).await?
-                {
+                if !has_row_locks && let Some(stream) = self.try_streaming_distinct(&query).await? {
                     return Ok(stream);
                 }
 
@@ -6787,9 +6789,7 @@ impl Executor {
                 // materialized hash-join build would return MemoryExceeded. Falls
                 // through (None) for every shape it does not handle.
                 #[cfg(feature = "server")]
-                if !has_row_locks
-                    && let Some(stream) = self.try_streaming_join(&query).await?
-                {
+                if !has_row_locks && let Some(stream) = self.try_streaming_join(&query).await? {
                     return Ok(stream);
                 }
 

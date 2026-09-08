@@ -209,6 +209,7 @@ impl Executor {
     /// arbitrary. A version column that does not resolve is left as-is rather
     /// than dropped: `merge_replacing` now refuses to collapse on a version it
     /// cannot read, which is the safe answer.
+    #[cfg(feature = "server")]
     fn positional_strategy(
         strategy: &crate::columnar::MergeStrategy,
         def: &TableDef,

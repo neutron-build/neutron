@@ -128,7 +128,7 @@ impl Default for Config {
 #[cfg(unix)]
 fn peak_rss_bytes() -> u64 {
     // SAFETY: `getrusage` writes a plain POD struct through the pointer; the
-    // zeroed value is a valid `rusage` and the call cannot fail for RUSAGE_SELF.
+    // zeroed value is a valid `rusage`; output is consumed only on success.
     unsafe {
         let mut usage: libc::rusage = std::mem::zeroed();
         if libc::getrusage(libc::RUSAGE_SELF, &mut usage) != 0 {

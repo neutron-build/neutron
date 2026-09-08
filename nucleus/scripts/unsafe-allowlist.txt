@@ -20,6 +20,15 @@ src/storage/wal.rs
 # `libc::statvfs` FFI for the free-space watermark guard.
 src/ops/disk.rs
 
+# Live-thread pthread stack bounds; local outputs, no stack-pointer dereference,
+# and successful pthread attribute initialization paired with destruction.
+src/executor/mod.rs
+
+# Benchmark FFI: owned live fd for fsync/F_FULLFSYNC (errors checked), and
+# getrusage into aligned local POD storage (output read only on success).
+src/bin/compete_graph.rs
+src/bin/compete_vector.rs
+
 # Misc reviewed call sites.
 src/executor/session.rs
 src/config/mod.rs

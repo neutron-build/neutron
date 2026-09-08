@@ -46,7 +46,10 @@ async fn prepare_churn_past_the_cap_is_refused_not_silent() {
         .execute("PREPARE p3 AS SELECT 3")
         .await
         .expect_err("the 4th distinct name must be refused");
-    assert!(err.to_string().contains("too_many_prepared_statements"), "got: {err}");
+    assert!(
+        err.to_string().contains("too_many_prepared_statements"),
+        "got: {err}"
+    );
     assert_eq!(sqlstate_of(&err), "54000");
 
     // Control: replacing an existing name is not growth.
@@ -69,7 +72,8 @@ async fn prepare_churn_past_the_cap_is_refused_not_silent() {
 fn prepared_statement_defaults_are_sane() {
     let ex = test_executor();
     assert_eq!(
-        ex.max_prepared_stmts_per_session.load(std::sync::atomic::Ordering::Relaxed),
+        ex.max_prepared_stmts_per_session
+            .load(std::sync::atomic::Ordering::Relaxed),
         crate::executor::DEFAULT_MAX_PREPARED_STMTS
     );
 }
@@ -137,7 +141,10 @@ async fn a_pathological_locking_session_is_cut_off_at_its_budget() {
         .unwrap_or_else(|e| panic!("lock {i} is within budget: {e}"));
     }
     let err = ex
-        .execute_with_session(hog, "SELECT id FROM jobs WHERE id = 6 FOR UPDATE SKIP LOCKED")
+        .execute_with_session(
+            hog,
+            "SELECT id FROM jobs WHERE id = 6 FOR UPDATE SKIP LOCKED",
+        )
         .await
         .expect_err("the 6th distinct row must be refused");
     assert!(err.to_string().contains("too_many_row_locks"), "got: {err}");
@@ -146,9 +153,12 @@ async fn a_pathological_locking_session_is_cut_off_at_its_budget() {
     // Control: a second session has its own budget — the cap is per session,
     // not a global ceiling.
     let other = ex.create_session();
-    ex.execute_with_session(other, "SELECT id FROM jobs WHERE id = 6 FOR UPDATE SKIP LOCKED")
-        .await
-        .expect("another session's budget is untouched");
+    ex.execute_with_session(
+        other,
+        "SELECT id FROM jobs WHERE id = 6 FOR UPDATE SKIP LOCKED",
+    )
+    .await
+    .expect("another session's budget is untouched");
 
     // The transaction's held set sits at the bound.
     assert_eq!(ex.row_locks.session_held_count(hog), 5);
@@ -190,10 +200,14 @@ async fn teardown_of_a_session_at_its_lock_budget_empties_the_table() {
     assert_eq!(ex.row_locks.held_count(), 6);
     // Refused past the budget on a REAL row — a claim matching zero rows
     // takes no locks and must keep succeeding.
-    assert!(ex
-        .execute_with_session(gone, "SELECT id FROM jobs WHERE id = 7 FOR UPDATE SKIP LOCKED")
+    assert!(
+        ex.execute_with_session(
+            gone,
+            "SELECT id FROM jobs WHERE id = 7 FOR UPDATE SKIP LOCKED"
+        )
         .await
-        .is_err());
+        .is_err()
+    );
     exec(&ex, "SELECT 1").await; // control: engine still serving
 
     // Drop without COMMIT: the disconnect path.
@@ -267,7 +281,10 @@ fn plan_cache_eviction_picks_the_least_accessed_victim() {
     cache.get("hot");
     // Overflow — the victim must be `cold`.
     cache.insert("newcomer".into(), plan());
-    assert!(cache.get("cold").is_none(), "the coldest entry is the victim");
+    assert!(
+        cache.get("cold").is_none(),
+        "the coldest entry is the victim"
+    );
     assert!(cache.get("warm").is_some());
     assert!(cache.get("hot").is_some());
     assert!(cache.get("newcomer").is_some());
