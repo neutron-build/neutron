@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/neutron-build/neutron/mail"
@@ -53,7 +54,7 @@ func dialIMAP(ctx context.Context, cred mail.Credential) (mail.Adapter, func(), 
 	conn, err := imap.Dial(ctx, imap.Config{
 		Host:        cred.Host,
 		Port:        cred.Port,
-		Username:    cred.Email,
+		Username:    imapUser(cred),
 		Password:    cred.Password,
 		AccessToken: cred.AccessToken,
 		Timeout:     30 * time.Second,
@@ -108,6 +109,13 @@ func bearerClient(token string) *http.Client {
 type bearerTransport struct {
 	token string
 	base  http.RoundTripper
+}
+
+func imapUser(cred mail.Credential) string {
+	if u := strings.TrimSpace(cred.Username); u != "" {
+		return u
+	}
+	return cred.Email
 }
 
 func (t bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {

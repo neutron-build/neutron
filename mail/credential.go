@@ -31,6 +31,10 @@ type Credential struct {
 	// Password is an app password, for IMAP without OAuth.
 	Password string
 
+	// Username is the IMAP/JMAP login when it differs from Email.
+	// Empty means Email.
+	Username string
+
 	// Host and Port address an IMAP or JMAP server. Unused for Gmail and
 	// Graph, whose endpoints are fixed.
 	Host string
