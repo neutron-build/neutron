@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron-go/nucleus"
 )
 
 // Defaults for the lease machinery. A claim is only valid for `defaultLease`;

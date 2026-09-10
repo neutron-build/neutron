@@ -95,7 +95,7 @@ var goModTmpl = `module {{.Module}}
 go 1.22
 
 require (
-	github.com/neutron-dev/neutron-go v0.1.0
+	github.com/neutron-build/neutron-go v0.1.0
 )
 `
 
@@ -106,8 +106,8 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/neutron-dev/neutron-go/neutron"
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron-go/neutron"
+	"github.com/neutron-build/neutron-go/nucleus"
 
 	"{{.Module}}/internal/handler"
 )
@@ -157,7 +157,7 @@ var healthHandlerTmpl = `package handler
 import (
 	"context"
 
-	"github.com/neutron-dev/neutron-go/neutron"
+	"github.com/neutron-build/neutron-go/neutron"
 )
 
 type HealthResponse struct {

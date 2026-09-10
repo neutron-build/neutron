@@ -18,10 +18,10 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/neutron-dev/neutron-go/neutron"
-	"github.com/neutron-dev/neutron-go/neutronauth"
-	"github.com/neutron-dev/neutron-go/neutronrealtime"
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron-go/neutron"
+	"github.com/neutron-build/neutron-go/neutronauth"
+	"github.com/neutron-build/neutron-go/neutronrealtime"
+	"github.com/neutron-build/neutron-go/nucleus"
 )
 
 type Message struct {

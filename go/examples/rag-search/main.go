@@ -19,9 +19,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/neutron"
-	"github.com/neutron-dev/neutron-go/neutroncache"
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron-go/neutron"
+	"github.com/neutron-build/neutron-go/neutroncache"
+	"github.com/neutron-build/neutron-go/nucleus"
 )
 
 // --- Models ---

@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron-go/nucleus"
 )
 
 // NucleusStream returns an SSE stream function that bridges Nucleus

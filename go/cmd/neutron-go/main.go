@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/neutron-dev/neutron-go/neutroncli"
+	"github.com/neutron-build/neutron-go/neutroncli"
 )
 
 func main() {

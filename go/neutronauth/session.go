@@ -13,8 +13,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/neutron"
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron-go/neutron"
+	"github.com/neutron-build/neutron-go/nucleus"
 )
 
 // SessionStore is the interface for session backends.

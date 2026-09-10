@@ -3,7 +3,7 @@ package neutronauth
 import (
 	"net/http"
 
-	"github.com/neutron-dev/neutron-go/neutron"
+	"github.com/neutron-build/neutron-go/neutron"
 )
 
 // RequireRole returns middleware that ensures the authenticated user has

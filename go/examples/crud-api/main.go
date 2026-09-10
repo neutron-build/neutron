@@ -17,8 +17,8 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/neutron-dev/neutron-go/neutron"
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron-go/neutron"
+	"github.com/neutron-build/neutron-go/nucleus"
 )
 
 // --- Models ---

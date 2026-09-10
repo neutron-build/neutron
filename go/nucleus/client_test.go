@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/neutron-dev/neutron-go/neutron"
+	"github.com/neutron-build/neutron-go/neutron"
 )
 
 func TestIsValidIdentifierExtended(t *testing.T) {

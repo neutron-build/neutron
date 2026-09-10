@@ -12,7 +12,7 @@ import (
 
 // frameworkPkg is this package's import path, used to walk past framework
 // frames when attributing a route registration to application code.
-const frameworkPkg = "github.com/neutron-dev/neutron-go/neutron."
+const frameworkPkg = "github.com/neutron-build/neutron-go/neutron."
 
 // callerSite names the application line that registered a route.
 //
