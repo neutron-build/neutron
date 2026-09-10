@@ -40,8 +40,9 @@ Gmail / Graph / IMAP / JMAP     mail lives here
 | `graph/` | Microsoft Graph, delta queries |
 | `cmd/neutron-mail/` | The service binary |
 
-The TypeScript client and agent tools live in
-`typescript/packages/neutron-mail` (`@neutron-build/mail`).
+The TypeScript client and agent tools live in the monorepo at
+`typescript/packages/neutron-mail` (`@neutron-build/mail`) — not part of this
+module's tree when it is vendored (see VENDOR.md downstream).
 
 ## The two ideas worth knowing
 
@@ -111,8 +112,9 @@ test would have found that.
 
 ## Status
 
-169 Go tests and 16 TypeScript tests, all passing, including the live oracle
-against GreenMail and the store suite against a real Nucleus.
+The module's Go tests pass, including the live oracle against GreenMail and
+the store suite against a real Nucleus (counts move with every change; CI is
+the source of truth).
 
 **Gmail and Graph have never been run against live servers.** They are written
 against the documented APIs and unit-tested over their normalization logic,
@@ -129,7 +131,7 @@ recency, which is the right default for mail anyway.
 
 One caveat worth knowing: Nucleus's English stemmer currently stems singular
 and plural forms of many nouns differently, so searching "folder" will not find
-"folders". See `docs/ADOPTION_FINDINGS.md`, A-014.
+"folders". See `docs/ADOPTION_FINDINGS.md` A-014 in the monorepo.
 
 ## Before serving Gmail users
 
