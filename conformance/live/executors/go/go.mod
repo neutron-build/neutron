@@ -2,7 +2,7 @@ module github.com/neutron-dev/neutron-live-conformance-go
 
 go 1.24.0
 
-require github.com/neutron-build/neutron-go v0.0.0
+require github.com/neutron-build/neutron/go v0.0.0
 
 require (
 	github.com/gabriel-vasile/mimetype v1.4.12 // indirect
@@ -20,4 +20,4 @@ require (
 	golang.org/x/text v0.32.0 // indirect
 )
 
-replace github.com/neutron-build/neutron-go => ../../../../go
+replace github.com/neutron-build/neutron/go => ../../../../go

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/neutron-build/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // TieredCache provides L1 (in-memory LRU) + L2 (Nucleus KV) caching.

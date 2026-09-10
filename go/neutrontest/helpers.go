@@ -8,7 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/neutron-build/neutron-go/neutron"
+	"github.com/neutron-build/neutron/go/neutron"
 )
 
 // NewTestApp creates a test Neutron app and httptest.Server.

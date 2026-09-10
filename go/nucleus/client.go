@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/neutron-build/neutron-go/neutron"
+	"github.com/neutron-build/neutron/go/neutron"
 )
 
 // identifierRe validates SQL identifiers (table names, column names).

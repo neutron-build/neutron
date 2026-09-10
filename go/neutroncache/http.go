@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/neutron-build/neutron-go/neutron"
+	"github.com/neutron-build/neutron/go/neutron"
 )
 
 // HTTPCacheOption configures HTTPCache.

@@ -3,7 +3,7 @@
 > Standalone, phase-by-phase engineering plan to take the Neutron Go framework
 > from a strong-but-broken-at-the-edges state to genuinely best-in-class.
 > Every citation below was verified against the tree at the time of writing.
-> Module: `github.com/neutron-build/neutron-go`, `go 1.24.0` (so
+> Module: `github.com/neutron-build/neutron/go`, `go 1.24.0` (so
 > `http.ResponseController`, Go 1.22+ method-pattern `ServeMux`, and generics
 > are all available).
 

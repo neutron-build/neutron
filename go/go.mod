@@ -1,4 +1,4 @@
-module github.com/neutron-build/neutron-go
+module github.com/neutron-build/neutron/go
 
 go 1.24.0
 

@@ -2,10 +2,10 @@
 
 Go SDK for the Neutron ecosystem — an HTTP application framework and a Nucleus
 database client covering all 14 data models, in one Go module:
-`github.com/neutron-build/neutron-go` (Go 1.24+).
+`github.com/neutron-build/neutron/go` (Go 1.24+).
 
 ```bash
-go get github.com/neutron-build/neutron-go
+go get github.com/neutron-build/neutron/go
 ```
 
 ## Packages
@@ -85,6 +85,6 @@ document described a multi-module layout (`nucleus-go/kv`, `nucleus-go/vector`,
 ...), an API that was never built (`ParseConfig`, `kv.New`, `CollectRows`), "9
 data models", and ended with "Status: Planned — not yet implemented" — for an
 SDK that now ships 447 tests and a CI workflow. Found by the S97 claims audit.
-The module path is `github.com/neutron-build/neutron-go` (the `neutron-dev`
+The module path is `github.com/neutron-build/neutron/go` (the `neutron-dev`
 path never existed as a GitHub org; the design doc used
 `github.com/neutron-build/nucleus-go`).*

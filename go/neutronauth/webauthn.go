@@ -13,7 +13,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/neutron-build/neutron-go/neutron"
+	"github.com/neutron-build/neutron/go/neutron"
 )
 
 // ---------------------------------------------------------------------------

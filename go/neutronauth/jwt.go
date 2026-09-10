@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/neutron-build/neutron-go/neutron"
+	"github.com/neutron-build/neutron/go/neutron"
 )
 
 // jwtHeader is the fixed header for HS256 JWTs.

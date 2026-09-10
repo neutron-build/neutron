@@ -1,7 +1,7 @@
 // Go executor for the Nucleus live data-model conformance spec.
 //
 // Reads ../../spec.json, runs every case against a live engine through the real
-// in-repo Go client (github.com/neutron-build/neutron-go/nucleus), and prints one
+// in-repo Go client (github.com/neutron-build/neutron/go/nucleus), and prints one
 // JSON result document to stdout. It asserts nothing a mock could assert: only
 // that a call reaches the engine, is accepted over the wire, and comes back with
 // the right value.
@@ -35,7 +35,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/neutron-build/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // tsBase is the instant the spec's time-series millisecond offsets are measured

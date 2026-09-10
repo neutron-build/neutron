@@ -11,7 +11,7 @@ import (
 	"net/url"
 	"sync"
 
-	"github.com/neutron-build/neutron-go/neutron"
+	"github.com/neutron-build/neutron/go/neutron"
 )
 
 // WebSocketConn abstracts a WebSocket connection. Implement this interface

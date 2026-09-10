@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"sort"
 
-	"github.com/neutron-build/neutron-go/neutron"
+	"github.com/neutron-build/neutron/go/neutron"
 )
 
 // maxRequestBody bounds an inbound JSON-RPC message. Tool arguments are small;
