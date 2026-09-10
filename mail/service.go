@@ -109,7 +109,7 @@ func (s *Service) send(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	messageID, err := sender.Send(r.Context(), msg)
+	messageID, _, err := sender.Send(r.Context(), msg)
 	if err != nil {
 		writeError(w, err)
 		return

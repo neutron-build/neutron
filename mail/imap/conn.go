@@ -147,6 +147,78 @@ func (c *Conn) Close() error {
 	return c.raw.Close()
 }
 
+// Append files a literal message into a mailbox, marked \Seen.
+//
+// APPEND is the only write that needs no selected mailbox, which is what
+// makes it the natural way to archive an outgoing message into Sent right
+// after SMTP submission. The literal uses the synchronising form — the
+// server confirms with a continuation before any message bytes cross the
+// wire — so a server that intends to refuse answers before the payload is
+// sent. A refusal can also arrive in place of the continuation as a tagged
+// NO/BAD; both shapes are handled.
+func (c *Conn) Append(ctx context.Context, mailbox string, message []byte) error {
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = c.raw.SetDeadline(deadline)
+		defer c.raw.SetDeadline(time.Time{})
+	}
+
+	tag := c.nextTag()
+	cmd := tag + " " + fmt.Sprintf("APPEND %s (\\Seen) {%d}", quote(mailbox), len(message)) + "\r\n"
+	if _, err := c.raw.Write([]byte(cmd)); err != nil {
+		return fmt.Errorf("imap: write: %w", err)
+	}
+
+	for {
+		toks, err := c.dec.readResponse()
+		if err != nil {
+			return fmt.Errorf("imap: read: %w", err)
+		}
+		if len(toks) == 0 {
+			continue
+		}
+		if toks[0].kind == tokenAtom && toks[0].text == tag {
+			// A tagged line here is the server refusing without asking
+			// for the literal.
+			if len(toks) < 2 {
+				return fmt.Errorf("imap: malformed completion: %v", toks)
+			}
+			if toks[1].atomEq("OK") {
+				return nil
+			}
+			return c.commandError(toks)
+		}
+		if toks[0].kind == tokenAtom && toks[0].text == "+" {
+			break
+		}
+	}
+
+	wire := make([]byte, len(message)+2)
+	copy(wire, message)
+	wire[len(message)], wire[len(message)+1] = '\r', '\n'
+	if _, err := c.raw.Write(wire); err != nil {
+		return fmt.Errorf("imap: write literal: %w", err)
+	}
+
+	for {
+		toks, err := c.dec.readResponse()
+		if err != nil {
+			return fmt.Errorf("imap: read: %w", err)
+		}
+		if len(toks) == 0 {
+			continue
+		}
+		if toks[0].kind == tokenAtom && toks[0].text == tag {
+			if len(toks) < 2 {
+				return fmt.Errorf("imap: malformed completion: %v", toks)
+			}
+			if toks[1].atomEq("OK") {
+				return nil
+			}
+			return c.commandError(toks)
+		}
+	}
+}
+
 // Supports reports whether the server advertised a capability.
 func (c *Conn) Supports(cap string) bool {
 	c.mu.Lock()

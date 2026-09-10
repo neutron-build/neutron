@@ -632,6 +632,12 @@ func (a *Adapter) SelectMailbox(ctx context.Context, box mail.MailboxID) error {
 	return err
 }
 
+// Append implements mail.Appender: the literal is written to the provider's
+// copy of the mailbox and picked up by the next sync like any other message.
+func (a *Adapter) Append(ctx context.Context, box mail.MailboxID, message []byte) error {
+	return a.conn.Append(ctx, a.native(box), message)
+}
+
 // uidFor resolves a canonical identity back to a UID in the selected mailbox.
 func (a *Adapter) uidFor(ctx context.Context, id mail.MessageID) (uint32, error) {
 	if loc, ok := a.locations[id]; ok {
@@ -757,3 +763,5 @@ func encodeXOAuth2(user, token string) string {
 }
 
 var _ mail.Adapter = (*Adapter)(nil)
+var _ mail.Appender = (*Adapter)(nil)
+var _ mail.MailboxSelector = (*Adapter)(nil)

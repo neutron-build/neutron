@@ -108,19 +108,21 @@ func ReplyTo(parent *Envelope, from Address, text string) *Outgoing {
 	}
 }
 
-// Send submits the message.
-func (s *Sender) Send(ctx context.Context, msg *Outgoing) (messageID string, err error) {
+// Send submits the message and returns its Message-ID along with the exact
+// RFC 5322 bytes that crossed the wire, so a caller can archive the sent copy
+// verbatim through an adapter that implements Appender.
+func (s *Sender) Send(ctx context.Context, msg *Outgoing) (messageID string, raw []byte, err error) {
 	if msg.From.Email == "" {
-		return "", fmt.Errorf("mail: outgoing message has no sender")
+		return "", nil, fmt.Errorf("mail: outgoing message has no sender")
 	}
 	if len(msg.To)+len(msg.Cc)+len(msg.Bcc) == 0 {
-		return "", fmt.Errorf("mail: outgoing message has no recipients")
+		return "", nil, fmt.Errorf("mail: outgoing message has no recipients")
 	}
 
 	messageID = newMessageID(msg.From.Email)
 	body, err := msg.render(messageID)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	// Bcc recipients receive the message but must not appear in the
@@ -139,9 +141,9 @@ func (s *Sender) Send(ctx context.Context, msg *Outgoing) (messageID string, err
 	}
 
 	if err := smtp.SendMail(addr, auth, msg.From.Email, rcpts, body); err != nil {
-		return "", fmt.Errorf("mail: send: %w", err)
+		return "", nil, fmt.Errorf("mail: send: %w", err)
 	}
-	return messageID, nil
+	return messageID, body, nil
 }
 
 // Render builds the complete RFC 5322 bytes for this message with a freshly

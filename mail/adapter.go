@@ -156,6 +156,19 @@ type MailboxSelector interface {
 	SelectMailbox(ctx context.Context, box MailboxID) error
 }
 
+// Appender is implemented by adapters that can file a complete RFC 5322
+// message into a mailbox at the provider.
+//
+// It exists for outgoing mail: SMTP submission is fire-and-forget, so the
+// copy that lands in Sent is a separate write of the exact bytes the sender
+// submitted. Providers whose send APIs already keep a copy — Gmail and Graph —
+// do not implement it; appending there would duplicate the sent message.
+type Appender interface {
+	// Append stores message in box, marked read. It needs no mailbox
+	// selected and uses no message identity: the literal is the identity.
+	Append(ctx context.Context, box MailboxID, message []byte) error
+}
+
 // Errors that the sync engine treats specially. Adapters should wrap these
 // rather than inventing equivalents, because the engine's recovery path
 // branches on them.

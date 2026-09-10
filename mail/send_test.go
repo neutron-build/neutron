@@ -211,12 +211,12 @@ func TestSendRejectsIncompleteMessages(t *testing.T) {
 	s := NewSender(SMTPConfig{Host: "localhost"})
 
 	noSender := &Outgoing{To: []Address{{Email: "b@x.com"}}, Text: "hi"}
-	if _, err := s.Send(t.Context(), noSender); err == nil {
+	if _, _, err := s.Send(t.Context(), noSender); err == nil {
 		t.Error("a message with no sender was accepted")
 	}
 
 	noRecipients := &Outgoing{From: Address{Email: "a@x.com"}, Text: "hi"}
-	if _, err := s.Send(t.Context(), noRecipients); err == nil {
+	if _, _, err := s.Send(t.Context(), noRecipients); err == nil {
 		t.Error("a message with no recipients was accepted")
 	}
 }
