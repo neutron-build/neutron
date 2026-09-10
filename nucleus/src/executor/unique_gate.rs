@@ -332,6 +332,38 @@ impl super::Executor {
                 slots.push(slot);
             }
         }
+
+        // `CREATE UNIQUE INDEX` puts its uniqueness in an IndexDef, not a
+        // TableConstraint, so those slots are enumerated separately — same
+        // opt-outs, same reason: the check enforces them, so the gate must
+        // serialize them or two sessions can pass the same check concurrently.
+        // Slot ids live in the same `usize` space as the constraint ids above;
+        // offsetting past `constraints.len()` keeps a unique index from sharing
+        // a slot id with an unrelated constraint. Ids are per-table, so the
+        // offset only has to be unique within this table's enumeration.
+        if let Some(indexes) = self.catalog.get_indexes_cached(table_name) {
+            for (iid, index) in indexes.iter().enumerate() {
+                if !index.unique {
+                    continue;
+                }
+                let indices: Vec<usize> = index
+                    .columns
+                    .iter()
+                    .filter_map(|c| table_def.column_index(c))
+                    .collect();
+                if indices.len() != index.columns.len() {
+                    continue;
+                }
+                let key: Vec<Value> = indices
+                    .iter()
+                    .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                    .collect();
+                let cid = table_def.constraints.len() + iid;
+                if let Some(slot) = UniqueGate::slot(table_name, cid, &key) {
+                    slots.push(slot);
+                }
+            }
+        }
         slots
     }
 

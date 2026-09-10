@@ -633,6 +633,7 @@ impl Executor {
         let started = std::time::Instant::now();
         let mut rebuilt = 0usize;
         let mut failed = 0usize;
+        let mut unique_rebuilt = 0usize;
         for table in self.catalog.table_names().await {
             let Some(table_def) = self.catalog.get_table(&table).await else {
                 continue;
@@ -659,6 +660,16 @@ impl Executor {
                     Ok(()) => {
                         self.btree_indexes
                             .insert((table.clone(), column.clone()), index.name.clone());
+                        // The UNIQUE flag rides in the catalog's IndexDef, which
+                        // catalog.json already restored before this ran — so
+                        // `check_unique_constraints` sees it without any action
+                        // here. Counting it separately is not decoration: it is
+                        // the assertion that a reopened UNIQUE index is still
+                        // enforcing, which was silently untrue when nothing read
+                        // `IndexDef::unique` back at all.
+                        if index.unique {
+                            unique_rebuilt += 1;
+                        }
                         rebuilt += 1;
                     }
                     Err(e) => {
@@ -678,7 +689,7 @@ impl Executor {
         if rebuilt > 0 || failed > 0 {
             tracing::info!(
                 target: "nucleus::startup",
-                "rebuilt {rebuilt} storage index(es) in {:.1}s ({failed} failed)",
+                "rebuilt {rebuilt} storage index(es) in {:.1}s ({unique_rebuilt} unique, {failed} failed)",
                 started.elapsed().as_secs_f64()
             );
         }
@@ -2222,6 +2233,39 @@ impl Executor {
                      column to key documents on; the `col @@ 'query'` operator \
                      still works without an index"
                 )));
+            }
+        }
+
+        // A UNIQUE index declared over a table that ALREADY has rows must be
+        // checked against those rows before anything is registered — otherwise
+        // the index is created "successfully" while blessing duplicates that
+        // every later write is then (correctly) refused for, an inconsistent
+        // state no DML can repair. `IF NOT EXISTS` short-circuited above, so
+        // reaching here means the index is genuinely new.
+        if create_index.unique {
+            let indices: Vec<usize> = columns
+                .iter()
+                .filter_map(|col_name| table_def.column_index(col_name))
+                .collect();
+            if indices.len() == columns.len() {
+                use std::collections::HashSet;
+                let mut seen: HashSet<Vec<Value>> = HashSet::new();
+                for row in self.storage_for(&table_name).scan(&table_name).await? {
+                    // SQL UNIQUE allows repeated NULLs; only non-NULL keys conflict.
+                    let key: Vec<Value> =
+                        indices.iter().map(|&i| row.get(i).cloned().unwrap_or(Value::Null)).collect();
+                    if key.iter().any(|v| matches!(v, Value::Null)) {
+                        continue;
+                    }
+                    if !seen.insert(key.clone()) {
+                        let col_names = columns.join(", ");
+                        return Err(ExecError::ConstraintViolation(format!(
+                            "could not create unique index \"{}\" on table \"{table_name}\": \
+                             duplicate key value violates unique constraint on ({col_names})",
+                            index_name
+                        )));
+                    }
+                }
             }
         }
 
@@ -3889,6 +3933,29 @@ impl Executor {
                         // Drop any backing index that matches the constraint name.
                         if let Err(_e) = self.catalog.drop_index(&constraint_name).await {
                             // Index may not exist (e.g., CHECK constraints have no backing index).
+                        }
+                        // …and the IMPLICIT one, which is not named after the
+                        // constraint: `create_implicit_unique_indexes` names a
+                        // PK's index `<table>_pkey` and a UNIQUE constraint's
+                        // `<table>_<cols>_key`, ignoring the constraint's own
+                        // name. Dropping only the constraint-named index left
+                        // that implicit index registered — harmless while
+                        // nothing read `IndexDef::unique` back, but now that
+                        // unique indexes are enforced it kept enforcing a
+                        // constraint the user had just dropped.
+                        if let Some(columns) = &removed_unique_columns {
+                            let implicit = implicit_unique_index_names(
+                                &table_name,
+                                std::slice::from_ref(columns),
+                            );
+                            for index_name in implicit {
+                                let _ = self.catalog.drop_index(&index_name).await;
+                                self.btree_indexes.retain(|_, name| name != &index_name);
+                                let _ = self
+                                    .storage_for(&table_name)
+                                    .drop_index(&index_name)
+                                    .await;
+                            }
                         }
                         self.btree_indexes
                             .retain(|_, name| name != &constraint_name);

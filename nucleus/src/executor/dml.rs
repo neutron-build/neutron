@@ -658,26 +658,16 @@ impl Executor {
             // can't see another txn's uncommitted row); otherwise use the fast
             // batch path. ReplacingMergeTree-style tables keep multiple versions per
             // key, so they opt out of unique enforcement (see check_unique_constraints).
+            // Constraint-derived AND unique-index-derived sets, so a
+            // `CREATE UNIQUE INDEX` is enforced as strongly as a UNIQUE
+            // constraint here too. ReplacingMergeTree-style tables keep
+            // multiple versions per key and opt out entirely (see
+            // `check_unique_constraints`).
             let unique_col_sets: Vec<Vec<usize>> =
                 if crate::columnar::replacing_config(&table_name).is_some() {
                     Vec::new()
                 } else {
-                    use crate::catalog::TableConstraint;
-                    table_def
-                        .constraints
-                        .iter()
-                        .filter_map(|c| match c {
-                            TableConstraint::PrimaryKey { columns, .. }
-                            | TableConstraint::Unique { columns, .. } => {
-                                let idxs: Vec<usize> = columns
-                                    .iter()
-                                    .filter_map(|n| table_def.column_index(n))
-                                    .collect();
-                                (idxs.len() == columns.len()).then_some(idxs)
-                            }
-                            _ => None,
-                        })
-                        .collect()
+                    self.unique_column_sets(&table_name, &table_def).await
                 };
             // Keys duplicated *within* this statement are invisible to the
             // per-row `check_unique_constraints` above: the earlier rows are
@@ -955,6 +945,62 @@ impl Executor {
         }
     }
 
+    /// Column-index sets that must hold unique values in `table`: one per
+    /// PRIMARY KEY / UNIQUE **constraint**, plus one per `CREATE UNIQUE INDEX`
+    /// whose uniqueness lives in the `IndexDef` rather than a constraint.
+    ///
+    /// Every enforcement surface derives its sets from here so they cannot
+    /// drift: the per-row snapshot check (`check_unique_constraints`), the
+    /// within-statement duplicate pass, and the engine-atomic
+    /// `insert_unique` / `update_unique` key sets.
+    pub(super) async fn unique_column_sets(
+        &self,
+        table_name: &str,
+        table_def: &TableDef,
+    ) -> Vec<Vec<usize>> {
+        use crate::catalog::TableConstraint;
+
+        let mut sets: Vec<Vec<usize>> = Vec::new();
+        for constraint in &table_def.constraints {
+            let columns = match constraint {
+                TableConstraint::PrimaryKey { columns, .. }
+                | TableConstraint::Unique { columns, .. } => columns,
+                _ => continue,
+            };
+            let indices: Vec<usize> = columns
+                .iter()
+                .filter_map(|col_name| table_def.column_index(col_name))
+                .collect();
+            if indices.len() == columns.len() {
+                sets.push(indices);
+            }
+        }
+
+        // A `CREATE UNIQUE INDEX` carries its uniqueness in the IndexDef, not in
+        // a TableConstraint, so enumerating constraints alone leaves such an
+        // index unenforced — a duplicate insert under it was accepted. Include
+        // those sets too. (A constraint-backed unique index is skipped: the
+        // constraint already contributed the same set above, and duplicating it
+        // would only re-check — and re-report — the same key.)
+        for index in self.catalog.get_indexes(table_name).await {
+            if !index.unique {
+                continue;
+            }
+            let indices: Vec<usize> = index
+                .columns
+                .iter()
+                .filter_map(|col_name| table_def.column_index(col_name))
+                .collect();
+            if indices.len() != index.columns.len() {
+                continue;
+            }
+            if !sets.contains(&indices) {
+                sets.push(indices);
+            }
+        }
+        sets
+    }
+
     /// Check UNIQUE and PRIMARY KEY constraints for a row.
     /// `skip_row_idx` is used during UPDATE to skip the row being updated.
     pub(super) async fn check_unique_constraints(
@@ -964,8 +1010,6 @@ impl Executor {
         new_row: &Row,
         skip_row_idx: Option<usize>,
     ) -> Result<(), ExecError> {
-        use crate::catalog::TableConstraint;
-
         // ReplacingMergeTree (and friends) intentionally keep multiple physical
         // rows per PK and collapse them to one at read time by version column.
         // Enforcing PK/UNIQUE on insert would reject every version after the
@@ -980,23 +1024,7 @@ impl Executor {
             return Ok(());
         }
 
-        let mut unique_col_sets: Vec<Vec<usize>> = Vec::new();
-
-        for constraint in &table_def.constraints {
-            match constraint {
-                TableConstraint::PrimaryKey { columns, .. }
-                | TableConstraint::Unique { columns, .. } => {
-                    let indices: Vec<usize> = columns
-                        .iter()
-                        .filter_map(|col_name| table_def.column_index(col_name))
-                        .collect();
-                    if indices.len() == columns.len() {
-                        unique_col_sets.push(indices);
-                    }
-                }
-                _ => {}
-            }
-        }
+        let unique_col_sets = self.unique_column_sets(table_name, table_def).await;
 
         if unique_col_sets.is_empty() {
             return Ok(());
@@ -2549,24 +2577,8 @@ impl Executor {
             })
             .collect();
         let count = if check_unique && !updates.is_empty() {
-            let unique_col_sets: Vec<Vec<usize>> = {
-                use crate::catalog::TableConstraint;
-                table_def
-                    .constraints
-                    .iter()
-                    .filter_map(|c| match c {
-                        TableConstraint::PrimaryKey { columns, .. }
-                        | TableConstraint::Unique { columns, .. } => {
-                            let idxs: Vec<usize> = columns
-                                .iter()
-                                .filter_map(|n| table_def.column_index(n))
-                                .collect();
-                            (idxs.len() == columns.len()).then_some(idxs)
-                        }
-                        _ => None,
-                    })
-                    .collect()
-            };
+            let unique_col_sets: Vec<Vec<usize>> =
+                self.unique_column_sets(&table_name, &table_def).await;
             // Same read-modify-write retry as the plain path. This branch is
             // taken when the statement changes a PRIMARY KEY or UNIQUE column,
             // and it lost writes the same way: a concurrent session changing a
