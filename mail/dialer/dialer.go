@@ -86,7 +86,7 @@ func dialGmail(ctx context.Context, cred mail.Credential) (mail.Adapter, func(),
 	// The token arrives already refreshed by the caller, so a fixed bearer
 	// is correct: this adapter must never attempt a refresh, having neither
 	// a refresh token nor a client secret.
-	ad, err := gmail.New(ctx, option.WithHTTPClient(bearerClient(cred.AccessToken)))
+	ad, err := gmail.New(ctx, option.WithHTTPClient(bearerClient(cred.AccessToken, "www.googleapis.com")))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -94,20 +94,32 @@ func dialGmail(ctx context.Context, cred mail.Credential) (mail.Adapter, func(),
 }
 
 func dialGraph(cred mail.Credential) (mail.Adapter, func(), error) {
-	ad := graph.New(bearerClient(cred.AccessToken))
+	ad := graph.New(bearerClient(cred.AccessToken, "graph.microsoft.com"))
 	return ad, func() { _ = ad.Close() }, nil
 }
 
 // bearerClient returns an HTTP client that attaches a fixed bearer token.
-func bearerClient(token string) *http.Client {
+//
+// The credential is bound to the explicitly allowed HTTPS hosts: the
+// transport attaches the Authorization header only when the request URL is
+// https and its host is permitted, so a redirect that leaves the provider
+// origin — including an HTTPS-to-HTTP downgrade — receives no token even
+// though http.Client replays each redirect hop through this transport
+// (audit neutron-16).
+func bearerClient(token string, allowedHosts ...string) *http.Client {
+	allowed := make(map[string]bool, len(allowedHosts))
+	for _, h := range allowedHosts {
+		allowed[strings.ToLower(h)] = true
+	}
 	return &http.Client{
 		Timeout:   60 * time.Second,
-		Transport: bearerTransport{token: token, base: http.DefaultTransport},
+		Transport: bearerTransport{token: token, hosts: allowed, base: http.DefaultTransport},
 	}
 }
 
 type bearerTransport struct {
 	token string
+	hosts map[string]bool
 	base  http.RoundTripper
 }
 
@@ -122,6 +134,10 @@ func (t bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	// Cloned rather than mutated: a RoundTripper must not modify the
 	// request it is handed.
 	clone := r.Clone(r.Context())
-	clone.Header.Set("Authorization", "Bearer "+t.token)
+	if r.URL.Scheme == "https" && t.hosts[strings.ToLower(r.URL.Hostname())] {
+		clone.Header.Set("Authorization", "Bearer "+t.token)
+	} else {
+		clone.Header.Del("Authorization")
+	}
 	return t.base.RoundTrip(clone)
 }
