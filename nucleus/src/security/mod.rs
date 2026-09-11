@@ -145,6 +145,31 @@ fn compare_cells(left: &str, right: &str) -> std::cmp::Ordering {
     left.cmp(right)
 }
 
+/// SQL three-valued logic for predicate evaluation.
+///
+/// A NULL column is ABSENT from the row map, so a comparison against it is
+/// UNKNOWN, not FALSE. The distinction is invisible to a direct comparison
+/// (both deny) but decisive under `NOT`: `NOT (col = 'x')` where col IS NULL
+/// is UNKNOWN and must never grant, while a boolean negation would turn the
+/// deny into a grant. Evaluation is therefore tri-state internally, and the
+/// public `evaluate` admits only `True`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriState {
+    True,
+    False,
+    Unknown,
+}
+
+impl From<bool> for TriState {
+    fn from(b: bool) -> Self {
+        if b {
+            TriState::True
+        } else {
+            TriState::False
+        }
+    }
+}
+
 /// A predicate that can be evaluated against a row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RlsPredicate {
@@ -365,39 +390,73 @@ impl RlsPredicate {
     }
 
     /// Evaluate the predicate against a row (column_name → value map) and session context.
+    ///
+    /// Admits only a definite True; False and Unknown both deny (SQL's rule
+    /// that unknown never grants). See [`TriState`] for why the internal
+    /// evaluation is tri-state rather than boolean.
     pub fn evaluate(&self, row: &HashMap<String, String>, ctx: &SessionContext) -> bool {
+        matches!(self.eval3(row, ctx), TriState::True)
+    }
+
+    /// Three-valued evaluation of the predicate.
+    fn eval3(&self, row: &HashMap<String, String>, ctx: &SessionContext) -> TriState {
+        // A NULL column is ABSENT from the map, so `get` yields None and every
+        // comparison below is Unknown. That is SQL's rule — a comparison with
+        // NULL is unknown, and unknown never grants — so a row whose guarded
+        // column is NULL is withheld rather than leaked, including under NOT.
         match self {
-            RlsPredicate::ColumnEqStr { column, value, .. } => row.get(column) == Some(value),
-            RlsPredicate::ColumnEqTenant { column, .. } => {
-                if let Some(tenant) = &ctx.tenant_id {
-                    row.get(column) == Some(tenant)
-                } else {
-                    false
-                }
-            }
-            RlsPredicate::ColumnEqUser { column, .. } => row.get(column) == Some(&ctx.user),
-            // A NULL column is ABSENT from the map, so `get` yields None and
-            // every comparison below denies. That is SQL's rule — a comparison
-            // with NULL is unknown, and unknown never grants — and it is the
-            // fail-closed direction, so a row whose guarded column is NULL is
-            // withheld rather than leaked.
+            RlsPredicate::ColumnEqStr { column, value, .. } => match row.get(column) {
+                Some(cell) => (cell == value).into(),
+                None => TriState::Unknown,
+            },
+            RlsPredicate::ColumnEqTenant { column, .. } => match &ctx.tenant_id {
+                // No tenant in the session makes the right-hand side NULL:
+                // the comparison is Unknown, which still never grants.
+                Some(tenant) => match row.get(column) {
+                    Some(cell) => (cell == tenant).into(),
+                    None => TriState::Unknown,
+                },
+                None => TriState::Unknown,
+            },
+            RlsPredicate::ColumnEqUser { column, .. } => match row.get(column) {
+                Some(cell) => (cell == &ctx.user).into(),
+                None => TriState::Unknown,
+            },
             RlsPredicate::ColumnCmp {
                 column, op, value, ..
-            } => row
-                .get(column)
-                .is_some_and(|cell| op.admits(compare_cells(cell, value))),
-            RlsPredicate::ColumnInList { column, values, .. } => row
-                .get(column)
-                .is_some_and(|cell| values.iter().any(|candidate| candidate == cell)),
+            } => match row.get(column) {
+                Some(cell) => op.admits(compare_cells(cell, value)).into(),
+                None => TriState::Unknown,
+            },
+            RlsPredicate::ColumnInList { column, values, .. } => match row.get(column) {
+                Some(cell) => values.iter().any(|candidate| candidate == cell).into(),
+                None => TriState::Unknown,
+            },
+            // IS NULL / IS NOT NULL are definite: NULL never makes them unknown.
             RlsPredicate::ColumnIsNull {
                 column, negated, ..
-            } => row.contains_key(column) == *negated,
-            RlsPredicate::HasRole { role } => ctx.has_role(role),
-            RlsPredicate::And(a, b) => a.evaluate(row, ctx) && b.evaluate(row, ctx),
-            RlsPredicate::Or(a, b) => a.evaluate(row, ctx) || b.evaluate(row, ctx),
-            RlsPredicate::Not(p) => !p.evaluate(row, ctx),
-            RlsPredicate::AlwaysTrue => true,
-            RlsPredicate::AlwaysFalse => false,
+            } => (row.contains_key(column) == *negated).into(),
+            RlsPredicate::HasRole { role } => ctx.has_role(role).into(),
+            // SQL AND: False dominates, else Unknown if any leg is Unknown.
+            RlsPredicate::And(a, b) => match (a.eval3(row, ctx), b.eval3(row, ctx)) {
+                (TriState::False, _) | (_, TriState::False) => TriState::False,
+                (TriState::Unknown, _) | (_, TriState::Unknown) => TriState::Unknown,
+                _ => TriState::True,
+            },
+            // SQL OR: True dominates, else Unknown if any leg is Unknown.
+            RlsPredicate::Or(a, b) => match (a.eval3(row, ctx), b.eval3(row, ctx)) {
+                (TriState::True, _) | (_, TriState::True) => TriState::True,
+                (TriState::Unknown, _) | (_, TriState::Unknown) => TriState::Unknown,
+                _ => TriState::False,
+            },
+            // NOT UNKNOWN is UNKNOWN — never a grant.
+            RlsPredicate::Not(p) => match p.eval3(row, ctx) {
+                TriState::True => TriState::False,
+                TriState::False => TriState::True,
+                TriState::Unknown => TriState::Unknown,
+            },
+            RlsPredicate::AlwaysTrue => TriState::True,
+            RlsPredicate::AlwaysFalse => TriState::False,
         }
     }
 }
@@ -1535,6 +1594,153 @@ mod tests {
         };
         assert!(text_cmp.evaluate(&make_row(&[("region", "eu")]), &ctx));
         assert!(!text_cmp.evaluate(&make_row(&[("region", "us")]), &ctx));
+    }
+
+    /// NOT over a NULL-guarded column must never grant: `NOT (col = 'x')`
+    /// where col IS NULL is UNKNOWN under SQL three-valued logic, not TRUE.
+    /// A boolean negation of the deny turned it into a grant.
+    #[test]
+    fn not_never_turns_a_null_comparison_into_a_grant() {
+        let ctx = SessionContext::new("u");
+        let null_row = make_row(&[("id", "1")]);
+
+        let not_eq = RlsPredicate::Not(Box::new(RlsPredicate::ColumnEqStr {
+            column: "region".into(),
+            value: "eu".into(),
+            column_id: 0,
+        }));
+        assert!(
+            !not_eq.evaluate(&null_row, &ctx),
+            "NOT (region = 'eu') with region NULL is UNKNOWN and must not grant"
+        );
+        // A non-NULL leg keeps working: 'us' <> 'eu' admits.
+        assert!(not_eq.evaluate(&make_row(&[("region", "us")]), &ctx));
+        assert!(!not_eq.evaluate(&make_row(&[("region", "eu")]), &ctx));
+
+        for op in [CmpOp::Lt, CmpOp::LtEq, CmpOp::Gt, CmpOp::GtEq, CmpOp::NotEq] {
+            let not_cmp = RlsPredicate::Not(Box::new(RlsPredicate::ColumnCmp {
+                column: "amount".into(),
+                op,
+                value: "100".into(),
+                column_id: 0,
+            }));
+            assert!(
+                !not_cmp.evaluate(&null_row, &ctx),
+                "NOT ({op:?} 100) with amount NULL must not grant"
+            );
+        }
+
+        let not_in_list = RlsPredicate::Not(Box::new(RlsPredicate::ColumnInList {
+            column: "amount".into(),
+            values: vec!["1".into(), "2".into()],
+            column_id: 0,
+        }));
+        assert!(
+            !not_in_list.evaluate(&null_row, &ctx),
+            "NOT (amount IN (...)) with amount NULL must not grant"
+        );
+
+        // End to end through the engine: a permissive policy written as NOT
+        // must not open the table's NULL rows.
+        let mut engine = RlsEngine::new();
+        engine.enable_rls("docs");
+        engine.add_policy(RlsPolicy {
+            name: "not_eu".into(),
+            table: "docs".into(),
+            command: PolicyCommand::Select,
+            target_roles: vec![],
+            predicate: not_eq,
+            check_predicate: None,
+            permissive: true,
+        });
+        assert!(
+            !engine.check_row("docs", PolicyCommand::Select, &null_row, &ctx),
+            "a NOT policy must withhold a row whose guarded column is NULL"
+        );
+        assert!(engine.check_row(
+            "docs",
+            PolicyCommand::Select,
+            &make_row(&[("region", "us")]),
+            &ctx
+        ));
+    }
+
+    /// AND/OR with a NULL leg: AND stays denied (Unknown with a True leg),
+    /// OR grants on a definite True leg, and both remain denied when the
+    /// NULL leg is the only hope.
+    #[test]
+    fn and_or_compose_null_legs_as_unknown() {
+        let ctx = SessionContext::new("u");
+        let owner_alice = RlsPredicate::ColumnEqStr {
+            column: "owner".into(),
+            value: "alice".into(),
+            column_id: 0,
+        };
+        let amount_over = RlsPredicate::ColumnCmp {
+            column: "amount".into(),
+            op: CmpOp::Gt,
+            value: "100".into(),
+            column_id: 0,
+        };
+
+        // owner = 'alice' AND amount > 100, amount NULL → Unknown → deny.
+        let and = RlsPredicate::And(Box::new(owner_alice.clone()), Box::new(amount_over.clone()));
+        assert!(and.evaluate(&make_row(&[("owner", "alice"), ("amount", "200")]), &ctx));
+        assert!(
+            !and.evaluate(&make_row(&[("owner", "alice")]), &ctx),
+            "AND with a NULL leg is UNKNOWN and must not grant"
+        );
+        // A definite False still dominates a NULL leg.
+        assert!(
+            !and.evaluate(&make_row(&[("owner", "bob"), ("amount", "200")]), &ctx),
+            "a False leg must deny regardless of the other leg"
+        );
+
+        // owner = 'alice' OR amount > 100: a True leg grants even when the
+        // other is NULL; a False leg with a NULL leg stays denied.
+        let or = RlsPredicate::Or(Box::new(owner_alice), Box::new(amount_over));
+        assert!(or.evaluate(&make_row(&[("owner", "alice")]), &ctx));
+        assert!(
+            !or.evaluate(&make_row(&[("owner", "bob")]), &ctx),
+            "False OR Unknown is UNKNOWN and must not grant"
+        );
+
+        // A WITH CHECK over a NULL column keeps denying through the engine.
+        let mut engine = RlsEngine::new();
+        engine.enable_rls("orders");
+        engine.add_policy(RlsPolicy {
+            name: "owner_and_amount".into(),
+            table: "orders".into(),
+            command: PolicyCommand::Insert,
+            target_roles: vec![],
+            predicate: RlsPredicate::AlwaysFalse,
+            check_predicate: Some(RlsPredicate::Or(
+                Box::new(RlsPredicate::ColumnEqUser {
+                    column: "owner".into(),
+                    column_id: 0,
+                }),
+                Box::new(RlsPredicate::ColumnEqTenant {
+                    column: "tenant".into(),
+                    column_id: 0,
+                }),
+            )),
+            permissive: true,
+        });
+        // owner matches the user, tenant is NULL in the row → True OR Unknown
+        // = True, so this candidate row is admitted.
+        assert!(engine.check_new_row(
+            "orders",
+            PolicyCommand::Insert,
+            &make_row(&[("owner", "u")]),
+            &ctx
+        ));
+        // Neither leg definite, tenant column NULL → Unknown → denied.
+        assert!(!engine.check_new_row(
+            "orders",
+            PolicyCommand::Insert,
+            &make_row(&[("owner", "other")]),
+            &ctx
+        ));
     }
 
     #[test]
