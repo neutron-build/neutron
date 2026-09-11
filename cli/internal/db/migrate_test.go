@@ -237,6 +237,72 @@ func TestCreateMigrationFilesCreatesDir(t *testing.T) {
 	}
 }
 
+// After a gap in the sequence (001, 003), the next version must be 004, not
+// 003 again — the old len(files)+1 allocation re-used the gap and silently
+// overwrote the existing pair.
+func TestCreateMigrationFilesSkipsGaps(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "001_first.up.sql"), []byte("up1"), 0644)
+	os.WriteFile(filepath.Join(dir, "001_first.down.sql"), []byte("down1"), 0644)
+	os.WriteFile(filepath.Join(dir, "003_third.up.sql"), []byte("up3"), 0644)
+	os.WriteFile(filepath.Join(dir, "003_third.down.sql"), []byte("down3"), 0644)
+
+	upPath, downPath, err := CreateMigrationFiles(dir, "fourth")
+	if err != nil {
+		t.Fatalf("CreateMigrationFiles() error: %v", err)
+	}
+
+	if !strings.Contains(upPath, "004_fourth.up.sql") {
+		t.Errorf("upPath = %q, want version 004 (max existing + 1)", upPath)
+	}
+	if !strings.Contains(downPath, "004_fourth.down.sql") {
+		t.Errorf("downPath = %q, want version 004 (max existing + 1)", downPath)
+	}
+
+	// The existing 003 pair must be untouched
+	third, err := os.ReadFile(filepath.Join(dir, "003_third.up.sql"))
+	if err != nil || string(third) != "up3" {
+		t.Errorf("003 up file was modified: content = %q, err = %v", third, err)
+	}
+}
+
+func TestCreateMigrationFilesIgnoresNonNumericVersions(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "abc_manual.up.sql"), []byte("up"), 0644)
+
+	upPath, _, err := CreateMigrationFiles(dir, "init")
+	if err != nil {
+		t.Fatalf("CreateMigrationFiles() error: %v", err)
+	}
+	if !strings.Contains(upPath, "001_init") {
+		t.Errorf("upPath = %q, want version 001 when no numeric versions exist", upPath)
+	}
+}
+
+// A collision must fail loudly instead of overwriting. The down file is not
+// scanned for version allocation, so an orphaned down file with no up file
+// recreates the collision the O_EXCL flag exists to catch.
+func TestCreateMigrationFilesFailsOnCollision(t *testing.T) {
+	dir := t.TempDir()
+	orphan := filepath.Join(dir, "001_orphan.down.sql")
+	os.WriteFile(orphan, []byte("precious down"), 0644)
+
+	_, _, err := CreateMigrationFiles(dir, "orphan")
+	if err == nil {
+		t.Fatal("expected error when target down file already exists")
+	}
+
+	orphanContent, readErr := os.ReadFile(orphan)
+	if readErr != nil || string(orphanContent) != "precious down" {
+		t.Errorf("existing down file was modified: content = %q, err = %v", orphanContent, readErr)
+	}
+
+	// The up half of the pair must not be left behind
+	if _, statErr := os.Stat(filepath.Join(dir, "001_orphan.up.sql")); statErr == nil {
+		t.Error("orphaned up file left behind after failed create")
+	}
+}
+
 func TestMigrationFileStruct(t *testing.T) {
 	mf := MigrationFile{
 		Version: "001",

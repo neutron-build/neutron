@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -211,9 +212,17 @@ func CreateMigrationFiles(dir, name string) (string, string, error) {
 		return "", "", err
 	}
 
-	// Determine next version number
+	// Determine next version number: one past the highest existing version.
+	// Counting files instead (len+1) re-allocates a version after a gap
+	// (001, 003) and silently overwrites the existing pair.
 	files, _ := ReadMigrationFiles(dir)
-	nextVersion := fmt.Sprintf("%03d", len(files)+1)
+	next := 1
+	for _, f := range files {
+		if n, err := strconv.Atoi(f.Version); err == nil && n >= next {
+			next = n + 1
+		}
+	}
+	nextVersion := fmt.Sprintf("%03d", next)
 
 	safeName := strings.ReplaceAll(strings.ToLower(name), " ", "_")
 	upPath := filepath.Join(dir, fmt.Sprintf("%s_%s.up.sql", nextVersion, safeName))
@@ -222,10 +231,32 @@ func CreateMigrationFiles(dir, name string) (string, string, error) {
 	upContent := fmt.Sprintf("-- Migration: %s\n", name)
 	downContent := fmt.Sprintf("-- Rollback: %s\n", name)
 
-	if err := os.WriteFile(upPath, []byte(upContent), 0644); err != nil {
+	// O_EXCL: a collision means this version is already taken — fail loudly
+	// rather than overwrite whatever owns it.
+	up, err := os.OpenFile(upPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
 		return "", "", err
 	}
-	if err := os.WriteFile(downPath, []byte(downContent), 0644); err != nil {
+	if _, err := up.WriteString(upContent); err != nil {
+		up.Close()
+		return "", "", err
+	}
+	if err := up.Close(); err != nil {
+		return "", "", err
+	}
+
+	down, err := os.OpenFile(downPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
+		os.Remove(upPath) // keep the pair atomic
+		return "", "", err
+	}
+	if _, err := down.WriteString(downContent); err != nil {
+		down.Close()
+		os.Remove(upPath)
+		return "", "", err
+	}
+	if err := down.Close(); err != nil {
+		os.Remove(upPath)
 		return "", "", err
 	}
 
