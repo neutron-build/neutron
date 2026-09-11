@@ -173,3 +173,59 @@ func TestCopyFileSrcNotFound(t *testing.T) {
 		t.Fatal("expected error for nonexistent source")
 	}
 }
+
+func TestSwapBinaryReplacesExecutable(t *testing.T) {
+	dir := t.TempDir()
+	execPath := filepath.Join(dir, "neutron")
+	newPath := filepath.Join(dir, "neutron.new")
+
+	os.WriteFile(execPath, []byte("old binary"), 0755)
+	os.WriteFile(newPath, []byte("new binary"), 0644)
+
+	if err := swapBinary(execPath, newPath); err != nil {
+		t.Fatalf("swapBinary() error: %v", err)
+	}
+
+	data, err := os.ReadFile(execPath)
+	if err != nil {
+		t.Fatalf("ReadFile(execPath) error: %v", err)
+	}
+	if string(data) != "new binary" {
+		t.Errorf("execPath content = %q, want %q", data, "new binary")
+	}
+
+	info, err := os.Stat(execPath)
+	if err != nil {
+		t.Fatalf("Stat(execPath) error: %v", err)
+	}
+	if info.Mode().Perm() != 0755 {
+		t.Errorf("execPath perms = %v, want 0755", info.Mode().Perm())
+	}
+
+	// The staged file must be gone — it became the executable.
+	if _, err := os.Stat(newPath); !os.IsNotExist(err) {
+		t.Errorf("staged file still present after swap: %v", err)
+	}
+}
+
+// The crash-window guarantee: any failure before the rename must leave the
+// original executable untouched.
+func TestSwapBinaryFailureLeavesOriginalUntouched(t *testing.T) {
+	dir := t.TempDir()
+	execPath := filepath.Join(dir, "neutron")
+
+	os.WriteFile(execPath, []byte("old binary"), 0755)
+
+	err := swapBinary(execPath, filepath.Join(dir, "missing.new"))
+	if err == nil {
+		t.Fatal("expected error when staged binary does not exist")
+	}
+
+	data, readErr := os.ReadFile(execPath)
+	if readErr != nil {
+		t.Fatalf("ReadFile(execPath) error: %v", readErr)
+	}
+	if string(data) != "old binary" {
+		t.Errorf("execPath content = %q after failed swap, want %q", data, "old binary")
+	}
+}

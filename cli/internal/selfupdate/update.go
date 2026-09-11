@@ -162,25 +162,51 @@ func DownloadAndReplace(release *Release) error {
 		return fmt.Errorf("resolve symlinks: %w", err)
 	}
 
-	// Atomic replace: rename current -> .old, rename new -> current
-	oldPath := execPath + ".old"
-	os.Remove(oldPath)
-
-	if err := os.Rename(execPath, oldPath); err != nil {
-		return fmt.Errorf("backup current binary: %w", err)
-	}
-
-	if err := copyFile(binaryPath, execPath); err != nil {
-		// Restore backup
-		os.Rename(oldPath, execPath)
+	// Copy-first swap: stage the new binary beside the live one, then rename
+	// it into place. The previous order — renaming the live executable aside
+	// before copying — left a window where a crash or copy failure meant no
+	// executable at execPath at all.
+	newPath := execPath + ".new"
+	if err := copyFile(binaryPath, newPath); err != nil {
+		os.Remove(newPath)
 		return fmt.Errorf("install new binary: %w", err)
 	}
 
-	if err := os.Chmod(execPath, 0755); err != nil {
+	if err := swapBinary(execPath, newPath); err != nil {
+		os.Remove(newPath)
+		return fmt.Errorf("swap binary: %w", err)
+	}
+
+	// Clean up any backup left by an earlier update.
+	os.Remove(execPath + ".old")
+	return nil
+}
+
+// swapBinary atomically replaces the executable at execPath with the binary
+// staged at newPath. The staged bytes are fsynced before the rename so a
+// crash cannot leave a half-written executable; until the rename succeeds
+// the original at execPath is untouched.
+func swapBinary(execPath, newPath string) error {
+	if err := os.Chmod(newPath, 0755); err != nil {
 		return fmt.Errorf("chmod: %w", err)
 	}
 
-	os.Remove(oldPath)
+	f, err := os.Open(newPath)
+	if err != nil {
+		return fmt.Errorf("open staged binary: %w", err)
+	}
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if syncErr != nil {
+		return fmt.Errorf("fsync staged binary: %w", syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close staged binary: %w", closeErr)
+	}
+
+	if err := os.Rename(newPath, execPath); err != nil {
+		return fmt.Errorf("replace binary: %w", err)
+	}
 	return nil
 }
 
