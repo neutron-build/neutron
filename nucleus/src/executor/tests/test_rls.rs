@@ -593,3 +593,74 @@ async fn extension_commands_recompute_session_context() {
         }
     }
 }
+
+/// BYPASSRLS bypasses ROW policies only — not table ACL grants, and not
+/// masking (audit A10). A BYPASSRLS role with no grant is denied; with a
+/// SELECT grant it reads rows unfiltered by RLS but still masked; a superuser
+/// remains exempt from all three gates.
+#[tokio::test]
+async fn bypassrls_bypasses_rows_but_not_grants_or_masks() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE guarded (id INT PRIMARY KEY, owner TEXT, ssn TEXT)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO guarded VALUES (1, 'alice', 'a1'), (2, 'bob', 'b1')",
+    )
+    .await;
+    exec(&ex, "CREATE ROLE freepass LOGIN PASSWORD 'x' BYPASSRLS").await;
+    // Deny-everything row policy: only the row bypass can see through it.
+    exec(
+        &ex,
+        "CREATE POLICY no_rows ON guarded FOR SELECT TO PUBLIC USING (false)",
+    )
+    .await;
+    exec(&ex, "ALTER TABLE guarded ENABLE ROW LEVEL SECURITY").await;
+    exec(
+        &ex,
+        "CREATE MASKING POLICY ON guarded (ssn) TO freepass USING REDACT '***'",
+    )
+    .await;
+
+    let sid = ex.create_session();
+    ex.bind_authenticated_session(sid, "freepass").await.unwrap();
+
+    // (a) No grant: denied, exactly as for any non-superuser.
+    let err = exec_session(&ex, sid, "SELECT id FROM guarded").await;
+    match err {
+        Err(ExecError::PermissionDenied(msg)) => {
+            assert!(msg.contains("permission denied"), "got: {msg}")
+        }
+        Err(other) => panic!("expected PermissionDenied, got: {other}"),
+        Ok(v) => panic!("BYPASSRLS role read a table it holds no grant on: {v:?}"),
+    }
+
+    // Grant SELECT from the bootstrap superuser session.
+    exec(&ex, "GRANT SELECT ON guarded TO freepass").await;
+
+    // (b) With the grant: reads work and RLS does NOT filter — both rows
+    // survive the deny-everything policy via the row bypass.
+    let result = exec_session(&ex, sid, "SELECT id FROM guarded ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows(&result[0]).len(), 2, "BYPASSRLS must bypass row policies");
+
+    // (c) Masking still applies: the mask is a per-role VALUE policy, and row
+    // bypass is not a license to read masked columns.
+    let result = exec_session(&ex, sid, "SELECT ssn FROM guarded ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows(&result[0])[0][0], Value::Text("***".into()));
+    assert_eq!(rows(&result[0])[1][0], Value::Text("***".into()));
+
+    // (d) A true superuser is unchanged: no grant needed, no mask, no filter.
+    let super_sid = ex.create_session();
+    let result = exec_session(&ex, super_sid, "SELECT ssn FROM guarded ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows(&result[0])[0][0], Value::Text("a1".into()));
+    assert_eq!(rows(&result[0])[1][0], Value::Text("b1".into()));
+}

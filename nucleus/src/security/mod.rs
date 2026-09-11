@@ -28,6 +28,13 @@ pub struct SessionContext {
     /// client-writable setting.
     #[serde(default)]
     pub bypass_rls: bool,
+    /// True superuser authority — distinct from `bypass_rls`, which exempts a
+    /// role from ROW policies only. A table grant, a mask and a row policy are
+    /// three different gates, and conflating the last one's bypass with the
+    /// other two granted BYPASSRLS roles every table privilege. Superusers
+    /// carry both attributes; `bypass_rls` alone does not make this true.
+    #[serde(default)]
+    pub is_superuser: bool,
 }
 
 impl SessionContext {
@@ -38,6 +45,7 @@ impl SessionContext {
             tenant_id: None,
             properties: HashMap::new(),
             bypass_rls: false,
+            is_superuser: false,
         }
     }
 
@@ -58,6 +66,11 @@ impl SessionContext {
 
     pub fn with_bypass_rls(mut self, bypass_rls: bool) -> Self {
         self.bypass_rls = bypass_rls;
+        self
+    }
+
+    pub fn with_superuser(mut self, is_superuser: bool) -> Self {
+        self.is_superuser = is_superuser;
         self
     }
 

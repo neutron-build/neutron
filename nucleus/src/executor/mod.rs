@@ -3517,15 +3517,17 @@ impl Executor {
     /// Session-keyed twin of `read_fast_paths_permitted`, for the wire gate,
     /// which has a session id but no session scope yet.
     ///
-    /// It collapses to "is this session privileged", because the policy half is
-    /// only ever true for a non-privileged session. Advisory: a fail-closed
-    /// optimisation that keeps unprivileged traffic off the bypass route
-    /// entirely. The enforcement lives inside the scoped call.
+    /// It collapses to "is this session a superuser", because the policy half
+    /// is only ever true for a non-superuser session — and BYPASSRLS is NOT
+    /// superuser: its reads still pass the GRANT gate and its masks still
+    /// apply, so the bypass routes must decline for it too. Advisory: a
+    /// fail-closed optimisation that keeps unprivileged traffic off the bypass
+    /// route entirely. The enforcement lives inside the scoped call.
     #[cfg(feature = "server")]
     pub fn session_read_fast_paths_permitted(&self, session_id: u64) -> bool {
         let session = self.get_session(session_id);
         let ctx = session.session_context.read();
-        ctx.bypass_rls
+        ctx.is_superuser
     }
 
     pub fn session_has_active_rls(&self, session_id: u64) -> bool {
@@ -3754,6 +3756,7 @@ impl Executor {
         let mut ctx = crate::security::SessionContext::new(&effective);
         let mut role_names = vec![effective.clone()];
         let mut bypass = false;
+        let mut super_user = false;
         if let Ok(roles) = self.roles.try_read() {
             // Revalidate an assumed role on every statement. Revoking
             // membership takes effect immediately for existing sessions.
@@ -3789,7 +3792,12 @@ impl Executor {
                 let name = role_names[cursor].clone();
                 cursor += 1;
                 if let Some(role) = roles.get(&name) {
+                    // SUPERUSER implies the row bypass; BYPASSRLS does not
+                    // imply superuser. Kept as two attributes because table
+                    // privileges and masking are enforced for a BYPASSRLS
+                    // role exactly as for any other non-superuser (A10).
                     bypass |= role.is_superuser || role.bypass_rls;
+                    super_user |= role.is_superuser;
                     for parent in &role.member_of {
                         if !role_names.contains(parent) {
                             role_names.push(parent.clone());
@@ -3802,7 +3810,13 @@ impl Executor {
             ctx = ctx.with_role(&role);
         }
         if bypass {
-            ctx = ctx.with_role("superuser").with_bypass_rls(true);
+            ctx = ctx.with_bypass_rls(true);
+        }
+        // The `superuser` role marker and the superuser ATTRIBUTE belong to
+        // actual superusers only: BYPASSRLS bypasses row policies, not table
+        // grants or masks.
+        if super_user {
+            ctx = ctx.with_role("superuser").with_superuser(true);
         }
         if let Some(t) = session.trusted_tenant_id.read().clone()
             && !t.is_empty()
@@ -3813,9 +3827,10 @@ impl Executor {
     }
 
     /// Whether RLS row-filtering is active for `table` in the current session:
-    /// RLS enabled on the table AND the session is not a superuser. This is the
-    /// FAIL-CLOSED gate every fast/bypass read path checks — when true, that
-    /// path must defer to the general materialize-and-filter path.
+    /// RLS enabled on the table AND the session does not bypass row policies
+    /// (superuser or BYPASSRLS). This is the FAIL-CLOSED gate every
+    /// fast/bypass read path checks — when true, that path must defer to the
+    /// general materialize-and-filter path.
     pub(super) fn rls_active(&self, table: &str) -> bool {
         // SEC-4: the attribute, not the name.
         if self.current_session().session_context.read().bypass_rls {
@@ -3826,10 +3841,12 @@ impl Executor {
 
     /// Whether a masking policy applies to `table` for this session.
     ///
-    /// Superusers see unmasked data, matching the RLS rule directly above.
+    /// Superusers see unmasked data. A BYPASSRLS role does not: row-policy
+    /// bypass is not a license to read masked columns — SEC-4 keeps masking a
+    /// per-role VALUE policy, and only the superuser attribute exempts.
     pub(super) fn masking_active(&self, table: &str) -> bool {
         // SEC-4: the attribute, not the name.
-        if self.current_session().session_context.read().bypass_rls {
+        if self.current_session().session_context.read().is_superuser {
             return false;
         }
         self.with_visible_security(|security| security.masking.covers_table(table))
@@ -3885,8 +3902,9 @@ impl Executor {
 
     /// True when this session's reads have to pass the GRANT gate.
     ///
-    /// `check_privilege` short-circuits for a superuser and for `bypass_rls`;
-    /// every other principal needs an explicit grant. But the SELECT gate has
+    /// `check_privilege` short-circuits for a superuser; every other
+    /// principal — BYPASSRLS included, which bypasses row policies but not
+    /// table ACL grants — needs an explicit grant. But the SELECT gate has
     /// exactly ONE read-path call site, inside `load_table_factor_with_ctes`,
     /// and it sits AFTER the fast paths have already returned rows. A role
     /// holding no grant at all could therefore read a table through `count(*)`,
@@ -3908,13 +3926,14 @@ impl Executor {
     pub(super) fn privileges_enforced_for_session(&self) -> bool {
         let session = self.current_session();
         let ctx = session.session_context.read();
-        !(ctx.bypass_rls)
+        !(ctx.is_superuser)
     }
 
     /// Whether any masking policy exists for this session.
     pub(super) fn any_masking_active(&self) -> bool {
-        // SEC-4: the attribute, not the name.
-        if self.current_session().session_context.read().bypass_rls {
+        // SEC-4: the attribute, not the name. Superuser only — BYPASSRLS
+        // keeps its masks.
+        if self.current_session().session_context.read().is_superuser {
             return false;
         }
         self.with_visible_security(|security| security.masking.any_policies())
@@ -3973,7 +3992,7 @@ impl Executor {
 
     /// Whether ANY table in the current query needs RLS filtering — used to
     /// disable the SQL-text-keyed result cache path wholesale when policies are
-    /// live (cheap: only true for non-superuser sessions with ≥1 enabled table).
+    /// live (cheap: only true for non-bypass sessions with ≥1 enabled table).
     pub(super) fn any_rls_active(&self) -> bool {
         // SEC-4: the attribute, not the name.
         if self.current_session().session_context.read().bypass_rls {
@@ -6036,7 +6055,7 @@ impl Executor {
             // Extension commands return from this block before the parsed
             // path's per-statement recompute — do it here so revocations
             // take effect on these arms too (a demoted superuser's session
-            // used its stale bypass_rls to read RLS-table stats).
+            // used its stale authority to read RLS-table stats).
             self.recompute_session_context(&self.current_session());
 
             let upper = trimmed.to_ascii_uppercase();
@@ -7259,9 +7278,12 @@ impl Executor {
     /// - The user has the specific privilege on the table
     /// - The user has ALL privilege on the table
     /// - No role is found and user is the default "nucleus" superuser
+    ///
+    /// A BYPASSRLS role passes this gate like any other non-superuser:
+    /// BYPASSRLS exempts a role from ROW policies, not from table ACL grants.
     async fn check_privilege(&self, table_name: &str, privilege: &str) -> bool {
         let ctx = self.current_session().session_context.read().clone();
-        if ctx.bypass_rls {
+        if ctx.is_superuser {
             return true;
         }
 

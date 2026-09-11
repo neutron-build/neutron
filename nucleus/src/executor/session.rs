@@ -355,7 +355,8 @@ impl Session {
                 // session's authority and break single-user mode.
                 crate::security::SessionContext::new("nucleus")
                     .with_role("superuser")
-                    .with_bypass_rls(true),
+                    .with_bypass_rls(true)
+                    .with_superuser(true),
             ),
             last_activity_ms: AtomicU64::new(now_millis()),
             executing: AtomicBool::new(false),

@@ -9469,10 +9469,11 @@ impl Executor {
                 // `has_table_privilege()` reported false. Every table without an
                 // RLS policy was world-readable to any authenticated role.
                 //
-                // Superusers and `bypass_rls` short-circuit inside
-                // `check_privilege`, so the default single-user session is
-                // unaffected; this engages once a session assumes a
-                // non-superuser identity.
+                // Superusers short-circuit inside `check_privilege`, so the
+                // default single-user session is unaffected; this engages once
+                // a session assumes a non-superuser identity. A BYPASSRLS
+                // role passes this gate too — row bypass is not a table
+                // grant.
                 //
                 // GRANT and RLS are two INDEPENDENT gates, as in PostgreSQL:
                 // SELECT is required to touch the table at all, and policies
