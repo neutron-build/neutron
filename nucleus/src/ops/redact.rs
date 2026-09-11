@@ -8,12 +8,11 @@
 //! credential is masked, and SQL text is scrubbed of the literal that follows
 //! a credential-bearing keyword before it is logged.
 //!
-//! **Status (PRC-11): test-only — not wired into any log path.** These
-//! helpers have zero production callers; SQL text still reaches logs
-//! unredacted (e.g. the `sql={sql}` sites in `main.rs`), so `CREATE ROLE ...
-//! PASSWORD '...'` is logged verbatim. Wiring them into the logging layer is
-//! the recorded follow-up; until then, do not assume a call site is covered
-//! just because this module exists.
+//! **Status:** wired into the log paths that carry SQL text — the slow-query
+//! capture (both the WARN line and `last_slow_query`) and the raw-SQL sites in
+//! `main.rs` (Raft apply failures, ForwardDml receipt). The executed statement
+//! itself is never modified; only text about to reach logs or operator-facing
+//! state passes through `redact_sql`.
 
 /// The replacement written in place of any secret.
 pub const REDACTED: &str = "[REDACTED]";
@@ -187,6 +186,24 @@ pub fn redact_sql(sql: &str) -> String {
                 j += 1;
             }
             j
+        } else if bytes[idx] == b'$' {
+            // Dollar-quoted literal (`$$...$$` or `$tag$...$tag$`). The tag
+            // is ASCII letters/digits/underscores, so the scan stays on byte
+            // boundaries. An unterminated opener masks the rest of the
+            // statement — erring toward masking is the contract.
+            let mut j = idx + 1;
+            while j < sql.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if j < sql.len() && bytes[j] == b'$' {
+                let delim = &sql[idx..=j];
+                sql[j + 1..]
+                    .find(delim)
+                    .map(|p| j + 1 + p + delim.len())
+                    .unwrap_or(sql.len())
+            } else {
+                sql.len()
+            }
         } else {
             let mut j = idx;
             while j < sql.len() && !bytes[j].is_ascii_whitespace() && bytes[j] != b';' {
@@ -313,6 +330,28 @@ mod tests {
             );
             assert!(scrubbed.contains(REDACTED), "{scrubbed}");
         }
+    }
+
+    #[test]
+    fn dollar_quoted_credentials_are_scrubbed_whole() {
+        // `$$...$$` and tagged delimiters, including literals with spaces —
+        // the bare-token branch used to stop at the first space and leak the
+        // rest of the literal.
+        for sql in [
+            "CREATE ROLE r PASSWORD $$dollar canary$$",
+            "CREATE ROLE r PASSWORD $tag$dollar canary$tag$",
+            "ALTER ROLE r PASSWORD $q$hunter 2 with $ signs$q$",
+        ] {
+            let scrubbed = redact_sql(sql);
+            assert!(
+                !scrubbed.contains("canary") && !scrubbed.contains("hunter"),
+                "dollar-quoted secret leaked: {scrubbed}"
+            );
+            assert!(scrubbed.contains(REDACTED), "{scrubbed}");
+        }
+        // A `$` that opens nothing is masked to the end rather than trusted.
+        let scrubbed = redact_sql("ALTER ROLE r PASSWORD $oops");
+        assert!(!scrubbed.contains("oops"), "{scrubbed}");
     }
 
     #[test]

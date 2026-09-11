@@ -7250,9 +7250,15 @@ impl Executor {
         if slow_query_ms > 0 {
             let duration_ms = duration * 1000.0;
             if duration_ms >= slow_query_ms as f64 {
+                // Redact BEFORE truncating: a credential that straddles the
+                // 200-char boundary must not survive as a partial literal,
+                // and the same scrubbed preview feeds the WARN line and
+                // `last_slow_query` — role DDL with PASSWORD reaches both
+                // verbatim otherwise (audit A19). The executed statement is
+                // untouched; this is log text only.
                 let preview = statement_text
                     .as_deref()
-                    .map(|s| s.chars().take(200).collect::<String>())
+                    .map(|s| crate::ops::redact_sql(s).chars().take(200).collect::<String>())
                     .unwrap_or_default();
                 tracing::warn!(
                     query_id,

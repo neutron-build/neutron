@@ -299,6 +299,57 @@ async fn slow_query_log_records_statement_over_threshold() {
     );
 }
 
+/// A slow statement carrying a credential must never leak it into the
+/// retained `last_slow_query` — and, since the WARN line logs the SAME
+/// scrubbed preview variable, into tracing either (audit A19). Role DDL is
+/// the canary because it is the statement class with a password literal,
+/// and every password write re-derives a SCRAM verifier (4096 PBKDF2-SHA256
+/// iterations), which crosses a 1 ms threshold on its own.
+#[tokio::test]
+async fn slow_query_capture_scrubs_password_literals() {
+    let ex = test_executor();
+    exec(&ex, "SET slow_query_log_ms = 1").await;
+
+    // Quoted and dollar-quoted password forms (a bare identifier does not
+    // parse as a PASSWORD value; the text-level scrubber covers it anyway).
+    // Each batch names many roles because the password is verified once per
+    // name (4096 PBKDF2-SHA256 iterations each), which is what makes the
+    // statement reliably cross the 1 ms threshold.
+    let canaries = ["'quoted-canary'", "$$dollar canary$$", "'retry-canary'"];
+    let mut captured = None;
+    for (attempt, form) in canaries.iter().enumerate() {
+        let names = (0..24)
+            .map(|i| format!("c{attempt}_{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        exec(
+            &ex,
+            &format!("CREATE ROLE {names} LOGIN PASSWORD {form}"),
+        )
+        .await;
+        if let Some((_, _, statement)) = ex.last_slow_query() {
+            assert!(
+                !statement.contains("canary"),
+                "password leaked into last_slow_query: {statement:?}"
+            );
+            assert!(
+                statement.contains("[REDACTED]"),
+                "scrubbed preview must carry the redaction marker: {statement:?}"
+            );
+            assert!(
+                statement.to_uppercase().contains("CREATE ROLE"),
+                "preview must still identify the statement: {statement:?}"
+            );
+            captured = Some(statement);
+            break;
+        }
+    }
+    assert!(
+        captured.is_some(),
+        "a role-DDL password rewrite must cross a 1ms threshold eventually"
+    );
+}
+
 /// The server-wide slow-query default (config `server.slow_query_log_ms`,
 /// builder `with_slow_query_default_ms`): a session that has not SET its own
 /// threshold inherits it, and an explicit SET still wins.

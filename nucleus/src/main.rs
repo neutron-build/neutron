@@ -1684,7 +1684,10 @@ async fn cmd_start(cfg: StartConfig) {
         let mut rx = apply_rx;
         while let Some(sql) = rx.recv().await {
             if let Err(e) = executor_for_apply.apply_replicated_sql(&sql).await {
-                tracing::warn!("Failed to apply Raft-committed SQL: {e}: sql={sql}");
+                tracing::warn!(
+                    "Failed to apply Raft-committed SQL: {e}: sql={}",
+                    nucleus::ops::redact_sql(&sql)
+                );
             }
         }
     });
@@ -2768,7 +2771,11 @@ async fn handle_cluster_message(
             }
         }
         Message::ForwardDml { sql, shard_id: _ } => {
-            tracing::debug!("ForwardDml from {}: sql={sql}", env.from);
+            tracing::debug!(
+                "ForwardDml from {}: sql={}",
+                env.from,
+                nucleus::ops::redact_sql(&sql)
+            );
             let request_id = env.id; // Preserve for send_request() correlation.
             let from = env.from;
             let (response_msg, self_id) = match executor.execute_principal_less_forward(&sql).await
