@@ -1765,3 +1765,94 @@ async fn a_failed_insert_statement_writes_no_rows() {
         "a failed statement wrote rows"
     );
 }
+
+// ── Session abandonment must restore per-table engine writes (audit A9) ────
+
+/// A disconnect mid-transaction must undo the transaction's writes to a table
+/// served by `WITH (engine=…)`. `drop_session` used to revert only the
+/// cross-model write-set and release locks — the per-table engine
+/// before-images (`engine_snapshots`) were never drained and derived state
+/// was never rebuilt, so the abandoned transaction's writes stayed applied
+/// with no transaction left to roll them back.
+#[cfg(feature = "server")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_session_reverts_per_table_engine_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = shipping_executor(dir.path()).await;
+
+    for (label, clause) in PER_TABLE_ENGINES {
+        exec(
+            &ex,
+            &format!("CREATE TABLE {label} (id INT PRIMARY KEY, v INT) {clause}"),
+        )
+        .await;
+        exec(&ex, &format!("INSERT INTO {label} VALUES (1, 100)")).await;
+
+        let sid = ex.create_session();
+        ex.execute_with_session(sid, "BEGIN").await.unwrap();
+        ex.execute_with_session(sid, &format!("INSERT INTO {label} VALUES (2, 200)"))
+            .await
+            .unwrap();
+        ex.execute_with_session(sid, &format!("INSERT INTO {label} VALUES (3, 300)"))
+            .await
+            .unwrap();
+        ex.drop_session(sid);
+
+        let after =
+            rows(&exec(&ex, &format!("SELECT id FROM {label} ORDER BY id")).await[0]).clone();
+        assert_eq!(
+            after,
+            vec![vec![Value::Int32(1)]],
+            "{label}: a dropped session's writes to a per-table engine survived the disconnect"
+        );
+    }
+}
+
+/// Pool return (`reset_session`) abandons an open transaction the same way a
+/// disconnect does, so it must restore per-table engine writes too, and leave
+/// the session reusable.
+#[cfg(feature = "server")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_session_reverts_per_table_engine_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = shipping_executor(dir.path()).await;
+
+    for (label, clause) in PER_TABLE_ENGINES {
+        exec(
+            &ex,
+            &format!("CREATE TABLE {label}_r (id INT PRIMARY KEY, v INT) {clause}"),
+        )
+        .await;
+        exec(&ex, &format!("INSERT INTO {label}_r VALUES (1, 100)")).await;
+
+        let sid = ex.create_session();
+        ex.execute_with_session(sid, "BEGIN").await.unwrap();
+        ex.execute_with_session(sid, &format!("INSERT INTO {label}_r VALUES (2, 200)"))
+            .await
+            .unwrap();
+        let actions = ex.reset_session(sid).await;
+        assert!(
+            actions.iter().any(|a| a.contains("ROLLBACK")),
+            "reset must report the rollback"
+        );
+
+        let after =
+            rows(&exec(&ex, &format!("SELECT id FROM {label}_r ORDER BY id")).await[0]).clone();
+        assert_eq!(
+            after,
+            vec![vec![Value::Int32(1)]],
+            "{label}: a pool-returned session's writes survived the reset"
+        );
+        // The session is reusable afterwards.
+        ex.execute_with_session(sid, &format!("INSERT INTO {label}_r VALUES (4, 400)"))
+            .await
+            .unwrap();
+        let after =
+            rows(&exec(&ex, &format!("SELECT id FROM {label}_r ORDER BY id")).await[0]).clone();
+        assert_eq!(
+            after,
+            vec![vec![Value::Int32(1)], vec![Value::Int32(4)]],
+            "{label}: the reset session must be usable in autocommit"
+        );
+    }
+}

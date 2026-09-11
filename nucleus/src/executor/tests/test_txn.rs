@@ -980,3 +980,39 @@ async fn cancelled_statement_aborts_open_transaction() {
     ex.drop_session(a);
     ex.drop_session(b);
 }
+
+/// A mid-transaction disconnect must also release the MVCC storage
+/// transaction: `drop_storage_session` only removed the session state, and
+/// dropping an Active storage txn without aborting it left its id in the
+/// transaction manager's active set forever — pinning the GC watermark for
+/// the life of the process (the same unbounded-growth failure the
+/// idle-in-transaction sweep exists to prevent).
+#[cfg(feature = "server")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_session_releases_the_storage_transaction() {
+    use crate::storage::MvccStorageAdapter;
+
+    let adapter = std::sync::Arc::new(MvccStorageAdapter::new());
+    let storage: std::sync::Arc<dyn crate::storage::StorageEngine> = adapter.clone();
+    let ex = Executor::new(std::sync::Arc::new(crate::catalog::Catalog::new()), storage);
+    exec(&ex, "CREATE TABLE gcpin (id INT)").await;
+    let baseline = adapter.txn_mgr().active_count();
+
+    let sid = ex.create_session();
+    ex.execute_with_session(sid, "BEGIN").await.unwrap();
+    ex.execute_with_session(sid, "INSERT INTO gcpin VALUES (1)")
+        .await
+        .unwrap();
+    assert_eq!(
+        adapter.txn_mgr().active_count(),
+        baseline + 1,
+        "the open transaction must be in the active set"
+    );
+
+    ex.drop_session(sid);
+    assert_eq!(
+        adapter.txn_mgr().active_count(),
+        baseline,
+        "drop_session leaked an active storage transaction — the GC watermark stays pinned"
+    );
+}

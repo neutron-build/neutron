@@ -227,6 +227,32 @@ impl Drop for StatementDepthGuard<'_> {
     }
 }
 
+/// Drive a session-teardown future from synchronous `drop_session` code.
+///
+/// Same strategy as `session::sync_block_on`, plus a no-runtime fallback for
+/// plain-thread callers (embedded helper threads): `block_in_place` on a
+/// multi-thread runtime (the pgwire cleanup path), a helper thread on a
+/// current-thread runtime (tests), and a bare inline executor when no tokio
+/// context exists at all.
+#[cfg(feature = "server")]
+fn block_on_session_teardown<F>(fut: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(fut))
+        }
+        Ok(handle) => std::thread::scope(|s| {
+            s.spawn(|| handle.block_on(fut))
+                .join()
+                .expect("session-teardown rollback panicked")
+        }),
+        Err(_) => futures::executor::block_on(fut),
+    }
+}
+
 /// The result of executing a statement.
 pub enum ExecResult {
     /// SELECT result with column names, types, and materialized rows.
@@ -3308,23 +3334,65 @@ impl Executor {
     /// Drop a session when a connection closes, freeing its state.
     ///
     /// A client that disconnects mid-transaction must not leave half of it
-    /// behind. `drop_storage_session` discards the uncommitted SQL rows, so the
-    /// cross-model half has to be reverted here too — otherwise a plain TCP
-    /// close splits the transaction (SQL rolled back, KV/graph/doc writes
-    /// permanent) with no crash and no timing window involved. The idle-in-
-    /// transaction sweep already does this via `rollback_transaction`; before
-    /// M8 the two abandonment paths disagreed.
+    /// behind. The idle-in-transaction sweep already restores via
+    /// `rollback_transaction`; a disconnect used to only revert the
+    /// cross-model write-set and release locks — the per-table engine
+    /// before-images (`engine_snapshots`) were never drained, so writes to a
+    /// table served by `WITH (engine=…)` stayed applied with no transaction
+    /// left to roll them back, derived state (indexes, zone maps) stayed
+    /// stale, and on MVCC the open storage transaction kept its id in the
+    /// active set, pinning the GC watermark for the life of the process.
+    ///
+    /// A mid-transaction disconnect now runs the SAME restoration a client
+    /// ROLLBACK performs, scoped to the dead session, before the teardown.
+    /// Best-effort with loud logging: if the restoration fails, the teardown
+    /// proceeds anyway — a half-dead session must not block connection
+    /// cleanup — and the residual state is the operator's signal, not a
+    /// silent pass.
     ///
     /// Synchronous on purpose: every disconnect path (pgwire cleanup, the
-    /// binary protocol handler, embedded callers) is sync, and the revert needs
-    /// no async work.
+    /// binary protocol handler, embedded callers) is sync. The restoration is
+    /// async work driven from this sync boundary the same way
+    /// `session::sync_block_on` drives it elsewhere.
     pub fn drop_session(&self, id: u64) {
         let session = self.sessions.write().remove(&id);
         if let Some(session) = session {
-            let cross_model = session.cross_model.lock().take();
-            if let Some(cm) = cross_model {
-                self.cross_model_revert(cm.base, cm.fts_ops);
-                self.metrics.open_transactions.dec();
+            if session.txn_active.load(Ordering::SeqCst) {
+                #[cfg(feature = "server")]
+                {
+                    let restore = CURRENT_SESSION.scope(
+                        session.clone(),
+                        STORAGE_SESSION_ID.scope(id, self.rollback_transaction()),
+                    );
+                    if let Err(e) = block_on_session_teardown(restore) {
+                        tracing::error!(
+                            "drop_session {id}: rolling back the abandoned transaction \
+                             failed: {e}; its per-table engine writes may remain applied \
+                             and its derived state stale"
+                        );
+                    }
+                }
+                // Core-only builds have no session-scoping machinery (no
+                // task-local CURRENT_SESSION/STORAGE_SESSION_ID), so an
+                // explicit transaction on a named session cannot have been
+                // opened there; keep the pre-A9 best-effort cross-model
+                // revert for that shape anyway.
+                #[cfg(not(feature = "server"))]
+                {
+                    let cross_model = session.cross_model.lock().take();
+                    if let Some(cm) = cross_model {
+                        self.cross_model_revert(cm.base, cm.fts_ops);
+                        self.metrics.open_transactions.dec();
+                    }
+                }
+            } else {
+                // Not in a transaction: the cross-model write-set should be
+                // empty, but a BEGIN that failed partway can leave one behind.
+                let cross_model = session.cross_model.lock().take();
+                if let Some(cm) = cross_model {
+                    self.cross_model_revert(cm.base, cm.fts_ops);
+                    self.metrics.open_transactions.dec();
+                }
             }
         }
         // A client that disconnects mid-transaction never reaches COMMIT or
@@ -3343,39 +3411,39 @@ impl Executor {
 
     /// Reset a session for connection reuse (pool return).
     ///
-    /// Aborts any active MVCC transaction, then clears all per-connection
-    /// state (prepared statements, cursors, settings). Returns the list of
-    /// cleanup actions performed.
+    /// Aborts any active transaction via the storage engine, then clears all
+    /// per-connection state (prepared statements, cursors, settings). Returns
+    /// the list of cleanup actions performed.
     #[cfg(feature = "server")]
     pub async fn reset_session(&self, id: u64) -> Vec<String> {
         let session = self.get_session(id);
         let mut actions = Vec::new();
 
-        // Abort any active transaction via the storage engine
-        let had_active_txn = {
-            let txn = session.txn_state.read().await;
-            txn.active
-        };
-        if had_active_txn {
-            if self.storage.supports_mvcc() {
-                let _ = CURRENT_SESSION
-                    .scope(
-                        session.clone(),
-                        STORAGE_SESSION_ID.scope(id, async {
-                            let _ = self.storage.abort_txn().await;
-                        }),
-                    )
-                    .await;
+        // Pool return abandons the transaction the same way a disconnect
+        // does, so it runs the same restoration a client ROLLBACK performs
+        // (A9): storage abort, cross-model revert, per-table engine
+        // before-images, derived-state rebuild — not just the bare storage
+        // abort, which left engine writes from the returned connection
+        // applied (see `drop_session`).
+        if session.txn_active.load(Ordering::SeqCst) {
+            let restore = CURRENT_SESSION.scope(
+                session.clone(),
+                STORAGE_SESSION_ID.scope(id, self.rollback_transaction()),
+            )
+            .await;
+            if let Err(e) = restore {
+                tracing::error!(
+                    "reset_session {id}: rolling back the abandoned transaction \
+                     failed: {e}; its per-table engine writes may remain applied \
+                     and its derived state stale"
+                );
             }
             actions.push("ROLLBACK active transaction".into());
-            self.metrics.open_transactions.dec();
-        }
-
-        // Pool return abandons the transaction the same way a disconnect does,
-        // so the cross-model half must be reverted with it.
-        let cross_model = session.cross_model.lock().take();
-        if let Some(cm) = cross_model {
-            self.cross_model_revert(cm.base, cm.fts_ops);
+        } else {
+            let cross_model = session.cross_model.lock().take();
+            if let Some(cm) = cross_model {
+                self.cross_model_revert(cm.base, cm.fts_ops);
+            }
         }
         // And the same for any FOR UPDATE row locks the returned connection
         // was still holding.
