@@ -1653,58 +1653,29 @@ impl Executor {
                 negated,
             } => {
                 let val = self.eval_row_expr(expr, row, col_meta)?;
-                // A locking subquery (`... IN (SELECT ... FOR UPDATE ...)`,
-                // the job-queue claim shape) must NEVER be served from this
-                // cache: a hit hands the caller a row set whose locks were
-                // taken by a DIFFERENT statement — possibly another session's,
-                // since the map is process-wide and cleared only at each
-                // top-level statement start — without taking any locks. That
-                // is the double-delivery defect row locks exist to prevent,
-                // reintroduced by an optimization. Re-read and re-lock every
-                // time; re-entrant locks make the per-row cost harmless.
-                let lockable = !subquery.locks.is_empty();
-                // Cache key is the canonical text of the subquery before
-                // outer-ref substitution, PLUS the principal it was evaluated
-                // for. The map is one process-wide table shared by every wire
-                // session, and this read happens before any RLS logic, so a
-                // text-only key served one principal's rows to another: a
-                // multi-tenant app issues the same prepared statement for every
-                // tenant, so tenant B primes the entry and tenant A's next
-                // execute matches against it. `rls_cache_principal` folds in
-                // the policy generation as well, so a policy change invalidates
-                // rather than lingering.
-                let subquery_text = format!("{subquery}");
-                let cache_key = format!("{}\u{1}{subquery_text}", self.rls_cache_principal());
-                // Check if we already have the result of this non-correlated subquery cached.
-                if !lockable
-                    && let Some(cached) = self
-                        .uncorrelated_subquery_cache
-                        .read()
-                        .get(&cache_key)
-                        .cloned()
-                {
-                    return Ok(Self::in_three_valued(&val, &cached, *negated));
-                }
+                // No shared cache here (audit A13). The old process-wide map
+                // keyed on rls_cache_principal() = policy_gen|user|roles,
+                // which leaves out the session's tenant and the transaction
+                // snapshot: two same-login sessions of different tenants, or
+                // two snapshots of one session, could serve each other's
+                // membership — including a value cached inside another
+                // transaction's snapshot with its uncommitted rows. Until a
+                // statement-owned cache can key on the full evaluation
+                // context, re-evaluate every time. A locking subquery
+                // (`IN (SELECT ... FOR UPDATE ...)`, the job-queue claim
+                // shape) must re-read and re-lock regardless; re-entrant row
+                // locks make that cheap.
                 self.check_subquery_depth()?;
                 let resolved = substitute_outer_refs_in_query(subquery, row, col_meta);
-                let resolved_key = format!("{resolved}");
                 let sub_result = sync_block_on(self.execute_query(resolved));
                 self.query_depth.fetch_sub(1, AtomicOrdering::Relaxed);
                 let sub_result = sub_result?;
-                let values: std::sync::Arc<Vec<Value>> = match &sub_result {
-                    ExecResult::Select { rows, .. } => std::sync::Arc::new(
-                        rows.iter().filter_map(|r| r.first().cloned()).collect(),
-                    ),
-                    _ => std::sync::Arc::new(vec![]),
+                let values: Vec<Value> = match &sub_result {
+                    ExecResult::Select { rows, .. } => {
+                        rows.iter().filter_map(|r| r.first().cloned()).collect()
+                    }
+                    _ => vec![],
                 };
-                // Only cache if non-correlated (resolved query text == original).
-                // Compare the TEXT, not `cache_key`, which now carries a
-                // principal prefix that `resolved_key` does not.
-                if !lockable && subquery_text == resolved_key {
-                    self.uncorrelated_subquery_cache
-                        .write()
-                        .insert(cache_key, values.clone());
-                }
                 Ok(Self::in_three_valued(&val, &values, *negated))
             }
             Expr::Subquery(subquery) => {

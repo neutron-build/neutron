@@ -664,3 +664,69 @@ async fn bypassrls_bypasses_rows_but_not_grants_or_masks() {
     assert_eq!(rows(&result[0])[0][0], Value::Text("a1".into()));
     assert_eq!(rows(&result[0])[1][0], Value::Text("b1".into()));
 }
+
+/// Same-principal sessions of DIFFERENT tenants must never share an IN
+/// (subquery) membership result (audit A13).
+///
+/// The old uncorrelated-subquery cache was process-wide and keyed only on
+/// policy_gen|user|roles — tenant and snapshot were missing — so a value
+/// evaluated inside one tenant's (or one transaction's) view could serve
+/// another. The acceptance shape is the audit's: construct both statement
+/// futures first, then poll them in REVERSE order, so tenant B's execution
+/// is the one that would prime any shared cache before tenant A runs.
+#[tokio::test]
+async fn in_subquery_membership_never_crosses_tenants_of_one_principal() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE items (id INT PRIMARY KEY, tenant TEXT, body TEXT)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO items VALUES (1, 'tenant-a', 'a1'), (2, 'tenant-a', 'a2'), (3, 'tenant-b', 'b1')",
+    )
+    .await;
+    exec(&ex, "CREATE ROLE app LOGIN").await;
+    exec(&ex, "GRANT SELECT ON items TO app").await;
+    exec(
+        &ex,
+        "CREATE POLICY tenant_isolation ON items FOR SELECT TO PUBLIC USING (tenant = current_setting('nucleus.tenant_id'))",
+    )
+    .await;
+    exec(&ex, "ALTER TABLE items ENABLE ROW LEVEL SECURITY").await;
+
+    // One principal, two sessions, two trusted tenants.
+    let sess_a = ex.create_session();
+    let sess_b = ex.create_session();
+    ex.bind_authenticated_session(sess_a, "app").await.unwrap();
+    ex.bind_authenticated_session(sess_b, "app").await.unwrap();
+    ex.bind_trusted_tenant(sess_a, Some("tenant-a".into()))
+        .unwrap();
+    ex.bind_trusted_tenant(sess_b, Some("tenant-b".into()))
+        .unwrap();
+
+    let sql = "SELECT id FROM items WHERE tenant IN (SELECT tenant FROM items) ORDER BY id";
+    // Construct both futures before polling either, then execute in reverse
+    // order of construction: B runs first and would prime a shared cache.
+    let fut_a = ex.execute_with_session(sess_a, sql);
+    let fut_b = ex.execute_with_session(sess_b, sql);
+    let rows_b = fut_b.await.expect("tenant-b executes fine");
+    let rows_a = fut_a.await.expect("tenant-a executes fine");
+
+    assert_eq!(
+        rows(&rows_b[0]).len(),
+        1,
+        "tenant-b sees only its own row"
+    );
+    assert_eq!(
+        rows(&rows_a[0]).len(),
+        2,
+        "tenant-a must not inherit tenant-b's cached membership: {:?}",
+        rows(&rows_a[0])
+    );
+
+    // And the forward order is unchanged.
+    let again = exec_session(&ex, sess_a, sql).await.unwrap();
+    assert_eq!(rows(&again[0]).len(), 2);
+}
