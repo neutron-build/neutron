@@ -466,14 +466,51 @@ pub fn backup_data_dir_opts(
         ));
     }
 
+    reject_path_overlap(data_dir, output_dir, "backup")?;
     // Establish identity BEFORE the copy, so the id file is part of the
     // snapshot. Created afterwards it would be missing from every snapshot,
     // and a restore could never tell one database from another.
     let db_id = database_id(data_dir);
 
-    reject_nested_destination(data_dir, output_dir)?;
-    prepare_output_dir(output_dir, force)?;
-    let snapshot_data = output_dir.join(DATA_SUBDIR);
+    if output_dir.exists() && !force {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "destination already exists: {} (use force to overwrite)",
+                output_dir.display()
+            ),
+        ));
+    }
+    // Build in a staging sibling and publish only the completed snapshot:
+    // the previous generation at `output_dir` survives every failure of
+    // this build, including a crash mid-copy (audit A22).
+    let staging = staging_sibling(output_dir);
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
+    }
+    let built = backup_data_dir_staged(data_dir, &staging, in_use, db_id, nucleus_version);
+    let manifest = match built {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+    };
+    publish_staging(&staging, output_dir)?;
+    Ok(manifest)
+}
+
+/// Copy the data tree into the staging directory's `data/` and compute the
+/// offline manifest from it. The manifest is written INSIDE staging, so a
+/// published destination always carries its manifest with it.
+fn backup_data_dir_staged(
+    data_dir: &Path,
+    staging: &Path,
+    in_use: bool,
+    db_id: String,
+    nucleus_version: &str,
+) -> io::Result<BackupManifest> {
+    let snapshot_data = staging.join(DATA_SUBDIR);
     copy_dir_filtered(data_dir, &snapshot_data, &|rel| !is_runtime_only(rel))?;
 
     // The highest LSN the copied WAL carries. This used to be hardcoded to 0,
@@ -513,7 +550,7 @@ pub fn backup_data_dir_opts(
         encryption: recorded_encryption(data_dir),
         files: fingerprint_tree(&snapshot_data)?,
     };
-    write_manifest(output_dir, &manifest)?;
+    write_manifest(staging, &manifest)?;
     Ok(manifest)
 }
 
@@ -536,18 +573,39 @@ pub fn backup_online(
             format!("data directory does not exist: {}", data_dir.display()),
         ));
     }
+    reject_path_overlap(data_dir, output_dir, "backup")?;
     // Identity before the copy so it lands inside the snapshot (see
     // `backup_data_dir_opts`).
     let db_id = database_id(data_dir);
 
-    reject_nested_destination(data_dir, output_dir)?;
-    prepare_output_dir(output_dir, force)?;
-    let snapshot_data = output_dir.join(DATA_SUBDIR);
+    if output_dir.exists() && !force {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "destination already exists: {} (use force to overwrite)",
+                output_dir.display()
+            ),
+        ));
+    }
+    // Build in a staging sibling and publish only the completed snapshot;
+    // the previous generation survives every failure of this build
+    // (audit A22).
+    let staging = staging_sibling(output_dir);
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
+    }
+    let snapshot_data = staging.join(DATA_SUBDIR);
     std::fs::create_dir_all(&snapshot_data)?;
 
     let result = backup_online_inner(data_dir, &snapshot_data, coord);
     coord.backup_release();
-    let consistent_lsn = result?;
+    let consistent_lsn = match result {
+        Ok(lsn) => lsn,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+    };
 
     let manifest = BackupManifest {
         nucleus_version: nucleus_version.to_string(),
@@ -562,7 +620,8 @@ pub fn backup_online(
         encryption: coord.encryption_info(),
         files: fingerprint_tree(&snapshot_data)?,
     };
-    write_manifest(output_dir, &manifest)?;
+    write_manifest(&staging, &manifest)?;
+    publish_staging(&staging, output_dir)?;
     Ok(manifest)
 }
 
@@ -647,38 +706,57 @@ fn copy_wal_upto(src_dir: &Path, dst_dir: &Path, end_lsn: u64) -> io::Result<()>
     Ok(())
 }
 
-/// Refuse a destination inside the source data directory.
-///
-/// The tree copy would descend into the snapshot it is writing and copy it into
-/// itself until the path exceeds the OS limit, surfacing as a baffling
-/// "File name too long" rather than "you asked for something impossible".
-/// `BACKUP DATABASE TO '/var/lib/nucleus/data/backup'` is an easy thing to type,
-/// so it must fail clearly and immediately.
-fn reject_nested_destination(data_dir: &Path, output_dir: &Path) -> io::Result<()> {
-    let src = data_dir
-        .canonicalize()
-        .unwrap_or_else(|_| data_dir.to_path_buf());
-    // The destination usually does not exist yet: canonicalize its nearest
-    // existing ancestor, then re-attach the remainder.
-    let mut probe = output_dir.to_path_buf();
+/// Resolve a path that may not exist yet to a comparable absolute form:
+/// canonicalize its nearest existing ancestor, then re-attach the remainder.
+/// Symlinks are resolved wherever the OS can answer; the remainder cannot be
+/// resolved and is compared lexically, which is the pragmatic best available
+/// before the path exists.
+fn resolve_pseudo(path: &Path) -> PathBuf {
+    let mut probe = path.to_path_buf();
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    let dst = loop {
+    loop {
         if let Ok(mut c) = probe.canonicalize() {
             for part in tail.iter().rev() {
                 c.push(part);
             }
-            break c;
+            return c;
         }
         match probe.file_name() {
             Some(name) => {
                 tail.push(name.to_os_string());
                 if !probe.pop() {
-                    break output_dir.to_path_buf();
+                    return path.to_path_buf();
                 }
             }
-            None => break output_dir.to_path_buf(),
+            None => return path.to_path_buf(),
         }
-    };
+    }
+}
+
+/// Refuse ANY filesystem overlap between a snapshot operation's source and
+/// destination — equal, destination inside the source, or destination an
+/// ANCESTOR of the source (audit A22).
+///
+/// The descendant case copies a tree into itself. The ancestor case is
+/// worse: a forced replacement begins with `remove_dir_all(destination)`,
+/// which deletes the SOURCE — `backup --force TO /parent/of/data` destroyed
+/// the database it was backing up. Equal is the degenerate mix of both.
+/// Restores need the same fence: `remove_dir_all(data_dir)` runs before the
+/// copy, so a destination that is the snapshot itself (or its ancestor)
+/// destroys the input before it is read. All checks run before any mutation.
+fn reject_path_overlap(source: &Path, destination: &Path, action: &str) -> io::Result<()> {
+    let src = resolve_pseudo(source);
+    let dst = resolve_pseudo(destination);
+    if src == dst {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{action} destination {} is the same directory as {} — refusing",
+                destination.display(),
+                source.display()
+            ),
+        ));
+    }
     if dst.starts_with(&src) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -690,23 +768,46 @@ fn reject_nested_destination(data_dir: &Path, output_dir: &Path) -> io::Result<(
             ),
         ));
     }
+    if src.starts_with(&dst) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{action} destination {} contains the data directory {} — a forced overwrite \
+                 would delete the data directory before copying it. Choose a destination that \
+                 is not an ancestor of the source.",
+                dst.display(),
+                src.display()
+            ),
+        ));
+    }
     Ok(())
 }
 
-fn prepare_output_dir(output_dir: &Path, force: bool) -> io::Result<()> {
+/// The staging sibling a backup is built in before publication:
+/// `<destination>.staging-<pid>` next to the destination (same filesystem,
+/// so the final rename is atomic). Building here keeps the previous valid
+/// generation intact until the new snapshot is complete and durable.
+fn staging_sibling(output_dir: &Path) -> PathBuf {
+    let mut name = output_dir
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".staging-{}", std::process::id()));
+    output_dir
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(name)
+}
+
+/// Publish a fully built staging directory: remove the previous generation
+/// (only now — the new one is complete), then rename staging into place.
+/// On failure the staging tree is deliberately left behind: it may be the
+/// only complete copy.
+fn publish_staging(staging: &Path, output_dir: &Path) -> io::Result<()> {
     if output_dir.exists() {
-        if !force {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "destination already exists: {} (use force to overwrite)",
-                    output_dir.display()
-                ),
-            ));
-        }
         std::fs::remove_dir_all(output_dir)?;
     }
-    std::fs::create_dir_all(output_dir)
+    std::fs::rename(staging, output_dir)
 }
 
 fn write_manifest(output_dir: &Path, manifest: &BackupManifest) -> io::Result<()> {
@@ -749,6 +850,11 @@ pub fn restore_data_dir(
             ),
         ));
     }
+    // The destination is removed before the copy lands. A destination that
+    // overlaps the INPUT (the snapshot itself, or an ancestor of it) would
+    // destroy the input with that removal — reject before any mutation
+    // (audit A22).
+    reject_path_overlap(input_dir, data_dir, "restore")?;
     let manifest: BackupManifest = serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -1373,4 +1479,134 @@ mod tests {
         drop(lock);
         let _ = std::fs::remove_dir_all(&root);
     }
+
+// ── Path fences + staged publication (audit A22) ─────────────────────
+
+/// A forced backup to an ANCESTOR of the data directory must be refused
+/// before any mutation: `prepare_output_dir(force)` used to begin with
+/// `remove_dir_all(destination)` — which deleted the database being backed
+/// up. Equal and descendant cases are refused for the copy-recursion they
+/// cause; the ancestor case is the destructive one.
+#[test]
+fn backup_destination_ancestor_equal_and_descendant_are_refused_untouched() {
+    let root = unique_tmp("fence");
+    let _ = std::fs::remove_dir_all(&root);
+    let data = root.join("nest").join("data");
+    write(&data, "catalog.json", b"{\"tables\":1}");
+
+    let before = dir_fingerprint(&root);
+
+    // Ancestor: the destination CONTAINS the source.
+    let err = backup_data_dir(&data, &root.join("nest"), true, "0.1.1").unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(
+        err.to_string().contains("ancestor"),
+        "refusal must name the ancestor problem: {err}"
+    );
+
+    // Equal: the destination IS the source.
+    let err = backup_data_dir(&data, &data, true, "0.1.1").unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+    // Descendant (the classic): the destination is inside the source.
+    let err = backup_data_dir(&data, &data.join("snap"), true, "0.1.1").unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(
+        err.to_string().contains("inside the data directory"),
+        "nested refusal message must stay recognizable: {err}"
+    );
+
+    assert_eq!(
+        before,
+        dir_fingerprint(&root),
+        "a refused backup must not touch either tree"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Restoring a snapshot onto ITSELF (or onto an ancestor of the snapshot)
+/// must be refused before `remove_dir_all(data_dir)` destroys the input.
+#[test]
+fn restore_onto_its_own_snapshot_is_refused_untouched() {
+    let root = unique_tmp("restore_fence");
+    let _ = std::fs::remove_dir_all(&root);
+    let data = root.join("data_dir");
+    write(&data, "catalog.json", b"{\"tables\":1}");
+    let snap = root.join("snap");
+    backup_data_dir(&data, &snap, false, "0.1.1").unwrap();
+
+    let before = dir_fingerprint(&root);
+
+    // Onto itself.
+    let err = restore_data_dir(&snap, &snap, true, "0.1.1").unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+    // Onto an ancestor of the snapshot (removing the destination would
+    // remove the snapshot with it).
+    let err = restore_data_dir(&snap, &root, true, "0.1.1").unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(
+        err.to_string().contains("ancestor"),
+        "refusal must name the ancestor problem: {err}"
+    );
+
+    assert_eq!(
+        before,
+        dir_fingerprint(&root),
+        "a refused restore must not touch either tree"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A failed forced rebuild must leave the previous generation at the
+/// destination intact (staged publication): the old snapshot is removed only
+/// after the new one is complete. Failure injected as an unreadable source
+/// file.
+#[cfg(unix)]
+#[test]
+fn a_failed_rebuild_keeps_the_previous_generation() {
+    let root = unique_tmp("staged");
+    let _ = std::fs::remove_dir_all(&root);
+    let data = root.join("data_dir");
+    write(&data, "catalog.json", b"v1");
+    let dest = root.join("snap");
+    backup_data_dir(&data, &dest, false, "0.1.1").unwrap();
+
+    // Grow the source, then break it: one unreadable file.
+    write(&data, "storage/big.dat", b"v2-payload");
+    let victim = data.join("storage").join("big.dat");
+    std::fs::set_permissions(&victim, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+        .unwrap();
+
+    let before = dir_fingerprint(&dest);
+    let err = backup_data_dir(&data, &dest, true, "0.1.1");
+    std::fs::set_permissions(&victim, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+        .unwrap();
+    assert!(
+        err.is_err(),
+        "the unreadable source file must fail the rebuild (test would be vacuous as root)"
+    );
+
+    assert_eq!(
+        before,
+        dir_fingerprint(&dest),
+        "the previous generation must survive a failed rebuild"
+    );
+    // No staging debris left behind after a clean (non-crash) failure.
+    let debris: Vec<_> = std::fs::read_dir(&root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".staging-"))
+        .collect();
+    assert!(debris.is_empty(), "staging debris: {debris:?}");
+
+    // And the destination still restores.
+    let restored = root.join("restored");
+    restore_data_dir(&dest, &restored, false, "0.1.1").unwrap();
+    assert_eq!(
+        std::fs::read(restored.join("catalog.json")).unwrap(),
+        b"v1"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
 }
