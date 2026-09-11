@@ -503,9 +503,9 @@ impl Executor {
 
     /// Scalar-subquery cardinality, shared by the constant-context and
     /// row-context evaluation paths: 0 rows → NULL, 1 row → its first cell,
-    /// >1 rows → the PostgreSQL error. An explicit `LIMIT 1` never returns
-    /// more than one row, so it needs no exception. The row path used to
-    /// take `rows[0][0]` silently — a wrong result (audit A16).
+    /// more than one row → the PostgreSQL error. An explicit `LIMIT 1` never
+    /// returns more than one row, so it needs no exception. The row path
+    /// used to take `rows[0][0]` silently — a wrong result (audit A16).
     fn scalar_subquery_value(rows: &[Row]) -> Result<Value, ExecError> {
         if rows.len() > 1 {
             return Err(ExecError::Runtime(

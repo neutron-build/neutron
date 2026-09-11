@@ -6564,8 +6564,8 @@ impl Executor {
             if mode != crate::distributed::ClusterMode::Standalone {
                 let has_security_ddl = statements
                     .iter()
-                    .any(|statement| Self::statement_is_security_ddl(statement));
-                let has_dml = statements.iter().any(|s| Self::statement_is_dml(s));
+                    .any(Self::statement_is_security_ddl);
+                let has_dml = statements.iter().any(Self::statement_is_dml);
                 if has_security_ddl {
                     // Authenticate authority before proposing a command that
                     // followers intentionally apply as the internal Raft user.
