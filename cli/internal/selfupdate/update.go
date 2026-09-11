@@ -3,7 +3,9 @@ package selfupdate
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -62,9 +64,18 @@ func DetectInstallMethod() InstallMethod {
 
 // CheckForUpdate checks if a newer CLI version is available.
 // It fetches all recent releases and finds the latest cli/vX.Y.Z tag.
+//
+// Prerelease policy: a prerelease tag is offered only when the current
+// version is itself a prerelease, so stable installs stay on stable
+// releases while an rc still upgrades to its own final.
 func CheckForUpdate(currentVersion string) (*Release, bool, error) {
 	if currentVersion == "dev" {
 		return nil, false, nil
+	}
+
+	currentVer, ok := parseSemverVersion(normalizeVersion(currentVersion))
+	if !ok {
+		return nil, false, fmt.Errorf("current version %q is not valid semver", currentVersion)
 	}
 
 	client := &http.Client{Timeout: 10 * time.Second}
@@ -83,31 +94,50 @@ func CheckForUpdate(currentVersion string) (*Release, bool, error) {
 		return nil, false, err
 	}
 
-	// Find the latest release with a cli/ tag prefix
+	// Find the latest eligible release with a cli/ tag prefix. A malformed
+	// version tag is skipped rather than mangled into a comparison.
 	var latest *Release
+	var latestVer semver
 	for i := range releases {
-		if strings.HasPrefix(releases[i].TagName, tagPrefix) {
-			latest = &releases[i]
-			break // GitHub returns newest first
+		if !strings.HasPrefix(releases[i].TagName, tagPrefix) {
+			continue
 		}
+		v, ok := parseSemverVersion(extractVersion(releases[i].TagName))
+		if !ok {
+			continue
+		}
+		if len(v.prerelease) > 0 && len(currentVer.prerelease) == 0 {
+			continue
+		}
+		latest = &releases[i]
+		latestVer = v
+		break // GitHub returns newest first
 	}
 
 	if latest == nil {
 		return nil, false, fmt.Errorf("no CLI releases found (looking for %s* tags)", tagPrefix)
 	}
 
-	latestVer := extractVersion(latest.TagName)
-	currentVer := normalizeVersion(currentVersion)
-
-	if compareSemver(latestVer, currentVer) > 0 {
+	if compareParsedSemver(latestVer, currentVer) > 0 {
 		return latest, true, nil
 	}
 
 	return latest, false, nil
 }
 
+// Download and verify stage limits. The initial version check is bounded to
+// ten seconds; the archive and checksum stages carry their own deadlines and
+// explicit byte caps so an abnormal upstream response cannot stall the
+// upgrade or consume unbounded disk and memory (audit neutron-11).
+const (
+	archiveDownloadTimeout  = 10 * time.Minute
+	checksumDownloadTimeout = 30 * time.Second
+	maxArchiveBytes         = int64(256 << 20)
+	maxChecksumBytes        = int64(1 << 20)
+)
+
 // DownloadAndReplace downloads the new binary, verifies checksum, and replaces the current one.
-func DownloadAndReplace(release *Release) error {
+func DownloadAndReplace(ctx context.Context, release *Release) error {
 	ver := extractVersion(release.TagName)
 	archiveExt := "tar.gz"
 	if runtime.GOOS == "windows" {
@@ -131,7 +161,7 @@ func DownloadAndReplace(release *Release) error {
 	}
 
 	// Download archive to temp file
-	archivePath, err := downloadToTemp(downloadURL)
+	archivePath, err := downloadToTemp(ctx, downloadURL, maxArchiveBytes, archiveDownloadTimeout)
 	if err != nil {
 		return fmt.Errorf("download archive: %w", err)
 	}
@@ -141,12 +171,12 @@ func DownloadAndReplace(release *Release) error {
 	if checksumURL == "" {
 		return fmt.Errorf("release is missing integrity checksum file; cannot verify download safely")
 	}
-	if err := verifyChecksum(archivePath, assetName, checksumURL); err != nil {
+	if err := verifyChecksum(ctx, archivePath, assetName, checksumURL); err != nil {
 		return fmt.Errorf("checksum verification failed: %w", err)
 	}
 
 	// Extract the neutron binary from the archive
-	binaryPath, err := extractBinary(archivePath)
+	binaryPath, err := extractBinary(archivePath, archiveExt)
 	if err != nil {
 		return fmt.Errorf("extract binary: %w", err)
 	}
@@ -210,9 +240,18 @@ func swapBinary(execPath, newPath string) error {
 	return nil
 }
 
-// downloadToTemp downloads a URL to a temp file and returns its path.
-func downloadToTemp(url string) (string, error) {
-	resp, err := http.Get(url)
+// downloadToTemp downloads a URL to a temp file and returns its path. The
+// stage has an explicit deadline and byte cap, and the file is synced and
+// closed with checked errors before the path is handed back.
+func downloadToTemp(ctx context.Context, url string, maxBytes int64, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -221,32 +260,76 @@ func downloadToTemp(url string) (string, error) {
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
 	}
+	if resp.ContentLength > maxBytes {
+		return "", fmt.Errorf("response of %d bytes exceeds the %d-byte limit", resp.ContentLength, maxBytes)
+	}
 
 	tmp, err := os.CreateTemp("", "neutron-update-*")
 	if err != nil {
 		return "", err
 	}
 
-	if _, err := io.Copy(tmp, resp.Body); err != nil {
-		tmp.Close()
+	// LimitReader with maxBytes+1 so an oversized body is detected by the
+	// copy length even when ContentLength lied or was absent.
+	n, err := io.Copy(tmp, io.LimitReader(resp.Body, maxBytes+1))
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
 		os.Remove(tmp.Name())
 		return "", err
 	}
-	tmp.Close()
+	if n > maxBytes {
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("download exceeded the %d-byte limit", maxBytes)
+	}
+	if err := syncFile(tmp.Name()); err != nil {
+		os.Remove(tmp.Name())
+		return "", err
+	}
 	return tmp.Name(), nil
 }
 
+// syncFile fsyncs a closed file's contents so a crash after download cannot
+// leave a truncated archive to verify and install.
+func syncFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
+}
+
 // verifyChecksum downloads the checksums file and verifies the archive.
-func verifyChecksum(archivePath, assetName, checksumURL string) error {
-	resp, err := http.Get(checksumURL)
+func verifyChecksum(ctx context.Context, archivePath, assetName, checksumURL string) error {
+	ctx, cancel := context.WithTimeout(ctx, checksumDownloadTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checksumURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d fetching %s", resp.StatusCode, checksumURL)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxChecksumBytes+1))
 	if err != nil {
 		return err
+	}
+	if int64(len(body)) > maxChecksumBytes {
+		return fmt.Errorf("checksum file exceeds the %d-byte limit", maxChecksumBytes)
 	}
 
 	// Parse checksums.txt: each line is "sha256hash  filename"
@@ -281,8 +364,18 @@ func verifyChecksum(archivePath, assetName, checksumURL string) error {
 	return nil
 }
 
-// extractBinary extracts the "neutron" binary from a .tar.gz archive to a temp file.
-func extractBinary(archivePath string) (string, error) {
+// extractBinary extracts the "neutron" binary from a release archive to a
+// temp file. Windows releases ship as ZIP; every other platform ships
+// tar.gz — the extractor must match the format the asset name selected, or
+// a valid Windows ZIP fails against the gzip reader (audit neutron-08).
+func extractBinary(archivePath, format string) (string, error) {
+	if format == "zip" {
+		return extractBinaryFromZip(archivePath)
+	}
+	return extractBinaryFromTarGz(archivePath)
+}
+
+func extractBinaryFromTarGz(archivePath string) (string, error) {
 	f, err := os.Open(archivePath)
 	if err != nil {
 		return "", err
@@ -325,6 +418,45 @@ func extractBinary(archivePath string) (string, error) {
 	return "", fmt.Errorf("neutron binary not found in archive")
 }
 
+func extractBinaryFromZip(archivePath string) (string, error) {
+	zr, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return "", err
+	}
+	defer zr.Close()
+
+	for _, f := range zr.File {
+		name := filepath.Base(f.Name)
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		if name == "neutron" || name == "neutron.exe" {
+			rc, err := f.Open()
+			if err != nil {
+				return "", err
+			}
+			tmp, err := os.CreateTemp("", "neutron-bin-*")
+			if err != nil {
+				rc.Close()
+				return "", err
+			}
+			_, copyErr := io.Copy(tmp, rc)
+			rc.Close()
+			if cerr := tmp.Close(); copyErr == nil {
+				copyErr = cerr
+			}
+			if copyErr != nil {
+				os.Remove(tmp.Name())
+				return "", copyErr
+			}
+			os.Chmod(tmp.Name(), 0755)
+			return tmp.Name(), nil
+		}
+	}
+
+	return "", fmt.Errorf("neutron binary not found in archive")
+}
+
 // copyFile copies src to dst (cross-device safe, unlike os.Rename).
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
@@ -357,39 +489,188 @@ func normalizeVersion(v string) string {
 	return strings.TrimPrefix(v, "v")
 }
 
-// compareSemver returns >0 if a > b, <0 if a < b, 0 if equal.
-// Handles X.Y.Z format. Non-numeric parts are ignored (treated as 0).
-func compareSemver(a, b string) int {
-	aParts := parseSemver(a)
-	bParts := parseSemver(b)
-
-	for i := 0; i < 3; i++ {
-		if aParts[i] != bParts[i] {
-			return aParts[i] - bParts[i]
-		}
-	}
-	return 0
+// semver is a parsed SemVer 2.0.0 version. Build metadata is dropped at
+// parse time: the spec forbids it from participating in precedence.
+type semver struct {
+	major, minor, patch uint64
+	// prerelease identifiers, or nil for a final release
+	prerelease []string
 }
 
-// parseSemver splits "X.Y.Z" into [X, Y, Z]. Missing parts default to 0.
-func parseSemver(v string) [3]int {
-	var parts [3]int
-	// Strip any pre-release suffix (e.g. "1.2.3-beta")
-	if idx := strings.IndexByte(v, '-'); idx >= 0 {
-		v = v[:idx]
+// parseSemverVersion parses X.Y.Z with optional -prerelease and +build
+// parts. Missing minor/patch default to 0 (historical leniency). Every
+// present component must be valid: numeric identifiers are digits without
+// leading zeros, prerelease identifiers are non-empty alphanumeric-plus
+// runs. Malformed input returns ok=false instead of being mangled into a
+// plausible number (audit neutron-10).
+func parseSemverVersion(v string) (semver, bool) {
+	if i := strings.IndexByte(v, '+'); i >= 0 {
+		v = v[:i]
 	}
-	segments := strings.SplitN(v, ".", 3)
-	for i, s := range segments {
-		if i >= 3 {
-			break
+	core, pre := v, ""
+	if i := strings.IndexByte(v, '-'); i >= 0 {
+		core, pre = v[:i], v[i+1:]
+	}
+
+	var s semver
+	parts := strings.Split(core, ".")
+	if len(parts) > 3 {
+		return semver{}, false
+	}
+	dst := []*uint64{&s.major, &s.minor, &s.patch}
+	for i, p := range parts {
+		n, ok := parseUint64(p)
+		if !ok {
+			return semver{}, false
 		}
-		n := 0
-		for _, c := range s {
-			if c >= '0' && c <= '9' {
-				n = n*10 + int(c-'0')
+		*dst[i] = n
+	}
+
+	if pre != "" {
+		s.prerelease = strings.Split(pre, ".")
+		for _, id := range s.prerelease {
+			if !validPrereleaseIdentifier(id) {
+				return semver{}, false
 			}
 		}
-		parts[i] = n
 	}
-	return parts
+	return s, true
+}
+
+// parseUint64 accepts digits only, with no leading zeros ("0" alone is
+// fine). Anything else — empty, signed, hex, overflow — is rejected.
+func parseUint64(s string) (uint64, bool) {
+	if s == "" || (len(s) > 1 && s[0] == '0') {
+		return 0, false
+	}
+	var n uint64
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		d := uint64(c - '0')
+		if n > (^uint64(0)-d)/10 {
+			return 0, false
+		}
+		n = n*10 + d
+	}
+	return n, true
+}
+
+func validPrereleaseIdentifier(id string) bool {
+	if id == "" {
+		return false
+	}
+	allDigits := true
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '-':
+			allDigits = false
+		default:
+			return false
+		}
+	}
+	// A numeric identifier may not carry leading zeros.
+	if allDigits {
+		_, ok := parseUint64(id)
+		return ok
+	}
+	return true
+}
+
+// compareParsedSemver implements SemVer 2.0.0 precedence over two parsed
+// versions.
+func compareParsedSemver(a, b semver) int {
+	if a.major != b.major {
+		return cmpUint64(a.major, b.major)
+	}
+	if a.minor != b.minor {
+		return cmpUint64(a.minor, b.minor)
+	}
+	if a.patch != b.patch {
+		return cmpUint64(a.patch, b.patch)
+	}
+	return comparePrerelease(a.prerelease, b.prerelease)
+}
+
+func cmpUint64(a, b uint64) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// comparePrerelease follows spec section 11: a release outranks any
+// prerelease of the same core; identifiers compare numerically when both
+// are numeric, lexically otherwise, and numeric identifiers outrank
+// lexical ones; a longer identifier list outranks a prefix of itself.
+func comparePrerelease(a, b []string) int {
+	if len(a) == 0 && len(b) == 0 {
+		return 0
+	}
+	if len(a) == 0 {
+		return 1
+	}
+	if len(b) == 0 {
+		return -1
+	}
+	for i := 0; i < len(a) && i < len(b); i++ {
+		an, aNum := parseUint64(a[i])
+		bn, bNum := parseUint64(b[i])
+		switch {
+		case aNum && bNum:
+			if an != bn {
+				return cmpUint64(an, bn)
+			}
+		case aNum:
+			return -1
+		case bNum:
+			return 1
+		default:
+			if a[i] != b[i] {
+				if a[i] < b[i] {
+					return -1
+				}
+				return 1
+			}
+		}
+	}
+	return cmpInt(len(a), len(b))
+}
+
+func cmpInt(a, b int) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// compareSemver returns >0 if a > b, <0 if a < b, 0 if equal, following
+// SemVer 2.0.0 precedence including prereleases; build metadata is
+// ignored. A malformed version compares below any valid one, and equal to
+// another malformed one, so a bad tag can never look "newer" by accident.
+func compareSemver(a, b string) int {
+	av, aok := parseSemverVersion(a)
+	bv, bok := parseSemverVersion(b)
+	switch {
+	case aok && bok:
+		return compareParsedSemver(av, bv)
+	case aok:
+		return 1
+	case bok:
+		return -1
+	default:
+		return 0
+	}
 }
