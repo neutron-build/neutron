@@ -768,6 +768,74 @@ impl RlsEngine {
             .map(|(i, _)| i)
             .collect()
     }
+
+    /// Three-way merge of staged policy state onto this committed engine
+    /// (audit A6). See [`SecurityManager::merge_policy_state`].
+    pub fn merge_with_staged(&self, base: &Self, staged: &Self) -> Self {
+        let mut merged = self.clone();
+        // RLS enablement, per table: only a toggle the staged copy changed
+        // relative to the baseline overrides the live state.
+        let tables: std::collections::HashSet<&String> = base
+            .enabled_tables
+            .iter()
+            .chain(staged.enabled_tables.iter())
+            .chain(self.enabled_tables.iter())
+            .collect();
+        for table in tables {
+            let staged_on = staged.enabled_tables.contains(table);
+            if base.enabled_tables.contains(table) != staged_on {
+                if staged_on {
+                    merged.enabled_tables.insert(table.clone());
+                } else {
+                    merged.enabled_tables.remove(table);
+                }
+            }
+        }
+        // Policies, keyed by (table, name): where staging differs from the
+        // baseline the staged version replaces the live one (added, altered,
+        // or dropped); everywhere else the live version wins.
+        let keys: std::collections::HashSet<(&String, &String)> = base
+            .policies
+            .iter()
+            .chain(staged.policies.iter())
+            .chain(self.policies.iter())
+            .flat_map(|(table, policies)| policies.iter().map(move |p| (table, &p.name)))
+            .collect();
+        for (table, name) in keys {
+            fn find<'e>(
+                engine: &'e RlsEngine,
+                table: &str,
+                name: &str,
+            ) -> Option<&'e RlsPolicy> {
+                engine
+                    .policies
+                    .get(table)
+                    .and_then(|ps| ps.iter().find(|p| p.name == name))
+            }
+            if find(base, table, name) != find(staged, table, name) {
+                match find(staged, table, name) {
+                    Some(staged_policy) => {
+                        let existing = merged
+                            .policies
+                            .get_mut(table)
+                            .and_then(|ps| ps.iter_mut().find(|p| p.name == *name));
+                        match existing {
+                            Some(slot) => *slot = staged_policy.clone(),
+                            None => merged
+                                .policies
+                                .entry(table.clone())
+                                .or_default()
+                                .push(staged_policy.clone()),
+                        }
+                    }
+                    None => {
+                        merged.remove_policy(table, name);
+                    }
+                }
+            }
+        }
+        merged
+    }
 }
 
 // ============================================================================
@@ -969,6 +1037,51 @@ impl MaskingEngine {
         self.policies.retain(|policy| policy.table != table);
     }
 
+    /// Three-way merge of staged masking state onto this committed engine
+    /// (audit A6). See [`SecurityManager::merge_policy_state`]. Entries are
+    /// keyed by `(table, column, role)` — the identity the DDL surface and
+    /// `remove_policy` already use.
+    pub fn merge_with_staged(&self, base: &Self, staged: &Self) -> Self {
+        let mut merged = self.clone();
+        let keys: std::collections::HashSet<(&String, &String, &String)> = base
+            .policies
+            .iter()
+            .chain(staged.policies.iter())
+            .chain(self.policies.iter())
+            .map(|p| (&p.table, &p.column, &p.role))
+            .collect();
+        for (table, column, role) in keys {
+            fn find<'e>(
+                engine: &'e MaskingEngine,
+                table: &str,
+                column: &str,
+                role: &str,
+            ) -> Option<&'e MaskingPolicy> {
+                engine
+                    .policies
+                    .iter()
+                    .find(|p| p.table == table && p.column == column && p.role == role)
+            }
+            if find(base, table, column, role) != find(staged, table, column, role) {
+                match find(staged, table, column, role) {
+                    Some(staged_policy) => {
+                        let existing = merged.policies.iter_mut().find(|p| {
+                            p.table == *table && p.column == *column && p.role == *role
+                        });
+                        match existing {
+                            Some(slot) => *slot = staged_policy.clone(),
+                            None => merged.policies.push(staged_policy.clone()),
+                        }
+                    }
+                    None => {
+                        merged.remove_policy(table, column, role);
+                    }
+                }
+            }
+        }
+        merged
+    }
+
     /// Get the masking rule for a specific table/column/role combination.
     /// Whether any masking policy exists at all.
     ///
@@ -1137,6 +1250,28 @@ impl SecurityManager {
         Self {
             rls: self.rls.clone(),
             masking: self.masking.clone(),
+            audit: AuditLog::new(),
+        }
+    }
+
+    /// Three-way merge of a session's staged policy state onto the committed
+    /// catalog this manager holds (audit A6).
+    ///
+    /// `base` is the committed catalog as of the staging session's BEGIN
+    /// (`TxnState::security_snapshot`); `staged` is that session's pending
+    /// catalog, cloned wholesale at its first policy write. Publishing
+    /// `staged` wholesale silently reverted every policy entry another
+    /// session committed after this BEGIN — last-writer-wins on the whole
+    /// catalog. The merge instead takes the staged version only where it
+    /// differs from the baseline (this session's own delta) and keeps the
+    /// live version everywhere else, so concurrent committed changes
+    /// survive. Two sessions editing disjoint entries both survive; the
+    /// same entry edited by both stays last-writer-wins, scoped to that
+    /// entry.
+    pub fn merge_policy_state(&self, base: &Self, staged: &Self) -> Self {
+        Self {
+            rls: self.rls.merge_with_staged(&base.rls, &staged.rls),
+            masking: self.masking.merge_with_staged(&base.masking, &staged.masking),
             audit: AuditLog::new(),
         }
     }
@@ -1526,6 +1661,112 @@ mod tests {
             !engine.check_row("orders", PolicyCommand::Select, &row, &named_only),
             "a role NAMED superuser must not bypass RLS without the attribute"
         );
+    }
+
+    fn named_policy(name: &str, table: &str, value: &str) -> RlsPolicy {
+        RlsPolicy {
+            name: name.into(),
+            table: table.into(),
+            command: PolicyCommand::All,
+            target_roles: vec![],
+            predicate: RlsPredicate::ColumnEqStr {
+                column: "owner".into(),
+                value: value.into(),
+                column_id: 0,
+            },
+            check_predicate: None,
+            permissive: true,
+        }
+    }
+
+    /// A6: publication merges, it does not overwrite. The staged catalog is a
+    /// whole-catalog clone, so wholesale publication silently reverted every
+    /// entry another session committed after this BEGIN.
+    #[test]
+    fn rls_merge_keeps_concurrently_committed_entries() {
+        let mut base = RlsEngine::new();
+        base.enable_rls("t");
+        base.add_policy(named_policy("existing", "t", "alice"));
+
+        // This session stages one new policy of its own.
+        let mut staged = base.clone();
+        staged.add_policy(named_policy("staged_new", "t", "bob"));
+
+        // Another session commits after the staging: a policy on another
+        // table plus an RLS toggle this session never staged.
+        let mut live = base.clone();
+        live.enable_rls("other");
+        live.add_policy(named_policy("concurrent", "other", "carol"));
+
+        let merged = live.merge_with_staged(&base, &staged);
+        assert!(
+            merged.policy("t", "staged_new").is_some(),
+            "this session's staged policy must publish"
+        );
+        assert!(
+            merged.policy("other", "concurrent").is_some(),
+            "a concurrently committed policy must survive publication"
+        );
+        assert!(
+            merged.is_enabled("other"),
+            "a concurrent RLS toggle must survive publication"
+        );
+        assert!(merged.is_enabled("t"));
+    }
+
+    /// A6: a staged drop publishes, and scopes itself to the entry the
+    /// session actually dropped.
+    #[test]
+    fn rls_merge_scopes_staged_drops_and_edits() {
+        let mut base = RlsEngine::new();
+        base.enable_rls("t");
+        base.add_policy(named_policy("mine", "t", "alice"));
+        base.add_policy(named_policy("theirs", "t", "carol"));
+
+        let mut staged = base.clone();
+        assert!(staged.remove_policy("t", "mine"));
+
+        // Concurrent commit ALTERs `theirs` on the live catalog.
+        let mut live = base.clone();
+        live.remove_policy("t", "theirs");
+        live.add_policy(named_policy("theirs", "t", "dave"));
+
+        let merged = live.merge_with_staged(&base, &staged);
+        assert!(
+            merged.policy("t", "mine").is_none(),
+            "the staged drop must publish"
+        );
+        match &merged.policy("t", "theirs").unwrap().predicate {
+            RlsPredicate::ColumnEqStr { value, .. } => assert_eq!(
+                value, "dave",
+                "a concurrent edit to an entry this session did not stage must survive"
+            ),
+            other => panic!("unexpected predicate: {other:?}"),
+        }
+    }
+
+    /// A6: when both sessions changed the SAME entry, the merge stays
+    /// last-writer-wins — but scoped to that entry, not the whole catalog.
+    #[test]
+    fn rls_merge_same_entry_stays_last_writer_wins() {
+        let mut base = RlsEngine::new();
+        base.add_policy(named_policy("shared", "t", "original"));
+
+        let mut staged = base.clone();
+        staged.remove_policy("t", "shared");
+        staged.add_policy(named_policy("shared", "t", "staged-version"));
+
+        let mut live = base.clone();
+        live.remove_policy("t", "shared");
+        live.add_policy(named_policy("shared", "t", "concurrent-version"));
+
+        let merged = live.merge_with_staged(&base, &staged);
+        match &merged.policy("t", "shared").unwrap().predicate {
+            RlsPredicate::ColumnEqStr { value, .. } => {
+                assert_eq!(value, "staged-version")
+            }
+            other => panic!("unexpected predicate: {other:?}"),
+        }
     }
 
     #[test]
@@ -2297,5 +2538,34 @@ mod masking_identity_tests {
             .find(|p| p.table == "staff")
             .unwrap();
         assert_eq!(staff.column, "ssn");
+    }
+
+    /// A6: masking publication merges the same way RLS publication does — a
+    /// mask another session committed after this BEGIN survives.
+    #[test]
+    fn masking_merge_keeps_concurrently_committed_entries() {
+        let mut base = MaskingEngine::new();
+        base.add_policy(mask("people", "ssn"));
+
+        let mut staged = base.clone();
+        staged.add_policy(mask("people", "email"));
+
+        let mut live = base.clone();
+        live.add_policy(mask("staff", "salary"));
+
+        let merged = live.merge_with_staged(&base, &staged);
+        assert_eq!(
+            merged.all_policies().len(),
+            3,
+            "the merge must keep this session's staged mask AND the concurrently committed one: {:?}",
+            merged.all_policies()
+        );
+        assert!(
+            merged
+                .all_policies()
+                .iter()
+                .any(|p| p.table == "staff" && p.column == "salary"),
+            "a concurrently committed mask must survive publication"
+        );
     }
 }

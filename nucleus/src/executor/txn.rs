@@ -161,6 +161,10 @@ impl Executor {
         // Taken before the state is cleared; published below, after the commit
         // decision (A7).
         let security_pending = txn.security_pending.take();
+        // The committed catalog as of BEGIN: the baseline that tells the
+        // publication below which entries this session staged, versus which
+        // entries another session committed concurrently (A6).
+        let security_base = txn.security_snapshot.take();
         // The storage commit above made this transaction's rows visible, so any
         // UNIQUE / PRIMARY KEY slots it was holding can go back: a waiting
         // session's constraint check will now see the rows and report the
@@ -218,7 +222,21 @@ impl Executor {
             && let Some(pending) = security_pending
         {
             let before = self.security.read().clone_policy_state();
-            *self.security.write() = pending;
+            // A6: publish this session's DELTAS onto the live catalog, not the
+            // staged whole-catalog clone. The clone was taken at this
+            // session's first policy write, so installing it wholesale
+            // silently reverted any policy entry another session committed
+            // after this BEGIN. The three-way merge keeps every live entry
+            // this session did not stage; an entry both sessions changed
+            // stays last-writer-wins, scoped to that entry. Without a
+            // baseline (unreachable — BEGIN always takes one, and nothing
+            // clears it before this point) the old wholesale publish is the
+            // fallback.
+            let merged = match security_base.as_ref() {
+                Some(base) => before.merge_policy_state(base, &pending),
+                None => pending,
+            };
+            *self.security.write() = merged;
             self.bump_policy_gen();
             #[cfg(feature = "server")]
             {

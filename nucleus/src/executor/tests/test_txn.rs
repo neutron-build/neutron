@@ -1109,3 +1109,94 @@ async fn failed_commit_publishes_no_policy_and_keeps_other_sessions_changes() {
     ex.drop_session(t);
     ex.drop_session(other);
 }
+
+// ======================================================================
+// Successful COMMIT merges staged policy with concurrent changes (audit A6)
+// ======================================================================
+
+/// The staged security catalog is a whole-catalog clone taken at this
+/// session's first policy write, so publishing it wholesale used to silently
+/// revert any policy another session committed after this BEGIN — the A7 fix
+/// closed the failure path; this is the success path's residual. COMMIT must
+/// merge this session's deltas onto the live catalog: both sessions' policies
+/// survive.
+#[tokio::test]
+async fn commit_merges_staged_policy_with_concurrent_committed_policy() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE guarded (id INT PRIMARY KEY, owner TEXT)").await;
+    exec(&ex, "ALTER TABLE guarded ENABLE ROW LEVEL SECURITY").await;
+
+    let stager = ex.create_session();
+    ex.execute_with_session(stager, "BEGIN").await.unwrap();
+    // First policy write of the session: the whole-catalog clone is staged
+    // HERE, before the concurrent commit below.
+    ex.execute_with_session(
+        stager,
+        "CREATE POLICY staged_p ON guarded TO PUBLIC USING (owner = CURRENT_USER)",
+    )
+    .await
+    .unwrap();
+
+    // A concurrent autocommit session commits its own policy AFTER the
+    // staging above: wholesale publication would revert it.
+    exec(
+        &ex,
+        "CREATE POLICY concurrent_p ON guarded TO PUBLIC USING (id >= 0)",
+    )
+    .await;
+
+    ex.execute_with_session(stager, "COMMIT").await.unwrap();
+
+    let names = rows(&exec(&ex, "SELECT policyname FROM pg_policies ORDER BY policyname").await[0]).clone();
+    let listed: Vec<String> = names
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Text(s) => s.clone(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        vec!["concurrent_p".to_string(), "staged_p".to_string()],
+        "COMMIT must publish this session's policy without reverting the \
+         concurrently committed one"
+    );
+    ex.drop_session(stager);
+}
+
+/// The same merge for RLS enablement: a concurrent DISABLE committed while
+/// this session held a staged catalog must not be undone by the staged
+/// catalog's stale enabled-bit.
+#[tokio::test]
+async fn commit_merges_staged_policy_with_concurrent_rls_toggle() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE guarded (id INT PRIMARY KEY, owner TEXT)").await;
+    exec(&ex, "ALTER TABLE guarded ENABLE ROW LEVEL SECURITY").await;
+
+    let stager = ex.create_session();
+    ex.execute_with_session(stager, "BEGIN").await.unwrap();
+    ex.execute_with_session(
+        stager,
+        "CREATE POLICY staged_p ON guarded TO PUBLIC USING (owner = CURRENT_USER)",
+    )
+    .await
+    .unwrap();
+
+    // Concurrent autocommit: disable RLS on a DIFFERENT table than the staged
+    // policy's — the staged clone still carries it as enabled, and wholesale
+    // publication would silently re-enable it.
+    exec(&ex, "ALTER TABLE guarded DISABLE ROW LEVEL SECURITY").await;
+
+    ex.execute_with_session(stager, "COMMIT").await.unwrap();
+
+    // The staged policy published, and the concurrent disable survived it.
+    assert!(
+        ex.security.read().rls.policy("guarded", "staged_p").is_some(),
+        "the staged policy must publish"
+    );
+    assert!(
+        !ex.security.read().rls.is_enabled("guarded"),
+        "the concurrent DISABLE must survive the staged catalog's publication"
+    );
+    ex.drop_session(stager);
+}
