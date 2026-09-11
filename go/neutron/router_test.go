@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
 )
 
 func TestRouterBasicRoute(t *testing.T) {
@@ -327,5 +330,84 @@ func TestRoutesIncludesUntypedRegistrations(t *testing.T) {
 	}
 	if got["/api/beta"] != "POST" {
 		t.Fatalf("grouped untyped route missing or wrong prefix: %+v", got)
+	}
+}
+
+// Mount/Static/StaticFS used to register raw handlers, so middleware
+// attached to a group silently did not apply to them — any guard on the
+// group (auth, rate limit) was bypassed by mounted or static routes.
+func TestGroupMiddlewareAppliesToMountStaticStaticFS(t *testing.T) {
+	reject := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+		})
+	}
+
+	setup := func() (*Router, string) {
+		r := newRouter()
+		dir := t.TempDir()
+		os.WriteFile(filepath.Join(dir, "file.txt"), []byte("asset"), 0644)
+		g := r.Group("/g", reject)
+		g.Mount("/m", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte("mounted"))
+		}))
+		g.Static("/s/", dir)
+		g.StaticFS("/f/", http.FS(fstest.MapFS{"file.txt": &fstest.MapFile{Data: []byte("embed")}}))
+		return r, dir
+	}
+
+	for _, path := range []string{"/g/m/x", "/g/s/file.txt", "/g/f/file.txt"} {
+		t.Run(path, func(t *testing.T) {
+			r, _ := setup()
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+			if w.Code != http.StatusForbidden {
+				t.Errorf("status = %d, want 403: group middleware was not applied", w.Code)
+			}
+		})
+	}
+}
+
+// Allowed requests must reach the handler with the guard applied exactly
+// once — not zero times (bypass) and not twice (double wrap).
+func TestGroupMiddlewareRunsExactlyOnceOnMountStaticStaticFS(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+	}{
+		{"mount", "/g/m/x"},
+		{"mount-exact", "/g/m"},
+		{"static", "/g/s/file.txt"},
+		{"staticfs", "/g/f/file.txt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			pass := func(next http.Handler) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					next.ServeHTTP(w, r)
+				})
+			}
+
+			r := newRouter()
+			dir := t.TempDir()
+			os.WriteFile(filepath.Join(dir, "file.txt"), []byte("asset"), 0644)
+			g := r.Group("/g", pass)
+			g.Mount("/m", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte("mounted:" + r.URL.Path))
+			}))
+			g.Static("/s/", dir)
+			g.StaticFS("/f/", http.FS(fstest.MapFS{"file.txt": &fstest.MapFile{Data: []byte("embed")}}))
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, tc.path, nil))
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", w.Code)
+			}
+			if calls != 1 {
+				t.Errorf("guard ran %d times, want exactly 1", calls)
+			}
+		})
 	}
 }

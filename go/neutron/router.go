@@ -143,15 +143,16 @@ func (r *Router) Group(prefix string, mw ...Middleware) *Router {
 }
 
 // Mount attaches an http.Handler under a prefix. Useful for mounting external
-// handlers or sub-routers.
+// handlers or sub-routers. The group's middleware applies to the mounted
+// handler the same as any other route on the group.
 func (r *Router) Mount(prefix string, handler http.Handler) {
 	fullPrefix := r.prefix + prefix
 	r.claimPattern(fullPrefix + "/")
 	r.claimPattern(fullPrefix)
 	// Strip prefix before passing to the handler
-	r.mux.Handle(fullPrefix+"/", http.StripPrefix(fullPrefix, handler))
+	r.mux.Handle(fullPrefix+"/", applyMiddleware(http.StripPrefix(fullPrefix, handler), r.middleware))
 	// Also handle exact prefix match
-	r.mux.Handle(fullPrefix, handler)
+	r.mux.Handle(fullPrefix, applyMiddleware(handler, r.middleware))
 }
 
 // Handle registers a raw http.Handler for the given pattern.
@@ -316,19 +317,20 @@ func applyMiddleware(h http.Handler, mw []Middleware) http.Handler {
 
 // Static serves files from a directory on disk under the given URL prefix.
 // For example, r.Static("/assets/", "./public") serves files from ./public
-// when requests hit /assets/*.
+// when requests hit /assets/*. The group's middleware applies to the served
+// files.
 func (r *Router) Static(prefix, dir string) {
 	fullPrefix := r.prefix + prefix
 	fs := http.FileServer(http.Dir(dir))
-	r.mux.Handle(fullPrefix, http.StripPrefix(fullPrefix, fs))
+	r.mux.Handle(fullPrefix, applyMiddleware(http.StripPrefix(fullPrefix, fs), r.middleware))
 }
 
 // StaticFS serves files from an http.FileSystem (e.g. embed.FS) under the
-// given URL prefix.
+// given URL prefix. The group's middleware applies to the served files.
 func (r *Router) StaticFS(prefix string, fs http.FileSystem) {
 	fullPrefix := r.prefix + prefix
 	fileServer := http.FileServer(fs)
-	r.mux.Handle(fullPrefix, http.StripPrefix(fullPrefix, fileServer))
+	r.mux.Handle(fullPrefix, applyMiddleware(http.StripPrefix(fullPrefix, fileServer), r.middleware))
 }
 
 // RouteInfo describes a registered route for debugging/inspection.
