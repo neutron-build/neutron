@@ -190,13 +190,15 @@ func cacheableHeaders(h http.Header) http.Header {
 	return out
 }
 
-// cacheKeyFor builds the key from the URL plus any headers the caller declared
-// the response varies on.
+// cacheKeyFor builds the key from the host, the URL, and any headers the
+// caller declared the response varies on. The host participates even though
+// r.URL.String() omits it: a cache shared across virtual hosts would
+// otherwise store host A's response under the same key as host B's and serve
+// it across.
 func cacheKeyFor(r *http.Request, vary []string) string {
-	if len(vary) == 0 {
-		return r.URL.String()
-	}
 	var b strings.Builder
+	b.WriteString(r.Host)
+	b.WriteString("\x00")
 	b.WriteString(r.URL.String())
 	for _, name := range vary {
 		b.WriteString("\x00")

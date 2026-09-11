@@ -216,3 +216,66 @@ func TestNonGETIsNotCached(t *testing.T) {
 		t.Error("a POST was served from cache")
 	}
 }
+
+func TestCacheKeyIncludesHost(t *testing.T) {
+	a := httptest.NewRequest(http.MethodGet, "http://a.test/page", nil)
+	b := httptest.NewRequest(http.MethodGet, "http://b.test/page", nil)
+	aAgain := httptest.NewRequest(http.MethodGet, "http://a.test/page", nil)
+
+	if cacheKeyFor(a, nil) == cacheKeyFor(b, nil) {
+		t.Error("same path on different hosts produced the same cache key")
+	}
+	if cacheKeyFor(a, nil) != cacheKeyFor(aAgain, nil) {
+		t.Error("identical requests produced different cache keys")
+	}
+}
+
+func TestCacheKeyVaryStillHonoredWithHost(t *testing.T) {
+	base := httptest.NewRequest(http.MethodGet, "http://a.test/page", nil)
+	en := httptest.NewRequest(http.MethodGet, "http://a.test/page", nil)
+	en.Header.Set("Accept-Language", "en")
+	fr := httptest.NewRequest(http.MethodGet, "http://a.test/page", nil)
+	fr.Header.Set("Accept-Language", "fr")
+
+	if cacheKeyFor(en, []string{"Accept-Language"}) == cacheKeyFor(fr, []string{"Accept-Language"}) {
+		t.Error("different vary header values produced the same cache key")
+	}
+	if cacheKeyFor(base, []string{"Accept-Language"}) == cacheKeyFor(en, []string{"Accept-Language"}) {
+		t.Error("missing vary header value collided with a set one")
+	}
+}
+
+// One cache across virtual hosts must not serve host A's body to host B —
+// the URL alone cannot tell them apart.
+func TestVirtualHostsGetDistinctEntries(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("host:" + r.Host))
+	})
+	h := HTTPCache(testCache(t), time.Minute)(handler)
+
+	first := httptest.NewRequest(http.MethodGet, "http://a.test/shared", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, first)
+	if got := rec.Body.String(); got != "host:a.test" {
+		t.Fatalf("first response = %q", got)
+	}
+
+	second := httptest.NewRequest(http.MethodGet, "http://b.test/shared", nil)
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, second)
+
+	if rec2.Header().Get("X-Cache") == "HIT" {
+		t.Fatal("host B was served host A's cached response")
+	}
+	if got := rec2.Body.String(); got != "host:b.test" {
+		t.Errorf("body = %q, want host:b.test", got)
+	}
+
+	// Host A's entry must still hit for host A.
+	again := httptest.NewRequest(http.MethodGet, "http://a.test/shared", nil)
+	rec3 := httptest.NewRecorder()
+	h.ServeHTTP(rec3, again)
+	if rec3.Header().Get("X-Cache") != "HIT" {
+		t.Error("host A's own entry no longer hits after host B's request")
+	}
+}
