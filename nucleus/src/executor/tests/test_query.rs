@@ -53,6 +53,74 @@ async fn test_in_subquery() {
     assert_eq!(rows(&results[0]).len(), 2);
 }
 
+/// A scalar subquery in ROW context must obey the same cardinality rule as
+/// the constant context: >1 rows is an error, never a silent first row
+/// (audit A16). Zero rows → NULL, one row → the value, LIMIT 1 shapes the
+/// query so it stays legal.
+#[tokio::test]
+async fn scalar_subquery_in_row_context_enforces_cardinality() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE parent_t (id INT)").await;
+    exec(&ex, "INSERT INTO parent_t VALUES (1), (2)").await;
+    exec(&ex, "CREATE TABLE multi (ref INT, v INT)").await;
+    exec(&ex, "INSERT INTO multi VALUES (1, 10), (1, 20), (2, 30)").await;
+    exec(&ex, "CREATE TABLE single (ref INT, v INT)").await;
+    exec(&ex, "INSERT INTO single VALUES (1, 7)").await;
+
+    // Correlated multi-row: parent id 1 has two multi rows.
+    let err = ex
+        .execute("SELECT (SELECT v FROM multi WHERE ref = parent_t.id) FROM parent_t WHERE id = 1")
+        .await;
+    match err {
+        Err(ExecError::Runtime(msg)) => assert!(
+            msg.contains("more than one row"),
+            "expected the cardinality error, got: {msg}"
+        ),
+        Err(other) => panic!("expected Runtime cardinality error, got: {other}"),
+        Ok(v) => panic!("correlated multirow scalar subquery silently returned {v:?}"),
+    }
+
+    // Row-projection multi-row over an uncorrelated subquery.
+    let err = ex
+        .execute("SELECT (SELECT v FROM multi) FROM parent_t WHERE id = 2")
+        .await;
+    assert!(
+        err.is_err(),
+        "uncorrelated multirow scalar subquery in row projection must error, got {:?}",
+        err.unwrap()[0]
+    );
+
+    // Zero rows → NULL.
+    let results = exec(
+        &ex,
+        "SELECT (SELECT v FROM multi WHERE ref = 99) FROM parent_t WHERE id = 1",
+    )
+    .await;
+    assert_eq!(scalar(&results[0]), &Value::Null);
+
+    // One row → the value.
+    let results = exec(
+        &ex,
+        "SELECT (SELECT v FROM single WHERE ref = parent_t.id) FROM parent_t WHERE id = 1",
+    )
+    .await;
+    assert_eq!(scalar(&results[0]), &Value::Int32(7));
+
+    // LIMIT 1 shapes the query: never more than one row, so it is legal.
+    let results = exec(
+        &ex,
+        "SELECT (SELECT v FROM multi WHERE ref = parent_t.id LIMIT 1) FROM parent_t WHERE id = 1",
+    )
+    .await;
+    assert_eq!(scalar(&results[0]), &Value::Int32(10));
+
+    // Constant context keeps the same rule (control for the shared helper).
+    let err = ex.execute("SELECT (SELECT v FROM multi)").await;
+    assert!(err.is_err(), "constant-context multirow must still error");
+    let results = exec(&ex, "SELECT (SELECT v FROM multi LIMIT 1)").await;
+    assert_eq!(scalar(&results[0]), &Value::Int32(10));
+}
+
 #[tokio::test]
 async fn test_subquery_in_from() {
     let ex = test_executor();

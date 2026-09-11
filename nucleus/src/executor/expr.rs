@@ -278,23 +278,7 @@ impl Executor {
                 let sub_result = sync_block_on(self.execute_query(*subquery.clone()));
                 self.query_depth.fetch_sub(1, AtomicOrdering::Relaxed);
                 match sub_result? {
-                    ExecResult::Select { rows, .. } => {
-                        // Scalar subquery: 0 rows → NULL, 1 row → its value,
-                        // >1 row → error (PostgreSQL: "more than one row
-                        // returned by a subquery used as an expression").
-                        // Silently taking the first row was a wrong result.
-                        if rows.len() > 1 {
-                            return Err(ExecError::Runtime(
-                                "more than one row returned by a subquery used as an expression"
-                                    .into(),
-                            ));
-                        }
-                        if rows.is_empty() || rows[0].is_empty() {
-                            Ok(Value::Null)
-                        } else {
-                            Ok(rows[0][0].clone())
-                        }
-                    }
+                    ExecResult::Select { rows, .. } => Self::scalar_subquery_value(&rows),
                     _ => Ok(Value::Null),
                 }
             }
@@ -515,6 +499,24 @@ impl Executor {
         coerce_to_array(r)
             .map(Some)
             .ok_or_else(|| ExecError::Unsupported("ANY/ALL requires an array or subquery".into()))
+    }
+
+    /// Scalar-subquery cardinality, shared by the constant-context and
+    /// row-context evaluation paths: 0 rows → NULL, 1 row → its first cell,
+    /// >1 rows → the PostgreSQL error. An explicit `LIMIT 1` never returns
+    /// more than one row, so it needs no exception. The row path used to
+    /// take `rows[0][0]` silently — a wrong result (audit A16).
+    fn scalar_subquery_value(rows: &[Row]) -> Result<Value, ExecError> {
+        if rows.len() > 1 {
+            return Err(ExecError::Runtime(
+                "more than one row returned by a subquery used as an expression".into(),
+            ));
+        }
+        if rows.is_empty() || rows[0].is_empty() {
+            Ok(Value::Null)
+        } else {
+            Ok(rows[0][0].clone())
+        }
     }
 
     pub(super) fn in_three_valued(val: &Value, candidates: &[Value], negated: bool) -> Value {
@@ -1679,20 +1681,14 @@ impl Executor {
                 Ok(Self::in_three_valued(&val, &values, *negated))
             }
             Expr::Subquery(subquery) => {
-                // Scalar subquery -- must return exactly one row, one column
+                // Scalar subquery -- must return exactly one row, one column.
+                // Same cardinality rule as the constant-context path (A16).
                 self.check_subquery_depth()?;
                 let resolved = substitute_outer_refs_in_query(subquery, row, col_meta);
                 let sub_result = sync_block_on(self.execute_query(resolved));
                 self.query_depth.fetch_sub(1, AtomicOrdering::Relaxed);
-                let sub_result = sub_result?;
-                match sub_result {
-                    ExecResult::Select { rows, .. } => {
-                        if rows.is_empty() || rows[0].is_empty() {
-                            Ok(Value::Null)
-                        } else {
-                            Ok(rows[0][0].clone())
-                        }
-                    }
+                match sub_result? {
+                    ExecResult::Select { rows, .. } => Self::scalar_subquery_value(&rows),
                     _ => Ok(Value::Null),
                 }
             }
