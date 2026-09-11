@@ -144,7 +144,6 @@ pub struct BackupManifest {
 #[derive(Debug)]
 pub struct DataDirLock {
     file: std::fs::File,
-    path: PathBuf,
 }
 
 impl DataDirLock {
@@ -172,7 +171,7 @@ impl DataDirLock {
                         .map(|d| d.as_secs())
                         .unwrap_or(0)
                 );
-                Ok(Some(Self { file, path }))
+                Ok(Some(Self { file }))
             }
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(e)) => Err(e),
@@ -210,10 +209,19 @@ impl DataDirLock {
 
 impl Drop for DataDirLock {
     fn drop(&mut self) {
+        // Unlock WITHOUT unlinking (audit A24). The old
+        // unlock-then-remove raced: after the unlock, B could acquire the
+        // OLD inode; the remove then deleted the pathname; C's acquire
+        // created and locked a FRESH file at the same path — two holders on
+        // one data directory. The file stays as a persistent, unlocked
+        // coordination inode: `is_locked` reports liveness via the OS lock,
+        // never file existence, so a stale sentinel is reusable and never
+        // blocks anyone. Ownership across maintenance flows that replace
+        // the whole directory is NOT handled here — a directory replaced
+        // under an open instance loses its sentinel and its lock atomically
+        // (the lock file inside the old directory is gone with it); that is
+        // out of scope and must be audited separately if such a flow lands.
         let _ = self.file.unlock();
-        // Only the holder removes the file, so a second (unlocked) opener
-        // dropping first cannot delete the live holder's lock.
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -1479,6 +1487,70 @@ mod tests {
         drop(lock);
         let _ = std::fs::remove_dir_all(&root);
     }
+
+// ── Lock sentinel (audit A24) ────────────────────────────────────────
+
+/// Drop must unlock WITHOUT unlinking. The old unlock-then-remove raced:
+/// after A unlocked, B acquired the old inode; A's remove deleted the
+/// pathname; C created and locked a fresh file at the same path — two
+/// holders. The acceptance sequence: A unlock, B acquire, (the cleanup the
+/// old Drop would have done must NOT have happened), C acquire fails.
+#[test]
+fn lock_release_leaves_a_reusable_sentinel_for_the_next_holder() {
+    let root = unique_tmp("sentinel");
+    let _ = std::fs::remove_dir_all(&root);
+    let data = root.join("data_dir");
+    write(&data, "catalog.json", b"{}");
+    let lock_path = data.join(LOCK_NAME);
+
+    // A holds the directory, then releases (drops) — under the fix, the
+    // sentinel file REMAINS (unlocked).
+    {
+        let a = DataDirLock::acquire(&data).unwrap().expect("A acquires");
+        drop(a);
+    }
+    assert!(
+        lock_path.exists(),
+        "release must leave the coordination inode in place"
+    );
+    assert!(!DataDirLock::is_locked(&data), "and it must be unlocked");
+
+    // B acquires the SAME sentinel inode.
+    let b = DataDirLock::acquire(&data).unwrap().expect("B acquires");
+    assert!(DataDirLock::is_locked(&data), "B is discoverable via the path");
+
+    // The cleanup the old Drop performed (unlinking) is exactly what let a
+    // third party in; under the fix nobody unlinks, so C — opening whatever
+    // file the path names — cannot acquire.
+    let c = DataDirLock::acquire(&data).unwrap();
+    assert!(c.is_none(), "C must fail to acquire while B holds the lock");
+
+    drop(b);
+    assert!(!DataDirLock::is_locked(&data));
+    // The unlocked sentinel is directly reusable by the next instance.
+    DataDirLock::acquire(&data)
+        .unwrap()
+        .expect("stale unlocked sentinel stays reusable");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A stale sentinel written by hand (a crashed instance's leftover) is
+/// unlocked, does not read as in-use, and does not block a backup.
+#[test]
+fn hand_written_stale_sentinel_is_not_in_use() {
+    let root = unique_tmp("stale_sentinel");
+    let _ = std::fs::remove_dir_all(&root);
+    let data = root.join("data_dir");
+    write(&data, "catalog.json", b"{}");
+    write(&data, LOCK_NAME, b"pid 999999 since 0\n");
+
+    assert!(!DataDirLock::is_locked(&data));
+    backup_data_dir(&data, &root.join("snap"), false, "0.1.1")
+        .expect("a stale sentinel must not block a backup");
+    // And the snapshot must not capture the lock file.
+    assert!(!root.join("snap").join(DATA_SUBDIR).join(LOCK_NAME).exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
 
 // ── Path fences + staged publication (audit A22) ─────────────────────
 
