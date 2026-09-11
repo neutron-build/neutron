@@ -3,6 +3,8 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/neutron-build/neutron/cli/internal/config"
@@ -204,44 +206,25 @@ func runMigrateDown(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if len(downFiles) == 0 {
-		ui.Warnf("No down migration files found in %s", dir)
-		return nil
-	}
-
 	// Get applied migrations
 	applied, err := client.AppliedMigrations(ctx)
 	if err != nil {
 		return err
 	}
 
-	appliedMap := make(map[string]bool)
-	for _, r := range applied {
-		appliedMap[r.Version] = true
-	}
-
-	// Find which down migrations to revert (newest first)
-	var toRevert []db.MigrationFile
-	for _, f := range downFiles {
-		if appliedMap[f.Version] && len(toRevert) < count {
-			toRevert = append(toRevert, f)
-		}
-		if len(toRevert) >= count {
-			break
-		}
+	// Preflight before executing any SQL: the newest `count` applied
+	// migrations — by version order, not by which down files happen to be
+	// present — must each have a non-empty down file. Otherwise a missing
+	// down file for a newer migration would be silently skipped and an older
+	// one reverted beneath it.
+	toRevert, err := selectRevertFrontier(applied, downFiles, count)
+	if err != nil {
+		return err
 	}
 
 	if len(toRevert) == 0 {
 		ui.Infof("No migrations to revert")
 		return nil
-	}
-
-	// Safety check: ensure each applied migration has a corresponding down file
-	for _, f := range toRevert {
-		// Check that the down file exists (we already have it from ReadDownMigrationFiles)
-		if f.SQL == "" {
-			return fmt.Errorf("down migration for version %s is empty", f.Version)
-		}
 	}
 
 	// Revert migrations
@@ -256,4 +239,35 @@ func runMigrateDown(cmd *cobra.Command, args []string) error {
 
 	ui.Successf("Reverted %d migration(s)", len(toRevert))
 	return nil
+}
+
+// selectRevertFrontier returns the down migrations to revert: the newest
+// `count` applied versions in version order, newest first. Every one of them
+// must have a non-empty down file — otherwise the rollback is aborted before
+// any SQL runs, because skipping a newer migration and reverting an older one
+// beneath it corrupts the schema.
+func selectRevertFrontier(applied []db.MigrationRecord, downFiles []db.MigrationFile, count int) ([]db.MigrationFile, error) {
+	downByVersion := make(map[string]db.MigrationFile, len(downFiles))
+	for _, f := range downFiles {
+		downByVersion[f.Version] = f
+	}
+
+	sorted := append([]db.MigrationRecord(nil), applied...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Version > sorted[j].Version })
+
+	var toRevert []db.MigrationFile
+	for _, rec := range sorted {
+		if len(toRevert) == count {
+			break
+		}
+		f, ok := downByVersion[rec.Version]
+		if !ok {
+			return nil, fmt.Errorf("aborting rollback: applied migration %s has no down migration file", rec.Version)
+		}
+		if strings.TrimSpace(f.SQL) == "" {
+			return nil, fmt.Errorf("aborting rollback: down migration for applied version %s is empty", rec.Version)
+		}
+		toRevert = append(toRevert, f)
+	}
+	return toRevert, nil
 }
