@@ -3,9 +3,12 @@ package mail
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"mime"
+	"net"
+	"net/mail"
 	"net/smtp"
 	"regexp"
 	"strings"
@@ -111,6 +114,11 @@ func ReplyTo(parent *Envelope, from Address, text string) *Outgoing {
 // Send submits the message and returns its Message-ID along with the exact
 // RFC 5322 bytes that crossed the wire, so a caller can archive the sent copy
 // verbatim through an adapter that implements Appender.
+//
+// Submission is context-aware end to end (audit neutron-12): the dial uses
+// DialContext, every stage inherits the caller's deadline, and a canceled or
+// expired context closes the connection so a stalled SMTP server cannot
+// outlive the application's send timeout.
 func (s *Sender) Send(ctx context.Context, msg *Outgoing) (messageID string, raw []byte, err error) {
 	if msg.From.Email == "" {
 		return "", nil, fmt.Errorf("mail: outgoing message has no sender")
@@ -134,16 +142,83 @@ func (s *Sender) Send(ctx context.Context, msg *Outgoing) (messageID string, raw
 		}
 	}
 
-	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
-	var auth smtp.Auth
-	if s.cfg.Username != "" {
-		auth = smtp.PlainAuth("", s.cfg.Username, s.cfg.Password, s.cfg.Host)
-	}
-
-	if err := smtp.SendMail(addr, auth, msg.From.Email, rcpts, body); err != nil {
+	if err := s.submit(ctx, msg.From.Email, rcpts, body); err != nil {
 		return "", nil, fmt.Errorf("mail: send: %w", err)
 	}
 	return messageID, body, nil
+}
+
+// submit performs the SMTP transaction with cancellation at every stage.
+// It mirrors net/smtp.SendMail's dialogue (EHLO, opportunistic STARTTLS,
+// AUTH when the server advertises it, MAIL/RCPT/DATA) but over a
+// context-aware connection.
+func (s *Sender) submit(ctx context.Context, from string, rcpts []string, body []byte) error {
+	addr := net.JoinHostPort(s.cfg.Host, fmt.Sprintf("%d", s.cfg.Port))
+
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+
+	// Cancellation-driven close: a read or write blocked on a stalled
+	// server is released by forcing the connection deadline into the past.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.SetDeadline(time.Now())
+		case <-done:
+		}
+	}()
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			conn.Close()
+			return fmt.Errorf("set deadline: %w", err)
+		}
+	}
+
+	c, err := smtp.NewClient(conn, s.cfg.Host)
+	if err != nil {
+		conn.Close()
+		return err
+	}
+	defer c.Close()
+
+	if err := c.Hello("localhost"); err != nil {
+		return err
+	}
+	if ok, _ := c.Extension("STARTTLS"); ok && !s.cfg.Plaintext {
+		if err := c.StartTLS(&tls.Config{ServerName: s.cfg.Host}); err != nil {
+			return err
+		}
+	}
+	if s.cfg.Username != "" {
+		if ok, _ := c.Extension("AUTH"); ok {
+			if err := c.Auth(smtp.PlainAuth("", s.cfg.Username, s.cfg.Password, s.cfg.Host)); err != nil {
+				return err
+			}
+		}
+	}
+	if err := c.Mail(from); err != nil {
+		return err
+	}
+	for _, rcpt := range rcpts {
+		if err := c.Rcpt(rcpt); err != nil {
+			return err
+		}
+	}
+	w, err := c.Data()
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write(body); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return c.Quit()
 }
 
 // Render builds the complete RFC 5322 bytes for this message with a freshly
@@ -167,6 +242,17 @@ func (msg *Outgoing) RenderWithBcc() ([]byte, error) {
 
 // render builds the RFC 5322 message.
 func (msg *Outgoing) render(messageID string, includeBcc bool) ([]byte, error) {
+	for _, group := range [][]Address{msg.To, msg.Cc, msg.Bcc} {
+		for _, a := range group {
+			if err := validateAddress(a); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := validateAddress(msg.From); err != nil {
+		return nil, err
+	}
+
 	var b strings.Builder
 
 	b.WriteString("From: " + formatAddress(msg.From) + "\r\n")
@@ -342,11 +428,25 @@ func domainOf(email string) string {
 	return "localhost"
 }
 
+// formatAddress renders one mailbox for a header field via net/mail, whose
+// formatter quotes RFC 5322 phrases correctly. Hand-building the phrase
+// with a Q-encoder left ordinary ASCII names containing commas — "Doe,
+// Jane" — unquoted, splitting one mailbox into two for every parser (audit
+// neutron-13).
 func formatAddress(a Address) string {
-	if a.Name == "" {
-		return a.Email
+	return (&mail.Address{Name: a.Name, Address: a.Email}).String()
+}
+
+// validateAddress rejects control characters at the composition boundary:
+// a CR or LF inside a display name or address would start a new header line
+// once rendered, and NUL is never legal in RFC 5322 text.
+func validateAddress(a Address) error {
+	for _, s := range []string{a.Name, a.Email} {
+		if strings.ContainsAny(s, "\r\n\x00") {
+			return fmt.Errorf("mail: address %q contains control characters", a.Name+" <"+a.Email+">")
+		}
 	}
-	return mime.QEncoding.Encode("utf-8", a.Name) + " <" + a.Email + ">"
+	return nil
 }
 
 func formatAddressList(addrs []Address) string {

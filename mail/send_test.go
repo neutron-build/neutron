@@ -1,9 +1,16 @@
 package mail
 
 import (
+	"bufio"
+	"context"
 	"encoding/base64"
+	"fmt"
+	"net"
+	"net/mail"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestReplyCarriesTheThreadingChain(t *testing.T) {
@@ -73,10 +80,12 @@ func TestRenderProducesValidHeaders(t *testing.T) {
 	}
 	s := string(raw)
 
+	// net/mail's formatter quotes display names and brackets bare
+	// addresses; both forms are one mailbox to any parser.
 	for _, want := range []string{
-		"From: Alice <alice@example.com>",
-		"To: bob@example.com",
-		"Cc: Carol <carol@example.com>",
+		`From: "Alice" <alice@example.com>`,
+		"To: <bob@example.com>",
+		`Cc: "Carol" <carol@example.com>`,
 		"Subject: Hello",
 		"Message-ID: <test@example.com>",
 		"MIME-Version: 1.0",
@@ -127,7 +136,7 @@ func TestRenderWithBccCarriesTheHeaderForEnvelopelessTransports(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), "Bcc: secret@x.com\r\n") {
+	if !strings.Contains(string(raw), "Bcc: <secret@x.com>\r\n") {
 		t.Errorf("RenderWithBcc dropped the Bcc header:\n%s", raw)
 	}
 
@@ -310,5 +319,207 @@ func TestRenderMixedCarriesAttachments(t *testing.T) {
 	}
 	if !strings.Contains(s, `filename="attachment"`) {
 		t.Fatalf("empty filename did not fall back:\n%s", s)
+	}
+}
+
+// Display names must survive a round trip through a standards-aware parser
+// as exactly one mailbox, including names a Q-encoder used to leave
+// unquoted and therefore split ("Doe, Jane") — audit neutron-13.
+func TestFormattedAddressesRoundTrip(t *testing.T) {
+	cases := []Address{
+		{Name: "Doe, Jane", Email: "jane@example.com"},
+		{Name: `Weird "Quote" \ Back`, Email: "w@x.com"},
+		{Name: "Bob (B.)", Email: "b@x.com"},
+		{Name: "Ünicode Sender", Email: "u@x.com"},
+		{Name: "plain", Email: "p@x.com"},
+		{Name: "", Email: "bare@x.com"},
+	}
+
+	list := formatAddressList(cases)
+	parsed, err := mail.ParseAddressList(list)
+	if err != nil {
+		t.Fatalf("formatted address list does not parse: %v\n%s", err, list)
+	}
+	if len(parsed) != len(cases) {
+		t.Fatalf("parsed %d mailboxes from %d formatted addresses:\n%s", len(parsed), len(cases), list)
+	}
+	for i, want := range cases {
+		if parsed[i].Address != want.Email {
+			t.Errorf("mailbox %d = %q, want %q (list: %s)", i, parsed[i].Address, want.Email, list)
+		}
+		if parsed[i].Name != want.Name {
+			t.Errorf("mailbox %d name = %q, want %q (list: %s)", i, parsed[i].Name, want.Name, list)
+		}
+	}
+}
+
+// Control characters in a display name or address must be rejected at the
+// composition boundary: rendered raw they would start forged header lines.
+func TestRenderRejectsControlCharactersInAddresses(t *testing.T) {
+	msg := &Outgoing{
+		From: Address{Name: "evil\r\nBcc: victim@example.com", Email: "a@x.com"},
+		To:   []Address{{Email: "b@x.com"}},
+		Text: "hi",
+	}
+	if _, err := msg.Render(); err == nil {
+		t.Error("a CRLF in a display name was accepted into composition")
+	}
+
+	msg.To = []Address{{Name: "ok", Email: "b@x.com\r\nBcc: victim@example.com"}}
+	msg.From = Address{Email: "a@x.com"}
+	if _, err := msg.Render(); err == nil {
+		t.Error("a CRLF in an email address was accepted into composition")
+	}
+}
+
+// fakeSMTPServer speaks just enough ESMTP for Sender.submit: greeting, one
+// command per line, canned replies. Each stage can be stalled from a test.
+type fakeSMTPServer struct {
+	ln         net.Listener
+	stallGreet bool
+	dialogue   []string
+}
+
+func newFakeSMTPServer(t *testing.T) *fakeSMTPServer {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &fakeSMTPServer{ln: ln}
+}
+
+func (f *fakeSMTPServer) addr() (host string, port int) {
+	_, portStr, _ := net.SplitHostPort(f.ln.Addr().String())
+	port, _ = strconv.Atoi(portStr)
+	return "127.0.0.1", port
+}
+
+func (f *fakeSMTPServer) serve(t *testing.T) {
+	t.Helper()
+	go func() {
+		conn, err := f.ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if f.stallGreet {
+			<-t.Context().Done()
+			return
+		}
+		reader := bufio.NewReader(conn)
+		f.write(conn, "220 fake ESMTP")
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			cmd := strings.TrimSpace(strings.ToUpper(line))
+			f.dialogue = append(f.dialogue, cmd)
+			switch {
+			case strings.HasPrefix(cmd, "EHLO"), strings.HasPrefix(cmd, "HELO"):
+				f.write(conn, "250-fake", "250 8BITMIME")
+			case strings.HasPrefix(cmd, "MAIL"), strings.HasPrefix(cmd, "RCPT"):
+				f.write(conn, "250 ok")
+			case strings.HasPrefix(cmd, "DATA"):
+				f.write(conn, "354 go")
+				// Consume the message until the lone dot terminator.
+				for {
+					line, err := reader.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if strings.TrimRight(line, "\r\n") == "." {
+						break
+					}
+				}
+				f.write(conn, "250 accepted")
+			case strings.HasPrefix(cmd, "QUIT"):
+				f.write(conn, "221 bye")
+				return
+			default:
+				f.write(conn, "250 ok")
+			}
+		}
+	}()
+}
+
+func (f *fakeSMTPServer) write(conn net.Conn, lines ...string) {
+	for _, l := range lines {
+		fmt.Fprintf(conn, "%s\r\n", l)
+	}
+}
+
+func (f *fakeSMTPServer) close() { f.ln.Close() }
+
+func testOutgoing(from, to string) *Outgoing {
+	return &Outgoing{
+		From:    Address{Email: from},
+		To:      []Address{{Email: to}},
+		Subject: "ctx",
+		Text:    "body",
+	}
+}
+
+// The replaced SendMail path had no test at all; this proves the
+// context-aware dialogue completes a real transaction.
+func TestSendCompletesAgainstFakeServer(t *testing.T) {
+	srv := newFakeSMTPServer(t)
+	srv.serve(t)
+	defer srv.close()
+
+	host, port := srv.addr()
+	s := NewSender(SMTPConfig{Host: host, Port: port, Plaintext: true})
+
+	id, raw, err := s.Send(t.Context(), testOutgoing("alice@example.com", "bob@example.com"))
+	if err != nil {
+		t.Fatalf("Send error: %v", err)
+	}
+	if id == "" || len(raw) == 0 {
+		t.Fatal("Send returned no message id or bytes")
+	}
+
+	joined := strings.Join(srv.dialogue, "\n")
+	for _, want := range []string{"EHLO", "MAIL", "RCPT", "DATA", "QUIT"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("SMTP dialogue missing %q:\n%s", want, joined)
+		}
+	}
+	if strings.Count(joined, "RCPT") != 1 {
+		t.Errorf("dialogue shows %d RCPT turns, want 1:\n%s", strings.Count(joined, "RCPT"), joined)
+	}
+}
+
+// A server that accepts the connection but never greets must not outlive
+// the caller's deadline (audit neutron-12).
+func TestSendStalledGreetingHonorsContextDeadline(t *testing.T) {
+	srv := newFakeSMTPServer(t)
+	srv.stallGreet = true
+	srv.serve(t)
+	defer srv.close()
+
+	host, port := srv.addr()
+	s := NewSender(SMTPConfig{Host: host, Port: port, Plaintext: true})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		_, _, err := s.Send(ctx, testOutgoing("a@x.com", "b@x.com"))
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a stalled greeting was reported as a successful send")
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("Send took %v against a stalled server; the deadline did not bound it", elapsed)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Send never returned against a stalled server")
 	}
 }
