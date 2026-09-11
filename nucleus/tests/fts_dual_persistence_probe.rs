@@ -109,7 +109,7 @@ async fn a_legacy_directory_upgrades_without_losing_the_json_only_documents() {
         let ex = boot(&dir);
         run(&ex, "SELECT FTS_INDEX(1, 'the quick brown fox')").await;
         run(&ex, "SELECT FTS_INDEX(3, 'a quick silver hare')").await;
-        ex.save_fts_index();
+        ex.save_fts_index().expect("fts checkpoint");
     }
     std::fs::write(fts_dir.join("fts.wal"), b"").unwrap();
     assert!(json.exists(), "the checkpoint must exist for this fixture");

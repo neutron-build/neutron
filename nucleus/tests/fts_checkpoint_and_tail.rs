@@ -80,7 +80,7 @@ async fn a_second_session_still_writes_to_the_fts_wal() {
         ex.execute("SELECT FTS_INDEX(1, 'first boot document')")
             .await
             .unwrap();
-        ex.save_fts_index(); // the server's checkpoint tick
+        ex.save_fts_index().expect("fts checkpoint"); // the server's checkpoint tick
     }
     assert!(
         data.join("fts_index.json").exists(),
@@ -125,7 +125,7 @@ async fn a_checkpoint_truncates_the_tail_it_absorbed() {
         "twenty writes produced an empty WAL tail — they are not being logged"
     );
 
-    ex.save_fts_index(); // the server's checkpoint tick
+    ex.save_fts_index().expect("fts checkpoint"); // the server's checkpoint tick
     let tail_after = wal_len(&data);
     let checkpoint = std::fs::metadata(data.join("fts_index.json"))
         .unwrap()
@@ -155,7 +155,7 @@ async fn a_tail_is_applied_on_top_of_the_checkpoint_and_is_idempotent() {
         ex.execute("SELECT FTS_INDEX(1, 'checkpointed document')")
             .await
             .unwrap();
-        ex.save_fts_index();
+        ex.save_fts_index().expect("fts checkpoint");
     }
 
     // Simulate the crash window: a WAL entry written, the checkpoint NOT
@@ -201,7 +201,7 @@ async fn a_removal_in_the_tail_is_not_resurrected() {
         ex.execute("SELECT FTS_INDEX(2, 'surviving document')")
             .await
             .unwrap();
-        ex.save_fts_index();
+        ex.save_fts_index().expect("fts checkpoint");
     }
 
     // The crash window again, this time for a removal.
@@ -237,7 +237,7 @@ async fn a_write_after_the_last_checkpoint_survives_a_crash() {
         ex.execute("SELECT FTS_INDEX(1, 'checkpointed before the crash')")
             .await
             .unwrap();
-        ex.save_fts_index();
+        ex.save_fts_index().expect("fts checkpoint");
     }
 
     // Second session: write, do NOT checkpoint, and drop the executor as a

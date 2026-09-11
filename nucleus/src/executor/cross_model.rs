@@ -633,7 +633,14 @@ impl Executor {
             // a successful ROLLBACK would replay the rolled-back writes from
             // the tail and resurrect them. Rollbacks are rare; writes are not.
             #[cfg(feature = "server")]
-            self.save_fts_index();
+            if let Err(e) = self.save_fts_index() {
+                tracing::error!(
+                    target: "nucleus::fts",
+                    "FTS rollback could not rewrite its checkpoint ({e}); a crash before \
+                     the next checkpoint could replay the rolled-back writes from the \
+                     surviving tail"
+                );
+            }
         }
     }
 }

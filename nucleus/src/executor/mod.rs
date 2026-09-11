@@ -1494,23 +1494,23 @@ impl Executor {
         }
     }
 
-    pub fn save_fts_index(&self) {
+    pub fn save_fts_index(&self) -> std::io::Result<()> {
         let Some(path) = self.fts_persist_path() else {
-            return;
+            return Ok(());
         };
         let index = self.fts_index.read();
-        let Ok(json) = index.to_json() else {
-            return;
-        };
-        if let Err(e) = std::fs::write(&path, &json) {
-            eprintln!(
-                "executor: failed to save FTS index to {}: {e}",
-                path.display()
-            );
-            // Deliberately do NOT truncate: the tail is the only record of
-            // whatever this checkpoint failed to capture.
-            return;
+        let json = index.to_json().map_err(std::io::Error::other)?;
+        // A8: the checkpoint must land durably — temp + fsync + rename + dir
+        // fsync, mirroring the WAL-side snapshot in `fts_wal.rs` — because the
+        // step below truncates the tail it was written from. The old bare
+        // `fs::write` was neither atomic nor fsynced: power loss in the
+        // window lost both the checkpoint and (once the truncate ran) the
+        // tail. A failed write propagates here and the tail is never
+        // truncated.
+        if let Some(e) = crate::storage::crashpoint::io_fault("fts.checkpoint_write") {
+            return Err(e);
         }
+        crate::storage::atomic_write::atomic_write(&path, json.as_bytes())?;
         // The checkpoint now contains everything the tail did, so the tail
         // starts again from empty. Ordering matters and is the reason this is
         // here rather than before the write: a crash between the two leaves a
@@ -1524,6 +1524,7 @@ impl Executor {
                  harmless — it is idempotent — but the log will keep growing."
             );
         }
+        Ok(())
     }
 
     /// Load the FTS index from disk at startup (called by new_with_persistence).
@@ -5326,7 +5327,9 @@ impl Executor {
         // which then truncates the tail it absorbed, and compact whatever is
         // left. Order matters — a crash between them leaves a tail that is a
         // subset of the checkpoint, which replays idempotently.
-        self.save_fts_index();
+        if let Err(e) = self.save_fts_index() {
+            tracing::warn!("FTS index checkpoint failed: {e}");
+        }
         if let Err(e) = self.fts_index().read().checkpoint_wal() {
             tracing::warn!("FTS WAL checkpoint failed: {e}");
         }

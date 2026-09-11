@@ -176,6 +176,11 @@ pub const ALL_IO_POINTS: &[&str] = &[
     // nowhere. Arming this must fail the flush (and the checkpoint that
     // drains it); only acknowledged keys may survive a restart.
     "lsm.sst_write",
+    // The FTS index checkpoint (`fts_index.json`). The checkpoint must be
+    // durably in place BEFORE the WAL tail it absorbed is truncated, so a
+    // failed checkpoint write must fail the save with the tail intact
+    // (audit A8) — never truncate into a checkpoint that never landed.
+    "fts.checkpoint_write",
 ];
 
 fn io_armed() -> Option<&'static str> {
