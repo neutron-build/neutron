@@ -49,6 +49,7 @@ mod test_ast_route_plan_key; // the pre-parsed route must not inherit a plan-cac
 mod test_audit_events; // N18: durable security audit events
 mod test_cache_coherence; // M2: cache + specialty-index invalidation oracle
 mod test_call_pipeline; // EXE-1/5 + PRC-1/3/4/5/7: the CALL pipeline end-to-end
+mod test_cluster_routing; // A14/A15: both execution entries route + fail closed
 mod test_collections;
 mod test_copy; // COPY FROM STDIN payload reconstruction
 mod test_cross_model;

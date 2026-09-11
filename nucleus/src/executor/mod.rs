@@ -4329,6 +4329,57 @@ impl Executor {
         ))
     }
 
+    /// Cluster-routing classifiers shared by the text and pre-parsed entry
+    /// points. Security DDL must reach the leader so authenticated authority
+    /// and policy order survive replication; DML must be proposed or
+    /// forwarded, never silently executed on whichever node received it.
+    #[cfg(feature = "server")]
+    fn statement_is_security_ddl(statement: &Statement) -> bool {
+        matches!(
+            statement,
+            Statement::CreateRole(_)
+                | Statement::AlterRole { .. }
+                | Statement::Grant(_)
+                | Statement::Revoke(_)
+                | Statement::CreatePolicy(_)
+                | Statement::DropPolicy(_)
+                | Statement::AlterPolicy(_)
+        ) || matches!(statement, Statement::AlterTable(alter) if alter.operations.iter().any(|op| matches!(
+            op,
+            ast::AlterTableOperation::EnableRowLevelSecurity
+                | ast::AlterTableOperation::DisableRowLevelSecurity
+                | ast::AlterTableOperation::ForceRowLevelSecurity
+                | ast::AlterTableOperation::NoForceRowLevelSecurity
+        )))
+    }
+
+    #[cfg(feature = "server")]
+    fn statement_is_dml(statement: &Statement) -> bool {
+        matches!(
+            statement,
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        )
+    }
+
+    /// Whether cluster routing in `execute_statements_dispatch` will consult
+    /// SQL TEXT for this batch: a non-standalone cluster is configured and
+    /// the batch contains DML or security DDL (forwarding and proposing carry
+    /// text; the follower-read freshness check reads statements only). Cheap,
+    /// so the pre-parsed entry point pays to render text only when routing
+    /// will actually use it — a standalone session never renders, and a
+    /// COPY-sized INSERT AST is expensive to stringify.
+    #[cfg(feature = "server")]
+    fn cluster_routing_needs_sql_text(&self, statements: &[Statement]) -> bool {
+        let Some(ref cluster_arc) = self.cluster else {
+            return false;
+        };
+        let mode = { cluster_arc.read().mode() };
+        mode != crate::distributed::ClusterMode::Standalone
+            && statements
+                .iter()
+                .any(|s| Self::statement_is_dml(s) || Self::statement_is_security_ddl(s))
+    }
+
     /// Execute pre-parsed statements within a specific session's scope.
     /// This is the AST-fast-path for the extended query protocol — avoids re-parsing.
     ///
@@ -4365,13 +4416,38 @@ impl Executor {
             STORAGE_SESSION_ID.scope(session_id, async move {
                 guard_sess.mark_command_start();
                 let _guard = CommandGuard(guard_sess);
-                let mut results = Vec::new();
-                for stmt in statements {
-                    // Materialization boundary (see execute_statements_dispatch).
-                    let r = self.execute_statement(stmt).await?.materialize().await?;
-                    results.push(r);
+                // Cluster routing (follower forward, leader Raft propose,
+                // security-DDL refusal, follower-read freshness) lives in
+                // execute_statements_dispatch; this AST entry used to call
+                // execute_statement directly, so a configured follower
+                // executed security DDL and DML locally through the extended
+                // protocol — the protocol every real driver takes (A14).
+                // Routing carries SQL TEXT, but the caller's original text
+                // still holds $n placeholders while this AST is already
+                // substituted (and some callers never had text), so render
+                // from the AST — only when a non-standalone cluster will
+                // actually consult it.
+                #[cfg(feature = "server")]
+                let sql = if self.cluster_routing_needs_sql_text(&statements) {
+                    statements
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                } else {
+                    String::new()
+                };
+                #[cfg(not(feature = "server"))]
+                let sql = String::new();
+                let results = self.execute_statements_dispatch(&sql, statements).await?;
+                // This entry has always returned fully materialized results
+                // (the extended protocol drains them eagerly); dispatch may
+                // hand back a single-statement stream, so materialize here.
+                let mut materialized = Vec::with_capacity(results.len());
+                for r in results {
+                    materialized.push(r.materialize().await?);
                 }
-                Ok(results)
+                Ok(materialized)
             }),
         ))
     }
@@ -6486,30 +6562,10 @@ impl Executor {
         if let Some(ref cluster_arc) = self.cluster {
             let mode = { cluster_arc.read().mode() };
             if mode != crate::distributed::ClusterMode::Standalone {
-                let has_security_ddl = statements.iter().any(|statement| {
-                    matches!(
-                        statement,
-                        Statement::CreateRole(_)
-                            | Statement::AlterRole { .. }
-                            | Statement::Grant(_)
-                            | Statement::Revoke(_)
-                            | Statement::CreatePolicy(_)
-                            | Statement::DropPolicy(_)
-                            | Statement::AlterPolicy(_)
-                    ) || matches!(statement, Statement::AlterTable(alter) if alter.operations.iter().any(|op| matches!(
-                        op,
-                        ast::AlterTableOperation::EnableRowLevelSecurity
-                            | ast::AlterTableOperation::DisableRowLevelSecurity
-                            | ast::AlterTableOperation::ForceRowLevelSecurity
-                            | ast::AlterTableOperation::NoForceRowLevelSecurity
-                    )))
-                });
-                let has_dml = statements.iter().any(|s| {
-                    matches!(
-                        s,
-                        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
-                    )
-                });
+                let has_security_ddl = statements
+                    .iter()
+                    .any(|statement| Self::statement_is_security_ddl(statement));
+                let has_dml = statements.iter().any(|s| Self::statement_is_dml(s));
                 if has_security_ddl {
                     // Authenticate authority before proposing a command that
                     // followers intentionally apply as the internal Raft user.
@@ -6668,11 +6724,6 @@ impl Executor {
         let statements = self.parse_with_ast_cache(sql)?;
         let mut results = Vec::new();
         for stmt in statements {
-            // Materialization boundary: the default result path (tests, embedded,
-            // RESP, binary wire, and today's pgwire) receives fully materialized
-            // rows. A streaming producer's SelectStream is collapsed here; only a
-            // future streaming wire path (Phase 4) bypasses this to stream a huge
-            // result to the client without materializing it.
             let r = self.execute_statement(stmt).await?.materialize().await?;
             results.push(r);
         }
