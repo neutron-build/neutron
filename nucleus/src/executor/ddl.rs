@@ -4837,6 +4837,20 @@ impl Executor {
         match object_type {
             DiscardObject::ALL => {
                 let sess = self.current_session();
+                // An active transaction's undo bookkeeping (engine_snapshots,
+                // security_pending, savepoints) used to be destroyed outright
+                // here, leaving its writes applied with no rollback path.
+                // PostgreSQL refuses DISCARD ALL inside a transaction block;
+                // the error also aborts the transaction through the normal
+                // statement-error state, so ROLLBACK still restores everything.
+                {
+                    let txn = sess.txn_state.read().await;
+                    if txn.active {
+                        return Err(ExecError::Runtime(
+                            "DISCARD ALL cannot run inside a transaction block".into(),
+                        ));
+                    }
+                }
                 sess.prepared_stmts.write().await.clear();
                 sess.cursors.write().await.clear();
                 {

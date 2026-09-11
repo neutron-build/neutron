@@ -767,3 +767,54 @@ async fn txn_active_mirrors_state() {
     assert_eq!(ex.sweep_idle_in_transaction(1).await, 1);
     agrees(&ex, sid, false, "the idle-in-transaction sweep").await;
 }
+
+// ======================================================================
+// DISCARD ALL vs an active transaction (audit A21)
+// ======================================================================
+
+/// DISCARD ALL must refuse inside a transaction instead of destroying the
+/// transaction's undo bookkeeping (`*txn = TxnState::new()` dropped
+/// engine_snapshots, security_pending and savepoints with no rollback, so the
+/// transaction's writes stayed applied). PostgreSQL refuses with "DISCARD ALL
+/// cannot run inside a transaction block"; ROLLBACK must still restore.
+#[tokio::test]
+async fn discard_all_refuses_inside_transaction_and_rollback_still_restores() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE disc (id INT PRIMARY KEY)").await;
+    exec(&ex, "INSERT INTO disc VALUES (1)").await;
+
+    exec(&ex, "BEGIN").await;
+    exec(&ex, "INSERT INTO disc VALUES (2)").await;
+    let err = ex
+        .execute("DISCARD ALL")
+        .await
+        .expect_err("DISCARD ALL must refuse inside a transaction");
+    assert!(
+        err.to_string().contains("cannot run inside a transaction block"),
+        "wrong refusal: {err}"
+    );
+
+    // The refusal is a statement error like any other: the transaction is
+    // aborted until ROLLBACK.
+    assert!(
+        ex.execute("SELECT 1").await.is_err(),
+        "statement after the refused DISCARD must report the aborted transaction"
+    );
+
+    exec(&ex, "ROLLBACK").await;
+    let after = rows(&exec(&ex, "SELECT id FROM disc").await[0]).clone();
+    assert_eq!(
+        after,
+        vec![vec![Value::Int32(1)]],
+        "ROLLBACK after the refused DISCARD must still restore the pre-BEGIN rows"
+    );
+
+    // Idle DISCARD ALL keeps working and still clears prepared statements.
+    exec(&ex, "PREPARE p AS SELECT 1").await;
+    exec(&ex, "EXECUTE p").await;
+    exec(&ex, "DISCARD ALL").await;
+    assert!(
+        ex.execute("EXECUTE p").await.is_err(),
+        "DISCARD ALL must still deallocate prepared statements when idle"
+    );
+}
