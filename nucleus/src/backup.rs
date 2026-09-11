@@ -909,6 +909,84 @@ fn now_unix() -> u64 {
 // Restore
 // ---------------------------------------------------------------------------
 
+/// Read and parse a snapshot manifest without touching any destination.
+/// The preflight half of a restore, shared with PITR (audit A23): every
+/// rejection that can be decided from the manifest alone must be decidable
+/// BEFORE the destination is replaced.
+pub(crate) fn read_manifest(input_dir: &Path) -> io::Result<BackupManifest> {
+    let manifest_path = input_dir.join(MANIFEST_NAME);
+    if !manifest_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "not a Nucleus backup (missing {MANIFEST_NAME}): {}",
+                input_dir.display()
+            ),
+        ));
+    }
+    serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Validate a restore DESTINATION (live lock, non-empty without force,
+/// different database identity) without mutating it. Shared by the restore
+/// path and PITR's preflight, so a rejected operation of either kind leaves
+/// the destination byte-for-byte unchanged.
+pub(crate) fn check_restore_destination(
+    data_dir: &Path,
+    force: bool,
+    incoming_database_id: &str,
+) -> io::Result<()> {
+    if DataDirLock::is_locked(data_dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::ResourceBusy,
+            format!(
+                "{} is open by a running Nucleus instance — stop it before restoring over it",
+                data_dir.display()
+            ),
+        ));
+    }
+
+    if !data_dir.exists() {
+        return Ok(());
+    }
+    let non_empty = std::fs::read_dir(data_dir)?.next().is_some();
+    if non_empty && !force {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "data directory is not empty: {} (use force to overwrite)",
+                data_dir.display()
+            ),
+        ));
+    }
+    // `force` says "overwrite this database", not "overwrite whichever
+    // database happens to be here". A different identity is the disaster
+    // case, so it takes a deliberate act (removing the directory) rather
+    // than a flag that was probably already in the operator's shell
+    // history.
+    let existing_id = std::fs::read_to_string(data_dir.join(DB_ID_NAME))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if !existing_id.is_empty()
+        && !incoming_database_id.is_empty()
+        && existing_id != incoming_database_id
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to restore: {} holds database {} but the snapshot is of database \
+                 {}. If replacing a different database is intended, remove the directory \
+                 first.",
+                data_dir.display(),
+                existing_id,
+                incoming_database_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Restore a snapshot at `input_dir` into `data_dir`. Refuses to overwrite a
 /// non-empty `data_dir` unless `force`, refuses a format mismatch, refuses a
 /// snapshot whose checksums do not match, and refuses to overwrite a different
@@ -922,23 +1000,12 @@ pub fn restore_data_dir(
     force: bool,
     nucleus_version: &str,
 ) -> io::Result<BackupManifest> {
-    let manifest_path = input_dir.join(MANIFEST_NAME);
-    if !manifest_path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "not a Nucleus backup (missing {MANIFEST_NAME}): {}",
-                input_dir.display()
-            ),
-        ));
-    }
     // The destination is removed before the copy lands. A destination that
     // overlaps the INPUT (the snapshot itself, or an ancestor of it) would
     // destroy the input with that removal — reject before any mutation
     // (audit A22).
     reject_path_overlap(input_dir, data_dir, "restore")?;
-    let manifest: BackupManifest = serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let manifest = read_manifest(input_dir)?;
 
     // Compatibility is governed by the on-disk format, not the release string:
     // a physical snapshot restores into any build that reads the same
@@ -973,51 +1040,9 @@ pub fn restore_data_dir(
     // since it was taken must never be laid down over a working database.
     verify_snapshot(input_dir, &manifest)?;
 
-    if DataDirLock::is_locked(data_dir) {
-        return Err(io::Error::new(
-            io::ErrorKind::ResourceBusy,
-            format!(
-                "{} is open by a running Nucleus instance — stop it before restoring over it",
-                data_dir.display()
-            ),
-        ));
-    }
+    check_restore_destination(data_dir, force, &manifest.database_id)?;
 
     if data_dir.exists() {
-        let non_empty = std::fs::read_dir(data_dir)?.next().is_some();
-        if non_empty && !force {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "data directory is not empty: {} (use force to overwrite)",
-                    data_dir.display()
-                ),
-            ));
-        }
-        // `force` says "overwrite this database", not "overwrite whichever
-        // database happens to be here". A different identity is the disaster
-        // case, so it takes a deliberate act (removing the directory) rather
-        // than a flag that was probably already in the operator's shell
-        // history.
-        let existing_id = std::fs::read_to_string(data_dir.join(DB_ID_NAME))
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
-        if !existing_id.is_empty()
-            && !manifest.database_id.is_empty()
-            && existing_id != manifest.database_id
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "refusing to restore: {} holds database {} but the snapshot is of database \
-                     {}. If replacing a different database is intended, remove the directory \
-                     first.",
-                    data_dir.display(),
-                    existing_id,
-                    manifest.database_id
-                ),
-            ));
-        }
         std::fs::remove_dir_all(data_dir)?;
     }
 

@@ -104,6 +104,12 @@ fn recovery_point_of(archive_dir: &Path, lsn: u64) -> Option<u64> {
 ///
 /// `db_file` is the primary data file name within the data dir (e.g.
 /// `"nucleus.db"`); its `.wal.d` / `.wal` siblings are the WAL locations.
+///
+/// Every decision that can reject the restore — manifest, target resolution,
+/// older-than-base, destination prerequisites — runs BEFORE the destination
+/// is touched, and the completed image is built in an isolated staging
+/// sibling and published by one rename. A rejected or failed restore leaves
+/// `out_data_dir` byte-for-byte unchanged (audit A23).
 pub fn restore_pitr(
     base_snapshot: &Path,
     archive_dir: &Path,
@@ -113,14 +119,14 @@ pub fn restore_pitr(
     nucleus_version: &str,
     force: bool,
 ) -> io::Result<PitrReport> {
-    // 1. Lay down the physical base (format-locked, refuses a dirty target).
-    let manifest =
-        crate::backup::restore_data_dir(base_snapshot, out_data_dir, force, nucleus_version)?;
-
-    // 2. Resolve the target LSN.
+    // 1. Read and validate everything first. These used to run AFTER the
+    //    base had already replaced the destination: a target older than the
+    //    base, or a time target with no archive index, left the operator's
+    //    database silently swapped to the base snapshot.
+    let manifest = crate::backup::read_manifest(base_snapshot)?;
     let target_lsn = resolve_target_lsn(archive_dir, target)?;
 
-    // 3. Refuse a target older than the base.
+    // 2. Refuse a target older than the base.
     //
     // Replay can only move forward. If the base was taken at LSN 5000 and the
     // operator asks for 4100 — say, to undo a destructive DELETE that ran at
@@ -143,14 +149,81 @@ pub fn restore_pitr(
         ));
     }
 
-    // 3. Locate the restored WAL locations for this db file.
+    // 3. Destination prerequisites (live lock, non-empty without force,
+    //    different database identity) — also before any mutation.
+    crate::backup::check_restore_destination(out_data_dir, force, &manifest.database_id)?;
+
+    // 4. Build the completed image in an isolated staging sibling of the
+    //    destination: base laid down, WAL reconstructed, all inside
+    //    `out_data_dir.pitr-image-<pid>`. Nothing under `out_data_dir` is
+    //    touched until the image is complete.
+    let mut name = out_data_dir
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".pitr-image-{}", std::process::id()));
+    let image = out_data_dir
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(name);
+    if image.exists() {
+        std::fs::remove_dir_all(&image)?;
+    }
+    let built = build_pitr_image(
+        base_snapshot,
+        archive_dir,
+        target_lsn,
+        &image,
+        db_file,
+        nucleus_version,
+    );
+    let (restored_lsn, segments_written, specialty_logs) = match built {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&image);
+            return Err(e);
+        }
+    };
+
+    // 5. Publish: the only mutation of the destination, one rename of a
+    //    complete image.
+    if out_data_dir.exists() {
+        std::fs::remove_dir_all(out_data_dir)?;
+    }
+    std::fs::rename(&image, out_data_dir)?;
+
+    Ok(PitrReport {
+        target_lsn,
+        restored_lsn,
+        segments_written,
+        recovery_point_unix: recovery_point_of(archive_dir, restored_lsn),
+        specialty_logs_at_base: specialty_logs,
+    })
+}
+
+/// Lay down the base and reconstruct the truncated WAL inside `image`.
+/// Returns `(restored_lsn, segments_written, specialty_logs)` computed from
+/// the completed image.
+fn build_pitr_image(
+    base_snapshot: &Path,
+    archive_dir: &Path,
+    target_lsn: u64,
+    image: &Path,
+    db_file: &str,
+    nucleus_version: &str,
+) -> io::Result<(u64, usize, Vec<String>)> {
+    // 1. Lay down the physical base (format-locked, refuses a dirty target).
+    //    `image` is a fresh staging directory, so force is not needed here.
+    crate::backup::restore_data_dir(base_snapshot, image, false, nucleus_version)?;
+
+    // 2. Locate the restored WAL locations for this db file.
     let db_path = Path::new(db_file);
     let wal_dir_name = db_path.with_extension("wal.d");
     let single_wal_name = db_path.with_extension("wal");
-    let restored_wal_dir = out_data_dir.join(&wal_dir_name);
-    let restored_single_wal = out_data_dir.join(&single_wal_name);
+    let restored_wal_dir = image.join(&wal_dir_name);
+    let restored_single_wal = image.join(&single_wal_name);
 
-    // 4. Gather candidate segment sources, in a stable order. Duplicate records
+    // 3. Gather candidate segment sources, in a stable order. Duplicate records
     //    across sources are harmless: recovery sorts by LSN and applies
     //    last-write-wins, and identical (lsn,page) writes are idempotent.
     let mut sources: Vec<PathBuf> = Vec::new();
@@ -172,8 +245,8 @@ pub fn restore_pitr(
         sources.push(restored_single_wal.clone());
     }
 
-    // 5. Assemble a fresh WAL directory holding every record <= target_lsn.
-    let staging = out_data_dir.join(format!("{}.pitr-staging", wal_dir_name.to_string_lossy()));
+    // 4. Assemble a fresh WAL directory holding every record <= target_lsn.
+    let staging = image.join(format!("{}.pitr-staging", wal_dir_name.to_string_lossy()));
     if staging.exists() {
         std::fs::remove_dir_all(&staging)?;
     }
@@ -202,7 +275,7 @@ pub fn restore_pitr(
         }
     }
 
-    // 6. Swap the reconstructed WAL into place and neutralize the base's WAL so
+    // 5. Swap the reconstructed WAL into place and neutralize the base's WAL so
     //    a reopen never replays past the target.
     if restored_wal_dir.exists() {
         std::fs::remove_dir_all(&restored_wal_dir)?;
@@ -212,13 +285,11 @@ pub fn restore_pitr(
         std::fs::remove_file(&restored_single_wal)?;
     }
 
-    Ok(PitrReport {
-        target_lsn,
+    Ok((
         restored_lsn,
-        segments_written: (seq - 1) as usize,
-        recovery_point_unix: recovery_point_of(archive_dir, restored_lsn),
-        specialty_logs_at_base: specialty_logs_in(out_data_dir, &wal_dir_name, &single_wal_name),
-    })
+        (seq - 1) as usize,
+        specialty_logs_in(image, &wal_dir_name, &single_wal_name),
+    ))
 }
 
 /// Every `*.wal` under `root` that is not the SQL substrate's own WAL.
@@ -475,4 +546,89 @@ mod tests {
         assert!(recs.iter().all(|r| r.lsn <= target));
         let _ = std::fs::remove_dir_all(&root);
     }
+
+// ── Preflight: a rejected restore never touches the destination (A23) ──
+
+/// Rejections that can be decided up front (target older than the base,
+/// missing time index) must fire BEFORE the base replaces the destination —
+/// the old order swapped the destination to the base first and only then
+/// refused, so a "failed" PITR had already destroyed the target directory.
+#[test]
+fn pitr_rejections_leave_the_destination_untouched() {
+    let root = tmp("preflight");
+    let _ = std::fs::remove_dir_all(&root);
+    let data = root.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    // A WAL with real records, so the base backup records consistent_lsn > 0.
+    let w = SegmentedWal::open(&data.join("nucleus.wal.d"), 10 * 1024 * 1024).unwrap();
+    let mut last = 0;
+    for i in 0..10u32 {
+        last = w.log_page_write(1, i, &page_with((i % 7) as u8 + 1)).unwrap();
+    }
+    w.sync().unwrap();
+    drop(w);
+    let base = root.join("base");
+    let manifest = crate::backup::backup_data_dir(&data, &base, false, "0.1.1").unwrap();
+    assert!(
+        manifest.consistent_lsn >= last,
+        "fixture: base must be consistent at its WAL head ({} >= {})",
+        manifest.consistent_lsn,
+        last
+    );
+
+    // A distinct, existing destination the operator expects to survive a
+    // refused restore.
+    let dest = root.join("live_db");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("precious.txt"), b"still here").unwrap();
+    let no_archive = root.join("no_archive");
+
+    // (a) Target OLDER than the base: refused with InvalidInput.
+    let err = restore_pitr(
+        &base,
+        &no_archive,
+        PitrTarget::Lsn(manifest.consistent_lsn - 1),
+        &dest,
+        "nucleus.db",
+        "0.1.1",
+        true,
+    )
+    .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("only moves forward"), "{err}");
+    assert_eq!(
+        std::fs::read(dest.join("precious.txt")).unwrap(),
+        b"still here",
+        "a rejected restore must leave the destination untouched"
+    );
+
+    // (b) Time-based target with NO archive index: refused with NotFound,
+    // destination untouched.
+    std::fs::create_dir_all(&no_archive).unwrap();
+    let err = restore_pitr(
+        &base,
+        &no_archive,
+        PitrTarget::UnixSeconds(1_700_000_000),
+        &dest,
+        "nucleus.db",
+        "0.1.1",
+        true,
+    )
+    .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    assert!(err.to_string().contains("archive index"), "{err}");
+    assert_eq!(
+        std::fs::read(dest.join("precious.txt")).unwrap(),
+        b"still here"
+    );
+
+    // No staging image debris after clean rejections.
+    let debris: Vec<_> = std::fs::read_dir(&root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".pitr-image"))
+        .collect();
+    assert!(debris.is_empty(), "staging debris: {debris:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
 }
