@@ -161,6 +161,80 @@ async fn test_on_conflict_do_update() {
 
 // ======================================================================
 
+// ON CONFLICT DO UPDATE table-privilege preflight (audit A17)
+// ======================================================================
+
+async fn upsert_priv_fixture(ex: &Executor) {
+    exec(&ex, "CREATE TABLE upsert_priv (id INT PRIMARY KEY, name TEXT)").await;
+    exec(&ex, "INSERT INTO upsert_priv VALUES (1, 'alice')").await;
+    exec(&ex, "CREATE ROLE writer LOGIN PASSWORD 'x'").await;
+}
+
+/// The conflict arm is an UPDATE: a role holding INSERT (and even SELECT)
+/// alone must not reach it, and the preflight must run before the source is
+/// evaluated so nothing is written or triggered by a denied statement.
+#[tokio::test]
+async fn on_conflict_do_update_requires_update_privilege() {
+    let ex = test_executor();
+    upsert_priv_fixture(&ex).await;
+    exec(&ex, "GRANT INSERT, SELECT ON upsert_priv TO writer").await;
+    let sid = ex.create_session();
+    ex.bind_authenticated_session(sid, "writer").await.unwrap();
+
+    let err = ex
+        .execute_with_session(
+            sid,
+            "INSERT INTO upsert_priv VALUES (1, 'bob') ON CONFLICT (id) DO UPDATE SET name = 'bob'",
+        )
+        .await;
+    match err {
+        Err(ExecError::PermissionDenied(msg)) => {
+            assert!(msg.contains("permission denied"), "got: {msg}")
+        }
+        Err(other) => panic!("expected PermissionDenied, got: {other}"),
+        Ok(v) => panic!("INSERT-only role updated a row via the conflict arm: {v:?}"),
+    }
+
+    // DO NOTHING is not an UPDATE: INSERT alone keeps working.
+    ex.execute_with_session(
+        sid,
+        "INSERT INTO upsert_priv VALUES (1, 'zed') ON CONFLICT (id) DO NOTHING",
+    )
+    .await
+    .unwrap();
+
+    // The denied upsert left the stored row untouched.
+    let results = exec(&ex, "SELECT name FROM upsert_priv WHERE id = 1").await;
+    assert_eq!(*scalar(&results[0]), Value::Text("alice".into()));
+}
+
+/// INSERT + UPDATE (no SELECT) is the exact grant set an upsert needs —
+/// mirroring plain UPDATE, which requires no SELECT either. RETURNING follows
+/// the engine-wide rule: no RETURNING clause anywhere requires SELECT, so the
+/// upsert's RETURNING is evaluated under the write grants alone.
+#[tokio::test]
+async fn on_conflict_do_update_succeeds_with_insert_update_grants() {
+    let ex = test_executor();
+    upsert_priv_fixture(&ex).await;
+    exec(&ex, "GRANT INSERT, UPDATE ON upsert_priv TO writer").await;
+    let sid = ex.create_session();
+    ex.bind_authenticated_session(sid, "writer").await.unwrap();
+
+    let res = ex
+        .execute_with_session(
+            sid,
+            "INSERT INTO upsert_priv VALUES (1, 'bob') ON CONFLICT (id) DO UPDATE SET name = 'bob' RETURNING name",
+        )
+        .await
+        .expect("fully granted upsert");
+    assert_eq!(rows(&res[0])[0][0], Value::Text("bob".into()));
+
+    let results = exec(&ex, "SELECT name FROM upsert_priv WHERE id = 1").await;
+    assert_eq!(*scalar(&results[0]), Value::Text("bob".into()));
+}
+
+// ======================================================================
+
 // RETURNING clause tests
 // ======================================================================
 

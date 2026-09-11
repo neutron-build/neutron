@@ -151,6 +151,26 @@ impl Executor {
             )));
         }
 
+        // ON CONFLICT DO UPDATE may rewrite an existing row: the conflict arm
+        // is an UPDATE, and a role holding INSERT alone must not reach it.
+        // The table-privilege preflight mirrors plain UPDATE and runs before
+        // the source is evaluated, so a denied statement never computes the
+        // candidate rows. The per-row RLS predicates on the conflict arm are
+        // unchanged and checked further down.
+        let conflict_updates = match &insert.on {
+            Some(ast::OnInsert::OnConflict(oc)) => {
+                matches!(oc.action, ast::OnConflictAction::DoUpdate(_))
+            }
+            // MySQL spelling, treated as DO UPDATE below.
+            Some(ast::OnInsert::DuplicateKeyUpdate(_)) => true,
+            _ => false,
+        };
+        if conflict_updates && !self.check_privilege(&table_name, "UPDATE").await {
+            return Err(ExecError::PermissionDenied(format!(
+                "permission denied for table {table_name}"
+            )));
+        }
+
         let table_def = self.get_table(&table_name).await?;
 
         // Extract column list (if specified, for partial inserts)
