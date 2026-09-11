@@ -95,6 +95,22 @@ func IsNative(id MessageID) bool {
 	return strings.HasPrefix(string(id), sourceNative+":")
 }
 
+// NativeID returns the provider-native identifier a native MessageID wraps,
+// or "" for header-derived and positional identities. Callers that must
+// address a message by the provider's own key — Graph's createReply, the
+// Gmail message resource — use this to unwrap what the mirror stores.
+func NativeID(id MessageID) string {
+	source, rest, found := strings.Cut(string(id), ":")
+	if !found || source != sourceNative {
+		return ""
+	}
+	_, native, found := strings.Cut(rest, ":")
+	if !found {
+		return ""
+	}
+	return native
+}
+
 // UpgradeIdentity returns the best identity available for a message.
 //
 // Identity sources are ordered native > header > positional. A message first

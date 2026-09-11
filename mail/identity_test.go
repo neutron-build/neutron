@@ -295,6 +295,25 @@ func TestShortTruncatesLongIdentities(t *testing.T) {
 	}
 }
 
+func TestNativeIDUnwrapsOnlyNativeIdentities(t *testing.T) {
+	if got := NativeID(NativeMessageID(ProviderGraph, "AAMkAGI=")); got != "AAMkAGI=" {
+		t.Errorf("NativeID(graph native) = %q, want the provider id", got)
+	}
+	if got := NativeID(NativeMessageID(ProviderGmail, "18c9f0a")); got != "18c9f0a" {
+		t.Errorf("NativeID(gmail native) = %q, want the provider id", got)
+	}
+	for _, id := range []MessageID{
+		HeaderMessageID("<a@b.com>"),
+		PositionalMessageID("INBOX", 1, 1),
+		MessageID("n:graph"),
+		"malformed",
+	} {
+		if got := NativeID(id); got != "" {
+			t.Errorf("NativeID(%q) = %q, want empty for a non-native identity", id, got)
+		}
+	}
+}
+
 func TestBodyPartAttachmentClassification(t *testing.T) {
 	tests := []struct {
 		name string
