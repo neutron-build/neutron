@@ -469,11 +469,43 @@ impl Database {
     /// tx.commit().await.unwrap();
     /// ```
     pub async fn begin(&self) -> Result<Transaction, ExecError> {
-        self.executor.execute("BEGIN").await?;
-        Ok(Transaction {
-            executor: self.executor.clone(),
-            finished: false,
-        })
+        #[cfg(feature = "server")]
+        {
+            // Each handle gets its own session identity (A3): every
+            // Transaction used to run on the executor's shared DEFAULT
+            // session, so two handles from one Database interleaved
+            // BEGIN/COMMIT/DROP-ROLLBACK on one session — the second BEGIN
+            // warned and silently joined the first transaction, and a dropped
+            // handle's rollback could undo the other's work. The lifecycle
+            // mirrors a wire connection: create on begin, drop on finish.
+            let session_id = self.executor.create_session();
+            match self
+                .executor
+                .execute_with_session(session_id, "BEGIN")
+                .await
+            {
+                Ok(_) => Ok(Transaction {
+                    executor: self.executor.clone(),
+                    session_id,
+                    finished: false,
+                }),
+                Err(e) => {
+                    self.executor.drop_session(session_id);
+                    Err(e)
+                }
+            }
+        }
+        #[cfg(not(feature = "server"))]
+        {
+            // Core-only builds have no session-scoping task-locals; the
+            // shared default session is the only one that exists.
+            self.executor.execute("BEGIN").await?;
+            Ok(Transaction {
+                executor: self.executor.clone(),
+                session_id: 0,
+                finished: false,
+            })
+        }
     }
 
     // ========================================================================
@@ -1086,20 +1118,35 @@ impl ColumnarHandle<'_> {
 /// a consistent snapshot. Changes are invisible to other transactions until
 /// `commit()` is called. If `rollback()` is called (or the handle is dropped
 /// without committing), all changes are discarded.
+///
+/// Each handle owns a dedicated executor session (server builds), so handles
+/// from one `Database` do not interleave on a shared session (A3).
 pub struct Transaction {
     executor: Arc<Executor>,
+    /// The dedicated session this transaction runs on. `0` (the shared
+    /// default session) in core-only builds, which have no session machinery.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    session_id: u64,
     finished: bool,
 }
 
 impl Transaction {
+    /// Run SQL on THIS transaction's session.
+    async fn run(&self, sql: &str) -> Result<Vec<ExecResult>, ExecError> {
+        #[cfg(feature = "server")]
+        return self.executor.execute_with_session(self.session_id, sql).await;
+        #[cfg(not(feature = "server"))]
+        self.executor.execute(sql).await
+    }
+
     /// Execute a SQL statement within this transaction.
     pub async fn execute(&self, sql: &str) -> Result<Vec<ExecResult>, ExecError> {
-        self.executor.execute(sql).await
+        self.run(sql).await
     }
 
     /// Execute a query and return just the rows.
     pub async fn query(&self, sql: &str) -> Result<Vec<Row>, ExecError> {
-        let results = self.executor.execute(sql).await?;
+        let results = self.run(sql).await?;
         for result in results.into_iter().rev() {
             // materialize(): under stream_results=on a SELECT yields a
             // SelectStream, which used to fall through here and silently
@@ -1113,17 +1160,32 @@ impl Transaction {
     }
 
     /// Commit the transaction, making all changes permanent.
+    ///
+    /// The commit outcome resolves BEFORE the handle is marked finished: on
+    /// failure the rollback a failed commit owes is attempted on this
+    /// transaction's own session, the session is torn down, and the error is
+    /// returned (A3).
     pub async fn commit(mut self) -> Result<(), ExecError> {
+        let outcome = self.run("COMMIT").await;
         self.finished = true;
-        self.executor.execute("COMMIT").await?;
-        Ok(())
+        if outcome.is_err() {
+            // A failed COMMIT can leave the transaction active on its session
+            // (e.g. a persistence failure); roll it back before teardown
+            // rather than leaving it for the safety net.
+            let _ = self.run("ROLLBACK").await;
+        }
+        #[cfg(feature = "server")]
+        self.executor.drop_session(self.session_id);
+        outcome.map(|_| ())
     }
 
     /// Roll back the transaction, discarding all changes.
     pub async fn rollback(mut self) -> Result<(), ExecError> {
+        let outcome = self.run("ROLLBACK").await;
         self.finished = true;
-        self.executor.execute("ROLLBACK").await?;
-        Ok(())
+        #[cfg(feature = "server")]
+        self.executor.drop_session(self.session_id);
+        outcome.map(|_| ())
     }
 }
 
@@ -1135,16 +1197,27 @@ impl Drop for Transaction {
             // core-only embedded build deliberately has no Tokio runtime feature;
             // it uses a small executor on a helper thread instead. This is a safety
             // net — callers should explicitly commit or rollback.
+            //
+            // The rollback targets THIS transaction's own session only (A3):
+            // when handles shared the default session, a dropped handle could
+            // roll back another handle's open transaction.
             let executor = self.executor.clone();
             #[cfg(feature = "server")]
             {
+                let session_id = self.session_id;
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     handle.spawn(async move {
-                        let _ = executor.execute("ROLLBACK").await;
+                        let _ = executor
+                            .execute_with_session(session_id, "ROLLBACK")
+                            .await;
+                        executor.drop_session(session_id);
                     });
                 } else {
                     std::thread::spawn(move || {
-                        let _ = futures::executor::block_on(executor.execute("ROLLBACK"));
+                        let _ = futures::executor::block_on(
+                            executor.execute_with_session(session_id, "ROLLBACK"),
+                        );
+                        executor.drop_session(session_id);
                     });
                 }
             }
@@ -2282,4 +2355,114 @@ mod tests {
             "the refused open must not rewrite the corrupt meta.json"
         );
     }
+}
+
+// ======================================================================
+// Explicit transaction handle isolation (audit A3)
+// ======================================================================
+
+/// Two `Transaction` handles from one `Database` must be isolated
+/// transactions. Both used to run on the executor's shared DEFAULT session:
+/// the second BEGIN warned and silently joined the first transaction, both
+/// commits hit the same session, and dropping one handle rolled back the
+/// other's open transaction.
+#[tokio::test]
+async fn embedded_transaction_handles_do_not_share_a_session() {
+    let db = Database::mvcc();
+    db.execute("CREATE TABLE tx (id INT PRIMARY KEY)").await.unwrap();
+
+    let tx1 = db.begin().await.unwrap();
+    let tx2 = db.begin().await.unwrap();
+    tx1.execute("INSERT INTO tx VALUES (1)").await.unwrap();
+    tx2.execute("INSERT INTO tx VALUES (2)").await.unwrap();
+
+    // Each handle sees only its own writes until commit.
+    let seen1 = tx1.query("SELECT id FROM tx ORDER BY id").await.unwrap();
+    assert_eq!(seen1.len(), 1, "tx1 must not see tx2's uncommitted row");
+    let seen2 = tx2.query("SELECT id FROM tx ORDER BY id").await.unwrap();
+    assert_eq!(seen2.len(), 1, "tx2 must not see tx1's uncommitted row");
+
+    tx1.commit().await.unwrap();
+    // Dropping tx2 rolls back only tx2's transaction; tx1's committed row
+    // survives and tx2's vanished row never appears.
+    drop(tx2);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let rows = db.query("SELECT id FROM tx").await.unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![Value::Int32(1)]],
+        "a dropped handle must roll back only its own transaction"
+    );
+}
+
+/// An explicit rollback ends the session cleanly and the database stays
+/// usable afterwards — no leaked open transaction on any shared session.
+#[tokio::test]
+async fn embedded_transaction_rollback_leaves_database_usable() {
+    let db = Database::mvcc();
+    db.execute("CREATE TABLE txr (id INT PRIMARY KEY)").await.unwrap();
+
+    let tx = db.begin().await.unwrap();
+    tx.execute("INSERT INTO txr VALUES (1)").await.unwrap();
+    tx.rollback().await.unwrap();
+
+    let rows = db.query("SELECT id FROM txr").await.unwrap();
+    assert!(rows.is_empty(), "rollback must discard the write");
+    // Autocommit still works on the database afterwards.
+    db.execute("INSERT INTO txr VALUES (2)").await.unwrap();
+    let rows = db.query("SELECT id FROM txr").await.unwrap();
+    assert_eq!(rows, vec![vec![Value::Int32(2)]]);
+}
+
+/// A FAILED commit resolves its outcome before the handle finishes: the
+/// transaction gets the rollback the failure owes, on its own session, and
+/// the caller sees the error. Driven with a SERIALIZABLE write-skew so the
+/// storage commit itself fails deterministically. `Database::begin` issues a
+/// plain BEGIN, so the handles are built here on sessions already opened at
+/// SERIALIZABLE — same construction, different isolation selection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn embedded_transaction_failed_commit_rolls_back_its_own_transaction() {
+    async fn serializable_tx(db: &Database) -> Transaction {
+        let session_id = db.executor.create_session();
+        db.executor
+            .execute_with_session(session_id, "BEGIN ISOLATION LEVEL SERIALIZABLE")
+            .await
+            .unwrap();
+        Transaction {
+            executor: db.executor.clone(),
+            session_id,
+            finished: false,
+        }
+    }
+
+    let db = Database::mvcc();
+    db.execute("CREATE TABLE skew (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+        .await
+        .unwrap();
+    db.execute("INSERT INTO skew VALUES (1,1),(2,1)").await.unwrap();
+
+    // The handle's transaction: read half of the write skew now.
+    let tx = serializable_tx(&db).await;
+    tx.query("SELECT v FROM skew WHERE id = 2").await.unwrap();
+
+    // A concurrent handle closes the cycle and commits first.
+    let winner = serializable_tx(&db).await;
+    winner.query("SELECT v FROM skew WHERE id = 1").await.unwrap();
+    winner
+        .execute("UPDATE skew SET v = 0 WHERE id = 2")
+        .await
+        .unwrap();
+    winner.commit().await.unwrap();
+
+    tx.execute("UPDATE skew SET v = 0 WHERE id = 1").await.unwrap();
+    let failed = tx.commit().await;
+    assert!(failed.is_err(), "the write-skew commit must fail");
+
+    // The failed handle's write was rolled back with its session; the
+    // winner's committed write stands.
+    let rows = db.query("SELECT v FROM skew ORDER BY id").await.unwrap();
+    assert_eq!(rows, vec![vec![Value::Int32(1)], vec![Value::Int32(0)]]);
+    // And the database remains usable in autocommit.
+    db.execute("INSERT INTO skew VALUES (3, 3)").await.unwrap();
 }
