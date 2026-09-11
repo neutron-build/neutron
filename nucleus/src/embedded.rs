@@ -123,7 +123,24 @@ impl DatabaseBuilder {
             }
             #[cfg(feature = "server")]
             StorageMode::Disk(ref path) => {
-                data_dir = Some(path.clone());
+                // A4: per-file sidecar directory `<file>.d`, keyed to the
+                // exact database file rather than its parent directory. The
+                // executor derives catalog.json, meta.json, sequences.json,
+                // stats.json and fts_index.json from the catalog path's
+                // parent, so a bare sibling file would scatter those into
+                // the parent — shared by every .ndb in that directory, which
+                // is exactly the collision a sidecar must not have. One
+                // directory keeps every sidecar artifact exclusive to this
+                // database and vanishes with a `rm -rf <file>.d`.
+                let mut sidecar = path.as_os_str().to_os_string();
+                sidecar.push(".d");
+                let sidecar = std::path::PathBuf::from(sidecar);
+                std::fs::create_dir_all(&sidecar).map_err(|e| {
+                    DatabaseError::Storage(format!(
+                        "create sidecar directory {}: {e}",
+                        sidecar.display()
+                    ))
+                })?;
                 let engine = DiskEngine::open(path, catalog.clone())
                     .map_err(|e| DatabaseError::Storage(e.to_string()))?;
                 // Repopulate the catalog from the restored on-disk table directory
@@ -134,6 +151,7 @@ impl DatabaseBuilder {
                 // directory epoch against a default-0 catalog epoch and wrongly
                 // treat every reopened table as a stale drop+recreate (T0.3).
                 recovered_epochs = engine.recovered_table_epochs();
+                data_dir = Some(sidecar);
                 Arc::new(engine)
             }
         };
@@ -142,23 +160,24 @@ impl DatabaseBuilder {
         // full TableDefs including CONSTRAINTS. The WAL schema records below
         // only know column names/types, so recovering from them alone
         // silently dropped PK/UNIQUE/FK enforcement after a reopen.
-        // Catalog sidecar: DurableMvcc ONLY. Its data directory is exclusive
-        // to one database, so catalog.json/sequences.json live inside it and
-        // vanish with it. Disk mode gets NO sidecar: the .ndb file already
-        // persists schemas WITH constraints through the engine's own
-        // directory (verified by the disk recovery suites), and a sidecar
-        // next to the file would be shared by every .ndb in that directory —
-        // one database's tables would leak into another's recovery.
+        // Catalog sidecar: DurableMvcc keeps catalog.json/sequences.json
+        // inside its data directory, which is exclusive to one database and
+        // vanishes with it. Disk mode keeps the same layout inside its
+        // per-file `<file>.d` sidecar (see above) — the executor's
+        // meta.json/fts_index.json/stats.json derivations land there too, so
+        // two .ndb files in one parent stay fully isolated.
         #[cfg(feature = "server")]
         let catalog_path = match self.mode {
             StorageMode::DurableMvcc(ref d) => Some(d.join("catalog.json")),
+            StorageMode::Disk(_) => data_dir.as_ref().map(|d| d.join("catalog.json")),
             _ => None,
         };
         #[cfg(not(feature = "server"))]
         let catalog_path: Option<std::path::PathBuf> = None;
-        // Only DurableMvcc sets `catalog_path`, and that mode is server-only, so
-        // in a core-only build this is dead code that still has to compile —
-        // against a `persistence` module that does not exist there.
+        // Both durable modes (DurableMvcc, Disk) set `catalog_path`, and both
+        // are server-only, so in a core-only build this is dead code that
+        // still has to compile — against a `persistence` module that does not
+        // exist there.
         #[cfg(feature = "server")]
         if let Some(ref cp) = catalog_path {
             let persistence = crate::storage::persistence::CatalogPersistence::new(cp);
@@ -1505,6 +1524,106 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A4: Disk mode keeps its metadata in a per-file `<file>.d` sidecar, so
+    /// KV strings, views and RLS policy survive a reopen of the same file —
+    /// and two .ndb files in one parent directory stay isolated (the old
+    /// code persisted none of this, and a naive parent-dir sidecar would have
+    /// leaked one database's metadata into the other's recovery).
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn embedded_disk_metadata_survives_reopen_and_siblings_stay_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.ndb");
+        let b = dir.path().join("b.ndb");
+
+        {
+            let db = Database::open(&a).unwrap();
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY, owner TEXT)")
+                .await
+                .unwrap();
+            db.execute("INSERT INTO t VALUES (1, 'alice')").await.unwrap();
+            db.execute("CREATE VIEW v AS SELECT id FROM t").await.unwrap();
+            db.execute("ALTER TABLE t ENABLE ROW LEVEL SECURITY")
+                .await
+                .unwrap();
+            db.execute("CREATE POLICY p ON t TO PUBLIC USING (owner = CURRENT_USER)")
+                .await
+                .unwrap();
+            db.kv().set("k", Value::Text("from-a".into()), None);
+        }
+        {
+            // A second database in the SAME parent, open while the first one
+            // has already written its sidecar: it must see none of a's state.
+            let db = Database::open(&b).unwrap();
+            assert!(
+                db.execute("SELECT * FROM v").await.is_err(),
+                "database b must not see database a's view"
+            );
+            db.kv().set("k", Value::Text("from-b".into()), None);
+        }
+
+        {
+            let db = Database::open(&a).unwrap();
+            assert_eq!(
+                db.kv().get("k"),
+                Some(Value::Text("from-a".into())),
+                "KV strings must survive a reopen of the same file"
+            );
+            let rows = db.query("SELECT id FROM v").await.unwrap();
+            assert_eq!(rows.len(), 1, "the view must survive a reopen");
+            let policies = db.query("SELECT policyname FROM pg_policies").await.unwrap();
+            assert_eq!(
+                policies.len(),
+                1,
+                "the RLS policy must survive a reopen (and RLS must still be enabled)"
+            );
+            assert!(
+                db.executor().rls_configured(),
+                "the RLS enablement must survive a reopen"
+            );
+        }
+        {
+            let db = Database::open(&b).unwrap();
+            assert_eq!(
+                db.kv().get("k"),
+                Some(Value::Text("from-b".into())),
+                "each file's KV namespace must stay isolated"
+            );
+            assert!(
+                db.query("SELECT policyname FROM pg_policies")
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "database b must not inherit database a's policies"
+            );
+        }
+    }
+
+    /// A4: a corrupt sidecar catalog must fail the open, not silently
+    /// substitute volatile state — the same contract DurableMvcc's catalog
+    /// load and main.rs's meta.json load already enforce.
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn embedded_disk_fails_closed_on_corrupt_sidecar_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("c.ndb");
+
+        {
+            let db = Database::open(&db_path).unwrap();
+            db.execute("CREATE TABLE t (id INT NOT NULL)").await.unwrap();
+        }
+
+        let sidecar_catalog = db_path.with_file_name("c.ndb.d").join("catalog.json");
+        assert!(sidecar_catalog.exists(), "the sidecar must exist after DDL");
+        std::fs::write(&sidecar_catalog, "not json").unwrap();
+
+        let err = Database::open(&db_path).err().map(|e| e.to_string());
+        assert!(
+            err.as_ref().is_some_and(|e| e.contains("catalog load")),
+            "a corrupt sidecar catalog must fail the open loudly, got: {err:?}"
+        );
     }
 
     #[tokio::test]
