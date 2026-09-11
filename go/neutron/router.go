@@ -145,14 +145,30 @@ func (r *Router) Group(prefix string, mw ...Middleware) *Router {
 // Mount attaches an http.Handler under a prefix. Useful for mounting external
 // handlers or sub-routers. The group's middleware applies to the mounted
 // handler the same as any other route on the group.
+//
+// The exact mount root (/service) is normalized to the same "/" subrequest
+// path that the slash-suffixed mount (/service/) produces, so a subrouter
+// with a root-only route answers both. Registering the raw handler on the
+// exact pattern used to hand it the unstripped "/service" path instead —
+// two path namespaces for one mount (audit neutron-22).
 func (r *Router) Mount(prefix string, handler http.Handler) {
 	fullPrefix := r.prefix + prefix
 	r.claimPattern(fullPrefix + "/")
 	r.claimPattern(fullPrefix)
-	// Strip prefix before passing to the handler
-	r.mux.Handle(fullPrefix+"/", applyMiddleware(http.StripPrefix(fullPrefix, handler), r.middleware))
-	// Also handle exact prefix match
-	r.mux.Handle(fullPrefix, applyMiddleware(handler, r.middleware))
+
+	root := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == fullPrefix {
+			rooted := req.Clone(req.Context())
+			rooted.URL.Path = "/"
+			rooted.URL.RawPath = ""
+			handler.ServeHTTP(w, rooted)
+			return
+		}
+		http.StripPrefix(fullPrefix, handler).ServeHTTP(w, req)
+	})
+	wrapped := applyMiddleware(root, r.middleware)
+	r.mux.Handle(fullPrefix+"/", wrapped)
+	r.mux.Handle(fullPrefix, wrapped)
 }
 
 // Handle registers a raw http.Handler for the given pattern.
@@ -249,18 +265,26 @@ func (r *Router) register(method, pattern string, handler http.Handler, inType, 
 // no route matches the path (genuine 404) and a non-empty pattern when the path
 // matches but the method does not (405) — so we distinguish them via Handler().
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	// Serve via the mux (it populates req.PathValue) wrapped in an interceptor
-	// that rewrites the mux's built-in plain-text 404/405 as problem+json. The
-	// interceptor forwards Flush/Hijack/Unwrap so SSE/WebSocket are unaffected.
-	r.mux.ServeHTTP(&errInterceptor{ResponseWriter: w, req: req}, req)
+	// Only the mux's own unmatched/method-mismatch outcomes get rewritten.
+	// Asking the mux which pattern wins separates them from a REGISTERED
+	// application handler that happens to answer 404 or 405 with its own
+	// body: rewriting those swallowed application error codes and payloads
+	// behind a generic problem document (audit neutron-23). The interceptor
+	// forwards Flush/Hijack/Unwrap so SSE/WebSocket are unaffected.
+	if _, pattern := r.mux.Handler(req); pattern == "" {
+		r.mux.ServeHTTP(&errInterceptor{ResponseWriter: w, req: req}, req)
+		return
+	}
+	r.mux.ServeHTTP(w, req)
 }
 
 // errInterceptor rewrites the std ServeMux's built-in plain-text 404/405 replies
-// as RFC 7807 problem+json. It only rewrites when the response content-type is
-// not already problem+json — so handlers that produce their own errors (via
-// WriteError) pass through untouched. Go 1.22's mux returns an empty pattern for
-// both genuine 404s and method-mismatch 405s, so the status code + the mux-set
-// Allow header are the reliable signals, not the pattern.
+// as RFC 7807 problem+json. It only ever wraps requests the mux could not route
+// to a registered pattern, so an application handler's own 404/405 — custom
+// JSON, an HTML not-found page — always passes through untouched. Go 1.22's
+// mux returns an empty pattern for both genuine 404s and method-mismatch 405s,
+// so the status code + the mux-set Allow header are the reliable signals, not
+// the pattern.
 type errInterceptor struct {
 	http.ResponseWriter
 	req       *http.Request
