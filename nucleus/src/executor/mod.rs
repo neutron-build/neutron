@@ -182,6 +182,51 @@ impl Drop for CommandGuard {
     }
 }
 
+/// RAII guard for one `execute_statement` nesting-depth slot.
+///
+/// The depth used to be fetch_add → await → fetch_sub with no cancellation
+/// guard. The wire layer drops statement futures (pgwire CancelRequest races
+/// the executor future in a `select!`; statement timeout wraps it in
+/// `tokio::time::timeout`), so a cancelled statement leaked its increment
+/// forever: the session's next statement ran at depth ≥ 1, and autocommit row
+/// locks — released only when the counter returns to zero — were held until
+/// the connection closed. Decrementing in Drop covers cancellation, timeout
+/// and panic alike.
+///
+/// On cancellation the guard also drives the error-state cleanup a failed
+/// statement gets: the outcome of a statement whose future was dropped
+/// mid-flight is unknown, so an open transaction is marked aborted (Postgres
+/// cancels the transaction, not just the statement) and autocommit locks are
+/// released at the outermost boundary. `try_write` on the txn state keeps the
+/// guard non-blocking — a session being torn down mid-write loses the flag,
+/// which the teardown's own rollback covers.
+struct StatementDepthGuard<'a> {
+    executor: &'a Executor,
+    session: std::sync::Arc<Session>,
+    /// Set on normal completion before the guard is dropped, so the
+    /// cancellation-only cleanup does not fire for a resolved statement.
+    completed: bool,
+}
+
+impl Drop for StatementDepthGuard<'_> {
+    fn drop(&mut self) {
+        let back = self.session.statement_depth.fetch_sub(1, Ordering::SeqCst);
+        // Row locks live until the transaction ends — except in autocommit,
+        // where the statement IS the transaction: only the outermost boundary
+        // releases, and only when no explicit transaction is active.
+        if back == 1 && !self.session.txn_active.load(Ordering::SeqCst) {
+            self.executor
+                .release_row_locks(unique_gate::gate_session_id());
+        }
+        if !self.completed
+            && let Ok(mut txn) = self.session.txn_state.try_write()
+            && txn.active
+        {
+            txn.aborted = true;
+        }
+    }
+}
+
 /// The result of executing a statement.
 pub enum ExecResult {
     /// SELECT result with column names, types, and materialized rows.
@@ -6591,13 +6636,18 @@ impl Executor {
         // inner statement (procedure body, trigger) from releasing the outer
         // statement's locks while it is still running; only the outermost
         // boundary releases, and only when no explicit transaction is active.
+        // The guard (not a trailing fetch_sub) owns the decrement so a
+        // cancelled statement future cannot leak the slot (A12).
         let session = self.current_session();
         session.statement_depth.fetch_add(1, Ordering::SeqCst);
+        let mut guard = StatementDepthGuard {
+            executor: self,
+            session: session.clone(),
+            completed: false,
+        };
         let result = self.execute_statement_inner(stmt).await;
-        let back = session.statement_depth.fetch_sub(1, Ordering::SeqCst);
-        if back == 1 && !session.txn_active.load(Ordering::SeqCst) {
-            self.release_row_locks(unique_gate::gate_session_id());
-        }
+        guard.completed = true;
+        drop(guard);
         if result.is_err() {
             let mut tx = session.txn_state.write().await;
             if tx.active {

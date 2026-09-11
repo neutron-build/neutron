@@ -884,3 +884,99 @@ async fn rollback_to_missing_savepoint_keeps_aborted_state() {
     );
     exec(&ex, "ROLLBACK").await;
 }
+
+// ======================================================================
+// Cancelled statement futures must not leak depth/locks (audit A12)
+// ======================================================================
+
+/// The wire layer drops statement futures (pgwire CancelRequest `select!`,
+/// statement-timeout `tokio::time::timeout`). The depth counter used to be
+/// fetch_add → await → fetch_sub with no cancellation guard, so the dropped
+/// statement leaked its increment: row locks were never released at depth 1
+/// and the error-state handling never ran. Drive the same drop here with a
+/// real parked statement — an autocommit claim that has taken one row lock
+/// and is waiting on another session's.
+#[cfg(feature = "server")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_statement_releases_depth_and_row_locks() {
+    use std::sync::atomic::Ordering;
+
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE cl (id INT PRIMARY KEY)").await;
+    exec(&ex, "INSERT INTO cl VALUES (1), (2)").await;
+
+    // Session A holds row 2 for the life of its transaction.
+    let a = ex.create_session();
+    ex.execute_with_session(a, "BEGIN").await.unwrap();
+    ex.execute_with_session(a, "SELECT id FROM cl WHERE id = 2 FOR UPDATE")
+        .await
+        .unwrap();
+
+    // Session B's autocommit claim takes row 1 (sorted first), then parks
+    // waiting for A's lock on row 2 — mid-statement, at depth 1.
+    let b = ex.create_session();
+    let claim = ex.execute_with_session(b, "SELECT id FROM cl WHERE id IN (1, 2) FOR UPDATE");
+    let parked =
+        tokio::time::timeout(std::time::Duration::from_millis(300), claim).await;
+    assert!(parked.is_err(), "claim should be parked on A's row lock");
+
+    // The dropped future must have returned the depth to zero...
+    assert_eq!(
+        ex.get_session(b).statement_depth.load(Ordering::SeqCst),
+        0,
+        "cancelled statement leaked its depth increment"
+    );
+    // ...and released the row it had already locked (autocommit: the
+    // statement IS the transaction).
+    assert_eq!(
+        ex.row_locks.session_held_count(b),
+        0,
+        "row lock from the cancelled statement was never released"
+    );
+    // So a third session can claim that row right now.
+    let c = ex.create_session();
+    ex.execute_with_session(c, "SELECT id FROM cl WHERE id = 1 FOR UPDATE NOWAIT")
+        .await
+        .expect("row 1 must be claimable after the cancelled statement");
+
+    ex.drop_session(a);
+    ex.drop_session(b);
+    ex.drop_session(c);
+}
+
+/// Cancellation must also drive the error-state cleanup a failed statement
+/// gets: an open transaction whose statement future is dropped mid-flight is
+/// aborted until ROLLBACK, because the statement's outcome is unknown.
+#[cfg(feature = "server")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_statement_aborts_open_transaction() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE ca (id INT PRIMARY KEY)").await;
+    exec(&ex, "INSERT INTO ca VALUES (1), (2)").await;
+
+    let a = ex.create_session();
+    ex.execute_with_session(a, "BEGIN").await.unwrap();
+    ex.execute_with_session(a, "SELECT id FROM ca WHERE id = 2 FOR UPDATE")
+        .await
+        .unwrap();
+
+    let b = ex.create_session();
+    ex.execute_with_session(b, "BEGIN").await.unwrap();
+    let claim = ex.execute_with_session(b, "SELECT id FROM ca WHERE id = 2 FOR UPDATE");
+    let parked =
+        tokio::time::timeout(std::time::Duration::from_millis(300), claim).await;
+    assert!(parked.is_err(), "claim should be parked on A's row lock");
+
+    let rejected = ex.execute_with_session(b, "SELECT 1").await;
+    let rejected_desc = rejected.map(|_| ()).unwrap_err().to_string();
+    assert!(
+        rejected_desc.contains("aborted"),
+        "a cancelled statement must abort its transaction, got {rejected_desc}"
+    );
+    // ROLLBACK ends the aborted transaction and releases its row locks.
+    ex.execute_with_session(b, "ROLLBACK").await.unwrap();
+    ex.execute_with_session(a, "ROLLBACK").await.unwrap();
+    assert_eq!(ex.row_locks.session_held_count(b), 0);
+    ex.drop_session(a);
+    ex.drop_session(b);
+}
