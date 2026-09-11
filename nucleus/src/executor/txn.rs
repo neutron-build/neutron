@@ -106,45 +106,12 @@ impl Executor {
             });
         }
 
-        // Policy metadata is durable before COMMIT is acknowledged. A
-        // persistence failure leaves the transaction active so callers can
-        // retry or roll it back without exposing a partial security catalog.
-        if txn.policy_dirty {
-            let pending = txn.security_pending.take().ok_or_else(|| {
-                ExecError::Runtime("policy transaction has no staged security catalog".into())
-            })?;
-            *self.security.write() = pending;
-            self.bump_policy_gen();
-            #[cfg(feature = "server")]
-            {
-                if let Err(error) = self
-                    .storage
-                    .flush_schema()
-                    .await
-                    .map_err(ExecError::Storage)
-                {
-                    let staged = self.security.read().clone_policy_state();
-                    *self.security.write() = txn
-                        .security_snapshot
-                        .as_ref()
-                        .expect("BEGIN captured security state")
-                        .clone_policy_state();
-                    txn.security_pending = Some(staged);
-                    self.bump_policy_gen();
-                    return Err(error);
-                }
-                if let Err(error) = self.persist_catalog().await {
-                    let staged = self.security.read().clone_policy_state();
-                    *self.security.write() = txn
-                        .security_snapshot
-                        .as_ref()
-                        .expect("BEGIN captured security state")
-                        .clone_policy_state();
-                    txn.security_pending = Some(staged);
-                    self.bump_policy_gen();
-                    return Err(error);
-                }
-            }
+        // A policy-dirty transaction must have its staged catalog pair intact
+        // before any commit-side effect: publication below depends on it.
+        if txn.policy_dirty && txn.security_pending.is_none() {
+            return Err(ExecError::Runtime(
+                "policy transaction has no staged security catalog".into(),
+            ));
         }
 
         // S63: an enlisted transaction's COMMIT must durably vouch for its
@@ -176,21 +143,24 @@ impl Executor {
         if self.storage.supports_mvcc()
             && let Err(error) = self.storage.commit_txn().await
         {
-            if txn.policy_dirty
-                && let Some(previous) = txn.security_snapshot.as_ref()
-            {
-                let staged = self.security.read().clone_policy_state();
-                *self.security.write() = previous.clone_policy_state();
-                txn.security_pending = Some(staged);
-                self.bump_policy_gen();
-                #[cfg(feature = "server")]
-                self.persist_catalog().await?;
-            }
+            // Publication and persistence happen only AFTER this decision
+            // (see below), so a failed commit has published nothing and
+            // persisted nothing: the staged catalog stays staged, the
+            // transaction stays active, and the caller can retry or roll
+            // back. The old code published and persisted first, then restored
+            // the BEGIN-era whole-catalog snapshot here — wiping OTHER
+            // sessions' policy DDL committed since this BEGIN, in memory and
+            // (via the re-persist) on disk — and a crash in that window left
+            // durable policy the transaction never committed.
             return Err(error.into());
         }
 
         let gin_dirty = txn.gin_dirty;
         let derived_dirty_tables: Vec<String> = txn.derived_dirty_tables.iter().cloned().collect();
+        let policy_dirty = txn.policy_dirty;
+        // Taken before the state is cleared; published below, after the commit
+        // decision (A7).
+        let security_pending = txn.security_pending.take();
         // The storage commit above made this transaction's rows visible, so any
         // UNIQUE / PRIMARY KEY slots it was holding can go back: a waiting
         // session's constraint check will now see the rows and report the
@@ -226,6 +196,60 @@ impl Executor {
         }
         for table in derived_dirty_tables {
             self.rebuild_table_derived_state(&table).await;
+        }
+
+        // Policy publication is tied to the commit decision (A7): the staged
+        // catalog is published in memory and then made durable only after the
+        // storage commit above succeeded. The old order (publish, persist,
+        // commit) had two failure modes — a failed commit restored the
+        // BEGIN-era whole-catalog snapshot, wiping other sessions' policy DDL
+        // committed since this BEGIN, and a crash between persist and commit
+        // left durable policy the transaction never committed (a rolled-back
+        // CREATE ROLE resurrected from meta.json on restart). The crash window
+        // now fails the safe way: a committed transaction whose policy change
+        // is missing on recovery, which re-running the DDL repairs.
+        //
+        // A persist failure un-publishes by restoring the pre-publish LIVE
+        // catalog (not the BEGIN snapshot, so other sessions' committed
+        // changes survive) and surfaces the error. The rows are already
+        // committed at that point; the error tells the caller the policy
+        // change did not stick and must be re-run.
+        if policy_dirty
+            && let Some(pending) = security_pending
+        {
+            let before = self.security.read().clone_policy_state();
+            *self.security.write() = pending;
+            self.bump_policy_gen();
+            #[cfg(feature = "server")]
+            {
+                let unpublish = |before: crate::security::SecurityManager| {
+                    *self.security.write() = before;
+                    self.bump_policy_gen();
+                };
+                if let Err(error) = self
+                    .storage
+                    .flush_schema()
+                    .await
+                    .map_err(ExecError::Storage)
+                {
+                    unpublish(before);
+                    tracing::error!(
+                        "COMMIT's storage commit succeeded but making its policy \
+                         change durable failed: {error}; the policy change was rolled \
+                         back in memory and must be re-run"
+                    );
+                    return Err(error);
+                }
+                if let Err(error) = self.persist_catalog().await {
+                    unpublish(before);
+                    tracing::error!(
+                        "COMMIT's storage commit succeeded but persisting its policy \
+                         change failed: {error}; the policy change was rolled back in \
+                         memory and must be re-run"
+                    );
+                    return Err(error);
+                }
+            }
         }
 
         Ok(ExecResult::Command {

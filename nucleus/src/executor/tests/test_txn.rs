@@ -1016,3 +1016,96 @@ async fn drop_session_releases_the_storage_transaction() {
         "drop_session leaked an active storage transaction — the GC watermark stays pinned"
     );
 }
+
+// ======================================================================
+// Policy publication is tied to the commit decision (audit A7)
+// ======================================================================
+
+/// A FAILED commit must publish nothing and wipe nothing. Policy used to be
+/// published to the shared catalog and persisted BEFORE `commit_txn`; on a
+/// commit failure the code restored the BEGIN-era whole-catalog snapshot —
+/// erasing OTHER sessions' policy DDL committed since this BEGIN — and a
+/// crash in the publish→persist→commit window left durable policy the
+/// transaction never committed. A deterministic commit failure via a
+/// SERIALIZABLE write-skew drives the branch end to end.
+#[cfg(feature = "server")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_commit_publishes_no_policy_and_keeps_other_sessions_changes() {
+    use crate::storage::MvccStorageAdapter;
+
+    let adapter = std::sync::Arc::new(MvccStorageAdapter::new());
+    let storage: std::sync::Arc<dyn crate::storage::StorageEngine> = adapter.clone();
+    let ex = Executor::new(std::sync::Arc::new(crate::catalog::Catalog::new()), storage);
+    exec(&ex, "CREATE TABLE guarded (id INT, owner TEXT)").await;
+    exec(&ex, "CREATE TABLE skew (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)").await;
+    exec(&ex, "INSERT INTO skew VALUES (1,1),(2,1)").await;
+
+    // T stages policy DDL and its read half of the write skew.
+    let t = ex.create_session();
+    ex.execute_with_session(t, "BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
+    ex.execute_with_session(t, "ALTER TABLE guarded ENABLE ROW LEVEL SECURITY")
+        .await
+        .unwrap();
+    ex.execute_with_session(
+        t,
+        "CREATE POLICY t_policy ON guarded TO PUBLIC USING (owner = CURRENT_USER)",
+    )
+    .await
+    .unwrap();
+    ex.execute_with_session(t, "SELECT v FROM skew WHERE id = 2")
+        .await
+        .unwrap();
+
+    // Another session commits its own policy DDL after T staged, closes the
+    // write-skew cycle, and commits successfully (first committer wins).
+    let other = ex.create_session();
+    ex.execute_with_session(other, "BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
+    ex.execute_with_session(
+        other,
+        "CREATE POLICY other_policy ON guarded TO PUBLIC USING (owner = CURRENT_USER)",
+    )
+    .await
+    .unwrap();
+    ex.execute_with_session(other, "SELECT v FROM skew WHERE id = 1")
+        .await
+        .unwrap();
+    ex.execute_with_session(other, "UPDATE skew SET v = 0 WHERE id = 2")
+        .await
+        .unwrap();
+    ex.execute_with_session(other, "COMMIT").await.unwrap();
+
+    // T's write half, then a COMMIT that loses the write-skew race.
+    ex.execute_with_session(t, "UPDATE skew SET v = 0 WHERE id = 1")
+        .await
+        .unwrap();
+    let failed = ex.execute_with_session(t, "COMMIT").await;
+    assert!(failed.is_err(), "the write-skew commit must fail");
+
+    // Published catalog: other session's DDL intact, T's staged DDL absent.
+    let names = rows(&exec(&ex, "SELECT policyname FROM pg_policies").await[0]).clone();
+    let listed: Vec<String> = names
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Text(s) => s.clone(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        vec!["other_policy".to_string()],
+        "a failed commit must neither publish its own policy nor wipe another \
+         session's committed policy"
+    );
+
+    // T's transaction survived the failure: ROLLBACK runs cleanly and clears
+    // the staged catalog without publishing it.
+    ex.execute_with_session(t, "ROLLBACK").await.unwrap();
+    let names = rows(&exec(&ex, "SELECT policyname FROM pg_policies").await[0]).clone();
+    assert_eq!(names.len(), 1);
+    ex.drop_session(t);
+    ex.drop_session(other);
+}
