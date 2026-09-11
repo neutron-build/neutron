@@ -1,11 +1,15 @@
 package neutroncache
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,6 +42,11 @@ func WithPublicRoutes(prefixes ...string) HTTPCacheOption {
 // WithVaryHeaders includes the named request headers in the cache key, for
 // routes that legitimately serve different bytes per header (Accept-Encoding,
 // Accept-Language).
+//
+// This declares an additional key dimension; it is not permission to ignore
+// a response's Vary field. A response that varies on a header not named
+// here — or on `*` — is not cached at all, because the key cannot represent
+// the variation.
 func WithVaryHeaders(names ...string) HTTPCacheOption {
 	return func(o *httpCacheOpts) { o.varyHeaders = append(o.varyHeaders, names...) }
 }
@@ -63,6 +72,15 @@ func WithCacheableRequest(fn func(*http.Request) bool) HTTPCacheOption {
 // this stack) had every personalised GET response stored under a key shared by
 // every visitor — and served to them. The failure is silent, only shows up
 // under concurrent users, and leaks whatever the page contained.
+//
+// Freshness contract (audit neutron-19): by default the cache honors the
+// freshness signals it can represent. A response marked `no-cache`, or with
+// `max-age=0`, is never stored; a numeric `max-age`/`s-maxage` bounds the
+// stored TTL below the middleware TTL. A request carrying
+// `Cache-Control: no-cache` bypasses the lookup (this cache cannot
+// revalidate, so bypass is the only correct interpretation) but still
+// refreshes the entry. Responses with no freshness metadata use the
+// middleware TTL as before.
 func HTTPCache(c *TieredCache, ttl time.Duration, opts ...HTTPCacheOption) neutron.Middleware {
 	var o httpCacheOpts
 	for _, fn := range opts {
@@ -83,25 +101,32 @@ func HTTPCache(c *TieredCache, ttl time.Duration, opts ...HTTPCacheOption) neutr
 
 			cacheKey := "httpcache:" + hashKey(cacheKeyFor(r, o.varyHeaders))
 
-			if data, ok := c.l1.Get(cacheKey); ok {
-				if entry, err := decodeEntry(data); err == nil {
-					// Replay the response as it was produced. Forcing a
-					// Content-Type here — this used to always claim
-					// application/json — silently rewrites an HTML or image
-					// response into the wrong type on every hit, so the route
-					// works until the moment it starts being cached.
-					for k, vs := range entry.Header {
-						for _, v := range vs {
-							w.Header().Add(k, v)
+			// A client asking for revalidation gets the origin: this cache
+			// has no conditional-request support, so bypass is the only
+			// answer that respects the request's intent.
+			_, bypassRead := cacheControlDirectives(r.Header.Get("Cache-Control"))["no-cache"]
+
+			if !bypassRead {
+				if data, ok := c.l1.Get(cacheKey); ok {
+					if entry, err := decodeEntry(data); err == nil {
+						// Replay the response as it was produced. Forcing a
+						// Content-Type here — this used to always claim
+						// application/json — silently rewrites an HTML or image
+						// response into the wrong type on every hit, so the route
+						// works until the moment it starts being cached.
+						for k, vs := range entry.Header {
+							for _, v := range vs {
+								w.Header().Add(k, v)
+							}
 						}
+						w.Header().Set("X-Cache", "HIT")
+						w.WriteHeader(entry.Status)
+						_, _ = w.Write(entry.Body)
+						return
 					}
-					w.Header().Set("X-Cache", "HIT")
-					w.WriteHeader(entry.Status)
-					_, _ = w.Write(entry.Body)
-					return
+					// An entry we cannot decode is treated as a miss rather than
+					// served as garbage.
 				}
-				// An entry we cannot decode is treated as a miss rather than
-				// served as garbage.
 			}
 
 			rec := &responseRecorder{
@@ -111,18 +136,49 @@ func HTTPCache(c *TieredCache, ttl time.Duration, opts ...HTTPCacheOption) neutr
 			}
 			next.ServeHTTP(rec, r)
 
-			if rec.status == http.StatusOK && responseIsCacheable(rec) {
+			// A flushed or hijacked response is a stream; it was never
+			// fully captured and must not be replayed.
+			if rec.streamed {
+				return
+			}
+			if rec.status == http.StatusOK && responseIsCacheable(rec, o.varyHeaders) {
 				entry := cacheEntry{
 					Status: rec.status,
 					Header: cacheableHeaders(rec.Header()),
 					Body:   rec.body.Bytes(),
 				}
 				if encoded, err := json.Marshal(entry); err == nil {
-					c.l1.Set(cacheKey, encoded, ttl)
+					c.l1.Set(cacheKey, encoded, responseTTL(ttl, rec.Header()))
 				}
 			}
 		})
 	}
+}
+
+// responseTTL bounds the middleware TTL by the response's own freshness
+// metadata when it is stricter: s-maxage (the shared-cache directive)
+// over max-age, over the configured TTL.
+func responseTTL(ttl time.Duration, h http.Header) time.Duration {
+	cc := cacheControlDirectives(h.Get("Cache-Control"))
+	if v, ok := cc["s-maxage"]; ok {
+		if d, err := parseSeconds(v); err == nil && d < ttl {
+			ttl = d
+		}
+	}
+	if v, ok := cc["max-age"]; ok {
+		if d, err := parseSeconds(v); err == nil && d < ttl {
+			ttl = d
+		}
+	}
+	return ttl
+}
+
+func parseSeconds(v string) (time.Duration, error) {
+	seconds, err := strconv.Atoi(strings.Trim(v, `"`))
+	if err != nil || seconds < 0 {
+		return 0, fmt.Errorf("invalid seconds %q", v)
+	}
+	return time.Duration(seconds) * time.Second, nil
 }
 
 // requestIsCacheable reports whether this request may be served from a shared
@@ -154,23 +210,75 @@ func isPublicPath(path string, prefixes []string) bool {
 	return false
 }
 
-// responseIsCacheable rejects responses that carry per-caller state.
-func responseIsCacheable(rec *responseRecorder) bool {
+// cacheControlDirectives parses a Cache-Control field into a map of
+// lowercase directive names to values ("no-cache" and friends have empty
+// values). Multiple field values are comma-separated per RFC 9111; values
+// may be quoted.
+func cacheControlDirectives(values ...string) map[string]string {
+	out := map[string]string{}
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			name, arg, _ := strings.Cut(strings.TrimSpace(part), "=")
+			name = strings.ToLower(strings.TrimSpace(name))
+			if name == "" {
+				continue
+			}
+			out[name] = strings.Trim(strings.TrimSpace(arg), `"`)
+		}
+	}
+	return out
+}
+
+// responseIsCacheable rejects responses that must not be stored or shared:
+// per-caller state, explicit freshness refusals, and any Vary dimension the
+// cache key cannot represent.
+func responseIsCacheable(rec *responseRecorder, varyHeaders []string) bool {
 	h := rec.Header()
 	// A stored Set-Cookie would be replayed to everyone who hits the entry,
 	// handing one visitor's session to the next.
 	if len(h.Values("Set-Cookie")) > 0 {
 		return false
 	}
-	cc := strings.ToLower(h.Get("Cache-Control"))
-	if strings.Contains(cc, "no-store") || strings.Contains(cc, "private") {
+	cc := cacheControlDirectives(h.Get("Cache-Control"))
+	if _, ok := cc["no-store"]; ok {
 		return false
 	}
-	// `Vary: Cookie` is the origin saying the body depends on the caller.
-	for _, v := range h.Values("Vary") {
-		if strings.Contains(strings.ToLower(v), "cookie") ||
-			strings.Contains(strings.ToLower(v), "authorization") {
+	if _, ok := cc["private"]; ok {
+		return false
+	}
+	// no-cache requires revalidation before reuse, and max-age=0 declares
+	// zero freshness: neither may become a fresh entry under the
+	// middleware TTL (audit neutron-19).
+	if _, ok := cc["no-cache"]; ok {
+		return false
+	}
+	if v, ok := cc["max-age"]; ok {
+		if d, err := parseSeconds(v); err == nil && d == 0 {
 			return false
+		}
+	}
+
+	// Every Vary dimension the response names must be either rejected
+	// outright (per-caller) or represented in the cache key; an unlisted
+	// field would let one representation replay to requests it does not
+	// match, and `*` can never be represented (audit neutron-18).
+	declared := make(map[string]bool, len(varyHeaders))
+	for _, name := range varyHeaders {
+		declared[strings.ToLower(http.CanonicalHeaderKey(name))] = true
+	}
+	for _, value := range h.Values("Vary") {
+		for _, name := range strings.Split(value, ",") {
+			field := strings.ToLower(strings.TrimSpace(name))
+			switch {
+			case field == "":
+				continue
+			case field == "*":
+				return false
+			case field == "cookie", field == "authorization":
+				return false
+			case !declared[field]:
+				return false
+			}
 		}
 	}
 	return true
@@ -224,10 +332,16 @@ func decodeEntry(data []byte) (cacheEntry, error) {
 	return e, err
 }
 
+// responseRecorder wraps the writer for a response being considered for
+// caching. Optional writer capabilities are forwarded (Flush, Hijack) and
+// Unwrap lets http.ResponseController walk past this wrapper; once a handler
+// flushes or hijacks, the response is a stream — capture stops and the
+// response is never cached (audit neutron-20).
 type responseRecorder struct {
 	http.ResponseWriter
-	body   *bytes.Buffer
-	status int
+	body     *bytes.Buffer
+	status   int
+	streamed bool
 }
 
 func (r *responseRecorder) WriteHeader(code int) {
@@ -236,8 +350,35 @@ func (r *responseRecorder) WriteHeader(code int) {
 }
 
 func (r *responseRecorder) Write(b []byte) (int, error) {
-	r.body.Write(b)
+	if !r.streamed {
+		r.body.Write(b)
+	}
 	return r.ResponseWriter.Write(b)
+}
+
+// Unwrap exposes the underlying writer so http.ResponseController can reach
+// capabilities this wrapper does not forward itself.
+func (r *responseRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+// Flush forwards to the underlying writer when it supports flushing. The
+// plain http.Flusher signature keeps direct `w.(http.Flusher)` assertions
+// working for handlers that predate ResponseController; a no-op on a
+// non-flushable underlying writer matches flushing a buffered writer.
+func (r *responseRecorder) Flush() {
+	r.streamed = true
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack forwards to the underlying writer. A hijacked connection is owned
+// by the handler; capture has stopped and the exchange is never cached.
+func (r *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := r.ResponseWriter.(http.Hijacker); ok {
+		r.streamed = true
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("neutroncache: underlying ResponseWriter does not support Hijack")
 }
 
 func hashKey(s string) string {
