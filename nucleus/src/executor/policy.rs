@@ -162,12 +162,20 @@ impl Executor {
                 }
                 if let Some(expr) = using {
                     let mut predicate = Self::compile_rls_predicate(&expr)?;
+                    // A5: a column that does not resolve must fail the ALTER.
+                    // bind_column_ids silently skips unresolved names, so
+                    // without this check a predicate referencing a
+                    // nonexistent column installed without error. The error
+                    // returns before the policy is touched, so the old one
+                    // stays enforced.
+                    Self::validate_rls_columns(&predicate, &table_def)?;
                     predicate.bind_column_ids(&|n: &str| table_def.column_id(n));
                     policy.predicate = predicate;
                     parts.push("USING".into());
                 }
                 if let Some(expr) = with_check {
                     let mut predicate = Self::compile_rls_predicate(&expr)?;
+                    Self::validate_rls_columns(&predicate, &table_def)?;
                     predicate.bind_column_ids(&|n: &str| table_def.column_id(n));
                     policy.check_predicate = Some(predicate);
                     parts.push("WITH CHECK".into());

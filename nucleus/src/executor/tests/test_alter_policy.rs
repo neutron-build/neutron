@@ -146,6 +146,45 @@ async fn an_empty_alter_is_refused() {
     );
 }
 
+/// A5: a predicate referencing a column that does not exist must be refused.
+/// `bind_column_ids` silently skips unresolved names, so ALTER POLICY used to
+/// install such a predicate without error — and since the column never
+/// appears in a row map, the policy silently matched nothing. CREATE POLICY
+/// validated its columns; ALTER did not. Both are asserted here so the two
+/// paths cannot drift apart again.
+#[tokio::test]
+async fn alter_policy_with_a_bogus_column_is_refused_and_the_old_policy_stays() {
+    let (ex, sid) = seeded().await;
+
+    for sql in [
+        "ALTER POLICY only_ada ON docs USING (no_such_column = 'bob')",
+        "ALTER POLICY only_ada ON docs WITH CHECK (no_such_column = 'bob')",
+        "CREATE POLICY bogus ON docs FOR SELECT TO reader USING (no_such_column = 'bob')",
+    ] {
+        let err = ex
+            .execute(sql)
+            .await
+            .expect_err(&format!("`{sql}` must be refused"));
+        assert!(
+            err.to_string().contains("no_such_column"),
+            "the error must name the unresolved column: {err}"
+        );
+        assert_eq!(
+            visible(&ex, sid).await,
+            vec!["ada"],
+            "`{sql}` was refused but changed the policy anyway"
+        );
+    }
+
+    // The same path still admits a valid alteration.
+    exec(&ex, "ALTER POLICY only_ada ON docs USING (owner = 'bob')").await;
+    assert_eq!(
+        visible(&ex, sid).await,
+        vec!["bob"],
+        "a valid alteration after the refusals must succeed"
+    );
+}
+
 /// Superuser-only, like the rest of policy DDL.
 #[tokio::test]
 async fn alter_policy_requires_superuser() {
