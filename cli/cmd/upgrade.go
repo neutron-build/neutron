@@ -20,6 +20,10 @@ var upgradeCmd = &cobra.Command{
 	RunE:  runUpgrade,
 }
 
+// checkForUpdate is a seam over selfupdate.CheckForUpdate so tests can
+// inject a failed update check without the network.
+var checkForUpdate = selfupdate.CheckForUpdate
+
 func runUpgrade(cmd *cobra.Command, args []string) error {
 	// Detect install method to avoid corrupting Homebrew state
 	method := selfupdate.DetectInstallMethod()
@@ -33,10 +37,14 @@ func runUpgrade(cmd *cobra.Command, args []string) error {
 
 	spinner := ui.NewSpinner("Checking for updates...")
 
-	release, hasUpdate, err := selfupdate.CheckForUpdate(version)
+	release, hasUpdate, err := checkForUpdate(version)
 	if err != nil {
-		spinner.StopWithMessage(ui.WarnMark, fmt.Sprintf("Could not check: %v", err))
-		return nil
+		spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Could not check: %v", err))
+		// An explicitly requested upgrade must fail loudly: scripts cannot
+		// distinguish "already latest" from a network or release-metadata
+		// failure if this returns nil. Best-effort warnings belong to
+		// optional startup notifications, not the upgrade command.
+		return fmt.Errorf("check for updates: %w", err)
 	}
 
 	if !hasUpdate {
@@ -52,7 +60,7 @@ func runUpgrade(cmd *cobra.Command, args []string) error {
 	}
 
 	spinner = ui.NewSpinner("Downloading...")
-	if err := selfupdate.DownloadAndReplace(release); err != nil {
+	if err := selfupdate.DownloadAndReplace(cmd.Context(), release); err != nil {
 		spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Upgrade failed: %v", err))
 		return err
 	}
