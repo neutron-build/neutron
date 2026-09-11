@@ -405,3 +405,177 @@ func TestReadDownMigrationFilesReverseSorted(t *testing.T) {
 		}
 	}
 }
+
+// Ordering must survive versions beyond the three-digit padding width:
+// lexicographic order put "1000" before "999" (audit neutron-06).
+func TestReadMigrationFilesNumericOrderAcrossPaddingWidth(t *testing.T) {
+	dir := t.TempDir()
+
+	for _, v := range []string{"998", "999", "1000", "1001"} {
+		os.WriteFile(filepath.Join(dir, v+"_step.up.sql"), []byte("up "+v), 0644)
+		os.WriteFile(filepath.Join(dir, v+"_step.down.sql"), []byte("down "+v), 0644)
+	}
+
+	result, err := ReadMigrationFiles(dir)
+	if err != nil {
+		t.Fatalf("ReadMigrationFiles() error: %v", err)
+	}
+	if len(result) != 4 {
+		t.Fatalf("got %d files, want 4", len(result))
+	}
+	for i, expected := range []string{"998", "999", "1000", "1001"} {
+		if result[i].Version != expected {
+			t.Errorf("result[%d].Version = %q, want %q", i, result[i].Version, expected)
+		}
+	}
+
+	down, err := ReadDownMigrationFiles(dir)
+	if err != nil {
+		t.Fatalf("ReadDownMigrationFiles() error: %v", err)
+	}
+	for i, expected := range []string{"1001", "1000", "999", "998"} {
+		if down[i].Version != expected {
+			t.Errorf("down[%d].Version = %q, want %q (reverse order broken past padding width)", i, down[i].Version, expected)
+		}
+	}
+}
+
+// Mixed-width numeric spellings order by value; duplicates stay adjacent
+// and deterministic (audit neutron-06).
+func TestReadMigrationFilesMixedWidthAndDuplicateVersions(t *testing.T) {
+	dir := t.TempDir()
+
+	for _, name := range []string{
+		"7_short.up.sql",
+		"003_padded.up.sql",
+		"007_duplicate.up.sql",
+		"1_tiny.up.sql",
+	} {
+		os.WriteFile(filepath.Join(dir, name), []byte("x"), 0644)
+	}
+
+	result, err := ReadMigrationFiles(dir)
+	if err != nil {
+		t.Fatalf("ReadMigrationFiles() error: %v", err)
+	}
+
+	got := make([]string, len(result))
+	for i, f := range result {
+		got[i] = f.Version
+	}
+	want := []string{"1", "003", "007", "7"}
+	if len(got) != len(want) {
+		t.Fatalf("versions = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("versions[%d] = %q, want %q (all: %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+// A path-like migration name must not write outside the migrations
+// directory (audit neutron-05).
+func TestCreateMigrationFilesRejectsPathLikeNames(t *testing.T) {
+	outer := t.TempDir()
+	dir := filepath.Join(outer, "migrations")
+
+	for _, name := range []string{
+		"part/../../escape",
+		`part\..\escape`,
+		"../traversal",
+		"..",
+		".",
+		"",
+		"naïve",
+		"semi;colon",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, _, err := CreateMigrationFiles(dir, name)
+			if err == nil {
+				t.Fatalf("CreateMigrationFiles(%q) accepted a path-like or illegal name", name)
+			}
+		})
+	}
+
+	// Nothing may have been created anywhere under the outer directory.
+	entries, err := os.ReadDir(outer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("rejected names left files behind under %s: %v", outer, entries)
+	}
+}
+
+func TestCreateMigrationFilesAcceptsDescriptiveNames(t *testing.T) {
+	dir := t.TempDir()
+
+	for _, name := range []string{"create_users", "Add User Email", "add-index-constraint"} {
+		t.Run(name, func(t *testing.T) {
+			upPath, _, err := CreateMigrationFiles(dir, name)
+			if err != nil {
+				t.Fatalf("CreateMigrationFiles(%q) error: %v", name, err)
+			}
+			if filepath.Dir(upPath) != dir {
+				t.Errorf("file created outside the migrations directory: %s", upPath)
+			}
+		})
+	}
+
+	for _, name := range []string{"semi;colon", "shell $(x)"} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := CreateMigrationFiles(dir, name); err == nil {
+				t.Errorf("CreateMigrationFiles(%q) accepted an illegal character", name)
+			}
+		})
+	}
+}
+
+// Applied versions with no local file must surface in the union with
+// Missing set, not vanish from the status output (audit neutron-07).
+func TestMergeMigrationStatusesIncludesAppliedButMissing(t *testing.T) {
+	files := []MigrationFile{
+		{Version: "001", Name: "init"},
+		{Version: "003", Name: "later"},
+	}
+	applied := []MigrationRecord{
+		{Version: "001", Name: "init"},
+		{Version: "002", Name: "vanished"},
+	}
+
+	statuses := mergeMigrationStatuses(files, applied)
+	if len(statuses) != 3 {
+		t.Fatalf("got %d statuses, want 3 (union of files and records)", len(statuses))
+	}
+
+	byVersion := map[string]MigrationStatus{}
+	for _, s := range statuses {
+		byVersion[s.Version] = s
+	}
+
+	if s := byVersion["001"]; !s.Applied || s.Missing {
+		t.Errorf("001 = %+v, want applied with file present", s)
+	}
+	s2, ok := byVersion["002"]
+	if !ok {
+		t.Fatal("applied-but-missing 002 was omitted from the status union")
+	}
+	if !s2.Applied || !s2.Missing || s2.Name != "vanished" {
+		t.Errorf("002 = %+v, want applied, Missing, name from the database record", s2)
+	}
+	if s := byVersion["003"]; s.Applied || s.Missing {
+		t.Errorf("003 = %+v, want pending", s)
+	}
+}
+
+func TestMergeMigrationStatusesOrderedNumerically(t *testing.T) {
+	files := []MigrationFile{
+		{Version: "1000", Name: "wide"},
+		{Version: "999", Name: "narrow"},
+	}
+	statuses := mergeMigrationStatuses(files, nil)
+	if len(statuses) != 2 || statuses[0].Version != "999" || statuses[1].Version != "1000" {
+		t.Errorf("statuses = %+v, want 999 before 1000", statuses)
+	}
+}

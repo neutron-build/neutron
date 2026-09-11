@@ -13,11 +13,11 @@ import (
 
 // MigrationFile represents a SQL migration file on disk.
 type MigrationFile struct {
-	Version  string
-	Name     string
-	Path     string
-	SQL      string
-	IsDown   bool
+	Version string
+	Name    string
+	Path    string
+	SQL     string
+	IsDown  bool
 }
 
 // MigrationRecord represents an applied migration in the tracking table.
@@ -33,6 +33,10 @@ type MigrationStatus struct {
 	Name      string
 	Applied   bool
 	AppliedAt time.Time
+	// Missing marks a version recorded in the database whose source file
+	// is absent from the local migrations directory. It can be inspected
+	// in status output but not rolled back from this checkout.
+	Missing bool
 }
 
 const createTrackingTable = `CREATE TABLE IF NOT EXISTS _neutron_migrations (
@@ -150,17 +154,43 @@ func readMigrationFilesWithSuffix(dir, suffix string, reverseSort bool) ([]Migra
 		})
 	}
 
+	// Sort numerically by version. Lexicographic ordering breaks once a
+	// version exceeds the padding width ("1000" < "999" as strings), which
+	// would apply migrations out of dependency order. Mixed-width and
+	// duplicate numeric spellings ("7" vs "007") order by value with the
+	// text as a deterministic tie-break; non-numeric versions sort last.
 	if reverseSort {
 		sort.Slice(files, func(i, j int) bool {
-			return files[i].Version > files[j].Version
+			return CompareVersions(files[j].Version, files[i].Version) < 0
 		})
 	} else {
 		sort.Slice(files, func(i, j int) bool {
-			return files[i].Version < files[j].Version
+			return CompareVersions(files[i].Version, files[j].Version) < 0
 		})
 	}
 
 	return files, nil
+}
+
+// CompareVersions orders version strings numerically when both parse,
+// falling back to a numeric-before-non-numeric then lexicographic rule.
+func CompareVersions(a, b string) int {
+	an, aErr := strconv.ParseInt(a, 10, 64)
+	bn, bErr := strconv.ParseInt(b, 10, 64)
+	switch {
+	case aErr == nil && bErr == nil:
+		if an != bn {
+			if an < bn {
+				return -1
+			}
+			return 1
+		}
+	case aErr == nil:
+		return -1
+	case bErr == nil:
+		return 1
+	}
+	return strings.Compare(a, b)
 }
 
 // ReadMigrationFiles reads .up.sql files from a directory.
@@ -174,6 +204,10 @@ func ReadDownMigrationFiles(dir string) ([]MigrationFile, error) {
 }
 
 // MigrationStatuses returns the status of all migrations (applied + pending).
+// The list is the union of local files and database records: an applied
+// migration whose file is missing from this checkout appears with Missing
+// set rather than silently disappearing from the status output (audit
+// neutron-07).
 func (c *Client) MigrationStatuses(ctx context.Context, dir string) ([]MigrationStatus, error) {
 	files, err := ReadMigrationFiles(dir)
 	if err != nil {
@@ -185,11 +219,18 @@ func (c *Client) MigrationStatuses(ctx context.Context, dir string) ([]Migration
 		return nil, err
 	}
 
+	return mergeMigrationStatuses(files, applied), nil
+}
+
+// mergeMigrationStatuses is the pure union of local files and applied
+// records, ordered by version.
+func mergeMigrationStatuses(files []MigrationFile, applied []MigrationRecord) []MigrationStatus {
 	appliedMap := make(map[string]MigrationRecord)
 	for _, r := range applied {
 		appliedMap[r.Version] = r
 	}
 
+	seen := make(map[string]bool)
 	var statuses []MigrationStatus
 	for _, f := range files {
 		status := MigrationStatus{
@@ -199,15 +240,58 @@ func (c *Client) MigrationStatuses(ctx context.Context, dir string) ([]Migration
 		if r, ok := appliedMap[f.Version]; ok {
 			status.Applied = true
 			status.AppliedAt = r.AppliedAt
+			seen[f.Version] = true
 		}
 		statuses = append(statuses, status)
 	}
 
-	return statuses, nil
+	// Applied versions with no local file: visible and flagged, not hidden.
+	for _, r := range applied {
+		if seen[r.Version] {
+			continue
+		}
+		statuses = append(statuses, MigrationStatus{
+			Version:   r.Version,
+			Name:      r.Name,
+			Applied:   true,
+			AppliedAt: r.AppliedAt,
+			Missing:   true,
+		})
+	}
+
+	sort.SliceStable(statuses, func(i, j int) bool {
+		return CompareVersions(statuses[i].Version, statuses[j].Version) < 0
+	})
+	return statuses
+}
+
+// migrationNameSlug validates and normalizes a migration name for use in a
+// filename. Path separators and dot components must be rejected outright:
+// lowercasing and space replacement alone let "part/../../escape" write
+// outside the migrations directory (audit neutron-05).
+func migrationNameSlug(name string) (string, error) {
+	slug := strings.ToLower(strings.ReplaceAll(name, " ", "_"))
+	if slug == "" {
+		return "", fmt.Errorf("migration name must not be empty")
+	}
+	for _, r := range slug {
+		allowed := (r >= 'a' && r <= 'z') ||
+			(r >= '0' && r <= '9') ||
+			r == '_' || r == '-'
+		if !allowed {
+			return "", fmt.Errorf("migration name %q contains %q; use letters, digits, spaces, underscores, or hyphens", name, r)
+		}
+	}
+	return slug, nil
 }
 
 // CreateMigrationFiles generates a new pair of .up.sql and .down.sql files.
 func CreateMigrationFiles(dir, name string) (string, string, error) {
+	safeName, err := migrationNameSlug(name)
+	if err != nil {
+		return "", "", err
+	}
+
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", "", err
 	}
@@ -224,7 +308,6 @@ func CreateMigrationFiles(dir, name string) (string, string, error) {
 	}
 	nextVersion := fmt.Sprintf("%03d", next)
 
-	safeName := strings.ReplaceAll(strings.ToLower(name), " ", "_")
 	upPath := filepath.Join(dir, fmt.Sprintf("%s_%s.up.sql", nextVersion, safeName))
 	downPath := filepath.Join(dir, fmt.Sprintf("%s_%s.down.sql", nextVersion, safeName))
 

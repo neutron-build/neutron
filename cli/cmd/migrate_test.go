@@ -1,10 +1,13 @@
 package cmd
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/neutron-build/neutron/cli/internal/db"
+	"github.com/spf13/cobra"
 )
 
 func TestMigrateCommand(t *testing.T) {
@@ -204,5 +207,106 @@ func TestSelectRevertFrontierIgnoresPending(t *testing.T) {
 	}
 	if len(toRevert) != 1 || toRevert[0].Version != "001" {
 		t.Errorf("got %v, want only 001", toRevert)
+	}
+}
+
+// Rollback order must also survive versions past the padding width — the
+// frontier is newest-first numerically, not lexicographically (audit
+// neutron-06).
+func TestSelectRevertFrontierNumericOrderPastPaddingWidth(t *testing.T) {
+	applied := appliedRecords("998", "999", "1000", "1001")
+	downs := downFilesMap(map[string]string{
+		"998":  "DROP 998;",
+		"999":  "DROP 999;",
+		"1000": "DROP 1000;",
+		"1001": "DROP 1001;",
+	})
+
+	toRevert, err := selectRevertFrontier(applied, downs, 3)
+	if err != nil {
+		t.Fatalf("selectRevertFrontier() error: %v", err)
+	}
+	want := []string{"1001", "1000", "999"}
+	for i, v := range want {
+		if toRevert[i].Version != v {
+			t.Errorf("revert order[%d] = %s, want %s (all: %v)", i, toRevert[i].Version, v, toRevert)
+		}
+	}
+}
+
+// The rollback count is strictly numeric: an integer prefix like "1junk"
+// used to be accepted by fmt.Sscanf (audit neutron-03).
+func TestParseRevertCountRejectsPartialNumbers(t *testing.T) {
+	for _, arg := range []string{"1junk", "junk", "1.5", "-1", "0", "", " 2", "2 "} {
+		t.Run(arg, func(t *testing.T) {
+			if _, err := parseRevertCount([]string{arg}); err == nil {
+				t.Errorf("parseRevertCount(%q) accepted a non-strict count", arg)
+			}
+		})
+	}
+
+	if n, err := parseRevertCount(nil); err != nil || n != 1 {
+		t.Errorf("parseRevertCount(nil) = %d, %v; want 1, nil", n, err)
+	}
+	if n, err := parseRevertCount([]string{"3"}); err != nil || n != 3 {
+		t.Errorf("parseRevertCount(3) = %d, %v; want 3, nil", n, err)
+	}
+}
+
+// The migration commands carry a documented --timeout budget, and 0 means
+// caller-controlled with no deadline (audit neutron-03).
+func TestMigrateTimeoutFlags(t *testing.T) {
+	for _, c := range []*cobra.Command{migrateCmd, migrateDownCmd, migrateStatusCmd} {
+		flag := c.Flags().Lookup("timeout")
+		if flag == nil {
+			t.Errorf("%s missing --timeout flag", c.Name())
+			continue
+		}
+		if flag.Usage == "" {
+			t.Errorf("%s --timeout has no usage text", c.Name())
+		}
+	}
+}
+
+// commandContext must derive from the command's context so cancellation
+// propagates, and honor the timeout budget when one is set.
+func TestCommandContextDerivesFromCommandContext(t *testing.T) {
+	parent, parentCancel := context.WithCancel(context.Background())
+	defer parentCancel()
+
+	c := &cobra.Command{Use: "test"}
+	c.SetContext(parent)
+
+	gotCtx, gotCancel := commandContext(c)
+	defer gotCancel()
+	select {
+	case <-gotCtx.Done():
+		t.Fatal("context canceled before the parent canceled")
+	default:
+	}
+	parentCancel()
+	select {
+	case <-gotCtx.Done():
+	default:
+		t.Error("child context did not observe parent cancellation")
+	}
+}
+
+func TestCommandContextAppliesTimeoutBudget(t *testing.T) {
+	c := &cobra.Command{Use: "test"}
+	c.Flags().Duration("timeout", time.Minute, "")
+	if err := c.ParseFlags(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	gotCtx, cancel := commandContext(c)
+	defer cancel()
+
+	deadline, ok := gotCtx.Deadline()
+	if !ok {
+		t.Fatal("no deadline set despite a positive --timeout")
+	}
+	if remaining := time.Until(deadline); remaining <= 0 || remaining > time.Minute {
+		t.Errorf("deadline = %v, want within one minute", remaining)
 	}
 }

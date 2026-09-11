@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,12 +16,15 @@ import (
 
 func init() {
 	migrateCmd.Flags().String("dir", "migrations", "migrations directory")
+	migrateCmd.Flags().Duration("timeout", 60*time.Second, "total time budget for the migration batch (0 = no deadline)")
 
 	migrateStatusCmd.Flags().String("dir", "migrations", "migrations directory")
+	migrateStatusCmd.Flags().Duration("timeout", 10*time.Second, "time budget for the status query (0 = no deadline)")
 
 	migrateCreateCmd.Flags().String("dir", "migrations", "migrations directory")
 
 	migrateDownCmd.Flags().String("dir", "migrations", "migrations directory")
+	migrateDownCmd.Flags().Duration("timeout", 60*time.Second, "total time budget for the rollback batch (0 = no deadline)")
 
 	migrateCmd.AddCommand(migrateStatusCmd)
 	migrateCmd.AddCommand(migrateCreateCmd)
@@ -55,11 +59,26 @@ var migrateDownCmd = &cobra.Command{
 	RunE:  runMigrateDown,
 }
 
+// commandContext derives the operation context from the command's own
+// context, so caller cancellation (signals, parent tooling) propagates into
+// the queries, with the --timeout flag as an optional overall budget.
+func commandContext(cmd *cobra.Command) (context.Context, context.CancelFunc) {
+	parent := cmd.Context()
+	if parent == nil {
+		parent = context.Background()
+	}
+	timeout, err := cmd.Flags().GetDuration("timeout")
+	if err != nil || timeout <= 0 {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
 func runMigrate(cmd *cobra.Command, args []string) error {
 	dir, _ := cmd.Flags().GetString("dir")
 	url := config.DatabaseURL()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := commandContext(cmd)
 	defer cancel()
 
 	client, err := db.Connect(ctx, url)
@@ -104,7 +123,10 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		spinner := ui.NewSpinner(fmt.Sprintf("Applying %s_%s...", f.Version, f.Name))
 		if err := client.ApplyMigration(ctx, f); err != nil {
 			spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Failed %s_%s: %v", f.Version, f.Name, err))
-			return err
+			// Name the interruption boundary: a partial batch is a
+			// different operational state than an untouched one.
+			return fmt.Errorf("interrupted after %d of %d pending migration(s) (failed at %s_%s): %w",
+				count, len(files)-len(applied), f.Version, f.Name, err)
 		}
 		spinner.StopWithMessage(ui.CheckMark, fmt.Sprintf("Applied %s_%s", f.Version, f.Name))
 		count++
@@ -123,7 +145,7 @@ func runMigrateStatus(cmd *cobra.Command, args []string) error {
 	dir, _ := cmd.Flags().GetString("dir")
 	url := config.DatabaseURL()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := commandContext(cmd)
 	defer cancel()
 
 	client, err := db.Connect(ctx, url)
@@ -148,6 +170,9 @@ func runMigrateStatus(cmd *cobra.Command, args []string) error {
 		appliedAt := ""
 		if s.Applied {
 			status = "applied"
+			if s.Missing {
+				status = "applied (file missing)"
+			}
 			appliedAt = s.AppliedAt.Format("2006-01-02 15:04:05")
 		}
 		tbl.AddRow(s.Version, s.Name, status, appliedAt)
@@ -171,22 +196,33 @@ func runMigrateCreate(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// parseRevertCount parses the optional `down [N]` argument with strict
+// full-string numeric validation: fmt.Sscanf accepted integer prefixes
+// like "1junk" (audit neutron-03).
+func parseRevertCount(args []string) (int, error) {
+	if len(args) == 0 {
+		return 1, nil
+	}
+	count, err := strconv.Atoi(args[0])
+	if err != nil {
+		return 0, fmt.Errorf("invalid count: %s", args[0])
+	}
+	if count < 1 {
+		return 0, fmt.Errorf("count must be >= 1")
+	}
+	return count, nil
+}
+
 func runMigrateDown(cmd *cobra.Command, args []string) error {
 	dir, _ := cmd.Flags().GetString("dir")
 	url := config.DatabaseURL()
 
-	// Parse count argument (default 1)
-	count := 1
-	if len(args) > 0 {
-		if _, err := fmt.Sscanf(args[0], "%d", &count); err != nil {
-			return fmt.Errorf("invalid count: %s", args[0])
-		}
-		if count < 1 {
-			return fmt.Errorf("count must be >= 1")
-		}
+	count, err := parseRevertCount(args)
+	if err != nil {
+		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := commandContext(cmd)
 	defer cancel()
 
 	client, err := db.Connect(ctx, url)
@@ -253,7 +289,9 @@ func selectRevertFrontier(applied []db.MigrationRecord, downFiles []db.Migration
 	}
 
 	sorted := append([]db.MigrationRecord(nil), applied...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Version > sorted[j].Version })
+	sort.Slice(sorted, func(i, j int) bool {
+		return db.CompareVersions(sorted[i].Version, sorted[j].Version) > 0
+	})
 
 	var toRevert []db.MigrationFile
 	for _, rec := range sorted {
