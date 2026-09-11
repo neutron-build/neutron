@@ -10,6 +10,10 @@
 //! A15: on a follower with no leader, on a leader whose proposal fails, and
 //! with no replicator, DML used to fall through to local execution — an
 //! acked write no other node will ever apply.
+//!
+//! Residual (2026-09-11): the embedded-API entries `execute_parsed` and
+//! `execute_prepared` were the last two callers of `execute_statement`
+//! bypassing dispatch; they now route through the same gate.
 
 use super::*;
 
@@ -195,5 +199,58 @@ async fn standalone_dml_is_untouched() {
     ex.execute("CREATE TABLE plain (id INT)").await.unwrap();
     ex.execute("INSERT INTO plain VALUES (1)").await.unwrap();
     let r = ex.execute("SELECT COUNT(*) FROM plain").await.unwrap();
+    assert_eq!(scalar(&r[0]), &Value::Int64(1));
+}
+
+/// The embedded-API entries (`execute_parsed`, `execute_prepared`) must hit
+/// the same cluster gate as the text and wire-AST entries: on a follower
+/// with no leader, DML through either is refused, never executed locally
+/// (2026-09-11 residual — they used to call `execute_statement` directly).
+#[tokio::test]
+async fn embedded_parsed_and_prepared_entries_route_through_the_cluster_gate() {
+    let ex = executor_with(follower_cluster());
+    ex.execute("CREATE TABLE res (id INT)").await.unwrap();
+
+    let ast = crate::sql::parse("INSERT INTO res VALUES (2)").unwrap();
+    let err = ex
+        .execute_parsed(ast.into_iter().next().unwrap())
+        .await
+        .expect_err("execute_parsed must not execute DML locally on a follower");
+    assert!(
+        err.to_string().contains("no cluster leader"),
+        "execute_parsed unexpected refusal: {err}"
+    );
+
+    let handle = ex.prepare("INSERT INTO res VALUES ($1)").unwrap();
+    let err = ex
+        .execute_prepared(&handle, &[Value::Int64(7)])
+        .await
+        .expect_err("execute_prepared must not execute DML locally on a follower");
+    assert!(
+        err.to_string().contains("no cluster leader"),
+        "execute_prepared unexpected refusal: {err}"
+    );
+
+    let r = ex.execute("SELECT COUNT(*) FROM res").await.unwrap();
+    assert_eq!(
+        scalar(&r[0]),
+        &Value::Int64(0),
+        "a refused embedded-entry INSERT must not change rows"
+    );
+}
+
+/// Standalone mode keeps the embedded entries' behavior: prepare, execute
+/// with parameters, and read the row back.
+#[tokio::test]
+async fn embedded_prepared_entry_works_in_standalone() {
+    let ex = test_executor();
+    ex.execute("CREATE TABLE prep (id INT, name TEXT)").await.unwrap();
+
+    let handle = ex.prepare("INSERT INTO prep VALUES ($1, $2)").unwrap();
+    ex.execute_prepared(&handle, &[Value::Int64(1), Value::Text("one".into())])
+        .await
+        .unwrap();
+
+    let r = ex.execute("SELECT COUNT(*) FROM prep").await.unwrap();
     assert_eq!(scalar(&r[0]), &Value::Int64(1));
 }

@@ -5697,9 +5697,34 @@ impl Executor {
     /// Execute a SQL string. Returns results for each statement.
     /// Execute a pre-parsed statement directly (used by prepared statement API).
     /// Skips SQL parsing entirely — the caller provides the AST.
+    ///
+    /// Like every other execution entry, this routes through
+    /// `execute_statements_dispatch`, so a configured cluster applies the
+    /// same gates the wire path enforces (follower forwarding, leader Raft
+    /// proposal, security-DDL refusal, follower-read freshness) to embedded
+    /// callers too. Calling `execute_statement` directly here — the wire
+    /// AST entry's A14 defect — left these two embedded entries the only
+    /// way to run DML on a follower without Raft.
     pub async fn execute_parsed(&self, stmt: Statement) -> Result<ExecResult, ExecError> {
         self.uncorrelated_subquery_cache.write().clear();
-        self.execute_statement(stmt).await
+        let statements = vec![stmt];
+        // Routing carries SQL TEXT, but the caller supplied an AST (and may
+        // never have had text), so render from the AST — only when a
+        // non-standalone cluster will actually consult it.
+        #[cfg(feature = "server")]
+        let sql = if self.cluster_routing_needs_sql_text(&statements) {
+            statements
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        } else {
+            String::new()
+        };
+        #[cfg(not(feature = "server"))]
+        let sql = String::new();
+        let mut results = self.execute_statements_dispatch(&sql, statements).await?;
+        Ok(results.swap_remove(0))
     }
 
     // ========================================================================
@@ -5740,8 +5765,12 @@ impl Executor {
     /// Execute a prepared statement with parameter values.
     ///
     /// Parameters replace `$1`, `$2`, etc. in the prepared SQL. Skips SQL
-    /// parsing entirely and seeds the plan cache key hint so that the query
+    /// parsing entirely and seeds the plan cache key hint so the query
     /// planner's plan cache is hit without re-normalizing the SQL string.
+    ///
+    /// Routes through `execute_statements_dispatch` for the same cluster
+    /// gates as `execute_parsed` — the substituted AST renders to text only
+    /// when a non-standalone cluster will consult it.
     pub async fn execute_prepared(
         &self,
         handle: &PreparedStmtHandle,
@@ -5755,7 +5784,21 @@ impl Executor {
         // query.to_string() + normalize_sql_for_cache().
         *self.current_session().plan_cache_key_hint.lock() = Some(handle.plan_cache_key.clone());
         self.uncorrelated_subquery_cache.write().clear();
-        self.execute_statement(ast).await
+        let statements = vec![ast];
+        #[cfg(feature = "server")]
+        let sql = if self.cluster_routing_needs_sql_text(&statements) {
+            statements
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        } else {
+            String::new()
+        };
+        #[cfg(not(feature = "server"))]
+        let sql = String::new();
+        let mut results = self.execute_statements_dispatch(&sql, statements).await?;
+        Ok(results.swap_remove(0))
     }
 
     /// Count `$N` parameter placeholders in SQL text. Returns the highest N found.
