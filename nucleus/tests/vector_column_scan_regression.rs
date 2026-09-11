@@ -37,6 +37,7 @@ fn row_count(r: Vec<ExecResult>) -> usize {
 async fn seeded(path: &std::path::Path, decl: &str) -> Database {
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(path.with_extension("wal"));
+    let _ = std::fs::remove_dir_all(Database::sidecar_dir(&path));
     let db = Database::builder().disk(path).build().unwrap();
     db.execute(&format!(
         "CREATE TABLE vprobe (id TEXT PRIMARY KEY, embedding {decl}, metadata JSONB)"

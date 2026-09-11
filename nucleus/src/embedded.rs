@@ -132,9 +132,7 @@ impl DatabaseBuilder {
                 // is exactly the collision a sidecar must not have. One
                 // directory keeps every sidecar artifact exclusive to this
                 // database and vanishes with a `rm -rf <file>.d`.
-                let mut sidecar = path.as_os_str().to_os_string();
-                sidecar.push(".d");
-                let sidecar = std::path::PathBuf::from(sidecar);
+                let sidecar = Database::sidecar_dir(path);
                 std::fs::create_dir_all(&sidecar).map_err(|e| {
                     DatabaseError::Storage(format!(
                         "create sidecar directory {}: {e}",
@@ -264,6 +262,18 @@ pub struct Database {
 }
 
 impl Database {
+    /// The per-file metadata sidecar directory Disk mode keeps next to the
+    /// database file: `<file>.d`. It holds `catalog.json`, `meta.json`,
+    /// `sequences.json` and the specialty-store WALs, keyed to this exact
+    /// file so two databases in one parent directory stay isolated. Deleting
+    /// the database means deleting the file, its WAL, and this directory.
+    #[cfg(feature = "server")]
+    pub fn sidecar_dir<P: AsRef<Path>>(path: P) -> std::path::PathBuf {
+        let mut sidecar = path.as_ref().as_os_str().to_os_string();
+        sidecar.push(".d");
+        std::path::PathBuf::from(sidecar)
+    }
+
     /// Open a database file. Creates the file if it doesn't exist.
     #[cfg(feature = "server")]
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, DatabaseError> {

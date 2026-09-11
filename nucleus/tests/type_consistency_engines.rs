@@ -28,6 +28,7 @@ fn make_db(engine: &str, tag: &str) -> Database {
             let path = std::env::temp_dir().join(format!("nucleus_tc_{tag}_disk.ndb"));
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_file(path.with_extension("wal"));
+            let _ = std::fs::remove_dir_all(Database::sidecar_dir(&path));
             let _ = std::fs::remove_dir_all(path.with_extension("wal.d"));
             Database::builder().disk(&path).build().unwrap()
         }

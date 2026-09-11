@@ -18,6 +18,7 @@ async fn disk_mode_table_and_data_survive_reopen() {
     let path = std::env::temp_dir().join("nucleus_disk_recovery_regression.ndb");
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("wal"));
+    let _ = std::fs::remove_dir_all(Database::sidecar_dir(&path));
 
     {
         let db = Database::builder().disk(&path).build().unwrap();
@@ -49,4 +50,5 @@ async fn disk_mode_table_and_data_survive_reopen() {
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("wal"));
+    let _ = std::fs::remove_dir_all(Database::sidecar_dir(&path));
 }

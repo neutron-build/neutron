@@ -32,6 +32,7 @@ async fn disk_abandoned_txn_does_not_survive_reopen() {
     let path = std::env::temp_dir().join("nucleus_disk_abandoned_txn.ndb");
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("wal"));
+    let _ = std::fs::remove_dir_all(Database::sidecar_dir(&path));
     {
         let db = Database::builder().disk(&path).build().unwrap();
         db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
@@ -55,6 +56,7 @@ async fn disk_abandoned_txn_does_not_survive_reopen() {
     );
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("wal"));
+    let _ = std::fs::remove_dir_all(Database::sidecar_dir(&path));
     assert_eq!(
         recovered,
         vec![(1, 10), (2, 20)],
@@ -67,6 +69,7 @@ async fn disk_recovery_explicit_txn_multicycle() {
     let path = std::env::temp_dir().join("nucleus_disk_recover_txn.ndb");
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("wal"));
+    let _ = std::fs::remove_dir_all(Database::sidecar_dir(&path));
 
     {
         let db = Database::builder().disk(&path).build().unwrap();
@@ -107,6 +110,7 @@ async fn disk_recovery_explicit_txn_multicycle() {
     );
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("wal"));
+    let _ = std::fs::remove_dir_all(Database::sidecar_dir(&path));
     assert_eq!(
         recovered,
         vec![(1, 11), (3, 99), (4, 40)],
@@ -119,6 +123,7 @@ async fn disk_recovery_reflects_update_delete() {
     let path = std::env::temp_dir().join("nucleus_disk_recover_dml.ndb");
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("wal"));
+    let _ = std::fs::remove_dir_all(Database::sidecar_dir(&path));
 
     let expected;
     {
@@ -155,6 +160,7 @@ async fn disk_recovery_reflects_update_delete() {
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("wal"));
+    let _ = std::fs::remove_dir_all(Database::sidecar_dir(&path));
 
     assert_eq!(
         recovered, expected,
