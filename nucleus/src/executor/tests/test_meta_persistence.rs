@@ -297,7 +297,7 @@ async fn test_drop_trigger_persists_across_restart() {
             "CREATE TRIGGER trg_drop_me AFTER INSERT ON data FOR EACH ROW EXECUTE FUNCTION noop()",
         )
         .await;
-        exec(&ex, "DROP TRIGGER trg_drop_me").await;
+        exec(&ex, "DROP TRIGGER trg_drop_me ON data").await;
     }
 
     {

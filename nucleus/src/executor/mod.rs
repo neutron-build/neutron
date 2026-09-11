@@ -7081,13 +7081,27 @@ impl Executor {
                 .await
             }
             Statement::DropTrigger(dt) => {
+                // The ON relation is the addressing key, not decoration: a
+                // bare-name drop swept same-named triggers off EVERY table
+                // (audit A18). Postgres requires `DROP TRIGGER ... ON <table>`;
+                // a parse without the relation is refused rather than guessed.
+                let Some(on_table) = &dt.table_name else {
+                    return Err(ExecError::Unsupported(
+                        "DROP TRIGGER requires ON <table>".into(),
+                    ));
+                };
+                let table_name = crate::sql::object_name_key(on_table);
                 let trigger_name = dt.trigger_name.to_string();
+                // Same authority as every other DROP statement — see
+                // `execute_drop`, which requires security-admin for all of
+                // them so a restricted principal cannot destroy policy state.
+                self.require_security_admin("drop an object")?;
                 let mut triggers = self.triggers.write().await;
                 let before = triggers.len();
-                triggers.retain(|t| t.name != trigger_name);
+                triggers.retain(|t| !(t.name == trigger_name && t.table_name == table_name));
                 if triggers.len() == before && !dt.if_exists {
                     return Err(ExecError::Unsupported(format!(
-                        "trigger '{trigger_name}' does not exist"
+                        "trigger '{trigger_name}' on table '{table_name}' does not exist"
                     )));
                 }
                 Ok(ExecResult::Command {

@@ -108,3 +108,100 @@ async fn concurrent_firings_do_not_interleave() {
     let got = rows(&exec(&ex, "SELECT COUNT(*) FROM watched").await[0]).clone();
     assert_eq!(got[0][0], Value::Int32(100));
 }
+
+// ======================================================================
+// DROP TRIGGER addressing + authorization (audit A18)
+// ======================================================================
+
+async fn two_same_named_triggers(ex: &Executor) {
+    exec(&ex, "CREATE TABLE t_a (id INT)").await;
+    exec(&ex, "CREATE TABLE t_b (id INT)").await;
+    exec(
+        &ex,
+        "CREATE TRIGGER trg AFTER INSERT ON t_a FOR EACH ROW BEGIN SELECT 1; END",
+    )
+    .await;
+    exec(
+        &ex,
+        "CREATE TRIGGER trg AFTER INSERT ON t_b FOR EACH ROW BEGIN SELECT 1; END",
+    )
+    .await;
+}
+
+async fn trigger_names(ex: &Executor) -> Vec<(String, String)> {
+    ex.triggers
+        .read()
+        .await
+        .iter()
+        .map(|t| (t.name.clone(), t.table_name.clone()))
+        .collect()
+}
+
+/// DROP TRIGGER removes only the (table, trigger) pair it addresses — the old
+/// bare-name retain swept same-named triggers off every other table.
+#[tokio::test]
+async fn drop_trigger_removes_only_the_addressed_table_pair() {
+    let ex = test_executor();
+    two_same_named_triggers(&ex).await;
+
+    exec(&ex, "DROP TRIGGER trg ON t_a").await;
+
+    let left = trigger_names(&ex).await;
+    assert_eq!(
+        left,
+        vec![("trg".to_string(), "t_b".to_string())],
+        "dropping trg on t_a must leave the same-named trigger on t_b"
+    );
+}
+
+/// Same authority as every other DROP statement: a non-superuser is refused
+/// and the trigger set is left intact.
+#[tokio::test]
+async fn drop_trigger_requires_security_admin() {
+    let ex = test_executor();
+    two_same_named_triggers(&ex).await;
+    exec(&ex, "CREATE ROLE nobody LOGIN PASSWORD 'x'").await;
+
+    let sid = ex.create_session();
+    ex.bind_authenticated_session(sid, "nobody").await.unwrap();
+    let err = ex.execute_with_session(sid, "DROP TRIGGER trg ON t_a").await;
+    match err {
+        Err(ExecError::PermissionDenied(msg)) => {
+            assert!(msg.contains("superuser"), "got: {msg}")
+        }
+        Err(other) => panic!("expected PermissionDenied, got: {other}"),
+        Ok(v) => panic!("non-superuser dropped a trigger: {v:?}"),
+    }
+    assert_eq!(
+        trigger_names(&ex).await.len(),
+        2,
+        "unauthorized drop must leave triggers intact"
+    );
+}
+
+/// IF EXISTS with the wrong relation is a harmless no-op; a miss without it is
+/// an error naming the relation; and the bare form — which used to sweep every
+/// table — is refused outright.
+#[tokio::test]
+async fn drop_trigger_if_exists_with_wrong_relation_is_a_noop() {
+    let ex = test_executor();
+    two_same_named_triggers(&ex).await;
+
+    exec(&ex, "DROP TRIGGER IF EXISTS trg ON missing_table").await;
+    assert_eq!(trigger_names(&ex).await.len(), 2, "IF EXISTS must be a no-op");
+
+    assert!(
+        ex.execute("DROP TRIGGER nope ON t_a").await.is_err(),
+        "dropping a trigger that does not exist on that relation must error"
+    );
+
+    assert!(
+        ex.execute("DROP TRIGGER trg").await.is_err(),
+        "bare DROP TRIGGER must not fall back to a cross-table sweep"
+    );
+    assert_eq!(
+        trigger_names(&ex).await.len(),
+        2,
+        "no variant above may remove a trigger"
+    );
+}
