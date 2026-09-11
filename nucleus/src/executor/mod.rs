@@ -6595,6 +6595,15 @@ impl Executor {
                         if let Some(addr) = leader_addr {
                             return self.forward_dml(sql, &addr).await;
                         }
+                        // Fail closed (A15): a follower that cannot reach a
+                        // leader must not quietly become one. Executing DML
+                        // locally here is an unreplicated write on a node
+                        // that just declared itself a follower — refuse and
+                        // let the client retry once a leader is known.
+                        return Err(ExecError::Runtime(
+                            "no cluster leader is known; refusing to execute DML locally on a follower"
+                                .into(),
+                        ));
                     } else {
                         let repl = self.raft_replicator.read().clone();
                         if let Some(replicator) = repl {
@@ -6621,7 +6630,15 @@ impl Executor {
                                             "security catalog replication failed: {e}"
                                         )));
                                     }
-                                    tracing::warn!("Raft propose failed: {e}");
+                                    // Fail closed (A15): a failed proposal
+                                    // means the write is not replicated.
+                                    // Executing it locally anyway acks a
+                                    // leader-only write no follower will
+                                    // ever apply — the divergence the
+                                    // refusal exists to prevent.
+                                    return Err(ExecError::Runtime(format!(
+                                        "refusing to execute DML locally: Raft proposal failed: {e}"
+                                    )));
                                 }
                             }
                         } else {
@@ -6630,6 +6647,17 @@ impl Executor {
                             {
                                 return Err(ExecError::Runtime(
                                     "security catalog changes require an active Raft replicator"
+                                        .into(),
+                                ));
+                            }
+                            // Fail closed for DML (A15): inside a configured
+                            // cluster, a leader with no replicator has no way
+                            // to commit through Raft — the local manager
+                            // append below is bookkeeping, not a quorum
+                            // outcome. Refuse the unreplicated write.
+                            if has_dml {
+                                return Err(ExecError::Runtime(
+                                    "cluster mode is configured but no Raft replicator is attached; refusing unreplicated DML"
                                         .into(),
                                 ));
                             }
@@ -6696,8 +6724,10 @@ impl Executor {
     /// Forward a DML statement to the cluster leader.
     ///
     /// Uses the RaftReplicator's `forward_to_leader()` which sends a `ForwardDml`
-    /// message over the cluster transport and awaits `ForwardDmlResponse`. Falls
-    /// back to local execution when no replicator is configured (single-node mode).
+    /// message over the cluster transport and awaits `ForwardDmlResponse`.
+    /// Without a replicator there is no transport to forward through, and a
+    /// configured cluster must fail closed rather than execute the write
+    /// locally on the follower (A15).
     #[cfg(feature = "server")]
     async fn forward_dml(
         &self,
@@ -6705,29 +6735,20 @@ impl Executor {
         leader_addr: &str,
     ) -> Result<Vec<ExecResult>, ExecError> {
         let repl = self.raft_replicator.read().clone();
-        if let Some(replicator) = repl {
-            match replicator.forward_to_leader(sql, leader_addr).await {
-                Ok(rows_affected) => {
-                    return Ok(vec![ExecResult::Command {
-                        tag: "forwarded".into(),
-                        rows_affected,
-                    }]);
-                }
-                Err(e) => {
-                    return Err(ExecError::Runtime(format!(
-                        "ForwardDml to leader failed: {e}"
-                    )));
-                }
-            }
+        let Some(replicator) = repl else {
+            return Err(ExecError::Runtime(format!(
+                "no Raft replicator is configured to forward DML to leader {leader_addr}"
+            )));
+        };
+        match replicator.forward_to_leader(sql, leader_addr).await {
+            Ok(rows_affected) => Ok(vec![ExecResult::Command {
+                tag: "forwarded".into(),
+                rows_affected,
+            }]),
+            Err(e) => Err(ExecError::Runtime(format!(
+                "ForwardDml to leader failed: {e}"
+            ))),
         }
-        // Fallback: execute locally (standalone / no replicator).
-        let statements = self.parse_with_ast_cache(sql)?;
-        let mut results = Vec::new();
-        for stmt in statements {
-            let r = self.execute_statement(stmt).await?.materialize().await?;
-            results.push(r);
-        }
-        Ok(results)
     }
 
     // ========================================================================
