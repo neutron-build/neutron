@@ -818,3 +818,69 @@ async fn discard_all_refuses_inside_transaction_and_rollback_still_restores() {
         "DISCARD ALL must still deallocate prepared statements when idle"
     );
 }
+
+// ======================================================================
+// ROLLBACK TO SAVEPOINT vs the aborted state (audit A11)
+// ======================================================================
+
+/// A successful ROLLBACK TO SAVEPOINT must clear `aborted` — only BEGIN and
+/// the savepoint restore used to, so a transaction that errored and then
+/// restored to a savepoint kept answering 25P02 for every later statement
+/// despite the successful restore. Missing savepoints and failed restores
+/// must leave the flag set.
+#[tokio::test]
+async fn rollback_to_savepoint_clears_aborted_state() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE spab (id INT PRIMARY KEY)").await;
+    exec(&ex, "INSERT INTO spab VALUES (1)").await;
+
+    exec(&ex, "BEGIN").await;
+    exec(&ex, "SAVEPOINT s").await;
+    exec(&ex, "INSERT INTO spab VALUES (2)").await;
+    // A statement error aborts the transaction.
+    assert!(
+        ex.execute("INSERT INTO spab VALUES (1)").await.is_err(),
+        "duplicate PK must error"
+    );
+    assert!(
+        ex.execute("SELECT id FROM spab").await.is_err(),
+        "statement after the error must report 25P02 (aborted)"
+    );
+
+    // ROLLBACK TO SAVEPOINT is itself admitted while aborted (it is a
+    // transaction-end statement for the gate) and clears the flag.
+    exec(&ex, "ROLLBACK TO SAVEPOINT s").await;
+    let after = rows(&exec(&ex, "SELECT id FROM spab").await[0]).clone();
+    assert_eq!(
+        after,
+        vec![vec![Value::Int32(1)]],
+        "restored savepoint state must be visible after clearing aborted"
+    );
+    exec(&ex, "INSERT INTO spab VALUES (3)").await;
+    exec(&ex, "COMMIT").await;
+    let committed = rows(&exec(&ex, "SELECT id FROM spab ORDER BY id").await[0]).clone();
+    assert_eq!(
+        committed,
+        vec![vec![Value::Int32(1)], vec![Value::Int32(3)]],
+        "writes after the savepoint restore must be committable"
+    );
+}
+
+/// The flag survives a ROLLBACK TO a savepoint that does not exist: that is a
+/// failed statement inside an already-aborted transaction, not a restore.
+#[tokio::test]
+async fn rollback_to_missing_savepoint_keeps_aborted_state() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE spmiss (id INT)").await;
+    exec(&ex, "BEGIN").await;
+    assert!(ex.execute("SELECT 1/0").await.is_err());
+    assert!(
+        ex.execute("ROLLBACK TO SAVEPOINT nope").await.is_err(),
+        "rolling back to a missing savepoint must error"
+    );
+    assert!(
+        ex.execute("SELECT 1").await.is_err(),
+        "a failed savepoint restore must keep the transaction aborted"
+    );
+    exec(&ex, "ROLLBACK").await;
+}

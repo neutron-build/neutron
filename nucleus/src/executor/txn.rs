@@ -461,6 +461,13 @@ impl Executor {
         }
         txn.security_savepoints.truncate(sp_pos + 1);
         let derived_dirty_tables: Vec<String> = txn.derived_dirty_tables.iter().cloned().collect();
+        // A successful restore ends the aborted state (PostgreSQL: ROLLBACK TO
+        // SAVEPOINT is allowed in an aborted transaction and clears it, so the
+        // next statement runs instead of getting 25P02). Only BEGIN and this
+        // success path clear the flag — the error returns above (missing
+        // savepoint, failed engine restore) deliberately leave it set. Every
+        // fallible step is past by here; the reverts below are best-effort.
+        txn.aborted = false;
         drop(txn);
 
         for (table, original) in &engine_revert {
