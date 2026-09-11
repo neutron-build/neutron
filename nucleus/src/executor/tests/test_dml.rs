@@ -889,6 +889,106 @@ async fn test_fk_set_null_on_update() {
     );
 }
 
+/// Upsert DO UPDATE that changes a parent key must run the same inbound FK
+/// checks as a plain UPDATE (audit A20). The conflict is taken on a UNIQUE
+/// key that is NOT the referenced PK so the update genuinely moves the key.
+#[tokio::test]
+async fn upsert_key_change_respects_on_update_restrict() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE uq_parent (id INT PRIMARY KEY, code TEXT UNIQUE)",
+    )
+    .await;
+    exec(&ex, "INSERT INTO uq_parent VALUES (1, 'C1')").await;
+    exec(
+        &ex,
+        "CREATE TABLE uq_child (id INT, pid INT REFERENCES uq_parent(id) ON UPDATE RESTRICT)",
+    )
+    .await;
+    exec(&ex, "INSERT INTO uq_child VALUES (10, 1)").await;
+
+    let result = ex
+        .execute(
+            "INSERT INTO uq_parent VALUES (99, 'C1') ON CONFLICT (code) DO UPDATE SET id = EXCLUDED.id",
+        )
+        .await;
+    let err = result.expect_err("RESTRICT must refuse an upsert that moves a referenced key");
+    assert!(
+        err.to_string().contains("foreign key"),
+        "error should mention foreign key: {err}"
+    );
+
+    // Neither side changed: no orphaned child, no half-moved parent.
+    let p = exec(&ex, "SELECT id FROM uq_parent WHERE code = 'C1'").await;
+    assert_eq!(rows(&p[0])[0][0], Value::Int32(1), "parent key must be unmoved");
+    let c = exec(&ex, "SELECT pid FROM uq_child WHERE id = 10").await;
+    assert_eq!(rows(&c[0])[0][0], Value::Int32(1), "child must still point at 1");
+}
+
+#[tokio::test]
+async fn upsert_key_change_cascades_on_update_cascade() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE uc_parent (id INT PRIMARY KEY, code TEXT UNIQUE)",
+    )
+    .await;
+    exec(&ex, "INSERT INTO uc_parent VALUES (1, 'C1')").await;
+    exec(
+        &ex,
+        "CREATE TABLE uc_child (id INT, pid INT REFERENCES uc_parent(id) ON UPDATE CASCADE)",
+    )
+    .await;
+    exec(&ex, "INSERT INTO uc_child VALUES (10, 1)").await;
+
+    exec(
+        &ex,
+        "INSERT INTO uc_parent VALUES (99, 'C1') ON CONFLICT (code) DO UPDATE SET id = EXCLUDED.id",
+    )
+    .await;
+
+    let p = exec(&ex, "SELECT id FROM uc_parent WHERE code = 'C1'").await;
+    assert_eq!(rows(&p[0])[0][0], Value::Int32(99), "parent key must move");
+    let c = exec(&ex, "SELECT pid FROM uc_child WHERE id = 10").await;
+    assert_eq!(
+        rows(&c[0])[0][0],
+        Value::Int32(99),
+        "CASCADE must carry the child to the new key"
+    );
+}
+
+/// A conflict update that does NOT touch the referenced key is unaffected:
+/// no inbound FK scan should refuse an ordinary non-key upsert.
+#[tokio::test]
+async fn upsert_non_key_change_ignores_inbound_fks() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE un_parent (id INT PRIMARY KEY, code TEXT UNIQUE, name TEXT)",
+    )
+    .await;
+    exec(&ex, "INSERT INTO un_parent VALUES (1, 'C1', 'old')").await;
+    exec(
+        &ex,
+        "CREATE TABLE un_child (id INT, pid INT REFERENCES un_parent(id) ON UPDATE RESTRICT)",
+    )
+    .await;
+    exec(&ex, "INSERT INTO un_child VALUES (10, 1)").await;
+
+    exec(
+        &ex,
+        "INSERT INTO un_parent VALUES (1, 'C1', 'new') ON CONFLICT (code) DO UPDATE SET name = EXCLUDED.name",
+    )
+    .await;
+
+    let p = exec(&ex, "SELECT id, name FROM un_parent WHERE code = 'C1'").await;
+    assert_eq!(rows(&p[0])[0][1], Value::Text("new".into()));
+    assert_eq!(rows(&p[0])[0][0], Value::Int32(1), "key must not move");
+    let c = exec(&ex, "SELECT pid FROM un_child WHERE id = 10").await;
+    assert_eq!(rows(&c[0])[0][0], Value::Int32(1));
+}
+
 #[tokio::test]
 async fn test_fk_multiple_children_cascade() {
     let ex = test_executor();

@@ -591,6 +591,32 @@ impl Executor {
                                         },
                                     )
                                     .await?;
+                                    // A conflict update that changes a PK/unique
+                                    // key re-parents referencing rows exactly as
+                                    // a plain UPDATE does, but this arm never ran
+                                    // the inbound checks — RESTRICT was
+                                    // skippable and CASCADE silently missed
+                                    // (audit A20). Same two passes as the
+                                    // UPDATE path: validate, then apply. Pairs
+                                    // whose referenced columns did not change
+                                    // are skipped inside, so non-key conflict
+                                    // updates pay only the constraint scan.
+                                    self.enforce_fk_on_parent_mutation(
+                                        &table_name,
+                                        &[],
+                                        Some(&[(existing.clone(), updated.clone())]),
+                                        0,
+                                        false,
+                                    )
+                                    .await?;
+                                    self.enforce_fk_on_parent_mutation(
+                                        &table_name,
+                                        &[],
+                                        Some(&[(existing.clone(), updated.clone())]),
+                                        0,
+                                        true,
+                                    )
+                                    .await?;
                                     // Derived-index maintenance for this arm
                                     // is the full rebuild below (`conflict_updated`
                                     // → rebuild_table_derived_state →
