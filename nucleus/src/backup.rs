@@ -332,8 +332,64 @@ fn copy_dir_inner(
         if file_type.is_dir() {
             copy_dir_inner(&from, &to, &child_rel, keep)?;
         } else if file_type.is_file() {
+            // fsync the copy before it can be acknowledged as part of a
+            // backup: without it a power loss after `Ok` can hand back a
+            // zero-length file the manifest still checksums (audit A25).
             std::fs::copy(&from, &to)?;
+            sync_file(&to)?;
         }
+    }
+    sync_dir(dst)?;
+    Ok(())
+}
+
+/// Flush one file's contents to stable storage. Prefers a writable handle;
+/// falls back to read-only when the permissions forbid writing, which still
+/// fsyncs the same data on the platforms Nucleus servers run on.
+fn sync_file(path: &Path) -> io::Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .or_else(|_| std::fs::File::open(path))?;
+    file.sync_all()
+}
+
+/// Flush a directory entry list. Directory handles open read-only; where a
+/// platform refuses to open or sync a directory at all the failure is
+/// swallowed — those platforms have no directory-entry durability to lose.
+fn sync_dir(path: &Path) -> io::Result<()> {
+    match std::fs::File::open(path) {
+        Ok(dir) => {
+            let _ = dir.sync_all();
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Recursively fsync every file, then every directory bottom-up, under
+/// `root`. Files written by paths that bypass `copy_dir_inner` (the WAL
+/// prefix copies, the coordinator's page-slot snapshot) are covered here, so
+/// an acknowledged backup is durable as a whole (audit A25).
+fn sync_tree(root: &Path) -> io::Result<()> {
+    fn walk(dir: &Path, out_dirs: &mut Vec<PathBuf>) -> io::Result<()> {
+        out_dirs.push(dir.to_path_buf());
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                walk(&entry.path(), out_dirs)?;
+            } else {
+                sync_file(&entry.path())?;
+            }
+        }
+        Ok(())
+    }
+    let mut dirs = Vec::new();
+    walk(root, &mut dirs)?;
+    // Bottom-up: a child's entry is durable before its parent's listing of
+    // the child is.
+    for dir in dirs.iter().rev() {
+        sync_dir(dir)?;
     }
     Ok(())
 }
@@ -558,6 +614,10 @@ fn backup_data_dir_staged(
         encryption: recorded_encryption(data_dir),
         files: fingerprint_tree(&snapshot_data)?,
     };
+    // Durability of the copy itself (covers the plain fs::copy above) before
+    // the manifest names it: an acknowledged backup is power-loss durable
+    // (audit A25).
+    sync_tree(staging)?;
     write_manifest(staging, &manifest)?;
     Ok(manifest)
 }
@@ -628,6 +688,9 @@ pub fn backup_online(
         encryption: coord.encryption_info(),
         files: fingerprint_tree(&snapshot_data)?,
     };
+    // Durability of everything the coordinator and WAL prefix copies wrote,
+    // before the manifest names it (audit A25).
+    sync_tree(&staging)?;
     write_manifest(&staging, &manifest)?;
     publish_staging(&staging, output_dir)?;
     Ok(manifest)
@@ -815,13 +878,24 @@ fn publish_staging(staging: &Path, output_dir: &Path) -> io::Result<()> {
     if output_dir.exists() {
         std::fs::remove_dir_all(output_dir)?;
     }
-    std::fs::rename(staging, output_dir)
+    std::fs::rename(staging, output_dir)?;
+    // The rename swaps the directory entry; syncing the parent makes the
+    // swap itself power-loss durable, completing "previous generation kept
+    // until the replacement is durable" (audit A25).
+    if let Some(parent) = output_dir.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
 }
 
 fn write_manifest(output_dir: &Path, manifest: &BackupManifest) -> io::Result<()> {
     let json = serde_json::to_string_pretty(manifest)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    std::fs::write(output_dir.join(MANIFEST_NAME), json)
+    // Atomic temp+fsync+rename (the storage layer's helper): a crash mid-write
+    // can never leave a half manifest that a later restore would parse as a
+    // valid-but-wrong generation, and the previous manifest survives intact
+    // until the rename (audit A25).
+    crate::storage::atomic_write::atomic_write(&output_dir.join(MANIFEST_NAME), json.as_bytes())
 }
 
 fn now_unix() -> u64 {
@@ -1487,6 +1561,48 @@ mod tests {
         drop(lock);
         let _ = std::fs::remove_dir_all(&root);
     }
+
+// ── Durability of an acknowledged backup (audit A25) ────────────────
+
+/// Every acknowledged (Ok-returned) backup must verify against its own
+/// manifest and restore — including a forced rebuild that replaces a
+/// previous generation — and leave no temp/staging debris. The fsync and
+/// atomic-manifest work exists to make that true ACROSS a power loss; the
+/// crash-probe harness owns the kill -9 half (see DURABILITY.md).
+#[test]
+fn an_acknowledged_backup_verifies_and_restores_cleanly() {
+    let root = unique_tmp("durable");
+    let _ = std::fs::remove_dir_all(&root);
+    let data = root.join("data_dir");
+    write(&data, "catalog.json", b"{\"gen\":1}");
+    write(&data, "wal/000001.wal", &[0u8, 1, 2, 3]);
+    let dest = root.join("snap");
+
+    let m1 = backup_data_dir(&data, &dest, false, "0.1.1").unwrap();
+    write(&data, "catalog.json", b"{\"gen\":2}");
+    let m2 = backup_data_dir(&data, &dest, true, "0.1.1").unwrap();
+    assert_ne!(m1.files, m2.files, "the rebuild must replace the generation");
+
+    verify_snapshot(&dest, &m2).expect("an acknowledged backup verifies");
+
+    let restored = root.join("restored");
+    restore_data_dir(&dest, &restored, false, "0.1.1").unwrap();
+    assert_eq!(
+        std::fs::read(restored.join("catalog.json")).unwrap(),
+        b"{\"gen\":2}"
+    );
+
+    // The atomic manifest write leaves no temp siblings, and staged
+    // publication leaves no staging directory.
+    let debris: Vec<String> = std::fs::read_dir(&root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".tmp") || n.contains(".staging-"))
+        .collect();
+    assert!(debris.is_empty(), "debris after clean backups: {debris:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
 
 // ── Lock sentinel (audit A24) ────────────────────────────────────────
 
