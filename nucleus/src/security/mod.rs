@@ -130,14 +130,23 @@ impl CmpOp {
 ///
 /// The RLS row map is stringly-typed, so `"10" < "9"` would hold under a plain
 /// lexical compare and a policy like `amount > 100` would admit rows it must
-/// not. Both sides are therefore parsed as numbers first and compared
-/// numerically when both parse; anything else (text, dates, uuids) falls back to
-/// a lexical compare, which is the right order for those. Dates and timestamps
-/// render ISO-8601, so lexical order is chronological order for them too.
+/// not. Both sides are therefore parsed and compared numerically when both
+/// parse; anything else (text, dates, uuids) falls back to a lexical compare,
+/// which is the right order for those. Dates and timestamps render ISO-8601,
+/// so lexical order is chronological order for them too.
+///
+/// Integers compare exactly first (`i64` before `f64`): an f64 mantissa is
+/// 53 bits, so integers beyond 2^53 collide exactly as floats — two distinct
+/// RLS boundaries like `id > 9007199254740992` would merge into one. Decimal
+/// and fractional values keep the float path.
 fn compare_cells(left: &str, right: &str) -> std::cmp::Ordering {
+    if let (Ok(l), Ok(r)) = (left.parse::<i64>(), right.parse::<i64>()) {
+        // Both exact integers: no representation gap, no NaN.
+        return l.cmp(&r);
+    }
     if let (Ok(l), Ok(r)) = (left.parse::<f64>(), right.parse::<f64>()) {
-        // Both numeric: NaN cannot appear from a parsed literal, so a total
-        // order over the parsed values is safe.
+        // Both numeric with a fraction somewhere: NaN cannot appear from a
+        // parsed literal, so a total order over the parsed values is safe.
         if let Some(ordering) = l.partial_cmp(&r) {
             return ordering;
         }
@@ -1521,6 +1530,46 @@ mod tests {
         assert!(predicate.evaluate(&make_row(&[("amount", "200")]), &ctx));
         assert!(!predicate.evaluate(&make_row(&[("amount", "9")]), &ctx));
         assert!(!predicate.evaluate(&make_row(&[("amount", "100")]), &ctx));
+    }
+
+    #[test]
+    fn compare_cells_is_exact_for_integers_beyond_f64_precision() {
+        use std::cmp::Ordering;
+        // 2^53 and 2^53+1 are distinct i64s but the SAME f64: an f64-first
+        // compare answered Equal, merging two distinct policy boundaries.
+        assert_eq!(
+            compare_cells("9007199254740992", "9007199254740993"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_cells("9007199254740993", "9007199254740992"),
+            Ordering::Greater
+        );
+        // Still exact in both directions across the boundary, including via
+        // the CmpOp that consumes the ordering.
+        let predicate = RlsPredicate::ColumnCmp {
+            column: "id".into(),
+            op: CmpOp::Gt,
+            value: "9007199254740992".into(),
+            column_id: 0,
+        };
+        let ctx = SessionContext::new("u");
+        assert!(predicate.evaluate(&make_row(&[("id", "9007199254740993")]), &ctx));
+        assert!(!predicate.evaluate(&make_row(&[("id", "9007199254740992")]), &ctx));
+    }
+
+    #[test]
+    fn compare_cells_keeps_float_text_and_mixed_orders() {
+        use std::cmp::Ordering;
+        // Decimals stay numerically ordered, integer against decimal included.
+        assert_eq!(compare_cells("1.5", "2.25"), Ordering::Less);
+        assert_eq!(compare_cells("10", "9.5"), Ordering::Greater);
+        assert_eq!(compare_cells("-0.1", "0.1"), Ordering::Less);
+        // Text stays lexical.
+        assert_eq!(compare_cells("apple", "banana"), Ordering::Less);
+        assert_eq!(compare_cells("2024-01-02", "2024-01-10"), Ordering::Less);
+        // Mixed numeric/text falls back to lexical, per the documented contract.
+        assert_eq!(compare_cells("10", "abc"), "10".cmp("abc"));
     }
 
     #[test]
