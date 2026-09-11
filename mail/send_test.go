@@ -67,7 +67,7 @@ func TestRenderProducesValidHeaders(t *testing.T) {
 		Text:    "body text",
 	}
 
-	raw, err := msg.render("<test@example.com>")
+	raw, err := msg.render("<test@example.com>", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,12 +104,44 @@ func TestBccIsNotRenderedIntoHeaders(t *testing.T) {
 		Text: "hi",
 	}
 
-	raw, err := msg.render("<id@x.com>")
+	raw, err := msg.render("<id@x.com>", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(raw), "secret@x.com") {
 		t.Error("a Bcc recipient leaked into the rendered headers")
+	}
+}
+
+func TestRenderWithBccCarriesTheHeaderForEnvelopelessTransports(t *testing.T) {
+	// A raw-MIME upload has no envelope: without the header, Bcc recipients
+	// are not delivered at all. Render() must keep omitting it.
+	msg := &Outgoing{
+		From: Address{Email: "a@x.com"},
+		To:   []Address{{Email: "b@x.com"}},
+		Bcc:  []Address{{Email: "secret@x.com"}},
+		Text: "hi",
+	}
+
+	raw, err := msg.RenderWithBcc()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "Bcc: secret@x.com\r\n") {
+		t.Errorf("RenderWithBcc dropped the Bcc header:\n%s", raw)
+	}
+
+	plain, err := msg.Render()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain), "secret@x.com") {
+		t.Error("Render leaked a Bcc recipient into the headers")
+	}
+
+	noBcc := &Outgoing{From: Address{Email: "a@x.com"}, To: []Address{{Email: "b@x.com"}}, Text: "hi"}
+	if out, err := noBcc.RenderWithBcc(); err != nil || strings.Contains(string(out), "Bcc:") {
+		t.Errorf("RenderWithBcc emitted a Bcc header with no recipients: %q err=%v", out, err)
 	}
 }
 
@@ -123,7 +155,7 @@ func TestMultipartPutsPlainTextFirst(t *testing.T) {
 		HTML: "<p>HTMLPART</p>",
 	}
 
-	raw, err := msg.render("<id@x.com>")
+	raw, err := msg.render("<id@x.com>", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +204,7 @@ func TestNonASCIIHeadersAreEncoded(t *testing.T) {
 		Text:    "hi",
 	}
 
-	raw, err := msg.render("<id@x.com>")
+	raw, err := msg.render("<id@x.com>", false)
 	if err != nil {
 		t.Fatal(err)
 	}

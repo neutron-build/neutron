@@ -120,7 +120,7 @@ func (s *Sender) Send(ctx context.Context, msg *Outgoing) (messageID string, raw
 	}
 
 	messageID = newMessageID(msg.From.Email)
-	body, err := msg.render(messageID)
+	body, err := msg.render(messageID, false)
 	if err != nil {
 		return "", nil, err
 	}
@@ -149,13 +149,24 @@ func (s *Sender) Send(ctx context.Context, msg *Outgoing) (messageID string, raw
 // Render builds the complete RFC 5322 bytes for this message with a freshly
 // minted Message-ID. Callers that submit raw MIME to a provider API (Gmail's
 // raw upload, JMAP) get the same multipart/alternative handling as SMTP,
-// including an HTML part when set.
+// including an HTML part when set. Bcc recipients are omitted: they travel
+// in the SMTP envelope, never in headers other recipients can read.
 func (msg *Outgoing) Render() ([]byte, error) {
-	return msg.render(newMessageID(msg.From.Email))
+	return msg.render(newMessageID(msg.From.Email), false)
+}
+
+// RenderWithBcc is Render with the Bcc header included, for transports with
+// no envelope of their own: a raw upload delivers to whoever the headers
+// name, so Bcc recipients receive nothing without the header. The transport
+// is expected to strip the header from what it relays, but the sender's own
+// saved copy will list the recipients — SMTP submission must keep using
+// Send, where Bcc rides the envelope.
+func (msg *Outgoing) RenderWithBcc() ([]byte, error) {
+	return msg.render(newMessageID(msg.From.Email), true)
 }
 
 // render builds the RFC 5322 message.
-func (msg *Outgoing) render(messageID string) ([]byte, error) {
+func (msg *Outgoing) render(messageID string, includeBcc bool) ([]byte, error) {
 	var b strings.Builder
 
 	b.WriteString("From: " + formatAddress(msg.From) + "\r\n")
@@ -164,6 +175,9 @@ func (msg *Outgoing) render(messageID string) ([]byte, error) {
 	}
 	if len(msg.Cc) > 0 {
 		b.WriteString("Cc: " + formatAddressList(msg.Cc) + "\r\n")
+	}
+	if includeBcc && len(msg.Bcc) > 0 {
+		b.WriteString("Bcc: " + formatAddressList(msg.Bcc) + "\r\n")
 	}
 	b.WriteString("Subject: " + encodeHeader(msg.Subject) + "\r\n")
 	b.WriteString("Date: " + time.Now().Format(time.RFC1123Z) + "\r\n")
