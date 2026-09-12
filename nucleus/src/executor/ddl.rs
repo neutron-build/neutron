@@ -632,6 +632,7 @@ impl Executor {
     pub async fn rebuild_persistent_indexes(&self) {
         let started = std::time::Instant::now();
         let mut rebuilt = 0usize;
+        let mut unique = 0usize;
         let mut failed = 0usize;
         for table in self.catalog.table_names().await {
             let Some(table_def) = self.catalog.get_table(&table).await else {
@@ -659,6 +660,17 @@ impl Executor {
                     Ok(()) => {
                         self.btree_indexes
                             .insert((table.clone(), column.clone()), index.name.clone());
+                        // `IndexDef.unique` round-trips through catalog.json,
+                        // so the reopened catalog already carries it and
+                        // `unique_col_sets` picks it up from there — but it
+                        // is the one flag this rebuild is responsible for
+                        // keeping honest, so count it: a UNIQUE index that
+                        // comes back as anything else is a durability bug we
+                        // want visible in the startup log, not a silent
+                        // degradation to a plain index.
+                        if index.unique {
+                            unique += 1;
+                        }
                         rebuilt += 1;
                     }
                     Err(e) => {
@@ -678,7 +690,7 @@ impl Executor {
         if rebuilt > 0 || failed > 0 {
             tracing::info!(
                 target: "nucleus::startup",
-                "rebuilt {rebuilt} storage index(es) in {:.1}s ({failed} failed)",
+                "rebuilt {rebuilt} storage index(es) in {:.1}s ({unique} unique, {failed} failed)",
                 started.elapsed().as_secs_f64()
             );
         }
@@ -2403,6 +2415,46 @@ impl Executor {
             None => crate::fts::Analyzer::default(),
         };
 
+        // A UNIQUE index is a promise about the rows already in the table as
+        // much as about the rows to come. Building it over duplicates while
+        // enforcing it only on later writes leaves a table that permanently
+        // violates its own declared constraint — and that no DML can repair,
+        // because every later statement trips over a duplicate it did not
+        // create. Refuse here, before any index state or catalog entry is
+        // registered, so a refused index leaves no trace.
+        if create_index.unique {
+            let indices: Vec<usize> = columns
+                .iter()
+                .filter_map(|col_name| table_def.column_index(col_name))
+                .collect();
+            if indices.len() == columns.len() {
+                let mut seen: HashSet<Vec<Value>> = HashSet::new();
+                for row in self.storage_for(&table_name).scan(&table_name).await? {
+                    let key: Vec<Value> = indices
+                        .iter()
+                        .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                        .collect();
+                    // NULL is never equal to NULL, so repeated NULLs are legal.
+                    if key.iter().any(|v| matches!(v, Value::Null)) {
+                        continue;
+                    }
+                    if !seen.insert(key.clone()) {
+                        let col_names = columns.join(", ");
+                        let vals = key
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(ExecError::ConstraintViolation(format!(
+                            "could not create unique index \"{index_name}\" on \"{table_name}\": \
+                             duplicate key value violates unique constraint on ({col_names}) — \
+                             key ({vals}) is duplicated"
+                        )));
+                    }
+                }
+            }
+        }
+
         // Register the index in the catalog
         let index_def = crate::catalog::IndexDef {
             name: index_name.clone(),
@@ -3830,20 +3882,28 @@ impl Executor {
                     let constraint_name = name.to_string();
                     let mut updated = (*table_def).clone();
                     let original_len = updated.constraints.len();
+                    // `create_implicit_unique_indexes` names a PK's backing
+                    // index after the table (`{table}_pkey`), not after the
+                    // constraint, so remember which flavour was dropped: the
+                    // index to retire is spelled differently for each.
                     let removed_unique_columns =
                         updated
                             .constraints
                             .iter()
                             .find_map(|constraint| match constraint {
                                 crate::catalog::TableConstraint::PrimaryKey { name, columns }
-                                | crate::catalog::TableConstraint::Unique { name, columns }
                                     if name.as_deref() == Some(constraint_name.as_str()) =>
                                 {
-                                    Some(columns.clone())
+                                    Some((true, columns.clone()))
+                                }
+                                crate::catalog::TableConstraint::Unique { name, columns }
+                                    if name.as_deref() == Some(constraint_name.as_str()) =>
+                                {
+                                    Some((false, columns.clone()))
                                 }
                                 _ => None,
                             });
-                    if let Some(columns) = &removed_unique_columns {
+                    if let Some((_, columns)) = &removed_unique_columns {
                         let dependent = self.catalog.list_tables().await.into_iter().any(|table| {
                             table.constraints.iter().any(|constraint| {
                                 matches!(
@@ -3886,16 +3946,31 @@ impl Executor {
                         // IF EXISTS: silently succeed
                     } else {
                         self.catalog.update_table(updated).await?;
-                        // Drop any backing index that matches the constraint name.
-                        if let Err(_e) = self.catalog.drop_index(&constraint_name).await {
-                            // Index may not exist (e.g., CHECK constraints have no backing index).
+                        // Drop the backing index the constraint created — by
+                        // EITHER spelling. `create_implicit_unique_indexes`
+                        // names it after the table for a PRIMARY KEY
+                        // (`{table}_pkey`) and `{table}_{cols}_key` for a
+                        // UNIQUE, only using the constraint's own name when
+                        // the constraint carried one; dropping by constraint
+                        // name alone leaves the implicit one registered. That
+                        // was inert while nothing read `IndexDef::unique`
+                        // back, but now that UNIQUE indexes are enforced it
+                        // kept enforcing a constraint the user had dropped.
+                        let mut backing_index_names = vec![constraint_name.clone()];
+                        if let Some((is_primary_key, columns)) = &removed_unique_columns {
+                            backing_index_names.push(if *is_primary_key {
+                                format!("{table_name}_pkey")
+                            } else {
+                                format!("{}_{}_key", table_name, columns.join("_"))
+                            });
                         }
-                        self.btree_indexes
-                            .retain(|_, name| name != &constraint_name);
-                        let _ = self
-                            .storage_for(&table_name)
-                            .drop_index(&constraint_name)
-                            .await;
+                        for index_name in &backing_index_names {
+                            if let Err(_e) = self.catalog.drop_index(index_name).await {
+                                // Index may not exist (e.g., CHECK constraints have no backing index).
+                            }
+                            self.btree_indexes.retain(|_, name| name != index_name);
+                            let _ = self.storage_for(&table_name).drop_index(index_name).await;
+                        }
                     }
                 }
                 _ => {
