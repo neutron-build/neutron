@@ -1,11 +1,56 @@
 # Runbook — rollback
 
-Getting back to the previous version after an upgrade. Which procedure applies
-depends entirely on whether the on-disk `format_version` changed.
+Getting back to the previous version after an upgrade.
+
+## 0. Correction, 2026-08-31 — read this before §1
+
+This runbook used to route on `format_version` alone and call an unchanged
+`format_version` "a binary swap. Cheap and safe." **That is wrong, and it is
+wrong in the direction that loses data.** `format_version` covers the SQL
+substrate's page format. The specialty-model WALs are versioned separately and
+are not covered by it at all.
+
+Measured 2026-08-31, v0.1.8 against HEAD (`c04a2a9f`), `format_version` 2 on
+both sides, reproduced with native binaries and again end to end with the
+published `:v0.1.8` and `:latest` images on linux/amd64:
+
+- **One `KV_HSET` under the newer build is enough.** On the next start the older
+  build fails the whole KV store open —
+  `kv/collections.wal: record at offset N (op 74) failed its checksum` — logs
+  **one** ERROR, marks the model VOLATILE, and comes up serving. Every key is
+  gone, including keys the older build itself wrote before the upgrade. It then
+  acknowledges new KV writes and loses them again on the next restart.
+- A plain `KV_SET` loses that one key **with no log line at all**.
+- Document and time-series writes made under the newer build vanish silently;
+  records written before the upgrade survive in those two models.
+- SST files are written with magic `LSM2` at HEAD; v0.1.8 accepts only `LSMS`
+  and errors on the whole store. So a single flush or compaction closes the
+  door independently of the WALs.
+- SQL tables, roles, RLS policies, views, sequences and `catalog.json`'s new
+  serde-defaulted keys all survive the round trip intact. A control directory
+  taken v0.1.8 → v0.1.8 from the same seed kept everything, so the damage is
+  entirely attributable to the round trip.
+
+**The revised decision:**
+
+```
+Has the newer version served any traffic?
+├── No  (it refused at boot, or you stopped it before any write)
+│        → §1. Swap the binary back. The on-disk format check runs before WAL
+│          recovery touches anything, so a refusal is provably non-destructive.
+└── Yes → §2. Restore from the pre-upgrade backup. You WILL lose everything
+          written since that backup. Do NOT try §1 first "to see" — an older
+          binary opens the directory happily and only then discovers it cannot
+          read the specialty WALs, and by then the KV model is gone.
+```
+
+`§1 first, it costs you a restart not your data` was the old advice. It is
+withdrawn.
 
 ## Status of this procedure
 
-**Written, never executed.** See the same note in [UPGRADE.md](UPGRADE.md#status-of-this-procedure).
+§0 and §2 are measured. The rest is **written, never executed** — see the same
+note in [UPGRADE.md](UPGRADE.md#status-of-this-procedure).
 
 ## Decision
 
@@ -42,7 +87,7 @@ The general lesson, which applies to the next release too: **§1 is only sound
 when no on-disk vocabulary changed without the format version changing.** Check
 that, not just the constant.
 
-## 1. Same format version — binary swap
+## 1. Newer version never wrote — binary swap
 
 ```bash
 systemctl stop nucleus

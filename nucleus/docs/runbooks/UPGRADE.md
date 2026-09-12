@@ -38,8 +38,15 @@ This is the only question that matters, and you answer it *before* upgrading.
 Physical snapshots are keyed on **`format_version`**, not the release string.
 So:
 
-- **Same `format_version` in old and new:** rollback is a binary swap.
-  Cheap and safe.
+- **Same `format_version` in old and new:** rollback is a binary swap **only
+  if the new version has not yet served traffic.** `format_version` covers the
+  SQL substrate's page format and nothing else; the specialty-model WALs (KV,
+  document, graph, blob, vector, time-series, streams, CDC) are versioned
+  separately. Measured 2026-08-31 across v0.1.8 -> HEAD, both at
+  `format_version` 2: one `KV_HSET` under the newer build makes the older build
+  fail the whole KV store open, mark it VOLATILE and come up serving with every
+  key gone — including keys written before the upgrade. See
+  [ROLLBACK.md §0](ROLLBACK.md#0-correction-2026-08-31--read-this-before-1).
 - **New `format_version`:** the new server rewrites the data directory into a
   format the old binary will refuse to open. **Rollback then requires a
   logical dump taken before the upgrade** — and `nucleus dump` omits roles,
@@ -128,9 +135,12 @@ Adoption is metadata only. **No rows are moved, rewritten or deleted.**
      something to do unasked.
    - `ORDER BY names a column the table does not have`. The declaration is
      wrong and dedup is **not** registered for that table. Fix the schema.
-4. **Rollback stays a binary swap.** `catalog.json` gains a serde-defaulted
-   `table_engines` array that an older binary ignores. Rolling back to v0.1.8
-   reverts to the over-reporting behaviour; it does not corrupt anything.
+4. **This particular change does not block rollback.** `catalog.json` gains a
+   serde-defaulted `table_engines` array that an older binary ignores —
+   verified: a v0.1.8 binary read a HEAD-written `catalog.json` with zero
+   difference in any query result. Rolling back reverts to the over-reporting
+   behaviour and corrupts nothing. **But rollback is not a binary swap for
+   other reasons** — see [ROLLBACK.md §0](ROLLBACK.md#0-correction-2026-08-31--read-this-before-1).
 5. **Do not hand-edit `engines.json`.** It is now a cache of `catalog.json`.
 
 ## 1a. Container images: check who owns the data directory
