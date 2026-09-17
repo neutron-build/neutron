@@ -673,9 +673,19 @@ impl TransactionManager {
     // SSI (Serializable Snapshot Isolation)
     // ========================================================================
 
+    /// Sentinel row index marking a table-level write (an INSERT, which
+    /// creates phantoms for any concurrent reader of the table). Real row
+    /// indices can never equal it.
+    pub(crate) const TABLE_WRITE_MARKER: usize = usize::MAX;
+
     /// Record that a SERIALIZABLE transaction read rows from a table.
     /// If any concurrent SERIALIZABLE transaction has already written to those
     /// rows, record an rw-conflict edge (this_txn → writer_txn).
+    ///
+    /// A read that matched NO rows still registers the table (NU-11): the
+    /// empty entry is what `record_table_write` needs to form a phantom
+    /// edge, and it is what lets this read discover a concurrent INSERT via
+    /// the writer's TABLE_WRITE_MARKER.
     pub fn record_siread(&self, txn_id: u64, table: &str, row_indices: &[usize]) {
         // Canonical lock order: ssi_txns → ssi_read_locks → ssi_write_sets → ssi_rw_conflicts
         let ssi = self.ssi_txns.lock();
@@ -701,6 +711,16 @@ impl TransactionManager {
             if let Some(other_writes) = writes.get(&other_txn)
                 && let Some(other_tbl_writes) = other_writes.get(table)
             {
+                // A table-level write (INSERT) conflicts with ANY read of the
+                // table, including an empty predicate read (NU-11).
+                if other_tbl_writes.contains(&Self::TABLE_WRITE_MARKER) {
+                    conflicts.insert((txn_id, other_txn));
+                    crate::bench_hooks::ssi_event(|| {
+                        format!("edge siread {txn_id}->{other_txn} on {table}[table-write]")
+                    });
+                    self.doom_new_pivot(&conflicts, txn_id, other_txn, txn_id);
+                    continue;
+                }
                 for &idx in row_indices {
                     if other_tbl_writes.contains(&idx) {
                         // txn_id read data that other_txn wrote
@@ -870,13 +890,23 @@ impl TransactionManager {
     /// Record a table-level SIREAD lock (for INSERT — new rows affect all
     /// concurrent readers of the table via predicate/phantom conflicts).
     pub fn record_table_write(&self, txn_id: u64, table: &str) {
-        // Canonical lock order: ssi_txns → ssi_read_locks → ssi_write_sets → ssi_rw_conflicts
+        // Canonical lock order: ssi_txns → ssi_read_locks → ssi_write_sets → ssi_rw_conflicts → ssi_concurrent
         let ssi = self.ssi_txns.lock();
         if !ssi.contains(&txn_id) {
             return;
         }
-        // Any concurrent SERIALIZABLE txn that scanned this table has a conflict
+        // The write is ALSO recorded as a TABLE_WRITE_MARKER in this txn's
+        // own write set (NU-11), so a LATER predicate read that matched
+        // nothing can discover it in the read direction
+        // (insert-before-read ordering).
         let reads = self.ssi_read_locks.lock();
+        let mut writes = self.ssi_write_sets.lock();
+        writes
+            .entry(txn_id)
+            .or_default()
+            .entry(table.to_string())
+            .or_default()
+            .insert(Self::TABLE_WRITE_MARKER);
         let mut conflicts = self.ssi_rw_conflicts.lock();
         let concurrent = self.ssi_concurrent.lock();
         for &other_txn in ssi.iter() {
@@ -962,7 +992,7 @@ impl TransactionManager {
     /// `BufferedDiskEngine` — what a server actually runs — takes strict 2PL
     /// instead; SSI here is `MvccStorageAdapter` (`--memory`, embedded
     /// `durable_mvcc`).
-    pub fn check_serializable_commit(&self, txn_id: u64) -> Result<(), String> {
+    fn check_serializable_commit_inner(&self, txn_id: u64) -> Result<(), String> {
         // Doomed at edge-creation time for being a pivot. This is the primary
         // rule; the deferred check below remains as a backstop for structures
         // completed by an edge this transaction was not party to.
@@ -1032,7 +1062,7 @@ impl TransactionManager {
             // counterpart visible as committed to whichever transaction
             // validates second.
             let _commit_point = self.serial_commit.lock();
-            let verdict = self.check_serializable_commit(txn.id);
+            let verdict = self.check_serializable_commit_inner(txn.id);
             // Snapshot the edges BEFORE reaching for the log. `ssi_event` takes
             // the log mutex, and every edge-creation site calls it while already
             // holding `ssi_rw_conflicts` — locking that inside the closure would
@@ -1056,6 +1086,34 @@ impl TransactionManager {
         }
         self.commit(txn);
         Ok(())
+    }
+
+    /// Take the serializable commit-point lock (NU-05). Callers that need a
+    /// durability step between SSI validation and publication (durable
+    /// commit decision BEFORE visibility) hold this guard across all three,
+    /// preserving the check-validate-publish atomicity that
+    /// `commit_serializable` guarantees in-memory.
+    pub(crate) fn serial_commit_lock(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.serial_commit.lock()
+    }
+
+    /// Validate a SERIALIZABLE transaction's commit WITHOUT committing it
+    /// (NU-05): the caller holds `serial_commit_lock`, performs its durable
+    /// decision, and then publishes via `commit`.
+    pub(crate) fn check_serializable_commit(&self, txn_id: u64) -> Result<(), String> {
+        let verdict = self.check_serializable_commit_inner(txn_id);
+        if crate::bench_hooks::ssi_trace_on() {
+            let mut edges: Vec<(u64, u64)> = self.ssi_rw_conflicts.lock().iter().copied().collect();
+            edges.sort_unstable();
+            let ok = verdict.is_ok();
+            crate::bench_hooks::ssi_event(move || {
+                format!(
+                    "commit-check {txn_id} -> {} edges={edges:?}",
+                    if ok { "OK" } else { "ABORT" }
+                )
+            });
+        }
+        verdict
     }
 
     /// Clean up SSI tracking after a SERIALIZABLE transaction COMMITS.
