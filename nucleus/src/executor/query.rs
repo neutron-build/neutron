@@ -10860,12 +10860,15 @@ impl Executor {
                 let after_limit_or_offset = {
                     let t = out.trim_end();
                     let ends_with_kw = |kw: &str| {
-                        t.len() >= kw.len()
-                            && t[t.len() - kw.len()..].eq_ignore_ascii_case(kw)
-                            && t[..t.len() - kw.len()]
-                                .chars()
-                                .last()
-                                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+                        let (tb, kb) = (t.as_bytes(), kw.as_bytes());
+                        let (n, k) = (tb.len(), kb.len());
+                        n >= k
+                            && tb[n - k..].eq_ignore_ascii_case(kb)
+                            && (n == k
+                                || {
+                                    let prev = tb[n - k - 1];
+                                    !(prev.is_ascii_alphanumeric() || prev == b'_')
+                                })
                     };
                     ends_with_kw("limit") || ends_with_kw("offset")
                 };
@@ -11018,12 +11021,15 @@ impl Executor {
                 let after_limit_or_offset = {
                     let t = out.trim_end();
                     let ends_with_kw = |kw: &str| {
-                        t.len() >= kw.len()
-                            && t[t.len() - kw.len()..].eq_ignore_ascii_case(kw)
-                            && t[..t.len() - kw.len()]
-                                .chars()
-                                .last()
-                                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+                        let (tb, kb) = (t.as_bytes(), kw.as_bytes());
+                        let (n, k) = (tb.len(), kb.len());
+                        n >= k
+                            && tb[n - k..].eq_ignore_ascii_case(kb)
+                            && (n == k
+                                || {
+                                    let prev = tb[n - k - 1];
+                                    !(prev.is_ascii_alphanumeric() || prev == b'_')
+                                })
                     };
                     ends_with_kw("limit") || ends_with_kw("offset")
                 };
@@ -11838,6 +11844,22 @@ mod normalize_tests {
         let sql = "SELECT * FROM users WHERE id = 500";
         let norm = Executor::normalize_sql_for_cache(sql);
         assert_eq!(norm, "SELECT * FROM users WHERE id = $N");
+    }
+
+    #[test]
+    fn test_normalize_multibyte_before_digit_does_not_panic() {
+        // The keyword-tail check slices backwards by the keyword byte length;
+        // a multi-byte character straddling that offset must not panic.
+        let norm = Executor::normalize_sql_for_cache("SELECT a—bcd 1");
+        assert_eq!(norm, "SELECT a—bcd $N");
+    }
+
+    #[test]
+    fn test_normalize_limit_operand_after_multibyte_stays_literal() {
+        let a = Executor::normalize_sql_for_cache("SELECT '—' FROM t LIMIT 5");
+        let b = Executor::normalize_sql_for_cache("SELECT '—' FROM t LIMIT 50");
+        assert_ne!(a, b);
+        assert!(a.contains("5"));
     }
 
     #[test]
