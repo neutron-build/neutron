@@ -363,9 +363,12 @@ describe("server e2e matrix", () => {
       const cachedThirdPayload = decodeSerializedPayload<Record<string, unknown>>(
         await cachedThird.json()
       );
+      // 3, not 2: the POST's own loader run (2) no longer re-primes the
+      // loader cache (mutation-method writes are GET/HEAD-only, TS-07), so
+      // this GET re-runs fresh. Stale data is never served.
       expect(
         (cachedThirdPayload["route:cached.ts"] as { loadCount: number }).loadCount
-      ).toBe(2);
+      ).toBe(3);
 
       const partialFirst = await fetch(`${baseUrl}/partial`, {
         headers: {

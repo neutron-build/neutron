@@ -108,7 +108,11 @@ describe("loader-cache invalidation matches how keys are written", () => {
     });
     expect(mutation.status).toBe(200);
 
-    expect(await getLoadCount(url)).toBe(2); // must re-run, not serve stale
+    // 3, not 1: the mutation's own loader run (2) no longer primes the
+    // loader cache — mutation-method writes were restricted to GET/HEAD
+    // (TS-07) because a fill started before an invalidation could publish
+    // stale data after it. The GET re-runs fresh; stale (1) is never served.
+    expect(await getLoadCount(url)).toBe(3);
   });
 
   it("a mutation to the bare path evicts loader data written via a trailing-slash request", { timeout: 30_000 }, async () => {
@@ -121,6 +125,8 @@ describe("loader-cache invalidation matches how keys are written", () => {
     });
     expect(mutation.status).toBe(200);
 
-    expect(await getLoadCount(`${baseUrl}/notes/`)).toBe(2); // must re-run
+    // See the test above: the POST's loader run counts (2) but does not
+    // re-prime the cache; the next GET re-runs (3) rather than serve stale.
+    expect(await getLoadCount(`${baseUrl}/notes/`)).toBe(3);
   });
 });

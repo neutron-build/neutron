@@ -1,8 +1,13 @@
 import { createHash } from "node:crypto";
 
-export function createEntityTag(body: string): string {
-  const size = Buffer.byteLength(body, "utf-8");
-  const digest = createHash("sha1").update(body).digest("hex").slice(0, 16);
+/**
+ * Build a weak ETag over a response body. Byte-exact for Uint8Array bodies
+ * (TS-06); the string overload sizes via UTF-8 to match the encoded bytes.
+ */
+export function createEntityTag(body: string | Uint8Array): string {
+  const bytes = typeof body === "string" ? Buffer.from(body, "utf-8") : Buffer.from(body);
+  const size = bytes.byteLength;
+  const digest = createHash("sha1").update(bytes).digest("hex").slice(0, 16);
   return `W/"${size.toString(16)}-${digest}"`;
 }
 

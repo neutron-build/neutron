@@ -2,7 +2,13 @@ export interface NeutronAppResponseCacheEntry {
   status: number;
   statusText: string;
   headers: [string, string][];
-  body: string;
+  /**
+   * Response body as raw bytes. The store is byte-exact by contract (TS-06):
+   * the previous `string` body round-tripped through UTF-8 text and silently
+   * transformed invalid-UTF-8/binary bytes while the copied headers still
+   * described the original octets.
+   */
+  body: Uint8Array;
   expiresAt: number;
 }
 
@@ -81,10 +87,13 @@ export function createMemoryAppCacheStore(
         return;
       }
 
-      const htmlPrefix = `html:${normalized}`;
-      const jsonPrefix = `json:${normalized}`;
+      // App-cache keys are `variant\norigin\npath\nsearch\n...` (see
+      // buildAppCacheKey). Match the path field EXACTLY: the previous
+      // `startsWith("html:/user")` prefix test also invalidated `/users` and
+      // every other path sharing the prefix (TS-08).
       for (const key of cache.keys()) {
-        if (key.startsWith(htmlPrefix) || key.startsWith(jsonPrefix)) {
+        const parts = key.split("\n");
+        if (parts.length >= 3 && parts[2] === normalized) {
           cache.delete(key);
         }
       }
@@ -117,7 +126,10 @@ export function createMemoryLoaderCacheStore(
       // LRU: a read refreshes recency (see the app cache store above).
       cache.delete(key);
       cache.set(key, entry);
-      return entry;
+      // Ownership boundary (TS-20): hand the caller a clone so mutating a
+      // nested value in the returned object cannot alter what another
+      // request will read from the cache.
+      return cloneLoaderEntry(entry);
     },
     async set(key, entry) {
       if (!cache.has(key) && cache.size >= maxEntries) {
@@ -126,7 +138,8 @@ export function createMemoryLoaderCacheStore(
           cache.delete(oldest);
         }
       }
-      cache.set(key, entry);
+      // Clone at ingress too: the caller keeps its reference after storing.
+      cache.set(key, cloneLoaderEntry(entry));
     },
     async deleteByPath(pathname) {
       const normalized = normalizeCachePathname(pathname);
@@ -147,6 +160,15 @@ export function createMemoryLoaderCacheStore(
   };
 }
 
+/**
+ * Clone stored loader data. Loader data must already be structured-clone
+ * compatible — it is JSON-serialized into the document — so a failed clone
+ * surfaces as a thrown error rather than silent cross-request aliasing.
+ */
+function cloneLoaderEntry(entry: NeutronLoaderDataCacheEntry): NeutronLoaderDataCacheEntry {
+  return { expiresAt: entry.expiresAt, data: structuredClone(entry.data) };
+}
+
 function resolveMaxEntries(value: number | undefined, fallback: number): number {
   if (!Number.isFinite(value) || (value || 0) <= 0) {
     return fallback;
@@ -160,8 +182,12 @@ function resolveMaxEntries(value: number | undefined, fallback: number): number 
  * this — keys written from the raw (percent-encoded, trailing-slash) request
  * path are invisible to invalidation and survive until their TTL.
  *
+ * Traversal is a whole SEGMENT equal to `..`, not a substring: `/a..b` and
+ * `/v1.2..3` are legal paths and must stay invalidatable (TS-08). This now
+ * matches the serving path's `normalizePathname` rule exactly.
+ *
  * Returns null when the path cannot be safely normalized (undecodable, not
- * rooted, contains `..`).
+ * rooted, contains a `..` segment).
  */
 export function normalizeCachePathname(pathname: string): string | null {
   let decoded: string;
@@ -171,7 +197,7 @@ export function normalizeCachePathname(pathname: string): string | null {
     return null;
   }
 
-  if (!decoded.startsWith("/") || decoded.includes("..")) {
+  if (!decoded.startsWith("/") || decoded.split("/").includes("..")) {
     return null;
   }
 

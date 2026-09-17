@@ -200,6 +200,14 @@ export interface NeutronWebSocketOptions {
    * (route inside your `wss.on("connection", (ws, req) => ...)` via `req.url`).
    */
   path?: string;
+  /**
+   * Fail-closed pre-upgrade authorization (TS-28). Raw upgrades bypass HTTP
+   * middleware entirely, so a handshake would otherwise be subject to no
+   * auth/rate-limit/origin check at all. Return `true` to complete the
+   * upgrade; anything else (false, throw, timeout) destroys the socket.
+   * Bounded at 5s — a stuck verifier must not pin the upgrade forever.
+   */
+  authorize?: (request: import("node:http").IncomingMessage) => boolean | Promise<boolean>;
 }
 
 /** Resolved handle returned by {@link createServer}. */
@@ -383,24 +391,32 @@ export async function createServer(
   // presence can be part of the decision to start one.
   const globalMiddlewareFile = isSsr ? findGlobalMiddlewareFile(resolvedRootDir) : null;
   const needsSsrRuntime = hasAppRoutes || globalMiddlewareFile !== null;
+  // Fail closed (TS-01): when the SSR runtime is required — app routes exist
+  // or a global middleware file was found — a Vite initialization failure
+  // must reject createServer, not silently downgrade the app to a static
+  // server whose auth/tenant/CSRF middleware never runs. Static-only
+  // serving is an explicitly selected mode, not an error fallback.
   const ssrServer = needsSsrRuntime
     ? await createSsrServer(resolvedRootDir, resolvedRoutesDir, runtime)
     : null;
   // An optional src/middleware.ts (default export = a MiddlewareFn) runs
   // OUTERMOST, before any per-route middleware. Loaded once at startup through
   // the same SSR runtime as routes so it shares the module graph (hooks,
-  // aliases). Absent file = none.
+  // aliases). Absent file = none. A PRESENT file that fails to import or
+  // exports something invalid is a startup error (TS-01): losing the auth
+  // gate to a typo must not look like a working server.
   const globalMiddleware: MiddlewareFn[] =
     globalMiddlewareFile && ssrServer
       ? await loadGlobalMiddleware(ssrServer, globalMiddlewareFile)
       : [];
 
   if (globalMiddlewareFile && !ssrServer) {
-    // Never fail silently here: the file documents itself as running on every
-    // request, and a gate that does not run is worse than one that is absent.
-    console.warn(
+    // Unreachable when needsSsrRuntime threw above, kept as a belt-and-braces
+    // guard for future callers that construct the pieces by hand.
+    throw new Error(
       `Global middleware ${path.relative(resolvedRootDir, globalMiddlewareFile)} was found but ` +
-        "the SSR runtime could not be started, so it will NOT run. Requests are served without it."
+        "the SSR runtime could not be started, so it cannot run. Fix the SSR runtime failure " +
+        "or remove the middleware file; serving requests without it would bypass its gate."
     );
   }
   const routeModuleCache = new Map<string, Promise<RouteModule>>();
@@ -408,16 +424,23 @@ export async function createServer(
     cache?.app || createMemoryAppCacheStore();
   const loaderDataCacheStore =
     cache?.loader || createMemoryLoaderCacheStore();
-  const appInFlightRequests = new Map<string, Promise<Response>>();
   // Background cache fills in progress, by app-cache key. A reader that
   // misses must join the fill rather than race it — otherwise a request
   // arriving right behind the first one re-renders (and reports MISS) while
   // the entry is a few microseconds from landing.
   const appPendingStores = new Map<string, Promise<void>>();
+  // Monotonic invalidation epoch (TS-07): captured when a cacheable request
+  // starts, checked immediately before its fill is committed. A mutation that
+  // invalidated the path in between advances the epoch and the stale fill is
+  // dropped instead of published after the invalidation.
+  let appCacheEpoch = 0;
 
   if (hasAppRoutes && !ssrServer) {
-    console.warn(
-      "App routes detected but SSR runtime could not be started. Falling back to static-only behavior."
+    // Unreachable for isSsr apps (needsSsrRuntime throws first) — kept for
+    // hand-assembled configurations.
+    throw new Error(
+      "App routes detected but the SSR runtime could not be started; refusing to " +
+        "degrade to static-only serving. Fix the SSR runtime failure."
     );
   }
 
@@ -705,7 +728,15 @@ export async function createServer(
         return runMiddlewareChain(globalMiddleware, c.req.raw, {}, async () => respond());
       };
 
-      if ((method === "GET" || method === "HEAD") && staticAllowed) {
+      // A warm static-HTML entry must never answer a loader-data request:
+      // the same `!isJsonRequest` eligibility the disk path applies (TS-09).
+      // Without it, warming the HTML cache changed the response to a later
+      // X-Neutron-Data request from JSON into HTML.
+      if (
+        (method === "GET" || method === "HEAD") &&
+        !isJsonRequest(c.req.raw) &&
+        staticAllowed
+      ) {
         const cached = staticHtmlCache.get(effectivePathname);
         if (cached) {
           const response = await serveStatic(() =>
@@ -764,11 +795,16 @@ export async function createServer(
               globalMiddleware
             );
             // The page renders as a normal route, which makes it a 200. The
-            // status is the part that matters to crawlers and monitoring, so
-            // it is forced here rather than left to the route.
-            return finalize(
-              new Response(rendered.body, { status: 404, headers: rendered.headers }),
-              {
+            // status is the part that matters to crawlers and monitoring — but
+            // only a 200 is rewritten: a response the not-found route (or its
+            // middleware) produced deliberately — a redirect, a 403, a
+            // ProblemError — is the real outcome and must pass through
+            // (TS-27).
+            const finalResponse =
+              rendered.status === 200
+                ? new Response(rendered.body, { status: 404, headers: rendered.headers })
+                : rendered;
+            return finalize(finalResponse, {
                 routeId: notFoundMatch.route.id,
                 routePath: notFoundMatch.route.path,
                 routeMode: notFoundMatch.route.config.mode,
@@ -819,97 +855,76 @@ export async function createServer(
       }
 
       if (isMutationMethod(method)) {
+        // Advance the invalidation epoch BEFORE deleting (TS-07): an
+        // in-flight cacheable GET that started before this mutation must not
+        // publish its (now stale) fill afterwards.
+        appCacheEpoch++;
         await appResponseCacheStore.deleteByPath(effectivePathname);
         await loaderDataCacheStore.deleteByPath(effectivePathname);
       }
 
       const appCacheMaxAge = match.route.config.cache?.maxAge ?? 0;
-      // SECURITY: the app-response cache is keyed only on path+query, so it is
-      // shared across users. Never read, single-flight-share, or store a
-      // response for a request that carries credentials (Cookie/Authorization),
-      // since it may be authenticated/personalized and would otherwise leak one
-      // user's rendered page to others. Conditional/no-cache requests without
+      // SECURITY: the app-response cache is keyed on the full representation
+      // identity (variant + path + query + origin + vary-able headers), so it
+      // is shared across users. Never read or store a response for a request
+      // that carries credentials (Cookie/Authorization), since it may be
+      // authenticated/personalized and would otherwise leak one user's
+      // rendered page to others. Conditional/no-cache requests without
       // credentials still revalidate normally.
       const appCacheKey =
         appCacheMaxAge > 0 && !requestCarriesCredentials(c.req.raw)
           ? buildAppCacheKey(c.req.raw, effectivePathname)
           : null;
+      const cacheReadsPermitted =
+        appCacheKey !== null && (method === "GET" || method === "HEAD");
+      const requestEpoch = appCacheEpoch;
 
-      if (appCacheKey && (method === "GET" || method === "HEAD")) {
-        const pendingStore = appPendingStores.get(appCacheKey);
-        if (pendingStore) {
-          await pendingStore;
-        }
-        const hit = await readCachedAppResponse(
-          appResponseCacheStore,
-          appCacheKey,
-          c.req.raw,
-          method
-        );
-        if (hit) {
-          return finalize(hit, {
-            routeId: match.route.id,
-            routePath: match.route.path,
-            routeMode: "app",
-          });
-        }
-      }
-
-      if (appCacheKey && method === "GET") {
-        const pending = appInFlightRequests.get(appCacheKey);
-        if (pending) {
-          const shared = await pending;
-          return finalize(shared.clone(), {
-            routeId: match.route.id,
-            routePath: match.route.path,
-            routeMode: "app",
-          });
-        }
-
-        const next = (async () => {
-          const response = await handleAppRouteRequest(
-            c.req.raw,
-            match,
-            ssrServer,
-            clientEntryScriptSrc,
-            stylesheetHrefs,
-            routeModuleCache,
-            loaderDataCacheStore,
-            requestTrace,
-            hooks,
-            globalMiddleware
-          );
-          // Fill the cache in the background. Awaiting the full body drain
-          // here would hold the response until its last byte — streaming
-          // defeated on exactly the popular pages caching targets. The fill
-          // is tracked so a concurrent reader joins it instead of racing it.
-          const store = maybeStoreAppResponse(
-            appResponseCacheStore,
-            appCacheKey,
-            response,
-            appCacheMaxAge
-          ).catch(() => {});
-          appPendingStores.set(appCacheKey, store);
-          void store.then(() => {
-            if (appPendingStores.get(appCacheKey) === store) {
-              appPendingStores.delete(appCacheKey);
-            }
-          });
-          return response;
-        })();
-
-        appInFlightRequests.set(appCacheKey, next);
-        try {
-          const response = await next;
-          return finalize(response.clone(), {
-            routeId: match.route.id,
-            routePath: match.route.path,
-            routeMode: "app",
-          });
-        } finally {
-          appInFlightRequests.delete(appCacheKey);
-        }
-      }
+      // The shared-cache boundary is applied INSIDE the route middleware
+      // chain (see renderAppRoute): a cache hit still executes every request
+      // middleware — auth gates, rate limits, audit hooks (TS-02). There is
+      // deliberately NO response-level single-flight sharing anymore (TS-03):
+      // joining a pending Response shared its Set-Cookie headers across
+      // concurrent cookieless requests, minting duplicate session cookies.
+      const responseCacheBoundary = cacheReadsPermitted
+        ? {
+            enabled: true,
+            read: async (): Promise<Response | null> => {
+              const pendingStore = appPendingStores.get(appCacheKey!);
+              if (pendingStore) {
+                await pendingStore;
+              }
+              const hit = await readCachedAppResponse(
+                appResponseCacheStore,
+                appCacheKey!,
+                c.req.raw,
+                method
+              );
+              return hit;
+            },
+            store: (response: Response) => {
+              if (method !== "GET" || !appCacheKey) {
+                return;
+              }
+              // maybeStoreAppResponse applies eligibility (status, cookies,
+              // cache-control, Vary, byte budget) and re-checks the epoch
+              // immediately before committing the entry.
+              const store = maybeStoreAppResponse(
+                appResponseCacheStore,
+                appCacheKey,
+                response,
+                appCacheMaxAge,
+                c.req.raw.headers.get("cache-control"),
+                () => appCacheEpoch === requestEpoch
+              ).catch(() => {});
+              appPendingStores.set(appCacheKey, store);
+              void store.then(() => {
+                if (appPendingStores.get(appCacheKey!) === store) {
+                  appPendingStores.delete(appCacheKey!);
+                }
+              });
+            },
+          }
+        : undefined;
 
       const response = await handleAppRouteRequest(
         c.req.raw,
@@ -921,7 +936,8 @@ export async function createServer(
         loaderDataCacheStore,
         requestTrace,
         hooks,
-        globalMiddleware
+        globalMiddleware,
+        responseCacheBoundary
       );
 
       if (isMutationMethod(method)) {
@@ -995,16 +1011,47 @@ export async function createServer(
     wss = new WSServer({ noServer: true });
     const httpServer = server as unknown as import("node:http").Server;
     httpServer.on("upgrade", (req, socket, head) => {
+      // The upgrade runs the configured path filter AND the pre-upgrade
+      // authorizer with a hard deadline (TS-28): the handshake is not part
+      // of the HTTP middleware chain, so without an explicit hook it is
+      // subject to no authorization at all. Fail closed on any outcome
+      // other than an explicit `true`.
+      const reject = () => socket.destroy();
       if (wsOptions.path) {
-        const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
-        if (pathname !== wsOptions.path) {
-          socket.destroy();
+        try {
+          const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+          if (pathname !== wsOptions.path) {
+            reject();
+            return;
+          }
+        } catch {
+          reject();
           return;
         }
       }
-      wss!.handleUpgrade(req, socket, head, (ws) => {
-        wss!.emit("connection", ws, req);
-      });
+      if (!wsOptions.authorize) {
+        wss!.handleUpgrade(req, socket, head, (ws) => {
+          wss!.emit("connection", ws, req);
+        });
+        return;
+      }
+      const timer = setTimeout(() => reject(), 5_000);
+      void (async () => {
+        try {
+          const allowed = await wsOptions.authorize!(req);
+          if (!allowed || socket.destroyed) {
+            reject();
+            return;
+          }
+          wss!.handleUpgrade(req, socket, head, (ws) => {
+            wss!.emit("connection", ws, req);
+          });
+        } catch {
+          reject();
+        } finally {
+          clearTimeout(timer);
+        }
+      })();
     });
   }
 
@@ -1013,26 +1060,52 @@ export async function createServer(
     server,
     wss,
     close: async () => {
-      await ssrServer?.close();
-      // Tear down WebSockets before draining HTTP. An upgraded WS socket is NOT an idle
-      // HTTP keep-alive, so server.close()/closeIdleConnections() won't reap it — a live
-      // client would otherwise hold the drain open until the caller's shutdown timeout.
-      // Forcibly terminate each live socket, then await the WS server's own close.
-      if (wss) {
-        for (const client of wss.clients) {
-          client.terminate();
-        }
-        await new Promise<void>((resolve) => wss!.close(() => resolve()));
+      // Shutdown order (TS-29): stop accepting and DRAIN in-flight requests
+      // first — they may still need the SSR runtime — then tear down the
+      // runtime. The previous order closed Vite first, failing every render
+      // still in flight. All stages run even when one fails; errors are
+      // combined so a failure in any stage is observable.
+      const teardown: Array<() => Promise<void>> = [
+        // Tear down WebSockets before draining HTTP. An upgraded WS socket is
+        // NOT an idle HTTP keep-alive, so server.close()/closeIdleConnections()
+        // won't reap it — a live client would otherwise hold the drain open
+        // until the caller's shutdown timeout. Forcibly terminate each live
+        // socket, then await the WS server's own close.
+        () =>
+          wss
+            ? (async () => {
+                for (const client of wss.clients) {
+                  client.terminate();
+                }
+                await new Promise<void>((resolve) => wss!.close(() => resolve()));
+              })()
+            : Promise.resolve(),
+        // Await server.close's callback so in-flight requests actually drain
+        // (a fire-and-forget resolved before any draining). Close idle
+        // keep-alive sockets so they don't hold the drain open indefinitely.
+        () =>
+          new Promise<void>((resolve, reject) => {
+            server.close((err) => (err ? reject(err) : resolve()));
+            (server as { closeIdleConnections?: () => void }).closeIdleConnections?.();
+          }),
+        // Last: the SSR runtime. Nothing still rendering depends on it now.
+        () => ssrServer?.close() ?? Promise.resolve(),
+      ];
+      const results = await Promise.allSettled(teardown.map((stage) => stage()));
+      const errors = results
+        .filter((r): r is PromiseRejectedResult => r.status === "rejected")
+        .map((r) => r.reason);
+      if (errors.length > 0) {
+        throw new AggregateError(errors, "Neutron server shutdown failed");
       }
-      // Await server.close's callback so in-flight requests actually drain
-      // (the previous fire-and-forget resolved before any draining). Close idle
-      // keep-alive sockets so they don't hold the drain open indefinitely.
-      await new Promise<void>((resolve) => {
-        server.close(() => resolve());
-        (server as { closeIdleConnections?: () => void }).closeIdleConnections?.();
-      });
     },
-    url: `http://${host}:${port}`,
+    url: (() => {
+      const address = server.address?.();
+      if (address && typeof address === "object" && "port" in address) {
+        return `http://${host}:${address.port}`;
+      }
+      return `http://${host}:${port}`;
+    })(),
   };
 }
 
@@ -1046,7 +1119,12 @@ async function handleAppRouteRequest(
   loaderDataCache: NeutronLoaderCacheStore,
   requestTrace: RequestTraceContext,
   hooks?: NeutronServerHooks,
-  globalMiddleware?: MiddlewareFn[]
+  globalMiddleware?: MiddlewareFn[],
+  responseCache?: {
+    enabled: boolean;
+    read: () => Promise<Response | null>;
+    store: (response: Response) => void;
+  }
 ): Promise<Response> {
   // Dev module-loading adapter: load every route/layout module through the
   // Vite SSR runtime, then hand the loaded map to the shared render core.
@@ -1064,6 +1142,7 @@ async function handleAppRouteRequest(
     requestTrace,
     hooks,
     globalMiddleware,
+    responseCache,
   });
 }
 
@@ -1130,29 +1209,31 @@ async function loadGlobalMiddleware(
   ssrServer: SsrServer,
   absolutePath: string
 ): Promise<MiddlewareFn[]> {
+  let mod: { default?: unknown; middleware?: unknown };
   try {
-    const mod = (await ssrServer.ssrLoadModule(absolutePath)) as {
+    mod = (await ssrServer.ssrLoadModule(absolutePath)) as {
       default?: unknown;
       middleware?: unknown;
     };
-    // Documented form: `export const middleware: MiddlewareFn[]`. Also
-    // accept a single function (default or named) for ergonomics.
-    const exported = mod.middleware ?? mod.default;
-    const list = normalizeMiddlewareExport(exported);
-    if (list.length === 0) {
-      console.warn(
-        exported === undefined
-          ? `Global middleware ${path.basename(absolutePath)}: no \`middleware\` or default export — ignoring.`
-          : `Global middleware ${path.basename(absolutePath)}: export is neither a function nor an array of functions — ignoring.`
-      );
-    }
-    return list;
   } catch (error) {
-    console.warn(
+    // A file that exists but cannot be imported is a startup error (TS-01):
+    // continuing without it silently removes whatever gate it carried.
+    throw new Error(
       `Failed to load global middleware ${path.basename(absolutePath)}: ${String(error)}`
     );
-    return [];
   }
+  // Documented form: `export const middleware: MiddlewareFn[]`. Also
+  // accept a single function (default or named) for ergonomics. An export
+  // that exists but is not usable is likewise a startup error.
+  const exported = mod.middleware ?? mod.default;
+  const list = normalizeMiddlewareExport(exported);
+  if (list.length === 0 || (Array.isArray(exported) && exported.length !== list.length)) {
+    throw new TypeError(
+      `Global middleware ${path.basename(absolutePath)}: expected \`middleware\` or default ` +
+        `export of a function or an array of functions (got ${typeof exported}).`
+    );
+  }
+  return list;
 }
 
 function normalizeMiddlewareExport(exported: unknown): MiddlewareFn[] {
@@ -1172,6 +1253,14 @@ function loadRouteModule(
   if (!pending) {
     pending = ssrServer.ssrLoadModule(routeFile).then((loaded) => loaded as RouteModule);
     moduleCache.set(routeFile, pending);
+    // A rejected import must not poison the route for the process lifetime
+    // (TS-29): delete the cached promise on failure (only if it is still the
+    // same one) so a transient load error can be retried on the next request.
+    void pending.catch(() => {
+      if (moduleCache.get(routeFile) === pending) {
+        moduleCache.delete(routeFile);
+      }
+    });
   }
   return pending;
 }
@@ -1358,7 +1447,23 @@ function loadStaticRouteHeaders(distDir: string): Map<string, Record<string, str
 function buildAppCacheKey(request: Request, pathname: string): string {
   const url = new URL(request.url);
   const variant = isJsonRequest(request) ? "json" : "html";
-  return `${variant}:${pathname}${url.search}`;
+  // The key must carry every representation dimension the response can vary
+  // on (TS-04): origin (multi-host apps), Accept-Language (loader
+  // personalization), and the partial-data selection headers the render core
+  // honors (X-Neutron-Data / X-Neutron-Routes). Without them one variant's
+  // body can answer another variant's request.
+  const acceptLanguage = request.headers.get("accept-language") ?? "";
+  const dataHeader = request.headers.get("x-neutron-data") ?? "";
+  const routesHeader = request.headers.get("x-neutron-routes") ?? "";
+  return [
+    variant,
+    url.origin,
+    pathname,
+    url.search,
+    acceptLanguage,
+    dataHeader,
+    routesHeader,
+  ].join("\n");
 }
 
 /**
@@ -1479,18 +1584,42 @@ async function readCachedAppResponse(
     });
   }
 
-  return new Response(entry.body, {
+  // Byte-exact restore: hand the Response the exact stored octets. The
+  // copy (slice) guards the stored entry against any downstream mutation of
+  // the view; the buffer is a plain ArrayBuffer (entries are built from
+  // arrayBuffer()).
+  const body = entry.body.slice();
+  return new Response(body.buffer as ArrayBuffer, {
     status: entry.status,
     statusText: entry.statusText,
     headers,
   });
 }
 
+/** Parse a Cache-Control header into lowercase directive names → values. */
+function cacheControlDirectives(value: string | null): Map<string, string> {
+  return new Map(
+    (value ?? "")
+      .split(",")
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .map((part) => {
+        const [name, ...rest] = part.split("=");
+        return [name.toLowerCase(), rest.join("=").replace(/^"|"$/g, "")];
+      })
+  );
+}
+
+/** Per-entry byte budget for a cached response body (TS-06). */
+const APP_CACHE_MAX_BODY_BYTES = 2 * 1024 * 1024;
+
 async function maybeStoreAppResponse(
   cache: NeutronAppCacheStore,
   key: string,
   response: Response,
-  maxAgeSec: number
+  maxAgeSec: number,
+  requestCacheControl: string | null,
+  stillValid: () => boolean
 ): Promise<void> {
   if (maxAgeSec <= 0 || response.status !== 200) {
     return;
@@ -1500,8 +1629,20 @@ async function maybeStoreAppResponse(
     return;
   }
 
-  const cacheControl = response.headers.get("Cache-Control") || "";
-  if (cacheControl.includes("no-store") || cacheControl.includes("private")) {
+  // Full Cache-Control policy, parsed case-insensitively (TS-05): the old
+  // substring test missed `NO-STORE`, `no-cache`, and request-side
+  // directives entirely.
+  const requestDirectives = cacheControlDirectives(requestCacheControl);
+  const responseDirectives = cacheControlDirectives(
+    response.headers.get("Cache-Control")
+  );
+  if (
+    requestDirectives.has("no-store") ||
+    requestDirectives.has("no-cache") ||
+    responseDirectives.has("private") ||
+    responseDirectives.has("no-store") ||
+    responseDirectives.has("no-cache")
+  ) {
     return;
   }
 
@@ -1513,15 +1654,63 @@ async function maybeStoreAppResponse(
     return;
   }
 
-  const body = await response.clone().text();
+  // Vary: the stored entry is keyed on a fixed representation set (variant +
+  // origin + accept-language + neutron data headers). Any other Vary field —
+  // or `Vary: *` — means this response cannot be safely reused for that key.
+  const varyFields = (response.headers.get("Vary") ?? "")
+    .split(",")
+    .map((field) => field.trim().toLowerCase())
+    .filter(Boolean);
+  const keyableVary = new Set(["accept", "accept-language", "x-neutron-data", "x-neutron-routes"]);
+  if (varyFields.some((field) => field === "*" || !keyableVary.has(field))) {
+    return;
+  }
+
+  // Cap the stored freshness by the response's own explicit lifetime, when
+  // it declares one (TS-05).
+  let effectiveMaxAge = maxAgeSec;
+  const declared =
+    responseDirectives.get("s-maxage") ?? responseDirectives.get("max-age");
+  if (declared !== undefined) {
+    if (!/^\d+$/.test(declared)) {
+      return;
+    }
+    const declaredSec = Number(declared);
+    if (!Number.isSafeInteger(declaredSec) || declaredSec <= 0) {
+      return;
+    }
+    effectiveMaxAge = Math.min(effectiveMaxAge, declaredSec);
+  }
+
+  // Byte-exact body capture (TS-06): arrayBuffer() copies the response's
+  // octets verbatim — no text transcoding — and the byte budget bounds a
+  // single entry's memory. Content-Length is validated against the actual
+  // bytes so the stored headers always describe the stored body.
+  const declaredLength = Number(response.headers.get("Content-Length") || "0");
+  if (Number.isFinite(declaredLength) && declaredLength > APP_CACHE_MAX_BODY_BYTES) {
+    return;
+  }
+  const body = new Uint8Array(await response.clone().arrayBuffer());
+  if (body.byteLength > APP_CACHE_MAX_BODY_BYTES) {
+    return;
+  }
+
+  // Generation fence (TS-07): checked immediately before the (synchronous
+  // for the memory store) insertion. A mutation that invalidated this path
+  // while the body drained must win.
+  if (!stillValid()) {
+    return;
+  }
+
   const headers = new Headers(response.headers);
   if (!headers.has("Cache-Control")) {
-    headers.set("Cache-Control", `public, max-age=${maxAgeSec}`);
+    headers.set("Cache-Control", `public, max-age=${effectiveMaxAge}`);
   }
   if (!headers.has("ETag")) {
     headers.set("ETag", createEntityTag(body));
   }
   headers.set("x-neutron-cache", "MISS");
+  headers.set("Content-Length", String(body.byteLength));
   const headerPairs: [string, string][] = [];
   headers.forEach((value, name) => {
     headerPairs.push([name, value]);
@@ -1532,7 +1721,7 @@ async function maybeStoreAppResponse(
     statusText: response.statusText,
     headers: headerPairs,
     body,
-    expiresAt: Date.now() + maxAgeSec * 1000,
+    expiresAt: Date.now() + effectiveMaxAge * 1000,
   });
 }
 
@@ -1558,7 +1747,7 @@ async function createSsrServer(
   rootDir: string,
   routesDir: string,
   runtime: NeutronRuntime
-): Promise<SsrServer | null> {
+): Promise<SsrServer> {
   try {
     const vite = await import("vite");
     const hmrPort = await getFreePort();
@@ -1595,8 +1784,11 @@ async function createSsrServer(
       close: () => viteServer.close(),
     };
   } catch (error) {
-    console.warn("Failed to initialize Vite SSR runtime:", error);
-    return null;
+    // Propagate (TS-01): callers only start an SSR runtime when routes or a
+    // global middleware require it, so a failure here means the app cannot
+    // serve correctly. Swallowing it produced a static-only server whose
+    // gates never ran.
+    throw new Error(`Failed to initialize Vite SSR runtime: ${String(error)}`);
   }
 }
 
