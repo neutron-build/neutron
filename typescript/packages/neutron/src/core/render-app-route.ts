@@ -72,6 +72,18 @@ export interface RenderAppRouteOptions {
   requestTrace: RenderRequestTrace;
   hooks?: RenderHooks;
   globalMiddleware?: MiddlewareFn[];
+  /**
+   * Shared app-response cache boundary, consulted INSIDE the middleware chain
+   * so a cache hit still executes every request middleware (auth, rate limits,
+   * audit). `enabled` is the caller's method/policy gate; `read` returns a
+   * ready-to-send Response on a hit; `store` is fire-and-forget and applies
+   * its own eligibility checks. (TS-02)
+   */
+  responseCache?: {
+    enabled: boolean;
+    read: () => Promise<Response | null>;
+    store: (response: Response) => void;
+  };
 }
 
 export function toError(value: unknown): Error {
@@ -265,9 +277,26 @@ async function resolveRouteHeaders(
 
     const resolved = await mod.headers(args);
     const next = toHeaders(resolved);
+    // Set-Cookie is multi-valued: `headers.set` replaces, so a route (or a
+    // parent layout) setting two cookies — or a deletion cookie alongside a
+    // new session cookie — would silently drop all but the last. Append
+    // cookies; ordinary singleton headers keep set() semantics. (TS-18)
     next.forEach((value, name) => {
-      headers.set(name, value);
+      if (name.toLowerCase() !== "set-cookie") {
+        headers.set(name, value);
+      }
     });
+    const setCookie = (next as Headers & { getSetCookie?: () => string[] }).getSetCookie?.();
+    if (setCookie) {
+      for (const cookie of setCookie) {
+        headers.append("Set-Cookie", cookie);
+      }
+    } else {
+      const single = next.get("Set-Cookie");
+      if (single) {
+        headers.append("Set-Cookie", single);
+      }
+    }
   }
 
   return headers;
@@ -533,30 +562,52 @@ function streamHtmlDocument(
   prefix: string,
   suffix: string
 ): ReadableStream<Uint8Array> {
+  // Pull-based: one upstream chunk is read per downstream pull, so a slow or
+  // abandoned consumer backpressures the renderer instead of letting the old
+  // `start()` loop drain it eagerly into an unbounded queue. `cancel` stops
+  // the upstream render when the consumer goes away. (TS-24)
+  const enc = TEXT_ENCODER;
+  let phase: "prefix" | "first" | "body" | "done" = "prefix";
+  let released = false;
+  const release = () => {
+    if (!released) {
+      released = true;
+      reader.releaseLock();
+    }
+  };
   return new ReadableStream<Uint8Array>({
-    async start(controller) {
-      controller.enqueue(TEXT_ENCODER.encode(prefix));
+    async pull(controller) {
       try {
-        if (!firstChunk.done) {
-          if (firstChunk.value) {
-            controller.enqueue(firstChunk.value);
-          }
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) {
-              break;
-            }
-            if (value) {
-              controller.enqueue(value);
-            }
-          }
+        if (phase === "prefix") {
+          phase = "first";
+          controller.enqueue(enc.encode(prefix));
+          return;
         }
-        controller.enqueue(TEXT_ENCODER.encode(suffix));
-        controller.close();
+        if (phase === "done") {
+          return;
+        }
+        const result = phase === "first" ? firstChunk : await reader.read();
+        phase = "body";
+        if (result.done) {
+          phase = "done";
+          controller.enqueue(enc.encode(suffix));
+          controller.close();
+          release();
+        } else if (result.value) {
+          controller.enqueue(result.value);
+        }
       } catch (error) {
+        phase = "done";
+        release();
         controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      phase = "done";
+      try {
+        await reader.cancel(reason);
       } finally {
-        reader.releaseLock();
+        release();
       }
     },
   });
@@ -643,8 +694,16 @@ async function renderAppRouteHtmlResponse(
   // Guard the first streamed bytes before the shell prefix is emitted, so a
   // full-document render (nested <html>/<body> inside #app) fails as a clean
   // error response rather than shipping malformed, doubly-hydrated markup.
+  // A throw here must also cancel the reader — an abandoned stream pins the
+  // renderer's underlying work. (TS-24)
   if (!firstChunk.done && firstChunk.value) {
-    assertRenderedFragment(decodeChunkStart(firstChunk.value), args.sourceFile);
+    try {
+      assertRenderedFragment(decodeChunkStart(firstChunk.value), args.sourceFile);
+    } catch (error) {
+      await reader.cancel(error).catch(() => {});
+      reader.releaseLock();
+      throw error;
+    }
   }
 
   const body = streamHtmlDocument(reader, firstChunk, shellPrefix, shellSuffix);
@@ -671,6 +730,7 @@ export async function renderAppRoute(
     requestTrace,
     hooks,
     globalMiddleware,
+    responseCache,
   } = opts;
   const allRoutes = [...match.layouts, match.route];
   const clientTier = resolveClientTier(allRoutes);
@@ -687,7 +747,12 @@ export async function renderAppRoute(
   }
   const context: AppContext = {};
 
-  return runMiddlewareChain(middlewares, request, context, async () => {
+  // The terminal render body, factored out so the shared-cache boundary can
+  // sit INSIDE the middleware chain: a cache hit still runs every request
+  // middleware (auth gates, rate limits, audit hooks). Consulting the cache
+  // outside the chain let an authenticated fill be replayed to a request that
+  // never executed its authorization middleware. (TS-02)
+  const renderRouteBody = async (): Promise<Response> => {
     let actionData: unknown = undefined;
     const pageModule = routeModules.get(match.route.id);
     const requestedRouteIds = resolveRequestedDataRouteIds(
@@ -696,11 +761,33 @@ export async function renderAppRoute(
       isMutationMethod(request.method)
     );
 
+    const method = request.method.toUpperCase();
+    const isReadMethod = method === "GET" || method === "HEAD";
+    const isMutationMethodRequest = isMutationMethod(method);
+
+    // Method dispatch (TS-27): only methods the route actually supports may
+    // run. A loader-only resource route answered every non-mutation method
+    // (OPTIONS/TRACE invoked the loader); a component route without an action
+    // rendered a success document for a POST. Both conceal the real outcome —
+    // a 405 with an Allow header says what is actually supported.
+    if (!isReadMethod && !isMutationMethodRequest) {
+      return new Response(null, {
+        status: 405,
+        headers: { Allow: "GET, HEAD" },
+      });
+    }
+    if (isMutationMethodRequest && !pageModule?.action) {
+      return new Response(null, {
+        status: 405,
+        headers: { Allow: "GET, HEAD" },
+      });
+    }
+
     if (!pageModule?.default) {
       // Resource route: a module with no component can still serve — its
-      // loader (GET) or action (mutations) must produce a raw Response
+      // loader (GET/HEAD) or action (mutations) must produce a raw Response
       // (returned or thrown). Anything else has nothing to render → 404.
-      const handler = isMutationMethod(request.method) ? pageModule?.action : pageModule?.loader;
+      const handler = isMutationMethodRequest ? pageModule?.action : pageModule?.loader;
       if (handler) {
         try {
           const result = await handler({ request, params: match.params, context });
@@ -842,12 +929,19 @@ export async function renderAppRoute(
         startedAt: loaderStartedAt,
       });
 
-      const routeParams = route.id === match.route.id ? match.params : {};
+      // Layout loaders receive the full matched params, same as the leaf —
+      // a dynamic `/orgs/:orgId` layout cannot read its own segment if only
+      // the leaf gets `match.params`. (TS-25)
+      const routeParams = { ...match.params };
       const loaderCacheMaxAge = route.config.cache?.loaderMaxAge ?? 0;
       const canCacheLoaderData =
         loaderCacheMaxAge > 0 && isLoaderDataCacheableRequest(request);
       const canReadLoaderCache =
         canCacheLoaderData && isLoaderDataCacheReadableMethod(request.method);
+      // Writes are GET/HEAD only (TS-07): a mutation-method loader run
+      // happens mid-action-pipeline and its result can publish AFTER the
+      // action's cache invalidation, resurrecting the pre-mutation view.
+      const canWriteLoaderCache = canReadLoaderCache;
       const loaderCacheKey = canCacheLoaderData
         ? buildLoaderDataCacheKey(request, route.id, routeParams)
         : null;
@@ -886,7 +980,7 @@ export async function renderAppRoute(
         if (data instanceof Response) {
           return { routeId: route.id, data: undefined, response: data };
         }
-        if (loaderCacheKey) {
+        if (loaderCacheKey && canWriteLoaderCache) {
           await storeLoaderDataCache(
             loaderDataCache,
             loaderCacheKey,
@@ -960,7 +1054,10 @@ export async function renderAppRoute(
       if ((result as { response?: Response }).response) {
         return (result as { response: Response }).response;
       }
-      if (result.error) {
+      // Property presence, not truthiness: `throw null` / `throw 0` /
+      // `throw ""` are falsy thrown values that must still take the error
+      // path rather than silently render with null data. (TS-26)
+      if ("error" in result) {
         if (isProblemError(result.error)) {
           return result.error.toResponse(new URL(request.url).pathname);
         }
@@ -1105,5 +1202,19 @@ export async function renderAppRoute(
         stylesheetHrefs
       );
     }
+  };
+
+  return runMiddlewareChain(middlewares, request, context, async () => {
+    if (responseCache?.enabled) {
+      const hit = await responseCache.read();
+      if (hit) {
+        return hit;
+      }
+    }
+    const response = await renderRouteBody();
+    if (responseCache?.enabled) {
+      responseCache.store(response);
+    }
+    return response;
   });
 }
