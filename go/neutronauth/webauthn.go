@@ -3,6 +3,7 @@ package neutronauth
 import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -215,6 +216,14 @@ func (s *WebAuthnService) BeginRegistration(userID, userName, displayName string
 
 // FinishRegistration verifies the browser's RegistrationResponse, extracts
 // the P-256 public key, and stores the credential.
+//
+// SECURITY: the attestation-object parse below is a byte-scanning scaffold,
+// NOT a CBOR/WebAuthn verifier — it does not validate the attestation
+// statement's relationship to the credential, authenticator flags, or COSE
+// algorithm semantics. Registration ceremonies must not be exposed to
+// untrusted clients until this is replaced with a complete WebAuthn
+// implementation (audit GO-16, deferred: the fix is a full library
+// integration, which is an API/dependency decision rather than a patch).
 func (s *WebAuthnService) FinishRegistration(userID string, resp RegistrationResponse) (*WebAuthnCredential, error) {
 	// 1. Retrieve the stored challenge.
 	challenge, err := s.store.GetChallenge("reg:" + userID)
@@ -366,6 +375,23 @@ func (s *WebAuthnService) FinishAuthentication(userID string, resp Authenticatio
 		return nil, fmt.Errorf("neutronauth: decode authenticatorData: %w", err)
 	}
 
+	// Authenticator-data structure checks (GO-17): the minimum length is
+	// rpIdHash(32) + flags(1) + signCount(4) = 37 bytes; the RP ID hash must
+	// match this relying party (a signature from a credential minted for a
+	// different RP is otherwise accepted on signature alone); and the UP
+	// (user presence) flag must be set.
+	if len(authData) < 37 {
+		return nil, fmt.Errorf("neutronauth: authenticatorData too short (%d bytes)", len(authData))
+	}
+	rpIDHash := sha256.Sum256([]byte(s.config.RPID))
+	if !hmac.Equal(authData[:32], rpIDHash[:]) {
+		return nil, fmt.Errorf("neutronauth: authenticatorData RP ID hash mismatch")
+	}
+	const flagUP = 0x01
+	if authData[32]&flagUP == 0 {
+		return nil, fmt.Errorf("neutronauth: user presence flag not set in authenticatorData")
+	}
+
 	clientDataHash := sha256.Sum256(clientDataBytes)
 	signedData := make([]byte, len(authData)+len(clientDataHash))
 	copy(signedData, authData)
@@ -386,16 +412,22 @@ func (s *WebAuthnService) FinishAuthentication(userID string, resp Authenticatio
 	}
 
 	// 5. Update the signature counter (clone detection).
-	if len(authData) >= 37 {
-		newCount := uint32(authData[33])<<24 | uint32(authData[34])<<16 |
-			uint32(authData[35])<<8 | uint32(authData[36])
-		if newCount > 0 && newCount <= matched.SignCount {
-			return nil, fmt.Errorf("neutronauth: signature counter regression (possible cloned authenticator)")
+	//
+	// A zero new counter is allowed (synced passkeys legitimately use zero
+	// counters); the regression check fires only when both stored and new
+	// counters are positive. A FAILED counter update fails the login
+	// (GO-17): succeeding silently would leave the stored security state
+	// stale, which is exactly what the counter exists to prevent.
+	newCount := uint32(authData[33])<<24 | uint32(authData[34])<<16 |
+		uint32(authData[35])<<8 | uint32(authData[36])
+	if newCount > 0 && matched.SignCount > 0 && newCount <= matched.SignCount {
+		return nil, fmt.Errorf("neutronauth: signature counter regression (possible cloned authenticator)")
+	}
+	if newCount > matched.SignCount {
+		if err := s.store.UpdateSignCount(matched.CredentialID, newCount); err != nil {
+			return nil, fmt.Errorf("neutronauth: persist signature counter: %w", err)
 		}
-		if newCount > matched.SignCount {
-			_ = s.store.UpdateSignCount(matched.CredentialID, newCount)
-			matched.SignCount = newCount
-		}
+		matched.SignCount = newCount
 	}
 
 	return matched, nil

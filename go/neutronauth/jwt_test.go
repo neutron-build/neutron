@@ -1,14 +1,17 @@
 package neutronauth
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 )
 
+
 func TestGenerateAndParseToken(t *testing.T) {
-	secret := "test-secret-key-256-bits-long!!"
+	secret := "test-secret-key-256-bits-long-enough!"
 	claims := Claims{"sub": "user123", "role": "admin"}
 
 	token, err := GenerateToken(claims, secret, time.Hour)
@@ -32,22 +35,24 @@ func TestGenerateAndParseToken(t *testing.T) {
 }
 
 func TestParseTokenExpired(t *testing.T) {
-	secret := "test-secret"
-	claims := Claims{"sub": "user123"}
+	secret := "test-secret-0123456789abcdef0123456789abcdef"
 
-	token, err := GenerateToken(claims, secret, -time.Hour) // expired
-	if err != nil {
-		t.Fatalf("GenerateToken: %v", err)
-	}
+	// GenerateToken refuses non-positive lifetimes (GO-15), so an expired
+	// token is minted by signing one directly with a past exp.
+	claims := Claims{"sub": "user123", "exp": time.Now().Add(-time.Hour).Unix()}
+	payload, _ := json.Marshal(claims)
+	encoded := base64.RawURLEncoding.EncodeToString(payload)
+	signingInput := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`)) + "." + encoded
+	token := signingInput + "." + sign(signingInput, secret)
 
-	_, err = ParseToken(token, secret)
+	_, err := ParseToken(token, secret)
 	if err == nil {
 		t.Fatal("expected error for expired token")
 	}
 }
 
 func TestParseTokenInvalidSignature(t *testing.T) {
-	secret := "test-secret"
+	secret := "test-secret-0123456789abcdef0123456789abcdef"
 	token, _ := GenerateToken(Claims{"sub": "user"}, secret, time.Hour)
 
 	_, err := ParseToken(token, "wrong-secret")
@@ -57,14 +62,14 @@ func TestParseTokenInvalidSignature(t *testing.T) {
 }
 
 func TestParseTokenInvalidFormat(t *testing.T) {
-	_, err := ParseToken("not-a-jwt", "secret")
+	_, err := ParseToken("not-a-jwt", "test-secret-0123456789abcdef0123456789abcdef")
 	if err == nil {
 		t.Fatal("expected error for invalid format")
 	}
 }
 
 func TestJWTMiddleware(t *testing.T) {
-	secret := "test-secret"
+	secret := "test-secret-0123456789abcdef0123456789abcdef"
 	token, _ := GenerateToken(Claims{"sub": "user123"}, secret, time.Hour)
 
 	handler := JWTMiddleware(secret)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -89,7 +94,7 @@ func TestJWTMiddleware(t *testing.T) {
 }
 
 func TestJWTMiddlewareMissingHeader(t *testing.T) {
-	handler := JWTMiddleware("secret")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := JWTMiddleware("test-secret-0123456789abcdef0123456789abcdef")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("should not reach handler")
 	}))
 
@@ -103,7 +108,7 @@ func TestJWTMiddlewareMissingHeader(t *testing.T) {
 }
 
 func TestJWTMiddlewareSkipPaths(t *testing.T) {
-	handler := JWTMiddleware("secret", WithSkipPaths("/health"))(
+	handler := JWTMiddleware("test-secret-0123456789abcdef0123456789abcdef", WithSkipPaths("/health"))(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 		}),

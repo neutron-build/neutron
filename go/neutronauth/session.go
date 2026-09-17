@@ -165,13 +165,16 @@ func SessionMiddleware(store SessionStore, opts ...SessionOption) neutron.Middle
 			// so it reflects what the handler did to the session. Writing it
 			// here, before `next`, is what made Regenerate and Destroy unable
 			// to change what the browser holds.
-			sw := &sessionWriter{ResponseWriter: w, finalize: func() {
-				// WithoutCancel: a client that disconnects mid-response must
-				// not abort the store writes. Otherwise a dropped connection
-				// during login leaves the previous session ID undeleted and
-				// still valid — the fixation window this rotation exists to
-				// close.
-				finalizeSession(context.WithoutCancel(r.Context()), r, w, sess, &o)
+			//
+			// The finalize context stays detached from client cancellation
+			// (a disconnect mid-login must not abort the store writes) but is
+			// BOUNDED (GO-21): a stuck store cannot hold header commitment
+			// open forever.
+			sw := &sessionWriter{ResponseWriter: w, req: r, finalize: func() error {
+				cleanup, cancel := context.WithTimeout(
+					context.WithoutCancel(r.Context()), sessionCleanupBudget)
+				defer cancel()
+				return finalizeSession(cleanup, r, w, sess, &o)
 			}}
 			ctx := context.WithValue(r.Context(), ctxKeySession, sess)
 			// Deferred: a panicking handler still has to rotate or destroy its
@@ -184,13 +187,19 @@ func SessionMiddleware(store SessionStore, opts ...SessionOption) neutron.Middle
 	}
 }
 
+// sessionCleanupBudget bounds detached session cleanup (GO-21).
+const sessionCleanupBudget = 5 * time.Second
+
 // finalizeSession reconciles storage and the cookie with what the handler did.
 //
-// It runs at most once per request, at the moment the headers are committed.
-// Storage errors here cannot be returned to the caller — the status is already
-// decided — so they are reported through the error handler for observability
-// and the cookie is still written.
-func finalizeSession(ctx context.Context, r *http.Request, w http.ResponseWriter, s *Session, o *sessionOpts) {
+// It runs at most once per request, at the moment the headers are committed —
+// and BEFORE the status is forwarded, so a persistence failure is RETURNED
+// (GO-20): sessionWriter replaces the response with a generic 503 and
+// suppresses the handler's body and cookie. A login whose rotation or
+// revocation failed must not be acknowledged with a success status. Raw
+// store errors stay out of the response; the onCommitError hook still fires
+// for observability.
+func finalizeSession(ctx context.Context, r *http.Request, w http.ResponseWriter, s *Session, o *sessionOpts) error {
 	switch {
 	case s.destroyed:
 		// Delete both ends: Destroy removed the current ID, but a handler that
@@ -198,26 +207,35 @@ func finalizeSession(ctx context.Context, r *http.Request, w http.ResponseWriter
 		if s.originalID != "" && s.originalID != s.ID {
 			if err := s.store.Delete(ctx, s.originalID); err != nil {
 				o.onCommitError(r, err)
+				return errFailedSessionCommit
 			}
 		}
 		http.SetCookie(w, sessionCookieFor(o, "", -1))
-		return
+		return nil
 
 	case s.ID != s.originalID:
 		// Rotation completes here so Regenerate alone is sufficient: the data
-		// moves to the new ID and the old record stops resolving.
+		// moves to the new ID and the old record stops resolving. Both writes
+		// must succeed before success is acknowledged.
 		if err := s.store.Set(ctx, s.ID, s.Data, s.ttl); err != nil {
 			o.onCommitError(r, err)
+			return errFailedSessionCommit
 		}
 		if s.originalID != "" {
 			if err := s.store.Delete(ctx, s.originalID); err != nil {
 				o.onCommitError(r, err)
+				return errFailedSessionCommit
 			}
 		}
 	}
 
 	http.SetCookie(w, sessionCookieFor(o, s.ID, int(o.ttl.Seconds())))
+	return nil
 }
+
+// errFailedSessionCommit marks a failed commit; the client-visible response
+// is a generic 503 problem document.
+var errFailedSessionCommit = errors.New("session commit failed")
 
 func sessionCookieFor(o *sessionOpts, value string, maxAge int) *http.Cookie {
 	return &http.Cookie{
@@ -237,10 +255,20 @@ func sessionCookieFor(o *sessionOpts, value string, maxAge int) *http.Cookie {
 // It forwards the optional ResponseWriter interfaces rather than hiding them:
 // a wrapper that drops Flush breaks SSE, and one that drops Hijack breaks
 // WebSocket upgrades, both silently.
+//
+// A finalize FAILURE fails the commit closed (GO-20): the handler's status is
+// replaced by a generic 503 problem document, the cookie is never written,
+// and the handler's body writes are suppressed — they would otherwise append
+// to an error response whose status says something else. Informational 1xx
+// responses (early hints) are forwarded WITHOUT committing the session: the
+// final response is still coming (GO-21).
 type sessionWriter struct {
 	http.ResponseWriter
-	finalize  func()
+	req       *http.Request
+	finalize  func() error
 	committed bool
+	// failed marks a commit that answered 503; subsequent writes are swallowed.
+	failed bool
 }
 
 func (w *sessionWriter) commit() {
@@ -248,16 +276,36 @@ func (w *sessionWriter) commit() {
 		return
 	}
 	w.committed = true
-	w.finalize()
+	if err := w.finalize(); err != nil {
+		// Nothing has been forwarded yet — the 503 is the response.
+		w.failed = true
+		neutron.WriteError(w.ResponseWriter, w.req, neutron.ErrServiceUnavailable("session persistence failed"))
+	}
 }
 
 func (w *sessionWriter) WriteHeader(code int) {
+	// Informational responses do not commit the final response; only the
+	// protocol switch (101) does, via Hijack.
+	if code >= 100 && code < 200 && code != http.StatusSwitchingProtocols {
+		w.ResponseWriter.WriteHeader(code)
+		return
+	}
 	w.commit()
+	if w.failed {
+		return
+	}
 	w.ResponseWriter.WriteHeader(code)
 }
 
 func (w *sessionWriter) Write(b []byte) (int, error) {
-	w.commit()
+	if !w.committed {
+		w.WriteHeader(http.StatusOK)
+	}
+	if w.failed {
+		// Swallow the handler's body: the 503 problem document already
+		// answered the request.
+		return len(b), nil
+	}
 	return w.ResponseWriter.Write(b)
 }
 
@@ -282,7 +330,13 @@ func (w *sessionWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 // ReadFrom keeps the sendfile fast path available to the underlying writer.
 func (w *sessionWriter) ReadFrom(src io.Reader) (int64, error) {
-	w.commit()
+	if !w.committed {
+		w.WriteHeader(http.StatusOK)
+	}
+	if w.failed {
+		// Discard the handler's body; the 503 already answered.
+		return io.Copy(io.Discard, src)
+	}
 	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
 		return rf.ReadFrom(src)
 	}
@@ -325,16 +379,11 @@ func WithSessionErrorHandler(fn func(http.ResponseWriter, *http.Request, error))
 // WithSessionCommitErrorHandler sets the handler invoked when the session store
 // fails while COMMITTING, after the handler has run.
 //
-// It deliberately receives no ResponseWriter. By that point the status is
-// already decided and the cookie has yet to be written, so anything that
-// writes to the response corrupts it — the default load-time handler writes
-// an error response, which would commit a 500 and body and then silently
-// drop the rotated session cookie. Withholding the writer makes that
-// mistake unexpressible rather than merely documented.
-//
-// Use it for logging and alerting. A commit failure is not recoverable in-band,
-// but it is worth knowing about: a failed delete of the previous session ID
-// leaves that ID valid until it expires.
+// It deliberately receives no ResponseWriter: the failure is handled by the
+// framework (a generic 503 problem document replaces the handler's response,
+// and the session cookie is suppressed — GO-20), so anything the hook writes
+// would corrupt that. Use it for logging and alerting: a failed rotation
+// means the client saw an error even though part of the write may have landed.
 func WithSessionCommitErrorHandler(fn func(*http.Request, error)) SessionOption {
 	return func(o *sessionOpts) { o.onCommitError = fn }
 }

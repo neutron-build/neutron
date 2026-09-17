@@ -8,7 +8,7 @@ import (
 )
 
 func TestRequireRolePasses(t *testing.T) {
-	secret := "secret"
+	secret := "test-secret-0123456789abcdef0123456789abcdef"
 	token, _ := GenerateToken(Claims{"sub": "user1", "role": "admin"}, secret, time.Hour)
 
 	handler := JWTMiddleware(secret)(
@@ -30,7 +30,7 @@ func TestRequireRolePasses(t *testing.T) {
 }
 
 func TestRequireRoleFails(t *testing.T) {
-	secret := "secret"
+	secret := "test-secret-0123456789abcdef0123456789abcdef"
 	token, _ := GenerateToken(Claims{"sub": "user1", "role": "viewer"}, secret, time.Hour)
 
 	handler := JWTMiddleware(secret)(
@@ -66,7 +66,7 @@ func TestRequireRoleNoClaims(t *testing.T) {
 }
 
 func TestRequirePermissionPasses(t *testing.T) {
-	secret := "secret"
+	secret := "test-secret-0123456789abcdef0123456789abcdef"
 	token, _ := GenerateToken(Claims{
 		"sub":         "user1",
 		"permissions": []any{"read", "write", "delete"},
@@ -91,7 +91,7 @@ func TestRequirePermissionPasses(t *testing.T) {
 }
 
 func TestRequirePermissionFails(t *testing.T) {
-	secret := "secret"
+	secret := "test-secret-0123456789abcdef0123456789abcdef"
 	token, _ := GenerateToken(Claims{
 		"sub":         "user1",
 		"permissions": []any{"read"},

@@ -1,6 +1,8 @@
 package neutronauth
 
 import (
+	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -8,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -202,7 +205,15 @@ func hmacSign(payload string, secret []byte) string {
 // ---------------------------------------------------------------------------
 
 func (p *OAuthProvider) authorizationURL(state, challenge string) string {
-	v := url.Values{}
+	// Parse and rebuild rather than appending an unconditional "?" (GO-19):
+	// an authorization endpoint that already carries a query string would
+	// otherwise produce a malformed `...?a=b?c=d` URL.
+	base, err := url.Parse(p.AuthURL)
+	if err != nil {
+		// Configuration error; the malformed URL will fail loudly at redirect.
+		return p.AuthURL + "?" + state
+	}
+	v := base.Query()
 	v.Set("response_type", "code")
 	v.Set("client_id", p.ClientID)
 	v.Set("redirect_uri", p.RedirectURL)
@@ -210,7 +221,8 @@ func (p *OAuthProvider) authorizationURL(state, challenge string) string {
 	v.Set("state", state)
 	v.Set("code_challenge", challenge)
 	v.Set("code_challenge_method", "S256")
-	return p.AuthURL + "?" + v.Encode()
+	base.RawQuery = v.Encode()
+	return base.String()
 }
 
 // ---------------------------------------------------------------------------
@@ -227,8 +239,32 @@ type tokenResponse struct {
 	Scope        string `json:"scope,omitempty"`
 }
 
+// oauthHTTPClient is the bounded client for all provider calls (GO-19): the
+// default client has no timeout, so a slow provider held request resources
+// indefinitely. Owned here rather than mutating http.DefaultClient.
+var oauthHTTPClient = &http.Client{Timeout: 10 * time.Second}
+
+// validate checks the provider configuration at flow start (GO-18/GO-19): a
+// provider with no UserInfoURL cannot establish a verified user identity —
+// the removed fallback DERIVED one from an access-token prefix, which
+// collided across users whose tokens shared a header prefix. A state-signing
+// secret shorter than 32 bytes is rejected too.
+func (p *OAuthProvider) validate() error {
+	if p.UserInfoURL == "" {
+		return fmt.Errorf(
+			"provider %q has no UserInfoURL: a verified userinfo endpoint is required " +
+				"to establish user identity (token-derived identities are not)",
+			p.ProviderName,
+		)
+	}
+	if len(p.Secret) < 32 {
+		return fmt.Errorf("provider %q: state-signing Secret must be at least 32 bytes of high-entropy key material", p.ProviderName)
+	}
+	return nil
+}
+
 // exchangeCode sends the authorization code to the token endpoint and returns tokens.
-func (p *OAuthProvider) exchangeCode(code, codeVerifier string) (*tokenResponse, error) {
+func (p *OAuthProvider) exchangeCode(ctx context.Context, code, codeVerifier string) (*tokenResponse, error) {
 	data := url.Values{}
 	data.Set("grant_type", "authorization_code")
 	data.Set("code", code)
@@ -237,36 +273,37 @@ func (p *OAuthProvider) exchangeCode(code, codeVerifier string) (*tokenResponse,
 	data.Set("client_secret", p.ClientSecret)
 	data.Set("code_verifier", codeVerifier)
 
-	req, err := http.NewRequest(http.MethodPost, p.TokenURL, strings.NewReader(data.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.TokenURL, strings.NewReader(data.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("neutronauth: build token request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := oauthHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("neutronauth: token exchange request: %w", err)
 	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MiB limit
+	body, err := readProviderBody(resp.Body, 1<<20)
 	if err != nil {
 		return nil, fmt.Errorf("neutronauth: read token response: %w", err)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("neutronauth: token endpoint returned %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("neutronauth: token endpoint returned %d", resp.StatusCode)
 	}
 
-	// Some providers (GitHub) may return form-encoded instead of JSON.
+	// Some providers (GitHub) may return form-encoded instead of JSON. Trim
+	// leading whitespace before classifying (GO-19): the old first-byte test
+	// misparsed whitespace-prefixed JSON as form data.
+	trimmed := bytes.TrimSpace(body)
 	var tok tokenResponse
-	if len(body) > 0 && body[0] == '{' {
-		if err := json.Unmarshal(body, &tok); err != nil {
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		if err := json.Unmarshal(trimmed, &tok); err != nil {
 			return nil, fmt.Errorf("neutronauth: unmarshal token response: %w", err)
 		}
 	} else {
-		parsed, parseErr := url.ParseQuery(string(body))
+		parsed, parseErr := url.ParseQuery(string(trimmed))
 		if parseErr != nil {
 			return nil, fmt.Errorf("neutronauth: parse form token response: %w", parseErr)
 		}
@@ -274,12 +311,27 @@ func (p *OAuthProvider) exchangeCode(code, codeVerifier string) (*tokenResponse,
 		tok.TokenType = parsed.Get("token_type")
 		tok.RefreshToken = parsed.Get("refresh_token")
 		tok.Scope = parsed.Get("scope")
-		if tok.AccessToken == "" {
-			return nil, fmt.Errorf("neutronauth: missing access_token in response")
-		}
+	}
+	// An empty access token is a failed exchange, whatever the status said.
+	if tok.AccessToken == "" {
+		return nil, fmt.Errorf("neutronauth: missing access_token in response")
 	}
 
 	return &tok, nil
+}
+
+// readProviderBody reads at most limit bytes and rejects truncation rather
+// than accepting a silently short body (GO-19).
+func readProviderBody(body io.ReadCloser, limit int64) ([]byte, error) {
+	defer body.Close()
+	data, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, errors.New("provider response too large")
+	}
+	return bytes.TrimSpace(data), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -287,42 +339,51 @@ func (p *OAuthProvider) exchangeCode(code, codeVerifier string) (*tokenResponse,
 // ---------------------------------------------------------------------------
 
 // fetchUserInfo calls the provider's userinfo endpoint and normalizes the result.
-func (p *OAuthProvider) fetchUserInfo(accessToken string) (*OAuthUser, error) {
+//
+// Numeric subject ids keep full precision (GO-18): the JSON decodes with
+// UseNumber, so a 64-bit provider id like 9007199254740993 survives instead
+// of collapsing onto its float64 neighbor and merging two users.
+func (p *OAuthProvider) fetchUserInfo(ctx context.Context, accessToken string) (*OAuthUser, error) {
+	// No prefix-derived identities (GO-18): identity without a userinfo
+	// endpoint is an explicit configuration error.
 	if p.UserInfoURL == "" {
-		return &OAuthUser{
-			ID:       accessToken[:min(16, len(accessToken))],
-			Provider: p.ProviderName,
-		}, nil
+		return nil, fmt.Errorf(
+			"neutronauth: provider %q has no userinfo endpoint; a verified subject is required",
+			p.ProviderName,
+		)
 	}
 
-	req, err := http.NewRequest(http.MethodGet, p.UserInfoURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.UserInfoURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("neutronauth: build userinfo request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := oauthHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("neutronauth: userinfo request: %w", err)
 	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := readProviderBody(resp.Body, 1<<20)
 	if err != nil {
 		return nil, fmt.Errorf("neutronauth: read userinfo response: %w", err)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("neutronauth: userinfo endpoint returned %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("neutronauth: userinfo endpoint returned %d", resp.StatusCode)
 	}
 
 	var raw map[string]any
-	if err := json.Unmarshal(body, &raw); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&raw); err != nil {
 		return nil, fmt.Errorf("neutronauth: unmarshal userinfo: %w", err)
 	}
 
 	user := normalizeUser(raw, p.ProviderName, accessToken)
+	if user.ID == "" {
+		return nil, fmt.Errorf("neutronauth: provider %q returned no stable subject (id/sub)", p.ProviderName)
+	}
 	return user, nil
 }
 
@@ -385,6 +446,11 @@ func normalizeUser(raw map[string]any, provider, accessToken string) *OAuthUser 
 //  3. Redirects the browser to the provider's authorization URL.
 func OAuthRedirectHandler(provider *OAuthProvider) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := provider.validate(); err != nil {
+			log.Printf("[neutronauth] invalid OAuth provider config: %v", err)
+			neutron.WriteError(w, r, neutron.ErrInternal("OAuth provider is misconfigured"))
+			return
+		}
 		pkce := newPKCEChallenge()
 		state := generateOAuthState()
 
@@ -450,8 +516,10 @@ func OAuthCallbackHandler(provider *OAuthProvider, onSuccess func(w http.Respons
 			return
 		}
 
-		// 4. Exchange the authorization code for tokens.
-		tokens, err := provider.exchangeCode(code, verifier)
+		// 4. Exchange the authorization code for tokens. The outbound call
+		// carries the inbound request's context, so a client disconnect
+		// cancels it (GO-19).
+		tokens, err := provider.exchangeCode(r.Context(), code, verifier)
 		if err != nil {
 			log.Printf("[neutronauth] token exchange failed: %v", err)
 			neutron.WriteError(w, r, neutron.ErrInternal("Authentication failed"))
@@ -459,7 +527,7 @@ func OAuthCallbackHandler(provider *OAuthProvider, onSuccess func(w http.Respons
 		}
 
 		// 5. Fetch user information from the provider.
-		user, err := provider.fetchUserInfo(tokens.AccessToken)
+		user, err := provider.fetchUserInfo(r.Context(), tokens.AccessToken)
 		if err != nil {
 			log.Printf("[neutronauth] userinfo fetch failed: %v", err)
 			neutron.WriteError(w, r, neutron.ErrInternal("Authentication failed"))

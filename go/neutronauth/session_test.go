@@ -669,10 +669,12 @@ func TestSessionRotatesEvenIfHandlerPanics(t *testing.T) {
 	}
 }
 
-// The commit-time error handler must never receive a ResponseWriter. At that
-// point the status is decided and the cookie is unwritten, so anything that
-// writes corrupts the response — the load-time default calls http.Error, which
-// would commit a 500 and silently drop the rotated cookie.
+// A commit-time persistence failure must fail the response closed (GO-20):
+// the handler's status is replaced by a generic 503, its body suppressed, and
+// NO rotated cookie written. The old behavior acknowledged a successful
+// rotation (418/200 + new cookie) while the old session ID was still valid —
+// an apparently successful login with the fixation window left open. The
+// commit-error hook still fires for observability and receives the request.
 func TestCommitErrorHandlerCannotCorruptTheResponse(t *testing.T) {
 	store := &failingStore{memoryStore: newMemoryStore(), failDelete: errStoreDown}
 	if err := store.Set(context.Background(), "old-id", map[string]any{}, time.Hour); err != nil {
@@ -703,13 +705,16 @@ func TestCommitErrorHandlerCannotCorruptTheResponse(t *testing.T) {
 	if !sawRequest {
 		t.Fatal("commit error handler must receive the real request, not nil")
 	}
-	if rec.Code != http.StatusTeapot {
-		t.Fatalf("status was rewritten by the error path: got %d, want %d", rec.Code, http.StatusTeapot)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("a failed rotation must fail closed: got %d, want 503", rec.Code)
 	}
-	if body := rec.Body.String(); body != "ok" {
-		t.Fatalf("body was corrupted by the error path: %q", body)
+	if body := rec.Body.String(); strings.Contains(body, "ok") {
+		t.Fatalf("handler body leaked into the failed-commit response: %q", body)
 	}
-	if len(rec.Result().Cookies()) == 0 {
-		t.Fatal("rotated cookie was dropped when the store errored")
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/problem+json") {
+		t.Fatalf("failed commit must answer problem+json, got %q", ct)
+	}
+	if len(rec.Result().Cookies()) != 0 {
+		t.Fatal("rotated cookie was written for a rotation that failed")
 	}
 }

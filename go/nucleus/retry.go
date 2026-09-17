@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
 	"time"
 
@@ -137,7 +138,10 @@ func (c *Client) WithTx(ctx context.Context, opts *RetryOptions, fn func(*Tx) er
 		// Honour cancellation before spending an attempt.
 		if err := ctx.Err(); err != nil {
 			if lastErr != nil {
-				return fmt.Errorf("nucleus: tx retry abandoned after %d attempt(s): %w", attempt-1, lastErr)
+				// Join so callers can detect BOTH the cancellation and the
+				// transaction error (GO-23): wrapping only the tx error hid
+				// context.Canceled from errors.Is.
+				return errors.Join(err, fmt.Errorf("nucleus: tx retry abandoned after %d attempt(s): %w", attempt-1, lastErr))
 			}
 			return err
 		}
@@ -154,16 +158,23 @@ func (c *Client) WithTx(ctx context.Context, opts *RetryOptions, fn func(*Tx) er
 		if attempt == attempts {
 			break
 		}
-		// Full jitter: sleep a random duration in [0, delay].
-		sleep := time.Duration(rand.Int63n(int64(delay) + 1))
+		// Full jitter: sleep a random duration in [0, delay]. The doubling
+		// below clamps at maxDelay BEFORE the range is built, so
+		// near-MaxInt64 delays cannot overflow int64(delay)+1 (GO-23).
+		bound := int64(delay)
+		if bound == math.MaxInt64 {
+			bound-- // keep bound+1 representable
+		}
+		sleep := time.Duration(rand.Int63n(bound + 1))
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("nucleus: tx retry cancelled after %d attempt(s): %w", attempt, lastErr)
+			return errors.Join(ctx.Err(), fmt.Errorf("nucleus: tx retry cancelled after %d attempt(s): %w", attempt, lastErr))
 		case <-time.After(sleep):
 		}
-		delay *= 2
-		if delay > maxDelay {
+		if delay > maxDelay-delay {
 			delay = maxDelay
+		} else {
+			delay *= 2
 		}
 	}
 	return fmt.Errorf("nucleus: transaction did not succeed in %d attempt(s): %w", attempts, lastErr)
@@ -182,12 +193,24 @@ func (c *Client) runOnce(ctx context.Context, isolation string, fn func(*Tx) err
 	defer func() {
 		if !committed {
 			// Rollback on a already-finished tx is harmless; the error is
-			// deliberately discarded so it cannot mask the real one.
-			_ = tx.Rollback(ctx)
+			// deliberately discarded so it cannot mask the real one. The
+			// rollback runs on a bounded DETACHED context (GO-23): the
+			// operation context may already be cancelled, and cleanup of a
+			// failed attempt still deserves a chance to release server-side
+			// state.
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackBudget)
+			defer cancel()
+			_ = tx.Rollback(cleanup)
 		}
 	}()
 
 	if isolation != "" {
+		// The isolation text is concatenated into SQL, so restrict it to the
+		// levels the server actually accepts (GO-23): an arbitrary string
+		// from the caller is an injection vector.
+		if !isKnownIsolationLevel(isolation) {
+			return fmt.Errorf("nucleus: unknown isolation level %q", isolation)
+		}
 		if _, err := tx.SQL().Exec(ctx, "SET TRANSACTION ISOLATION LEVEL "+isolation); err != nil {
 			return err
 		}
@@ -200,4 +223,18 @@ func (c *Client) runOnce(ctx context.Context, isolation string, fn func(*Tx) err
 	}
 	committed = true
 	return nil
+}
+
+// rollbackBudget bounds the detached rollback of a failed attempt (GO-23).
+const rollbackBudget = 5 * time.Second
+
+// isKnownIsolationLevel allowlists the isolation texts runOnce may splice
+// into SET TRANSACTION ISOLATION LEVEL.
+func isKnownIsolationLevel(level string) bool {
+	switch level {
+	case "READ UNCOMMITTED", "READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE":
+		return true
+	default:
+		return false
+	}
 }
