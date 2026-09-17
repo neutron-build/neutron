@@ -4,7 +4,8 @@ Unresolved findings for this repository from the ChatGPT-led audit series.
 Read this before treating related work as done; update it when you close,
 defer, or upstream-report an item.
 
-Open items: **1 deferral cluster** (see the table) — every other finding of
+Open items: **1 deferral cluster** (see the table) plus **2 consumer-reported
+items** (see the last section) — every other finding of
 the 2026-09-17 pass is fixed, partially fixed with the remainder scoped, or
 recorded as a false positive with evidence.
 
@@ -135,6 +136,23 @@ against a recorded decision.
 | neutron-14 | FIXED — pathname-index TTL only ever extended (never shortened below a live member) | 14dceb36 |
 | neutron-15 | FIXED — invalidation claims the index via atomic RENAME; concurrent writers stay indexed | 14dceb36 |
 | nucleus-residual-01 | FIXED — execute_parsed/execute_prepared route through execute_statements_dispatch | 456e4526 |
+
+## Reported by consumers, open (2026-09-17)
+
+Found by teploy-observe's live-engine verification during its 2026-09-17 audit
+close-out (its detailed upstream ledger is local to the Teploy umbrella,
+`Teploy/_internal/UPSTREAM_BUGS.md`); recorded here so Neutron sessions see
+them without that folder:
+
+- **Migration-ledger TOCTOU** — concurrent `Migrate` callers race the
+  `appliedVersions`→INSERT sequence and lose with `duplicate key ... (version)`
+  (SQLSTATE 23505) at `go/nucleus/migrate.go:88`; reconfirmed 2026-09-17
+  against the original 2026-08-26 report. Consumer workaround in place: run
+  Nucleus-backed suites serially (`go test -p 1`).
+- **No cross-table consistent-snapshot boundary** — capability gap, not a
+  defect: no snapshot/lease API lets a consumer establish a point-in-time view
+  or mutation-blocking lease across tables (teploy-observe audit F45 — its
+  backup dump reads related tables independently and can mix logical moments).
 
 Out-of-repo note: Lullmail's vendored copies of the send.go / bearer-transport
 blobs (flagged in neutron-12/13/16 as affected consumers) are NOT fixed here —
