@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use parking_lot::Mutex;
 
@@ -138,13 +138,37 @@ fn write_framed<W: Write>(w: &mut W, record: &MvccWalRecord) -> io::Result<()> {
 
 impl MvccWal {
     /// Open or create the WAL file.  Returns (wal, recovered_state).
-    pub fn open(dir: &Path) -> io::Result<(Self, MvccWalState)> {
+    ///
+    /// Corruption is fatal (NU-04): a mid-file CRC mismatch or undecodable
+    /// record surfaces as `InvalidData` with the byte offset, and the file
+    /// is left exactly as found — repair is an operator decision. A torn
+    /// FINAL frame (crash mid-append, nothing durable behind it) is
+    /// accepted with a warning and recovers the prefix; the next compaction
+    /// rewrites the log cleanly without the torn tail.
+    pub fn open(dir: &std::path::Path) -> io::Result<(Self, MvccWalState)> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("mvcc.wal");
         let state = if path.exists() {
             let mut data = Vec::new();
             File::open(&path)?.read_to_end(&mut data)?;
-            replay(&data)
+            match replay(&data) {
+                Ok((state, ReplayStop::TornTail { at })) => {
+                    let recovered: usize = state.tables.values().map(|t| t.rows.len()).sum();
+                    eprintln!(
+                        "nucleus: MVCC WAL has a torn final record at byte {at} \
+                         (crash during append); recovering {recovered} committed rows \
+                         and rewriting the log without the tail"
+                    );
+                    state
+                }
+                Ok((state, ReplayStop::CleanEof)) => state,
+                Err(msg) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{msg} — the WAL is left unmodified; inspect it before retrying"),
+                    ));
+                }
+            }
         } else {
             MvccWalState::default()
         };
@@ -477,8 +501,11 @@ fn datatype_to_u8(dt: &DataType) -> u8 {
     }
 }
 
-fn u8_to_datatype(v: u8) -> DataType {
-    match v {
+/// Decode a schema type tag. Unknown codes return None (NU-15): silently
+/// substituting TEXT for a corrupt/unknown type code reconstructed a
+/// DIFFERENT schema than the one that was written.
+fn u8_to_datatype(v: u8) -> Option<DataType> {
+    let dt = match v {
         0 => DataType::Bool,
         1 => DataType::Int32,
         2 => DataType::Int64,
@@ -495,8 +522,9 @@ fn u8_to_datatype(v: u8) -> DataType {
         13 => DataType::Vector(0),
         14 => DataType::Array(Box::new(DataType::Text)),
         15 => DataType::UserDefined(String::new()),
-        _ => DataType::Text,
-    }
+        _ => return None,
+    };
+    Some(dt)
 }
 
 /// Simple CRC32C (Castagnoli) for WAL record integrity.
@@ -517,37 +545,91 @@ fn crc32c(data: &[u8]) -> u32 {
 
 // ── Replay ───────────────────────────────────────────────────────────────────
 
+/// Ceiling on a single framed payload. A length field beyond this is treated
+/// as corruption, not as a torn tail: real records are kilobytes at most, so
+/// a multi-gigabyte "length" can only be a damaged frame.
+const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
+
+/// Why replay stopped early, when it did.
+#[derive(Debug)]
+pub enum ReplayStop {
+    /// The file ended exactly on a frame boundary — a clean log.
+    CleanEof,
+    /// The final frame is incomplete (torn write from a crash mid-append).
+    /// Everything before it parsed and is recovered; the torn frame is
+    /// dropped by the next compaction. This is the explicit torn-tail
+    /// policy (NU-04): accepted, because the frame never had a durable
+    /// commit decision behind it.
+    TornTail { at: usize },
+}
+
 /// Replay WAL data to recover committed state.
-fn replay(data: &[u8]) -> MvccWalState {
+///
+/// Fail-closed corruption policy (NU-04): a CRC mismatch, an impossible
+/// length field, an unknown record tag, or undecodable payload is CORRUPTION
+/// and returns Err — startup fails with the byte offset and the original
+/// file is left untouched for diagnosis (compaction only runs after a
+/// successful open). The previous behavior silently accepted the longest
+/// parseable prefix and then compacted it over the damaged suffix,
+/// permanently discarding the evidence and any committed records after the
+/// damage.
+fn replay(data: &[u8]) -> Result<(MvccWalState, ReplayStop), String> {
     let mut pos = 0usize;
     let mut records: Vec<MvccWalRecord> = Vec::new();
 
     // Phase 1: Parse all records
-    while pos + 4 <= data.len() {
-        let len =
-            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+    loop {
+        if pos == data.len() {
+            return finish_replay(records, ReplayStop::CleanEof);
+        }
+        let frame_start = pos;
+        let Some(length_bytes) = data.get(pos..pos + 4) else {
+            // Fewer than 4 bytes left: a length header cut off mid-write.
+            return finish_replay(records, ReplayStop::TornTail { at: frame_start });
+        };
+        let len = u32::from_le_bytes([length_bytes[0], length_bytes[1], length_bytes[2], length_bytes[3]])
+            as usize;
         pos += 4;
+        if len == 0 || len > MAX_PAYLOAD {
+            return Err(format!(
+                "MVCC WAL corruption: impossible record length {len} at byte {frame_start}"
+            ));
+        }
         if pos + len + 4 > data.len() {
-            break;
-        } // truncated
+            // The declared frame extends past EOF: a torn write.
+            return finish_replay(records, ReplayStop::TornTail { at: frame_start });
+        }
         let payload = &data[pos..pos + len];
         pos += len;
-        let stored_crc =
-            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        let crc_bytes = &data[pos..pos + 4];
         pos += 4;
+        let stored_crc = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
         let computed_crc = crc32c(payload);
         if stored_crc != computed_crc {
-            break;
-        } // corrupt
+            return Err(format!(
+                "MVCC WAL corruption: CRC mismatch at byte {frame_start} \
+                 (stored {stored_crc:#x}, computed {computed_crc:#x})"
+            ));
+        }
 
-        if let Some(rec) = decode_record(payload) {
-            records.push(rec);
-        } else {
-            break;
+        match decode_record(payload) {
+            Some(rec) => records.push(rec),
+            None => {
+                return Err(format!(
+                    "MVCC WAL corruption: undecodable record (tag {:#x}) at byte {frame_start}",
+                    payload.first().copied().unwrap_or(0)
+                ));
+            }
         }
     }
+}
 
-    // Phase 2: Identify committed transactions
+/// Phase 2+3 of replay, shared by every stop kind.
+fn finish_replay(
+    records: Vec<MvccWalRecord>,
+    stop: ReplayStop,
+) -> Result<(MvccWalState, ReplayStop), String> {
+    // Identify committed transactions
     let mut committed: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut aborted: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut committed_xacts: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -565,8 +647,13 @@ fn replay(data: &[u8]) -> MvccWalState {
             _ => {}
         }
     }
+    // (aborted is intentionally consulted via `committed` semantics below:
+    // a txn with both records is corrupt input, but replay has historically
+    // treated Commit as decisive; keep that order and keep the set for
+    // future use.)
+    let _ = &aborted;
 
-    // Phase 3: Replay committed operations (and auto-commits where txn_id=0).
+    // Replay committed operations (and auto-commits where txn_id=0).
     // Rows are keyed by the engine's stable per-row VERSION INDEX, so DELETE and
     // UPDATE address the exact row by identity — no fragile scan-position
     // arithmetic. A BTreeMap keeps rows in version order (the scan order); the
@@ -652,17 +739,25 @@ fn replay(data: &[u8]) -> MvccWalState {
         })
         .collect();
 
-    MvccWalState {
-        tables,
-        committed_xacts,
-    }
+    Ok((
+        MvccWalState {
+            tables,
+            committed_xacts,
+        },
+        stop,
+    ))
 }
 
+/// Decode a payload to a record, or None when it is not a well-formed
+/// record of a KNOWN shape (NU-04/NU-15): unknown tags, unknown type codes,
+/// and trailing undecoded bytes are all rejected rather than best-effort
+/// coerced — a value_codec read that stops early used to leave silently
+/// ignored bytes, and unknown schema-type tags used to degrade to TEXT.
 fn decode_record(data: &[u8]) -> Option<MvccWalRecord> {
     let mut pos = 0usize;
     let tag = *data.get(pos)?;
     pos += 1;
-    match tag {
+    let record = match tag {
         TAG_CREATE_TABLE => {
             let name = read_str(data, &mut pos)?;
             let count = read_u32_val(data, &mut pos)? as usize;
@@ -671,35 +766,35 @@ fn decode_record(data: &[u8]) -> Option<MvccWalRecord> {
                 let col_name = read_str(data, &mut pos)?;
                 let col_type = *data.get(pos)?;
                 pos += 1;
-                columns.push((col_name, u8_to_datatype(col_type)));
+                columns.push((col_name, u8_to_datatype(col_type)?));
             }
-            Some(MvccWalRecord::CreateTable { name, columns })
+            MvccWalRecord::CreateTable { name, columns }
         }
         TAG_DROP_TABLE => {
             let name = read_str(data, &mut pos)?;
-            Some(MvccWalRecord::DropTable { name })
+            MvccWalRecord::DropTable { name }
         }
         TAG_INSERT => {
             let table = read_str(data, &mut pos)?;
             let txn_id = read_u64_val(data, &mut pos)?;
             let version_idx = read_u32_val(data, &mut pos)?;
             let row = crate::storage::value_codec::read_row(data, &mut pos)?;
-            Some(MvccWalRecord::Insert {
+            MvccWalRecord::Insert {
                 table,
                 txn_id,
                 version_idx,
                 row,
-            })
+            }
         }
         TAG_DELETE => {
             let table = read_str(data, &mut pos)?;
             let txn_id = read_u64_val(data, &mut pos)?;
             let version_idx = read_u32_val(data, &mut pos)?;
-            Some(MvccWalRecord::Delete {
+            MvccWalRecord::Delete {
                 table,
                 txn_id,
                 version_idx,
-            })
+            }
         }
         TAG_UPDATE => {
             let table = read_str(data, &mut pos)?;
@@ -707,33 +802,38 @@ fn decode_record(data: &[u8]) -> Option<MvccWalRecord> {
             let old_version_idx = read_u32_val(data, &mut pos)?;
             let new_version_idx = read_u32_val(data, &mut pos)?;
             let new_row = crate::storage::value_codec::read_row(data, &mut pos)?;
-            Some(MvccWalRecord::Update {
+            MvccWalRecord::Update {
                 table,
                 txn_id,
                 old_version_idx,
                 new_version_idx,
                 new_row,
-            })
+            }
         }
         TAG_BEGIN => {
             let txn_id = read_u64_val(data, &mut pos)?;
-            Some(MvccWalRecord::Begin { txn_id })
+            MvccWalRecord::Begin { txn_id }
         }
         TAG_COMMIT => {
             let txn_id = read_u64_val(data, &mut pos)?;
-            Some(MvccWalRecord::Commit { txn_id })
+            MvccWalRecord::Commit { txn_id }
         }
         TAG_ABORT => {
             let txn_id = read_u64_val(data, &mut pos)?;
-            Some(MvccWalRecord::Abort { txn_id })
+            MvccWalRecord::Abort { txn_id }
         }
         TAG_XACT_COMMIT => {
             let xact = read_u64_val(data, &mut pos)?;
-            Some(MvccWalRecord::XactCommit { xact })
+            MvccWalRecord::XactCommit { xact }
         }
-        TAG_CHECKPOINT => Some(MvccWalRecord::Checkpoint),
-        _ => None,
+        TAG_CHECKPOINT => MvccWalRecord::Checkpoint,
+        _ => return None,
+    };
+    if pos != data.len() {
+        // Trailing bytes the decoder does not know how to interpret.
+        return None;
     }
+    Some(record)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -866,20 +966,70 @@ mod tests {
         }
 
         // Corrupt a byte in the middle of the WAL
-        {
-            let path = dir.path().join("mvcc.wal");
-            let mut data = std::fs::read(&path).unwrap();
-            if data.len() > 20 {
-                data[20] ^= 0xFF;
-            }
-            std::fs::write(&path, data).unwrap();
+        let path = dir.path().join("mvcc.wal");
+        let original = std::fs::read(&path).unwrap();
+        let mut data = original.clone();
+        if data.len() > 20 {
+            data[20] ^= 0xFF;
         }
+        std::fs::write(&path, &data).unwrap();
 
-        // Recover — should stop at corrupted record
+        // Fail closed (NU-04): mid-file corruption is an error, the file is
+        // preserved for diagnosis, and no state is silently recovered.
+        let result = MvccWal::open(dir.path());
+        match result {
+            Err(err) => {
+                assert!(
+                    err.to_string().contains("corruption"),
+                    "error must name corruption: {err}"
+                );
+                // The damaged file is left byte-for-byte intact.
+                assert_eq!(std::fs::read(&path).unwrap(), data);
+            }
+            Ok(_) => panic!("corrupted WAL was accepted"),
+        }
+        // Restore the pristine log to prove it still opens cleanly.
+        std::fs::write(&path, original).unwrap();
         let (_wal2, state) = MvccWal::open(dir.path()).unwrap();
-        // Depending on which record was corrupted, table may or may not exist
-        // but it should NOT panic
-        let _ = state.tables.get("t");
+        assert_eq!(state.tables.get("t").map(|t| t.rows.len()), Some(1));
+    }
+
+    #[test]
+    fn torn_tail_recovers_the_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = MvccWal::open(dir.path()).unwrap();
+            wal.log(&MvccWalRecord::CreateTable {
+                name: "t".into(),
+                columns: vec![("x".into(), DataType::Int64)],
+            })
+            .unwrap();
+            wal.log(&MvccWalRecord::Insert {
+                table: "t".into(),
+                txn_id: 0,
+                version_idx: 0,
+                row: vec![Value::Int64(1)],
+            })
+            .unwrap();
+            wal.log(&MvccWalRecord::Insert {
+                table: "t".into(),
+                txn_id: 0,
+                version_idx: 1,
+                row: vec![Value::Int64(2)],
+            })
+            .unwrap();
+            wal.sync().unwrap();
+        }
+        // Truncate mid-frame: the FINAL insert loses its tail bytes and is
+        // dropped; everything before it was fsynced and must survive.
+        let path = dir.path().join("mvcc.wal");
+        let full = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &full[..full.len() - 3]).unwrap();
+
+        let (_wal, state) = MvccWal::open(dir.path()).unwrap();
+        let t = state.tables.get("t").expect("table survived");
+        assert_eq!(t.rows.len(), 1, "complete prefix records must be recovered");
+        assert_eq!(t.rows[0], vec![Value::Int64(1)]);
     }
 
     #[test]
