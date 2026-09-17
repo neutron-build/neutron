@@ -131,10 +131,11 @@ func TestCORSMiddleware(t *testing.T) {
 		t.Errorf("ACAO = %q", w.Header().Get("Access-Control-Allow-Origin"))
 	}
 
-	// Preflight
+	// Preflight (a genuine one carries Access-Control-Request-Method)
 	w = httptest.NewRecorder()
 	r = httptest.NewRequest("OPTIONS", "/", nil)
 	r.Header.Set("Origin", "http://example.com")
+	r.Header.Set("Access-Control-Request-Method", "POST")
 	handler.ServeHTTP(w, r)
 
 	if w.Code != http.StatusNoContent {
@@ -303,14 +304,14 @@ func TestDefaultStackAllLayersInContractOrder(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	var authCalls int
-	var sawRequestID, sawCORS, sawContentEncoding, sawDeadlineAtAuth, sawTraceAtAuth bool
+	var sawRequestID, sawCORS, sawVaryAcceptEncoding, sawDeadlineAtAuth, sawTraceAtAuth bool
 
 	auth := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			authCalls++
 			sawRequestID = w.Header().Get("X-Request-Id") != ""
 			sawCORS = w.Header().Get("Access-Control-Allow-Origin") != ""
-			sawContentEncoding = w.Header().Get("Content-Encoding") != ""
+			sawVaryAcceptEncoding = w.Header().Get("Vary") != ""
 			_, sawDeadlineAtAuth = r.Context().Deadline()
 			sawTraceAtAuth = TraceIDFromContext(r.Context()) != ""
 			next.ServeHTTP(w, r)
@@ -321,7 +322,7 @@ func TestDefaultStackAllLayersInContractOrder(t *testing.T) {
 		Logger:    logger,
 		CORS:      &CORSOptions{AllowOrigins: []string{"https://example.com"}},
 		Compress:  true,
-		RateLimit: &RateLimitConfig{RPS: 0, Burst: 1},
+		RateLimit: &RateLimitConfig{RPS: 0.000001, Burst: 1},
 		Auth:      auth,
 		Timeout:   time.Second,
 		OTel:      &OTelOptions{ServiceName: "test"},
@@ -357,8 +358,10 @@ func TestDefaultStackAllLayersInContractOrder(t *testing.T) {
 	if !sawCORS {
 		t.Error("CORS did not run before Auth (no Access-Control-Allow-Origin at Auth)")
 	}
-	if !sawContentEncoding {
-		t.Error("Compress did not run before Auth (no Content-Encoding at Auth)")
+	// Compress commits Content-Encoding lazily (at first write), so its
+	// presence at Auth is proven by the Vary header it sets eagerly.
+	if !sawVaryAcceptEncoding {
+		t.Error("Compress did not run before Auth (no Vary: Accept-Encoding at Auth)")
 	}
 	if sawDeadlineAtAuth {
 		t.Error("Timeout ran before Auth — contract places Timeout after Auth")
@@ -379,7 +382,7 @@ func TestDefaultStackAllLayersInContractOrder(t *testing.T) {
 		t.Errorf("log line missing non-empty request_id — RequestID must precede Logging: %q", out)
 	}
 
-	// Request 2: token bucket drained (RPS 0, burst 1), so RateLimit rejects.
+	// Request 2: token bucket drained (burst 1, negligible refill), so RateLimit rejects.
 	// Auth must not run, and the layers outer than RateLimit must still act.
 	rec2 := httptest.NewRecorder()
 	req2 := httptest.NewRequest("GET", "/", nil)
@@ -410,6 +413,7 @@ func TestDefaultStackAllLayersInContractOrder(t *testing.T) {
 	rec3 := httptest.NewRecorder()
 	req3 := httptest.NewRequest(http.MethodOptions, "/", nil)
 	req3.Header.Set("Origin", "https://example.com")
+	req3.Header.Set("Access-Control-Request-Method", "POST")
 	req3.Header.Set("Accept-Encoding", "gzip")
 	wrapped.ServeHTTP(rec3, req3)
 

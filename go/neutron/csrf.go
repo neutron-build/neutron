@@ -2,9 +2,13 @@ package neutron
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"strings"
 )
@@ -31,7 +35,18 @@ type CSRFOptions struct {
 	// When set, the middleware also validates the Origin/Referer header on
 	// unsafe methods.
 	TrustedOrigins []string
+	// Secret, when set, hardens the double-submit cookie against same-site
+	// sibling injection (GO-22): the cookie carries nonce.MAC where MAC is
+	// an HMAC over the random nonce under this server-only key. An attacker
+	// who can inject a cookie (a hostile sibling subdomain) can mint a
+	// nonce but not a valid MAC, so their injected pair is rejected.
+	// Minimum 32 bytes of high-entropy key material; shorter values panic
+	// at construction.
+	Secret []byte
 }
+
+// csrfMinSecretLen is the minimum HMAC key size for the signed-token mode.
+const csrfMinSecretLen = 32
 
 type ctxKeyCSRF struct{}
 
@@ -79,6 +94,11 @@ func CSRF(opts CSRFOptions) Middleware {
 		cookieSecure = false
 	}
 
+	// A short HMAC key is no HMAC key (GO-22) — fail loudly at assembly.
+	if len(opts.Secret) > 0 && len(opts.Secret) < csrfMinSecretLen {
+		panic(fmt.Sprintf("neutron: CSRF Secret must be at least %d bytes of high-entropy key material", csrfMinSecretLen))
+	}
+
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Check if this path should skip CSRF validation.
@@ -96,6 +116,15 @@ func CSRF(opts CSRFOptions) Middleware {
 			}
 			if cookieToken == "" {
 				cookieToken = generateCSRFToken()
+			}
+
+			// In signed mode the cookie value is nonce.MAC and the client
+			// must echo the exact same value: the MAC is verified, so a
+			// cookie injected by a same-site sibling (which cannot compute
+			// MACs) fails even when attacker-supplied cookie and header
+			// match (GO-22).
+			if len(opts.Secret) > 0 && !validSignedCSRFToken(cookieToken, opts.Secret) {
+				cookieToken = newSignedCSRFToken(opts.Secret)
 			}
 
 			// Set the cookie.  NOT HttpOnly — JavaScript SPAs need to read it
@@ -144,10 +173,16 @@ func CSRF(opts CSRFOptions) Middleware {
 					}
 				}
 
-				// Try header first, then form field.
+				// Try header first, then the FORM body only (GO-22): the old
+				// r.FormValue fallback also read the URL query, so a token
+				// could ride on the query string of a crafted link.
 				submitted := r.Header.Get(opts.HeaderName)
 				if submitted == "" {
-					submitted = r.FormValue(opts.FormField)
+					submitted = r.PostFormValue(opts.FormField)
+				}
+				// In signed mode the echoed value must carry a valid MAC.
+				if len(opts.Secret) > 0 && !validSignedCSRFToken(submitted, opts.Secret) {
+					submitted = ""
 				}
 				if submitted == "" || !tokensMatch(cookieToken, submitted) {
 					WriteError(w, r, newAppError(
@@ -172,18 +207,57 @@ func generateCSRFToken() string {
 	return hex.EncodeToString(b)
 }
 
+// newSignedCSRFToken mints nonce.MAC (both base64url) under the server key.
+func newSignedCSRFToken(secret []byte) string {
+	nonce := make([]byte, 32)
+	_, _ = rand.Read(nonce)
+	return signedCSRFToken(nonce, csrfMAC(secret, nonce))
+}
+
+func signedCSRFToken(nonce, mac []byte) string {
+	return base64.RawURLEncoding.EncodeToString(nonce) + "." +
+		base64.RawURLEncoding.EncodeToString(mac)
+}
+
+// csrfMAC computes the length-prefixed HMAC binding the nonce to the key.
+func csrfMAC(secret, nonce []byte) []byte {
+	mac := hmac.New(sha256.New, secret)
+	fmt.Fprintf(mac, "%d:%s", len(nonce), base64.RawURLEncoding.EncodeToString(nonce))
+	return mac.Sum(nil)
+}
+
+// validSignedCSRFToken verifies a nonce.MAC token under the server key.
+func validSignedCSRFToken(token string, secret []byte) bool {
+	nonceB64, macB64, ok := strings.Cut(token, ".")
+	if !ok {
+		return false
+	}
+	nonce, err := base64.RawURLEncoding.DecodeString(nonceB64)
+	if err != nil || len(nonce) != 32 {
+		return false
+	}
+	mac, err := base64.RawURLEncoding.DecodeString(macB64)
+	if err != nil {
+		return false
+	}
+	return hmac.Equal(mac, csrfMAC(secret, nonce))
+}
+
 // tokensMatch compares two token strings in constant time.
 func tokensMatch(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
-// isUnsafeMethod returns true for HTTP methods that mutate state.
+// isUnsafeMethod returns true for any method that can mutate state (GO-22):
+// the old closed list of four missed custom verbs, which then bypassed CSRF
+// entirely.
 func isUnsafeMethod(method string) bool {
 	switch method {
-	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return false
+	default:
 		return true
 	}
-	return false
 }
 
 // originInList checks whether the given origin (or referer URL) matches any

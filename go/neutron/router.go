@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync/atomic"
 )
 
 // frameworkPkg is this package's import path, used to walk past framework
@@ -46,7 +47,8 @@ func callerSite() string {
 //
 // The check has to happen before the mux sees the pattern: ServeMux panics on
 // a duplicate itself, and once it does, the better message can no longer be
-// produced.
+// produced. Every registration also bumps the generation counter so a cached
+// OpenAPI spec can detect staliness (GO-13).
 func (r *Router) claimPattern(fullPattern string) {
 	site := callerSite()
 	if r.sites != nil {
@@ -57,6 +59,27 @@ func (r *Router) claimPattern(fullPattern string) {
 		}
 		(*r.sites)[fullPattern] = site
 	}
+	r.gen.Add(1)
+}
+
+// covers reports whether a registration equivalent to `pattern` — with or
+// without its method qualifier — is already claimed (GO-13). A user's
+// methodless "/health" and the framework's "GET /health" are the same
+// registration for override purposes; the built-in must yield to either.
+func (r *Router) covers(pattern string) bool {
+	if r.sites == nil {
+		return false
+	}
+	if _, taken := (*r.sites)[pattern]; taken {
+		return true
+	}
+	method, path := splitPattern(pattern)
+	if method != "" {
+		_, taken := (*r.sites)[path]
+		return taken
+	}
+	_, taken := (*r.sites)["GET "+pattern]
+	return taken
 }
 
 // Router wraps Go 1.22+ net/http.ServeMux with composable route groups and
@@ -66,14 +89,20 @@ type Router struct {
 	prefix     string
 	middleware []Middleware
 	// routes is shared across a root router and its Group() descendants via
-	// pointer so OpenAPI sees every registered endpoint regardless of where it
-	// was registered.
+	// pointer so OpenAPI sees every registered endpoint regardless of where
+	// it was registered.
 	routes *[]routeRecord
 	// sites maps a mux pattern to the application line that registered it,
 	// shared across the router tree the same way routes is. It exists only to
 	// make a collision panic name the two files in conflict.
 	sites *map[string]string
+	// gen counts registrations so cached artifacts (OpenAPI) can detect
+	// staliness (GO-13).
+	gen atomic.Uint64
 }
+
+// Generation reports the current registration generation.
+func (r *Router) Generation() uint64 { return r.gen.Load() }
 
 // routeRecord stores metadata about a registered route for OpenAPI.
 type routeRecord struct {
@@ -198,18 +227,23 @@ func (r *Router) Handle(pattern string, handler http.Handler) {
 }
 
 // handleIfAbsent registers a framework-supplied default route unless the
-// application has already claimed that exact pattern. Reports whether it
-// registered anything.
+// application has already claimed that pattern — or a method-equivalent
+// registration of it (GO-13): a methodless user "/health" and the built-in
+// "GET /health" are the same registration, and the built-in must yield to
+// either or it silently shadows the user's handler.
 //
-// Yielding is the right default for a framework route: an application defining
-// its own /health is ordinary, and the alternatives are both worse than
-// stepping aside — overwriting silently replaces the application's handler with
-// the framework's, and treating it as a collision turns a reasonable app into
-// one that panics on startup.
+// Yielding is the right default for a framework route: an application
+// defining its own /health is ordinary, and the alternatives are both worse
+// than stepping aside — overwriting silently replaces the application's
+// handler with the framework's, and treating it as a collision turns a
+// reasonable app into one that panics on startup.
 func (r *Router) handleIfAbsent(pattern string, handler http.Handler) bool {
 	fullPattern := joinPattern(r.prefix, pattern)
 	if r.sites != nil {
 		if _, taken := (*r.sites)[fullPattern]; taken {
+			return false
+		}
+		if r.covers(fullPattern) {
 			return false
 		}
 	}

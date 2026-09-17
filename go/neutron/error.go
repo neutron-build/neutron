@@ -87,6 +87,12 @@ func ErrInternal(detail string) *AppError {
 	return newAppError(http.StatusInternalServerError, "internal", "Internal Server Error", detail)
 }
 
+// ErrServiceUnavailable builds a 503 problem — for dependencies that are
+// configured but currently failing (e.g. session persistence at commit time).
+func ErrServiceUnavailable(detail string) *AppError {
+	return newAppError(http.StatusServiceUnavailable, "service-unavailable", "Service Unavailable", detail)
+}
+
 // ToProblemDetail converts an AppError to the RFC 7807 wire format.
 func (e *AppError) ToProblemDetail(instance string) ProblemDetail {
 	pd := ProblemDetail{

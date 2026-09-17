@@ -3,7 +3,10 @@ package neutron
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -44,11 +47,21 @@ func Register[In, Out any](r *Router, method, pattern string, h HandlerFunc[In, 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		var input In
 
+		// Bind through the actual generic input variable (GO-01): the old
+		// code reconstructed the input from a separately allocated value and
+		// asserted it back to In, which panicked for pointer inputs (`In =
+		// *T`) because the assertion ran from T to *T.
+		rv := reflect.ValueOf(&input).Elem()
+		isPointerInput := rv.Kind() == reflect.Ptr
+		if isPointerInput {
+			// Allocate the target even without a body so query/path/header
+			// binding has somewhere to land.
+			rv.Set(reflect.New(rv.Type().Elem()))
+			rv = rv.Elem()
+		}
+
 		// Decode input unless it's Empty
 		if inType != nil && inType != emptyType {
-			rv := reflect.New(inType).Elem()
-			inputPtr := rv.Addr().Interface()
-
 			if hasBody(method) && req.Body != nil && req.ContentLength != 0 {
 				ct := req.Header.Get("Content-Type")
 				mediaType, _, _ := mime.ParseMediaType(ct)
@@ -59,29 +72,60 @@ func Register[In, Out any](r *Router, method, pattern string, h HandlerFunc[In, 
 						WriteError(w, req, ErrBadRequest("Invalid multipart form: "+err.Error()))
 						return
 					}
-					populateFromForm(rv, req.MultipartForm)
+					if err := populateFromForm(rv, req.MultipartForm); err != nil {
+						WriteError(w, req, ErrBadRequest("Invalid multipart form: "+err.Error()))
+						return
+					}
 				case "application/x-www-form-urlencoded":
 					if err := req.ParseForm(); err != nil {
 						WriteError(w, req, ErrBadRequest("Invalid form data: "+err.Error()))
 						return
 					}
-					populateFromURLValues(rv, req.Form)
+					if err := populateFromURLValues(rv, req.Form); err != nil {
+						WriteError(w, req, ErrBadRequest("Invalid form data: "+err.Error()))
+						return
+					}
 				default:
-					// Default: JSON binding
-					if err := json.NewDecoder(req.Body).Decode(inputPtr); err != nil {
+					// Default: JSON binding, decoded through &input so both T
+					// and *T work (GO-01). Exactly one JSON value; trailing
+					// garbage or a second document is a 400 (GO-03).
+					if err := decodeOneJSON(req.Body, &input); err != nil {
 						WriteError(w, req, ErrBadRequest("Invalid JSON: "+err.Error()))
 						return
+					}
+					// Re-derive after the decode (it may have replaced a
+					// pointer input) and reject JSON `null` for it.
+					rv = reflect.ValueOf(&input).Elem()
+					if rv.Kind() == reflect.Ptr {
+						if rv.IsNil() {
+							WriteError(w, req, ErrBadRequest("Request body must not be null"))
+							return
+						}
+						rv = rv.Elem()
 					}
 				}
 			}
 
-			// Extract path, query, header, and form params
-			populateFromRequest(rv, req)
+			// Extract path, query, header, and form params. Parse failures
+			// are field errors now (GO-02): the old binder discarded every
+			// error, parsed integers at 64 bits, and silently wrapped
+			// out-of-range values into narrow fields.
+			if err := populateFromRequest(rv, req); err != nil {
+				WriteError(w, req, ErrBadRequest(err.Error()))
+				return
+			}
 
-			input = rv.Interface().(In)
-
-			// Validate
-			if errs := Validate(input); len(errs) > 0 {
+			// Validate. A validator configuration problem (unsupported
+			// target, bad tags) is a 500, not a silent pass (GO-05); field
+			// violations remain 422 and no longer echo the rejected raw
+			// value, which could reflect a password or token into the
+			// response.
+			errs, verr := validateInput(input)
+			if verr != nil {
+				WriteError(w, req, ErrInternal("Validation configuration error"))
+				return
+			}
+			if len(errs) > 0 {
 				WriteError(w, req, ErrValidation("Request body failed validation", errs))
 				return
 			}
@@ -134,17 +178,41 @@ func Delete[In, Out any](r *Router, pattern string, h HandlerFunc[In, Out], opts
 }
 
 func hasBody(method string) bool {
-	return method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch
+	// DELETE can carry a typed body (GO-03): a typed Delete handler binds
+	// its request body like POST/PUT/PATCH.
+	return method == http.MethodPost ||
+		method == http.MethodPut ||
+		method == http.MethodPatch ||
+		method == http.MethodDelete
+}
+
+// decodeOneJSON decodes exactly one JSON value and requires EOF afterwards
+// (GO-03): a bare Decode accepted `{}{}` and trailing garbage, so a valid
+// first document plus junk sailed through.
+func decodeOneJSON(r io.Reader, dst any) error {
+	decoder := json.NewDecoder(r)
+	if err := decoder.Decode(dst); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("request body must contain a single JSON value")
+		}
+		return errors.New("trailing data after JSON value")
+	}
+	return nil
 }
 
 // populateFromRequest fills struct fields from path, query, and header parameters.
-func populateFromRequest(rv reflect.Value, r *http.Request) {
+// Binding failures return an error naming the parameter (GO-02).
+func populateFromRequest(rv reflect.Value, r *http.Request) error {
 	if rv.Kind() == reflect.Ptr {
 		rv = rv.Elem()
 	}
 	rt := rv.Type()
 	if rt.Kind() != reflect.Struct {
-		return
+		return nil
 	}
 
 	for i := 0; i < rt.NumField(); i++ {
@@ -156,23 +224,26 @@ func populateFromRequest(rv reflect.Value, r *http.Request) {
 		}
 
 		if pathKey := field.Tag.Get("path"); pathKey != "" {
-			val := r.PathValue(pathKey)
-			if val != "" {
-				setFieldValue(fieldVal, val)
+			if val := r.PathValue(pathKey); val != "" {
+				if err := bindText(fieldVal, val); err != nil {
+					return fmt.Errorf("invalid path parameter %s: %w", pathKey, err)
+				}
 			}
 		}
 
 		if queryKey := field.Tag.Get("query"); queryKey != "" {
-			val := r.URL.Query().Get(queryKey)
-			if val != "" {
-				setFieldValue(fieldVal, val)
+			if val := r.URL.Query().Get(queryKey); val != "" {
+				if err := bindText(fieldVal, val); err != nil {
+					return fmt.Errorf("invalid query parameter %s: %w", queryKey, err)
+				}
 			}
 		}
 
 		if headerKey := field.Tag.Get("header"); headerKey != "" {
-			val := r.Header.Get(headerKey)
-			if val != "" {
-				setFieldValue(fieldVal, val)
+			if val := r.Header.Get(headerKey); val != "" {
+				if err := bindText(fieldVal, val); err != nil {
+					return fmt.Errorf("invalid header %s: %w", headerKey, err)
+				}
 			}
 		}
 
@@ -190,55 +261,94 @@ func populateFromRequest(rv reflect.Value, r *http.Request) {
 			// For regular fields, check form values
 			if r.Form != nil {
 				if val := r.Form.Get(formKey); val != "" {
-					setFieldValue(fieldVal, val)
+					if err := bindText(fieldVal, val); err != nil {
+						return fmt.Errorf("invalid form field %s: %w", formKey, err)
+					}
 				}
 			} else if r.MultipartForm != nil && r.MultipartForm.Value != nil {
 				if vals, ok := r.MultipartForm.Value[formKey]; ok && len(vals) > 0 {
-					setFieldValue(fieldVal, vals[0])
+					if err := bindText(fieldVal, vals[0]); err != nil {
+						return fmt.Errorf("invalid form field %s: %w", formKey, err)
+					}
 				}
 			}
 		}
 	}
+	return nil
 }
 
-func setFieldValue(v reflect.Value, s string) {
+// bindText sets v (a settable struct field) from a raw string with
+// destination-width parsing and error reporting (GO-02). Integers parse at
+// the destination's width, so int8("128") is a 400 rather than a silent -128;
+// floats reject NaN/Infinity; named string element types are honored.
+func bindText(v reflect.Value, raw string) error {
+	if !v.CanSet() {
+		return errors.New("field is not settable")
+	}
+	if v.Kind() == reflect.Ptr {
+		n := reflect.New(v.Type().Elem())
+		if err := bindText(n.Elem(), raw); err != nil {
+			return err
+		}
+		v.Set(n)
+		return nil
+	}
 	switch v.Kind() {
 	case reflect.String:
-		v.SetString(s)
+		v.SetString(raw)
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
-			v.SetInt(n)
+		n, err := strconv.ParseInt(raw, 10, v.Type().Bits())
+		if err != nil {
+			return err
 		}
+		v.SetInt(n)
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		if n, err := strconv.ParseUint(s, 10, 64); err == nil {
-			v.SetUint(n)
+		n, err := strconv.ParseUint(raw, 10, v.Type().Bits())
+		if err != nil {
+			return err
 		}
+		v.SetUint(n)
 	case reflect.Float32, reflect.Float64:
-		if f, err := strconv.ParseFloat(s, 64); err == nil {
-			v.SetFloat(f)
+		n, err := strconv.ParseFloat(raw, v.Type().Bits())
+		if err != nil {
+			return err
 		}
+		if math.IsInf(n, 0) || math.IsNaN(n) {
+			return errors.New("non-finite number")
+		}
+		v.SetFloat(n)
 	case reflect.Bool:
-		if b, err := strconv.ParseBool(s); err == nil {
-			v.SetBool(b)
+		b, err := strconv.ParseBool(raw)
+		if err != nil {
+			return err
 		}
+		v.SetBool(b)
 	case reflect.Slice:
-		if v.Type().Elem().Kind() == reflect.String {
-			parts := strings.Split(s, ",")
-			v.Set(reflect.ValueOf(parts))
+		if v.Type().Elem().Kind() != reflect.String {
+			return fmt.Errorf("unsupported slice element type %s", v.Type().Elem())
 		}
+		parts := strings.Split(raw, ",")
+		n := reflect.MakeSlice(v.Type(), len(parts), len(parts))
+		for i, s := range parts {
+			n.Index(i).SetString(s)
+		}
+		v.Set(n)
+	default:
+		return fmt.Errorf("unsupported field type %s", v.Type())
 	}
+	return nil
 }
 
 // populateFromForm fills struct fields from a parsed multipart form.
 // Fields are matched via the `form` struct tag. *multipart.FileHeader fields
 // are populated from the file map; all other fields use the value map.
-func populateFromForm(rv reflect.Value, mf *multipart.Form) {
+func populateFromForm(rv reflect.Value, mf *multipart.Form) error {
 	if rv.Kind() == reflect.Ptr {
 		rv = rv.Elem()
 	}
 	rt := rv.Type()
 	if rt.Kind() != reflect.Struct || mf == nil {
-		return
+		return nil
 	}
 
 	for i := 0; i < rt.NumField(); i++ {
@@ -265,20 +375,23 @@ func populateFromForm(rv reflect.Value, mf *multipart.Form) {
 		// Regular value field
 		if mf.Value != nil {
 			if vals, ok := mf.Value[formKey]; ok && len(vals) > 0 {
-				setFieldValue(fieldVal, vals[0])
+				if err := bindText(fieldVal, vals[0]); err != nil {
+					return fmt.Errorf("invalid form field %s: %w", formKey, err)
+				}
 			}
 		}
 	}
+	return nil
 }
 
 // populateFromURLValues fills struct fields from url.Values using `form` tags.
-func populateFromURLValues(rv reflect.Value, values map[string][]string) {
+func populateFromURLValues(rv reflect.Value, values map[string][]string) error {
 	if rv.Kind() == reflect.Ptr {
 		rv = rv.Elem()
 	}
 	rt := rv.Type()
 	if rt.Kind() != reflect.Struct {
-		return
+		return nil
 	}
 
 	for i := 0; i < rt.NumField(); i++ {
@@ -292,9 +405,12 @@ func populateFromURLValues(rv reflect.Value, values map[string][]string) {
 			continue
 		}
 		if vals, ok := values[formKey]; ok && len(vals) > 0 {
-			setFieldValue(fieldVal, vals[0])
+			if err := bindText(fieldVal, vals[0]); err != nil {
+				return fmt.Errorf("invalid form field %s: %w", formKey, err)
+			}
 		}
 	}
+	return nil
 }
 
 // typeNameForSchema returns the type name suitable for OpenAPI schema references.

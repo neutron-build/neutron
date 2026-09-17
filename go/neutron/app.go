@@ -2,6 +2,8 @@ package neutron
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -18,12 +20,15 @@ type NucleusChecker interface {
 // App is the Neutron application. It ties together routing, middleware,
 // lifecycle management, configuration, and OpenAPI generation.
 type App struct {
-	router         *Router
-	middleware     []Middleware
-	lifecycle      *lifecycle
-	config         *Config
-	logger         *slog.Logger
-	openapi        *OpenAPISpec
+	router     *Router
+	middleware []Middleware
+	lifecycle  *lifecycle
+	config     *Config
+	logger     *slog.Logger
+	openapi    *OpenAPISpec
+	// openapiGen is the router generation the cached spec was built at
+	// (GO-13).
+	openapiGen     uint64
 	oaInfo         OpenAPIInfo
 	nucleusChecker NucleusChecker
 	// built records that Build() has already registered the default routes, so
@@ -116,14 +121,18 @@ func (a *App) Router() *Router {
 }
 
 // OpenAPI returns the auto-generated OpenAPI 3.1 specification.
-// The spec is built lazily on first access from registered routes.
+// The spec is built lazily on first access from registered routes and
+// re-generated when routes were registered after the last build (GO-13):
+// a spec cached before later registrations was silently stale.
 func (a *App) OpenAPI() *OpenAPISpec {
-	if a.openapi == nil {
+	gen := a.router.Generation()
+	if a.openapi == nil || a.openapiGen != gen {
 		var routes []routeRecord
 		if a.router.routes != nil {
 			routes = *a.router.routes
 		}
 		a.openapi = generateOpenAPI(routes, a.oaInfo)
+		a.openapiGen = gen
 	}
 	return a.openapi
 }
@@ -202,6 +211,12 @@ func (a *App) Run(addr string) error {
 		a.logger.Info("shutdown signal received", "signal", sig.String())
 	case err := <-errCh:
 		if err != http.ErrServerClosed {
+			// GO-11: a bind/listen failure must still stop the hooks that
+			// started successfully, or their resources leak on startup exit.
+			if stopErr := a.lifecycle.stopWithBudget(ctx); stopErr != nil {
+				a.logger.Error("lifecycle shutdown error", "error", stopErr)
+				return errors.Join(err, stopErr)
+			}
 			return err
 		}
 	}
@@ -210,13 +225,19 @@ func (a *App) Run(addr string) error {
 	shutdownCtx, cancel := context.WithTimeout(ctx, a.config.Server.ShutdownTimeout)
 	defer cancel()
 
+	// GO-11: a shutdown timeout must not strand stop hooks with an expired
+	// context. Force-close the connections Server.Shutdown was waiting on,
+	// then run the hooks with a guaranteed-fresh bounded budget; hook errors
+	// propagate instead of being logged and swallowed.
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		a.logger.Error("server shutdown error", "error", err)
+		srv.Close()
 	}
 
 	// Stop lifecycle hooks in reverse order
-	if err := a.lifecycle.stop(shutdownCtx); err != nil {
+	if err := a.lifecycle.stopWithBudget(shutdownCtx); err != nil {
 		a.logger.Error("lifecycle shutdown error", "error", err)
+		return fmt.Errorf("neutron: lifecycle shutdown: %w", err)
 	}
 
 	a.logger.Info("server stopped")
@@ -230,10 +251,26 @@ func (a *App) registerHealthCheck() {
 			"version": a.oaInfo.Version,
 		}
 		// Contract §7: nucleus reflects the HEALTH of the nucleus dependency.
-		// No checker → "unconfigured"; checker present → "connected" when the
-		// nucleus connection is detected, else "disconnected".
+		// No checker → "unconfigured". With a checker, prefer a LIVE probe:
+		// `IsNucleus` reports features detected earlier by a version query —
+		// a previously identified database can be down while identity stays
+		// true (GO-12). Checkers that implement Ping get a real bounded
+		// connectivity check; a failed probe degrades the response.
 		if a.nucleusChecker == nil {
 			resp["nucleus"] = "unconfigured"
+		} else if pinger, ok := a.nucleusChecker.(interface {
+			Ping(context.Context) error
+		}); ok {
+			probeCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			defer cancel()
+			if err := pinger.Ping(probeCtx); err != nil {
+				resp["status"] = "degraded"
+				resp["nucleus"] = "disconnected"
+				resp["error"] = "nucleus dependency unreachable"
+				JSON(w, http.StatusServiceUnavailable, resp)
+				return
+			}
+			resp["nucleus"] = "connected"
 		} else if a.nucleusChecker.IsNucleus() {
 			resp["nucleus"] = "connected"
 		} else {
