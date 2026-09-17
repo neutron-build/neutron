@@ -64,6 +64,9 @@ export interface CsrfOptions {
  * - Validates that the token in the cookie matches the token in the header
  * - Returns 403 Forbidden if validation fails
  *
+ * The token travels in a HEADER (fetch/SPA) — the middleware does not read
+ * form bodies. To submit from a native form, POST with the header via fetch.
+ *
  * @example
  * ```ts
  * import { csrfMiddleware } from "@neutron-build/core/server";
@@ -77,19 +80,25 @@ export interface CsrfOptions {
  * ];
  * ```
  *
- * In your forms:
- * ```tsx
- * <form method="POST">
- *   <input type="hidden" name="_csrf" value={context.csrfToken} />
- *   {" "}
- * </form>
+ * In your client code, echo the cookie token in the header:
+ * ```ts
+ * // token is readable from the _csrf cookie (not HttpOnly)
+ * await fetch("/submit", {
+ *   method: "POST",
+ *   headers: { "x-csrf-token": readCookie("_csrf") },
+ * });
  * ```
  */
 export function csrfMiddleware(options: CsrfOptions = {}): MiddlewareFn {
   const cookieName = options.cookieName || "_csrf";
   const headerName = options.headerName || "x-csrf-token";
+  // Normalize configured safe methods to uppercase (TS-23): the method is
+  // compared as `method.toUpperCase()`, so a lowercase `["get"]` never
+  // matched and GET requests were being token-checked instead of exempt.
   const ignoredMethods = new Set(
-    options.ignoredMethods || ["GET", "HEAD", "OPTIONS"]
+    (options.ignoredMethods || ["GET", "HEAD", "OPTIONS"]).map((m) =>
+      m.toUpperCase()
+    )
   );
   const cookieOpts = options.cookieOptions || {};
   const cookiePath = cookieOpts.path || "/";
@@ -113,6 +122,9 @@ export function csrfMiddleware(options: CsrfOptions = {}): MiddlewareFn {
       // Only (re)set the cookie when we minted a new token. Regenerating on
       // every safe request churns the cookie and can race a token already
       // embedded in an in-flight form, causing spurious 403s on submit.
+      // The response from `next()` can carry immutable headers (native
+      // redirects, proxied responses) — rewrap instead of appending in
+      // place (TS-17).
       if (!existing) {
         const cookieString = serializeCookie(cookieName, token, {
           path: cookiePath,
@@ -120,7 +132,7 @@ export function csrfMiddleware(options: CsrfOptions = {}): MiddlewareFn {
           secure: cookieSecure,
           sameSite: cookieSameSite,
         });
-        response.headers.append("Set-Cookie", cookieString);
+        return withSetCookie(response, cookieString);
       }
 
       return response;
@@ -172,9 +184,12 @@ function timingSafeEqualStr(a: string, b: string): boolean {
 
 /**
  * Same-origin check for state-changing requests. When an Origin (or Referer)
- * header is present it must match the request host; a forged cross-site request
- * carries the attacker's origin and is rejected. Absent both headers we defer
- * to token validation rather than hard-failing legitimate non-browser clients.
+ * header is present its ORIGIN — scheme + host + port — must match the
+ * request's (TS-23): comparing bare `.host` ignored the scheme, so an
+ * http page and its https namesake were treated as same-origin. A forged
+ * cross-site request carries the attacker's origin and is rejected. Absent
+ * both headers we defer to token validation rather than hard-failing
+ * legitimate non-browser clients.
  */
 function isSameOrigin(request: Request): boolean {
   const source = request.headers.get("Origin") || request.headers.get("Referer");
@@ -182,10 +197,32 @@ function isSameOrigin(request: Request): boolean {
     return true;
   }
   try {
-    return new URL(source).host === new URL(request.url).host;
+    return new URL(source).origin === new URL(request.url).origin;
   } catch {
     return false;
   }
+}
+
+/**
+ * Return `response` with `cookie` appended, rewrapping when the response's
+ * headers are immutable (native redirects, proxied responses) — see TS-17.
+ */
+function withSetCookie(response: Response, cookie: string): Response {
+  if (response.status >= 200 && response.status < 600) {
+    try {
+      const headers = new Headers(response.headers);
+      headers.append("Set-Cookie", cookie);
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
+    } catch {
+      // Exotic runtimes whose Response constructor rejects a used body.
+    }
+  }
+  response.headers.append("Set-Cookie", cookie);
+  return response;
 }
 
 /**

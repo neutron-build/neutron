@@ -164,6 +164,16 @@ export function rateLimitMiddleware(
 ): MiddlewareFn {
   const windowMs = options.windowMs ?? 60000; // 1 minute default
   const maxRequests = options.maxRequests ?? 100;
+  if (
+    !Number.isFinite(windowMs) ||
+    windowMs <= 0 ||
+    !Number.isFinite(maxRequests) ||
+    maxRequests < 1
+  ) {
+    throw new RangeError(
+      "rateLimitMiddleware: windowMs and maxRequests must be finite positive numbers"
+    );
+  }
   const skip = options.skip || (() => false);
   const resolveKey = options.keyGenerator
     ? (request: Request, _context: unknown) => String(options.keyGenerator!(request))
@@ -205,21 +215,45 @@ export function rateLimitMiddleware(
     const now = Date.now();
     const record = requests.get(key);
 
-    // No record or window expired - create new window
+    // No record or window expired - create new window. The cap is a real
+    // admission bound (TS-21): when the map is at capacity and only live
+    // keys remain, a NEW key is refused (a controlled 429 for this client)
+    // rather than admitted past the cap — the old expired-only sweep made
+    // no progress once all keys were live, so memory grew without bound
+    // and every new key triggered another full scan. Existing keys are
+    // always served: refusing them would let an attacker evict a victim's
+    // bucket just by filling the map.
     if (!record || now >= record.resetAt) {
       if (!record && requests.size >= MAX_KEYS) {
-        // At capacity: drop expired entries before admitting a new key.
         for (const [existingKey, existing] of requests) {
           if (now >= existing.resetAt) {
             requests.delete(existingKey);
           }
+        }
+        if (requests.size >= MAX_KEYS) {
+          const retryAfter = Math.ceil(windowMs / 1000);
+          return new Response("Too Many Requests", {
+            status: 429,
+            headers: {
+              "Content-Type": "text/plain",
+              "Retry-After": String(retryAfter),
+              "X-RateLimit-Limit": String(maxRequests),
+              "X-RateLimit-Remaining": "0",
+            },
+          });
         }
       }
       requests.set(key, {
         count: 1,
         resetAt: now + windowMs,
       });
-      return next();
+      // Emit limit headers on first requests too — a client's very first
+      // request should see its budget like every subsequent one does.
+      const response = await next();
+      response.headers.set("X-RateLimit-Limit", String(maxRequests));
+      response.headers.set("X-RateLimit-Remaining", String(Math.max(0, maxRequests - 1)));
+      response.headers.set("X-RateLimit-Reset", String(Math.ceil((now + windowMs) / 1000)));
+      return response;
     }
 
     // Rate limit exceeded

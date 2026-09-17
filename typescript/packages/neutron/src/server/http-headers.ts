@@ -86,9 +86,13 @@ export function createCorsPreflightResponse(
     return null;
   }
 
+  // The response varies on Origin whether the origin is allowed or not
+  // (TS-30): a disallowed-origin 403 without `Vary: Origin` lets a shared
+  // cache serve one origin's rejection (or reuse a cached response with the
+  // wrong header state) for another.
   const resolvedOrigin = resolveResponseOrigin(request, options);
   if (!resolvedOrigin) {
-    return new Response(null, { status: 403 });
+    return new Response(null, { status: 403, headers: makeVaryOriginHeaders() });
   }
 
   const headers = new Headers();
@@ -105,18 +109,29 @@ export function createCorsPreflightResponse(
   return new Response(null, { status: 204, headers });
 }
 
+/** Minimal headers declaring Origin variation for rejected/no-origin paths. */
+function makeVaryOriginHeaders(): Headers {
+  const headers = new Headers();
+  appendVary(headers, "Origin");
+  return headers;
+}
+
 export function applyCorsHeaders(
   request: Request,
   response: Response,
   options: ResolvedCorsOptions
 ): void {
+  // Origin-dependent responses must declare that variation on every path —
+  // including absent and disallowed origins (TS-30). Without it a shared
+  // intermediary can store the no-CORS-header variant and reuse it for an
+  // origin that would have received different header state.
+  appendVary(response.headers, "Origin");
   const resolvedOrigin = resolveResponseOrigin(request, options);
   if (!resolvedOrigin) {
     return;
   }
 
   response.headers.set("Access-Control-Allow-Origin", resolvedOrigin);
-  appendVary(response.headers, "Origin");
 
   if (options.credentials) {
     response.headers.set("Access-Control-Allow-Credentials", "true");

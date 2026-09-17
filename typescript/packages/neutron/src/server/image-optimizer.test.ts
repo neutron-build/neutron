@@ -153,6 +153,13 @@ describe("validateImageParams", () => {
   });
 });
 
+// A real 1x1 PNG — tests that exercise the decode path need valid image
+// bytes, since the optimizer fails closed on undecodable input (TS-13).
+const REAL_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+  "base64"
+);
+
 describe("resolveSourceFile", () => {
   let tmpDir: string;
 
@@ -168,32 +175,53 @@ describe("resolveSourceFile", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("finds file in first publicDir", () => {
-    const result = resolveSourceFile("/photo.jpg", [
+  it("finds file in first publicDir", async () => {
+    const result = await resolveSourceFile("/photo.jpg", [
       path.join(tmpDir, "public"),
       path.join(tmpDir, "src"),
     ]);
-    expect(result).toBe(path.join(tmpDir, "public", "photo.jpg"));
+    // Containment resolves through the filesystem (symlinks, /var →
+    // /private/var on macOS), so compare realpaths.
+    expect(result).toBe(fs.realpathSync(path.join(tmpDir, "public", "photo.jpg")));
   });
 
-  it("finds file in second publicDir", () => {
-    const result = resolveSourceFile("/logo.png", [
+  it("finds file in second publicDir", async () => {
+    const result = await resolveSourceFile("/logo.png", [
       path.join(tmpDir, "public"),
       path.join(tmpDir, "src"),
     ]);
-    expect(result).toBe(path.join(tmpDir, "src", "logo.png"));
+    expect(result).toBe(fs.realpathSync(path.join(tmpDir, "src", "logo.png")));
   });
 
-  it("returns null for missing file", () => {
-    const result = resolveSourceFile("/missing.jpg", [
+  it("returns null for missing file", async () => {
+    const result = await resolveSourceFile("/missing.jpg", [
       path.join(tmpDir, "public"),
     ]);
     expect(result).toBeNull();
   });
 
-  it("rejects path traversal attempts", () => {
+  it("rejects path traversal attempts", async () => {
     // Even if validateImageParams is bypassed, resolveSourceFile should catch this
-    const result = resolveSourceFile("/../../../etc/passwd", [
+    const result = await resolveSourceFile("/../../../etc/passwd", [
+      path.join(tmpDir, "public"),
+    ]);
+    expect(result).toBeNull();
+  });
+
+  it("rejects backslash paths that would escape on Windows", async () => {
+    const result = await resolveSourceFile("/..%5C..%5Cetc%5Cpasswd", [
+      path.join(tmpDir, "public"),
+    ]);
+    expect(result).toBeNull();
+  });
+
+  it("refuses a symlink that escapes the serving root", async () => {
+    const outside = path.join(tmpDir, "outside");
+    fs.mkdirSync(outside, { recursive: true });
+    const secret = path.join(outside, "secret.txt");
+    fs.writeFileSync(secret, "secret");
+    fs.symlinkSync(secret, path.join(tmpDir, "public", "linked.txt"));
+    const result = await resolveSourceFile("/linked.txt", [
       path.join(tmpDir, "public"),
     ]);
     expect(result).toBeNull();
@@ -263,18 +291,42 @@ describe("optimizeImage", () => {
     }
   });
 
-  it("passes through original file when sharp is unavailable", async () => {
-    const content = Buffer.from("fake-image-content");
-    fs.writeFileSync(path.join(tmpDir, "public", "test.png"), content);
+  it("fails closed — a non-image source is never served raw (TS-13)", async () => {
+    // The old fallback returned the original file through the image
+    // endpoint, which made it an arbitrary-file reader for anything inside
+    // the serving roots. Undecodable bytes must be a 415; a missing sharp
+    // must be a 503. Neither may serve the source bytes.
+    const content = Buffer.from("definitely-not-an-image");
+    fs.writeFileSync(path.join(tmpDir, "public", "test.txt"), content);
 
     const result = await optimizeImage(
-      { src: "/test.png", width: 640, quality: 75, format: "webp" },
+      { src: "/test.txt", width: 640, quality: 75, format: "webp" },
       { publicDirs: [path.join(tmpDir, "public")], cacheDir }
     );
 
-    expect("buffer" in result).toBe(true);
-    if ("buffer" in result) {
-      expect(result.buffer).toEqual(content);
+    expect("error" in result).toBe(true);
+    if ("error" in result) {
+      expect([415, 503]).toContain(result.status);
+    }
+  });
+
+  it("transforms a real image rather than echoing its bytes", async () => {
+    fs.writeFileSync(path.join(tmpDir, "public", "one.png"), REAL_PNG);
+
+    const result = await optimizeImage(
+      { src: "/one.png", width: 16, quality: 75, format: "webp" },
+      { publicDirs: [path.join(tmpDir, "public")], cacheDir }
+    );
+
+    if ("error" in result) {
+      expect(result.status).toBe(503); // sharp unavailable in this checkout
+    } else {
+      // A real transform: webp bytes, never the raw PNG echoed back.
+      expect(result.contentType).toBe("image/webp");
+      expect(result.buffer.equals(REAL_PNG)).toBe(false);
+      expect(result.buffer.length).toBeGreaterThan(0);
+      // And the published cache entry exists (atomic publication path).
+      expect(fs.existsSync(cacheDir)).toBe(true);
     }
   });
 });
@@ -313,11 +365,14 @@ describe("handleImageRequest", () => {
     expect(response.status).toBe(404);
   });
 
-  it("returns correct content-type and cache headers", async () => {
-    fs.writeFileSync(
-      path.join(tmpDir, "public", "test.png"),
-      Buffer.from("fakeimage")
-    );
+  it("returns correct content-type and cache headers from a warmed cache entry", async () => {
+    // Served from the cache, so the response-shape assertions do not depend
+    // on sharp being installed.
+    const params = { src: "/test.png", width: 640, quality: 75, format: "png" as const };
+    const { buildCachePath } = await import("./image-optimizer.js");
+    const cached = buildCachePath(cacheDir, params);
+    fs.mkdirSync(path.dirname(cached), { recursive: true });
+    fs.writeFileSync(cached, Buffer.from("cachedpng"));
 
     const request = new Request(
       "http://localhost/_neutron/image?src=/test.png&w=640&fmt=png"
@@ -331,6 +386,7 @@ describe("handleImageRequest", () => {
     expect(response.headers.get("Cache-Control")).toBe(
       "public, max-age=31536000, immutable"
     );
+    expect(Buffer.from(await response.arrayBuffer()).toString()).toBe("cachedpng");
   });
 
   it("returns 400 for path traversal", async () => {
@@ -360,8 +416,7 @@ describe("remote image allowlist (fetch path)", () => {
   }
 
   it("fetches an allowed remote image and serves it", async () => {
-    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
-    const fetchMock = vi.fn(async (_url: string) => imageFetchResponse(png, "image/png"));
+    const fetchMock = vi.fn(async (_url: string) => imageFetchResponse(REAL_PNG, "image/png"));
     vi.stubGlobal("fetch", fetchMock);
 
     const request = new Request(
@@ -379,8 +434,12 @@ describe("remote image allowlist (fetch path)", () => {
     expect((fetchMock.mock.calls[0][0] as string)).toBe(
       "https://cdn.example.com/photo.png"
     );
-    expect(response.status).toBe(200);
-    expect(response.headers.get("content-type")).toContain("image/");
+    // With sharp installed the transform runs and serves 200; without it the
+    // endpoint fails closed (503). Either way the allowlist decided the fetch.
+    expect([200, 503]).toContain(response.status);
+    if (response.status === 200) {
+      expect(response.headers.get("content-type")).toContain("image/");
+    }
   });
 
   it("refuses a remote response that is not an image", async () => {

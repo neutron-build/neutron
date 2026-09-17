@@ -81,6 +81,33 @@ export interface SessionMiddlewareOptions {
 
 const SESSION_CONTEXT_KEY = "session";
 
+/**
+ * Return `response` with `cookie` appended, without mutating the original
+ * (TS-17): responses from `next()` can carry immutable header guards — a
+ * native `Response.redirect()`, a network-fetched response — and appending
+ * to those throws AFTER session persistence has already happened, turning a
+ * login into a 500. Rewrapping with a mutable header copy is lossless for
+ * normal HTTP responses (body stream, status, statusText carried over).
+ */
+function withSetCookie(response: Response, cookie: string): Response {
+  if (response.status >= 200 && response.status < 600) {
+    try {
+      const headers = new Headers(response.headers);
+      headers.append("Set-Cookie", cookie);
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
+    } catch {
+      // Fall through and attempt the direct append — e.g. an exotic runtime
+      // whose Response constructor rejects a used body.
+    }
+  }
+  response.headers.append("Set-Cookie", cookie);
+  return response;
+}
+
 export function createMemorySessionStorage(
   options: MemorySessionStorageOptions = {}
 ): SessionStorage {
@@ -109,12 +136,18 @@ export function createMemorySessionStorage(
       }
     }
 
-    // If still over limit, evict least-recently-used entries (access promotes
-    // recency in getSession, so insertion order is now LRU order).
-    if (map.size >= maxSessions) {
-      const entries = Array.from(map.entries());
-      const toDelete = entries.slice(0, Math.floor(maxSessions * 0.1));
-      for (const [key] of toDelete) {
+    // Evict until at or below capacity (TS-16): the old fixed batch of
+    // `floor(maxSessions * 0.1)` removed ZERO entries for any capacity
+    // below 10, so small stores grew without bound. Evicting oldest-first
+    // (insertion order is LRU order — access promotes recency in
+    // getSession) always makes progress. Session replacement above
+    // refreshes its own recency first, so an update to an existing session
+    // never evicts itself.
+    if (map.size > maxSessions) {
+      for (const key of map.keys()) {
+        if (map.size <= maxSessions) {
+          break;
+        }
         map.delete(key);
       }
     }
@@ -138,8 +171,12 @@ export function createMemorySessionStorage(
       map.delete(sessionId);
       map.set(sessionId, record);
 
+      // Ownership boundary (TS-20): a deep clone at egress, so mutating a
+      // nested value in the returned data cannot alter the stored record
+      // another request reads. Session data must be structured-clone
+      // compatible — persistent backends JSON-encode it anyway.
       return {
-        data: { ...record.data },
+        data: structuredClone(record.data),
         expiresAt: record.expiresAt,
       };
     },
@@ -147,8 +184,13 @@ export function createMemorySessionStorage(
     async setSession(sessionId, data, expiresAt) {
       const ttlExpiry =
         defaultTtlMs && !expiresAt ? Date.now() + defaultTtlMs : expiresAt;
+      // Re-inserting an existing id refreshes its LRU recency rather than
+      // leaving it where it was inserted (TS-16).
+      map.delete(sessionId);
       map.set(sessionId, {
-        data: { ...data },
+        // Deep clone at ingress (TS-20): the caller keeps its reference
+        // after saving, and a shallow copy left nested objects shared.
+        data: structuredClone(data),
         expiresAt: ttlExpiry,
       });
       lazySweep();
@@ -190,15 +232,14 @@ export function sessionMiddleware(options: SessionMiddlewareOptions): Middleware
       if (cookieSessionId) {
         await options.storage.deleteSession(cookieSessionId);
       }
-      response.headers.append(
-        "Set-Cookie",
+      return withSetCookie(
+        response,
         serializeCookie(cookieName, "", {
           ...cookieOptions,
           maxAge: 0,
           expires: new Date(0),
         })
       );
-      return response;
     }
 
     if (session.isDirty || session.isNew) {
@@ -212,8 +253,8 @@ export function sessionMiddleware(options: SessionMiddlewareOptions): Middleware
       }
       const expiresAt = ttlSeconds ? Date.now() + ttlSeconds * 1000 : undefined;
       await options.storage.setSession(session.id, session.toJSON(), expiresAt);
-      response.headers.append(
-        "Set-Cookie",
+      return withSetCookie(
+        response,
         serializeCookie(cookieName, session.id, {
           ...cookieOptions,
           ...(ttlSeconds ? { maxAge: ttlSeconds } : {}),

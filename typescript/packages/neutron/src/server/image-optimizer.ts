@@ -42,7 +42,9 @@ const DEFAULT_FORMAT = "webp";
 /**
  * Negotiate the best image format based on the request Accept header.
  * If an explicit format is provided (via `fmt` query param), it takes priority.
- * Otherwise: prefer AVIF > WebP > JPEG based on what the client accepts.
+ * Otherwise: prefer AVIF > WebP > JPEG based on what the client accepts
+ * WITH a non-zero quality factor — `image/avif;q=0` explicitly forbids AVIF
+ * and must not select it (TS-15).
  */
 export function negotiateFormat(request: Request, requestedFormat?: string): { format: string; negotiated: boolean } {
   if (requestedFormat && VALID_FORMATS.has(requestedFormat)) {
@@ -51,11 +53,39 @@ export function negotiateFormat(request: Request, requestedFormat?: string): { f
 
   const accept = request.headers.get("accept") || "";
 
-  if (accept.includes("image/avif")) {
+  const accepts = (type: string): boolean => {
+    let wildcard = -1; // -1 = unseen, else explicit q of the coding
+    let explicit = -1;
+    for (const item of accept.split(",")) {
+      const [name, ...params] = item.split(";");
+      const trimmed = name.trim().toLowerCase();
+      if (trimmed !== type && trimmed !== "*") {
+        continue;
+      }
+      let q = 1;
+      for (const param of params) {
+        const [key, ...rest] = param.trim().split("=");
+        if (key.trim().toLowerCase() === "q") {
+          const parsed = Number(rest.join("="));
+          q = Number.isFinite(parsed) ? Math.min(Math.max(parsed, 0), 1) : 0;
+        }
+      }
+      if (trimmed === "*") {
+        wildcard = wildcard === -1 ? q : Math.min(wildcard, q);
+      } else {
+        explicit = explicit === -1 ? q : Math.min(explicit, q);
+      }
+    }
+    if (explicit !== -1) return explicit > 0;
+    if (wildcard !== -1) return wildcard > 0;
+    return false;
+  };
+
+  if (accepts("image/avif")) {
     return { format: "avif", negotiated: true };
   }
 
-  if (accept.includes("image/webp")) {
+  if (accepts("image/webp")) {
     return { format: "webp", negotiated: true };
   }
 
@@ -63,7 +93,7 @@ export function negotiateFormat(request: Request, requestedFormat?: string): { f
 }
 
 let sharpModule: any = undefined;
-let sharpLoadAttempted = false;
+let sharpPromise: Promise<any | null> | undefined;
 let sharpWarningLogged = false;
 
 export function validateImageParams(
@@ -137,9 +167,16 @@ export function validateImageParams(
     return { error: "Image src must start with '/'", status: 400 };
   }
 
+  // SECURITY: backslash and NUL are never legal in a URL path; on Windows a
+  // decoded `..\` component is a separator and escapes the serving root even
+  // though it is not a slash-delimited `..` segment (TS-10).
+  if (/[\\\0]/.test(decodedSrc)) {
+    return { error: "Invalid characters in image path", status: 400 };
+  }
+
   // SECURITY: Check for path traversal BEFORE normalization
   // (path.normalize resolves ".." so checking after is useless!)
-  if (decodedSrc.includes("..")) {
+  if (decodedSrc.split("/").includes("..")) {
     return { error: "Path traversal not allowed", status: 400 };
   }
 
@@ -177,8 +214,13 @@ function parseWidth(searchParams: URLSearchParams): number | ImageValidationErro
   if (!wParam) {
     return { error: "Missing 'w' (width) parameter", status: 400 };
   }
-  const width = parseInt(wParam, 10);
-  if (!Number.isFinite(width) || width < MIN_WIDTH || width > MAX_WIDTH) {
+  // Strict decimal integer (TS-15): `parseInt("200junk")` silently produced
+  // 200, accepting malformed input.
+  if (!/^\d+$/.test(wParam)) {
+    return { error: "Width must be a decimal integer", status: 400 };
+  }
+  const width = Number(wParam);
+  if (!Number.isSafeInteger(width) || width < MIN_WIDTH || width > MAX_WIDTH) {
     return {
       error: `Width must be between ${MIN_WIDTH} and ${MAX_WIDTH}`,
       status: 400,
@@ -192,8 +234,11 @@ function parseQuality(searchParams: URLSearchParams): number | ImageValidationEr
   if (!qParam) {
     return DEFAULT_QUALITY;
   }
-  const quality = parseInt(qParam, 10);
-  if (!Number.isFinite(quality) || quality < MIN_QUALITY || quality > MAX_QUALITY) {
+  if (!/^\d+$/.test(qParam)) {
+    return { error: "Quality must be a decimal integer", status: 400 };
+  }
+  const quality = Number(qParam);
+  if (!Number.isSafeInteger(quality) || quality < MIN_QUALITY || quality > MAX_QUALITY) {
     return {
       error: `Quality must be between ${MIN_QUALITY} and ${MAX_QUALITY}`,
       status: 400,
@@ -218,28 +263,35 @@ function parseFormat(
   return fmtParam as ImageParams["format"];
 }
 
-export function resolveSourceFile(
+export async function resolveSourceFile(
   src: string,
   publicDirs: string[]
-): string | null {
+): Promise<string | null> {
+  // Filesystem-resolved containment (TS-10): the previous check was purely
+  // lexical, so a symlink inside a serving root that pointed elsewhere was
+  // followed without complaint. Resolve both root and target through the
+  // filesystem and require the target to live under the REAL root.
   for (const dir of publicDirs) {
-    const resolved = path.resolve(dir, src.slice(1));
-    const normalizedResolved = path.normalize(resolved);
-    const normalizedDir = path.normalize(dir);
-
-    // SECURITY: Fix logic error - use OR instead of AND
-    if (!normalizedResolved.startsWith(normalizedDir + path.sep) || normalizedResolved === normalizedDir) {
+    const decodedPath = src.startsWith("/") ? src : `/${src}`;
+    if (/[\\\0]/.test(decodedPath)) {
       continue;
     }
-
-    // SECURITY: Additional check using path.relative to prevent traversal
-    const relative = path.relative(normalizedDir, normalizedResolved);
-    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    try {
+      const realRoot = await fs.promises.realpath(dir);
+      const target = await fs.promises.realpath(
+        path.resolve(realRoot, "." + decodedPath)
+      );
+      const rel = path.relative(realRoot, target);
+      if (!rel || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+        continue;
+      }
+      const stat = await fs.promises.stat(target);
+      if (stat.isFile()) {
+        return target;
+      }
+    } catch {
+      // Missing file / broken symlink in this root — try the next.
       continue;
-    }
-
-    if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
-      return resolved;
     }
   }
 
@@ -268,25 +320,26 @@ export function buildCachePath(cacheDir: string, params: ImageParams): string {
 }
 
 async function loadSharp(): Promise<any> {
-  if (sharpLoadAttempted) {
-    return sharpModule;
-  }
-
-  sharpLoadAttempted = true;
-  try {
-    const sharpId = "sharp";
-    sharpModule = (await import(/* @vite-ignore */ sharpId)).default;
-  } catch {
-    sharpModule = null;
-    if (!sharpWarningLogged) {
-      console.warn(
-        "[neutron] sharp is not installed. Images will be served without optimization. " +
-          "Install sharp for image optimization: npm install sharp"
-      );
-      sharpWarningLogged = true;
+  // Cache the PROMISE, not the attempt flag (TS-15): `sharpLoadAttempted`
+  // was set before the dynamic import resolved, so concurrent first
+  // requests observed an undefined module and fell into the raw-bytes
+  // fallback. Every caller now awaits the same in-flight import.
+  sharpPromise ??= (async () => {
+    try {
+      const sharpId = "sharp";
+      return (await import(/* @vite-ignore */ sharpId)).default;
+    } catch {
+      if (!sharpWarningLogged) {
+        console.warn(
+          "[neutron] sharp is not installed. The image endpoint will fail " +
+            "closed (503) until it is: npm install sharp"
+        );
+        sharpWarningLogged = true;
+      }
+      return null;
     }
-  }
-
+  })();
+  sharpModule = await sharpPromise;
   return sharpModule;
 }
 
@@ -302,40 +355,95 @@ const FORMAT_TO_CONTENT_TYPE: Record<string, string> = {
 const REMOTE_FETCH_TIMEOUT_MS = 10_000;
 const REMOTE_FETCH_MAX_BYTES = 20 * 1024 * 1024;
 
+/** Read a body stream up to `limit` bytes (TS-12): the cap is enforced on
+ *  ACTUAL bytes as they arrive — never allocated first — and the upstream is
+ *  cancelled when the cap is exceeded or the read fails. */
+async function readBounded(
+  body: ReadableStream<Uint8Array> | null,
+  limit: number
+): Promise<Uint8Array> {
+  if (body === null) {
+    return new Uint8Array();
+  }
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > limit) {
+        throw new RangeError("body exceeds byte limit");
+      }
+      chunks.push(value);
+    }
+    const out = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return out;
+  } catch (error) {
+    void reader.cancel(error).catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 async function fetchRemoteImage(
   src: string,
   opts: ImageOptimizerOptions
 ): Promise<Buffer | { error: string; status: number }> {
-  let response: Response;
+  // Credentials in the URL are rejected outright (TS-11).
+  let url: URL;
   try {
-    response = await fetch(src, {
+    url = new URL(src);
+  } catch {
+    return { error: `Invalid remote image URL: ${src}`, status: 400 };
+  }
+  if (url.username || url.password) {
+    return { error: "Remote image URL must not carry credentials", status: 400 };
+  }
+  try {
+    // Redirects are refused, not followed (TS-11): `redirect: "follow"` let
+    // an allowlisted origin with an open redirect aim the fetch at any
+    // disallowed origin, port, or internal service. Supporting redirects
+    // safely would mean re-validating the allowlist at every hop; refusing
+    // is the containment.
+    const response = await fetch(url.toString(), {
       signal: AbortSignal.timeout(REMOTE_FETCH_TIMEOUT_MS),
-      redirect: "follow",
+      redirect: "error",
     });
+    if (!response.ok) {
+      return { error: `Remote image returned ${response.status}`, status: 502 };
+    }
+    const contentType = response.headers.get("content-type") || "";
+    if (!contentType.startsWith("image/")) {
+      return {
+        error: `Remote image at ${src} is "${contentType}", not an image`,
+        status: 415,
+      };
+    }
+
+    // Enforce the cap on the actual byte stream (TS-12): a chunked,
+    // omitted, or lying Content-Length used to allocate the full body
+    // before the size was ever checked.
+    let bytes: Uint8Array;
+    try {
+      bytes = await readBounded(response.body, REMOTE_FETCH_MAX_BYTES);
+    } catch (error) {
+      if (error instanceof RangeError) {
+        return { error: "Remote image exceeds the 20 MB fetch cap", status: 413 };
+      }
+      return { error: `Failed to read remote image: ${src}`, status: 502 };
+    }
+    return Buffer.from(bytes);
   } catch {
     return { error: `Failed to fetch remote image: ${src}`, status: 502 };
   }
-
-  if (!response.ok) {
-    return { error: `Remote image returned ${response.status}`, status: 502 };
-  }
-  const contentType = response.headers.get("content-type") || "";
-  if (!contentType.startsWith("image/")) {
-    return {
-      error: `Remote image at ${src} is "${contentType}", not an image`,
-      status: 415,
-    };
-  }
-  const declaredLength = Number(response.headers.get("content-length") || "0");
-  if (declaredLength > REMOTE_FETCH_MAX_BYTES) {
-    return { error: "Remote image exceeds the 20 MB fetch cap", status: 413 };
-  }
-
-  const body = await response.arrayBuffer();
-  if (body.byteLength > REMOTE_FETCH_MAX_BYTES) {
-    return { error: "Remote image exceeds the 20 MB fetch cap", status: 413 };
-  }
-  return Buffer.from(body);
 }
 
 export async function optimizeImage(
@@ -366,69 +474,82 @@ export async function optimizeImage(
     }
     sourceBytes = remote;
   } else {
-    sourcePath = resolveSourceFile(params.src, opts.publicDirs);
+    sourcePath = await resolveSourceFile(params.src, opts.publicDirs);
     if (!sourcePath) {
       return { error: "Image not found", status: 404 };
     }
   }
 
+  // Fail closed (TS-13): with sharp unavailable there is no way to verify
+  // the bytes are an image at the requested transform — the old fallback
+  // served the RAW source file through this endpoint, turning the image
+  // optimizer into an arbitrary-file reader for anything inside (or
+  // symlinked into) the serving roots. Optimization support being missing
+  // is a service error, not a reason to skip validation.
   const sharp = await loadSharp();
-
   if (!sharp) {
-    const buffer =
-      sourceBytes ??
-      Buffer.from(fs.readFileSync(sourcePath as unknown as string));
-    const ext = params.remote
-      ? path.posix.extname(new URL(params.src).pathname).toLowerCase().slice(1)
-      : path.extname(sourcePath as unknown as string).toLowerCase().slice(1);
-    const contentType =
-      FORMAT_TO_CONTENT_TYPE[ext] ||
-      FORMAT_TO_CONTENT_TYPE[params.format] ||
-      "application/octet-stream";
-    return { buffer, contentType };
+    return { error: "Image optimization is unavailable (sharp not installed)", status: 503 };
   }
 
   try {
-    let pipeline = sharp(sourceBytes ?? sourcePath).resize(params.width);
+    // Validate that the source decodes as a supported image before
+    // transforming it (TS-13): a readable non-image inside an allowed root
+    // (a .txt, a manifest) must be a 415, never a served file.
+    const pipeline = sharp(sourceBytes ?? sourcePath, {
+      limitInputPixels: 40_000_000,
+    });
+    const metadata = await pipeline.metadata();
+    if (
+      !metadata.format ||
+      !new Set(["jpeg", "png", "webp", "avif", "gif", "svg"]).has(metadata.format)
+    ) {
+      return { error: "Unsupported image", status: 415 };
+    }
+
+    let transformed = sharp(sourceBytes ?? sourcePath, {
+      limitInputPixels: 40_000_000,
+    }).resize(params.width);
 
     switch (params.format) {
       case "webp":
-        pipeline = pipeline.webp({ quality: params.quality });
+        transformed = transformed.webp({ quality: params.quality });
         break;
       case "avif":
-        pipeline = pipeline.avif({ quality: params.quality });
+        transformed = transformed.avif({ quality: params.quality });
         break;
       case "jpeg":
-        pipeline = pipeline.jpeg({ quality: params.quality });
+        transformed = transformed.jpeg({ quality: params.quality });
         break;
       case "png":
-        pipeline = pipeline.png({ quality: params.quality });
+        transformed = transformed.png({ quality: params.quality });
         break;
     }
 
-    const buffer = await pipeline.toBuffer();
+    const buffer = await transformed.toBuffer();
 
-    const cacheParentDir = path.dirname(cachePath);
-    fs.mkdirSync(cacheParentDir, { recursive: true });
-    fs.writeFileSync(cachePath, buffer);
+    // Atomic publication (TS-14): write to a same-directory temp file and
+    // rename it over the final path, so a concurrent reader never sees a
+    // partially written entry. Asynchronous IO throughout — the sync writes
+    // blocked the event loop.
+    await fs.promises.mkdir(path.dirname(cachePath), { recursive: true });
+    const tempPath = `${cachePath}.${process.pid}.${Date.now()}.${Math.random()
+      .toString(36)
+      .slice(2)}.tmp`;
+    try {
+      await fs.promises.writeFile(tempPath, buffer);
+      await fs.promises.rename(tempPath, cachePath);
+    } catch {
+      await fs.promises.unlink(tempPath).catch(() => {});
+    }
 
     return {
       buffer,
       contentType: FORMAT_TO_CONTENT_TYPE[params.format] || "application/octet-stream",
     };
-  } catch (err) {
-    console.error("[neutron] Image optimization failed:", err);
-    const buffer =
-      sourceBytes ??
-      Buffer.from(fs.readFileSync(sourcePath as unknown as string));
-    const ext = params.remote
-      ? path.posix.extname(new URL(params.src).pathname).toLowerCase().slice(1)
-      : path.extname(sourcePath as unknown as string).toLowerCase().slice(1);
-    const contentType =
-      FORMAT_TO_CONTENT_TYPE[ext] ||
-      FORMAT_TO_CONTENT_TYPE[params.format] ||
-      "application/octet-stream";
-    return { buffer, contentType };
+  } catch {
+    // Decode/transform failure is a 415 (TS-13): serving the original bytes
+    // would bypass every guarantee this endpoint makes about what it emits.
+    return { error: "Invalid or unsupported image", status: 415 };
   }
 }
 

@@ -95,9 +95,16 @@ export function inputLimitsMiddleware(options: InputLimitsOptions = {}): Middlew
       });
     }
 
-    // Validate request body size for methods that may have a body
+    // Validate request body size for methods that may have a body. DELETE is
+    // included (TS-22): a typed DELETE handler can bind a body, so a large
+    // one deserved the same early rejection as POST/PUT/PATCH.
     const method = request.method.toUpperCase();
-    if (method === "POST" || method === "PUT" || method === "PATCH") {
+    if (
+      method === "POST" ||
+      method === "PUT" ||
+      method === "PATCH" ||
+      method === "DELETE"
+    ) {
       const contentLength = request.headers.get("content-length");
       const transferEncoding = request.headers.get("transfer-encoding");
 
