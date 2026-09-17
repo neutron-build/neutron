@@ -102,6 +102,12 @@ impl MvccTable {
     ///
     /// Uses CAS (compare-and-swap) on the atomic `deleted_by` field under a
     /// **read lock**, avoiding the need for a write lock on the row vector.
+    ///
+    /// A tombstone left by an ABORTED transaction is reclaimable (NU-10):
+    /// the previous code always CAS'd from `TXN_INVALID`, so an aborted
+    /// owner's ID in the field blocked every later writer until a GC pass
+    /// happened to clear it — an update/delete after a failed transaction
+    /// conflicted forever.
     fn delete_version(
         &self,
         version_idx: usize,
@@ -110,37 +116,61 @@ impl MvccTable {
     ) -> Result<(), MvccError> {
         let rows = self.rows.read(); // READ lock, not write!
         let row = &rows[version_idx];
-        let current = row.version.deleted_by.load(Ordering::Acquire);
-        if current != TXN_INVALID {
-            // Already has a deleted_by set
+        loop {
+            let current = row.version.deleted_by.load(Ordering::Acquire);
             if current == txn_id {
                 return Ok(()); // We already deleted it
             }
-            let status = txn_mgr.get_status(current);
-            if status == TxnStatus::Active {
-                return Err(MvccError::WriteConflict {
-                    table: String::new(),
-                    row_idx: version_idx,
-                });
-            }
-            // If committed/aborted, we can try to overwrite
-        }
-        // CAS: try to set deleted_by from TXN_INVALID to txn_id
-        match row.version.deleted_by.compare_exchange(
-            TXN_INVALID,
-            txn_id,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => Ok(()),
-            Err(existing) => {
-                if existing == txn_id {
-                    Ok(())
-                } else {
-                    Err(MvccError::WriteConflict {
+            // Only an ABORTED owner's marker is reclaimable (NU-10). A
+            // committed tombstone is history — the row's delete already
+            // happened, and a concurrent writer must conflict, not
+            // re-own it.
+            let status = if current == TXN_INVALID {
+                TxnStatus::Committed // sentinel: no owner to reclaim
+            } else {
+                txn_mgr.get_status(current)
+            };
+            match status {
+                TxnStatus::Active => {
+                    return Err(MvccError::WriteConflict {
                         table: String::new(),
                         row_idx: version_idx,
-                    })
+                    });
+                }
+                TxnStatus::Aborted => {
+                    // Reclaim the stale marker: CAS from the OBSERVED id.
+                    match row.version.deleted_by.compare_exchange(
+                        current,
+                        txn_id,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(_) => continue, // someone re-observed first; retry
+                    }
+                }
+                TxnStatus::Committed => {
+                    if current != TXN_INVALID {
+                        // A committed tombstone: the delete already happened
+                        // and is not ours to overwrite.
+                        return Err(MvccError::WriteConflict {
+                            table: String::new(),
+                            row_idx: version_idx,
+                        });
+                    }
+                    // No owner — claim it.
+                    match row.version.deleted_by.compare_exchange(
+                        TXN_INVALID,
+                        txn_id,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(existing) if existing == txn_id => return Ok(()),
+                        // Another writer claimed or reclaimed it first —
+                        // re-observe and judge the new owner.
+                        Err(_) => continue,
+                    }
                 }
             }
         }
@@ -161,33 +191,57 @@ impl MvccTable {
         new_row: Row,
         txn_mgr: &TransactionManager,
     ) -> Result<usize, MvccError> {
-        // Phase 1: CAS delete under read lock
+        // Phase 1: CAS delete under read lock. An ABORTED owner's stale
+        // marker is reclaimable (NU-10) — see `delete_version`.
         {
             let rows = self.rows.read();
             let row = &rows[version_idx];
-            let current = row.version.deleted_by.load(Ordering::Acquire);
-            if current != TXN_INVALID && current != txn_id {
-                let status = txn_mgr.get_status(current);
-                if status == TxnStatus::Active {
-                    return Err(MvccError::WriteConflict {
-                        table: String::new(),
-                        row_idx: version_idx,
-                    });
+            loop {
+                let current = row.version.deleted_by.load(Ordering::Acquire);
+                if current == txn_id {
+                    break; // already ours
                 }
-            }
-            match row.version.deleted_by.compare_exchange(
-                TXN_INVALID,
-                txn_id,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {}
-                Err(existing) if existing == txn_id => {}
-                Err(_) => {
-                    return Err(MvccError::WriteConflict {
-                        table: String::new(),
-                        row_idx: version_idx,
-                    });
+                let status = if current == TXN_INVALID {
+                    TxnStatus::Committed // sentinel: unclaimed
+                } else {
+                    txn_mgr.get_status(current)
+                };
+                match status {
+                    TxnStatus::Active => {
+                        return Err(MvccError::WriteConflict {
+                            table: String::new(),
+                            row_idx: version_idx,
+                        });
+                    }
+                    TxnStatus::Aborted => {
+                        match row.version.deleted_by.compare_exchange(
+                            current,
+                            txn_id,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => break,
+                            Err(_) => continue,
+                        }
+                    }
+                    TxnStatus::Committed => {
+                        if current != TXN_INVALID {
+                            return Err(MvccError::WriteConflict {
+                                table: String::new(),
+                                row_idx: version_idx,
+                            });
+                        }
+                        match row.version.deleted_by.compare_exchange(
+                            TXN_INVALID,
+                            txn_id,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => break,
+                            Err(existing) if existing == txn_id => break,
+                            Err(_) => continue,
+                        }
+                    }
                 }
             }
         }
@@ -201,28 +255,47 @@ impl MvccTable {
         Ok(new_idx)
     }
 
-    /// Garbage collect: remove versions that are invisible to ALL possible
-    /// future transactions (deleted by a committed txn, and no active txn
-    /// could still see the old version).
+    /// Garbage collect: neutralize versions that are invisible to ALL
+    /// possible future transactions.
+    ///
+    /// Identity containment (NU-01): dead versions are neutralized IN PLACE
+    /// — payload dropped, tombstone header kept — and the row vector is
+    /// NEVER compacted. Version indices are stable identities shared by the
+    /// live row store, secondary indexes, pending mutations, and the WAL
+    /// (Delete/Update records address rows by index); `retain`-compaction
+    /// renumbered every survivor, so a post-VACUUM mutation logged a
+    /// position that meant a DIFFERENT row at replay — data loss and
+    /// resurrection. The memory cost of retained tombstone slots is the
+    /// price of identity stability until rows carry stable 64-bit IDs
+    /// (deferred: an on-disk format redesign).
+    ///
+    /// Neutralized slots stay invisible by construction: their creator is
+    /// Aborted (statuses of referenced txns are retained — see
+    /// `gc_resolved_aborted`), or they are deleted by a committed txn older
+    /// than every possible future snapshot.
     fn gc(&self, oldest_active_xmin: u64, txn_mgr: &TransactionManager) -> usize {
         let mut rows = self.rows.write();
-        let before = rows.len();
-        rows.retain(|r| {
+        let mut reclaimed = 0usize;
+        for r in rows.iter_mut() {
             // An aborted creator never produced a visible row. Once it is no
-            // longer active, the physical version can be removed outright.
+            // longer active, the physical version can be dropped outright.
             if txn_mgr.get_status(r.version.created_by) == TxnStatus::Aborted {
-                return false;
+                // Keep the slot (stable identity), release the payload.
+                if !r.data.is_empty() {
+                    reclaimed += 1;
+                }
+                r.data = Arc::new(Vec::new());
+                continue;
             }
-            // Keep if not deleted
             let deleted = r.version.deleted_by.load(Ordering::Acquire);
             if deleted == TXN_INVALID {
-                return true;
+                continue;
             }
             // An aborted delete never removed the row. Clear the stale
             // tombstone before its transaction status is reclaimed.
             if txn_mgr.get_status(deleted) == TxnStatus::Aborted {
                 r.version.deleted_by.store(TXN_INVALID, Ordering::Release);
-                return true;
+                continue;
             }
             // Soundness (checked against lean4 `MvccProofs`/`MvccSpec`): the
             // proven visibility predicate makes a row invisible to a snapshot S
@@ -234,11 +307,14 @@ impl MvccTable {
             // `created_by < oldest_active_xmin` clause is redundant (a row is
             // always deleted no earlier than it was created, so
             // `created_by <= deleted_by`) but kept as an explicit guard.
-            !(r.version.created_by < oldest_active_xmin
-                && deleted < oldest_active_xmin
-                && deleted != TXN_INVALID)
-        });
-        before - rows.len()
+            if r.version.created_by < oldest_active_xmin && deleted < oldest_active_xmin {
+                if !r.data.is_empty() {
+                    reclaimed += 1;
+                }
+                r.data = Arc::new(Vec::new());
+            }
+        }
+        reclaimed
     }
 
     fn referenced_txn_ids(&self, referenced: &mut HashSet<u64>) {
@@ -801,6 +877,35 @@ use super::mvcc_wal::{MvccWal, MvccWalRecord};
 use super::txn::Transaction;
 use super::{StorageEngine, StorageError};
 
+/// Helper macro to gate WAL logging calls. On non-server builds, the macro
+/// expands to `Ok(())` without referencing MvccWalRecord or wal_log.
+macro_rules! wal_log {
+    ($self:expr, $record:expr) => {{
+        #[cfg(feature = "server")]
+        {
+            $self.wal_log(&$record)
+        }
+        #[cfg(not(feature = "server"))]
+        {
+            Ok::<(), StorageError>(())
+        }
+    }};
+}
+
+macro_rules! wal_log_commit {
+    ($self:expr, $txn_id:expr, $xact:expr) => {{
+        #[cfg(feature = "server")]
+        {
+            $self.wal_log_commit($txn_id, $xact)
+        }
+        #[cfg(not(feature = "server"))]
+        {
+            let _ = $xact;
+            Ok::<(), StorageError>(())
+        }
+    }};
+}
+
 /// Wraps [`MvccMemoryEngine`] behind the [`StorageEngine`] trait, providing
 /// proper MVCC-based transactions.
 ///
@@ -808,23 +913,53 @@ use super::{StorageEngine, StorageError};
 /// implicit transaction that is committed immediately. With an explicit
 /// `BEGIN`, all operations use the session's transaction and its snapshot
 /// for visibility filtering.
-/// Savepoint state captured at SAVEPOINT time: per-table visible rows + dirty set.
-pub(super) struct SavepointState {
-    name: String,
-    /// Snapshot of visible rows per table at savepoint time.
-    table_snapshots: HashMap<String, Vec<Row>>,
-    /// Copy of the dirty_tables set at savepoint time.
-    dirty_tables: std::collections::HashSet<String>,
+/// Drop guard for an implicit (auto-commit) transaction (NU-06). See
+/// [`MvccStorageAdapter::auto_txn_guard`].
+struct AutoTxnGuard<'a> {
+    adapter: &'a MvccStorageAdapter,
+    txn_id: u64,
 }
 
-impl SavepointState {
-    fn clone_state(&self) -> SavepointState {
-        SavepointState {
-            name: self.name.clone(),
-            table_snapshots: self.table_snapshots.clone(),
-            dirty_tables: self.dirty_tables.clone(),
+impl Drop for AutoTxnGuard<'_> {
+    fn drop(&mut self) {
+        if self.adapter.engine.txn_mgr().get_status(self.txn_id)
+            == super::txn::TxnStatus::Active
+        {
+            self.adapter.auto_txn_abort(self.txn_id);
         }
     }
+}
+
+/// One reversible operation of an explicit transaction, for
+/// ROLLBACK TO SAVEPOINT (NU-02/NU-03).
+///
+/// The undo journal replaces full-table value snapshots: a savepoint is now
+/// a mark into this journal (O(1) to take), and rollback replays the
+/// entries after the mark in reverse. The old snapshot restore could not
+/// distinguish pre- from post-savepoint work (a delete issued BEFORE the
+/// savepoint was resurrected), collapsed identical duplicate rows into one
+/// via value-equality reinsertion, and logged nothing to the WAL (a
+/// rollback resurrected on replay once the outer transaction committed).
+pub(super) enum UndoOp {
+    /// This transaction inserted the row at `vidx`.
+    Insert { table: String, vidx: usize },
+    /// This transaction deleted the pre-existing row at `vidx` (whose
+    /// content was `row`).
+    DeleteMark { table: String, vidx: usize, row: Row },
+    /// This transaction superseded `old_vidx` (content `old_row`) with a new
+    /// version appended at `new_vidx`.
+    Update {
+        table: String,
+        old_vidx: usize,
+        new_vidx: usize,
+        old_row: Row,
+    },
+}
+
+/// A savepoint: a name plus the undo-journal offset at SAVEPOINT time.
+pub(super) struct SavepointState {
+    pub(super) name: String,
+    pub(super) undo_offset: usize,
 }
 
 /// Per-session MVCC state. Each wire-protocol connection gets its own instance
@@ -838,6 +973,8 @@ pub struct MvccSessionState {
     pub(super) dirty_tables: parking_lot::RwLock<std::collections::HashSet<String>>,
     /// Savepoint stack for nested savepoints within an explicit transaction.
     pub(super) savepoints: parking_lot::RwLock<Vec<SavepointState>>,
+    /// Undo journal of this transaction's operations (NU-02).
+    pub(super) undo_log: parking_lot::RwLock<Vec<UndoOp>>,
     /// Isolation level for the next BEGIN (set via SET TRANSACTION ISOLATION LEVEL).
     pub(super) next_isolation: parking_lot::RwLock<IsolationLevel>,
 }
@@ -854,6 +991,7 @@ impl MvccSessionState {
             session_txn: parking_lot::RwLock::new(None),
             dirty_tables: parking_lot::RwLock::new(std::collections::HashSet::new()),
             savepoints: parking_lot::RwLock::new(Vec::new()),
+            undo_log: parking_lot::RwLock::new(Vec::new()),
             next_isolation: parking_lot::RwLock::new(IsolationLevel::Snapshot),
         }
     }
@@ -1317,6 +1455,48 @@ impl MvccStorageAdapter {
         self.engine.release_unique(txn_id);
     }
 
+    /// RAII backstop for an implicit transaction (NU-06): many auto-commit
+    /// paths have fallible steps between `current_or_auto()` allocating the
+    /// transaction and `auto_commit()` finishing it. A `?` exit used to
+    /// leave the transaction ACTIVE forever — pinning the GC horizon and
+    /// holding unique reservations for the life of the process. The guard
+    /// aborts any implicit transaction that is still active when it drops.
+    /// (A synthetic snapshot suffices: `abort` only reads the id,
+    /// isolation, and membership.)
+    fn auto_txn_guard(&self, txn_id: u64) -> AutoTxnGuard<'_> {
+        AutoTxnGuard {
+            adapter: self,
+            txn_id,
+        }
+    }
+
+    /// Abort a multi-row auto-commit batch that failed partway (NU-07):
+    /// log Abort (best effort — the in-memory state matters more), abort the
+    /// implicit transaction, release its reservations.
+    fn auto_batch_abort(&self, txn_id: u64) {
+        if let Err(e) = wal_log!(self, MvccWalRecord::Abort { txn_id }) {
+            tracing::warn!("MVCC WAL failed to log batch ABORT for txn {txn_id}: {e}");
+        }
+        self.auto_txn_abort(txn_id);
+    }
+
+    /// Abort an implicit transaction that never committed (NU-06).
+    fn auto_txn_abort(&self, txn_id: u64) {
+        let mut txn = Transaction {
+            id: txn_id,
+            status: super::txn::TxnStatus::Active,
+            isolation: IsolationLevel::Snapshot,
+            snapshot: super::txn::Snapshot {
+                txn_id,
+                xmin: txn_id,
+                xmax: txn_id + 1,
+                active: std::collections::HashSet::new(),
+            },
+        };
+        self.engine.release_unique(txn_id);
+        self.engine.txn_mgr().abort(&mut txn);
+    }
+
     /// Log a WAL record (no-op if WAL is disabled or server feature is off).
     #[cfg(feature = "server")]
     fn wal_log(&self, record: &MvccWalRecord) -> Result<(), StorageError> {
@@ -1389,6 +1569,167 @@ impl MvccStorageAdapter {
         self.default_mvcc_session.clone()
     }
 
+    /// Undo one of this transaction's inserts: tombstone the row and log the
+    /// compensating Delete.
+    fn undo_own_insert(
+        &self,
+        table: &str,
+        vidx: usize,
+        txn_id: u64,
+    ) -> Result<(), StorageError> {
+        if let Ok(tbl) = self.engine.get_table(table) {
+            let rows = tbl.rows.read();
+            if let Some(row) = rows.get(vidx)
+                && row.version.created_by == txn_id
+            {
+                // Own insert: mark deleted by ourselves (invisible to
+                // everyone, including this snapshot).
+                let _ = row.version.deleted_by.compare_exchange(
+                    super::txn::TXN_INVALID,
+                    txn_id,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+        }
+        wal_log!(
+            self,
+            MvccWalRecord::Delete {
+                table: table.to_string(),
+                txn_id,
+                version_idx: vidx as u32,
+            }
+        )?;
+        Ok(())
+    }
+
+    /// Undo one of this transaction's deletes: clear the tombstone and log
+    /// the compensating Insert (keyed by the same version index).
+    fn undo_own_delete(
+        &self,
+        table: &str,
+        vidx: usize,
+        row: Row,
+        txn_id: u64,
+    ) -> Result<(), StorageError> {
+        if let Ok(tbl) = self.engine.get_table(table) {
+            let rows = tbl.rows.read();
+            if let Some(mvcc_row) = rows.get(vidx) {
+                let current = mvcc_row.version.deleted_by.load(Ordering::Acquire);
+                if current == txn_id && mvcc_row.version.created_by != txn_id {
+                    mvcc_row
+                        .version
+                        .deleted_by
+                        .store(super::txn::TXN_INVALID, Ordering::Release);
+                }
+            }
+        }
+        wal_log!(
+            self,
+            MvccWalRecord::Insert {
+                table: table.to_string(),
+                txn_id,
+                version_idx: vidx as u32,
+                row,
+            }
+        )?;
+        Ok(())
+    }
+
+    /// Undo one of this transaction's updates: restore the old version,
+    /// tombstone the new one, and log both compensations.
+    fn undo_own_update(
+        &self,
+        table: &str,
+        old_vidx: usize,
+        new_vidx: usize,
+        old_row: Row,
+        txn_id: u64,
+    ) -> Result<(), StorageError> {
+        if let Ok(tbl) = self.engine.get_table(table) {
+            let rows = tbl.rows.read();
+            if let Some(old) = rows.get(old_vidx)
+                && old.version.deleted_by.load(Ordering::Acquire) == txn_id
+                && old.version.created_by != txn_id
+            {
+                old.version
+                    .deleted_by
+                    .store(super::txn::TXN_INVALID, Ordering::Release);
+            }
+            if let Some(new) = rows.get(new_vidx)
+                && new.version.created_by == txn_id
+            {
+                let _ = new.version.deleted_by.compare_exchange(
+                    super::txn::TXN_INVALID,
+                    txn_id,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+        }
+        wal_log!(
+            self,
+            MvccWalRecord::Insert {
+                table: table.to_string(),
+                txn_id,
+                version_idx: old_vidx as u32,
+                row: old_row,
+            }
+        )?;
+        wal_log!(
+            self,
+            MvccWalRecord::Delete {
+                table: table.to_string(),
+                txn_id,
+                version_idx: new_vidx as u32,
+            }
+        )?;
+        Ok(())
+    }
+
+
+    /// Resolve cached index candidates to snapshot-visible rows (NU-14).
+    ///
+    /// `idx.map` entries are keyed by stable version index, so each candidate
+    /// is re-read from `tbl.rows` and visibility-checked under a fresh
+    /// snapshot — the cached copy itself is never trusted. Dead slots (empty
+    /// data after GC), invisible versions, and value drift are all filtered.
+    /// Lock order matches every other index path (indexes guard held, then
+    /// table locks); a concurrent rebuild's `indexes.write` simply waits for
+    /// the shared read guard, and nothing below takes an indexes guard.
+    fn resolve_index_entries(
+        &self,
+        table: &str,
+        _col_idx: usize,
+        _value: &Value,
+        entries: &HashMap<usize, Row>,
+    ) -> Vec<Row> {
+        let candidates: Vec<usize> = entries.keys().copied().collect();
+        let tbl = {
+            let tables = self.engine.tables.read();
+            match tables.get(table) {
+                Some(t) => t.clone(),
+                None => return Vec::new(),
+            }
+        };
+        // Fresh snapshot for the visibility decision.
+        let Ok(mut observer) = self.engine.txn_mgr().try_begin(IsolationLevel::Snapshot) else {
+            return Vec::new();
+        };
+        let snap = observer.snapshot.clone();
+        self.engine.txn_mgr().abort(&mut observer);
+        let rows = tbl.rows.read();
+        let mut out = Vec::with_capacity(candidates.len());
+        for vidx in candidates {
+            if let Some(r) = rows.get(vidx)
+                && r.version.is_visible(&snap, self.engine.txn_mgr())
+            {
+                out.push((*r.data).clone());
+            }
+        }
+        out
+    }
+
     /// O(1) index-based point lookup: check if any index on this table covers
     /// `col_idx`, look up the value in its version_map, verify the version is
     /// still visible, and return the matching `(version_idx, row)` pairs.
@@ -1437,18 +1778,25 @@ impl MvccStorageAdapter {
             // stable MVCC version index, NOT a scan-order position, so a following
             // update()/delete() mutates exactly this version (no re-scan / position
             // remapping that could hit the wrong row).
+            //
+            // Every visible match is returned (NU-09): the old loop broke after
+            // the first visible candidate, which silently reduced a non-unique
+            // index's equality lookup to one row — and a position-based
+            // UPDATE/DELETE on that key then missed rows. Index metadata does
+            // not establish uniqueness, so no single-row optimization is sound
+            // here. The key is re-checked per candidate because version_map
+            // entries can be stale (add-only between rebuilds).
             let mut matches: Vec<(usize, Row)> = Vec::new();
-            // Iterate in reverse: newest versions are appended at the end, so
-            // the most recently visible row is found first. For PK/unique
-            // columns only 1 row per value can be visible at a time —
-            // break immediately to avoid O(n) visibility checks on long
-            // version chains (e.g. 1000+ UPDATEs to the same PK).
             for &vidx in version_indices.iter().rev() {
                 if vidx < rows_guard.len() {
                     let mvcc_row = &rows_guard[vidx];
-                    if mvcc_row.version.is_visible(snap, &self.engine.txn_mgr) {
+                    if mvcc_row.version.is_visible(snap, &self.engine.txn_mgr)
+                        && mvcc_row
+                            .data
+                            .get(idx.col_idx)
+                            .is_some_and(|v| value_eq_coerced(v, value))
+                    {
                         matches.push((vidx, (*mvcc_row.data).clone()));
-                        break;
                     }
                 }
             }
@@ -1487,7 +1835,19 @@ fn value_eq_coerced(a: &Value, b: &Value) -> bool {
 }
 
 /// Type-coerced ordering: promotes Int32/Int64/Float64 to f64 for comparison.
+///
+/// Integer-vs-integer comparisons are EXACT (NU-13): routing them through
+/// f64 merged adjacent Int64 values above 2^53 (9007199254740992 and
+/// 9007199254740993 compared Equal), letting an inclusive range bound admit
+/// out-of-range rows.
 fn value_cmp_coerced(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    fn to_i64(v: &Value) -> Option<i64> {
+        match v {
+            Value::Int32(n) => Some(i64::from(*n)),
+            Value::Int64(n) => Some(*n),
+            _ => None,
+        }
+    }
     fn to_f64(v: &Value) -> Option<f64> {
         match v {
             Value::Int32(n) => Some(*n as f64),
@@ -1499,7 +1859,11 @@ fn value_cmp_coerced(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     if a == b {
         return Some(std::cmp::Ordering::Equal);
     }
-    // Numeric cross-type comparison (Int32/Int64/Float64).
+    // Exact integer comparison before any floating coercion.
+    if let (Some(ai), Some(bi)) = (to_i64(a), to_i64(b)) {
+        return Some(ai.cmp(&bi));
+    }
+    // Numeric cross-type comparison (int/float mixes still go through f64).
     if let (Some(af), Some(bf)) = (to_f64(a), to_f64(b)) {
         return af.partial_cmp(&bf);
     }
@@ -1518,34 +1882,6 @@ fn value_cmp_coerced(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     }
 }
 
-/// Helper macro to gate WAL logging calls. On non-server builds, the macro
-/// expands to `Ok(())` without referencing MvccWalRecord or wal_log.
-macro_rules! wal_log {
-    ($self:expr, $record:expr) => {{
-        #[cfg(feature = "server")]
-        {
-            $self.wal_log(&$record)
-        }
-        #[cfg(not(feature = "server"))]
-        {
-            Ok::<(), StorageError>(())
-        }
-    }};
-}
-
-macro_rules! wal_log_commit {
-    ($self:expr, $txn_id:expr, $xact:expr) => {{
-        #[cfg(feature = "server")]
-        {
-            $self.wal_log_commit($txn_id, $xact)
-        }
-        #[cfg(not(feature = "server"))]
-        {
-            let _ = $xact;
-            Ok::<(), StorageError>(())
-        }
-    }};
-}
 
 #[async_trait::async_trait]
 impl StorageEngine for MvccStorageAdapter {
@@ -1636,6 +1972,8 @@ impl StorageEngine for MvccStorageAdapter {
     async fn insert(&self, table: &str, row: Row) -> Result<(), StorageError> {
         let _writes = self.write_gauge();
         let (txn_id, _snap, auto) = self.current_or_auto()?;
+        // NU-06: a `?` exit below must not strand the implicit transaction.
+        let _auto_guard = auto.then(|| self.auto_txn_guard(txn_id));
         let version_idx = self
             .engine
             .insert(table, txn_id, row.clone())
@@ -1671,6 +2009,10 @@ impl StorageEngine for MvccStorageAdapter {
                 .entry(table.to_string())
                 .or_insert(0) += 1;
         } else {
+            self.mvcc_session().undo_log.write().push(UndoOp::Insert {
+                table: table.to_string(),
+                vidx: version_idx,
+            });
             self.mvcc_session()
                 .dirty_tables
                 .write()
@@ -1687,6 +2029,7 @@ impl StorageEngine for MvccStorageAdapter {
     ) -> Result<(), StorageError> {
         let _writes = self.write_gauge();
         let (txn_id, _snap, auto) = self.current_or_auto()?;
+        let _auto_guard = auto.then(|| self.auto_txn_guard(txn_id));
         let probe = self.unique_probe(table);
         let version_idx = self
             .engine
@@ -1730,6 +2073,10 @@ impl StorageEngine for MvccStorageAdapter {
                 .entry(table.to_string())
                 .or_insert(0) += 1;
         } else {
+            self.mvcc_session().undo_log.write().push(UndoOp::Insert {
+                table: table.to_string(),
+                vidx: version_idx,
+            });
             self.mvcc_session()
                 .dirty_tables
                 .write()
@@ -1746,34 +2093,63 @@ impl StorageEngine for MvccStorageAdapter {
         // One implicit transaction for the whole batch — avoids N auto-commit transactions.
         let n = rows.len() as i64;
         let (txn_id, _snap, auto) = self.current_or_auto()?;
-        let _wal_txn_id = if auto { 0 } else { txn_id };
+        let _auto_guard = auto.then(|| self.auto_txn_guard(txn_id));
+        // NU-07: a MULTI-ROW auto-commit batch is one statement and must be
+        // atomic at replay too. Rows logged as `txn_id = 0` were each
+        // independently recoverable, so a failure halfway left a successful
+        // prefix after restart. Real Begin/records/Commit under the batch's
+        // own id (same formats, replay already understands them); a failure
+        // writes Abort and the prefix is excluded. Single-row batches keep
+        // the cheap txn-0 record (atomic by itself).
+        let wal_txn_id = match (auto, rows.len()) {
+            (true, n) if n > 1 => {
+                wal_log!(self, MvccWalRecord::Begin { txn_id })?;
+                txn_id
+            }
+            (true, _) => 0,
+            (false, _) => txn_id,
+        };
+        let batch_in_wal_txn = auto && rows.len() > 1;
         let mut version_indices: Vec<usize> = Vec::with_capacity(rows.len());
         for row in &rows {
-            let vidx = self
-                .engine
-                .insert(table, txn_id, row.clone())
-                .map_err(|e| match e {
-                    MvccError::TableNotFound(t) => StorageError::TableNotFound(t),
-                    MvccError::WriteConflict { table, row_idx } => {
-                        StorageError::WriteConflict(format!("{table} row {row_idx}"))
+            let vidx = match self.engine.insert(table, txn_id, row.clone()) {
+                Ok(vidx) => vidx,
+                Err(e) => {
+                    if batch_in_wal_txn {
+                        self.auto_batch_abort(txn_id);
                     }
-                    MvccError::NoActiveTransaction => StorageError::NoActiveTransaction,
-                    MvccError::UniqueViolation { table, key } => {
-                        StorageError::UniqueViolation(format!("{table} {key}"))
-                    }
-                })?;
+                    return Err(match e {
+                        MvccError::TableNotFound(t) => StorageError::TableNotFound(t),
+                        MvccError::WriteConflict { table, row_idx } => {
+                            StorageError::WriteConflict(format!("{table} row {row_idx}"))
+                        }
+                        MvccError::NoActiveTransaction => StorageError::NoActiveTransaction,
+                        MvccError::UniqueViolation { table, key } => {
+                            StorageError::UniqueViolation(format!("{table} {key}"))
+                        }
+                    });
+                }
+            };
             version_indices.push(vidx);
-            wal_log!(
+            if let Err(e) = wal_log!(
                 self,
                 MvccWalRecord::Insert {
                     table: table.to_string(),
-                    txn_id: _wal_txn_id,
+                    txn_id: wal_txn_id,
                     version_idx: vidx as u32,
                     row: row.clone(),
                 }
-            )?;
+            ) {
+                if batch_in_wal_txn {
+                    self.auto_batch_abort(txn_id);
+                }
+                return Err(e);
+            }
         }
         if auto {
+            if batch_in_wal_txn {
+                wal_log!(self, MvccWalRecord::Commit { txn_id })?;
+            }
             self.auto_commit(txn_id);
             let pairs: Vec<(&Row, usize)> = rows.iter().zip(version_indices).collect();
             self.update_indexes_for_new_rows(table, &pairs);
@@ -1783,6 +2159,14 @@ impl StorageEngine for MvccStorageAdapter {
                 .entry(table.to_string())
                 .or_insert(0) += n;
         } else {
+            let sess = self.mvcc_session();
+            let mut journal = sess.undo_log.write();
+            for &vidx in &version_indices {
+                journal.push(UndoOp::Insert {
+                    table: table.to_string(),
+                    vidx,
+                });
+            }
             self.mvcc_session()
                 .dirty_tables
                 .write()
@@ -1790,6 +2174,7 @@ impl StorageEngine for MvccStorageAdapter {
         }
         Ok(())
     }
+
 
     async fn scan(&self, table: &str) -> Result<Vec<Row>, StorageError> {
         let (_txn_id, snap, auto) = self.current_or_auto()?;
@@ -2182,7 +2567,11 @@ impl StorageEngine for MvccStorageAdapter {
             }
         }
         drop(rows);
-        if !auto && !matched_vidx.is_empty() {
+        // SIREAD is recorded even when NOTHING matched (NU-11): an empty
+        // predicate read must still register the table so a concurrent
+        // INSERT (record_table_write) forms the phantom edge. record_siread
+        // creates the table entry even with an empty row list.
+        if !auto {
             self.maybe_record_siread(txn_id, table, &matched_vidx);
         }
         if auto {
@@ -2353,7 +2742,10 @@ impl StorageEngine for MvccStorageAdapter {
             }
         }
         drop(rows);
-        if !auto && !matched_vidx.is_empty() {
+        // SIREAD on matched rows (see fast_scan_where_eq) — recorded even
+        // when the range matched nothing, so empty predicate reads are
+        // visible to the conflict graph (NU-11).
+        if !auto {
             self.maybe_record_siread(txn_id, table, &matched_vidx);
         }
         if auto {
@@ -2366,6 +2758,7 @@ impl StorageEngine for MvccStorageAdapter {
         let _writes = self.write_gauge();
         self.mark_mutated(table);
         let (txn_id, _snap, auto) = self.current_or_auto()?;
+        let _auto_guard = auto.then(|| self.auto_txn_guard(txn_id));
 
         // `positions` are stable MVCC version indices (from scan_where_eq_positions
         // / scan_physical), NOT scan-order positions — operate on each directly.
@@ -2374,7 +2767,18 @@ impl StorageEngine for MvccStorageAdapter {
         sorted.dedup();
 
         let mut count = 0;
-        let _wal_txn_id = if auto { 0 } else { txn_id };
+        // NU-07: multi-row auto-commit deletions are one statement and get a
+        // real WAL transaction (Begin/records/Commit-or-Abort); single-row
+        // autos keep the txn-0 record.
+        let wal_txn_id = match (auto, sorted.len()) {
+            (true, n) if n > 1 => {
+                wal_log!(self, MvccWalRecord::Begin { txn_id })?;
+                txn_id
+            }
+            (true, _) => 0,
+            (false, _) => txn_id,
+        };
+        let batch_in_wal_txn = auto && sorted.len() > 1;
         let mut written_indices = Vec::new();
         // (old_row, version_idx) of each deleted row, for auto-commit index removal.
         let mut deleted: Vec<(Arc<Row>, usize)> = Vec::new();
@@ -2383,24 +2787,32 @@ impl StorageEngine for MvccStorageAdapter {
             let Some(old_row) = self.engine.row_at(table, version_idx) else {
                 continue;
             };
-            self.engine
-                .delete(table, version_idx, txn_id)
-                .map_err(|e| match e {
+            if let Err(e) = self.engine.delete(table, version_idx, txn_id) {
+                if batch_in_wal_txn {
+                    self.auto_batch_abort(txn_id);
+                }
+                return Err(match e {
                     MvccError::WriteConflict { table, row_idx } => {
                         StorageError::WriteConflict(format!("{table} row {row_idx}"))
                     }
                     e => StorageError::Io(e.to_string()),
-                })?;
+                });
+            }
             written_indices.push(version_idx);
             deleted.push((old_row, version_idx));
-            wal_log!(
+            if let Err(e) = wal_log!(
                 self,
                 MvccWalRecord::Delete {
                     table: table.to_string(),
-                    txn_id: _wal_txn_id,
+                    txn_id: wal_txn_id,
                     version_idx: version_idx as u32,
                 }
-            )?;
+            ) {
+                if batch_in_wal_txn {
+                    self.auto_batch_abort(txn_id);
+                }
+                return Err(e);
+            }
             count += 1;
         }
 
@@ -2410,6 +2822,9 @@ impl StorageEngine for MvccStorageAdapter {
         }
 
         if auto {
+            if batch_in_wal_txn {
+                wal_log!(self, MvccWalRecord::Commit { txn_id })?;
+            }
             self.auto_commit(txn_id);
             // Incremental index removal: only remove deleted rows from indexes.
             let deleted_rows: Vec<(&Row, usize)> =
@@ -2425,6 +2840,15 @@ impl StorageEngine for MvccStorageAdapter {
                     .or_insert(0) -= count as i64;
             }
         } else {
+            let sess = self.mvcc_session();
+            let mut journal = sess.undo_log.write();
+            for (old_row, version_idx) in &deleted {
+                journal.push(UndoOp::DeleteMark {
+                    table: table.to_string(),
+                    vidx: *version_idx,
+                    row: (**old_row).clone(),
+                });
+            }
             self.mvcc_session()
                 .dirty_tables
                 .write()
@@ -2437,12 +2861,14 @@ impl StorageEngine for MvccStorageAdapter {
         self.update_impl(table, updates, None).await
     }
 
-    /// Positions here are version indices, which name one version for as long
-    /// as it exists and are never reassigned, so there is nothing to re-check:
-    /// the read row can only have been superseded, and the visibility rules in
-    /// `update_impl`/`delete` already decide that. Overrides the trait default,
-    /// which re-resolves by scanning (correct only for scan-ordinal engines,
-    /// and it would match an unrelated row that happens to be equal).
+    /// Positions here are version indices, which name one version for as
+    /// long as it exists. Since the NU-01 identity containment, GC never
+    /// compacts the row vector, so these indices are genuinely never
+    /// reassigned: the read row can only have been superseded, and the
+    /// visibility rules in `update_impl`/`delete` already decide that.
+    /// Overrides the trait default, which re-resolves by scanning (correct
+    /// only for scan-ordinal engines, and it would match an unrelated row
+    /// that happens to be equal).
     async fn update_if_unchanged(
         &self,
         table: &str,
@@ -2530,58 +2956,100 @@ impl StorageEngine for MvccStorageAdapter {
             *next = IsolationLevel::Snapshot; // reset for next BEGIN
             iso
         };
-        let txn = self
+        let mut txn = self
             .engine
             .txn_mgr()
             .try_begin(iso)
             .map_err(|_| StorageError::TransactionIdExhausted)?;
-        wal_log!(self, MvccWalRecord::Begin { txn_id: txn.id })?;
+        // NU-06: a failed WAL BEGIN used to return early with the transaction
+        // already registered as ACTIVE in the manager — leaked until the end
+        // of the process. Abort it explicitly before propagating.
+        if let Err(e) = wal_log!(self, MvccWalRecord::Begin { txn_id: txn.id }) {
+            self.engine.release_unique(txn.id);
+            self.engine.txn_mgr().abort(&mut txn);
+            return Err(e);
+        }
+        sess.undo_log.write().clear();
         *lock = Some(txn);
         Ok(())
     }
 
     async fn commit_txn(&self) -> Result<(), StorageError> {
         let sess = self.mvcc_session();
-        let commit_txn_id;
-        let is_serializable;
-        let mut ser_err: Option<String> = None;
-        {
-            let mut lock = sess.session_txn.write();
-            if let Some(ref mut txn) = *lock {
-                commit_txn_id = txn.id;
-                is_serializable = txn.isolation == IsolationLevel::Serializable;
-                if is_serializable {
-                    // SSI check: detect rw-antidependency cycles before committing.
-                    match self.engine.txn_mgr().commit_serializable(txn) {
-                        Ok(()) => {}
-                        Err(e) => {
-                            // Serialization failure: abort and surface the error.
-                            // Crucially we STILL clear the session transaction
-                            // (`*lock = None` below) — otherwise the session keeps
-                            // an aborted txn with a stale snapshot that a retry's
-                            // BEGIN would silently reuse (BEGIN no-ops when a txn is
-                            // already present), causing read-modify-writes against a
-                            // dead snapshot → lost update.
-                            self.engine.txn_mgr().abort(txn);
-                            ser_err = Some(e);
-                        }
+        // Take the transaction out of the session first: whatever happens
+        // below, the session must not keep a stale transaction a later BEGIN
+        // would silently reuse.
+        let mut txn_opt = sess.session_txn.write().take();
+        let Some(txn) = txn_opt.as_mut() else {
+            // No active transaction: nothing to commit.
+            return Ok(());
+        };
+        let commit_txn_id = txn.id;
+        let is_serializable = txn.isolation == IsolationLevel::Serializable;
+
+        // DURABILITY BEFORE PUBLICATION (NU-05): the old order ran
+        // txn_mgr.commit (making every write visible to concurrent
+        // transactions) BEFORE the durable COMMIT record — an fsync failure
+        // then returned an error after the data was already visible, and
+        // another transaction could commit dependent work on top of a
+        // decision that was never durable. Now: validate, durably decide,
+        // THEN publish. A WAL failure aborts cleanly — nothing was ever
+        // visible, so there is no ambiguous outcome to unwind.
+        //
+        // The S63 marker is taken BEFORE the commit record so it rides the
+        // same fsync (taken, not peeked, so a failed commit cannot leak it
+        // into a later transaction's marker).
+        let xact = if commit_txn_id != 0 {
+            super::current_storage_session()
+                .and_then(|id| self.pending_enlistment.write().remove(&id))
+                .or_else(|| self.pending_enlistment.write().remove(&0))
+        } else {
+            None
+        };
+
+        let commit_result: Result<(), StorageError> = if is_serializable {
+            // Serializable: SSI validation and publication must stay atomic
+            // w.r.t. other serializable committers, with the durable decision
+            // sandwiched between them under the same commit-point lock.
+            let _commit_point = self.engine.txn_mgr().serial_commit_lock();
+            match self.engine.txn_mgr().check_serializable_commit(commit_txn_id) {
+                Err(e) => Err(StorageError::SerializationFailure(e)),
+                Ok(()) => match wal_log_commit!(self, commit_txn_id, xact) {
+                    Err(e) => Err(e),
+                    Ok(()) => {
+                        self.engine.txn_mgr().commit(txn);
+                        Ok(())
                     }
-                } else {
-                    self.engine.txn_mgr().commit(txn);
-                }
-            } else {
-                commit_txn_id = 0;
-                is_serializable = false;
+                },
             }
-            *lock = None;
-        }
-        if let Some(e) = ser_err {
-            // Txn already aborted (abort() ran cleanup_ssi). Discard the session's
-            // uncommitted side state so the next BEGIN starts from a clean slate.
-            self.engine.release_unique(commit_txn_id);
+        } else {
+            match wal_log_commit!(self, commit_txn_id, xact) {
+                Err(e) => Err(e),
+                Ok(()) => {
+                    self.engine.txn_mgr().commit(txn);
+                    Ok(())
+                }
+            }
+        };
+
+        if let Err(e) = commit_result {
+            // Nothing was published: the transaction can be rolled back
+            // cleanly. (For a serialization failure `check_*` did not abort;
+            // for a WAL failure the commit never happened — either way the
+            // in-memory txn is still active, so abort it here.)
+            if self.engine.txn_mgr().get_status(commit_txn_id) == super::txn::TxnStatus::Active
+            {
+                self.engine.release_unique(commit_txn_id);
+                self.engine.txn_mgr().abort(txn);
+            } else {
+                self.engine.release_unique(commit_txn_id);
+            }
+            // An aborted (serializable) txn's SSI data was purged by abort();
+            // a WAL-failure abort does the same via abort().
             sess.savepoints.write().clear();
+            sess.undo_log.write().clear();
             sess.dirty_tables.write().clear();
-            return Err(StorageError::SerializationFailure(e));
+            return Err(e);
         }
         if is_serializable {
             self.engine.txn_mgr().cleanup_ssi(commit_txn_id);
@@ -2611,16 +3079,9 @@ impl StorageEngine for MvccStorageAdapter {
             // Committed: release in-flight unique reservations (the committed rows
             // now hold their keys via the committed-live check + rebuilt index).
             self.engine.release_unique(commit_txn_id);
-            // This session's staged S63 marker, if its transaction enlisted a
-            // specialty model: written beside the COMMIT record under the same
-            // fsync. Taken (not peeked) so a failed commit cannot leak it into
-            // a later transaction's marker.
-            let xact = super::current_storage_session()
-                .and_then(|id| self.pending_enlistment.write().remove(&id))
-                .or_else(|| self.pending_enlistment.write().remove(&0));
-            wal_log_commit!(self, commit_txn_id, xact)?;
         }
         sess.savepoints.write().clear();
+        sess.undo_log.write().clear();
         Ok(())
     }
 
@@ -2634,136 +3095,123 @@ impl StorageEngine for MvccStorageAdapter {
             self.pending_enlistment.write().remove(&id);
         }
         self.pending_enlistment.write().remove(&0);
-        let mut lock = sess.session_txn.write();
-        if let Some(ref mut txn) = *lock {
-            wal_log!(self, MvccWalRecord::Abort { txn_id: txn.id })?;
-            // Release in-flight unique reservations — the aborted inserts are gone,
-            // so their keys are genuinely free again.
+        // LOGICAL CLEANUP FIRST (NU-06): the old order logged WAL Abort with
+        // `?` BEFORE releasing reservations and aborting in-memory state, so
+        // a WAL failure skipped the logical rollback entirely and left an
+        // active transaction holding uniqueness reservations. Replay never
+        // needs the Abort record to exclude the txn (no Commit record means
+        // uncommitted), so a failed Abort log is logged and swallowed rather
+        // than allowed to skip cleanup.
+        if let Some(mut txn) = sess.session_txn.write().take() {
             self.engine.release_unique(txn.id);
-            self.engine.txn_mgr().abort(txn);
+            self.engine.txn_mgr().abort(&mut txn);
+            if let Err(e) = wal_log!(self, MvccWalRecord::Abort { txn_id: txn.id }) {
+                tracing::warn!("MVCC WAL failed to log ABORT for txn {}: {e}", txn.id);
+            }
         }
-        *lock = None;
         sess.dirty_tables.write().clear();
         sess.savepoints.write().clear();
+        sess.undo_log.write().clear();
         Ok(())
     }
 
     async fn savepoint(&self, name: &str) -> Result<(), StorageError> {
         let sess = self.mvcc_session();
-        // Capture visible rows for all tables under the current transaction's snapshot.
-        let lock = sess.session_txn.read();
-        let snap = match lock.as_ref() {
-            Some(txn) => txn.snapshot.clone(),
-            None => return Err(StorageError::NoActiveTransaction),
+        // A savepoint is a MARK into the transaction's undo journal
+        // (NU-02): O(1) to take, precise to roll back to. The previous
+        // implementation snapshotted every table's visible rows — O(database)
+        // per SAVEPOINT, unable to distinguish pre- from post-savepoint work,
+        // and lossy for duplicate rows.
+        let offset = {
+            let lock = sess.session_txn.read();
+            if lock.is_none() {
+                return Err(StorageError::NoActiveTransaction);
+            }
+            sess.undo_log.read().len()
         };
-        drop(lock);
-
-        // Brief outer lock: clone all table names and Arc refs, then drop.
-        let table_entries: Vec<(String, Arc<MvccTable>)> = {
-            let tables = self.engine.tables.read();
-            tables
-                .iter()
-                .map(|(name, tbl)| (name.clone(), Arc::clone(tbl)))
-                .collect()
-        };
-
-        let mut table_snapshots = HashMap::new();
-        for (tbl_name, tbl) in &table_entries {
-            let rows: Vec<Row> = tbl
-                .scan_visible(&snap, self.engine.txn_mgr())
-                .into_iter()
-                .map(|(_, r)| (*r).clone())
-                .collect();
-            table_snapshots.insert(tbl_name.clone(), rows);
-        }
-
-        let dirty_snapshot = sess.dirty_tables.read().clone();
         sess.savepoints.write().push(SavepointState {
             name: name.to_string(),
-            table_snapshots,
-            dirty_tables: dirty_snapshot,
+            undo_offset: offset,
         });
         Ok(())
     }
 
     async fn rollback_to_savepoint(&self, name: &str) -> Result<(), StorageError> {
         let sess = self.mvcc_session();
-        let mut sps = sess.savepoints.write();
-        let pos = sps.iter().rposition(|sp| sp.name == name);
-        let pos = match pos {
-            Some(p) => p,
-            None => return Err(StorageError::Io(format!("savepoint {name} does not exist"))),
+        // Roll back the journal AFTER the mark, in reverse. Nested savepoints
+        // established after this one are discarded; the target stays live
+        // (Postgres semantics — it can be rolled back to again).
+        let (offset, truncate_to) = {
+            let mut sps = sess.savepoints.write();
+            let pos = sps
+                .iter()
+                .rposition(|sp| sp.name == name)
+                .ok_or_else(|| StorageError::Io(format!("savepoint {name} does not exist")))?;
+            let offset = sps[pos].undo_offset;
+            sps.truncate(pos + 1);
+            (offset, pos + 1)
         };
-        let sp = sps[pos].clone_state();
+        let _ = truncate_to;
 
-        // Truncate to keep only savepoints up to and including this one.
-        sps.truncate(pos + 1);
-        drop(sps);
-
-        // Restore: get the current txn_id, then for each table in the snapshot,
-        // delete all currently-visible rows and re-insert the snapshot rows.
-        let lock = sess.session_txn.read();
-        let txn_id = match lock.as_ref() {
-            Some(txn) => txn.id,
-            None => return Err(StorageError::NoActiveTransaction),
-        };
-        let snap = lock.as_ref().unwrap().snapshot.clone();
-        drop(lock);
-
-        for (tbl_name, saved_rows) in &sp.table_snapshots {
-            // Get Arc to the table (brief outer read lock, then drop).
-            let tbl = match self.engine.get_table(tbl_name) {
-                Ok(t) => t,
-                Err(_) => continue, // table was dropped since savepoint
-            };
-
-            // Acquire per-table rows write lock for mutation.
-            let mut rows = tbl.rows.write();
-
-            // Undo all changes by this txn since the savepoint:
-            // - Mark rows created by this txn as deleted (undo inserts)
-            // - Un-delete rows deleted by this txn (undo deletes)
-            for mvcc_row in rows.iter() {
-                if mvcc_row.version.created_by == txn_id {
-                    mvcc_row.version.deleted_by.store(txn_id, Ordering::Release);
-                }
-                if mvcc_row.version.deleted_by.load(Ordering::Acquire) == txn_id
-                    && mvcc_row.version.created_by != txn_id
-                {
-                    mvcc_row
-                        .version
-                        .deleted_by
-                        .store(super::txn::TXN_INVALID, Ordering::Release);
-                }
+        let txn_id = {
+            let lock = sess.session_txn.read();
+            match lock.as_ref() {
+                Some(txn) => txn.id,
+                None => return Err(StorageError::NoActiveTransaction),
             }
+        };
 
-            // Now re-insert saved rows that are not already visible.
-            let txn_mgr = self.engine.txn_mgr();
-            for row in saved_rows {
-                let already_visible = rows
-                    .iter()
-                    .any(|r| r.version.is_visible(&snap, txn_mgr) && *r.data == *row);
-                if !already_visible {
-                    rows.push(MvccRow {
-                        version: RowVersion::new(txn_id),
-                        data: Arc::new(row.clone()),
-                    });
+        // Undo in reverse order; each entry is reversed in memory AND in the
+        // WAL via compensation records (NU-03): the compensations carry the
+        // same txn id, so replay applies them only if the outer transaction
+        // commits, and the rolled-back operations stay rolled back after a
+        // restart. (Formats unchanged — Insert/Delete/Update records already
+        // express everything the undo needs.)
+        let undone: Vec<UndoOp> = {
+            let mut journal = sess.undo_log.write();
+            let tail = journal.split_off(offset);
+            tail.into_iter().rev().collect()
+        };
+        for op in undone {
+            match op {
+                UndoOp::Insert { table, vidx } => {
+                    self.undo_own_insert(&table, vidx, txn_id)?;
+                }
+                UndoOp::DeleteMark { table, vidx, row } => {
+                    self.undo_own_delete(&table, vidx, row, txn_id)?;
+                }
+                UndoOp::Update {
+                    table,
+                    old_vidx,
+                    new_vidx,
+                    old_row,
+                } => {
+                    self.undo_own_update(&table, old_vidx, new_vidx, old_row, txn_id)?;
                 }
             }
         }
-
-        // Restore dirty_tables to the savepoint state.
-        *sess.dirty_tables.write() = sp.dirty_tables;
-
         Ok(())
     }
 
+    /// RELEASE SAVEPOINT (NU-19): the named savepoint and everything nested
+    /// inside it are destroyed while their work is KEPT. The old
+    /// implementation removed only the matching entry (nested savepoints
+    /// stayed usable after their parent was released) and silently succeeded
+    /// for unknown names.
     async fn release_savepoint(&self, name: &str) -> Result<(), StorageError> {
         let sess = self.mvcc_session();
-        let mut sps = sess.savepoints.write();
-        if let Some(pos) = sps.iter().rposition(|sp| sp.name == name) {
-            sps.remove(pos);
+        if sess.session_txn.read().is_none() {
+            return Err(StorageError::NoActiveTransaction);
         }
+        let mut sps = sess.savepoints.write();
+        let pos = sps
+            .iter()
+            .rposition(|sp| sp.name == name)
+            .ok_or_else(|| StorageError::Io(format!("savepoint {name} does not exist")))?;
+        // Drop the target and everything established after it. The undo
+        // journal is untouched: an OUTER savepoint's rollback must still be
+        // able to undo this work.
+        sps.truncate(pos);
         Ok(())
     }
 
@@ -2903,7 +3351,7 @@ impl StorageEngine for MvccStorageAdapter {
 
     fn index_lookup_sync(
         &self,
-        _table: &str,
+        table: &str,
         index_name: &str,
         value: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
@@ -2924,20 +3372,27 @@ impl StorageEngine for MvccStorageAdapter {
             return Ok(None);
         }
         let indexes = self.indexes.read();
-        match indexes.get(index_name) {
-            Some(idx) => Ok(Some(
-                idx.map
-                    .get(value)
-                    .map(|entries| entries.values().cloned().collect())
-                    .unwrap_or_default(),
-            )),
-            None => Ok(None),
-        }
+        let Some(idx) = indexes.get(index_name) else {
+            return Ok(None);
+        };
+        let Some(entries) = idx.map.get(value) else {
+            return Ok(Some(Vec::new()));
+        };
+        // Autocommit readers resolve every cached candidate through a fresh
+        // snapshot (NU-14): `idx.map` is a candidate store, not a row
+        // authority. An implicit writer publishes its index entry BEFORE its
+        // transaction commits (see insert_unique), so trusting the cached
+        // copy exposed uncommitted rows in that window; resolving
+        // `version_idx → tbl.rows` with a visibility check closes it and
+        // also repairs stale copies after concurrent updates.
+        Ok(Some(
+            self.resolve_index_entries(table, idx.col_idx, value, entries),
+        ))
     }
 
     fn index_lookup_range_sync(
         &self,
-        _table: &str,
+        table: &str,
         index_name: &str,
         low: std::ops::Bound<&Value>,
         high: std::ops::Bound<&Value>,
@@ -2954,32 +3409,29 @@ impl StorageEngine for MvccStorageAdapter {
             return Ok(None);
         }
         let indexes = self.indexes.read();
-        match indexes.get(index_name) {
-            Some(idx) => {
-                // BTreeMap::range panics if the start bound is greater than the
-                // end bound; a reversed/contradictory range (e.g. `id >= 20 AND
-                // id <= -5`) is simply empty. The check must use the same `Ord`
-                // the map is keyed by — a coercing comparison reports `Text("")`
-                // vs `Int32(2)` as incomparable and lets the panic through.
-                if crate::storage::range_cannot_match(low, high) {
-                    return Ok(Some(Vec::new()));
-                }
-                // Use BTreeMap::range for O(log N + k) instead of O(N) linear scan.
-                // BTreeMap iterates in key order, so no sort needed.
-                let rows: Vec<Row> = idx
-                    .map
-                    .range((low, high))
-                    .flat_map(|(_, r)| r.values().cloned())
-                    .collect();
-                Ok(Some(rows))
-            }
-            None => Ok(None),
+        let Some(idx) = indexes.get(index_name) else {
+            return Ok(None);
+        };
+        // BTreeMap::range panics if the start bound is greater than the
+        // end bound; a reversed/contradictory range (e.g. `id >= 20 AND
+        // id <= -5`) is simply empty. The check must use the same `Ord`
+        // the map is keyed by — a coercing comparison reports `Text("")`
+        // vs `Int32(2)` as incomparable and lets the panic through.
+        if crate::storage::range_cannot_match(low, high) {
+            return Ok(Some(Vec::new()));
         }
+        // Use BTreeMap::range for O(log N + k), then resolve every candidate
+        // through a fresh snapshot (NU-14 — see index_lookup_sync).
+        let mut resolved = Vec::new();
+        for (key, entries) in idx.map.range((low, high)) {
+            resolved.extend(self.resolve_index_entries(table, idx.col_idx, key, entries));
+        }
+        Ok(Some(resolved))
     }
 
     fn index_only_scan(
         &self,
-        _table: &str,
+        table: &str,
         index_name: &str,
         eq_value: Option<&Value>,
         range: Option<(&Value, &Value)>,
@@ -2998,9 +3450,12 @@ impl StorageEngine for MvccStorageAdapter {
         }
         let indexes = self.indexes.read();
         let idx = indexes.get(index_name)?;
+        // Candidates are resolved through a fresh snapshot (NU-14) so dead or
+        // not-yet-committed versions do not contribute key rows.
         if let Some(val) = eq_value {
             let entries = idx.map.get(val)?;
-            Some(entries.values().map(|_| vec![val.clone()]).collect())
+            let rows = self.resolve_index_entries(table, idx.col_idx, val, entries);
+            Some(rows.into_iter().map(|_| vec![val.clone()]).collect())
         } else if let Some((low, high)) = range {
             // Empty/reversed range — BTreeMap::range would panic.
             if crate::storage::range_cannot_match(
@@ -3011,7 +3466,8 @@ impl StorageEngine for MvccStorageAdapter {
             }
             let mut rows = Vec::new();
             for (key, entries) in idx.map.range(low..=high) {
-                for _ in entries.values() {
+                let resolved = self.resolve_index_entries(table, idx.col_idx, key, entries);
+                for _ in resolved {
                     rows.push(vec![key.clone()]);
                 }
             }
@@ -3019,13 +3475,15 @@ impl StorageEngine for MvccStorageAdapter {
         } else {
             let mut rows = Vec::new();
             for (key, entries) in &idx.map {
-                for _ in entries.values() {
+                let resolved = self.resolve_index_entries(table, idx.col_idx, key, entries);
+                for _ in resolved {
                     rows.push(vec![key.clone()]);
                 }
             }
             Some(rows)
         }
     }
+
 
     fn supports_mvcc(&self) -> bool {
         true
@@ -3059,19 +3517,43 @@ impl StorageEngine for MvccStorageAdapter {
     }
 
     fn drop_storage_session(&self, id: u64) {
-        self.mvcc_sessions.write().remove(&id);
+        // NU-06: removing the session map entry without aborting its
+        // registered transaction leaked an ACTIVE transaction forever —
+        // pinning the GC horizon and holding uniqueness reservations. Take
+        // the transaction and abort it explicitly; the WAL Abort is best
+        // effort (replay excludes the txn anyway without a Commit record).
+        if let Some(sess) = self.mvcc_sessions.write().remove(&id) {
+            if let Some(mut txn) = sess.session_txn.write().take() {
+                self.engine.release_unique(txn.id);
+                self.engine.txn_mgr().abort(&mut txn);
+                #[cfg(feature = "server")]
+                if let Some(ref wal) = self.wal
+                    && let Err(e) = wal.log(&MvccWalRecord::Abort { txn_id: txn.id })
+                {
+                    tracing::warn!(
+                        "MVCC WAL failed to log ABORT for dropped session txn {}: {e}",
+                        txn.id
+                    );
+                }
+            }
+            // Any staged enlistment marker dies with the session.
+            self.pending_enlistment.write().remove(&id);
+        }
     }
 
     /// O(1) COUNT(*) — returns the committed row count maintained by the engine.
-    /// During an active explicit transaction the count reflects the last commit,
-    /// not mid-txn inserts/deletes (those are accounted for at COMMIT).
+    /// Declines inside any explicit transaction (NU-12): the cached count
+    /// reflects the last commit, so it omits the transaction's own
+    /// inserts/deletes and any external commits since its snapshot — a
+    /// transaction-visible COUNT must fall back to the snapshot-correct
+    /// scan. It also declines for serializable transactions so the read
+    /// stays visible to SSI.
     fn fast_count_all(&self, table: &str) -> Option<usize> {
         if crate::storage::fast_path_blocked_by_replacing(table) {
             return None;
         }
-        // See `serializable_txn_active` — declining keeps the read visible to
-        // SSI by forcing the caller onto a SIREAD-recording path.
-        if self.serializable_txn_active() {
+        let session = self.mvcc_session();
+        if session.session_txn.read().is_some() {
             return None;
         }
         self.committed_counts
@@ -3087,22 +3569,29 @@ impl StorageEngine for MvccStorageAdapter {
         } else {
             vec![table.to_string()]
         };
-        let removed = if table.is_empty() {
+        let reclaimed = if table.is_empty() {
             self.engine.gc(watermark)
         } else {
             self.engine
                 .gc_table(table, watermark)
                 .map_err(|error| StorageError::TableNotFound(error.to_string()))?
         };
+        // Version slots are retained (NU-01 identity containment), so the
+        // referenced transaction statuses stay referenced — reclaim only
+        // what nothing refers to anymore.
         let referenced = self.engine.referenced_txn_ids();
-        let gc_aborted = self
+        let _gc_aborted = self
             .engine
             .txn_mgr()
             .gc_resolved_aborted(watermark, &referenced);
-        let (_, gc_committed, retained_aborted) = self.engine.txn_mgr().run_gc();
-        // GC compacts each table's version vector, so physical version indices
-        // change. Rebuild every affected secondary index before returning;
-        // otherwise an index can point at a different surviving row.
+        let _ = self.engine.txn_mgr().run_gc();
+        // GC neutralizes version payloads in place; secondary indexes are
+        // rebuilt from the surviving snapshot so no index entry points at a
+        // neutralized slot. Rebuild failure PROPAGATES (NU-20): the old code
+        // discarded it and reported success while an affected index stayed
+        // stale. The observer transaction is committed first so it cannot
+        // leak on the error path.
+        let mut repair_err: Option<StorageError> = None;
         for affected in affected_tables {
             let mut observer = self
                 .engine
@@ -3110,12 +3599,24 @@ impl StorageEngine for MvccStorageAdapter {
                 .try_begin(IsolationLevel::Snapshot)
                 .map_err(|_| StorageError::TransactionIdExhausted)?;
             let snapshot = observer.snapshot.clone();
-            let _ = self.rebuild_indexes_for_table(&affected, &snapshot);
+            let repair = self.rebuild_indexes_for_table(&affected, &snapshot);
             self.engine.txn_mgr().commit(&mut observer);
+            if repair.is_none() && repair_err.is_none() {
+                repair_err = Some(StorageError::Io(format!(
+                    "index rebuild failed for table {affected} during vacuum; \
+                     derived indexes may be stale"
+                )));
+            }
+        }
+        if let Some(err) = repair_err {
+            return Err(err);
         }
         // (pages_scanned, dead_tuples_reclaimed, pages_freed, bytes_reclaimed)
-        // For in-memory MVCC, "pages" are not meaningful; report version counts.
-        Ok((0, removed, 0, gc_committed + gc_aborted + retained_aborted))
+        // For in-memory MVCC, "pages" are not meaningful. Bytes reclaimed are
+        // NOT measured (NU-20): the previous code reported a SUM OF TRANSACTION
+        // STATUS COUNTS in the bytes field, which is a count of metadata
+        // entries, not bytes — a number with the wrong unit is worse than none.
+        Ok((0, reclaimed, 0, 0))
     }
 
     async fn vacuum_all(&self) -> Result<(usize, usize, usize, usize), StorageError> {
@@ -3339,10 +3840,17 @@ mod tests {
 
         assert_eq!(engine.total_versions(), 2);
 
-        // GC with xmin beyond both txns — should remove the old deleted version
+        // GC with xmin beyond both txns neutralizes the old deleted version
+        // (NU-01 identity containment): its payload is dropped but its SLOT
+        // is retained, so version indices — the identities the WAL, indexes,
+        // and pending mutations address rows by — are never reassigned.
         let gc_count = engine.gc(t2.id + 10);
         assert_eq!(gc_count, 1);
-        assert_eq!(engine.total_versions(), 1);
+        assert_eq!(engine.total_versions(), 2, "slots are retained; identities are stable");
+        // The dead version is invisible to a fresh snapshot.
+        let mut reader = txn_mgr.begin(IsolationLevel::Snapshot);
+        assert_eq!(engine.scan_rows("t1", &reader.snapshot).unwrap().len(), 1);
+        txn_mgr.abort(&mut reader);
     }
 
     #[test]
@@ -3371,7 +3879,15 @@ mod tests {
 
         txn_mgr.abort(&mut observer);
         assert_eq!(engine.gc(txn_mgr.gc_watermark()), 1);
-        assert_eq!(engine.total_versions(), 0);
+        // Slot retained (NU-01); the version is dead but its identity is not
+        // reassigned.
+        assert_eq!(engine.total_versions(), 1);
+        let mut after = txn_mgr.begin(IsolationLevel::Snapshot);
+        assert!(
+            engine.scan_rows("gc_horizon", &after.snapshot).unwrap().is_empty(),
+            "the collected version must be invisible"
+        );
+        txn_mgr.abort(&mut after);
     }
 
     #[test]
@@ -3429,12 +3945,17 @@ mod tests {
             engine.gc_table("gc_one", txn_mgr.gc_watermark()).unwrap(),
             1
         );
-        assert_eq!(engine.total_versions(), 1);
+        // Slots retained under NU-01 identity containment.
+        assert_eq!(engine.total_versions(), 2);
         assert_eq!(
             engine.gc_table("gc_two", txn_mgr.gc_watermark()).unwrap(),
             1
         );
-        assert_eq!(engine.total_versions(), 0);
+        assert_eq!(engine.total_versions(), 2);
+        let mut after = txn_mgr.begin(IsolationLevel::Snapshot);
+        assert!(engine.scan_rows("gc_one", &after.snapshot).unwrap().is_empty());
+        assert!(engine.scan_rows("gc_two", &after.snapshot).unwrap().is_empty());
+        txn_mgr.abort(&mut after);
     }
 
     #[test]
@@ -3467,7 +3988,8 @@ mod tests {
 
         txn_mgr.commit(&mut long_snapshot);
         assert_eq!(engine.gc(txn_mgr.gc_watermark()), 1_000);
-        assert_eq!(engine.total_versions(), 1);
+        // All 1000 dead slots are retained (NU-01): identities stay stable.
+        assert_eq!(engine.total_versions(), 1_001);
         let observer = txn_mgr.begin(IsolationLevel::Snapshot);
         assert_eq!(
             engine.scan_rows("gc_churn", &observer.snapshot).unwrap(),
@@ -4666,10 +5188,180 @@ mod tests {
 
         assert_eq!(engine.total_versions(), 1);
 
-        // GC should remove the deleted version
+        // GC neutralizes the deleted version; its slot is retained (NU-01).
         let removed = engine.gc(t2.id + 10);
         assert_eq!(removed, 1);
-        assert_eq!(engine.total_versions(), 0);
+        assert_eq!(engine.total_versions(), 1);
+        let mut fresh = txn_mgr.begin(IsolationLevel::Snapshot);
+        assert!(engine.scan_rows("t", &fresh.snapshot).unwrap().is_empty());
+        txn_mgr.abort(&mut fresh);
+    }
+
+
+    // ── Audit regression tests (2026-09-17 sweep) ─────────────────────────
+
+    /// NU-13: adjacent Int64 values above 2^53 must not compare Equal via
+    /// f64 coercion — an inclusive range bound would admit the neighbor.
+    #[test]
+    fn audit_value_cmp_exact_for_large_integers() {
+        use crate::types::Value;
+        let big = Value::Int64(9_007_199_254_740_992);
+        let neighbor = Value::Int64(9_007_199_254_740_993);
+        assert_ne!(
+            value_cmp_coerced(&big, &neighbor),
+            Some(std::cmp::Ordering::Equal),
+            "distinct Int64 values merged through f64 coercion"
+        );
+        assert_eq!(
+            value_cmp_coerced(&neighbor, &big),
+            Some(std::cmp::Ordering::Greater)
+        );
+        // Mixed widths stay exact too.
+        assert_eq!(
+            value_cmp_coerced(&Value::Int32(5), &Value::Int64(5)),
+            Some(std::cmp::Ordering::Equal)
+        );
+    }
+
+    /// NU-10: a tombstone left by an ABORTED transaction must be reclaimable
+    /// by a later writer — without waiting for a VACUUM.
+    #[test]
+    fn audit_aborted_delete_owner_is_reclaimable() {
+        let (engine, txn_mgr) = setup();
+        engine.create_table("t");
+
+        let mut creator = txn_mgr.begin(IsolationLevel::Snapshot);
+        engine.insert("t", creator.id, row(&[1])).unwrap();
+        txn_mgr.commit(&mut creator);
+
+        // First writer deletes the row, then aborts.
+        let mut loser = txn_mgr.begin(IsolationLevel::Snapshot);
+        let vidx = engine.scan("t", &loser.snapshot).unwrap()[0].0;
+        engine.delete("t", vidx, loser.id).unwrap();
+        txn_mgr.abort(&mut loser);
+
+        // A second writer must be able to delete/update the same row: the
+        // aborted owner's marker is stale and reclaimable (the old CAS only
+        // ever compared against TXN_INVALID and conflicted forever).
+        let mut winner = txn_mgr.begin(IsolationLevel::Snapshot);
+        engine
+            .delete("t", vidx, winner.id)
+            .expect("aborted tombstone must be reclaimable without VACUUM");
+        txn_mgr.commit(&mut winner);
+    }
+
+    /// NU-01: version indices are stable identities across GC — the WAL and
+    /// pending mutations address rows by them, so compaction must not
+    /// renumber survivors.
+    #[test]
+    fn audit_gc_never_renumbers_surviving_identities() {
+        let (engine, txn_mgr) = setup();
+        engine.create_table("t");
+
+        let mut c1 = txn_mgr.begin(IsolationLevel::Snapshot);
+        engine.insert("t", c1.id, row(&[1])).unwrap();
+        txn_mgr.commit(&mut c1);
+        let mut c2 = txn_mgr.begin(IsolationLevel::Snapshot);
+        let a = engine.scan("t", &c2.snapshot).unwrap()[0].0;
+        engine.insert("t", c2.id, row(&[2])).unwrap();
+        txn_mgr.commit(&mut c2);
+
+        // Delete row 0 and GC: row 1 survives. Its identity must not shift
+        // to index 0, or a later mutation by identity would hit the wrong
+        // row (and the historical WAL would replay onto the wrong row).
+        let mut d = txn_mgr.begin(IsolationLevel::Snapshot);
+        let idxs = engine.scan("t", &d.snapshot).unwrap();
+        let first = idxs.iter().map(|(i, _)| *i).min().unwrap();
+        engine.delete("t", first, d.id).unwrap();
+        txn_mgr.commit(&mut d);
+        engine.gc(txn_mgr.gc_watermark());
+
+        let mut reader = txn_mgr.begin(IsolationLevel::Snapshot);
+        let survivors = engine.scan("t", &reader.snapshot).unwrap();
+        txn_mgr.abort(&mut reader);
+        let survivor_idx = survivors[0].0;
+        assert_ne!(
+            survivor_idx, first,
+            "GC renumbered a surviving row into a reclaimed slot"
+        );
+
+        // Mutating by the survivor's identity still hits the survivor.
+        let mut w = txn_mgr.begin(IsolationLevel::Snapshot);
+        engine
+            .update("t", survivor_idx, w.id, row(&[42]))
+            .unwrap();
+        txn_mgr.commit(&mut w);
+        let mut check = txn_mgr.begin(IsolationLevel::Snapshot);
+        let rows = engine.scan_rows("t", &check.snapshot).unwrap();
+        txn_mgr.abort(&mut check);
+        assert_eq!(rows, vec![row(&[42])]);
+    }
+
+    /// NU-02: ROLLBACK TO SAVEPOINT must undo only POST-savepoint work. A
+    /// delete issued BEFORE the savepoint stays deleted.
+    #[tokio::test]
+    async fn audit_savepoint_keeps_pre_savepoint_delete() {
+        let adapter = MvccStorageAdapter::new();
+        adapter.create_table("t").await.unwrap();
+        adapter.insert("t", adapter_row(&[1])).await.unwrap();
+        adapter.insert("t", adapter_row(&[2])).await.unwrap();
+
+        adapter.begin_txn().await.unwrap();
+        // Delete row 0 FIRST...
+        adapter.delete("t", &[0]).await.unwrap();
+        // ...then savepoint, then insert.
+        adapter.savepoint("sp").await.unwrap();
+        adapter.insert("t", adapter_row(&[3])).await.unwrap();
+        adapter.rollback_to_savepoint("sp").await.unwrap();
+
+        let rows = adapter.scan("t").await.unwrap();
+        assert_eq!(
+            rows,
+            vec![adapter_row(&[2])],
+            "pre-savepoint delete was resurrected and/or the post-savepoint insert survived"
+        );
+        adapter.commit_txn().await.unwrap();
+    }
+
+    /// NU-02: identical duplicate rows survive a savepoint rollback with
+    /// their multiplicity (value-equality restore used to collapse them).
+    #[tokio::test]
+    async fn audit_savepoint_preserves_duplicate_multiplicity() {
+        let adapter = MvccStorageAdapter::new();
+        adapter.create_table("t").await.unwrap();
+        adapter.insert("t", adapter_row(&[7])).await.unwrap();
+        adapter.insert("t", adapter_row(&[7])).await.unwrap();
+
+        adapter.begin_txn().await.unwrap();
+        adapter.savepoint("sp").await.unwrap();
+        // Delete BOTH duplicates after the savepoint, then roll back.
+        adapter.delete("t", &[0, 1]).await.unwrap();
+        adapter.rollback_to_savepoint("sp").await.unwrap();
+
+        let rows = adapter.scan("t").await.unwrap();
+        assert_eq!(rows.len(), 2, "duplicate rows collapsed to one");
+        adapter.commit_txn().await.unwrap();
+    }
+
+    /// NU-19: RELEASE SAVEPOINT destroys the savepoint AND its nested
+    /// descendants; ROLLBACK TO a released savepoint fails; unknown names
+    /// fail instead of succeeding silently.
+    #[tokio::test]
+    async fn audit_release_savepoint_drops_nested_and_unknown_fails() {
+        let adapter = MvccStorageAdapter::new();
+        adapter.create_table("t").await.unwrap();
+        adapter.insert("t", adapter_row(&[1])).await.unwrap();
+
+        adapter.begin_txn().await.unwrap();
+        adapter.savepoint("outer").await.unwrap();
+        adapter.savepoint("inner").await.unwrap();
+        adapter.release_savepoint("outer").await.unwrap();
+
+        let err = adapter.rollback_to_savepoint("inner").await;
+        assert!(err.is_err(), "nested savepoint survived its parent's RELEASE");
+        let err = adapter.release_savepoint("nope").await;
+        assert!(err.is_err(), "unknown savepoint name silently succeeded");
+        adapter.commit_txn().await.unwrap();
     }
 
     #[tokio::test]
@@ -5133,13 +5825,24 @@ impl MvccStorageAdapter {
         let _writes = self.write_gauge();
         self.mark_mutated(table);
         let (txn_id, _snap, auto) = self.current_or_auto()?;
+        let _auto_guard = auto.then(|| self.auto_txn_guard(txn_id));
 
         // `updates` keys are stable MVCC version indices (from
         // scan_where_eq_positions / scan_physical), NOT scan-order positions —
         // mutate each version directly so the write always lands on the row that
         // row-finding matched, never a re-scan position that could be the wrong row.
         let mut count = 0;
-        let _wal_txn_id = if auto { 0 } else { txn_id };
+        // NU-07: multi-row auto-commit updates are one statement and get a
+        // real WAL transaction; single-row autos keep the txn-0 record.
+        let wal_txn_id = match (auto, updates.len()) {
+            (true, n) if n > 1 => {
+                wal_log!(self, MvccWalRecord::Begin { txn_id })?;
+                txn_id
+            }
+            (true, _) => 0,
+            (false, _) => txn_id,
+        };
+        let batch_in_wal_txn = auto && updates.len() > 1;
         let mut written_indices = Vec::new();
         // (old_vidx, new_vidx, old_row, new_row) of each applied update, for
         // auto-commit incremental index maintenance.
@@ -5161,27 +5864,40 @@ impl MvccStorageAdapter {
                 None => self
                     .engine
                     .update(table, *version_idx, txn_id, new_row.clone()),
-            }
-            .map_err(|e| match e {
-                MvccError::WriteConflict { table, row_idx } => {
-                    StorageError::WriteConflict(format!("{table} row {row_idx}"))
+            };
+            let new_vidx = match new_vidx {
+                Ok(v) => v,
+                Err(e) => {
+                    if batch_in_wal_txn {
+                        self.auto_batch_abort(txn_id);
+                    }
+                    return Err(match e {
+                        MvccError::WriteConflict { table, row_idx } => {
+                            StorageError::WriteConflict(format!("{table} row {row_idx}"))
+                        }
+                        MvccError::UniqueViolation { table, key } => {
+                            StorageError::UniqueViolation(format!("{table} {key}"))
+                        }
+                        e => StorageError::Io(e.to_string()),
+                    });
                 }
-                MvccError::UniqueViolation { table, key } => {
-                    StorageError::UniqueViolation(format!("{table} {key}"))
-                }
-                e => StorageError::Io(e.to_string()),
-            })?;
+            };
             written_indices.push(*version_idx);
-            wal_log!(
+            if let Err(e) = wal_log!(
                 self,
                 MvccWalRecord::Update {
                     table: table.to_string(),
-                    txn_id: _wal_txn_id,
+                    txn_id: wal_txn_id,
                     old_version_idx: *version_idx as u32,
                     new_version_idx: new_vidx as u32,
                     new_row: new_row.clone(),
                 }
-            )?;
+            ) {
+                if batch_in_wal_txn {
+                    self.auto_batch_abort(txn_id);
+                }
+                return Err(e);
+            }
             applied.push((*version_idx, new_vidx, old_row, new_row.clone()));
             count += 1;
         }
@@ -5192,6 +5908,9 @@ impl MvccStorageAdapter {
         }
 
         if auto {
+            if batch_in_wal_txn {
+                wal_log!(self, MvccWalRecord::Commit { txn_id })?;
+            }
             // Publish index entries BEFORE auto_commit releases unique
             // reservations — same ordering contract as insert_unique (see
             // there): a concurrent unique probe must find the reservation or
@@ -5207,6 +5926,16 @@ impl MvccStorageAdapter {
             }
             self.auto_commit(txn_id);
         } else {
+            let sess = self.mvcc_session();
+            let mut journal = sess.undo_log.write();
+            for (old_vidx, new_vidx, old_row, _) in &applied {
+                journal.push(UndoOp::Update {
+                    table: table.to_string(),
+                    old_vidx: *old_vidx,
+                    new_vidx: *new_vidx,
+                    old_row: (**old_row).clone(),
+                });
+            }
             self.mvcc_session()
                 .dirty_tables
                 .write()
