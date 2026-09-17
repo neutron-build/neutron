@@ -59,6 +59,9 @@ fn is_pending_pos(pos: usize) -> bool {
     pos >= PENDING_POS_BASE
 }
 
+/// A (position, replacement-row) pair, as `BufferedOp::Update`/`Delete` carry.
+type PosUpdate = (usize, Row);
+
 /// A buffered write operation within a transaction.
 #[derive(Debug, Clone)]
 enum BufferedOp {
@@ -75,6 +78,26 @@ enum BufferedOp {
     Update {
         table: String,
         updates: Vec<(usize, Row)>,
+    },
+    /// A conditional update issued inside the transaction (NU-16): carries
+    /// the FIRST observed committed row per position so `apply_buffer` can
+    /// re-check the precondition atomically at COMMIT. The executor's
+    /// read-modify-write contract survives concurrent writers between the
+    /// read and the commit — the old code stripped the expected row and
+    /// applied a plain update, silently overwriting a competing writer.
+    UpdateIf {
+        table: String,
+        /// (position, expected row, replacement row)
+        updates: Vec<(usize, Row, Row)>,
+        /// Unique column sets to enforce when the conditional path is the
+        /// deciding write.
+        unique_col_sets: Vec<Vec<usize>>,
+    },
+    /// A conditional delete issued inside the transaction (NU-16).
+    DeleteIf {
+        table: String,
+        /// (position, expected row)
+        targets: Vec<(usize, Row)>,
     },
     CreateTable {
         table: String,
@@ -102,6 +125,12 @@ struct TableOverlay {
     /// `BTreeMap` so they read back in the order they were inserted, which is
     /// what replaying the append-only log produced.
     inserts: std::collections::BTreeMap<usize, Row>,
+    /// Table existence under this transaction's DDL (NU-18): `CreateTable`
+    /// marks the table as existing WITHOUT inheriting the engine's committed
+    /// rows; `DropTable` marks it as gone — reads must not see the old
+    /// incarnation's rows, and a later re-CREATE starts empty.
+    created_in_txn: bool,
+    dropped_in_txn: bool,
 }
 
 /// Transaction state — holds buffered operations until commit/abort.
@@ -170,6 +199,12 @@ impl TxnBuffer {
     /// a DELETE after an UPDATE wins, an UPDATE after a DELETE is a no-op
     /// (the row is gone), and an UPDATE to a pending row edits it in place —
     /// exactly what replaying the log against a materialised view did.
+    ///
+    /// DDL folds too (NU-18): CreateTable clears the table's buffered rows
+    /// and marks it created (an empty base, not the engine's old rows);
+    /// DropTable clears the rows and marks it dropped (reads must not see
+    /// the committed incarnation — a drop-then-read used to return the old
+    /// table's rows). The latest DDL wins for a drop-then-create cycle.
     fn fold(overlays: &mut HashMap<String, TableOverlay>, op: &BufferedOp) {
         match op {
             BufferedOp::Insert {
@@ -204,7 +239,43 @@ impl TxnBuffer {
                     }
                 }
             }
-            BufferedOp::CreateTable { .. } | BufferedOp::DropTable { .. } => {}
+            BufferedOp::UpdateIf { table, updates, .. } => {
+                let ov = overlays.entry(table.clone()).or_default();
+                for (pos, _expected, new_row) in updates {
+                    if ov.deleted.contains(pos) {
+                        continue;
+                    }
+                    if let Some(slot) = ov.inserts.get_mut(pos) {
+                        *slot = new_row.clone();
+                    } else {
+                        ov.updates.insert(*pos, new_row.clone());
+                    }
+                }
+            }
+            BufferedOp::DeleteIf { table, targets } => {
+                let ov = overlays.entry(table.clone()).or_default();
+                for (pos, _) in targets {
+                    ov.inserts.remove(pos);
+                    ov.updates.remove(pos);
+                    ov.deleted.insert(*pos);
+                }
+            }
+            BufferedOp::CreateTable { table } => {
+                let ov = overlays.entry(table.clone()).or_default();
+                ov.deleted.clear();
+                ov.updates.clear();
+                ov.inserts.clear();
+                ov.created_in_txn = true;
+                ov.dropped_in_txn = false;
+            }
+            BufferedOp::DropTable { table } => {
+                let ov = overlays.entry(table.clone()).or_default();
+                ov.deleted.clear();
+                ov.updates.clear();
+                ov.inserts.clear();
+                ov.dropped_in_txn = true;
+                ov.created_in_txn = false;
+            }
         }
     }
 
@@ -479,8 +550,18 @@ impl BufferedDiskEngine {
                         last_touch.insert(pos, i);
                     }
                 }
+                BufferedOp::DeleteIf { targets, .. } => {
+                    for (pos, _) in targets.iter().filter(|(p, _)| !is_pending_pos(*p)) {
+                        last_touch.insert(*pos, i);
+                    }
+                }
                 BufferedOp::Update { updates, .. } => {
                     for (pos, _) in updates.iter().filter(|(p, _)| !is_pending_pos(*p)) {
+                        last_touch.insert(*pos, i);
+                    }
+                }
+                BufferedOp::UpdateIf { updates, .. } => {
+                    for (pos, _, _) in updates.iter().filter(|(p, _, _)| !is_pending_pos(*p)) {
                         last_touch.insert(*pos, i);
                     }
                 }
@@ -488,7 +569,50 @@ impl BufferedDiskEngine {
             }
         }
 
+        // NU-16: anchor each real position's FIRST observation of the
+        // committed row. Only a CONDITIONAL op as the FIRST op naming a
+        // position carries a valid anchor: its expected row is what the
+        // executor read from the committed image. A conditional op that
+        // follows one of this transaction's OWN ops on the same position
+        // reads back its own uncommitted value (the overlay), which the
+        // committed row can never match — such positions are owned
+        // unconditionally and apply plain.
+        let mut preconds: HashMap<usize, (Row, Vec<Vec<usize>>)> = HashMap::new();
+        let mut seen: HashSet<usize> = HashSet::new();
+        for op in &ops {
+            match op {
+                BufferedOp::Delete { positions, .. } => {
+                    for pos in positions.iter().copied().filter(|p| !is_pending_pos(*p)) {
+                        seen.insert(pos);
+                    }
+                }
+                BufferedOp::Update { updates, .. } => {
+                    for (pos, _) in updates.iter().filter(|(p, _)| !is_pending_pos(*p)) {
+                        seen.insert(*pos);
+                    }
+                }
+                BufferedOp::UpdateIf { updates, unique_col_sets, .. } => {
+                    for (pos, expected, _) in updates.iter().filter(|(p, _, _)| !is_pending_pos(*p)) {
+                        if seen.insert(*pos) {
+                            preconds.insert(*pos, (expected.clone(), unique_col_sets.clone()));
+                        }
+                    }
+                }
+                BufferedOp::DeleteIf { targets, .. } => {
+                    for (pos, expected) in targets.iter().filter(|(p, _)| !is_pending_pos(*p)) {
+                        if seen.insert(*pos) {
+                            preconds.insert(*pos, (expected.clone(), Vec::new()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
         // Resolve the fate of each buffered insert before replaying anything.
+        // The conditional variants fold the same way for pending positions
+        // (NU-16): a conditional update of a row this transaction inserted
+        // rewrites the insert; a conditional delete cancels it.
         let mut cancelled: HashSet<usize> = HashSet::new();
         let mut rewritten: HashMap<usize, Row> = HashMap::new();
         for op in &ops {
@@ -499,10 +623,23 @@ impl BufferedDiskEngine {
                         rewritten.remove(&pos);
                     }
                 }
+                BufferedOp::DeleteIf { targets, .. } => {
+                    for (pos, _) in targets.iter().filter(|(p, _)| is_pending_pos(*p)) {
+                        cancelled.insert(*pos);
+                        rewritten.remove(pos);
+                    }
+                }
                 BufferedOp::Update { updates, .. } => {
                     for (pos, row) in updates.iter().filter(|(p, _)| is_pending_pos(*p)) {
                         if !cancelled.contains(pos) {
                             rewritten.insert(*pos, row.clone());
+                        }
+                    }
+                }
+                BufferedOp::UpdateIf { updates, .. } => {
+                    for (pos, _, replacement) in updates.iter().filter(|(p, _, _)| is_pending_pos(*p)) {
+                        if !cancelled.contains(pos) {
+                            rewritten.insert(*pos, replacement.clone());
                         }
                     }
                 }
@@ -532,8 +669,46 @@ impl BufferedDiskEngine {
                         .filter(|p| !is_pending_pos(*p))
                         .filter(|p| last_touch.get(p) == Some(&i))
                         .collect();
-                    if !positions.is_empty() {
-                        self.inner.delete(&table, &positions).await?;
+                    // NU-16: a position first touched by a CONDITIONAL op
+                    // keeps its precondition even when a later plain op is
+                    // the deciding write — the whole transaction's claim on
+                    // the row is anchored to the first read.
+                    let (plain, conditional): (Vec<usize>, Vec<usize>) = positions
+                        .into_iter()
+                        .partition(|p| !preconds.contains_key(p));
+                    if !plain.is_empty() {
+                        self.inner.delete(&table, &plain).await?;
+                    }
+                    if !conditional.is_empty() {
+                        let targets: Vec<(usize, Row)> = conditional
+                            .iter()
+                            .filter_map(|p| {
+                                preconds.get(p).map(|(expected, _)| (*p, expected.clone()))
+                            })
+                            .collect();
+                        let changed = self.inner.delete_if_unchanged(&table, &targets).await?;
+                        // Every targeted row must still match its anchor;
+                        // anything else means a concurrent writer moved it.
+                        if changed != targets.len() {
+                            return Err(StorageError::WriteConflict(
+                                "buffered row changed before commit".to_string(),
+                            ));
+                        }
+                    }
+                }
+                BufferedOp::DeleteIf { table, targets } => {
+                    let targets: Vec<(usize, Row)> = targets
+                        .into_iter()
+                        .filter(|(p, _)| !is_pending_pos(*p))
+                        .filter(|(p, _)| last_touch.get(p) == Some(&i))
+                        .collect();
+                    if !targets.is_empty() {
+                        let changed = self.inner.delete_if_unchanged(&table, &targets).await?;
+                        if changed != targets.len() {
+                            return Err(StorageError::WriteConflict(
+                                "buffered row changed before commit".to_string(),
+                            ));
+                        }
                     }
                 }
                 BufferedOp::Update { table, updates } => {
@@ -542,8 +717,100 @@ impl BufferedDiskEngine {
                         .filter(|(p, _)| !is_pending_pos(*p))
                         .filter(|(p, _)| last_touch.get(p) == Some(&i))
                         .collect();
-                    if !updates.is_empty() {
-                        self.inner.update(&table, &updates).await?;
+                    if updates.is_empty() {
+                        continue;
+                    }
+                    // NU-16: positions anchored by a conditional first touch
+                    // apply through the conditional path with their original
+                    // expected row; the replacement is the FINAL folded value.
+                    let (plain, conditional): (Vec<PosUpdate>, Vec<PosUpdate>) = updates
+                        .into_iter()
+                        .partition(|(p, _)| !preconds.contains_key(p));
+                    if !plain.is_empty() {
+                        self.inner.update(&table, &plain).await?;
+                    }
+                    if !conditional.is_empty() {
+                        let mut applied = 0usize;
+                        for (p, row) in &conditional {
+                            let Some((expected, sets)) = preconds.get(p) else {
+                                continue;
+                            };
+                            let changed = if sets.is_empty() {
+                                self.inner
+                                    .update_if_value_unchanged(
+                                        &table,
+                                        &[(*p, expected.clone(), row.clone())],
+                                    )
+                                    .await?
+                            } else {
+                                self.inner
+                                    .update_unique_if_value_unchanged(
+                                        &table,
+                                        &[(*p, expected.clone(), row.clone())],
+                                        sets,
+                                    )
+                                    .await?
+                            };
+                            applied += changed.len();
+                        }
+                        if applied != conditional.len() {
+                            return Err(StorageError::WriteConflict(
+                                "buffered row changed before commit".to_string(),
+                            ));
+                        }
+                    }
+                }
+                BufferedOp::UpdateIf { table, updates, unique_col_sets } => {
+                    // Substitute each update's expected row with the
+                    // position's ANCHORED precondition (NU-16): a conditional
+                    // op that followed this transaction's own write on the
+                    // same position carries its own uncommitted value as
+                    // "expected", which the committed row can never match.
+                    // The anchor is what the committed image was when this
+                    // transaction first read the position.
+                    // Per position: the ANCHORED expected row (NU-16), with
+                    // constraint sets taken from the anchor when it carried
+                    // any, else from this op.
+                    let mut plain: Vec<(usize, Row, Row)> = Vec::new();
+                    let mut with_sets: Vec<(usize, Row, Row)> = Vec::new();
+                    let mut effective_sets: Vec<Vec<usize>> = unique_col_sets.clone();
+                    for (pos, expected, replacement) in updates {
+                        if is_pending_pos(pos) || last_touch.get(&pos) != Some(&i) {
+                            continue;
+                        }
+                        match preconds.get(&pos) {
+                            Some((anchored, anchor_sets)) => {
+                                if anchor_sets.is_empty() {
+                                    plain.push((pos, anchored.clone(), replacement));
+                                } else {
+                                    effective_sets = anchor_sets.clone();
+                                    with_sets.push((pos, anchored.clone(), replacement));
+                                }
+                            }
+                            None => {
+                                if unique_col_sets.is_empty() {
+                                    plain.push((pos, expected, replacement));
+                                } else {
+                                    with_sets.push((pos, expected, replacement));
+                                }
+                            }
+                        }
+                    }
+                    let mut applied = 0usize;
+                    if !plain.is_empty() {
+                        applied += self.inner.update_if_value_unchanged(&table, &plain).await?.len();
+                    }
+                    if !with_sets.is_empty() {
+                        applied += self
+                            .inner
+                            .update_unique_if_value_unchanged(&table, &with_sets, &effective_sets)
+                            .await?
+                            .len();
+                    }
+                    if applied != plain.len() + with_sets.len() {
+                        return Err(StorageError::WriteConflict(
+                            "buffered row changed before commit".to_string(),
+                        ));
                     }
                 }
                 BufferedOp::CreateTable { table } => {
@@ -565,21 +832,45 @@ impl BufferedDiskEngine {
         table: &str,
         site: usize,
     ) -> Result<Vec<(usize, Row)>, StorageError> {
-        // A table created inside this transaction exists only in the buffer —
-        // `create_table` records an op and returns without touching the engine
-        // — so the engine correctly reports it missing. Treating that as an
-        // error made `BEGIN; CREATE TABLE t; INSERT INTO t ...; SELECT FROM t`
-        // fail with "table not found in storage", after the INSERT had already
-        // reported success. That is the standard shape of a migration, and it
-        // is why a migration runner (which wraps each migration in a
-        // transaction) could not create and populate a table.
-        //
-        // Only a table this transaction actually created is allowed to read as
-        // empty; any other failure still propagates, or a genuinely missing
-        // table would silently scan as empty.
+        // Consult the folded overlay FIRST (NU-18): a table this transaction
+        // DROPPED must read as gone (not as the committed incarnation), and a
+        // table it CREATED must read as empty (not as whatever the engine has
+        // under that name). The decision is computed and the guard DROPPED
+        // before any await — a parking_lot guard is not Send.
+        enum DdlView {
+            Inherit,
+            Dropped,
+            Created(Vec<(usize, Row)>),
+        }
+        let ddl: DdlView = {
+            let bufs = self.txn_bufs.read();
+            match bufs.get(&current_session_id()).and_then(|b| b.overlays.get(table)) {
+                Some(ov) if ov.dropped_in_txn => DdlView::Dropped,
+                Some(ov) if ov.created_in_txn => {
+                    crate::bench_hooks::record_overlay(site, 0);
+                    DdlView::Created(
+                        ov.inserts
+                            .iter()
+                            .filter(|(pos, _)| !ov.deleted.contains(*pos))
+                            .map(|(pos, row)| (*pos, row.clone()))
+                            .collect(),
+                    )
+                }
+                _ => DdlView::Inherit,
+            }
+        };
+        match ddl {
+            DdlView::Dropped => return Err(StorageError::TableNotFound(table.to_string())),
+            DdlView::Created(rows) => return Ok(rows),
+            DdlView::Inherit => {}
+        }
+
         let mut rows = match self.inner.scan_physical(table).await {
             Ok(rows) => rows,
             Err(err) => {
+                // Only a table this transaction created is allowed to read as
+                // empty; any other failure still propagates, or a genuinely
+                // missing table would silently scan as empty.
                 let created = {
                     let bufs = self.txn_bufs.read();
                     bufs.get(&current_session_id())
@@ -846,15 +1137,18 @@ impl StorageEngine for BufferedDiskEngine {
         updates: &[(usize, Row, Row)],
     ) -> Result<usize, StorageError> {
         self.lock_write(table).await?;
-        if self.is_in_txn() {
-            // Buffered writes are this session's alone and are replayed against
-            // the engine only at COMMIT, so nothing can have moved underneath
-            // them yet; the identity re-check happens when the buffer applies.
-            let plain: Vec<(usize, Row)> = updates
-                .iter()
-                .map(|(pos, _read, new_row)| (*pos, new_row.clone()))
-                .collect();
-            return self.update(table, &plain).await;
+        if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
+            // NU-16: the expected rows ride WITH the buffered op and are
+            // re-checked against the engine at COMMIT. The old code stripped
+            // them ("the identity re-check happens when the buffer applies" —
+            // it never did), so a concurrent writer's change was silently
+            // overwritten by this transaction's commit.
+            txn.push_op(BufferedOp::UpdateIf {
+                table: table.to_string(),
+                updates: updates.to_vec(),
+                unique_col_sets: Vec::new(),
+            });
+            return Ok(updates.len());
         }
         self.inner.update_if_unchanged(table, updates).await
     }
@@ -865,17 +1159,13 @@ impl StorageEngine for BufferedDiskEngine {
         updates: &[(usize, Row, Row)],
     ) -> Result<Vec<usize>, StorageError> {
         self.lock_write(table).await?;
-        if self.is_in_txn() {
-            // Same reasoning as `update_if_unchanged` above: buffered writes are
-            // this session's alone and are replayed at COMMIT, so nothing has
-            // moved underneath them yet and there is no race to report. Claiming
-            // a conflict here would send the executor into a re-read that sees
-            // the transaction's own uncommitted value.
-            let plain: Vec<(usize, Row)> = updates
-                .iter()
-                .map(|(pos, _read, new_row)| (*pos, new_row.clone()))
-                .collect();
-            self.update(table, &plain).await?;
+        if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
+            // NU-16: preserve the precondition; see update_if_unchanged.
+            txn.push_op(BufferedOp::UpdateIf {
+                table: table.to_string(),
+                updates: updates.to_vec(),
+                unique_col_sets: Vec::new(),
+            });
             return Ok(updates.iter().map(|(pos, _, _)| *pos).collect());
         }
         self.inner.update_if_value_unchanged(table, updates).await
@@ -888,14 +1178,14 @@ impl StorageEngine for BufferedDiskEngine {
         unique_col_sets: &[Vec<usize>],
     ) -> Result<Vec<usize>, StorageError> {
         self.lock_write(table).await?;
-        if self.is_in_txn() {
-            // In a transaction, as with the non-unique path: buffered writes are
-            // replayed at COMMIT, so nothing has moved underneath them yet.
-            let plain: Vec<(usize, Row)> = updates
-                .iter()
-                .map(|(pos, _read, new_row)| (*pos, new_row.clone()))
-                .collect();
-            self.update(table, &plain).await?;
+        if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
+            // NU-16: preserve BOTH the precondition and the explicit
+            // constraint sets — the old code discarded the constraints too.
+            txn.push_op(BufferedOp::UpdateIf {
+                table: table.to_string(),
+                updates: updates.to_vec(),
+                unique_col_sets: unique_col_sets.to_vec(),
+            });
             return Ok(updates.iter().map(|(pos, _, _)| *pos).collect());
         }
         self.inner
@@ -909,9 +1199,14 @@ impl StorageEngine for BufferedDiskEngine {
         targets: &[(usize, Row)],
     ) -> Result<usize, StorageError> {
         self.lock_write(table).await?;
-        if self.is_in_txn() {
-            let positions: Vec<usize> = targets.iter().map(|(pos, _)| *pos).collect();
-            return self.delete(table, &positions).await;
+        if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
+            // NU-16: the expected rows ride with the op and are re-checked at
+            // COMMIT; the old code stripped them and applied a plain delete.
+            txn.push_op(BufferedOp::DeleteIf {
+                table: table.to_string(),
+                targets: targets.to_vec(),
+            });
+            return Ok(targets.len());
         }
         self.inner.delete_if_unchanged(table, targets).await
     }
@@ -1231,6 +1526,13 @@ impl StorageEngine for BufferedDiskEngine {
         value: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
         self.lock_read(table).await?;
+        // Inside a transaction the inner index reflects only COMMITTED rows —
+        // it cannot see this transaction's buffered inserts, updates that
+        // moved a row into the key, or deletes (NU-17). Decline so the caller
+        // falls back to `scan`, which the buffer overlays.
+        if self.is_in_txn() {
+            return Ok(None);
+        }
         self.inner.index_lookup(table, index_name, value).await
     }
 
@@ -1254,17 +1556,20 @@ impl StorageEngine for BufferedDiskEngine {
         }
 
         // Inside a transaction the inner index describes the COMMITTED image
-        // only. Three corrections, all bounded by this transaction's own
+        // only. Four corrections, all bounded by this transaction's own
         // buffer rather than by the table:
         //
         //   deleted  — a position this transaction removed is not a match,
         //              however the index still points at it;
         //   updates  — a position this transaction rewrote must be judged on
-        //              the new row, which may no longer match at all;
+        //              the new row, which may no longer match at all — and a
+        //              rewrite whose OLD key did not match never appears in
+        //              the base result at all, so the union must be scanned,
+        //              not just the base positions (NU-17);
         //   inserts  — rows that exist only in this transaction have no index
         //              entry, so they are scanned out of the buffer.
         //
-        // Without this the statement would miss its own writes; with a plain
+        // Without this the statement could miss its own writes; with a plain
         // decline it fell back to materialising the whole table, which is the
         // O(table) cost this path exists to remove.
         let bufs = self.txn_bufs.read();
@@ -1274,28 +1579,31 @@ impl StorageEngine for BufferedDiskEngine {
         else {
             return Ok(Some(base));
         };
-        let mut out: Vec<(usize, Row)> = Vec::with_capacity(base.len());
+        // Merge the union of committed candidates, ALL overlay updates, and
+        // buffered inserts, keyed by position; the final row decides.
+        let mut candidates: HashMap<usize, Row> = HashMap::with_capacity(base.len());
         for (pos, row) in base {
-            if overlay.deleted.contains(&pos) {
-                continue;
-            }
-            match overlay.updates.get(&pos) {
-                Some(updated) => {
-                    if updated.get(col_idx).is_some_and(|v| v.loose_eq(value)) {
-                        out.push((pos, updated.clone()));
-                    }
-                }
-                None => out.push((pos, row)),
+            if !overlay.deleted.contains(&pos) {
+                candidates.insert(pos, row);
             }
         }
-        for (pos, row) in &overlay.inserts {
-            if overlay.deleted.contains(pos) {
-                continue;
-            }
-            if row.get(col_idx).is_some_and(|v| v.loose_eq(value)) {
-                out.push((*pos, row.clone()));
+        for (&pos, row) in &overlay.updates {
+            if !overlay.deleted.contains(&pos) {
+                candidates.insert(pos, row.clone());
             }
         }
+        for (&pos, row) in &overlay.inserts {
+            if !overlay.deleted.contains(&pos) {
+                candidates.insert(pos, row.clone());
+            }
+        }
+        let out: Vec<(usize, Row)> = candidates
+            .into_iter()
+            .filter(|(pos, row)| {
+                !overlay.deleted.contains(pos)
+                    && row.get(col_idx).is_some_and(|v| v.loose_eq(value))
+            })
+            .collect();
         Ok(Some(out))
     }
 
@@ -1307,6 +1615,12 @@ impl StorageEngine for BufferedDiskEngine {
         high: std::ops::Bound<&Value>,
     ) -> Result<Option<Vec<Row>>, StorageError> {
         self.lock_read(table).await?;
+        // See `index_lookup`: inside a transaction the inner index cannot see
+        // this transaction's own writes, so decline to the overlay-aware scan
+        // (NU-17) — the old delegation silently missed buffered rows.
+        if self.is_in_txn() {
+            return Ok(None);
+        }
         self.inner
             .index_lookup_range(table, index_name, low, high)
             .await
@@ -1348,6 +1662,11 @@ impl StorageEngine for BufferedDiskEngine {
         if !self.sync_fastpath_allowed() {
             return Ok(None);
         }
+        // Inside a transaction this path cannot see the buffer's own writes
+        // (NU-17) — decline to the overlay-aware path.
+        if self.is_in_txn() {
+            return Ok(None);
+        }
         self.inner
             .index_lookup_range_sync(table, index_name, low, high)
     }
@@ -1362,6 +1681,11 @@ impl StorageEngine for BufferedDiskEngine {
         // See `index_lookup_sync` — a serializable transaction cannot take
         // its lock from a sync path, so decline and let the async path run.
         if !self.sync_fastpath_allowed() {
+            return None;
+        }
+        // Inside a transaction the inner index cannot see the buffer's own
+        // writes (NU-17) — decline to the overlay-aware path.
+        if self.is_in_txn() {
             return None;
         }
         self.inner
@@ -1387,6 +1711,91 @@ mod tests {
     use crate::catalog::{Catalog, ColumnDef, TableDef};
     use crate::storage::disk_engine::DiskEngine;
     use crate::types::{DataType, Value};
+
+
+    /// NU-18: DROP TABLE inside a transaction must hide the committed
+    /// incarnation's rows from reads in that transaction (the old overlay
+    /// still served them), and a re-CREATE starts from an empty table.
+    #[tokio::test]
+    async fn audit_txn_drop_hides_committed_rows_and_recreate_starts_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::new());
+        let disk = Arc::new(DiskEngine::open(&dir.path().join("a.db"), catalog.clone()).unwrap());
+        let engine = BufferedDiskEngine::new(disk);
+
+        register_table(&catalog, "t").await;
+        engine.create_table("t").await.unwrap();
+        engine
+            .insert("t", vec![Value::Int32(1), Value::Text("x".into())])
+            .await
+            .unwrap();
+
+        // A second session id simulates another connection's committed state.
+        engine.begin_txn().await.unwrap();
+        engine.drop_table("t").await.unwrap();
+        let err = engine.scan("t").await;
+        assert!(err.is_err(), "dropped table still readable inside the transaction");
+
+        engine.create_table("t").await.unwrap();
+        let rows = engine.scan("t").await.unwrap();
+        assert!(rows.is_empty(), "re-created table inherited the old incarnation's rows");
+        engine.commit_txn().await.unwrap();
+        let rows = engine.scan("t").await.unwrap();
+        assert!(rows.is_empty(), "old rows reappeared after commit");
+    }
+
+    /// NU-16: a conditional update inside a transaction must FAIL when a
+    /// concurrent writer changed the base row between the read and the
+    /// commit — the old buffer stripped the precondition and silently
+    /// overwrote the competitor.
+    #[tokio::test]
+    async fn audit_conditional_update_conflicts_on_changed_base_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::new());
+        let disk = Arc::new(DiskEngine::open(&dir.path().join("b.db"), catalog.clone()).unwrap());
+        let engine = BufferedDiskEngine::new(disk.clone());
+
+        register_table(&catalog, "t").await;
+        engine.create_table("t").await.unwrap();
+        engine
+            .insert("t", vec![Value::Int32(1), Value::Text("base".into())])
+            .await
+            .unwrap();
+        let base_pos = engine.scan_physical("t").await.unwrap()[0].0;
+
+        // Session A reads the row and buffers a conditional update.
+        engine.begin_txn().await.unwrap();
+        let expected = vec![Value::Int32(1), Value::Text("base".into())];
+        engine
+            .update_if_value_unchanged(
+                "t",
+                &[(
+                    base_pos,
+                    expected,
+                    vec![Value::Int32(1), Value::Text("from-a".into())],
+                )],
+            )
+            .await
+            .unwrap();
+
+        // Meanwhile a competing writer changes the committed row, directly
+        // through the inner engine (outside A's transaction buffer).
+        let changed = disk
+            .update(
+                "t",
+                &[(base_pos, vec![Value::Int32(1), Value::Text("from-b".into())])],
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed, 1);
+
+        // A's commit must detect the changed base row and conflict.
+        let err = engine.commit_txn().await;
+        assert!(
+            matches!(err, Err(crate::storage::StorageError::WriteConflict(_))),
+            "conditional update overwrote a concurrent writer: {err:?}"
+        );
+    }
 
     /// The overlay used to be computed by replaying the whole op log against a
     /// materialised view on EVERY read. That is now folded incrementally, which
