@@ -228,6 +228,76 @@ against a recorded decision.
 | neutron-15 | FIXED — invalidation claims the index via atomic RENAME; concurrent writers stay indexed | 14dceb36 |
 | nucleus-residual-01 | FIXED — execute_parsed/execute_prepared route through execute_statements_dispatch | 456e4526 |
 
+## Reported by consumers, resolved (2026-09-18 — engine defects from the teploy-observe trust-close session)
+
+Two Nucleus engine defects filed 2026-09-18 from teploy-observe's F12/F19
+close-out (its private ledger is `Teploy/_internal/UPSTREAM_BUGS.md`, newest
+entries). Both root-caused by direct builds of named revisions; both now
+carry lib-suite regression tests
+(`nucleus/src/executor/tests/test_upstream_teploy_2026_09_18.rs`).
+
+- **Renamed table invisible to later statements in the same script** —
+  fresh installs of teploy-observe failed at migration 027
+  (`ALTER TABLE events RENAME TO events_pre027; …; INSERT INTO events
+  SELECT … FROM events_pre027`) on repo-built engines with
+  `table 'events_pre027' not found in storage`, while the v0.1.8 image
+  applied the ladder. Two live defects, both on the disk stack
+  (`BufferedDiskEngine` over `DiskEngine` — the server shape with a data
+  directory; the in-memory MVCC adapter never had either):
+  1. *Committed-table rename inside a transaction* (the pinned-submodule
+     5b5d0a3 failure): fixed on main by the 2026-09-17 round-2
+     buffered-disk DDL-visibility work (`344090ac`, NU-16..18). Pinned by
+     `migration_027_rebuild_shape_in_one_tx`.
+  2. *Same-transaction CREATE + RENAME + COMMIT* — still broken at HEAD:
+     the buffered `CreateTable` op replayed at COMMIT against
+     `DiskEngine::create_table`, which re-asked the CATALOG for the schema
+     under the old name — but the RENAME statement had already moved the
+     catalog entry, so COMMIT failed `table '<old>' not found in storage`
+     and left DDL debris. FIXED: the buffered op now carries the schema
+     captured at statement time (`TableSchemaSnapshot`), making COMMIT
+     replay self-contained. Pinned by `create_rename_commit_in_one_script`.
+  A third, adjacent blind spot fell out of the same investigation:
+  RENAME consulted only the `engines.json` sidecar to decide whether a
+  table has a per-table engine override, so a memory-mode database (no
+  sidecar) or a table created before the sidecar existed took the PLAIN
+  rename path for an override-engine table — copying rows into the base
+  engine while the routing map still pointed at the override, after which
+  the renamed table answered `not found in storage` (the same 027 symptom
+  through another door). FIXED: the decision now falls back to the
+  catalog's engine spec (sidecar first, catalog second, mirroring
+  `restore_table_engines`). Pinned by `mergetree_override_rename_in_tx`
+  (which fails on the pre-fix tree with exactly
+  `TableNotFound("m_events_pre")`).
+  The report's double-wrapped error text
+  (`table 'table 'x' not found' not found in storage`) was a second defect
+  in the MVCC adapter's error mapping — MvccErrors flattened through
+  `StorageError::TableNotFound(e.to_string())`. FIXED with a
+  variant-preserving `From<MvccError> for StorageError`.
+  Verified: observe's full 001-041 migration ladder applies on a
+  repo-built debug binary via the real neutron-go `Migrate` path (Go
+  reproducer against a live engine), 5/5 fresh installs.
+- **Committed same-key ReplacingMergeTree upsert lost in a multi-table
+  transaction** — silent data loss (~6-in-20 on accumulated data; observe's
+  replay-session upserts since migration 039). Reproduced 8/20 with the
+  exact observe DDL on the v0.1.8 image (= main at `d1384841`,
+  2026-08-21) and 8/20 on main at `d4a30583` (2026-08-20); the loss is
+  DELAYED — the immediate post-commit read can pass while a later
+  MergeTree part merge drops the committed higher-version row, leaving the
+  older version's payload stable forever. Root cause window verified by
+  direct builds: fixed on main by the 2026-08-25 columnar-atomicity work
+  (`b172b43f`, S63 slices 5-8) — the v0.1.8 image was cut four days before
+  that fix and still ships it. Every revision tested since (b172b43f,
+  a0732f5c, 344090ac, 6dcefaab, HEAD) is clean: 0 lost across 700+
+  iterations at 20/30/200/300-iteration scales, immediate AND delayed
+  re-verification. Pinned at HEAD by
+  `replacing_upsert_multi_table_tx_survives_and_survives_merges` (accumulated
+  seed, multi-table txs, merge pressure, then re-verify every key and the
+  child rows). **Action needed outside this repo: the published
+  `ghcr.io/neutron-build/nucleus` images v0.1.5/v0.1.8 predate both fixes
+  (and the arm64 glibc break already on file) — an image rebuild from
+  current main is required before the next release; no tag was cut from
+  this session.**
+
 ## Reported by consumers, open (2026-09-17)
 
 Found by teploy-observe's live-engine verification during its 2026-09-17 audit
