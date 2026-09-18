@@ -1931,6 +1931,14 @@ impl SimpleQueryHandler for NucleusHandler {
             {
                 return Err(exec_error_to_pgwire(e));
             }
+            // Snapshot-lease writer gate (Consumer-2): same reason — this
+            // path bypasses the executor's dispatch, so a KV write during
+            // another session's lease window must wait here.
+            if kv_cmd.is_write() {
+                if let Err(e) = self.executor.gate_snapshot_lease_write().await {
+                    return Err(exec_error_to_pgwire(e));
+                }
+            }
             let result = kv_fast_path::execute_kv_command(&kv_cmd, self.executor.kv_store());
             // A KV write must be durable before it is acked — this path bypasses
             // execute()'s commit-time force, so force here (no-op under
