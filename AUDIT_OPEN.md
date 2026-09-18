@@ -4,12 +4,13 @@ Unresolved findings for this repository from the ChatGPT-led audit series.
 Read this before treating related work as done; update it when you close,
 defer, or upstream-report an item.
 
-Open items: **1 deferral cluster** (see the table) plus **2 consumer-reported
-items** (see the last section) — every other finding of
+Open items: **1 deferral cluster** (see the table) plus **1 consumer-reported
+item** (see the last section) — every other finding of
 the 2026-09-17 pass is fixed, partially fixed with the remainder scoped, or
 recorded as a false positive with evidence. The 2026-09-17 round-2
 re-verification (see its section) repaired all five disputed closures and
-resolved the twelve new findings it raised.
+resolved the twelve new findings it raised. The round-3 close-out (same day)
+finished the three round-2 partials: GO-30/GO-31/Consumer-1 (see table).
 
 ## Round-2 verification (2026-09-17, re-audit at `360c0023`)
 
@@ -122,9 +123,9 @@ FALSE-POSITIVE (not reproducible in source; evidence cited).
 | GO-26 | FIXED (round 2) — statusWriter.Hijack no longer emits an unsolicited 101 (zero header writes, error preserved for unsupported writers) | r2 |
 | GO-27 | FIXED (round 2) — hard 100k live-bucket ceiling: new identities refused 429+Retry-After at capacity, existing buckets keep state, expiry sweep throttled to once per 10s (was: full map scan per new key past 100k) | r2 |
 | GO-28 | FIXED (round 2) — url-encoded bodies decoded explicitly for every body-bearing method through MaxBytesReader (413 on overflow, 400 on malformed); body takes precedence over query for `form` tags; Go ParseForm ignores DELETE bodies | r2 |
-| GO-29 | FIXED-PARTIAL (round 2) — the whole Migrate/MigrateDown operation (history reads included) is serialized by an in-process gate, closing the appliedVersions→INSERT TOCTOU behind the consumer's 23505. Residual: cross-PROCESS runners still need one-runner-per-database (or an engine-backed lock, unverified for Nucleus) | r2 |
-| GO-30 | FIXED-PARTIAL (round 2) — plans are copied (caller's slice never sorted in place) and prevalidated (duplicate/nonpositive versions, empty name/Up) before any SQL runs. Residual: applied-history checksum needs a history-schema change (see deferrals) | r2 |
-| GO-31 | FIXED-PARTIAL (round 2) — signed TEXT integers decode as text ("-123" no longer misreads as ~1.7e9 binary), platform-int range checked. Residual: the text/binary ambiguity itself is an engine wire-format bug (declared format disagrees with payload — Nucleus finding #35) | r2 |
+| GO-29 | FIXED (round 2 + round 3) — the whole Migrate/MigrateDown operation (history reads included) is serialized by an in-process gate, closing the appliedVersions→INSERT TOCTOU behind the consumer's 23505. Cross-process runners are now serialized too, by the `_neutron_migration_lock` ledger claim landed with Consumer-1 (round 3) | r2 + r3 |
+| GO-30 | FIXED (round 2 + round 3) — plans are copied and prevalidated before any SQL runs (round 2); applied history records a sha256 checksum over version/name/Up, enforced on every run, with legacy rows baselined from the current plan on first new-version run (round 3). History schema carries a nullable `checksum` column, upgraded in place via `ADD COLUMN IF NOT EXISTS` | r2 + r3 |
+| GO-31 | FIXED (round 2 + round 3) — round 2 kept the Go client's heuristic decoder as a stopgap. Round 3 verified the engine already honors its declared result formats end to end (client-requested formats honored since `1a1b1b41`; text is the default everywhere, binary only on explicit Bind) and pinned it byte-for-byte on the wire in both directions (nucleus `wire::tests_row_description::integer_payloads_honor_the_declared_format`: ASCII decimal incl. `-123`/`i64::MIN` under format 0 for simple, extended-default, and explicit-text Bind; true big-endian int4/int8 under format 1). The Go heuristic (`scanInt`) is removed; `appliedVersions`/`MigrationStatus` scan integers natively, and a live-engine round-trip test pins the client half | r2 + r3 |
 | NU-21 | FIXED (round 2) — one shared checked frame encoder for append and compaction: payloads over the 64 MiB replay limit are rejected before the first byte, so the writer can no longer accept a record its own replay refuses | r2 |
 | NU-22 | FIXED (round 2) — index scans hold ONE registered observer for the whole statement (snapshot passed into candidate resolution, aborted only after materialization; was: snapshot detached before use while vacuum could reclaim under it, and per-key observers mixed snapshots in one range scan); observer allocation failure declines the optimization instead of a false empty result | r2 |
 | NU-23 | FIXED (round 2) — replay validates terminal decisions: Commit+Abort for one txn is corruption (fails recovery with the id, file preserved); identical duplicate markers stay idempotent; terminal records for reserved id 0 rejected | r2 |
@@ -148,13 +149,19 @@ FALSE-POSITIVE (not reproducible in source; evidence cited).
 5. **WebAuthn library integration** (GO-16): new dependency + ceremony/persistence API.
 6. **Versioned/CAS session store contract** (TS-19, and the fenced half of
    GO-20/GO-21): public API redesign across the TS and Go SDKs.
-7. **Migration history checksum** (GO-30 remainder, round 2): a
-   `checksum` column on `_neutron_migrations` plus a baseline policy for
-   existing history. History-schema change.
-8. **Nucleus pgwire integer format** (GO-31 remainder / Nucleus finding
-   #35): the server declares text format but emits binary integers; the Go
-   client's heuristic decode stays until the engine honors its declared
-   format. Engine wire-protocol fix.
+
+## Resolved deferrals (2026-09-18, round 3)
+
+- **Migration history checksum** (was deferral 7, GO-30 remainder):
+   resolved as a nullable `checksum` column on `_neutron_migrations`
+   (upgraded in place with `ADD COLUMN IF NOT EXISTS`) — see the GO-30 row.
+- **Nucleus pgwire integer format** (was deferral 8, GO-31 remainder /
+   Nucleus finding #35): the engine has honored client-requested result
+   formats since `1a1b1b41` (2026-07-09) — text by default, binary only when
+   the client Binds it. The round-2 residual was stale: it assumed the
+   declared format still disagreed with the payload. Round 3 pins the
+   contract with byte-level wire tests in both directions and removed the Go
+   client's heuristic decoder. No engine change was needed.
 
 ## Resolved 2026-09-11 (prior series)
 
@@ -194,11 +201,18 @@ them without that folder:
 - **Migration-ledger TOCTOU** — concurrent `Migrate` callers race the
   `appliedVersions`→INSERT sequence and lose with `duplicate key ... (version)`
   (SQLSTATE 23505) at `go/nucleus/migrate.go`; originally reported 2026-08-26,
-  reconfirmed 2026-09-17. **Round 2 (GO-29): fixed in-process** — the whole
-  Migrate/MigrateDown operation is serialized behind a package gate, which
-  removes the race for all clients in one process (the common
-  teploy-observe reproduction). Cross-process runners still require
-  serializing the suites (`go test -p 1`) or a future engine-backed lock.
+  reconfirmed 2026-09-17. **Round 2 (GO-29): fixed in-process** via the
+  package gate. **Round 3 (Consumer-1): fixed cross-process** — Migrate and
+  MigrateDown now claim a `_neutron_migration_lock` ledger row
+  (INSERT-first, `ON CONFLICT DO NOTHING`) before touching history; a second
+  runner in any process blocks until the holder releases, and a claim whose
+  `locked_at` goes unrefreshed for 10 minutes (holder crashed) is stolen by a
+  server-side atomic staleness predicate. Advisory-lock verdict, verified in
+  engine source before choosing the design: Nucleus has no `pg_advisory_lock`
+  (only an honest `pg_advisory_unlock_all` no-op), so no engine-backed lock
+  exists to build on — the ledger claim is the contract, not a fake lock.
+  Live-engine coverage: `go/nucleus/migrate_integration_test.go`
+  (`NEUTRON_TEST_DATABASE_URL`).
 - **No cross-table consistent-snapshot boundary** — capability gap, not a
   defect: no snapshot/lease API lets a consumer establish a point-in-time view
   or mutation-blocking lease across tables (teploy-observe audit F45 — its
