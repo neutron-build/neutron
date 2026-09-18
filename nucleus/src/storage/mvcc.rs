@@ -406,6 +406,30 @@ pub enum MvccError {
     },
 }
 
+/// Variant-preserving [`MvccError`] → [`StorageError`] mapping.
+///
+/// Several scan/maintenance call sites used to flatten an MvccError through
+/// `StorageError::TableNotFound(e.to_string())`. For a missing table that
+/// produced the doubled `table 'table 'x' not found' not found in storage` —
+/// an inner error message substituted into a table-name slot (observed in the
+/// 2026-09-18 teploy-observe upstream report) — and for every other variant
+/// it MISLABELLED the failure as a missing table. Map each variant to the
+/// StorageError that says what actually went wrong.
+impl From<MvccError> for StorageError {
+    fn from(e: MvccError) -> StorageError {
+        match e {
+            MvccError::TableNotFound(t) => StorageError::TableNotFound(t),
+            MvccError::WriteConflict { table, row_idx } => {
+                StorageError::WriteConflict(format!("{table} row {row_idx}"))
+            }
+            MvccError::NoActiveTransaction => StorageError::NoActiveTransaction,
+            MvccError::UniqueViolation { table, key } => {
+                StorageError::UniqueViolation(format!("{table} {key}"))
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for MvccError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1285,7 +1309,7 @@ impl MvccStorageAdapter {
             }
             engine
                 .pad_table(name, table.next_version_id, txn_id)
-                .map_err(|e| StorageError::TableNotFound(e.to_string()))?;
+                .map_err(StorageError::from)?;
             let mut txn = txn;
             engine.txn_mgr().commit(&mut txn);
             committed_counts.insert(name.clone(), table.rows.len() as i64);
@@ -2169,7 +2193,7 @@ impl StorageEngine for MvccStorageAdapter {
     async fn drop_table(&self, table: &str) -> Result<(), StorageError> {
         self.engine
             .drop_table(table)
-            .map_err(|e| StorageError::TableNotFound(e.to_string()))?;
+            .map_err(StorageError::from)?;
         wal_log!(
             self,
             MvccWalRecord::DropTable {
@@ -2403,7 +2427,7 @@ impl StorageEngine for MvccStorageAdapter {
         let results = self
             .engine
             .scan(table, &snap)
-            .map_err(|e| StorageError::TableNotFound(e.to_string()))?;
+            .map_err(StorageError::from)?;
         // Record SIREAD locks for SERIALIZABLE transactions
         if !auto {
             let indices: Vec<usize> = results.iter().map(|(idx, _)| *idx).collect();
@@ -2430,7 +2454,7 @@ impl StorageEngine for MvccStorageAdapter {
         let results = self
             .engine
             .scan(table, &snap)
-            .map_err(|e| StorageError::TableNotFound(e.to_string()))?;
+            .map_err(StorageError::from)?;
         // The read set is every version the snapshot exposed, regardless of
         // how few columns the query kept — narrowing must not shrink it.
         if !auto {
@@ -2456,7 +2480,7 @@ impl StorageEngine for MvccStorageAdapter {
         let results = self
             .engine
             .scan(table, &snap)
-            .map_err(|e| StorageError::TableNotFound(e.to_string()))?;
+            .map_err(StorageError::from)?;
         let rows: Vec<Row> = results.into_iter().map(|(_, r)| (*r).clone()).collect();
         if auto {
             self.auto_commit(txn_id);
@@ -2473,7 +2497,7 @@ impl StorageEngine for MvccStorageAdapter {
         let results = self
             .engine
             .scan(table, &snap)
-            .map_err(|e| StorageError::TableNotFound(e.to_string()))?;
+            .map_err(StorageError::from)?;
         if !auto {
             let indices: Vec<usize> = results.iter().map(|(idx, _)| *idx).collect();
             self.maybe_record_siread(_txn_id, table, &indices);
@@ -3574,7 +3598,7 @@ impl StorageEngine for MvccStorageAdapter {
             let scanned = self.engine.scan_versions_with_visibility(table, &snap);
             self.engine.txn_mgr().abort(&mut read_txn);
             let results =
-                scanned.map_err(|e| StorageError::TableNotFound(e.to_string()))?;
+                scanned.map_err(StorageError::from)?;
             let mut map: std::collections::BTreeMap<Value, HashMap<usize, Row>> =
                 std::collections::BTreeMap::new();
             let mut version_map: HashMap<Value, Vec<usize>> = HashMap::new();
@@ -3898,7 +3922,7 @@ impl StorageEngine for MvccStorageAdapter {
         } else {
             self.engine
                 .gc_table(table, watermark)
-                .map_err(|error| StorageError::TableNotFound(error.to_string()))?
+                .map_err(StorageError::from)?
         };
         // Version slots are retained (NU-01 identity containment), so the
         // referenced transaction statuses stay referenced — reclaim only

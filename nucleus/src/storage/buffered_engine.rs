@@ -101,6 +101,12 @@ enum BufferedOp {
     },
     CreateTable {
         table: String,
+        /// The table's schema at statement time, so COMMIT can materialize the
+        /// table without consulting a catalog that later same-transaction DDL
+        /// (a RENAME, a drop+recreate) may already have rewritten. `None` only
+        /// when the catalog held no entry at buffer time, in which case replay
+        /// falls back to asking the catalog — the old behavior.
+        schema: Option<super::disk_engine::TableSchemaSnapshot>,
     },
     DropTable {
         table: String,
@@ -174,8 +180,7 @@ impl TxnBuffer {
         let mut created = false;
         for op in &self.ops {
             match op {
-                BufferedOp::CreateTable { table: t } if t == table => created = true,
-                BufferedOp::DropTable { table: t } if t == table => created = false,
+                BufferedOp::CreateTable { table: t, .. } if t == table => created = true,                BufferedOp::DropTable { table: t } if t == table => created = false,
                 _ => {}
             }
         }
@@ -260,7 +265,7 @@ impl TxnBuffer {
                     ov.deleted.insert(*pos);
                 }
             }
-            BufferedOp::CreateTable { table } => {
+            BufferedOp::CreateTable { table, .. } => {
                 let ov = overlays.entry(table.clone()).or_default();
                 ov.deleted.clear();
                 ov.updates.clear();
@@ -813,8 +818,18 @@ impl BufferedDiskEngine {
                         ));
                     }
                 }
-                BufferedOp::CreateTable { table } => {
-                    self.inner.create_table(&table).await?;
+                BufferedOp::CreateTable { table, schema } => {
+                    // Replay against the CAPTURED schema when there is one:
+                    // the live catalog may have renamed or replaced this name
+                    // through later same-transaction DDL, and asking it again
+                    // is exactly the dependency that made CREATE + RENAME +
+                    // COMMIT fail with "table '<old>' not found in storage".
+                    match schema {
+                        Some(snap) => {
+                            self.inner.create_table_with_schema(&table, &snap).await?
+                        }
+                        None => self.inner.create_table(&table).await?,
+                    }
                 }
                 BufferedOp::DropTable { table } => {
                     self.inner.drop_table(&table).await?;
@@ -920,9 +935,16 @@ impl StorageEngine for BufferedDiskEngine {
 
     async fn create_table(&self, table: &str) -> Result<(), StorageError> {
         self.lock_write(table).await?;
+        // Capture the schema BEFORE taking the txn-buffers guard: the executor
+        // writes the catalog entry immediately before this call, and a later
+        // RENAME in the same transaction would take that entry away before
+        // COMMIT replays this op (see TableSchemaSnapshot). The snapshot needs
+        // an await, and a parking_lot guard is not Send.
+        let schema = self.inner.table_schema_snapshot(table).await;
         if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
             txn.push_op(BufferedOp::CreateTable {
                 table: table.to_string(),
+                schema,
             });
             return Ok(());
         }

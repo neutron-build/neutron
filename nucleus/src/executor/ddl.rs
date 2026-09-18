@@ -97,6 +97,21 @@ impl Executor {
             .unwrap_or_default()
     }
 
+    /// The engine declaration for `table` from the CATALOG, in the sidecar's
+    /// shape. The catalog is the durable record (`record_table_engine`); the
+    /// sidecar is a cache of it, so a missing sidecar entry must not mean
+    /// "plain heap table" when the catalog says otherwise.
+    fn catalog_engine_meta(&self, table: &str) -> Option<TableEngineMeta> {
+        let spec = self.catalog.table_engine(table)?;
+        Some(TableEngineMeta {
+            engine: spec.engine,
+            order_by: spec.order_by,
+            version_column: spec.version_column,
+            sum_columns: spec.sum_columns,
+            count_columns: spec.count_columns,
+        })
+    }
+
     fn save_engines_meta(&self, metas: &HashMap<String, TableEngineMeta>) {
         let Some(path) = self.engines_meta_path() else {
             return;
@@ -2849,8 +2864,26 @@ impl Executor {
                     // override across engines; plain heap tables keep the simple
                     // create-new / copy / drop-old path (both names resolve to
                     // the base engine).
+                    // The sidecar is ONE source of the engine declaration, not
+                    // the only one: the catalog records the same spec at
+                    // CREATE TABLE (`record_table_engine` — "the catalog is
+                    // the durable record; engines.json is a cache of it"). A
+                    // rename that consulted only the sidecar took the PLAIN
+                    // path for an override-engine table whenever the sidecar
+                    // was missing the entry — a memory-mode database (no data
+                    // dir, no sidecar) or a table created before the sidecar
+                    // existed — and copied the rows into the BASE engine
+                    // while the routing map still pointed the old name at the
+                    // override, so the renamed table answered `not found in
+                    // storage` (the migration-027 symptom). Sidecar first,
+                    // catalog second, mirroring `restore_table_engines`.
                     #[cfg(feature = "server")]
-                    let override_meta = self.load_engines_meta().remove(&table_name);
+                    let override_meta = self
+                        .load_engines_meta()
+                        .remove(&table_name)
+                        // The catalog rename above already MOVED the spec to
+                        // the new name, so that is where the fallback looks.
+                        .or_else(|| self.catalog_engine_meta(&new));
                     #[cfg(not(feature = "server"))]
                     let override_meta: Option<TableEngineMeta> = None;
 

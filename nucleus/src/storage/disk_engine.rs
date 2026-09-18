@@ -2455,6 +2455,72 @@ impl crate::backup::BackupCoordinator for DiskEngine {
     }
 }
 
+/// A CREATE TABLE's schema, captured at statement time for deferred replay.
+///
+/// The buffered engine defers a transaction's `CREATE TABLE` to COMMIT. The
+/// replay used to re-ask the CATALOG for the schema — but the catalog is
+/// mutated eagerly by later DDL in the same transaction, so a CREATE + RENAME
+/// committed with the buffered `CreateTable` replaying under a name the rename
+/// had already taken away, and `DiskEngine::create_table` answered
+/// `table '<old>' not found in storage`. Capturing the schema when the op is
+/// BUFFERED (the moment the executor has just written the catalog entry) makes
+/// the replay self-contained: it no longer depends on what the catalog looks
+/// like at commit.
+#[derive(Clone, Debug)]
+pub(crate) struct TableSchemaSnapshot {
+    pub col_types: Vec<DataType>,
+    pub col_names: Vec<String>,
+    pub epoch: u64,
+}
+
+impl DiskEngine {
+    /// The catalog's current schema for `table`, in the form a deferred
+    /// `CreateTable` replay needs. `None` when the catalog has no such table.
+    pub(crate) async fn table_schema_snapshot(
+        &self,
+        table: &str,
+    ) -> Option<TableSchemaSnapshot> {
+        let def = self.catalog.get_table(table).await?;
+        Some(TableSchemaSnapshot {
+            col_types: def.columns.iter().map(|c| c.data_type.clone()).collect(),
+            col_names: def.columns.iter().map(|c| c.name.clone()).collect(),
+            epoch: def.epoch,
+        })
+    }
+
+    /// Materialize `table` from a captured schema instead of the live catalog.
+    ///
+    /// Same shape as [`StorageEngine::create_table`]'s fresh-table tail: if
+    /// the engine already knows the table (a restored directory entry, or a
+    /// second buffered create of the same name), refresh its column layout
+    /// from the snapshot and keep its pages; otherwise insert an empty
+    /// `TableMeta` stamped with the snapshot's epoch.
+    pub(crate) async fn create_table_with_schema(
+        &self,
+        table: &str,
+        snap: &TableSchemaSnapshot,
+    ) -> Result<(), StorageError> {
+        let mut tables = self.tables.write();
+        if let Some(meta) = tables.get_mut(table) {
+            meta.col_types = snap.col_types.clone();
+            meta.col_names = snap.col_names.clone();
+            meta.epoch = snap.epoch;
+            return Ok(());
+        }
+        tables.insert(
+            table.to_string(),
+            TableMeta {
+                first_page: INVALID_PAGE_ID,
+                last_page: INVALID_PAGE_ID,
+                col_types: snap.col_types.clone(),
+                col_names: snap.col_names.clone(),
+                epoch: snap.epoch,
+            },
+        );
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl StorageEngine for DiskEngine {
     fn as_backup_coordinator(&self) -> Option<&dyn crate::backup::BackupCoordinator> {
