@@ -67,6 +67,7 @@ import {
   serializeForInlineScript,
 } from "../core/serialization.js";
 import { handleImageRequest } from "./image-optimizer.js";
+import { capRequestBody, RequestBodyTooLargeError } from "./input-limits.js";
 import { handleIslandRequest } from "./server-islands.js";
 import type {
   ActionArgs,
@@ -101,7 +102,7 @@ export type { CsrfOptions } from "./csrf.js";
 export { rateLimitMiddleware, apiRateLimit, imageRateLimit } from "./rate-limit.js";
 export type { RateLimitOptions } from "./rate-limit.js";
 export type { NeutronOpenApiOptions } from "./openapi.js";
-export { inputLimitsMiddleware } from "./input-limits.js";
+export { inputLimitsMiddleware, capRequestBody, RequestBodyTooLargeError } from "./input-limits.js";
 export type { InputLimitsOptions } from "./input-limits.js";
 export {
   tenantIsolation,
@@ -189,6 +190,16 @@ export interface NeutronServerOptions {
    * `WebSocketServer`); attach `.on("connection", ...)` to handle sockets.
    */
   websocket?: boolean | NeutronWebSocketOptions;
+  /**
+   * Adapter-level ACTUAL-BYTE cap on request bodies (TS-22). While set, the
+   * server wraps every body-bearing request's stream so that reading past
+   * `maxRequestBodyBytes` bytes fails the read with a 413 — covering chunked
+   * bodies with no Content-Length and requests whose declared length lies.
+   * The middleware's Content-Length check stays as the early rejection for
+   * honestly-declared sizes (cheaper: no body read at all). Unset = no
+   * adapter cap; the input-limits middleware alone applies.
+   */
+  maxRequestBodyBytes?: number;
 }
 
 /** Rendering mode for {@link createServer}. The transport axis is {@link NeutronServerOptions.websocket}. */
@@ -453,6 +464,15 @@ export async function createServer(
   // thrown inside the SSR catch-all are converted there, where the request
   // path is at hand. Anything else propagates to Hono's default 500.
   app.onError((error, c) => {
+    // The adapter's capped body stream failing a read surfaces here first:
+    // answer 413 like the Content-Length early check, not as a generic 500
+    // (TS-22 actual-byte half).
+    if (error instanceof RequestBodyTooLargeError) {
+      return new Response("Request body too large", {
+        status: 413,
+        headers: { "Content-Type": "text/plain" },
+      });
+    }
     if (isProblemError(error)) {
       return error.toResponse(c.req.path);
     }
@@ -1019,8 +1039,27 @@ export async function createServer(
     );
   }
 
+  // TS-22: the actual-byte cap lives where the adapter hands the Request to
+  // the app — the middleware cannot substitute the body, but the adapter
+  // can. Content-Length stays as the early check (both in the middleware
+  // and here, so the cap holds even for requests that never see it).
+  let fetchFn: (request: Request) => Response | Promise<Response> = app.fetch;
+  if (options.maxRequestBodyBytes !== undefined && options.maxRequestBodyBytes > 0) {
+    const cap = options.maxRequestBodyBytes;
+    fetchFn = (request: Request): Response | Promise<Response> => {
+      const declared = request.headers.get("content-length");
+      if (declared !== null && Number(declared) > cap) {
+        return new Response("Request body too large", {
+          status: 413,
+          headers: { "Content-Type": "text/plain" },
+        });
+      }
+      return app.fetch(capRequestBody(request, cap));
+    };
+  }
+
   const server = serve({
-    fetch: app.fetch,
+    fetch: fetchFn,
     port,
     hostname: host,
   });

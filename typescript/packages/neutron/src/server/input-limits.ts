@@ -8,9 +8,79 @@
  *
  * These limits prevent memory exhaustion and processing delays from
  * maliciously crafted requests.
+ *
+ * TS-22 split of duties: this middleware keeps the Content-Length EARLY
+ * check (cheap, before any body byte is read). The actual-byte cap for
+ * streamed bodies — chunked requests with no Content-Length, or a lying
+ * one — is enforced where the request stream is created: the server
+ * adapter wraps the body with {@link capRequestBody} (see
+ * `maxRequestBodyBytes` on `NeutronServerOptions`). The middleware cannot
+ * substitute the Request body downstream handlers read; the adapter can.
  */
 
 import type { MiddlewareFn } from "../core/types.js";
+
+/**
+ * Raised by the adapter's capped body stream when a request's ACTUAL body
+ * bytes exceed the configured cap. Mapped to a 413 by the app-level error
+ * handler — the same status the Content-Length early check produces.
+ */
+export class RequestBodyTooLargeError extends Error {
+  constructor(readonly capBytes: number) {
+    super(`Request body exceeded the ${capBytes}-byte cap while streaming`);
+    this.name = "RequestBodyTooLargeError";
+  }
+}
+
+/**
+ * Wrap a request's body in a counting stream that errors with
+ * {@link RequestBodyTooLargeError} past `capBytes` and cancels the source
+ * (the sender stops being read). Bodyless methods pass through untouched.
+ *
+ * This is the server-adapter half of TS-22: it runs where the Request is
+ * handed to the app, so downstream `request.text()`/`json()` reads observe
+ * the cap on real bytes, declared length or not.
+ */
+export function capRequestBody(request: Request, capBytes: number): Request {
+  const method = request.method.toUpperCase();
+  if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
+    return request;
+  }
+  if (!request.body) {
+    return request;
+  }
+  const source = request.body.getReader();
+  let seen = 0;
+  const capped = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const { done, value } = await source.read();
+      if (done) {
+        controller.close();
+        return;
+      }
+      seen += value.byteLength;
+      if (seen > capBytes) {
+        // Stop reading the sender and fail the consumer: the bytes already
+        // buffered past the cap never reach the handler.
+        await source.cancel().catch(() => {});
+        controller.error(new RequestBodyTooLargeError(capBytes));
+        return;
+      }
+      controller.enqueue(value);
+    },
+    cancel(reason) {
+      source.cancel(reason).catch(() => {});
+    },
+  });
+  return new Request(request.url, {
+    method: request.method,
+    headers: request.headers,
+    body: capped,
+    // A streaming body requires half-duplex in fetch-land Request
+    // construction; without it Node's undici rejects the init.
+    duplex: "half",
+  });
+}
 
 export interface InputLimitsOptions {
   /**
@@ -142,11 +212,10 @@ export function inputLimitsMiddleware(options: InputLimitsOptions = {}): Middlew
       }
 
       // SECURITY: For requests with a declared length we enforce the cap above.
-      // True byte-accurate enforcement of streamed/chunked bodies has to happen
-      // where the request stream is created (the server adapter) or at the
-      // reverse proxy (nginx/cloudflare) — this middleware cannot replace the
-      // request body that downstream handlers will read. Configure body limits
-      // there as defense-in-depth, or enable `rejectUnknownLength`.
+      // The ACTUAL-byte cap for streamed/undeclared bodies is enforced by the
+      // server adapter (`maxRequestBodyBytes` → `capRequestBody`), which owns
+      // the request stream — see the module docs. Configure both for
+      // defense-in-depth, or enable `rejectUnknownLength`.
     }
 
     return next();
