@@ -158,6 +158,15 @@ impl Executor {
         let gin_dirty = txn.gin_dirty;
         let derived_dirty_tables: Vec<String> = txn.derived_dirty_tables.iter().cloned().collect();
         let policy_dirty = txn.policy_dirty;
+        // Snapshot lease (Consumer-2): the lease's lifetime is the holding
+        // transaction's — COMMIT releases it. Released AFTER the storage
+        // commit, so blocked writers wake to a state that already includes
+        // this transaction (which wrote nothing, the lease view being
+        // read-only, but ordering it here keeps the rule simple: the window
+        // opens only once the transaction is fully finished).
+        #[cfg(feature = "server")]
+        self.snapshot_leases
+            .release(super::unique_gate::gate_session_id());
         // Taken before the state is cleared; published below, after the commit
         // decision (A7).
         let security_pending = txn.security_pending.take();
@@ -283,6 +292,14 @@ impl Executor {
     pub(super) async fn rollback_transaction(&self) -> Result<ExecResult, ExecError> {
         let sess = self.current_session();
         let mut txn = sess.txn_state.write().await;
+
+        // Snapshot lease (Consumer-2): ROLLBACK releases it too — the
+        // transaction is ending either way, and the lease's window must not
+        // outlive it. Before the engine abort so a blocked writer woken by
+        // the release can never observe this transaction still active.
+        #[cfg(feature = "server")]
+        self.snapshot_leases
+            .release(super::unique_gate::gate_session_id());
 
         if self.storage.supports_mvcc() {
             self.storage.abort_txn().await?;

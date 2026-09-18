@@ -99,6 +99,7 @@ mod test_specialty_surface_guard; // N15: the specialty fail-closed guard, audit
 mod test_spill_sweep; // B2: executor sweeps orphaned query-spill files on startup
 mod test_sql_wal_ack_durability; // R4: an acked autocommit SQL write is fsync-durable
 mod test_ssi_census; // B1: end-to-end SSI anomaly census (gate for MVCC scan changes)
+mod test_snapshot_lease; // Consumer-2: cross-table snapshot lease + mutation-blocking window
 mod test_streaming_aggregate; // Grace hash aggregation: bounded-memory GROUP BY with spill
 mod test_streaming_filter; // Phase 1.2 read-side: streaming WHERE filter (SIREAD-safe full scan)
 mod test_streaming_join; // Grace hash join: bounded-memory two-table equi-JOIN with spill

@@ -152,6 +152,8 @@ pub(crate) mod row_batch;
 mod row_locks;
 mod scalar_fns;
 mod scan_stream;
+#[cfg(feature = "server")]
+mod snapshot_lease;
 mod schema_types;
 mod session;
 mod spill;
@@ -573,6 +575,10 @@ pub struct Executor {
     follower_read_mgr: Option<Arc<parking_lot::RwLock<crate::distributed::FollowerReadManager>>>,
     /// Per-connection sessions keyed by session ID.
     sessions: parking_lot::RwLock<HashMap<u64, Arc<Session>>>,
+    /// Database-wide snapshot lease (Consumer-2): one holder blocks every
+    /// other session's mutations until release/expiry. See `snapshot_lease`.
+    #[cfg(feature = "server")]
+    snapshot_leases: snapshot_lease::SnapshotLeaseRegistry,
     /// Counter for generating unique session IDs.
     next_session_id: AtomicU64,
     /// Coordinator transaction-id counter (S63): minted at BEGIN, never
@@ -1036,6 +1042,8 @@ impl Executor {
             #[cfg(feature = "server")]
             follower_read_mgr: None,
             sessions: parking_lot::RwLock::new(HashMap::new()),
+            #[cfg(feature = "server")]
+            snapshot_leases: snapshot_lease::SnapshotLeaseRegistry::new(),
             next_session_id: AtomicU64::new(1),
             next_xact_id: AtomicU64::new(1),
             specialty_horizon: AtomicU64::new(1),
@@ -3404,6 +3412,13 @@ impl Executor {
         // Same for its FOR UPDATE row locks: an abandoned session must not
         // park claimable rows behind it forever.
         self.release_row_locks(id);
+        // And same for a snapshot lease it still held: the rollback above
+        // normally released it, but a lease acquired by a session whose
+        // transaction state was already gone would survive — release by
+        // session id so the mutation window cannot outlive the connection
+        // (belt and braces alongside the timeout).
+        #[cfg(feature = "server")]
+        self.snapshot_leases.release(id);
         self.storage.drop_storage_session(id);
         self.metrics
             .sessions_active
@@ -4359,6 +4374,67 @@ impl Executor {
             statement,
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
         )
+    }
+
+    /// Whether a statement mutates logical state and therefore must wait
+    /// for an active snapshot lease's window (Consumer-2). DML plus
+    /// table-shape DDL plus COPY-in. Reads (SELECT, COPY TO), transaction
+    /// control, and maintenance (VACUUM/ANALYZE, which do not change
+    /// logical content) pass without waiting. Security DDL is included —
+    /// a dump that captures tables while roles drift is not a moment.
+    #[cfg(feature = "server")]
+    fn statement_blocks_on_snapshot_lease(statement: &Statement) -> bool {
+        Self::statement_is_dml(statement)
+            || Self::statement_is_security_ddl(statement)
+            || matches!(
+                statement,
+                Statement::CreateTable(_)
+                    | Statement::Drop { .. }
+                    | Statement::CreateIndex(_)
+                    | Statement::AlterTable(_)
+                    | Statement::CreateType { .. }
+                    | Statement::CreateView(_)
+                    | Statement::CreateSequence { .. }
+                    | Statement::CreateFunction(_)
+                    | Statement::DropFunction(_)
+                    | Statement::CreateTrigger(_)
+                    | Statement::DropTrigger(_)
+                    | Statement::CreateSchema { .. }
+                    | Statement::CreateExtension(_)
+                    | Statement::DropExtension(_)
+                    | Statement::Truncate { .. }
+                    | Statement::Merge { .. }
+                    | Statement::Copy { to: false, .. }
+            )
+    }
+
+    /// Writer half of the snapshot lease. The holder's write is refused
+    /// (the frozen view is read-only); anyone else waits for release or
+    /// expiry — bounded by the lease's own timeout, so a crashed holder
+    /// cannot wedge writers indefinitely.
+    #[cfg(feature = "server")]
+    async fn gate_mutation_on_snapshot_lease(&self) -> Result<(), ExecError> {
+        let session_id = unique_gate::gate_session_id();
+        if let Some((holder, _remaining)) = self.snapshot_leases.holder() {
+            if holder == session_id {
+                return Err(ExecError::Runtime(
+                    "this session holds the snapshot lease; its point-in-time view is \
+                     read-only — RELEASE SNAPSHOT LEASE (or COMMIT/ROLLBACK) first"
+                        .into(),
+                ));
+            }
+        }
+        self.snapshot_leases
+            .wait_for_mutation_window(session_id)
+            .await;
+        Ok(())
+    }
+
+    /// Public wrapper of the snapshot-lease writer gate for wire-level fast
+    /// paths that bypass `execute_statements_dispatch` (the KV interceptor).
+    #[cfg(feature = "server")]
+    pub async fn gate_snapshot_lease_write(&self) -> Result<(), ExecError> {
+        self.gate_mutation_on_snapshot_lease().await
     }
 
     /// Whether cluster routing in `execute_statements_dispatch` will consult
@@ -5901,6 +5977,15 @@ impl Executor {
             return Some(Err(self.service.admit_write(label).unwrap_err()));
         }
 
+        // The snapshot-lease writer gate, for the same reason as the
+        // read-only gate above: this path bypasses the dispatch, so
+        // non-holder mutations must wait here too (Consumer-2).
+        if !matches!(cmd, SqlFastPathCommand::PointSelect { .. })
+            && let Err(e) = self.gate_mutation_on_snapshot_lease().await
+        {
+            return Some(Err(e));
+        }
+
         match cmd {
             SqlFastPathCommand::PointSelect {
                 table,
@@ -6277,8 +6362,13 @@ impl Executor {
                         .to_ascii_uppercase();
                     second == b'E' // SELECT or SET
                 }
-                // 'R' could be REFRESH (extension) or ROLLBACK/RESET/REVOKE (standard)
-                b'R' => !Self::starts_with_ci(trimmed, "REFRESH"),
+                // 'R' could be REFRESH (extension) or ROLLBACK/RESET/REVOKE (standard);
+                // RELEASE SNAPSHOT LEASE is an extension that must not fall to
+                // sqlparser (which only knows RELEASE SAVEPOINT).
+                b'R' => {
+                    !Self::starts_with_ci(trimmed, "REFRESH")
+                        && !Self::starts_with_ci(trimmed, "RELEASE SNAPSHOT")
+                }
                 _ => false,
             };
 
@@ -6340,6 +6430,21 @@ impl Executor {
             }
             if upper == "SHOW MEMORY" || upper == "SHOW MEMORY;" {
                 return Ok(vec![self.execute_show_memory()]);
+            }
+            // Snapshot lease surface (Consumer-2 / teploy-observe F45): the
+            // cross-table point-in-time + mutation-blocking boundary a Go
+            // consumer drives over the wire. See `snapshot_lease`.
+            #[cfg(feature = "server")]
+            if upper.starts_with("ACQUIRE SNAPSHOT LEASE") {
+                return Ok(vec![self.execute_acquire_snapshot_lease(trimmed)?]);
+            }
+            #[cfg(feature = "server")]
+            if upper.starts_with("RELEASE SNAPSHOT LEASE") {
+                return Ok(vec![self.execute_release_snapshot_lease()?]);
+            }
+            #[cfg(feature = "server")]
+            if upper == "SHOW SNAPSHOT LEASE" || upper == "SHOW SNAPSHOT LEASE;" {
+                return Ok(vec![self.execute_show_snapshot_lease()?]);
             }
             if upper == "MEMORY PRESSURE" || upper == "MEMORY PRESSURE;" {
                 return Ok(vec![self.execute_memory_pressure().await]);
@@ -6596,9 +6701,20 @@ impl Executor {
         sql: &str,
         #[cfg_attr(not(feature = "server"), allow(unused_mut))] mut statements: Vec<Statement>,
     ) -> Result<Vec<ExecResult>, ExecError> {
-        #[cfg(not(feature = "server"))]
-        let _ = sql;
+    #[cfg(not(feature = "server"))]
+    let _ = sql;
         self.recompute_session_context(&self.current_session());
+        // Snapshot-lease writer gate (Consumer-2): while a lease is held,
+        // other sessions' mutations wait for the window to open; the
+        // holder's own mutations are refused (its view is the frozen
+        // moment — writing into it would both dirty the moment and
+        // deadlock the gate against itself). Placement here, at the
+        // single dispatch every entry point routes through, is what makes
+        // the boundary cross-statement and cross-connection.
+        #[cfg(feature = "server")]
+        if statements.iter().any(Self::statement_blocks_on_snapshot_lease) {
+            self.gate_mutation_on_snapshot_lease().await?;
+        }
         // Cluster-mode DML routing: followers forward to leader; leader appends to Raft log.
         // Skip entirely in standalone mode to avoid lock contention on the Raft mutex.
         #[cfg(feature = "server")]

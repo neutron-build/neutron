@@ -213,6 +213,13 @@ impl Executor {
         // Handle special multi-word SHOW commands
         let var_upper = var_name.to_uppercase();
         match var_upper.as_str() {
+            // The parsed-statement route (extended protocol / prepared SHOW)
+            // lands here; the raw-text route lands in `execute`'s extension
+            // arm. Both must answer identically or a client's Describe and
+            // Execute disagree on the schema. The parsed form joins the
+            // variable's words with dots (`SNAPSHOT.LEASE`).
+            #[cfg(feature = "server")]
+            "SNAPSHOT LEASE" | "SNAPSHOT.LEASE" => return self.execute_show_snapshot_lease(),
             "POOL_STATUS" | "POOL STATUS" => return self.show_pool_status(),
             "BUFFER_POOL" | "BUFFER POOL" => return self.show_buffer_pool(),
             "METRICS" => return self.show_metrics(),
