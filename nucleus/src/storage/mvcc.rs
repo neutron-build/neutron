@@ -97,6 +97,58 @@ impl MvccTable {
         idx
     }
 
+    /// Recovery-only insert at an explicit durable version id (WAL v2
+    /// identity, cluster 1): the row is seated at exactly `version_id`, and
+    /// any gap below it is filled with neutralized filler slots so the row
+    /// vector position keeps equaling the durable id — the next minted id
+    /// (`rows.len()`) can then never collide with an id from an earlier log
+    /// generation. Fillers are invisible by construction (created AND
+    /// tombstoned by the recovery transaction, which commits), exactly like
+    /// a GC-neutralized slot.
+    ///
+    /// An id below the current length overwrites the slot (resurrection);
+    /// the v2 baseline writer never emits one, but replay tolerance here
+    /// keeps recovery explicit rather than positional.
+    fn recover_insert(&self, version_id: usize, txn_id: u64, row: Row) {
+        let filler = || MvccRow {
+            version: {
+                let v = RowVersion::new(txn_id);
+                v.deleted_by.store(txn_id, Ordering::Release);
+                v
+            },
+            data: Arc::new(Vec::new()),
+        };
+        let mut rows = self.rows.write();
+        while rows.len() < version_id {
+            rows.push(filler());
+        }
+        let m = MvccRow {
+            version: RowVersion::new(txn_id),
+            data: Arc::new(row),
+        };
+        if version_id == rows.len() {
+            rows.push(m);
+        } else {
+            rows[version_id] = m;
+        }
+    }
+
+    /// Pad the identity space up to `floor` with invisible filler slots, so
+    /// the next minted id is `floor` — never a re-use of a dead id the
+    /// previous log generation contained. Bounded by that generation's
+    /// high-water mark, which the previous run's memory already paid for.
+    fn pad_to(&self, floor: usize, txn_id: u64) {
+        let mut rows = self.rows.write();
+        while rows.len() < floor {
+            let v = RowVersion::new(txn_id);
+            v.deleted_by.store(txn_id, Ordering::Release);
+            rows.push(MvccRow {
+                version: v,
+                data: Arc::new(Vec::new()),
+            });
+        }
+    }
+
     /// Mark a row version as deleted by the given transaction.
     /// Returns Err if the row is already being modified by another active txn.
     ///
@@ -739,6 +791,43 @@ impl MvccMemoryEngine {
         Ok(tbl.insert(txn_id, row))
     }
 
+    /// Recovery-only insert at an explicit durable version id — see
+    /// [`MvccTable::recover_insert`]. Used by `with_wal` to re-seat each
+    /// recovered row at exactly the id the WAL recorded for it.
+    pub fn recover_insert(
+        &self,
+        table: &str,
+        version_id: u64,
+        txn_id: u64,
+        row: Row,
+    ) -> Result<(), MvccError> {
+        let tbl = self.get_table(table)?;
+        tbl.recover_insert(
+            version_id.min(usize::MAX as u64) as usize,
+            txn_id,
+            row,
+        );
+        Ok(())
+    }
+
+    /// Pad a table's identity space to `floor` (recovery continuation).
+    pub fn pad_table(&self, table: &str, floor: u64, txn_id: u64) -> Result<(), MvccError> {
+        let tbl = self.get_table(table)?;
+        tbl.pad_to(floor.min(usize::MAX as u64) as usize, txn_id);
+        Ok(())
+    }
+
+    /// The table's current identity high-water mark: the next id a write
+    /// would mint. 0 when the table does not exist. The adapter logs this
+    /// as the CreateTable version floor so a later recovery never mints
+    /// below the ids this run already used.
+    pub fn table_version_count(&self, table: &str) -> usize {
+        self.tables
+            .read()
+            .get(table)
+            .map_or(0, |t| t.version_count())
+    }
+
     /// Scan visible rows for the given snapshot.
     /// Returns (version_index, row_data) pairs.
     pub fn scan(
@@ -1177,27 +1266,43 @@ impl MvccStorageAdapter {
         let engine = MvccMemoryEngine::new(txn_mgr);
         let mut committed_counts = HashMap::new();
         let mut recovered_schemas = Vec::new();
+        let mut state = state;
 
-        // Replay recovered tables into the MVCC engine
+        // Replay recovered tables into the MVCC engine. Each row is re-seated
+        // at its ORIGINAL durable version id (cluster 1: identity survives
+        // restarts), and the table is padded to its recovered floor so the
+        // next minted id continues above every id the log ever contained —
+        // dead or aborted ids included. Fillers are invisible slots, same as
+        // a GC-neutralized tombstone.
         for (name, table) in &state.tables {
             engine.create_table(name);
             recovered_schemas.push((name.clone(), table.columns.clone()));
             // Use auto-commit for recovery inserts
             let txn = engine.txn_mgr().begin(IsolationLevel::Snapshot);
             let txn_id = txn.id;
-            for row in &table.rows {
-                let _ = engine.insert(name, txn_id, row.clone());
+            for (version_id, row) in &table.rows {
+                let _ = engine.recover_insert(name, *version_id, txn_id, row.clone());
             }
+            engine
+                .pad_table(name, table.next_version_id, txn_id)
+                .map_err(|e| StorageError::TableNotFound(e.to_string()))?;
             let mut txn = txn;
             engine.txn_mgr().commit(&mut txn);
             committed_counts.insert(name.clone(), table.rows.len() as i64);
         }
+        // The engine's identity high-water marks are authoritative now (they
+        // equal the recovered floors); reflect them back into the state so
+        // the compaction baseline records correct floors.
+        for (name, tbl) in state.tables.iter_mut() {
+            tbl.next_version_id = tbl
+                .next_version_id
+                .max(engine.table_version_count(name) as u64);
+        }
 
         // Compact the WAL to a clean baseline matching the just-reconstructed
-        // state. The engine assigned version indices 0..n per table above (in
-        // `table.rows` order); compact() writes Insert records with the SAME
-        // indices, so subsequent writes get non-colliding higher indices and a
-        // later recovery cannot resurrect/lose rows via cross-run vidx reuse.
+        // state. The baseline preserves each row's version id and the floor,
+        // so a later recovery cannot resurrect/lose rows via id reuse, and
+        // the durable identity space never rewinds across restarts.
         wal.compact(&state)
             .map_err(|e| StorageError::Io(format!("WAL compact: {e}")))?;
 
@@ -1536,8 +1641,8 @@ impl MvccStorageAdapter {
     }
 
     /// Log a COMMIT and fsync (no-op if WAL is disabled or server feature is off).
-    /// `xact` is the optional S63 coordinating-transaction id, marker-written
-    /// under the same fsync as the COMMIT record.
+    /// `xact` is the optional S63 coordinating-transaction id, carried inside
+    /// the atomic CommitV2 frame under the same fsync as the decision.
     ///
     /// NU-05 round 2: a failure here is an INDETERMINATE commit, not a clean
     /// abort. The Commit record (and its bytes) may already be durable —
@@ -1560,7 +1665,12 @@ impl MvccStorageAdapter {
                         .into(),
                 ));
             }
-            if let Err(e) = wal.log_commit(txn_id, xact) {
+            let single = xact.map(|x| [x]);
+            let xacts: &[u64] = match &single {
+                Some(arr) => arr,
+                None => &[],
+            };
+            if let Err(e) = wal.log_commit(txn_id, xacts) {
                 self.recovery_required
                     .store(true, std::sync::atomic::Ordering::Release);
                 return Err(StorageError::Io(format!(
@@ -1661,7 +1771,7 @@ impl MvccStorageAdapter {
             MvccWalRecord::Delete {
                 table: table.to_string(),
                 txn_id,
-                version_idx: vidx as u32,
+                version_id: vidx as u64,
             }
         )?;
         Ok(())
@@ -1710,7 +1820,7 @@ impl MvccStorageAdapter {
             MvccWalRecord::Insert {
                 table: table.to_string(),
                 txn_id,
-                version_idx: vidx as u32,
+                version_id: vidx as u64,
                 row,
             }
         )?;
@@ -1764,7 +1874,7 @@ impl MvccStorageAdapter {
             MvccWalRecord::Insert {
                 table: table.to_string(),
                 txn_id,
-                version_idx: old_vidx as u32,
+                version_id: old_vidx as u64,
                 row: old_row,
             }
         )?;
@@ -1773,7 +1883,7 @@ impl MvccStorageAdapter {
             MvccWalRecord::Delete {
                 table: table.to_string(),
                 txn_id,
-                version_idx: new_vidx as u32,
+                version_id: new_vidx as u64,
             }
         )?;
         Ok(())
@@ -2032,6 +2142,7 @@ impl StorageEngine for MvccStorageAdapter {
             MvccWalRecord::CreateTable {
                 name: table.to_string(),
                 columns: Vec::new(),
+                next_version_id: 0,
             }
         )?;
         self.engine.create_table(table);
@@ -2041,11 +2152,14 @@ impl StorageEngine for MvccStorageAdapter {
 
     fn store_table_schema(&self, table: &str, _columns: &[(String, crate::types::DataType)]) {
         // Re-log CreateTable with full schema so recovery can restore the catalog.
+        // The version floor is the engine's current high-water mark, so a
+        // recovery of this record never mints ids below ones already used.
         if let Err(e) = wal_log!(
             self,
             MvccWalRecord::CreateTable {
                 name: table.to_string(),
                 columns: _columns.to_vec(),
+                next_version_id: self.engine.table_version_count(table) as u64,
             }
         ) {
             tracing::error!("MVCC WAL failed to log schema for table {table}: {e}");
@@ -2103,7 +2217,7 @@ impl StorageEngine for MvccStorageAdapter {
             MvccWalRecord::Insert {
                 table: table.to_string(),
                 txn_id: if auto { 0 } else { txn_id },
-                version_idx: version_idx as u32,
+                version_id: version_idx as u64,
                 row: row.clone(),
             }
         )?;
@@ -2159,7 +2273,7 @@ impl StorageEngine for MvccStorageAdapter {
             MvccWalRecord::Insert {
                 table: table.to_string(),
                 txn_id: if auto { 0 } else { txn_id },
-                version_idx: version_idx as u32,
+                version_id: version_idx as u64,
                 row: row.clone(),
             }
         )?;
@@ -2243,7 +2357,7 @@ impl StorageEngine for MvccStorageAdapter {
                 MvccWalRecord::Insert {
                     table: table.to_string(),
                     txn_id: wal_txn_id,
-                    version_idx: vidx as u32,
+                    version_id: vidx as u64,
                     row: row.clone(),
                 }
             ) {
@@ -2912,7 +3026,7 @@ impl StorageEngine for MvccStorageAdapter {
                 MvccWalRecord::Delete {
                     table: table.to_string(),
                     txn_id: wal_txn_id,
-                    version_idx: version_idx as u32,
+                    version_id: version_idx as u64,
                 }
             ) {
                 if batch_in_wal_txn {
@@ -6189,8 +6303,8 @@ impl MvccStorageAdapter {
                 MvccWalRecord::Update {
                     table: table.to_string(),
                     txn_id: wal_txn_id,
-                    old_version_idx: *version_idx as u32,
-                    new_version_idx: new_vidx as u32,
+                    old_version_id: *version_idx as u64,
+                    new_version_id: new_vidx as u64,
                     new_row: new_row.clone(),
                 }
             ) {

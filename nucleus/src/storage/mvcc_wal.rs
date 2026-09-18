@@ -4,10 +4,35 @@
 //! as logical records.  On recovery, committed transactions are replayed
 //! in order while aborted/in-flight transactions are skipped.
 //!
-//! ## Binary entry format
+//! ## Format v2 (current)
+//!
+//! Every frame carries a versioned, checksummed header so a corrupted
+//! length is distinguishable from a genuine crash-torn tail (NU-04
+//! remainder):
+//! ```text
+//! [magic: u32 "NUW2"] [version: u16 = 2] [len: u32]
+//! [hcrc: u32 = crc32c(magic|version|len)] [payload: len bytes]
+//! [pcrc: u32 = crc32c(payload)]
+//! ```
+//! A crash mid-append can only ever leave a PREFIX of the header or a
+//! truncated payload; a complete 14-byte header whose own CRC fails is
+//! therefore damage, not a torn tail, and fails closed. Payloads carry
+//! 64-bit stable version ids (never narrowed), lossless type
+//! descriptors for parameterized columns, and the atomic cross-model
+//! `CommitV2` record (txn + all enlistment ids in one frame, NU-08).
+//!
+//! ## Format v1 (legacy, read-only)
+//!
 //! ```text
 //! [record_len: u32 LE] [tag: u8] [payload ...] [crc32: u32 LE]
 //! ```
+//! A v1 log is detected on open (its first four bytes are a length, and
+//! `MAGIC` as a length exceeds the replay ceiling), fully replayed, and
+//! rewritten as a v2 baseline — the original is preserved as
+//! `mvcc.wal.v1` until the next clean v2 open retires it. v1 is never
+//! appended to (no dual-format limbo). An old binary reading a v2 log
+//! rejects it as an impossible record length and leaves the file
+//! untouched: fail-closed in both directions.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -29,12 +54,31 @@ const TAG_BEGIN: u8 = 0x10;
 const TAG_COMMIT: u8 = 0x11;
 const TAG_ABORT: u8 = 0x12;
 /// S63 marker: the coordinating (cross-model) transaction id that committed
-/// alongside this WAL's own txn id. A separate record rather than a field on
-/// `Commit` so the pre-S63 `Commit` byte layout is untouched — addition-only
-/// compatibility, the same rule every specialty WAL follows.
+/// alongside this WAL's own txn id. Written by pre-v2 commits next to the
+/// `Commit` record (the two-frame window `CommitV2` closes for new writes)
+/// and rewritten by `compact` so the marker set survives log reclaim.
 const TAG_XACT_COMMIT: u8 = 0x13;
+/// v2 atomic cross-model commit (NU-08): one frame carrying the SQL txn id
+/// and every enlisted coordinating id, checksummed as a unit. A crash can
+/// no longer leave "SQL committed" durable while the enlistment marker
+/// torn — the whole decision is present or absent.
+const TAG_COMMIT_V2: u8 = 0x14;
 const TAG_CHECKPOINT: u8 = 0x20;
 
+// ── v2 framing constants ─────────────────────────────────────────────────────
+
+/// v2 frame magic. On disk the first four bytes of every v2 log read
+/// "NUW2". As a little-endian u32 it is ~844 million — far above the
+/// 64 MiB replay ceiling, so it can never be confused with a v1 record
+/// length, and a v1-only reader offered a v2 log rejects it as an
+/// impossible length instead of misinterpreting it.
+const MAGIC: u32 = 0x3257_554E;
+/// The frame version this writer emits. A reader that sees a higher
+/// version in a valid header refuses the log with an explicit
+/// "newer format" error rather than guessing at the layout.
+const FORMAT_VERSION: u16 = 2;
+/// magic(4) + version(2) + len(4) + hcrc(4).
+const V2_HEADER_SIZE: usize = 14;
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /// A logical WAL record for the MVCC engine.
@@ -43,6 +87,11 @@ pub enum MvccWalRecord {
     CreateTable {
         name: String,
         columns: Vec<(String, DataType)>,
+        /// Durable version-id floor for the table (cluster 1): the next id
+        /// the writer may mint. Recorded so recovery can validate that the
+        /// identity space never rewinds, and so ids from earlier log
+        /// generations are never reused for a different row.
+        next_version_id: u64,
     },
     DropTable {
         name: String,
@@ -50,25 +99,27 @@ pub enum MvccWalRecord {
     Insert {
         table: String,
         txn_id: u64,
-        /// Engine version index assigned to this row (stable identity for the
-        /// life of the table). Replay keys rows by this so DELETE/UPDATE address
-        /// the exact row regardless of scan order.
-        version_idx: u32,
+        /// Engine version id assigned to this row — a stable 64-bit durable
+        /// identity (cluster 1). Replay keys rows by it so DELETE/UPDATE
+        /// address the exact row regardless of scan order, and recovery
+        /// rejects a committed INSERT onto an already-live id (id reuse is
+        /// a writer bug, not a recoverable state).
+        version_id: u64,
         row: Vec<Value>,
     },
     Delete {
         table: String,
         txn_id: u64,
-        /// Version index of the deleted row (NOT a scan position).
-        version_idx: u32,
+        /// Version id of the deleted row (NOT a scan position).
+        version_id: u64,
     },
     Update {
         table: String,
         txn_id: u64,
-        /// Version index of the superseded row.
-        old_version_idx: u32,
-        /// Version index of the new row version the engine appended.
-        new_version_idx: u32,
+        /// Version id of the superseded row.
+        old_version_id: u64,
+        /// Version id of the new row version the engine appended.
+        new_version_id: u64,
         new_row: Vec<Value>,
     },
     Begin {
@@ -88,6 +139,14 @@ pub enum MvccWalRecord {
     XactCommit {
         xact: u64,
     },
+    /// v2 atomic commit (NU-08): `txn_id` committed AND every id in
+    /// `xacts` is a committed coordinating transaction — one frame, one
+    /// checksum, one fsync decision. Subsumes the `Commit` + `XactCommit`
+    /// pair; the pair's two-frame window is closed for new writes.
+    CommitV2 {
+        txn_id: u64,
+        xacts: Vec<u64>,
+    },
     Checkpoint,
 }
 
@@ -106,10 +165,16 @@ pub struct MvccWalState {
 #[derive(Debug, Clone)]
 pub struct RecoveredTable {
     pub columns: Vec<(String, DataType)>,
-    pub rows: Vec<Vec<Value>>,
+    /// Committed rows with their durable version ids, in id order.
+    /// The id is part of the recovered state (cluster 1): reconstruction
+    /// re-seats each row at exactly this id so identities survive restarts.
+    pub rows: Vec<(u64, Vec<Value>)>,
+    /// The next version id the engine may mint for this table — never lower
+    /// than every id that ever appeared in this log, live or dead.
+    pub next_version_id: u64,
 }
 
-/// Append-only WAL for MVCC durability.
+/// Append-only WAL for MVCC durability (v2 writer).
 pub struct MvccWal {
     path: PathBuf,
     writer: Mutex<BufWriter<File>>,
@@ -145,49 +210,115 @@ fn encode_checked(record: &MvccWalRecord) -> io::Result<Vec<u8>> {
     Ok(payload)
 }
 
-/// Write one length-prefixed, CRC-suffixed record onto any writer. Shares
-/// the exact framing `MvccWal::log` uses so a staged file replays
-/// identically. Both paths share `encode_checked`, so an appender and
-/// compaction can never diverge on the size contract (NU-21).
+/// Write one v2 frame onto any writer. Append and compaction share this
+/// path (and `encode_checked`), so an appender and a rewritten baseline
+/// can never diverge on the framing or size contract (NU-21).
 fn write_framed<W: Write>(w: &mut W, record: &MvccWalRecord) -> io::Result<()> {
     let payload = encode_checked(record)?;
-    let crc = crc32c(&payload);
-    w.write_all(&(payload.len() as u32).to_le_bytes())?;
-    w.write_all(&payload)?;
-    w.write_all(&crc.to_le_bytes())
+    write_v2_frame(w, &payload)
+}
+
+/// Lay down one v2 frame: checksummed header (magic, version, length)
+/// followed by the payload and its own CRC. The header CRC is what makes
+/// a corrupted length provable — see the module docs.
+fn write_v2_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
+    let mut header = [0u8; V2_HEADER_SIZE - 4];
+    header[..4].copy_from_slice(&MAGIC.to_le_bytes());
+    header[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    header[6..10].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    let hcrc = crc32c(&header);
+    w.write_all(&header)?;
+    w.write_all(&hcrc.to_le_bytes())?;
+    w.write_all(payload)?;
+    let pcrc = crc32c(payload);
+    w.write_all(&pcrc.to_le_bytes())
 }
 
 impl MvccWal {
     /// Open or create the WAL file.  Returns (wal, recovered_state).
     ///
-    /// Corruption is fatal (NU-04): a mid-file CRC mismatch or undecodable
-    /// record surfaces as `InvalidData` with the byte offset, and the file
-    /// is left exactly as found — repair is an operator decision. A torn
-    /// FINAL frame (crash mid-append, nothing durable behind it) is
-    /// accepted with a warning and recovers the prefix; the next compaction
-    /// rewrites the log cleanly without the torn tail.
+    /// Corruption is fatal (NU-04): a mid-file CRC mismatch, an impossible
+    /// or damaged header, or an undecodable record surfaces as
+    /// `InvalidData` with the byte offset, and the file is left exactly as
+    /// found — repair is an operator decision. A torn FINAL frame (crash
+    /// mid-append, nothing durable behind it) is accepted with a warning
+    /// and recovers the prefix; a v2 log is truncated to the last valid
+    /// frame so appends never land behind a torn tail.
+    ///
+    /// A legacy (v1) log is replayed in full and immediately rewritten as
+    /// a v2 baseline (upgrade-on-open); the original is preserved as
+    /// `mvcc.wal.v1` until the next clean v2 open retires it — the engine
+    /// has no clean-shutdown hook, so a full clean replay of the upgraded
+    /// log is the proof point that the backup is no longer needed.
     pub fn open(dir: &std::path::Path) -> io::Result<(Self, MvccWalState)> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("mvcc.wal");
+        let mut was_legacy = false;
         let state = if path.exists() {
             let mut data = Vec::new();
             File::open(&path)?.read_to_end(&mut data)?;
-            match replay(&data) {
-                Ok((state, ReplayStop::TornTail { at })) => {
-                    let recovered: usize = state.tables.values().map(|t| t.rows.len()).sum();
-                    eprintln!(
-                        "nucleus: MVCC WAL has a torn final record at byte {at} \
-                         (crash during append); recovering {recovered} committed rows \
-                         and rewriting the log without the tail"
-                    );
-                    state
+            if is_v2(&data) {
+                match replay_v2(&data) {
+                    Ok((state, ReplayStop::TornTail { at })) => {
+                        let recovered: usize = state.tables.values().map(|t| t.rows.len()).sum();
+                        eprintln!(
+                            "nucleus: MVCC WAL (v2) has a torn final frame at byte {at} \
+                             (crash during append); recovering {recovered} committed rows \
+                             and truncating the tail"
+                        );
+                        // Repair now: a later append must never land behind
+                        // torn bytes the next replay would stop at. The torn
+                        // frame never had a durable decision behind it.
+                        let file = OpenOptions::new().write(true).open(&path)?;
+                        file.set_len(at as u64)?;
+                        file.sync_all()?;
+                        state
+                    }
+                    Ok((state, ReplayStop::CleanEof)) => {
+                        // The v2 log replayed cleanly end to end: retire a
+                        // leftover upgrade backup, if any. Its v1 original
+                        // has now been superseded by a log that provably
+                        // opens.
+                        let _ = std::fs::remove_file(v1_backup_path(&path));
+                        state
+                    }
+                    Err(msg) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("{msg} — the WAL is left unmodified; inspect it before retrying"),
+                        ));
+                    }
                 }
-                Ok((state, ReplayStop::CleanEof)) => state,
-                Err(msg) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("{msg} — the WAL is left unmodified; inspect it before retrying"),
-                    ));
+            } else {
+                match replay_v1(&data) {
+                    Ok((state, _stop)) => {
+                        // Legacy log: replay is done, now upgrade. Preserve
+                        // the original before anything touches it. A torn v1
+                        // tail is the accepted prefix case (`_stop`), and the
+                        // rewrite below drops it cleanly.
+                        was_legacy = true;
+                        let backup = v1_backup_path(&path);
+                        if let Err(e) = std::fs::copy(&path, &backup) {
+                            return Err(std::io::Error::other(format!(
+                                "legacy WAL upgrade: could not preserve the original at {}: {e}",
+                                backup.display()
+                            )));
+                        }
+                        let upgraded_rows: usize =
+                            state.tables.values().map(|t| t.rows.len()).sum();
+                        eprintln!(
+                            "nucleus: MVCC WAL is format v1; replayed {upgraded_rows} committed \
+                             rows, upgrading to v2 (original preserved at {})",
+                            backup.display()
+                        );
+                        state
+                    }
+                    Err(msg) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("{msg} — the WAL is left unmodified; inspect it before retrying"),
+                        ));
+                    }
                 }
             }
         } else {
@@ -198,14 +329,20 @@ impl MvccWal {
         // discard it rather than leaving it to confuse a later compaction.
         let _ = std::fs::remove_file(path.with_extension("wal.compacting"));
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        Ok((
-            Self {
-                path,
-                writer: Mutex::new(BufWriter::new(file)),
-                sync: crate::storage::wal_util::WalSync::new(),
-            },
-            state,
-        ))
+        let wal = Self {
+            path,
+            writer: Mutex::new(BufWriter::new(file)),
+            sync: crate::storage::wal_util::WalSync::new(),
+        };
+        // A legacy log was replayed above; rewrite it as the v2 baseline NOW,
+        // inside open, so no caller can end up appending v2 frames after v1
+        // bytes (no dual-format limbo). compact() stages + fsyncs + atomically
+        // renames; on failure the original v1 log is still intact (and the
+        // .v1 backup exists).
+        if was_legacy {
+            wal.compact(&state)?;
+        }
+        Ok((wal, state))
     }
 
     /// Log a record and flush to OS buffer.
@@ -213,14 +350,10 @@ impl MvccWal {
         // Size-check before the first byte goes out (NU-21): an accepted
         // record that replay rejects would brick every later open.
         let payload = encode_checked(record)?;
-        let crc = crc32c(&payload);
-        let len = payload.len() as u32; // bounded by MAX_PAYLOAD check above
         let mut w = self.writer.lock();
         crate::storage::crashpoint::io_fault_check!("wal.append");
         crate::storage::crashpoint::reach("wal.before_append");
-        w.write_all(&len.to_le_bytes())?;
-        w.write_all(&payload)?;
-        w.write_all(&crc.to_le_bytes())?;
+        write_v2_frame(&mut *w, &payload)?;
         let r = w.flush();
         // Bump the LSN under the writer lock, so a concurrent `group_sync`'s
         // captured mark is exact.
@@ -261,15 +394,21 @@ impl MvccWal {
         self.sync.is_dirty()
     }
 
-    /// Log a COMMIT and immediately fsync. When the committing transaction
-    /// coordinated specialty models (S63), `xact` also writes a durable
-    /// `XactCommit` marker under the same fsync, so a crash between the two
-    /// records cannot split "SQL committed" from "specialty writes keepable".
-    pub fn log_commit(&self, txn_id: u64, xact: Option<u64>) -> io::Result<()> {
+    /// Log a commit decision and immediately fsync (NU-08). With
+    /// enlistments this writes ONE `CommitV2` frame — the SQL txn id and
+    /// every coordinating id, checksummed as a unit — so a crash between
+    /// decision bytes can no longer split "SQL committed" from
+    /// "specialty writes keepable". Without enlistments it is the plain
+    /// `Commit` frame.
+    pub fn log_commit(&self, txn_id: u64, xacts: &[u64]) -> io::Result<()> {
         crate::storage::crashpoint::reach("wal.before_commit_record");
-        self.log(&MvccWalRecord::Commit { txn_id })?;
-        if let Some(xact) = xact {
-            self.log(&MvccWalRecord::XactCommit { xact })?;
+        if xacts.is_empty() {
+            self.log(&MvccWalRecord::Commit { txn_id })?;
+        } else {
+            self.log(&MvccWalRecord::CommitV2 {
+                txn_id,
+                xacts: xacts.to_vec(),
+            })?;
         }
         let r = self.sync();
         crate::storage::crashpoint::reach("wal.after_commit_record");
@@ -295,14 +434,25 @@ impl MvccWal {
         Ok(())
     }
 
-    /// Rewrite the WAL as a clean baseline for a recovered state: one
-    /// `CreateTable` plus sequential auto-committed `Insert`s (version_idx 0..n)
-    /// per table. Called on open right after replay so that (a) version indices
-    /// restart from 0 each run — otherwise a fresh run's new vidx would collide
-    /// with a survivor's old vidx in the accumulated WAL and corrupt the NEXT
-    /// recovery — and (b) the WAL stays compact. The caller reconstructs the
-    /// engine from the SAME `state` in the same per-table row order, so the
-    /// engine's assigned version indices match these baseline records exactly.
+    /// Rewrite the WAL as a clean v2 baseline for a recovered state: one
+    /// `CreateTable` (with the table's version-id floor) plus auto-committed
+    /// `Insert`s — each row at its ORIGINAL durable version id — and the
+    /// surviving `XactCommit` markers.
+    ///
+    /// Preserving ids across the rewrite is what makes the identity space
+    /// stable across restarts (cluster 1): a row recovered from an old log
+    /// keeps the id it had, and the recorded floor keeps the next minted id
+    /// above every id the log ever contained. This is also what un-blocks
+    /// in-memory GC compaction (NU-01's deferred half): the WAL speaks
+    /// stable ids, not vector positions, so a future compaction can
+    /// renumber positions behind an id map without touching the format.
+    /// (Compaction itself remains deliberately unimplemented.)
+    ///
+    /// Called on open right after replay so that the WAL stays compact and
+    /// a legacy log is upgraded in the same breath. The caller
+    /// reconstructs the engine from the SAME `state` in the same per-table
+    /// row order, so the engine's version ids match these baseline records
+    /// exactly.
     pub fn compact(&self, state: &MvccWalState) -> io::Result<()> {
         // CRASH SAFETY: stage the new baseline in a temp file, fsync it, then
         // swap it in with an atomic rename.
@@ -331,15 +481,16 @@ impl MvccWal {
                     &MvccWalRecord::CreateTable {
                         name: name.clone(),
                         columns: tbl.columns.clone(),
+                        next_version_id: tbl.next_version_id,
                     },
                 )?;
-                for (i, row) in tbl.rows.iter().enumerate() {
+                for (version_id, row) in &tbl.rows {
                     write_framed(
                         &mut w,
                         &MvccWalRecord::Insert {
                             table: name.clone(),
                             txn_id: 0,
-                            version_idx: i as u32,
+                            version_id: *version_id,
                             row: row.clone(),
                         },
                     )?;
@@ -383,19 +534,78 @@ impl MvccWal {
     }
 }
 
-// ── Encoding ─────────────────────────────────────────────────────────────────
+/// Where the pre-upgrade original of a legacy log is kept.
+fn v1_backup_path(path: &std::path::Path) -> PathBuf {
+    path.with_extension("wal.v1")
+}
+
+/// Does `data` begin with a v2 frame? The magic is far above the v1 replay
+/// ceiling, so a v1 record length can never alias it.
+fn is_v2(data: &[u8]) -> bool {
+    data.len() >= 4 && data[..4] == MAGIC.to_le_bytes()
+}
+
+// ── Encoding (v2 payloads) ───────────────────────────────────────────────────
+
+/// Lossless type descriptor (cluster 3 / NU-15): parameterized types carry
+/// their parameters. `[code: u8]` alone for simple types; `Vector` appends
+/// a u32 dimension, `Array` a recursive descriptor, `UserDefined` the type
+/// name. Unknown codes still fail closed on decode.
+fn write_type_desc(buf: &mut Vec<u8>, dt: &DataType) {
+    match dt {
+        DataType::Vector(dim) => {
+            buf.push(TYPE_VECTOR);
+            write_u32(buf, *dim as u32);
+        }
+        DataType::Array(inner) => {
+            buf.push(TYPE_ARRAY);
+            write_type_desc(buf, inner);
+        }
+        DataType::UserDefined(name) => {
+            buf.push(TYPE_USER_DEFINED);
+            write_str(buf, name);
+        }
+        other => buf.push(datatype_to_u8(other)),
+    }
+}
+
+fn read_type_desc(data: &[u8], pos: &mut usize) -> Option<DataType> {
+    let code = *data.get(*pos)?;
+    *pos += 1;
+    let dt = match code {
+        TYPE_VECTOR => {
+            let dim = read_u32_val(data, pos)?;
+            DataType::Vector(dim as usize)
+        }
+        TYPE_ARRAY => {
+            let inner = read_type_desc(data, pos)?;
+            DataType::Array(Box::new(inner))
+        }
+        TYPE_USER_DEFINED => {
+            let name = read_str(data, pos)?;
+            DataType::UserDefined(name)
+        }
+        code => u8_to_datatype(code)?,
+    };
+    Some(dt)
+}
 
 fn encode_record(rec: &MvccWalRecord) -> Vec<u8> {
     let mut buf = Vec::new();
     match rec {
-        MvccWalRecord::CreateTable { name, columns } => {
+        MvccWalRecord::CreateTable {
+            name,
+            columns,
+            next_version_id,
+        } => {
             buf.push(TAG_CREATE_TABLE);
             write_str(&mut buf, name);
             write_u32(&mut buf, columns.len() as u32);
             for (col_name, col_type) in columns {
                 write_str(&mut buf, col_name);
-                write_u8(&mut buf, datatype_to_u8(col_type));
+                write_type_desc(&mut buf, col_type);
             }
+            write_u64(&mut buf, *next_version_id);
         }
         MvccWalRecord::DropTable { name } => {
             buf.push(TAG_DROP_TABLE);
@@ -404,37 +614,37 @@ fn encode_record(rec: &MvccWalRecord) -> Vec<u8> {
         MvccWalRecord::Insert {
             table,
             txn_id,
-            version_idx,
+            version_id,
             row,
         } => {
             buf.push(TAG_INSERT);
             write_str(&mut buf, table);
             write_u64(&mut buf, *txn_id);
-            write_u32(&mut buf, *version_idx);
+            write_u64(&mut buf, *version_id);
             crate::storage::value_codec::write_row(&mut buf, row);
         }
         MvccWalRecord::Delete {
             table,
             txn_id,
-            version_idx,
+            version_id,
         } => {
             buf.push(TAG_DELETE);
             write_str(&mut buf, table);
             write_u64(&mut buf, *txn_id);
-            write_u32(&mut buf, *version_idx);
+            write_u64(&mut buf, *version_id);
         }
         MvccWalRecord::Update {
             table,
             txn_id,
-            old_version_idx,
-            new_version_idx,
+            old_version_id,
+            new_version_id,
             new_row,
         } => {
             buf.push(TAG_UPDATE);
             write_str(&mut buf, table);
             write_u64(&mut buf, *txn_id);
-            write_u32(&mut buf, *old_version_idx);
-            write_u32(&mut buf, *new_version_idx);
+            write_u64(&mut buf, *old_version_id);
+            write_u64(&mut buf, *new_version_id);
             crate::storage::value_codec::write_row(&mut buf, new_row);
         }
         MvccWalRecord::Begin { txn_id } => {
@@ -453,6 +663,14 @@ fn encode_record(rec: &MvccWalRecord) -> Vec<u8> {
             buf.push(TAG_XACT_COMMIT);
             write_u64(&mut buf, *xact);
         }
+        MvccWalRecord::CommitV2 { txn_id, xacts } => {
+            buf.push(TAG_COMMIT_V2);
+            write_u64(&mut buf, *txn_id);
+            write_u32(&mut buf, xacts.len() as u32);
+            for xact in xacts {
+                write_u64(&mut buf, *xact);
+            }
+        }
         MvccWalRecord::Checkpoint => {
             buf.push(TAG_CHECKPOINT);
         }
@@ -462,9 +680,6 @@ fn encode_record(rec: &MvccWalRecord) -> Vec<u8> {
 
 // ── Primitive helpers ────────────────────────────────────────────────────────
 
-fn write_u8(buf: &mut Vec<u8>, v: u8) {
-    buf.push(v);
-}
 fn write_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
@@ -503,49 +718,80 @@ fn read_str(data: &[u8], pos: &mut usize) -> Option<String> {
     Some(s)
 }
 
+const TYPE_BOOL: u8 = 0;
+const TYPE_INT32: u8 = 1;
+const TYPE_INT64: u8 = 2;
+const TYPE_FLOAT64: u8 = 3;
+const TYPE_TEXT: u8 = 4;
+const TYPE_BYTEA: u8 = 5;
+const TYPE_NUMERIC: u8 = 6;
+const TYPE_UUID: u8 = 7;
+const TYPE_DATE: u8 = 8;
+const TYPE_TIMESTAMP: u8 = 9;
+const TYPE_TIMESTAMPTZ: u8 = 10;
+const TYPE_INTERVAL: u8 = 11;
+const TYPE_JSONB: u8 = 12;
+const TYPE_VECTOR: u8 = 13;
+const TYPE_ARRAY: u8 = 14;
+const TYPE_USER_DEFINED: u8 = 15;
+
 fn datatype_to_u8(dt: &DataType) -> u8 {
     match dt {
-        DataType::Bool => 0,
-        DataType::Int32 => 1,
-        DataType::Int64 => 2,
-        DataType::Float64 => 3,
-        DataType::Text => 4,
-        DataType::Bytea => 5,
-        DataType::Numeric => 6,
-        DataType::Uuid => 7,
-        DataType::Date => 8,
-        DataType::Timestamp => 9,
-        DataType::TimestampTz => 10,
-        DataType::Interval => 11,
-        DataType::Jsonb => 12,
-        DataType::Vector(_) => 13,
-        DataType::Array(_) => 14,
-        DataType::UserDefined(_) => 15,
+        DataType::Bool => TYPE_BOOL,
+        DataType::Int32 => TYPE_INT32,
+        DataType::Int64 => TYPE_INT64,
+        DataType::Float64 => TYPE_FLOAT64,
+        DataType::Text => TYPE_TEXT,
+        DataType::Bytea => TYPE_BYTEA,
+        DataType::Numeric => TYPE_NUMERIC,
+        DataType::Uuid => TYPE_UUID,
+        DataType::Date => TYPE_DATE,
+        DataType::Timestamp => TYPE_TIMESTAMP,
+        DataType::TimestampTz => TYPE_TIMESTAMPTZ,
+        DataType::Interval => TYPE_INTERVAL,
+        DataType::Jsonb => TYPE_JSONB,
+        DataType::Vector(_) => TYPE_VECTOR,
+        DataType::Array(_) => TYPE_ARRAY,
+        DataType::UserDefined(_) => TYPE_USER_DEFINED,
     }
 }
 
-/// Decode a schema type tag. Unknown codes return None (NU-15): silently
+/// Decode a schema type code. Unknown codes return None (NU-15): silently
 /// substituting TEXT for a corrupt/unknown type code reconstructed a
-/// DIFFERENT schema than the one that was written.
+/// DIFFERENT schema than the one that was written. Parameterized codes
+/// (13/14/15) WITHOUT their parameters decode only on the legacy path —
+/// here they are errors, because a bare 13/14/15 in a v2 payload is a
+/// malformed descriptor.
 fn u8_to_datatype(v: u8) -> Option<DataType> {
     let dt = match v {
-        0 => DataType::Bool,
-        1 => DataType::Int32,
-        2 => DataType::Int64,
-        3 => DataType::Float64,
-        4 => DataType::Text,
-        5 => DataType::Bytea,
-        6 => DataType::Numeric,
-        7 => DataType::Uuid,
-        8 => DataType::Date,
-        9 => DataType::Timestamp,
-        10 => DataType::TimestampTz,
-        11 => DataType::Interval,
-        12 => DataType::Jsonb,
-        13 => DataType::Vector(0),
-        14 => DataType::Array(Box::new(DataType::Text)),
-        15 => DataType::UserDefined(String::new()),
+        TYPE_BOOL => DataType::Bool,
+        TYPE_INT32 => DataType::Int32,
+        TYPE_INT64 => DataType::Int64,
+        TYPE_FLOAT64 => DataType::Float64,
+        TYPE_TEXT => DataType::Text,
+        TYPE_BYTEA => DataType::Bytea,
+        TYPE_NUMERIC => DataType::Numeric,
+        TYPE_UUID => DataType::Uuid,
+        TYPE_DATE => DataType::Date,
+        TYPE_TIMESTAMP => DataType::Timestamp,
+        TYPE_TIMESTAMPTZ => DataType::TimestampTz,
+        TYPE_INTERVAL => DataType::Interval,
+        TYPE_JSONB => DataType::Jsonb,
         _ => return None,
+    };
+    Some(dt)
+}
+
+/// Legacy one-byte decode (v1 logs only): parameterized types come back
+/// with their parameters defaulted — the information was never recorded.
+/// This is the recorded NU-15 loss for pre-v2 logs; v2 descriptors are
+/// lossless.
+fn u8_to_datatype_legacy(v: u8) -> Option<DataType> {
+    let dt = match v {
+        TYPE_VECTOR => DataType::Vector(0),
+        TYPE_ARRAY => DataType::Array(Box::new(DataType::Text)),
+        TYPE_USER_DEFINED => DataType::UserDefined(String::new()),
+        v => u8_to_datatype(v)?,
     };
     Some(dt)
 }
@@ -579,28 +825,118 @@ pub enum ReplayStop {
     /// The file ended exactly on a frame boundary — a clean log.
     CleanEof,
     /// The final frame is incomplete (torn write from a crash mid-append).
-    /// Everything before it parsed and is recovered; the torn frame is
-    /// dropped by the next compaction. This is the explicit torn-tail
-    /// policy (NU-04): accepted, because the frame never had a durable
-    /// commit decision behind it.
+    /// Everything before it parsed and is recovered; v2 open truncates the
+    /// torn frame away. This is the explicit torn-tail policy (NU-04):
+    /// accepted, because the frame never had a durable commit decision
+    /// behind it.
     TornTail { at: usize },
 }
 
-/// Replay WAL data to recover committed state.
-///
-/// Fail-closed corruption policy (NU-04): a CRC mismatch, an impossible
-/// length field, an unknown record tag, or undecodable payload is CORRUPTION
-/// and returns Err — startup fails with the byte offset and the original
-/// file is left untouched for diagnosis (compaction only runs after a
-/// successful open). The previous behavior silently accepted the longest
-/// parseable prefix and then compacted it over the damaged suffix,
-/// permanently discarding the evidence and any committed records after the
-/// damage.
+/// Detect + dispatch (used by binary probes; open() dispatches inline so
+/// each arm can apply its own torn-tail policy).
+#[allow(dead_code)]
 fn replay(data: &[u8]) -> Result<(MvccWalState, ReplayStop), String> {
+    if is_v2(data) {
+        replay_v2(data)
+    } else {
+        replay_v1(data)
+    }
+}
+
+/// Replay a v2 log.
+fn replay_v2(data: &[u8]) -> Result<(MvccWalState, ReplayStop), String> {
     let mut pos = 0usize;
     let mut records: Vec<MvccWalRecord> = Vec::new();
 
-    // Phase 1: Parse all records
+    loop {
+        if pos == data.len() {
+            return finish_replay(records, ReplayStop::CleanEof);
+        }
+        let frame_start = pos;
+        // A crash leaves a prefix; fewer bytes than a full header is a torn
+        // tail, whatever their contents.
+        let Some(header) = data.get(pos..pos + V2_HEADER_SIZE) else {
+            return finish_replay(records, ReplayStop::TornTail { at: frame_start });
+        };
+        let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let version = u16::from_le_bytes([header[4], header[5]]);
+        let len = u32::from_le_bytes([header[6], header[7], header[8], header[9]]) as usize;
+        let stored_hcrc =
+            u32::from_le_bytes([header[10], header[11], header[12], header[13]]);
+        if magic != MAGIC {
+            // A v1 frame inside a v2 log (or garbage). Neither is a crash
+            // artifact: crash truncates, it does not substitute bytes.
+            return Err(format!(
+                "MVCC WAL corruption: non-v2 frame at byte {frame_start} inside a v2 log \
+                 (mixed-format logs are not appendable)"
+            ));
+        }
+        if version != FORMAT_VERSION {
+            return Err(format!(
+                "MVCC WAL: frame at byte {frame_start} has format version {version}; \
+                 this reader supports up to {FORMAT_VERSION} — the log was written by a \
+                 newer engine"
+            ));
+        }
+        let computed_hcrc = crc32c(&header[..V2_HEADER_SIZE - 4]);
+        if stored_hcrc != computed_hcrc {
+            // The header is COMPLETE on disk (14 bytes exist) but its own
+            // checksum fails. A crash mid-write cannot produce this — the
+            // hcrc bytes are the last thing the append writes before the
+            // payload, and a torn append leaves a SHORT header, handled
+            // above. This is the NU-04 remainder closed: a damaged length
+            // (whatever value it took, plausible or not) is corruption,
+            // distinguishable from a genuine torn tail.
+            return Err(format!(
+                "MVCC WAL corruption: header CRC mismatch at byte {frame_start} \
+                 (stored {stored_hcrc:#x}, computed {computed_hcrc:#x}) — a complete \
+                 header with a bad checksum is damage, not a torn tail"
+            ));
+        }
+        if len == 0 || len > MAX_PAYLOAD {
+            return Err(format!(
+                "MVCC WAL corruption: impossible payload length {len} at byte {frame_start} \
+                 with a valid header CRC"
+            ));
+        }
+        let payload_end = frame_start + V2_HEADER_SIZE + len;
+        let frame_end = payload_end + 4;
+        if frame_end > data.len() {
+            // Valid header, physically incomplete payload: the ordinary
+            // crash-torn tail.
+            return finish_replay(records, ReplayStop::TornTail { at: frame_start });
+        }
+        let payload = &data[frame_start + V2_HEADER_SIZE..payload_end];
+        let crc_bytes = &data[payload_end..frame_end];
+        let stored_pcrc =
+            u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+        let computed_pcrc = crc32c(payload);
+        if stored_pcrc != computed_pcrc {
+            return Err(format!(
+                "MVCC WAL corruption: payload CRC mismatch at byte {frame_start} \
+                 (stored {stored_pcrc:#x}, computed {computed_pcrc:#x})"
+            ));
+        }
+
+        match decode_record_v2(payload) {
+            Some(rec) => records.push(rec),
+            None => {
+                return Err(format!(
+                    "MVCC WAL corruption: undecodable record (tag {:#x}) at byte {frame_start}",
+                    payload.first().copied().unwrap_or(0)
+                ));
+            }
+        }
+        pos = frame_end;
+    }
+}
+
+/// Replay a legacy (v1) log. Read-only path kept for upgrade-on-open; the
+/// writer never emits v1 frames.
+fn replay_v1(data: &[u8]) -> Result<(MvccWalState, ReplayStop), String> {
+    let mut pos = 0usize;
+    let mut records: Vec<MvccWalRecord> = Vec::new();
+
     loop {
         if pos == data.len() {
             return finish_replay(records, ReplayStop::CleanEof);
@@ -614,8 +950,17 @@ fn replay(data: &[u8]) -> Result<(MvccWalState, ReplayStop), String> {
             as usize;
         pos += 4;
         if len == 0 || len > MAX_PAYLOAD {
+            // This includes a v2 log offered to the v1 path: the magic reads
+            // as a ~844 MB length, far above the ceiling — the old reader's
+            // honest, fail-closed rejection.
             return Err(format!(
-                "MVCC WAL corruption: impossible record length {len} at byte {frame_start}"
+                "MVCC WAL corruption: impossible record length {len} at byte {frame_start}{}",
+                if len == MAGIC as usize {
+                    " (the value is the v2 frame magic — this log is format v2, \
+                     written by a newer engine)"
+                } else {
+                    ""
+                }
             ));
         }
         if pos + len + 4 > data.len() {
@@ -635,19 +980,25 @@ fn replay(data: &[u8]) -> Result<(MvccWalState, ReplayStop), String> {
             ));
         }
 
-        match decode_record(payload) {
+        match decode_record_v1(payload) {
             Some(rec) => records.push(rec),
             None => {
                 return Err(format!(
-                    "MVCC WAL corruption: undecodable record (tag {:#x}) at byte {frame_start}",
-                    payload.first().copied().unwrap_or(0)
+                    "MVCC WAL corruption: undecodable record (tag {:#x}) at byte {frame_start}{}",
+                    payload.first().copied().unwrap_or(0),
+                    if payload.first() == Some(&TAG_COMMIT_V2) {
+                        " (tag 0x14 is CommitV2 — this record was written by a \
+                         v2-format engine and cannot be read by a v1 decoder)"
+                    } else {
+                        ""
+                    }
                 ));
             }
         }
     }
 }
 
-/// Phase 2+3 of replay, shared by every stop kind.
+/// Phase 2+3 of replay, shared by both format readers.
 fn finish_replay(
     records: Vec<MvccWalRecord>,
     stop: ReplayStop,
@@ -695,6 +1046,10 @@ fn finish_replay(
             MvccWalRecord::Commit { txn_id } => {
                 record_decision(&mut decisions, *txn_id, Decision::Commit)?;
             }
+            MvccWalRecord::CommitV2 { txn_id, xacts } => {
+                record_decision(&mut decisions, *txn_id, Decision::Commit)?;
+                committed_xacts.extend(xacts.iter().copied());
+            }
             MvccWalRecord::Abort { txn_id } => {
                 record_decision(&mut decisions, *txn_id, Decision::Abort)?;
             }
@@ -713,14 +1068,27 @@ fn finish_replay(
         .collect();
 
     // Replay committed operations (and auto-commits where txn_id=0).
-    // Rows are keyed by the engine's stable per-row VERSION INDEX, so DELETE and
+    // Rows are keyed by the engine's stable per-row VERSION ID, so DELETE and
     // UPDATE address the exact row by identity — no fragile scan-position
-    // arithmetic. A BTreeMap keeps rows in version order (the scan order); the
+    // arithmetic. A BTreeMap keeps rows in id order (the scan order); the
     // final ordering is irrelevant to callers, which re-sort, but it is
     // deterministic. An uncommitted transaction's records are simply never
     // applied, so its writes are rolled back on recovery.
+    //
+    // ID-space validation (cluster 1): a committed INSERT onto an id that is
+    // currently LIVE is corruption — the writer minted (or reused) an id
+    // already assigned to a different live row. Re-INSERTING a dead id is
+    // legal (savepoint-rollback compensation resurrects deleted versions).
     let mut columns: HashMap<String, Vec<(String, DataType)>> = HashMap::new();
-    let mut rowmaps: HashMap<String, std::collections::BTreeMap<u32, Vec<Value>>> = HashMap::new();
+    let mut rowmaps: HashMap<String, std::collections::BTreeMap<u64, Vec<Value>>> = HashMap::new();
+    let mut floors: HashMap<String, u64> = HashMap::new();
+
+    let observe_id = |floors: &mut HashMap<String, u64>, table: &str, id: u64| {
+        let floor = floors.entry(table.to_string()).or_insert(0);
+        if id >= *floor {
+            *floor = id + 1;
+        }
+    };
 
     for rec in &records {
         let committed_rec = |txn_id: &u64| *txn_id == 0 || committed.contains(txn_id);
@@ -728,71 +1096,100 @@ fn finish_replay(
             MvccWalRecord::CreateTable {
                 name,
                 columns: cols,
+                next_version_id,
             } => {
                 columns.insert(name.clone(), cols.clone());
                 rowmaps.insert(name.clone(), std::collections::BTreeMap::new());
+                floors.insert(name.clone(), *next_version_id);
             }
             MvccWalRecord::DropTable { name } => {
                 columns.remove(name);
                 rowmaps.remove(name);
+                floors.remove(name);
             }
             MvccWalRecord::Insert {
                 table,
                 txn_id,
-                version_idx,
+                version_id,
                 row,
             } => {
+                observe_id(&mut floors, table, *version_id);
                 if committed_rec(txn_id)
                     && let Some(m) = rowmaps.get_mut(table)
                 {
-                    m.insert(*version_idx, row.clone());
+                    if m.contains_key(version_id) {
+                        return Err(format!(
+                            "MVCC WAL corruption: committed INSERT reuses live version id \
+                             {version_id} in table {table} — the durable identity space was \
+                             reused for two live rows"
+                        ));
+                    }
+                    m.insert(*version_id, row.clone());
                 }
             }
             MvccWalRecord::Delete {
                 table,
                 txn_id,
-                version_idx,
+                version_id,
             } => {
+                observe_id(&mut floors, table, *version_id);
                 if committed_rec(txn_id)
                     && let Some(m) = rowmaps.get_mut(table)
                 {
-                    m.remove(version_idx);
+                    m.remove(version_id);
                 }
             }
             MvccWalRecord::Update {
                 table,
                 txn_id,
-                old_version_idx,
-                new_version_idx,
+                old_version_id,
+                new_version_id,
                 new_row,
             } => {
+                observe_id(&mut floors, table, *old_version_id);
+                observe_id(&mut floors, table, *new_version_id);
                 if committed_rec(txn_id)
                     && let Some(m) = rowmaps.get_mut(table)
                 {
-                    m.remove(old_version_idx);
-                    m.insert(*new_version_idx, new_row.clone());
+                    m.remove(old_version_id);
+                    if m.contains_key(new_version_id) {
+                        return Err(format!(
+                            "MVCC WAL corruption: committed UPDATE targets live version id \
+                             {new_version_id} in table {table} — the durable identity space \
+                             was reused for two live rows"
+                        ));
+                    }
+                    m.insert(*new_version_id, new_row.clone());
                 }
             }
             MvccWalRecord::Checkpoint => {
                 // After a checkpoint, previous records can be ignored.
                 // In a future version, truncate records before the checkpoint.
             }
-            _ => {} // Begin, Commit, Abort handled above
+            _ => {} // Begin, Commit, Abort, XactCommit handled above
         }
     }
 
     let tables: HashMap<String, RecoveredTable> = columns
         .into_iter()
         .map(|(name, cols)| {
-            let rows = rowmaps
-                .remove(&name)
-                .map(|m| m.into_values().collect())
-                .unwrap_or_default();
+            let (rows, next_version_id) = match rowmaps.remove(&name) {
+                Some(m) => {
+                    let floor = floors.get(&name).copied().unwrap_or(0);
+                    let rows: Vec<(u64, Vec<Value>)> = m.into_iter().collect();
+                    (rows, floor)
+                }
+                None => (
+                    Vec::new(),
+                    floors.get(&name).copied().unwrap_or(0),
+                ),
+            };
             (
                 name,
                 RecoveredTable {
                     columns: cols,
                     rows,
+                    next_version_id,
                 },
             )
         })
@@ -807,12 +1204,112 @@ fn finish_replay(
     ))
 }
 
-/// Decode a payload to a record, or None when it is not a well-formed
+/// Decode a v2 payload to a record, or None when it is not a well-formed
 /// record of a KNOWN shape (NU-04/NU-15): unknown tags, unknown type codes,
 /// and trailing undecoded bytes are all rejected rather than best-effort
-/// coerced — a value_codec read that stops early used to leave silently
-/// ignored bytes, and unknown schema-type tags used to degrade to TEXT.
-fn decode_record(data: &[u8]) -> Option<MvccWalRecord> {
+/// coerced.
+fn decode_record_v2(data: &[u8]) -> Option<MvccWalRecord> {
+    let mut pos = 0usize;
+    let tag = *data.get(pos)?;
+    pos += 1;
+    let record = match tag {
+        TAG_CREATE_TABLE => {
+            let name = read_str(data, &mut pos)?;
+            let count = read_u32_val(data, &mut pos)? as usize;
+            let mut columns = Vec::with_capacity(super::wal_util::bounded_capacity(count));
+            for _ in 0..count {
+                let col_name = read_str(data, &mut pos)?;
+                let col_type = read_type_desc(data, &mut pos)?;
+                columns.push((col_name, col_type));
+            }
+            let next_version_id = read_u64_val(data, &mut pos)?;
+            MvccWalRecord::CreateTable {
+                name,
+                columns,
+                next_version_id,
+            }
+        }
+        TAG_DROP_TABLE => {
+            let name = read_str(data, &mut pos)?;
+            MvccWalRecord::DropTable { name }
+        }
+        TAG_INSERT => {
+            let table = read_str(data, &mut pos)?;
+            let txn_id = read_u64_val(data, &mut pos)?;
+            let version_id = read_u64_val(data, &mut pos)?;
+            let row = crate::storage::value_codec::read_row(data, &mut pos)?;
+            MvccWalRecord::Insert {
+                table,
+                txn_id,
+                version_id,
+                row,
+            }
+        }
+        TAG_DELETE => {
+            let table = read_str(data, &mut pos)?;
+            let txn_id = read_u64_val(data, &mut pos)?;
+            let version_id = read_u64_val(data, &mut pos)?;
+            MvccWalRecord::Delete {
+                table,
+                txn_id,
+                version_id,
+            }
+        }
+        TAG_UPDATE => {
+            let table = read_str(data, &mut pos)?;
+            let txn_id = read_u64_val(data, &mut pos)?;
+            let old_version_id = read_u64_val(data, &mut pos)?;
+            let new_version_id = read_u64_val(data, &mut pos)?;
+            let new_row = crate::storage::value_codec::read_row(data, &mut pos)?;
+            MvccWalRecord::Update {
+                table,
+                txn_id,
+                old_version_id,
+                new_version_id,
+                new_row,
+            }
+        }
+        TAG_BEGIN => {
+            let txn_id = read_u64_val(data, &mut pos)?;
+            MvccWalRecord::Begin { txn_id }
+        }
+        TAG_COMMIT => {
+            let txn_id = read_u64_val(data, &mut pos)?;
+            MvccWalRecord::Commit { txn_id }
+        }
+        TAG_ABORT => {
+            let txn_id = read_u64_val(data, &mut pos)?;
+            MvccWalRecord::Abort { txn_id }
+        }
+        TAG_XACT_COMMIT => {
+            let xact = read_u64_val(data, &mut pos)?;
+            MvccWalRecord::XactCommit { xact }
+        }
+        TAG_COMMIT_V2 => {
+            let txn_id = read_u64_val(data, &mut pos)?;
+            let count = read_u32_val(data, &mut pos)? as usize;
+            let mut xacts = Vec::with_capacity(super::wal_util::bounded_capacity(count));
+            for _ in 0..count {
+                xacts.push(read_u64_val(data, &mut pos)?);
+            }
+            MvccWalRecord::CommitV2 { txn_id, xacts }
+        }
+        TAG_CHECKPOINT => MvccWalRecord::Checkpoint,
+        _ => return None,
+    };
+    if pos != data.len() {
+        // Trailing bytes the decoder does not know how to interpret.
+        return None;
+    }
+    Some(record)
+}
+
+/// Decode a v1 payload (frozen legacy layouts): u32 version indices widened
+/// to the u64 id space, one-byte schema codes with parameterized types
+/// defaulted (the recorded NU-15 loss — the parameters were never written),
+/// no `CreateTable` floor, no `CommitV2` (tag 0x14 fails closed with an
+/// explicit newer-writer message).
+fn decode_record_v1(data: &[u8]) -> Option<MvccWalRecord> {
     let mut pos = 0usize;
     let tag = *data.get(pos)?;
     pos += 1;
@@ -825,9 +1322,13 @@ fn decode_record(data: &[u8]) -> Option<MvccWalRecord> {
                 let col_name = read_str(data, &mut pos)?;
                 let col_type = *data.get(pos)?;
                 pos += 1;
-                columns.push((col_name, u8_to_datatype(col_type)?));
+                columns.push((col_name, u8_to_datatype_legacy(col_type)?));
             }
-            MvccWalRecord::CreateTable { name, columns }
+            MvccWalRecord::CreateTable {
+                name,
+                columns,
+                next_version_id: 0,
+            }
         }
         TAG_DROP_TABLE => {
             let name = read_str(data, &mut pos)?;
@@ -836,36 +1337,36 @@ fn decode_record(data: &[u8]) -> Option<MvccWalRecord> {
         TAG_INSERT => {
             let table = read_str(data, &mut pos)?;
             let txn_id = read_u64_val(data, &mut pos)?;
-            let version_idx = read_u32_val(data, &mut pos)?;
+            let version_id = read_u32_val(data, &mut pos)? as u64;
             let row = crate::storage::value_codec::read_row(data, &mut pos)?;
             MvccWalRecord::Insert {
                 table,
                 txn_id,
-                version_idx,
+                version_id,
                 row,
             }
         }
         TAG_DELETE => {
             let table = read_str(data, &mut pos)?;
             let txn_id = read_u64_val(data, &mut pos)?;
-            let version_idx = read_u32_val(data, &mut pos)?;
+            let version_id = read_u32_val(data, &mut pos)? as u64;
             MvccWalRecord::Delete {
                 table,
                 txn_id,
-                version_idx,
+                version_id,
             }
         }
         TAG_UPDATE => {
             let table = read_str(data, &mut pos)?;
             let txn_id = read_u64_val(data, &mut pos)?;
-            let old_version_idx = read_u32_val(data, &mut pos)?;
-            let new_version_idx = read_u32_val(data, &mut pos)?;
+            let old_version_id = read_u32_val(data, &mut pos)? as u64;
+            let new_version_id = read_u32_val(data, &mut pos)? as u64;
             let new_row = crate::storage::value_codec::read_row(data, &mut pos)?;
             MvccWalRecord::Update {
                 table,
                 txn_id,
-                old_version_idx,
-                new_version_idx,
+                old_version_id,
+                new_version_id,
                 new_row,
             }
         }
@@ -916,24 +1417,25 @@ mod tests {
                     ("id".into(), DataType::Int64),
                     ("name".into(), DataType::Text),
                 ],
+                next_version_id: 0,
             })
             .unwrap();
             wal.log(&MvccWalRecord::Begin { txn_id: 1 }).unwrap();
             wal.log(&MvccWalRecord::Insert {
                 table: "users".into(),
                 txn_id: 1,
-                version_idx: 0,
+                version_id: 0,
                 row: vec![Value::Int64(1), Value::Text("Alice".into())],
             })
             .unwrap();
             wal.log(&MvccWalRecord::Insert {
                 table: "users".into(),
                 txn_id: 1,
-                version_idx: 1,
+                version_id: 1,
                 row: vec![Value::Int64(2), Value::Text("Bob".into())],
             })
             .unwrap();
-            wal.log_commit(1, None).unwrap();
+            wal.log_commit(1, &[]).unwrap();
             drop(wal);
         }
 
@@ -941,8 +1443,10 @@ mod tests {
         let (_wal2, state) = MvccWal::open(dir.path()).unwrap();
         let users = state.tables.get("users").unwrap();
         assert_eq!(users.rows.len(), 2);
-        assert_eq!(users.rows[0][1], Value::Text("Alice".into()));
-        assert_eq!(users.rows[1][1], Value::Text("Bob".into()));
+        assert_eq!(users.rows[0].0, 0);
+        assert_eq!(users.rows[0].1[1], Value::Text("Alice".into()));
+        assert_eq!(users.rows[1].0, 1);
+        assert_eq!(users.rows[1].1[1], Value::Text("Bob".into()));
     }
 
     #[test]
@@ -954,13 +1458,14 @@ mod tests {
             wal.log(&MvccWalRecord::CreateTable {
                 name: "t".into(),
                 columns: vec![("x".into(), DataType::Int32)],
+                next_version_id: 0,
             })
             .unwrap();
             wal.log(&MvccWalRecord::Begin { txn_id: 1 }).unwrap();
             wal.log(&MvccWalRecord::Insert {
                 table: "t".into(),
                 txn_id: 1,
-                version_idx: 0,
+                version_id: 0,
                 row: vec![Value::Int32(10)],
             })
             .unwrap();
@@ -982,6 +1487,7 @@ mod tests {
             wal.log(&MvccWalRecord::CreateTable {
                 name: "t".into(),
                 columns: vec![("x".into(), DataType::Int32)],
+                next_version_id: 0,
             })
             .unwrap();
             // Begin but never commit/abort
@@ -989,7 +1495,7 @@ mod tests {
             wal.log(&MvccWalRecord::Insert {
                 table: "t".into(),
                 txn_id: 1,
-                version_idx: 0,
+                version_id: 0,
                 row: vec![Value::Int32(42)],
             })
             .unwrap();
@@ -1010,17 +1516,18 @@ mod tests {
             wal.log(&MvccWalRecord::CreateTable {
                 name: "t".into(),
                 columns: vec![("x".into(), DataType::Int32)],
+                next_version_id: 0,
             })
             .unwrap();
             wal.log(&MvccWalRecord::Begin { txn_id: 1 }).unwrap();
             wal.log(&MvccWalRecord::Insert {
                 table: "t".into(),
                 txn_id: 1,
-                version_idx: 0,
+                version_id: 0,
                 row: vec![Value::Int32(99)],
             })
             .unwrap();
-            wal.log_commit(1, None).unwrap();
+            wal.log_commit(1, &[]).unwrap();
             drop(wal);
         }
 
@@ -1061,19 +1568,20 @@ mod tests {
             wal.log(&MvccWalRecord::CreateTable {
                 name: "t".into(),
                 columns: vec![("x".into(), DataType::Int64)],
+                next_version_id: 0,
             })
             .unwrap();
             wal.log(&MvccWalRecord::Insert {
                 table: "t".into(),
                 txn_id: 0,
-                version_idx: 0,
+                version_id: 0,
                 row: vec![Value::Int64(1)],
             })
             .unwrap();
             wal.log(&MvccWalRecord::Insert {
                 table: "t".into(),
                 txn_id: 0,
-                version_idx: 1,
+                version_id: 1,
                 row: vec![Value::Int64(2)],
             })
             .unwrap();
@@ -1088,7 +1596,7 @@ mod tests {
         let (_wal, state) = MvccWal::open(dir.path()).unwrap();
         let t = state.tables.get("t").expect("table survived");
         assert_eq!(t.rows.len(), 1, "complete prefix records must be recovered");
-        assert_eq!(t.rows[0], vec![Value::Int64(1)]);
+        assert_eq!(t.rows[0].1, vec![Value::Int64(1)]);
     }
 
     #[test]
@@ -1100,12 +1608,13 @@ mod tests {
             wal.log(&MvccWalRecord::CreateTable {
                 name: "temp".into(),
                 columns: vec![("x".into(), DataType::Int32)],
+                next_version_id: 0,
             })
             .unwrap();
             wal.log(&MvccWalRecord::Insert {
                 table: "temp".into(),
                 txn_id: 0,
-                version_idx: 0,
+                version_id: 0,
                 row: vec![Value::Int32(1)],
             })
             .unwrap();
@@ -1130,6 +1639,7 @@ mod tests {
         wal.log(&MvccWalRecord::CreateTable {
             name: "t".into(),
             columns: vec![("x".into(), DataType::Bytea)],
+            next_version_id: 0,
         })
         .unwrap();
         wal.sync().unwrap();
@@ -1138,7 +1648,7 @@ mod tests {
         let oversized = MvccWalRecord::Insert {
             table: "t".into(),
             txn_id: 0,
-            version_idx: 0,
+            version_id: 0,
             row: vec![Value::Bytea(vec![0u8; MAX_PAYLOAD + 1])],
         };
         let err = wal.log(&oversized).unwrap_err();
@@ -1163,13 +1673,14 @@ mod tests {
             wal.log(&MvccWalRecord::CreateTable {
                 name: "t".into(),
                 columns: vec![("x".into(), DataType::Int32)],
+                next_version_id: 0,
             })
             .unwrap();
             wal.log(&MvccWalRecord::Begin { txn_id: 1 }).unwrap();
             wal.log(&MvccWalRecord::Insert {
                 table: "t".into(),
                 txn_id: 1,
-                version_idx: 0,
+                version_id: 0,
                 row: vec![Value::Int32(7)],
             })
             .unwrap();
@@ -1199,13 +1710,14 @@ mod tests {
             wal.log(&MvccWalRecord::CreateTable {
                 name: "t".into(),
                 columns: vec![("x".into(), DataType::Int32)],
+                next_version_id: 0,
             })
             .unwrap();
             wal.log(&MvccWalRecord::Begin { txn_id: 1 }).unwrap();
             wal.log(&MvccWalRecord::Insert {
                 table: "t".into(),
                 txn_id: 1,
-                version_idx: 0,
+                version_id: 0,
                 row: vec![Value::Int32(7)],
             })
             .unwrap();
@@ -1217,8 +1729,6 @@ mod tests {
         assert_eq!(state.tables.get("t").map(|t| t.rows.len()), Some(1));
     }
 }
-
-// ── S63: coordinating-transaction markers survive reclaim ─────────────────
 
 #[cfg(test)]
 mod xact_marker_tests {
@@ -1233,9 +1743,10 @@ mod xact_marker_tests {
             wal.log(&MvccWalRecord::CreateTable {
                 name: "t".into(),
                 columns: vec![("x".into(), DataType::Int64)],
+                next_version_id: 0,
             })
             .unwrap();
-            wal.log_commit(7, Some(42)).unwrap();
+            wal.log_commit(7, &[42]).unwrap();
         }
         let (_wal, state) = MvccWal::open(dir.path()).unwrap();
         assert!(
@@ -1257,17 +1768,18 @@ mod xact_marker_tests {
             wal.log(&MvccWalRecord::CreateTable {
                 name: "t".into(),
                 columns: vec![("x".into(), DataType::Int64)],
+                next_version_id: 0,
             })
             .unwrap();
             wal.log(&MvccWalRecord::Begin { txn_id: 1 }).unwrap();
             wal.log(&MvccWalRecord::Insert {
                 table: "t".into(),
                 txn_id: 1,
-                version_idx: 0,
+                version_id: 0,
                 row: vec![Value::Int64(5)],
             })
             .unwrap();
-            wal.log_commit(1, Some(9)).unwrap();
+            wal.log_commit(1, &[9]).unwrap();
             drop(wal);
         }
         // Reopen 1: replay, then compact (the with_wal sequence).
@@ -1313,13 +1825,14 @@ mod crash_safety_tests {
         wal.log(&MvccWalRecord::CreateTable {
             name: "t".into(),
             columns: vec![("id".into(), DataType::Int64)],
+            next_version_id: 0,
         })
         .unwrap();
-        for i in 0..5u32 {
+        for i in 0..5u64 {
             wal.log(&MvccWalRecord::Insert {
                 table: "t".into(),
                 txn_id: 0,
-                version_idx: i,
+                version_id: i,
                 row: vec![Value::Int64(i as i64)],
             })
             .unwrap();
@@ -1354,13 +1867,14 @@ mod crash_safety_tests {
         wal.log(&MvccWalRecord::CreateTable {
             name: "t".into(),
             columns: vec![("id".into(), DataType::Int64)],
+            next_version_id: 0,
         })
         .unwrap();
-        for i in 0..3u32 {
+        for i in 0..3u64 {
             wal.log(&MvccWalRecord::Insert {
                 table: "t".into(),
                 txn_id: 0,
-                version_idx: i,
+                version_id: i,
                 row: vec![Value::Int64(i as i64)],
             })
             .unwrap();
@@ -1383,3 +1897,860 @@ mod crash_safety_tests {
         );
     }
 }
+
+// ── v2 framing, schema codec, and identity-space tests ──────────────────────
+
+#[cfg(test)]
+mod format_v2_tests {
+    use super::*;
+
+    fn write_samples(wal: &MvccWal) {
+        wal.log(&MvccWalRecord::CreateTable {
+            name: "t".into(),
+            columns: vec![("x".into(), DataType::Int64)],
+            next_version_id: 0,
+        })
+        .unwrap();
+        for i in 0..3u64 {
+            wal.log(&MvccWalRecord::Insert {
+                table: "t".into(),
+                txn_id: 0,
+                version_id: i,
+                row: vec![Value::Int64(i as i64)],
+            })
+            .unwrap();
+        }
+        wal.sync().unwrap();
+    }
+
+    /// The written file is v2: magic first, and every writer frame carries
+    /// the format version.
+    #[test]
+    fn writer_emits_v2_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = MvccWal::open(dir.path()).unwrap();
+            write_samples(&wal);
+        }
+        let data = std::fs::read(dir.path().join("mvcc.wal")).unwrap();
+        assert!(is_v2(&data), "file must start with the v2 magic");
+        let version = u16::from_le_bytes([data[4], data[5]]);
+        assert_eq!(version, FORMAT_VERSION);
+    }
+
+    /// A corrupted-but-plausible LENGTH extending past EOF was v1's
+    /// unresolvable case (classified torn tail). In v2 the length lives in a
+    /// checksummed header, so the same damage is provably corruption — even
+    /// in the FINAL frame — and fails closed with the file untouched.
+    /// This is the cluster-4 / NU-04-remainder fix.
+    #[test]
+    fn corrupted_length_is_corruption_not_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = MvccWal::open(dir.path()).unwrap();
+            write_samples(&wal);
+        }
+        let path = dir.path().join("mvcc.wal");
+        let mut data = std::fs::read(&path).unwrap();
+        // Flip a bit in the FINAL frame's length field (header offset 6).
+        // The frame's declared length now disagrees with its header CRC.
+        // Locate the final frame precisely: walk frames like replay does.
+        let mut pos = 0usize;
+        let mut last_start = 0usize;
+        while pos + V2_HEADER_SIZE <= data.len() {
+            let len =
+                u32::from_le_bytes([data[pos + 6], data[pos + 7], data[pos + 8], data[pos + 9]])
+                    as usize;
+            last_start = pos;
+            pos += V2_HEADER_SIZE + len + 4;
+        }
+        data[last_start + 6] ^= 0x08;
+        std::fs::write(&path, &data).unwrap();
+
+        let result = MvccWal::open(dir.path());
+        match result {
+            Err(err) => {
+                assert!(
+                    err.to_string().contains("header CRC mismatch"),
+                    "error must name the header CRC: {err}"
+                );
+                // Fail-closed: the damaged file is left untouched.
+                assert_eq!(std::fs::read(&path).unwrap(), data);
+            }
+            Ok(_) => panic!("corrupted length was classified as a torn tail"),
+        }
+    }
+
+    /// A mid-file frame with a damaged header is corruption, and recovery
+    /// refuses rather than recovering a prefix behind the damage.
+    #[test]
+    fn midfile_header_damage_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = MvccWal::open(dir.path()).unwrap();
+            write_samples(&wal);
+        }
+        let path = dir.path().join("mvcc.wal");
+        let mut data = std::fs::read(&path).unwrap();
+        // First frame starts at 0; the second frame's header begins right
+        // after it. Damage the second frame's magic byte.
+        let first_len =
+            u32::from_le_bytes([data[6], data[7], data[8], data[9]]) as usize;
+        let second = V2_HEADER_SIZE + first_len + 4;
+        data[second] ^= 0xFF;
+        std::fs::write(&path, &data).unwrap();
+
+        let result = MvccWal::open(dir.path());
+        match result {
+            Err(err) => assert!(
+                err.to_string().contains("non-v2 frame"),
+                "error must name the mixed/damaged frame: {err}"
+            ),
+            Ok(_) => panic!("damaged interior frame was accepted"),
+        }
+    }
+
+    /// A frame version above this reader's is refused with an explicit
+    /// newer-format error, not a guess at the layout.
+    #[test]
+    fn newer_format_version_is_rejected_explicitly() {
+        let mut payload = vec![TAG_CHECKPOINT];
+        let mut buf = Vec::new();
+        let mut header = [0u8; V2_HEADER_SIZE - 4];
+        header[..4].copy_from_slice(&MAGIC.to_le_bytes());
+        header[4..6].copy_from_slice(&99u16.to_le_bytes()); // future version
+        header[6..10].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        std::io::Write::write_all(&mut buf, &header).unwrap();
+        let hcrc = crc32c(&header);
+        std::io::Write::write_all(&mut buf, &hcrc.to_le_bytes()).unwrap();
+        payload.clear();
+        let pcrc = crc32c(&payload);
+        std::io::Write::write_all(&mut buf, &payload).unwrap();
+        std::io::Write::write_all(&mut buf, &pcrc.to_le_bytes()).unwrap();
+
+        let err = replay_v2(&buf).unwrap_err();
+        assert!(
+            err.contains("format version 99"),
+            "error must name the version: {err}"
+        );
+    }
+
+    /// The v1 reader's honest rejection of a v2 log: the magic parses as a
+    /// length far above the ceiling. The error names the situation.
+    #[test]
+    fn legacy_reader_rejects_v2_log_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = MvccWal::open(dir.path()).unwrap();
+            write_samples(&wal);
+        }
+        let data = std::fs::read(dir.path().join("mvcc.wal")).unwrap();
+        let err = replay_v1(&data).unwrap_err();
+        assert!(
+            err.contains("impossible record length")
+                && err.contains("format v2"),
+            "error must name the impossible length and the v2 magic: {err}"
+        );
+    }
+
+    /// A v1 frame appended after v2 frames is a mixed-format log: refused,
+    /// never best-effort parsed.
+    #[test]
+    fn mixed_format_log_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = MvccWal::open(dir.path()).unwrap();
+            write_samples(&wal);
+        }
+        let path = dir.path().join("mvcc.wal");
+        let mut data = std::fs::read(&path).unwrap();
+        // A syntactically valid v1 frame (a Commit record) — at 17 bytes it
+        // is longer than a v2 header, so the magic check engages rather
+        // than the torn-tail path.
+        let v1_payload = {
+            let mut p = vec![TAG_COMMIT];
+            p.extend_from_slice(&7u64.to_le_bytes());
+            p
+        };
+        let crc = crc32c(&v1_payload);
+        data.extend_from_slice(&(v1_payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(&v1_payload);
+        data.extend_from_slice(&crc.to_le_bytes());
+        std::fs::write(&path, &data).unwrap();
+
+        let result = MvccWal::open(dir.path());
+        match result {
+            Err(err) => assert!(
+                err.to_string().contains("non-v2 frame"),
+                "error must name the mixed format: {err}"
+            ),
+            Ok(_) => panic!("mixed-format log was accepted"),
+        }
+    }
+
+    /// A v2 torn tail is truncated at open, so appends never land behind
+    /// bytes the next replay would stop at.
+    #[test]
+    fn v2_torn_tail_is_repaired_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = MvccWal::open(dir.path()).unwrap();
+            write_samples(&wal);
+        }
+        let path = dir.path().join("mvcc.wal");
+        let full = std::fs::read(&path).unwrap();
+        // Walk to the start of the last frame, keep everything before it,
+        // plus a few header bytes of the last frame.
+        let mut pos = 0usize;
+        let mut last_start = 0usize;
+        while pos + V2_HEADER_SIZE <= full.len() {
+            let len = u32::from_le_bytes([
+                full[pos + 6],
+                full[pos + 7],
+                full[pos + 8],
+                full[pos + 9],
+            ]) as usize;
+            last_start = pos;
+            pos += V2_HEADER_SIZE + len + 4;
+        }
+        std::fs::write(&path, &full[..last_start + 7]).unwrap();
+
+        let (wal, state) = MvccWal::open(dir.path()).unwrap();
+        assert_eq!(state.tables.get("t").map(|t| t.rows.len()), Some(2));
+        // The file was truncated back to the valid prefix: appending works
+        // and a second open replays everything.
+        wal.log(&MvccWalRecord::Insert {
+            table: "t".into(),
+            txn_id: 0,
+            version_id: 2,
+            row: vec![Value::Int64(2)],
+        })
+        .unwrap();
+        wal.sync().unwrap();
+        drop(wal);
+        let (_wal2, state) = MvccWal::open(dir.path()).unwrap();
+        assert_eq!(state.tables.get("t").map(|t| t.rows.len()), Some(3));
+    }
+}
+
+#[cfg(test)]
+mod commit_v2_tests {
+    use super::*;
+
+    /// CommitV2 is ONE frame carrying the txn and every enlistment id, and
+    /// replay recovers both halves from it (cluster 2 / NU-08).
+    #[test]
+    fn commit_v2_is_one_atomic_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = MvccWal::open(dir.path()).unwrap();
+            wal.log(&MvccWalRecord::CreateTable {
+                name: "t".into(),
+                columns: vec![("x".into(), DataType::Int64)],
+                next_version_id: 0,
+            })
+            .unwrap();
+            wal.log(&MvccWalRecord::Begin { txn_id: 5 }).unwrap();
+            wal.log(&MvccWalRecord::Insert {
+                table: "t".into(),
+                txn_id: 5,
+                version_id: 0,
+                row: vec![Value::Int64(1)],
+            })
+            .unwrap();
+            wal.log_commit(5, &[9, 10]).unwrap();
+            drop(wal);
+        }
+        // Exactly ONE frame was appended for the decision: count frames.
+        let data = std::fs::read(dir.path().join("mvcc.wal")).unwrap();
+        let mut pos = 0usize;
+        let mut frames = 0usize;
+        let mut saw_commit_v2 = false;
+        while pos < data.len() {
+            let len = u32::from_le_bytes([
+                data[pos + 6],
+                data[pos + 7],
+                data[pos + 8],
+                data[pos + 9],
+            ]) as usize;
+            let payload = &data[pos + V2_HEADER_SIZE..pos + V2_HEADER_SIZE + len];
+            if payload.first() == Some(&TAG_COMMIT_V2) {
+                saw_commit_v2 = true;
+            }
+            pos += V2_HEADER_SIZE + len + 4;
+            frames += 1;
+        }
+        // CreateTable + Begin + Insert + CommitV2 = 4 frames, one decision.
+        assert_eq!(frames, 4, "the decision must be a single frame");
+        assert!(saw_commit_v2);
+
+        let (_wal, state) = MvccWal::open(dir.path()).unwrap();
+        assert_eq!(state.tables.get("t").map(|t| t.rows.len()), Some(1));
+        assert!(
+            state.committed_xacts.contains(&9) && state.committed_xacts.contains(&10),
+            "CommitV2 must recover every enlistment id"
+        );
+    }
+
+    /// The closed two-record window: a torn commit decision leaves the
+    /// transaction AND its enlistments entirely absent. Under v1's
+    /// Commit + XactCommit pair, a crash between the records could leave
+    /// "SQL committed" durable while the specialty filter lost its marker.
+    #[test]
+    fn torn_commit_v2_leaves_txn_and_enlistments_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = MvccWal::open(dir.path()).unwrap();
+            wal.log(&MvccWalRecord::CreateTable {
+                name: "t".into(),
+                columns: vec![("x".into(), DataType::Int64)],
+                next_version_id: 0,
+            })
+            .unwrap();
+            wal.log(&MvccWalRecord::Begin { txn_id: 5 }).unwrap();
+            wal.log(&MvccWalRecord::Insert {
+                table: "t".into(),
+                txn_id: 5,
+                version_id: 0,
+                row: vec![Value::Int64(1)],
+            })
+            .unwrap();
+            wal.sync().unwrap();
+            // Append the CommitV2 frame's bytes by hand, then cut it short.
+            let payload = encode_record(&MvccWalRecord::CommitV2 {
+                txn_id: 5,
+                xacts: vec![9],
+            });
+            let mut frame = Vec::new();
+            write_v2_frame(&mut frame, &payload).unwrap();
+            let path = dir.path().join("mvcc.wal");
+            let mut data = std::fs::read(&path).unwrap();
+            data.extend_from_slice(&frame[..frame.len() - 5]); // torn mid-payload
+            std::fs::write(&path, &data).unwrap();
+        }
+        let (_wal, state) = MvccWal::open(dir.path()).unwrap();
+        assert_eq!(
+            state.tables.get("t").map(|t| t.rows.len()),
+            Some(0),
+            "a torn decision frame must leave the txn uncommitted"
+        );
+        assert!(
+            !state.committed_xacts.contains(&9),
+            "a torn decision frame must leave the enlistments unproven — the \
+             two-record window is closed because there is only one record"
+        );
+    }
+
+    /// A plain Commit (no enlistments) still round-trips.
+    #[test]
+    fn plain_commit_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = MvccWal::open(dir.path()).unwrap();
+            wal.log(&MvccWalRecord::CreateTable {
+                name: "t".into(),
+                columns: vec![("x".into(), DataType::Int64)],
+                next_version_id: 0,
+            })
+            .unwrap();
+            wal.log_commit(3, &[]).unwrap();
+        }
+        let (_wal, _state) = MvccWal::open(dir.path()).unwrap();
+        // Reaching here means the plain Commit frame replayed cleanly.
+    }
+
+    /// The v1 decoder names tag 0x14 as a newer-writer record rather than a
+    /// generic undecodable tag — an operator can tell format skew from
+    /// random corruption (old-reader rejection policy, cluster 2).
+    #[test]
+    fn v1_decoder_names_commit_v2_explicitly() {
+        // Hand-craft a v1 frame whose payload is tag 0x14 + txn id.
+        let payload = {
+            let mut p = vec![TAG_COMMIT_V2];
+            p.extend_from_slice(&7u64.to_le_bytes());
+            p
+        };
+        let crc = crc32c(&payload);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(&crc.to_le_bytes());
+
+        let err = replay_v1(&frame).unwrap_err();
+        assert!(
+            err.contains("CommitV2"),
+            "error must name CommitV2: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod schema_codec_tests {
+    use super::*;
+
+    /// Lossless parameterized type descriptors (cluster 3 / NU-15): vector
+    /// dims, array element types (recursively), and UDT names round-trip
+    /// exactly through a write-replay cycle.
+    #[test]
+    fn parameterized_schema_roundtrips_losslessly() {
+        let dir = tempfile::tempdir().unwrap();
+        let columns = vec![
+            ("id".into(), DataType::Int64),
+            (
+                "nested".into(),
+                DataType::Array(Box::new(DataType::Array(Box::new(DataType::Int32)))),
+            ),
+            ("emb".into(), DataType::Vector(1536)),
+            ("mood".into(), DataType::UserDefined("mood".into())),
+            ("plain".into(), DataType::TimestampTz),
+        ];
+        {
+            let (wal, _) = MvccWal::open(dir.path()).unwrap();
+            wal.log(&MvccWalRecord::CreateTable {
+                name: "t".into(),
+                columns: columns.clone(),
+                next_version_id: 0,
+            })
+            .unwrap();
+            wal.sync().unwrap();
+        }
+        let (_wal, state) = MvccWal::open(dir.path()).unwrap();
+        let t = state.tables.get("t").expect("table survived");
+        assert_eq!(t.columns, columns, "schema must round-trip losslessly");
+    }
+
+    /// The descriptor codec itself: every parameterized shape, including
+    /// nesting, encodes and decodes to the identical type.
+    #[test]
+    fn type_descriptors_roundtrip() {
+        for dt in [
+            DataType::Bool,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Text,
+            DataType::Bytea,
+            DataType::Numeric,
+            DataType::Uuid,
+            DataType::Date,
+            DataType::Timestamp,
+            DataType::TimestampTz,
+            DataType::Interval,
+            DataType::Jsonb,
+            DataType::Vector(0),
+            DataType::Vector(7),
+            DataType::Array(Box::new(DataType::Text)),
+            DataType::Array(Box::new(DataType::Array(Box::new(
+                DataType::Vector(3),
+            )))),
+            DataType::UserDefined("color".into()),
+        ] {
+            let mut buf = Vec::new();
+            write_type_desc(&mut buf, &dt);
+            let mut pos = 0;
+            let out = read_type_desc(&buf, &mut pos).expect("decodes");
+            assert_eq!(pos, buf.len(), "descriptor consumed exactly");
+            assert_eq!(out, dt, "descriptor did not round-trip: {dt:?}");
+        }
+    }
+
+    /// Unknown type codes still fail closed (NU-15): no silent TEXT.
+    #[test]
+    fn unknown_type_code_fails_closed() {
+        assert!(read_type_desc(&[200u8], &mut 0).is_none());
+        // Bare parameterized codes without their parameters are malformed
+        // in v2 descriptors.
+        assert!(read_type_desc(&[TYPE_VECTOR], &mut 0).is_none());
+        assert!(read_type_desc(&[TYPE_ARRAY], &mut 0).is_none());
+        assert!(read_type_desc(&[TYPE_USER_DEFINED], &mut 0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    /// Cluster 1: a committed INSERT that reuses a LIVE version id is
+    /// corruption — the durable identity space was double-assigned.
+    #[test]
+    fn committed_insert_reusing_live_id_is_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = MvccWal::open(dir.path()).unwrap();
+            wal.log(&MvccWalRecord::CreateTable {
+                name: "t".into(),
+                columns: vec![("x".into(), DataType::Int64)],
+                next_version_id: 0,
+            })
+            .unwrap();
+            wal.log(&MvccWalRecord::Insert {
+                table: "t".into(),
+                txn_id: 0,
+                version_id: 4,
+                row: vec![Value::Int64(1)],
+            })
+            .unwrap();
+            // Same id, still live, committed again: a mint-past-floor bug.
+            wal.log(&MvccWalRecord::Insert {
+                table: "t".into(),
+                txn_id: 0,
+                version_id: 4,
+                row: vec![Value::Int64(2)],
+            })
+            .unwrap();
+            wal.sync().unwrap();
+        }
+        let result = MvccWal::open(dir.path());
+        match result {
+            Err(err) => assert!(
+                err.to_string().contains("reuses live version id"),
+                "error must name the identity reuse: {err}"
+            ),
+            Ok(_) => panic!("live version-id reuse was accepted"),
+        }
+    }
+
+    /// Re-INSERTING a dead id is legal: savepoint-rollback compensation
+    /// resurrects deleted versions by id.
+    #[test]
+    fn insert_of_dead_id_is_resurrection_not_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = MvccWal::open(dir.path()).unwrap();
+            wal.log(&MvccWalRecord::CreateTable {
+                name: "t".into(),
+                columns: vec![("x".into(), DataType::Int64)],
+                next_version_id: 0,
+            })
+            .unwrap();
+            wal.log(&MvccWalRecord::Insert {
+                table: "t".into(),
+                txn_id: 0,
+                version_id: 4,
+                row: vec![Value::Int64(1)],
+            })
+            .unwrap();
+            wal.log(&MvccWalRecord::Delete {
+                table: "t".into(),
+                txn_id: 0,
+                version_id: 4,
+            })
+            .unwrap();
+            wal.log(&MvccWalRecord::Insert {
+                table: "t".into(),
+                txn_id: 0,
+                version_id: 4,
+                row: vec![Value::Int64(9)],
+            })
+            .unwrap();
+            wal.sync().unwrap();
+        }
+        let (_wal, state) = MvccWal::open(dir.path()).unwrap();
+        let t = state.tables.get("t").unwrap();
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(t.rows[0], (4, vec![Value::Int64(9)]));
+    }
+
+    /// The recovered floor advances past every id the log ever contained —
+    /// live, dead, or belonging to an aborted txn — so the next minted id
+    /// can never collide with one of them.
+    #[test]
+    fn floor_advances_past_every_observed_id() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = MvccWal::open(dir.path()).unwrap();
+            wal.log(&MvccWalRecord::CreateTable {
+                name: "t".into(),
+                columns: vec![("x".into(), DataType::Int64)],
+                next_version_id: 0,
+            })
+            .unwrap();
+            wal.log(&MvccWalRecord::Begin { txn_id: 1 }).unwrap();
+            wal.log(&MvccWalRecord::Insert {
+                table: "t".into(),
+                txn_id: 1,
+                version_id: 2,
+                row: vec![Value::Int64(1)],
+            })
+            .unwrap();
+            wal.log(&MvccWalRecord::Abort { txn_id: 1 }).unwrap();
+            // Even the aborted txn's id 2 burns the floor forward.
+            wal.sync().unwrap();
+        }
+        let (_wal, state) = MvccWal::open(dir.path()).unwrap();
+        let t = state.tables.get("t").unwrap();
+        assert_eq!(t.rows.len(), 0);
+        assert_eq!(t.next_version_id, 3, "floor must pass the aborted id");
+    }
+
+    /// Compaction preserves row ids and the floor, so identities survive
+    /// restarts: reopen twice and the same rows keep the same ids, with the
+    /// floor never rewinding.
+    #[test]
+    fn compaction_preserves_ids_and_floor_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = MvccWal::open(dir.path()).unwrap();
+            wal.log(&MvccWalRecord::CreateTable {
+                name: "t".into(),
+                columns: vec![("x".into(), DataType::Int64)],
+                next_version_id: 0,
+            })
+            .unwrap();
+            // Sparse ids, as a preserved-id baseline produces.
+            for id in [0u64, 2, 5] {
+                wal.log(&MvccWalRecord::Insert {
+                    table: "t".into(),
+                    txn_id: 0,
+                    version_id: id,
+                    row: vec![Value::Int64(id as i64)],
+                })
+                .unwrap();
+            }
+            wal.sync().unwrap();
+        }
+        let ids_after_restart = {
+            let (wal, state) = MvccWal::open(dir.path()).unwrap();
+            wal.compact(&state).unwrap();
+            drop(wal);
+            let (_wal2, state) = MvccWal::open(dir.path()).unwrap();
+            let t = state.tables.get("t").unwrap();
+            let ids: Vec<u64> = t.rows.iter().map(|(id, _)| *id).collect();
+            assert_eq!(t.next_version_id, 6);
+            ids
+        };
+        assert_eq!(ids_after_restart, vec![0, 2, 5]);
+        // And once more: still stable.
+        let (_wal3, state) = MvccWal::open(dir.path()).unwrap();
+        let t = state.tables.get("t").unwrap();
+        let ids: Vec<u64> = t.rows.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![0, 2, 5]);
+        assert_eq!(t.next_version_id, 6);
+    }
+
+    /// A DROP + CREATE of the same name starts a fresh identity space —
+    /// the new table's floor is its own.
+    #[test]
+    fn drop_then_create_resets_the_identity_space() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = MvccWal::open(dir.path()).unwrap();
+            wal.log(&MvccWalRecord::CreateTable {
+                name: "t".into(),
+                columns: vec![("x".into(), DataType::Int64)],
+                next_version_id: 0,
+            })
+            .unwrap();
+            wal.log(&MvccWalRecord::Insert {
+                table: "t".into(),
+                txn_id: 0,
+                version_id: 3,
+                row: vec![Value::Int64(1)],
+            })
+            .unwrap();
+            wal.log(&MvccWalRecord::DropTable { name: "t".into() }).unwrap();
+            wal.log(&MvccWalRecord::CreateTable {
+                name: "t".into(),
+                columns: vec![("y".into(), DataType::Text)],
+                next_version_id: 0,
+            })
+            .unwrap();
+            wal.sync().unwrap();
+        }
+        let (_wal, state) = MvccWal::open(dir.path()).unwrap();
+        let t = state.tables.get("t").unwrap();
+        assert_eq!(t.rows.len(), 0);
+        assert_eq!(t.next_version_id, 0, "recreated table starts fresh");
+    }
+}
+
+// ── Legacy (v1) upgrade-on-open: frozen corpus tests ────────────────────────
+//
+// The corpus bytes below were generated against the pre-v2 writer (at commit
+// 6dcefaab, before any v2 write landed), so these tests exercise the REAL
+// legacy format — not a re-derivation from the current encoder that could
+// drift in lockstep with a bug.
+
+#[cfg(test)]
+mod legacy_upgrade_tests {
+    use super::*;
+
+/// Frozen legacy (v1) corpus: 597 bytes emitted by the pre-v2 writer at
+/// commit 6dcefaab (generated against the then-current code BEFORE any v2
+/// write landed). Covers: CreateTable with parameterized columns (Array,
+/// Vector), explicit-txn inserts + commit, an autocommit insert, a committed
+/// txn doing Update + Delete + log_commit(txn, Some(77)) (Commit + XactCommit
+/// pair), and an aborted txn whose insert must not survive.
+const LEGACY_V1_CORPUS: &[u8] = &[
+    0x2F, 0x00, 0x00, 0x00, 0x01, 0x05, 0x00, 0x00, 0x00, 0x75, 0x73, 0x65, 0x72, 0x73, 0x04, 0x00,
+    0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x69, 0x64, 0x02, 0x04, 0x00, 0x00, 0x00, 0x6E, 0x61, 0x6D,
+    0x65, 0x04, 0x04, 0x00, 0x00, 0x00, 0x74, 0x61, 0x67, 0x73, 0x0E, 0x03, 0x00, 0x00, 0x00, 0x65,
+    0x6D, 0x62, 0x0D, 0x06, 0xD9, 0xD4, 0x2D, 0x09, 0x00, 0x00, 0x00, 0x10, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x5B, 0x86, 0xD2, 0x87, 0x48, 0x00, 0x00, 0x00, 0x03, 0x05, 0x00, 0x00,
+    0x00, 0x75, 0x73, 0x65, 0x72, 0x73, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
+    0x05, 0x00, 0x00, 0x00, 0x41, 0x6C, 0x69, 0x63, 0x65, 0x0F, 0x01, 0x00, 0x00, 0x00, 0x02, 0x07,
+    0x00, 0x00, 0x00, 0x0D, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3F, 0x00, 0x00, 0x80, 0x3F,
+    0x00, 0x00, 0x00, 0xC0, 0xBF, 0x3E, 0x33, 0x8C, 0x41, 0x00, 0x00, 0x00, 0x03, 0x05, 0x00, 0x00,
+    0x00, 0x75, 0x73, 0x65, 0x72, 0x73, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+    0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x03, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
+    0x03, 0x00, 0x00, 0x00, 0x42, 0x6F, 0x62, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x0D, 0x03, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x82, 0xB5, 0x24,
+    0xDB, 0x09, 0x00, 0x00, 0x00, 0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13, 0x50,
+    0xEC, 0x73, 0x4D, 0x00, 0x00, 0x00, 0x03, 0x05, 0x00, 0x00, 0x00, 0x75, 0x73, 0x65, 0x72, 0x73,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+    0x03, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x05, 0x00, 0x00, 0x00, 0x43, 0x61,
+    0x72, 0x6F, 0x6C, 0x0F, 0x02, 0x00, 0x00, 0x00, 0x02, 0x01, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00,
+    0x00, 0x00, 0x0D, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x80, 0x3F, 0x00,
+    0x00, 0x80, 0x3F, 0x34, 0x94, 0xB6, 0xAD, 0x09, 0x00, 0x00, 0x00, 0x10, 0x02, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x32, 0x01, 0x96, 0x5C, 0x48, 0x00, 0x00, 0x00, 0x05, 0x05, 0x00, 0x00,
+    0x00, 0x75, 0x73, 0x65, 0x72, 0x73, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x05, 0x06, 0x00, 0x00, 0x00, 0x41, 0x6C, 0x69, 0x63, 0x69, 0x61, 0x0F, 0x00,
+    0x00, 0x00, 0x00, 0x0D, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x41, 0x00, 0x00, 0x10, 0x41,
+    0x00, 0x00, 0x10, 0x41, 0x57, 0x89, 0x68, 0x9C, 0x16, 0x00, 0x00, 0x00, 0x04, 0x05, 0x00, 0x00,
+    0x00, 0x75, 0x73, 0x65, 0x72, 0x73, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+    0x00, 0x00, 0x21, 0xD0, 0xFE, 0xF3, 0x09, 0x00, 0x00, 0x00, 0x11, 0x02, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x7A, 0xD7, 0xA8, 0xA8, 0x09, 0x00, 0x00, 0x00, 0x13, 0x4D, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xF7, 0xC7, 0x5B, 0xE7, 0x09, 0x00, 0x00, 0x00, 0x10, 0x03, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x15, 0x7C, 0xAA, 0x15, 0x43, 0x00, 0x00, 0x00, 0x03, 0x05, 0x00,
+    0x00, 0x00, 0x75, 0x73, 0x65, 0x72, 0x73, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
+    0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x03, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x05, 0x05, 0x00, 0x00, 0x00, 0x4E, 0x65, 0x76, 0x65, 0x72, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x0D,
+    0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x64, 0xBF, 0x14, 0x5B, 0x09, 0x00, 0x00, 0x00, 0x12, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x74, 0xA6, 0x3B, 0xF8,
+];
+
+    /// Expected recovery from the corpus: txn 1 committed (Alice@0, Bob@1),
+    /// autocommit Carol@2, txn 2 committed (Update 0->3 "Alicia", Delete 1),
+    /// txn 3 aborted (Never@4 must not survive). Live rows: 2 and 3.
+    /// Floor 5 (ids 0..4 were all observed). XactCommit 77 recovered.
+    /// Parameterized columns come back defaulted — the parameters were never
+    /// recorded in v1 (the recorded NU-15 loss; v2 is lossless).
+    #[test]
+    fn legacy_corpus_upgrades_to_v2_with_exact_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mvcc.wal");
+        std::fs::write(&path, LEGACY_V1_CORPUS).unwrap();
+
+        let (_wal, state) = MvccWal::open(dir.path()).unwrap();
+
+        let users = state.tables.get("users").expect("table survived");
+        assert_eq!(users.rows.len(), 2, "Alice-updated + Carol survive; Bob is deleted");
+        assert_eq!(users.rows[0].0, 2);
+        assert_eq!(users.rows[0].1[1], Value::Text("Carol".into()));
+        assert_eq!(users.rows[1].0, 3);
+        assert_eq!(users.rows[1].1[1], Value::Text("Alicia".into()));
+        assert_eq!(users.next_version_id, 5, "floor passes every observed id");
+        assert!(
+            state.committed_xacts.contains(&77),
+            "the v1 Commit+XactCommit pair must upgrade into the committed set"
+        );
+        // Legacy schema decode: parameters were never written.
+        let tags = &users.columns[2].1;
+        assert_eq!(*tags, DataType::Array(Box::new(DataType::Text)));
+        let emb = &users.columns[3].1;
+        assert_eq!(*emb, DataType::Vector(0));
+
+        // The live log was rewritten as v2; the original is preserved.
+        assert!(is_v2(&std::fs::read(&path).unwrap()), "upgraded log is v2");
+        let backup = v1_backup_path(&path);
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            LEGACY_V1_CORPUS,
+            "the pre-upgrade original is preserved byte-for-byte"
+        );
+    }
+
+    /// Upgrade idempotence: the second open reads the v2 log (no re-upgrade),
+    /// recovers the SAME ids, retires the backup on the clean open, and the
+    /// third open is an ordinary v2 open.
+    #[test]
+    fn upgrade_is_idempotent_and_backup_retires_on_clean_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mvcc.wal");
+        std::fs::write(&path, LEGACY_V1_CORPUS).unwrap();
+
+        let ids_and_floor = |state: &MvccWalState| {
+            let users = state.tables.get("users").unwrap();
+            (
+                users.rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                users.next_version_id,
+            )
+        };
+
+        let (wal, state) = MvccWal::open(dir.path()).unwrap();
+        let first = ids_and_floor(&state);
+        drop(wal);
+
+        // Second open: v2, clean -> backup retired, identity stable.
+        let (wal, state) = MvccWal::open(dir.path()).unwrap();
+        assert_eq!(ids_and_floor(&state), first, "ids and floor must be stable");
+        assert!(
+            !v1_backup_path(&path).exists(),
+            "a clean v2 open retires the upgrade backup"
+        );
+        assert!(is_v2(&std::fs::read(&path).unwrap()));
+        drop(wal);
+
+        // Third open: ordinary v2 open, still stable.
+        let (_wal, state) = MvccWal::open(dir.path()).unwrap();
+        assert_eq!(ids_and_floor(&state), first);
+    }
+
+    /// A torn v1 tail upgrades its prefix; the torn original is preserved
+    /// as the backup. Truncating inside frame 7 (the Update) leaves txn 2
+    /// without a Commit, so Alice/Bob/Carol survive unmodified and no
+    /// XactCommit is recovered.
+    #[test]
+    fn torn_legacy_tail_upgrades_the_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mvcc.wal");
+        std::fs::write(&path, &LEGACY_V1_CORPUS[..350]).unwrap();
+
+        let (_wal, state) = MvccWal::open(dir.path()).unwrap();
+        let users = state.tables.get("users").expect("table survived");
+        let names: Vec<&Value> = users.rows.iter().map(|(_, r)| &r[1]).collect();
+        assert_eq!(
+            names,
+            vec![
+                &Value::Text("Alice".into()),
+                &Value::Text("Bob".into()),
+                &Value::Text("Carol".into()),
+            ],
+            "the torn-away txn-2 records must not apply"
+        );
+        assert!(state.committed_xacts.is_empty());
+        // The torn original is preserved, not silently discarded.
+        assert_eq!(
+            std::fs::read(v1_backup_path(&path)).unwrap(),
+            &LEGACY_V1_CORPUS[..350]
+        );
+    }
+
+    /// Legacy corruption still fails closed with the file untouched: the
+    /// upgrade path inherits NU-04's policy exactly.
+    #[test]
+    fn corrupted_legacy_log_fails_closed_before_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mvcc.wal");
+        let mut data = LEGACY_V1_CORPUS.to_vec();
+        data[20] ^= 0xFF; // inside the first CreateTable payload
+        std::fs::write(&path, &data).unwrap();
+
+        let result = MvccWal::open(dir.path());
+        match result {
+            Err(err) => {
+                assert!(err.to_string().contains("corruption"), "{err}");
+                assert_eq!(std::fs::read(&path).unwrap(), data);
+                assert!(
+                    !v1_backup_path(&path).exists(),
+                    "no backup is taken for a log that failed to replay"
+                );
+            }
+            Ok(_) => panic!("corrupted legacy WAL was accepted"),
+        }
+    }
+}
+

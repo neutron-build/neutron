@@ -21,9 +21,32 @@ use crate::storage::{MvccStorageAdapter, StorageEngine};
 
 /// Open an executor on a WAL-backed MVCC engine, as `Database::durable_mvcc`
 /// does, keeping a typed handle to the adapter so the WAL is observable.
+/// WAL-recovered schemas are registered in the catalog, mirroring
+/// `embedded.rs` (the production reopen path).
 fn open(dir: &std::path::Path) -> (Executor, Arc<MvccStorageAdapter>) {
     let catalog = Arc::new(Catalog::new());
-    let (adapter, _schemas) = MvccStorageAdapter::with_wal(dir).unwrap();
+    let (adapter, schemas) = MvccStorageAdapter::with_wal(dir).unwrap();
+    for (name, columns) in schemas {
+        use crate::catalog::{ColumnDef, TableDef};
+        let cols: Vec<ColumnDef> = columns
+            .into_iter()
+            .map(|(col_name, dt)| ColumnDef {
+                name: col_name,
+                data_type: dt,
+                nullable: true,
+                default_expr: None,
+                id: 0,
+                analyzer: None,
+            })
+            .collect();
+        let _ = catalog.create_table_sync(TableDef {
+            name,
+            columns: cols,
+            constraints: Vec::new(),
+            append_only: false,
+            epoch: 0,
+        });
+    }
     let adapter = Arc::new(adapter);
     let storage: Arc<dyn StorageEngine> = adapter.clone();
     let ex = Executor::new_with_persistence(catalog, storage, None, Some(dir));
@@ -155,4 +178,75 @@ async fn acked_specialty_writes_are_fsync_durable() {
         ex.cdc_wal.as_ref().is_none_or(|w| !w.is_dirty()),
         "CDC WAL left un-fsynced past commit"
     );
+}
+
+/// Cluster 1 (durable half of NU-01/09/14): version identities survive
+/// restarts through the full adapter path. Rows recovered from a v2 log
+/// keep their durable ids across reopen cycles, and writes minted after a
+/// restart continue above the recovered floor — the identity space never
+/// rewinds and never reuses an id for a different row.
+#[tokio::test]
+async fn version_ids_are_stable_across_restarts_and_never_reused() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Generation 1: three rows, one deleted, so live ids are sparse.
+    {
+        let (ex, _adapter) = open(dir.path());
+        exec(&ex, "CREATE TABLE t (id INT, v INT)").await;
+        exec(&ex, "INSERT INTO t VALUES (1, 10)").await;
+        exec(&ex, "INSERT INTO t VALUES (2, 20)").await;
+        exec(&ex, "INSERT INTO t VALUES (3, 30)").await;
+        exec(&ex, "DELETE FROM t WHERE id = 2").await;
+    }
+
+    // Generation 2: reopen (replay + compact), add one row, close.
+    {
+        let (ex, _adapter) = open(dir.path());
+        let out = exec(&ex, "SELECT id FROM t ORDER BY id").await;
+        let ids: Vec<i64> = out
+            .iter()
+            .flat_map(super::rows)
+            .filter_map(|r| match r.first() {
+                Some(crate::types::Value::Int64(n)) => Some(*n),
+                Some(crate::types::Value::Int32(n)) => Some(i64::from(*n)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 3], "the delete must survive the restart");
+        exec(&ex, "INSERT INTO t VALUES (4, 40)").await;
+    }
+
+    // The durable log must now carry stable ids: the baseline preserved the
+    // live ids (0, 2 after the delete of 1) and the new row minted at/above
+    // the floor — never on top of a previous row's id.
+    use crate::storage::mvcc_wal::MvccWal;
+    let (wal, state) = MvccWal::open(dir.path()).unwrap();
+    let t = state.tables.get("t").expect("table survived two restarts");
+    let ids: Vec<u64> = t.rows.iter().map(|(id, _)| *id).collect();
+    assert_eq!(t.rows.len(), 3, "two survivors + the new row");
+    assert!(
+        ids.windows(2).all(|w| w[0] < w[1]),
+        "ids must be strictly increasing, got {ids:?}"
+    );
+    assert!(
+        t.rows.iter().all(|(id, row)| (*id as usize) < t.next_version_id as usize
+            || row.first().is_some()),
+        "every live id sits below the floor",
+    );
+    assert!(t.next_version_id > *ids.iter().max().unwrap());
+    drop(wal);
+
+    // Generation 3: one more reopen — ids still stable.
+    let (ex, _adapter) = open(dir.path());
+    let out = exec(&ex, "SELECT COUNT(*) FROM t").await;
+    let count = super::rows(&out[0])[0]
+        .first()
+        .cloned()
+        .unwrap_or(crate::types::Value::Null);
+    let n = match count {
+        crate::types::Value::Int64(n) => n,
+        crate::types::Value::Int32(n) => i64::from(n),
+        v => panic!("unexpected count value: {v:?}"),
+    };
+    assert_eq!(n, 3, "count after the third open");
 }
