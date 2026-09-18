@@ -252,3 +252,147 @@ describe("TS-18: resolveRouteHeaders keeps every Set-Cookie", () => {
     expect(cookies).toEqual(["a=1", "b=2"]);
   });
 });
+
+
+describe("TS-31: loader-cache keys separate origins", () => {
+  it("a host-dependent loader does not leak across hosts", async () => {
+    const route = makeRoute({
+      config: { mode: "app", cache: { loaderMaxAge: 60 } },
+    });
+    let calls = 0;
+    const modules = new Map<string, RouteModule>([
+      [
+        route.id,
+        {
+          default: () => null,
+          loader: async (args: LoaderArgs) => {
+            calls++;
+            return { host: new URL(args.request.url).host };
+          },
+        } as RouteModule,
+      ],
+    ]);
+    const cache = loaderCache();
+    const base = {
+      clientEntryScriptSrc: null,
+      loaderDataCache: cache,
+      requestTrace: { requestId: "r", method: "GET", pathname: "/" },
+    };
+    const first = await renderAppRoute(new Request("http://a.test/"), makeMatch(route), modules, base);
+    const second = await renderAppRoute(new Request("http://b.test/"), makeMatch(route), modules, base);
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(calls).toBe(2);
+  });
+
+  it("mixed-case NO-STORE requests are not cached", async () => {
+    const route = makeRoute({
+      config: { mode: "app", cache: { loaderMaxAge: 60 } },
+    });
+    let calls = 0;
+    const modules = new Map<string, RouteModule>([
+      [
+        route.id,
+        {
+          default: () => null,
+          loader: async () => {
+            calls++;
+            return { n: calls };
+          },
+        } as RouteModule,
+      ],
+    ]);
+    const cache = loaderCache();
+    const base = {
+      clientEntryScriptSrc: null,
+      loaderDataCache: cache,
+      requestTrace: { requestId: "r", method: "GET", pathname: "/" },
+    };
+    await renderAppRoute(
+      new Request("http://a.test/", { headers: { "Cache-Control": "NO-STORE" } }),
+      makeMatch(route),
+      modules,
+      base
+    );
+    await renderAppRoute(
+      new Request("http://a.test/", { headers: { "Cache-Control": "NO-STORE" } }),
+      makeMatch(route),
+      modules,
+      base
+    );
+    expect(calls).toBe(2);
+  });
+
+  it("a null loader result is not cached", async () => {
+    const route = makeRoute({
+      config: { mode: "app", cache: { loaderMaxAge: 60 } },
+    });
+    let calls = 0;
+    const modules = new Map<string, RouteModule>([
+      [
+        route.id,
+        {
+          default: () => null,
+          loader: async () => {
+            calls++;
+            return null;
+          },
+        } as RouteModule,
+      ],
+    ]);
+    const cache = loaderCache();
+    const base = {
+      clientEntryScriptSrc: null,
+      loaderDataCache: cache,
+      requestTrace: { requestId: "r", method: "GET", pathname: "/" },
+    };
+    await renderAppRoute(new Request("http://a.test/"), makeMatch(route), modules, base);
+    await renderAppRoute(new Request("http://a.test/"), makeMatch(route), modules, base);
+    expect(calls).toBe(2);
+  });
+});
+
+describe("TS-07: loader fills are generation-fenced", () => {
+  it("a fill whose fence went invalid is not published", async () => {
+    const route = makeRoute({
+      config: { mode: "app", cache: { loaderMaxAge: 60 } },
+    });
+    let calls = 0;
+    const modules = new Map<string, RouteModule>([
+      [
+        route.id,
+        {
+          default: () => null,
+          loader: async () => {
+            calls++;
+            return { n: calls };
+          },
+        } as RouteModule,
+      ],
+    ]);
+    const cache = loaderCache();
+    // Fence says the generation is stale (a mutation completed while the
+    // GET ran): the loader result must not be stored.
+    const fence = { stillValid: () => false };
+    await renderAppRoute(new Request("http://a.test/"), makeMatch(route), modules, {
+      clientEntryScriptSrc: null,
+      loaderDataCache: cache,
+      requestTrace: { requestId: "r", method: "GET", pathname: "/" },
+      loaderCacheFence: fence,
+    });
+    // A subsequent unfenced request must re-run the loader (nothing was
+    // published), then cache normally.
+    await renderAppRoute(new Request("http://a.test/"), makeMatch(route), modules, {
+      clientEntryScriptSrc: null,
+      loaderDataCache: cache,
+      requestTrace: { requestId: "r2", method: "GET", pathname: "/" },
+    });
+    expect(calls).toBe(2);
+    await renderAppRoute(new Request("http://a.test/"), makeMatch(route), modules, {
+      clientEntryScriptSrc: null,
+      loaderDataCache: cache,
+      requestTrace: { requestId: "r3", method: "GET", pathname: "/" },
+    });
+    expect(calls).toBe(2);
+  });
+});

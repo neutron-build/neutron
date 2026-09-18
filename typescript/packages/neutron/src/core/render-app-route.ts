@@ -84,6 +84,17 @@ export interface RenderAppRouteOptions {
     read: () => Promise<Response | null>;
     store: (response: Response) => void;
   };
+  /**
+   * Generation fence for loader-data fills (TS-07): checked immediately
+   * before a loader result is committed to the loader cache. The server
+   * advances its invalidation epoch when a mutation COMPLETES; a GET that
+   * started before that completion must not publish its (now stale) loader
+   * output afterwards. GET/HEAD-only admission alone does not fence a GET
+   * that began before the invalidation.
+   */
+  loaderCacheFence?: {
+    stillValid: () => boolean;
+  };
 }
 
 export function toError(value: unknown): Error {
@@ -165,8 +176,13 @@ function toHeaders(
 }
 
 function isLoaderDataCacheableRequest(request: Request): boolean {
-  const cacheControl = request.headers.get("Cache-Control") || "";
-  if (cacheControl.includes("no-cache") || cacheControl.includes("no-store")) {
+  // Case-insensitive directive parsing (TS-31): `No-Store`/`NO-CACHE` from
+  // real clients skipped the old lowercase `includes` test and were cached.
+  const directives = (request.headers.get("Cache-Control") ?? "")
+    .split(",")
+    .map((part) => part.trim().split("=", 1)[0].toLowerCase())
+    .filter(Boolean);
+  if (directives.includes("no-cache") || directives.includes("no-store")) {
     return false;
   }
 
@@ -203,7 +219,13 @@ function buildLoaderDataCacheKey(
   // under loaderMaxAge — the same reason an HTTP cache emits
   // `Vary: Accept-Language`.
   const acceptLanguage = request.headers.get("accept-language") ?? "";
-  return `${canonicalPath}::${url.search}::${routeId}::${encodedParams}::${acceptLanguage}`;
+  // ORIGIN is part of the key (TS-31): one server can serve multiple hosts,
+  // and a host-dependent (tenant) loader's cached result must not answer a
+  // different cookieless host's request. It sits AFTER the canonical path so
+  // `deleteByPath`'s `path::` prefix invalidation still sweeps every
+  // origin's entry for a mutated path.
+  const origin = url.origin;
+  return `${canonicalPath}::${origin}::${url.search}::${routeId}::${encodedParams}::${acceptLanguage}`;
 }
 
 async function readCachedLoaderData(
@@ -221,6 +243,13 @@ async function storeLoaderDataCache(
   maxAgeSec: number
 ): Promise<void> {
   if (maxAgeSec <= 0) {
+    return;
+  }
+  // A null/undefined loader result is not stored (TS-31): the read path
+  // cannot distinguish "cached null" from "no entry" in the store entry
+  // shape, so caching it would silently re-run the loader on every request
+  // while appearing cached. Skip — correctness over a wasted slot.
+  if (data === null || data === undefined) {
     return;
   }
 
@@ -731,6 +760,7 @@ export async function renderAppRoute(
     hooks,
     globalMiddleware,
     responseCache,
+    loaderCacheFence,
   } = opts;
   const allRoutes = [...match.layouts, match.route];
   const clientTier = resolveClientTier(allRoutes);
@@ -981,6 +1011,23 @@ export async function renderAppRoute(
           return { routeId: route.id, data: undefined, response: data };
         }
         if (loaderCacheKey && canWriteLoaderCache) {
+          // Generation fence (TS-07): a mutation that COMPLETED while this
+          // loader ran advanced the server's epoch — publishing now would
+          // resurrect the pre-mutation view after the invalidation.
+          if (loaderCacheFence && !loaderCacheFence.stillValid()) {
+            emitHook(hooks?.onLoaderEnd, {
+              requestId: requestTrace.requestId,
+              method: requestTrace.method,
+              pathname: requestTrace.pathname,
+              routeId: route.id,
+              routePath: route.path,
+              startedAt: loaderStartedAt,
+              endedAt: Date.now(),
+              outcome: "success",
+              cacheStatus: "bypass",
+            });
+            return { routeId: route.id, data };
+          }
           await storeLoaderDataCache(
             loaderDataCache,
             loaderCacheKey,

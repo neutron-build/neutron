@@ -18,6 +18,7 @@ import { renderToString } from "preact-render-to-string";
 import { discoverRoutes } from "../core/manifest.js";
 import { runMiddlewareChain } from "../core/middleware.js";
 import { createRouter } from "../core/router.js";
+import { installTransportPeer } from "./peer.js";
 import {
   compileRouteRules,
   resolveRouteRuleHeaders,
@@ -463,8 +464,20 @@ export async function createServer(
   // with the per-request trace context and surfaced as the x-request-id response
   // header on every response, including /health.
   app.use("*", async (c, next) => {
-    const incoming = c.req.header("x-request-id");
-    const requestId = incoming && incoming.length > 0 ? incoming : createRequestId();
+    // Install transport peer identity FIRST (TS-32): the node adapter's
+    // socket address is the only trustworthy nearest-hop identity. Consumers
+    // (session Secure-cookie proxy trust, rate-limit keying) read it via
+    // transportPeer() and never from forwarding headers.
+    const incoming = (
+      c.env as { incoming?: { socket?: { remoteAddress?: string } } } | undefined
+    )?.incoming;
+    const remoteAddress = incoming?.socket?.remoteAddress;
+    if (typeof remoteAddress === "string" && remoteAddress.length > 0) {
+      installTransportPeer(c.req.raw, remoteAddress);
+    }
+    const requestIdHeader = c.req.header("x-request-id");
+    const requestId =
+      requestIdHeader && requestIdHeader.length > 0 ? requestIdHeader : createRequestId();
     c.set("requestId", requestId);
     await next();
     c.res.headers.set("x-request-id", requestId);
@@ -937,10 +950,21 @@ export async function createServer(
         requestTrace,
         hooks,
         globalMiddleware,
-        responseCacheBoundary
+        responseCacheBoundary,
+        // Loader fills share the app-cache generation fence (TS-07): the
+        // epoch is captured per request and re-checked immediately before a
+        // loader result is committed, so a GET that began before a mutation
+        // completed cannot republish the pre-mutation loader data.
+        { stillValid: () => appCacheEpoch === requestEpoch }
       );
 
       if (isMutationMethod(method)) {
+        // Advance the epoch AGAIN before completion invalidation (TS-07
+        // round 2): a GET that STARTED during the mutation captured the
+        // post-pre-invalidation epoch, and its fill must not publish after
+        // this final delete. The pre-mutation bump alone fenced only GETs
+        // that began before the mutation.
+        appCacheEpoch++;
         await applyMutationInvalidationFromResponse(
           appResponseCacheStore,
           effectivePathname,
@@ -1055,49 +1079,63 @@ export async function createServer(
     });
   }
 
+  // One shutdown per server (TS-29): repeated close() calls join the same
+  // teardown instead of racing a second one through still-draining stages.
+  let closingPromise: Promise<void> | undefined;
   return {
     app,
     server,
     wss,
-    close: async () => {
+    close: () => {
       // Shutdown order (TS-29): stop accepting and DRAIN in-flight requests
       // first — they may still need the SSR runtime — then tear down the
       // runtime. The previous order closed Vite first, failing every render
-      // still in flight. All stages run even when one fails; errors are
-      // combined so a failure in any stage is observable.
-      const teardown: Array<() => Promise<void>> = [
-        // Tear down WebSockets before draining HTTP. An upgraded WS socket is
-        // NOT an idle HTTP keep-alive, so server.close()/closeIdleConnections()
-        // won't reap it — a live client would otherwise hold the drain open
-        // until the caller's shutdown timeout. Forcibly terminate each live
-        // socket, then await the WS server's own close.
-        () =>
-          wss
-            ? (async () => {
-                for (const client of wss.clients) {
-                  client.terminate();
-                }
-                await new Promise<void>((resolve) => wss!.close(() => resolve()));
-              })()
-            : Promise.resolve(),
-        // Await server.close's callback so in-flight requests actually drain
-        // (a fire-and-forget resolved before any draining). Close idle
-        // keep-alive sockets so they don't hold the drain open indefinitely.
-        () =>
-          new Promise<void>((resolve, reject) => {
-            server.close((err) => (err ? reject(err) : resolve()));
-            (server as { closeIdleConnections?: () => void }).closeIdleConnections?.();
-          }),
-        // Last: the SSR runtime. Nothing still rendering depends on it now.
-        () => ssrServer?.close() ?? Promise.resolve(),
-      ];
-      const results = await Promise.allSettled(teardown.map((stage) => stage()));
-      const errors = results
-        .filter((r): r is PromiseRejectedResult => r.status === "rejected")
-        .map((r) => r.reason);
-      if (errors.length > 0) {
-        throw new AggregateError(errors, "Neutron server shutdown failed");
-      }
+      // still in flight. Stages run SEQUENTIALLY (round 2): the recorded
+      // order was constructed correctly but then executed via
+      // `Promise.allSettled(teardown.map(...))`, which starts every stage
+      // at once — Vite closed while renders were still draining. Each stage
+      // still runs even when an earlier one fails; errors are combined so a
+      // failure anywhere is observable.
+      closingPromise ??= (async () => {
+        const teardown: Array<() => Promise<void>> = [
+          // Tear down WebSockets before draining HTTP. An upgraded WS socket is
+          // NOT an idle HTTP keep-alive, so server.close()/closeIdleConnections()
+          // won't reap it — a live client would otherwise hold the drain open
+          // until the caller's shutdown timeout. Forcibly terminate each live
+          // socket, then await the WS server's own close.
+          () =>
+            wss
+              ? (async () => {
+                  for (const client of wss.clients) {
+                    client.terminate();
+                  }
+                  await new Promise<void>((resolve) => wss!.close(() => resolve()));
+                })()
+              : Promise.resolve(),
+          // Await server.close's callback so in-flight requests actually drain
+          // (a fire-and-forget resolved before any draining). Close idle
+          // keep-alive sockets so they don't hold the drain open indefinitely.
+          () =>
+            new Promise<void>((resolve, reject) => {
+              server.close((err) => (err ? reject(err) : resolve()));
+              (server as { closeIdleConnections?: () => void }).closeIdleConnections?.();
+            }),
+          // Last: the SSR runtime. Nothing still rendering depends on it now.
+          () => ssrServer?.close() ?? Promise.resolve(),
+        ];
+        const errors: unknown[] = [];
+        for (const stage of teardown) {
+          try {
+            await stage();
+          } catch (error) {
+            errors.push(error);
+          }
+        }
+        if (errors.length > 0) {
+          throw new AggregateError(errors, "Neutron server shutdown failed");
+        }
+      })();
+      return closingPromise;
     },
     url: (() => {
       const address = server.address?.();
@@ -1124,6 +1162,9 @@ async function handleAppRouteRequest(
     enabled: boolean;
     read: () => Promise<Response | null>;
     store: (response: Response) => void;
+  },
+  loaderCacheFence?: {
+    stillValid: () => boolean;
   }
 ): Promise<Response> {
   // Dev module-loading adapter: load every route/layout module through the
@@ -1143,6 +1184,7 @@ async function handleAppRouteRequest(
     hooks,
     globalMiddleware,
     responseCache,
+    loaderCacheFence,
   });
 }
 

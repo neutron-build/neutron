@@ -5,6 +5,7 @@ import {
   type CookieSerializeOptions,
 } from "../core/cookies.js";
 import type { AppContext, MiddlewareFn } from "../core/types.js";
+import { transportPeer } from "./peer.js";
 
 export interface SessionData {
   [key: string]: unknown;
@@ -64,12 +65,16 @@ export interface SessionMiddlewareOptions {
   cookie?: SessionCookieOptions;
   ttlSeconds?: number;
   /**
-   * List of trusted proxy IP addresses or CIDR ranges.
-   * Only requests from these IPs will be trusted for X-Forwarded-Proto header.
+   * List of trusted proxy IP addresses or IPv4 CIDR ranges.
    *
-   * SECURITY: If not specified, X-Forwarded-Proto will be trusted from any source,
-   * which may allow attackers to bypass secure cookie settings. Always configure
-   * this in production when behind a proxy.
+   * SECURITY (TS-32): the nearest hop is identified by the TRANSPORT's
+   * socket address (installed by the node adapter), never by forwarding
+   * headers — a directly connected client forging `X-Real-IP` cannot
+   * impersonate a trusted proxy. When this list is omitted (or the adapter
+   * supplied no peer metadata for the request), X-Forwarded-Proto is
+   * ignored entirely and Secure falls back to the request's own protocol
+   * (plus the production default). IPv6 entries match by exact string only;
+   * CIDR ranges are IPv4.
    *
    * @example
    * ```ts
@@ -371,22 +376,21 @@ function resolveCookieOptionsForRequest(
 /**
  * Determines if the request is over HTTPS
  *
- * SECURITY: Only trusts X-Forwarded-Proto if request comes from a trusted proxy IP.
- * This prevents attackers from spoofing the header to bypass secure cookie settings.
+ * SECURITY (TS-32): X-Forwarded-Proto is honored only when the request's
+ * NEAREST HOP is a configured trusted proxy, and that hop is identified by
+ * the TRANSPORT-INSTALLED socket address — never by X-Real-IP or
+ * X-Forwarded-For, both of which a directly connected client can forge.
+ * Without transport peer metadata (hand-built Requests, adapters that do
+ * not install it), no header is trusted at all.
  *
  * @param request - The incoming request
  * @param trustedProxies - List of trusted proxy IPs/CIDR ranges (optional)
  */
 function isSecureRequest(request: Request, trustedProxies?: string[]): boolean {
   const forwardedProto = request.headers.get("x-forwarded-proto");
-  // Only honor X-Forwarded-Proto when the request demonstrably arrived through
-  // a configured trusted proxy. Without trustedProxies the header is
-  // attacker-controlled, so we ignore it entirely and fall back to the real
-  // connection protocol — a spoofed `X-Forwarded-Proto: https` must never
-  // decide the Secure cookie flag.
   if (forwardedProto && trustedProxies && trustedProxies.length > 0) {
-    const clientIp = getClientIp(request);
-    if (clientIp && isTrustedProxy(clientIp, trustedProxies)) {
+    const peer = transportPeer(request);
+    if (peer && isTrustedProxy(peer.remoteAddress, trustedProxies)) {
       const first = forwardedProto.split(",")[0]?.trim().toLowerCase();
       if (first === "https") {
         return true;
@@ -400,32 +404,6 @@ function isSecureRequest(request: Request, trustedProxies?: string[]): boolean {
   } catch {
     return false;
   }
-}
-
-/**
- * Extracts client IP from request headers
- */
-function getClientIp(request: Request): string | null {
-  // X-Real-IP is set by the nearest proxy to the address of its immediate peer.
-  const xRealIp = request.headers.get("x-real-ip");
-  if (xRealIp) {
-    return xRealIp.trim();
-  }
-
-  const xForwardedFor = request.headers.get("x-forwarded-for");
-  if (xForwardedFor) {
-    const ips = xForwardedFor
-      .split(",")
-      .map((ip) => ip.trim())
-      .filter(Boolean);
-    // The right-most entry is the peer observed by our nearest hop; left-most
-    // entries are client-supplied and must not be trusted for proxy checks.
-    if (ips.length > 0) {
-      return ips[ips.length - 1]!;
-    }
-  }
-
-  return null;
 }
 
 /**
@@ -453,8 +431,14 @@ function isTrustedProxy(ip: string, trustedProxies: string[]): boolean {
 
 function ipMatchesCidr(ip: string, cidr: string): boolean {
   const [prefix, maskStr] = cidr.split('/');
+  // Strict mask syntax (TS-32): the old parseInt accepted "08", "8.5",
+  // " 8", and "+8" — permissive parsing silently mis-ranged malformed
+  // configurations instead of refusing them.
+  if (!/^(0|[1-9][0-9]?)$/.test(maskStr ?? "") || maskStr === undefined) {
+    return false;
+  }
   const maskBits = parseInt(maskStr, 10);
-  if (isNaN(maskBits) || maskBits < 0 || maskBits > 32) return false;
+  if (maskBits > 32) return false;
 
   const ipNum = ipToNumber(ip);
   const prefixNum = ipToNumber(prefix);

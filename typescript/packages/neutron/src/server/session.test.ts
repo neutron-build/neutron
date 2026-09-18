@@ -6,6 +6,7 @@ import {
   getSessionFromContext,
   sessionMiddleware,
 } from "./session.js";
+import { installTransportPeer } from "./peer.js";
 
 describe("session middleware", () => {
   it("creates and persists a new session", async () => {
@@ -131,7 +132,66 @@ describe("session middleware", () => {
     expect(setCookie).not.toContain("Secure");
   });
 
-  it("honors forwarded protocol only from a trusted proxy", async () => {
+  it("ignores forwarded protocol headers without transport peer metadata", async () => {
+    // TS-32: the nearest hop must be proven by the transport's socket
+    // address, never by X-Real-IP/X-Forwarded-For — a directly connected
+    // client can forge all of them. A request carrying the headers but NO
+    // installed peer must not get a Secure cookie from plain HTTP.
+    const storage = createMemorySessionStorage();
+    const middleware = sessionMiddleware({
+      storage,
+      cookie: { name: "sid" },
+      trustedProxies: ["10.0.0.0/8"],
+    });
+
+    const context: AppContext = {};
+    const request = new Request("http://example.com/test", {
+      headers: {
+        "x-forwarded-proto": "https",
+        "x-real-ip": "10.0.0.5",
+        "x-forwarded-for": "203.0.113.9, 10.0.0.5",
+      },
+    });
+    const response = await runMiddlewareChain([middleware], request, context, async () => {
+      getSessionFromContext(context)?.set("userId", "1");
+      return new Response("ok");
+    });
+
+    const setCookie = response.headers.get("Set-Cookie");
+    expect(setCookie).toBeTruthy();
+    expect(setCookie).not.toContain("Secure");
+  });
+
+  it("honors forwarded protocol only from a transport-verified trusted proxy", async () => {
+    const storage = createMemorySessionStorage();
+    const middleware = sessionMiddleware({
+      storage,
+      cookie: { name: "sid" },
+      trustedProxies: ["10.0.0.0/8"],
+    });
+
+    const context: AppContext = {};
+    const request = new Request("http://example.com/test", {
+      headers: {
+        "x-forwarded-proto": "https",
+      },
+    });
+    // The node adapter installs the socket's remote address; a hop inside
+    // 10.0.0.0/8 is trusted to have set X-Forwarded-Proto.
+    installTransportPeer(request, "10.0.0.5");
+    const response = await runMiddlewareChain([middleware], request, context, async () => {
+      getSessionFromContext(context)?.set("userId", "1");
+      return new Response("ok");
+    });
+
+    const setCookie = response.headers.get("Set-Cookie");
+    expect(setCookie).toBeTruthy();
+    expect(setCookie).toContain("Secure");
+  });
+
+  it("ignores forwarded protocol from an unverified peer address", async () => {
+    // The socket peer is NOT in trustedProxies: headers are ignored even
+    // when they claim a trusted hop.
     const storage = createMemorySessionStorage();
     const middleware = sessionMiddleware({
       storage,
@@ -146,6 +206,7 @@ describe("session middleware", () => {
         "x-real-ip": "10.0.0.5",
       },
     });
+    installTransportPeer(request, "203.0.113.9");
     const response = await runMiddlewareChain([middleware], request, context, async () => {
       getSessionFromContext(context)?.set("userId", "1");
       return new Response("ok");
@@ -153,7 +214,7 @@ describe("session middleware", () => {
 
     const setCookie = response.headers.get("Set-Cookie");
     expect(setCookie).toBeTruthy();
-    expect(setCookie).toContain("Secure");
+    expect(setCookie).not.toContain("Secure");
   });
 
   it("defaults Secure in production over plain HTTP without trusted proxies", async () => {

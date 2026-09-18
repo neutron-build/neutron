@@ -160,6 +160,11 @@ export {
   type MemorySessionStorageOptions,
 } from "./server/session.js";
 export {
+  installTransportPeer,
+  transportPeer,
+  type TransportPeer,
+} from "./server/peer.js";
+export {
   csrfMiddleware,
   type CsrfOptions,
 } from "./server/csrf.js";
