@@ -117,11 +117,21 @@ func Logger(logger *slog.Logger) Middleware {
 
 // Recover returns middleware that catches panics and returns a 500 error.
 // The panic details are logged server-side but NOT exposed to the client.
+//
+// http.ErrAbortHandler is re-panicked, not handled (GO-09): it is how the
+// compression middleware signals "response already partially on the wire,
+// no in-band error is possible". net/http aborts the connection on it —
+// the client sees a truncated response (detectable) instead of a
+// complete-looking corrupt one.
 func Recover() Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			defer func() {
 				if rec := recover(); rec != nil {
+					if rec == http.ErrAbortHandler {
+						log.Printf("[neutron] aborting response after mid-stream panic (headers already sent; no in-band error possible)")
+						panic(rec)
+					}
 					log.Printf("[neutron] panic recovered: %v\n%s", rec, debug.Stack())
 					err := ErrInternal("An unexpected error occurred")
 					WriteError(w, r, err)
@@ -604,6 +614,26 @@ func Compress(level int) Middleware {
 				return
 			}
 			gw := &gzipWriter{ResponseWriter: w, level: level}
+			defer func() {
+				if rec := recover(); rec != nil {
+					if gw.encoder != nil {
+						// A gzip member is open, so the final status and
+						// Content-Encoding header are already on the wire:
+						// no in-band error is possible. Appending the plain
+						// problem+json bytes Recovery would write would only
+						// deepen the corruption, and the member stays
+						// deliberately unfinalized (no trailer — see finish).
+						// Replace the panic with net/http's controlled abort
+						// sentinel: the connection is closed mid-response and
+						// the client detects truncation instead of decoding a
+						// corrupt "complete" body (GO-09 residual).
+						panic(http.ErrAbortHandler)
+					}
+					// Nothing compressed yet — the response is still
+					// answerable in-band. Hand the original panic to Recovery.
+					panic(rec)
+				}
+			}()
 			next.ServeHTTP(gw, r)
 			// Close only on normal completion: a panic unwinds past this
 			// point, and writing a gzip trailer into a stream the recovery

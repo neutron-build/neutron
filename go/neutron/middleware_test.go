@@ -693,3 +693,82 @@ func TestRateLimitHardBucketBound(t *testing.T) {
 		t.Errorf("existing bucket at capacity: status = %d, want 200", w.Code)
 	}
 }
+
+// GO-09 residual: a panic after the first compressed byte cannot be
+// answered in-band (the 200 + Content-Encoding are already on the wire), so
+// the compression middleware converts it into net/http's controlled
+// connection abort. The client must observe a response that is detectably
+// incomplete — never a valid-looking gzip body silently followed by plain
+// problem+json, and never a gzip member finalized by a trailer it did not
+// earn.
+func TestPanicAfterFirstCompressedByteAbortsTheConnection(t *testing.T) {
+	handler := Recover()(Compress(gzip.DefaultCompression)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Commit headers and push compressed bytes onto the wire...
+		w.Write([]byte(strings.Repeat("payload", 64)))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// ...then die mid-stream.
+		panic("boom mid-stream")
+	})))
+
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	req, _ := http.NewRequest("GET", server.URL, nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (headers were already committed)", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", got)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err == nil {
+		t.Fatalf("body read succeeded on an aborted stream — the client cannot detect truncation (%d bytes)", len(body))
+	}
+	// Whatever bytes DID arrive must not decode as a complete gzip member:
+	// the panic path leaves the member unfinalized (no trailer), so a
+	// successful gzip read here means a trailer was written post-panic.
+	if gzipErr := func() error {
+		zr, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		_, err = io.ReadAll(zr)
+		return err
+	}(); gzipErr == nil {
+		t.Fatal("partial body decoded as a complete gzip member — a trailer was emitted after the panic")
+	}
+	// And no plain-text error bytes were appended to the compressed stream.
+	if bytes.Contains(body, []byte("unexpected error")) || bytes.Contains(body, []byte("problem+json")) {
+		t.Fatal("plain-text error bytes were appended to the compressed stream")
+	}
+}
+
+// GO-09, the other half: a panic BEFORE any byte is written stays
+// answerable in-band — the ordinary 500 problem+json, uncompressed.
+func TestPanicBeforeAnyByteStillAnswersInBand(t *testing.T) {
+	handler := Recover()(Compress(gzip.DefaultCompression)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic("boom before body")
+	})))
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Header.Set("Accept-Encoding", "gzip")
+	handler.ServeHTTP(w, r)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", w.Code)
+	}
+	if got := w.Header().Get("Content-Encoding"); got != "" {
+		t.Fatalf("Content-Encoding = %q, want empty (in-band answer is plain)", got)
+	}
+	if !strings.Contains(w.Body.String(), "unexpected error") {
+		t.Fatalf("body = %q, want the in-band 500 problem detail", w.Body.String())
+	}
+}
