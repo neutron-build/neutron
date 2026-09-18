@@ -88,10 +88,55 @@ fn data_row_width(payload: &[u8]) -> usize {
     i16::from_be_bytes([payload[0], payload[1]]) as usize
 }
 
+/// The raw value bytes of a DataRow payload (None per NULL column).
+fn data_row_values(payload: &[u8]) -> Vec<Option<&[u8]>> {
+    let n = data_row_width(payload);
+    let mut out = Vec::with_capacity(n);
+    let mut i = 2;
+    for _ in 0..n {
+        let len = i32::from_be_bytes([
+            payload[i],
+            payload[i + 1],
+            payload[i + 2],
+            payload[i + 3],
+        ]);
+        if len < 0 {
+            out.push(None);
+        } else {
+            let len = len as usize;
+            out.push(Some(&payload[i + 4..i + 4 + len]));
+            i += len;
+        }
+        i += 4;
+    }
+    out
+}
+
+/// The declared format code of each field in a RowDescription payload
+/// (0 = text, 1 = binary).
+fn field_formats(payload: &[u8]) -> Vec<i16> {
+    let n = i16::from_be_bytes([payload[0], payload[1]]) as usize;
+    let mut out = Vec::with_capacity(n);
+    let mut i = 2;
+    for _ in 0..n {
+        let end = payload[i..].iter().position(|&b| b == 0).unwrap() + i;
+        // name NUL, then tableOid(4) attnum(2) typeOid(4) typlen(2) typmod(4),
+        // then the 2-byte format code.
+        let at = end + 1 + 16;
+        out.push(i16::from_be_bytes([payload[at], payload[at + 1]]));
+        i = end + 1 + 18;
+    }
+    out
+}
+
 struct Answer {
     fields: Option<Vec<String>>,
     row_widths: Vec<usize>,
     errors: Vec<String>,
+    /// Declared format codes from the RowDescription, when one was sent.
+    formats: Option<Vec<i16>>,
+    /// Raw value bytes of every DataRow, in arrival order.
+    values: Vec<Vec<Option<Vec<u8>>>>,
 }
 
 fn error_text(payload: &[u8]) -> String {
@@ -113,6 +158,8 @@ async fn drain(stream: &mut tokio::net::TcpStream) -> Answer {
         fields: None,
         row_widths: Vec::new(),
         errors: Vec::new(),
+        formats: None,
+        values: Vec::new(),
     };
     loop {
         let m = tokio::time::timeout(std::time::Duration::from_secs(30), read_message(stream))
@@ -120,9 +167,17 @@ async fn drain(stream: &mut tokio::net::TcpStream) -> Answer {
             .expect("read timeout")
             .expect("eof");
         match m.tag {
-            b'T' => answer.fields = Some(field_names(&m.payload)),
+            b'T' => {
+                answer.fields = Some(field_names(&m.payload));
+                answer.formats = Some(field_formats(&m.payload));
+            }
             b'n' => answer.fields = Some(Vec::new()),
-            b'D' => answer.row_widths.push(data_row_width(&m.payload)),
+            b'D' => {
+                answer.row_widths.push(data_row_width(&m.payload));
+                answer
+                    .values
+                    .push(data_row_values(&m.payload).into_iter().map(|v| v.map(Into::into)).collect());
+            }
             b'E' => answer.errors.push(error_text(&m.payload)),
             b'Z' => return answer,
             _ => {}
@@ -141,6 +196,18 @@ async fn simple_query(stream: &mut tokio::net::TcpStream, sql: &str) -> Answer {
 /// node-postgres sends for a parameterized query, and the one where the
 /// description and the rows come from two separate derivations.
 async fn extended_query(stream: &mut tokio::net::TcpStream, sql: &str) -> Answer {
+    extended_query_formats(stream, sql, &[]).await
+}
+
+/// The extended sequence with explicit Bind result format codes: `&[0]`
+/// forces text, `&[1]` forces binary, `&[]` sends none (server default —
+/// the protocol makes that all-text, matching what pgx and node-postgres
+/// send when they have no reason to prefer binary).
+async fn extended_query_formats(
+    stream: &mut tokio::net::TcpStream,
+    sql: &str,
+    result_formats: &[i16],
+) -> Answer {
     let mut parse = vec![0u8];
     parse.extend_from_slice(sql.as_bytes());
     parse.push(0);
@@ -150,7 +217,10 @@ async fn extended_query(stream: &mut tokio::net::TcpStream, sql: &str) -> Answer
     let mut bind = vec![0u8, 0u8];
     bind.extend_from_slice(&0i16.to_be_bytes()); // param formats
     bind.extend_from_slice(&0i16.to_be_bytes()); // params
-    bind.extend_from_slice(&0i16.to_be_bytes()); // result formats
+    bind.extend_from_slice(&(result_formats.len() as i16).to_be_bytes());
+    for code in result_formats {
+        bind.extend_from_slice(&code.to_be_bytes());
+    }
     send_message(stream, b'B', &bind).await;
 
     send_message(stream, b'D', &[b'P', 0]).await;
@@ -276,6 +346,124 @@ async fn describe_matches_the_rows_it_precedes() {
         SHAPES.len(),
         failures.join("\n  ")
     );
+}
+
+// ── declared format vs payload (GO-31 / Nucleus finding #35) ────────────────
+
+/// The DataRow payload must carry the format the RowDescription declares.
+///
+/// Integer columns are the historical offender: an engine deployed to a
+/// consumer declared text and shipped big-endian binary, and the consumer's
+/// Go client grew a heuristic decoder that guessed text-vs-binary per value
+/// (the exact bytes decided whether "-123" read as -123 or ~1.7e9). A live
+/// socket pins both directions here: text-declared columns carry ASCII
+/// decimal — negatives and i64::MIN included — under format code 0 from the
+/// simple protocol, the extended protocol's default, and an explicit text
+/// Bind, and a client that explicitly Binds format code 1 gets true
+/// big-endian int4/int8 payloads under a binary RowDescription.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn integer_payloads_honor_the_declared_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = Arc::new(crate::catalog::Catalog::new());
+    let engine =
+        crate::storage::DiskEngine::open(&dir.path().join("nucleus.db"), catalog.clone()).unwrap();
+    let storage: Arc<dyn crate::storage::StorageEngine> = Arc::new(engine);
+    let ex = Arc::new(crate::executor::Executor::new_with_persistence(
+        catalog,
+        storage,
+        None,
+        Some(dir.path()),
+    ));
+    let server = Arc::new(NucleusServer::new(Arc::new(NucleusHandler::new(ex))));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accept = tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let _ = process_socket_closing_on_terminate(socket, None, server).await;
+            });
+        }
+    });
+
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    startup(&mut client).await;
+
+    let setup = simple_query(
+        &mut client,
+        "CREATE TABLE fmt_t (a INT, b BIGINT)",
+    )
+    .await;
+    assert!(setup.errors.is_empty(), "setup: {:?}", setup.errors);
+    for (a, b) in [(7i64, i64::MAX), (-123, i64::MIN), (0, 0)] {
+        let r = simple_query(
+            &mut client,
+            &format!("INSERT INTO fmt_t (a, b) VALUES ({a}, {b})"),
+        )
+        .await;
+        assert!(r.errors.is_empty(), "insert: {:?}", r.errors);
+    }
+
+    // Ordered so the byte-for-byte row assertions below are exact.
+    let sql = "SELECT a, b FROM fmt_t ORDER BY a";
+
+    // Every text-declaring mode must ship ASCII decimal, and nothing else.
+    let text_answers = vec![
+        ("simple", simple_query(&mut client, sql).await),
+        (
+            "extended-default",
+            extended_query(&mut client, sql).await,
+        ),
+        (
+            "extended-text",
+            extended_query_formats(&mut client, sql, &[0]).await,
+        ),
+    ];
+    for (mode, answer) in &text_answers {
+        assert!(answer.errors.is_empty(), "{mode}: {:?}", answer.errors);
+        let formats = answer.formats.as_ref().expect("RowDescription");
+        assert!(
+            formats.iter().all(|f| *f == 0),
+            "{mode}: declared {formats:?}, want all text"
+        );
+        assert_eq!(answer.values.len(), 3, "{mode}: row count");
+        let expected: [(&[u8], &[u8]); 3] = [
+            (b"-123", b"-9223372036854775808"),
+            (b"0", b"0"),
+            (b"7", b"9223372036854775807"),
+        ];
+        for (row, (want_a, want_b)) in answer.values.iter().zip(expected) {
+            assert_eq!(row[0].as_deref(), Some(want_a), "{mode}: int4 payload");
+            assert_eq!(row[1].as_deref(), Some(want_b), "{mode}: int8 payload");
+        }
+    }
+
+    // A client that asks for binary gets it — declared and shipped.
+    let binary = extended_query_formats(&mut client, sql, &[1]).await;
+    assert!(binary.errors.is_empty(), "{:?}", binary.errors);
+    let formats = binary.formats.as_ref().expect("RowDescription");
+    assert!(
+        formats.iter().all(|f| *f == 1),
+        "declared {formats:?}, want all binary"
+    );
+    let expected: [(&[u8], &[u8]); 3] = [
+        (
+            &[0xff, 0xff, 0xff, 0x85],
+            &[0x80, 0, 0, 0, 0, 0, 0, 0],
+        ),
+        (&[0, 0, 0, 0], &[0; 8]),
+        (&[0, 0, 0, 7], &[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+    ];
+    for (row, (want_a, want_b)) in binary.values.iter().zip(expected) {
+        assert_eq!(row[0].as_deref(), Some(want_a), "binary int4 payload");
+        assert_eq!(row[1].as_deref(), Some(want_b), "binary int8 payload");
+    }
+
+    drop(client);
+    accept.abort();
 }
 
 // ── zero_row_probe ───────────────────────────────────────────────────────────
