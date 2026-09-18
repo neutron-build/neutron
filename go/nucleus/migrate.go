@@ -2,10 +2,12 @@ package nucleus
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"fmt"
 	"io/fs"
-	"math"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -50,8 +52,34 @@ const migrationsTable = `
 CREATE TABLE IF NOT EXISTS _neutron_migrations (
     version     INTEGER PRIMARY KEY,
     name        TEXT NOT NULL,
-    applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    checksum    TEXT
 )`
+
+// migrationsAddChecksum upgrades history tables created before the checksum
+// column existed (GO-30). Nullable on purpose: rows applied by older clients
+// have no checksum until Migrate baselines them on the next run.
+const migrationsAddChecksum = `
+ALTER TABLE _neutron_migrations ADD COLUMN IF NOT EXISTS checksum TEXT`
+
+// migrationLockTable is the cross-process claim one migration runner holds
+// for a database (Consumer-1). A single fixed row (id = 1); holding it means
+// having your token in it.
+const migrationLockTable = `
+CREATE TABLE IF NOT EXISTS _neutron_migration_lock (
+    id        INTEGER PRIMARY KEY,
+    token     BIGINT NOT NULL,
+    locked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)`
+
+// migrationLockStaleAfter is how long a claim may go unrefreshed before a
+// waiting runner may steal it — the crash-safety valve for a holder that
+// died without releasing. Generous on purpose: a steal that fires while the
+// holder is alive (one very slow migration statement) would let two runners
+// interleave, which is exactly what the lock exists to prevent. Migrate
+// refreshes locked_at after every applied migration, so a live runner only
+// approaches the threshold on a single statement that takes this long.
+const migrationLockStaleAfter = 10 * time.Minute
 
 // migrationGate serializes migration runners within this process (GO-29):
 // Migrate/MigrateDown used to read applied versions OUTSIDE each migration
@@ -59,9 +87,122 @@ CREATE TABLE IF NOT EXISTS _neutron_migrations (
 // ran its Up SQL, then fought over the unique history INSERT
 // (consumer-observed SQLSTATE 23505) — with the migration work possibly
 // executed twice. Holding this gate across the WHOLE operation (history
-// read included) removes the in-process race; cross-process coordination
-// still requires running a single migration runner per database.
+// read included) removes the in-process race; the ledger lock below covers
+// runners in DIFFERENT processes.
 var migrationGate sync.Mutex
+
+// Advisory-lock verdict (Consumer-1, tested before this design was chosen):
+// Nucleus has no advisory locks. pg_advisory_lock does not exist in the
+// engine — the only advisory function implemented is pg_advisory_unlock_all,
+// an honest no-op for asyncpg's pool reset (nucleus
+// src/executor/scalar_fns.rs documents that if locks are ever implemented
+// it must start releasing them). A lock cannot be built on a function the
+// engine does not have, so cross-process serialization uses the INSERT-first
+// ledger claim below, on engine features that DO exist and are regression-
+// tested: INSERT ... ON CONFLICT DO NOTHING and conditional UPDATE (the
+// engine re-checks UPDATE predicates atomically at apply, so an UPDATE whose
+// predicate no longer matches affects zero rows instead of overwriting).
+
+// migrationLockStealSQL transfers a STALE claim: one statement whose WHERE
+// both decides staleness (locked_at older than the threshold, measured
+// against the server's NOW()) and writes the new token, so the decision and
+// the write are atomic. Built from migrationLockStaleAfter at init.
+var migrationLockStealSQL = fmt.Sprintf(
+	"UPDATE _neutron_migration_lock SET token = $1, locked_at = NOW() "+
+		"WHERE id = 1 AND locked_at < NOW() - make_interval(secs => %d)",
+	int(migrationLockStaleAfter.Seconds()))
+
+// acquireMigrationLock claims the database's migration runner slot, waiting
+// until any other holder releases (or proves stale). The claim is one row:
+// an INSERT that conflicts does nothing, so exactly one caller's token lands
+// in it. Waiting is a poll loop with capped backoff — the engine has no
+// LISTEN-based wake for this table, and the common case (no contention) pays
+// one INSERT.
+//
+// Stale claims (holder crashed without releasing) are stolen by the
+// server-side predicate in migrationLockStealSQL, so no client clock is
+// involved and the check is atomic with the write: two waiters cannot both
+// steal (the loser's UPDATE re-evaluates against the winner's refreshed
+// locked_at and matches zero rows), and a holder that refreshes between a
+// waiter's polls cannot be stolen from. A compare-and-swap on a previously
+// READ token — the obvious alternative — has neither property here: the
+// token does not change on refresh, so a stale read could steal from a live
+// holder, and reading holder state means scanning engine timestamps, which
+// the wire layer declares as text (pgx refuses them as *time.Time).
+//
+// The returned token identifies this claim; releaseMigrationLock deletes
+// only the row carrying it, so a late release never removes a successor's
+// stolen claim.
+func (c *Client) acquireMigrationLock(ctx context.Context) (int64, error) {
+	if _, err := c.pool.Exec(ctx, migrationLockTable); err != nil {
+		return 0, fmt.Errorf("nucleus: create migration lock table: %w", err)
+	}
+
+	var token int64
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return 0, fmt.Errorf("nucleus: migration lock token: %w", err)
+	}
+	for _, b := range buf {
+		token = token<<8 | int64(b)
+	}
+
+	delay := 25 * time.Millisecond
+	const maxDelay = 2 * time.Second
+	for {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+
+		ct, err := c.pool.Exec(ctx,
+			"INSERT INTO _neutron_migration_lock (id, token) VALUES (1, $1) ON CONFLICT (id) DO NOTHING",
+			sqlParam(token))
+		if err != nil {
+			return 0, fmt.Errorf("nucleus: claim migration lock: %w", err)
+		}
+		if ct.RowsAffected() == 1 {
+			return token, nil
+		}
+
+		// Held by someone: steal it if — and only if — the claim is stale.
+		ct, err = c.pool.Exec(ctx, migrationLockStealSQL, sqlParam(token))
+		if err != nil {
+			return 0, fmt.Errorf("nucleus: steal stale migration lock: %w", err)
+		}
+		if ct.RowsAffected() == 1 {
+			return token, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(delay):
+		}
+		if delay < maxDelay {
+			delay *= 2
+		}
+	}
+}
+
+// releaseMigrationLock drops the claim if — and only if — the row still
+// carries this token. Failures are deliberately not returned to the caller:
+// by the time Migrate releases, its work is committed, and an unreleased
+// claim self-heals via the stale steal after migrationLockStaleAfter.
+func (c *Client) releaseMigrationLock(ctx context.Context, token int64) {
+	_, _ = c.pool.Exec(ctx,
+		"DELETE FROM _neutron_migration_lock WHERE id = 1 AND token = $1",
+		sqlParam(token))
+}
+
+// migrationChecksum is the digest recorded per applied version (GO-30):
+// version, name, and Up SQL, NUL-separated so no field can bleed into the
+// next one. The Down SQL is excluded — rolling back is allowed to evolve
+// independently of what was applied.
+func migrationChecksum(m Migration) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%d\x00%s\x00%s", m.Version, m.Name, m.Up)
+	return hex.EncodeToString(h.Sum(nil))
+}
 
 // prepareMigrations copies, sorts, and validates the migration plan before
 // any SQL runs (GO-30): Migrate/MigrateDown used to sort the CALLER's slice
@@ -97,30 +238,71 @@ func prepareMigrations(input []Migration, descending bool) ([]Migration, error) 
 }
 
 // Migrate runs all pending migrations in order.
+//
+// Concurrency: runners in one process are serialized by a package gate
+// (GO-29); runners in DIFFERENT processes are serialized by the ledger
+// claim in _neutron_migration_lock (Consumer-1) — a second runner's Migrate
+// blocks until the first releases or its claim goes stale.
+//
+// Checksums: every applied migration records migrationChecksum in
+// _neutron_migrations. History rows written before the checksum column
+// existed are baselined on the next run — their checksum is backfilled from
+// the CURRENT plan without complaint, because legacy rows cannot be
+// re-derived. From then on the checksum is enforced: a migration whose
+// content no longer matches its recorded checksum fails Migrate instead of
+// silently skipping (the applied version would otherwise mask a modified —
+// possibly already-deployed-differently — script forever).
 func (c *Client) Migrate(ctx context.Context, migrations []Migration) error {
 	migrationGate.Lock()
 	defer migrationGate.Unlock()
 
-	// Ensure migrations table exists
-	_, err := c.pool.Exec(ctx, migrationsTable)
-	if err != nil {
-		return fmt.Errorf("nucleus: create migrations table: %w", err)
-	}
-
-	// Copy + validate the plan before executing anything (GO-30).
 	plan, err := prepareMigrations(migrations, false)
 	if err != nil {
 		return err
 	}
 
-	// Get applied versions
+	lockToken, err := c.acquireMigrationLock(ctx)
+	if err != nil {
+		return err
+	}
+	defer c.releaseMigrationLock(context.WithoutCancel(ctx), lockToken)
+
+	// Ensure migrations table exists (with the checksum column, upgrading
+	// history tables created by older clients in place).
+	if _, err := c.pool.Exec(ctx, migrationsTable); err != nil {
+		return fmt.Errorf("nucleus: create migrations table: %w", err)
+	}
+	if _, err := c.pool.Exec(ctx, migrationsAddChecksum); err != nil {
+		return fmt.Errorf("nucleus: add migrations checksum column: %w", err)
+	}
+
+	// Get applied versions with their checksums.
 	applied, err := c.appliedVersions(ctx)
 	if err != nil {
 		return err
 	}
 
 	for _, m := range plan {
-		if applied[m.Version] {
+		rec, isApplied := applied[m.Version]
+		if isApplied {
+			if rec.checksum == nil {
+				// Legacy row from before checksums existed: baseline it from
+				// the current plan. Drift here is accepted by policy — there
+				// is no earlier recorded content to compare against.
+				if _, err := c.pool.Exec(ctx,
+					"UPDATE _neutron_migrations SET checksum = $1 WHERE version = $2 AND checksum IS NULL",
+					migrationChecksum(m), sqlParam(m.Version)); err != nil {
+					return fmt.Errorf("nucleus: baseline checksum for migration %d: %w", m.Version, err)
+				}
+				continue
+			}
+			if *rec.checksum != migrationChecksum(m) {
+				return fmt.Errorf(
+					"nucleus: migration %d (%s) has been modified since it was applied: "+
+						"recorded checksum sha256:%s does not match the current script (%s) — "+
+						"restore the applied script or write a new migration",
+					m.Version, m.Name, *rec.checksum, migrationChecksum(m))
+			}
 			continue
 		}
 
@@ -134,7 +316,7 @@ func (c *Client) Migrate(ctx context.Context, migrations []Migration) error {
 			return fmt.Errorf("nucleus: migration %d (%s) up: %w", m.Version, m.Name, err)
 		}
 
-		if _, err := tx.Exec(ctx, "INSERT INTO _neutron_migrations (version, name) VALUES ($1, $2)", sqlParam(m.Version), m.Name); err != nil {
+		if _, err := tx.Exec(ctx, "INSERT INTO _neutron_migrations (version, name, checksum) VALUES ($1, $2, $3)", sqlParam(m.Version), m.Name, migrationChecksum(m)); err != nil {
 			_ = tx.Rollback(ctx)
 			return fmt.Errorf("nucleus: record migration %d: %w", m.Version, err)
 		}
@@ -142,12 +324,20 @@ func (c *Client) Migrate(ctx context.Context, migrations []Migration) error {
 		if err := tx.Commit(ctx); err != nil {
 			return fmt.Errorf("nucleus: commit migration %d: %w", m.Version, err)
 		}
+
+		// Refresh the claim so a long train of migrations never approaches
+		// the stale threshold while still alive.
+		_, _ = c.pool.Exec(ctx,
+			"UPDATE _neutron_migration_lock SET locked_at = NOW() WHERE id = 1 AND token = $1",
+			sqlParam(lockToken))
 	}
 
 	return nil
 }
 
-// MigrateDown rolls back the specified number of migrations.
+// MigrateDown rolls back the specified number of migrations. Serialized by
+// the same gates as Migrate (package gate in-process, ledger claim across
+// processes).
 func (c *Client) MigrateDown(ctx context.Context, migrations []Migration, steps int) error {
 	migrationGate.Lock()
 	defer migrationGate.Unlock()
@@ -156,6 +346,12 @@ func (c *Client) MigrateDown(ctx context.Context, migrations []Migration, steps 
 	if err != nil {
 		return err
 	}
+
+	lockToken, err := c.acquireMigrationLock(ctx)
+	if err != nil {
+		return err
+	}
+	defer c.releaseMigrationLock(context.WithoutCancel(ctx), lockToken)
 
 	applied, err := c.appliedVersions(ctx)
 	if err != nil {
@@ -167,7 +363,7 @@ func (c *Client) MigrateDown(ctx context.Context, migrations []Migration, steps 
 		if rolled >= steps {
 			break
 		}
-		if !applied[m.Version] {
+		if _, isApplied := applied[m.Version]; !isApplied {
 			continue
 		}
 		if m.Down == "" {
@@ -209,102 +405,41 @@ func (c *Client) MigrationStatus(ctx context.Context) ([]MigrationRecord, error)
 	var records []MigrationRecord
 	for rows.Next() {
 		var r MigrationRecord
-		var rawVer []byte
-		if err := rows.Scan(&rawVer, &r.Name, &r.AppliedAt); err != nil {
+		if err := rows.Scan(&r.Version, &r.Name, &r.AppliedAt); err != nil {
 			return nil, err
 		}
-		v, err := scanInt(rawVer)
-		if err != nil {
-			return nil, fmt.Errorf("nucleus: parse migration version: %w", err)
-		}
-		r.Version = v
 		records = append(records, r)
 	}
 	return records, rows.Err()
 }
 
-func (c *Client) appliedVersions(ctx context.Context) (map[int]bool, error) {
-	rows, err := c.pool.Query(ctx, "SELECT version FROM _neutron_migrations")
+// appliedVersion is one _neutron_migrations row as Migrate consumes it.
+// checksum is nil for legacy rows written before the column existed.
+type appliedVersion struct {
+	checksum *string
+}
+
+// appliedVersions reads the applied-history map. Integer columns arrive as
+// text-formatted ASCII under the engine's declared text format (the wire
+// contract is pinned by nucleus's tests_row_description integer-format
+// test), so pgx decodes them natively — no per-value byte inspection.
+func (c *Client) appliedVersions(ctx context.Context) (map[int]appliedVersion, error) {
+	rows, err := c.pool.Query(ctx, "SELECT version, checksum FROM _neutron_migrations")
 	if err != nil {
 		return nil, fmt.Errorf("nucleus: query applied versions: %w", err)
 	}
 	defer rows.Close()
 
-	applied := make(map[int]bool)
+	applied := make(map[int]appliedVersion)
 	for rows.Next() {
-		var rawVer []byte
-		if err := rows.Scan(&rawVer); err != nil {
-			return nil, err
+		var version int
+		var rec appliedVersion
+		if err := rows.Scan(&version, &rec.checksum); err != nil {
+			return nil, fmt.Errorf("nucleus: scan applied version: %w", err)
 		}
-		v, err := scanInt(rawVer)
-		if err != nil {
-			return nil, fmt.Errorf("nucleus: parse migration version: %w", err)
-		}
-		applied[v] = true
+		applied[version] = rec
 	}
 	return applied, rows.Err()
-}
-
-// scanInt decodes an integer value from raw pgwire bytes. Nucleus declares
-// text format (code 0) in RowDescription but sends big-endian binary bytes
-// for INTEGER columns — pgx's text decoder then fails. We inspect the bytes:
-// anything that is valid textual integer syntax (optional leading '-', then
-// ASCII digits, fitting the platform int) decodes as text — including
-// NEGATIVE text like "-123", which the old all-digits test misread as a
-// 4-byte big-endian value near 1.7 billion (GO-31). Otherwise decode as
-// big-endian int32/int64 with a platform-int range check. Fully resolving
-// the text/binary ambiguity needs the engine to honor its declared wire
-// format; until then the reserved-autocommit note stands: migration
-// versions are validated positive before they are ever written.
-// Track as Nucleus finding #35.
-func scanInt(b []byte) (int, error) {
-	if len(b) == 0 {
-		return 0, fmt.Errorf("empty value")
-	}
-	// Textual integer syntax first (GO-31): handles signed text and keeps
-	// digit-only binary bytes on their historical text interpretation.
-	if isTextualInt(b) {
-		n, err := strconv.ParseInt(string(b), 10, 64)
-		if err != nil {
-			return 0, err
-		}
-		if n > math.MaxInt || n < math.MinInt {
-			return 0, fmt.Errorf("value %d overflows platform int", n)
-		}
-		return int(n), nil
-	}
-	switch len(b) {
-	case 4:
-		v := int32(b[0])<<24 | int32(b[1])<<16 | int32(b[2])<<8 | int32(b[3])
-		return int(v), nil
-	case 8:
-		v := int64(b[0])<<56 | int64(b[1])<<48 | int64(b[2])<<40 | int64(b[3])<<32 |
-			int64(b[4])<<24 | int64(b[5])<<16 | int64(b[6])<<8 | int64(b[7])
-		if v > math.MaxInt || v < math.MinInt {
-			return 0, fmt.Errorf("value %d overflows platform int", v)
-		}
-		return int(v), nil
-	default:
-		return 0, fmt.Errorf("unexpected %d-byte integer", len(b))
-	}
-}
-
-// isTextualInt reports whether b is `[+-]?[0-9]+` — the shape a text-format
-// integer takes on the wire.
-func isTextualInt(b []byte) bool {
-	digits := b
-	if len(b) > 0 && (b[0] == '-' || b[0] == '+') {
-		digits = b[1:]
-	}
-	if len(digits) == 0 {
-		return false
-	}
-	for _, c := range digits {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
 }
 
 // LoadMigrations reads migration files from an embedded filesystem.

@@ -143,9 +143,11 @@ func scanRow(rows pgx.Rows, dest any) error {
 	}
 
 	// Scan all columns as nullable strings, then convert to target types.
-	// Nucleus pgwire may send binary format indicators with text data, so
-	// direct scanning into typed fields fails. Nullable string intermediary
-	// handles all cases including NULL values.
+	// The string intermediary handles NULL columns uniformly and sidesteps
+	// typed-decode mismatches on the engine's text renderings (the engine
+	// honors its declared text format for integer results; that contract is
+	// pinned by nucleus's wire tests and by the migration round-trip test
+	// here).
 	rawVals := make([]any, len(colNames))
 	rawPtrs := make([]*string, len(colNames))
 	for i := range rawVals {

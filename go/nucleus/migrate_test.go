@@ -332,24 +332,56 @@ func TestPrepareMigrationsRejectsBadPlans(t *testing.T) {
 	}
 }
 
-// GO-31: signed TEXT integers decode as text — the old all-digits test
-// misread a four-byte text like "-123" as a huge big-endian binary value.
-func TestScanIntSignedText(t *testing.T) {
-	for _, tc := range []struct {
-		raw  string
-		want int
-	}{
-		{"42", 42},
-		{"-123", -123},
-		{"0", 0},
-		{"2147483647", 2147483647},
-	} {
-		got, err := scanInt([]byte(tc.raw))
-		if err != nil {
-			t.Fatalf("scanInt(%q): %v", tc.raw, err)
-		}
-		if got != tc.want {
-			t.Errorf("scanInt(%q) = %d, want %d", tc.raw, got, tc.want)
-		}
+// GO-30: applied migrations record a sha256 over version, name, and Up SQL.
+// Deterministic, and sensitive to exactly the inputs that define what ran.
+func TestMigrationChecksum(t *testing.T) {
+	base := Migration{Version: 1, Name: "create_users", Up: "CREATE TABLE users (id INT)"}
+	want := migrationChecksum(base)
+
+	if got := migrationChecksum(base); got != want {
+		t.Errorf("checksum not deterministic: %s vs %s", got, want)
+	}
+	if len(want) != 64 { // sha256 hex
+		t.Errorf("checksum length = %d, want 64", len(want))
+	}
+
+	changed := base
+	changed.Up = "CREATE TABLE users (id BIGINT)"
+	if migrationChecksum(changed) == want {
+		t.Error("checksum insensitive to Up SQL changes")
+	}
+	changed = base
+	changed.Name = "create_users_v2"
+	if migrationChecksum(changed) == want {
+		t.Error("checksum insensitive to name changes")
+	}
+	changed = base
+	changed.Version = 2
+	if migrationChecksum(changed) == want {
+		t.Error("checksum insensitive to version changes")
+	}
+
+	// NUL separation: (1, "ab", ...) and (1, "a", "b", ...) must differ —
+	// without the separators a field boundary could move without changing
+	// the bytes.
+	if migrationChecksum(Migration{Version: 1, Name: "ab", Up: "c"}) ==
+		migrationChecksum(Migration{Version: 1, Name: "a", Up: "bc"}) {
+		t.Error("checksum not NUL-separated: field boundary can slide")
+	}
+}
+
+// The history and lock tables carry the columns the code writes.
+func TestMigrationsTableSQLChecksum(t *testing.T) {
+	if !contains(migrationsTable, "checksum") {
+		t.Error("migrationsTable should have a checksum column")
+	}
+	if !contains(migrationsAddChecksum, "ADD COLUMN IF NOT EXISTS checksum") {
+		t.Error("migrationsAddChecksum should add the checksum column if missing")
+	}
+	if !contains(migrationLockTable, "_neutron_migration_lock") {
+		t.Error("migrationLockTable should create _neutron_migration_lock")
+	}
+	if !contains(migrationLockTable, "token") || !contains(migrationLockTable, "locked_at") {
+		t.Error("migrationLockTable should carry token and locked_at")
 	}
 }
