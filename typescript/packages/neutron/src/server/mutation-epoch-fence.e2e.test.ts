@@ -35,15 +35,28 @@ async function getFreePort(): Promise<number> {
 
 const ROUTE = `
 import { h } from "preact";
+import * as fs from "node:fs/promises";
 export const config = { mode: "app", cache: { loaderMaxAge: 120 } };
 let loadCount = 0;
 export async function loader() {
   loadCount += 1;
   const n = loadCount;
-  // The FIRST loader run is slow, so the mutation below can complete while
-  // it is still in flight.
-  if (n === 1) {
-    await new Promise((resolve) => setTimeout(resolve, 600));
+  // The FIRST loader run blocks on a gate file the test writes only after
+  // the mutation has completed, so the interleaving is deterministic under
+  // scheduler load instead of relying on a fixed sleep.
+  if (n === 1 && process.env.EPOCH_FENCE_DIR) {
+    const dir = process.env.EPOCH_FENCE_DIR;
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(dir + "/started", String(n), "utf-8");
+    const deadline = Date.now() + 60_000;
+    while (Date.now() < deadline) {
+      try {
+        await fs.stat(dir + "/gate");
+        break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
   }
   return { loadCount: n };
 }
@@ -74,6 +87,7 @@ async function getLoadCount(): Promise<number> {
 beforeAll(async () => {
   fixtureRoot = await fs.mkdtemp(path.join(process.cwd(), ".tmp-neutron-epoch-"));
   await writeFixtureApp(fixtureRoot);
+  process.env.EPOCH_FENCE_DIR = path.join(fixtureRoot, "fence");
 
   const port = await getFreePort();
   server = await createServer({
@@ -102,17 +116,28 @@ describe("TS-07: completion invalidation fences in-flight loader fills", () => {
     "a GET that started before a mutation's completion does not republish stale loader data",
     { timeout: 30_000 },
     async () => {
-      // GET 1 starts; its loader sleeps 600ms.
+      // GET 1 starts; its first loader run blocks on the gate file.
       const inFlight = getLoadCount();
-      // Let GET 1 reach its loader, then complete a mutation on the same
-      // path (pre-invalidation + action + completion invalidation all land
-      // while GET 1's loader is still sleeping).
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      // Wait until GET 1's loader has observably started, then complete a
+      // mutation on the same path (pre-invalidation + action + completion
+      // invalidation all land while GET 1's loader is still gated).
+      const fenceDir = process.env.EPOCH_FENCE_DIR!;
+      const startedDeadline = Date.now() + 10_000;
+      while (Date.now() < startedDeadline) {
+        try {
+          await fs.stat(fenceDir + "/started");
+          break;
+        } catch {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      }
       const mutation = await fetch(`${baseUrl}/docs`, {
         method: "POST",
         headers: { Accept: "application/json" },
       });
       expect(mutation.status).toBe(200);
+      // Release GET 1's loader only now, after the mutation completed.
+      await fs.writeFile(fenceDir + "/gate", "1", "utf-8");
 
       // GET 1 finishes AFTER the mutation completed. Its fill was fenced,
       // so nothing stale was published.
