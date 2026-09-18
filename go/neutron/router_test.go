@@ -521,3 +521,102 @@ func TestApplication405AndHtml404PassThrough(t *testing.T) {
 		t.Errorf("body = %q, want the application's HTML page", w2.Body.String())
 	}
 }
+
+// GO-28: Go's Request.ParseForm only populates PostForm from the BODY for
+// POST/PUT/PATCH — a url-encoded DELETE body was silently ignored and the
+// typed handler saw empty form fields. Form binding now decodes the body
+// explicitly for every body-bearing method.
+func TestRouterDeleteFormBody(t *testing.T) {
+	r := newRouter()
+
+	type Input struct {
+		Name string `form:"name"`
+	}
+	type Resp struct {
+		Name string `json:"name"`
+	}
+	Delete[Input, Resp](r, "/items", func(ctx context.Context, input Input) (Resp, error) {
+		return Resp{Name: input.Name}, nil
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("DELETE", "/items", strings.NewReader("name=alice"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var resp Resp
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Name != "alice" {
+		t.Errorf("name = %q, want \"alice\" — DELETE body was ignored", resp.Name)
+	}
+}
+
+// GO-28: body values take precedence over same-named query values for
+// form-tagged fields, while query tags keep reading the URL.
+func TestRouterFormBodyPrecedenceOverQuery(t *testing.T) {
+	r := newRouter()
+
+	type Input struct {
+		Name  string `form:"name"`
+		Scope string `query:"scope"`
+	}
+	type Resp struct {
+		Name  string `json:"name"`
+		Scope string `json:"scope"`
+	}
+	Post[Input, Resp](r, "/things", func(ctx context.Context, input Input) (Resp, error) {
+		return Resp{Name: input.Name, Scope: input.Scope}, nil
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/things?name=query-value&scope=org", strings.NewReader("name=body-value"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.ServeHTTP(w, req)
+
+	var resp Resp
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Name != "body-value" {
+		t.Errorf("form field = %q, want body value", resp.Name)
+	}
+	if resp.Scope != "org" {
+		t.Errorf("query field = %q, want \"org\"", resp.Scope)
+	}
+}
+
+// GO-28: an oversized url-encoded body maps to 413 (via MaxBytesReader),
+// and malformed percent escapes stay a 400.
+func TestRouterFormBodyLimits(t *testing.T) {
+	r := newRouter()
+	type Input struct {
+		Name string `form:"name"`
+	}
+	Delete[Input, Empty](r, "/items", func(ctx context.Context, input Input) (Empty, error) {
+		return Empty{}, nil
+	})
+
+	// Oversized -> 413.
+	w := httptest.NewRecorder()
+	big := "name=" + strings.Repeat("x", maxFormBodyBytes)
+	req := httptest.NewRequest("DELETE", "/items", strings.NewReader(big))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("oversized form body: status = %d, want 413", w.Code)
+	}
+
+	// Malformed escapes -> 400.
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest("DELETE", "/items", strings.NewReader("name=%zz"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("malformed form body: status = %d, want 400", w.Code)
+	}
+}

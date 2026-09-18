@@ -268,6 +268,17 @@ type tokenBucket struct {
 	lastTime time.Time
 }
 
+// Hard ceiling on live rate-limit buckets (GO-27). Without it, >100k
+// distinct source addresses made EVERY new key sweep the whole map under
+// the global mutex (O(n) per request once over the old threshold), and the
+// map still grew without bound when keys were all recent. At capacity, new
+// identities are refused with 429; existing buckets keep their state.
+const rateLimitMaxBuckets = 100_000
+
+// Minimum spacing between expiry sweeps, so a flood of new keys cannot
+// trigger a full-map scan per request (GO-27).
+const rateLimitSweepInterval = 10 * time.Second
+
 // RateLimit returns middleware implementing a per-IP token-bucket rate limiter.
 //
 // Configuration is validated at construction (GO-24): non-finite or
@@ -282,6 +293,7 @@ func RateLimit(rps float64, burst int) Middleware {
 	}
 	var mu sync.Mutex
 	buckets := make(map[string]*tokenBucket)
+	var nextSweep time.Time
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -295,16 +307,27 @@ func RateLimit(rps float64, burst int) Middleware {
 			mu.Lock()
 			b, ok := buckets[ip]
 			if !ok {
-				b = &tokenBucket{tokens: float64(burst), lastTime: time.Now()}
-				buckets[ip] = b
-				// Evict stale entries to prevent unbounded growth
-				if len(buckets) > 100000 {
+				// Bounded maintenance (GO-27): the expiry sweep runs at most
+				// once per interval — never once per new key — and admission
+				// stops at the hard bucket ceiling instead of scanning
+				// forever.
+				now := time.Now()
+				if now.After(nextSweep) {
 					for k, v := range buckets {
-						if time.Since(v.lastTime) > 2*time.Minute {
+						if now.Sub(v.lastTime) > 2*time.Minute {
 							delete(buckets, k)
 						}
 					}
+					nextSweep = now.Add(rateLimitSweepInterval)
 				}
+				if len(buckets) >= rateLimitMaxBuckets {
+					mu.Unlock()
+					w.Header().Set("Retry-After", "10")
+					WriteError(w, r, ErrRateLimited("Rate limiter capacity reached"))
+					return
+				}
+				b = &tokenBucket{tokens: float64(burst), lastTime: time.Now()}
+				buckets[ip] = b
 			}
 
 			now := time.Now()
@@ -412,26 +435,34 @@ func encodingQuality(header, coding string) float64 {
 	return 0
 }
 
-// gzipWriter wraps http.ResponseWriter with a gzip writer.
+// gzipWriter wraps http.ResponseWriter with a lazily-committed gzip writer.
 //
-// Header commitment is LAZY (GO-09): Content-Encoding is set and
-// Content-Length removed only at the moment the response actually commits
-// (first WriteHeader/Write), after eligibility is decidable from the final
-// headers. The old wrapper set both before the handler ran, so a handler
-// that set Content-Length afterwards produced compressed bytes with the
-// uncompressed length on the wire, and a panic before the first byte still
-// carried the gzip header into the recovery response.
+// The encoder is created only when the FINAL headers prove the response
+// eligible (GO-09), and finalized only if it was ever selected (GO-25):
+// the old writer created the gzip.Writer eagerly and closed it
+// unconditionally after the handler, appending an empty gzip member to
+// bypassed responses ("abc" → 26 bytes with no Content-Encoding) and
+// emitting trailer-only gzip bytes for empty handlers. Flush used to push
+// gzip bytes BEFORE the eligibility decision, producing compressed output
+// under an unencoded implicit-200; informational WriteHeader calls
+// finalized compression state mid-handshake. A Write with no Content-Type
+// now sniffs the ORIGINAL bytes before compression, so the underlying
+// server advertises the real media type instead of the gzip magic.
 type gzipWriter struct {
 	http.ResponseWriter
-	Writer io.Writer
-	// decided marks that compression headers were emitted; once true the
-	// response is committed as gzip and no plain-text recovery body may be
-	// appended.
+	level int
+	// encoder is non-nil exactly while a gzip member is open.
+	encoder *gzip.Writer
+	// decided marks that the final-header decision was made; once true no
+	// later WriteHeader can change the outcome.
 	decided  bool
 	skipGzip bool
 }
 
-func (w *gzipWriter) commitHeaders(code int) {
+// commitHeaders makes the one-way eligibility decision and (when eligible)
+// installs the encoder. `sample` is the first body bytes when the commit is
+// triggered by Write, used for Content-Type sniffing.
+func (w *gzipWriter) commitHeaders(code int, sample []byte) {
 	if w.decided {
 		return
 	}
@@ -439,12 +470,11 @@ func (w *gzipWriter) commitHeaders(code int) {
 	h := w.ResponseWriter.Header()
 	// Response-side eligibility, judged on the FINAL headers at commitment
 	// (GO-09): bodyless statuses, existing encodings, ranges, and
-	// no-transform responses pass through uncompressed.
-	if h.Get("Content-Encoding") != "" ||
-		h.Get("Content-Range") != "" ||
-		code == http.StatusNoContent ||
-		code == http.StatusResetContent ||
-		code == http.StatusNotModified {
+	// no-transform responses pass through uncompressed. Non-final statuses
+	// never reach here (see WriteHeader).
+	if code < 200 || code == http.StatusNoContent || code == http.StatusResetContent ||
+		code == http.StatusNotModified ||
+		h.Get("Content-Encoding") != "" || h.Get("Content-Range") != "" {
 		w.skipGzip = true
 		return
 	}
@@ -455,39 +485,82 @@ func (w *gzipWriter) commitHeaders(code int) {
 			return
 		}
 	}
+	if h.Get("Content-Type") == "" {
+		if len(sample) == 0 {
+			// No body bytes to sniff yet (explicit WriteHeader, or a Flush
+			// before any Write): compressing would leave the underlying
+			// server to sniff the GZIP magic and advertise the wrong type.
+			// Stay identity.
+			w.skipGzip = true
+			return
+		}
+		h.Set("Content-Type", http.DetectContentType(sample))
+	}
+	w.encoder, _ = gzip.NewWriterLevel(w.ResponseWriter, w.level)
 	h.Set("Content-Encoding", "gzip")
 	h.Del("Content-Length")
+	// The representation is transformed, so a strong ETag no longer
+	// identifies the delivered bytes.
+	if etag := h.Get("ETag"); etag != "" && !strings.HasPrefix(etag, "W/") {
+		h.Set("ETag", "W/"+etag)
+	}
 }
 
 func (w *gzipWriter) WriteHeader(code int) {
-	w.commitHeaders(code)
+	// Informational responses are NOT final commitments (GO-25): forward
+	// them untouched — finalizing compression state on a 103 left the
+	// eventual body appended to a decided-but-unencoded response. 101 is a
+	// protocol switch: the connection stops being an HTTP response, so
+	// bypass compression for whatever follows.
+	if code >= 100 && code < 200 && code != http.StatusSwitchingProtocols {
+		w.ResponseWriter.WriteHeader(code)
+		return
+	}
+	if code == http.StatusSwitchingProtocols {
+		w.decided = true
+		w.skipGzip = true
+		w.ResponseWriter.WriteHeader(code)
+		return
+	}
+	w.commitHeaders(code, nil)
 	w.ResponseWriter.WriteHeader(code)
 }
 
 func (w *gzipWriter) Write(b []byte) (int, error) {
-	// Implicit 200 commitment shares the same lazy decision.
-	w.commitHeaders(http.StatusOK)
-	if w.skipGzip {
+	w.commitHeaders(http.StatusOK, b)
+	if w.skipGzip || w.encoder == nil {
 		return w.ResponseWriter.Write(b)
 	}
-	return w.Writer.Write(b)
+	return w.encoder.Write(b)
 }
 
 func (w *gzipWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // Flush flushes the gzip writer (to push buffered compressed bytes) and then
-// the underlying writer, so SSE works through compression.
+// the underlying writer, so SSE works through compression. Committing BEFORE
+// flushing guarantees the Content-Encoding header rides the same implicit
+// 200 as the first compressed bytes (GO-25).
 func (w *gzipWriter) Flush() {
-	if f, ok := w.Writer.(interface{ Flush() error }); ok {
-		_ = f.Flush()
+	w.commitHeaders(http.StatusOK, nil)
+	if w.encoder != nil {
+		_ = w.encoder.Flush()
 	}
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
 }
 
+// finish closes the gzip member iff one was opened. Called only on normal
+// handler completion (GO-09): a panic must NOT finalize a partial stream.
+func (w *gzipWriter) finish() error {
+	if w.encoder == nil {
+		return nil
+	}
+	return w.encoder.Close()
+}
+
 // Hijack forwards to the underlying writer (the hijacked connection bypasses
-// gzip, which is correct for WebSocket upgrades).
+// gzip, which is correct for WebSocket upgrades). No header is emitted.
 func (w *gzipWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
 		return h.Hijack()
@@ -511,7 +584,16 @@ func requestWantsGzip(r *http.Request) bool {
 // The negotiation is quality-aware (GO-08): `gzip;q=0` (or a wildcard `*`
 // with an explicit gzip;q=0) never selects gzip — the old substring test
 // happily compressed for clients that had forbidden the coding.
+//
+// The encoder is fully lazy (GO-25): it is created at final-header
+// commitment and closed only if it was ever created, so bypassed
+// (no-transform / pre-encoded / ranged / bodyless) and empty responses go
+// out byte-for-byte unchanged instead of dragging an empty gzip member.
 func Compress(level int) Middleware {
+	// Validate the level once, before any request is served.
+	if _, err := gzip.NewWriterLevel(io.Discard, level); err != nil {
+		panic("neutron: invalid gzip level: " + err.Error())
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// The response varies on Accept-Encoding whether or not we compress,
@@ -521,18 +603,13 @@ func Compress(level int) Middleware {
 				next.ServeHTTP(w, r)
 				return
 			}
-			gz, err := gzip.NewWriterLevel(w, level)
-			if err != nil {
-				next.ServeHTTP(w, r)
-				return
-			}
-			gw := &gzipWriter{ResponseWriter: w, Writer: gz}
+			gw := &gzipWriter{ResponseWriter: w, level: level}
 			next.ServeHTTP(gw, r)
 			// Close only on normal completion: a panic unwinds past this
 			// point, and writing a gzip trailer into a stream the recovery
 			// middleware is about to append plain text to would only deepen
 			// the corruption.
-			_ = gz.Close()
+			_ = gw.finish()
 		})
 	}
 }
@@ -614,10 +691,15 @@ func (w *statusWriter) Flush() {
 // Hijack forwards to the underlying writer so WebSocket upgrades work behind
 // this middleware. Embedding the ResponseWriter interface does not promote
 // Hijack (it is not part of http.ResponseWriter), so it must be forwarded.
+//
+// It must NOT emit any response header of its own (GO-26): the old
+// `WriteHeader(101)` wrote an unsolicited protocol-switch status BEFORE
+// delegating — duplicating/corrupting a WebSocket handshake the caller was
+// about to perform, and emitting wire output even when the underlying writer
+// does not support Hijack at all. Hijack is connection ownership, not a
+// response; the recorded status for logging stays the implicit 200 unless
+// the caller wrote one.
 func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	if !w.committed {
-		w.WriteHeader(http.StatusSwitchingProtocols)
-	}
 	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
 		return h.Hijack()
 	}

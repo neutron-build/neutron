@@ -2,6 +2,7 @@ package nucleus
 
 import (
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -259,4 +260,96 @@ func containsHelper(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// GO-30: migration inputs are copied and validated before any SQL runs —
+// the caller's slice is never mutated (it may be shared configuration), and
+// duplicate/nonpositive/empty versions are rejected up front instead of
+// mid-run after earlier migrations already executed.
+func TestPrepareMigrationsDoesNotMutateInput(t *testing.T) {
+	input := []Migration{
+		{Version: 3, Name: "c", Up: "SELECT 3"},
+		{Version: 1, Name: "a", Up: "SELECT 1"},
+		{Version: 2, Name: "b", Up: "SELECT 2"},
+	}
+	plan, err := prepareMigrations(input, false)
+	if err != nil {
+		t.Fatalf("prepareMigrations: %v", err)
+	}
+	if len(plan) != 3 || plan[0].Version != 1 || plan[2].Version != 3 {
+		t.Errorf("plan not sorted ascending: %+v", plan)
+	}
+	if input[0].Version != 3 || input[1].Version != 1 {
+		t.Errorf("caller's slice was mutated in place: %+v", input)
+	}
+
+	desc, err := prepareMigrations(input, true)
+	if err != nil {
+		t.Fatalf("prepareMigrations descending: %v", err)
+	}
+	if desc[0].Version != 3 || desc[2].Version != 1 {
+		t.Errorf("plan not sorted descending: %+v", desc)
+	}
+}
+
+func TestPrepareMigrationsRejectsBadPlans(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   []Migration
+		wantErr string
+	}{
+		{
+			name:    "duplicate versions",
+			input:   []Migration{{Version: 1, Name: "a", Up: "SELECT 1"}, {Version: 1, Name: "b", Up: "SELECT 1"}},
+			wantErr: "duplicate migration version 1",
+		},
+		{
+			name:    "nonpositive version",
+			input:   []Migration{{Version: 0, Name: "a", Up: "SELECT 1"}},
+			wantErr: "invalid migration version 0",
+		},
+		{
+			name:    "empty name",
+			input:   []Migration{{Version: 1, Name: "  ", Up: "SELECT 1"}},
+			wantErr: "empty name",
+		},
+		{
+			name:    "empty up sql",
+			input:   []Migration{{Version: 1, Name: "a", Up: "   "}},
+			wantErr: "empty Up SQL",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := prepareMigrations(tc.input, false)
+			if err == nil {
+				t.Fatalf("expected an error containing %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %v, want it to contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// GO-31: signed TEXT integers decode as text — the old all-digits test
+// misread a four-byte text like "-123" as a huge big-endian binary value.
+func TestScanIntSignedText(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want int
+	}{
+		{"42", 42},
+		{"-123", -123},
+		{"0", 0},
+		{"2147483647", 2147483647},
+	} {
+		got, err := scanInt([]byte(tc.raw))
+		if err != nil {
+			t.Fatalf("scanInt(%q): %v", tc.raw, err)
+		}
+		if got != tc.want {
+			t.Errorf("scanInt(%q) = %d, want %d", tc.raw, got, tc.want)
+		}
+	}
 }

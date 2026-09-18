@@ -1,9 +1,13 @@
 package neutron
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
+	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -450,5 +454,242 @@ func TestDefaultStackAllLayersInContractOrder(t *testing.T) {
 	}
 	if out := panicBuf.String(); !strings.Contains(out, "status=500") {
 		t.Errorf("panic: no request log line — Logger must run outside Recover: %q", out)
+	}
+}
+
+// GO-25: gzip finalization must not corrupt bypassed, empty, or flush-first
+// responses. The old writer closed an eagerly-created encoder
+// unconditionally, appending an empty gzip member to responses that were
+// never compressed (and carried no Content-Encoding).
+func TestGzipBypassedResponseIsByteForByteUnchanged(t *testing.T) {
+	handler := Compress(gzip.DefaultCompression)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-transform")
+		_, _ = w.Write([]byte("abc"))
+	}))
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Header.Set("Accept-Encoding", "gzip")
+	handler.ServeHTTP(w, r)
+
+	if enc := w.Header().Get("Content-Encoding"); enc != "" {
+		t.Errorf("no-transform response was encoded: %q", enc)
+	}
+	if got := w.Body.String(); got != "abc" {
+		t.Errorf("body = %q (%d bytes), want exactly \"abc\" — an empty gzip member was appended", got, w.Body.Len())
+	}
+}
+
+func TestGzipEmptyHandlerEmitsNothing(t *testing.T) {
+	handler := Compress(gzip.DefaultCompression)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Header.Set("Accept-Encoding", "gzip")
+	handler.ServeHTTP(w, r)
+
+	if enc := w.Header().Get("Content-Encoding"); enc != "" {
+		t.Errorf("empty response was encoded: %q", enc)
+	}
+	if w.Body.Len() != 0 {
+		t.Errorf("empty handler produced %d bytes of trailer-only gzip output", w.Body.Len())
+	}
+}
+
+// GO-25: a Flush before any Write must not push gzip bytes under an
+// unencoded implicit-200. With no Content-Type set there is nothing safe to
+// sniff from, so the response stays identity.
+func TestGzipFlushFirstWithoutContentTypeStaysIdentity(t *testing.T) {
+	handler := Compress(gzip.DefaultCompression)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f := w.(http.Flusher)
+		f.Flush()
+		_, _ = w.Write([]byte("abc"))
+	}))
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Header.Set("Accept-Encoding", "gzip")
+	handler.ServeHTTP(w, r)
+
+	if enc := w.Header().Get("Content-Encoding"); enc != "" {
+		t.Errorf("flush-first response was encoded with no Content-Type: %q", enc)
+	}
+	if got := w.Body.String(); got != "abc" {
+		t.Errorf("body = %q, want \"abc\"", got)
+	}
+}
+
+// GO-25: with a Content-Type declared, a flush-first response commits AS
+// gzip and the flushed stream decodes back to the original bytes.
+func TestGzipFlushFirstWithContentTypeCommitsAsGzip(t *testing.T) {
+	handler := Compress(gzip.DefaultCompression)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		_, _ = w.Write([]byte("data: one\n\n"))
+		f.Flush()
+		_, _ = w.Write([]byte("data: two\n\n"))
+	}))
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Header.Set("Accept-Encoding", "gzip")
+	handler.ServeHTTP(w, r)
+
+	if enc := w.Header().Get("Content-Encoding"); enc != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", enc)
+	}
+	zr, err := gzip.NewReader(w.Body)
+	if err != nil {
+		t.Fatalf("body is not a gzip stream: %v", err)
+	}
+	decoded, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("gzip decode: %v", err)
+	}
+	if got := string(decoded); got != "data: one\n\ndata: two\n\n" {
+		t.Errorf("decoded body = %q", got)
+	}
+}
+
+// GO-25: informational statuses are forwarded without finalizing
+// compression; the final body still lands in a well-formed gzip member.
+// Uses a real server: httptest's recorder (and net/http itself) refuse body
+// writes after a 1xx on the same writer, while a live connection treats the
+// 103 as an interim response and expects a final one after it.
+func TestGzipInformationalStatusDoesNotFinalize(t *testing.T) {
+	handler := Compress(gzip.DefaultCompression)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(103) // early-hint style interim response
+		_, _ = w.Write([]byte("payload"))
+	}))
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	req, _ := http.NewRequest("GET", server.URL, nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if enc := resp.Header.Get("Content-Encoding"); enc != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", enc)
+	}
+	zr, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		t.Fatalf("body is not a valid gzip stream: %v", err)
+	}
+	decoded, _ := io.ReadAll(zr)
+	if string(decoded) != "payload" {
+		t.Errorf("decoded body = %q", decoded)
+	}
+}
+
+// GO-25: a Write with no Content-Type sniffs the ORIGINAL bytes, so the
+// served media type describes the content, not the gzip magic.
+func TestGzipWriteWithoutContentTypeSniffsOriginalBytes(t *testing.T) {
+	handler := Compress(gzip.DefaultCompression)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("<html><body>hi</body></html>"))
+	}))
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Header.Set("Accept-Encoding", "gzip")
+	handler.ServeHTTP(w, r)
+
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("Content-Type = %q, want sniffed text/html", ct)
+	}
+	zr, err := gzip.NewReader(w.Body)
+	if err != nil {
+		t.Fatalf("body is not a gzip stream: %v", err)
+	}
+	decoded, _ := io.ReadAll(zr)
+	if string(decoded) != "<html><body>hi</body></html>" {
+		t.Errorf("decoded body = %q", decoded)
+	}
+}
+
+// GO-26: Hijack must never emit response state. The old statusWriter wrote
+// an unsolicited 101 BEFORE delegating — even when the underlying writer
+// did not support Hijack at all.
+func TestHijackEmitsNoResponseState(t *testing.T) {
+	// Unsupported underlying writer: must return an error with zero side
+	// effects.
+	rec := httptest.NewRecorder()
+	sw := &statusWriter{ResponseWriter: rec}
+	if _, _, err := sw.Hijack(); err == nil {
+		t.Fatal("unsupported Hijack must fail")
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("unsupported Hijack wrote status %d", rec.Code)
+	}
+	if len(rec.Header()) != 0 || rec.Body.Len() != 0 {
+		t.Errorf("unsupported Hijack produced output: headers=%v body=%q", rec.Header(), rec.Body.String())
+	}
+
+	// Supported underlying writer: delegation succeeds and STILL writes no
+	// header.
+	stub := &hijackableWriter{ResponseWriter: httptest.NewRecorder()}
+	sw2 := &statusWriter{ResponseWriter: stub}
+	conn, buf, err := sw2.Hijack()
+	if err != nil {
+		t.Fatalf("Hijack failed: %v", err)
+	}
+	defer conn.Close()
+	if buf == nil {
+		t.Error("Hijack returned no ReadWriter")
+	}
+	if stub.headerWrites != 0 {
+		t.Errorf("Hijack triggered %d WriteHeader calls on the underlying writer", stub.headerWrites)
+	}
+}
+
+// hijackableWriter is a ResponseWriter whose Hijack succeeds and counts
+// WriteHeader invocations.
+type hijackableWriter struct {
+	http.ResponseWriter
+	headerWrites int
+}
+
+func (h *hijackableWriter) WriteHeader(int) { h.headerWrites++ }
+
+func (h *hijackableWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	_, client := net.Pipe()
+	return client, bufio.NewReadWriter(bufio.NewReader(client), bufio.NewWriter(client)), nil
+}
+
+// GO-27: the bucket map has a hard live-key ceiling. Past capacity, NEW
+// identities are refused with 429 + Retry-After while EXISTING buckets keep
+// their state — the old limiter instead swept the whole map on every new
+// key and grew without bound when keys were all recent.
+func TestRateLimitHardBucketBound(t *testing.T) {
+	handler := RateLimit(1e9, 10)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	serve := func(remote string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = remote + ":1234"
+		handler.ServeHTTP(w, r)
+		return w
+	}
+
+	// Fill to capacity with distinct recent identities.
+	for i := 0; i < rateLimitMaxBuckets; i++ {
+		w := serve(fmt.Sprintf("10.0.%d.%d", i/256, i%256))
+		if w.Code != http.StatusOK {
+			t.Fatalf("fill request %d: status = %d", i, w.Code)
+		}
+	}
+
+	// One NEW identity at capacity: refused, with a retry hint.
+	w := serve("192.0.2.9")
+	if w.Code != http.StatusTooManyRequests {
+		t.Errorf("new identity at capacity: status = %d, want 429", w.Code)
+	}
+	if w.Header().Get("Retry-After") == "" {
+		t.Error("429 admission refusal lacks Retry-After")
+	}
+
+	// An EXISTING bucket keeps working (its tokens are intact).
+	w = serve("10.0.0.0")
+	if w.Code != http.StatusOK {
+		t.Errorf("existing bucket at capacity: status = %d, want 200", w.Code)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strconv"
 	"strings"
@@ -77,11 +78,11 @@ func Register[In, Out any](r *Router, method, pattern string, h HandlerFunc[In, 
 						return
 					}
 				case "application/x-www-form-urlencoded":
-					if err := req.ParseForm(); err != nil {
-						WriteError(w, req, ErrBadRequest("Invalid form data: "+err.Error()))
+					if err := decodeURLEncodedBody(w, req, maxFormBodyBytes); err != nil {
+						WriteError(w, req, formDecodeError(w, req, err))
 						return
 					}
-					if err := populateFromURLValues(rv, req.Form); err != nil {
+					if err := populateFromURLValues(rv, req.PostForm); err != nil {
 						WriteError(w, req, ErrBadRequest("Invalid form data: "+err.Error()))
 						return
 					}
@@ -202,6 +203,60 @@ func decodeOneJSON(r io.Reader, dst any) error {
 		return errors.New("trailing data after JSON value")
 	}
 	return nil
+}
+
+// Upper bound on a URL-encoded request body read for form binding (GO-28).
+const maxFormBodyBytes = 10 << 20 // 10 MiB, matching ParseMultipartForm's memory threshold scale
+
+// decodeURLEncodedBody reads and parses an `application/x-www-form-urlencoded`
+// BODY explicitly for every body-bearing method (GO-28): `Request.ParseForm`
+// only populates PostForm from the body for POST/PUT/PATCH — Go's net/http
+// ignores a DELETE body — so a typed DELETE handler silently received empty
+// form fields. The body is read through MaxBytesReader (overflow maps to 413,
+// not 400) and PostForm becomes the body-derived values; `form`-tagged fields
+// bind from the BODY, while `query` tags keep binding from the URL.
+func decodeURLEncodedBody(w http.ResponseWriter, r *http.Request, limit int64) error {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return err
+	}
+	values, err := url.ParseQuery(string(body))
+	if err != nil {
+		return err
+	}
+	r.PostForm = values
+	// Rebuild the combined r.Form with BODY values taking Get() precedence
+	// over query values (the same precedence ParseForm documents).
+	combined := make(url.Values, len(values))
+	for key, items := range values {
+		combined[key] = append([]string(nil), items...)
+	}
+	for key, items := range r.URL.Query() {
+		combined[key] = append(combined[key], items...)
+	}
+	r.Form = combined
+	return nil
+}
+
+// formDecodeError classifies a form-body decode failure (GO-28): a
+// MaxBytesReader overflow is a 413, everything else is a malformed 400.
+func formDecodeError(_ http.ResponseWriter, _ *http.Request, err error) *AppError {
+	var maxBytes *http.MaxBytesError
+	if errors.As(err, &maxBytes) {
+		return newAppError(
+			http.StatusRequestEntityTooLarge,
+			"payload-too-large",
+			"Payload Too Large",
+			"Form body exceeds the size limit",
+		)
+	}
+	return newAppError(
+		http.StatusBadRequest,
+		"bad-request",
+		"Invalid form data",
+		err.Error(),
+	)
 }
 
 // populateFromRequest fills struct fields from path, query, and header parameters.

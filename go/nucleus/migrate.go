@@ -5,10 +5,12 @@ import (
 	"embed"
 	"fmt"
 	"io/fs"
+	"math"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -51,18 +53,65 @@ CREATE TABLE IF NOT EXISTS _neutron_migrations (
     applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )`
 
+// migrationGate serializes migration runners within this process (GO-29):
+// Migrate/MigrateDown used to read applied versions OUTSIDE each migration
+// transaction, so two concurrent callers both saw a version absent, both
+// ran its Up SQL, then fought over the unique history INSERT
+// (consumer-observed SQLSTATE 23505) — with the migration work possibly
+// executed twice. Holding this gate across the WHOLE operation (history
+// read included) removes the in-process race; cross-process coordination
+// still requires running a single migration runner per database.
+var migrationGate sync.Mutex
+
+// prepareMigrations copies, sorts, and validates the migration plan before
+// any SQL runs (GO-30): Migrate/MigrateDown used to sort the CALLER's slice
+// in place (mutating shared configuration and racing concurrent reuse), and
+// duplicate or nonpositive versions were only discovered mid-run — after
+// earlier migrations had already executed.
+func prepareMigrations(input []Migration, descending bool) ([]Migration, error) {
+	result := make([]Migration, len(input))
+	copy(result, input)
+	sort.Slice(result, func(i, j int) bool {
+		if descending {
+			return result[i].Version > result[j].Version
+		}
+		return result[i].Version < result[j].Version
+	})
+	seen := make(map[int]struct{}, len(result))
+	for _, m := range result {
+		if m.Version <= 0 {
+			return nil, fmt.Errorf("nucleus: invalid migration version %d (must be positive)", m.Version)
+		}
+		if strings.TrimSpace(m.Name) == "" {
+			return nil, fmt.Errorf("nucleus: migration %d has an empty name", m.Version)
+		}
+		if strings.TrimSpace(m.Up) == "" {
+			return nil, fmt.Errorf("nucleus: migration %d (%s) has empty Up SQL", m.Version, m.Name)
+		}
+		if _, exists := seen[m.Version]; exists {
+			return nil, fmt.Errorf("nucleus: duplicate migration version %d", m.Version)
+		}
+		seen[m.Version] = struct{}{}
+	}
+	return result, nil
+}
+
 // Migrate runs all pending migrations in order.
 func (c *Client) Migrate(ctx context.Context, migrations []Migration) error {
+	migrationGate.Lock()
+	defer migrationGate.Unlock()
+
 	// Ensure migrations table exists
 	_, err := c.pool.Exec(ctx, migrationsTable)
 	if err != nil {
 		return fmt.Errorf("nucleus: create migrations table: %w", err)
 	}
 
-	// Sort migrations by version
-	sort.Slice(migrations, func(i, j int) bool {
-		return migrations[i].Version < migrations[j].Version
-	})
+	// Copy + validate the plan before executing anything (GO-30).
+	plan, err := prepareMigrations(migrations, false)
+	if err != nil {
+		return err
+	}
 
 	// Get applied versions
 	applied, err := c.appliedVersions(ctx)
@@ -70,7 +119,7 @@ func (c *Client) Migrate(ctx context.Context, migrations []Migration) error {
 		return err
 	}
 
-	for _, m := range migrations {
+	for _, m := range plan {
 		if applied[m.Version] {
 			continue
 		}
@@ -100,9 +149,13 @@ func (c *Client) Migrate(ctx context.Context, migrations []Migration) error {
 
 // MigrateDown rolls back the specified number of migrations.
 func (c *Client) MigrateDown(ctx context.Context, migrations []Migration, steps int) error {
-	sort.Slice(migrations, func(i, j int) bool {
-		return migrations[i].Version > migrations[j].Version // descending
-	})
+	migrationGate.Lock()
+	defer migrationGate.Unlock()
+
+	plan, err := prepareMigrations(migrations, true)
+	if err != nil {
+		return err
+	}
 
 	applied, err := c.appliedVersions(ctx)
 	if err != nil {
@@ -110,7 +163,7 @@ func (c *Client) MigrateDown(ctx context.Context, migrations []Migration, steps 
 	}
 
 	rolled := 0
-	for _, m := range migrations {
+	for _, m := range plan {
 		if rolled >= steps {
 			break
 		}
@@ -192,36 +245,66 @@ func (c *Client) appliedVersions(ctx context.Context) (map[int]bool, error) {
 	return applied, rows.Err()
 }
 
-// scanInt decodes an integer value from raw pgwire bytes. Nucleus declares text
-// format (code 0) in RowDescription but sends big-endian binary bytes for
-// INTEGER columns — pgx's text decoder then fails. We inspect the bytes: if all
-// are ASCII digits, treat as text; otherwise decode as big-endian int32/int64.
+// scanInt decodes an integer value from raw pgwire bytes. Nucleus declares
+// text format (code 0) in RowDescription but sends big-endian binary bytes
+// for INTEGER columns — pgx's text decoder then fails. We inspect the bytes:
+// anything that is valid textual integer syntax (optional leading '-', then
+// ASCII digits, fitting the platform int) decodes as text — including
+// NEGATIVE text like "-123", which the old all-digits test misread as a
+// 4-byte big-endian value near 1.7 billion (GO-31). Otherwise decode as
+// big-endian int32/int64 with a platform-int range check. Fully resolving
+// the text/binary ambiguity needs the engine to honor its declared wire
+// format; until then the reserved-autocommit note stands: migration
+// versions are validated positive before they are ever written.
 // Track as Nucleus finding #35.
 func scanInt(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, fmt.Errorf("empty value")
 	}
-	allDigits := true
-	for _, c := range b {
-		if c < '0' || c > '9' {
-			allDigits = false
-			break
-		}
-	}
-	if allDigits {
+	// Textual integer syntax first (GO-31): handles signed text and keeps
+	// digit-only binary bytes on their historical text interpretation.
+	if isTextualInt(b) {
 		n, err := strconv.ParseInt(string(b), 10, 64)
-		return int(n), err
+		if err != nil {
+			return 0, err
+		}
+		if n > math.MaxInt || n < math.MinInt {
+			return 0, fmt.Errorf("value %d overflows platform int", n)
+		}
+		return int(n), nil
 	}
 	switch len(b) {
 	case 4:
-		return int(int32(b[0])<<24 | int32(b[1])<<16 | int32(b[2])<<8 | int32(b[3])), nil
+		v := int32(b[0])<<24 | int32(b[1])<<16 | int32(b[2])<<8 | int32(b[3])
+		return int(v), nil
 	case 8:
 		v := int64(b[0])<<56 | int64(b[1])<<48 | int64(b[2])<<40 | int64(b[3])<<32 |
 			int64(b[4])<<24 | int64(b[5])<<16 | int64(b[6])<<8 | int64(b[7])
+		if v > math.MaxInt || v < math.MinInt {
+			return 0, fmt.Errorf("value %d overflows platform int", v)
+		}
 		return int(v), nil
 	default:
 		return 0, fmt.Errorf("unexpected %d-byte integer", len(b))
 	}
+}
+
+// isTextualInt reports whether b is `[+-]?[0-9]+` — the shape a text-format
+// integer takes on the wire.
+func isTextualInt(b []byte) bool {
+	digits := b
+	if len(b) > 0 && (b[0] == '-' || b[0] == '+') {
+		digits = b[1:]
+	}
+	if len(digits) == 0 {
+		return false
+	}
+	for _, c := range digits {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // LoadMigrations reads migration files from an embedded filesystem.
