@@ -940,6 +940,7 @@ impl Drop for AutoTxnGuard<'_> {
 /// savepoint was resurrected), collapsed identical duplicate rows into one
 /// via value-equality reinsertion, and logged nothing to the WAL (a
 /// rollback resurrected on replay once the outer transaction committed).
+#[derive(Clone)]
 pub(super) enum UndoOp {
     /// This transaction inserted the row at `vidx`.
     Insert { table: String, vidx: usize },
@@ -975,6 +976,11 @@ pub struct MvccSessionState {
     pub(super) savepoints: parking_lot::RwLock<Vec<SavepointState>>,
     /// Undo journal of this transaction's operations (NU-02).
     pub(super) undo_log: parking_lot::RwLock<Vec<UndoOp>>,
+    /// Set when a ROLLBACK TO SAVEPOINT failed partway (NU-03 round 2):
+    /// the transaction's in-memory state and WAL compensations have
+    /// diverged, so COMMIT and further savepoint work must refuse until the
+    /// whole transaction is rolled back (ROLLBACK clears it).
+    pub(super) doomed: std::sync::atomic::AtomicBool,
     /// Isolation level for the next BEGIN (set via SET TRANSACTION ISOLATION LEVEL).
     pub(super) next_isolation: parking_lot::RwLock<IsolationLevel>,
 }
@@ -992,6 +998,7 @@ impl MvccSessionState {
             dirty_tables: parking_lot::RwLock::new(std::collections::HashSet::new()),
             savepoints: parking_lot::RwLock::new(Vec::new()),
             undo_log: parking_lot::RwLock::new(Vec::new()),
+            doomed: std::sync::atomic::AtomicBool::new(false),
             next_isolation: parking_lot::RwLock::new(IsolationLevel::Snapshot),
         }
     }
@@ -1047,6 +1054,13 @@ pub struct MvccStorageAdapter {
     /// Staged S63 markers (session id → coordinating id), consumed by that
     /// session's `commit_txn`. See `set_pending_enlistment`.
     pending_enlistment: parking_lot::RwLock<HashMap<u64, u64>>,
+    /// NU-05 round 2: set when a commit's WAL append/fsync fails after the
+    /// decision bytes may have left the process. The commit's outcome is
+    /// INDETERMINATE (replay treats a surviving Commit record as decisive,
+    /// so the transaction may reappear after a crash) — every further write
+    /// through this WAL is fenced until recovery (reopen) runs.
+    #[cfg(feature = "server")]
+    recovery_required: std::sync::atomic::AtomicBool,
     /// Optional WAL for crash-safe durability.
     #[cfg(feature = "server")]
     wal: Option<Arc<MvccWal>>,
@@ -1143,6 +1157,8 @@ impl MvccStorageAdapter {
             committed_xacts: std::sync::Arc::new(std::collections::HashSet::new()),
             pending_enlistment: parking_lot::RwLock::new(HashMap::new()),
             #[cfg(feature = "server")]
+            recovery_required: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "server")]
             wal: None,
         }
     }
@@ -1198,6 +1214,7 @@ impl MvccStorageAdapter {
                 mutated_tables: parking_lot::RwLock::new(std::collections::HashSet::new()),
                 committed_xacts: std::sync::Arc::new(state.committed_xacts),
                 pending_enlistment: parking_lot::RwLock::new(HashMap::new()),
+                recovery_required: std::sync::atomic::AtomicBool::new(false),
                 wal: Some(Arc::new(wal)),
             },
             recovered_schemas,
@@ -1498,9 +1515,20 @@ impl MvccStorageAdapter {
     }
 
     /// Log a WAL record (no-op if WAL is disabled or server feature is off).
+    /// Fenced after an indeterminate commit (NU-05 round 2).
     #[cfg(feature = "server")]
     fn wal_log(&self, record: &MvccWalRecord) -> Result<(), StorageError> {
         if let Some(ref wal) = self.wal {
+            if self
+                .recovery_required
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(StorageError::Io(
+                    "WAL is fenced: a prior commit failed with an indeterminate outcome; \
+                     recovery (reopen) required before further writes"
+                        .into(),
+                ));
+            }
             wal.log(record)
                 .map_err(|e| StorageError::Io(format!("WAL write: {e}")))?;
         }
@@ -1510,11 +1538,37 @@ impl MvccStorageAdapter {
     /// Log a COMMIT and fsync (no-op if WAL is disabled or server feature is off).
     /// `xact` is the optional S63 coordinating-transaction id, marker-written
     /// under the same fsync as the COMMIT record.
+    ///
+    /// NU-05 round 2: a failure here is an INDETERMINATE commit, not a clean
+    /// abort. The Commit record (and its bytes) may already be durable —
+    /// replay treats a surviving Commit as decisive, so the transaction can
+    /// reappear after a crash even though the caller was told it failed and
+    /// the in-memory state was rolled back. The WAL is therefore fenced for
+    /// every subsequent write until recovery, and the error says so; no
+    /// Abort record is appended (it would contradict a possibly-durable
+    /// Commit and trip replay's contradiction check).
     #[cfg(feature = "server")]
     fn wal_log_commit(&self, txn_id: u64, xact: Option<u64>) -> Result<(), StorageError> {
         if let Some(ref wal) = self.wal {
-            wal.log_commit(txn_id, xact)
-                .map_err(|e| StorageError::Io(format!("WAL commit: {e}")))?;
+            if self
+                .recovery_required
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(StorageError::Io(
+                    "WAL is fenced: a prior commit failed with an indeterminate outcome; \
+                     recovery (reopen) required before further writes"
+                        .into(),
+                ));
+            }
+            if let Err(e) = wal.log_commit(txn_id, xact) {
+                self.recovery_required
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(StorageError::Io(format!(
+                    "commit outcome INDETERMINATE — WAL commit failed: {e}; \
+                     the transaction may or may not be durable; recovery (reopen) \
+                     is required before further writes"
+                )));
+            }
         }
         Ok(())
     }
@@ -1537,6 +1591,16 @@ impl MvccStorageAdapter {
     pub fn wal_sync(&self) -> Result<(), StorageError> {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal {
+            if self
+                .recovery_required
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(StorageError::Io(
+                    "WAL is fenced: a prior commit failed with an indeterminate outcome; \
+                     recovery (reopen) required before further writes"
+                        .into(),
+                ));
+            }
             wal.sync()
                 .map_err(|e| StorageError::Io(format!("WAL sync: {e}")))?;
         }
@@ -1605,6 +1669,13 @@ impl MvccStorageAdapter {
 
     /// Undo one of this transaction's deletes: clear the tombstone and log
     /// the compensating Insert (keyed by the same version index).
+    ///
+    /// The tombstone is cleared even when the row was CREATED earlier in
+    /// this same transaction (NU-02 round 2): BEGIN; INSERT; SAVEPOINT;
+    /// DELETE; ROLLBACK TO must restore the inserted row, but the old
+    /// `created_by != txn_id` guard left the tombstone in place and silently
+    /// dropped it. Ownership is still checked via the observed `deleted_by`
+    /// value, so a marker not owned by this transaction is never touched.
     fn undo_own_delete(
         &self,
         table: &str,
@@ -1616,11 +1687,21 @@ impl MvccStorageAdapter {
             let rows = tbl.rows.read();
             if let Some(mvcc_row) = rows.get(vidx) {
                 let current = mvcc_row.version.deleted_by.load(Ordering::Acquire);
-                if current == txn_id && mvcc_row.version.created_by != txn_id {
+                if current == txn_id {
                     mvcc_row
                         .version
                         .deleted_by
-                        .store(super::txn::TXN_INVALID, Ordering::Release);
+                        .compare_exchange(
+                            txn_id,
+                            super::txn::TXN_INVALID,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .map_err(|_| {
+                            StorageError::Io(
+                                "savepoint undo ownership changed mid-rollback".into(),
+                            )
+                        })?;
                 }
             }
         }
@@ -1648,13 +1729,24 @@ impl MvccStorageAdapter {
     ) -> Result<(), StorageError> {
         if let Ok(tbl) = self.engine.get_table(table) {
             let rows = tbl.rows.read();
+            // Restore the old version's visibility even when it was created
+            // earlier in this same transaction (NU-02 round 2) — same rule
+            // as `undo_own_delete`. Ownership is proven by the observed
+            // `deleted_by` value, not by who created the row.
             if let Some(old) = rows.get(old_vidx)
                 && old.version.deleted_by.load(Ordering::Acquire) == txn_id
-                && old.version.created_by != txn_id
             {
                 old.version
                     .deleted_by
-                    .store(super::txn::TXN_INVALID, Ordering::Release);
+                    .compare_exchange(
+                        txn_id,
+                        super::txn::TXN_INVALID,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .map_err(|_| {
+                        StorageError::Io("savepoint undo ownership changed mid-rollback".into())
+                    })?;
             }
             if let Some(new) = rows.get(new_vidx)
                 && new.version.created_by == txn_id
@@ -1691,18 +1783,24 @@ impl MvccStorageAdapter {
     /// Resolve cached index candidates to snapshot-visible rows (NU-14).
     ///
     /// `idx.map` entries are keyed by stable version index, so each candidate
-    /// is re-read from `tbl.rows` and visibility-checked under a fresh
-    /// snapshot — the cached copy itself is never trusted. Dead slots (empty
-    /// data after GC), invisible versions, and value drift are all filtered.
-    /// Lock order matches every other index path (indexes guard held, then
-    /// table locks); a concurrent rebuild's `indexes.write` simply waits for
-    /// the shared read guard, and nothing below takes an indexes guard.
+    /// is re-read from `tbl.rows` and visibility-checked — the cached copy
+    /// itself is never trusted. Dead slots (empty data after GC), invisible
+    /// versions, and value drift are all filtered. Lock order matches every
+    /// other index path (indexes guard held, then table locks); a concurrent
+    /// rebuild's `indexes.write` simply waits for the shared read guard, and
+    /// nothing below takes an indexes guard.
+    ///
+    /// The snapshot is supplied by the CALLER, whose observer transaction
+    /// must stay registered for the whole index scan (NU-22 round 2): this
+    /// helper used to begin an observer, clone its snapshot, and abort it
+    /// BEFORE evaluating visibility — a concurrent vacuum could then reclaim
+    /// versions the detached snapshot still needed, and range scans that
+    /// called it per key mixed different snapshots inside one logical scan.
     fn resolve_index_entries(
         &self,
         table: &str,
-        _col_idx: usize,
-        _value: &Value,
         entries: &HashMap<usize, Row>,
+        snapshot: &super::txn::Snapshot,
     ) -> Vec<Row> {
         let candidates: Vec<usize> = entries.keys().copied().collect();
         let tbl = {
@@ -1712,22 +1810,31 @@ impl MvccStorageAdapter {
                 None => return Vec::new(),
             }
         };
-        // Fresh snapshot for the visibility decision.
-        let Ok(mut observer) = self.engine.txn_mgr().try_begin(IsolationLevel::Snapshot) else {
-            return Vec::new();
-        };
-        let snap = observer.snapshot.clone();
-        self.engine.txn_mgr().abort(&mut observer);
         let rows = tbl.rows.read();
         let mut out = Vec::with_capacity(candidates.len());
         for vidx in candidates {
             if let Some(r) = rows.get(vidx)
-                && r.version.is_visible(&snap, self.engine.txn_mgr())
+                && r.version.is_visible(snapshot, self.engine.txn_mgr())
             {
                 out.push((*r.data).clone());
             }
         }
         out
+    }
+
+    /// Begin ONE observer for an autocommit index scan and return
+    /// `(transaction, snapshot)` (NU-22 round 2). The caller keeps the
+    /// observer alive until every candidate is materialized, then aborts it.
+    fn index_scan_observer(
+        &self,
+    ) -> Option<(super::txn::Transaction, super::txn::Snapshot)> {
+        let observer = self
+            .engine
+            .txn_mgr()
+            .try_begin(IsolationLevel::Snapshot)
+            .ok()?;
+        let snap = observer.snapshot.clone();
+        Some((observer, snap))
     }
 
     /// O(1) index-based point lookup: check if any index on this table covers
@@ -2976,6 +3083,31 @@ impl StorageEngine for MvccStorageAdapter {
 
     async fn commit_txn(&self) -> Result<(), StorageError> {
         let sess = self.mvcc_session();
+        // NU-03 round 2: a transaction whose savepoint rollback failed
+        // partway has in-memory state and WAL compensations diverging; a
+        // COMMIT could publish a partial rollback. Refuse — the caller must
+        // ROLLBACK the whole transaction.
+        if sess
+            .doomed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(StorageError::Io(
+                "transaction requires rollback: a savepoint rollback failed".into(),
+            ));
+        }
+        // NU-05 round 2: after an indeterminate commit decision, no further
+        // write through this WAL may be accepted until recovery reopens it.
+        #[cfg(feature = "server")]
+        if self
+            .recovery_required
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(StorageError::Io(
+                "WAL is fenced: a prior commit failed with an indeterminate outcome; \
+                 recovery (reopen) required before further writes"
+                    .into(),
+            ));
+        }
         // Take the transaction out of the session first: whatever happens
         // below, the session must not keep a stale transaction a later BEGIN
         // would silently reuse.
@@ -2993,8 +3125,11 @@ impl StorageEngine for MvccStorageAdapter {
         // then returned an error after the data was already visible, and
         // another transaction could commit dependent work on top of a
         // decision that was never durable. Now: validate, durably decide,
-        // THEN publish. A WAL failure aborts cleanly — nothing was ever
-        // visible, so there is no ambiguous outcome to unwind.
+        // THEN publish. A WAL failure here is INDETERMINATE (round 2): the
+        // Commit bytes may be durable, so `wal_log_commit` fences the WAL
+        // and the error says the outcome is unknown; in-memory state is
+        // still aborted below (memory is not authoritative post-crash), but
+        // no further write is admitted until recovery.
         //
         // The S63 marker is taken BEFORE the commit record so it rides the
         // same fsync (taken, not peeked, so a failed commit cannot leak it
@@ -3033,10 +3168,12 @@ impl StorageEngine for MvccStorageAdapter {
         };
 
         if let Err(e) = commit_result {
-            // Nothing was published: the transaction can be rolled back
-            // cleanly. (For a serialization failure `check_*` did not abort;
-            // for a WAL failure the commit never happened — either way the
-            // in-memory txn is still active, so abort it here.)
+            // In-memory state is not authoritative for a WAL failure (the
+            // Commit may be durable — see NU-05 round 2): abort it locally,
+            // but the WAL fence set by `wal_log_commit` refuses every
+            // further write until recovery, and the indeterminate error has
+            // already reached the caller. A serialization failure is a
+            // definite abort (nothing was written).
             if self.engine.txn_mgr().get_status(commit_txn_id) == super::txn::TxnStatus::Active
             {
                 self.engine.release_unique(commit_txn_id);
@@ -3112,11 +3249,25 @@ impl StorageEngine for MvccStorageAdapter {
         sess.dirty_tables.write().clear();
         sess.savepoints.write().clear();
         sess.undo_log.write().clear();
+        // A full ROLLBACK is the sanctioned exit from a doomed transaction
+        // (NU-03 round 2): the whole transaction's effects are discarded, so
+        // the session may start fresh.
+        sess.doomed
+            .store(false, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
     async fn savepoint(&self, name: &str) -> Result<(), StorageError> {
         let sess = self.mvcc_session();
+        if sess
+            .doomed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(StorageError::Io(
+                "transaction is doomed by a failed savepoint rollback; ROLLBACK required"
+                    .into(),
+            ));
+        }
         // A savepoint is a MARK into the transaction's undo journal
         // (NU-02): O(1) to take, precise to roll back to. The previous
         // implementation snapshotted every table's visible rows — O(database)
@@ -3141,6 +3292,15 @@ impl StorageEngine for MvccStorageAdapter {
         // Roll back the journal AFTER the mark, in reverse. Nested savepoints
         // established after this one are discarded; the target stays live
         // (Postgres semantics — it can be rolled back to again).
+        if sess
+            .doomed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(StorageError::Io(
+                "transaction is doomed by a failed savepoint rollback; ROLLBACK required"
+                    .into(),
+            ));
+        }
         let (offset, truncate_to) = {
             let mut sps = sess.savepoints.write();
             let pos = sps
@@ -3167,29 +3327,41 @@ impl StorageEngine for MvccStorageAdapter {
         // commits, and the rolled-back operations stay rolled back after a
         // restart. (Formats unchanged — Insert/Delete/Update records already
         // express everything the undo needs.)
+        //
+        // The journal tail is CLONED, not split off (NU-03 round 2): the old
+        // split_off discarded every remaining undo entry the moment the
+        // rollback started, so a compensation WAL failure midway left a
+        // half-rolled-back transaction that could still COMMIT — partial
+        // rollback, diverging live state from recovery. Now the tail is only
+        // truncated after every undo applied cleanly; on failure the
+        // transaction is doomed (see `doomed`) and must be rolled back
+        // entirely.
         let undone: Vec<UndoOp> = {
-            let mut journal = sess.undo_log.write();
-            let tail = journal.split_off(offset);
-            tail.into_iter().rev().collect()
+            let journal = sess.undo_log.read();
+            journal[offset..].to_vec()
         };
-        for op in undone {
-            match op {
+        for op in undone.iter().rev() {
+            let outcome = match op {
                 UndoOp::Insert { table, vidx } => {
-                    self.undo_own_insert(&table, vidx, txn_id)?;
+                    self.undo_own_insert(table, *vidx, txn_id)
                 }
                 UndoOp::DeleteMark { table, vidx, row } => {
-                    self.undo_own_delete(&table, vidx, row, txn_id)?;
+                    self.undo_own_delete(table, *vidx, row.clone(), txn_id)
                 }
                 UndoOp::Update {
                     table,
                     old_vidx,
                     new_vidx,
                     old_row,
-                } => {
-                    self.undo_own_update(&table, old_vidx, new_vidx, old_row, txn_id)?;
-                }
+                } => self.undo_own_update(table, *old_vidx, *new_vidx, old_row.clone(), txn_id),
+            };
+            if let Err(error) = outcome {
+                sess.doomed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(error);
             }
         }
+        sess.undo_log.write().truncate(offset);
         Ok(())
     }
 
@@ -3200,6 +3372,15 @@ impl StorageEngine for MvccStorageAdapter {
     /// for unknown names.
     async fn release_savepoint(&self, name: &str) -> Result<(), StorageError> {
         let sess = self.mvcc_session();
+        if sess
+            .doomed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(StorageError::Io(
+                "transaction is doomed by a failed savepoint rollback; ROLLBACK required"
+                    .into(),
+            ));
+        }
         if sess.session_txn.read().is_none() {
             return Err(StorageError::NoActiveTransaction);
         }
@@ -3272,11 +3453,14 @@ impl StorageEngine for MvccStorageAdapter {
                 .try_begin(IsolationLevel::Snapshot)
                 .map_err(|_| StorageError::TransactionIdExhausted)?;
             let snap = read_txn.snapshot.clone();
-            let results = self
-                .engine
-                .scan_versions_with_visibility(table, &snap)
-                .map_err(|e| StorageError::TableNotFound(e.to_string()))?;
+            // Abort the observer BEFORE propagating a scan failure (NU-06
+            // round 2): the `?` used to return with the observer still
+            // registered — a missing/dropped table then leaked an ACTIVE
+            // transaction that pinned the GC horizon forever.
+            let scanned = self.engine.scan_versions_with_visibility(table, &snap);
             self.engine.txn_mgr().abort(&mut read_txn);
+            let results =
+                scanned.map_err(|e| StorageError::TableNotFound(e.to_string()))?;
             let mut map: std::collections::BTreeMap<Value, HashMap<usize, Row>> =
                 std::collections::BTreeMap::new();
             let mut version_map: HashMap<Value, Vec<usize>> = HashMap::new();
@@ -3378,16 +3562,24 @@ impl StorageEngine for MvccStorageAdapter {
         let Some(entries) = idx.map.get(value) else {
             return Ok(Some(Vec::new()));
         };
-        // Autocommit readers resolve every cached candidate through a fresh
-        // snapshot (NU-14): `idx.map` is a candidate store, not a row
-        // authority. An implicit writer publishes its index entry BEFORE its
-        // transaction commits (see insert_unique), so trusting the cached
-        // copy exposed uncommitted rows in that window; resolving
-        // `version_idx → tbl.rows` with a visibility check closes it and
-        // also repairs stale copies after concurrent updates.
-        Ok(Some(
-            self.resolve_index_entries(table, idx.col_idx, value, entries),
-        ))
+        // Autocommit readers resolve every cached candidate through ONE
+        // snapshot held for the whole lookup (NU-14/NU-22 round 2):
+        // `idx.map` is a candidate store, not a row authority. An implicit
+        // writer publishes its index entry BEFORE its transaction commits
+        // (see insert_unique), so trusting the cached copy exposed
+        // uncommitted rows in that window; resolving `version_idx →
+        // tbl.rows` with a visibility check closes it and also repairs
+        // stale copies after concurrent updates. The observer stays
+        // registered until the rows are materialized (a detached snapshot
+        // lets vacuum reclaim versions it still needs), and an observer
+        // allocation failure DECLINES the optimization (None) rather than
+        // reporting a false empty result.
+        let Some((mut observer, snap)) = self.index_scan_observer() else {
+            return Ok(None);
+        };
+        let resolved = self.resolve_index_entries(table, entries, &snap);
+        self.engine.txn_mgr().abort(&mut observer);
+        Ok(Some(resolved))
     }
 
     fn index_lookup_range_sync(
@@ -3421,11 +3613,18 @@ impl StorageEngine for MvccStorageAdapter {
             return Ok(Some(Vec::new()));
         }
         // Use BTreeMap::range for O(log N + k), then resolve every candidate
-        // through a fresh snapshot (NU-14 — see index_lookup_sync).
+        // through ONE snapshot held for the whole range scan (NU-14/NU-22
+        // round 2 — per-key observers mixed snapshots inside one logical
+        // scan, and detaching a snapshot before use let vacuum reclaim
+        // versions it still needed).
+        let Some((mut observer, snap)) = self.index_scan_observer() else {
+            return Ok(None);
+        };
         let mut resolved = Vec::new();
-        for (key, entries) in idx.map.range((low, high)) {
-            resolved.extend(self.resolve_index_entries(table, idx.col_idx, key, entries));
+        for (_key, entries) in idx.map.range((low, high)) {
+            resolved.extend(self.resolve_index_entries(table, entries, &snap));
         }
+        self.engine.txn_mgr().abort(&mut observer);
         Ok(Some(resolved))
     }
 
@@ -3450,38 +3649,49 @@ impl StorageEngine for MvccStorageAdapter {
         }
         let indexes = self.indexes.read();
         let idx = indexes.get(index_name)?;
-        // Candidates are resolved through a fresh snapshot (NU-14) so dead or
-        // not-yet-committed versions do not contribute key rows.
-        if let Some(val) = eq_value {
-            let entries = idx.map.get(val)?;
-            let rows = self.resolve_index_entries(table, idx.col_idx, val, entries);
-            Some(rows.into_iter().map(|_| vec![val.clone()]).collect())
+        // Candidates are resolved through ONE snapshot held for the whole
+        // index-only scan (NU-14/NU-22 round 2) so dead or not-yet-committed
+        // versions do not contribute key rows; observer allocation failure
+        // declines the optimization instead of returning a false empty set.
+        let (mut observer, snap) = self.index_scan_observer()?;
+        let resolved_rows = if let Some(val) = eq_value {
+            let Some(entries) = idx.map.get(val) else {
+                // Untracked key: decline (the caller's scan decides), same
+                // as before — the map is not an authority for absence.
+                self.engine.txn_mgr().abort(&mut observer);
+                return None;
+            };
+            let rows = self.resolve_index_entries(table, entries, &snap);
+            rows.into_iter().map(|_| vec![val.clone()]).collect()
         } else if let Some((low, high)) = range {
             // Empty/reversed range — BTreeMap::range would panic.
             if crate::storage::range_cannot_match(
                 std::ops::Bound::Included(low),
                 std::ops::Bound::Included(high),
             ) {
+                self.engine.txn_mgr().abort(&mut observer);
                 return Some(Vec::new());
             }
             let mut rows = Vec::new();
             for (key, entries) in idx.map.range(low..=high) {
-                let resolved = self.resolve_index_entries(table, idx.col_idx, key, entries);
+                let resolved = self.resolve_index_entries(table, entries, &snap);
                 for _ in resolved {
                     rows.push(vec![key.clone()]);
                 }
             }
-            Some(rows)
+            rows
         } else {
             let mut rows = Vec::new();
             for (key, entries) in &idx.map {
-                let resolved = self.resolve_index_entries(table, idx.col_idx, key, entries);
+                let resolved = self.resolve_index_entries(table, entries, &snap);
                 for _ in resolved {
                     rows.push(vec![key.clone()]);
                 }
             }
-            Some(rows)
-        }
+            rows
+        };
+        self.engine.txn_mgr().abort(&mut observer);
+        Some(resolved_rows)
     }
 
 
@@ -4323,6 +4533,97 @@ mod tests {
         let rows = adapter.scan("t").await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], adapter_row(&[1]));
+    }
+
+    /// NU-02 round 2: a row CREATED earlier in the same transaction must be
+    /// restored by ROLLBACK TO SAVEPOINT after a post-savepoint DELETE. The
+    /// old undo kept the tombstone whenever `created_by == txn_id`, silently
+    /// dropping the row (and diverging from its own WAL compensations).
+    #[tokio::test]
+    async fn savepoint_rollback_restores_own_created_row_after_delete() {
+        let adapter = MvccStorageAdapter::new();
+        adapter.create_table("t").await.unwrap();
+
+        adapter.begin_txn().await.unwrap();
+        adapter.insert("t", adapter_row(&[1])).await.unwrap();
+        adapter.savepoint("sp").await.unwrap();
+        adapter.delete("t", &[0]).await.unwrap();
+        assert_eq!(adapter.scan("t").await.unwrap().len(), 0);
+
+        adapter.rollback_to_savepoint("sp").await.unwrap();
+        let rows = adapter.scan("t").await.unwrap();
+        assert_eq!(rows.len(), 1, "own-created row must survive ROLLBACK TO");
+        assert_eq!(rows[0], adapter_row(&[1]));
+
+        // And the outer COMMIT must keep it.
+        adapter.commit_txn().await.unwrap();
+        assert_eq!(adapter.scan("t").await.unwrap().len(), 1);
+    }
+
+    /// NU-02 round 2, update flavor: same-transaction insert + post-savepoint
+    /// update must restore the ORIGINAL row version on ROLLBACK TO.
+    #[tokio::test]
+    async fn savepoint_rollback_restores_own_created_row_after_update() {
+        let adapter = MvccStorageAdapter::new();
+        adapter.create_table("t").await.unwrap();
+
+        adapter.begin_txn().await.unwrap();
+        adapter.insert("t", adapter_row(&[1])).await.unwrap();
+        adapter.savepoint("sp").await.unwrap();
+        adapter
+            .update("t", &[(0, adapter_row(&[99]))])
+            .await
+            .unwrap();
+        assert_eq!(adapter.scan("t").await.unwrap().len(), 1);
+
+        adapter.rollback_to_savepoint("sp").await.unwrap();
+        let rows = adapter.scan("t").await.unwrap();
+        assert_eq!(rows.len(), 1, "updated-away own row must be restored");
+        assert_eq!(rows[0], adapter_row(&[1]), "original value must be back");
+
+        adapter.commit_txn().await.unwrap();
+        let rows = adapter.scan("t").await.unwrap();
+        assert_eq!(rows, vec![adapter_row(&[1])]);
+    }
+
+    /// NU-03 round 2: a savepoint rollback that fails partway must doom the
+    /// transaction — COMMIT refuses, further savepoint work refuses, and
+    /// only a full ROLLBACK clears the state. The WAL-failure trigger needs
+    /// the server feature's fault injection; this pins the state-machine
+    /// half of the contract (the journal tail itself is no longer split off
+    /// before the undos apply, so recovery of the remaining entries stays
+    /// possible).
+    #[tokio::test]
+    async fn failed_savepoint_rollback_dooms_the_transaction() {
+        let adapter = MvccStorageAdapter::new();
+        adapter.create_table("t").await.unwrap();
+
+        adapter.begin_txn().await.unwrap();
+        adapter.insert("t", adapter_row(&[1])).await.unwrap();
+        adapter.savepoint("sp").await.unwrap();
+        adapter.insert("t", adapter_row(&[2])).await.unwrap();
+
+        let sess = adapter.mvcc_session();
+        sess.doomed.store(true, std::sync::atomic::Ordering::Release);
+
+        let commit = adapter.commit_txn().await;
+        assert!(commit.is_err(), "doomed transaction must not commit");
+        let sp = adapter.savepoint("sp2").await;
+        assert!(sp.is_err(), "doomed transaction must refuse new savepoints");
+        let rbsp = adapter.rollback_to_savepoint("sp").await;
+        assert!(rbsp.is_err(), "doomed transaction must refuse ROLLBACK TO");
+
+        // Full ROLLBACK is the sanctioned exit and clears the doom.
+        adapter.abort_txn().await.unwrap();
+        assert!(!sess
+            .doomed
+            .load(std::sync::atomic::Ordering::Acquire));
+
+        // The session works again afterwards.
+        adapter.begin_txn().await.unwrap();
+        adapter.insert("t", adapter_row(&[5])).await.unwrap();
+        adapter.commit_txn().await.unwrap();
+        assert_eq!(adapter.scan("t").await.unwrap().len(), 1);
     }
 
     #[tokio::test]

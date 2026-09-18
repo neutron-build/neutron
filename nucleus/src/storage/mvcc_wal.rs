@@ -126,10 +126,31 @@ pub struct MvccWal {
     sync: crate::storage::wal_util::WalSync,
 }
 
-/// Write one length-prefixed, CRC-suffixed record onto any writer. Shares the
-/// exact framing `MvccWal::log` uses so a staged file replays identically.
-fn write_framed<W: Write>(w: &mut W, record: &MvccWalRecord) -> io::Result<()> {
+/// Encode a record and enforce the framing contract BEFORE any byte is
+/// written (NU-21): replay rejects payloads above `MAX_PAYLOAD`, so the
+/// writer must not accept a record its own replay would refuse — an
+/// oversized append used to succeed and poison every subsequent open.
+fn encode_checked(record: &MvccWalRecord) -> io::Result<Vec<u8>> {
     let payload = encode_record(record);
+    if payload.is_empty() || payload.len() > MAX_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "WAL payload of {} bytes exceeds the {}-byte replay limit",
+                payload.len(),
+                MAX_PAYLOAD
+            ),
+        ));
+    }
+    Ok(payload)
+}
+
+/// Write one length-prefixed, CRC-suffixed record onto any writer. Shares
+/// the exact framing `MvccWal::log` uses so a staged file replays
+/// identically. Both paths share `encode_checked`, so an appender and
+/// compaction can never diverge on the size contract (NU-21).
+fn write_framed<W: Write>(w: &mut W, record: &MvccWalRecord) -> io::Result<()> {
+    let payload = encode_checked(record)?;
     let crc = crc32c(&payload);
     w.write_all(&(payload.len() as u32).to_le_bytes())?;
     w.write_all(&payload)?;
@@ -189,9 +210,11 @@ impl MvccWal {
 
     /// Log a record and flush to OS buffer.
     pub fn log(&self, record: &MvccWalRecord) -> io::Result<()> {
-        let payload = encode_record(record);
+        // Size-check before the first byte goes out (NU-21): an accepted
+        // record that replay rejects would brick every later open.
+        let payload = encode_checked(record)?;
         let crc = crc32c(&payload);
-        let len = payload.len() as u32;
+        let len = payload.len() as u32; // bounded by MAX_PAYLOAD check above
         let mut w = self.writer.lock();
         crate::storage::crashpoint::io_fault_check!("wal.append");
         crate::storage::crashpoint::reach("wal.before_append");
@@ -629,17 +652,51 @@ fn finish_replay(
     records: Vec<MvccWalRecord>,
     stop: ReplayStop,
 ) -> Result<(MvccWalState, ReplayStop), String> {
-    // Identify committed transactions
-    let mut committed: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let mut aborted: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // Identify committed transactions, validating the decision log (NU-23):
+    // a transaction with BOTH a Commit and an Abort record is corrupt input
+    // (a writer/retry bug — replay used to silently treat it as committed),
+    // and a terminal record for the reserved autocommit id 0 contradicts the
+    // implicit-autocommit contract. Identical duplicate markers stay
+    // idempotent. Contradictions fail recovery with the offending id; the
+    // file is left untouched for diagnosis, like every other corruption.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Decision {
+        Commit,
+        Abort,
+    }
+    fn record_decision(
+        decisions: &mut std::collections::HashMap<u64, Decision>,
+        txn_id: u64,
+        next: Decision,
+    ) -> Result<(), String> {
+        if txn_id == 0 {
+            return Err(format!(
+                "MVCC WAL corruption: terminal {:?} record for reserved autocommit id 0",
+                next
+            ));
+        }
+        match decisions.get(&txn_id) {
+            Some(&previous) if previous != next => Err(format!(
+                "MVCC WAL corruption: conflicting terminal decisions for txn {txn_id} \
+                 ({previous:?} then {next:?})"
+            )),
+            Some(_) => Ok(()), // identical duplicate marker: idempotent
+            None => {
+                decisions.insert(txn_id, next);
+                Ok(())
+            }
+        }
+    }
+    let mut decisions: std::collections::HashMap<u64, Decision> =
+        std::collections::HashMap::new();
     let mut committed_xacts: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for rec in &records {
         match rec {
             MvccWalRecord::Commit { txn_id } => {
-                committed.insert(*txn_id);
+                record_decision(&mut decisions, *txn_id, Decision::Commit)?;
             }
             MvccWalRecord::Abort { txn_id } => {
-                aborted.insert(*txn_id);
+                record_decision(&mut decisions, *txn_id, Decision::Abort)?;
             }
             MvccWalRecord::XactCommit { xact } => {
                 committed_xacts.insert(*xact);
@@ -647,11 +704,13 @@ fn finish_replay(
             _ => {}
         }
     }
-    // (aborted is intentionally consulted via `committed` semantics below:
-    // a txn with both records is corrupt input, but replay has historically
-    // treated Commit as decisive; keep that order and keep the set for
-    // future use.)
-    let _ = &aborted;
+    let committed: std::collections::HashSet<u64> = decisions
+        .into_iter()
+        .filter_map(|(txn_id, decision)| match decision {
+            Decision::Commit => Some(txn_id),
+            Decision::Abort => None,
+        })
+        .collect();
 
     // Replay committed operations (and auto-commits where txn_id=0).
     // Rows are keyed by the engine's stable per-row VERSION INDEX, so DELETE and
@@ -1059,6 +1118,103 @@ mod tests {
 
         let (_wal2, state) = MvccWal::open(dir.path()).unwrap();
         assert!(!state.tables.contains_key("temp"));
+    }
+
+    /// NU-21: the writer must refuse a record its own replay would reject
+    /// as oversized, before writing a single byte — an accepted append that
+    /// bricks every later open is a writer/replay contract mismatch.
+    #[test]
+    fn oversized_record_is_rejected_and_leaves_file_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = MvccWal::open(dir.path()).unwrap();
+        wal.log(&MvccWalRecord::CreateTable {
+            name: "t".into(),
+            columns: vec![("x".into(), DataType::Bytea)],
+        })
+        .unwrap();
+        wal.sync().unwrap();
+        let before = std::fs::read(dir.path().join("mvcc.wal")).unwrap();
+
+        let oversized = MvccWalRecord::Insert {
+            table: "t".into(),
+            txn_id: 0,
+            version_idx: 0,
+            row: vec![Value::Bytea(vec![0u8; MAX_PAYLOAD + 1])],
+        };
+        let err = wal.log(&oversized).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        // Rejected before the first byte: the file is byte-for-byte intact
+        // and still opens cleanly.
+        assert_eq!(std::fs::read(dir.path().join("mvcc.wal")).unwrap(), before);
+        drop(wal);
+        let (_wal2, state) = MvccWal::open(dir.path()).unwrap();
+        assert_eq!(state.tables.get("t").map(|t| t.rows.len()), Some(0));
+    }
+
+    /// NU-23: a transaction carrying BOTH Commit and Abort records is
+    /// contradictory input; recovery must fail closed instead of silently
+    /// treating the transaction as committed.
+    #[test]
+    fn contradictory_commit_and_abort_fails_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = MvccWal::open(dir.path()).unwrap();
+            wal.log(&MvccWalRecord::CreateTable {
+                name: "t".into(),
+                columns: vec![("x".into(), DataType::Int32)],
+            })
+            .unwrap();
+            wal.log(&MvccWalRecord::Begin { txn_id: 1 }).unwrap();
+            wal.log(&MvccWalRecord::Insert {
+                table: "t".into(),
+                txn_id: 1,
+                version_idx: 0,
+                row: vec![Value::Int32(7)],
+            })
+            .unwrap();
+            wal.log(&MvccWalRecord::Commit { txn_id: 1 }).unwrap();
+            // Written directly (not via log_commit): the contradictory
+            // terminal marker a buggy writer/retry sequence would emit.
+            wal.log(&MvccWalRecord::Abort { txn_id: 1 }).unwrap();
+            drop(wal);
+        }
+        let result = MvccWal::open(dir.path());
+        match result {
+            Err(err) => assert!(
+                err.to_string().contains("conflicting terminal decisions"),
+                "error must name the contradiction: {err}"
+            ),
+            Ok(_) => panic!("contradictory terminal records were accepted"),
+        }
+    }
+
+    /// NU-23: identical duplicate terminal markers stay idempotent — the
+    /// same Commit record twice is a benign retry, not corruption.
+    #[test]
+    fn duplicate_identical_commit_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = MvccWal::open(dir.path()).unwrap();
+            wal.log(&MvccWalRecord::CreateTable {
+                name: "t".into(),
+                columns: vec![("x".into(), DataType::Int32)],
+            })
+            .unwrap();
+            wal.log(&MvccWalRecord::Begin { txn_id: 1 }).unwrap();
+            wal.log(&MvccWalRecord::Insert {
+                table: "t".into(),
+                txn_id: 1,
+                version_idx: 0,
+                row: vec![Value::Int32(7)],
+            })
+            .unwrap();
+            wal.log(&MvccWalRecord::Commit { txn_id: 1 }).unwrap();
+            wal.log(&MvccWalRecord::Commit { txn_id: 1 }).unwrap();
+            drop(wal);
+        }
+        let (_wal2, state) = MvccWal::open(dir.path()).unwrap();
+        assert_eq!(state.tables.get("t").map(|t| t.rows.len()), Some(1));
     }
 }
 
