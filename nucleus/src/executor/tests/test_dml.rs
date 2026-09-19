@@ -165,9 +165,9 @@ async fn test_on_conflict_do_update() {
 // ======================================================================
 
 async fn upsert_priv_fixture(ex: &Executor) {
-    exec(&ex, "CREATE TABLE upsert_priv (id INT PRIMARY KEY, name TEXT)").await;
-    exec(&ex, "INSERT INTO upsert_priv VALUES (1, 'alice')").await;
-    exec(&ex, "CREATE ROLE writer LOGIN PASSWORD 'x'").await;
+    exec(ex, "CREATE TABLE upsert_priv (id INT PRIMARY KEY, name TEXT)").await;
+    exec(ex, "INSERT INTO upsert_priv VALUES (1, 'alice')").await;
+    exec(ex, "CREATE ROLE writer LOGIN PASSWORD 'x'").await;
 }
 
 /// The conflict arm is an UPDATE: a role holding INSERT (and even SELECT)

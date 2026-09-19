@@ -2550,6 +2550,7 @@ async fn embedded_transaction_rollback_leaves_database_usable() {
 /// storage commit itself fails deterministically. `Database::begin` issues a
 /// plain BEGIN, so the handles are built here on sessions already opened at
 /// SERIALIZABLE — same construction, different isolation selection.
+#[cfg(feature = "server")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn embedded_transaction_failed_commit_rolls_back_its_own_transaction() {
     async fn serializable_tx(db: &Database) -> Transaction {

@@ -6016,7 +6016,7 @@ mod tests {
         engine.insert("t", c1.id, row(&[1])).unwrap();
         txn_mgr.commit(&mut c1);
         let mut c2 = txn_mgr.begin(IsolationLevel::Snapshot);
-        let a = engine.scan("t", &c2.snapshot).unwrap()[0].0;
+        let _a = engine.scan("t", &c2.snapshot).unwrap()[0].0;
         engine.insert("t", c2.id, row(&[2])).unwrap();
         txn_mgr.commit(&mut c2);
 

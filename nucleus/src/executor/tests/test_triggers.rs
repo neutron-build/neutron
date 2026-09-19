@@ -114,15 +114,15 @@ async fn concurrent_firings_do_not_interleave() {
 // ======================================================================
 
 async fn two_same_named_triggers(ex: &Executor) {
-    exec(&ex, "CREATE TABLE t_a (id INT)").await;
-    exec(&ex, "CREATE TABLE t_b (id INT)").await;
+    exec(ex, "CREATE TABLE t_a (id INT)").await;
+    exec(ex, "CREATE TABLE t_b (id INT)").await;
     exec(
-        &ex,
+        ex,
         "CREATE TRIGGER trg AFTER INSERT ON t_a FOR EACH ROW BEGIN SELECT 1; END",
     )
     .await;
     exec(
-        &ex,
+        ex,
         "CREATE TRIGGER trg AFTER INSERT ON t_b FOR EACH ROW BEGIN SELECT 1; END",
     )
     .await;

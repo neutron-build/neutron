@@ -128,14 +128,13 @@ impl SnapshotLeaseRegistry {
     ) -> Result<(), LeaseRefusal> {
         let now = tokio::time::Instant::now();
         let mut guard = self.state.lock();
-        if let Some(existing) = *guard {
-            if existing.deadline > now && existing.session_id != session_id {
+        if let Some(existing) = *guard
+            && existing.deadline > now && existing.session_id != session_id {
                 return Err(LeaseRefusal::HeldByOther(
                     existing.deadline.duration_since(now).as_millis() as u64,
                 ));
             }
             // Same session re-acquire, or an expired lease: replace.
-        }
         *guard = Some(Lease {
             session_id,
             deadline: now + Duration::from_millis(timeout_ms),

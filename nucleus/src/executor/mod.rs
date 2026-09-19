@@ -4415,15 +4415,14 @@ impl Executor {
     #[cfg(feature = "server")]
     async fn gate_mutation_on_snapshot_lease(&self) -> Result<(), ExecError> {
         let session_id = unique_gate::gate_session_id();
-        if let Some((holder, _remaining)) = self.snapshot_leases.holder() {
-            if holder == session_id {
+        if let Some((holder, _remaining)) = self.snapshot_leases.holder()
+            && holder == session_id {
                 return Err(ExecError::Runtime(
                     "this session holds the snapshot lease; its point-in-time view is \
                      read-only — RELEASE SNAPSHOT LEASE (or COMMIT/ROLLBACK) first"
                         .into(),
                 ));
             }
-        }
         self.snapshot_leases
             .wait_for_mutation_window(session_id)
             .await;

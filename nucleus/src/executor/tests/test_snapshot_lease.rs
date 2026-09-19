@@ -276,7 +276,7 @@ async fn expired_lease_lets_blocked_writers_recover() {
     let result = write.await.expect("writer task panicked");
     drop(result);
 
-    let after = ex.execute(&"SELECT COUNT(*) FROM t".to_string()).await.unwrap();
+    let after = ex.execute("SELECT COUNT(*) FROM t").await.unwrap();
     let count = match rows(&after[0])[0].first() {
         Some(Value::Int64(n)) => *n,
         Some(Value::Int32(n)) => i64::from(*n),
@@ -285,7 +285,7 @@ async fn expired_lease_lets_blocked_writers_recover() {
     assert_eq!(count, 2, "the writer must land once the lease expires");
 
     // The expired lease is gone from SHOW.
-    let show = ex.execute(&"SHOW SNAPSHOT LEASE".to_string()).await.unwrap();
+    let show = ex.execute("SHOW SNAPSHOT LEASE").await.unwrap();
     assert!(rows(&show[0]).is_empty());
 }
 
@@ -397,7 +397,7 @@ async fn mutating_scalar_calls_in_where_pg_catalog_and_collections_also_gate() {
     ex.execute_with_session(holder, "COMMIT").await.unwrap();
     writes.await.expect("writer task panicked");
     let member = ex
-        .execute(&"SELECT KV_SCARD('lease:s')".to_string())
+        .execute("SELECT KV_SCARD('lease:s')")
         .await
         .unwrap();
     assert_eq!(
@@ -609,7 +609,7 @@ async fn acquire_times_out_behind_a_writer_that_never_drains() {
     );
     // The failed acquisition holds no lease.
     let show = ex
-        .execute(&"SHOW SNAPSHOT LEASE".to_string())
+        .execute("SHOW SNAPSHOT LEASE")
         .await
         .unwrap();
     assert!(rows(&show[0]).is_empty());
