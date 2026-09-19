@@ -87,6 +87,14 @@ pub fn get_storage_session_id() -> u64 {
     STORAGE_SESSION_ID_CELL.with(|c| c.get())
 }
 
+/// Core/WASM builds: set the thread's storage session id, returning the
+/// previous value so scoped callers can restore it (see
+/// `Transaction::run`).
+#[cfg(not(feature = "server"))]
+pub fn set_storage_session_id(id: u64) -> u64 {
+    STORAGE_SESSION_ID_CELL.with(|c| c.replace(id))
+}
+
 /// True when an aggregate fast path must decline `table`.
 ///
 /// The fast paths (`fast_count_all`, `fast_sum_f64`, `fast_group_by`, …) read

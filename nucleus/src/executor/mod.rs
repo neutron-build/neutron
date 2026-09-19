@@ -166,8 +166,9 @@ use helpers::*;
 #[cfg(feature = "server")]
 pub(crate) use scalar_fns::{extension_scalar_return_type, side_effecting_return_type};
 use schema_types::*;
-use session::CURRENT_SESSION;
 pub use session::Session;
+#[cfg(not(feature = "server"))]
+pub(crate) use session::CURRENT_SESSION;
 pub use types::PreparedStmtHandle;
 use types::*;
 
@@ -3559,6 +3560,14 @@ impl Executor {
     /// used by the wire layer to decode binary COPY payloads.
     pub fn table_column_types(&self, table: &str) -> Option<Vec<(String, DataType)>> {
         self.table_columns.read().get(table).cloned()
+    }
+
+    /// Session lookup for embedded core builds: the thread-local scope in
+    /// `Transaction::run` needs the `Arc<Session>` itself, with the same
+    /// default fallback `get_session` applies.
+    #[cfg(not(feature = "server"))]
+    pub(crate) fn session_for_embedded_scope(&self, id: u64) -> Arc<Session> {
+        self.get_session(id)
     }
 
     fn get_session(&self, id: u64) -> Arc<Session> {

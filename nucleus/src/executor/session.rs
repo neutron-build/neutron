@@ -64,11 +64,20 @@ pub(super) mod __current_session {
                 *cell.borrow_mut() = Some(session);
             });
         }
+
+        /// Replace the thread's session and return the previous one, if set.
+        /// Restores pair with `set` for scoped ownership around embedded
+        /// `Transaction` runs (core/WASM builds drive futures on one thread,
+        /// so a thread-local scope is the correct mechanism there).
+        #[allow(dead_code)]
+        pub fn replace(&self, session: Arc<Session>) -> Option<Arc<Session>> {
+            INNER.with(|cell| cell.borrow_mut().replace(session))
+        }
     }
 }
 
 #[cfg(not(feature = "server"))]
-pub(super) static CURRENT_SESSION: __current_session::SessionLocal =
+pub(crate) static CURRENT_SESSION: __current_session::SessionLocal =
     __current_session::SessionLocal;
 
 /// Run an async future from a synchronous context without deadlocking tokio.

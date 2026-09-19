@@ -526,14 +526,31 @@ impl Database {
         }
         #[cfg(not(feature = "server"))]
         {
-            // Core-only builds have no session-scoping task-locals; the
-            // shared default session is the only one that exists.
-            self.executor.execute("BEGIN").await?;
-            Ok(Transaction {
-                executor: self.executor.clone(),
-                session_id: 0,
-                finished: false,
-            })
+            // Core/WASM builds establish the session through the thread-local
+            // cells (see Transaction::run) — same lifecycle as the server
+            // path: one session identity per handle, created on begin and
+            // dropped on finish. The old code hardcoded session 0, so every
+            // handle shared the default session's transaction.
+            let session_id = self.executor.create_session();
+            let session = self.executor.session_for_embedded_scope(session_id);
+            let prev_session = crate::executor::CURRENT_SESSION.replace(session);
+            let prev_storage_id = crate::storage::set_storage_session_id(session_id);
+            let begun = self.executor.execute("BEGIN").await;
+            crate::storage::set_storage_session_id(prev_storage_id);
+            if let Some(prev) = prev_session {
+                crate::executor::CURRENT_SESSION.replace(prev);
+            }
+            match begun {
+                Ok(_) => Ok(Transaction {
+                    executor: self.executor.clone(),
+                    session_id,
+                    finished: false,
+                }),
+                Err(e) => {
+                    self.executor.drop_session(session_id);
+                    Err(e)
+                }
+            }
         }
     }
 
@@ -1164,8 +1181,25 @@ impl Transaction {
     async fn run(&self, sql: &str) -> Result<Vec<ExecResult>, ExecError> {
         #[cfg(feature = "server")]
         return self.executor.execute_with_session(self.session_id, sql).await;
+        // Core/WASM builds have no task-local scopes; they drive futures on
+        // one thread, so the session context is established through the
+        // thread-local cells instead — set for the call, restored after, so a
+        // subsequent bare `Database::execute` still resolves the default
+        // session. Without this, every handle ran on the shared default
+        // session and the second BEGIN silently joined the first transaction.
         #[cfg(not(feature = "server"))]
-        self.executor.execute(sql).await
+        {
+            let session = self.executor.session_for_embedded_scope(self.session_id);
+            let prev_session = crate::executor::CURRENT_SESSION.replace(session);
+            let prev_storage_id = crate::storage::set_storage_session_id(self.session_id);
+            let outcome = self.executor.execute(sql).await;
+            crate::storage::set_storage_session_id(prev_storage_id);
+            match prev_session {
+                Some(prev) => crate::executor::CURRENT_SESSION.replace(prev),
+                None => None,
+            };
+            outcome
+        }
     }
 
     /// Execute a SQL statement within this transaction.
@@ -1203,7 +1237,6 @@ impl Transaction {
             // rather than leaving it for the safety net.
             let _ = self.run("ROLLBACK").await;
         }
-        #[cfg(feature = "server")]
         self.executor.drop_session(self.session_id);
         outcome.map(|_| ())
     }
@@ -1212,7 +1245,6 @@ impl Transaction {
     pub async fn rollback(mut self) -> Result<(), ExecError> {
         let outcome = self.run("ROLLBACK").await;
         self.finished = true;
-        #[cfg(feature = "server")]
         self.executor.drop_session(self.session_id);
         outcome.map(|_| ())
     }
