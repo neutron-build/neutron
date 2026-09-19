@@ -86,6 +86,12 @@ pub const ALL_POINTS: &[&str] = &[
     // for their transaction, and recovery must discard them — alongside the
     // SQL rows of the same transaction, which recovery undoes as a loser.
     "crossmodel.before_commit_record",
+    // NU-01 tail compaction: between computing the dead-tail cut and the
+    // mint-floor store + truncate. Compaction is MEMORY-ONLY (no WAL or page
+    // writes), so a crash anywhere inside it must recover to exactly the
+    // state the compaction started from — the point exists so the
+    // subprocess matrix proves that, not assumes it.
+    "gc.mid_compaction",
 ];
 
 /// Raft durability boundaries, kept separate from [`ALL_POINTS`] because a SQL

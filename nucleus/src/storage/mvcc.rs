@@ -17,7 +17,8 @@ use std::sync::atomic::Ordering;
 use parking_lot::RwLock;
 
 use super::txn::{
-    IsolationLevel, RowVersion, Snapshot, TXN_INVALID, TransactionManager, TxnStatus,
+    IsolationLevel, RowVersion, Snapshot, TXN_COMMITTED_BEFORE_ALL, TXN_INVALID, TransactionManager,
+    TxnStatus,
 };
 use crate::types::{Row, Value};
 
@@ -57,13 +58,50 @@ struct MvccTable {
     /// All row versions (including deleted ones, until GC).
     /// Protected by a per-table RwLock for fine-grained concurrency.
     rows: RwLock<Vec<MvccRow>>,
+    /// Identity floor for minting (NU-01 tail compaction): the lowest
+    /// version id a future insert/update may take. Zero until compaction
+    /// truncates the row vector, afterwards the highest id this table has
+    /// EVER minted (or recovered from a WAL floor) — so a reclaimed dead
+    /// id is never re-minted in this log generation. The
+    /// position==durable-id invariant is preserved: mints pad invisible
+    /// filler slots up to the floor before pushing, exactly like
+    /// recovery's `pad_to`.
+    mint_floor: std::sync::atomic::AtomicUsize,
+}
+
+/// An invisible filler slot: created AND deleted by the bootstrap
+/// transaction (`TXN_COMMITTED_BEFORE_ALL`), empty payload. Invisible to
+/// every snapshot by construction — the same shape `recover_insert` and
+/// `pad_to` use during recovery.
+fn filler_slot() -> MvccRow {
+    let v = RowVersion::new(TXN_COMMITTED_BEFORE_ALL);
+    v.deleted_by
+        .store(TXN_COMMITTED_BEFORE_ALL, Ordering::Release);
+    MvccRow {
+        version: v,
+        data: Arc::new(Vec::new()),
+    }
 }
 
 impl MvccTable {
     fn new() -> Self {
         Self {
             rows: RwLock::new(Vec::new()),
+            mint_floor: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// The id a new version minted NOW would take. Honors `mint_floor`
+    /// (tail compaction's never-rewind guarantee): the vector is padded
+    /// with invisible fillers up to the floor first, so position keeps
+    /// equaling durable id even after dead tail slots were reclaimed.
+    /// Callers must hold the `rows` write lock.
+    fn mint_id(&self, rows: &mut Vec<MvccRow>) -> usize {
+        let floor = self.mint_floor.load(Ordering::Acquire);
+        while rows.len() < floor {
+            rows.push(filler_slot());
+        }
+        rows.len()
     }
 
     /// Scan only visible rows for the given snapshot.
@@ -89,7 +127,7 @@ impl MvccTable {
     /// Insert a new row version. Returns the version index of the new row.
     fn insert(&self, txn_id: u64, row: Row) -> usize {
         let mut rows = self.rows.write();
-        let idx = rows.len();
+        let idx = self.mint_id(&mut rows);
         rows.push(MvccRow {
             version: RowVersion::new(txn_id),
             data: Arc::new(row),
@@ -167,7 +205,16 @@ impl MvccTable {
         txn_mgr: &TransactionManager,
     ) -> Result<(), MvccError> {
         let rows = self.rows.read(); // READ lock, not write!
-        let row = &rows[version_idx];
+        // A slot tail compaction reclaimed (this statement resolved its
+        // target before an await, the row died and was collected in the
+        // window) is a gone row, not a panic: report it as the conflict it
+        // is equivalent to.
+        let Some(row) = rows.get(version_idx) else {
+            return Err(MvccError::WriteConflict {
+                table: String::new(),
+                row_idx: version_idx,
+            });
+        };
         loop {
             let current = row.version.deleted_by.load(Ordering::Acquire);
             if current == txn_id {
@@ -247,7 +294,14 @@ impl MvccTable {
         // marker is reclaimable (NU-10) — see `delete_version`.
         {
             let rows = self.rows.read();
-            let row = &rows[version_idx];
+            // Tail-compaction reclaimed slot: the row is gone; the write is
+            // a conflict, never an out-of-bounds panic.
+            let Some(row) = rows.get(version_idx) else {
+                return Err(MvccError::WriteConflict {
+                    table: String::new(),
+                    row_idx: version_idx,
+                });
+            };
             loop {
                 let current = row.version.deleted_by.load(Ordering::Acquire);
                 if current == txn_id {
@@ -299,7 +353,7 @@ impl MvccTable {
         }
         // Phase 2: Push new version under write lock (O(1))
         let mut rows = self.rows.write();
-        let new_idx = rows.len();
+        let new_idx = self.mint_id(&mut rows);
         rows.push(MvccRow {
             version: RowVersion::new(txn_id),
             data: Arc::new(new_row),
@@ -377,6 +431,60 @@ impl MvccTable {
                 referenced.insert(deleted);
             }
         }
+    }
+
+    /// Tail compaction (NU-01's safe subset, unblocked by WAL v2's stable
+    /// ids): truncate the row vector below the last slot that must be kept,
+    /// reclaiming dead-version memory. Conservative by construction:
+    ///
+    /// - only a suffix of ALL-dead slots is reclaimed — no live id moves,
+    ///   so position keeps equaling durable id for every survivor;
+    /// - the mint floor is raised to the pre-truncation high-water mark
+    ///   BEFORE the slots are released, so a reclaimed id is never
+    ///   re-minted in this log generation (the never-rewinds guarantee);
+    ///   later mints pad invisible fillers up to the floor, the same shape
+    ///   recovery's `pad_to` produces;
+    /// - the reclaimability predicate is exactly `gc`'s: an aborted
+    ///   creator, or a committed delete below `oldest_active_xmin` —
+    ///   invisible to every active AND future snapshot (the lean4-verified
+    ///   visibility argument on `gc`), so no reader can hold a reference.
+    ///
+    /// Durable effects: NONE. No WAL record is required — replay rebuilds a
+    /// superset (it re-seats what it can and pads to a floor that is at
+    /// least every id the log ever contained), which is precisely the
+    /// pre-compaction state. A crash mid-compaction is therefore identical
+    /// to the compaction never having run (the `gc.mid_compaction`
+    /// crashpoint marks the window for the subprocess matrix).
+    fn compact_tail(&self, oldest_active_xmin: u64, txn_mgr: &TransactionManager) -> usize {
+        let mut rows = self.rows.write();
+        let mut cut = rows.len();
+        while cut > 0 {
+            let r = &rows[cut - 1];
+            let dead = match txn_mgr.get_status(r.version.created_by) {
+                TxnStatus::Aborted => true,
+                TxnStatus::Active => false,
+                TxnStatus::Committed => {
+                    let deleted = r.version.deleted_by.load(Ordering::Acquire);
+                    deleted != TXN_INVALID
+                        && txn_mgr.get_status(deleted) == TxnStatus::Committed
+                        && r.version.created_by < oldest_active_xmin
+                        && deleted < oldest_active_xmin
+                }
+            };
+            if !dead {
+                break;
+            }
+            cut -= 1;
+        }
+        if cut == rows.len() {
+            return 0;
+        }
+        let reclaimed = rows.len() - cut;
+        let horizon = rows.len().max(self.mint_floor.load(Ordering::Acquire));
+        crate::storage::crashpoint::reach("gc.mid_compaction");
+        self.mint_floor.store(horizon, Ordering::Release);
+        rows.truncate(cut);
+        reclaimed
     }
 
     /// Get the number of row versions in this table.
@@ -844,12 +952,17 @@ impl MvccMemoryEngine {
     /// The table's current identity high-water mark: the next id a write
     /// would mint. 0 when the table does not exist. The adapter logs this
     /// as the CreateTable version floor so a later recovery never mints
-    /// below the ids this run already used.
+    /// below the ids this run already used. Honors the mint floor: after
+    /// tail compaction the vector is shorter than the ids this run has
+    /// minted, and the DURABLE floor must say so — a baseline recorded at
+    /// the truncated length would rewind the identity space across
+    /// restart. (Replay's own observe-id rule would still catch up, but
+    /// the recorded floor must not lie.)
     pub fn table_version_count(&self, table: &str) -> usize {
-        self.tables
-            .read()
-            .get(table)
-            .map_or(0, |t| t.version_count())
+        self.tables.read().get(table).map_or(0, |t| {
+            t.version_count()
+                .max(t.mint_floor.load(std::sync::atomic::Ordering::Acquire))
+        })
     }
 
     /// Scan visible rows for the given snapshot.
@@ -951,6 +1064,28 @@ impl MvccMemoryEngine {
 
     pub fn gc_table(&self, table: &str, oldest_active_xmin: u64) -> Result<usize, MvccError> {
         Ok(self.get_table(table)?.gc(oldest_active_xmin, &self.txn_mgr))
+    }
+
+    /// Compact every table's dead tail (see [`MvccTable::compact_tail`]).
+    /// Returns the number of dead version slots reclaimed.
+    pub fn compact_tails(&self, oldest_active_xmin: u64) -> usize {
+        let all_tables = self.get_all_tables();
+        all_tables
+            .iter()
+            .map(|t| t.compact_tail(oldest_active_xmin, &self.txn_mgr))
+            .sum()
+    }
+
+    /// Compact one table's dead tail. Returns the number of dead version
+    /// slots reclaimed.
+    pub fn compact_table_tail(
+        &self,
+        table: &str,
+        oldest_active_xmin: u64,
+    ) -> Result<usize, MvccError> {
+        Ok(self
+            .get_table(table)?
+            .compact_tail(oldest_active_xmin, &self.txn_mgr))
     }
 
     fn referenced_txn_ids(&self) -> HashSet<u64> {
@@ -3978,6 +4113,20 @@ impl StorageEngine for MvccStorageAdapter {
             .txn_mgr()
             .gc_resolved_aborted(watermark, &referenced);
         let _ = self.engine.txn_mgr().run_gc();
+        // Tail compaction (NU-01's unblocked subset): now that GC has
+        // neutralized dead payloads and cleared stale aborted tombstones,
+        // reclaim all-dead TAIL slots outright — ids preserved, mint floor
+        // raised to the pre-truncation horizon so no id is ever re-minted.
+        // Memory-only: no durable effect, so no WAL record. Runs BEFORE the
+        // index rebuild below, which then drops any entry that pointed at a
+        // reclaimed slot.
+        let slots_reclaimed = if table.is_empty() {
+            self.engine.compact_tails(watermark)
+        } else {
+            self.engine
+                .compact_table_tail(table, watermark)
+                .map_err(StorageError::from)?
+        };
         // GC neutralizes version payloads in place; secondary indexes are
         // rebuilt from the surviving snapshot so no index entry points at a
         // neutralized slot. Rebuild failure PROPAGATES (NU-20): the old code
@@ -4009,7 +4158,7 @@ impl StorageEngine for MvccStorageAdapter {
         // NOT measured (NU-20): the previous code reported a SUM OF TRANSACTION
         // STATUS COUNTS in the bytes field, which is a count of metadata
         // entries, not bytes — a number with the wrong unit is worse than none.
-        Ok((0, reclaimed, 0, 0))
+        Ok((0, reclaimed + slots_reclaimed, 0, 0))
     }
 
     async fn vacuum_all(&self) -> Result<(usize, usize, usize, usize), StorageError> {
@@ -4057,6 +4206,127 @@ mod tests {
         let rows = engine.scan_rows("t1", &t2.snapshot).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], row(&[1, 2]));
+    }
+
+    // ========================================================================
+    // NU-01 tail compaction (WAL v2 unblocked subset)
+    // ========================================================================
+
+    /// The core contract: an all-dead TAIL is reclaimed, ids are never
+    /// re-minted (the mint floor holds the pre-truncation horizon), and the
+    /// fillers a post-compaction mint pads in are invisible to every
+    /// snapshot.
+    #[test]
+    fn tail_compaction_reclaims_dead_tail_and_never_reuses_ids() {
+        let (engine, txn_mgr) = setup();
+        engine.create_table("t");
+
+        // ids 0..=9, all committed.
+        for i in 0..10 {
+            let mut t = txn_mgr.begin(IsolationLevel::Snapshot);
+            engine.insert("t", t.id, row(&[i])).unwrap();
+            txn_mgr.commit(&mut t);
+        }
+        // Kill the tail: ids 5..=9 deleted by committed transactions.
+        for _ in 0..5 {
+            let mut d = txn_mgr.begin(IsolationLevel::Snapshot);
+            let visible = engine.scan("t", &d.snapshot).unwrap();
+            let last = visible.last().unwrap().0;
+            engine.delete("t", last, d.id).unwrap();
+            txn_mgr.commit(&mut d);
+        }
+
+        let watermark = txn_mgr.gc_watermark();
+        engine.gc(watermark);
+        let reclaimed = engine.compact_tails(watermark);
+        assert_eq!(reclaimed, 5, "the five dead tail slots must be reclaimed");
+        // The vector is 5 slots; the identity high-water stays at the
+        // pre-truncation horizon (10) — that is the never-rewinds guarantee
+        // being visible to the durable floor the adapter records.
+        assert_eq!(engine.table_version_count("t"), 10);
+        assert_eq!(engine.total_versions(), 5);
+
+        // A new mint must NOT reuse any reclaimed id: it pads to the floor
+        // and takes an id at or above the pre-truncation horizon (10).
+        let mut w = txn_mgr.begin(IsolationLevel::Snapshot);
+        let new_idx = engine.insert("t", w.id, row(&[99])).unwrap();
+        txn_mgr.commit(&mut w);
+        assert!(new_idx >= 10, "reclaimed id re-minted: got {new_idx}");
+
+        // The fillers padded up to the floor are invisible: exactly the
+        // five survivors plus the new row.
+        let r = txn_mgr.begin(IsolationLevel::Snapshot);
+        let rows = engine.scan("t", &r.snapshot).unwrap();
+        assert_eq!(rows.len(), 6);
+        assert!(rows.iter().all(|(idx, _)| *idx < 5 || *idx >= 10));
+    }
+
+    /// Mid-vector dead versions are neutralized, never moved: a live id
+    /// keeps its slot even when dead slots precede it. This is the boundary
+    /// of the safe subset — full renumbering stays deliberately
+    /// unimplemented.
+    #[test]
+    fn mid_vector_dead_slots_are_neutralized_not_moved() {
+        let (engine, txn_mgr) = setup();
+        engine.create_table("t");
+
+        for i in 0..6 {
+            let mut t = txn_mgr.begin(IsolationLevel::Snapshot);
+            engine.insert("t", t.id, row(&[i])).unwrap();
+            txn_mgr.commit(&mut t);
+        }
+        // Kill id 2 only (middle of the vector).
+        let mut d = txn_mgr.begin(IsolationLevel::Snapshot);
+        engine.delete("t", 2, d.id).unwrap();
+        txn_mgr.commit(&mut d);
+
+        let watermark = txn_mgr.gc_watermark();
+        engine.gc(watermark);
+        let reclaimed = engine.compact_tails(watermark);
+        assert_eq!(reclaimed, 0, "a dead slot below live slots is never reclaimed");
+        assert_eq!(engine.table_version_count("t"), 6);
+        // And ids survive unmoved: a scan returns the survivors at 0,1,3,4,5.
+        let r = txn_mgr.begin(IsolationLevel::Snapshot);
+        let ids: Vec<usize> = engine.scan("t", &r.snapshot).unwrap().into_iter().map(|(i, _)| i).collect();
+        assert_eq!(ids, vec![0, 1, 3, 4, 5]);
+    }
+
+    /// The watermark gates collection: a delete a still-active reader could
+    /// not have observed is not reclaimable, because that reader's snapshot
+    /// (and any snapshot it spawns) still needs the version.
+    #[test]
+    fn compaction_respects_the_active_snapshot_horizon() {
+        let (engine, txn_mgr) = setup();
+        engine.create_table("t");
+
+        for i in 0..3 {
+            let mut t = txn_mgr.begin(IsolationLevel::Snapshot);
+            engine.insert("t", t.id, row(&[i])).unwrap();
+            txn_mgr.commit(&mut t);
+        }
+        // A reader parks on a snapshot that still sees all three rows.
+        let reader = txn_mgr.begin(IsolationLevel::Snapshot);
+        // ...then the tail dies.
+        let mut d = txn_mgr.begin(IsolationLevel::Snapshot);
+        engine.delete("t", 2, d.id).unwrap();
+        txn_mgr.commit(&mut d);
+
+        let watermark = txn_mgr.gc_watermark();
+        engine.gc(watermark);
+        assert_eq!(
+            engine.compact_tails(watermark),
+            0,
+            "the deleting txn committed after the reader began, so its \
+             delete is not below the watermark"
+        );
+        assert_eq!(engine.scan("t", &reader.snapshot).unwrap().len(), 3);
+
+        // Once the reader ends, the same pass reclaims.
+        let mut reader = reader;
+        txn_mgr.commit(&mut reader);
+        let watermark = txn_mgr.gc_watermark();
+        engine.gc(watermark);
+        assert_eq!(engine.compact_tails(watermark), 1);
     }
 
     #[test]
