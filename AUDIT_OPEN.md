@@ -12,9 +12,90 @@ round-2 re-verification repaired all five disputed closures and resolved
 the twelve new findings it raised; round 3 closed its partials; round 4
 (2026-09-18, below) closed the four WAL-format deferral clusters and the
 consumer-reported snapshot-capability gap under the founder-ratified
-"WAL format v2 + snapshot lease" direction.
+"WAL format v2 + snapshot lease" direction; round 5 (2026-09-18, above)
+closed the three lease-scope defects reported from the observe backup
+session and landed NU-01's unblocked compaction subset.
+
+## Resolved 2026-09-18 (round 5 — lease-scope closure + NU-01 compaction subset)
+
+Two work items from the observe backup session's upstream reports and the
+round-4 NU-01 note, closed the same day.
+
+### Lease-scope defects (the three 2026-09-18 teploy-observe reports, `Teploy/_internal/UPSTREAM_BUGS.md` newest entries)
+
+All three root-caused on the exact stacks the live probes hit, each with a
+fail-before/pass-after regression test in
+`nucleus/src/executor/tests/test_snapshot_lease.rs`:
+
+1. **KV/specialty scalar writes bypassed the writer gate.** `SELECT
+   kv_set(...)` parses as a Query, so the dispatch gate's DDL/DML shape
+   match never saw it — every SQL client's KV writes sailed through the
+   lease window (the 8664cbd1 fix had covered only the RESP-wire fast
+   path). FIXED: the dispatch walks the statement AST for mutating scalar
+   calls while a lease is held
+   (`admission::statement_carries_mutating_scalar_fn`; canonicalized like
+   the scalar dispatcher, so WHERE-carried and `pg_catalog.`-qualified
+   calls gate too). No-lease path keeps its O(matches) cost.
+2. **Holder reads were not pinned to the acquire-time snapshot.** A writer
+   whose statement predated the lease could COMMIT mid-window (COMMIT is
+   not a gated statement) and the holder's next statement saw the new
+   rows. FIXED two ways: ACQUIRE now DRAINS — waits, bounded by the
+   lease's own TIMEOUT, for every other session's write-bearing
+   transaction to end (engine-side via the new
+   `StorageEngine::session_has_uncommitted_writes` — BufferedDiskEngine
+   buffers, MVCC undo; executor-side via before-images, cross-model
+   enlistment, policy/GIN/derived markers) — and versioning engines
+   re-take the holder's snapshot at the acquire instant (new
+   `StorageEngine::refresh_txn_snapshot`; the MVCC adapter pins it for
+   the rest of the transaction, suppressing the READ COMMITTED
+   per-statement refresh while held, so the pinned moment is ACQUIRE,
+   not BEGIN).
+3. **Holder saw another sessions' in-flight uncommitted writes.** The live
+   shape was a per-table override engine (mergetree) on the disk stack —
+   those engines have no transaction buffering, so the parked INSERT was
+   readable outright. FIXED by the same drain: the window can only open
+   on resolved state. Acquisition inside a transaction that has already
+   written is refused (its moment cannot include its own uncommitted
+   work; its write-side resources could deadlock the drain). Honest
+   residual, documented in the lease module: a mutation already
+   mid-statement at the acquire instant races the drain the same way it
+   races the DML gate, and RESP-direct / background specialty writes
+   remain outside the gate (unchanged scope note). Engine-side
+   equivalents of teploy-observe's backup consistency proofs landed
+   (`backup_under_lease_is_one_moment_across_models`: heap + mergetree +
+   KV under one window). Commit `4c7c4367`.
+
+### NU-01 in-memory compaction — the safe subset landed, the rest scoped
+
+WAL v2's stable ids unblocked GC compaction; what landed
+(commit `6d7c3ffa`) is the conservative subset:
+
+- **Landed — dead-TAIL reclamation.** An all-dead suffix of a table's row
+  vector is truncated at VACUUM under gc's own watermark soundness rule.
+  No live id moves (mid-vector dead versions stay neutralized in place),
+  the mint floor is raised to the pre-truncation horizon before slots
+  release (never-rewinds holds; later mints pad invisible fillers to the
+  floor, the same shape recovery's `pad_to` produces), and
+  `table_version_count` reports max(len, floor) so durable baselines
+  cannot understate the horizon. Durable effects: none — replay rebuilds
+  a superset, so no new WAL record; proven by WAL-size-unchanged,
+  reclaim/mint/reopen, live-id-stability, and torn-tail-after-compaction
+  tests, plus a `gc.mid_compaction` crashpoint for the subprocess matrix.
+- **Deferred, precisely — mid-vector compaction/renumbering.** Requires
+  an id→position map on every addressing path (secondary indexes, pending
+  mutations, WAL Delete/Update records, executor position resolution);
+  until that indirection exists, moving a live id breaks
+  position==durable-id. Rejected for this pass.
+- **Deferred, precisely — WAL-space reclamation of dead records.** The
+  log retains dead Insert/Delete records until a reopen compacts the
+  baseline (which preserves ids and floors but rewrites dead rows too).
+  Reclaiming them at runtime needs a new v2 Compaction baseline record
+  and a replay floor-reset rule — the one place the never-rewinds
+  invariant would be redefined rather than honored. Not taken in this
+  pass.
 
 ## Round-2 verification (2026-09-17, re-audit at `360c0023`)
+
 
 An independent re-verification of the 74-finding pass plus twelve new
 findings (TS-31/32, GO-25..31, NU-21..23). Disputes it raised against
@@ -99,7 +180,7 @@ FALSE-POSITIVE (not reproducible in source; evidence cited).
 | GO-22 | FIXED-PARTIAL — optional server-side HMAC token signing (defeats sibling cookie injection), POST-body-only form fallback, any-unsafe-verb coverage. __Host- cookie prefix not made default (breaking change for existing sessions) | 086e0253 |
 | GO-23 | FIXED — errors.Join preserves cancellation, bounded detached rollback context, isolation allowlist before SQL splicing, overflow-safe jitter | 086e0253 |
 | GO-24 | FIXED — rate/burst validated at construction, SplitHostPort client IP, Timeout documented cooperative. The capacity defect round 2 found under GO-24 is fixed as GO-27 | 4f743588 |
-| NU-01 | FIXED (durable half, round 4) + CONTAINED (in-memory half) — GC never compacts the row vector: dead versions are neutralized in place, so WAL/index/mutation addresses stay stable. The durable half landed with WAL v2: stable 64-bit version ids in every record, per-table id floors, identity-preserving baselines, replay validation. In-memory compaction is now UNBLOCKED and deliberately not implemented | a0732f5c + r4 |
+| NU-01 | FIXED (durable half, round 4) + CONTAINED (in-memory half) — GC never compacts the row vector: dead versions are neutralized in place, so WAL/index/mutation addresses stay stable. The durable half landed with WAL v2: stable 64-bit version ids in every record, per-table id floors, identity-preserving baselines, replay validation. Round 5 landed the unblocked SUBSET: all-dead TAIL slots are reclaimed at VACUUM with ids preserved and the mint floor holding the pre-truncation horizon (no live id moves, never-rewinds holds, no durable effect — see the round-5 section). Mid-vector renumbering and WAL-space reclamation of dead records remain deferred with their reasons recorded there | a0732f5c + r4 + r5 |
 | NU-02 | FIXED — savepoints are O(1) marks into a per-transaction undo journal; rollback replays post-mark ops in reverse, preserving identity and duplicate multiplicity | a0732f5c |
 | NU-03 | FIXED — rollback writes WAL compensation records (Insert/Delete/Update under the same txn id — existing formats), so replay applies the rollback exactly when the outer transaction commits | a0732f5c |
 | NU-04 | FIXED — corruption (CRC/length/tag/decode) fails startup with the byte offset and leaves the file untouched; torn FINAL frames are the explicit accepted case. The round-2 residual (unchecked length prefix) closed with v2 framing (round 4): the checksummed magic+version+length header makes a corrupted length provable damage — including in the final frame — while a valid-header truncated payload stays the accepted torn-tail case (v2 open repairs it; legacy logs keep v1 semantics on their read-only upgrade path) | 6033d56d + r4 |
@@ -332,11 +413,15 @@ them without that folder:
   `Tx.AcquireSnapshotLease/ReleaseSnapshotLease`,
   `Client.SnapshotLease`, with typed `ErrSnapshotLeaseHeld` conflicts —
   live-engine tests in `go/nucleus/snapshot_lease_integration_test.go`.
-  Scope note, stated honestly: the gate covers SQL DML/DDL and the
-  intercepted fast paths; specialty-model writes that neither route through
-  the executor dispatch nor match the two fast paths (RESP-wire direct,
-  streams/CDC appends from background tasks) are not lease-gated — a backup
-  of those models still relies on their own snapshot/checkpoint paths.
+   Scope note, stated honestly: the gate covers SQL DML/DDL, the
+   intercepted fast paths, and (round 5) SELECT-carried specialty scalar
+   writes — `SELECT kv_set(...)` and friends now take the gate, since the
+   SQL scalar functions are how every SQL client writes KV. Acquisition
+   drains write-bearing foreign transactions first and pins the holder's
+   snapshot to the ACQUIRE moment (round 5, above). Specialty-model writes
+   that route through none of those (RESP-wire direct, streams/CDC appends
+   from background tasks) are not lease-gated — a backup of those models
+   still relies on their own snapshot/checkpoint paths.
 
 Out-of-repo note: Lullmail's vendored copies of the send.go / bearer-transport
 blobs (flagged in neutron-12/13/16 as affected consumers) are NOT fixed here —
