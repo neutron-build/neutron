@@ -167,7 +167,6 @@ use helpers::*;
 pub(crate) use scalar_fns::{extension_scalar_return_type, side_effecting_return_type};
 use schema_types::*;
 pub use session::Session;
-#[cfg(not(feature = "server"))]
 pub(crate) use session::CURRENT_SESSION;
 pub use types::PreparedStmtHandle;
 use types::*;

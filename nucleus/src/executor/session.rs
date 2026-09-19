@@ -20,7 +20,7 @@ pub(super) fn now_millis() -> u64 {
 #[cfg(feature = "server")]
 tokio::task_local! {
     /// The active per-connection session for the current task.
-    pub(super) static CURRENT_SESSION: Arc<Session>;
+    pub(crate) static CURRENT_SESSION: Arc<Session>;
 }
 
 /// Non-server (WASM) fallback: thread-local session holder with a
