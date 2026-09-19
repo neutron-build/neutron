@@ -524,10 +524,27 @@ impl TransactionManager {
 
     /// Get the status of a transaction.
     ///
-    /// Ordering is critical: aborted set must be checked before the watermark
-    /// because the watermark can't distinguish committed-then-GC'd from aborted.
-    /// Aborted IDs are never removed from the aborted set, guaranteeing this
-    /// check is correct.
+    /// Ordering is critical, in two places:
+    ///
+    /// * **Set-check order vs publication order.** `commit`/`abort` insert
+    ///   into their terminal set FIRST and remove from `active` second. A
+    ///   reader that checks the terminal set before `active` can interleave
+    ///   in that window, miss BOTH sets, and hit the unknown-txn fallthrough
+    ///   — reporting a committing transaction as Aborted. NU-10 made that
+    ///   answer load-bearing: an "Aborted" owner's tombstone is
+    ///   reclaimable, so a concurrent writer CAS'd over a transaction that
+    ///   was actually committing, both pushed successor versions, and both
+    ///   committed — two live rows with one PRIMARY KEY. Checking `active`
+    ///   BEFORE the terminal sets closes the window: a miss on `active`
+    ///   means the terminal insert (which happens first) is already
+    ///   visible.
+    /// * **The fallthrough vs GC pruning.** `gc` advances the watermark and
+    ///   then prunes `committed`; a reader holding a pre-advance watermark
+    ///   misses the pruned entry and would fall through. Re-loading the
+    ///   (monotone) watermark at the fallthrough resolves it: below the
+    ///   watermark, a transaction is resolved (anything aborted and not in
+    ///   the unpruned `aborted` set was reclaimed by vacuum, which first
+    ///   removed every row reference to it).
     pub fn get_status(&self, txn_id: u64) -> TxnStatus {
         if txn_id == TXN_COMMITTED_BEFORE_ALL {
             return TxnStatus::Committed;
@@ -546,17 +563,28 @@ impl TransactionManager {
             }
             return TxnStatus::Committed;
         }
-        // 2. Check aborted set (for transactions above watermark).
+        // 2. Check active BEFORE the terminal sets — see the doc comment.
+        //    `abort` also removes from active after inserting into `aborted`,
+        //    so this order is safe for both terminal states.
+        if self.active.lock().contains(&txn_id) {
+            return TxnStatus::Active;
+        }
+        // 3. Check aborted set (never GC'd below the watermark except for
+        //    vacuum-reclaimed ids, which the watermark re-check covers).
         if self.aborted_count.load(Ordering::Acquire) > 0 && self.aborted.lock().contains(&txn_id) {
             return TxnStatus::Aborted;
         }
-        // 3. Check recently committed (not yet GC'd).
+        // 4. Check recently committed (not yet GC'd).
         if self.committed.lock().contains(&txn_id) {
             return TxnStatus::Committed;
         }
-        // 4. Check active.
-        if self.active.lock().contains(&txn_id) {
-            return TxnStatus::Active;
+        // 5. Absent from every set: either GC-pruned committed (the loaded
+        //    watermark was stale), or truly unknown. The watermark only
+        //    advances past transactions no active snapshot can still depend
+        //    on, so below it the answer is Committed unless the aborted set
+        //    (checked above) says otherwise.
+        if txn_id < self.committed_watermark.load(Ordering::Acquire) {
+            return TxnStatus::Committed;
         }
         // Truly unknown txn — treat as aborted for safety (invisible).
         TxnStatus::Aborted

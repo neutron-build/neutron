@@ -2168,8 +2168,29 @@ impl MvccStorageAdapter {
             // not establish uniqueness, so no single-row optimization is sound
             // here. The key is re-checked per candidate because version_map
             // entries can be stale (add-only between rebuilds).
+            //
+            // The candidate list is DEDUPED first, preserving newest-first
+            // order. version_map is a deliberately-maintained SUPERSET and the
+            // same version can legitimately appear twice: an in-flight
+            // auto-commit INSERT is captured by a concurrent `create_index`
+            // rebuild (whose raw list includes uncommitted versions so the
+            // unique probe stays sound) and is then pushed again by the
+            // insert's own per-row maintenance once it acquires the indexes
+            // lock. The pre-NU-09 first-match break made that duplication
+            // harmless; returning every match without dedup turned each
+            // duplicate into a duplicate POSITION, and an UPDATE fed
+            // [(v,row),(v,row)] then minted two live versions of one row under
+            // one transaction — two live rows with the same PRIMARY KEY
+            // (concurrency_schema_constraints_probe, a0732f5c regression).
+            // Dedup keeps every DISTINCT version (NU-09's guarantee) while
+            // restoring "at most one match per physical version".
+            let mut seen: std::collections::HashSet<usize> =
+                std::collections::HashSet::with_capacity(version_indices.len());
             let mut matches: Vec<(usize, Row)> = Vec::new();
             for &vidx in version_indices.iter().rev() {
+                if !seen.insert(vidx) {
+                    continue;
+                }
                 if vidx < rows_guard.len() {
                     let mvcc_row = &rows_guard[vidx];
                     if mvcc_row.version.is_visible(snap, &self.engine.txn_mgr)
@@ -4810,6 +4831,62 @@ mod tests {
         assert_eq!(rows[0], adapter_row(&[1]));
     }
 
+    /// A duplicated `version_map` entry must not become a duplicated
+    /// position (a0732f5c regression, caught by
+    /// concurrency_schema_constraints_probe). `version_map` is a
+    /// deliberately-maintained SUPERSET, and the same version can be pushed
+    /// twice: a concurrent `create_index` rebuild captures an in-flight
+    /// auto-commit insert in its raw (uncommitted-inclusive) candidate list,
+    /// and the insert's own per-row maintenance pushes the same version again
+    /// once it acquires the indexes lock. The pre-NU-09 first-match break
+    /// made that harmless; returning every match without dedup turned each
+    /// duplicate into a duplicate POSITION, and an UPDATE fed the same row
+    /// twice minted two live versions of it under one transaction — two live
+    /// rows with the same PRIMARY KEY.
+    #[tokio::test]
+    async fn adapter_duplicated_version_map_entry_yields_one_position_and_one_update() {
+        let adapter = MvccStorageAdapter::new();
+        adapter.create_table("t").await.unwrap();
+        adapter.insert("t", row(&[1, 10])).await.unwrap(); // version 0
+        adapter.create_index("t", "t_pkey", 0).await.unwrap();
+
+        // Poison the index exactly like the race does: one version, listed twice.
+        {
+            let mut indexes = adapter.indexes.write();
+            let idx = indexes.get_mut("t_pkey").unwrap();
+            idx.version_map
+                .get_mut(&Value::Int32(1))
+                .unwrap()
+                .push(0);
+        }
+
+        let matches = adapter
+            .scan_where_eq_positions("t", 0, &Value::Int32(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            matches.len(),
+            1,
+            "a duplicated version_map entry became a duplicated position"
+        );
+
+        // Even a duplicated position feed must write the row ONCE: the second
+        // write's CAS would see `deleted_by == own txn` and mint another
+        // version instead of conflicting.
+        let n = adapter
+            .update("t", &[(0, row(&[1, 11])), (0, row(&[1, 11]))])
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let rows = adapter.scan("t").await.unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "an update fed a duplicated position minted two live versions"
+        );
+        assert_eq!(rows[0], row(&[1, 11]));
+    }
+
     #[tokio::test]
     async fn adapter_vacuum_rebuilds_secondary_version_indices() {
         let adapter = MvccStorageAdapter::new();
@@ -6585,6 +6662,20 @@ impl MvccStorageAdapter {
         // scan_where_eq_positions / scan_physical), NOT scan-order positions —
         // mutate each version directly so the write always lands on the row that
         // row-finding matched, never a re-scan position that could be the wrong row.
+        //
+        // One version named twice is ONE row, not two — `delete` has always
+        // sorted+deduped its position list for this reason. Processing a
+        // duplicated position twice under one transaction used to be
+        // unreachable (index lookups returned each version at most once);
+        // since the unique gate trusts an index-assisted position feed, a
+        // duplicated entry minted TWO new versions of the same row in one
+        // txn — both committed-live, duplicating the PRIMARY KEY. The second
+        // write's CAS sees `deleted_by == own txn` ("already ours") and
+        // pushes another version instead of conflicting, so nothing else
+        // stops it here.
+        let mut updates: Vec<(usize, Row)> = updates.to_vec();
+        updates.sort_unstable_by_key(|(vidx, _)| *vidx);
+        updates.dedup_by_key(|(vidx, _)| *vidx);
         let mut count = 0;
         // NU-07: multi-row auto-commit updates are one statement and get a
         // real WAL transaction; single-row autos keep the txn-0 record.
@@ -6601,7 +6692,7 @@ impl MvccStorageAdapter {
         // (old_vidx, new_vidx, old_row, new_row) of each applied update, for
         // auto-commit incremental index maintenance.
         let mut applied: Vec<(usize, usize, Arc<Row>, Row)> = Vec::new();
-        for (version_idx, new_row) in updates {
+        for (version_idx, new_row) in &updates {
             // Skip stale/out-of-range version indices (matches the old pos<len guard).
             let Some(old_row) = self.engine.row_at(table, *version_idx) else {
                 continue;
