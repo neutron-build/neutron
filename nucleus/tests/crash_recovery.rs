@@ -137,12 +137,22 @@ async fn crash_crc_corruption_detected() {
         std::fs::write(&path, data).unwrap();
     }
 
-    // Phase 3: Reopen — should not panic, recovery stops at corrupt record
+    // Phase 3: Reopen — WAL v2 fails closed on provable mid-file corruption
+    // (NU-04): a complete frame with a bad header CRC is damage, not a torn
+    // tail, so the open refuses rather than serving a partial history. The
+    // pre-v2 contract (skip the corrupt record and open anyway) is gone by
+    // design; this test pins the fail-closed behavior.
     {
         let result = Database::durable_mvcc(dir.path());
-        assert!(result.is_ok(), "recovery should not panic on corrupt WAL");
-        // The database may have partial data depending on which record was
-        // corrupted, but it should be internally consistent and not crash.
+        assert!(
+            result.is_err(),
+            "mid-file CRC corruption must fail the open, not serve partial data"
+        );
+        let err = result.err().unwrap().to_string();
+        assert!(
+            err.to_lowercase().contains("corrupt"),
+            "error must name corruption: {err}"
+        );
     }
 }
 

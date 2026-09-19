@@ -95,19 +95,28 @@ fn flip_in_last_record_payload_is_crc_rejected() {
     let original = std::fs::read(&wal).unwrap();
 
     // Flip a byte a few positions before the end — lands in the last record's
-    // payload. CRC must reject it; that record is skipped, earlier rows survive.
+    // payload. WAL v2 (NU-04): the record is fully present (complete header
+    // AND full payload length), so a payload CRC mismatch is provable damage
+    // — the open fails closed and the WAL is left unmodified. The pre-v2
+    // contract (skip the record, serve earlier rows) is gone by design; a
+    // genuinely torn final record (short payload) is covered by the
+    // torn-tail suites.
     let mut torn = original.clone();
     let pos = original.len() - 6;
     torn[pos] ^= 0xFF;
     std::fs::write(&wal, &torn).unwrap();
 
-    let db = Database::durable_mvcc(dir.path()).expect("reopen must not panic on flipped tail");
-    let rt = rt();
-    let recovered = rows(&db, &rt);
-    for (id, c1) in &recovered {
-        assert!((1..=6).contains(id), "resurrected non-committed id {id}");
-        assert_eq!(*c1, format!("Some(Text(\"v{id}\"))"));
-    }
+    let result = Database::durable_mvcc(dir.path());
+    let err = result
+        .err()
+        .expect("full-record payload corruption must fail the open")
+        .to_string();
+    assert!(
+        err.to_lowercase().contains("corrupt"),
+        "error must name corruption: {err}"
+    );
+    let after = std::fs::read(&wal).unwrap();
+    assert_eq!(after, torn, "the refused open must leave the WAL unmodified");
 }
 
 #[test]
