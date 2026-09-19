@@ -18,7 +18,7 @@
 //! * `VACUUM` — reclaims space inside the data files.
 //! * `CHECKPOINT` — flushes and truncates WAL segments.
 
-use sqlparser::ast::Statement;
+use sqlparser::ast::{self, Visit, Statement};
 
 use super::{ExecError, Executor};
 
@@ -177,6 +177,47 @@ fn side_effecting(fname: &str) -> bool {
 #[cfg(not(feature = "server"))]
 fn side_effecting(_fname: &str) -> bool {
     false
+}
+
+/// Visitor that stops at the first scalar-function call the engine classifies
+/// as a write. Used by the snapshot-lease writer gate, which runs at dispatch
+/// time and therefore must see the mutation in the AST — the eval-time guard
+/// (`scalar_fns.rs`'s degraded-mode check) fires too late to WAIT, and a
+/// sync eval cannot take the async gate.
+struct MutatingFnVisitor {
+    found: bool,
+}
+
+impl sqlparser::ast::Visitor for MutatingFnVisitor {    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &ast::Expr) -> std::ops::ControlFlow<Self::Break> {
+        if let ast::Expr::Function(func) = expr {
+            // Same canonicalization the scalar dispatcher applies: strip the
+            // schema qualifier and upper-case. `pg_catalog.kv_set(...)` must
+            // not sail past the gate the way it once sailed past the RLS
+            // specialty guard (see the SECURITY ORDERING note in
+            // `eval_scalar`).
+            let name = func.name.to_string().to_uppercase();
+            let bare = name.rsplit('.').next().unwrap_or(&name);
+            if scalar_fn_mutates(bare) {
+                self.found = true;
+                return std::ops::ControlFlow::Break(());
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+/// Whether a statement carries a mutating specialty-store function call
+/// anywhere in its expressions (`SELECT kv_set(...)`, a `WHERE
+/// doc_insert(...) = 1`, a subquery projection, ...). The snapshot-lease
+/// writer gate treats such a statement exactly like DML: it parses as a
+/// Query, but it writes.
+#[cfg(feature = "server")]
+pub(super) fn statement_carries_mutating_scalar_fn(stmt: &Statement) -> bool {
+    let mut visitor = MutatingFnVisitor { found: false };
+    let _ = stmt.visit(&mut visitor);
+    visitor.found
 }
 
 impl Executor {

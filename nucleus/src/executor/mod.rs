@@ -6436,7 +6436,7 @@ impl Executor {
             // consumer drives over the wire. See `snapshot_lease`.
             #[cfg(feature = "server")]
             if upper.starts_with("ACQUIRE SNAPSHOT LEASE") {
-                return Ok(vec![self.execute_acquire_snapshot_lease(trimmed)?]);
+                return Ok(vec![self.execute_acquire_snapshot_lease(trimmed).await?]);
             }
             #[cfg(feature = "server")]
             if upper.starts_with("RELEASE SNAPSHOT LEASE") {
@@ -6711,8 +6711,21 @@ impl Executor {
         // deadlock the gate against itself). Placement here, at the
         // single dispatch every entry point routes through, is what makes
         // the boundary cross-statement and cross-connection.
+        //
+        // SELECT-carried specialty writes (`SELECT kv_set(...)`) parse as
+        // Queries and so do not match `statement_blocks_on_snapshot_lease`;
+        // the AST walk for them only runs while a lease is actually held,
+        // so the no-lease path keeps its O(matches) cost. This is the
+        // KV-scalar-bypass defect from the 2026-09-18 teploy-observe
+        // reports: the SQL scalar functions are how every SQL client
+        // writes KV, so the lease must see them.
         #[cfg(feature = "server")]
-        if statements.iter().any(Self::statement_blocks_on_snapshot_lease) {
+        if statements.iter().any(Self::statement_blocks_on_snapshot_lease)
+            || (self.snapshot_leases.holder().is_some()
+                && statements
+                    .iter()
+                    .any(admission::statement_carries_mutating_scalar_fn))
+        {
             self.gate_mutation_on_snapshot_lease().await?;
         }
         // Cluster-mode DML routing: followers forward to leader; leader appends to Raft log.

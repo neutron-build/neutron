@@ -1243,6 +1243,16 @@ impl StorageEngine for BufferedDiskEngine {
 
     // -- Transaction lifecycle --
 
+    fn session_has_uncommitted_writes(&self, session_id: u64) -> bool {
+        // An empty ops list is a BEGIN-only transaction: nothing buffered,
+        // nothing to drain. Anything else (rows, DDL) is a write this
+        // session has not committed or rolled back yet.
+        self.txn_bufs
+            .read()
+            .get(&session_id)
+            .is_some_and(|txn| !txn.ops.is_empty())
+    }
+
     fn set_pending_enlistment(&self, body: [u8; 10]) {
         let id = current_session_id();
         self.pending_enlistment.write().insert(id, body);

@@ -851,6 +851,26 @@ pub trait StorageEngine: Send + Sync {
     /// no-op for SNAPSHOT/SERIALIZABLE (snapshot is fixed at BEGIN) and for
     /// engines without MVCC. Default: no-op.
     fn refresh_statement_snapshot(&self) {}
+    /// Whether `session_id`'s open transaction holds uncommitted writes
+    /// inside THIS engine (buffered ops, undo-logged versions). The
+    /// snapshot-lease acquire path drains such transactions before taking
+    /// the lease (Consumer-2 follow-up): on engines without versioning a
+    /// parked writer's uncommitted rows are already visible to readers, and
+    /// on every engine its COMMIT could land mid-window. Engines whose
+    /// in-transaction writes are the executor's responsibility (before-images
+    /// in `TxnState::engine_snapshots`, cross-model enlistment) keep the
+    /// default — the executor's drain predicate covers those.
+    fn session_has_uncommitted_writes(&self, _session_id: u64) -> bool {
+        false
+    }
+    /// Pin the current session's transaction read snapshot to the CURRENT
+    /// committed moment, regardless of isolation level (snapshot-lease
+    /// acquire): the lease's point-in-time view is the ACQUIRE moment, not
+    /// the BEGIN moment, so a versioning engine re-takes the snapshot here
+    /// and suppresses the per-statement READ COMMITTED refresh for the rest
+    /// of the transaction. No-op for engines without snapshots (the lease's
+    /// writer gate + drain freeze the committed state for them).
+    fn refresh_txn_snapshot(&self) {}
     /// Flush all dirty data to stable storage. Engines that don't persist
     /// can no-op (the default).
     async fn flush_all_dirty(&self) -> Result<(), StorageError> {

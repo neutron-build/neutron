@@ -1096,6 +1096,11 @@ pub struct MvccSessionState {
     pub(super) doomed: std::sync::atomic::AtomicBool,
     /// Isolation level for the next BEGIN (set via SET TRANSACTION ISOLATION LEVEL).
     pub(super) next_isolation: parking_lot::RwLock<IsolationLevel>,
+    /// Set while this session's transaction holds a snapshot lease: the
+    /// acquire pinned the read snapshot to the ACQUIRE moment, so the
+    /// per-statement READ COMMITTED refresh must not move it mid-lease.
+    /// Cleared at BEGIN/COMMIT/ROLLBACK of the next transaction.
+    pub(super) lease_pinned: std::sync::atomic::AtomicBool,
 }
 
 impl Default for MvccSessionState {
@@ -1113,6 +1118,7 @@ impl MvccSessionState {
             undo_log: parking_lot::RwLock::new(Vec::new()),
             doomed: std::sync::atomic::AtomicBool::new(false),
             next_isolation: parking_lot::RwLock::new(IsolationLevel::Snapshot),
+            lease_pinned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -3215,6 +3221,8 @@ impl StorageEngine for MvccStorageAdapter {
             return Err(e);
         }
         sess.undo_log.write().clear();
+        sess.lease_pinned
+            .store(false, std::sync::atomic::Ordering::Release);
         *lock = Some(txn);
         Ok(())
     }
@@ -3357,6 +3365,8 @@ impl StorageEngine for MvccStorageAdapter {
         }
         sess.savepoints.write().clear();
         sess.undo_log.write().clear();
+        sess.lease_pinned
+            .store(false, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -3387,6 +3397,8 @@ impl StorageEngine for MvccStorageAdapter {
         sess.dirty_tables.write().clear();
         sess.savepoints.write().clear();
         sess.undo_log.write().clear();
+        sess.lease_pinned
+            .store(false, std::sync::atomic::Ordering::Release);
         // A full ROLLBACK is the sanctioned exit from a doomed transaction
         // (NU-03 round 2): the whole transaction's effects are discarded, so
         // the session may start fresh.
@@ -3839,11 +3851,44 @@ impl StorageEngine for MvccStorageAdapter {
 
     fn refresh_statement_snapshot(&self) {
         let sess = self.mvcc_session();
+        if sess
+            .lease_pinned
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            // A lease holder's snapshot is pinned to the ACQUIRE moment;
+            // the per-statement READ COMMITTED refresh would move it.
+            return;
+        }
         let mut lock = sess.session_txn.write();
         if let Some(ref mut txn) = *lock
             && txn.isolation == IsolationLevel::ReadCommitted
         {
             self.engine.txn_mgr().refresh_snapshot(txn);
+        }
+    }
+
+    fn session_has_uncommitted_writes(&self, session_id: u64) -> bool {
+        let sess = if session_id != 0
+            && let Some(sess) = self.mvcc_sessions.read().get(&session_id)
+        {
+            sess.clone()
+        } else {
+            self.default_mvcc_session.clone()
+        };
+        !sess.undo_log.read().is_empty() || !sess.dirty_tables.read().is_empty()
+    }
+
+    fn refresh_txn_snapshot(&self) {
+        // The lease's moment is the ACQUIRE instant: re-take this
+        // transaction's snapshot now (whatever commits happened between
+        // BEGIN and ACQUIRE are pre-window and belong in the view) and pin
+        // it for the rest of the transaction.
+        let sess = self.mvcc_session();
+        let mut lock = sess.session_txn.write();
+        if let Some(ref mut txn) = *lock {
+            self.engine.txn_mgr().refresh_snapshot(txn);
+            sess.lease_pinned
+                .store(true, std::sync::atomic::Ordering::Release);
         }
     }
 

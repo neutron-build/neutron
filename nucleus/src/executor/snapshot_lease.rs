@@ -3,14 +3,28 @@
 //! A point-in-time backup boundary: `ACQUIRE SNAPSHOT LEASE` pins one
 //! database-wide mutation window. While the lease is held:
 //!
-//! - the holder's transaction keeps its MVCC snapshot (stable across
-//!   statements), so its reads are one logical moment across every table;
-//! - every OTHER session's SQL mutations (DML + table-shape DDL) WAIT at
+//! - the holder's transaction keeps a read snapshot pinned to the ACQUIRE
+//!   moment (stable across statements), so its reads are one logical
+//!   moment across every table;
+//! - every OTHER session's SQL mutations (DML + table-shape DDL +
+//!   SELECT-carried specialty writes such as `SELECT kv_set(...)`) WAIT at
 //!   the dispatch gate until the lease is released or expires — no commit
 //!   can advance the database past the holder's moment while it reads;
 //! - the holder's own mutations are refused (the lease view is read-only;
 //!   letting the holder write would both dirty the "moment" and deadlock
 //!   the writer gate against itself).
+//!
+//! Acquisition DRAINS first: `ACQUIRE` waits (bounded by the lease's own
+//! TIMEOUT) for every other session's open write-bearing transaction to
+//! end. A transaction that already executed its writes when the lease is
+//! requested is invisible to the writer gate — its COMMIT would land
+//! mid-window and, on engines without versioning (the disk stack, and
+//! per-table override engines whose writes are immediate), its uncommitted
+//! rows are visible to readers outright. Draining resolves both before the
+//! window opens: an idle transaction that has written nothing does not
+//! block acquisition. On versioning engines the holder's snapshot is then
+//! re-taken at the acquire instant (`refresh_txn_snapshot`), so the pinned
+//! moment is ACQUIRE, not BEGIN.
 //!
 //! Because no writer can commit during the window, even plain autocommit
 //! reads from unrelated sessions observe the same frozen state — a dump
@@ -23,8 +37,13 @@
 //! the deadline; blocked writers wake at the deadline at the latest).
 //!
 //! Scope, stated honestly: the gate covers SQL statements through the
-//! executor's central dispatch. The KV wire fast path and specialty-model
-//! writes that bypass the executor are not lease-gated.
+//! executor's central dispatch, the KV wire fast path, and the
+//! SELECT-carried specialty functions the dispatch can see in the AST.
+//! Specialty-model writes that bypass all of those (RESP-wire direct,
+//! streams/CDC appends from background tasks) are not lease-gated, and a
+//! mutation that is already mid-statement at the acquire instant races the
+//! drain the same way it races the DML gate — the lease cannot retroactively
+//! stop work that began before it existed.
 
 use std::time::Duration;
 
@@ -180,14 +199,78 @@ impl SnapshotLeaseRegistry {
 /// SQL surface for the lease: `ACQUIRE SNAPSHOT LEASE [TIMEOUT <millis>]`,
 /// `RELEASE SNAPSHOT LEASE`, and `SHOW SNAPSHOT LEASE`.
 impl super::Executor {
+    /// Whether `session`'s open transaction holds uncommitted writes, from
+    /// the EXECUTOR's side: before-images for tables served by engines with
+    /// no transaction of their own (per-table overrides, a non-MVCC default
+    /// engine), cross-model enlistment (KV/specialty writes inside the
+    /// transaction), or staged policy/GIN/derived-state changes. The
+    /// engine's own buffers are asked through
+    /// [`StorageEngine::session_has_uncommitted_writes`].
+    async fn session_txn_has_uncommitted_writes(&self, id: u64, session: &super::Session) -> bool {
+        if !session
+            .txn_active
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        if self.storage.session_has_uncommitted_writes(id) {
+            return true;
+        }
+        if session
+            .cross_model
+            .lock()
+            .as_ref()
+            .is_some_and(|cm| !cm.enlisted.is_empty())
+        {
+            return true;
+        }
+        let txn = session.txn_state.read().await;
+        !txn.engine_snapshots.is_empty()
+            || txn.policy_dirty
+            || txn.gin_dirty
+            || !txn.derived_dirty_tables.is_empty()
+    }
+
+    /// Count of OTHER sessions whose open transactions hold uncommitted
+    /// writes — the acquisition drain set. Named sessions plus, when the
+    /// acquiring session is not itself the shared default (id 0), the
+    /// default session too: embedded/background statements that never
+    /// created a session land there, and their transaction is exactly as
+    /// able to straddle the window.
+    async fn foreign_write_bearing_txns(&self, me: u64) -> usize {
+        let sessions: Vec<(u64, std::sync::Arc<super::Session>)> = self
+            .sessions
+            .read()
+            .iter()
+            .map(|(id, s)| (*id, s.clone()))
+            .collect();
+        let mut n = 0;
+        for (id, session) in &sessions {
+            if *id == me {
+                continue;
+            }
+            if self.session_txn_has_uncommitted_writes(*id, session).await {
+                n += 1;
+            }
+        }
+        if me != 0
+            && self
+                .session_txn_has_uncommitted_writes(0, &self.default_session)
+                .await
+        {
+            n += 1;
+        }
+        n
+    }
+
     /// ACQUIRE SNAPSHOT LEASE [TIMEOUT <millis>].
     ///
     /// Requires an active transaction: the lease's point-in-time view IS the
-    /// transaction's MVCC snapshot, and tying the lease to the transaction is
+    /// transaction's read snapshot, and tying the lease to the transaction is
     /// what makes release-on-commit/rollback structural rather than best
     /// effort. Fails with the remaining window if another session holds the
     /// lease.
-    pub(super) fn execute_acquire_snapshot_lease(
+    pub(super) async fn execute_acquire_snapshot_lease(
         &self,
         sql: &str,
     ) -> Result<super::ExecResult, super::ExecError> {
@@ -231,6 +314,52 @@ impl super::Executor {
                 "this session already holds the snapshot lease".into(),
             ));
         }
+        // Refuse to acquire inside a transaction that has already written.
+        // The lease's moment cannot include the holder's own uncommitted
+        // work (its snapshot would, on every engine, expose it to the
+        // "frozen" view), and draining FOREIGN writers while this
+        // transaction holds write-side resources (unique slots, row locks)
+        // can deadlock a writer the drain is waiting for.
+        {
+            let session = self.current_session();
+            if self
+                .session_txn_has_uncommitted_writes(session_id, &session)
+                .await
+            {
+                return Err(super::ExecError::Runtime(
+                    "ACQUIRE SNAPSHOT LEASE: this transaction has already written — \
+                     acquire at transaction start, before any writes"
+                        .into(),
+                ));
+            }
+        }
+        // DRAIN: wait for every other session's write-bearing transaction
+        // to end, bounded by the lease's own TIMEOUT. A writer whose
+        // statement ran before the lease existed is invisible to the writer
+        // gate; without the drain its COMMIT would land mid-window (and on
+        // engines without versioning its uncommitted rows are readable
+        // outright). An idle transaction that has written nothing does not
+        // block.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            let blockers = self.foreign_write_bearing_txns(session_id).await;
+            if blockers == 0 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(super::ExecError::Runtime(format!(
+                    "ACQUIRE SNAPSHOT LEASE: timed out waiting for {blockers} \
+                     in-flight writer transaction(s) to end — retry, or raise TIMEOUT"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Pin the holder's read view to THIS instant. On versioning engines
+        // the transaction's snapshot is re-taken (the moment is ACQUIRE,
+        // not BEGIN — commits between the two belong in the view) and held
+        // for the rest of the transaction. Elsewhere a no-op: the drain +
+        // writer gate are what freeze the state there.
+        self.storage.refresh_txn_snapshot();
         self.snapshot_leases
             .try_acquire(session_id, timeout_ms)
             .map_err(|refusal| super::ExecError::Runtime(refusal.to_string()))?;
