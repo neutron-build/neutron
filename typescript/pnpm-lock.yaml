@@ -4,9 +4,6 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
-overrides:
-  fast-xml-parser@>=5.0.0 <5.7.0: '>=5.7.0'
-
 importers:
 
   .:
@@ -58,6 +55,25 @@ importers:
       vite:
         specifier: ^6.0.7
         version: 6.4.1(@types/node@25.9.1)(jiti@2.6.1)(tsx@4.21.0)(yaml@2.8.2)
+
+  apps/observe:
+    dependencies:
+      '@neutron-build/cli':
+        specifier: workspace:*
+        version: link:../../packages/neutron-cli
+      '@neutron-build/core':
+        specifier: workspace:*
+        version: link:../../packages/neutron
+      preact:
+        specifier: 10.25.4
+        version: 10.25.4
+      uplot:
+        specifier: 1.6.31
+        version: 1.6.31
+    devDependencies:
+      typescript:
+        specifier: 5.7.2
+        version: 5.7.2
 
   apps/playground:
     dependencies:
@@ -4841,6 +4857,9 @@ packages:
     hasBin: true
     peerDependencies:
       browserslist: '>= 4.21.0'
+
+  uplot@1.6.31:
+    resolution: {integrity: sha512-sQZqSwVCbJGnFB4IQjQYopzj5CoTZJ4Br1fG/xdONimqgHmsacvCjNesdGDypNKFbrhLGIeshYhy89FxPF+H+w==}
 
   use-callback-ref@1.3.3:
     resolution: {integrity: sha512-jQL3lRnocaFtu3V00JToYz/4QkNWswxijDaCVNZRiRTO3HQDLsdu1ZtmIUvV4yPp+rvWm5j0y0TG/S61cuijTg==}
@@ -9708,6 +9727,8 @@ snapshots:
       browserslist: 4.28.1
       escalade: 3.2.0
       picocolors: 1.1.1
+
+  uplot@1.6.31: {}
 
   use-callback-ref@1.3.3(@types/react@19.2.14)(react-compat-shim@file:compat-matrix/shims/react):
     dependencies:

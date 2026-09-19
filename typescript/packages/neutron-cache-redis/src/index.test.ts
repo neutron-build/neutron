@@ -181,7 +181,7 @@ test("app.clear uses SCAN when client supports it", async () => {
     status: 200,
     statusText: "OK",
     headers: [],
-    body: "<h1>Home</h1>",
+    body: new TextEncoder().encode("<h1>Home</h1>"),
     expiresAt: Date.now() + 60_000,
   });
   await stores.loader.set("/home::route::{}", {
@@ -208,7 +208,7 @@ test("app.clear falls back to KEYS when scan is unavailable", async () => {
     status: 200,
     statusText: "OK",
     headers: [],
-    body: "<h1>About</h1>",
+    body: new TextEncoder().encode("<h1>About</h1>"),
     expiresAt: Date.now() + 60_000,
   });
 
@@ -229,21 +229,21 @@ test("app.deleteByPath removes indexed entries for the selected pathname only", 
     status: 200,
     statusText: "OK",
     headers: [],
-    body: "<h1>Home A</h1>",
+    body: new TextEncoder().encode("<h1>Home A</h1>"),
     expiresAt: Date.now() + 60_000,
   });
   await stores.app.set("html:/home?view=2", {
     status: 200,
     statusText: "OK",
     headers: [],
-    body: "<h1>Home B</h1>",
+    body: new TextEncoder().encode("<h1>Home B</h1>"),
     expiresAt: Date.now() + 60_000,
   });
   await stores.app.set("html:/about", {
     status: 200,
     statusText: "OK",
     headers: [],
-    body: "<h1>About</h1>",
+    body: new TextEncoder().encode("<h1>About</h1>"),
     expiresAt: Date.now() + 60_000,
   });
 
@@ -287,7 +287,7 @@ test("app path index ttl is never shortened by a shorter-lived variant", async (
     status: 200 as const,
     statusText: "OK",
     headers: [] as [],
-    body: "<h1>long lived</h1>",
+    body: new TextEncoder().encode("<h1>long lived</h1>"),
     expiresAt: Date.now() + 600_000,
   };
   await stores.app.set("html:/deep", longEntry);
@@ -297,7 +297,7 @@ test("app path index ttl is never shortened by a shorter-lived variant", async (
 
   await stores.app.set("html:/deep?view=quick", {
     ...longEntry,
-    body: "<h1>short lived</h1>",
+    body: new TextEncoder().encode("<h1>short lived</h1>"),
     expiresAt: Date.now() + 10_000,
   });
   const ttlAfterShort = await client.ttl(indexKey);
@@ -351,7 +351,7 @@ test("concurrent write during invalidation stays invalidatable", async () => {
     status: 200,
     statusText: "OK",
     headers: [],
-    body: "variant 1",
+    body: new TextEncoder().encode("variant 1"),
     expiresAt: Date.now() + 60_000,
   });
 
@@ -390,7 +390,7 @@ test("concurrent write during invalidation stays invalidatable", async () => {
     status: 200,
     statusText: "OK",
     headers: [],
-    body: "variant 2",
+    body: new TextEncoder().encode("variant 2"),
     expiresAt: Date.now() + 60_000,
   });
   assert.equal(client.hasKey("test:idx:app:/race"), true);

@@ -77,9 +77,10 @@ export function capRequestBody(request: Request, capBytes: number): Request {
     headers: request.headers,
     body: capped,
     // A streaming body requires half-duplex in fetch-land Request
-    // construction; without it Node's undici rejects the init.
+    // construction; without it Node's undici rejects the init. Older
+    // lib.dom RequestInit typings predate the duplex option, hence the cast.
     duplex: "half",
-  });
+  } as RequestInit);
 }
 
 export interface InputLimitsOptions {
