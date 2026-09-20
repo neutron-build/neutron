@@ -1,0 +1,10 @@
+# The arm64 linux target is cross-compiled, and `cross` resolves its toolchain
+# image from a moving tag when unpinned — master moved to a newer-glibc base
+# and the v1.1.0 arm64 layer shipped requiring GLIBC_2.38, which the
+# debian:bookworm-slim runtime image (2.36) cannot load. Pin both the tool
+# (workflow installs cross 0.2.5) and the target image (0.2.5, ubuntu 20.04
+# base, glibc 2.31) so cross-built binaries stay loadable on the runtime and
+# on older self-hosted hosts alike. Bump deliberately, with a fresh check of
+# the image's glibc against the runtime base.
+[target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:0.2.5"
