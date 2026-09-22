@@ -98,7 +98,21 @@ neutron migrate
 neutron migrate --dir db/migrations    # custom directory
 ```
 
-Migrations are `.up.sql` files named `{NNN}_{name}.up.sql`. Each runs in a transaction.
+Migrations are `.up.sql` files named `{NNN}_{name}.up.sql`. Each runs in a transaction that also records its history row (version, checksum, owner, format), so a migration is either fully applied or not applied at all.
+
+Runners are serialized across processes with a PostgreSQL session-level advisory lock held on a dedicated connection from the history read through the final apply. Transaction-pooled proxies (for example PgBouncer in transaction mode) are unsupported for migration connections — use a direct or session-pooled connection.
+
+Applied migrations record a SHA-256 checksum of their SQL; a modified applied migration fails the next run before anything new is applied. `neutron migrate` targets PostgreSQL — for Nucleus databases use the language SDK runners (`go/nucleus`, `@neutron-build/nucleus`), which stay experimental.
+
+### `neutron migrate adopt`
+
+Adopt a legacy migration history into the current protocol, in one transaction.
+
+```bash
+neutron migrate adopt
+```
+
+Databases with histories written by an older CLI, or by the Go/TS Nucleus SDKs (integer version columns), are refused by `neutron migrate` until adopted once. Adoption matches history rows to files by exact version text (`001` and `1` are never treated as the same migration), verifies what can be proven (a legacy SDK checksum that reproduces from the supplied file), and reports everything else as unverified — checksums are never fabricated.
 
 ### `neutron migrate status`
 
