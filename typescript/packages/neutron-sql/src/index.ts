@@ -29,6 +29,8 @@ export {
   type ColumnDataType,
   type JsTypeOf,
   type JsWriteTypeOf,
+  type BigintRead,
+  type TemporalRead,
   type SelectTypeOf,
   type RelationLeafTypeOf,
   type RelationSelectTypeOf,
@@ -139,6 +141,19 @@ export {
 export { compile, compileStatement, type CompileState, type CompiledQuery } from "./compile.js";
 
 export { schemaToDDL, createTableSQL, createIndexSQL, dropTableSQL, addForeignKeySQL, sqlTypeOf } from "./ddl.js";
+
+export {
+  jsonNull,
+  isJsonNull,
+  type BigintMode,
+  type BigintOptions,
+  type TemporalMode,
+  type TemporalOptions,
+  type NumericOptions,
+  type JsonNullValue,
+  type ColumnCodec,
+  type CodecRead,
+} from "./codecs.js";
 
 export {
   createDatabase,

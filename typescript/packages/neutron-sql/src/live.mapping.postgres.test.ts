@@ -264,18 +264,18 @@ for (const driverKind of ["postgres", "pg"] as const) {
     });
   });
 
-  test(`live mapping (${driverKind}): V02 int8/numeric arrive as strings — never coerced numbers`, async () => {
+  test(`live mapping (${driverKind}): int8 arrives as bigint (F03 default mode) and numeric as exact strings — never coerced numbers`, async () => {
     await withSuite(driverKind, async ({ db }) => {
       await db.insert(accounts).values({ ownerId: 9007199254740993n, balance: "12345678901234567890.123456789" });
       const rows = await db.select().from(accounts);
-      assert.equal(typeof rows[0].ownerId, "string", "int8 select arrives as string");
-      assert.equal(rows[0].ownerId, "9007199254740993");
-      assert.equal(typeof rows[0].balance, "string", "numeric select arrives as string");
+      assert.equal(typeof rows[0].ownerId, "bigint", "int8 select arrives as bigint (default mode)");
+      assert.equal(rows[0].ownerId, 9007199254740993n);
+      assert.equal(typeof rows[0].balance, "string", "numeric select arrives as its exact decimal string");
       assert.equal(rows[0].balance, "12345678901234567890.123456789");
 
       const ret = await db.insert(accounts).values({ ownerId: "9007199254740995", balance: 1.5 }).returning();
-      assert.equal(typeof ret[0].ownerId, "string", "int8 returning arrives as string");
-      assert.equal(ret[0].ownerId, "9007199254740995");
+      assert.equal(typeof ret[0].ownerId, "bigint", "int8 returning arrives as bigint");
+      assert.equal(ret[0].ownerId, 9007199254740995n);
       assert.equal(ret[0].balance, "1.5");
 
       // Oracle: raw text representation, no ORM in the path.
@@ -326,13 +326,13 @@ for (const driverKind of ["postgres", "pg"] as const) {
         async () => {
           await db.insert(people).values({ firstName: { nested: true }, lastName: "X" } as never);
         },
-        /invalid value for column "firstName" \("first_name"\) on people: nested object/,
+        /column "firstName" \("first_name"\) on people: text columns accept strings/,
       );
       await assert.rejects(
         async () => {
           await db.update(people).set({ lastName: { nested: true } as never }).where(eq(people.id, 1));
         },
-        /invalid value for column "lastName" \("last_name"\) on people/,
+        /column "lastName" \("last_name"\) on people: text columns accept strings/,
       );
       const cnt = await db.driver.query<{ n: number }>("select count(*)::int as n from people");
       assert.equal(cnt[0].n, 0, "rejected operations never touched the table");

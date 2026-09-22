@@ -3,6 +3,7 @@ import type {
   Schema, NucleusFeatures, QueryResult,
   ColumnDetail, IndexDetail, SavedQuery, FKDetail,
 } from './types'
+import { decodeRows } from './wire'
 
 const BASE = '/api'
 
@@ -21,6 +22,14 @@ async function request<T>(
     throw new Error(text || `HTTP ${res.status}`)
   }
   return res.json() as Promise<T>
+}
+
+/** Query results may carry tagged cells for bigint/decimal/binary/temporal
+ *  values (lossless across JSON.parse); decode them, passthrough otherwise. */
+async function requestQueryResult(method: string, path: string, body?: unknown): Promise<QueryResult> {
+  const result = await request<QueryResult>(method, path, body)
+  if (Array.isArray(result.rows)) decodeRows(result.rows)
+  return result
 }
 
 // --- Connections ---
@@ -46,7 +55,7 @@ export const api = {
   // --- Query ---
 
   query: (sql: string, connectionId: string, params?: unknown[]) =>
-    request<QueryResult>('POST', '/query', { sql, connectionId, params }),
+    requestQueryResult('POST', '/query', { sql, connectionId, params }),
 
   // --- Schema ---
 
@@ -79,7 +88,7 @@ export const api = {
       params.set('sortColumn', sort.column)
       params.set('sortDir', sort.dir)
     }
-    return request<QueryResult>('GET', `/table?${params.toString()}`)
+    return requestQueryResult('GET', `/table?${params.toString()}`)
   },
 
   tableUpdate: (input: {

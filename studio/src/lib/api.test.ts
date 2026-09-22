@@ -102,6 +102,25 @@ describe('api', () => {
       })
     })
 
+    it('decodes tagged lossless cells in query results, passes plain cells through', async () => {
+      mockOk({
+        columns: ['id', 'balance', 'payload', 'posted_at', 'name'],
+        rows: [
+          [{ t: 'int8', v: '9007199254740993' }, { t: 'numeric', v: '1.50' }, { t: 'bytea', v: '00ff10' }, { t: 'timestamptz', v: '2026-03-08T07:30:00.123456Z' }, 'plain'],
+        ],
+        rowCount: 1,
+        duration: 2,
+      })
+
+      const result = await api.query('SELECT * FROM t', 'c1')
+      const row = result.rows[0]
+      expect(row[0]).toBe(9007199254740993n)
+      expect(row[1]).toBe('1.50')
+      expect(Array.from(row[2] as Uint8Array)).toEqual([0x00, 0xff, 0x10])
+      expect(row[3]).toBe('2026-03-08T07:30:00.123456Z')
+      expect(row[4]).toBe('plain')
+    })
+
     it('should pass params when provided', async () => {
       mockOk({ columns: [], rows: [], rowCount: 0, duration: 1 })
 

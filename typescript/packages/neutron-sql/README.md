@@ -165,19 +165,67 @@ errors.
   `.set()` assignments on every column type except `json`/`jsonb`, where
   object values always bind as values.
 
-### Corrected pre-1.0 types (migration note)
+### Lossless value codecs (and the corrected pre-1.0 types)
 
-`bigint` (int8) and `numeric` results are typed `string` — both drivers return
-them as strings today, and this package never coerces values. Through
-relational `with` reads they are rendered `::text` inside the JSON aggregation,
-so they arrive there as exact strings too (values beyond
-`Number.MAX_SAFE_INTEGER` and full decimal scale survive JSON parsing).
-Writing those columns accepts `string | number | bigint` (int8) and
-`string | number` (numeric). `primaryKey()` now implies NOT NULL in a column's
-insert type, and `.values()` requires NOT NULL-without-default keys at compile
-time. Code that relied on `number` for int8 columns must read `string` (parse
-explicitly with a safe-integer check). Exact codecs (BigInt/Date modes,
-lossless transport) are a planned, separately documented change.
+Values never silently lose precision. Schema-known columns are acquired as
+lossless text in SQL (`to_jsonb(col)::text` temporals, `::text` int8/numeric
+inside JSON aggregations) or as driver-native values that are already exact
+(int8/numeric strings, bytea buffers), then decoded per column mode. No
+global driver parser is ever mutated, and lossless acquisition happens
+**before** any driver Date parsing or `JSON.parse` — a decoder cannot recover
+microseconds a `Date` already dropped or digits a double already rounded.
+
+| SQL type | Default TS value | Notes |
+|---|---|---|
+| int2/int4/serial | `number` | integer + range validated on write |
+| int8 (bigint) | `bigint` | never passes through JS Number; `mode: "string"` keeps the exact string; `mode: "number"` is a checked safe-number mode that rejects values outside ±(2^53−1) |
+| numeric | `string` | exact decimal string (scale and trailing zeros preserved); optional per-column `decoder` — a decoder that narrows to number owns the precision loss |
+| float4/float8 | `number` | non-finite numbers (NaN/±Infinity) are rejected on write |
+| date | `string` (`YYYY-MM-DD`) | no timezone interpretation; Date values are rejected on write |
+| timestamp (without tz) | `string` (`YYYY-MM-DDTHH:MM:SS[.ffffff]`) | timezone-free canonical string, microseconds preserved; explicit `mode: "date"` interprets the wall clock as UTC and truncates to milliseconds |
+| timestamptz | `string` (`…Z`, canonical UTC) | microseconds preserved, independent of process and server timezones; explicit `mode: "date"` gives the exact instant at millisecond precision |
+| boolean/text/uuid | `boolean`/`string`/`string` | uuid format validated on write |
+| bytea | `Uint8Array` | drivers hand back buffers |
+| json/jsonb | `unknown` | SQL NULL vs JSON null distinguished on writes (below) |
+
+Temporal **writes** take canonical strings (microsecond-exact) or `Date`
+values. A `Date` carries only an instant at millisecond precision: it stores
+its UTC wall clock into `timestamp` columns — the same `Date` stores the same
+value on every machine and process timezone — and its exact instant into
+`timestamptz`. `infinity`/`-infinity` temporal strings pass through; Date mode
+rejects them. Canonical write strings are validated with column context
+(timestamps reject offsets; timestamptz requires `Z` or `±HH:MM`; dates must
+be exactly `YYYY-MM-DD`).
+
+**SQL NULL vs JSON null (writes).** For `json`/`jsonb` columns the JS value is
+the JSON value: `null` binds SQL NULL, the exported `jsonNull` sentinel writes
+the JSON null value, and every other JSON-representable value (including
+strings, booleans and nested arrays) is JSON-encoded by the codec —
+`"null"` the string stores the JSON string `"null"`, never JSON null.
+Timestamp/json parameters bind as canonical text at explicitly text-typed
+sites (`$n::text::jsonb`), which both drivers pass through untouched:
+postgres.js otherwise re-encodes server-typed date/json parameters through
+`new Date(...).toISOString()` (timezone shift + millisecond truncation) and
+double-`JSON.stringify`s strings. On read, SQL NULL and JSON null both arrive
+as JS `null` — the distinction is preserved for writes and queryable with
+`sql` fragments (`data is null` vs `data = 'null'::jsonb`).
+
+Predicate values (`eq`/`ne`/`lt`/`lte`/`gt`/`gte`/`inArray`) run through the
+same codec: validated with column context and bound at the same safe sites.
+Values inside raw `sql` fragments are yours — no codec touches them.
+
+**Migration note (corrected pre-1.0 types).** Before this change: `bigint`
+columns read as `string`, `timestamp`/`timestamptz`/`date` columns read as
+`Date` (driver-parsed — microseconds truncated, `timestamp` reads shifted by
+the process timezone, `date` reads disagreed between drivers), relation-child
+`bytea` leaves read as `\x` hex strings, and json string writes were
+interpreted as JSON text. Now int8 reads `bigint` by default (parse with a
+safe-integer check, or declare `mode: "string"`), temporals read canonical
+microsecond-exact strings (declare `mode: "date"` where a `Date` is worth the
+millisecond truncation), temporal writes accept canonical strings as well as
+`Date`s, `date` writes take `YYYY-MM-DD` strings only, and json writes encode
+the JS value. Code that relied on `number` for int8 or `Date` for temporals
+must switch to the new types or opt into the explicit modes.
 
 ## Relational reads (one level)
 
@@ -197,16 +245,15 @@ Child order is deterministic (ordered by the target's primary key).
   compile time. Unknown relation names in `with` and unknown property keys in
   `columns` are compile errors (and runtime errors when values arrive without
   static types).
-- Child leaf values are represented losslessly and typed honestly: `bigint`/
-  `numeric` leaves are rendered `::text` inside the JSON projection and arrive
-  as exact strings (`9007199254740993` survives, trailing decimal zeros like
-  `"1.50"` keep their scale); `timestamp`/`timestamptz`/`date` leaves arrive as
-  their JSON string form (e.g. `"2026-01-01T19:04:05.678123"` — microseconds
-  intact) and `bytea` leaves as their `\x…` hex text form, so those child
-  columns are typed `string` (not `Date`/`Uint8Array`) until explicit decode
-  modes land. `int4`/`float8` and other JSON-safe leaves keep their plain
-  types. The casts apply only to the projected JSON — correlation predicates
-  and ordering keys compare raw columns.
+- Child leaf values decode through the same codecs as the flat path:
+  `bigint` leaves arrive as the column's mode value (default `bigint`),
+  `numeric` leaves as exact decimal strings (rendered `::text` inside the
+  aggregation), `timestamp`/`date` leaves as their canonical strings,
+  `timestamptz` leaves as their canonical UTC string (`to_jsonb(col at time
+  zone 'UTC')` — session-timezone independent, microseconds intact) and
+  `bytea` leaves as `Uint8Array` decoded from the `\x` hex text form. The
+  casts apply only to the projected JSON — correlation predicates and
+  ordering keys compare raw columns.
 - When a table has two foreign keys to the same target (`posts.author` +
   `posts.reviewer`), name the pair with `relationName` on both the `one()` and
   the `many()`. Reverse inference without names is allowed only when exactly
@@ -245,11 +292,14 @@ general-purpose use.
 - Implemented and live-tested: typed CRUD (`select`/`insert`/`update`/
   `delete`, `returning`), batch inserts independent of key order, one-level
   relational reads with exact result types, transactions, `toSQL()`, mapped
-  properties/NULL/required-key semantics, precision-honest int8/numeric.
+  properties/NULL/required-key semantics, lossless codecs (bigint/string/
+  safe-number int8 modes, exact numerics, microsecond temporals, bytea,
+  SQL NULL vs JSON null writes) across raw select, projection, `returning`
+  and relation paths on both drivers, verified under multiple process
+  timezones.
 - `update`/`delete` require `.where()` (foot-gun guard).
 - Deferred with explicit rejection, not implemented: nested/per-relation
-  `with` and repeated targets (Q05), decode modes beyond strings for
-  int8/numeric/temporal/bytea children (F03), generated/identity columns —
+  `with` and repeated targets (Q05), generated/identity columns —
   the schema cannot declare them yet, so the "generated-field writes are
   rejected" guarantee lands with them; `serial` stays writable per PostgreSQL
   semantics (Q07), composite constraints/enums/arrays/views in migrations

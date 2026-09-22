@@ -15,6 +15,7 @@ import { getTableColumns, getTableName } from "./schema.js";
 import type { AnyColumnBuilder, AnyPgTable, Relation, RelationOne, TableRelations } from "./schema.js";
 import type { ExecContext } from "./builder.js";
 import { run } from "./builder.js";
+import { decodeJsonLeaf, decodeNativeValue, decodeTextWire, wireReadExpr, type ColumnContext } from "./codecs.js";
 
 export interface RQBArgs {
   where?: Condition;
@@ -124,12 +125,15 @@ function pkColumnsOf(table: AnyPgTable): AnyColumnBuilder[] {
  *  from the physical columns via schema metadata (never name spelling).
  *  int8/numeric leaves render ::text: as jsonb numbers both drivers would
  *  JSON.parse them into doubles (silently corrupting values beyond 2^53 and
- *  dropping numeric scale); as text they arrive exactly, matching the declared
- *  string read types. The cast applies to the JSON projection only —
- *  correlation predicates and order keys stay raw column references. */
+ *  dropping numeric scale). timestamptz leaves render their UTC wall clock
+ *  (session-timezone independent); other temporals and bytea leaves keep
+ *  to_jsonb's exact string forms (microseconds, \x hex). Correlation
+ *  predicates and order keys stay raw column references. */
 function jsonLeaf(alias: string, column: AnyColumnBuilder): string {
   const ref = qualify(alias, column.columnName);
-  return column.dataType === "bigint" || column.dataType === "numeric" ? `${ref}::text` : ref;
+  if (column.dataType === "bigint" || column.dataType === "numeric") return `${ref}::text`;
+  if (column.dataType === "timestamptz") return `to_jsonb(${ref} at time zone 'UTC')`;
+  return ref;
 }
 
 function jsonObjectFor(table: AnyPgTable, alias: string): string {
@@ -220,19 +224,7 @@ export function buildRelationalSQL(
 
   const params: unknown[] = [];
   const tableName = getTableName(table);
-  // args.columns are property keys; map them to physical columns through
-  // metadata. Unselected columns default to the full declaration order.
-  const allEntries = Object.entries(getTableColumns(table) as Record<string, AnyColumnBuilder>).map(([propertyKey, column]) => ({
-    propertyKey,
-    column,
-  }));
-  const requested =
-    args.columns !== undefined && args.columns.length > 0
-      ? args.columns.map((key) => {
-          const entry = allEntries.find(({ propertyKey }) => propertyKey === key);
-          return { propertyKey: key, column: entry!.column };
-        })
-      : allEntries;
+  const requested = requestedEntries(table, args);
 
   const extras: string[] = [];
   for (const key of Object.keys(args.with ?? {})) {
@@ -264,8 +256,12 @@ export function buildRelationalSQL(
   }
 
   // Top-level rows are keyed by property keys (alias when the names differ).
+  // Lossy-native columns (temporals) project their lossless text wire form,
+  // exactly like the flat select path.
   const selectParts = requested.map(({ propertyKey, column }) => {
     const ref = qualify(tableName, column.columnName);
+    const wire = wireReadExpr(column.dataType, ref);
+    if (wire) return `${wire} as ${qident(propertyKey)}`;
     return propertyKey === column.columnName ? ref : `${ref} as ${qident(propertyKey)}`;
   });
   if (extras.length > 0) selectParts.push(...extras);
@@ -282,6 +278,22 @@ export function buildRelationalSQL(
   if (args.offset !== undefined) sqlText += ` offset ${args.offset}`;
 
   return { sql: sqlText, params };
+}
+
+/** args.columns are property keys; map them to physical columns through
+ *  metadata. Unselected columns default to the full declaration order. */
+function requestedEntries(table: AnyPgTable, args: RQBArgs): Array<{ propertyKey: string; column: AnyColumnBuilder }> {
+  const allEntries = Object.entries(getTableColumns(table) as Record<string, AnyColumnBuilder>).map(([propertyKey, column]) => ({
+    propertyKey,
+    column,
+  }));
+  if (args.columns !== undefined && args.columns.length > 0) {
+    return args.columns.map((key) => {
+      const entry = allEntries.find(({ propertyKey }) => propertyKey === key);
+      return { propertyKey: key, column: entry!.column };
+    });
+  }
+  return allEntries;
 }
 
 function inlineInto(fragment: { sql: string; params: readonly unknown[] }, params: unknown[]): string {
@@ -301,9 +313,54 @@ export async function findMany(
 ): Promise<Array<Record<string, unknown>>> {
   const { sql: sqlText, params } = buildRelationalSQL(table, relations, args);
   const rows = (await run(ctx, sqlText, params, "query")) as Array<Record<string, unknown>>;
+  const tableName = getTableName(table);
+  // Parent columns decode exactly like the flat select path.
+  for (const { propertyKey, column } of requestedEntries(table, args)) {
+    const wire = wireReadExpr(column.dataType, "x");
+    for (const row of rows) {
+      const raw = row[propertyKey];
+      if (raw === null || raw === undefined) continue;
+      const cctx: ColumnContext = { propertyKey, columnName: column.columnName, tableName };
+      row[propertyKey] =
+        wire !== null
+          ? decodeTextWire(column, cctx, raw)
+          : decodeNativeValue(column, cctx, raw);
+    }
+  }
+  // Children decode per target-table column: the JSON projection renders
+  // int8/numeric ::text, timestamptz as its UTC wall clock and bytea as \x
+  // hex text, so precision survives JSON.parse and decodes through the same
+  // codecs as the flat path (mode-aware).
+  const childColumns = new Map<string, Array<{ propertyKey: string; column: AnyColumnBuilder }>>();
+  for (const key of Object.keys(args.with ?? {})) {
+    const target = relations[key].targetTable;
+    childColumns.set(
+      key,
+      Object.entries(getTableColumns(target) as Record<string, AnyColumnBuilder>).map(([propertyKey, column]) => ({
+        propertyKey,
+        column,
+      })),
+    );
+  }
   for (const row of rows) {
-    for (const key of Object.keys(args.with ?? {})) {
-      if (key in row) row[key] = normalizeNested(row[key]);
+    for (const [key, columns] of childColumns) {
+      if (!(key in row)) continue;
+      row[key] = normalizeNested(row[key]);
+      const children = Array.isArray(row[key]) ? row[key] : [row[key]];
+      for (const child of children) {
+        if (child === null || typeof child !== "object") continue;
+        const target = relations[key].targetTable;
+        const targetName = getTableName(target);
+        for (const { propertyKey, column } of columns) {
+          const raw = (child as Record<string, unknown>)[propertyKey];
+          if (raw === null || raw === undefined) continue;
+          (child as Record<string, unknown>)[propertyKey] = decodeJsonLeaf(
+            column,
+            { propertyKey, columnName: column.columnName, tableName: targetName },
+            raw,
+          );
+        }
+      }
     }
   }
   return rows;

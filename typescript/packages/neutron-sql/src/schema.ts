@@ -2,6 +2,8 @@
 // @neutron-build/sql — schema definition (Drizzle-shaped, no codegen)
 // ---------------------------------------------------------------------------
 
+import type { BigintMode, BigintOptions, TemporalMode, TemporalOptions, NumericOptions } from "./codecs.js";
+
 export type ColumnDataType =
   | "serial"
   | "integer"
@@ -22,27 +24,30 @@ export type ColumnDataType =
   | "bytea"
   | "vector";
 
-/** Read type: what the drivers hand back for D today. int8/numeric arrive as
- *  strings on both drivers and are typed honestly as such (no coercion);
- *  exact codecs are a later, separately documented change. */
+/** Default read type per SQL type (the master codec table). int8 never passes
+ *  through JS Number (bigint, with optional string / checked safe-number
+ *  modes); numerics are exact decimal strings; temporals are canonical
+ *  strings (microsecond-preserving; explicit Date mode truncates to
+ *  milliseconds); dates carry no timezone interpretation. */
 export type JsTypeOf<D extends ColumnDataType> =
   D extends "serial" | "integer" | "smallint" | "double" | "real"
     ? number
-    : D extends "bigint" | "numeric" | "text" | "varchar" | "uuid"
-      ? string
-      : D extends "boolean"
-        ? boolean
-        : D extends "timestamp" | "timestamptz" | "date"
-          ? Date
+    : D extends "bigint"
+      ? bigint
+      : D extends "numeric" | "text" | "varchar" | "uuid" | "timestamp" | "timestamptz" | "date"
+        ? string
+        : D extends "boolean"
+          ? boolean
           : D extends "bytea"
             ? Uint8Array
             : D extends "vector"
               ? number[]
               : unknown;
 
-/** Write type: values the drivers accept for D today. int8 additionally takes
- *  number/bigint and numeric takes number; sending never coerces the stored
- *  value — 9007199254740993n and "9007199254740993" store identically. */
+/** Write type: values the codec layer accepts for D. Temporal columns take
+ *  canonical strings (microsecond-exact) or Dates (millisecond precision;
+ *  timestamps store the UTC wall clock); dates take "YYYY-MM-DD" strings
+ *  only. */
 export type JsWriteTypeOf<D extends ColumnDataType> =
   D extends "bigint"
     ? string | number | bigint
@@ -54,13 +59,18 @@ export type JsWriteTypeOf<D extends ColumnDataType> =
           ? string
           : D extends "boolean"
             ? boolean
-            : D extends "timestamp" | "timestamptz" | "date"
-              ? Date
-              : D extends "bytea"
-                ? Uint8Array
-                : D extends "vector"
-                  ? number[]
-                  : unknown;
+            : D extends "timestamp" | "timestamptz"
+              ? string | Date
+              : D extends "date"
+                ? string
+                : D extends "bytea"
+                  ? Uint8Array
+                  : D extends "vector"
+                    ? number[]
+                    : unknown;
+
+export type BigintRead<M extends BigintMode> = M extends "string" ? string : M extends "number" ? number : bigint;
+export type TemporalRead<M extends TemporalMode> = M extends "date" ? Date : string;
 
 export interface ForeignKeyRef {
   (): ColumnBuilder<ColumnDataType, boolean, boolean>;
@@ -71,11 +81,17 @@ export class ColumnBuilder<
   D extends ColumnDataType = ColumnDataType,
   NN extends boolean = false,
   HD extends boolean = false,
+  RT = JsTypeOf<D>,
 > {
-  declare readonly _: { dataType: D; notNull: NN; hasDefault: HD };
+  declare readonly _: { dataType: D; notNull: NN; hasDefault: HD; readType: RT };
 
   readonly columnName: string;
   readonly dataType: D;
+  /** Codec read mode (bigint: bigint|string|number; timestamp/timestamptz:
+   *  string|date). Set by the column factory only. */
+  readMode?: BigintMode | TemporalMode;
+  /** Optional user decoder for numeric columns (exact decimal string in). */
+  valueDecoder?: (raw: string) => unknown;
   isPrimaryKey = false;
   isNotNull: boolean = false;
   hasDefault: boolean = false;
@@ -92,77 +108,81 @@ export class ColumnBuilder<
     this.dataType = dataType;
   }
 
-  notNull(): ColumnBuilder<D, true, HD> {
+  notNull(): ColumnBuilder<D, true, HD, RT> {
     this.isNotNull = true;
-    return this as unknown as ColumnBuilder<D, true, HD>;
+    return this as unknown as ColumnBuilder<D, true, HD, RT>;
   }
 
-  default(value: JsWriteTypeOf<D>): ColumnBuilder<D, NN, true> {
+  default(value: JsWriteTypeOf<D>): ColumnBuilder<D, NN, true, RT> {
     this.hasDefault = true;
     this.defaultValue = value;
-    return this as unknown as ColumnBuilder<D, NN, true>;
+    return this as unknown as ColumnBuilder<D, NN, true, RT>;
   }
 
-  defaultNow(): ColumnBuilder<D, NN, true> {
+  defaultNow(): ColumnBuilder<D, NN, true, RT> {
     this.hasDefault = true;
     this.nowDefault = true;
-    return this as unknown as ColumnBuilder<D, NN, true>;
+    return this as unknown as ColumnBuilder<D, NN, true, RT>;
   }
 
   /** Primary keys are implicitly NOT NULL (PostgreSQL semantics); the insert
    *  type reflects that. Serial primary keys still default server-side. */
-  primaryKey(): ColumnBuilder<D, true, HD> {
+  primaryKey(): ColumnBuilder<D, true, HD, RT> {
     this.isPrimaryKey = true;
-    return this as unknown as ColumnBuilder<D, true, HD>;
+    return this as unknown as ColumnBuilder<D, true, HD, RT>;
   }
 
-  unique(): ColumnBuilder<D, NN, HD> {
+  unique(): ColumnBuilder<D, NN, HD, RT> {
     this.isUnique = true;
-    return this as unknown as ColumnBuilder<D, NN, HD>;
+    return this as unknown as ColumnBuilder<D, NN, HD, RT>;
   }
 
   references(
     ref: ForeignKeyRef,
     opts?: { onDelete?: ForeignKeyRef["onDelete"] },
-  ): ColumnBuilder<D, NN, HD> {
+  ): ColumnBuilder<D, NN, HD, RT> {
     const bound: ForeignKeyRef = Object.assign(() => ref(), { onDelete: opts?.onDelete });
     this.foreignKey = bound;
-    return this as unknown as ColumnBuilder<D, NN, HD>;
+    return this as unknown as ColumnBuilder<D, NN, HD, RT>;
   }
 }
 
-export type AnyColumnBuilder = ColumnBuilder<ColumnDataType, boolean, boolean>;
+export type AnyColumnBuilder = ColumnBuilder<ColumnDataType, boolean, boolean, unknown>;
 
-export type SelectTypeOf<C> = C extends ColumnBuilder<infer D, infer NN, infer _HD>
+export type SelectTypeOf<C> = C extends ColumnBuilder<infer _D, infer NN, infer _HD, infer RT>
   ? NN extends true
-    ? JsTypeOf<D>
-    : JsTypeOf<D> | null
+    ? RT
+    : RT | null
   : never;
 
-/** Read type of a column inside a relation child projection (JSON path).
- *  int8/numeric leaves are rendered ::text inside the aggregation and
- *  temporal/bytea leaves pass through to_jsonb's string form, so all of
- *  those arrive as strings; int4/float8 leaves are JSON numbers within JS
- *  safe precision. Explicit decode modes (BigInt/Date/Uint8Array) are a
- *  later, separately documented change. */
+/** Default-mode read type of a column inside a relation child projection
+ *  (JSON path) — int8/numeric render ::text, temporals render as canonical
+ *  strings and bytea as \x hex text inside the aggregation, all decoded
+ *  through the same codecs as the flat path. */
 export type RelationLeafTypeOf<D extends ColumnDataType> =
   D extends "serial" | "integer" | "smallint" | "double" | "real"
     ? number
-    : D extends "bigint" | "numeric" | "text" | "varchar" | "uuid" | "timestamp" | "timestamptz" | "date" | "bytea"
+    : D extends "numeric" | "text" | "varchar" | "uuid" | "timestamp" | "timestamptz" | "date"
       ? string
-      : D extends "boolean"
-        ? boolean
-        : D extends "vector"
-          ? number[]
-          : unknown;
+      : D extends "bigint"
+        ? bigint
+        : D extends "boolean"
+          ? boolean
+          : D extends "bytea"
+            ? Uint8Array
+            : D extends "vector"
+              ? number[]
+              : unknown;
 
-export type RelationSelectTypeOf<C> = C extends ColumnBuilder<infer D, infer NN, infer _HD>
+/** Relation child leaf read type: the column's declared read mode, exactly
+ *  like the flat path (children decode through the same codecs). */
+export type RelationSelectTypeOf<C> = C extends ColumnBuilder<infer _D, infer NN, infer _HD, infer RT>
   ? NN extends true
-    ? RelationLeafTypeOf<D>
-    : RelationLeafTypeOf<D> | null
+    ? RT
+    : RT | null
   : never;
 
-export type InsertTypeOf<C> = C extends ColumnBuilder<infer D, infer NN, infer HD>
+export type InsertTypeOf<C> = C extends ColumnBuilder<infer D, infer NN, infer HD, any>
   ? NN extends true
     ? HD extends true
       ? JsWriteTypeOf<D> | undefined
@@ -172,7 +192,7 @@ export type InsertTypeOf<C> = C extends ColumnBuilder<infer D, infer NN, infer H
     : JsWriteTypeOf<D> | null | undefined
   : never;
 
-export type UpdateTypeOf<C> = C extends ColumnBuilder<infer D, infer NN, infer _HD>
+export type UpdateTypeOf<C> = C extends ColumnBuilder<infer D, infer NN, infer _HD, any>
   ? NN extends true
     ? JsWriteTypeOf<D>
     : JsWriteTypeOf<D> | null
@@ -395,6 +415,20 @@ export function isTableRelations(value: unknown): value is TableRelations {
 // Column helpers
 // ---------------------------------------------------------------------------
 
+function applyBigintMode(c: ColumnBuilder<"bigint", boolean, boolean, unknown>, mode: BigintMode): void {
+  if (mode !== "bigint" && mode !== "string" && mode !== "number") {
+    throw new Error(`unknown bigint codec mode "${String(mode)}" (known: bigint, string, number)`);
+  }
+  c.readMode = mode;
+}
+
+function applyTemporalMode(c: ColumnBuilder<"timestamp" | "timestamptz", boolean, boolean, unknown>, mode: TemporalMode): void {
+  if (mode !== "string" && mode !== "date") {
+    throw new Error(`unknown temporal codec mode "${String(mode)}" (known: string, date)`);
+  }
+  c.readMode = mode;
+}
+
 export function serial(name: string): ColumnBuilder<"serial", false, false> {
   return new ColumnBuilder(name, "serial");
 }
@@ -404,8 +438,16 @@ export function integer(name: string): ColumnBuilder<"integer", false, false> {
 export function smallint(name: string): ColumnBuilder<"smallint", false, false> {
   return new ColumnBuilder(name, "smallint");
 }
-export function bigint(name: string): ColumnBuilder<"bigint", false, false> {
-  return new ColumnBuilder(name, "bigint");
+/** int8 column. Default read mode `bigint` never passes through JS Number;
+ *  `string` keeps the exact decimal string; `number` is a checked safe-number
+ *  mode that rejects values outside ±(2^53-1). */
+export function bigint<M extends BigintMode = "bigint">(
+  name: string,
+  opts: BigintOptions<M> = {},
+): ColumnBuilder<"bigint", false, false, BigintRead<M>> {
+  const c = new ColumnBuilder<"bigint", false, false, BigintRead<M>>(name, "bigint");
+  applyBigintMode(c, opts.mode ?? "bigint");
+  return c;
 }
 export function double(name: string): ColumnBuilder<"double", false, false> {
   return new ColumnBuilder(name, "double");
@@ -413,8 +455,21 @@ export function double(name: string): ColumnBuilder<"double", false, false> {
 export function real(name: string): ColumnBuilder<"real", false, false> {
   return new ColumnBuilder(name, "real");
 }
-export function numeric(name: string): ColumnBuilder<"numeric", false, false> {
-  return new ColumnBuilder(name, "numeric");
+/** Exact decimal column: reads as the exact decimal string (scale and
+ *  trailing zeros preserved). An optional user decoder converts the exact
+ *  string and owns any precision narrowing. */
+export function numeric(name: string, opts?: { decoder?: undefined }): ColumnBuilder<"numeric", false, false>;
+export function numeric<D extends (raw: string) => unknown>(
+  name: string,
+  opts: { decoder: D },
+): ColumnBuilder<"numeric", false, false, ReturnType<D>>;
+export function numeric(name: string, opts: NumericOptions = {}): ColumnBuilder<"numeric", false, false, unknown> {
+  const c = new ColumnBuilder<"numeric", false, false, string>(name, "numeric");
+  if (opts.decoder !== undefined) {
+    if (typeof opts.decoder !== "function") throw new Error(`numeric("${name}"): decoder must be a function`);
+    c.valueDecoder = opts.decoder;
+  }
+  return c as unknown as ColumnBuilder<"numeric", false, false, unknown>;
 }
 export function text(name: string): ColumnBuilder<"text", false, false> {
   return new ColumnBuilder(name, "text");
@@ -427,12 +482,32 @@ export function varchar(name: string, length: number): ColumnBuilder<"varchar", 
 export function boolean(name: string): ColumnBuilder<"boolean", false, false> {
   return new ColumnBuilder(name, "boolean");
 }
-export function timestamp(name: string): ColumnBuilder<"timestamp", false, false> {
-  return new ColumnBuilder(name, "timestamp");
+/** timestamp without time zone. Reads as the canonical timezone-free string
+ *  `YYYY-MM-DDTHH:MM:SS[.ffffff]` (microseconds preserved). Explicit
+ *  `mode: "date"` returns Dates interpreting the wall clock as UTC and
+ *  truncating to milliseconds. */
+export function timestamp<M extends TemporalMode = "string">(
+  name: string,
+  opts: TemporalOptions<M> = {},
+): ColumnBuilder<"timestamp", false, false, TemporalRead<M>> {
+  const c = new ColumnBuilder<"timestamp", false, false, TemporalRead<M>>(name, "timestamp");
+  applyTemporalMode(c, opts.mode ?? "string");
+  return c;
 }
-export function timestamptz(name: string): ColumnBuilder<"timestamptz", false, false> {
-  return new ColumnBuilder(name, "timestamptz");
+/** timestamptz. Reads as the canonical UTC string
+ *  `YYYY-MM-DDTHH:MM:SS[.ffffff]Z` (microseconds preserved, process and
+ *  server timezones irrelevant). Explicit `mode: "date"` returns Dates
+ *  (exact instant, millisecond truncation). */
+export function timestamptz<M extends TemporalMode = "string">(
+  name: string,
+  opts: TemporalOptions<M> = {},
+): ColumnBuilder<"timestamptz", false, false, TemporalRead<M>> {
+  const c = new ColumnBuilder<"timestamptz", false, false, TemporalRead<M>>(name, "timestamptz");
+  applyTemporalMode(c, opts.mode ?? "string");
+  return c;
 }
+/** date column: `YYYY-MM-DD` strings in and out, no timezone interpretation
+ *  (Date values are rejected — a Date has no timezone-free meaning). */
 export function date(name: string): ColumnBuilder<"date", false, false> {
   return new ColumnBuilder(name, "date");
 }

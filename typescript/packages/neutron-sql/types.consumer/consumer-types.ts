@@ -13,6 +13,9 @@ import {
   integer,
   text,
   timestamp,
+  timestamptz,
+  bigint,
+  jsonNull,
   relations,
   eq,
   getTableName,
@@ -55,11 +58,33 @@ const collision = pgTable("collision", {
 type UsersInsert = typeof users.$inferInsert;
 const eqInsert: AssertEq<
   UsersInsert,
-  { id?: number | undefined; email: string; name?: string | null | undefined; createdAt?: Date | undefined }
+  { id?: number | undefined; email: string; name?: string | null | undefined; createdAt?: string | Date | undefined }
 > = true;
 type UsersSelect = typeof users.$inferSelect;
-const eqSelect: AssertEq<UsersSelect, { id: number; email: string; name: string | null; createdAt: Date }> = true;
+const eqSelect: AssertEq<UsersSelect, { id: number; email: string; name: string | null; createdAt: string }> = true;
 void [eqInsert, eqSelect];
+
+// F03 codec modes through the packed declarations: bigint defaults to bigint
+// with opt-in string/number modes; temporals default to canonical strings
+// with an explicit Date mode.
+const modes = pgTable("modes", {
+  big: bigint("big"),
+  bigStr: bigint("big_str", { mode: "string" }),
+  bigNum: bigint("big_num", { mode: "number" }),
+  at: timestamptz("at"),
+  atDate: timestamptz("at_date", { mode: "date" }),
+});
+type ModesSelect = typeof modes.$inferSelect;
+const eqModes: AssertEq<
+  ModesSelect,
+  { big: bigint | null; bigStr: string | null; bigNum: number | null; at: string | null; atDate: Date | null }
+> = true;
+void eqModes;
+// temporal and jsonNull writes type-check through the packed declarations
+void modes.$inferInsert;
+declare function modesAre(v: typeof modes.$inferInsert): void;
+modesAre({ big: 1n, bigStr: "1", bigNum: 2, at: "2026-01-01T00:00:00Z", atDate: new Date() });
+modesAre({ at: new Date() });
 
 type CollisionInsert = typeof collision.$inferInsert;
 const eqCollisionInsert: AssertEq<
@@ -84,6 +109,8 @@ valuesAre({ name: "no email" });
 
 // @ts-expect-error null for a NOT NULL column
 const badNull: UsersInsert = { email: "x", createdAt: null };
+// @ts-expect-error jsonNull only binds json/jsonb columns
+const badJsonNull: UsersInsert = { email: "x", createdAt: jsonNull };
 // @ts-expect-error invalid value type (boolean for text)
 const badValue: UsersInsert = { email: "x", name: true };
 // @ts-expect-error unknown insert key
@@ -92,12 +119,12 @@ const badKey: UsersInsert = { email: "x", nope: 1 };
 const badCollision: CollisionInsert = { tableName: null };
 // @ts-expect-error invalid value for the collision column
 const badCollisionValue: CollisionInsert = { columns: 42 };
-void [badNull, badValue, badKey, badCollision, badCollisionValue];
+void [badNull, badJsonNull, badValue, badKey, badCollision, badCollisionValue];
 
 // --- exact relational row types through the packed declarations ------------
 
-type ExpectedUserRow = { id: number; email: string; name: string | null; createdAt: Date };
-/** users row as a relation CHILD: the temporal leaf arrives as a string through the JSON path. */
+type ExpectedUserRow = { id: number; email: string; name: string | null; createdAt: string };
+/** users row as a relation CHILD: same leaf types as the flat path. */
 type ExpectedUserChildRow = { id: number; email: string; name: string | null; createdAt: string };
 type ExpectedPostChild = { id: number; userId: number; title: string };
 
@@ -111,7 +138,7 @@ async function relationalFixtures(): Promise<void> {
   const withPosts = await db.query.users.findMany({ with: { posts: true } });
   const eqMany: AssertEq<
     (typeof withPosts)[number],
-    { id: number; email: string; name: string | null; createdAt: Date; posts: ExpectedPostChild[] }
+    { id: number; email: string; name: string | null; createdAt: string; posts: ExpectedPostChild[] }
   > = true;
   const withAuthor = await db.query.posts.findFirst({ with: { author: true } });
   const eqOne: AssertEq<

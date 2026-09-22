@@ -23,6 +23,7 @@ import {
   or,
   eq,
   gt,
+  lt,
   inArray,
   asc,
   desc,
@@ -110,7 +111,7 @@ test("select: plain, where, order, limit, offset", () => {
   const plain = db.select().from(users).toSQL();
   assert.equal(
     plain.sql,
-    'select "users"."id", "users"."email", "users"."name", "users"."active", "users"."created_at" as "createdAt" from "users"',
+    'select "users"."id", "users"."email", "users"."name", "users"."active", to_jsonb("users"."created_at")::text as "createdAt" from "users"',
   );
   assert.deepEqual(plain.params, []);
 
@@ -122,7 +123,7 @@ test("select: plain, where, order, limit, offset", () => {
     .toSQL();
   assert.equal(
     filtered.sql,
-    'select "users"."id", "users"."email", "users"."name", "users"."active", "users"."created_at" as "createdAt" from "users" where (("users"."id" = $1) and ("users"."id" > $2)) order by "users"."created_at" desc, "users"."id" asc limit 10 offset 20',
+    'select "users"."id", "users"."email", "users"."name", "users"."active", to_jsonb("users"."created_at")::text as "createdAt" from "users" where (("users"."id" = $1) and ("users"."id" > $2)) order by "users"."created_at" desc, "users"."id" asc limit 10 offset 20',
   );
   assert.deepEqual(filtered.params, [1, 0]);
 });
@@ -136,13 +137,13 @@ test("select: or + inArray param renumbering", () => {
   const q = db.select().from(users)
     .where(or(eq(users.id, 5, "users"), inArray(users.email, ["a@x.com", "b@x.com"], "users")))
     .toSQL();
-  assert.equal(q.sql, 'select "users"."id", "users"."email", "users"."name", "users"."active", "users"."created_at" as "createdAt" from "users" where (("users"."id" = $1) or ("users"."email" in ($2, $3)))');
+  assert.equal(q.sql, 'select "users"."id", "users"."email", "users"."name", "users"."active", to_jsonb("users"."created_at")::text as "createdAt" from "users" where (("users"."id" = $1) or ("users"."email" in ($2, $3)))');
   assert.deepEqual(q.params, [5, "a@x.com", "b@x.com"]);
 });
 
 test("select: aliased projection labels columns with the requested key", () => {
   const q = db.select({ displayName: users.email, createdAt: users.createdAt }).from(users).toSQL();
-  assert.equal(q.sql, 'select "users"."email" as "displayName", "users"."created_at" as "createdAt" from "users"');
+  assert.equal(q.sql, 'select "users"."email" as "displayName", to_jsonb("users"."created_at")::text as "createdAt" from "users"');
 });
 
 test("select: property keys differing from physical names alias by metadata", () => {
@@ -158,7 +159,7 @@ test("insert: single and multi-row with returning", () => {
   const single = db.insert(users).values({ email: "a@x.com", name: "A" }).returning().toSQL();
   assert.equal(
     single.sql,
-    'insert into "users" ("email", "name") values ($1, $2) returning "id", "email", "name", "active", "created_at" as "createdAt"',
+    'insert into "users" ("email", "name") values ($1, $2) returning "id", "email", "name", "active", to_jsonb("created_at")::text as "createdAt"',
   );
   assert.deepEqual(single.params, ["a@x.com", "A"]);
 
@@ -250,13 +251,13 @@ test("insert: unbindable values are rejected before execution", () => {
 test("insert: nested object values rejected before execution with column context", () => {
   assert.throws(
     () => db.insert(users).values({ email: "a@x.com", name: { nested: true } as never }).toSQL(),
-    /invalid value for column "name" \("name"\) on users: nested object/,
+    /column "name" \("name"\) on users: text columns accept strings/,
   );
   // B01 review minor 2: pg silently JSON-stringifies and postgres.js stores
   // "[object Object]" — both must now fail before any driver call.
   const b = db.insert(users).values({ email: "a@x.com", active: { nested: true } as never });
-  assert.throws(() => b.toSQL(), /invalid value for column "active" \("active"\) on users/);
-  assert.throws(() => db.insert(users).values({ email: "a@x.com", name: [1, 2] as never }).toSQL(), /array values are not bindable for text/);
+  assert.throws(() => b.toSQL(), /column "active" \("active"\) on users: boolean columns accept booleans/);
+  assert.throws(() => db.insert(users).values({ email: "a@x.com", name: [1, 2] as never }).toSQL(), /column "name" \("name"\) on users: text columns accept strings/);
 });
 
 test("insert: inherited (prototype-chain) values bind DEFAULT, not the inherited value", () => {
@@ -315,7 +316,7 @@ test("update: set, where, fragment set, returning", () => {
   const q = db.update(users).set({ name: "B", active: sql`not ${true}` }).where(eq(users.id, 1)).returning().toSQL();
   assert.equal(
     q.sql,
-    'update "users" set "name" = $1, "active" = not $2 where "users"."id" = $3 returning "id", "email", "name", "active", "created_at" as "createdAt"',
+    'update "users" set "name" = $1, "active" = not $2 where "users"."id" = $3 returning "id", "email", "name", "active", to_jsonb("created_at")::text as "createdAt"',
   );
   assert.deepEqual(q.params, ["B", true, 1]);
 });
@@ -357,8 +358,8 @@ test("update: invalid set values rejected before execution with column context",
     firstName: text("first_name").notNull(),
     meta: jsonb("meta"),
   });
-  assert.throws(() => db.update(people).set({ firstName: { nested: true } as never }), /invalid value for column "firstName"/);
-  assert.throws(() => db.update(people).set({ firstName: new Map() as never }), /not bindable/);
+  assert.throws(() => db.update(people).set({ firstName: { nested: true } as never }), /column "firstName" \("first_name"\) on people_map3: text columns accept strings/);
+  assert.throws(() => db.update(people).set({ firstName: new Map() as never }), /text columns accept strings/);
   // json/jsonb columns keep accepting JSON values (objects bind as values).
   assert.doesNotThrow(() => db.update(people).set({ meta: { a: 1, b: [null, "x"] } }));
   assert.throws(() => db.update(people).set({ meta: { a: 1n } as never }), /JSON-representable/);
@@ -378,7 +379,7 @@ test("relational: findMany with posts (many) aggregates one independent subquery
   const { sqlText } = relational(usersRelations, { with: { posts: true } });
   assert.equal(
     sqlText,
-    'select "users"."id", "users"."email", "users"."name", "users"."active", "users"."created_at" as "createdAt", ' +
+    'select "users"."id", "users"."email", "users"."name", "users"."active", to_jsonb("users"."created_at")::text as "createdAt", ' +
       '(select coalesce(jsonb_agg(jsonb_build_object(\'id\', "__rel_posts"."id", \'userId\', "__rel_posts"."user_id", ' +
       '\'title\', "__rel_posts"."title", \'body\', "__rel_posts"."body", \'published\', "__rel_posts"."published") ' +
       'order by "__rel_posts"."id"), \'[]\'::jsonb) from "posts" as "__rel_posts" where "__rel_posts"."user_id" = "users"."id") as "posts" ' +
@@ -803,46 +804,46 @@ void uuid;
 // ---------------------------------------------------------------------------
 
 // @ts-expect-error missing required insert key "email" (NOT NULL, no default)
-void db.insert(users).values({});
+void (() => db.insert(users).values({}));
 // @ts-expect-error null is not assignable to a NOT NULL column on insert
-void db.insert(users).values({ email: "x@x.com", active: null });
+void (() => db.insert(users).values({ email: "x@x.com", active: null }));
 // @ts-expect-error null is not assignable to a NOT NULL column on update
-void db.update(users).set({ active: null });
+void (() => db.update(users).set({ active: null }));
 // @ts-expect-error invalid update value type: text column rejects a number
-void db.update(users).set({ name: 123 });
+void (() => db.update(users).set({ name: 123 }));
 // @ts-expect-error invalid update value type: boolean column rejects a string
-void db.update(users).set({ active: "yes" });
+void (() => db.update(users).set({ active: "yes" }));
 // @ts-expect-error invalid value type: text column rejects a boolean
-void db.insert(users).values({ email: "x@x.com", name: true });
+void (() => db.insert(users).values({ email: "x@x.com", name: true }));
 // @ts-expect-error invalid value type: boolean column rejects a string
-void db.insert(users).values({ email: "x@x.com", active: "yes" });
+void (() => db.insert(users).values({ email: "x@x.com", active: "yes" }));
 // @ts-expect-error invalid value type: timestamp column rejects a number
-void db.insert(users).values({ email: "x@x.com", createdAt: 123 });
+void (() => db.insert(users).values({ email: "x@x.com", createdAt: 123 }));
 // @ts-expect-error unknown insert key (excess property)
-void db.insert(users).values({ email: "x@x.com", nope: 1 });
+void (() => db.insert(users).values({ email: "x@x.com", nope: 1 }));
 // @ts-expect-error unknown update key
-void db.update(users).set({ nope: 1 });
+void (() => db.update(users).set({ nope: 1 }));
 // @ts-expect-error unknown column in a projection source
-void db.select({ x: users.bogus });
+void (() => db.select({ x: users.bogus }));
 // @ts-expect-error unknown column in a predicate
-void db.select().from(users).where(eq(users.bogus, 1));
+void (() => db.select().from(users).where(eq(users.bogus, 1)));
 // @ts-expect-error unknown table key in db.query
-void db.query.bogus;
+void (() => db.query.bogus);
 
 // @ts-expect-error unknown relation name in `with` must fail compilation
-void db.query.users.findFirst({ with: { totallyUnknownRelation: true } });
+void (() => db.query.users.findFirst({ with: { totallyUnknownRelation: true } }));
 // @ts-expect-error unknown relation name in `with` (findMany too)
-void db.query.users.findMany({ with: { alsoUnknown: true } });
+void (() => db.query.users.findMany({ with: { alsoUnknown: true } }));
 // @ts-expect-error unknown property key in args.columns
-void db.query.users.findMany({ columns: ["nonexistent"] });
+void (() => db.query.users.findMany({ columns: ["nonexistent"] }));
 // @ts-expect-error nested with / per-relation options are not a `true` selection
-void db.query.users.findMany({ with: { posts: { with: {} } } });
+void (() => db.query.users.findMany({ with: { posts: { with: {} } } }));
 // @ts-expect-error false is not a relation selection
-void db.query.users.findMany({ with: { posts: false } });
+void (() => db.query.users.findMany({ with: { posts: false } }));
 // @ts-expect-error depth-2 with (posts -> author) is rejected until Q05
-void db.query.users.findMany({ with: { posts: { with: { author: true } } } });
+void (() => db.query.users.findMany({ with: { posts: { with: { author: true } } } }));
 // @ts-expect-error depth-3 with (posts -> author -> manager) is rejected until Q05
-void db.query.users.findMany({ with: { posts: { columns: ["id"], with: { author: { with: { posts: true } } } } } });
+void (() => db.query.users.findMany({ with: { posts: { columns: ["id"], with: { author: { with: { posts: true } } } } } }));
 
 // Natural (non-serial) primary keys are required: NOT NULL without default.
 const naturalKey = pgTable("natural_key", {
@@ -850,18 +851,18 @@ const naturalKey = pgTable("natural_key", {
   email: text("email").notNull(),
 });
 // @ts-expect-error bigint PK is NOT NULL without default — required on insert
-void db.insert(naturalKey).values({ email: "x@x.com" });
+void (() => db.insert(naturalKey).values({ email: "x@x.com" }));
 const _natOk: typeof naturalKey.$inferInsert = { id: "9007199254740993", email: "x@x.com" };
 // @ts-expect-error null is not assignable to a NOT NULL primary key
-void db.insert(naturalKey).values({ id: null, email: "x@x.com" });
+void (() => db.insert(naturalKey).values({ id: null, email: "x@x.com" }));
 
 // Metadata-name collisions compile: columns/tableName/indexes are ordinary
 // column names; metadata access goes through the accessor helpers.
 const _colOk: typeof metaNames.$inferInsert = { columns: "c", tableName: null, indexes: 1 };
 // @ts-expect-error the "columns" column is NOT NULL without default — required
-void db.insert(metaNames).values({ tableName: null });
+void (() => db.insert(metaNames).values({ tableName: null }));
 // @ts-expect-error invalid value for the collision column (boolean for text)
-void db.insert(metaNames).values({ columns: true });
+void (() => db.insert(metaNames).values({ columns: true }));
 const _colName: string = metaNames.tableName.columnName;
 const _colTable: string = getTableName(metaNames);
 void [_natOk, _colOk, _colName, _colTable];
@@ -915,10 +916,10 @@ type UserRow = {
   email: string;
   name: string | null;
   active: boolean;
-  createdAt: Date;
+  createdAt: string;
 };
-/** users row as a relation CHILD: the temporal leaf arrives as a string
- *  through the JSON path (typed decode is F03). */
+/** users row as a relation CHILD: same leaf types as the flat path (the
+ *  child JSON leaves decode through the same codecs). */
 type UserChildRow = {
   id: number;
   email: string;
@@ -941,7 +942,7 @@ async function relationalTypeFixtures(): Promise<void> {
   const selected = await db.query.users.findMany({ columns: ["id", "email"], with: { posts: true } });
 
   const eqBase: AssertEq<(typeof noArgs)[number], UserRow> = true;
-  const eqMany: AssertEq<(typeof withPosts)[number], { id: number; email: string; name: string | null; active: boolean; createdAt: Date; posts: PostRow[] }> = true;
+  const eqMany: AssertEq<(typeof withPosts)[number], { id: number; email: string; name: string | null; active: boolean; createdAt: string; posts: PostRow[] }> = true;
   const eqOne: AssertEq<NonNullable<typeof withAuthor>, { id: number; userId: number; title: string; body: string | null; published: boolean; author: UserChildRow | null }> = true;
   const eqSelected: AssertEq<(typeof selected)[number], { id: number; email: string; posts: PostRow[] }> = true;
   void [eqBase, eqMany, eqOne, eqSelected];
@@ -964,7 +965,7 @@ const eqInsert: AssertEq<
     email: string;
     name?: string | null | undefined;
     active?: boolean | undefined;
-    createdAt?: Date | undefined;
+    createdAt?: string | Date | undefined;
   }
 > = true;
 void eqInsert;
@@ -997,9 +998,10 @@ async function projectionExactTypes(): Promise<void> {
 void projectionExactTypes;
 
 // ---------------------------------------------------------------------------
-// F2: relation child leaves are typed honestly — int8/numeric (::text inside
-// the aggregation) and temporal/bytea (to_jsonb string forms) are strings;
-// int4/float8 stay numbers. AssertEq demands type identity.
+// F03: relation child leaves decode through the same codecs as the flat path
+// — int8 defaults to bigint (string/number modes opt-in), temporals are
+// canonical strings, bytea decodes to Uint8Array from its \x hex text form.
+// AssertEq demands type identity.
 // ---------------------------------------------------------------------------
 
 const leafKinds = pgTable("leaf_kinds", {
@@ -1022,15 +1024,157 @@ const eqLeafKinds: AssertEq<
   {
     id: number;
     n: number | null;
-    big: string | null;
+    big: bigint | null;
     amt: string | null;
     flt: number | null;
     at: string | null;
     atz: string | null;
     d: string | null;
-    bin: string | null;
+    bin: Uint8Array | null;
     flag: boolean | null;
     s: string | null;
   }
 > = true;
 void eqLeafKinds;
+
+// ---------------------------------------------------------------------------
+// F03 codecs: modes, lossless wire acquisition, write encoding, JSON null.
+// ---------------------------------------------------------------------------
+
+import { jsonNull, isJsonNull } from "./codecs.js";
+
+const codecTable = pgTable("f03_unit", {
+  id: serial("id").primaryKey(),
+  big: bigint("big"),
+  bigStr: bigint("big_str", { mode: "string" }),
+  bigNum: bigint("big_num", { mode: "number" }),
+  at: timestamp("at"),
+  atDate: timestamp("at_date", { mode: "date" }),
+  atz: timestamptz("atz"),
+  atzDate: timestamptz("atz_date", { mode: "date" }),
+  amt: numeric("amt"),
+  amtDec: numeric("amt_dec", { decoder: (raw: string) => raw.length }),
+  bin: bytea("bin"),
+  doc: jsonb("doc"),
+});
+
+test("codecs: declared modes drive exact read types", () => {
+  type Row = typeof codecTable.$inferSelect;
+  const eqRow: AssertEq<
+    Row,
+    {
+      id: number;
+      big: bigint | null;
+      bigStr: string | null;
+      bigNum: number | null;
+      at: string | null;
+      atDate: Date | null;
+      atz: string | null;
+      atzDate: Date | null;
+      amt: string | null;
+      amtDec: number | null;
+      bin: Uint8Array | null;
+      doc: unknown;
+    }
+  > = true;
+  void eqRow;
+});
+
+test("codecs: unknown mode values fail at factory time", () => {
+  assert.throws(() => bigint("x", { mode: "decimal" } as never), /unknown bigint codec mode "decimal"/);
+  assert.throws(() => timestamp("x", { mode: "number" } as never), /unknown temporal codec mode "number"/);
+  assert.throws(() => timestamptz("x", { mode: "string!" } as never), /unknown temporal codec mode/);
+});
+
+test("codecs: lossy-native columns project lossless text wire forms", () => {
+  const q = db.select().from(codecTable).toSQL();
+  assert.equal(
+    q.sql,
+    'select "f03_unit"."id", "f03_unit"."big", "f03_unit"."big_str" as "bigStr", "f03_unit"."big_num" as "bigNum", ' +
+      'to_jsonb("f03_unit"."at")::text as "at", to_jsonb("f03_unit"."at_date")::text as "atDate", ' +
+      `to_jsonb("f03_unit"."atz" at time zone 'UTC')::text as "atz", ` +
+      `to_jsonb("f03_unit"."atz_date" at time zone 'UTC')::text as "atzDate", ` +
+      '"f03_unit"."amt", "f03_unit"."amt_dec" as "amtDec", ' +
+      '"f03_unit"."bin", "f03_unit"."doc" from "f03_unit"',
+  );
+  // int8/numeric/bytea keep their native (already exact) acquisition.
+  assert.ok(!q.sql.includes('"big"::text'));
+});
+
+test("codecs: predicate values encode with text-typed sites where required", () => {
+  const atz = eq(codecTable.atz, "2026-03-08T07:30:00.123456Z");
+  assert.equal(atz.sql, '"f03_unit"."atz" = $1::text::timestamptz');
+  assert.deepEqual(atz.params, ["2026-03-08T07:30:00.123456Z"]);
+
+  const atzDate = eq(codecTable.atzDate, new Date(Date.UTC(2026, 0, 2, 3, 4, 5, 678)));
+  assert.equal(atzDate.sql, '"f03_unit"."atz_date" = $1::text::timestamptz');
+  assert.deepEqual(atzDate.params, ["2026-01-02T03:04:05.678Z"]);
+
+  const at = lt(codecTable.at, "2026-01-01T00:00:00.000001");
+  assert.equal(at.sql, '"f03_unit"."at" < $1::text::timestamp');
+
+  const big = gt(codecTable.big, 1n);
+  assert.equal(big.sql, '"f03_unit"."big" > $1');
+  assert.deepEqual(big.params, [1n]);
+
+  const many = inArray(codecTable.atz, ["2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z"]);
+  assert.equal(many.sql, '"f03_unit"."atz" in ($1::text::timestamptz, $2::text::timestamptz)');
+
+  const doc = eq(codecTable.doc, jsonNull);
+  assert.equal(doc.sql, '"f03_unit"."doc" = $1::text::jsonb');
+  assert.deepEqual(doc.params, ["null"]);
+});
+
+test("codecs: temporal and json writes bind canonical text at text-typed sites", () => {
+  const q = db
+    .insert(codecTable)
+    .values({
+      big: "9007199254740993",
+      at: "2026-01-01T19:04:05.678123",
+      atz: new Date(Date.UTC(2026, 0, 2, 3, 4, 5, 678)),
+      doc: jsonNull,
+    })
+    .toSQL();
+  assert.equal(
+    q.sql,
+    'insert into "f03_unit" ("big", "at", "atz", "doc") values ($1, $2::text::timestamp, $3::text::timestamptz, $4::text::jsonb)',
+  );
+  assert.deepEqual(q.params, ["9007199254740993", "2026-01-01T19:04:05.678123", "2026-01-02T03:04:05.678Z", "null"]);
+});
+
+test("codecs: json writes encode the JS value as its JSON encoding", () => {
+  const q = db
+    .insert(codecTable)
+    .values({ doc: "null" })
+    .toSQL();
+  assert.equal(q.sql, 'insert into "f03_unit" ("doc") values ($1::text::jsonb)');
+  assert.deepEqual(q.params, ['"null"'], "the JS string 'null' binds as the JSON string");
+  const q2 = db
+    .insert(codecTable)
+    .values({ doc: { a: 1, b: [null, "x"] } })
+    .toSQL();
+  assert.deepEqual(q2.params, ['{"a":1,"b":[null,"x"]}']);
+});
+
+test("codecs: jsonNull is a frozen branded singleton", () => {
+  assert.equal(Object.isFrozen(jsonNull), true);
+  assert.equal(isJsonNull(jsonNull), true);
+  assert.equal(isJsonNull(null), false);
+  assert.equal(isJsonNull("null"), false);
+  assert.equal(isJsonNull({}), false);
+});
+
+test("codecs: write validation rejects before execution with column context", () => {
+  assert.throws(() => db.insert(codecTable).values({ big: "1.0" as never }).toSQL(), /"1\.0" is not an integer string/);
+  assert.throws(() => db.insert(codecTable).values({ at: "2026-01-01" as never }).toSQL(), /is not a canonical timestamp string/);
+  assert.throws(() => db.insert(codecTable).values({ atz: "2026-01-01T00:00:00" as never }).toSQL(), /is not a canonical timestamptz string/);
+  assert.throws(() => db.insert(codecTable).values({ doc: { big: 1n } as never }).toSQL(), /JSON-representable/);
+  assert.throws(() => db.insert(codecTable).values({ bin: "00ff" as never }).toSQL(), /bytea columns accept Uint8Array values/);
+});
+
+test("codecs: returning projects the same lossless wire forms as select", () => {
+  const q = db.insert(codecTable).values({ big: 1n }).returning().toSQL();
+  assert.ok(q.sql.includes('returning "id", "big", "big_str" as "bigStr", "big_num" as "bigNum", to_jsonb("at")::text as "at"'));
+  assert.ok(q.sql.includes(`to_jsonb("atz" at time zone 'UTC')::text as "atz"`));
+  assert.ok(q.sql.includes(`to_jsonb("atz_date" at time zone 'UTC')::text as "atzDate"`));
+});

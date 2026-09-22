@@ -17,6 +17,15 @@ import type {
 } from "./schema.js";
 import { getTableColumns, getTableName, isPgTable } from "./schema.js";
 import {
+  decodeNativeValue,
+  decodeTextWire,
+  encodeWriteValue,
+  needsFlatDecode,
+  wireReadExpr,
+  type ColumnContext,
+  type EncodedValue,
+} from "./codecs.js";
+import {
   cte,
   ident,
   join as joinNode,
@@ -76,42 +85,72 @@ function columnEntries(table: AnyPgTable): ColumnEntries {
 }
 
 /** Physical column reference labeled with its property key so driver rows come
- *  back keyed by declared JS property names. Identical names skip the alias. */
+ *  back keyed by declared JS property names. Identical names skip the alias.
+ *  Columns whose driver-native value is lossy (temporals) project a lossless
+ *  text expression instead — the expression is always labeled. */
 function aliasedColumn(table: string, column: AnyColumnBuilder, propertyKey: string): string {
   const ref = qualify(table, column.columnName);
+  const wire = wireReadExpr(column.dataType, ref);
+  if (wire) return `${wire} as ${qident(propertyKey)}`;
   return propertyKey === column.columnName ? ref : `${ref} as ${qident(propertyKey)}`;
 }
 
 function returningList(table: AnyPgTable): string {
   return columnEntries(table)
-    .map(({ propertyKey, column }) =>
-      propertyKey === column.columnName ? qident(column.columnName) : `${qident(column.columnName)} as ${qident(propertyKey)}`,
-    )
+    .map(({ propertyKey, column }) => {
+      const wire = wireReadExpr(column.dataType, qident(column.columnName));
+      if (wire) return `${wire} as ${qident(propertyKey)}`;
+      return propertyKey === column.columnName
+        ? qident(column.columnName)
+        : `${qident(column.columnName)} as ${qident(propertyKey)}`;
+    })
     .join(", ");
 }
 
 // ---------------------------------------------------------------------------
-// Mutation value validation (before execution, with column context)
+// Row decode plans (flat select / RETURNING paths)
 // ---------------------------------------------------------------------------
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  if (typeof value !== "object" || value === null) return false;
-  const proto: unknown = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
+interface RowDecode {
+  key: string;
+  column: AnyColumnBuilder;
+  wire: "text" | "native";
 }
 
-/** json/jsonb values must survive JSON serialization unchanged. */
-function jsonRepresentable(value: unknown): boolean {
-  if (value === null) return true;
-  const t = typeof value;
-  if (t === "string" || t === "boolean") return true;
-  if (t === "number") return Number.isFinite(value);
-  if (t === "object") {
-    if (Array.isArray(value)) return value.every(jsonRepresentable);
-    if (isPlainObject(value)) return Object.values(value).every(jsonRepresentable);
+function rowDecodePlan<E extends { key: string; column: AnyColumnBuilder | null }>(entries: E[]): RowDecode[] {
+  const plan: RowDecode[] = [];
+  for (const { key, column } of entries) {
+    if (!column) continue;
+    if (wireReadExpr(column.dataType, "x") !== null) {
+      plan.push({ key, column, wire: "text" });
+    } else if (needsFlatDecode(column)) {
+      plan.push({ key, column, wire: "native" });
+    }
   }
-  return false;
+  return plan;
 }
+
+function columnContext(table: string, column: AnyColumnBuilder, propertyKey: string): ColumnContext {
+  return { propertyKey, columnName: column.columnName, tableName: table };
+}
+
+function applyRowDecode(rows: Array<Record<string, unknown>>, plan: RowDecode[], table: string): void {
+  if (plan.length === 0) return;
+  for (const row of rows) {
+    for (const entry of plan) {
+      if (row[entry.key] === null || row[entry.key] === undefined) continue;
+      const ctx = columnContext(table, entry.column, entry.key);
+      row[entry.key] =
+        entry.wire === "text"
+          ? decodeTextWire(entry.column, ctx, row[entry.key])
+          : decodeNativeValue(entry.column, ctx, row[entry.key]);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Mutation value encoding (before execution, with column context)
+// ---------------------------------------------------------------------------
 
 /** Duck-typed SqlFragment: own `sql` string + own `params` array. */
 function isFragmentLike(value: object): value is SqlFragment {
@@ -119,39 +158,17 @@ function isFragmentLike(value: object): value is SqlFragment {
   return Object.hasOwn(value, "sql") && typeof v.sql === "string" && Object.hasOwn(value, "params") && Array.isArray(v.params);
 }
 
-/** Null if the value is a bindable shape for this column; otherwise the reason. */
-function valueBindingError(column: AnyColumnBuilder, value: unknown): string | null {
-  if (value === null) return null; // nullability is checked separately
-  const t = typeof value;
-  const isJson = column.dataType === "json" || column.dataType === "jsonb";
-  if (t === "string" || t === "boolean" || t === "undefined") return null;
-  if (t === "number") return isJson && !Number.isFinite(value) ? "non-finite numbers are not JSON-representable" : null;
-  if (t === "bigint") return isJson ? "bigint is not JSON-representable" : null;
-  if (t === "symbol" || t === "function") return `${t} values cannot be bound`;
-  if (Array.isArray(value)) {
-    if (column.dataType === "vector") {
-      return value.every((e) => typeof e === "number" && Number.isFinite(e)) ? null : "vector columns accept arrays of finite numbers";
-    }
-    if (isJson) return value.every(jsonRepresentable) ? null : "array values for json/jsonb columns must contain only JSON-representable values";
-    return `array values are not bindable for ${column.dataType} columns`;
-  }
-  if (value instanceof Date) {
-    return column.dataType === "timestamp" || column.dataType === "timestamptz" || column.dataType === "date"
-      ? null
-      : `Date values are not bindable for ${column.dataType} columns`;
-  }
-  if (value instanceof Uint8Array) {
-    return column.dataType === "bytea" ? null : "Uint8Array values are only bindable for bytea columns";
-  }
-  if (isJson) {
-    return isPlainObject(value) && Object.values(value).every(jsonRepresentable)
-      ? null
-      : "values for json/jsonb columns must be JSON-representable";
-  }
-  if (isPlainObject(value)) {
-    return "nested object values are not bindable (only json/jsonb columns accept objects; use a sql`…` fragment in .set() for expressions)";
-  }
-  return `values of this shape are not bindable for ${column.dataType} columns`;
+function encodeForColumn(table: string, column: AnyColumnBuilder, propertyKey: string, value: unknown): EncodedValue {
+  return encodeWriteValue(column, columnContext(table, column, propertyKey), value);
+}
+
+/** Bind site for an encoded value: temporal and json/jsonb values bind as
+ *  canonical text at explicitly text-typed sites so both drivers pass the
+ *  string through untouched (postgres.js otherwise re-encodes server-typed
+ *  date/json params through Date/JSON.stringify, losing microseconds and
+ *  double-encoding strings). */
+function bindSite(n: number, encoded: EncodedValue): string {
+  return encoded.cast === undefined ? `$${n}` : `$${n}::text::${encoded.cast}`;
 }
 
 function effectiveNotNull(column: AnyColumnBuilder): boolean {
@@ -206,6 +223,16 @@ export class SelectBuilder<T> implements PromiseLike<T[]> {
     return this;
   }
 
+  private projectionEntries(): Array<{ key: string; column: AnyColumnBuilder | null }> {
+    if (!this.projection) {
+      return columnEntries(this.table).map(({ propertyKey, column }) => ({ key: propertyKey, column }));
+    }
+    return Object.entries(this.projection).map(([key, value]) => ({
+      key,
+      column: "columnName" in value ? (value as AnyColumnBuilder) : null,
+    }));
+  }
+
   toSQL(): { sql: string; params: unknown[] } {
     const params: unknown[] = [];
 
@@ -215,9 +242,12 @@ export class SelectBuilder<T> implements PromiseLike<T[]> {
       for (const [key, value] of Object.entries(this.projection)) {
         if ("columnName" in value) {
           // Output label = the projection key; physical ref from metadata.
+          // Lossy-native columns project a lossless text expression (always
+          // labeled — the expression itself has no usable output name).
           const owner = value.ownerTable ? getTableName(value.ownerTable) : getTableName(this.table);
           const ref = qualify(owner, value.columnName);
-          parts.push(key === value.columnName ? ref : `${ref} as ${qident(String(key))}`);
+          const wire = wireReadExpr(value.dataType, ref);
+          parts.push(wire ? `${wire} as ${qident(String(key))}` : key === value.columnName ? ref : `${ref} as ${qident(String(key))}`);
         } else {
           parts.push(`${inline(value, params)} as ${qident(String(key))}`);
         }
@@ -245,7 +275,9 @@ export class SelectBuilder<T> implements PromiseLike<T[]> {
 
   async execute(): Promise<T[]> {
     const { sql: sqlText, params } = this.toSQL();
-    return (await run(this.ctx, sqlText, params, "query")) as T[];
+    const rows = (await run(this.ctx, sqlText, params, "query")) as Array<Record<string, unknown>>;
+    applyRowDecode(rows, rowDecodePlan(this.projectionEntries()), getTableName(this.table));
+    return rows as T[];
   }
 
   then<R1 = T[], R2 = never>(
@@ -294,12 +326,16 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     // Validate every row and collect the union of supplied keys. A key is
     // supplied when it is present with a value other than undefined in at
     // least one row; explicit null is a supplied value (NULL, never DEFAULT).
+    // Non-null values are codec-encoded now (validation + canonical text) so
+    // the values section binds exactly what was validated.
     const supplied = new Set<string>();
+    const encodedRows: Array<Map<string, EncodedValue>> = [];
     for (let rowIdx = 0; rowIdx < this.rows.length; rowIdx++) {
       const row = this.rows[rowIdx];
       if (typeof row !== "object" || row === null || Array.isArray(row)) {
         throw new Error(`insert .values() rows must be objects on ${getTableName(this.table)}`);
       }
+      const encoded = new Map<string, EncodedValue>();
       for (const key of Object.keys(row)) {
         if (!knownKeys.has(key)) throw new Error(`unknown column "${key}" on ${getTableName(this.table)}`);
         const column = columns[key];
@@ -310,18 +346,18 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
             `insert on ${getTableName(this.table)}: null is not allowed for NOT NULL column "${key}" ("${column.columnName}")`,
           );
         }
-        const reason = valueBindingError(column, value);
-        if (reason) {
-          throw new Error(`invalid value for column "${key}" ("${column.columnName}") on ${getTableName(this.table)}: ${reason}`);
+        if (value !== null) {
+          encoded.set(key, encodeForColumn(getTableName(this.table), column, key, value));
         }
         supplied.add(key);
       }
+      encodedRows.push(encoded);
       const missing = required.filter(({ propertyKey }) => !Object.hasOwn(row, propertyKey) || row[propertyKey] === undefined);
       if (missing.length > 0) {
         throw new Error(
           `insert on ${getTableName(this.table)} row ${rowIdx} is missing required column(s) ` +
-            missing.map(({ propertyKey, column }) => `"${propertyKey}" ("${column.columnName}")`).join(", ") +
-            " — NOT NULL without a default",
+          missing.map(({ propertyKey, column }) => `"${propertyKey}" ("${column.columnName}")`).join(", ") +
+          " — NOT NULL without a default",
         );
       }
     }
@@ -347,12 +383,17 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     } else {
       columnsSql = ` (${orderedKeys.map((k) => qident(columns[k].columnName)).join(", ")})`;
       valuesSql = `values ${this.rows
-        .map((row) => {
+        .map((row, rowIdx) => {
+          const encoded = encodedRows[rowIdx];
           const cells = orderedKeys.map((k) => {
-            const value = Object.hasOwn(row, k) ? row[k] : undefined;
-            if (value === undefined) return "default";
-            params.push(value);
-            return `$${params.length}`;
+            if (!Object.hasOwn(row, k) || row[k] === undefined) return "default";
+            if (row[k] === null) {
+              params.push(null);
+              return `$${params.length}`;
+            }
+            const enc = encoded.get(k)!;
+            params.push(enc.bind);
+            return bindSite(params.length, enc);
           });
           return `(${cells.join(", ")})`;
         })
@@ -367,7 +408,13 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
   async execute(): Promise<R> {
     const { sql: sqlText, params } = this.toSQL();
     if (this.wantsReturning) {
-      return (await run(this.ctx, sqlText, params, "query")) as R;
+      const rows = (await run(this.ctx, sqlText, params, "query")) as Array<Record<string, unknown>>;
+      applyRowDecode(
+        rows,
+        rowDecodePlan(columnEntries(this.table).map(({ propertyKey, column }) => ({ key: propertyKey, column }))),
+        getTableName(this.table),
+      );
+      return rows as R;
     }
     return (await run(this.ctx, sqlText, params, "execute")) as R;
   }
@@ -386,7 +433,7 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
 
 export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = number> implements PromiseLike<R> {
   private conditions: Condition[] = [];
-  private sets: Array<{ col: string; value?: unknown; frag?: SqlFragment }> = [];
+  private sets: Array<{ col: string; value?: unknown; frag?: SqlFragment; cast?: string }> = [];
   private hasSet = false;
   private wantsReturning = false;
 
@@ -419,9 +466,8 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
         this.sets.push({ col: physical, frag: value });
         continue;
       }
-      const reason = valueBindingError(column, value);
-      if (reason) throw new Error(`invalid value for column "${key}" ("${physical}") on ${getTableName(this.table)}: ${reason}`);
-      this.sets.push({ col: physical, value });
+      const encoded = encodeForColumn(getTableName(this.table), column, key, value);
+      this.sets.push({ col: physical, value: encoded.bind, cast: encoded.cast });
     }
     return this;
   }
@@ -444,7 +490,7 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     const assignments = this.sets.map((s) => {
       if (s.frag) return `${qident(s.col)} = ${inline(s.frag, params)}`;
       params.push(s.value);
-      return `${qident(s.col)} = $${params.length}`;
+      return `${qident(s.col)} = ${s.cast === undefined ? `$${params.length}` : `$${params.length}::text::${s.cast}`}`;
     });
     let sqlText = `update ${qident(getTableName(this.table))} set ${assignments.join(", ")}`;
     sqlText += ` where ${this.conditions.map((c) => inline(c, params)).join(" and ")}`;
@@ -455,7 +501,13 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
   async execute(): Promise<R> {
     const { sql: sqlText, params } = this.toSQL();
     if (this.wantsReturning) {
-      return (await run(this.ctx, sqlText, params, "query")) as R;
+      const rows = (await run(this.ctx, sqlText, params, "query")) as Array<Record<string, unknown>>;
+      applyRowDecode(
+        rows,
+        rowDecodePlan(columnEntries(this.table).map(({ propertyKey, column }) => ({ key: propertyKey, column }))),
+        getTableName(this.table),
+      );
+      return rows as R;
     }
     return (await run(this.ctx, sqlText, params, "execute")) as R;
   }
@@ -503,7 +555,13 @@ export class DeleteBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
   async execute(): Promise<R> {
     const { sql: sqlText, params } = this.toSQL();
     if (this.wantsReturning) {
-      return (await run(this.ctx, sqlText, params, "query")) as R;
+      const rows = (await run(this.ctx, sqlText, params, "query")) as Array<Record<string, unknown>>;
+      applyRowDecode(
+        rows,
+        rowDecodePlan(columnEntries(this.table).map(({ propertyKey, column }) => ({ key: propertyKey, column }))),
+        getTableName(this.table),
+      );
+      return rows as R;
     }
     return (await run(this.ctx, sqlText, params, "execute")) as R;
   }

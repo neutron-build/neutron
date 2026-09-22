@@ -5,7 +5,8 @@
 // params. Merging renumbers. The final query assembly is therefore trivial.
 
 import { getTableName } from "./schema.js";
-import type { AnyColumnBuilder, ColumnBuilder, JsTypeOf, ColumnDataType } from "./schema.js";
+import type { AnyColumnBuilder, ColumnBuilder, JsWriteTypeOf, ColumnDataType } from "./schema.js";
+import { encodeWriteValue } from "./codecs.js";
 
 export interface SqlFragment {
   readonly sql: string;
@@ -51,31 +52,45 @@ function colRef(col: AnyColumnBuilder | string, table?: string): string {
   return qident(col.columnName);
 }
 
-function cmp(op: string, col: AnyColumnBuilder | string, value: unknown, table?: string): Condition {
-  return { sql: `${colRef(col, table)} ${op} $1`, params: [value] };
+/** Predicate values run through the column codec: validation with column
+ *  context, canonical encoding, and a text-typed bind site for temporal and
+ *  json/jsonb values (postgres.js otherwise re-encodes server-typed params
+ *  through Date/JSON.stringify). */
+function encodedParam(col: AnyColumnBuilder, table: string | undefined, value: unknown): { site: string; bind: unknown } {
+  const tableName = table ?? (col.ownerTable ? getTableName(col.ownerTable) : col.columnName);
+  const enc = encodeWriteValue(col, { propertyKey: col.columnName, columnName: col.columnName, tableName }, value);
+  return { site: enc.cast === undefined ? "$1" : `$1::text::${enc.cast}`, bind: enc.bind };
 }
 
-export function eq<D extends ColumnDataType>(col: ColumnBuilder<D, boolean, boolean> | string, value: JsTypeOf<D>, table?: string): Condition {
+function cmp(op: string, col: AnyColumnBuilder | string, value: unknown, table?: string): Condition {
+  if (typeof col === "string") {
+    return { sql: `${qident(col)} ${op} $1`, params: [value] };
+  }
+  const { site, bind } = encodedParam(col, table, value);
+  return { sql: `${colRef(col, table)} ${op} ${site}`, params: [bind] };
+}
+
+export function eq<D extends ColumnDataType>(col: ColumnBuilder<D, boolean, boolean, unknown> | string, value: JsWriteTypeOf<D>, table?: string): Condition {
   return cmp("=", col, value, table);
 }
 
-export function ne<D extends ColumnDataType>(col: ColumnBuilder<D, boolean, boolean> | string, value: JsTypeOf<D>, table?: string): Condition {
+export function ne<D extends ColumnDataType>(col: ColumnBuilder<D, boolean, boolean, unknown> | string, value: JsWriteTypeOf<D>, table?: string): Condition {
   return cmp("<>", col, value, table);
 }
 
-export function lt<D extends ColumnDataType>(col: ColumnBuilder<D, boolean, boolean> | string, value: JsTypeOf<D>, table?: string): Condition {
+export function lt<D extends ColumnDataType>(col: ColumnBuilder<D, boolean, boolean, unknown> | string, value: JsWriteTypeOf<D>, table?: string): Condition {
   return cmp("<", col, value, table);
 }
 
-export function lte<D extends ColumnDataType>(col: ColumnBuilder<D, boolean, boolean> | string, value: JsTypeOf<D>, table?: string): Condition {
+export function lte<D extends ColumnDataType>(col: ColumnBuilder<D, boolean, boolean, unknown> | string, value: JsWriteTypeOf<D>, table?: string): Condition {
   return cmp("<=", col, value, table);
 }
 
-export function gt<D extends ColumnDataType>(col: ColumnBuilder<D, boolean, boolean> | string, value: JsTypeOf<D>, table?: string): Condition {
+export function gt<D extends ColumnDataType>(col: ColumnBuilder<D, boolean, boolean, unknown> | string, value: JsWriteTypeOf<D>, table?: string): Condition {
   return cmp(">", col, value, table);
 }
 
-export function gte<D extends ColumnDataType>(col: ColumnBuilder<D, boolean, boolean> | string, value: JsTypeOf<D>, table?: string): Condition {
+export function gte<D extends ColumnDataType>(col: ColumnBuilder<D, boolean, boolean, unknown> | string, value: JsWriteTypeOf<D>, table?: string): Condition {
   return cmp(">=", col, value, table);
 }
 
@@ -88,13 +103,22 @@ export function ilike(col: AnyColumnBuilder | string, pattern: string, table?: s
 }
 
 export function inArray<D extends ColumnDataType>(
-  col: ColumnBuilder<D, boolean, boolean> | string,
-  values: Array<JsTypeOf<D>>,
+  col: ColumnBuilder<D, boolean, boolean, unknown> | string,
+  values: Array<JsWriteTypeOf<D>>,
   table?: string,
 ): Condition {
   if (values.length === 0) return { sql: "1 = 0", params: [] };
-  const placeholders = values.map((_, i) => `$${i + 1}`).join(", ");
-  return { sql: `${colRef(col, table)} in (${placeholders})`, params: values.slice() };
+  if (typeof col === "string") {
+    const placeholders = values.map((_, i) => `$${i + 1}`).join(", ");
+    return { sql: `${qident(col)} in (${placeholders})`, params: values.slice() };
+  }
+  const binds: unknown[] = [];
+  const sites = values.map((value) => {
+    const { site, bind } = encodedParam(col, table, value);
+    binds.push(bind);
+    return site === "$1" ? `$${binds.length}` : `$${binds.length}${site.slice(2)}`;
+  });
+  return { sql: `${colRef(col, table)} in (${sites.join(", ")})`, params: binds };
 }
 
 export function isNull(col: AnyColumnBuilder | string, table?: string): Condition {

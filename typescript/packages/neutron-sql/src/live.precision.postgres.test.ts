@@ -140,9 +140,9 @@ for (const driverKind of ["postgres", "pg"] as const) {
 
       const w1 = await db.query.wallets.findFirst({ where: eq(wallets.label, "W1"), with: { moves: true } });
       assert.ok(w1);
-      // Parent row (flat path): int8 still an exact string.
-      assert.equal(w1.id, "9007199254740993");
-      assert.equal(typeof w1.id, "string");
+      // Parent row (flat path): int8 is the default-mode bigint, exact.
+      assert.equal(w1.id, 9007199254740993n);
+      assert.equal(typeof w1.id, "bigint");
 
       const m = w1.moves;
       assert.equal(m.length, 4);
@@ -152,24 +152,24 @@ for (const driverKind of ["postgres", "pg"] as const) {
       assert.deepEqual(
         m.map((row) => [row.dayKey, row.seq]),
         [
-          ["1", "11"],
-          ["1", "9007199254740995"],
-          ["11", "1"],
-          ["11", "9007199254740993"],
+          [1n, 11n],
+          [1n, 9007199254740995n],
+          [11n, 1n],
+          [11n, 9007199254740993n],
         ],
       );
 
       // int8 leaves: exact strings, never doubles (9007199254740993 would
       // arrive as 9007199254740992 and 9007199254740995 as 9007199254740996
       // through an uncast jsonb number).
-      assert.equal(m[0].delta, "-9007199254740993");
-      assert.equal(m[1].seq, "9007199254740995");
-      assert.equal(m[2].delta, "9007199254740995");
-      assert.equal(m[3].seq, "9007199254740993");
+      assert.equal(m[0].delta, -9007199254740993n);
+      assert.equal(m[1].seq, 9007199254740995n);
+      assert.equal(m[2].delta, 9007199254740995n);
+      assert.equal(m[3].seq, 9007199254740993n);
       for (const row of m) {
-        assert.equal(typeof row.dayKey, "string");
-        assert.equal(typeof row.seq, "string");
-        assert.equal(typeof row.delta, "string");
+        assert.equal(typeof row.dayKey, "bigint");
+        assert.equal(typeof row.seq, "bigint");
+        assert.equal(typeof row.delta, "bigint");
       }
 
       // numeric leaves: 30+ digit values and trailing-zero scale survive exactly.
@@ -188,11 +188,13 @@ for (const driverKind of ["postgres", "pg"] as const) {
       assert.equal(typeof m[0].weight, "number");
       assert.equal(m[3].weight, 0.5);
 
-      // temporal/bytea leaves arrive as their to_jsonb string forms.
+      // temporal leaves keep their canonical string form; bytea leaves
+      // decode from the \x hex text form to Uint8Array (F03).
       assert.equal(typeof m[0].postedAt, "string");
       assert.equal(m[3].postedAt, "2026-01-01T19:04:05.678123", "microseconds intact");
-      assert.equal(m[0].payload, "\\x00ff10", "bytea as its hex text form");
-      assert.equal(m[3].payload, "\\x00ff10");
+      assert.ok(m[0].payload instanceof Uint8Array, "bytea child leaf decodes to Uint8Array");
+      assert.equal(Buffer.from(m[0].payload).toString("hex"), "00ff10");
+      assert.equal(Buffer.from(m[3].payload as Uint8Array).toString("hex"), "00ff10");
       assert.equal(m[1].payload, null, "SQL NULL becomes JSON null");
       assert.equal(m[1].memo, null);
       assert.equal(m[0].memo, "m1");
@@ -208,7 +210,7 @@ for (const driverKind of ["postgres", "pg"] as const) {
       assert.equal(oracle[0].id, "9007199254740993");
       assert.deepEqual(
         oracle[0].moves.map((row) => [row.dayKey, row.seq]),
-        m.map((row) => [row.dayKey, row.seq]),
+        m.map((row) => [String(row.dayKey), String(row.seq)]),
       );
 
       // Flat-path agreement: relation child leaves equal flat driver values.
@@ -243,7 +245,7 @@ for (const driverKind of ["postgres", "pg"] as const) {
       assert.equal(byLabel.get("W1")!.moves.length, 4);
       const w2Moves = byLabel.get("W2")!.moves;
       assert.equal(w2Moves.length, 1);
-      assert.deepEqual([w2Moves[0].dayKey, w2Moves[0].seq], ["5", "5"]);
+      assert.deepEqual([w2Moves[0].dayKey, w2Moves[0].seq], [5n, 5n]);
       assert.equal(w2Moves[0].amount, "2.25");
 
       // To-one through an int8 key: the child finds its parent exactly.
@@ -254,8 +256,8 @@ for (const driverKind of ["postgres", "pg"] as const) {
       });
       assert.ok(move);
       assert.ok(move.wallet);
-      assert.equal(move.wallet.id, "9007199254740993");
-      assert.equal(typeof move.wallet.id, "string");
+      assert.equal(move.wallet.id, 9007199254740993n);
+      assert.equal(typeof move.wallet.id, "bigint");
       assert.equal(move.wallet.label, "W1");
     });
   });
