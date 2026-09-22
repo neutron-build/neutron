@@ -8,8 +8,9 @@ import (
 	"time"
 )
 
-// Migration behavior that only a live engine can prove: the checksum
-// lifecycle (GO-30), the cross-process ledger claim (Consumer-1), and the
+// Migration behavior that only a live engine can prove: the protocol-v2
+// history lifecycle (checksums, owner/format, legacy refusal and adoption),
+// the cross-process ledger claim WITHOUT time-based takeover (M04), and the
 // text-format integer contract the ledger depends on (GO-31 — the engine
 // pins the same contract server-side in nucleus's
 // wire::tests_row_description integer-format test).
@@ -49,6 +50,8 @@ func resetMigrationTables(t *testing.T, c *Client) {
 		"DROP TABLE IF EXISTS mig_b",
 		"DROP TABLE IF EXISTS legacy_a",
 		"DROP TABLE IF EXISTS legacy_b",
+		"DROP TABLE IF EXISTS ts_a",
+		"DROP TABLE IF EXISTS ts_b",
 		"DROP TABLE IF EXISTS conc_a",
 		"DROP TABLE IF EXISTS conc_b",
 	} {
@@ -124,12 +127,13 @@ func TestIntegerResultsAreTextRoundTrip(t *testing.T) {
 		t.Fatalf("scan int64 literal: %v", err)
 	}
 	if big != 9223372036854775807 {
-		t.Errorf("int64 literal = %d", big)
+		t.Errorf("int64 literal = %d, want max", big)
 	}
 }
 
-// GO-30: applied history records checksums; modified applied migrations are
-// refused; legacy rows (no checksum column content) are baselined silently.
+// Protocol v2: applied history records checksums, owner and format; a
+// modified applied migration is refused; a fresh-database run works
+// end-to-end and rolls back cleanly.
 func TestMigrateChecksumLifecycle(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()
@@ -143,7 +147,7 @@ func TestMigrateChecksumLifecycle(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 
-	// Both applied, both checksummed with the deterministic digest.
+	// Both applied under the v2 protocol marker with the canonical digest.
 	applied, err := c.appliedVersions(ctx)
 	if err != nil {
 		t.Fatalf("applied versions: %v", err)
@@ -156,11 +160,14 @@ func TestMigrateChecksumLifecycle(t *testing.T) {
 		if !ok {
 			t.Fatalf("version %d not applied", m.Version)
 		}
-		if rec.checksum == nil {
-			t.Fatalf("version %d recorded without checksum", m.Version)
+		if rec.checksum == nil || rec.format == nil {
+			t.Fatalf("version %d recorded without checksum/format", m.Version)
 		}
 		if *rec.checksum != migrationChecksum(m) {
 			t.Errorf("version %d checksum = %s, want %s", m.Version, *rec.checksum, migrationChecksum(m))
+		}
+		if *rec.format != MigrationHistoryFormat {
+			t.Errorf("version %d format = %s, want %s", m.Version, *rec.format, MigrationHistoryFormat)
 		}
 	}
 
@@ -198,18 +205,16 @@ func TestMigrateChecksumLifecycle(t *testing.T) {
 	}
 }
 
-// GO-30 baseline policy: a history table written by an older client (no
-// checksum column, no checksum content) upgrades in place — the column is
-// added, existing rows are baselined from the current plan, and nothing
-// fails. Drifted legacy rows are accepted by policy: there is no earlier
-// recorded content to compare against.
-func TestMigrateBaselinesLegacyHistory(t *testing.T) {
+// The M04 transition: a history written by an older client (NULL checksum,
+// NULL format — the TS SDK shape and pre-GO-30 Go shape) is REFUSED until
+// explicit adoption graduates it. Adoption keeps unprovable rows unverified
+// (checksum NULL, never baselined), and the run then proceeds.
+func TestMigrateRefusesLegacyHistoryUntilAdopted(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()
 	resetMigrationTables(t, c)
 
-	// Pre-checksum-era table, exactly as old clients created it, with a
-	// legacy row whose content only roughly matches the plan.
+	// TS-SDK-era table, exactly as old clients created it.
 	legacy := `
 CREATE TABLE _neutron_migrations (
     version     INTEGER PRIMARY KEY,
@@ -225,48 +230,171 @@ CREATE TABLE _neutron_migrations (
 	}
 
 	plan := []Migration{
-		// "Modified" relative to whatever actually ran in the legacy row —
-		// baselining must not care.
-		{Version: 1, Name: "first", Up: "CREATE TABLE legacy_a (id INT)", Down: "DROP TABLE legacy_a"},
-		{Version: 2, Name: "second", Up: "CREATE TABLE legacy_b (id INT)", Down: "DROP TABLE legacy_b"},
-	}
-	if err := c.Migrate(ctx, plan); err != nil {
-		t.Fatalf("migrate over legacy history: %v", err)
+		{Version: 1, Name: "first", Up: "CREATE TABLE ts_a (id INT)", Down: "DROP TABLE ts_a"},
+		{Version: 2, Name: "second", Up: "CREATE TABLE ts_b (id INT)", Down: "DROP TABLE ts_b"},
 	}
 
+	// Refused BEFORE mutations: version 2 must not run.
+	err := c.Migrate(ctx, plan)
+	if err == nil {
+		t.Fatal("legacy history accepted without adoption")
+	}
+	if !strings.Contains(err.Error(), "adopt") {
+		t.Errorf("refusal must point at adoption: %v", err)
+	}
+	if _, err := c.pool.Exec(ctx, "SELECT 1 FROM ts_b"); err == nil {
+		t.Error("pending migration ran despite legacy-history refusal")
+	}
+
+	// Explicit adoption: the row had no checksum, so it graduates as
+	// unverified — reported, never baselined.
+	report, err := c.AdoptMigrations(ctx, plan)
+	if err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	if len(report.Verified) != 0 || len(report.Unverified) != 1 || report.Unverified[0] != 1 {
+		t.Fatalf("adoption report = %+v, want 1 unverified (version 1)", report)
+	}
 	applied, err := c.appliedVersions(ctx)
 	if err != nil {
-		t.Fatalf("applied versions: %v", err)
+		t.Fatalf("applied after adopt: %v", err)
 	}
-	if len(applied) != 2 {
-		t.Fatalf("applied = %d rows, want 2", len(applied))
+	if applied[1].checksum != nil {
+		t.Error("unverifiable row was baselined with a checksum")
 	}
-	for _, m := range plan {
-		rec, ok := applied[m.Version]
-		if !ok {
-			t.Fatalf("version %d missing", m.Version)
-		}
-		if rec.checksum == nil {
-			t.Fatalf("version %d not baselined", m.Version)
-		}
-		if *rec.checksum != migrationChecksum(m) {
-			t.Errorf("version %d checksum = %s, want plan digest", m.Version, *rec.checksum)
-		}
+	if applied[1].format == nil || *applied[1].format != MigrationHistoryFormat {
+		t.Error("adopted row not stamped with format v2")
 	}
 
-	// And the baselined row is now ENFORCED: modifying it fails.
+	// The run now proceeds: only version 2 applies.
+	if err := c.Migrate(ctx, plan); err != nil {
+		t.Fatalf("migrate after adoption: %v", err)
+	}
+	applied, err = c.appliedVersions(ctx)
+	if err != nil {
+		t.Fatalf("applied after migrate: %v", err)
+	}
+	if len(applied) != 2 {
+		t.Fatalf("applied = %d, want 2", len(applied))
+	}
+	// The adopted-unverified row stays exempt from enforcement (its SQL in
+	// the plan is not what ran, and that is fine — it was never provable).
+}
+
+// Pre-M04 Go SDK history (GO-30 legacy digests): refused until adopted, and
+// adoption VERIFIES via the legacy digest when the supplied plan reproduces
+// it — after which the row is enforced under the v2 checksum.
+func TestMigrateRefusesLegacyDigestHistoryUntilAdopted(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	resetMigrationTables(t, c)
+
+	up1 := "CREATE TABLE legacy_a (id INT)"
+	legacyTable := `
+CREATE TABLE _neutron_migrations (
+    version     INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL,
+    applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    checksum    TEXT
+)`
+	if _, err := c.pool.Exec(ctx, legacyTable); err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+	if _, err := c.pool.Exec(ctx,
+		"INSERT INTO _neutron_migrations (version, name, checksum) VALUES (1, 'first', $1)",
+		legacyMigrationChecksum(1, "first", up1)); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+
+	plan := []Migration{
+		{Version: 1, Name: "first", Up: up1, Down: "DROP TABLE legacy_a"},
+		{Version: 2, Name: "second", Up: "CREATE TABLE legacy_b (id INT)", Down: "DROP TABLE legacy_b"},
+	}
+
+	if err := c.Migrate(ctx, plan); err == nil {
+		t.Fatal("legacy-digest history accepted without adoption")
+	} else if !strings.Contains(err.Error(), "adopt") {
+		t.Errorf("refusal must point at adoption: %v", err)
+	}
+
+	report, err := c.AdoptMigrations(ctx, plan)
+	if err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	if len(report.Verified) != 1 || report.Verified[0] != 1 {
+		t.Fatalf("adoption report = %+v, want version 1 verified via legacy digest", report)
+	}
+	applied, err := c.appliedVersions(ctx)
+	if err != nil {
+		t.Fatalf("applied after adopt: %v", err)
+	}
+	if applied[1].checksum == nil || *applied[1].checksum != migrationChecksum(plan[0]) {
+		t.Errorf("verified adoption must record the v2 digest, got %v", applied[1].checksum)
+	}
+
+	// Enforced from now on: tampering with the verified row fails.
 	tampered := make([]Migration, len(plan))
 	copy(tampered, plan)
-	tampered[0].Up = "CREATE TABLE legacy_a (id BIGINT)"
+	tampered[0].Up = up1 + " -- tampered"
 	if err := c.Migrate(ctx, tampered); err == nil {
-		t.Error("tampered baselined migration accepted")
+		t.Error("tampered adopted-verified migration accepted")
+	}
+	if err := c.Migrate(ctx, plan); err != nil {
+		t.Fatalf("migrate after adoption: %v", err)
+	}
+
+	// A recorded checksum that matches neither digest aborts adoption.
+	resetMigrationTables(t, c)
+	if _, err := c.pool.Exec(ctx, legacyTable); err != nil {
+		t.Fatalf("recreate legacy table: %v", err)
+	}
+	if _, err := c.pool.Exec(ctx,
+		"INSERT INTO _neutron_migrations (version, name, checksum) VALUES (1, 'first', 'deadbeef')"); err != nil {
+		t.Fatalf("seed mismatched row: %v", err)
+	}
+	if _, err := c.AdoptMigrations(ctx, plan); err == nil {
+		t.Error("adoption accepted a checksum matching neither digest")
+	} else if !strings.Contains(err.Error(), "neither") {
+		t.Errorf("mismatch error must say neither digest matched: %v", err)
 	}
 }
 
-// Consumer-1: the ledger claim serializes migration runners. Exactly one
-// acquirer holds the claim; a second waits; a released claim is re-taken;
-// a stale claim (holder crashed without releasing) is stolen.
-func TestMigrationLedgerLock(t *testing.T) {
+// Mixed-runner rule: a text-version history belongs to the canonical CLI
+// protocol; the SDK runner refuses it before any mutation.
+func TestMigrateRefusesTextHistory(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	resetMigrationTables(t, c)
+
+	if _, err := c.pool.Exec(ctx, `
+		CREATE TABLE _neutron_migrations (
+			version TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			checksum TEXT, owner TEXT, format TEXT
+		)`); err != nil {
+		t.Fatalf("create CLI-shaped history: %v", err)
+	}
+
+	plan := []Migration{{Version: 1, Name: "first", Up: "CREATE TABLE mig_a (id INT)"}}
+	err := c.Migrate(ctx, plan)
+	if err == nil {
+		t.Fatal("SDK accepted a CLI-owned text history")
+	}
+	if !strings.Contains(err.Error(), "text") {
+		t.Errorf("refusal must name the text history: %v", err)
+	}
+	if _, err := c.pool.Exec(ctx, "SELECT 1 FROM mig_a"); err == nil {
+		t.Error("migration ran despite mixed-history refusal")
+	}
+}
+
+// Consumer-1 + M04: the ledger claim serializes migration runners, with NO
+// automatic time-based takeover. Exactly one acquirer holds the claim; a
+// second waits; a released claim is re-taken; a STALE claim still blocks
+// (the retired 10-minute steal must never come back); a killed holder
+// blocks until the explicit force-unlock.
+func TestMigrationLedgerLockNoStaleTakeover(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()
 	resetMigrationTables(t, c)
@@ -289,6 +417,15 @@ func TestMigrationLedgerLock(t *testing.T) {
 		t.Errorf("second acquire returned early (%v) instead of waiting", elapsed)
 	}
 
+	// The holder is diagnosable while held.
+	info, err := c.MigrationLockInfo(ctx)
+	if err != nil {
+		t.Fatalf("lock info: %v", err)
+	}
+	if !info.Held || !strings.Contains(info.Owner, "nucleus-go-sdk") {
+		t.Fatalf("lock info = %+v, want held with go-sdk owner", info)
+	}
+
 	// Release drops exactly this token.
 	c.releaseMigrationLock(ctx, token)
 	var count int
@@ -308,32 +445,65 @@ func TestMigrationLedgerLock(t *testing.T) {
 		t.Error("re-acquisition reused the released token")
 	}
 
-	// Stale claim is stolen: age locked_at past the threshold.
+	// STALE claim is NOT stolen: age the heartbeat far past every threshold
+	// any runner has ever used — the claim must still block.
 	if _, err := c.pool.Exec(ctx,
-		"UPDATE _neutron_migration_lock SET locked_at = NOW() - make_interval(secs => 3600) WHERE id = 1"); err != nil {
+		"UPDATE _neutron_migration_lock SET locked_at = NOW() - make_interval(secs => 86400) WHERE id = 1"); err != nil {
 		t.Fatalf("age lock row: %v", err)
 	}
-	stolen, err := c.acquireMigrationLock(ctx)
-	if err != nil {
-		t.Fatalf("acquire over stale claim: %v", err)
+	staleCtx, staleCancel := context.WithTimeout(ctx, 600*time.Millisecond)
+	defer staleCancel()
+	if _, err := c.acquireMigrationLock(staleCtx); err == nil {
+		t.Fatal("stale claim was stolen — automatic time-based takeover must not exist")
+	} else if !errorsIsContextDeadline(err) {
+		t.Fatalf("stale acquire error = %v, want context deadline (no steal)", err)
 	}
+
+	// KILLED holder: close a client's entire pool WITHOUT releasing — the
+	// process-death shape. The durable claim survives, so runners still
+	// block until an operator force-unlocks.
+	url := os.Getenv("NEUTRON_TEST_DATABASE_URL")
+	dead, err := Connect(ctx, url)
+	if err != nil {
+		t.Fatalf("connect doomed client: %v", err)
+	}
+	if err := dead.ForceUnlockMigrations(ctx); err != nil { // clear token2's claim for a clean slate
+		t.Fatalf("clear claim: %v", err)
+	}
+	deadToken, err := dead.acquireMigrationLock(ctx)
+	if err != nil {
+		t.Fatalf("doomed client acquire: %v", err)
+	}
+	_ = deadToken
+	dead.Close() // sessions die; the claim row is durable and remains
+
+	blockedCtx, blockedCancel := context.WithTimeout(ctx, 600*time.Millisecond)
+	defer blockedCancel()
+	if _, err := c.acquireMigrationLock(blockedCtx); err == nil {
+		t.Fatal("acquire succeeded after holder death without force-unlock")
+	} else if !errorsIsContextDeadline(err) {
+		t.Fatalf("post-death acquire error = %v, want context deadline (durable claim)", err)
+	}
+
+	// Explicit unlock — the only recovery path — lets the next runner in.
+	if err := c.ForceUnlockMigrations(ctx); err != nil {
+		t.Fatalf("force unlock: %v", err)
+	}
+	recovered, err := c.acquireMigrationLock(ctx)
+	if err != nil {
+		t.Fatalf("acquire after force unlock: %v", err)
+	}
+
+	// A late release of the OLD claim must not remove the successor's.
+	c.releaseMigrationLock(ctx, token2)
 	var holder int64
 	if err := c.pool.QueryRow(ctx, "SELECT token FROM _neutron_migration_lock WHERE id = 1").Scan(&holder); err != nil {
 		t.Fatalf("read holder: %v", err)
 	}
-	if holder != stolen {
-		t.Errorf("holder token = %d, want the stealing acquirer's %d", holder, stolen)
+	if holder != recovered {
+		t.Errorf("late release removed the successor claim: holder = %d, want %d", holder, recovered)
 	}
-
-	// A late release of the OLD claim must not remove the stolen one.
-	c.releaseMigrationLock(ctx, token2)
-	if err := c.pool.QueryRow(ctx, "SELECT token FROM _neutron_migration_lock WHERE id = 1").Scan(&holder); err != nil {
-		t.Fatalf("read holder after late release: %v", err)
-	}
-	if holder != stolen {
-		t.Errorf("late release removed the stolen claim: holder = %d, want %d", holder, stolen)
-	}
-	c.releaseMigrationLock(ctx, stolen)
+	c.releaseMigrationLock(ctx, recovered)
 }
 
 // Consumer-1, end to end: two clients over separate connection pools

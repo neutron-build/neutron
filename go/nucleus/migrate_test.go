@@ -350,38 +350,66 @@ func TestMigrationChecksum(t *testing.T) {
 	if migrationChecksum(changed) == want {
 		t.Error("checksum insensitive to Up SQL changes")
 	}
+
+	// The v2 checksum covers the up SQL only (contracts/data/MIGRATIONS.md
+	// §3): identity lives in the version primary key, the down SQL may
+	// evolve, and the name is metadata.
 	changed = base
 	changed.Name = "create_users_v2"
-	if migrationChecksum(changed) == want {
-		t.Error("checksum insensitive to name changes")
+	if migrationChecksum(changed) != want {
+		t.Error("checksum must not track name changes")
 	}
 	changed = base
 	changed.Version = 2
-	if migrationChecksum(changed) == want {
-		t.Error("checksum insensitive to version changes")
+	if migrationChecksum(changed) != want {
+		t.Error("checksum must not track version changes")
 	}
+}
 
-	// NUL separation: (1, "ab", ...) and (1, "a", "b", ...) must differ —
-	// without the separators a field boundary could move without changing
-	// the bytes.
-	if migrationChecksum(Migration{Version: 1, Name: "ab", Up: "c"}) ==
-		migrationChecksum(Migration{Version: 1, Name: "a", Up: "bc"}) {
-		t.Error("checksum not NUL-separated: field boundary can slide")
+// Golden vectors pin the canonical algorithm across the CLI and both SDKs
+// (contracts/data/MIGRATIONS.md §3).
+func TestMigrationChecksumGoldenVectors(t *testing.T) {
+	cases := []struct{ sql, want string }{
+		{"CREATE TABLE x (id INT)\n", "c4b873a900b90da54e1de8efb0da3f7294599c0e96b5c50f2ff411bd7274a65a"},
+		{"CREATE TABLE users (id serial PRIMARY KEY);\nALTER TABLE users ADD COLUMN email TEXT;\n",
+			"5df840dd9f1517a75a84c53d78c6caf338ecff05e211ea8a08df48f21b983f9c"},
+	}
+	for _, c := range cases {
+		m := Migration{Version: 9, Name: "vector", Up: c.sql}
+		if got := migrationChecksum(m); got != c.want {
+			t.Errorf("migrationChecksum(%q) = %s, want %s", c.sql, got, c.want)
+		}
+	}
+}
+
+// The legacy digest golden vector — the compatibility shim verified during
+// adoption.
+func TestLegacyMigrationChecksumVector(t *testing.T) {
+	got := legacyMigrationChecksum(1, "first", "CREATE TABLE legacy_a (id INT)")
+	want := "208474566c268521846034e32490fac1e893a2d6390018f75bb915b3722d995f"
+	if got != want {
+		t.Errorf("legacyMigrationChecksum = %s, want %s", got, want)
+	}
+	// NUL separation: (1, "ab", ...) and (1, "a", "b", ...) must differ.
+	if legacyMigrationChecksum(1, "ab", "c") == legacyMigrationChecksum(1, "a", "bc") {
+		t.Error("legacy digest not NUL-separated: field boundary can slide")
 	}
 }
 
 // The history and lock tables carry the columns the code writes.
 func TestMigrationsTableSQLChecksum(t *testing.T) {
-	if !contains(migrationsTable, "checksum") {
-		t.Error("migrationsTable should have a checksum column")
+	for _, col := range []string{"checksum", "owner", "format"} {
+		if !contains(migrationsTable, col) {
+			t.Errorf("migrationsTable should have a %s column", col)
+		}
 	}
-	if !contains(migrationsAddChecksum, "ADD COLUMN IF NOT EXISTS checksum") {
-		t.Error("migrationsAddChecksum should add the checksum column if missing")
+	if !contains(migrationsAddColumns, "ADD COLUMN IF NOT EXISTS checksum") {
+		t.Error("migrationsAddColumns should add the checksum column if missing")
 	}
 	if !contains(migrationLockTable, "_neutron_migration_lock") {
 		t.Error("migrationLockTable should create _neutron_migration_lock")
 	}
-	if !contains(migrationLockTable, "token") || !contains(migrationLockTable, "locked_at") {
-		t.Error("migrationLockTable should carry token and locked_at")
+	if !contains(migrationLockTable, "token") || !contains(migrationLockTable, "locked_at") || !contains(migrationLockTable, "owner") {
+		t.Error("migrationLockTable should carry token, locked_at and owner")
 	}
 }

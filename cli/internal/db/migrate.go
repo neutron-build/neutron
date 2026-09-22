@@ -25,6 +25,14 @@ type MigrationRecord struct {
 	Version   string
 	Name      string
 	AppliedAt time.Time
+	// Checksum is the recorded v2 digest (SHA-256 over the applied up SQL).
+	// Nil means unverified history: no trustworthy content record exists
+	// (legacy row or adopted-unverified). Never silently backfilled.
+	Checksum *string
+	// Owner is the runner identity that wrote or adopted the row.
+	Owner string
+	// Format is the protocol marker ("v2"); empty for legacy rows.
+	Format string
 }
 
 // MigrationStatus combines file and database state for a migration.
@@ -37,18 +45,27 @@ type MigrationStatus struct {
 	// is absent from the local migrations directory. It can be inspected
 	// in status output but not rolled back from this checkout.
 	Missing bool
+	// Unverified marks an applied migration whose recorded content could
+	// not be proven (NULL checksum) — reported, never baselined.
+	Unverified bool
 }
 
+// createTrackingTable creates the protocol v2 history table
+// (contracts/data/MIGRATIONS.md). Legacy tables graduate via explicit
+// adoption, never via this CREATE (IF NOT EXISTS is a no-op on them).
+// Table creation for a RUN happens on the locked session
+// (MigrationSession.EnsureMigrationTableV2); this constant is the shared
+// shape used by AppliedMigrations when no history exists yet — a
+// pre-existing metadata write (the empty v2 table is created outside the
+// advisory lock, idempotent), kept from pre-M04 status behavior.
 const createTrackingTable = `CREATE TABLE IF NOT EXISTS _neutron_migrations (
     version TEXT PRIMARY KEY,
     name TEXT NOT NULL,
-    applied_at TIMESTAMPTZ DEFAULT now()
+    applied_at TIMESTAMPTZ DEFAULT now(),
+    checksum TEXT,
+    owner TEXT,
+    format TEXT
 );`
-
-// EnsureMigrationTable creates the tracking table if it doesn't exist.
-func (c *Client) EnsureMigrationTable(ctx context.Context) error {
-	return c.Exec(ctx, createTrackingTable)
-}
 
 // HasMigrationHistory reports whether the tracking table exists and holds at
 // least one applied migration (guards `db push` against clobbering managed DBs).
@@ -71,67 +88,53 @@ func (c *Client) HasMigrationHistory(ctx context.Context) (bool, error) {
 	return count > 0, nil
 }
 
-// AppliedMigrations returns all applied migrations from the tracking table.
+// AppliedMigrations returns all applied migrations from the tracking table,
+// reading v2 columns when the table has them. The status command uses this;
+// mutating flows must read under a MigrationSession's advisory lock. On an
+// absent history this creates the empty v2 table outside the lock — a
+// pre-existing (pre-M04) idempotent metadata write, not new behavior.
 func (c *Client) AppliedMigrations(ctx context.Context) ([]MigrationRecord, error) {
-	if err := c.EnsureMigrationTable(ctx); err != nil {
+	shape, err := c.InspectMigrationHistory(ctx)
+	if err != nil {
 		return nil, err
 	}
+	switch shape {
+	case HistoryAbsent:
+		if err := c.Exec(ctx, createTrackingTable); err != nil {
+			return nil, err
+		}
+		shape = HistoryV2Text
+	case HistoryV2Text, HistoryV2Integer:
+	case HistoryLegacyText, HistoryLegacyInteger, HistoryIncompatible:
+		// Read what is there without the v2 columns.
+		rows, err := c.pool.Query(ctx, "SELECT version, name, applied_at FROM _neutron_migrations ORDER BY version")
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var records []MigrationRecord
+		for rows.Next() {
+			var r MigrationRecord
+			if err := rows.Scan(&r.Version, &r.Name, &r.AppliedAt); err != nil {
+				return nil, err
+			}
+			records = append(records, r)
+		}
+		return records, rows.Err()
+	}
 
-	rows, err := c.Query(ctx, "SELECT version, name, applied_at FROM _neutron_migrations ORDER BY version")
+	rows, err := c.pool.Query(ctx, "SELECT version, name, applied_at, checksum, owner, format FROM _neutron_migrations ORDER BY version")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
-	var records []MigrationRecord
-	for rows.Next() {
-		var r MigrationRecord
-		if err := rows.Scan(&r.Version, &r.Name, &r.AppliedAt); err != nil {
-			return nil, err
-		}
-		records = append(records, r)
-	}
-	return records, rows.Err()
+	return scanMigrationRecords(rows)
 }
 
-// ApplyMigration applies a single migration within a transaction.
-func (c *Client) ApplyMigration(ctx context.Context, mf MigrationFile) error {
-	tx, err := c.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
-	if _, err := tx.Exec(ctx, mf.SQL); err != nil {
-		return fmt.Errorf("execute migration %s: %w", mf.Version, err)
-	}
-
-	if _, err := tx.Exec(ctx, "INSERT INTO _neutron_migrations (version, name) VALUES ($1, $2)",
-		mf.Version, mf.Name); err != nil {
-		return fmt.Errorf("record migration %s: %w", mf.Version, err)
-	}
-
-	return tx.Commit(ctx)
-}
-
-// RevertMigration reverts a single migration within a transaction.
-func (c *Client) RevertMigration(ctx context.Context, mf MigrationFile) error {
-	tx, err := c.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
-	if _, err := tx.Exec(ctx, mf.SQL); err != nil {
-		return fmt.Errorf("execute down migration %s: %w", mf.Version, err)
-	}
-
-	if _, err := tx.Exec(ctx, "DELETE FROM _neutron_migrations WHERE version = $1", mf.Version); err != nil {
-		return fmt.Errorf("delete migration record %s: %w", mf.Version, err)
-	}
-
-	return tx.Commit(ctx)
-}
+// ApplyMigration/RevertMigration live on MigrationSession
+// (migrate_history.go): every mutation runs on the pinned advisory-lock
+// connection with v2 checksum/owner/format metadata recorded atomically with
+// the DDL. There is deliberately no unlocked pool-level apply path.
 
 // readMigrationFilesWithSuffix is a helper that reads migration files with a given suffix.
 func readMigrationFilesWithSuffix(dir, suffix string, reverseSort bool) ([]MigrationFile, error) {
@@ -261,6 +264,7 @@ func mergeMigrationStatuses(files []MigrationFile, applied []MigrationRecord) []
 		if r, ok := appliedMap[f.Version]; ok {
 			status.Applied = true
 			status.AppliedAt = r.AppliedAt
+			status.Unverified = r.Checksum == nil
 			seen[f.Version] = true
 		}
 		statuses = append(statuses, status)
@@ -272,11 +276,12 @@ func mergeMigrationStatuses(files []MigrationFile, applied []MigrationRecord) []
 			continue
 		}
 		statuses = append(statuses, MigrationStatus{
-			Version:   r.Version,
-			Name:      r.Name,
-			Applied:   true,
-			AppliedAt: r.AppliedAt,
-			Missing:   true,
+			Version:    r.Version,
+			Name:       r.Name,
+			Applied:    true,
+			AppliedAt:  r.AppliedAt,
+			Missing:    true,
+			Unverified: r.Checksum == nil,
 		})
 	}
 

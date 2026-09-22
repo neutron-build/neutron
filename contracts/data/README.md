@@ -11,6 +11,7 @@ fixtures that two independent implementations must agree on byte-for-byte.
 |---|---|
 | `schema-v2.json` | JSON Schema (draft 2020-12) for schema document v2 — the normative shape |
 | `CANONICAL.md` | Canonical JSON rules: key sorting, unordered sets vs ordered tuples, number and string serialization, SHA-256, rejection codes, the v1 upgrade reader rules |
+| `MIGRATIONS.md` | Migration history protocol v2: text IDs and collisions, checksum algorithm and golden vectors, owner/format metadata, advisory-lock and claim serialization, explicit legacy adoption, mixed-runner rules |
 | `consumer.ts` | TypeScript reference implementation: validates, canonicalizes and hashes the fixtures; run with `node --experimental-strip-types contracts/data/consumer.ts` |
 | `golden/manifest.json` | Fixture index: expected canonical bytes, SHA-256 hashes and rejection codes |
 | `golden/valid/` | Valid documents, each with the expected canonical serialization |

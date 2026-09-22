@@ -23,6 +23,11 @@ import {
   migrate,
   migrateDown,
   migrationStatus,
+  adoptMigrations,
+  forceUnlockMigrations,
+  migrationLockInfo,
+  migrationChecksum,
+  legacyGoSdkChecksum,
 } from "./index.js";
 
 import type {
@@ -1530,6 +1535,12 @@ describe("withPubSub plugin", () => {
 // Migration system
 // ---------------------------------------------------------------------------
 
+// v2Row shapes a history row the runner trusts: format v2 plus the canonical
+// checksum of the up SQL (adopted-unverified rows carry checksum null).
+function v2Row(m: Migration): { version: number; checksum: string; format: string } {
+  return { version: m.version, checksum: migrationChecksum(m.up), format: "v2" };
+}
+
 describe("migrate", () => {
   let transport: MockTransport;
 
@@ -1541,7 +1552,9 @@ describe("migrate", () => {
 
   beforeEach(() => {
     transport = new MockTransport();
-    // Make ensureTable + appliedVersions work: SELECT version returns empty
+    // The ledger claim INSERT must succeed on the mock (1 = claimed).
+    transport.executeResult = 1;
+    // Make ensureTable + appliedRows work: SELECT version returns empty.
     transport.onQuery("SELECT version", []);
   });
 
@@ -1551,13 +1564,13 @@ describe("migrate", () => {
   });
 
   it("skips already applied migrations", async () => {
-    transport.onQuery("SELECT version", [{ version: 1 }]);
+    transport.onQuery("SELECT version", [v2Row(migrations[0])]);
     const ran = await migrate(transport, migrations);
     assert.deepEqual(ran, ["add_email", "create_posts"]);
   });
 
   it("returns empty array when all are applied", async () => {
-    transport.onQuery("SELECT version", [{ version: 1 }, { version: 2 }, { version: 3 }]);
+    transport.onQuery("SELECT version", migrations.map(v2Row));
     const ran = await migrate(transport, migrations);
     assert.deepEqual(ran, []);
   });
@@ -1566,6 +1579,79 @@ describe("migrate", () => {
     const reversed = [...migrations].reverse();
     const ran = await migrate(transport, reversed);
     assert.deepEqual(ran, ["create_users", "add_email", "create_posts"]);
+  });
+
+  it("records checksum, owner and format with each migration", async () => {
+    await migrate(transport, [migrations[0]]);
+    const insert = transport.calls.find(
+      (c) => c.method === "execute" && String(c.args[0]).includes("INSERT INTO _neutron_migrations"),
+    );
+    assert.ok(insert, "history INSERT not issued");
+    const params = insert!.args[1] as unknown[];
+    assert.equal(params[2], migrationChecksum(migrations[0].up));
+    assert.equal(params[4], "v2");
+    assert.ok(String(params[3]).startsWith("nucleus-ts-sdk@"));
+  });
+
+  it("refuses a modified applied migration before any new mutation", async () => {
+    transport.onQuery("SELECT version", [v2Row(migrations[0])]);
+    const tampered: Migration[] = [
+      { ...migrations[0], up: "CREATE TABLE users (id BIGINT)" },
+      migrations[1],
+    ];
+    await assert.rejects(
+      () => migrate(transport, tampered),
+      (err: Error) => err.message.includes("modified since it was applied"),
+    );
+    // Refusal precedes mutations: no history INSERT was issued.
+    assert.ok(!transport.calls.some(
+      (c) => c.method === "execute" && String(c.args[0]).includes("INSERT INTO _neutron_migrations"),
+    ));
+  });
+
+  it("refuses legacy-format history rows until adoption", async () => {
+    transport.onQuery("SELECT version", [
+      { version: 1, checksum: "deadbeef", format: null },
+    ]);
+    await assert.rejects(
+      () => migrate(transport, migrations),
+      (err: Error) => err.message.includes("adopt"),
+    );
+    assert.ok(!transport.calls.some(
+      (c) => c.method === "execute" && String(c.args[0]).includes("INSERT INTO _neutron_migrations"),
+    ));
+  });
+
+  it(" exempts adopted-unverified rows (null checksum, v2 format)", async () => {
+    transport.onQuery("SELECT version", [
+      { version: 1, checksum: null, format: "v2" },
+    ]);
+    const ran = await migrate(transport, migrations);
+    assert.deepEqual(ran, ["add_email", "create_posts"]);
+  });
+
+  it("aborts the lock wait on signal and never steals the claim", async () => {
+    const transportHeld = new MockTransport();
+    transportHeld.executeResult = 0; // claim INSERT conflicts: held elsewhere
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 60);
+    await assert.rejects(
+      () => migrate(transportHeld, migrations, { signal: controller.signal }),
+      () => true,
+    );
+    // No time-based takeover path exists: no UPDATE ever touches the lock
+    // table (a steal would be one).
+    const lockWrites = transportHeld.calls.filter(
+      (c) => c.method === "execute" && String(c.args[0]).includes("_neutron_migration_lock"),
+    );
+    assert.ok(lockWrites.length > 0, "claim was never attempted");
+    for (const c of lockWrites) {
+      const sql = String(c.args[0]);
+      assert.ok(
+        !sql.trimStart().toUpperCase().startsWith("UPDATE"),
+        `unexpected lock-table mutation (steal path?): ${sql}`,
+      );
+    }
   });
 });
 
@@ -1579,24 +1665,123 @@ describe("migrateDown", () => {
 
   beforeEach(() => {
     transport = new MockTransport();
+    transport.executeResult = 1;
   });
 
   it("rolls back the most recent migration", async () => {
-    transport.onQuery("SELECT version", [{ version: 1 }, { version: 2 }]);
+    transport.onQuery("SELECT version", migrations.map(v2Row));
     const rolled = await migrateDown(transport, migrations, 1);
     assert.deepEqual(rolled, ["add_email"]);
   });
 
   it("rolls back multiple steps", async () => {
-    transport.onQuery("SELECT version", [{ version: 1 }, { version: 2 }]);
+    transport.onQuery("SELECT version", migrations.map(v2Row));
     const rolled = await migrateDown(transport, migrations, 2);
     assert.deepEqual(rolled, ["add_email", "create_users"]);
   });
 
   it("throws when migration has no down SQL", async () => {
     const noDown: Migration[] = [{ version: 1, name: "irreversible", up: "DO SOMETHING" }];
-    transport.onQuery("SELECT version", [{ version: 1 }]);
+    transport.onQuery("SELECT version", [v2Row(noDown[0])]);
     await assert.rejects(() => migrateDown(transport, noDown, 1), Error);
+  });
+});
+
+describe("adoptMigrations", () => {
+  it("verifies rows whose legacy Go SDK digest reproduces from the plan", async () => {
+    const transport = new MockTransport();
+    transport.executeResult = 1;
+    const m: Migration = { version: 1, name: "first", up: "CREATE TABLE a (id INT)" };
+    transport.onFetchval("SELECT EXISTS", 1);
+    transport.onQuery("SELECT version, name", [
+      { version: 1, name: "first", checksum: legacyGoSdkChecksum(1, "first", m.up) },
+    ]);
+    const report = await adoptMigrations(transport, [m]);
+    assert.deepEqual(report.verified, [1]);
+    assert.deepEqual(report.unverified, []);
+    const update = transport.calls.find(
+      (c) => c.method === "execute" && String(c.args[0]).startsWith("UPDATE _neutron_migrations"),
+    );
+    assert.ok(update, "adoption UPDATE not issued");
+    assert.equal((update!.args[1] as unknown[])[0], migrationChecksum(m.up));
+  });
+
+  it("adopts unverifiable rows with NULL checksum, never baselined", async () => {
+    const transport = new MockTransport();
+    transport.executeResult = 1;
+    const m: Migration = { version: 1, name: "first", up: "CREATE TABLE a (id INT)" };
+    transport.onFetchval("SELECT EXISTS", 1);
+    transport.onQuery("SELECT version, name", [{ version: 1, name: "first", checksum: null }]);
+    const report = await adoptMigrations(transport, [m]);
+    assert.deepEqual(report.verified, []);
+    assert.deepEqual(report.unverified, [1]);
+    const update = transport.calls.find(
+      (c) => c.method === "execute" && String(c.args[0]).startsWith("UPDATE _neutron_migrations"),
+    );
+    assert.ok(update, "adoption UPDATE not issued");
+    // The checksum is set to a literal NULL in SQL (never a computed
+    // baseline); the only parameters are owner/format/version.
+    assert.ok(String((update!.args[1] as unknown[])[0]).startsWith("nucleus-ts-sdk@"));
+  });
+
+  it("aborts when a recorded checksum matches neither digest", async () => {
+    const transport = new MockTransport();
+    transport.executeResult = 1;
+    const m: Migration = { version: 1, name: "first", up: "CREATE TABLE a (id INT)" };
+    transport.onFetchval("SELECT EXISTS", 1);
+    transport.onQuery("SELECT version, name", [{ version: 1, name: "first", checksum: "deadbeef" }]);
+    await assert.rejects(
+      () => adoptMigrations(transport, [m]),
+      (err: Error) => err.message.includes("neither"),
+    );
+  });
+});
+
+describe("migration checksums", () => {
+  // Golden vectors pin the canonical algorithm across the CLI and both SDKs
+  // (contracts/data/MIGRATIONS.md §3).
+  it("matches the cross-language golden vectors", () => {
+    assert.equal(
+      migrationChecksum("CREATE TABLE x (id INT)\n"),
+      "c4b873a900b90da54e1de8efb0da3f7294599c0e96b5c50f2ff411bd7274a65a",
+    );
+    assert.equal(
+      migrationChecksum("CREATE TABLE users (id serial PRIMARY KEY);\nALTER TABLE users ADD COLUMN email TEXT;\n"),
+      "5df840dd9f1517a75a84c53d78c6caf338ecff05e211ea8a08df48f21b983f9c",
+    );
+    assert.equal(
+      legacyGoSdkChecksum(1, "first", "CREATE TABLE legacy_a (id INT)"),
+      "208474566c268521846034e32490fac1e893a2d6390018f75bb915b3722d995f",
+    );
+  });
+});
+
+describe("migrationLockInfo / forceUnlockMigrations", () => {
+  it("reports an unheld lock", async () => {
+    const transport = new MockTransport();
+    transport.onQuery("SELECT owner", []);
+    const info = await migrationLockInfo(transport);
+    assert.equal(info.held, false);
+    assert.equal(info.owner, null);
+  });
+
+  it("reports holder diagnostics", async () => {
+    const transport = new MockTransport();
+    transport.onQuery("SELECT owner", [{ owner: "someone", heartbeat: "2026-09-22 00:00:00+00" }]);
+    const info = await migrationLockInfo(transport);
+    assert.equal(info.held, true);
+    assert.equal(info.owner, "someone");
+    assert.equal(info.heartbeat, "2026-09-22 00:00:00+00");
+  });
+
+  it("force-unlock deletes the claim row", async () => {
+    const transport = new MockTransport();
+    transport.executeResult = 1;
+    await forceUnlockMigrations(transport);
+    const del = transport.calls.find(
+      (c) => c.method === "execute" && String(c.args[0]).includes("DELETE FROM _neutron_migration_lock"),
+    );
+    assert.ok(del, "claim row not deleted");
   });
 });
 
