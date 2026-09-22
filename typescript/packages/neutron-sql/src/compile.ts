@@ -1,0 +1,230 @@
+// ---------------------------------------------------------------------------
+// @neutron-build/sql — AST compiler (F01 architecture spike)
+// ---------------------------------------------------------------------------
+// ONE traversal renders a statement: text is appended strictly in final order
+// and parameters are bound at the moment their placeholder is emitted, so
+// $n indexes and the params array can never disagree. There is no regex over
+// SQL text anywhere on this path — trusted segments pass through verbatim,
+// which is exactly why renumbering-by-regex is impossible here.
+//
+// compile() is pure: same (frozen) AST → byte-identical SQL + params array.
+// Alias generation (`__q1`, `__q2`, …) is a compile-state counter advanced in
+// traversal order, so unnamed derived tables get stable, deterministic names.
+
+import { forgedTextKind, validJoinType, validLimit, validOp } from "./ast.js";
+import type {
+  CteNode,
+  ExpressionNode,
+  JoinNode,
+  OrderSpec,
+  ProjectionNode,
+  SqlNode,
+  StatementNode,
+} from "./ast.js";
+
+export interface CompileState {
+  /** SQL text chunks, appended in final order. */
+  readonly parts: string[];
+  /** Bound values; placeholder n is params[n - 1]. */
+  readonly params: unknown[];
+  /** Deterministic auto-alias counter for unnamed derived tables. */
+  aliasCounter: number;
+}
+
+export interface CompiledQuery {
+  readonly sql: string;
+  readonly params: readonly unknown[];
+}
+
+function quoteIdent(name: string): string {
+  // Every identifier-ish field (names, aliases, qualified parts, CTE columns)
+  // funnels through here, including structurally forged nodes — so the text is
+  // validated here, not only at construction. A non-string (e.g. an object
+  // with a hostile `replace`) or a NUL byte fails closed before quoting.
+  if (typeof name !== "string") throw new Error(`compile: identifier text must be a string (got ${typeof name})`);
+  if (name.includes("\0")) throw new Error("compile: identifier text must not contain NUL bytes");
+  return '"' + name.replace(/"/g, '""') + '"';
+}
+
+/** Compile one node into `state`. Exported for direct traversal tests; the
+ *  public entry point is compileStatement. */
+export function compile(node: SqlNode, state: CompileState): void {
+  switch (node.kind) {
+    case "identifier":
+      state.parts.push(quoteIdent(node.name));
+      return;
+    case "qualified":
+      state.parts.push(node.parts.map(quoteIdent).join("."));
+      return;
+    case "param":
+      state.params.push(node.value);
+      state.parts.push(`$${state.params.length}`);
+      return;
+    case "trusted": {
+      if (forgedTextKind(node) !== null) {
+        throw new Error('compile: rejected a forged "trusted" node — construct trusted SQL through trustSql()/sqlAst()');
+      }
+      state.parts.push(node.text);
+      return;
+    }
+    case "fragment": {
+      if (forgedTextKind(node) !== null) {
+        throw new Error('compile: rejected a forged "fragment" node — construct fragments through fragment()/sqlAst()');
+      }
+      for (const part of node.parts) {
+        if (typeof part === "string") state.parts.push(part);
+        else compile(part, state);
+      }
+      return;
+    }
+    case "expr":
+      compileExpr(node, state);
+      return;
+    case "projection":
+      compileProjection(node, state);
+      return;
+    case "join":
+      compileJoin(node, state);
+      return;
+    case "subquery":
+      state.parts.push("(");
+      compile(node.select, state);
+      state.parts.push(")");
+      return;
+    case "cte":
+      compileCte(node, state);
+      return;
+    case "select":
+      compileStatementNode(node, state);
+      return;
+    default: {
+      // Unreachable for the typed union; a structurally forged node (or a
+      // non-node) lands here and fails closed instead of compiling silently.
+      throw new Error(`compile: unknown node kind ${JSON.stringify((node as { kind?: unknown }).kind)}`);
+    }
+  }
+}
+
+function compileExpr(node: ExpressionNode, state: CompileState): void {
+  validOp(node.op, node.form);
+  if (node.form === "binary") {
+    state.parts.push("(");
+    compile(node.args[0], state);
+    state.parts.push(` ${node.op} `);
+    compile(node.args[1], state);
+    state.parts.push(")");
+    return;
+  }
+  if (node.form === "unary") {
+    state.parts.push(`(${node.op} `);
+    compile(node.args[0], state);
+    state.parts.push(")");
+    return;
+  }
+  state.parts.push(`${node.op}(`);
+  for (let i = 0; i < node.args.length; i++) {
+    if (i > 0) state.parts.push(", ");
+    compile(node.args[i], state);
+  }
+  state.parts.push(")");
+}
+
+function compileProjection(node: ProjectionNode, state: CompileState): void {
+  compile(node.expr, state);
+  if (node.alias !== undefined) state.parts.push(` as ${quoteIdent(node.alias)}`);
+}
+
+function nextAlias(state: CompileState): string {
+  state.aliasCounter += 1;
+  return `__q${state.aliasCounter}`;
+}
+
+function compileJoin(node: JoinNode, state: CompileState): void {
+  validJoinType(node.type, "compile join");
+  const keyword = node.type === "cross" ? "cross join" : `${node.type} join`;
+  state.parts.push(keyword);
+  state.parts.push(" ");
+  compile(node.target, state);
+  if (node.alias !== undefined) {
+    state.parts.push(` as ${quoteIdent(node.alias)}`);
+  } else if (node.target.kind === "subquery") {
+    // A derived table is invalid without a name in Postgres; deterministically generated.
+    state.parts.push(` as ${quoteIdent(nextAlias(state))}`);
+  }
+  if (node.type !== "cross" && node.on !== undefined) {
+    state.parts.push(" on ");
+    compile(node.on, state);
+  }
+}
+
+function compileCte(node: CteNode, state: CompileState): void {
+  state.parts.push(quoteIdent(node.name));
+  if (node.columns !== undefined && node.columns.length > 0) {
+    state.parts.push(` (${node.columns.map(quoteIdent).join(", ")})`);
+  }
+  state.parts.push(" as (");
+  compile(node.select, state);
+  state.parts.push(")");
+}
+
+function compileOrder(order: readonly OrderSpec[], state: CompileState): void {
+  state.parts.push(" order by ");
+  for (let i = 0; i < order.length; i++) {
+    if (i > 0) state.parts.push(", ");
+    compile(order[i].expr, state);
+    state.parts.push(order[i].direction === "desc" ? " desc" : " asc");
+  }
+}
+
+function compileStatementNode(stmt: StatementNode, state: CompileState): void {
+  if (stmt.ctes.length > 0) {
+    state.parts.push("with ");
+    for (let i = 0; i < stmt.ctes.length; i++) {
+      if (i > 0) state.parts.push(", ");
+      compile(stmt.ctes[i], state);
+    }
+    state.parts.push(" ");
+  }
+  state.parts.push("select ");
+  if (stmt.projections.length === 0) {
+    state.parts.push("*");
+  } else {
+    for (let i = 0; i < stmt.projections.length; i++) {
+      if (i > 0) state.parts.push(", ");
+      compile(stmt.projections[i], state);
+    }
+  }
+  if (stmt.from !== undefined) {
+    state.parts.push(" from ");
+    compile(stmt.from, state);
+    if (stmt.fromAlias !== undefined) {
+      state.parts.push(` as ${quoteIdent(stmt.fromAlias)}`);
+    } else if (stmt.from.kind === "subquery") {
+      state.parts.push(` as ${quoteIdent(nextAlias(state))}`);
+    }
+  }
+  for (const j of stmt.joins) {
+    state.parts.push(" ");
+    compile(j, state);
+  }
+  if (stmt.where.length > 0) {
+    state.parts.push(" where ");
+    for (let i = 0; i < stmt.where.length; i++) {
+      if (i > 0) state.parts.push(" and ");
+      state.parts.push("(");
+      compile(stmt.where[i], state);
+      state.parts.push(")");
+    }
+  }
+  if (stmt.orderBy.length > 0) compileOrder(stmt.orderBy, state);
+  if (stmt.limit !== undefined) state.parts.push(` limit ${validLimit(stmt.limit, "compile limit")}`);
+  if (stmt.offset !== undefined) state.parts.push(` offset ${validLimit(stmt.offset, "compile offset")}`);
+}
+
+/** Public entry: compile a statement with fresh state. Pure — same AST gives
+ *  a byte-identical SQL string and params array on every call. */
+export function compileStatement(stmt: StatementNode): CompiledQuery {
+  const state: CompileState = { parts: [], params: [], aliasCounter: 0 };
+  compileStatementNode(stmt, state);
+  return { sql: state.parts.join(""), params: state.params };
+}

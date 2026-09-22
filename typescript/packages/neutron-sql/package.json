@@ -1,0 +1,66 @@
+{
+  "name": "@neutron-build/sql",
+  "version": "0.1.0",
+  "description": "Drizzle-shaped TypeScript SQL ORM for Postgres and Nucleus. Schema in code, no codegen.",
+  "author": "Tyler",
+  "license": "MIT",
+  "homepage": "https://neutron.build",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/neutron-build/neutron",
+    "directory": "typescript/packages/neutron-sql"
+  },
+  "keywords": [
+    "neutron",
+    "sql",
+    "orm",
+    "postgres",
+    "nucleus",
+    "drizzle",
+    "query-builder"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.test.*",
+    "!dist/live-harness.js"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "lint": "tsc --noEmit --pretty false",
+    "test": "pnpm run build && node --test --experimental-test-isolation=none \"dist/**/*.test.js\""
+  },
+  "peerDependencies": {
+    "pg": "^8.11.0",
+    "postgres": "^3.4.7"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    },
+    "postgres": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "@types/pg": "^8.11.0",
+    "pg": "^8.11.0",
+    "postgres": "^3.4.7",
+    "typescript": "^5.7.2"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "sideEffects": false
+}
