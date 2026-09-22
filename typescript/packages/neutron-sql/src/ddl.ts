@@ -4,6 +4,7 @@
 // Deterministic: same schema in, same SQL out. This is the source the P1
 // migration generator diffs against introspected databases.
 
+import { getTableColumns, getTableName, getTableIndexes } from "./schema.js";
 import type { AnyColumnBuilder, AnyPgTable } from "./schema.js";
 import { qident } from "./expr.js";
 
@@ -86,27 +87,27 @@ function columnDefLine(table: AnyPgTable, col: AnyColumnBuilder, inlineRefs: boo
 /** Topologically sort tables so referenced tables are created first. */
 export function topoSortTables(tables: AnyPgTable[]): { order: AnyPgTable[]; deferredFks: Array<{ table: AnyPgTable; column: AnyColumnBuilder }> } {
   const deferredFks: Array<{ table: AnyPgTable; column: AnyColumnBuilder }> = [];
-  const byName = new Map(tables.map((t) => [t.tableName, t]));
+  const byName = new Map(tables.map((t) => [getTableName(t), t]));
   const visited = new Set<string>();
   const visiting = new Set<string>();
   const order: AnyPgTable[] = [];
 
   const visit = (table: AnyPgTable): void => {
-    if (visited.has(table.tableName)) return;
-    if (visiting.has(table.tableName)) return; // cycle: defer this edge via ALTER
-    visiting.add(table.tableName);
-    for (const col of Object.values(table.columns) as AnyColumnBuilder[]) {
+    if (visited.has(getTableName(table))) return;
+    if (visiting.has(getTableName(table))) return; // cycle: defer this edge via ALTER
+    visiting.add(getTableName(table));
+    for (const col of Object.values(getTableColumns(table)) as AnyColumnBuilder[]) {
       if (!col.foreignKey) continue;
       const target = col.foreignKey().ownerTable;
-      if (!target || !byName.has(target.tableName)) continue;
-      if (visiting.has(target.tableName)) {
+      if (!target || !byName.has(getTableName(target))) continue;
+      if (visiting.has(getTableName(target))) {
         deferredFks.push({ table, column: col });
         continue;
       }
       visit(target);
     }
-    visiting.delete(table.tableName);
-    visited.add(table.tableName);
+    visiting.delete(getTableName(table));
+    visited.add(getTableName(table));
     order.push(table);
   };
 
@@ -120,29 +121,29 @@ export function referenceClause(col: AnyColumnBuilder): string {
   if (!targetTable) {
     throw new Error(`column ${col.columnName} has a foreign key to a column with no owning table`);
   }
-  let refSql = `references ${qident(targetTable.tableName)} (${qident(target.columnName)})`;
+  let refSql = `references ${qident(getTableName(targetTable))} (${qident(target.columnName)})`;
   if (col.foreignKey!.onDelete) refSql += ` on delete ${col.foreignKey!.onDelete}`;
   return refSql;
 }
 
 export function createTableSQL(table: AnyPgTable, inlineRefs = true): string {
-  const lines = (Object.values(table.columns) as AnyColumnBuilder[]).map((col) => `  ${columnDefLine(table, col, inlineRefs)}`);
-  return `create table ${qident(table.tableName)} (\n${lines.join(",\n")}\n)`;
+  const lines = (Object.values(getTableColumns(table)) as AnyColumnBuilder[]).map((col) => `  ${columnDefLine(table, col, inlineRefs)}`);
+  return `create table ${qident(getTableName(table))} (\n${lines.join(",\n")}\n)`;
 }
 
 export function addForeignKeySQL(table: AnyPgTable, column: AnyColumnBuilder, constraintName?: string): string {
-  const name = constraintName ?? `${table.tableName}_${column.columnName}_fkey`;
-  return `alter table ${qident(table.tableName)} add constraint ${qident(name)} foreign key (${qident(column.columnName)}) ${referenceClause(column)}`;
+  const name = constraintName ?? `${getTableName(table)}_${column.columnName}_fkey`;
+  return `alter table ${qident(getTableName(table))} add constraint ${qident(name)} foreign key (${qident(column.columnName)}) ${referenceClause(column)}`;
 }
 
 export function createIndexSQL(table: AnyPgTable, index: { indexName: string; unique: boolean; columns: string[]; method?: string }): string {
   const cols = index.columns.map((c) => qident(c)).join(", ");
   const method = index.method && index.method !== "btree" ? ` using ${index.method}` : "";
-  return `create ${index.unique ? "unique " : ""}index ${qident(index.indexName)} on ${qident(table.tableName)}${method} (${cols})`;
+  return `create ${index.unique ? "unique " : ""}index ${qident(index.indexName)} on ${qident(getTableName(table))}${method} (${cols})`;
 }
 
 export function dropTableSQL(table: AnyPgTable): string {
-  return `drop table if exists ${qident(table.tableName)}`;
+  return `drop table if exists ${qident(getTableName(table))}`;
 }
 
 /** Full DDL for a schema: tables (dep-ordered), FKs for cyclic edges, indexes. */
@@ -151,7 +152,7 @@ export function schemaToDDL(tables: AnyPgTable[]): string[] {
   const statements: string[] = [];
   for (const table of order) {
     statements.push(createTableSQL(table));
-    for (const idx of table.indexes) {
+    for (const idx of getTableIndexes(table)) {
       statements.push(createIndexSQL(table, idx));
     }
   }

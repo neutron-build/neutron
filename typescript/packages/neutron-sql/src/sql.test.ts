@@ -29,12 +29,19 @@ import {
   sql,
   schemaToDDL,
   createTableSQL,
+  getTableName,
+  getTableColumns,
+  getTableIndexes,
+  isPgTable,
+  exportTable,
+  TABLE_SYMBOL,
   type AnyColumnBuilder,
+  type ColumnBuilder,
   type Relation,
 } from "./index.js";
 import { buildRelationalSQL, resolveRelations } from "./relations.js";
 import type { RQBArgs } from "./relations.js";
-import type { TableRelations } from "./schema.js";
+import type { PgTableCore, TableRelations } from "./schema.js";
 import { createDatabase, type RelationChildModelOf } from "./db.js";
 
 // Schema used across the snapshot suite — mirrors the acceptance brief's
@@ -655,6 +662,136 @@ function relationalWithParams(
   return { sqlText: built.sql, params: built.params };
 }
 
+// ---------------------------------------------------------------------------
+// F02: metadata-name collisions. Authoritative table metadata lives in the
+// symbol-keyed internal record; user columns named columns/tableName/indexes
+// are ordinary columns and must not clobber it (B02 review M1).
+// ---------------------------------------------------------------------------
+
+const metaNames = pgTable(
+  "meta_names",
+  {
+    id: serial("id").primaryKey(),
+    columns: text("columns").notNull(),
+    tableName: text("table_name"),
+    indexes: integer("indexes"),
+  },
+  (t) => [index("meta_names_columns_idx").on(t.columns)],
+);
+
+const metaChildren = pgTable("meta_children", {
+  id: serial("id").primaryKey(),
+  parentId: integer("parent_id").notNull().references(() => metaNames.id),
+  label: text("label").notNull(),
+});
+
+const metaNamesRelations = relations(metaNames, ({ many }) => ({
+  children: many(metaChildren),
+}));
+const metaChildrenRelations = relations(metaChildren, ({ one }) => ({
+  parent: one(metaNames, { fields: [metaChildren.parentId], references: [metaNames.id] }),
+}));
+
+test("metadata: user columns named columns/tableName/indexes cannot clobber table metadata", () => {
+  assert.ok(isPgTable(metaNames));
+  assert.equal(getTableName(metaNames), "meta_names");
+  assert.deepEqual(Object.keys(getTableColumns(metaNames)), ["id", "columns", "tableName", "indexes"]);
+  assert.equal(getTableColumns(metaNames).tableName.columnName, "table_name");
+  assert.deepEqual(
+    getTableIndexes(metaNames).map((i) => i.indexName),
+    ["meta_names_columns_idx"],
+  );
+  // The user-facing surface still exposes those names as plain columns.
+  assert.equal(metaNames.columns.columnName, "columns");
+  assert.equal(metaNames.columns.dataType, "text");
+  assert.equal(metaNames.tableName.columnName, "table_name");
+  assert.equal(metaNames.indexes.columnName, "indexes");
+  // The metadata record itself is frozen; the caller's column map is not.
+  const metaRecord = (metaNames as { [TABLE_SYMBOL]: unknown })[TABLE_SYMBOL];
+  assert.ok(Object.isFrozen(metaRecord));
+  assert.equal(Object.isFrozen(getTableColumns(metaNames)), false);
+});
+
+test("metadata: accessors fail closed on non-tables", () => {
+  assert.throws(() => getTableName({} as never), /not a neutron-sql table/);
+  assert.throws(() => getTableColumns({ tableName: "fake" } as never), /not a neutron-sql table/);
+  assert.throws(() => getTableIndexes(null as never), /not a neutron-sql table/);
+  // Pre-F02 shape (symbol === true) must not pass as a table.
+  const legacyShape = { [Symbol.for("@neutron-build/sql.table")]: true } as never;
+  assert.equal(isPgTable(legacyShape), false);
+  assert.throws(() => getTableName(legacyShape), /not a neutron-sql table/);
+});
+
+test("metadata: full CRUD compiles correctly on the collision table", () => {
+  const sel = db.select().from(metaNames).toSQL();
+  assert.equal(
+    sel.sql,
+    'select "meta_names"."id", "meta_names"."columns", "meta_names"."table_name" as "tableName", "meta_names"."indexes" from "meta_names"',
+  );
+
+  const ins = db.insert(metaNames).values({ columns: "c1", tableName: null, indexes: 3 }).toSQL();
+  assert.equal(ins.sql, 'insert into "meta_names" ("columns", "table_name", "indexes") values ($1, $2, $3)');
+  assert.deepEqual(ins.params, ["c1", null, 3]);
+
+  const ret = db.insert(metaNames).values({ columns: "c1" }).returning().toSQL();
+  assert.equal(
+    ret.sql,
+    'insert into "meta_names" ("columns") values ($1) returning "id", "columns", "table_name" as "tableName", "indexes"',
+  );
+
+  const upd = db
+    .update(metaNames)
+    .set({ columns: "c2", tableName: "t" })
+    .where(eq(metaNames.columns, "c1"))
+    .toSQL();
+  assert.equal(upd.sql, 'update "meta_names" set "columns" = $1, "table_name" = $2 where "meta_names"."columns" = $3');
+  assert.deepEqual(upd.params, ["c2", "t", "c1"]);
+
+  const del = db.delete(metaNames).where(eq(metaNames.tableName, "t")).returning().toSQL();
+  assert.equal(
+    del.sql,
+    'delete from "meta_names" where "meta_names"."table_name" = $1 returning "id", "columns", "table_name" as "tableName", "indexes"',
+  );
+});
+
+test("metadata: DDL and export use authoritative metadata on the collision table", () => {
+  assert.equal(
+    createTableSQL(metaNames),
+    [
+      'create table "meta_names" (',
+      '  "id" serial primary key,',
+      '  "columns" text not null,',
+      '  "table_name" text,',
+      '  "indexes" integer',
+      ")",
+    ].join("\n"),
+  );
+  const ddl = schemaToDDL([metaNames]);
+  assert.ok(ddl.some((s) => s === 'create index "meta_names_columns_idx" on "meta_names" ("columns")'));
+
+  const exported = exportTable(metaNames);
+  assert.equal(exported.name, "meta_names");
+  assert.deepEqual(
+    exported.columns.map((c) => c.name),
+    ["id", "columns", "table_name", "indexes"],
+  );
+  assert.deepEqual(exported.indexes, [{ name: "meta_names_columns_idx", unique: false, columns: ["columns"] }]);
+});
+
+test("metadata: relational reads project collision-named columns through metadata", () => {
+  resolveRelations([metaNamesRelations, metaChildrenRelations]);
+  const { sqlText } = relational(metaNamesRelations, { with: { children: true } });
+  assert.ok(sqlText.startsWith('select "meta_names"."id", "meta_names"."columns", "meta_names"."table_name" as "tableName", "meta_names"."indexes", '));
+  assert.ok(sqlText.includes('\'id\', "__rel_children"."id"'));
+  assert.ok(sqlText.includes('\'parentId\', "__rel_children"."parent_id"'));
+  assert.ok(sqlText.includes('from "meta_children" as "__rel_children" where "__rel_children"."parent_id" = "meta_names"."id"'));
+
+  const one = relational(metaChildrenRelations, { with: { parent: true } });
+  assert.ok(one.sqlText.includes('\'columns\', "__rel_parent"."columns"'));
+  assert.ok(one.sqlText.includes('\'tableName\', "__rel_parent"."table_name"'));
+  assert.ok(one.sqlText.includes('\'indexes\', "__rel_parent"."indexes"'));
+});
+
 // keep imports referenced for type-only uses
 void jsonb;
 void uuid;
@@ -671,6 +808,26 @@ void db.insert(users).values({});
 void db.insert(users).values({ email: "x@x.com", active: null });
 // @ts-expect-error null is not assignable to a NOT NULL column on update
 void db.update(users).set({ active: null });
+// @ts-expect-error invalid update value type: text column rejects a number
+void db.update(users).set({ name: 123 });
+// @ts-expect-error invalid update value type: boolean column rejects a string
+void db.update(users).set({ active: "yes" });
+// @ts-expect-error invalid value type: text column rejects a boolean
+void db.insert(users).values({ email: "x@x.com", name: true });
+// @ts-expect-error invalid value type: boolean column rejects a string
+void db.insert(users).values({ email: "x@x.com", active: "yes" });
+// @ts-expect-error invalid value type: timestamp column rejects a number
+void db.insert(users).values({ email: "x@x.com", createdAt: 123 });
+// @ts-expect-error unknown insert key (excess property)
+void db.insert(users).values({ email: "x@x.com", nope: 1 });
+// @ts-expect-error unknown update key
+void db.update(users).set({ nope: 1 });
+// @ts-expect-error unknown column in a projection source
+void db.select({ x: users.bogus });
+// @ts-expect-error unknown column in a predicate
+void db.select().from(users).where(eq(users.bogus, 1));
+// @ts-expect-error unknown table key in db.query
+void db.query.bogus;
 
 // @ts-expect-error unknown relation name in `with` must fail compilation
 void db.query.users.findFirst({ with: { totallyUnknownRelation: true } });
@@ -682,6 +839,32 @@ void db.query.users.findMany({ columns: ["nonexistent"] });
 void db.query.users.findMany({ with: { posts: { with: {} } } });
 // @ts-expect-error false is not a relation selection
 void db.query.users.findMany({ with: { posts: false } });
+// @ts-expect-error depth-2 with (posts -> author) is rejected until Q05
+void db.query.users.findMany({ with: { posts: { with: { author: true } } } });
+// @ts-expect-error depth-3 with (posts -> author -> manager) is rejected until Q05
+void db.query.users.findMany({ with: { posts: { columns: ["id"], with: { author: { with: { posts: true } } } } } });
+
+// Natural (non-serial) primary keys are required: NOT NULL without default.
+const naturalKey = pgTable("natural_key", {
+  id: bigint("id").primaryKey(),
+  email: text("email").notNull(),
+});
+// @ts-expect-error bigint PK is NOT NULL without default — required on insert
+void db.insert(naturalKey).values({ email: "x@x.com" });
+const _natOk: typeof naturalKey.$inferInsert = { id: "9007199254740993", email: "x@x.com" };
+// @ts-expect-error null is not assignable to a NOT NULL primary key
+void db.insert(naturalKey).values({ id: null, email: "x@x.com" });
+
+// Metadata-name collisions compile: columns/tableName/indexes are ordinary
+// column names; metadata access goes through the accessor helpers.
+const _colOk: typeof metaNames.$inferInsert = { columns: "c", tableName: null, indexes: 1 };
+// @ts-expect-error the "columns" column is NOT NULL without default — required
+void db.insert(metaNames).values({ tableName: null });
+// @ts-expect-error invalid value for the collision column (boolean for text)
+void db.insert(metaNames).values({ columns: true });
+const _colName: string = metaNames.tableName.columnName;
+const _colTable: string = getTableName(metaNames);
+void [_natOk, _colOk, _colName, _colTable];
 
 // Positive controls — must keep compiling:
 // nullable column accepts null on insert and update; defaults/serials keep
@@ -689,7 +872,36 @@ void db.query.users.findMany({ with: { posts: false } });
 const _p1 = db.insert(users).values({ email: "x@x.com", name: null });
 const _p2 = db.update(users).set({ name: null });
 const _p3 = db.insert(users).values({ email: "x@x.com" });
-void [_p1, _p2, _p3];
+// serial is writable by design (PostgreSQL semantics: default, not generated).
+// The generated-field-write rejection lands with generated/identity columns (Q07).
+const _serialWrite = db.insert(users).values({ id: 5, email: "seed@x.com" });
+// collision-named columns work in predicates too
+const _p4 = db.select().from(metaNames).where(eq(metaNames.columns, "c")).limit(1);
+void [_p1, _p2, _p3, _serialWrite, _p4];
+
+async function absentAndUnrequestedFixtures(): Promise<void> {
+  const projected = await db.select({ email: users.email }).from(users);
+  // @ts-expect-error "name" is absent from the projection's result type
+  void projected[0].name;
+
+  const withPosts = await db.query.users.findMany({ with: { posts: true } });
+  // @ts-expect-error "comments" was not requested — absent from the row type
+  void withPosts[0].comments;
+
+  const plain = await db.query.users.findMany();
+  // @ts-expect-error relation keys are absent unless requested through `with`
+  void plain[0].posts;
+
+  const withAuthor = await db.query.posts.findMany({ with: { author: true } });
+  // @ts-expect-error to-many cardinality: posts is an array, not one row
+  const asOne: PostRow = withPosts[0].posts;
+  // @ts-expect-error to-one outer-join nullability: author may be null
+  const notNull: UserChildRow = withAuthor[0].author;
+  // @ts-expect-error to-one is a single row, never an array
+  const asMany: UserChildRow[] = withAuthor[0].author;
+  void [asOne, notNull, asMany];
+}
+void absentAndUnrequestedFixtures;
 
 // ---------------------------------------------------------------------------
 // V04 exact one-level result types: rows carry exactly the selected columns
@@ -738,6 +950,53 @@ async function relationalTypeFixtures(): Promise<void> {
 void relationalTypeFixtures;
 
 // ---------------------------------------------------------------------------
+// F02 exact schema-level types: $inferSelect / $inferInsert / projections
+// are pinned by identity. Insert optionality follows PK/default/NOT-NULL
+// state: serial PK and defaulted columns optional, NOT NULL-without-default
+// required, nullable columns accept null.
+// ---------------------------------------------------------------------------
+
+type UsersInsertModel = typeof users.$inferInsert;
+const eqInsert: AssertEq<
+  UsersInsertModel,
+  {
+    id?: number | undefined;
+    email: string;
+    name?: string | null | undefined;
+    active?: boolean | undefined;
+    createdAt?: Date | undefined;
+  }
+> = true;
+void eqInsert;
+
+type UsersSelectModel = typeof users.$inferSelect;
+const eqSelectModel: AssertEq<UsersSelectModel, UserRow> = true;
+void eqSelectModel;
+
+// Natural bigint PK: required (NOT NULL, no default), accepts string|number|bigint.
+type NaturalInsertModel = typeof naturalKey.$inferInsert;
+const eqNatural: AssertEq<NaturalInsertModel, { id: string | number | bigint; email: string }> = true;
+void eqNatural;
+
+// Collision table: the metadata-like names are ordinary required/optional columns.
+type MetaNamesInsertModel = typeof metaNames.$inferInsert;
+const eqMetaNames: AssertEq<MetaNamesInsertModel, { id?: number | undefined; columns: string; tableName?: string | null | undefined; indexes?: number | null | undefined }> = true;
+void eqMetaNames;
+
+// The user-facing table surface types those names as the columns they are.
+const eqCollisionSurface: AssertEq<typeof metaNames.columns, ColumnBuilder<"text", true, false>> = true;
+const eqCollisionSurface2: AssertEq<typeof metaNames.indexes, ColumnBuilder<"integer", false, false>> = true;
+void [eqCollisionSurface, eqCollisionSurface2];
+
+async function projectionExactTypes(): Promise<void> {
+  const rows = await db.select({ email: users.email, n: sql`count(*)` }).from(users);
+  const eqProjection: AssertEq<(typeof rows)[number], { email: string; n: unknown }> = true;
+  void eqProjection;
+  void rows;
+}
+void projectionExactTypes;
+
+// ---------------------------------------------------------------------------
 // F2: relation child leaves are typed honestly — int8/numeric (::text inside
 // the aggregation) and temporal/bytea (to_jsonb string forms) are strings;
 // int4/float8 stay numbers. AssertEq demands type identity.
@@ -756,7 +1015,8 @@ const leafKinds = pgTable("leaf_kinds", {
   flag: boolean("flag"),
   s: text("s"),
 });
-type LeafChildRow = RelationChildModelOf<typeof leafKinds.columns>;
+type ColumnsOfTable<T> = T extends PgTableCore<infer C> ? C : never;
+type LeafChildRow = RelationChildModelOf<ColumnsOfTable<typeof leafKinds>>;
 const eqLeafKinds: AssertEq<
   LeafChildRow,
   {

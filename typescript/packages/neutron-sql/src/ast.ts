@@ -14,7 +14,7 @@
 // `TrustedSql`. Template-literal text in `sqlAst` is trusted by construction
 // (it is authored in source); interpolated VALUES are always parameters.
 
-import { TABLE_SYMBOL, type AnyColumnBuilder, type AnyPgTable } from "./schema.js";
+import { getTableName, isPgTable, type AnyColumnBuilder, type AnyPgTable } from "./schema.js";
 
 // ---------------------------------------------------------------------------
 // Node types
@@ -386,7 +386,7 @@ export function ref(tableOrColumn: string | AnyColumnBuilder, column?: AnyColumn
   if (column !== undefined) throw new Error("ref: pass either (column) or (tableAlias, column)");
   const owner = tableOrColumn.ownerTable;
   if (!owner) throw new Error("ref: column has no owner table; qualify it with an explicit alias");
-  return qual(owner.tableName, tableOrColumn.columnName);
+  return qual(getTableName(owner), tableOrColumn.columnName);
 }
 
 // ---------------------------------------------------------------------------
@@ -404,10 +404,6 @@ export function ref(tableOrColumn: string | AnyColumnBuilder, column?: AnyColumn
 
 function isColumnBuilder(v: object): v is AnyColumnBuilder {
   return typeof (v as { columnName?: unknown }).columnName === "string";
-}
-
-function isPgTable(v: object): v is AnyPgTable {
-  return (v as { [TABLE_SYMBOL]?: unknown })[TABLE_SYMBOL] === true;
 }
 
 function isLegacyFragment(v: object): boolean {
@@ -434,9 +430,9 @@ function templatePart(value: unknown): ValueNode {
     if (isColumnBuilder(value)) {
       const owner = value.ownerTable;
       if (!owner) throw new Error("sqlAst: interpolated column has no owner table; use ref(alias, column) inside joins");
-      return qual(owner.tableName, value.columnName);
+      return qual(getTableName(owner), value.columnName);
     }
-    if (isPgTable(value)) return ident(value.tableName);
+    if (isPgTable(value)) return ident(getTableName(value));
     if (isLegacyFragment(value)) {
       throw new Error(
         "sqlAst: legacy SqlFragment {sql, params} cannot be interpolated structurally — its $n text would need raw-SQL renumbering. Rebuild it with sqlAst or acknowledge it via trustSql",

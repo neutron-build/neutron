@@ -181,20 +181,53 @@ export type UpdateTypeOf<C> = C extends ColumnBuilder<infer D, infer NN, infer _
 // ---------------------------------------------------------------------------
 // Tables
 // ---------------------------------------------------------------------------
+// Authoritative table metadata (name, column map, indexes) lives in a
+// symbol-keyed internal record, never in plain properties: user columns named
+// `columns`, `tableName` or `indexes` are ordinary columns and cannot clobber
+// it. Read metadata through the accessor helpers below.
 
 export const TABLE_SYMBOL = Symbol.for("@neutron-build/sql.table");
 
-export interface PgTableCore<Cols extends Record<string, AnyColumnBuilder> = Record<string, AnyColumnBuilder>> {
-  readonly [TABLE_SYMBOL]: true;
+export interface TableMetadata<Cols extends Record<string, AnyColumnBuilder> = Record<string, AnyColumnBuilder>> {
   readonly tableName: string;
   readonly columns: Cols;
-  indexes: TableIndex[];
+  readonly indexes: TableIndex[];
+}
+
+export interface PgTableCore<Cols extends Record<string, AnyColumnBuilder> = Record<string, AnyColumnBuilder>> {
+  readonly [TABLE_SYMBOL]: TableMetadata<Cols>;
   readonly $inferSelect: InferSelectModelOf<Cols>;
   readonly $inferInsert: InferInsertModelOf<Cols>;
 }
 
-/** A table: core metadata plus its columns as top-level properties (users.email). */
+/** A table: symbol-keyed metadata plus its columns as top-level properties (users.email). */
 export type PgTable<Cols extends Record<string, AnyColumnBuilder> = Record<string, AnyColumnBuilder>> = PgTableCore<Cols> & Cols;
+
+function tableMetaOf(table: AnyPgTable, who: string): TableMetadata {
+  if (typeof table !== "object" || table === null) {
+    throw new Error(`${who}: not a neutron-sql table (missing table metadata record)`);
+  }
+  const meta = (table as { [TABLE_SYMBOL]?: unknown })[TABLE_SYMBOL];
+  if (typeof meta !== "object" || meta === null || typeof (meta as TableMetadata).tableName !== "string") {
+    throw new Error(`${who}: not a neutron-sql table (missing table metadata record)`);
+  }
+  return meta as TableMetadata;
+}
+
+/** Authoritative table name. Fails closed on anything that is not a table. */
+export function getTableName(table: AnyPgTable): string {
+  return tableMetaOf(table, "getTableName").tableName;
+}
+
+/** Authoritative column map (property key -> ColumnBuilder). */
+export function getTableColumns(table: AnyPgTable): Record<string, AnyColumnBuilder> {
+  return tableMetaOf(table, "getTableColumns").columns;
+}
+
+/** Authoritative index list. */
+export function getTableIndexes(table: AnyPgTable): TableIndex[] {
+  return tableMetaOf(table, "getTableIndexes").indexes;
+}
 
 export type InferSelectModelOf<Cols extends Record<string, AnyColumnBuilder>> = {
   [K in keyof Cols]: SelectTypeOf<Cols[K]>;
@@ -247,29 +280,31 @@ export function pgTable<Cols extends Record<string, AnyColumnBuilder>>(
   columns: Cols,
   extras?: (t: PgTable<Cols>) => TableIndex[],
 ): PgTable<Cols> {
-  const core: PgTableCore<Cols> = {
-    [TABLE_SYMBOL]: true as const,
-    tableName: name,
-    columns,
-    indexes: [],
+  const meta: { tableName: string; columns: Cols; indexes: TableIndex[] } = { tableName: name, columns, indexes: [] };
+  const table = {
+    [TABLE_SYMBOL]: meta,
     // phantom — never read at runtime
     $inferSelect: undefined as never,
     $inferInsert: undefined as never,
-  };
+    ...columns,
+  } as PgTable<Cols>;
   for (const col of Object.values(columns)) {
-    col.ownerTable = core;
+    col.ownerTable = table;
   }
   if (extras) {
-    // Index definitions may reference columns through the table object; give
-    // them the column map directly so `.on(t.col)` resolves before assignment.
-    const carrier = { ...core, ...columns } as unknown as PgTable<Cols>;
-    core.indexes = extras(carrier);
+    // Index definitions may reference columns through the table object; they
+    // read the user-facing column properties, which cannot clobber metadata.
+    meta.indexes = extras(table);
   }
-  return { ...core, ...columns } as PgTable<Cols>;
+  const frozenMeta: TableMetadata<Cols> = meta;
+  Object.freeze(frozenMeta);
+  return table;
 }
 
 export function isPgTable(value: unknown): value is AnyPgTable {
-  return typeof value === "object" && value !== null && (value as { [TABLE_SYMBOL]?: unknown })[TABLE_SYMBOL] === true;
+  if (typeof value !== "object" || value === null) return false;
+  const meta = (value as { [TABLE_SYMBOL]?: unknown })[TABLE_SYMBOL];
+  return typeof meta === "object" && meta !== null && typeof (meta as TableMetadata).tableName === "string";
 }
 
 // ---------------------------------------------------------------------------

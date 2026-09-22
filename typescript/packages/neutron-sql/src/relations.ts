@@ -11,6 +11,7 @@
 // output row). Depth is one level; nested `with` is rejected explicitly.
 
 import { type Condition, type OrderExpression, qident, qualify } from "./expr.js";
+import { getTableColumns, getTableName } from "./schema.js";
 import type { AnyColumnBuilder, AnyPgTable, Relation, RelationOne, TableRelations } from "./schema.js";
 import type { ExecContext } from "./builder.js";
 import { run } from "./builder.js";
@@ -35,13 +36,13 @@ export interface ResolvedRelations {
 export function resolveRelations(all: TableRelations[]): ResolvedRelations {
   const byTable = new Map<string, TableRelations>();
   for (const r of all) {
-    const existing = byTable.get(r.table.tableName);
+    const existing = byTable.get(getTableName(r.table));
     if (existing) {
       throw new Error(
-        `relations for table ${r.table.tableName} are declared more than once (duplicate declarations cannot be merged)`,
+        `relations for table ${getTableName(r.table)} are declared more than once (duplicate declarations cannot be merged)`,
       );
     }
-    byTable.set(r.table.tableName, r);
+    byTable.set(getTableName(r.table), r);
   }
 
   // relationName must be unique among one table's entries: it is the pairing
@@ -53,7 +54,7 @@ export function resolveRelations(all: TableRelations[]): ResolvedRelations {
       const prior = seen.get(rel.relationName);
       if (prior !== undefined) {
         throw new Error(
-          `duplicate relationName "${rel.relationName}" on ${r.table.tableName}: relations "${prior}" and "${key}" declare it`,
+          `duplicate relationName "${rel.relationName}" on ${getTableName(r.table)}: relations "${prior}" and "${key}" declare it`,
         );
       }
       seen.set(rel.relationName, key);
@@ -64,20 +65,20 @@ export function resolveRelations(all: TableRelations[]): ResolvedRelations {
     for (const [key, rel] of Object.entries(r.entries)) {
       if (rel.kind !== "many") continue;
       const target = rel.targetTable;
-      if ((Object.values(target.columns) as AnyColumnBuilder[]).every((c) => !c.isPrimaryKey)) {
+      if ((Object.values(getTableColumns(target)) as AnyColumnBuilder[]).every((c) => !c.isPrimaryKey)) {
         throw new Error(
-          `relation "${key}" on ${r.table.tableName}: target table ${target.tableName} has no primary key; relation ordering undefined`,
+          `relation "${key}" on ${getTableName(r.table)}: target table ${getTableName(target)} has no primary key; relation ordering undefined`,
         );
       }
-      const targetSet = byTable.get(target.tableName);
+      const targetSet = byTable.get(getTableName(target));
       if (!targetSet) {
         throw new Error(
-          `relation "${key}" on ${r.table.tableName} targets ${target.tableName} but that table declares no relations`,
+          `relation "${key}" on ${getTableName(r.table)} targets ${getTableName(target)} but that table declares no relations`,
         );
       }
       const candidates: Array<[string, RelationOne]> = [];
       for (const [k, candidate] of Object.entries(targetSet.entries)) {
-        if (candidate.kind === "one" && candidate.targetTable.tableName === r.table.tableName) {
+        if (candidate.kind === "one" && getTableName(candidate.targetTable) === getTableName(r.table)) {
           candidates.push([k, candidate]);
         }
       }
@@ -86,18 +87,18 @@ export function resolveRelations(all: TableRelations[]): ResolvedRelations {
         source = candidates.find(([, candidate]) => candidate.relationName === rel.relationName)?.[1];
         if (!source) {
           throw new Error(
-            `relation "${key}" on ${r.table.tableName} declares relationName "${rel.relationName}" but no one() on ${target.tableName} targeting ${r.table.tableName} declares the same relationName — name both sides of the pair`,
+            `relation "${key}" on ${getTableName(r.table)} declares relationName "${rel.relationName}" but no one() on ${getTableName(target)} targeting ${getTableName(r.table)} declares the same relationName — name both sides of the pair`,
           );
         }
       } else if (candidates.length === 1) {
         source = candidates[0][1];
       } else if (candidates.length === 0) {
         throw new Error(
-          `relation "${key}" on ${r.table.tableName} has no matching one() on ${target.tableName} — declare fields/references there`,
+          `relation "${key}" on ${getTableName(r.table)} has no matching one() on ${getTableName(target)} — declare fields/references there`,
         );
       } else {
         throw new Error(
-          `relation "${key}" on ${r.table.tableName} is ambiguous: ${target.tableName} declares multiple one() relations to ${r.table.tableName} (` +
+          `relation "${key}" on ${getTableName(r.table)} is ambiguous: ${getTableName(target)} declares multiple one() relations to ${getTableName(r.table)} (` +
             candidates.map(([k]) => `"${k}"`).join(", ") +
             `) — give the pair an explicit relationName on both sides`,
         );
@@ -107,14 +108,14 @@ export function resolveRelations(all: TableRelations[]): ResolvedRelations {
   }
 
   const byTableEntries = new Map<string, Record<string, Relation>>();
-  for (const r of all) byTableEntries.set(r.table.tableName, r.entries);
+  for (const r of all) byTableEntries.set(getTableName(r.table), r.entries);
   return { byTable: byTableEntries };
 }
 
 function pkColumnsOf(table: AnyPgTable): AnyColumnBuilder[] {
-  const pks = (Object.values(table.columns) as AnyColumnBuilder[]).filter((c) => c.isPrimaryKey);
+  const pks = (Object.values(getTableColumns(table)) as AnyColumnBuilder[]).filter((c) => c.isPrimaryKey);
   if (pks.length === 0) {
-    throw new Error(`target table ${table.tableName} has no primary key; relation ordering undefined`);
+    throw new Error(`target table ${getTableName(table)} has no primary key; relation ordering undefined`);
   }
   return pks;
 }
@@ -132,7 +133,7 @@ function jsonLeaf(alias: string, column: AnyColumnBuilder): string {
 }
 
 function jsonObjectFor(table: AnyPgTable, alias: string): string {
-  const parts = Object.entries(table.columns as Record<string, AnyColumnBuilder>).map(
+  const parts = Object.entries(getTableColumns(table) as Record<string, AnyColumnBuilder>).map(
     ([propertyKey, column]) => `'${propertyKey.replace(/'/g, "''")}', ${jsonLeaf(alias, column)}`,
   );
   return `jsonb_build_object(${parts.join(", ")})`;
@@ -162,14 +163,14 @@ function relAlias(relationKey: string, outerTable: string): string {
 /** Validate args against the declared table/relations before building SQL.
  *  Every rejection names the exact shape so callers can see what to fix. */
 function validateArgs(table: AnyPgTable, relations: Record<string, Relation>, args: RQBArgs): void {
-  const tableName = table.tableName;
+  const tableName = getTableName(table);
 
   if (args.columns !== undefined) {
     if (!Array.isArray(args.columns)) throw new Error(`args.columns on ${tableName} must be an array of property keys`);
     if (args.columns.length === 0) {
       throw new Error(`args.columns on ${tableName} is empty — omit columns to select every column`);
     }
-    const known = new Set(Object.keys(table.columns));
+    const known = new Set(Object.keys(getTableColumns(table)));
     for (const key of args.columns) {
       if (!known.has(key)) {
         throw new Error(
@@ -197,7 +198,7 @@ function validateArgs(table: AnyPgTable, relations: Record<string, Relation>, ar
             `nested with / per-relation options are not implemented`,
         );
       }
-      const targetName = rel.targetTable.tableName;
+      const targetName = getTableName(rel.targetTable);
       const prior = seenTargets.get(targetName);
       if (prior !== undefined) {
         throw new Error(
@@ -218,10 +219,10 @@ export function buildRelationalSQL(
   validateArgs(table, relations, args);
 
   const params: unknown[] = [];
-  const tableName = table.tableName;
+  const tableName = getTableName(table);
   // args.columns are property keys; map them to physical columns through
   // metadata. Unselected columns default to the full declaration order.
-  const allEntries = Object.entries(table.columns as Record<string, AnyColumnBuilder>).map(([propertyKey, column]) => ({
+  const allEntries = Object.entries(getTableColumns(table) as Record<string, AnyColumnBuilder>).map(([propertyKey, column]) => ({
     propertyKey,
     column,
   }));
@@ -250,14 +251,14 @@ export function buildRelationalSQL(
         .join(", ");
       extras.push(
         `(select coalesce(jsonb_agg(${jsonObjectFor(target, alias)} order by ${orderBy}), '[]'::jsonb) ` +
-          `from ${qident(target.tableName)} as ${qident(alias)} where ${correlation}) as ${qident(key)}`,
+          `from ${qident(getTableName(target))} as ${qident(alias)} where ${correlation}) as ${qident(key)}`,
       );
     } else {
       const correlation = rel.fields
         .map((f, i) => `${qualify(alias, rel.references[i].columnName)} = ${qualify(tableName, f.columnName)}`)
         .join(" and ");
       extras.push(
-        `(select ${jsonObjectFor(target, alias)} from ${qident(target.tableName)} as ${qident(alias)} where ${correlation}) as ${qident(key)}`,
+        `(select ${jsonObjectFor(target, alias)} from ${qident(getTableName(target))} as ${qident(alias)} where ${correlation}) as ${qident(key)}`,
       );
     }
   }

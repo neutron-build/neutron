@@ -4,6 +4,7 @@
 // A fragment carries SQL text with $1..$n placeholders relative to its own
 // params. Merging renumbers. The final query assembly is therefore trivial.
 
+import { getTableName } from "./schema.js";
 import type { AnyColumnBuilder, ColumnBuilder, JsTypeOf, ColumnDataType } from "./schema.js";
 
 export interface SqlFragment {
@@ -46,7 +47,7 @@ export type Condition = SqlFragment;
 function colRef(col: AnyColumnBuilder | string, table?: string): string {
   if (typeof col === "string") return qident(col);
   if (table) return qualify(table, col.columnName);
-  if (col.ownerTable) return qualify(col.ownerTable.tableName, col.columnName);
+  if (col.ownerTable) return qualify(getTableName(col.ownerTable), col.columnName);
   return qident(col.columnName);
 }
 

@@ -5,7 +5,7 @@
 // database and diffs against this file to emit migration SQL.
 
 import type { AnyColumnBuilder, AnyPgTable } from "./schema.js";
-import { isPgTable } from "./schema.js";
+import { getTableColumns, getTableName, getTableIndexes, isPgTable } from "./schema.js";
 import type { TablesInput } from "./db.js";
 
 export interface ExportedForeignKey {
@@ -59,7 +59,7 @@ export function exportSchema(tables: TablesInput): ExportedSchema {
 
 export function exportTable(table: AnyPgTable): ExportedTable {
   const columns: ExportedColumn[] = [];
-  for (const col of Object.values(table.columns) as AnyColumnBuilder[]) {
+  for (const col of Object.values(getTableColumns(table)) as AnyColumnBuilder[]) {
     const exported: ExportedColumn = {
       name: col.columnName,
       type: col.dataType,
@@ -85,7 +85,7 @@ export function exportTable(table: AnyPgTable): ExportedTable {
       const target = col.foreignKey();
       const targetTable = target.ownerTable;
       if (targetTable) {
-        const fk: ExportedForeignKey = { table: targetTable.tableName, column: target.columnName };
+        const fk: ExportedForeignKey = { table: getTableName(targetTable), column: target.columnName };
         if (col.foreignKey.onDelete) fk.onDelete = col.foreignKey.onDelete;
         exported.foreignKey = fk;
       }
@@ -93,8 +93,8 @@ export function exportTable(table: AnyPgTable): ExportedTable {
     columns.push(exported);
   }
   return {
-    name: table.tableName,
+    name: getTableName(table),
     columns,
-    indexes: table.indexes.map((idx) => ({ name: idx.indexName, unique: idx.unique, columns: idx.columns.slice() })),
+    indexes: getTableIndexes(table).map((idx) => ({ name: idx.indexName, unique: idx.unique, columns: idx.columns.slice() })),
   };
 }

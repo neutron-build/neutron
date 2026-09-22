@@ -15,7 +15,7 @@ import type {
   SelectTypeOf,
   UpdateTypeOf,
 } from "./schema.js";
-import { isPgTable } from "./schema.js";
+import { getTableColumns, getTableName, isPgTable } from "./schema.js";
 import {
   cte,
   ident,
@@ -69,7 +69,7 @@ function inline(fragment: SqlFragment, params: unknown[]): string {
 type ColumnEntries = Array<{ propertyKey: string; column: AnyColumnBuilder }>;
 
 function columnEntries(table: AnyPgTable): ColumnEntries {
-  return Object.entries(table.columns as Record<string, AnyColumnBuilder>).map(([propertyKey, column]) => ({
+  return Object.entries(getTableColumns(table)).map(([propertyKey, column]) => ({
     propertyKey,
     column,
   }));
@@ -215,7 +215,7 @@ export class SelectBuilder<T> implements PromiseLike<T[]> {
       for (const [key, value] of Object.entries(this.projection)) {
         if ("columnName" in value) {
           // Output label = the projection key; physical ref from metadata.
-          const owner = value.ownerTable?.tableName ?? this.table.tableName;
+          const owner = value.ownerTable ? getTableName(value.ownerTable) : getTableName(this.table);
           const ref = qualify(owner, value.columnName);
           parts.push(key === value.columnName ? ref : `${ref} as ${qident(String(key))}`);
         } else {
@@ -225,11 +225,11 @@ export class SelectBuilder<T> implements PromiseLike<T[]> {
       selectList = parts.join(", ");
     } else {
       selectList = columnEntries(this.table)
-        .map(({ propertyKey, column }) => aliasedColumn(this.table.tableName, column, propertyKey))
+        .map(({ propertyKey, column }) => aliasedColumn(getTableName(this.table), column, propertyKey))
         .join(", ");
     }
 
-    let sqlText = `select ${selectList} from ${qident(this.table.tableName)}`;
+    let sqlText = `select ${selectList} from ${qident(getTableName(this.table))}`;
 
     if (this.conditions.length > 0) {
       sqlText += ` where ${this.conditions.map((c) => inline(c, params)).join(" and ")}`;
@@ -285,9 +285,9 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     if (!this.hasValues) throw new Error("insert requires .values()");
     if (this.rows.length === 0) throw new Error("insert .values() received an empty array");
 
-    const columns = this.table.columns as Record<string, AnyColumnBuilder>;
+    const columns = getTableColumns(this.table) as Record<string, AnyColumnBuilder>;
     const propertyOrder = Object.keys(columns);
-    if (propertyOrder.length === 0) throw new Error(`table ${this.table.tableName} has no columns`);
+    if (propertyOrder.length === 0) throw new Error(`table ${getTableName(this.table)} has no columns`);
     const knownKeys = new Set(propertyOrder);
     const required = requiredInsertKeys(this.table);
 
@@ -298,28 +298,28 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     for (let rowIdx = 0; rowIdx < this.rows.length; rowIdx++) {
       const row = this.rows[rowIdx];
       if (typeof row !== "object" || row === null || Array.isArray(row)) {
-        throw new Error(`insert .values() rows must be objects on ${this.table.tableName}`);
+        throw new Error(`insert .values() rows must be objects on ${getTableName(this.table)}`);
       }
       for (const key of Object.keys(row)) {
-        if (!knownKeys.has(key)) throw new Error(`unknown column "${key}" on ${this.table.tableName}`);
+        if (!knownKeys.has(key)) throw new Error(`unknown column "${key}" on ${getTableName(this.table)}`);
         const column = columns[key];
         const value = row[key];
         if (value === undefined) continue;
         if (effectiveNotNull(column) && value === null) {
           throw new Error(
-            `insert on ${this.table.tableName}: null is not allowed for NOT NULL column "${key}" ("${column.columnName}")`,
+            `insert on ${getTableName(this.table)}: null is not allowed for NOT NULL column "${key}" ("${column.columnName}")`,
           );
         }
         const reason = valueBindingError(column, value);
         if (reason) {
-          throw new Error(`invalid value for column "${key}" ("${column.columnName}") on ${this.table.tableName}: ${reason}`);
+          throw new Error(`invalid value for column "${key}" ("${column.columnName}") on ${getTableName(this.table)}: ${reason}`);
         }
         supplied.add(key);
       }
       const missing = required.filter(({ propertyKey }) => !Object.hasOwn(row, propertyKey) || row[propertyKey] === undefined);
       if (missing.length > 0) {
         throw new Error(
-          `insert on ${this.table.tableName} row ${rowIdx} is missing required column(s) ` +
+          `insert on ${getTableName(this.table)} row ${rowIdx} is missing required column(s) ` +
             missing.map(({ propertyKey, column }) => `"${propertyKey}" ("${column.columnName}")`).join(", ") +
             " — NOT NULL without a default",
         );
@@ -359,7 +359,7 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
         .join(", ")}`;
     }
 
-    let sqlText = `insert into ${qident(this.table.tableName)}${columnsSql} ${valuesSql}`;
+    let sqlText = `insert into ${qident(getTableName(this.table))}${columnsSql} ${valuesSql}`;
     if (this.wantsReturning) sqlText += ` returning ${returningList(this.table)}`;
     return { sql: sqlText, params };
   }
@@ -396,10 +396,10 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
   ) {}
 
   set(values: UpdateSetInput<TCols>): this {
-    const columns = this.table.columns as Record<string, AnyColumnBuilder>;
+    const columns = getTableColumns(this.table) as Record<string, AnyColumnBuilder>;
     for (const [key, value] of Object.entries(values)) {
       const column = columns[key];
-      if (!column) throw new Error(`unknown column "${key}" on ${this.table.tableName}`);
+      if (!column) throw new Error(`unknown column "${key}" on ${getTableName(this.table)}`);
       this.hasSet = true;
       if (value === undefined) continue; // omitted/undefined update keys are ignored
       const physical = column.columnName;
@@ -407,7 +407,7 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
       // for nullable columns, never an object to interrogate.
       if (value === null) {
         if (effectiveNotNull(column)) {
-          throw new Error(`update on ${this.table.tableName}: null is not allowed for NOT NULL column "${key}" ("${physical}")`);
+          throw new Error(`update on ${getTableName(this.table)}: null is not allowed for NOT NULL column "${key}" ("${physical}")`);
         }
         this.sets.push({ col: physical, value });
         continue;
@@ -420,7 +420,7 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
         continue;
       }
       const reason = valueBindingError(column, value);
-      if (reason) throw new Error(`invalid value for column "${key}" ("${physical}") on ${this.table.tableName}: ${reason}`);
+      if (reason) throw new Error(`invalid value for column "${key}" ("${physical}") on ${getTableName(this.table)}: ${reason}`);
       this.sets.push({ col: physical, value });
     }
     return this;
@@ -446,7 +446,7 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
       params.push(s.value);
       return `${qident(s.col)} = $${params.length}`;
     });
-    let sqlText = `update ${qident(this.table.tableName)} set ${assignments.join(", ")}`;
+    let sqlText = `update ${qident(getTableName(this.table))} set ${assignments.join(", ")}`;
     sqlText += ` where ${this.conditions.map((c) => inline(c, params)).join(" and ")}`;
     if (this.wantsReturning) sqlText += ` returning ${returningList(this.table)}`;
     return { sql: sqlText, params };
@@ -494,7 +494,7 @@ export class DeleteBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
   toSQL(): { sql: string; params: unknown[] } {
     if (this.conditions.length === 0) throw new Error("delete without .where() is not allowed");
     const params: unknown[] = [];
-    let sqlText = `delete from ${qident(this.table.tableName)}`;
+    let sqlText = `delete from ${qident(getTableName(this.table))}`;
     sqlText += ` where ${this.conditions.map((c) => inline(c, params)).join(" and ")}`;
     if (this.wantsReturning) sqlText += ` returning ${returningList(this.table)}`;
     return { sql: sqlText, params };
@@ -682,14 +682,14 @@ export class AstSelectBuilder {
   /** The statement as a frozen AST — composition point for subqueries. */
   toAST(): StatementNode {
     const from = this.fromSpec.table;
-    const fromTarget = isPgTable(from) ? ident(from.tableName) : from;
+    const fromTarget = isPgTable(from) ? ident(getTableName(from)) : from;
     return selectStatement({
       ctes: this.cteSpecs,
       projections: this.buildProjections(),
       from: fromTarget,
       fromAlias: this.fromSpec.alias,
       joins: this.joinSpecs.map((j) => {
-        const target = isPgTable(j.table) ? ident(j.table.tableName) : j.table;
+        const target = isPgTable(j.table) ? ident(getTableName(j.table)) : j.table;
         return joinNode(j.type, target, { alias: j.alias, on: j.on });
       }),
       where: this.wheres,
@@ -718,12 +718,12 @@ export class AstSelectBuilder {
       // Default projection: every column, labeled with its property key
       // whenever the property key differs from the physical name.
       return columnEntries(from).map(({ propertyKey, column }) =>
-        projectionNode(qual(from.tableName, column.columnName), propertyKey === column.columnName ? undefined : propertyKey),
+        projectionNode(qual(getTableName(from), column.columnName), propertyKey === column.columnName ? undefined : propertyKey),
       );
     }
     return Object.entries(this.projectionSpec).map(([key, value]) => {
       if (isPgColumnRef(value)) {
-        const owner = value.ownerTable?.tableName;
+        const owner = value.ownerTable ? getTableName(value.ownerTable) : undefined;
         if (!owner) throw new Error(`astSelect: projected column "${key}" has no owner table`);
         return projectionNode(qual(owner, value.columnName), key === value.columnName ? undefined : key);
       }

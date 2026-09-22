@@ -135,6 +135,19 @@ Mapping is a schema-metadata lookup, never a name-spelling transform — two
 properties whose names differ only by case style (`firstName` -> `first_name`
 and `first_name` -> `"firstName"`) each map to their own physical column.
 
+Table metadata (name, column map, indexes) lives in a symbol-keyed internal
+record, not in plain properties, so user columns named `columns`, `tableName`
+or `indexes` are ordinary columns and cannot clobber it — CRUD, `returning`,
+relational reads, DDL and schema export all work on such tables. Read
+metadata through the exported helpers `getTableName(table)`,
+`getTableColumns(table)` and `getTableIndexes(table)`; the pre-alpha plain
+`table.tableName` / `table.columns` properties are gone. Insert and select
+types are exact: required insert keys are NOT NULL-without-default columns
+(primary keys imply NOT NULL; `serial` implies a server default), nullable
+columns accept `null`, and invalid value types, unknown keys, unknown
+relations and nested `with` (depth 2+) are compile errors as well as runtime
+errors.
+
 - Nullable columns accept `null`: `.set({ nick: null })` binds SQL NULL; the
   empty string stays an empty string. `undefined` in `.set()` is ignored, and
   an update whose `.set()` leaves no assignments is an error.
@@ -208,8 +221,9 @@ Child order is deterministic (ordered by the target's primary key).
 
 ## Tests
 
-- `pnpm test` builds and runs the unit suites plus the live Postgres suites
-  (both drivers).
+- `pnpm test` builds, type-checks the consumer type fixture against the packed
+  `dist/*.d.ts` declarations (`types.consumer/`), and runs the unit suites plus
+  the live Postgres suites (both drivers).
 - Live suites run only when `NEUTRON_TEST_DATABASE_URL` points at a
   disposable Postgres URL. Each suite creates and drops its own uniquely
   named throwaway database — never point it at shared data. (The older
@@ -235,9 +249,11 @@ general-purpose use.
 - `update`/`delete` require `.where()` (foot-gun guard).
 - Deferred with explicit rejection, not implemented: nested/per-relation
   `with` and repeated targets (Q05), decode modes beyond strings for
-  int8/numeric/temporal/bytea children (F03), composite constraints/enums/
-  arrays/views in migrations (M02+), composite/no-key mutation in Studio
-  (S01).
+  int8/numeric/temporal/bytea children (F03), generated/identity columns —
+  the schema cannot declare them yet, so the "generated-field writes are
+  rejected" guarantee lands with them; `serial` stays writable per PostgreSQL
+  semantics (Q07), composite constraints/enums/arrays/views in migrations
+  (M02+), composite/no-key mutation in Studio (S01).
 - Studio: `neutron studio` opens the SQL browser (filter, sort, FK links)
   against a Postgres connection URL; cell edits are permitted only on tables
   with a proven single-column primary key — composite/no-key tables are

@@ -16,6 +16,7 @@ import {
 } from "./builder.js";
 import { buildRelationalSQL, findFirst, findMany, resolveRelations, type RQBArgs } from "./relations.js";
 import {
+  getTableName,
   isPgTable,
   isTableRelations,
   type AnyColumnBuilder,
@@ -163,19 +164,19 @@ export async function createDatabase<
 
   const tables = new Map<string, { key: string; table: AnyPgTable }>();
   for (const [key, value] of Object.entries(options.tables ?? {})) {
-    if (isPgTable(value)) tables.set(value.tableName, { key, table: value });
+    if (isPgTable(value)) tables.set(getTableName(value), { key, table: value });
   }
 
   const relationSets: TableRelations[] = [];
   const relationsByName = new Map<string, TableRelations>();
   for (const [key, value] of Object.entries(options.relations ?? {})) {
     if (!isTableRelations(value)) continue;
-    relationsByName.set(value.table.tableName, value);
+    relationsByName.set(getTableName(value.table), value);
     relationSets.push(value);
   }
   const resolved = resolveRelations(relationSets);
   const relationsByTable = new Map<string, Record<string, Relation>>();
-  for (const r of relationSets) relationsByTable.set(r.table.tableName, r.entries);
+  for (const r of relationSets) relationsByTable.set(getTableName(r.table), r.entries);
   void resolved;
 
   const ctx: ExecContext = { driver, logger };
@@ -192,7 +193,7 @@ export async function createDatabase<
   const makeQuery = (context: ExecContext): QueryApi => {
     const api: QueryApi = {};
     for (const { key, table } of tables.values()) {
-      const entries = relationsByTable.get(table.tableName) ?? {};
+      const entries = relationsByTable.get(getTableName(table)) ?? {};
       api[key] = {
         findMany: (args: RQBArgs = {}) => findMany(context, table, entries, args),
         findFirst: (args: RQBArgs = {}) => findFirst(context, table, entries, args),
