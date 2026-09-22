@@ -125,6 +125,54 @@ jobs:
       - run: pnpm typecheck
         working-directory: typescript
 
+  # Required-live Postgres integration for @neutron-build/sql. Both drivers
+  # (postgres.js and pg) run inside the suite; each live file creates and
+  # drops its own uniquely named throwaway database. NEUTRON_LIVE_REQUIRED=1
+  # means a missing URL or an unreachable server fails the run instead of
+  # skipping — locally, without the env, the same tests skip with a visible
+  # reason. Image: postgres:17 (repo workflows pin no digests; majors are
+  # declared/reassessed at release per VERIFICATION, 16/18 are release-time).
+  neutron-sql:
+    name: neutron-sql live (Postgres 17)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      NEUTRON_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      NEUTRON_LIVE_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: typescript/package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: typescript/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install
+        working-directory: typescript
+
+      - name: Test neutron-sql (live Postgres, both drivers)
+        run: pnpm --filter @neutron-build/sql run test
+        working-directory: typescript
+
   # Browser e2e: the only tests that verify in a real browser that routing,
   # actions, and island hydration actually work end-to-end. Chromium only —
   # the suite checks framework behaviour, not cross-browser rendering, and
