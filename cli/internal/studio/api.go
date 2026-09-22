@@ -386,6 +386,21 @@ func (s *Server) handleFeatures(w http.ResponseWriter, r *http.Request) {
 
 // --- /api/table ---
 
+// allowedFilterOps maps the frontend's filter op names to SQL operators.
+var allowedFilterOps = map[string]string{
+	"eq":       "=",
+	"ne":       "<>",
+	"lt":       "<",
+	"lte":      "<=",
+	"gt":       ">",
+	"gte":      ">=",
+	"like":     "LIKE",
+	"ilike":    "ILIKE",
+	"is-null":  "IS NULL",
+	"not-null": "IS NOT NULL",
+}
+
+
 func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -397,6 +412,11 @@ func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 	tableName := q.Get("table")
 	limit := parseInt(q.Get("limit"), 200)
 	offset := parseInt(q.Get("offset"), 0)
+	filterColumn := q.Get("filterColumn")
+	filterOp := q.Get("filterOp")
+	filterValue := q.Get("filterValue")
+	sortColumn := q.Get("sortColumn")
+	sortDir := q.Get("sortDir")
 
 	if connID == "" || schemaName == "" || tableName == "" {
 		writeError(w, http.StatusBadRequest, "connectionId, schema, and table are required")
@@ -408,14 +428,39 @@ func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Use quoted identifiers to prevent SQL injection
+	var where string
+	var args []any
+	if filterColumn != "" {
+		op, ok := allowedFilterOps[filterOp]
+		if !ok {
+			writeError(w, http.StatusBadRequest, "filterOp must be one of eq, ne, lt, lte, gt, gte, like, ilike, is-null, not-null")
+			return
+		}
+		if op == "IS NULL" || op == "IS NOT NULL" {
+			where = fmt.Sprintf(" WHERE %s.%s %s", quoteIdent(tableName), quoteIdent(filterColumn), op)
+		} else {
+			args = append(args, filterValue)
+			where = fmt.Sprintf(" WHERE %s.%s %s $1", quoteIdent(tableName), quoteIdent(filterColumn), op)
+		}
+	}
+
+	order := ""
+	if sortColumn != "" {
+		dir := "ASC"
+		if strings.EqualFold(sortDir, "desc") {
+			dir = "DESC"
+		}
+		order = fmt.Sprintf(" ORDER BY %s.%s %s", quoteIdent(tableName), quoteIdent(sortColumn), dir)
+	}
+
+	// Quoted identifiers throughout; filter values are bound parameters.
 	sql := fmt.Sprintf(
-		`SELECT * FROM %s.%s LIMIT %d OFFSET %d`,
-		quoteIdent(schemaName), quoteIdent(tableName), limit, offset,
+		`SELECT * FROM %s.%s%s%s LIMIT %d OFFSET %d`,
+		quoteIdent(schemaName), quoteIdent(tableName), where, order, limit, offset,
 	)
 
 	start := time.Now()
-	rows, err := client.Query(r.Context(), sql)
+	rows, err := client.Query(r.Context(), sql, args...)
 	if err != nil {
 		log.Printf("studio: table query error: %v", err)
 		writeJSON(w, http.StatusOK, map[string]any{

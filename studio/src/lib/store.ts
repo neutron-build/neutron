@@ -33,14 +33,20 @@ export const activeTab = computed(() =>
 )
 
 export function openTab(tab: Tab) {
-  const existing = tabs.value.find(t =>
-    t.kind === tab.kind &&
-    t.objectSchema === tab.objectSchema &&
-    t.objectName === tab.objectName
-  )
-  if (existing) {
-    activeTabId.value = existing.id
-    return
+  // Filtered views (FK follow) must not collapse into the unfiltered tab.
+  if (!tab.filter) {
+    const existing = tabs.value.find(t =>
+      t.kind === tab.kind &&
+      t.objectSchema === tab.objectSchema &&
+      t.objectName === tab.objectName
+    )
+    if (existing) {
+      activeTabId.value = existing.id
+      return
+    }
+  }
+  if (!tab.id) {
+    tab.id = `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   }
   tabs.value = [...tabs.value, tab]
   activeTabId.value = tab.id

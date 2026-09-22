@@ -106,3 +106,91 @@
   font-family: var(--font-mono);
   font-size: var(--text-sm);
 }
+
+/* --- editing + FK follow + sort (SQL browser parity) --- */
+
+.cellInput {
+  width: 100%;
+  min-width: 6rem;
+  padding: 2px 6px;
+  border: 1px solid var(--accent, #4da3ff);
+  border-radius: 3px;
+  background: var(--bg-elevated, #1e1e2e);
+  color: var(--text-primary, #e0e0e0);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+.nullBtn {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font: inherit;
+}
+
+.fkLink {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font: inherit;
+  color: var(--accent, #4da3ff);
+  text-decoration: underline dotted;
+}
+
+.fkLink:hover {
+  text-decoration: underline solid;
+}
+
+.thSortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.thSortable:hover {
+  text-decoration: underline;
+}
+
+.sortMark {
+  opacity: 0.8;
+}
+
+.fkMark {
+  opacity: 0.6;
+  font-size: var(--text-xs);
+}
+
+.thPk {
+  color: var(--warning, #f0c674);
+}
+
+.pkHeader {
+  color: var(--warning, #f0c674);
+  font-size: var(--text-xs);
+}
+
+.editHint {
+  padding: 4px 8px;
+  font-size: var(--text-xs);
+  opacity: 0.6;
+  border-top: 1px solid var(--border, #333344);
+}
+
+.cellEditor {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+}
+
+.nullToggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: var(--text-xs);
+  color: var(--text-secondary, #aaa);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}

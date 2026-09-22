@@ -1,7 +1,7 @@
 import type {
   Connection, ConnectionInput, TestResult,
   Schema, NucleusFeatures, QueryResult,
-  ColumnDetail, IndexDetail, SavedQuery,
+  ColumnDetail, IndexDetail, SavedQuery, FKDetail,
 } from './types'
 
 const BASE = '/api'
@@ -58,11 +58,44 @@ export const api = {
   features: (connectionId: string) =>
     request<NucleusFeatures>('GET', `/features?connectionId=${connectionId}`),
 
-  // --- Table data (paginated) ---
+  // --- Table data (paginated, filterable, sortable) ---
 
-  tableData: (connectionId: string, schema: string, table: string, limit = 200, offset = 0) =>
-    request<QueryResult>('GET',
-      `/table?connectionId=${connectionId}&schema=${schema}&table=${table}&limit=${limit}&offset=${offset}`
+  tableData: (
+    connectionId: string, schema: string, table: string,
+    limit = 200, offset = 0,
+    filter?: { column: string; op: string; value?: string },
+    sort?: { column: string; dir: 'asc' | 'desc' },
+  ) => {
+    const params = new URLSearchParams({
+      connectionId, schema, table,
+      limit: String(limit), offset: String(offset),
+    })
+    if (filter) {
+      params.set('filterColumn', filter.column)
+      params.set('filterOp', filter.op)
+      if (filter.value !== undefined) params.set('filterValue', filter.value)
+    }
+    if (sort) {
+      params.set('sortColumn', sort.column)
+      params.set('sortDir', sort.dir)
+    }
+    return request<QueryResult>('GET', `/table?${params.toString()}`)
+  },
+
+  tableUpdate: (input: {
+    connectionId: string; schema: string; table: string
+    pkColumn: string; pkValue: unknown
+    column: string; value?: unknown; isNull?: boolean
+  }) => request<{ rowsAffected: number; error?: string }>('POST', '/table/update', input),
+
+  tableDeleteRow: (input: {
+    connectionId: string; schema: string; table: string
+    pkColumn: string; pkValue: unknown
+  }) => request<{ rowsAffected: number; error?: string }>('POST', '/table/delete', input),
+
+  tableFKs: (connectionId: string, schema: string, table: string) =>
+    request<{ fks: FKDetail[]; error?: string }>('GET',
+      `/table/fks?connectionId=${connectionId}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`
     ),
 
   // --- Schema designer ---

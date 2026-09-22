@@ -166,3 +166,59 @@
   color: var(--text-tertiary);
   font-family: var(--font-mono);
 }
+
+/* --- filter bar --- */
+
+.filterBar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border, #333344);
+  flex-wrap: wrap;
+}
+
+.filterSelect {
+  padding: 4px 8px;
+  border: 1px solid var(--border, #333344);
+  border-radius: 4px;
+  background: var(--bg-elevated, #1e1e2e);
+  color: var(--text-primary, #e0e0e0);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+.filterInput {
+  padding: 4px 8px;
+  min-width: 10rem;
+  border: 1px solid var(--border, #333344);
+  border-radius: 4px;
+  background: var(--bg-elevated, #1e1e2e);
+  color: var(--text-primary, #e0e0e0);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+.filterBtn {
+  padding: 4px 12px;
+  border: 1px solid var(--border, #333344);
+  border-radius: 4px;
+  background: var(--bg-elevated, #1e1e2e);
+  color: var(--text-primary, #e0e0e0);
+  cursor: pointer;
+  font-size: var(--text-sm);
+}
+
+.filterBtn:hover {
+  border-color: var(--accent, #4da3ff);
+}
+
+.readOnlyNote {
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  font-size: var(--text-sm);
+  color: var(--warning, #f0c674);
+  background: color-mix(in srgb, var(--warning, #f0c674) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning, #f0c674) 35%, transparent);
+  border-radius: 4px;
+}

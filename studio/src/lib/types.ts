@@ -149,6 +149,13 @@ export interface ColumnDetail {
   ordinal: number
 }
 
+export interface FKDetail {
+  column: string
+  refSchema: string
+  refTable: string
+  refColumn: string
+}
+
 export interface IndexDetail {
   name: string
   columns: string[]
@@ -195,6 +202,8 @@ export interface Tab {
   // context: which object is open
   objectSchema?: string
   objectName?: string
+  /** Pre-applied SQL-browser filter (FK follow). */
+  filter?: { column: string; op: string; value: string }
 }
 
 // --- Pending changes ---
