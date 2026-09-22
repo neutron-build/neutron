@@ -1,0 +1,48 @@
+{
+  "version": 2,
+  "dialect": "postgresql",
+  "capabilities": [],
+  "schemas": [{"name": "public"}],
+  "enums": [
+    {"identity": {"schema": "public", "name": "color"}, "managed": true, "values": ["red", "green", "blue"]}
+  ],
+  "tables": [
+    {
+      "identity": {"schema": "public", "name": "indexes"},
+      "managed": true,
+      "columns": [
+        {"name": "name", "type": {"name": "text", "codec": "string"}, "notNull": true},
+        {"name": "columns", "type": {"name": "jsonb", "codec": "json"}, "notNull": true},
+        {"name": "type", "type": {"name": "text", "codec": "string"}, "notNull": false}
+      ],
+      "constraints": [
+        {"name": "indexes_pkey", "type": "primary-key", "columns": ["name"]}
+      ],
+      "indexes": []
+    },
+    {
+      "identity": {"schema": "public", "name": "meta"},
+      "managed": true,
+      "columns": [
+        {"name": "id", "type": {"name": "int4", "codec": "number"}, "notNull": true},
+        {"name": "columns", "type": {"name": "text", "codec": "string"}, "notNull": false},
+        {"name": "identity", "type": {"name": "text", "codec": "string"}, "notNull": false},
+        {"name": "version", "type": {"name": "text", "codec": "string"}, "notNull": false},
+        {"name": "tint", "type": {"name": "enum", "codec": "enum", "enum": {"schema": "public", "name": "color"}}, "notNull": false}
+      ],
+      "constraints": [
+        {"name": "meta_pkey", "type": "primary-key", "columns": ["id"]}
+      ],
+      "indexes": []
+    }
+  ],
+  "views": [
+    {"identity": {"schema": "public", "name": "v_active"}, "managed": true, "definition": "select name from public.indexes where type = 'active'", "checkOption": "cascaded", "securityInvoker": true},
+    {"identity": {"schema": "public", "name": "v_meta_count"}, "managed": false, "definition": "select count(*) as n from public.meta"}
+  ],
+  "opaque": [
+    {"kind": "extension-table", "identity": {"schema": "public", "name": "spatial_ref_sys"}, "owner": "postgis", "reason": "owned by extension postgis"},
+    {"kind": "extension-object", "identity": {"schema": "public", "name": "uuid_generate_v4"}, "owner": "uuid-ossp", "reason": "extension-owned function"},
+    {"kind": "unsupported-object", "identity": {"schema": "public", "name": "monthly_rollup"}, "reason": "materialized views are not representable in this contract version"}
+  ]
+}

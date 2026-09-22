@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "tables": [
+    {
+      "name": "posts",
+      "columns": [
+        {"name": "id", "type": "serial", "notNull": true, "primaryKey": true},
+        {"name": "title", "type": "text", "notNull": true},
+        {"name": "author_id", "type": "integer", "notNull": true, "foreignKey": {"table": "users", "column": "id", "onDelete": "cascade"}},
+        {"name": "views", "type": "integer", "notNull": false, "hasDefault": true, "default": "0"}
+      ],
+      "indexes": [
+        {"name": "posts_title_idx", "unique": false, "columns": ["title"]}
+      ]
+    },
+    {
+      "name": "users",
+      "columns": [
+        {"name": "id", "type": "serial", "notNull": true, "primaryKey": true},
+        {"name": "email", "type": "varchar", "varcharLength": 255, "notNull": true, "unique": true},
+        {"name": "name", "type": "text", "notNull": false},
+        {"name": "created_at", "type": "timestamptz", "notNull": true, "hasDefault": true, "defaultNow": true},
+        {"name": "active", "type": "boolean", "notNull": true, "hasDefault": true, "default": "true"},
+        {"name": "balance", "type": "numeric", "notNull": false, "hasDefault": true, "default": "0"}
+      ],
+      "indexes": []
+    }
+  ]
+}

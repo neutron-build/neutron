@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "dialect": "postgresql",
+  "capabilities": [],
+  "schemas": [{"name": "public"}],
+  "tables": [
+    {
+      "identity": {"schema": "app", "name": "memberships"},
+      "managed": true,
+      "columns": [{"name": "id", "type": {"name": "int4", "codec": "number"}, "notNull": true}],
+      "constraints": [{"name": "memberships_pkey", "type": "primary-key", "columns": ["id"]}],
+      "indexes": []
+    }
+  ],
+  "enums": [],
+  "views": [],
+  "opaque": []
+}

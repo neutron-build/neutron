@@ -1,0 +1,10 @@
+{
+  "version": 3,
+  "dialect": "postgresql",
+  "capabilities": [],
+  "schemas": [{"name": "public"}],
+  "tables": [],
+  "enums": [],
+  "views": [],
+  "opaque": []
+}

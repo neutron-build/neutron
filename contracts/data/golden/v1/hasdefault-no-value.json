@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "tables": [
+    {
+      "name": "users",
+      "columns": [
+        {"name": "id", "type": "serial", "notNull": true, "primaryKey": true},
+        {"name": "flag", "type": "boolean", "notNull": false, "hasDefault": true}
+      ],
+      "indexes": []
+    }
+  ]
+}

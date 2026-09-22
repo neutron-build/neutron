@@ -1,0 +1,31 @@
+{
+  "version": 2,
+  "dialect": "postgresql",
+  "capabilities": [],
+  "schemas": [{"name": "public"}],
+  "tables": [
+    {
+      "identity": {"schema": "public", "name": "users"},
+      "managed": true,
+      "columns": [
+        {"name": "id", "type": {"name": "int4", "codec": "number"}, "notNull": true},
+        {"name": "email", "type": {"name": "text", "codec": "string"}, "notNull": false}
+      ],
+      "constraints": [{"name": "users_pkey", "type": "primary-key", "columns": ["id"]}],
+      "indexes": [{"identity": {"schema": "public", "name": "shared_idx"}, "unique": false, "method": "btree", "key": [{"column": "email"}]}]
+    },
+    {
+      "identity": {"schema": "public", "name": "orders"},
+      "managed": true,
+      "columns": [
+        {"name": "id", "type": {"name": "int4", "codec": "number"}, "notNull": true},
+        {"name": "note", "type": {"name": "text", "codec": "string"}, "notNull": false}
+      ],
+      "constraints": [{"name": "orders_pkey", "type": "primary-key", "columns": ["id"]}],
+      "indexes": [{"identity": {"schema": "public", "name": "shared_idx"}, "unique": false, "method": "btree", "key": [{"column": "note"}]}]
+    }
+  ],
+  "enums": [],
+  "views": [],
+  "opaque": []
+}

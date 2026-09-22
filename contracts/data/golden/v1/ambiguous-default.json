@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "tables": [
+    {
+      "name": "users",
+      "columns": [
+        {"name": "id", "type": "serial", "notNull": true, "primaryKey": true},
+        {"name": "bio", "type": "text", "notNull": false, "hasDefault": true, "default": "hello world"}
+      ],
+      "indexes": []
+    }
+  ]
+}

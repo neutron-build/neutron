@@ -1,0 +1,72 @@
+{
+  "version": 2,
+  "dialect": "postgresql",
+  "capabilities": [],
+  "schemas": [{"name": "app"}, {"name": "public"}],
+  "tables": [
+    {
+      "identity": {"schema": "public", "name": "tenants"},
+      "managed": true,
+      "columns": [
+        {"name": "id", "type": {"name": "int4", "codec": "number"}, "notNull": true}
+      ],
+      "constraints": [
+        {"name": "tenants_pkey", "type": "primary-key", "columns": ["id"]}
+      ],
+      "indexes": []
+    },
+    {
+      "identity": {"schema": "public", "name": "users"},
+      "managed": true,
+      "columns": [
+        {"name": "tenant_id", "type": {"name": "int4", "codec": "number"}, "notNull": true},
+        {"name": "id", "type": {"name": "int4", "codec": "number"}, "notNull": true},
+        {"name": "email", "type": {"name": "varchar", "codec": "string", "params": {"length": 254}}, "notNull": true},
+        {"name": "name", "type": {"name": "text", "codec": "string"}, "notNull": false}
+      ],
+      "constraints": [
+        {"name": "users_pkey", "type": "primary-key", "columns": ["tenant_id", "id"]},
+        {"name": "users_email_key", "type": "unique", "columns": ["email"]},
+        {"name": "users_tenant_fkey", "type": "foreign-key", "columns": ["tenant_id"], "references": {"table": {"schema": "public", "name": "tenants"}, "columns": ["id"], "onDelete": "cascade"}}
+      ],
+      "indexes": []
+    },
+    {
+      "identity": {"schema": "app", "name": "memberships"},
+      "managed": true,
+      "columns": [
+        {"name": "tenant_id", "type": {"name": "int4", "codec": "number"}, "notNull": true},
+        {"name": "user_id", "type": {"name": "int4", "codec": "number"}, "notNull": true},
+        {"name": "role", "type": {"name": "varchar", "codec": "string", "params": {"length": 32}}, "notNull": true}
+      ],
+      "constraints": [
+        {"name": "memberships_pkey", "type": "primary-key", "columns": ["tenant_id", "user_id"]},
+        {"name": "memberships_user_fkey", "type": "foreign-key", "columns": ["tenant_id", "user_id"], "references": {"table": {"schema": "public", "name": "users"}, "columns": ["tenant_id", "id"], "onDelete": "cascade"}, "deferrable": true, "initiallyDeferred": false},
+        {"name": "memberships_role_check", "type": "check", "expression": "length(btrim(role)) > 0"}
+      ],
+      "indexes": [
+        {"identity": {"schema": "app", "name": "memberships_user_idx"}, "unique": false, "method": "btree", "key": [{"column": "user_id"}], "where": "user_id is not null", "include": ["tenant_id"]}
+      ]
+    },
+    {
+      "identity": {"schema": "app", "name": "org_settings"},
+      "managed": true,
+      "columns": [
+        {"name": "org_id", "type": {"name": "int4", "codec": "number"}, "notNull": true},
+        {"name": "dept", "type": {"name": "int4", "codec": "number"}, "notNull": true},
+        {"name": "note", "type": {"name": "text", "codec": "string"}, "notNull": false}
+      ],
+      "constraints": [
+        {"name": "org_settings_scope_key", "type": "unique", "columns": ["org_id", "dept"]}
+      ],
+      "indexes": [
+        {"identity": {"schema": "app", "name": "org_settings_note_idx"}, "unique": false, "method": "btree", "key": [{"column": "org_id"}, {"expression": "lower(note)"}], "include": ["dept", "org_id"]}
+      ]
+    }
+  ],
+  "enums": [],
+  "views": [],
+  "opaque": [
+    {"kind": "extension-table", "identity": {"schema": "app", "name": "audit_chunk"}, "owner": "pg_partman", "reason": "partitioned child table owned by pg_partman"}
+  ]
+}

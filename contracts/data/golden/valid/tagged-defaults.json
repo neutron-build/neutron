@@ -1,0 +1,39 @@
+{
+  "version": 2,
+  "dialect": "postgresql",
+  "capabilities": ["pgvector"],
+  "schemas": [{"name": "public"}],
+  "enums": [
+    {"identity": {"schema": "public", "name": "event_status"}, "managed": true, "values": ["draft", "published", "archived"]}
+  ],
+  "tables": [
+    {
+      "identity": {"schema": "public", "name": "events"},
+      "managed": true,
+      "columns": [
+        {"name": "id", "type": {"name": "int8", "codec": "bigint"}, "notNull": true, "default": {"kind": "identity", "generated": "always"}},
+        {"name": "seq_num", "type": {"name": "int4", "codec": "number"}, "notNull": true, "default": {"kind": "sequence", "sequence": {"schema": "public", "name": "events_seq_num_seq"}}},
+        {"name": "note", "type": {"name": "text", "codec": "string"}, "notNull": true, "default": {"kind": "literal", "sql": "'now()'"}},
+        {"name": "suffix", "type": {"name": "text", "codec": "string"}, "notNull": false, "default": {"kind": "literal", "sql": "''"}},
+        {"name": "label", "type": {"name": "text", "codec": "string"}, "notNull": true, "default": {"kind": "literal", "sql": "'pending'::text"}},
+        {"name": "handle", "type": {"name": "uuid", "codec": "uuid"}, "notNull": true, "default": {"kind": "expression", "sql": "gen_random_uuid()"}},
+        {"name": "created_at", "type": {"name": "timestamptz", "codec": "timestamptz-string"}, "notNull": true, "default": {"kind": "expression", "sql": "now()"}},
+        {"name": "ratio", "type": {"name": "numeric", "codec": "decimal-string", "params": {"precision": 8, "scale": 4}}, "notNull": true, "default": {"kind": "literal", "sql": "1.5000"}},
+        {"name": "tags", "type": {"name": "text", "codec": "array", "array": true}, "notNull": true, "default": {"kind": "literal", "sql": "'{}'::text[]"}},
+        {"name": "status", "type": {"name": "enum", "codec": "enum", "enum": {"schema": "public", "name": "event_status"}}, "notNull": true, "default": {"kind": "literal", "sql": "'draft'"}},
+        {"name": "embedding", "type": {"name": "vector", "codec": "vector", "params": {"dimensions": 1536}}, "notNull": false},
+        {"name": "counter", "type": {"name": "int4", "codec": "number"}, "notNull": false, "default": {"kind": "literal", "sql": "0"}}
+      ],
+      "constraints": [
+        {"name": "events_pkey", "type": "primary-key", "columns": ["id"]}
+      ],
+      "indexes": [
+        {"identity": {"schema": "public", "name": "events_note_expr_idx"}, "unique": false, "method": "btree", "key": [{"expression": "lower(note)"}], "include": ["label"]},
+        {"identity": {"schema": "public", "name": "events_created_idx"}, "unique": false, "method": "btree", "key": [{"column": "created_at"}, {"column": "counter"}], "where": "counter >= 0"},
+        {"identity": {"schema": "public", "name": "events_handle_idx"}, "unique": true, "method": "btree", "key": [{"column": "handle"}]}
+      ]
+    }
+  ],
+  "views": [],
+  "opaque": []
+}

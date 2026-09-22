@@ -1,0 +1,24 @@
+{
+  "version": 2,
+  "dialect": "postgresql",
+  "capabilities": [],
+  "schemas": [{"name": "public"}],
+  "tables": [
+    {
+      "identity": {"schema": "public", "name": "posts"},
+      "managed": true,
+      "columns": [
+        {"name": "id", "type": {"name": "int4", "codec": "number"}, "notNull": true},
+        {"name": "author_id", "type": {"name": "int4", "codec": "number"}, "notNull": true}
+      ],
+      "constraints": [
+        {"name": "posts_pkey", "type": "primary-key", "columns": ["id"]},
+        {"name": "posts_author_fkey", "type": "foreign-key", "columns": ["author_id"], "references": {"table": {"schema": "public", "name": "ghost"}, "columns": ["id"]}}
+      ],
+      "indexes": []
+    }
+  ],
+  "enums": [],
+  "views": [],
+  "opaque": []
+}

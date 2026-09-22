@@ -1,0 +1,33 @@
+{
+	"version": 2,
+	"dialect": "postgresql",
+	"capabilities": [],
+	"schemas": [{"name": "public"}],
+	"tables": [
+		{
+			"identity": {"schema": "public", "name": "zz😀"},
+			"managed": true,
+			"columns": [
+				{"name": "id", "type": {"name": "int4", "codec": "number"}, "notNull": true}
+			],
+			"constraints": [
+				{"name": "zz😀_pkey", "type": "primary-key", "columns": ["id"]}
+			],
+			"indexes": []
+		},
+		{
+			"identity": {"schema": "public", "name": "zz￿"},
+			"managed": true,
+			"columns": [
+				{"name": "id", "type": {"name": "int4", "codec": "number"}, "notNull": true}
+			],
+			"constraints": [
+				{"name": "zz￿_pkey", "type": "primary-key", "columns": ["id"]}
+			],
+			"indexes": []
+		}
+	],
+	"enums": [],
+	"views": [],
+	"opaque": []
+}

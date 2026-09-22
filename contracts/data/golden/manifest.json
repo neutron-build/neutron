@@ -1,0 +1,153 @@
+{
+  "valid": [
+    {
+      "name": "basic-users",
+      "document": "valid/basic-users.json",
+      "canonical": "valid/basic-users.canonical.json",
+      "sha256": "fa31d0e4fbdf6887c7466653c0ffb0f3db99fee2875c68c5b4774628b6057368"
+    },
+    {
+      "name": "catalog-surface",
+      "document": "valid/catalog-surface.json",
+      "canonical": "valid/catalog-surface.canonical.json",
+      "sha256": "55935c11fa9ffa8bc460990a8c784c285d2c743034350b9215d0fcc5c36bb5af"
+    },
+    {
+      "name": "column-order",
+      "document": "valid/column-order.json",
+      "canonical": "valid/column-order.canonical.json",
+      "sha256": "4734761baccc05f6eac5a47229f9482d6774484ecda7d9a4798678daee861a6a"
+    },
+    {
+      "name": "empty-managed",
+      "document": "valid/empty-managed.json",
+      "canonical": "valid/empty-managed.canonical.json",
+      "sha256": "ff2147c53df12de33c9a890242fb9c5232bf037fa907d6292bc850eb8c58a706"
+    },
+    {
+      "name": "order-insensitive",
+      "document": "valid/order-insensitive.json",
+      "canonical": "valid/order-insensitive.canonical.json",
+      "sha256": "fa31d0e4fbdf6887c7466653c0ffb0f3db99fee2875c68c5b4774628b6057368"
+    },
+    {
+      "name": "tagged-defaults",
+      "document": "valid/tagged-defaults.json",
+      "canonical": "valid/tagged-defaults.canonical.json",
+      "sha256": "2b91210175f15a1d73a483001658e50f87123103945b38dab9051acb34bd2dde"
+    },
+    {
+      "name": "tenant-composite",
+      "document": "valid/tenant-composite.json",
+      "canonical": "valid/tenant-composite.canonical.json",
+      "sha256": "75dcd548ba39feea7db6bcdb818ea175c71a30e599321063435f89fa613e7ef3"
+    },
+    {
+      "name": "unicode-sort",
+      "document": "valid/unicode-sort.json",
+      "canonical": "valid/unicode-sort.canonical.json",
+      "sha256": "45643b285e7ad6b21525a03017ee8a41dfd1a4f92c3793943a7f079d9d07ce2b"
+    }
+  ],
+  "invalid": [
+    {
+      "name": "constraint-unknown-column",
+      "document": "invalid/constraint-unknown-column.json",
+      "code": "constraint-column"
+    },
+    {
+      "name": "control-in-name",
+      "document": "invalid/control-in-name.json",
+      "code": "invalid-identity"
+    },
+    {
+      "name": "duplicate-index",
+      "document": "invalid/duplicate-index.json",
+      "code": "duplicate-index"
+    },
+    {
+      "name": "duplicate-table",
+      "document": "invalid/duplicate-table.json",
+      "code": "duplicate-table"
+    },
+    {
+      "name": "enum-unresolved",
+      "document": "invalid/enum-unresolved.json",
+      "code": "enum-unresolved"
+    },
+    {
+      "name": "fk-unresolved",
+      "document": "invalid/fk-unresolved.json",
+      "code": "fk-target"
+    },
+    {
+      "name": "literal-looks-expression",
+      "document": "invalid/literal-looks-expression.json",
+      "code": "invalid-literal"
+    },
+    {
+      "name": "missing-managed",
+      "document": "invalid/missing-managed.json",
+      "code": "missing-field"
+    },
+    {
+      "name": "nul-in-sqltext",
+      "document": "invalid/nul-in-sqltext.json",
+      "code": "invalid-value"
+    },
+    {
+      "name": "non-integer-number",
+      "document": "invalid/non-integer-number.json",
+      "code": "invalid-number"
+    },
+    {
+      "name": "pk-not-null",
+      "document": "invalid/pk-not-null.json",
+      "code": "pk-not-null"
+    },
+    {
+      "name": "undeclared-schema",
+      "document": "invalid/undeclared-schema.json",
+      "code": "undeclared-schema"
+    },
+    {
+      "name": "unknown-field",
+      "document": "invalid/unknown-field.json",
+      "code": "unknown-field"
+    },
+    {
+      "name": "unknown-version",
+      "document": "invalid/unknown-version.json",
+      "code": "unknown-version"
+    },
+    {
+      "name": "ufffd-string",
+      "document": "invalid/ufffd-string.json",
+      "code": "invalid-value"
+    }
+  ],
+  "v1": [
+    {
+      "name": "ambiguous-default",
+      "document": "v1/ambiguous-default.json",
+      "code": "ambiguous-default"
+    },
+    {
+      "name": "basic-upgrade",
+      "document": "v1/basic-upgrade.json",
+      "canonical": "v1/basic-upgrade.canonical.json",
+      "sha256": "933f7978f321863801bf2e3950eafda40e209abde3afbd2c5b1137f657507c0c"
+    },
+    {
+      "name": "hasdefault-no-value",
+      "document": "v1/hasdefault-no-value.json",
+      "code": "ambiguous-default"
+    },
+    {
+      "name": "vector-upgrade",
+      "document": "v1/vector-upgrade.json",
+      "canonical": "v1/vector-upgrade.canonical.json",
+      "sha256": "10277182d649c070a59195c3292c38f66feb4fbc2c542a5431e620cc6142b857"
+    }
+  ]
+}

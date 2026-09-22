@@ -1,0 +1,79 @@
+name: Schema Contracts
+
+# Cross-language agreement gate for the schema document contract: the
+# TypeScript consumer and the Go validator must produce identical canonical
+# bytes and SHA-256 hashes for every golden fixture and reject every invalid
+# fixture for the same reason (V09).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "contracts/**"
+      - "cli/internal/db/**"
+      - ".github/workflows/contracts.yml"
+  pull_request:
+    paths:
+      - "contracts/**"
+      - "cli/internal/db/**"
+      - ".github/workflows/contracts.yml"
+
+jobs:
+  agreement:
+    name: TS/Go canonical agreement
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Plain node, no install step: the consumer is dependency-free and runs
+      # via type stripping (node >= 22.6).
+      - name: TypeScript consumer over golden fixtures
+        run: node --experimental-strip-types contracts/data/consumer.ts
+
+      # Keep schema-v2.json load-bearing (review F2): it must validate
+      # against the draft 2020-12 metaschema, accept every valid golden
+      # document, reject the shape-level invalid fixtures, and accept the
+      # cross-object invalid fixtures (those are validator-only by design —
+      # see the shape/cross-object split table in contracts/data/README.md).
+      # ajv is fetched on demand by npx; nothing is added to the repo.
+      - name: JSON Schema is load-bearing (ajv, draft 2020-12)
+        run: |
+          set -e
+          npx --yes ajv-cli@5 compile --spec=draft2020 -s contracts/data/schema-v2.json
+          npx --yes ajv-cli@5 validate --spec=draft2020 -s contracts/data/schema-v2.json \
+            -d "contracts/data/golden/valid/*.json"
+          schema_rejectable="control-in-name literal-looks-expression missing-managed non-integer-number nul-in-sqltext unknown-field unknown-version"
+          validator_only="constraint-unknown-column duplicate-index duplicate-table enum-unresolved fk-unresolved pk-not-null undeclared-schema ufffd-string"
+          for f in $schema_rejectable; do
+            if npx --yes ajv-cli@5 validate --spec=draft2020 -s contracts/data/schema-v2.json \
+              -d "contracts/data/golden/invalid/$f.json" >/dev/null 2>&1; then
+              echo "schema-v2.json must reject golden/invalid/$f.json (shape-level rule)"; exit 1
+            fi
+          done
+          for f in $validator_only; do
+            if ! npx --yes ajv-cli@5 validate --spec=draft2020 -s contracts/data/schema-v2.json \
+              -d "contracts/data/golden/invalid/$f.json" >/dev/null 2>&1; then
+              echo "schema-v2.json must accept golden/invalid/$f.json (cross-object rule; keep the split documented in contracts/data/README.md)"; exit 1
+            fi
+          done
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: cli/go.sum
+
+      # Golden fixtures are in contracts/, outside cli/, so point the test at
+      # the checked-out tree; only the contract tests run here (no database,
+      # no Studio embed needed).
+      - name: Go validator over golden fixtures
+        run: go test ./internal/db -run 'TestV2|TestDetect|TestValidateSchemaDocument|TestUpgradeV1' -count=1
+        working-directory: cli
+
+      - name: Vet
+        run: go vet ./internal/db
+        working-directory: cli

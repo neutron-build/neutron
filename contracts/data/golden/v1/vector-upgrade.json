@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "tables": [
+    {
+      "name": "items",
+      "columns": [
+        {"name": "id", "type": "serial", "notNull": true, "primaryKey": true},
+        {"name": "embedding", "type": "vector", "notNull": true, "nucleusOnly": true, "vectorDimensions": 3}
+      ],
+      "indexes": []
+    }
+  ]
+}
