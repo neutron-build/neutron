@@ -50,6 +50,27 @@ func (c *Client) EnsureMigrationTable(ctx context.Context) error {
 	return c.Exec(ctx, createTrackingTable)
 }
 
+// HasMigrationHistory reports whether the tracking table exists and holds at
+// least one applied migration (guards `db push` against clobbering managed DBs).
+func (c *Client) HasMigrationHistory(ctx context.Context) (bool, error) {
+	var exists bool
+	err := c.pool.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM information_schema.tables
+		WHERE table_schema = current_schema() AND table_name = '_neutron_migrations'
+	)`).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return false, nil
+	}
+	var count int
+	if err := c.pool.QueryRow(ctx, `SELECT count(*) FROM _neutron_migrations`).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 // AppliedMigrations returns all applied migrations from the tracking table.
 func (c *Client) AppliedMigrations(ctx context.Context) ([]MigrationRecord, error) {
 	if err := c.EnsureMigrationTable(ctx); err != nil {
@@ -287,6 +308,13 @@ func migrationNameSlug(name string) (string, error) {
 
 // CreateMigrationFiles generates a new pair of .up.sql and .down.sql files.
 func CreateMigrationFiles(dir, name string) (string, string, error) {
+	return CreateMigrationFilesWithContent(dir, name, "", "")
+}
+
+// CreateMigrationFilesWithContent generates a migration pair with explicit
+// up/down SQL bodies (used by `migrate generate`). Empty content falls back
+// to the comment-header stubs of CreateMigrationFiles.
+func CreateMigrationFilesWithContent(dir, name, upSQL, downSQL string) (string, string, error) {
 	safeName, err := migrationNameSlug(name)
 	if err != nil {
 		return "", "", err
@@ -312,7 +340,13 @@ func CreateMigrationFiles(dir, name string) (string, string, error) {
 	downPath := filepath.Join(dir, fmt.Sprintf("%s_%s.down.sql", nextVersion, safeName))
 
 	upContent := fmt.Sprintf("-- Migration: %s\n", name)
+	if strings.TrimSpace(upSQL) != "" {
+		upContent += "\n" + strings.TrimRight(upSQL, "\n") + "\n"
+	}
 	downContent := fmt.Sprintf("-- Rollback: %s\n", name)
+	if strings.TrimSpace(downSQL) != "" {
+		downContent += "\n" + strings.TrimRight(downSQL, "\n") + "\n"
+	}
 
 	// O_EXCL: a collision means this version is already taken — fail loudly
 	// rather than overwrite whatever owns it.

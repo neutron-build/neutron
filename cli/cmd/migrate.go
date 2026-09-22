@@ -35,7 +35,7 @@ func init() {
 var migrateCmd = &cobra.Command{
 	Use:   "migrate",
 	Short: "Run database migrations",
-	Long:  "Apply pending SQL migration files to the database.",
+	Long:  "Apply pending SQL migration files to the database.\n\nMigration files run verbatim in filename order: the protections enforced when SQL is generated (migrate generate and db push never plan changes to neutron-internal _neutron_* metadata or extension-owned objects) are generation-time only — hand-edited files are not re-checked before they run.",
 	RunE:  runMigrate,
 }
 

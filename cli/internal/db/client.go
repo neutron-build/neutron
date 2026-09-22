@@ -44,6 +44,72 @@ func (c *Client) Exec(ctx context.Context, sql string, args ...any) error {
 	return err
 }
 
+// ExecTag executes a SQL statement and returns the affected row count.
+func (c *Client) ExecTag(ctx context.Context, sql string, args ...any) (int64, error) {
+	tag, err := c.pool.Exec(ctx, sql, args...)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// ApplyInTransaction executes the statements as ONE transaction: any
+// statement failure rolls back everything already applied, leaving the
+// database exactly as it was. onApplied, when non-nil, is called after each
+// successful statement. Comment-only entries (e.g. NUCLEUS-ONLY notes) are
+// reported but not executed.
+func (c *Client) ApplyInTransaction(ctx context.Context, statements []string, onApplied func(stmt string)) error {
+	tx, err := c.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	for _, stmt := range statements {
+		if !hasExecutableSQL(stmt) {
+			if onApplied != nil {
+				onApplied(stmt)
+			}
+			continue
+		}
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("apply %q: %w", firstSQLLine(stmt), err)
+		}
+		if onApplied != nil {
+			onApplied(stmt)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
+// hasExecutableSQL reports whether a plan entry contains anything besides
+// SQL comments/whitespace.
+func hasExecutableSQL(stmt string) bool {
+	for _, line := range strings.Split(stmt, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" && !strings.HasPrefix(trimmed, "--") {
+			return true
+		}
+	}
+	return false
+}
+
+// firstSQLLine returns the first non-comment line of a statement for error
+// messages.
+func firstSQLLine(stmt string) string {
+	for _, line := range strings.Split(stmt, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" && !strings.HasPrefix(trimmed, "--") {
+			return trimmed
+		}
+	}
+	return strings.TrimSpace(stmt)
+}
+
 // Query executes a SQL query and returns rows.
 func (c *Client) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	return c.pool.Query(ctx, sql, args...)
