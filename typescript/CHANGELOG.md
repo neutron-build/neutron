@@ -22,6 +22,12 @@ All notable changes to this project are documented in this file.
   SIGTERM/SIGINT exits immediately, in `start` too.
 - **`neutron-ts dev` answered 404 for `GET /health`.** It now serves the same
   §7 body and yields to an app-defined `/health` route, as `start` does.
+- **`neutron-ts dev` ignored `server.openapi`.** `GET /openapi.json` fell
+  through to Vite's index.html (200 `text/html`). With `server.openapi`
+  configured, dev now serves `/openapi.json` and `/docs` with the same
+  document and content types as `start` (FRAMEWORK_CONTRACT.md §4), and
+  yields to an app-defined route at either path. Unconfigured, dev is
+  unchanged.
 - **`@neutron-build/auth` read a Response from another constructor as
   session data.** Its four `instanceof Response` guards missed native
   Responses under `@hono/node-server` (and cross-realm ones); a Better Auth
