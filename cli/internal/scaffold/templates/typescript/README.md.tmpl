@@ -1,0 +1,36 @@
+# {{.Name}}
+
+A Neutron TypeScript app — file-based routing and Preact SSR
+(`{{.SDK.Name}}`, with the `neutron-ts` binary from `{{.CLI.Name}}`).
+
+## Getting started
+
+```sh
+{{range .NextSteps}}{{.}}
+{{end}}```
+
+`neutron dev` runs this project's `neutron-ts dev` (Vite), passing
+`NEUTRON_PORT` / `NEUTRON_HOST` as `--port` / `--host` when they are set
+(default port {{.Port}}). `npm run dev` does the same without that translation.
+
+| Command | Action |
+| --- | --- |
+| `npm run build` | Production build into `dist/` |
+| `npm start -- --port 3000` | Serve the production build |
+| `npm run typecheck` | `tsc --noEmit` |
+
+## Routes
+
+- `src/routes/index.tsx` → `/`; add a page by adding a file under `src/routes/`
+- `src/routes/_layout.tsx` wraps every page
+- `src/main.tsx` is framework glue — do not edit it (see `AGENTS.md`)
+
+`GET /health` (`{"status", "nucleus", "version"}`) is built into the
+production server (`npm start`). The Vite dev server does not serve it.
+
+## Configuration
+
+`NEUTRON_DATABASE_URL` in `.env` is for your own loaders and actions; the
+framework does not read it. Nothing loads `.env` automatically.
+
+Docs: https://neutron.build/docs

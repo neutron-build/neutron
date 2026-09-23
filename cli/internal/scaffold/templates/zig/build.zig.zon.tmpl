@@ -1,7 +1,17 @@
 .{
-    .name = "{{.Name}}",
+    .name = .{{.Ident}},
     .version = "0.1.0",
-    .dependencies = .{},
+    .fingerprint = {{.Fingerprint}},
+    // The Neutron Zig SDK pins Zig 0.15.2; 0.16 cannot compile it.
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        // The Neutron repository at a fixed commit; the SDK is its `{{.SDK.Subdir}}/`
+        // directory. To update: zig fetch --save=neutron <archive URL of a newer commit>
+        .neutron = .{
+            .url = "{{.SDK.Source}}",
+            .hash = "{{.SDK.Hash}}",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

@@ -63,26 +63,8 @@ func runNew(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 	ui.Infof("Next steps:")
 	fmt.Printf("  cd %s\n", name)
-
-	switch lang {
-	case detect.Python:
-		fmt.Println("  pip install -e .")
-		fmt.Println("  neutron dev")
-	case detect.TypeScript:
-		fmt.Println("  npm install")
-		fmt.Println("  neutron dev")
-	case detect.Go:
-		fmt.Println("  go mod tidy")
-		fmt.Println("  neutron dev")
-	case detect.Rust:
-		fmt.Println("  cargo build")
-		fmt.Println("  neutron dev")
-	case detect.Zig:
-		fmt.Println("  zig build")
-		fmt.Println("  neutron dev")
-	case detect.Julia:
-		fmt.Println("  julia --project=. -e 'using Pkg; Pkg.instantiate()'")
-		fmt.Println("  neutron dev")
+	for _, step := range scaffold.NextSteps(lang) {
+		fmt.Printf("  %s\n", step)
 	}
 
 	return nil

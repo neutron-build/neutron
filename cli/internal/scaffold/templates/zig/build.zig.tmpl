@@ -4,16 +4,40 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const exe = b.addExecutable(.{
-        .name = "{{.Name}}",
+    // The Neutron Zig SDK lives in the `{{.SDK.Subdir}}/` directory of the Neutron
+    // repository (see build.zig.zon). Its root module reads `build_options`
+    // to select layers; these match the SDK's own defaults, minus TLS.
+    const neutron_repo = b.dependency("neutron", .{});
+    const options = b.addOptions();
+    options.addOption(bool, "enable_layer1", true);
+    options.addOption(bool, "enable_layer2", true);
+    options.addOption(bool, "enable_layer3", true);
+    options.addOption(bool, "enable_nucleus", true);
+    options.addOption(bool, "enable_tls", false);
+
+    const neutron = b.createModule(.{
+        .root_source_file = neutron_repo.path("{{.SDK.Subdir}}/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    neutron.addOptions("build_options", options);
+
+    const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+    });
+    exe_mod.addImport("neutron", neutron);
+
+    const exe = b.addExecutable(.{
+        .name = "{{.Name}}",
+        .root_module = exe_mod,
     });
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Run the server");
     run_step.dependOn(&run_cmd.step);
 }

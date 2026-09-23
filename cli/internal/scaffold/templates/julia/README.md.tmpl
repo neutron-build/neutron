@@ -1,0 +1,25 @@
+# {{.Name}}
+
+A Neutron Julia project. `{{.SDK.Name}}` is a **database client** for Nucleus (or
+any PostgreSQL) — all data models over pgwire. There is no HTTP server in the
+Julia SDK, so this project has no `/health` endpoint and `neutron dev` runs a
+script rather than a server.
+
+## Getting started
+
+```sh
+{{range .NextSteps}}{{.}}
+{{end}}```
+
+`neutron dev` runs `julia --project=. src/main.jl`, which connects to
+`NEUTRON_DATABASE_URL` (default `postgres://localhost:5432/{{.Name}}`), runs
+`SELECT 1` and reports whether the server is Nucleus.
+
+`{{.SDK.Name}}` is not in the General registry. `Project.toml` points at the
+Neutron repository through `[sources]`, which Julia 1.11+ reads during
+`Pkg.instantiate()`. On older Julia, add it by URL instead:
+
+```julia
+using Pkg
+Pkg.add(url="{{.SDK.Source}}", subdir="{{.SDK.Subdir}}")
+```

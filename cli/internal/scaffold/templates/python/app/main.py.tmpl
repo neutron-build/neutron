@@ -1,13 +1,15 @@
 """{{.Name}} — built with Neutron."""
 
-from neutron import App, Router
+from neutron import App, Router, default_stack
 
-app = App(title="{{.Name}}", version="0.1.0")
+# FRAMEWORK_CONTRACT §5 middleware order. GET /health, /openapi.json and /docs
+# are built in.
+app = App(title="{{.Name}}", version="0.1.0", middleware=default_stack())
 router = Router()
 
 
-@router.get("/")
-async def index() -> dict:
+@router.get("/api/hello")
+async def hello() -> dict:
     return {"message": "Hello from {{.Name}}!"}
 
 

@@ -1,0 +1,12 @@
+import type { ComponentChildren } from "preact";
+
+export default function Layout(props: { children?: ComponentChildren }) {
+  return (
+    <div style="max-width: 900px; margin: 0 auto; padding: 2rem; font-family: system-ui, sans-serif;">
+      <header style="margin-bottom: 1.5rem;">
+        <h1 style="margin: 0;">{{.Name}}</h1>
+      </header>
+      <main>{props.children}</main>
+    </div>
+  );
+}
