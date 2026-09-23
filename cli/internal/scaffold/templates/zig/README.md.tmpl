@@ -9,8 +9,9 @@ does not compile on 0.16, which removed std APIs it uses.
 {{range .NextSteps}}{{.}}
 {{end}}```
 
-`zig build` downloads the SDK on first use. `neutron dev` runs `zig build run`
-with the first Zig 0.15 it finds (`zig` on PATH, then Homebrew's `zig@0.15`).
+`neutron dev` runs `zig build run` with the first Zig 0.15 it finds (`zig` on
+PATH, then Homebrew's `zig@0.15`); the first build downloads the SDK. To build
+without running, use `zig build` from a Zig 0.15.x.
 
 The SDK is the `{{.SDK.Subdir}}/` directory of the Neutron repository, pinned to one
 commit in `build.zig.zon` (the Zig package manager needs a content hash). To

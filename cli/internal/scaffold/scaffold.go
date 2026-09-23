@@ -102,7 +102,9 @@ func NextSteps(lang detect.Language) []string {
 	case detect.Rust:
 		return []string{"cargo build", "neutron dev"}
 	case detect.Zig:
-		return []string{"zig build", "neutron dev"}
+		// No `zig build` step: `zig` on PATH may be 0.16, which cannot compile
+		// the SDK. `neutron dev` finds a 0.15 and builds before running.
+		return []string{"neutron dev"}
 	case detect.Julia:
 		return []string{"julia --project=. -e 'using Pkg; Pkg.instantiate()'", "neutron dev"}
 	default:
