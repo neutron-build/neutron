@@ -73,7 +73,7 @@ async function withSuite(driverKind: "postgres" | "pg", fn: (fx: SuiteFixture) =
   url.pathname = `/${DB_NAME}`;
   const db = await createDatabase({
     url: url.toString(),
-    driver: { driver: driverKind },
+    driverOptions: { driver: driverKind },
     tables: { people, allDefaults, quotedNames },
   });
   try {

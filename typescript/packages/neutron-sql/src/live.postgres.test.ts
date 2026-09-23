@@ -62,7 +62,7 @@ async function withSuite(driverKind: "postgres" | "pg", fn: (fx: SuiteFixture) =
   url.pathname = `/${DB_NAME}`;
   const db = await createDatabase({
     url: url.toString(),
-    driver: { driver: driverKind },
+    driverOptions: { driver: driverKind },
     tables: { users, posts },
     relations: { users: usersRelations, posts: postsRelations },
   });
@@ -178,7 +178,7 @@ for (const driverKind of ["postgres", "pg"] as const) {
       const events: Array<{ sql: string }> = [];
       const db = await createDatabase({
         url: url.toString(),
-        driver: { driver: driverKind },
+        driverOptions: { driver: driverKind },
         tables: { users, posts },
         relations: { users: usersRelations, posts: postsRelations },
         logger: (e) => events.push({ sql: e.sql }),

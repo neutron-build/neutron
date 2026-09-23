@@ -87,7 +87,7 @@ const postsRelations = relations(posts, ({ one }) => ({
 // Snapshot tests never execute; postgres.js connects lazily so the URL is inert.
 const db = await createDatabase({
   url: "postgres://snapshot:nouser@127.0.0.1:1/none",
-  driver: { driver: "postgres" },
+  driverOptions: { driver: "postgres" },
   tables: { users, posts },
   relations: { users: usersRelations, posts: postsRelations },
 });
@@ -578,7 +578,7 @@ test("relational: PK-less many() targets never fall back to a column for orderin
     () =>
       createDatabase({
         url: "postgres://snapshot:nouser@127.0.0.1:1/none",
-        driver: { driver: "postgres" },
+        driverOptions: { driver: "postgres" },
         relations: {
           owners: relations(pklessOwners, ({ many }) => ({ items: many(pklessTarget) })),
           items: relations(pklessTarget, ({ one }) => ({
