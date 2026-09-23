@@ -15,6 +15,7 @@ import {
   type SeoMetaInput,
 } from "./seo.js";
 import { resolveHeadDocument } from "./head.js";
+import { isResponse } from "./response.js";
 import { withRouterProviders, type CreateElement } from "./router-providers.js";
 import { renderSpeculationRules } from "./speculation-rules.js";
 import { resolvePreactSsr, importPreactSsr } from "./preact-ssr.js";
@@ -156,9 +157,9 @@ export async function renderStatic(options: StaticRenderOptions): Promise<void> 
           let response: Response | undefined;
           try {
             const result = await module.loader({ request, params: {}, context: {} } as LoaderArgs);
-            if (result instanceof Response) response = result;
+            if (isResponse(result)) response = result;
           } catch (error) {
-            if (error instanceof Response) response = error;
+            if (isResponse(error)) response = error;
             else throw error;
           }
 

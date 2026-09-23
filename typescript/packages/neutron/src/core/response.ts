@@ -229,7 +229,25 @@ function notFoundDocument(message: string): string {
 </html>`;
 }
 
+/**
+ * True for any Fetch `Response`, whichever `Response` constructor made it.
+ *
+ * `instanceof Response` is not enough on Node: `@hono/node-server` replaces
+ * `globalThis.Response` with a lightweight class whose prototype chains to the
+ * native one. `new Response()` then passes `instanceof`, but the inherited
+ * static factories (`Response.json()`, `Response.redirect()`,
+ * `Response.error()`) still return NATIVE instances, which fail `instanceof`
+ * against the replacement — so a returned `Response.json(...)` was treated as
+ * plain data. The `Symbol.toStringTag` brand is shared by both.
+ */
 export function isResponse(value: unknown): value is Response {
-  return value instanceof Response;
+  if (typeof Response !== "undefined" && value instanceof Response) return true;
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Response;
+  return (
+    Object.prototype.toString.call(value) === "[object Response]" &&
+    typeof candidate.status === "number" &&
+    typeof candidate.headers?.get === "function"
+  );
 }
 

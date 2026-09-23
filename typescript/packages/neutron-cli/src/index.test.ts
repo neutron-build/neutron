@@ -1249,3 +1249,235 @@ describe("loadNeutronConfig (shared command loader)", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Port/host resolution (FRAMEWORK_CONTRACT.md §6): flag > env > config > default
+// ---------------------------------------------------------------------------
+
+import { resolveListenAddress } from "./lib/listen.js";
+
+describe("resolveListenAddress", () => {
+  const base = { argv: [] as string[], env: {} as Record<string, string | undefined> };
+
+  it("defaults to 3000 and the caller's default host", () => {
+    assert.deepEqual(resolveListenAddress({ ...base, defaultHost: "0.0.0.0" }), {
+      port: 3000,
+      host: "0.0.0.0",
+      portExplicit: false,
+    });
+    assert.equal(resolveListenAddress(base).host, undefined);
+  });
+
+  it("config beats the default", () => {
+    const r = resolveListenAddress({ ...base, config: { port: 4321, host: "10.0.0.5" }, defaultHost: "0.0.0.0" });
+    assert.deepEqual(r, { port: 4321, host: "10.0.0.5", portExplicit: true });
+  });
+
+  it("NEUTRON_PORT / NEUTRON_HOST beat config", () => {
+    const r = resolveListenAddress({
+      ...base,
+      env: { NEUTRON_PORT: "5555", NEUTRON_HOST: "127.0.0.1" },
+      config: { port: 4321, host: "10.0.0.5" },
+    });
+    assert.deepEqual(r, { port: 5555, host: "127.0.0.1", portExplicit: true });
+  });
+
+  it("flags beat the environment (both flag spellings)", () => {
+    const env = { NEUTRON_PORT: "5555", NEUTRON_HOST: "127.0.0.1" };
+    assert.deepEqual(
+      resolveListenAddress({ ...base, argv: ["--port", "6000", "--host", "::1"], env }),
+      { port: 6000, host: "::1", portExplicit: true }
+    );
+    assert.deepEqual(
+      resolveListenAddress({ ...base, argv: ["--port=6001", "--host=localhost"], env }),
+      { port: 6001, host: "localhost", portExplicit: true }
+    );
+  });
+
+  it("empty env vars count as unset", () => {
+    const r = resolveListenAddress({ ...base, env: { NEUTRON_PORT: "", NEUTRON_HOST: " " }, config: { port: 4321 } });
+    assert.equal(r.port, 4321);
+    assert.equal(r.host, undefined);
+  });
+
+  for (const bad of ["abc", "0", "65536", "80a", "-1", "3.5", "1e3"]) {
+    it(`rejects NEUTRON_PORT=${JSON.stringify(bad)} instead of falling back`, () => {
+      assert.throws(
+        () => resolveListenAddress({ ...base, env: { NEUTRON_PORT: bad }, config: { port: 4321 } }),
+        (error: Error) => error.message.includes(`Invalid NEUTRON_PORT "${bad}"`) && error.message.includes("1 and 65535")
+      );
+    });
+  }
+
+  it("rejects an invalid --port the same way", () => {
+    assert.throws(() => resolveListenAddress({ ...base, argv: ["--port", "nope"] }), /Invalid --port "nope"/);
+  });
+
+  it("accepts the range edges", () => {
+    assert.equal(resolveListenAddress({ ...base, env: { NEUTRON_PORT: "1" } }).port, 1);
+    assert.equal(resolveListenAddress({ ...base, env: { NEUTRON_PORT: "65535" } }).port, 65535);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `neutron-ts dev` / `start` as real processes: §6 env binding, §7 /health in
+// dev, §8 graceful drain on SIGTERM in dev.
+// ---------------------------------------------------------------------------
+
+import { spawn, type ChildProcess } from "node:child_process";
+import * as net from "node:net";
+import { fileURLToPath } from "node:url";
+
+const CLI_PACKAGE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const CLI_BIN = path.join(CLI_PACKAGE_DIR, "bin", "neutron-ts.mjs");
+
+const SLOW_ROUTE = `
+import { h } from "preact";
+export const config = { mode: "app" };
+export async function loader() {
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+  return { done: true };
+}
+export default function Page({ data }) {
+  return h("div", null, "slow-done=" + String(data.done));
+}
+`;
+
+function makeCliFixture(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "neutron-cli-proc-"));
+  fs.mkdirSync(path.join(dir, "src", "routes"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "src", "routes", "slow.tsx"), SLOW_ROUTE);
+  // Resolve preact / @neutron-build/core through the CLI package's own deps.
+  fs.symlinkSync(path.join(CLI_PACKAGE_DIR, "node_modules"), path.join(dir, "node_modules"), "dir");
+  return dir;
+}
+
+async function freePort(): Promise<number> {
+  return await new Promise((resolve, reject) => {
+    const socket = net.createServer();
+    socket.listen(0, "127.0.0.1", () => {
+      const address = socket.address();
+      if (!address || typeof address === "string") return reject(new Error("no port"));
+      const { port } = address;
+      socket.close(() => resolve(port));
+    });
+    socket.on("error", reject);
+  });
+}
+
+interface CliProcess {
+  child: ChildProcess;
+  output: () => string;
+  exited: Promise<number | null>;
+}
+
+function runCli(command: string, cwd: string, env: Record<string, string>, args: string[] = []): CliProcess {
+  const child = spawn(process.execPath, [CLI_BIN, command, ...args], {
+    cwd,
+    env: { ...process.env, ...env },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let output = "";
+  child.stdout!.on("data", (chunk) => (output += chunk));
+  child.stderr!.on("data", (chunk) => (output += chunk));
+  const exited = new Promise<number | null>((resolve) => child.on("exit", (code) => resolve(code)));
+  return { child, output: () => output, exited };
+}
+
+async function waitForHealth(url: string, proc: CliProcess, timeoutMs = 30_000): Promise<Response> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (proc.child.exitCode !== null) {
+      throw new Error(`process exited early (${proc.child.exitCode}):\n${proc.output()}`);
+    }
+    try {
+      return await fetch(url);
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+  }
+  throw new Error(`timed out waiting for ${url}:\n${proc.output()}`);
+}
+
+describe("neutron-ts dev (process)", () => {
+  it("binds NEUTRON_PORT, serves /health, and drains an in-flight request on SIGTERM", { timeout: 90_000 }, async () => {
+    const dir = makeCliFixture();
+    const port = await freePort();
+    const proc = runCli("dev", dir, { NEUTRON_PORT: String(port), NEUTRON_HOST: "127.0.0.1" });
+    try {
+      const health = await waitForHealth(`http://127.0.0.1:${port}/health`, proc);
+      assert.equal(health.status, 200);
+      assert.deepEqual(await health.json(), { status: "ok", nucleus: "unconfigured", version: "0.1.0" });
+
+      // Warm the route once so the timed request measures the loader, not Vite's first compile.
+      await (await fetch(`http://127.0.0.1:${port}/slow`)).text();
+
+      const inFlight = fetch(`http://127.0.0.1:${port}/slow`).then(async (res) => ({
+        status: res.status,
+        body: await res.text(),
+      }));
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      proc.child.kill("SIGTERM");
+
+      const result = await inFlight;
+      assert.equal(result.status, 200);
+      assert.match(result.body, /slow-done=true/);
+      assert.equal(await proc.exited, 0, proc.output());
+    } finally {
+      proc.child.kill("SIGKILL");
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails fast with a clear error on an invalid NEUTRON_PORT", { timeout: 60_000 }, async () => {
+    const dir = makeCliFixture();
+    const proc = runCli("dev", dir, { NEUTRON_PORT: "not-a-port" });
+    try {
+      assert.equal(await proc.exited, 1);
+      assert.match(proc.output(), /neutron-ts dev: Invalid NEUTRON_PORT "not-a-port"/);
+    } finally {
+      proc.child.kill("SIGKILL");
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("neutron-ts start (process)", () => {
+  it("binds NEUTRON_PORT, and --port overrides it", { timeout: 90_000 }, async () => {
+    const dir = makeCliFixture();
+    const envPort = await freePort();
+    const flagPort = await freePort();
+    const fromEnv = runCli("start", dir, { NEUTRON_PORT: String(envPort), NEUTRON_HOST: "127.0.0.1" });
+    const fromFlag = runCli("start", dir, { NEUTRON_PORT: String(envPort), NEUTRON_HOST: "127.0.0.1" }, [
+      "--port",
+      String(flagPort),
+    ]);
+    try {
+      const envHealth = await waitForHealth(`http://127.0.0.1:${envPort}/health`, fromEnv);
+      assert.equal(envHealth.status, 200);
+      const flagHealth = await waitForHealth(`http://127.0.0.1:${flagPort}/health`, fromFlag);
+      assert.equal(flagHealth.status, 200);
+
+      fromEnv.child.kill("SIGTERM");
+      fromFlag.child.kill("SIGTERM");
+      assert.equal(await fromEnv.exited, 0, fromEnv.output());
+      assert.equal(await fromFlag.exited, 0, fromFlag.output());
+    } finally {
+      fromEnv.child.kill("SIGKILL");
+      fromFlag.child.kill("SIGKILL");
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails fast with a clear error on an out-of-range NEUTRON_PORT", { timeout: 60_000 }, async () => {
+    const dir = makeCliFixture();
+    const proc = runCli("start", dir, { NEUTRON_PORT: "70000" });
+    try {
+      assert.equal(await proc.exited, 1);
+      assert.match(proc.output(), /neutron-ts start: Invalid NEUTRON_PORT "70000"/);
+    } finally {
+      proc.child.kill("SIGKILL");
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
