@@ -3,6 +3,8 @@
 // ---------------------------------------------------------------------------
 
 import { loadDriver, type Driver, type LoadDriverOptions } from "./drivers.js";
+import { capabilityGate, type CapabilityEvidence, type EngineIdentity } from "./engine.js";
+import type { StatementCapability } from "./codecs.js";
 import { resolveLogger, type LoggerOption } from "./logger.js";
 import {
   DeleteBuilder,
@@ -43,14 +45,22 @@ export interface DatabaseOptions<
   T extends TablesInput = TablesInput,
   R extends RelationsInput = RelationsInput,
 > {
-  /** Postgres or Nucleus (pgwire) connection URL. */
-  url: string;
+  /** Postgres or Nucleus (pgwire) connection URL. The package creates the
+   *  adapter and OWNS it: `close()` terminates it. Provide either `url` or
+   *  `driver`, not both. */
+  url?: string;
+  /** Injected adapter (from `wrapPgPool` / `wrapPostgresJs` / `loadDriver`).
+   *  Its lifecycle governs disposal: wrapped pools/clients are BORROWED by
+   *  default, so `close()` leaves the resource you injected functional. */
+  driver?: Driver;
+  /** Driver kind and pool tuning when `url` is used (renamed from the
+   *  pre-I01 `driver` option, which now injects an adapter). */
+  driverOptions?: LoadDriverOptions;
   /** Tables; enables db.query.<name>. */
   tables?: T;
   /** Relations keyed by the same names as `tables`. */
   relations?: R;
   logger?: LoggerOption;
-  driver?: LoadDriverOptions;
 }
 
 /** Row shape of a relation child as it arrives through the JSON path.
@@ -141,7 +151,16 @@ export interface NeutronDatabase<
   R extends RelationsInput = RelationsInput,
 > {
   driver: Driver;
+  /** Close per the driver's ownership: owned adapters terminate exactly
+   *  once (idempotent); borrowed adapters are never closed — their owner
+   *  stays functional. */
   close(): Promise<void>;
+  /** Engine identity of the connected server (memoized SELECT VERSION();
+   *  FRAMEWORK_CONTRACT.md §1 — product is tri-state, see engine.ts). */
+  engine(): Promise<EngineIdentity>;
+  /** Tri-state capability status with evidence (supported / unsupported /
+   *  unknown; unknown fails closed for statements that require it). */
+  capability(name: StatementCapability): Promise<CapabilityEvidence>;
   select(): SelectFrom;
   select<P extends Projection>(projection: P): SelectProjectedFrom<P>;
   insert<TCols extends Record<string, AnyColumnBuilder>>(table: PgTable<TCols>): InsertBuilder<TCols, number>;
@@ -159,8 +178,12 @@ export async function createDatabase<
   T extends TablesInput = TablesInput,
   R extends RelationsInput = RelationsInput,
 >(options: DatabaseOptions<T, R>): Promise<NeutronDatabase<T, R>> {
-  const driver = await loadDriver(options.url, options.driver);
+  if ((options.url === undefined) === (options.driver === undefined)) {
+    throw new Error("createDatabase requires exactly one of `url` or `driver` (inject an adapter wrapped via wrapPgPool/wrapPostgresJs)");
+  }
+  const driver = options.driver ?? (await loadDriver(options.url!, options.driverOptions));
   const logger = resolveLogger(options.logger);
+  const capabilities = capabilityGate(driver);
 
   const tables = new Map<string, { key: string; table: AnyPgTable }>();
   for (const [key, value] of Object.entries(options.tables ?? {})) {
@@ -179,7 +202,7 @@ export async function createDatabase<
   for (const r of relationSets) relationsByTable.set(getTableName(r.table), r.entries);
   void resolved;
 
-  const ctx: ExecContext = { driver, logger };
+  const ctx: ExecContext = { driver, logger, capabilities };
 
   const makeCrud = (context: ExecContext): Crud => ({
     select: ((projection?: Projection) => ({
@@ -208,10 +231,12 @@ export async function createDatabase<
   const db = {
     driver,
     close: (): Promise<void> => driver.close(),
+    engine: (): Promise<EngineIdentity> => capabilities.engine(),
+    capability: (name: StatementCapability): Promise<CapabilityEvidence> => capabilities.status(name),
     ...crud,
     transaction: async <Tx>(fn: (tx: TxScope) => Promise<Tx>): Promise<Tx> => {
       return driver.begin(async (txDriver) => {
-        const txCtx: ExecContext = { driver: txDriver, logger };
+        const txCtx: ExecContext = { driver: txDriver, logger, capabilities };
         return fn({ ...makeCrud(txCtx), query: makeQuery(txCtx) } as TxScope);
       });
     },

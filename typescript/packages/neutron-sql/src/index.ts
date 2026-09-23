@@ -196,7 +196,51 @@ export {
   type RelationChildModelOf,
 } from "./db.js";
 
-export { loadDriver, type Driver, type DriverKind, type LoadDriverOptions } from "./drivers.js";
+export {
+  loadDriver,
+  wrapPgPool,
+  wrapPostgresJs,
+  makeLifecycle,
+  type Driver,
+  type DriverKind,
+  type LoadDriverOptions,
+  type AdapterOwnership,
+  type DriverLifecycle,
+  type WrapAdapterOptions,
+  type PgPoolLike,
+  type PgPoolClientLike,
+  type PostgresJsClient,
+} from "./drivers.js";
+
+// I01: stable driver error taxonomy. SQLSTATE survives every wrapper
+// (ServerSqlError.sqlstate / getSqlState); connection failures and missing
+// driver packages are distinct classes, never conflated.
+export {
+  NeutronSqlError,
+  MissingDriverError,
+  ConnectionFailedError,
+  ServerSqlError,
+  classifyDriverError,
+  getSqlState,
+  isConnectionError,
+  isMissingDriverError,
+} from "./errors.js";
+
+// I01: engine identity (FRAMEWORK_CONTRACT.md §1) and the tri-state
+// capability contract — supported / unsupported / unknown, and unknown fails
+// closed. Plain Postgres gains no model dependency: detection is one
+// `select version()` through whichever driver you brought.
+export {
+  parseVersionString,
+  resolveCapabilityStatus,
+  capabilityGate,
+  CapabilityRequirementError,
+  type EngineProduct,
+  type EngineIdentity,
+  type CapabilityStatus,
+  type CapabilityEvidence,
+  type CapabilityGate,
+} from "./engine.js";
 
 export { resolveLogger, type Logger, type LoggerOption, type LogEvent } from "./logger.js";
 

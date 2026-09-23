@@ -371,7 +371,7 @@ export async function findMany(
   args: RQBArgs,
 ): Promise<Array<Record<string, unknown>>> {
   const built = buildRelationalSQL(table, relations, args);
-  const rows = (await run(ctx, built.sql, built.params, "query")) as Array<Record<string, unknown>>;
+  const rows = (await run(ctx, built.sql, built.params, "query", built.capabilities)) as Array<Record<string, unknown>>;
   // Parent columns decode through the compiled statement's decode plan,
   // exactly like the flat select path.
   applyProjectionDecoders(rows, built.decoders);

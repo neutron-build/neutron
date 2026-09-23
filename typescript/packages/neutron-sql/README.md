@@ -132,9 +132,50 @@ silently mishandled.
 
 `postgres` (postgres.js) and `pg` (node-postgres) are both supported and
 live-tested; with no explicit choice, `postgres` is tried first and `pg` is
-the fallback. Nucleus speaks the same wire protocol, but this package has no
-test coverage against it — treat any non-Postgres engine as unsupported until
-a conformance leg exists.
+the fallback **only when the postgres.js module is genuinely not installed**
+— a loaded driver's connection or URL failure propagates instead of silently
+switching libraries under you. Nucleus speaks the same wire protocol, but
+this package has no test coverage against it — treat any non-Postgres engine
+as unsupported until a conformance leg exists.
+
+Driver choice and pool tuning: `createDatabase({ url, driverOptions: { driver: "pg", max: 10 } })`
+(`driverOptions` replaces the pre-0.1 `driver` option, which now injects an
+adapter — see below).
+
+### Injected adapters and ownership
+
+Pass an adapter you created instead of a URL: wrap an existing `pg` pool or
+postgres.js client with `wrapPgPool(pool)` / `wrapPostgresJs(client)`. Wrapped
+resources are **borrowed by default** — `db.close()` (and the driver's
+`close()`) never ends them; the pool/client you injected stays yours and
+functional. Pass `{ ownership: "owned" }` to transfer disposal instead.
+Adapters this package creates from `url` are owned: `close()` terminates
+them exactly once, and repeated or concurrent `close()` calls are idempotent
+(no double-`end`). Every driver exposes `driver.lifecycle`
+(`{ ownership, terminated, terminate() }`) so callers can inspect and drive
+the lifecycle explicitly. Custom adapters passed via `driver:` must expose the
+same `lifecycle` and `close()` — wrap an existing pool/client with
+`wrapPgPool`/`wrapPostgresJs` to get a conforming adapter.
+
+### Errors and capabilities
+
+Driver errors surface as a stable taxonomy instead of message matching:
+`MissingDriverError` (the npm package is absent), `ConnectionFailedError`
+(transport: refused/timeout/socket died/pool ended — with `code`, `address`,
+`port` when present), and `ServerSqlError` (the server answered with an SQL
+error; `sqlstate` retained verbatim, plus `severity`/`detail`/`hint`/`position`,
+original driver error as `cause`). `getSqlState(err)` walks wrapper chains.
+
+`db.engine()` returns the connected engine's identity (one `SELECT VERSION()`,
+memoized; Nucleus detection per the framework contract — an unrecognized
+server is `unknown`, never assumed Postgres). `db.capability(name)` resolves
+capability status as `supported` / `unsupported` / `unknown` with the evidence
+that produced it: documented PostgreSQL version facts, or a side-effect-free
+probe on engines without them. Compiled statements carry their capability
+requirements; an `unknown` requirement fails closed with
+`CapabilityRequirementError` before any SQL runs — unknown is never
+all-enabled. Detection runs through whichever driver you brought; a plain
+Postgres connection gains no Nucleus/model dependency.
 
 ## Nucleus-only column types
 

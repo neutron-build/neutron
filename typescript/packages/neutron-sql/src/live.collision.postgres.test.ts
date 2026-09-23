@@ -74,7 +74,7 @@ async function withSuite(driverKind: "postgres" | "pg", fn: (db: TestDb) => Prom
   url.pathname = `/${DB_NAME}`;
   const db = (await createDatabase({
     url: url.toString(),
-    driver: { driver: driverKind },
+    driverOptions: { driver: driverKind },
     tables: { metaNames, metaChildren },
     relations: { metaNames: metaNamesRelations, metaChildren: metaChildrenRelations },
   })) as unknown as TestDb;
