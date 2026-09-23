@@ -92,6 +92,10 @@ func initConfig() {
 	viper.SetDefault("nucleus.version", "latest")
 	viper.SetDefault("nucleus.port", 5432)
 	viper.SetDefault("nucleus.data_dir", "nucleus_data")
+	viper.SetDefault("migrations.dir", "migrations")
+	viper.SetDefault("migrations.snapshots", false)
+	viper.SetDefault("migrations.schema", "neutron.schema.json")
+	viper.SetDefault("migrations.module", "export-schema.mjs")
 
 	if err := viper.ReadInConfig(); err != nil {
 		// Config file not found is fine
