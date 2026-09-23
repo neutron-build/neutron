@@ -13,6 +13,7 @@ import { createHash } from "node:crypto";
 import { hostname } from "node:os";
 
 import type { Transport } from './types.js';
+import { sqlState } from './retry.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -121,11 +122,28 @@ CREATE TABLE IF NOT EXISTS _neutron_migration_lock (
 const MIGRATION_LOCK_ADD_OWNER = `
 ALTER TABLE _neutron_migration_lock ADD COLUMN IF NOT EXISTS owner TEXT`;
 
+/** Bootstrap DDL is written IF NOT EXISTS, but two cold runners racing the
+ * same statement can both decide to create: Postgres breaks the tie with a
+ * unique violation on the catalog row (pg_type_typname_nsp_index, SQLSTATE
+ * 23505) and the loser's statement fails despite IF NOT EXISTS. Retry with
+ * backoff — the winner's create commits and the re-run is a no-op. */
+async function executeBootstrapDdl(transport: Transport, sql: string): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await transport.execute(sql);
+      return;
+    } catch (err) {
+      if (attempt >= 5 || sqlState(err) !== '23505') throw err;
+      await sleep(25 * (attempt + 1));
+    }
+  }
+}
+
 async function ensureTable(transport: Transport): Promise<void> {
-  await transport.execute(MIGRATIONS_TABLE_SQL);
-  await transport.execute(MIGRATIONS_ADD_CHECKSUM);
-  await transport.execute(MIGRATIONS_ADD_OWNER);
-  await transport.execute(MIGRATIONS_ADD_FORMAT);
+  await executeBootstrapDdl(transport, MIGRATIONS_TABLE_SQL);
+  await executeBootstrapDdl(transport, MIGRATIONS_ADD_CHECKSUM);
+  await executeBootstrapDdl(transport, MIGRATIONS_ADD_OWNER);
+  await executeBootstrapDdl(transport, MIGRATIONS_ADD_FORMAT);
 }
 
 interface AppliedRow {
@@ -235,8 +253,8 @@ async function acquireMigrationLock(
   transport: Transport,
   options?: MigrateOptions,
 ): Promise<string> {
-  await transport.execute(MIGRATION_LOCK_TABLE_SQL);
-  await transport.execute(MIGRATION_LOCK_ADD_OWNER);
+  await executeBootstrapDdl(transport, MIGRATION_LOCK_TABLE_SQL);
+  await executeBootstrapDdl(transport, MIGRATION_LOCK_ADD_OWNER);
 
   // The claim table is shared with the Go SDK, whose schema predates this
   // module: token is BIGINT. A 15-hex-digit slice (60 bits, always positive

@@ -143,13 +143,19 @@ describe("Integration: migration protocol v2 (live engine)", { skip: !live() && 
 
   it("serializes two runners (separate pools) with exactly-once effects", async () => {
     await reset(t);
-    const t2 = new PgTransport(url);
+    // Four runners, not two: the bootstrap DDL (CREATE TABLE IF NOT EXISTS)
+    // races in Postgres's catalog when the tables were just dropped — the
+    // loser historically took a pg_type unique violation (23505) — and the
+    // wider the field, the harder that race is pinned.
+    const extra = [new PgTransport(url), new PgTransport(url), new PgTransport(url)];
 
     const results = await Promise.allSettled([
       migrate(t, plan),
-      migrate(t2, plan),
+      ...extra.map((tx) => migrate(tx, plan)),
     ]);
-    await t2.close().catch(() => {});
+    for (const tx of extra) {
+      await tx.close().catch(() => {});
+    }
     for (const r of results) {
       assert.equal(r.status, "fulfilled");
     }
