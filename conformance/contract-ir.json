@@ -88,6 +88,30 @@
     }
   },
 
+  "config": {
+    "$section": "6",
+    "$note": "What the config.env dimension asserts. The app is booted with ONLY {prefix}_HOST and {prefix}_PORT addressing it; every variable in adapterVars is removed from the environment first, including one inherited from the caller's shell. Until 2026-09-23 each adapter pinned its port with a variable of its own (PORT for Go, Python, TS and Elixir), so Go and TypeScript ignoring NEUTRON_PORT was invisible to the suite.",
+    "prefix": "NEUTRON",
+    "exercised": ["HOST", "PORT"],
+    "probeHost": "127.0.0.1",
+    "adapterVars": ["PORT", "HOST"]
+  },
+
+  "shutdown": {
+    "$section": "8",
+    "$note": "What the shutdown.sigterm dimension asserts. Every conformance app serves slowPath, which answers 200 after slowMs. The runner starts that request, sends probeSignal to the server process signalAfterMs later, opens a new connection probeAfterSignalMs after the signal, then requires: the in-flight request completes 200; the new connection is refused (or never served) or answered with one of newConnectionStatuses; the process exits with exitStatus within slowMs + exitMarginMs of the signal. Python drained but never exited until 2026-09-23 and the suite could not see it: its teardown SIGKILLed whatever was left without looking.",
+    "signals": ["SIGTERM", "SIGINT"],
+    "probeSignal": "SIGTERM",
+    "defaultDrainSeconds": 30,
+    "exitStatus": 0,
+    "newConnectionStatuses": [503],
+    "slowPath": "/slow",
+    "slowMs": 1500,
+    "signalAfterMs": 400,
+    "probeAfterSignalMs": 250,
+    "exitMarginMs": 5000
+  },
+
   "dimensions": [
     { "id": "health.shape", "section": "7", "asserts": "GET /health returns exactly {status, nucleus, version}" },
     { "id": "health.types", "section": "7", "asserts": "status/version are strings; nucleus is one of the tri-state values" },
@@ -100,6 +124,8 @@
     { "id": "openapi.31", "section": "4", "asserts": "that document declares OpenAPI 3.1" },
     { "id": "mw.requestid", "section": "5", "asserts": "responses carry x-request-id" },
     { "id": "mw.cors", "section": "5", "asserts": "preflight and Access-Control-Allow-Origin" },
-    { "id": "mw.compression", "section": "5", "asserts": "content-encoding negotiated, with Vary: Accept-Encoding" }
+    { "id": "mw.compression", "section": "5", "asserts": "content-encoding negotiated, with Vary: Accept-Encoding" },
+    { "id": "config.env", "section": "6", "kind": "lifecycle", "asserts": "booted with only NEUTRON_HOST/NEUTRON_PORT (no adapter-specific variable), the app answers GET /health on that port" },
+    { "id": "shutdown.sigterm", "section": "8", "kind": "lifecycle", "asserts": "SIGTERM mid-request: the in-flight request completes 200, a new connection is refused or answered 503, and the process exits 0 within the drain plus a margin" }
   ]
 }

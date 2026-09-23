@@ -2,24 +2,30 @@
 
 The TypeScript SDK (`typescript/packages/neutron`, published as `@neutron-build/core`)
 is a **web/SSR meta-framework** (file-based routing, Preact SSR, islands) built on
-Hono. Since S81 it implements all twelve conformance dimensions, including the
+Hono. Since S81 it implements all the HTTP conformance dimensions, including the
 API surfaces: RFC 7807 errors (§2), typed validation (§2), and OpenAPI 3.1
-(§4). The adapter is 12/12 with zero skips.
+(§4), and it passes the lifecycle dimensions (§6 env, §8 SIGTERM) through
+`neutron-ts start`. The adapter is 14/14 with zero skips.
 
-`conformance_app.mjs` boots the server headless (no DB) by importing the built
-`dist/server/index.js` directly. Route files (`routes/`) import the SDK through
-the `@neutron-build/core` alias set in `vite.config.mts` — the same import a
-real app uses; the adapter directory sits outside the pnpm workspace, so the
-alias points at the built dist inside it. The runner wires the app in as the
-`ts` SDK (`runner/sdks.mjs`); it is auto-skipped (`UNAVAILABLE`) when the
-package has not been built.
+The app boots headless (no DB) through the SDK's own production entry point,
+`neutron-ts start`, run from this directory with `neutron.config.mjs` supplying
+the server options. That is deliberate: listen-address resolution
+(`NEUTRON_HOST`/`NEUTRON_PORT`, contract §6) and the SIGTERM drain + exit (§8)
+live in that command, so an adapter script calling `createServer({ port })`
+with its own `PORT` — which is what this used to be — could not see either one
+break. Route files (`routes/`) import the SDK through the `@neutron-build/core`
+alias set in `vite.config.mts` — the same import a real app uses; the adapter
+directory sits outside the pnpm workspace, so the alias points at the built
+dist inside it. The runner wires the app in as the `ts` SDK
+(`runner/sdks.mjs`); it is reported absent when `@neutron-build/core` or
+`@neutron-build/cli` has not been built.
 
 ## Boot it
 
 ```bash
-# 1. Build the package once (offline tsc build; no network needed if deps installed)
+# 1. Build the packages once (offline tsc build; no network needed if deps installed)
 cd typescript
-pnpm --filter @neutron-build/core build
+pnpm --filter @neutron-build/core --filter @neutron-build/cli build
 
 # 2. Run the full matrix (the runner builds/boots every available SDK)
 cd ../conformance && node runner/run.mjs
@@ -28,7 +34,7 @@ cd ../conformance && node runner/run.mjs
 node runner/run.mjs ts
 
 # …or boot the adapter standalone and point the runner at it:
-PORT=8084 node adapters/typescript/conformance_app.mjs
+(cd adapters/typescript && NEUTRON_PORT=8084 node ../../../typescript/packages/neutron-cli/bin/neutron-ts.mjs start)
 node runner/run.mjs --base=http://127.0.0.1:8084
 ```
 
@@ -45,6 +51,8 @@ node runner/run.mjs --base=http://127.0.0.1:8084
 | `error.*` (×3)       | pass   | `routes/errors/[code].tsx` throws the SDK taxonomy constructors; the render pipeline serves `ProblemError` as `application/problem+json` |
 | `validation.format`  | pass   | `routes/api/items.tsx` action validates with `validateJsonBody` (zod) → 422 problem+json with `errors[]` |
 | `openapi.present/.31`| pass   | `openapi` server option → `/openapi.json` (3.1.0, generated from the route tree) + `/docs` |
+| `config.env`         | pass   | booted with only `NEUTRON_HOST`/`NEUTRON_PORT`; `neutron-ts start` resolves them (flag > env > config > default) |
+| `shutdown.sigterm`   | pass   | SIGTERM mid-`/slow`: the request completes 200, new connections are refused, the process exits 0 |
 
 The §2/§4 dimensions are exercised through SDK features (`core/problem.ts`,
 `server/openapi.ts`), not hand-built responses in the adapter — before S81 the

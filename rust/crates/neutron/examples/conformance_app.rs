@@ -9,6 +9,7 @@
 //!   GET  /api/items                    200 list (compression / request-id probe)
 //!   POST /api/items                    422 validation error (RFC 7807 + errors[])
 //!   GET  /errors/{bad-request,…}       forced standard §2 errors
+//!   GET  /slow                         200 after 1.5s (in-flight request for the §8 drain probe)
 //!
 //! Listen address comes from NEUTRON_HOST/NEUTRON_PORT (Config::from_env, contract
 //! §6), so the runner pins an ephemeral port. Middleware follows the contract order.
@@ -52,6 +53,17 @@ async fn list_items() -> Json<Vec<Item>> {
         })
         .collect();
     Json(items)
+}
+
+#[derive(Serialize)]
+struct Done {
+    ok: bool,
+}
+
+// §8 drain probe: a request that is still in flight when SIGTERM arrives.
+async fn slow() -> Json<Done> {
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    Json(Done { ok: true })
 }
 
 // Typed validation: a bad body returns the SDK's validation error response.
@@ -104,6 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .get("/openapi.json", spec.json_handler())
         .get("/api/items", list_items)
         .post("/api/items", create_item)
+        .get("/slow", slow)
         .get("/errors/bad-request", || async {
             AppError::bad_request("forced bad request")
         })
