@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import MagicString from "magic-string";
 import type { Plugin, ViteDevServer } from "vite";
 import { escapeHtml } from "../core/escape.js";
@@ -8,6 +9,7 @@ import { discoverRoutes } from "../core/manifest.js";
 import { prepareRouteTypes } from "../core/route-typegen.js";
 import { createRouter } from "../core/router.js";
 import { runMiddlewareChain } from "../core/middleware.js";
+import { isResponse } from "../core/response.js";
 import {
   compileRouteRules,
   resolveRouteRuleHeaders,
@@ -34,6 +36,7 @@ import type { SeoMetaInput } from "../core/seo.js";
 import type { NeutronRoutesConfig } from "../config.js";
 import type { Route, RouteModule, AppContext, LoaderArgs, ActionArgs, HeadArgs, MiddlewareFn, ErrorBoundaryProps } from "../core/types.js";
 import { handleImageRequest } from "../server/image-optimizer.js";
+import { appDefinesHealthRoute, healthBody } from "../server/health.js";
 import { checkAccessibility } from "./a11y-checker.js";
 import { parseError } from "./error-parser.js";
 
@@ -42,6 +45,8 @@ export interface NeutronPluginOptions {
   rootDir?: string;
   writeRouteTypes?: boolean;
   routeRules?: NeutronRoutesConfig;
+  /** Version the dev server's GET /health reports (`server.version` in neutron.config). */
+  version?: string;
 }
 
 const ROUTES_DIR_DEFAULT = "src/routes";
@@ -308,6 +313,28 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
             return next();
           }
 
+          // GET /health (FRAMEWORK_CONTRACT.md §7): same body and override rule
+          // as the production server, so probes behave identically in dev.
+          if (
+            originalPathname === "/health" &&
+            (req.method === "GET" || req.method === "HEAD") &&
+            !appDefinesHealthRoute(state.routes)
+          ) {
+            const body = JSON.stringify(healthBody(options.version));
+            const inboundRequestId = req.headers["x-request-id"];
+            res.statusCode = 200;
+            res.setHeader("Content-Type", "application/json");
+            res.setHeader("Content-Length", Buffer.byteLength(body));
+            res.setHeader(
+              "x-request-id",
+              typeof inboundRequestId === "string" && inboundRequestId.length > 0
+                ? inboundRequestId
+                : randomUUID()
+            );
+            res.end(req.method === "HEAD" ? undefined : body);
+            return;
+          }
+
           // Static-asset bypass: only short-circuit if the LAST path segment
           // looks like a real file extension (a single trailing `.ext` with
           // alphanumeric characters). This preserves bypasses for things like
@@ -504,7 +531,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
           // (the denial path of requireOrganization()/requirePermissions()).
           // Production finalizes it as-is (server/index.ts catch-all); dev
           // must answer with the same status and body, not 500 via next(err).
-          if (err instanceof Response) {
+          if (isResponse(err)) {
             res.statusCode = err.status;
             err.headers.forEach((value, key) => {
               res.setHeader(key, value);
@@ -864,11 +891,11 @@ async function handleRequest(
       const actionArgs: ActionArgs = { request, params, context };
       try {
         actionData = await module.action(actionArgs);
-        if (actionData instanceof Response) {
+        if (isResponse(actionData)) {
           return actionData;
         }
       } catch (error) {
-        if (error instanceof Response) {
+        if (isResponse(error)) {
           return error;
         }
         // Action error - send enriched error to overlay
@@ -914,10 +941,18 @@ async function handleRequest(
 
   const loaderResults = await Promise.all(loaderPromises);
 
+  // A loader may RETURN a Response (redirect, custom status, JSON) — serve it
+  // directly, as production does (render-app-route). Route order decides,
+  // so an earlier loader's error still wins over a later one's Response.
+  for (const result of loaderResults) {
+    if (result.error) break;
+    if (isResponse(result.data)) return result.data;
+  }
+
   // Check for loader errors
   const loaderError = loaderResults.find((r) => r.error);
   if (loaderError?.error) {
-    if (loaderError.error instanceof Response) return loaderError.error;
+    if (isResponse(loaderError.error)) return loaderError.error;
     const loaderErrorPayload = parseError(loaderError.error, 'loader', rootDir, loaderError.routeId, request.url);
     server.ws.send({ type: "custom", event: "neutron:dev-toolbar:error", data: loaderErrorPayload });
     return renderError(server, route, layoutChain, loaderError.error, request, moduleCache, clientEntry);

@@ -4,6 +4,35 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **An action or loader returning `Response.json(...)` was served as 200 `{}`
+  by `neutron-ts start`.** `@hono/node-server` replaces `globalThis.Response`;
+  `Response.json()` still returns a native instance, which failed the
+  framework's `instanceof Response` checks and was treated as data.
+  `isResponse()` now recognizes both, and every loader/action/middleware
+  check uses it. Dev now also serves a Response *returned* from a loader
+  directly, as production always has.
+- **`neutron-ts start` opened a second listener**: Vite's HMR WebSocket on a
+  random port on all interfaces. The production SSR runtime now runs with
+  `hmr: false, ws: false`; only the configured port listens.
+- **`neutron-ts dev` dropped in-flight requests on SIGTERM** (exit 143).
+  Dev now drains like `start` (FRAMEWORK_CONTRACT.md §8): stop accepting,
+  finish in-flight requests (bounded at 30s), close Vite, exit 0. A second
+  SIGTERM/SIGINT exits immediately, in `start` too.
+- **`neutron-ts dev` answered 404 for `GET /health`.** It now serves the same
+  §7 body and yields to an app-defined `/health` route, as `start` does.
+
+### Changed
+
+- **`dev` and `start` read `NEUTRON_PORT` / `NEUTRON_HOST`**
+  (FRAMEWORK_CONTRACT.md §6). Precedence: `--port`/`--host` > env >
+  `neutron.config` `server.port`/`server.host` > default (3000; `start` binds
+  0.0.0.0, `dev` keeps Vite's localhost). An invalid port from a flag or the
+  environment is a startup error. `dev` now also honours `server.port`/`host`
+  from the config, and fails instead of silently moving when an explicitly
+  configured port is taken.
+
 ## [core 0.2.2, cli 0.2.3, create-neutron 0.1.5] - 2026-09-07
 
 ### Fixed

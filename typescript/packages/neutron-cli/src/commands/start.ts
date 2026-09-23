@@ -2,42 +2,37 @@ import { createServer, startServer } from "@neutron-build/core/server";
 import { prepareContentCollections, resolveRuntime } from "@neutron-build/core";
 import { loadEnv } from "vite";
 import { loadNeutronConfig } from "../lib/config.js";
+import { resolveListenAddress, type ListenAddress } from "../lib/listen.js";
 
 export async function start() {
   const cwd = process.cwd();
   applyEnv(cwd, "production");
   const neutronConfig = await loadNeutronConfig(cwd);
+  let address: ListenAddress;
+  try {
+    address = resolveListenAddress({
+      argv: process.argv.slice(3),
+      env: process.env,
+      config: neutronConfig.server,
+      defaultHost: "0.0.0.0",
+    });
+  } catch (error) {
+    console.error(`neutron-ts start: ${(error as Error).message}`);
+    process.exit(1);
+  }
+
   await prepareContentCollections({
     rootDir: cwd,
     writeManifest: false,
     writeTypes: false,
   });
 
-  // Parse CLI args
-  const args = process.argv.slice(3);
-  let port = neutronConfig.server?.port || 3000;
-  let host = neutronConfig.server?.host || "0.0.0.0";
-
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--port" && args[i + 1]) {
-      port = parseInt(args[i + 1], 10);
-      i++;
-    } else if (args[i].startsWith("--port=")) {
-      port = parseInt(args[i].split("=")[1], 10);
-    } else if (args[i] === "--host" && args[i + 1]) {
-      host = args[i + 1];
-      i++;
-    } else if (args[i].startsWith("--host=")) {
-      host = args[i].split("=")[1];
-    }
-  }
-
   await startServer({
     ...neutronConfig.server,
     routes: neutronConfig.routes,
     runtime: resolveRuntime(neutronConfig),
-    port,
-    host,
+    port: address.port,
+    host: address.host,
     rootDir: cwd,
   });
 }
