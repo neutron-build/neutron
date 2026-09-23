@@ -57,7 +57,11 @@ func runDev(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("could not detect project language — are you in a Neutron project directory?\nHint: run 'neutron init' to set up the project")
 	}
 
-	ui.Infof("Detected %s project — starting dev server...", lang.DisplayName())
+	if lang == detect.Julia {
+		ui.Infof("Detected Julia project — running src/main.jl (the Julia SDK is a database client with no HTTP server)")
+	} else {
+		ui.Infof("Detected %s project — starting dev server...", lang.DisplayName())
+	}
 
 	return delegate.RunDevServer(lang, cwd)
 }

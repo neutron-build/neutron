@@ -1,6 +1,7 @@
-name = "{{.Name}}"
-uuid = "00000000-0000-0000-0000-000000000000"
-version = "0.1.0"
-
 [deps]
-Neutron = "0.1"
+{{.SDK.Name}} = "{{.SDK.UUID}}"
+
+# NeutronJulia is not in the General registry; it is the `{{.SDK.Subdir}}/`
+# directory of the Neutron repository. `[sources]` needs Julia 1.11+.
+[sources]
+{{.SDK.Name}} = {url = "{{.SDK.Source}}", subdir = "{{.SDK.Subdir}}"}

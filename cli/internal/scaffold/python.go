@@ -5,6 +5,7 @@ type pythonScaffolder struct{}
 func (s *pythonScaffolder) Files(data *TemplateData) []TemplateFile {
 	return []TemplateFile{
 		{TemplatePath: "templates/python/pyproject.toml.tmpl", OutputPath: "pyproject.toml"},
+		{TemplatePath: "templates/python/README.md.tmpl", OutputPath: "README.md"},
 		{TemplatePath: "templates/python/app/__init__.py.tmpl", OutputPath: "app/__init__.py"},
 		{TemplatePath: "templates/python/app/main.py.tmpl", OutputPath: "app/main.py"},
 		{TemplatePath: "templates/python/dotenv.tmpl", OutputPath: ".env"},

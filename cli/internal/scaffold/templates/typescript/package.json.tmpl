@@ -1,17 +1,24 @@
 {
   "name": "{{.Name}}",
-  "version": "0.1.0",
   "private": true,
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "neutron dev",
-    "build": "neutron build",
-    "start": "neutron start"
+    "dev": "neutron-ts dev",
+    "build": "neutron-ts build",
+    "start": "neutron-ts start",
+    "preview": "neutron-ts preview",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "neutron": "^{{.NeutronVer}}"
+    "{{.SDK.Name}}": "{{.SDK.Version}}",
+    "{{.CLI.Name}}": "{{.CLI.Version}}",
+    "preact": "^10.25.4",
+    "preact-render-to-string": "^6.5.0"
   },
   "devDependencies": {
-    "typescript": "^5.5"
+    "@preact/preset-vite": "^2.9.4",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7"
   }
 }

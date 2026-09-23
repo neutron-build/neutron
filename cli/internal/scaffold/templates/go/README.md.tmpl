@@ -1,0 +1,27 @@
+# {{.Name}}
+
+A Neutron Go service.
+
+## Getting started
+
+```sh
+{{range .NextSteps}}{{.}}
+{{end}}```
+
+`neutron dev` runs `air` when it is installed, otherwise `go run ./cmd/server`.
+The server connects to the database at startup and exits if it cannot.
+
+## Endpoints
+
+- `GET /api/hello` — sample route in `internal/handler/hello.go`
+- `GET /health` — built in: `{"status", "nucleus", "version"}`
+
+## Configuration
+
+Read from the environment (`.env.example` lists them; nothing loads it automatically):
+
+| Variable | Default |
+|---|---|
+| `NEUTRON_HOST` / `NEUTRON_PORT` | listen on `:8080` |
+| `NEUTRON_DATABASE_URL` | then `DATABASE_URL`, then `postgres://localhost:5432/{{.Name}}` |
+| `NEUTRON_LOG_LEVEL` | `info` |

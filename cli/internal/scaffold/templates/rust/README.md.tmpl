@@ -1,0 +1,34 @@
+# {{.Name}}
+
+A Neutron Rust service (Hyper).
+
+## Getting started
+
+```sh
+{{range .NextSteps}}{{.}}
+{{end}}```
+
+`neutron dev` runs `cargo watch -x run` when cargo-watch is installed,
+otherwise `cargo run`.
+
+The SDK (`{{.SDK.Name}}` crate) comes from the Neutron repository
+(`{{.SDK.Source}}`); cargo finds the crate by name inside it and pins the
+commit in `Cargo.lock`. It is not on crates.io, where `neutron` is an
+unrelated crate. `cargo update -p {{.SDK.Name}}` moves to the latest commit.
+
+## Endpoints
+
+- `GET /api/hello` — sample route in `src/main.rs`
+- `GET /health` — the SDK's contract handler: `{"status", "nucleus", "version"}`
+
+## Configuration
+
+Read from the environment by `Config::from_env()` (`.env` lists them; nothing
+loads it automatically):
+
+| Variable | Default |
+|---|---|
+| `NEUTRON_HOST` | `0.0.0.0` |
+| `NEUTRON_PORT` | `8080` |
+| `NEUTRON_DATABASE_URL` | unset — `/health` reports `"nucleus": "unconfigured"` |
+| `NEUTRON_LOG_LEVEL` | `info` |

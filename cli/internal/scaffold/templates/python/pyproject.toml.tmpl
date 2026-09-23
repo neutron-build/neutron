@@ -4,7 +4,10 @@ version = "0.1.0"
 description = ""
 requires-python = ">=3.11"
 dependencies = [
-    "neutron>={{.NeutronVer}}",
+    # The Neutron Python SDK is the `neutron-py` distribution, installed from
+    # the Neutron repository. It is not on PyPI, and `neutron` there is
+    # OpenStack's networking service.
+    "{{.SDK.Name}} @ {{.SDK.Source}}#subdirectory={{.SDK.Subdir}}",
 ]
 
 [project.optional-dependencies]
@@ -16,6 +19,12 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
