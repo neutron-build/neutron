@@ -9,6 +9,8 @@
 // Never executed — `pnpm test:types` only type-checks it.
 import {
   pgTable,
+  pgSchema,
+  alias,
   serial,
   integer,
   text,
@@ -32,6 +34,8 @@ import {
   getTableName,
   getTableColumns,
   getTableIndexes,
+  getTableSchema,
+  isAliasHandle,
   createDatabase,
   type ColumnBuilder,
   type Condition,
@@ -42,6 +46,7 @@ import {
   type ProjectionDecoder,
   type StatementCapability,
   type SchemaDocumentV2,
+  type AliasedTable,
 } from "@neutron-build/sql";
 
 type AssertEq<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
@@ -239,3 +244,73 @@ const docVersion: AssertEq<(typeof doc)["version"], 2> = true;
 const canonical: string = canonicalSchemaJson(doc);
 const upgraded: SchemaDocumentV2 = readSchemaDocumentV1('{"version":1,"dialect":"postgresql","tables":[]}');
 void [docVersion, canonical, upgraded];
+
+// --- Q01 joins and aliases through the packed declarations -------------------
+// Outer-join nullability is exact: a NOT NULL column on the nullable side of
+// an outer join reads `| null`; the preserved side stays exact. Self joins
+// and same-SQL-name tables in two schemas keep distinct keys and types.
+
+const reviews = pgTable("reviews", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id").notNull(),
+  body: text("body").notNull(),
+  at: timestamp("at"),
+});
+
+const legacy = pgSchema("legacy");
+const legacyUsers = legacy.table("users", {
+  id: serial("id").primaryKey(),
+  email: text("email").notNull(),
+});
+
+async function joinFixtures(): Promise<void> {
+  const db = await createDatabase({ url: "postgres://type-fixture:not-run@localhost:1/none", tables: { users, posts } });
+  const r = alias(reviews, "r");
+
+  const inner = db.select({ email: users.email, body: r.body }).from(users).innerJoin(r, sql`${r.userId} = ${users.id}`);
+  const eqInner: AssertEq<Awaited<typeof inner>[number], { email: string; body: string }> = true;
+
+  const left = db.select({ email: users.email, body: r.body, at: r.at }).from(users).leftJoin(r, sql`${r.userId} = ${users.id}`);
+  const eqLeft: AssertEq<Awaited<typeof left>[number], { email: string; body: string | null; at: string | null }> = true;
+  // @ts-expect-error left-joined NOT NULL columns are nullable in results
+  const badLeft: { email: string; body: string; at: string | null } = {} as Awaited<typeof left>[number];
+
+  const right = db.select({ email: users.email, body: r.body }).from(users).rightJoin(r, sql`${r.userId} = ${users.id}`);
+  const eqRight: AssertEq<Awaited<typeof right>[number], { email: string | null; body: string }> = true;
+
+  const full = db.select({ email: users.email, body: r.body }).from(users).fullJoin(r, sql`${r.userId} = ${users.id}`);
+  const eqFull: AssertEq<Awaited<typeof full>[number], { email: string | null; body: string | null }> = true;
+
+  const cross = db.select({ email: users.email, body: r.body }).from(users).crossJoin(r);
+  const eqCross: AssertEq<Awaited<typeof cross>[number], { email: string; body: string }> = true;
+
+  // expression projections over joined columns are unknown without a decoder
+  const expr = db.select({ older: sql`${r.at} < ${"2026-01-01T00:00:00"}` }).from(users).innerJoin(r, sql`${r.userId} = ${users.id}`);
+  const eqExpr: AssertEq<Awaited<typeof expr>[number], { older: unknown }> = true;
+
+  // self join: two handles of one table with independent nullability
+  const mgr = alias(users, "mgr");
+  const mentor = alias(users, "mentor");
+  const selfQ = db.select({ name: users.name, boss: mgr.name, guide: mentor.name })
+    .from(users)
+    .innerJoin(mgr, sql`${mgr.id} = ${users.id}`)
+    .leftJoin(mentor, sql`${mentor.id} = ${users.id}`);
+  const eqSelf: AssertEq<Awaited<typeof selfQ>[number], { name: string | null; boss: string | null; guide: string | null }> = true;
+
+  // same SQL table name in a second schema: distinct keys, no collision
+  const lu = alias(legacyUsers, "lu");
+  const two = db.select({ current: users.email, legacy: lu.email }).from(users).leftJoin(lu, sql`${lu.id} = ${users.id}`);
+  const eqTwo: AssertEq<Awaited<typeof two>[number], { current: string; legacy: string | null }> = true;
+  const schemaName: string | undefined = getTableSchema(legacyUsers);
+  const noSchema: string | undefined = getTableSchema(users);
+  const handleCheck: boolean = isAliasHandle(lu) && !isAliasHandle(users);
+  void [schemaName, noSchema, handleCheck];
+
+  // @ts-expect-error joins take alias() handles, not raw tables
+  db.select({ email: users.email }).from(users).leftJoin(reviews, sql`1 = 1`);
+  db.insert(mgr).values({ email: "x" }); // runtime-rejected (handles are join identities)
+
+  void [eqInner, eqLeft, eqRight, eqFull, eqCross, eqExpr, eqSelf, eqTwo, badLeft];
+  void [inner, left, right, full, cross, expr, selfQ, two];
+}
+void joinFixtures;

@@ -14,7 +14,20 @@
 // every ambiguity instead of guessing.
 
 import type { AnyColumnBuilder, AnyPgTable } from "./schema.js";
-import { getTableColumns, getTableName, getTableIndexes, isPgTable } from "./schema.js";
+import { getTableColumns, getTableName, getTableIndexes, getTableSchema, isPgTable } from "./schema.js";
+
+/** The v1/v2 export contract covers default-search-path tables only
+ *  (identity.schema is "public"). A declared schema would export under the
+ *  wrong identity, so schema-qualified tables fail closed until Q07 owns
+ *  cross-schema export. */
+function assertPlainTable(table: AnyPgTable, who: string): void {
+  const schema = getTableSchema(table);
+  if (schema !== undefined) {
+    throw new Error(
+      `${who}: table "${schema}"."${getTableName(table)}" declares a schema — schema export for schema-qualified tables lands with Q07 (the query layer supports them)`,
+    );
+  }
+}
 import type { TablesInput } from "./db.js";
 import { quoteStringLiteral } from "./compile.js";
 import { encodeWriteValue, type ColumnContext } from "./codecs.js";
@@ -69,6 +82,7 @@ export function exportSchema(tables: TablesInput): ExportedSchema {
 }
 
 export function exportTable(table: AnyPgTable): ExportedTable {
+  assertPlainTable(table, "exportTable");
   const columns: ExportedColumn[] = [];
   for (const col of Object.values(getTableColumns(table)) as AnyColumnBuilder[]) {
     const exported: ExportedColumn = {
@@ -265,7 +279,10 @@ function v2TypeFor(table: string, column: AnyColumnBuilder): V2TypeRef {
 export function exportSchemaV2(tables: TablesInput): SchemaDocumentV2 {
   const exported: AnyPgTable[] = [];
   for (const value of Object.values(tables)) {
-    if (isPgTable(value)) exported.push(value);
+    if (isPgTable(value)) {
+      assertPlainTable(value, "exportSchemaV2");
+      exported.push(value);
+    }
   }
   // Deterministic table order: schema-qualified identity (public here).
   exported.sort((a, b) => byteCompare(getTableName(a), getTableName(b)));

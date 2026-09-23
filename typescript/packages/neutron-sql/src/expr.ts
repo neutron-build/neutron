@@ -7,7 +7,7 @@
 // direct-execution escape hatch: its {sql, params} shape is executed as-is
 // through the driver and never interpolated into other statements.
 
-import { getTableName } from "./schema.js";
+import { getTableName, tableRefParts } from "./schema.js";
 import type { AnyColumnBuilder, ColumnBuilder, JsWriteTypeOf, ColumnDataType } from "./schema.js";
 import { encodeWriteValue } from "./codecs.js";
 import {
@@ -46,7 +46,7 @@ export type Condition = ValueNode;
 function colRef(col: AnyColumnBuilder | string, table?: string): ValueNode {
   if (typeof col === "string") return ident(col);
   if (table) return qual(table, col.columnName);
-  if (col.ownerTable) return qual(getTableName(col.ownerTable), col.columnName);
+  if (col.ownerTable) return qual(...tableRefParts(col.ownerTable), col.columnName);
   return ident(col.columnName);
 }
 
