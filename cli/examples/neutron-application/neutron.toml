@@ -21,3 +21,18 @@ depends_on = ["api"]
 path = "api"
 command = ["go", "vet", "./..."]
 timeout = "5m"
+
+# Typed client: api/openapi.json is the committed, reviewed interface
+# (refresh with `neutron project spec --write --service api`; CI runs --check).
+# The web app's types are generated from it, never hand-written.
+[application.tasks.web-api-types]
+path = "web"
+command = ["./node_modules/.bin/openapi-typescript", "../api/openapi.json", "--output", "src/api.d.ts"]
+timeout = "2m"
+outputs = ["src/api.d.ts"]
+
+[application.tasks.web-typecheck]
+path = "web"
+command = ["./node_modules/.bin/tsc", "--noEmit"]
+depends_on = ["web-api-types"]
+timeout = "5m"

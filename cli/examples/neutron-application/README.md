@@ -27,10 +27,27 @@ The log shows each assigned port. The web page lists items fetched from the API;
 `POST /api/items` with `{}` returns a 422 `application/problem+json` body.
 Interrupt once to drain and stop both services.
 
+## Typed client across the language boundary
+
+`api/openapi.json` is a committed snapshot of the Go API's OpenAPI document:
+the reviewed interface, so an API change shows up as a diff in review. The web
+app's types are generated from it by an ordinary task, never hand-written.
+
+```sh
+/tmp/neutron project spec --write --service api   # refresh the snapshot
+/tmp/neutron project spec --check                 # fail if a service drifted
+/tmp/neutron project run web-typecheck            # generate src/api.d.ts, then tsc
+```
+
+Renaming a field in the Go API makes `spec --check` fail; after `--write`, the
+web typecheck fails where the old field was used.
+
 ## Smoke test
 
 `python3 smoke.py /path/to/neutron` packs the TypeScript SDKs from this checkout,
-copies the example outside the repository, installs it, and checks: data flows
+copies the example outside the repository, installs it, and checks: the
+snapshot matches the running API, an API field rename is caught as spec drift and
+as a TypeScript error, data flows
 web → API through the injected URL, validation errors follow RFC 7807, no
 contract deviation is reported, two copies run at once on assigned ports, and an
 in-flight request completes during shutdown with no process left behind. CI runs

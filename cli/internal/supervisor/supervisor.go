@@ -26,6 +26,10 @@ type Options struct {
 	// Force, when closed, skips remaining grace periods during shutdown
 	// (a second interrupt). Nil means always wait the full grace period.
 	Force <-chan struct{}
+	// OnReady, when set, runs once every selected service has started and
+	// passed readiness, with each service's resolved port (0 when it has no
+	// single port). Run then stops the services and returns OnReady's error.
+	OnReady func(ports map[string]int) error
 }
 type process struct {
 	service project.Service
@@ -373,6 +377,9 @@ func Run(ctx context.Context, plan *project.Plan, options Options) error {
 				}
 			}
 		}
+	}
+	if options.OnReady != nil {
+		return options.OnReady(ports)
 	}
 	select {
 	case <-ctx.Done():
