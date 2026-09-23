@@ -10,13 +10,18 @@ the Go/Rust conformance apps endpoint-for-endpoint:
     GET  /api/items               200 list (compression / request-id probe)
     POST /api/items               422 validation error (RFC 7807 + errors[])
     GET  /errors/{bad-request,…}  forced standard §2 errors
+    GET  /slow                    200 after 1.5s (in-flight request for the §8 drain probe)
 
-Listen port comes from PORT (HOST), so the runner can pin an ephemeral port.
+The listen address is the SDK's own: ``App.run()`` with no arguments reads
+NEUTRON_HOST / NEUTRON_PORT (contract §6). The adapter reads no variable of its
+own — the runner's ``config.env`` dimension exists to catch an SDK that ignores
+them, and an adapter-specific PORT would hide exactly that.
 
-Boot (requires: pip install starlette pydantic uvicorn):
-    PORT=8083 python conformance_app.py
+Boot (requires: pip install -e ./python):
+    NEUTRON_PORT=8083 python conformance_app.py
 """
 
+import asyncio
 import os
 import sys
 
@@ -67,6 +72,13 @@ async def create_item(body: NewItem) -> Item:
     return Item(id=1, name=body.name, price=body.price)
 
 
+# §8 drain probe: a request that is still in flight when SIGTERM arrives.
+@router.get("/slow")
+async def slow() -> dict:
+    await asyncio.sleep(1.5)
+    return {"ok": True}
+
+
 # One forced-error route per standard error, built from the generated taxonomy
 # rather than written out seven times. `AppError(status, code, title, detail)`
 # is a generic constructor, so no per-code helper mapping is needed and adding a
@@ -106,4 +118,4 @@ app = build()
 
 
 if __name__ == "__main__":
-    app.run(host=os.getenv("HOST", "127.0.0.1"), port=int(os.getenv("PORT", "8083")))
+    app.run()

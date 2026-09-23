@@ -1,9 +1,23 @@
 // Per-SDK boot descriptors for the conformance runner.
 //
 // Each descriptor declares how to (optionally) build and how to start a canonical
-// "conformance app" for that SDK, plus the env var used to pin the port. The
-// runner picks a free ephemeral port, boots the server, waits for /health, runs
-// the contract, and tears the process down.
+// "conformance app" for that SDK. The runner picks a free ephemeral port and
+// boots the server with NEUTRON_HOST/NEUTRON_PORT (contract §6) — never with a
+// variable of the adapter's own — waits for /health, runs the contract, and
+// tears the process down.
+//
+// `cmd()` must start the SDK's server process ITSELF, not a wrapper around it:
+// the shutdown dimension sends SIGTERM to that PID and asserts on its exit
+// status. `go run`, `npx`, `cargo run` or a shell script that does not `exec`
+// would receive the signal in the SDK's place. Hence prebuilt binaries, the
+// interpreter directly, and `neutron-ts` via its bin script (which imports the
+// CLI in-process).
+//
+// Optional `portEnv` / `hostEnv`: an adapter-specific addressing variable, for
+// an SDK that does not read NEUTRON_PORT yet. It is used only after the
+// `config.env` dimension has failed, so the rest of the contract is still
+// measured, and that failure must be recorded in known-skips.json. No SDK
+// needs one today — every adapter relies on the SDK's own env handling.
 //
 // `available()` returns null if the SDK can be booted in this environment, or a
 // string reason if it cannot (missing toolchain, needs a build step, etc.).
@@ -29,8 +43,10 @@ const GO_APP = path.join(CONF, "adapters/go/conformance-app");
 const GO_BIN = path.join(CONF, ".build/conf-go-app");
 const RUST_BIN = path.join(REPO, "rust/target/release/examples/conformance_app");
 const PY_APP = path.join(CONF, "adapters/python/conformance_app.py");
-const TS_APP = path.join(CONF, "adapters/typescript/conformance_app.mjs");
+const TS_APP_DIR = path.join(CONF, "adapters/typescript");
 const TS_DIST = path.join(REPO, "typescript/packages/neutron/dist/server/index.js");
+const TS_CLI_BIN = path.join(REPO, "typescript/packages/neutron-cli/bin/neutron-ts.mjs");
+const TS_CLI_DIST = path.join(REPO, "typescript/packages/neutron-cli/dist/index.js");
 const EX_APP = path.join(CONF, "adapters/elixir/conformance_app.exs");
 const ZIG_APP = path.join(CONF, "adapters/zig");
 const ZIG_PREFIX = path.join(CONF, ".build/conf-zig");
@@ -71,8 +87,6 @@ function zig15() {
 export const SDKS = [
   {
     name: "go",
-    portEnv: "PORT",
-    hostEnv: "HOST",
     // Build ahead of time so boot is instant and deterministic.
     build() {
       fs.mkdirSync(path.dirname(GO_BIN), { recursive: true });
@@ -92,8 +106,6 @@ export const SDKS = [
   },
   {
     name: "rust",
-    portEnv: "NEUTRON_PORT",
-    hostEnv: "NEUTRON_HOST",
     build() {
       const r = spawnSync(
         "cargo",
@@ -112,8 +124,6 @@ export const SDKS = [
   },
   {
     name: "python",
-    portEnv: "PORT",
-    hostEnv: "HOST",
     build() {},
     cmd() {
       return { command: pythonBin() || "python3", args: [PY_APP] };
@@ -133,26 +143,29 @@ export const SDKS = [
     // FRAMEWORK_CONTRACT.md §2 grants no SSR exemption, so the design was
     // self-exempting from a MUST rather than scoping one.
     name: "ts",
-    portEnv: "PORT",
-    hostEnv: "HOST",
     build() {},
+    //
+    // Booted through `neutron-ts start` — the SDK's production entry point —
+    // from the adapter directory (server options in its neutron.config.mjs).
+    // NEUTRON_HOST/NEUTRON_PORT resolution (§6) and the SIGTERM drain + exit
+    // (§8) live in that command, so an adapter script calling createServer()
+    // itself bypassed both; the suite could not see them break.
     cmd() {
-      return { command: process.execPath, args: [TS_APP] };
+      return { command: process.execPath, args: [TS_CLI_BIN, "start"], cwd: TS_APP_DIR };
     },
     available() {
-      if (!fs.existsSync(TS_DIST)) {
-        return "TS package not built (run: pnpm --filter @neutron-build/core build)";
+      if (!fs.existsSync(TS_DIST) || !fs.existsSync(TS_CLI_DIST)) {
+        return "TS packages not built (run: pnpm --filter @neutron-build/core --filter @neutron-build/cli build)";
       }
       return null;
     },
   },
   {
     name: "elixir",
-    portEnv: "PORT",
-    hostEnv: "HOST",
     // Mix.install compiles the path dependency on first run and caches it by
     // lockfile hash, so the build step is a no-op and the first boot is slow.
-    // The runner's health wait covers it.
+    // The runner's health wait covers it. `elixir` is a shell script, but it
+    // `exec`s erl, which `exec`s the BEAM, so the spawned PID is the server.
     build() {},
     cmd() {
       return { command: "elixir", args: [EX_APP] };
@@ -165,8 +178,6 @@ export const SDKS = [
   },
   {
     name: "zig",
-    portEnv: "NEUTRON_PORT",
-    hostEnv: "NEUTRON_HOST",
     build() {
       const { bin } = zig15();
       const r = spawnSync(
