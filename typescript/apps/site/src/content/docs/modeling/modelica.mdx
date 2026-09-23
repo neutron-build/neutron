@@ -1,0 +1,37 @@
+---
+title: Physical Simulation
+description: The current Neutron Modelica implementation, optional integrations, and interoperability boundaries.
+---
+
+[Neutron Modelica](/modelica) is Neutron’s physical-simulation component. Its implementation lives in `modelica/`; the Python distribution is named `neutron-sim`.
+
+## What exists today
+
+The `neutron_sim` package exposes `Variable`, `Parameter`, `Equation`, `der`, `Connector`, `Component`, `System`, `connect`, and `simulate`. Domain libraries cover electrical, mechanical, thermal, and fluid components. SciPy provides numerical integration.
+
+Optional modules add FMI import and orchestration, a `juliacall` bridge, Nucleus result storage, plotting, MCP tools, and scikit-learn surrogate models. These require their own dependencies and, for live integrations, their runtimes or services.
+
+The separate `neutron_modelica` source package contains FMI runtime, Kirchhoff circuit, and Julia bridge helpers. The current `pyproject.toml` includes only `neutron_sim` in the wheel. Source-tree availability does not establish that both packages are installed from a built distribution.
+
+## Develop from the repository
+
+From `modelica/`:
+
+```bash
+python -m pip install -e ".[dev]"
+python -m pytest
+```
+
+Select extras such as `fmi`, `julia`, and `ai` for the integrations you use. Julia also needs a working Julia runtime and its numerical packages. Nucleus integration tests require a configured database. Review skipped tests before treating a local test run as validation of those integrations.
+
+## Modelica and FMI boundaries
+
+Neutron’s Python modeling API is not a general compiler for `.mo` source. Use an external Modelica compiler for Modelica-language models and validate the resulting FMU against the selected importer.
+
+The current export function creates `modelDescription.xml` and serialized Python resources for Neutron round trips. It does not supply a native executable FMI implementation. General interchange requires a compatible implementation as well as metadata; see the [FMI specification](https://fmi-standard.org/docs/main/).
+
+## Recommended integration direction
+
+Keep model authoring, solving, and result storage independently usable. Validate numerical results against analytical references where available, document solver tolerances, and test optional backends explicitly. A portable FMU export needs an independent import-and-execute test, not only a Neutron round trip.
+
+See the [proposed modeling architecture](/docs/modeling/architecture) for the shared artifact and application-integration approach. These additions are future work.

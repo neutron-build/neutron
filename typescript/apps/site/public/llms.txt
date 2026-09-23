@@ -12,11 +12,10 @@ Multi-model database in Rust. One engine for 14 data models: SQL, Key-Value, Vec
 - Vector syntax: `VECTOR('[1,0,0]')` not bare string
 - Port: 5432 (pgwire)
 
-### rust/ — Neutron Rust (Web Framework)
-High-performance HTTP/1.1, HTTP/2, HTTP/3 web framework in Rust. Hyper 1.x + tokio, middleware pipeline, file-based routing, WebSockets, SSE, multipart, TLS, gRPC, GraphQL. 19 crates including OAuth, WebAuthn, Stripe, SMTP, Redis, OpenTelemetry.
-- Entry: `rust/crates/neutron/src/lib.rs`
-- Tests: `cargo test` in `rust/`
-- Key types: `App`, `Router`, `Request`, `Response`, `Middleware`, `Handler`
+### rust/ — Neutron Rust (Services and Application Backends)
+Modular async services and workers with Tokio and a Hyper HTTP core. Optional jobs, database, storage, cache, and telemetry crates; Rust also powers the Neutron Desktop backend. Use the modules that fit the application and measure performance for the workload.
+- Entry: `rust/`
+- Documentation: /docs/rust/overview
 
 ### typescript/ — Neutron TypeScript (UI Framework)
 SSR-first TypeScript UI framework on Preact: file-based routing, per-route loaders/actions, static + server (`app`) render modes, islands, signals, streaming. Published as `@neutron-build/core`. Monorepo: pnpm + Turbo. Packages include auth, data, nucleus, otel, security; scaffolding via `create-neutron`.
@@ -55,15 +54,16 @@ ML and scientific computing library. Typed Nucleus client for all 14 models. Ext
 - Tests: `julia --project=. -e 'using Pkg; Pkg.test()'`
 - Key types: `NeutronJulia.connect`, `sql()`, `kv()`, `vector()`, `timeseries()`
 
-### zig/ — Neutron Zig (Systems Library)
-4-layer systems library (wire -> HAL -> protocols -> app). Nucleus client for all 14 models. JWT auth, compression, SSE, cache. Zero heap allocations, comptime SQL validation. Targets ARM, RISC-V, AVR, ESP32.
+### zig/ — Neutron Zig (Systems Framework)
+Layered wire codecs, networking, protocol servers, application framework, and Nucleus client. Wire codecs are allocation-free; higher-level clients use an allocator. Pinned to Zig 0.15.2. Embedded targets require explicit validation.
 - Entry: `zig/`
-- Tests: `zig build test` in `zig/` (295 tests)
+- Documentation: /docs/zig/overview
 
-### modelica/ — Neutron Modelica (Physics Simulation)
-Physics simulation framework. FMI 2.0/3.0 model exchange, Kirchhoff's law solver (MNA), Julia bridge via DifferentialEquations.jl. Python-based tooling.
+### modelica/ — Neutron Modelica (Simulation, in progress)
+Python modeling and SciPy simulation with optional FMI, Julia, Nucleus, plotting, and scikit-learn integrations. No general Modelica compiler. Current export packages metadata and Python resources, not a portable native FMI implementation. The wheel includes neutron_sim only; neutron_modelica helpers also exist in the source tree.
 - Entry: `modelica/`
-- CI: `.github/workflows/modelica.yml`
+- Documentation: /docs/modeling/modelica
+- Proposed integration architecture: /docs/modeling/architecture
 
 ### native/ — Neutron Native (Mobile Framework)
 React Native Fabric (iOS/Android) + Preact (web). Expo Go for on-device preview. Web device APIs, NeutronWind styling with 700+ design tokens. Components, router, navigation, device modules, animation, gestures, accessibility.
@@ -109,8 +109,9 @@ Single schema covers SQL tables, KV stores, vector collections, timeseries metri
 
 Formal verification across three tools:
 
-- **Lean4** (`lean4/`): 26 files, algorithm proofs, 100% proven (Aeneas Rust-to-Lean translation)
-- **Quint** (`quint/`): 27 protocol specification files, 12 test files, nucleus + framework + realtime specs
+- **Neutron Lean** (/lean): Coming soon — a planned verification framework for Neutron applications, with reusable models, proofs, language conformance checks, and build integration. These integrations are not yet available.
+- **Lean 4 proof suite** (`lean4/`): Neutron’s verification suite for hand-written models of Nucleus algorithms, under stated assumptions. It does not certify the shipping binary. See /docs/verification/lean4.
+- **Neutron Quint** (`quint/`): Protocol models for Nucleus, services, and realtime. CI runs type checks, random simulation, and model harness tests. Live implementation conformance is unfinished; the Rust harness mirrors models. See /docs/verification/quint.
 - **Verus** (`verus/`): 12 files, Rust verification for nucleus (MVCC, page, buffer) and framework (JWT, session, rate limit)
 
 ## Key Design Decisions
@@ -118,7 +119,7 @@ Formal verification across three tools:
 - Neutron TS uses Preact (3KB) not React (42KB)
 - Nucleus uses PostgreSQL wire protocol — works with any Postgres client
 - Nucleus MVCC + WAL crash recovery — production-grade persistence
-- Neutron Rust uses hyper 1.x + tokio, no framework overhead
+- Neutron Rust uses Hyper and Tokio; performance depends on the workload.
 - Mojo uses SIMD kernels for tensor ops
 - Elixir uses OTP supervisors for fault tolerance
 - License: MIT (frameworks) | BSL 1.1 → MIT 2046 (Nucleus)
