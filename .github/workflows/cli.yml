@@ -100,6 +100,49 @@ jobs:
         run: go vet ./...
         working-directory: cli
 
+  # The application coordinator supervises real process trees, so its runtime
+  # support is only claimed where these run natively. Windows is cross-compiled
+  # below and rejects application mode at runtime.
+  coordinator:
+    name: Coordinator (${{ matrix.os }})
+    needs: studio
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch Studio dist
+        uses: actions/download-artifact@v4
+        with:
+          name: studio-dist
+          path: cli/internal/studio/dist
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: cli/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Lifecycle tests
+        run: go test -race -count=3 ./internal/project ./internal/supervisor
+        working-directory: cli
+
+      - name: Native two-language smoke
+        run: |
+          go build -o "$RUNNER_TEMP/neutron" .
+          python3 examples/application/smoke.py "$RUNNER_TEMP/neutron"
+        working-directory: cli
+
   cross-compile:
     name: Cross-compile
     needs: studio
