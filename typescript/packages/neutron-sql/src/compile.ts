@@ -11,8 +11,9 @@
 // Alias generation (`__q1`, `__q2`, …) is a compile-state counter advanced in
 // traversal order, so unnamed derived tables get stable, deterministic names.
 
-import { forgedTextKind, validJoinType, validLimit, validOp, validParamCast } from "./ast.js";
+import { forgedTextKind, validAggregate, validJoinType, validLimit, validOp, validParamCast } from "./ast.js";
 import type {
+  AggregateNode,
   AnyStatementNode,
   CteNode,
   DeleteStatementNode,
@@ -100,6 +101,9 @@ export function compile(node: SqlNode, state: CompileState): void {
     case "expr":
       compileExpr(node, state);
       return;
+    case "aggregate":
+      compileAggregate(node, state);
+      return;
     case "projection":
       compileProjection(node, state);
       return;
@@ -137,7 +141,7 @@ export function compile(node: SqlNode, state: CompileState): void {
 /** Render one operand of a binary/unary operator application. Fragments and
  *  trusted segments carry arbitrary text whose top-level connectives (`or`,
  *  `and`, `not`) would otherwise escape the operator being applied — the
- *  exact rule compileWhere applies to where-list items. Call-form arguments
+ *  exact rule compilePredicateList applies to where/having items. Call-form arguments
  *  need no wrap: the call's own parentheses and commas delimit each argument. */
 function compileOperand(node: ValueNode, state: CompileState): void {
   const wrap = node.kind === "fragment" || node.kind === "trusted";
@@ -166,6 +170,25 @@ function compileExpr(node: ExpressionNode, state: CompileState): void {
   for (let i = 0; i < node.args.length; i++) {
     if (i > 0) state.parts.push(", ");
     compile(node.args[i], state);
+  }
+  state.parts.push(")");
+}
+
+/** Aggregates self-delimit (`op(args)`), so operands never need wrapping.
+ *  `count()` with zero args renders `count(*)`; `distinct` renders inside
+ *  the parentheses. Params inside args (e.g. the string_agg separator)
+ *  bind in traversal order. */
+function compileAggregate(node: AggregateNode, state: CompileState): void {
+  validAggregate(node.op, node.args.length, "compile aggregate");
+  state.parts.push(`${node.op}(`);
+  if (node.distinct === true) state.parts.push("distinct ");
+  if (node.op === "count" && node.args.length === 0) {
+    state.parts.push("*");
+  } else {
+    for (let i = 0; i < node.args.length; i++) {
+      if (i > 0) state.parts.push(", ");
+      compile(node.args[i], state);
+    }
   }
   state.parts.push(")");
 }
@@ -218,8 +241,14 @@ function compileOrder(order: readonly OrderSpec[], state: CompileState): void {
 }
 
 function compileStatementNode(stmt: StatementNode, state: CompileState): void {
+  // Defensive reads: a structurally forged statement (missing Q02 fields)
+  // still reaches the field validations below instead of crashing on
+  // undefined arrays — fail closed with the pinned messages.
+  const groupBy = stmt.groupBy ?? [];
+  const having = stmt.having ?? [];
+  const setOps = stmt.setOps ?? [];
   if (stmt.ctes.length > 0) {
-    state.parts.push("with ");
+    state.parts.push(stmt.recursive === true ? "with recursive " : "with ");
     for (let i = 0; i < stmt.ctes.length; i++) {
       if (i > 0) state.parts.push(", ");
       compile(stmt.ctes[i], state);
@@ -227,6 +256,7 @@ function compileStatementNode(stmt: StatementNode, state: CompileState): void {
     state.parts.push(" ");
   }
   state.parts.push("select ");
+  if (stmt.distinct === true) state.parts.push("distinct ");
   if (stmt.projections.length === 0) {
     state.parts.push("*");
   } else {
@@ -248,23 +278,40 @@ function compileStatementNode(stmt: StatementNode, state: CompileState): void {
     state.parts.push(" ");
     compile(j, state);
   }
-  compileWhere(stmt.where, state);
+  compilePredicateList(stmt.where, "where", state);
+  if (groupBy.length > 0) {
+    state.parts.push(" group by ");
+    for (let i = 0; i < groupBy.length; i++) {
+      if (i > 0) state.parts.push(", ");
+      compile(groupBy[i], state);
+    }
+  }
+  compilePredicateList(having, "having", state);
+  // Set-operation branches render parenthesized: chaining is
+  // left-associative in call order, never in SQL's intersect-over-union
+  // precedence, and a branch keeps its own WITH/ORDER BY/LIMIT inside the
+  // parentheses (PostgreSQL semantics).
+  for (const so of setOps) {
+    state.parts.push(` ${so.op} (`);
+    compile(so.select, state);
+    state.parts.push(")");
+  }
   if (stmt.orderBy.length > 0) compileOrder(stmt.orderBy, state);
   if (stmt.limit !== undefined) state.parts.push(` limit ${validLimit(stmt.limit, "compile limit")}`);
   if (stmt.offset !== undefined) state.parts.push(` offset ${validLimit(stmt.offset, "compile offset")}`);
 }
 
-function compileWhere(where: readonly ValueNode[], state: CompileState): void {
-  if (where.length === 0) return;
-  state.parts.push(" where ");
-  for (let i = 0; i < where.length; i++) {
+/** where/having share one renderer: items join with `and`, and fragments and
+ *  trusted segments are delimited so joining cannot change their meaning
+ *  (the F04 Grouping guarantee, applied to HAVING since Q02). */
+function compilePredicateList(items: readonly ValueNode[], keyword: "where" | "having", state: CompileState): void {
+  if (items.length === 0) return;
+  state.parts.push(` ${keyword} `);
+  for (let i = 0; i < items.length; i++) {
     if (i > 0) state.parts.push(" and ");
-    // Fragments and trusted segments carry arbitrary text — always delimit
-    // them so joining with `and` cannot change their meaning. Expr nodes
-    // self-parenthesize and atoms bind tighter than `and`.
-    if (where[i].kind === "fragment" || where[i].kind === "trusted") state.parts.push("(");
-    compile(where[i], state);
-    if (where[i].kind === "fragment" || where[i].kind === "trusted") state.parts.push(")");
+    if (items[i].kind === "fragment" || items[i].kind === "trusted") state.parts.push("(");
+    compile(items[i], state);
+    if (items[i].kind === "fragment" || items[i].kind === "trusted") state.parts.push(")");
   }
 }
 
@@ -313,14 +360,14 @@ function compileUpdate(node: UpdateStatementNode, state: CompileState): void {
     state.parts.push(" = ");
     compile(node.sets[i].value, state);
   }
-  compileWhere(node.where, state);
+  compilePredicateList(node.where, "where", state);
   compileReturning(node.returning, state);
 }
 
 function compileDelete(node: DeleteStatementNode, state: CompileState): void {
   state.parts.push("delete from ");
   compile(node.table, state);
-  compileWhere(node.where, state);
+  compilePredicateList(node.where, "where", state);
   compileReturning(node.returning, state);
 }
 

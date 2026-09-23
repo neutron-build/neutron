@@ -4,7 +4,7 @@
 // Deterministic: same schema in, same SQL out. This is the source the P1
 // migration generator diffs against introspected databases.
 
-import { getTableColumns, getTableName, getTableIndexes, getTableSchema } from "./schema.js";
+import { getTableColumns, getTableName, getTableIndexes, getTableSchema, rejectDerivedTable } from "./schema.js";
 import type { AnyColumnBuilder, AnyPgTable } from "./schema.js";
 import { qident } from "./expr.js";
 import { quoteStringLiteral } from "./compile.js";
@@ -13,6 +13,7 @@ import { quoteStringLiteral } from "./compile.js";
  *  schema would silently emit DDL against the wrong (search-path) location,
  *  so schema-qualified tables fail closed here until Q07 owns them. */
 function assertPlainTable(table: AnyPgTable, who: string): void {
+  rejectDerivedTable(table, who);
   const schema = getTableSchema(table);
   if (schema !== undefined) {
     throw new Error(

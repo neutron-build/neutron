@@ -5,6 +5,7 @@ import {
   and,
   asc,
   astSelect,
+  compileStatement,
   createDatabase,
   eq,
   exportSchema,
@@ -19,12 +20,14 @@ import {
   bigint,
   integer,
   numeric,
+  projection,
+  qual,
+  selectStatement,
   serial,
   text,
   timestamp,
   schemaToDDL,
   sql,
-  qual,
   type Condition,
   type SelectBuilder,
 } from "./index.js";
@@ -276,6 +279,44 @@ test("joins: legacy fragments are rejected in the on slot with the shared hint",
     () => db.select().from(users).innerJoin(alias(orders, "o"), legacy as never),
     /legacy SqlFragment .* cannot be used here .* renumbering/s,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Q01 review carry-forwards fixed in Q02: crossJoin wrappers reject a runtime
+// ON argument; whole-table sql interpolation renders schema-qualified.
+// ---------------------------------------------------------------------------
+
+test("joins: crossJoin wrappers reject a runtime ON argument instead of dropping it", () => {
+  const c = alias(orders, "cx");
+  assert.throws(
+    () => db.select({ email: users.email }).from(users).crossJoin(c, sql`${c.total} > ${1}` as never),
+    /crossJoin: cross joins take no on condition/,
+  );
+  assert.throws(
+    () => astSelect({ id: qual("t", "id") }).from(ident("t")).crossJoin(ident("t"), "x", sql`1 = 1` as never),
+    /ast crossJoin: cross joins take no on condition/,
+  );
+  // The underlying .join() rejection still fires too.
+  assert.throws(
+    () => astSelect().from(users).join("cross", ident("x"), "cx2", sql`1 = 1` as never),
+    /cross joins take no on/,
+  );
+  // Explicit undefined is treated as absent (no silent cartesian trap).
+  const ok = db.select({ email: users.email }).from(users).crossJoin(c, undefined).toSQL();
+  assert.equal(ok.sql, 'select "users"."email" from "users" cross join "orders" as "cx"');
+});
+
+test("joins: whole-table sql interpolation renders schema-qualified references", () => {
+  const frag = sql`select * from ${altUsers}`;
+  const stmt = selectStatement({ projections: [projection(frag)], from: ident("x") });
+  const { sql: text } = compileStatement(stmt);
+  assert.equal(text, 'select select * from "alt"."users" from "x"');
+  // Default-search-path tables and alias handles keep their one-part form.
+  const plain = compileStatement(selectStatement({ projections: [projection(sql`select * from ${users}`)], from: ident("x") }));
+  assert.equal(plain.sql, 'select select * from "users" from "x"');
+  const au = alias(altUsers, "au");
+  const handle = compileStatement(selectStatement({ projections: [projection(sql`select * from ${au}`)], from: ident("x") }));
+  assert.equal(handle.sql, 'select select * from "au" from "x"');
 });
 
 test("joins: builders stay immutable across join forks", () => {

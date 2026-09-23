@@ -11,6 +11,7 @@ import { getTableName, tableRefParts } from "./schema.js";
 import type { AnyColumnBuilder, ColumnBuilder, JsWriteTypeOf, ColumnDataType } from "./schema.js";
 import { encodeWriteValue } from "./codecs.js";
 import {
+  aggregate,
   expr as exprNode,
   fragment,
   ident,
@@ -19,7 +20,9 @@ import {
   param as paramNode,
   paramCast,
   qual,
+  type AggregateNode,
   type OrderSpec,
+  type SubqueryNode,
   type ValueNode,
 } from "./ast.js";
 
@@ -155,10 +158,114 @@ export function not(condition: Condition): Condition {
  *  node (a raw expression defaults to ascending). */
 export type OrderExpression = OrderSpec | ValueNode;
 
-export function asc(col: AnyColumnBuilder | string, table?: string): OrderSpec {
-  return Object.freeze({ expr: colRef(col, table), direction: "asc" } as OrderSpec);
+function isAggregateNode(v: unknown): v is AggregateNode<unknown> {
+  return typeof v === "object" && v !== null && (v as { kind?: unknown }).kind === "aggregate";
 }
 
-export function desc(col: AnyColumnBuilder | string, table?: string): OrderSpec {
-  return Object.freeze({ expr: colRef(col, table), direction: "desc" } as OrderSpec);
+function orderRef(col: AnyColumnBuilder | AggregateNode<unknown> | string, table?: string): ValueNode {
+  if (isAggregateNode(col)) return col;
+  return colRef(col, table);
+}
+
+export function asc(col: AnyColumnBuilder | AggregateNode<unknown> | string, table?: string): OrderSpec {
+  return Object.freeze({ expr: orderRef(col, table), direction: "asc" } as OrderSpec);
+}
+
+export function desc(col: AnyColumnBuilder | AggregateNode<unknown> | string, table?: string): OrderSpec {
+  return Object.freeze({ expr: orderRef(col, table), direction: "desc" } as OrderSpec);
+}
+
+// ---------------------------------------------------------------------------
+// Aggregates (Q02) — typed helpers over the frozen AggregateNode. Result
+// types follow PostgreSQL exactly (see codecs.ts aggregateProjection for the
+// decode side): count/sum-over-integers return int8 (bigint via the F03
+// codec, never null — count is 0 on empty input); sum-over-int8/numeric and
+// avg-over-exact return exact numeric strings; sum/avg over floats return
+// number; min/max return the column's read type; all but count are null on
+// empty input.
+// ---------------------------------------------------------------------------
+
+type IntFamily = "serial" | "integer" | "smallint";
+
+export type SumResult<D extends ColumnDataType> =
+  D extends IntFamily ? bigint | null
+  : D extends "bigint" | "numeric" ? string | null
+  : D extends "double" | "real" ? number | null
+  : never;
+
+export type AvgResult<D extends ColumnDataType> =
+  D extends "double" | "real" ? number | null
+  : D extends IntFamily | "bigint" | "numeric" ? string | null
+  : never;
+
+export type MinMaxResult<C> = C extends ColumnBuilder<ColumnDataType, boolean, boolean, infer RT> ? RT | null : never;
+
+function aggregateArg<T>(op: "count" | "sum" | "avg" | "min" | "max" | "bool_and" | "bool_or", col: AnyColumnBuilder | ValueNode, distinct = false): AggregateNode<T> {
+  if (typeof col === "object" && col !== null && typeof (col as AnyColumnBuilder).columnName === "string") {
+    const column = col as AnyColumnBuilder;
+    return aggregate<T>(op, [colRef(column)], { distinct, argColumns: [column] });
+  }
+  return aggregate<T>(op, [col as ValueNode], { distinct });
+}
+
+/** `count(*)` — bigint, never null (0 on empty input). */
+export function count(): AggregateNode<bigint>;
+export function count(col: AnyColumnBuilder | ValueNode): AggregateNode<bigint>;
+export function count(col?: AnyColumnBuilder | ValueNode): AggregateNode<bigint> {
+  if (col === undefined) return aggregate<bigint>("count", []);
+  return aggregateArg<bigint>("count", col);
+}
+
+/** `count(distinct col)` — bigint, never null. */
+export function countDistinct(col: AnyColumnBuilder | ValueNode): AggregateNode<bigint> {
+  return aggregateArg<bigint>("count", col, true);
+}
+
+/** `sum(col)` — int8 columns and numerics sum to exact strings, integer
+ *  columns to int8 (bigint), floats to number. Null on empty input. */
+export function sum<D extends ColumnDataType>(col: ColumnBuilder<D, boolean, boolean, unknown>): AggregateNode<SumResult<D>> {
+  return aggregateArg<SumResult<D>>("sum", col);
+}
+
+/** `avg(col)` — exact strings except over floats (number). Null on empty input. */
+export function avg<D extends ColumnDataType>(col: ColumnBuilder<D, boolean, boolean, unknown>): AggregateNode<AvgResult<D>> {
+  return aggregateArg<AvgResult<D>>("avg", col);
+}
+
+/** `min(col)` / `max(col)` — the column's own read type and codec (temporal
+ *  modes honored). Null on empty input. */
+export function min<C extends ColumnBuilder<ColumnDataType, boolean, boolean, unknown>>(col: C): AggregateNode<MinMaxResult<C>> {
+  return aggregateArg<MinMaxResult<C>>("min", col);
+}
+
+export function max<C extends ColumnBuilder<ColumnDataType, boolean, boolean, unknown>>(col: C): AggregateNode<MinMaxResult<C>> {
+  return aggregateArg<MinMaxResult<C>>("max", col);
+}
+
+/** `string_agg(col, separator)` — text, null on empty input. */
+export function stringAgg(col: ColumnBuilder<"text" | "varchar", boolean, boolean, unknown>, separator: string): AggregateNode<string | null> {
+  return aggregate<string | null>("string_agg", [colRef(col), paramNode(separator)], { argColumns: [col, undefined] });
+}
+
+/** `bool_and(col)` / `bool_or(col)` — boolean, null on empty input. */
+export function boolAnd(col: ColumnBuilder<"boolean", boolean, boolean, unknown>): AggregateNode<boolean | null> {
+  return aggregateArg<boolean | null>("bool_and", col);
+}
+
+export function boolOr(col: ColumnBuilder<"boolean", boolean, boolean, unknown>): AggregateNode<boolean | null> {
+  return aggregateArg<boolean | null>("bool_or", col);
+}
+
+// ---------------------------------------------------------------------------
+// Subquery predicates (Q02)
+// ---------------------------------------------------------------------------
+
+/** `exists (subquery)` as a condition. Accepts a SubqueryNode or any builder
+ *  exposing `.subquery()` (typed and AST select builders, set-op builders). */
+export function exists(source: SubqueryNode | { subquery(): SubqueryNode }): Condition {
+  const node = typeof (source as { subquery?: unknown }).subquery === "function" ? (source as { subquery(): SubqueryNode }).subquery() : (source as SubqueryNode);
+  if (typeof node !== "object" || node === null || (node as { kind?: unknown }).kind !== "subquery") {
+    throw new Error("exists: requires a subquery node or a builder with .subquery()");
+  }
+  return fragment("exists ", node);
 }

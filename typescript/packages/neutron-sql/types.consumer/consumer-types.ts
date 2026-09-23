@@ -13,6 +13,9 @@ import {
   alias,
   serial,
   integer,
+  numeric,
+  boolean,
+  serial as serial2,
   text,
   timestamp,
   timestamptz,
@@ -36,18 +39,35 @@ import {
   getTableIndexes,
   getTableSchema,
   isAliasHandle,
+  isDerivedTableHandle,
   createDatabase,
+  count,
+  countDistinct,
+  sum,
+  avg,
+  min,
+  max,
+  stringAgg,
+  boolAnd,
+  boolOr,
+  exists,
+  cteTable,
+  derivedTable,
   type ColumnBuilder,
   type Condition,
   type OrderExpression,
   type OrderSpec,
   type ValueNode,
+  type AggregateNode,
   type CompiledStatement,
   type ProjectionDecoder,
   type StatementCapability,
   type SchemaDocumentV2,
   type AliasedTable,
+  type DerivedTable,
+  type SetOpBuilder,
 } from "@neutron-build/sql";
+void numeric; void boolean; void serial2;
 
 type AssertEq<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
 
@@ -314,3 +334,101 @@ async function joinFixtures(): Promise<void> {
   void [inner, left, right, full, cross, expr, selfQ, two];
 }
 void joinFixtures;
+
+
+// --- Q02 subqueries/CTEs/aggregates/set operations through the packed
+// declarations: aggregate result types (count never null; sum/avg/min/max/
+// string_agg/bool_* nullable on empty input), CTE/derived row types derived
+// from projections, set-op rows typed by the first branch.
+
+async function q02Fixtures(): Promise<void> {
+  const db = await createDatabase({ url: "postgres://type-fixture:not-run@localhost:1/none", tables: { users, posts, reviews } });
+
+  // Aggregate result types follow PostgreSQL exactly.
+  const g = db.select({
+    userId: reviews.userId,
+    n: count(),
+    nd: countDistinct(reviews.userId),
+    bodies: stringAgg(reviews.body, ", "),
+  }).from(reviews).groupBy(reviews.userId);
+  const eqAgg: AssertEq<
+    Awaited<typeof g>[number],
+    { userId: number; n: bigint; nd: bigint; bodies: string | null }
+  > = true;
+  // @ts-expect-error string_agg is nullable on empty input
+  const badBodies: { bodies: string } = ({} as Awaited<typeof g>[number]);
+
+  // sum/avg/min/max typing per column type: numerics sum to exact strings,
+  // integer columns to bigint (the int8 codec), min/max mirror the column.
+  const ledger = pgTable("ledger", {
+    id: serial("id").primaryKey(),
+    cents: integer("cents"),
+    amount: numeric("amount"),
+    at: timestamp("at"),
+    big: bigint("big"),
+  });
+  const s1 = db.select({ total: sum(ledger.cents), amount: sum(ledger.amount), mean: avg(ledger.amount), lo: min(ledger.at), hi: max(ledger.big) }).from(ledger);
+  const eqSum: AssertEq<
+    Awaited<typeof s1>[number],
+    { total: bigint | null; amount: string | null; mean: string | null; lo: string | null; hi: bigint | null }
+  > = true;
+
+  // min/max over a derived/CTE timestamptz column keep the column's read
+  // type through composition (the aggregate mirrors its argument column).
+  const events = pgTable("events", { id: serial("id").primaryKey(), seen: timestamptz("seen") });
+  const seenSrc = derivedTable("seen_src", db.select({ id: events.id, seen: events.seen }).from(events));
+  const seenAgg = db.select({ lo: min(seenSrc.seen), hi: max(seenSrc.seen) }).from(seenSrc);
+  const eqSeenAgg: AssertEq<Awaited<typeof seenAgg>[number], { lo: string | null; hi: string | null }> = true;
+  const seenComposed = db.select({ seen: seenSrc.seen }).from(seenSrc);
+  const eqSeenComposed: AssertEq<Awaited<typeof seenComposed>[number], { seen: string | null }> = true;
+
+  // groupBy/having/distinct chain on the same builder without widening.
+  const grouped = db.select({ userId: reviews.userId, n: count() })
+    .from(reviews)
+    .groupBy(reviews.userId)
+    .having(sql`${count()} > ${1}`)
+    .distinct();
+  const eqGrouped: AssertEq<Awaited<typeof grouped>[number], { userId: number; n: bigint }> = true;
+
+  // CTE/derived row types derive from the source's projections; count stays
+  // bigint through the handle.
+  const src = db.select({ userId: reviews.userId, n: count() }).from(reviews).groupBy(reviews.userId);
+  const agg = cteTable("agg", src);
+  const fromCte = db.select({ userId: agg.userId, n: agg.n }).from(agg);
+  const eqCte: AssertEq<Awaited<typeof fromCte>[number], { userId: number; n: bigint }> = true;
+  // @ts-expect-error the derived column keeps its source type
+  const badCte: { n: number } = ({} as Awaited<typeof fromCte>[number]);
+
+  const wrapped = derivedTable("wrapped", fromCte);
+  const fromDerived = db.select().from(wrapped);
+  const eqDerived: AssertEq<Awaited<typeof fromDerived>[number], { userId: number; n: bigint }> = true;
+
+  // leftJoin over a derived handle nulls its columns (the handle's own name
+  // is the join identity).
+  const lj = db.select({ email: users.email, n: wrapped.n })
+    .from(users)
+    .leftJoin(wrapped, sql`${wrapped.userId} = ${users.id}`);
+  const eqLj: AssertEq<Awaited<typeof lj>[number], { email: string; n: bigint | null }> = true;
+  // @ts-expect-error left-joined derived columns are nullable
+  const badLj: { email: string; n: bigint } = ({} as Awaited<typeof lj>[number]);
+
+  // Set operations type rows by the first branch.
+  const u = db.select({ id: reviews.id }).from(reviews).union(db.select({ id: posts.id }).from(posts));
+  const eqU: AssertEq<Awaited<typeof u>[number], { id: number }> = true;
+  const compound: SetOpBuilder<{ id: number }> = u;
+  void compound;
+
+  // exists() takes a subquery node or any builder with .subquery().
+  const cond: Condition = exists(astSelect({ one: sql`1` }).from(reviews).where(sql`${reviews.userId} = ${users.id}`));
+  void db.select({ email: users.email }).from(users).where(cond);
+
+  // handle guards distinguish derived/CTE handles from tables and aliases.
+  const guard: boolean = isDerivedTableHandle(wrapped) && !isDerivedTableHandle(users) && !isAliasHandle(wrapped);
+  void guard;
+  const derivedType: DerivedTable<"wrapped", { userId: number; n: bigint }> = wrapped;
+  void derivedType;
+
+  void [eqAgg, badBodies, eqSum, eqGrouped, eqCte, badCte, eqDerived, eqLj, badLj, eqU, eqSeenAgg, eqSeenComposed];
+  void [g, s1, grouped, fromCte, fromDerived, lj, u, seenAgg, seenComposed];
+}
+void q02Fixtures;

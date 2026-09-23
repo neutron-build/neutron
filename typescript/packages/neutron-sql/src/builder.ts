@@ -23,18 +23,25 @@ import type {
   SelectTypeOf,
   UpdateTypeOf,
 } from "./schema.js";
-import { ALIAS_MARKER, getTableColumns, getTableName, isAliasHandle, isPgTable, rejectAliasHandle, tableRefParts } from "./schema.js";
+import { ALIAS_MARKER, getDerivedRecord, getTableColumns, getTableName, isAliasHandle, isPgTable, rejectAliasHandle, rejectDerivedTable, tableRefParts } from "./schema.js";
 import {
+  aggregateResultColumn,
   applyProjectionDecoders,
+  aggregateProjection,
+  canonicalTextWireNode,
   encodeWriteValue,
   projectionDecoder,
   wireReadNode,
+  type BigintMode,
   type ColumnContext,
   type EncodedValue,
   type ProjectionDecoder,
   type StatementCapability,
+  type TemporalMode,
 } from "./codecs.js";
+import type { ColumnDataType } from "./schema.js";
 import {
+  assertCteRefsResolve,
   cte,
   defaultCell,
   ident,
@@ -48,12 +55,15 @@ import {
   projection as projectionNode,
   qual,
   selectStatement,
+  statementReferencesName,
   subquery as subqueryNode,
   updateStatement,
   validAlias,
   deleteStatement,
+  type AggregateNode,
   type AnyStatementNode,
   type CteNode,
+  type FromTarget,
   type IdentifierNode,
   type InsertCell,
   type JoinType,
@@ -61,6 +71,7 @@ import {
   type ParamNode,
   type ProjectionNode,
   type QualifiedNode,
+  type SetOpKind,
   type StatementNode,
   type SubqueryNode,
   type ValueNode,
@@ -136,6 +147,69 @@ interface SelectPlan {
   readonly capabilities: StatementCapability[];
 }
 
+/** Q02 additions carried through forks: group-by expressions, having
+ *  conditions, distinct flag, explicitly registered CTEs. */
+interface SelectExtras {
+  readonly group: readonly ValueNode[];
+  readonly having: readonly Condition[];
+  readonly distinct: boolean;
+  readonly ctes: readonly StatementCte[];
+}
+
+const NO_EXTRAS: SelectExtras = Object.freeze({ group: [], having: [], distinct: false, ctes: [] });
+
+/** One registered CTE: name + source statement + the capabilities the source
+ *  acquired (merged into the consuming statement). */
+interface StatementCte {
+  readonly name: string;
+  readonly stmt: StatementNode;
+  readonly capabilities: readonly StatementCapability[];
+}
+
+/** Decode metadata for one output column of a plan — the shape
+ *  derivedTable()/cteTable() pseudo-columns are built from (Q02). */
+export interface PlanColumnSpec {
+  readonly key: string;
+  readonly dataType: ColumnDataType;
+  readonly readMode?: BigintMode | TemporalMode;
+  readonly valueDecoder?: (raw: string) => unknown;
+  readonly canonicalText?: boolean;
+}
+
+/** A full select plan: the statement node plus its decode plan, engine
+ *  capability requirements (CTE/derived sources merged in), and the output
+ *  column specs (for derived-table/CTE pseudo-columns). */
+export interface FullSelectPlan {
+  readonly stmt: StatementNode;
+  readonly decoders: readonly ProjectionDecoder[];
+  readonly capabilities: readonly StatementCapability[];
+  readonly columns: readonly PlanColumnSpec[];
+}
+
+/** Anything that can supply a select statement for a CTE, a derived table,
+ *  or a set-operation branch. SubqueryNode is the structural form. */
+export type SubquerySource =
+  | SubqueryNode
+  | { toPlan(): FullSelectPlan }
+  | { toAST(): StatementNode };
+
+/** Extract the statement (+ capabilities when known) from a subquery source.
+ *  AST builders carry no decode/capability plan — that is the typed layer's
+ *  contract — so they contribute none. */
+export function sourceStatement(source: SubquerySource): { stmt: StatementNode; capabilities: readonly StatementCapability[] } {
+  if (typeof source === "object" && source !== null && (source as { kind?: unknown }).kind === "subquery") {
+    return { stmt: (source as SubqueryNode).select, capabilities: [] };
+  }
+  if (typeof (source as { toPlan?: unknown }).toPlan === "function") {
+    const plan = (source as { toPlan(): FullSelectPlan }).toPlan();
+    return { stmt: plan.stmt, capabilities: plan.capabilities };
+  }
+  if (typeof (source as { toAST?: unknown }).toAST === "function") {
+    return { stmt: (source as { toAST(): StatementNode }).toAST(), capabilities: [] };
+  }
+  throw new Error("subquery source: requires a builder (toPlan/toAST) or a subquery node");
+}
+
 /** One typed join: the base table, its in-statement alias and the ON
  *  condition (undefined for cross joins). Frozen at construction. */
 interface JoinSpec {
@@ -151,13 +225,19 @@ export function tableTargetNode(table: AnyPgTable): IdentifierNode | QualifiedNo
   return parts.length === 1 ? ident(parts[0]) : qual(...parts);
 }
 
-/** Unwrap an alias() handle for a join slot. Fails closed on raw tables and
- *  non-handles: joins are keyed by alias, which is what keeps self joins and
- *  same-name tables in different schemas unambiguous. */
+/** Unwrap an alias() handle or a derived/CTE handle for a join slot. Fails
+ *  closed on raw tables and non-handles: joins are keyed by alias, which is
+ *  what keeps self joins and same-name tables in different schemas
+ *  unambiguous. Derived/CTE handles join under their own name (the subquery
+ *  inlines for derived, the CTE auto-registers for CTE handles). */
 function resolveAliasHandle(handle: unknown, who: string): { table: AnyPgTable; alias: string } {
+  const derived = typeof handle === "object" && handle !== null ? getDerivedRecord(handle as AnyPgTable) : undefined;
+  if (derived !== undefined) {
+    return { table: handle as AnyPgTable, alias: derived.name };
+  }
   if (!isAliasHandle(handle)) {
     throw new Error(
-      `${who}: joins take alias() handles — wrap the table with alias(table, "name") so every reference and the result mapping are unambiguous`,
+      `${who}: joins take alias() handles (or derivedTable/cteTable handles, which join under their own name) — wrap the table with alias(table, "name") so every reference and the result mapping are unambiguous`,
     );
   }
   const rec = handle[ALIAS_MARKER];
@@ -189,7 +269,7 @@ function selectPlanFor(tableRef: string[], tableName: string, entries: ColumnEnt
   let usesJsonb = false;
   for (const { propertyKey: key, column } of entries) {
     const ref = qual(...tableRef, column.columnName);
-    const wire = wireReadNode(column.dataType, ref);
+    const wire = column.canonicalText ? canonicalTextWireNode(column.dataType, ref) : wireReadNode(column.dataType, ref);
     if (wire !== null) {
       nodes.push(projectionNode(wire, key));
       usesJsonb = true;
@@ -218,8 +298,19 @@ export function whereItems(items: readonly ValueNode[]): ValueNode[] {
   return out;
 }
 
+/** Normalize one order/group term: order specs pass through, columns become
+ *  qualified references, value nodes render as authored. */
+function exprTerm(e: AnyColumnBuilder | ValueNode): ValueNode {
+  if (typeof e === "object" && e !== null && typeof (e as { columnName?: unknown }).columnName === "string" && (e as { kind?: unknown }).kind === undefined) {
+    const col = e as unknown as AnyColumnBuilder;
+    if (col.ownerTable) return qual(...tableRefParts(col.ownerTable), col.columnName);
+    return ident(col.columnName);
+  }
+  return e as ValueNode;
+}
+
 function orderSpecs(order: readonly OrderExpression[]): OrderSpec[] {
-  return order.map((o) => (typeof (o as OrderSpec).direction === "string" ? (o as OrderSpec) : { expr: o as ValueNode, direction: "asc" as const }));
+  return order.map((o) => (typeof (o as OrderSpec).direction === "string" ? (o as OrderSpec) : { expr: exprTerm(o as ValueNode), direction: "asc" as const }));
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +352,10 @@ export type ProjectionResult<P extends Projection> = {
 /** One projected field under join nullability. An aliased column widens to
  *  `| null` when its alias is on the nullable side of an outer join (the
  *  alias is the join identity); a plain (from-table) column widens when the
- *  from side is the nullable side (right/full join). */
+ *  from side is the nullable side (right/full join). Aggregate projections
+ *  carry their own typed nullability (count is never null; the other
+ *  aggregates are `| null` on empty input) and outer-join nullability of
+ *  their inputs is already captured by aggregate semantics. */
 export type JoinFieldType<V, N extends string, F extends boolean> = V extends AnyColumnBuilder
   ? V extends { readonly aliasTag: infer A }
     ? A extends N
@@ -270,7 +364,9 @@ export type JoinFieldType<V, N extends string, F extends boolean> = V extends An
     : F extends true
       ? SelectTypeOf<V> | null
       : SelectTypeOf<V>
-  : unknown;
+  : V extends AggregateNode<infer T>
+    ? T
+    : unknown;
 
 /** Result row of a joined select: the projected fields with outer-join
  *  nullability applied (`R0` is the no-projection base row, nulled field-wise
@@ -287,6 +383,7 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
   private readonly ctx: ExecContext;
   private readonly table: AnyPgTable;
   private readonly projection: Projection | null;
+  private readonly extras: SelectExtras;
 
   constructor(
     ctx: ExecContext,
@@ -297,6 +394,7 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
     private readonly order: readonly OrderExpression[] = [],
     private readonly limitCount: number | undefined = undefined,
     private readonly offsetCount: number | undefined = undefined,
+    extras: SelectExtras = NO_EXTRAS,
   ) {
     // The projection is copied and frozen at construction (shallow): the
     // caller's object stays theirs, and every fork compiles the snapshot it
@@ -315,11 +413,21 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
       }
       this.projection = Object.freeze(copy);
     }
+    this.extras = Object.freeze({
+      group: Object.freeze([...extras.group]),
+      having: Object.freeze([...extras.having]),
+      distinct: extras.distinct === true,
+      ctes: Object.freeze([...extras.ctes]),
+    });
     for (const spec of this.joinSpecs) Object.freeze(spec);
     Object.freeze(this.joinSpecs);
     Object.freeze(this.conditions);
     Object.freeze(this.order);
     Object.freeze(this);
+  }
+
+  private fork(extras: SelectExtras): SelectBuilder<P, R0, N, F> {
+    return new SelectBuilder<P, R0, N, F>(this.ctx, this.table, this.projection as P, this.joinSpecs, this.conditions, this.order, this.limitCount, this.offsetCount, extras);
   }
 
   // -------------------------------------------------------------------------
@@ -331,7 +439,12 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
   innerJoin<C extends Record<string, AnyColumnBuilder>, A extends string>(
     handle: AliasedTable<C, A>,
     on: Condition,
-  ): SelectBuilder<P, R0, N, F> {
+  ): SelectBuilder<P, R0, N, F>;
+  innerJoin<R2 extends Record<string, unknown>, A2 extends string>(
+    handle: import("./subqueries.js").DerivedTable<A2, R2>,
+    on: Condition,
+  ): SelectBuilder<P, R0, N, F>;
+  innerJoin(handle: unknown, on: Condition): SelectBuilder<P, R0, N, F> {
     rejectLegacyFragment(on, "innerJoin on");
     const { table, alias } = resolveAliasHandle(handle, "innerJoin");
     return this.forkJoin<N, F>({ type: "inner", table, alias, on });
@@ -340,16 +453,26 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
   leftJoin<C extends Record<string, AnyColumnBuilder>, A extends string>(
     handle: AliasedTable<C, A>,
     on: Condition,
-  ): SelectBuilder<P, R0, N | A, F> {
+  ): SelectBuilder<P, R0, N | A, F>;
+  leftJoin<R2 extends Record<string, unknown>, A2 extends string>(
+    handle: import("./subqueries.js").DerivedTable<A2, R2>,
+    on: Condition,
+  ): SelectBuilder<P, R0, N | A2, F>;
+  leftJoin(handle: unknown, on: Condition): SelectBuilder<P, R0, N, F> {
     rejectLegacyFragment(on, "leftJoin on");
     const { table, alias } = resolveAliasHandle(handle, "leftJoin");
-    return this.forkJoin<N | A, F>({ type: "left", table, alias, on });
+    return this.forkJoin<N, F>({ type: "left", table, alias, on });
   }
 
   rightJoin<C extends Record<string, AnyColumnBuilder>, A extends string>(
     handle: AliasedTable<C, A>,
     on: Condition,
-  ): SelectBuilder<P, R0, N, true> {
+  ): SelectBuilder<P, R0, N, true>;
+  rightJoin<R2 extends Record<string, unknown>, A2 extends string>(
+    handle: import("./subqueries.js").DerivedTable<A2, R2>,
+    on: Condition,
+  ): SelectBuilder<P, R0, N, true>;
+  rightJoin(handle: unknown, on: Condition): SelectBuilder<P, R0, N, true> {
     rejectLegacyFragment(on, "rightJoin on");
     const { table, alias } = resolveAliasHandle(handle, "rightJoin");
     return this.forkJoin<N, true>({ type: "right", table, alias, on });
@@ -358,15 +481,31 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
   fullJoin<C extends Record<string, AnyColumnBuilder>, A extends string>(
     handle: AliasedTable<C, A>,
     on: Condition,
-  ): SelectBuilder<P, R0, N | A, true> {
+  ): SelectBuilder<P, R0, N | A, true>;
+  fullJoin<R2 extends Record<string, unknown>, A2 extends string>(
+    handle: import("./subqueries.js").DerivedTable<A2, R2>,
+    on: Condition,
+  ): SelectBuilder<P, R0, N | A2, true>;
+  fullJoin(handle: unknown, on: Condition): SelectBuilder<P, R0, N, true> {
     rejectLegacyFragment(on, "fullJoin on");
     const { table, alias } = resolveAliasHandle(handle, "fullJoin");
-    return this.forkJoin<N | A, true>({ type: "full", table, alias, on });
+    return this.forkJoin<N, true>({ type: "full", table, alias, on });
   }
 
   crossJoin<C extends Record<string, AnyColumnBuilder>, A extends string>(
     handle: AliasedTable<C, A>,
-  ): SelectBuilder<P, R0, N, F> {
+    on?: never,
+  ): SelectBuilder<P, R0, N, F>;
+  crossJoin<R2 extends Record<string, unknown>, A2 extends string>(
+    handle: import("./subqueries.js").DerivedTable<A2, R2>,
+    on?: never,
+  ): SelectBuilder<P, R0, N, F>;
+  crossJoin(handle: unknown, on?: never): SelectBuilder<P, R0, N, F> {
+    // Q01 review MINOR-1: a runtime ON argument must never be silently
+    // dropped — a loose-typed caller would get a cartesian product.
+    if (arguments.length > 1 && arguments[1] !== undefined) {
+      throw new Error("crossJoin: cross joins take no on condition — use innerJoin/leftJoin/rightJoin/fullJoin or drop the condition");
+    }
     const { table, alias } = resolveAliasHandle(handle, "crossJoin");
     return this.forkJoin<N, F>({ type: "cross", table, alias, on: undefined });
   }
@@ -384,28 +523,121 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
       this.order,
       this.limitCount,
       this.offsetCount,
+      this.extras,
     );
+  }
+
+  // -------------------------------------------------------------------------
+  // Set operations (Q02): union/union all/intersect/intersect all/except/
+  // except all chain left-associatively in call order (branches render
+  // parenthesized), and the result rows are typed by the FIRST branch —
+  // PostgreSQL takes output column names and types from it.
+  // -------------------------------------------------------------------------
+
+  union<P2 extends Projection | null, R02, N2 extends string, F2 extends boolean>(other: SelectBuilder<P2, R02, N2, F2>): SetOpBuilder<JoinRowOf<P, R0, N, F>> {
+    return SetOpBuilder.compound<JoinRowOf<P, R0, N, F>>(this.ctx, this.toPlan(), "union", other);
+  }
+
+  unionAll<P2 extends Projection | null, R02, N2 extends string, F2 extends boolean>(other: SelectBuilder<P2, R02, N2, F2>): SetOpBuilder<JoinRowOf<P, R0, N, F>> {
+    return SetOpBuilder.compound<JoinRowOf<P, R0, N, F>>(this.ctx, this.toPlan(), "union all", other);
+  }
+
+  intersect<P2 extends Projection | null, R02, N2 extends string, F2 extends boolean>(other: SelectBuilder<P2, R02, N2, F2>): SetOpBuilder<JoinRowOf<P, R0, N, F>> {
+    return SetOpBuilder.compound<JoinRowOf<P, R0, N, F>>(this.ctx, this.toPlan(), "intersect", other);
+  }
+
+  intersectAll<P2 extends Projection | null, R02, N2 extends string, F2 extends boolean>(other: SelectBuilder<P2, R02, N2, F2>): SetOpBuilder<JoinRowOf<P, R0, N, F>> {
+    return SetOpBuilder.compound<JoinRowOf<P, R0, N, F>>(this.ctx, this.toPlan(), "intersect all", other);
+  }
+
+  except<P2 extends Projection | null, R02, N2 extends string, F2 extends boolean>(other: SelectBuilder<P2, R02, N2, F2>): SetOpBuilder<JoinRowOf<P, R0, N, F>> {
+    return SetOpBuilder.compound<JoinRowOf<P, R0, N, F>>(this.ctx, this.toPlan(), "except", other);
+  }
+
+  exceptAll<P2 extends Projection | null, R02, N2 extends string, F2 extends boolean>(other: SelectBuilder<P2, R02, N2, F2>): SetOpBuilder<JoinRowOf<P, R0, N, F>> {
+    return SetOpBuilder.compound<JoinRowOf<P, R0, N, F>>(this.ctx, this.toPlan(), "except all", other);
   }
 
   where(condition: Condition): SelectBuilder<P, R0, N, F> {
     rejectLegacyFragment(condition, "where");
-    return new SelectBuilder<P, R0, N, F>(this.ctx, this.table, this.projection as P, this.joinSpecs, [...this.conditions, condition], this.order, this.limitCount, this.offsetCount);
+    return new SelectBuilder<P, R0, N, F>(this.ctx, this.table, this.projection as P, this.joinSpecs, [...this.conditions, condition], this.order, this.limitCount, this.offsetCount, this.extras);
   }
 
-  orderBy(...exprs: OrderExpression[]): SelectBuilder<P, R0, N, F> {
+  orderBy(...exprs: Array<AnyColumnBuilder | OrderExpression>): SelectBuilder<P, R0, N, F> {
     for (const e of exprs) {
       rejectLegacyFragment(e, "orderBy");
       rejectLegacyFragment((e as OrderSpec).expr, "orderBy");
     }
-    return new SelectBuilder<P, R0, N, F>(this.ctx, this.table, this.projection as P, this.joinSpecs, this.conditions, [...this.order, ...exprs], this.limitCount, this.offsetCount);
+    const added = exprs.map((e) => (typeof (e as OrderSpec).direction === "string" ? (e as OrderSpec) : exprTerm(e as AnyColumnBuilder | ValueNode)));
+    return new SelectBuilder<P, R0, N, F>(this.ctx, this.table, this.projection as P, this.joinSpecs, this.conditions, [...this.order, ...added], this.limitCount, this.offsetCount, this.extras);
   }
 
   limit(n: number): SelectBuilder<P, R0, N, F> {
-    return new SelectBuilder<P, R0, N, F>(this.ctx, this.table, this.projection as P, this.joinSpecs, this.conditions, this.order, n, this.offsetCount);
+    return new SelectBuilder<P, R0, N, F>(this.ctx, this.table, this.projection as P, this.joinSpecs, this.conditions, this.order, n, this.offsetCount, this.extras);
   }
 
   offset(n: number): SelectBuilder<P, R0, N, F> {
-    return new SelectBuilder<P, R0, N, F>(this.ctx, this.table, this.projection as P, this.joinSpecs, this.conditions, this.order, this.limitCount, n);
+    return new SelectBuilder<P, R0, N, F>(this.ctx, this.table, this.projection as P, this.joinSpecs, this.conditions, this.order, this.limitCount, n, this.extras);
+  }
+
+  // -------------------------------------------------------------------------
+  // Q02: group by / having / distinct / CTEs / set operations
+  // -------------------------------------------------------------------------
+
+  /** Group by columns or expressions. Multiple calls accumulate (AND of the
+   *  grouping terms). Columns render as qualified references; fragments and
+   *  other value nodes render as authored. */
+  groupBy(...exprs: Array<AnyColumnBuilder | ValueNode>): SelectBuilder<P, R0, N, F> {
+    const terms: ValueNode[] = [];
+    for (const e of exprs) {
+      rejectLegacyFragment(e, "groupBy");
+      if (typeof e === "object" && e !== null && typeof (e as { direction?: unknown }).direction === "string") {
+        throw new Error("groupBy: order specs are not group terms — pass columns or expressions, not asc()/desc()");
+      }
+      const term = exprTerm(e as AnyColumnBuilder | ValueNode);
+      rejectLegacyFragment(term, "groupBy");
+      terms.push(term);
+    }
+    return this.fork({ ...this.extras, group: [...this.extras.group, ...terms] });
+  }
+
+  /** HAVING conditions — the same AST values `where` takes (aggregates,
+   *  fragments, combinators), joined with `and`, fragments delimited (the
+   *  F04 Grouping guarantee applies to HAVING). */
+  having(condition: Condition): SelectBuilder<P, R0, N, F> {
+    rejectLegacyFragment(condition, "having");
+    return this.fork({ ...this.extras, having: [...this.extras.having, condition] });
+  }
+
+  /** Plain `select distinct` — one row per distinct projection tuple. */
+  distinct(): SelectBuilder<P, R0, N, F> {
+    return this.fork({ ...this.extras, distinct: true });
+  }
+
+  /** Register a CTE by name (`with "name" as (source)`). The consuming
+   *  statement carries the source's capability requirements. Prefer
+   *  `cteTable(name, source)` — it registers the CTE automatically when
+   *  referenced in from/joins. */
+  withCte(name: string, source: SubquerySource): SelectBuilder<P, R0, N, F> {
+    validAlias(name, "withCte");
+    const { stmt, capabilities } = sourceStatement(source);
+    return this.fork({ ...this.extras, ctes: [...this.extras.ctes, { name, stmt, capabilities }] });
+  }
+
+  /** Wrap this builder's statement for interpolation into a parent query. */
+  subquery(): SubqueryNode {
+    return subqueryNode(this.toPlan().stmt);
+  }
+
+  /** The statement as a frozen AST — composition point for subqueries. */
+  toAST(): StatementNode {
+    return this.toPlan().stmt;
+  }
+
+  /** Full plan (statement + decode plan + capability requirements). Internal
+   *  composition seam shared with CTEs, derived tables and set operations. */
+  toPlan(): FullSelectPlan {
+    return this.buildPlan();
   }
 
   private projectionEntries(): Array<{ key: string; column: AnyColumnBuilder | null }> {
@@ -418,32 +650,56 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
     }));
   }
 
-  /** The statement + decode plan; pure — same builder state compiles to
-   *  byte-identical SQL. */
-  toCompiled(): CompiledStatement {
+  /** The full plan: statement node + decode plan + capability requirements.
+   *  Pure — same builder state compiles to byte-identical SQL. Derived/CTE
+   *  from/join targets resolve here (derived inline as `(select …) as
+   *  "name"`, CTE handles reference the bare name and auto-register their
+   *  CTE), and every source's capability requirements merge in. */
+  private buildPlan(): FullSelectPlan {
     const tableName = getTableName(this.table);
     const tableRef = tableRefParts(this.table);
     const nodes: ProjectionNode[] = [];
     const decoders: ProjectionDecoder[] = [];
-    let usesJsonb = false;
+    const columns: PlanColumnSpec[] = [];
+    const caps = new Set<StatementCapability>();
+    const pushColumn = (spec: PlanColumnSpec): void => {
+      columns.push(spec.readMode === undefined && spec.valueDecoder === undefined && spec.canonicalText !== true ? { key: spec.key, dataType: spec.dataType } : spec);
+    };
 
     if (this.projection) {
       for (const [key, value] of Object.entries(this.projection)) {
         if (isValueNode(value)) {
+          if (value.kind === "aggregate") {
+            const plan = aggregateProjection(value, key);
+            nodes.push(plan.node);
+            if (plan.decoder) decoders.push(plan.decoder);
+            if (plan.usesJsonb) caps.add("jsonb-functions");
+            const spec = aggregateResultColumn(value);
+            pushColumn({ key, dataType: spec.dataType, readMode: spec.readMode, valueDecoder: spec.valueDecoder, canonicalText: spec.dataType === "timestamp" || spec.dataType === "timestamptz" || spec.dataType === "date" });
+            continue;
+          }
           nodes.push(projectionNode(value, key));
+          pushColumn({ key, dataType: "text" });
           continue;
         }
         const parts = value.ownerTable ? tableRefParts(value.ownerTable) : tableRef;
         const ref = qual(...parts, value.columnName);
-        const wire = wireReadNode(value.dataType, ref);
+        const wire = value.canonicalText ? canonicalTextWireNode(value.dataType, ref) : wireReadNode(value.dataType, ref);
         if (wire !== null) {
           nodes.push(projectionNode(wire, key));
-          usesJsonb = true;
+          caps.add("jsonb-functions");
         } else {
           nodes.push(projectionNode(ref, key === value.columnName ? undefined : key));
         }
         const decoder = projectionDecoder(parts.join("."), value, key);
         if (decoder) decoders.push(decoder);
+        pushColumn({
+          key,
+          dataType: value.dataType,
+          readMode: value.readMode as BigintMode | TemporalMode | undefined,
+          valueDecoder: value.valueDecoder,
+          canonicalText: value.dataType === "timestamp" || value.dataType === "timestamptz" || value.dataType === "date",
+        });
       }
     } else {
       // Default projection with joins: the from table's columns only.
@@ -452,23 +708,104 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
       const plan = selectPlanFor(tableRef, tableName, columnEntries(this.table));
       nodes.push(...plan.nodes);
       decoders.push(...plan.decoders);
-      usesJsonb = plan.capabilities.length > 0;
+      for (const c of plan.capabilities) caps.add(c);
+      for (const { propertyKey: key, column } of columnEntries(this.table)) {
+        pushColumn({
+          key,
+          dataType: column.dataType,
+          readMode: column.readMode as BigintMode | TemporalMode | undefined,
+          valueDecoder: column.valueDecoder,
+          canonicalText: column.dataType === "timestamp" || column.dataType === "timestamptz" || column.dataType === "date",
+        });
+      }
     }
 
     assertDistinctJoinAliases(this.table, this.joinSpecs);
+
+    // CTE registration: explicit withCte() calls first, then CTE handles
+    // referenced in from/joins. Same name + same statement is idempotent;
+    // same name + different statement fails closed (ambiguous identity).
+    const cteRegs = new Map<string, StatementCte>();
+    const registerCte = (reg: StatementCte): void => {
+      const prior = cteRegs.get(reg.name);
+      if (prior === undefined) {
+        cteRegs.set(reg.name, reg);
+        return;
+      }
+      if (prior.stmt !== reg.stmt) {
+        throw new Error(`cte "${reg.name}": registered twice with different statements — a CTE name has one definition per statement`);
+      }
+    };
+    for (const reg of this.extras.ctes) registerCte(reg);
+
+    // From-target resolution: derived handles inline their subquery, CTE
+    // handles reference the bare name (and register their CTE).
+    const fromRec = getDerivedRecord(this.table);
+    let from: FromTarget;
+    let fromAlias: string | undefined;
+    if (fromRec?.kind === "derived") {
+      from = subqueryNode(fromRec.select);
+      fromAlias = fromRec.name;
+      for (const c of fromRec.capabilities) caps.add(c);
+    } else if (fromRec?.kind === "cte") {
+      from = ident(fromRec.name);
+      registerCte({ name: fromRec.name, stmt: fromRec.select, capabilities: fromRec.capabilities });
+      for (const c of fromRec.capabilities) caps.add(c);
+    } else {
+      from = tableTargetNode(this.table);
+    }
+
+    const joins = this.joinSpecs.map((j): ReturnType<typeof joinNode> => {
+      const rec = getDerivedRecord(j.table);
+      if (rec?.kind === "derived") {
+        for (const c of rec.capabilities) caps.add(c);
+        return joinNode(j.type, subqueryNode(rec.select), { alias: j.alias, on: j.on });
+      }
+      if (rec?.kind === "cte") {
+        registerCte({ name: rec.name, stmt: rec.select, capabilities: rec.capabilities });
+        for (const c of rec.capabilities) caps.add(c);
+        return joinNode(j.type, ident(rec.name), { alias: j.alias, on: j.on });
+      }
+      return joinNode(j.type, tableTargetNode(j.table), { alias: j.alias, on: j.on });
+    });
+
+    // `with recursive` is required exactly when a CTE self-references —
+    // detected structurally (fragment text is never scanned; a hand-typed
+    // self-reference inside fragment text fails closed at the database).
+    let recursive = false;
+    for (const reg of cteRegs.values()) {
+      if (statementReferencesName(reg.stmt, reg.name)) recursive = true;
+      for (const c of reg.capabilities) caps.add(c);
+    }
+
     const stmt: StatementNode = selectStatement({
+      ctes: [...cteRegs.values()].map((reg) => cte(reg.name, reg.stmt)),
+      recursive,
+      distinct: this.extras.distinct,
       projections: nodes,
-      from: tableTargetNode(this.table),
-      joins: this.joinSpecs.map((j) => joinNode(j.type, tableTargetNode(j.table), { alias: j.alias, on: j.on })),
+      from,
+      fromAlias,
+      joins,
       where: whereItems(this.conditions),
+      groupBy: groupExprs(this.extras.group),
+      having: whereItems(this.extras.having),
       orderBy: orderSpecs(this.order),
       limit: this.limitCount,
       offset: this.offsetCount,
     });
+    // Fragment-spliced CTE references must resolve to a registered CTE of the
+    // same source (Q02 review MINOR-2): unregistered or shadowed same-name
+    // references fail closed here instead of silently binding.
+    assertCteRefsResolve(stmt);
+    return { stmt, decoders, capabilities: [...caps], columns };
+  }
+
+  toCompiled(): CompiledStatement {
+    const plan = this.buildPlan();
     return {
-      ...compileStatement(stmt),
-      decoders,
-      capabilities: usesJsonb ? ["jsonb-functions"] : [],
+      ...compileStatement(plan.stmt),
+      decoders: plan.decoders,
+      capabilities: plan.capabilities,
     };
   }
 
@@ -492,6 +829,164 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
   }
 }
 
+/** Group-by terms: columns render as qualified references, value nodes as
+ *  authored (order specs are rejected — they are not group terms). */
+function groupExprs(group: readonly OrderExpression[]): ValueNode[] {
+  return group as readonly ValueNode[] as ValueNode[];
+}
+
+// ---------------------------------------------------------------------------
+// Set operations (Q02) — union / union all / intersect / intersect all /
+// except / except all over typed select builders.
+// ---------------------------------------------------------------------------
+
+interface SetOpBranchSpec {
+  readonly op: SetOpKind;
+  readonly plan: FullSelectPlan;
+}
+
+/** A compound select: the first branch plus trailing set operations. Chained
+ *  set operations compose LEFT-ASSOCIATIVELY in call order (branches render
+ *  parenthesized, so SQL's intersect-over-union precedence never reorders
+ *  them). Result rows are typed by the first branch; PostgreSQL takes output
+ *  column names from it, and the first branch's decode plan applies (branch
+ *  projections must be structurally aligned — same output keys and wire
+ *  forms). orderBy/limit/offset on the compound apply to the WHOLE compound
+ *  per PostgreSQL semantics. */
+export class SetOpBuilder<R> implements PromiseLike<R[]> {
+  private constructor(
+    private readonly ctx: ExecContext,
+    private readonly first: FullSelectPlan,
+    private readonly branches: readonly SetOpBranchSpec[],
+    private readonly order: readonly OrderExpression[] = [],
+    private readonly limitCount: number | undefined = undefined,
+    private readonly offsetCount: number | undefined = undefined,
+  ) {
+    Object.freeze(this.branches);
+    Object.freeze(this.order);
+    Object.freeze(this);
+  }
+
+  /** Start a compound from a first branch + one trailing operation. The
+   *  first branch's own ORDER BY/LIMIT cannot survive composition: in SQL
+   *  they would silently bind to the compound — fail closed instead. */
+  static compound<R>(ctx: ExecContext, first: FullSelectPlan, op: SetOpKind, other: SubquerySource): SetOpBuilder<R> {
+    if (first.stmt.orderBy.length > 0 || first.stmt.limit !== undefined || first.stmt.offset !== undefined) {
+      throw new Error("set operations: the first branch carries orderBy/limit/offset — in SQL these would silently bind to the compound; order/limit the compound after the set operation instead");
+    }
+    const { stmt, capabilities } = sourceStatement(other);
+    return new SetOpBuilder<R>(ctx, first, [{ op, plan: { stmt, decoders: [], capabilities, columns: [] } }]);
+  }
+
+  private fork<R2>(branches: readonly SetOpBranchSpec[], order?: readonly OrderExpression[], limit?: number, offset?: number): SetOpBuilder<R2> {
+    return new SetOpBuilder<R2>(this.ctx, this.first, branches, order ?? this.order, limit ?? this.limitCount, offset ?? this.offsetCount);
+  }
+
+  private add<R2>(op: SetOpKind, other: SubquerySource): SetOpBuilder<R2> {
+    const { stmt, capabilities } = sourceStatement(other);
+    return this.fork<R2>([...this.branches, { op, plan: { stmt, decoders: [], capabilities, columns: [] } }]);
+  }
+
+  union<P extends Projection | null, R0, N extends string, F extends boolean>(other: SelectBuilder<P, R0, N, F>): SetOpBuilder<R> {
+    return this.add<R>("union", other);
+  }
+
+  unionAll<P extends Projection | null, R0, N extends string, F extends boolean>(other: SelectBuilder<P, R0, N, F>): SetOpBuilder<R> {
+    return this.add<R>("union all", other);
+  }
+
+  intersect<P extends Projection | null, R0, N extends string, F extends boolean>(other: SelectBuilder<P, R0, N, F>): SetOpBuilder<R> {
+    return this.add<R>("intersect", other);
+  }
+
+  intersectAll<P extends Projection | null, R0, N extends string, F extends boolean>(other: SelectBuilder<P, R0, N, F>): SetOpBuilder<R> {
+    return this.add<R>("intersect all", other);
+  }
+
+  except<P extends Projection | null, R0, N extends string, F extends boolean>(other: SelectBuilder<P, R0, N, F>): SetOpBuilder<R> {
+    return this.add<R>("except", other);
+  }
+
+  exceptAll<P extends Projection | null, R0, N extends string, F extends boolean>(other: SelectBuilder<P, R0, N, F>): SetOpBuilder<R> {
+    return this.add<R>("except all", other);
+  }
+
+  orderBy(...exprs: Array<AnyColumnBuilder | OrderExpression>): SetOpBuilder<R> {
+    for (const e of exprs) {
+      rejectLegacyFragment(e, "orderBy");
+      rejectLegacyFragment((e as OrderSpec).expr, "orderBy");
+    }
+    const added = exprs.map((e) => (typeof (e as OrderSpec).direction === "string" ? (e as OrderSpec) : exprTerm(e as AnyColumnBuilder | ValueNode)));
+    return this.fork<R>(this.branches, [...this.order, ...added]);
+  }
+
+  limit(n: number): SetOpBuilder<R> {
+    return this.fork<R>(this.branches, undefined, n, this.offsetCount);
+  }
+
+  offset(n: number): SetOpBuilder<R> {
+    return this.fork<R>(this.branches, undefined, this.limitCount, n);
+  }
+
+  /** Composition point: the compound as a subquery node. */
+  subquery(): SubqueryNode {
+    return subqueryNode(this.toAST());
+  }
+
+  /** The compound as a frozen AST. */
+  toAST(): StatementNode {
+    const s = this.first.stmt;
+    return selectStatement({
+      ctes: s.ctes,
+      recursive: s.recursive,
+      distinct: s.distinct,
+      projections: s.projections,
+      from: s.from,
+      fromAlias: s.fromAlias,
+      joins: s.joins,
+      where: s.where,
+      groupBy: s.groupBy,
+      having: s.having,
+      setOps: this.branches.map((b) => ({ op: b.op, select: b.plan.stmt })),
+      orderBy: orderSpecs(this.order),
+      limit: this.limitCount,
+      offset: this.offsetCount,
+    });
+  }
+
+  /** Full plan: the first branch's decode plan + the merged capability
+   *  requirements of every branch. */
+  toPlan(): FullSelectPlan {
+    const caps = new Set<StatementCapability>(this.first.capabilities);
+    for (const b of this.branches) for (const c of b.plan.capabilities) caps.add(c);
+    return { stmt: this.toAST(), decoders: this.first.decoders, capabilities: [...caps], columns: this.first.columns };
+  }
+
+  toCompiled(): CompiledStatement {
+    const plan = this.toPlan();
+    return { ...compileStatement(plan.stmt), decoders: plan.decoders, capabilities: plan.capabilities };
+  }
+
+  toSQL(): { sql: string; params: unknown[] } {
+    const compiled = this.toCompiled();
+    return { sql: compiled.sql, params: compiled.params as unknown[] };
+  }
+
+  async execute(): Promise<R[]> {
+    const compiled = this.toCompiled();
+    const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query", compiled.capabilities)) as Array<Record<string, unknown>>;
+    applyProjectionDecoders(rows, compiled.decoders);
+    return rows as R[];
+  }
+
+  then<R1 = R[], R2 = never>(
+    onfulfilled?: ((value: R[]) => R1 | PromiseLike<R1>) | null,
+    onrejected?: ((reason: unknown) => R2 | PromiseLike<R2>) | null,
+  ): Promise<R1 | R2> {
+    return this.execute().then(onfulfilled, onrejected);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Insert
 // ---------------------------------------------------------------------------
@@ -505,6 +1000,7 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     private readonly wantsReturning = false,
   ) {
     rejectAliasHandle(table, "insert");
+    rejectDerivedTable(table, "insert");
     Object.freeze(this.rows);
     Object.freeze(this);
   }
@@ -661,6 +1157,7 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     private readonly wantsReturning = false,
   ) {
     rejectAliasHandle(table, "update");
+    rejectDerivedTable(table, "update");
     Object.freeze(this.sets);
     Object.freeze(this.conditions);
     Object.freeze(this);
@@ -728,6 +1225,7 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
       where: whereItems(this.conditions),
       returning: returningPlan.nodes,
     });
+    assertCteRefsResolve(stmt);
     return {
       ...compileStatement(stmt),
       decoders: returningPlan.decoders,
@@ -770,6 +1268,7 @@ export class DeleteBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     private readonly wantsReturning = false,
   ) {
     rejectAliasHandle(table, "delete");
+    rejectDerivedTable(table, "delete");
     Object.freeze(this.conditions);
     Object.freeze(this);
   }
@@ -799,6 +1298,7 @@ export class DeleteBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
       where: whereItems(this.conditions),
       returning: returningPlan.nodes,
     });
+    assertCteRefsResolve(stmt);
     return {
       ...compileStatement(stmt),
       decoders: returningPlan.decoders,
@@ -870,8 +1370,18 @@ interface AstFromSpec {
   readonly alias: string | undefined;
 }
 
+interface AstExtras {
+  readonly group: readonly ValueNode[];
+  readonly having: readonly ValueNode[];
+  readonly distinct: boolean;
+  readonly setOps: readonly { op: SetOpKind; select: StatementNode }[];
+}
+
+const AST_NO_EXTRAS: AstExtras = Object.freeze({ group: [], having: [], distinct: false, setOps: [] });
+
 export class AstSelectBuilder {
   private readonly projectionSpec: AstProjection | null;
+  private readonly extras: AstExtras;
 
   /** Internal — construct through `astSelect()`. Kept public only so the
    *  entry-point factory can build instances; the shape is not API. */
@@ -884,6 +1394,7 @@ export class AstSelectBuilder {
     private readonly cteSpecs: readonly CteNode[],
     private readonly limitCount: number | undefined,
     private readonly offsetCount: number | undefined,
+    extras: AstExtras = AST_NO_EXTRAS,
   ) {
     // F-R2: the freeze must be deep over builder-owned state. Forks share
     // these arrays (copy-on-write), so a mutable array would let one branch
@@ -903,6 +1414,12 @@ export class AstSelectBuilder {
       }
       this.projectionSpec = Object.freeze(copy);
     }
+    this.extras = Object.freeze({
+      group: Object.freeze([...extras.group]),
+      having: Object.freeze([...extras.having]),
+      distinct: extras.distinct === true,
+      setOps: Object.freeze([...extras.setOps]),
+    });
     Object.freeze(this.fromSpec);
     for (const spec of this.joinSpecs) Object.freeze(spec);
     Object.freeze(this.joinSpecs);
@@ -911,6 +1428,10 @@ export class AstSelectBuilder {
     Object.freeze(this.orders);
     Object.freeze(this.cteSpecs);
     Object.freeze(this);
+  }
+
+  private fork(extras: AstExtras): AstSelectBuilder {
+    return new AstSelectBuilder(this.fromSpec, this.projectionSpec, this.joinSpecs, this.wheres, this.orders, this.cteSpecs, this.limitCount, this.offsetCount, extras);
   }
 
   /** Non-cross joins need a condition; cross joins take none. */
@@ -931,6 +1452,7 @@ export class AstSelectBuilder {
       this.cteSpecs,
       this.limitCount,
       this.offsetCount,
+      this.extras,
     );
   }
 
@@ -950,7 +1472,11 @@ export class AstSelectBuilder {
     return this.join("full", table, alias, on);
   }
 
-  crossJoin(table: AstJoinTarget, alias: string | undefined): AstSelectBuilder {
+  crossJoin(table: AstJoinTarget, alias: string | undefined, on?: never): AstSelectBuilder {
+    // Q01 review MINOR-1: reject a runtime ON argument instead of dropping it.
+    if (arguments.length > 2 && arguments[2] !== undefined) {
+      throw new Error("ast crossJoin: cross joins take no on condition — use join(\"inner\"|\"left\"|…) or drop the condition");
+    }
     return this.join("cross", table, alias, undefined);
   }
 
@@ -965,6 +1491,7 @@ export class AstSelectBuilder {
       this.cteSpecs,
       this.limitCount,
       this.offsetCount,
+      this.extras,
     );
   }
 
@@ -979,19 +1506,22 @@ export class AstSelectBuilder {
       this.cteSpecs,
       this.limitCount,
       this.offsetCount,
+      this.extras,
     );
   }
 
-  withCte(name: string, sub: SubqueryNode): AstSelectBuilder {
+  withCte(name: string, sub: SubqueryNode | { subquery(): SubqueryNode }): AstSelectBuilder {
+    const stmt = typeof (sub as { subquery?: unknown }).subquery === "function" ? (sub as { subquery(): SubqueryNode }).subquery().select : (sub as SubqueryNode).select;
     return new AstSelectBuilder(
       this.fromSpec,
       this.projectionSpec,
       this.joinSpecs,
       this.wheres,
       this.orders,
-      [...this.cteSpecs, cte(name, sub.select)],
+      [...this.cteSpecs, cte(name, stmt)],
       this.limitCount,
       this.offsetCount,
+      this.extras,
     );
   }
 
@@ -1005,6 +1535,7 @@ export class AstSelectBuilder {
       this.cteSpecs,
       n,
       this.offsetCount,
+      this.extras,
     );
   }
 
@@ -1018,27 +1549,129 @@ export class AstSelectBuilder {
       this.cteSpecs,
       this.limitCount,
       n,
+      this.extras,
     );
   }
 
-  /** The statement as a frozen AST — composition point for subqueries. */
+  // -------------------------------------------------------------------------
+  // Q02: group by / having / distinct / set operations. Set operations on
+  // this structural builder compose left-associatively in call order
+  // (branches render parenthesized); orderBy/limit/offset set AFTER a set
+  // operation apply to the whole compound per PostgreSQL semantics.
+  // -------------------------------------------------------------------------
+
+  groupBy(...exprs: Array<AnyColumnBuilder | ValueNode>): AstSelectBuilder {
+    const terms = exprs.map((e) => {
+      rejectLegacyFragment(e, "astSelect groupBy");
+      return exprTerm(e);
+    });
+    for (const t of terms) rejectLegacyFragment(t, "astSelect groupBy");
+    return this.fork({ ...this.extras, group: [...this.extras.group, ...terms] });
+  }
+
+  having(node: ValueNode): AstSelectBuilder {
+    rejectLegacyFragment(node, "astSelect having");
+    return this.fork({ ...this.extras, having: [...this.extras.having, node] });
+  }
+
+  distinct(): AstSelectBuilder {
+    return this.fork({ ...this.extras, distinct: true });
+  }
+
+  union(other: AstSelectBuilder | SubqueryNode): AstSelectBuilder {
+    return this.addSetOp("union", other);
+  }
+
+  unionAll(other: AstSelectBuilder | SubqueryNode): AstSelectBuilder {
+    return this.addSetOp("union all", other);
+  }
+
+  intersect(other: AstSelectBuilder | SubqueryNode): AstSelectBuilder {
+    return this.addSetOp("intersect", other);
+  }
+
+  intersectAll(other: AstSelectBuilder | SubqueryNode): AstSelectBuilder {
+    return this.addSetOp("intersect all", other);
+  }
+
+  except(other: AstSelectBuilder | SubqueryNode): AstSelectBuilder {
+    return this.addSetOp("except", other);
+  }
+
+  exceptAll(other: AstSelectBuilder | SubqueryNode): AstSelectBuilder {
+    return this.addSetOp("except all", other);
+  }
+
+  private addSetOp(op: SetOpKind, other: AstSelectBuilder | SubqueryNode): AstSelectBuilder {
+    if (this.orders.length > 0 || this.limitCount !== undefined || this.offsetCount !== undefined) {
+      throw new Error("astSelect set operations: this branch carries orderBy/limit/offset — in SQL these would silently bind to the compound; apply them after the set operation instead");
+    }
+    const stmt = typeof other === "object" && other !== null && (other as { kind?: unknown }).kind === "subquery" ? (other as SubqueryNode).select : (other as AstSelectBuilder).toAST();
+    return this.fork({ ...this.extras, setOps: [...this.extras.setOps, { op, select: stmt }] });
+  }
+
+  /** The statement as a frozen AST — composition point for subqueries.
+   *  `with recursive` is computed from structural CTE self-references.
+   *  CTE handles in from/joins auto-register their `with` entry (same
+   *  conflict rule as the typed builder), and fragment-spliced CTE
+   *  references must resolve (Q02 review MINOR-2). */
   toAST(): StatementNode {
     const from = this.fromSpec.table;
-    const fromTarget = isPgTable(from) ? tableTargetNode(from) : from;
-    return selectStatement({
-      ctes: this.cteSpecs,
+    const fromRec = isPgTable(from) ? getDerivedRecord(from) : undefined;
+    const regs = new Map<string, StatementNode>();
+    const register = (name: string, select: StatementNode): void => {
+      const prior = regs.get(name);
+      if (prior === undefined) {
+        regs.set(name, select);
+        return;
+      }
+      if (prior !== select) {
+        throw new Error(`cte "${name}": registered twice with different statements — a CTE name has one definition per statement`);
+      }
+    };
+    for (const c of this.cteSpecs) register(c.name, c.select);
+    let fromTarget: FromTarget;
+    let fromAlias = this.fromSpec.alias;
+    if (fromRec?.kind === "derived") {
+      fromTarget = subqueryNode(fromRec.select);
+      if (fromAlias === undefined) fromAlias = fromRec.name;
+    } else if (fromRec?.kind === "cte") {
+      fromTarget = ident(fromRec.name);
+      register(fromRec.name, fromRec.select);
+    } else {
+      fromTarget = isPgTable(from) ? tableTargetNode(from) : from;
+    }
+    const joins = this.joinSpecs.map((j) => {
+      const rec = isPgTable(j.table) ? getDerivedRecord(j.table) : undefined;
+      if (rec?.kind === "derived") {
+        return joinNode(j.type, subqueryNode(rec.select), { alias: j.alias ?? rec.name, on: j.on });
+      }
+      if (rec?.kind === "cte") {
+        register(rec.name, rec.select);
+        return joinNode(j.type, ident(rec.name), { alias: j.alias, on: j.on });
+      }
+      const target = isPgTable(j.table) ? tableTargetNode(j.table) : j.table;
+      return joinNode(j.type, target, { alias: j.alias, on: j.on });
+    });
+    const ctes = [...regs.entries()].map(([name, select]) => cte(name, select));
+    const stmt = selectStatement({
+      ctes,
+      recursive: ctes.some((c) => statementReferencesName(c.select, c.name)),
+      distinct: this.extras.distinct,
       projections: this.buildProjections(),
       from: fromTarget,
-      fromAlias: this.fromSpec.alias,
-      joins: this.joinSpecs.map((j) => {
-        const target = isPgTable(j.table) ? tableTargetNode(j.table) : j.table;
-        return joinNode(j.type, target, { alias: j.alias, on: j.on });
-      }),
+      fromAlias,
+      joins,
       where: this.wheres,
+      groupBy: this.extras.group,
+      having: this.extras.having,
+      setOps: this.extras.setOps,
       orderBy: this.orders,
       limit: this.limitCount,
       offset: this.offsetCount,
     });
+    assertCteRefsResolve(stmt);
+    return stmt;
   }
 
   /** Wrap this builder's statement for interpolation into a parent query. */
@@ -1049,6 +1682,35 @@ export class AstSelectBuilder {
   /** Pure compile: same builder state → byte-identical SQL + params. */
   toSQL(): CompiledQuery {
     return compileStatement(this.toAST());
+  }
+
+  /** Output column specs for derivedTable()/cteTable() pseudo-columns. A
+   *  default projection over a subquery/CTE reference has no enumerable
+   *  columns — project explicitly. */
+  derivedColumns(): PlanColumnSpec[] {
+    if (this.projectionSpec === null) {
+      const from = this.fromSpec.table;
+      if (!isPgTable(from)) {
+        throw new Error("derivedTable/cteTable: the source selects star from a subquery/CTE reference — project its columns explicitly");
+      }
+      return columnEntries(from).map(({ propertyKey, column }) => ({
+        key: propertyKey,
+        dataType: column.dataType,
+        readMode: column.readMode as BigintMode | TemporalMode | undefined,
+        valueDecoder: column.valueDecoder,
+        canonicalText: column.canonicalText,
+      }));
+    }
+    return Object.entries(this.projectionSpec).map(([key, value]): PlanColumnSpec => {
+      if (isPgColumnRef(value)) {
+        return { key, dataType: value.dataType, readMode: value.readMode as BigintMode | TemporalMode | undefined, valueDecoder: value.valueDecoder };
+      }
+      if (isValueNode(value) && value.kind === "aggregate") {
+        const spec = aggregateResultColumn(value);
+        return { key, dataType: spec.dataType, readMode: spec.readMode, valueDecoder: spec.valueDecoder, canonicalText: spec.dataType === "timestamp" || spec.dataType === "timestamptz" || spec.dataType === "date" };
+      }
+      return { key, dataType: "text" };
+    });
   }
 
   private buildProjections(): ProjectionNode[] {
