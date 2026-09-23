@@ -479,6 +479,79 @@ identity.
 - Derived/CTE handles are query-surface identities: mutations, DDL, schema
   export and `db.query` registration reject them.
 
+## Conflict handling and upserts
+
+`db.insert(table).values(...)` chains into PostgreSQL's `ON CONFLICT` clauses
+(Q03). Both actions compile through the same one-traversal AST — placeholders
+bind values first, then `do update set` assignments, then predicates, so
+`$1..$n` are deterministic in every shape.
+
+```ts
+// ignore unique violations: conflicted rows are simply not inserted
+await db.insert(members).values(rows).onConflictDoNothing();
+
+// partial unique index: the target carries the index predicate
+await db.insert(soft).values(row).onConflictDoNothing({
+  target: [soft.email],
+  where: sql`${soft.deletedAt} is null`,
+});
+
+// the upsert: excluded(col) references the row proposed for insertion
+await db.insert(members).values(row)
+  .onConflictUpdate({
+    target: members.email,                    // a column, a composite array,
+                                              // { constraint: "name" } for
+                                              // ON CONSTRAINT, or
+                                              // { columns, where } for a
+                                              // partial unique index
+    set: { hits: sql`${excluded(members.hits)} + 1`, score: "2.50" },
+    setWhere: sql`${members.hits} < ${10}`,   // conditional update (optional)
+  })
+  .returning(["email", "hits"]);              // selected subset, losslessly
+                                             // decoded like every projection
+```
+
+- **Targets.** A single column, a composite list, `{ columns, where }` with
+  the index predicate (partial unique index inference), or
+  `{ constraint: "name" }` for `on conflict on constraint`. `DO UPDATE`
+  requires a target (PostgreSQL rejects targetless `DO UPDATE`);
+  `DO NOTHING` without one lets PostgreSQL arbitrate over any unique index.
+  Target columns must belong to the inserted table; an index predicate is
+  only valid with a column-list target.
+- **`excluded(col)`** renders `excluded."col"` — the proposed row — in SET
+  assignments and predicates. References naming a column the table does not
+  have fail before SQL; `excluded()` anywhere outside on-conflict clauses
+  (e.g. a plain `update ... .set()`) fails closed the same way.
+- **SET values** follow update `.set()` semantics: literals run through the
+  column codec (validated, canonically encoded), `sql` fragments and
+  expression/excluded/subquery nodes splice structurally on non-json columns,
+  and `null` respects NOT NULL.
+- **Returning arity is honest.** Upsert returning yields one row per input
+  row that was inserted or updated (0..n). `DO NOTHING` **omits** conflicted
+  rows from returning; a `DO UPDATE ... setWhere` that rejects a conflicted
+  row means it is neither updated nor returned. The non-returning insert
+  resolves to the affected-row count (0 when everything conflicted away).
+- **Returning subsets.** `.returning(["email", "hits"])` on insert and update
+  builders projects exactly those property keys — same lossless codec path
+  as full returning (`int8`/`numeric` exact, temporal microseconds, `bytea`
+  bytes). Unknown or duplicate keys are rejected before SQL.
+- **Batch atomicity is statement atomicity.** One `.values([...])` call
+  compiles to ONE multi-row `insert` statement: it either lands whole or
+  fails whole (a mid-batch unique violation without `on conflict` leaves
+  nothing behind). Splitting large imports into chunks is a **caller
+  policy** — chunk boundaries, per-chunk error handling and resume are
+  deliberately not implemented here and belong to future import tooling.
+- **Duplicate assignments error deterministically.** Assigning the same
+  physical column twice — two `.set()` calls, two property keys mapping to
+  one physical column in a `.set()`/insert row/on-conflict SET map, a
+  duplicated conflict-target list — throws **before SQL** with one message
+  regardless of object key or call order. (Overlap between the insert's
+  columns and `DO UPDATE SET` is legal upsert semantics, not a conflict.)
+  Two rows in one batch that conflict with *each other* under `DO UPDATE`
+  surface PostgreSQL's own error — `ON CONFLICT DO UPDATE command cannot
+  affect row a second time` (SQLSTATE `21000`) — unchanged, with the
+  statement atomic (nothing lands).
+
 ## Relational reads (one level)
 
 `db.query.<table>.findMany/findFirst` compile every requested relation edge to
@@ -548,7 +621,11 @@ general-purpose use.
   ordinary/recursive CTEs, derived tables, group by/having/distinct, typed
   aggregates with PostgreSQL empty-input semantics (count never null,
   sum/avg/min/max/string_agg/bool_and/bool_or null on empty), correlated
-  subqueries and union/intersect/except (plus their ALL variants), one-level
+  subqueries and union/intersect/except (plus their ALL variants),
+  on-conflict do-nothing/do-update with named/composite/constraint/partial-index
+  targets, excluded references, conditional upserts and selected returning
+  subsets (order-independent duplicate-assignment rejection included),
+  one-level
   relational reads with exact result types, transactions, `toSQL()`, mapped
   properties/NULL/required-key semantics, lossless codecs (bigint/string/
   safe-number int8 modes, exact numerics, microsecond temporals, bytea,

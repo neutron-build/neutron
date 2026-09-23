@@ -433,6 +433,17 @@ test("fuzz: 200 seeded random ASTs compile deterministically with exact param ro
   const rng = mulberry32(0x20260922);
   const pick = <T>(arr: readonly T[]): T => arr[Math.floor(rng() * arr.length)];
   const int = (min: number, max: number): number => min + Math.floor(rng() * (max - min + 1));
+  // Sample WITHOUT replacement: duplicate column lists/assignments are
+  // invalid statements by contract (Q03 order-independent duplicate
+  // rejection), so the generator stays inside the valid input space.
+  const pickDistinct = <T>(arr: readonly T[], count: number): T[] => {
+    const pool = [...arr];
+    const out: T[] = [];
+    for (let i = 0; i < count && pool.length > 0; i++) {
+      out.push(pool.splice(Math.floor(rng() * pool.length), 1)[0]);
+    }
+    return out;
+  };
 
   const tables = ["users", "orders", 'we"ird', "ta ble", "t$1", "select"] as const;
   const cols = ["id", "author_id", 'va"l', "col one", "c$2", "x"] as const;
@@ -498,7 +509,7 @@ test("fuzz: 200 seeded random ASTs compile deterministically with exact param ro
       case 1: {
         // insert: schema-ordered columns, per-row param/default/cast cells
         const columnCount = int(1, 4);
-        const columnNames = Array.from({ length: columnCount }, () => pick(cols));
+        const columnNames = pickDistinct(cols, columnCount);
         const rows = Array.from({ length: int(1, 3) }, () =>
           Array.from({ length: columnCount }, () => {
             if (rng() < 0.25) return defaultCell();
@@ -512,7 +523,7 @@ test("fuzz: 200 seeded random ASTs compile deterministically with exact param ro
       case 2:
         return updateStatement({
           table: qual("sche\"ma", pick(tables)),
-          sets: Array.from({ length: int(1, 3) }, () => ({ column: pick(cols), value: genValue(1) })),
+          sets: pickDistinct(cols, int(1, 3)).map((column) => ({ column, value: genValue(1) })),
           where: Array.from({ length: int(1, 2) }, () => genValue(2)),
         });
       case 3:
@@ -572,6 +583,17 @@ test("fuzz: connectives over fragments group exactly (spec renderer oracle)", ()
   const rng = mulberry32(0x20260923);
   const pick = <T>(arr: readonly T[]): T => arr[Math.floor(rng() * arr.length)];
   const int = (min: number, max: number): number => min + Math.floor(rng() * (max - min + 1));
+  // Sample WITHOUT replacement: duplicate column lists/assignments are
+  // invalid statements by contract (Q03 order-independent duplicate
+  // rejection), so the generator stays inside the valid input space.
+  const pickDistinct = <T>(arr: readonly T[], count: number): T[] => {
+    const pool = [...arr];
+    const out: T[] = [];
+    for (let i = 0; i < count && pool.length > 0; i++) {
+      out.push(pool.splice(Math.floor(rng() * pool.length), 1)[0]);
+    }
+    return out;
+  };
 
   const cols = ["a", "b", "c", 'we"ird'] as const;
   const values = [0, 1, 2, true, false, "x", null] as const;

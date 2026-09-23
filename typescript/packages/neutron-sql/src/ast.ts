@@ -166,6 +166,26 @@ export type MutationTarget = IdentifierNode | QualifiedNode;
  *  (optionally text-cast) or a DEFAULT request. */
 export type InsertCell = ParamNode | DefaultNode;
 
+/** ON CONFLICT target: an explicit column list (with an optional partial-index
+ *  predicate) or a named constraint. Omitted target lets PostgreSQL arbitrate
+ *  (any unique index for DO NOTHING; DO UPDATE requires a target). */
+export type ConflictTarget =
+  | { readonly kind: "columns"; readonly columns: readonly string[]; readonly where?: readonly ValueNode[] }
+  | { readonly kind: "constraint"; readonly constraint: string };
+
+/** `on conflict [target] do nothing | do update set … [where …]` (Q03).
+ *  `where` is the DO UPDATE predicate; the target's own `where` is the index
+ *  predicate for partial unique indexes. */
+export interface OnConflictNode {
+  readonly kind: "on-conflict";
+  readonly action: "nothing" | "update";
+  readonly target?: ConflictTarget;
+  /** DO UPDATE SET assignments (forbidden for DO NOTHING). */
+  readonly sets?: readonly UpdateAssignment[];
+  /** DO UPDATE ... WHERE (forbidden for DO NOTHING). */
+  readonly where?: readonly ValueNode[];
+}
+
 export interface InsertStatementNode {
   readonly kind: "insert";
   readonly table: MutationTarget;
@@ -174,12 +194,39 @@ export interface InsertStatementNode {
   readonly rows: readonly ReadonlyArray<InsertCell>[];
   /** Single-row `insert into … default values` form. */
   readonly defaultValues: boolean;
+  readonly onConflict?: OnConflictNode;
   readonly returning?: readonly ProjectionNode[];
 }
 
 export interface UpdateAssignment {
   readonly column: string;
   readonly value: ValueNode;
+}
+
+/** Order-independent duplicate-assignment detector (Q03): maps assignment
+ *  keys to physical column names and throws naming the physical column and
+ *  the sorted offending keys, so the error never depends on object key or
+ *  call order. Shared by update .set() chains, insert rows and on-conflict
+ *  SET maps. */
+export function assertDistinctPhysicalColumns(
+  tableName: string,
+  entries: ReadonlyArray<readonly [propertyKey: string, physical: string]>,
+  what: string,
+): void {
+  const byPhysical = new Map<string, string[]>();
+  for (const [propertyKey, physical] of entries) {
+    const keys = byPhysical.get(physical);
+    if (keys === undefined) byPhysical.set(physical, [propertyKey]);
+    else keys.push(propertyKey);
+  }
+  const collisions = [...byPhysical.entries()].filter(([, keys]) => keys.length > 1).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  const first = collisions[0];
+  if (first !== undefined) {
+    const keys = [...first[1]].sort();
+    throw new Error(
+      `${what} on ${tableName}: physical column "${first[0]}" is assigned twice (properties ${keys.map((k) => `"${k}"`).join(", ")}) — assign each column exactly once`,
+    );
+  }
 }
 
 export interface UpdateStatementNode {
@@ -360,7 +407,19 @@ function visitValueNodeForCteRefs(node: ValueNode, scopes: readonly CteScope[]):
  *  author's handle carries. Builders call this on the final node; fragment
  *  text is never scanned. */
 export function assertCteRefsResolve(stmt: AnyStatementNode, outer: readonly CteScope[] = []): void {
-  if (stmt.kind === "insert") return;
+  if (stmt.kind === "insert") {
+    // Inserts carry no WITH of their own; conflict-clause expressions are the
+    // only where-bearing surface, so branded CTE refs must resolve in an
+    // enclosing scope or fail closed here (Q03).
+    const oc = stmt.onConflict;
+    if (oc?.target?.kind === "columns" && oc.target.where !== undefined) {
+      for (const w of oc.target.where) visitValueNodeForCteRefs(w, outer);
+    }
+    if (oc?.sets !== undefined) for (const s of oc.sets) visitValueNodeForCteRefs(s.value, outer);
+    if (oc?.where !== undefined) for (const w of oc.where) visitValueNodeForCteRefs(w, outer);
+    if (stmt.returning !== undefined) for (const p of stmt.returning) visitValueNodeForCteRefs(p.expr, outer);
+    return;
+  }
   if (stmt.kind === "update" || stmt.kind === "delete") {
     for (const w of stmt.where) visitValueNodeForCteRefs(w, outer);
     if (stmt.returning !== undefined) for (const p of stmt.returning) visitValueNodeForCteRefs(p.expr, outer);
@@ -704,11 +763,15 @@ export interface InsertStatementInput {
   readonly rows?: readonly ReadonlyArray<InsertCell>[];
   /** Single-row `default values` form; mutually exclusive with columns/rows. */
   readonly defaultValues?: boolean;
+  readonly onConflict?: OnConflictNode;
   readonly returning?: readonly ProjectionNode[];
 }
 
 export function insertStatement(input: InsertStatementInput): InsertStatementNode {
   const columns = [...(input.columns ?? [])].map((c) => validIdent(c, "insert column"));
+  if (new Set(columns).size !== columns.length) {
+    throw new Error("insert: the column list assigns a column more than once");
+  }
   const rows = (input.rows ?? []).map((row) => {
     if (!Array.isArray(row)) throw new Error("insert: rows must be arrays of cells");
     if (row.length !== columns.length) {
@@ -734,7 +797,74 @@ export function insertStatement(input: InsertStatementInput): InsertStatementNod
     columns: Object.freeze(columns),
     rows: Object.freeze(rows),
     defaultValues: input.defaultValues === true,
+    onConflict: input.onConflict,
     returning: input.returning === undefined ? undefined : [...input.returning],
+  });
+}
+
+export interface OnConflictClauseInput {
+  readonly action: "nothing" | "update";
+  /** Physical target column list. Mutually exclusive with `constraint`;
+   *  required for `update` (PostgreSQL rejects targetless DO UPDATE). */
+  readonly targetColumns?: readonly string[];
+  /** Index predicate for partial unique indexes — only with targetColumns. */
+  readonly targetWhere?: readonly ValueNode[];
+  /** `on constraint <name>` target. Mutually exclusive with targetColumns. */
+  readonly constraint?: string;
+  /** DO UPDATE SET assignments — required for update, forbidden for nothing. */
+  readonly sets?: readonly UpdateAssignment[];
+  /** DO UPDATE ... WHERE — forbidden for nothing. */
+  readonly where?: readonly ValueNode[];
+}
+
+export function onConflictClause(input: OnConflictClauseInput): OnConflictNode {
+  if (input.action !== "nothing" && input.action !== "update") {
+    throw new Error(`on conflict: unknown action ${JSON.stringify(input.action)} (known: nothing, update)`);
+  }
+  const hasColumns = input.targetColumns !== undefined && input.targetColumns.length > 0;
+  if (input.targetColumns !== undefined && input.targetColumns.length === 0) {
+    throw new Error("on conflict: targetColumns must be a non-empty column list");
+  }
+  const hasConstraint = input.constraint !== undefined;
+  if (hasColumns && hasConstraint) {
+    throw new Error("on conflict: targetColumns and constraint are mutually exclusive");
+  }
+  const hasTarget = hasColumns || hasConstraint;
+  if (input.action === "update" && !hasTarget) {
+    throw new Error("on conflict: do update requires a target — PostgreSQL rejects targetless DO UPDATE");
+  }
+  if (input.targetWhere !== undefined && !hasColumns) {
+    throw new Error("on conflict: an index predicate (targetWhere) is only valid with a column-list target — ON CONSTRAINT takes no predicate");
+  }
+  const target: ConflictTarget | undefined = hasColumns
+    ? {
+        kind: "columns",
+        columns: Object.freeze([...(input.targetColumns ?? [])].map((c) => validIdent(c, "conflict target column"))),
+        where: input.targetWhere === undefined ? undefined : [...input.targetWhere],
+      }
+    : hasConstraint
+      ? { kind: "constraint", constraint: validIdent(input.constraint as string, "conflict constraint name") }
+      : undefined;
+  if (target?.kind === "columns" && new Set(target.columns).size !== target.columns.length) {
+    throw new Error("on conflict: the target column list names a column more than once");
+  }
+  if (input.action === "nothing") {
+    if ((input.sets !== undefined && input.sets.length > 0) || input.where !== undefined) {
+      throw new Error("on conflict: do nothing takes no assignments or predicate");
+    }
+    return frozen<OnConflictNode>({ kind: "on-conflict", action: "nothing", target });
+  }
+  const sets = [...(input.sets ?? [])];
+  if (sets.length === 0) throw new Error("on conflict: do update requires at least one assignment");
+  if (new Set(sets.map((s) => s.column)).size !== sets.length) {
+    throw new Error("on conflict: do update set assigns a column more than once");
+  }
+  return frozen<OnConflictNode>({
+    kind: "on-conflict",
+    action: "update",
+    target,
+    sets: Object.freeze(sets.map((s) => frozen<UpdateAssignment>({ column: validIdent(s.column, "conflict set column"), value: s.value }))),
+    where: input.where === undefined ? undefined : [...input.where],
   });
 }
 
@@ -750,6 +880,9 @@ export function updateStatement(input: UpdateStatementInput): UpdateStatementNod
   const sets = input.sets.map((s) =>
     frozen<UpdateAssignment>({ column: validIdent(s.column, "update column"), value: s.value }),
   );
+  if (new Set(sets.map((s) => s.column)).size !== sets.length) {
+    throw new Error("update: the assignment list assigns a column more than once");
+  }
   if (input.where.length === 0) throw new Error("update: a where predicate is required — builders must not emit all-row updates");
   return frozen<UpdateStatementNode>({
     kind: "update",
