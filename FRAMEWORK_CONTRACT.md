@@ -426,7 +426,7 @@ All frameworks SHOULD apply middleware in this default order (outermost first):
 
 ## 6. Configuration Environment Variables
 
-All frameworks MUST support these environment variables (with framework-specific prefix):
+All frameworks MUST support these environment variables. `{PREFIX}` is `NEUTRON` in every SDK (`NEUTRON_HOST`, `NEUTRON_PORT`, …), and the variables MUST take effect without adapter- or application-specific configuration: an app started without an explicit listen address listens on `NEUTRON_HOST`:`NEUTRON_PORT`.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
@@ -457,11 +457,11 @@ Feature detection (is the connected DB a Nucleus instance vs plain Postgres) is 
 
 All frameworks MUST:
 1. Catch `SIGTERM` and `SIGINT`
-2. Stop accepting new connections
+2. Stop accepting new connections (a connection attempted after the signal is refused, or answered `503`)
 3. Drain in-flight requests (configurable timeout, default 30s)
 4. Run OnStop lifecycle hooks in reverse registration order
 5. Close database connections
-6. Exit cleanly
+6. Exit cleanly, with status 0 after a completed drain
 
 ## 9. Workflow Event-Log Wire Format (v1)
 
