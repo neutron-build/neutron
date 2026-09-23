@@ -583,17 +583,6 @@ test("fuzz: connectives over fragments group exactly (spec renderer oracle)", ()
   const rng = mulberry32(0x20260923);
   const pick = <T>(arr: readonly T[]): T => arr[Math.floor(rng() * arr.length)];
   const int = (min: number, max: number): number => min + Math.floor(rng() * (max - min + 1));
-  // Sample WITHOUT replacement: duplicate column lists/assignments are
-  // invalid statements by contract (Q03 order-independent duplicate
-  // rejection), so the generator stays inside the valid input space.
-  const pickDistinct = <T>(arr: readonly T[], count: number): T[] => {
-    const pool = [...arr];
-    const out: T[] = [];
-    for (let i = 0; i < count && pool.length > 0; i++) {
-      out.push(pool.splice(Math.floor(rng() * pool.length), 1)[0]);
-    }
-    return out;
-  };
 
   const cols = ["a", "b", "c", 'we"ird'] as const;
   const values = [0, 1, 2, true, false, "x", null] as const;

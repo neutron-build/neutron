@@ -11,7 +11,7 @@
 // Alias generation (`__q1`, `__q2`, …) is a compile-state counter advanced in
 // traversal order, so unnamed derived tables get stable, deterministic names.
 
-import { forgedTextKind, validAggregate, validJoinType, validLimit, validOp, validParamCast } from "./ast.js";
+import { assertExcludedScope, forgedTextKind, validAggregate, validJoinType, validLimit, validNulls, validOp, validParamCast } from "./ast.js";
 import type {
   AggregateNode,
   AnyStatementNode,
@@ -238,6 +238,8 @@ function compileOrder(order: readonly OrderSpec[], state: CompileState): void {
     if (i > 0) state.parts.push(", ");
     compile(order[i].expr, state);
     state.parts.push(order[i].direction === "desc" ? " desc" : " asc");
+    const nulls = validNulls(order[i].nulls, "compile order by");
+    if (nulls !== undefined) state.parts.push(` nulls ${nulls}`);
   }
 }
 
@@ -422,8 +424,11 @@ function compileDelete(node: DeleteStatementNode, state: CompileState): void {
 }
 
 /** Public entry: compile a statement with fresh state. Pure — same AST gives
- *  a byte-identical SQL string and params array on every call. */
+ *  a byte-identical SQL string and params array on every call. The excluded()
+ *  scope choke point runs first: every statement kind fails closed before any
+ *  SQL renders if it references excluded() where PostgreSQL cannot see it. */
 export function compileStatement(stmt: AnyStatementNode): CompiledQuery {
+  assertExcludedScope(stmt);
   const state: CompileState = { parts: [], params: [], aliasCounter: 0 };
   compile(stmt, state);
   return { sql: state.parts.join(""), params: state.params };

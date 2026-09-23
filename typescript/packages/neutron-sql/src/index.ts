@@ -95,6 +95,10 @@ export {
   not,
   asc,
   desc,
+  ascNullsLast,
+  ascNullsFirst,
+  descNullsLast,
+  descNullsFirst,
   exists,
   excluded,
   count,
@@ -175,6 +179,10 @@ export {
   deleteStatement,
   onConflictClause,
   assertDistinctPhysicalColumns,
+  assertOnConflictNodeValid,
+  assertNoExcludedRefs,
+  assertExcludedScope,
+  collectExcludedRefs,
   isValueNode,
   isStatement,
   type IdentifierNode,
@@ -261,6 +269,8 @@ export {
   wrapPgPool,
   wrapPostgresJs,
   makeLifecycle,
+  preparedStatement,
+  pgStatementName,
   type Driver,
   type DriverKind,
   type LoadDriverOptions,
@@ -269,8 +279,22 @@ export {
   type WrapAdapterOptions,
   type PgPoolLike,
   type PgPoolClientLike,
+  type PgQueryConfig,
   type PostgresJsClient,
+  type PreparedStatement,
 } from "./drivers.js";
+
+// Q04: keyset pagination — unique tie-breakers, explicit null ordering,
+// mixed directions, versioned opaque cursors with strict validation.
+export {
+  keyset,
+  CursorError,
+  type KeysetPager,
+  type KeysetColumn,
+  type KeysetOptions,
+  type KeysetPage,
+  type KeysetQueryable,
+} from "./pagination.js";
 
 // I01: stable driver error taxonomy. SQLSTATE survives every wrapper
 // (ServerSqlError.sqlstate / getSqlState); connection failures and missing

@@ -43,6 +43,8 @@ import type { ColumnDataType } from "./schema.js";
 import {
   assertCteRefsResolve,
   assertDistinctPhysicalColumns,
+  assertNoExcludedRefs,
+  collectExcludedRefs,
   cte,
   defaultCell,
   ident,
@@ -61,6 +63,7 @@ import {
   subquery as subqueryNode,
   updateStatement,
   validAlias,
+  validNulls,
   deleteStatement,
   type AggregateNode,
   type AnyStatementNode,
@@ -375,39 +378,6 @@ function isColumnBuilderLike(v: unknown): v is AnyColumnBuilder {
   return typeof v === "object" && v !== null && typeof (v as { columnName?: unknown }).columnName === "string";
 }
 
-/** Collect `excluded."col"` references from expression positions (expr args,
- *  aggregate args, structural fragment parts). Fragment TEXT is never
- *  scanned; subqueries are separate scopes PostgreSQL keeps excluded out of. */
-function collectExcludedRefs(node: ValueNode, out: QualifiedNode[]): void {
-  switch (node.kind) {
-    case "qualified":
-      if (node.parts.length > 0 && node.parts[0] === "excluded") out.push(node);
-      return;
-    case "expr":
-      for (const a of node.args) collectExcludedRefs(a, out);
-      return;
-    case "aggregate":
-      for (const a of node.args) collectExcludedRefs(a, out);
-      return;
-    case "fragment":
-      for (const p of node.parts) if (typeof p !== "string") collectExcludedRefs(p, out);
-      return;
-    default:
-      return;
-  }
-}
-
-/** excluded() references are only addressable inside ON CONFLICT clauses —
- *  an update .set() value referencing the pseudo-relation fails closed
- *  before SQL instead of as a database "missing FROM-clause entry". */
-function assertNoExcludedRefs(node: ValueNode, who: string): void {
-  const refs: QualifiedNode[] = [];
-  collectExcludedRefs(node, refs);
-  if (refs.length > 0) {
-    throw new Error(`${who}: excluded() references the row proposed for insertion and is only valid in on-conflict clauses`);
-  }
-}
-
 /** Every excluded."col" reference in an on-conflict expression must name a
  *  physical column of the inserted table — typo'd references fail before SQL
  *  instead of as a database error. */
@@ -527,7 +497,10 @@ function buildOnConflictNode(table: AnyPgTable, plan: ConflictPlan): OnConflictN
     } else if (resolved.columns !== undefined) {
       input.targetColumns = resolved.columns;
       if (resolved.predicate !== undefined) {
-        assertExcludedColumnsResolve(tableName, columns, resolved.predicate, `on conflict target where on ${tableName}`);
+        // The index predicate cannot see excluded (live-verified PG 17:
+        // "invalid reference to FROM-clause entry for table excluded") —
+        // reject it here instead of as a database error.
+        assertNoExcludedRefs(resolved.predicate, `on conflict target where on ${tableName}`);
         input.targetWhere = whereItems([resolved.predicate]);
       }
     }
@@ -765,6 +738,7 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
 
   where(condition: Condition): SelectBuilder<P, R0, N, F> {
     rejectLegacyFragment(condition, "where");
+    assertNoExcludedRefs(condition, "select where");
     return new SelectBuilder<P, R0, N, F>(this.ctx, this.table, this.projection as P, this.joinSpecs, [...this.conditions, condition], this.order, this.limitCount, this.offsetCount, this.extras);
   }
 
@@ -783,6 +757,13 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
 
   offset(n: number): SelectBuilder<P, R0, N, F> {
     return new SelectBuilder<P, R0, N, F>(this.ctx, this.table, this.projection as P, this.joinSpecs, this.conditions, this.order, this.limitCount, n, this.extras);
+  }
+
+  /** Keyset pagination introspection (Q04): the pager's apply()/page() guard
+   *  reads this to fail closed when composing onto a builder that already
+   *  carries order terms or an offset. */
+  keysetBuilderState(): { ordered: boolean; offset: boolean } {
+    return { ordered: this.order.length > 0, offset: this.offsetCount !== undefined };
   }
 
   // -------------------------------------------------------------------------
@@ -1133,6 +1114,13 @@ export class SetOpBuilder<R> implements PromiseLike<R[]> {
     return this.fork<R>(this.branches, undefined, this.limitCount, n);
   }
 
+  /** Keyset pagination introspection (Q04): same guard contract as
+   *  SelectBuilder's — compounds carrying order terms or an offset are
+   *  rejected by the pager's apply()/page(). */
+  keysetBuilderState(): { ordered: boolean; offset: boolean } {
+    return { ordered: this.order.length > 0, offset: this.offsetCount !== undefined };
+  }
+
   /** Composition point: the compound as a subquery node. */
   subquery(): SubqueryNode {
     return subqueryNode(this.toAST());
@@ -1371,10 +1359,14 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
       }
       // Duplicate physical assignments inside one row (two property keys
       // mapping to one physical column) are rejected order-independently —
-      // the emitted column list would assign the column twice.
+      // the emitted column list would assign the column twice. Keys valued
+      // undefined are OMITTED by the undefined-is-omitted convention, so
+      // they cannot collide (Q04 entry condition).
       assertDistinctPhysicalColumns(
         tableName,
-        rowKeys.map((k) => [k, columns[k].columnName] as const),
+        rowKeys
+          .filter((k) => row[k] !== undefined)
+          .map((k) => [k, columns[k].columnName] as const),
         "insert values",
       );
       encodedRows.push(encoded);
@@ -1520,6 +1512,7 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
 
   where(condition: Condition): UpdateBuilder<TCols, R> {
     rejectLegacyFragment(condition, "where");
+    assertNoExcludedRefs(condition, "update where");
     return new UpdateBuilder<TCols, R>(this.ctx, this.table, this.sets, this.hasSet, [...this.conditions, condition], this.returningKeys);
   }
 
@@ -1604,6 +1597,7 @@ export class DeleteBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
 
   where(condition: Condition): DeleteBuilder<TCols, R> {
     rejectLegacyFragment(condition, "where");
+    assertNoExcludedRefs(condition, "delete where");
     return new DeleteBuilder<TCols, R>(this.ctx, this.table, [...this.conditions, condition], this.wantsReturning);
   }
 

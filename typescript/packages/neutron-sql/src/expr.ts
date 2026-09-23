@@ -183,6 +183,25 @@ export function desc(col: AnyColumnBuilder | AggregateNode<unknown> | string, ta
   return Object.freeze({ expr: orderRef(col, table), direction: "desc" } as OrderSpec);
 }
 
+/** Explicit-null-ordering order specs (Q04). Keyset pagination REQUIRES one
+ *  of these on every term (the ordering must be total and unambiguous);
+ *  plain orderBy may use them anywhere `nulls first/last` is wanted. */
+export function ascNullsLast(col: AnyColumnBuilder | AggregateNode<unknown> | string, table?: string): OrderSpec {
+  return Object.freeze({ expr: orderRef(col, table), direction: "asc", nulls: "last" } as OrderSpec);
+}
+
+export function ascNullsFirst(col: AnyColumnBuilder | AggregateNode<unknown> | string, table?: string): OrderSpec {
+  return Object.freeze({ expr: orderRef(col, table), direction: "asc", nulls: "first" } as OrderSpec);
+}
+
+export function descNullsLast(col: AnyColumnBuilder | AggregateNode<unknown> | string, table?: string): OrderSpec {
+  return Object.freeze({ expr: orderRef(col, table), direction: "desc", nulls: "last" } as OrderSpec);
+}
+
+export function descNullsFirst(col: AnyColumnBuilder | AggregateNode<unknown> | string, table?: string): OrderSpec {
+  return Object.freeze({ expr: orderRef(col, table), direction: "desc", nulls: "first" } as OrderSpec);
+}
+
 // ---------------------------------------------------------------------------
 // Aggregates (Q02) — typed helpers over the frozen AggregateNode. Result
 // types follow PostgreSQL exactly (see codecs.ts aggregateProjection for the

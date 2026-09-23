@@ -122,6 +122,18 @@ export interface CteNode {
 export interface OrderSpec {
   readonly expr: ValueNode;
   readonly direction: "asc" | "desc";
+  /** Explicit NULL ordering (`nulls first` / `nulls last`). Keyset pagination
+   *  requires it on every term; optional elsewhere (PostgreSQL defaults:
+   *  asc → nulls last, desc → nulls first). */
+  readonly nulls?: "first" | "last";
+}
+
+export function validNulls(nulls: unknown, what: string): "first" | "last" | undefined {
+  if (nulls === undefined) return undefined;
+  if (nulls !== "first" && nulls !== "last") {
+    throw new Error(`${what}: nulls ordering must be "first" or "last", got ${JSON.stringify(nulls)}`);
+  }
+  return nulls;
 }
 
 export type FromTarget = IdentifierNode | QualifiedNode | SubqueryNode;
@@ -442,6 +454,150 @@ export function assertCteRefsResolve(stmt: AnyStatementNode, outer: readonly Cte
 }
 
 // ---------------------------------------------------------------------------
+// excluded() scope (Q04 entry condition): PostgreSQL's `excluded` pseudo-
+// relation is visible ONLY inside ON CONFLICT DO UPDATE SET expressions and
+// the DO UPDATE WHERE predicate (live-verified on PG 17: the conflict
+// TARGET's index predicate errors with "invalid reference to FROM-clause
+// entry", select/update/delete positions with "missing FROM-clause entry").
+// collectExcludedRefs finds structural references; the compile choke point
+// (assertExcludedScope) rejects them everywhere they cannot work, so every
+// path — typed builders, hand-built ASTs — fails BEFORE SQL instead of as a
+// database error. Fragment TEXT is never scanned and subquery bodies are
+// separate scopes (they cannot see excluded either; those fail at the
+// database, consistent with the fragment-text posture).
+// ---------------------------------------------------------------------------
+
+/** Collect `excluded."col"` references from expression positions (expr args,
+ *  aggregate args, structural fragment parts). */
+export function collectExcludedRefs(node: ValueNode, out: QualifiedNode[]): void {
+  switch (node.kind) {
+    case "qualified":
+      if (node.parts.length > 0 && node.parts[0] === "excluded") out.push(node);
+      return;
+    case "expr":
+      for (const a of node.args) collectExcludedRefs(a, out);
+      return;
+    case "aggregate":
+      for (const a of node.args) collectExcludedRefs(a, out);
+      return;
+    case "fragment":
+      for (const p of node.parts) if (typeof p !== "string") collectExcludedRefs(p, out);
+      return;
+    default:
+      return;
+  }
+}
+
+/** Reject excluded() references in one expression position. */
+export function assertNoExcludedRefs(node: ValueNode, who: string): void {
+  const refs: QualifiedNode[] = [];
+  collectExcludedRefs(node, refs);
+  if (refs.length > 0) {
+    throw new Error(`${who}: excluded() references the row proposed for insertion and is only valid in on-conflict clauses`);
+  }
+}
+
+function excludedScopeError(who: string): Error {
+  return new Error(
+    `${who}: excluded() references the row proposed for insertion and is only valid directly inside on-conflict do-update set/where expressions — this position cannot see it (PostgreSQL rejects it at execution)`,
+  );
+}
+
+/** "reject": no excluded reference anywhere. "set-scope": direct references
+ *  allowed (the DO UPDATE SET / WHERE surfaces); subqueries inside still
+ *  reject — a subquery can never see excluded, even in a legal clause. */
+type ExcludedPolicy = "reject" | "set-scope";
+
+function visitForExcluded(node: ValueNode, policy: ExcludedPolicy, who: string): void {
+  switch (node.kind) {
+    case "qualified":
+      if (policy === "reject" && node.parts.length > 0 && node.parts[0] === "excluded") {
+        throw excludedScopeError(who);
+      }
+      return;
+    case "expr":
+      for (const a of node.args) visitForExcluded(a, policy, who);
+      return;
+    case "aggregate":
+      for (const a of node.args) visitForExcluded(a, policy, who);
+      return;
+    case "fragment":
+      for (const p of node.parts) if (typeof p !== "string") visitForExcluded(p, policy, who);
+      return;
+    case "subquery":
+      assertStatementNoExcluded(node.select, `${who} (subquery)`);
+      return;
+    default:
+      return;
+  }
+}
+
+/** Every position of a statement (and of nested statements) rejects excluded
+ *  references; value-node subqueries recurse strictly. Defensive reads mirror
+ *  compileStatementNode: a structurally forged statement (missing Q02 fields)
+ *  reaches the compiler's own field validations with their pinned messages
+ *  instead of crashing here. */
+function assertStatementNoExcluded(stmt: StatementNode, who: string): void {
+  const groupBy = stmt.groupBy ?? [];
+  const having = stmt.having ?? [];
+  const setOps = stmt.setOps ?? [];
+  const orderBy = stmt.orderBy ?? [];
+  const projections = stmt.projections ?? [];
+  const joins = stmt.joins ?? [];
+  const where = stmt.where ?? [];
+  const ctes = stmt.ctes ?? [];
+  for (const c of ctes) assertStatementNoExcluded(c.select, `cte "${c.name}" in ${who}`);
+  if (stmt.from?.kind === "subquery") assertStatementNoExcluded(stmt.from.select, `from in ${who}`);
+  for (const p of projections) visitForExcluded(p.expr, "reject", `projection in ${who}`);
+  for (const j of joins) {
+    if (j.target.kind === "subquery") assertStatementNoExcluded(j.target.select, `join target in ${who}`);
+    if (j.on !== undefined) visitForExcluded(j.on, "reject", `join on in ${who}`);
+  }
+  for (const w of where) visitForExcluded(w, "reject", `where in ${who}`);
+  for (const g of groupBy) visitForExcluded(g, "reject", `group by in ${who}`);
+  for (const h of having) visitForExcluded(h, "reject", `having in ${who}`);
+  for (const o of orderBy) visitForExcluded(o.expr, "reject", `order by in ${who}`);
+  for (const b of setOps) assertStatementNoExcluded(b.select, `set-operation branch in ${who}`);
+}
+
+/** Compile choke point: excluded() may appear ONLY directly inside an
+ *  insert's ON CONFLICT DO UPDATE SET expressions / DO UPDATE WHERE
+ *  predicate. Everything else — any select position, update sets/where/
+ *  returning, delete where/returning, insert RETURNING, the conflict
+ *  target's index predicate, and every subquery — fails here, before any
+ *  SQL is rendered. */
+export function assertExcludedScope(stmt: AnyStatementNode): void {
+  switch (stmt.kind) {
+    case "select":
+      assertStatementNoExcluded(stmt, "select statement");
+      return;
+    case "update":
+      for (const s of stmt.sets ?? []) visitForExcluded(s.value, "reject", "update set");
+      for (const w of stmt.where ?? []) visitForExcluded(w, "reject", "update where");
+      if (stmt.returning !== undefined) for (const p of stmt.returning) visitForExcluded(p.expr, "reject", "update returning");
+      return;
+    case "delete":
+      for (const w of stmt.where ?? []) visitForExcluded(w, "reject", "delete where");
+      if (stmt.returning !== undefined) for (const p of stmt.returning) visitForExcluded(p.expr, "reject", "delete returning");
+      return;
+    case "insert": {
+      const oc = stmt.onConflict;
+      // The conflict TARGET's index predicate cannot see excluded (PG:
+      // "invalid reference to FROM-clause entry for table excluded").
+      if (oc?.target?.kind === "columns" && oc.target.where !== undefined) {
+        for (const w of oc.target.where) visitForExcluded(w, "reject", "on conflict target where");
+      }
+      // DO UPDATE SET expressions and the DO UPDATE WHERE predicate are the
+      // two legal surfaces — direct refs allowed, subqueries still reject.
+      if (oc?.sets !== undefined) for (const s of oc.sets) visitForExcluded(s.value, "set-scope", "on conflict do update set");
+      if (oc?.where !== undefined) for (const w of oc.where) visitForExcluded(w, "set-scope", "on conflict do update where");
+      if (stmt.returning !== undefined) for (const p of stmt.returning) visitForExcluded(p.expr, "reject", "insert returning");
+      return;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Trusted SQL boundary
 // ---------------------------------------------------------------------------
 
@@ -751,7 +907,7 @@ export function selectStatement(input: StatementInput): StatementNode {
     groupBy: [...(input.groupBy ?? [])],
     having: [...(input.having ?? [])],
     setOps: [...(input.setOps ?? [])],
-    orderBy: (input.orderBy ?? []).map((o) => frozen<OrderSpec>({ expr: o.expr, direction: o.direction })),
+    orderBy: (input.orderBy ?? []).map((o) => frozen<OrderSpec>({ expr: o.expr, direction: o.direction, nulls: validNulls(o.nulls, "orderBy") })),
     limit: validLimit(input.limit, "limit"),
     offset: validLimit(input.offset, "offset"),
   });
@@ -797,9 +953,58 @@ export function insertStatement(input: InsertStatementInput): InsertStatementNod
     columns: Object.freeze(columns),
     rows: Object.freeze(rows),
     defaultValues: input.defaultValues === true,
-    onConflict: input.onConflict,
+    onConflict: input.onConflict === undefined ? undefined : assertOnConflictNodeValid(input.onConflict, "insert onConflict"),
     returning: input.returning === undefined ? undefined : [...input.returning],
   });
+}
+
+/** Validate a (possibly hand-built) OnConflictNode: same invariants
+ *  onConflictClause() enforces on its own construction — action, target
+ *  shape, duplicate target/set columns, nothing/update rules. Hand-built
+ *  nodes passed raw to insertStatement() must not bypass duplicate
+ *  validation (Q04 entry condition). Returns the node; throws on violation. */
+export function assertOnConflictNodeValid(node: OnConflictNode, what: string): OnConflictNode {
+  if (typeof node !== "object" || node === null || node.kind !== "on-conflict") {
+    throw new Error(`${what}: requires an OnConflictNode (build one with onConflictClause())`);
+  }
+  if (node.action !== "nothing" && node.action !== "update") {
+    throw new Error(`${what}: unknown action ${JSON.stringify(node.action)} (known: nothing, update)`);
+  }
+  const target = node.target;
+  if (target !== undefined) {
+    if (target.kind === "constraint") {
+      validIdent(target.constraint, `${what} constraint name`);
+    } else if (target.kind === "columns") {
+      if (!Array.isArray(target.columns) || target.columns.length === 0) {
+        throw new Error(`${what}: a column-list conflict target needs at least one column`);
+      }
+      const cols = target.columns.map((c) => validIdent(c, `${what} conflict target column`));
+      if (new Set(cols).size !== cols.length) {
+        throw new Error(`${what}: the target column list names a column more than once`);
+      }
+    } else {
+      throw new Error(`${what}: target must be { kind: "columns", ... } or { kind: "constraint" }`);
+    }
+  }
+  if (node.action === "nothing") {
+    if ((node.sets !== undefined && node.sets.length > 0) || (node.where !== undefined && node.where.length > 0)) {
+      throw new Error(`${what}: do nothing takes no assignments or predicate`);
+    }
+    return node;
+  }
+  if (target === undefined) {
+    throw new Error(`${what}: do update requires a target — PostgreSQL rejects targetless DO UPDATE`);
+  }
+  if (target.kind === "constraint" && (target as { where?: unknown }).where !== undefined) {
+    throw new Error(`${what}: an index predicate is only valid with a column-list target`);
+  }
+  const sets = node.sets ?? [];
+  if (sets.length === 0) throw new Error(`${what}: do update requires at least one assignment`);
+  const cols = sets.map((s) => validIdent(s.column, `${what} conflict set column`));
+  if (new Set(cols).size !== cols.length) {
+    throw new Error(`${what}: do update set assigns a column more than once`);
+  }
+  return node;
 }
 
 export interface OnConflictClauseInput {
