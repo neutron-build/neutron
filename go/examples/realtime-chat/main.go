@@ -14,7 +14,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"os"
 
@@ -120,10 +119,11 @@ func main() {
 
 	_ = hub // Hub would be wired to WebSocket upgrade handler in production
 
-	addr := os.Getenv("PORT")
-	if addr == "" {
-		addr = "8080"
+	// PORT (platform convention) wins; otherwise Run("") reads NEUTRON_HOST /
+	// NEUTRON_PORT and defaults to :8080.
+	addr := ""
+	if port := os.Getenv("PORT"); port != "" {
+		addr = ":" + port
 	}
-	fmt.Println("Chat server starting on", addr)
-	app.Run(":" + addr)
+	app.Run(addr)
 }

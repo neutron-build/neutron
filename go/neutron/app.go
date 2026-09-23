@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -176,9 +179,15 @@ func (a *App) Handler() http.Handler {
 }
 
 // Run starts the HTTP server with graceful shutdown on SIGTERM/SIGINT.
+//
+// A non-empty addr is used as given. An empty addr derives the listen address
+// from NEUTRON_HOST and NEUTRON_PORT (contract §6), each falling back to the
+// corresponding part of the configured Server.Addr (default ":8080" — all
+// interfaces, port 8080). An invalid NEUTRON_PORT is an error.
 func (a *App) Run(addr string) error {
-	if addr == "" {
-		addr = a.config.Server.Addr
+	addr, err := a.listenAddr(addr)
+	if err != nil {
+		return err
 	}
 
 	a.Build()
@@ -242,6 +251,37 @@ func (a *App) Run(addr string) error {
 
 	a.logger.Info("server stopped")
 	return nil
+}
+
+// listenAddr resolves the address Run listens on. An explicit addr always
+// wins; otherwise NEUTRON_HOST / NEUTRON_PORT override the host and port of
+// the configured Server.Addr independently.
+func (a *App) listenAddr(addr string) (string, error) {
+	if addr != "" {
+		return addr, nil
+	}
+	host, port := "", "8080"
+	if cfg := a.config.Server.Addr; cfg != "" {
+		h, p, err := net.SplitHostPort(cfg)
+		if err != nil {
+			return "", fmt.Errorf("neutron: invalid Server.Addr %q: %w", cfg, err)
+		}
+		host = h
+		if p != "" {
+			port = p
+		}
+	}
+	if v, ok := os.LookupEnv("NEUTRON_HOST"); ok && v != "" {
+		host = strings.TrimSuffix(strings.TrimPrefix(v, "["), "]")
+	}
+	if v, ok := os.LookupEnv("NEUTRON_PORT"); ok && v != "" {
+		n, err := strconv.ParseUint(v, 10, 16)
+		if err != nil || n < 1 {
+			return "", fmt.Errorf("neutron: invalid NEUTRON_PORT %q: must be an integer between 1 and 65535", v)
+		}
+		port = strconv.FormatUint(n, 10)
+	}
+	return net.JoinHostPort(host, port), nil
 }
 
 func (a *App) registerHealthCheck() {
