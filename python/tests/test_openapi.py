@@ -186,3 +186,167 @@ def test_problem_detail_schema_matches_real_422_payload():
             assert key in errors_schema["properties"]
         for key in errors_schema["required"]:
             assert key in err
+
+
+# --- Nested models: every $ref must resolve inside the document ---------------
+
+
+def _billing_models():
+    class Address(BaseModel):
+        street: str
+        city: str
+
+    return Address
+
+
+def _shipping_models():
+    class Address(BaseModel):
+        dock: int
+
+    return Address
+
+
+def _iter_refs(node):
+    if isinstance(node, dict):
+        if "$ref" in node:
+            yield node["$ref"]
+        for value in node.values():
+            yield from _iter_refs(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _iter_refs(value)
+
+
+def _resolve(spec, ref):
+    assert ref.startswith("#/"), f"non-local ref {ref}"
+    node = spec
+    for part in ref[2:].split("/"):
+        assert isinstance(node, dict) and part in node, f"dangling ref {ref}"
+        node = node[part]
+    return node
+
+
+def _nested_spec():
+    from enum import Enum
+    from typing import Literal
+
+    BillingAddress = _billing_models()
+    ShippingAddress = _shipping_models()
+
+    class Status(str, Enum):
+        active = "active"
+        closed = "closed"
+
+    class Customer(BaseModel):
+        billing: BillingAddress
+        previous: list[BillingAddress] = []
+        status: Status
+        tier: Literal["free", "pro"] | None = None
+
+    class Shipment(BaseModel):
+        to: ShippingAddress
+        customer: Customer
+
+    class Node(BaseModel):
+        name: str
+        children: list["Node"] = []
+
+    class ProblemDetail(BaseModel):  # collides with the shared RFC 7807 schema
+        code: int
+
+    async def create_customer(body: Customer) -> Shipment: ...
+    async def tree() -> Node: ...
+    async def app_problem() -> list[ProblemDetail]: ...
+
+    info = [
+        _make_info("/customers", "post", create_customer),
+        _make_info("/tree", "get", tree),
+        _make_info("/problems", "get", app_problem),
+    ]
+    return generate_openapi("Test", "1.0.0", info)
+
+
+def test_nested_model_refs_all_resolve():
+    spec = _nested_spec()
+    refs = list(_iter_refs(spec))
+    assert refs
+    for ref in refs:
+        assert ref.startswith("#/components/schemas/"), ref
+        _resolve(spec, ref)
+    assert not any("$defs" in s for s in spec["components"]["schemas"].values())
+
+
+def test_nested_model_schemas_hoisted_with_correct_shape():
+    spec = _nested_spec()
+    schemas = spec["components"]["schemas"]
+
+    customer = schemas["Customer"]
+    assert set(customer["required"]) == {"billing", "status"}
+    assert _resolve(spec, customer["properties"]["status"]["$ref"])["enum"] == [
+        "active",
+        "closed",
+    ]
+    tier = customer["properties"]["tier"]["anyOf"]
+    assert {"enum": ["free", "pro"], "type": "string"} in tier
+    assert {"type": "null"} in tier
+
+    node = schemas["Node"]
+    assert node["properties"]["children"]["items"] == {"$ref": "#/components/schemas/Node"}
+
+
+def test_colliding_model_names_stay_distinct():
+    spec = _nested_spec()
+    schemas = spec["components"]["schemas"]
+
+    billing = _resolve(spec, schemas["Customer"]["properties"]["billing"]["$ref"])
+    shipping = _resolve(spec, schemas["Shipment"]["properties"]["to"]["$ref"])
+    assert set(billing["properties"]) == {"street", "city"}
+    assert set(shipping["properties"]) == {"dock"}
+    assert (
+        schemas["Customer"]["properties"]["billing"]["$ref"]
+        != schemas["Shipment"]["properties"]["to"]["$ref"]
+    )
+
+
+def test_app_model_named_problem_detail_does_not_replace_shared_schema():
+    spec = _nested_spec()
+    schemas = spec["components"]["schemas"]
+
+    assert set(schemas["ProblemDetail"]["required"]) == {"type", "title", "status", "detail"}
+    items = spec["paths"]["/problems"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]["items"]
+    assert items == {"$ref": "#/components/schemas/ProblemDetail2"}
+    assert schemas["ProblemDetail2"]["properties"] == {
+        "code": {"title": "Code", "type": "integer"}
+    }
+
+
+def test_nested_spec_is_deterministic():
+    assert _nested_spec() == _nested_spec()
+
+
+def test_served_openapi_has_no_dangling_refs():
+    from neutron import App, Router
+    from neutron.test import SyncTestClient
+
+    class Line(BaseModel):
+        sku: str
+
+    class Order(BaseModel):
+        lines: list[Line]
+
+    router = Router()
+
+    @router.post("/orders")
+    async def create(body: Order) -> Order:
+        return body
+
+    app = App()
+    app.include_router(router)
+    with SyncTestClient(app) as client:
+        spec = client.get("/openapi.json").json()
+
+    assert "Line" in spec["components"]["schemas"]
+    for ref in _iter_refs(spec):
+        _resolve(spec, ref)
