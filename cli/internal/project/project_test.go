@@ -209,3 +209,77 @@ func TestInvalidTasks(t *testing.T) {
 		})
 	}
 }
+
+const contractSample = `[application]
+version=1
+name="contract"
+[application.services.api]
+path="."
+command=["api"]
+contract="neutron/v1"
+[application.services.web]
+path="."
+command=["web"]
+depends_on=["api"]
+ports=[3000]
+[application.services.web.ready]
+path="/"
+timeout="5s"
+[application.services.admin]
+path="."
+command=["admin"]
+depends_on=["api"]
+env={NEUTRON_SERVICE_API_URL="http://example.test"}
+`
+
+func TestContractServices(t *testing.T) {
+	m, err := Load(manifestFile(t, contractSample))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := m.Build("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]Service{}
+	for _, s := range plan.Services {
+		byName[s.Name] = s
+	}
+	api := byName["api"]
+	if !api.AssignPort || api.GracePeriod != "30s" || api.Ready == nil || api.Ready.Path != "/health" {
+		t.Fatalf("contract defaults: %+v %+v", api, api.Ready)
+	}
+	if strings.Join(api.EnvironmentKeys, ",") != "NEUTRON_HOST,NEUTRON_PORT" {
+		t.Fatalf("api keys %v", api.EnvironmentKeys)
+	}
+	if strings.Join(byName["web"].EnvironmentKeys, ",") != "NEUTRON_SERVICE_API_URL" {
+		t.Fatalf("web keys %v", byName["web"].EnvironmentKeys)
+	}
+	if keys := InjectedKeys(byName["admin"], byName); len(keys) != 0 {
+		t.Fatalf("explicit env must win: %v", keys)
+	}
+	if ServiceURLKey("user-api") != "NEUTRON_SERVICE_USER_API_URL" {
+		t.Fatal(ServiceURLKey("user-api"))
+	}
+}
+
+func TestInvalidContractServices(t *testing.T) {
+	cases := map[string]string{
+		"unknown contract":    strings.Replace(contractSample, "neutron/v1", "neutron/v9", 1),
+		"two ports":           strings.Replace(contractSample, "contract=\"neutron/v1\"", "contract=\"neutron/v1\"\nports=[1,2]", 1),
+		"path without port":   strings.Replace(contractSample, "ports=[3000]\n", "", 1),
+		"path not absolute":   strings.Replace(contractSample, "path=\"/\"", "path=\"health\"", 1),
+		"two readiness kinds": strings.Replace(contractSample, "path=\"/\"", "path=\"/\"\ntcp=\"127.0.0.1:3000\"", 1),
+	}
+	for name, s := range cases {
+		t.Run(name, func(t *testing.T) {
+			m, err := Load(manifestFile(t, s))
+			if err == nil {
+				_, err = m.Build("")
+			}
+			if err == nil {
+				t.Fatal("accepted invalid manifest")
+			}
+		})
+	}
+}

@@ -1,7 +1,8 @@
 import { createServer } from "node:http";
 
 type Message = { message: string };
-const origin = process.env.API_ORIGIN ?? "http://127.0.0.1:4301";
+// Injected by the coordinator from depends_on = ["api"].
+const origin = process.env.NEUTRON_SERVICE_API_URL ?? "http://127.0.0.1:4301";
 const server = createServer(async (request, response) => {
   if (request.url === "/health") {
     response.writeHead(200).end("ok");

@@ -24,6 +24,7 @@ type Application struct {
 }
 type ServiceSpec struct {
 	Path      string            `toml:"path"`
+	Contract  string            `toml:"contract"`
 	Command   []string          `toml:"command"`
 	DependsOn []string          `toml:"depends_on"`
 	Ports     []int             `toml:"ports"`
@@ -41,8 +42,10 @@ type TaskSpec struct {
 	Outputs   []string          `toml:"outputs"`
 }
 type Readiness struct {
-	HTTP    string `toml:"http" json:"http,omitempty"`
-	TCP     string `toml:"tcp" json:"tcp,omitempty"`
+	HTTP string `toml:"http" json:"http,omitempty"`
+	TCP  string `toml:"tcp" json:"tcp,omitempty"`
+	// Path probes HTTP on the service's own single port.
+	Path    string `toml:"path" json:"path,omitempty"`
 	Timeout string `toml:"timeout" json:"timeout"`
 }
 type Manifest struct {
@@ -57,11 +60,15 @@ type Plan struct {
 	Tasks    []Task    `json:"tasks,omitempty"`
 }
 type Service struct {
-	Name            string            `json:"name"`
-	Dir             string            `json:"directory"`
-	Command         []string          `json:"command"`
-	DependsOn       []string          `json:"depends_on,omitempty"`
-	Ports           []int             `json:"ports,omitempty"`
+	Name      string   `json:"name"`
+	Dir       string   `json:"directory"`
+	Command   []string `json:"command"`
+	Contract  string   `json:"contract,omitempty"`
+	DependsOn []string `json:"depends_on,omitempty"`
+	Ports     []int    `json:"ports,omitempty"`
+	// AssignPort means the coordinator picks a free loopback port at start.
+	AssignPort      bool              `json:"assign_port,omitempty"`
+	GracePeriod     string            `json:"grace_period,omitempty"`
 	Env             map[string]string `json:"-"`
 	EnvironmentKeys []string          `json:"environment_keys,omitempty"`
 	Ready           *Readiness        `json:"ready,omitempty"`
@@ -196,10 +203,34 @@ func (m *Manifest) Build(selected string) (*Plan, error) {
 			}
 			ports[port] = name
 		}
+		svc := Service{Name: name, Dir: dir, Command: append([]string(nil), c.Command...), Contract: c.Contract, Ports: c.Ports, Env: c.Env, Ready: c.Ready}
+		switch c.Contract {
+		case "":
+		case ContractNeutronV1:
+			if len(c.Ports) > 1 {
+				return nil, fmt.Errorf("%s: a %s service serves one port; declare at most one", name, ContractNeutronV1)
+			}
+			svc.AssignPort = len(c.Ports) == 0
+			svc.GracePeriod = "30s" // FRAMEWORK_CONTRACT §8 drain default
+			if svc.Ready == nil {
+				svc.Ready = &Readiness{Path: "/health", Timeout: "60s"}
+			}
+		default:
+			return nil, fmt.Errorf("%s: unsupported contract %q (supported: %s)", name, c.Contract, ContractNeutronV1)
+		}
 		if c.Ready != nil {
 			r := c.Ready
-			if (r.HTTP == "") == (r.TCP == "") {
-				return nil, fmt.Errorf("%s: readiness needs exactly one of http or tcp", name)
+			set := 0
+			for _, v := range []string{r.HTTP, r.TCP, r.Path} {
+				if v != "" {
+					set++
+				}
+			}
+			if set != 1 {
+				return nil, fmt.Errorf("%s: readiness needs exactly one of http, tcp or path", name)
+			}
+			if r.Path != "" && (!strings.HasPrefix(r.Path, "/") || (len(c.Ports) != 1 && !svc.AssignPort)) {
+				return nil, fmt.Errorf("%s: readiness path must start with / and the service must have exactly one port", name)
 			}
 			if d, err := time.ParseDuration(r.Timeout); err != nil || d <= 0 || d > time.Hour {
 				return nil, fmt.Errorf("%s: readiness timeout must be positive and at most 1h", name)
@@ -209,8 +240,11 @@ func (m *Manifest) Build(selected string) (*Plan, error) {
 				if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.Fragment != "" || (u.Port() != "" && !validPort(u.Port())) {
 					return nil, fmt.Errorf("%s: invalid HTTP readiness URL", name)
 				}
-			} else if host, port, err := net.SplitHostPort(r.TCP); err != nil || host == "" || !validPort(port) {
-				return nil, fmt.Errorf("%s: invalid TCP readiness address (want host:port, port 1-65535)", name)
+			}
+			if r.TCP != "" {
+				if host, port, err := net.SplitHostPort(r.TCP); err != nil || host == "" || !validPort(port) {
+					return nil, fmt.Errorf("%s: invalid TCP readiness address (want host:port, port 1-65535)", name)
+				}
 			}
 		}
 		deps := append([]string(nil), c.DependsOn...)
@@ -226,11 +260,30 @@ func (m *Manifest) Build(selected string) (*Plan, error) {
 			if i > 0 && deps[i-1] == dep {
 				return nil, fmt.Errorf("%s: duplicate dependency %s", name, dep)
 			}
-			if target.Ready == nil {
+			if target.Ready == nil && target.Contract != ContractNeutronV1 {
 				return nil, fmt.Errorf("%s: dependency %s must declare readiness", name, dep)
 			}
 		}
-		services[name] = Service{Name: name, Dir: dir, Command: append([]string(nil), c.Command...), DependsOn: deps, Ports: c.Ports, Env: c.Env, EnvironmentKeys: keys, Ready: c.Ready}
+		svc.DependsOn = deps
+		svc.EnvironmentKeys = keys
+		services[name] = svc
+	}
+	// Injected keys are part of the plan; their values are resolved at start.
+	for _, name := range names {
+		svc := services[name]
+		keys := map[string]bool{}
+		for _, k := range svc.EnvironmentKeys {
+			keys[k] = true
+		}
+		for k := range InjectedKeys(svc, services) {
+			keys[k] = true
+		}
+		svc.EnvironmentKeys = svc.EnvironmentKeys[:0]
+		for k := range keys {
+			svc.EnvironmentKeys = append(svc.EnvironmentKeys, k)
+		}
+		sort.Strings(svc.EnvironmentKeys)
+		services[name] = svc
 	}
 	serviceDeps := map[string][]string{}
 	for name, s := range services {
@@ -264,6 +317,35 @@ func (m *Manifest) Build(selected string) (*Plan, error) {
 		plan.Tasks = append(plan.Tasks, tasks[name])
 	}
 	return plan, nil
+}
+
+const ContractNeutronV1 = "neutron/v1"
+
+// SinglePort reports whether a service has exactly one port, declared or assigned.
+func (s Service) SinglePort() bool { return len(s.Ports) == 1 || s.AssignPort }
+
+// ServiceURLKey names the variable through which dependents find a service.
+func ServiceURLKey(name string) string {
+	return "NEUTRON_SERVICE_" + strings.ToUpper(strings.ReplaceAll(name, "-", "_")) + "_URL"
+}
+
+// InjectedKeys lists the variables the coordinator adds for a service, with
+// the name of the service whose port supplies each value. Explicit env wins.
+func InjectedKeys(s Service, services map[string]Service) map[string]string {
+	keys := map[string]string{}
+	if s.Contract == ContractNeutronV1 {
+		keys["NEUTRON_HOST"] = s.Name
+		keys["NEUTRON_PORT"] = s.Name
+	}
+	for _, dep := range s.DependsOn {
+		if services[dep].SinglePort() {
+			keys[ServiceURLKey(dep)] = dep
+		}
+	}
+	for k := range s.Env {
+		delete(keys, k)
+	}
+	return keys
 }
 
 // TaskPlan validates the whole manifest and returns the selected tasks plus

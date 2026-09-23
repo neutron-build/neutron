@@ -69,6 +69,27 @@ The test copies this example to a temporary directory, chooses available ports,
 checks planning from a subdirectory, verifies communication and native reload,
 and checks that interruption or an API crash closes both service ports.
 
+## Service discovery and Neutron services
+
+A service receives `NEUTRON_SERVICE_<NAME>_URL` (`http://127.0.0.1:<port>`) for
+each direct dependency with exactly one port, so it never hard-codes another
+service's port. The web service here reads `NEUTRON_SERVICE_API_URL`. Explicit
+`env` entries always win over injected values.
+
+`contract = "neutron/v1"` marks a service built on a Neutron SDK
+(FRAMEWORK_CONTRACT.md). Such a service:
+
+- may omit `ports`; the coordinator then assigns a free loopback port at start,
+- receives `NEUTRON_HOST` and `NEUTRON_PORT`,
+- is ready when `GET /health` succeeds (overridable with `ready`),
+- gets the contract's 30-second shutdown drain before SIGKILL,
+- is checked once ready: a degraded `/health`, a missing `/openapi.json` or a
+  non-3.1 spec is reported as a `contract:` line. These are warnings; the
+  session keeps running.
+
+`ready = { path = "/health", timeout = "30s" }` probes a path on any service with
+exactly one port.
+
 ## Tasks
 
 `[application.tasks.<name>]` declares finite commands such as builds, tests or

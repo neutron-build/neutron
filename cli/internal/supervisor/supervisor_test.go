@@ -42,6 +42,34 @@ func TestHelperProcess(t *testing.T) {
 			Ports: []int{portNumber}, Ready: &project.Readiness{HTTP: "http://" + address, Timeout: "5s"}}
 		_ = Run(context.Background(), &project.Plan{Root: os.Getenv("ROOT"), Services: []project.Service{api}}, Options{GracePeriod: 200 * time.Millisecond})
 		os.Exit(0)
+	case "contract":
+		// A neutron/v1-shaped service: binds NEUTRON_HOST:NEUTRON_PORT.
+		mux := http.NewServeMux()
+		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"status":%q,"nucleus":"unconfigured","version":"0.0.0"}`, os.Getenv("HEALTH_STATUS"))
+		})
+		if os.Getenv("SERVE_OPENAPI") == "1" {
+			mux.HandleFunc("/openapi.json", func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprint(w, `{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}`)
+			})
+		}
+		address := net.JoinHostPort(os.Getenv("NEUTRON_HOST"), os.Getenv("NEUTRON_PORT"))
+		if err := http.ListenAndServe(address, mux); err != nil {
+			os.Exit(6)
+		}
+	case "env":
+		// Records the injected variables, then stays up.
+		var lines []string
+		for _, entry := range os.Environ() {
+			if strings.HasPrefix(entry, "NEUTRON_SERVICE_") || strings.HasPrefix(entry, "NEUTRON_PORT=") || strings.HasPrefix(entry, "NEUTRON_HOST=") {
+				lines = append(lines, entry)
+			}
+		}
+		_ = os.WriteFile(os.Getenv("STARTED"), []byte(strings.Join(lines, "\n")), 0600)
+		for {
+			time.Sleep(time.Hour)
+		}
 	case "exit":
 		os.Exit(0)
 	case "record":
@@ -417,6 +445,64 @@ func TestPreflightRejectsListenerOnOtherAddresses(t *testing.T) {
 			if _, err := os.Stat(s.Env["STARTED"]); !os.IsNotExist(err) {
 				t.Fatal("service started despite occupied port")
 			}
+		})
+	}
+}
+
+func TestContractServiceAssignedPortAndInjectedURL(t *testing.T) {
+	for _, openapi := range []bool{true, false} {
+		t.Run(fmt.Sprintf("openapi=%v", openapi), func(t *testing.T) {
+			root := t.TempDir()
+			api := service(t, "api", "contract", root)
+			api.Contract = project.ContractNeutronV1
+			api.AssignPort = true
+			api.GracePeriod = "30s"
+			api.Ready = &project.Readiness{Path: "/health", Timeout: "10s"}
+			api.Env["HEALTH_STATUS"] = "degraded"
+			if openapi {
+				api.Env["SERVE_OPENAPI"] = "1"
+			}
+			web := service(t, "web", "env", root)
+			web.DependsOn = []string{"api"}
+			web.Env["STARTED"] = filepath.Join(root, "web-env")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var logs bytes.Buffer
+			result := make(chan error, 1)
+			go func() {
+				result <- Run(ctx, &project.Plan{Root: root, Services: []project.Service{api, web}}, Options{Output: &logs, GracePeriod: 100 * time.Millisecond})
+			}()
+			waitFile(t, web.Env["STARTED"])
+			recorded, _ := os.ReadFile(web.Env["STARTED"])
+			var url string
+			for _, line := range strings.Split(string(recorded), "\n") {
+				if v, ok := strings.CutPrefix(line, "NEUTRON_SERVICE_API_URL="); ok {
+					url = v
+				}
+				if strings.HasPrefix(line, "NEUTRON_PORT=") {
+					t.Fatal("non-contract dependent received NEUTRON_PORT")
+				}
+			}
+			if url == "" {
+				t.Fatalf("dependent did not receive the api URL: %q", recorded)
+			}
+			response, err := http.Get(url + "/health")
+			if err != nil || response.StatusCode != 200 {
+				t.Fatalf("injected URL does not reach api: %v", err)
+			}
+			response.Body.Close()
+			cancel()
+			if err := waitResult(t, result); err != context.Canceled {
+				t.Fatal(err)
+			}
+			text := logs.String()
+			if !strings.Contains(text, "(assigned)") || !strings.Contains(text, "health is degraded") {
+				t.Fatal(text)
+			}
+			if missing := strings.Contains(text, "/openapi.json is not served"); missing == openapi {
+				t.Fatalf("openapi=%v but log:\n%s", openapi, text)
+			}
+			requireClosed(t, strings.TrimPrefix(url, "http://"))
 		})
 	}
 }

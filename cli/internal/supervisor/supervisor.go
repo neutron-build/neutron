@@ -4,6 +4,7 @@ package supervisor
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -133,6 +134,65 @@ func executable(s project.Service) (string, error) {
 	return "", fmt.Errorf("executable %q not found in PATH", name)
 }
 
+func graceFor(s project.Service, fallback time.Duration) time.Duration {
+	if d, err := time.ParseDuration(s.GracePeriod); err == nil && d > 0 {
+		return d
+	}
+	return fallback
+}
+
+func assignPort(taken map[int]bool) (int, error) {
+	for attempt := 0; attempt < 20; attempt++ {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return 0, err
+		}
+		port := listener.Addr().(*net.TCPAddr).Port
+		listener.Close()
+		if !taken[port] {
+			taken[port] = true
+			return port, nil
+		}
+	}
+	return 0, fmt.Errorf("no free port found")
+}
+
+// contractNotes reports FRAMEWORK_CONTRACT deviations of a ready neutron/v1
+// service. They are advice for the developer, never a reason to stop.
+func contractNotes(ctx context.Context, port int) []string {
+	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}}
+	defer client.CloseIdleConnections()
+	get := func(path string) (int, map[string]any) {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d%s", port, path), nil)
+		if err != nil {
+			return 0, nil
+		}
+		response, err := client.Do(request)
+		if err != nil {
+			return 0, nil
+		}
+		defer response.Body.Close()
+		var body map[string]any
+		_ = json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(&body)
+		return response.StatusCode, body
+	}
+	notes := []string{}
+	_, health := get("/health")
+	switch {
+	case health == nil || health["status"] == nil:
+		notes = append(notes, "/health does not return the contract body {status, nucleus, version} (FRAMEWORK_CONTRACT §7)")
+	case health["status"] == "degraded":
+		notes = append(notes, fmt.Sprintf("health is degraded (nucleus: %v)", health["nucleus"]))
+	}
+	code, spec := get("/openapi.json")
+	if code != http.StatusOK || spec == nil {
+		notes = append(notes, "/openapi.json is not served (FRAMEWORK_CONTRACT §4)")
+	} else if version, _ := spec["openapi"].(string); !strings.HasPrefix(version, "3.1") {
+		notes = append(notes, fmt.Sprintf("/openapi.json is OpenAPI %q, contract requires 3.1 (FRAMEWORK_CONTRACT §4)", version))
+	}
+	return notes
+}
+
 // portAvailable rejects a port that another process already serves. Binding
 // 127.0.0.1 alone misses listeners on the wildcard or ::1 on macOS, and a
 // readiness probe would then succeed against the stale process.
@@ -195,6 +255,28 @@ func Run(ctx context.Context, plan *project.Plan, options Options) error {
 			}
 		}
 	}
+	// Resolve every port before starting anything, so dependents' injected
+	// URLs are known. An assigned port can be taken by another process between
+	// here and the service binding it; that window is not closed.
+	byName := map[string]project.Service{}
+	ports := map[string]int{}
+	taken := map[int]bool{}
+	for _, s := range plan.Services {
+		byName[s.Name] = s
+		if len(s.Ports) == 1 {
+			ports[s.Name] = s.Ports[0]
+			taken[s.Ports[0]] = true
+		}
+	}
+	for _, s := range plan.Services {
+		if s.AssignPort {
+			port, err := assignPort(taken)
+			if err != nil {
+				return fmt.Errorf("%s: assign port: %w", s.Name, err)
+			}
+			ports[s.Name] = port
+		}
+	}
 	lifeline, lifelineWriter, err := os.Pipe()
 	if err != nil {
 		return err
@@ -210,7 +292,7 @@ func Run(ctx context.Context, plan *project.Plan, options Options) error {
 			p := running[i]
 			out.print("[%s] stopping\n", p.service.Name)
 			signalTree(p.cmd, false)
-			timer := time.NewTimer(options.GracePeriod)
+			timer := time.NewTimer(graceFor(p.service, options.GracePeriod))
 			select {
 			case <-p.done:
 			case <-timer.C:
@@ -235,8 +317,31 @@ func Run(ctx context.Context, plan *project.Plan, options Options) error {
 			return err
 		}
 		cmd.Dir = s.Dir
-		cmd.Env = append(environment(s.Env), shimEnv+"="+options.GracePeriod.String())
+		overrides := map[string]string{}
+		for k, v := range s.Env {
+			overrides[k] = v
+		}
+		for key, source := range project.InjectedKeys(s, byName) {
+			switch key {
+			case "NEUTRON_HOST":
+				overrides[key] = "127.0.0.1"
+			case "NEUTRON_PORT":
+				overrides[key] = strconv.Itoa(ports[source])
+			default:
+				overrides[key] = fmt.Sprintf("http://127.0.0.1:%d", ports[source])
+			}
+		}
+		cmd.Env = append(environment(overrides), shimEnv+"="+graceFor(s, options.GracePeriod).String())
 		ownProcess(cmd)
+		if s.AssignPort {
+			out.print("[%s] port %d (assigned)\n", s.Name, ports[s.Name])
+		}
+		if s.Ready != nil && s.Ready.Path != "" {
+			ready := *s.Ready
+			ready.HTTP = fmt.Sprintf("http://127.0.0.1:%d%s", ports[s.Name], ready.Path)
+			ready.Path = ""
+			s.Ready = &ready
+		}
 		stdout := &logWriter{out: out, prefix: s.Name + " stdout"}
 		stderr := &logWriter{out: out, prefix: s.Name + " stderr"}
 		cmd.Stdout = stdout
@@ -260,6 +365,11 @@ func Run(ctx context.Context, plan *project.Plan, options Options) error {
 				return err
 			}
 			out.print("[%s] ready\n", s.Name)
+			if s.Contract == project.ContractNeutronV1 {
+				for _, note := range contractNotes(ctx, ports[s.Name]) {
+					out.print("[%s] contract: %s\n", s.Name, note)
+				}
+			}
 		}
 	}
 	select {
