@@ -139,9 +139,30 @@ jobs:
   # ---------------------------------------------------------------------------
   # Release builds: only on nucleus/v* tags, after CI passes
   # ---------------------------------------------------------------------------
+  # The startup banner and backup manifests identify the engine with
+  # CARGO_PKG_VERSION (nucleus/Cargo.toml), while release naming is tag-driven.
+  # When a tag is cut without bumping Cargo.toml the published image reports a
+  # stale version in its banner (v1.1.0/v1.1.1 both said "nucleus 1.0.2").
+  # Refuse the mismatch at the source: a nucleus/v* tag must point at a tree
+  # whose Cargo.toml version equals the tag.
+  version:
+    name: Tag matches Cargo.toml
+    if: startsWith(github.ref, 'refs/tags/nucleus/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare tag to crate version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/nucleus/v}"
+          CRATE="$(grep -m1 '^version' nucleus/Cargo.toml | sed 's/version *= *"\(.*\)"/\1/')"
+          if [ "$TAG" != "$CRATE" ]; then
+            echo "::error::tag nucleus/v$TAG points at a tree whose nucleus/Cargo.toml says $CRATE — bump the crate version in the release commit"
+            exit 1
+          fi
+
   build:
     name: Build ${{ matrix.os }}-${{ matrix.arch }}
-    needs: [test, clippy, sbom]
+    needs: [test, clippy, sbom, version]
     if: startsWith(github.ref, 'refs/tags/nucleus/v')
     runs-on: ${{ matrix.runner }}
     strategy:

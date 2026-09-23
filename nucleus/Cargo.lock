@@ -2998,7 +2998,7 @@ dependencies = [
 
 [[package]]
 name = "nucleusdb"
-version = "1.0.2"
+version = "1.1.1"
 dependencies = [
  "aes-gcm",
  "argon2",
