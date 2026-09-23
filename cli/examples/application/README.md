@@ -11,8 +11,8 @@ needed. From the repository's `cli` directory:
 go build -o /tmp/neutron-coordinator .
 cd examples/application
 /tmp/neutron-coordinator project check
-/tmp/neutron-coordinator project plan --json --component web
-/tmp/neutron-coordinator dev --component web
+/tmp/neutron-coordinator project plan --json --service web
+/tmp/neutron-coordinator dev --service web
 ```
 
 Open `http://127.0.0.1:4300`. Edit `web/server.ts` to exercise Node's native watch
@@ -22,15 +22,15 @@ also discovers the application's manifest.
 ## Manifest behavior
 
 The optional `[application]` table uses `version = 1`, an application name, and
-named `components`. Each component declares a directory relative to the manifest
+named `services`. Each service declares a directory relative to the manifest
 and a command as an argument array. Commands execute directly without a shell.
 Environment entries override inherited values; ports declare expected listeners
 for preflight checks. Directories must remain inside the application root.
 
 `depends_on` requires each dependency to declare readiness: either an HTTP URL
 returning a 2xx response (without redirects) or a TCP `host:port`, plus a positive
-timeout up to one hour. The coordinator starts components in deterministic
-dependency order. Selecting one component includes its dependencies.
+timeout up to one hour. The coordinator starts services in deterministic
+dependency order. Selecting one service includes its dependencies.
 
 `project check` and `project plan` validate without running commands, contacting
 services, or writing files. JSON plans omit environment values, but command

@@ -131,17 +131,17 @@ func executable(s project.Service) (string, error) {
 
 func unexpected(e exit) error {
 	if e.err == nil {
-		return fmt.Errorf("component %s exited unexpectedly (status 0)", e.name)
+		return fmt.Errorf("service %s exited unexpectedly (status 0)", e.name)
 	}
-	return fmt.Errorf("component %s exited unexpectedly: %w", e.name, e.err)
+	return fmt.Errorf("service %s exited unexpectedly: %w", e.name, e.err)
 }
 
 func Run(ctx context.Context, plan *project.Plan, options Options) error {
 	if err := platformCheck(); err != nil {
 		return err
 	}
-	if len(plan.Components) == 0 {
-		return fmt.Errorf("application has no selected components")
+	if len(plan.Services) == 0 {
+		return fmt.Errorf("application has no selected services")
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -158,9 +158,9 @@ func Run(ctx context.Context, plan *project.Plan, options Options) error {
 		return err
 	}
 	defer unlock()
-	// Preflight every selected command/port before starting any component.
+	// Preflight every selected command/port before starting any service.
 	binaries := map[string]string{}
-	for _, s := range plan.Components {
+	for _, s := range plan.Services {
 		binary, err := executable(s)
 		if err != nil {
 			return fmt.Errorf("%s: %w", s.Name, err)
@@ -174,7 +174,7 @@ func Run(ctx context.Context, plan *project.Plan, options Options) error {
 			_ = listener.Close()
 		}
 	}
-	exits := make(chan exit, len(plan.Components))
+	exits := make(chan exit, len(plan.Services))
 	running := []*process{}
 	defer func() {
 		for i := len(running) - 1; i >= 0; i-- {
@@ -192,7 +192,7 @@ func Run(ctx context.Context, plan *project.Plan, options Options) error {
 			<-p.done
 		}
 	}()
-	for _, s := range plan.Components {
+	for _, s := range plan.Services {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()

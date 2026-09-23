@@ -145,7 +145,7 @@ func TestReadinessOrderingCancellationAndLock(t *testing.T) {
 	web.Env["REQUIRE_MARKER"] = marker
 	web.Env["STARTED"] = filepath.Join(root, "web-started")
 	web.DependsOn = []string{"api"}
-	plan := &project.Plan{Root: root, Components: []project.Service{api, web}}
+	plan := &project.Plan{Root: root, Services: []project.Service{api, web}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var logs bytes.Buffer
@@ -179,7 +179,7 @@ func TestUnexpectedExitCleansUpReadySibling(t *testing.T) {
 			root := t.TempDir()
 			api := httpService(t, "api", "http", root)
 			bad := service(t, "bad", mode, root)
-			err := Run(context.Background(), &project.Plan{Root: root, Components: []project.Service{api, bad}}, Options{GracePeriod: 50 * time.Millisecond})
+			err := Run(context.Background(), &project.Plan{Root: root, Services: []project.Service{api, bad}}, Options{GracePeriod: 50 * time.Millisecond})
 			if err == nil || !strings.Contains(err.Error(), "bad exited unexpectedly") {
 				t.Fatalf("%v", err)
 			}
@@ -200,7 +200,7 @@ func TestReadinessFailureAndRedirects(t *testing.T) {
 			}
 			web := service(t, "web", "stay", root)
 			web.Env["STARTED"] = filepath.Join(root, "must-not-start")
-			err := Run(context.Background(), &project.Plan{Root: root, Components: []project.Service{api, web}}, Options{GracePeriod: 50 * time.Millisecond})
+			err := Run(context.Background(), &project.Plan{Root: root, Services: []project.Service{api, web}}, Options{GracePeriod: 50 * time.Millisecond})
 			if err == nil || !strings.Contains(err.Error(), "readiness timed out") {
 				t.Fatalf("%v", err)
 			}
@@ -219,7 +219,7 @@ func TestGrandchildCleanup(t *testing.T) {
 	defer cancel()
 	result := make(chan error, 1)
 	go func() {
-		result <- Run(ctx, &project.Plan{Root: root, Components: []project.Service{tree}}, Options{GracePeriod: 100 * time.Millisecond})
+		result <- Run(ctx, &project.Plan{Root: root, Services: []project.Service{tree}}, Options{GracePeriod: 100 * time.Millisecond})
 	}()
 	waitFile(t, tree.Env["MARKER"])
 	cancel()
@@ -234,7 +234,7 @@ func TestPreflightDoesNotStartAnything(t *testing.T) {
 	first.Env["STARTED"] = filepath.Join(root, "started")
 	bad := service(t, "missing", "stay", root)
 	bad.Command = []string{"/no/such/program"}
-	err := Run(context.Background(), &project.Plan{Root: root, Components: []project.Service{first, bad}}, Options{})
+	err := Run(context.Background(), &project.Plan{Root: root, Services: []project.Service{first, bad}}, Options{})
 	if err == nil {
 		t.Fatal("missing command accepted")
 	}
@@ -247,7 +247,7 @@ func TestPreflightDoesNotStartAnything(t *testing.T) {
 	}
 	defer l.Close()
 	first.Ports = []int{l.Addr().(*net.TCPAddr).Port}
-	if err := Run(context.Background(), &project.Plan{Root: root, Components: []project.Service{first}}, Options{}); err == nil {
+	if err := Run(context.Background(), &project.Plan{Root: root, Services: []project.Service{first}}, Options{}); err == nil {
 		t.Fatal("occupied port accepted")
 	}
 }
@@ -260,7 +260,7 @@ func TestLongOutputDoesNotBlockLifecycle(t *testing.T) {
 	var logs bytes.Buffer
 	result := make(chan error, 1)
 	go func() {
-		result <- Run(ctx, &project.Plan{Root: root, Components: []project.Service{s}}, Options{Output: &logs, GracePeriod: 100 * time.Millisecond})
+		result <- Run(ctx, &project.Plan{Root: root, Services: []project.Service{s}}, Options{Output: &logs, GracePeriod: 100 * time.Millisecond})
 	}()
 	waitFile(t, s.Env["STARTED"])
 	cancel()

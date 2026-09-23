@@ -15,18 +15,18 @@ setting=true
 [application]
 version=1
 name="example"
-[application.components.api]
+[application.services.api]
 path="."
 command=["does-not-need-to-exist"]
 env={TOKEN="never-print-this-secret"}
-[application.components.api.ready]
+[application.services.api.ready]
 http="http://127.0.0.1:8000/health"
 timeout="1s"
-[application.components.web]
+[application.services.web]
 path="."
 command=["also-not-executed"]
 depends_on=["api"]
-[application.components.extra]
+[application.services.extra]
 path="."
 command=["unused"]
 `
@@ -51,8 +51,8 @@ func TestDiscoverPlanSelectionAndNoSideEffects(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(p.Components) != 2 || p.Components[0].Name != "api" || p.Components[1].Name != "web" {
-		t.Fatalf("order: %+v", p.Components)
+	if len(p.Services) != 2 || p.Services[0].Name != "api" || p.Services[1].Name != "web" {
+		t.Fatalf("order: %+v", p.Services)
 	}
 	data, _ := json.Marshal(p)
 	if strings.Contains(string(data), "never-print") || !strings.Contains(string(data), "TOKEN") {

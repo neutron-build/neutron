@@ -61,14 +61,14 @@ with tempfile.TemporaryDirectory(prefix="neutron-app-smoke-") as directory:
         web_port = available_port()
     manifest = root / "neutron.toml"
     manifest.write_text(manifest.read_text().replace("4301", str(api_port)).replace("4300", str(web_port)))
-    plan = subprocess.run([binary, "project", "plan", "--json", "--component", "web"], cwd=root / "web", check=True, capture_output=True, text=True)
-    assert [c["name"] for c in json.loads(plan.stdout)["components"]] == ["api", "web"]
+    plan = subprocess.run([binary, "project", "plan", "--json", "--service", "web"], cwd=root / "web", check=True, capture_output=True, text=True)
+    assert [c["name"] for c in json.loads(plan.stdout)["services"]] == ["api", "web"]
     assert not (root / ".neutron").exists(), "planning changed project files"
     print("PASS: planning from a subdirectory without execution", flush=True)
     for scenario in ["interrupt", "api_failure"]:
         log_path = Path(directory) / f"{scenario}.log"
         with log_path.open("w") as log:
-            process = subprocess.Popen([binary, "dev", "--component", "web"], cwd=root / "web", stdout=log, stderr=subprocess.STDOUT)
+            process = subprocess.Popen([binary, "dev", "--service", "web"], cwd=root / "web", stdout=log, stderr=subprocess.STDOUT)
             try:
                 data = wait_for(lambda: request(web_port), process)
                 assert data == {"from": "TypeScript", "api": "Hello from Go"}, data
