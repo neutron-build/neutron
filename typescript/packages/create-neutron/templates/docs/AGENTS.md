@@ -63,21 +63,28 @@ import type { ActionArgs } from "@neutron-build/core";
 export const config = { mode: "app" };
 export async function loader() { return { currentName: "Acme" }; }
 
-// Handles POST. Return value arrives as `props.actionData`.
+// Handles POST. Return a plain object: it arrives as `props.actionData` and
+// the page re-renders. A returned Response (Response.json, redirect(), ...) is
+// sent as the HTTP response itself, and the page is not rendered.
 export async function action({ request }: ActionArgs) {
   const fd = await request.formData();
-  return Response.json({ ok: true, name: String(fd.get("name") || "") });
+  return { ok: true, name: String(fd.get("name") || "") };
 }
 
-export default function Settings(props: { data?: { currentName: string }; actionData?: { ok: boolean } }) {
+export default function Settings(props: { data?: { currentName: string }; actionData?: { ok: boolean; name: string } }) {
   return (
     <Form method="post">
       <input name="name" defaultValue={props.data?.currentName} />
       <button type="submit">Save</button>
+      {props.actionData?.ok ? <p>Saved {props.actionData.name}</p> : null}
     </Form>
   );
 }
 ```
+
+Rule: **plain object → `props.actionData`; a `Response` → sent as the response.**
+Return a Response only to redirect or to answer a non-page request (see API
+routes below).
 
 ## API routes
 

@@ -15,14 +15,14 @@ export async function action({ request }: ActionArgs) {
   const name = String(formData.get("name") || "").trim();
   const theme = String(formData.get("theme") || "system").trim();
 
-  return Response.json({
+  return {
     ok: true,
     saved: {
       name: name || "Unnamed Workspace",
       theme,
     },
     updatedAt: new Date().toISOString(),
-  });
+  };
 }
 
 export default function Settings(props: {
