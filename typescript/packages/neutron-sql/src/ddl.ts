@@ -4,10 +4,22 @@
 // Deterministic: same schema in, same SQL out. This is the source the P1
 // migration generator diffs against introspected databases.
 
-import { getTableColumns, getTableName, getTableIndexes } from "./schema.js";
+import { getTableColumns, getTableName, getTableIndexes, getTableSchema } from "./schema.js";
 import type { AnyColumnBuilder, AnyPgTable } from "./schema.js";
 import { qident } from "./expr.js";
 import { quoteStringLiteral } from "./compile.js";
+
+/** DDL/migration emission covers default-search-path tables only. A declared
+ *  schema would silently emit DDL against the wrong (search-path) location,
+ *  so schema-qualified tables fail closed here until Q07 owns them. */
+function assertPlainTable(table: AnyPgTable, who: string): void {
+  const schema = getTableSchema(table);
+  if (schema !== undefined) {
+    throw new Error(
+      `${who}: table "${schema}"."${getTableName(table)}" declares a schema — DDL/migration emission for schema-qualified tables lands with Q07 (the query layer supports them)`,
+    );
+  }
+}
 
 export function sqlTypeOf(col: AnyColumnBuilder): string {
   switch (col.dataType) {
@@ -128,27 +140,32 @@ export function referenceClause(col: AnyColumnBuilder): string {
 }
 
 export function createTableSQL(table: AnyPgTable, inlineRefs = true): string {
+  assertPlainTable(table, "createTableSQL");
   const lines = (Object.values(getTableColumns(table)) as AnyColumnBuilder[]).map((col) => `  ${columnDefLine(table, col, inlineRefs)}`);
   return `create table ${qident(getTableName(table))} (\n${lines.join(",\n")}\n)`;
 }
 
 export function addForeignKeySQL(table: AnyPgTable, column: AnyColumnBuilder, constraintName?: string): string {
+  assertPlainTable(table, "addForeignKeySQL");
   const name = constraintName ?? `${getTableName(table)}_${column.columnName}_fkey`;
   return `alter table ${qident(getTableName(table))} add constraint ${qident(name)} foreign key (${qident(column.columnName)}) ${referenceClause(column)}`;
 }
 
 export function createIndexSQL(table: AnyPgTable, index: { indexName: string; unique: boolean; columns: string[]; method?: string }): string {
+  assertPlainTable(table, "createIndexSQL");
   const cols = index.columns.map((c) => qident(c)).join(", ");
   const method = index.method && index.method !== "btree" ? ` using ${index.method}` : "";
   return `create ${index.unique ? "unique " : ""}index ${qident(index.indexName)} on ${qident(getTableName(table))}${method} (${cols})`;
 }
 
 export function dropTableSQL(table: AnyPgTable): string {
+  assertPlainTable(table, "dropTableSQL");
   return `drop table if exists ${qident(getTableName(table))}`;
 }
 
 /** Full DDL for a schema: tables (dep-ordered), FKs for cyclic edges, indexes. */
 export function schemaToDDL(tables: AnyPgTable[]): string[] {
+  for (const t of tables) assertPlainTable(t, "schemaToDDL");
   const { order, deferredFks } = topoSortTables(tables);
   const statements: string[] = [];
   for (const table of order) {

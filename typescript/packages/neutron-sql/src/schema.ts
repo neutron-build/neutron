@@ -210,6 +210,12 @@ export const TABLE_SYMBOL = Symbol.for("@neutron-build/sql.table");
 
 export interface TableMetadata<Cols extends Record<string, AnyColumnBuilder> = Record<string, AnyColumnBuilder>> {
   readonly tableName: string;
+  /** SQL schema the table lives in (undefined = the connection's default
+   *  search path, effectively public). Declared through pgSchema(); the
+   *  query layer (CRUD + alias joins) renders qualified references, while
+   *  DDL emission, schema export and relational reads reject schema-declared
+   *  tables until their scoped cards (Q05/Q07). */
+  readonly schema?: string;
   readonly columns: Cols;
   readonly indexes: TableIndex[];
 }
@@ -237,6 +243,19 @@ function tableMetaOf(table: AnyPgTable, who: string): TableMetadata {
 /** Authoritative table name. Fails closed on anything that is not a table. */
 export function getTableName(table: AnyPgTable): string {
   return tableMetaOf(table, "getTableName").tableName;
+}
+
+/** Authoritative SQL schema name, or undefined for the default search path. */
+export function getTableSchema(table: AnyPgTable): string | undefined {
+  return tableMetaOf(table, "getTableSchema").schema;
+}
+
+/** Reference parts for a table: `[name]` or `[schema, name]`. Every query
+ *  layer site that builds a table-qualified reference funnels through here so
+ *  same-name tables in different schemas can never address each other. */
+export function tableRefParts(table: AnyPgTable): string[] {
+  const meta = tableMetaOf(table, "tableRefParts");
+  return meta.schema === undefined ? [meta.tableName] : [meta.schema, meta.tableName];
 }
 
 /** Authoritative column map (property key -> ColumnBuilder). */
@@ -300,7 +319,21 @@ export function pgTable<Cols extends Record<string, AnyColumnBuilder>>(
   columns: Cols,
   extras?: (t: PgTable<Cols>) => TableIndex[],
 ): PgTable<Cols> {
-  const meta: { tableName: string; columns: Cols; indexes: TableIndex[] } = { tableName: name, columns, indexes: [] };
+  return makeTable(name, columns, extras, undefined);
+}
+
+function makeTable<Cols extends Record<string, AnyColumnBuilder>>(
+  name: string,
+  columns: Cols,
+  extras: ((t: PgTable<Cols>) => TableIndex[]) | undefined,
+  schema: string | undefined,
+): PgTable<Cols> {
+  const meta: { tableName: string; schema?: string; columns: Cols; indexes: TableIndex[] } = {
+    tableName: name,
+    columns,
+    indexes: [],
+  };
+  if (schema !== undefined) meta.schema = schema;
   const table = {
     [TABLE_SYMBOL]: meta,
     // phantom — never read at runtime
@@ -321,10 +354,123 @@ export function pgTable<Cols extends Record<string, AnyColumnBuilder>>(
   return table;
 }
 
+/** A named SQL schema: `pgSchema("alt").table("users", {...})` declares
+ *  `alt.users`. Query-layer surface (CRUD select/insert/update/delete and
+ *  alias joins render qualified references); DDL emission, schema export and
+ *  relational reads reject schema-declared tables until Q05/Q07. */
+export interface PgSchemaBuilder {
+  readonly schemaName: string;
+  table<Cols extends Record<string, AnyColumnBuilder>>(
+    name: string,
+    columns: Cols,
+    extras?: (t: PgTable<Cols>) => TableIndex[],
+  ): PgTable<Cols>;
+}
+
+export function pgSchema(schema: string): PgSchemaBuilder {
+  if (typeof schema !== "string" || schema.length === 0) throw new Error("pgSchema: schema must be a non-empty string");
+  if (schema.includes("\0")) throw new Error("pgSchema: schema must not contain NUL bytes");
+  return {
+    schemaName: schema,
+    table: (name, columns, extras) => makeTable(name, columns, extras, schema),
+  };
+}
+
 export function isPgTable(value: unknown): value is AnyPgTable {
   if (typeof value !== "object" || value === null) return false;
   const meta = (value as { [TABLE_SYMBOL]?: unknown })[TABLE_SYMBOL];
   return typeof meta === "object" && meta !== null && typeof (meta as TableMetadata).tableName === "string";
+}
+
+// ---------------------------------------------------------------------------
+// Aliases — the join identity (Q01)
+// ---------------------------------------------------------------------------
+// `alias(table, "p")` binds a table to a name. Joins on the typed select
+// builder take alias handles ONLY: the alias is the table's identity inside
+// the statement, which is what makes self joins and same-SQL-name tables in
+// different schemas unambiguous both in SQL text and in the result mapping.
+//
+// Runtime: the handle is a pseudo-table whose metadata tableName IS the alias
+// and whose columns are copies whose ownerTable points back at it — so every
+// existing reference-building path (eq/asc/sql interpolation, projections,
+// decoders) renders alias-qualified references unchanged.
+// Types: the handle's columns are the original column types intersected with
+// `{ aliasTag: A }`, letting outer-join nullability key on the alias literal.
+
+export const ALIAS_MARKER: unique symbol = Symbol.for("@neutron-build/sql.alias");
+
+export interface AliasRecord {
+  /** The base table the alias wraps. */
+  readonly table: AnyPgTable;
+  readonly alias: string;
+}
+
+/** Columns of an aliased table: original column types carrying the alias. */
+export type AliasedCols<Cols extends Record<string, AnyColumnBuilder>, A extends string> = {
+  [K in keyof Cols]: Cols[K] & { readonly aliasTag: A };
+};
+
+/** `alias(posts, "p")` — structurally a table (metadata + column properties)
+ *  plus the alias record, with column types tagged by the alias. */
+export type AliasedTable<Cols extends Record<string, AnyColumnBuilder>, A extends string> = PgTableCore<AliasedCols<Cols, A>> &
+  AliasedCols<Cols, A> & {
+    readonly [ALIAS_MARKER]: AliasRecord;
+  };
+
+export function alias<Cols extends Record<string, AnyColumnBuilder>, A extends string>(
+  table: PgTable<Cols>,
+  name: A,
+): AliasedTable<Cols, A> {
+  if (isAliasHandle(table)) {
+    throw new Error(`alias: input is already an alias handle ("${table[ALIAS_MARKER].alias}") — alias the base table, not a handle`);
+  }
+  tableMetaOf(table, "alias");
+  if (typeof name !== "string" || name.length === 0) throw new Error("alias: name must be a non-empty string");
+  if (name.includes("\0")) throw new Error("alias: name must not contain NUL bytes");
+  if (name.includes(".")) throw new Error(`alias: name "${name}" must not contain "." — an alias is one identifier, not a qualification`);
+  if (/^__q\d+$/.test(name)) throw new Error(`alias: name "${name}" is reserved for compiler-generated derived tables`);
+
+  const base = getTableColumns(table);
+  const clonedCols = {} as Record<string, AnyColumnBuilder>;
+  for (const [key, column] of Object.entries(base)) {
+    // Copy own state (class fields); the original column is never mutated or
+    // shared. The clone's owner is wired to the handle below, so references
+    // resolve to the alias.
+    const clone = Object.create(Object.getPrototypeOf(column)) as AnyColumnBuilder;
+    Object.assign(clone, column);
+    (clone as { aliasTag?: string }).aliasTag = name;
+    clonedCols[key] = clone;
+  }
+  const handle = {
+    [TABLE_SYMBOL]: { tableName: name, columns: clonedCols, indexes: [] },
+    $inferSelect: undefined as never,
+    $inferInsert: undefined as never,
+    ...clonedCols,
+    [ALIAS_MARKER]: Object.freeze({ table, alias: name }) as AliasRecord,
+  } as unknown as AliasedTable<Cols, A>;
+  for (const clone of Object.values(clonedCols)) {
+    clone.ownerTable = handle as unknown as AnyPgTable;
+    Object.freeze(clone);
+  }
+  Object.freeze(clonedCols);
+  Object.freeze(handle);
+  return handle;
+}
+
+/** True for `alias()` products. Alias handles are join identities, never
+ *  mutation targets or from-tables. */
+export function isAliasHandle(value: unknown): value is { [ALIAS_MARKER]: AliasRecord } & AnyPgTable {
+  if (typeof value !== "object" || value === null) return false;
+  if (!isPgTable(value)) return false;
+  const rec = (value as { [ALIAS_MARKER]?: unknown })[ALIAS_MARKER];
+  return typeof rec === "object" && rec !== null && typeof (rec as AliasRecord).alias === "string";
+}
+
+/** Fail closed when an alias handle reaches a slot that takes base tables. */
+export function rejectAliasHandle(value: unknown, who: string): void {
+  if (isAliasHandle(value)) {
+    throw new Error(`${who}: received the alias handle "${value[ALIAS_MARKER].alias}" — alias handles are join identities; pass the base table here`);
+  }
 }
 
 // ---------------------------------------------------------------------------
