@@ -15,6 +15,7 @@ import type { Driver } from "./drivers.js";
 import type { Logger } from "./logger.js";
 import { type Condition, type OrderExpression } from "./expr.js";
 import type {
+  AliasedTable,
   AnyColumnBuilder,
   AnyPgTable,
   InferInsertModelOf,
@@ -22,7 +23,7 @@ import type {
   SelectTypeOf,
   UpdateTypeOf,
 } from "./schema.js";
-import { getTableColumns, getTableName, isPgTable } from "./schema.js";
+import { ALIAS_MARKER, getTableColumns, getTableName, isAliasHandle, isPgTable, rejectAliasHandle, tableRefParts } from "./schema.js";
 import {
   applyProjectionDecoders,
   encodeWriteValue,
@@ -59,6 +60,7 @@ import {
   type OrderSpec,
   type ParamNode,
   type ProjectionNode,
+  type QualifiedNode,
   type StatementNode,
   type SubqueryNode,
   type ValueNode,
@@ -134,16 +136,59 @@ interface SelectPlan {
   readonly capabilities: StatementCapability[];
 }
 
+/** One typed join: the base table, its in-statement alias and the ON
+ *  condition (undefined for cross joins). Frozen at construction. */
+interface JoinSpec {
+  readonly type: JoinType;
+  readonly table: AnyPgTable;
+  readonly alias: string;
+  readonly on: ValueNode | undefined;
+}
+
+/** SQL target node for a table: `"name"` or `"schema"."name"`. */
+export function tableTargetNode(table: AnyPgTable): IdentifierNode | QualifiedNode {
+  const parts = tableRefParts(table);
+  return parts.length === 1 ? ident(parts[0]) : qual(...parts);
+}
+
+/** Unwrap an alias() handle for a join slot. Fails closed on raw tables and
+ *  non-handles: joins are keyed by alias, which is what keeps self joins and
+ *  same-name tables in different schemas unambiguous. */
+function resolveAliasHandle(handle: unknown, who: string): { table: AnyPgTable; alias: string } {
+  if (!isAliasHandle(handle)) {
+    throw new Error(
+      `${who}: joins take alias() handles — wrap the table with alias(table, "name") so every reference and the result mapping are unambiguous`,
+    );
+  }
+  const rec = handle[ALIAS_MARKER];
+  return { table: rec.table, alias: rec.alias };
+}
+
+/** Reject alias names that collide inside one statement: with the from
+ *  table's own name, or with another join's alias. PostgreSQL rejects these
+ *  at execution; this fails before any SQL runs, naming the collision. */
+function assertDistinctJoinAliases(fromTable: AnyPgTable, joins: readonly JoinSpec[]): void {
+  const seen = new Map<string, string>([[getTableName(fromTable), "the from table"]]);
+  for (const j of joins) {
+    const prior = seen.get(j.alias);
+    if (prior !== undefined) {
+      throw new Error(`join alias "${j.alias}" collides with ${prior} — give every table occurrence its own alias() name`);
+    }
+    seen.set(j.alias, `a previous join's alias`);
+  }
+}
+
 /** Projection list for a set of `{ propertyKey, column }` entries: physical
  *  qualified references labeled with property keys, lossless text-acquisition
  *  fragments for lossy-native types (always labeled), plus the matching
- *  decode plan. */
-function selectPlanFor(tableName: string, entries: ColumnEntries): SelectPlan {
+ *  decode plan. `tableRef` carries the reference parts (schema-qualified when
+ *  the table declares a schema). */
+function selectPlanFor(tableRef: string[], tableName: string, entries: ColumnEntries): SelectPlan {
   const nodes: ProjectionNode[] = [];
   const decoders: ProjectionDecoder[] = [];
   let usesJsonb = false;
   for (const { propertyKey: key, column } of entries) {
-    const ref = qual(tableName, column.columnName);
+    const ref = qual(...tableRef, column.columnName);
     const wire = wireReadNode(column.dataType, ref);
     if (wire !== null) {
       nodes.push(projectionNode(wire, key));
@@ -213,7 +258,32 @@ export type ProjectionResult<P extends Projection> = {
   [K in keyof P]: P[K] extends AnyColumnBuilder ? SelectTypeOf<P[K]> : unknown;
 };
 
-export class SelectBuilder<T> implements PromiseLike<T[]> {
+/** One projected field under join nullability. An aliased column widens to
+ *  `| null` when its alias is on the nullable side of an outer join (the
+ *  alias is the join identity); a plain (from-table) column widens when the
+ *  from side is the nullable side (right/full join). */
+export type JoinFieldType<V, N extends string, F extends boolean> = V extends AnyColumnBuilder
+  ? V extends { readonly aliasTag: infer A }
+    ? A extends N
+      ? SelectTypeOf<V> | null
+      : SelectTypeOf<V>
+    : F extends true
+      ? SelectTypeOf<V> | null
+      : SelectTypeOf<V>
+  : unknown;
+
+/** Result row of a joined select: the projected fields with outer-join
+ *  nullability applied (`R0` is the no-projection base row, nulled field-wise
+ *  when the from side is nullable). */
+export type JoinRowOf<P extends Projection | null, R0, N extends string, F extends boolean> = P extends null
+  ? F extends true
+    ? { [K in keyof R0]: R0[K] | null }
+    : R0
+  : { [K in keyof P]: JoinFieldType<P[K], N, F> };
+
+export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends string = never, F extends boolean = false>
+  implements PromiseLike<JoinRowOf<P, R0, N, F>[]>
+{
   private readonly ctx: ExecContext;
   private readonly table: AnyPgTable;
   private readonly projection: Projection | null;
@@ -221,7 +291,8 @@ export class SelectBuilder<T> implements PromiseLike<T[]> {
   constructor(
     ctx: ExecContext,
     table: AnyPgTable,
-    projection: Projection | null,
+    projection: P,
+    private readonly joinSpecs: readonly JoinSpec[] = [],
     private readonly conditions: readonly Condition[] = [],
     private readonly order: readonly OrderExpression[] = [],
     private readonly limitCount: number | undefined = undefined,
@@ -233,6 +304,7 @@ export class SelectBuilder<T> implements PromiseLike<T[]> {
     // (F01 review-2 carry-forward). Legacy fragments never enter the copy.
     this.ctx = ctx;
     this.table = table;
+    rejectAliasHandle(table, "select from");
     if (projection === null) {
       this.projection = null;
     } else {
@@ -243,30 +315,97 @@ export class SelectBuilder<T> implements PromiseLike<T[]> {
       }
       this.projection = Object.freeze(copy);
     }
+    for (const spec of this.joinSpecs) Object.freeze(spec);
+    Object.freeze(this.joinSpecs);
     Object.freeze(this.conditions);
     Object.freeze(this.order);
     Object.freeze(this);
   }
 
-  where(condition: Condition): SelectBuilder<T> {
-    rejectLegacyFragment(condition, "where");
-    return new SelectBuilder(this.ctx, this.table, this.projection, [...this.conditions, condition], this.order, this.limitCount, this.offsetCount);
+  // -------------------------------------------------------------------------
+  // Joins (Q01): every join takes an alias() handle. Left joins make the
+  // joined alias nullable; right joins make the from side nullable; full
+  // joins make both nullable; inner/cross add no nullability.
+  // -------------------------------------------------------------------------
+
+  innerJoin<C extends Record<string, AnyColumnBuilder>, A extends string>(
+    handle: AliasedTable<C, A>,
+    on: Condition,
+  ): SelectBuilder<P, R0, N, F> {
+    rejectLegacyFragment(on, "innerJoin on");
+    const { table, alias } = resolveAliasHandle(handle, "innerJoin");
+    return this.forkJoin<N, F>({ type: "inner", table, alias, on });
   }
 
-  orderBy(...exprs: OrderExpression[]): SelectBuilder<T> {
+  leftJoin<C extends Record<string, AnyColumnBuilder>, A extends string>(
+    handle: AliasedTable<C, A>,
+    on: Condition,
+  ): SelectBuilder<P, R0, N | A, F> {
+    rejectLegacyFragment(on, "leftJoin on");
+    const { table, alias } = resolveAliasHandle(handle, "leftJoin");
+    return this.forkJoin<N | A, F>({ type: "left", table, alias, on });
+  }
+
+  rightJoin<C extends Record<string, AnyColumnBuilder>, A extends string>(
+    handle: AliasedTable<C, A>,
+    on: Condition,
+  ): SelectBuilder<P, R0, N, true> {
+    rejectLegacyFragment(on, "rightJoin on");
+    const { table, alias } = resolveAliasHandle(handle, "rightJoin");
+    return this.forkJoin<N, true>({ type: "right", table, alias, on });
+  }
+
+  fullJoin<C extends Record<string, AnyColumnBuilder>, A extends string>(
+    handle: AliasedTable<C, A>,
+    on: Condition,
+  ): SelectBuilder<P, R0, N | A, true> {
+    rejectLegacyFragment(on, "fullJoin on");
+    const { table, alias } = resolveAliasHandle(handle, "fullJoin");
+    return this.forkJoin<N | A, true>({ type: "full", table, alias, on });
+  }
+
+  crossJoin<C extends Record<string, AnyColumnBuilder>, A extends string>(
+    handle: AliasedTable<C, A>,
+  ): SelectBuilder<P, R0, N, F> {
+    const { table, alias } = resolveAliasHandle(handle, "crossJoin");
+    return this.forkJoin<N, F>({ type: "cross", table, alias, on: undefined });
+  }
+
+  /** Fork with one more join, instantiating the widened nullability
+   *  parameters explicitly (the constructor cannot infer them — they shape
+   *  only the result row type). */
+  private forkJoin<N2 extends string, F2 extends boolean>(spec: JoinSpec): SelectBuilder<P, R0, N2, F2> {
+    return new SelectBuilder<P, R0, N2, F2>(
+      this.ctx,
+      this.table,
+      this.projection as P,
+      [...this.joinSpecs, spec],
+      this.conditions,
+      this.order,
+      this.limitCount,
+      this.offsetCount,
+    );
+  }
+
+  where(condition: Condition): SelectBuilder<P, R0, N, F> {
+    rejectLegacyFragment(condition, "where");
+    return new SelectBuilder<P, R0, N, F>(this.ctx, this.table, this.projection as P, this.joinSpecs, [...this.conditions, condition], this.order, this.limitCount, this.offsetCount);
+  }
+
+  orderBy(...exprs: OrderExpression[]): SelectBuilder<P, R0, N, F> {
     for (const e of exprs) {
       rejectLegacyFragment(e, "orderBy");
       rejectLegacyFragment((e as OrderSpec).expr, "orderBy");
     }
-    return new SelectBuilder(this.ctx, this.table, this.projection, this.conditions, [...this.order, ...exprs], this.limitCount, this.offsetCount);
+    return new SelectBuilder<P, R0, N, F>(this.ctx, this.table, this.projection as P, this.joinSpecs, this.conditions, [...this.order, ...exprs], this.limitCount, this.offsetCount);
   }
 
-  limit(n: number): SelectBuilder<T> {
-    return new SelectBuilder(this.ctx, this.table, this.projection, this.conditions, this.order, n, this.offsetCount);
+  limit(n: number): SelectBuilder<P, R0, N, F> {
+    return new SelectBuilder<P, R0, N, F>(this.ctx, this.table, this.projection as P, this.joinSpecs, this.conditions, this.order, n, this.offsetCount);
   }
 
-  offset(n: number): SelectBuilder<T> {
-    return new SelectBuilder(this.ctx, this.table, this.projection, this.conditions, this.order, this.limitCount, n);
+  offset(n: number): SelectBuilder<P, R0, N, F> {
+    return new SelectBuilder<P, R0, N, F>(this.ctx, this.table, this.projection as P, this.joinSpecs, this.conditions, this.order, this.limitCount, n);
   }
 
   private projectionEntries(): Array<{ key: string; column: AnyColumnBuilder | null }> {
@@ -283,6 +422,7 @@ export class SelectBuilder<T> implements PromiseLike<T[]> {
    *  byte-identical SQL. */
   toCompiled(): CompiledStatement {
     const tableName = getTableName(this.table);
+    const tableRef = tableRefParts(this.table);
     const nodes: ProjectionNode[] = [];
     const decoders: ProjectionDecoder[] = [];
     let usesJsonb = false;
@@ -293,8 +433,8 @@ export class SelectBuilder<T> implements PromiseLike<T[]> {
           nodes.push(projectionNode(value, key));
           continue;
         }
-        const owner = value.ownerTable ? getTableName(value.ownerTable) : tableName;
-        const ref = qual(owner, value.columnName);
+        const parts = value.ownerTable ? tableRefParts(value.ownerTable) : tableRef;
+        const ref = qual(...parts, value.columnName);
         const wire = wireReadNode(value.dataType, ref);
         if (wire !== null) {
           nodes.push(projectionNode(wire, key));
@@ -302,19 +442,24 @@ export class SelectBuilder<T> implements PromiseLike<T[]> {
         } else {
           nodes.push(projectionNode(ref, key === value.columnName ? undefined : key));
         }
-        const decoder = projectionDecoder(owner, value, key);
+        const decoder = projectionDecoder(parts.join("."), value, key);
         if (decoder) decoders.push(decoder);
       }
     } else {
-      const plan = selectPlanFor(tableName, columnEntries(this.table));
+      // Default projection with joins: the from table's columns only.
+      // Joined tables contribute through an explicit projection — that is the
+      // documented output-mapping rule (property keys cannot collide).
+      const plan = selectPlanFor(tableRef, tableName, columnEntries(this.table));
       nodes.push(...plan.nodes);
       decoders.push(...plan.decoders);
       usesJsonb = plan.capabilities.length > 0;
     }
 
+    assertDistinctJoinAliases(this.table, this.joinSpecs);
     const stmt: StatementNode = selectStatement({
       projections: nodes,
-      from: ident(tableName),
+      from: tableTargetNode(this.table),
+      joins: this.joinSpecs.map((j) => joinNode(j.type, tableTargetNode(j.table), { alias: j.alias, on: j.on })),
       where: whereItems(this.conditions),
       orderBy: orderSpecs(this.order),
       limit: this.limitCount,
@@ -332,15 +477,15 @@ export class SelectBuilder<T> implements PromiseLike<T[]> {
     return { sql: compiled.sql, params: compiled.params as unknown[] };
   }
 
-  async execute(): Promise<T[]> {
+  async execute(): Promise<JoinRowOf<P, R0, N, F>[]> {
     const compiled = this.toCompiled();
     const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query", compiled.capabilities)) as Array<Record<string, unknown>>;
     applyProjectionDecoders(rows, compiled.decoders);
-    return rows as T[];
+    return rows as JoinRowOf<P, R0, N, F>[];
   }
 
-  then<R1 = T[], R2 = never>(
-    onfulfilled?: ((value: T[]) => R1 | PromiseLike<R1>) | null,
+  then<R1 = JoinRowOf<P, R0, N, F>[], R2 = never>(
+    onfulfilled?: ((value: JoinRowOf<P, R0, N, F>[]) => R1 | PromiseLike<R1>) | null,
     onrejected?: ((reason: unknown) => R2 | PromiseLike<R2>) | null,
   ): Promise<R1 | R2> {
     return this.execute().then(onfulfilled, onrejected);
@@ -359,6 +504,7 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     private readonly hasValues = false,
     private readonly wantsReturning = false,
   ) {
+    rejectAliasHandle(table, "insert");
     Object.freeze(this.rows);
     Object.freeze(this);
   }
@@ -434,7 +580,7 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     const orderedKeys = propertyOrder.filter((k) => supplied.has(k));
 
     const returningPlan = this.wantsReturning
-      ? selectPlanFor(tableName, columnEntries(this.table))
+      ? selectPlanFor(tableRefParts(this.table), tableName, columnEntries(this.table))
       : { nodes: [] as ProjectionNode[], decoders: [] as ProjectionDecoder[], capabilities: [] as StatementCapability[] };
 
     const stmt: AnyStatementNode = (() => {
@@ -442,17 +588,17 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
         // Every row is default-only. Postgres has no multi-row DEFAULT VALUES
         // form, so batch by explicitly requesting DEFAULT for one column.
         if (this.rows.length === 1) {
-          return insertStatement({ table: ident(tableName), defaultValues: true, returning: returningPlan.nodes });
+          return insertStatement({ table: tableTargetNode(this.table), defaultValues: true, returning: returningPlan.nodes });
         }
         return insertStatement({
-          table: ident(tableName),
+          table: tableTargetNode(this.table),
           columns: [columns[propertyOrder[0]].columnName],
           rows: this.rows.map(() => [defaultCell()] as ReadonlyArray<InsertCell>),
           returning: returningPlan.nodes,
         });
       }
       return insertStatement({
-        table: ident(tableName),
+        table: tableTargetNode(this.table),
         columns: orderedKeys.map((k) => columns[k].columnName),
         rows: this.rows.map((row, rowIdx) => {
           const encoded = encodedRows[rowIdx];
@@ -514,6 +660,7 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     private readonly conditions: readonly Condition[] = [],
     private readonly wantsReturning = false,
   ) {
+    rejectAliasHandle(table, "update");
     Object.freeze(this.sets);
     Object.freeze(this.conditions);
     Object.freeze(this);
@@ -573,10 +720,10 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     if (this.conditions.length === 0) throw new Error("update without .where() is not allowed");
     const tableName = getTableName(this.table);
     const returningPlan = this.wantsReturning
-      ? selectPlanFor(tableName, columnEntries(this.table))
+      ? selectPlanFor(tableRefParts(this.table), tableName, columnEntries(this.table))
       : { nodes: [] as ProjectionNode[], decoders: [] as ProjectionDecoder[], capabilities: [] as StatementCapability[] };
     const stmt = updateStatement({
-      table: ident(tableName),
+      table: tableTargetNode(this.table),
       sets: this.sets,
       where: whereItems(this.conditions),
       returning: returningPlan.nodes,
@@ -622,6 +769,7 @@ export class DeleteBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     private readonly conditions: readonly Condition[] = [],
     private readonly wantsReturning = false,
   ) {
+    rejectAliasHandle(table, "delete");
     Object.freeze(this.conditions);
     Object.freeze(this);
   }
@@ -644,10 +792,10 @@ export class DeleteBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     if (this.conditions.length === 0) throw new Error("delete without .where() is not allowed");
     const tableName = getTableName(this.table);
     const returningPlan = this.wantsReturning
-      ? selectPlanFor(tableName, columnEntries(this.table))
+      ? selectPlanFor(tableRefParts(this.table), tableName, columnEntries(this.table))
       : { nodes: [] as ProjectionNode[], decoders: [] as ProjectionDecoder[], capabilities: [] as StatementCapability[] };
     const stmt = deleteStatement({
-      table: ident(tableName),
+      table: tableTargetNode(this.table),
       where: whereItems(this.conditions),
       returning: returningPlan.nodes,
     });
@@ -706,18 +854,19 @@ export type UpdateSetInput<TCols extends Record<string, AnyColumnBuilder>> = {
  *  any value node (always labeled with the projection key). */
 export type AstProjection = Record<string, AnyColumnBuilder | ValueNode>;
 
-/** Join/from targets: a schema table, a CTE name, or a subquery node. */
-export type AstJoinTarget = AnyPgTable | SubqueryNode | IdentifierNode;
+/** Join/from targets: a schema table, a schema-qualified name node, a CTE
+ *  name, or a subquery node. */
+export type AstJoinTarget = AnyPgTable | SubqueryNode | IdentifierNode | QualifiedNode;
 
 interface AstJoinSpec {
   readonly type: JoinType;
-  readonly table: AnyPgTable | SubqueryNode | IdentifierNode;
+  readonly table: AstJoinTarget;
   readonly alias: string | undefined;
   readonly on: ValueNode | undefined;
 }
 
 interface AstFromSpec {
-  readonly table: AnyPgTable | SubqueryNode | IdentifierNode;
+  readonly table: AstJoinTarget;
   readonly alias: string | undefined;
 }
 
@@ -765,11 +914,14 @@ export class AstSelectBuilder {
   }
 
   /** Non-cross joins need a condition; cross joins take none. */
-  join(type: "cross", table: AstJoinTarget, alias?: undefined, on?: undefined): AstSelectBuilder;
+  join(type: "cross", table: AstJoinTarget, alias?: string, on?: undefined): AstSelectBuilder;
   join(type: Exclude<JoinType, "cross">, table: AstJoinTarget, alias: string | undefined, on: ValueNode): AstSelectBuilder;
   join(type: JoinType, table: AstJoinTarget, alias?: string, on?: ValueNode): AstSelectBuilder {
     if (type !== "cross" && on === undefined) throw new Error(`ast join: ${type} joins require an on condition`);
+    if (type === "cross" && on !== undefined) throw new Error("ast join: cross joins take no on condition");
+    if (on !== undefined) rejectLegacyFragment(on, "ast join on");
     if (alias !== undefined) validAlias(alias, "ast join alias");
+    if (isPgTable(table)) rejectAliasHandle(table, "ast join");
     return new AstSelectBuilder(
       this.fromSpec,
       this.projectionSpec,
@@ -788,6 +940,18 @@ export class AstSelectBuilder {
 
   leftJoin(table: AstJoinTarget, alias: string | undefined, on: ValueNode): AstSelectBuilder {
     return this.join("left", table, alias, on);
+  }
+
+  rightJoin(table: AstJoinTarget, alias: string | undefined, on: ValueNode): AstSelectBuilder {
+    return this.join("right", table, alias, on);
+  }
+
+  fullJoin(table: AstJoinTarget, alias: string | undefined, on: ValueNode): AstSelectBuilder {
+    return this.join("full", table, alias, on);
+  }
+
+  crossJoin(table: AstJoinTarget, alias: string | undefined): AstSelectBuilder {
+    return this.join("cross", table, alias, undefined);
   }
 
   where(node: ValueNode): AstSelectBuilder {
@@ -860,14 +1024,14 @@ export class AstSelectBuilder {
   /** The statement as a frozen AST — composition point for subqueries. */
   toAST(): StatementNode {
     const from = this.fromSpec.table;
-    const fromTarget = isPgTable(from) ? ident(getTableName(from)) : from;
+    const fromTarget = isPgTable(from) ? tableTargetNode(from) : from;
     return selectStatement({
       ctes: this.cteSpecs,
       projections: this.buildProjections(),
       from: fromTarget,
       fromAlias: this.fromSpec.alias,
       joins: this.joinSpecs.map((j) => {
-        const target = isPgTable(j.table) ? ident(getTableName(j.table)) : j.table;
+        const target = isPgTable(j.table) ? tableTargetNode(j.table) : j.table;
         return joinNode(j.type, target, { alias: j.alias, on: j.on });
       }),
       where: this.wheres,
@@ -895,15 +1059,15 @@ export class AstSelectBuilder {
       }
       // Default projection: every column, labeled with its property key
       // whenever the property key differs from the physical name.
+      const parts = tableRefParts(from);
       return columnEntries(from).map(({ propertyKey, column }) =>
-        projectionNode(qual(getTableName(from), column.columnName), propertyKey === column.columnName ? undefined : propertyKey),
+        projectionNode(qual(...parts, column.columnName), propertyKey === column.columnName ? undefined : propertyKey),
       );
     }
     return Object.entries(this.projectionSpec).map(([key, value]) => {
       if (isPgColumnRef(value)) {
-        const owner = value.ownerTable ? getTableName(value.ownerTable) : undefined;
-        if (!owner) throw new Error(`astSelect: projected column "${key}" has no owner table`);
-        return projectionNode(qual(owner, value.columnName), key === value.columnName ? undefined : key);
+        if (!value.ownerTable) throw new Error(`astSelect: projected column "${key}" has no owner table`);
+        return projectionNode(qual(...tableRefParts(value.ownerTable), value.columnName), key === value.columnName ? undefined : key);
       }
       return projectionNode(value, key);
     });
@@ -921,6 +1085,7 @@ export function astSelect(projection: AstProjection | null = null): { from(table
   return {
     from: (table: AstJoinTarget, alias?: string) => {
       if (alias !== undefined) validAlias(alias, "astSelect from alias");
+      if (isPgTable(table)) rejectAliasHandle(table, "astSelect from");
       return new AstSelectBuilder({ table, alias }, projection, [], [], [], [], undefined, undefined);
     },
   };

@@ -344,6 +344,62 @@ millisecond truncation), temporal writes accept canonical strings as well as
 the JS value. Code that relied on `number` for int8 or `Date` for temporals
 must switch to the new types or opt into the explicit modes.
 
+## Joins and aliases
+
+All five join forms — `innerJoin`, `leftJoin`, `rightJoin`, `fullJoin`,
+`crossJoin` — are available on the typed select builder. Joins take
+**`alias()` handles**, not raw tables: `const p = alias(posts, "p")`, then
+`.innerJoin(p, sql`${p.userId} = ${users.id}`)`. The alias is the table's
+identity inside the statement — every reference (`p.title` in projections,
+`eq(p.title, …)` in predicates, `asc(p.id)` in order specs) compiles to the
+alias-qualified `"p"."title"`, which is what makes self joins and same-name
+tables unambiguous. Two joins may not share an alias, and a join alias may
+not collide with the from table's name — both fail before any SQL runs.
+
+- **ON conditions are conditions** (the same AST values `where` takes):
+  typed predicates (`eq(p.authorId, 7)`), `sql` fragments, and `and`/`or`/
+  `not` combinators all work. The grouping guarantee applies: fragments
+  passed to an operator are delimited, so `and(sql`a or b`, eq(…))` keeps
+  the intended grouping. Column-to-column comparisons are `sql` templates
+  interpolating two columns (`sql`${p.userId} = ${users.id}``). Cross joins
+  take no ON.
+- **Outer-join nullability is typed.** A column from the nullable side of a
+  left/right/full join reads as its declared type **`| null`** — including
+  NOT NULL columns, which the outer join can still null out. `leftJoin`
+  nulls the joined alias; `rightJoin` nulls the from side; `fullJoin` nulls
+  both; `innerJoin`/`crossJoin` add no nulls. Nulls decode through the same
+  codecs as everything else: a left-joined timestamp cell that is SQL NULL
+  reads `null`, never an epoch string, and int8/numeric NULLs stay `null`.
+- **Output mapping rule.** With an explicit projection the row keys are
+  exactly the projection keys — JavaScript object keys are unique, so two
+  same-named columns (from two schemas, or a self join) simply need two
+  projection keys (`{ pub: users.email, alt: au.email }`). Without an
+  explicit projection the row is the **from table's columns only** — joined
+  tables never leak into the default projection, so property keys cannot
+  collide.
+- **Parameter order is deterministic**: projections first, then each join's
+  ON condition in call order, then `where`, then `order by` — `$1..$n`
+  follow that traversal; `limit`/`offset` render inline.
+- **Expression projections** over joined columns (`sql`${o.qty} * ${2}``)
+  type as `unknown` — there is no column codec behind an arbitrary
+  expression.
+- Builders stay immutable: every `.join…()` call forks, so a base query can
+  be reused with different joins without leakage, and `.toSQL()` is pure.
+
+### Schema-qualified tables
+
+`pgSchema("legacy").table("users", { … })` declares `legacy.users`. The
+query layer supports them end to end: CRUD renders qualified targets
+(`insert into "legacy"."users"`), alias joins render qualified join targets,
+and predicates/projections reference schema-qualified columns — `public`
+users and `legacy` users can be joined in one statement under distinct
+aliases. This is deliberately **query-layer only**: DDL emission
+(`schemaToDDL`), schema export (`exportSchema`/`exportSchemaV2`) and
+relational reads (`db.query`, the `tables`/`relations` inputs) reject
+schema-declared tables with explicit errors until their scoped work lands
+(Q05/Q07) — they would otherwise address or export the wrong (search-path)
+identity.
+
 ## Relational reads (one level)
 
 `db.query.<table>.findMany/findFirst` compile every requested relation edge to
@@ -407,7 +463,9 @@ general-purpose use.
   evidence on 17.11), both drivers. 16/18 and non-Postgres engines: not
   claimed.
 - Implemented and live-tested: typed CRUD (`select`/`insert`/`update`/
-  `delete`, `returning`), batch inserts independent of key order, one-level
+  `delete`, `returning`), batch inserts independent of key order, joins and
+  aliases (inner/left/right/full/cross with typed outer-join nullability,
+  self joins, schema-qualified tables in the query layer), one-level
   relational reads with exact result types, transactions, `toSQL()`, mapped
   properties/NULL/required-key semantics, lossless codecs (bigint/string/
   safe-number int8 modes, exact numerics, microsecond temporals, bytea,
@@ -424,7 +482,9 @@ general-purpose use.
   the schema cannot declare them yet, so the "generated-field writes are
   rejected" guarantee lands with them; `serial` stays writable per PostgreSQL
   semantics (Q07), composite constraints/enums/arrays/views in migrations
-  (M02+), composite/no-key mutation in Studio (S01).
+  (M02+), schema-qualified tables in DDL emission/schema export/relational
+  reads — the query layer supports them (Q05/Q07), composite/no-key mutation
+  in Studio (S01).
 - Studio: `neutron studio` opens the SQL browser (filter, sort, FK links)
   against a Postgres connection URL; cell edits are permitted only on tables
   with a proven single-column primary key — composite/no-key tables are

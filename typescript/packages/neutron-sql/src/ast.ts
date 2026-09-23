@@ -14,7 +14,7 @@
 // `TrustedSql`. Template-literal text in `sqlAst` is trusted by construction
 // (it is authored in source); interpolated VALUES are always parameters.
 
-import { getTableName, isPgTable, type AnyColumnBuilder, type AnyPgTable } from "./schema.js";
+import { getTableName, isPgTable, tableRefParts, type AnyColumnBuilder, type AnyPgTable } from "./schema.js";
 
 // ---------------------------------------------------------------------------
 // Node types
@@ -417,6 +417,9 @@ const RESERVED_ALIAS = /^__q\d+$/;
 
 export function validAlias(name: string, what: string): string {
   validIdent(name, what);
+  if (name.includes(".")) {
+    throw new Error(`${what}: alias "${name}" must not contain "." — an alias is one identifier, not a qualification`);
+  }
   if (RESERVED_ALIAS.test(name)) {
     throw new Error(`${what}: alias "${name}" is reserved for compiler-generated derived tables`);
   }
@@ -541,7 +544,8 @@ export function isStatement(v: unknown): v is StatementNode {
 // Schema-aware helpers
 // ---------------------------------------------------------------------------
 
-/** `ref(t, users.email)` → `"t"."email"`; `ref(users.email)` → owner-qualified. */
+/** `ref(t, users.email)` → `"t"."email"`; `ref(users.email)` → owner-qualified
+ *  (schema-qualified when the owner table declares a schema). */
 export function ref(tableOrColumn: string | AnyColumnBuilder, column?: AnyColumnBuilder | string): QualifiedNode {
   if (typeof tableOrColumn === "string") {
     if (column === undefined) throw new Error("ref: column required when first argument is an alias");
@@ -551,7 +555,7 @@ export function ref(tableOrColumn: string | AnyColumnBuilder, column?: AnyColumn
   if (column !== undefined) throw new Error("ref: pass either (column) or (tableAlias, column)");
   const owner = tableOrColumn.ownerTable;
   if (!owner) throw new Error("ref: column has no owner table; qualify it with an explicit alias");
-  return qual(getTableName(owner), tableOrColumn.columnName);
+  return qual(...tableRefParts(owner), tableOrColumn.columnName);
 }
 
 // ---------------------------------------------------------------------------
@@ -631,7 +635,7 @@ function templatePart(value: unknown): ValueNode {
     if (isColumnBuilder(value)) {
       const owner = value.ownerTable;
       if (!owner) throw new Error("sqlAst: interpolated column has no owner table; use ref(alias, column) inside joins");
-      return qual(getTableName(owner), value.columnName);
+      return qual(...tableRefParts(owner), value.columnName);
     }
     if (isPgTable(value)) return ident(getTableName(value));
     if (isLegacyFragment(value)) throw legacyFragmentError("sqlAst");

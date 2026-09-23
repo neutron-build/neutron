@@ -14,11 +14,11 @@ import {
   type ExecContext,
   type InferSelectModelOfRecord,
   type Projection,
-  type ProjectionResult,
 } from "./builder.js";
 import { buildRelationalSQL, findFirst, findMany, resolveRelations, type RQBArgs } from "./relations.js";
 import {
   getTableName,
+  getTableSchema,
   isPgTable,
   isTableRelations,
   type AnyColumnBuilder,
@@ -140,10 +140,10 @@ type QueryApiOf<T extends TablesInput, R extends RelationsInput> = {
 };
 
 export interface SelectFrom {
-  from<TCols extends Record<string, AnyColumnBuilder>>(table: PgTable<TCols>): SelectBuilder<InferSelectModelOfRecord<TCols>>;
+  from<TCols extends Record<string, AnyColumnBuilder>>(table: PgTable<TCols>): SelectBuilder<null, InferSelectModelOfRecord<TCols>>;
 }
 export interface SelectProjectedFrom<P extends Projection> {
-  from(table: AnyPgTable): SelectBuilder<ProjectionResult<P>>;
+  from(table: AnyPgTable): SelectBuilder<P, unknown>;
 }
 
 export interface NeutronDatabase<
@@ -187,13 +187,28 @@ export async function createDatabase<
 
   const tables = new Map<string, { key: string; table: AnyPgTable }>();
   for (const [key, value] of Object.entries(options.tables ?? {})) {
-    if (isPgTable(value)) tables.set(getTableName(value), { key, table: value });
+    if (isPgTable(value)) {
+      const schema = getTableSchema(value);
+      if (schema !== undefined) {
+        throw new Error(
+          `tables.${key}: "${schema}"."${getTableName(value)}" declares a schema — relational reads (db.query) on schema-qualified tables land with Q05/Q07. ` +
+            `CRUD select/insert/update/delete and alias joins support them without registering them in \`tables\``,
+        );
+      }
+      tables.set(getTableName(value), { key, table: value });
+    }
   }
 
   const relationSets: TableRelations[] = [];
   const relationsByName = new Map<string, TableRelations>();
   for (const [key, value] of Object.entries(options.relations ?? {})) {
     if (!isTableRelations(value)) continue;
+    const schema = getTableSchema(value.table);
+    if (schema !== undefined) {
+      throw new Error(
+        `relations.${key}: "${schema}"."${getTableName(value.table)}" declares a schema — relational reads on schema-qualified tables land with Q05/Q07`,
+      );
+    }
     relationsByName.set(getTableName(value.table), value);
     relationSets.push(value);
   }
