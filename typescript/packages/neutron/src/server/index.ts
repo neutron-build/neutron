@@ -46,7 +46,8 @@ import { createEntityTag, requestHasMatchingEtag } from "./cache-utils.js";
 import { escapeHtml } from "../core/escape.js";
 import { isProblemError, notFoundError } from "../core/problem.js";
 import {
-  buildOpenApiSpec,
+  appDefinesSpecRoute,
+  serverOpenApiSpec,
   swaggerDocsHtml,
   type NeutronOpenApiOptions,
 } from "./openapi.js";
@@ -584,21 +585,8 @@ export async function createServer(
 
   // FRAMEWORK_CONTRACT.md §4: /openapi.json + /docs. Like /health, suppressed
   // when the app defines its own route at the same path — the user route wins.
-  const userDefinesSpecRoute = isSsr
-    ? routes.some(
-        (route) =>
-          (route.path === "/openapi.json" || route.path === "/docs") &&
-          !route.file.includes("_layout")
-      )
-    : false;
-  if (openapi && !userDefinesSpecRoute) {
-    const spec = buildOpenApiSpec(routes, {
-      title: openapi.title,
-      version: openapi.version ?? serverVersion,
-      description: openapi.description,
-      paths: openapi.paths,
-      components: openapi.components,
-    });
+  if (openapi && !appDefinesSpecRoute(routes)) {
+    const spec = serverOpenApiSpec(routes, openapi, serverVersion);
     app.get("/openapi.json", (c) => c.json(spec));
     app.get("/docs", (c) => c.html(swaggerDocsHtml(openapi.title)));
   }

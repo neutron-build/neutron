@@ -6,11 +6,16 @@ import { afterAll, describe, expect, it } from "vitest";
 import { createServer as createViteServer } from "vite";
 import { neutronPlugin } from "./plugin.js";
 import { resolvePreactSsr, vitePreactAliases } from "../core/preact-ssr.js";
+import { discoverRoutes } from "../core/manifest.js";
+import { serverOpenApiSpec, type NeutronOpenApiOptions } from "../server/openapi.js";
 
 /**
  * Dev/prod contract parity for the dev pipeline:
  * - GET /health (FRAMEWORK_CONTRACT.md §7) answers with the same body and
  *   override rule as the production server (it used to 404 in dev).
+ * - GET /openapi.json + /docs (§4) are served when `server.openapi` is
+ *   configured, with the production server's document (they fell through to
+ *   Vite's index.html in dev).
  * - Responses returned from actions and loaders keep their status and body
  *   whether built with `Response.json()` or `new Response()`.
  */
@@ -79,7 +84,7 @@ async function makeApp(files: Record<string, string>): Promise<string> {
   return root;
 }
 
-async function boot(root: string, version?: string): Promise<string> {
+async function boot(root: string, version?: string, openapi?: NeutronOpenApiOptions): Promise<string> {
   const port = await getFreePort();
   const preactSsr = resolvePreactSsr(root);
   const vite = await createViteServer({
@@ -91,6 +96,7 @@ async function boot(root: string, version?: string): Promise<string> {
         routesDir: path.join(root, "src", "routes"),
         rootDir: root,
         version,
+        openapi,
       }),
     ],
     resolve: { alias: vitePreactAliases(preactSsr) },
@@ -142,6 +148,64 @@ describe("dev server: GET /health", () => {
     const res = await fetch(`${base}/health`);
     expect(res.status).toBe(503);
     expect(await res.json()).toEqual({ status: "degraded", nucleus: "disconnected", version: "9.9.9" });
+  });
+});
+
+const USER_DOCS_ROUTE = `
+export const config = { mode: "app" };
+export async function loader() {
+  return new Response("user docs", { headers: { "content-type": "text/plain" } });
+}
+export default function Page() {
+  return null;
+}
+`;
+
+describe("dev server: GET /openapi.json and /docs", () => {
+  const openapi: NeutronOpenApiOptions = { title: "Example web", version: "1.0.0" };
+
+  it("serves the production server's spec when server.openapi is configured", { timeout: 30_000 }, async () => {
+    const root = await makeApp({ "item.tsx": responseRoute(`(b, s) => Response.json(b, { status: s })`) });
+    const base = await boot(root, undefined, openapi);
+
+    const res = await fetch(`${base}/openapi.json`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    expect(res.headers.get("x-request-id")).toBeTruthy();
+    const spec = (await res.json()) as { openapi: string; info: { title: string; version: string }; paths: object };
+    expect(spec.openapi.startsWith("3.1")).toBe(true);
+    expect(spec.info).toEqual({ title: "Example web", version: "1.0.0" });
+    expect(Object.keys(spec.paths)).toContain("/item");
+    const routes = discoverRoutes({ routesDir: path.join(root, "src", "routes") });
+    expect(spec).toEqual(serverOpenApiSpec(routes, openapi, "0.1.0"));
+
+    const docs = await fetch(`${base}/docs`);
+    expect(docs.status).toBe(200);
+    expect(docs.headers.get("content-type")).toBe("text/html; charset=UTF-8");
+    expect(await docs.text()).toContain("<title>Example web — API Docs</title>");
+
+    const head = await fetch(`${base}/openapi.json`, { method: "HEAD" });
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe("");
+  });
+
+  it("defaults info.version to the server version, as start does", { timeout: 30_000 }, async () => {
+    const base = await boot(await makeApp({ "index.tsx": responseRoute(`(b, s) => Response.json(b, { status: s })`) }), "4.5.6", { title: "No version" });
+    const spec = (await (await fetch(`${base}/openapi.json`)).json()) as { info: { version: string } };
+    expect(spec.info.version).toBe("4.5.6");
+  });
+
+  it("is not served when server.openapi is not configured", { timeout: 30_000 }, async () => {
+    const base = await boot(await makeApp({ "index.tsx": responseRoute(`(b, s) => Response.json(b, { status: s })`) }));
+    const res = await fetch(`${base}/openapi.json`);
+    expect(res.headers.get("content-type") ?? "").not.toContain("application/json");
+  });
+
+  it("yields to an app-defined /docs route", { timeout: 30_000 }, async () => {
+    const base = await boot(await makeApp({ "docs.tsx": USER_DOCS_ROUTE }), undefined, openapi);
+    const res = await fetch(`${base}/docs`);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("user docs");
   });
 });
 

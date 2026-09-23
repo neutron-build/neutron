@@ -166,3 +166,33 @@ export function swaggerDocsHtml(title: string): string {
 </body>
 </html>`;
 }
+
+/**
+ * The document the server serves at /openapi.json for its `openapi` setting.
+ * Shared by `start` and the dev server so both serve the same spec.
+ */
+export function serverOpenApiSpec(
+  routes: Route[],
+  openapi: NeutronOpenApiOptions,
+  serverVersion: string
+): Record<string, unknown> {
+  return buildOpenApiSpec(routes, {
+    title: openapi.title,
+    version: openapi.version ?? serverVersion,
+    description: openapi.description,
+    paths: openapi.paths,
+    components: openapi.components,
+  });
+}
+
+/**
+ * True when the app defines its own /openapi.json or /docs route. The
+ * built-ins are then both suppressed so the user route wins, as with /health.
+ */
+export function appDefinesSpecRoute(routes: readonly Route[]): boolean {
+  return routes.some(
+    (route) =>
+      (route.path === "/openapi.json" || route.path === "/docs") &&
+      !route.file.includes("_layout")
+  );
+}
