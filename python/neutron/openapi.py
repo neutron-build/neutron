@@ -6,6 +6,7 @@ import inspect
 from typing import Any, get_args, get_origin
 
 from pydantic import BaseModel
+from pydantic.json_schema import models_json_schema
 
 from neutron.handler import HandlerParam, ParamKind
 
@@ -83,9 +84,10 @@ def generate_openapi(
         spec["security"] = list(security)
 
     schemas = spec["components"]["schemas"]
+    model_refs = _register_models(_collect_models(handler_info), schemas)
 
     # Shared error schema
-    schemas["ProblemDetail"] = {
+    schemas[_PROBLEM_DETAIL] = {
         "type": "object",
         "properties": {
             "type": {"type": "string"},
@@ -175,14 +177,11 @@ def generate_openapi(
                 }
                 parameters.append(param_entry)
             elif param.kind == ParamKind.FORM:
-                schema_name = _register_model(param.annotation, schemas)
                 request_body = {
                     "required": True,
                     "content": {
                         "application/x-www-form-urlencoded": {
-                            "schema": {
-                                "$ref": f"#/components/schemas/{schema_name}"
-                            },
+                            "schema": dict(model_refs[param.annotation]),
                         }
                     },
                 }
@@ -204,14 +203,11 @@ def generate_openapi(
                     },
                 }
             elif param.kind == ParamKind.BODY:
-                schema_name = _register_model(param.annotation, schemas)
                 request_body = {
                     "required": True,
                     "content": {
                         "application/json": {
-                            "schema": {
-                                "$ref": f"#/components/schemas/{schema_name}"
-                            },
+                            "schema": dict(model_refs[param.annotation]),
                         }
                     },
                 }
@@ -225,7 +221,7 @@ def generate_openapi(
         responses: dict[str, Any] = {}
         effective_status = str(info.get("status_code", 200))
         if return_type and return_type is not type(None):
-            response_schema = _get_response_schema(return_type, schemas)
+            response_schema = _get_response_schema(return_type, model_refs)
             responses[effective_status] = {
                 "description": "Successful response",
                 "content": {"application/json": {"schema": response_schema}},
@@ -282,35 +278,94 @@ def _type_to_schema(t: type[Any] | None) -> dict[str, Any]:
     return {"type": "string"}
 
 
-def _register_model(model: type[Any], schemas: dict[str, Any]) -> str:
-    name = model.__name__
-    if name not in schemas:
-        schema = model.model_json_schema()
-        defs = schema.pop("$defs", {})
-        for def_name, def_schema in defs.items():
-            schemas[def_name] = def_schema
-        schemas[name] = schema
-    return name
+_PROBLEM_DETAIL = "ProblemDetail"
+_REF_PREFIX = "#/components/schemas/"
+
+
+def _collect_models(handler_info: list[dict[str, Any]]) -> list[type[BaseModel]]:
+    """Every Pydantic model that becomes a component, in first-use order."""
+    seen: dict[type[BaseModel], None] = {}
+    for info in handler_info:
+        for param in info["params"]:
+            if param.kind in (ParamKind.BODY, ParamKind.FORM) and _is_pydantic_model(
+                param.annotation
+            ):
+                seen.setdefault(param.annotation, None)
+        return_type = info["return_type"]
+        if get_origin(return_type) is list:
+            args = get_args(return_type)
+            return_type = args[0] if args else None
+        if _is_pydantic_model(return_type):
+            seen.setdefault(return_type, None)
+    return list(seen)
+
+
+def _register_models(
+    models: list[type[BaseModel]], schemas: dict[str, Any]
+) -> dict[type[BaseModel], dict[str, str]]:
+    """Add ``models`` and everything they reference to ``components/schemas``.
+
+    Generated in one pass so that every nested model, enum and recursive
+    reference lands in ``components/schemas`` and every ``$ref`` points there.
+    Per-model ``model_json_schema()`` emits ``#/$defs/<Name>`` refs, which do
+    not resolve inside an OpenAPI document, and keys components by bare class
+    name, so two different ``Address`` classes overwrote each other.
+    Pydantic's shared generator names each distinct class once and qualifies
+    colliding names by module (``app__billing__Address``), deterministically.
+
+    ``ProblemDetail`` is reserved for the shared RFC 7807 schema; an
+    application model with that name is renamed ``ProblemDetail2`` (then 3,
+    ...) and its refs rewritten.
+
+    Returns each top-level model's ``{"$ref": ...}``.
+    """
+    if not models:
+        return {}
+    key_map, top = models_json_schema(
+        [(m, "validation") for m in models],
+        ref_template=_REF_PREFIX + "{model}",
+    )
+    defs: dict[str, Any] = top.get("$defs", {})
+    refs = {model: key_map[(model, "validation")] for model in models}
+
+    if _PROBLEM_DETAIL in defs:
+        n = 2
+        while f"{_PROBLEM_DETAIL}{n}" in defs:
+            n += 1
+        new_name = f"{_PROBLEM_DETAIL}{n}"
+        defs[new_name] = defs.pop(_PROBLEM_DETAIL)
+        _rewrite_ref(
+            [defs, refs], _REF_PREFIX + _PROBLEM_DETAIL, _REF_PREFIX + new_name
+        )
+
+    schemas.update(defs)
+    return refs
+
+
+def _rewrite_ref(node: Any, old: str, new: str) -> None:
+    if isinstance(node, dict):
+        if node.get("$ref") == old:
+            node["$ref"] = new
+        for value in node.values():
+            _rewrite_ref(value, old, new)
+    elif isinstance(node, list):
+        for value in node:
+            _rewrite_ref(value, old, new)
 
 
 def _get_response_schema(
-    return_type: type[Any], schemas: dict[str, Any]
+    return_type: type[Any], model_refs: dict[type[BaseModel], dict[str, str]]
 ) -> dict[str, Any]:
     origin = get_origin(return_type)
     if origin is list:
         args = get_args(return_type)
         if args and _is_pydantic_model(args[0]):
-            name = _register_model(args[0], schemas)
-            return {
-                "type": "array",
-                "items": {"$ref": f"#/components/schemas/{name}"},
-            }
+            return {"type": "array", "items": dict(model_refs[args[0]])}
         if args:
             return {"type": "array", "items": _type_to_schema(args[0])}
         return {"type": "array"}
 
     if _is_pydantic_model(return_type):
-        name = _register_model(return_type, schemas)
-        return {"$ref": f"#/components/schemas/{name}"}
+        return dict(model_refs[return_type])
 
     return _type_to_schema(return_type)
