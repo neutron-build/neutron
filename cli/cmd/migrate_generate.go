@@ -19,9 +19,10 @@ func init() {
 	migrateGenerateCmd.Flags().String("dir", "migrations", "migrations directory")
 	migrateGenerateCmd.Flags().String("schema", "neutron.schema.json", "schema JSON exported from @neutron-build/sql (exportSchema)")
 	migrateGenerateCmd.Flags().String("name", "", "migration name (default: generated)")
-	migrateGenerateCmd.Flags().StringArray("rename", nil, "explicit column rename: table.old>table.new (repeatable)")
+	migrateGenerateCmd.Flags().StringArray("rename", nil, "explicit column rename (repeatable): schema.table.old>schema.table.new for v2 documents (two-part table.old>table.new resolves when the table name is unambiguous; v1 documents keep table.old>table.new)")
 	migrateGenerateCmd.Flags().Duration("timeout", 30*time.Second, "time budget for introspection")
 	migrateGenerateCmd.Flags().Bool("allow-destructive", false, "acknowledge data loss: include DROP statements for tables, columns, and indexes that exist in the database but are absent from the schema (neutron-internal metadata and extension-owned objects are never touched)")
+	migrateGenerateCmd.Flags().String("mode", "", "planning mode: live (diff against the database) or snapshot (offline, from the last accepted snapshot; default: [migrations].snapshots in neutron.toml, else live)")
 	migrateCmd.AddCommand(migrateGenerateCmd)
 }
 
@@ -31,6 +32,8 @@ var migrateGenerateCmd = &cobra.Command{
 	Long: `Compares the desired schema document with the live database and writes an .up.sql/.down.sql pair runnable by ` + "`neutron migrate`" + `.
 
 Schema documents: version 2 (the cross-language contract in contracts/data/) plans through full catalog introspection — qualified schemas, composite PK/unique/check/foreign-key constraints, indexes with predicates and expressions, enums, arrays and views; version 1 (legacy @neutron-build/sql exportSchema output) keeps its historical behavior.
+
+Planning modes: --mode live (the default) diffs against the live database. --mode snapshot plans fully OFFLINE from the last accepted snapshot to the desired document, accounting for pending migrations — the second unapplied migration plans against the first's snapshot, no database connection is made, and nothing is written to the database. Each snapshot-mode migration also records a .plan.json risk/reversibility report and a target snapshot under migrations/snapshots/. Snapshot mode requires a schema document v2.
 
 The generated SQL never drops neutron-internal tables (_neutron_*), extension-owned objects, or anything absent from the schema unless --allow-destructive is passed as an explicit acknowledgement of data loss. Catalog structures this diff engine cannot represent faithfully are rejected with an error instead of producing a migration that falsely claims synchronization.`,
 	RunE: func(cmd *cobra.Command, args []string) error { return reportRunE(runMigrateGenerate(cmd, args)) },
@@ -78,6 +81,29 @@ func runMigrateGenerate(cmd *cobra.Command, args []string) error {
 	renameFlags, _ := cmd.Flags().GetStringArray("rename")
 	timeout, _ := cmd.Flags().GetDuration("timeout")
 	allowDestructive, _ := cmd.Flags().GetBool("allow-destructive")
+	modeFlag, _ := cmd.Flags().GetString("mode")
+
+	mode := modeFlag
+	if mode == "" {
+		if config.MigrationsSnapshotMode() {
+			mode = "snapshot"
+		} else {
+			mode = "live"
+		}
+	}
+	switch mode {
+	case "live":
+	case "snapshot":
+		// Offline planning makes no connection and waits on nothing; an
+		// explicitly passed --timeout would be silently ignored — reject
+		// it instead (review-1 LOW-2). The default value passes through.
+		if cmd.Flags().Changed("timeout") {
+			return fmt.Errorf("--timeout has no effect in snapshot mode: offline planning makes no database connection and waits on nothing; drop the flag (or use --mode live)")
+		}
+		return runMigrateGenerateSnapshot(cmd, dir, schemaPath, name, renameFlags, allowDestructive)
+	default:
+		return fmt.Errorf("--mode must be live or snapshot, got %q", mode)
+	}
 
 	if name == "" {
 		name = "generated"
@@ -135,6 +161,117 @@ func runMigrateGenerate(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 	fmt.Println("Review the SQL, then apply with `neutron migrate`.")
 	return nil
+}
+
+// runMigrateGenerateSnapshot is the M03 offline path: plan from the last
+// accepted snapshot to the desired document, accounting for pending
+// migrations. No database connection, no history write, no locks; the
+// serialized runner (neutron migrate) owns apply-time behavior. All four
+// artifacts (up/down SQL, plan report, target snapshot) are written
+// all-or-nothing and never overwrite existing files.
+func runMigrateGenerateSnapshot(cmd *cobra.Command, dir, schemaPath, name string, renameFlags []string, allowDestructive bool) error {
+	if name == "" {
+		name = "generated"
+	}
+
+	loaded, err := loadSchemaDocument(schemaPath)
+	if err != nil {
+		return err
+	}
+	if loaded.V2 == nil {
+		return fmt.Errorf("snapshot planning requires a schema document v2; %s is the legacy version 1 shape — re-export with exportSchemaV2 or `neutron schema export`", schemaPath)
+	}
+
+	chain, err := db.LoadSnapshotChain(dir)
+	if err != nil {
+		return err
+	}
+	baseDoc, err := chain.HeadDocument()
+	if err != nil {
+		return err
+	}
+
+	renames, err := parseSchemaRenames(renameFlags, loaded)
+	if err != nil {
+		return err
+	}
+
+	// Offline: no normalizer. Expression-bearing comparisons fall back to
+	// strict text and surface as explicit caveats in the plan artifact —
+	// equivalence decisions need the catalog (live check has it).
+	result, err := db.DiffV2Document(cmd.Context(), loaded.V2, baseDoc, db.DiffV2Options{
+		Renames:          renames,
+		AllowDestructive: allowDestructive,
+		SnapshotBase:     true, // messages name the planning base, not "the database"
+	})
+	if err != nil {
+		return err
+	}
+
+	for _, w := range result.Warnings {
+		ui.Warnf("%s", w)
+	}
+
+	if len(result.Up) == 0 {
+		if len(result.Warnings) > 0 {
+			ui.Infof("No applicable changes; see the notes above — objects reported as left untouched are not in sync with the schema.")
+		} else {
+			ui.Infof("No schema changes detected (planning base: snapshot %s).", chain.HeadRef)
+		}
+		return nil
+	}
+
+	version, err := db.NextMigrationVersion(dir)
+	if err != nil {
+		return err
+	}
+	plan, err := db.BuildPlanArtifact(version, name, chain.HeadRef, chain.HeadSHA256, loaded.V2, renames, result)
+	if err != nil {
+		return err
+	}
+
+	upSQL := strings.Join(result.Up, ";\n") + ";"
+	downSQL := strings.Join(reverseStrings(result.Down), ";\n") + ";"
+	files, err := db.MigrationArtifactSet(dir, version, name, plan, loaded.V2, upSQL, downSQL)
+	if err != nil {
+		return err
+	}
+	if err := db.WriteArtifactSet(files); err != nil {
+		return err
+	}
+
+	ui.Infof("Planning base: snapshot %s (canonical SHA-256 %s)", chain.HeadRef, shortHashCLI(chain.HeadSHA256))
+	destructiveCount := 0
+	for _, op := range plan.Operations {
+		if op.Destructive {
+			destructiveCount++
+		}
+	}
+	ui.Infof("Risk report: %d statement(s), %d destructive, %d irreversible — overall reversibility %s",
+		plan.Risk.StatementCount, destructiveCount, plan.Risk.IrreversibleCount, plan.Risk.OverallReversibility)
+	for _, op := range plan.Operations {
+		if op.Destructive || op.DataLoss {
+			ui.Warnf("operation %d is %s: %s", op.Index, riskLabel(op), firstLine(op.SQL))
+		}
+	}
+	ui.Successf("Generated migration %s with %d statement(s):", version+"_"+name, len(result.Up))
+	for _, f := range files {
+		fmt.Printf("  %s\n", f.Path)
+	}
+	fmt.Println()
+	fmt.Println("Review the SQL and plan report, then apply with `neutron migrate`.")
+	return nil
+}
+
+func riskLabel(op db.PlanOperation) string {
+	switch {
+	case op.DataLoss:
+		return "data-loss"
+	case op.Destructive:
+		return "destructive"
+	default:
+		return "risky"
+	}
 }
 
 // loadedSchema is a desired-schema document in either supported format:

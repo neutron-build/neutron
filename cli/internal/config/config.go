@@ -5,15 +5,27 @@ import "github.com/spf13/viper"
 
 // NeutronConfig holds all CLI configuration.
 type NeutronConfig struct {
-	Database DatabaseConfig `mapstructure:"database"`
-	Studio   StudioConfig   `mapstructure:"studio"`
-	Project  ProjectConfig  `mapstructure:"project"`
-	Nucleus  NucleusConfig  `mapstructure:"nucleus"`
+	Database   DatabaseConfig   `mapstructure:"database"`
+	Studio     StudioConfig     `mapstructure:"studio"`
+	Project    ProjectConfig    `mapstructure:"project"`
+	Nucleus    NucleusConfig    `mapstructure:"nucleus"`
+	Migrations MigrationsConfig `mapstructure:"migrations"`
 }
 
 // DatabaseConfig holds database connection settings.
 type DatabaseConfig struct {
 	URL string `mapstructure:"url"`
+}
+
+// MigrationsConfig holds the migration workflow settings ([migrations] in
+// neutron.toml). Snapshots opts `neutron migrate generate` into offline
+// snapshot-based planning; dir/schema/module carry the project's paths so
+// two checkouts of one repository behave identically.
+type MigrationsConfig struct {
+	Dir       string `mapstructure:"dir"`
+	Snapshots bool   `mapstructure:"snapshots"`
+	Schema    string `mapstructure:"schema"`
+	Module    string `mapstructure:"module"`
 }
 
 // StudioConfig holds Studio UI settings.
@@ -45,6 +57,36 @@ func Load() (*NeutronConfig, error) {
 // DatabaseURL returns the configured database URL.
 func DatabaseURL() string {
 	return viper.GetString("database.url")
+}
+
+// MigrationsDir returns the migrations directory (default "migrations").
+func MigrationsDir() string {
+	if v := viper.GetString("migrations.dir"); v != "" {
+		return v
+	}
+	return "migrations"
+}
+
+// MigrationsSnapshotMode reports whether the manifest opted into offline
+// snapshot-based generation ([migrations] snapshots = true).
+func MigrationsSnapshotMode() bool {
+	return viper.GetBool("migrations.snapshots")
+}
+
+// MigrationsSchemaSource returns the desired schema document path.
+func MigrationsSchemaSource() string {
+	if v := viper.GetString("migrations.schema"); v != "" {
+		return v
+	}
+	return "neutron.schema.json"
+}
+
+// MigrationsExportModule returns the schema export module path.
+func MigrationsExportModule() string {
+	if v := viper.GetString("migrations.module"); v != "" {
+		return v
+	}
+	return "export-schema.mjs"
 }
 
 // StudioPort returns the configured Studio port.
