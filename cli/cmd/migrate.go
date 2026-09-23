@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 func init() {
 	migrateCmd.Flags().String("dir", "migrations", "migrations directory")
 	migrateCmd.Flags().Duration("timeout", 60*time.Second, "total time budget for the migration batch (0 = no deadline)")
+	migrateCmd.Flags().Bool("allow-destructive", false, "acknowledge data loss: apply pending migrations whose statements drop tables, columns, indexes or types (migrations may contain only allowlisted statement kinds — SELECT/INSERT/UPDATE/DELETE/MERGE, TRUNCATE, CREATE/ALTER/DROP of schema objects, SET LOCAL; anything else is refused whatever flags are passed, and within those kinds neutron-internal metadata and extension-owned objects are never touched by any drop form, cascade, alteration, row write or WITH-wrapped data-modifying CTE)")
 
 	migrateStatusCmd.Flags().String("dir", "migrations", "migrations directory")
 	migrateStatusCmd.Flags().Duration("timeout", 10*time.Second, "time budget for the status query (0 = no deadline)")
@@ -49,10 +51,48 @@ anything new runs. Transaction-pooled proxies (e.g. PgBouncer transaction
 mode) are unsupported for migration connections: use a direct or
 session-pooled connection.
 
-Migration files run verbatim in filename order: the protections enforced when
-SQL is generated (migrate generate and db push never plan changes to
-neutron-internal _neutron_* metadata or extension-owned objects) are
-generation-time only — hand-edited files are not re-checked before they run.
+Before any DDL runs, under the lock, the runner validates history shape and
+checksums, managed drift when the migrations directory carries a snapshot
+chain (changes made outside migration files abort the run; ` + "`neutron schema check --live`" + ` reports them), plan.json staleness for snapshot-workflow migrations, the statement-kind allowlist, and protected objects.
+
+Migrations may contain only these statement kinds: SELECT (including WITH;
+data-modifying CTEs are target-guarded), INSERT/UPDATE/DELETE/MERGE,
+TRUNCATE, CREATE/ALTER/DROP of schema objects (tables, views, materialized
+views, indexes including CONCURRENTLY, sequences, types, domains, schemas,
+and extensions — extensions may be CREATEd and DROPped only when member-free;
+every ALTER EXTENSION is refused — the schema-object subset of the guard
+vocabulary; database- and role-wide kinds such as DATABASE, TABLESPACE or
+ROLE/USER/GROUP are refused like any other out-of-allowlist kind), and
+SET LOCAL. Anything
+else — EXPLAIN, PREPARE/EXECUTE, DO, CALL, COPY, CREATE FUNCTION/PROCEDURE/
+RULE/TRIGGER, GRANT/REVOKE, COMMENT ON, VACUUM/ANALYZE, REINDEX, LOCK,
+SAVEPOINT, BEGIN/COMMIT, session-level SET, CREATE/ALTER/DROP DATABASE or
+ROLE — is refused with an error naming the statement kind and the reason,
+before any statement in the file executes
+(atomically: nothing in the batch applies). No flag bypasses this.
+
+Within the allowlisted kinds, hand-edited files are re-checked at apply time:
+statements that drop, alter or write to neutron-internal _neutron_* metadata
+or extension-owned objects are refused under every spelling the tokenizer
+sees through — comments, quoted identifiers, data-modifying CTEs — and so
+are CASCADE drops of EVERY allowlisted kind (relations, types, domains,
+schemas, routines, aggregates, operators, operator classes and families,
+collations, conversions, statistics, text-search objects, policies,
+triggers, rules) whose transitive dependents include protected objects —
+or metadata attached to protected objects, like constraints and column
+defaults — in any schema, and creates of
+_neutron_-prefixed names (the namespace is reserved; a planted lookalike
+would defeat the cascade protection). Statements the
+planner classifies as destructive or data-losing require --allow-destructive
+as an explicit acknowledgement.
+
+Migrations containing concurrent index operations (CREATE INDEX CONCURRENTLY)
+cannot run in a transaction: they execute statement-by-statement on the
+locked session, structure-changing statements only (data changes are
+refused — split them into their own transactional migration), with the
+history row recorded after the last statement. A failure or kill mid-file
+leaves partial effects and no history row: inspect and recover explicitly
+with ` + "`neutron migrate resolve <version>`" + ` — never a silent replay.
 
 Targets PostgreSQL. Nucleus migration runners live in the language SDKs and
 remain experimental. Databases with pre-protocol histories (older CLI, or
@@ -199,6 +239,7 @@ func prepareHistoryRun(ctx context.Context, client *db.Client, sess *db.Migratio
 
 func runMigrate(cmd *cobra.Command, args []string) error {
 	dir, _ := cmd.Flags().GetString("dir")
+	allowDestructive, _ := cmd.Flags().GetBool("allow-destructive")
 
 	ctx, cancel := commandContext(cmd)
 	defer cancel()
@@ -229,22 +270,81 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 	for _, r := range applied {
 		appliedSet[r.Version] = true
 	}
+	var pendingFiles []db.MigrationFile
+	for _, f := range files {
+		if !appliedSet[f.Version] {
+			pendingFiles = append(pendingFiles, f)
+		}
+	}
+	if len(pendingFiles) == 0 {
+		if len(unverified) > 0 {
+			ui.Warnf("%d applied migration(s) have unverified history (no recorded checksum): %s",
+				len(unverified), strings.Join(unverified, ", "))
+		}
+		ui.Successf("Database is up to date (%d migrations applied)", len(applied))
+		return nil
+	}
+
+	// Everything below is the M05 precondition layer: it all runs under
+	// the lock, before any DDL.
+	chain, err := chainIfPresent(dir)
+	if err != nil {
+		return err
+	}
+	if err := managedDriftUnderLock(ctx, client, chain, applied); err != nil {
+		return err
+	}
+
+	pendings, err := analyzeMigrations(dir, pendingFiles)
+	if err != nil {
+		return err
+	}
+	if err := validateStatementAllowlist(pendings); err != nil {
+		return err
+	}
+	if err := guardProtectedObjects(ctx, client, pendings, false); err != nil {
+		return err
+	}
+	if err := requireDestructiveAcknowledgement(pendings, allowDestructive); err != nil {
+		return err
+	}
+	if err := refuseNontransactionalDataChanges(pendings); err != nil {
+		return err
+	}
 
 	var count int
-	for _, f := range files {
-		if appliedSet[f.Version] {
+	for _, p := range pendings {
+		if p.Nontransactional {
+			// One spinner stop per spinner (StopWithMessage is not
+			// re-entrant): per-statement progress is not reported while
+			// the run is in flight; resolve re-inspects afterwards.
+			spinner := ui.NewSpinner(fmt.Sprintf("Applying %s_%s (nontransactional)...", p.File.Version, p.File.Name))
+			err := sess.ApplyNontransactionalMigration(ctx, p.File, p.Statements, nil)
+			if err != nil {
+				var partial *db.NontransactionalPartialError
+				if errors.As(err, &partial) {
+					spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Failed %s_%s: %v", p.File.Version, p.File.Name, err))
+					return fmt.Errorf(
+						"interrupted after %d of %d pending migration(s) (%s_%s failed MID-FILE outside any transaction; its earlier statements' effects REMAIN — no rollback is pretended):\n%v\ninspect and recover explicitly: `neutron migrate resolve %s`",
+						count, len(pendings), p.File.Version, p.File.Name, err, p.File.Version)
+				}
+				spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Failed %s_%s: %v", p.File.Version, p.File.Name, err))
+				return err
+			}
+			spinner.StopWithMessage(ui.CheckMark, fmt.Sprintf("Applied %s_%s", p.File.Version, p.File.Name))
+			count++
 			continue
 		}
 
-		spinner := ui.NewSpinner(fmt.Sprintf("Applying %s_%s...", f.Version, f.Name))
-		if err := sess.ApplyMigration(ctx, f); err != nil {
-			spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Failed %s_%s: %v", f.Version, f.Name, err))
+		spinner := ui.NewSpinner(fmt.Sprintf("Applying %s_%s...", p.File.Version, p.File.Name))
+		if err := sess.ApplyMigration(ctx, p.File); err != nil {
+			spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Failed %s_%s: %v", p.File.Version, p.File.Name, err))
 			// Name the interruption boundary: a partial batch is a
 			// different operational state than an untouched one.
 			return fmt.Errorf("interrupted after %d of %d pending migration(s) (failed at %s_%s): %w",
-				count, len(files)-len(applied), f.Version, f.Name, err)
+				count, len(pendings), p.File.Version, p.File.Name, err)
 		}
-		spinner.StopWithMessage(ui.CheckMark, fmt.Sprintf("Applied %s_%s", f.Version, f.Name))
+		spinner.StopWithMessage(ui.CheckMark, fmt.Sprintf("Applied %s_%s", p.File.Version, p.File.Name))
 		count++
 	}
 
@@ -339,6 +439,37 @@ func runMigrateStatus(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	// Failed/uncertain reporting (M05): a pending migration whose durable
+	// effects are partially or fully present is an interrupted or
+	// unrecorded state, not an ordinary pending one. Read-only catalog
+	// inspection; the resolve command owns recovery.
+	appliedSet := map[string]bool{}
+	for _, s := range statuses {
+		if s.Applied {
+			appliedSet[s.Version] = true
+		}
+	}
+	verdicts := map[string]string{}
+	if files, err := db.ReadMigrationFiles(dir); err == nil {
+		for _, f := range files {
+			if appliedSet[f.Version] {
+				continue
+			}
+			report, err := inspectEffects(ctx, client, f)
+			if err != nil {
+				return err
+			}
+			switch report.Verdict() {
+			case "partial":
+				verdicts[f.Version] = "INTERRUPTED: partial effects present — `neutron migrate resolve " + f.Version + "`"
+			case "complete":
+				verdicts[f.Version] = "EFFECTS PRESENT, UNRECORDED — `neutron migrate resolve " + f.Version + " --mark-applied` after verifying"
+			case "invalid":
+				verdicts[f.Version] = "INTERRUPTED: invalid concurrent index remains — `neutron migrate resolve " + f.Version + "`"
+			}
+		}
+	}
+
 	tbl := ui.NewTable("Version", "Name", "Status", "Applied At")
 	for _, s := range statuses {
 		status := "pending"
@@ -352,6 +483,8 @@ func runMigrateStatus(cmd *cobra.Command, args []string) error {
 				status += ", file missing"
 			}
 			appliedAt = s.AppliedAt.Format("2006-01-02 15:04:05")
+		} else if d, ok := verdicts[s.Version]; ok {
+			status = d
 		}
 		tbl.AddRow(s.Version, s.Name, status, appliedAt)
 	}
@@ -444,6 +577,37 @@ func runMigrateDown(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	// Reversibility limits (M05): refuse downs the plan marks irreversible
+	// and downs with no executable SQL (an IRREVERSIBLE comment stub is not
+	// a restoration — running it would only delete the history row); guard
+	// the down SQL's targets like the up path; refuse concurrent drops.
+	upByVersion := make(map[string]db.MigrationFile, len(upFiles))
+	for _, f := range upFiles {
+		upByVersion[f.Version] = f
+	}
+	var revertAnalysis []pendingMigration
+	for _, f := range toRevert {
+		up, ok := upByVersion[f.Version]
+		if !ok {
+			return fmt.Errorf("applied version %s has no up migration file — cannot evaluate reversibility", f.Version)
+		}
+		p, err := analyzeMigrations(dir, []db.MigrationFile{up})
+		if err != nil {
+			return err
+		}
+		p[0].DownFile = &f
+		if err := validateDownReversibility(p[0]); err != nil {
+			return err
+		}
+		if err := validateDownStatementAllowlist(p[0]); err != nil {
+			return err
+		}
+		revertAnalysis = append(revertAnalysis, p[0])
+	}
+	if err := guardProtectedObjects(ctx, client, revertAnalysis, true); err != nil {
+		return err
+	}
+
 	// Revert migrations
 	for _, f := range toRevert {
 		spinner := ui.NewSpinner(fmt.Sprintf("Reverting %s_%s...", f.Version, f.Name))
@@ -455,6 +619,40 @@ func runMigrateDown(cmd *cobra.Command, args []string) error {
 	}
 
 	ui.Successf("Reverted %d migration(s)", len(toRevert))
+	return nil
+}
+
+// validateDownReversibility enforces the down-side limits: the down file
+// must contain executable SQL (a comment-only IRREVERSIBLE stub must not be
+// "run" to a silent history deletion), must not itself use concurrent
+// operations, and — when a plan artifact exists — must not be marked
+// irreversible by the M03 risk report.
+func validateDownReversibility(p pendingMigration) error {
+	if p.DownFile == nil {
+		return fmt.Errorf("aborting rollback: applied migration %s has no down migration file", p.File.Version)
+	}
+	executable := false
+	for _, stmt := range db.SplitSQLStatements(p.DownFile.SQL) {
+		if !hasExecutableStmt(stmt) {
+			continue
+		}
+		executable = true
+		if db.IsNontransactionalStatement(stmt) {
+			return fmt.Errorf(
+				"aborting rollback: down migration for %s uses concurrent operations — this runner does not revert through DROP INDEX CONCURRENTLY; drop the index by hand",
+				p.File.Version)
+		}
+	}
+	if !executable {
+		return fmt.Errorf(
+			"aborting rollback: down migration for applied version %s contains no executable SQL (an IRREVERSIBLE marker, not a restoration) — the plan classifies it irreversible; forward-fix instead of pretending to roll back",
+			p.File.Version)
+	}
+	if p.Plan != nil && p.Plan.Risk.OverallReversibility == db.ReversibilityIrreversible {
+		return fmt.Errorf(
+			"aborting rollback: migration %s is marked irreversible by its plan report (%d irreversible operation(s)) — down SQL is not data restoration; forward-fix instead",
+			p.File.Version, p.Plan.Risk.IrreversibleCount)
+	}
 	return nil
 }
 

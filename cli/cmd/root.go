@@ -29,6 +29,15 @@ run migrations, launch Studio, and more.`,
 }
 
 func Execute() error {
+	// Flag-parse failures (an unknown flag, a missing flag value) never
+	// reach a command's RunE, and SilenceErrors swallows cobra's own
+	// report — surface them here so a wrong flag is not a silent exit 1
+	// (reportRunE keeps printing every error that does reach a RunE;
+	// FlagErrorFunc fires only on flag parsing, so nothing double-prints).
+	rootCmd.SetFlagErrorFunc(func(c *cobra.Command, err error) error {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return err
+	})
 	return rootCmd.Execute()
 }
 

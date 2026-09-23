@@ -50,23 +50,6 @@ type MigrationStatus struct {
 	Unverified bool
 }
 
-// createTrackingTable creates the protocol v2 history table
-// (contracts/data/MIGRATIONS.md). Legacy tables graduate via explicit
-// adoption, never via this CREATE (IF NOT EXISTS is a no-op on them).
-// Table creation for a RUN happens on the locked session
-// (MigrationSession.EnsureMigrationTableV2); this constant is the shared
-// shape used by AppliedMigrations when no history exists yet — a
-// pre-existing metadata write (the empty v2 table is created outside the
-// advisory lock, idempotent), kept from pre-M04 status behavior.
-const createTrackingTable = `CREATE TABLE IF NOT EXISTS _neutron_migrations (
-    version TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    applied_at TIMESTAMPTZ DEFAULT now(),
-    checksum TEXT,
-    owner TEXT,
-    format TEXT
-);`
-
 // HasMigrationHistory reports whether the tracking table exists and holds at
 // least one applied migration (guards `db push` against clobbering managed DBs).
 func (c *Client) HasMigrationHistory(ctx context.Context) (bool, error) {
@@ -89,23 +72,18 @@ func (c *Client) HasMigrationHistory(ctx context.Context) (bool, error) {
 }
 
 // AppliedMigrations returns all applied migrations from the tracking table,
-// reading v2 columns when the table has them. The status command uses this;
-// mutating flows must read under a MigrationSession's advisory lock. On an
-// absent history this creates the empty v2 table outside the lock — a
-// pre-existing (pre-M04) idempotent metadata write, not new behavior.
+// reading v2 columns when the table has them. Read-only: an absent history
+// yields no records and creates nothing — the history table is born only
+// under a locked run (MigrationSession.EnsureMigrationTableV2) or adoption.
 func (c *Client) AppliedMigrations(ctx context.Context) ([]MigrationRecord, error) {
 	shape, err := c.InspectMigrationHistory(ctx)
 	if err != nil {
 		return nil, err
 	}
-	switch shape {
-	case HistoryAbsent:
-		if err := c.Exec(ctx, createTrackingTable); err != nil {
-			return nil, err
-		}
-		shape = HistoryV2Text
-	case HistoryV2Text, HistoryV2Integer:
-	case HistoryLegacyText, HistoryLegacyInteger, HistoryIncompatible:
+	if shape == HistoryAbsent {
+		return nil, nil
+	}
+	if shape == HistoryLegacyText || shape == HistoryLegacyInteger || shape == HistoryIncompatible {
 		// Read what is there without the v2 columns.
 		rows, err := c.pool.Query(ctx, "SELECT version, name, applied_at FROM _neutron_migrations ORDER BY version")
 		if err != nil {

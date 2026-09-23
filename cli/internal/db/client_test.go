@@ -46,11 +46,8 @@ func TestStatusInfoStruct(t *testing.T) {
 	}
 }
 
-func TestCreateTrackingTableSQL(t *testing.T) {
-	if createTrackingTable == "" {
-		t.Error("createTrackingTable SQL is empty")
-	}
-	if len(createTrackingTable) < 50 {
-		t.Error("createTrackingTable SQL seems too short")
-	}
-}
+// The unlocked status path used to CREATE the empty v2 history table
+// (pre-M04 behavior, removed in M05: read-only means read-only — the
+// history table is born only on a locked run or via adoption). The live
+// contract is pinned by the M05 E2E status case; there is no unlocked DDL
+// left here to unit-test.

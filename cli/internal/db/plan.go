@@ -31,6 +31,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -574,9 +575,12 @@ func summarizeRisk(ops []PlanOperation) PlanRisk {
 
 // statementDestructive classifies statements this package's own planner
 // emits, by their deterministic leading tokens. It is not a SQL parser and
-// never executes anything.
+// never executes anything. Classification reads the single tokenizer's
+// significant-token rendering (normalizedStatementText), so comments
+// cannot hide a destructive statement from the acknowledgement gate; the
+// classified vocabulary itself is unchanged (the M03 contract).
 func statementDestructive(sql string) bool {
-	s := normalizeSQL(sql)
+	s := normalizedStatementText(sql)
 	for _, prefix := range []string{"drop table", "drop view", "drop index", "drop type", "drop schema"} {
 		if strings.HasPrefix(s, prefix) {
 			return true
@@ -590,9 +594,10 @@ func statementDestructive(sql string) bool {
 
 // statementDataLoss marks operations that can destroy row data or column
 // values. Constraint/index/view drops destroy structure, not data; column
-// type conversions can truncate, so they carry the flag too.
+// type conversions can truncate, so they carry the flag too. Same
+// token-based rendering as statementDestructive, same frozen vocabulary.
 func statementDataLoss(sql string) bool {
-	s := normalizeSQL(sql)
+	s := normalizedStatementText(sql)
 	for _, prefix := range []string{"drop table", "drop type", "drop schema"} {
 		if strings.HasPrefix(s, prefix) {
 			return true
@@ -607,16 +612,6 @@ func statementDataLoss(sql string) bool {
 		}
 	}
 	return false
-}
-
-func normalizeSQL(sql string) string {
-	s := strings.TrimSpace(strings.ToLower(sql))
-	for strings.Contains(s, "  ") {
-		s = strings.ReplaceAll(s, "  ", " ")
-	}
-	s = strings.ReplaceAll(s, "\n", " ")
-	s = strings.ReplaceAll(s, "\t", " ")
-	return strings.TrimSpace(s)
 }
 
 func renameDisplayList(renames map[string]string) []string {
@@ -797,6 +792,76 @@ func marshalDeterministic(v any) ([]byte, error) {
 // MarshalPlanJSON renders a plan artifact deterministically.
 func MarshalPlanJSON(plan *PlanArtifact) ([]byte, error) {
 	return marshalDeterministic(plan)
+}
+
+// LoadPlanArtifact reads and validates a .plan.json artifact. Unknown
+// fields, foreign format versions, foreign workflow tags and trailing
+// content after the JSON value are refused: the plan is the authority for
+// apply-time reversibility limits, so a file this reader does not fully
+// understand is an error, not a guess.
+func LoadPlanArtifact(path string) (*PlanArtifact, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read plan %s: %w", path, err)
+	}
+	var plan PlanArtifact
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&plan); err != nil {
+		return nil, fmt.Errorf("invalid plan %s: %w", path, err)
+	}
+	// Exactly one JSON value and nothing else: trailing garbage (even a
+	// second valid value) means a malformed artifact, not a readable plan.
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, fmt.Errorf("invalid plan %s: trailing content after the JSON object", path)
+	}
+	if plan.FormatVersion != PlanFormatVersion {
+		return nil, fmt.Errorf("plan %s declares format version %d; this CLI understands version %d only", path, plan.FormatVersion, PlanFormatVersion)
+	}
+	if plan.Workflow != SnapshotWorkflowTag {
+		return nil, fmt.Errorf("plan %s declares workflow %q; this reader understands %q only", path, plan.Workflow, SnapshotWorkflowTag)
+	}
+	return &plan, nil
+}
+
+// VerifyPlanIdentity refuses a plan artifact that names a different
+// migration than the file it sits next to (renamed or copied artifacts).
+func VerifyPlanIdentity(plan *PlanArtifact, version, name string) error {
+	if plan.MigrationVersion != version || plan.MigrationName != name {
+		return fmt.Errorf(
+			"plan records migration %s_%s but sits next to %s_%s — filename/content identity mismatch; the chain refuses ambiguous artifacts",
+			plan.MigrationVersion, plan.MigrationName, version, name)
+	}
+	return nil
+}
+
+// PlanMatchesUpSQL verifies the plan's operations are exactly the up file's
+// executable statements. A plan.json that disagrees with its up.sql is
+// stale — edited after generation — and its risk/reversibility report can
+// no longer be trusted to gate apply or down.
+func PlanMatchesUpSQL(plan *PlanArtifact, upSQL string) error {
+	stmts := SplitSQLStatements(upSQL)
+	var exec []string
+	for _, s := range stmts {
+		if hasExecutableSQL(s) {
+			exec = append(exec, stripTrailingSemicolon(s))
+		}
+	}
+	var ops []string
+	for _, op := range plan.Operations {
+		if hasExecutableSQL(op.SQL) {
+			ops = append(ops, stripTrailingSemicolon(op.SQL))
+		}
+	}
+	if len(exec) != len(ops) {
+		return fmt.Errorf("stale plan: up.sql carries %d executable statement(s) but plan.json records %d — regenerate the migration or restore the up file", len(exec), len(ops))
+	}
+	for i := range exec {
+		if exec[i] != ops[i] {
+			return fmt.Errorf("stale plan: statement %d differs between up.sql and plan.json (%q) — regenerate the migration or restore the up file", i+1, firstSQLLine(ops[i]))
+		}
+	}
+	return nil
 }
 
 // MarshalSnapshotJSON renders a snapshot artifact with the embedded document
