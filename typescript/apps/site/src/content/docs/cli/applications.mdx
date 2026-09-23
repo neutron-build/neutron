@@ -1,0 +1,90 @@
+---
+title: Multi-service applications
+description: Run several native services and finite tasks from one neutron.toml. Experimental; macOS and Linux.
+---
+
+**Experimental.** The manifest format may still change. Service supervision and tasks run on macOS and Linux; on Windows only `project check` and `project plan` work.
+
+An `[application]` table in `neutron.toml` describes services that keep running (an API, a web app) and tasks that finish (a build, a test run, a proof check). Each keeps its own native toolchain: Neutron runs the command you declare, as an argument list without a shell, and does not compile or wrap it. Projects without the table keep the single-language `neutron dev` behavior.
+
+```toml
+[application]
+version = 1
+name = "inventory"
+
+[application.services.api]
+path = "services/api"
+command = ["go", "run", "./cmd/server"]
+contract = "neutron/v1"          # a Neutron SDK service; port assigned at start
+
+[application.services.web]
+path = "apps/web"
+command = ["pnpm", "dev"]
+ports = [3000]
+depends_on = ["api"]             # web receives NEUTRON_SERVICE_API_URL
+ready = { http = "http://127.0.0.1:3000/", timeout = "30s" }
+
+[application.tasks.test]
+path = "services/api"
+command = ["go", "test", "./..."]
+timeout = "10m"
+```
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `neutron project check` | Validates the manifest without running anything. |
+| `neutron project plan [--json] [--service NAME]` | Shows services, tasks, ports and injected environment keys (never values). |
+| `neutron dev [--service NAME]` | Starts the selected service and its dependencies in dependency order, in the foreground. |
+| `neutron project run TASK... [--jobs N] [--json]` | Runs tasks and their dependencies; exits nonzero unless all succeed. |
+
+## Services
+
+A service starts once each of its `depends_on` services is ready. Readiness is one of `http` (a URL that must return 2xx, no redirects), `tcp` (`host:port` accepting connections), or `path` (an HTTP path on the service's own single port), each with a `timeout`. A service that others depend on must be able to report readiness.
+
+If any service fails to start, fails readiness, or exits, even with status 0, the whole session stops. There is no automatic restart; your tool's own watcher handles reloads.
+
+**Stopping.** Interrupt once: dependents stop before their dependencies, each gets SIGTERM, then SIGKILL after its grace period. Interrupt again to skip the remaining grace. Services also stop if the terminal closes or the `neutron` process itself is killed; each service runs under a small supervisor process that stops its whole process tree when `neutron` goes away.
+
+**Ports.** Declared ports are checked before anything starts, including listeners on `0.0.0.0`, `::` and `::1`, so a stale server cannot pass as the new one.
+
+**Finding other services.** Each service receives `NEUTRON_SERVICE_<NAME>_URL` (for example `NEUTRON_SERVICE_API_URL=http://127.0.0.1:52811`) for every direct dependency with exactly one port. Explicit `env` entries always win.
+
+## Neutron SDK services
+
+`contract = "neutron/v1"` marks a service built on a Neutron SDK that follows the [framework contract](https://github.com/neutron-build/neutron/blob/main/FRAMEWORK_CONTRACT.md). For such a service the coordinator:
+
+- assigns a free loopback port when `ports` is omitted, and passes `NEUTRON_HOST` and `NEUTRON_PORT`,
+- treats `GET /health` as readiness unless `ready` says otherwise,
+- allows the contract's 30-second drain before SIGKILL,
+- reports, once ready, a degraded `/health`, a missing `/openapi.json`, or a spec that is not OpenAPI 3.1. These are warnings; the session keeps running.
+
+The SDK must read `NEUTRON_HOST` and `NEUTRON_PORT` for an assigned port to work. Declare `ports` explicitly where an SDK version does not yet do so.
+
+## Tasks
+
+A task succeeds when its command exits 0. `timeout` is required. `depends_on` may name only other tasks. `outputs` lists paths the task should produce; they appear in the result but are not cached or checked. Native tools keep their own caches.
+
+`project run` is fail-fast: after a failure, timeout or interrupt, nothing new starts, running tasks are stopped, and the rest are reported as `skipped`. `--jobs` bounds concurrency (default: CPU count). With `--json`, a versioned result goes to stdout and task output to stderr:
+
+```json
+{
+  "version": 1,
+  "tasks": [
+    { "name": "build", "status": "succeeded", "exit_code": 0, "duration_ms": 1840, "outputs": ["bin/api"] },
+    { "name": "test", "status": "failed", "exit_code": 1, "duration_ms": 3120, "error": "exit status 1" }
+  ]
+}
+```
+
+Statuses are `succeeded`, `failed`, `timed_out`, `cancelled` and `skipped`. Verification and simulation tools such as `lake build`, `quint verify`, or a Modelica run are ordinary tasks. A passing task means the tool exited 0, not that a proof covers your implementation.
+
+## Limits
+
+- Services and tasks cannot depend on each other yet.
+- An assigned port is free when chosen; another process could take it before the service binds it.
+- A readiness probe proves something answered on the port, not which process answered.
+- Child output is shown as written; secrets printed by a service are not redacted.
+
+A runnable two-language example is in [`cli/examples/application`](https://github.com/neutron-build/neutron/tree/main/cli/examples/application).

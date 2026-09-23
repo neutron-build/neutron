@@ -38,6 +38,8 @@ neutron dev
 
 Delegates to the language-specific dev server based on auto-detection.
 
+If `neutron.toml` has an `[application]` table, `neutron dev` instead starts its services in dependency order; `--service NAME` selects one service plus its dependencies. See [Multi-service applications](/docs/cli/applications), which also covers `neutron project check`, `plan` and `run`.
+
 ### `neutron generate`
 
 Generate typed models from one database table or every table in a schema.

@@ -264,6 +264,7 @@ export const docsNavigation = [
     items: [
       { label: "Overview", link: "/docs/cli/overview" },
       { label: "Commands", link: "/docs/cli/commands" },
+      { label: "Multi-service applications", link: "/docs/cli/applications" },
     ],
   },
   {
