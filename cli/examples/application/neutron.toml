@@ -1,0 +1,24 @@
+[application]
+version = 1
+name = "two-language-example"
+
+[application.components.api]
+path = "api"
+command = ["go", "run", "."]
+ports = [4301]
+env = { PORT = "4301" }
+
+[application.components.api.ready]
+http = "http://127.0.0.1:4301/health"
+timeout = "30s"
+
+[application.components.web]
+path = "web"
+command = ["node", "--experimental-strip-types", "--watch", "server.ts"]
+ports = [4300]
+depends_on = ["api"]
+env = { PORT = "4300", API_ORIGIN = "http://127.0.0.1:4301" }
+
+[application.components.web.ready]
+http = "http://127.0.0.1:4300/health"
+timeout = "10s"

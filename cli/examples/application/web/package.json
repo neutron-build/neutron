@@ -1,0 +1,6 @@
+{
+  "name": "neutron-coordination-example-web",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.6.0" }
+}
