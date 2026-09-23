@@ -1,0 +1,19 @@
+package handler
+
+import (
+	"context"
+
+	"github.com/neutron-build/neutron/go/neutron"
+)
+
+type HelloResponse struct {
+	Message string `json:"message"`
+}
+
+func Register(r *neutron.Router) {
+	neutron.Get(r, "/api/hello", hello)
+}
+
+func hello(ctx context.Context, _ neutron.Empty) (HelloResponse, error) {
+	return HelloResponse{Message: "Hello from {{.Name}}"}, nil
+}
