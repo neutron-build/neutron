@@ -25,7 +25,9 @@ func init() {
 var dbPushCmd = &cobra.Command{
 	Use:   "push",
 	Short: "Push the schema directly to the database (no migration files)",
-	Long: `For prototyping: diffs the exported schema JSON against the live database and applies the changes immediately, in a single transaction (a mid-plan failure rolls everything back). Refuses to run when a migration history exists unless --force.
+	Long: `For prototyping: diffs the desired schema document against the live database and applies the changes immediately, in a single transaction (a mid-plan failure rolls everything back). Refuses to run when a migration history exists unless --force.
+
+Schema documents: version 2 (the cross-language contract in contracts/data/) plans through full catalog introspection — qualified schemas, composite PK/unique/check/foreign-key constraints, indexes with predicates and expressions, enums, arrays and views; version 1 (legacy @neutron-build/sql exportSchema output) keeps its historical behavior.
 
 Safety rails (not bypassed by any flag): neutron-internal tables (_neutron_*), extension-owned objects, and schema metadata are never dropped or modified; objects absent from the schema are only dropped with --allow-destructive as an explicit acknowledgement of data loss; catalog structures this diff engine cannot represent faithfully are rejected with an error instead of being silently "synchronized".`,
 	RunE: func(cmd *cobra.Command, args []string) error { return reportRunE(runDBPush(cmd, args)) },
@@ -39,12 +41,12 @@ func runDBPush(cmd *cobra.Command, args []string) error {
 	allowDestructive, _ := cmd.Flags().GetBool("allow-destructive")
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
 
-	desired, err := loadSchemaJSON(schemaPath)
+	loaded, err := loadSchemaDocument(schemaPath)
 	if err != nil {
 		return err
 	}
 
-	renames, err := parseRenames(renameFlags)
+	renames, err := parseSchemaRenames(renameFlags, loaded)
 	if err != nil {
 		return err
 	}
@@ -69,15 +71,7 @@ func runDBPush(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	actual, err := client.IntrospectSchema(ctx)
-	if err != nil {
-		return fmt.Errorf("introspect: %w", err)
-	}
-
-	result, err := db.DiffSchema(desired, actual, db.DiffOptions{
-		Renames:          renames,
-		AllowDestructive: allowDestructive,
-	})
+	result, err := computeSchemaPlan(ctx, client, loaded, renames, allowDestructive)
 	if err != nil {
 		return err
 	}
