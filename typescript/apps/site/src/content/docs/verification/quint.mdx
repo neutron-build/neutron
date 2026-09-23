@@ -1,101 +1,47 @@
 ---
 title: Quint Specifications
-description: TLA+-style protocol model checking.
+description: Protocol models, simulation, checker scope, and the current implementation-conformance boundary.
 ---
 
-The `quint/` directory contains formal specifications of distributed protocols and stateful algorithms using Quint, a modern alternative to TLA+. These specs verify safety properties through exhaustive state-space exploration.
+[Neutron Quint](/quint) models stateful protocols with state variables, actions, and invariants. The repository includes database protocols, framework state machines, and real-time communication models.
 
-## What's Specified
+## Source layout
 
-### Nucleus Protocols
+- `quint/specs/common/`: shared types, network, and crash models.
+- `quint/specs/nucleus/`: Multi-Raft, resharding, distributed transactions, replication, membership, and snapshot transfer.
+- `quint/specs/framework/`: circuit breaker, rate limiter, CSRF, and session lifecycle.
+- `quint/specs/realtime/`: WebSocket hub and hot reload.
+- `quint/tests/`: scenario tests.
+- `quint/conformance/`: additional Quint scenarios and a Rust model harness.
 
-| Spec | Properties Verified |
-|------|-------------------|
-| Multi-Raft | Leader election, log consistency, safety under partitions |
-| Resharding | Data integrity during shard splits/merges |
-| Distributed Transactions | Atomicity, isolation across shards |
-| Replication | Consistency between primary and replicas |
-| Membership | Correct join/leave under concurrent changes |
-| Snapshot Transfer | Complete state transfer without data loss |
+A specification models a design. Its presence does not mean the corresponding production feature is complete or verified.
 
-### Framework Protocols
+## Run checks
 
-| Spec | Properties Verified |
-|------|-------------------|
-| Circuit Breaker | Valid state transitions, bounded failure counts, reject guarantees |
-| Rate Limiter | Rate enforcement, fairness, no undercounting |
-| CSRF Lifecycle | No replay attacks, session isolation, expiry correctness |
-| Session Lifecycle | Terminal permanence, bounded renewals, owner immutability |
-
-### Real-Time Protocols
-
-| Spec | Properties Verified |
-|------|-------------------|
-| WebSocket Hub | No self-delivery, no duplicates, scoped broadcasting |
-| Hot Reload | Version monotonicity, delta ordering, no version gaps |
-
-## How Quint Works
-
-Quint specs define:
-1. **State variables** — The system's mutable state
-2. **Actions** — State transitions (what can happen)
-3. **Invariants** — Safety properties that must always hold
-
-The model checker explores all possible action orderings and verifies that invariants are never violated.
-
-## Example: Circuit Breaker
-
-```quint
-module circuit_breaker {
-    var state: str             // "closed" | "open" | "half_open"
-    var failure_count: int
-    var success_count: int
-
-    action trip = all {
-        state == "closed",
-        failure_count >= FAILURE_THRESHOLD,
-        state' = "open",
-        // ...
-    }
-
-    // Safety: requests are rejected when circuit is open
-    val reject_bound = (state == "open") implies (failure_count >= FAILURE_THRESHOLD)
-}
-```
-
-## Project Structure
-
-```
-quint/
-├── specs/
-│   ├── common/         # Shared types, network, crash models
-│   ├── nucleus/        # Database protocol specs
-│   ├── framework/      # Web framework protocol specs
-│   └── realtime/       # Real-time protocol specs
-├── tests/              # Test runs for each spec
-├── conformance/        # Rust conformance tests
-└── scripts/            # CI scripts
-```
-
-## Running Specs
+From `quint/`, with Quint installed:
 
 ```bash
-# Check a specification
 quint typecheck specs/framework/circuit_breaker.qnt
-
-# Run tests
 quint test tests/circuit_breaker_test.qnt
-
-# Model check (exhaustive state exploration)
-quint verify specs/framework/circuit_breaker.qnt --invariant reject_bound
+quint run --max-samples=1000 --max-steps=50 --invariant=reject_bound specs/framework/circuit_breaker.qnt
 ```
 
-## Relationship to Code
+For model checking, install a compatible checker toolchain and choose the property and bounds explicitly:
 
-Quint specs are **not compiled** into the running system. They serve as:
+```bash
+quint verify --max-steps=20 --invariant=reject_bound specs/framework/circuit_breaker.qnt
+```
 
-1. **Design validation** — Verify protocol correctness before implementation
-2. **Regression testing** — Catch protocol bugs during design changes
-3. **Documentation** — Precise, executable specification of system behavior
+Type checking checks specification structure. Tests exercise selected scenarios; `quint run` samples behaviors. `quint verify` uses a model checker. The current upstream CLI supports Apalache and an alternative TLC backend; consult the [checker documentation](https://quint.sh/docs/model-checkers) and your installed CLI version.
 
-The `conformance/` directory contains Rust tests that verify the implementation matches the spec.
+Apalache bounded checks cover the configured model and execution bound. TLC can enumerate reachable states of a finite model. Neither establishes arbitrary production behavior merely because a check passes.
+
+## What the repository CI runs
+
+`scripts/ci.sh` runs type checking, randomized simulation against declared invariants, Quint conformance scenarios, and Rust harness tests. The workflow also runs a canary that must detect a violated invariant. The script does not run `quint verify`; its success must not be described as exhaustive model checking.
+
+## Connection to application code
+
+The Rust harness currently reimplements modeled state machines. It does not execute the production Nucleus engine. The proposed `quint-connect` dependency remains commented out, so live-engine conformance is unfinished.
+
+The recommended next step is a small trace adapter against a real service, with deliberately faulty behavior that the adapter must detect. See the [proposed integration architecture](/docs/modeling/architecture).

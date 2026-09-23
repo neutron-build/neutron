@@ -109,12 +109,14 @@
   animation: pulse-dot 2s ease-in-out infinite;
 }
 
+.status-badge--coming-soon,
 .status-badge--planned {
   background: rgba(107, 114, 128, 0.08);
   border-color: rgba(107, 114, 128, 0.2);
   color: #9CA3AF;
 }
 
+.status-badge--coming-soon::before,
 .status-badge--planned::before {
   background: #9CA3AF;
 }
