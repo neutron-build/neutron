@@ -426,3 +426,36 @@ them without that folder:
 Out-of-repo note: Lullmail's vendored copies of the send.go / bearer-transport
 blobs (flagged in neutron-12/13/16 as affected consumers) are NOT fixed here —
 that is a separate repo and needs its own sync.
+
+## Reported by consumers, closed 2026-09-22
+
+Two items from the Teploy ledger (`Teploy/_internal/UPSTREAM_BUGS.md`), fixed
+upstream as standalone commits on `fix/kv-keys-and-banner` (branched from
+e5c6e9fe = origin/main at the time):
+
+- **KV_KEYS could not enumerate collection keys** (teploy-observe 2026-09-18;
+  sets/zsets/lists/hashes invisible to `KV_KEYS('prefix:*')` because
+  `KvStore::keys` iterated only the string shards). CLOSED —
+  `ShardedCollections::keys(pattern)` added with the same simple-glob
+  semantics and merged into `KvStore::keys`; pinned by
+  `keys_enumerates_collection_keys_not_just_strings`. `dbsize()` keeps its
+  string-keyspace semantics (separate decision, unchanged). Consumer
+  follow-up when re-pinned: observe's backup srcmap can relist set/zset
+  indexes directly again; the per-key TYPE verification workaround and the
+  orphaned-index residual hole can be retired.
+- **v1.1.1 image banners as "nucleus 1.0.2"** (teploy-observe 2026-09-22
+  verification audit; tags v1.1.0/v1.1.1 were cut without bumping
+  `nucleus/Cargo.toml`, and the banner reads CARGO_PKG_VERSION). CLOSED for
+  the future — crate bumped to 1.1.1 to match the latest tag, and a release
+  workflow job now refuses any `nucleus/v*` tag whose tree Cargo.toml version
+  differs from the tag. The already-published v1.1.0/v1.1.1 images still say
+  1.0.2; they are superseded by any next image build (which the arm64 glibc
+  rebuild already requires).
+
+Also recorded here because it was found while gating the orm branch: the
+neutron-nucleus TS SDK live suite had a flake — two cold migration runners
+racing `CREATE TABLE IF NOT EXISTS` on a freshly-dropped database, loser
+taking the Postgres catalog unique violation (pg_type, 23505). Fixed on
+`fix/migrate-bootstrap-race` (on top of 4231cfa6) with a 23505-retry around
+the bootstrap DDL; the serialization test now runs four concurrent pools.
+
