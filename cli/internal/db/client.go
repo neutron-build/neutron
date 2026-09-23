@@ -87,15 +87,22 @@ func (c *Client) ApplyInTransaction(ctx context.Context, statements []string, on
 }
 
 // hasExecutableSQL reports whether a plan entry contains anything besides
-// SQL comments/whitespace.
+// SQL comments/whitespace. It reads the single tokenizer's token stream:
+// both `--` line comments and (nested) /* */ block comments are comments,
+// so a comment-only fragment — however spelled — is never executed.
 func hasExecutableSQL(stmt string) bool {
-	for _, line := range strings.Split(stmt, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed != "" && !strings.HasPrefix(trimmed, "--") {
+	for _, t := range tokenizeSQL(stmt) {
+		if t.kind != 'c' {
 			return true
 		}
 	}
 	return false
+}
+
+// HasExecutableSQL is the exported form of hasExecutableSQL for the
+// command layer's statement filters.
+func HasExecutableSQL(stmt string) bool {
+	return hasExecutableSQL(stmt)
 }
 
 // firstSQLLine returns the first non-comment line of a statement for error
