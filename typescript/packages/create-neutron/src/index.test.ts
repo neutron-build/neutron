@@ -688,6 +688,47 @@ describe("template DX files", () => {
       assert.ok(!/children\?:\s*unknown/.test(src), `layout types children as unknown: ${file}`);
     }
   });
+
+  // A Response returned from an action is sent as the HTTP response; only a
+  // plain object reaches the page as `props.actionData`. A page that renders
+  // actionData must therefore not build a Response in its action.
+  const returnsResponse = /\bResponse\.json\s*\(|\bnew\s+Response\s*\(|\bjson\s*\(/;
+  const actionBody = (src: string) =>
+    /export\s+async\s+function\s+action\b[\s\S]*?\n\}/.exec(src)?.[0] ?? "";
+
+  it("pages that render actionData return a plain object from their action", () => {
+    const pages: string[] = [];
+    const walk = (dir: string) => {
+      if (!fs.existsSync(dir)) return;
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const p = path.join(dir, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (/\.tsx$/.test(e.name)) {
+          const src = fs.readFileSync(p, "utf8");
+          if (/\bactionData\b/.test(src) && actionBody(src)) pages.push(p);
+        }
+      }
+    };
+    for (const name of TEMPLATE_NAMES) walk(path.join(templatesDir2, name, "src", "routes"));
+    assert.ok(pages.length >= 2, `expected the app/full settings pages, found: ${pages.join(", ")}`);
+    for (const file of pages) {
+      const body = actionBody(fs.readFileSync(file, "utf8"));
+      assert.ok(!returnsResponse.test(body), `action returns a Response, so actionData never renders: ${file}`);
+    }
+  });
+
+  it("AGENTS.md data-writes example returns a plain object and states the rule", () => {
+    for (const name of TEMPLATE_NAMES) {
+      const doc = fs.readFileSync(path.join(templatesDir2, name, "AGENTS.md"), "utf8");
+      const section = /## Data writes[\s\S]*?(?=\n## )/.exec(doc)?.[0] ?? "";
+      assert.ok(section, `template ${name} AGENTS.md has no "Data writes" section`);
+      const body = actionBody(section);
+      assert.ok(body, `template ${name} AGENTS.md data-writes example has no action`);
+      assert.ok(!returnsResponse.test(body), `template ${name} AGENTS.md example returns a Response`);
+      assert.match(section, /plain object[^\n]*actionData/, `template ${name} AGENTS.md does not state the rule`);
+      assert.match(section, /Response[^\n]*sent as the (HTTP )?response/, `template ${name} AGENTS.md does not state the rule`);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

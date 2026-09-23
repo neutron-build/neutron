@@ -28,6 +28,11 @@ All notable changes to this project are documented in this file.
   resolver returning one had its `Set-Cookie` forwarded. The guards now use
   the same brand check as core's `isResponse()`, kept local because every
   core in auth's `^0.2.0` range ships the `instanceof`-only version.
+- **The `app` and `full` templates' settings page never showed its saved
+  state.** Its action returned `Response.json(...)`, which is sent as the
+  HTTP response, so the page showed raw JSON instead of `actionData`. It now
+  returns a plain object, and every template's `AGENTS.md` states the rule:
+  plain object → `props.actionData`; a Response → sent as the response.
 
 ### Changed
 
