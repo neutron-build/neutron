@@ -16,11 +16,11 @@ import (
 )
 
 type Application struct {
-	Version    int                  `toml:"version"`
-	Name       string               `toml:"name"`
-	Components map[string]Component `toml:"components"`
+	Version  int                    `toml:"version"`
+	Name     string                 `toml:"name"`
+	Services map[string]ServiceSpec `toml:"services"`
 }
-type Component struct {
+type ServiceSpec struct {
 	Path      string            `toml:"path"`
 	Command   []string          `toml:"command"`
 	DependsOn []string          `toml:"depends_on"`
@@ -38,10 +38,10 @@ type Manifest struct {
 	Application Application
 }
 type Plan struct {
-	Version    int       `json:"version"`
-	Name       string    `json:"name"`
-	Root       string    `json:"root"`
-	Components []Service `json:"components"`
+	Version  int       `json:"version"`
+	Name     string    `json:"name"`
+	Root     string    `json:"root"`
+	Services []Service `json:"services"`
 }
 type Service struct {
 	Name            string            `json:"name"`
@@ -137,20 +137,20 @@ func (m *Manifest) Build(selected string) (*Plan, error) {
 	if app.Version != 1 {
 		return nil, fmt.Errorf("unsupported application version %d (want 1)", app.Version)
 	}
-	if !validName(app.Name) || len(app.Components) == 0 {
-		return nil, fmt.Errorf("application needs a name and at least one component")
+	if !validName(app.Name) || len(app.Services) == 0 {
+		return nil, fmt.Errorf("application needs a name and at least one service")
 	}
-	names := make([]string, 0, len(app.Components))
-	for name := range app.Components {
+	names := make([]string, 0, len(app.Services))
+	for name := range app.Services {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	services := map[string]Service{}
 	ports := map[int]string{}
 	for _, name := range names {
-		c := app.Components[name]
+		c := app.Services[name]
 		if !validName(name) {
-			return nil, fmt.Errorf("invalid component name %q", name)
+			return nil, fmt.Errorf("invalid service name %q", name)
 		}
 		if c.Path == "" || filepath.IsAbs(c.Path) {
 			return nil, fmt.Errorf("%s: path must be relative to the manifest", name)
@@ -212,7 +212,7 @@ func (m *Manifest) Build(selected string) (*Plan, error) {
 		deps := append([]string(nil), c.DependsOn...)
 		sort.Strings(deps)
 		for i, dep := range deps {
-			target, ok := app.Components[dep]
+			target, ok := app.Services[dep]
 			if !ok {
 				return nil, fmt.Errorf("%s: unknown dependency %s", name, dep)
 			}
@@ -266,7 +266,7 @@ func (m *Manifest) Build(selected string) (*Plan, error) {
 	}
 	if selected != "" {
 		if _, ok := services[selected]; !ok {
-			return nil, fmt.Errorf("unknown component %s", selected)
+			return nil, fmt.Errorf("unknown service %s", selected)
 		}
 		include(selected)
 	} else {
@@ -274,10 +274,10 @@ func (m *Manifest) Build(selected string) (*Plan, error) {
 			include(name)
 		}
 	}
-	plan := &Plan{Version: 1, Name: app.Name, Root: m.Root, Components: []Service{}}
+	plan := &Plan{Version: 1, Name: app.Name, Root: m.Root, Services: []Service{}}
 	for _, name := range order {
 		if included[name] {
-			plan.Components = append(plan.Components, services[name])
+			plan.Services = append(plan.Services, services[name])
 		}
 	}
 	return plan, nil

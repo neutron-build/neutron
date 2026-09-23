@@ -10,17 +10,17 @@ import (
 )
 
 func init() {
-	command := &cobra.Command{Use: "project", Short: "Inspect an opt-in multi-component application"}
+	command := &cobra.Command{Use: "project", Short: "Inspect an opt-in multi-service application"}
 	check := &cobra.Command{Use: "check", Short: "Validate application configuration without running commands", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
 		plan, err := loadApplication("")
 		if err != nil {
 			return applicationError(cmd, err)
 		}
-		fmt.Fprintf(cmd.OutOrStdout(), "Application %s is valid (%d components)\n", plan.Name, len(plan.Components))
+		fmt.Fprintf(cmd.OutOrStdout(), "Application %s is valid (%d services)\n", plan.Name, len(plan.Services))
 		return nil
 	}}
 	planCmd := &cobra.Command{Use: "plan", Short: "Show an application plan without executing it", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
-		selected, _ := cmd.Flags().GetString("component")
+		selected, _ := cmd.Flags().GetString("service")
 		plan, err := loadApplication(selected)
 		if err != nil {
 			return applicationError(cmd, err)
@@ -32,13 +32,13 @@ func init() {
 			return encoder.Encode(plan)
 		}
 		fmt.Fprintf(cmd.OutOrStdout(), "Application %s (%s)\n", plan.Name, plan.Root)
-		for _, s := range plan.Components {
+		for _, s := range plan.Services {
 			fmt.Fprintf(cmd.OutOrStdout(), "  %s: %s; dependencies=%v; environment keys=%v\n", s.Name, s.Dir, s.DependsOn, s.EnvironmentKeys)
 		}
 		return nil
 	}}
 	planCmd.Flags().Bool("json", false, "output versioned JSON (environment values omitted)")
-	planCmd.Flags().String("component", "", "select a component and its dependencies")
+	planCmd.Flags().String("service", "", "select a service and its dependencies")
 	command.AddCommand(check, planCmd)
 	rootCmd.AddCommand(command)
 }

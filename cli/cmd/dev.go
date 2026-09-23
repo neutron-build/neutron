@@ -16,7 +16,7 @@ import (
 )
 
 func init() {
-	devCmd.Flags().String("component", "", "application component to run with its dependencies")
+	devCmd.Flags().String("service", "", "application service to run with its dependencies")
 	rootCmd.AddCommand(devCmd)
 }
 
@@ -37,7 +37,7 @@ func runDev(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return applicationError(cmd, err)
 	}
-	selected, _ := cmd.Flags().GetString("component")
+	selected, _ := cmd.Flags().GetString("service")
 	if manifest != nil {
 		plan, err := manifest.Build(selected)
 		if err != nil {
@@ -52,7 +52,7 @@ func runDev(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if selected != "" {
-		return applicationError(cmd, fmt.Errorf("--component requires an [application] manifest"))
+		return applicationError(cmd, fmt.Errorf("--service requires an [application] manifest"))
 	}
 	lang := detect.DetectLanguage(cwd)
 	if lang == detect.Unknown {
