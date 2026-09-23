@@ -1269,6 +1269,24 @@ impl ShardedCollections {
         data.get(key).map(|c| c.type_name())
     }
 
+    /// Enumerate every collection key matching a glob pattern (same simple
+    /// glob semantics as the string keyspace's KEYS). Redis-parity KEYS must
+    /// reach collections, not just strings — `KvStore::keys` merges this with
+    /// the string shards. Collections carry no TTL, so every present key
+    /// counts as non-expired.
+    pub fn keys(&self, pattern: &str) -> Vec<String> {
+        let mut result = Vec::new();
+        for shard in &self.shards {
+            let data = shard.data.read();
+            for key in data.keys() {
+                if crate::kv::match_pattern(pattern, key) {
+                    result.push(key.clone());
+                }
+            }
+        }
+        result
+    }
+
     // ========================================================================
     // WAL support helpers
     // ========================================================================

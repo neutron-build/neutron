@@ -804,9 +804,13 @@ impl KvStore {
     }
 
     /// KEYS — return all non-expired keys matching a pattern (simple glob: * only).
+    /// Redis-parity KEYS reaches every type: collection keys (sets, sorted
+    /// sets, lists, hashes, HLLs, streams, geosets) live in the collections
+    /// store, not the string shards, and are enumerated alongside the string
+    /// keyspace. Collections carry no TTL, so every present key counts.
     pub fn keys(&self, pattern: &str) -> Vec<String> {
         let now = Instant::now();
-        let mut result = Vec::new();
+        let mut result = self.collections.keys(pattern);
         for shard in &self.data.shards {
             let data = shard.data.read();
             for (key, entry) in data.iter() {
@@ -2311,7 +2315,7 @@ fn instant_to_epoch_ms(t: Instant) -> u64 {
 // Pattern matching (simple glob)
 // ============================================================================
 
-fn match_pattern(pattern: &str, input: &str) -> bool {
+pub(crate) fn match_pattern(pattern: &str, input: &str) -> bool {
     if pattern == "*" {
         return true;
     }
@@ -2760,6 +2764,25 @@ mod tests {
 
         let all = store.keys("*");
         assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn keys_enumerates_collection_keys_not_just_strings() {
+        // Reported by teploy-observe (2026-09-18): KV_KEYS('prefix:*') listed
+        // only string keys — sets/zsets/lists/hashes live in the collections
+        // store and were invisible to enumeration.
+        let store = KvStore::new();
+        store.set("probe:str", Value::Int32(1), None);
+        store.sadd("probe:set", "m").unwrap();
+        store.rpush("probe:list", Value::Int32(2)).unwrap();
+
+        let mut all = store.keys("probe:*");
+        all.sort();
+        assert_eq!(all, vec!["probe:list", "probe:set", "probe:str"]);
+
+        let mut sets = store.keys("probe:s*");
+        sets.sort();
+        assert_eq!(sets, vec!["probe:set", "probe:str"]);
     }
 
     #[test]
