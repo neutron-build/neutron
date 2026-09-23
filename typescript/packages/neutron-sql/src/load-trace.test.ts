@@ -56,6 +56,11 @@ console.log(JSON.stringify({
   createDatabase: typeof root.createDatabase,
   exportSchemaV2: typeof root.exportSchemaV2,
   pgTable: typeof root.pgTable,
+  wrapPgPool: typeof root.wrapPgPool,
+  capabilityGate: typeof root.capabilityGate,
+  parseVersionString: typeof root.parseVersionString,
+  MissingDriverError: typeof root.MissingDriverError,
+  ServerSqlError: typeof root.ServerSqlError,
   driverCacheEntries: driverish,
 }));
 `);
@@ -65,6 +70,11 @@ console.log(JSON.stringify({
   assert.equal(out.createDatabase, "function");
   assert.equal(out.exportSchemaV2, "function");
   assert.equal(out.pgTable, "function");
+  assert.equal(out.wrapPgPool, "function");
+  assert.equal(out.capabilityGate, "function");
+  assert.equal(out.parseVersionString, "function");
+  assert.equal(out.MissingDriverError, "function");
+  assert.equal(out.ServerSqlError, "function");
   assert.deepEqual(out.driverCacheEntries, [], "no pg/postgres/nucleus module may be loaded by the root import");
 });
 

@@ -64,6 +64,7 @@ import {
   type ValueNode,
 } from "./ast.js";
 import { compileStatement, type CompiledQuery } from "./compile.js";
+import type { CapabilityGate } from "./engine.js";
 
 /** Fail-closed check for one builder-slot value: legacy {sql, params}
  *  fragments are direct-execution shapes and never splice into compiled
@@ -75,9 +76,26 @@ function rejectLegacyFragment(value: unknown, slot: string): void {
 export interface ExecContext {
   driver: Driver;
   logger: Logger | null;
+  /** Capability gate of the owning database (I01). When present, statements
+   *  carrying requirements are checked against the connected engine before
+   *  execution; unknown status fails closed. */
+  capabilities?: CapabilityGate;
 }
 
-export async function run(ctx: ExecContext, sqlText: string, params: unknown[], kind: "query" | "execute"): Promise<unknown> {
+/** Fail closed when a compiled statement carries requirements the engine
+ *  does not prove supported (unknown is not all-enabled). */
+async function assertCapabilities(ctx: ExecContext, required: readonly StatementCapability[]): Promise<void> {
+  if (required.length === 0 || !ctx.capabilities) return;
+  await ctx.capabilities.assert(required);
+}
+export async function run(
+  ctx: ExecContext,
+  sqlText: string,
+  params: unknown[],
+  kind: "query" | "execute",
+  required: readonly StatementCapability[] = [],
+): Promise<unknown> {
+  await assertCapabilities(ctx, required);
   const started = performance.now();
   try {
     const result = kind === "query" ? await ctx.driver.query(sqlText, params) : await ctx.driver.execute(sqlText, params);
@@ -316,7 +334,7 @@ export class SelectBuilder<T> implements PromiseLike<T[]> {
 
   async execute(): Promise<T[]> {
     const compiled = this.toCompiled();
-    const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query")) as Array<Record<string, unknown>>;
+    const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query", compiled.capabilities)) as Array<Record<string, unknown>>;
     applyProjectionDecoders(rows, compiled.decoders);
     return rows as T[];
   }
@@ -463,11 +481,11 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
   async execute(): Promise<R> {
     const compiled = this.toCompiled();
     if (this.wantsReturning) {
-      const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query")) as Array<Record<string, unknown>>;
+      const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query", compiled.capabilities)) as Array<Record<string, unknown>>;
       applyProjectionDecoders(rows, compiled.decoders);
       return rows as R;
     }
-    return (await run(this.ctx, compiled.sql, compiled.params as unknown[], "execute")) as R;
+    return (await run(this.ctx, compiled.sql, compiled.params as unknown[], "execute", compiled.capabilities)) as R;
   }
 
   then<R1 = R, R2 = never>(
@@ -578,11 +596,11 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
   async execute(): Promise<R> {
     const compiled = this.toCompiled();
     if (this.wantsReturning) {
-      const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query")) as Array<Record<string, unknown>>;
+      const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query", compiled.capabilities)) as Array<Record<string, unknown>>;
       applyProjectionDecoders(rows, compiled.decoders);
       return rows as R;
     }
-    return (await run(this.ctx, compiled.sql, compiled.params as unknown[], "execute")) as R;
+    return (await run(this.ctx, compiled.sql, compiled.params as unknown[], "execute", compiled.capabilities)) as R;
   }
 
   then<R1 = R, R2 = never>(
@@ -648,11 +666,11 @@ export class DeleteBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
   async execute(): Promise<R> {
     const compiled = this.toCompiled();
     if (this.wantsReturning) {
-      const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query")) as Array<Record<string, unknown>>;
+      const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query", compiled.capabilities)) as Array<Record<string, unknown>>;
       applyProjectionDecoders(rows, compiled.decoders);
       return rows as R;
     }
-    return (await run(this.ctx, compiled.sql, compiled.params as unknown[], "execute")) as R;
+    return (await run(this.ctx, compiled.sql, compiled.params as unknown[], "execute", compiled.capabilities)) as R;
   }
 
   then<R1 = R, R2 = never>(

@@ -118,7 +118,7 @@ async function withSuite(
   url.pathname = `/${DB_NAME}`;
   const db = await createDatabase({
     url: url.toString(),
-    driver: { driver: driverKind },
+    driverOptions: { driver: driverKind },
     tables: { users, posts, comments, invoices, invoiceLines },
     relations: {
       users: usersRelations,

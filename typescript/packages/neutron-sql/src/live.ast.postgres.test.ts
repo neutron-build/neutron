@@ -256,7 +256,7 @@ test("live ast (pg): V07 compiled CRUD matches hand-written SQL on real Postgres
     });
     // Snapshot URL is inert: postgres.js connects lazily and these queries
     // execute through the pool below, not through the db object.
-    const db = await createDatabase({ url: "postgres://snapshot:nouser@127.0.0.1:1/none", driver: { driver: "postgres" }, tables: { events } });
+    const db = await createDatabase({ url: "postgres://snapshot:nouser@127.0.0.1:1/none", driverOptions: { driver: "postgres" }, tables: { events } });
     await pool.query(`create table "events" (
       "id" serial primary key,
       "kind" text not null,
@@ -373,7 +373,7 @@ test("live ast (pg): V07 connectives over fragments match intended-grouping orac
 
     const tt = pgTable("tt", { a: boolean("a").notNull(), b: boolean("b").notNull(), c: boolean("c").notNull() });
     // Snapshot URL: postgres.js connects lazily; execution goes through the pool.
-    const db = await createDatabase({ url: "postgres://snapshot:nouser@127.0.0.1:1/none", driver: { driver: "postgres" }, tables: { tt } });
+    const db = await createDatabase({ url: "postgres://snapshot:nouser@127.0.0.1:1/none", driverOptions: { driver: "postgres" }, tables: { tt } });
 
     const compare = async (label: string, compiled: { sql: string; params: readonly unknown[] }, oracleSql: string, oracleParams: unknown[]): Promise<void> => {
       // The compiled side has no order by (it is not what these cases test);
