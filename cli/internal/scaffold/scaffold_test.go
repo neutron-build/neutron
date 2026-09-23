@@ -2,6 +2,7 @@ package scaffold
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -54,7 +55,7 @@ func TestScaffoldGo(t *testing.T) {
 	expect := []string{
 		"my-service/go.mod",
 		"my-service/cmd/server/main.go",
-		"my-service/internal/handler/health.go",
+		"my-service/internal/handler/hello.go",
 		"my-service/neutron.toml",
 		"my-service/migrations/001_init.up.sql",
 		"my-service/migrations/001_init.down.sql",
@@ -140,5 +141,32 @@ func TestScaffoldInvalidName(t *testing.T) {
 	err = ScaffoldProject("-starts-with-dash", detect.Python)
 	if err == nil {
 		t.Fatal("expected error for name starting with dash")
+	}
+}
+
+// A scaffold that does not compile ships silently if tests only check file
+// names; this builds it against the SDK version the template pins.
+func TestScaffoldGoCompiles(t *testing.T) {
+	if testing.Short() {
+		t.Skip("downloads the published Go SDK")
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain not available")
+	}
+	dir := t.TempDir()
+	origDir, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(origDir)
+	if err := ScaffoldProject("compiles", detect.Go); err != nil {
+		t.Fatal(err)
+	}
+	project := filepath.Join(dir, "compiles")
+	for _, args := range [][]string{{"mod", "tidy"}, {"build", "./..."}, {"vet", "./..."}} {
+		cmd := exec.Command("go", args...)
+		cmd.Dir = project
+		cmd.Env = append(os.Environ(), "GOFLAGS=-mod=mod")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("go %v: %v\n%s", args, err, out)
+		}
 	}
 }
