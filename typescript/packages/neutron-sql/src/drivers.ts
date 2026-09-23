@@ -12,12 +12,31 @@
 // missing-driver, and "auto" driver selection falls back ONLY when the
 // preferred module is genuinely not installed.
 
+import { createHash } from "node:crypto";
 import {
   MissingDriverError,
   classifyDriverError,
   connectionConstructionError,
   isModuleNotFoundError,
 } from "./errors.js";
+
+/** A connection-scoped prepared statement (Q04). `query`/`execute` bind
+ *  parameters exactly like Driver.query/Driver.execute; the server-side
+ *  parse/plan is reused per connection across calls. */
+export interface PreparedStatement {
+  /** The SQL text this statement was created from. */
+  readonly sql: string;
+  /** The deterministic server-side statement name when the adapter names
+ *  statements itself (pg: `nsqp_` + sha256(sql) hex — stable across
+ *  processes, unique per SQL text; postgres.js owns per-connection
+ *  auto-naming keyed by its SQL+types signature — undefined here). */
+  readonly name: string | undefined;
+  /** Run the statement; resolve to rows as plain objects keyed by column
+   *  label. */
+  query<T = Record<string, unknown>>(params?: unknown[]): Promise<T[]>;
+  /** Run the statement; resolve to the affected row count. */
+  execute(params?: unknown[]): Promise<number>;
+}
 
 export interface Driver {
   /** Run a query; resolve to rows as plain objects keyed by column label. */
@@ -31,6 +50,34 @@ export interface Driver {
   close(): Promise<void>;
   /** Explicit, typed lifecycle for this adapter. */
   readonly lifecycle: DriverLifecycle;
+  /** Connection-scoped prepared execution (Q04). OPTIONAL BY DESIGN — this
+   *  is the adapter capability gate: present exactly where the adapter's
+   *  semantics support safe prepared statements (both bundled drivers do;
+   *  custom adapters may not). Use preparedStatement() for a fail-closed
+   *  accessor. Statement identity is derived from the SQL text, never shared
+   *  across different SQL; see README "Prepared execution". */
+  prepare?(sqlText: string): PreparedStatement;
+}
+
+/** Fail-closed accessor for adapter prepared execution: drivers without
+ *  `prepare` (custom adapters) error clearly instead of silently falling
+ *  back to unnamed execution. */
+export function preparedStatement(driver: Driver, sqlText: string): PreparedStatement {
+  if (typeof driver.prepare !== "function") {
+    throw new Error(
+      "prepared statements: this adapter does not advertise support (Driver.prepare is absent) — wrap a pg pool/client or a postgres.js client via wrapPgPool/wrapPostgresJs, or extend the custom adapter",
+    );
+  }
+  return driver.prepare(sqlText);
+}
+
+/** Deterministic, collision-free server-side statement name for the pg
+ *  adapter: `nsqp_` + 58 hex chars of sha256(sql) (232 bits, within PG's
+ *  63-byte NAMEDATALEN limit). Same SQL text -> same name on every machine;
+ *  different SQL can never share a name (pg rejects a name reused with
+ *  different text on one connection). */
+export function pgStatementName(sqlText: string): string {
+  return `nsqp_${createHash("sha256").update(sqlText, "utf8").digest("hex").slice(0, 58)}`;
 }
 
 export type DriverKind = "postgres" | "pg" | "auto";
@@ -120,7 +167,11 @@ interface PostgresJsResult extends Array<Record<string, unknown>> {
 }
 
 export interface PostgresJsClient {
-  unsafe(sqlText: string, params?: unknown[]): Promise<PostgresJsResult>;
+  /** postgres.js `unsafe`. Options: `{ prepare: true }` switches the text
+   *  from the unsafe default (prepare off) to postgres.js's per-connection
+   *  automatic named-statement cache (signature-keyed: SQL text + parameter
+   *  types; names are generated per connection). */
+  unsafe(sqlText: string, params?: unknown[], options?: { prepare?: boolean; simple?: boolean }): Promise<PostgresJsResult>;
   begin<T>(fn: (tx: PostgresJsClient) => Promise<T>): Promise<T>;
   end(opts?: { timeout?: number }): Promise<void>;
 }
@@ -160,6 +211,32 @@ export function wrapPostgresJs(client: PostgresJsClient, options: WrapAdapterOpt
   const ownership = options.ownership ?? "borrowed";
   const lifecycle = makeLifecycle(ownership, () => client.end({ timeout: 5 }));
 
+  // Prepared execution rides postgres.js's own per-connection statement
+  // cache: `{ prepare: true }` (plus simple:false so even zero-parameter
+  // text takes the extended protocol) keys statements by SQL text + inferred
+  // parameter types PER CONNECTION with auto-generated names. The wrapper
+  // supplies no name of its own — there is no safe cross-connection name to
+  // give (see README "Prepared execution").
+  const postgresJsPrepared = (owner: PostgresJsClient, sqlText: string): PreparedStatement => ({
+    sql: sqlText,
+    name: undefined,
+    async query<T>(params: unknown[] = []): Promise<T[]> {
+      try {
+        return (await owner.unsafe(sqlText, params as unknown[], { prepare: true, simple: false })) as unknown as T[];
+      } catch (err) {
+        throw classifyDriverError(err, "postgres");
+      }
+    },
+    async execute(params: unknown[] = []): Promise<number> {
+      try {
+        const res = await owner.unsafe(sqlText, params as unknown[], { prepare: true, simple: false });
+        return res.count ?? 0;
+      } catch (err) {
+        throw classifyDriverError(err, "postgres");
+      }
+    },
+  });
+
   const scoped = (tx: PostgresJsClient): Driver => {
     const scope: Driver = {
       async query<T>(sqlText: string, params: unknown[] = []): Promise<T[]> {
@@ -182,6 +259,7 @@ export function wrapPostgresJs(client: PostgresJsClient, options: WrapAdapterOpt
       },
       close: () => scope.lifecycle.terminate(),
       lifecycle: makeLifecycle("borrowed", () => Promise.resolve()),
+      prepare: (sqlText: string): PreparedStatement => postgresJsPrepared(tx, sqlText),
     };
     return scope;
   };
@@ -214,6 +292,7 @@ export function wrapPostgresJs(client: PostgresJsClient, options: WrapAdapterOpt
     },
     close: () => driver.lifecycle.terminate(),
     lifecycle,
+    prepare: (sqlText: string): PreparedStatement => postgresJsPrepared(client, sqlText),
   };
   return driver;
 }
@@ -232,13 +311,24 @@ function isDriverBoundaryError(err: Error): boolean {
 
 // --- node-postgres ---------------------------------------------------------
 
+/** pg's query-config form. `name` requests a NAMED prepared statement —
+ *  session-scoped on the server; pg tracks parsed names per connection and
+ *  re-Parses the same name on connections that have not seen it yet. */
+export interface PgQueryConfig {
+  name?: string;
+  text: string;
+  values?: unknown[];
+}
+
 export interface PgPoolClientLike {
   query(sqlText: string, params?: unknown[]): Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
+  query(config: PgQueryConfig): Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
   release(): void;
 }
 
 export interface PgPoolLike {
   query(sqlText: string, params?: unknown[]): Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
+  query(config: PgQueryConfig): Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
   connect(): Promise<PgPoolClientLike>;
   end(): Promise<void>;
 }
@@ -283,6 +373,41 @@ export function wrapPgPool(pool: PgPoolLike, options: WrapAdapterOptions = {}): 
     }
   });
 
+  // pg named prepared statements are SESSION-scoped. Sending every execution
+  // as `{ name, text }` is pool-safe: pg re-Parses the name on each pooled
+  // connection that has not parsed it (its per-connection parsedStatements
+  // map then caches the parse), and its submit() guard rejects a name reused
+  // with DIFFERENT text on one connection. The name is sha256-derived from
+  // the SQL text (pgStatementName), so that guard can never fire through
+  // this wrapper and names are never shared across different SQL.
+  // Verified live on PG 17 (live.prepared suite): statements survive
+  // transaction ROLLBACK and ABORT — the session is their only lifetime.
+  // (postgres.js additionally retries 26000 "statement does not exist" for
+  // environments where statements DO vanish, e.g. transaction poolers.)
+  const pgPrepared = (owner: { query(config: PgQueryConfig): Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }> }, sqlText: string): PreparedStatement => {
+    const name = pgStatementName(sqlText);
+    return {
+      sql: sqlText,
+      name,
+      async query<T>(params: unknown[] = []): Promise<T[]> {
+        try {
+          const res = await owner.query({ name, text: sqlText, values: params });
+          return res.rows as T[];
+        } catch (err) {
+          throw classifyDriverError(err, "pg");
+        }
+      },
+      async execute(params: unknown[] = []): Promise<number> {
+        try {
+          const res = await owner.query({ name, text: sqlText, values: params });
+          return res.rowCount ?? 0;
+        } catch (err) {
+          throw classifyDriverError(err, "pg");
+        }
+      },
+    };
+  };
+
   const fromClient = (client: PgPoolClientLike): Driver => {
     const scope: Driver = {
       async query<T>(sqlText: string, params: unknown[] = []): Promise<T[]> {
@@ -306,6 +431,7 @@ export function wrapPgPool(pool: PgPoolLike, options: WrapAdapterOptions = {}): 
       },
       close: () => scope.lifecycle.terminate(),
       lifecycle: makeLifecycle("borrowed", () => Promise.resolve()),
+      prepare: (sqlText: string): PreparedStatement => pgPrepared(client, sqlText),
     };
     return scope;
   };
@@ -352,6 +478,7 @@ export function wrapPgPool(pool: PgPoolLike, options: WrapAdapterOptions = {}): 
     },
     close: () => driver.lifecycle.terminate(),
     lifecycle,
+    prepare: (sqlText: string): PreparedStatement => pgPrepared(pool, sqlText),
   };
   return driver;
 }

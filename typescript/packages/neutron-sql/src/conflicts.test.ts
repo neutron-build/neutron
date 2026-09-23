@@ -1,16 +1,26 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  astSelect,
+  compileStatement,
   createDatabase,
   eq,
   excluded,
+  fragment,
+  ident,
+  insertStatement,
   integer,
   numeric,
   onConflictClause,
+  param,
   pgTable,
+  projection,
+  qual,
   raw,
+  selectStatement,
   serial,
   sql,
+  subquery,
   text,
   timestamp,
   type NeutronDatabase,
@@ -445,3 +455,143 @@ function captureError(fn: () => unknown): unknown {
     return err;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Q04 entry conditions: excluded() scope is enforced at the COMPILE CHOKE
+// POINT — every statement kind, every position — plus eager where-guards on
+// the typed builders. Live-verified PG 17 ground truth: excluded is visible
+// ONLY directly inside DO UPDATE SET expressions and the DO UPDATE WHERE
+// predicate; the conflict target's index predicate errors with "invalid
+// reference to FROM-clause entry", select/update/delete positions and insert
+// RETURNING with "missing FROM-clause entry".
+// ---------------------------------------------------------------------------
+
+test("conflict: excluded() in select/update/delete .where() fails before SQL (Q04 entry condition)", () => {
+  assert.throws(
+    () => db.select().from(members).where(sql`${excluded(members.hits)} > ${5}`).toSQL(),
+    /excluded\(\) references the row proposed for insertion/,
+  );
+  assert.throws(() => db.update(members).set({ hits: 1 }).where(sql`${excluded(members.hits)} > ${5}`).toSQL(), /excluded\(\)/);
+  assert.throws(() => db.delete(members).where(sql`${excluded(members.hits)} > ${5}`).toSQL(), /excluded\(\)/);
+});
+
+test("conflict: excluded() in the on-conflict target index predicate fails before SQL", () => {
+  assert.throws(
+    () =>
+      db.insert(members).values({ email: "a@x" }).onConflictUpdate({
+        target: [members.email],
+        targetWhere: sql`${excluded(members.hits)} > ${0}`,
+        set: { hits: sql`${excluded(members.hits)}` },
+      }).toSQL(),
+    /on conflict target where on members: excluded\(\) references the row proposed for insertion/,
+  );
+});
+
+test("conflict: the compile choke point rejects excluded() in every non-conflict position", () => {
+  const bad = qual("excluded", "hits");
+  // select order by
+  assert.throws(
+    () => compileStatement(selectStatement({ from: ident("members"), orderBy: [{ expr: bad, direction: "asc" }] })),
+    /only valid directly inside on-conflict do-update set\/where/,
+  );
+  // select having
+  assert.throws(
+    () => compileStatement(selectStatement({ from: ident("members"), having: [bad] })),
+    /only valid directly inside on-conflict/,
+  );
+  // a subquery inside a LEGAL DO UPDATE SET still rejects (subqueries never see excluded)
+  assert.throws(
+    () =>
+      compileStatement(
+        insertStatement({
+          table: ident("members"),
+          columns: ["email"],
+          rows: [[param("a@x")]],
+          onConflict: onConflictClause({
+            action: "update",
+            targetColumns: ["email"],
+            sets: [{ column: "hits", value: fragment("(select ", subquery(selectStatement({ from: ident("members"), where: [bad] })), ")") }],
+          }),
+        }),
+      ),
+    /only valid directly inside on-conflict/,
+  );
+  // insert RETURNING cannot reference excluded (live-verified PG error)
+  assert.throws(
+    () =>
+      compileStatement(
+        insertStatement({
+          table: ident("members"),
+          columns: ["email"],
+          rows: [[param("a@x")]],
+          returning: [projection(bad)],
+        }),
+      ),
+    /insert returning/,
+  );
+});
+
+test("conflict: legal excluded() surfaces keep compiling (SET, DO UPDATE WHERE, subqueries elsewhere)", () => {
+  const set = sql`${excluded(members.hits)} + 1`;
+  const compiled = db.insert(members).values({ email: "a@x" }).onConflictUpdate({
+    target: members.email,
+    set: { hits: set },
+    setWhere: sql`${excluded(members.score)} is not null`,
+  }).toSQL();
+  assert.match(compiled.sql, /"excluded"\."hits" \+ 1/);
+  assert.match(compiled.sql, /"excluded"\."score" is not null/);
+  // a subquery WITHOUT excluded in a SET value is fine
+  const fine = db.insert(members).values({ email: "b@x" }).onConflictUpdate({
+    target: members.email,
+    set: { hits: sql`(${astSelect().from(members).subquery()})` },
+  }).toSQL();
+  assert.ok(fine.sql.includes("select"));
+});
+
+// Q04 entry condition 2: undefined-valued insert keys are OMITTED by the
+// undefined-is-omitted convention and must not participate in duplicate
+// physical-assignment detection.
+test("conflict: undefined-valued duplicate-physical insert keys are omitted, not duplicates", () => {
+  const dupPhysicalTable = pgTable("q04_undef_dup", {
+    id: serial("id").primaryKey(),
+    first: text("shared_col").notNull(),
+    second: text("shared_col"),
+  });
+  const compiled = db.insert(dupPhysicalTable).values({ first: "a", second: undefined }).toSQL();
+  const occurrences = compiled.sql.match(/"shared_col"/g) ?? [];
+  assert.equal(occurrences.length, 1, `exactly one shared_col column: ${compiled.sql}`);
+  // a REAL duplicate (two defined values) still errors
+  assert.throws(() => db.insert(dupPhysicalTable).values({ first: "a", second: "b" }).toSQL(), /assigned twice/);
+});
+
+// Q04 entry condition 3: hand-built OnConflictNodes pass through the same
+// validator when handed to insertStatement.
+test("conflict: hand-built OnConflictNode duplicates are rejected at insertStatement", () => {
+  const dupSets = {
+    kind: "on-conflict",
+    action: "update",
+    target: { kind: "columns", columns: ["email"] },
+    sets: [
+      { column: "hits", value: sql`1` },
+      { column: "hits", value: sql`2` },
+    ],
+  } as const;
+  assert.throws(
+    () => insertStatement({ table: ident("members"), columns: ["email"], rows: [[param("a@x")]], onConflict: dupSets as never }),
+    /assigns a column more than once/,
+  );
+  const dupTarget = {
+    kind: "on-conflict",
+    action: "nothing",
+    target: { kind: "columns", columns: ["email", "email"] },
+  } as const;
+  assert.throws(
+    () => insertStatement({ table: ident("members"), columns: ["email"], rows: [[param("a@x")]], onConflict: dupTarget as never }),
+    /names a column more than once/,
+  );
+  const targetless = { kind: "on-conflict", action: "update", sets: [{ column: "hits", value: sql`1` }] } as const;
+  assert.throws(
+    () => insertStatement({ table: ident("members"), columns: ["email"], rows: [[param("a@x")]], onConflict: targetless as never }),
+    /do update requires a target/,
+  );
+});
