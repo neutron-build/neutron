@@ -38,11 +38,16 @@ import (
 // DiffV2Options parameterizes DiffV2Document. Renames maps the qualified
 // desired column ("schema.table.newcol") to the actual column it renames.
 // AllowDestructive is the explicit acknowledgement required before drops of
-// managed objects are planned.
+// managed objects are planned. SnapshotBase relabels the comparison base in
+// user-facing errors and warnings: offline snapshot planning (M03) compares
+// against a recorded snapshot, not a live catalog, and its messages must
+// say so. Live callers leave it unset and every message keeps the
+// historical database wording byte-for-byte.
 type DiffV2Options struct {
 	Renames          map[string]string
 	AllowDestructive bool
 	Normalizer       V2Normalizer
+	SnapshotBase     bool
 }
 
 // DiffV2Document produces the up/down SQL moving the database described by
@@ -147,6 +152,39 @@ type v2Planner struct {
 
 func (p *v2Planner) warn(format string, args ...any) {
 	p.result.warn(format, args...)
+}
+
+// baseNoun names the comparison base in user-facing messages: the live
+// database, or the planning-base snapshot for offline snapshot planning.
+func (p *v2Planner) baseNoun() string {
+	if p.opts.SnapshotBase {
+		return "the planning base (snapshot)"
+	}
+	return "the database"
+}
+
+// baseBareNoun is the adjectival form for phrases like "the database table".
+func (p *v2Planner) baseBareNoun() string {
+	if p.opts.SnapshotBase {
+		return "planning-base"
+	}
+	return "database"
+}
+
+// baseTableNoun names the base relation whose column order matters.
+func (p *v2Planner) baseTableNoun() string {
+	if p.opts.SnapshotBase {
+		return "the planning-base table"
+	}
+	return "the live table"
+}
+
+// baseLiveNoun is the bare adjective for order comparisons ("live order").
+func (p *v2Planner) baseLiveNoun() string {
+	if p.opts.SnapshotBase {
+		return "planning-base"
+	}
+	return "live"
 }
 
 func (p *v2Planner) emit(up, down string) {
@@ -261,22 +299,22 @@ func (p *v2Planner) checkBlockers() error {
 		}
 		id := t.Identity
 		if o := p.actual.OpaqueEntry("extension-table", id); o != nil {
-			return fmt.Errorf("table %s exists in the database as an extension-owned table (owning extension: %s) — extension-owned objects are never managed or modified; remove the table from the schema document", id, o.Owner)
+			return fmt.Errorf("table %s exists in %s as an extension-owned table (owning extension: %s) — extension-owned objects are never managed or modified; remove the table from the schema document", id, p.baseNoun(), o.Owner)
 		}
 		if o := p.actual.OpaqueEntry("extension-object", id); o != nil {
-			return fmt.Errorf("table %s exists in the database as an extension-owned object (owning extension: %s) — extension-owned objects are never managed or modified; remove the table from the schema document", id, o.Owner)
+			return fmt.Errorf("table %s exists in %s as an extension-owned object (owning extension: %s) — extension-owned objects are never managed or modified; remove the table from the schema document", id, p.baseNoun(), o.Owner)
 		}
 		if o := p.actual.OpaqueEntry("unsupported-table", id); o != nil {
 			return fmt.Errorf("table %s carries catalog structure this diff cannot represent faithfully: %s — refusing to claim synchronization until supported", id, o.Reason)
 		}
 		if o := p.actual.OpaqueEntry("unsupported-object", id); o != nil {
-			return fmt.Errorf("object %s exists in the database as an unrepresentable %s — a table with that identity cannot be managed; resolve the conflict manually", id, unsupportedObjectKind(o.Reason))
+			return fmt.Errorf("object %s exists in %s as an unrepresentable %s — a table with that identity cannot be managed; resolve the conflict manually", id, p.baseNoun(), unsupportedObjectKind(o.Reason))
 		}
 		if p.actualViews[id] {
-			return fmt.Errorf("object %s is a VIEW in the database but a table in the desired schema — resolve the conflict manually", id)
+			return fmt.Errorf("object %s is a VIEW in %s but a table in the desired schema — resolve the conflict manually", id, p.baseNoun())
 		}
 		if p.actualEnums[id] {
-			return fmt.Errorf("object %s is an enum type in the database but a table in the desired schema — resolve the conflict manually", id)
+			return fmt.Errorf("object %s is an enum type in %s but a table in the desired schema — resolve the conflict manually", id, p.baseNoun())
 		}
 		if isProtectedTableName(t.Identity.Name) {
 			return fmt.Errorf("table %s is neutron-internal metadata and is managed automatically — remove it from the schema document; internal tables are never part of a diff or plan", id)
@@ -288,13 +326,13 @@ func (p *v2Planner) checkBlockers() error {
 		}
 		id := e.Identity
 		if o := p.actual.OpaqueEntry("extension-object", id); o != nil {
-			return fmt.Errorf("enum %s exists in the database as an extension-owned type (owning extension: %s) — extension-owned objects are never managed; remove the enum from the schema document", id, o.Owner)
+			return fmt.Errorf("enum %s exists in %s as an extension-owned type (owning extension: %s) — extension-owned objects are never managed; remove the enum from the schema document", id, p.baseNoun(), o.Owner)
 		}
 		if p.actualTables[id] {
-			return fmt.Errorf("object %s is a table in the database but an enum in the desired schema — resolve the conflict manually", id)
+			return fmt.Errorf("object %s is a table in %s but an enum in the desired schema — resolve the conflict manually", id, p.baseNoun())
 		}
 		if p.actualViews[id] {
-			return fmt.Errorf("object %s is a view in the database but an enum in the desired schema — resolve the conflict manually", id)
+			return fmt.Errorf("object %s is a view in %s but an enum in the desired schema — resolve the conflict manually", id, p.baseNoun())
 		}
 	}
 	for _, v := range p.desired.Views {
@@ -303,22 +341,22 @@ func (p *v2Planner) checkBlockers() error {
 		}
 		id := v.Identity
 		if o := p.actual.OpaqueEntry("extension-object", id); o != nil {
-			return fmt.Errorf("view %s exists in the database as an extension-owned object (owning extension: %s) — extension-owned objects are never managed; remove the view from the schema document", id, o.Owner)
+			return fmt.Errorf("view %s exists in %s as an extension-owned object (owning extension: %s) — extension-owned objects are never managed; remove the view from the schema document", id, p.baseNoun(), o.Owner)
 		}
 		if o := p.actual.OpaqueEntry("extension-table", id); o != nil {
-			return fmt.Errorf("view %s exists in the database as an extension-owned table (owning extension: %s) — remove the view from the schema document", id, o.Owner)
+			return fmt.Errorf("view %s exists in %s as an extension-owned table (owning extension: %s) — remove the view from the schema document", id, p.baseNoun(), o.Owner)
 		}
 		if o := p.actual.OpaqueEntry("unsupported-object", id); o != nil {
-			return fmt.Errorf("view %s cannot be managed: the database object with that identity is unrepresentable (%s) — resolve the conflict manually", id, o.Reason)
+			return fmt.Errorf("view %s cannot be managed: the %s object with that identity is unrepresentable (%s) — resolve the conflict manually", id, p.baseBareNoun(), o.Reason)
 		}
 		if o := p.actual.OpaqueEntry("unsupported-table", id); o != nil {
-			return fmt.Errorf("view %s exists in the database as an unrepresentable table (%s) — a view with that identity cannot be managed; resolve the conflict manually", id, o.Reason)
+			return fmt.Errorf("view %s exists in %s as an unrepresentable table (%s) — a view with that identity cannot be managed; resolve the conflict manually", id, p.baseNoun(), o.Reason)
 		}
 		if p.actualTables[id] {
-			return fmt.Errorf("object %s is a table in the database but a view in the desired schema — resolve the conflict manually", id)
+			return fmt.Errorf("object %s is a table in %s but a view in the desired schema — resolve the conflict manually", id, p.baseNoun())
 		}
 		if p.actualEnums[id] {
-			return fmt.Errorf("object %s is an enum type in the database but a view in the desired schema — resolve the conflict manually", id)
+			return fmt.Errorf("object %s is an enum type in %s but a view in the desired schema — resolve the conflict manually", id, p.baseNoun())
 		}
 	}
 	return nil
@@ -362,16 +400,16 @@ func (p *v2Planner) validateRenames() error {
 		}
 		at := p.actual.Table(table)
 		if at == nil {
-			return fmt.Errorf("--rename %s.%s>%s: table %s does not exist in the database", table, source, newCol, table)
+			return fmt.Errorf("--rename %s.%s>%s: table %s does not exist in %s", table, source, newCol, table, p.baseNoun())
 		}
 		if at.Column(source) == nil {
-			return fmt.Errorf("--rename %s.%s>%s: source column %q does not exist in table %s in the database", table, source, newCol, source, table)
+			return fmt.Errorf("--rename %s.%s>%s: source column %q does not exist in table %s in %s", table, source, newCol, source, table, p.baseNoun())
 		}
 		if dt.Column(source) != nil {
 			return fmt.Errorf("--rename %s.%s>%s: ambiguous — source column %q is also still declared in the desired schema; a rename replaces the old name", table, source, newCol, source)
 		}
 		if at.Column(newCol) != nil {
-			return fmt.Errorf("--rename %s.%s>%s: ambiguous — target column %q already exists in the database table", table, source, newCol, newCol)
+			return fmt.Errorf("--rename %s.%s>%s: ambiguous — target column %q already exists in the %s table", table, source, newCol, newCol, p.baseBareNoun())
 		}
 		srcKey := table.String() + "." + source
 		if prev, dup := seenSource[srcKey]; dup {
@@ -395,7 +433,7 @@ func (p *v2Planner) planSchemas() {
 			fmt.Sprintf("create schema if not exists %s", quoteIdent(s.Name)),
 			fmt.Sprintf("-- schema %s was created by this plan; schemas are not dropped automatically", quoteIdent(s.Name)),
 		)
-		p.warn("schema %q does not exist in the database: it will be created", s.Name)
+		p.warn("schema %q does not exist in %s: it will be created", s.Name, p.baseNoun())
 	}
 }
 
@@ -451,8 +489,8 @@ func planEnumValues(p *v2Planner, de, ae V2EnumDecl) error {
 		}
 		if !found {
 			return fmt.Errorf(
-				"enum %s: value %q exists in the database but not in the desired schema — PostgreSQL cannot remove enum values; recreate the type manually (new type + column migration) if this is intentional",
-				de.Identity, v)
+				"enum %s: value %q exists in %s but not in the desired schema — PostgreSQL cannot remove enum values; recreate the type manually (new type + column migration) if this is intentional",
+				de.Identity, v, p.baseNoun())
 		}
 	}
 	// Actual values must appear in desired order (subsequence check).
@@ -464,8 +502,8 @@ func planEnumValues(p *v2Planner, de, ae V2EnumDecl) error {
 	}
 	if i != len(ae.Values) {
 		return fmt.Errorf(
-			"enum %s: desired value order conflicts with the live type (live order %v) — PostgreSQL cannot reorder enum values; recreate the type manually if this is intentional",
-			de.Identity, ae.Values)
+			"enum %s: desired value order conflicts with the %s type (%s order %v) — PostgreSQL cannot reorder enum values; recreate the type manually if this is intentional",
+			de.Identity, p.baseLiveNoun(), p.baseLiveNoun(), ae.Values)
 	}
 	for idx, v := range de.Values {
 		if actualSet[v] {
@@ -605,7 +643,7 @@ func (p *v2Planner) planViewsAroundAlters() {
 			continue
 		}
 		if !p.opts.AllowDestructive {
-			p.warn("view %s exists in the database but not in the schema: left untouched (dropping requires explicit destructive acknowledgement, --allow-destructive)", av.Identity)
+			p.warn("view %s exists in %s but not in the schema: left untouched (dropping requires explicit destructive acknowledgement, --allow-destructive)", av.Identity, p.baseNoun())
 			continue
 		}
 		p.warn("view %s will be dropped", av.Identity)
@@ -681,8 +719,8 @@ func (p *v2Planner) planSharedTables() error {
 		}
 		if !ordered {
 			return fmt.Errorf(
-				"table %s: the desired column order differs from the live table (attnum order %v) — PostgreSQL cannot reorder columns without rewriting the table; align the document order or plan a manual migration",
-				dt.Identity, columnNames(*at))
+				"table %s: the desired column order differs from %s (attnum order %v) — PostgreSQL cannot reorder columns without rewriting the table; align the document order or plan a manual migration",
+				dt.Identity, p.baseTableNoun(), columnNames(*at))
 		}
 	}
 
@@ -766,7 +804,7 @@ func (p *v2Planner) planSharedTables() error {
 				continue
 			}
 			if !p.opts.AllowDestructive {
-				p.warn("table %s: column %q exists in the database but not in the schema: left untouched (dropping requires explicit destructive acknowledgement, --allow-destructive)", dt.Identity, ac.Name)
+				p.warn("table %s: column %q exists in %s but not in the schema: left untouched (dropping requires explicit destructive acknowledgement, --allow-destructive)", dt.Identity, ac.Name, p.baseNoun())
 				continue
 			}
 			p.warn("table %s: column %q will be dropped (data lost unless it is a rename — see --rename)", dt.Identity, ac.Name)
@@ -1168,7 +1206,7 @@ func (p *v2Planner) planIndexChanges(table V2Identity, desired, actual *V2Table)
 			continue
 		}
 		if !p.opts.AllowDestructive {
-			p.warn("index %q on table %s exists in the database but not in the schema: left untouched (dropping requires explicit destructive acknowledgement, --allow-destructive)", ai.Identity.Name, table)
+			p.warn("index %q on table %s exists in %s but not in the schema: left untouched (dropping requires explicit destructive acknowledgement, --allow-destructive)", ai.Identity.Name, table, p.baseNoun())
 			continue
 		}
 		oldDDL, err := createV2IndexSQL(*actual, ai)
@@ -1318,7 +1356,7 @@ func (p *v2Planner) planTableDrops() {
 			continue
 		}
 		if !p.opts.AllowDestructive {
-			p.warn("table %s exists in the database but not in the schema: left untouched (dropping requires explicit destructive acknowledgement, --allow-destructive)", t.Identity)
+			p.warn("table %s exists in %s but not in the schema: left untouched (dropping requires explicit destructive acknowledgement, --allow-destructive)", t.Identity, p.baseNoun())
 			continue
 		}
 		toDrop = append(toDrop, t)
@@ -1389,7 +1427,7 @@ func (p *v2Planner) planTableDrops() {
 		}
 		sort.Slice(droppable, func(i, j int) bool { return droppable[i].String() < droppable[j].String() })
 		for _, id := range droppable {
-			p.warn("table %s exists in the database but not in the schema: it will be dropped (all rows lost)", id)
+			p.warn("table %s exists in %s but not in the schema: it will be dropped (all rows lost)", id, p.baseNoun())
 			ddl, err := createV2TableSQL(*p.actual.Table(id), nil)
 			if err != nil {
 				ddl = fmt.Sprintf("-- IRREVERSIBLE: table %s carries unrepresentable structure; no down statement can re-create it", id)
@@ -1411,7 +1449,7 @@ func (p *v2Planner) planEnumDrops(droppedInPlan map[V2Identity]bool) {
 			continue
 		}
 		if !p.opts.AllowDestructive {
-			p.warn("enum %s exists in the database but not in the schema: left untouched (dropping requires explicit destructive acknowledgement, --allow-destructive)", e.Identity)
+			p.warn("enum %s exists in %s but not in the schema: left untouched (dropping requires explicit destructive acknowledgement, --allow-destructive)", e.Identity, p.baseNoun())
 			continue
 		}
 		usedBy := ""
