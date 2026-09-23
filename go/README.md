@@ -64,6 +64,9 @@ neutron.Get[neutron.Empty, User](r, "/api/users/:id", func(ctx context.Context, 
 _ = app.Run(":8080")
 ```
 
+`app.Run("")` listens on `NEUTRON_HOST`/`NEUTRON_PORT` (default all interfaces,
+port 8080; an invalid port is an error). A non-empty address always wins.
+
 `GET /health`, `GET /openapi.json`, and `GET /docs` are mounted by default;
 errors render as RFC 7807 `application/problem+json`; middleware
 (`Logger`, `Recover`, rate limiting, and the rest of the contract stack) is

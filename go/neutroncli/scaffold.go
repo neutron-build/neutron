@@ -144,11 +144,13 @@ func main() {
 
 	_ = db // use db in your handlers
 
-	addr := os.Getenv("PORT")
-	if addr == "" {
-		addr = "8080"
+	// PORT (platform convention) wins; otherwise Run("") reads NEUTRON_HOST /
+	// NEUTRON_PORT and defaults to :8080.
+	addr := ""
+	if port := os.Getenv("PORT"); port != "" {
+		addr = ":" + port
 	}
-	app.Run(":" + addr)
+	app.Run(addr)
 }
 `
 

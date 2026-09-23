@@ -215,10 +215,11 @@ func main() {
 
 	_ = cache // used in production for caching search results
 
-	addr := os.Getenv("PORT")
-	if addr == "" {
-		addr = "8080"
+	// PORT (platform convention) wins; otherwise Run("") reads NEUTRON_HOST /
+	// NEUTRON_PORT and defaults to :8080.
+	addr := ""
+	if port := os.Getenv("PORT"); port != "" {
+		addr = ":" + port
 	}
-	fmt.Println("RAG Search API starting on", addr)
-	app.Run(":" + addr)
+	app.Run(addr)
 }
