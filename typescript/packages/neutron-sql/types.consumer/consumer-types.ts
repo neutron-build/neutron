@@ -18,11 +18,30 @@ import {
   jsonNull,
   relations,
   eq,
+  and,
+  or,
+  not,
+  sql,
+  raw,
+  asc,
+  desc,
+  astSelect,
+  exportSchemaV2,
+  canonicalSchemaJson,
+  readSchemaDocumentV1,
   getTableName,
   getTableColumns,
   getTableIndexes,
   createDatabase,
   type ColumnBuilder,
+  type Condition,
+  type OrderExpression,
+  type OrderSpec,
+  type ValueNode,
+  type CompiledStatement,
+  type ProjectionDecoder,
+  type StatementCapability,
+  type SchemaDocumentV2,
 } from "@neutron-build/sql";
 
 type AssertEq<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
@@ -174,3 +193,49 @@ async function relationalFixtures(): Promise<void> {
   void [rows, eqCollisionRow];
 }
 void relationalFixtures;
+
+// --- F04 public shapes through the packed declarations ----------------------
+// Condition/OrderExpression/CompiledStatement exactness and the F04 migration
+// claims (predicates return AST nodes; legacy raw() fragments are not
+// conditions; asc()/desc() return order specs; compiled statements carry
+// decode plans + capability requirements).
+
+// Condition is the AST ValueNode union: every predicate/connective returns it.
+const cond: Condition = and(eq(users.id, 1), sql`${users.name}`, not(or(eq(users.email, "x"), sql`${users.name} is null`)));
+const eqCondIsValueNode: AssertEq<Condition, ValueNode> = true;
+void [cond, eqCondIsValueNode];
+// @ts-expect-error legacy raw() fragments are not Conditions (direct execution only)
+const badCond: Condition = raw("id = $1", [1]);
+// @ts-expect-error destructured .sql on predicates no longer exists (F04 migration note)
+const { sql: gone } = eq(users.id, 1);
+void [badCond, gone];
+
+// asc()/desc() return frozen order specs; OrderExpression is spec-or-node.
+const spec: OrderSpec = asc(users.id);
+const dirIsClosed: AssertEq<(typeof spec)["direction"], "asc" | "desc"> = true;
+const descSpec: OrderSpec = desc(users.createdAt);
+const anyOrder: OrderExpression[] = [spec, descSpec, sql`${users.id} + 1`];
+void [dirIsClosed, anyOrder];
+
+// CompiledStatement: sql + params + decode plans + capability requirements,
+// and toCompiled() is the builder entry for it.
+async function compiledStatementFixtures(): Promise<void> {
+  const db = await createDatabase({ url: "postgres://type-fixture:not-run@localhost:1/none", tables: { users, posts, collision } });
+  const compiled: CompiledStatement = db.select().from(users).where(eq(users.id, 1)).toCompiled();
+  const sqlText: string = compiled.sql;
+  const params: readonly unknown[] = compiled.params;
+  const decoders: readonly ProjectionDecoder[] = compiled.decoders;
+  const capabilities: readonly StatementCapability[] = compiled.capabilities;
+  const capIsJsonb: AssertEq<StatementCapability, "jsonb-functions"> = true;
+  const mutated: CompiledStatement = db.update(users).set({ name: "x" }).where(eq(users.id, 1)).returning().toCompiled();
+  void [sqlText, params, decoders, capabilities, mutated, capIsJsonb];
+}
+void compiledStatementFixtures;
+
+// Schema export v2: typed document tree, deterministic canonical bytes,
+// explicit v1 compatibility reader.
+const doc: SchemaDocumentV2 = exportSchemaV2({ users, posts });
+const docVersion: AssertEq<(typeof doc)["version"], 2> = true;
+const canonical: string = canonicalSchemaJson(doc);
+const upgraded: SchemaDocumentV2 = readSchemaDocumentV1('{"version":1,"dialect":"postgresql","tables":[]}');
+void [docVersion, canonical, upgraded];

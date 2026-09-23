@@ -21,6 +21,7 @@ import {
   relations,
   and,
   or,
+  not,
   eq,
   gt,
   lt,
@@ -28,6 +29,10 @@ import {
   asc,
   desc,
   sql,
+  raw,
+  astSelect,
+  trustSql,
+  TRUSTED_SQL_ACK,
   schemaToDDL,
   createTableSQL,
   getTableName,
@@ -35,9 +40,13 @@ import {
   getTableIndexes,
   isPgTable,
   exportTable,
+  compileStatement,
+  selectStatement,
+  ident,
   TABLE_SYMBOL,
   type AnyColumnBuilder,
   type ColumnBuilder,
+  type Condition,
   type Relation,
 } from "./index.js";
 import { buildRelationalSQL, resolveRelations } from "./relations.js";
@@ -123,7 +132,7 @@ test("select: plain, where, order, limit, offset", () => {
     .toSQL();
   assert.equal(
     filtered.sql,
-    'select "users"."id", "users"."email", "users"."name", "users"."active", to_jsonb("users"."created_at")::text as "createdAt" from "users" where (("users"."id" = $1) and ("users"."id" > $2)) order by "users"."created_at" desc, "users"."id" asc limit 10 offset 20',
+    'select "users"."id", "users"."email", "users"."name", "users"."active", to_jsonb("users"."created_at")::text as "createdAt" from "users" where ("users"."id" = $1) and ("users"."id" > $2) order by "users"."created_at" desc, "users"."id" asc limit 10 offset 20',
   );
   assert.deepEqual(filtered.params, [1, 0]);
 });
@@ -159,7 +168,7 @@ test("insert: single and multi-row with returning", () => {
   const single = db.insert(users).values({ email: "a@x.com", name: "A" }).returning().toSQL();
   assert.equal(
     single.sql,
-    'insert into "users" ("email", "name") values ($1, $2) returning "id", "email", "name", "active", to_jsonb("created_at")::text as "createdAt"',
+    'insert into "users" ("email", "name") values ($1, $2) returning "users"."id", "users"."email", "users"."name", "users"."active", to_jsonb("users"."created_at")::text as "createdAt"',
   );
   assert.deepEqual(single.params, ["a@x.com", "A"]);
 
@@ -316,7 +325,7 @@ test("update: set, where, fragment set, returning", () => {
   const q = db.update(users).set({ name: "B", active: sql`not ${true}` }).where(eq(users.id, 1)).returning().toSQL();
   assert.equal(
     q.sql,
-    'update "users" set "name" = $1, "active" = not $2 where "users"."id" = $3 returning "id", "email", "name", "active", to_jsonb("created_at")::text as "createdAt"',
+    'update "users" set "name" = $1, "active" = not $2 where ("users"."id" = $3) returning "users"."id", "users"."email", "users"."name", "users"."active", to_jsonb("users"."created_at")::text as "createdAt"',
   );
   assert.deepEqual(q.params, ["B", true, 1]);
 });
@@ -328,7 +337,7 @@ test("update: property keys map to physical column names in assignments", () => 
     nick: text("nick"),
   });
   const q = db.update(people).set({ firstName: "Ada", nick: null }).where(eq(people.id, 1)).toSQL();
-  assert.equal(q.sql, 'update "people_map" set "first_name" = $1, "nick" = $2 where "people_map"."id" = $3');
+  assert.equal(q.sql, 'update "people_map" set "first_name" = $1, "nick" = $2 where ("people_map"."id" = $3)');
   assert.deepEqual(q.params, ["Ada", null, 1]);
 });
 
@@ -344,12 +353,12 @@ test("update: unknown set key rejected; null/undefined/fragment order", () => {
   assert.doesNotThrow(() => db.update(people).set({ nick: null }));
   // undefined keys are ignored entirely (never a bound value).
   const q = db.update(people).set({ nick: undefined, firstName: "X" }).where(eq(people.id, 1)).toSQL();
-  assert.equal(q.sql, 'update "people_map2" set "first_name" = $1 where "people_map2"."id" = $2');
+  assert.equal(q.sql, 'update "people_map2" set "first_name" = $1 where ("people_map2"."id" = $2)');
   // An update whose .set() leaves no assignments is an error.
   assert.throws(() => db.update(people).set({ nick: undefined }).where(eq(people.id, 1)).toSQL(), /no assignments/);
   // Fragments keep working in assignments (B01-supported API).
   const frag = db.update(people).set({ firstName: sql`upper(${"bob"})` }).where(eq(people.id, 1)).toSQL();
-  assert.equal(frag.sql, 'update "people_map2" set "first_name" = upper($1) where "people_map2"."id" = $2');
+  assert.equal(frag.sql, 'update "people_map2" set "first_name" = upper($1) where ("people_map2"."id" = $2)');
 });
 
 test("update: invalid set values rejected before execution with column context", () => {
@@ -371,7 +380,7 @@ test("update without where throws", () => {
 
 test("delete: where + returning", () => {
   const q = db.delete(posts).where(eq(posts.userId, 7)).returning().toSQL();
-  assert.equal(q.sql, 'delete from "posts" where "posts"."user_id" = $1 returning "id", "user_id" as "userId", "title", "body", "published"');
+  assert.equal(q.sql, 'delete from "posts" where ("posts"."user_id" = $1) returning "posts"."id", "posts"."user_id" as "userId", "posts"."title", "posts"."body", "posts"."published"');
   assert.deepEqual(q.params, [7]);
 });
 
@@ -382,7 +391,7 @@ test("relational: findMany with posts (many) aggregates one independent subquery
     'select "users"."id", "users"."email", "users"."name", "users"."active", to_jsonb("users"."created_at")::text as "createdAt", ' +
       '(select coalesce(jsonb_agg(jsonb_build_object(\'id\', "__rel_posts"."id", \'userId\', "__rel_posts"."user_id", ' +
       '\'title\', "__rel_posts"."title", \'body\', "__rel_posts"."body", \'published\', "__rel_posts"."published") ' +
-      'order by "__rel_posts"."id"), \'[]\'::jsonb) from "posts" as "__rel_posts" where "__rel_posts"."user_id" = "users"."id") as "posts" ' +
+      'order by "__rel_posts"."id"), \'[]\'::jsonb) from "posts" as "__rel_posts" where ("__rel_posts"."user_id" = "users"."id")) as "posts" ' +
       'from "users"',
   );
 });
@@ -419,7 +428,7 @@ test("relational: findFirst with author (one) nulls on missing FK", () => {
     'select "posts"."id", "posts"."user_id" as "userId", "posts"."title", "posts"."body", "posts"."published", ' +
       '(select jsonb_build_object(\'id\', "__rel_author"."id", \'email\', "__rel_author"."email", \'name\', "__rel_author"."name", ' +
       '\'active\', "__rel_author"."active", \'createdAt\', "__rel_author"."created_at") ' +
-      'from "users" as "__rel_author" where "__rel_author"."id" = "posts"."user_id") as "author" ' +
+      'from "users" as "__rel_author" where ("__rel_author"."id" = "posts"."user_id")) as "author" ' +
       'from "posts"',
   );
 });
@@ -434,7 +443,7 @@ test("relational: self-relation (manager) aliases the correlated scope", () => {
   }));
   const { sqlText } = relational(selfRelations, { with: { manager: true } });
   assert.ok(sqlText.includes('from "self_users" as "__rel_manager"'));
-  assert.ok(sqlText.includes('where "__rel_manager"."id" = "self_users"."manager_id"'));
+  assert.ok(sqlText.includes('where ("__rel_manager"."id" = "self_users"."manager_id")'));
 });
 
 test("relational: where + limit + orderBy apply to the parent row", () => {
@@ -444,7 +453,7 @@ test("relational: where + limit + orderBy apply to the parent row", () => {
     orderBy: [desc(users.id, "users")],
     limit: 5,
   });
-  assert.ok(sqlText.includes('where "users"."email" = $1'));
+  assert.ok(sqlText.includes('where ("users"."email" = $1)'));
   assert.ok(sqlText.endsWith('order by "users"."id" desc limit 5'));
   assert.deepEqual(params, ["a@x.com"]);
 });
@@ -531,7 +540,7 @@ test("relational: int8/numeric child leaves render ::text in the JSON projection
   assert.ok(!many.sqlText.includes('"__rel_txs"."account_id"::text'), "no blanket cast over int4 leaves");
   assert.ok(!many.sqlText.includes("::text ="), "correlation predicates never cast");
   assert.ok(
-    many.sqlText.includes('where "__rel_txs"."account_id" = "cast_accounts"."id"'),
+    many.sqlText.includes('where ("__rel_txs"."account_id" = "cast_accounts"."id")'),
     "correlation keys stay raw columns",
   );
   assert.ok(many.sqlText.includes('order by "__rel_txs"."id"'), "order key stays a raw column");
@@ -737,7 +746,7 @@ test("metadata: full CRUD compiles correctly on the collision table", () => {
   const ret = db.insert(metaNames).values({ columns: "c1" }).returning().toSQL();
   assert.equal(
     ret.sql,
-    'insert into "meta_names" ("columns") values ($1) returning "id", "columns", "table_name" as "tableName", "indexes"',
+    'insert into "meta_names" ("columns") values ($1) returning "meta_names"."id", "meta_names"."columns", "meta_names"."table_name" as "tableName", "meta_names"."indexes"',
   );
 
   const upd = db
@@ -745,13 +754,13 @@ test("metadata: full CRUD compiles correctly on the collision table", () => {
     .set({ columns: "c2", tableName: "t" })
     .where(eq(metaNames.columns, "c1"))
     .toSQL();
-  assert.equal(upd.sql, 'update "meta_names" set "columns" = $1, "table_name" = $2 where "meta_names"."columns" = $3');
+  assert.equal(upd.sql, 'update "meta_names" set "columns" = $1, "table_name" = $2 where ("meta_names"."columns" = $3)');
   assert.deepEqual(upd.params, ["c2", "t", "c1"]);
 
   const del = db.delete(metaNames).where(eq(metaNames.tableName, "t")).returning().toSQL();
   assert.equal(
     del.sql,
-    'delete from "meta_names" where "meta_names"."table_name" = $1 returning "id", "columns", "table_name" as "tableName", "indexes"',
+    'delete from "meta_names" where ("meta_names"."table_name" = $1) returning "meta_names"."id", "meta_names"."columns", "meta_names"."table_name" as "tableName", "meta_names"."indexes"',
   );
 });
 
@@ -785,7 +794,7 @@ test("metadata: relational reads project collision-named columns through metadat
   assert.ok(sqlText.startsWith('select "meta_names"."id", "meta_names"."columns", "meta_names"."table_name" as "tableName", "meta_names"."indexes", '));
   assert.ok(sqlText.includes('\'id\', "__rel_children"."id"'));
   assert.ok(sqlText.includes('\'parentId\', "__rel_children"."parent_id"'));
-  assert.ok(sqlText.includes('from "meta_children" as "__rel_children" where "__rel_children"."parent_id" = "meta_names"."id"'));
+  assert.ok(sqlText.includes('from "meta_children" as "__rel_children" where ("__rel_children"."parent_id" = "meta_names"."id")'));
 
   const one = relational(metaChildrenRelations, { with: { parent: true } });
   assert.ok(one.sqlText.includes('\'columns\', "__rel_parent"."columns"'));
@@ -1102,26 +1111,31 @@ test("codecs: lossy-native columns project lossless text wire forms", () => {
 });
 
 test("codecs: predicate values encode with text-typed sites where required", () => {
-  const atz = eq(codecTable.atz, "2026-03-08T07:30:00.123456Z");
-  assert.equal(atz.sql, '"f03_unit"."atz" = $1::text::timestamptz');
+  // Predicates are AST value nodes since F04; their rendered form is checked
+  // through a compiled one-condition statement (SQL + params exact).
+  const cond = (c: Condition): { sql: string; params: readonly unknown[] } =>
+    compileStatement(selectStatement({ from: ident("t"), where: [c] }));
+
+  const atz = cond(eq(codecTable.atz, "2026-03-08T07:30:00.123456Z"));
+  assert.equal(atz.sql, 'select * from "t" where ("f03_unit"."atz" = $1::text::timestamptz)');
   assert.deepEqual(atz.params, ["2026-03-08T07:30:00.123456Z"]);
 
-  const atzDate = eq(codecTable.atzDate, new Date(Date.UTC(2026, 0, 2, 3, 4, 5, 678)));
-  assert.equal(atzDate.sql, '"f03_unit"."atz_date" = $1::text::timestamptz');
+  const atzDate = cond(eq(codecTable.atzDate, new Date(Date.UTC(2026, 0, 2, 3, 4, 5, 678))));
+  assert.equal(atzDate.sql, 'select * from "t" where ("f03_unit"."atz_date" = $1::text::timestamptz)');
   assert.deepEqual(atzDate.params, ["2026-01-02T03:04:05.678Z"]);
 
-  const at = lt(codecTable.at, "2026-01-01T00:00:00.000001");
-  assert.equal(at.sql, '"f03_unit"."at" < $1::text::timestamp');
+  const at = cond(lt(codecTable.at, "2026-01-01T00:00:00.000001"));
+  assert.equal(at.sql, 'select * from "t" where ("f03_unit"."at" < $1::text::timestamp)');
 
-  const big = gt(codecTable.big, 1n);
-  assert.equal(big.sql, '"f03_unit"."big" > $1');
+  const big = cond(gt(codecTable.big, 1n));
+  assert.equal(big.sql, 'select * from "t" where ("f03_unit"."big" > $1)');
   assert.deepEqual(big.params, [1n]);
 
-  const many = inArray(codecTable.atz, ["2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z"]);
-  assert.equal(many.sql, '"f03_unit"."atz" in ($1::text::timestamptz, $2::text::timestamptz)');
+  const many = cond(inArray(codecTable.atz, ["2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z"]));
+  assert.equal(many.sql, 'select * from "t" where ("f03_unit"."atz" in ($1::text::timestamptz, $2::text::timestamptz))');
 
-  const doc = eq(codecTable.doc, jsonNull);
-  assert.equal(doc.sql, '"f03_unit"."doc" = $1::text::jsonb');
+  const doc = cond(eq(codecTable.doc, jsonNull));
+  assert.equal(doc.sql, 'select * from "t" where ("f03_unit"."doc" = $1::text::jsonb)');
   assert.deepEqual(doc.params, ["null"]);
 });
 
@@ -1174,7 +1188,228 @@ test("codecs: write validation rejects before execution with column context", ()
 
 test("codecs: returning projects the same lossless wire forms as select", () => {
   const q = db.insert(codecTable).values({ big: 1n }).returning().toSQL();
-  assert.ok(q.sql.includes('returning "id", "big", "big_str" as "bigStr", "big_num" as "bigNum", to_jsonb("at")::text as "at"'));
-  assert.ok(q.sql.includes(`to_jsonb("atz" at time zone 'UTC')::text as "atz"`));
-  assert.ok(q.sql.includes(`to_jsonb("atz_date" at time zone 'UTC')::text as "atzDate"`));
+  assert.ok(q.sql.includes('returning "f03_unit"."id", "f03_unit"."big", "f03_unit"."big_str" as "bigStr", "f03_unit"."big_num" as "bigNum", to_jsonb("f03_unit"."at")::text as "at"'));
+  assert.ok(q.sql.includes(`to_jsonb("f03_unit"."atz" at time zone 'UTC')::text as "atz"`));
+  assert.ok(q.sql.includes(`to_jsonb("f03_unit"."atz_date" at time zone 'UTC')::text as "atzDate"`));
+});
+
+// ---------------------------------------------------------------------------
+// F04: CRUD builders are immutable (copy-on-write, frozen), compile through
+// the one AST compiler deterministically, and carry decode plans + capability
+// requirements with their compiled statements.
+// ---------------------------------------------------------------------------
+
+test("F04: CRUD builders are immutable — fluent calls fork, never mutate", () => {
+  const base = db.select().from(users);
+  const withFilter = base.where(eq(users.email, "a@x.com", "users"));
+  const withLimit = base.limit(5);
+
+  assert.equal(Object.isFrozen(base), true, "builder instances are frozen");
+  assert.equal(base.toSQL().sql.includes("where"), false, "base builder unaffected by forks");
+  assert.ok(withFilter.toSQL().sql.includes('where ("users"."email" = $1)'));
+  assert.ok(withLimit.toSQL().sql.endsWith("limit 5"));
+  // Two requests from one base query cannot contaminate each other (V02).
+  assert.deepEqual(base.toSQL().params, []);
+
+  const insBase = db.insert(users);
+  const insA = insBase.values({ email: "a@x.com" });
+  const insB = insBase.values({ email: "b@x.com" }).returning();
+  assert.throws(() => insBase.toSQL(), /requires \.values\(\)/);
+  assert.equal(insA.toSQL().sql, 'insert into "users" ("email") values ($1)');
+  assert.ok(insB.toSQL().sql.startsWith('insert into "users" ("email") values ($1) returning'));
+
+  const updBase = db.update(users).set({ name: "X" });
+  const updA = updBase.where(eq(users.id, 1));
+  const updB = updBase.where(eq(users.id, 2)).returning();
+  assert.throws(() => updBase.toSQL(), /without \.where\(\)/);
+  assert.equal(updA.toSQL().sql, 'update "users" set "name" = $1 where ("users"."id" = $2)');
+  assert.ok(updB.toSQL().sql.includes("returning"));
+
+  const delBase = db.delete(users);
+  const delA = delBase.where(eq(users.id, 1));
+  assert.throws(() => delBase.toSQL(), /without \.where\(\)/);
+  assert.equal(delA.toSQL().sql, 'delete from "users" where ("users"."id" = $1)');
+});
+
+test("F04: CRUD compilation is pure — repeated compiles are byte-identical", () => {
+  const q = db.select().from(users).where(and(eq(users.active, true, "users"), gt(users.id, 0, "users"))).limit(3);
+  const a = q.toSQL();
+  const b = q.toSQL();
+  assert.equal(a.sql, b.sql);
+  assert.deepEqual(a.params, b.params);
+
+  const i = db.insert(posts).values([{ userId: 1, title: "p" }, { userId: 2, title: "q" }]).returning();
+  assert.deepEqual(i.toSQL(), i.toSQL());
+});
+
+test("F04: compiled statements carry projection decoders and capability requirements", () => {
+  const plan = db.select().from(codecTable).toCompiled();
+  const keys = plan.decoders.map((d) => d.key);
+  assert.ok(keys.includes("big"), "bigint decode rides along");
+  assert.ok(keys.includes("at"), "timestamp text-wire decode rides along");
+  assert.ok(keys.includes("atz"), "timestamptz text-wire decode rides along");
+  assert.ok(!keys.includes("s"), "identity columns carry no decoder");
+  for (const d of plan.decoders) {
+    assert.ok(d.codec, "decoder entries carry the serializable ColumnCodec plan");
+    if (d.codec.textWire) assert.equal(d.wire, "text");
+  }
+  assert.deepEqual(plan.capabilities, ["jsonb-functions"], "wire-read projections require jsonb functions");
+
+  const plain = db.select({ email: users.email }).from(users).toCompiled();
+  assert.equal(plain.capabilities.length, 0, "plain projections require no capabilities");
+  assert.equal(plain.decoders.length, 0, "varchar/text need no decode");
+
+  // A decode plan actually decodes driver rows (text-wire form -> value).
+  const rows: Array<Record<string, unknown>> = [{ at: '"2026-01-02T03:04:05.678912"', big: "9007199254740993" }];
+  const decoders = db.select().from(codecTable).toCompiled().decoders;
+  for (const d of decoders) {
+    const raw = rows[0][d.key];
+    if (raw !== undefined) rows[0][d.key] = d.decode(raw);
+  }
+  assert.equal(rows[0].at, "2026-01-02T03:04:05.678912");
+  assert.equal(rows[0].big, 9007199254740993n);
+
+  // Mutations without returning carry no decoders; with returning they do.
+  assert.equal(db.update(users).set({ name: "x" }).where(eq(users.id, 1)).toCompiled().decoders.length, 0);
+  assert.ok(db.update(users).set({ name: "x" }).where(eq(users.id, 1)).returning().toCompiled().decoders.length > 0);
+});
+
+test("F04: chained .where() calls with OR fragments are safely parenthesized", () => {
+  // Old regex assembly joined raw fragment text with " and " — two OR
+  // fragments produced precedence corruption (a or b and c or d). The
+  // compiler wraps every fragment condition.
+  const q = db.select({ id: users.id })
+    .from(users)
+    .where(sql`${users.id} = ${1} or ${users.active} = ${false}`)
+    .where(sql`${users.id} = ${2} or ${users.active} = ${true}`)
+    .toSQL();
+  assert.equal(q.sql, 'select "users"."id" from "users" where ("users"."id" = $1 or "users"."active" = $2) and ("users"."id" = $3 or "users"."active" = $4)');
+  assert.deepEqual(q.params, [1, false, 2, true]);
+});
+
+test("F04: legacy SqlFragment assignments are rejected with a rebuild hint", () => {
+  const legacy = raw("upper('a')");
+  assert.throws(() => db.update(users).set({ name: legacy } as never), /update set: legacy SqlFragment \{sql, params\} cannot be used here/);
+  // Structural fragments (sql``) keep working in projections and assignments.
+  const q = db.select({ n: sql`count(*)` }).from(users).toSQL();
+  assert.ok(q.sql.includes("count(*)"));
+});
+
+// ---------------------------------------------------------------------------
+// F04 rework (attempt 2): reviewer findings — connective grouping (MAJOR-1),
+// projection copy-on-fork (MAJOR-2), legacy-fragment rejection on every slot
+// (MINOR-1).
+// ---------------------------------------------------------------------------
+
+test("F04 rework MAJOR-1: and()/not() parenthesize fragment args (connective grouping)", () => {
+  // Reviewer live proof (attempt-1 code): and(eq(a,true), sql`b or c`) compiled
+  // to `(("a" = $1) and "b" or "c")` — Postgres parses the bare `or` tighter
+  // than the enclosing `and`, silently returning 5 of 8 truth-table rows
+  // instead of 3. Every connective application now delimits text-bearing args
+  // exactly like the where list does.
+  const andFrag = and(eq(users.active, true, "users"), sql`${users.id} <> ${1} or ${users.active} = ${false}`);
+  assert.equal(
+    db.select({ id: users.id }).from(users).where(andFrag).toSQL().sql,
+    'select "users"."id" from "users" where ("users"."active" = $1) and ("users"."id" <> $2 or "users"."active" = $3)',
+  );
+
+  // Fragment on the LEFT of the connective too.
+  const andFragLeft = and(sql`${users.active} = ${true} or ${users.id} = ${9}`, eq(users.id, 1, "users"));
+  assert.equal(
+    db.select({ id: users.id }).from(users).where(andFragLeft).toSQL().sql,
+    'select "users"."id" from "users" where ("users"."active" = $1 or "users"."id" = $2) and ("users"."id" = $3)',
+  );
+
+  // not(): any top-level connective inside the fragment must stay inside.
+  const notFrag = not(sql`${users.active} = ${true} or ${users.id} = ${9}`);
+  assert.equal(
+    db.select({ id: users.id }).from(users).where(notFrag).toSQL().sql,
+    'select "users"."id" from "users" where (not ("users"."active" = $1 or "users"."id" = $2))',
+  );
+
+  // Nested: a connective buried inside or() — where-list flattening cannot
+  // save it because the and() is not a direct child of the where list.
+  const nested = or(and(eq(users.active, true, "users"), sql`${users.id} > ${0} or ${users.id} = ${9}`), eq(users.id, 5, "users"));
+  const nestedOut = db.select({ id: users.id }).from(users).where(nested).toSQL();
+  assert.equal(
+    nestedOut.sql,
+    'select "users"."id" from "users" where ((("users"."active" = $1) and ("users"."id" > $2 or "users"."id" = $3)) or ("users"."id" = $4))',
+  );
+  assert.deepEqual(nestedOut.params, [true, 0, 9, 5]);
+
+  // Raw AST path (selectStatement) gets the same grouping. The where list is
+  // not builder-flattened here, so the whole and() renders as one
+  // self-parenthesized expr with its fragment operand delimited.
+  const rawAst = compileStatement(
+    selectStatement({ projections: [{ kind: "projection", expr: ident("id"), alias: "id" }], from: ident("users"), where: [andFrag] }),
+  );
+  assert.equal(
+    rawAst.sql,
+    'select "id" as "id" from "users" where (("users"."active" = $1) and ("users"."id" <> $2 or "users"."active" = $3))',
+  );
+
+  // trusted segments as connective args are delimited the same way.
+  const trustedCond = and(eq(users.active, true, "users"), sql`${trustSql("users.id <> 1 or users.active = false", TRUSTED_SQL_ACK)}`);
+  assert.equal(
+    db.select({ id: users.id }).from(users).where(trustedCond).toSQL().sql,
+    'select "users"."id" from "users" where ("users"."active" = $1) and (users.id <> 1 or users.active = false)',
+  );
+});
+
+test("F04 rework MAJOR-2: projection is copied on fork — post-fork caller mutation is isolated", () => {
+  // F01 review-2 carry-forward: the reviewer showed a post-fork `evil` key
+  // reaching BOTH sibling forks' compiled SQL when the projection object was
+  // shared by reference.
+  const projection: Record<string, unknown> = { id: users.id, email: users.email };
+  const base = db.select(projection as never).from(users);
+  const b1 = base.where(eq(users.id, 1));
+  const b2 = base.where(eq(users.id, 2));
+  const before = b1.toSQL().sql;
+  // Hostile post-fork mutation of the CALLER's object the builder was built from.
+  projection.evil = sql`1`;
+  const after1 = b1.toSQL().sql;
+  const after2 = b2.toSQL().sql;
+  assert.equal(after1, before, "fork 1 compiled SQL must not change after post-fork caller mutation");
+  assert.ok(!after2.includes("evil"), "fork 2 must not see post-fork caller mutation");
+  // The base builder itself is equally isolated, and later forks of it.
+  assert.ok(!base.limit(5).toSQL().sql.includes("evil"));
+  // Compiling before the mutation and after still agrees (snapshot semantics).
+  assert.equal(after1, b1.toSQL().sql);
+});
+
+test("F04 rework MINOR-1: legacy {sql, params} fragments fail closed with one rebuild hint on every slot", () => {
+  const legacy = raw("id = $1", [1]);
+  const hint = /legacy SqlFragment \{sql, params\} cannot be used here .* raw\(\) \+ driver\.query/s;
+
+  // where — select/update/delete (CRUD) and the AST builder.
+  assert.throws(() => db.select().from(users).where(legacy as never), hint);
+  assert.throws(() => db.update(users).set({ name: "x" }).where(legacy as never), hint);
+  assert.throws(() => db.delete(users).where(legacy as never), hint);
+  assert.throws(() => astSelect().from(users).where(legacy as never), hint);
+
+  // orderBy — CRUD and AST builder.
+  assert.throws(() => db.select().from(users).orderBy(legacy as never), hint);
+  assert.throws(() => astSelect().from(users).orderBy(legacy as never), hint);
+
+  // set assignment (attempt-1 already had this slot; message now shared).
+  assert.throws(() => db.update(users).set({ name: legacy } as never), hint);
+
+  // projection slots — CRUD select and astSelect.
+  assert.throws(() => db.select({ id: users.id, evil: legacy } as never).from(users).toSQL(), hint);
+  assert.throws(() => astSelect({ id: users.id, evil: legacy as never }).from(users).toSQL(), hint);
+
+  // connective arguments — accepted-at-construction was the attempt-1 hole.
+  assert.throws(() => and(eq(users.id, 1), legacy as never), hint);
+  assert.throws(() => or(eq(users.id, 1), legacy as never), hint);
+  assert.throws(() => not(legacy as never), hint);
+
+  // insert cell values.
+  assert.throws(() => db.insert(users).values({ email: legacy } as never).toSQL(), hint);
+
+  // relational args (where via the RQB surface).
+  const usersEntries = resolveRelations([usersRelations, postsRelations]).byTable.get("users")!;
+  assert.throws(() => buildRelationalSQL(users, usersEntries, { where: legacy as never }), hint);
+
+  // sql template interpolation (pre-existing slot, same hint shape since rework).
+  assert.throws(() => sql`${legacy as never}`, hint);
 });

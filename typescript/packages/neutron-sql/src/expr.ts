@@ -1,13 +1,31 @@
 // ---------------------------------------------------------------------------
 // @neutron-build/sql — expressions, operators, raw SQL fragments
 // ---------------------------------------------------------------------------
-// A fragment carries SQL text with $1..$n placeholders relative to its own
-// params. Merging renumbers. The final query assembly is therefore trivial.
+// Since F04 every predicate/order builder produces AST value nodes, compiled
+// by the one-traversal compiler (compile.ts) — no fragment text with $n
+// placeholders is ever renumbered here. `raw()` remains for the explicit
+// direct-execution escape hatch: its {sql, params} shape is executed as-is
+// through the driver and never interpolated into other statements.
 
 import { getTableName } from "./schema.js";
 import type { AnyColumnBuilder, ColumnBuilder, JsWriteTypeOf, ColumnDataType } from "./schema.js";
 import { encodeWriteValue } from "./codecs.js";
+import {
+  expr as exprNode,
+  fragment,
+  ident,
+  isLegacySqlFragment,
+  legacyFragmentError,
+  param as paramNode,
+  paramCast,
+  qual,
+  type OrderSpec,
+  type ValueNode,
+} from "./ast.js";
 
+/** Parameterized raw text for DIRECT execution only (`driver.query(raw.sql,
+ *  raw.params)`). Its `$n` placeholders are never spliced into compiled
+ *  statements — that would require scanning raw SQL text. */
 export interface SqlFragment {
   readonly sql: string;
   readonly params: readonly unknown[];
@@ -17,57 +35,36 @@ export function raw(sqlText: string, params: unknown[] = []): SqlFragment {
   return { sql: sqlText, params };
 }
 
-/** Raw SQL with interpolated values: sql`select * from t where id = ${1}` */
-export function sql(strings: TemplateStringsArray, ...values: unknown[]): SqlFragment {
-  let text = "";
-  const params: unknown[] = [];
-  for (let i = 0; i < strings.length; i++) {
-    text += strings[i];
-    if (i < values.length) {
-      params.push(values[i]);
-      text += `$${params.length}`;
-    }
-  }
-  return { sql: text, params };
-}
-
-export function qident(name: string): string {
-  return '"' + name.replace(/"/g, '""') + '"';
-}
-
-export function qualify(table: string, column: string): string {
-  return `${qident(table)}.${qident(column)}`;
-}
+export { quoteIdent as qident } from "./compile.js";
 
 // ---------------------------------------------------------------------------
-// Conditions
+// Conditions — AST value nodes
 // ---------------------------------------------------------------------------
 
-export type Condition = SqlFragment;
+export type Condition = ValueNode;
 
-function colRef(col: AnyColumnBuilder | string, table?: string): string {
-  if (typeof col === "string") return qident(col);
-  if (table) return qualify(table, col.columnName);
-  if (col.ownerTable) return qualify(getTableName(col.ownerTable), col.columnName);
-  return qident(col.columnName);
+function colRef(col: AnyColumnBuilder | string, table?: string): ValueNode {
+  if (typeof col === "string") return ident(col);
+  if (table) return qual(table, col.columnName);
+  if (col.ownerTable) return qual(getTableName(col.ownerTable), col.columnName);
+  return ident(col.columnName);
 }
 
 /** Predicate values run through the column codec: validation with column
  *  context, canonical encoding, and a text-typed bind site for temporal and
  *  json/jsonb values (postgres.js otherwise re-encodes server-typed params
  *  through Date/JSON.stringify). */
-function encodedParam(col: AnyColumnBuilder, table: string | undefined, value: unknown): { site: string; bind: unknown } {
+function encodedParamNode(col: AnyColumnBuilder, table: string | undefined, value: unknown): ValueNode {
   const tableName = table ?? (col.ownerTable ? getTableName(col.ownerTable) : col.columnName);
   const enc = encodeWriteValue(col, { propertyKey: col.columnName, columnName: col.columnName, tableName }, value);
-  return { site: enc.cast === undefined ? "$1" : `$1::text::${enc.cast}`, bind: enc.bind };
+  return enc.cast === undefined ? paramNode(enc.bind) : paramCast(enc.bind, enc.cast);
 }
 
 function cmp(op: string, col: AnyColumnBuilder | string, value: unknown, table?: string): Condition {
   if (typeof col === "string") {
-    return { sql: `${qident(col)} ${op} $1`, params: [value] };
+    return exprNode("binary", op, [ident(col), paramNode(value)]);
   }
-  const { site, bind } = encodedParam(col, table, value);
-  return { sql: `${colRef(col, table)} ${op} ${site}`, params: [bind] };
+  return exprNode("binary", op, [colRef(col, table), encodedParamNode(col, table, value)]);
 }
 
 export function eq<D extends ColumnDataType>(col: ColumnBuilder<D, boolean, boolean, unknown> | string, value: JsWriteTypeOf<D>, table?: string): Condition {
@@ -107,77 +104,61 @@ export function inArray<D extends ColumnDataType>(
   values: Array<JsWriteTypeOf<D>>,
   table?: string,
 ): Condition {
-  if (values.length === 0) return { sql: "1 = 0", params: [] };
-  if (typeof col === "string") {
-    const placeholders = values.map((_, i) => `$${i + 1}`).join(", ");
-    return { sql: `${qident(col)} in (${placeholders})`, params: values.slice() };
-  }
-  const binds: unknown[] = [];
-  const sites = values.map((value) => {
-    const { site, bind } = encodedParam(col, table, value);
-    binds.push(bind);
-    return site === "$1" ? `$${binds.length}` : `$${binds.length}${site.slice(2)}`;
+  if (values.length === 0) return fragment("1 = 0");
+  const cells = typeof col === "string" ? values.map((v) => paramNode(v)) : values.map((value) => encodedParamNode(col, table, value));
+  const parts: Array<string | ValueNode> = [colRef(col, table), " in ("];
+  cells.forEach((cell, i) => {
+    if (i > 0) parts.push(", ");
+    parts.push(cell);
   });
-  return { sql: `${colRef(col, table)} in (${sites.join(", ")})`, params: binds };
+  parts.push(")");
+  return fragment(...parts);
 }
 
 export function isNull(col: AnyColumnBuilder | string, table?: string): Condition {
-  return { sql: `${colRef(col, table)} is null`, params: [] };
+  return fragment(colRef(col, table), " is null");
 }
 
 export function isNotNull(col: AnyColumnBuilder | string, table?: string): Condition {
-  return { sql: `${colRef(col, table)} is not null`, params: [] };
+  return fragment(colRef(col, table), " is not null");
+}
+
+function rejectLegacy(condition: Condition, connective: string): void {
+  if (isLegacySqlFragment(condition)) throw legacyFragmentError(connective);
+}
+
+function combine(op: "and" | "or", conditions: Array<Condition | undefined>): Condition {
+  const parts = conditions.filter((c): c is Condition => c !== undefined);
+  for (const c of parts) rejectLegacy(c, op);
+  if (parts.length === 0) return fragment("1 = 1");
+  return parts.reduce((acc, c) => exprNode("binary", op, [acc, c]));
 }
 
 export function and(...conditions: Array<Condition | undefined>): Condition {
-  const parts = conditions.filter((c): c is Condition => c !== undefined);
-  if (parts.length === 0) return { sql: "1 = 1", params: [] };
-  if (parts.length === 1) return parts[0];
-  return { sql: `(${mergeFragments(parts, " and ", true).sql})`, params: mergeFragments(parts, " and ", true).params };
+  return combine("and", conditions);
 }
 
 export function or(...conditions: Array<Condition | undefined>): Condition {
-  const parts = conditions.filter((c): c is Condition => c !== undefined);
-  if (parts.length === 0) return { sql: "1 = 1", params: [] };
-  if (parts.length === 1) return parts[0];
-  return { sql: `(${mergeFragments(parts, " or ", true).sql})`, params: mergeFragments(parts, " or ", true).params };
+  return combine("or", conditions);
 }
 
 export function not(condition: Condition): Condition {
-  return mergeFragments([condition], "", true, "not ");
-}
-
-/** Concatenate fragments, renumbering placeholders into one shared param list. */
-export function mergeFragments(
-  fragments: SqlFragment[],
-  joiner: string,
-  parenthesize: boolean,
-  prefix = "",
-): SqlFragment {
-  const params: unknown[] = [];
-  const pieces: string[] = [];
-  for (const frag of fragments) {
-    let n = 0;
-    const text = frag.sql.replace(/\$(\d+)/g, () => {
-      params.push(frag.params[n]);
-      n++;
-      return `$${params.length}`;
-    });
-    pieces.push(parenthesize ? `(${text})` : text);
-  }
-  return { sql: prefix + pieces.join(joiner), params };
+  rejectLegacy(condition, "not");
+  return exprNode("unary", "not", [condition]);
 }
 
 // ---------------------------------------------------------------------------
 // Order
 // ---------------------------------------------------------------------------
 
-export type OrderExpression = SqlFragment;
+/** Order expression: an explicit `asc(col)`/`desc(col)` spec, or any value
+ *  node (a raw expression defaults to ascending). */
+export type OrderExpression = OrderSpec | ValueNode;
 
-export function asc(col: AnyColumnBuilder | string, table?: string): OrderExpression {
-  return { sql: `${colRef(col, table)} asc`, params: [] };
+export function asc(col: AnyColumnBuilder | string, table?: string): OrderSpec {
+  return Object.freeze({ expr: colRef(col, table), direction: "asc" } as OrderSpec);
 }
 
-export function desc(col: AnyColumnBuilder | string, table?: string): OrderExpression {
-  return { sql: `${colRef(col, table)} desc`, params: [] };
+export function desc(col: AnyColumnBuilder | string, table?: string): OrderSpec {
+  return Object.freeze({ expr: colRef(col, table), direction: "desc" } as OrderSpec);
 }

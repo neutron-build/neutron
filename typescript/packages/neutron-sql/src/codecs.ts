@@ -11,6 +11,7 @@
 // pass through untouched and which keeps microsecond and scale digits intact.
 
 import type { AnyColumnBuilder, ColumnDataType } from "./schema.js";
+import { fragment, type QualifiedNode, type ValueNode } from "./ast.js";
 
 export type BigintMode = "bigint" | "string" | "number";
 export type TemporalMode = "string" | "date";
@@ -57,18 +58,20 @@ function codecError(ctx: ColumnContext, reason: string): Error {
 // Read acquisition
 // ---------------------------------------------------------------------------
 
-/** SQL expression acquiring a lossless value for one column reference, or
- *  null when the driver-native value is already exact for this type. */
-export function wireReadExpr(dataType: ColumnDataType, ref: string): string | null {
+/** Structured lossless-acquisition expression for one column reference, or
+ *  null when the driver-native value is already exact for this type. The
+ *  fragments are authored here (trusted text) around the caller's reference
+ *  node — compiled statements never re-derive SQL text. */
+export function wireReadNode(dataType: ColumnDataType, ref: QualifiedNode): ValueNode | null {
   switch (dataType) {
     case "timestamp":
     case "date":
       // to_jsonb renders temporal values in fixed ISO form (T separator,
       // microsecond digits preserved, DateStyle-independent) as a JSON string.
-      return `to_jsonb(${ref})::text`;
+      return fragment("to_jsonb(", ref, ")::text");
     case "timestamptz":
       // Render the UTC wall clock (session-timezone independent).
-      return `to_jsonb(${ref} at time zone 'UTC')::text`;
+      return fragment("to_jsonb(", ref, " at time zone 'UTC')::text");
     default:
       // int8/numeric arrive as exact strings natively on both drivers;
       // bytea arrives as a buffer; the rest are exact JS scalars.
@@ -76,10 +79,11 @@ export function wireReadExpr(dataType: ColumnDataType, ref: string): string | nu
   }
 }
 
-/** Whether a column's projected value must be text-acquired via wireReadExpr. */
-export function usesTextWire(dataType: ColumnDataType): boolean {
-  return wireReadExpr(dataType, "x") !== null;
-}
+/** Engine feature a compiled statement requires. `jsonb-functions` marks
+ *  statements whose projections aggregate or acquire values through
+ *  PostgreSQL jsonb functions (to_jsonb / jsonb_build_object / jsonb_agg);
+ *  engines without them must reject these statements rather than run them. */
+export type StatementCapability = "jsonb-functions";
 
 function stripJsonQuotes(raw: unknown, ctx: ColumnContext): string {
   if (typeof raw !== "string" || raw.length < 2 || !raw.startsWith('"') || !raw.endsWith('"')) {
@@ -516,6 +520,52 @@ export function codecOf(column: AnyColumnBuilder): ColumnCodec {
       return { dataType: dt, read: "date-text", textWire: true };
     default:
       return { dataType: dt, read: "identity", textWire: false };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Projection decode plan — the decoders compiled statements carry (F04).
+// Built from the serializable ColumnCodec plan; the decode closures delegate
+// to the decode functions above (never re-implemented).
+// ---------------------------------------------------------------------------
+
+export interface ProjectionDecoder {
+  /** Output row key the decoded value is written back to. */
+  readonly key: string;
+  /** Serializable codec plan (codecOf) for this projection. */
+  readonly codec: ColumnCodec;
+  readonly context: ColumnContext;
+  readonly wire: "text" | "native";
+  decode(raw: unknown): unknown;
+}
+
+/** Decode-plan entry for one projected column, or null when the driver-native
+ *  value needs no post-processing (identity codec, native acquisition). */
+export function projectionDecoder(tableName: string, column: AnyColumnBuilder, key: string): ProjectionDecoder | null {
+  const codec = codecOf(column);
+  const context: ColumnContext = { propertyKey: key, columnName: column.columnName, tableName };
+  if (codec.textWire) {
+    return { key, codec, context, wire: "text", decode: (raw) => decodeTextWire(column, context, raw) };
+  }
+  if (needsFlatDecode(column)) {
+    return { key, codec, context, wire: "native", decode: (raw) => decodeNativeValue(column, context, raw) };
+  }
+  return null;
+}
+
+/** Apply a decode plan to driver rows in place. Rows without a plan entry or
+ *  with SQL-NULL/missing cells are untouched. */
+export function applyProjectionDecoders(
+  rows: Array<Record<string, unknown>>,
+  decoders: readonly ProjectionDecoder[],
+): void {
+  if (decoders.length === 0) return;
+  for (const row of rows) {
+    for (const entry of decoders) {
+      const raw = row[entry.key];
+      if (raw === null || raw === undefined) continue;
+      row[entry.key] = entry.decode(raw);
+    }
   }
 }
 

@@ -74,9 +74,9 @@ codegen step and `db` never types as `unknown`.
 ```bash
 # 1. export the schema as JSON — export-schema.mjs next to your schema:
 #    import { writeFileSync } from "node:fs";
-#    import { exportSchema } from "@neutron-build/sql";
+#    import { exportSchemaV2, canonicalSchemaJson } from "@neutron-build/sql";
 #    import { users, posts } from "./schema.js";
-#    writeFileSync("neutron.schema.json", JSON.stringify(exportSchema({ users, posts })));
+#    writeFileSync("neutron.schema.json", canonicalSchemaJson(exportSchemaV2({ users, posts })));
 node export-schema.mjs
 
 # 2. point the CLI at a disposable database (env or --url)
@@ -91,6 +91,25 @@ neutron migrate generate --rename 'users.name>users.full_name'   # quote it: > i
 neutron migrate          # apply (history table: _neutron_migrations)
 neutron migrate status
 ```
+
+Two export formats exist. `exportSchema()` emits the legacy version-1 shape
+the current CLI planning commands still consume. `exportSchemaV2()` emits the
+cross-language schema contract v2 (`contracts/data/schema-v2.json`) and
+`canonicalSchemaJson()` serializes it deterministically: identical bytes and
+SHA-256 for the same schema on every machine, input key order and process
+timezone irrelevant — the Go CLI and the `contracts/data` reference consumer
+reproduce the same canonical bytes (CI-pinned by the golden fixture
+`contracts/data/golden/valid/exported-v2.json`). `readSchemaDocumentV1()`
+is the explicit compatibility reader: it upgrades legacy v1 export documents
+to v2 under the same rules as the Go upgrade reader
+(`contracts/data/CANONICAL.md` §6) and reports every ambiguity
+(`[ambiguous-default]`) instead of guessing literal vs expression. Columns
+keep declaration order (PostgreSQL `attnum` semantics); tables, constraints
+and indexes normalize as sorted sets in the canonical form. Schemas the v2
+document cannot represent faithfully — a `serial` column with an explicit
+default, a foreign key to a column outside the export or not covered by a
+primary-key/unique constraint — fail at export time with the contract error
+code, never as a silently invalid document.
 
 `migrate generate` diffs the exported schema against the live database
 (information_schema) and writes `{version}_{name}.up.sql` / `.down.sql` pairs.
@@ -161,9 +180,64 @@ errors.
   data (pg JSON-stringifies objects into text columns; postgres.js stores
   `"[object Object]"`). `json`/`jsonb` columns accept JSON-representable
   values (recursively checked — no `bigint`, `symbol`, `undefined` or
-  non-finite numbers anywhere inside). `sql` fragments remain supported in
-  `.set()` assignments on every column type except `json`/`jsonb`, where
-  object values always bind as values.
+  non-finite numbers anywhere inside). `sql` template expressions remain
+  supported in `.set()` assignments on every column type except `json`/`jsonb`,
+  where object values always bind as values.
+
+## One compiler, structural fragments
+
+Every statement this package emits — `select`/`insert`/`update`/`delete`,
+projections, `returning`, relational aggregation — is built as a frozen AST
+and rendered by a single one-traversal compiler (`compileStatement`).
+Placeholders and the params array are produced in the same pass, so they can
+never disagree; nothing on this path ever scans or renumbers SQL text. The
+old regex-splicing assembly was deleted in F04, which also fixed a real
+precedence hole: chained `.where()` calls are now individually parenthesized
+(`where (a or b) and (c or d)`) instead of raw-joined with `and`.
+
+Grouping guarantee (F04 rework): **every operator the compiler applies —
+`and`/`or`/`not`, comparisons, the where-list join — parenthesizes its
+fragment and `trustSql` operands**, so a top-level `or`/`and`/`not` inside
+spliced text can never escape the operator it was passed to
+(`and(eq(a), sql`b or c`)` compiles to `((a = $1) and (b or c))`). Call-form
+arguments need no wrap: the call's own parentheses and commas delimit each
+argument. Fragments nested inside fragment *text* compose verbatim — the
+author of the outer template owns that text; the compiler only delimits what
+it applies itself.
+
+- `sql\`…\`` is the structural template: interpolated **values bind as
+  parameters** (never spliced), while columns, tables, other nodes and
+  `trustSql(text, TRUSTED_SQL_ACK)` segments splice structurally. A literal
+  `"$1"` inside a value or a dollar-quoted string can never collide with
+  placeholder numbering. (This was `sqlAst` during F01–F03; the names
+  collapsed in F04 and `sqlAst` remains as a deprecated alias.)
+- Raw parameterized text survives only through the explicit direct-execution
+  escape hatch: `raw(text, params)` executed via `driver.query`/`driver.execute`.
+  Its `$n` placeholders are never interpolated into other statements — that
+  would require scanning raw SQL. Passing a legacy `{sql, params}` fragment
+  into ANY builder slot (`where`, `orderBy`, `set`, projections, connective
+  arguments, insert values, relational args, template interpolation) throws
+  the same fail-closed rejection with instructions to rebuild it with `sql`,
+  bind a plain value, or run it directly via `raw()` + `driver.query`.
+- Builders are immutable: every fluent call (`.where()`, `.set()`, `.values()`,
+  `.limit()`, …) returns a new frozen builder. Reusing a base query in two
+  requests cannot leak filters between them, and `.toSQL()` is pure — the
+  same builder state compiles to byte-identical SQL.
+- Compiled statements carry their projection **decode plans** (built from the
+  serializable per-column `ColumnCodec`) and their engine **capability
+  requirements** (statements using `to_jsonb`/`jsonb_agg` acquisition carry
+  `jsonb-functions`; engines without those functions must reject them).
+- The compiler reserves the `__q<number>` alias namespace for generated
+  derived-table aliases; user aliases in that namespace are rejected.
+
+**Migration note (F04, pre-1.0 breaking changes).** The `sql` template now
+returns a structural fragment node instead of `{sql, params}`; destructured
+`.sql`/`.params` accesses on `eq()`/`and()` results no longer exist
+(inspect conditions through `.toSQL()`/`.toCompiled()`). `asc()`/`desc()`
+return order specs (still accepted by `orderBy`). Update/delete `where`
+clauses and `returning` lists are now uniformly parenthesized/qualified —
+semantics unchanged, byte-level SQL text shifted. Legacy fragments are
+`raw()` + direct execution only.
 
 ### Lossless value codecs (and the corrected pre-1.0 types)
 
@@ -210,9 +284,11 @@ double-`JSON.stringify`s strings. On read, SQL NULL and JSON null both arrive
 as JS `null` — the distinction is preserved for writes and queryable with
 `sql` fragments (`data is null` vs `data = 'null'::jsonb`).
 
-Predicate values (`eq`/`ne`/`lt`/`lte`/`gt`/`gte`/`inArray`) run through the
-same codec: validated with column context and bound at the same safe sites.
-Values inside raw `sql` fragments are yours — no codec touches them.
+Predicate values (`eq`/`ne`/`lt`/`lte`/`gt`/`gte`/`inArray`) run through
+the same codec: validated with column context and bound at the same safe sites.
+Values interpolated into a raw `sql\`…\`` template bind as plain parameters —
+no column codec touches them (use the typed predicates when you want
+validation).
 
 **Migration note (corrected pre-1.0 types).** Before this change: `bigint`
 columns read as `string`, `timestamp`/`timestamptz`/`date` columns read as
@@ -296,7 +372,11 @@ general-purpose use.
   safe-number int8 modes, exact numerics, microsecond temporals, bytea,
   SQL NULL vs JSON null writes) across raw select, projection, `returning`
   and relation paths on both drivers, verified under multiple process
-  timezones.
+  timezones. Since F04 every statement compiles through the one AST compiler
+  with immutable builders, compiled statements carry decode plans and
+  capability requirements, and schema export v2 is deterministic and
+  cross-language-pinned (Go + reference consumer agree byte-for-byte);
+  importing the root loads no driver module until a connection is requested.
 - `update`/`delete` require `.where()` (foot-gun guard).
 - Deferred with explicit rejection, not implemented: nested/per-relation
   `with` and repeated targets (Q05), generated/identity columns —

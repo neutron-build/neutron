@@ -7,6 +7,7 @@
 import { getTableColumns, getTableName, getTableIndexes } from "./schema.js";
 import type { AnyColumnBuilder, AnyPgTable } from "./schema.js";
 import { qident } from "./expr.js";
+import { quoteStringLiteral } from "./compile.js";
 
 export function sqlTypeOf(col: AnyColumnBuilder): string {
   switch (col.dataType) {
@@ -67,7 +68,7 @@ function defaultLiteral(col: AnyColumnBuilder): string | undefined {
     case "numeric":
       return String(v);
     default:
-      return `'${String(v).replace(/'/g, "''")}'`;
+      return quoteStringLiteral(String(v));
   }
 }
 

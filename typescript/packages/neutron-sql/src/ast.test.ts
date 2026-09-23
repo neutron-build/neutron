@@ -5,12 +5,16 @@ import {
   compile,
   compileStatement,
   cte,
+  defaultCell,
+  deleteStatement,
   expr,
   fragment,
   ident,
+  insertStatement,
   isValueNode,
   join,
   param,
+  paramCast,
   qual,
   ref,
   selectStatement,
@@ -18,12 +22,14 @@ import {
   subquery,
   TRUSTED_SQL_ACK,
   trustSql,
+  updateStatement,
+  type AnyStatementNode,
   type SqlNode,
   type StatementNode,
   type TrustedSql,
   type ValueNode,
 } from "./index.js";
-import { pgTable, serial, integer, text, boolean, raw, sql } from "./index.js";
+import { pgTable, serial, integer, text, boolean, raw } from "./index.js";
 
 // ---------------------------------------------------------------------------
 // Fixture schema (mirrors the snapshot suite's users + posts).
@@ -180,7 +186,7 @@ test("compile: expressions render all three forms", () => {
   const q = compileStatement(selectStatement({ from: ident("t"), where: [e1, e2, e3] }));
   assert.equal(
     q.sql,
-    'select * from "t" where (("t"."a" = $1)) and ((not "t"."b")) and (coalesce("t"."c", $2))',
+    'select * from "t" where ("t"."a" = $1) and (not "t"."b") and coalesce("t"."c", $2)',
   );
   assert.deepEqual(q.params, [1, 0]);
 });
@@ -216,8 +222,7 @@ test("sqlAst: values bind as parameters, schema objects splice structurally", ()
 
 test("sqlAst: legacy {sql, params} fragments are rejected, never renumbered", () => {
   assert.throws(() => sqlAst`${raw("x = $1")}` as never, /legacy SqlFragment/);
-  const legacy = sql`count(*)`;
-  assert.throws(() => sqlAst`${legacy}` as never, /legacy SqlFragment/);
+  assert.throws(() => sqlAst`${raw("count(*)")}` as never, /legacy SqlFragment/);
 });
 
 test("sqlAst: unsupported interpolation shapes fail explicitly", () => {
@@ -391,6 +396,21 @@ function collectParamsPreOrder(node: SqlNode, out: unknown[]): void {
       for (const w of node.where) collectParamsPreOrder(w, out);
       for (const o of node.orderBy) collectParamsPreOrder(o.expr, out);
       return;
+    case "default":
+      return;
+    case "insert":
+      for (const row of node.rows) for (const cell of row) collectParamsPreOrder(cell, out);
+      if (node.returning) for (const p of node.returning) collectParamsPreOrder(p, out);
+      return;
+    case "update":
+      for (const s of node.sets) collectParamsPreOrder(s.value, out);
+      for (const w of node.where) collectParamsPreOrder(w, out);
+      if (node.returning) for (const p of node.returning) collectParamsPreOrder(p, out);
+      return;
+    case "delete":
+      for (const w of node.where) collectParamsPreOrder(w, out);
+      if (node.returning) for (const p of node.returning) collectParamsPreOrder(p, out);
+      return;
   }
 }
 
@@ -416,16 +436,20 @@ test("fuzz: 200 seeded random ASTs compile deterministically with exact param ro
 
   const tables = ["users", "orders", 'we"ird', "ta ble", "t$1", "select"] as const;
   const cols = ["id", "author_id", 'va"l', "col one", "c$2", "x"] as const;
-  const trustedTexts = ["now()", "- 1", "%%", "$$raw $1 $$", "'literal '' quote'"] as const;
-  const ops = ["=", "<>", "<", "<=", ">", ">=", "+", "||", "like"] as const;
+  const trustedTexts = ["now()", "- 1", "%%", "$$raw $1 $$", "'literal '' quote'", "b or c", "not b", "a and b or c"] as const;
+  const ops = ["=", "<>", "<", "<=", ">", ">=", "+", "||", "like", "and", "or"] as const;
   const calls = ["coalesce", "abs", "lower", "greatest"] as const;
   const params = [0, 1, -42, 3.5, "", "x", "$1", "$$d$$", 'quo"te', null, true, false, "9007199254740993"] as const;
   const aliases = ["a", "b", "p", 'al"ias', "t1"] as const;
+  const casts = [undefined, "timestamp", "timestamptz", "date", "json", "jsonb"] as const;
 
   const genValue = (depth: number): ValueNode => {
-    switch (int(0, depth <= 0 ? 1 : 5)) {
-      case 0:
-        return param(pick(params));
+    switch (int(0, depth <= 0 ? 1 : 6)) {
+      case 0: {
+        const cast = pick(casts);
+        const v = pick(params);
+        return cast === undefined ? param(v) : paramCast(v, cast);
+      }
       case 1:
         return qual(pick(tables), pick(cols));
       case 2:
@@ -434,6 +458,8 @@ test("fuzz: 200 seeded random ASTs compile deterministically with exact param ro
         return sqlAst`${trustSql(pick(trustedTexts), TRUSTED_SQL_ACK)}`;
       case 4:
         return expr("binary", pick(ops), [genValue(depth - 1), genValue(depth - 1)]);
+      case 5:
+        return expr("unary", "not", [genValue(depth - 1)]);
       default:
         return expr("call", pick(calls), Array.from({ length: int(0, 2) }, () => genValue(depth - 1)));
     }
@@ -466,8 +492,41 @@ test("fuzz: 200 seeded random ASTs compile deterministically with exact param ro
   };
 
   let determinismChecks = 0;
+  let mutations = 0;
+  const genAnyStatement = (): AnyStatementNode => {
+    switch (int(0, 3)) {
+      case 1: {
+        // insert: schema-ordered columns, per-row param/default/cast cells
+        const columnCount = int(1, 4);
+        const columnNames = Array.from({ length: columnCount }, () => pick(cols));
+        const rows = Array.from({ length: int(1, 3) }, () =>
+          Array.from({ length: columnCount }, () => {
+            if (rng() < 0.25) return defaultCell();
+            const cast = pick(casts);
+            const v = pick(params);
+            return cast === undefined ? param(v) : paramCast(v, cast);
+          }),
+        );
+        return insertStatement({ table: ident(pick(tables)), columns: columnNames, rows });
+      }
+      case 2:
+        return updateStatement({
+          table: qual("sche\"ma", pick(tables)),
+          sets: Array.from({ length: int(1, 3) }, () => ({ column: pick(cols), value: genValue(1) })),
+          where: Array.from({ length: int(1, 2) }, () => genValue(2)),
+        });
+      case 3:
+        return deleteStatement({
+          table: ident(pick(tables)),
+          where: Array.from({ length: int(1, 2) }, () => genValue(2)),
+        });
+      default:
+        return genStatement(2);
+    }
+  };
   for (let i = 0; i < 200; i++) {
-    const stmt = genStatement(2);
+    const stmt = genAnyStatement();
+    if (stmt.kind !== "select") mutations++;
     const first = compileStatement(stmt);
     const second = compileStatement(stmt);
     assert.equal(second.sql, first.sql, `case ${i}: recompile differs`);
@@ -481,7 +540,11 @@ test("fuzz: 200 seeded random ASTs compile deterministically with exact param ro
       expectedParams,
       `case ${i}: bound params must equal the pre-order param walk (one traversal)`,
     );
-    assert.ok(first.sql.startsWith("select ") || first.sql.startsWith("with "), `case ${i}: statement shape`);
+    assert.ok(
+      first.sql.startsWith("select ") || first.sql.startsWith("with ") ||
+        first.sql.startsWith("insert ") || first.sql.startsWith("update ") || first.sql.startsWith("delete "),
+      `case ${i}: statement shape`,
+    );
     assert.ok(!first.sql.includes("\0"), `case ${i}: NUL byte in output`);
     for (const v of first.params) {
       assert.ok(
@@ -491,6 +554,136 @@ test("fuzz: 200 seeded random ASTs compile deterministically with exact param ro
     }
   }
   assert.ok(determinismChecks === 200);
+  assert.ok(mutations >= 100, `mutation statements must be well represented (got ${mutations})`);
+});
+
+// ---------------------------------------------------------------------------
+// F04 rework (attempt 2) MAJOR-1: connective-grouping fuzz. The main fuzz
+// above proves determinism and param order; this one pins the GROUPING SPEC
+// — every fragment/trusted operand of a compiler-applied operator (binary,
+// unary, where-list join) is paren-delimited — against an independent
+// renderer derived from that spec, not from compile.ts. Attempt 1 shipped
+// the where-list parens only; and()/not() spliced fragment text bare and
+// silently returned wrong rows (reviewer live proof: 5 of 8 truth-table
+// rows where 3 were intended).
+// ---------------------------------------------------------------------------
+
+test("fuzz: connectives over fragments group exactly (spec renderer oracle)", () => {
+  const rng = mulberry32(0x20260923);
+  const pick = <T>(arr: readonly T[]): T => arr[Math.floor(rng() * arr.length)];
+  const int = (min: number, max: number): number => min + Math.floor(rng() * (max - min + 1));
+
+  const cols = ["a", "b", "c", 'we"ird'] as const;
+  const values = [0, 1, 2, true, false, "x", null] as const;
+  const connectiveTexts = ["b or c", "not b", "a and b or c", "b is null or c", "x"] as const;
+
+  type Tree =
+    | { k: "eq"; col: string; v: (typeof values)[number] }
+    | { k: "frag"; parts: Array<string | Tree> }
+    | { k: "and" | "or"; l: Tree; r: Tree }
+    | { k: "not"; a: Tree };
+
+  const genLeaf = (): Tree => (rng() < 0.3 ? { k: "frag", parts: [pick(connectiveTexts)] } : { k: "eq", col: pick(cols), v: pick(values) });
+  const genFrag = (): Tree => ({
+    k: "frag",
+    parts: Array.from({ length: int(1, 3) }, () => (rng() < 0.5 ? pick(connectiveTexts) : { k: "eq", col: pick(cols), v: pick(values) })),
+  });
+  const genTree = (depth: number): Tree => {
+    if (depth <= 0) return rng() < 0.35 ? genFrag() : genLeaf();
+    switch (int(0, 3)) {
+      case 0:
+        return { k: "and", l: genTree(depth - 1), r: genTree(depth - 1) };
+      case 1:
+        return { k: "or", l: genTree(depth - 1), r: genTree(depth - 1) };
+      case 2:
+        return { k: "not", a: genTree(depth - 1) };
+      default:
+        return rng() < 0.5 ? genFrag() : genLeaf();
+    }
+  };
+
+  const toNode = (t: Tree): ValueNode => {
+    switch (t.k) {
+      case "eq":
+        return expr("binary", "=", [qual("tt", t.col), param(t.v)]);
+      case "frag":
+        return fragment(...t.parts.map((p) => (typeof p === "string" ? p : toNode(p))));
+      case "not":
+        return expr("unary", "not", [toNode(t.a)]);
+      default:
+        return expr("binary", t.k, [toNode(t.l), toNode(t.r)]);
+    }
+  };
+
+  // Spec renderer (independent of compile.ts): where items join with "and"
+  // and every item is delimited when text-bearing; binary/unary operators
+  // delimit fragment operands; params number in emission order.
+  const expectedParams: unknown[] = [];
+  const render = (t: Tree): string => {
+    switch (t.k) {
+      case "eq":
+        expectedParams.push(t.v);
+        return `("tt"."${t.col.replace(/"/g, '""')}" = $${expectedParams.length})`;
+      case "frag":
+        return t.parts.map((p) => (typeof p === "string" ? p : render(p))).join("");
+      case "not":
+        return `(not ${operand(t.a)})`;
+      default:
+        return `(${operand(t.l)} ${t.k} ${operand(t.r)})`;
+    }
+  };
+  const operand = (t: Tree): string => (t.k === "frag" ? `(${render(t)})` : render(t));
+
+  let fragmentOperands = 0;
+  const countFrags = (t: Tree, under: boolean): void => {
+    if (t.k === "frag" && under) fragmentOperands++;
+    if (t.k === "and" || t.k === "or") {
+      countFrags(t.l, true);
+      countFrags(t.r, true);
+    }
+    if (t.k === "not") countFrags(t.a, true);
+    if (t.k === "frag") for (const p of t.parts) if (typeof p !== "string") countFrags(p, false);
+  };
+
+  for (let i = 0; i < 300; i++) {
+    const trees = Array.from({ length: int(1, 3) }, () => genTree(3));
+    for (const t of trees) countFrags(t, false);
+    const stmt = selectStatement({
+      projections: [projectionForTest()],
+      from: ident("tt"),
+      where: trees.map(toNode),
+    });
+    const compiled = compileStatement(stmt);
+    expectedParams.length = 0;
+    const expectedWhere = trees.map((t) => (t.k === "frag" ? `(${render(t)})` : render(t))).join(" and ");
+    const expectedSql = `select "x" from "tt" where ${expectedWhere}`;
+    assert.equal(compiled.sql, expectedSql, `case ${i}: grouping differs from spec`);
+    assert.deepEqual(compiled.params, expectedParams, `case ${i}: params differ from spec order`);
+  }
+  assert.ok(fragmentOperands >= 100, `fragments as connective operands must dominate the corpus (got ${fragmentOperands})`);
+
+  function projectionForTest() {
+    return { kind: "projection" as const, expr: ident("x") };
+  }
+});
+
+test("F04 rework MAJOR-2: astSelect projectionSpec is copied on fork, caller object untouched", () => {
+  // F01 review-2 carry-forward, AST builder side: a post-fork `evil` key
+  // reached BOTH sibling forks' compiled SQL when projectionSpec was shared
+  // by reference (review-1 verified empirically).
+  const projection: Record<string, unknown> = { email: users.email };
+  const base = astSelect(projection as never).from(users);
+  const b1 = base.where(qual("users", "id"));
+  const b2 = base.limit(3);
+  const before = b1.toSQL().sql;
+  projection.evil = sqlAst`${ident("users")}."id"`;
+  assert.equal(b1.toSQL().sql, before, "fork 1 must compile its construction-time snapshot");
+  assert.ok(!b2.toSQL().sql.includes("evil"), "fork 2 must not see post-fork caller mutation");
+  assert.ok(!base.offset(1).toSQL().sql.includes("evil"), "later forks of the base are isolated too");
+  // The caller's object is copied, never frozen by the builder.
+  assert.equal(Object.isFrozen(projection), false);
+  delete projection.evil;
+  assert.equal(b1.toSQL().sql, before);
 });
 
 // ---------------------------------------------------------------------------
@@ -669,19 +862,110 @@ test("F-R2: every builder-owned collection is frozen (joinSpecs, orders, cteSpec
 
 
 
+// Compile-time-only fixtures (F03 pattern: never-called arrows so the
+// intentional throws stay type-level and never abort module evaluation —
+// code after a throwing fixture would silently never register).
 // @ts-expect-error trustSql demands the acknowledgment argument
-void trustSql("select 1");
+void (() => trustSql("select 1"));
 // @ts-expect-error a string is not the acknowledgment type
-void trustSql("select 1", "i promise");
+void (() => trustSql("select 1", "i promise"));
 // @ts-expect-error TrustedSql cannot be assigned from a plain literal
 const notTrusted: TrustedSql = { text: "select 1" };
 void notTrusted;
 // @ts-expect-error plain strings are not condition nodes
-void astSelect().from(users).where("active = true");
+void (() => astSelect().from(users).where("active = true"));
 // @ts-expect-error legacy fragments are not value nodes (and are rejected at runtime)
-void astSelect().from(users).where(raw("id = $1"));
+void (() => astSelect().from(users).where(raw("id = $1")));
 
 // Positive controls — must keep compiling:
 const okTrusted = trustSql("now()", TRUSTED_SQL_ACK);
 const okQuery = astSelect({ email: users.email, now: sqlAst`${okTrusted}` }).from(users).where(sqlAst`${ref("users", users.id)} = ${1}`);
 void [okQuery.toSQL()];
+
+// ---------------------------------------------------------------------------
+// F04: mutation statements (insert/update/delete) compile through the same
+// one-traversal compiler; param casts render `$n::text::<cast>`; the `__q`
+// alias namespace is reserved; constructor validation fails closed.
+// ---------------------------------------------------------------------------
+
+test("F04: insert statements compile with default cells, casts and returning", () => {
+  const stmt = insertStatement({
+    table: ident("t"),
+    columns: ["a", "b", "c"],
+    rows: [
+      [param(1), paramCast("2026-01-02T03:04:05.678Z", "timestamptz"), defaultCell()],
+      [defaultCell(), param(null), defaultCell()],
+    ],
+    returning: [{ kind: "projection", expr: qual("t", "a"), alias: "a" }],
+  });
+  const q = compileStatement(stmt);
+  assert.equal(q.sql, 'insert into "t" ("a", "b", "c") values ($1, $2::text::timestamptz, default), (default, $3, default) returning "t"."a" as "a"');
+  assert.deepEqual(q.params, [1, "2026-01-02T03:04:05.678Z", null]);
+  const again = compileStatement(stmt);
+  assert.equal(again.sql, q.sql);
+  assert.deepEqual(again.params, q.params);
+});
+
+test("F04: insert default values form and its mutual exclusivity", () => {
+  const q = compileStatement(insertStatement({ table: ident("t"), defaultValues: true }));
+  assert.equal(q.sql, "insert into \"t\" default values");
+  assert.deepEqual(q.params, []);
+  assert.throws(() => insertStatement({ table: ident("t"), defaultValues: true, columns: ["a"] }), /defaultValues takes no columns/);
+  assert.throws(() => insertStatement({ table: ident("t"), columns: ["a"], rows: [] }), /need columns and rows/);
+  assert.throws(() => insertStatement({ table: ident("t"), columns: ["a", "b"], rows: [[param(1)]] }), /row has 1 cells but 2 columns/);
+  // Cells must be param/default nodes — arbitrary value nodes are rejected.
+  assert.throws(
+    () => insertStatement({ table: ident("t"), columns: ["a"], rows: [[qual("x", "y") as never]] }),
+    /cells must be param\(\) or defaultCell\(\) nodes/,
+  );
+});
+
+test("F04: update and delete compile with where and returning", () => {
+  const u = compileStatement(
+    updateStatement({
+      table: ident("users"),
+      sets: [
+        { column: "name", value: param("B") },
+        { column: "active", value: expr("unary", "not", [param(true)]) },
+      ],
+      where: [expr("binary", "=", [qual("users", "id"), param(7)])],
+      returning: [{ kind: "projection", expr: qual("users", "id") }],
+    }),
+  );
+  assert.equal(u.sql, 'update "users" set "name" = $1, "active" = (not $2) where ("users"."id" = $3) returning "users"."id"');
+  assert.deepEqual(u.params, ["B", true, 7]);
+
+  const d = compileStatement(
+    deleteStatement({
+      table: qual("sche\"ma", "logs"),
+      where: [fragment(qual("sche\"ma", "logs"), ".ts < ", param(10))],
+      returning: [{ kind: "projection", expr: qual("sche\"ma", "logs") }],
+    }),
+  );
+  assert.equal(d.sql, 'delete from "sche""ma"."logs" where ("sche""ma"."logs".ts < $1) returning "sche""ma"."logs"');
+  assert.deepEqual(d.params, [10]);
+});
+
+test("F04: mutation constructors refuse predicate-free statements", () => {
+  assert.throws(() => updateStatement({ table: ident("t"), sets: [{ column: "a", value: param(1) }], where: [] }), /where predicate is required/);
+  assert.throws(() => deleteStatement({ table: ident("t"), where: [] }), /where predicate is required/);
+  assert.throws(() => updateStatement({ table: ident("t"), sets: [], where: [param(1)] }), /at least one assignment/);
+});
+
+test("F04: param casts are validated at construction and at the compile choke point", () => {
+  assert.equal(compileStatement(insertStatement({ table: ident("t"), columns: ["a"], rows: [[paramCast("x", "jsonb")]] })).sql, 'insert into "t" ("a") values ($1::text::jsonb)');
+  assert.throws(() => paramCast(1, "timestamp; drop table x"), /cast must be a plain lowercase type name/);
+  assert.throws(() => paramCast(1, "Timestamp"), /cast must be a plain lowercase type name/);
+  // A forged cast on a hand-built node fails at compile (the choke point).
+  const forged = JSON.parse('{"kind":"param","value":1,"cast":"int; drop table x"}');
+  assert.throws(() => compileStatement(selectStatement({ from: ident("t"), where: [forged] })), /cast must be a plain lowercase type name/);
+});
+
+test("F04: the __q alias namespace is reserved for compiler-generated aliases", () => {
+  assert.throws(() => astSelect().from(users, "__q1"), /reserved for compiler-generated/);
+  assert.throws(() => astSelect().from(users).innerJoin(posts, "__q2", sqlAst`${ref("p", posts.authorId)} = ${ref("users", users.id)}`), /reserved/);
+  // Regular aliases keep working (column refs stay owner-qualified until Q01
+  // adds alias-aware references).
+  const q = astSelect({ email: users.email }).from(users, "u").toSQL();
+  assert.equal(q.sql, 'select "users"."email" from "users" as "u"');
+});

@@ -31,10 +31,19 @@ export interface QualifiedNode {
   readonly parts: readonly string[];
 }
 
-/** A bound value. Renders as the next $n placeholder, never as SQL text. */
+/** A bound value. Renders as the next $n placeholder, never as SQL text.
+ *  `cast` (set via paramCast) renders the placeholder as `$n::text::<cast>`
+ *  so the parameter stays a text value on both drivers — codecs use it for
+ *  temporal and json writes (F03's text-typed bind sites). */
 export interface ParamNode {
   readonly kind: "param";
   readonly value: unknown;
+  readonly cast?: string;
+}
+
+/** An insert cell requesting the column DEFAULT (SQL `default` keyword). */
+export interface DefaultNode {
+  readonly kind: "default";
 }
 
 /** Verbatim SQL text from an acknowledged `TrustedSql`. Never scanned. */
@@ -113,6 +122,49 @@ export interface StatementNode {
   readonly offset?: number;
 }
 
+/** Target of an insert/update/delete statement. */
+export type MutationTarget = IdentifierNode | QualifiedNode;
+
+/** One insert row: a cell per listed column, each a bound parameter
+ *  (optionally text-cast) or a DEFAULT request. */
+export type InsertCell = ParamNode | DefaultNode;
+
+export interface InsertStatementNode {
+  readonly kind: "insert";
+  readonly table: MutationTarget;
+  /** Physical column names, schema-ordered; empty with defaultValues. */
+  readonly columns: readonly string[];
+  readonly rows: readonly ReadonlyArray<InsertCell>[];
+  /** Single-row `insert into … default values` form. */
+  readonly defaultValues: boolean;
+  readonly returning?: readonly ProjectionNode[];
+}
+
+export interface UpdateAssignment {
+  readonly column: string;
+  readonly value: ValueNode;
+}
+
+export interface UpdateStatementNode {
+  readonly kind: "update";
+  readonly table: MutationTarget;
+  readonly sets: readonly UpdateAssignment[];
+  /** Required: an update without a predicate is a builder-level error. */
+  readonly where: readonly ValueNode[];
+  readonly returning?: readonly ProjectionNode[];
+}
+
+export interface DeleteStatementNode {
+  readonly kind: "delete";
+  readonly table: MutationTarget;
+  /** Required: a delete without a predicate is a builder-level error. */
+  readonly where: readonly ValueNode[];
+  readonly returning?: readonly ProjectionNode[];
+}
+
+/** Any compilable top-level statement. */
+export type AnyStatementNode = StatementNode | InsertStatementNode | UpdateStatementNode | DeleteStatementNode;
+
 /** Nodes valid in expression positions. */
 export type ValueNode =
   | IdentifierNode
@@ -124,7 +176,7 @@ export type ValueNode =
   | SubqueryNode;
 
 /** The full frozen union (README §3.1 node list). */
-export type SqlNode = ValueNode | ProjectionNode | JoinNode | CteNode | StatementNode;
+export type SqlNode = ValueNode | ProjectionNode | JoinNode | CteNode | AnyStatementNode | DefaultNode;
 
 // ---------------------------------------------------------------------------
 // Trusted SQL boundary
@@ -204,7 +256,17 @@ function validIdent(name: string, what: string): string {
 }
 
 const KEYWORD_OR_IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const OPERATORS = new Set(["=", "<>", "!=", "<", "<=", ">", ">=", "+", "-", "*", "/", "%", "||", "like", "ilike", "is", "is not", "in", "not in"]);
+const OPERATORS = new Set(["=", "<>", "!=", "<", "<=", ">", ">=", "+", "-", "*", "/", "%", "||", "and", "or", "like", "ilike", "is", "is not", "in", "not in"]);
+const CAST_TYPE_NAME = /^[a-z][a-z0-9_]*$/;
+
+/** Text-typed parameter cast (`$n::text::<cast>`). Only plain lowercase type
+ *  names are accepted; validated here and again at the compile choke point. */
+export function validParamCast(cast: string): string {
+  if (typeof cast !== "string" || !CAST_TYPE_NAME.test(cast)) {
+    throw new Error(`paramCast: cast must be a plain lowercase type name, got ${JSON.stringify(cast)}`);
+  }
+  return cast;
+}
 
 export function validOp(op: string, form: ExpressionNode["form"]): string {
   if (typeof op !== "string" || op.length === 0) throw new Error("expr: op must be a non-empty string");
@@ -265,6 +327,18 @@ export function param(value: unknown): ParamNode {
   return frozen<ParamNode>({ kind: "param", value });
 }
 
+/** A parameter rendered at a text-typed site: `$n::text::<cast>`. The codec
+ *  layer's canonical temporal/json binds (F03) ride parameters this way. */
+export function paramCast(value: unknown, cast: string): ParamNode {
+  validParamValue(value, "param");
+  return frozen<ParamNode>({ kind: "param", value, cast: validParamCast(cast) });
+}
+
+/** An insert cell requesting the column DEFAULT. */
+export function defaultCell(): DefaultNode {
+  return frozen<DefaultNode>({ kind: "default" });
+}
+
 export function expr(form: ExpressionNode["form"], op: string, args: readonly ValueNode[]): ExpressionNode {
   if (form === "binary" && args.length !== 2) throw new Error("expr: binary form takes exactly 2 args");
   if (form === "unary" && args.length !== 1) throw new Error("expr: unary form takes exactly 1 arg");
@@ -306,7 +380,7 @@ export function join(type: JoinType, target: JoinTarget, opts: { alias?: string;
     kind: "join",
     type: validJoinType(type, "join"),
     target,
-    alias: opts.alias === undefined ? undefined : validIdent(opts.alias, "join alias"),
+    alias: opts.alias === undefined ? undefined : validAlias(opts.alias, "join alias"),
     on: opts.on,
   });
 }
@@ -336,8 +410,21 @@ export function validJoinType(type: JoinType, what: string): JoinType {
   return type;
 }
 
+// The compiler names unnamed derived tables `__q1`, `__q2`, … (deterministic
+// alias counter). User-supplied aliases in that namespace are rejected so a
+// generated alias can never capture a user's name (F01 decision record §4).
+const RESERVED_ALIAS = /^__q\d+$/;
+
+export function validAlias(name: string, what: string): string {
+  validIdent(name, what);
+  if (RESERVED_ALIAS.test(name)) {
+    throw new Error(`${what}: alias "${name}" is reserved for compiler-generated derived tables`);
+  }
+  return name;
+}
+
 export function selectStatement(input: StatementInput): StatementNode {
-  if (input.fromAlias !== undefined) validIdent(input.fromAlias, "fromAlias");
+  if (input.fromAlias !== undefined) validAlias(input.fromAlias, "fromAlias");
   return frozen<StatementNode>({
     kind: "select",
     ctes: [...(input.ctes ?? [])],
@@ -349,6 +436,84 @@ export function selectStatement(input: StatementInput): StatementNode {
     orderBy: (input.orderBy ?? []).map((o) => frozen<OrderSpec>({ expr: o.expr, direction: o.direction })),
     limit: validLimit(input.limit, "limit"),
     offset: validLimit(input.offset, "offset"),
+  });
+}
+
+export interface InsertStatementInput {
+  readonly table: MutationTarget;
+  readonly columns?: readonly string[];
+  readonly rows?: readonly ReadonlyArray<InsertCell>[];
+  /** Single-row `default values` form; mutually exclusive with columns/rows. */
+  readonly defaultValues?: boolean;
+  readonly returning?: readonly ProjectionNode[];
+}
+
+export function insertStatement(input: InsertStatementInput): InsertStatementNode {
+  const columns = [...(input.columns ?? [])].map((c) => validIdent(c, "insert column"));
+  const rows = (input.rows ?? []).map((row) => {
+    if (!Array.isArray(row)) throw new Error("insert: rows must be arrays of cells");
+    if (row.length !== columns.length) {
+      throw new Error(`insert: row has ${row.length} cells but ${columns.length} columns are listed`);
+    }
+    for (const cell of row) {
+      if (typeof cell !== "object" || cell === null || (cell.kind !== "param" && cell.kind !== "default")) {
+        throw new Error("insert: cells must be param() or defaultCell() nodes");
+      }
+    }
+    return Object.freeze([...row]) as ReadonlyArray<InsertCell>;
+  });
+  if (input.defaultValues) {
+    if (columns.length > 0 || rows.length > 0) {
+      throw new Error("insert: defaultValues takes no columns/rows");
+    }
+  } else if (columns.length === 0 || rows.length === 0) {
+    throw new Error("insert: statements need columns and rows (or defaultValues for one default-only row)");
+  }
+  return frozen<InsertStatementNode>({
+    kind: "insert",
+    table: input.table,
+    columns: Object.freeze(columns),
+    rows: Object.freeze(rows),
+    defaultValues: input.defaultValues === true,
+    returning: input.returning === undefined ? undefined : [...input.returning],
+  });
+}
+
+export interface UpdateStatementInput {
+  readonly table: MutationTarget;
+  readonly sets: readonly UpdateAssignment[];
+  readonly where: readonly ValueNode[];
+  readonly returning?: readonly ProjectionNode[];
+}
+
+export function updateStatement(input: UpdateStatementInput): UpdateStatementNode {
+  if (input.sets.length === 0) throw new Error("update: at least one assignment is required");
+  const sets = input.sets.map((s) =>
+    frozen<UpdateAssignment>({ column: validIdent(s.column, "update column"), value: s.value }),
+  );
+  if (input.where.length === 0) throw new Error("update: a where predicate is required — builders must not emit all-row updates");
+  return frozen<UpdateStatementNode>({
+    kind: "update",
+    table: input.table,
+    sets: Object.freeze(sets),
+    where: [...input.where],
+    returning: input.returning === undefined ? undefined : [...input.returning],
+  });
+}
+
+export interface DeleteStatementInput {
+  readonly table: MutationTarget;
+  readonly where: readonly ValueNode[];
+  readonly returning?: readonly ProjectionNode[];
+}
+
+export function deleteStatement(input: DeleteStatementInput): DeleteStatementNode {
+  if (input.where.length === 0) throw new Error("delete: a where predicate is required — builders must not emit all-row deletes");
+  return frozen<DeleteStatementNode>({
+    kind: "delete",
+    table: input.table,
+    where: [...input.where],
+    returning: input.returning === undefined ? undefined : [...input.returning],
   });
 }
 
@@ -410,6 +575,42 @@ function isLegacyFragment(v: object): boolean {
   return Object.hasOwn(v, "sql") && typeof (v as { sql?: unknown }).sql === "string" && Object.hasOwn(v, "params");
 }
 
+// ---------------------------------------------------------------------------
+// Legacy {sql, params} fragments — one detection + one rejection, shared by
+// every builder slot, connective and template interpolation (F04 MINOR-1).
+// Their $n placeholders can only be reused by scanning raw SQL text, which
+// this package never does; every entry path fails closed with the same hint.
+// ---------------------------------------------------------------------------
+
+/** Structural shape of a legacy fragment (duck-typed: own `sql` string +
+ *  own `params` array). */
+export interface LegacySqlFragmentShape {
+  readonly sql: string;
+  readonly params: readonly unknown[];
+}
+
+/** True for duck-typed legacy `{sql, params}` fragments — direct-execution
+ *  shapes that must never splice into compiled statements. */
+export function isLegacySqlFragment(v: unknown): v is LegacySqlFragmentShape {
+  return (
+    typeof v === "object" &&
+    v !== null &&
+    Object.hasOwn(v, "sql") &&
+    typeof (v as { sql?: unknown }).sql === "string" &&
+    Object.hasOwn(v, "params") &&
+    Array.isArray((v as { params?: unknown }).params)
+  );
+}
+
+/** The one rejection message every slot uses for legacy fragments. `slot`
+ *  names the entry point ("where", "orderBy", "sqlAst", …). */
+export function legacyFragmentError(slot: string): Error {
+  return new Error(
+    `${slot}: legacy SqlFragment {sql, params} cannot be used here — its $n text would need raw-SQL renumbering, which this compiler never does. ` +
+      `Rebuild the expression with the sql template (values bind as parameters), bind a plain value, or execute it directly via raw() + driver.query`,
+  );
+}
+
 function isTrustedSql(v: object): v is TrustedSql {
   return typeof (v as { text?: unknown }).text === "string" && TRUSTED_MARKER in v;
 }
@@ -433,11 +634,7 @@ function templatePart(value: unknown): ValueNode {
       return qual(getTableName(owner), value.columnName);
     }
     if (isPgTable(value)) return ident(getTableName(value));
-    if (isLegacyFragment(value)) {
-      throw new Error(
-        "sqlAst: legacy SqlFragment {sql, params} cannot be interpolated structurally — its $n text would need raw-SQL renumbering. Rebuild it with sqlAst or acknowledge it via trustSql",
-      );
-    }
+    if (isLegacyFragment(value)) throw legacyFragmentError("sqlAst");
   }
   throw new Error(`sqlAst: cannot interpolate ${t === "object" ? "an object of this shape" : `a ${t}`} — values bind as parameters; fragments/nodes splice structurally`);
 }

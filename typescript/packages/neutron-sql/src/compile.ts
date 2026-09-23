@@ -11,15 +11,20 @@
 // Alias generation (`__q1`, `__q2`, …) is a compile-state counter advanced in
 // traversal order, so unnamed derived tables get stable, deterministic names.
 
-import { forgedTextKind, validJoinType, validLimit, validOp } from "./ast.js";
+import { forgedTextKind, validJoinType, validLimit, validOp, validParamCast } from "./ast.js";
 import type {
+  AnyStatementNode,
   CteNode,
+  DeleteStatementNode,
   ExpressionNode,
+  InsertStatementNode,
   JoinNode,
   OrderSpec,
   ProjectionNode,
   SqlNode,
   StatementNode,
+  UpdateStatementNode,
+  ValueNode,
 } from "./ast.js";
 
 export interface CompileState {
@@ -36,7 +41,9 @@ export interface CompiledQuery {
   readonly params: readonly unknown[];
 }
 
-function quoteIdent(name: string): string {
+/** The single identifier-quote implementation (every identifier-ish field in
+ *  every module funnels here or through the AST constructors). */
+export function quoteIdent(name: string): string {
   // Every identifier-ish field (names, aliases, qualified parts, CTE columns)
   // funnels through here, including structurally forged nodes — so the text is
   // validated here, not only at construction. A non-string (e.g. an object
@@ -44,6 +51,14 @@ function quoteIdent(name: string): string {
   if (typeof name !== "string") throw new Error(`compile: identifier text must be a string (got ${typeof name})`);
   if (name.includes("\0")) throw new Error("compile: identifier text must not contain NUL bytes");
   return '"' + name.replace(/"/g, '""') + '"';
+}
+
+/** The single string-literal-quote implementation (every module that needs a
+ *  quoted SQL text literal funnels here): single quotes doubled, per
+ *  standard_conforming_strings. */
+export function quoteStringLiteral(text: string): string {
+  if (typeof text !== "string") throw new Error(`compile: literal text must be a string (got ${typeof text})`);
+  return "'" + text.replace(/'/g, "''") + "'";
 }
 
 /** Compile one node into `state`. Exported for direct traversal tests; the
@@ -56,9 +71,14 @@ export function compile(node: SqlNode, state: CompileState): void {
     case "qualified":
       state.parts.push(node.parts.map(quoteIdent).join("."));
       return;
-    case "param":
+    case "param": {
       state.params.push(node.value);
-      state.parts.push(`$${state.params.length}`);
+      const n = state.params.length;
+      state.parts.push(node.cast === undefined ? `$${n}` : `$${n}::text::${validParamCast(node.cast)}`);
+      return;
+    }
+    case "default":
+      state.parts.push("default");
       return;
     case "trusted": {
       if (forgedTextKind(node) !== null) {
@@ -97,6 +117,15 @@ export function compile(node: SqlNode, state: CompileState): void {
     case "select":
       compileStatementNode(node, state);
       return;
+    case "insert":
+      compileInsert(node, state);
+      return;
+    case "update":
+      compileUpdate(node, state);
+      return;
+    case "delete":
+      compileDelete(node, state);
+      return;
     default: {
       // Unreachable for the typed union; a structurally forged node (or a
       // non-node) lands here and fails closed instead of compiling silently.
@@ -105,19 +134,31 @@ export function compile(node: SqlNode, state: CompileState): void {
   }
 }
 
+/** Render one operand of a binary/unary operator application. Fragments and
+ *  trusted segments carry arbitrary text whose top-level connectives (`or`,
+ *  `and`, `not`) would otherwise escape the operator being applied — the
+ *  exact rule compileWhere applies to where-list items. Call-form arguments
+ *  need no wrap: the call's own parentheses and commas delimit each argument. */
+function compileOperand(node: ValueNode, state: CompileState): void {
+  const wrap = node.kind === "fragment" || node.kind === "trusted";
+  if (wrap) state.parts.push("(");
+  compile(node, state);
+  if (wrap) state.parts.push(")");
+}
+
 function compileExpr(node: ExpressionNode, state: CompileState): void {
   validOp(node.op, node.form);
   if (node.form === "binary") {
     state.parts.push("(");
-    compile(node.args[0], state);
+    compileOperand(node.args[0], state);
     state.parts.push(` ${node.op} `);
-    compile(node.args[1], state);
+    compileOperand(node.args[1], state);
     state.parts.push(")");
     return;
   }
   if (node.form === "unary") {
     state.parts.push(`(${node.op} `);
-    compile(node.args[0], state);
+    compileOperand(node.args[0], state);
     state.parts.push(")");
     return;
   }
@@ -207,24 +248,86 @@ function compileStatementNode(stmt: StatementNode, state: CompileState): void {
     state.parts.push(" ");
     compile(j, state);
   }
-  if (stmt.where.length > 0) {
-    state.parts.push(" where ");
-    for (let i = 0; i < stmt.where.length; i++) {
-      if (i > 0) state.parts.push(" and ");
-      state.parts.push("(");
-      compile(stmt.where[i], state);
-      state.parts.push(")");
-    }
-  }
+  compileWhere(stmt.where, state);
   if (stmt.orderBy.length > 0) compileOrder(stmt.orderBy, state);
   if (stmt.limit !== undefined) state.parts.push(` limit ${validLimit(stmt.limit, "compile limit")}`);
   if (stmt.offset !== undefined) state.parts.push(` offset ${validLimit(stmt.offset, "compile offset")}`);
 }
 
+function compileWhere(where: readonly ValueNode[], state: CompileState): void {
+  if (where.length === 0) return;
+  state.parts.push(" where ");
+  for (let i = 0; i < where.length; i++) {
+    if (i > 0) state.parts.push(" and ");
+    // Fragments and trusted segments carry arbitrary text — always delimit
+    // them so joining with `and` cannot change their meaning. Expr nodes
+    // self-parenthesize and atoms bind tighter than `and`.
+    if (where[i].kind === "fragment" || where[i].kind === "trusted") state.parts.push("(");
+    compile(where[i], state);
+    if (where[i].kind === "fragment" || where[i].kind === "trusted") state.parts.push(")");
+  }
+}
+
+function compileReturning(returning: readonly ProjectionNode[] | undefined, state: CompileState): void {
+  if (returning === undefined || returning.length === 0) return;
+  state.parts.push(" returning ");
+  for (let i = 0; i < returning.length; i++) {
+    if (i > 0) state.parts.push(", ");
+    compile(returning[i], state);
+  }
+}
+
+function compileInsert(node: InsertStatementNode, state: CompileState): void {
+  state.parts.push("insert into ");
+  compile(node.table, state);
+  if (node.defaultValues) {
+    state.parts.push(" default values");
+  } else {
+    state.parts.push(" (");
+    for (let i = 0; i < node.columns.length; i++) {
+      if (i > 0) state.parts.push(", ");
+      state.parts.push(quoteIdent(node.columns[i]));
+    }
+    state.parts.push(") values ");
+    for (let r = 0; r < node.rows.length; r++) {
+      if (r > 0) state.parts.push(", ");
+      state.parts.push("(");
+      const row = node.rows[r];
+      for (let i = 0; i < row.length; i++) {
+        if (i > 0) state.parts.push(", ");
+        compile(row[i], state);
+      }
+      state.parts.push(")");
+    }
+  }
+  compileReturning(node.returning, state);
+}
+
+function compileUpdate(node: UpdateStatementNode, state: CompileState): void {
+  state.parts.push("update ");
+  compile(node.table, state);
+  state.parts.push(" set ");
+  for (let i = 0; i < node.sets.length; i++) {
+    if (i > 0) state.parts.push(", ");
+    state.parts.push(quoteIdent(node.sets[i].column));
+    state.parts.push(" = ");
+    compile(node.sets[i].value, state);
+  }
+  compileWhere(node.where, state);
+  compileReturning(node.returning, state);
+}
+
+function compileDelete(node: DeleteStatementNode, state: CompileState): void {
+  state.parts.push("delete from ");
+  compile(node.table, state);
+  compileWhere(node.where, state);
+  compileReturning(node.returning, state);
+}
+
 /** Public entry: compile a statement with fresh state. Pure — same AST gives
  *  a byte-identical SQL string and params array on every call. */
-export function compileStatement(stmt: StatementNode): CompiledQuery {
+export function compileStatement(stmt: AnyStatementNode): CompiledQuery {
   const state: CompileState = { parts: [], params: [], aliasCounter: 0 };
-  compileStatementNode(stmt, state);
+  compile(stmt, state);
   return { sql: state.parts.join(""), params: state.params };
 }

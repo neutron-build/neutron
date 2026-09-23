@@ -47,6 +47,12 @@
       "document": "valid/unicode-sort.json",
       "canonical": "valid/unicode-sort.canonical.json",
       "sha256": "45643b285e7ad6b21525a03017ee8a41dfd1a4f92c3793943a7f079d9d07ce2b"
+    },
+    {
+      "name": "exported-v2",
+      "document": "valid/exported-v2.json",
+      "canonical": "valid/exported-v2.canonical.json",
+      "sha256": "3d89b22962431511b7e6a3e5249e00e40d9cc4989735f284b045ab73fbc3964c"
     }
   ],
   "invalid": [

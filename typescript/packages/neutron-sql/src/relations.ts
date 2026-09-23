@@ -10,12 +10,35 @@
 // offset apply to parent rows before child expansion (the subqueries run per
 // output row). Depth is one level; nested `with` is rejected explicitly.
 
-import { type Condition, type OrderExpression, qident, qualify } from "./expr.js";
+import { type Condition, type OrderExpression } from "./expr.js";
 import { getTableColumns, getTableName } from "./schema.js";
 import type { AnyColumnBuilder, AnyPgTable, Relation, RelationOne, TableRelations } from "./schema.js";
 import type { ExecContext } from "./builder.js";
-import { run } from "./builder.js";
-import { decodeJsonLeaf, decodeNativeValue, decodeTextWire, wireReadExpr, type ColumnContext } from "./codecs.js";
+import { run, whereItems } from "./builder.js";
+import {
+  applyProjectionDecoders,
+  decodeJsonLeaf,
+  projectionDecoder,
+  wireReadNode,
+  type ProjectionDecoder,
+  type StatementCapability,
+} from "./codecs.js";
+import {
+  expr as exprNode,
+  fragment,
+  ident,
+  isLegacySqlFragment,
+  legacyFragmentError,
+  projection as projectionNode,
+  qual,
+  selectStatement,
+  subquery as subqueryNode,
+  type OrderSpec,
+  type ProjectionNode,
+  type StatementNode,
+  type ValueNode,
+} from "./ast.js";
+import { compileStatement, quoteStringLiteral } from "./compile.js";
 
 export interface RQBArgs {
   where?: Condition;
@@ -129,18 +152,20 @@ function pkColumnsOf(table: AnyPgTable): AnyColumnBuilder[] {
  *  (session-timezone independent); other temporals and bytea leaves keep
  *  to_jsonb's exact string forms (microseconds, \x hex). Correlation
  *  predicates and order keys stay raw column references. */
-function jsonLeaf(alias: string, column: AnyColumnBuilder): string {
-  const ref = qualify(alias, column.columnName);
-  if (column.dataType === "bigint" || column.dataType === "numeric") return `${ref}::text`;
-  if (column.dataType === "timestamptz") return `to_jsonb(${ref} at time zone 'UTC')`;
+function jsonLeaf(alias: string, column: AnyColumnBuilder): ValueNode {
+  const ref = qual(alias, column.columnName);
+  if (column.dataType === "bigint" || column.dataType === "numeric") return fragment(ref, "::text");
+  if (column.dataType === "timestamptz") return fragment("to_jsonb(", ref, " at time zone 'UTC')");
   return ref;
 }
 
-function jsonObjectFor(table: AnyPgTable, alias: string): string {
-  const parts = Object.entries(getTableColumns(table) as Record<string, AnyColumnBuilder>).map(
-    ([propertyKey, column]) => `'${propertyKey.replace(/'/g, "''")}', ${jsonLeaf(alias, column)}`,
-  );
-  return `jsonb_build_object(${parts.join(", ")})`;
+function jsonObjectFor(table: AnyPgTable, alias: string): ValueNode {
+  const args: ValueNode[] = [];
+  for (const [propertyKey, column] of Object.entries(getTableColumns(table) as Record<string, AnyColumnBuilder>)) {
+    args.push(fragment(quoteStringLiteral(propertyKey)));
+    args.push(jsonLeaf(alias, column));
+  }
+  return exprNode("call", "jsonb_build_object", args);
 }
 
 /** Normalize driver output: some pgwire servers hand json/jsonb back as strings. */
@@ -219,65 +244,108 @@ export function buildRelationalSQL(
   table: AnyPgTable,
   relations: Record<string, Relation>,
   args: RQBArgs,
-): { sql: string; params: unknown[] } {
+): { sql: string; params: unknown[]; decoders: readonly ProjectionDecoder[]; capabilities: readonly StatementCapability[] } {
   validateArgs(table, relations, args);
+  if (args.where !== undefined && isLegacySqlFragment(args.where)) throw legacyFragmentError("where");
+  for (const o of args.orderBy ?? []) {
+    if (isLegacySqlFragment(o)) throw legacyFragmentError("orderBy");
+    if (isLegacySqlFragment((o as OrderSpec).expr)) throw legacyFragmentError("orderBy");
+  }
 
-  const params: unknown[] = [];
   const tableName = getTableName(table);
   const requested = requestedEntries(table, args);
 
-  const extras: string[] = [];
+  const projections: ProjectionNode[] = [];
+  const decoders: ProjectionDecoder[] = [];
+  let usesJsonb = false;
+
+  // Top-level rows are keyed by property keys (alias when the names differ).
+  // Lossy-native columns (temporals) project their lossless text wire form,
+  // exactly like the flat select path.
+  for (const { propertyKey, column } of requested) {
+    const ref = qual(tableName, column.columnName);
+    const wire = wireReadNode(column.dataType, ref);
+    if (wire !== null) {
+      projections.push(projectionNode(wire, propertyKey));
+      usesJsonb = true;
+    } else {
+      projections.push(projectionNode(ref, propertyKey === column.columnName ? undefined : propertyKey));
+    }
+    const decoder = projectionDecoder(tableName, column, propertyKey);
+    if (decoder) decoders.push(decoder);
+  }
+
   for (const key of Object.keys(args.with ?? {})) {
     const rel = relations[key];
     const target = rel.targetTable;
     const alias = relAlias(key, tableName);
 
+    let inner: StatementNode;
     if (rel.kind === "many") {
       const source = rel.source!;
       // source.fields live on target; source.references live on this table
-      const correlation = source.fields
-        .map((f, i) => `${qualify(alias, f.columnName)} = ${qualify(tableName, source.references[i].columnName)}`)
-        .join(" and ");
-      const orderBy = pkColumnsOf(target)
-        .map((c) => qualify(alias, c.columnName))
-        .join(", ");
-      extras.push(
-        `(select coalesce(jsonb_agg(${jsonObjectFor(target, alias)} order by ${orderBy}), '[]'::jsonb) ` +
-          `from ${qident(getTableName(target))} as ${qident(alias)} where ${correlation}) as ${qident(key)}`,
+      const correlation = andChain(
+        source.fields.map((f, i) => [qual(alias, f.columnName), qual(tableName, source.references[i].columnName)] as const),
       );
+      const orderKeys = pkColumnsOf(target).map((c) => qual(alias, c.columnName));
+      const agg = aggWithOrder(jsonObjectFor(target, alias), orderKeys);
+      inner = selectStatement({
+        projections: [projectionNode(agg)],
+        from: ident(getTableName(target)),
+        fromAlias: alias,
+        where: [correlation],
+      });
     } else {
-      const correlation = rel.fields
-        .map((f, i) => `${qualify(alias, rel.references[i].columnName)} = ${qualify(tableName, f.columnName)}`)
-        .join(" and ");
-      extras.push(
-        `(select ${jsonObjectFor(target, alias)} from ${qident(getTableName(target))} as ${qident(alias)} where ${correlation}) as ${qident(key)}`,
+      const correlation = andChain(
+        rel.fields.map((f, i) => [qual(alias, rel.references[i].columnName), qual(tableName, f.columnName)] as const),
       );
+      inner = selectStatement({
+        projections: [projectionNode(jsonObjectFor(target, alias))],
+        from: ident(getTableName(target)),
+        fromAlias: alias,
+        where: [correlation],
+      });
     }
+    projections.push(projectionNode(subqueryNode(inner), key));
+    usesJsonb = true;
   }
 
-  // Top-level rows are keyed by property keys (alias when the names differ).
-  // Lossy-native columns (temporals) project their lossless text wire form,
-  // exactly like the flat select path.
-  const selectParts = requested.map(({ propertyKey, column }) => {
-    const ref = qualify(tableName, column.columnName);
-    const wire = wireReadExpr(column.dataType, ref);
-    if (wire) return `${wire} as ${qident(propertyKey)}`;
-    return propertyKey === column.columnName ? ref : `${ref} as ${qident(propertyKey)}`;
+  const stmt = selectStatement({
+    projections,
+    from: ident(tableName),
+    where: args.where ? whereItems([args.where]) : [],
+    orderBy: (args.orderBy ?? []).map((o) =>
+      typeof (o as OrderSpec).direction === "string" ? (o as OrderSpec) : { expr: o as ValueNode, direction: "asc" as const },
+    ),
+    limit: args.limit,
+    offset: args.offset,
   });
-  if (extras.length > 0) selectParts.push(...extras);
+  const compiled = compileStatement(stmt);
+  const capabilities: StatementCapability[] = usesJsonb ? ["jsonb-functions"] : [];
+  return { sql: compiled.sql, params: compiled.params as unknown[], decoders, capabilities };
+}
 
-  let sqlText = `select ${selectParts.join(", ")} from ${qident(tableName)}`;
+/** Fold correlation pairs with `=` and `and` (raw column comparisons — the
+ *  JSON-only casts never apply to predicates). */
+function andChain(pairs: ReadonlyArray<readonly [ValueNode, ValueNode]>): ValueNode {
+  const eqs = pairs.map(([a, b]) => exprNode("binary", "=", [a, b]));
+  return eqs.reduce((acc, c) => exprNode("binary", "and", [acc, c]));
+}
 
-  if (args.where) {
-    sqlText += ` where ${inlineInto(args.where, params)}`;
+/** `coalesce(jsonb_agg(obj order by keys), '[]'::jsonb)` as one fragment —
+ *  aggregate ORDER BY lives inside the call, so it interleaves trusted text
+ *  with the object expression and the raw order keys. */
+function aggWithOrder(obj: ValueNode, orderKeys: readonly ValueNode[]): ValueNode {
+  const parts: Array<string | ValueNode> = ["coalesce(jsonb_agg(", obj];
+  if (orderKeys.length > 0) {
+    parts.push(" order by ");
+    orderKeys.forEach((k, i) => {
+      if (i > 0) parts.push(", ");
+      parts.push(k);
+    });
   }
-  if (args.orderBy && args.orderBy.length > 0) {
-    sqlText += ` order by ${args.orderBy.map((o) => o.sql).join(", ")}`;
-  }
-  if (args.limit !== undefined) sqlText += ` limit ${args.limit}`;
-  if (args.offset !== undefined) sqlText += ` offset ${args.offset}`;
-
-  return { sql: sqlText, params };
+  parts.push("), '[]'::jsonb)");
+  return fragment(...parts);
 }
 
 /** args.columns are property keys; map them to physical columns through
@@ -296,37 +364,17 @@ function requestedEntries(table: AnyPgTable, args: RQBArgs): Array<{ propertyKey
   return allEntries;
 }
 
-function inlineInto(fragment: { sql: string; params: readonly unknown[] }, params: unknown[]): string {
-  let n = 0;
-  return fragment.sql.replace(/\$(\d+)/g, () => {
-    params.push(fragment.params[n]);
-    n++;
-    return `$${params.length}`;
-  });
-}
-
 export async function findMany(
   ctx: ExecContext,
   table: AnyPgTable,
   relations: Record<string, Relation>,
   args: RQBArgs,
 ): Promise<Array<Record<string, unknown>>> {
-  const { sql: sqlText, params } = buildRelationalSQL(table, relations, args);
-  const rows = (await run(ctx, sqlText, params, "query")) as Array<Record<string, unknown>>;
-  const tableName = getTableName(table);
-  // Parent columns decode exactly like the flat select path.
-  for (const { propertyKey, column } of requestedEntries(table, args)) {
-    const wire = wireReadExpr(column.dataType, "x");
-    for (const row of rows) {
-      const raw = row[propertyKey];
-      if (raw === null || raw === undefined) continue;
-      const cctx: ColumnContext = { propertyKey, columnName: column.columnName, tableName };
-      row[propertyKey] =
-        wire !== null
-          ? decodeTextWire(column, cctx, raw)
-          : decodeNativeValue(column, cctx, raw);
-    }
-  }
+  const built = buildRelationalSQL(table, relations, args);
+  const rows = (await run(ctx, built.sql, built.params, "query")) as Array<Record<string, unknown>>;
+  // Parent columns decode through the compiled statement's decode plan,
+  // exactly like the flat select path.
+  applyProjectionDecoders(rows, built.decoders);
   // Children decode per target-table column: the JSON projection renders
   // int8/numeric ::text, timestamptz as its UTC wall clock and bytea as \x
   // hex text, so precision survives JSON.parse and decodes through the same

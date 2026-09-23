@@ -3,10 +3,17 @@
 // ---------------------------------------------------------------------------
 // Every builder is a PromiseLike: awaiting executes. `.toSQL()` shows the
 // exact statement without running it. One visible SQL statement per call.
+//
+// Since F04 all CRUD paths build AST statements and compile them with the
+// one-traversal compiler (compile.ts) — the old regex-renumbering assembly
+// (inline/mergeFragments) is gone. Builders are IMMUTABLE: fluent calls
+// return new frozen instances (copy-on-write), so reuse cannot leak filters
+// between requests. Compiled statements carry their projection decode plan
+// and engine capability requirements alongside sql/params.
 
 import type { Driver } from "./drivers.js";
 import type { Logger } from "./logger.js";
-import { type Condition, type OrderExpression, type SqlFragment, qident, qualify } from "./expr.js";
+import { type Condition, type OrderExpression } from "./expr.js";
 import type {
   AnyColumnBuilder,
   AnyPgTable,
@@ -17,32 +24,53 @@ import type {
 } from "./schema.js";
 import { getTableColumns, getTableName, isPgTable } from "./schema.js";
 import {
-  decodeNativeValue,
-  decodeTextWire,
+  applyProjectionDecoders,
   encodeWriteValue,
-  needsFlatDecode,
-  wireReadExpr,
+  projectionDecoder,
+  wireReadNode,
   type ColumnContext,
   type EncodedValue,
+  type ProjectionDecoder,
+  type StatementCapability,
 } from "./codecs.js";
 import {
   cte,
+  defaultCell,
   ident,
+  insertStatement,
+  isLegacySqlFragment,
+  isValueNode,
   join as joinNode,
+  legacyFragmentError,
+  param as paramNode,
+  paramCast,
   projection as projectionNode,
   qual,
   selectStatement,
   subquery as subqueryNode,
+  updateStatement,
+  validAlias,
+  deleteStatement,
+  type AnyStatementNode,
   type CteNode,
   type IdentifierNode,
+  type InsertCell,
   type JoinType,
   type OrderSpec,
+  type ParamNode,
   type ProjectionNode,
   type StatementNode,
   type SubqueryNode,
   type ValueNode,
 } from "./ast.js";
 import { compileStatement, type CompiledQuery } from "./compile.js";
+
+/** Fail-closed check for one builder-slot value: legacy {sql, params}
+ *  fragments are direct-execution shapes and never splice into compiled
+ *  statements (shared rejection across every slot). */
+function rejectLegacyFragment(value: unknown, slot: string): void {
+  if (isLegacySqlFragment(value)) throw legacyFragmentError(slot);
+}
 
 export interface ExecContext {
   driver: Driver;
@@ -61,14 +89,12 @@ export async function run(ctx: ExecContext, sqlText: string, params: unknown[], 
   }
 }
 
-/** Splice a fragment's params into the shared list, renumbering its $N refs. */
-function inline(fragment: SqlFragment, params: unknown[]): string {
-  let n = 0;
-  return fragment.sql.replace(/\$(\d+)/g, () => {
-    params.push(fragment.params[n]);
-    n++;
-    return `$${params.length}`;
-  });
+/** A compiled CRUD statement: sql + params from the one-traversal compiler,
+ *  plus the projection decode plan and the engine capabilities the statement
+ *  requires (empty when plain SQL suffices). */
+export interface CompiledStatement extends CompiledQuery {
+  readonly decoders: readonly ProjectionDecoder[];
+  readonly capabilities: readonly StatementCapability[];
 }
 
 // ---------------------------------------------------------------------------
@@ -84,91 +110,69 @@ function columnEntries(table: AnyPgTable): ColumnEntries {
   }));
 }
 
-/** Physical column reference labeled with its property key so driver rows come
- *  back keyed by declared JS property names. Identical names skip the alias.
- *  Columns whose driver-native value is lossy (temporals) project a lossless
- *  text expression instead — the expression is always labeled. */
-function aliasedColumn(table: string, column: AnyColumnBuilder, propertyKey: string): string {
-  const ref = qualify(table, column.columnName);
-  const wire = wireReadExpr(column.dataType, ref);
-  if (wire) return `${wire} as ${qident(propertyKey)}`;
-  return propertyKey === column.columnName ? ref : `${ref} as ${qident(propertyKey)}`;
+interface SelectPlan {
+  readonly nodes: ProjectionNode[];
+  readonly decoders: ProjectionDecoder[];
+  readonly capabilities: StatementCapability[];
 }
 
-function returningList(table: AnyPgTable): string {
-  return columnEntries(table)
-    .map(({ propertyKey, column }) => {
-      const wire = wireReadExpr(column.dataType, qident(column.columnName));
-      if (wire) return `${wire} as ${qident(propertyKey)}`;
-      return propertyKey === column.columnName
-        ? qident(column.columnName)
-        : `${qident(column.columnName)} as ${qident(propertyKey)}`;
-    })
-    .join(", ");
-}
-
-// ---------------------------------------------------------------------------
-// Row decode plans (flat select / RETURNING paths)
-// ---------------------------------------------------------------------------
-
-interface RowDecode {
-  key: string;
-  column: AnyColumnBuilder;
-  wire: "text" | "native";
-}
-
-function rowDecodePlan<E extends { key: string; column: AnyColumnBuilder | null }>(entries: E[]): RowDecode[] {
-  const plan: RowDecode[] = [];
-  for (const { key, column } of entries) {
-    if (!column) continue;
-    if (wireReadExpr(column.dataType, "x") !== null) {
-      plan.push({ key, column, wire: "text" });
-    } else if (needsFlatDecode(column)) {
-      plan.push({ key, column, wire: "native" });
+/** Projection list for a set of `{ propertyKey, column }` entries: physical
+ *  qualified references labeled with property keys, lossless text-acquisition
+ *  fragments for lossy-native types (always labeled), plus the matching
+ *  decode plan. */
+function selectPlanFor(tableName: string, entries: ColumnEntries): SelectPlan {
+  const nodes: ProjectionNode[] = [];
+  const decoders: ProjectionDecoder[] = [];
+  let usesJsonb = false;
+  for (const { propertyKey: key, column } of entries) {
+    const ref = qual(tableName, column.columnName);
+    const wire = wireReadNode(column.dataType, ref);
+    if (wire !== null) {
+      nodes.push(projectionNode(wire, key));
+      usesJsonb = true;
+    } else {
+      nodes.push(projectionNode(ref, key === column.columnName ? undefined : key));
     }
+    const decoder = projectionDecoder(tableName, column, key);
+    if (decoder) decoders.push(decoder);
   }
-  return plan;
+  return { nodes, decoders, capabilities: usesJsonb ? ["jsonb-functions"] : [] };
 }
 
-function columnContext(table: string, column: AnyColumnBuilder, propertyKey: string): ColumnContext {
-  return { propertyKey, columnName: column.columnName, tableName: table };
-}
-
-function applyRowDecode(rows: Array<Record<string, unknown>>, plan: RowDecode[], table: string): void {
-  if (plan.length === 0) return;
-  for (const row of rows) {
-    for (const entry of plan) {
-      if (row[entry.key] === null || row[entry.key] === undefined) continue;
-      const ctx = columnContext(table, entry.column, entry.key);
-      row[entry.key] =
-        entry.wire === "text"
-          ? decodeTextWire(entry.column, ctx, row[entry.key])
-          : decodeNativeValue(entry.column, ctx, row[entry.key]);
+/** Flatten top-level `and` expressions into separate where items — pure
+ *  associativity, so `.where(and(a, b))` and `.where(a).where(b)` compile to
+ *  the same uniformly parenthesized predicate list. */
+export function whereItems(items: readonly ValueNode[]): ValueNode[] {
+  const out: ValueNode[] = [];
+  const visit = (node: ValueNode): void => {
+    if (node.kind === "expr" && node.form === "binary" && node.op.toLowerCase() === "and") {
+      for (const arg of node.args) visit(arg);
+      return;
     }
-  }
+    out.push(node);
+  };
+  for (const item of items) visit(item);
+  return out;
+}
+
+function orderSpecs(order: readonly OrderExpression[]): OrderSpec[] {
+  return order.map((o) => (typeof (o as OrderSpec).direction === "string" ? (o as OrderSpec) : { expr: o as ValueNode, direction: "asc" as const }));
 }
 
 // ---------------------------------------------------------------------------
 // Mutation value encoding (before execution, with column context)
 // ---------------------------------------------------------------------------
 
-/** Duck-typed SqlFragment: own `sql` string + own `params` array. */
-function isFragmentLike(value: object): value is SqlFragment {
-  const v = value as { sql?: unknown; params?: unknown };
-  return Object.hasOwn(value, "sql") && typeof v.sql === "string" && Object.hasOwn(value, "params") && Array.isArray(v.params);
-}
-
 function encodeForColumn(table: string, column: AnyColumnBuilder, propertyKey: string, value: unknown): EncodedValue {
   return encodeWriteValue(column, columnContext(table, column, propertyKey), value);
 }
 
-/** Bind site for an encoded value: temporal and json/jsonb values bind as
- *  canonical text at explicitly text-typed sites so both drivers pass the
- *  string through untouched (postgres.js otherwise re-encodes server-typed
- *  date/json params through Date/JSON.stringify, losing microseconds and
- *  double-encoding strings). */
-function bindSite(n: number, encoded: EncodedValue): string {
-  return encoded.cast === undefined ? `$${n}` : `$${n}::text::${encoded.cast}`;
+function columnContext(table: string, column: AnyColumnBuilder, propertyKey: string): ColumnContext {
+  return { propertyKey, columnName: column.columnName, tableName: table };
+}
+
+function cellNode(encoded: EncodedValue): ParamNode {
+  return encoded.cast === undefined ? paramNode(encoded.bind) : paramCast(encoded.bind, encoded.cast);
 }
 
 function effectiveNotNull(column: AnyColumnBuilder): boolean {
@@ -185,42 +189,66 @@ function requiredInsertKeys(table: AnyPgTable): Array<{ propertyKey: string; col
 // Select
 // ---------------------------------------------------------------------------
 
-export type Projection = Record<string, AnyColumnBuilder | SqlFragment>;
+export type Projection = Record<string, AnyColumnBuilder | ValueNode>;
 
 export type ProjectionResult<P extends Projection> = {
   [K in keyof P]: P[K] extends AnyColumnBuilder ? SelectTypeOf<P[K]> : unknown;
 };
 
 export class SelectBuilder<T> implements PromiseLike<T[]> {
-  private conditions: Condition[] = [];
-  private order: OrderExpression[] = [];
-  private limitCount?: number;
-  private offsetCount?: number;
+  private readonly ctx: ExecContext;
+  private readonly table: AnyPgTable;
+  private readonly projection: Projection | null;
 
   constructor(
-    private readonly ctx: ExecContext,
-    private readonly table: AnyPgTable,
-    private readonly projection: Projection | null,
-  ) {}
-
-  where(condition: Condition): this {
-    this.conditions.push(condition);
-    return this;
+    ctx: ExecContext,
+    table: AnyPgTable,
+    projection: Projection | null,
+    private readonly conditions: readonly Condition[] = [],
+    private readonly order: readonly OrderExpression[] = [],
+    private readonly limitCount: number | undefined = undefined,
+    private readonly offsetCount: number | undefined = undefined,
+  ) {
+    // The projection is copied and frozen at construction (shallow): the
+    // caller's object stays theirs, and every fork compiles the snapshot it
+    // was built from — post-fork caller mutation cannot reach any sibling
+    // (F01 review-2 carry-forward). Legacy fragments never enter the copy.
+    this.ctx = ctx;
+    this.table = table;
+    if (projection === null) {
+      this.projection = null;
+    } else {
+      const copy: Projection = {};
+      for (const [key, value] of Object.entries(projection)) {
+        rejectLegacyFragment(value, "select projection");
+        copy[key] = value;
+      }
+      this.projection = Object.freeze(copy);
+    }
+    Object.freeze(this.conditions);
+    Object.freeze(this.order);
+    Object.freeze(this);
   }
 
-  orderBy(...exprs: OrderExpression[]): this {
-    this.order.push(...exprs);
-    return this;
+  where(condition: Condition): SelectBuilder<T> {
+    rejectLegacyFragment(condition, "where");
+    return new SelectBuilder(this.ctx, this.table, this.projection, [...this.conditions, condition], this.order, this.limitCount, this.offsetCount);
   }
 
-  limit(n: number): this {
-    this.limitCount = n;
-    return this;
+  orderBy(...exprs: OrderExpression[]): SelectBuilder<T> {
+    for (const e of exprs) {
+      rejectLegacyFragment(e, "orderBy");
+      rejectLegacyFragment((e as OrderSpec).expr, "orderBy");
+    }
+    return new SelectBuilder(this.ctx, this.table, this.projection, this.conditions, [...this.order, ...exprs], this.limitCount, this.offsetCount);
   }
 
-  offset(n: number): this {
-    this.offsetCount = n;
-    return this;
+  limit(n: number): SelectBuilder<T> {
+    return new SelectBuilder(this.ctx, this.table, this.projection, this.conditions, this.order, n, this.offsetCount);
+  }
+
+  offset(n: number): SelectBuilder<T> {
+    return new SelectBuilder(this.ctx, this.table, this.projection, this.conditions, this.order, this.limitCount, n);
   }
 
   private projectionEntries(): Array<{ key: string; column: AnyColumnBuilder | null }> {
@@ -229,54 +257,67 @@ export class SelectBuilder<T> implements PromiseLike<T[]> {
     }
     return Object.entries(this.projection).map(([key, value]) => ({
       key,
-      column: "columnName" in value ? (value as AnyColumnBuilder) : null,
+      column: isValueNode(value) ? null : value,
     }));
   }
 
-  toSQL(): { sql: string; params: unknown[] } {
-    const params: unknown[] = [];
+  /** The statement + decode plan; pure — same builder state compiles to
+   *  byte-identical SQL. */
+  toCompiled(): CompiledStatement {
+    const tableName = getTableName(this.table);
+    const nodes: ProjectionNode[] = [];
+    const decoders: ProjectionDecoder[] = [];
+    let usesJsonb = false;
 
-    let selectList: string;
     if (this.projection) {
-      const parts: string[] = [];
       for (const [key, value] of Object.entries(this.projection)) {
-        if ("columnName" in value) {
-          // Output label = the projection key; physical ref from metadata.
-          // Lossy-native columns project a lossless text expression (always
-          // labeled — the expression itself has no usable output name).
-          const owner = value.ownerTable ? getTableName(value.ownerTable) : getTableName(this.table);
-          const ref = qualify(owner, value.columnName);
-          const wire = wireReadExpr(value.dataType, ref);
-          parts.push(wire ? `${wire} as ${qident(String(key))}` : key === value.columnName ? ref : `${ref} as ${qident(String(key))}`);
-        } else {
-          parts.push(`${inline(value, params)} as ${qident(String(key))}`);
+        if (isValueNode(value)) {
+          nodes.push(projectionNode(value, key));
+          continue;
         }
+        const owner = value.ownerTable ? getTableName(value.ownerTable) : tableName;
+        const ref = qual(owner, value.columnName);
+        const wire = wireReadNode(value.dataType, ref);
+        if (wire !== null) {
+          nodes.push(projectionNode(wire, key));
+          usesJsonb = true;
+        } else {
+          nodes.push(projectionNode(ref, key === value.columnName ? undefined : key));
+        }
+        const decoder = projectionDecoder(owner, value, key);
+        if (decoder) decoders.push(decoder);
       }
-      selectList = parts.join(", ");
     } else {
-      selectList = columnEntries(this.table)
-        .map(({ propertyKey, column }) => aliasedColumn(getTableName(this.table), column, propertyKey))
-        .join(", ");
+      const plan = selectPlanFor(tableName, columnEntries(this.table));
+      nodes.push(...plan.nodes);
+      decoders.push(...plan.decoders);
+      usesJsonb = plan.capabilities.length > 0;
     }
 
-    let sqlText = `select ${selectList} from ${qident(getTableName(this.table))}`;
+    const stmt: StatementNode = selectStatement({
+      projections: nodes,
+      from: ident(tableName),
+      where: whereItems(this.conditions),
+      orderBy: orderSpecs(this.order),
+      limit: this.limitCount,
+      offset: this.offsetCount,
+    });
+    return {
+      ...compileStatement(stmt),
+      decoders,
+      capabilities: usesJsonb ? ["jsonb-functions"] : [],
+    };
+  }
 
-    if (this.conditions.length > 0) {
-      sqlText += ` where ${this.conditions.map((c) => inline(c, params)).join(" and ")}`;
-    }
-    if (this.order.length > 0) {
-      sqlText += ` order by ${this.order.map((o) => o.sql).join(", ")}`;
-    }
-    if (this.limitCount !== undefined) sqlText += ` limit ${this.limitCount}`;
-    if (this.offsetCount !== undefined) sqlText += ` offset ${this.offsetCount}`;
-
-    return { sql: sqlText, params };
+  toSQL(): { sql: string; params: unknown[] } {
+    const compiled = this.toCompiled();
+    return { sql: compiled.sql, params: compiled.params as unknown[] };
   }
 
   async execute(): Promise<T[]> {
-    const { sql: sqlText, params } = this.toSQL();
-    const rows = (await run(this.ctx, sqlText, params, "query")) as Array<Record<string, unknown>>;
-    applyRowDecode(rows, rowDecodePlan(this.projectionEntries()), getTableName(this.table));
+    const compiled = this.toCompiled();
+    const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query")) as Array<Record<string, unknown>>;
+    applyProjectionDecoders(rows, compiled.decoders);
     return rows as T[];
   }
 
@@ -293,33 +334,40 @@ export class SelectBuilder<T> implements PromiseLike<T[]> {
 // ---------------------------------------------------------------------------
 
 export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = number> implements PromiseLike<R> {
-  private rows: Array<Record<string, unknown>> = [];
-  private hasValues = false;
-  private wantsReturning = false;
-
   constructor(
     private readonly ctx: ExecContext,
     private readonly table: PgTable<TCols>,
-  ) {}
+    private readonly rows: Array<Record<string, unknown>> = [],
+    private readonly hasValues = false,
+    private readonly wantsReturning = false,
+  ) {
+    Object.freeze(this.rows);
+    Object.freeze(this);
+  }
 
-  values(values: InferInsertModelOfRecord<TCols> | Array<InferInsertModelOfRecord<TCols>>): this {
-    this.rows = Array.isArray(values) ? (values as unknown as Array<Record<string, unknown>>) : [values as unknown as Record<string, unknown>];
-    this.hasValues = true;
-    return this;
+  values(values: InferInsertModelOfRecord<TCols> | Array<InferInsertModelOfRecord<TCols>>): InsertBuilder<TCols, R> {
+    const rows = Array.isArray(values) ? (values as unknown as Array<Record<string, unknown>>) : [values as unknown as Record<string, unknown>];
+    return new InsertBuilder<TCols, R>(this.ctx, this.table, rows, true, this.wantsReturning);
   }
 
   returning(): InsertBuilder<TCols, Array<InferSelectModelOfRecord<TCols>>> {
-    this.wantsReturning = true;
-    return this as unknown as InsertBuilder<TCols, Array<InferSelectModelOfRecord<TCols>>>;
+    return new InsertBuilder<TCols, Array<InferSelectModelOfRecord<TCols>>>(
+      this.ctx,
+      this.table,
+      this.rows,
+      this.hasValues,
+      true,
+    ) as unknown as InsertBuilder<TCols, Array<InferSelectModelOfRecord<TCols>>>;
   }
 
-  toSQL(): { sql: string; params: unknown[] } {
+  toCompiled(): CompiledStatement {
     if (!this.hasValues) throw new Error("insert requires .values()");
     if (this.rows.length === 0) throw new Error("insert .values() received an empty array");
 
+    const tableName = getTableName(this.table);
     const columns = getTableColumns(this.table) as Record<string, AnyColumnBuilder>;
     const propertyOrder = Object.keys(columns);
-    if (propertyOrder.length === 0) throw new Error(`table ${getTableName(this.table)} has no columns`);
+    if (propertyOrder.length === 0) throw new Error(`table ${tableName} has no columns`);
     const knownKeys = new Set(propertyOrder);
     const required = requiredInsertKeys(this.table);
 
@@ -333,21 +381,22 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     for (let rowIdx = 0; rowIdx < this.rows.length; rowIdx++) {
       const row = this.rows[rowIdx];
       if (typeof row !== "object" || row === null || Array.isArray(row)) {
-        throw new Error(`insert .values() rows must be objects on ${getTableName(this.table)}`);
+        throw new Error(`insert .values() rows must be objects on ${tableName}`);
       }
       const encoded = new Map<string, EncodedValue>();
       for (const key of Object.keys(row)) {
-        if (!knownKeys.has(key)) throw new Error(`unknown column "${key}" on ${getTableName(this.table)}`);
+        if (!knownKeys.has(key)) throw new Error(`unknown column "${key}" on ${tableName}`);
         const column = columns[key];
         const value = row[key];
         if (value === undefined) continue;
+        rejectLegacyFragment(value, "insert values");
         if (effectiveNotNull(column) && value === null) {
           throw new Error(
-            `insert on ${getTableName(this.table)}: null is not allowed for NOT NULL column "${key}" ("${column.columnName}")`,
+            `insert on ${tableName}: null is not allowed for NOT NULL column "${key}" ("${column.columnName}")`,
           );
         }
         if (value !== null) {
-          encoded.set(key, encodeForColumn(getTableName(this.table), column, key, value));
+          encoded.set(key, encodeForColumn(tableName, column, key, value));
         }
         supplied.add(key);
       }
@@ -355,7 +404,7 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
       const missing = required.filter(({ propertyKey }) => !Object.hasOwn(row, propertyKey) || row[propertyKey] === undefined);
       if (missing.length > 0) {
         throw new Error(
-          `insert on ${getTableName(this.table)} row ${rowIdx} is missing required column(s) ` +
+          `insert on ${tableName} row ${rowIdx} is missing required column(s) ` +
           missing.map(({ propertyKey, column }) => `"${propertyKey}" ("${column.columnName}")`).join(", ") +
           " — NOT NULL without a default",
         );
@@ -365,58 +414,60 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     // One stable schema-ordered column list shared by every row. Cell reads
     // use own properties only: an inherited value is not a supplied value.
     const orderedKeys = propertyOrder.filter((k) => supplied.has(k));
-    const params: unknown[] = [];
 
-    let columnsSql: string;
-    let valuesSql: string;
-    if (orderedKeys.length === 0) {
-      // Every row is default-only. Postgres has no multi-row DEFAULT VALUES
-      // form, so batch by explicitly requesting DEFAULT for one column.
-      if (this.rows.length === 1) {
-        columnsSql = "";
-        valuesSql = "default values";
-      } else {
-        const fallback = columns[propertyOrder[0]].columnName;
-        columnsSql = ` (${qident(fallback)})`;
-        valuesSql = `values ${this.rows.map(() => "(default)").join(", ")}`;
+    const returningPlan = this.wantsReturning
+      ? selectPlanFor(tableName, columnEntries(this.table))
+      : { nodes: [] as ProjectionNode[], decoders: [] as ProjectionDecoder[], capabilities: [] as StatementCapability[] };
+
+    const stmt: AnyStatementNode = (() => {
+      if (orderedKeys.length === 0) {
+        // Every row is default-only. Postgres has no multi-row DEFAULT VALUES
+        // form, so batch by explicitly requesting DEFAULT for one column.
+        if (this.rows.length === 1) {
+          return insertStatement({ table: ident(tableName), defaultValues: true, returning: returningPlan.nodes });
+        }
+        return insertStatement({
+          table: ident(tableName),
+          columns: [columns[propertyOrder[0]].columnName],
+          rows: this.rows.map(() => [defaultCell()] as ReadonlyArray<InsertCell>),
+          returning: returningPlan.nodes,
+        });
       }
-    } else {
-      columnsSql = ` (${orderedKeys.map((k) => qident(columns[k].columnName)).join(", ")})`;
-      valuesSql = `values ${this.rows
-        .map((row, rowIdx) => {
+      return insertStatement({
+        table: ident(tableName),
+        columns: orderedKeys.map((k) => columns[k].columnName),
+        rows: this.rows.map((row, rowIdx) => {
           const encoded = encodedRows[rowIdx];
-          const cells = orderedKeys.map((k) => {
-            if (!Object.hasOwn(row, k) || row[k] === undefined) return "default";
-            if (row[k] === null) {
-              params.push(null);
-              return `$${params.length}`;
-            }
-            const enc = encoded.get(k)!;
-            params.push(enc.bind);
-            return bindSite(params.length, enc);
+          return orderedKeys.map<InsertCell>((k) => {
+            if (!Object.hasOwn(row, k) || row[k] === undefined) return defaultCell();
+            if (row[k] === null) return paramNode(null);
+            return cellNode(encoded.get(k)!);
           });
-          return `(${cells.join(", ")})`;
-        })
-        .join(", ")}`;
-    }
+        }),
+        returning: returningPlan.nodes,
+      });
+    })();
 
-    let sqlText = `insert into ${qident(getTableName(this.table))}${columnsSql} ${valuesSql}`;
-    if (this.wantsReturning) sqlText += ` returning ${returningList(this.table)}`;
-    return { sql: sqlText, params };
+    return {
+      ...compileStatement(stmt),
+      decoders: returningPlan.decoders,
+      capabilities: returningPlan.capabilities,
+    };
+  }
+
+  toSQL(): { sql: string; params: unknown[] } {
+    const compiled = this.toCompiled();
+    return { sql: compiled.sql, params: compiled.params as unknown[] };
   }
 
   async execute(): Promise<R> {
-    const { sql: sqlText, params } = this.toSQL();
+    const compiled = this.toCompiled();
     if (this.wantsReturning) {
-      const rows = (await run(this.ctx, sqlText, params, "query")) as Array<Record<string, unknown>>;
-      applyRowDecode(
-        rows,
-        rowDecodePlan(columnEntries(this.table).map(({ propertyKey, column }) => ({ key: propertyKey, column }))),
-        getTableName(this.table),
-      );
+      const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query")) as Array<Record<string, unknown>>;
+      applyProjectionDecoders(rows, compiled.decoders);
       return rows as R;
     }
-    return (await run(this.ctx, sqlText, params, "execute")) as R;
+    return (await run(this.ctx, compiled.sql, compiled.params as unknown[], "execute")) as R;
   }
 
   then<R1 = R, R2 = never>(
@@ -431,85 +482,107 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
 // Update
 // ---------------------------------------------------------------------------
 
-export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = number> implements PromiseLike<R> {
-  private conditions: Condition[] = [];
-  private sets: Array<{ col: string; value?: unknown; frag?: SqlFragment; cast?: string }> = [];
-  private hasSet = false;
-  private wantsReturning = false;
+interface UpdateSet {
+  readonly column: string;
+  readonly value: ValueNode;
+}
 
+export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = number> implements PromiseLike<R> {
   constructor(
     private readonly ctx: ExecContext,
     private readonly table: PgTable<TCols>,
-  ) {}
+    private readonly sets: ReadonlyArray<UpdateSet> = [],
+    private readonly hasSet = false,
+    private readonly conditions: readonly Condition[] = [],
+    private readonly wantsReturning = false,
+  ) {
+    Object.freeze(this.sets);
+    Object.freeze(this.conditions);
+    Object.freeze(this);
+  }
 
-  set(values: UpdateSetInput<TCols>): this {
+  set(values: UpdateSetInput<TCols>): UpdateBuilder<TCols, R> {
+    const tableName = getTableName(this.table);
     const columns = getTableColumns(this.table) as Record<string, AnyColumnBuilder>;
+    const added: UpdateSet[] = [];
     for (const [key, value] of Object.entries(values)) {
       const column = columns[key];
-      if (!column) throw new Error(`unknown column "${key}" on ${getTableName(this.table)}`);
-      this.hasSet = true;
+      if (!column) throw new Error(`unknown column "${key}" on ${tableName}`);
       if (value === undefined) continue; // omitted/undefined update keys are ignored
       const physical = column.columnName;
       // Null is checked BEFORE fragment detection: null is a bindable value
       // for nullable columns, never an object to interrogate.
       if (value === null) {
         if (effectiveNotNull(column)) {
-          throw new Error(`update on ${getTableName(this.table)}: null is not allowed for NOT NULL column "${key}" ("${physical}")`);
+          throw new Error(`update on ${tableName}: null is not allowed for NOT NULL column "${key}" ("${physical}")`);
         }
-        this.sets.push({ col: physical, value });
+        added.push({ column: physical, value: paramNode(null) });
         continue;
       }
       const isJson = column.dataType === "json" || column.dataType === "jsonb";
-      // sql fragments stay supported assignments on every column type except
-      // json/jsonb, where plain-object values always bind as values.
-      if (!isJson && typeof value === "object" && isFragmentLike(value)) {
-        this.sets.push({ col: physical, frag: value });
+      // AST fragments (sql`...`) stay supported assignments on every column
+      // type except json/jsonb, where plain-object values always bind as
+      // values.
+      if (!isJson && isValueNode(value)) {
+        added.push({ column: physical, value });
         continue;
       }
-      const encoded = encodeForColumn(getTableName(this.table), column, key, value);
-      this.sets.push({ col: physical, value: encoded.bind, cast: encoded.cast });
+      rejectLegacyFragment(value, "update set");
+      added.push({ column: physical, value: cellNode(encodeForColumn(tableName, column, key, value)) });
     }
-    return this;
+    return new UpdateBuilder<TCols, R>(this.ctx, this.table, [...this.sets, ...added], true, this.conditions, this.wantsReturning);
   }
 
-  where(condition: Condition): this {
-    this.conditions.push(condition);
-    return this;
+  where(condition: Condition): UpdateBuilder<TCols, R> {
+    rejectLegacyFragment(condition, "where");
+    return new UpdateBuilder<TCols, R>(this.ctx, this.table, this.sets, this.hasSet, [...this.conditions, condition], this.wantsReturning);
   }
 
   returning(): UpdateBuilder<TCols, Array<InferSelectModelOfRecord<TCols>>> {
-    this.wantsReturning = true;
-    return this as unknown as UpdateBuilder<TCols, Array<InferSelectModelOfRecord<TCols>>>;
+    return new UpdateBuilder<TCols, Array<InferSelectModelOfRecord<TCols>>>(
+      this.ctx,
+      this.table,
+      this.sets,
+      this.hasSet,
+      this.conditions,
+      true,
+    ) as unknown as UpdateBuilder<TCols, Array<InferSelectModelOfRecord<TCols>>>;
   }
 
-  toSQL(): { sql: string; params: unknown[] } {
+  toCompiled(): CompiledStatement {
     if (!this.hasSet) throw new Error("update requires .set()");
     if (this.sets.length === 0) throw new Error("update .set() had no assignments — undefined values are ignored");
     if (this.conditions.length === 0) throw new Error("update without .where() is not allowed");
-    const params: unknown[] = [];
-    const assignments = this.sets.map((s) => {
-      if (s.frag) return `${qident(s.col)} = ${inline(s.frag, params)}`;
-      params.push(s.value);
-      return `${qident(s.col)} = ${s.cast === undefined ? `$${params.length}` : `$${params.length}::text::${s.cast}`}`;
+    const tableName = getTableName(this.table);
+    const returningPlan = this.wantsReturning
+      ? selectPlanFor(tableName, columnEntries(this.table))
+      : { nodes: [] as ProjectionNode[], decoders: [] as ProjectionDecoder[], capabilities: [] as StatementCapability[] };
+    const stmt = updateStatement({
+      table: ident(tableName),
+      sets: this.sets,
+      where: whereItems(this.conditions),
+      returning: returningPlan.nodes,
     });
-    let sqlText = `update ${qident(getTableName(this.table))} set ${assignments.join(", ")}`;
-    sqlText += ` where ${this.conditions.map((c) => inline(c, params)).join(" and ")}`;
-    if (this.wantsReturning) sqlText += ` returning ${returningList(this.table)}`;
-    return { sql: sqlText, params };
+    return {
+      ...compileStatement(stmt),
+      decoders: returningPlan.decoders,
+      capabilities: returningPlan.capabilities,
+    };
+  }
+
+  toSQL(): { sql: string; params: unknown[] } {
+    const compiled = this.toCompiled();
+    return { sql: compiled.sql, params: compiled.params as unknown[] };
   }
 
   async execute(): Promise<R> {
-    const { sql: sqlText, params } = this.toSQL();
+    const compiled = this.toCompiled();
     if (this.wantsReturning) {
-      const rows = (await run(this.ctx, sqlText, params, "query")) as Array<Record<string, unknown>>;
-      applyRowDecode(
-        rows,
-        rowDecodePlan(columnEntries(this.table).map(({ propertyKey, column }) => ({ key: propertyKey, column }))),
-        getTableName(this.table),
-      );
+      const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query")) as Array<Record<string, unknown>>;
+      applyProjectionDecoders(rows, compiled.decoders);
       return rows as R;
     }
-    return (await run(this.ctx, sqlText, params, "execute")) as R;
+    return (await run(this.ctx, compiled.sql, compiled.params as unknown[], "execute")) as R;
   }
 
   then<R1 = R, R2 = never>(
@@ -525,45 +598,61 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
 // ---------------------------------------------------------------------------
 
 export class DeleteBuilder<TCols extends Record<string, AnyColumnBuilder>, R = number> implements PromiseLike<R> {
-  private conditions: Condition[] = [];
-  private wantsReturning = false;
-
   constructor(
     private readonly ctx: ExecContext,
     private readonly table: PgTable<TCols>,
-  ) {}
+    private readonly conditions: readonly Condition[] = [],
+    private readonly wantsReturning = false,
+  ) {
+    Object.freeze(this.conditions);
+    Object.freeze(this);
+  }
 
-  where(condition: Condition): this {
-    this.conditions.push(condition);
-    return this;
+  where(condition: Condition): DeleteBuilder<TCols, R> {
+    rejectLegacyFragment(condition, "where");
+    return new DeleteBuilder<TCols, R>(this.ctx, this.table, [...this.conditions, condition], this.wantsReturning);
   }
 
   returning(): DeleteBuilder<TCols, Array<InferSelectModelOfRecord<TCols>>> {
-    this.wantsReturning = true;
-    return this as unknown as DeleteBuilder<TCols, Array<InferSelectModelOfRecord<TCols>>>;
+    return new DeleteBuilder<TCols, Array<InferSelectModelOfRecord<TCols>>>(
+      this.ctx,
+      this.table,
+      this.conditions,
+      true,
+    ) as unknown as DeleteBuilder<TCols, Array<InferSelectModelOfRecord<TCols>>>;
+  }
+
+  toCompiled(): CompiledStatement {
+    if (this.conditions.length === 0) throw new Error("delete without .where() is not allowed");
+    const tableName = getTableName(this.table);
+    const returningPlan = this.wantsReturning
+      ? selectPlanFor(tableName, columnEntries(this.table))
+      : { nodes: [] as ProjectionNode[], decoders: [] as ProjectionDecoder[], capabilities: [] as StatementCapability[] };
+    const stmt = deleteStatement({
+      table: ident(tableName),
+      where: whereItems(this.conditions),
+      returning: returningPlan.nodes,
+    });
+    return {
+      ...compileStatement(stmt),
+      decoders: returningPlan.decoders,
+      capabilities: returningPlan.capabilities,
+    };
   }
 
   toSQL(): { sql: string; params: unknown[] } {
-    if (this.conditions.length === 0) throw new Error("delete without .where() is not allowed");
-    const params: unknown[] = [];
-    let sqlText = `delete from ${qident(getTableName(this.table))}`;
-    sqlText += ` where ${this.conditions.map((c) => inline(c, params)).join(" and ")}`;
-    if (this.wantsReturning) sqlText += ` returning ${returningList(this.table)}`;
-    return { sql: sqlText, params };
+    const compiled = this.toCompiled();
+    return { sql: compiled.sql, params: compiled.params as unknown[] };
   }
 
   async execute(): Promise<R> {
-    const { sql: sqlText, params } = this.toSQL();
+    const compiled = this.toCompiled();
     if (this.wantsReturning) {
-      const rows = (await run(this.ctx, sqlText, params, "query")) as Array<Record<string, unknown>>;
-      applyRowDecode(
-        rows,
-        rowDecodePlan(columnEntries(this.table).map(({ propertyKey, column }) => ({ key: propertyKey, column }))),
-        getTableName(this.table),
-      );
+      const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query")) as Array<Record<string, unknown>>;
+      applyProjectionDecoders(rows, compiled.decoders);
       return rows as R;
     }
-    return (await run(this.ctx, sqlText, params, "execute")) as R;
+    return (await run(this.ctx, compiled.sql, compiled.params as unknown[], "execute")) as R;
   }
 
   then<R1 = R, R2 = never>(
@@ -587,17 +676,13 @@ export type InferSelectModelOfRecord<TCols extends Record<string, AnyColumnBuild
 export type InferInsertModelOfRecord<TCols extends Record<string, AnyColumnBuilder>> = InferInsertModelOf<TCols>;
 
 export type UpdateSetInput<TCols extends Record<string, AnyColumnBuilder>> = {
-  [K in keyof TCols]?: UpdateTypeOf<TCols[K]> | SqlFragment;
+  [K in keyof TCols]?: UpdateTypeOf<TCols[K]> | ValueNode;
 };
 
 // ---------------------------------------------------------------------------
-// AST select builder (F01 spike — the minimal builder integration)
+// AST select builder (F01) — immutable structural builder over the same
+// compiler; the typed-condition CRUD builders above share compileStatement.
 // ---------------------------------------------------------------------------
-// One representative path proves ast + compile end to end: mapped columns,
-// bound where values, aliased joins and composable subqueries. This builder
-// is IMMUTABLE: every fluent call returns a new frozen instance sharing no
-// mutable state, so forking and reuse cannot leak filters between requests.
-// Execution integration for all CRUD paths is F04; here `.toSQL()` is pure.
 
 /** Projection values: a schema column (physical ref + property-key label) or
  *  any value node (always labeled with the projection key). */
@@ -619,11 +704,13 @@ interface AstFromSpec {
 }
 
 export class AstSelectBuilder {
+  private readonly projectionSpec: AstProjection | null;
+
   /** Internal — construct through `astSelect()`. Kept public only so the
    *  entry-point factory can build instances; the shape is not API. */
   constructor(
     private readonly fromSpec: AstFromSpec,
-    private readonly projectionSpec: AstProjection | null,
+    projectionSpec: AstProjection | null,
     private readonly joinSpecs: readonly AstJoinSpec[],
     private readonly wheres: readonly ValueNode[],
     private readonly orders: readonly OrderSpec[],
@@ -635,8 +722,20 @@ export class AstSelectBuilder {
     // these arrays (copy-on-write), so a mutable array would let one branch
     // corrupt another via wheres.pop()/push(). Nodes inside are already
     // frozen at construction; the specs the builder creates itself are
-    // frozen here element-wise. projectionSpec is caller-owned input and is
-    // deliberately not frozen (freezing it would mutate the caller's object).
+    // frozen here element-wise. projectionSpec is COPIED shallowly and the
+    // private copy frozen: freezing the caller's object directly would
+    // mutate it, but sharing it by reference would let post-fork caller
+    // mutation reach every sibling — F01 review-2's carry-forward.
+    if (projectionSpec === null) {
+      this.projectionSpec = null;
+    } else {
+      const copy: AstProjection = {};
+      for (const [key, value] of Object.entries(projectionSpec)) {
+        rejectLegacyFragment(value, "astSelect projection");
+        copy[key] = value;
+      }
+      this.projectionSpec = Object.freeze(copy);
+    }
     Object.freeze(this.fromSpec);
     for (const spec of this.joinSpecs) Object.freeze(spec);
     Object.freeze(this.joinSpecs);
@@ -652,6 +751,7 @@ export class AstSelectBuilder {
   join(type: Exclude<JoinType, "cross">, table: AstJoinTarget, alias: string | undefined, on: ValueNode): AstSelectBuilder;
   join(type: JoinType, table: AstJoinTarget, alias?: string, on?: ValueNode): AstSelectBuilder {
     if (type !== "cross" && on === undefined) throw new Error(`ast join: ${type} joins require an on condition`);
+    if (alias !== undefined) validAlias(alias, "ast join alias");
     return new AstSelectBuilder(
       this.fromSpec,
       this.projectionSpec,
@@ -673,6 +773,7 @@ export class AstSelectBuilder {
   }
 
   where(node: ValueNode): AstSelectBuilder {
+    rejectLegacyFragment(node, "where");
     return new AstSelectBuilder(
       this.fromSpec,
       this.projectionSpec,
@@ -686,6 +787,7 @@ export class AstSelectBuilder {
   }
 
   orderBy(expr: ValueNode, direction: "asc" | "desc" = "asc"): AstSelectBuilder {
+    rejectLegacyFragment(expr, "orderBy");
     return new AstSelectBuilder(
       this.fromSpec,
       this.projectionSpec,
@@ -799,7 +901,9 @@ function isPgColumnRef(value: unknown): value is AnyColumnBuilder {
  *  table with property-key labels. */
 export function astSelect(projection: AstProjection | null = null): { from(table: AstJoinTarget, alias?: string): AstSelectBuilder } {
   return {
-    from: (table: AstJoinTarget, alias?: string) =>
-      new AstSelectBuilder({ table, alias }, projection, [], [], [], [], undefined, undefined),
+    from: (table: AstJoinTarget, alias?: string) => {
+      if (alias !== undefined) validAlias(alias, "astSelect from alias");
+      return new AstSelectBuilder({ table, alias }, projection, [], [], [], [], undefined, undefined);
+    },
   };
 }
