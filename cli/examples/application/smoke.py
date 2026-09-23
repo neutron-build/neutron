@@ -65,6 +65,21 @@ with tempfile.TemporaryDirectory(prefix="neutron-app-smoke-") as directory:
     assert [c["name"] for c in json.loads(plan.stdout)["services"]] == ["api", "web"]
     assert not (root / ".neutron").exists(), "planning changed project files"
     print("PASS: planning from a subdirectory without execution", flush=True)
+    tasks = subprocess.run([binary, "project", "run", "api-vet", "--json"], cwd=root, capture_output=True, text=True)
+    result = json.loads(tasks.stdout)
+    assert tasks.returncode == 0, tasks.stderr
+    assert [(t["name"], t["status"]) for t in result["tasks"]] == [("api-build", "succeeded"), ("api-vet", "succeeded")], result
+    assert (root / "api/bin/api").exists(), "declared output missing"
+    print("PASS: native Go build then vet as ordered tasks", flush=True)
+    api_source = root / "api/main.go"
+    original = api_source.read_text()
+    api_source.write_text(original + "\nthis is not Go\n")
+    tasks = subprocess.run([binary, "project", "run", "api-vet", "--json"], cwd=root, capture_output=True, text=True)
+    result = json.loads(tasks.stdout)
+    assert tasks.returncode != 0
+    assert [(t["name"], t["status"]) for t in result["tasks"]] == [("api-build", "failed"), ("api-vet", "skipped")], result
+    api_source.write_text(original)
+    print("PASS: failed build skips its dependent and exits nonzero", flush=True)
     for scenario in ["interrupt", "api_failure", "hangup", "coordinator_killed"]:
         log_path = Path(directory) / f"{scenario}.log"
         with log_path.open("w") as log:

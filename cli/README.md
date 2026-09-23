@@ -37,7 +37,7 @@ brew upgrade neutron   # delegated automatically for Homebrew installs
 | `new <name>` | Scaffold a new project in a chosen language (python, typescript, go, rust, zig, julia) |
 | `init` | Add a `neutron.toml` (and `migrations/`) to an existing project |
 | `dev` | Detect the project language and start its dev server |
-| `project check` / `project plan` | Validate and inspect an experimental multi-service application |
+| `project check` / `plan` / `run` | Validate, inspect and run tasks for an experimental multi-service application |
 | `db` | Manage a local Nucleus instance -- subcommands `start`, `stop`, `status`, `reset` |
 | `migrate` | Apply SQL migrations -- subcommands `status`, `create <name>`, `down [N]` |
 | `seed` | Run a SQL seed file against the database |

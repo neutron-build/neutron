@@ -132,3 +132,80 @@ func TestSymlinkCannotEscapeRoot(t *testing.T) {
 		t.Fatal("accepted outside symlink")
 	}
 }
+
+const taskSample = `[application]
+version=1
+name="tasks"
+[application.services.api]
+path="."
+command=["api"]
+[application.services.api.ready]
+tcp="127.0.0.1:9000"
+timeout="1s"
+[application.tasks.build]
+path="."
+command=["go","build","./..."]
+timeout="5m"
+outputs=["bin/api"]
+[application.tasks.test]
+path="."
+command=["go","test","./..."]
+depends_on=["build"]
+timeout="10m"
+env={SECRET="never-print-this"}
+[application.tasks.lint]
+path="."
+command=["go","vet","./..."]
+timeout="1m"
+`
+
+func TestTaskPlanning(t *testing.T) {
+	m, err := Load(manifestFile(t, taskSample))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := m.TaskPlan([]string{"test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 2 || tasks[0].Name != "build" || tasks[1].Name != "test" {
+		t.Fatalf("%+v", tasks)
+	}
+	if _, err := m.TaskPlan([]string{"api"}); err == nil || !strings.Contains(err.Error(), "neutron dev") {
+		t.Fatalf("service as task: %v", err)
+	}
+	if _, err := m.TaskPlan([]string{"nope"}); err == nil {
+		t.Fatal("unknown task accepted")
+	}
+	plan, err := m.Build("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(plan)
+	if !strings.Contains(string(encoded), `"tasks"`) || strings.Contains(string(encoded), "never-print-this") {
+		t.Fatalf("%s", encoded)
+	}
+}
+
+func TestInvalidTasks(t *testing.T) {
+	cases := map[string]string{
+		"task depends on service": strings.Replace(taskSample, `depends_on=["build"]`, `depends_on=["api"]`, 1),
+		"service depends on task": strings.Replace(taskSample, "command=[\"api\"]", "command=[\"api\"]\ndepends_on=[\"build\"]", 1),
+		"missing timeout":         strings.Replace(taskSample, "timeout=\"1m\"", "", 1),
+		"output escapes":          strings.Replace(taskSample, `outputs=["bin/api"]`, `outputs=["../elsewhere"]`, 1),
+		"task cycle":              strings.Replace(taskSample, "timeout=\"5m\"", "timeout=\"5m\"\ndepends_on=[\"test\"]", 1),
+		"name clash":              strings.Replace(taskSample, "[application.tasks.lint]", "[application.tasks.api]", 1),
+		"unknown task field":      strings.Replace(taskSample, "timeout=\"1m\"", "timeout=\"1m\"\ncache=true", 1),
+	}
+	for name, s := range cases {
+		t.Run(name, func(t *testing.T) {
+			m, err := Load(manifestFile(t, s))
+			if err == nil {
+				_, err = m.Build("")
+			}
+			if err == nil {
+				t.Fatal("accepted invalid manifest")
+			}
+		})
+	}
+}

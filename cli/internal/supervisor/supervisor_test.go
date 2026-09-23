@@ -44,6 +44,25 @@ func TestHelperProcess(t *testing.T) {
 		os.Exit(0)
 	case "exit":
 		os.Exit(0)
+	case "record":
+		f, err := os.OpenFile(os.Getenv("RECORD"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			os.Exit(5)
+		}
+		fmt.Fprintln(f, os.Getenv("NAME"))
+		f.Close()
+		os.Exit(0)
+	case "barrier":
+		// Succeeds only if a peer runs at the same time.
+		_ = os.WriteFile(os.Getenv("STARTED"), []byte("started"), 0600)
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(os.Getenv("PEER")); err == nil {
+				os.Exit(0)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		os.Exit(3)
 	case "fail":
 		os.Exit(7)
 	case "tree":

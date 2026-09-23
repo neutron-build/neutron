@@ -68,3 +68,20 @@ python3 smoke.py /tmp/neutron-coordinator
 The test copies this example to a temporary directory, chooses available ports,
 checks planning from a subdirectory, verifies communication and native reload,
 and checks that interruption or an API crash closes both service ports.
+
+## Tasks
+
+`[application.tasks.<name>]` declares finite commands such as builds, tests or
+checks. A task succeeds when it exits 0, unlike a service. Each task needs a
+`timeout`. `depends_on` may name only other tasks. `outputs` lists paths the task
+is expected to produce; they are reported but not cached or verified.
+
+```sh
+/tmp/neutron-coordinator project run api-vet          # runs api-build first
+/tmp/neutron-coordinator project run api-vet --json   # versioned result on stdout
+```
+
+`--jobs N` bounds how many tasks run at once (default: CPU count). The run is
+fail-fast: after a failure or timeout, nothing new starts, running tasks are
+stopped, and remaining tasks are reported as `skipped`. The command exits nonzero
+unless every selected task succeeded. Task and service names share one namespace.
