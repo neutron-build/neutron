@@ -6,6 +6,9 @@ on:
     paths:
       - "cli/**"
       - "studio/**"
+      - "go/**"
+      - "typescript/packages/neutron/**"
+      - "typescript/packages/neutron-cli/**"
       - ".github/workflows/cli.yml"
     tags:
       - "cli/v*"
@@ -13,6 +16,9 @@ on:
     paths:
       - "cli/**"
       - "studio/**"
+      - "go/**"
+      - "typescript/packages/neutron/**"
+      - "typescript/packages/neutron-cli/**"
       - ".github/workflows/cli.yml"
 
 permissions:
@@ -141,6 +147,59 @@ jobs:
         run: |
           go build -o "$RUNNER_TEMP/neutron" .
           python3 examples/application/smoke.py "$RUNNER_TEMP/neutron"
+        working-directory: cli
+
+  # A Go SDK API and a Neutron TypeScript app as neutron/v1 services, run
+  # outside the repository against SDKs packed from this checkout.
+  coordinator-sdk:
+    name: Coordinator with Neutron SDKs (${{ matrix.os }})
+    needs: studio
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch Studio dist
+        uses: actions/download-artifact@v4
+        with:
+          name: studio-dist
+          path: cli/internal/studio/dist
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: |
+            cli/go.sum
+            cli/examples/neutron-application/api/go.sum
+
+      # Version comes from typescript/package.json packageManager.
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: typescript/package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: typescript/pnpm-lock.yaml
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build TypeScript SDK packages
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter "@neutron-build/cli..." build
+        working-directory: typescript
+
+      - name: Example smoke
+        run: |
+          go build -o "$RUNNER_TEMP/neutron" .
+          python3 examples/neutron-application/smoke.py "$RUNNER_TEMP/neutron"
         working-directory: cli
 
   cross-compile:

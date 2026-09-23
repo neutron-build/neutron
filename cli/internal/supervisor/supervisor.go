@@ -162,31 +162,33 @@ func assignPort(taken map[int]bool) (int, error) {
 func contractNotes(ctx context.Context, port int) []string {
 	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}}
 	defer client.CloseIdleConnections()
-	get := func(path string) (int, map[string]any) {
+	get := func(path string) (int, string, map[string]any) {
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d%s", port, path), nil)
 		if err != nil {
-			return 0, nil
+			return 0, "", nil
 		}
 		response, err := client.Do(request)
 		if err != nil {
-			return 0, nil
+			return 0, "", nil
 		}
 		defer response.Body.Close()
 		var body map[string]any
 		_ = json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(&body)
-		return response.StatusCode, body
+		return response.StatusCode, response.Header.Get("Content-Type"), body
 	}
 	notes := []string{}
-	_, health := get("/health")
+	_, _, health := get("/health")
 	switch {
 	case health == nil || health["status"] == nil:
 		notes = append(notes, "/health does not return the contract body {status, nucleus, version} (FRAMEWORK_CONTRACT §7)")
 	case health["status"] == "degraded":
 		notes = append(notes, fmt.Sprintf("health is degraded (nucleus: %v)", health["nucleus"]))
 	}
-	code, spec := get("/openapi.json")
-	if code != http.StatusOK || spec == nil {
+	code, contentType, spec := get("/openapi.json")
+	if code != http.StatusOK {
 		notes = append(notes, "/openapi.json is not served (FRAMEWORK_CONTRACT §4)")
+	} else if spec == nil {
+		notes = append(notes, fmt.Sprintf("/openapi.json returned %s, not a JSON document (FRAMEWORK_CONTRACT §4)", contentType))
 	} else if version, _ := spec["openapi"].(string); !strings.HasPrefix(version, "3.1") {
 		notes = append(notes, fmt.Sprintf("/openapi.json is OpenAPI %q, contract requires 3.1 (FRAMEWORK_CONTRACT §4)", version))
 	}
