@@ -54,6 +54,14 @@ import {
   excluded,
   cteTable,
   derivedTable,
+  keyset,
+  ascNullsLast,
+  ascNullsFirst,
+  descNullsLast,
+  descNullsFirst,
+  preparedStatement,
+  CursorError,
+  type KeysetPage,
   type ColumnBuilder,
   type Condition,
   type OrderExpression,
@@ -479,3 +487,48 @@ async function q03Fixtures(): Promise<void> {
     .onConflictUpdate({ target: { columns: [users.email], where: sql`${users.name} is null` }, set: { name: "n" }, setWhere: cond });
 }
 void q03Fixtures;
+
+// --- Q04 keyset pagination + prepared execution through the packed
+// declarations: page() row types track the builder's row type, cursors are
+// strings, CursorError is constructible/narrowable, and prepared statements
+// carry the documented surface.
+
+async function q04Fixtures(): Promise<void> {
+  const db = await createDatabase({ url: "postgres://type-fixture:not-run@localhost:1/none", tables: { users, posts } });
+
+  const pager = keyset(users, [ascNullsLast(users.name), descNullsFirst(users.id)], { perPage: 10 });
+  const eqTerms: AssertEq<typeof pager.columns[number]["direction"], "asc" | "desc"> = true;
+  void eqTerms;
+
+  const page: KeysetPage<typeof users.$inferSelect> = await pager.page(db.select().from(users), undefined, 10);
+  const eqRow: AssertEq<typeof page.rows[number], typeof users.$inferSelect> = true;
+  const eqCursor: AssertEq<typeof page.nextCursor, string | null> = true;
+  void [eqRow, eqCursor];
+  const cursor: string = pager.cursorOf({ id: 1, email: "a@x.com", name: null, createdAt: "2026-01-01T00:00:00" });
+  const applied = pager.apply(db.select().from(users), cursor, 5);
+  const eqApplied: AssertEq<Awaited<ReturnType<typeof applied.execute>>[number], typeof users.$inferSelect> = true;
+  void eqApplied;
+  void pager.seekCondition(cursor);
+  void pager.orderExpressions();
+
+  // reject a cursor with the narrow error class
+  try {
+    pager.seekCondition("bogus");
+  } catch (err) {
+    if (err instanceof CursorError) void err.message;
+  }
+
+  // prepared statements: optional capability on the driver, fail-closed helper
+  const stmt = db.driver.prepare?.("select id from users where email = $1");
+  if (stmt) {
+    const rows = await stmt.query<{ id: number }>(["a@x.com"]);
+    void rows[0].id;
+    void stmt.name;
+  }
+  // @ts-expect-error prepare is optional — calling it unguarded is a type error
+  db.driver.prepare("select 1").query();
+
+  // @ts-expect-error perPage must be a number
+  keyset(users, [ascNullsLast(users.name)], { perPage: "ten" });
+}
+void q04Fixtures;

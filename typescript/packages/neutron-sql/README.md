@@ -275,7 +275,9 @@ it applies itself.
 returns a structural fragment node instead of `{sql, params}`; destructured
 `.sql`/`.params` accesses on `eq()`/`and()` results no longer exist
 (inspect conditions through `.toSQL()`/`.toCompiled()`). `asc()`/`desc()`
-return order specs (still accepted by `orderBy`). Update/delete `where`
+return order specs (still accepted by `orderBy`), as do the explicit
+null-ordering variants `ascNullsLast()`/`ascNullsFirst()`/`descNullsLast()`/
+`descNullsFirst()` (required on keyset terms). Update/delete `where`
 clauses and `returning` lists are now uniformly parenthesized/qualified —
 semantics unchanged, byte-level SQL text shifted. Legacy fragments are
 `raw()` + direct execution only.
@@ -519,9 +521,20 @@ await db.insert(members).values(row)
   Target columns must belong to the inserted table; an index predicate is
   only valid with a column-list target.
 - **`excluded(col)`** renders `excluded."col"` — the proposed row — in SET
-  assignments and predicates. References naming a column the table does not
-  have fail before SQL; `excluded()` anywhere outside on-conflict clauses
-  (e.g. a plain `update ... .set()`) fails closed the same way.
+  assignments and DO UPDATE WHERE predicates. This scope is enforced **at the
+  compile choke point on every statement kind**: `excluded()` anywhere else —
+  a select's where/having/order/projections, an update's sets/where/returning,
+  a delete's where/returning, an insert's RETURNING, the conflict target's
+  index predicate, or inside any subquery — fails **before SQL** with one
+  message instead of as a database error (those positions cannot see the
+  pseudo-relation; PostgreSQL rejects them at execution with "missing
+  FROM-clause entry" / "invalid reference to FROM-clause entry"). References
+  naming a column the table does not have fail before SQL the same way.
+- **`INSERT ... SELECT` is not implemented.** `.values()` accepts plain row
+  objects only (an array or single object); handing it anything else — e.g. a
+  select builder — surfaces the unknown-column/row-shape rejection rather
+  than composing a set-returning insert. Composing inserts from queries is a
+  later card; use explicit SQL through the driver in the meantime.
 - **SET values** follow update `.set()` semantics: literals run through the
   column codec (validated, canonically encoded), `sql` fragments and
   expression/excluded/subquery nodes splice structurally on non-json columns,
@@ -551,6 +564,113 @@ await db.insert(members).values(row)
   surface PostgreSQL's own error — `ON CONFLICT DO UPDATE command cannot
   affect row a second time` (SQLSTATE `21000`) — unchanged, with the
   statement atomic (nothing lands).
+
+## Keyset pagination
+
+`keyset()` builds a cursor (seek) pager over an explicitly ordered keyset:
+
+```ts
+import { keyset, ascNullsLast, descNullsFirst } from "@neutron-build/sql";
+
+const pager = keyset(events, [ascNullsLast(events.occurredAt), descNullsFirst(events.rank)], { perPage: 20 });
+
+const page1 = await pager.page(db.select().from(events), undefined, 20);
+// page1.rows: up to 20 rows; page1.nextCursor: opaque string or null
+const page2 = await pager.page(db.select().from(events), page1.nextCursor, 20);
+```
+
+- **Unique ordering is enforced.** The keyset must contain a schema-declared
+  unique key (single-column PK/unique, the composite PK, or a unique index).
+  When it does not, a unique tie-breaker column is **auto-appended** (`asc
+  nulls last` — the single-column PK first, then any unique column, then a
+  composite key) and exposed as `pager.columns[...].autoAppended`; with
+  `{ autoAppendTiebreaker: false }` a non-unique keyset errors instead. A
+  table with no unique key at all always errors — ties would duplicate/omit
+  rows at page boundaries.
+- **Null ordering is explicit and required.** Every term must come from
+  `ascNullsLast()/ascNullsFirst()/descNullsLast()/descNullsFirst()` — those
+  helpers also work in plain `.orderBy()`. `nulls last` places NULL at the
+  END of the ordering in both directions, `nulls first` at the start; the
+  seek predicate decomposes mixed directions with tie comparisons
+  (`IS NOT DISTINCT FROM` on nullable columns, `=` on NOT NULL ones).
+- **Cursors are opaque, versioned and strictly validated.**
+  `base64url(version byte + JSON payload)`. Values are tagged and
+  precision-exact: int8 rides exact decimal strings (never through JS
+  Number), numerics their exact decimal text, temporals the canonical
+  microsecond text, NULL positions explicit. A cursor that is not valid
+  base64url, carries an unknown version byte, malformed JSON/values, values
+  whose tags disagree with the column types, unknown envelope or value
+  fields, or was built for a DIFFERENT keyset ordering fails with
+  `CursorError` **before any SQL runs**. Cursors are JSON-safe strings (safe
+  to embed in URLs/bodies) and deterministic.
+- **Precision limits, honestly:** temporal keyset columns must use the
+  default string mode (`mode: "date"` truncates to milliseconds and would
+  break boundaries — rejected), numeric keyset columns must not carry a user
+  `decoder` (decoded values cannot re-encode losslessly — rejected). int8
+  columns work in any read mode; float columns round-trip through
+  shortest-round-trip decimal text (exact for IEEE doubles).
+- **Page mechanics.** `page()` fetches `perPage + 1` rows so hasMore is known
+  without a count query, returns the first `perPage` rows, and derives
+  `nextCursor` from the page's **last included row**. `apply()` composes
+  seek + order + limit without mutating the source builder — and the
+  builder must be **fresh**: one that already carries ORDER BY terms or an
+  OFFSET is rejected with an error before any SQL runs (composed silently,
+  a leading user order term or a persisting offset duplicates and omits
+  rows — the seek predicate is only correct when the keyset ordering is
+  the statement's total ORDER BY). To combine, filter a fresh builder —
+  `db.select().from(t).where(...)` — and let the pager apply ordering and
+  limit exclusively; to keep your own ordering, paginate the builder
+  directly with `.limit()`/`.offset()` instead of the pager.
+- **Concurrency (each page is its own statement, default READ COMMITTED):**
+  rows inserted between pages appear exactly when they sort **after the
+  then-current cursor** — before-cursor inserts never reappear, so the
+  pre-existing snapshot is never duplicated or omitted; rows sorting after
+  the cursor appear on the first page query executed after their insert.
+  Rows deleted/updated across their own boundary can be missed or moved —
+  that is inherent to seeking. For one immutable snapshot across a whole
+  walk, wrap it in a single `REPEATABLE READ` transaction (`set transaction
+  isolation level repeatable read` as the transaction's first statement) —
+  pinned live in the Q04 suite.
+
+## Prepared execution
+
+`driver.prepare(sql)` (optional Driver member — the capability gate) returns a
+`PreparedStatement` bound to that adapter; `preparedStatement(driver, sql)`
+is the fail-closed accessor for custom adapters (absent `prepare` errors
+clearly rather than silently running unnamed execution).
+
+```ts
+const stmt = db.driver.prepare!("select id from users where email = $1");
+const rows = await stmt.query<{ id: number }>(["a@x.com"]); // re-parses per connection only once
+const affected = await db.driver.prepare!("update users set seen = true where email = $1").execute(["a@x.com"]);
+```
+
+- **Prepared statements are connection-scoped (session-scoped on the
+  server); the adapters' semantics differ and both are honored:**
+  - **pg** sends every execution as `{ name, text }` with a deterministic
+    name derived from the SQL text (`nsqp_` + 58 hex chars of SHA-256, within
+    the 63-byte name limit). This is pool-safe: pg re-parses the name on each
+    pooled connection that has not parsed it yet, and its own guard rejects a
+    name reused with different text on one connection — unreachable through
+    this wrapper because the name IS a hash of the text. Two connections may
+    hold the same name with different SQL (server sessions are independent
+    namespaces — pinned live).
+  - **postgres.js** owns naming internally: `{ prepare: true }` rides its
+    per-connection cache keyed by SQL text + inferred parameter types, with
+    per-connection auto-generated names (`PreparedStatement.name` is
+    undefined). Its FetchPreparedStatement retry transparently re-parses in
+    environments where statements vanish (e.g. transaction poolers).
+- **Session end releases server-side statements** (no DEALLOCATE is sent;
+  PostgreSQL deallocates when the session terminates — verified live via
+  pg_stat_activity). Verified on PG 17: statements survive transaction
+  ROLLBACK and ABORT — the session is their only lifetime.
+- Transaction-scoped drivers (`db.transaction`) expose `prepare` pinned to
+  the transaction's connection. That pin **outlives the transaction**: on
+  `pg`, calling the scoped driver (or its prepared statements) after
+  `commit`/`rollback` still executes — on the released pooled client, which
+  the pool may hand to another caller. This is the same posture plain
+  `tx.query` already has, and it is **unsupported**: do not use a
+  transaction-scoped driver or statement after its transaction ends.
 
 ## Relational reads (one level)
 
@@ -623,8 +743,16 @@ general-purpose use.
   sum/avg/min/max/string_agg/bool_and/bool_or null on empty), correlated
   subqueries and union/intersect/except (plus their ALL variants),
   on-conflict do-nothing/do-update with named/composite/constraint/partial-index
-  targets, excluded references, conditional upserts and selected returning
+  targets, excluded references (scope enforced at the compile choke point),
+  conditional upserts and selected returning
   subsets (order-independent duplicate-assignment rejection included),
+  keyset pagination (unique tie-breakers with auto-append, explicit null
+  ordering, mixed directions, versioned opaque cursors with strict
+  validation, precision-exact cursor values; page-walks verified against
+  hand-SQL oracles with documented concurrent-insert semantics), and
+  connection-scoped prepared execution (deterministic SQL-derived names on
+  pg, postgres.js signature caching; scope and session-release verified
+  live),
   one-level
   relational reads with exact result types, transactions, `toSQL()`, mapped
   properties/NULL/required-key semantics, lossless codecs (bigint/string/
