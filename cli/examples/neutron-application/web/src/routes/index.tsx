@@ -1,6 +1,9 @@
+import type { components } from "../api";
+
 export const config = { mode: "app" };
 
-type Item = { id: number; name: string };
+// Generated from api/openapi.json by the web-api-types task.
+type Item = components["schemas"]["Item"];
 
 // The coordinator injects NEUTRON_SERVICE_API_URL from depends_on = ["api"],
 // so this service never hard-codes the API's (assigned) port.

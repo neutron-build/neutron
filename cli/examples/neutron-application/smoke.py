@@ -82,6 +82,27 @@ with tempfile.TemporaryDirectory(prefix="neutron-sdk-example-") as directory:
     subprocess.run(["go", "mod", "download"], cwd=root / "api", check=True, capture_output=True)
     print("PASS: example installed outside the repository against packed SDKs", flush=True)
 
+    def neutron(*args):
+        return subprocess.run([binary, *args], cwd=root, capture_output=True, text=True, timeout=300)
+
+    check = neutron("project", "spec", "--check", "--service", "api")
+    assert check.returncode == 0, check.stdout + check.stderr
+    typecheck = neutron("project", "run", "web-typecheck")
+    assert typecheck.returncode == 0, typecheck.stdout + typecheck.stderr
+    print("PASS: committed API snapshot matches the running API; generated TS client typechecks", flush=True)
+
+    api_source = root / "api/main.go"
+    original = api_source.read_text()
+    api_source.write_text(original.replace('Name string `json:"name"`', 'Label string `json:"label"`').replace("Name: ", "Label: "))
+    check = neutron("project", "spec", "--check", "--service", "api")
+    assert check.returncode != 0 and "differs" in check.stderr, check.stdout + check.stderr
+    assert neutron("project", "spec", "--write", "--service", "api").returncode == 0
+    typecheck = neutron("project", "run", "web-typecheck")
+    assert typecheck.returncode != 0 and "Property 'name' does not exist" in typecheck.stdout, typecheck.stdout
+    api_source.write_text(original)
+    assert neutron("project", "spec", "--write", "--service", "api").returncode == 0
+    print("PASS: an API field rename is caught as spec drift and as a TS type error", flush=True)
+
     log_path = work / "dev.log"
     process, ports = start(root, log_path)
     try:

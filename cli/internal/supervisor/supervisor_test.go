@@ -506,3 +506,28 @@ func TestContractServiceAssignedPortAndInjectedURL(t *testing.T) {
 		})
 	}
 }
+
+func TestOnReadyRunsOnceAllReadyThenStops(t *testing.T) {
+	root := t.TempDir()
+	api := httpService(t, "api", "http", root)
+	var seen map[string]int
+	err := Run(context.Background(), &project.Plan{Root: root, Services: []project.Service{api}}, Options{
+		GracePeriod: 100 * time.Millisecond,
+		OnReady: func(ports map[string]int) error {
+			seen = ports
+			if conn, err := net.Dial("tcp", api.Env["ADDRESS"]); err != nil {
+				t.Errorf("service not reachable during OnReady: %v", err)
+			} else {
+				conn.Close()
+			}
+			return fmt.Errorf("sentinel")
+		},
+	})
+	if err == nil || err.Error() != "sentinel" {
+		t.Fatalf("OnReady error not returned: %v", err)
+	}
+	if seen["api"] != api.Ports[0] {
+		t.Fatalf("ports %v", seen)
+	}
+	requireClosed(t, api.Env["ADDRESS"])
+}
