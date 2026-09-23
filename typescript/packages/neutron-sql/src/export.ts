@@ -14,13 +14,14 @@
 // every ambiguity instead of guessing.
 
 import type { AnyColumnBuilder, AnyPgTable } from "./schema.js";
-import { getTableColumns, getTableName, getTableIndexes, getTableSchema, isPgTable } from "./schema.js";
+import { getTableColumns, getTableName, getTableIndexes, getTableSchema, isPgTable, rejectDerivedTable } from "./schema.js";
 
 /** The v1/v2 export contract covers default-search-path tables only
  *  (identity.schema is "public"). A declared schema would export under the
  *  wrong identity, so schema-qualified tables fail closed until Q07 owns
  *  cross-schema export. */
 function assertPlainTable(table: AnyPgTable, who: string): void {
+  rejectDerivedTable(table, who);
   const schema = getTableSchema(table);
   if (schema !== undefined) {
     throw new Error(

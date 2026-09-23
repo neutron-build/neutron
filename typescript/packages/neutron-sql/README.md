@@ -400,6 +400,85 @@ schema-declared tables with explicit errors until their scoped work lands
 (Q05/Q07) — they would otherwise address or export the wrong (search-path)
 identity.
 
+## Subqueries, CTEs, aggregates and set operations
+
+- **Grouping and aggregates.** `.groupBy(col | expr, …)` sets the grouping
+  terms; `.having(cond)` takes the same AST values `.where()` takes
+  (aggregates, `sql` fragments, `and`/`or`/`not` — fragments are delimited,
+  the grouping guarantee applies); `.distinct()` emits plain `select
+  distinct`. Typed aggregates — `count()`, `count(col)`,
+  `countDistinct(col)`, `sum`, `avg`, `min`, `max`, `stringAgg(col, sep)`,
+  `boolAnd`, `boolOr` — project and order (`desc(count())`) with result
+  types that follow PostgreSQL exactly: `count` returns **bigint through
+  the int8 codec and is never null** (0 on empty input); `sum` over integer
+  columns returns bigint, over int8/numeric columns exact decimal strings,
+  over floats numbers; `avg` returns exact strings except over floats; and
+  `sum`/`avg`/`min`/`max`/`string_agg`/`bool_and`/`bool_or` are **null on
+  empty input**. `min`/`max` mirror their argument column's codec (temporal
+  modes honored; int8 modes honored) — over a derived/CTE temporal column
+  the aggregate parses the materialized canonical text back to the temporal
+  type first (`min(col::timestamp)`), so composed `timestamptz` never
+  consults the session timezone. A grouped query over an empty table
+  returns zero rows — no groups exist.
+- **Derived tables and CTEs.** `derivedTable(name, source)` and
+  `cteTable(name, source)` turn any select builder into a table-like
+  handle; the row type derives from the source's projection outputs.
+  `derivedTable` inlines `(select …) as "name"` at each reference
+  (from or join); `cteTable` references the bare name and auto-registers
+  `with "name" as (…)` on the consuming statement — referencing the same
+  handle twice registers one CTE, and two different statements under one
+  name fail closed. Handles join under their own name (no `alias()` wrap;
+  re-aliasing a handle is rejected because it would lose the subquery), and
+  outer joins over a handle null its columns exactly like alias handles.
+  Source capability requirements merge into the consuming statement.
+  Temporal columns compose losslessly: a derived/CTE level materializes the
+  canonical text wire form, and the outer level re-acquires it with the
+  naive pass-through `to_jsonb(col::timestamp)::text` — for `timestamptz`
+  too (the canonical text IS the UTC wall clock; re-parsing with
+  `::timestamptz` would consult the session timezone and shift the value
+  per composition level). The acquisition is idempotent, so values stay
+  byte-exact through any depth in any session timezone.
+- **CTE references inside `sql` fragments resolve or fail closed.**
+  Interpolating a `cteTable` handle (or one of its columns) into a `sql`
+  template renders the bare name, branded with the handle's CTE identity;
+  compilation fails when the consuming statement does not carry that exact
+  CTE in scope — an unregistered reference, or a same-name CTE built from a
+  different statement that would silently capture it, is a compile-time
+  error rather than a silent bind (or a missing-relation database error).
+  Reference the handle from `from`/`joins` (its CTE registers) or register
+  the same source with `withCte`. Interpolating a whole `derivedTable`
+  handle into a fragment is rejected outright — a derived table exists only
+  at its inline from/join site. Hand-typed `ident`/`qual` references stay
+  trusted text (never scanned).
+- **Recursive CTEs.** `with recursive` is computed structurally: a CTE whose
+  statement references its own name (as a from/join target or qualified
+  reference) renders recursively. Reference the working table through
+  `ident("name")` / `qual("name", "col")` nodes in the recursive branch —
+  a self-reference hand-typed inside `sql` fragment text is not scanned
+  (this compiler never parses SQL text) and fails at the database instead.
+  Cycle safety is the SQL contract: traverse cyclic graphs with `union`
+  (deduplicating) or an explicit depth bound on `union all`.
+- **Correlated subqueries.** `sql` templates interpolate subqueries and
+  builder `.subquery()` nodes anywhere a value goes — scalar subqueries in
+  projections, `in (select …)` lists, ON conditions — with parameters
+  binding in traversal order. `exists(source)` builds the `exists`
+  predicate.
+- **Set operations.** `.union/.unionAll/.intersect/.intersectAll/
+  .except/.exceptAll(other)` on a select builder (and on the resulting
+  compound) compose **left-associatively in call order** — branches render
+  parenthesized, so SQL's intersect-over-union precedence never reorders
+  your chain. Result rows are typed by (and decode through) the **first
+  branch** — PostgreSQL takes output column names from it, so branch
+  projections must be structurally aligned. `orderBy`/`limit`/`offset`
+  after a set operation apply to the whole compound; a first branch that
+  already carries them fails closed instead of silently rebinding them.
+- **Parameter and alias composition is deterministic through three
+  levels**: outer projections bind first, then derived-table/CTE bodies,
+  then where/group/having, then set-op branches, then order by — `$1..$n`
+  follow that traversal in every composed shape.
+- Derived/CTE handles are query-surface identities: mutations, DDL, schema
+  export and `db.query` registration reject them.
+
 ## Relational reads (one level)
 
 `db.query.<table>.findMany/findFirst` compile every requested relation edge to
@@ -465,13 +544,18 @@ general-purpose use.
 - Implemented and live-tested: typed CRUD (`select`/`insert`/`update`/
   `delete`, `returning`), batch inserts independent of key order, joins and
   aliases (inner/left/right/full/cross with typed outer-join nullability,
-  self joins, schema-qualified tables in the query layer), one-level
+  self joins, schema-qualified tables in the query layer), subqueries,
+  ordinary/recursive CTEs, derived tables, group by/having/distinct, typed
+  aggregates with PostgreSQL empty-input semantics (count never null,
+  sum/avg/min/max/string_agg/bool_and/bool_or null on empty), correlated
+  subqueries and union/intersect/except (plus their ALL variants), one-level
   relational reads with exact result types, transactions, `toSQL()`, mapped
   properties/NULL/required-key semantics, lossless codecs (bigint/string/
   safe-number int8 modes, exact numerics, microsecond temporals, bytea,
   SQL NULL vs JSON null writes) across raw select, projection, `returning`
   and relation paths on both drivers, verified under multiple process
-  timezones. Since F04 every statement compiles through the one AST compiler
+  timezones and (for derived/CTE composition and composed aggregates)
+  multiple server session timezones. Since F04 every statement compiles through the one AST compiler
   with immutable builders, compiled statements carry decode plans and
   capability requirements, and schema export v2 is deterministic and
   cross-language-pinned (Go + reference consumer agree byte-for-byte);
