@@ -38,6 +38,7 @@ timeout = "10m"
 | `neutron project plan [--json] [--service NAME]` | Shows services, tasks, ports and injected environment keys (never values). |
 | `neutron dev [--service NAME]` | Starts the selected service and its dependencies in dependency order, in the foreground. |
 | `neutron project run TASK... [--jobs N] [--json]` | Runs tasks and their dependencies; exits nonzero unless all succeed. |
+| `neutron project spec --write` or `--check` `[--service NAME]` | Snapshots each Neutron SDK service's OpenAPI document, or fails if a snapshot is out of date. |
 
 ## Services
 
@@ -60,7 +61,28 @@ If any service fails to start, fails readiness, or exits, even with status 0, th
 - allows the contract's 30-second drain before SIGKILL,
 - reports, once ready, a degraded `/health`, a missing `/openapi.json`, or a spec that is not OpenAPI 3.1. These are warnings; the session keeps running.
 
-The SDK must read `NEUTRON_HOST` and `NEUTRON_PORT` for an assigned port to work. Declare `ports` explicitly where an SDK version does not yet do so.
+The SDK must read `NEUTRON_HOST` and `NEUTRON_PORT` for an assigned port to work. The Go, TypeScript and Python SDKs do so from the current repository; declare `ports` explicitly with older releases.
+
+## Typed clients between services
+
+A Neutron SDK service describes its API at `/openapi.json`. `neutron project spec --write` starts the Neutron SDK services, waits until they are ready, and saves each document canonically as `openapi.json` in the service's directory. Commit that file: it is the reviewed interface, so an API change appears as a diff. `neutron project spec --check` fails when a running service no longer matches its snapshot, which makes it a useful CI step.
+
+Clients are generated from the snapshot by an ordinary task using an existing generator, for example a TypeScript client from a Go API:
+
+```toml
+[application.tasks.web-api-types]
+path = "apps/web"
+command = ["./node_modules/.bin/openapi-typescript", "../../services/api/openapi.json", "--output", "src/api.d.ts"]
+timeout = "2m"
+
+[application.tasks.web-typecheck]
+path = "apps/web"
+command = ["./node_modules/.bin/tsc", "--noEmit"]
+depends_on = ["web-api-types"]
+timeout = "5m"
+```
+
+Renaming a response field in the API then fails `spec --check`, and after `spec --write` fails the typecheck wherever the old field was used.
 
 ## Tasks
 
@@ -87,4 +109,4 @@ Statuses are `succeeded`, `failed`, `timed_out`, `cancelled` and `skipped`. Veri
 - A readiness probe proves something answered on the port, not which process answered.
 - Child output is shown as written; secrets printed by a service are not redacted.
 
-A runnable two-language example is in [`cli/examples/application`](https://github.com/neutron-build/neutron/tree/main/cli/examples/application).
+Runnable examples: [`cli/examples/application`](https://github.com/neutron-build/neutron/tree/main/cli/examples/application) (plain Go and Node services) and [`cli/examples/neutron-application`](https://github.com/neutron-build/neutron/tree/main/cli/examples/neutron-application) (a Go SDK API and a Neutron TypeScript app with a generated typed client).
