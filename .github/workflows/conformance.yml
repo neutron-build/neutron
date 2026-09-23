@@ -11,6 +11,10 @@ on:
       - "elixir/**"
       - "zig/**"
       - "typescript/packages/neutron/**"
+      # The ts adapter boots through `neutron-ts start`, where NEUTRON_HOST /
+      # NEUTRON_PORT resolution (§6) and the SIGTERM drain + exit (§8) live, so
+      # a CLI change can break config.env or shutdown.sigterm.
+      - "typescript/packages/neutron-cli/**"
       - "FRAMEWORK_CONTRACT.md"
       - ".github/workflows/conformance.yml"
   pull_request:
@@ -22,6 +26,10 @@ on:
       - "elixir/**"
       - "zig/**"
       - "typescript/packages/neutron/**"
+      # The ts adapter boots through `neutron-ts start`, where NEUTRON_HOST /
+      # NEUTRON_PORT resolution (§6) and the SIGTERM drain + exit (§8) live, so
+      # a CLI change can break config.env or shutdown.sigterm.
+      - "typescript/packages/neutron-cli/**"
       - "FRAMEWORK_CONTRACT.md"
       - ".github/workflows/conformance.yml"
   schedule:
@@ -117,5 +125,10 @@ jobs:
         # broke — and an SDK that booted but never became healthy is a defect
         # either way. Without this the matrix was green while Python had never
         # run in it at all.
+        #
+        # Includes the lifecycle dimensions: config.env (§6 — each app is
+        # booted with only NEUTRON_HOST/NEUTRON_PORT) and shutdown.sigterm (§8
+        # — SIGTERM mid-request, drain, exit 0). No extra setup: they boot the
+        # same apps the HTTP dimensions do.
         run: node run.mjs --strict
         working-directory: conformance/runner
