@@ -33,7 +33,18 @@ func init() {
 		}
 		fmt.Fprintf(cmd.OutOrStdout(), "Application %s (%s)\n", plan.Name, plan.Root)
 		for _, s := range plan.Services {
-			fmt.Fprintf(cmd.OutOrStdout(), "  %s: %s; dependencies=%v; environment keys=%v\n", s.Name, s.Dir, s.DependsOn, s.EnvironmentKeys)
+			ports := fmt.Sprint(s.Ports)
+			if s.AssignPort {
+				ports = "assigned at start"
+			}
+			contract := ""
+			if s.Contract != "" {
+				contract = "; contract=" + s.Contract
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "  service %s: %s; ports=%s%s; dependencies=%v; environment keys=%v\n", s.Name, s.Dir, ports, contract, s.DependsOn, s.EnvironmentKeys)
+		}
+		for _, t := range plan.Tasks {
+			fmt.Fprintf(cmd.OutOrStdout(), "  task %s: %s; timeout=%s; dependencies=%v\n", t.Name, t.Dir, t.Timeout, t.DependsOn)
 		}
 		return nil
 	}}

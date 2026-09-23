@@ -17,7 +17,7 @@ path = "web"
 command = ["node", "--experimental-strip-types", "--watch", "server.ts"]
 ports = [4300]
 depends_on = ["api"]
-env = { PORT = "4300", API_ORIGIN = "http://127.0.0.1:4301" }
+env = { PORT = "4300" }
 
 [application.services.web.ready]
 http = "http://127.0.0.1:4300/health"
