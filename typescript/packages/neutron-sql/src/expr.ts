@@ -46,6 +46,14 @@ export { quoteIdent as qident } from "./compile.js";
 
 export type Condition = ValueNode;
 
+/** `excluded.<column>` — the row proposed for insertion, addressable inside
+ *  ON CONFLICT DO UPDATE SET assignments and predicates (Q03). Renders the
+ *  pseudo-relation reference `excluded."col"`. Only valid in on-conflict
+ *  clauses; update .set() values reject it before SQL. */
+export function excluded(col: AnyColumnBuilder): ReturnType<typeof qual> {
+  return qual("excluded", col.columnName);
+}
+
 function colRef(col: AnyColumnBuilder | string, table?: string): ValueNode {
   if (typeof col === "string") return ident(col);
   if (table) return qual(table, col.columnName);

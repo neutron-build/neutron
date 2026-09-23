@@ -96,6 +96,7 @@ export {
   asc,
   desc,
   exists,
+  excluded,
   count,
   countDistinct,
   sum,
@@ -133,6 +134,8 @@ export {
   type FullSelectPlan,
   type PlanColumnSpec,
   type SubquerySource,
+  type ConflictTargetSpec,
+  type ReturningSubsetOf,
 } from "./builder.js";
 
 // Q02: derived tables and CTE references — table-like handles over a select
@@ -170,6 +173,8 @@ export {
   insertStatement,
   updateStatement,
   deleteStatement,
+  onConflictClause,
+  assertDistinctPhysicalColumns,
   isValueNode,
   isStatement,
   type IdentifierNode,
@@ -196,6 +201,9 @@ export {
   type StatementInput,
   type InsertStatementNode,
   type InsertStatementInput,
+  type OnConflictNode,
+  type OnConflictClauseInput,
+  type ConflictTarget,
   type UpdateStatementNode,
   type UpdateStatementInput,
   type UpdateAssignment,

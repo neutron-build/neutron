@@ -51,6 +51,7 @@ import {
   boolAnd,
   boolOr,
   exists,
+  excluded,
   cteTable,
   derivedTable,
   type ColumnBuilder,
@@ -432,3 +433,49 @@ async function q02Fixtures(): Promise<void> {
   void [g, s1, grouped, fromCte, fromDerived, lj, u, seenAgg, seenComposed];
 }
 void q02Fixtures;
+
+// --- Q03 conflict handling and write expressions through the packed
+// declarations: on-conflict builders keep the insert's R (number without
+// returning, rows with), returning subsets are exact, excluded() values fit
+// set inputs, and arity is honest (0..n rows for conflicted statements).
+
+async function q03Fixtures(): Promise<void> {
+  const db = await createDatabase({ url: "postgres://type-fixture:not-run@localhost:1/none", tables: { users, posts } });
+
+  // do-nothing: R stays number without returning; rows array with it (0..n).
+  const plain = db.insert(users).values({ email: "a@x.com" }).onConflictDoNothing();
+  const eqPlain: AssertEq<Awaited<typeof plain>, number> = true;
+  const rowsBack = db.insert(users).values({ email: "a@x.com" }).onConflictDoNothing().returning();
+  const eqRows: AssertEq<Awaited<typeof rowsBack>[number], typeof users.$inferSelect> = true;
+
+  // returning subsets are exact: only the requested keys, with column types.
+  const subset = db.insert(users).values({ email: "a@x.com" }).returning(["id", "email"]);
+  const eqSubset: AssertEq<Awaited<typeof subset>[number], { id: number; email: string }> = true;
+  // @ts-expect-error unknown returning key is rejected
+  db.insert(users).values({ email: "a@x.com" }).returning(["nope"]);
+  const updSubset = db.update(users).set({ name: "n" }).where(eq(users.id, 1)).returning(["email", "name"]);
+  const eqUpd: AssertEq<Awaited<typeof updSubset>[number], { email: string; name: string | null }> = true;
+  void [eqPlain, eqRows, eqSubset, eqUpd];
+
+  // upsert: excluded() values type-check in set inputs alongside literals
+  // and sql expressions; targets take single/composite columns.
+  const up = db
+    .insert(users)
+    .values({ email: "a@x.com" })
+    .onConflictUpdate({ target: users.email, set: { name: sql`${excluded(users.name)}`, email: "kept@x.com" } })
+    .returning(["id", "email"]);
+  const eqUp: AssertEq<Awaited<typeof up>[number], { id: number; email: string }> = true;
+  void [eqUp, up, subset, updSubset, rowsBack, plain];
+  // @ts-expect-error unknown set key is rejected in on-conflict set maps
+  db.insert(users).values({ email: "a@x.com" }).onConflictUpdate({ target: users.email, set: { nope: 1 } });
+  // @ts-expect-error invalid literal type for the column
+  db.insert(users).values({ email: "a@x.com" }).onConflictUpdate({ target: users.email, set: { name: 42 } });
+
+  // Conditional upsert predicates take Conditions (fragments compose).
+  const cond: Condition = or(sql`${users.name} is null`, eq(users.id, 1));
+  void db
+    .insert(users)
+    .values({ email: "a@x.com" })
+    .onConflictUpdate({ target: { columns: [users.email], where: sql`${users.name} is null` }, set: { name: "n" }, setWhere: cond });
+}
+void q03Fixtures;

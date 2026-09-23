@@ -42,6 +42,7 @@ import {
 import type { ColumnDataType } from "./schema.js";
 import {
   assertCteRefsResolve,
+  assertDistinctPhysicalColumns,
   cte,
   defaultCell,
   ident,
@@ -50,6 +51,7 @@ import {
   isValueNode,
   join as joinNode,
   legacyFragmentError,
+  onConflictClause,
   param as paramNode,
   paramCast,
   projection as projectionNode,
@@ -63,10 +65,12 @@ import {
   type AggregateNode,
   type AnyStatementNode,
   type CteNode,
+  type ConflictTarget,
   type FromTarget,
   type IdentifierNode,
   type InsertCell,
   type JoinType,
+  type OnConflictNode,
   type OrderSpec,
   type ParamNode,
   type ProjectionNode,
@@ -74,6 +78,7 @@ import {
   type SetOpKind,
   type StatementNode,
   type SubqueryNode,
+  type UpdateAssignment,
   type ValueNode,
 } from "./ast.js";
 import { compileStatement, type CompiledQuery } from "./compile.js";
@@ -337,6 +342,206 @@ function effectiveNotNull(column: AnyColumnBuilder): boolean {
  *  serial columns always have a server default. */
 function requiredInsertKeys(table: AnyPgTable): Array<{ propertyKey: string; column: AnyColumnBuilder }> {
   return columnEntries(table).filter(({ column }) => effectiveNotNull(column) && !column.hasDefault && column.dataType !== "serial");
+}
+
+// ---------------------------------------------------------------------------
+// ON CONFLICT (Q03) — builder-side resolution of the frozen AST clause
+// ---------------------------------------------------------------------------
+
+/** Conflict target for the typed insert builder: one column, a composite
+ *  list, either plus an index predicate (partial unique indexes), or a named
+ *  constraint (`on conflict on constraint …`). Omitted target = PostgreSQL
+ *  arbitrates (DO NOTHING only; DO UPDATE requires a target). */
+export type ConflictTargetSpec =
+  | AnyColumnBuilder
+  | readonly AnyColumnBuilder[]
+  | { readonly columns: readonly AnyColumnBuilder[]; readonly where?: Condition }
+  | { readonly constraint: string };
+
+/** Builder-side conflict plan, frozen at the onConflict* call and resolved
+ *  against the table at compile time (single path for toSQL/execute). */
+interface ConflictPlan {
+  readonly action: "nothing" | "update";
+  readonly target?: ConflictTargetSpec;
+  /** Index predicate from the `where`/`targetWhere` option. */
+  readonly targetWhere?: Condition;
+  /** Raw set input (update only), resolved at compile time. */
+  readonly set?: Record<string, unknown>;
+  /** DO UPDATE ... WHERE. */
+  readonly setWhere?: Condition;
+}
+
+function isColumnBuilderLike(v: unknown): v is AnyColumnBuilder {
+  return typeof v === "object" && v !== null && typeof (v as { columnName?: unknown }).columnName === "string";
+}
+
+/** Collect `excluded."col"` references from expression positions (expr args,
+ *  aggregate args, structural fragment parts). Fragment TEXT is never
+ *  scanned; subqueries are separate scopes PostgreSQL keeps excluded out of. */
+function collectExcludedRefs(node: ValueNode, out: QualifiedNode[]): void {
+  switch (node.kind) {
+    case "qualified":
+      if (node.parts.length > 0 && node.parts[0] === "excluded") out.push(node);
+      return;
+    case "expr":
+      for (const a of node.args) collectExcludedRefs(a, out);
+      return;
+    case "aggregate":
+      for (const a of node.args) collectExcludedRefs(a, out);
+      return;
+    case "fragment":
+      for (const p of node.parts) if (typeof p !== "string") collectExcludedRefs(p, out);
+      return;
+    default:
+      return;
+  }
+}
+
+/** excluded() references are only addressable inside ON CONFLICT clauses —
+ *  an update .set() value referencing the pseudo-relation fails closed
+ *  before SQL instead of as a database "missing FROM-clause entry". */
+function assertNoExcludedRefs(node: ValueNode, who: string): void {
+  const refs: QualifiedNode[] = [];
+  collectExcludedRefs(node, refs);
+  if (refs.length > 0) {
+    throw new Error(`${who}: excluded() references the row proposed for insertion and is only valid in on-conflict clauses`);
+  }
+}
+
+/** Every excluded."col" reference in an on-conflict expression must name a
+ *  physical column of the inserted table — typo'd references fail before SQL
+ *  instead of as a database error. */
+function assertExcludedColumnsResolve(tableName: string, columns: Record<string, AnyColumnBuilder>, node: ValueNode, who: string): void {
+  const refs: QualifiedNode[] = [];
+  collectExcludedRefs(node, refs);
+  const physicalNames = new Set(Object.values(columns).map((c) => c.columnName));
+  for (const ref of refs) {
+    if (ref.parts.length !== 2 || !physicalNames.has(ref.parts[1])) {
+      throw new Error(`${who}: excluded reference "${ref.parts.join(".")}" is not a column of ${tableName}`);
+    }
+  }
+}
+
+function resolveConflictTarget(
+  table: AnyPgTable,
+  spec: ConflictTargetSpec,
+  targetWhere: Condition | undefined,
+): { columns?: readonly string[]; constraint?: string; predicate?: Condition } {
+  const tableName = getTableName(table);
+  let cols: readonly AnyColumnBuilder[] | undefined;
+  let inlineWhere: Condition | undefined;
+  let constraint: string | undefined;
+  if (isColumnBuilderLike(spec)) {
+    cols = [spec];
+  } else if (Array.isArray(spec)) {
+    cols = spec;
+  } else if (typeof (spec as { constraint?: unknown }).constraint === "string") {
+    constraint = (spec as { constraint: string }).constraint;
+  } else if (Array.isArray((spec as { columns?: unknown }).columns)) {
+    cols = (spec as { columns: readonly AnyColumnBuilder[]; where?: Condition }).columns;
+    inlineWhere = (spec as { columns: readonly AnyColumnBuilder[]; where?: Condition }).where;
+  } else {
+    throw new Error(`on conflict target on ${tableName}: pass a column, a column array, { columns, where } or { constraint }`);
+  }
+  if (constraint !== undefined) {
+    if (constraint.length === 0) throw new Error(`on conflict target on ${tableName}: constraint name must be a non-empty string`);
+    if (targetWhere !== undefined) {
+      throw new Error(`on conflict target on ${tableName}: an index predicate is only valid with a column-list target — ON CONSTRAINT takes no predicate`);
+    }
+    return { constraint };
+  }
+  if (cols === undefined || cols.length === 0) {
+    throw new Error(`on conflict target on ${tableName}: a column-list target needs at least one column`);
+  }
+  if (inlineWhere !== undefined && targetWhere !== undefined) {
+    throw new Error(`on conflict target on ${tableName}: index predicate supplied twice — pass it as the target's where or the option, not both`);
+  }
+  const predicate = inlineWhere ?? targetWhere;
+  if (predicate !== undefined) rejectLegacyFragment(predicate, "on conflict target where");
+  const physicalNames = new Set(Object.values(getTableColumns(table) as Record<string, AnyColumnBuilder>).map((c) => c.columnName));
+  const physical = cols.map((c) => {
+    if (!isColumnBuilderLike(c)) throw new Error(`on conflict target on ${tableName}: target entries must be column builders of ${tableName}`);
+    if (!physicalNames.has(c.columnName)) {
+      throw new Error(`on conflict target: "${c.columnName}" is not a column of ${tableName}`);
+    }
+    return c.columnName;
+  });
+  return { columns: physical, predicate };
+}
+
+/** Encode an on-conflict SET map exactly like update .set(): literals run
+ *  through the column codec, ValueNodes (expressions, excluded() refs, sql
+ *  fragments) splice structurally on non-json columns, null checks NOT NULL.
+ *  Duplicate physical assignments error deterministically (key-order
+ *  independent). */
+function conflictAssignments(table: AnyPgTable, values: Record<string, unknown>): UpdateSet[] {
+  const tableName = getTableName(table);
+  const columns = getTableColumns(table) as Record<string, AnyColumnBuilder>;
+  const added: UpdateSet[] = [];
+  const inputEntries: Array<readonly [string, string]> = [];
+  for (const [key, value] of Object.entries(values)) {
+    const column = columns[key];
+    if (!column) throw new Error(`unknown column "${key}" on ${tableName}`);
+    if (value === undefined) continue; // omitted/undefined set keys are ignored
+    const physical = column.columnName;
+    inputEntries.push([key, physical]);
+    if (value === null) {
+      if (effectiveNotNull(column)) {
+        throw new Error(`on conflict do update set on ${tableName}: null is not allowed for NOT NULL column "${key}" ("${physical}")`);
+      }
+      added.push({ propertyKey: key, column: physical, value: paramNode(null) });
+      continue;
+    }
+    const isJson = column.dataType === "json" || column.dataType === "jsonb";
+    if (!isJson && isValueNode(value)) {
+      assertExcludedColumnsResolve(tableName, columns, value, `on conflict do update set "${key}" on ${tableName}`);
+      added.push({ propertyKey: key, column: physical, value });
+      continue;
+    }
+    rejectLegacyFragment(value, "on conflict set");
+    added.push({ propertyKey: key, column: physical, value: cellNode(encodeForColumn(tableName, column, key, value)) });
+  }
+  if (added.length === 0) {
+    throw new Error(`on conflict do update set on ${tableName}: no assignments — undefined values are ignored`);
+  }
+  assertDistinctPhysicalColumns(tableName, inputEntries, "on conflict do update set");
+  return added;
+}
+
+/** Resolve the builder-side conflict plan into the frozen AST clause. */
+function buildOnConflictNode(table: AnyPgTable, plan: ConflictPlan): OnConflictNode {
+  const tableName = getTableName(table);
+  const columns = getTableColumns(table) as Record<string, AnyColumnBuilder>;
+  const input: {
+    action: "nothing" | "update";
+    targetColumns?: readonly string[];
+    targetWhere?: readonly ValueNode[];
+    constraint?: string;
+    sets?: readonly UpdateAssignment[];
+    where?: readonly ValueNode[];
+  } = { action: plan.action };
+  if (plan.target !== undefined) {
+    const resolved = resolveConflictTarget(table, plan.target, plan.targetWhere);
+    if (resolved.constraint !== undefined) {
+      input.constraint = resolved.constraint;
+    } else if (resolved.columns !== undefined) {
+      input.targetColumns = resolved.columns;
+      if (resolved.predicate !== undefined) {
+        assertExcludedColumnsResolve(tableName, columns, resolved.predicate, `on conflict target where on ${tableName}`);
+        input.targetWhere = whereItems([resolved.predicate]);
+      }
+    }
+  }
+  if (plan.action === "update") {
+    if (plan.set === undefined) throw new Error("onConflictUpdate: set is required");
+    input.sets = conflictAssignments(table, plan.set);
+    if (plan.setWhere !== undefined) {
+      rejectLegacyFragment(plan.setWhere, "on conflict set where");
+      assertExcludedColumnsResolve(tableName, columns, plan.setWhere, `on conflict set where on ${tableName}`);
+      input.where = whereItems([plan.setWhere]);
+    }
+  }
+  return onConflictClause(input);
 }
 
 // ---------------------------------------------------------------------------
@@ -991,13 +1196,62 @@ export class SetOpBuilder<R> implements PromiseLike<R[]> {
 // Insert
 // ---------------------------------------------------------------------------
 
+/** Result type of a selected returning() subset: exactly the requested
+ *  property keys with their column read types. */
+export type ReturningSubsetOf<TCols extends Record<string, AnyColumnBuilder>, K extends keyof TCols> = {
+  [P in K]: SelectTypeOf<TCols[P]>;
+};
+
+/** Returning selection state: null = no returning, "all" = every column,
+ *  otherwise the requested property keys in selection order. */
+type ReturningKeys = null | "all" | readonly string[];
+
+function returningPlanFor(
+  table: AnyPgTable,
+  keys: ReturningKeys,
+): { nodes: ProjectionNode[]; decoders: ProjectionDecoder[]; capabilities: StatementCapability[] } {
+  if (keys === null) {
+    return { nodes: [], decoders: [] as ProjectionDecoder[], capabilities: [] as StatementCapability[] };
+  }
+  const tableName = getTableName(table);
+  if (keys === "all") {
+    return selectPlanFor(tableRefParts(table), tableName, columnEntries(table));
+  }
+  const columns = getTableColumns(table) as Record<string, AnyColumnBuilder>;
+  const seen = new Set<string>();
+  const entries: ColumnEntries = [];
+  for (const key of keys) {
+    const column = columns[key];
+    if (!column) throw new Error(`returning: unknown column "${key}" on ${tableName}`);
+    if (seen.has(key)) throw new Error(`returning: column "${key}" is selected twice — select each column once`);
+    seen.add(key);
+    entries.push({ propertyKey: key, column });
+  }
+  return selectPlanFor(tableRefParts(table), tableName, entries);
+}
+
+/** Validate a returning selection eagerly (at the returning() call): keys
+ *  must be known property keys, each selected once. The compile-time plan
+ *  re-checks as a backstop. */
+function assertReturningKeys(table: AnyPgTable, keys: readonly string[]): void {
+  const tableName = getTableName(table);
+  const columns = getTableColumns(table) as Record<string, AnyColumnBuilder>;
+  const seen = new Set<string>();
+  for (const key of keys) {
+    if (!Object.hasOwn(columns, key)) throw new Error(`returning: unknown column "${key}" on ${tableName}`);
+    if (seen.has(key)) throw new Error(`returning: column "${key}" is selected twice — select each column once`);
+    seen.add(key);
+  }
+}
+
 export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = number> implements PromiseLike<R> {
   constructor(
     private readonly ctx: ExecContext,
     private readonly table: PgTable<TCols>,
     private readonly rows: Array<Record<string, unknown>> = [],
     private readonly hasValues = false,
-    private readonly wantsReturning = false,
+    private readonly returningKeys: ReturningKeys = null,
+    private readonly conflict: ConflictPlan | null = null,
   ) {
     rejectAliasHandle(table, "insert");
     rejectDerivedTable(table, "insert");
@@ -1007,17 +1261,68 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
 
   values(values: InferInsertModelOfRecord<TCols> | Array<InferInsertModelOfRecord<TCols>>): InsertBuilder<TCols, R> {
     const rows = Array.isArray(values) ? (values as unknown as Array<Record<string, unknown>>) : [values as unknown as Record<string, unknown>];
-    return new InsertBuilder<TCols, R>(this.ctx, this.table, rows, true, this.wantsReturning);
+    return new InsertBuilder<TCols, R>(this.ctx, this.table, rows, true, this.returningKeys, this.conflict);
   }
 
-  returning(): InsertBuilder<TCols, Array<InferSelectModelOfRecord<TCols>>> {
-    return new InsertBuilder<TCols, Array<InferSelectModelOfRecord<TCols>>>(
-      this.ctx,
-      this.table,
-      this.rows,
-      this.hasValues,
-      true,
-    ) as unknown as InsertBuilder<TCols, Array<InferSelectModelOfRecord<TCols>>>;
+  /** `on conflict do nothing` — a unique violation is ignored instead of
+   *  failing the statement. `where` is the index predicate for partial unique
+   *  index targets (only valid with a column-list target). Conflicted rows
+   *  are simply not inserted: with .returning() they are omitted from the
+   *  result (0..n rows — the actual inserted set, per PostgreSQL). */
+  onConflictDoNothing(opts: { target?: ConflictTargetSpec; where?: Condition } = {}): InsertBuilder<TCols, R> {
+    this.assertNoConflict("onConflictDoNothing");
+    if (opts.where !== undefined) rejectLegacyFragment(opts.where, "on conflict target where");
+    return new InsertBuilder<TCols, R>(this.ctx, this.table, this.rows, this.hasValues, this.returningKeys, {
+      action: "nothing",
+      target: opts.target,
+      targetWhere: opts.where,
+    });
+  }
+
+  /** `on conflict … do update set … [where …]` — the upsert. `target` is
+   *  required (PostgreSQL rejects targetless DO UPDATE); `set` assignments
+   *  may reference `excluded(col)` (the proposed row), expressions and
+   *  literals; `targetWhere` is the partial-index predicate, `setWhere` the
+   *  conditional-update predicate (conflicted rows it rejects are neither
+   *  updated nor returned). Returning yields one row per input row that was
+   *  inserted or updated. */
+  onConflictUpdate(opts: {
+    target: ConflictTargetSpec;
+    set: UpdateSetInput<TCols>;
+    targetWhere?: Condition;
+    setWhere?: Condition;
+  }): InsertBuilder<TCols, R> {
+    this.assertNoConflict("onConflictUpdate");
+    if (opts.target === undefined) throw new Error("onConflictUpdate: target is required — PostgreSQL rejects targetless DO UPDATE");
+    if (opts.set === undefined || typeof opts.set !== "object") throw new Error("onConflictUpdate: set is required");
+    if (opts.targetWhere !== undefined) rejectLegacyFragment(opts.targetWhere, "on conflict target where");
+    if (opts.setWhere !== undefined) rejectLegacyFragment(opts.setWhere, "on conflict set where");
+    return new InsertBuilder<TCols, R>(this.ctx, this.table, this.rows, this.hasValues, this.returningKeys, {
+      action: "update",
+      target: opts.target,
+      targetWhere: opts.targetWhere,
+      set: opts.set as Record<string, unknown>,
+      setWhere: opts.setWhere,
+    });
+  }
+
+  private assertNoConflict(who: string): void {
+    if (this.conflict !== null) {
+      throw new Error(
+        `${who}: this insert already carries an on-conflict clause (${this.conflict.action === "nothing" ? "do nothing" : "do update"}) — build a new insert per conflict action`,
+      );
+    }
+  }
+
+  returning(): InsertBuilder<TCols, Array<InferSelectModelOfRecord<TCols>>>;
+  returning<K extends keyof TCols & string>(selection: K | readonly K[]): InsertBuilder<TCols, Array<ReturningSubsetOf<TCols, K>>>;
+  returning(selection?: keyof TCols & string | readonly (keyof TCols & string)[]): InsertBuilder<TCols, unknown> {
+    const keys: ReturningKeys = selection === undefined ? "all" : Array.isArray(selection) ? [...selection] : [selection];
+    if (keys !== "all" && keys !== null) {
+      if (keys.length === 0) throw new Error("returning: select at least one column — no-argument returning() returns every column");
+      assertReturningKeys(this.table, keys);
+    }
+    return new InsertBuilder<TCols, unknown>(this.ctx, this.table, this.rows, this.hasValues, keys, this.conflict);
   }
 
   toCompiled(): CompiledStatement {
@@ -1035,7 +1340,10 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     // supplied when it is present with a value other than undefined in at
     // least one row; explicit null is a supplied value (NULL, never DEFAULT).
     // Non-null values are codec-encoded now (validation + canonical text) so
-    // the values section binds exactly what was validated.
+    // the values section binds exactly what was validated. Duplicate physical
+    // assignments inside one row (two property keys mapping to one physical
+    // column) are rejected order-independently — the emitted column list
+    // would assign the column twice.
     const supplied = new Set<string>();
     const encodedRows: Array<Map<string, EncodedValue>> = [];
     for (let rowIdx = 0; rowIdx < this.rows.length; rowIdx++) {
@@ -1043,8 +1351,9 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
       if (typeof row !== "object" || row === null || Array.isArray(row)) {
         throw new Error(`insert .values() rows must be objects on ${tableName}`);
       }
+      const rowKeys = Object.keys(row);
       const encoded = new Map<string, EncodedValue>();
-      for (const key of Object.keys(row)) {
+      for (const key of rowKeys) {
         if (!knownKeys.has(key)) throw new Error(`unknown column "${key}" on ${tableName}`);
         const column = columns[key];
         const value = row[key];
@@ -1060,6 +1369,14 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
         }
         supplied.add(key);
       }
+      // Duplicate physical assignments inside one row (two property keys
+      // mapping to one physical column) are rejected order-independently —
+      // the emitted column list would assign the column twice.
+      assertDistinctPhysicalColumns(
+        tableName,
+        rowKeys.map((k) => [k, columns[k].columnName] as const),
+        "insert values",
+      );
       encodedRows.push(encoded);
       const missing = required.filter(({ propertyKey }) => !Object.hasOwn(row, propertyKey) || row[propertyKey] === undefined);
       if (missing.length > 0) {
@@ -1075,21 +1392,21 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     // use own properties only: an inherited value is not a supplied value.
     const orderedKeys = propertyOrder.filter((k) => supplied.has(k));
 
-    const returningPlan = this.wantsReturning
-      ? selectPlanFor(tableRefParts(this.table), tableName, columnEntries(this.table))
-      : { nodes: [] as ProjectionNode[], decoders: [] as ProjectionDecoder[], capabilities: [] as StatementCapability[] };
+    const returningPlan = returningPlanFor(this.table, this.returningKeys);
+    const onConflict = this.conflict === null ? undefined : buildOnConflictNode(this.table, this.conflict);
 
     const stmt: AnyStatementNode = (() => {
       if (orderedKeys.length === 0) {
         // Every row is default-only. Postgres has no multi-row DEFAULT VALUES
         // form, so batch by explicitly requesting DEFAULT for one column.
         if (this.rows.length === 1) {
-          return insertStatement({ table: tableTargetNode(this.table), defaultValues: true, returning: returningPlan.nodes });
+          return insertStatement({ table: tableTargetNode(this.table), defaultValues: true, onConflict, returning: returningPlan.nodes });
         }
         return insertStatement({
           table: tableTargetNode(this.table),
           columns: [columns[propertyOrder[0]].columnName],
           rows: this.rows.map(() => [defaultCell()] as ReadonlyArray<InsertCell>),
+          onConflict,
           returning: returningPlan.nodes,
         });
       }
@@ -1104,10 +1421,12 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
             return cellNode(encoded.get(k)!);
           });
         }),
+        onConflict,
         returning: returningPlan.nodes,
       });
     })();
 
+    assertCteRefsResolve(stmt);
     return {
       ...compileStatement(stmt),
       decoders: returningPlan.decoders,
@@ -1122,7 +1441,7 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
 
   async execute(): Promise<R> {
     const compiled = this.toCompiled();
-    if (this.wantsReturning) {
+    if (this.returningKeys !== null) {
       const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query", compiled.capabilities)) as Array<Record<string, unknown>>;
       applyProjectionDecoders(rows, compiled.decoders);
       return rows as R;
@@ -1143,6 +1462,8 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
 // ---------------------------------------------------------------------------
 
 interface UpdateSet {
+  /** Declared property key (for duplicate-assignment diagnostics). */
+  readonly propertyKey: string;
   readonly column: string;
   readonly value: ValueNode;
 }
@@ -1154,7 +1475,7 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     private readonly sets: ReadonlyArray<UpdateSet> = [],
     private readonly hasSet = false,
     private readonly conditions: readonly Condition[] = [],
-    private readonly wantsReturning = false,
+    private readonly returningKeys: ReturningKeys = null,
   ) {
     rejectAliasHandle(table, "update");
     rejectDerivedTable(table, "update");
@@ -1178,37 +1499,39 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
         if (effectiveNotNull(column)) {
           throw new Error(`update on ${tableName}: null is not allowed for NOT NULL column "${key}" ("${physical}")`);
         }
-        added.push({ column: physical, value: paramNode(null) });
+        added.push({ propertyKey: key, column: physical, value: paramNode(null) });
         continue;
       }
       const isJson = column.dataType === "json" || column.dataType === "jsonb";
       // AST fragments (sql`...`) stay supported assignments on every column
       // type except json/jsonb, where plain-object values always bind as
-      // values.
+      // values. excluded() references are on-conflict-only and fail closed
+      // here instead of as a database "missing FROM-clause entry".
       if (!isJson && isValueNode(value)) {
-        added.push({ column: physical, value });
+        assertNoExcludedRefs(value, `update set on ${tableName} column "${key}"`);
+        added.push({ propertyKey: key, column: physical, value });
         continue;
       }
       rejectLegacyFragment(value, "update set");
-      added.push({ column: physical, value: cellNode(encodeForColumn(tableName, column, key, value)) });
+      added.push({ propertyKey: key, column: physical, value: cellNode(encodeForColumn(tableName, column, key, value)) });
     }
-    return new UpdateBuilder<TCols, R>(this.ctx, this.table, [...this.sets, ...added], true, this.conditions, this.wantsReturning);
+    return new UpdateBuilder<TCols, R>(this.ctx, this.table, [...this.sets, ...added], true, this.conditions, this.returningKeys);
   }
 
   where(condition: Condition): UpdateBuilder<TCols, R> {
     rejectLegacyFragment(condition, "where");
-    return new UpdateBuilder<TCols, R>(this.ctx, this.table, this.sets, this.hasSet, [...this.conditions, condition], this.wantsReturning);
+    return new UpdateBuilder<TCols, R>(this.ctx, this.table, this.sets, this.hasSet, [...this.conditions, condition], this.returningKeys);
   }
 
-  returning(): UpdateBuilder<TCols, Array<InferSelectModelOfRecord<TCols>>> {
-    return new UpdateBuilder<TCols, Array<InferSelectModelOfRecord<TCols>>>(
-      this.ctx,
-      this.table,
-      this.sets,
-      this.hasSet,
-      this.conditions,
-      true,
-    ) as unknown as UpdateBuilder<TCols, Array<InferSelectModelOfRecord<TCols>>>;
+  returning(): UpdateBuilder<TCols, Array<InferSelectModelOfRecord<TCols>>>;
+  returning<K extends keyof TCols & string>(selection: K | readonly K[]): UpdateBuilder<TCols, Array<ReturningSubsetOf<TCols, K>>>;
+  returning(selection?: keyof TCols & string | readonly (keyof TCols & string)[]): UpdateBuilder<TCols, unknown> {
+    const keys: ReturningKeys = selection === undefined ? "all" : Array.isArray(selection) ? [...selection] : [selection];
+    if (keys !== "all" && keys !== null) {
+      if (keys.length === 0) throw new Error("returning: select at least one column — no-argument returning() returns every column");
+      assertReturningKeys(this.table, keys);
+    }
+    return new UpdateBuilder<TCols, unknown>(this.ctx, this.table, this.sets, this.hasSet, this.conditions, keys);
   }
 
   toCompiled(): CompiledStatement {
@@ -1216,9 +1539,15 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     if (this.sets.length === 0) throw new Error("update .set() had no assignments — undefined values are ignored");
     if (this.conditions.length === 0) throw new Error("update without .where() is not allowed");
     const tableName = getTableName(this.table);
-    const returningPlan = this.wantsReturning
-      ? selectPlanFor(tableRefParts(this.table), tableName, columnEntries(this.table))
-      : { nodes: [] as ProjectionNode[], decoders: [] as ProjectionDecoder[], capabilities: [] as StatementCapability[] };
+    // A column assigned by two .set() calls (or two property keys mapping to
+    // one physical column) is a deterministic pre-SQL error — never a
+    // traversal-order-dependent "multiple assignments" database error.
+    assertDistinctPhysicalColumns(
+      tableName,
+      this.sets.map((s) => [s.propertyKey, s.column] as const),
+      "update set",
+    );
+    const returningPlan = returningPlanFor(this.table, this.returningKeys);
     const stmt = updateStatement({
       table: tableTargetNode(this.table),
       sets: this.sets,
@@ -1240,7 +1569,7 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
 
   async execute(): Promise<R> {
     const compiled = this.toCompiled();
-    if (this.wantsReturning) {
+    if (this.returningKeys !== null) {
       const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query", compiled.capabilities)) as Array<Record<string, unknown>>;
       applyProjectionDecoders(rows, compiled.decoders);
       return rows as R;

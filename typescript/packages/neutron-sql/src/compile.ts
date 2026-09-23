@@ -20,6 +20,7 @@ import type {
   ExpressionNode,
   InsertStatementNode,
   JoinNode,
+  OnConflictNode,
   OrderSpec,
   ProjectionNode,
   SqlNode,
@@ -324,6 +325,54 @@ function compileReturning(returning: readonly ProjectionNode[] | undefined, stat
   }
 }
 
+/** ON CONFLICT rendering (Q03). The target's index predicate and the DO
+ *  UPDATE predicate both go through compilePredicateList, so fragments and
+ *  trusted segments are delimited exactly like where/having — the Grouping
+ *  guarantee extends to conflict clauses. */
+function compileOnConflict(node: OnConflictNode, state: CompileState): void {
+  if (node.action !== "nothing" && node.action !== "update") {
+    throw new Error(`compile insert: unknown on-conflict action ${JSON.stringify(node.action)}`);
+  }
+  state.parts.push(" on conflict");
+  const target = node.target;
+  if (target !== undefined) {
+    if (target.kind === "constraint") {
+      state.parts.push(` on constraint ${quoteIdent(target.constraint)}`);
+    } else {
+      if (!Array.isArray(target.columns) || target.columns.length === 0) {
+        throw new Error("compile insert: a column-list conflict target needs at least one column");
+      }
+      state.parts.push(" (");
+      for (let i = 0; i < target.columns.length; i++) {
+        if (i > 0) state.parts.push(", ");
+        state.parts.push(quoteIdent(target.columns[i]));
+      }
+      state.parts.push(")");
+      compilePredicateList(target.where ?? [], "where", state);
+    }
+  }
+  if (node.action === "nothing") {
+    if ((node.sets !== undefined && node.sets.length > 0) || (node.where !== undefined && node.where.length > 0)) {
+      throw new Error("compile insert: do nothing takes no assignments or predicate");
+    }
+    state.parts.push(" do nothing");
+    return;
+  }
+  if (target === undefined) {
+    throw new Error("compile insert: on conflict do update requires a target — PostgreSQL rejects targetless DO UPDATE");
+  }
+  const sets = node.sets ?? [];
+  if (sets.length === 0) throw new Error("compile insert: on conflict do update requires at least one assignment");
+  state.parts.push(" do update set ");
+  for (let i = 0; i < sets.length; i++) {
+    if (i > 0) state.parts.push(", ");
+    state.parts.push(quoteIdent(sets[i].column));
+    state.parts.push(" = ");
+    compile(sets[i].value, state);
+  }
+  compilePredicateList(node.where ?? [], "where", state);
+}
+
 function compileInsert(node: InsertStatementNode, state: CompileState): void {
   state.parts.push("insert into ");
   compile(node.table, state);
@@ -347,6 +396,7 @@ function compileInsert(node: InsertStatementNode, state: CompileState): void {
       state.parts.push(")");
     }
   }
+  if (node.onConflict !== undefined) compileOnConflict(node.onConflict, state);
   compileReturning(node.returning, state);
 }
 
