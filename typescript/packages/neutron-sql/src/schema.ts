@@ -97,6 +97,11 @@ export class ColumnBuilder<
   hasDefault: boolean = false;
   defaultValue: unknown = undefined;
   isUnique = false;
+  /** Q02: the column lives in a derived table/CTE whose source already
+   *  materialized the canonical text wire form (to_jsonb(...)::text) — the
+   *  outer acquisition must cast back to the temporal type before
+   *  re-rendering, or the JSON quotes would double. */
+  canonicalText = false;
   varcharLength?: number;
   vectorDimensions?: number;
   nowDefault = false;
@@ -424,6 +429,12 @@ export function alias<Cols extends Record<string, AnyColumnBuilder>, A extends s
   if (isAliasHandle(table)) {
     throw new Error(`alias: input is already an alias handle ("${table[ALIAS_MARKER].alias}") — alias the base table, not a handle`);
   }
+  if (isDerivedTableHandle(table)) {
+    const rec = table[DERIVED_MARKER];
+    throw new Error(
+      `alias: input is a ${rec.kind === "cte" ? "CTE" : "derived-table"} handle ("${rec.name}") — name it at construction (derivedTable/cteTable) instead of re-aliasing; the subquery would be lost`,
+    );
+  }
   tableMetaOf(table, "alias");
   if (typeof name !== "string" || name.length === 0) throw new Error("alias: name must be a non-empty string");
   if (name.includes("\0")) throw new Error("alias: name must not contain NUL bytes");
@@ -470,6 +481,61 @@ export function isAliasHandle(value: unknown): value is { [ALIAS_MARKER]: AliasR
 export function rejectAliasHandle(value: unknown, who: string): void {
   if (isAliasHandle(value)) {
     throw new Error(`${who}: received the alias handle "${value[ALIAS_MARKER].alias}" — alias handles are join identities; pass the base table here`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Derived tables and CTE references (Q02)
+// ---------------------------------------------------------------------------
+// `derivedTable(name, source)` / `cteTable(name, source)` build table-like
+// handles over a subquery: a pseudo-table whose metadata tableName IS the
+// name and whose columns are pseudo-columns synthesized from the source's
+// projections (typed from the source's row type). Derived handles inline
+// `(select …) as "name"` at their reference site; CTE handles render the
+// bare name and auto-register the CTE on the consuming statement.
+
+export const DERIVED_MARKER: unique symbol = Symbol.for("@neutron-build/sql.derived");
+
+/** Runtime record carried by derived/CTE handles. `select` is the source
+ *  statement; `capabilities` are the requirements the source acquired
+ *  (e.g. jsonb-functions for temporal wire forms) — merged into every
+ *  consuming statement. */
+export interface DerivedRecord {
+  readonly kind: "derived" | "cte";
+  readonly name: string;
+  readonly select: import("./ast.js").StatementNode;
+  readonly capabilities: readonly import("./codecs.js").StatementCapability[];
+}
+
+export type AnyDerivedHandle = { readonly [DERIVED_MARKER]: DerivedRecord } & AnyPgTable;
+
+/** True for derivedTable()/cteTable() products. */
+export function isDerivedTableHandle(value: unknown): value is AnyDerivedHandle {
+  if (typeof value !== "object" || value === null) return false;
+  const rec = (value as { [DERIVED_MARKER]?: unknown })[DERIVED_MARKER];
+  if (typeof rec !== "object" || rec === null) return false;
+  const kind = (rec as DerivedRecord).kind;
+  return kind === "derived" || kind === "cte";
+}
+
+/** The derived record of a table, or undefined for base tables and alias
+ *  handles. */
+export function getDerivedRecord(table: AnyPgTable): DerivedRecord | undefined {
+  if (typeof table !== "object" || table === null) return undefined;
+  const rec = (table as { [DERIVED_MARKER]?: unknown })[DERIVED_MARKER];
+  if (typeof rec !== "object" || rec === null) return undefined;
+  const r = rec as DerivedRecord;
+  return (r.kind === "derived" || r.kind === "cte") && typeof r.name === "string" ? r : undefined;
+}
+
+/** Fail closed when a derived/CTE handle reaches a slot that takes base
+ *  tables (mutations, DDL, export, relational registration). */
+export function rejectDerivedTable(value: unknown, who: string): void {
+  if (isDerivedTableHandle(value)) {
+    const rec = value[DERIVED_MARKER];
+    throw new Error(
+      `${who}: received the ${rec.kind === "cte" ? "CTE" : "derived-table"} handle "${rec.name}" — these are query-surface identities (from/joins/selects only); pass a pgTable here`,
+    );
   }
 }
 

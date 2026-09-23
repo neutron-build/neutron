@@ -11,7 +11,8 @@
 // pass through untouched and which keeps microsecond and scale digits intact.
 
 import type { AnyColumnBuilder, ColumnDataType } from "./schema.js";
-import { fragment, type QualifiedNode, type ValueNode } from "./ast.js";
+import { ColumnBuilder } from "./schema.js";
+import { aggregate, fragment, projection, type AggregateNode, type ProjectionNode, type QualifiedNode, type ValueNode } from "./ast.js";
 
 export type BigintMode = "bigint" | "string" | "number";
 export type TemporalMode = "string" | "date";
@@ -76,6 +77,28 @@ export function wireReadNode(dataType: ColumnDataType, ref: QualifiedNode): Valu
       // int8/numeric arrive as exact strings natively on both drivers;
       // bytea arrives as a buffer; the rest are exact JS scalars.
       return null;
+  }
+}
+
+/** Wire acquisition for a column whose stored value is already the canonical
+ *  text form (a derived table/CTE over a text-wire projection): render the
+ *  naive pass-through `to_jsonb(ref::timestamp)::text` for BOTH timestamp and
+ *  timestamptz. The canonical timestamptz text IS the UTC wall clock (the
+ *  level-1 wire form), and `::timestamp` parses naive text with no timezone
+ *  interpretation — so re-parsing can never consult the session timezone and
+ *  the render is idempotent on canonical values (JSON quotes never double
+ *  across composition levels; the decode side appends Z). Re-parsing with
+ *  `::timestamptz` instead would resolve the naive text in the SESSION
+ *  timezone and shift the value per composition level (Q02 review BLOCKER). */
+export function canonicalTextWireNode(dataType: ColumnDataType, ref: QualifiedNode): ValueNode | null {
+  switch (dataType) {
+    case "timestamp":
+    case "timestamptz":
+      return fragment("to_jsonb(", ref, "::timestamp)::text");
+    case "date":
+      return fragment("to_jsonb(", ref, "::date)::text");
+    default:
+      return wireReadNode(dataType, ref);
   }
 }
 
@@ -145,6 +168,10 @@ export function decodeTextWire(column: AnyColumnBuilder, ctx: ColumnContext, raw
       throw codecError(ctx, `unexpected date wire form "${inner}"`);
     }
     return inner;
+  }
+  if (dt === "bytea") {
+    // to_jsonb renders bytea as its \x hex text form inside a JSON string.
+    return byteaFromHex(inner, ctx);
   }
   throw codecError(ctx, `text wire decode is not defined for ${dt} columns`);
 }
@@ -579,4 +606,123 @@ export function needsFlatDecode(column: AnyColumnBuilder): boolean {
     dt === "timestamptz" ||
     dt === "date"
   );
+}
+
+// ---------------------------------------------------------------------------
+// Aggregate projections (Q02) — decode plans follow PostgreSQL result types
+// and the F03 codec policy exactly:
+//   count / count(col) / sum over int-family  -> int8  -> bigint (default mode)
+//   sum over int8/numeric, avg over exact     -> numeric -> exact decimal string
+//   sum/avg over float                        -> float8 -> number (native)
+//   min/max                                   -> the arg column's own codec
+//     (temporals acquire to_jsonb wire forms; int8 honors the column's mode)
+//   string_agg / bool_and / bool_or           -> text/bool, native-exact
+// count never returns null; the other aggregates return null on empty input.
+// ---------------------------------------------------------------------------
+
+/** The result decode spec of an aggregate — the classification shared by
+ *  projection planning (aggregateProjection) and derived-table/CTE pseudo
+ *  columns (a materialized aggregate column decodes exactly like a base
+ *  column of the result type; min/max mirror their argument column). */
+export function aggregateResultColumn(a: AggregateNode): { dataType: ColumnDataType; readMode?: BigintMode | TemporalMode; valueDecoder?: (raw: string) => unknown } {
+  const argCol = a.argColumns?.[0];
+  const argType = argCol?.dataType;
+  if ((a.op === "min" || a.op === "max") && argCol !== undefined) {
+    return { dataType: argCol.dataType, readMode: argCol.readMode, valueDecoder: argCol.valueDecoder };
+  }
+  if (a.op === "count" || (a.op === "sum" && (argType === "serial" || argType === "integer" || argType === "smallint"))) {
+    return { dataType: "bigint" };
+  }
+  if ((a.op === "sum" && (argType === "bigint" || argType === "numeric")) ||
+    (a.op === "avg" && (argType === "serial" || argType === "integer" || argType === "smallint" || argType === "bigint" || argType === "numeric"))) {
+    return { dataType: "numeric" };
+  }
+  if (a.op === "sum" || a.op === "avg") {
+    return { dataType: "double" };
+  }
+  if (a.op === "string_agg") {
+    return { dataType: "text" };
+  }
+  if (a.op === "bool_and" || a.op === "bool_or") {
+    return { dataType: "boolean" };
+  }
+  return { dataType: "text" };
+}
+
+function syntheticColumn(key: string, dataType: ColumnDataType, from?: AnyColumnBuilder): AnyColumnBuilder {
+  const c = new ColumnBuilder(key, dataType);
+  if (from !== undefined) {
+    c.readMode = from.readMode;
+    c.valueDecoder = from.valueDecoder;
+  }
+  return c;
+}
+
+/** Projection + decode plan for one projected aggregate. Mirrors
+ *  selectPlanFor: wire-wrapped temporals carry the jsonb-functions
+ *  capability; int8/numeric arrive natively exact and decode per mode. */
+export function aggregateProjection(a: AggregateNode, key: string): { node: ProjectionNode; decoder: ProjectionDecoder | null; usesJsonb: boolean } {
+  const argCol = a.argColumns?.[0];
+  const argType = argCol?.dataType;
+  const int8Result = (a.op === "count" || (a.op === "sum" && (argType === "serial" || argType === "integer" || argType === "smallint")));
+  const numericResult = (a.op === "sum" && (argType === "bigint" || argType === "numeric")) ||
+    (a.op === "avg" && (argType === "serial" || argType === "integer" || argType === "smallint" || argType === "bigint" || argType === "numeric"));
+
+  if ((a.op === "min" || a.op === "max") && argCol !== undefined) {
+    const dt = argCol.dataType;
+    if (dt === "timestamp" || dt === "timestamptz" || dt === "date") {
+      if (argCol.canonicalText) {
+        // Derived/CTE pseudo-column: the materialized value is the canonical
+        // text wire form (a JSON-quoted string), so the aggregate must parse
+        // it back to the temporal type BEFORE aggregating — a bare min(text)
+        // would return the quoted string and re-quoting would double the
+        // quotes at decode. timestamptz casts ::timestamp (the canonical text
+        // IS the UTC wall clock; ::timestamptz would consult the session
+        // timezone — Q02 review BLOCKER), so no `at time zone` appears and
+        // the render is the naive pass-through (decode appends Z).
+        const castTo = dt === "date" ? "date" : "timestamp";
+        const casted = aggregate(
+          a.op,
+          a.args.map((arg, i) => (a.argColumns?.[i]?.canonicalText === true ? fragment(arg, `::${castTo}`) : arg)),
+          { distinct: a.distinct, argColumns: a.argColumns },
+        );
+        return {
+          node: projection(fragment("to_jsonb(", casted, ")::text"), key),
+          decoder: projectionDecoder(a.op, syntheticColumn(key, dt, argCol), key),
+          usesJsonb: true,
+        };
+      }
+      if (dt === "timestamptz") {
+        return {
+          node: projection(fragment("to_jsonb(", a, " at time zone 'UTC')::text"), key),
+          decoder: projectionDecoder(a.op, syntheticColumn(key, dt, argCol), key),
+          usesJsonb: true,
+        };
+      }
+      return {
+        node: projection(fragment("to_jsonb(", a, ")::text"), key),
+        decoder: projectionDecoder(a.op, syntheticColumn(key, dt, argCol), key),
+        usesJsonb: true,
+      };
+    }
+    if (dt === "bytea") {
+      return {
+        node: projection(fragment("to_jsonb(", a, ")::text"), key),
+        decoder: projectionDecoder(a.op, syntheticColumn(key, dt, argCol), key),
+        usesJsonb: true,
+      };
+    }
+    if (dt === "bigint" || dt === "numeric") {
+      return { node: projection(a, key), decoder: projectionDecoder(a.op, syntheticColumn(key, dt, argCol), key), usesJsonb: false };
+    }
+    return { node: projection(a, key), decoder: null, usesJsonb: false };
+  }
+
+  if (int8Result) {
+    return { node: projection(a, key), decoder: projectionDecoder(a.op, syntheticColumn(key, "bigint"), key), usesJsonb: false };
+  }
+  if (numericResult) {
+    return { node: projection(a, key), decoder: projectionDecoder(a.op, syntheticColumn(key, "numeric"), key), usesJsonb: false };
+  }
+  return { node: projection(a, key), decoder: null, usesJsonb: false };
 }

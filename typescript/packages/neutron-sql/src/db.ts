@@ -21,6 +21,7 @@ import {
   getTableSchema,
   isPgTable,
   isTableRelations,
+  rejectDerivedTable,
   type AnyColumnBuilder,
   type AnyPgTable,
   type PgTable,
@@ -141,6 +142,9 @@ type QueryApiOf<T extends TablesInput, R extends RelationsInput> = {
 
 export interface SelectFrom {
   from<TCols extends Record<string, AnyColumnBuilder>>(table: PgTable<TCols>): SelectBuilder<null, InferSelectModelOfRecord<TCols>>;
+  /** Select from a derived table or CTE reference: the row type is the
+   *  source query's row type (Q02). */
+  from<R extends Record<string, unknown>>(table: import("./subqueries.js").DerivedTable<string, R>): SelectBuilder<null, R>;
 }
 export interface SelectProjectedFrom<P extends Projection> {
   from(table: AnyPgTable): SelectBuilder<P, unknown>;
@@ -188,6 +192,7 @@ export async function createDatabase<
   const tables = new Map<string, { key: string; table: AnyPgTable }>();
   for (const [key, value] of Object.entries(options.tables ?? {})) {
     if (isPgTable(value)) {
+      rejectDerivedTable(value, `tables.${key}`);
       const schema = getTableSchema(value);
       if (schema !== undefined) {
         throw new Error(
@@ -203,6 +208,7 @@ export async function createDatabase<
   const relationsByName = new Map<string, TableRelations>();
   for (const [key, value] of Object.entries(options.relations ?? {})) {
     if (!isTableRelations(value)) continue;
+    rejectDerivedTable(value.table, `relations.${key}`);
     const schema = getTableSchema(value.table);
     if (schema !== undefined) {
       throw new Error(
