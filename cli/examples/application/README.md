@@ -16,7 +16,10 @@ cd examples/application
 ```
 
 Open `http://127.0.0.1:4300`. Edit `web/server.ts` to exercise Node's native watch
-mode. Interrupt the CLI to stop both services. Starting from the `web` directory
+mode. Interrupt the CLI to stop both services: dependents stop first, each gets
+SIGTERM and then SIGKILL after a grace period; a second interrupt skips the
+remaining grace. Services also stop if the terminal closes or the CLI itself is
+killed. Starting from the `web` directory
 also discovers the application's manifest.
 
 ## Manifest behavior

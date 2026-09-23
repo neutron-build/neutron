@@ -43,9 +43,21 @@ func runDev(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return applicationError(cmd, err)
 		}
-		ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
-		defer stop()
-		err = supervisor.Run(ctx, plan, supervisor.Options{Output: cmd.OutOrStdout()})
+		// First signal stops gracefully; a second skips the grace periods.
+		// SIGHUP covers a closed terminal.
+		signals := make(chan os.Signal, 2)
+		signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+		defer signal.Stop(signals)
+		ctx, cancel := context.WithCancel(cmd.Context())
+		defer cancel()
+		force := make(chan struct{})
+		go func() {
+			<-signals
+			cancel()
+			<-signals
+			close(force)
+		}()
+		err = supervisor.Run(ctx, plan, supervisor.Options{Output: cmd.OutOrStdout(), Force: force})
 		if err != nil && err != context.Canceled {
 			return applicationError(cmd, err)
 		}

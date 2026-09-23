@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -118,6 +119,13 @@ func Load(file string) (*Manifest, error) {
 	return &Manifest{File: abs, Root: resolved, Application: app}, nil
 }
 
+// validPort accepts only numeric ports: a service name such as "http" would
+// resolve through the system services database at probe time.
+func validPort(s string) bool {
+	n, err := strconv.Atoi(s)
+	return err == nil && n >= 1 && n <= 65535 && strconv.Itoa(n) == s
+}
+
 func validName(s string) bool {
 	if s == "" {
 		return false
@@ -202,11 +210,11 @@ func (m *Manifest) Build(selected string) (*Plan, error) {
 			}
 			if r.HTTP != "" {
 				u, err := url.Parse(r.HTTP)
-				if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.Fragment != "" {
+				if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.Fragment != "" || (u.Port() != "" && !validPort(u.Port())) {
 					return nil, fmt.Errorf("%s: invalid HTTP readiness URL", name)
 				}
-			} else if host, port, err := net.SplitHostPort(r.TCP); err != nil || host == "" || port == "" {
-				return nil, fmt.Errorf("%s: invalid TCP readiness address", name)
+			} else if host, port, err := net.SplitHostPort(r.TCP); err != nil || host == "" || !validPort(port) {
+				return nil, fmt.Errorf("%s: invalid TCP readiness address (want host:port, port 1-65535)", name)
 			}
 		}
 		deps := append([]string(nil), c.DependsOn...)

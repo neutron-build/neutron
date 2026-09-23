@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -30,6 +31,17 @@ func TestHelperProcess(t *testing.T) {
 		}
 	}
 	switch mode {
+	case "coordinator":
+		// A coordinator in its own process, so the test can SIGKILL it.
+		binary, _ := os.Executable()
+		address := os.Getenv("SERVICE_ADDRESS")
+		_, port, _ := net.SplitHostPort(address)
+		portNumber, _ := strconv.Atoi(port)
+		api := project.Service{Name: "api", Dir: os.Getenv("ROOT"), Command: []string{binary, "-test.run=^TestHelperProcess$"},
+			Env:   map[string]string{"NEUTRON_SUPERVISOR_HELPER": "http", "ADDRESS": address},
+			Ports: []int{portNumber}, Ready: &project.Readiness{HTTP: "http://" + address, Timeout: "5s"}}
+		_ = Run(context.Background(), &project.Plan{Root: os.Getenv("ROOT"), Services: []project.Service{api}}, Options{GracePeriod: 200 * time.Millisecond})
+		os.Exit(0)
 	case "exit":
 		os.Exit(0)
 	case "fail":
@@ -272,5 +284,120 @@ func TestLongOutputDoesNotBlockLifecycle(t *testing.T) {
 		if len(line) > 8250 {
 			t.Fatal("unbounded line")
 		}
+	}
+}
+
+func waitAccepting(t *testing.T, address string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if conn, err := net.DialTimeout("tcp", address, 100*time.Millisecond); err == nil {
+			conn.Close()
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("service never accepted connections at " + address)
+}
+
+// Process groups are not signalled when their parent dies; the shim's
+// lifeline must stop the service however the coordinator ends.
+func TestCoordinatorDeathStopsServices(t *testing.T) {
+	for _, sig := range []syscall.Signal{syscall.SIGKILL, syscall.SIGHUP} {
+		t.Run(sig.String(), func(t *testing.T) {
+			root := t.TempDir()
+			address := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+			coordinator := exec.Command(os.Args[0], "-test.run=^TestHelperProcess$")
+			coordinator.Env = append(os.Environ(), "NEUTRON_SUPERVISOR_HELPER=coordinator", "ROOT="+root, "SERVICE_ADDRESS="+address)
+			if err := coordinator.Start(); err != nil {
+				t.Fatal(err)
+			}
+			waitAccepting(t, address)
+			_ = coordinator.Process.Signal(sig)
+			_ = coordinator.Wait()
+			requireClosed(t, address)
+			unlock, err := lockProject(root)
+			if err != nil {
+				t.Fatalf("lock not released after coordinator death: %v", err)
+			}
+			unlock()
+		})
+	}
+}
+
+func TestInterruptDuringReadiness(t *testing.T) {
+	root := t.TempDir()
+	api := httpService(t, "api", "http", root)
+	api.Env["READY_DELAY"] = "3s"
+	api.Ready.Timeout = "10s"
+	web := service(t, "web", "stay", root)
+	web.Env["STARTED"] = filepath.Join(root, "must-not-start")
+	web.DependsOn = []string{"api"}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- Run(ctx, &project.Plan{Root: root, Services: []project.Service{api, web}}, Options{GracePeriod: 100 * time.Millisecond})
+	}()
+	time.Sleep(300 * time.Millisecond)
+	started := time.Now()
+	cancel()
+	if err := waitResult(t, result); err != context.Canceled {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("interrupt during readiness took %s", elapsed)
+	}
+	if _, err := os.Stat(web.Env["STARTED"]); !os.IsNotExist(err) {
+		t.Fatal("dependent started after interrupt")
+	}
+	requireClosed(t, api.Env["ADDRESS"])
+}
+
+func TestForceSkipsGracePeriod(t *testing.T) {
+	root := t.TempDir()
+	api := httpService(t, "api", "http", root) // ignores SIGTERM
+	api.Env["MARKER"] = filepath.Join(root, "ready")
+	ctx, cancel := context.WithCancel(context.Background())
+	force := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- Run(ctx, &project.Plan{Root: root, Services: []project.Service{api}}, Options{GracePeriod: 30 * time.Second, Force: force})
+	}()
+	waitAccepting(t, api.Env["ADDRESS"])
+	started := time.Now()
+	cancel()
+	time.Sleep(100 * time.Millisecond)
+	close(force)
+	if err := waitResult(t, result); err != context.Canceled {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("force did not skip grace: %s", elapsed)
+	}
+	requireClosed(t, api.Env["ADDRESS"])
+}
+
+// A stale server on the wildcard or ::1 must fail preflight; otherwise the
+// readiness probe would succeed against it.
+func TestPreflightRejectsListenerOnOtherAddresses(t *testing.T) {
+	for _, host := range []string{"0.0.0.0", "[::]", "[::1]"} {
+		t.Run(host, func(t *testing.T) {
+			l, err := net.Listen("tcp", host+":0")
+			if err != nil {
+				t.Skipf("%s unavailable here: %v", host, err)
+			}
+			defer l.Close()
+			root := t.TempDir()
+			s := service(t, "api", "stay", root)
+			s.Env["STARTED"] = filepath.Join(root, "started")
+			s.Ports = []int{l.Addr().(*net.TCPAddr).Port}
+			err = Run(context.Background(), &project.Plan{Root: root, Services: []project.Service{s}}, Options{})
+			if err == nil || !strings.Contains(err.Error(), "unavailable") {
+				t.Fatalf("occupied port accepted: %v", err)
+			}
+			if _, err := os.Stat(s.Env["STARTED"]); !os.IsNotExist(err) {
+				t.Fatal("service started despite occupied port")
+			}
+		})
 	}
 }

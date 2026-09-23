@@ -65,7 +65,7 @@ with tempfile.TemporaryDirectory(prefix="neutron-app-smoke-") as directory:
     assert [c["name"] for c in json.loads(plan.stdout)["services"]] == ["api", "web"]
     assert not (root / ".neutron").exists(), "planning changed project files"
     print("PASS: planning from a subdirectory without execution", flush=True)
-    for scenario in ["interrupt", "api_failure"]:
+    for scenario in ["interrupt", "api_failure", "hangup", "coordinator_killed"]:
         log_path = Path(directory) / f"{scenario}.log"
         with log_path.open("w") as log:
             process = subprocess.Popen([binary, "dev", "--service", "web"], cwd=root / "web", stdout=log, stderr=subprocess.STDOUT)
@@ -82,11 +82,20 @@ with tempfile.TemporaryDirectory(prefix="neutron-app-smoke-") as directory:
                     wait_for(lambda: request(web_port).get("from") == "TypeScript reloaded", process)
                     print("PASS: native TypeScript watch/reload", flush=True)
                     process.send_signal(signal.SIGINT)
+                elif scenario == "hangup":
+                    # A closed terminal delivers SIGHUP.
+                    process.send_signal(signal.SIGHUP)
+                elif scenario == "coordinator_killed":
+                    # No cleanup code runs; the per-service lifeline must fire.
+                    process.kill()
                 else:
                     pid = int(re.search(r"api pid=(\d+)", text).group(1))
                     os.kill(pid, signal.SIGKILL)
                 assert process.wait(timeout=12) != 0
-                assert closed(api_port) and closed(web_port), "orphaned service"
+                deadline = time.monotonic() + 10
+                while not (closed(api_port) and closed(web_port)):
+                    assert time.monotonic() < deadline, "orphaned service"
+                    time.sleep(0.1)
                 print(f"PASS: {scenario} stops both process trees", flush=True)
             except BaseException:
                 print(log_path.read_text(), file=sys.stderr)

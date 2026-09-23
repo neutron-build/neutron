@@ -83,6 +83,11 @@ func TestInvalidManifests(t *testing.T) {
 		"duplicate ports":    strings.ReplaceAll(sample, "path=\".\"", "path=\".\"\nports=[8080]"),
 		"duplicate keys":     strings.Replace(sample, "version=1", "version=1\nversion=1", 1),
 		"no readiness":       strings.Replace(sample, "depends_on=[\"api\"]", "depends_on=[\"extra\"]", 1),
+		"tcp named port":     strings.Replace(sample, "http=\"http://127.0.0.1:8000/health\"", "tcp=\"127.0.0.1:http\"", 1),
+		"tcp port zero":      strings.Replace(sample, "http=\"http://127.0.0.1:8000/health\"", "tcp=\"127.0.0.1:0\"", 1),
+		"tcp port range":     strings.Replace(sample, "http=\"http://127.0.0.1:8000/health\"", "tcp=\"127.0.0.1:70000\"", 1),
+		"http port range":    strings.Replace(sample, "127.0.0.1:8000", "127.0.0.1:70000", 1),
+		"http port zero":     strings.Replace(sample, "127.0.0.1:8000", "127.0.0.1:0", 1),
 	}
 	for name, s := range cases {
 		t.Run(name, func(t *testing.T) {

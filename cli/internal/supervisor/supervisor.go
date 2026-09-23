@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,9 @@ import (
 type Options struct {
 	Output      io.Writer
 	GracePeriod time.Duration
+	// Force, when closed, skips remaining grace periods during shutdown
+	// (a second interrupt). Nil means always wait the full grace period.
+	Force <-chan struct{}
 }
 type process struct {
 	service project.Service
@@ -129,6 +133,25 @@ func executable(s project.Service) (string, error) {
 	return "", fmt.Errorf("executable %q not found in PATH", name)
 }
 
+// portAvailable rejects a port that another process already serves. Binding
+// 127.0.0.1 alone misses listeners on the wildcard or ::1 on macOS, and a
+// readiness probe would then succeed against the stale process.
+func portAvailable(port int) error {
+	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return err
+	}
+	_ = listener.Close()
+	for _, host := range []string{"127.0.0.1", "::1"} {
+		address := net.JoinHostPort(host, strconv.Itoa(port))
+		if conn, err := net.DialTimeout("tcp", address, 250*time.Millisecond); err == nil {
+			conn.Close()
+			return fmt.Errorf("another process is accepting connections on %s", address)
+		}
+	}
+	return nil
+}
+
 func unexpected(e exit) error {
 	if e.err == nil {
 		return fmt.Errorf("service %s exited unexpectedly (status 0)", e.name)
@@ -167,13 +190,19 @@ func Run(ctx context.Context, plan *project.Plan, options Options) error {
 		}
 		binaries[s.Name] = binary
 		for _, port := range s.Ports {
-			listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-			if err != nil {
+			if err := portAvailable(port); err != nil {
 				return fmt.Errorf("%s: declared port %d unavailable: %w", s.Name, port, err)
 			}
-			_ = listener.Close()
 		}
 	}
+	lifeline, lifelineWriter, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	// Closed only after every service is stopped; closing it is what tells
+	// shims their coordinator is gone.
+	defer lifelineWriter.Close()
+	defer lifeline.Close()
 	exits := make(chan exit, len(plan.Services))
 	running := []*process{}
 	defer func() {
@@ -185,6 +214,7 @@ func Run(ctx context.Context, plan *project.Plan, options Options) error {
 			select {
 			case <-p.done:
 			case <-timer.C:
+			case <-options.Force:
 			}
 			timer.Stop()
 			// Also terminate descendants when the wrapper has already exited.
@@ -200,9 +230,12 @@ func Run(ctx context.Context, plan *project.Plan, options Options) error {
 			return unexpected(e)
 		default:
 		}
-		cmd := exec.Command(binaries[s.Name], s.Command[1:]...)
+		cmd, err := shimCommand(binaries[s.Name], s.Command[1:], lifeline)
+		if err != nil {
+			return err
+		}
 		cmd.Dir = s.Dir
-		cmd.Env = environment(s.Env)
+		cmd.Env = append(environment(s.Env), shimEnv+"="+options.GracePeriod.String())
 		ownProcess(cmd)
 		stdout := &logWriter{out: out, prefix: s.Name + " stdout"}
 		stderr := &logWriter{out: out, prefix: s.Name + " stderr"}
