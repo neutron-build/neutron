@@ -9,7 +9,6 @@ import (
 	"time"
 )
 
-
 func TestGenerateAndParseToken(t *testing.T) {
 	secret := "test-secret-key-256-bits-long-enough!"
 	claims := Claims{"sub": "user123", "role": "admin"}
