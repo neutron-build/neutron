@@ -22,6 +22,12 @@ All notable changes to this project are documented in this file.
   SIGTERM/SIGINT exits immediately, in `start` too.
 - **`neutron-ts dev` answered 404 for `GET /health`.** It now serves the same
   §7 body and yields to an app-defined `/health` route, as `start` does.
+- **`@neutron-build/auth` read a Response from another constructor as
+  session data.** Its four `instanceof Response` guards missed native
+  Responses under `@hono/node-server` (and cross-realm ones); a Better Auth
+  resolver returning one had its `Set-Cookie` forwarded. The guards now use
+  the same brand check as core's `isResponse()`, kept local because every
+  core in auth's `^0.2.0` range ships the `instanceof`-only version.
 
 ### Changed
 

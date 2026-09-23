@@ -465,3 +465,74 @@ describe("createAuthJsAdapter", () => {
     assert.equal((await adapter.getSession(new Request("https://example.com")))?.user?.id, "legacy-authjs");
   });
 });
+
+// @hono/node-server replaces globalThis.Response with a class whose prototype
+// chains to the native one. The inherited static factories (Response.json())
+// still return native instances, which fail `instanceof` against the
+// replacement. A Response from another realm fails it the same way.
+describe("Responses from another Response constructor", () => {
+  async function withReplacedResponse(fn: () => Promise<void>): Promise<void> {
+    const nativeResponse = globalThis.Response;
+    globalThis.Response = class extends nativeResponse {} as typeof Response;
+    try {
+      await fn();
+    } finally {
+      globalThis.Response = nativeResponse;
+    }
+  }
+
+  // Session-shaped own properties make each guard load-bearing: without it,
+  // the Response would be read as a valid session.
+  function foreignResponse(fields: Record<string, unknown>, init?: ResponseInit): Response {
+    const response = Response.json({}, init);
+    assert.equal(response instanceof Response, false, "precondition: fails instanceof");
+    return Object.assign(response, fields);
+  }
+
+  const user = { id: "from-response" };
+  const expires = "2099-01-01T00:00:00.000Z";
+
+  it("Better Auth: a Response in place of the envelope is not a session and forwards no cookies", async () => {
+    await withReplacedResponse(async () => {
+      const raw = foreignResponse(
+        { response: { session: { expiresAt: expires }, user } },
+        { headers: { "Set-Cookie": "leak=1; Path=/" } }
+      );
+      const adapter = createBetterAuthAdapter({ auth: { api: { getSession: async () => raw } } });
+      const context: Record<string, unknown> = {};
+      const response = await createAuthContextMiddleware({ adapter })(
+        new Request("https://example.com"),
+        context,
+        async () => ok()
+      );
+      assert.equal((context.auth as NeutronAuthState).isAuthenticated, false);
+      assert.equal(response.headers.get("set-cookie"), null);
+    });
+  });
+
+  it("Better Auth: a Response as the envelope's response is not a session payload", async () => {
+    await withReplacedResponse(async () => {
+      const payload = foreignResponse({ session: { expiresAt: expires }, user });
+      const adapter = createBetterAuthAdapter({
+        auth: { api: { getSession: async () => ({ headers: new Headers(), response: payload }) } },
+      });
+      assert.equal(await adapter.getSession(new Request("https://example.com")), null);
+    });
+  });
+
+  it("Better Auth legacy resolver: a Response is not a session", async () => {
+    await withReplacedResponse(async () => {
+      const value = foreignResponse({ user, expiresAt: expires });
+      const adapter = createBetterAuthAdapter({ auth: { getSession: async () => value } });
+      assert.equal(await adapter.getSession(new Request("https://example.com")), null);
+    });
+  });
+
+  it("Auth.js: a Response is not a session", async () => {
+    await withReplacedResponse(async () => {
+      const value = foreignResponse({ user, expires });
+      const adapter = createAuthJsAdapter({ getSession: async () => value });
+      assert.equal(await adapter.getSession(new Request("https://example.com")), null);
+    });
+  });
+});

@@ -248,7 +248,7 @@ function normalizeBetterAuthResolution<TUser extends AuthUser>(
   value: unknown,
   options: BetterAuthAdapterOptions<TUser>
 ): AuthResolution<TUser> {
-  if (!value || typeof value !== "object" || value instanceof Response) {
+  if (!value || typeof value !== "object" || isResponse(value)) {
     return { session: null };
   }
   const envelope = value as Record<string, unknown>;
@@ -260,7 +260,7 @@ function normalizeBetterAuthResolution<TUser extends AuthUser>(
   if (options.mapSession) {
     return { session: validateSession(options.mapSession(response)), setCookie };
   }
-  if (!response || typeof response !== "object" || response instanceof Response) {
+  if (!response || typeof response !== "object" || isResponse(response)) {
     return { session: null, setCookie };
   }
 
@@ -278,7 +278,7 @@ function normalizeBetterAuthResolution<TUser extends AuthUser>(
 }
 
 function normalizeAuthJsSession<TUser extends AuthUser>(value: unknown): AuthSession<TUser> | null {
-  if (!isRecord(value) || value instanceof Response || !isRecord(value.user)) {
+  if (!isRecord(value) || isResponse(value) || !isRecord(value.user)) {
     return null;
   }
 
@@ -290,7 +290,7 @@ function normalizeAuthJsSession<TUser extends AuthUser>(value: unknown): AuthSes
 }
 
 function normalizeLegacySession<TUser extends AuthUser>(value: unknown): AuthSession<TUser> | null {
-  if (!isRecord(value) || value instanceof Response) return null;
+  if (!isRecord(value) || isResponse(value)) return null;
   const nested = isRecord(value.session) ? value.session : value;
   return validateSession(nested as AuthSession<TUser>);
 }
@@ -446,6 +446,26 @@ function splitSetCookieHeader(value: string): string[] {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * True for any Fetch `Response`, whichever `Response` constructor made it.
+ *
+ * `instanceof Response` misses Responses from another constructor: on Node,
+ * `@hono/node-server` replaces `globalThis.Response`, and the inherited static
+ * factories (`Response.json()` etc.) still return native instances. Same rule
+ * as core's `isResponse`, kept local because every published core in this
+ * package's `^0.2.0` range ships the `instanceof`-only version.
+ */
+function isResponse(value: unknown): value is Response {
+  if (typeof Response !== "undefined" && value instanceof Response) return true;
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Response;
+  return (
+    Object.prototype.toString.call(value) === "[object Response]" &&
+    typeof candidate.status === "number" &&
+    typeof candidate.headers?.get === "function"
+  );
 }
 
 /**
