@@ -20,6 +20,7 @@ type Application struct {
 	Version  int                    `toml:"version"`
 	Name     string                 `toml:"name"`
 	Services map[string]ServiceSpec `toml:"services"`
+	Tasks    map[string]TaskSpec    `toml:"tasks"`
 }
 type ServiceSpec struct {
 	Path      string            `toml:"path"`
@@ -28,6 +29,16 @@ type ServiceSpec struct {
 	Ports     []int             `toml:"ports"`
 	Env       map[string]string `toml:"env"`
 	Ready     *Readiness        `toml:"ready"`
+}
+
+// TaskSpec is a finite command: exit 0 is success, unlike a service.
+type TaskSpec struct {
+	Path      string            `toml:"path"`
+	Command   []string          `toml:"command"`
+	DependsOn []string          `toml:"depends_on"`
+	Env       map[string]string `toml:"env"`
+	Timeout   string            `toml:"timeout"`
+	Outputs   []string          `toml:"outputs"`
 }
 type Readiness struct {
 	HTTP    string `toml:"http" json:"http,omitempty"`
@@ -43,6 +54,7 @@ type Plan struct {
 	Name     string    `json:"name"`
 	Root     string    `json:"root"`
 	Services []Service `json:"services"`
+	Tasks    []Task    `json:"tasks,omitempty"`
 }
 type Service struct {
 	Name            string            `json:"name"`
@@ -53,6 +65,17 @@ type Service struct {
 	Env             map[string]string `json:"-"`
 	EnvironmentKeys []string          `json:"environment_keys,omitempty"`
 	Ready           *Readiness        `json:"ready,omitempty"`
+}
+
+type Task struct {
+	Name            string            `json:"name"`
+	Dir             string            `json:"directory"`
+	Command         []string          `json:"command"`
+	DependsOn       []string          `json:"depends_on,omitempty"`
+	Env             map[string]string `json:"-"`
+	EnvironmentKeys []string          `json:"environment_keys,omitempty"`
+	Timeout         string            `json:"timeout"`
+	Outputs         []string          `json:"outputs,omitempty"`
 }
 
 // Discover never reads runnable application definitions from home config.
@@ -145,8 +168,8 @@ func (m *Manifest) Build(selected string) (*Plan, error) {
 	if app.Version != 1 {
 		return nil, fmt.Errorf("unsupported application version %d (want 1)", app.Version)
 	}
-	if !validName(app.Name) || len(app.Services) == 0 {
-		return nil, fmt.Errorf("application needs a name and at least one service")
+	if !validName(app.Name) || len(app.Services)+len(app.Tasks) == 0 {
+		return nil, fmt.Errorf("application needs a name and at least one service or task")
 	}
 	names := make([]string, 0, len(app.Services))
 	for name := range app.Services {
@@ -160,28 +183,9 @@ func (m *Manifest) Build(selected string) (*Plan, error) {
 		if !validName(name) {
 			return nil, fmt.Errorf("invalid service name %q", name)
 		}
-		if c.Path == "" || filepath.IsAbs(c.Path) {
-			return nil, fmt.Errorf("%s: path must be relative to the manifest", name)
-		}
-		dir, err := filepath.EvalSymlinks(filepath.Join(m.Root, c.Path))
+		dir, keys, err := m.validateCommon(name, c.Path, c.Command, c.Env)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", name, err)
-		}
-		rel, err := filepath.Rel(m.Root, dir)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return nil, fmt.Errorf("%s: path escapes application root", name)
-		}
-		info, err := os.Stat(dir)
-		if err != nil || !info.IsDir() {
-			return nil, fmt.Errorf("%s: path must be a directory", name)
-		}
-		if len(c.Command) == 0 || strings.TrimSpace(c.Command[0]) == "" {
-			return nil, fmt.Errorf("%s: command needs an executable", name)
-		}
-		for _, arg := range c.Command {
-			if strings.ContainsRune(arg, 0) {
-				return nil, fmt.Errorf("%s: command contains NUL", name)
-			}
+			return nil, err
 		}
 		for _, port := range c.Ports {
 			if port < 1 || port > 65535 {
@@ -192,14 +196,6 @@ func (m *Manifest) Build(selected string) (*Plan, error) {
 			}
 			ports[port] = name
 		}
-		keys := []string{}
-		for key, value := range c.Env {
-			if key == "" || strings.ContainsAny(key, "=\x00") || strings.ContainsRune(value, 0) {
-				return nil, fmt.Errorf("%s: invalid environment entry", name)
-			}
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
 		if c.Ready != nil {
 			r := c.Ready
 			if (r.HTTP == "") == (r.TCP == "") {
@@ -221,6 +217,9 @@ func (m *Manifest) Build(selected string) (*Plan, error) {
 		sort.Strings(deps)
 		for i, dep := range deps {
 			target, ok := app.Services[dep]
+			if _, isTask := app.Tasks[dep]; !ok && isTask {
+				return nil, fmt.Errorf("%s: services cannot depend on task %s", name, dep)
+			}
 			if !ok {
 				return nil, fmt.Errorf("%s: unknown dependency %s", name, dep)
 			}
@@ -233,6 +232,166 @@ func (m *Manifest) Build(selected string) (*Plan, error) {
 		}
 		services[name] = Service{Name: name, Dir: dir, Command: append([]string(nil), c.Command...), DependsOn: deps, Ports: c.Ports, Env: c.Env, EnvironmentKeys: keys, Ready: c.Ready}
 	}
+	serviceDeps := map[string][]string{}
+	for name, s := range services {
+		serviceDeps[name] = s.DependsOn
+	}
+	order, err := topological(names, serviceDeps)
+	if err != nil {
+		return nil, err
+	}
+	tasks, taskOrder, err := m.buildTasks()
+	if err != nil {
+		return nil, err
+	}
+	var roots []string
+	if selected != "" {
+		if _, ok := services[selected]; !ok {
+			return nil, fmt.Errorf("unknown service %s", selected)
+		}
+		roots = []string{selected}
+	} else {
+		roots = names
+	}
+	included := closure(roots, serviceDeps)
+	plan := &Plan{Version: 1, Name: app.Name, Root: m.Root, Services: []Service{}}
+	for _, name := range order {
+		if included[name] {
+			plan.Services = append(plan.Services, services[name])
+		}
+	}
+	for _, name := range taskOrder {
+		plan.Tasks = append(plan.Tasks, tasks[name])
+	}
+	return plan, nil
+}
+
+// TaskPlan validates the whole manifest and returns the selected tasks plus
+// their transitive dependencies in deterministic dependency order.
+func (m *Manifest) TaskPlan(selected []string) ([]Task, error) {
+	plan, err := m.Build("")
+	if err != nil {
+		return nil, err
+	}
+	if len(selected) == 0 {
+		return nil, fmt.Errorf("name at least one task")
+	}
+	byName := map[string]Task{}
+	deps := map[string][]string{}
+	for _, t := range plan.Tasks {
+		byName[t.Name] = t
+		deps[t.Name] = t.DependsOn
+	}
+	for _, name := range selected {
+		if _, ok := byName[name]; !ok {
+			if _, isService := m.Application.Services[name]; isService {
+				return nil, fmt.Errorf("%s is a service; run services with neutron dev", name)
+			}
+			return nil, fmt.Errorf("unknown task %s", name)
+		}
+	}
+	included := closure(selected, deps)
+	result := []Task{}
+	for _, t := range plan.Tasks {
+		if included[t.Name] {
+			result = append(result, t)
+		}
+	}
+	return result, nil
+}
+
+func (m *Manifest) buildTasks() (map[string]Task, []string, error) {
+	app := m.Application
+	names := make([]string, 0, len(app.Tasks))
+	for name := range app.Tasks {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	tasks := map[string]Task{}
+	deps := map[string][]string{}
+	for _, name := range names {
+		c := app.Tasks[name]
+		if !validName(name) {
+			return nil, nil, fmt.Errorf("invalid task name %q", name)
+		}
+		if _, clash := app.Services[name]; clash {
+			return nil, nil, fmt.Errorf("%s: name is used by both a service and a task", name)
+		}
+		dir, keys, err := m.validateCommon(name, c.Path, c.Command, c.Env)
+		if err != nil {
+			return nil, nil, err
+		}
+		if d, err := time.ParseDuration(c.Timeout); err != nil || d <= 0 || d > 24*time.Hour {
+			return nil, nil, fmt.Errorf("%s: task timeout is required, positive and at most 24h", name)
+		}
+		for _, output := range c.Outputs {
+			clean := filepath.Clean(output)
+			if output == "" || filepath.IsAbs(output) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+				return nil, nil, fmt.Errorf("%s: output %q must be a relative path inside the task directory", name, output)
+			}
+		}
+		taskDeps := append([]string(nil), c.DependsOn...)
+		sort.Strings(taskDeps)
+		for i, dep := range taskDeps {
+			if _, isService := app.Services[dep]; isService {
+				return nil, nil, fmt.Errorf("%s: tasks cannot depend on service %s", name, dep)
+			}
+			if _, ok := app.Tasks[dep]; !ok {
+				return nil, nil, fmt.Errorf("%s: unknown dependency %s", name, dep)
+			}
+			if i > 0 && taskDeps[i-1] == dep {
+				return nil, nil, fmt.Errorf("%s: duplicate dependency %s", name, dep)
+			}
+		}
+		deps[name] = taskDeps
+		tasks[name] = Task{Name: name, Dir: dir, Command: append([]string(nil), c.Command...), DependsOn: taskDeps, Env: c.Env, EnvironmentKeys: keys, Timeout: c.Timeout, Outputs: c.Outputs}
+	}
+	order, err := topological(names, deps)
+	if err != nil {
+		return nil, nil, err
+	}
+	return tasks, order, nil
+}
+
+// validateCommon checks the fields services and tasks share.
+func (m *Manifest) validateCommon(name, path string, command []string, env map[string]string) (string, []string, error) {
+	if path == "" || filepath.IsAbs(path) {
+		return "", nil, fmt.Errorf("%s: path must be relative to the manifest", name)
+	}
+	dir, err := filepath.EvalSymlinks(filepath.Join(m.Root, path))
+	if err != nil {
+		return "", nil, fmt.Errorf("%s: %w", name, err)
+	}
+	rel, err := filepath.Rel(m.Root, dir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", nil, fmt.Errorf("%s: path escapes application root", name)
+	}
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		return "", nil, fmt.Errorf("%s: path must be a directory", name)
+	}
+	if len(command) == 0 || strings.TrimSpace(command[0]) == "" {
+		return "", nil, fmt.Errorf("%s: command needs an executable", name)
+	}
+	for _, arg := range command {
+		if strings.ContainsRune(arg, 0) {
+			return "", nil, fmt.Errorf("%s: command contains NUL", name)
+		}
+	}
+	keys := []string{}
+	for key, value := range env {
+		if key == "" || strings.ContainsAny(key, "=\x00") || strings.ContainsRune(value, 0) {
+			return "", nil, fmt.Errorf("%s: invalid environment entry", name)
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return dir, keys, nil
+}
+
+// topological orders names so dependencies come first, visiting in the given
+// (sorted) order for determinism, and reports a cycle with its path.
+func topological(names []string, deps map[string][]string) ([]string, error) {
 	state := map[string]int{}
 	order := []string{}
 	stack := []string{}
@@ -246,7 +405,7 @@ func (m *Manifest) Build(selected string) (*Plan, error) {
 		}
 		state[name] = 1
 		stack = append(stack, name)
-		for _, dep := range services[name].DependsOn {
+		for _, dep := range deps[name] {
 			if err := visit(dep); err != nil {
 				return err
 			}
@@ -261,6 +420,10 @@ func (m *Manifest) Build(selected string) (*Plan, error) {
 			return nil, err
 		}
 	}
+	return order, nil
+}
+
+func closure(roots []string, deps map[string][]string) map[string]bool {
 	included := map[string]bool{}
 	var include func(string)
 	include = func(name string) {
@@ -268,25 +431,12 @@ func (m *Manifest) Build(selected string) (*Plan, error) {
 			return
 		}
 		included[name] = true
-		for _, dep := range services[name].DependsOn {
+		for _, dep := range deps[name] {
 			include(dep)
 		}
 	}
-	if selected != "" {
-		if _, ok := services[selected]; !ok {
-			return nil, fmt.Errorf("unknown service %s", selected)
-		}
-		include(selected)
-	} else {
-		for _, name := range names {
-			include(name)
-		}
+	for _, root := range roots {
+		include(root)
 	}
-	plan := &Plan{Version: 1, Name: app.Name, Root: m.Root, Services: []Service{}}
-	for _, name := range order {
-		if included[name] {
-			plan.Services = append(plan.Services, services[name])
-		}
-	}
-	return plan, nil
+	return included
 }

@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/signal"
-	"syscall"
 
 	"github.com/neutron-build/neutron/cli/internal/delegate"
 	"github.com/neutron-build/neutron/cli/internal/detect"
@@ -43,20 +41,8 @@ func runDev(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return applicationError(cmd, err)
 		}
-		// First signal stops gracefully; a second skips the grace periods.
-		// SIGHUP covers a closed terminal.
-		signals := make(chan os.Signal, 2)
-		signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
-		defer signal.Stop(signals)
-		ctx, cancel := context.WithCancel(cmd.Context())
-		defer cancel()
-		force := make(chan struct{})
-		go func() {
-			<-signals
-			cancel()
-			<-signals
-			close(force)
-		}()
+		ctx, force, stop := interruptContext(cmd.Context())
+		defer stop()
 		err = supervisor.Run(ctx, plan, supervisor.Options{Output: cmd.OutOrStdout(), Force: force})
 		if err != nil && err != context.Canceled {
 			return applicationError(cmd, err)

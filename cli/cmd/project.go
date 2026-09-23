@@ -39,7 +39,7 @@ func init() {
 	}}
 	planCmd.Flags().Bool("json", false, "output versioned JSON (environment values omitted)")
 	planCmd.Flags().String("service", "", "select a service and its dependencies")
-	command.AddCommand(check, planCmd)
+	command.AddCommand(check, planCmd, newProjectRunCmd())
 	rootCmd.AddCommand(command)
 }
 func loadApplication(selected string) (*project.Plan, error) {

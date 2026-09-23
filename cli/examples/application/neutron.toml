@@ -22,3 +22,15 @@ env = { PORT = "4300", API_ORIGIN = "http://127.0.0.1:4301" }
 [application.services.web.ready]
 http = "http://127.0.0.1:4300/health"
 timeout = "10s"
+
+[application.tasks.api-build]
+path = "api"
+command = ["go", "build", "-o", "bin/api", "."]
+timeout = "5m"
+outputs = ["bin/api"]
+
+[application.tasks.api-vet]
+path = "api"
+command = ["go", "vet", "./..."]
+depends_on = ["api-build"]
+timeout = "5m"
