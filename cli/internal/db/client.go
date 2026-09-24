@@ -58,7 +58,43 @@ func (c *Client) ExecTag(ctx context.Context, sql string, args ...any) (int64, e
 // database exactly as it was. onApplied, when non-nil, is called after each
 // successful statement. Comment-only entries (e.g. NUCLEUS-ONLY notes) are
 // reported but not executed.
+//
+// One documented exception (Q07): `alter type ... add value` statements are
+// committed in their own transaction BEFORE the main one when the plan also
+// contains statements that may use the new values (views, checks, defaults).
+// PostgreSQL forbids using a value added in the same transaction (SQLSTATE
+// 55P04), so enum additions cannot share the main transaction with their
+// dependents. Enum additions are monotone catalog extensions: if a later
+// statement fails, the added values remain and the next plan converges
+// without re-adding them.
 func (c *Client) ApplyInTransaction(ctx context.Context, statements []string, onApplied func(stmt string)) error {
+	var enumAdds, rest []string
+	sawDependent := false
+	for _, stmt := range statements {
+		trimmed := strings.TrimSpace(stmt)
+		if hasExecutableSQL(stmt) && strings.HasPrefix(trimmed, "alter type ") && strings.Contains(trimmed, " add value ") {
+			enumAdds = append(enumAdds, stmt)
+			continue
+		}
+		rest = append(rest, stmt)
+		if len(enumAdds) > 0 {
+			sawDependent = true
+		}
+	}
+	if len(enumAdds) > 0 && sawDependent {
+		if err := c.applyOneTransaction(ctx, enumAdds, onApplied); err != nil {
+			return err
+		}
+		return c.applyOneTransaction(ctx, rest, onApplied)
+	}
+	if len(enumAdds) > 0 {
+		all := append(append([]string{}, enumAdds...), rest...)
+		return c.applyOneTransaction(ctx, all, onApplied)
+	}
+	return c.applyOneTransaction(ctx, statements, onApplied)
+}
+
+func (c *Client) applyOneTransaction(ctx context.Context, statements []string, onApplied func(stmt string)) error {
 	tx, err := c.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)

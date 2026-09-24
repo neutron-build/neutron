@@ -277,7 +277,14 @@ func TestDBPushV2E2E(t *testing.T) {
 	})
 
 	t.Run("BlockedPlanExitsNonzero", func(t *testing.T) {
-		if err := fixture.Exec(context.Background(), `CREATE TABLE unman (p int, g int GENERATED ALWAYS AS (p + 1) STORED)`); err != nil {
+		// Stored generated columns are representable since Q07; the blocker
+		// is the NULLS NOT DISTINCT unique constraint (Q07 opaque class).
+		if err := fixture.Exec(context.Background(),
+			`CREATE TABLE unman (p int, g int GENERATED ALWAYS AS (p + 1) STORED, u int)`); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.Exec(context.Background(),
+			`ALTER TABLE unman ADD CONSTRAINT unman_nnd UNIQUE NULLS NOT DISTINCT (u)`); err != nil {
 			t.Fatal(err)
 		}
 		blocked := `{
@@ -294,7 +301,7 @@ func TestDBPushV2E2E(t *testing.T) {
 		blockedPath := filepath.Join(work, "blocked.json")
 		writeFile(t, blockedPath, blocked)
 		code, out := run("db", "push", "--schema", blockedPath)
-		if code == 0 || !strings.Contains(out, "generated column") {
+		if code == 0 || !strings.Contains(out, "NULLS NOT DISTINCT") {
 			t.Fatalf("declaring an unrepresentable table must fail loudly, code=%d out:\n%s", code, out)
 		}
 	})

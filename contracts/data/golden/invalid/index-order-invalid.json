@@ -1,0 +1,28 @@
+{
+  "version": 2,
+  "dialect": "postgresql",
+  "capabilities": [],
+  "schemas": [{ "name": "public" }],
+  "enums": [],
+  "tables": [
+    {
+      "identity": { "schema": "public", "name": "bad" },
+      "managed": true,
+      "columns": [
+        { "name": "id", "type": { "name": "int4", "codec": "number" }, "notNull": true },
+        { "name": "n", "type": { "name": "int4", "codec": "number" }, "notNull": false }
+      ],
+      "constraints": [{ "name": "bad_pkey", "type": "primary-key", "columns": ["id"] }],
+      "indexes": [
+        {
+          "identity": { "schema": "public", "name": "bad_n_idx" },
+          "unique": false,
+          "method": "btree",
+          "key": [{ "column": "n", "order": "descending" }]
+        }
+      ]
+    }
+  ],
+  "views": [],
+  "opaque": []
+}

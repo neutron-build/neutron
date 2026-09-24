@@ -46,8 +46,8 @@ jobs:
           npx --yes ajv-cli@5 compile --spec=draft2020 -s contracts/data/schema-v2.json
           npx --yes ajv-cli@5 validate --spec=draft2020 -s contracts/data/schema-v2.json \
             -d "contracts/data/golden/valid/*.json"
-          schema_rejectable="control-in-name literal-looks-expression missing-managed non-integer-number nul-in-sqltext unknown-field unknown-version"
-          validator_only="constraint-unknown-column duplicate-index duplicate-table enum-unresolved fk-unresolved pk-not-null undeclared-schema ufffd-string"
+          schema_rejectable="control-in-name index-order-invalid literal-looks-expression missing-managed non-integer-number nul-in-sqltext unknown-field unknown-version"
+          validator_only="constraint-unknown-column duplicate-index duplicate-table enum-unresolved fk-unresolved generated-with-default index-method-type-invalid pk-not-null undeclared-schema ufffd-string"
           for f in $schema_rejectable; do
             if npx --yes ajv-cli@5 validate --spec=draft2020 -s contracts/data/schema-v2.json \
               -d "contracts/data/golden/invalid/$f.json" >/dev/null 2>&1; then

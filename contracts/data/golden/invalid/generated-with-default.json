@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "dialect": "postgresql",
+  "capabilities": [],
+  "schemas": [{ "name": "public" }],
+  "enums": [],
+  "tables": [
+    {
+      "identity": { "schema": "public", "name": "bad" },
+      "managed": true,
+      "columns": [
+        { "name": "id", "type": { "name": "int4", "codec": "number" }, "notNull": true },
+        { "name": "net", "type": { "name": "numeric", "codec": "decimal-string" }, "notNull": true, "default": { "kind": "literal", "sql": "0" }, "generated": { "expression": "net * 2" } }
+      ],
+      "constraints": [{ "name": "bad_pkey", "type": "primary-key", "columns": ["id"] }],
+      "indexes": []
+    }
+  ],
+  "views": [],
+  "opaque": []
+}

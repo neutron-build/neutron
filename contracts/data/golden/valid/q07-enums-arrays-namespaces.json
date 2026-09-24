@@ -1,0 +1,214 @@
+{
+  "version": 2,
+  "dialect": "postgresql",
+  "capabilities": [],
+  "schemas": [
+    {
+      "name": "app"
+    },
+    {
+      "name": "public"
+    }
+  ],
+  "enums": [
+    {
+      "identity": {
+        "schema": "app",
+        "name": "mood"
+      },
+      "managed": true,
+      "values": [
+        "sad",
+        "ok",
+        "glad"
+      ]
+    },
+    {
+      "identity": {
+        "schema": "public",
+        "name": "color"
+      },
+      "managed": true,
+      "values": [
+        "red",
+        "green",
+        "blue"
+      ]
+    }
+  ],
+  "tables": [
+    {
+      "identity": {
+        "schema": "app",
+        "name": "tenants"
+      },
+      "managed": true,
+      "columns": [
+        {
+          "name": "id",
+          "type": {
+            "name": "int4",
+            "codec": "number"
+          },
+          "notNull": true,
+          "default": {
+            "kind": "sequence",
+            "sequence": {
+              "schema": "app",
+              "name": "tenants_id_seq"
+            }
+          }
+        },
+        {
+          "name": "name",
+          "type": {
+            "name": "varchar",
+            "codec": "string",
+            "params": {
+              "length": 120
+            }
+          },
+          "notNull": true
+        },
+        {
+          "name": "tone",
+          "type": {
+            "name": "enum",
+            "codec": "enum",
+            "enum": {
+              "schema": "app",
+              "name": "mood"
+            }
+          },
+          "notNull": false,
+          "default": {
+            "kind": "literal",
+            "sql": "'ok'"
+          }
+        },
+        {
+          "name": "palette",
+          "type": {
+            "name": "enum",
+            "codec": "array",
+            "array": true,
+            "enum": {
+              "schema": "public",
+              "name": "color"
+            }
+          },
+          "notNull": false
+        },
+        {
+          "name": "scores",
+          "type": {
+            "name": "int8",
+            "codec": "array",
+            "array": true
+          },
+          "notNull": true
+        },
+        {
+          "name": "aliases",
+          "type": {
+            "name": "varchar",
+            "codec": "array",
+            "array": true,
+            "params": {
+              "length": 40
+            }
+          },
+          "notNull": false,
+          "default": {
+            "kind": "literal",
+            "sql": "'{}'::varchar[]"
+          }
+        }
+      ],
+      "constraints": [
+        {
+          "name": "tenants_pkey",
+          "type": "primary-key",
+          "columns": [
+            "id"
+          ]
+        }
+      ],
+      "indexes": []
+    },
+    {
+      "identity": {
+        "schema": "public",
+        "name": "notices"
+      },
+      "managed": true,
+      "columns": [
+        {
+          "name": "id",
+          "type": {
+            "name": "int4",
+            "codec": "number"
+          },
+          "notNull": true,
+          "default": {
+            "kind": "sequence",
+            "sequence": {
+              "schema": "public",
+              "name": "notices_id_seq"
+            }
+          }
+        },
+        {
+          "name": "tenant",
+          "type": {
+            "name": "int4",
+            "codec": "number"
+          },
+          "notNull": true
+        },
+        {
+          "name": "tags",
+          "type": {
+            "name": "text",
+            "codec": "array",
+            "array": true
+          },
+          "notNull": false,
+          "default": {
+            "kind": "literal",
+            "sql": "'{news}'::text[]"
+          }
+        }
+      ],
+      "constraints": [
+        {
+          "name": "notices_pkey",
+          "type": "primary-key",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "notices_tenant_fkey",
+          "type": "foreign-key",
+          "columns": [
+            "tenant"
+          ],
+          "references": {
+            "table": {
+              "schema": "app",
+              "name": "tenants"
+            },
+            "columns": [
+              "id"
+            ],
+            "onDelete": "cascade"
+          }
+        }
+      ],
+      "indexes": []
+    }
+  ],
+  "views": [],
+  "opaque": []
+}

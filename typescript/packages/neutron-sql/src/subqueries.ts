@@ -31,6 +31,7 @@ import type { AnyColumnBuilder, PgTableCore } from "./schema.js";
 import { validAlias } from "./ast.js";
 import type { StatementNode } from "./ast.js";
 import type { StatementCapability } from "./codecs.js";
+import { copyRichCodec } from "./codecs.js";
 import type { AstSelectBuilder, FullSelectPlan, JoinRowOf, PlanColumnSpec, Projection, SelectBuilder, SetOpBuilder } from "./builder.js";
 
 /** Column dataType implied by a read type — drives predicate value typing on
@@ -94,6 +95,7 @@ function makeDerivedHandle(kind: "derived" | "cte", name: string, source: Derive
     if (spec.canonicalText === true && (spec.dataType === "timestamp" || spec.dataType === "timestamptz" || spec.dataType === "date")) {
       c.canonicalText = true;
     }
+    if (spec.source !== undefined) copyRichCodec(spec.source, c);
     (c as unknown as { aliasTag?: string }).aliasTag = name;
     cols[spec.key] = c;
   }

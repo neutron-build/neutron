@@ -25,15 +25,16 @@ import type {
   SelectTypeOf,
   UpdateTypeOf,
 } from "./schema.js";
-import { ALIAS_MARKER, getDerivedRecord, getTableColumns, getTableName, isAliasHandle, isPgTable, rejectAliasHandle, rejectDerivedTable, tableRefParts } from "./schema.js";
+import { ALIAS_MARKER, getDerivedRecord, getTableColumns, getTableName, isAliasHandle, isPgTable, rejectAliasHandle, rejectDerivedTable, rejectViewHandle, tableRefParts } from "./schema.js";
 import {
   aggregateResultColumn,
   applyProjectionDecoders,
   aggregateProjection,
-  canonicalTextWireNode,
+  assertColumnWritable,
+  columnWireReadNode,
   encodeWriteValue,
   projectionDecoder,
-  wireReadNode,
+  richCodecSource,
   type BigintMode,
   type ColumnContext,
   type EncodedValue,
@@ -195,6 +196,9 @@ export interface PlanColumnSpec {
   readonly readMode?: BigintMode | TemporalMode;
   readonly valueDecoder?: (raw: string) => unknown;
   readonly canonicalText?: boolean;
+  /** Q07: source column whose codec-shaping metadata (array shape, enum
+   *  definition, custom codec) pseudo-columns copy. Set only when present. */
+  readonly source?: AnyColumnBuilder;
 }
 
 /** A full select plan: the statement node plus its decode plan, engine
@@ -290,7 +294,7 @@ function selectPlanFor(tableRef: string[], tableName: string, entries: ColumnEnt
   let usesJsonb = false;
   for (const { propertyKey: key, column } of entries) {
     const ref = qual(...tableRef, column.columnName);
-    const wire = column.canonicalText ? canonicalTextWireNode(column.dataType, ref) : wireReadNode(column.dataType, ref);
+    const wire = columnWireReadNode(column, ref);
     if (wire !== null) {
       nodes.push(projectionNode(wire, key));
       usesJsonb = true;
@@ -466,6 +470,7 @@ function conflictAssignments(table: AnyPgTable, values: Record<string, unknown>)
     const column = columns[key];
     if (!column) throw new Error(`unknown column "${key}" on ${tableName}`);
     if (value === undefined) continue; // omitted/undefined set keys are ignored
+    assertColumnWritable(column, columnContext(tableName, column, key));
     const physical = column.columnName;
     inputEntries.push([key, physical]);
     if (value === null) {
@@ -862,7 +867,7 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
     const columns: PlanColumnSpec[] = [];
     const caps = new Set<StatementCapability>();
     const pushColumn = (spec: PlanColumnSpec): void => {
-      columns.push(spec.readMode === undefined && spec.valueDecoder === undefined && spec.canonicalText !== true ? { key: spec.key, dataType: spec.dataType } : spec);
+      columns.push(spec.readMode === undefined && spec.valueDecoder === undefined && spec.canonicalText !== true && spec.source === undefined ? { key: spec.key, dataType: spec.dataType } : spec);
     };
 
     if (this.projection) {
@@ -874,7 +879,7 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
             if (plan.decoder) decoders.push(plan.decoder);
             if (plan.usesJsonb) caps.add("jsonb-functions");
             const spec = aggregateResultColumn(value);
-            pushColumn({ key, dataType: spec.dataType, readMode: spec.readMode, valueDecoder: spec.valueDecoder, canonicalText: spec.dataType === "timestamp" || spec.dataType === "timestamptz" || spec.dataType === "date" });
+            pushColumn({ key, dataType: spec.dataType, readMode: spec.readMode, valueDecoder: spec.valueDecoder, canonicalText: spec.dataType === "timestamp" || spec.dataType === "timestamptz" || spec.dataType === "date", source: richCodecSource(spec.source) });
             continue;
           }
           nodes.push(projectionNode(value, key));
@@ -883,7 +888,7 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
         }
         const parts = value.ownerTable ? tableRefParts(value.ownerTable) : tableRef;
         const ref = qual(...parts, value.columnName);
-        const wire = value.canonicalText ? canonicalTextWireNode(value.dataType, ref) : wireReadNode(value.dataType, ref);
+        const wire = columnWireReadNode(value, ref);
         if (wire !== null) {
           nodes.push(projectionNode(wire, key));
           caps.add("jsonb-functions");
@@ -898,6 +903,7 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
           readMode: value.readMode as BigintMode | TemporalMode | undefined,
           valueDecoder: value.valueDecoder,
           canonicalText: value.dataType === "timestamp" || value.dataType === "timestamptz" || value.dataType === "date",
+          source: richCodecSource(value),
         });
       }
     } else {
@@ -915,6 +921,7 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
           readMode: column.readMode as BigintMode | TemporalMode | undefined,
           valueDecoder: column.valueDecoder,
           canonicalText: column.dataType === "timestamp" || column.dataType === "timestamptz" || column.dataType === "date",
+          source: richCodecSource(column),
         });
       }
     }
@@ -1256,6 +1263,7 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
   ) {
     rejectAliasHandle(table, "insert");
     rejectDerivedTable(table, "insert");
+    rejectViewHandle(table, "insert");
     Object.freeze(this.rows);
     Object.freeze(this);
   }
@@ -1359,6 +1367,7 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
         const column = columns[key];
         const value = row[key];
         if (value === undefined) continue;
+        assertColumnWritable(column, columnContext(tableName, column, key));
         rejectLegacyFragment(value, "insert values");
         if (effectiveNotNull(column) && value === null) {
           throw new Error(
@@ -1484,6 +1493,7 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
   ) {
     rejectAliasHandle(table, "update");
     rejectDerivedTable(table, "update");
+    rejectViewHandle(table, "update");
     Object.freeze(this.sets);
     Object.freeze(this.conditions);
     Object.freeze(this);
@@ -1497,6 +1507,7 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
       const column = columns[key];
       if (!column) throw new Error(`unknown column "${key}" on ${tableName}`);
       if (value === undefined) continue; // omitted/undefined update keys are ignored
+      assertColumnWritable(column, columnContext(tableName, column, key));
       const physical = column.columnName;
       // Null is checked BEFORE fragment detection: null is a bindable value
       // for nullable columns, never an object to interrogate.
@@ -1604,6 +1615,7 @@ export class DeleteBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
   ) {
     rejectAliasHandle(table, "delete");
     rejectDerivedTable(table, "delete");
+    rejectViewHandle(table, "delete");
     Object.freeze(this.conditions);
     Object.freeze(this);
   }
@@ -2035,15 +2047,16 @@ export class AstSelectBuilder {
         readMode: column.readMode as BigintMode | TemporalMode | undefined,
         valueDecoder: column.valueDecoder,
         canonicalText: column.canonicalText,
+        source: richCodecSource(column),
       }));
     }
     return Object.entries(this.projectionSpec).map(([key, value]): PlanColumnSpec => {
       if (isPgColumnRef(value)) {
-        return { key, dataType: value.dataType, readMode: value.readMode as BigintMode | TemporalMode | undefined, valueDecoder: value.valueDecoder };
+        return { key, dataType: value.dataType, readMode: value.readMode as BigintMode | TemporalMode | undefined, valueDecoder: value.valueDecoder, source: richCodecSource(value) };
       }
       if (isValueNode(value) && value.kind === "aggregate") {
         const spec = aggregateResultColumn(value);
-        return { key, dataType: spec.dataType, readMode: spec.readMode, valueDecoder: spec.valueDecoder, canonicalText: spec.dataType === "timestamp" || spec.dataType === "timestamptz" || spec.dataType === "date" };
+        return { key, dataType: spec.dataType, readMode: spec.readMode, valueDecoder: spec.valueDecoder, canonicalText: spec.dataType === "timestamp" || spec.dataType === "timestamptz" || spec.dataType === "date", source: richCodecSource(spec.source) };
       }
       return { key, dataType: "text" };
     });
