@@ -246,6 +246,7 @@ export {
   type JsonNullValue,
   type ColumnCodec,
   type CodecRead,
+  type ColumnContext,
   type ProjectionDecoder,
   type StatementCapability,
 } from "./codecs.js";
@@ -253,15 +254,21 @@ export {
 export {
   createDatabase,
   buildRelationalSQL,
+  buildRelationalPlan,
+  MAX_RELATION_DEPTH,
   type DatabaseOptions,
   type TablesInput,
   type RelationsInput,
   type NeutronDatabase,
   type QueryApiFor,
   type RelationalArgs,
+  type OneRelationArgs,
   type RelationalRow,
   type RelationValue,
   type RelationChildModelOf,
+  type RelationalExplainPlan,
+  type RelationalStatementPlan,
+  type RelationEdgePlan,
 } from "./db.js";
 
 export {

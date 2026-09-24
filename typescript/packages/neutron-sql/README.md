@@ -204,9 +204,8 @@ metadata through the exported helpers `getTableName(table)`,
 `table.tableName` / `table.columns` properties are gone. Insert and select
 types are exact: required insert keys are NOT NULL-without-default columns
 (primary keys imply NOT NULL; `serial` implies a server default), nullable
-columns accept `null`, and invalid value types, unknown keys, unknown
-relations and nested `with` (depth 2+) are compile errors as well as runtime
-errors.
+columns accept `null`, and invalid value types, unknown keys and unknown
+relations are compile errors as well as runtime errors.
 
 - Nullable columns accept `null`: `.set({ nick: null })` binds SQL NULL; the
   empty string stays an empty string. `undefined` in `.set()` is ignored, and
@@ -672,25 +671,64 @@ const affected = await db.driver.prepare!("update users set seen = true where em
   `tx.query` already has, and it is **unsupported**: do not use a
   transaction-scoped driver or statement after its transaction ends.
 
-## Relational reads (one level)
+## Relational reads (nested, Q05)
 
-`db.query.<table>.findMany/findFirst` compile every requested relation edge to
-its own **independent correlated scalar subquery** — a to-many child aggregates
-with `jsonb_agg(... order by <target primary key>)` inside a subquery, a to-one
-parent builds a single `jsonb_build_object` that is `null` when the foreign key
-misses. Sibling relations never join each other, so requesting two to-many
-children returns each child set exactly (no cartesian fan-out), and parent
-`where`/`orderBy`/`limit`/`offset` apply to parent rows before child expansion.
-Child order is deterministic (ordered by the target's primary key).
+`db.query.<table>.findMany/findFirst` compile every requested relation edge —
+at any nesting depth — into the **one statement** as its own independent
+correlated scalar subquery: a to-many child aggregates with
+`jsonb_agg(... order by <keys>)` inside a subquery, a to-one parent builds a
+single `jsonb_build_object` that is `null` when the foreign key misses, and a
+nested `with` embeds the next level's subquery inside the child's JSON object.
+Sibling relations never join each other, so two to-many children (or two
+relations to the same target — `created_by` + `updated_by` both to `users`)
+return each child set exactly, with no cartesian fan-out; each edge gets its
+own path-derived alias (`__rel_posts`, `__rel_posts__comments`, …).
 
-- Result types are exact at one level: requesting `with: { posts: true }` makes
-  `posts` a required key typed as the target's relation-child model (`| null`
-  for to-one, array for to-many); unrequested relation keys are absent, and
-  `columns: [...]` restricts the row to those property keys at both runtime and
-  compile time. Unknown relation names in `with` and unknown property keys in
-  `columns` are compile errors (and runtime errors when values arrive without
-  static types).
-- Child leaf values decode through the same codecs as the flat path:
+- **Parent filtering/pagination runs before child expansion**: parent
+  `where`/`orderBy`/`limit`/`offset` apply to parent rows; the per-row
+  subqueries then expand children for exactly the emitted parents. One query
+  is one statement at any depth — no N+1.
+- **Per-child options** ride the nested `with` value:
+  `with: { posts: { where, orderBy, limit, offset, columns, with } }`.
+  `limit`/`offset` bound **each parent's** children, never the global set —
+  the aggregation runs over a limited derived table
+  (`jsonb_agg` over `(select … order by … limit N)`), with the target primary
+  key appended as a deterministic tie-breaker. That derived table projects
+  **every** target column: the aggregate's order keys and nested edges'
+  foreign-key correlations resolve against it and may reference columns
+  outside the requested `columns` subset — order expressions can even name
+  columns through raw `sql` fragment text, which no structural extraction
+  can recover (the emitted JSON still carries exactly the selected columns;
+  edges without `limit`/`offset` compile with no derived table at all).
+  `limit`/`offset` and `orderBy` are rejected on to-one edges (a to-one
+  matches at most one row — an ordering could not change the single-row
+  result) at both compile time and runtime.
+- **Child `where`/`orderBy` reference the child table's columns** and are
+  rewritten to the edge's alias automatically. References to any other table,
+  subqueries, and trusted-SQL segments inside per-child expressions are
+  rejected before SQL — they cannot be soundly remapped (filter the parent
+  instead; parent-correlated child filters are a documented non-goal for now).
+- **Cycles terminate by construction**: nesting depth is structurally bounded
+  (`MAX_RELATION_DEPTH = 5`, acceptance-verified at depth 3) — a self-relation
+  tree over cyclic data stops at the bound; there is no unbounded recursive
+  term. Self pairs (`manager` one + `reports` many on one table) share a
+  `relationName` — that is the self-relation idiom; two one()s or two many()s
+  sharing a name on one table remain errors.
+- **Exact result shapes at every level**: a missing to-many is `[]` (never
+  `null`), a missing to-one is `null` (never `[]` or a missing key), and
+  equal-valued distinct children both survive (ordering keys are raw columns —
+  no `DISTINCT` collapse). A relation key that arrives as a structurally
+  impossible shape (say a non-array for a to-many, on a server that hands
+  jsonb back as strings) fails loudly instead of silently degrading to `[]`.
+  Composite FK keys zip by declared position on both
+  sides; declaring the reversed order works and is pinned by tests.
+- **Result types are exact at every nesting depth**: requesting
+  `with: { posts: { with: { comments: true } } }` types `posts` as an array of
+  post rows carrying `comments` arrays; per-child `columns` subsets and
+  to-one `| null` propagate precisely; unrequested relation keys are absent
+  and unknown relation/column names are compile errors at every level (and
+  runtime errors for untyped callers).
+- **Child leaf values decode through the same codecs as the flat path**:
   `bigint` leaves arrive as the column's mode value (default `bigint`),
   `numeric` leaves as exact decimal strings (rendered `::text` inside the
   aggregation), `timestamp`/`date` leaves as their canonical strings,
@@ -698,18 +736,25 @@ Child order is deterministic (ordered by the target's primary key).
   zone 'UTC')` — session-timezone independent, microseconds intact) and
   `bytea` leaves as `Uint8Array` decoded from the `\x` hex text form. The
   casts apply only to the projected JSON — correlation predicates and
-  ordering keys compare raw columns.
+  ordering keys compare raw columns. Losslessness holds through the whole
+  nesting (verified live at depth 3 on both drivers).
+- **Pure inspection without a connection**: `db.query.<table>.toSQL(args)`
+  returns `{ sql, params }` and `db.query.<table>.explainQuery(args)` returns
+  a structured plan — statement count (1 today), the compiled SQL with
+  parameters, the serializable decode plans, capability requirements, and the
+  relation edge tree (target, cardinality, alias, selected columns, filters,
+  limits, depth). Both compile purely — no driver round-trip, no execution.
+- Relational statements carry the `jsonb-functions` capability requirement:
+  an engine that cannot prove jsonb support (e.g. PostgreSQL before 9.4)
+  rejects the query **before any statement executes** — zero partial work.
 - When a table has two foreign keys to the same target (`posts.author` +
   `posts.reviewer`), name the pair with `relationName` on both the `one()` and
   the `many()`. Reverse inference without names is allowed only when exactly
   one candidate exists; otherwise relation resolution fails with an error
   naming the candidates.
-- Explicitly rejected with clear errors (deferred, not implemented): nested
-  `with` / per-relation options (only `true` is accepted), the same target
-  table twice in one `with` clause (query them separately), empty
-  `columns` arrays, and `columns` values that are not arrays. A `many()`
-  relation whose target table has no primary key is rejected at
-  `createDatabase` time — child ordering would be undefined.
+- A `many()` relation whose target table has no primary key is rejected at
+  `createDatabase` time — child ordering would be undefined. Empty `columns`
+  arrays and non-array `columns` values are rejected at every level.
 
 ## Tests
 
@@ -753,8 +798,13 @@ general-purpose use.
   connection-scoped prepared execution (deterministic SQL-derived names on
   pg, postgres.js signature caching; scope and session-release verified
   live),
-  one-level
-  relational reads with exact result types, transactions, `toSQL()`, mapped
+  nested relational reads to depth 3 with exact result types (per-child
+  filter/order/limit/offset/columns, two references to one target, named
+  inverse pairs, self-relation trees over cyclic data, composite tenant keys,
+  lossless child values through the JSON projection, statement-count-pinned
+  one-statement execution, pure `toSQL`/`explainQuery` inspection, and
+  capability fail-before-running on jsonb-less engines),
+  transactions, `toSQL()`, mapped
   properties/NULL/required-key semantics, lossless codecs (bigint/string/
   safe-number int8 modes, exact numerics, microsecond temporals, bytea,
   SQL NULL vs JSON null writes) across raw select, projection, `returning`
@@ -766,8 +816,10 @@ general-purpose use.
   cross-language-pinned (Go + reference consumer agree byte-for-byte);
   importing the root loads no driver module until a connection is requested.
 - `update`/`delete` require `.where()` (foot-gun guard).
-- Deferred with explicit rejection, not implemented: nested/per-relation
-  `with` and repeated targets (Q05), generated/identity columns —
+- Deferred with explicit rejection, not implemented: parent-correlated
+  per-child filters (filter the parent instead) and subqueries inside
+  per-child where/orderBy, relation nesting deeper than 5 levels,
+  generated/identity columns —
   the schema cannot declare them yet, so the "generated-field writes are
   rejected" guarantee lands with them; `serial` stays writable per PostgreSQL
   semantics (Q07), composite constraints/enums/arrays/views in migrations

@@ -207,8 +207,6 @@ async function relationalFixtures(): Promise<void> {
   void db.query.users.findMany({ with: { nope: true } });
   // @ts-expect-error unrequested relation access is absent from the row type
   void withPosts[0].comments;
-  // @ts-expect-error nested with (depth 2) is rejected until Q05
-  void db.query.users.findMany({ with: { posts: { with: { author: true } } } });
   // @ts-expect-error to-one result is nullable (outer-join semantics)
   const notNull: ExpectedUserRow = (await db.query.posts.findFirst({ with: { author: true } }))!.author;
   // @ts-expect-error to-many cardinality is an array
@@ -532,3 +530,64 @@ async function q04Fixtures(): Promise<void> {
   keyset(users, [ascNullsLast(users.name)], { perPage: "ten" });
 }
 void q04Fixtures;
+
+// --- Q05 nested relational reads through the packed declarations:
+// exact depth-3 row types with per-child columns/limit/where, per-cardinality
+// nested args (limit rejected on to-one), and pure toSQL/explainQuery.
+
+async function q05Fixtures(): Promise<void> {
+  const db = await createDatabase({
+    url: "postgres://type-fixture:not-run@localhost:1/none",
+    tables: { users, posts, collision },
+    relations: { users: usersRelations, posts: postsRelations },
+  });
+
+  // Depth-3 chain with column subsets at every level.
+  const chain = await db.query.users.findMany({
+    columns: ["id", "email"],
+    with: { posts: { columns: ["id", "title"], with: { author: { columns: ["name"] } } } },
+  });
+  const eqChain: AssertEq<
+    (typeof chain)[number],
+    { id: number; email: string; posts: Array<{ id: number; title: string; author: { name: string | null } | null }> }
+  > = true;
+
+  // Per-child limit on a to-many edge; the nested row keeps full types.
+  const limited = await db.query.posts.findMany({
+    with: { author: { columns: ["email"], with: { posts: { limit: 2 } } } },
+  });
+  const eqLimited: AssertEq<
+    (typeof limited)[number],
+    { id: number; userId: number; title: string; author: { email: string; posts: ExpectedPostChild[] } | null }
+  > = true;
+
+  // A no-args call carries NO relation keys.
+  const plain = await db.query.users.findMany();
+  const eqPlain: AssertEq<(typeof plain)[number], ExpectedUserRow> = true;
+  void [eqChain, eqLimited, eqPlain];
+
+  // @ts-expect-error unknown NESTED relation name
+  void db.query.users.findMany({ with: { posts: { with: { nope: true } } } });
+  // @ts-expect-error unknown nested column key
+  void db.query.users.findMany({ with: { posts: { columns: ["nope"] } } });
+  // @ts-expect-error limit is rejected on to-one nested args
+  void db.query.posts.findMany({ with: { author: { limit: 1 } } });
+  // @ts-expect-error orderBy is rejected on to-one nested args too (rework m1)
+  void db.query.posts.findMany({ with: { author: { orderBy: [desc(posts.id)] } } });
+  // @ts-expect-error columns subset at depth 1: absent keys are compile errors
+  void chain[0].posts[0].userId;
+  // @ts-expect-error columns subset at depth 2: absent keys are compile errors
+  void chain[0].posts[0].author!.email;
+  void [chain, limited, plain];
+
+  // Pure inspection needs no connection.
+  const compiled = db.query.users.toSQL({ with: { posts: true } });
+  const sqlText: string = compiled.sql;
+  const paramsList: unknown[] = compiled.params;
+  const plan = db.query.users.explainQuery({ with: { posts: { with: { author: true } } } });
+  const stmtCount: number = plan.statementCount;
+  const depth: number = plan.depth;
+  const caps: readonly StatementCapability[] = plan.capabilities;
+  void [sqlText, paramsList, stmtCount, depth, caps];
+}
+void q05Fixtures;
