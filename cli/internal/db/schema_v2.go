@@ -281,6 +281,25 @@ var v2TypeParams = map[string]map[string]bool{
 var v2ReferentialActions = map[string]bool{"cascade": true, "restrict": true, "no action": true, "set null": true, "set default": true}
 var v2FKMatches    = map[string]bool{"simple": true, "full": true, "partial": true}
 var v2IndexMethods = map[string]bool{"btree": true, "hash": true, "gin": true, "gist": true, "spgist": true, "brin": true}
+
+// Default-operator-class facts for the index methods and column types in
+// the contract vocabulary: exactly these combinations apply on PostgreSQL
+// without naming an operator class (built-in pg_opclass defaults; arrays
+// uniformly via array_ops). Everything else is refused by the server with
+// SQLSTATE 42704, so the validator rejects it at definition time — the
+// contract has no operator-class slot to spell an explicit one. Derived
+// from a live probe on PostgreSQL 17 and the REL_15_STABLE pg_opclass
+// catalog source; the two agree on every vocabulary combination.
+var v2IndexMethodScalars = map[string]map[string]bool{
+	"btree":  {"text": true, "varchar": true, "bool": true, "int2": true, "int4": true, "int8": true, "float4": true, "float8": true, "numeric": true, "timestamp": true, "timestamptz": true, "date": true, "uuid": true, "bytea": true, "enum": true, "jsonb": true},
+	"hash":   {"text": true, "varchar": true, "bool": true, "int2": true, "int4": true, "int8": true, "float4": true, "float8": true, "numeric": true, "timestamp": true, "timestamptz": true, "date": true, "uuid": true, "bytea": true, "enum": true, "jsonb": true},
+	"gin":    {"jsonb": true},
+	"gist":   {},
+	"spgist": {"text": true, "varchar": true},
+	"brin":   {"text": true, "varchar": true, "int2": true, "int4": true, "int8": true, "float4": true, "float8": true, "numeric": true, "timestamp": true, "timestamptz": true, "date": true, "uuid": true, "bytea": true},
+}
+var v2IndexMethodArrays = map[string]bool{"btree": true, "hash": true, "gin": true}
+
 var v2OpaqueKinds  = map[string]bool{"extension-table": true, "extension-object": true, "unsupported-table": true, "unsupported-object": true}
 
 // v2LiteralPattern matches exactly one SQL literal token, optionally cast:
@@ -290,7 +309,48 @@ const v2LiteralPattern = `^('([^']|'')*'(::[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-
 
 var v2LiteralRegexp = regexp.MustCompile(v2LiteralPattern)
 
+// v2LiteralCast splits an optional cast off a spelled literal default into
+// its element type name (schema qualification dropped) and array depth:
+// '{a}'::public.text[] -> ("text", 1, true). Only called on strings the
+// literal pattern already accepted.
+func v2LiteralCast(sql string) (string, int, bool) {
+	i := strings.Index(sql, "::")
+	if i < 0 {
+		return "", 0, false
+	}
+	cast := sql[i+2:]
+	depth := 0
+	for strings.HasSuffix(cast, "[]") {
+		depth++
+		cast = cast[:len(cast)-2]
+	}
+	if j := strings.LastIndex(cast, "."); j >= 0 {
+		cast = cast[j+1:]
+	}
+	return cast, depth, true
+}
+
+// v2TypeAliases maps the spellable aliases of the vocabulary's type names.
+var v2TypeAliases = map[string]string{
+	"boolean": "bool", "int": "int4", "integer": "int4", "smallint": "int2",
+	"bigint": "int8", "real": "float4", "decimal": "numeric",
+}
+
+func v2NormalizeTypeName(name string) string {
+	if alias, ok := v2TypeAliases[name]; ok {
+		return alias
+	}
+	return name
+}
+
 var v2IntegerTypes = map[string]bool{"int2": true, "int4": true, "int8": true}
+
+// v2ColumnType carries what the definition-time applicability and
+// default-cast checks need to know about a column.
+type v2ColumnType struct {
+	Name    string
+	IsArray bool
+}
 
 // v2State accumulates what cross-reference checks need across collections.
 type v2State struct {
@@ -643,8 +703,9 @@ func v2ValidateTable(item any, path string, st *v2State) error {
 		return contractErr("invalid-value", path+".columns", "table %q must declare at least one column", key)
 	}
 	colNames := map[string]bool{}
+	colTypes := map[string]v2ColumnType{}
 	for j, col := range columns {
-		colName, err := v2ValidateColumn(col, fmt.Sprintf("%s.columns[%d]", path, j), st)
+		colName, colType, err := v2ValidateColumn(col, fmt.Sprintf("%s.columns[%d]", path, j), st)
 		if err != nil {
 			return err
 		}
@@ -652,6 +713,7 @@ func v2ValidateTable(item any, path string, st *v2State) error {
 			return contractErr("duplicate-column", fmt.Sprintf("%s.columns[%d].name", path, j), "column %q is declared twice on table %q", colName, key)
 		}
 		colNames[colName] = true
+		colTypes[colName] = colType
 	}
 
 	constraints, err := v2Array(m["constraints"], path+".constraints")
@@ -682,7 +744,7 @@ func v2ValidateTable(item any, path string, st *v2State) error {
 		return err
 	}
 	for j, idx := range indexes {
-		if err := v2ValidateIndex(idx, fmt.Sprintf("%s.indexes[%d]", path, j), colNames, key, st); err != nil {
+		if err := v2ValidateIndex(idx, fmt.Sprintf("%s.indexes[%d]", path, j), colNames, colTypes, key, st); err != nil {
 			return err
 		}
 	}
@@ -692,46 +754,68 @@ func v2ValidateTable(item any, path string, st *v2State) error {
 	return nil
 }
 
-func v2ValidateColumn(item any, path string, st *v2State) (string, error) {
+func v2ValidateColumn(item any, path string, st *v2State) (string, v2ColumnType, error) {
 	m, err := v2Object(item, path)
 	if err != nil {
-		return "", err
+		return "", v2ColumnType{}, err
 	}
 	for k := range m {
 		switch k {
-		case "name", "type", "notNull", "default":
+		case "name", "type", "notNull", "default", "generated":
 		default:
-			return "", contractErr("unknown-field", path+"."+k, "unknown field %q", k)
+			return "", v2ColumnType{}, contractErr("unknown-field", path+"."+k, "unknown field %q", k)
 		}
 	}
 	for _, k := range []string{"name", "type", "notNull"} {
 		if _, ok := m[k]; !ok {
-			return "", contractErr("missing-field", path+"."+k, "column requires %q", k)
+			return "", v2ColumnType{}, contractErr("missing-field", path+"."+k, "column requires %q", k)
 		}
 	}
 	name, err := v2String(m["name"], path+".name")
 	if err != nil {
-		return "", err
+		return "", v2ColumnType{}, err
 	}
 	if err := v2CheckName(name, path+".name"); err != nil {
-		return "", err
+		return "", v2ColumnType{}, err
 	}
 	if _, err := v2Bool(m["notNull"], path+".notNull"); err != nil {
-		return "", err
+		return "", v2ColumnType{}, err
+	}
+
+	if gen, ok := m["generated"]; ok {
+		gm, err := v2Object(gen, path+".generated")
+		if err != nil {
+			return "", v2ColumnType{}, err
+		}
+		for k := range gm {
+			if k != "expression" {
+				return "", v2ColumnType{}, contractErr("unknown-field", path+".generated."+k, "unknown field %q", k)
+			}
+		}
+		es, err := v2String(gm["expression"], path+".generated.expression")
+		if err != nil {
+			return "", v2ColumnType{}, err
+		}
+		if err := v2CheckSQLText(es, path+".generated.expression", true); err != nil {
+			return "", v2ColumnType{}, err
+		}
+		if _, hasDefault := m["default"]; hasDefault {
+			return "", v2ColumnType{}, contractErr("invalid-default", path+".default", "a generated column cannot also declare a default")
+		}
 	}
 
 	typeObj, err := v2Object(m["type"], path+".type")
 	if err != nil {
-		return "", err
+		return "", v2ColumnType{}, err
 	}
-	typeName, err := v2ValidateColumnType(typeObj, path+".type", st)
+	typeName, isArray, err := v2ValidateColumnType(typeObj, path+".type", st)
 	if err != nil {
-		return "", err
+		return "", v2ColumnType{}, err
 	}
 
 	if def, ok := m["default"]; ok {
-		if err := v2ValidateDefault(def, path+".default", typeName); err != nil {
-			return "", err
+		if err := v2ValidateDefault(def, path+".default", typeName, isArray); err != nil {
+			return "", v2ColumnType{}, err
 		}
 		defObj, _ := v2Object(def, path+".default")
 		var seqRef any
@@ -744,46 +828,46 @@ func v2ValidateColumn(item any, path string, st *v2State) (string, error) {
 		if seqRef != nil {
 			seqSchema, _, err := v2CheckIdentity(seqRef, path+".default.sequence")
 			if err != nil {
-				return "", err
+				return "", v2ColumnType{}, err
 			}
 			st.sequenceSchemas = append(st.sequenceSchemas, seqSchema)
 		}
 	}
-	return name, nil
+	return name, v2ColumnType{Name: typeName, IsArray: isArray}, nil
 }
 
-func v2ValidateColumnType(typeObj map[string]any, path string, st *v2State) (string, error) {
+func v2ValidateColumnType(typeObj map[string]any, path string, st *v2State) (typeName string, isArray bool, err error) {
 	for k := range typeObj {
 		switch k {
 		case "name", "params", "array", "codec", "enum":
 		default:
-			return "", contractErr("unknown-field", path+"."+k, "unknown field %q", k)
+			return "", false, contractErr("unknown-field", path+"."+k, "unknown field %q", k)
 		}
 	}
 	if _, ok := typeObj["name"]; !ok {
-		return "", contractErr("missing-field", path+".name", "type requires \"name\"")
+		return "", false, contractErr("missing-field", path+".name", "type requires \"name\"")
 	}
 	if _, ok := typeObj["codec"]; !ok {
-		return "", contractErr("missing-field", path+".codec", "type requires \"codec\"")
+		return "", false, contractErr("missing-field", path+".codec", "type requires \"codec\"")
 	}
-	typeName, err := v2String(typeObj["name"], path+".name")
+	typeName, err = v2String(typeObj["name"], path+".name")
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	codec, err := v2String(typeObj["codec"], path+".codec")
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	defaultCodec, known := v2TypeCodecs[typeName]
 	if !known {
-		return "", contractErr("unknown-type", path+".name", "unknown column type %q", typeName)
+		return "", false, contractErr("unknown-type", path+".name", "unknown column type %q", typeName)
 	}
 
-	isArray := false
+	isArray = false
 	if arr, ok := typeObj["array"]; ok {
 		isArray, err = v2Bool(arr, path+".array")
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 	}
 	wantCodec := defaultCodec
@@ -791,27 +875,27 @@ func v2ValidateColumnType(typeObj map[string]any, path string, st *v2State) (str
 		wantCodec = "array"
 	}
 	if codec != wantCodec {
-		return "", contractErr("codec-mismatch", path+".codec", "type %s (array=%v) requires codec %q, got %q", typeName, isArray, wantCodec, codec)
+		return "", false, contractErr("codec-mismatch", path+".codec", "type %s (array=%v) requires codec %q, got %q", typeName, isArray, wantCodec, codec)
 	}
 
 	if typeName == "enum" {
 		enumRef, ok := typeObj["enum"]
 		if !ok {
-			return "", contractErr("missing-field", path+".enum", "type name \"enum\" requires an \"enum\" identity reference")
+			return "", false, contractErr("missing-field", path+".enum", "type name \"enum\" requires an \"enum\" identity reference")
 		}
 		schema, name, err := v2CheckIdentity(enumRef, path+".enum")
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 		st.enumRefs = append(st.enumRefs, v2EnumRef{Path: path + ".enum", Key: v2TableKey(schema, name)})
 	} else if _, ok := typeObj["enum"]; ok {
-		return "", contractErr("unknown-field", path+".enum", "enum reference is only valid on type \"enum\"")
+		return "", false, contractErr("unknown-field", path+".enum", "enum reference is only valid on type \"enum\"")
 	}
 
 	if params, ok := typeObj["params"]; ok {
 		pm, err := v2Object(params, path+".params")
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 		allowed := v2TypeParams[typeName]
 		keys := make([]string, 0, len(pm))
@@ -821,61 +905,61 @@ func v2ValidateColumnType(typeObj map[string]any, path string, st *v2State) (str
 		sort.Strings(keys)
 		for _, k := range keys {
 			if allowed == nil || !allowed[k] {
-				return "", contractErr("invalid-type-params", path+".params."+k, "type %s accepts no parameter %q", typeName, k)
+				return "", false, contractErr("invalid-type-params", path+".params."+k, "type %s accepts no parameter %q", typeName, k)
 			}
 			iv, err := v2Int(pm[k], path+".params."+k)
 			if err != nil {
-				return "", err
+				return "", false, err
 			}
 			switch k {
 			case "length":
 				if iv < 1 || iv > 10485760 {
-					return "", contractErr("invalid-type-params", path+".params.length", "length must be within 1..10485760")
+					return "", false, contractErr("invalid-type-params", path+".params.length", "length must be within 1..10485760")
 				}
 			case "precision":
 				if typeName == "numeric" {
 					if iv < 1 || iv > 1000 {
-						return "", contractErr("invalid-type-params", path+".params.precision", "numeric precision must be within 1..1000")
+						return "", false, contractErr("invalid-type-params", path+".params.precision", "numeric precision must be within 1..1000")
 					}
 				} else if iv < 0 || iv > 6 {
-					return "", contractErr("invalid-type-params", path+".params.precision", "timestamp precision must be within 0..6")
+					return "", false, contractErr("invalid-type-params", path+".params.precision", "timestamp precision must be within 0..6")
 				}
 			case "scale":
 				prec, hasPrec := pm["precision"]
 				if !hasPrec {
-					return "", contractErr("invalid-type-params", path+".params.scale", "scale requires precision")
+					return "", false, contractErr("invalid-type-params", path+".params.scale", "scale requires precision")
 				}
 				precV, err := v2Int(prec, path+".params.precision")
 				if err != nil {
-					return "", err
+					return "", false, err
 				}
 				if iv < 0 || iv > precV {
-					return "", contractErr("invalid-type-params", path+".params.scale", "scale must be within 0..precision")
+					return "", false, contractErr("invalid-type-params", path+".params.scale", "scale must be within 0..precision")
 				}
 			case "dimensions":
 				if iv < 1 || iv > 16000 {
-					return "", contractErr("invalid-type-params", path+".params.dimensions", "vector dimensions must be within 1..16000")
+					return "", false, contractErr("invalid-type-params", path+".params.dimensions", "vector dimensions must be within 1..16000")
 				}
 			}
 		}
 		if typeName == "vector" {
 			if _, ok := pm["dimensions"]; !ok {
-				return "", contractErr("invalid-type-params", path+".params.dimensions", "vector type requires dimensions")
+				return "", false, contractErr("invalid-type-params", path+".params.dimensions", "vector type requires dimensions")
 			}
 		}
 	} else if typeName == "vector" {
-		return "", contractErr("invalid-type-params", path+".params", "vector type requires params.dimensions")
+		return "", false, contractErr("invalid-type-params", path+".params", "vector type requires params.dimensions")
 	}
 
 	if typeName == "vector" {
 		if !st.capabilities["pgvector"] && !st.capabilities["nucleus"] {
-			return "", contractErr("vector-capability", path+".name", "vector columns require capability \"pgvector\" or \"nucleus\" in the document capabilities")
+			return "", false, contractErr("vector-capability", path+".name", "vector columns require capability \"pgvector\" or \"nucleus\" in the document capabilities")
 		}
 	}
-	return typeName, nil
+	return typeName, isArray, nil
 }
 
-func v2ValidateDefault(item any, path string, typeName string) error {
+func v2ValidateDefault(item any, path string, typeName string, isArray bool) error {
 	m, err := v2Object(item, path)
 	if err != nil {
 		return err
@@ -900,6 +984,18 @@ func v2ValidateDefault(item any, path string, typeName string) error {
 		}
 		if !v2LiteralRegexp.MatchString(sql) {
 			return contractErr("invalid-literal", path+".sql", "default tagged literal must be exactly one SQL literal token (quoted string, numeric, true, false or null), got %q — expression-looking text must be tagged expression", sql)
+		}
+		if isArray && typeName == "enum" {
+			return contractErr("invalid-default", path, "enum array column defaults are explicitly unsupported — the enum element cast cannot be spelled as a contract literal")
+		}
+		elem, depth, hasCast := v2LiteralCast(sql)
+		if hasCast && (isArray || depth > 0) {
+			if !isArray || depth == 0 {
+				return contractErr("invalid-default", path+".sql", "default cast ::%s does not match the array-ness of column type %s (PostgreSQL refuses it with SQLSTATE 42804 at apply)", elem, typeName)
+			}
+			if v2NormalizeTypeName(elem) != typeName {
+				return contractErr("invalid-default", path+".sql", "array default cast ::%s does not match the column element type %s (PostgreSQL refuses it with SQLSTATE 42804 at apply)", elem, typeName)
+			}
 		}
 		return nil
 	case "expression":
@@ -1127,7 +1223,7 @@ func v2CheckDeferrable(m map[string]any, path string) error {
 	return nil
 }
 
-func v2ValidateIndex(item any, path string, colNames map[string]bool, tableKey string, st *v2State) error {
+func v2ValidateIndex(item any, path string, colNames map[string]bool, colTypes map[string]v2ColumnType, tableKey string, st *v2State) error {
 	m, err := v2Object(item, path)
 	if err != nil {
 		return err
@@ -1188,6 +1284,16 @@ func v2ValidateIndex(item any, path string, colNames map[string]bool, tableKey s
 			if !colNames[cs] {
 				return contractErr("constraint-column", ppath+".column", "index %q references unknown column %q on table %q", ident, cs, tableKey)
 			}
+			if ct, ok := colTypes[cs]; ok {
+				applicable := ct.IsArray && v2IndexMethodArrays[method] || !ct.IsArray && v2IndexMethodScalars[method][ct.Name]
+				if !applicable {
+					desc := ct.Name
+					if ct.IsArray {
+						desc += "[]"
+					}
+					return contractErr("invalid-index", ppath, "index method %q over column %q (%s) has no default operator class on any supported server (PostgreSQL refuses it with SQLSTATE 42704) — explicitly unsupported: the contract has no operator-class slot", method, cs, desc)
+				}
+			}
 		case hasExpr:
 			es, err := v2String(expr, ppath+".expression")
 			if err != nil {
@@ -1196,12 +1302,39 @@ func v2ValidateIndex(item any, path string, colNames map[string]bool, tableKey s
 			if err := v2CheckSQLText(es, ppath+".expression", true); err != nil {
 				return err
 			}
+			if method != "btree" {
+				return contractErr("invalid-index", ppath, "expression keys are only definable with method \"btree\" — the default operator class of an expression result type cannot be verified at definition time (the contract has no operator-class slot)")
+			}
+			if _, hasOrder := pm["order"]; hasOrder {
+				return contractErr("index-key", ppath, "ordered expression keys are explicitly unsupported (per-part expression deparse is engine-dependent)")
+			}
+			if _, hasNulls := pm["nulls"]; hasNulls {
+				return contractErr("index-key", ppath, "ordered expression keys are explicitly unsupported (per-part expression deparse is engine-dependent)")
+			}
 		default:
 			return contractErr("index-key", ppath, "key part needs either column or expression")
 		}
 		for k := range pm {
-			if k != "column" && k != "expression" {
+			if k != "column" && k != "expression" && k != "order" && k != "nulls" {
 				return contractErr("unknown-field", ppath+"."+k, "unknown field %q on index key part", k)
+			}
+		}
+		if o, ok := pm["order"]; ok {
+			os, err := v2String(o, ppath+".order")
+			if err != nil {
+				return err
+			}
+			if os != "asc" && os != "desc" {
+				return contractErr("invalid-value", ppath+".order", "index key part order must be \"asc\" or \"desc\", got %q", os)
+			}
+		}
+		if n, ok := pm["nulls"]; ok {
+			ns, err := v2String(n, ppath+".nulls")
+			if err != nil {
+				return err
+			}
+			if ns != "first" && ns != "last" {
+				return contractErr("invalid-value", ppath+".nulls", "index key part nulls must be \"first\" or \"last\", got %q", ns)
 			}
 		}
 	}

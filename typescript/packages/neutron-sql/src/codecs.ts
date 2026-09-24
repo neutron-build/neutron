@@ -13,6 +13,7 @@
 import type { AnyColumnBuilder, ColumnDataType } from "./schema.js";
 import { ColumnBuilder } from "./schema.js";
 import { aggregate, fragment, projection, type AggregateNode, type ProjectionNode, type QualifiedNode, type ValueNode } from "./ast.js";
+import { formatArrayLiteral, parseArrayLiteral } from "./pg-array.js";
 
 export type BigintMode = "bigint" | "string" | "number";
 export type TemporalMode = "string" | "date";
@@ -80,6 +81,15 @@ export function wireReadNode(dataType: ColumnDataType, ref: QualifiedNode): Valu
   }
 }
 
+/** Column-aware lossless acquisition (Q07): array columns acquire their
+ *  array literal (`ref::text`, decoded per element by the column codec);
+ *  derived/CTE pseudo-columns over canonical temporal text re-render
+ *  through canonicalTextWireNode; everything else follows wireReadNode. */
+export function columnWireReadNode(column: AnyColumnBuilder, ref: QualifiedNode): ValueNode | null {
+  if (column.arrayDimensions !== undefined) return fragment(ref, "::text");
+  return column.canonicalText ? canonicalTextWireNode(column.dataType, ref) : wireReadNode(column.dataType, ref);
+}
+
 /** Wire acquisition for a column whose stored value is already the canonical
  *  text form (a derived table/CTE over a text-wire projection): render the
  *  naive pass-through `to_jsonb(ref::timestamp)::text` for BOTH timestamp and
@@ -133,6 +143,10 @@ function timestampToInstantMs(canonical: string, ctx: ColumnContext): number {
 
 /** Decode a to_jsonb text wire value (quoted string) to the column's value. */
 export function decodeTextWire(column: AnyColumnBuilder, ctx: ColumnContext, raw: unknown): unknown {
+  return applyCustomDecode(column, ctx, decodeTextWireInner(column, ctx, raw));
+}
+
+function decodeTextWireInner(column: AnyColumnBuilder, ctx: ColumnContext, raw: unknown): unknown {
   const inner = stripJsonQuotes(raw, ctx);
   const dt = column.dataType;
   if (dt === "timestamp") {
@@ -206,7 +220,14 @@ function decodeNumericString(text: string, column: AnyColumnBuilder, ctx: Column
  *  both drivers; bytea arrives as a buffer) to the column's final value. */
 export function decodeNativeValue(column: AnyColumnBuilder, ctx: ColumnContext, raw: unknown): unknown {
   if (raw === null || raw === undefined) return raw;
+  return applyCustomDecode(column, ctx, decodeNativeValueInner(column, ctx, raw));
+}
+
+function decodeNativeValueInner(column: AnyColumnBuilder, ctx: ColumnContext, raw: unknown): unknown {
+  if (column.arrayDimensions !== undefined) return decodeArrayText(column, ctx, raw);
   switch (column.dataType) {
+    case "enum":
+      return decodeEnumValue(column, ctx, raw);
     case "bigint":
       if (typeof raw !== "string" && typeof raw !== "bigint" && typeof raw !== "number") {
         throw codecError(ctx, `unexpected int8 value of type ${typeof raw}`);
@@ -244,7 +265,14 @@ export function byteaFromHex(text: string, ctx: ColumnContext): Uint8Array {
  *  relations.ts), so precision survives JSON.parse and decodes here. */
 export function decodeJsonLeaf(column: AnyColumnBuilder, ctx: ColumnContext, raw: unknown): unknown {
   if (raw === null || raw === undefined) return raw;
+  return applyCustomDecode(column, ctx, decodeJsonLeafInner(column, ctx, raw));
+}
+
+function decodeJsonLeafInner(column: AnyColumnBuilder, ctx: ColumnContext, raw: unknown): unknown {
+  if (column.arrayDimensions !== undefined) return decodeArrayText(column, ctx, raw);
   switch (column.dataType) {
+    case "enum":
+      return decodeEnumValue(column, ctx, raw);
     case "bigint":
     case "numeric": {
       if (typeof raw !== "string" && typeof raw !== "number") {
@@ -295,6 +323,157 @@ export function decodeJsonLeaf(column: AnyColumnBuilder, ctx: ColumnContext, raw
     default:
       return raw;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Enums and arrays (Q07)
+// ---------------------------------------------------------------------------
+
+function enumLabel(column: AnyColumnBuilder): string {
+  const def = column.enumDef;
+  if (def === undefined) return "enum";
+  return def.schema === undefined ? `enum "${def.name}"` : `enum "${def.schema}"."${def.name}"`;
+}
+
+/** Enum reads validate membership: the column's read type is the declared
+ *  literal union, so a database value outside it (a type that drifted from
+ *  the schema declaration) fails instead of widening the type silently. */
+function decodeEnumValue(column: AnyColumnBuilder, ctx: ColumnContext, raw: unknown): string {
+  if (typeof raw !== "string") throw codecError(ctx, `unexpected ${enumLabel(column)} value of type ${typeof raw}`);
+  const values = column.enumDef?.values;
+  if (values === undefined) throw codecError(ctx, "enum column carries no enum definition");
+  if (!values.includes(raw)) {
+    throw codecError(ctx, `database value "${raw}" is not a declared value of ${enumLabel(column)} (declared: ${values.join(", ")}) — the database type has drifted from the schema declaration`);
+  }
+  return raw;
+}
+
+const INTEGER_TEXT = /^[+-]?\d+$/;
+const FLOAT_TEXT = /^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/;
+
+/** Decode one array element's text (PostgreSQL element output) with the
+ *  column's element codec. */
+function decodeArrayElement(column: AnyColumnBuilder, ctx: ColumnContext, text: string): unknown {
+  switch (column.dataType) {
+    case "integer":
+    case "smallint":
+      if (!INTEGER_TEXT.test(text)) throw codecError(ctx, `unexpected ${column.dataType} array element "${text}"`);
+      return Number(text);
+    case "bigint":
+      return decodeBigintString(text, column, ctx);
+    case "numeric":
+      return decodeNumericString(text, column, ctx);
+    case "double":
+    case "real":
+      if (text === "NaN") return Number.NaN;
+      if (text === "Infinity") return Number.POSITIVE_INFINITY;
+      if (text === "-Infinity") return Number.NEGATIVE_INFINITY;
+      if (!FLOAT_TEXT.test(text)) throw codecError(ctx, `unexpected ${column.dataType} array element "${text}"`);
+      return Number(text);
+    case "boolean":
+      if (text === "t") return true;
+      if (text === "f") return false;
+      throw codecError(ctx, `unexpected boolean array element "${text}"`);
+    case "text":
+    case "varchar":
+    case "uuid":
+      return text;
+    case "enum":
+      return decodeEnumValue(column, ctx, text);
+    case "json":
+    case "jsonb":
+      try {
+        return JSON.parse(text) as unknown;
+      } catch {
+        throw codecError(ctx, "array element is not valid JSON text");
+      }
+    default:
+      throw codecError(ctx, `${column.dataType} arrays are not supported`);
+  }
+}
+
+/** Decode an array column value: the array literal text (flat path and JSON
+ *  child leaves both acquire `col::text`). */
+export function decodeArrayText(column: AnyColumnBuilder, ctx: ColumnContext, raw: unknown): Array<unknown> {
+  if (typeof raw !== "string") {
+    throw codecError(ctx, `expected the array literal text (col::text acquisition), got ${Array.isArray(raw) ? "a driver-parsed array" : typeof raw}`);
+  }
+  let elements: Array<string | null>;
+  try {
+    elements = parseArrayLiteral(raw, "array value");
+  } catch (err) {
+    throw codecError(ctx, (err as Error).message);
+  }
+  return elements.map((e) => (e === null ? null : decodeArrayElement(column, ctx, e)));
+}
+
+/** SQL type name for an array column's parameter cast (`$n::text::<cast>`):
+ *  the element's pg_catalog name, or the quoted (schema-qualified when
+ *  declared) enum type, plus `[]`. */
+export function arrayCastOf(column: AnyColumnBuilder): string {
+  const quote = (s: string): string => `"${s.replace(/"/g, '""')}"`;
+  switch (column.dataType) {
+    case "integer": return "int4[]";
+    case "smallint": return "int2[]";
+    case "bigint": return "int8[]";
+    case "double": return "float8[]";
+    case "real": return "float4[]";
+    case "numeric": return "numeric[]";
+    case "text": return "text[]";
+    case "varchar": return "varchar[]";
+    case "boolean": return "bool[]";
+    case "uuid": return "uuid[]";
+    case "json": return "json[]";
+    case "jsonb": return "jsonb[]";
+    case "enum": {
+      const def = column.enumDef;
+      if (def === undefined) throw new Error(`enum array column "${column.columnName}" carries no enum definition`);
+      return def.schema === undefined ? `${quote(def.name)}[]` : `${quote(def.schema)}.${quote(def.name)}[]`;
+    }
+    default:
+      throw new Error(`${column.dataType} arrays are not supported`);
+  }
+}
+
+/** Element text for an array literal, from a validated scalar encoding. */
+function arrayElementText(column: AnyColumnBuilder, encoded: EncodedValue): string {
+  const b = encoded.bind;
+  switch (column.dataType) {
+    case "boolean":
+      return b === true ? "t" : "f";
+    default:
+      return typeof b === "string" ? b : String(b);
+  }
+}
+
+function encodeArrayValue(column: AnyColumnBuilder, ctx: ColumnContext, value: unknown): EncodedValue {
+  if (!Array.isArray(value)) throw codecError(ctx, `array columns accept arrays, got ${describeValue(value)}`);
+  const scalar = scalarElementColumn(column);
+  const texts: Array<string | null> = [];
+  value.forEach((element: unknown, i) => {
+    if (element === null) {
+      texts.push(null);
+      return;
+    }
+    if (Array.isArray(element)) {
+      throw codecError(ctx, `element ${i} is an array — the column is declared as a one-dimensional array`);
+    }
+    if (element === undefined) throw codecError(ctx, `element ${i} is undefined (use null for SQL NULL elements)`);
+    const enc = encodeWriteValue(scalar, { ...ctx, propertyKey: `${ctx.propertyKey}[${i}]` }, element);
+    texts.push(arrayElementText(column, enc));
+  });
+  return { bind: formatArrayLiteral(texts), cast: arrayCastOf(column) };
+}
+
+/** A scalar stand-in for an array column's element (same type, codec mode
+ *  and enum definition, no array flag). */
+function scalarElementColumn(column: AnyColumnBuilder): AnyColumnBuilder {
+  const c = new ColumnBuilder(column.columnName, column.dataType) as AnyColumnBuilder;
+  c.readMode = column.readMode;
+  c.valueDecoder = column.valueDecoder;
+  c.varcharLength = column.varcharLength;
+  c.enumDef = column.enumDef;
+  return c;
 }
 
 // ---------------------------------------------------------------------------
@@ -350,13 +529,65 @@ function jsonRepresentable(value: unknown): boolean {
 /** Validate and encode a non-null, non-undefined write value for a column.
  *  Returns the bind value (plus a cast requirement for temporal/json sites)
  *  or throws with column context. */
+/** Why a column cannot be assigned by INSERT/UPDATE (database-generated
+ *  columns), or undefined when it is writable. Mutation paths check this for
+ *  every supplied key — including null and sql-fragment values — before any
+ *  SQL runs; predicate and cursor values do not (comparing against a
+ *  generated column is ordinary). */
+export function columnWriteRejection(column: AnyColumnBuilder): string | undefined {
+  if (column.generatedExpr !== undefined) {
+    return "column is GENERATED ALWAYS AS (stored) — the database computes it; values cannot be written";
+  }
+  if (column.identityKind === "always") {
+    return "column is GENERATED ALWAYS AS IDENTITY — the database generates values; values cannot be written";
+  }
+  return undefined;
+}
+
+/** Mutation-site guard: throws with column context for generated columns. */
+export function assertColumnWritable(column: AnyColumnBuilder, ctx: ColumnContext): void {
+  const reason = columnWriteRejection(column);
+  if (reason !== undefined) throw codecError(ctx, reason);
+}
+
 export function encodeWriteValue(column: AnyColumnBuilder, ctx: ColumnContext, value: unknown): EncodedValue {
-  const dt = column.dataType;
-  const t = typeof value;
+  let userValue = value;
+  if (column.customCodec !== undefined) {
+    if (value === null) {
+      // SQL NULL passes through untouched (the codec maps values, not NULL).
+    } else {
+      try {
+        userValue = column.customCodec.encode(value);
+      } catch (err) {
+        throw codecError(ctx, `custom codec encode failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      const ut = typeof userValue;
+      if (ut === "symbol" || ut === "function" || ut === "undefined") {
+        throw codecError(ctx, `custom codec encode returned a ${ut}, which cannot be bound`);
+      }
+    }
+  }
+  const t = typeof userValue;
   if (t === "symbol" || t === "function" || t === "undefined") {
     throw codecError(ctx, `${t} values cannot be bound`);
   }
+  return encodeWriteValueInner(column, ctx, userValue);
+}
+
+function encodeWriteValueInner(column: AnyColumnBuilder, ctx: ColumnContext, value: unknown): EncodedValue {
+  const dt = column.dataType;
+  const t = typeof value;
+  if (column.arrayDimensions !== undefined) return encodeArrayValue(column, ctx, value);
   switch (dt) {
+    case "enum": {
+      if (typeof value !== "string") throw codecError(ctx, `${enumLabel(column)} columns accept one of their declared string values`);
+      const values = column.enumDef?.values;
+      if (values === undefined) throw codecError(ctx, "enum column carries no enum definition");
+      if (!values.includes(value)) {
+        throw codecError(ctx, `"${value}" is not a declared value of ${enumLabel(column)} (declared: ${values.join(", ")})`);
+      }
+      return { bind: value };
+    }
     case "serial":
     case "integer": {
       if (typeof value !== "number" || !Number.isInteger(value)) {
@@ -520,7 +751,9 @@ export type CodecRead =
   | "numeric"
   | "timestamp-text"
   | "timestamptz-text"
-  | "date-text";
+  | "date-text"
+  | "enum"
+  | "array-text";
 
 /** Plain-data codec description for one column. Compiled statements carry
  *  these with their projections (F04); the decode functions above consume
@@ -534,7 +767,14 @@ export interface ColumnCodec {
 
 export function codecOf(column: AnyColumnBuilder): ColumnCodec {
   const dt = column.dataType;
+  if (column.arrayDimensions !== undefined) {
+    return column.readMode === undefined
+      ? { dataType: dt, read: "array-text", textWire: false }
+      : { dataType: dt, read: "array-text", textWire: false, mode: column.readMode };
+  }
   switch (dt) {
+    case "enum":
+      return { dataType: dt, read: "enum", textWire: false };
     case "bigint":
       return { dataType: dt, read: "bigint-mode", textWire: false, mode: (column.readMode as BigintMode) ?? "bigint" };
     case "numeric":
@@ -600,6 +840,9 @@ export function applyProjectionDecoders(
 export function needsFlatDecode(column: AnyColumnBuilder): boolean {
   const dt = column.dataType;
   return (
+    column.arrayDimensions !== undefined ||
+    column.customCodec !== undefined ||
+    dt === "enum" ||
     dt === "bigint" ||
     dt === "numeric" && column.valueDecoder !== undefined ||
     dt === "timestamp" ||
@@ -624,11 +867,11 @@ export function needsFlatDecode(column: AnyColumnBuilder): boolean {
  *  projection planning (aggregateProjection) and derived-table/CTE pseudo
  *  columns (a materialized aggregate column decodes exactly like a base
  *  column of the result type; min/max mirror their argument column). */
-export function aggregateResultColumn(a: AggregateNode): { dataType: ColumnDataType; readMode?: BigintMode | TemporalMode; valueDecoder?: (raw: string) => unknown } {
+export function aggregateResultColumn(a: AggregateNode): { dataType: ColumnDataType; readMode?: BigintMode | TemporalMode; valueDecoder?: (raw: string) => unknown; source?: AnyColumnBuilder } {
   const argCol = a.argColumns?.[0];
   const argType = argCol?.dataType;
   if ((a.op === "min" || a.op === "max") && argCol !== undefined) {
-    return { dataType: argCol.dataType, readMode: argCol.readMode, valueDecoder: argCol.valueDecoder };
+    return { dataType: argCol.dataType, readMode: argCol.readMode, valueDecoder: argCol.valueDecoder, source: argCol };
   }
   if (a.op === "count" || (a.op === "sum" && (argType === "serial" || argType === "integer" || argType === "smallint"))) {
     return { dataType: "bigint" };
@@ -654,8 +897,37 @@ function syntheticColumn(key: string, dataType: ColumnDataType, from?: AnyColumn
   if (from !== undefined) {
     c.readMode = from.readMode;
     c.valueDecoder = from.valueDecoder;
+    copyRichCodec(from, c);
   }
   return c;
+}
+
+/** The column itself when it carries Q07 codec-shaping metadata (array
+ *  shape, enum definition, custom codec), else undefined — plan column specs
+ *  record it so derived/CTE pseudo-columns decode like their source. */
+export function richCodecSource(column: AnyColumnBuilder | undefined): AnyColumnBuilder | undefined {
+  if (column === undefined) return undefined;
+  return column.arrayDimensions !== undefined || column.enumDef !== undefined || column.customCodec !== undefined ? column : undefined;
+}
+
+/** Copy the Q07 codec-shaping metadata (array shape, enum definition, custom
+ *  codec) of a source column onto a synthetic/pseudo column that decodes
+ *  its values. */
+export function copyRichCodec(from: AnyColumnBuilder, to: AnyColumnBuilder): void {
+  if (from.arrayDimensions !== undefined) to.arrayDimensions = from.arrayDimensions;
+  if (from.enumDef !== undefined) to.enumDef = from.enumDef;
+  if (from.customCodec !== undefined) to.customCodec = from.customCodec;
+}
+
+/** Apply a column's custom codec (Q07e) to a decoded value. SQL NULL passes
+ *  through; codec errors carry the column context. */
+function applyCustomDecode(column: AnyColumnBuilder, ctx: ColumnContext, value: unknown): unknown {
+  if (column.customCodec === undefined || value === null || value === undefined) return value;
+  try {
+    return column.customCodec.decode(value);
+  } catch (err) {
+    throw codecError(ctx, `custom codec decode failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 /** Projection + decode plan for one projected aggregate. Mirrors
@@ -670,6 +942,10 @@ export function aggregateProjection(a: AggregateNode, key: string): { node: Proj
 
   if ((a.op === "min" || a.op === "max") && argCol !== undefined) {
     const dt = argCol.dataType;
+    if (argCol.arrayDimensions !== undefined) {
+      // Array min/max compares arrays; acquire the result's array literal.
+      return { node: projection(fragment(a, "::text"), key), decoder: projectionDecoder(a.op, syntheticColumn(key, dt, argCol), key), usesJsonb: false };
+    }
     if (dt === "timestamp" || dt === "timestamptz" || dt === "date") {
       if (argCol.canonicalText) {
         // Derived/CTE pseudo-column: the materialized value is the canonical
@@ -712,7 +988,7 @@ export function aggregateProjection(a: AggregateNode, key: string): { node: Proj
         usesJsonb: true,
       };
     }
-    if (dt === "bigint" || dt === "numeric") {
+    if (dt === "bigint" || dt === "numeric" || dt === "enum") {
       return { node: projection(a, key), decoder: projectionDecoder(a.op, syntheticColumn(key, dt, argCol), key), usesJsonb: false };
     }
     return { node: projection(a, key), decoder: null, usesJsonb: false };

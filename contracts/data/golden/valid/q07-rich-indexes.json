@@ -1,0 +1,220 @@
+{
+  "version": 2,
+  "dialect": "postgresql",
+  "capabilities": [],
+  "schemas": [
+    {
+      "name": "public"
+    }
+  ],
+  "enums": [],
+  "tables": [
+    {
+      "identity": {
+        "schema": "public",
+        "name": "ledger"
+      },
+      "managed": true,
+      "columns": [
+        {
+          "name": "id",
+          "type": {
+            "name": "int4",
+            "codec": "number"
+          },
+          "notNull": true
+        },
+        {
+          "name": "account",
+          "type": {
+            "name": "text",
+            "codec": "string"
+          },
+          "notNull": true
+        },
+        {
+          "name": "branch",
+          "type": {
+            "name": "int4",
+            "codec": "number"
+          },
+          "notNull": true
+        },
+        {
+          "name": "rank",
+          "type": {
+            "name": "int4",
+            "codec": "number"
+          },
+          "notNull": false
+        },
+        {
+          "name": "amount",
+          "type": {
+            "name": "numeric",
+            "codec": "decimal-string"
+          },
+          "notNull": true
+        },
+        {
+          "name": "memo",
+          "type": {
+            "name": "text",
+            "codec": "string"
+          },
+          "notNull": false
+        },
+        {
+          "name": "tags",
+          "type": {
+            "name": "text",
+            "codec": "array",
+            "array": true
+          },
+          "notNull": false
+        }
+      ],
+      "constraints": [
+        {
+          "name": "ledger_pkey",
+          "type": "primary-key",
+          "columns": [
+            "account",
+            "branch"
+          ]
+        },
+        {
+          "name": "ledger_amount_check",
+          "type": "check",
+          "expression": "amount >= 0"
+        },
+        {
+          "name": "ledger_rank_account_key",
+          "type": "unique",
+          "columns": [
+            "rank",
+            "account"
+          ],
+          "deferrable": true,
+          "initiallyDeferred": true
+        },
+        {
+          "name": "ledger_branch_fkey",
+          "type": "foreign-key",
+          "columns": [
+            "branch"
+          ],
+          "references": {
+            "table": {
+              "schema": "public",
+              "name": "branches"
+            },
+            "columns": [
+              "id"
+            ],
+            "onDelete": "set null",
+            "onUpdate": "cascade",
+            "match": "full"
+          }
+        }
+      ],
+      "indexes": [
+        {
+          "identity": {
+            "schema": "public",
+            "name": "ledger_memo_idx"
+          },
+          "unique": false,
+          "method": "btree",
+          "key": [
+            {
+              "column": "rank",
+              "order": "desc"
+            },
+            {
+              "column": "memo",
+              "nulls": "first"
+            },
+            {
+              "column": "rank",
+              "order": "desc",
+              "nulls": "last"
+            },
+            {
+              "expression": "lower(memo)"
+            }
+          ],
+          "include": [
+            "amount",
+            "branch"
+          ],
+          "where": "memo is not null"
+        },
+        {
+          "identity": {
+            "schema": "public",
+            "name": "ledger_tags_gin"
+          },
+          "unique": false,
+          "method": "gin",
+          "key": [
+            {
+              "column": "tags"
+            }
+          ]
+        },
+        {
+          "identity": {
+            "schema": "public",
+            "name": "ledger_amount_unq"
+          },
+          "unique": true,
+          "method": "btree",
+          "key": [
+            {
+              "column": "amount",
+              "nulls": "first"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "identity": {
+        "schema": "public",
+        "name": "branches"
+      },
+      "managed": true,
+      "columns": [
+        {
+          "name": "id",
+          "type": {
+            "name": "int4",
+            "codec": "number"
+          },
+          "notNull": true
+        },
+        {
+          "name": "name",
+          "type": {
+            "name": "text",
+            "codec": "string"
+          },
+          "notNull": true
+        }
+      ],
+      "constraints": [
+        {
+          "name": "branches_pkey",
+          "type": "primary-key",
+          "columns": [
+            "id"
+          ]
+        }
+      ],
+      "indexes": []
+    }
+  ],
+  "views": [],
+  "opaque": []
+}

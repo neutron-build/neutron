@@ -146,6 +146,9 @@ func (n *TwinNormalizer) NormalizeTable(ctx context.Context, table V2Table) (V2T
 				out.Columns[i].Default = tc.Default
 			}
 		}
+		if out.Columns[i].Generated != nil && tc.Generated != nil {
+			out.Columns[i].Generated = tc.Generated
+		}
 	}
 	twinChecks := map[string]string{}
 	for _, con := range twin.Constraints {
