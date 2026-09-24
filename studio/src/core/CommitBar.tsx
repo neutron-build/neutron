@@ -1,4 +1,4 @@
-import { useEffect } from 'preact/hooks'
+import { useEffect, useRef } from 'preact/hooks'
 import {
   stagedEdits, stagedCount, removeStagedEdit, discardLastStaged, clearStaged,
   commitStaged, previewStaged, revertLastCommit,
@@ -6,16 +6,37 @@ import {
   activeConnection, toast, bindingActive,
 } from '../lib/store'
 import { ApiError } from '../lib/api'
+import type { PreviewOpDiff } from '../lib/types'
 import s from './CommitBar.module.css'
 
-/** The atomic commit bar (S02): staged row operations commit as ONE
- *  transaction under one operation ID, with a dry-run preview, per-edit
- *  discard, and server-side revert of the last committed batch. Failed or
- *  outcome-unknown commits keep the staged draft (reconcilable); a dropped
- *  response is resolved through the recorded outcome, never a blind
- *  re-commit. */
+function previewLine(op: PreviewOpDiff): string {
+  const target = `${op.schema}.${op.table}`
+  switch (op.op) {
+    case 'insert': {
+      const vals = op.after && typeof op.after === 'object'
+        ? Object.entries(op.after as Record<string, unknown>).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(', ')
+        : ''
+      return `+ insert ${target} ${vals}`
+    }
+    case 'update':
+      return `~ update ${target}.${op.column}: ${JSON.stringify(op.before ?? null)} → ${JSON.stringify(op.after ?? null)}`
+    case 'delete': {
+      const key = (op.key ?? []).map(k => `${k.column}=${JSON.stringify(k.value)}`).join(', ')
+      return `− delete ${target} (${key})`
+    }
+  }
+}
+
+/** The atomic commit bar (S02/S03): staged row operations commit as ONE
+ *  transaction under one operation ID, with a dry-run preview (per-op
+ *  diff), per-edit discard, and server-side revert of the last committed
+ *  batch. Failed or outcome-unknown commits keep the staged draft
+ *  (reconcilable) and pin the first offending edit so the data grid can
+ *  focus it; a dropped response is resolved through the recorded outcome,
+ *  never a blind re-commit. */
 export function CommitBar() {
   const count = stagedCount.value
+  const errorRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -32,6 +53,15 @@ export function CommitBar() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [count])
+
+  // Error focus: the failed commit pinned the first offending staged edit
+  // (the grid focuses its row); this bar also takes focus itself so the
+  // error text is announced and reachable by keyboard.
+  useEffect(() => {
+    if (commitPhase.value === 'failed' && commitError.value && errorRef.current) {
+      errorRef.current.focus()
+    }
+  }, [commitPhase.value, commitError.value])
 
   if (count === 0 && !lastCommit.value && commitPhase.value !== 'failed') return null
 
@@ -89,6 +119,7 @@ export function CommitBar() {
   const busy = commitPhase.value === 'committing'
   const last = lastCommit.value
   const previewReport = lastPreview.value
+  const conn = activeConnection.value
 
   return (
     <div class={s.bar}>
@@ -97,6 +128,9 @@ export function CommitBar() {
           <span class={s.change} key={e.id} title={e.label}>
             <span class={s.changeModel}>{e.operation.op}</span>
             <span class={s.changeLabel}>{e.label}</span>
+            {conn && e.connectionId !== conn.id && (
+              <span class={s.changeConn} title="staged through another connection — never sent through the active one"> @{e.connectionId}</span>
+            )}
             <button
               class={s.revert}
               title="Discard this staged edit"
@@ -110,9 +144,21 @@ export function CommitBar() {
       </div>
       <div class={s.actions}>
         {previewReport && count > 0 && (
-          <span class={s.change} title="Last dry-run preview (nothing was applied)">
-            preview: {previewReport.counts.insert ?? 0}+ {previewReport.counts.update ?? 0}~ {previewReport.counts.delete ?? 0}−
-          </span>
+          <details class={s.previewDetails}>
+            <summary class={s.change} title="Last dry-run preview (nothing was applied)">
+              preview: {previewReport.counts.insert ?? 0}+ {previewReport.counts.update ?? 0}~ {previewReport.counts.delete ?? 0}−
+            </summary>
+            <div class={s.previewList}>
+              {previewReport.operations.map(op => (
+                <div class={s.previewOp} key={op.index}>{previewLine(op)}</div>
+              ))}
+            </div>
+          </details>
+        )}
+        {commitPhase.value === 'failed' && commitError.value && (
+          <div class={s.commitError} role="alert" tabIndex={-1} ref={errorRef}>
+            commit failed: {commitError.value} — the draft stays staged; fix or discard the pinned row
+          </div>
         )}
         {last && (
           <button

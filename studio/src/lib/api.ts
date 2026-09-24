@@ -2,7 +2,7 @@ import type {
   Connection, ConnectionInput, TestResult,
   Schema, NucleusFeatures, QueryResult,
   ColumnDetail, IndexDetail, SavedQuery, FKDetail,
-  TableMeta, MutationOutcome, KeyCell, MatchCell,
+  TableMeta, MutationOutcome, KeyCell, MatchCell, TableFilter, TableSort,
   CommitResponse, PreviewResponse, OutcomeResponse, CommitOperation,
 } from './types'
 import { decodeRows } from './wire'
@@ -191,13 +191,16 @@ export const api = {
   features: (connectionId: string) =>
     request<NucleusFeatures>('GET', `/features?connectionId=${connectionId}`),
 
-  // --- Table data (paginated, filterable, sortable) ---
+  // --- Table data (paginated, multi-filterable, multi-sortable) ---
 
   tableData: (
     connectionId: string, schema: string, table: string,
     limit = 200, offset = 0,
-    filter?: { column: string; op: string; value?: string },
+    /** Multiple ANDed filters (S03); legacy single-filter callers pass one. */
+    filters?: TableFilter[],
     sort?: { column: string; dir: 'asc' | 'desc' },
+    /** Ordered multi-sort keys (S03); earlier keys take precedence. */
+    sorts?: TableSort[],
     /** Full-tuple equality filter (composite FK follow); values are wire cells. */
     match?: MatchCell[],
   ) => {
@@ -205,14 +208,15 @@ export const api = {
       connectionId, schema, table,
       limit: String(limit), offset: String(offset),
     })
-    if (filter) {
-      params.set('filterColumn', filter.column)
-      params.set('filterOp', filter.op)
-      if (filter.value !== undefined) params.set('filterValue', filter.value)
+    if (filters && filters.length > 0) {
+      params.set('filters', JSON.stringify(filters))
     }
     if (sort) {
       params.set('sortColumn', sort.column)
       params.set('sortDir', sort.dir)
+    }
+    if (sorts && sorts.length > 0) {
+      params.set('sorts', JSON.stringify(sorts))
     }
     if (match && match.length > 0) {
       params.set('match', JSON.stringify(match))

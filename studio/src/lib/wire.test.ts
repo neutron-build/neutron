@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { decodeCell, decodeRows, encodeCell, formatCell, isTaggedCell, WireDecodeError } from './wire'
+import { decodeCell, decodeRows, encodeCell, encodeEdit, formatCell, isTaggedCell, WireDecodeError, WireEncodeError, type WireTag } from './wire'
 
 // Fixtures pin the tagged wire format (the backend side lands with the typed
 // row-identity protocol; these tests are the format contract both ends meet):
@@ -128,5 +128,50 @@ describe('wire display and bytea editing', () => {
     expect(formatCell({ n: 1n })).toBe('{"n":"1"}')
     expect(encodeCell('\\x00ff', 'bytea')).toEqual({ t: 'bytea', v: '00ff' })
     expect(encodeCell('00ff', 'bytea')).toEqual({ t: 'bytea', v: '00ff' })
+  })
+})
+
+describe('encodeEdit — S03 typed staging to wire form', () => {
+  const col = (type: string, tag: WireTag | null = null) => ({ name: 'c', type, tag })
+
+  it('null and default never coerce into values or each other', () => {
+    expect(encodeEdit({ kind: 'null' }, col('text'))).toEqual({ kind: 'null' })
+    expect(encodeEdit({ kind: 'default' }, col('text'))).toEqual({ kind: 'omit' })
+  })
+
+  it('an empty text value is a real empty string', () => {
+    expect(encodeEdit({ kind: 'value', text: '' }, col('text'))).toEqual({ kind: 'value', value: '' })
+  })
+
+  it('tagged columns cross as tagged cells — digits never through Number', () => {
+    expect(encodeEdit({ kind: 'value', text: '9007199254740993' }, col('bigint', 'int8')))
+      .toEqual({ kind: 'value', value: { t: 'int8', v: '9007199254740993' } })
+    expect(encodeEdit({ kind: 'value', text: '12.3450' }, col('numeric', 'numeric')))
+      .toEqual({ kind: 'value', value: { t: 'numeric', v: '12.3450' } })
+    expect(encodeEdit({ kind: 'value', text: '2026-01-02T03:04:05Z' }, col('timestamptz', 'timestamptz')))
+      .toEqual({ kind: 'value', value: { t: 'timestamptz', v: '2026-01-02T03:04:05Z' } })
+  })
+
+  it('booleans cross as booleans; anything else is refused with the column named', () => {
+    expect(encodeEdit({ kind: 'value', text: 'true' }, col('boolean'))).toEqual({ kind: 'value', value: true })
+    expect(encodeEdit({ kind: 'value', text: 'false' }, col('boolean'))).toEqual({ kind: 'value', value: false })
+    expect(() => encodeEdit({ kind: 'value', text: 'yes' }, col('boolean'))).toThrow(WireEncodeError)
+    try {
+      encodeEdit({ kind: 'value', text: 'yes' }, col('boolean'))
+    } catch (err) {
+      expect((err as Error).message).toContain('c')
+    }
+  })
+
+  it('JSON columns require valid JSON text and cross as the text itself', () => {
+    expect(encodeEdit({ kind: 'value', text: '{"a":1}' }, col('jsonb')))
+      .toEqual({ kind: 'value', value: '{"a":1}' })
+    expect(() => encodeEdit({ kind: 'value', text: '{nope' }, col('json'))).toThrow(WireEncodeError)
+  })
+
+  it('plain text and bytea display forms round-trip', () => {
+    expect(encodeEdit({ kind: 'value', text: 'plain' }, col('text'))).toEqual({ kind: 'value', value: 'plain' })
+    expect(encodeEdit({ kind: 'value', text: '\\x00ff' }, col('bytea', 'bytea')))
+      .toEqual({ kind: 'value', value: { t: 'bytea', v: '00ff' } })
   })
 })

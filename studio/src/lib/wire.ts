@@ -116,3 +116,53 @@ export function formatCell(value: unknown): string {
   }
   return String(value)
 }
+
+/**
+ * Encode a staged cell edit to its wire form for one column (S03). The
+ * three-way discipline is preserved exactly: 'null' is SQL NULL, 'default'
+ * omits the column (insert DEFAULT), and 'value' encodes per the column's
+ * authoritative type — tagged columns re-tag (bigint/decimal digits never
+ * cross through Number), booleans cross as booleans, JSON crosses as
+ * validated JSON text. Throws WireEncodeError for text that cannot be the
+ * column's value; the server re-validates strictly regardless.
+ */
+export class WireEncodeError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'WireEncodeError'
+  }
+}
+
+export interface EditableColumnShape {
+  name: string
+  type: string
+  tag: WireTag | null
+}
+
+export type EncodedEdit =
+  | { kind: 'value'; value: unknown }
+  | { kind: 'null' }
+  | { kind: 'omit' }
+
+export function encodeEdit(edit: { kind: 'value'; text: string } | { kind: 'null' } | { kind: 'default' }, col: EditableColumnShape): EncodedEdit {
+  if (edit.kind === 'null') return { kind: 'null' }
+  if (edit.kind === 'default') return { kind: 'omit' }
+  const text = edit.text
+  if (col.type === 'boolean' || col.type === 'bool') {
+    if (text === 'true') return { kind: 'value', value: true }
+    if (text === 'false') return { kind: 'value', value: false }
+    throw new WireEncodeError(`column ${col.name}: boolean value must be true or false`)
+  }
+  if (/^json(b)?$/.test(col.type)) {
+    try {
+      JSON.parse(text)
+    } catch (err) {
+      throw new WireEncodeError(`column ${col.name}: invalid JSON text (${err instanceof Error ? err.message : String(err)})`)
+    }
+    return { kind: 'value', value: text }
+  }
+  if (col.tag) {
+    return { kind: 'value', value: encodeCell(text, col.tag) }
+  }
+  return { kind: 'value', value: text }
+}

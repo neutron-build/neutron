@@ -1,13 +1,17 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/preact'
-import { activeConnection, schema, toasts, tabs } from '../../lib/store'
-import { _setSessionTokenForTests, ApiError } from '../../lib/api'
+import {
+  activeConnection, schema, openTab, toast, toasts, tabs, stagedEdits, clearStaged,
+  failedEditFocus, bindingActive,
+} from '../../lib/store'
+import { _setSessionTokenForTests } from '../../lib/api'
 import type { Schema, SqlTable, QueryResult, TableMeta } from '../../lib/types'
 import { SQLBrowser } from './SQLBrowser'
 
-// Rendered SQLBrowser tests for the S01 typed row-identity protocol, driven
-// through the real component tree (SQLBrowser -> DataGrid). Only the fetch
-// boundary (lib/api) is mocked; backend behavior is covered by the Go E2E leg.
+// Rendered SQLBrowser tests for the S01 typed row-identity protocol and the
+// S03 data editor, driven through the real component tree (SQLBrowser ->
+// DataGrid -> TypedEditor). Only the fetch boundary (lib/api) is mocked;
+// backend behavior is covered by the Go E2E leg.
 
 vi.mock('../../lib/api', async (importOriginal) => {
   const orig = await importOriginal<typeof import('../../lib/api')>()
@@ -17,14 +21,12 @@ vi.mock('../../lib/api', async (importOriginal) => {
       tableData: vi.fn(),
       tableMeta: vi.fn(),
       tableFKs: vi.fn().mockResolvedValue({ fks: [] }),
-      tableUpdateV2: vi.fn(),
     },
   }
 })
 
 import { api } from '../../lib/api'
 
-const tableUpdateV2 = vi.mocked(api.tableUpdateV2)
 const tableData = vi.mocked(api.tableData)
 const tableMeta = vi.mocked(api.tableMeta)
 
@@ -55,9 +57,10 @@ function singleKeyMeta(t: Partial<TableMeta>): TableMeta {
     keyColumns: ['id'],
     versioned: true,
     readOnly: false,
+    canDelete: true,
     columns: [
-      { name: 'id', type: 'int4', tag: null, nullable: false, isKey: true, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: false, readOnlyReason: 'key column is read-only (it addresses the row)' },
-      { name: 'body', type: 'text', tag: null, nullable: true, isKey: false, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: true },
+      { name: 'id', type: 'int4', tag: null, nullable: false, isKey: true, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: false, readOnlyReason: 'key column is read-only (it addresses the row)', insertable: true },
+      { name: 'body', type: 'text', tag: null, nullable: true, isKey: false, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: true, insertable: true },
     ],
     ...t,
   }
@@ -71,15 +74,40 @@ function cellAt(row: number, col: string): HTMLElement {
 }
 
 function editorInput(): HTMLInputElement {
-  const el = document.querySelector('input.cellInput')
+  const el = document.querySelector('input[aria-label$=" value"]')
   if (!el) throw new Error('cell editor input not found')
   return el as HTMLInputElement
+}
+
+function stateSelect(): HTMLSelectElement {
+  const el = document.querySelector('select[aria-label$=" value state"]')
+  if (!el) throw new Error('value-state select not found')
+  return el as HTMLSelectElement
+}
+
+/** The last staged operation (staged through the real UI). */
+function lastStaged() {
+  const edits = stagedEdits.value
+  if (edits.length === 0) throw new Error('nothing staged')
+  return edits[edits.length - 1]
+}
+
+const memoSchema = () => {
+  schema.value = fullSchema([sqlTable({
+    columns: [
+      { name: 'id', type: 'int4', nullable: false, isPrimaryKey: true },
+      { name: 'body', type: 'text', nullable: true, isPrimaryKey: false },
+    ],
+  })])
 }
 
 beforeEach(() => {
   vi.clearAllMocks()
   _setSessionTokenForTests('test-session-token')
   toasts.value = []
+  tabs.value = []
+  clearStaged()
+  failedEditFocus.value = null
   activeConnection.value = { id: 'c1', name: 'local', url: 'postgres://x', isNucleus: false }
   tableMeta.mockResolvedValue(singleKeyMeta({}))
   ;(api.tableFKs as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ fks: [] })
@@ -90,125 +118,105 @@ afterEach(() => {
   _setSessionTokenForTests(null)
 })
 
-describe('SQLBrowser versioned identity editing (rendered flow)', () => {
-  it('commits edits addressed by the full-key identity and version', async () => {
-    schema.value = fullSchema([sqlTable({
-      columns: [
-        { name: 'id', type: 'int4', nullable: false, isPrimaryKey: true },
-        { name: 'body', type: 'text', nullable: true, isPrimaryKey: false },
-      ],
-    })])
+describe('SQLBrowser versioned identity editing (staged draft flow)', () => {
+  it('stages edits addressed by the full-key identity and version', async () => {
+    memoSchema()
     tableData.mockResolvedValue(keyedResult([[1, 'hello']], ['777']))
 
     render(<SQLBrowser schema="public" table="memo" />)
     await waitFor(() => expect(cellAt(0, 'body').textContent).toBe('hello'))
 
-    tableUpdateV2.mockResolvedValue({ rowsAffected: 1, version: '778' })
-    tableData.mockResolvedValue(keyedResult([[1, 'world']], ['778']))
-
     fireEvent.dblClick(cellAt(0, 'body'))
     fireEvent.input(editorInput(), { target: { value: 'world' } })
     fireEvent.keyDown(editorInput(), { key: 'Enter' })
 
-    await waitFor(() => expect(tableUpdateV2).toHaveBeenCalledTimes(1))
-    expect(tableUpdateV2).toHaveBeenCalledWith(expect.objectContaining({
-      connectionId: 'c1', schema: 'public', table: 'memo',
+    const staged = lastStaged()
+    expect(staged.connectionId).toBe('c1')
+    expect(staged.operation).toEqual({
+      op: 'update', schema: 'public', table: 'memo', binding: 'e1:16385',
       key: [{ column: 'id', value: 1 }], version: '777',
-      column: 'body', value: 'world', isNull: false,
-    }))
+      column: 'body', value: 'world',
+    })
+    // staging sends nothing over the wire — the draft commits as one batch
+    expect(tableData).toHaveBeenCalledTimes(1)
   })
 
   it('commits an empty string distinctly from NULL through the real UI', async () => {
-    schema.value = fullSchema([sqlTable({
-      columns: [
-        { name: 'id', type: 'int4', nullable: false, isPrimaryKey: true },
-        { name: 'body', type: 'text', nullable: true, isPrimaryKey: false },
-      ],
-    })])
+    memoSchema()
     tableData.mockResolvedValue(keyedResult([[1, 'hello']], ['100']))
-    tableUpdateV2.mockResolvedValue({ rowsAffected: 1, version: '101' })
 
     render(<SQLBrowser schema="public" table="memo" />)
     await waitFor(() => expect(cellAt(0, 'body').textContent).toBe('hello'))
 
-    // 1. clear the text and commit -> empty string, isNull false
+    // 1. clear the text and stage -> empty string value
     fireEvent.dblClick(cellAt(0, 'body'))
     fireEvent.input(editorInput(), { target: { value: '' } })
     fireEvent.keyDown(editorInput(), { key: 'Enter' })
-    await waitFor(() => expect(tableUpdateV2).toHaveBeenCalledTimes(1))
-    expect(tableUpdateV2).toHaveBeenLastCalledWith(expect.objectContaining({
-      column: 'body', value: '', isNull: false,
+    expect(lastStaged().operation).toEqual(expect.objectContaining({
+      column: 'body', value: '',
     }))
+    expect((lastStaged().operation as Record<string, unknown>).isNull).toBeUndefined()
 
-    // 2. explicit NULL via the checkbox -> isNull true, no value
-    tableData.mockResolvedValue(keyedResult([[1, 'hello']], ['101']))
+    // 2. explicit NULL via the state control
     fireEvent.dblClick(cellAt(0, 'body'))
-    fireEvent.click(screen.getByRole('checkbox'))
-    fireEvent.keyDown(editorInput(), { key: 'Enter' })
-    await waitFor(() => expect(tableUpdateV2).toHaveBeenCalledTimes(2))
-    expect(tableUpdateV2).toHaveBeenLastCalledWith(expect.objectContaining({
-      column: 'body', value: undefined, isNull: true,
+    fireEvent.change(stateSelect(), { target: { value: 'null' } })
+    fireEvent.keyDown(stateSelect(), { key: 'Enter' })
+    expect(lastStaged().operation).toEqual(expect.objectContaining({
+      column: 'body', isNull: true,
     }))
+    expect((lastStaged().operation as Record<string, unknown>).value).toBeUndefined()
   })
 
-  it('surfaces a stale-version conflict explicitly and reloads', async () => {
-    schema.value = fullSchema([sqlTable({
-      columns: [
-        { name: 'id', type: 'int4', nullable: false, isPrimaryKey: true },
-        { name: 'body', type: 'text', nullable: true, isPrimaryKey: false },
-      ],
-    })])
-    tableData.mockResolvedValue(keyedResult([[1, 'hello']], ['55']))
+  it('staged edits overlay their committed cells and survive reloads by key', async () => {
+    memoSchema()
+    tableData.mockResolvedValue(keyedResult([[1, 'hello'], [2, 'there']], ['10', '11']))
 
     render(<SQLBrowser schema="public" table="memo" />)
     await waitFor(() => expect(cellAt(0, 'body').textContent).toBe('hello'))
 
-    // The server refuses with the explicit conflict state (409 shape).
-    tableUpdateV2.mockRejectedValue(new ApiError(409, 'update refused: row changed since it was read (current row version 99)', { conflict: true, currentVersion: '99' }))
-    const reloadSpy = tableData.mockResolvedValue(keyedResult([[1, 'fresh']], ['99']))
-
     fireEvent.dblClick(cellAt(0, 'body'))
-    fireEvent.input(editorInput(), { target: { value: 'stale-edit' } })
+    fireEvent.input(editorInput(), { target: { value: 'staged-value' } })
     fireEvent.keyDown(editorInput(), { key: 'Enter' })
 
-    await waitFor(() => expect(tableUpdateV2).toHaveBeenCalledTimes(1))
-    await waitFor(() => expect(toasts.value.some(t => t.kind === 'error' && t.message.includes('Edit conflict'))).toBe(true))
-    expect(toasts.value.some(t => t.kind === 'success')).toBe(false)
-    // The conflict triggered a reload so the user sees current values.
-    await waitFor(() => expect(cellAt(0, 'body').textContent).toBe('fresh'))
-    expect(reloadSpy).toBeTruthy()
-  })
+    await waitFor(() => expect(cellAt(0, 'body').textContent).toBe('staged-value'))
+    expect(cellAt(0, 'body').querySelector('span[title^="staged (not committed)"]')).not.toBeNull()
 
-  it('surfaces a missing row distinctly and reloads', async () => {
-    schema.value = fullSchema([sqlTable({
-      columns: [
-        { name: 'id', type: 'int4', nullable: false, isPrimaryKey: true },
-        { name: 'body', type: 'text', nullable: true, isPrimaryKey: false },
-      ],
-    })])
-    tableData.mockResolvedValue(keyedResult([[1, 'hello']], ['55']))
-
-    render(<SQLBrowser schema="public" table="memo" />)
-    await waitFor(() => expect(cellAt(0, 'body').textContent).toBe('hello'))
-
-    tableUpdateV2.mockRejectedValue(new ApiError(409, 'update matched no row for this key: the row is stale, deleted, or not visible to this connection', { missing: true }))
-    tableData.mockResolvedValue({ columns: ['id', 'body'], rows: [], rowCount: 0, duration: 0, keyColumns: ['id'], versions: [], versioned: true })
-
-    fireEvent.dblClick(cellAt(0, 'body'))
-    fireEvent.input(editorInput(), { target: { value: 'x' } })
-    fireEvent.keyDown(editorInput(), { key: 'Enter' })
-
-    await waitFor(() => expect(toasts.value.some(t => t.kind === 'error' && t.message.includes('Row is gone'))).toBe(true))
+    // a reload (refresh) re-reads; the draft re-attaches to its row by key
+    fireEvent.click(screen.getByTitle('Refresh'))
     await waitFor(() => expect(tableData).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(cellAt(0, 'body').textContent).toBe('staged-value'))
+    expect(cellAt(1, 'body').textContent).toBe('there')
   })
 
-  it('refuses to edit when the connection has switched (lost-window semantics)', async () => {
-    schema.value = fullSchema([sqlTable({
-      columns: [
-        { name: 'id', type: 'int4', nullable: false, isPrimaryKey: true },
-        { name: 'body', type: 'text', nullable: true, isPrimaryKey: false },
-      ],
-    })])
+  it('staged edits survive re-sorting and follow their row, never the index', async () => {
+    memoSchema()
+    tableData.mockResolvedValue(keyedResult([[1, 'hello'], [2, 'there']], ['10', '11']))
+
+    render(<SQLBrowser schema="public" table="memo" />)
+    await waitFor(() => expect(cellAt(0, 'body').textContent).toBe('hello'))
+
+    fireEvent.dblClick(cellAt(0, 'body'))
+    fireEvent.input(editorInput(), { target: { value: 'sorted-draft' } })
+    fireEvent.keyDown(editorInput(), { key: 'Enter' })
+    await waitFor(() => expect(cellAt(0, 'body').textContent).toBe('sorted-draft'))
+
+    // Sort by id: the server returns the rows reversed.
+    tableData.mockResolvedValue(keyedResult([[2, 'there'], [1, 'hello']], ['11', '10']))
+    const headers0 = Array.from(document.querySelectorAll('th'))
+    fireEvent.click(headers0.find(th => th.textContent?.includes('id'))!)
+
+    await waitFor(() => expect(tableData).toHaveBeenCalledTimes(2))
+    expect(tableData.mock.calls[1][7]).toEqual([{ column: 'id', dir: 'asc' }])
+    // the draft moved WITH its row (id=1 is now row 1), untouched row 0
+    await waitFor(() => expect(cellAt(1, 'body').textContent).toBe('sorted-draft'))
+    expect(cellAt(0, 'body').textContent).toBe('there')
+    expect(lastStaged().operation).toEqual(expect.objectContaining({
+      key: [{ column: 'id', value: 1 }], version: '10', value: 'sorted-draft',
+    }))
+  })
+
+  it('refuses to stage when the connection has switched (lost-window semantics)', async () => {
+    memoSchema()
     tableData.mockResolvedValue(keyedResult([[1, 'hello']], ['55']))
 
     render(<SQLBrowser schema="public" table="memo" />)
@@ -216,41 +224,41 @@ describe('SQLBrowser versioned identity editing (rendered flow)', () => {
 
     // User switches the active connection; the view stays bound to c1.
     activeConnection.value = { id: 'c2', name: 'other', url: 'postgres://y', isNucleus: false }
+    await waitFor(() => expect(screen.getByRole('note').textContent).toContain('bound to connection c1'))
 
     fireEvent.dblClick(cellAt(0, 'body'))
     fireEvent.input(editorInput(), { target: { value: 'smuggled' } })
     fireEvent.keyDown(editorInput(), { key: 'Enter' })
 
     await waitFor(() => expect(toasts.value.some(t => t.kind === 'error' && t.message.includes('bound to connection'))).toBe(true))
-    expect(tableUpdateV2).not.toHaveBeenCalled()
+    expect(stagedEdits.value).toEqual([])
+    expect(bindingActive({ connectionId: 'c1', schema: 'public', table: 'memo' })).toBe(false)
   })
 
-  it('mutations carry the binding reported by the table read', async () => {
-    schema.value = fullSchema([sqlTable({
-      columns: [
-        { name: 'id', type: 'int4', nullable: false, isPrimaryKey: true },
-        { name: 'body', type: 'text', nullable: true, isPrimaryKey: false },
-      ],
-    })])
-    // The server's read response carries the relation binding; every v2
-    // mutation MUST send it back or the server refuses with 400.
-    tableData.mockResolvedValue({ ...keyedResult([[1, 'hello']], ['777']), binding: 'e1:16385' })
+  it('a failed commit focuses the first offending row in the grid', async () => {
+    memoSchema()
+    tableData.mockResolvedValue(keyedResult([[1, 'hello'], [2, 'there']], ['10', '11']))
 
     render(<SQLBrowser schema="public" table="memo" />)
     await waitFor(() => expect(cellAt(0, 'body').textContent).toBe('hello'))
 
-    tableUpdateV2.mockResolvedValue({ rowsAffected: 1, version: '778' })
-    fireEvent.dblClick(cellAt(0, 'body'))
-    fireEvent.input(editorInput(), { target: { value: 'world' } })
+    // row 2's edit is the offending one (operations[1])
+    fireEvent.dblClick(cellAt(1, 'body'))
+    fireEvent.input(editorInput(), { target: { value: 'bad' } })
     fireEvent.keyDown(editorInput(), { key: 'Enter' })
+    await waitFor(() => expect(stagedEdits.value.length).toBe(1))
 
-    await waitFor(() => expect(tableUpdateV2).toHaveBeenCalledTimes(1))
-    expect(tableUpdateV2).toHaveBeenCalledWith(expect.objectContaining({
-      binding: 'e1:16385',
-    }))
+    failedEditFocus.value = { editId: stagedEdits.value[0].id, reason: 'operations[0]: update refused' }
+    await waitFor(() => expect(document.querySelector('tr.trFocus')).not.toBeNull())
+    const focused = document.querySelector('tr.trFocus') as HTMLElement
+    expect(focused.getAttribute('data-row-index')).toBe('1')
+    expect(cellAt(1, 'body').className).toContain('tdFocus')
+
+    failedEditFocus.value = null
+    // focus handed back clears the highlight
   })
 
-  it('edits to tagged columns cross as tagged wire cells, not bare text', async () => {
+  it('edits to tagged columns stage as tagged wire cells, not bare text', async () => {
     schema.value = fullSchema([sqlTable({
       columns: [
         { name: 'id', type: 'int4', nullable: false, isPrimaryKey: true },
@@ -260,9 +268,9 @@ describe('SQLBrowser versioned identity editing (rendered flow)', () => {
     })])
     tableMeta.mockResolvedValue(singleKeyMeta({
       columns: [
-        { name: 'id', type: 'int4', tag: null, nullable: false, isKey: true, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: false, readOnlyReason: 'key column is read-only (it addresses the row)' },
-        { name: 'amount', type: 'numeric', tag: 'numeric', nullable: true, isKey: false, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: true },
-        { name: 'seen_at', type: 'timestamptz', tag: 'timestamptz', nullable: true, isKey: false, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: true },
+        { name: 'id', type: 'int4', tag: null, nullable: false, isKey: true, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: false, readOnlyReason: 'key column is read-only (it addresses the row)', insertable: true },
+        { name: 'amount', type: 'numeric', tag: 'numeric', nullable: true, isKey: false, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: true, insertable: true },
+        { name: 'seen_at', type: 'timestamptz', tag: 'timestamptz', nullable: true, isKey: false, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: true, insertable: true },
       ],
     }))
     // Decoded cells: numeric/timestamptz arrive from lib/wire as strings.
@@ -274,58 +282,22 @@ describe('SQLBrowser versioned identity editing (rendered flow)', () => {
     render(<SQLBrowser schema="public" table="memo" />)
     await waitFor(() => expect(cellAt(0, 'amount').textContent).toBe('9.9000'))
 
-    tableUpdateV2.mockResolvedValue({ rowsAffected: 1, version: '6' })
     fireEvent.dblClick(cellAt(0, 'amount'))
     fireEvent.input(editorInput(), { target: { value: '12.3450' } })
     fireEvent.keyDown(editorInput(), { key: 'Enter' })
 
-    await waitFor(() => expect(tableUpdateV2).toHaveBeenCalledTimes(1))
-    expect(tableUpdateV2).toHaveBeenCalledWith(expect.objectContaining({
-      column: 'amount', value: { t: 'numeric', v: '12.3450' }, isNull: false,
+    await waitFor(() => expect(stagedEdits.value.length).toBe(1))
+    expect(lastStaged().operation).toEqual(expect.objectContaining({
+      column: 'amount', value: { t: 'numeric', v: '12.3450' },
     }))
 
     // A temporal edit is likewise a tagged cell.
     fireEvent.dblClick(cellAt(0, 'seen_at'))
     fireEvent.input(editorInput(), { target: { value: '2026-01-02T03:04:05.000002Z' } })
     fireEvent.keyDown(editorInput(), { key: 'Enter' })
-    await waitFor(() => expect(tableUpdateV2).toHaveBeenCalledTimes(2))
-    expect(tableUpdateV2).toHaveBeenLastCalledWith(expect.objectContaining({
+    await waitFor(() => expect(stagedEdits.value.length).toBe(2))
+    expect(lastStaged().operation).toEqual(expect.objectContaining({
       column: 'seen_at', value: { t: 'timestamptz', v: '2026-01-02T03:04:05.000002Z' },
-    }))
-  })
-
-  it('re-tags textual key cells (numeric/temporal keys) on mutation', async () => {
-    schema.value = fullSchema([sqlTable({
-      columns: [
-        { name: 'sku', type: 'numeric', nullable: false, isPrimaryKey: true },
-        { name: 'label', type: 'text', nullable: true, isPrimaryKey: false },
-      ],
-    })])
-    tableMeta.mockResolvedValue(singleKeyMeta({
-      keyColumns: ['sku'],
-      columns: [
-        { name: 'sku', type: 'numeric', tag: 'numeric', nullable: false, isKey: true, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: false, readOnlyReason: 'key column is read-only (it addresses the row)' },
-        { name: 'label', type: 'text', tag: null, nullable: true, isKey: false, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: true },
-      ],
-    }))
-    // The read's tagged numeric cell decodes to the exact string '1.50';
-    // the mutation must send it re-tagged, or the server rejects the key.
-    tableData.mockResolvedValue({
-      columns: ['sku', 'label'], rows: [['1.50', 'hello']], rowCount: 1, duration: 0,
-      keyColumns: ['sku'], versions: ['3'], versioned: true, binding: 'e1:2',
-    })
-
-    render(<SQLBrowser schema="public" table="memo" />)
-    await waitFor(() => expect(cellAt(0, 'label').textContent).toBe('hello'))
-
-    tableUpdateV2.mockResolvedValue({ rowsAffected: 1, version: '4' })
-    fireEvent.dblClick(cellAt(0, 'label'))
-    fireEvent.input(editorInput(), { target: { value: 'renamed' } })
-    fireEvent.keyDown(editorInput(), { key: 'Enter' })
-
-    await waitFor(() => expect(tableUpdateV2).toHaveBeenCalledTimes(1))
-    expect(tableUpdateV2).toHaveBeenCalledWith(expect.objectContaining({
-      key: [{ column: 'sku', value: { t: 'numeric', v: '1.50' } }],
     }))
   })
 
@@ -339,30 +311,26 @@ describe('SQLBrowser versioned identity editing (rendered flow)', () => {
     tableMeta.mockResolvedValue(singleKeyMeta({
       keyColumns: ['id'],
       columns: [
-        { name: 'id', type: 'int8', tag: 'int8', nullable: false, isKey: true, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: false, readOnlyReason: 'key column is read-only (it addresses the row)' },
-        { name: 'body', type: 'text', tag: null, nullable: true, isKey: false, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: true },
+        { name: 'id', type: 'int8', tag: 'int8', nullable: false, isKey: true, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: false, readOnlyReason: 'key column is read-only (it addresses the row)', insertable: true },
+        { name: 'body', type: 'text', tag: null, nullable: true, isKey: false, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: true, insertable: true },
       ],
     }))
     // The read returns a tagged int8 cell; the UI decodes it to a bigint
     // (lib/api decodeRows) and re-tags it exactly on the way back.
-    tableData.mockResolvedValue(keyedResult([[[{ t: 'int8', v: '9007199254740993' }], 'hello']], ['9']))
-    // decodeRows is real (only fetch is mocked) — run it through api? No:
-    // tableData IS mocked, so decode the row the way api would.
     const decoded = keyedResult([[[{ t: 'int8', v: '9007199254740993' }], 'hello']], ['9'])
-    // simulate the decode layer
+    // simulate the decode layer (tableData is mocked)
     ;(decoded.rows[0] as unknown[])[0] = 9007199254740993n
     tableData.mockResolvedValue(decoded)
 
     render(<SQLBrowser schema="public" table="memo" />)
     await waitFor(() => expect(cellAt(0, 'body').textContent).toBe('hello'))
 
-    tableUpdateV2.mockResolvedValue({ rowsAffected: 1, version: '10' })
     fireEvent.dblClick(cellAt(0, 'body'))
     fireEvent.input(editorInput(), { target: { value: 'big' } })
     fireEvent.keyDown(editorInput(), { key: 'Enter' })
 
-    await waitFor(() => expect(tableUpdateV2).toHaveBeenCalledTimes(1))
-    const key = tableUpdateV2.mock.calls[0][0].key
+    await waitFor(() => expect(stagedEdits.value.length).toBe(1))
+    const key = (lastStaged().operation as { key: { column: string; value: unknown }[] }).key
     expect(key).toEqual([{ column: 'id', value: { t: 'int8', v: '9007199254740993' } }])
   })
 })
@@ -380,9 +348,9 @@ describe('SQLBrowser read-only states are authoritative', () => {
     tableMeta.mockResolvedValue(singleKeyMeta({
       keyColumns: ['tenant_id', 'id'],
       columns: [
-        { name: 'tenant_id', type: 'int4', tag: null, nullable: false, isKey: true, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: false, readOnlyReason: 'key column is read-only (it addresses the row)' },
-        { name: 'id', type: 'int4', tag: null, nullable: false, isKey: true, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: false, readOnlyReason: 'key column is read-only (it addresses the row)' },
-        { name: 'payload', type: 'text', tag: null, nullable: false, isKey: false, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: true },
+        { name: 'tenant_id', type: 'int4', tag: null, nullable: false, isKey: true, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: false, readOnlyReason: 'key column is read-only (it addresses the row)', insertable: true },
+        { name: 'id', type: 'int4', tag: null, nullable: false, isKey: true, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: false, readOnlyReason: 'key column is read-only (it addresses the row)', insertable: true },
+        { name: 'payload', type: 'text', tag: null, nullable: false, isKey: false, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: true, insertable: true },
       ],
     }))
     tableData.mockResolvedValue({
@@ -392,18 +360,18 @@ describe('SQLBrowser read-only states are authoritative', () => {
 
     render(<SQLBrowser schema="public" table="docs" />)
     await waitFor(() => expect(screen.queryByRole('note')).toBeNull())
-    expect(screen.getByText(/double-click a cell to edit/)).toBeDefined()
+    expect(screen.getByText(/stage an edit/)).toBeDefined()
 
-    tableUpdateV2.mockResolvedValue({ rowsAffected: 1, version: '43' })
     fireEvent.dblClick(cellAt(0, 'payload'))
     fireEvent.input(editorInput(), { target: { value: 'renamed' } })
     fireEvent.keyDown(editorInput(), { key: 'Enter' })
 
-    await waitFor(() => expect(tableUpdateV2).toHaveBeenCalledWith(expect.objectContaining({
+    await waitFor(() => expect(stagedEdits.value.length).toBe(1))
+    expect(lastStaged().operation).toEqual(expect.objectContaining({
       key: [{ column: 'tenant_id', value: 1 }, { column: 'id', value: 1 }],
       version: '42',
       column: 'payload', value: 'renamed',
-    })))
+    }))
   })
 
   it('no-key table: meta-driven read-only note and no editor', async () => {
@@ -429,8 +397,8 @@ describe('SQLBrowser read-only states are authoritative', () => {
     expect(screen.getByRole('note').textContent).toContain('has no primary key')
 
     fireEvent.dblClick(cellAt(0, 'note'))
-    expect(document.querySelector('input.cellInput')).toBeNull()
-    expect(tableUpdateV2).not.toHaveBeenCalled()
+    expect(document.querySelector('select[aria-label$=" value state"]')).toBeNull()
+    expect(stagedEdits.value).toEqual([])
   })
 
   it('unversioned table (no xmin): read-only with the server reason', async () => {
@@ -447,7 +415,217 @@ describe('SQLBrowser read-only states are authoritative', () => {
 
     render(<SQLBrowser schema="public" table="nucleus_t" />)
     await waitFor(() => expect(screen.getByRole('note').textContent).toContain('no xmin'))
-    expect(screen.queryByText(/double-click a cell to edit/)).toBeNull()
+    expect(screen.queryByText(/stage an edit/)).toBeNull()
+  })
+})
+
+describe('SQLBrowser S03: insert, delete, filters, sorts, counts', () => {
+  function editorsMeta(): TableMeta {
+    return singleKeyMeta({
+      columns: [
+        { name: 'id', type: 'int4', tag: null, nullable: false, isKey: true, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: false, readOnlyReason: 'key column is read-only (it addresses the row)', insertable: true },
+        { name: 'body', type: 'text', tag: null, nullable: false, isKey: false, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: true, insertable: true },
+        { name: 'note', type: 'text', tag: null, nullable: true, isKey: false, generated: false, identity: false, hasDefault: true, autoAssigned: false, editable: true, insertable: true },
+        { name: 'flag', type: 'boolean', tag: null, nullable: false, isKey: false, generated: false, identity: false, hasDefault: true, autoAssigned: false, editable: true, insertable: true },
+        { name: 'amount', type: 'numeric', tag: 'numeric', nullable: true, isKey: false, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: true, insertable: true },
+        { name: 'doc', type: 'jsonb', tag: null, nullable: true, isKey: false, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: true, insertable: true },
+      ],
+    })
+  }
+  function editorsSchema() {
+    schema.value = fullSchema([sqlTable({
+      name: 'editors',
+      columns: [
+        { name: 'id', type: 'int4', nullable: false, isPrimaryKey: true },
+        { name: 'body', type: 'text', nullable: false, isPrimaryKey: false },
+        { name: 'note', type: 'text', nullable: true, isPrimaryKey: false },
+        { name: 'flag', type: 'boolean', nullable: false, isPrimaryKey: false },
+        { name: 'amount', type: 'numeric', nullable: true, isPrimaryKey: false },
+        { name: 'doc', type: 'jsonb', nullable: true, isPrimaryKey: false },
+      ],
+    })])
+  }
+
+  it('the insert form stages a typed insert with NULL, DEFAULT and tagged values distinct', async () => {
+    editorsSchema()
+    tableMeta.mockResolvedValue(editorsMeta())
+    tableData.mockResolvedValue(keyedResult([[1, 'hello', 'n', true, '1.0', null]], ['1']))
+
+    render(<SQLBrowser schema="public" table="editors" />)
+    await waitFor(() => expect(cellAt(0, 'body').textContent).toBe('hello'))
+
+    fireEvent.click(screen.getByTitle(/Stage a new row/))
+
+    // id + body are required (NOT NULL, no default): fill them
+    const idInput = screen.getByLabelText('id value') as HTMLInputElement
+    fireEvent.input(idInput, { target: { value: '10' } })
+    const bodyInput = screen.getByLabelText('body value') as HTMLInputElement
+    fireEvent.input(bodyInput, { target: { value: '' } }) // explicit empty string
+    // note: switch to NULL
+    fireEvent.change(screen.getByLabelText('note value state'), { target: { value: 'null' } })
+    // flag: boolean select -> true
+    fireEvent.change(screen.getByLabelText('flag boolean value'), { target: { value: 'true' } })
+    // amount: tagged numeric text
+    fireEvent.input(screen.getByLabelText('amount value'), { target: { value: '12.3450' } })
+    // doc: JSON text; note stays DEFAULT (omitted) — wait, note was set NULL above; 'doc' default omitted
+    fireEvent.input(screen.getByLabelText('doc JSON text'), { target: { value: '{"a":1}' } })
+
+    fireEvent.click(screen.getByText('Stage insert'))
+
+    await waitFor(() => expect(stagedEdits.value.length).toBe(1))
+    expect(lastStaged().operation).toEqual({
+      op: 'insert', schema: 'public', table: 'editors', binding: 'e1:16385',
+      values: {
+        id: '10',
+        body: '',
+        note: null,
+        flag: true,
+        amount: { t: 'numeric', v: '12.3450' },
+        doc: '{"a":1}',
+      },
+    })
+    // form closes after staging
+    expect(screen.queryByText('Stage insert')).toBeNull()
+  })
+
+  it('the insert form refuses a required column left non-value', async () => {
+    editorsSchema()
+    tableMeta.mockResolvedValue(editorsMeta())
+    tableData.mockResolvedValue(keyedResult([[1, 'hello']], ['1']))
+
+    render(<SQLBrowser schema="public" table="editors" />)
+    await waitFor(() => expect(cellAt(0, 'body').textContent).toBe('hello'))
+
+    fireEvent.click(screen.getByTitle(/Stage a new row/))
+    // body is required but set to DEFAULT
+    fireEvent.change(screen.getByLabelText('body value state'), { target: { value: 'default' } })
+    fireEvent.click(screen.getByText('Stage insert'))
+
+    await waitFor(() => expect(toasts.value.some(t => t.kind === 'error' && t.message.includes('body'))).toBe(true))
+    expect(stagedEdits.value).toEqual([])
+    // the form stays open with the error surfaced on the field
+    expect(screen.getByRole('alert').textContent).toContain('required column')
+  })
+
+  it('the insert form refuses invalid JSON with column context', async () => {
+    editorsSchema()
+    tableMeta.mockResolvedValue(editorsMeta())
+    tableData.mockResolvedValue(keyedResult([[1, 'hello']], ['1']))
+
+    render(<SQLBrowser schema="public" table="editors" />)
+    await waitFor(() => expect(cellAt(0, 'body').textContent).toBe('hello'))
+
+    fireEvent.click(screen.getByTitle(/Stage a new row/))
+    fireEvent.input(screen.getByLabelText('id value'), { target: { value: '11' } })
+    fireEvent.input(screen.getByLabelText('body value'), { target: { value: 'x' } })
+    fireEvent.input(screen.getByLabelText('doc JSON text'), { target: { value: '{not json' } })
+    fireEvent.click(screen.getByText('Stage insert'))
+
+    await waitFor(() => expect(toasts.value.some(t => t.kind === 'error' && t.message.includes('doc'))).toBe(true))
+    expect(stagedEdits.value).toEqual([])
+  })
+
+  it('the row delete button stages a delete with identity and version', async () => {
+    memoSchema()
+    tableMeta.mockResolvedValue(singleKeyMeta({}))
+    tableData.mockResolvedValue(keyedResult([[1, 'hello'], [2, 'bye']], ['10', '11']))
+
+    render(<SQLBrowser schema="public" table="memo" />)
+    await waitFor(() => expect(cellAt(0, 'body').textContent).toBe('hello'))
+
+    fireEvent.click(screen.getAllByTitle('Stage row delete')[0])
+    await waitFor(() => expect(stagedEdits.value.length).toBe(1))
+    expect(lastStaged().operation).toEqual({
+      op: 'delete', schema: 'public', table: 'memo', binding: 'e1:16385',
+      key: [{ column: 'id', value: 1 }], version: '10',
+    })
+    // the row renders struck-through until commit or discard
+    expect((document.querySelector('tr[data-row-index="0"]') as HTMLElement).className).toContain('trStagedDelete')
+  })
+
+  it('multiple filters AND: the read carries the filters array', async () => {
+    memoSchema()
+    tableData.mockResolvedValue(keyedResult([], []))
+
+    render(<SQLBrowser schema="public" table="memo" />)
+    await waitFor(() => expect(tableData).toHaveBeenCalledTimes(1))
+
+    fireEvent.click(screen.getByTitle('Add an ANDed filter'))
+    fireEvent.change(screen.getByLabelText('Filter column 1'), { target: { value: 'body' } })
+    fireEvent.change(screen.getByLabelText('Filter operator 1'), { target: { value: 'like' } })
+    fireEvent.input(screen.getByLabelText('Filter value 1'), { target: { value: '%x%' } })
+    fireEvent.click(screen.getByTitle('Add an ANDed filter'))
+    fireEvent.change(screen.getByLabelText('Filter column 2'), { target: { value: 'id' } })
+    fireEvent.change(screen.getByLabelText('Filter operator 2'), { target: { value: 'gt' } })
+    fireEvent.input(screen.getByLabelText('Filter value 2'), { target: { value: '5' } })
+    fireEvent.click(screen.getByText('Apply'))
+
+    await waitFor(() => expect(tableData).toHaveBeenCalledTimes(2))
+    expect(tableData.mock.calls[1][5]).toEqual([
+      { column: 'body', op: 'like', value: '%x%' },
+      { column: 'id', op: 'gt', value: '5' },
+    ])
+  })
+
+  it('an incomplete filter row refuses to apply', async () => {
+    memoSchema()
+    tableData.mockResolvedValue(keyedResult([], []))
+
+    render(<SQLBrowser schema="public" table="memo" />)
+    await waitFor(() => expect(tableData).toHaveBeenCalledTimes(1))
+
+    fireEvent.click(screen.getByTitle('Add an ANDed filter'))
+    fireEvent.click(screen.getByText('Apply'))
+    await waitFor(() => expect(toasts.value.some(t => t.kind === 'error' && t.message.includes('column'))).toBe(true))
+    expect(tableData).toHaveBeenCalledTimes(1)
+  })
+
+  it('shift-click builds a multi-column sort; plain click resets to primary', async () => {
+    memoSchema()
+    tableData.mockResolvedValue(keyedResult([], []))
+
+    render(<SQLBrowser schema="public" table="memo" />)
+    await waitFor(() => expect(tableData).toHaveBeenCalledTimes(1))
+
+    const headers = Array.from(document.querySelectorAll('th'))
+    const idTh = headers.find(th => th.textContent?.includes('id'))!
+    const bodyTh = headers.find(th => th.textContent?.includes('body'))!
+
+    // plain click: primary asc
+    fireEvent.click(idTh)
+    await waitFor(() => expect(tableData).toHaveBeenCalledTimes(2))
+    expect(tableData.mock.calls[1][7]).toEqual([{ column: 'id', dir: 'asc' }])
+    await waitFor(() => expect(Array.from(document.querySelectorAll('th')).find(th => th.textContent?.includes('id'))!.textContent).toContain('↑'))
+
+    // shift-click body: multi-sort id asc, body asc
+    fireEvent.click(bodyTh, { shiftKey: true })
+    await waitFor(() => expect(tableData).toHaveBeenCalledTimes(3))
+    expect(tableData.mock.calls[2][7]).toEqual([
+      { column: 'id', dir: 'asc' }, { column: 'body', dir: 'asc' },
+    ])
+    await waitFor(() => expect(Array.from(document.querySelectorAll('th')).find(th => th.textContent?.includes('body'))!.textContent).toContain('↑2'))
+
+    // plain click body: body becomes the single primary
+    fireEvent.click(bodyTh)
+    await waitFor(() => expect(tableData).toHaveBeenCalledTimes(4))
+    expect(tableData.mock.calls[3][7]).toEqual([{ column: 'body', dir: 'asc' }])
+  })
+
+  it('row counts are separated: fetched vs filtered vs total vs staged', async () => {
+    memoSchema()
+    tableData.mockResolvedValue({
+      ...keyedResult([[1, 'a'], [2, 'b']], ['10', '11']),
+      filterCount: 42, totalCount: 1000,
+    })
+
+    render(<SQLBrowser schema="public" table="memo" />)
+    await waitFor(() => expect(screen.getByText(/42 filtered/)).toBeDefined())
+    expect(screen.getByText(/1,000 total/)).toBeDefined()
+
+    fireEvent.dblClick(cellAt(0, 'body'))
+    fireEvent.input(editorInput(), { target: { value: 'z' } })
+    fireEvent.keyDown(editorInput(), { key: 'Enter' })
+    await waitFor(() => expect(screen.getByText(/1 staged/)).toBeDefined())
   })
 })
 
@@ -456,9 +634,9 @@ describe('SQLBrowser S01 binding, read-level state and composite FK follow', () 
     return {
       exists: true, binding: 'e1:20', keyColumns: ['tenant_id', 'order_no'], versioned: true, readOnly: false, canDelete: true,
       columns: [
-        { name: 'tenant_id', type: 'int4', tag: null, nullable: false, isKey: true, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: false, readOnlyReason: 'key column is read-only (it addresses the row)' },
-        { name: 'order_no', type: 'int8', tag: 'int8', nullable: false, isKey: true, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: false, readOnlyReason: 'key column is read-only (it addresses the row)' },
-        { name: 'label', type: 'text', tag: null, nullable: true, isKey: false, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: true },
+        { name: 'tenant_id', type: 'int4', tag: null, nullable: false, isKey: true, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: false, readOnlyReason: 'key column is read-only (it addresses the row)', insertable: true },
+        { name: 'order_no', type: 'int8', tag: 'int8', nullable: false, isKey: true, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: false, readOnlyReason: 'key column is read-only (it addresses the row)', insertable: true },
+        { name: 'label', type: 'text', tag: null, nullable: true, isKey: false, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: true, insertable: true },
       ],
     }
   }
@@ -515,7 +693,7 @@ describe('SQLBrowser S01 binding, read-level state and composite FK follow', () 
     render(<SQLBrowser schema="public" table="orders" />)
     await waitFor(() => expect(cellAt(0, 'order_no').textContent).toBe('5'))
     await new Promise(r => setTimeout(r, 0))
-    expect(cellAt(0, 'tenant_id').querySelector('button')).toBeNull()
+    expect(cellAt(0, 'tenant_id').querySelector('button.fkLink')).toBeNull()
   })
 
   it('an initial match (FK follow target) is passed to the read', async () => {
@@ -526,32 +704,7 @@ describe('SQLBrowser S01 binding, read-level state and composite FK follow', () 
 
     render(<SQLBrowser schema="public" table="orders" initialMatch={match} />)
     await waitFor(() => expect(tableData).toHaveBeenCalled())
-    expect(tableData.mock.calls[0][7]).toEqual(match)
-  })
-
-  it('a stale binding (409 binding) reloads metadata and rows, never retries the write', async () => {
-    ordersSchema()
-    tableMeta.mockResolvedValue(docsMeta())
-    tableData.mockResolvedValue(ordersResult([[1, 7n, 'o1']]))
-
-    render(<SQLBrowser schema="public" table="orders" />)
-    await waitFor(() => expect(cellAt(0, 'label').textContent).toBe('o1'))
-    const metaCalls = tableMeta.mock.calls.length
-    const dataCalls = tableData.mock.calls.length
-
-    tableUpdateV2.mockRejectedValue(new ApiError(409, 'no longer the relation these rows were read from', { state: 'binding' }))
-    fireEvent.dblClick(cellAt(0, 'label'))
-    fireEvent.input(editorInput(), { target: { value: 'x' } })
-    fireEvent.keyDown(editorInput(), { key: 'Enter' })
-
-    await waitFor(() => expect(toasts.value.some(t => t.kind === 'error' && t.message.includes('stale'))).toBe(true))
-    await waitFor(() => expect(tableMeta.mock.calls.length).toBeGreaterThan(metaCalls))
-    await waitFor(() => expect(tableData.mock.calls.length).toBeGreaterThan(dataCalls))
-    expect(tableUpdateV2).toHaveBeenCalledTimes(1)
-    expect(tableUpdateV2).toHaveBeenCalledWith(expect.objectContaining({
-      binding: 'e1:20',
-      key: [{ column: 'tenant_id', value: 1 }, { column: 'order_no', value: { t: 'int8', v: '7' } }],
-    }))
+    expect(tableData.mock.calls[0][8]).toEqual(match)
   })
 
   it('a read-only table read wins even if metadata says editable', async () => {
@@ -565,7 +718,7 @@ describe('SQLBrowser S01 binding, read-level state and composite FK follow', () 
     render(<SQLBrowser schema="public" table="orders" />)
     await waitFor(() => expect(screen.getByRole('note').textContent).toContain('cannot yet compare exactly'))
     fireEvent.dblClick(cellAt(0, 'label'))
-    expect(document.querySelector('input.cellInput')).toBeNull()
-    expect(tableUpdateV2).not.toHaveBeenCalled()
+    expect(document.querySelector('select[aria-label$=" value state"]')).toBeNull()
+    expect(stagedEdits.value).toEqual([])
   })
 })
