@@ -12,7 +12,9 @@
 // and engine capability requirements alongside sql/params.
 
 import type { Driver } from "./drivers.js";
-import type { Logger } from "./logger.js";
+import { errorSummary, paramsLoggingEnabled, statementIdOf, type Logger } from "./logger.js";
+import { QueryCanceledError } from "./errors.js";
+import type { QueryExecutionOptions } from "./transactions.js";
 import { type Condition, type OrderExpression } from "./expr.js";
 import type {
   AliasedTable,
@@ -115,15 +117,26 @@ export async function run(
   params: unknown[],
   kind: "query" | "execute",
   required: readonly StatementCapability[] = [],
+  options?: QueryExecutionOptions,
 ): Promise<unknown> {
   await assertCapabilities(ctx, required);
+  const statementId = statementIdOf(sqlText);
   const started = performance.now();
+  ctx.logger?.({
+    kind: "query-begin",
+    statementId,
+    sql: sqlText,
+    ...(paramsLoggingEnabled() ? { params } : {}),
+  });
   try {
-    const result = kind === "query" ? await ctx.driver.query(sqlText, params) : await ctx.driver.execute(sqlText, params);
-    ctx.logger?.({ sql: sqlText, params, durationMs: performance.now() - started });
+    const result = kind === "query" ? await ctx.driver.query(sqlText, params, options) : await ctx.driver.execute(sqlText, params, options);
+    ctx.logger?.({ kind: "query-end", statementId, sql: sqlText, durationMs: performance.now() - started });
     return result;
   } catch (err) {
-    ctx.logger?.({ sql: sqlText, params, durationMs: performance.now() - started, error: err as Error });
+    ctx.logger?.({ kind: "query-error", statementId, sql: sqlText, durationMs: performance.now() - started, error: errorSummary(err) });
+    if (err instanceof QueryCanceledError) {
+      ctx.logger?.({ kind: "cancel", statementId, cancelReason: err.reason });
+    }
     throw err;
   }
 }
@@ -1000,9 +1013,9 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
     return { sql: compiled.sql, params: compiled.params as unknown[] };
   }
 
-  async execute(): Promise<JoinRowOf<P, R0, N, F>[]> {
+  async execute(options?: QueryExecutionOptions): Promise<JoinRowOf<P, R0, N, F>[]> {
     const compiled = this.toCompiled();
-    const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query", compiled.capabilities)) as Array<Record<string, unknown>>;
+    const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query", compiled.capabilities, options)) as Array<Record<string, unknown>>;
     applyProjectionDecoders(rows, compiled.decoders);
     return rows as JoinRowOf<P, R0, N, F>[];
   }
@@ -1165,9 +1178,9 @@ export class SetOpBuilder<R> implements PromiseLike<R[]> {
     return { sql: compiled.sql, params: compiled.params as unknown[] };
   }
 
-  async execute(): Promise<R[]> {
+  async execute(options?: QueryExecutionOptions): Promise<R[]> {
     const compiled = this.toCompiled();
-    const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query", compiled.capabilities)) as Array<Record<string, unknown>>;
+    const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query", compiled.capabilities, options)) as Array<Record<string, unknown>>;
     applyProjectionDecoders(rows, compiled.decoders);
     return rows as R[];
   }
@@ -1431,14 +1444,14 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     return { sql: compiled.sql, params: compiled.params as unknown[] };
   }
 
-  async execute(): Promise<R> {
+  async execute(options?: QueryExecutionOptions): Promise<R> {
     const compiled = this.toCompiled();
     if (this.returningKeys !== null) {
-      const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query", compiled.capabilities)) as Array<Record<string, unknown>>;
+      const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query", compiled.capabilities, options)) as Array<Record<string, unknown>>;
       applyProjectionDecoders(rows, compiled.decoders);
       return rows as R;
     }
-    return (await run(this.ctx, compiled.sql, compiled.params as unknown[], "execute", compiled.capabilities)) as R;
+    return (await run(this.ctx, compiled.sql, compiled.params as unknown[], "execute", compiled.capabilities, options)) as R;
   }
 
   then<R1 = R, R2 = never>(
@@ -1560,14 +1573,14 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     return { sql: compiled.sql, params: compiled.params as unknown[] };
   }
 
-  async execute(): Promise<R> {
+  async execute(options?: QueryExecutionOptions): Promise<R> {
     const compiled = this.toCompiled();
     if (this.returningKeys !== null) {
-      const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query", compiled.capabilities)) as Array<Record<string, unknown>>;
+      const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query", compiled.capabilities, options)) as Array<Record<string, unknown>>;
       applyProjectionDecoders(rows, compiled.decoders);
       return rows as R;
     }
-    return (await run(this.ctx, compiled.sql, compiled.params as unknown[], "execute", compiled.capabilities)) as R;
+    return (await run(this.ctx, compiled.sql, compiled.params as unknown[], "execute", compiled.capabilities, options)) as R;
   }
 
   then<R1 = R, R2 = never>(
@@ -1634,14 +1647,14 @@ export class DeleteBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     return { sql: compiled.sql, params: compiled.params as unknown[] };
   }
 
-  async execute(): Promise<R> {
+  async execute(options?: QueryExecutionOptions): Promise<R> {
     const compiled = this.toCompiled();
     if (this.wantsReturning) {
-      const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query", compiled.capabilities)) as Array<Record<string, unknown>>;
+      const rows = (await run(this.ctx, compiled.sql, compiled.params as unknown[], "query", compiled.capabilities, options)) as Array<Record<string, unknown>>;
       applyProjectionDecoders(rows, compiled.decoders);
       return rows as R;
     }
-    return (await run(this.ctx, compiled.sql, compiled.params as unknown[], "execute", compiled.capabilities)) as R;
+    return (await run(this.ctx, compiled.sql, compiled.params as unknown[], "execute", compiled.capabilities, options)) as R;
   }
 
   then<R1 = R, R2 = never>(

@@ -367,12 +367,17 @@ test("I01: wrapPgPool borrowed default never ends the injected pool; owned ends 
 test("I01: wrapPostgresJs borrowed default never ends the injected client", async () => {
   let ends = 0;
   type Client = Parameters<typeof wrapPostgresJs>[0];
+  // local lifecycle double (no database boundary involved): unsafe/reserve
+  // return cancelable promises matching the postgres.js Query surface
+  const fakeUnsafe = (): ReturnType<Client["unsafe"]> =>
+    Object.assign(Promise.resolve(Object.assign([], { count: 0 })), { cancel: () => Promise.resolve() });
   const client: Client = {
-    unsafe: async () => Object.assign([], { count: 0 }),
+    unsafe: fakeUnsafe,
     begin: async <T>(fn: (tx: Client) => Promise<T>): Promise<T> => fn(client),
     end: async () => {
       ends++;
     },
+    reserve: async () => ({ unsafe: fakeUnsafe, release: () => {} }),
   };
   const borrowed = wrapPostgresJs(client);
   await borrowed.close();

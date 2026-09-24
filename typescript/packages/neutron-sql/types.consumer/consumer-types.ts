@@ -591,3 +591,116 @@ async function q05Fixtures(): Promise<void> {
   void [sqlText, paramsList, stmtCount, depth, caps];
 }
 void q05Fixtures;
+
+// --- I02 transactions, cancellation and observability through the packed
+// declarations: transaction options (validated modes + retry with the
+// REQUIRED idempotency assertion), nested savepoint transactions and
+// explicit savepoint handles, execution options (deadlineMs/AbortSignal) on
+// builder and relational terminals, error narrowing for the cancellation
+// and commit-ambiguity states, and the redacted structured event shape.
+
+// Minimal ambient AbortSignal for this type-only fixture (the consumer
+// tsconfig runs with no DOM/node libs on purpose).
+interface AbortSignal {
+  aborted: boolean;
+}
+
+import {
+  CommitAmbiguityError,
+  QueryCanceledError,
+  isRetriableTransactionError,
+  statementIdOf,
+  type TransactionOptions,
+  type TransactionTxScope,
+  type QueryExecutionOptions,
+  type Savepoint,
+  type SqlEvent,
+  type SqlEventKind,
+  type IsolationLevel,
+} from "@neutron-build/sql";
+void CommitAmbiguityError; void isRetriableTransactionError;
+
+async function i02Fixtures(): Promise<void> {
+  const db = await createDatabase({
+    url: "postgres://type-fixture:not-run@localhost:1/none",
+    tables: { users, posts },
+    logger: (event: SqlEvent) => {
+      const kind: SqlEventKind = event.kind;
+      const id: string = event.statementId;
+      void [kind, id];
+      // params is OPTIONAL: absent from events unless the process opts in
+      // via NEUTRON_SQL_LOG_PARAMS=1
+      const maybeParams: readonly unknown[] | undefined = event.params;
+      void maybeParams;
+    },
+  });
+
+  // Transaction options: typed modes, retry requires idempotent: true.
+  const modes: IsolationLevel[] = ["read-committed", "repeatable-read", "serializable"];
+  void modes;
+  const opts: TransactionOptions = {
+    isolation: "serializable",
+    readOnly: true,
+    deferrable: true,
+    retry: { maxAttempts: 3, backoffMs: (n: number) => n * 25, idempotent: true },
+  };
+  void opts;
+  // @ts-expect-error an invalid isolation literal is a compile error
+  const badMode: TransactionOptions = { isolation: "read-uncommitted" };
+  // @ts-expect-error retry without the idempotency assertion is a compile error
+  const badRetry: TransactionOptions = { retry: { maxAttempts: 3 } };
+  // (deferrable-without-readOnly is a RUNTIME rejection — renderBeginSql
+  // refuses the silent no-op before any SQL; the type stays boolean.)
+  void [badMode, badRetry];
+
+  await db.transaction(async (tx) => {
+    // The tx scope carries CRUD + query + nested savepoint transactions.
+    const scope: TransactionTxScope<{ users: typeof users; posts: typeof posts }> = tx;
+    void scope;
+    await tx.transaction(async (inner) => {
+      void inner.select().from(users);
+    });
+    const sp: Savepoint = await tx.savepoint("stage1");
+    const spName: string = sp.name;
+    await sp.rollbackTo();
+    await sp.release();
+    void spName;
+    // @ts-expect-error the tx scope has no driver/close
+    void tx.driver;
+  });
+
+  // Execution options on builder terminals and relational queries.
+  const execOpts: QueryExecutionOptions = { deadlineMs: 250 };
+  const withSignal: QueryExecutionOptions = { signal: { aborted: false } as AbortSignal };
+  void withSignal;
+  await db.select().from(users).execute(execOpts);
+  await db.insert(users).values({ email: "a@x.com" }).execute(execOpts);
+  await db.query.users.findMany({ with: { posts: true } }, execOpts);
+  // @ts-expect-error deadlineMs is a number of milliseconds
+  await db.select().from(users).execute({ deadlineMs: "soon" });
+
+  // Error narrowing through the packed declarations.
+  try {
+    await db.driver.query("select 1", [], { deadlineMs: 50 });
+  } catch (err) {
+    if (err instanceof QueryCanceledError) {
+      const reason: "deadline" | "signal" = err.reason;
+      const dispatched: boolean = err.dispatched;
+      const state: string = err.sqlstate;
+      void [reason, dispatched, state];
+    }
+  }
+  try {
+    await db.transaction(async () => 1);
+  } catch (err) {
+    if (err instanceof CommitAmbiguityError) {
+      const cause: unknown = err.cause;
+      void cause;
+    }
+    const retriable: boolean = isRetriableTransactionError(err);
+    void retriable;
+  }
+  const sid: string = statementIdOf("select 1");
+  void sid;
+}
+void i02Fixtures;

@@ -5,7 +5,20 @@
 import { loadDriver, type Driver, type LoadDriverOptions } from "./drivers.js";
 import { capabilityGate, type CapabilityEvidence, type EngineIdentity } from "./engine.js";
 import type { StatementCapability } from "./codecs.js";
-import { resolveLogger, type LoggerOption } from "./logger.js";
+import { resolveLogger, type Logger, type LoggerOption, type SqlEvent } from "./logger.js";
+import {
+  hasModes,
+  renderBeginSql,
+  runRetriedTransaction,
+  runTransaction,
+  validateRetryOptions,
+  type QueryExecutionOptions,
+  type Savepoint,
+  type TransactionModes,
+  type TransactionRetryOptions,
+  type TransactionScope,
+} from "./transactions.js";
+import { NeutronSqlError } from "./errors.js";
 import {
   DeleteBuilder,
   InsertBuilder,
@@ -207,9 +220,11 @@ export interface QueryApiFor<
 > {
   findMany<const A extends RelationalArgs<Cols, Entries, R> = {}>(
     args?: A,
+    options?: QueryExecutionOptions,
   ): Promise<Array<RelationalRow<Cols, Entries, R, A>>>;
   findFirst<const A extends RelationalArgs<Cols, Entries, R> = {}>(
     args?: A,
+    options?: QueryExecutionOptions,
   ): Promise<RelationalRow<Cols, Entries, R, A> | undefined>;
   /** Pure compile of the query — no driver round-trip, no execution. */
   toSQL(args?: RQBArgs): { sql: string; params: unknown[] };
@@ -238,6 +253,35 @@ export interface SelectProjectedFrom<P extends Projection> {
   from(table: AnyPgTable): SelectBuilder<P, unknown>;
 }
 
+/** Options for `db.transaction` (I02): transaction modes plus the opt-in
+ *  whole-transaction retry. */
+export interface TransactionOptions extends TransactionModes {
+  /** Retry the WHOLE transaction on serialization failure (40001) or
+   *  deadlock (40P01) only, up to maxAttempts, with backoff between
+   *  attempts. Requires `idempotent: true` — a retried attempt re-executes
+   *  the callback from the top. A CommitAmbiguityError (unknown commit
+   *  outcome) is never retried. */
+  retry?: TransactionRetryOptions;
+}
+
+/** The scope passed to a `db.transaction` callback: the full database
+ *  surface (CRUD, relational queries) pinned to the transaction's
+ *  connection, plus nested transactions (real savepoints) and explicit
+ *  savepoint control. */
+export interface TransactionTxScope<
+  T extends TablesInput = TablesInput,
+  R extends RelationsInput = RelationsInput,
+> extends Omit<NeutronDatabase<T, R>, "transaction" | "close" | "driver"> {
+  /** Nested transaction: a real SAVEPOINT on the same connection. On error
+   *  the savepoint is rolled back and released and the error rethrows; the
+   *  outer transaction stays usable. Modes are properties of the outer
+   *  BEGIN — a nested call takes none. */
+  transaction<Tx>(fn: (tx: TransactionTxScope<T, R>) => Promise<Tx>): Promise<Tx>;
+  /** Create an explicitly controlled savepoint (`rollbackTo` keeps it,
+   *  `release` destroys it). Omit the name for an auto-generated one. */
+  savepoint(name?: string): Promise<Savepoint>;
+}
+
 export interface NeutronDatabase<
   T extends TablesInput = TablesInput,
   R extends RelationsInput = RelationsInput,
@@ -258,18 +302,22 @@ export interface NeutronDatabase<
   insert<TCols extends Record<string, AnyColumnBuilder>>(table: PgTable<TCols>): InsertBuilder<TCols, number>;
   update<TCols extends Record<string, AnyColumnBuilder>>(table: PgTable<TCols>): UpdateBuilder<TCols, number>;
   delete<TCols extends Record<string, AnyColumnBuilder>>(table: PgTable<TCols>): DeleteBuilder<TCols, number>;
-  transaction<Tx>(fn: (tx: Omit<NeutronDatabase<T, R>, "transaction" | "close" | "driver">) => Promise<Tx>): Promise<Tx>;
+  /** Run `fn` in one transaction. Options select isolation/read-only/
+   *  deferrable modes (rendered into BEGIN) and the opt-in retry. A
+   *  transport failure while COMMIT is in flight throws
+   *  CommitAmbiguityError — the outcome is unknown and never replayed. */
+  transaction<Tx>(fn: (tx: TransactionTxScope<T, R>) => Promise<Tx>, options?: TransactionOptions): Promise<Tx>;
   query: QueryApiOf<T, R>;
 }
 
 type Crud = Pick<NeutronDatabase, "select" | "insert" | "update" | "delete">;
 type QueryApi = Record<string, {
-  findMany: (args?: RQBArgs) => Promise<unknown>;
-  findFirst: (args?: RQBArgs) => Promise<unknown>;
+  findMany: (args?: RQBArgs, options?: QueryExecutionOptions) => Promise<unknown>;
+  findFirst: (args?: RQBArgs, options?: QueryExecutionOptions) => Promise<unknown>;
   toSQL: (args?: RQBArgs) => { sql: string; params: unknown[] };
   explainQuery: (args?: RQBArgs) => RelationalExplainPlan;
 }>;
-type TxScope = Omit<NeutronDatabase, "transaction" | "close" | "driver">;
+type TxScope = TransactionTxScope;
 
 export async function createDatabase<
   T extends TablesInput = TablesInput,
@@ -332,8 +380,8 @@ export async function createDatabase<
     for (const { key, table } of tables.values()) {
       const entries = relationsByTable.get(getTableName(table)) ?? {};
       api[key] = {
-        findMany: (args: RQBArgs = {}) => findMany(context, table, entries, args, relationsByTable),
-        findFirst: (args: RQBArgs = {}) => findFirst(context, table, entries, args, relationsByTable),
+        findMany: (args: RQBArgs = {}, options?: QueryExecutionOptions) => findMany(context, table, entries, args, relationsByTable, options),
+        findFirst: (args: RQBArgs = {}, options?: QueryExecutionOptions) => findFirst(context, table, entries, args, relationsByTable, options),
         toSQL: (args: RQBArgs = {}) => {
           const built = buildRelationalSQL(table, entries, args, relationsByTable);
           return { sql: built.sql, params: built.params };
@@ -347,17 +395,62 @@ export async function createDatabase<
   const crud = makeCrud(ctx);
   const query = makeQuery(ctx);
 
+  /** Adapt a driver-level transaction scope into the full database-shaped
+   *  tx scope (CRUD + relational queries pinned to the transaction's
+   *  connection, nested savepoint transactions, explicit savepoints). */
+  const adaptScope = (scope: TransactionScope): TxScope => {
+    const txCtx: ExecContext = { driver: scope, logger, capabilities };
+    return {
+      ...makeCrud(txCtx),
+      query: makeQuery(txCtx),
+      transaction: <Tx>(nested: (tx: TxScope) => Promise<Tx>): Promise<Tx> =>
+        scope.transaction((inner) => nested(adaptScope(inner))),
+      savepoint: (name?: string): Promise<Savepoint> => scope.savepoint(name),
+    } as TxScope;
+  };
+
+  /** Legacy scope for custom adapters without Driver.pin: transactions run
+   *  through their begin(), without savepoints or transaction options. */
+  const legacyScope = (txDriver: Driver): TxScope => {
+    const txCtx: ExecContext = { driver: txDriver, logger, capabilities };
+    return {
+      ...makeCrud(txCtx),
+      query: makeQuery(txCtx),
+      transaction: async <Tx>(_fn: (tx: TxScope) => Promise<Tx>): Promise<Tx> => {
+        throw new NeutronSqlError("nested transactions (savepoints) require a pinnable adapter (Driver.pin) — this custom adapter's begin() scope does not expose them");
+      },
+      savepoint: async (_name?: string): Promise<Savepoint> => {
+        throw new NeutronSqlError("savepoints require a pinnable adapter (Driver.pin) — this custom adapter's begin() scope does not expose them");
+      },
+    } as TxScope;
+  };
+
   const db = {
     driver,
     close: (): Promise<void> => driver.close(),
     engine: (): Promise<EngineIdentity> => capabilities.engine(),
     capability: (name: StatementCapability): Promise<CapabilityEvidence> => capabilities.status(name),
     ...crud,
-    transaction: async <Tx>(fn: (tx: TxScope) => Promise<Tx>): Promise<Tx> => {
-      return driver.begin(async (txDriver) => {
-        const txCtx: ExecContext = { driver: txDriver, logger, capabilities };
-        return fn({ ...makeCrud(txCtx), query: makeQuery(txCtx) } as TxScope);
-      });
+    transaction: async <Tx>(fn: (tx: TxScope) => Promise<Tx>, options: TransactionOptions = {}): Promise<Tx> => {
+      const retry = options.retry;
+      if (retry !== undefined) validateRetryOptions(retry);
+      // Honest pre-SQL validation of modes (and pre-pin: nothing touches a
+      // connection for an unsupported combination).
+      renderBeginSql(options);
+      const hooks = { onEvent: (event: SqlEvent) => logger?.(event) };
+      if (typeof driver.pin !== "function") {
+        if (hasModes(options) || retry !== undefined) {
+          throw new NeutronSqlError(
+            "transaction options (isolation/read-only/deferrable/retry) require a pinnable adapter (Driver.pin) — the injected custom adapter does not provide one; both bundled drivers do",
+          );
+        }
+        return driver.begin(async (txDriver) => fn(legacyScope(txDriver)));
+      }
+      const pinFactory = (): Promise<import("./transactions.js").PinnedExecutor> => driver.pin!();
+      if (retry === undefined) {
+        return runTransaction(await pinFactory(), (scope) => fn(adaptScope(scope)), options, hooks);
+      }
+      return runRetriedTransaction(pinFactory, (scope) => fn(adaptScope(scope)), options, retry, hooks);
     },
     query,
   };
