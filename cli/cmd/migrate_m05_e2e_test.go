@@ -1882,9 +1882,26 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 				t.Errorf("drop role2: %v", err)
 			}
 		})
+		// The LOCATION must exist on the SERVER's filesystem. A local server
+		// sees the test's temp dir; a containerized one (CI service
+		// containers) does not, so fall back to a directory the server
+		// creates itself (superuser COPY ... TO PROGRAM, owned by the server
+		// user as CREATE TABLESPACE requires).
 		tsdir := t.TempDir()
 		if err := admin.Exec(context.Background(), fmt.Sprintf(`CREATE TABLESPACE %q LOCATION '%s'`, ts, tsdir)); err != nil {
-			t.Fatalf("create tablespace: %v", err)
+			if !strings.Contains(err.Error(), "58P01") {
+				t.Fatalf("create tablespace: %v", err)
+			}
+			tsdir = fmt.Sprintf("/tmp/neutron_ts_%d_%d", os.Getpid(), time.Now().UnixNano())
+			if err := admin.Exec(context.Background(), fmt.Sprintf(`COPY (SELECT 1) TO PROGRAM 'mkdir -p %s'`, tsdir)); err != nil {
+				t.Skipf("server cannot see the client's filesystem and cannot create a directory itself (%v); tablespace refusal needs a server-visible directory", err)
+			}
+			t.Cleanup(func() {
+				_ = admin.Exec(context.Background(), fmt.Sprintf(`COPY (SELECT 1) TO PROGRAM 'rm -rf %s'`, tsdir))
+			})
+			if err := admin.Exec(context.Background(), fmt.Sprintf(`CREATE TABLESPACE %q LOCATION '%s'`, ts, tsdir)); err != nil {
+				t.Fatalf("create tablespace in server-created dir: %v", err)
+			}
 		}
 		t.Cleanup(func() {
 			if err := admin.Exec(context.Background(), fmt.Sprintf(`DROP TABLESPACE IF EXISTS %q`, ts)); err != nil {
