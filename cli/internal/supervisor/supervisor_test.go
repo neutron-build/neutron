@@ -66,7 +66,11 @@ func TestHelperProcess(t *testing.T) {
 				lines = append(lines, entry)
 			}
 		}
-		_ = os.WriteFile(os.Getenv("STARTED"), []byte(strings.Join(lines, "\n")), 0600)
+		// Write then rename: the test polls for the file's existence and
+		// must never read it half-written.
+		tmp := os.Getenv("STARTED") + ".tmp"
+		_ = os.WriteFile(tmp, []byte(strings.Join(lines, "\n")), 0600)
+		_ = os.Rename(tmp, os.Getenv("STARTED"))
 		for {
 			time.Sleep(time.Hour)
 		}

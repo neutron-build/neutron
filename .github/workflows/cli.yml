@@ -81,6 +81,10 @@ jobs:
       NEUTRON_LIVE_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The M05/M06 fail-before batteries build the parent of each
+          # card's landing commit, located by subject in HEAD's history.
+          fetch-depth: 0
 
       - name: Fetch Studio dist
         uses: actions/download-artifact@v4

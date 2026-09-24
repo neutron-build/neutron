@@ -3594,20 +3594,15 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 	})
 }
 
-// preM05Revision is the last pre-M05 revision (the Q04 landing), the
-// verified_source HEAD recorded for M05 in the program ledger. M05's own
-// landing made HEAD unsuitable as this battery's fail-before reference —
-// the premises need a tree WITHOUT the M05 guards — so the reference is
-// pinned to the revision the M05 evidence was reviewed against.
-const preM05Revision = "35858e6e"
-
-// buildPreM05CLIBinary builds the pre-M05 CLI from the pinned revision via
-// read-only `git archive` (plus the gitignored embedded Studio assets
-// copied from the working tree) — fail-before reproduction without
-// touching the tree.
+// buildPreM05CLIBinary builds the pre-M05 CLI — the parent of the M05
+// landing, the last tree WITHOUT the M05 guards — via read-only
+// `git archive` (plus the gitignored embedded Studio assets copied from the
+// working tree): fail-before reproduction without touching the tree. The
+// reference is located by the card marker in the landing's subject, not a
+// pinned SHA, so it survives rebases and rebase-merges.
 func buildPreM05CLIBinary(t *testing.T) string {
 	t.Helper()
-	return buildRevisionCLIBinary(t, preM05Revision)
+	return buildRevisionCLIBinary(t, parentOfLanding(t, "(orm-program M05)"))
 }
 
 func mustReadFile(t *testing.T, path string) []byte {
