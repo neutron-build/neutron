@@ -217,6 +217,98 @@ export interface MutationOutcome {
   currentVersion?: string
 }
 
+// --- S02 staged commits and retry outcomes ---
+
+export type CommitOpKind = 'insert' | 'update' | 'delete'
+
+/** One staged row operation. Field shapes mirror the server's strict
+ *  per-kind contract: inserts carry only values, updates carry
+ *  key/version/column and value-or-isNull, deletes carry key/version. */
+export interface CommitOperation {
+  op: CommitOpKind
+  schema: string
+  table: string
+  /** Relation binding from the table read. */
+  binding: string
+  /** insert: column -> wire cell; omitted column = DEFAULT, null = SQL NULL. */
+  values?: Record<string, unknown>
+  /** update/delete: full key tuple as wire cells. */
+  key?: KeyCell[]
+  /** update/delete: row version at read time. */
+  version?: string
+  /** update: target column. */
+  column?: string
+  /** update: new wire value (mutually exclusive with isNull). */
+  value?: unknown
+  /** update: set the column to SQL NULL. */
+  isNull?: boolean
+}
+
+/** Per-operation result of a committed batch. */
+export interface CommitOpResult {
+  index: number
+  op: CommitOpKind
+  rowsAffected: number
+  /** Inserted row's key cells (refreshes the identity). */
+  key?: KeyCell[]
+  /** New row version after update/insert. */
+  version?: string
+}
+
+/** Commit/revert outcome envelope. Errors surface via ApiError states. */
+export interface CommitResponse {
+  operationId: string
+  rowsAffected: number
+  operations: CommitOpResult[]
+  /** Whether this commit can be undone through /table/v2/revert. */
+  reversible: boolean
+  reversibleReason?: string
+  /** True when this body was replayed from the recorded outcome. */
+  replayed?: boolean
+  /** Revert responses name the reverted operation ID. */
+  reverted?: string
+}
+
+/** One operation's dry-run diff from /table/v2/preview. */
+export interface PreviewOpDiff {
+  index: number
+  op: CommitOpKind
+  schema: string
+  table: string
+  key?: KeyCell[]
+  /** update: the edited column. */
+  column?: string
+  /** update/delete: the pre-commit value(s) as wire cells. */
+  before?: unknown
+  /** update: the post-commit value; insert: the values map. */
+  after?: unknown
+}
+
+export interface PreviewResponse {
+  ok: boolean
+  counts: Record<string, number>
+  operations: PreviewOpDiff[]
+  error?: string
+  state?: string
+}
+
+/** Recorded-outcome lookup from /table/v2/outcome. "unknown" is the honest
+ *  answer for never-seen, expired, evicted and post-restart IDs: the client
+ *  must verify table state before any retry, never auto-recommit. */
+export type OutcomeState = 'committed' | 'failed' | 'unknown' | 'in_progress'
+
+export interface OutcomeResponse {
+  operationId: string
+  state: OutcomeState
+  /** HTTP status the commit itself returned/would return. */
+  status?: number
+  /** The recorded outcome body (present for terminal states). */
+  response?: CommitResponse
+  reversible?: boolean
+  reversibleReason?: string
+  error?: string
+}
+
 export interface KeyedQueryResult extends QueryResult {
   keyColumns: string[]
   versions: string[]

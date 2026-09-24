@@ -153,6 +153,17 @@ func firstSQLLine(stmt string) string {
 	return strings.TrimSpace(stmt)
 }
 
+// BeginTx starts one transaction on a single pooled connection and hands
+// the caller the pgx.Tx: every statement the caller runs through it shares
+// that connection and transaction, so multi-statement units (e.g. Studio's
+// atomic edit commits) execute all-or-nothing. The caller owns the
+// lifecycle: Commit to persist, Rollback (a deferred Rollback is the usual
+// pattern) to discard. Do NOT run BEGIN/COMMIT as plain Exec calls — pool
+// queries may hop connections between statements.
+func (c *Client) BeginTx(ctx context.Context) (pgx.Tx, error) {
+	return c.pool.Begin(ctx)
+}
+
 // Query executes a SQL query and returns rows.
 func (c *Client) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	return c.pool.Query(ctx, sql, args...)

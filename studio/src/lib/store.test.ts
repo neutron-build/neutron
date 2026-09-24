@@ -7,8 +7,35 @@ import {
   theme, toggleTheme,
   paletteOpen, paletteQuery, openPalette, closePalette,
   toasts, toast, bindingActive,
+  stagedEdits, stagedCount, stageEdit, removeStagedEdit, discardLastStaged, clearStaged,
+  commitStaged, previewStaged, revertLastCommit,
+  commitPhase, commitError, lastCommit, lastPreview,
 } from './store'
-import type { Tab, PendingChange } from './types'
+import type { Tab, PendingChange, CommitResponse, PreviewResponse } from './types'
+import { ApiError } from './api'
+
+// The S02 store tests mock only the fetch boundary (lib/api), per the
+// repo's testing convention; backend semantics live in the Go E2E leg.
+vi.mock('./api', async (importOriginal) => {
+  const orig = await importOriginal<typeof import('./api')>()
+  return {
+    ...orig,
+    api: {
+      ...orig.api,
+      commitOperations: vi.fn(),
+      previewOperations: vi.fn(),
+      operationOutcome: vi.fn(),
+      revertOperation: vi.fn(),
+    },
+  }
+})
+
+import { api } from './api'
+
+const commitOperations = vi.mocked(api.commitOperations)
+const previewOperations = vi.mocked(api.previewOperations)
+const operationOutcome = vi.mocked(api.operationOutcome)
+const revertOperation = vi.mocked(api.revertOperation)
 
 describe('store — connection state', () => {
   beforeEach(() => {
@@ -296,5 +323,198 @@ describe('store — editing binding (S01 lost-window semantics)', () => {
   it('no active connection deactivates every binding', () => {
     activeConnection.value = null
     expect(bindingActive({ connectionId: 'c1', schema: 'public', table: 't' })).toBe(false)
+  })
+})
+
+describe('store — staged edits and commit outcomes (S02)', () => {
+  const updateOp = {
+    op: 'update' as const, schema: 'public', table: 'docs', binding: 'e:1',
+    key: [{ column: 'id', value: 1 }], version: '9',
+    column: 'note', value: 'staged',
+  }
+
+  beforeEach(() => {
+    stagedEdits.value = []
+    commitPhase.value = 'idle'
+    commitError.value = null
+    lastCommit.value = null
+    lastPreview.value = null
+    activeConnection.value = { id: 'c1', name: 'one', url: 'postgres://a', isNucleus: false }
+    commitOperations.mockReset()
+    previewOperations.mockReset()
+    operationOutcome.mockReset()
+    revertOperation.mockReset()
+  })
+  afterEach(() => {
+    activeConnection.value = null
+  })
+
+  it('stages edits with a stable list contract', () => {
+    const a = stageEdit({ connectionId: 'c1', operation: updateOp, label: 'docs.note' })
+    const b = stageEdit({ connectionId: 'c2', operation: { ...updateOp, binding: 'e:2' }, label: 'other-conn' })
+    expect(stagedCount.value).toBe(2)
+    expect(a.id).not.toBe(b.id)
+
+    removeStagedEdit(a.id)
+    expect(stagedEdits.value.map(e => e.id)).toEqual([b.id])
+
+    discardLastStaged()
+    expect(stagedCount.value).toBe(0)
+    expect(discardLastStaged()).toBeUndefined()
+
+    stageEdit({ connectionId: 'c1', operation: updateOp, label: 'x' })
+    stageEdit({ connectionId: 'c2', operation: updateOp, label: 'y' })
+    clearStaged('c1')
+    expect(stagedEdits.value.every(e => e.connectionId === 'c2')).toBe(true)
+    clearStaged()
+    expect(stagedCount.value).toBe(0)
+  })
+
+  it('a successful commit sends one atomic batch under one operation ID and clears only that connection\'s draft', async () => {
+    stageEdit({ connectionId: 'c1', operation: updateOp, label: 'docs.note' })
+    stageEdit({ connectionId: 'c2', operation: updateOp, label: 'other' })
+
+    const response: CommitResponse = {
+      operationId: 'server-sees-this', rowsAffected: 1,
+      operations: [{ index: 0, op: 'update', rowsAffected: 1, version: '10' }],
+      reversible: true,
+    }
+    commitOperations.mockResolvedValue(response)
+
+    const res = await commitStaged('c1')
+    expect(res).toEqual(response)
+    expect(commitOperations).toHaveBeenCalledTimes(1)
+    const sent = commitOperations.mock.calls[0][0]
+    expect(sent.connectionId).toBe('c1')
+    expect(sent.operationId).toMatch(/^[0-9a-f-]{36}$/)
+    expect(sent.operations).toEqual([updateOp])
+    expect(commitPhase.value).toBe('committed')
+    expect(stagedEdits.value.map(e => e.connectionId)).toEqual(['c2'])
+    expect(lastCommit.value?.operationId).toBe(sent.operationId)
+  })
+
+  it('a refused commit retains the staged draft (reconcilable)', async () => {
+    stageEdit({ connectionId: 'c1', operation: updateOp, label: 'docs.note' })
+    commitOperations.mockRejectedValue(new ApiError(409, 'row changed since it was read', { state: 'conflict' }))
+
+    await expect(commitStaged('c1')).rejects.toBeInstanceOf(ApiError)
+    expect(commitPhase.value).toBe('failed')
+    expect(commitError.value).toContain('row changed since it was read')
+    expect(stagedCount.value).toBe(1)
+    expect(lastCommit.value).toBeNull()
+  })
+
+  it('a dropped response after commit resolves the recorded outcome with the SAME operation ID — no second send', async () => {
+    stageEdit({ connectionId: 'c1', operation: updateOp, label: 'docs.note' })
+
+    // The fetch fails mid-flight (network drop) after the server committed.
+    commitOperations.mockRejectedValueOnce(new TypeError('network dropped'))
+    const recorded: CommitResponse = {
+      operationId: 'resolved', rowsAffected: 1,
+      operations: [{ index: 0, op: 'update', rowsAffected: 1, version: '10' }],
+      reversible: true,
+    }
+    operationOutcome.mockResolvedValueOnce({ operationId: 'resolved', state: 'committed', status: 200, response: recorded })
+
+    const res = await commitStaged('c1')
+    expect(res).toEqual(recorded)
+    expect(commitOperations).toHaveBeenCalledTimes(1) // never re-sent
+    const sentId = commitOperations.mock.calls[0][0].operationId
+    expect(operationOutcome).toHaveBeenCalledWith('c1', sentId)
+    expect(commitPhase.value).toBe('committed')
+    expect(stagedCount.value).toBe(0)
+    expect(lastCommit.value?.response).toEqual(recorded)
+  })
+
+  it('an unknown outcome (expired/evicted/restart) never auto-recommits and keeps the draft', async () => {
+    stageEdit({ connectionId: 'c1', operation: updateOp, label: 'docs.note' })
+    commitOperations.mockRejectedValueOnce(new TypeError('network dropped'))
+    operationOutcome.mockResolvedValueOnce({ operationId: 'x', state: 'unknown' })
+
+    await expect(commitStaged('c1')).rejects.toThrow('outcome unknown')
+    expect(commitOperations).toHaveBeenCalledTimes(1)
+    expect(commitPhase.value).toBe('failed')
+    expect(stagedCount.value).toBe(1)
+  })
+
+  it('a failed recorded outcome surfaces the failure without a second send', async () => {
+    stageEdit({ connectionId: 'c1', operation: updateOp, label: 'docs.note' })
+    commitOperations.mockRejectedValueOnce(new TypeError('network dropped'))
+    operationOutcome.mockResolvedValueOnce({ operationId: 'x', state: 'failed', status: 409 })
+
+    await expect(commitStaged('c1')).rejects.toThrow('network dropped')
+    expect(commitOperations).toHaveBeenCalledTimes(1)
+    expect(commitPhase.value).toBe('failed')
+    expect(stagedCount.value).toBe(1)
+  })
+
+  it('a server-side unknown state (ambiguous commit) resolves the outcome instead of retrying', async () => {
+    stageEdit({ connectionId: 'c1', operation: updateOp, label: 'docs.note' })
+    commitOperations.mockRejectedValueOnce(new ApiError(502, 'the outcome cannot be determined', { state: 'unknown' }))
+    operationOutcome.mockResolvedValueOnce({ operationId: 'x', state: 'unknown' })
+
+    await expect(commitStaged('c1')).rejects.toThrow('outcome unknown')
+    expect(operationOutcome).toHaveBeenCalledTimes(1)
+    expect(stagedCount.value).toBe(1)
+  })
+
+  it('an empty staged batch refuses to commit', async () => {
+    await expect(commitStaged('c1')).rejects.toThrow('no staged edits')
+    expect(commitOperations).not.toHaveBeenCalled()
+  })
+
+  it('preview runs the staged batch dry and stores the report', async () => {
+    stageEdit({ connectionId: 'c1', operation: updateOp, label: 'docs.note' })
+    const report: PreviewResponse = {
+      ok: true, counts: { insert: 0, update: 1, delete: 0 },
+      operations: [{ index: 0, op: 'update', schema: 'public', table: 'docs', column: 'note', before: 'old', after: 'staged' }],
+    }
+    previewOperations.mockResolvedValueOnce(report)
+
+    const res = await previewStaged('c1')
+    expect(res).toEqual(report)
+    expect(lastPreview.value).toEqual(report)
+    expect(previewOperations.mock.calls[0][0].operations).toEqual([updateOp])
+    expect(stagedCount.value).toBe(1) // preview stages nothing
+  })
+
+  it('revert sends the last committed operation ID under a fresh idempotency key', async () => {
+    lastCommit.value = {
+      operationId: 'original-op', at: Date.now(),
+      response: { operationId: 'original-op', rowsAffected: 1, operations: [], reversible: true },
+    }
+    const reverted: CommitResponse = {
+      operationId: 'new-key', rowsAffected: 1, operations: [], reversible: false, reverted: 'original-op',
+    }
+    revertOperation.mockResolvedValueOnce(reverted)
+
+    const res = await revertLastCommit('c1')
+    expect(res.reverted).toBe('original-op')
+    expect(revertOperation).toHaveBeenCalledWith({
+      connectionId: 'c1',
+      operationId: 'original-op',
+      revertOperationId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+    })
+    expect(lastCommit.value).toBeNull()
+    expect(commitPhase.value).toBe('idle')
+  })
+
+  it('revert without a committed batch is an honest refusal', async () => {
+    await expect(revertLastCommit('c1')).rejects.toThrow('nothing to revert')
+    expect(revertOperation).not.toHaveBeenCalled()
+  })
+
+  it('each commit attempt uses a fresh operation ID (spent IDs are never reused)', async () => {
+    stageEdit({ connectionId: 'c1', operation: updateOp, label: 'a' })
+    commitOperations.mockRejectedValueOnce(new ApiError(409, 'conflict', { state: 'conflict' }))
+    await expect(commitStaged('c1')).rejects.toBeInstanceOf(ApiError)
+
+    const ok: CommitResponse = { operationId: 'second', rowsAffected: 1, operations: [], reversible: true }
+    commitOperations.mockResolvedValueOnce(ok)
+    await commitStaged('c1')
+
+    const firstId = commitOperations.mock.calls[0][0].operationId
+    const secondId = commitOperations.mock.calls[1][0].operationId
+    expect(firstId).not.toBe(secondId)
   })
 })
