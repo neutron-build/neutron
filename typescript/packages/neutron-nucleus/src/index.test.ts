@@ -730,9 +730,14 @@ describe("withVector plugin", () => {
     await vector.createCollection("embeddings", 384);
     assert.equal(transport.calls.length, 2);
     assert.ok((transport.calls[0].args[0] as string).includes("CREATE TABLE"));
-    assert.ok((transport.calls[0].args[0] as string).includes("VECTOR(384)"));
-    assert.ok((transport.calls[1].args[0] as string).includes("CREATE INDEX"));
-    assert.ok((transport.calls[1].args[0] as string).includes("cosine"));
+    assert.equal(
+      transport.calls[0].args[0],
+      "CREATE TABLE IF NOT EXISTS embeddings (rid BIGSERIAL PRIMARY KEY, id TEXT NOT NULL UNIQUE, embedding VECTOR(384), metadata JSONB DEFAULT '{}')",
+    );
+    assert.equal(
+      transport.calls[1].args[0],
+      "CREATE INDEX IF NOT EXISTS idx_embeddings_embedding ON embeddings USING HNSW (embedding) WITH (metric = 'cosine')",
+    );
   });
 
   it("createCollection validates identifier", async () => {
