@@ -270,8 +270,10 @@ func (v *VectorModel) CreateCollection(ctx context.Context, name string, dimensi
 	if !isValidIdentifier(name) {
 		return fmt.Errorf("nucleus: vector create collection: invalid name %q", name)
 	}
+	// The engine refuses an HNSW index unless the table has a single-column
+	// integer PRIMARY KEY, so `rid` is that key; the caller's `id` stays UNIQUE.
 	createSQL := fmt.Sprintf(
-		"CREATE TABLE IF NOT EXISTS %s (id TEXT PRIMARY KEY, embedding VECTOR(%d), metadata JSONB DEFAULT '{}')",
+		"CREATE TABLE IF NOT EXISTS %s (rid BIGSERIAL PRIMARY KEY, id TEXT NOT NULL UNIQUE, embedding VECTOR(%d), metadata JSONB DEFAULT '{}')",
 		name, dimension,
 	)
 	if _, err := v.pool.Exec(ctx, createSQL); err != nil {
@@ -285,8 +287,10 @@ func (v *VectorModel) CreateCollection(ctx context.Context, name string, dimensi
 		return fmt.Errorf("nucleus: vector create collection: invalid metric %q", metricStr)
 	}
 
+	// The index name is unchanged from earlier releases, so re-calling this on
+	// a collection created by one is a no-op rather than a second index.
 	indexSQL := fmt.Sprintf(
-		"CREATE INDEX IF NOT EXISTS idx_%s_embedding ON %s USING VECTOR (embedding) WITH (metric = '%s')",
+		"CREATE INDEX IF NOT EXISTS idx_%s_embedding ON %s USING HNSW (embedding) WITH (metric = '%s')",
 		name, name, metricStr,
 	)
 	_, err := v.pool.Exec(ctx, indexSQL)
