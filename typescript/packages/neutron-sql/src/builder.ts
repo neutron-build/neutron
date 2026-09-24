@@ -74,6 +74,7 @@ import {
   type FromTarget,
   type IdentifierNode,
   type InsertCell,
+  type JoinTarget,
   type JoinType,
   type OnConflictNode,
   type OrderSpec,
@@ -183,8 +184,8 @@ interface SelectExtras {
   readonly locking?: readonly LockRequest[];
 }
 
-/** One `.for()` call: strength, optional OF targets (the from table or join
- *  alias handles) and the wait policy. */
+/** One `.for()` call: strength, optional OF targets (the from table, join
+ *  alias handles, or plain derived-table handles) and the wait policy. */
 interface LockRequest {
   readonly strength: LockStrength;
   readonly of: readonly unknown[];
@@ -193,8 +194,13 @@ interface LockRequest {
 
 /** Options of SelectBuilder.for(): OF targets and the lock-wait policy. */
 export interface LockOptions {
-  /** Lock only these from items: the from table itself and/or alias()
-   *  handles of joined tables. Omitted: every table in FROM. */
+  /** Lock only these from items: the from table itself, alias() handles of
+   *  joined tables, or derived-table handles whose derivation contains no
+   *  CTE (PostgreSQL locks their base rows through the alias). CTE handles
+   *  are rejected — PostgreSQL refuses to lock a WITH query — and so are
+   *  derived handles whose derivation reaches one: PostgreSQL locks only
+   *  the derivation's base rows and silently skips the WITH query's rows.
+   *  Omitted: every table in FROM. */
   of?: AnyPgTable | AliasedTable<Record<string, AnyColumnBuilder>, string> | ReadonlyArray<AnyPgTable | AliasedTable<Record<string, AnyColumnBuilder>, string>>;
   /** Fail immediately (SQLSTATE 55P03) instead of waiting for a lock. */
   noWait?: boolean;
@@ -813,11 +819,12 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
 
   /** Row-locking clause: `for update | no key update | share | key share
    *  [of …] [nowait | skip locked]`. Calls accumulate (PostgreSQL applies
-   *  the strongest lock per table). `of` names the from table and/or join
-   *  alias handles; without it every table in FROM is locked — rejected
-   *  when an outer join makes a side nullable or a CTE sits in FROM (which
-   *  PostgreSQL would silently leave unlocked). Locks need a transaction to
-   *  be useful: run inside db.transaction, a batch or a stream. */
+   *  the strongest lock per table). `of` names the from table, join alias
+   *  handles, or derived-table handles; without it every table in FROM is
+   *  locked — rejected when an outer join makes a side nullable or a CTE
+   *  sits anywhere in FROM (which PostgreSQL would silently leave
+   *  unlocked). Locks need a transaction to be useful: run inside
+   *  db.transaction, a batch or a stream. */
   for(strength: LockStrength, options: LockOptions = {}): SelectBuilder<P, R0, N, F> {
     if (strength !== "update" && strength !== "no key update" && strength !== "share" && strength !== "key share") {
       throw new Error(`for: unknown lock strength ${JSON.stringify(strength)} (known: update, no key update, share, key share)`);
@@ -1129,11 +1136,66 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
   }
 }
 
+/** What an outer row lock does to one FROM/JOIN item's rows on PG 17
+ *  (verified with two connections across inline, materialized and
+ *  multi-reference forms):
+ *  - "locks": the item's rows are locked — plain tables, and derived
+ *    tables over them (the lock propagates through subqueries).
+ *  - "silent": nothing the item sources is lockable from outside — a WITH
+ *    query is computed separately, so an outer lock clause never reaches
+ *    its rows, directly or under a chain of derived tables.
+ *  - "partial": the item mixes both (a base table and a CTE together) —
+ *    PostgreSQL locks the base tables' rows through it and silently skips
+ *    only the WITH-sourced rows. */
+type LockSilence = "locks" | "silent" | "partial";
+
+/** Classify one from/join item: CTE handles are silent; plain tables lock;
+ *  derived tables by what their derivation's FROM tree reaches. */
+function lockTargetSilence(table: AnyPgTable): LockSilence {
+  const rec = getDerivedRecord(table);
+  if (rec === undefined) return "locks";
+  if (rec.kind === "cte") return "silent";
+  return fromTargetsSilence(rec.select);
+}
+
+/** Classify a source statement's FROM/JOIN tree: "silent" when every item
+ *  resolves to one of the statement's own CTEs (directly or through nested
+ *  derived tables), "partial" when only some do — PostgreSQL then locks the
+ *  base tables' rows and silently skips the WITH-sourced ones — and "locks"
+ *  otherwise. Node fields only — fragment text is never scanned.
+ *  Set-operation branches are not walked: PostgreSQL itself errors (0A000)
+ *  on locking through them, so they hold no silent hazard. */
+function fromTargetsSilence(stmt: StatementNode): LockSilence {
+  // A compound derivation makes PostgreSQL error on the lock itself (0A000
+  // for UNION/INTERSECT/EXCEPT, oracle-verified), so it is not silent.
+  if (stmt.setOps.length > 0) return "locks";
+  const cteNames = new Set(stmt.ctes.map((c) => c.name));
+  const reaches = (target: FromTarget | JoinTarget): LockSilence => {
+    if (target.kind === "identifier") return cteNames.has(target.name) ? "silent" : "locks";
+    if (target.kind === "qualified") return cteNames.has(target.parts[0]) ? "silent" : "locks";
+    return fromTargetsSilence(target.select);
+  };
+  const items: LockSilence[] = [];
+  if (stmt.from !== undefined) items.push(reaches(stmt.from));
+  for (const j of stmt.joins) items.push(reaches(j.target));
+  if (items.length === 0) return "locks";
+  if (items.every((s) => s === "silent")) return "silent";
+  if (items.some((s) => s !== "locks")) return "partial";
+  return "locks";
+}
+
 /** Resolve `.for()` requests against the statement's from/join items (Q08).
- *  OF targets must be the from table or join alias handles; unqualified
- *  locks are rejected where PostgreSQL would error (nullable side of an
- *  outer join) or silently lock nothing (a CTE in FROM). Adds the matching
- *  capability requirements. */
+ *  OF targets must be the from table, alias() handles of joined tables, or
+ *  plain derived-table handles (PostgreSQL locks their base rows through
+ *  the alias); a derivation that reaches a CTE is not a valid OF target —
+ *  its lock would silently skip the WITH query's rows. Unqualified locks
+ *  are rejected where PostgreSQL would error (the nullable side of an
+ *  outer join) or silently drop rows: fully silent shapes (every FROM item
+ *  CTE-sourced) lock nothing at all, and mixed shapes (base tables plus
+ *  CTE-sourced items in one statement) lock the base rows while silently
+ *  skipping the WITH-sourced ones — partial silence still silently drops
+ *  part of what the lock promises, so both classes fail closed here.
+ *  Adds the matching capability requirements. */
 function resolveLocking(
   requests: readonly LockRequest[],
   fromTable: AnyPgTable,
@@ -1155,19 +1217,61 @@ function resolveLocking(
     if (j.type === "full") nullable.add(j.alias);
     seen.push(j.alias);
   }
-  const cteItems = [fromRec?.kind === "cte" ? fromName : undefined, ...joins.map((j) => (getDerivedRecord(j.table)?.kind === "cte" ? j.alias : undefined))].filter(
-    (n): n is string => n !== undefined,
-  );
+  // PostgreSQL propagates a row lock through plain derived tables to their
+  // base rows (verified live on PG 17 with two connections: plain, limited,
+  //  nested and joined derived forms all produce 55P03 on a competing lock
+  // of the base table), so those FROM items are allowed. The hazard is
+  // CTEs: a lock clause never reaches a WITH query's rows on PG 17 —
+  // directly, or through derived tables stacked over one (inline,
+  // materialized and multi-reference forms alike). Each from/join item is
+  // classified: every item CTE-sourced ("silent") locks nothing; a base
+  // table next to CTE-sourced items ("partial") locks the base rows while
+  // the WITH-sourced rows are silently skipped (two-connection verified for
+  // base+CTE join-side shapes, unqualified and OF, inline and materialized).
+  // Both classes fail closed — partial silence silently drops part of what
+  // the lock promises. Grouped/distinct/windowed/union derivations are left
+  // to PostgreSQL, which errors on them itself (0A000).
+  const items = [
+    { name: fromName, silence: lockTargetSilence(fromTable) },
+    ...joins.map((j) => ({ name: j.alias, silence: lockTargetSilence(j.table) })),
+  ];
+  const silentItems = items.filter((i) => i.silence === "silent");
+  const partialItems = items.filter((i) => i.silence === "partial");
   const joinAliases = new Set(joins.map((j) => j.alias));
   return requests.map((req) => {
     caps.add("row-locking");
     if (req.strength === "no key update" || req.strength === "key share") caps.add("row-locking-key-strength");
     if (req.wait === "skip locked") caps.add("row-locking-skip-locked");
     const names = req.of.map((target) => {
-      if (typeof target === "object" && target !== null && getDerivedRecord(target as AnyPgTable) !== undefined) {
-        throw new Error(
-          `for ${req.strength}: of cannot name the derived/CTE handle "${getDerivedRecord(target as AnyPgTable)!.name}" — PostgreSQL cannot lock a WITH query, and derived rows are not base rows; lock the base table inside the source instead`,
-        );
+      if (typeof target === "object" && target !== null) {
+        const rec = getDerivedRecord(target as AnyPgTable);
+        if (rec !== undefined) {
+          if (rec.kind === "cte") {
+            throw new Error(
+              `for ${req.strength}: of cannot name the CTE "${rec.name}" — PostgreSQL rejects locking a WITH query (SQLSTATE 0A000); lock the base table inside the CTE source`,
+            );
+          }
+          const silence = fromTargetsSilence(rec.select);
+          if (silence === "silent") {
+            throw new Error(
+              `for ${req.strength}: of "${rec.name}" would silently lock nothing — the derivation wraps a CTE, and PostgreSQL never locks a WITH query's rows; lock the base table inside the source`,
+            );
+          }
+          if (silence === "partial") {
+            throw new Error(
+              `for ${req.strength}: of "${rec.name}" would be partially silent — PostgreSQL locks the derivation's base tables' rows but silently skips the WITH query's rows reached through it; lock those rows inside the CTE source`,
+            );
+          }
+          // A plain derived table: PostgreSQL locks its underlying base rows
+          // through the alias (verified live on PG 17), so the handle is a
+          // valid OF target — as this statement's from item or a joined one.
+          if (target === fromTable) return fromName;
+          const joined = joins.find((j) => j.table === target);
+          if (joined !== undefined) return joined.alias;
+          throw new Error(
+            `for ${req.strength}: of names the derived table "${rec.name}", which is neither this statement's from item nor joined here`,
+          );
+        }
       }
       if (isAliasHandle(target)) {
         const alias = target[ALIAS_MARKER].alias;
@@ -1188,9 +1292,15 @@ function resolveLocking(
           `for ${req.strength}: an unqualified lock covers the nullable side of an outer join (${[...nullable].map((n) => `"${n}"`).join(", ")}) — PostgreSQL rejects it (SQLSTATE 0A000); name the non-nullable from items with of`,
         );
       }
-      if (cteItems.length > 0) {
+      if (silentItems.length > 0 || partialItems.length > 0) {
+        if (silentItems.length === items.length) {
+          throw new Error(
+            `for ${req.strength}: an unqualified lock over ${silentItems.map((i) => `"${i.name}"`).join(", ")} would silently lock nothing — PostgreSQL never locks the rows of a WITH query (directly, or through derived tables over one); lock the base rows inside the source statement`,
+          );
+        }
+        const skipped = [...silentItems, ...partialItems];
         throw new Error(
-          `for ${req.strength}: an unqualified lock would silently skip the CTE ${cteItems.map((n) => `"${n}"`).join(", ")} in FROM (PostgreSQL locks no rows of a WITH query) — name the base tables to lock with of, or lock inside the CTE source`,
+          `for ${req.strength}: an unqualified lock over ${items.map((i) => `"${i.name}"`).join(", ")} would be partially silent — PostgreSQL locks the base tables' rows but silently skips the WITH query's rows reached through ${skipped.map((i) => `"${i.name}"`).join(", ")}; name the lockable items with of, or lock the skipped rows inside the CTE source`,
         );
       }
     }

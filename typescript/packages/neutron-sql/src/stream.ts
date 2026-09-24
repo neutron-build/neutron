@@ -18,8 +18,9 @@
 //   - Inside `db.transaction` the stream runs on the transaction's pinned
 //     connection and never issues BEGIN/COMMIT/ROLLBACK: the enclosing
 //     callback owns the transaction. Early exit CLOSEs the cursor. Using the
-//     stream after that transaction settled is rejected (never touches a
-//     released connection).
+//     stream after that transaction settled is rejected IMMEDIATELY — rows
+//     still sitting in the client-side buffer are dropped, and the released
+//     connection is never touched.
 //
 // Cancellation: `signal` / `deadlineMs` apply to every DECLARE/FETCH round
 // trip exactly like QueryExecutionOptions (server-side cancel, SQLSTATE
@@ -222,16 +223,18 @@ function ownSession(driver: Driver, modes: TransactionModes, p: SessionParams): 
   };
 }
 
+function enclosingSettledError(): NeutronSqlError {
+  return new NeutronSqlError(
+    "stream: its enclosing transaction has settled — a stream opened inside db.transaction must be consumed or closed before the callback returns (the transaction's connection is no longer this stream's)",
+  );
+}
+
 function enclosingSession(scope: Driver, p: SessionParams): CursorSession {
   let opened = false;
   let finished = false;
   const sctx: ExecContext = { driver: scope, logger: p.logger };
   const guard = (): void => {
-    if (transactionScopeState(scope) !== "active") {
-      throw new NeutronSqlError(
-        "stream: its enclosing transaction has settled — a stream opened inside db.transaction must be consumed or closed before the callback returns (the transaction's connection is no longer this stream's)",
-      );
-    }
+    if (transactionScopeState(scope) !== "active") throw enclosingSettledError();
   };
   return {
     async fetch(): Promise<Row[] | null> {
@@ -425,6 +428,13 @@ export class CursorStream<T> implements AsyncIterableIterator<T> {
       this.#aborted = true;
     }
     if (this.#aborted) throw this.#cancelError();
+    if (this.#ownership === "enclosing" && !this.#done && transactionScopeState(this.#ctx.driver) !== "active") {
+      // Post-settle use is rejected BEFORE serving buffered rows (Q08 review
+      // LOW-3): a partially consumed batch is dropped, not drained, and the
+      // released connection is never touched.
+      this.#finish();
+      throw enclosingSettledError();
+    }
     if (this.#mode === "rows" && this.#index < this.#buffer.length) {
       const row = this.#buffer[this.#index];
       this.#index += 1;
