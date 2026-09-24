@@ -465,7 +465,7 @@ test("relational: unknown relation throws", () => {
   );
 });
 
-test("relational: same target table twice in one with is rejected explicitly", () => {
+test("relational: two references to one target in one with get distinct aliases (Q05)", () => {
   const reviewerPosts = pgTable("reviewer_posts", {
     id: serial("id").primaryKey(),
     authorId: integer("author_id").notNull(),
@@ -475,23 +475,30 @@ test("relational: same target table twice in one with is rejected explicitly", (
     author: one(users, { fields: [reviewerPosts.authorId], references: [users.id], relationName: "author" }),
     reviewer: one(users, { fields: [reviewerPosts.reviewerId], references: [users.id], relationName: "reviewer" }),
   }));
-  assert.throws(
-    () => relational(revRelations, { with: { author: true, reviewer: true } }),
-    /relations "author" and "reviewer" on reviewer_posts both target table "users" in one with clause/,
-  );
+  // Both edges in ONE with clause: independent subqueries, distinct aliases,
+  // each correlated through its own FK pair.
+  const { sqlText } = relational(revRelations, { with: { author: true, reviewer: true } });
+  assert.ok(sqlText.includes('as "author"'));
+  assert.ok(sqlText.includes('as "reviewer"'));
+  assert.ok(sqlText.includes('from "users" as "__rel_author" where ("__rel_author"."id" = "reviewer_posts"."author_id")'));
+  assert.ok(sqlText.includes('from "users" as "__rel_reviewer" where ("__rel_reviewer"."id" = "reviewer_posts"."reviewer_id")'));
   // Each relation on its own still builds.
   assert.ok(relational(revRelations, { with: { author: true } }).sqlText.includes('as "author"'));
   assert.ok(relational(revRelations, { with: { reviewer: true } }).sqlText.includes('as "reviewer"'));
 });
 
-test("relational: non-true with values (nested/per-relation options) are rejected", () => {
+test("relational: non-true/non-object with values are rejected", () => {
   assert.throws(
-    () => relational(usersRelations, { with: { posts: { with: {} } as never } }),
-    /relation "posts" in with on users: only `true` is supported/,
+    () => relational(usersRelations, { with: { posts: 42 as never } }),
+    /relation "posts" in with on users: expected true or a per-relation options object, got a number/,
   );
   assert.throws(
     () => relational(usersRelations, { with: { posts: false as never } }),
-    /only `true` is supported/,
+    /relation "posts" in with on users: expected true or a per-relation options object, got a boolean/,
+  );
+  assert.throws(
+    () => relational(usersRelations, { with: { posts: ["id"] as never } }),
+    /relation "posts" in with on users: expected true or a per-relation options object, got an array/,
   );
 });
 
@@ -655,7 +662,7 @@ test("resolveRelations: duplicate relationName within one table is an error", ()
   }));
   assert.throws(
     () => resolveRelations([postsSide]),
-    /duplicate relationName "same" on dup_posts: relations "a" and "b" declare it/,
+    /duplicate relationName "same" on dup_posts: one\(\) relations "a" and "b" declare it/,
   );
 });
 
@@ -845,14 +852,16 @@ void (() => db.query.users.findFirst({ with: { totallyUnknownRelation: true } })
 void (() => db.query.users.findMany({ with: { alsoUnknown: true } }));
 // @ts-expect-error unknown property key in args.columns
 void (() => db.query.users.findMany({ columns: ["nonexistent"] }));
-// @ts-expect-error nested with / per-relation options are not a `true` selection
-void (() => db.query.users.findMany({ with: { posts: { with: {} } } }));
 // @ts-expect-error false is not a relation selection
 void (() => db.query.users.findMany({ with: { posts: false } }));
-// @ts-expect-error depth-2 with (posts -> author) is rejected until Q05
-void (() => db.query.users.findMany({ with: { posts: { with: { author: true } } } }));
-// @ts-expect-error depth-3 with (posts -> author -> manager) is rejected until Q05
-void (() => db.query.users.findMany({ with: { posts: { columns: ["id"], with: { author: { with: { posts: true } } } } } }));
+// @ts-expect-error unknown relation name in a NESTED with must fail compilation
+void (() => db.query.users.findMany({ with: { posts: { with: { nope: true } } } }));
+// @ts-expect-error unknown property key in nested args.columns
+void (() => db.query.users.findMany({ with: { posts: { columns: ["nope"] } } }));
+// @ts-expect-error per-child limit on a to-one relation is rejected (limit is to-many only)
+void (() => db.query.posts.findMany({ with: { author: { limit: 1 } } }));
+// @ts-expect-error per-child orderBy on a to-one relation is rejected too (rework m1 — single row, ordering cannot change the result)
+void (() => db.query.posts.findMany({ with: { author: { orderBy: [desc(users.id)] } } }));
 
 // Natural (non-serial) primary keys are required: NOT NULL without default.
 const naturalKey = pgTable("natural_key", {
@@ -958,6 +967,54 @@ async function relationalTypeFixtures(): Promise<void> {
   void [noArgs, withPosts, withAuthor, selected];
 }
 void relationalTypeFixtures;
+
+// ---------------------------------------------------------------------------
+// Q05: exact nested result types at depth 3 — per-child columns, per-child
+// options, one-chains and many-chains, to-one nullability at the leaf.
+// ---------------------------------------------------------------------------
+
+async function q05RelationalTypeFixtures(): Promise<void> {
+  // Depth-3 many->many->one with column subsets at every level.
+  const chain = await db.query.users.findMany({
+    columns: ["id", "name"],
+    with: { posts: { columns: ["id", "title"], with: { author: { columns: ["email"] } } } },
+  });
+  const eqChain: AssertEq<
+    (typeof chain)[number],
+    { id: number; name: string | null; posts: Array<{ id: number; title: string; author: { email: string } | null }> }
+  > = true;
+
+  // Depth-3 one->many->many with a per-child limit on a to-many edge.
+  const back = await db.query.posts.findMany({
+    with: { author: { columns: ["email"], with: { posts: { orderBy: [desc(posts.id)], limit: 2 } } } },
+  });
+  const eqBack: AssertEq<
+    (typeof back)[number],
+    { id: number; userId: number; title: string; body: string | null; published: boolean; author: { email: string; posts: PostRow[] } | null }
+  > = true;
+
+  // Per-child where narrows nothing at the type level (runtime filtering),
+  // but nested unrequested relations stay absent at every level.
+  const filtered = await db.query.users.findMany({ with: { posts: { columns: ["id"], where: eq(posts.published, true) } } });
+  const eqFiltered: AssertEq<(typeof filtered)[number], { id: number; email: string; name: string | null; active: boolean; createdAt: string; posts: Array<{ id: number }> }> = true;
+  // @ts-expect-error columns subset at depth 2: absent keys are compile errors
+  void (filtered[0].posts[0].title);
+
+  void [eqChain, eqBack, eqFiltered];
+  void [chain, back, filtered];
+
+  // Pure inspection: toSQL/explainQuery need no connection and no execution.
+  const compiled = db.query.users.toSQL({ with: { posts: { with: { author: true } } } });
+  const sqlText: string = compiled.sql;
+  const params: unknown[] = compiled.params;
+  const plan = db.query.users.explainQuery({ with: { posts: true } });
+  const table: string = plan.table;
+  const n: number = plan.statementCount;
+  const depth: number = plan.depth;
+  const caps: readonly string[] = plan.capabilities;
+  void [sqlText, params, table, n, depth, caps];
+}
+void q05RelationalTypeFixtures;
 
 // ---------------------------------------------------------------------------
 // F02 exact schema-level types: $inferSelect / $inferInsert / projections

@@ -15,7 +15,19 @@ import {
   type InferSelectModelOfRecord,
   type Projection,
 } from "./builder.js";
-import { buildRelationalSQL, findFirst, findMany, resolveRelations, type RQBArgs } from "./relations.js";
+import {
+  buildRelationalPlan,
+  buildRelationalSQL,
+  findFirst,
+  findMany,
+  resolveRelations,
+  MAX_RELATION_DEPTH,
+  type RQBArgs,
+  type RelationalExplainPlan,
+  type RelationalStatementPlan,
+  type RelationEdgePlan,
+} from "./relations.js";
+export type { RelationalExplainPlan, RelationalStatementPlan, RelationEdgePlan };
 import {
   getTableName,
   getTableSchema,
@@ -65,8 +77,7 @@ export interface DatabaseOptions<
 }
 
 /** Row shape of a relation child as it arrives through the JSON path.
- *  Leaves are typed honestly per RelationLeafTypeOf: int8/numeric (rendered
- *  ::text) and temporal/bytea (to_jsonb string forms) are `string`. */
+ *  Leaves decode through the same codecs as the flat path (mode-aware). */
 export type RelationChildModelOf<Cols extends Record<string, AnyColumnBuilder>> = {
   [K in keyof Cols]: RelationSelectTypeOf<Cols[K]>;
 };
@@ -83,60 +94,137 @@ export type RelationValue<R> = R extends RelationMany<infer T>
       : never
     : never;
 
-type WithSelection<Entries extends Record<string, Relation>> = { [K in keyof Entries]?: true };
+type Simplify<T> = { [K in keyof T]: T[K] } & {};
 
-/** Typed relational args. `columns` accepts only the table's property keys;
- *  `with` accepts only declared relation names, each `true` (one level). */
+/** Columns of a relation's target table (extracted from its table type). */
+type TargetColsOf<Rel> =
+  Rel extends RelationOne<infer T>
+    ? T extends PgTableCore<infer Cols>
+      ? Cols
+      : never
+    : Rel extends RelationMany<infer T>
+      ? T extends PgTableCore<infer Cols>
+        ? Cols
+        : never
+      : never;
+
+/** The target table type of one relation. */
+type TargetTableOf<Rel> =
+  Rel extends RelationOne<infer T> ? T : Rel extends RelationMany<infer T> ? T : never;
+
+/** Relation entries declared for one table, resolved through the whole
+ *  relations input by table type (the input is keyed by table name — the
+ *  runtime convention). Unresolvable targets degrade to the permissive map,
+ *  matching runtime rejection of unknown relations. */
+type EntriesForTarget<R extends RelationsInput, T> = UnionizeEntries<{
+  [K in keyof R]: R[K] extends TableRelations<infer TT, infer E> ? ([T] extends [TT] ? E : never) : never;
+}>;
+type UnionizeEntries<T> = T[keyof T] extends infer U ? (U extends Record<string, Relation> ? U : never) : never;
+
+/** Nested args for one relation edge: to-many edges take the full
+ *  RelationalArgs; to-one edges reject limit/offset/orderBy at the type
+ *  level too (a to-one matches at most one row — limit/offset would bound
+ *  nothing and an ordering could not change the single-row result; the
+ *  runtime enforces the same rules for untyped callers). */
+type NestedArgsOf<Rel, R extends RelationsInput> = Rel extends RelationOne<any>
+  ? OneRelationArgs<TargetColsOf<Rel>, EntriesForTarget<R, TargetTableOf<Rel>>, R>
+  : RelationalArgs<TargetColsOf<Rel>, EntriesForTarget<R, TargetTableOf<Rel>>, R>;
+
+export interface OneRelationArgs<
+  Cols extends Record<string, AnyColumnBuilder>,
+  Entries extends Record<string, Relation>,
+  R extends RelationsInput = RelationsInput,
+> extends Omit<RelationalArgs<Cols, Entries, R>, "limit" | "offset" | "orderBy"> {}
+
+/** Typed relational args, recursive through `with`. `columns` accepts only
+ *  the table's property keys; `with` accepts only declared relation names,
+ *  each `true` or a nested RelationalArgs applying to that relation's rows
+ *  (per-child filter/order/limit/offset/columns and further nesting up to
+ *  MAX_RELATION_DEPTH). */
 export interface RelationalArgs<
   Cols extends Record<string, AnyColumnBuilder>,
   Entries extends Record<string, Relation>,
+  R extends RelationsInput = RelationsInput,
   C extends keyof Cols = keyof Cols,
-  W extends keyof Entries = never,
 > {
   where?: RQBArgs["where"];
   orderBy?: RQBArgs["orderBy"];
   limit?: number;
   offset?: number;
-  columns?: Array<C>;
-  with?: { [K in W]?: true };
+  columns?: ReadonlyArray<C>;
+  with?: {
+    [K in keyof Entries]?: true | NestedArgsOf<Entries[K], R>;
+  };
 }
 
-type Simplify<T> = { [K in keyof T]: T[K] } & {};
+/** The with-map of an args value ({} when absent — `true` and plain args
+ *  without `with` both select every column and no nested edges). */
+type WithOf<A> = A extends { with?: infer W } ? (W extends Record<string, unknown> ? W : {}) : {};
 
-/** Exact one-level result row: the selected columns (all of them when
- *  `columns` is omitted) plus exactly the requested relation edges. */
+/** Column keys selected by an args value: its `columns` subset intersected
+ *  with the table's keys, or every key when omitted. */
+type ColumnsSelected<A, Cols extends Record<string, AnyColumnBuilder>> =
+  A extends { columns?: ReadonlyArray<infer CC> } ? (CC & keyof Cols) : keyof Cols;
+
+/** Exact result row for one nesting level: the selected columns plus exactly
+ *  the requested relation edges, each typed by the edge's cardinality and
+ *  its own nested selection. */
 export type RelationalRow<
   Cols extends Record<string, AnyColumnBuilder>,
-  C extends keyof Cols,
   Entries extends Record<string, Relation>,
-  W extends keyof Entries,
-> = Simplify<{ [K in C]: SelectTypeOf<Cols[K]> } & { [K in Extract<W, keyof Entries>]: RelationValue<Entries[K]> }>;
+  R extends RelationsInput = RelationsInput,
+  A = RelationalArgs<Cols, Entries, R>,
+> = Simplify<
+  { [K in ColumnsSelected<A, Cols>]: SelectTypeOf<Cols[K]> } & {
+    [K in keyof WithOf<A> & keyof Entries]: RelationEdgeValue<Entries[K], NonNullable<WithOf<A>[K & keyof WithOf<A>]>, R>;
+  }
+>;
+
+/** Value of one relation edge given its nested args: array of child rows
+ *  (to-many; missing -> []) or child row | null (to-one). */
+type RelationEdgeValue<Rel, W, R extends RelationsInput> = Rel extends RelationMany<infer T>
+  ? T extends PgTableCore<infer Cols>
+    ? Array<RelationalRow<Cols, EntriesForTarget<R, T>, R, W>>
+    : never[]
+  : Rel extends RelationOne<infer T>
+    ? T extends PgTableCore<infer Cols>
+      ? RelationalRow<Cols, EntriesForTarget<R, T>, R, W> | null
+      : never
+    : never;
 
 /**
- * Relational query API per table. Types are exact at one level: requesting
- * `with: { posts: true }` makes `posts` a required key of the result row and
- * unrequested relation keys are absent. Unknown relation names in `with` and
- * unknown property keys in `columns` are compile errors.
+ * Relational query API per table. Types are exact at every nesting depth:
+ * requesting `with: { posts: { with: { comments: true } } }` types `posts`
+ * as an array of post rows carrying `comments` arrays; unrequested relation
+ * keys are absent. Unknown relation names in `with` and unknown property
+ * keys in `columns` are compile errors at every level. `toSQL` and
+ * `explainQuery` compile WITHOUT a connection (pure inspection).
  */
-export type QueryApiFor<
+export interface QueryApiFor<
   Cols extends Record<string, AnyColumnBuilder>,
   Entries extends Record<string, Relation>,
-> = {
-  findMany<C extends keyof Cols = keyof Cols, W extends keyof Entries = never>(
-    args?: RelationalArgs<Cols, Entries, C, W>,
-  ): Promise<Array<RelationalRow<Cols, C, Entries, W>>>;
-  findFirst<C extends keyof Cols = keyof Cols, W extends keyof Entries = never>(
-    args?: RelationalArgs<Cols, Entries, C, W>,
-  ): Promise<RelationalRow<Cols, C, Entries, W> | undefined>;
-};
+  R extends RelationsInput = RelationsInput,
+> {
+  findMany<const A extends RelationalArgs<Cols, Entries, R> = {}>(
+    args?: A,
+  ): Promise<Array<RelationalRow<Cols, Entries, R, A>>>;
+  findFirst<const A extends RelationalArgs<Cols, Entries, R> = {}>(
+    args?: A,
+  ): Promise<RelationalRow<Cols, Entries, R, A> | undefined>;
+  /** Pure compile of the query — no driver round-trip, no execution. */
+  toSQL(args?: RQBArgs): { sql: string; params: unknown[] };
+  /** Structured pure compile plan: statements, parameters, decode plans,
+   *  capability requirements and the relation edge tree. */
+  explainQuery(args?: RQBArgs): RelationalExplainPlan;
+}
 
 type QueryApiOf<T extends TablesInput, R extends RelationsInput> = {
   [K in keyof T]: T[K] extends PgTableCore<infer Cols>
     ? R[K & keyof R] extends TableRelations<any, infer E>
       ? E extends Record<string, Relation>
-        ? QueryApiFor<Cols, E>
-        : QueryApiFor<Cols, Record<string, Relation>>
-      : QueryApiFor<Cols, Record<string, Relation>>
+        ? QueryApiFor<Cols, E, R>
+        : QueryApiFor<Cols, Record<string, Relation>, R>
+      : QueryApiFor<Cols, Record<string, Relation>, R>
     : never;
 };
 
@@ -175,7 +263,12 @@ export interface NeutronDatabase<
 }
 
 type Crud = Pick<NeutronDatabase, "select" | "insert" | "update" | "delete">;
-type QueryApi = Record<string, { findMany: (args?: RQBArgs) => Promise<unknown>; findFirst: (args?: RQBArgs) => Promise<unknown> }>;
+type QueryApi = Record<string, {
+  findMany: (args?: RQBArgs) => Promise<unknown>;
+  findFirst: (args?: RQBArgs) => Promise<unknown>;
+  toSQL: (args?: RQBArgs) => { sql: string; params: unknown[] };
+  explainQuery: (args?: RQBArgs) => RelationalExplainPlan;
+}>;
 type TxScope = Omit<NeutronDatabase, "transaction" | "close" | "driver">;
 
 export async function createDatabase<
@@ -239,8 +332,13 @@ export async function createDatabase<
     for (const { key, table } of tables.values()) {
       const entries = relationsByTable.get(getTableName(table)) ?? {};
       api[key] = {
-        findMany: (args: RQBArgs = {}) => findMany(context, table, entries, args),
-        findFirst: (args: RQBArgs = {}) => findFirst(context, table, entries, args),
+        findMany: (args: RQBArgs = {}) => findMany(context, table, entries, args, relationsByTable),
+        findFirst: (args: RQBArgs = {}) => findFirst(context, table, entries, args, relationsByTable),
+        toSQL: (args: RQBArgs = {}) => {
+          const built = buildRelationalSQL(table, entries, args, relationsByTable);
+          return { sql: built.sql, params: built.params };
+        },
+        explainQuery: (args: RQBArgs = {}) => buildRelationalPlan(table, entries, args, relationsByTable),
       };
     }
     return api;
@@ -267,4 +365,4 @@ export async function createDatabase<
   return db as unknown as NeutronDatabase<T, R>;
 }
 
-export { buildRelationalSQL };
+export { buildRelationalSQL, buildRelationalPlan, MAX_RELATION_DEPTH };
