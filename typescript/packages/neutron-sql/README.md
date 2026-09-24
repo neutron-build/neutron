@@ -41,7 +41,7 @@ const db = await createDatabase({
   url: process.env.DATABASE_URL!,
   tables: { users, posts },
   relations: { users: usersRelations, posts: postsRelations },
-  logger: true, // prints every SQL statement with timing in dev
+  logger: true, // redacted JSON-lines events in dev — never parameter values
 });
 
 // SQL builder — typed CRUD
@@ -155,16 +155,139 @@ them exactly once, and repeated or concurrent `close()` calls are idempotent
 (`{ ownership, terminated, terminate() }`) so callers can inspect and drive
 the lifecycle explicitly. Custom adapters passed via `driver:` must expose the
 same `lifecycle` and `close()` — wrap an existing pool/client with
-`wrapPgPool`/`wrapPostgresJs` to get a conforming adapter.
+`wrapPgPool`/`wrapPostgresJs` to get a conforming adapter. The injected
+postgres.js surface must include `reserve()` (every postgres.js 3.x client
+has it) — transactions pin their connection through it.
+
+## Transactions, cancellation and observability (I02)
+
+`db.transaction(fn, options?)` runs the callback on one pinned connection
+(pg: a checked-out pool client; postgres.js: `sql.reserve()`), driven by one
+shared runner on both drivers: `BEGIN` with validated modes, real savepoints
+for nesting, `COMMIT`/`ROLLBACK`, and honest failure classification.
+
+```ts
+await db.transaction(
+  async (tx) => {
+    await tx.insert(posts).values({ userId: 1, title: "hello" });
+    // Nested transaction = a real SAVEPOINT: inner failure rolls back and
+    // releases only the savepoint; the outer transaction stays usable.
+    await tx.transaction(async (tx2) => { /* ... */ });
+    // Or explicit control: rollbackTo keeps the savepoint, release drops it.
+    const sp = await tx.savepoint("stage1");
+    await sp.rollbackTo();
+    await sp.release();
+  },
+  {
+    isolation: "serializable",        // "read-committed" | "repeatable-read" | "serializable"
+    readOnly: true,                   // BEGIN READ ONLY
+    deferrable: true,                 // only with serializable + readOnly — see below
+    retry: { maxAttempts: 3, backoffMs: (n) => n * 50, idempotent: true },
+  },
+);
+```
+
+- **Isolation** maps to what PostgreSQL actually supports — the three real
+  levels (there is no `read-uncommitted`: it aliases `READ COMMITTED` and is
+  not offered). Modes are observable: the server's
+  `current_setting('transaction_isolation')` reflects them.
+- **`deferrable` is only accepted where it is real**: `serializable` +
+  `readOnly: true`. PostgreSQL *accepts* `DEFERRABLE` with any mode but it
+  has no effect outside serializable read-only transactions; that silent
+  no-op is rejected up front instead.
+- **Retry is opt-in and bounded.** Only SQLSTATE `40001` (serialization
+  failure, including ones surfacing at `COMMIT`) and `40P01` (deadlock) are
+  retried, up to `maxAttempts` total executions with backoff between
+  attempts. Enabling retry requires `idempotent: true`: a retried attempt
+  re-executes the whole callback from the top, including any external side
+  effects. Non-retriable errors surface after one attempt.
+- **A commit with an unknown outcome is its own error state.** If the
+  connection fails while `COMMIT` is in flight (transport failure, FATAL
+  `57P01`/`57P02`/`57P03`, or a cancellation), the transaction throws
+  `CommitAmbiguityError` with the cause and guidance: the transaction may or
+  may not be durably committed, and it is **never replayed automatically**
+  — not even with retry armed. Inspect the database state (or an idempotency
+  record) before re-submitting. An SQL error at `COMMIT` (e.g. `40001`) is
+  the server's definite rollback answer, never ambiguous.
+
+### Query deadlines and AbortSignal — cancellation reaches the database
+
+```ts
+// any statement, both drivers:
+await db.driver.query("select ...", [id], { deadlineMs: 250 });
+const ac = new AbortController();
+req.on("close", () => ac.abort());
+await db.select().from(users).execute({ signal: ac.signal });   // builders take options
+await db.query.users.findMany({ with: { posts: true } }, { deadlineMs: 250 }); // relational too
+```
+
+The cancel is delivered to the **server**, not just the caller's promise:
+the pg leg runs `pg_cancel_backend(pid)` on a second pooled connection (the
+backend pid is read from the connection running the query — one extra round
+trip on cancellation-armed statements; the side channel needs spare pool
+capacity, so a `max: 1` pool cannot service it); postgres.js uses its native
+`Query.cancel()` (a dedicated cancel connection managed by the driver —
+installed 3.4.x has no AbortSignal support of its own). The canceled
+statement fails with `QueryCanceledError` (`reason: "deadline" | "signal"`,
+`dispatched`, SQLSTATE `57014` — it is a `ServerSqlError`, so SQLSTATE
+survives wrappers). **The pooled connection stays usable**: the server
+answers 57014 and the session returns clean — verified live on both drivers
+by canceling `pg_sleep` mid-flight and running subsequent queries on the same
+pool. A 57014 you did not request (server-side `statement_timeout`, an
+administrator cancel) stays a plain `ServerSqlError`. A pre-aborted signal
+rejects immediately with `dispatched: false` — nothing is sent.
+
+One pg caveat fixed along the way: a connection dying inside a transaction
+used to surface as an *unhandled* `'error'` event on the checked-out client
+(pg-pool detaches its listener while checked out) and could crash the
+process. The transaction pin now owns that hazard, and fatally-lost
+connections are removed from the pool instead of returning to the idle set.
+
+### Structured events (redacted by default)
+
+`logger: true` prints one JSON line per event; a custom function receives
+the same `SqlEvent`. Kinds: `query-begin`, `query-end`, `query-error`,
+`tx-begin`, `tx-commit`, `tx-rollback`, `savepoint`, `cancel` — with
+durations, 16-hex statement ids (sha256 of the SQL text), transaction ids
+and savepoint names. **Parameter values never appear**: the `params` field
+exists only when the process sets `NEUTRON_SQL_LOG_PARAMS=1`, an explicit
+redaction-free mode — the emitted values are then visible in whatever sink
+receives events, so do not enable it where logs are shared. Connection
+strings and passwords are never logged (events carry no connection
+information at all). Server error messages pass through verbatim in
+`error.message` — PostgreSQL itself may echo values there (e.g. duplicate-key
+details); that is the server's wording, not this package's emission. The
+pre-I02 logger (plain SQL lines that printed parameter values) is gone;
+`LogEvent` remains as a deprecated alias of `SqlEvent`.
+
+### postgres.js 3.4.8 defects worked around (documented)
+
+Reproduced on raw postgres.js during I02 (see the private evidence record):
+its own `sql.begin()` **crashes the process** when the backend is terminated
+mid-transaction (rollback written to the already-nulled socket), and
+releasing a reservation whose socket died reopens the dead connection into
+the pool (next pooled query crashes the same way; one stale `57P01` can also
+be delivered to an innocent later query). This package's transaction runner
+pins through `reserve()` but never rolls back onto a fatally-lost connection
+and never releases a dead reservation — the terminate-mid-transaction storms
+in the live suite survive where the driver's own path crashes. The residual
+upstream behavior (a stale one-shot 57P01 after a killed reservation) is
+sequenced around, not hidden: statements never ran, so a retry is safe.
 
 ### Errors and capabilities
 
 Driver errors surface as a stable taxonomy instead of message matching:
 `MissingDriverError` (the npm package is absent), `ConnectionFailedError`
 (transport: refused/timeout/socket died/pool ended — with `code`, `address`,
-`port` when present), and `ServerSqlError` (the server answered with an SQL
+`port` when present), `ServerSqlError` (the server answered with an SQL
 error; `sqlstate` retained verbatim, plus `severity`/`detail`/`hint`/`position`,
-original driver error as `cause`). `getSqlState(err)` walks wrapper chains.
+original driver error as `cause`), `QueryCanceledError` (a `ServerSqlError`
+for a cancellation this package dispatched — `57014`, with the
+deadline/signal `reason`), and `CommitAmbiguityError` (a COMMIT whose
+outcome the connection failure left unknown — never retried
+automatically). `getSqlState(err)` walks wrapper chains;
+`isRetriableTransactionError(err)` answers the 40001/40P01 question the
+retry contract asks.
 
 `db.engine()` returns the connected engine's identity (one `SELECT VERSION()`,
 memoized; Nucleus detection per the framework contract — an unrecognized
@@ -804,7 +927,14 @@ general-purpose use.
   lossless child values through the JSON projection, statement-count-pinned
   one-statement execution, pure `toSQL`/`explainQuery` inspection, and
   capability fail-before-running on jsonb-less engines),
-  transactions, `toSQL()`, mapped
+  transactions with the full I02 contract (validated isolation/read-only/
+  deferrable modes rendered into BEGIN, real savepoints for nesting and
+  explicit rollback-to/release control, server-reaching deadlines and
+  AbortSignal cancellation with pooled connections verified usable after,
+  opt-in 40001/40P01 whole-transaction retry requiring an idempotency
+  assertion, commit-ambiguity as its own never-replayed error state, and
+  redacted structured events — both drivers, terminate-mid-transaction
+  storms included), `toSQL()`, mapped
   properties/NULL/required-key semantics, lossless codecs (bigint/string/
   safe-number int8 modes, exact numerics, microsecond temporals, bytea,
   SQL NULL vs JSON null writes) across raw select, projection, `returning`

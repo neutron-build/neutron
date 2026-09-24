@@ -85,6 +85,62 @@ export class ServerSqlError extends NeutronSqlError {
   }
 }
 
+/** A query canceled through this package's deadline/AbortSignal contract
+ * (I02). The cancel was dispatched to the server (pg_cancel_backend side
+ * channel on pg; driver-native Query.cancel() on postgres.js) and the server
+ * answered with SQLSTATE 57014. It is a ServerSqlError: SQLSTATE and the
+ * original driver error survive (getSqlState walks this class first).
+ * A 57014 that arrives WITHOUT our cancel having been dispatched (e.g. a
+ * server-side statement_timeout or an administrator cancel) is NOT wrapped
+ * in this class — it stays a plain ServerSqlError. */
+export class QueryCanceledError extends ServerSqlError {
+  /** What triggered the cancel: a deadlineMs expiry or an AbortSignal. */
+  readonly reason: "deadline" | "signal";
+  /** True when the cancel was actually dispatched toward the server. False
+   * means the query was rejected locally before any server round trip
+   * (pre-aborted signal / non-positive deadline). */
+  readonly dispatched: boolean;
+  constructor(
+    message: string,
+    fields: { reason: "deadline" | "signal"; dispatched: boolean; cause?: unknown },
+  ) {
+    super(message, { sqlstate: "57014", cause: fields.cause });
+    this.reason = fields.reason;
+    this.dispatched = fields.dispatched;
+  }
+}
+
+/** COMMIT was sent and the connection failed before the server answered:
+ * the transaction may or may not be durably committed — the client cannot
+ * know without checking database state. NEVER retried automatically (the
+ * I02 contract): re-running a transaction whose commit outcome is unknown
+ * can double-apply effects. Inspect the committed state (or an idempotency
+ * record) before deciding to re-submit. */
+export class CommitAmbiguityError extends NeutronSqlError {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+  }
+}
+
+/** True when the error means the SESSION is gone: a transport failure or a
+ * FATAL connection-exception SQLSTATE (class 57P0x — administrator shutdown,
+ * crash-and-restart, cannot-connect-now). Used to keep dead connections out
+ * of pools. A canceled query (57014) is NOT fatal: the connection stays
+ * usable. */
+export function isFatalConnectionLoss(err: unknown): boolean {
+  if (err instanceof ConnectionFailedError) return true;
+  if (err instanceof ServerSqlError) return /^57P\d\d$/.test(err.sqlstate);
+  return false;
+}
+
+/** True when the error is (or wraps) SQLSTATE 40001 (serialization failure)
+ * or 40P01 (deadlock detected) — the only failure classes the opt-in
+ * whole-transaction retry ever retries. */
+export function isRetriableTransactionError(err: unknown): boolean {
+  const state = getSqlState(err);
+  return state === "40001" || state === "40P01";
+}
+
 // ---------------------------------------------------------------------------
 // Classification
 // ---------------------------------------------------------------------------

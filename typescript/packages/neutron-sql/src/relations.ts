@@ -31,6 +31,7 @@ import { getTableColumns, getTableName } from "./schema.js";
 import type { AnyColumnBuilder, AnyPgTable, Relation, RelationOne, TableRelations } from "./schema.js";
 import type { ExecContext } from "./builder.js";
 import { run, whereItems } from "./builder.js";
+import type { QueryExecutionOptions } from "./transactions.js";
 import {
   applyProjectionDecoders,
   decodeJsonLeaf,
@@ -881,10 +882,11 @@ export async function findMany(
   relations: Record<string, Relation>,
   args: RQBArgs,
   relationsByTable?: Map<string, Record<string, Relation>>,
+  options?: QueryExecutionOptions,
 ): Promise<Array<Record<string, unknown>>> {
   const byTable = relationsByTable ?? new Map<string, Record<string, Relation>>([[getTableName(table), relations]]);
   const built = buildRelationalSQL(table, relations, args, byTable);
-  const rows = (await run(ctx, built.sql, built.params, "query", built.capabilities)) as Array<Record<string, unknown>>;
+  const rows = (await run(ctx, built.sql, built.params, "query", built.capabilities, options)) as Array<Record<string, unknown>>;
   // Parent columns decode through the compiled statement's decode plan,
   // exactly like the flat select path.
   applyProjectionDecoders(rows, built.decoders);
@@ -909,7 +911,8 @@ export async function findFirst(
   relations: Record<string, Relation>,
   args: RQBArgs,
   relationsByTable?: Map<string, Record<string, Relation>>,
+  options?: QueryExecutionOptions,
 ): Promise<Record<string, unknown> | undefined> {
-  const rows = await findMany(ctx, table, relations, { ...args, limit: 1 }, relationsByTable);
+  const rows = await findMany(ctx, table, relations, { ...args, limit: 1 }, relationsByTable, options);
   return rows[0];
 }

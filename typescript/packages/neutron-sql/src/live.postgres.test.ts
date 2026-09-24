@@ -181,7 +181,7 @@ for (const driverKind of ["postgres", "pg"] as const) {
         driverOptions: { driver: driverKind },
         tables: { users, posts },
         relations: { users: usersRelations, posts: postsRelations },
-        logger: (e) => events.push({ sql: e.sql }),
+        logger: (e) => events.push({ sql: e.sql ?? "" }),
       });
       try {
         await db.select().from(users);
