@@ -88,11 +88,16 @@ The provider is the overload key:
 types with zero casts.
 
 One TypeScript note for partial installs: drizzle-orm's own declarations
-reference its *other* optional drivers (`mysql2`, `gel`, …), so consumers
-that install only the Postgres or only the SQLite peer set need
+reference its *other* optional drivers (`mysql2`, `gel`, …), and this
+package's `/drizzle` declaration type-imports the SQLite client
+(`@libsql/client`) for its LibSQL overload — so consumers that install only
+the Postgres or only the SQLite peer set need
 `skipLibCheck: true` (the ecosystem norm for drizzle-orm) to compile against
-`/drizzle`. Your own code is still fully checked; only drizzle-orm's
-internal declarations are skipped.
+`/drizzle`. Your own code is still fully checked; the declarations skipped
+are drizzle-orm's internals and this package's own `/drizzle` declaration
+(1 of the 76 errors in a pg-only counterfactual is
+`dist/db/drizzle.d.ts: TS2307 Cannot find module '@libsql/client'`, the
+other 75 are drizzle-orm's own).
 
 The `nucleus` provider connects the same postgres.js driver over Nucleus's
 pg-wire protocol and additionally connects an `@neutron-build/nucleus` client

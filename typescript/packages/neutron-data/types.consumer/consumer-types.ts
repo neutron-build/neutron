@@ -11,7 +11,7 @@
 //   Drizzle's own row types, never a cast to a Neutron type;
 // - the root export stays usable with the loose surface (no drizzle-orm
 //   types leak into the root declaration — asserted by
-//   root-export-purity.test.ts over the emitted dist);
+//   src/root-export-purity.test.ts, which walks the emitted dist tree);
 // - invalid uses fail for the intended reason (@ts-expect-error directives
 //   below — an unused directive is itself a compile error).
 
