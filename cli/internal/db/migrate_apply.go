@@ -1420,6 +1420,11 @@ func (c *Client) RelationExists(ctx context.Context, schema, name string) (bool,
 // IndexStatus reports whether a named index exists and (when it does)
 // whether it is valid. A failed CREATE INDEX CONCURRENTLY leaves an INVALID
 // index behind; validity is the difference between "done" and "debris".
+// The validity arm aggregates (bool_and) instead of returning a bare scalar
+// row: same-name indexes in multiple schemas must never turn a status
+// probe into SQLSTATE 21000 — with more than one match the conservative
+// aggregate (any invalid ⇒ invalid) decides deterministically (M06 rework,
+// review-1 MAJOR-2).
 func (c *Client) IndexStatus(ctx context.Context, schema, name string) (exists, valid bool, err error) {
 	err = c.pool.QueryRow(ctx, `
 		SELECT EXISTS (
@@ -1430,7 +1435,7 @@ func (c *Client) IndexStatus(ctx context.Context, schema, name string) (exists, 
 			  AND ($1 = '' OR n.nspname = $1)
 		),
 		COALESCE((
-			SELECT i.indisvalid
+			SELECT bool_and(i.indisvalid)
 			FROM pg_class ic
 			JOIN pg_namespace n ON n.oid = ic.relnamespace
 			JOIN pg_index i ON i.indexrelid = ic.oid

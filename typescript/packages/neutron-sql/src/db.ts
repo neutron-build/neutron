@@ -2,7 +2,7 @@
 // @neutron-build/sql — database entry point
 // ---------------------------------------------------------------------------
 
-import { loadDriver, type Driver, type LoadDriverOptions } from "./drivers.js";
+import { loadDriver, assertNodeRuntime, type Driver, type LoadDriverOptions } from "./drivers.js";
 import { capabilityGate, type CapabilityEvidence, type EngineIdentity } from "./engine.js";
 import type { StatementCapability } from "./codecs.js";
 import { resolveLogger, type Logger, type LoggerOption, type SqlEvent } from "./logger.js";
@@ -323,6 +323,7 @@ export async function createDatabase<
   T extends TablesInput = TablesInput,
   R extends RelationsInput = RelationsInput,
 >(options: DatabaseOptions<T, R>): Promise<NeutronDatabase<T, R>> {
+  assertNodeRuntime("createDatabase");
   if ((options.url === undefined) === (options.driver === undefined)) {
     throw new Error("createDatabase requires exactly one of `url` or `driver` (inject an adapter wrapped via wrapPgPool/wrapPostgresJs)");
   }
@@ -403,8 +404,19 @@ export async function createDatabase<
     return {
       ...makeCrud(txCtx),
       query: makeQuery(txCtx),
-      transaction: <Tx>(nested: (tx: TxScope) => Promise<Tx>): Promise<Tx> =>
-        scope.transaction((inner) => nested(adaptScope(inner))),
+      // Nested transaction: a real SAVEPOINT on the same connection. Modes
+      // are properties of the outer BEGIN — a JS caller passing an options
+      // argument (reachable only without types; the declared surface takes
+      // none) gets a precise runtime rejection instead of a silent drop.
+      transaction: <Tx>(nested: (tx: TxScope) => Promise<Tx>, ...extra: unknown[]): Promise<Tx> => {
+        const modes = extra[0] as TransactionModes | undefined;
+        if (modes !== undefined && hasModes(modes)) {
+          throw new NeutronSqlError(
+            "isolation/read-only/deferrable are properties of the outer BEGIN — pass them to db.transaction(fn, options) or the driver-scoped begin(fn, modes); a nested transaction is a savepoint and takes no modes",
+          );
+        }
+        return scope.transaction((inner) => nested(adaptScope(inner)));
+      },
       savepoint: (name?: string): Promise<Savepoint> => scope.savepoint(name),
     } as TxScope;
   };

@@ -275,6 +275,7 @@ export {
 
 export {
   loadDriver,
+  assertNodeRuntime,
   wrapPgPool,
   wrapPostgresJs,
   makeLifecycle,

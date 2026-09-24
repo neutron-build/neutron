@@ -231,7 +231,29 @@ export interface WrapAdapterOptions {
 // Loader
 // ---------------------------------------------------------------------------
 
+/** Runtime-support guard (I03): the bundled adapters drive `pg` and
+ *  `postgres` through Node transports and no edge/browser adapter exists
+ *  (adding one requires a real transport fixture, per the runtime-support
+ *  contract). Detection is POSITIVE — is a Node process present? — never
+ *  `typeof window` inference, so a runtime that genuinely provides Node
+ *  compatibility is not blocked. A runtime without it fails here with one
+ *  precise error instead of crashing inside a driver import. */
+export function assertNodeRuntime(operation: string): void {
+  const versions =
+    typeof process === "undefined"
+      ? undefined
+      : (process as { versions?: { node?: string } }).versions;
+  if (!versions?.node) {
+    throw new NeutronSqlError(
+      `${operation} requires a Node.js runtime (no process.versions.node was found). ` +
+        `@neutron-build/sql's pg/postgres.js adapters use Node sockets and have no edge/browser ` +
+        `transport adapter — run in Node.js (see "Runtime support" in the README).`,
+    );
+  }
+}
+
 export async function loadDriver(url: string, options: LoadDriverOptions = {}): Promise<Driver> {
+  assertNodeRuntime("loadDriver");
   const kind = options.driver ?? "auto";
   if (kind === "pg") return loadNodePostgres(url, options);
   if (kind === "postgres") return loadPostgresJs(url, options);
