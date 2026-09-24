@@ -831,6 +831,147 @@ const affected = await db.driver.prepare!("update users set seen = true where em
   `tx.query` already has, and it is **unsupported**: do not use a
   transaction-scoped driver or statement after its transaction ends.
 
+## Advanced query controls (Q08)
+
+### Window functions
+
+`over(fn, spec)` builds `fn(...) over (partition by … order by … frame)` as a
+structural AST fragment — every keyword comes from a fixed vocabulary, frame
+offsets are validated safe integers, and placement is enforced at the compile
+choke point: windows may appear in the select list and ORDER BY only (using
+one in WHERE/GROUP BY/HAVING/JOIN ON or DML clauses fails before any SQL
+runs, mirroring PostgreSQL's own evaluation order).
+
+```ts
+import { over, rowNumber, lag, desc, asc, lte } from "@neutron-build/sql";
+
+const ranked = cteTable("ranked", db.select({
+  id: posts.id,
+  userId: posts.userId,
+  rn: over(rowNumber(), { partitionBy: [posts.userId], orderBy: [desc(posts.id)] }),
+}).from(posts));
+const topPerUser = await db.select().from(ranked).where(lte(ranked.rn, 2));
+```
+
+- **Result typing follows PostgreSQL:** `row_number`/`rank`/`dense_rank` are
+  int8 (bigint by default mode), `ntile` integer, `percent_rank`/`cume_dist`
+  double, and value functions (`lag`/`lead`/`first_value`/`last_value`/
+  `nth_value`) keep their argument column's codec — temporals read back as
+  canonical strings (microseconds intact), numeric keeps its scale, int8
+  stays bigint.
+- **Frames:** `rows`/`range`/`groups` with `between … and …` (or the
+  single-bound form), offset bounds as `{ preceding: n }` / `{ following: n }`,
+  and `exclude: "current row" | "group" | "ties" | "no others"` (PostgreSQL
+  11). `range` with value offsets is rejected (the offset's type depends on
+  the ordering column); `groups` requires an orderBy, and frames that end
+  before they start are rejected up front.
+- **Aggregates compose as windows:** `over(sum(col), …)`, `over(count(), …)`.
+  `DISTINCT` aggregates over a window are rejected (PostgreSQL rejects them
+  too), as are nested window calls.
+- **Capabilities:** statements carrying windows require `window-functions`;
+  `groups` frames add `window-frame-groups` and `exclude` adds
+  `window-frame-exclude` (facts-only requirements — engines that cannot
+  prove them fail closed before running anything).
+
+### Row locking (`for … [nowait | skip locked]`)
+
+```ts
+const claimed = await db.transaction(async (tx) => {
+  const rows = await tx.select().from(jobs)
+    .where(eq(jobs.state, "ready"))
+    .for("update", { skipLocked: true })   // work-queue claim
+    .limit(10);
+  for (const j of rows) await tx.update(jobs).set({ state: "claimed" }).where(eq(jobs.id, j.id));
+  return rows;
+});
+```
+
+- Strengths are the four PostgreSQL levels — `update`, `no key update`,
+  `share`, `key share`; wait policies are wait (default), `noWait`
+  (SQLSTATE 55P03 surfaces with its SQLSTATE preserved) and `skipLocked`.
+  Clauses accumulate across `.for()` calls.
+- **`of` targets the from table, `alias()` handles of joined tables, and
+  derived-table handles whose derivation contains no CTE** (PostgreSQL
+  locks the underlying base rows through a derived alias; a handle whose
+  derivation reaches a CTE is rejected). An unqualified lock is rejected
+  where PostgreSQL would silently drop rows: the nullable side of an outer
+  join (PostgreSQL errors), or a CTE in FROM — directly or wrapped in
+  derived tables (PostgreSQL accepts the statement and locks none of the
+  `WITH` query's rows; base tables in the same statement still lock, so a
+  mixed shape is partially silent — lock the base rows inside the source
+  instead). Plain derived tables are allowed through: PostgreSQL propagates
+  the lock to their base rows and errors itself (0A000) on grouped/distinct/
+  windowed/union derivations.
+- Locking is rejected at compile time on DISTINCT/GROUP BY/HAVING/aggregate/
+  window/set-operation statements — the same shapes PostgreSQL itself
+  refuses (the rows are not base-table rows).
+- Capability requirements: `row-locking` always; `row-locking-key-strength`
+  for `no key update`/`key share`; `row-locking-skip-locked` for
+  skip-locked.
+
+### Explicit batch plans
+
+`db.batch([q1, q2, …])` runs a fixed list of compiled statements sequentially
+on ONE connection inside ONE transaction and resolves to a typed tuple of
+their results (selects/set-operations → rows; mutations → affected count, or
+rows with `returning()`).
+
+- **The plan is explicit:** `explain()` on the returned object lists every
+  statement (SQL, parameters, result shape, decode plan, capabilities) plus
+  the transaction envelope — pure, before anything runs. Execution issues
+  exactly those statements, each as its own ordinary driver call (never a
+  multi-statement string). A compile failure in any item stops the whole
+  batch with zero statements executed; a late failure rolls earlier
+  statements back (one transaction).
+- **A batch that owns its transaction defaults to REPEATABLE READ** — one
+  snapshot for every statement (READ COMMITTED would re-snapshot per
+  statement; pass `isolation` to choose that deliberately). Writes racing a
+  concurrent commit can fail with 40001; `retry: { idempotent: true,
+  maxAttempts }` replays the whole batch with the I02 semantics (never after
+  an ambiguous commit).
+- Inside `db.transaction` the batch joins that scope and takes no
+  modes/retry — the enclosing callback owns BEGIN/COMMIT (its rollback takes
+  the batch's writes with it).
+
+### Bounded streaming (server-side cursors)
+
+`stream()` / `streamBatches()` consume a select through a PostgreSQL
+server-side cursor: `DECLARE … NO SCROLL CURSOR FOR <select>`, then
+`FETCH FORWARD <batchSize>` only when the consumer pulls, then `CLOSE`. At
+most ONE batch (1..10000 rows, default 100) is buffered client-side
+whatever the result size. Every statement is sent on its own — no
+multi-statement strings — so both drivers run it through their ordinary
+query path.
+
+```ts
+for await (const row of db.select().from(events).stream({ batchSize: 100 })) {
+  if (done(row)) break; // early exit: rollback + immediate connection return
+}
+for await (const batch of db.select().from(events).streamBatches({ batchSize: 100 })) {
+  await process(batch); // batches of <= 100 rows, last one short
+}
+```
+
+- **Ownership follows the calling context (I02 preserved).** Outside a
+  transaction the stream owns one: it pins a connection, runs
+  BEGIN/DECLARE/FETCH…/CLOSE and COMMITs when the cursor is exhausted.
+  **Early exit (break, `return()`, `throw()`, or abort) rolls back and
+   returns the connection to the pool promptly** (the live suite asserts
+   pool counts). Inside `db.transaction` the stream runs on the transaction's
+  pinned connection and never issues BEGIN/COMMIT/ROLLBACK: the enclosing
+  callback owns the transaction, early exit just CLOSEs the cursor, and
+  using a stream after its transaction settled is rejected without touching
+  the released connection.
+- **Cancellation reaches the server on every round trip** (declare and each
+  fetch): `deadlineMs`/`signal` follow the I02 query-options semantics; an
+  abort while the consumer is idle still rolls back an owned stream and
+  releases its connection without waiting for the next pull.
+- Streams are single-consumer; N concurrent streams need N free pooled
+  connections (each holds one, idle-in-transaction, from first pull until
+  exhausted or closed). `explain()` describes the full statement plan
+  (roles begin/declare/fetch/close/commit, capabilities incl.
+  `server-cursors`) without executing anything.
+
 ## Relational reads (nested, Q05)
 
 `db.query.<table>.findMany/findFirst` compile every requested relation edge —
@@ -1069,6 +1210,19 @@ general-purpose use.
   capability requirements, and schema export v2 is deterministic and
   cross-language-pinned (Go + reference consumer agree byte-for-byte);
   importing the root loads no driver module until a connection is requested.
+- Implemented and live-tested on PostgreSQL 17, both drivers: window
+  functions (ranking, value and distribution functions with PostgreSQL
+  result typing, rows/range/groups frames with exclude variants, aggregates
+  as windows, placement enforced at the compile choke point), row locking
+  (four strengths, nowait, skip locked, `of` targeting the from table, join
+  aliases and derived-table handles, unqualified locks rejected over
+  outer-join nullable sides and CTE-reaching FROM items), explicit batch
+  plans (typed result tuples, one transaction on one connection, REPEATABLE
+  READ default, opt-in retry, enclosing-scope participation, pure
+  `explain()`), and bounded streaming over server-side cursors (capped
+  client buffering, rollback and connection release on early exit,
+  per-round-trip cancellation, post-settle use rejected without touching
+  the released connection).
 - `update`/`delete` require `.where()` (foot-gun guard).
 - Deferred with explicit rejection, not implemented: parent-correlated
   per-child filters (filter the parent instead) and subqueries inside

@@ -86,6 +86,38 @@ const REGISTRY: Readonly<Record<string, CapabilitySpec>> = {
     postgresSince: [9, 4],
     probeSql: "select to_jsonb(1)::text as a, jsonb_build_object('k', 1)::text as b, coalesce(jsonb_agg(v), '[]'::jsonb)::text as c from (values (1)) as t(v)",
   },
+  // Q08 rules. Version facts only (PostgreSQL release notes); no probes: a
+  // statement that merely parses on another engine proves nothing about
+  // window semantics, lock behavior or cursor lifetime, so non-Postgres
+  // engines resolve `unknown` and fail closed until engine evidence exists.
+  "window-functions": {
+    description: "window function calls — fn(...) over (partition by / order by / frame) (PostgreSQL 8.4 release notes)",
+    postgresSince: [8, 4],
+  },
+  "window-frame-groups": {
+    description: "the GROUPS window frame mode (PostgreSQL 11 release notes)",
+    postgresSince: [11, 0],
+  },
+  "window-frame-exclude": {
+    description: "window frame EXCLUDE clauses (PostgreSQL 11 release notes)",
+    postgresSince: [11, 0],
+  },
+  "row-locking": {
+    description: "SELECT ... FOR UPDATE / FOR SHARE with NOWAIT (FOR SHARE and NOWAIT: PostgreSQL 8.1 release notes)",
+    postgresSince: [8, 1],
+  },
+  "row-locking-key-strength": {
+    description: "FOR NO KEY UPDATE / FOR KEY SHARE lock strengths (PostgreSQL 9.3 release notes)",
+    postgresSince: [9, 3],
+  },
+  "row-locking-skip-locked": {
+    description: "the SKIP LOCKED lock-wait policy (PostgreSQL 9.5 release notes)",
+    postgresSince: [9, 5],
+  },
+  "server-cursors": {
+    description: "DECLARE ... NO SCROLL CURSOR / FETCH FORWARD n / CLOSE inside a transaction (NO SCROLL: PostgreSQL 7.4 release notes)",
+    postgresSince: [7, 4],
+  },
 };
 
 function compareVersion(version: string, since: readonly [number, number]): number | null {

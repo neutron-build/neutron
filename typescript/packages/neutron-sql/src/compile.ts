@@ -11,7 +11,8 @@
 // Alias generation (`__q1`, `__q2`, …) is a compile-state counter advanced in
 // traversal order, so unnamed derived tables get stable, deterministic names.
 
-import { assertExcludedScope, forgedTextKind, validAggregate, validJoinType, validLimit, validNulls, validOp, validParamCast } from "./ast.js";
+import { assertExcludedScope, assertLockingClauseValid, forgedTextKind, validAggregate, validJoinType, validLimit, validNulls, validOp, validParamCast } from "./ast.js";
+import { assertWindowPlacement, containsAggregate, containsWindow } from "./window.js";
 import type {
   AggregateNode,
   AnyStatementNode,
@@ -20,6 +21,7 @@ import type {
   ExpressionNode,
   InsertStatementNode,
   JoinNode,
+  LockingClause,
   OnConflictNode,
   OrderSpec,
   ProjectionNode,
@@ -295,6 +297,9 @@ function compileStatementNode(stmt: StatementNode, state: CompileState): void {
   // precedence, and a branch keeps its own WITH/ORDER BY/LIMIT inside the
   // parentheses (PostgreSQL semantics).
   for (const so of setOps) {
+    if ((so.select.locking ?? []).length > 0) {
+      throw lockingError("UNION/INTERSECT/EXCEPT", "a set-operation branch carries a locking clause");
+    }
     state.parts.push(` ${so.op} (`);
     compile(so.select, state);
     state.parts.push(")");
@@ -302,6 +307,37 @@ function compileStatementNode(stmt: StatementNode, state: CompileState): void {
   if (stmt.orderBy.length > 0) compileOrder(stmt.orderBy, state);
   if (stmt.limit !== undefined) state.parts.push(` limit ${validLimit(stmt.limit, "compile limit")}`);
   if (stmt.offset !== undefined) state.parts.push(` offset ${validLimit(stmt.offset, "compile offset")}`);
+  compileLocking(stmt, state);
+}
+
+function lockingError(construct: string, detail: string): Error {
+  return new Error(
+    `compile: row-locking clauses are not allowed with ${construct} (${detail}) — PostgreSQL rejects the combination (SQLSTATE 0A000); lock the base rows in a plain select and aggregate/deduplicate separately`,
+  );
+}
+
+/** Locking clauses (Q08): `for <strength> [of …] [nowait | skip locked]`,
+ *  rendered after limit/offset. Validated here for hand-built ASTs too:
+ *  PostgreSQL forbids row locks on grouped, distinct, aggregated, windowed
+ *  and set-operation results (the rows are not base-table rows). */
+function compileLocking(stmt: StatementNode, state: CompileState): void {
+  const locking: readonly LockingClause[] = stmt.locking ?? [];
+  if (locking.length === 0) return;
+  if ((stmt.setOps ?? []).length > 0) throw lockingError("UNION/INTERSECT/EXCEPT", "the statement is a compound");
+  if (stmt.distinct === true) throw lockingError("DISTINCT", "the statement selects distinct rows");
+  if ((stmt.groupBy ?? []).length > 0) throw lockingError("GROUP BY", "the statement groups rows");
+  if ((stmt.having ?? []).length > 0) throw lockingError("HAVING", "the statement filters groups");
+  for (const p of stmt.projections) {
+    if (containsAggregate(p.expr)) throw lockingError("aggregate functions", "a projection aggregates rows");
+    if (containsWindow(p.expr)) throw lockingError("window functions", "a projection is a window call");
+  }
+  for (const clause of locking) {
+    assertLockingClauseValid(clause, "compile locking");
+    state.parts.push(` for ${clause.strength}`);
+    if (clause.of.length > 0) state.parts.push(` of ${clause.of.map(quoteIdent).join(", ")}`);
+    if (clause.wait === "nowait") state.parts.push(" nowait");
+    else if (clause.wait === "skip locked") state.parts.push(" skip locked");
+  }
 }
 
 /** where/having share one renderer: items join with `and`, and fragments and
@@ -429,6 +465,7 @@ function compileDelete(node: DeleteStatementNode, state: CompileState): void {
  *  SQL renders if it references excluded() where PostgreSQL cannot see it. */
 export function compileStatement(stmt: AnyStatementNode): CompiledQuery {
   assertExcludedScope(stmt);
+  assertWindowPlacement(stmt);
   const state: CompileState = { parts: [], params: [], aliasCounter: 0 };
   compile(stmt, state);
   return { sql: state.parts.join(""), params: state.params };

@@ -152,6 +152,22 @@ export interface TransactionHooks {
   onEvent?(event: SqlEvent): void;
 }
 
+// Q08: scope registry. Streams and batch plans issued through a transaction
+// scope run on the scope's pinned connection and must never touch it after
+// the transaction settles (on pg the released client may already serve
+// another borrower). Registration is by scope identity; non-runner drivers
+// are unregistered.
+const SCOPE_STATE = new WeakMap<object, () => boolean>();
+
+/** Transaction state of a driver-level scope created by the shared runner:
+ *  "active" while its callback runs, "settled" once the callback returned or
+ *  threw (COMMIT/ROLLBACK follows), undefined for any other driver. */
+export function transactionScopeState(driver: object): "active" | "settled" | undefined {
+  const active = SCOPE_STATE.get(driver);
+  if (active === undefined) return undefined;
+  return active() ? "active" : "settled";
+}
+
 let txSequence = 0;
 
 /** Drive one transaction attempt on a pinned connection. Owns the pin: it is
@@ -170,6 +186,7 @@ export async function runTransaction<T>(
   };
   let savepointSeq = 0;
   let released = false;
+  let callbackSettled = false;
   const releasePin = (err?: unknown): void => {
     if (released) return;
     released = true;
@@ -198,6 +215,7 @@ export async function runTransaction<T>(
       },
     };
     if (typeof pin.prepare === "function") scope.prepare = (sqlText: string) => pin.prepare!(sqlText);
+    SCOPE_STATE.set(scope, () => !callbackSettled && !released);
     return scope;
   };
 
@@ -280,7 +298,9 @@ export async function runTransaction<T>(
   let result: T;
   try {
     result = await fn(makeScope());
+    callbackSettled = true;
   } catch (err) {
+    callbackSettled = true;
     const rollbackFailure = await rollbackAndRethrow(pin, txId, started, emit, err);
     releasePin(rollbackFailure !== false ? rollbackFailure : isFatalConnectionLoss(err) ? err : undefined);
     throw err;
