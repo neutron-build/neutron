@@ -62,6 +62,38 @@ func NewServer(port int) (*Server, error) {
 
 // Start begins listening. Blocks until the context is cancelled.
 func (s *Server) Start(ctx context.Context) error {
+	mux, err := s.routes()
+	if err != nil {
+		return err
+	}
+	s.srv = &http.Server{
+		Addr:    fmt.Sprintf("127.0.0.1:%d", s.port),
+		Handler: s.corsMiddleware(mux),
+	}
+
+	ln, err := net.Listen("tcp", s.srv.Addr)
+	if err != nil {
+		return fmt.Errorf("listen on port %d: %w", s.port, err)
+	}
+
+	go func() {
+		<-ctx.Done()
+		shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		s.srv.Shutdown(shutCtx) //nolint
+	}()
+
+	log.Printf("Studio running at http://localhost:%d\n", s.port)
+	if err := s.srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}
+
+// routes builds the full route table: every API endpoint plus the embedded
+// SPA static handler. Extracted from Start so tests can drive the exact
+// production routing (through corsMiddleware) without binding a listener.
+func (s *Server) routes() (*http.ServeMux, error) {
 	mux := http.NewServeMux()
 
 	// API routes
@@ -91,7 +123,7 @@ func (s *Server) Start(ctx context.Context) error {
 	// SPA static files
 	distFS, err := fs.Sub(Dist, "dist")
 	if err != nil {
-		return fmt.Errorf("embed sub: %w", err)
+		return nil, fmt.Errorf("embed sub: %w", err)
 	}
 	fileServer := http.FileServer(http.FS(distFS))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -105,29 +137,7 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 		fileServer.ServeHTTP(w, r)
 	})
-
-	s.srv = &http.Server{
-		Addr:    fmt.Sprintf("127.0.0.1:%d", s.port),
-		Handler: s.corsMiddleware(mux),
-	}
-
-	ln, err := net.Listen("tcp", s.srv.Addr)
-	if err != nil {
-		return fmt.Errorf("listen on port %d: %w", s.port, err)
-	}
-
-	go func() {
-		<-ctx.Done()
-		shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		s.srv.Shutdown(shutCtx) //nolint
-	}()
-
-	log.Printf("Studio running at http://localhost:%d\n", s.port)
-	if err := s.srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-		return err
-	}
-	return nil
+	return mux, nil
 }
 
 // URL returns the local URL for the Studio server.
