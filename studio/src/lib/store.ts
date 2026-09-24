@@ -1,5 +1,6 @@
 import { signal, computed } from '@preact/signals'
-import type { Connection, Schema, NucleusFeatures, Tab, PendingChange } from './types'
+import type { Connection, Schema, NucleusFeatures, Tab, PendingChange, CommitOperation, CommitResponse, PreviewResponse, OutcomeResponse } from './types'
+import { api, ApiError } from './api'
 
 // --- Connection state ---
 
@@ -106,6 +107,150 @@ export interface EditingBinding {
 /** True while the captured binding still matches the active connection. */
 export function bindingActive(binding: EditingBinding): boolean {
   return activeConnection.value?.id === binding.connectionId
+}
+
+// --- Staged edits and atomic commit outcomes (S02) ---
+//
+// Edits are staged locally as structured operations (never client-built
+// SQL) and committed as ONE atomic batch under a client-generated
+// operation ID. The retry contract mirrors the server's:
+//
+//   - a dropped response (network failure after the server committed) is
+//     resolved by looking up the recorded outcome with the SAME operation
+//     ID before any retry — a committed outcome completes the flow without
+//     re-sending, an unknown outcome surfaces for manual verification and
+//     NEVER auto-recommits;
+//   - a refused commit (conflict, constraint, validation) retains every
+//     staged edit locally — the draft stays reconcilable;
+//   - a later attempt always uses a fresh operation ID (the failed one is
+//     spent: same ID + different payload is an operation_conflict).
+
+export interface StagedEdit {
+  id: string
+  connectionId: string
+  operation: CommitOperation
+  label: string
+}
+
+export const stagedEdits = signal<StagedEdit[]>([])
+
+export const stagedCount = computed(() => stagedEdits.value.length)
+
+let stageSeq = 0
+
+export function stageEdit(edit: Omit<StagedEdit, 'id'>): StagedEdit {
+  const staged: StagedEdit = { ...edit, id: `stage-${Date.now()}-${stageSeq++}` }
+  stagedEdits.value = [...stagedEdits.value, staged]
+  return staged
+}
+
+export function removeStagedEdit(id: string) {
+  stagedEdits.value = stagedEdits.value.filter(e => e.id !== id)
+}
+
+export function discardLastStaged() {
+  const last = stagedEdits.value[stagedEdits.value.length - 1]
+  if (!last) return
+  removeStagedEdit(last.id)
+}
+
+export function clearStaged(connectionId?: string) {
+  stagedEdits.value = connectionId === undefined
+    ? []
+    : stagedEdits.value.filter(e => e.connectionId !== connectionId)
+}
+
+export type CommitPhase = 'idle' | 'committing' | 'committed' | 'failed'
+
+export const commitPhase = signal<CommitPhase>('idle')
+export const commitError = signal<string | null>(null)
+export const lastCommit = signal<{ operationId: string; response: CommitResponse; at: number } | null>(null)
+export const lastPreview = signal<PreviewResponse | null>(null)
+
+function newOperationId(): string {
+  return typeof crypto !== 'undefined' && 'randomUUID' in crypto
+    ? crypto.randomUUID()
+    : `op-${Date.now()}-${stageSeq++}`
+}
+
+/** Stage-then-commit flow for one connection's staged edits. */
+export async function commitStaged(connectionId: string): Promise<CommitResponse> {
+  const edits = stagedEdits.value.filter(e => e.connectionId === connectionId)
+  if (edits.length === 0) throw new Error('no staged edits for this connection')
+
+  const operationId = newOperationId()
+  const payload = {
+    connectionId,
+    operationId,
+    operations: edits.map(e => e.operation),
+  }
+  commitPhase.value = 'committing'
+  commitError.value = null
+  try {
+    const res = await api.commitOperations(payload)
+    commitPhase.value = 'committed'
+    lastCommit.value = { operationId, response: res, at: Date.now() }
+    clearStaged(connectionId)
+    return res
+  } catch (err: unknown) {
+    return await resolveFailedCommit(connectionId, operationId, err)
+  }
+}
+
+/** A commit attempt failed: either the server refused it (nothing applied —
+ *  the draft stays staged), or the response was lost mid-flight and the
+ *  recorded outcome decides. Unknown outcomes never auto-retry. */
+async function resolveFailedCommit(connectionId: string, operationId: string, err: unknown): Promise<CommitResponse> {
+  const dropped = err instanceof TypeError || (err instanceof ApiError && err.state === 'unknown')
+  if (dropped) {
+    let outcome: OutcomeResponse | null = null
+    try {
+      outcome = await api.operationOutcome(connectionId, operationId)
+    } catch {
+      outcome = null // the lookup itself failed
+    }
+    if (outcome && outcome.state === 'committed' && outcome.response) {
+      commitPhase.value = 'committed'
+      lastCommit.value = { operationId, response: outcome.response, at: Date.now() }
+      clearStaged(connectionId)
+      return outcome.response
+    }
+    if (!outcome || outcome.state === 'unknown') {
+      commitPhase.value = 'failed'
+      commitError.value = 'commit outcome unknown — verify the table state before retrying with a new operation ID'
+      throw new Error(commitError.value)
+    }
+    // failed / in_progress: fall through with the original error.
+  }
+  commitPhase.value = 'failed'
+  commitError.value = err instanceof Error ? err.message : String(err)
+  throw err
+}
+
+/** Dry-run the staged batch; nothing is applied and nothing is staged anew. */
+export async function previewStaged(connectionId: string): Promise<PreviewResponse> {
+  const edits = stagedEdits.value.filter(e => e.connectionId === connectionId)
+  if (edits.length === 0) throw new Error('no staged edits for this connection')
+  const res = await api.previewOperations({
+    connectionId,
+    operations: edits.map(e => e.operation),
+  })
+  lastPreview.value = res
+  return res
+}
+
+/** Undo the last committed batch through the server's recorded inverse. */
+export async function revertLastCommit(connectionId: string): Promise<CommitResponse> {
+  const last = lastCommit.value
+  if (!last) throw new Error('nothing to revert')
+  const res = await api.revertOperation({
+    connectionId,
+    operationId: last.operationId,
+    revertOperationId: newOperationId(),
+  })
+  lastCommit.value = null
+  commitPhase.value = 'idle'
+  return res
 }
 
 // --- Theme ---
