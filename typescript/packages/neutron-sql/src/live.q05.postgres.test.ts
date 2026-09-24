@@ -195,8 +195,8 @@ async function withSuite(driverKind: "postgres" | "pg", fn: (fx: SuiteFixture) =
       q05_moves: movesRelations,
       q05_audits: auditsRelations,
     } as RelationsMap,
-    logger: () => {
-      statements.count += 1;
+    logger: (e) => {
+      if (e.kind === "query-end") statements.count += 1;
     },
   });
   try {

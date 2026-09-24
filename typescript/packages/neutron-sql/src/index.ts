@@ -260,6 +260,8 @@ export {
   type TablesInput,
   type RelationsInput,
   type NeutronDatabase,
+  type TransactionOptions,
+  type TransactionTxScope,
   type QueryApiFor,
   type RelationalArgs,
   type OneRelationArgs,
@@ -288,8 +290,32 @@ export {
   type PgPoolClientLike,
   type PgQueryConfig,
   type PostgresJsClient,
+  type PostgresJsExecutor,
+  type PostgresJsReserved,
+  type CancelablePromise,
   type PreparedStatement,
 } from "./drivers.js";
+
+// I02: transaction control, cancellation and observability. One shared
+// runner drives BEGIN/COMMIT/ROLLBACK/savepoints on pinned connections for
+// both bundled drivers; deadlines and AbortSignals cancel at the server
+// (pg_cancel_backend side channel / postgres.js native Query.cancel);
+// CommitAmbiguityError is never auto-replayed; structured events are
+// redacted by default (params only under NEUTRON_SQL_LOG_PARAMS=1).
+export {
+  renderBeginSql,
+  hasModes,
+  runTransaction,
+  runRetriedTransaction,
+  validateRetryOptions,
+  type PinnedExecutor,
+  type QueryExecutionOptions,
+  type TransactionModes,
+  type TransactionRetryOptions,
+  type TransactionScope,
+  type TransactionHooks,
+  type Savepoint,
+} from "./transactions.js";
 
 // Q04: keyset pagination — unique tie-breakers, explicit null ordering,
 // mixed directions, versioned opaque cursors with strict validation.
@@ -305,16 +331,23 @@ export {
 
 // I01: stable driver error taxonomy. SQLSTATE survives every wrapper
 // (ServerSqlError.sqlstate / getSqlState); connection failures and missing
-// driver packages are distinct classes, never conflated.
+// driver packages are distinct classes, never conflated. I02 adds the
+// cancellation state (QueryCanceledError, SQLSTATE 57014 with the cancel
+// reason) and the unknown-commit-outcome state (CommitAmbiguityError,
+// never retried automatically).
 export {
   NeutronSqlError,
   MissingDriverError,
   ConnectionFailedError,
   ServerSqlError,
+  QueryCanceledError,
+  CommitAmbiguityError,
   classifyDriverError,
   getSqlState,
   isConnectionError,
   isMissingDriverError,
+  isFatalConnectionLoss,
+  isRetriableTransactionError,
 } from "./errors.js";
 
 // I01: engine identity (FRAMEWORK_CONTRACT.md §1) and the tri-state
@@ -333,7 +366,18 @@ export {
   type CapabilityGate,
 } from "./engine.js";
 
-export { resolveLogger, type Logger, type LoggerOption, type LogEvent } from "./logger.js";
+export {
+  resolveLogger,
+  paramsLoggingEnabled,
+  statementIdOf,
+  errorSummary,
+  type Logger,
+  type LoggerOption,
+  type LogEvent,
+  type SqlEvent,
+  type SqlEventKind,
+  type IsolationLevel,
+} from "./logger.js";
 
 export { type RQBArgs } from "./relations.js";
 

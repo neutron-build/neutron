@@ -78,8 +78,8 @@ async function withSuite(driverKind: "postgres" | "pg", fn: (fx: SuiteFixture) =
     url: url.toString(),
     driverOptions: { driver: driverKind },
     tables: { walk, exact, conc },
-    logger: () => {
-      statements.count += 1;
+    logger: (e) => {
+      if (e.kind === "query-end") statements.count += 1;
     },
   });
   try {
