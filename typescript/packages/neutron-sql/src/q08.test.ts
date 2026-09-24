@@ -12,6 +12,7 @@ import {
   sql,
   text,
   cteTable,
+  derivedTable,
   lockingClause,
   compileStatement,
   selectStatement,
@@ -104,7 +105,7 @@ test("locking: for() validates strength, options and OF targets", () => {
   );
 });
 
-test("locking: of rejects unknown aliases and derived/CTE handles", () => {
+test("locking: of rejects unknown aliases and CTE handles honestly", () => {
   const o = alias(owners, "o");
   const notJoined = alias(owners, "elsewhere");
   assert.throws(
@@ -114,22 +115,101 @@ test("locking: of rejects unknown aliases and derived/CTE handles", () => {
   const cte = cteTable("cte_src", db.select({ id: jobs.id, queue: jobs.queue }).from(jobs));
   assert.throws(
     () => db.select().from(cte).for("update", { of: cte as never }).toSQL(),
-    /cannot lock a WITH query/,
+    /of cannot name the CTE "cte_src".*SQLSTATE 0A000/,
+  );
+  const unrelated = derivedTable("d_unrelated", db.select({ id: jobs.id }).from(jobs));
+  assert.throws(
+    () => db.select().from(jobs).for("update", { of: unrelated }).toSQL(),
+    /neither this statement's from item nor joined here/,
   );
 });
 
-test("locking: unqualified locks reject outer-join nullable sides and CTEs in FROM", () => {
+test("locking: derived FROM items lock through to their base rows (PG-17 verified matrix)", () => {
+  // Two-connection live oracle (live.q08): PostgreSQL 17 propagates a row
+  // lock through plain/limited/nested/joined derived tables and through OF
+  // on a derived alias (a competing base-row lock hits 55P03). The builder
+  // must ALLOW these and render the subquery forms.
+  const plain = derivedTable("d", db.select({ id: jobs.id }).from(jobs));
+  assert.equal(
+    db.select().from(plain).for("update").toSQL().sql,
+    'select "d"."id" from (select "q08_jobs"."id" from "q08_jobs") as "d" for update',
+  );
+  // A limited derivation still locks the base rows it emits.
+  const limited = derivedTable("d_lim", db.select({ id: jobs.id }).from(jobs).limit(3));
+  assert.doesNotThrow(() => db.select().from(limited).for("update").toSQL());
+  // Derived over derived: the lock still reaches the base table.
+  const inner = derivedTable("d_in", db.select({ id: jobs.id }).from(jobs));
+  const outer = derivedTable("d_out", db.select({ id: inner.id }).from(inner));
+  assert.doesNotThrow(() => db.select().from(outer).for("update").toSQL());
+  // A derived table JOINed to a base table: both lock.
+  const joined = derivedTable("d_join", db.select({ id: jobs.id }).from(jobs));
+  assert.doesNotThrow(() =>
+    db.select({ id: jobs.id }).from(jobs).innerJoin(joined, sql`${joined.id} = ${jobs.id}`).for("update").toSQL(),
+  );
+  // OF on the derived FROM handle renders the alias (PG locks the base rows
+  // through it) and OF on a joined derived handle renders its join alias.
+  assert.equal(db.select().from(plain).for("update", { of: plain }).toSQL().sql.endsWith('for update of "d"'), true);
+  assert.equal(
+    db.select({ id: jobs.id }).from(jobs).innerJoin(joined, sql`${joined.id} = ${jobs.id}`).for("update", { of: joined }).toSQL().sql.endsWith('for update of "d_join"'),
+    true,
+  );
+});
+
+test("locking: unqualified locks reject outer-join nullable sides and CTE-reaching FROM items", () => {
   const o = alias(owners, "o");
   assert.throws(
     () => db.select({ id: jobs.id }).from(jobs).leftJoin(o, sql`${o.jobId} = ${jobs.id}`).for("update").toSQL(),
     /nullable side of an outer join/,
   );
+  // The real PG-17 hazard (two-connection oracle): a lock over a WITH query
+  // locks NOTHING — silently, in every form (inline/materialized/multi-ref).
   const cte = cteTable("cte_src", db.select({ id: jobs.id }).from(jobs));
   assert.throws(
     () => db.select().from(cte).for("update").toSQL(),
-    /silently skip the CTE/,
+    /an unqualified lock over "cte_src" would silently lock nothing.*WITH query/,
   );
-  // Qualifying with of keeps both valid (locking the non-nullable side).
+  // Same hazard one level down: a derived table whose only FROM item is a
+  // CTE — PG silently locks nothing through the CTE scan (fully silent).
+  const cteInner = cteTable("c_in", db.select({ id: jobs.id }).from(jobs));
+  const derivedOverCte = derivedTable("d_over", db.select({ id: cteInner.id }).from(cteInner));
+  assert.throws(
+    () => db.select().from(derivedOverCte).for("update").toSQL(),
+    /an unqualified lock over "d_over" would silently lock nothing.*WITH query/,
+  );
+  assert.throws(
+    () => db.select().from(derivedOverCte).for("update", { of: derivedOverCte }).toSQL(),
+    /of "d_over" would silently lock nothing/,
+  );
+  // MIXED derivation (base table + CTE on the join side): PG locks the base
+  // rows through it and silently skips only the WITH-sourced rows — partial
+  // silence (two-connection verified: base row 55P03, CTE-source row free,
+  // inline and materialized, unqualified and OF forms). Still rejected: part
+  // of what the lock promises is silently dropped.
+  const cteJoinSide = cteTable("c_side", db.select({ jobId: owners.jobId }).from(owners));
+  const derivedJoinCte = derivedTable(
+    "d_jc",
+    db.select({ id: jobs.id }).from(jobs).innerJoin(cteJoinSide, sql`${cteJoinSide.jobId} = ${jobs.id}`),
+  );
+  assert.throws(
+    () => db.select().from(derivedJoinCte).for("update").toSQL(),
+    /an unqualified lock over "d_jc" would be partially silent.*base tables.*WITH query.*"d_jc"/,
+  );
+  assert.throws(
+    () => db.select().from(derivedJoinCte).for("update", { of: derivedJoinCte }).toSQL(),
+    /of "d_jc" would be partially silent.*base tables.*WITH query/,
+  );
+  // The same mix at the outer level (a base table with a CTE joined to it):
+  // base rows lock, the WITH-sourced rows are silently skipped.
+  assert.throws(
+    () => db.select({ id: jobs.id }).from(jobs).innerJoin(cteJoinSide, sql`${cteJoinSide.jobId} = ${jobs.id}`).for("update").toSQL(),
+    /an unqualified lock over "q08_jobs", "c_side" would be partially silent.*"c_side"/,
+  );
+  // A derivation over a set operation is NOT silent-classified: PostgreSQL
+  // errors on the lock itself (0A000), so the statement goes through and
+  // the server rejects it honestly (covered live).
+  const unionSrc = db.select({ id: jobs.id }).from(jobs).union(db.select({ id: owners.jobId }).from(owners));
+  assert.doesNotThrow(() => db.select().from(derivedTable("d_u", unionSrc)).for("update").toSQL());
+  // Qualifying with of keeps the outer-join case valid (non-nullable side).
   assert.doesNotThrow(() =>
     db.select({ id: jobs.id }).from(jobs).leftJoin(o, sql`${o.jobId} = ${jobs.id}`).for("update", { of: jobs }).toSQL(),
   );

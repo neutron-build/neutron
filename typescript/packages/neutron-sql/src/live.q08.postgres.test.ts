@@ -11,6 +11,7 @@ import {
   count,
   createDatabase,
   cteTable,
+  derivedTable,
   desc,
   eq,
   getSqlState,
@@ -661,6 +662,165 @@ for (const driverKind of ["postgres", "pg"] as const) {
     assert.equal(rows.length, 2);
     assert.equal(ctx.statements.count, 1);
   });
+
+  test(`live q08 (${driverKind}): derived FROM locks reach base rows; CTE shapes stay the guarded silent hazard (PG-17 matrix)`, async () => {
+    const ctx = await ctxFor(driverKind);
+    if (!ctx) return;
+
+    // (a) The builder guard fails CTE-reaching shapes closed, before any
+    // statement (a CteRecord FROM item, and a derived table over a CTE).
+    ctx.statements.count = 0;
+    const cte = cteTable("q08_c_src", ctx.db.select({ id: jobs.id }).from(jobs));
+    assert.throws(() => ctx.db.select().from(cte).for("update").toSQL(), /an unqualified lock over "q08_c_src" would silently lock nothing.*WITH query/);
+    const cteIn = cteTable("q08_c_in", ctx.db.select({ id: jobs.id }).from(jobs));
+    const overCte = derivedTable("q08_d_over", ctx.db.select({ id: cteIn.id }).from(cteIn));
+    assert.throws(() => ctx.db.select().from(overCte).for("update").toSQL(), /an unqualified lock over "q08_d_over" would silently lock nothing/);
+    // Mixed derivation (base table + CTE on the join side): partially
+    // silent — also rejected, with the partial-silence fact stated.
+    const cteSide = cteTable("q08_c_side", ctx.db.select({ id: events.id }).from(events));
+    const mixed = derivedTable("q08_d_jc", ctx.db.select({ id: jobs.id }).from(jobs).innerJoin(cteSide, sql`${cteSide.id} = ${jobs.id}`));
+    assert.throws(() => ctx.db.select().from(mixed).for("update").toSQL(), /an unqualified lock over "q08_d_jc" would be partially silent.*base tables.*WITH query/);
+    assert.throws(() => ctx.db.select().from(mixed).for("update", { of: mixed }).toSQL(), /of "q08_d_jc" would be partially silent/);
+    assert.equal(ctx.statements.count, 0, "guard rejections happen before any statement");
+    // Plain derived tables compile and execute (no blanket rejection).
+    const plain = derivedTable("q08_d_plain", ctx.db.select({ id: jobs.id }).from(jobs));
+    assert.doesNotThrow(() => ctx.db.select().from(plain).for("update").toSQL());
+
+    // Two-connection oracle (hand-SQL twins, independent of the builder): a
+    // raw holder runs each shape in an open transaction; THIS driver probes
+    // the base row with FOR UPDATE NOWAIT. 55P03 means the shape's lock
+    // reached q08_jobs; success means PostgreSQL locked NOTHING (silent).
+    const A = await rawClient(ctx);
+    try {
+      const probe = async (): Promise<Array<{ id: number }>> =>
+        (await ctx.db.select({ id: jobs.id }).from(jobs).where(eq(jobs.id, 1)).for("update", { noWait: true })) as Array<{ id: number }>;
+      const holdAndProbe = async (holderSql: string, want: "55P03" | "silent"): Promise<void> => {
+        await A.query("begin");
+        try {
+          await A.query(holderSql);
+          if (want === "55P03") {
+            await assert.rejects(probe, (err: unknown) => getSqlState(err) === "55P03");
+          } else {
+            const rows = await probe();
+            assert.equal(rows.length, 1, "PostgreSQL locked nothing — the silent hazard the guard exists for");
+          }
+        } finally {
+          await A.query("rollback");
+        }
+      };
+
+      // (b) Derived variants lock the base rows (PG 17): plain, limited,
+      // doubly nested, joined, and OF on the derived alias.
+      await holdAndProbe(`select * from (select "id" from "q08_jobs" where "id" = 1) d where "id" = 1 for update`, "55P03");
+      await holdAndProbe(`select * from (select "id" from "q08_jobs" limit 3) d where "id" = 1 for update`, "55P03");
+      await holdAndProbe(`select * from (select "id" from (select "id" from "q08_jobs") i) d where "id" = 1 for update`, "55P03");
+      await holdAndProbe(`select d."id" from (select "id" from "q08_jobs") d join "q08_jobs" t on t."id" = d."id" where d."id" = 1 for update`, "55P03");
+      await holdAndProbe(`select * from (select "id" from "q08_jobs") d where "id" = 1 for update of d`, "55P03");
+
+      // (c) CTE variants lock NOTHING on PG 17 (inline, materialized,
+      // multi-reference, and a derived table stacked over the CTE) — the
+      // hazard class the builder guard rejects.
+      await holdAndProbe(`with c as (select "id" from "q08_jobs") select * from c where "id" = 1 for update`, "silent");
+      await holdAndProbe(`with c as materialized (select "id" from "q08_jobs") select * from c where "id" = 1 for update`, "silent");
+      await holdAndProbe(`with c as (select "id" from "q08_jobs") select a."id" from c a join c b on a."id" = b."id" where a."id" = 1 for update`, "silent");
+      await holdAndProbe(`with c as (select "id" from "q08_jobs") select * from (select * from c) d where "id" = 1 for update`, "silent");
+
+      // (c2) MIXED shapes (base table + CTE on the join side): PG 17 locks
+      // the base rows and silently skips only the WITH-sourced ones —
+      // partially silent, which is why the guard rejects these too. Dual
+      // probe: the base row (jobs 1) must hit 55P03 while the CTE-source
+      // row (events 1) stays free. Unqualified and OF forms, inline and
+      // materialized, CTE on the outer query's join side and under a
+      // derived alias.
+      const probeEvents = async (): Promise<Array<{ id: number }>> =>
+        (await ctx.db.select({ id: events.id }).from(events).where(eq(events.id, 1)).for("update", { noWait: true })) as Array<{ id: number }>;
+      const holdMixed = async (holderSql: string): Promise<void> => {
+        await A.query("begin");
+        try {
+          await A.query(holderSql);
+          await assert.rejects(probe, (err: unknown) => getSqlState(err) === "55P03");
+          const ev = await probeEvents();
+          assert.equal(ev.length, 1, "the WITH-sourced row is silently skipped (partially silent)");
+        } finally {
+          await A.query("rollback");
+        }
+      };
+      await holdMixed(`with c as (select "id" from "q08_events") select j."id" from "q08_jobs" j join c on c."id" = j."id" where j."id" = 1 for update`);
+      await holdMixed(`with c as materialized (select "id" from "q08_events") select j."id" from "q08_jobs" j join c on c."id" = j."id" where j."id" = 1 for update`);
+      await holdMixed(`with c as (select "id" from "q08_events") select * from (select j."id" as "id" from "q08_jobs" j join c on c."id" = j."id") d_jc where "id" = 1 for update`);
+      await holdMixed(`with c as materialized (select "id" from "q08_events") select * from (select j."id" as "id" from "q08_jobs" j join c on c."id" = j."id") d_jc where "id" = 1 for update`);
+      await holdMixed(`with c as (select "id" from "q08_events") select * from (select j."id" as "id" from "q08_jobs" j join c on c."id" = j."id") d_jc where "id" = 1 for update of d_jc`);
+      await holdMixed(`with c as materialized (select "id" from "q08_events") select * from (select j."id" as "id" from "q08_jobs" j join c on c."id" = j."id") d_jc where "id" = 1 for update of d_jc`);
+
+      // (d) Grouped/distinct/windowed/union derivations: PostgreSQL errors
+      // itself (0A000) — no silent hazard, the statement goes through.
+      for (const derivation of [
+        `select * from (select "id", count(*) from "q08_jobs" group by "id") d where "id" = 1 for update`,
+        `select * from (select distinct "id" from "q08_jobs") d where "id" = 1 for update`,
+        `select * from (select "id", row_number() over () rn from "q08_jobs") d where "id" = 1 for update`,
+        `select * from (select "id" from "q08_jobs" union select "id" from "q08_jobs") d where "id" = 1 for update`,
+        `with c as (select "id" from "q08_jobs") select * from c where "id" = 1 for update of c`,
+      ]) {
+        await assert.rejects(A.query(derivation), (err: { code?: string }) => err.code === "0A000");
+      }
+    } finally {
+      await A.end();
+    }
+
+    // (e) This driver's own compiled SQL locks through a derived FROM: the
+    // transaction holds the lock (gate); the raw probe hits 55P03 — the
+    // unqualified form and OF on the derived handle both reach the base rows.
+    let releaseHolder!: () => void;
+    const holderGate = new Promise<void>((resolve) => (releaseHolder = resolve));
+    const holderTx = ctx.db.transaction(async (tx) => {
+      const d = derivedTable("q08_d_hold", tx.select({ id: jobs.id }).from(jobs));
+      const rows = await tx.select().from(d).for("update");
+      assert.equal(rows.length, 5);
+      await holderGate;
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    const rawProbe = new pg.Client({ connectionString: ctx.dbUrl });
+    await rawProbe.connect();
+    try {
+      await assert.rejects(
+        rawProbe.query(`select "id" from "q08_jobs" where "id" = 1 for update nowait`),
+        (err: { code?: string }) => err.code === "55P03",
+      );
+    } finally {
+      await rawProbe.end();
+    }
+    releaseHolder();
+    await holderTx;
+
+    let releaseOfHolder!: () => void;
+    const ofGate = new Promise<void>((resolve) => (releaseOfHolder = resolve));
+    const ofTx = ctx.db.transaction(async (tx) => {
+      const d = derivedTable("q08_d_of", tx.select({ id: jobs.id }).from(jobs));
+      const rows = await tx.select().from(d).for("update", { of: d });
+      assert.equal(rows.length, 5);
+      await ofGate;
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    const rawProbe2 = new pg.Client({ connectionString: ctx.dbUrl });
+    await rawProbe2.connect();
+    try {
+      await assert.rejects(
+        rawProbe2.query(`select "id" from "q08_jobs" where "id" = 1 for update nowait`),
+        (err: { code?: string }) => err.code === "55P03",
+      );
+    } finally {
+      await rawProbe2.end();
+    }
+    releaseOfHolder();
+    await ofTx;
+
+    // (f) A grouped derivation goes through the builder and PostgreSQL
+    // rejects it itself, honestly (0A000 — not a silent shape).
+    const grouped = derivedTable("q08_d_grouped", ctx.db.select({ id: jobs.id }).from(jobs).groupBy(jobs.id));
+    await assert.rejects(async () => {
+      await ctx.db.select().from(grouped).for("update");
+    }, (err: unknown) => getSqlState(err) === "0A000");
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,15 +1182,20 @@ for (const driverKind of ["postgres", "pg"] as const) {
     assert.equal(committed[0].v, 11, "enclosing commit persists after streams closed");
   });
 
-  test(`live q08 (${driverKind}): a stream used after its transaction settled is rejected, not executed`, async () => {
+  test(`live q08 (${driverKind}): a stream used after its transaction settled is rejected before its buffered batch`, async () => {
     const ctx = await ctxFor(driverKind);
     if (!ctx) return;
     const tx = ctx.db.transaction(async (scope) => {
-      const stream = scope.select().from(kv).stream({ batchSize: 1 });
+      // batchSize 2 over the 5 job rows: one FETCH fills the client-side
+      // buffer with [1, 2]; row 1 is consumed and row 2 stays buffered when
+      // the callback returns (batchSize > 1 exposes the buffered window the
+      // review's probe masked).
+      const stream = scope.select().from(jobs).stream({ batchSize: 2 });
       const first = await stream.next();
       assert.equal(first.done, false);
       // Keep the stream alive past the callback: using it after settle must
-      // fail without touching the released connection.
+      // reject IMMEDIATELY — the buffered row is dropped, never served, and
+      // the released connection is never touched.
       return stream;
     });
     const stream = await tx;

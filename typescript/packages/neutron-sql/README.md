@@ -890,11 +890,18 @@ const claimed = await db.transaction(async (tx) => {
   `share`, `key share`; wait policies are wait (default), `noWait`
   (SQLSTATE 55P03 surfaces with its SQLSTATE preserved) and `skipLocked`.
   Clauses accumulate across `.for()` calls.
-- **`of` targets the from table and `alias()` handles of joined tables**
-  (unqualified names, as PostgreSQL requires). An unqualified lock is
-  rejected where PostgreSQL would error or silently lock nothing: the
-  nullable side of an outer join, or a CTE in FROM (PostgreSQL locks no rows
-  of a `WITH` query — name the base tables instead).
+- **`of` targets the from table, `alias()` handles of joined tables, and
+  derived-table handles whose derivation contains no CTE** (PostgreSQL
+  locks the underlying base rows through a derived alias; a handle whose
+  derivation reaches a CTE is rejected). An unqualified lock is rejected
+  where PostgreSQL would silently drop rows: the nullable side of an outer
+  join (PostgreSQL errors), or a CTE in FROM — directly or wrapped in
+  derived tables (PostgreSQL accepts the statement and locks none of the
+  `WITH` query's rows; base tables in the same statement still lock, so a
+  mixed shape is partially silent — lock the base rows inside the source
+  instead). Plain derived tables are allowed through: PostgreSQL propagates
+  the lock to their base rows and errors itself (0A000) on grouped/distinct/
+  windowed/union derivations.
 - Locking is rejected at compile time on DISTINCT/GROUP BY/HAVING/aggregate/
   window/set-operation statements — the same shapes PostgreSQL itself
   refuses (the rows are not base-table rows).
@@ -949,8 +956,8 @@ for await (const batch of db.select().from(events).streamBatches({ batchSize: 10
   transaction the stream owns one: it pins a connection, runs
   BEGIN/DECLARE/FETCH…/CLOSE and COMMITs when the cursor is exhausted.
   **Early exit (break, `return()`, `throw()`, or abort) rolls back and
-  returns the connection to the pool promptly** (the live suite asserts
-  pool counts; see Status for its execution state). Inside `db.transaction` the stream runs on the transaction's
+   returns the connection to the pool promptly** (the live suite asserts
+   pool counts). Inside `db.transaction` the stream runs on the transaction's
   pinned connection and never issues BEGIN/COMMIT/ROLLBACK: the enclosing
   callback owns the transaction, early exit just CLOSEs the cursor, and
   using a stream after its transaction settled is rejected without touching
@@ -1203,18 +1210,19 @@ general-purpose use.
   capability requirements, and schema export v2 is deterministic and
   cross-language-pinned (Go + reference consumer agree byte-for-byte);
   importing the root loads no driver module until a connection is requested.
-- Implemented, **live suites written but not yet executed** (Q08, pending
-  the integration gate): window functions (ranking, value and distribution
-  functions with PostgreSQL result typing, rows/range/groups frames with
-  exclude variants, aggregates as windows, placement enforced at the compile
-  choke point), row locking (four strengths, nowait, skip locked, `of`
-  targeting the from table and join aliases), explicit batch plans (typed
-  result tuples, one transaction on one connection, REPEATABLE READ default,
-  opt-in retry, enclosing-scope participation, pure `explain()`), and bounded
-  streaming over server-side cursors (capped client buffering, rollback and
-  connection release on early exit, per-round-trip cancellation). SQL
-  compilation, validation and the stream/batch statement protocol are
-  unit-tested; database behavior on both drivers is not yet evidenced.
+- Implemented and live-tested on PostgreSQL 17, both drivers: window
+  functions (ranking, value and distribution functions with PostgreSQL
+  result typing, rows/range/groups frames with exclude variants, aggregates
+  as windows, placement enforced at the compile choke point), row locking
+  (four strengths, nowait, skip locked, `of` targeting the from table, join
+  aliases and derived-table handles, unqualified locks rejected over
+  outer-join nullable sides and CTE-reaching FROM items), explicit batch
+  plans (typed result tuples, one transaction on one connection, REPEATABLE
+  READ default, opt-in retry, enclosing-scope participation, pure
+  `explain()`), and bounded streaming over server-side cursors (capped
+  client buffering, rollback and connection release on early exit,
+  per-round-trip cancellation, post-settle use rejected without touching
+  the released connection).
 - `update`/`delete` require `.where()` (foot-gun guard).
 - Deferred with explicit rejection, not implemented: parent-correlated
   per-child filters (filter the parent instead) and subqueries inside
