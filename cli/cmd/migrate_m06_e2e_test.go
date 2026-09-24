@@ -134,8 +134,10 @@ func TestMigrateJournaledE2E(t *testing.T) {
 			t.Fatal("cannot locate test source path")
 		}
 		src := filepath.Join(filepath.Dir(thisFile), "..", "examples-src")
+		// "src/." copies the directory's contents on both BSD and GNU cp;
+		// "src/" nests the directory under dst on GNU (Linux CI).
 		dst := t.TempDir()
-		if out, err := exec.Command("cp", "-R", src+string(os.PathSeparator), dst).CombinedOutput(); err != nil {
+		if out, err := exec.Command("cp", "-R", src+string(os.PathSeparator)+".", dst).CombinedOutput(); err != nil {
 			t.Fatalf("copy examples-src: %v\n%s", err, out)
 		}
 		return filepath.Join(dst, "migrations"), filepath.Join(dst, "seeds")
