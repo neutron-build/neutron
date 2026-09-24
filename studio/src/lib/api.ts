@@ -230,6 +230,18 @@ export const api = {
     request<TableMeta>('GET',
       `/table/v2/meta?connectionId=${connectionId}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`),
 
+  // X01: table search (vector similarity + full-text), read-only and
+  // parameter-bound server-side.
+  tableSearch: (input: {
+    connectionId: string; schema: string; table: string
+    kind: 'vector' | 'fts'
+    column: string
+    query: string
+    operator?: 'l2' | 'cosine' | 'inner-product' | 'l1'
+    config?: string
+    limit?: number
+  }) => mutationRequest<QueryResult>('POST', '/table/v2/search', input),
+
   tableInsert: (input: {
     connectionId: string; schema: string; table: string
     /** Relation binding from the table read — required by the server. */

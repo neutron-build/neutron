@@ -52,6 +52,53 @@ type MigrationStatus struct {
 
 // HasMigrationHistory reports whether the tracking table exists and holds at
 // least one applied migration (guards `db push` against clobbering managed DBs).
+// ExtensionStatus reports whether a PostgreSQL EXTENSION is installed in
+// the connected database and whether the server could install it (X01:
+// extension detection is a catalog fact, separate from engine capabilities
+// and from Nucleus model capabilities). Errors only when the catalogs
+// themselves are unusable; an absent extension is a status, not an error.
+type ExtensionStatus struct {
+	Name      string
+	Installed bool
+	Version   string // installed version when Installed
+	// Available reports pg_available_extensions: the server carries the
+	// extension package and "create extension" would work.
+	Available bool
+	DefaultVersion string
+}
+
+func (c *Client) Extension(ctx context.Context, name string) (*ExtensionStatus, error) {
+	st := &ExtensionStatus{Name: name}
+	err := c.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = $1)`, name,
+	).Scan(&st.Installed)
+	if err != nil {
+		return nil, fmt.Errorf("read pg_extension: %w", err)
+	}
+	if st.Installed {
+		if err := c.pool.QueryRow(ctx,
+			`SELECT extversion FROM pg_catalog.pg_extension WHERE extname = $1`, name,
+		).Scan(&st.Version); err != nil {
+			return nil, fmt.Errorf("read extension version: %w", err)
+		}
+		return st, nil
+	}
+	err = c.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_available_extensions WHERE name = $1)`, name,
+	).Scan(&st.Available)
+	if err != nil {
+		return nil, fmt.Errorf("read pg_available_extensions: %w", err)
+	}
+	if st.Available {
+		if err := c.pool.QueryRow(ctx,
+			`SELECT default_version FROM pg_catalog.pg_available_extensions WHERE name = $1`, name,
+		).Scan(&st.DefaultVersion); err != nil {
+			return nil, fmt.Errorf("read extension default_version: %w", err)
+		}
+	}
+	return st, nil
+}
+
 func (c *Client) HasMigrationHistory(ctx context.Context) (bool, error) {
 	var exists bool
 	err := c.pool.QueryRow(ctx, `SELECT EXISTS (

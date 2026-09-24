@@ -1,0 +1,67 @@
+{
+  "version": 2,
+  "dialect": "postgresql",
+  "capabilities": [],
+  "schemas": [
+    {
+      "name": "public"
+    }
+  ],
+  "enums": [],
+  "tables": [
+    {
+      "identity": {
+        "schema": "public",
+        "name": "bad"
+      },
+      "managed": true,
+      "columns": [
+        {
+          "name": "id",
+          "type": {
+            "name": "int4",
+            "codec": "number"
+          },
+          "notNull": true
+        },
+        {
+          "name": "memo",
+          "type": {
+            "name": "text",
+            "codec": "string"
+          },
+          "notNull": false
+        }
+      ],
+      "constraints": [
+        {
+          "name": "bad_pkey",
+          "type": "primary-key",
+          "columns": [
+            "id"
+          ]
+        }
+      ],
+      "indexes": [
+        {
+          "identity": {
+            "schema": "public",
+            "name": "bad_memo_btree"
+          },
+          "unique": false,
+          "method": "btree",
+          "key": [
+            {
+              "column": "memo"
+            }
+          ],
+          "with": {
+            "fillfactor": "90"
+          }
+        }
+      ]
+    }
+  ],
+  "views": [],
+  "opaque": []
+}

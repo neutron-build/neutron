@@ -13,6 +13,7 @@ import type {
   QueryResult, SqlColumn, FKDetail, TableMeta, KeyCell, MatchCell,
   CellEdit, TableFilter, TableSort, TableMetaColumn, CommitOperation,
 } from '../../lib/types'
+import { TableSearchPanel } from './TableSearchPanel'
 import s from './SQLBrowser.module.css'
 
 interface SQLBrowserProps {
@@ -557,6 +558,9 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
         </div>
       )}
 
+      {meta.value && meta.value.exists && (
+        <TableSearchPanel schema={schemaName} table={table} meta={meta.value} />
+      )}
       <div class={s.grid}>
         {loading.value && <div class={s.loading}>Loading…</div>}
         {!loading.value && error.value && <div class={s.error}>{error.value}</div>}

@@ -63,6 +63,7 @@ import {
   qual,
   selectStatement,
   statementReferencesName,
+  collectRequirements,
   subquery as subqueryNode,
   updateStatement,
   validAlias,
@@ -1111,6 +1112,10 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
     // same source (Q02 review MINOR-2): unregistered or shadowed same-name
     // references fail closed here instead of silently binding.
     assertCteRefsResolve(stmt);
+    // X01: expressions spliced by optional capability modules (/pgvector,
+    // /fts) carry their requirements on the nodes (where/having/group/
+    // order/projections/joins/CTEs); collect them from the final statement.
+    collectRequirements(stmt, caps);
     return { stmt, decoders, capabilities: [...caps], columns };
   }
 
@@ -1890,10 +1895,12 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
       returning: returningPlan.nodes,
     });
     assertCteRefsResolve(stmt);
+    const caps = new Set<StatementCapability>(returningPlan.capabilities);
+    collectRequirements(stmt, caps);
     return {
       ...compileStatement(stmt),
       decoders: returningPlan.decoders,
-      capabilities: returningPlan.capabilities,
+      capabilities: [...caps],
     };
   }
 
@@ -1971,10 +1978,12 @@ export class DeleteBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
       returning: returningPlan.nodes,
     });
     assertCteRefsResolve(stmt);
+    const caps = new Set<StatementCapability>(returningPlan.capabilities);
+    collectRequirements(stmt, caps);
     return {
       ...compileStatement(stmt),
       decoders: returningPlan.decoders,
-      capabilities: returningPlan.capabilities,
+      capabilities: [...caps],
     };
   }
 

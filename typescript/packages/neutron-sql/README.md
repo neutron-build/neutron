@@ -337,11 +337,84 @@ requirements; an `unknown` requirement fails closed with
 all-enabled. Detection runs through whichever driver you brought; a plain
 Postgres connection gains no Nucleus/model dependency.
 
-## Nucleus-only column types
+## Vectors and search (X01)
 
-`vector("embedding", 1536)` is accepted in the same schema file. On vanilla Postgres the
-migration generator skips it with a `-- NUCLEUS-ONLY` comment and a warning instead of
-emitting DDL that would fail.
+Vector columns and full-text search live in OPTIONAL capability modules —
+the SQL-only root never loads them; importing the entry point is the
+explicit opt-in.
+
+### pgvector (`@neutron-build/sql/pgvector`)
+
+```ts
+import { pgVector, l2Distance, cosineDistance, pgvectorExtension } from "@neutron-build/sql/pgvector";
+
+const docs = pgTable("docs", {
+  id: serial("id").primaryKey(),
+  body: text("body").notNull(),
+  embedding: pgVector("embedding", 3).notNull(),
+}, (t) => [
+  // Index metadata: method, operator class and access-method parameters.
+  index("docs_emb_hnsw").using("hnsw").on(t.embedding)
+    .opclass(t.embedding, "vector_cosine_ops")
+    .with({ m: 16, ef_construction: 64 }),
+]);
+
+const nearest = await db
+  .select({ id: docs.id, d: l2Distance(docs.embedding, [1, 0, 0]) })
+  .from(docs)
+  .orderBy(asc(l2Distance(docs.embedding, [1, 0, 0])))
+  .limit(5);
+```
+
+- The declared dimension is a contract, validated at definition, at write
+  time and on every distance bind — a wrong-dimension vector is a precise
+  client-side error before any SQL runs, and pgvector enforces the same
+  contract server-side.
+- Distance/similarity operators (`<->` L2, `<#>` inner product, `<=>`
+  cosine, `<+>` L1) are typed expressions carrying capability requirements:
+  engines without the extension — including Nucleus, whose vector model has
+  no proven SQL-column semantics — reject the statement BEFORE any SQL
+  runs. Unknown fails closed (I01).
+- `pgvectorExtension(driver)` reports the extension state per database
+  (installed with version / available / absent) from `pg_extension` and
+  `pg_available_extensions` — PostgreSQL extension detection, separate from
+  engine capabilities. Migrations that need pgvector fail loudly when the
+  extension is missing; they never skip a queried column.
+- The root `vector()` export remains as a deprecated alias.
+
+### Full-text search (`@neutron-build/sql/fts`)
+
+Core PostgreSQL (no extension): `tsvector` columns, `to_tsvector`,
+`websearch_to_tsquery` / `plainto` / `phraseto` / `to_tsquery`, the `@@`
+match predicate and `tsRank` / `tsRankCd` ranking — exact server semantics,
+configurations bound as `regconfig` parameters.
+
+```ts
+import { tsvector, toTsvector, websearchToTsquery, tsRank, matches } from "@neutron-build/sql/fts";
+
+const posts = pgTable("posts", {
+  id: serial("id").primaryKey(),
+  body: text("body").notNull(),
+  keywords: tsvector("keywords"),
+}, (t) => [index("posts_kw_gin").using("gin").on(t.keywords)]);
+
+const ranked = await db
+  .select({ id: posts.id, rank: tsRank(toTsvector("english", posts.body), websearchToTsquery("english", "search")) })
+  .from(posts)
+  .where(matches(toTsvector("english", posts.body), websearchToTsquery("english", "search or ranking")))
+  .orderBy(desc(sql`${tsRank(toTsvector("english", posts.body), websearchToTsquery("english", "search"))}`))
+  .limit(10);
+```
+
+Hybrid search composes the two: order by `ts_rank(...) desc, embedding <=> $1`
+— text relevance first, vector distance as the tie-breaker, one statement.
+
+### Vector columns in the v1 workflow (breaking, X01)
+
+The legacy v1 skip behavior (`-- NUCLEUS-ONLY (skipped on Postgres)`) is
+withdrawn: a skipped column is later queried but nonexistent. v1 documents
+with vector columns now fail with a pointer to schema document v2 (whose
+`capabilities: ["pgvector"]` is detected per database at apply time).
 
 ## Property mapping, NULL and required keys
 

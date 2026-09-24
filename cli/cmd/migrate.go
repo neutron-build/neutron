@@ -341,6 +341,9 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 	if err := refuseNontransactionalDataChanges(pendings); err != nil {
 		return err
 	}
+	if err := verifyExtensionCapabilities(ctx, client, pendings); err != nil {
+		return err
+	}
 
 	var count int
 	for _, p := range pendings {

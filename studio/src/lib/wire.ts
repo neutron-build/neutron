@@ -7,7 +7,7 @@
 // studio, landed with the typed row-identity protocol); plain values pass
 // through unchanged, so connections that send untagged rows keep working.
 
-export type WireTag = 'int8' | 'numeric' | 'date' | 'timestamp' | 'timestamptz' | 'bytea'
+export type WireTag = 'int8' | 'numeric' | 'date' | 'timestamp' | 'timestamptz' | 'bytea' | 'vector' | 'tsvector'
 
 export interface TaggedCell {
   t: WireTag
@@ -21,7 +21,7 @@ export class WireDecodeError extends Error {
   }
 }
 
-const TAGS: readonly WireTag[] = ['int8', 'numeric', 'date', 'timestamp', 'timestamptz', 'bytea']
+const TAGS: readonly WireTag[] = ['int8', 'numeric', 'date', 'timestamp', 'timestamptz', 'bytea', 'vector', 'tsvector']
 
 export function isTaggedCell(value: unknown): value is TaggedCell {
   if (typeof value !== 'object' || value === null) return false

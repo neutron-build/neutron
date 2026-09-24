@@ -1,0 +1,28 @@
+{
+  "version": 2,
+  "dialect": "postgresql",
+  "capabilities": [],
+  "schemas": [{ "name": "public" }],
+  "enums": [],
+  "tables": [
+    {
+      "identity": { "schema": "public", "name": "bad" },
+      "managed": true,
+      "columns": [
+        { "name": "id", "type": { "name": "int4", "codec": "number" }, "notNull": true },
+        { "name": "memo", "type": { "name": "text", "codec": "string" }, "notNull": false }
+      ],
+      "constraints": [{ "name": "bad_pkey", "type": "primary-key", "columns": ["id"] }],
+      "indexes": [
+        {
+          "identity": { "schema": "public", "name": "bad_memo_lower" },
+          "unique": false,
+          "method": "btree",
+          "key": [{ "expression": "lower(memo)", "opclass": "text_ops" }]
+        }
+      ]
+    }
+  ],
+  "views": [],
+  "opaque": []
+}

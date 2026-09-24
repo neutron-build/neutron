@@ -450,12 +450,13 @@ func TestQ07UnrepresentableIndexesAndConstraints(t *testing.T) {
 	h.exec(`CREATE SCHEMA app`)
 	h.exec(`CREATE TYPE app.mood AS ENUM ('sad', 'ok', 'glad')`)
 	h.exec(`CREATE TABLE app.tenants (id int4 PRIMARY KEY, name varchar(120), tone app.mood DEFAULT 'ok', score int4, memo text)`)
-	// NULLS NOT DISTINCT unique, a collated key and a non-default opclass:
-	// all unrepresentable — the table must inventory as opaque, with the
-	// table surviving untouched.
+	// NULLS NOT DISTINCT unique and a collated key: unrepresentable — the
+	// table must inventory as opaque, with the table surviving untouched.
+	// (A non-default operator class became REPRESENTABLE in X01 — it is
+	// captured on the key part — so it no longer blocks the table; that
+	// case moved to TestX01OpclassIntrospection.)
 	h.exec(`ALTER TABLE app.tenants ADD CONSTRAINT nnd UNIQUE NULLS NOT DISTINCT (name)`)
 	h.exec(`CREATE INDEX collated ON app.tenants (memo COLLATE "C")`)
-	h.exec(`CREATE INDEX opclassed ON app.tenants (memo text_pattern_ops)`)
 
 	actual, err := h.client.IntrospectV2(context.Background())
 	if err != nil {
@@ -472,7 +473,7 @@ func TestQ07UnrepresentableIndexesAndConstraints(t *testing.T) {
 	if op == nil {
 		t.Fatal("the table must be inventoried as unsupported-table")
 	}
-	for _, want := range []string{"NULLS NOT DISTINCT", "COLLATE", "operator class"} {
+	for _, want := range []string{"NULLS NOT DISTINCT", "COLLATE"} {
 		if !strings.Contains(op.Reason, want) {
 			t.Fatalf("opaque reason must mention %q, got: %s", want, op.Reason)
 		}
@@ -693,8 +694,8 @@ func TestQ07IndexMethodApplicability(t *testing.T) {
 			if !want {
 				if err == nil {
 					t.Errorf("%s over %s: expected [invalid-index] refusal, accepted instead", method, tc.label)
-				} else if !strings.Contains(err.Error(), "[invalid-index]") || !strings.Contains(err.Error(), "operator-class slot") {
-					t.Errorf("%s over %s: refusal must name the missing default operator class and the absent contract slot, got %v", method, tc.label, err)
+				} else if !strings.Contains(err.Error(), "[invalid-index]") || !strings.Contains(err.Error(), "no default operator class") {
+					t.Errorf("%s over %s: refusal must name the missing default operator class (and the X01 opclass escape), got %v", method, tc.label, err)
 				}
 			}
 		}

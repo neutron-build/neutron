@@ -25,6 +25,7 @@ export type ColumnDataType =
   | "uuid"
   | "bytea"
   | "vector"
+  | "tsvector"
   | "enum";
 
 /** Default read type per SQL type (the master codec table). int8 never passes
@@ -37,7 +38,7 @@ export type JsTypeOf<D extends ColumnDataType> =
     ? number
     : D extends "bigint"
       ? bigint
-      : D extends "numeric" | "text" | "varchar" | "uuid" | "timestamp" | "timestamptz" | "date" | "enum"
+      : D extends "numeric" | "text" | "varchar" | "uuid" | "timestamp" | "timestamptz" | "date" | "enum" | "tsvector"
         ? string
         : D extends "boolean"
           ? boolean
@@ -485,15 +486,25 @@ export type InferInsertModelOf<Cols extends Record<string, AnyColumnBuilder>> = 
 >;
 
 /** One index key part: a column reference or an SQL expression, with
- *  optional per-key ordering (Q07b). Raw until export renders expressions. */
+ *  optional per-key ordering (Q07b) and an optional operator class (X01 —
+ *  required by the pgvector access methods and legal on gist/spgist too).
+ *  Raw until export renders expressions. */
 export interface IndexKeyPartDef {
   readonly column?: string;
   readonly expression?: SchemaExpression;
   readonly order?: "asc" | "desc";
   readonly nulls?: "first" | "last";
+  readonly opclass?: string;
 }
 
-export type IndexMethod = "btree" | "hash" | "gin" | "gist" | "spgist" | "brin";
+/** Index access-method parameters (X01): `with (m = 16, ef_construction = 64)`
+ *  on HNSW, `with (lists = 100)` on IVFFlat. Keys are validated
+ *  identifiers; values are integers or strings. */
+export interface IndexWithParams {
+  readonly [param: string]: number | string;
+}
+
+export type IndexMethod = "btree" | "hash" | "gin" | "gist" | "spgist" | "brin" | "hnsw" | "ivfflat";
 
 export class TableIndex {
   readonly columns: string[] = [];
@@ -501,6 +512,7 @@ export class TableIndex {
   methodValue: IndexMethod = "btree";
   whereExpr?: SchemaExpression;
   readonly includeCols: string[] = [];
+  withParams?: IndexWithParams;
 
   constructor(
     readonly indexName: string,
@@ -516,6 +528,42 @@ export class TableIndex {
   /** Access method (Q07b). */
   using(method: IndexMethod): TableIndex {
     this.methodValue = method;
+    return this;
+  }
+
+  /** Access-method parameters (X01): `.with({ m: 16, ef_construction: 64 })`
+   *  renders `with (m = 16, ef_construction = 64)`. Integer and string
+   *  values only; keys must be plain identifiers. */
+  with(params: IndexWithParams): TableIndex {
+    if (this.withParams !== undefined) throw new Error(`index "${this.indexName}": .with() called twice`);
+    for (const [k, v] of Object.entries(params)) {
+      if (!/^[a-z_][a-z0-9_]*$/.test(k)) {
+        throw new Error(`index "${this.indexName}": with-parameter names must be plain lowercase identifiers (got "${k}")`);
+      }
+      if (typeof v !== "number" && typeof v !== "string") {
+        throw new Error(`index "${this.indexName}": with-parameter "${k}" must be a number or string (got ${typeof v})`);
+      }
+    }
+    this.withParams = { ...params };
+    return this;
+  }
+
+  /** Operator class for one column key part (X01): `.opclass(embedding,
+   *  "vector_cosine_ops")` renders `embedding vector_cosine_ops`. The
+   *  operator class is carried, never resolved — a class the backend does
+   *  not have fails at DDL time with the server's error. */
+  opclass(col: { columnName: string }, name: string): TableIndex {
+    if (!/^[a-z_][a-z0-9_]*$/.test(name)) {
+      throw new Error(`index "${this.indexName}": operator class names must be plain lowercase identifiers (got "${name}")`);
+    }
+    const part = this.keyParts.find((p) => p.column === col.columnName);
+    if (part === undefined) {
+      throw new Error(`index "${this.indexName}": .opclass() names column "${col.columnName}" which is not a key part — call .on() with it first`);
+    }
+    if (part.expression !== undefined) {
+      throw new Error(`index "${this.indexName}": operator classes attach to column key parts only`);
+    }
+    (part as { opclass?: string }).opclass = name;
     return this;
   }
 
@@ -1293,12 +1341,30 @@ export function bytea(name: string): ColumnBuilder<"bytea", false, false> {
   return new ColumnBuilder(name, "bytea");
 }
 /**
- * Nucleus vector column (experimental). On vanilla Postgres the migration
- * generator skips it with a warning and a documented comment instead of
- * emitting failing DDL.
+ * Vector column (pgvector). DEPRECATED root alias kept for compatibility —
+ * the canonical factory is `pgVector` in the optional `@neutron-build/sql/pgvector`
+ * module, which also carries the distance/similarity expressions and the
+ * extension gate. On PostgreSQL the pgvector extension must be installed
+ * (`create extension vector`); migrations on backends without it fail, they
+ * never skip the column. On Nucleus engines vector support is unproven and
+ * fails closed per the I01 capability contract.
+ * @deprecated Use `pgVector` from `@neutron-build/sql/pgvector`.
  */
 export function vector(name: string, dimensions: number): ColumnBuilder<"vector", false, false> {
   const c = new ColumnBuilder<"vector", false, false>(name, "vector");
+  if (!Number.isInteger(dimensions) || dimensions < 1 || dimensions > 16000) {
+    throw new Error(`column "${name}": vector dimensions must be an integer between 1 and 16000 (pgvector's type limit), got ${dimensions}`);
+  }
   c.vectorDimensions = dimensions;
   return c;
+}
+/**
+ * tsvector column (full-text search). DEPRECATED root alias — the canonical
+ * factory and the query/ranking expressions live in the optional
+ * `@neutron-build/sql/fts` module. Reads return the exact tsvector text form
+ * (`'cat':3 'rat':5A`); writes take PostgreSQL tsvector literal text.
+ * @deprecated Use `tsvector` from `@neutron-build/sql/fts`.
+ */
+export function tsvector(name: string): ColumnBuilder<"tsvector", false, false> {
+  return new ColumnBuilder<"tsvector", false, false>(name, "tsvector");
 }

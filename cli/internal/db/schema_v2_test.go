@@ -228,8 +228,8 @@ func TestV2ContractV1Upgrade(t *testing.T) {
 		if err := dec.Decode(&s); err != nil {
 			t.Fatalf("%s: parse v1: %v", fx.Name, err)
 		}
-		if err := ValidateSchema(&s); err != nil {
-			t.Fatalf("%s: v1 fixture must pass v1 validation: %v", fx.Name, err)
+		if err := ValidateSchemaV1ForUpgrade(&s); err != nil {
+			t.Fatalf("%s: v1 fixture must pass v1-for-upgrade validation: %v", fx.Name, err)
 		}
 		tree, err := UpgradeV1Schema(&s)
 		if fx.Code != "" {
@@ -859,7 +859,7 @@ func TestUpgradeV1VectorCapability(t *testing.T) {
 	if err := json.Unmarshal(raw, &s); err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateSchema(&s); err != nil {
+	if err := ValidateSchemaV1ForUpgrade(&s); err != nil {
 		t.Fatal(err)
 	}
 	tree, err := UpgradeV1Schema(&s)
@@ -867,8 +867,8 @@ func TestUpgradeV1VectorCapability(t *testing.T) {
 		t.Fatal(err)
 	}
 	caps := tree["capabilities"].([]any)
-	if len(caps) != 1 || caps[0] != "nucleus" {
-		t.Fatalf("vector upgrade must add the nucleus capability, got %+v", caps)
+	if len(caps) != 1 || caps[0] != "pgvector" {
+		t.Fatalf("vector upgrade must add the pgvector capability (X01 separated PostgreSQL extension detection from Nucleus), got %+v", caps)
 	}
 	treeJSON, _ := json.Marshal(tree)
 	if _, err := ParseV2Document(treeJSON); err != nil {

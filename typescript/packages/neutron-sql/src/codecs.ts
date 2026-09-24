@@ -118,7 +118,9 @@ export function canonicalTextWireNode(dataType: ColumnDataType, ref: QualifiedNo
  *  engines without them must reject these statements rather than run them.
  *  Q08 adds window functions (and the GROUPS frame mode), row-locking
  *  clauses (strengths and SKIP LOCKED separately) and server-side cursors
- *  (streaming). */
+ *  (streaming). X01 adds the pgvector family (extension-provided: no
+ *  version fact can prove them, only the extension's presence via a real
+ *  probe) and core full-text search (a PostgreSQL version fact, 8.3). */
 export type StatementCapability =
   | "jsonb-functions"
   | "window-functions"
@@ -127,7 +129,14 @@ export type StatementCapability =
   | "row-locking"
   | "row-locking-key-strength"
   | "row-locking-skip-locked"
-  | "server-cursors";
+  | "server-cursors"
+  | "vector-type"
+  | "vector-operator-l2"
+  | "vector-operator-inner-product"
+  | "vector-operator-cosine"
+  | "vector-operator-l1"
+  | "fts-functions"
+  | "fts-websearch-tsquery";
 
 function stripJsonQuotes(raw: unknown, ctx: ColumnContext): string {
   if (typeof raw !== "string" || raw.length < 2 || !raw.startsWith('"') || !raw.endsWith('"')) {
@@ -254,6 +263,19 @@ function decodeNativeValueInner(column: AnyColumnBuilder, ctx: ColumnContext, ra
         throw codecError(ctx, `unexpected bytea value of type ${typeof raw}`);
       }
       return raw;
+    case "vector":
+      // Both bundled drivers return unknown OIDs (pgvector's vector) as
+      // their text form; tolerate an already-parsed array defensively.
+      if (typeof raw === "string") return parseVectorText(raw, ctx);
+      if (Array.isArray(raw) && raw.every((e) => typeof e === "number" && Number.isFinite(e))) {
+        return [...raw] as number[];
+      }
+      throw codecError(ctx, `unexpected vector value of type ${typeof raw} (expected the '[1,2,3]' text form)`);
+    case "tsvector":
+      if (typeof raw !== "string") {
+        throw codecError(ctx, `unexpected tsvector value of type ${typeof raw} (expected the exact tsvector text form)`);
+      }
+      return raw;
     default:
       return raw;
   }
@@ -331,6 +353,20 @@ function decodeJsonLeafInner(column: AnyColumnBuilder, ctx: ColumnContext, raw: 
       }
       return byteaFromHex(raw, ctx);
     }
+    case "vector": {
+      // jsonLeaf acquires vector columns as ref::text inside
+      // jsonb_build_object, so the leaf is the '[1,2,3]' text as a JSON
+      // string (to_jsonb(vector) is a server error — no cast exists).
+      if (typeof raw !== "string") {
+        throw codecError(ctx, `unexpected vector child leaf of type ${typeof raw}`);
+      }
+      return parseVectorText(raw, ctx);
+    }
+    case "tsvector":
+      if (typeof raw !== "string") {
+        throw codecError(ctx, `unexpected tsvector child leaf of type ${typeof raw}`);
+      }
+      return raw;
     default:
       return raw;
   }
@@ -506,6 +542,14 @@ export function writeCastTarget(dataType: ColumnDataType): string | undefined {
     case "json":
     case "jsonb":
       return sqlTypeName(dataType);
+    case "vector":
+      // The bind is the pgvector literal text '[1,2,3]'; the cast parses it
+      // server-side. text -> vector has no implicit cast, so the explicit
+      // cast is required on every write site.
+      return "vector";
+    case "tsvector":
+      // Same story: text -> tsvector has no implicit assignment cast.
+      return "tsvector";
     default:
       return undefined;
   }
@@ -517,6 +561,27 @@ function sqlTypeName(dataType: ColumnDataType): string {
 
 const INT8_MIN = -9223372036854775808n;
 const INT8_MAX = 9223372036854775807n;
+
+/** pgvector's text literal form: '[1,2,3]'. Numbers render via their JS
+ *  toString, which round-trips finite doubles exactly in PostgreSQL's
+ *  float8 input. */
+export function vectorLiteralText(value: readonly number[]): string {
+  return `[${value.join(",")}]`;
+}
+
+const VECTOR_TEXT = /^\[\]$|^\[-?(?:\d+(?:\.\d*)?(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?)(?:,-?(?:\d+(?:\.\d*)?(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?))*\]$/;
+
+/** Parse pgvector's text output form ('[1,2,3]') into number[]. Strict:
+ *  anything the engine did not produce in that exact shape fails with the
+ *  offending text. */
+export function parseVectorText(text: string, ctx: ColumnContext): number[] {
+  if (!VECTOR_TEXT.test(text)) {
+    throw codecError(ctx, `unexpected vector wire form "${text.slice(0, 60)}"`);
+  }
+  const inner = text.slice(1, -1).trim();
+  if (inner === "") return [];
+  return inner.split(",").map(Number);
+}
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null) return false;
@@ -732,7 +797,18 @@ function encodeWriteValueInner(column: AnyColumnBuilder, ctx: ColumnContext, val
       if (!Array.isArray(value) || !value.every((e) => typeof e === "number" && Number.isFinite(e))) {
         throw codecError(ctx, "vector columns accept arrays of finite numbers");
       }
-      return { bind: value };
+      const dims = column.vectorDimensions;
+      if (dims !== undefined && value.length !== dims) {
+        throw codecError(ctx, `vector column expects ${dims} dimension${dims === 1 ? "" : "s"}, got ${value.length} — the declared dimension is a schema contract, not a hint`);
+      }
+      // Bind the pgvector literal text; the ::vector cast parses it.
+      return { bind: vectorLiteralText(value), cast: "vector" };
+    }
+    case "tsvector": {
+      if (typeof value !== "string" || value.length === 0) {
+        throw codecError(ctx, "tsvector columns accept non-empty strings in PostgreSQL tsvector literal form (lexemes the server validates)");
+      }
+      return { bind: value, cast: "tsvector" };
     }
   }
 }
@@ -764,7 +840,9 @@ export type CodecRead =
   | "timestamptz-text"
   | "date-text"
   | "enum"
-  | "array-text";
+  | "array-text"
+  | "vector-text"
+  | "tsvector-text";
 
 /** Plain-data codec description for one column. Compiled statements carry
  *  these with their projections (F04); the decode functions above consume
@@ -796,6 +874,14 @@ export function codecOf(column: AnyColumnBuilder): ColumnCodec {
       return { dataType: dt, read: "timestamptz-text", textWire: true, mode: (column.readMode as TemporalMode) ?? "string" };
     case "date":
       return { dataType: dt, read: "date-text", textWire: true };
+    case "vector":
+      // Native acquisition (the plain column reference): drivers hand back
+      // the '[1,2,3]' text for the unknown vector OID; decodeNativeValue
+      // parses it. Not textWire: that path strips JSON quotes, and vector
+      // has no to_jsonb form (to_jsonb(vector) is a server error).
+      return { dataType: dt, read: "vector-text", textWire: false };
+    case "tsvector":
+      return { dataType: dt, read: "tsvector-text", textWire: false };
     default:
       return { dataType: dt, read: "identity", textWire: false };
   }
@@ -858,7 +944,9 @@ export function needsFlatDecode(column: AnyColumnBuilder): boolean {
     dt === "numeric" && column.valueDecoder !== undefined ||
     dt === "timestamp" ||
     dt === "timestamptz" ||
-    dt === "date"
+    dt === "date" ||
+    dt === "vector" ||
+    dt === "tsvector"
   );
 }
 

@@ -322,3 +322,46 @@
 .stagedCount {
   color: var(--warning, #f0c674);
 }
+
+/* X01: table search panel (vector similarity + full-text). */
+.searchPanel {
+  border-top: 1px solid var(--border, #333);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.searchRow {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.searchInput {
+  flex: 1;
+  min-width: 220px;
+}
+
+.searchHint {
+  font-size: 11px;
+  color: var(--text-dim, #888);
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+
+.searchError {
+  font-size: 12px;
+  color: var(--danger, #f66);
+}
+
+.searchResults {
+  max-height: 320px;
+  overflow: auto;
+}
+
+.searchMeta {
+  font-size: 11px;
+  color: var(--text-dim, #888);
+  margin-bottom: 4px;
+}

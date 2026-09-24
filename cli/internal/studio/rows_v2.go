@@ -152,6 +152,17 @@ func keyTypeSupported(col tableColumnMeta) bool {
 // column the current role cannot UPDATE is read-only. Columns with a plain
 // or serial default remain writable (a default only applies when a value is
 // absent on insert).
+// columnWireTag extends the OID-based wire tags with type-name tags for
+// types the wire layer passes through as exact text (X01): vector cells
+// cross as their '[1,2,3]' text, tsvector as its lexeme text. The tag lets
+// the client render them read-only with copy instead of an editor.
+func columnWireTag(col tableColumnMeta) string {
+	if col.TypeName == "vector" || col.TypeName == "tsvector" {
+		return col.TypeName
+	}
+	return wireTag(col.TypeOID)
+}
+
 func editableReason(col tableColumnMeta) string {
 	switch {
 	case col.Generated != "":
@@ -160,6 +171,12 @@ func editableReason(col tableColumnMeta) string {
 		return "identity column (assigned by the database) is read-only"
 	case col.IsPK:
 		return "key column is read-only (it addresses the row)"
+	case col.TypeName == "vector":
+		// X01: vectors are not row-editable values — read-only render with
+		// copy; similarity search runs through the table search endpoint.
+		return "vector columns are not row-editable values (read-only render; use the table's vector search or the SQL editor)"
+	case col.TypeName == "tsvector":
+		return "tsvector columns are read-only in the editor (exact text render; their lexemes are server-normalized)"
 	case !col.CanUpdate:
 		return "the connected role has no UPDATE privilege on this column"
 	}
@@ -177,6 +194,10 @@ func insertableReason(col tableColumnMeta) string {
 		return "identity column (assigned by the database) cannot be inserted — omit it to use its default"
 	case col.autoAssigned():
 		return "auto-assigned column (serial default) cannot be inserted — omit it to use its default"
+	case col.TypeName == "vector":
+		return "vector columns are not row-editable values (read-only render; use the table's vector search or the SQL editor)"
+	case col.TypeName == "tsvector":
+		return "tsvector columns are read-only in the editor (exact text render; their lexemes are server-normalized)"
 	case !col.CanInsert:
 		return "the connected role has no INSERT privilege on this column"
 	}
@@ -777,7 +798,7 @@ func buildTableMetaV2(meta *tableMeta, binding string, versioned bool, schemaNam
 		resp.Columns = append(resp.Columns, metaColumnV2{
 			Name:           col.Name,
 			Type:           col.TypeName,
-			Tag:            wireTag(col.TypeOID),
+			Tag:            columnWireTag(col),
 			Nullable:       !col.NotNull,
 			IsKey:          col.IsPK,
 			Generated:      col.Generated != "",

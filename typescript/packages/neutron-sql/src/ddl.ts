@@ -31,9 +31,14 @@ function assertLegacySurface(table: AnyPgTable, who: string): void {
     );
   }
   for (const idx of getTableIndexes(table)) {
-    if (idx.keyParts.some((p) => p.expression !== undefined || p.order !== undefined || p.nulls !== undefined) || idx.whereExpr !== undefined || idx.includeCols.length > 0) {
+    if (
+      idx.keyParts.some((p) => p.expression !== undefined || p.order !== undefined || p.nulls !== undefined || p.opclass !== undefined) ||
+      idx.whereExpr !== undefined ||
+      idx.includeCols.length > 0 ||
+      idx.withParams !== undefined
+    ) {
       throw new Error(
-        `${who}: index "${idx.indexName}" uses expressions, ordering options, a predicate or INCLUDE — the legacy DDL emitter cannot emit it; use schema export v2 (Q07)`,
+        `${who}: index "${idx.indexName}" uses expressions, ordering options, a predicate, INCLUDE, operator classes or access-method parameters — the legacy DDL emitter cannot emit it; use schema export v2`,
       );
     }
   }
@@ -44,6 +49,11 @@ function assertLegacySurface(table: AnyPgTable, who: string): void {
     if (col.identityKind !== undefined) throw new Error(`${at} is an identity column — the legacy DDL emitter cannot emit identity; use schema export v2 (Q07)`);
     if (col.generatedExpr !== undefined) throw new Error(`${at} is a generated column — the legacy DDL emitter cannot emit generation expressions; use schema export v2 (Q07)`);
     if (col.foreignKey?.onUpdate !== undefined) throw new Error(`${at} declares a foreign key with ON UPDATE — the legacy DDL emitter drops it; use schema export v2 (Q07)`);
+    if (col.dataType === "vector" || col.dataType === "tsvector") {
+      throw new Error(
+        `${at} is a ${col.dataType} column — the legacy DDL emitter cannot emit it (vector requires the pgvector extension and its dimension parameter; tsvector belongs to the FTS surface); use schema export v2 with the pgvector capability or the /fts module (X01)`,
+      );
+    }
   }
 }
 
@@ -94,7 +104,9 @@ export function sqlTypeOf(col: AnyColumnBuilder): string {
     case "bytea":
       return "bytea";
     case "vector":
-      return "vector";
+      throw new Error(`column "${col.columnName}": vector columns have no legacy SQL type spelling — the dimension parameter is load-bearing; use schema export v2 (X01)`);
+    case "tsvector":
+      throw new Error(`column "${col.columnName}": tsvector columns have no legacy SQL type spelling; use schema export v2 (X01)`);
   }
 }
 

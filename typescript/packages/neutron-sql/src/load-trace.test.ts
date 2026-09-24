@@ -78,6 +78,61 @@ console.log(JSON.stringify({
   assert.deepEqual(out.driverCacheEntries, [], "no pg/postgres/nucleus module may be loaded by the root import");
 });
 
+// X01: the root import must also leave the optional capability modules
+// (/pgvector, /fts) unloaded — the SQL-only root does not pull the
+// pgvector/FTS surface until a consumer imports the entry point explicitly.
+test("load-trace: SQL-only root loads no /pgvector or /fts module", () => {
+  const res = runChild(`
+const root = await import(${JSON.stringify(pathToFileURL(path.join(packageRoot, "dist", "index.js")).href)});
+const optionalModules = Object.keys(require.cache).filter(
+  (k) => k.includes("/dist/pgvector.js") || k.includes("/dist/fts.js"),
+);
+console.log(JSON.stringify({
+  imported: true,
+  vectorAlias: typeof root.vector,
+  tsvectorAlias: typeof root.tsvector,
+  optionalModulesLoaded: optionalModules,
+}));
+`);
+  assert.equal(res.status, 0, `root import must succeed:\n${res.stderr}`);
+  const out = JSON.parse(res.stdout.trim().split("\n").at(-1)!);
+  assert.equal(out.imported, true);
+  // The deprecated root aliases are plain re-exports living in schema.js —
+  // importing the root must still not load the module files themselves.
+  assert.deepEqual(out.optionalModulesLoaded, [], "the root import must not load dist/pgvector.js or dist/fts.js");
+});
+
+// X01: the optional modules import standalone, with no driver resolvable —
+// they are capability surfaces over the same lazy-driver substrate.
+test("load-trace: /pgvector and /fts import standalone without drivers", () => {
+  const res = runChild(`
+const pgvector = await import(${JSON.stringify(pathToFileURL(path.join(packageRoot, "dist", "pgvector.js")).href)});
+const fts = await import(${JSON.stringify(pathToFileURL(path.join(packageRoot, "dist", "fts.js")).href)});
+console.log(JSON.stringify({
+  pgVector: typeof pgvector.pgVector,
+  l2Distance: typeof pgvector.l2Distance,
+  cosineDistance: typeof pgvector.cosineDistance,
+  pgvectorExtension: typeof pgvector.pgvectorExtension,
+  tsvector: typeof fts.tsvector,
+  toTsvector: typeof fts.toTsvector,
+  websearchToTsquery: typeof fts.websearchToTsquery,
+  tsRank: typeof fts.tsRank,
+  matches: typeof fts.matches,
+}));
+`);
+  assert.equal(res.status, 0, `optional-module imports must succeed without drivers:\n${res.stderr}`);
+  const out = JSON.parse(res.stdout.trim().split("\n").at(-1)!);
+  assert.equal(out.pgVector, "function");
+  assert.equal(out.l2Distance, "function");
+  assert.equal(out.cosineDistance, "function");
+  assert.equal(out.pgvectorExtension, "function");
+  assert.equal(out.tsvector, "function");
+  assert.equal(out.toTsvector, "function");
+  assert.equal(out.websearchToTsquery, "function");
+  assert.equal(out.tsRank, "function");
+  assert.equal(out.matches, "function");
+});
+
 test("load-trace: the unresolvable simulation is real (positive control)", () => {
   const res = runChild(`
 try {
