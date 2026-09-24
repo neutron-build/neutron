@@ -258,9 +258,22 @@ async function compiledStatementFixtures(): Promise<void> {
   const params: readonly unknown[] = compiled.params;
   const decoders: readonly ProjectionDecoder[] = compiled.decoders;
   const capabilities: readonly StatementCapability[] = compiled.capabilities;
-  const capIsJsonb: AssertEq<StatementCapability, "jsonb-functions"> = true;
+  // Q08 widened the capability union: windows (+GROUPS/EXCLUDE frames), row
+  // locking (strengths, SKIP LOCKED) and server-side cursors joined
+  // jsonb-functions. The union stays closed — exactly these members.
+  const capIsClosed: AssertEq<
+    StatementCapability,
+    | "jsonb-functions"
+    | "window-functions"
+    | "window-frame-groups"
+    | "window-frame-exclude"
+    | "row-locking"
+    | "row-locking-key-strength"
+    | "row-locking-skip-locked"
+    | "server-cursors"
+  > = true;
   const mutated: CompiledStatement = db.update(users).set({ name: "x" }).where(eq(users.id, 1)).returning().toCompiled();
-  void [sqlText, params, decoders, capabilities, mutated, capIsJsonb];
+  void [sqlText, params, decoders, capabilities, mutated, capIsClosed];
 }
 void compiledStatementFixtures;
 
@@ -610,6 +623,17 @@ import {
   QueryCanceledError,
   isRetriableTransactionError,
   statementIdOf,
+  rowNumber,
+  lag,
+  over,
+  lockingClause,
+  type WindowFunction,
+  type WindowExpr,
+  type LockStrength,
+  type LockWaitPolicy,
+  type LockingClause,
+  type BatchPlan,
+  type StreamPlan,
   type TransactionOptions,
   type TransactionTxScope,
   type QueryExecutionOptions,
@@ -704,3 +728,68 @@ async function i02Fixtures(): Promise<void> {
   void sid;
 }
 void i02Fixtures;
+
+// --- Q08 advanced query controls through the packed declarations -----------
+
+function q08Fixtures(): void {
+  // Window functions: typed results (row_number int8 -> bigint), structural
+  // over() spec, frame bounds with EXCLUDE.
+  const rn: WindowFunction<bigint> = rowNumber();
+  const ranked: WindowExpr<bigint> = over(rn, {
+    partitionBy: [posts.userId],
+    orderBy: [desc(posts.id), asc(posts.id)],
+    frame: { mode: "rows", start: { preceding: 2 }, end: "current row", exclude: "ties" },
+  });
+  const lagged: WindowExpr<number | null> = over(lag(posts.userId), { orderBy: [asc(posts.id)] });
+  void [rn, ranked, lagged];
+
+  // Locking: strengths are a closed union, options take of/noWait/skipLocked.
+  const strength: LockStrength = "no key update";
+  const wait: LockWaitPolicy = "skip locked";
+  const clause: LockingClause = lockingClause({ strength, of: ["posts"], wait });
+  void clause;
+  // @ts-expect-error strengths are closed
+  const badStrength: LockStrength = "destroy";
+  void badStrength;
+
+  // Batch: results tuple is per-position typed (rows array, affected count).
+  async function batchTyped(): Promise<void> {
+    const db = await createDatabase({ url: "postgres://type-fixture:not-run@localhost:1/none", tables: { users, posts } });
+    const plan: BatchPlan = db
+      .batch([db.select({ id: posts.id }).from(posts), db.update(posts).set({ title: "x" }).where(sql`${posts.id} = ${1}`)])
+      .explain();
+    const count2: number = plan.statementCount;
+    void count2;
+    const [rows, affected] = await db.batch([
+      db.select({ id: posts.id }).from(posts),
+      db.update(posts).set({ title: "x" }).where(sql`${posts.id} = ${1}`),
+    ]);
+    const firstId: number = rows[0].id;
+    const n: number = affected;
+    void [firstId, n];
+    // @ts-expect-error result positions are typed (select is not a count)
+    const wrong: number = rows;
+    void wrong;
+  }
+  void batchTyped;
+
+  // Streaming: AsyncIterableIterator of typed rows; plan exposes the cursor
+  // lifecycle; options bound the batch size and carry cancellation.
+  async function streamTyped(): Promise<void> {
+    const db = await createDatabase({ url: "postgres://type-fixture:not-run@localhost:1/none", tables: { users, posts } });
+    const signal: AbortSignal = { aborted: false };
+    const stream = db.select({ id: posts.id }).from(posts).stream({ batchSize: 50, signal });
+    const iter: AsyncIterableIterator<{ id: number }> = stream;
+    const plan: StreamPlan = stream.explain();
+    const strategy: "server-cursor" = plan.strategy;
+    const exit: "rollback" | "close" = plan.earlyExit;
+    void [iter, strategy, exit];
+    for await (const row of stream) {
+      const id: number = row.id;
+      void id;
+      break;
+    }
+  }
+  void streamTyped;
+}
+void q08Fixtures;
