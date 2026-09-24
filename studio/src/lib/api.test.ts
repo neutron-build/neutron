@@ -1,15 +1,17 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { api } from './api'
+import { api, ApiError, _setSessionTokenForTests } from './api'
 
 describe('api', () => {
   const mockFetch = vi.fn()
 
   beforeEach(() => {
     vi.stubGlobal('fetch', mockFetch)
+    _setSessionTokenForTests('test-session-token')
   })
 
   afterEach(() => {
     vi.restoreAllMocks()
+    _setSessionTokenForTests(null)
   })
 
   function mockOk(data: unknown) {
@@ -27,6 +29,19 @@ describe('api', () => {
     })
   }
 
+  function mockJSONError(status: number, body: unknown) {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status,
+      text: () => Promise.resolve(JSON.stringify(body)),
+    })
+  }
+
+  const sessionHeaders = {
+    'Content-Type': 'application/json',
+    'X-Studio-Session': 'test-session-token',
+  }
+
   describe('connections', () => {
     it('list: should GET /api/connections', async () => {
       const conns = [{ id: 'c1', name: 'Test', url: 'pg://test', isNucleus: false }]
@@ -41,7 +56,7 @@ describe('api', () => {
       })
     })
 
-    it('add: should POST /api/connections with body', async () => {
+    it('add: should POST /api/connections with body and session token', async () => {
       const conn = { id: 'c1', name: 'New', url: 'pg://new', isNucleus: false }
       mockOk(conn)
 
@@ -49,18 +64,18 @@ describe('api', () => {
       expect(result).toEqual(conn)
       expect(mockFetch).toHaveBeenCalledWith('/api/connections', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: sessionHeaders,
         body: JSON.stringify({ name: 'New', url: 'pg://new' }),
       })
     })
 
-    it('remove: should DELETE /api/connections/:id', async () => {
+    it('remove: should DELETE /api/connections/:id with session token', async () => {
       mockOk(undefined)
 
       await api.connections.remove('c1')
       expect(mockFetch).toHaveBeenCalledWith('/api/connections/c1', {
         method: 'DELETE',
-        headers: undefined,
+        headers: sessionHeaders,
         body: undefined,
       })
     })
@@ -221,13 +236,13 @@ describe('api', () => {
       expect(result.name).toBe('test')
     })
 
-    it('remove: should DELETE /api/saved-queries/:id', async () => {
+    it('remove: should DELETE /api/saved-queries/:id with session token', async () => {
       mockOk(undefined)
 
       await api.savedQueries.remove('sq1')
       expect(mockFetch).toHaveBeenCalledWith('/api/saved-queries/sq1', {
         method: 'DELETE',
-        headers: undefined,
+        headers: sessionHeaders,
         body: undefined,
       })
     })
@@ -242,6 +257,125 @@ describe('api', () => {
     it('should throw with HTTP status when no error text', async () => {
       mockError(500, '')
       await expect(api.connections.list()).rejects.toThrow('HTTP 500')
+    })
+  })
+
+  describe('session token bootstrap', () => {
+    it('fetches the token lazily once and presents it on mutations', async () => {
+      _setSessionTokenForTests(null)
+      mockOk({ token: 'fresh-launch-token' })
+      mockOk({ rowsAffected: 1 })
+
+      await api.tableInsert({ connectionId: 'c1', schema: 'public', table: 't', values: { a: 1 } })
+
+      expect(mockFetch).toHaveBeenNthCalledWith(1, '/api/session')
+      expect(mockFetch).toHaveBeenNthCalledWith(2, '/api/table/v2/insert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Studio-Session': 'fresh-launch-token' },
+        body: JSON.stringify({ connectionId: 'c1', schema: 'public', table: 't', values: { a: 1 } }),
+      })
+
+      // Second mutation reuses the cached token without refetching.
+      mockOk({ rowsAffected: 1 })
+      await api.tableInsert({ connectionId: 'c1', schema: 'public', table: 't', values: { a: 2 } })
+      expect(mockFetch).toHaveBeenCalledTimes(3)
+    })
+
+    it('an older server without /api/session still gets plain mutations', async () => {
+      _setSessionTokenForTests(null)
+      mockFetch.mockResolvedValueOnce({ ok: false, status: 404, text: () => Promise.resolve('') })
+      mockOk({ rowsAffected: 1 })
+
+      await api.tableDeleteV2({ connectionId: 'c1', schema: 'public', table: 't', key: [{ column: 'id', value: 1 }], version: '5' })
+      expect(mockFetch).toHaveBeenNthCalledWith(2, '/api/table/v2/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ connectionId: 'c1', schema: 'public', table: 't', key: [{ column: 'id', value: 1 }], version: '5' }),
+      })
+    })
+  })
+
+  describe('v2 mutation protocol', () => {
+    it('tableMeta GETs the authoritative metadata', async () => {
+      mockOk({ exists: true, keyColumns: ['id'], versioned: true, readOnly: false, columns: [] })
+
+      const meta = await api.tableMeta('c1', 'public', 'users')
+      expect(meta.keyColumns).toEqual(['id'])
+      expect(mockFetch).toHaveBeenCalledWith(
+        '/api/table/v2/meta?connectionId=c1&schema=public&table=users',
+        expect.anything()
+      )
+    })
+
+    it('tableUpdateV2 posts the full-key identity and version', async () => {
+      mockOk({ rowsAffected: 1, version: '99' })
+
+      const res = await api.tableUpdateV2({
+        connectionId: 'c1', schema: 'public', table: 'docs',
+        key: [{ column: 'tenant_id', value: 1 }, { column: 'id', value: 2 }],
+        version: '98', column: 'payload', value: 'x', isNull: false,
+      })
+      expect(res.version).toBe('99')
+      expect(mockFetch).toHaveBeenCalledWith('/api/table/v2/update', {
+        method: 'POST',
+        headers: sessionHeaders,
+        body: JSON.stringify({
+          connectionId: 'c1', schema: 'public', table: 'docs',
+          key: [{ column: 'tenant_id', value: 1 }, { column: 'id', value: 2 }],
+          version: '98', column: 'payload', value: 'x', isNull: false,
+        }),
+      })
+    })
+
+    it('a 409 conflict body becomes an ApiError carrying the conflict state', async () => {
+      mockJSONError(409, {
+        conflict: true,
+        currentVersion: '1234',
+        error: 'update refused: row changed since it was read (current row version 1234)',
+      })
+
+      const err = await api.tableUpdateV2({
+        connectionId: 'c1', schema: 'public', table: 't',
+        key: [{ column: 'id', value: 1 }], version: '1', column: 'a', value: 'x',
+      }).catch(e => e as ApiError)
+
+      expect(err).toBeInstanceOf(ApiError)
+      expect(err.status).toBe(409)
+      expect(err.conflict).toBe(true)
+      expect(err.missing).toBeUndefined()
+      expect(err.currentVersion).toBe('1234')
+      expect(err.message).toContain('row changed since it was read')
+    })
+
+    it('a 409 missing body becomes an ApiError with the missing state', async () => {
+      mockJSONError(409, { missing: true, error: 'matched no row' })
+
+      const err = await api.tableDeleteV2({
+        connectionId: 'c1', schema: 'public', table: 't',
+        key: [{ column: 'id', value: 9 }], version: '1',
+      }).catch(e => e as ApiError)
+
+      expect(err.status).toBe(409)
+      expect(err.missing).toBe(true)
+      expect(err.conflict).toBeUndefined()
+    })
+
+    it('tableData results carry keyColumns and versions through decode', async () => {
+      mockOk({
+        columns: ['id', 'body'],
+        rows: [[{ t: 'int8', v: '9007199254740993' }, 'x']],
+        rowCount: 1,
+        duration: 0,
+        keyColumns: ['id'],
+        versions: ['42'],
+        versioned: true,
+      })
+
+      const result = await api.tableData('c1', 'public', 't')
+      expect(result.rows[0][0]).toBe(9007199254740993n)
+      const keyed = result as import('./types').KeyedQueryResult
+      expect(keyed.keyColumns).toEqual(['id'])
+      expect(keyed.versions).toEqual(['42'])
     })
   })
 })

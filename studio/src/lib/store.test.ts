@@ -6,7 +6,7 @@ import {
   pendingChanges, pendingCount, addPending, removePending, revertLast, clearPending,
   theme, toggleTheme,
   paletteOpen, paletteQuery, openPalette, closePalette,
-  toasts, toast,
+  toasts, toast, bindingActive,
 } from './store'
 import type { Tab, PendingChange } from './types'
 
@@ -271,5 +271,30 @@ describe('store — toast notifications', () => {
     vi.advanceTimersByTime(2000)
     expect(toasts.value.length).toBe(1)
     expect(toasts.value[0].message).toBe('Second')
+  })
+})
+
+describe('store — editing binding (S01 lost-window semantics)', () => {
+  beforeEach(() => {
+    activeConnection.value = { id: 'c1', name: 'one', url: 'postgres://a', isNucleus: false }
+  })
+  afterEach(() => {
+    activeConnection.value = null
+  })
+
+  it('a binding is active while its connection is the active connection', () => {
+    const binding = { connectionId: 'c1', schema: 'public', table: 'docs' }
+    expect(bindingActive(binding)).toBe(true)
+  })
+
+  it('switching connections deactivates bindings captured under the old connection', () => {
+    const binding = { connectionId: 'c1', schema: 'public', table: 'docs' }
+    activeConnection.value = { id: 'c2', name: 'two', url: 'postgres://b', isNucleus: false }
+    expect(bindingActive(binding)).toBe(false)
+  })
+
+  it('no active connection deactivates every binding', () => {
+    activeConnection.value = null
+    expect(bindingActive({ connectionId: 'c1', schema: 'public', table: 't' })).toBe(false)
   })
 })

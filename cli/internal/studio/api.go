@@ -3,6 +3,7 @@ package studio
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -10,6 +11,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/neutron-build/neutron/cli/internal/db"
 )
@@ -82,6 +86,9 @@ func (s *Server) listConnections(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) addConnection(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMutationAuth(w, r) {
+		return
+	}
 	var body struct {
 		Name string `json:"name"`
 		URL  string `json:"url"`
@@ -160,6 +167,9 @@ func (s *Server) handleConnection(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) removeConnection(w http.ResponseWriter, r *http.Request, id string) {
+	if !s.requireMutationAuth(w, r) {
+		return
+	}
 	if err := s.store.Remove(id); err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
@@ -170,11 +180,15 @@ func (s *Server) removeConnection(w http.ResponseWriter, r *http.Request, id str
 		c.Close()
 		delete(s.clients, id)
 	}
+	delete(s.epochs, id)
 	s.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) connectDB(w http.ResponseWriter, r *http.Request, id string) {
+	if !s.requireMutationAuth(w, r) {
+		return
+	}
 	saved, ok := s.store.Get(id)
 	if !ok {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("connection %q not found", id))
@@ -252,6 +266,11 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	// The SQL editor executes arbitrary statements — including mutations —
+	// so it is guarded exactly like the row endpoints.
+	if !s.requireMutationAuth(w, r) {
+		return
+	}
 	var body struct {
 		SQL          string `json:"sql"`
 		ConnectionID string `json:"connectionId"`
@@ -281,27 +300,11 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	cols := make([]string, len(rows.FieldDescriptions()))
-	for i, fd := range rows.FieldDescriptions() {
-		cols[i] = string(fd.Name)
-	}
-
-	var data [][]any
-	for rows.Next() {
-		vals, err := rows.Values()
-		if err != nil {
-			continue
-		}
-		data = append(data, vals)
-	}
-	// pgx surfaces execution errors (division by zero, RLS denials, missing
-	// relations…) at the end of iteration, not from Query itself. Without
-	// this check every failing statement reported "0 rows, success" and the
-	// frontend could never show why.
-	if err := rows.Err(); err != nil {
+	result, err := collectTaggedRows(rows)
+	if err != nil {
 		log.Printf("studio: query error: %v", err)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"columns":  cols,
+			"columns":  result.columns,
 			"rows":     [][]any{},
 			"rowCount": 0,
 			"duration": time.Since(start).Milliseconds(),
@@ -309,16 +312,47 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if data == nil {
-		data = [][]any{}
-	}
-
 	writeJSON(w, http.StatusOK, map[string]any{
-		"columns":  cols,
-		"rows":     data,
-		"rowCount": len(data),
+		"columns":  result.columns,
+		"rows":     result.data,
+		"rowCount": len(result.data),
 		"duration": time.Since(start).Milliseconds(),
 	})
+}
+
+// taggedResult is a query result with cells converted to their wire forms.
+type taggedResult struct {
+	columns []string
+	data    [][]any
+}
+
+// collectTaggedRows drains a pgx result, converting every cell of a tagged
+// type (int8/numeric/bytea/temporal) to its {t, v} wire form so precision
+// survives JSON. Execution errors surface after iteration (pgx behavior).
+func collectTaggedRows(rows pgx.Rows) (*taggedResult, error) {
+	fds := rows.FieldDescriptions()
+	cols := make([]string, len(fds))
+	for i, fd := range fds {
+		cols[i] = string(fd.Name)
+	}
+	var data [][]any
+	for rows.Next() {
+		// A row that cannot be decoded fails the read loudly; silently
+		// skipping it would show a table with rows missing.
+		vals, err := rows.Values()
+		if err != nil {
+			return &taggedResult{columns: cols}, err
+		}
+		row := make([]any, len(vals))
+		for i, v := range vals {
+			row[i] = encodeTaggedCell(fds[i].DataTypeOID, v)
+		}
+		data = append(data, row)
+	}
+	if err := rows.Err(); err != nil {
+		return &taggedResult{columns: cols}, err
+	}
+	return &taggedResult{columns: cols, data: data}, nil
 }
 
 // --- /api/schema ---
@@ -400,7 +434,6 @@ var allowedFilterOps = map[string]string{
 	"not-null": "IS NOT NULL",
 }
 
-
 func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -428,7 +461,24 @@ func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var where string
+	if limit <= 0 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	// Authoritative column list (attnum order) for the select and for the
+	// reported identity metadata. When introspection is unavailable (an
+	// engine without these catalogs) or the relation is not an ordinary
+	// table, the read still works — as an explicitly read-only result.
+	meta, metaErr := fetchTableMeta(r.Context(), client, schemaName, tableName)
+	identityOK := metaErr == nil && meta.Exists
+	if metaErr != nil {
+		log.Printf("studio: table introspection error: %v", metaErr)
+	}
+
+	var conds []string
 	var args []any
 	if filterColumn != "" {
 		op, ok := allowedFilterOps[filterOp]
@@ -437,11 +487,26 @@ func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if op == "IS NULL" || op == "IS NOT NULL" {
-			where = fmt.Sprintf(" WHERE %s.%s %s", quoteIdent(tableName), quoteIdent(filterColumn), op)
+			conds = append(conds, fmt.Sprintf("%s.%s %s", quoteIdent(tableName), quoteIdent(filterColumn), op))
 		} else {
 			args = append(args, filterValue)
-			where = fmt.Sprintf(" WHERE %s.%s %s $1", quoteIdent(tableName), quoteIdent(filterColumn), op)
+			conds = append(conds, fmt.Sprintf("%s.%s %s $%d", quoteIdent(tableName), quoteIdent(filterColumn), op, len(args)))
 		}
+	}
+	// match: a full-tuple equality filter (composite FK follow). Every
+	// component is a bound parameter; the tuple is ANDed as a whole.
+	if raw := q.Get("match"); raw != "" {
+		matchConds, matchArgs, err := parseMatch(raw, meta, identityOK, len(args))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		conds = append(conds, matchConds...)
+		args = append(args, matchArgs...)
+	}
+	where := ""
+	if len(conds) > 0 {
+		where = " WHERE " + strings.Join(conds, " AND ")
 	}
 
 	order := ""
@@ -454,13 +519,31 @@ func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Quoted identifiers throughout; filter values are bound parameters.
-	sql := fmt.Sprintf(
-		`SELECT * FROM %s.%s%s%s LIMIT %d OFFSET %d`,
-		quoteIdent(schemaName), quoteIdent(tableName), where, order, limit, offset,
-	)
+	tableRef := fmt.Sprintf("%s.%s", quoteIdent(schemaName), quoteIdent(tableName))
+	selectCols := "*"
+	versionSelect := ""
+	if identityOK {
+		selectList := make([]string, 0, len(meta.Order))
+		for _, col := range meta.Order {
+			selectList = append(selectList, quoteIdent(col.Name))
+		}
+		selectCols = strings.Join(selectList, ", ")
+		versionSelect = ", xmin::text"
+	}
+	buildSQL := func() string {
+		return fmt.Sprintf(`SELECT %s%s FROM %s%s%s LIMIT %d OFFSET %d`,
+			selectCols, versionSelect, tableRef, where, order, limit, offset)
+	}
 
 	start := time.Now()
-	rows, err := client.Query(r.Context(), sql, args...)
+	rows, err := client.Query(r.Context(), buildSQL(), args...)
+	if err != nil && versionSelect != "" && isUndefinedColumnErr(err) {
+		// An engine that does not expose xmin (Nucleus) must still be
+		// browsable: retry once without the version column and report the
+		// table as unversioned — read-only, never unguarded editing.
+		versionSelect = ""
+		rows, err = client.Query(r.Context(), buildSQL(), args...)
+	}
 	if err != nil {
 		log.Printf("studio: table query error: %v", err)
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -474,24 +557,11 @@ func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	cols := make([]string, len(rows.FieldDescriptions()))
-	for i, fd := range rows.FieldDescriptions() {
-		cols[i] = string(fd.Name)
-	}
-
-	var data [][]any
-	for rows.Next() {
-		vals, err := rows.Values()
-		if err != nil {
-			continue
-		}
-		data = append(data, vals)
-	}
-	// Same as handleQuery: execution errors surface after iteration.
-	if err := rows.Err(); err != nil {
+	result, err := collectTaggedRows(rows)
+	if err != nil {
 		log.Printf("studio: table query error: %v", err)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"columns":  cols,
+			"columns":  []string{},
 			"rows":     [][]any{},
 			"rowCount": 0,
 			"duration": time.Since(start).Milliseconds(),
@@ -499,16 +569,128 @@ func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if data == nil {
-		data = [][]any{}
+
+	response := map[string]any{
+		"columns":    result.columns,
+		"rows":       result.data,
+		"rowCount":   len(result.data),
+		"duration":   time.Since(start).Milliseconds(),
+		"keyColumns": []string{},
+		"versioned":  false,
+		"readOnly":   true,
+	}
+	if !identityOK {
+		response["readOnlyReason"] = fmt.Sprintf(
+			"%s.%s: row identity metadata is unavailable on this connection — rows are read-only", schemaName, tableName)
+		writeJSON(w, http.StatusOK, response)
+		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"columns":  cols,
-		"rows":     data,
-		"rowCount": len(data),
-		"duration": time.Since(start).Milliseconds(),
-	})
+	// Split the trailing version column off the row arrays; `columns` and
+	// every row keep exactly the table's real width.
+	versioned := versionSelect != ""
+	if versioned {
+		result.columns = result.columns[:len(result.columns)-1]
+		versions := make([]string, len(result.data))
+		reduced := make([][]any, len(result.data))
+		for i, row := range result.data {
+			if len(row) > 0 {
+				if v, ok := row[len(row)-1].(string); ok {
+					versions[i] = v
+				}
+				reduced[i] = row[:len(row)-1]
+			}
+		}
+		response["columns"] = result.columns
+		response["rows"] = reduced
+		response["versions"] = versions
+	}
+	state := tableReadOnlyState(meta, versioned)
+	response["keyColumns"] = meta.PKCols
+	response["versioned"] = versioned
+	response["binding"] = bindingFor(s.connectionEpoch(connID), meta.RelOID)
+	response["readOnly"] = state.readOnly
+	if state.readOnly {
+		response["readOnlyReason"] = fmt.Sprintf("%s.%s %s", schemaName, tableName, state.reason)
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+// matchCell is one component of a full-tuple equality filter.
+type matchCell struct {
+	Column string `json:"column"`
+	Value  any    `json:"value"`
+}
+
+// parseMatch decodes the match parameter: a JSON array of {column, value}
+// equality components, ANDed as one tuple. Columns must exist (when the
+// catalog is known) and appear once; values are bound parameters decoded
+// exactly (tagged cells to exact driver values, JSON numbers as their
+// literal text so PostgreSQL parses the digits into the column type). NULL
+// never matches under equality and is refused.
+func parseMatch(raw string, meta *tableMeta, catalogKnown bool, argOffset int) ([]string, []any, error) {
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	dec.DisallowUnknownFields()
+	var cells []matchCell
+	if err := dec.Decode(&cells); err != nil {
+		return nil, nil, fmt.Errorf("match must be a JSON array of {column, value}: %v", err)
+	}
+	if len(cells) == 0 || len(cells) > 32 {
+		return nil, nil, fmt.Errorf("match must name between 1 and 32 columns")
+	}
+	seen := map[string]bool{}
+	var conds []string
+	var args []any
+	for _, c := range cells {
+		if c.Column == "" || seen[c.Column] {
+			return nil, nil, fmt.Errorf("match column %q is empty or repeated", c.Column)
+		}
+		seen[c.Column] = true
+		if catalogKnown {
+			if _, ok := meta.Columns[c.Column]; !ok {
+				return nil, nil, fmt.Errorf("match column %q does not exist", c.Column)
+			}
+		}
+		var v any
+		switch val := c.Value.(type) {
+		case nil:
+			return nil, nil, fmt.Errorf("match column %q: NULL never matches by equality", c.Column)
+		case json.Number:
+			v = val.String()
+		case string, bool:
+			v = val
+		case map[string]any:
+			cell, ok := taggedCellOf(val)
+			if !ok {
+				return nil, nil, fmt.Errorf("match column %q: value must be a scalar or tagged wire cell", c.Column)
+			}
+			d, err := decodeTagged(cell)
+			if err != nil {
+				return nil, nil, fmt.Errorf("match column %q: %v", c.Column, err)
+			}
+			v = d
+		default:
+			return nil, nil, fmt.Errorf("match column %q: value must be a scalar or tagged wire cell", c.Column)
+		}
+		args = append(args, v)
+		conds = append(conds, fmt.Sprintf("%s = $%d", quoteIdent(c.Column), argOffset+len(args)))
+	}
+	return conds, args, nil
+}
+
+// isUndefinedColumnErr reports whether a query error means the referenced
+// column does not exist on this engine (PostgreSQL SQLSTATE 42703, or a
+// text mentioning the column for engines without SQLSTATE).
+func isUndefinedColumnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "42703"
+	}
+	return strings.Contains(err.Error(), "xmin")
 }
 
 func parseInt(s string, def int) int {

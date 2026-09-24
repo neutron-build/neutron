@@ -264,6 +264,9 @@ func (s *Server) handleDDL(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
 		return
 	}
+	if !s.requireMutationAuth(w, r) {
+		return
+	}
 	var body struct {
 		SQL          string `json:"sql"`
 		ConnectionID string `json:"connectionId"`
