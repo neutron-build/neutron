@@ -10,8 +10,9 @@
 //   caller's schema threaded through, so select()/query results carry
 //   Drizzle's own row types, never a cast to a Neutron type;
 // - the root export stays usable with the loose surface (no drizzle-orm
-//   types leak into the root declaration — asserted by
-//   root-export-purity.test.ts over the emitted dist);
+//   types leak into the root declaration — verified by reviewing the
+//   emitted dist/index.d.ts and by the no-peer consumer compiling; no
+//   separate test file pins this);
 // - invalid uses fail for the intended reason (@ts-expect-error directives
 //   below — an unused directive is itself a compile error).
 
