@@ -48,7 +48,12 @@ impl fmt::Display for NucleusError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Connect(e) => write!(f, "Nucleus connect: {e}"),
-            Self::Query(e) => write!(f, "Nucleus query: {e}"),
+            // tokio-postgres displays every server-side rejection as just "db
+            // error"; the server's message lives on the DbError it wraps.
+            Self::Query(e) => match e.as_db_error() {
+                Some(db) => write!(f, "Nucleus query: {e}: {db}"),
+                None => write!(f, "Nucleus query: {e}"),
+            },
             Self::PoolExhausted => write!(f, "Nucleus pool exhausted"),
             Self::Migration { step, source } => write!(f, "Migration '{step}' failed: {source}"),
             Self::Io(e) => write!(f, "Nucleus I/O: {e}"),
