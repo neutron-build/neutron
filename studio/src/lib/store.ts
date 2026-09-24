@@ -86,6 +86,28 @@ export function clearPending() {
   pendingChanges.value = []
 }
 
+// --- Editing binding (S01 lost-window semantics) ---
+//
+// Every editing surface captures the connection it loaded its rows under.
+// Connection switching is explicit and never redirects edits: while a
+// different connection is active, a view bound to the old connection
+// refuses new commits and asks for a reload instead of sending its stale
+// identity to the newly active connection. The server independently
+// re-validates the full identity (connection + schema + table + key +
+// version) at mutation time, so a lost browser tab cannot smuggle an edit
+// across connections even if this client-side guard were bypassed.
+
+export interface EditingBinding {
+  connectionId: string
+  schema: string
+  table: string
+}
+
+/** True while the captured binding still matches the active connection. */
+export function bindingActive(binding: EditingBinding): boolean {
+  return activeConnection.value?.id === binding.connectionId
+}
+
 // --- Theme ---
 
 const storedTheme = typeof localStorage !== 'undefined'

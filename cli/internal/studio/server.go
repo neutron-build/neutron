@@ -23,8 +23,16 @@ type Server struct {
 	store   *connectionStore
 	saved   *savedQueryStore
 	clients map[string]*db.Client
-	mu      sync.RWMutex
-	srv     *http.Server
+	// epochs holds a fresh random value per established client: row
+	// identities are bound to it, so an identity read before a reconnect
+	// can never address rows through the replacement connection.
+	epochs map[string]string
+	mu     sync.RWMutex
+	srv    *http.Server
+	// sessionToken is the per-launch CSRF-class token required on every
+	// mutating endpoint (see session.go). Empty only for hand-constructed
+	// Servers in tests that never call requireMutationAuth.
+	sessionToken string
 }
 
 // NewServer creates and configures the Studio server on the given port.
@@ -37,11 +45,17 @@ func NewServer(port int) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("saved query store: %w", err)
 	}
+	token, err := newSessionToken()
+	if err != nil {
+		return nil, fmt.Errorf("session token: %w", err)
+	}
 	s := &Server{
-		port:    port,
-		store:   store,
-		saved:   saved,
-		clients: map[string]*db.Client{},
+		port:         port,
+		store:        store,
+		saved:        saved,
+		clients:      map[string]*db.Client{},
+		epochs:       map[string]string{},
+		sessionToken: token,
 	}
 	return s, nil
 }
@@ -51,6 +65,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 
 	// API routes
+	mux.HandleFunc("/api/session", s.handleSession)
 	mux.HandleFunc("/api/connections", s.handleConnections)
 	mux.HandleFunc("/api/connections/test", s.handleTest)
 	mux.HandleFunc("/api/connections/", s.handleConnection) // /:id and /:id/connect
@@ -58,6 +73,10 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/schema", s.handleSchema)
 	mux.HandleFunc("/api/features", s.handleFeatures)
 	mux.HandleFunc("/api/table", s.handleTable)
+	mux.HandleFunc("/api/table/v2/meta", s.handleTableRowMetaV2)
+	mux.HandleFunc("/api/table/v2/insert", s.handleTableRowInsertV2)
+	mux.HandleFunc("/api/table/v2/update", s.handleTableRowUpdateV2)
+	mux.HandleFunc("/api/table/v2/delete", s.handleTableRowDeleteV2)
 	mux.HandleFunc("/api/table/update", s.handleTableRowUpdate)
 	mux.HandleFunc("/api/table/delete", s.handleTableRowDelete)
 	mux.HandleFunc("/api/table/fks", s.handleTableFKs)
@@ -131,32 +150,38 @@ func OpenBrowser(url string) {
 	exec.Command(cmd, args...).Start() //nolint
 }
 
-// corsMiddleware restricts cross-origin requests to localhost origins only.
+// corsMiddleware enforces the loopback boundary for every request: the Host
+// header must name the loopback listener (DNS-rebinding defense), a present
+// Origin must be one of this launch's exact allowed origins (other localhost
+// ports are other applications, not Studio), and every state-changing /api/
+// request must carry the session token. CORS headers are echoed only for the
+// exact allowed origins.
 func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.hostAllowed(r.Host) {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
 		origin := r.Header.Get("Origin")
 		if origin != "" {
-			if !isLocalhostOrigin(origin) {
-				http.Error(w, "Forbidden", http.StatusForbidden)
+			if !s.originAllowed(origin) {
+				writeAuthError(w, "origin", "origin not allowed")
 				return
 			}
 			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-			if r.Method == "OPTIONS" {
-				w.WriteHeader(204)
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, "+sessionHeader)
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
 				return
 			}
 		}
+		if strings.HasPrefix(r.URL.Path, "/api/") && isMutatingMethod(r.Method) && !s.requireMutationAuth(w, r) {
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
-}
-
-func isLocalhostOrigin(origin string) bool {
-	return strings.HasPrefix(origin, "http://localhost:") ||
-		strings.HasPrefix(origin, "http://127.0.0.1:") ||
-		strings.HasPrefix(origin, "http://[::1]:") ||
-		origin == "http://localhost" || origin == "http://127.0.0.1"
 }
 
 // --- Helpers ---
@@ -178,11 +203,32 @@ func (s *Server) clientFor(id string) (*db.Client, bool) {
 	return c, ok
 }
 
+// connectionEpoch returns the binding epoch of the connection's current
+// client. Hand-constructed test servers without epochs report "0".
+func (s *Server) connectionEpoch(id string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if e, ok := s.epochs[id]; ok {
+		return e
+	}
+	return "0"
+}
+
 func (s *Server) setClient(id string, c *db.Client) {
+	epoch, err := newSessionToken()
+	if err != nil {
+		// crypto/rand failure: fall back to a value that still changes per
+		// client instance so stale identities are never rebound.
+		epoch = fmt.Sprintf("t%d", time.Now().UnixNano())
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if old, ok := s.clients[id]; ok {
 		old.Close()
 	}
 	s.clients[id] = c
+	if s.epochs == nil {
+		s.epochs = map[string]string{}
+	}
+	s.epochs[id] = epoch[:16]
 }

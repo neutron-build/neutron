@@ -86,12 +86,14 @@ func TestStudioRowSafetyE2E(t *testing.T) {
 		}
 	}
 
-	s := &Server{clients: map[string]*db.Client{"e2e": fixture}}
+	s := &Server{port: 59999, sessionToken: "e2e-test-token", clients: map[string]*db.Client{"e2e": fixture}}
 
 	post := func(handler http.HandlerFunc, payload string) (int, map[string]any) {
 		t.Helper()
 		req := httptest.NewRequest(http.MethodPost, "/api/table", strings.NewReader(payload))
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", "http://localhost:59999")
+		req.Header.Set(sessionHeader, s.sessionToken)
 		rec := httptest.NewRecorder()
 		handler(rec, req)
 		var body map[string]any

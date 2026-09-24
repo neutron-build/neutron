@@ -19,6 +19,9 @@ func (s *Server) handleBlobUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
 		return
 	}
+	if !s.requireMutationAuth(w, r) {
+		return
+	}
 
 	// Limit upload size to 100 MB
 	r.Body = http.MaxBytesReader(w, r.Body, 100<<20)
