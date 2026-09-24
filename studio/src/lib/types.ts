@@ -147,6 +147,15 @@ export interface QueryResult {
   /** Authoritative editing state of the table read (server catalog). */
   readOnly?: boolean
   readOnlyReason?: string
+  /** SQL editor (S04): the request ID the statement ran under. */
+  requestId?: string
+  /** SQL editor (S04): the statement was cancelled at the user's request. */
+  canceled?: boolean
+  /** SQL editor (S04): PostgreSQL SQLSTATE of the error, when there is one. */
+  sqlState?: string
+  /** SQL editor (S04): after a cancel, whether the backend passed the
+   *  post-cancel probe and went back to the pool (false: it was discarded). */
+  connectionReused?: boolean
 }
 
 /** One component of a full-tuple equality filter; value is a wire cell. */
@@ -360,7 +369,55 @@ export interface QueryHistoryEntry {
   executedAt: string
   duration: number
   rowCount: number
+  /** Bound parameter values ($1..$n) the statement ran with; null is SQL NULL. */
+  params?: (string | null)[]
+  /** Outcome; absent on entries written before S04 (treated as ok). */
+  status?: 'ok' | 'error' | 'canceled'
 }
+
+// --- SQL editor: cancellation and EXPLAIN (S04) ---
+
+export interface CancelQueryResponse {
+  requestId: string
+  /** sent: pg_cancel_backend delivered to the running backend;
+   *  canceled-before-dispatch: the statement was still queued and never ran. */
+  state: 'sent' | 'canceled-before-dispatch'
+  method?: string
+}
+
+/** A successful EXPLAIN: PostgreSQL's FORMAT JSON document, unmodified. */
+export interface ExplainPlan {
+  ok: true
+  requestId: string
+  engine: string
+  format: 'json'
+  plan: unknown
+  analyze: boolean
+  /** True only for ANALYZE: the statement was executed. */
+  executed: boolean
+  writesAllowed: boolean
+  readOnly: boolean
+  /** Always false: Studio never commits from EXPLAIN. */
+  committed: false
+  duration: number
+}
+
+/** An EXPLAIN that produced no plan, with the reason. */
+export interface ExplainRefusal {
+  ok: false
+  /** unsupported: no plan exists for this statement/engine;
+   *  write-blocked: ANALYZE would write and writes were not allowed;
+   *  canceled / sql-error: execution outcome. */
+  state: 'unsupported' | 'write-blocked' | 'canceled' | 'sql-error'
+  error: string
+  requestId?: string
+  sqlState?: string
+  executed?: boolean
+  engine?: string
+  connectionReused?: boolean
+}
+
+export type ExplainOutcome = ExplainPlan | ExplainRefusal
 
 export type TabKind =
   | 'sql-browser'

@@ -260,65 +260,8 @@ func nucleusModels(isNucleus bool) []string {
 }
 
 // --- /api/query ---
-
-func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	// The SQL editor executes arbitrary statements — including mutations —
-	// so it is guarded exactly like the row endpoints.
-	if !s.requireMutationAuth(w, r) {
-		return
-	}
-	var body struct {
-		SQL          string `json:"sql"`
-		ConnectionID string `json:"connectionId"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON")
-		return
-	}
-	client, ok := s.clientFor(body.ConnectionID)
-	if !ok {
-		writeError(w, http.StatusBadRequest, "not connected — call /api/connections/:id/connect first")
-		return
-	}
-
-	start := time.Now()
-	rows, err := client.Query(r.Context(), body.SQL)
-	if err != nil {
-		log.Printf("studio: query error: %v", err)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"columns":  []string{},
-			"rows":     [][]any{},
-			"rowCount": 0,
-			"duration": time.Since(start).Milliseconds(),
-			"error":    sanitizeError(err),
-		})
-		return
-	}
-	defer rows.Close()
-
-	result, err := collectTaggedRows(rows)
-	if err != nil {
-		log.Printf("studio: query error: %v", err)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"columns":  result.columns,
-			"rows":     [][]any{},
-			"rowCount": 0,
-			"duration": time.Since(start).Milliseconds(),
-			"error":    sanitizeError(err),
-		})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"columns":  result.columns,
-		"rows":     result.data,
-		"rowCount": len(result.data),
-		"duration": time.Since(start).Milliseconds(),
-	})
-}
+// The SQL editor endpoints (/api/query, /api/query/cancel,
+// /api/query/explain) live in sqlexec.go.
 
 // taggedResult is a query result with cells converted to their wire forms.
 type taggedResult struct {
