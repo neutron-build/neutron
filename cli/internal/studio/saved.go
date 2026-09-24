@@ -103,6 +103,9 @@ func (s *Server) handleSavedQueries(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, s.saved.List())
 	case http.MethodPost:
+		if !s.requireMutationAuth(w, r) {
+			return
+		}
 		var body struct {
 			Name string `json:"name"`
 			SQL  string `json:"sql"`
@@ -134,6 +137,9 @@ func (s *Server) handleSavedQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method != http.MethodDelete {
 		writeError(w, http.StatusMethodNotAllowed, "DELETE required")
+		return
+	}
+	if !s.requireMutationAuth(w, r) {
 		return
 	}
 	if err := s.saved.Remove(id); err != nil {

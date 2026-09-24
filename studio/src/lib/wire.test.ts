@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { decodeCell, decodeRows, isTaggedCell, WireDecodeError } from './wire'
+import { decodeCell, decodeRows, encodeCell, isTaggedCell, WireDecodeError } from './wire'
 
 // Fixtures pin the tagged wire format (the backend side lands with the typed
 // row-identity protocol; these tests are the format contract both ends meet):
@@ -64,5 +64,48 @@ describe('wire', () => {
     expect(decoded[1][0]).toBe('1.50')
     expect(Array.from(decoded[1][1] as Uint8Array)).toEqual([0x00, 0xff, 0x10])
     expect(decoded[1][2]).toBe(7)
+  })
+
+  // Round-trip: what decodeCell produces, encodeCell sends back exactly —
+  // this is what row identities use (keys decoded from reads re-tag on
+  // mutation requests).
+  it('encodes bigint back to an int8 cell', () => {
+    expect(encodeCell(9007199254740993n)).toEqual({ t: 'int8', v: '9007199254740993' })
+    expect(encodeCell(-9223372036854775808n)).toEqual({ t: 'int8', v: '-9223372036854775808' })
+  })
+
+  it('encodes Uint8Array back to a bytea hex cell', () => {
+    expect(encodeCell(new Uint8Array([0x00, 0xff, 0x10]))).toEqual({ t: 'bytea', v: '00ff10' })
+    expect(encodeCell(new Uint8Array(0))).toEqual({ t: 'bytea', v: '' })
+  })
+
+  it('encodes plain values untouched (temporal/numeric strings pass as text)', () => {
+    for (const v of ['2026-01-02', '123.4560', 'x', true]) {
+      expect(encodeCell(v)).toBe(v)
+    }
+    expect(encodeCell(1.5)).toBe(1.5)
+  })
+
+  it('encodes an integral number as a tagged int8 when the column tag says int8', () => {
+    expect(encodeCell(7, 'int8')).toEqual({ t: 'int8', v: '7' })
+    // Non-integral or mistyped values are not silently re-tagged.
+    expect(encodeCell(1.5, 'int8')).toBe(1.5)
+    expect(encodeCell('7', 'int8')).toBe('7')
+  })
+
+  it('null stays null; undefined normalizes to null', () => {
+    expect(encodeCell(null)).toBe(null)
+    expect(encodeCell(undefined)).toBe(null)
+  })
+
+  it('decode->encode round-trips identity cells exactly', () => {
+    // Binary types re-tag; textual canonical forms (numeric/temporal) pass
+    // as plain strings — the server accepts canonical text for those
+    // columns and validates it against the catalog.
+    expect(encodeCell(decodeCell({ t: 'int8', v: '9007199254740993' }))).toEqual({ t: 'int8', v: '9007199254740993' })
+    expect(encodeCell(decodeCell({ t: 'bytea', v: '00ff10' }))).toEqual({ t: 'bytea', v: '00ff10' })
+    expect(encodeCell(decodeCell({ t: 'numeric', v: '1.50' }))).toBe('1.50')
+    expect(encodeCell(decodeCell({ t: 'date', v: '2026-01-02' }))).toBe('2026-01-02')
+    expect(encodeCell(decodeCell({ t: 'timestamptz', v: '2026-03-08T07:30:00.123456Z' }))).toBe('2026-03-08T07:30:00.123456Z')
   })
 })

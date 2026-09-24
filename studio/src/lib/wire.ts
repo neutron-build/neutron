@@ -68,3 +68,27 @@ export function decodeRows(rows: unknown[][]): unknown[][] {
   }
   return rows
 }
+
+function toHex(bytes: Uint8Array): string {
+  let out = ''
+  for (const b of bytes) out += b.toString(16).padStart(2, '0')
+  return out
+}
+
+/**
+ * Encode one value back to its wire form for mutation requests. The decoded
+ * lossless types re-tag exactly: bigint -> int8 cell, Uint8Array -> bytea
+ * cell. Strings (numeric/temporal canonical forms included) pass through —
+ * the server accepts canonical text for those columns and validates it
+ * against the catalog. The optional column tag comes from the authoritative
+ * table metadata.
+ */
+export function encodeCell(value: unknown, tag?: WireTag | null): unknown {
+  if (value === null || value === undefined) return value ?? null
+  if (typeof value === 'bigint') return { t: 'int8', v: value.toString() }
+  if (value instanceof Uint8Array) return { t: 'bytea', v: toHex(value) }
+  if (tag === 'int8' && typeof value === 'number' && Number.isInteger(value)) {
+    return { t: 'int8', v: String(value) }
+  }
+  return value
+}
