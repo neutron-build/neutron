@@ -105,8 +105,19 @@ export function canonicalTextWireNode(dataType: ColumnDataType, ref: QualifiedNo
 /** Engine feature a compiled statement requires. `jsonb-functions` marks
  *  statements whose projections aggregate or acquire values through
  *  PostgreSQL jsonb functions (to_jsonb / jsonb_build_object / jsonb_agg);
- *  engines without them must reject these statements rather than run them. */
-export type StatementCapability = "jsonb-functions";
+ *  engines without them must reject these statements rather than run them.
+ *  Q08 adds window functions (and the GROUPS frame mode), row-locking
+ *  clauses (strengths and SKIP LOCKED separately) and server-side cursors
+ *  (streaming). */
+export type StatementCapability =
+  | "jsonb-functions"
+  | "window-functions"
+  | "window-frame-groups"
+  | "window-frame-exclude"
+  | "row-locking"
+  | "row-locking-key-strength"
+  | "row-locking-skip-locked"
+  | "server-cursors";
 
 function stripJsonQuotes(raw: unknown, ctx: ColumnContext): string {
   if (typeof raw !== "string" || raw.length < 2 || !raw.startsWith('"') || !raw.endsWith('"')) {

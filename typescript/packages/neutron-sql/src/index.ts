@@ -140,6 +140,7 @@ export {
   type SubquerySource,
   type ConflictTargetSpec,
   type ReturningSubsetOf,
+  type LockOptions,
 } from "./builder.js";
 
 // Q02: derived tables and CTE references — table-like handles over a select
@@ -185,6 +186,8 @@ export {
   collectExcludedRefs,
   isValueNode,
   isStatement,
+  lockingClause,
+  assertLockingClauseValid,
   type IdentifierNode,
   type QualifiedNode,
   type ParamNode,
@@ -223,7 +226,67 @@ export {
   type SqlNode,
   type TrustedSql,
   type TrustedSqlAcknowledgment,
+  type LockStrength,
+  type LockWaitPolicy,
+  type LockingClause,
 } from "./ast.js";
+
+// Q08: window functions — structural `fn(...) over (partition by / order by /
+// frame)` expressions with PostgreSQL result typing (row_number/rank int8,
+// value functions their argument column's codec), placement enforced at the
+// compile choke point (select list and ORDER BY only) and capability
+// requirements (window-functions, window-frame-groups).
+export {
+  over,
+  isWindowExpr,
+  rowNumber,
+  rank,
+  denseRank,
+  percentRank,
+  cumeDist,
+  ntile,
+  lag,
+  lead,
+  firstValue,
+  lastValue,
+  nthValue,
+  containsWindow,
+  type WindowFunction,
+  type WindowFunctionOp,
+  type WindowExpr,
+  type WindowSpec,
+  type WindowOrderTerm,
+  type WindowFrame,
+  type FrameBound,
+  type FrameExclude,
+  type WindowValueResult,
+  type WindowResultSpec,
+} from "./window.js";
+
+// Q08: bounded streaming over server-side cursors — DECLARE / FETCH FORWARD
+// / CLOSE, at most one batch buffered client-side, early exit returns the
+// connection promptly (owned transaction rolls back, enclosing scope closes
+// the cursor), cancellation reaches the server on every round trip.
+export {
+  CursorStream,
+  DEFAULT_STREAM_BATCH_SIZE,
+  MAX_STREAM_BATCH_SIZE,
+  type StreamOptions,
+  type StreamPlan,
+  type StreamStatementRunner,
+} from "./stream.js";
+
+// Q08: explicit batch query plans — a fixed list of compiled statements run
+// sequentially on one connection in one transaction (REPEATABLE READ
+// snapshot by default), opt-in whole-batch retry with I02 semantics.
+export {
+  BatchQuery,
+  type Batchable,
+  type BatchOptions,
+  type BatchResults,
+  type BatchPlan,
+  type BatchStatementPlan,
+} from "./batch.js";
 
 export { compile, compileStatement, quoteIdent, type CompileState, type CompiledQuery } from "./compile.js";
 

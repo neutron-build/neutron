@@ -28,6 +28,7 @@ import {
   type InferSelectModelOfRecord,
   type Projection,
 } from "./builder.js";
+import { BatchQuery, type BatchOptions, type Batchable, type BatchResults } from "./batch.js";
 import {
   buildRelationalPlan,
   buildRelationalSQL,
@@ -302,6 +303,14 @@ export interface NeutronDatabase<
   insert<TCols extends Record<string, AnyColumnBuilder>>(table: PgTable<TCols>): InsertBuilder<TCols, number>;
   update<TCols extends Record<string, AnyColumnBuilder>>(table: PgTable<TCols>): UpdateBuilder<TCols, number>;
   delete<TCols extends Record<string, AnyColumnBuilder>>(table: PgTable<TCols>): DeleteBuilder<TCols, number>;
+  /** Explicit batch query plan (Q08): run a fixed list of compiled
+   *  statements sequentially on ONE connection inside ONE transaction and
+   *  get their results as a tuple (await it). `explain()` on the returned
+   *  plan describes every statement purely; execution issues exactly the
+   *  listed statements — never a multi-statement string. A batch owning its
+   *  transaction defaults to REPEATABLE READ (one snapshot); inside
+   *  db.transaction it joins that scope. */
+  batch<const Q extends readonly Batchable[]>(queries: Q, options?: BatchOptions): BatchQuery<BatchResults<Q>>;
   /** Run `fn` in one transaction. Options select isolation/read-only/
    *  deferrable modes (rendered into BEGIN) and the opt-in retry. A
    *  transport failure while COMMIT is in flight throws
@@ -404,6 +413,8 @@ export async function createDatabase<
     return {
       ...makeCrud(txCtx),
       query: makeQuery(txCtx),
+      batch: <const Q extends readonly Batchable[]>(queries: Q, options?: BatchOptions): BatchQuery<BatchResults<Q>> =>
+        new BatchQuery(txCtx, queries, options),
       // Nested transaction: a real SAVEPOINT on the same connection. Modes
       // are properties of the outer BEGIN — a JS caller passing an options
       // argument (reachable only without types; the declared surface takes
@@ -428,6 +439,8 @@ export async function createDatabase<
     return {
       ...makeCrud(txCtx),
       query: makeQuery(txCtx),
+      batch: <const Q extends readonly Batchable[]>(queries: Q, options?: BatchOptions): BatchQuery<BatchResults<Q>> =>
+        new BatchQuery(txCtx, queries, options),
       transaction: async <Tx>(_fn: (tx: TxScope) => Promise<Tx>): Promise<Tx> => {
         throw new NeutronSqlError("nested transactions (savepoints) require a pinnable adapter (Driver.pin) — this custom adapter's begin() scope does not expose them");
       },
@@ -443,6 +456,8 @@ export async function createDatabase<
     engine: (): Promise<EngineIdentity> => capabilities.engine(),
     capability: (name: StatementCapability): Promise<CapabilityEvidence> => capabilities.status(name),
     ...crud,
+    batch: <const Q extends readonly Batchable[]>(queries: Q, options?: BatchOptions): BatchQuery<BatchResults<Q>> =>
+      new BatchQuery(ctx, queries, options),
     transaction: async <Tx>(fn: (tx: TxScope) => Promise<Tx>, options: TransactionOptions = {}): Promise<Tx> => {
       const retry = options.retry;
       if (retry !== undefined) validateRetryOptions(retry);
