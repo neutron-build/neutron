@@ -457,11 +457,16 @@ fn call(
     // ── vector ──
     var vec = client.vector();
     if (eq(u8, op, "vector.createCollection")) {
-        // The schema every SDK's create uses — the vector model's own INSERT
-        // addresses the embedding column.
+        // The canonical collection DDL every SDK's create uses
+        // (FRAMEWORK_CONTRACT §3.2) — the vector model's own INSERT addresses
+        // the embedding column.
+        const name = try argStr(args, 0);
         var buf: [512]u8 = undefined;
-        const sql = try std.fmt.bufPrint(&buf, "CREATE TABLE {s} (id TEXT PRIMARY KEY, embedding VECTOR({d}), metadata JSONB)", .{ try argStr(args, 0), try argInt(args, 1) });
+        const sql = try std.fmt.bufPrint(&buf, "CREATE TABLE {s} (rid BIGSERIAL PRIMARY KEY, id TEXT NOT NULL UNIQUE, embedding VECTOR({d}), metadata JSONB DEFAULT '{{}}')", .{ name, try argInt(args, 1) });
         _ = try client.exec(sql);
+        var ibuf: [512]u8 = undefined;
+        const isql = try std.fmt.bufPrint(&ibuf, "CREATE INDEX IF NOT EXISTS idx_{s}_embedding ON {s} USING HNSW (embedding) WITH (metric = 'cosine')", .{ name, name });
+        _ = try client.exec(isql);
         return .none;
     }
     if (eq(u8, op, "vector.insert"))
