@@ -242,7 +242,10 @@ function call_op(c, op::String, args::Vector{Any})
     # ── vector ──
     v = vector(c)
     if op == "vector.createCollection"
-        execute!(sql(c), "CREATE TABLE $(args[1]) (id TEXT PRIMARY KEY, embedding VECTOR($(Int(args[2]))), metadata JSONB)")
+        # The SDK has no create_collection; this is the canonical collection
+        # DDL (FRAMEWORK_CONTRACT §3.2), with the index built by the SDK.
+        execute!(sql(c), "CREATE TABLE $(args[1]) (rid BIGSERIAL PRIMARY KEY, id TEXT NOT NULL UNIQUE, embedding VECTOR($(Int(args[2]))), metadata JSONB DEFAULT '{}')")
+        NeutronJulia.create_index!(v, String(args[1]))
         return nothing
     end
     op == "vector.insert" && return NeutronJulia.vector_insert!(v, String(args[1]), String(args[2]), Float64.(args[3]))
