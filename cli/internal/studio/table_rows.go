@@ -219,9 +219,10 @@ type tableMeta struct {
 const tableMetaSQL = `
 SELECT a.attname,
        COALESCE((
-	       SELECT pg_catalog.array_position(i.indkey::int2[], a.attnum)
+	       SELECT u.ord
 	       FROM pg_catalog.pg_index i
-	       WHERE i.indrelid = c.oid AND i.indisprimary
+	       CROSS JOIN LATERAL pg_catalog.unnest(i.indkey) WITH ORDINALITY AS u(k, ord)
+	       WHERE i.indrelid = c.oid AND i.indisprimary AND u.k = a.attnum
        ), 0) AS key_pos,
        COALESCE(a.attidentity::text, ''),
        COALESCE(a.attgenerated::text, ''),
