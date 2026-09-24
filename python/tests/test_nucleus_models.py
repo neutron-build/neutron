@@ -313,10 +313,16 @@ class TestVector:
     async def test_create_collection(self, mock_conn, nucleus_features):
         mock_conn.execute.return_value = "CREATE TABLE"
         vec = VectorModel(_make_exec(mock_conn), nucleus_features)
-        await vec.create_collection("embeddings", 1536, metric="cosine")
+        await vec.create_collection("embeddings", 1536, metric="l2")
         calls = [c[0][0] for c in mock_conn.execute.call_args_list]
-        assert any("CREATE TABLE" in c for c in calls)
-        assert any("CREATE INDEX" in c and "USING HNSW" in c for c in calls)
+        create = next(c for c in calls if "CREATE TABLE" in c)
+        # HNSW needs a single-column integer PK; `id` stays UNIQUE for ON CONFLICT.
+        assert "rid BIGSERIAL PRIMARY KEY" in create
+        assert "id TEXT NOT NULL UNIQUE" in create
+        assert "VECTOR(1536)" in create
+        index = next(c for c in calls if "CREATE INDEX" in c)
+        assert "idx_embeddings_vec" in index
+        assert "USING HNSW (embedding) WITH (metric = 'l2')" in index
 
     @pytest.mark.asyncio
     async def test_delete(self, mock_conn, nucleus_features):

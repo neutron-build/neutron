@@ -63,18 +63,25 @@ class VectorModel:
         # scan" and invisible to the client. Every collection this client has
         # ever created is affected. The engine bug is filed separately; passing
         # the dimension is correct regardless, and is what the other SDKs do.
+        # The engine refuses an HNSW index unless the table has a single-column
+        # integer PRIMARY KEY, so `rid` is that key; the caller's `id` stays
+        # UNIQUE, which is also what `insert`'s ON CONFLICT (id) upsert needs.
         await self._exec.execute(
             f"CREATE TABLE IF NOT EXISTS {safe_name} ("
-            f"  id TEXT PRIMARY KEY,"
+            f"  rid BIGSERIAL PRIMARY KEY,"
+            f"  id TEXT NOT NULL UNIQUE,"
             f"  embedding VECTOR({dimension}),"
             f"  metadata JSONB DEFAULT '{{}}'"
             f")"
         )
         # The engine's DDL knows HASH/GIN/GIST/HNSW/IVFFLAT; anything else
-        # (e.g. "VECTOR") silently falls back to BTree.
+        # (e.g. "VECTOR") silently falls back to BTree. The index name is
+        # unchanged from earlier releases, so re-calling this on a collection
+        # created by one is a no-op rather than a second index. `metric` was
+        # validated above and, until now, never sent — every index was L2.
         await self._exec.execute(
             f"CREATE INDEX IF NOT EXISTS idx_{safe_name}_vec "
-            f"ON {safe_name} USING HNSW (embedding)"
+            f"ON {safe_name} USING HNSW (embedding) WITH (metric = '{metric}')"
         )
 
     async def insert(
