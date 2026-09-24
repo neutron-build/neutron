@@ -91,8 +91,10 @@ One TypeScript note for partial installs: drizzle-orm's own declarations
 reference its *other* optional drivers (`mysql2`, `gel`, …), so consumers
 that install only the Postgres or only the SQLite peer set need
 `skipLibCheck: true` (the ecosystem norm for drizzle-orm) to compile against
-`/drizzle`. Your own code is still fully checked; only drizzle-orm's
-internal declarations are skipped.
+`/drizzle`. Your own code is still fully checked; what is skipped is
+drizzle-orm's internal declarations plus this package's `/drizzle`
+declaration (its type-only import of the not-installed driver's client) —
+the root `.` export never needs either.
 
 The `nucleus` provider connects the same postgres.js driver over Nucleus's
 pg-wire protocol and additionally connects an `@neutron-build/nucleus` client
