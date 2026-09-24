@@ -3,6 +3,8 @@
 // ---------------------------------------------------------------------------
 
 import type { BigintMode, BigintOptions, TemporalMode, TemporalOptions, NumericOptions } from "./codecs.js";
+import type { SchemaExpression } from "./ddl-text.js";
+import type { OrderSpec } from "./ast.js";
 
 export type ColumnDataType =
   | "serial"
@@ -22,7 +24,8 @@ export type ColumnDataType =
   | "jsonb"
   | "uuid"
   | "bytea"
-  | "vector";
+  | "vector"
+  | "enum";
 
 /** Default read type per SQL type (the master codec table). int8 never passes
  *  through JS Number (bigint, with optional string / checked safe-number
@@ -34,7 +37,7 @@ export type JsTypeOf<D extends ColumnDataType> =
     ? number
     : D extends "bigint"
       ? bigint
-      : D extends "numeric" | "text" | "varchar" | "uuid" | "timestamp" | "timestamptz" | "date"
+      : D extends "numeric" | "text" | "varchar" | "uuid" | "timestamp" | "timestamptz" | "date" | "enum"
         ? string
         : D extends "boolean"
           ? boolean
@@ -55,7 +58,7 @@ export type JsWriteTypeOf<D extends ColumnDataType> =
       ? string | number
       : D extends "serial" | "integer" | "smallint" | "double" | "real"
         ? number
-        : D extends "text" | "varchar" | "uuid"
+        : D extends "text" | "varchar" | "uuid" | "enum"
           ? string
           : D extends "boolean"
             ? boolean
@@ -72,18 +75,52 @@ export type JsWriteTypeOf<D extends ColumnDataType> =
 export type BigintRead<M extends BigintMode> = M extends "string" ? string : M extends "number" ? number : bigint;
 export type TemporalRead<M extends TemporalMode> = M extends "date" ? Date : string;
 
+/** Referential actions (PostgreSQL ON DELETE / ON UPDATE). */
+export type ReferentialAction = "cascade" | "restrict" | "set null" | "set default" | "no action";
+
 export interface ForeignKeyRef {
-  (): ColumnBuilder<ColumnDataType, boolean, boolean>;
-  onDelete?: "cascade" | "restrict" | "set null" | "no action";
+  (): ColumnBuilder<ColumnDataType, boolean, boolean, unknown, unknown>;
+  onDelete?: ReferentialAction;
+  onUpdate?: ReferentialAction;
 }
+
+/** Enum type metadata carried by enum columns (Q07). `schema` is undefined
+ *  for the default search path (exported as "public"). */
+export interface PgEnumDefinition {
+  readonly schema: string | undefined;
+  readonly name: string;
+  readonly values: readonly string[];
+}
+
+/** Custom codec over a column's lossless representation (Q07e): `decode`
+ *  maps the value the column codec produced (flat select, JSON relation
+ *  leaf, returning) to the user-facing read value; `encode` maps a
+ *  user-facing value back to what the column codec accepts (writes,
+ *  predicates, declared defaults). The SQL type is unchanged — the codec is
+ *  query-layer mapping, invisible to the schema contract. */
+export interface CustomCodec<R, W, RT2, WT2> {
+  decode(value: R): RT2;
+  encode(value: WT2): W;
+}
+
+/** Element types `.array()` supports: their PostgreSQL text output is exact
+ *  and session-independent, so arrays are acquired as the array literal
+ *  (`col::text`) and decoded per element on both drivers. Temporal, bytea,
+ *  vector and serial arrays are explicitly unsupported (their text forms
+ *  depend on DateStyle/TimeZone/bytea_output, or the type has no array). */
+export const ARRAY_ELEMENT_TYPES: ReadonlySet<ColumnDataType> = new Set<ColumnDataType>([
+  "integer", "smallint", "bigint", "double", "real", "numeric",
+  "text", "varchar", "boolean", "uuid", "enum", "json", "jsonb",
+]);
 
 export class ColumnBuilder<
   D extends ColumnDataType = ColumnDataType,
   NN extends boolean = false,
   HD extends boolean = false,
   RT = JsTypeOf<D>,
+  WT = JsWriteTypeOf<D>,
 > {
-  declare readonly _: { dataType: D; notNull: NN; hasDefault: HD; readType: RT };
+  declare readonly _: { dataType: D; notNull: NN; hasDefault: HD; readType: RT; writeType: WT };
 
   readonly columnName: string;
   readonly dataType: D;
@@ -107,54 +144,182 @@ export class ColumnBuilder<
   nowDefault = false;
   foreignKey?: ForeignKeyRef;
   ownerTable?: AnyPgTable;
+  /** Q07: set to 1 by `.array()` — a one-dimensional array whose elements
+   *  have type `dataType`. */
+  arrayDimensions?: 1;
+  /** Q07: enum type of an enum column (dataType "enum"). */
+  enumDef?: PgEnumDefinition;
+  /** Q07c: identity kind of an identity column. */
+  identityKind?: "always" | "by default";
+  /** Q07c: stored generated-column expression (rendered SQL text is set at
+   *  export; the declaration keeps the raw expression until then). */
+  generatedExpr?: SchemaExpression;
+  /** Q07e: custom codec mapping over the column's lossless representation. */
+  customCodec?: CustomCodec<unknown, unknown, unknown, unknown>;
 
   constructor(columnName: string, dataType: D) {
     this.columnName = columnName;
     this.dataType = dataType;
   }
 
-  notNull(): ColumnBuilder<D, true, HD, RT> {
+  notNull(): ColumnBuilder<D, true, HD, RT, WT> {
     this.isNotNull = true;
-    return this as unknown as ColumnBuilder<D, true, HD, RT>;
+    return this as unknown as ColumnBuilder<D, true, HD, RT, WT>;
   }
 
-  default(value: JsWriteTypeOf<D>): ColumnBuilder<D, NN, true, RT> {
+  default(value: WT): ColumnBuilder<D, NN, true, RT, WT> {
+    if (this.generatedExpr !== undefined || this.identityKind !== undefined) {
+      throw new Error(`column "${this.columnName}": .default() — a column cannot combine a default with a generation expression or identity`);
+    }
     this.hasDefault = true;
     this.defaultValue = value;
-    return this as unknown as ColumnBuilder<D, NN, true, RT>;
+    return this as unknown as ColumnBuilder<D, NN, true, RT, WT>;
   }
 
-  defaultNow(): ColumnBuilder<D, NN, true, RT> {
+  defaultNow(): ColumnBuilder<D, NN, true, RT, WT> {
+    if (this.generatedExpr !== undefined || this.identityKind !== undefined) {
+      throw new Error(`column "${this.columnName}": .defaultNow() — a column cannot combine a default with a generation expression or identity`);
+    }
     this.hasDefault = true;
     this.nowDefault = true;
-    return this as unknown as ColumnBuilder<D, NN, true, RT>;
+    return this as unknown as ColumnBuilder<D, NN, true, RT, WT>;
   }
 
   /** Primary keys are implicitly NOT NULL (PostgreSQL semantics); the insert
    *  type reflects that. Serial primary keys still default server-side. */
-  primaryKey(): ColumnBuilder<D, true, HD, RT> {
+  primaryKey(): ColumnBuilder<D, true, HD, RT, WT> {
     this.isPrimaryKey = true;
-    return this as unknown as ColumnBuilder<D, true, HD, RT>;
+    return this as unknown as ColumnBuilder<D, true, HD, RT, WT>;
   }
 
-  unique(): ColumnBuilder<D, NN, HD, RT> {
+  unique(): ColumnBuilder<D, NN, HD, RT, WT> {
     this.isUnique = true;
-    return this as unknown as ColumnBuilder<D, NN, HD, RT>;
+    return this as unknown as ColumnBuilder<D, NN, HD, RT, WT>;
   }
 
   references(
     ref: ForeignKeyRef,
-    opts?: { onDelete?: ForeignKeyRef["onDelete"] },
-  ): ColumnBuilder<D, NN, HD, RT> {
-    const bound: ForeignKeyRef = Object.assign(() => ref(), { onDelete: opts?.onDelete });
+    opts?: { onDelete?: ReferentialAction; onUpdate?: ReferentialAction },
+  ): ColumnBuilder<D, NN, HD, RT, WT> {
+    const bound: ForeignKeyRef = Object.assign(() => ref(), { onDelete: opts?.onDelete, onUpdate: opts?.onUpdate });
     this.foreignKey = bound;
-    return this as unknown as ColumnBuilder<D, NN, HD, RT>;
+    return this as unknown as ColumnBuilder<D, NN, HD, RT, WT>;
+  }
+
+  /** One-dimensional PostgreSQL array of this column's type (Q07). Elements
+   *  may be SQL NULL, so they read and write as `T | null`. Call it on the
+   *  bare column factory, before `.default()`/`.primaryKey()`. Arrays read
+   *  through the array literal (`col::text`) and decode per element with the
+   *  element codec on both drivers; values with more than one dimension or
+   *  non-default lower bounds fail to decode instead of being reshaped. */
+  array(): ColumnBuilder<D, NN, HD, Array<RT | null>, Array<WT | null>> {
+    const who = `column "${this.columnName}": .array()`;
+    if (this.arrayDimensions !== undefined) throw new Error(`${who} — already an array; multi-dimensional array columns are not supported`);
+    if (!ARRAY_ELEMENT_TYPES.has(this.dataType)) {
+      throw new Error(
+        `${who} — ${this.dataType} arrays are not supported (supported element types: ${[...ARRAY_ELEMENT_TYPES].join(", ")}); ` +
+          `temporal/bytea text forms depend on session settings, so no lossless acquisition exists for them yet`,
+      );
+    }
+    if (this.hasDefault || this.isPrimaryKey || this.isUnique || this.foreignKey !== undefined || this.ownerTable !== undefined) {
+      throw new Error(`${who} must be called on the bare column factory, before .default()/.primaryKey()/.unique()/.references() and before the table is built`);
+    }
+    if (this.dataType === "numeric" && this.valueDecoder !== undefined) {
+      throw new Error(`${who} — numeric decoders apply to scalar columns only; decode array elements after reading`);
+    }
+    this.arrayDimensions = 1;
+    return this as unknown as ColumnBuilder<D, NN, HD, Array<RT | null>, Array<WT | null>>;
+  }
+
+  /** GENERATED ALWAYS AS IDENTITY (Q07c): the database generates values;
+   *  writes are rejected at the type level (write type `never`) and at
+   *  runtime. Integer columns only. Implies NOT NULL and a default. */
+  generatedAlwaysAsIdentity(): ColumnBuilder<D, true, true, RT, never> {
+    this.assertIdentityEligible("generatedAlwaysAsIdentity");
+    this.identityKind = "always";
+    this.isNotNull = true;
+    this.hasDefault = true;
+    return this as unknown as ColumnBuilder<D, true, true, RT, never>;
+  }
+
+  /** GENERATED BY DEFAULT AS IDENTITY (Q07c): the database generates values
+   *  unless the statement supplies one. Implies NOT NULL and a default. */
+  generatedByDefaultAsIdentity(): ColumnBuilder<D, true, true, RT, WT> {
+    this.assertIdentityEligible("generatedByDefaultAsIdentity");
+    this.identityKind = "by default";
+    this.isNotNull = true;
+    this.hasDefault = true;
+    return this as unknown as ColumnBuilder<D, true, true, RT, WT>;
+  }
+
+  private assertIdentityEligible(who: string): void {
+    if (this.dataType !== "integer" && this.dataType !== "smallint" && this.dataType !== "bigint" && this.dataType !== "serial") {
+      throw new Error(`column "${this.columnName}": .${who}() — identity columns must be integer, smallint, bigint or serial`);
+    }
+    if (this.dataType === "serial") {
+      throw new Error(`column "${this.columnName}": .${who}() — serial already implies a sequence default; use integer/smallint/bigint with identity instead`);
+    }
+    if (this.arrayDimensions !== undefined) throw new Error(`column "${this.columnName}": .${who}() — identity array columns are not supported`);
+    if (this.hasDefault || this.nowDefault || this.generatedExpr !== undefined) {
+      throw new Error(`column "${this.columnName}": .${who}() — a column cannot combine identity with a default or a generation expression`);
+    }
+  }
+
+  /** GENERATED ALWAYS AS (expr) STORED (Q07c): the value is computed by the
+   *  database and cannot be written (write type `never`, runtime rejection).
+   *  Virtual generated columns are explicitly unsupported (PostgreSQL < 18
+   *  does not have them; nothing depends on them here). */
+  generatedAlwaysAs(expr: SchemaExpression, opts?: { mode?: "stored" }): ColumnBuilder<D, NN, false, RT, never> {
+    const who = `column "${this.columnName}": .generatedAlwaysAs()`;
+    if (opts?.mode !== undefined && opts.mode !== "stored") {
+      throw new Error(`${who} — mode ${JSON.stringify(opts.mode)} is not supported; only stored generated columns exist (virtual generated columns require PostgreSQL 18 and are explicitly unsupported)`);
+    }
+    if (this.generatedExpr !== undefined) throw new Error(`${who} — already generated`);
+    if (this.identityKind !== undefined || this.hasDefault || this.nowDefault) {
+      throw new Error(`${who} — a column cannot combine a generation expression with identity or a default`);
+    }
+    if (this.arrayDimensions !== undefined) throw new Error(`${who} — generated array columns are not supported`);
+    this.generatedExpr = expr;
+    return this as unknown as ColumnBuilder<D, NN, false, RT, never>;
+  }
+
+  /** Custom codec over this column's lossless representation (Q07e). The
+   *  SQL type is unchanged; decode maps codec output to the read value and
+   *  encode maps user values back before the column codec runs. Call before
+   *  `.default()` — declared defaults store the user-facing value. */
+  codec<RT2, WT2>(codec: CustomCodec<RT, WT, RT2, WT2>): ColumnBuilder<D, NN, HD, RT2, WT2> {
+    const who = `column "${this.columnName}": .codec()`;
+    if (this.customCodec !== undefined) throw new Error(`${who} — already has a custom codec`);
+    if (this.arrayDimensions !== undefined) {
+      throw new Error(`${who} — custom codecs apply to the column's own value; decode array elements in the codec of a scalar column instead`);
+    }
+    if (this.generatedExpr !== undefined || this.identityKind === "always") {
+      throw new Error(`${who} — database-generated columns cannot carry a custom codec (their values are never written through it)`);
+    }
+    if (typeof codec?.decode !== "function" || typeof codec?.encode !== "function") {
+      throw new Error(`${who} — a custom codec must be { decode, encode } functions`);
+    }
+    this.customCodec = codec as unknown as CustomCodec<unknown, unknown, unknown, unknown>;
+    return this as unknown as ColumnBuilder<D, NN, HD, RT2, WT2>;
   }
 }
 
-export type AnyColumnBuilder = ColumnBuilder<ColumnDataType, boolean, boolean, unknown>;
+export type AnyColumnBuilder = ColumnBuilder<ColumnDataType, boolean, boolean, unknown, unknown>;
 
-export type SelectTypeOf<C> = C extends ColumnBuilder<infer _D, infer NN, infer _HD, infer RT>
+/** The write (insert/update value) type of a column; `never` for columns
+ *  the database generates. */
+export type WriteTypeOf<C> = C extends ColumnBuilder<ColumnDataType, boolean, boolean, unknown, infer WT> ? WT : never;
+
+/** The value type predicates and cursors compare a column against: the
+ *  write type, or — for database-generated columns, which cannot be written
+ *  but are compared like any other — the SQL type's base write type. */
+export type PredicateValueOf<C> = C extends ColumnBuilder<infer D, boolean, boolean, unknown, infer WT>
+  ? [WT] extends [never]
+    ? JsWriteTypeOf<D>
+    : WT
+  : never;
+
+export type SelectTypeOf<C> = C extends ColumnBuilder<infer _D, infer NN, infer _HD, infer RT, unknown>
   ? NN extends true
     ? RT
     : RT | null
@@ -167,7 +332,7 @@ export type SelectTypeOf<C> = C extends ColumnBuilder<infer _D, infer NN, infer 
 export type RelationLeafTypeOf<D extends ColumnDataType> =
   D extends "serial" | "integer" | "smallint" | "double" | "real"
     ? number
-    : D extends "numeric" | "text" | "varchar" | "uuid" | "timestamp" | "timestamptz" | "date"
+    : D extends "numeric" | "text" | "varchar" | "uuid" | "timestamp" | "timestamptz" | "date" | "enum"
       ? string
       : D extends "bigint"
         ? bigint
@@ -181,26 +346,33 @@ export type RelationLeafTypeOf<D extends ColumnDataType> =
 
 /** Relation child leaf read type: the column's declared read mode, exactly
  *  like the flat path (children decode through the same codecs). */
-export type RelationSelectTypeOf<C> = C extends ColumnBuilder<infer _D, infer NN, infer _HD, infer RT>
+export type RelationSelectTypeOf<C> = C extends ColumnBuilder<infer _D, infer NN, infer _HD, infer RT, unknown>
   ? NN extends true
     ? RT
     : RT | null
   : never;
 
-export type InsertTypeOf<C> = C extends ColumnBuilder<infer D, infer NN, infer HD, any>
-  ? NN extends true
-    ? HD extends true
-      ? JsWriteTypeOf<D> | undefined
-      : D extends "serial"
-        ? JsWriteTypeOf<D> | undefined
-        : JsWriteTypeOf<D>
-    : JsWriteTypeOf<D> | null | undefined
+/** Insert value type. A write type of `never` marks a column the database
+ *  generates (GENERATED ALWAYS identity or generated expression columns):
+ *  only `undefined` (omission) is accepted. */
+export type InsertTypeOf<C> = C extends ColumnBuilder<infer D, infer NN, infer HD, unknown, infer WT>
+  ? [WT] extends [never]
+    ? undefined
+    : NN extends true
+      ? HD extends true
+        ? WT | undefined
+        : D extends "serial"
+          ? WT | undefined
+          : WT
+      : WT | null | undefined
   : never;
 
-export type UpdateTypeOf<C> = C extends ColumnBuilder<infer D, infer NN, infer _HD, any>
-  ? NN extends true
-    ? JsWriteTypeOf<D>
-    : JsWriteTypeOf<D> | null
+export type UpdateTypeOf<C> = C extends ColumnBuilder<infer _D, infer NN, infer _HD, unknown, infer WT>
+  ? [WT] extends [never]
+    ? never
+    : NN extends true
+      ? WT
+      : WT | null
   : never;
 
 // ---------------------------------------------------------------------------
@@ -216,13 +388,18 @@ export const TABLE_SYMBOL = Symbol.for("@neutron-build/sql.table");
 export interface TableMetadata<Cols extends Record<string, AnyColumnBuilder> = Record<string, AnyColumnBuilder>> {
   readonly tableName: string;
   /** SQL schema the table lives in (undefined = the connection's default
-   *  search path, effectively public). Declared through pgSchema(); the
-   *  query layer (CRUD + alias joins) renders qualified references, while
-   *  DDL emission, schema export and relational reads reject schema-declared
-   *  tables until their scoped cards (Q05/Q07). */
+   *  search path, exported as public). Declared through pgSchema(); the
+   *  query layer (CRUD + alias joins) renders qualified references and
+   *  schema export v2 exports the table under its schema (Q07), while the
+   *  legacy TS DDL emitter and relational reads reject schema-declared
+   *  tables. */
   readonly schema?: string;
   readonly columns: Cols;
   readonly indexes: TableIndex[];
+  /** Q07b: table-level constraints declared through the extras callback. */
+  readonly constraints: TableConstraint[];
+  /** Q07d: present when this handle is a view, not a base table. */
+  readonly viewDef?: ViewDefinition;
 }
 
 export interface PgTableCore<Cols extends Record<string, AnyColumnBuilder> = Record<string, AnyColumnBuilder>> {
@@ -273,6 +450,16 @@ export function getTableIndexes(table: AnyPgTable): TableIndex[] {
   return tableMetaOf(table, "getTableIndexes").indexes;
 }
 
+/** Authoritative table-level constraint list (Q07b). */
+export function getTableConstraints(table: AnyPgTable): TableConstraint[] {
+  return tableMetaOf(table, "getTableConstraints").constraints;
+}
+
+/** View definition when this handle is a view (Q07d), else undefined. */
+export function getViewDefinition(table: AnyPgTable): ViewDefinition | undefined {
+  return tableMetaOf(table, "getViewDefinition").viewDef;
+}
+
 export type InferSelectModelOf<Cols extends Record<string, AnyColumnBuilder>> = {
   [K in keyof Cols]: SelectTypeOf<Cols[K]>;
 };
@@ -280,9 +467,9 @@ export type InferSelectModelOf<Cols extends Record<string, AnyColumnBuilder>> = 
 /** Insert keys that are NOT NULL (PK implies NOT NULL) without a default.
  *  Serial columns always have a server default and are never required. */
 type InsertRequiredKeys<Cols extends Record<string, AnyColumnBuilder>> = {
-  [K in keyof Cols]-?: Cols[K] extends ColumnBuilder<"serial", boolean, boolean>
+  [K in keyof Cols]-?: Cols[K] extends ColumnBuilder<"serial", boolean, boolean, unknown, unknown>
     ? never
-    : Cols[K] extends ColumnBuilder<ColumnDataType, true, false>
+    : Cols[K] extends ColumnBuilder<ColumnDataType, true, false, unknown, unknown>
       ? K
       : never;
 }[keyof Cols];
@@ -297,18 +484,204 @@ export type InferInsertModelOf<Cols extends Record<string, AnyColumnBuilder>> = 
   }
 >;
 
+/** One index key part: a column reference or an SQL expression, with
+ *  optional per-key ordering (Q07b). Raw until export renders expressions. */
+export interface IndexKeyPartDef {
+  readonly column?: string;
+  readonly expression?: SchemaExpression;
+  readonly order?: "asc" | "desc";
+  readonly nulls?: "first" | "last";
+}
+
+export type IndexMethod = "btree" | "hash" | "gin" | "gist" | "spgist" | "brin";
+
 export class TableIndex {
+  readonly columns: string[] = [];
+  readonly keyParts: IndexKeyPartDef[] = [];
+  methodValue: IndexMethod = "btree";
+  whereExpr?: SchemaExpression;
+  readonly includeCols: string[] = [];
+
   constructor(
     readonly indexName: string,
     readonly unique: boolean,
-    readonly columns: string[] = [],
-    readonly method: "btree" | "hash" | "gin" | "gist" = "btree",
-  ) {}
+    columns: string[] = [],
+    method: IndexMethod = "btree",
+  ) {
+    this.columns = columns;
+    this.methodValue = method;
+    for (const c of columns) this.keyParts.push({ column: c });
+  }
 
-  on(...cols: Array<{ columnName: string }>): TableIndex {
-    for (const c of cols) this.columns.push(c.columnName);
+  /** Access method (Q07b). */
+  using(method: IndexMethod): TableIndex {
+    this.methodValue = method;
     return this;
   }
+
+  /** Key parts: bare columns, `asc(col)`/`desc(col)`/`ascNullsFirst(...)`-
+   *  style order specs (expr.ts), or `sql` fragments for expression keys. */
+  on(...cols: Array<{ columnName: string } | OrderSpec | SchemaExpression>): TableIndex {
+    for (const c of cols) {
+      if (typeof c === "object" && c !== null && "columnName" in c && typeof (c as { columnName: unknown }).columnName === "string") {
+        this.columns.push((c as { columnName: string }).columnName);
+        this.keyParts.push({ column: (c as { columnName: string }).columnName });
+        continue;
+      }
+      if (isOrderSpec(c)) {
+        this.keyParts.push(orderSpecKeyPart(c));
+        continue;
+      }
+      if (typeof c === "object" && c !== null && (c as { kind?: unknown }).kind === "fragment") {
+        this.keyParts.push({ expression: c as SchemaExpression });
+        continue;
+      }
+      throw new Error(`index "${this.indexName}": .on() accepts columns, order specs (asc/desc/...) or sql fragments`);
+    }
+    return this;
+  }
+
+  /** Partial-index predicate (Q07b). */
+  where(predicate: SchemaExpression): TableIndex {
+    if (this.whereExpr !== undefined) throw new Error(`index "${this.indexName}": .where() called twice`);
+    this.whereExpr = predicate;
+    return this;
+  }
+
+  /** Included columns for INCLUDE (btree only, Q07b). */
+  include(...cols: Array<{ columnName: string }>): TableIndex {
+    for (const c of cols) this.includeCols.push(c.columnName);
+    return this;
+  }
+
+  get method(): IndexMethod {
+    return this.methodValue;
+  }
+}
+
+function isOrderSpec(v: unknown): v is OrderSpec {
+  return typeof v === "object" && v !== null && "expr" in v && "direction" in v;
+}
+
+function orderSpecKeyPart(spec: OrderSpec): IndexKeyPartDef {
+  const e = spec.expr as unknown;
+  const opts = { ...(spec.nulls ? { nulls: spec.nulls } : {}), ...(spec.direction === "desc" ? { order: "desc" as const } : {}) };
+  if (typeof e === "object" && e !== null && (e as { kind?: unknown }).kind === "qualified") {
+    return { column: (e as { parts: string[] }).parts[(e as { parts: string[] }).parts.length - 1], ...opts };
+  }
+  throw new Error("index key order specs must wrap a column — ordered expression keys are explicitly unsupported (wrap the expression, order the column keys)");
+}
+
+// ---------------------------------------------------------------------------
+// Table-level constraints (Q07b)
+// ---------------------------------------------------------------------------
+
+export interface TablePrimaryKeyDef {
+  readonly kind: "primary-key";
+  readonly name?: string;
+  readonly columns: readonly string[];
+  readonly deferrable?: boolean;
+  readonly initiallyDeferred?: boolean;
+}
+
+export interface TableUniqueDef {
+  readonly kind: "unique";
+  readonly name?: string;
+  readonly columns: readonly string[];
+  readonly deferrable?: boolean;
+  readonly initiallyDeferred?: boolean;
+}
+
+export interface TableCheckDef {
+  readonly kind: "check";
+  readonly name: string;
+  readonly expression: SchemaExpression;
+  readonly deferrable?: boolean;
+  readonly initiallyDeferred?: boolean;
+}
+
+export interface TableForeignKeyShape {
+  readonly kind: "foreign-key";
+  readonly name?: string;
+  readonly columns: readonly string[];
+  readonly refTable?: AnyPgTable;
+  readonly refColumns: readonly string[];
+  readonly onDelete?: ReferentialAction;
+  readonly onUpdate?: ReferentialAction;
+  readonly match?: ForeignKeyMatch;
+  readonly deferrable?: boolean;
+  readonly initiallyDeferred?: boolean;
+}
+
+export type ForeignKeyMatch = "simple" | "full" | "partial";
+
+/** Foreign-key builder: `foreignKey({ columns: [t.a, t.b] }).references(other, [other.x, other.y], { onDelete: "cascade" })`. */
+export class TableForeignKeyDef implements TableForeignKeyShape {
+  readonly kind = "foreign-key" as const;
+  readonly name?: string;
+  readonly columns: string[];
+  refTable?: AnyPgTable;
+  refColumns: string[] = [];
+  onDelete?: ReferentialAction;
+  onUpdate?: ReferentialAction;
+  match?: ForeignKeyMatch;
+  deferrable?: boolean;
+  initiallyDeferred?: boolean;
+
+  constructor(config: { name?: string; columns: ReadonlyArray<{ columnName: string }> }) {
+    this.name = config.name;
+    this.columns = config.columns.map((c) => c.columnName);
+  }
+
+  /** Target tuple and referential behavior. */
+  references(
+    table: AnyPgTable,
+    columns: ReadonlyArray<{ columnName: string }>,
+    opts?: { onDelete?: ReferentialAction; onUpdate?: ReferentialAction; match?: ForeignKeyMatch; deferrable?: boolean; initiallyDeferred?: boolean },
+  ): this {
+    this.refTable = table;
+    this.refColumns = columns.map((c) => c.columnName);
+    this.onDelete = opts?.onDelete;
+    this.onUpdate = opts?.onUpdate;
+    this.match = opts?.match;
+    this.deferrable = opts?.deferrable;
+    this.initiallyDeferred = opts?.initiallyDeferred;
+    return this;
+  }
+}
+
+export type TableConstraint = TablePrimaryKeyDef | TableUniqueDef | TableCheckDef | TableForeignKeyDef;
+
+export function primaryKey(config: { name?: string; columns: ReadonlyArray<{ columnName: string }> }): TablePrimaryKeyDef {
+  return { kind: "primary-key", name: config.name, columns: config.columns.map((c) => c.columnName) };
+}
+
+export function unique(config: { name?: string; columns: ReadonlyArray<{ columnName: string }> }): TableUniqueDef {
+  return { kind: "unique", name: config.name, columns: config.columns.map((c) => c.columnName) };
+}
+
+export function check(name: string, expression: SchemaExpression): TableCheckDef {
+  return { kind: "check", name, expression };
+}
+
+export function foreignKey(config: { name?: string; columns: ReadonlyArray<{ columnName: string }> }): TableForeignKeyDef {
+  return new TableForeignKeyDef(config);
+}
+
+export type TableExtra = TableIndex | TableConstraint;
+
+function isTableConstraint(v: unknown): v is TableConstraint {
+  return typeof v === "object" && v !== null && "kind" in v;
+}
+
+function splitExtras(extras: TableExtra[]): { indexes: TableIndex[]; constraints: TableConstraint[] } {
+  const indexes: TableIndex[] = [];
+  const constraints: TableConstraint[] = [];
+  for (const e of extras) {
+    if (isTableConstraint(e)) constraints.push(e);
+    else indexes.push(e);
+  }
+  return { indexes, constraints };
 }
 
 export function index(name: string): TableIndex {
@@ -322,7 +695,7 @@ export function uniqueIndex(name: string): TableIndex {
 export function pgTable<Cols extends Record<string, AnyColumnBuilder>>(
   name: string,
   columns: Cols,
-  extras?: (t: PgTable<Cols>) => TableIndex[],
+  extras?: (t: PgTable<Cols>) => TableExtra[],
 ): PgTable<Cols> {
   return makeTable(name, columns, extras, undefined);
 }
@@ -330,13 +703,14 @@ export function pgTable<Cols extends Record<string, AnyColumnBuilder>>(
 function makeTable<Cols extends Record<string, AnyColumnBuilder>>(
   name: string,
   columns: Cols,
-  extras: ((t: PgTable<Cols>) => TableIndex[]) | undefined,
+  extras: ((t: PgTable<Cols>) => TableExtra[]) | undefined,
   schema: string | undefined,
 ): PgTable<Cols> {
-  const meta: { tableName: string; schema?: string; columns: Cols; indexes: TableIndex[] } = {
+  const meta: { tableName: string; schema?: string; columns: Cols; indexes: TableIndex[]; constraints: TableConstraint[] } = {
     tableName: name,
     columns,
     indexes: [],
+    constraints: [],
   };
   if (schema !== undefined) meta.schema = schema;
   const table = {
@@ -350,9 +724,12 @@ function makeTable<Cols extends Record<string, AnyColumnBuilder>>(
     col.ownerTable = table;
   }
   if (extras) {
-    // Index definitions may reference columns through the table object; they
-    // read the user-facing column properties, which cannot clobber metadata.
-    meta.indexes = extras(table);
+    // Index/constraint definitions may reference columns through the table
+    // object; they read the user-facing column properties, which cannot
+    // clobber metadata.
+    const extraList = extras(table);
+    if (!Array.isArray(extraList)) throw new Error(`pgTable("${name}"): the extras callback must return an array of index()/constraint definitions`);
+    Object.assign(meta, splitExtras(extraList));
   }
   const frozenMeta: TableMetadata<Cols> = meta;
   Object.freeze(frozenMeta);
@@ -360,25 +737,195 @@ function makeTable<Cols extends Record<string, AnyColumnBuilder>>(
 }
 
 /** A named SQL schema: `pgSchema("alt").table("users", {...})` declares
- *  `alt.users`. Query-layer surface (CRUD select/insert/update/delete and
- *  alias joins render qualified references); DDL emission, schema export and
- *  relational reads reject schema-declared tables until Q05/Q07. */
+ *  `alt.users`; `.enum(...)` declares `alt.<enum>`. The query layer (CRUD
+ *  select/insert/update/delete and alias joins) renders qualified
+ *  references and schema export v2 (Q07) exports these objects under their
+ *  schema. The legacy TS DDL emitter (schemaToDDL) and relational reads
+ *  (db.query) reject schema-declared tables. */
 export interface PgSchemaBuilder {
   readonly schemaName: string;
   table<Cols extends Record<string, AnyColumnBuilder>>(
     name: string,
     columns: Cols,
-    extras?: (t: PgTable<Cols>) => TableIndex[],
+    extras?: (t: PgTable<Cols>) => TableExtra[],
   ): PgTable<Cols>;
+  enum<const V extends readonly [string, ...string[]]>(name: string, values: V): PgEnum<V>;
+  view<Cols extends Record<string, AnyColumnBuilder>>(name: string, columns: Cols, opts: ViewOptions): PgTable<Cols>;
+}
+
+function checkSchemaObjectName(value: unknown, who: string): string {
+  if (typeof value !== "string" || value.length === 0) throw new Error(`${who} must be a non-empty string`);
+  for (const ch of value) {
+    const cp = ch.codePointAt(0)!;
+    if (cp < 0x20 || cp === 0x7f) throw new Error(`${who} must not contain control characters (including NUL)`);
+  }
+  return value;
 }
 
 export function pgSchema(schema: string): PgSchemaBuilder {
   if (typeof schema !== "string" || schema.length === 0) throw new Error("pgSchema: schema must be a non-empty string");
   if (schema.includes("\0")) throw new Error("pgSchema: schema must not contain NUL bytes");
+  checkSchemaObjectName(schema, "pgSchema: schema");
   return {
     schemaName: schema,
     table: (name, columns, extras) => makeTable(name, columns, extras, schema),
+    enum: (name, values) => makeEnum(name, values, schema),
+    view: (name, columns, opts) => makeView(name, columns, opts, schema) as PgTable<never>,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Enums (Q07)
+// ---------------------------------------------------------------------------
+// `pgEnum("mood", ["sad", "ok"])` declares the PostgreSQL enum type and
+// returns a column factory: `mood("current_mood")` is an enum column whose
+// read/write type is the literal union of the declared values. Value order
+// is semantic (PostgreSQL compares enum values by declaration order) and is
+// exported verbatim. Reads and writes validate membership at runtime, so a
+// database enum that has drifted from the declaration fails loudly instead
+// of producing values outside the declared type.
+
+export const ENUM_SYMBOL = Symbol.for("@neutron-build/sql.enum");
+
+export interface PgEnum<V extends readonly [string, ...string[]]> {
+  (columnName: string): ColumnBuilder<"enum", false, false, V[number], V[number]>;
+  readonly [ENUM_SYMBOL]: PgEnumDefinition;
+  readonly enumName: string;
+  readonly schema: string | undefined;
+  readonly enumValues: V;
+}
+
+export type AnyPgEnum = PgEnum<readonly [string, ...string[]]>;
+
+function makeEnum<const V extends readonly [string, ...string[]]>(name: string, values: V, schema: string | undefined): PgEnum<V> {
+  checkSchemaObjectName(name, "pgEnum: name");
+  if (!Array.isArray(values) || values.length === 0) throw new Error(`pgEnum("${name}"): values must be a non-empty array`);
+  const seen = new Set<string>();
+  for (const v of values) {
+    checkSchemaObjectName(v, `pgEnum("${name}"): value`);
+    if (seen.has(v)) throw new Error(`pgEnum("${name}"): value "${v}" is declared twice`);
+    seen.add(v);
+  }
+  const frozenValues = Object.freeze([...values]) as unknown as V;
+  const def: PgEnumDefinition = Object.freeze({ schema, name, values: frozenValues });
+  const factory = (columnName: string): ColumnBuilder<"enum", false, false, V[number], V[number]> => {
+    const c = new ColumnBuilder<"enum", false, false, V[number], V[number]>(columnName, "enum");
+    c.enumDef = def;
+    return c;
+  };
+  Object.defineProperty(factory, ENUM_SYMBOL, { value: def, enumerable: false });
+  Object.defineProperty(factory, "enumName", { value: name, enumerable: true });
+  Object.defineProperty(factory, "schema", { value: schema, enumerable: true });
+  Object.defineProperty(factory, "enumValues", { value: frozenValues, enumerable: true });
+  return Object.freeze(factory) as unknown as PgEnum<V>;
+}
+
+/** Declare an enum type in the default schema (exported as public). */
+export function pgEnum<const V extends readonly [string, ...string[]]>(name: string, values: V): PgEnum<V> {
+  return makeEnum(name, values, undefined);
+}
+
+export function isPgEnum(value: unknown): value is AnyPgEnum {
+  return typeof value === "function" && typeof (value as { [ENUM_SYMBOL]?: unknown })[ENUM_SYMBOL] === "object";
+}
+
+/** Enum definition of an enum object. */
+export function getEnumDefinition(value: AnyPgEnum): PgEnumDefinition {
+  return value[ENUM_SYMBOL];
+}
+
+// ---------------------------------------------------------------------------
+// Views (Q07d)
+// ---------------------------------------------------------------------------
+// A view handle is a read-only table: the same symbol-keyed metadata shape
+// (so select/join/projection paths accept it unchanged) plus a viewDef
+// record. Its columns are clones of the projection columns with ownerTable
+// rebound to the view, so references render view-qualified. Mutations
+// (insert/update/delete) and relational reads reject view handles.
+
+export interface ViewDefinition {
+  readonly definition: SchemaExpression;
+  readonly checkOption?: "local" | "cascaded";
+  readonly securityInvoker?: boolean;
+}
+
+function cloneColumnForView(column: AnyColumnBuilder, view: AnyPgTable): AnyColumnBuilder {
+  const c = new ColumnBuilder(column.columnName, column.dataType);
+  c.readMode = column.readMode;
+  c.valueDecoder = column.valueDecoder;
+  c.varcharLength = column.varcharLength;
+  c.vectorDimensions = column.vectorDimensions;
+  c.arrayDimensions = column.arrayDimensions;
+  c.enumDef = column.enumDef;
+  c.identityKind = column.identityKind;
+  c.generatedExpr = column.generatedExpr;
+  c.customCodec = column.customCodec;
+  c.isNotNull = column.isNotNull;
+  c.hasDefault = column.hasDefault;
+  c.defaultValue = column.defaultValue;
+  c.nowDefault = column.nowDefault;
+  c.canonicalText = column.canonicalText;
+  c.ownerTable = view;
+  return c as AnyColumnBuilder;
+}
+
+export interface ViewOptions {
+  /** View body: SQL text or a `sql` template over the source tables'
+   *  columns (references keep their table qualification). */
+  definition: SchemaExpression;
+  checkOption?: "local" | "cascaded";
+  securityInvoker?: boolean;
+}
+
+function makeView(name: string, columns: Record<string, AnyColumnBuilder>, opts: ViewOptions, schema: string | undefined): AnyPgTable {
+  checkSchemaObjectName(name, "pgView: name");
+  if (opts === null || typeof opts !== "object" || !("definition" in opts)) {
+    throw new Error(`pgView("${name}"): options must carry the view { definition }`);
+  }
+  if (opts.checkOption !== undefined && opts.checkOption !== "local" && opts.checkOption !== "cascaded") {
+    throw new Error(`pgView("${name}"): checkOption must be "local" or "cascaded"`);
+  }
+  const view: { [TABLE_SYMBOL]?: unknown; $inferSelect?: never; $inferInsert?: never } = {
+    [TABLE_SYMBOL]: {
+      tableName: name,
+      columns: {},
+      indexes: [],
+      constraints: [],
+      viewDef: {
+        definition: opts.definition,
+        ...(opts.checkOption ? { checkOption: opts.checkOption } : {}),
+        ...(opts.securityInvoker === true ? { securityInvoker: true } : {}),
+      },
+    },
+    $inferSelect: undefined as never,
+    $inferInsert: undefined as never,
+  };
+  if (schema !== undefined) (view[TABLE_SYMBOL] as { schema?: string }).schema = schema;
+  const meta = view[TABLE_SYMBOL] as TableMetadata;
+  const viewHandle = view as unknown as AnyPgTable;
+  const cloned: Record<string, AnyColumnBuilder> = {};
+  for (const [key, col] of Object.entries(columns)) {
+    cloned[key] = cloneColumnForView(col, viewHandle);
+  }
+  (meta as { columns: unknown }).columns = cloned;
+  const handle = { ...view, ...cloned } as unknown as AnyPgTable;
+  (handle as { [TABLE_SYMBOL]?: unknown })[TABLE_SYMBOL] = meta;
+  for (const col of Object.values(cloned)) {
+    col.ownerTable = handle;
+  }
+  Object.freeze(meta);
+  return handle;
+}
+
+/** Declare a view in the default schema (exported as public). Columns are
+ *  typically source-table handles: `pgView("active", { id: users.id },
+ *  { definition: sql`select ...` })`. Views are read-only. */
+export function pgView<Cols extends Record<string, AnyColumnBuilder>>(name: string, columns: Cols, opts: ViewOptions): PgTable<Cols> {
+  return makeView(name, columns, opts, undefined) as PgTable<Cols>;
+}
+
+export function isPgView(value: unknown): value is AnyPgTable {
+  return isPgTable(value) && getViewDefinition(value) !== undefined;
 }
 
 export function isPgTable(value: unknown): value is AnyPgTable {
@@ -535,6 +1082,16 @@ export function rejectDerivedTable(value: unknown, who: string): void {
     const rec = value[DERIVED_MARKER];
     throw new Error(
       `${who}: received the ${rec.kind === "cte" ? "CTE" : "derived-table"} handle "${rec.name}" — these are query-surface identities (from/joins/selects only); pass a pgTable here`,
+    );
+  }
+}
+
+/** Fail closed when a view handle reaches a mutation slot (Q07d): views are
+ *  read-only here — no auto-updatable-view inference. */
+export function rejectViewHandle(value: unknown, who: string): void {
+  if (isPgTable(value) && getViewDefinition(value) !== undefined) {
+    throw new Error(
+      `${who}: "${getTableName(value)}" is a view — views are read-only in neutron-sql (no auto-updatable-view inference); write to a base table instead`,
     );
   }
 }

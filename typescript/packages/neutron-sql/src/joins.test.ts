@@ -5,6 +5,7 @@ import {
   and,
   asc,
   astSelect,
+  canonicalSchemaJson,
   compileStatement,
   createDatabase,
   eq,
@@ -234,10 +235,15 @@ test("joins: same SQL table name in two schemas joins without collision", () => 
   assert.equal(pred.sql, 'select "users"."id", "users"."email", "users"."name" from "users" where ("alt"."users"."email" in ($1, $2))');
 });
 
-test("joins: schema-qualified surfaces fail closed outside the query layer", () => {
-  assert.throws(() => schemaToDDL([altUsers]), /Q07.*query layer/s);
-  assert.throws(() => exportSchema({ altUsers }), /Q07.*query layer/s);
-  assert.throws(() => exportSchemaV2({ altUsers }), /Q07.*query layer/s);
+test("joins: schema-qualified surfaces outside the query layer (Q07)", () => {
+  assert.throws(() => schemaToDDL([altUsers]), /legacy DDL emitter covers the default search path only; use schema export v2/);
+  assert.throws(() => exportSchema({ altUsers }), /v1 export shape covers the default search path only/);
+  // Q07: export v2 owns schema-qualified export now.
+  const doc = exportSchemaV2({ altUsers });
+  assert.equal(doc.tables.length, 1);
+  assert.deepEqual(doc.tables[0].identity, { schema: "alt", name: "users" });
+  assert.deepEqual(doc.schemas.map((s) => s.name), ["alt", "public"]);
+  assert.doesNotThrow(() => JSON.parse(canonicalSchemaJson(doc)));
   assert.rejects(
     createDatabase({ url: "postgres://snapshot:nouser@127.0.0.1:1/none", driverOptions: { driver: "postgres" }, tables: { altUsers } }),
     /Q05\/Q07/,

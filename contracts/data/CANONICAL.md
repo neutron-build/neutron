@@ -72,6 +72,20 @@ Sequences that are **ordered tuples** are preserved verbatim:
 - index `key` parts (btree column order is semantic);
 - enum `values` (PostgreSQL enum order is semantic).
 
+Index key parts carry per-part ordering (`order`, `nulls`) in **minimal
+form**: `order` is written only for `desc` (ascending is the default) and
+`nulls` only when it is not the direction default (`asc` defaults to
+`nulls last`, `desc` to `nulls first`). This is exactly what introspection
+derives from `pg_index.indoption` (bit 0x0001 = desc, bit 0x0002 = nulls
+first), so a desired document and the introspected state of the database it
+describes canonicalize identically: `a desc`, `b nulls first`,
+`c desc nulls last` — never `a desc nulls first` (redundant) or `b asc`
+(redundant).
+
+A generated column carries `generated.expression` (GENERATED ALWAYS AS
+(...) STORED). Virtual generated columns are not representable in v2
+(explicitly unsupported); introspection reports them as opaque structure.
+
 ## 3. Hash
 
 `SHA-256` over the canonical UTF-8 bytes, reported as lowercase hex. The

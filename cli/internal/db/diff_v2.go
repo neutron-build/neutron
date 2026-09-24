@@ -270,6 +270,9 @@ func tableHasComparableExpressions(t *V2Table) bool {
 		if c.Default != nil && (c.Default.Kind == "literal" || c.Default.Kind == "expression") {
 			return true
 		}
+		if c.Generated != nil {
+			return true
+		}
 	}
 	for _, con := range t.Constraints {
 		if con.Type == "check" && con.Expression != nil {
@@ -549,11 +552,36 @@ func (p *v2Planner) planTables() error {
 	ordered, deferredFKs := orderV2Creates(&p.desired, toCreate)
 	for _, id := range ordered {
 		t := p.desired.Table(id)
+		// Sequence defaults (serial columns) reference a sequence the
+		// document implies but never declares as an object: create it
+		// before the table (the default's nextval resolves at create
+		// time) and attach ownership after, so the sequence drops with
+		// its column exactly like a native serial sequence.
+		var ownedSeqs []struct{ seq, stmt string }
+		for _, c := range t.Columns {
+			if c.Default != nil && c.Default.Kind == "sequence" && c.Default.Sequence != nil {
+				seq := *c.Default.Sequence
+				seqQ := qualifiedNameSQL(seq)
+				// Idempotent: the sequence may pre-exist as a standalone
+				// (or extension-owned) object the document only
+				// references. Ownership is attached only when the sequence
+				// is not already an inventoried opaque object — standalone
+				// sequences stay standalone and never drop with the table.
+				p.emitRaw(fmt.Sprintf("create sequence if not exists %s", seqQ), fmt.Sprintf("-- sequence %s: no down statement (it may predate this plan)", seqQ))
+				preexisting := p.actual.OpaqueEntry("unsupported-object", seq) != nil || p.actual.OpaqueEntry("extension-object", seq) != nil
+				if !preexisting {
+					ownedSeqs = append(ownedSeqs, struct{ seq, stmt string }{seqQ, fmt.Sprintf("alter sequence %s owned by %s.%s", seqQ, qualifiedNameSQL(id), quoteIdent(c.Name))})
+				}
+			}
+		}
 		ddl, err := createV2TableSQL(*t, deferredFKs[id])
 		if err != nil {
 			return err
 		}
 		p.emitRaw(ddl, fmt.Sprintf("drop table if exists %s", qualifiedNameSQL(id)))
+		for _, own := range ownedSeqs {
+			p.emitRaw(own.stmt, fmt.Sprintf("alter sequence %s owned by none", own.seq))
+		}
 		for _, idx := range t.Indexes {
 			idxDDL, err := createV2IndexSQL(*t, idx)
 			if err != nil {
@@ -873,6 +901,36 @@ func (p *v2Planner) planColumnAttributes(table V2Identity, dc, ac V2Column) erro
 	cq := quoteIdent(dc.Name)
 	typeChanged := !dc.Type.SameAs(ac.Type)
 
+	// Generated-column transitions (Q07c). PostgreSQL cannot attach a
+	// generation expression to an existing column; converting away from
+	// generated keeps the computed values as plain data and is explicitly
+	// irreversible (no down statement can restore the expression).
+	switch {
+	case dc.Generated != nil && ac.Generated == nil:
+		return fmt.Errorf(
+			"table %s: column %q cannot become a generated column — PostgreSQL cannot attach a generation expression to an existing column; add a new generated column and backfill instead",
+			table, dc.Name)
+	case dc.Generated == nil && ac.Generated != nil:
+		p.warn("table %s: column %q drops its generation expression; the last computed values are kept as plain data and the expression is lost (irreversible)", table, dc.Name)
+		p.emit(
+			fmt.Sprintf("alter table %s alter column %s drop expression", tq, cq),
+			fmt.Sprintf("-- column %s: no down statement — PostgreSQL cannot attach a generation expression to an existing column (was: generated always as (%s) stored)", cq, ac.Generated.Expression),
+		)
+	case dc.Generated != nil && ac.Generated != nil:
+		if !p.textEqual(table, "column "+dc.Name+" generation expression", &dc.Generated.Expression, &ac.Generated.Expression) {
+			p.warn("table %s: generated column %q changes its expression via ALTER COLUMN ... SET EXPRESSION (PostgreSQL 17+; older servers reject the statement and the plan rolls back) — the table is rewritten to recompute values", table, dc.Name)
+			p.emit(
+				fmt.Sprintf("alter table %s alter column %s set expression as (%s)", tq, cq, dc.Generated.Expression),
+				fmt.Sprintf("alter table %s alter column %s set expression as (%s)", tq, cq, ac.Generated.Expression),
+			)
+		}
+	}
+	if typeChanged && (dc.Generated != nil || ac.Generated != nil) {
+		return fmt.Errorf(
+			"table %s: generated column %q cannot change type — PostgreSQL requires dropping and re-adding the column; plan it explicitly",
+			table, dc.Name)
+	}
+
 	if typeChanged {
 		newType, err := v2TypeDDL(dc.Type)
 		if err != nil {
@@ -933,6 +991,23 @@ func (p *v2Planner) planDefaultChange(table V2Identity, dc, ac V2Column) error {
 	dd, ad := dc.Default, ac.Default
 
 	setDefault := func(newDef *V2ColumnDefault, inverse string) {
+		if newDef.Kind == "sequence" && newDef.Sequence != nil {
+			// The sequence is implied by the default, never declared as an
+			// object; it may not exist yet on an altered table. If-not-
+			// exists, no down statement (a pre-existing sequence must not
+			// be dropped by rolling this plan back).
+			seqQ := qualifiedNameSQL(*newDef.Sequence)
+			p.emitRaw(fmt.Sprintf("create sequence if not exists %s", seqQ), fmt.Sprintf("-- sequence %s: no down statement (it may predate this plan)", seqQ))
+			// Mirror the create-table path: a sequence this plan had to
+			// create becomes OWNED BY the column, so introspection reads
+			// it as implied by the default (not a standalone unsupported
+			// object) and it drops with the table. Pre-existing
+			// inventoried opaque sequences stay standalone (M02).
+			preexisting := p.actual.OpaqueEntry("unsupported-object", *newDef.Sequence) != nil || p.actual.OpaqueEntry("extension-object", *newDef.Sequence) != nil
+			if !preexisting {
+				p.emitRaw(fmt.Sprintf("alter sequence %s owned by %s.%s", seqQ, tq, cq), fmt.Sprintf("alter sequence %s owned by none", seqQ))
+			}
+		}
 		p.emit(
 			fmt.Sprintf("alter table %s alter column %s set default %s", tq, cq, defaultSQL(*newDef)),
 			inverse,
@@ -1242,6 +1317,9 @@ func (p *v2Planner) indexEqualAfterRenames(table V2Identity, di, ai V2Index) boo
 		equal = false
 	} else {
 		for i := range di.Key {
+			if !sameKeyPartOrdering(di.Key[i], ai.Key[i]) {
+				equal = false
+			}
 			if di.Key[i].Column != nil && ai.Key[i].Column != nil {
 				if *di.Key[i].Column != p.actualToDesiredName(table, *ai.Key[i].Column) {
 					equal = false
@@ -1257,6 +1335,27 @@ func (p *v2Planner) indexEqualAfterRenames(table V2Identity, di, ai V2Index) boo
 		equal = false
 	}
 	return equal
+}
+
+// canonicalKeyPartOrdering reduces a key part's ordering to its effective
+// PostgreSQL meaning: (descending, nullsFirst). An explicit "asc", or a
+// nulls placement equal to the direction default (ASC -> NULLS LAST, DESC ->
+// NULLS FIRST), is the same catalog state as omission — introspection writes
+// the minimal form, so desired documents spelling the defaults explicitly
+// must compare equal or the diff never converges.
+func canonicalKeyPartOrdering(k V2IndexKeyPart) (desc bool, nullsFirst bool) {
+	desc = k.Order != nil && *k.Order == "desc"
+	nullsFirst = desc
+	if k.Nulls != nil {
+		nullsFirst = *k.Nulls == "first"
+	}
+	return desc, nullsFirst
+}
+
+func sameKeyPartOrdering(a, b V2IndexKeyPart) bool {
+	ad, an := canonicalKeyPartOrdering(a)
+	bd, bn := canonicalKeyPartOrdering(b)
+	return ad == bd && an == bn
 }
 
 func (p *v2Planner) textEqual(table V2Identity, what string, desired, actual *string) bool {
@@ -1483,8 +1582,12 @@ func (p *v2Planner) planEnumDrops(droppedInPlan map[V2Identity]bool) {
 	}
 }
 
+// securityInvokerOn reads the effective security_invoker setting: absent
+// and explicit false are the same PostgreSQL state (the default).
+func securityInvokerOn(b *bool) bool { return b != nil && *b }
+
 func (p *v2Planner) viewEqual(dv, av V2View) bool {
-	if !equalStrPtrs(dv.CheckOption, av.CheckOption) || !equalBoolPtrs(dv.SecurityInvoker, av.SecurityInvoker) {
+	if !equalStrPtrs(dv.CheckOption, av.CheckOption) || securityInvokerOn(dv.SecurityInvoker) != securityInvokerOn(av.SecurityInvoker) {
 		return false
 	}
 	if dv.Definition == av.Definition {
@@ -1618,6 +1721,9 @@ func v2ColumnDDL(c V2Column) (string, error) {
 		return "", fmt.Errorf("column %q: %w", c.Name, err)
 	}
 	parts := []string{quoteIdent(c.Name), typeSQL}
+	if c.Generated != nil {
+		parts = append(parts, "generated always as ("+c.Generated.Expression+") stored")
+	}
 	if c.Default != nil {
 		switch c.Default.Kind {
 		case "identity":
@@ -1738,13 +1844,29 @@ func createV2IndexSQL(t V2Table, idx V2Index) (string, error) {
 func indexBodySQL(idx V2Index) (string, error) {
 	parts := make([]string, 0, len(idx.Key))
 	for _, k := range idx.Key {
+		var body string
 		if k.Column != nil {
-			parts = append(parts, quoteIdent(*k.Column))
+			body = quoteIdent(*k.Column)
 		} else if k.Expression != nil {
-			parts = append(parts, "("+*k.Expression+")")
+			body = "(" + *k.Expression + ")"
 		} else {
 			return "", fmt.Errorf("index %q has a key part with neither column nor expression", idx.Identity.Name)
 		}
+		// Key-part ordering is stored in minimal form: order written only
+		// for desc, nulls only when non-default for the direction.
+		desc, nullsFirst := canonicalKeyPartOrdering(k)
+		if desc {
+			body += " desc"
+		}
+		if nullsFirst != desc {
+			// Non-default placement for the direction.
+			if nullsFirst {
+				body += " nulls first"
+			} else {
+				body += " nulls last"
+			}
+		}
+		parts = append(parts, body)
 	}
 	sql := "using " + idx.Method + " (" + strings.Join(parts, ", ") + ")"
 	if len(idx.Include) > 0 {

@@ -676,13 +676,18 @@ function validIdent(name: string, what: string): string {
 
 const KEYWORD_OR_IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const OPERATORS = new Set(["=", "<>", "!=", "<", "<=", ">", ">=", "+", "-", "*", "/", "%", "||", "and", "or", "like", "ilike", "is", "is not", "in", "not in"]);
-const CAST_TYPE_NAME = /^[a-z][a-z0-9_]*$/;
+// Plain lowercase type names, optionally a one-dimensional array (`int4[]`),
+// or a double-quoted (optionally schema-qualified) user type such as an enum
+// (`"mood"[]`, `"app"."mood"`). Quoted parts must double embedded quotes, so
+// the cast can never terminate its identifier early (Q07).
+const QUOTED_TYPE_PART = String.raw`"(?:[^"\u0000]|"")+"`;
+const CAST_TYPE_NAME = new RegExp(String.raw`^(?:[a-z][a-z0-9_]*|${QUOTED_TYPE_PART}(?:\.${QUOTED_TYPE_PART})?)(?:\[\])?$`);
 
 /** Text-typed parameter cast (`$n::text::<cast>`). Only plain lowercase type
  *  names are accepted; validated here and again at the compile choke point. */
 export function validParamCast(cast: string): string {
   if (typeof cast !== "string" || !CAST_TYPE_NAME.test(cast)) {
-    throw new Error(`paramCast: cast must be a plain lowercase type name, got ${JSON.stringify(cast)}`);
+    throw new Error(`paramCast: cast must be a plain lowercase type name or a quoted (qualified) type, optionally with [], got ${JSON.stringify(cast)}`);
   }
   return cast;
 }

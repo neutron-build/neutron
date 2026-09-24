@@ -4,25 +4,60 @@
 // Deterministic: same schema in, same SQL out. This is the source the P1
 // migration generator diffs against introspected databases.
 
-import { getTableColumns, getTableName, getTableIndexes, getTableSchema, rejectDerivedTable } from "./schema.js";
+import { getTableColumns, getTableName, getTableIndexes, getTableSchema, getTableConstraints, rejectDerivedTable, getViewDefinition } from "./schema.js";
 import type { AnyColumnBuilder, AnyPgTable } from "./schema.js";
 import { qident } from "./expr.js";
 import { quoteStringLiteral } from "./compile.js";
 
-/** DDL/migration emission covers default-search-path tables only. A declared
- *  schema would silently emit DDL against the wrong (search-path) location,
- *  so schema-qualified tables fail closed here until Q07 owns them. */
-function assertPlainTable(table: AnyPgTable, who: string): void {
-  rejectDerivedTable(table, who);
+/** The legacy DDL emitter covers the pre-Q07 surface only (default
+ *  search-path tables, plain columns, column-level constraints, simple
+ *  column indexes). Every Q07 feature fails closed here instead of emitting
+ *  lossy SQL — the schema export v2 document plus the CLI planner own the
+ *  full surface (Q07). */
+function assertLegacySurface(table: AnyPgTable, who: string): void {
+  rejectDerivedTable(table, "schemaToDDL");
+  if (getViewDefinition(table) !== undefined) {
+    throw new Error(`${who}: "${getTableName(table)}" is a view — the legacy DDL emitter does not support views; use schema export v2`);
+  }
   const schema = getTableSchema(table);
   if (schema !== undefined) {
     throw new Error(
-      `${who}: table "${schema}"."${getTableName(table)}" declares a schema — DDL/migration emission for schema-qualified tables lands with Q07 (the query layer supports them)`,
+      `${who}: table "${schema}"."${getTableName(table)}" declares a schema — the legacy DDL emitter covers the default search path only; use schema export v2 (Q07)`,
     );
+  }
+  if (getTableConstraints(table).length > 0) {
+    throw new Error(
+      `${who}: table "${getTableName(table)}" declares table-level constraints — the legacy DDL emitter cannot emit them; use schema export v2 (Q07)`,
+    );
+  }
+  for (const idx of getTableIndexes(table)) {
+    if (idx.keyParts.some((p) => p.expression !== undefined || p.order !== undefined || p.nulls !== undefined) || idx.whereExpr !== undefined || idx.includeCols.length > 0) {
+      throw new Error(
+        `${who}: index "${idx.indexName}" uses expressions, ordering options, a predicate or INCLUDE — the legacy DDL emitter cannot emit it; use schema export v2 (Q07)`,
+      );
+    }
+  }
+  for (const col of Object.values(getTableColumns(table)) as AnyColumnBuilder[]) {
+    const at = `${who}: column "${col.columnName}" of "${getTableName(table)}"`;
+    if (col.dataType === "enum" || col.enumDef !== undefined) throw new Error(`${at} is an enum column — the legacy DDL emitter cannot emit enum types; use schema export v2 (Q07)`);
+    if (col.arrayDimensions !== undefined) throw new Error(`${at} is an array column — the legacy DDL emitter cannot emit array types; use schema export v2 (Q07)`);
+    if (col.identityKind !== undefined) throw new Error(`${at} is an identity column — the legacy DDL emitter cannot emit identity; use schema export v2 (Q07)`);
+    if (col.generatedExpr !== undefined) throw new Error(`${at} is a generated column — the legacy DDL emitter cannot emit generation expressions; use schema export v2 (Q07)`);
+    if (col.foreignKey?.onUpdate !== undefined) throw new Error(`${at} declares a foreign key with ON UPDATE — the legacy DDL emitter drops it; use schema export v2 (Q07)`);
   }
 }
 
+function assertPlainTable(table: AnyPgTable, who: string): void {
+  assertLegacySurface(table, who);
+}
+
 export function sqlTypeOf(col: AnyColumnBuilder): string {
+  if (col.arrayDimensions !== undefined) {
+    throw new Error(`column "${col.columnName}": array columns have no legacy SQL type spelling — use schema export v2 (Q07)`);
+  }
+  if (col.dataType === "enum") {
+    throw new Error(`column "${col.columnName}": enum columns have no legacy SQL type spelling — use schema export v2 (Q07)`);
+  }
   switch (col.dataType) {
     case "serial":
       return "serial";

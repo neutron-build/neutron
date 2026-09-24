@@ -99,10 +99,17 @@ func (t V2ColumnType) SameAs(o V2ColumnType) bool {
 }
 
 type V2Column struct {
-	Name    string           `json:"name"`
-	Type    V2ColumnType     `json:"type"`
-	NotNull bool             `json:"notNull"`
-	Default *V2ColumnDefault `json:"default,omitempty"`
+	Name      string           `json:"name"`
+	Type      V2ColumnType     `json:"type"`
+	NotNull   bool             `json:"notNull"`
+	Default   *V2ColumnDefault `json:"default,omitempty"`
+	Generated *V2Generated     `json:"generated,omitempty"`
+}
+
+// V2Generated is a stored generated-column expression (GENERATED ALWAYS AS
+// (expression) STORED; virtual generated columns are not representable).
+type V2Generated struct {
+	Expression string `json:"expression"`
 }
 
 type V2FKReference struct {
@@ -126,6 +133,8 @@ type V2Constraint struct {
 type V2IndexKeyPart struct {
 	Column     *string `json:"column,omitempty"`
 	Expression *string `json:"expression,omitempty"`
+	Order      *string `json:"order,omitempty"` // asc | desc (minimal form: only desc is written)
+	Nulls      *string `json:"nulls,omitempty"` // first | last (minimal form: only non-default for the direction)
 }
 
 type V2Index struct {

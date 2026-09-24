@@ -1,0 +1,96 @@
+{
+  "version": 2,
+  "dialect": "postgresql",
+  "capabilities": [],
+  "schemas": [
+    {
+      "name": "public"
+    }
+  ],
+  "enums": [],
+  "tables": [
+    {
+      "identity": {
+        "schema": "public",
+        "name": "invoices"
+      },
+      "managed": true,
+      "columns": [
+        {
+          "name": "id",
+          "type": {
+            "name": "int4",
+            "codec": "number"
+          },
+          "notNull": true,
+          "default": {
+            "kind": "identity",
+            "generated": "always"
+          }
+        },
+        {
+          "name": "revision",
+          "type": {
+            "name": "int8",
+            "codec": "bigint"
+          },
+          "notNull": true,
+          "default": {
+            "kind": "identity",
+            "generated": "by default"
+          }
+        },
+        {
+          "name": "number",
+          "type": {
+            "name": "text",
+            "codec": "string"
+          },
+          "notNull": true
+        },
+        {
+          "name": "net",
+          "type": {
+            "name": "numeric",
+            "codec": "decimal-string"
+          },
+          "notNull": true
+        },
+        {
+          "name": "gross",
+          "type": {
+            "name": "numeric",
+            "codec": "decimal-string"
+          },
+          "notNull": false,
+          "generated": {
+            "expression": "net * 1.19"
+          }
+        },
+        {
+          "name": "stamp",
+          "type": {
+            "name": "text",
+            "codec": "string"
+          },
+          "notNull": false,
+          "generated": {
+            "expression": "btrim(number)"
+          }
+        }
+      ],
+      "constraints": [
+        {
+          "name": "invoices_pkey",
+          "type": "primary-key",
+          "columns": [
+            "id"
+          ]
+        }
+      ],
+      "indexes": []
+    }
+  ],
+  "views": [],
+  "opaque": []
+}

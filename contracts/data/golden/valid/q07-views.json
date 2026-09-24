@@ -1,0 +1,38 @@
+{
+  "version": 2,
+  "dialect": "postgresql",
+  "capabilities": [],
+  "schemas": [{ "name": "app" }, { "name": "public" }],
+  "enums": [{ "identity": { "schema": "app", "name": "role" }, "managed": true, "values": ["reader", "writer"] }],
+  "tables": [
+    {
+      "identity": { "schema": "app", "name": "members" },
+      "managed": true,
+      "columns": [
+        { "name": "id", "type": { "name": "int4", "codec": "number" }, "notNull": true },
+        { "name": "email", "type": { "name": "text", "codec": "string" }, "notNull": true },
+        { "name": "role", "type": { "name": "enum", "codec": "enum", "enum": { "schema": "app", "name": "role" } }, "notNull": true }
+      ],
+      "constraints": [
+        { "name": "members_pkey", "type": "primary-key", "columns": ["id"] },
+        { "name": "members_email_key", "type": "unique", "columns": ["email"] }
+      ],
+      "indexes": []
+    }
+  ],
+  "views": [
+    {
+      "identity": { "schema": "app", "name": "writers" },
+      "managed": true,
+      "definition": "select id, email from app.members where role = 'writer'",
+      "checkOption": "cascaded",
+      "securityInvoker": true
+    },
+    {
+      "identity": { "schema": "public", "name": "member_count" },
+      "managed": true,
+      "definition": "select count(*) as n from app.members"
+    }
+  ],
+  "opaque": []
+}

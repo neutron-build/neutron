@@ -161,12 +161,21 @@
     },
     "column": {
       "type": "object",
-      "description": "Table column. Absence of default means no default. Primary-key columns must declare notNull: true explicitly (validators reject otherwise; v2 performs no silent normalization).",
+      "description": "Table column. Absence of default means no default. Primary-key columns must declare notNull: true explicitly (validators reject otherwise; v2 performs no silent normalization). A generated column carries its stored expression in generated and never a default; virtual generated columns are not representable (explicitly unsupported).",
       "properties": {
         "name": { "$ref": "#/$defs/name" },
         "type": { "$ref": "#/$defs/columnType" },
         "notNull": { "type": "boolean" },
-        "default": { "$ref": "#/$defs/columnDefault" }
+        "default": { "$ref": "#/$defs/columnDefault" },
+        "generated": {
+          "type": "object",
+          "properties": {
+            "expression": { "$ref": "#/$defs/sqlText" }
+          },
+          "required": ["expression"],
+          "additionalProperties": false,
+          "description": "GENERATED ALWAYS AS (expression) STORED. Database-computed; never written."
+        }
       },
       "required": ["name", "type", "notNull"],
       "additionalProperties": false
@@ -248,18 +257,26 @@
             "oneOf": [
               {
                 "type": "object",
-                "properties": { "column": { "$ref": "#/$defs/name" } },
+                "properties": {
+                  "column": { "$ref": "#/$defs/name" },
+                  "order": { "enum": ["asc", "desc"] },
+                  "nulls": { "enum": ["first", "last"] }
+                },
                 "required": ["column"],
                 "additionalProperties": false
               },
               {
                 "type": "object",
-                "properties": { "expression": { "$ref": "#/$defs/sqlText" } },
+                "properties": {
+                  "expression": { "$ref": "#/$defs/sqlText" }
+                },
                 "required": ["expression"],
-                "additionalProperties": false
+                "additionalProperties": false,
+                "description": "Expression key parts cannot carry per-part ordering: per-part deparse is engine-dependent, so ordered expression keys are explicitly unsupported (validators reject order/nulls here)."
               }
             ]
-          }
+          },
+          "description": "Ordered key parts. Per-part ordering is stored in minimal form (Q07): order is written only for desc (asc is the default), nulls only when it is not the direction default (asc defaults to nulls last, desc to nulls first). This matches what introspection derives from pg_index.indoption, so desired and introspected documents canonicalize identically."
         },
         "where": { "$ref": "#/$defs/sqlText", "description": "Partial-index predicate, verbatim." },
         "include": {

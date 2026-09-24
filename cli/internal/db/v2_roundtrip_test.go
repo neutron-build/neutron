@@ -259,8 +259,7 @@ const m02Doc1 = `{
 				 "default": {"kind": "identity", "generated": "by default"}},
 				{"name": "post_author", "type": {"name": "int8", "codec": "bigint"}, "notNull": true},
 				{"name": "post_slug", "type": {"name": "varchar", "codec": "string", "params": {"length": 120}}, "notNull": true},
-				{"name": "moods", "type": {"name": "enum", "codec": "array", "array": true, "enum": {"schema": "public", "name": "mood"}}, "notNull": true,
-				 "default": {"kind": "literal", "sql": "'{}'"}}
+				{"name": "moods", "type": {"name": "enum", "codec": "array", "array": true, "enum": {"schema": "public", "name": "mood"}}, "notNull": true}
 			],
 			"constraints": [
 				{"name": "comments_pkey", "type": "primary-key", "columns": ["id"]},
@@ -441,8 +440,7 @@ const m02Doc2 = `{
 				 "default": {"kind": "identity", "generated": "by default"}},
 				{"name": "post_author", "type": {"name": "int8", "codec": "bigint"}, "notNull": true},
 				{"name": "post_slug", "type": {"name": "varchar", "codec": "string", "params": {"length": 120}}, "notNull": true},
-				{"name": "moods", "type": {"name": "enum", "codec": "array", "array": true, "enum": {"schema": "public", "name": "mood"}}, "notNull": true,
-				 "default": {"kind": "literal", "sql": "'{}'"}},
+				{"name": "moods", "type": {"name": "enum", "codec": "array", "array": true, "enum": {"schema": "public", "name": "mood"}}, "notNull": true},
 				{"name": "author", "type": {"name": "int8", "codec": "bigint"}, "notNull": true}
 			],
 			"constraints": [
@@ -570,7 +568,12 @@ func TestV2DropOrderingAndCycles(t *testing.T) {
 
 func TestV2UnsupportedObjectsUntouchedAndBlocking(t *testing.T) {
 	h := newM02Harness(t, "unsup")
+	// Stored generated columns are representable since Q07; the table stays
+	// deliberately unrepresentable through its NULLS NOT DISTINCT unique
+	// constraint (Q07 opaque class), while keeping the generated column so
+	// the fixture still proves generated support does not unblock it.
 	h.exec(`CREATE TABLE gen_t (pos int, g int GENERATED ALWAYS AS (pos * 2) STORED)`)
+	h.exec(`ALTER TABLE gen_t ADD CONSTRAINT gen_nnd UNIQUE NULLS NOT DISTINCT (pos)`)
 	h.exec(`CREATE MATERIALIZED VIEW mat_v AS SELECT pos FROM gen_t`)
 	h.exec(`CREATE SEQUENCE leftover_seq`)
 	h.exec(`CREATE TABLE trig_t (id int PRIMARY KEY)`)
@@ -609,8 +612,8 @@ func TestV2UnsupportedObjectsUntouchedAndBlocking(t *testing.T) {
 		}
 	}
 	for _, o := range am.Opaque {
-		if o.Identity.Name == "gen_t" && !strings.Contains(o.Reason, "generated column") {
-			t.Fatalf("gen_t reason must name the generated column: %s", o.Reason)
+		if o.Identity.Name == "gen_t" && !strings.Contains(o.Reason, "NULLS NOT DISTINCT") {
+			t.Fatalf("gen_t reason must name the NULLS NOT DISTINCT constraint: %s", o.Reason)
 		}
 		if o.Identity.Name == "trig_t" && !strings.Contains(o.Reason, "trigger") {
 			t.Fatalf("trig_t must stay unrepresentable via its trigger: %s", o.Reason)
@@ -643,7 +646,7 @@ func TestV2UnsupportedObjectsUntouchedAndBlocking(t *testing.T) {
 	}
 
 	// Declaring unsupported/extension objects as managed blocks the plan.
-	h.assertDiffError(strings.Replace(okDoc, `"name": "fresh"`, `"name": "gen_t"`, 1), "generated column", nil)
+	h.assertDiffError(strings.Replace(okDoc, `"name": "fresh"`, `"name": "gen_t"`, 1), "NULLS NOT DISTINCT", nil)
 	// Extension-owned object declared as a desired view: blocked (B03 invariant).
 	extViewDoc := strings.Replace(okDoc, `"views": []`, `"views": [{"identity": {"schema": "public", "name": "pg_stat_statements"}, "managed": true, "definition": "select 1"}]`, 1)
 	h.assertDiffError(extViewDoc, "extension-owned", nil)
