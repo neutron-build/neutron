@@ -271,7 +271,27 @@ export {
   type RelationalExplainPlan,
   type RelationalStatementPlan,
   type RelationEdgePlan,
+  type UniqueSelector,
+  type NestedCreateData,
+  type NestedUpdateData,
+  type NestedCreateArgs,
+  type NestedUpdateArgs,
+  type NestedDeleteArgs,
+  type NestedCascadeSpec,
 } from "./db.js";
+
+export {
+  NestedWriteError,
+  uniqueKeysOf,
+  type NestedWritePlan,
+  type NestedWriteStep,
+  type NestedWriteOp,
+  type NestedWriteAction,
+  type NestedWriteExpect,
+  type NestedWriteOptions,
+  type NestedEdgePlan,
+  type StepOutputRef,
+} from "./nested.js";
 
 export {
   loadDriver,
