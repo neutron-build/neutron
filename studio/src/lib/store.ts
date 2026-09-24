@@ -34,7 +34,7 @@ export const activeTab = computed(() =>
 
 export function openTab(tab: Tab) {
   // Filtered views (FK follow) must not collapse into the unfiltered tab.
-  if (!tab.filter) {
+  if (!tab.filter && !tab.match) {
     const existing = tabs.value.find(t =>
       t.kind === tab.kind &&
       t.objectSchema === tab.objectSchema &&
