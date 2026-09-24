@@ -1,22 +1,32 @@
 import { useEffect, useRef, useState } from 'preact/hooks'
-import type { QueryResult } from '../lib/types'
+import type { QueryResult, TableMetaColumn } from '../lib/types'
+import { formatCell } from '../lib/wire'
 import s from './DataGrid.module.css'
 
 export interface FKTarget {
   refSchema: string
   refTable: string
-  refColumn: string
+  refColumn?: string
+  refColumns?: string[]
+  /** Local columns of the constraint, in constraint order (the whole tuple). */
+  columns?: string[]
+}
+
+/** Local tuple columns of an FK (single-column FKs may only name `column`). */
+function fkLocalColumns(fk: FKTarget, fallback: string): string[] {
+  return fk.columns && fk.columns.length > 0 ? fk.columns : [fallback]
 }
 
 interface DataGridProps {
   result: QueryResult
-  /** Column name of the single-column primary key (enables editing). */
-  pkColumn?: string
+  /** Authoritative column metadata; columns that are not editable are rendered read-only. */
+  columns?: TableMetaColumn[]
   /** Commit an edit; value === null means SQL NULL, '' means empty string. */
   onCommitEdit?: (rowIndex: number, column: string, value: string | null) => void
   /** FK columns by name; enables follow links. */
   fkColumns?: Record<string, FKTarget>
-  onFollowFK?: (fk: FKTarget, value: unknown) => void
+  /** Follow a reference; the whole FK tuple is read from the given row. */
+  onFollowFK?: (fk: FKTarget, rowIndex: number) => void
   sortColumn?: string | null
   sortDir?: 'asc' | 'desc'
   onSort?: (column: string) => void
@@ -33,7 +43,7 @@ interface EditState {
 
 export function DataGrid({
   result,
-  pkColumn,
+  columns,
   onCommitEdit,
   fkColumns,
   onFollowFK,
@@ -56,12 +66,17 @@ export function DataGrid({
     return <div class={s.error}>{result.error}</div>
   }
 
-  const editable = pkColumn !== undefined && typeof onCommitEdit === 'function'
+  const editable = columns !== undefined && typeof onCommitEdit === 'function'
+
+  const metaByCol = new Map((columns ?? []).map(c => [c.name, c]))
 
   function cellEditable(col: string): boolean {
-    // The key column identifies the row; editing it is not offered (the
-    // backend additionally rejects writes to generated/identity keys).
-    return editable && col !== pkColumn
+    // Authoritative: the server's catalog metadata decides. Key columns,
+    // generated and identity columns are read-only; everything else edits.
+    if (!editable) return false
+    const meta = metaByCol.get(col)
+    if (!meta) return false
+    return meta.editable
   }
 
   function commitEdit() {
@@ -136,14 +151,22 @@ export function DataGrid({
     }
 
     const fk = fkColumns?.[col]
-    if (fk && onFollowFK && val !== null && val !== undefined) {
+    // A reference is followable only when every component of its tuple is
+    // non-NULL in this row (MATCH SIMPLE: a NULL component references nothing).
+    const fkTupleComplete = fk !== undefined && fkLocalColumns(fk, col).every(c => {
+      const i = result.columns.indexOf(c)
+      const v = i < 0 ? undefined : (result.rows[rowIdx] as unknown[] | undefined)?.[i]
+      return v !== null && v !== undefined
+    })
+    if (fk && onFollowFK && fkTupleComplete) {
+      const refs = (fk.refColumns ?? [fk.refColumn]).filter(Boolean).join(', ')
       return (
         <button
           class={s.fkLink}
-          title={`Follow ${fk.refSchema}.${fk.refTable} (${fk.refColumn})`}
-          onClick={() => onFollowFK(fk, val)}
+          title={`Follow ${fk.refSchema}.${fk.refTable} (${refs})`}
+          onClick={() => onFollowFK(fk, rowIdx)}
         >
-          {String(val)}
+          {formatCell(val)}
         </button>
       )
     }
@@ -158,7 +181,7 @@ export function DataGrid({
       )
     }
     if (val === undefined) return <span class={s.null}>—</span>
-    return String(val)
+    return formatCell(val)
   }
 
   return (
@@ -168,7 +191,8 @@ export function DataGrid({
           <thead>
             <tr>
               {result.columns.map((col) => {
-                const isPk = col === pkColumn
+                const meta = metaByCol.get(col)
+                const isPk = meta?.isKey ?? false
                 const isSorted = sortColumn === col
                 return (
                   <th
@@ -180,7 +204,7 @@ export function DataGrid({
                     {isPk && <span class={s.pkHeader} title="Primary key">PK </span>}
                     {col}
                     {isSorted && <span class={s.sortMark}> {sortDir === 'desc' ? '↓' : '↑'}</span>}
-                    {fkColumns?.[col] && <span class={s.fkMark} title={`References ${fkColumns[col].refTable}.${fkColumns[col].refColumn}`}> FK</span>}
+                    {fkColumns?.[col] && <span class={s.fkMark} title={`References ${fkColumns[col].refTable}.${(fkColumns[col].refColumns ?? [fkColumns[col].refColumn]).filter(Boolean).join(', ')}`}> FK</span>}
                                       </th>
                 )
               })}
@@ -189,31 +213,37 @@ export function DataGrid({
           <tbody>
             {result.rows.map((row, rowIdx) => (
               <tr key={rowIdx} class={s.tr}>
-                {result.columns.map((col, colIdx) => (
-                  <td
-                    key={col}
-                    class={s.td}
-                    onDblClick={
-                      cellEditable(col)
-                        ? () => {
-                            const cell = (row as unknown[])[colIdx]
-                            const isNull = cell === null || cell === undefined
-                            setEdit({
-                              row: rowIdx,
-                              col,
-                              draft: isNull ? '' : String(cell),
-                              initialText: isNull ? '' : String(cell),
-                              initialIsNull: isNull,
-                              setNull: isNull,
-                            })
-                          }
-                        : undefined
-                    }
-                    title={editable && col === pkColumn ? 'Primary key column is read-only' : undefined}
-                  >
-                    {renderCell(rowIdx, colIdx)}
-                  </td>
-                ))}
+                {result.columns.map((col, colIdx) => {
+                  const meta = metaByCol.get(col)
+                  const readOnlyTitle = editable && meta && !meta.editable
+                    ? (meta.readOnlyReason ?? 'read-only')
+                    : undefined
+                  return (
+                    <td
+                      key={col}
+                      class={s.td}
+                      onDblClick={
+                        cellEditable(col)
+                          ? () => {
+                              const cell = (row as unknown[])[colIdx]
+                              const isNull = cell === null || cell === undefined
+                              setEdit({
+                                row: rowIdx,
+                                col,
+                                draft: isNull ? '' : formatCell(cell),
+                                initialText: isNull ? '' : formatCell(cell),
+                                initialIsNull: isNull,
+                                setNull: isNull,
+                              })
+                            }
+                          : undefined
+                      }
+                      title={readOnlyTitle}
+                    >
+                      {renderCell(rowIdx, colIdx)}
+                    </td>
+                  )
+                })}
               </tr>
             ))}
           </tbody>

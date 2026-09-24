@@ -68,3 +68,51 @@ export function decodeRows(rows: unknown[][]): unknown[][] {
   }
   return rows
 }
+
+function toHex(bytes: Uint8Array): string {
+  let out = ''
+  for (const b of bytes) out += b.toString(16).padStart(2, '0')
+  return out
+}
+
+/**
+ * Encode one value back to its wire form for mutation requests. The decoded
+ * lossless types re-tag exactly from the value (bigint -> int8 cell,
+ * Uint8Array -> bytea cell). The server's strict per-column decoder refuses
+ * bare text for tagged columns, so a string value WITH a column tag re-tags
+ * as {t, v} — the server validates the payload against the catalog type
+ * (parse, hex shape, canonical temporal form). Without a tag, strings pass
+ * through untouched.
+ */
+export function encodeCell(value: unknown, tag?: WireTag | null): unknown {
+  if (value === null || value === undefined) return value ?? null
+  if (typeof value === 'bigint') return { t: 'int8', v: value.toString() }
+  if (value instanceof Uint8Array) return { t: 'bytea', v: toHex(value) }
+  if (tag && typeof value === 'string') {
+    // Display form of bytea is \x-prefixed hex; the wire payload is bare hex.
+    const v = tag === 'bytea' && /^\\x/i.test(value) ? value.slice(2) : value
+    return { t: tag, v }
+  }
+  if (tag === 'int8' && typeof value === 'number' && Number.isInteger(value)) {
+    return { t: 'int8', v: String(value) }
+  }
+  return value
+}
+
+/**
+ * Render a decoded cell as editable/display text. Exact for every decoded
+ * type: bigint keeps all digits, bytea shows \x-prefixed hex (which
+ * encodeCell accepts back), objects (json/jsonb) show JSON text.
+ */
+export function formatCell(value: unknown): string {
+  if (typeof value === 'bigint') return value.toString()
+  if (value instanceof Uint8Array) return '\\x' + toHex(value)
+  if (typeof value === 'object' && value !== null) {
+    try {
+      return JSON.stringify(value, (_k, v) => typeof v === 'bigint' ? v.toString() : v)
+    } catch {
+      return String(value)
+    }
+  }
+  return String(value)
+}

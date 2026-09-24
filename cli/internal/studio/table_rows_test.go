@@ -24,8 +24,8 @@ func TestRequireSingleColumnKey(t *testing.T) {
 		wantText   string
 	}{
 		{
-			name: "table missing is rejected",
-			meta: &tableMeta{Exists: false, Columns: map[string]tableColumnMeta{}},
+			name:       "table missing is rejected",
+			meta:       &tableMeta{Exists: false, Columns: map[string]tableColumnMeta{}},
 			wantReject: true, wantText: "was not found or is not an ordinary table",
 		},
 		{
@@ -156,10 +156,11 @@ func TestMutateExactlyOneWrapsWithCount(t *testing.T) {
 }
 
 func TestRowHandlerRequestValidation(t *testing.T) {
-	s := &Server{}
+	s := newAuthTestServer(t)
 
 	post := func(handler http.HandlerFunc, body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/api/table/x", strings.NewReader(body))
+		authed(s, req)
 		rec := httptest.NewRecorder()
 		handler(rec, req)
 		return rec

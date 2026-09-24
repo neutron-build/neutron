@@ -42,7 +42,7 @@ export function ContentArea() {
 
   switch (tab.kind) {
     case 'sql-browser':
-      content = <SQLBrowser schema={tab.objectSchema!} table={tab.objectName!} initialFilter={tab.filter} />
+      content = <SQLBrowser schema={tab.objectSchema!} table={tab.objectName!} initialFilter={tab.filter} initialMatch={tab.match} />
       break
     case 'sql-editor':
       content = <SQLEditor tabId={tab.id} />

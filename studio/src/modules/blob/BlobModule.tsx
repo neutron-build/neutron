@@ -1,7 +1,7 @@
 import { useSignal } from '@preact/signals'
 import { useEffect, useRef, useCallback } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
-import { api } from '../../lib/api'
+import { api, mutationHeaders } from '../../lib/api'
 import { exportCSV, exportJSON } from '../../lib/export'
 import { isRlsDenied } from '../../lib/rls'
 import { RlsNotice } from '../../components/RlsNotice'
@@ -130,7 +130,14 @@ export function BlobModule({ name }: BlobModuleProps) {
         }
 
         xhr.onerror = () => reject(new Error('Upload failed'))
-        xhr.send(formData)
+        // Upload is a mutation: present the session token like every other
+        // mutating request (see lib/api.ts). Headers must be set before send.
+        mutationHeaders().then(headers => {
+          for (const [k, v] of Object.entries(headers)) {
+            if (k.toLowerCase() !== 'content-type') xhr.setRequestHeader(k, v)
+          }
+          xhr.send(formData)
+        }, reject)
       })
 
       toast('success', `Uploaded ${file.name}`)

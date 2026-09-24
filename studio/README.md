@@ -24,6 +24,17 @@ UI in a browser.
 document, graph, fts, geo, blob, streams, columnar, datalog, cdc, pubsub —
 plus `schema` (schema designer and code generator).
 
+## Development
+
+`npm run dev` serves the SPA on port 5173 and proxies `/api` to the Go
+server on 4983. The server accepts state-changing requests only from its
+own exact origin plus a per-launch session token, so start it with the dev
+origin allowed explicitly:
+
+```bash
+NEUTRON_STUDIO_DEV_ORIGIN=http://localhost:5173 neutron studio
+```
+
 ## Testing
 
 Frontend: `npm test` (vitest) and `npm run build` in `studio/`. Backend:
