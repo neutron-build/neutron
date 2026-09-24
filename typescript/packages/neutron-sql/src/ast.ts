@@ -148,6 +148,60 @@ export interface SetOpBranch {
 
 export type SetOpKind = "union" | "union all" | "intersect" | "intersect all" | "except" | "except all";
 
+/** Row-lock strength of a locking clause (Q08). */
+export type LockStrength = "update" | "no key update" | "share" | "key share";
+
+/** Lock-wait policy: block (PostgreSQL default), fail immediately (NOWAIT,
+ *  SQLSTATE 55P03) or skip rows another transaction holds (SKIP LOCKED). */
+export type LockWaitPolicy = "wait" | "nowait" | "skip locked";
+
+/** `for <strength> [of "a", "b"] [nowait | skip locked]` (Q08). `of` holds
+ *  UNQUALIFIED from-item names (table names or aliases — PostgreSQL rejects
+ *  schema-qualified names here); empty means every table in FROM. */
+export interface LockingClause {
+  readonly kind: "locking";
+  readonly strength: LockStrength;
+  readonly of: readonly string[];
+  readonly wait: LockWaitPolicy;
+}
+
+const LOCK_STRENGTHS: ReadonlySet<string> = new Set(["update", "no key update", "share", "key share"]);
+const LOCK_WAITS: ReadonlySet<string> = new Set(["wait", "nowait", "skip locked"]);
+
+/** Validate a (possibly hand-built) locking clause. Shared by the constructor
+ *  and the compile choke point, so forged nodes fail closed too. */
+export function assertLockingClauseValid(node: LockingClause, what: string): LockingClause {
+  if (typeof node !== "object" || node === null || node.kind !== "locking") {
+    throw new Error(`${what}: requires a LockingClause (build one with lockingClause())`);
+  }
+  if (typeof node.strength !== "string" || !LOCK_STRENGTHS.has(node.strength)) {
+    throw new Error(`${what}: unknown lock strength ${JSON.stringify(node.strength)} (known: update, no key update, share, key share)`);
+  }
+  if (typeof node.wait !== "string" || !LOCK_WAITS.has(node.wait)) {
+    throw new Error(`${what}: unknown lock wait policy ${JSON.stringify(node.wait)} (known: wait, nowait, skip locked)`);
+  }
+  if (!Array.isArray(node.of)) throw new Error(`${what}: of must be an array of from-item names`);
+  const seen = new Set<string>();
+  for (const name of node.of) {
+    validIdent(name, `${what} of`);
+    if (name.includes(".")) {
+      throw new Error(`${what}: "of" names from-item names or aliases, unqualified — PostgreSQL rejects schema-qualified names in locking clauses (got "${name}")`);
+    }
+    if (seen.has(name)) throw new Error(`${what}: "${name}" is named twice in one locking clause`);
+    seen.add(name);
+  }
+  return node;
+}
+
+export function lockingClause(input: { strength: LockStrength; of?: readonly string[]; wait?: LockWaitPolicy }): LockingClause {
+  return frozen(
+    assertLockingClauseValid(
+      { kind: "locking", strength: input.strength, of: [...(input.of ?? [])], wait: input.wait ?? "wait" },
+      "lockingClause",
+    ),
+  );
+}
+
 /** The statement node: with / select list / from / joins / where / group by /
  *  having / set operations / order / limit. When `setOps` is non-empty the
  *  node's own select is the first branch and orderBy/limit apply to the
@@ -169,6 +223,9 @@ export interface StatementNode {
   readonly orderBy: readonly OrderSpec[];
   readonly limit?: number;
   readonly offset?: number;
+  /** Row-locking clauses (Q08), rendered after limit/offset. Absent when the
+   *  statement takes no row locks. */
+  readonly locking?: readonly LockingClause[];
 }
 
 /** Target of an insert/update/delete statement. */
@@ -866,6 +923,8 @@ export interface StatementInput {
   readonly orderBy?: readonly OrderSpec[];
   readonly limit?: number;
   readonly offset?: number;
+  /** Row-locking clauses (Q08). */
+  readonly locking?: readonly LockingClause[];
 }
 
 export function validLimit(n: number | undefined, what: string): number | undefined {
@@ -915,6 +974,11 @@ export function selectStatement(input: StatementInput): StatementNode {
     orderBy: (input.orderBy ?? []).map((o) => frozen<OrderSpec>({ expr: o.expr, direction: o.direction, nulls: validNulls(o.nulls, "orderBy") })),
     limit: validLimit(input.limit, "limit"),
     offset: validLimit(input.offset, "offset"),
+    // Only present when locking is requested: statements without row locks
+    // keep their exact pre-Q08 shape.
+    ...(input.locking !== undefined && input.locking.length > 0
+      ? { locking: input.locking.map((c) => assertLockingClauseValid(c, "locking")) }
+      : {}),
   });
 }
 

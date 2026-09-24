@@ -89,6 +89,9 @@ import {
 } from "./ast.js";
 import { compileStatement, type CompiledQuery } from "./compile.js";
 import type { CapabilityGate } from "./engine.js";
+import { lockingClause, type LockStrength, type LockWaitPolicy, type LockingClause } from "./ast.js";
+import { collectWindowCapabilities, isWindowExpr, windowProjection, windowResultColumn, type WindowExpr } from "./window.js";
+import { CursorStream, type StreamOptions } from "./stream.js";
 
 /** Fail-closed check for one builder-slot value: legacy {sql, params}
  *  fragments are direct-execution shapes and never splice into compiled
@@ -176,6 +179,28 @@ interface SelectExtras {
   readonly having: readonly Condition[];
   readonly distinct: boolean;
   readonly ctes: readonly StatementCte[];
+  /** Q08 row-locking requests, resolved against the from/join items at
+   *  plan time (joins may be added after .for()). */
+  readonly locking?: readonly LockRequest[];
+}
+
+/** One `.for()` call: strength, optional OF targets (the from table or join
+ *  alias handles) and the wait policy. */
+interface LockRequest {
+  readonly strength: LockStrength;
+  readonly of: readonly unknown[];
+  readonly wait: LockWaitPolicy;
+}
+
+/** Options of SelectBuilder.for(): OF targets and the lock-wait policy. */
+export interface LockOptions {
+  /** Lock only these from items: the from table itself and/or alias()
+   *  handles of joined tables. Omitted: every table in FROM. */
+  of?: AnyPgTable | AliasedTable<Record<string, AnyColumnBuilder>, string> | ReadonlyArray<AnyPgTable | AliasedTable<Record<string, AnyColumnBuilder>, string>>;
+  /** Fail immediately (SQLSTATE 55P03) instead of waiting for a lock. */
+  noWait?: boolean;
+  /** Skip rows another transaction has locked (work-queue pattern). */
+  skipLocked?: boolean;
 }
 
 const NO_EXTRAS: SelectExtras = Object.freeze({ group: [], having: [], distinct: false, ctes: [] });
@@ -562,7 +587,9 @@ export type JoinFieldType<V, N extends string, F extends boolean> = V extends An
       : SelectTypeOf<V>
   : V extends AggregateNode<infer T>
     ? T
-    : unknown;
+    : V extends WindowExpr<infer T>
+      ? T
+      : unknown;
 
 /** Result row of a joined select: the projected fields with outer-join
  *  nullability applied (`R0` is the no-projection base row, nulled field-wise
@@ -614,6 +641,7 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
       having: Object.freeze([...extras.having]),
       distinct: extras.distinct === true,
       ctes: Object.freeze([...extras.ctes]),
+      ...(extras.locking !== undefined && extras.locking.length > 0 ? { locking: Object.freeze([...extras.locking]) } : {}),
     });
     for (const spec of this.joinSpecs) Object.freeze(spec);
     Object.freeze(this.joinSpecs);
@@ -785,6 +813,56 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
   }
 
   // -------------------------------------------------------------------------
+  // Q08: row locking, streaming, batch participation
+  // -------------------------------------------------------------------------
+
+  /** Row-locking clause: `for update | no key update | share | key share
+   *  [of …] [nowait | skip locked]`. Calls accumulate (PostgreSQL applies
+   *  the strongest lock per table). `of` names the from table and/or join
+   *  alias handles; without it every table in FROM is locked — rejected
+   *  when an outer join makes a side nullable or a CTE sits in FROM (which
+   *  PostgreSQL would silently leave unlocked). Locks need a transaction to
+   *  be useful: run inside db.transaction, a batch or a stream. */
+  for(strength: LockStrength, options: LockOptions = {}): SelectBuilder<P, R0, N, F> {
+    if (strength !== "update" && strength !== "no key update" && strength !== "share" && strength !== "key share") {
+      throw new Error(`for: unknown lock strength ${JSON.stringify(strength)} (known: update, no key update, share, key share)`);
+    }
+    if (typeof options !== "object" || options === null) throw new Error("for: options must be an object { of?, noWait?, skipLocked? }");
+    for (const key of Object.keys(options)) {
+      if (key !== "of" && key !== "noWait" && key !== "skipLocked") throw new Error(`for: unknown option "${key}" (known: of, noWait, skipLocked)`);
+    }
+    if (options.noWait === true && options.skipLocked === true) {
+      throw new Error("for: noWait and skipLocked are mutually exclusive — choose to fail on a locked row or to skip it");
+    }
+    const of = options.of === undefined ? [] : Array.isArray(options.of) ? [...options.of] : [options.of];
+    if (options.of !== undefined && of.length === 0) throw new Error("for: of must name at least one from item (omit it to lock every table)");
+    const request: LockRequest = Object.freeze({
+      strength,
+      of: Object.freeze(of),
+      wait: options.noWait === true ? "nowait" : options.skipLocked === true ? "skip locked" : "wait",
+    });
+    return this.fork({ ...this.extras, locking: [...(this.extras.locking ?? []), request] });
+  }
+
+  /** Stream result rows through a server-side cursor, fetching `batchSize`
+   *  rows per round trip only as the consumer pulls (see stream.ts for the
+   *  transaction/cancellation contract). */
+  stream(options?: StreamOptions): CursorStream<JoinRowOf<P, R0, N, F>> {
+    return new CursorStream<JoinRowOf<P, R0, N, F>>(this.ctx, this.toCompiled(), options, "rows", run);
+  }
+
+  /** Like stream(), yielding each fetched batch (non-empty arrays of at most
+   *  `batchSize` rows). */
+  streamBatches(options?: StreamOptions): CursorStream<JoinRowOf<P, R0, N, F>[]> {
+    return new CursorStream<JoinRowOf<P, R0, N, F>[]>(this.ctx, this.toCompiled(), options, "batches", run);
+  }
+
+  /** Batch participation (Q08): selects yield rows. */
+  batchResultKind(): "rows" {
+    return "rows";
+  }
+
+  // -------------------------------------------------------------------------
   // Q02: group by / having / distinct / CTEs / set operations
   // -------------------------------------------------------------------------
 
@@ -872,6 +950,11 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
 
     if (this.projection) {
       for (const [key, value] of Object.entries(this.projection)) {
+        if (typeof value === "object" && value !== null && (value as { kind?: unknown }).kind === "window-function") {
+          throw new Error(
+            `${key}: a window function cannot render bare — wrap it in over() (rowNumber(), rank(), lag(col), … all require OVER in PostgreSQL)`,
+          );
+        }
         if (isValueNode(value)) {
           if (value.kind === "aggregate") {
             const plan = aggregateProjection(value, key);
@@ -882,6 +965,19 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
             pushColumn({ key, dataType: spec.dataType, readMode: spec.readMode, valueDecoder: spec.valueDecoder, canonicalText: spec.dataType === "timestamp" || spec.dataType === "timestamptz" || spec.dataType === "date", source: richCodecSource(spec.source) });
             continue;
           }
+          if (isWindowExpr(value)) {
+            // Q08: window results follow PostgreSQL result types through the
+            // codec layer (row_number/rank int8 -> bigint mode, value
+            // functions keep their argument column's codec).
+            const plan = windowProjection(value, key);
+            nodes.push(plan.node);
+            if (plan.decoder) decoders.push(plan.decoder);
+            for (const c of plan.capabilities) caps.add(c);
+            const spec = windowResultColumn(value);
+            pushColumn({ key, dataType: spec.dataType, readMode: spec.readMode, valueDecoder: spec.valueDecoder, canonicalText: spec.dataType === "timestamp" || spec.dataType === "timestamptz" || spec.dataType === "date" });
+            continue;
+          }
+          collectWindowCapabilities(value, caps);
           nodes.push(projectionNode(value, key));
           pushColumn({ key, dataType: "text" });
           continue;
@@ -984,6 +1080,10 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
       for (const c of reg.capabilities) caps.add(c);
     }
 
+    const order = orderSpecs(this.order);
+    for (const o of order) collectWindowCapabilities(o.expr, caps);
+    const locking = resolveLocking(this.extras.locking ?? [], this.table, fromRec, fromAlias, this.joinSpecs, caps);
+
     const stmt: StatementNode = selectStatement({
       ctes: [...cteRegs.values()].map((reg) => cte(reg.name, reg.stmt)),
       recursive,
@@ -995,9 +1095,10 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
       where: whereItems(this.conditions),
       groupBy: groupExprs(this.extras.group),
       having: whereItems(this.extras.having),
-      orderBy: orderSpecs(this.order),
+      orderBy: order,
       limit: this.limitCount,
       offset: this.offsetCount,
+      locking,
     });
     // Fragment-spliced CTE references must resolve to a registered CTE of the
     // same source (Q02 review MINOR-2): unregistered or shadowed same-name
@@ -1033,6 +1134,80 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
   ): Promise<R1 | R2> {
     return this.execute().then(onfulfilled, onrejected);
   }
+}
+
+/** Resolve `.for()` requests against the statement's from/join items (Q08).
+ *  OF targets must be the from table or join alias handles; unqualified
+ *  locks are rejected where PostgreSQL would error (nullable side of an
+ *  outer join) or silently lock nothing (a CTE in FROM). Adds the matching
+ *  capability requirements. */
+function resolveLocking(
+  requests: readonly LockRequest[],
+  fromTable: AnyPgTable,
+  fromRec: ReturnType<typeof getDerivedRecord>,
+  fromAlias: string | undefined,
+  joins: readonly JoinSpec[],
+  caps: Set<StatementCapability>,
+): LockingClause[] {
+  if (requests.length === 0) return [];
+  const fromName = fromAlias ?? fromRec?.name ?? getTableName(fromTable);
+  // Nullable from items under the declared join sequence: a left join makes
+  // its alias nullable; right/full joins make everything before them
+  // nullable (full also the joined alias).
+  const nullable = new Set<string>();
+  const seen: string[] = [fromName];
+  for (const j of joins) {
+    if (j.type === "left") nullable.add(j.alias);
+    if (j.type === "right" || j.type === "full") for (const name of seen) nullable.add(name);
+    if (j.type === "full") nullable.add(j.alias);
+    seen.push(j.alias);
+  }
+  const cteItems = [fromRec?.kind === "cte" ? fromName : undefined, ...joins.map((j) => (getDerivedRecord(j.table)?.kind === "cte" ? j.alias : undefined))].filter(
+    (n): n is string => n !== undefined,
+  );
+  const joinAliases = new Set(joins.map((j) => j.alias));
+  return requests.map((req) => {
+    caps.add("row-locking");
+    if (req.strength === "no key update" || req.strength === "key share") caps.add("row-locking-key-strength");
+    if (req.wait === "skip locked") caps.add("row-locking-skip-locked");
+    const names = req.of.map((target) => {
+      if (typeof target === "object" && target !== null && getDerivedRecord(target as AnyPgTable) !== undefined) {
+        throw new Error(
+          `for ${req.strength}: of cannot name the derived/CTE handle "${getDerivedRecord(target as AnyPgTable)!.name}" — PostgreSQL cannot lock a WITH query, and derived rows are not base rows; lock the base table inside the source instead`,
+        );
+      }
+      if (isAliasHandle(target)) {
+        const alias = target[ALIAS_MARKER].alias;
+        if (!joinAliases.has(alias)) throw new Error(`for ${req.strength}: of names alias "${alias}", which is not joined in this statement`);
+        return alias;
+      }
+      if (isPgTable(target)) {
+        if (target !== fromTable) {
+          throw new Error(`for ${req.strength}: of names table "${getTableName(target)}", which is not this statement's from table — name a joined table by its alias() handle`);
+        }
+        return fromName;
+      }
+      throw new Error(`for ${req.strength}: of entries must be the from table or alias() handles of joined tables`);
+    });
+    if (names.length === 0) {
+      if (nullable.size > 0) {
+        throw new Error(
+          `for ${req.strength}: an unqualified lock covers the nullable side of an outer join (${[...nullable].map((n) => `"${n}"`).join(", ")}) — PostgreSQL rejects it (SQLSTATE 0A000); name the non-nullable from items with of`,
+        );
+      }
+      if (cteItems.length > 0) {
+        throw new Error(
+          `for ${req.strength}: an unqualified lock would silently skip the CTE ${cteItems.map((n) => `"${n}"`).join(", ")} in FROM (PostgreSQL locks no rows of a WITH query) — name the base tables to lock with of, or lock inside the CTE source`,
+        );
+      }
+    }
+    for (const name of names) {
+      if (nullable.has(name)) {
+        throw new Error(`for ${req.strength}: "${name}" is on the nullable side of an outer join — PostgreSQL rejects locking it (SQLSTATE 0A000)`);
+      }
+    }
+    return lockingClause({ strength: req.strength, of: names, wait: req.wait });
+  });
 }
 
 /** Group-by terms: columns render as qualified references, value nodes as
@@ -1079,6 +1254,12 @@ export class SetOpBuilder<R> implements PromiseLike<R[]> {
   static compound<R>(ctx: ExecContext, first: FullSelectPlan, op: SetOpKind, other: SubquerySource): SetOpBuilder<R> {
     if (first.stmt.orderBy.length > 0 || first.stmt.limit !== undefined || first.stmt.offset !== undefined) {
       throw new Error("set operations: the first branch carries orderBy/limit/offset — in SQL these would silently bind to the compound; order/limit the compound after the set operation instead");
+    }
+    if ((first.stmt.locking ?? []).length > 0) {
+      // The compound is rebuilt from the first branch's fields; a locking
+      // clause would be dropped silently — and PostgreSQL rejects row locks
+      // on set operations anyway.
+      throw new Error("set operations: the first branch carries a locking clause (.for()) — PostgreSQL rejects FOR UPDATE/SHARE with UNION/INTERSECT/EXCEPT");
     }
     const { stmt, capabilities } = sourceStatement(other);
     return new SetOpBuilder<R>(ctx, first, [{ op, plan: { stmt, decoders: [], capabilities, columns: [] } }]);
@@ -1139,6 +1320,21 @@ export class SetOpBuilder<R> implements PromiseLike<R[]> {
    *  rejected by the pager's apply()/page(). */
   keysetBuilderState(): { ordered: boolean; offset: boolean } {
     return { ordered: this.order.length > 0, offset: this.offsetCount !== undefined };
+  }
+
+  /** Stream the compound's rows through a server-side cursor (Q08). */
+  stream(options?: StreamOptions): CursorStream<R> {
+    return new CursorStream<R>(this.ctx, this.toCompiled(), options, "rows", run);
+  }
+
+  /** Like stream(), yielding each fetched batch. */
+  streamBatches(options?: StreamOptions): CursorStream<R[]> {
+    return new CursorStream<R[]>(this.ctx, this.toCompiled(), options, "batches", run);
+  }
+
+  /** Batch participation (Q08): compounds yield rows. */
+  batchResultKind(): "rows" {
+    return "rows";
   }
 
   /** Composition point: the compound as a subquery node. */
@@ -1332,6 +1528,12 @@ export class InsertBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
       assertReturningKeys(this.table, keys);
     }
     return new InsertBuilder<TCols, unknown>(this.ctx, this.table, this.rows, this.hasValues, keys, this.conflict);
+  }
+
+  /** Batch participation (Q08): rows with returning(), else the affected
+   *  row count. */
+  batchResultKind(): "rows" | "count" {
+    return this.returningKeys !== null ? "rows" : "count";
   }
 
   toCompiled(): CompiledStatement {
@@ -1551,6 +1753,12 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
     return new UpdateBuilder<TCols, unknown>(this.ctx, this.table, this.sets, this.hasSet, this.conditions, keys);
   }
 
+  /** Batch participation (Q08): rows with returning(), else the affected
+   *  row count. */
+  batchResultKind(): "rows" | "count" {
+    return this.returningKeys !== null ? "rows" : "count";
+  }
+
   toCompiled(): CompiledStatement {
     if (!this.hasSet) throw new Error("update requires .set()");
     if (this.sets.length === 0) throw new Error("update .set() had no assignments — undefined values are ignored");
@@ -1633,6 +1841,12 @@ export class DeleteBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
       this.conditions,
       true,
     ) as unknown as DeleteBuilder<TCols, Array<InferSelectModelOfRecord<TCols>>>;
+  }
+
+  /** Batch participation (Q08): rows with returning(), else the affected
+   *  row count. */
+  batchResultKind(): "rows" | "count" {
+    return this.wantsReturning ? "rows" : "count";
   }
 
   toCompiled(): CompiledStatement {
@@ -1758,6 +1972,11 @@ export class AstSelectBuilder {
       const copy: AstProjection = {};
       for (const [key, value] of Object.entries(projectionSpec)) {
         rejectLegacyFragment(value, "astSelect projection");
+        if (typeof value === "object" && value !== null && (value as { kind?: unknown }).kind === "window-function") {
+          throw new Error(
+            `${key}: a window function cannot render bare — wrap it in over() (rowNumber(), rank(), lag(col), … all require OVER in PostgreSQL)`,
+          );
+        }
         copy[key] = value;
       }
       this.projectionSpec = Object.freeze(copy);
@@ -2057,6 +2276,12 @@ export class AstSelectBuilder {
       if (isValueNode(value) && value.kind === "aggregate") {
         const spec = aggregateResultColumn(value);
         return { key, dataType: spec.dataType, readMode: spec.readMode, valueDecoder: spec.valueDecoder, canonicalText: spec.dataType === "timestamp" || spec.dataType === "timestamptz" || spec.dataType === "date", source: richCodecSource(spec.source) };
+      }
+      if (isWindowExpr(value)) {
+        // The AST builder projects windows raw (no wire wrapping), so the
+        // pseudo-column is the native result type, not canonical text.
+        const spec = windowResultColumn(value);
+        return { key, dataType: spec.dataType, readMode: spec.readMode, valueDecoder: spec.valueDecoder };
       }
       return { key, dataType: "text" };
     });

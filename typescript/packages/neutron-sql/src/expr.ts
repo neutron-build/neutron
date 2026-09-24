@@ -16,6 +16,7 @@ import {
   fragment,
   ident,
   isLegacySqlFragment,
+  isValueNode,
   legacyFragmentError,
   param as paramNode,
   paramCast,
@@ -170,35 +171,38 @@ function isAggregateNode(v: unknown): v is AggregateNode<unknown> {
   return typeof v === "object" && v !== null && (v as { kind?: unknown }).kind === "aggregate";
 }
 
-function orderRef(col: AnyColumnBuilder | AggregateNode<unknown> | string, table?: string): ValueNode {
+function orderRef(col: AnyColumnBuilder | AggregateNode<unknown> | ValueNode | string, table?: string): ValueNode {
+  // Value nodes (sql fragments, window expressions, exprs) pass through
+  // unchanged — ordering by a window result uses its fragment directly.
+  if (isValueNode(col)) return col;
   if (isAggregateNode(col)) return col;
   return colRef(col, table);
 }
 
-export function asc(col: AnyColumnBuilder | AggregateNode<unknown> | string, table?: string): OrderSpec {
+export function asc(col: AnyColumnBuilder | AggregateNode<unknown> | ValueNode | string, table?: string): OrderSpec {
   return Object.freeze({ expr: orderRef(col, table), direction: "asc" } as OrderSpec);
 }
 
-export function desc(col: AnyColumnBuilder | AggregateNode<unknown> | string, table?: string): OrderSpec {
+export function desc(col: AnyColumnBuilder | AggregateNode<unknown> | ValueNode | string, table?: string): OrderSpec {
   return Object.freeze({ expr: orderRef(col, table), direction: "desc" } as OrderSpec);
 }
 
 /** Explicit-null-ordering order specs (Q04). Keyset pagination REQUIRES one
  *  of these on every term (the ordering must be total and unambiguous);
  *  plain orderBy may use them anywhere `nulls first/last` is wanted. */
-export function ascNullsLast(col: AnyColumnBuilder | AggregateNode<unknown> | string, table?: string): OrderSpec {
+export function ascNullsLast(col: AnyColumnBuilder | AggregateNode<unknown> | ValueNode | string, table?: string): OrderSpec {
   return Object.freeze({ expr: orderRef(col, table), direction: "asc", nulls: "last" } as OrderSpec);
 }
 
-export function ascNullsFirst(col: AnyColumnBuilder | AggregateNode<unknown> | string, table?: string): OrderSpec {
+export function ascNullsFirst(col: AnyColumnBuilder | AggregateNode<unknown> | ValueNode | string, table?: string): OrderSpec {
   return Object.freeze({ expr: orderRef(col, table), direction: "asc", nulls: "first" } as OrderSpec);
 }
 
-export function descNullsLast(col: AnyColumnBuilder | AggregateNode<unknown> | string, table?: string): OrderSpec {
+export function descNullsLast(col: AnyColumnBuilder | AggregateNode<unknown> | ValueNode | string, table?: string): OrderSpec {
   return Object.freeze({ expr: orderRef(col, table), direction: "desc", nulls: "last" } as OrderSpec);
 }
 
-export function descNullsFirst(col: AnyColumnBuilder | AggregateNode<unknown> | string, table?: string): OrderSpec {
+export function descNullsFirst(col: AnyColumnBuilder | AggregateNode<unknown> | ValueNode | string, table?: string): OrderSpec {
   return Object.freeze({ expr: orderRef(col, table), direction: "desc", nulls: "first" } as OrderSpec);
 }
 
