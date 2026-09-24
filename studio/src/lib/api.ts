@@ -3,6 +3,7 @@ import type {
   Schema, NucleusFeatures, QueryResult,
   ColumnDetail, IndexDetail, SavedQuery, FKDetail,
   TableMeta, MutationOutcome, KeyCell, MatchCell,
+  CommitResponse, PreviewResponse, OutcomeResponse, CommitOperation,
 } from './types'
 import { decodeRows } from './wire'
 
@@ -249,6 +250,38 @@ export const api = {
     key: KeyCell[]
     version: string
   }) => mutationRequest<MutationOutcome>('POST', '/table/v2/delete', input),
+
+  // --- S02 atomic staged commits and retry outcomes ---
+
+  /** Commit one staged operation list atomically under an idempotency key.
+   *  Same operationId + same payload replays the recorded outcome; same ID
+   *  + different payload is a 409 operation_conflict; expired/evicted
+   *  outcomes report unknown (never retried blindly). */
+  commitOperations: (input: {
+    connectionId: string
+    operationId: string
+    operations: CommitOperation[]
+  }) => mutationRequest<CommitResponse>('POST', '/table/v2/commit', input),
+
+  /** Dry-run the identical validation and execution, always rolled back. */
+  previewOperations: (input: {
+    connectionId: string
+    operations: CommitOperation[]
+  }) => mutationRequest<PreviewResponse>('POST', '/table/v2/preview', input),
+
+  /** Resolve a recorded outcome for an operation ID (status lookup must
+   *  precede any retry after a dropped response). */
+  operationOutcome: (connectionId: string, operationId: string) =>
+    mutationRequest<OutcomeResponse>('POST', '/table/v2/outcome', { connectionId, operationId }),
+
+  /** Undo a committed operation list through its recorded inverse; honest
+   *  refusal where the inverse cannot be exact. The revert is itself a
+   *  deduplicated commit under revertOperationId. */
+  revertOperation: (input: {
+    connectionId: string
+    operationId: string
+    revertOperationId: string
+  }) => mutationRequest<CommitResponse>('POST', '/table/v2/revert', input),
 
   // --- Interim v1 row endpoints (guarded, kept during the transition) ---
 

@@ -33,6 +33,16 @@ type Server struct {
 	// mutating endpoint (see session.go). Empty only for hand-constructed
 	// Servers in tests that never call requireMutationAuth.
 	sessionToken string
+	// outcomes records commit results for operation-ID deduplication and
+	// retry resolution (S02, see commit_v2.go). Lazily initialized with
+	// default retention for hand-constructed test servers.
+	outcomes *outcomeStore
+	// maxCommitOps / maxMutBody bound one commit request. Defaults come from
+	// the package constants; NEUTRON_STUDIO_MAX_COMMIT_OPERATIONS and
+	// NEUTRON_STUDIO_MAX_MUTATION_BYTES can lower them at launch (values
+	// above the default clamp to the default — configurable downward only).
+	maxCommitOps int
+	maxMutBody   int64
 }
 
 // NewServer creates and configures the Studio server on the given port.
@@ -56,6 +66,9 @@ func NewServer(port int) (*Server, error) {
 		clients:      map[string]*db.Client{},
 		epochs:       map[string]string{},
 		sessionToken: token,
+		outcomes:     newOutcomeStore(defaultOutcomeCapacity, defaultOutcomeTTL, defaultStaleReservation),
+		maxCommitOps: clampDownwardInt(envInt("NEUTRON_STUDIO_MAX_COMMIT_OPERATIONS"), maxCommitOperations),
+		maxMutBody:   clampDownwardInt64(envInt64("NEUTRON_STUDIO_MAX_MUTATION_BYTES"), maxMutationBody),
 	}
 	return s, nil
 }
@@ -109,6 +122,10 @@ func (s *Server) routes() (*http.ServeMux, error) {
 	mux.HandleFunc("/api/table/v2/insert", s.handleTableRowInsertV2)
 	mux.HandleFunc("/api/table/v2/update", s.handleTableRowUpdateV2)
 	mux.HandleFunc("/api/table/v2/delete", s.handleTableRowDeleteV2)
+	mux.HandleFunc("/api/table/v2/commit", s.handleTableCommitV2)
+	mux.HandleFunc("/api/table/v2/preview", s.handleTablePreviewV2)
+	mux.HandleFunc("/api/table/v2/outcome", s.handleTableOutcomeV2)
+	mux.HandleFunc("/api/table/v2/revert", s.handleTableRevertV2)
 	mux.HandleFunc("/api/table/update", s.handleTableRowUpdate)
 	mux.HandleFunc("/api/table/delete", s.handleTableRowDelete)
 	mux.HandleFunc("/api/table/fks", s.handleTableFKs)

@@ -24,6 +24,52 @@ UI in a browser.
 document, graph, fts, geo, blob, streams, columnar, datalog, cdc, pubsub —
 plus `schema` (schema designer and code generator).
 
+## Atomic commits and retry outcomes (S02)
+
+Row edits can be staged as a structured operation list and committed as
+ONE transaction through `POST /api/table/v2/commit` (siblings:
+`/preview`, `/outcome`, `/revert`). An operation is `insert`, `update` or
+`delete` in the S01 row protocol — full-key identity, relation binding,
+xmin version guard, tagged wire values — and batches are bounded: at most
+100 operations and a 1 MiB body per request. Both limits can be lowered
+at launch (`NEUTRON_STUDIO_MAX_COMMIT_OPERATIONS`,
+`NEUTRON_STUDIO_MAX_MUTATION_BYTES`); they can never be raised past the
+coded bounds.
+
+Every commit carries a client-generated `operationId` (idempotency key).
+The server records one outcome per ID, transactionally with the batch:
+
+- Same ID + same payload → the recorded outcome is **replayed** (marked
+  `"replayed": true`); the operations are not executed again. This is how
+  a dropped response after a commit resolves: look the outcome up
+  (`POST /api/table/v2/outcome`) or retry the identical request.
+- Same ID + different payload → `409 state "operation_conflict"`. IDs are
+  single-use; send a fresh ID for different content.
+- Concurrent duplicate while the first is committing → `409 state
+  "in_progress"` (retry the same payload to receive the outcome).
+- Expired or evicted outcome records → `"unknown"`, never a guess and
+  never safe-to-repeat: a retried commit on a spent-unknown ID is refused
+  (`409 state "unknown"`) until the client verifies the table state and
+  uses a new ID.
+
+Outcome records are in-process with bounded retention (capacity 256, TTL
+15 minutes, tombstones for evicted IDs). A Studio restart therefore makes
+prior IDs unknown — the honest direction; no hidden tables are created in
+your database to remember them.
+
+`POST /api/table/v2/preview` runs the identical validation and execution
+inside a transaction that is always rolled back and reports the per-op
+diff (before/after values, would-be keys). `POST /api/table/v2/revert`
+undoes a committed batch through the inverse recorded at commit time —
+updates restored to their old values, inserted rows deleted, deleted rows
+re-inserted — under its own fresh `revertOperationId` (reverts are
+commits and deduplicate like any other). Reverts are refused honestly
+(`409 state "irreversible"`) where the inverse cannot be exact: identity
+or serial keys that cannot be re-supplied, generated columns, values that
+cannot round-trip the wire, or FK cascade/set-null/set-default side
+effects the inverse does not capture. A batch is reversible only when
+every operation is.
+
 ## Development
 
 `npm run dev` serves the SPA on port 5173 and proxies `/api` to the Go

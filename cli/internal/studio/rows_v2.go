@@ -2,14 +2,13 @@ package studio
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
 
-	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/neutron-build/neutron/cli/internal/db"
 )
@@ -301,15 +300,15 @@ func buildGuardedMutationV2(schemaName, tableName string, mut func(keyWhere stri
 
 // runGuardedMutation executes the guarded statement as one atomic statement
 // (implicit transaction) and returns the affected count plus the row's new
-// version.
-func runGuardedMutation(ctx context.Context, client *db.Client, sqlText string, args ...any) (int64, string, error) {
+// version. Runs identically on the pool or inside an explicit transaction.
+func runGuardedMutation(ctx context.Context, q rowQuerier, sqlText string, args ...any) (int64, string, error) {
 	var n int64
 	var ver string
 	wrapped := fmt.Sprintf(
 		"WITH mutated AS (%s RETURNING xmin::text AS ver) SELECT count(*) AS n, COALESCE(max(ver),'') AS ver FROM mutated",
 		sqlText,
 	)
-	err := client.QueryRow(ctx, wrapped, args...).Scan(&n, &ver)
+	err := q.QueryRow(ctx, wrapped, args...).Scan(&n, &ver)
 	return n, ver, err
 }
 
@@ -317,11 +316,11 @@ func runGuardedMutation(ctx context.Context, client *db.Client, sqlText string, 
 // the key with a different version is a conflict (report the current
 // version so the UI can refresh its identity); a row not found is missing
 // — the wording deliberately does not distinguish RLS-hidden from deleted.
-func explainRowConflictV2(ctx context.Context, client *db.Client, schemaName, tableName string, keyArgs []any, keyCols []string, verb string) error {
+func explainRowConflictV2(ctx context.Context, q rowQuerier, schemaName, tableName string, keyArgs []any, keyCols []string, verb string) error {
 	tableRef := fmt.Sprintf("%s.%s", quoteIdent(schemaName), quoteIdent(tableName))
 	keyWhere := keyPredicate(keyCols, 1)
 	var current string
-	err := client.QueryRow(ctx, fmt.Sprintf("SELECT xmin::text FROM %s WHERE %s", tableRef, keyWhere), keyArgs...).Scan(&current)
+	err := q.QueryRow(ctx, fmt.Sprintf("SELECT xmin::text FROM %s WHERE %s", tableRef, keyWhere), keyArgs...).Scan(&current)
 	if err == nil {
 		return rowStateError{
 			state:          "conflict",
@@ -342,33 +341,81 @@ type resolvedTarget struct {
 	meta   *tableMeta
 }
 
-// resolveTarget runs the checks every v2 mutation shares after auth and
-// body decoding: connection lookup, fresh introspection, binding match and
-// the read-only gate. It writes the response and returns false on refusal.
-func (s *Server) resolveTarget(w http.ResponseWriter, r *http.Request, connID, binding, schemaName, tableName string) (*resolvedTarget, bool) {
+// rowQuerier is the single-row query surface *db.Client and pgx.Tx share,
+// so the guarded-statement helpers run identically inside and outside a
+// transaction.
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// errNotConnected marks a connection the server has no client for.
+type errNotConnected struct{}
+
+func (errNotConnected) Error() string { return "not connected" }
+
+// errIntrospection marks a catalog-read failure; the wrapped error is for
+// the log, the sanitized one for the client.
+type errIntrospection struct{ err error }
+
+func (e errIntrospection) Error() string { return sanitizeError(e.err) }
+
+// resolveTargetErr runs the checks every v2 mutation shares after auth and
+// body decoding: connection lookup, fresh introspection, the read-only
+// gate, then the binding match. The table-level domain checks come BEFORE
+// the binding check (S01 review F1): a client probing a no-key or
+// unsupported table gets the table's honest read-only reason even when its
+// binding is also wrong — safety is identical (refused either way), but
+// the reported cause is the more useful one. The binding check still runs
+// last so identities from a reconnected client or a replaced relation are
+// refused with state "binding" on tables that are otherwise editable.
+func (s *Server) resolveTargetErr(ctx context.Context, connID, binding, schemaName, tableName string) (*resolvedTarget, error) {
 	client, ok := s.clientFor(connID)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "not connected")
-		return nil, false
+		return nil, errNotConnected{}
 	}
-	meta, err := fetchTableMeta(r.Context(), client, schemaName, tableName)
+	meta, err := fetchTableMeta(ctx, client, schemaName, tableName)
 	if err != nil {
-		log.Printf("studio: key introspection error: %v", err)
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": sanitizeError(err)})
-		return nil, false
+		return nil, errIntrospection{err}
 	}
-	if !meta.Exists || bindingFor(s.connectionEpoch(connID), meta.RelOID) != binding {
-		writeMutationOutcome(w, rowStateError{state: "binding", msg: fmt.Sprintf(
-			"%s.%s is no longer the relation these rows were read from (reconnected, or the table was replaced); reload before editing",
-			schemaName, tableName)}, "binding")
-		return nil, false
+	state := tableReadOnlyState(meta, false)
+	if !meta.Exists {
+		// Not-found is a read-only-class reason; no probe, no binding to check.
+		return nil, mutationDomainError{msg: fmt.Sprintf("%s.%s %s", schemaName, tableName, state.reason)}
 	}
-	state := tableReadOnlyState(meta, probeVersioned(r.Context(), client, schemaName, tableName))
+	state = tableReadOnlyState(meta, probeVersioned(ctx, client, schemaName, tableName))
 	if state.readOnly {
-		writeDomainError(w, mutationDomainError{msg: fmt.Sprintf("%s.%s %s", schemaName, tableName, state.reason)})
+		return nil, mutationDomainError{msg: fmt.Sprintf("%s.%s %s", schemaName, tableName, state.reason)}
+	}
+	if bindingFor(s.connectionEpoch(connID), meta.RelOID) != binding {
+		return nil, rowStateError{state: "binding", msg: fmt.Sprintf(
+			"%s.%s is no longer the relation these rows were read from (reconnected, or the table was replaced); reload before editing",
+			schemaName, tableName)}
+	}
+	return &resolvedTarget{client: client, meta: meta}, nil
+}
+
+// resolveTarget wraps resolveTargetErr with the HTTP response mapping.
+// It writes the response and returns false on refusal.
+func (s *Server) resolveTarget(w http.ResponseWriter, r *http.Request, connID, binding, schemaName, tableName string) (*resolvedTarget, bool) {
+	target, err := s.resolveTargetErr(r.Context(), connID, binding, schemaName, tableName)
+	if err != nil {
+		switch e := err.(type) {
+		case errNotConnected:
+			writeError(w, http.StatusBadRequest, e.Error())
+		case errIntrospection:
+			log.Printf("studio: key introspection error: %v", e.err)
+			writeJSON(w, http.StatusBadGateway, map[string]any{"error": e.Error()})
+		case mutationDomainError:
+			writeDomainError(w, e)
+		case rowStateError:
+			writeMutationOutcome(w, e, "resolve target")
+		default:
+			log.Printf("studio: resolve target error: %v", err)
+			writeJSON(w, http.StatusBadGateway, map[string]any{"error": sanitizeError(err)})
+		}
 		return nil, false
 	}
-	return &resolvedTarget{client: client, meta: meta}, true
+	return target, true
 }
 
 // readMutationBody applies the shared preamble: auth, method, size bound and
@@ -381,12 +428,40 @@ func (s *Server) readMutationBody(w http.ResponseWriter, r *http.Request, dst an
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return false
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxMutationBody)
+	r.Body = http.MaxBytesReader(w, r.Body, s.mutationBodyLimit())
 	if err := decodeStrictJSONBody(r, dst); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return false
 	}
 	return true
+}
+
+// mutationBodyLimit is the request-size bound for this launch (default
+// maxMutationBody, lowered via env at launch).
+func (s *Server) mutationBodyLimit() int64 {
+	if s.maxMutBody > 0 {
+		return s.maxMutBody
+	}
+	return maxMutationBody
+}
+
+// commitOpLimit bounds one commit's operation count (default
+// maxCommitOperations, lowered via env at launch).
+func (s *Server) commitOpLimit() int {
+	if s.maxCommitOps > 0 {
+		return s.maxCommitOps
+	}
+	return maxCommitOperations
+}
+
+// outcomeStore lazily hands hand-constructed servers the default retention.
+func (s *Server) outcomeRecords() *outcomeStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.outcomes == nil {
+		s.outcomes = newOutcomeStore(defaultOutcomeCapacity, defaultOutcomeTTL, defaultStaleReservation)
+	}
+	return s.outcomes
 }
 
 // validateIdentityFields checks the identity's scalar fields before any
@@ -411,32 +486,14 @@ func writeDomainError(w http.ResponseWriter, err error) {
 // writeMutationOutcome maps an error to the v2 status convention. It
 // returns false when the request is finished (handler must return).
 func writeMutationOutcome(w http.ResponseWriter, err error, verb string) bool {
-	var pgErr *pgconn.PgError
-	switch e := err.(type) {
-	case nil:
+	if err == nil {
 		return true
-	case mutationDomainError:
-		writeDomainError(w, e)
-	case rowStateError:
-		body := map[string]any{"error": e.msg, "state": e.state}
-		if e.state == "conflict" {
-			body["currentVersion"] = e.currentVersion
-		}
-		writeJSON(w, http.StatusConflict, body)
-	default:
-		switch {
-		case errors.As(err, &pgErr) && strings.HasPrefix(pgErr.Code, "22"):
-			// Data exception: the value does not parse as the column type.
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": sanitizeError(err)})
-		case errors.As(err, &pgErr) && strings.HasPrefix(pgErr.Code, "23"):
-			writeJSON(w, http.StatusConflict, map[string]any{"error": sanitizeError(err), "state": "constraint"})
-		case errors.As(err, &pgErr) && pgErr.Code == "42501":
-			writeJSON(w, http.StatusForbidden, map[string]any{"error": sanitizeError(err), "state": "privilege"})
-		default:
-			log.Printf("studio: %s error: %v", verb, err)
-			writeJSON(w, http.StatusBadGateway, map[string]any{"error": sanitizeError(err)})
-		}
 	}
+	status, body := classifyMutationOutcome(err, verb)
+	if status >= 500 {
+		log.Printf("studio: %s error: %v", verb, err)
+	}
+	writeJSON(w, status, body)
 	return false
 }
 
@@ -576,62 +633,12 @@ func (s *Server) handleTableRowInsertV2(w http.ResponseWriter, r *http.Request) 
 	}
 	meta := target.meta
 
-	// Validate every named column against the catalog and decode values
-	// BEFORE any SQL. Omitted columns request DEFAULT; JSON null requests SQL
-	// NULL — the two are never conflated. Column order is deterministic
-	// (attnum), independent of JSON object order.
-	for name := range body.Values {
-		if _, exists := meta.Columns[name]; !exists {
-			writeDomainError(w, mutationDomainError{msg: fmt.Sprintf(
-				"column %q does not exist on %s.%s; insert rejected", name, body.Schema, body.Table)})
-			return
-		}
+	colNames, args, err := validateInsertValues(meta, body.Values, body.Schema, body.Table)
+	if err != nil {
+		writeDomainError(w, err)
+		return
 	}
-	var colNames []string
-	var args []any
-	for _, col := range meta.Order {
-		raw, provided := body.Values[col.Name]
-		if !provided {
-			continue
-		}
-		if reason := insertableReason(col); reason != "" {
-			writeDomainError(w, mutationDomainError{msg: fmt.Sprintf("column %q: %s", col.Name, reason)})
-			return
-		}
-		if raw == nil && col.NotNull {
-			writeDomainError(w, mutationDomainError{msg: fmt.Sprintf("column %q is NOT NULL; SQL NULL rejected (omit it to use its DEFAULT)", col.Name)})
-			return
-		}
-		v, err := decodeColumnValue(col, raw)
-		if err != nil {
-			writeDomainError(w, mutationDomainError{msg: fmt.Sprintf("column %q: %v", col.Name, err)})
-			return
-		}
-		colNames = append(colNames, col.Name)
-		args = append(args, v)
-	}
-
-	tableRef := fmt.Sprintf("%s.%s", quoteIdent(body.Schema), quoteIdent(body.Table))
-	returning := make([]string, 0, len(meta.PKCols)+1)
-	for _, pk := range meta.PKCols {
-		returning = append(returning, quoteIdent(pk))
-	}
-	returning = append(returning, "xmin::text")
-
-	var sqlText string
-	if len(colNames) == 0 {
-		// All-DEFAULT row: valid backend syntax, never "INSERT () VALUES ()".
-		sqlText = fmt.Sprintf("INSERT INTO %s DEFAULT VALUES RETURNING %s", tableRef, strings.Join(returning, ", "))
-	} else {
-		quotedCols := make([]string, len(colNames))
-		placeholders := make([]string, len(colNames))
-		for i, c := range colNames {
-			quotedCols[i] = quoteIdent(c)
-			placeholders[i] = fmt.Sprintf("$%d", i+1)
-		}
-		sqlText = fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) RETURNING %s",
-			tableRef, strings.Join(quotedCols, ", "), strings.Join(placeholders, ", "), strings.Join(returning, ", "))
-	}
+	sqlText, _ := buildInsertStatementV2(meta, body.Schema, body.Table, colNames)
 
 	scanVals := make([]any, len(meta.PKCols)+1)
 	dest := make([]any, len(scanVals))
@@ -652,6 +659,64 @@ func (s *Server) handleTableRowInsertV2(w http.ResponseWriter, r *http.Request) 
 		"version":      scanVals[len(scanVals)-1],
 		"binding":      body.Binding,
 	})
+}
+
+// validateInsertValues checks an insert values map against the catalog and
+// decodes every value BEFORE any SQL. Omitted columns request DEFAULT;
+// JSON null requests SQL NULL — the two are never conflated. Column order
+// is deterministic (attnum), independent of JSON object order.
+func validateInsertValues(meta *tableMeta, values map[string]any, schemaName, tableName string) ([]string, []any, error) {
+	for name := range values {
+		if _, exists := meta.Columns[name]; !exists {
+			return nil, nil, mutationDomainError{msg: fmt.Sprintf(
+				"column %q does not exist on %s.%s; insert rejected", name, schemaName, tableName)}
+		}
+	}
+	var colNames []string
+	var args []any
+	for _, col := range meta.Order {
+		raw, provided := values[col.Name]
+		if !provided {
+			continue
+		}
+		if reason := insertableReason(col); reason != "" {
+			return nil, nil, mutationDomainError{msg: fmt.Sprintf("column %q: %s", col.Name, reason)}
+		}
+		if raw == nil && col.NotNull {
+			return nil, nil, mutationDomainError{msg: fmt.Sprintf("column %q is NOT NULL; SQL NULL rejected (omit it to use its DEFAULT)", col.Name)}
+		}
+		v, err := decodeColumnValue(col, raw)
+		if err != nil {
+			return nil, nil, mutationDomainError{msg: fmt.Sprintf("column %q: %v", col.Name, err)}
+		}
+		colNames = append(colNames, col.Name)
+		args = append(args, v)
+	}
+	return colNames, args, nil
+}
+
+// buildInsertStatementV2 renders the single-row INSERT with RETURNING of
+// the full key tuple and the new row version. An empty column list is the
+// valid all-DEFAULT row (DEFAULT VALUES), never "INSERT () VALUES ()".
+func buildInsertStatementV2(meta *tableMeta, schemaName, tableName string, colNames []string) (string, []string) {
+	tableRef := fmt.Sprintf("%s.%s", quoteIdent(schemaName), quoteIdent(tableName))
+	returning := make([]string, 0, len(meta.PKCols)+1)
+	for _, pk := range meta.PKCols {
+		returning = append(returning, quoteIdent(pk))
+	}
+	returning = append(returning, "xmin::text")
+
+	if len(colNames) == 0 {
+		return fmt.Sprintf("INSERT INTO %s DEFAULT VALUES RETURNING %s", tableRef, strings.Join(returning, ", ")), returning
+	}
+	quotedCols := make([]string, len(colNames))
+	placeholders := make([]string, len(colNames))
+	for i, c := range colNames {
+		quotedCols[i] = quoteIdent(c)
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+	}
+	return fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) RETURNING %s",
+		tableRef, strings.Join(quotedCols, ", "), strings.Join(placeholders, ", "), strings.Join(returning, ", ")), returning
 }
 
 // --- GET /api/table/v2/meta: authoritative editable-column metadata ---
