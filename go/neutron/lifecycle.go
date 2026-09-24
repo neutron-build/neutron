@@ -37,8 +37,14 @@ func (lc *lifecycle) add(hooks ...LifecycleHook) {
 // are joined onto the original error so both are observable.
 func (lc *lifecycle) start(ctx context.Context) error {
 	started := 0
+	failed := false
 	defer func() {
-		if started == 0 {
+		// Roll back ONLY a failed start. The old guard (started == 0)
+		// treated a fully successful start as rollback-worthy: with every
+		// hook started, stopLimited ran on the SUCCESS path too, leaving a
+		// booted application with all hooks stopped (found live by
+		// teploy-observe's O11 e2e: healthz 503, closed pool).
+		if !failed || started == 0 {
 			return
 		}
 		if err := lc.stopLimited(context.Background(), started); err != nil {
@@ -51,6 +57,7 @@ func (lc *lifecycle) start(ctx context.Context) error {
 		}
 		lc.logger.Info("starting lifecycle hook", "name", h.Name)
 		if err := h.OnStart(ctx); err != nil {
+			failed = true
 			err = fmt.Errorf("lifecycle start %q: %w", h.Name, err)
 			// Roll back the started prefix; stopLimited runs the first
 			// `started` hooks' OnStop in reverse. Its own failure is logged
