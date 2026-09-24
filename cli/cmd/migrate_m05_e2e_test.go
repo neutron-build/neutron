@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -9,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -30,8 +28,8 @@ import (
 // lock.
 //
 // Every refusal is first reproduced as a FAILURE on the pre-M05 binary
-// (built from HEAD via read-only `git archive`; the working tree is never
-// stashed or checked out). State is asserted by inspecting the database
+// (built from the pinned pre-M05 revision 35858e6e via read-only
+// `git archive`; the working tree is never stashed or checked out). State is asserted by inspecting the database
 // with raw SQL, not command output.
 //
 // Skipped unless NEUTRON_E2E_DATABASE_URL points at a disposable Postgres
@@ -46,7 +44,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 	}
 
 	bin := buildCLIBinary(t)
-	headBin := buildHEADCLIBinary(t)
+	preM05Bin := buildPreM05CLIBinary(t)
 
 	newDB := func(t *testing.T) string {
 		t.Helper()
@@ -61,15 +59,26 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 			t.Fatalf("create database %s: %v", dbName, err)
 		}
 		t.Cleanup(func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			if err := admin.Exec(ctx, fmt.Sprintf(
-				`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '%s' AND pid <> pg_backend_pid()`, dbName,
-			)); err != nil {
-				t.Errorf("terminate backends: %v", err)
-			}
-			if err := admin.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %q`, dbName)); err != nil {
-				t.Errorf("drop database %s: %v", dbName, err)
+			// Review-8 LOW-1 mitigation: under load (pinned-reference
+			// binary builds, -race instrumentation, busy dev machines) the
+			// original 15s window fired as a flake on DROP DATABASE —
+			// harness robustness only, never product behavior. Bounded at
+			// 45s with one retry.
+			for attempt := 0; attempt < 2; attempt++ {
+				ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+				if err := admin.Exec(ctx, fmt.Sprintf(
+					`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '%s' AND pid <> pg_backend_pid()`, dbName,
+				)); err != nil {
+					t.Errorf("terminate backends: %v", err)
+				}
+				err := admin.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %q`, dbName))
+				cancel()
+				if err == nil {
+					return
+				}
+				if attempt == 1 {
+					t.Errorf("drop database %s: %v", dbName, err)
+				}
 			}
 		})
 		return dbURL
@@ -201,8 +210,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 		})
 
 		// FAIL-BEFORE (pre-M05 binary): applies the drop with no ack.
-		if code, out := runCLIProcess(t, headBin, dbURL, "migrate", "--dir", dir); code != 0 {
-			t.Fatalf("head binary must apply destructive migration ungated (fail-before setup): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbURL, "migrate", "--dir", dir); code != 0 {
+			t.Fatalf("pre-M05 binary must apply destructive migration ungated (fail-before setup): %s", out)
 		}
 		if got := query(t, dbURL, `SELECT count(*) FROM information_schema.tables WHERE table_name='keepme'`); got != "0" {
 			t.Fatalf("fail-before state wrong: keepme still exists")
@@ -265,8 +274,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 		// documented L1 limitation. (The extension-table DROP needs no
 		// fail-before: PostgreSQL itself refuses deptype='e' drops; the
 		// guarded refusal below is our own earlier, clearer boundary.)
-		if code, out := runCLIProcess(t, headBin, dbURL, "migrate", "--dir", dir); code != 0 {
-			t.Fatalf("head binary must apply the protected statement (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbURL, "migrate", "--dir", dir); code != 0 {
+			t.Fatalf("pre-M05 binary must apply the protected statement (fail-before): %s", out)
 		}
 		if got := query(t, dbURL, `SELECT count(*) FROM _neutron_migrations WHERE version='001'`); got != "0" {
 			t.Fatalf("fail-before: TRUNCATE destroyed applied history (001's row vanished)")
@@ -328,8 +337,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 		execRaw(t, dbURL, `ALTER TABLE users ADD COLUMN sneaky text`)
 
 		// FAIL-BEFORE (pre-M05): pending 002 applies straight over drift.
-		if code, out := runCLIProcess(t, headBin, dbURL, "migrate", "--dir", mig); code != 0 {
-			t.Fatalf("head binary must apply over drift (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbURL, "migrate", "--dir", mig); code != 0 {
+			t.Fatalf("pre-M05 binary must apply over drift (fail-before): %s", out)
 		}
 		if got := query(t, dbURL, `SELECT count(*) FROM information_schema.tables WHERE table_name='posts'`); got != "1" {
 			t.Fatalf("fail-before state wrong: posts missing")
@@ -387,8 +396,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 		writeFile(t, up2, string(mustReadFile(t, up2))+"\nCREATE TABLE hacked (id int);\n")
 
 		// FAIL-BEFORE (pre-M05): the stale plan is never consulted.
-		if code, out := runCLIProcess(t, headBin, dbURL, "migrate", "--dir", mig); code != 0 {
-			t.Fatalf("head binary must apply the stale-planned migration (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbURL, "migrate", "--dir", mig); code != 0 {
+			t.Fatalf("pre-M05 binary must apply the stale-planned migration (fail-before): %s", out)
 		}
 		if got := query(t, dbURL, `SELECT count(*) FROM information_schema.tables WHERE table_name='hacked'`); got != "1" {
 			t.Fatalf("fail-before state wrong: hacked missing")
@@ -444,15 +453,15 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 			t.Fatalf("destructive pending migration applied without acknowledgement (code %d): %s", code, out)
 		}
 
-		// FAIL-BEFORE (pre-M05): the head binary applies everything
+		// FAIL-BEFORE (pre-M05): the pre-M05 binary applies everything
 		// ungated, and its `down 3` "reverts" 002 by executing ZERO SQL —
 		// the comment-only stub runs as nothing and the history row
 		// silently disappears (the fake rollback).
-		if code, out := runCLIProcess(t, headBin, dbURL, "migrate", "--dir", dir); code != 0 {
-			t.Fatalf("head binary must apply ungated (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbURL, "migrate", "--dir", dir); code != 0 {
+			t.Fatalf("pre-M05 binary must apply ungated (fail-before): %s", out)
 		}
-		if code, out := runCLIProcess(t, headBin, dbURL, "migrate", "down", "3", "--dir", dir); code != 0 {
-			t.Fatalf("head binary must fake the rollback (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbURL, "migrate", "down", "3", "--dir", dir); code != 0 {
+			t.Fatalf("pre-M05 binary must fake the rollback (fail-before): %s", out)
 		}
 		if got := query(t, dbURL, `SELECT count(*) FROM _neutron_migrations`); got != "0" {
 			t.Fatalf("fail-before: fake rollback left history rows = %s, want 0 (002's row vanished without SQL)", got)
@@ -727,12 +736,12 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 		})
 
 		// FAIL-BEFORE (pre-M05): status created the empty history table.
-		if code, out := runCLIProcess(t, headBin, dbURL, "migrate", "status", "--dir", dir); code != 0 {
-			t.Fatalf("head status failed: %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbURL, "migrate", "status", "--dir", dir); code != 0 {
+			t.Fatalf("pre-M05 status failed: %s", out)
 		}
-		headCreated := query(t, dbURL, `SELECT count(*) FROM information_schema.tables WHERE table_name='_neutron_migrations'`)
-		if headCreated != "1" {
-			t.Fatalf("fail-before premise wrong: head status did not create the history table (got %s)", headCreated)
+		preM05Created := query(t, dbURL, `SELECT count(*) FROM information_schema.tables WHERE table_name='_neutron_migrations'`)
+		if preM05Created != "1" {
+			t.Fatalf("fail-before premise wrong: pre-M05 status did not create the history table (got %s)", preM05Created)
 		}
 		execRaw(t, dbURL, `DROP TABLE _neutron_migrations`)
 
@@ -795,28 +804,28 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 
 		// FAIL-BEFORE (pre-M05): push does not wait — it finishes while
 		// the holder is still mid-migration.
-		headDone := make(chan time.Time, 1)
+		preM05Done := make(chan time.Time, 1)
 		go func() {
 			start := time.Now()
-			code, _ := runCLIProcess(t, headBin, dbURL, "db", "push", "--schema", schemaDoc, "--force")
+			code, _ := runCLIProcess(t, preM05Bin, dbURL, "db", "push", "--schema", schemaDoc, "--force")
 			if code != 0 {
-				t.Errorf("head push failed")
+				t.Errorf("pre-M05 push failed")
 			}
-			headDone <- time.Now()
+			preM05Done <- time.Now()
 			_ = start
 		}()
 		holderDone := make(chan error, 1)
 		go func() { holderDone <- holder.Wait() }()
-		headEnd := <-headDone
+		preM05End := <-preM05Done
 		if err := <-holderDone; err != nil {
 			t.Fatalf("holder failed: %v", err)
 		}
-		if headEnd.Before(time.Now().Add(-5 * time.Second)) {
-			t.Log("fail-before confirmed: head push completed while the migration still ran")
+		if preM05End.Before(time.Now().Add(-5 * time.Second)) {
+			t.Log("fail-before confirmed: pre-M05 push completed while the migration still ran")
 		} else {
-			t.Log("head push duration inconclusive (timing); guarded behavior is what is asserted")
+			t.Log("pre-M05 push duration inconclusive (timing); guarded behavior is what is asserted")
 		}
-		// The head push applied during the run; reset so the guarded
+		// The pre-M05 push applied during the run; reset so the guarded
 		// assertion starts from a known state (fresh history + no tables).
 		execRaw(t, dbURL, `DROP TABLE IF EXISTS push_t, lock_t`)
 		execRaw(t, dbURL, `DROP TABLE IF EXISTS _neutron_migrations`)
@@ -884,8 +893,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 		})
 		// FAIL-BEFORE (pre-M05): the sibling spelling applies with NO
 		// flags — extension and member destroyed.
-		if code, out := runCLIProcess(t, headBin, dbURL, "migrate", "--dir", dirExtCascade); code != 0 {
-			t.Fatalf("head binary must apply DROP EXTENSION CASCADE ungated (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbURL, "migrate", "--dir", dirExtCascade); code != 0 {
+			t.Fatalf("pre-M05 binary must apply DROP EXTENSION CASCADE ungated (fail-before): %s", out)
 		}
 		if got := query(t, dbURL, `SELECT count(*) FROM pg_extension WHERE extname='cube'`); got != "0" {
 			t.Fatalf("fail-before: extension must be gone, got %s", got)
@@ -1004,8 +1013,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 		})
 		// FAIL-BEFORE (pre-M05): the server happily executes the cascade
 		// — the extension-owned view AND the extension are destroyed.
-		if code, out := runCLIProcess(t, headBin, dbURL, "migrate", "--dir", dir); code != 0 {
-			t.Fatalf("head binary must apply the cascade drop ungated (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbURL, "migrate", "--dir", dir); code != 0 {
+			t.Fatalf("pre-M05 binary must apply the cascade drop ungated (fail-before): %s", out)
 		}
 		if got := query(t, dbURL, `SELECT count(*) FROM information_schema.tables WHERE table_name='innoc'`); got != "0" {
 			t.Fatalf("fail-before: innoc must be gone, got %s", got)
@@ -1059,8 +1068,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 		dirForge := writeMigrations(t, map[string]string{
 			"001_forge.up.sql": "INSERT INTO _neutron_migrations (version, name, applied_at, owner, format) VALUES ('999','fake',now(),'attacker','v2');",
 		})
-		if code, out := runCLIProcess(t, headBin, dbURL, "migrate", "--dir", dirForge); code != 0 {
-			t.Fatalf("head binary must apply the forged history row (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbURL, "migrate", "--dir", dirForge); code != 0 {
+			t.Fatalf("pre-M05 binary must apply the forged history row (fail-before): %s", out)
 		}
 		if got := query(t, dbURL, `SELECT count(*) FROM _neutron_migrations WHERE version='999' AND owner='attacker'`); got != "1" {
 			t.Fatalf("fail-before: the forged row must be present, got %s", got)
@@ -1238,7 +1247,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 	// P. Pass-2 BLOCKER-2: comments (leading line, leading/nested/mid-
 	//    statement blocks) must not hide destructive statements from
 	//    the guard AND the acknowledgement. Every escape applied on the
-	//    pre-M05 HEAD binary (fail-before) and on the attempt-2 tree.
+	//    pre-M05 binary (fail-before) and on the attempt-2 tree.
 	// ------------------------------------------------------------------
 	t.Run("CommentObfuscatedDestructiveRefused", func(t *testing.T) {
 		dbURL := newDB(t)
@@ -1253,14 +1262,14 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 		})
 		// FAIL-BEFORE: the block-comment escape applies with no flags
 		// (attempt-2 behavior — the guard never saw the statement). One
-		// statement only: the head binary executes verbatim, so a second
+		// statement only: the pre-M05 binary executes verbatim, so a second
 		// drop of the same table would fail on its own.
 		dirEscape := writeMigrations(t, map[string]string{
 			"001_escape.up.sql":   "/* note */ DROP TABLE _neutron_probe_tbl;",
 			"001_escape.down.sql": "SELECT 1;",
 		})
-		if code, out := runCLIProcess(t, headBin, dbURL, "migrate", "--dir", dirEscape); code != 0 {
-			t.Fatalf("head binary must apply the comment-obfuscated drop (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbURL, "migrate", "--dir", dirEscape); code != 0 {
+			t.Fatalf("pre-M05 binary must apply the comment-obfuscated drop (fail-before): %s", out)
 		}
 		if got := query(t, dbURL, `SELECT count(*) FROM pg_class WHERE relname='_neutron_probe_tbl'`); got != "0" {
 			t.Fatalf("fail-before: comment-obfuscated drop must destroy the table, got %s", got)
@@ -1354,7 +1363,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 	//    into managed tables stay legal.
 	// ------------------------------------------------------------------
 	t.Run("WithCTEWritesTargetGuarded", func(t *testing.T) {
-		// Destruction proof on dbA: the pre-M05 HEAD binary applies the
+		// Destruction proof on dbA: the pre-M05 binary applies the
 		// WITH-wrapped delete and destroys the 001 history row.
 		dbA := newDB(t)
 		dirA := writeMigrations(t, map[string]string{
@@ -1367,8 +1376,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 		writeFile(t, filepath.Join(dirA, "002_cte.up.sql"),
 			"WITH d AS (DELETE FROM _neutron_migrations WHERE version <> '002' RETURNING 1) SELECT count(*) FROM d;")
 		writeFile(t, filepath.Join(dirA, "002_cte.down.sql"), "SELECT 1;")
-		if code, out := runCLIProcess(t, headBin, dbA, "migrate", "--dir", dirA); code != 0 {
-			t.Fatalf("head binary must apply the WITH-wrapped delete (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbA, "migrate", "--dir", dirA); code != 0 {
+			t.Fatalf("pre-M05 binary must apply the WITH-wrapped delete (fail-before): %s", out)
 		}
 		if got := query(t, dbA, `SELECT count(*) FROM _neutron_migrations WHERE version='001'`); got != "0" {
 			t.Fatalf("fail-before: WITH-wrapped delete must destroy the 001 row, got %s", got)
@@ -1436,9 +1445,9 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 			"001_do.up.sql":   "DO $$ BEGIN CREATE TABLE do_t (i int); END $$;",
 			"001_do.down.sql": "DROP TABLE do_t;",
 		})
-		// FAIL-BEFORE: the pre-M05 HEAD binary applies the DO block.
-		if code, out := runCLIProcess(t, headBin, dbURL, "migrate", "--dir", dir); code != 0 {
-			t.Fatalf("head binary must apply the DO block (fail-before): %s", out)
+		// FAIL-BEFORE: the pre-M05 binary applies the DO block.
+		if code, out := runCLIProcess(t, preM05Bin, dbURL, "migrate", "--dir", dir); code != 0 {
+			t.Fatalf("pre-M05 binary must apply the DO block (fail-before): %s", out)
 		}
 		if got := query(t, dbURL, `SELECT count(*) FROM pg_class WHERE relname='do_t'`); got != "1" {
 			t.Fatalf("fail-before: DO block must create do_t, got %s", got)
@@ -1483,10 +1492,10 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 		})
 		// FAIL-BEFORE: with the acknowledgement, the attempt-2 guard's
 		// dead LIKE arm let the schema and its _neutron_* relation be
-		// destroyed. The pre-M05 HEAD binary is even earlier (no guard,
+		// destroyed. The pre-M05 binary is even earlier (no guard,
 		// no --allow-destructive flag — it applies ungated).
-		if code, out := runCLIProcess(t, headBin, dbURL, "migrate", "--dir", dirSchema); code != 0 {
-			t.Fatalf("head binary must apply DROP SCHEMA CASCADE ungated (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbURL, "migrate", "--dir", dirSchema); code != 0 {
+			t.Fatalf("pre-M05 binary must apply DROP SCHEMA CASCADE ungated (fail-before): %s", out)
 		}
 		if got := query(t, dbURL, `SELECT count(*) FROM information_schema.schemata WHERE schema_name='guard_s'`); got != "0" {
 			t.Fatalf("fail-before: schema must be destroyed, got %s", got)
@@ -1544,7 +1553,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 	//    statement runs, atomically, under both flag variants.
 	// ------------------------------------------------------------------
 	t.Run("ExplainAndPrepareExecuteRefused", func(t *testing.T) {
-		// EXPLAIN ANALYZE — fail-before: the head binary applies it and
+		// EXPLAIN ANALYZE — fail-before: the pre-M05 binary applies it and
 		// the 001 history row is destroyed.
 		dbA := newDB(t)
 		dirA := writeMigrations(t, map[string]string{
@@ -1556,8 +1565,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 		}
 		writeFile(t, filepath.Join(dirA, "002_attack.up.sql"), "EXPLAIN ANALYZE DELETE FROM _neutron_migrations;")
 		writeFile(t, filepath.Join(dirA, "002_attack.down.sql"), "SELECT 1;")
-		if code, out := runCLIProcess(t, headBin, dbA, "migrate", "--dir", dirA); code != 0 {
-			t.Fatalf("head binary must apply the EXPLAIN-wrapped delete (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbA, "migrate", "--dir", dirA); code != 0 {
+			t.Fatalf("pre-M05 binary must apply the EXPLAIN-wrapped delete (fail-before): %s", out)
 		}
 		if got := query(t, dbA, `SELECT count(*) FROM _neutron_migrations WHERE version='001'`); got != "0" {
 			t.Fatalf("fail-before: EXPLAIN ANALYZE destroyed the 001 row, got %s", got)
@@ -1592,8 +1601,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 			"002_attack.up.sql":   "PREPARE p AS DELETE FROM _neutron_migrations;\nEXECUTE p;",
 			"002_attack.down.sql": "SELECT 1;",
 		})
-		if code, out := runCLIProcess(t, headBin, dbC, "migrate", "--dir", dirC); code != 0 {
-			t.Fatalf("head binary must apply the PREPARE/EXECUTE pair (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbC, "migrate", "--dir", dirC); code != 0 {
+			t.Fatalf("pre-M05 binary must apply the PREPARE/EXECUTE pair (fail-before): %s", out)
 		}
 		if got := query(t, dbC, `SELECT count(*) FROM _neutron_migrations WHERE version='001'`); got != "0" {
 			t.Fatalf("fail-before: EXECUTE destroyed the 001 row, got %s", got)
@@ -1642,7 +1651,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 		}
 		for _, route := range routes {
 			t.Run(route.name, func(t *testing.T) {
-				// FAIL-BEFORE: the head binary applies the route and
+				// FAIL-BEFORE: the pre-M05 binary applies the route and
 				// the 001 history row is destroyed.
 				dbA := newDB(t)
 				dirA := writeMigrations(t, map[string]string{
@@ -1651,8 +1660,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					"002_attack.up.sql":   route.attack,
 					"002_attack.down.sql": "SELECT 1;",
 				})
-				if code, out := runCLIProcess(t, headBin, dbA, "migrate", "--dir", dirA); code != 0 {
-					t.Fatalf("head binary must apply the %s route (fail-before): %s", route.label, out)
+				if code, out := runCLIProcess(t, preM05Bin, dbA, "migrate", "--dir", dirA); code != 0 {
+					t.Fatalf("pre-M05 binary must apply the %s route (fail-before): %s", route.label, out)
 				}
 				if got := query(t, dbA, `SELECT count(*) FROM _neutron_migrations WHERE version='001'`); got != "0" {
 					t.Fatalf("fail-before: the %s route destroyed the 001 row, got %s", route.label, got)
@@ -1689,21 +1698,21 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 	//    time — fast, named, atomic.
 	// ------------------------------------------------------------------
 	t.Run("CopyStatementsRefusedFast", func(t *testing.T) {
-		// FROM STDIN — fail-before: the head binary stalls for the full
+		// FROM STDIN — fail-before: the pre-M05 binary stalls for the full
 		// --timeout and its error does not name COPY.
 		dbA := newDB(t)
 		dirA := writeMigrations(t, map[string]string{
 			"001_copy.up.sql": "COPY _neutron_migrations FROM STDIN;",
 		})
 		start := time.Now()
-		if code, out := runCLIProcess(t, headBin, dbA, "migrate", "--dir", dirA, "--timeout", "3s"); code == 0 {
-			t.Fatalf("head binary must fail the stalled COPY (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbA, "migrate", "--dir", dirA, "--timeout", "3s"); code == 0 {
+			t.Fatalf("pre-M05 binary must fail the stalled COPY (fail-before): %s", out)
 		}
 		if elapsed := time.Since(start); elapsed < 2500*time.Millisecond {
-			t.Fatalf("fail-before premise wrong: head COPY failed in %v, expected a stall until the timeout", elapsed)
+			t.Fatalf("fail-before premise wrong: pre-M05 COPY failed in %v, expected a stall until the timeout", elapsed)
 		}
-		if code, out := runCLIProcess(t, headBin, dbA, "migrate", "--dir", dirA, "--timeout", "3s"); code == 0 || strings.Contains(out, "COPY") {
-			t.Fatalf("head failure must be the unnamed timeout, not a COPY-named refusal: %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbA, "migrate", "--dir", dirA, "--timeout", "3s"); code == 0 || strings.Contains(out, "COPY") {
+			t.Fatalf("pre-M05 failure must be the unnamed timeout, not a COPY-named refusal: %s", out)
 		}
 
 		// Guarded: refused fast, with COPY named, under both variants.
@@ -1730,14 +1739,14 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 			t.Fatalf("refused COPY batch must record nothing, got %s rows", got)
 		}
 
-		// FROM PROGRAM — fail-before: the program executes on the head
+		// FROM PROGRAM — fail-before: the program executes on the pre-M05
 		// binary (its output lands as rows).
 		dbC := newDB(t)
 		dirC := writeMigrations(t, map[string]string{
 			"001_prog.up.sql": "CREATE TABLE prog_t (data text);\nCOPY prog_t FROM PROGRAM 'echo pwned-by-program';",
 		})
-		if code, out := runCLIProcess(t, headBin, dbC, "migrate", "--dir", dirC); code != 0 {
-			t.Fatalf("head binary must execute the FROM PROGRAM copy (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbC, "migrate", "--dir", dirC); code != 0 {
+			t.Fatalf("pre-M05 binary must execute the FROM PROGRAM copy (fail-before): %s", out)
 		}
 		if got := query(t, dbC, `SELECT count(*) FROM prog_t WHERE data LIKE 'pwned-by-program%'`); got != "1" {
 			t.Fatalf("fail-before: the program must have executed, got %s rows", got)
@@ -1779,10 +1788,10 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 			"CREATE TABLE legit_t (id int);\nEXPLAIN ANALYZE DELETE FROM _neutron_migrations;")
 		writeFile(t, filepath.Join(dir, "002_mixed.down.sql"), "DROP TABLE legit_t;")
 
-		// FAIL-BEFORE: the head binary applies the whole file — legit_t
+		// FAIL-BEFORE: the pre-M05 binary applies the whole file — legit_t
 		// exists AND the 001 history row is destroyed.
-		if code, out := runCLIProcess(t, headBin, dbURL, "migrate", "--dir", dir); code != 0 {
-			t.Fatalf("head binary must apply the mixed file (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbURL, "migrate", "--dir", dir); code != 0 {
+			t.Fatalf("pre-M05 binary must apply the mixed file (fail-before): %s", out)
 		}
 		if got := query(t, dbURL, `SELECT count(*) FROM information_schema.tables WHERE table_name='legit_t'`); got != "1" {
 			t.Fatalf("fail-before: legit_t must exist, got %s", got)
@@ -1830,11 +1839,11 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 	//    acceptance with the schema-object subset; the guard
 	//    vocabulary itself is untouched. The CIC+DROP DATABASE
 	//    fail-before is reproduced on the attempt-4 binary in
-	//    attempt-5.md (HEAD predates nontransactional execution and is
-	//    server-blocked inside a transaction, so headBin cannot carry
+	//    attempt-5.md (the pinned revision predates nontransactional execution and is
+	//    server-blocked inside a transaction, so preM05Bin cannot carry
 	//    that premise); the guarded assertions below lock the fix — a
 	//    revert re-executes the attack. ALTER ROLE and DROP ROLE carry
-	//    their own headBin fail-befores (transactional shapes).
+	//    their own preM05Bin fail-befores (transactional shapes).
 	// ------------------------------------------------------------------
 	t.Run("DatabaseAndRoleWideKindsRefused", func(t *testing.T) {
 		admin, err := db.Connect(context.Background(), base)
@@ -1914,7 +1923,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 			t.Fatalf("history must hold exactly 001, got %s", got)
 		}
 
-		// ALTER ROLE — fail-before: the head binary applies it and the
+		// ALTER ROLE — fail-before: the pre-M05 binary applies it and the
 		// role's configuration is persistently mutated.
 		dbB := newDB(t)
 		dirB := writeMigrations(t, map[string]string{
@@ -1923,8 +1932,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 		})
 		writeFile(t, filepath.Join(dirB, "020_ar.up.sql"), "ALTER ROLE "+role+" SET statement_timeout = '10s';")
 		writeFile(t, filepath.Join(dirB, "020_ar.down.sql"), "SELECT 1;")
-		if code, out := runCLIProcess(t, headBin, dbB, "migrate", "--dir", dirB); code != 0 {
-			t.Fatalf("head binary must apply the ALTER ROLE (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbB, "migrate", "--dir", dirB); code != 0 {
+			t.Fatalf("pre-M05 binary must apply the ALTER ROLE (fail-before): %s", out)
 		}
 		if got := query(t, dbB, `SELECT count(*) FROM pg_roles WHERE rolname='`+role+`' AND rolconfig IS NOT NULL`); got != "1" {
 			t.Fatalf("fail-before: ALTER ROLE must have persisted rolconfig, got %s", got)
@@ -1951,7 +1960,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 			t.Fatalf("the role's configuration must be untouched by the refused batch, got %s", got)
 		}
 
-		// DROP ROLE — fail-before: the head binary drops the role.
+		// DROP ROLE — fail-before: the pre-M05 binary drops the role.
 		dbC := newDB(t)
 		dirC := writeMigrations(t, map[string]string{
 			"001_base.up.sql":   "CREATE TABLE base_t (id int);",
@@ -1959,8 +1968,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 		})
 		writeFile(t, filepath.Join(dirC, "030_dr.up.sql"), "DROP ROLE "+role2+";")
 		writeFile(t, filepath.Join(dirC, "030_dr.down.sql"), "SELECT 1;")
-		if code, out := runCLIProcess(t, headBin, dbC, "migrate", "--dir", dirC); code != 0 {
-			t.Fatalf("head binary must apply the DROP ROLE (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbC, "migrate", "--dir", dirC); code != 0 {
+			t.Fatalf("pre-M05 binary must apply the DROP ROLE (fail-before): %s", out)
 		}
 		if got := query(t, dbC, `SELECT count(*) FROM pg_roles WHERE rolname='`+role2+`'`); got != "0" {
 			t.Fatalf("fail-before: DROP ROLE must have destroyed the role, got %s", got)
@@ -2048,7 +2057,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 	// Z. Review-4 MINOR-1: CREATE OR REPLACE spellings refused with the
 	//    degraded label "CREATE OR" and the generic reason. The label
 	//    now skips the modifier words, so each form names its real kind
-	//    and fires the precise per-kind reason. (Fail-before: the head
+	//    and fires the precise per-kind reason. (Fail-before: the pre-M05
 	//    binary applies these statements outright — pre-allowlist.)
 	// ------------------------------------------------------------------
 	t.Run("CreateOrReplaceKindsNamedPrecisely", func(t *testing.T) {
@@ -2065,7 +2074,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 		}
 		for _, form := range forms {
 			t.Run(form.name, func(t *testing.T) {
-				// FAIL-BEFORE: the head binary applies the statement
+				// FAIL-BEFORE: the pre-M05 binary applies the statement
 				// (the trigger form needs its function to exist —
 				// created through the harness, not migration SQL).
 				dbA := newDB(t)
@@ -2076,8 +2085,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					"002_or.down.sql":   "SELECT 1;",
 				})
 				execRaw(t, dbA, "CREATE FUNCTION orsrc() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$")
-				if code, out := runCLIProcess(t, headBin, dbA, "migrate", "--dir", dirA); code != 0 {
-					t.Fatalf("head binary must apply the %s form (fail-before): %s", form.label, out)
+				if code, out := runCLIProcess(t, preM05Bin, dbA, "migrate", "--dir", dirA); code != 0 {
+					t.Fatalf("pre-M05 binary must apply the %s form (fail-before): %s", form.label, out)
 				}
 
 				// Guarded: refused naming the REAL kind (a degraded
@@ -2127,7 +2136,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 	//     protected-prefix view in ANOTHER schema. Non-relation cascade
 	//     kinds now run the same transitive closure, cross-schema. (The
 	//     attempt-5-binary fail-befores are reproduced on
-	//     /tmp/m05a5/neutron-fix in attempt-6.md; the headBin premises
+	//     /tmp/m05a5/neutron-fix in attempt-6.md; the preM05Bin premises
 	//     below carry the same attacks pre-gate.)
 	// ------------------------------------------------------------------
 	t.Run("NonRelationCascadeTransitivityRefused", func(t *testing.T) {
@@ -2148,10 +2157,10 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 		dirA := writeMigrations(t, map[string]string{
 			"001_dom.up.sql": "DROP DOMAIN vict.d CASCADE;",
 		})
-		// FAIL-BEFORE (pre-M05 head): applies ungated; the domain
+		// FAIL-BEFORE (pre-M05 binary): applies ungated; the domain
 		// cascade empties the protected table's column.
-		if code, out := runCLIProcess(t, headBin, dbA, "migrate", "--dir", dirA); code != 0 {
-			t.Fatalf("head binary must apply the domain cascade (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbA, "migrate", "--dir", dirA); code != 0 {
+			t.Fatalf("pre-M05 binary must apply the domain cascade (fail-before): %s", out)
 		}
 		if got := query(t, dbA, `SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_z'`); got != "0" {
 			t.Fatalf("fail-before: the domain cascade must have dropped _neutron_z's column, got %s columns", got)
@@ -2199,10 +2208,10 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 		// Vector 2 — DROP SCHEMA ... CASCADE destroys a protected view
 		// in ANOTHER schema (the cross-schema transitive dependent).
 		writeFile(t, filepath.Join(baseB, "006_schema.up.sql"), "DROP SCHEMA vict CASCADE;")
-		// FAIL-BEFORE (pre-M05 head): applies ungated; the schema and
+		// FAIL-BEFORE (pre-M05 binary): applies ungated; the schema and
 		// the cross-schema dependent view are destroyed.
-		if code, out := runCLIProcess(t, headBin, dbB, "migrate", "--dir", baseB); code != 0 {
-			t.Fatalf("head binary must apply the schema cascade (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbB, "migrate", "--dir", baseB); code != 0 {
+			t.Fatalf("pre-M05 binary must apply the schema cascade (fail-before): %s", out)
 		}
 		if got := query(t, dbB, `SELECT count(*) FROM information_schema.schemata WHERE schema_name='vict'`); got != "0" {
 			t.Fatalf("fail-before: the schema must be destroyed, got %s", got)
@@ -2298,9 +2307,9 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 			"001_plant.up.sql":   "CREATE TABLE ok_t (i int);\nCREATE TABLE _neutron_plant (i int);",
 			"001_plant.down.sql": "DROP TABLE ok_t;",
 		})
-		// FAIL-BEFORE (pre-M05 head): the planted lookalike applies.
-		if code, out := runCLIProcess(t, headBin, dbA, "migrate", "--dir", dirA); code != 0 {
-			t.Fatalf("head binary must apply the planted lookalike (fail-before): %s", out)
+		// FAIL-BEFORE (pre-M05 binary): the planted lookalike applies.
+		if code, out := runCLIProcess(t, preM05Bin, dbA, "migrate", "--dir", dirA); code != 0 {
+			t.Fatalf("pre-M05 binary must apply the planted lookalike (fail-before): %s", out)
 		}
 		if got := query(t, dbA, `SELECT count(*) FROM pg_class WHERE relname='_neutron_plant'`); got != "1" {
 			t.Fatalf("fail-before: the planted table must exist, got %s", got)
@@ -2331,16 +2340,16 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 			"001_insch.up.sql":   "CREATE SCHEMA guard_s;\nCREATE TABLE guard_s._neutron_insch (i int);\nDROP SCHEMA guard_s CASCADE;",
 			"001_insch.down.sql": "SELECT 1;",
 		})
-		// FAIL-BEFORE (pre-M05 head): applies ungated — the file
+		// FAIL-BEFORE (pre-M05 binary): applies ungated — the file
 		// creates the schema with its planted table and destroys both.
-		if code, out := runCLIProcess(t, headBin, dbB, "migrate", "--dir", dirC); code != 0 {
-			t.Fatalf("head binary must apply the create-then-drop file (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbB, "migrate", "--dir", dirC); code != 0 {
+			t.Fatalf("pre-M05 binary must apply the create-then-drop file (fail-before): %s", out)
 		}
 		if got := query(t, dbB, `SELECT count(*) FROM information_schema.schemata WHERE schema_name='guard_s'`); got != "0" {
 			t.Fatalf("fail-before: the self-dropping schema must be gone, got %s", got)
 		}
 		if got := query(t, dbB, `SELECT count(*) FROM _neutron_migrations WHERE version='001'`); got != "1" {
-			t.Fatalf("fail-before: head must have recorded the applied 001, got %s", got)
+			t.Fatalf("fail-before: pre-M05 must have recorded the applied 001, got %s", got)
 		}
 		dbC := newDB(t)
 		dirC2 := writeMigrations(t, map[string]string{
@@ -2372,10 +2381,10 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 			"001_ext.up.sql":   "CREATE EXTENSION IF NOT EXISTS cube;\nDROP EXTENSION cube;",
 			"001_ext.down.sql": "SELECT 1;",
 		})
-		// FAIL-BEFORE (pre-M05 head): applies — the extension is
+		// FAIL-BEFORE (pre-M05 binary): applies — the extension is
 		// created and destroyed in one migration.
-		if code, out := runCLIProcess(t, headBin, dbD, "migrate", "--dir", dirD); code != 0 {
-			t.Fatalf("head binary must apply the extension round-trip (fail-before): %s", out)
+		if code, out := runCLIProcess(t, preM05Bin, dbD, "migrate", "--dir", dirD); code != 0 {
+			t.Fatalf("pre-M05 binary must apply the extension round-trip (fail-before): %s", out)
 		}
 		if got := query(t, dbD, `SELECT count(*) FROM pg_extension WHERE extname='cube'`); got != "0" {
 			t.Fatalf("fail-before: the extension must be gone after the round-trip, got %s", got)
@@ -2429,7 +2438,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 	//    DROP FUNCTION/OPERATOR/COLLATION CASCADE, DROP SCHEMA CASCADE
 	//    over a collation-only schema, DROP TABLE CASCADE stripping an
 	//    FK of a protected table, DROP SEQUENCE CASCADE stripping a
-	//    column default — reproduced fail-before on the pre-M05 head
+	//    column default — reproduced fail-before on the pre-M05 binary
 	//    binary, then refused under both flag variants with victims
 	//    intact and nothing applied.
 	// ------------------------------------------------------------------
@@ -2479,7 +2488,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE SCHEMA vs3; CREATE COLLATION vs3.c (provider = icu, locale = 'und');`,
 					`CREATE TABLE _neutron_sct (t text COLLATE vs3.c);`,
 				},
-				drop:  "DROP SCHEMA vs3 CASCADE;", // ack demand only on the head binary
+				drop:  "DROP SCHEMA vs3 CASCADE;", // ack demand only on the pre-M05 binary
 				named: "_neutron_sct",
 				probes: [][2]string{
 					{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_sct'`, "1"},
@@ -2525,14 +2534,14 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 				writeFile(t, filepath.Join(dir, "002_vec.up.sql"), vec.drop)
 				writeFile(t, filepath.Join(dir, "002_vec.down.sql"), "SELECT 1;")
 				// FAIL-BEFORE (attempt-6 binary class): the pre-M05
-				// head binary carries no guard and no ack gate — it
+				// pre-M05 binary carries no guard and no ack gate — it
 				// applies every vector ungated and destroys the victim.
-				if code, out := runCLIProcess(t, headBin, dbURL, "migrate", "--dir", dir); code != 0 {
-					t.Fatalf("head binary must apply the vector (fail-before): %s", out)
+				if code, out := runCLIProcess(t, preM05Bin, dbURL, "migrate", "--dir", dir); code != 0 {
+					t.Fatalf("pre-M05 binary must apply the vector (fail-before): %s", out)
 				}
 				for _, probe := range vec.probes {
 					if got := query(t, dbURL, probe[0]); got == probe[1] {
-						t.Fatalf("fail-before premise wrong: victim intact before the head-binary run (%s)", probe[0])
+						t.Fatalf("fail-before premise wrong: victim intact before the pre-M05-binary run (%s)", probe[0])
 					}
 				}
 				// Restore the fixture on a fresh database for the
@@ -2574,7 +2583,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 	//    enumerated from db.AllowlistedDropKinds(); each carries a
 	//    planted dependent chain terminating in a _neutron_-protected
 	//    fixture (table/view/constraint/default/column), a fail-before
-	//    run on the pre-M05 head binary, refusal under BOTH flag
+	//    run on the pre-M05 binary, refusal under BOTH flag
 	//    variants with the victim intact and nothing applied, and the
 	//    LEGAL direction — the same shape with ordinary user victims —
 	//    applying with ack semantics. A kind added to the allowlist
@@ -2592,15 +2601,15 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 			check [][2]string
 		}
 		type kindFixture struct {
-			plant       []string
-			drop        string
-			named       string
-			probes      [][2]string
-			vacuous     string // non-empty: no constructible chain; assert no false refusal
-			serverGuard string // non-empty: only the server refuses it; assert layered refusal
-			headAppl    bool   // the head binary applies the drop (rc 0)
-			headFlags   bool   // ...but only with --allow-destructive
-			legal       *legalSpec
+			plant           []string
+			drop            string
+			named           string
+			probes          [][2]string
+			vacuous         string // non-empty: no constructible chain; assert no false refusal
+			serverGuard     string // non-empty: only the server refuses it; assert layered refusal
+			preM05Applies   bool   // the pre-M05 binary applies the drop (rc 0)
+			preM05NeedsFlag bool   // ...but only with --allow-destructive
+			legal           *legalSpec
 		}
 		fixtures := map[string]kindFixture{
 			"table": {
@@ -2609,8 +2618,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE VIEW _neutron_pt_table_v AS SELECT i FROM pt_table.src;`,
 				},
 				drop: "DROP TABLE pt_table.src CASCADE;", named: "_neutron_pt_table_v",
-				probes:   [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='_neutron_pt_table_v'`, "1"}},
-				headAppl: true,
+				probes:        [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='_neutron_pt_table_v'`, "1"}},
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE TABLE pt_table.legalt (i int); CREATE VIEW pt_table.legalv AS SELECT i FROM pt_table.legalt;`},
 					drop:  "DROP TABLE pt_table.legalt CASCADE;", ack: true,
@@ -2623,8 +2632,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE VIEW _neutron_pt_view_v AS SELECT x FROM pt_view.src;`,
 				},
 				drop: "DROP VIEW pt_view.src CASCADE;", named: "_neutron_pt_view_v",
-				probes:   [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='_neutron_pt_view_v'`, "1"}},
-				headAppl: true,
+				probes:        [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='_neutron_pt_view_v'`, "1"}},
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE VIEW pt_view.legal1 AS SELECT 1 AS x; CREATE VIEW pt_view.legal2 AS SELECT x FROM pt_view.legal1;`},
 					drop:  "DROP VIEW pt_view.legal1 CASCADE;", ack: true,
@@ -2637,8 +2646,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE VIEW _neutron_pt_mview_v AS SELECT x FROM pt_mview.src;`,
 				},
 				drop: "DROP MATERIALIZED VIEW pt_mview.src CASCADE;", named: "_neutron_pt_mview_v",
-				probes:   [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='_neutron_pt_mview_v'`, "1"}},
-				headAppl: true,
+				probes:        [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='_neutron_pt_mview_v'`, "1"}},
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE MATERIALIZED VIEW pt_mview.legal1 AS SELECT 1 AS x; CREATE VIEW pt_mview.legal2 AS SELECT x FROM pt_mview.legal1;`},
 					drop:  "DROP MATERIALIZED VIEW pt_mview.legal1 CASCADE;",
@@ -2658,9 +2667,9 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`ALTER TABLE _neutron_pt_index ADD CONSTRAINT pt_index_c UNIQUE USING INDEX pt_index_ix;`,
 				},
 				drop: "DROP INDEX pt_index_c CASCADE;", named: "_neutron_pt_index",
-				probes:      [][2]string{{`SELECT count(*) FROM pg_constraint WHERE conrelid='_neutron_pt_index'::regclass`, "1"}},
-				serverGuard: "the only dependent edge of an index is its owning constraint's internal dependency, which PostgreSQL refuses to break even with CASCADE",
-				headAppl:    false,
+				probes:        [][2]string{{`SELECT count(*) FROM pg_constraint WHERE conrelid='_neutron_pt_index'::regclass`, "1"}},
+				serverGuard:   "the only dependent edge of an index is its owning constraint's internal dependency, which PostgreSQL refuses to break even with CASCADE",
+				preM05Applies: false,
 				legal: &legalSpec{
 					plant: []string{`CREATE TABLE pt_index_t (i int); CREATE INDEX pt_index_li ON pt_index_t(i);`},
 					drop:  "DROP INDEX pt_index_li CASCADE;", ack: true,
@@ -2673,8 +2682,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE TABLE _neutron_pt_seq (i int DEFAULT nextval('pt_seq.s'));`,
 				},
 				drop: "DROP SEQUENCE pt_seq.s CASCADE;", named: "_neutron_pt_seq",
-				probes:   [][2]string{{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_pt_seq' AND column_default IS NOT NULL`, "1"}},
-				headAppl: true,
+				probes:        [][2]string{{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_pt_seq' AND column_default IS NOT NULL`, "1"}},
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE SEQUENCE pt_seq.ls; CREATE TABLE pt_seq.lt (i int DEFAULT nextval('pt_seq.ls'));`},
 					drop:  "DROP SEQUENCE pt_seq.ls CASCADE;",
@@ -2687,8 +2696,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE TABLE _neutron_pt_type (c pt_type.e);`,
 				},
 				drop: "DROP TYPE pt_type.e CASCADE;", named: "_neutron_pt_type",
-				probes:   [][2]string{{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_pt_type'`, "1"}},
-				headAppl: true,
+				probes:        [][2]string{{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_pt_type'`, "1"}},
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE TYPE pt_type.le AS ENUM ('a'); CREATE TABLE pt_type.lt (c pt_type.le);`},
 					drop:  "DROP TYPE pt_type.le CASCADE;", ack: true,
@@ -2701,8 +2710,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE TABLE _neutron_pt_domain (c pt_domain.d);`,
 				},
 				drop: "DROP DOMAIN pt_domain.d CASCADE;", named: "_neutron_pt_domain",
-				probes:   [][2]string{{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_pt_domain'`, "1"}},
-				headAppl: true,
+				probes:        [][2]string{{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_pt_domain'`, "1"}},
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE DOMAIN pt_domain.ld AS int; CREATE TABLE pt_domain.lt (c pt_domain.ld);`},
 					drop:  "DROP DOMAIN pt_domain.ld CASCADE;",
@@ -2719,7 +2728,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_pt_schema'`, "1"},
 					{`SELECT count(*) FROM information_schema.schemata WHERE schema_name='pt_schema'`, "1"},
 				},
-				headAppl: true,
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE SCHEMA pt_schema_l; CREATE TABLE pt_schema_l.t (i int);`},
 					drop:  "DROP SCHEMA pt_schema_l CASCADE;", ack: true,
@@ -2733,9 +2742,9 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 				// (review-6 recorded the same limit).
 				plant: []string{`CREATE EXTENSION cube`},
 				drop:  "DROP EXTENSION cube CASCADE;", named: "cube",
-				probes:   [][2]string{{`SELECT count(*) FROM pg_extension WHERE extname='cube'`, "1"}},
-				headAppl: true,
-				legal:    nil,
+				probes:        [][2]string{{`SELECT count(*) FROM pg_extension WHERE extname='cube'`, "1"}},
+				preM05Applies: true,
+				legal:         nil,
 			},
 			"function": {
 				plant: []string{
@@ -2744,8 +2753,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE VIEW _neutron_pt_fn_v AS SELECT pt_fn.f() AS r;`,
 				},
 				drop: "DROP FUNCTION pt_fn.f() CASCADE;", named: "_neutron_pt_fn_v",
-				probes:   [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='_neutron_pt_fn_v'`, "1"}},
-				headAppl: true,
+				probes:        [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='_neutron_pt_fn_v'`, "1"}},
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE FUNCTION pt_fn.lf() RETURNS int LANGUAGE sql RETURN 7; CREATE VIEW pt_fn.lv AS SELECT pt_fn.lf() AS r;`},
 					drop:  "DROP FUNCTION pt_fn.lf() CASCADE;",
@@ -2763,8 +2772,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE VIEW _neutron_pt_proc_v AS SELECT pt_proc.f() AS r;`,
 				},
 				drop: "DROP PROCEDURE pt_proc.f() CASCADE;", named: "_neutron_pt_proc_v",
-				probes:   [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='_neutron_pt_proc_v'`, "1"}},
-				headAppl: false,
+				probes:        [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='_neutron_pt_proc_v'`, "1"}},
+				preM05Applies: false,
 				legal: &legalSpec{
 					plant: []string{`CREATE PROCEDURE pt_proc.lp() LANGUAGE plpgsql AS $$ BEGIN NULL; END $$;`},
 					drop:  "DROP PROCEDURE pt_proc.lp() CASCADE;",
@@ -2778,8 +2787,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE VIEW _neutron_pt_routine_v AS SELECT pt_routine.f() AS r;`,
 				},
 				drop: "DROP ROUTINE pt_routine.f() CASCADE;", named: "_neutron_pt_routine_v",
-				probes:   [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='_neutron_pt_routine_v'`, "1"}},
-				headAppl: true,
+				probes:        [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='_neutron_pt_routine_v'`, "1"}},
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE FUNCTION pt_routine.lf() RETURNS int LANGUAGE sql RETURN 7; CREATE VIEW pt_routine.lv AS SELECT pt_routine.lf() AS r;`},
 					drop:  "DROP ROUTINE pt_routine.lf() CASCADE;",
@@ -2793,8 +2802,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE VIEW _neutron_pt_agg_v AS SELECT pt_agg.a(i) AS s FROM pt_agg.t;`,
 				},
 				drop: "DROP AGGREGATE pt_agg.a (int) CASCADE;", named: "_neutron_pt_agg_v",
-				probes:   [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='_neutron_pt_agg_v'`, "1"}},
-				headAppl: true,
+				probes:        [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='_neutron_pt_agg_v'`, "1"}},
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE AGGREGATE pt_agg.la (int) (SFUNC = int4_sum, STYPE = int8, INITCOND = '0'); CREATE VIEW pt_agg.lv AS SELECT pt_agg.la(i) AS s FROM pt_agg.t;`},
 					drop:  "DROP AGGREGATE pt_agg.la (int) CASCADE;",
@@ -2807,8 +2816,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE TABLE _neutron_pt_col (t text COLLATE pt_col.c);`,
 				},
 				drop: "DROP COLLATION pt_col.c CASCADE;", named: "_neutron_pt_col",
-				probes:   [][2]string{{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_pt_col'`, "1"}},
-				headAppl: true,
+				probes:        [][2]string{{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_pt_col'`, "1"}},
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE COLLATION pt_col.lc (provider = icu, locale = 'und'); CREATE TABLE pt_col.lt (t text COLLATE pt_col.lc);`},
 					drop:  "DROP COLLATION pt_col.lc CASCADE;",
@@ -2816,12 +2825,12 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 				},
 			},
 			"conversion": {
-				vacuous:  "nothing in PostgreSQL 17 records a pg_depend reference INTO a pg_conversion, so no dependent chain terminating in a protected fixture is constructible; the closure runs and must not over-refuse",
-				plant:    []string{`CREATE SCHEMA pt_conv; CREATE CONVERSION pt_conv.c FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8; CREATE TABLE _neutron_pt_conv (i int);`},
-				drop:     "DROP CONVERSION pt_conv.c CASCADE;",
-				probes:   [][2]string{{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_pt_conv'`, "1"}},
-				headAppl: true,
-				legal:    nil,
+				vacuous:       "nothing in PostgreSQL 17 records a pg_depend reference INTO a pg_conversion, so no dependent chain terminating in a protected fixture is constructible; the closure runs and must not over-refuse",
+				plant:         []string{`CREATE SCHEMA pt_conv; CREATE CONVERSION pt_conv.c FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8; CREATE TABLE _neutron_pt_conv (i int);`},
+				drop:          "DROP CONVERSION pt_conv.c CASCADE;",
+				probes:        [][2]string{{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_pt_conv'`, "1"}},
+				preM05Applies: true,
+				legal:         nil,
 			},
 			"policy": {
 				plant: []string{
@@ -2829,8 +2838,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE POLICY pt_policy_p ON _neutron_pt_policy USING (true);`,
 				},
 				drop: "DROP POLICY pt_policy_p ON _neutron_pt_policy CASCADE;", named: "_neutron_pt_policy",
-				probes:   [][2]string{{`SELECT count(*) FROM pg_policy WHERE polname='pt_policy_p'`, "1"}},
-				headAppl: true,
+				probes:        [][2]string{{`SELECT count(*) FROM pg_policy WHERE polname='pt_policy_p'`, "1"}},
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE TABLE pt_policy_t (i int); CREATE POLICY pt_policy_lp ON pt_policy_t USING (true);`},
 					drop:  "DROP POLICY pt_policy_lp ON pt_policy_t CASCADE;",
@@ -2844,8 +2853,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE TRIGGER pt_trigger_t BEFORE UPDATE ON _neutron_pt_trigger FOR EACH ROW EXECUTE FUNCTION pt_trg.f();`,
 				},
 				drop: "DROP TRIGGER pt_trigger_t ON _neutron_pt_trigger CASCADE;", named: "_neutron_pt_trigger",
-				probes:   [][2]string{{`SELECT count(*) FROM pg_trigger WHERE tgname='pt_trigger_t' AND NOT tgisinternal`, "1"}},
-				headAppl: true,
+				probes:        [][2]string{{`SELECT count(*) FROM pg_trigger WHERE tgname='pt_trigger_t' AND NOT tgisinternal`, "1"}},
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE TABLE pt_trigger_lt (i int); CREATE TRIGGER pt_trigger_lt2 BEFORE UPDATE ON pt_trigger_lt FOR EACH ROW EXECUTE FUNCTION pt_trg.f();`},
 					drop:  "DROP TRIGGER pt_trigger_lt2 ON pt_trigger_lt CASCADE;",
@@ -2858,8 +2867,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE RULE pt_rule_r AS ON INSERT TO _neutron_pt_rule DO INSTEAD NOTHING;`,
 				},
 				drop: "DROP RULE pt_rule_r ON _neutron_pt_rule CASCADE;", named: "_neutron_pt_rule",
-				probes:   [][2]string{{`SELECT count(*) FROM pg_rewrite WHERE rulename='pt_rule_r'`, "1"}},
-				headAppl: true,
+				probes:        [][2]string{{`SELECT count(*) FROM pg_rewrite WHERE rulename='pt_rule_r'`, "1"}},
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE TABLE pt_rule_lt (i int); CREATE RULE pt_rule_lr AS ON INSERT TO pt_rule_lt DO INSTEAD NOTHING;`},
 					drop:  "DROP RULE pt_rule_lr ON pt_rule_lt CASCADE;",
@@ -2867,12 +2876,12 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 				},
 			},
 			"statistics": {
-				vacuous:  "nothing in PostgreSQL 17 records a pg_depend reference INTO a pg_statistic_ext, so no dependent chain terminating in a protected fixture is constructible; the closure runs and must not over-refuse",
-				plant:    []string{`CREATE SCHEMA pt_stats; CREATE TABLE pt_stats.t (a int, b int); CREATE STATISTICS pt_stats.st ON a, b FROM pt_stats.t; CREATE TABLE _neutron_pt_stats (i int);`},
-				drop:     "DROP STATISTICS pt_stats.st CASCADE;",
-				probes:   [][2]string{{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_pt_stats'`, "1"}},
-				headAppl: true,
-				legal:    nil,
+				vacuous:       "nothing in PostgreSQL 17 records a pg_depend reference INTO a pg_statistic_ext, so no dependent chain terminating in a protected fixture is constructible; the closure runs and must not over-refuse",
+				plant:         []string{`CREATE SCHEMA pt_stats; CREATE TABLE pt_stats.t (a int, b int); CREATE STATISTICS pt_stats.st ON a, b FROM pt_stats.t; CREATE TABLE _neutron_pt_stats (i int);`},
+				drop:          "DROP STATISTICS pt_stats.st CASCADE;",
+				probes:        [][2]string{{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_pt_stats'`, "1"}},
+				preM05Applies: true,
+				legal:         nil,
 			},
 			"operator": {
 				plant: []string{
@@ -2881,8 +2890,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE VIEW _neutron_pt_op_v AS SELECT i OPERATOR(pt_op.===) 1 AS r FROM pt_op.t;`,
 				},
 				drop: "DROP OPERATOR pt_op.===(int, int) CASCADE;", named: "_neutron_pt_op_v",
-				probes:   [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='_neutron_pt_op_v'`, "1"}},
-				headAppl: true,
+				probes:        [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='_neutron_pt_op_v'`, "1"}},
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE OPERATOR pt_op.!== (LEFTARG = int, RIGHTARG = int, PROCEDURE = int4ne); CREATE VIEW pt_op.lv AS SELECT i OPERATOR(pt_op.!==) 1 AS r FROM pt_op.t;`},
 					drop:  "DROP OPERATOR pt_op.!== (int, int) CASCADE;",
@@ -2897,8 +2906,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE VIEW _neutron_pt_ft_v AS SELECT i FROM pt_ft.src;`,
 				},
 				drop: "DROP FOREIGN TABLE pt_ft.src CASCADE;", named: "_neutron_pt_ft_v",
-				probes:   [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='_neutron_pt_ft_v'`, "1"}},
-				headAppl: true,
+				probes:        [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='_neutron_pt_ft_v'`, "1"}},
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE FOREIGN TABLE pt_ft.lt (i int) SERVER pt_srv; CREATE VIEW pt_ft.lv AS SELECT i FROM pt_ft.lt;`},
 					drop:  "DROP FOREIGN TABLE pt_ft.lt CASCADE;",
@@ -2913,8 +2922,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE INDEX pt_oc_ix ON _neutron_pt_oc USING btree (i pt_oc.oc);`,
 				},
 				drop: "DROP OPERATOR CLASS pt_oc.oc USING btree CASCADE;", named: "pt_oc_ix",
-				probes:   [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='pt_oc_ix'`, "1"}},
-				headAppl: true,
+				probes:        [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='pt_oc_ix'`, "1"}},
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE TABLE pt_oc.lt (i int); CREATE OPERATOR FAMILY pt_oc.lfam USING btree; CREATE OPERATOR CLASS pt_oc.loc FOR TYPE int USING btree FAMILY pt_oc.lfam AS OPERATOR 1 <, OPERATOR 3 =, FUNCTION 1 btint4cmp(int4,int4); CREATE INDEX pt_oc_li ON pt_oc.lt USING btree (i pt_oc.loc);`},
 					drop:  "DROP OPERATOR CLASS pt_oc.loc USING btree CASCADE;",
@@ -2930,8 +2939,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE INDEX pt_of_ix ON _neutron_pt_of USING btree (i pt_of.oc);`,
 				},
 				drop: "DROP OPERATOR FAMILY pt_of.fam USING btree CASCADE;", named: "pt_of_ix",
-				probes:   [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='pt_of_ix'`, "1"}},
-				headAppl: true,
+				probes:        [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='pt_of_ix'`, "1"}},
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE OPERATOR FAMILY pt_of.lfam USING btree;`},
 					drop:  "DROP OPERATOR FAMILY pt_of.lfam USING btree CASCADE;",
@@ -2944,8 +2953,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE TABLE _neutron_pt_tsc (v tsvector DEFAULT to_tsvector('pt_tsc.c'::regconfig, 'x'));`,
 				},
 				drop: "DROP TEXT SEARCH CONFIGURATION pt_tsc.c CASCADE;", named: "_neutron_pt_tsc",
-				probes:   [][2]string{{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_pt_tsc' AND column_default IS NOT NULL`, "1"}},
-				headAppl: true,
+				probes:        [][2]string{{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_pt_tsc' AND column_default IS NOT NULL`, "1"}},
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE TEXT SEARCH CONFIGURATION pt_tsc.lc (COPY = english); CREATE TABLE pt_tsc.lt (v tsvector DEFAULT to_tsvector('pt_tsc.lc'::regconfig, 'x'));`},
 					drop:  "DROP TEXT SEARCH CONFIGURATION pt_tsc.lc CASCADE;",
@@ -2961,8 +2970,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE TABLE _neutron_pt_tsd (v tsvector DEFAULT to_tsvector('pt_tsd.c'::regconfig, 'x'));`,
 				},
 				drop: "DROP TEXT SEARCH DICTIONARY pt_tsd.d CASCADE;", named: "_neutron_pt_tsd",
-				probes:   [][2]string{{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_pt_tsd' AND column_default IS NOT NULL`, "1"}},
-				headAppl: true,
+				probes:        [][2]string{{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_pt_tsd' AND column_default IS NOT NULL`, "1"}},
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE TEXT SEARCH DICTIONARY pt_tsd.ld (TEMPLATE = snowball, Language = 'english'); CREATE TEXT SEARCH CONFIGURATION pt_tsd.lc (COPY = english); ALTER TEXT SEARCH CONFIGURATION pt_tsd.lc ALTER MAPPING FOR word WITH pt_tsd.ld; CREATE TABLE pt_tsd.lt (v tsvector DEFAULT to_tsvector('pt_tsd.lc'::regconfig, 'x'));`},
 					drop:  "DROP TEXT SEARCH DICTIONARY pt_tsd.ld CASCADE;",
@@ -2978,8 +2987,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE TABLE _neutron_pt_tsp (v tsvector DEFAULT to_tsvector('pt_tsp.c'::regconfig, 'x'));`,
 				},
 				drop: "DROP TEXT SEARCH PARSER pt_tsp.p CASCADE;", named: "_neutron_pt_tsp",
-				probes:   [][2]string{{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_pt_tsp' AND column_default IS NOT NULL`, "1"}},
-				headAppl: true,
+				probes:        [][2]string{{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_pt_tsp' AND column_default IS NOT NULL`, "1"}},
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE TEXT SEARCH PARSER pt_tsp.lp (START = prsd_start, GETTOKEN = prsd_nexttoken, END = prsd_end, LEXTYPES = prsd_lextype); CREATE TEXT SEARCH CONFIGURATION pt_tsp.lc (PARSER = pt_tsp.lp); ALTER TEXT SEARCH CONFIGURATION pt_tsp.lc ADD MAPPING FOR word WITH english_stem; CREATE TABLE pt_tsp.lt (v tsvector DEFAULT to_tsvector('pt_tsp.lc'::regconfig, 'x'));`},
 					drop:  "DROP TEXT SEARCH PARSER pt_tsp.lp CASCADE;",
@@ -2996,8 +3005,8 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					`CREATE TABLE _neutron_pt_tt (v tsvector DEFAULT to_tsvector('pt_tt.c'::regconfig, 'x'));`,
 				},
 				drop: "DROP TEXT SEARCH TEMPLATE pt_tt.t CASCADE;", named: "_neutron_pt_tt",
-				probes:   [][2]string{{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_pt_tt' AND column_default IS NOT NULL`, "1"}},
-				headAppl: true,
+				probes:        [][2]string{{`SELECT count(*) FROM information_schema.columns WHERE table_name='_neutron_pt_tt' AND column_default IS NOT NULL`, "1"}},
+				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE TEXT SEARCH TEMPLATE pt_tt.lt (INIT = dsimple_init, LEXIZE = dsimple_lexize); CREATE TEXT SEARCH DICTIONARY pt_tt.ld (TEMPLATE = pt_tt.lt); CREATE TEXT SEARCH CONFIGURATION pt_tt.lc (COPY = english); ALTER TEXT SEARCH CONFIGURATION pt_tt.lc ALTER MAPPING FOR word WITH pt_tt.ld; CREATE TABLE pt_tt.lt2 (v tsvector DEFAULT to_tsvector('pt_tt.lc'::regconfig, 'x'));`},
 					drop:  "DROP TEXT SEARCH TEMPLATE pt_tt.lt CASCADE;",
@@ -3026,18 +3035,18 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					"001_pt.up.sql":   fix.drop,
 					"001_pt.down.sql": "SELECT 1;",
 				})
-				// Fail-before: the pre-M05 head binary carries no
+				// Fail-before: the pre-M05 binary carries no
 				// guard; for constructible chains it applies the drop
 				// and destroys the victim (premise carried forever).
-				code, out := runCLIProcess(t, headBin, dbURL, "migrate", "--dir", dir)
-				if fix.headAppl && code != 0 {
-					t.Fatalf("head binary must apply the %s drop (fail-before): %s", kind, out)
+				code, out := runCLIProcess(t, preM05Bin, dbURL, "migrate", "--dir", dir)
+				if fix.preM05Applies && code != 0 {
+					t.Fatalf("pre-M05 binary must apply the %s drop (fail-before): %s", kind, out)
 				}
-				if !fix.headAppl && code == 0 {
-					t.Fatalf("head binary unexpectedly applied the %s drop (fixture premise wrong — the server should refuse it too)", kind)
+				if !fix.preM05Applies && code == 0 {
+					t.Fatalf("pre-M05 binary unexpectedly applied the %s drop (fixture premise wrong — the server should refuse it too)", kind)
 				}
 				execRaw(t, dbURL, `DROP TABLE IF EXISTS _neutron_migrations`)
-				// Whatever the head run destroyed is replanted on a
+				// Whatever the pre-M05 run destroyed is replanted on a
 				// fresh database for the guarded assertions.
 				dbGuarded := newDB(t)
 				for _, stmt := range fix.plant {
@@ -3110,23 +3119,23 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 	// AA. Review-7 MAJOR-1: the demonstrated name-class ALTER escapes —
 	//     ALTER OPERATOR CLASS/FAMILY ... RENAME and ALTER OPERATOR
 	//     ... SET SCHEMA over cube's own members applied rc 0 on the
-	//     attempt-7 binary — reproduced fail-before on the pre-M05 head
+	//     attempt-7 binary — reproduced fail-before on the pre-M05 binary
 	//     binary (PostgreSQL accepts member renames; it refuses only
 	//     member drops, 2BP01), then refused under both flag variants
 	//     with members intact. The member-DROP shapes (plain and
 	//     CASCADE) are pinned guard-side, ahead of the server's own
 	//     2BP01, so a future PostgreSQL behavior change cannot reopen
-	//     them silently; the head binary already fails those through
+	//     them silently; the pre-M05 binary already fails those through
 	//     the server. Control: the same SET SCHEMA spelling over a
 	//     USER-created operator stays legal.
 	// ------------------------------------------------------------------
 	t.Run("Review7NameClassAlterVectorsRefused", func(t *testing.T) {
 		vectors := []struct {
-			name     string
-			plant    []string
-			stmt     string
-			headAppl bool // the head binary applies it (the server accepts)
-			probes   [][2]string
+			name          string
+			plant         []string
+			stmt          string
+			preM05Applies bool // the pre-M05 binary applies it (the server accepts)
+			probes        [][2]string
 		}{
 			{
 				name:  "OperatorClassMemberRename",
@@ -3136,7 +3145,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					{`SELECT count(*) FROM pg_opclass WHERE opcname='cube_ops'`, "1"},
 					{`SELECT count(*) FROM pg_opclass WHERE opcname='cube_ops2'`, "0"},
 				},
-				headAppl: true,
+				preM05Applies: true,
 			},
 			{
 				name:  "OperatorFamilyMemberRename",
@@ -3146,7 +3155,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					{`SELECT count(*) FROM pg_opfamily WHERE opfname='cube_ops'`, "1"},
 					{`SELECT count(*) FROM pg_opfamily WHERE opfname='cube_fam2'`, "0"},
 				},
-				headAppl: true,
+				preM05Applies: true,
 			},
 			{
 				name:  "OperatorMemberSetSchema",
@@ -3155,7 +3164,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 				probes: [][2]string{
 					{`SELECT count(*) FROM pg_operator o JOIN pg_namespace n ON n.oid=o.oprnamespace JOIN pg_depend d ON d.classid='pg_operator'::regclass AND d.objid=o.oid WHERE d.deptype='e' AND o.oprname='<>' AND n.nspname='public'`, "1"},
 				},
-				headAppl: true,
+				preM05Applies: true,
 			},
 			{
 				name:  "OperatorMemberDropPlainPinnedServerSide",
@@ -3164,7 +3173,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 				probes: [][2]string{
 					{`SELECT count(*) FROM pg_depend d JOIN pg_extension e ON e.oid=d.refobjid WHERE e.extname='cube' AND d.deptype='e' AND d.classid='pg_operator'::regclass`, "14"},
 				},
-				headAppl: false, // PostgreSQL itself refuses (2BP01)
+				preM05Applies: false, // PostgreSQL itself refuses (2BP01)
 			},
 			{
 				name:  "OperatorMemberDropCascadePinnedServerSide",
@@ -3173,7 +3182,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 				probes: [][2]string{
 					{`SELECT count(*) FROM pg_depend d JOIN pg_extension e ON e.oid=d.refobjid WHERE e.extname='cube' AND d.deptype='e' AND d.classid='pg_operator'::regclass`, "14"},
 				},
-				headAppl: false, // PostgreSQL itself refuses (2BP01)
+				preM05Applies: false, // PostgreSQL itself refuses (2BP01)
 			},
 		}
 		for _, vec := range vectors {
@@ -3187,20 +3196,20 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					"001_vec.down.sql": "SELECT 1;",
 				})
 				// Fail-before (member ALTERs) / premise (member DROPs):
-				// the pre-M05 head binary carries no guard. PostgreSQL
+				// the pre-M05 pre-M05 binary carries no guard. PostgreSQL
 				// accepts member ALTERs, so they apply and mutate the
 				// member; member DROPs it refuses itself (2BP01).
-				code, out := runCLIProcess(t, headBin, dbURL, "migrate", "--dir", dir)
-				if vec.headAppl && code != 0 {
-					t.Fatalf("head binary must apply the member ALTER (fail-before — PostgreSQL accepts member renames): %s", out)
+				code, out := runCLIProcess(t, preM05Bin, dbURL, "migrate", "--dir", dir)
+				if vec.preM05Applies && code != 0 {
+					t.Fatalf("pre-M05 binary must apply the member ALTER (fail-before — PostgreSQL accepts member renames): %s", out)
 				}
-				if !vec.headAppl && code == 0 {
-					t.Fatal("head binary unexpectedly applied the member drop (fixture premise wrong — the server should refuse it too)")
+				if !vec.preM05Applies && code == 0 {
+					t.Fatal("pre-M05 binary unexpectedly applied the member drop (fixture premise wrong — the server should refuse it too)")
 				}
-				if vec.headAppl {
+				if vec.preM05Applies {
 					for _, probe := range vec.probes {
 						if got := query(t, dbURL, probe[0]); got == probe[1] {
-							t.Fatalf("fail-before premise wrong: member intact after the head-binary run (%s)", probe[0])
+							t.Fatalf("fail-before premise wrong: member intact after the pre-M05-binary run (%s)", probe[0])
 						}
 					}
 				}
@@ -3259,7 +3268,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 	//     dispatches on); each carries an extension-member fixture
 	//     (cube's stock members, or a member planted through
 	//     ALTER EXTENSION cube ADD), a fail-before run on the pre-M05
-	//     head binary proving PostgreSQL accepts the member ALTER,
+	//     pre-M05 binary proving PostgreSQL accepts the member ALTER,
 	//     refusal under BOTH flag variants with the member intact and
 	//     nothing applied, and the LEGAL direction — the same ALTER
 	//     over a user object applies. Kinds for which PostgreSQL 17
@@ -3485,16 +3494,16 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 					"001_pt.down.sql": "SELECT 1;",
 				})
 				if fix.vacuous == "" {
-					// Fail-before: the pre-M05 head binary carries no
+					// Fail-before: the pre-M05 binary carries no
 					// guard, and PostgreSQL accepts member ALTERs —
 					// the member is renamed or relocated ungated.
-					code, out := runCLIProcess(t, headBin, dbURL, "migrate", "--dir", dir)
+					code, out := runCLIProcess(t, preM05Bin, dbURL, "migrate", "--dir", dir)
 					if code != 0 {
-						t.Fatalf("head binary must apply the %s member ALTER (fail-before — PostgreSQL accepts member renames): %s", kind, out)
+						t.Fatalf("pre-M05 binary must apply the %s member ALTER (fail-before — PostgreSQL accepts member renames): %s", kind, out)
 					}
 					for _, probe := range fix.probes {
 						if got := query(t, dbURL, probe[0]); got == probe[1] {
-							t.Fatalf("fail-before premise wrong: member intact after the head-binary run (%s)", probe[0])
+							t.Fatalf("fail-before premise wrong: member intact after the pre-M05-binary run (%s)", probe[0])
 						}
 					}
 				}
@@ -3585,65 +3594,20 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 	})
 }
 
-// buildHEADCLIBinary builds the pre-M05 CLI from HEAD via read-only
-// `git archive` (plus the gitignored embedded Studio assets copied from the
-// working tree) — fail-before reproduction without touching the tree.
-func buildHEADCLIBinary(t *testing.T) string {
+// preM05Revision is the last pre-M05 revision (the Q04 landing), the
+// verified_source HEAD recorded for M05 in the program ledger. M05's own
+// landing made HEAD unsuitable as this battery's fail-before reference —
+// the premises need a tree WITHOUT the M05 guards — so the reference is
+// pinned to the revision the M05 evidence was reviewed against.
+const preM05Revision = "35858e6e"
+
+// buildPreM05CLIBinary builds the pre-M05 CLI from the pinned revision via
+// read-only `git archive` (plus the gitignored embedded Studio assets
+// copied from the working tree) — fail-before reproduction without
+// touching the tree.
+func buildPreM05CLIBinary(t *testing.T) string {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("cannot locate test source path")
-	}
-	cmdDir := filepath.Dir(thisFile) // .../cli/cmd
-	cliDir := filepath.Dir(cmdDir)   // .../cli
-	repoRoot := filepath.Dir(cliDir) // repository root
-	tmp := t.TempDir()
-	archive := exec.Command("git", "-C", repoRoot, "archive", "HEAD", "cli")
-	var tarBytes bytes.Buffer
-	archive.Stdout = &tarBytes
-	archive.Stderr = os.Stderr
-	if err := archive.Run(); err != nil {
-		t.Fatalf("git archive HEAD cli: %v", err)
-	}
-	extract := exec.Command("tar", "-x", "-C", tmp)
-	extract.Stdin = &tarBytes
-	if out, err := extract.CombinedOutput(); err != nil {
-		t.Fatalf("extract HEAD archive: %v\n%s", err, out)
-	}
-	// The embedded Studio dist is a gitignored build artifact: copy it in
-	// so the HEAD binary links exactly like the working-tree one.
-	srcDist := filepath.Join(cliDir, "internal", "studio", "dist")
-	dstDist := filepath.Join(tmp, "cli", "internal", "studio", "dist")
-	if err := filepath.WalkDir(srcDist, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			return nil
-		}
-		rel, err := filepath.Rel(srcDist, path)
-		if err != nil {
-			return err
-		}
-		target := filepath.Join(dstDist, rel)
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return err
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(target, data, 0o644)
-	}); err != nil {
-		t.Fatalf("copy studio dist: %v", err)
-	}
-	bin := filepath.Join(t.TempDir(), "neutron-head")
-	build := exec.Command("go", "build", "-o", bin, ".")
-	build.Dir = filepath.Join(tmp, "cli")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build HEAD CLI: %v\n%s", err, out)
-	}
-	return bin
+	return buildRevisionCLIBinary(t, preM05Revision)
 }
 
 func mustReadFile(t *testing.T, path string) []byte {

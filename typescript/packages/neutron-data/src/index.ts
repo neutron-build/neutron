@@ -10,10 +10,22 @@ export {
   type DatabaseProfile,
 } from "./db/index.js";
 export {
-  createDrizzleDatabase,
   type DrizzleDatabase,
   type DrizzleDatabaseOptions,
-} from "./db/drizzle.js";
+} from "./db/types.js";
+import { createDrizzleDatabase as createDrizzleDatabaseImpl } from "./db/drizzle.js";
+import type { DrizzleDatabase, DrizzleDatabaseOptions } from "./db/types.js";
+/**
+ * Back-compatibility alias with the pre-I03 loosely typed surface
+ * (`db: unknown`). The same function with genuine Drizzle result types
+ * (Postgres/SQLite overloads over real `drizzle-orm` declarations) is
+ * exported from `@neutron-build/data/drizzle`. This alias exists so
+ * consumers that never touch Drizzle can compile against this package
+ * without drizzle-orm's types installed.
+ */
+export const createDrizzleDatabase: (
+  options?: DrizzleDatabaseOptions
+) => Promise<DrizzleDatabase> = createDrizzleDatabaseImpl;
 
 export {
   MemoryCacheClient,

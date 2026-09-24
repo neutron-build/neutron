@@ -9,6 +9,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -149,6 +150,8 @@ func runMigrateResolve(cmd *cobra.Command, args []string) error {
 	switch {
 	case report.ProvenClean():
 		ui.Successf("No effects present — nothing ran. A plain `neutron migrate` retries safely")
+	case report.Unevaluable > 0 && report.Verdict() == "clean":
+		ui.Warnf("No effects are provably present, but %d step(s) could not be evaluated (index identity unresolved or verify errored — each report line carries its reason); whether they ran is not provable, so nothing is recorded automatically. Fix the named cause (qualify an unresolvable table as schema.table, or repair the verify query), or `neutron migrate resolve %s --abort` removes effects via the guarded down SQL; a plain `neutron migrate` re-runs the journal and REFUSES any step whose identity still cannot be pinned", report.Unevaluable, version)
 	case report.Verdict() == "clean":
 		ui.Warnf("No checkable effects are present, but %d statement(s) have no checkable postcondition — whether they ran is not provable. If any ran, `neutron migrate resolve %s --abort` removes them via the guarded down SQL (history stays empty); a plain `neutron migrate` also retries and fails loudly on the first conflict", report.Unverifiable, version)
 	case report.Verdict() == "partial":
@@ -159,7 +162,7 @@ func runMigrateResolve(cmd *cobra.Command, args []string) error {
 		ui.Errorf("An INVALID concurrent index remains (a failed build leaves debris). Drop it by hand or with `--abort`, then retry")
 	}
 	if report.Unverifiable > 0 && report.CreationsPresent > 0 {
-		ui.Warnf("Unverifiable statements exist alongside present effects — their outcome is unknown; this runner never replays them (M06 owns journaled data steps)")
+		ui.Warnf("Unverifiable statements exist alongside present effects — their outcome is unknown; this runner never replays them (a `-- neutron:journaled` migration with per-step verify makes every step provably skippable instead)")
 	}
 	return nil
 }
@@ -171,6 +174,9 @@ func resolveMarkApplied(ctx context.Context, sess *db.MigrationSession, p pendin
 		reasons := []string{}
 		if report.Unverifiable > 0 {
 			reasons = append(reasons, fmt.Sprintf("%d statement(s) have no checkable postcondition", report.Unverifiable))
+		}
+		if report.Unevaluable > 0 {
+			reasons = append(reasons, fmt.Sprintf("%d step(s) could not be evaluated (identity unresolved or verify errored)", report.Unevaluable))
 		}
 		if report.HasInvalid {
 			reasons = append(reasons, "an INVALID concurrent index is present")
@@ -227,13 +233,32 @@ func resolveAbort(ctx context.Context, client *db.Client, sess *db.MigrationSess
 
 // resolveRetry re-runs the migration, skipping statements whose effects
 // are provably present. Unverifiable statements after a partial run are
-// refused: replaying them could repeat unknown-outcome work.
+// refused: replaying them could repeat unknown-outcome work. Journaled
+// migrations (M06) retry through the journal executor: each step's
+// verification decides skip vs re-run, and INVALID concurrent-index debris
+// is dropped and rebuilt — the operational shapes M05 could only refuse.
 func resolveRetry(ctx context.Context, client *db.Client, sess *db.MigrationSession, p pendingMigration, report *effectsReport) error {
 	if err := validateStatementAllowlist([]pendingMigration{p}); err != nil {
 		return err
 	}
 	if err := guardProtectedObjects(ctx, client, []pendingMigration{p}, false); err != nil {
 		return err
+	}
+	if p.Journal != nil {
+		ui.Infof("Retrying %s step-by-step through the journal (verified steps are skipped; INVALID index debris is dropped and rebuilt)", p.File.Version)
+		if err := sess.ApplyJournaledMigration(ctx, client, p.File, p.Journal, printJournaledEvent); err != nil {
+			var ident *db.JournaledIdentityError
+			if errors.As(err, &ident) {
+				return fmt.Errorf("retry of %s refused at step %d BEFORE EXECUTION (index identity — the statement did not run): %v\nfix the named cause (typically: qualify the table as schema.table, or clear the name collision) and re-run: `neutron migrate resolve %s`", p.File.Version, ident.StepIndex, err, p.File.Version)
+			}
+			var verify *db.JournaledVerifyError
+			if errors.As(err, &verify) {
+				return fmt.Errorf("retry of %s failed at step %d — the statement ran but its verification did not hold: %v\ninspect the durable state before trying again: `neutron migrate resolve %s`", p.File.Version, verify.StepIndex, err, p.File.Version)
+			}
+			return fmt.Errorf("retry of %s failed: %w\ninspect the durable state before trying again: `neutron migrate resolve %s`", p.File.Version, err, p.File.Version)
+		}
+		ui.Successf("Retried %s — history recorded", p.File.Version)
+		return nil
 	}
 	if report.HasInvalid {
 		return fmt.Errorf(

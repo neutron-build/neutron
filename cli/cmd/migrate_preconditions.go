@@ -29,6 +29,11 @@ type pendingMigration struct {
 	Plan             *db.PlanArtifact
 	Statements       []string
 	Nontransactional bool
+	// Journal is the parsed journal of a `-- neutron:journaled` migration
+	// (M06 operational steps); nil for ordinary files. Journal validation
+	// happens at parse time, so a malformed journal fails analysis before
+	// any precondition or statement runs.
+	Journal *db.JournaledFile
 	// RiskyStatements are the first lines of statements the M03 planners
 	// classify as destructive or data-losing.
 	RiskyStatements []string
@@ -74,6 +79,11 @@ func analyzeMigrations(dir string, pending []db.MigrationFile) ([]pendingMigrati
 			}
 			p.Plan = plan
 		}
+		journal, err := db.ParseJournaledFile(f.SQL)
+		if err != nil {
+			return nil, fmt.Errorf("%s_%s: %w", f.Version, f.Name, err)
+		}
+		p.Journal = journal
 		for _, stmt := range db.SplitSQLStatements(f.SQL) {
 			p.Statements = append(p.Statements, stmt)
 			if !hasExecutableStmt(stmt) {
@@ -319,16 +329,17 @@ func requireDestructiveAcknowledgement(pendings []pendingMigration, acknowledged
 // refuseNontransactionalDataChanges refuses nontransactional migrations
 // that contain row-data changes: their partial outcomes could not be
 // recovered without replaying statements whose effect on data is unknown.
-// Structural statements only — M06 owns journaled data operations.
+// Structural statements only — journaled migrations (M06) carry per-step
+// verification and route through the journal executor instead.
 func refuseNontransactionalDataChanges(pendings []pendingMigration) error {
 	for _, p := range pendings {
-		if !p.Nontransactional {
+		if !p.Nontransactional || p.Journal != nil {
 			continue
 		}
 		for _, stmt := range p.Statements {
 			if db.ChangesRowData(stmt) {
 				return fmt.Errorf(
-					"migration %s_%s mixes nontransactional operations (concurrent indexes) with data-changing statements — a partial failure could not be recovered without replaying unknown-outcome data changes. Split the data changes into their own transactional migration (journaled data operations land with M06)",
+					"migration %s_%s mixes nontransactional operations (concurrent indexes) with data-changing statements — a partial failure could not be recovered without replaying unknown-outcome data changes. Split the data changes into their own transactional migration, or declare the journal (a `-- neutron:journaled` header with per-step verify annotations) so every step is verifiably recoverable",
 					p.File.Version, p.File.Name)
 			}
 		}
@@ -359,6 +370,12 @@ type effectsReport struct {
 	HasInvalid bool
 	// Unverifiable counts statements with no checkable postcondition.
 	Unverifiable int
+	// Unevaluable counts journaled steps whose verification could not be
+	// EVALUATED against the live state (index identity unresolvable, or
+	// the probe/verify query errored). Never counted as absent: a verdict
+	// must not rest on a probe that could not run (M06 rework, review-1
+	// MAJOR-2).
+	Unevaluable int
 }
 
 // Verdict classifies what is durably knowable about a pending migration:
@@ -385,18 +402,19 @@ func (r *effectsReport) Verdict() string {
 }
 
 // ProvenClean reports whether the catalog PROVES nothing ran: no
-// creation-side effect present AND no unverifiable statement (an ALTER or
+// creation-side effect present, no unverifiable statement (an ALTER or
 // DML statement may have run without leaving a checkable trace — absence
-// of evidence is not evidence of absence for those).
+// of evidence is not evidence of absence for those), and no step whose
+// evaluation could not run.
 func (r *effectsReport) ProvenClean() bool {
-	return r.Verdict() == "clean" && r.Unverifiable == 0
+	return r.Verdict() == "clean" && r.Unverifiable == 0 && r.Unevaluable == 0
 }
 
 // MarkAppliedAllowed reports whether every statement's postcondition is
 // checkable and satisfied — the only state in which recording the version
 // as applied without running SQL is honest.
 func (r *effectsReport) MarkAppliedAllowed() bool {
-	if r.Unverifiable > 0 || r.HasInvalid {
+	if r.Unverifiable > 0 || r.Unevaluable > 0 || r.HasInvalid {
 		return false
 	}
 	for _, e := range r.Effects {
@@ -409,8 +427,18 @@ func (r *effectsReport) MarkAppliedAllowed() bool {
 
 // inspectEffects evaluates every statement's postcondition against the
 // live catalog. Read-only; usable from lockless status and locked resolve
-// alike.
+// alike. Journaled migrations (M06) evaluate their per-step verification —
+// declared verify queries and built-in postconditions — so every step of a
+// journaled file is provably present, absent or invalid (the journal
+// contract refused unverifiable steps at parse time).
 func inspectEffects(ctx context.Context, client *db.Client, f db.MigrationFile) (*effectsReport, error) {
+	if db.HasJournaledMarker(f.SQL) {
+		jf, err := db.ParseJournaledFile(f.SQL)
+		if err != nil {
+			return nil, err
+		}
+		return inspectJournaledEffects(ctx, client, jf)
+	}
 	report := &effectsReport{}
 	for i, stmt := range db.SplitSQLStatements(f.SQL) {
 		if !hasExecutableStmt(stmt) {
