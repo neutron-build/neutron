@@ -183,7 +183,10 @@ func (c *Client) Acquire(ctx context.Context) (*pgxpool.Conn, error) {
 // statements must still be able to cancel them. Returns the server's answer
 // (false: no such backend, or it could not be signalled).
 func (c *Client) CancelBackend(ctx context.Context, pid uint32) (bool, error) {
-	conn, err := pgx.Connect(ctx, c.url)
+	// The pool's parsed connection config, not c.url: the URL may carry
+	// pool-only parameters (pool_max_conns, …) that a plain connection would
+	// send to the server as unknown runtime settings.
+	conn, err := pgx.ConnectConfig(ctx, c.pool.Config().ConnConfig.Copy())
 	if err != nil {
 		return false, fmt.Errorf("cancel side connection: %w", err)
 	}
