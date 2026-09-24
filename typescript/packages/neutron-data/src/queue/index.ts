@@ -1,6 +1,4 @@
-import cronParser from "cron-parser";
-
-const { parseExpression } = cronParser;
+import { parseCron, type CronSchedule } from "./cron.js";
 
 export interface Job<TPayload = unknown> {
   id: string;
@@ -42,8 +40,6 @@ export interface QueueDriver {
   /** Remove a schedule previously registered with `schedule()`. */
   unschedule(id: string): Promise<void>;
 }
-
-type CronInterval = ReturnType<typeof parseExpression<false>>;
 
 const MAX_ATTEMPTS = 3;
 const RETRY_BACKOFF_MS = 10;
@@ -126,10 +122,11 @@ export class InMemoryQueueDriver implements QueueDriver {
     payload: unknown,
     _opts?: ScheduleOptions
   ): Promise<void> {
-    const interval = parseExpression(pattern);
+    const cron = parseCron(pattern);
+    const first = cron.next(new Date());
     this.clearSchedule(id);
     this.scheduleIds.add(id);
-    this.armSchedule(id, interval, payload);
+    this.armSchedule(id, cron, first, payload);
   }
 
   async unschedule(id: string): Promise<void> {
@@ -149,10 +146,11 @@ export class InMemoryQueueDriver implements QueueDriver {
 
   private armSchedule(
     id: string,
-    interval: CronInterval,
+    cron: CronSchedule,
+    fireAt: Date,
     payload: unknown
   ): void {
-    const delay = Math.max(0, interval.next().toDate().getTime() - Date.now());
+    const delay = Math.max(0, fireAt.getTime() - Date.now());
     const timer = setTimeout(() => {
       this.scheduleTimers.delete(id);
       if (!this.scheduleIds.has(id)) {
@@ -165,7 +163,7 @@ export class InMemoryQueueDriver implements QueueDriver {
         createdAt: Date.now(),
       });
       void this.drain();
-      this.armSchedule(id, interval, payload);
+      this.armSchedule(id, cron, cron.next(fireAt), payload);
     }, delay);
     if (typeof timer.unref === "function") {
       timer.unref();
