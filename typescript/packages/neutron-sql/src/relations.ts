@@ -36,7 +36,7 @@ import {
   applyProjectionDecoders,
   decodeJsonLeaf,
   projectionDecoder,
-  wireReadNode,
+  columnWireReadNode,
   type ColumnCodec,
   type ColumnContext,
   type ProjectionDecoder,
@@ -193,6 +193,7 @@ function pkColumnsOf(table: AnyPgTable): AnyColumnBuilder[] {
  *  predicates and order keys stay raw column references. */
 function jsonLeaf(alias: string, column: AnyColumnBuilder): ValueNode {
   const ref = qual(alias, column.columnName);
+  if (column.arrayDimensions !== undefined) return fragment(ref, "::text");
   if (column.dataType === "bigint" || column.dataType === "numeric") return fragment(ref, "::text");
   if (column.dataType === "timestamptz") return fragment("to_jsonb(", ref, " at time zone 'UTC')");
   return ref;
@@ -706,7 +707,7 @@ export function buildRelationalPlan(
   // exactly like the flat select path.
   for (const { propertyKey, column } of requested) {
     const ref = qual(tableName, column.columnName);
-    const wire = wireReadNode(column.dataType, ref);
+    const wire = columnWireReadNode(column, ref);
     if (wire !== null) {
       projections.push(projectionNode(wire, propertyKey));
       usesJsonb = true;

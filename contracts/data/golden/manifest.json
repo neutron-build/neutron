@@ -53,6 +53,36 @@
       "document": "valid/exported-v2.json",
       "canonical": "valid/exported-v2.canonical.json",
       "sha256": "3d89b22962431511b7e6a3e5249e00e40d9cc4989735f284b045ab73fbc3964c"
+    },
+    {
+      "name": "q07-enums-arrays-namespaces",
+      "document": "valid/q07-enums-arrays-namespaces.json",
+      "canonical": "valid/q07-enums-arrays-namespaces.canonical.json",
+      "sha256": "3bbe5ef8b97154aa436dbf120cc0bbfdfd1c108f2bfc5a3d073f3f89c32c3fcd"
+    },
+    {
+      "name": "q07-generated-identity",
+      "document": "valid/q07-generated-identity.json",
+      "canonical": "valid/q07-generated-identity.canonical.json",
+      "sha256": "a3296d4066966a465f25bf67599b9fff54df4e3f4654bc463a053f796a7671d3"
+    },
+    {
+      "name": "q07-rich-indexes",
+      "document": "valid/q07-rich-indexes.json",
+      "canonical": "valid/q07-rich-indexes.canonical.json",
+      "sha256": "358b1b4c96817628e1c89eaa6a2e597bf3fbb92a9f80812ab7104e34084e6bea"
+    },
+    {
+      "name": "q07-views",
+      "document": "valid/q07-views.json",
+      "canonical": "valid/q07-views.canonical.json",
+      "sha256": "cbf6592abcf483d25355e85821d4390f75da24ad2a67d524e3e7931b024515a4"
+    },
+    {
+      "name": "q07-exported-v2",
+      "document": "valid/q07-exported-v2.json",
+      "canonical": "valid/q07-exported-v2.canonical.json",
+      "sha256": "9993e06d085b06aa011bc85060e09bf5a15c935110a0fc0abd18940c80517cf1"
     }
   ],
   "invalid": [
@@ -130,6 +160,21 @@
       "name": "ufffd-string",
       "document": "invalid/ufffd-string.json",
       "code": "invalid-value"
+    },
+    {
+      "name": "generated-with-default",
+      "document": "invalid/generated-with-default.json",
+      "code": "invalid-default"
+    },
+    {
+      "name": "index-order-invalid",
+      "document": "invalid/index-order-invalid.json",
+      "code": "invalid-value"
+    },
+    {
+      "name": "index-method-type-invalid",
+      "document": "invalid/index-method-type-invalid.json",
+      "code": "invalid-index"
     }
   ],
   "v1": [

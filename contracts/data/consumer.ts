@@ -55,6 +55,39 @@ const TYPE_PARAMS: Record<string, Set<string>> = {
 const REFERENTIAL_ACTIONS = new Set(["cascade", "restrict", "no action", "set null", "set default"]);
 const FK_MATCHES = new Set(["simple", "full", "partial"]);
 const INDEX_METHODS = new Set(["btree", "hash", "gin", "gist", "spgist", "brin"]);
+// Default-operator-class facts for the index methods and column types in
+// the vocabulary: exactly these combinations apply on PostgreSQL without
+// naming an operator class (built-in pg_opclass defaults; arrays uniformly
+// via array_ops). Everything else is refused by the server with SQLSTATE
+// 42704, so the consumer rejects it — the contract has no operator-class
+// slot. Kept in lockstep with schema_v2.go and export.ts.
+const INDEX_METHOD_SCALARS: Record<string, ReadonlySet<string>> = {
+  btree: new Set(["text", "varchar", "bool", "int2", "int4", "int8", "float4", "float8", "numeric", "timestamp", "timestamptz", "date", "uuid", "bytea", "enum", "jsonb"]),
+  hash: new Set(["text", "varchar", "bool", "int2", "int4", "int8", "float4", "float8", "numeric", "timestamp", "timestamptz", "date", "uuid", "bytea", "enum", "jsonb"]),
+  gin: new Set(["jsonb"]),
+  gist: new Set(),
+  spgist: new Set(["text", "varchar"]),
+  brin: new Set(["text", "varchar", "int2", "int4", "int8", "float4", "float8", "numeric", "timestamp", "timestamptz", "date", "uuid", "bytea"]),
+};
+const INDEX_METHOD_ARRAYS = new Set(["btree", "hash", "gin"]);
+const TYPE_ALIASES: Record<string, string> = {
+  boolean: "bool", int: "int4", integer: "int4", smallint: "int2",
+  bigint: "int8", real: "float4", decimal: "numeric",
+};
+const literalCast = (sql: string): { elem: string; depth: number } | null => {
+  const i = sql.indexOf("::");
+  if (i < 0) return null;
+  let cast = sql.slice(i + 2);
+  let depth = 0;
+  while (cast.endsWith("[]")) {
+    depth++;
+    cast = cast.slice(0, -2);
+  }
+  const dot = cast.lastIndexOf(".");
+  if (dot >= 0) cast = cast.slice(dot + 1);
+  return { elem: cast, depth };
+};
+const normalizeTypeName = (name: string): string => TYPE_ALIASES[name] ?? name;
 const OPAQUE_KINDS = new Set(["extension-table", "extension-object", "unsupported-table", "unsupported-object"]);
 const INTEGER_TYPES = new Set(["int2", "int4", "int8"]);
 const SAFE_INTEGER_LIMIT = 2 ** 53 - 1;
@@ -307,13 +340,15 @@ const validateTable = (item: Json, at: string, st: State): void => {
     fail("invalid-value", `${at}.columns`, `table ${JSON.stringify(key)} must declare at least one column`);
   }
   const colNames = new Set<string>();
+  const colTypes = new Map<string, { name: string; isArray: boolean }>();
   let pkCount = 0;
   columns.forEach((col, j) => {
-    const name = validateColumn(col, `${at}.columns[${j}]`, st);
+    const [name, colType] = validateColumn(col, `${at}.columns[${j}]`, st);
     if (colNames.has(name)) {
       fail("duplicate-column", `${at}.columns[${j}].name`, `column ${JSON.stringify(name)} is declared twice on table ${JSON.stringify(key)}`);
     }
     colNames.add(name);
+    colTypes.set(name, colType);
   });
 
   const constraints = isArr(m.constraints, `${at}.constraints`);
@@ -331,25 +366,34 @@ const validateTable = (item: Json, at: string, st: State): void => {
   }
 
   isArr(m.indexes, `${at}.indexes`).forEach((idx, j) => {
-    validateIndex(idx, `${at}.indexes[${j}]`, colNames, key, st);
+    validateIndex(idx, `${at}.indexes[${j}]`, colNames, colTypes, key, st);
   });
 
   st.tables.set(key, m);
   st.tableColumns.set(key, colNames);
 };
 
-const validateColumn = (item: Json, at: string, st: State): string => {
+const validateColumn = (item: Json, at: string, st: State): [string, { name: string; isArray: boolean }] => {
   const m = isObj(item, at);
-  onlyFields(m, at, ["name", "type", "notNull", "default"], ["name", "type", "notNull"]);
+  onlyFields(m, at, ["name", "type", "notNull", "default", "generated"], ["name", "type", "notNull"]);
   const name = isStr(m.name, `${at}.name`);
   checkName(name, `${at}.name`);
   isBool(m.notNull, `${at}.notNull`);
 
+  if ("generated" in m) {
+    const gm = isObj(m.generated, `${at}.generated`);
+    onlyFields(gm, `${at}.generated`, ["expression"], ["expression"]);
+    checkSQLText(isStr(gm.expression, `${at}.generated.expression`), `${at}.generated.expression`, true);
+    if ("default" in m) {
+      fail("invalid-default", `${at}.default`, "a generated column cannot also declare a default");
+    }
+  }
+
   const typeObj = isObj(m.type, `${at}.type`);
-  const typeName = validateColumnType(typeObj, `${at}.type`, st);
+  const { typeName, isArray } = validateColumnType(typeObj, `${at}.type`, st);
 
   if ("default" in m) {
-    validateDefault(m.default, `${at}.default`, typeName);
+    validateDefault(m.default, `${at}.default`, typeName, isArray);
     const d = m.default as Obj;
     if (d.kind === "sequence") {
       st.sequenceSchemas.push(checkIdentity(d.sequence, `${at}.default.sequence`).schema);
@@ -357,10 +401,10 @@ const validateColumn = (item: Json, at: string, st: State): string => {
       st.sequenceSchemas.push(checkIdentity(d.sequence as Json, `${at}.default.sequence`).schema);
     }
   }
-  return name;
+  return [name, { name: typeName, isArray }];
 };
 
-const validateColumnType = (m: Obj, at: string, st: State): string => {
+const validateColumnType = (m: Obj, at: string, st: State): { typeName: string; isArray: boolean } => {
   onlyFields(m, at, ["name", "params", "array", "codec", "enum"], ["name", "codec"]);
   const typeName = isStr(m.name, `${at}.name`);
   const codec = isStr(m.codec, `${at}.codec`);
@@ -420,10 +464,10 @@ const validateColumnType = (m: Obj, at: string, st: State): string => {
   if (typeName === "vector" && !st.capabilities.has("pgvector") && !st.capabilities.has("nucleus")) {
     fail("vector-capability", `${at}.name`, 'vector columns require capability "pgvector" or "nucleus"');
   }
-  return typeName;
+  return { typeName, isArray };
 };
 
-const validateDefault = (v: Json, at: string, typeName: string): void => {
+const validateDefault = (v: Json, at: string, typeName: string, isArray: boolean): void => {
   const m = isObj(v, at);
   const kind = isStr(m.kind, `${at}.kind`);
   if (kind === "literal") {
@@ -431,6 +475,18 @@ const validateDefault = (v: Json, at: string, typeName: string): void => {
     const sql = isStr(m.sql, `${at}.sql`);
     if (!LITERAL_PATTERN.test(sql)) {
       fail("invalid-literal", `${at}.sql`, `default tagged literal must be exactly one SQL literal token, got ${JSON.stringify(sql)}`);
+    }
+    if (isArray && typeName === "enum") {
+      fail("invalid-default", at, "enum array column defaults are explicitly unsupported — the enum element cast cannot be spelled as a contract literal");
+    }
+    const cast = literalCast(sql);
+    if (cast !== null && (isArray || cast.depth > 0)) {
+      if (!isArray || cast.depth === 0) {
+        fail("invalid-default", `${at}.sql`, `default cast ::${cast.elem} does not match the array-ness of column type ${typeName} (PostgreSQL refuses it with SQLSTATE 42804 at apply)`);
+      }
+      if (normalizeTypeName(cast.elem) !== typeName) {
+        fail("invalid-default", `${at}.sql`, `array default cast ::${cast.elem} does not match the column element type ${typeName} (PostgreSQL refuses it with SQLSTATE 42804 at apply)`);
+      }
     }
     return;
   }
@@ -540,7 +596,7 @@ const validateConstraint = (item: Json, at: string, colNames: Set<string>, table
   return [name, false];
 };
 
-const validateIndex = (item: Json, at: string, colNames: Set<string>, table: string, st: State): void => {
+const validateIndex = (item: Json, at: string, colNames: Set<string>, colTypes: Map<string, { name: string; isArray: boolean }>, table: string, st: State): void => {
   const m = isObj(item, at);
   onlyFields(m, at, ["identity", "unique", "method", "key", "where", "include"], ["identity", "unique", "method", "key"]);
   const id = checkIdentity(m.identity, `${at}.identity`);
@@ -556,17 +612,40 @@ const validateIndex = (item: Json, at: string, colNames: Set<string>, table: str
   key.forEach((part, i) => {
     const pat = `${at}.key[${i}]`;
     const pm = isObj(part, pat);
-    onlyFields(pm, pat, ["column", "expression"], []);
+    onlyFields(pm, pat, ["column", "expression", "order", "nulls"], []);
     const hasCol = "column" in pm;
     const hasExpr = "expression" in pm;
     if (hasCol && hasExpr) fail("index-key", pat, "key part sets both column and expression");
+    if ("order" in pm) {
+      const o = isStr(pm.order, `${pat}.order`);
+      if (o !== "asc" && o !== "desc") {
+        fail("invalid-value", `${pat}.order`, `index key part order must be "asc" or "desc", got ${JSON.stringify(o)}`);
+      }
+    }
+    if ("nulls" in pm) {
+      const n = isStr(pm.nulls, `${pat}.nulls`);
+      if (n !== "first" && n !== "last") {
+        fail("invalid-value", `${pat}.nulls`, `index key part nulls must be "first" or "last", got ${JSON.stringify(n)}`);
+      }
+    }
     if (hasCol) {
       const cs = isStr(pm.column, `${pat}.column`);
       if (!colNames.has(cs)) {
         fail("constraint-column", `${pat}.column`, `index ${JSON.stringify(ident)} references unknown column ${JSON.stringify(cs)}`);
       }
+      const ct = colTypes.get(cs);
+      if (ct !== undefined) {
+        const applicable = ct.isArray ? INDEX_METHOD_ARRAYS.has(method) : (INDEX_METHOD_SCALARS[method] ?? new Set()).has(ct.name);
+        if (!applicable) {
+          const desc = ct.isArray ? `${ct.name}[]` : ct.name;
+          fail("invalid-index", pat, `index method ${JSON.stringify(method)} over column ${JSON.stringify(cs)} (${desc}) has no default operator class on any supported server (PostgreSQL refuses it with SQLSTATE 42704) — explicitly unsupported: the contract has no operator-class slot`);
+        }
+      }
     } else if (hasExpr) {
       checkSQLText(isStr(pm.expression, `${pat}.expression`), `${pat}.expression`, true);
+      if (method !== "btree") {
+        fail("invalid-index", pat, 'expression keys are only definable with method "btree" — the default operator class of an expression result type cannot be verified at definition time (the contract has no operator-class slot)');
+      }
     } else {
       fail("index-key", pat, "key part needs either column or expression");
     }

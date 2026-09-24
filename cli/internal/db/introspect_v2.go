@@ -121,6 +121,7 @@ SELECT a.attnum,
        a.attidentity::text,
        a.attgenerated::text,
        a.attcollation <> t.typcollation AS nondefault_collation,
+       a.attcollation::oid,
        pg_get_expr(ad.adbin, a.attrelid) AS default_expr
 FROM pg_attribute a
 JOIN pg_type t ON t.oid = a.atttypid
@@ -146,6 +147,7 @@ SELECT rc.conname,
        rc.confmatchtype::text,
        rc.condeferrable,
        rc.condeferred,
+       pg_get_constraintdef(rc.oid) AS condef,
        pg_get_expr(rc.conbin, rc.conrelid) AS check_expr
 FROM pg_constraint rc
 LEFT JOIN pg_class rt ON rt.oid = rc.confrelid
@@ -163,11 +165,18 @@ SELECT ic.oid,
        i.indnatts,
        i.indkey::int2[],
        i.indoption::int2[],
+       i.indcollation::oid[],
+       pg_get_indexdef(i.indexrelid) AS indexdef,
        pg_get_expr(i.indpred, i.indrelid) AS predicate,
        EXISTS (
          SELECT 1 FROM pg_depend d
          WHERE d.classid = 'pg_class'::regclass AND d.objid = ic.oid AND d.deptype = 'e'
-       ) AS extension_owned
+       ) AS extension_owned,
+       (
+         SELECT array_agg(oc.opcdefault ORDER BY k.ord)
+           FROM unnest(i.indclass) WITH ORDINALITY AS k(opclass, ord)
+           JOIN pg_opclass oc ON oc.oid = k.opclass
+       ) AS opclass_defaults
 FROM pg_index i
 JOIN pg_class ic ON ic.oid = i.indexrelid
 JOIN pg_am am ON am.oid = ic.relam
@@ -707,7 +716,11 @@ func (c *Client) introspectV2View(ctx context.Context, rel v2RelationInfo) (V2Vi
 		case opt == "security_invoker=true":
 			view.SecurityInvoker = boolPtr(true)
 		case opt == "security_invoker=false":
-			view.SecurityInvoker = boolPtr(false)
+			// Canonical equivalence (Q07d): absent and explicit false are
+			// the same PostgreSQL state (the default), and the contract's
+			// canonical form writes securityInvoker only when true —
+			// recording an explicit false would make an unchanged view
+			// differ from every desired document forever.
 		default:
 			reasons = append(reasons, fmt.Sprintf("view option %q is not representable in schema document v2", opt))
 		}
@@ -764,6 +777,7 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 
 	// Columns in attnum order (the contract's ordered tuple).
 	attnumNames := make(map[int16]string)
+	attnumCollations := make(map[int16]uint32)
 	columns := []V2Column{}
 	colRows, err := q.Query(ctx, introspectV2ColumnsSQL, rel.oid)
 	if err != nil {
@@ -781,19 +795,25 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 			notNull                            bool
 			identity, generated                string
 			nonDefaultCollation                bool
+			collation                          uint32
 			defaultExpr                        *string
 		)
 		if err := colRows.Scan(
 			&attnum, &name, &typeSchema, &typname, &typtype, &typcategory,
 			&elemName, &elemTypetype, &elemCategory, &elemSchema,
-			&typmod, &notNull, &identity, &generated, &nonDefaultCollation, &defaultExpr,
+			&typmod, &notNull, &identity, &generated, &nonDefaultCollation, &collation, &defaultExpr,
 		); err != nil {
 			return table, nil, nil, err
 		}
 		attnumNames[attnum] = name
+		attnumCollations[attnum] = collation
 
-		if generated != "" {
-			reasons = append(reasons, fmt.Sprintf("column %q is a generated column (not representable in schema document v2)", name))
+		if generated == "v" {
+			reasons = append(reasons, fmt.Sprintf("column %q is a virtual generated column (not representable in schema document v2)", name))
+			continue
+		}
+		if generated != "" && generated != "s" {
+			reasons = append(reasons, fmt.Sprintf("column %q has unknown attgenerated kind %q", name, generated))
 			continue
 		}
 		if nonDefaultCollation {
@@ -812,7 +832,15 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 		}
 
 		col := V2Column{Name: name, Type: colType, NotNull: notNull}
-		if identity == "a" || identity == "d" {
+		if generated == "s" {
+			// Stored generated column: the pg_attrdef row carries the
+			// generation expression, which is NOT a default.
+			if defaultExpr == nil {
+				reasons = append(reasons, fmt.Sprintf("generated column %q has no stored expression in the catalog", name))
+				continue
+			}
+			col.Generated = &V2Generated{Expression: *defaultExpr}
+		} else if identity == "a" || identity == "d" {
 			gen := "always"
 			if identity == "d" {
 				gen = "by default"
@@ -852,10 +880,11 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 			confDel, confUpd     *string
 			confMatch            *string
 			deferrable, deferred bool
+			condef               string
 			checkExpr            *string
 		)
 		if err := conRows.Scan(&name, &contype, &conkey, &refSchema, &refTable, &refCols,
-			&confDel, &confUpd, &confMatch, &deferrable, &deferred, &checkExpr); err != nil {
+			&confDel, &confUpd, &confMatch, &deferrable, &deferred, &condef, &checkExpr); err != nil {
 			return table, nil, nil, err
 		}
 		if constraintNames[name] {
@@ -863,6 +892,15 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 			continue
 		}
 		constraintNames[name] = true
+		// NULLS NOT DISTINCT is detected from the constraint definition:
+		// the pg_constraint.connullsnotdistinct catalog column is a
+		// PostgreSQL 15+ addition that wire-compatible engines may not
+		// carry, while the deparse spelling is authoritative wherever the
+		// syntax exists at all.
+		if contype == "u" && strings.Contains(condef, "NULLS NOT DISTINCT") {
+			reasons = append(reasons, fmt.Sprintf("unique constraint %q is NULLS NOT DISTINCT (not representable in schema document v2)", name))
+			continue
+		}
 		if contype == "x" {
 			reasons = append(reasons, fmt.Sprintf("exclusion constraint %q (not representable)", name))
 			continue
@@ -941,15 +979,18 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 	// (the twin normalizer) never interleaves an open iterator with a new
 	// query.
 	type rawIndex struct {
-		oid        uint32
-		name       string
-		method     string
-		unique     bool
-		nkey, natt int
-		indkey     []int16
-		indoption  []int16
-		predicate  *string
-		extOwned   bool
+		oid             uint32
+		name            string
+		method          string
+		unique          bool
+		nkey, natt      int
+		indkey          []int16
+		indoption       []int16
+		indcoll         []uint32
+		indexdef        string
+		predicate       *string
+		extOwned        bool
+		opclassDefaults []bool
 	}
 	var rawIndexes []rawIndex
 	idxRows, err := q.Query(ctx, introspectV2IndexesSQL, rel.oid)
@@ -958,7 +999,7 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 	}
 	for idxRows.Next() {
 		var r rawIndex
-		if err := idxRows.Scan(&r.oid, &r.name, &r.unique, &r.method, &r.nkey, &r.natt, &r.indkey, &r.indoption, &r.predicate, &r.extOwned); err != nil {
+		if err := idxRows.Scan(&r.oid, &r.name, &r.unique, &r.method, &r.nkey, &r.natt, &r.indkey, &r.indoption, &r.indcoll, &r.indexdef, &r.predicate, &r.extOwned, &r.opclassDefaults); err != nil {
 			idxRows.Close()
 			return table, nil, nil, err
 		}
@@ -975,6 +1016,14 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 			reasons = append(reasons, fmt.Sprintf("index %q is owned by an extension", r.name))
 			continue
 		}
+		// NULLS NOT DISTINCT unique indexes: detected from the index
+		// definition (pg_index.indnullsnotdistinct is a PostgreSQL 15+
+		// catalog column wire-compatible engines may not carry; the deparse
+		// spelling is authoritative wherever the syntax exists).
+		if r.unique && strings.Contains(r.indexdef, "NULLS NOT DISTINCT") {
+			reasons = append(reasons, fmt.Sprintf("unique index %q is NULLS NOT DISTINCT (not representable in schema document v2)", r.name))
+			continue
+		}
 		idx := V2Index{
 			Identity: V2Identity{Schema: rel.schema, Name: r.name},
 			Unique:   r.unique,
@@ -983,13 +1032,39 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 		}
 		bad := false
 		for i := 0; i < r.nkey; i++ {
+			// Per-part ordering, in the contract's minimal form (Q07):
+			// indoption bit 0x0001 = DESC, bit 0x0002 = NULLS FIRST. ASC
+			// defaults to NULLS LAST and DESC to NULLS FIRST, so nulls is
+			// written only when it is not the direction default.
+			var order, nulls *string
 			if i < len(r.indoption) && r.indoption[i] != 0 {
-				reasons = append(reasons, fmt.Sprintf("index %q orders key part %d with DESC/NULLS options (not representable)", r.name, i+1))
+				desc := r.indoption[i]&0x0001 != 0
+				nullsFirst := r.indoption[i]&0x0002 != 0
+				if desc {
+					order = strPtrV2("desc")
+					if !nullsFirst {
+						nulls = strPtrV2("last")
+					}
+				} else if nullsFirst {
+					nulls = strPtrV2("first")
+				}
+			}
+			// A non-default opclass is not representable (the contract key
+			// shape has no opclass slot). pg_get_indexdef(part) omits
+			// opclass/collation entirely, so this is checked against the
+			// catalog, never the deparse.
+			if i < len(r.opclassDefaults) && !r.opclassDefaults[i] {
+				reasons = append(reasons, fmt.Sprintf("index %q key part %d uses a non-default operator class (not representable)", r.name, i+1))
 				bad = true
 				break
 			}
 			attnum := r.indkey[i]
 			if attnum == 0 {
+				if order != nil || nulls != nil {
+					reasons = append(reasons, fmt.Sprintf("index %q orders expression key part %d (ordered expression keys are not representable)", r.name, i+1))
+					bad = true
+					break
+				}
 				expr, err := indexPartExpressionOn(ctx, q, r.oid, i+1)
 				if err != nil {
 					return table, nil, nil, err
@@ -1003,20 +1078,31 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 				bad = true
 				break
 			}
+			// An explicit COLLATE on the key part (indcollation differing
+			// from the column's own collation) is not representable; the
+			// deparse omits it, so this is checked against the catalog.
+			partColl := uint32(0)
+			if i < len(r.indcoll) {
+				partColl = r.indcoll[i]
+			}
+			if partColl != attnumCollations[attnum] {
+				reasons = append(reasons, fmt.Sprintf("index %q key part %d carries an explicit COLLATE (not representable)", r.name, i+1))
+				bad = true
+				break
+			}
 			// pg_get_indexdef(idx, part, false) returns the bare column
-			// name only when the part carries no non-default decoration
-			// (opclass, collation, ordering). Anything else is not
-			// representable in the contract key shape.
+			// name; anything else means a non-default decoration the
+			// catalog checks above did not classify.
 			partDef, err := indexPartExpressionOn(ctx, q, r.oid, i+1)
 			if err != nil {
 				return table, nil, nil, err
 			}
 			if partDef != cn && partDef != quoteIdent(cn) {
-				reasons = append(reasons, fmt.Sprintf("index %q key part %d carries a non-default opclass/collation/ordering (%q)", r.name, i+1, partDef))
+				reasons = append(reasons, fmt.Sprintf("index %q key part %d carries a non-default decoration (%q)", r.name, i+1, partDef))
 				bad = true
 				break
 			}
-			idx.Key = append(idx.Key, V2IndexKeyPart{Column: strPtrV2(cn)})
+			idx.Key = append(idx.Key, V2IndexKeyPart{Column: strPtrV2(cn), Order: order, Nulls: nulls})
 		}
 		if bad {
 			continue

@@ -8,7 +8,7 @@
 // through the driver and never interpolated into other statements.
 
 import { getTableName, tableRefParts } from "./schema.js";
-import type { AnyColumnBuilder, ColumnBuilder, JsWriteTypeOf, ColumnDataType } from "./schema.js";
+import type { AnyColumnBuilder, ColumnBuilder, ColumnDataType, PredicateValueOf } from "./schema.js";
 import { encodeWriteValue } from "./codecs.js";
 import {
   aggregate,
@@ -78,27 +78,27 @@ function cmp(op: string, col: AnyColumnBuilder | string, value: unknown, table?:
   return exprNode("binary", op, [colRef(col, table), encodedParamNode(col, table, value)]);
 }
 
-export function eq<D extends ColumnDataType>(col: ColumnBuilder<D, boolean, boolean, unknown> | string, value: JsWriteTypeOf<D>, table?: string): Condition {
+export function eq<D extends ColumnDataType, C extends ColumnBuilder<D, boolean, boolean, unknown> = ColumnBuilder<D, boolean, boolean, unknown>>(col: C | string, value: PredicateValueOf<C>, table?: string): Condition {
   return cmp("=", col, value, table);
 }
 
-export function ne<D extends ColumnDataType>(col: ColumnBuilder<D, boolean, boolean, unknown> | string, value: JsWriteTypeOf<D>, table?: string): Condition {
+export function ne<D extends ColumnDataType, C extends ColumnBuilder<D, boolean, boolean, unknown> = ColumnBuilder<D, boolean, boolean, unknown>>(col: C | string, value: PredicateValueOf<C>, table?: string): Condition {
   return cmp("<>", col, value, table);
 }
 
-export function lt<D extends ColumnDataType>(col: ColumnBuilder<D, boolean, boolean, unknown> | string, value: JsWriteTypeOf<D>, table?: string): Condition {
+export function lt<D extends ColumnDataType, C extends ColumnBuilder<D, boolean, boolean, unknown> = ColumnBuilder<D, boolean, boolean, unknown>>(col: C | string, value: PredicateValueOf<C>, table?: string): Condition {
   return cmp("<", col, value, table);
 }
 
-export function lte<D extends ColumnDataType>(col: ColumnBuilder<D, boolean, boolean, unknown> | string, value: JsWriteTypeOf<D>, table?: string): Condition {
+export function lte<D extends ColumnDataType, C extends ColumnBuilder<D, boolean, boolean, unknown> = ColumnBuilder<D, boolean, boolean, unknown>>(col: C | string, value: PredicateValueOf<C>, table?: string): Condition {
   return cmp("<=", col, value, table);
 }
 
-export function gt<D extends ColumnDataType>(col: ColumnBuilder<D, boolean, boolean, unknown> | string, value: JsWriteTypeOf<D>, table?: string): Condition {
+export function gt<D extends ColumnDataType, C extends ColumnBuilder<D, boolean, boolean, unknown> = ColumnBuilder<D, boolean, boolean, unknown>>(col: C | string, value: PredicateValueOf<C>, table?: string): Condition {
   return cmp(">", col, value, table);
 }
 
-export function gte<D extends ColumnDataType>(col: ColumnBuilder<D, boolean, boolean, unknown> | string, value: JsWriteTypeOf<D>, table?: string): Condition {
+export function gte<D extends ColumnDataType, C extends ColumnBuilder<D, boolean, boolean, unknown> = ColumnBuilder<D, boolean, boolean, unknown>>(col: C | string, value: PredicateValueOf<C>, table?: string): Condition {
   return cmp(">=", col, value, table);
 }
 
@@ -110,9 +110,9 @@ export function ilike(col: AnyColumnBuilder | string, pattern: string, table?: s
   return cmp("ilike", col, pattern, table);
 }
 
-export function inArray<D extends ColumnDataType>(
-  col: ColumnBuilder<D, boolean, boolean, unknown> | string,
-  values: Array<JsWriteTypeOf<D>>,
+export function inArray<D extends ColumnDataType, C extends ColumnBuilder<D, boolean, boolean, unknown> = ColumnBuilder<D, boolean, boolean, unknown>>(
+  col: C | string,
+  values: Array<PredicateValueOf<C>>,
   table?: string,
 ): Condition {
   if (values.length === 0) return fragment("1 = 0");

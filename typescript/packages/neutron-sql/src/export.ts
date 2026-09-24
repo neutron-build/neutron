@@ -13,20 +13,40 @@
 // rules as the Go upgrade reader (contracts/data/CANONICAL.md §6), reporting
 // every ambiguity instead of guessing.
 
-import type { AnyColumnBuilder, AnyPgTable } from "./schema.js";
-import { getTableColumns, getTableName, getTableIndexes, getTableSchema, isPgTable, rejectDerivedTable } from "./schema.js";
+import type { AnyColumnBuilder, AnyPgEnum, AnyPgTable, PgEnumDefinition } from "./schema.js";
+import { getEnumDefinition, getTableColumns, getTableConstraints, getTableName, getTableIndexes, getTableSchema, getViewDefinition, isPgEnum, isPgTable, rejectDerivedTable } from "./schema.js";
+import { renderSchemaExpression } from "./ddl-text.js";
 
-/** The v1/v2 export contract covers default-search-path tables only
- *  (identity.schema is "public"). A declared schema would export under the
- *  wrong identity, so schema-qualified tables fail closed until Q07 owns
- *  cross-schema export. */
+/** The v1 export contract covers the pre-Q07 surface only (default-search-
+ *  path tables with plain columns, column-level constraints and simple
+ *  column indexes). Every Q07 feature fails closed here — the v2 writer
+ *  (exportSchemaV2) owns the full surface. */
 function assertPlainTable(table: AnyPgTable, who: string): void {
   rejectDerivedTable(table, who);
+  if (getViewDefinition(table) !== undefined) {
+    throw new Error(`${who}: "${getTableName(table)}" is a view — the v1 export shape cannot represent views; use exportSchemaV2 (Q07)`);
+  }
   const schema = getTableSchema(table);
   if (schema !== undefined) {
     throw new Error(
-      `${who}: table "${schema}"."${getTableName(table)}" declares a schema — schema export for schema-qualified tables lands with Q07 (the query layer supports them)`,
+      `${who}: table "${schema}"."${getTableName(table)}" declares a schema — the v1 export shape covers the default search path only; use exportSchemaV2 (Q07)`,
     );
+  }
+  if (getTableConstraints(table).length > 0) {
+    throw new Error(`${who}: table "${getTableName(table)}" declares table-level constraints — the v1 export shape cannot represent them; use exportSchemaV2 (Q07)`);
+  }
+  for (const idx of getTableIndexes(table)) {
+    if (idx.keyParts.some((p) => p.expression !== undefined || p.order !== undefined || p.nulls !== undefined) || idx.whereExpr !== undefined || idx.includeCols.length > 0) {
+      throw new Error(`${who}: index "${idx.indexName}" uses expressions, ordering options, a predicate or INCLUDE — the v1 export shape cannot represent it; use exportSchemaV2 (Q07)`);
+    }
+  }
+  for (const col of Object.values(getTableColumns(table)) as AnyColumnBuilder[]) {
+    const at = `${who}: column "${col.columnName}" of "${getTableName(table)}"`;
+    if (col.dataType === "enum" || col.enumDef !== undefined) throw new Error(`${at} is an enum column — the v1 export shape cannot represent enum types; use exportSchemaV2 (Q07)`);
+    if (col.arrayDimensions !== undefined) throw new Error(`${at} is an array column — the v1 export shape cannot represent arrays; use exportSchemaV2 (Q07)`);
+    if (col.identityKind !== undefined) throw new Error(`${at} is an identity column — the v1 export shape cannot represent identity defaults; use exportSchemaV2 (Q07)`);
+    if (col.generatedExpr !== undefined) throw new Error(`${at} is a generated column — the v1 export shape cannot represent generated columns; use exportSchemaV2 (Q07)`);
+    if (col.foreignKey?.onUpdate !== undefined) throw new Error(`${at} declares a foreign key with ON UPDATE — the v1 export shape drops it; use exportSchemaV2 (Q07)`);
   }
 }
 import type { TablesInput } from "./db.js";
@@ -75,6 +95,9 @@ export interface ExportedSchema {
 export function exportSchema(tables: TablesInput): ExportedSchema {
   const out: ExportedTable[] = [];
   for (const value of Object.values(tables)) {
+    if (isPgEnum(value)) {
+      throw new Error(`exportSchema: enum "${getEnumDefinition(value).name}" cannot be exported by the legacy v1 writer — use exportSchemaV2 (Q07)`);
+    }
     if (!isPgTable(value)) continue;
     out.push(exportTable(value));
   }
@@ -138,38 +161,78 @@ export interface V2TypeRef {
   readonly name: string;
   readonly codec: string;
   readonly params?: Readonly<Record<string, number>>;
+  /** True when the column is a one-dimensional array of the base type. */
+  readonly array?: boolean;
+  /** Enum type identity (required when name is "enum"). */
+  readonly enum?: V2Identity;
 }
 
 export type V2Default =
   | { readonly kind: "literal"; readonly sql: string }
   | { readonly kind: "expression"; readonly sql: string }
+  | { readonly kind: "identity"; readonly generated: "always" | "by default" }
   | { readonly kind: "sequence"; readonly sequence: V2Identity };
+
+/** Stored generated-column expression (Q07c). Virtual generated columns
+ *  are explicitly unsupported (PostgreSQL < 18). */
+export interface V2Generated {
+  readonly expression: string;
+}
 
 export interface V2Column {
   readonly name: string;
   readonly type: V2TypeRef;
   readonly notNull: boolean;
   readonly default?: V2Default;
+  readonly generated?: V2Generated;
 }
 
-export type V2ConstraintType = "primary-key" | "unique" | "foreign-key";
+export type V2ConstraintType = "primary-key" | "unique" | "foreign-key" | "check";
 
 export interface V2Constraint {
   readonly name: string;
   readonly type: V2ConstraintType;
-  readonly columns: readonly string[];
+  readonly columns?: readonly string[];
+  readonly expression?: string;
   readonly references?: {
     readonly table: V2Identity;
     readonly columns: readonly string[];
     readonly onDelete?: string;
+    readonly onUpdate?: string;
+    readonly match?: string;
   };
+  readonly deferrable?: boolean;
+  readonly initiallyDeferred?: boolean;
+}
+
+export interface V2IndexKeyPart {
+  readonly column?: string;
+  readonly expression?: string;
+  readonly order?: "asc" | "desc";
+  readonly nulls?: "first" | "last";
 }
 
 export interface V2Index {
   readonly identity: V2Identity;
   readonly unique: boolean;
   readonly method: string;
-  readonly key: ReadonlyArray<{ readonly column?: string }>;
+  readonly key: readonly V2IndexKeyPart[];
+  readonly where?: string;
+  readonly include?: readonly string[];
+}
+
+export interface V2Enum {
+  readonly identity: V2Identity;
+  readonly managed: boolean;
+  readonly values: readonly string[];
+}
+
+export interface V2View {
+  readonly identity: V2Identity;
+  readonly managed: boolean;
+  readonly definition: string;
+  readonly checkOption?: "local" | "cascaded";
+  readonly securityInvoker?: boolean;
 }
 
 export interface V2Table {
@@ -186,10 +249,14 @@ export interface SchemaDocumentV2 {
   readonly capabilities: readonly string[];
   readonly schemas: ReadonlyArray<{ readonly name: string }>;
   readonly tables: readonly V2Table[];
-  readonly enums: readonly never[];
-  readonly views: readonly never[];
+  readonly enums: readonly V2Enum[];
+  readonly views: readonly V2View[];
   readonly opaque: readonly never[];
 }
+
+/** Schema input for exportSchemaV2: tables, views and enum objects keyed by
+ *  any property name (keys are presentation only). */
+export type SchemaV2Input = Record<string, AnyPgTable | AnyPgEnum>;
 
 /** pg_catalog type names for the schema-builder type vocabulary, with the
  *  canonical v2 codec per type (contracts/data TYPE_CODECS). */
@@ -207,6 +274,26 @@ const V2_TYPE_CODECS: Record<string, string> = {
   timestamp: "timestamp-string", timestamptz: "timestamptz-string", date: "date-string",
   bytea: "binary", uuid: "uuid", json: "json", jsonb: "json", vector: "vector",
 };
+const V2_INDEX_METHODS = new Set(["btree", "hash", "gin", "gist", "spgist", "brin"]);
+const V2_IDENTITY_TYPES = new Set(["serial", "integer", "smallint", "bigint"]);
+
+/** Default-operator-class facts for the index methods and column types in
+ *  the vocabulary: exactly these combinations apply on PostgreSQL without
+ *  naming an operator class (built-in pg_opclass defaults; arrays uniformly
+ *  via array_ops). Everything else is refused by the server with SQLSTATE
+ *  42704, so export refuses it at definition time — the contract has no
+ *  operator-class slot to spell an explicit one. Derived from a live probe
+ *  on PostgreSQL 17 and the REL_15_STABLE pg_opclass catalog source; the
+ *  two agree on every vocabulary combination. */
+const V2_INDEX_METHOD_SCALARS: Record<string, ReadonlySet<string>> = {
+  btree: new Set(["text", "varchar", "bool", "int2", "int4", "int8", "float4", "float8", "numeric", "timestamp", "timestamptz", "date", "uuid", "bytea", "enum", "jsonb"]),
+  hash: new Set(["text", "varchar", "bool", "int2", "int4", "int8", "float4", "float8", "numeric", "timestamp", "timestamptz", "date", "uuid", "bytea", "enum", "jsonb"]),
+  gin: new Set(["jsonb"]),
+  gist: new Set(),
+  spgist: new Set(["text", "varchar"]),
+  brin: new Set(["text", "varchar", "int2", "int4", "int8", "float4", "float8", "numeric", "timestamp", "timestamptz", "date", "uuid", "bytea"]),
+};
+const V2_INDEX_METHOD_ARRAYS = new Set(["btree", "hash", "gin"]);
 
 const V2_LITERAL_PATTERN = /^('([^']|'')*'(::[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?(\[\])*)?|-?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?|true|false|null)$/;
 const V2_NUMERIC_DEFAULT = /^-?\d+(\.\d+)?([eE][+-]?\d+)?$/;
@@ -218,23 +305,38 @@ function exportError(code: string, at: string, detail: string): Error {
 /** Tag a declared default (a JS value from `.default(...)`) as a v2 default.
  *  The codec canonicalizes the value (validation with column context); the
  *  literal spelling is a deterministic function of the canonical value. */
-function v2DefaultFor(table: string, column: AnyColumnBuilder): V2Default | undefined {
+function v2DefaultFor(tableId: V2Identity, column: AnyColumnBuilder): V2Default | undefined {
+  const at = `tables[${tableId.schema}.${tableId.name}].columns[${column.columnName}].default`;
   if (column.dataType === "serial") {
     // The schema DDL `serial` creates exactly this named sequence; an
     // explicit default alongside it is ambiguous and rejected above.
-    return { kind: "sequence", sequence: { schema: "public", name: `${table}_${column.columnName}_seq` } };
+    return { kind: "sequence", sequence: { schema: tableId.schema, name: `${tableId.name}_${column.columnName}_seq` } };
+  }
+  if (column.identityKind !== undefined) {
+    return { kind: "identity", generated: column.identityKind };
   }
   if (column.nowDefault) return { kind: "expression", sql: "now()" };
   if (!column.hasDefault) return undefined;
-  const at = `tables[public.${table}].columns[${column.columnName}].default`;
   if (column.defaultValue === undefined) {
     throw exportError("invalid-default", at, "default is declared without a value — exportSchemaV2 cannot spell it");
   }
-  const ctx: ColumnContext = { propertyKey: column.columnName, columnName: column.columnName, tableName: table };
+  const ctx: ColumnContext = { propertyKey: column.columnName, columnName: column.columnName, tableName: tableId.name };
   const encoded = encodeWriteValue(column, ctx, column.defaultValue);
   const dt = column.dataType;
   let sql: string;
-  if (dt === "boolean") {
+  if (column.arrayDimensions !== undefined) {
+    // The encoded bind is the array literal text; spell it as one string
+    // literal cast to the element type. Enum array casts are quoted type
+    // names, which the literal vocabulary cannot spell — rejected below.
+    sql = `${quoteStringLiteral(String(encoded.bind))}::${(encoded.cast ?? "").replace(/"/g, "")}`;
+    if ((encoded.cast ?? "").includes('"')) {
+      throw exportError(
+        "invalid-literal",
+        at,
+        `array default needs a quoted enum type cast (${encoded.cast}) — not spellable as a contract literal; enum array column defaults are explicitly unsupported`,
+      );
+    }
+  } else if (dt === "boolean") {
     sql = encoded.bind === true ? "true" : "false";
   } else if (dt === "integer" || dt === "smallint" || dt === "bigint" || dt === "double" || dt === "real" || dt === "numeric") {
     sql = String(encoded.bind);
@@ -254,13 +356,22 @@ function v2DefaultFor(table: string, column: AnyColumnBuilder): V2Default | unde
   return { kind: "literal", sql };
 }
 
-function v2TypeFor(table: string, column: AnyColumnBuilder): V2TypeRef {
-  const at = `tables[public.${table}].columns[${column.columnName}].type`;
-  const typeName = V2_TYPE_NAMES[column.dataType];
+function v2TypeFor(tableId: V2Identity, column: AnyColumnBuilder): V2TypeRef {
+  const at = `tables[${tableId.schema}.${tableId.name}].columns[${column.columnName}].type`;
+  const typeName = column.dataType === "enum" ? "enum" : V2_TYPE_NAMES[column.dataType];
   if (typeName === undefined) {
     throw exportError("unknown-type", at, `unknown column type ${JSON.stringify(column.dataType)}`);
   }
-  const ref: { name: string; codec: string; params?: Record<string, number> } = { name: typeName, codec: V2_TYPE_CODECS[typeName] };
+  if (column.identityKind !== undefined && !V2_IDENTITY_TYPES.has(column.dataType)) {
+    throw exportError("invalid-default", `${at}.default`, "identity columns must be integer, smallint or bigint");
+  }
+  if (column.arrayDimensions !== undefined && column.dataType === "enum" && column.enumDef === undefined) {
+    throw exportError("unknown-type", at, "enum array column carries no enum definition");
+  }
+  const ref: { name: string; codec: string; params?: Record<string, number>; array?: boolean; enum?: V2Identity } =
+    column.arrayDimensions !== undefined
+      ? { name: typeName, codec: "array", array: true }
+      : { name: typeName, codec: column.dataType === "enum" ? "enum" : V2_TYPE_CODECS[typeName] };
   if (column.dataType === "vector") {
     if (typeof column.vectorDimensions !== "number") {
       throw exportError("invalid-type-params", at, "vector columns require dimensions");
@@ -269,37 +380,121 @@ function v2TypeFor(table: string, column: AnyColumnBuilder): V2TypeRef {
   } else if (column.dataType === "varchar" && column.varcharLength) {
     ref.params = { length: column.varcharLength };
   }
+  if (column.dataType === "enum") {
+    if (column.enumDef === undefined) {
+      throw exportError("unknown-type", at, "enum column carries no enum definition");
+    }
+    ref.enum = { schema: column.enumDef.schema ?? "public", name: column.enumDef.name };
+  }
   return ref;
 }
 
-/** Export the given tables as a schema document v2. Deterministic: the same
- *  tables (in any input key order) produce the same document and the same
- *  canonical bytes. Columns keep declaration order (attnum semantics);
- *  tables/constraints/indexes are emitted in a stable order and sorted sets
- *  normalize further in canonicalSchemaJson. */
-export function exportSchemaV2(tables: TablesInput): SchemaDocumentV2 {
+/** Normalize an index key part to the contract's minimal form: order is
+ *  written only for DESC, nulls only when it is not the direction default
+ *  (ASC defaults to NULLS LAST, DESC to NULLS FIRST). This is exactly what
+ *  introspection derives from pg_index.indoption, so desired and
+ *  introspected documents canonicalize identically. */
+function v2IndexKeyPart(part: { column?: string; expression?: unknown; order?: "asc" | "desc"; nulls?: "first" | "last" }): V2IndexKeyPart {
+  const order = part.order === "desc" ? ("desc" as const) : undefined;
+  const nulls =
+    (order === undefined && part.nulls === "first") || (order === "desc" && part.nulls === "last")
+      ? part.nulls
+      : undefined;
+  return {
+    ...(part.column !== undefined ? { column: part.column } : {}),
+    ...(part.expression !== undefined ? { expression: part.expression as string } : {}),
+    ...(order ? { order } : {}),
+    ...(nulls ? { nulls } : {}),
+  };
+}
+
+/** Export the given tables, views and enums as a schema document v2.
+ * Deterministic: the same objects (in any input key order) produce the same
+ * document and the same canonical bytes. Columns keep declaration order
+ * (attnum semantics); tables/enums/views/constraints/indexes are emitted in
+ * a stable order and sorted sets normalize further in canonicalSchemaJson.
+ * Every schema/enum/identity the document references is validated here the
+ * same way the Go contract validator does, so an exported document always
+ * validates. */
+export function exportSchemaV2(input: SchemaV2Input): SchemaDocumentV2 {
   const exported: AnyPgTable[] = [];
-  for (const value of Object.values(tables)) {
-    if (isPgTable(value)) {
-      assertPlainTable(value, "exportSchemaV2");
-      exported.push(value);
+  const viewHandles: AnyPgTable[] = [];
+  const standaloneEnums = new Map<string, { def: PgEnumDefinition; at: string }>();
+  for (const [key, value] of Object.entries(input)) {
+    if (isPgEnum(value)) {
+      const def = getEnumDefinition(value);
+      const id = `${def.schema ?? "public"}.${def.name}`;
+      if (standaloneEnums.has(id)) {
+        throw exportError("duplicate-enum", `enums[${id}]`, `enum ${JSON.stringify(id)} is declared twice (input key ${JSON.stringify(key)})`);
+      }
+      standaloneEnums.set(id, { def, at: `input[${JSON.stringify(key)}]` });
+      continue;
+    }
+    if (!isPgTable(value)) continue;
+    rejectDerivedTable(value, "exportSchemaV2");
+    if (getViewDefinition(value) !== undefined) {
+      viewHandles.push(value);
+      continue;
+    }
+    exported.push(value);
+  }
+  const byId = (t: AnyPgTable): string => `${getTableSchema(t) ?? "public"}.${getTableName(t)}`;
+  exported.sort((a, b) => byteCompare(byId(a), byId(b)));
+  const tableIds = new Map(exported.map((t) => [t, byId(t)]));
+
+  // Schemas: public is always declared; every object adds its own.
+  const schemas = new Set<string>(["public"]);
+  for (const t of exported) schemas.add(getTableSchema(t) ?? "public");
+  for (const v of viewHandles) schemas.add(getTableSchema(v) ?? "public");
+
+  // Enums: standalone declarations plus every enum referenced by a column.
+  const enums = new Map<string, { def: PgEnumDefinition; at: string }>(standaloneEnums);
+  for (const table of exported) {
+    for (const column of Object.values(getTableColumns(table)) as AnyColumnBuilder[]) {
+      if (column.enumDef === undefined) continue;
+      const id = `${column.enumDef.schema ?? "public"}.${column.enumDef.name}`;
+      const existing = enums.get(id);
+      if (existing !== undefined && existing.def !== column.enumDef) {
+        // Same identity declared through two pgEnum objects: values must agree.
+        if (existing.def.values.length !== column.enumDef.values.length || existing.def.values.some((v, i) => v !== column.enumDef!.values[i])) {
+          throw exportError(
+            "duplicate-enum",
+            `enums[${id}]`,
+            `enum ${JSON.stringify(id)} is declared twice with different values (${existing.at} vs tables[${byId(table)}].columns[${column.columnName}])`,
+          );
+        }
+      } else if (existing === undefined) {
+        enums.set(id, { def: column.enumDef, at: `tables[${byId(table)}].columns[${column.columnName}]` });
+      }
+      schemas.add(column.enumDef.schema ?? "public");
     }
   }
-  // Deterministic table order: schema-qualified identity (public here).
-  exported.sort((a, b) => byteCompare(getTableName(a), getTableName(b)));
+  for (const id of enums.keys()) schemas.add(id.slice(0, id.indexOf(".")));
 
-  const byName = new Map(exported.map((t) => [getTableName(t), t]));
+  const enumList: V2Enum[] = [...enums.entries()]
+    .sort((a, b) => byteCompare(a[0], b[0]))
+    .map(([id, e]) => ({ identity: { schema: id.slice(0, id.indexOf(".")), name: id.slice(id.indexOf(".") + 1) }, managed: true, values: [...e.def.values] }));
+
   const out: V2Table[] = [];
+  const keyTuples = new Map<string, string[][]>();
   let hasVector = false;
 
   for (const table of exported) {
-    const tableName = getTableName(table);
+    const tableId: V2Identity = { schema: getTableSchema(table) ?? "public", name: getTableName(table) };
     const columns: V2Column[] = [];
     const constraints: V2Constraint[] = [];
     const pkColumns: string[] = [];
+    const tableConstraints = getTableConstraints(table);
+    const tablePk = tableConstraints.find((c) => c.kind === "primary-key");
+    const seenColumnNames = new Set<string>();
+    const columnTypes = new Map<string, { name: string; array: boolean }>();
 
     for (const column of Object.values(getTableColumns(table)) as AnyColumnBuilder[]) {
-      const at = `tables[public.${tableName}].columns[${column.columnName}]`;
+      const at = `tables[${tableId.schema}.${tableId.name}].columns[${column.columnName}]`;
+      if (seenColumnNames.has(column.columnName)) {
+        throw exportError("duplicate-column", at, `column ${JSON.stringify(column.columnName)} is declared twice`);
+      }
+      seenColumnNames.add(column.columnName);
       if (column.dataType === "serial") {
         if (column.defaultValue !== undefined || column.nowDefault) {
           throw exportError(
@@ -310,18 +505,36 @@ export function exportSchemaV2(tables: TablesInput): SchemaDocumentV2 {
         }
       }
       if (column.dataType === "vector") hasVector = true;
-      const def = v2DefaultFor(tableName, column);
+      const inTablePk = tablePk !== undefined && tablePk.columns.includes(column.columnName);
+      if (column.isPrimaryKey && tablePk !== undefined) {
+        throw exportError(
+          "multiple-primary-key",
+          at,
+          "column-level .primaryKey() and a table-level primaryKey() are declared — a table has exactly one primary key",
+        );
+      }
+      const generated: V2Generated | undefined =
+        column.generatedExpr !== undefined
+          ? { expression: renderSchemaExpression(column.generatedExpr, { what: `${at}.generated expression`, table }) }
+          : undefined;
+      if (generated !== undefined && column.hasDefault) {
+        throw exportError("invalid-default", `${at}.default`, "a generated column cannot also declare a default");
+      }
+      const def = v2DefaultFor(tableId, column);
+      const v2Type = v2TypeFor(tableId, column);
+      columnTypes.set(column.columnName, { name: v2Type.name, array: v2Type.array === true });
       const v2Column: V2Column = {
         name: column.columnName,
-        type: v2TypeFor(tableName, column),
-        notNull: column.isNotNull || column.isPrimaryKey, // PK implies NOT NULL
+        type: v2Type,
+        notNull: column.isNotNull || column.isPrimaryKey || inTablePk,
         ...(def ? { default: def } : {}),
+        ...(generated ? { generated } : {}),
       };
       columns.push(v2Column);
 
       if (column.isPrimaryKey) pkColumns.push(column.columnName);
       if (column.isUnique) {
-        constraints.push({ name: `${tableName}_${column.columnName}_key`, type: "unique", columns: [column.columnName] });
+        constraints.push({ name: `${tableId.name}_${column.columnName}_key`, type: "unique", columns: [column.columnName] });
       }
       if (column.foreignKey) {
         const target = column.foreignKey();
@@ -332,32 +545,26 @@ export function exportSchemaV2(tables: TablesInput): SchemaDocumentV2 {
         if (!targetTable) {
           throw exportError("fk-target", at, "foreign key references a column with no owning table");
         }
+        if (getViewDefinition(targetTable) !== undefined) {
+          throw exportError("fk-target", at, "foreign key references a view — targets must be tables");
+        }
         const targetName = getTableName(targetTable);
-        if (!byName.has(targetName)) {
+        const targetSchema = getTableSchema(targetTable) ?? "public";
+        if (!tableIds.has(targetTable)) {
           throw exportError(
             "fk-target",
             at,
-            `foreign key references table ${JSON.stringify(targetName)}, which is not part of the exported schema`,
-          );
-        }
-        // v2 requires FK targets covered by a primary-key or unique constraint.
-        const targetColumn = (Object.values(getTableColumns(targetTable)) as AnyColumnBuilder[]).find(
-          (c) => c.columnName === target.columnName,
-        );
-        if (!targetColumn || (!targetColumn.isPrimaryKey && !targetColumn.isUnique)) {
-          throw exportError(
-            "fk-not-unique",
-            at,
-            `foreign key references ${targetName}.${target.columnName}, which is not covered by a primary-key or unique constraint`,
+            `foreign key references table "${targetSchema}"."${targetName}", which is not part of the exported schema`,
           );
         }
         const references: V2Constraint["references"] = {
-          table: { schema: "public", name: targetName },
+          table: { schema: targetSchema, name: targetName },
           columns: [target.columnName],
           ...(column.foreignKey.onDelete ? { onDelete: column.foreignKey.onDelete } : {}),
+          ...(column.foreignKey.onUpdate ? { onUpdate: column.foreignKey.onUpdate } : {}),
         };
         constraints.push({
-          name: `${tableName}_${column.columnName}_fkey`,
+          name: `${tableId.name}_${column.columnName}_fkey`,
           type: "foreign-key",
           columns: [column.columnName],
           references,
@@ -366,31 +573,196 @@ export function exportSchemaV2(tables: TablesInput): SchemaDocumentV2 {
     }
 
     if (pkColumns.length > 0) {
-      constraints.push({ name: `${tableName}_pkey`, type: "primary-key", columns: [...pkColumns] });
+      constraints.push({ name: `${tableId.name}_pkey`, type: "primary-key", columns: [...pkColumns] });
     }
 
+    for (const extra of tableConstraints) {
+      const at = `tables[${tableId.schema}.${tableId.name}].constraints`;
+      const assertColumns = (cols: readonly string[], what: string): void => {
+        if (!Array.isArray(cols) || cols.length === 0) throw exportError("constraint-column", at, `${what} must list at least one column`);
+        for (const c of cols) {
+          if (!seenColumnNames.has(c)) {
+            throw exportError("constraint-column", `${at}[${c}]`, `${what} references unknown column ${JSON.stringify(c)}`);
+          }
+        }
+      };
+      if (extra.kind === "primary-key") {
+        assertColumns(extra.columns, "primaryKey");
+        constraints.push({
+          name: extra.name ?? `${tableId.name}_pkey`,
+          type: "primary-key",
+          columns: [...extra.columns],
+          ...(extra.deferrable !== undefined ? { deferrable: extra.deferrable } : {}),
+          ...(extra.initiallyDeferred !== undefined ? { initiallyDeferred: extra.initiallyDeferred } : {}),
+        });
+      } else if (extra.kind === "unique") {
+        assertColumns(extra.columns, "unique");
+        constraints.push({
+          name: extra.name ?? `${tableId.name}_${extra.columns.join("_")}_key`,
+          type: "unique",
+          columns: [...extra.columns],
+          ...(extra.deferrable !== undefined ? { deferrable: extra.deferrable } : {}),
+          ...(extra.initiallyDeferred !== undefined ? { initiallyDeferred: extra.initiallyDeferred } : {}),
+        });
+      } else if (extra.kind === "check") {
+        constraints.push({
+          name: extra.name,
+          type: "check",
+          expression: renderSchemaExpression(extra.expression, { what: `${at}[${extra.name}].expression`, table }),
+          ...(extra.deferrable !== undefined ? { deferrable: extra.deferrable } : {}),
+          ...(extra.initiallyDeferred !== undefined ? { initiallyDeferred: extra.initiallyDeferred } : {}),
+        });
+      } else {
+        assertColumns(extra.columns, "foreignKey");
+        if (extra.refTable === undefined || extra.refColumns.length !== extra.columns.length) {
+          throw exportError("fk-target", at, "table-level foreign key has no resolved .references(table, columns) target");
+        }
+        if (getViewDefinition(extra.refTable) !== undefined) {
+          throw exportError("fk-target", at, "foreign key references a view — targets must be tables");
+        }
+        if (!tableIds.has(extra.refTable)) {
+          throw exportError(
+            "fk-target",
+            at,
+            `foreign key references table "${getTableSchema(extra.refTable) ?? "public"}"."${getTableName(extra.refTable)}", which is not part of the exported schema`,
+          );
+        }
+        constraints.push({
+          name: extra.name ?? `${tableId.name}_${extra.columns.join("_")}_fkey`,
+          type: "foreign-key",
+          columns: [...extra.columns],
+          references: {
+            table: { schema: getTableSchema(extra.refTable) ?? "public", name: getTableName(extra.refTable) },
+            columns: [...extra.refColumns],
+            ...(extra.onDelete ? { onDelete: extra.onDelete } : {}),
+            ...(extra.onUpdate ? { onUpdate: extra.onUpdate } : {}),
+            ...(extra.match ? { match: extra.match } : {}),
+          },
+          ...(extra.deferrable !== undefined ? { deferrable: extra.deferrable } : {}),
+          ...(extra.initiallyDeferred !== undefined ? { initiallyDeferred: extra.initiallyDeferred } : {}),
+        });
+      }
+    }
+
+    // Column-level FK targets must be covered by a primary-key or unique
+    // constraint (the contract's cross-object rule), evaluated after all
+    // constraints are known — collect tuples first, verify below.
+    keyTuples.set(
+      `${tableId.schema}.${tableId.name}`,
+      constraints.filter((c) => c.type === "primary-key" || c.type === "unique").map((c) => [...(c.columns ?? [])]),
+    );
+
     out.push({
-      identity: { schema: "public", name: tableName },
+      identity: tableId,
       managed: true,
       columns,
       constraints,
-      indexes: getTableIndexes(table).map((idx) => ({
-        identity: { schema: "public", name: idx.indexName },
-        unique: idx.unique,
-        method: idx.method ?? "btree",
-        key: idx.columns.map((c) => ({ column: c })),
-      })),
+      indexes: getTableIndexes(table).map((idx) => {
+        const idxAt = `tables[${tableId.schema}.${tableId.name}].indexes[${idx.indexName}]`;
+        if (!V2_INDEX_METHODS.has(idx.methodValue)) {
+          throw exportError("unknown-index-method", idxAt, `index method ${JSON.stringify(idx.methodValue)} is not in the contract vocabulary`);
+        }
+        if (idx.includeCols.length > 0 && idx.methodValue !== "btree") {
+          throw exportError("invalid-index", idxAt, "INCLUDE is a btree-only feature");
+        }
+        if (idx.keyParts.length === 0) {
+          throw exportError("index-key", idxAt, "index must declare at least one key part");
+        }
+        const key = idx.keyParts.map((p, i) => {
+          if (p.column !== undefined) {
+            if (!seenColumnNames.has(p.column)) {
+              throw exportError("index-column", `${idxAt}[${i}]`, `index references unknown column ${JSON.stringify(p.column)}`);
+            }
+            const colType = columnTypes.get(p.column);
+            if (
+              colType !== undefined &&
+              !(colType.array ? V2_INDEX_METHOD_ARRAYS.has(idx.methodValue) : (V2_INDEX_METHOD_SCALARS[idx.methodValue] ?? new Set()).has(colType.name))
+            ) {
+              throw exportError(
+                "invalid-index",
+                `${idxAt}[${i}]`,
+                `index method ${JSON.stringify(idx.methodValue)} over column ${JSON.stringify(p.column)} (${colType.name}${colType.array ? "[]" : ""}) has no default operator class on any supported server (PostgreSQL refuses it with SQLSTATE 42704) — explicitly unsupported — contract has no operator-class slot`,
+              );
+            }
+            return v2IndexKeyPart(p);
+          }
+          if (p.expression === undefined) throw exportError("index-key", `${idxAt}[${i}]`, "index key part has neither column nor expression");
+          if (p.order !== undefined || p.nulls !== undefined) {
+            throw exportError("index-key", `${idxAt}[${i}]`, "ordered expression keys are explicitly unsupported (per-part expression deparse is engine-dependent)");
+          }
+          if (idx.methodValue !== "btree") {
+            throw exportError(
+              "invalid-index",
+              `${idxAt}[${i}]`,
+              'expression keys are only definable with method "btree" — the default operator class of an expression result type cannot be verified at definition time (contract has no operator-class slot)',
+            );
+          }
+          return v2IndexKeyPart({
+            expression: renderSchemaExpression(p.expression, { what: `${idxAt}[${i}].expression`, table }),
+          });
+        });
+        for (const inc of idx.includeCols) {
+          if (!seenColumnNames.has(inc)) {
+            throw exportError("index-column", idxAt, `INCLUDE references unknown column ${JSON.stringify(inc)}`);
+          }
+        }
+        return {
+          identity: { schema: tableId.schema, name: idx.indexName },
+          unique: idx.unique,
+          method: idx.methodValue,
+          key,
+          ...(idx.whereExpr !== undefined ? { where: renderSchemaExpression(idx.whereExpr, { what: `${idxAt}.where`, table }) } : {}),
+          ...(idx.includeCols.length > 0 ? { include: [...idx.includeCols] } : {}),
+        };
+      }),
     });
   }
+
+  // FK target coverage (mirrors the Go validator's cross-reference rule).
+  for (const table of out) {
+    const tableKey = `${table.identity.schema}.${table.identity.name}`;
+    for (const constraint of table.constraints) {
+      if (constraint.type !== "foreign-key" || constraint.references === undefined) continue;
+      const targetKey = `${constraint.references.table.schema}.${constraint.references.table.name}`;
+      const tuples = keyTuples.get(targetKey) ?? [];
+      const refCols = constraint.references.columns;
+      if (!tuples.some((tuple) => tuple.length === refCols.length && tuple.every((c, i) => c === refCols[i]))) {
+        throw exportError(
+          "fk-not-unique",
+          `tables[${tableKey}].constraints[${constraint.name}]`,
+          `foreign key references (${refCols.join(", ")}) on ${targetKey}, which is not covered by a primary-key or unique constraint`,
+        );
+      }
+    }
+  }
+
+  // Views: rendered definitions, exported under their schema.
+  const views: V2View[] = [];
+  const seenViews = new Set<string>();
+  for (const view of viewHandles) {
+    const viewDef = getViewDefinition(view)!;
+    const id: V2Identity = { schema: getTableSchema(view) ?? "public", name: getTableName(view) };
+    const key = `${id.schema}.${id.name}`;
+    if (seenViews.has(key)) throw exportError("duplicate-view", `views[${key}]`, `view ${JSON.stringify(key)} is declared twice`);
+    seenViews.add(key);
+    views.push({
+      identity: id,
+      managed: true,
+      definition: renderSchemaExpression(viewDef.definition, { what: `views[${key}].definition` }),
+      ...(viewDef.checkOption ? { checkOption: viewDef.checkOption } : {}),
+      ...(viewDef.securityInvoker === true ? { securityInvoker: true } : {}),
+    });
+  }
+  views.sort((a, b) => (a.identity.schema !== b.identity.schema ? byteCompare(a.identity.schema, b.identity.schema) : byteCompare(a.identity.name, b.identity.name)));
 
   return {
     version: 2,
     dialect: "postgresql",
     capabilities: hasVector ? ["nucleus"] : [],
-    schemas: [{ name: "public" }],
+    schemas: [...schemas].sort(byteCompare).map((name) => ({ name })),
     tables: out,
-    enums: [],
-    views: [],
+    enums: enumList,
+    views,
     opaque: [],
   };
 }
@@ -431,9 +803,12 @@ function canonicalString(s: string): string {
 
 /** Serialize a schema document v2 into its canonical form: object keys sorted
  *  bytewise, set collections (capabilities, schemas, tables, constraints,
- *  indexes) sorted, ordered tuples (columns, constraint columns, references
- *  columns, index key parts) preserved, minimal string escaping, no
- *  whitespace. Pure: same document → identical bytes on every machine. */
+ *  indexes, enums, views, opaque, index INCLUDE) sorted, ordered tuples
+ *  (columns, constraint columns, references columns, index key parts, enum
+ *  values) preserved, minimal string escaping, no whitespace. Pure: same
+ *  document → identical bytes on every machine. Byte-identical to the Go
+ *  canonicalizer (cli/internal/db schema_v2.go v2CanonicalBytes) and the
+ *  contracts/data reference consumer. */
 export function canonicalSchemaJson(doc: SchemaDocumentV2): string {
   const parts: string[] = [];
   parts.push('{"capabilities":[');
@@ -441,18 +816,23 @@ export function canonicalSchemaJson(doc: SchemaDocumentV2): string {
     if (i > 0) parts.push(",");
     parts.push(canonicalString(c));
   });
-  parts.push('],"dialect":"postgresql","enums":[],"opaque":[');
+  parts.push('],"dialect":"postgresql","enums":[');
+  [...doc.enums]
+    .sort((a, b) => identityCompare(a.identity, b.identity))
+    .forEach((e, i) => {
+      if (i > 0) parts.push(",");
+      parts.push(`{"identity":${canonicalIdentity(e.identity)},"managed":${e.managed},"values":[`);
+      parts.push(e.values.map(canonicalString).join(","));
+      parts.push("]}");
+    });
+  parts.push('],"opaque":[');
   parts.push('],"schemas":[');
   [...doc.schemas].sort((a, b) => byteCompare(a.name, b.name)).forEach((s, i) => {
     if (i > 0) parts.push(",");
     parts.push(`{"name":${canonicalString(s.name)}}`);
   });
   parts.push('],"tables":[');
-  const tables = [...doc.tables].sort((a, b) =>
-    a.identity.schema !== b.identity.schema
-      ? byteCompare(a.identity.schema, b.identity.schema)
-      : byteCompare(a.identity.name, b.identity.name),
-  );
+  const tables = [...doc.tables].sort((a, b) => identityCompare(a.identity, b.identity));
   tables.forEach((t, i) => {
     if (i > 0) parts.push(",");
     parts.push('{"columns":[');
@@ -460,6 +840,7 @@ export function canonicalSchemaJson(doc: SchemaDocumentV2): string {
       if (j > 0) parts.push(",");
       parts.push("{");
       if (c.default) parts.push(`"default":${canonicalDefault(c.default)},`);
+      if (c.generated) parts.push(`"generated":{"expression":${canonicalString(c.generated.expression)}},`);
       parts.push(`"name":${canonicalString(c.name)},"notNull":${c.notNull},"type":`);
       parts.push(canonicalType(c.type));
       parts.push("}");
@@ -468,42 +849,77 @@ export function canonicalSchemaJson(doc: SchemaDocumentV2): string {
     [...t.constraints].sort((a, b) => byteCompare(a.name, b.name)).forEach((c, j) => {
       if (j > 0) parts.push(",");
       parts.push("{");
-      if (c.columns.length > 0) parts.push(`"columns":[${c.columns.map(canonicalString).join(",")}],`);
+      if (c.columns && c.columns.length > 0) parts.push(`"columns":[${c.columns.map(canonicalString).join(",")}],`);
+      if (c.deferrable !== undefined) parts.push(`"deferrable":${c.deferrable},`);
+      if (c.expression !== undefined) parts.push(`"expression":${canonicalString(c.expression)},`);
+      if (c.initiallyDeferred !== undefined) parts.push(`"initiallyDeferred":${c.initiallyDeferred},`);
       parts.push(`"name":${canonicalString(c.name)}`);
       if (c.references) {
         const r = c.references;
         parts.push(',"references":{"columns":[');
         parts.push(r.columns.map(canonicalString).join(","));
         parts.push("]");
+        if (r.match) parts.push(`,"match":${canonicalString(r.match)}`);
         if (r.onDelete) parts.push(`,"onDelete":${canonicalString(r.onDelete)}`);
-        parts.push(`,"table":{"name":${canonicalString(r.table.name)},"schema":${canonicalString(r.table.schema)}}}`);
+        if (r.onUpdate) parts.push(`,"onUpdate":${canonicalString(r.onUpdate)}`);
+        parts.push(`,"table":${canonicalIdentity(r.table)}}`);
       }
       parts.push(`,"type":${canonicalString(c.type)}}`);
     });
-    parts.push(`],"identity":{"name":${canonicalString(t.identity.name)},"schema":${canonicalString(t.identity.schema)}},"indexes":[`);
+    parts.push(`],"identity":${canonicalIdentity(t.identity)},"indexes":[`);
     [...t.indexes]
-      .sort((a, b) =>
-        a.identity.schema !== b.identity.schema
-          ? byteCompare(a.identity.schema, b.identity.schema)
-          : byteCompare(a.identity.name, b.identity.name),
-      )
+      .sort((a, b) => identityCompare(a.identity, b.identity))
       .forEach((idx, j) => {
         if (j > 0) parts.push(",");
-        parts.push(`{"identity":{"name":${canonicalString(idx.identity.name)},"schema":${canonicalString(idx.identity.schema)}},"key":[`);
+        parts.push(`{"identity":${canonicalIdentity(idx.identity)}`);
+        if (idx.include && idx.include.length > 0) {
+          parts.push(`,"include":[${[...idx.include].sort(byteCompare).map(canonicalString).join(",")}]`);
+        }
+        parts.push(',"key":[');
         idx.key.forEach((part, k) => {
           if (k > 0) parts.push(",");
-          if (part.column !== undefined) parts.push(`{"column":${canonicalString(part.column)}}`);
+          parts.push("{");
+          if (part.column !== undefined) parts.push(`"column":${canonicalString(part.column)}`);
+          if (part.expression !== undefined) parts.push(`${part.column !== undefined ? "," : ""}"expression":${canonicalString(part.expression)}`);
+          if (part.nulls !== undefined) parts.push(`,"nulls":${canonicalString(part.nulls)}`);
+          if (part.order !== undefined) parts.push(`,"order":${canonicalString(part.order)}`);
+          parts.push("}");
         });
-        parts.push(`],"method":${canonicalString(idx.method)},"unique":${idx.unique}}`);
+        parts.push(`],"method":${canonicalString(idx.method)},"unique":${idx.unique}`);
+        if (idx.where !== undefined) parts.push(`,"where":${canonicalString(idx.where)}`);
+        parts.push("}");
       });
     parts.push(`],"managed":${t.managed}}`);
   });
-  parts.push('],"version":2,"views":[]}');
+  parts.push('],"version":2,"views":[');
+  [...doc.views]
+    .sort((a, b) => identityCompare(a.identity, b.identity))
+    .forEach((v, i) => {
+      if (i > 0) parts.push(",");
+      parts.push("{");
+      if (v.checkOption !== undefined) parts.push(`"checkOption":${canonicalString(v.checkOption)},`);
+      parts.push(`"definition":${canonicalString(v.definition)},"identity":${canonicalIdentity(v.identity)},"managed":${v.managed}`);
+      if (v.securityInvoker !== undefined) parts.push(`,"securityInvoker":${v.securityInvoker}`);
+      parts.push("}");
+    });
+  parts.push("]}");
   return parts.join("");
 }
 
+function identityCompare(a: V2Identity, b: V2Identity): number {
+  return a.schema !== b.schema ? byteCompare(a.schema, b.schema) : byteCompare(a.name, b.name);
+}
+
+function canonicalIdentity(id: V2Identity): string {
+  return `{"name":${canonicalString(id.name)},"schema":${canonicalString(id.schema)}}`;
+}
+
 function canonicalType(type: V2TypeRef): string {
-  const parts: string[] = [`{"codec":${canonicalString(type.codec)},"name":${canonicalString(type.name)}`];
+  const parts: string[] = ["{"];
+  if (type.array === true) parts.push('"array":true,');
+  parts.push(`"codec":${canonicalString(type.codec)}`);
+  if (type.enum) parts.push(`,"enum":${canonicalIdentity(type.enum)}`);
+  parts.push(`,"name":${canonicalString(type.name)}`);
   if (type.params) {
     const keys = Object.keys(type.params).sort(byteCompare);
     if (keys.length > 0) {
@@ -522,6 +938,9 @@ function canonicalType(type: V2TypeRef): string {
 function canonicalDefault(def: V2Default): string {
   if (def.kind === "sequence") {
     return `{"kind":"sequence","sequence":{"name":${canonicalString(def.sequence.name)},"schema":${canonicalString(def.sequence.schema)}}}`;
+  }
+  if (def.kind === "identity") {
+    return `{"generated":${canonicalString(def.generated)},"kind":"identity"}`;
   }
   return `{"kind":${canonicalString(def.kind)},"sql":${canonicalString(def.sql)}}`;
 }

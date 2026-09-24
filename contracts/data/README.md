@@ -50,6 +50,7 @@ fixtures and accept the cross-object ones (ajv gate in
 | Foreign-key target existence, column existence, PK/unique tuple coverage | no | yes |
 | PK columns declare notNull | no | yes |
 | Codec/type consistency, vector capability | no | yes |
+| Index method has a default operator class for the key column type (else SQLSTATE 42704 at apply); expression keys only with btree | no | yes |
 
 ## Status
 
