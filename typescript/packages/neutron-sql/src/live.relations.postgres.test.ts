@@ -368,12 +368,12 @@ for (const driverKind of ["postgres", "pg"] as const) {
         /unknown relation "bogus" on users/,
       );
       await assert.rejects(
-        () => db.query.posts.findMany({ with: { author: true, reviewer: true } }),
-        /relations "author" and "reviewer" on posts both target table "users" in one with clause/,
+        () => db.query.users.findMany({ with: { posts: 42 as never } }),
+        /relation "posts" in with on users: expected true or a per-relation options object, got a number/,
       );
       await assert.rejects(
-        () => db.query.users.findMany({ with: { posts: { with: {} } as never } }),
-        /relation "posts" in with on users: only `true` is supported/,
+        () => db.query.users.findMany({ with: { posts: { columns: ["bogus"] } as never } }),
+        /unknown column "bogus" in args.columns on users\.posts/,
       );
       await assert.rejects(
         () => db.query.users.findMany({ columns: ["bogus"] as never }),
@@ -387,6 +387,12 @@ for (const driverKind of ["postgres", "pg"] as const) {
         () => db.query.users.findMany({ columns: "id" as never }),
         /args.columns on users must be an array of property keys/,
       );
+      // Two references to one target and nested with are SUPPORTED since Q05 —
+      // covered positively in live.q05.postgres.test.ts.
+      const bothRefs = await db.query.posts.findMany({ with: { author: true, reviewer: true } });
+      assert.ok(Array.isArray(bothRefs));
+      const nested = await db.query.users.findMany({ with: { posts: { with: { author: true } } }, limit: 1 });
+      assert.ok(Array.isArray(nested));
     });
   });
 
