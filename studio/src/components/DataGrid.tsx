@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'preact/hooks'
 import type { QueryResult, TableMetaColumn } from '../lib/types'
+import { formatCell } from '../lib/wire'
 import s from './DataGrid.module.css'
 
 export interface FKTarget {
@@ -7,6 +8,13 @@ export interface FKTarget {
   refTable: string
   refColumn?: string
   refColumns?: string[]
+  /** Local columns of the constraint, in constraint order (the whole tuple). */
+  columns?: string[]
+}
+
+/** Local tuple columns of an FK (single-column FKs may only name `column`). */
+function fkLocalColumns(fk: FKTarget, fallback: string): string[] {
+  return fk.columns && fk.columns.length > 0 ? fk.columns : [fallback]
 }
 
 interface DataGridProps {
@@ -17,7 +25,8 @@ interface DataGridProps {
   onCommitEdit?: (rowIndex: number, column: string, value: string | null) => void
   /** FK columns by name; enables follow links. */
   fkColumns?: Record<string, FKTarget>
-  onFollowFK?: (fk: FKTarget, value: unknown) => void
+  /** Follow a reference; the whole FK tuple is read from the given row. */
+  onFollowFK?: (fk: FKTarget, rowIndex: number) => void
   sortColumn?: string | null
   sortDir?: 'asc' | 'desc'
   onSort?: (column: string) => void
@@ -142,14 +151,22 @@ export function DataGrid({
     }
 
     const fk = fkColumns?.[col]
-    if (fk && onFollowFK && val !== null && val !== undefined) {
+    // A reference is followable only when every component of its tuple is
+    // non-NULL in this row (MATCH SIMPLE: a NULL component references nothing).
+    const fkTupleComplete = fk !== undefined && fkLocalColumns(fk, col).every(c => {
+      const i = result.columns.indexOf(c)
+      const v = i < 0 ? undefined : (result.rows[rowIdx] as unknown[] | undefined)?.[i]
+      return v !== null && v !== undefined
+    })
+    if (fk && onFollowFK && fkTupleComplete) {
+      const refs = (fk.refColumns ?? [fk.refColumn]).filter(Boolean).join(', ')
       return (
         <button
           class={s.fkLink}
-          title={`Follow ${fk.refSchema}.${fk.refTable} (${(fk.refColumns ?? [fk.refColumn]).filter(Boolean).join(', ')})`}
-          onClick={() => onFollowFK(fk, val)}
+          title={`Follow ${fk.refSchema}.${fk.refTable} (${refs})`}
+          onClick={() => onFollowFK(fk, rowIdx)}
         >
-          {String(val)}
+          {formatCell(val)}
         </button>
       )
     }
@@ -164,7 +181,7 @@ export function DataGrid({
       )
     }
     if (val === undefined) return <span class={s.null}>—</span>
-    return String(val)
+    return formatCell(val)
   }
 
   return (
@@ -213,8 +230,8 @@ export function DataGrid({
                               setEdit({
                                 row: rowIdx,
                                 col,
-                                draft: isNull ? '' : String(cell),
-                                initialText: isNull ? '' : String(cell),
+                                draft: isNull ? '' : formatCell(cell),
+                                initialText: isNull ? '' : formatCell(cell),
                                 initialIsNull: isNull,
                                 setNull: isNull,
                               })

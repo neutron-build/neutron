@@ -2,7 +2,7 @@ import type {
   Connection, ConnectionInput, TestResult,
   Schema, NucleusFeatures, QueryResult,
   ColumnDetail, IndexDetail, SavedQuery, FKDetail,
-  TableMeta, MutationOutcome, KeyCell,
+  TableMeta, MutationOutcome, KeyCell, MatchCell,
 } from './types'
 import { decodeRows } from './wire'
 
@@ -15,16 +15,25 @@ const BASE = '/api'
  */
 export class ApiError extends Error {
   status: number
+  /** v2 outcome state: conflict | missing | binding | constraint | privilege. */
+  state?: string
+  /** Auth refusal code from the server boundary: origin | session. */
+  auth?: string
   conflict?: boolean
   missing?: boolean
+  /** The rows' relation binding is stale (reconnect or table replaced). */
+  binding?: boolean
   currentVersion?: string
 
-  constructor(status: number, message: string, extra?: { conflict?: boolean; missing?: boolean; currentVersion?: string }) {
+  constructor(status: number, message: string, extra?: { state?: string; auth?: string; conflict?: boolean; missing?: boolean; currentVersion?: string }) {
     super(message)
     this.name = 'ApiError'
     this.status = status
+    this.state = extra?.state
+    this.auth = extra?.auth
     this.conflict = extra?.conflict
     this.missing = extra?.missing
+    this.binding = extra?.state === undefined ? undefined : extra.state === 'binding'
     this.currentVersion = extra?.currentVersion
   }
 }
@@ -37,23 +46,23 @@ export function _setSessionTokenForTests(token: string | null) {
   sessionToken = token
 }
 
-async function fetchSessionToken(): Promise<string> {
+async function fetchSessionToken(): Promise<string | null> {
   try {
     const res = await fetch(BASE + '/session')
     if (res.ok) {
       const body = await res.json() as { token?: string }
-      return body.token ?? ''
+      return body.token || null
     }
   } catch {
-    // Server unreachable or a pre-session build: no token to present.
+    // Server unreachable: no token yet; the next mutation retries the fetch.
   }
-  return ''
+  return null
 }
 
 /**
  * Headers for a mutating request: JSON content type plus the session token.
- * The token is fetched lazily once per page load from the same-origin
- * /api/session endpoint; an older server without it simply sees no header.
+ * The token is fetched lazily from the same-origin /api/session endpoint and
+ * cached; a failed fetch is not cached, so the next mutation tries again.
  */
 export async function mutationHeaders(): Promise<Record<string, string>> {
   if (sessionToken === null) {
@@ -85,15 +94,21 @@ async function mutationRequest<T>(
   path: string,
   body?: unknown,
 ): Promise<T> {
-  const headers = await mutationHeaders()
-  const res = await fetch(BASE + path, {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-  })
+  const payload = body === undefined ? undefined : JSON.stringify(body)
+  let res = await fetch(BASE + path, { method, headers: await mutationHeaders(), body: payload })
+  if (res.status === 403) {
+    const err = await toApiError(res)
+    // A stale token (the server restarted and minted a new one) is refused
+    // before the handler runs, so one retry with a fresh token is safe.
+    // Origin refusals are never retried.
+    if (err.auth !== 'session') throw err
+    sessionToken = null
+    res = await fetch(BASE + path, { method, headers: await mutationHeaders(), body: payload })
+  }
   if (!res.ok) {
     throw await toApiError(res)
   }
+  if (res.status === 204) return undefined as T
   return res.json() as Promise<T>
 }
 
@@ -102,9 +117,23 @@ async function toApiError(res: Response): Promise<ApiError> {
   try {
     const raw = await res.text()
     try {
-      const parsed = JSON.parse(raw) as { error?: string; conflict?: boolean; missing?: boolean; currentVersion?: string }
+      const parsed = JSON.parse(raw) as {
+        error?: string
+        state?: string
+        auth?: string
+        currentVersion?: string
+      }
       if (parsed && typeof parsed === 'object' && typeof parsed.error === 'string') {
-        return new ApiError(res.status, parsed.error, parsed)
+        // The v2 protocol carries its outcome in "state": "conflict" |
+        // "missing" | "binding" | "constraint" | "privilege"; the auth
+        // boundary answers 403 with "auth": "origin" | "session".
+        return new ApiError(res.status, parsed.error, {
+          state: parsed.state,
+          auth: parsed.auth,
+          conflict: parsed.state === 'conflict',
+          missing: parsed.state === 'missing',
+          currentVersion: parsed.currentVersion,
+        })
       }
       text = raw
     } catch {
@@ -119,7 +148,9 @@ async function toApiError(res: Response): Promise<ApiError> {
 /** Query results may carry tagged cells for bigint/decimal/binary/temporal
  *  values (lossless across JSON.parse); decode them, passthrough otherwise. */
 async function requestQueryResult(method: string, path: string, body?: unknown): Promise<QueryResult> {
-  const result = await request<QueryResult>(method, path, body)
+  const result = method === 'GET'
+    ? await request<QueryResult>(method, path, body)
+    : await mutationRequest<QueryResult>(method, path, body)
   if (Array.isArray(result.rows)) decodeRows(result.rows)
   return result
 }
@@ -138,7 +169,7 @@ export const api = {
       mutationRequest<void>('DELETE', `/connections/${id}`),
 
     test: (url: string) =>
-      request<TestResult>('POST', '/connections/test', { url }),
+      mutationRequest<TestResult>('POST', '/connections/test', { url }),
 
     connect: (id: string) =>
       mutationRequest<{ features: NucleusFeatures; schema: Schema }>('POST', `/connections/${id}/connect`),
@@ -166,6 +197,8 @@ export const api = {
     limit = 200, offset = 0,
     filter?: { column: string; op: string; value?: string },
     sort?: { column: string; dir: 'asc' | 'desc' },
+    /** Full-tuple equality filter (composite FK follow); values are wire cells. */
+    match?: MatchCell[],
   ) => {
     const params = new URLSearchParams({
       connectionId, schema, table,
@@ -180,6 +213,9 @@ export const api = {
       params.set('sortColumn', sort.column)
       params.set('sortDir', sort.dir)
     }
+    if (match && match.length > 0) {
+      params.set('match', JSON.stringify(match))
+    }
     return requestQueryResult('GET', `/table?${params.toString()}`)
   },
 
@@ -191,12 +227,15 @@ export const api = {
 
   tableInsert: (input: {
     connectionId: string; schema: string; table: string
+    /** Relation binding from the table read — required by the server. */
+    binding: string
     /** Column -> cell. Omitted columns request DEFAULT; null is SQL NULL. */
     values: Record<string, unknown>
   }) => mutationRequest<MutationOutcome>('POST', '/table/v2/insert', input),
 
   tableUpdateV2: (input: {
     connectionId: string; schema: string; table: string
+    binding: string
     key: KeyCell[]
     version: string
     column: string
@@ -206,6 +245,7 @@ export const api = {
 
   tableDeleteV2: (input: {
     connectionId: string; schema: string; table: string
+    binding: string
     key: KeyCell[]
     version: string
   }) => mutationRequest<MutationOutcome>('POST', '/table/v2/delete', input),

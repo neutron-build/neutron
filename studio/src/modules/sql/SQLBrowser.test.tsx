@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/preact'
-import { activeConnection, schema, toasts } from '../../lib/store'
+import { activeConnection, schema, toasts, tabs } from '../../lib/store'
 import { _setSessionTokenForTests, ApiError } from '../../lib/api'
 import type { Schema, SqlTable, QueryResult, TableMeta } from '../../lib/types'
 import { SQLBrowser } from './SQLBrowser'
@@ -46,7 +46,7 @@ function result(rows: unknown[][]): QueryResult {
 }
 
 function keyedResult(rows: unknown[][], versions: string[]): QueryResult {
-  return { ...result(rows), keyColumns: ['id'], versions, versioned: true }
+  return { ...result(rows), keyColumns: ['id'], versions, versioned: true, binding: 'e1:16385' }
 }
 
 function singleKeyMeta(t: Partial<TableMeta>): TableMeta {
@@ -225,6 +225,110 @@ describe('SQLBrowser versioned identity editing (rendered flow)', () => {
     expect(tableUpdateV2).not.toHaveBeenCalled()
   })
 
+  it('mutations carry the binding reported by the table read', async () => {
+    schema.value = fullSchema([sqlTable({
+      columns: [
+        { name: 'id', type: 'int4', nullable: false, isPrimaryKey: true },
+        { name: 'body', type: 'text', nullable: true, isPrimaryKey: false },
+      ],
+    })])
+    // The server's read response carries the relation binding; every v2
+    // mutation MUST send it back or the server refuses with 400.
+    tableData.mockResolvedValue({ ...keyedResult([[1, 'hello']], ['777']), binding: 'e1:16385' })
+
+    render(<SQLBrowser schema="public" table="memo" />)
+    await waitFor(() => expect(cellAt(0, 'body').textContent).toBe('hello'))
+
+    tableUpdateV2.mockResolvedValue({ rowsAffected: 1, version: '778' })
+    fireEvent.dblClick(cellAt(0, 'body'))
+    fireEvent.input(editorInput(), { target: { value: 'world' } })
+    fireEvent.keyDown(editorInput(), { key: 'Enter' })
+
+    await waitFor(() => expect(tableUpdateV2).toHaveBeenCalledTimes(1))
+    expect(tableUpdateV2).toHaveBeenCalledWith(expect.objectContaining({
+      binding: 'e1:16385',
+    }))
+  })
+
+  it('edits to tagged columns cross as tagged wire cells, not bare text', async () => {
+    schema.value = fullSchema([sqlTable({
+      columns: [
+        { name: 'id', type: 'int4', nullable: false, isPrimaryKey: true },
+        { name: 'amount', type: 'numeric', nullable: true, isPrimaryKey: false },
+        { name: 'seen_at', type: 'timestamptz', nullable: true, isPrimaryKey: false },
+      ],
+    })])
+    tableMeta.mockResolvedValue(singleKeyMeta({
+      columns: [
+        { name: 'id', type: 'int4', tag: null, nullable: false, isKey: true, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: false, readOnlyReason: 'key column is read-only (it addresses the row)' },
+        { name: 'amount', type: 'numeric', tag: 'numeric', nullable: true, isKey: false, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: true },
+        { name: 'seen_at', type: 'timestamptz', tag: 'timestamptz', nullable: true, isKey: false, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: true },
+      ],
+    }))
+    // Decoded cells: numeric/timestamptz arrive from lib/wire as strings.
+    tableData.mockResolvedValue({
+      columns: ['id', 'amount', 'seen_at'], rows: [[1, '9.9000', '2026-01-02T03:04:05.000001Z']], rowCount: 1, duration: 0,
+      keyColumns: ['id'], versions: ['5'], versioned: true, binding: 'e1:1',
+    })
+
+    render(<SQLBrowser schema="public" table="memo" />)
+    await waitFor(() => expect(cellAt(0, 'amount').textContent).toBe('9.9000'))
+
+    tableUpdateV2.mockResolvedValue({ rowsAffected: 1, version: '6' })
+    fireEvent.dblClick(cellAt(0, 'amount'))
+    fireEvent.input(editorInput(), { target: { value: '12.3450' } })
+    fireEvent.keyDown(editorInput(), { key: 'Enter' })
+
+    await waitFor(() => expect(tableUpdateV2).toHaveBeenCalledTimes(1))
+    expect(tableUpdateV2).toHaveBeenCalledWith(expect.objectContaining({
+      column: 'amount', value: { t: 'numeric', v: '12.3450' }, isNull: false,
+    }))
+
+    // A temporal edit is likewise a tagged cell.
+    fireEvent.dblClick(cellAt(0, 'seen_at'))
+    fireEvent.input(editorInput(), { target: { value: '2026-01-02T03:04:05.000002Z' } })
+    fireEvent.keyDown(editorInput(), { key: 'Enter' })
+    await waitFor(() => expect(tableUpdateV2).toHaveBeenCalledTimes(2))
+    expect(tableUpdateV2).toHaveBeenLastCalledWith(expect.objectContaining({
+      column: 'seen_at', value: { t: 'timestamptz', v: '2026-01-02T03:04:05.000002Z' },
+    }))
+  })
+
+  it('re-tags textual key cells (numeric/temporal keys) on mutation', async () => {
+    schema.value = fullSchema([sqlTable({
+      columns: [
+        { name: 'sku', type: 'numeric', nullable: false, isPrimaryKey: true },
+        { name: 'label', type: 'text', nullable: true, isPrimaryKey: false },
+      ],
+    })])
+    tableMeta.mockResolvedValue(singleKeyMeta({
+      keyColumns: ['sku'],
+      columns: [
+        { name: 'sku', type: 'numeric', tag: 'numeric', nullable: false, isKey: true, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: false, readOnlyReason: 'key column is read-only (it addresses the row)' },
+        { name: 'label', type: 'text', tag: null, nullable: true, isKey: false, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: true },
+      ],
+    }))
+    // The read's tagged numeric cell decodes to the exact string '1.50';
+    // the mutation must send it re-tagged, or the server rejects the key.
+    tableData.mockResolvedValue({
+      columns: ['sku', 'label'], rows: [['1.50', 'hello']], rowCount: 1, duration: 0,
+      keyColumns: ['sku'], versions: ['3'], versioned: true, binding: 'e1:2',
+    })
+
+    render(<SQLBrowser schema="public" table="memo" />)
+    await waitFor(() => expect(cellAt(0, 'label').textContent).toBe('hello'))
+
+    tableUpdateV2.mockResolvedValue({ rowsAffected: 1, version: '4' })
+    fireEvent.dblClick(cellAt(0, 'label'))
+    fireEvent.input(editorInput(), { target: { value: 'renamed' } })
+    fireEvent.keyDown(editorInput(), { key: 'Enter' })
+
+    await waitFor(() => expect(tableUpdateV2).toHaveBeenCalledTimes(1))
+    expect(tableUpdateV2).toHaveBeenCalledWith(expect.objectContaining({
+      key: [{ column: 'sku', value: { t: 'numeric', v: '1.50' } }],
+    }))
+  })
+
   it('sends tagged key cells for bigint keys', async () => {
     schema.value = fullSchema([sqlTable({
       columns: [
@@ -283,7 +387,7 @@ describe('SQLBrowser read-only states are authoritative', () => {
     }))
     tableData.mockResolvedValue({
       columns: ['tenant_id', 'id', 'payload'], rows: [[1, 1, 'alpha']], rowCount: 1, duration: 0,
-      keyColumns: ['tenant_id', 'id'], versions: ['42'], versioned: true,
+      keyColumns: ['tenant_id', 'id'], versions: ['42'], versioned: true, binding: 'e1:16390',
     })
 
     render(<SQLBrowser schema="public" table="docs" />)
@@ -344,5 +448,124 @@ describe('SQLBrowser read-only states are authoritative', () => {
     render(<SQLBrowser schema="public" table="nucleus_t" />)
     await waitFor(() => expect(screen.getByRole('note').textContent).toContain('no xmin'))
     expect(screen.queryByText(/double-click a cell to edit/)).toBeNull()
+  })
+})
+
+describe('SQLBrowser S01 binding, read-level state and composite FK follow', () => {
+  function docsMeta(): TableMeta {
+    return {
+      exists: true, binding: 'e1:20', keyColumns: ['tenant_id', 'order_no'], versioned: true, readOnly: false, canDelete: true,
+      columns: [
+        { name: 'tenant_id', type: 'int4', tag: null, nullable: false, isKey: true, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: false, readOnlyReason: 'key column is read-only (it addresses the row)' },
+        { name: 'order_no', type: 'int8', tag: 'int8', nullable: false, isKey: true, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: false, readOnlyReason: 'key column is read-only (it addresses the row)' },
+        { name: 'label', type: 'text', tag: null, nullable: true, isKey: false, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: true },
+      ],
+    }
+  }
+  function ordersResult(rows: unknown[][]): QueryResult {
+    return {
+      columns: ['tenant_id', 'order_no', 'label'], rows, rowCount: rows.length, duration: 0,
+      keyColumns: ['tenant_id', 'order_no'], versions: rows.map(() => '10'), versioned: true, binding: 'e1:20',
+    }
+  }
+  function ordersSchema() {
+    schema.value = fullSchema([sqlTable({
+      name: 'orders',
+      columns: [
+        { name: 'tenant_id', type: 'int4', nullable: false, isPrimaryKey: true },
+        { name: 'order_no', type: 'int8', nullable: false, isPrimaryKey: true },
+        { name: 'label', type: 'text', nullable: true, isPrimaryKey: false },
+      ],
+    })])
+  }
+
+  it('composite FK follow opens the target filtered by the WHOLE tuple, exactly', async () => {
+    ordersSchema()
+    tableMeta.mockResolvedValue(docsMeta())
+    ;(api.tableFKs as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      fks: [{ name: 'orders_doc_fk', columns: ['tenant_id', 'order_no'], refSchema: 'public', refTable: 'docs', refColumns: ['tenant_id', 'id'], composite: true }],
+    })
+    tableData.mockResolvedValue(ordersResult([[1, 9007199254740993n, 'o1']]))
+    tabs.value = []
+
+    render(<SQLBrowser schema="public" table="orders" />)
+    await waitFor(() => expect(cellAt(0, 'label').textContent).toBe('o1'))
+    // Both tuple components render as follow links; either follows the tuple.
+    await waitFor(() => expect(cellAt(0, 'order_no').querySelector('button')).not.toBeNull())
+    expect(cellAt(0, 'order_no').textContent).toBe('9007199254740993')
+    fireEvent.click(cellAt(0, 'order_no').querySelector('button')!)
+
+    const opened = tabs.value[tabs.value.length - 1]
+    expect(opened.objectName).toBe('docs')
+    expect(opened.filter).toBeUndefined()
+    expect(opened.match).toEqual([
+      { column: 'tenant_id', value: 1 },
+      { column: 'id', value: { t: 'int8', v: '9007199254740993' } },
+    ])
+  })
+
+  it('a composite FK with a NULL component offers no follow link', async () => {
+    ordersSchema()
+    tableMeta.mockResolvedValue(docsMeta())
+    ;(api.tableFKs as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      fks: [{ name: 'fk', columns: ['tenant_id', 'label'], refSchema: 'public', refTable: 'docs', refColumns: ['tenant_id', 'payload'], composite: true }],
+    })
+    tableData.mockResolvedValue(ordersResult([[1, 5n, null]]))
+
+    render(<SQLBrowser schema="public" table="orders" />)
+    await waitFor(() => expect(cellAt(0, 'order_no').textContent).toBe('5'))
+    await new Promise(r => setTimeout(r, 0))
+    expect(cellAt(0, 'tenant_id').querySelector('button')).toBeNull()
+  })
+
+  it('an initial match (FK follow target) is passed to the read', async () => {
+    ordersSchema()
+    tableMeta.mockResolvedValue(docsMeta())
+    tableData.mockResolvedValue(ordersResult([]))
+    const match = [{ column: 'tenant_id', value: 1 }, { column: 'order_no', value: { t: 'int8', v: '2' } }]
+
+    render(<SQLBrowser schema="public" table="orders" initialMatch={match} />)
+    await waitFor(() => expect(tableData).toHaveBeenCalled())
+    expect(tableData.mock.calls[0][7]).toEqual(match)
+  })
+
+  it('a stale binding (409 binding) reloads metadata and rows, never retries the write', async () => {
+    ordersSchema()
+    tableMeta.mockResolvedValue(docsMeta())
+    tableData.mockResolvedValue(ordersResult([[1, 7n, 'o1']]))
+
+    render(<SQLBrowser schema="public" table="orders" />)
+    await waitFor(() => expect(cellAt(0, 'label').textContent).toBe('o1'))
+    const metaCalls = tableMeta.mock.calls.length
+    const dataCalls = tableData.mock.calls.length
+
+    tableUpdateV2.mockRejectedValue(new ApiError(409, 'no longer the relation these rows were read from', { state: 'binding' }))
+    fireEvent.dblClick(cellAt(0, 'label'))
+    fireEvent.input(editorInput(), { target: { value: 'x' } })
+    fireEvent.keyDown(editorInput(), { key: 'Enter' })
+
+    await waitFor(() => expect(toasts.value.some(t => t.kind === 'error' && t.message.includes('stale'))).toBe(true))
+    await waitFor(() => expect(tableMeta.mock.calls.length).toBeGreaterThan(metaCalls))
+    await waitFor(() => expect(tableData.mock.calls.length).toBeGreaterThan(dataCalls))
+    expect(tableUpdateV2).toHaveBeenCalledTimes(1)
+    expect(tableUpdateV2).toHaveBeenCalledWith(expect.objectContaining({
+      binding: 'e1:20',
+      key: [{ column: 'tenant_id', value: 1 }, { column: 'order_no', value: { t: 'int8', v: '7' } }],
+    }))
+  })
+
+  it('a read-only table read wins even if metadata says editable', async () => {
+    ordersSchema()
+    tableMeta.mockResolvedValue(docsMeta())
+    tableData.mockResolvedValue({
+      ...ordersResult([[1, 7n, 'o1']]),
+      readOnly: true, readOnlyReason: 'public.orders has key column "x" of type float8, which Studio cannot yet compare exactly',
+    })
+
+    render(<SQLBrowser schema="public" table="orders" />)
+    await waitFor(() => expect(screen.getByRole('note').textContent).toContain('cannot yet compare exactly'))
+    fireEvent.dblClick(cellAt(0, 'label'))
+    expect(document.querySelector('input.cellInput')).toBeNull()
+    expect(tableUpdateV2).not.toHaveBeenCalled()
   })
 })
