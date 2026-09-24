@@ -1,0 +1,21 @@
+-- Migration: contract orders.total_cents to NOT NULL
+--
+-- Phase 3 of expand -> backfill -> contract. The constraint can only be
+-- set once every row is populated -- the ALTER itself fails (and the run
+-- reports it honestly) while any NULL remains. Declared as a journaled
+-- step so the contract is verifiable and interruptible like the backfill
+-- it completes:
+--
+--   - verify proves the step's EFFECT (attnotnull = true), not merely its
+--     precondition -- "0 remaining NULLs" would already hold after 002 and
+--     the journal would skip the ALTER;
+--   - lock_timeout=5s: SET NOT NULL takes a brief ACCESS EXCLUSIVE lock
+--     and a full table scan; on a busy table it fails honestly after five
+--     seconds of queueing instead of blocking everything behind it.
+--
+-- A verify must always test what the step changes, never what earlier
+-- steps already proved.
+
+-- neutron:journaled
+-- neutron:step verify="SELECT attnotnull FROM pg_attribute WHERE attrelid = 'orders'::regclass AND attname = 'total_cents'" expect="true" lock_timeout=5s
+ALTER TABLE orders ALTER COLUMN total_cents SET NOT NULL;

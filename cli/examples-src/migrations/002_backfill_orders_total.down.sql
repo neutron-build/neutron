@@ -1,0 +1,11 @@
+-- Rollback: backfill orders.total_cents in bounded, resumable batches
+--
+-- IRREVERSIBLE
+--
+-- The backfill rewrote 1000 row values. Nulling them back is a DATA
+-- decision (dependent reads may have shipped against the migrated values),
+-- not structure reversal, so this file deliberately contains no SQL: the
+-- runner refuses to "roll back" through a comment stub -- it fails the
+-- downgrade loudly and tells you to forward-fix. A down that ran
+-- `UPDATE orders SET total_cents = NULL` would look reassuring while
+-- destroying exactly the state you might need to inspect.

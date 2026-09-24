@@ -207,7 +207,7 @@ export async function loader({ request }) {
 | `@neutron-build/core` | Core framework (directory: `packages/neutron`) |
 | `@neutron-build/cli` | Dev server, build, preview (directory: `packages/neutron-cli`) |
 | `create-neutron` | Project scaffolding |
-| `@neutron-build/data` | Database, cache, sessions, queues, storage |
+| `@neutron-build/data` | Drizzle interop wrapper (`@neutron-build/data/drizzle`), cache, sessions, queues, storage |
 | `@neutron-build/auth` | Auth middleware and adapters |
 | `@neutron-build/security` | CSP, CSRF, rate limiting |
 | `@neutron-build/cache-redis` | Distributed Redis/Dragonfly cache |

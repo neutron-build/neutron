@@ -142,6 +142,32 @@ Driver choice and pool tuning: `createDatabase({ url, driverOptions: { driver: "
 (`driverOptions` replaces the pre-0.1 `driver` option, which now injects an
 adapter — see below).
 
+### Runtime support (Node.js)
+
+This package runs on Node.js (`engines: ">= 20"`); the pg and postgres.js
+adapters use Node sockets. `createDatabase` and `loadDriver` detect the
+runtime positively (`process.versions.node` — never `typeof window`
+inference) and, on a runtime without Node compatibility, fail with one
+precise error before any driver import is attempted. In a bundler that
+externalizes `node:` builtins (Vite-style shims), that call-time error is
+what you get; in a runtime with hard no-Node module resolution, the import
+itself fails at `node:crypto` (used for statement ids). There is **no
+edge/browser transport adapter** — none will be advertised until one exists
+with real transport fixtures for every claimed runtime. A runtime that
+genuinely provides Node compatibility passes the guard but stays outside
+the tested matrix.
+
+### Relationship to `@neutron-build/data` (Drizzle interop)
+
+Two documented database paths exist, separately named. This package is the
+**first-party SQL path** (schema, compiler, transactions, migrations feed).
+`@neutron-build/data`'s `createDrizzleDatabase` — import it from
+`@neutron-build/data/drizzle` — is the **explicit Drizzle interop path**:
+it returns genuine drizzle-orm databases (`PostgresJsDatabase` /
+`LibSQLDatabase`, typed through your schema) for existing Drizzle users and
+for Nucleus multi-model access. See that package's README for the interop
+contract and its supported peer versions.
+
 ### Injected adapters and ownership
 
 Pass an adapter you created instead of a URL: wrap an existing `pg` pool or
@@ -273,6 +299,17 @@ and never releases a dead reservation — the terminate-mid-transaction storms
 in the live suite survive where the driver's own path crashes. The residual
 upstream behavior (a stale one-shot 57P01 after a killed reservation) is
 sequenced around, not hidden: statements never ran, so a retry is safe.
+
+One more upstream behavior, documented rather than worked around: repeated
+killed reservations can stall postgres.js's reconnect backoff. After ~7
+consecutive terminations of reserved backends, the next `reserve()` (or the
+BEGIN that follows it) can fail to settle for tens of seconds (observed
+once at ~40 s on a `max: 6` client; a 6-kill run recovered instantly). The
+stalled slot is a connection mid-reconnect inside the driver (upstream
+`closed()` → `backoff(retries)` lifecycle), not a checked-out connection:
+once the backoff expires the pool serves normally again (plain queries,
+fresh reserves) — no permanent leak, no crash, no data risk. Recovery is
+automatic; nothing here needs to intervene.
 
 ### Errors and capabilities
 

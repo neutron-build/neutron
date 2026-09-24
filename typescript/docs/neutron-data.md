@@ -21,7 +21,7 @@ available as optional driver modules with lazy dependency loading.
 
 ## Optional Driver APIs
 
-- `createDrizzleDatabase(...)` (Postgres + SQLite via Drizzle adapters)
+- `createDrizzleDatabase(...)` (Postgres + SQLite via Drizzle adapters) — typed entry: `import { createDrizzleDatabase } from "@neutron-build/data/drizzle"` (genuine `PostgresJsDatabase` / `LibSQLDatabase` result types via Postgres/SQLite overloads; the root export keeps the loose pre-I03 alias)
 - `createRedisCacheClient(...)` (Dragonfly/Redis protocol)
 - `createRedisSessionStore(...)` (session store backed by Dragonfly/Redis)
 - `createBullMqQueueDriver(...)` (BullMQ over Dragonfly/Redis)

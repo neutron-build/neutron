@@ -94,6 +94,36 @@ history row recorded after the last statement. A failure or kill mid-file
 leaves partial effects and no history row: inspect and recover explicitly
 with ` + "`neutron migrate resolve <version>`" + ` — never a silent replay.
 
+Operational migrations (concurrent indexes over big tables, bounded
+backfills, expand→backfill→contract steps) can declare the journal instead:
+a ` + "`-- neutron:journaled`" + ` line before the first statement. Every step then
+carries a verification — a built-in structural postcondition (created/
+dropped tables, indexes, types, schemas) or a declared one:
+
+  -- neutron:step verify="SELECT count(*) FROM t WHERE col IS NULL" expect="0"
+  UPDATE t SET col = 0 WHERE col IS NULL AND id <= 500;
+
+Verified effects are skipped on apply and on ` + "`migrate resolve --retry`" + ` (interrupted
+backfills resume from their data checkpoint; re-runs are idempotent), and
+` + "`resolve --mark-applied`" + ` can close a fully-verified unrecorded state. Each step
+runs with lock_timeout (default 10s) and statement_timeout (default 0 =
+unbounded) knobs — per-step overridable via lock_timeout=/statement_timeout=
+annotations, applied with SET LOCAL inside the step's transaction (session
+level around concurrent-index statements, which cannot run in one). Index
+steps verify their effect by full identity (schema+table+name, never a bare
+index name): unqualified tables resolve through the search path exactly as
+the statement itself resolves them, and a table that cannot be resolved
+REFUSES the step before execution with a demand to qualify it. A failed
+concurrent index build leaves INVALID debris: journaled index steps detect
+it and recover by DROP INDEX CONCURRENTLY + re-CREATE (REINDEX is not used:
+it is outside the migration allowlist and its own failures leave a second
+debris class), while building progress is reported from
+pg_stat_progress_create_index where available. DML without per-step
+verification stays refused in unmarked concurrent files. Down files run in
+one transaction and never carry the journal marker; a backfill that
+rewrites values must ship an IRREVERSIBLE down stub, which this runner
+refuses honestly instead of pretending to roll back.
+
 Targets PostgreSQL. Nucleus migration runners live in the language SDKs and
 remain experimental. Databases with pre-protocol histories (older CLI, or
 Go/TS SDK integer-version tables) are refused until adopted once with
@@ -314,6 +344,13 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 
 	var count int
 	for _, p := range pendings {
+		if p.Journal != nil {
+			if err := applyJournaledMigration(ctx, client, sess, p, count, len(pendings)); err != nil {
+				return err
+			}
+			count++
+			continue
+		}
 		if p.Nontransactional {
 			// One spinner stop per spinner (StopWithMessage is not
 			// re-entrant): per-statement progress is not reported while
@@ -624,12 +661,16 @@ func runMigrateDown(cmd *cobra.Command, args []string) error {
 
 // validateDownReversibility enforces the down-side limits: the down file
 // must contain executable SQL (a comment-only IRREVERSIBLE stub must not be
-// "run" to a silent history deletion), must not itself use concurrent
-// operations, and — when a plan artifact exists — must not be marked
-// irreversible by the M03 risk report.
+// "run" to a silent history deletion), must not use concurrent operations,
+// must not carry a journal marker (down runs in one transaction; per-step
+// journal semantics do not apply to it), and — when a plan artifact exists
+// — must not be marked irreversible by the M03 risk report.
 func validateDownReversibility(p pendingMigration) error {
 	if p.DownFile == nil {
 		return fmt.Errorf("aborting rollback: applied migration %s has no down migration file", p.File.Version)
+	}
+	if err := db.RefuseJournaledDown(p.DownFile.SQL); err != nil {
+		return fmt.Errorf("aborting rollback: down migration for %s: %w", p.File.Version, err)
 	}
 	executable := false
 	for _, stmt := range db.SplitSQLStatements(p.DownFile.SQL) {
