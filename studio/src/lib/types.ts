@@ -156,6 +156,10 @@ export interface QueryResult {
   /** SQL editor (S04): after a cancel, whether the backend passed the
    *  post-cancel probe and went back to the pool (false: it was discarded). */
   connectionReused?: boolean
+  /** Rows matching the read's conditions (filters + match), unpaginated. */
+  filterCount?: number
+  /** Rows in the table ignoring all conditions. */
+  totalCount?: number
 }
 
 /** One component of a full-tuple equality filter; value is a wire cell. */
@@ -321,6 +325,29 @@ export interface OutcomeResponse {
 export interface KeyedQueryResult extends QueryResult {
   keyColumns: string[]
   versions: string[]
+}
+
+// --- S03 data editor ---
+
+/** One staged cell value: an explicit value (editable text), SQL NULL, or
+ *  DEFAULT (insert only — an omitted column). The three never coerce into
+ *  each other; the wire discipline is the S01 contract. */
+export type CellEdit =
+  | { kind: 'value'; text: string }
+  | { kind: 'null' }
+  | { kind: 'default' }
+
+/** One ANDed filter component of a multi-filter read. */
+export interface TableFilter {
+  column: string
+  op: string
+  value?: string
+}
+
+/** One key of a multi-sort read; earlier entries take precedence. */
+export interface TableSort {
+  column: string
+  dir: 'asc' | 'desc'
 }
 
 // --- Tab types ---

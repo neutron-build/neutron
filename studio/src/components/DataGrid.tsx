@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks'
-import type { QueryResult, TableMetaColumn } from '../lib/types'
+import type { CellEdit, QueryResult, TableMetaColumn, TableSort } from '../lib/types'
 import { formatCell } from '../lib/wire'
+import { TypedEditor } from './TypedEditor'
 import s from './DataGrid.module.css'
 
 export interface FKTarget {
@@ -17,56 +18,101 @@ function fkLocalColumns(fk: FKTarget, fallback: string): string[] {
   return fk.columns && fk.columns.length > 0 ? fk.columns : [fallback]
 }
 
+/** One staged cell displayed over the committed value. */
+export interface StagedCell {
+  editId: string
+  edit: CellEdit
+}
+
+/** A row's staged state: cell updates keyed by column, plus a staged delete. */
+export interface StagedRowState {
+  updates: Record<string, StagedCell>
+  deleteId?: string
+}
+
+export function stagedCellText(edit: CellEdit): string {
+  if (edit.kind === 'null') return 'NULL'
+  if (edit.kind === 'default') return 'DEFAULT'
+  return edit.text
+}
+
 interface DataGridProps {
   result: QueryResult
   /** Authoritative column metadata; columns that are not editable are rendered read-only. */
   columns?: TableMetaColumn[]
-  /** Commit an edit; value === null means SQL NULL, '' means empty string. */
-  onCommitEdit?: (rowIndex: number, column: string, value: string | null) => void
+  /** Stage a cell edit (S03): edits join the atomic draft, never auto-commit.
+   *  The parent addresses the row by its full-key identity at stage time. */
+  onStageUpdate?: (rowIndex: number, column: string, edit: CellEdit) => void
+  /** Stage a row delete. */
+  onStageDelete?: (rowIndex: number) => void
+  /** Whether the server reports DELETE privilege for this table. */
+  canDelete?: boolean
+  /** Staged state per row index: overlay + disabled re-delete. */
+  stagedRows?: Map<number, StagedRowState>
   /** FK columns by name; enables follow links. */
   fkColumns?: Record<string, FKTarget>
   /** Follow a reference; the whole FK tuple is read from the given row. */
   onFollowFK?: (fk: FKTarget, rowIndex: number) => void
-  sortColumn?: string | null
-  sortDir?: 'asc' | 'desc'
-  onSort?: (column: string) => void
+  /** Ordered multi-sort keys; header clicks rebuild this list. */
+  sorts?: TableSort[]
+  /** plain click: replace the sort with this column (asc -> desc -> off);
+   *  shift-click: toggle the column inside the multi-sort list. */
+  onSort?: (column: string, additive: boolean) => void
+  /** Stable row key strings (data attributes + focus targets). */
+  rowKeys?: string[]
+  /** Row/cell the parent wants focused after a failed commit. The parent
+   *  clears it (the highlight lingers for the user); the grid only focuses. */
+  focusCell?: { rowIndex: number; column?: string } | null
 }
 
 interface EditState {
   row: number
   col: string
-  draft: string
-  initialText: string
-  initialIsNull: boolean
-  setNull: boolean
+  edit: CellEdit
+  initial: CellEdit
+}
+
+function sameEdit(a: CellEdit, b: CellEdit): boolean {
+  if (a.kind !== b.kind) return false
+  if (a.kind === 'value' && b.kind === 'value') return a.text === b.text
+  return true
 }
 
 export function DataGrid({
   result,
   columns,
-  onCommitEdit,
+  onStageUpdate,
+  onStageDelete,
+  canDelete,
+  stagedRows,
   fkColumns,
   onFollowFK,
-  sortColumn,
-  sortDir,
+  sorts,
   onSort,
+  rowKeys,
+  focusCell,
 }: DataGridProps) {
   const [edit, setEdit] = useState<EditState | null>(null)
-  const inputRef = useRef<HTMLInputElement>(null)
-  const nullRef = useRef<HTMLInputElement>(null)
+  const rowRefs = useRef<Map<number, HTMLTableRowElement>>(new Map())
 
+  // Error focus (S03): land on the first offending row/cell after a failed
+  // commit so the cause is on screen. The parent clears focusCell (the
+  // highlight lingers); each new focus object re-triggers the focus.
   useEffect(() => {
-    if (edit && !edit.setNull && inputRef.current) {
-      inputRef.current.focus()
-      inputRef.current.select()
+    if (!focusCell) return
+    const tr = rowRefs.current.get(focusCell.rowIndex)
+    if (tr) {
+      tr.focus()
+      tr.scrollIntoView({ block: 'nearest' })
     }
-  }, [edit])
+  }, [focusCell])
 
   if (result.error) {
     return <div class={s.error}>{result.error}</div>
   }
 
-  const editable = columns !== undefined && typeof onCommitEdit === 'function'
+  const editable = columns !== undefined && typeof onStageUpdate === 'function'
+  const deletable = typeof onStageDelete === 'function' && canDelete !== false
 
   const metaByCol = new Map((columns ?? []).map(c => [c.name, c]))
 
@@ -79,40 +125,61 @@ export function DataGrid({
     return meta.editable
   }
 
+  function nextEditableColumn(fromCol: string): string | null {
+    if (!columns) return null
+    const order = result.columns
+    const start = order.indexOf(fromCol)
+    for (let i = start + 1; i < order.length; i++) {
+      if (cellEditable(order[i])) return order[i]
+    }
+    return null
+  }
+
   function commitEdit() {
-    if (!edit || !onCommitEdit) return
-    if (edit.setNull) {
-      if (edit.initialIsNull) {
-        setEdit(null)
-        return
-      }
-      onCommitEdit(edit.row, edit.col, null)
-    } else {
-      if (!edit.initialIsNull && edit.draft === edit.initialText) {
-        setEdit(null)
-        return
-      }
-      // Empty input is a real empty string — SQL NULL requires the explicit
-      // NULL control. The two are never silently converted into each other.
-      onCommitEdit(edit.row, edit.col, edit.draft)
+    if (!edit || !onStageUpdate) return
+    if (!sameEdit(edit.edit, edit.initial)) {
+      onStageUpdate(edit.row, edit.col, edit.edit)
     }
     setEdit(null)
   }
 
-  function handleKey(e: KeyboardEvent) {
-    if (e.key === 'Enter') {
-      e.preventDefault()
-      commitEdit()
-    } else if (e.key === 'Escape') {
-      e.preventDefault()
-      setEdit(null)
+  function commitEditAndTab() {
+    if (!edit || !onStageUpdate) return
+    if (!sameEdit(edit.edit, edit.initial)) {
+      onStageUpdate(edit.row, edit.col, edit.edit)
     }
+    const next = nextEditableColumn(edit.col)
+    if (next === null) {
+      setEdit(null)
+      return
+    }
+    const idx = result.columns.indexOf(next)
+    const cell = (result.rows[edit.row] as unknown[] | undefined)?.[idx]
+    const isNull = cell === null || cell === undefined
+    const staged = stagedRows?.get(edit.row)?.updates[next]
+    const initial: CellEdit = staged
+      ? staged.edit
+      : isNull ? { kind: 'null' } : { kind: 'value', text: formatCell(cell) }
+    setEdit({ row: edit.row, col: next, edit: initial, initial })
   }
 
-  function handleBlur(e: FocusEvent) {
-    // Clicking/tabbing into the NULL control must not commit the editor.
-    if (e.relatedTarget === nullRef.current) return
-    commitEdit()
+  function openEditor(rowIdx: number, col: string) {
+    if (!cellEditable(col)) return
+    const idx = result.columns.indexOf(col)
+    const cell = (result.rows[rowIdx] as unknown[] | undefined)?.[idx]
+    const isNull = cell === null || cell === undefined
+    const staged = stagedRows?.get(rowIdx)?.updates[col]
+    const initial: CellEdit = staged
+      ? staged.edit
+      : isNull ? { kind: 'null' } : { kind: 'value', text: formatCell(cell) }
+    setEdit({ row: rowIdx, col, edit: initial, initial })
+  }
+
+  function sortMark(col: string): string | null {
+    if (!sorts) return null
+    const i = sorts.findIndex(k => k.column === col)
+    if (i < 0) return null
+    return `${sorts[i].dir === 'desc' ? '↓' : '↑'}${sorts.length > 1 ? i + 1 : ''}`
   }
 
   function renderCell(rowIdx: number, colIdx: number) {
@@ -120,32 +187,30 @@ export function DataGrid({
     const val = (result.rows[rowIdx] as unknown[] | undefined)?.[colIdx]
 
     if (edit && edit.row === rowIdx && edit.col === col) {
+      const meta = metaByCol.get(col)
       return (
-        <span class={s.cellEditor}>
-          <input
-            ref={inputRef}
-            class={s.cellInput}
-            value={edit.draft}
-            disabled={edit.setNull}
-            onInput={e => { if (edit) setEdit({ ...edit, draft: (e.target as HTMLInputElement).value }) }}
-            onKeyDown={handleKey}
-            onBlur={handleBlur}
-            title="Enter to save, Esc to cancel; empty stays an empty string"
-          />
-          <label
-            class={s.nullToggle}
-            title="Set SQL NULL (empty text stays an empty string)"
-            onMouseDown={e => e.preventDefault()}
-          >
-            <input
-              ref={nullRef}
-              type="checkbox"
-              checked={edit.setNull}
-              onKeyDown={e => { if (e.key === 'Escape') { e.preventDefault(); setEdit(null) } else if (e.key === 'Enter') { e.preventDefault(); commitEdit() } }}
-              onChange={e => { if (edit) setEdit({ ...edit, setNull: (e.target as HTMLInputElement).checked }) }}
-            />
-            NULL
-          </label>
+        <TypedEditor
+          column={meta ?? { name: col, type: 'text', tag: null, nullable: true, isKey: false, generated: false, identity: false, hasDefault: false, autoAssigned: false, editable: true }}
+          mode="update"
+          edit={edit.edit}
+          autoFocus
+          commitOnBlur
+          onChange={next => { if (edit) setEdit({ ...edit, edit: next }) }}
+          onCommit={commitEdit}
+          onCancel={() => setEdit(null)}
+          onTab={commitEditAndTab}
+        />
+      )
+    }
+
+    const stagedCell = stagedRows?.get(rowIdx)?.updates[col]
+    if (stagedCell) {
+      return (
+        <span
+          class={s.stagedCell}
+          title={`staged (not committed): ${stagedCellText(stagedCell.edit)} — was ${val === null || val === undefined ? 'NULL' : formatCell(val)}`}
+        >
+          {stagedCellText(stagedCell.edit)}
         </span>
       )
     }
@@ -173,7 +238,7 @@ export function DataGrid({
 
     if (val === null) {
       return cellEditable(col) ? (
-        <button class={s.nullBtn} title="Set value" onClick={() => setEdit({ row: rowIdx, col, draft: '', initialText: '', initialIsNull: true, setNull: true })}>
+        <button class={s.nullBtn} title="Set value" onClick={() => openEditor(rowIdx, col)}>
           <span class={s.null}>NULL</span>
         </button>
       ) : (
@@ -190,67 +255,80 @@ export function DataGrid({
         <table class={s.table}>
           <thead>
             <tr>
+              {deletable && <th class={`${s.th} ${s.thAction}`} scope="col"> </th>}
               {result.columns.map((col) => {
                 const meta = metaByCol.get(col)
                 const isPk = meta?.isKey ?? false
-                const isSorted = sortColumn === col
+                const mark = sortMark(col)
                 return (
                   <th
                     key={col}
                     class={`${s.th}${isPk ? ` ${s.thPk}` : ''}${onSort ? ` ${s.thSortable}` : ''}`}
-                    onClick={onSort ? () => onSort(col) : undefined}
-                    title={onSort ? 'Click to sort' : undefined}
+                    onClick={onSort ? (e => onSort(col, e.shiftKey)) : undefined}
+                    title={onSort ? 'Click to sort by this column (asc → desc → off); Shift+click to add it to a multi-column sort' : undefined}
                   >
                     {isPk && <span class={s.pkHeader} title="Primary key">PK </span>}
                     {col}
-                    {isSorted && <span class={s.sortMark}> {sortDir === 'desc' ? '↓' : '↑'}</span>}
+                    {mark && <span class={s.sortMark}> {mark}</span>}
                     {fkColumns?.[col] && <span class={s.fkMark} title={`References ${fkColumns[col].refTable}.${(fkColumns[col].refColumns ?? [fkColumns[col].refColumn]).filter(Boolean).join(', ')}`}> FK</span>}
-                                      </th>
+                  </th>
                 )
               })}
             </tr>
           </thead>
           <tbody>
-            {result.rows.map((row, rowIdx) => (
-              <tr key={rowIdx} class={s.tr}>
-                {result.columns.map((col, colIdx) => {
-                  const meta = metaByCol.get(col)
-                  const readOnlyTitle = editable && meta && !meta.editable
-                    ? (meta.readOnlyReason ?? 'read-only')
-                    : undefined
-                  return (
-                    <td
-                      key={col}
-                      class={s.td}
-                      onDblClick={
-                        cellEditable(col)
-                          ? () => {
-                              const cell = (row as unknown[])[colIdx]
-                              const isNull = cell === null || cell === undefined
-                              setEdit({
-                                row: rowIdx,
-                                col,
-                                draft: isNull ? '' : formatCell(cell),
-                                initialText: isNull ? '' : formatCell(cell),
-                                initialIsNull: isNull,
-                                setNull: isNull,
-                              })
-                            }
-                          : undefined
-                      }
-                      title={readOnlyTitle}
-                    >
-                      {renderCell(rowIdx, colIdx)}
+            {result.rows.map((_row, rowIdx) => {
+              const stagedRow = stagedRows?.get(rowIdx)
+              const rowDeleted = stagedRow?.deleteId !== undefined
+              const focused = focusCell?.rowIndex === rowIdx
+              return (
+                <tr
+                  key={rowKeys?.[rowIdx] ?? rowIdx}
+                  ref={el => {
+                    if (el) rowRefs.current.set(rowIdx, el)
+                    else rowRefs.current.delete(rowIdx)
+                  }}
+                  class={`${s.tr}${rowDeleted ? ` ${s.trStagedDelete}` : ''}${focused ? ` ${s.trFocus}` : ''}`}
+                  data-row-index={rowIdx}
+                  data-row-key={rowKeys?.[rowIdx]}
+                  tabIndex={-1}
+                >
+                  {deletable && (
+                    <td class={s.tdAction}>
+                      <button
+                        class={s.deleteBtn}
+                        disabled={rowDeleted}
+                        title={rowDeleted ? 'Delete staged — commit or discard it below' : 'Stage row delete'}
+                        aria-label={`Stage delete row ${rowIdx + 1}`}
+                        onClick={() => onStageDelete?.(rowIdx)}
+                      >×</button>
                     </td>
-                  )
-                })}
-              </tr>
-            ))}
+                  )}
+                  {result.columns.map((col, colIdx) => {
+                    const meta = metaByCol.get(col)
+                    const readOnlyTitle = editable && meta && !meta.editable
+                      ? (meta.readOnlyReason ?? 'read-only')
+                      : undefined
+                    const cellFocused = focused && focusCell?.column === col
+                    return (
+                      <td
+                        key={col}
+                        class={`${s.td}${cellFocused ? ` ${s.tdFocus}` : ''}`}
+                        onDblClick={cellEditable(col) ? () => openEditor(rowIdx, col) : undefined}
+                        title={readOnlyTitle}
+                      >
+                        {renderCell(rowIdx, colIdx)}
+                      </td>
+                    )
+                  })}
+                </tr>
+              )
+            })}
           </tbody>
         </table>
       </div>
       {editable && (
-        <div class={s.editHint}>double-click a cell to edit — Enter saves, Esc cancels; check NULL for SQL NULL, empty text stays an empty string</div>
+        <div class={s.editHint}>double-click a cell to stage an edit — Enter or Tab saves, Esc cancels; NULL is explicit (empty text stays an empty string); staged edits commit as one atomic batch below</div>
       )}
     </div>
   )

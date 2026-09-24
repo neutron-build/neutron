@@ -67,8 +67,45 @@ commits and deduplicate like any other). Reverts are refused honestly
 (`409 state "irreversible"`) where the inverse cannot be exact: identity
 or serial keys that cannot be re-supplied, generated columns, values that
 cannot round-trip the wire, or FK cascade/set-null/set-default side
-effects the inverse does not capture. A batch is reversible only when
-every operation is.
+effects the inverse does not capture — including side effects that first
+appear BETWEEN commit and revert (rows that started referencing the
+committed value after the commit): the revert aborts with nothing
+applied. A batch is reversible only when every operation is.
+
+## The data editor (S03)
+
+Table views edit by STAGING: a cell edit, a row delete or a typed insert
+joins the local draft (the commit bar) instead of writing immediately;
+`Preview` dry-runs the whole draft, `Commit` sends it as ONE atomic batch
+under the S02 protocol, `Revert commit` undoes the last batch server-side.
+A failed commit keeps the draft staged and focuses the first offending
+row in its grid — the batch error names `operations[N]` and the Nth
+staged edit is pinned.
+
+Staged drafts are addressed by the full-key row identity captured at read
+time, never by row position: paging, re-sorting and re-filtering move
+rows without detaching (or re-attaching to the wrong row) — a draft whose
+row left the current page simply stays staged. Staged values render
+highlighted over the committed cell until commit or discard.
+
+Every editor is typed from the server's catalog metadata: booleans edit
+as true/false, JSON as validated JSON text, and bigint/numeric/temporal
+values as their canonical text re-tagged on the wire (digits never cross
+through a JavaScript number). Each column carries an explicit three-way
+value state — a value (empty text is a real empty string), SQL `NULL`,
+and, on insert, `DEFAULT` (omit the column). Composite foreign keys
+navigate by the whole tuple (any component's link opens the referenced
+row filtered on all of them).
+
+Reads support multiple ANDed filters and ordered multi-column sorts
+(`GET /api/table?filters=[...]&sorts=[...]`, at most 8 and 4; unknown
+columns are refused with 400) and separate the row counts: `rowCount` is
+the fetched page, `filterCount` applies the read's conditions,
+`totalCount` applies none. Connection switching never carries a draft: a
+view bound to another connection refuses to stage, the commit bar refuses
+to commit another connection's edits, and the server independently
+re-refuses any operation whose relation binding was not read through the
+request's connection.
 
 ## Development
 

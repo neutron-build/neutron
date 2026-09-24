@@ -1396,6 +1396,41 @@ func (s *Server) handleTableRevertV2(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, out)
 		return
 	}
+	// runCommitOps re-probed FK side effects for every inverse update/delete
+	// INSIDE this transaction (execs[i].fkSide/fkErr). Between the commit and
+	// this revert a child row may have started honoring a cascade/set-null/
+	// set-default rule against the committed value; applying the inverse
+	// would change that child silently. Abort before Commit: the deferred
+	// Rollback discards everything, and the refusal explains what to repair
+	// (S02 review F1).
+	for i := range execs {
+		if execs[i].fkErr != nil {
+			out := map[string]any{
+				"state": "irreversible",
+				"error": fmt.Sprintf(
+					"operations[%d]: the revert could not be verified to stay row-precise (%v); nothing was applied — repair the rows that changed after the commit",
+					i, sanitizeError(execs[i].fkErr)),
+			}
+			store.finish(revertKey, func(rec *outcomeRecord) {
+				rec.State, rec.Status, rec.Response = outcomeFailed, http.StatusConflict, out
+			})
+			writeJSON(w, http.StatusConflict, out)
+			return
+		}
+		if execs[i].fkSide {
+			out := map[string]any{
+				"state": "irreversible",
+				"error": fmt.Sprintf(
+					"operations[%d]: rows now reference the committed value through an ON DELETE/UPDATE cascade/set-null/set-default rule (they appeared after the commit); reverting would change them silently — nothing was applied",
+					i),
+			}
+			store.finish(revertKey, func(rec *outcomeRecord) {
+				rec.State, rec.Status, rec.Response = outcomeFailed, http.StatusConflict, out
+			})
+			writeJSON(w, http.StatusConflict, out)
+			return
+		}
+	}
 	if err := tx.Commit(r.Context()); err != nil {
 		log.Printf("studio: revert commit error: %v", err)
 		out := map[string]any{

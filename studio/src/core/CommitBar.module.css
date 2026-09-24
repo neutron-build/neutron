@@ -75,3 +75,52 @@
 .commit:hover {
   opacity: 0.85;
 }
+
+.changeConn {
+  color: var(--warning, #f0c674);
+  font-size: 10px;
+}
+
+.previewDetails {
+  position: relative;
+}
+
+.previewDetails summary {
+  list-style: none;
+  cursor: pointer;
+}
+
+.previewList {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  max-width: 480px;
+  max-height: 240px;
+  overflow: auto;
+  padding: var(--space-2);
+  background: var(--bg-elevated, #1e1e2e);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+}
+
+.previewOp {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.commitError {
+  max-width: 460px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 4px var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--danger, #ff6b6b);
+  border: 1px solid color-mix(in srgb, var(--danger, #ff6b6b) 45%, transparent);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--danger, #ff6b6b) 10%, transparent);
+}

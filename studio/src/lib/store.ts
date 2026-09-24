@@ -1,5 +1,5 @@
 import { signal, computed } from '@preact/signals'
-import type { Connection, Schema, NucleusFeatures, Tab, PendingChange, CommitOperation, CommitResponse, PreviewResponse, OutcomeResponse } from './types'
+import type { Connection, Schema, NucleusFeatures, Tab, PendingChange, CommitOperation, CommitResponse, PreviewResponse, OutcomeResponse, KeyCell } from './types'
 import { api, ApiError } from './api'
 
 // --- Connection state ---
@@ -160,6 +160,41 @@ export function clearStaged(connectionId?: string) {
     : stagedEdits.value.filter(e => e.connectionId !== connectionId)
 }
 
+/** Staged edits scoped to one table on one connection (S03 grid overlay). */
+export function stagedForTable(connectionId: string, schema: string, table: string): StagedEdit[] {
+  return stagedEdits.value.filter(e =>
+    e.connectionId === connectionId &&
+    e.operation.schema === schema &&
+    e.operation.table === table)
+}
+
+/** Canonical string form of a full key tuple: stable across renders, used
+ *  to address a row's staged state and error-focus targets. Values are
+ *  wire cells (tagged cells serialize deterministically). */
+export function keyStringOf(key: KeyCell[]): string {
+  return JSON.stringify(key.map(k => [k.column, k.value]))
+}
+
+// --- Error focus (S03) ---
+//
+// A failed commit pins the first offending staged edit; the data grid
+// focuses that row so the user lands on the cause, not a generic error.
+
+export interface FailedEditFocus {
+  editId: string
+  /** Decoded error message, surfaced by the bar as well. */
+  reason: string
+}
+
+export const failedEditFocus = signal<FailedEditFocus | null>(null)
+
+/** Index of the first operation named by a server batch error
+ *  ("operations[N]: ..."), or 0 — the batch is refused as a unit. */
+export function firstOffendingOpIndex(message: string): number {
+  const m = /operations\[(\d+)\]/.exec(message)
+  return m ? Number(m[1]) : 0
+}
+
 export type CommitPhase = 'idle' | 'committing' | 'committed' | 'failed'
 
 export const commitPhase = signal<CommitPhase>('idle')
@@ -186,6 +221,7 @@ export async function commitStaged(connectionId: string): Promise<CommitResponse
   }
   commitPhase.value = 'committing'
   commitError.value = null
+  failedEditFocus.value = null
   try {
     const res = await api.commitOperations(payload)
     commitPhase.value = 'committed'
@@ -193,14 +229,16 @@ export async function commitStaged(connectionId: string): Promise<CommitResponse
     clearStaged(connectionId)
     return res
   } catch (err: unknown) {
-    return await resolveFailedCommit(connectionId, operationId, err)
+    return await resolveFailedCommit(connectionId, operationId, err, edits)
   }
 }
 
 /** A commit attempt failed: either the server refused it (nothing applied —
  *  the draft stays staged), or the response was lost mid-flight and the
- *  recorded outcome decides. Unknown outcomes never auto-retry. */
-async function resolveFailedCommit(connectionId: string, operationId: string, err: unknown): Promise<CommitResponse> {
+ *  recorded outcome decides. Unknown outcomes never auto-retry. The first
+ *  offending operation pins the error focus so the grid can land the user
+ *  on the cause. */
+async function resolveFailedCommit(connectionId: string, operationId: string, err: unknown, edits: StagedEdit[]): Promise<CommitResponse> {
   const dropped = err instanceof TypeError || (err instanceof ApiError && err.state === 'unknown')
   if (dropped) {
     let outcome: OutcomeResponse | null = null
@@ -224,6 +262,10 @@ async function resolveFailedCommit(connectionId: string, operationId: string, er
   }
   commitPhase.value = 'failed'
   commitError.value = err instanceof Error ? err.message : String(err)
+  const offender = edits[firstOffendingOpIndex(commitError.value)]
+  if (offender) {
+    failedEditFocus.value = { editId: offender.id, reason: commitError.value }
+  }
   throw err
 }
 
