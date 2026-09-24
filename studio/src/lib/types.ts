@@ -141,6 +141,18 @@ export interface QueryResult {
   /** Per-row version strings (xmin) aligned with rows (table reads only). */
   versions?: string[]
   versioned?: boolean
+  /** Relation binding ("<connection epoch>:<relation oid>") the server
+   *  requires on every v2 mutation for these rows. */
+  binding?: string
+  /** Authoritative editing state of the table read (server catalog). */
+  readOnly?: boolean
+  readOnlyReason?: string
+}
+
+/** One component of a full-tuple equality filter; value is a wire cell. */
+export interface MatchCell {
+  column: string
+  value: unknown
 }
 
 // --- S01 typed row identities ---
@@ -151,9 +163,11 @@ export interface KeyCell {
   value: unknown
 }
 
-/** A row addressed by connection + schema + table + full PK tuple + version. */
+/** A row addressed by connection + relation binding + schema + table + full
+ *  PK tuple + version. */
 export interface RowIdentity {
   connectionId: string
+  binding: string
   schema: string
   table: string
   key: KeyCell[]
@@ -173,10 +187,14 @@ export interface TableMetaColumn {
   autoAssigned: boolean
   editable: boolean
   readOnlyReason?: string
+  insertable?: boolean
 }
 
 export interface TableMeta {
   exists: boolean
+  /** "<connection epoch>:<relation oid>"; mutations must present it. */
+  binding?: string
+  canDelete?: boolean
   keyColumns: string[]
   versioned: boolean
   readOnly: boolean
@@ -278,8 +296,10 @@ export interface Tab {
   // context: which object is open
   objectSchema?: string
   objectName?: string
-  /** Pre-applied SQL-browser filter (FK follow). */
+  /** Pre-applied SQL-browser filter. */
   filter?: { column: string; op: string; value: string }
+  /** Pre-applied full-tuple equality filter (FK follow, incl. composite). */
+  match?: MatchCell[]
 }
 
 // --- Pending changes ---

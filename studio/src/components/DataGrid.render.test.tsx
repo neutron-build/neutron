@@ -173,3 +173,18 @@ describe('DataGrid edit affordances come from authoritative metadata', () => {
     expect(onCommitEdit).not.toHaveBeenCalled()
   })
 })
+
+describe('DataGrid renders decoded lossless values exactly', () => {
+  it('bigint keeps every digit, bytea shows \\x hex, JSON objects show JSON text', () => {
+    const result: QueryResult = {
+      columns: ['id', 'blob', 'doc'],
+      rows: [[9223372036854775807n, new Uint8Array([0x00, 0xff, 0x10]), { a: 1 }]],
+      rowCount: 1,
+      duration: 0,
+    }
+    render(<DataGrid result={result} />)
+    expect(cellAt(0, 'id').textContent).toBe('9223372036854775807')
+    expect(cellAt(0, 'blob').textContent).toBe('\\x00ff10')
+    expect(cellAt(0, 'doc').textContent).toBe('{"a":1}')
+  })
+})
