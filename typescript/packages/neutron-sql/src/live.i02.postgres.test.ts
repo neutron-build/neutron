@@ -591,9 +591,18 @@ for (const driverKind of ["postgres", "pg"] as const) {
     const canaryPassword = `i02_pw_canary_${process.pid}`;
     const lines: string[] = [];
     const originalLog = console.log;
-    // A connection string WITH a password — trust auth ignores the value;
-    // the logger must never emit it.
+    // Connect as a throwaway login role whose real password is the canary,
+    // so the connection string carries a secret the logger must never emit
+    // and authentication succeeds whether the server uses trust or
+    // password auth.
+    const canaryRole = `i02_canary_${process.pid}_${driverKind}`;
+    await ctx.admin.query(`drop role if exists "${canaryRole}"`);
+    await ctx.admin.query(`create role "${canaryRole}" login password '${canaryPassword}'`);
+    await ctx.driver.execute(`grant usage on schema public to "${canaryRole}"`);
+    await ctx.driver.execute(`grant select, insert on "i02_notes" to "${canaryRole}"`);
+    await ctx.driver.execute(`grant usage on sequence "i02_notes_id_seq" to "${canaryRole}"`);
     const withPw = new URL(ctx.dbUrl);
+    withPw.username = canaryRole;
     withPw.password = canaryPassword;
     let canaryRaw: unknown = null;
     let db: Awaited<ReturnType<typeof createDatabase>> | null = null;
@@ -618,6 +627,8 @@ for (const driverKind of ["postgres", "pg"] as const) {
         if (driverKind === "pg") await (canaryRaw as pg.Pool).end();
         else await (canaryRaw as { end(o?: { timeout?: number }): Promise<void> }).end({ timeout: 5 });
       }
+      await ctx.driver.execute(`drop owned by "${canaryRole}"`);
+      await ctx.admin.query(`drop role if exists "${canaryRole}"`);
     }
     assert.ok(lines.length >= 3, `expected JSON lines from the default logger, got ${lines.length}`);
     const all = lines.join("\n");
