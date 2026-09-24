@@ -42,6 +42,19 @@ import {
 } from "./relations.js";
 export type { RelationalExplainPlan, RelationalStatementPlan, RelationEdgePlan };
 import {
+  compileNestedCreate,
+  compileNestedUpdate,
+  compileNestedDelete,
+  executeNestedWrite,
+  type NestedCreateInput,
+  type NestedUpdateInput,
+  type NestedDeleteInput,
+  type NestedWriteOptions,
+  type NestedWritePlan,
+  type CompiledNestedWrite,
+} from "./nested.js";
+import type { ValueNode } from "./ast.js";
+import {
   getTableName,
   getTableSchema,
   isPgTable,
@@ -49,6 +62,10 @@ import {
   rejectDerivedTable,
   type AnyColumnBuilder,
   type AnyPgTable,
+  type ColumnBuilder,
+  type InsertTypeOf,
+  type JsWriteTypeOf,
+  type UpdateTypeOf,
   type PgTable,
   type PgTableCore,
   type Relation,
@@ -205,6 +222,129 @@ type RelationEdgeValue<Rel, W, R extends RelationsInput> = Rel extends RelationM
       : never
     : never;
 
+// ---------------------------------------------------------------------------
+// Nested writes (Q06) — typed input shapes
+// ---------------------------------------------------------------------------
+
+type OneOrMany<T> = T | ReadonlyArray<T>;
+type ColumnWriteOf<C> = C extends ColumnBuilder<infer D, boolean, boolean, unknown> ? JsWriteTypeOf<D> : never;
+
+/** A unique-key selector: property keys of ONE declared unique key (the
+ *  possibly composite primary key, a unique column, or a unique index) with
+ *  non-null values. Which keys form a unique key is checked at runtime before
+ *  any SQL (the key sets are not visible to the type system). */
+export type UniqueSelector<Cols extends Record<string, AnyColumnBuilder>> = {
+  [K in keyof Cols]?: ColumnWriteOf<Cols[K]>;
+};
+
+/** Relation keys of a data object. Untyped relation maps (no relations
+ *  generic) accept any key and defer to runtime validation. */
+type RelationOpsMap<Entries extends Record<string, Relation>, R extends RelationsInput, M extends "create" | "update"> =
+  string extends keyof Entries
+    ? { [key: string]: unknown }
+    : { [K in keyof Entries]?: M extends "create" ? CreateOpsOf<Entries[K], R> : UpdateOpsOf<Entries[K], R> };
+
+/** Data for a created row: column values (every key optional at the type
+ *  level — foreign-key columns may be supplied by a relation operation, so
+ *  required-column presence is checked at runtime before any SQL) plus
+ *  relation operations. */
+export type NestedCreateData<
+  Cols extends Record<string, AnyColumnBuilder>,
+  Entries extends Record<string, Relation>,
+  R extends RelationsInput = RelationsInput,
+> = { [K in keyof Cols]?: InsertTypeOf<Cols[K]> } & RelationOpsMap<Entries, R, "create">;
+
+/** Data for an updated row: column assignments (undefined ignored, null for
+ *  nullable columns, expressions allowed like update().set()) plus relation
+ *  operations. */
+export type NestedUpdateData<
+  Cols extends Record<string, AnyColumnBuilder>,
+  Entries extends Record<string, Relation>,
+  R extends RelationsInput = RelationsInput,
+> = { [K in keyof Cols]?: UpdateTypeOf<Cols[K]> | ValueNode } & RelationOpsMap<Entries, R, "update">;
+
+type CreateOpsOf<Rel, R extends RelationsInput> = Rel extends RelationMany<infer T>
+  ? T extends PgTableCore<infer TC>
+    ? {
+        create?: OneOrMany<NestedCreateData<TC, EntriesForTarget<R, T>, R>>;
+        connect?: OneOrMany<UniqueSelector<TC>>;
+      }
+    : never
+  : Rel extends RelationOne<infer T>
+    ? T extends PgTableCore<infer TC>
+      ? {
+          create?: NestedCreateData<TC, EntriesForTarget<R, T>, R>;
+          connect?: UniqueSelector<TC>;
+        }
+      : never
+    : never;
+
+type UpdateOpsOf<Rel, R extends RelationsInput> = Rel extends RelationMany<infer T>
+  ? T extends PgTableCore<infer TC>
+    ? {
+        create?: OneOrMany<NestedCreateData<TC, EntriesForTarget<R, T>, R>>;
+        connect?: OneOrMany<UniqueSelector<TC>>;
+        update?: OneOrMany<{ where: UniqueSelector<TC>; data: NestedUpdateData<TC, EntriesForTarget<R, T>, R> }>;
+        disconnect?: OneOrMany<UniqueSelector<TC>>;
+        delete?: OneOrMany<UniqueSelector<TC>>;
+      }
+    : never
+  : Rel extends RelationOne<infer T>
+    ? T extends PgTableCore<infer TC>
+      ? {
+          create?: NestedCreateData<TC, EntriesForTarget<R, T>, R>;
+          connect?: UniqueSelector<TC>;
+          update?: NestedUpdateData<TC, EntriesForTarget<R, T>, R>;
+          disconnect?: true;
+          delete?: true;
+        }
+      : never
+    : never;
+
+export interface NestedCreateArgs<
+  Cols extends Record<string, AnyColumnBuilder>,
+  Entries extends Record<string, Relation>,
+  R extends RelationsInput = RelationsInput,
+> {
+  data: NestedCreateData<Cols, Entries, R>;
+}
+
+export interface NestedUpdateArgs<
+  Cols extends Record<string, AnyColumnBuilder>,
+  Entries extends Record<string, Relation>,
+  R extends RelationsInput = RelationsInput,
+> {
+  /** One unique key of the row to update (exactly one row must match). */
+  where: UniqueSelector<Cols>;
+  data: NestedUpdateData<Cols, Entries, R>;
+}
+
+/** Dependent-row disposition for a delete cascade (to-many edges only):
+ *  `"disconnect"` keeps the rows and nulls their foreign key (nullable FKs
+ *  only), `"delete"` removes them, `{ delete: {...} }` removes them with
+ *  dispositions for THEIR dependents. */
+type CascadeOf<Rel, R extends RelationsInput> = Rel extends RelationMany<infer T>
+  ? T extends PgTableCore
+    ? "disconnect" | "delete" | { delete: NestedCascadeSpec<EntriesForTarget<R, T>, R> }
+    : never
+  : never;
+
+/** Dispositions keyed by relation name. An edge with existing rows and no
+ *  declared disposition aborts the whole delete. */
+export type NestedCascadeSpec<Entries extends Record<string, Relation>, R extends RelationsInput = RelationsInput> = {
+  [K in keyof Entries]?: CascadeOf<Entries[K], R>;
+};
+
+export interface NestedDeleteArgs<
+  Cols extends Record<string, AnyColumnBuilder>,
+  Entries extends Record<string, Relation>,
+  R extends RelationsInput = RelationsInput,
+> {
+  /** One unique key of the row to delete (exactly one row must match). */
+  where: UniqueSelector<Cols>;
+  cascade?: NestedCascadeSpec<Entries, R>;
+}
+
 /**
  * Relational query API per table. Types are exact at every nesting depth:
  * requesting `with: { posts: { with: { comments: true } } }` types `posts`
@@ -231,6 +371,26 @@ export interface QueryApiFor<
   /** Structured pure compile plan: statements, parameters, decode plans,
    *  capability requirements and the relation edge tree. */
   explainQuery(args?: RQBArgs): RelationalExplainPlan;
+  /** Nested create (Q06): insert one row plus the relation operations in
+   *  `data`, atomically (one transaction; a savepoint inside db.transaction).
+   *  Resolves to the created row. Never retried automatically. */
+  create(args: NestedCreateArgs<Cols, Entries, R>, options?: NestedWriteOptions): Promise<InferSelectModelOfRecord<Cols>>;
+  /** Nested update (Q06) of exactly one row named by a unique key, plus the
+   *  relation operations in `data`, atomically. Resolves to the updated row. */
+  update(args: NestedUpdateArgs<Cols, Entries, R>, options?: NestedWriteOptions): Promise<InferSelectModelOfRecord<Cols>>;
+  /** Nested delete (Q06) of exactly one row named by a unique key, with
+   *  explicit dispositions for every dependent edge (`cascade`). Dependent
+   *  edges with rows and no declared disposition abort the write. Resolves
+   *  to the deleted row. Never retried automatically. */
+  delete(args: NestedDeleteArgs<Cols, Entries, R>, options?: NestedWriteOptions): Promise<InferSelectModelOfRecord<Cols>>;
+  /** Dry compilation of a nested create: every planned statement in order,
+   *  with parameters (step-output references for generated keys),
+   *  dependencies and edge ownership. Pure — no connection. */
+  explainCreate(args: NestedCreateArgs<Cols, Entries, R>): NestedWritePlan;
+  /** Dry compilation of a nested update (pure). */
+  explainUpdate(args: NestedUpdateArgs<Cols, Entries, R>): NestedWritePlan;
+  /** Dry compilation of a nested delete (pure). */
+  explainDelete(args: NestedDeleteArgs<Cols, Entries, R>): NestedWritePlan;
 }
 
 type QueryApiOf<T extends TablesInput, R extends RelationsInput> = {
@@ -316,8 +476,17 @@ type QueryApi = Record<string, {
   findFirst: (args?: RQBArgs, options?: QueryExecutionOptions) => Promise<unknown>;
   toSQL: (args?: RQBArgs) => { sql: string; params: unknown[] };
   explainQuery: (args?: RQBArgs) => RelationalExplainPlan;
+  create: (args: NestedCreateInput, options?: NestedWriteOptions) => Promise<unknown>;
+  update: (args: NestedUpdateInput, options?: NestedWriteOptions) => Promise<unknown>;
+  delete: (args: NestedDeleteInput, options?: NestedWriteOptions) => Promise<unknown>;
+  explainCreate: (args: NestedCreateInput) => NestedWritePlan;
+  explainUpdate: (args: NestedUpdateInput) => NestedWritePlan;
+  explainDelete: (args: NestedDeleteInput) => NestedWritePlan;
 }>;
 type TxScope = TransactionTxScope;
+
+/** Runs a nested-write body atomically on a transaction-scoped context. */
+type AtomicRunner = <T>(body: (context: ExecContext) => Promise<T>, isolation: NestedWriteOptions["isolation"]) => Promise<T>;
 
 export async function createDatabase<
   T extends TablesInput = TablesInput,
@@ -376,11 +545,28 @@ export async function createDatabase<
     delete: ((table: AnyPgTable) => new DeleteBuilder(context, table)) as Crud["delete"],
   });
 
-  const makeQuery = (context: ExecContext): QueryApi => {
+  const makeQuery = (context: ExecContext, atomic: AtomicRunner): QueryApi => {
     const api: QueryApi = {};
     for (const { key, table } of tables.values()) {
       const entries = relationsByTable.get(getTableName(table)) ?? {};
+      // Nested writes compile (and validate) BEFORE any connection is touched;
+      // only a valid plan opens the transaction. The compile itself runs
+      // inside an async entry so planning rejections surface as promise
+      // rejections (never synchronous throws off an await expression).
+      const nestedExec = (compiled: CompiledNestedWrite, options: NestedWriteOptions = {}): Promise<unknown> => {
+        const { isolation, ...statementOptions } = options;
+        return atomic((txContext) => executeNestedWrite(txContext, compiled, statementOptions), isolation);
+      };
       api[key] = {
+        create: async (args: NestedCreateInput, options?: NestedWriteOptions) =>
+          nestedExec(compileNestedCreate(table, args, relationsByTable), options),
+        update: async (args: NestedUpdateInput, options?: NestedWriteOptions) =>
+          nestedExec(compileNestedUpdate(table, args, relationsByTable), options),
+        delete: async (args: NestedDeleteInput, options?: NestedWriteOptions) =>
+          nestedExec(compileNestedDelete(table, args, relationsByTable), options),
+        explainCreate: (args: NestedCreateInput) => compileNestedCreate(table, args, relationsByTable).plan,
+        explainUpdate: (args: NestedUpdateInput) => compileNestedUpdate(table, args, relationsByTable).plan,
+        explainDelete: (args: NestedDeleteInput) => compileNestedDelete(table, args, relationsByTable).plan,
         findMany: (args: RQBArgs = {}, options?: QueryExecutionOptions) => findMany(context, table, entries, args, relationsByTable, options),
         findFirst: (args: RQBArgs = {}, options?: QueryExecutionOptions) => findFirst(context, table, entries, args, relationsByTable, options),
         toSQL: (args: RQBArgs = {}) => {
@@ -394,16 +580,43 @@ export async function createDatabase<
   };
 
   const crud = makeCrud(ctx);
-  const query = makeQuery(ctx);
+
+  /** Top level: a nested write opens its own transaction (the shared I02
+   *  runner on a pinned connection; the adapter's begin() for custom
+   *  adapters). Never retried — a failure or an ambiguous commit surfaces
+   *  unchanged. */
+  const topLevelAtomic: AtomicRunner = async (body, isolation) => {
+    const modes: TransactionModes = isolation === undefined ? {} : { isolation };
+    renderBeginSql(modes);
+    if (typeof driver.pin !== "function") {
+      if (isolation !== undefined) {
+        throw new NeutronSqlError("nested write isolation requires a pinnable adapter (Driver.pin) — the injected custom adapter does not provide one");
+      }
+      return driver.begin((txDriver) => body({ driver: txDriver, logger, capabilities }));
+    }
+    const hooks = { onEvent: (event: SqlEvent) => logger?.(event) };
+    return runTransaction(await driver.pin(), (scope) => body({ driver: scope, logger, capabilities }), modes, hooks);
+  };
+  const query = makeQuery(ctx, topLevelAtomic);
 
   /** Adapt a driver-level transaction scope into the full database-shaped
    *  tx scope (CRUD + relational queries pinned to the transaction's
    *  connection, nested savepoint transactions, explicit savepoints). */
   const adaptScope = (scope: TransactionScope): TxScope => {
     const txCtx: ExecContext = { driver: scope, logger, capabilities };
+    // Inside a transaction a nested write runs in its own SAVEPOINT: a failed
+    // graph rolls back to it and the outer transaction stays usable.
+    const savepointAtomic: AtomicRunner = (body, isolation) => {
+      if (isolation !== undefined) {
+        return Promise.reject(
+          new NeutronSqlError("nested write isolation is a property of the outer BEGIN — pass it to db.transaction(fn, options); inside a transaction the write runs in a savepoint"),
+        );
+      }
+      return scope.transaction((inner) => body({ driver: inner, logger, capabilities }));
+    };
     return {
       ...makeCrud(txCtx),
-      query: makeQuery(txCtx),
+      query: makeQuery(txCtx, savepointAtomic),
       // Nested transaction: a real SAVEPOINT on the same connection. Modes
       // are properties of the outer BEGIN — a JS caller passing an options
       // argument (reachable only without types; the declared surface takes
@@ -425,9 +638,15 @@ export async function createDatabase<
    *  through their begin(), without savepoints or transaction options. */
   const legacyScope = (txDriver: Driver): TxScope => {
     const txCtx: ExecContext = { driver: txDriver, logger, capabilities };
+    const noSavepoints: AtomicRunner = () =>
+      Promise.reject(
+        new NeutronSqlError(
+          "nested writes inside a transaction need savepoints to stay atomic (a failed graph must not leave partial work in your transaction) — this custom adapter has no Driver.pin; run the nested write outside db.transaction or use a bundled adapter",
+        ),
+      );
     return {
       ...makeCrud(txCtx),
-      query: makeQuery(txCtx),
+      query: makeQuery(txCtx, noSavepoints),
       transaction: async <Tx>(_fn: (tx: TxScope) => Promise<Tx>): Promise<Tx> => {
         throw new NeutronSqlError("nested transactions (savepoints) require a pinnable adapter (Driver.pin) — this custom adapter's begin() scope does not expose them");
       },

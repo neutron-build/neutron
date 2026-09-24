@@ -916,6 +916,93 @@ own path-derived alias (`__rel_posts`, `__rel_posts__comments`, …).
   `createDatabase` time — child ordering would be undefined. Empty `columns`
   arrays and non-array `columns` values are rejected at every level.
 
+## Nested writes (Q06)
+
+`db.query.<table>.create({ data })` / `.update({ where, data })` /
+`.delete({ where, cascade? })` write a whole relation graph in **one
+transaction** — a savepoint when called inside `db.transaction` (a failed
+graph rolls back to the savepoint; the outer transaction stays usable).
+Every operation declares what it does to each relation edge; nothing is
+inferred:
+
+| Edge op (to-one, this table holds the FK) | Effect |
+|---|---|
+| `create` | make the target row first, then write this row's FK from it |
+| `connect: { unique key }` | link an existing row (a lookup SELECT binds its keys) |
+| `disconnect: true` | NULL this row's FK — rejected at plan time when the FK is NOT NULL |
+| `update: { ... }` | mutate the currently connected target row |
+| `delete: true` | NULL this row's FK, then delete the target row |
+
+On to-many edges (the target holds the FK) the same vocabulary addresses
+*children*: `create` makes linked children, `connect` **adopts** existing
+rows (an UPDATE whose affected-row count enforces exactly-one), and
+`update`/`disconnect`/`delete` take arrays of `{ where: <unique key>, … }`
+entries, each scoped to rows currently connected to this parent.
+
+- **Ownership is explicit per edge and derived from the schema.** A `one()`
+  relation's declaring table owns the edge (its `fields` are the FK); a
+  `many()` relation is owned by the target through the paired `one()`. A
+  column assigned twice — by data and by an edge, or by two edges — is a
+  plan-time error naming both claimants. Two references to one target
+  (`author` + `reviewer`, `created_by` + `updated_by`) are independent
+  edges and never collide.
+- **Selectors are unique keys.** `connect`, edge-op `where` entries and
+  top-level `where`/`cascade` keys must name exactly one declared unique
+  key — the (possibly composite) primary key, a unique column, or a unique
+  index. Key-set mismatches, unknown keys and NULL values are rejected
+  before any SQL, listing the usable keys. Composite keys zip positionally
+  (the reversed declaration order works). Cardinality is enforced by the
+  database, not trusted from metadata: a lookup (or adopt UPDATE) matching
+  zero rows fails `not-found`, more than one fails `cardinality` — a
+  `NestedWriteError` whose `step`, `path`, `op` and `rowCount` name the
+  exact statement.
+- **One statement per row, final at plan time.** Planning is pure — SQL
+  text is complete before any connection is touched, and values that only
+  exist after an earlier statement ran (generated keys) appear in the dry
+  plan as `{ kind: "step-output", step, key }` references. Every row write
+  affects or returns **exactly one row** (zero or several rolls the whole
+  graph back); keys are captured in exact wire forms and re-bound through
+  the consuming column's codec (an int8 parent key never becomes a JS
+  Number).
+- **Dry compilation exposes every planned statement.**
+  `explainCreate` / `explainUpdate` / `explainDelete` return the full plan
+  — statement count, ordered steps with SQL/params/dependencies/edge
+  ownership, capability requirements — without executing anything. The
+  executed statement sequence is exactly the plan's.
+- **Cycles: preallocated keys or a clear rejection.** A `connect` naming a
+  row the same write creates is recognized only through explicit unique
+  values (preallocated keys) — the planner orders the statements and never
+  emits a lookup. A reference cycle is executable when one inserted row's
+  owned FK is nullable: that edge is written NULL and completed by a
+  follow-up link UPDATE (`deferredLinks` counts them). Otherwise the whole
+  write is rejected before any SQL, naming the cycle and the way out.
+  Serial ids cannot be preallocated — connect-by-id to an in-flight row is
+  a plain lookup that fails `not-found`.
+- **Delete dispositions own every dependent edge.** A root delete scans
+  every declared to-many edge of the deleted row (and, per disposition, of
+  its dependents, recursively): `cascade: { posts: "disconnect" |
+  "delete" | { delete: { comments: "delete" } } }`. Dependent rows with no
+  declared disposition abort the write (`undeclared-dependents`) — nothing
+  is silently dropped or cascaded. Scans and mutations are
+  predicate-driven (correlated `exists` chains with distinct
+  compiler-generated aliases; self-edges and A→B→A chains never shadow),
+  so the statement count is independent of row counts; each mutation's
+  affected-row count must equal its scan (`row-set-changed` aborts the
+  write if the set moved under it). The deletion root is excluded from its
+  own dependents scans, so data cycles through the root (mutual managers)
+  disconnect the survivor instead of double-counting the root. Undeclared
+  database FKs without a relation are not scanned — the engine's own
+  constraint aborts the delete, which is honest but unattributed.
+- **No implicit retries, ever.** A nested write runs one transaction with
+  no callbacks and no external side effects between statements; failures
+  (including late constraint violations) and commit-ambiguity surface
+  unchanged. Whole-transaction retry remains the caller's explicit opt-in
+  at `db.transaction` level. `NestedWriteOptions` carries
+  `deadlineMs`/`signal` (per statement) and an `isolation` that applies
+  only to a top-level write's own BEGIN (inside `db.transaction` it is a
+  savepoint — passing it there is an error pointing at
+  `db.transaction(fn, options)`).
+
 ## Tests
 
 - `pnpm test` builds, type-checks the consumer type fixture against the packed
