@@ -118,6 +118,56 @@ const REGISTRY: Readonly<Record<string, CapabilitySpec>> = {
     description: "DECLARE ... NO SCROLL CURSOR / FETCH FORWARD n / CLOSE inside a transaction (NO SCROLL: PostgreSQL 7.4 release notes)",
     postgresSince: [7, 4],
   },
+  // X01 rules. The vector family is EXTENSION-PROVIDED, so no PostgreSQL
+  // version fact can ever prove it: even the newest release lacks the
+  // operators until the pgvector extension is installed in the database.
+  // Resolution is therefore probe-only, and the probes are self-testing:
+  // each fails with a server error (42704 unknown type / 42883 unknown
+  // function) exactly when the capability is absent, on every engine —
+  // including Nucleus, whose vector MODEL is a different surface with no
+  // proven SQL-column semantics (X00 capability report records none).
+  // Extension presence/version as a SEPARATE concern (pg_extension /
+  // pg_available_extensions) is exposed by the /pgvector module's
+  // pgvectorExtension(), not by this registry.
+  "vector-type": {
+    description: "the pgvector `vector` column type (extension-provided)",
+    probeSql: "select '[1]'::vector as v",
+  },
+  "vector-operator-l2": {
+    description: "pgvector L2 distance operator <-> (vector_l2_ops semantics)",
+    probeSql: "select ('[1]'::vector <-> '[2]'::vector) as d",
+  },
+  "vector-operator-inner-product": {
+    description: "pgvector negative inner product operator <#> (vector_ip_ops semantics)",
+    probeSql: "select ('[1]'::vector <#> '[2]'::vector) as d",
+  },
+  "vector-operator-cosine": {
+    description: "pgvector cosine distance operator <=> (vector_cosine_ops semantics)",
+    probeSql: "select ('[1]'::vector <=> '[2]'::vector) as d",
+  },
+  "vector-operator-l1": {
+    description: "pgvector L1 distance operator <+> (pgvector 0.7.0+)",
+    probeSql: "select ('[1]'::vector <+> '[2]'::vector) as d",
+  },
+  // X01: core full-text search. Integrated into PostgreSQL in 8.3 (the
+  // pre-8.3 tsearch2 contrib module is a different API); websearch_to_tsquery
+  // arrived in 11. Probes verify SEMANTICS with a positive AND a negative
+  // control (the 1/0 arm fires when either is wrong): a parse-only probe
+  // would certify engines that accept the syntax and always answer yes —
+  // observed on Nucleus 1.0.2, whose to_tsvector returns a constant and
+  // whose @@ is true for any non-match (recorded in the X01 Nucleus leg
+  // evidence). Match must hold for a present word and fail for an absent
+  // one; ts_rank must be positive on the match.
+  "fts-functions": {
+    description: "to_tsvector / to_tsquery / plainto_tsquery / ts_rank / @@ match (PostgreSQL 8.3 release notes)",
+    postgresSince: [8, 3],
+    probeSql: "select case when to_tsvector('english', 'quick brown fox') @@ plainto_tsquery('english', 'fox') and not (to_tsvector('english', 'quick brown fox') @@ plainto_tsquery('english', 'zebra')) and ts_rank(to_tsvector('english', 'quick brown fox'), plainto_tsquery('english', 'fox')) > 0 then 1 else 1/0 end",
+  },
+  "fts-websearch-tsquery": {
+    description: "websearch_to_tsquery (PostgreSQL 11 release notes)",
+    postgresSince: [11, 0],
+    probeSql: "select case when websearch_to_tsquery('english', 'neutron \"exact phrase\"') @@ to_tsvector('english', 'neutron exact phrase') and not (websearch_to_tsquery('english', 'neutron -zebra') @@ to_tsvector('english', 'neutron zebra')) then 1 else 1/0 end",
+  },
 };
 
 function compareVersion(version: string, since: readonly [number, number]): number | null {

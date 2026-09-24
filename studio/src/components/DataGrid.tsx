@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks'
 import type { CellEdit, QueryResult, TableMetaColumn, TableSort } from '../lib/types'
 import { formatCell } from '../lib/wire'
+import { toast } from '../lib/store'
 import { TypedEditor } from './TypedEditor'
 import s from './DataGrid.module.css'
 
@@ -246,6 +247,28 @@ export function DataGrid({
       )
     }
     if (val === undefined) return <span class={s.null}>—</span>
+    // X01: vectors and tsvectors are not row-editable values — read-only
+    // render of the exact text form with a copy affordance.
+    const tag = metaByCol.get(col)?.tag
+    if (tag === 'vector' || tag === 'tsvector') {
+      const text = formatCell(val)
+      return (
+        <span class={s.vectorCell}>
+          <span class={s.vectorText} title={text}>{text}</span>
+          <button
+            class={s.copyBtn}
+            title={`Copy ${tag} value`}
+            aria-label={`Copy ${tag} value`}
+            onClick={() => {
+              void navigator.clipboard?.writeText(text).then(
+                () => toast('info', `${tag} value copied`),
+                () => toast('error', 'copy failed'),
+              )
+            }}
+          >⧉</button>
+        </span>
+      )
+    }
     return formatCell(val)
   }
 

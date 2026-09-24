@@ -56,6 +56,10 @@ export interface TrustedNode {
 export interface FragmentNode {
   readonly kind: "fragment";
   readonly parts: readonly FragmentPart[];
+  /** Engine capabilities this fragment requires (X01). Populated only by
+   *  `withRequirements` — trusted, module-authored metadata collected at
+   *  plan time so unsupported engines fail closed before any SQL runs. */
+  readonly requires?: readonly string[];
 }
 
 export type FragmentPart = string | ValueNode;
@@ -66,6 +70,8 @@ export interface ExpressionNode {
   readonly form: "binary" | "unary" | "call";
   readonly op: string;
   readonly args: readonly ValueNode[];
+  /** Engine capabilities this expression requires (X01). See FragmentNode. */
+  readonly requires?: readonly string[];
 }
 
 /** Aggregate function application: `op(args…)` with an optional `distinct`
@@ -91,6 +97,8 @@ export interface ProjectionNode {
   readonly kind: "projection";
   readonly expr: ValueNode;
   readonly alias?: string;
+  /** Engine capabilities this projection requires (X01). See FragmentNode. */
+  readonly requires?: readonly string[];
 }
 
 export type JoinType = "inner" | "left" | "right" | "full" | "cross";
@@ -732,7 +740,7 @@ function validIdent(name: string, what: string): string {
 }
 
 const KEYWORD_OR_IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const OPERATORS = new Set(["=", "<>", "!=", "<", "<=", ">", ">=", "+", "-", "*", "/", "%", "||", "and", "or", "like", "ilike", "is", "is not", "in", "not in"]);
+const OPERATORS = new Set(["=", "<>", "!=", "<", "<=", ">", ">=", "+", "-", "*", "/", "%", "||", "and", "or", "like", "ilike", "is", "is not", "in", "not in", "<->", "<#>", "<=>", "<+>", "@@"]);
 // Plain lowercase type names, optionally a one-dimensional array (`int4[]`),
 // or a double-quoted (optionally schema-qualified) user type such as an enum
 // (`"mood"[]`, `"app"."mood"`). Quoted parts must double embedded quotes, so
@@ -881,6 +889,125 @@ export function fragment(...parts: readonly FragmentPart[]): FragmentNode {
 
 export function projection(exprNode: ValueNode, alias?: string): ProjectionNode {
   return frozen<ProjectionNode>({ kind: "projection", expr: exprNode, alias: alias === undefined ? undefined : validIdent(alias, "projection alias") });
+}
+
+// ---------------------------------------------------------------------------
+// Structural capability requirements (X01)
+// ---------------------------------------------------------------------------
+
+/** Copy one expression/fragment/projection node with capability
+ *  requirements attached. The copy is rebuilt through the same freezing
+ *  discipline as the constructors (fragments keep their anti-forgery
+ *  brand), so `requires` can only appear on nodes this module built. */
+export function withRequirements<N extends FragmentNode | ExpressionNode | ProjectionNode>(node: N, caps: readonly string[]): N {
+  if (caps.length === 0) return node;
+  for (const c of caps) {
+    if (typeof c !== "string" || c.length === 0) throw new Error(`withRequirements: capability names must be non-empty strings (got ${JSON.stringify(c)})`);
+  }
+  const copy = { ...node, requires: [...caps] } as N;
+  if (copy.kind === "fragment") return frozen(brandTextNode(copy));
+  return frozen(copy);
+}
+
+/** Collect `requires` from a node tree into `out` (X01). Structural walk
+ *  over every place a value node can carry requirements — expression args,
+ *  fragment parts, projections, aggregates, subquery statements (their
+ *  where/having/order/projections/joins), CTE bodies and DML value cells.
+ *  The plan-level collectors call this; unknown node kinds contribute
+ *  nothing. */
+export function collectRequirements(node: unknown, out: Set<string>): void {
+  if (typeof node !== "object" || node === null) return;
+  const n = node as { kind?: unknown; requires?: unknown };
+  if (Array.isArray(node)) {
+    for (const item of node) collectRequirements(item, out);
+    return;
+  }
+  if (n.kind !== undefined && n.requires !== undefined) {
+    if (Array.isArray(n.requires)) {
+      for (const c of n.requires) if (typeof c === "string") out.add(c);
+    }
+  }
+  switch (n.kind) {
+    case "expr":
+    case "aggregate": {
+      const args = (node as { args?: unknown }).args;
+      if (Array.isArray(args)) collectRequirements(args, out);
+      return;
+    }
+    case "fragment": {
+      const parts = (node as { parts?: unknown }).parts;
+      if (Array.isArray(parts)) collectRequirements(parts, out);
+      return;
+    }
+    case "projection":
+      collectRequirements((node as { expr?: unknown }).expr, out);
+      return;
+    case "subquery":
+      collectRequirements((node as { select?: unknown }).select, out);
+      return;
+    case "cte":
+      collectRequirements((node as { select?: unknown }).select, out);
+      return;
+    case "join":
+      collectRequirements((node as { on?: unknown }).on, out);
+      return;
+    case "select": {
+      const s = node as { projections?: unknown; where?: unknown; having?: unknown; groupBy?: unknown; orderBy?: unknown; joins?: unknown; ctes?: unknown };
+      collectRequirements(s.projections, out);
+      collectRequirements(s.where, out);
+      collectRequirements(s.having, out);
+      collectRequirements(s.groupBy, out);
+      // OrderSpec carries no `kind`; walk its expr explicitly.
+      if (Array.isArray(s.orderBy)) {
+        for (const o of s.orderBy) {
+          if (typeof o === "object" && o !== null) collectRequirements((o as { expr?: unknown }).expr, out);
+        }
+      }
+      collectRequirements(s.joins, out);
+      collectRequirements(s.ctes, out);
+      return;
+    }
+    case "insert": {
+      const s = node as { rows?: unknown; returning?: unknown; onConflict?: unknown };
+      if (Array.isArray(s.rows)) {
+        for (const row of s.rows) {
+          if (typeof row === "object" && row !== null) collectRequirements(Object.values(row as Record<string, unknown>), out);
+        }
+      }
+      collectRequirements(s.onConflict, out);
+      collectRequirements(s.returning, out);
+      return;
+    }
+    case "on-conflict": {
+      const s = node as { sets?: unknown; where?: unknown };
+      if (Array.isArray(s.sets)) {
+        for (const set of s.sets) {
+          if (typeof set === "object" && set !== null) collectRequirements((set as { value?: unknown }).value, out);
+        }
+      }
+      collectRequirements(s.where, out);
+      return;
+    }
+    case "update": {
+      const s = node as { sets?: unknown; where?: unknown; returning?: unknown };
+      if (Array.isArray(s.sets)) {
+        for (const set of s.sets) {
+          if (typeof set === "object" && set !== null) collectRequirements((set as { value?: unknown }).value, out);
+        }
+      }
+      collectRequirements(s.where, out);
+      collectRequirements(s.returning, out);
+      return;
+    }
+    case "delete": {
+      const s = node as { where?: unknown; returning?: unknown };
+      collectRequirements(s.where, out);
+      collectRequirements(s.returning, out);
+      return;
+    }
+    default:
+      return;
+  }
 }
 
 export function subquery(stmt: StatementNode): SubqueryNode {

@@ -265,7 +265,7 @@ var v2TypeCodecs = map[string]string{
 	"text": "string", "varchar": "string",
 	"timestamp": "timestamp-string", "timestamptz": "timestamptz-string", "date": "date-string",
 	"bytea": "binary", "uuid": "uuid", "json": "json", "jsonb": "json",
-	"vector": "vector", "enum": "enum",
+	"vector": "vector", "tsvector": "tsvector", "enum": "enum",
 }
 
 // v2TypeParams lists the type-parameter keys each type accepts. Types absent
@@ -280,23 +280,28 @@ var v2TypeParams = map[string]map[string]bool{
 
 var v2ReferentialActions = map[string]bool{"cascade": true, "restrict": true, "no action": true, "set null": true, "set default": true}
 var v2FKMatches    = map[string]bool{"simple": true, "full": true, "partial": true}
-var v2IndexMethods = map[string]bool{"btree": true, "hash": true, "gin": true, "gist": true, "spgist": true, "brin": true}
+var v2IndexMethods = map[string]bool{"btree": true, "hash": true, "gin": true, "gist": true, "spgist": true, "brin": true, "hnsw": true, "ivfflat": true}
 
 // Default-operator-class facts for the index methods and column types in
 // the contract vocabulary: exactly these combinations apply on PostgreSQL
 // without naming an operator class (built-in pg_opclass defaults; arrays
 // uniformly via array_ops). Everything else is refused by the server with
-// SQLSTATE 42704, so the validator rejects it at definition time — the
-// contract has no operator-class slot to spell an explicit one. Derived
+// SQLSTATE 42704, so the validator rejects it at definition time unless the
+// key part names an explicit operator class (X01 opclass slot). Derived
 // from a live probe on PostgreSQL 17 and the REL_15_STABLE pg_opclass
 // catalog source; the two agree on every vocabulary combination.
 var v2IndexMethodScalars = map[string]map[string]bool{
 	"btree":  {"text": true, "varchar": true, "bool": true, "int2": true, "int4": true, "int8": true, "float4": true, "float8": true, "numeric": true, "timestamp": true, "timestamptz": true, "date": true, "uuid": true, "bytea": true, "enum": true, "jsonb": true},
 	"hash":   {"text": true, "varchar": true, "bool": true, "int2": true, "int4": true, "int8": true, "float4": true, "float8": true, "numeric": true, "timestamp": true, "timestamptz": true, "date": true, "uuid": true, "bytea": true, "enum": true, "jsonb": true},
-	"gin":    {"jsonb": true},
+	"gin":    {"jsonb": true, "tsvector": true},
 	"gist":   {},
 	"spgist": {"text": true, "varchar": true},
 	"brin":   {"text": true, "varchar": true, "int2": true, "int4": true, "int8": true, "float4": true, "float8": true, "numeric": true, "timestamp": true, "timestamptz": true, "date": true, "uuid": true, "bytea": true},
+	// pgvector access methods (X01): both apply to the vector type; the
+	// default operator class is vector_ops (L2). cosine/inner-product
+	// indexes name vector_cosine_ops / vector_ip_ops explicitly.
+	"hnsw":    {"vector": true},
+	"ivfflat": {"vector": true},
 }
 var v2IndexMethodArrays = map[string]bool{"btree": true, "hash": true, "gin": true}
 
@@ -308,6 +313,11 @@ var v2OpaqueKinds  = map[string]bool{"extension-table": true, "extension-object"
 const v2LiteralPattern = `^('([^']|'')*'(::[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?(\[\])*)?|-?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?|true|false|null)$`
 
 var v2LiteralRegexp = regexp.MustCompile(v2LiteralPattern)
+
+// v2OpclassPattern: operator-class and access-method parameter names are
+// plain lowercase identifiers (X01), kept in lockstep with schema-v2.json
+// and consumer.ts.
+var v2OpclassPattern = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
 
 // v2LiteralCast splits an optional cast off a spelled literal default into
 // its element type name (schema qualification dropped) and array depth:
@@ -1230,7 +1240,7 @@ func v2ValidateIndex(item any, path string, colNames map[string]bool, colTypes m
 	}
 	for k := range m {
 		switch k {
-		case "identity", "unique", "method", "key", "where", "include":
+		case "identity", "unique", "method", "key", "where", "include", "with":
 		default:
 			return contractErr("unknown-field", path+"."+k, "unknown field %q on index", k)
 		}
@@ -1284,14 +1294,24 @@ func v2ValidateIndex(item any, path string, colNames map[string]bool, colTypes m
 			if !colNames[cs] {
 				return contractErr("constraint-column", ppath+".column", "index %q references unknown column %q on table %q", ident, cs, tableKey)
 			}
-			if ct, ok := colTypes[cs]; ok {
+			opclass, hasOpclass := pm["opclass"]
+			if hasOpclass {
+				ocs, err := v2String(opclass, ppath+".opclass")
+				if err != nil {
+					return err
+				}
+				if !v2OpclassPattern.MatchString(ocs) {
+					return contractErr("invalid-value", ppath+".opclass", "operator class names are plain lowercase identifiers, got %q", ocs)
+				}
+			}
+			if ct, ok := colTypes[cs]; ok && !hasOpclass {
 				applicable := ct.IsArray && v2IndexMethodArrays[method] || !ct.IsArray && v2IndexMethodScalars[method][ct.Name]
 				if !applicable {
 					desc := ct.Name
 					if ct.IsArray {
 						desc += "[]"
 					}
-					return contractErr("invalid-index", ppath, "index method %q over column %q (%s) has no default operator class on any supported server (PostgreSQL refuses it with SQLSTATE 42704) — explicitly unsupported: the contract has no operator-class slot", method, cs, desc)
+					return contractErr("invalid-index", ppath, "index method %q over column %q (%s) has no default operator class on any supported server (PostgreSQL refuses it with SQLSTATE 42704) — name an explicit operator class (key-part opclass, X01) or use a method/type pair the server defaults", method, cs, desc)
 				}
 			}
 		case hasExpr:
@@ -1311,11 +1331,14 @@ func v2ValidateIndex(item any, path string, colNames map[string]bool, colTypes m
 			if _, hasNulls := pm["nulls"]; hasNulls {
 				return contractErr("index-key", ppath, "ordered expression keys are explicitly unsupported (per-part expression deparse is engine-dependent)")
 			}
+			if _, hasOpclass := pm["opclass"]; hasOpclass {
+				return contractErr("index-key", ppath, "operator classes attach to column key parts only (X01)")
+			}
 		default:
 			return contractErr("index-key", ppath, "key part needs either column or expression")
 		}
 		for k := range pm {
-			if k != "column" && k != "expression" && k != "order" && k != "nulls" {
+			if k != "column" && k != "expression" && k != "order" && k != "nulls" && k != "opclass" {
 				return contractErr("unknown-field", ppath+"."+k, "unknown field %q on index key part", k)
 			}
 		}
@@ -1365,6 +1388,26 @@ func v2ValidateIndex(item any, path string, colNames map[string]bool, colTypes m
 				return contractErr("invalid-value", fmt.Sprintf("%s.include[%d]", path, i), "index %q includes column %q twice", ident, cs)
 			}
 			seen[cs] = true
+		}
+	}
+	if withParams, ok := m["with"]; ok {
+		wpath := path + ".with"
+		wm, err := v2Object(withParams, wpath)
+		if err != nil {
+			return err
+		}
+		if len(wm) == 0 {
+			return contractErr("invalid-index", wpath, "with must declare at least one parameter")
+		}
+		for k, v := range wm {
+			if !v2OpclassPattern.MatchString(k) {
+				return contractErr("invalid-value", wpath+"."+k, "access-method parameter names are plain lowercase identifiers, got %q", k)
+			}
+			// JSON numbers decode as float64; the vocabulary takes integers.
+			f, ok := v.(float64)
+			if !ok || f != math.Trunc(f) {
+					return contractErr("invalid-index", wpath+"."+k, "access-method parameters are integers (m, ef_construction, lists, fillfactor); non-integer reloptions keep the index unrepresentable")
+			}
 		}
 	}
 	st.indexIdents[ident] = tableKey

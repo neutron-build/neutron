@@ -43,7 +43,7 @@ const TYPE_CODECS: Record<string, string> = {
   text: "string", varchar: "string",
   timestamp: "timestamp-string", timestamptz: "timestamptz-string", date: "date-string",
   bytea: "binary", uuid: "uuid", json: "json", jsonb: "json",
-  vector: "vector", enum: "enum",
+  vector: "vector", tsvector: "tsvector", enum: "enum",
 };
 const TYPE_PARAMS: Record<string, Set<string>> = {
   varchar: new Set(["length"]),
@@ -54,7 +54,7 @@ const TYPE_PARAMS: Record<string, Set<string>> = {
 };
 const REFERENTIAL_ACTIONS = new Set(["cascade", "restrict", "no action", "set null", "set default"]);
 const FK_MATCHES = new Set(["simple", "full", "partial"]);
-const INDEX_METHODS = new Set(["btree", "hash", "gin", "gist", "spgist", "brin"]);
+const INDEX_METHODS = new Set(["btree", "hash", "gin", "gist", "spgist", "brin", "hnsw", "ivfflat"]);
 // Default-operator-class facts for the index methods and column types in
 // the vocabulary: exactly these combinations apply on PostgreSQL without
 // naming an operator class (built-in pg_opclass defaults; arrays uniformly
@@ -64,11 +64,15 @@ const INDEX_METHODS = new Set(["btree", "hash", "gin", "gist", "spgist", "brin"]
 const INDEX_METHOD_SCALARS: Record<string, ReadonlySet<string>> = {
   btree: new Set(["text", "varchar", "bool", "int2", "int4", "int8", "float4", "float8", "numeric", "timestamp", "timestamptz", "date", "uuid", "bytea", "enum", "jsonb"]),
   hash: new Set(["text", "varchar", "bool", "int2", "int4", "int8", "float4", "float8", "numeric", "timestamp", "timestamptz", "date", "uuid", "bytea", "enum", "jsonb"]),
-  gin: new Set(["jsonb"]),
+  gin: new Set(["jsonb", "tsvector"]),
   gist: new Set(),
   spgist: new Set(["text", "varchar"]),
   brin: new Set(["text", "varchar", "int2", "int4", "int8", "float4", "float8", "numeric", "timestamp", "timestamptz", "date", "uuid", "bytea"]),
+  // pgvector access methods (X01): default class vector_ops (L2).
+  hnsw: new Set(["vector"]),
+  ivfflat: new Set(["vector"]),
 };
+const OPCLASS_NAME = /^[a-z_][a-z0-9_]*$/;
 const INDEX_METHOD_ARRAYS = new Set(["btree", "hash", "gin"]);
 const TYPE_ALIASES: Record<string, string> = {
   boolean: "bool", int: "int4", integer: "int4", smallint: "int2",
@@ -598,7 +602,7 @@ const validateConstraint = (item: Json, at: string, colNames: Set<string>, table
 
 const validateIndex = (item: Json, at: string, colNames: Set<string>, colTypes: Map<string, { name: string; isArray: boolean }>, table: string, st: State): void => {
   const m = isObj(item, at);
-  onlyFields(m, at, ["identity", "unique", "method", "key", "where", "include"], ["identity", "unique", "method", "key"]);
+  onlyFields(m, at, ["identity", "unique", "method", "key", "where", "include", "with"], ["identity", "unique", "method", "key"]);
   const id = checkIdentity(m.identity, `${at}.identity`);
   const ident = tableKey(id.schema, id.name);
   if (st.indexIdents.has(ident)) {
@@ -612,7 +616,7 @@ const validateIndex = (item: Json, at: string, colNames: Set<string>, colTypes: 
   key.forEach((part, i) => {
     const pat = `${at}.key[${i}]`;
     const pm = isObj(part, pat);
-    onlyFields(pm, pat, ["column", "expression", "order", "nulls"], []);
+    onlyFields(pm, pat, ["column", "expression", "order", "nulls", "opclass"], []);
     const hasCol = "column" in pm;
     const hasExpr = "expression" in pm;
     if (hasCol && hasExpr) fail("index-key", pat, "key part sets both column and expression");
@@ -628,21 +632,29 @@ const validateIndex = (item: Json, at: string, colNames: Set<string>, colTypes: 
         fail("invalid-value", `${pat}.nulls`, `index key part nulls must be "first" or "last", got ${JSON.stringify(n)}`);
       }
     }
+    const hasOpclass = "opclass" in pm;
+    if (hasOpclass) {
+      const ocs = isStr(pm.opclass, `${pat}.opclass`);
+      if (!OPCLASS_NAME.test(ocs)) {
+        fail("invalid-value", `${pat}.opclass`, `operator class names are plain lowercase identifiers, got ${JSON.stringify(ocs)}`);
+      }
+    }
     if (hasCol) {
       const cs = isStr(pm.column, `${pat}.column`);
       if (!colNames.has(cs)) {
         fail("constraint-column", `${pat}.column`, `index ${JSON.stringify(ident)} references unknown column ${JSON.stringify(cs)}`);
       }
       const ct = colTypes.get(cs);
-      if (ct !== undefined) {
+      if (ct !== undefined && !hasOpclass) {
         const applicable = ct.isArray ? INDEX_METHOD_ARRAYS.has(method) : (INDEX_METHOD_SCALARS[method] ?? new Set()).has(ct.name);
         if (!applicable) {
           const desc = ct.isArray ? `${ct.name}[]` : ct.name;
-          fail("invalid-index", pat, `index method ${JSON.stringify(method)} over column ${JSON.stringify(cs)} (${desc}) has no default operator class on any supported server (PostgreSQL refuses it with SQLSTATE 42704) — explicitly unsupported: the contract has no operator-class slot`);
+          fail("invalid-index", pat, `index method ${JSON.stringify(method)} over column ${JSON.stringify(cs)} (${desc}) has no default operator class on any supported server (PostgreSQL refuses it with SQLSTATE 42704) — name an explicit operator class (key-part opclass, X01) or use a method/type pair the server defaults`);
         }
       }
     } else if (hasExpr) {
       checkSQLText(isStr(pm.expression, `${pat}.expression`), `${pat}.expression`, true);
+      if (hasOpclass) fail("index-key", pat, "operator classes attach to column key parts only (X01)");
       if (method !== "btree") {
         fail("invalid-index", pat, 'expression keys are only definable with method "btree" — the default operator class of an expression result type cannot be verified at definition time (the contract has no operator-class slot)');
       }
@@ -663,6 +675,21 @@ const validateIndex = (item: Json, at: string, colNames: Set<string>, colTypes: 
       if (seen.has(cs)) fail("invalid-value", iat, `index ${JSON.stringify(ident)} includes column ${JSON.stringify(cs)} twice`);
       seen.add(cs);
     });
+  }
+  if ("with" in m) {
+    const wat = `${at}.with`;
+    const wm = isObj(m.with, wat);
+    const keys = Object.keys(wm);
+    if (keys.length === 0) fail("invalid-index", wat, "with must declare at least one parameter");
+    for (const k of keys) {
+      if (!OPCLASS_NAME.test(k)) {
+        fail("invalid-value", `${wat}.${k}`, `access-method parameter names are plain lowercase identifiers, got ${JSON.stringify(k)}`);
+      }
+      const v = wm[k];
+      if (typeof v !== "number" || !Number.isInteger(v)) {
+        fail("invalid-index", `${wat}.${k}`, "access-method parameters are integers (m, ef_construction, lists, fillfactor); non-integer reloptions keep the index unrepresentable");
+      }
+    }
   }
   st.indexIdents.set(ident, table);
 };
@@ -803,6 +830,13 @@ const canonicalize = (v: Json): Json => {
           t.indexes = sortBy(t.indexes as Json[], (m) => fieldKey(m, "identity")).map((iv) => {
             const idx = { ...(iv as Obj) } as Obj;
             if ("include" in idx) idx.include = sortBy(idx.include as Json[], (m) => m as string) as Json;
+            if ("with" in idx) {
+              // X01: access-method parameters canonicalize with sorted keys.
+              const w = idx.with as Obj;
+              const sorted: Obj = {};
+              for (const k of Object.keys(w).sort()) sorted[k] = w[k];
+              idx.with = sorted;
+            }
             return idx as Json;
           }) as Json;
           return t as Json;

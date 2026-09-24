@@ -170,6 +170,19 @@ var numericDefaultPattern = regexp.MustCompile(`^-?\d+(\.\d+)?([eE][+-]?\d+)?$`)
 // It validates the version 1 shape only; version detection across document
 // versions (including the v2 contract) is ValidateSchemaDocument.
 func ValidateSchema(s *Schema) error {
+	return validateSchema(s, false)
+}
+
+// ValidateSchemaV1ForUpgrade validates a version-1 schema for the v1->v2
+// UPGRADE reader only: legacy documents may carry nucleusOnly vector
+// columns (the pre-X01 escape hatch), which the upgrade path converts to
+// the pgvector capability. The planning surface (ValidateSchema) rejects
+// those documents — migrations fail rather than skipping a queried column.
+func ValidateSchemaV1ForUpgrade(s *Schema) error {
+	return validateSchema(s, true)
+}
+
+func validateSchema(s *Schema, forUpgrade bool) error {
 	if s.Version != SchemaVersion {
 		return fmt.Errorf(
 			"schema JSON declares version %d, but this CLI supports version %d only — "+
@@ -237,13 +250,24 @@ func ValidateSchema(s *Schema) error {
 					t.Name, c.Name, c.Type)
 			}
 			if c.Type == "vector" {
-				if !c.NucleusOnly {
+				if forUpgrade {
+					// Legacy upgrade rule: nucleusOnly + dimensions, exactly
+					// as pre-X01 documents spelled them.
+					if !c.NucleusOnly {
+						return fmt.Errorf("column %s.%s: legacy vector columns must be nucleusOnly (pre-X01 shape); a non-nucleusOnly vector column never had meaning in v1", t.Name, c.Name)
+					}
+					if c.VectorDims <= 0 {
+						return fmt.Errorf("column %s.%s: vector type requires vectorDimensions > 0", t.Name, c.Name)
+					}
+				} else {
+					// X01: vector columns are planned through schema document v2
+					// (pgvector capability, extension precondition at apply time).
+					// The v1 skip behavior is withdrawn: a skipped column is a
+					// silently queried-but-nonexistent column, so v1 fails
+					// closed instead.
 					return fmt.Errorf(
-						"column %s.%s: vector columns must be nucleusOnly on vanilla Postgres (until pgvector planning is supported) — mark the column nucleusOnly or remove it",
+						"column %s.%s: vector columns require schema document v2 with the pgvector capability — the legacy v1 workflow no longer skips them (a skipped column is later queried but nonexistent; X01 removed that behavior). Re-export with exportSchemaV2 or remove the column",
 						t.Name, c.Name)
-				}
-				if c.VectorDims <= 0 {
-					return fmt.Errorf("column %s.%s: vector type requires vectorDimensions > 0", t.Name, c.Name)
 				}
 			} else {
 				if c.NucleusOnly {

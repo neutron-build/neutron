@@ -227,3 +227,33 @@
   opacity: 0.6;
   border-top: 1px solid var(--border, #333344);
 }
+
+/* X01: read-only vector/tsvector cells (exact text render + copy). */
+.vectorCell {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+}
+
+.vectorText {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+}
+
+.copyBtn {
+  border: none;
+  background: transparent;
+  color: var(--text-dim, #888);
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.copyBtn:hover {
+  color: var(--accent, #4af);
+}

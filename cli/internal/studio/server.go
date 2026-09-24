@@ -129,6 +129,7 @@ func (s *Server) routes() (*http.ServeMux, error) {
 	mux.HandleFunc("/api/table/v2/delete", s.handleTableRowDeleteV2)
 	mux.HandleFunc("/api/table/v2/commit", s.handleTableCommitV2)
 	mux.HandleFunc("/api/table/v2/preview", s.handleTablePreviewV2)
+	mux.HandleFunc("/api/table/v2/search", s.handleTableSearchV2)
 	mux.HandleFunc("/api/table/v2/outcome", s.handleTableOutcomeV2)
 	mux.HandleFunc("/api/table/v2/revert", s.handleTableRevertV2)
 	mux.HandleFunc("/api/table/update", s.handleTableRowUpdate)

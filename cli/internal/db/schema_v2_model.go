@@ -135,6 +135,9 @@ type V2IndexKeyPart struct {
 	Expression *string `json:"expression,omitempty"`
 	Order      *string `json:"order,omitempty"` // asc | desc (minimal form: only desc is written)
 	Nulls      *string `json:"nulls,omitempty"` // first | last (minimal form: only non-default for the direction)
+	// Explicit operator class (X01): pgvector's hnsw/ivfflat indexes select
+	// their distance semantics this way. Omitted = the method's default.
+	Opclass *string `json:"opclass,omitempty"`
 }
 
 type V2Index struct {
@@ -144,6 +147,10 @@ type V2Index struct {
 	Key      []V2IndexKeyPart `json:"key"`
 	Where    *string          `json:"where,omitempty"`
 	Include  []string         `json:"include,omitempty"`
+	// Access-method parameters (X01): with (m = 16, ef_construction = 64) on
+	// hnsw, with (lists = 100) on ivfflat. Integer values; canonical form
+	// sorts the keys.
+	With map[string]int64 `json:"with,omitempty"`
 }
 
 type V2Table struct {
