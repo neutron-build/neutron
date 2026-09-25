@@ -722,3 +722,83 @@ describe('SQLBrowser S01 binding, read-level state and composite FK follow', () 
     expect(stagedEdits.value).toEqual([])
   })
 })
+
+// R01 (real browser, Chrome via the served Studio): when the cell editor
+// closes, Chrome fires blur/focusout on the editor elements as they leave
+// the DOM, and the key event that closed it continues to the grid. The
+// closed editor's handlers then ran against stale state: one Enter staged
+// the edit twice (the batch then failed on its own duplicate) and reopened
+// the editor; Escape staged the abandoned text. These tests replay that
+// event sequence on the detached editor elements.
+describe('SQLBrowser editor close is exactly-once (browser event order)', () => {
+  function openEditorOn(row: number, col: string): { input: HTMLInputElement; editor: HTMLElement } {
+    fireEvent.dblClick(cellAt(row, col))
+    const input = editorInput()
+    const editor = input.closest('[data-column]') as HTMLElement
+    return { input, editor }
+  }
+
+  function afterClose(input: HTMLInputElement, editor: HTMLElement, key: string) {
+    // What Chrome dispatches once the editor has been removed.
+    fireEvent.blur(input)
+    fireEvent.focusOut(input)
+    fireEvent.blur(editor)
+    fireEvent.focusOut(editor)
+    fireEvent.keyDown(input, { key })
+  }
+
+  it('Enter stages one edit and leaves the editor closed', async () => {
+    memoSchema()
+    tableData.mockResolvedValue(keyedResult([[1, 'hello']], ['7']))
+    render(<SQLBrowser schema="public" table="memo" />)
+    await waitFor(() => expect(cellAt(0, 'body').textContent).toBe('hello'))
+
+    const { input, editor } = openEditorOn(0, 'body')
+    fireEvent.input(input, { target: { value: 'world' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(document.querySelector('input[aria-label$=" value"]')).toBeNull())
+    afterClose(input, editor, 'Enter')
+    await new Promise(r => setTimeout(r, 20))
+
+    expect(stagedEdits.value.length).toBe(1)
+    expect(document.querySelector('input[aria-label$=" value"]')).toBeNull()
+  })
+
+  it('Escape stages nothing, even when the closed editor blurs afterwards', async () => {
+    memoSchema()
+    tableData.mockResolvedValue(keyedResult([[1, 'hello']], ['7']))
+    render(<SQLBrowser schema="public" table="memo" />)
+    await waitFor(() => expect(cellAt(0, 'body').textContent).toBe('hello'))
+
+    const { input, editor } = openEditorOn(0, 'body')
+    fireEvent.input(input, { target: { value: 'abandoned' } })
+    fireEvent.keyDown(input, { key: 'Escape' })
+    await waitFor(() => expect(document.querySelector('input[aria-label$=" value"]')).toBeNull())
+    afterClose(input, editor, 'Escape')
+    await new Promise(r => setTimeout(r, 20))
+
+    expect(stagedEdits.value).toEqual([])
+  })
+
+  it('two edits to one row stage two operations, each once', async () => {
+    schema.value = fullSchema([sqlTable({
+      columns: [
+        { name: 'id', type: 'int4', nullable: false, isPrimaryKey: true },
+        { name: 'body', type: 'text', nullable: true, isPrimaryKey: false },
+      ],
+    })])
+    tableData.mockResolvedValue(keyedResult([[1, 'hello'], [2, 'there']], ['7', '8']))
+    render(<SQLBrowser schema="public" table="memo" />)
+    await waitFor(() => expect(cellAt(1, 'body').textContent).toBe('there'))
+
+    for (const [row, text] of [[0, 'one'], [1, 'two']] as const) {
+      const { input, editor } = openEditorOn(row, 'body')
+      fireEvent.input(input, { target: { value: text } })
+      fireEvent.keyDown(input, { key: 'Enter' })
+      await waitFor(() => expect(document.querySelector('input[aria-label$=" value"]')).toBeNull())
+      afterClose(input, editor, 'Enter')
+      await new Promise(r => setTimeout(r, 20))
+    }
+    expect(stagedEdits.value.map(e => (e.operation as { value?: unknown }).value)).toEqual(['one', 'two'])
+  })
+})

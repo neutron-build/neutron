@@ -96,6 +96,8 @@ interface EditState {
   col: string
   edit: CellEdit
   initial: CellEdit
+  /** Identity of one open-editor session (kept across onChange updates). */
+  session: number
 }
 
 function sameEdit(a: CellEdit, b: CellEdit): boolean {
@@ -120,7 +122,20 @@ export function DataGrid({
   label,
   exportName,
 }: DataGridProps) {
-  const [edit, setEdit] = useState<EditState | null>(null)
+  const [edit, setEditState] = useState<EditState | null>(null)
+  // The open editor session, mirrored in a ref. When an editor closes, the
+  // browser fires blur/focusout on its elements as they leave the DOM, and
+  // those run the closed editor's handlers with the state of the render that
+  // created them. Commit/cancel/change act only on the session that is still
+  // open, so a closed or replaced session can never stage again (R01, real
+  // browser: one Enter staged every edit twice and the batch then failed on
+  // its own duplicate; Escape staged the abandoned text).
+  const openEdit = useRef<EditState | null>(null)
+  const sessionSeq = useRef(0)
+  function setEdit(next: EditState | null) {
+    openEdit.current = next
+    setEditState(next)
+  }
   const rowRefs = useRef<Map<number, HTMLTableRowElement>>(new Map())
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const headRef = useRef<HTMLTableSectionElement | null>(null)
@@ -263,21 +278,24 @@ export function DataGrid({
     if (returnFocus) setFocusSeq(n => n + 1)
   }
 
-  function commitEdit() {
-    if (!edit || !onStageUpdate) return
+  function commitEdit(session: number) {
+    const current = openEdit.current
+    if (!current || current.session !== session || !onStageUpdate) return
     const returnFocus = focusInEditor()
-    if (!sameEdit(edit.edit, edit.initial)) {
-      onStageUpdate(edit.row, edit.col, edit.edit)
+    if (!sameEdit(current.edit, current.initial)) {
+      onStageUpdate(current.row, current.col, current.edit)
     }
     closeEditor(returnFocus)
   }
 
-  function cancelEdit() {
+  function cancelEdit(session: number) {
+    if (openEdit.current?.session !== session) return
     closeEditor(focusInEditor())
   }
 
-  function commitEditAndTab() {
-    if (!edit || !onStageUpdate) return
+  function commitEditAndTab(session: number) {
+    const edit = openEdit.current
+    if (!edit || edit.session !== session || !onStageUpdate) return
     if (!sameEdit(edit.edit, edit.initial)) {
       onStageUpdate(edit.row, edit.col, edit.edit)
     }
@@ -294,7 +312,7 @@ export function DataGrid({
       ? staged.edit
       : isNull ? { kind: 'null' } : { kind: 'value', text: formatCell(cell) }
     setActive({ row: edit.row, col: idx })
-    setEdit({ row: edit.row, col: next, edit: initial, initial })
+    setEdit({ row: edit.row, col: next, edit: initial, initial, session: ++sessionSeq.current })
   }
 
   function openEditor(rowIdx: number, col: string) {
@@ -307,7 +325,7 @@ export function DataGrid({
     const initial: CellEdit = staged
       ? staged.edit
       : isNull ? { kind: 'null' } : { kind: 'value', text: formatCell(cell) }
-    setEdit({ row: rowIdx, col, edit: initial, initial })
+    setEdit({ row: rowIdx, col, edit: initial, initial, session: ++sessionSeq.current })
   }
 
   function sortMark(col: string): string | null {
@@ -330,10 +348,13 @@ export function DataGrid({
           edit={edit.edit}
           autoFocus
           commitOnBlur
-          onChange={next => { if (edit) setEdit({ ...edit, edit: next }) }}
-          onCommit={commitEdit}
-          onCancel={cancelEdit}
-          onTab={commitEditAndTab}
+          onChange={next => {
+            const cur = openEdit.current
+            if (cur && cur.session === edit.session) setEdit({ ...cur, edit: next })
+          }}
+          onCommit={() => commitEdit(edit.session)}
+          onCancel={() => cancelEdit(edit.session)}
+          onTab={() => commitEditAndTab(edit.session)}
         />
       )
     }
