@@ -261,8 +261,8 @@ async function compiledStatementFixtures(): Promise<void> {
   // Q08 widened the capability union: windows (+GROUPS/EXCLUDE frames), row
   // locking (strengths, SKIP LOCKED) and server-side cursors joined
   // jsonb-functions. X01 added the pgvector family (extension-provided,
-  // probe-resolved) and core FTS. The union stays closed — exactly these
-  // members.
+  // probe-resolved) and core FTS. X03 added ts-bucketing (probe-resolved
+  // date_trunc semantics). The union stays closed — exactly these members.
   const capIsClosed: AssertEq<
     StatementCapability,
     | "jsonb-functions"
@@ -280,6 +280,7 @@ async function compiledStatementFixtures(): Promise<void> {
     | "vector-operator-l1"
     | "fts-functions"
     | "fts-websearch-tsquery"
+    | "ts-bucketing"
   > = true;
   const mutated: CompiledStatement = db.update(users).set({ name: "x" }).where(eq(users.id, 1)).returning().toCompiled();
   void [sqlText, params, decoders, capabilities, mutated, capIsClosed];

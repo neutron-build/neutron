@@ -112,6 +112,37 @@ export function canonicalTextWireNode(dataType: ColumnDataType, ref: QualifiedNo
   }
 }
 
+// X03: temporal-typed EXPRESSION registry. Optional capability modules
+// (e.g. /timeseries timeBucket) build value nodes whose PostgreSQL result
+// is a temporal value even though the node is not a column reference. The
+// root must give such projections the lossless temporal wire form + decode
+// (a raw expression projection would fall to driver-default parsing, which
+// truncates microseconds) — WITHOUT the root importing the optional module.
+// The module therefore registers its node here against a source column
+// carrying the codec metadata; the select planner recognizes the node by
+// identity (WeakMap, never by scanning SQL text).
+const TEMPORAL_EXPR_SOURCES = new WeakMap<object, AnyColumnBuilder>();
+
+/** Register `node` as a temporal-typed expression whose result decodes like
+ *  `source` (its dataType/readMode/valueDecoder). Module-private seam for
+ *  optional capability modules; returns the node. */
+export function registerTemporalExpression<N extends object>(node: N, source: AnyColumnBuilder): N {
+  TEMPORAL_EXPR_SOURCES.set(node, source);
+  return node;
+}
+
+/** True when `v` is a registered temporal-typed expression (X03 seam). */
+export function isTemporalExpression(v: unknown): boolean {
+  return typeof v === "object" && v !== null && TEMPORAL_EXPR_SOURCES.has(v);
+}
+
+/** Source column whose codec a registered temporal expression follows. */
+export function temporalExpressionSource(v: object): AnyColumnBuilder {
+  const src = TEMPORAL_EXPR_SOURCES.get(v);
+  if (src === undefined) throw new Error("temporal expression: not registered (registerTemporalExpression)");
+  return src;
+}
+
 /** Engine feature a compiled statement requires. `jsonb-functions` marks
  *  statements whose projections aggregate or acquire values through
  *  PostgreSQL jsonb functions (to_jsonb / jsonb_build_object / jsonb_agg);
@@ -120,7 +151,11 @@ export function canonicalTextWireNode(dataType: ColumnDataType, ref: QualifiedNo
  *  clauses (strengths and SKIP LOCKED separately) and server-side cursors
  *  (streaming). X01 adds the pgvector family (extension-provided: no
  *  version fact can prove them, only the extension's presence via a real
- *  probe) and core full-text search (a PostgreSQL version fact, 8.3). */
+ *  probe) and core full-text search (a PostgreSQL version fact, 8.3).
+ *  X03 adds time bucketing (date_trunc with its timezone argument): probe
+ *  resolved with semantic controls — no version fact is cited because
+ *  date_trunc predates cleanly citable release notes, and a semantics-
+ *  verifying probe is strictly stronger than a parse-only version check. */
 export type StatementCapability =
   | "jsonb-functions"
   | "window-functions"
@@ -136,7 +171,8 @@ export type StatementCapability =
   | "vector-operator-cosine"
   | "vector-operator-l1"
   | "fts-functions"
-  | "fts-websearch-tsquery";
+  | "fts-websearch-tsquery"
+  | "ts-bucketing";
 
 function stripJsonQuotes(raw: unknown, ctx: ColumnContext): string {
   if (typeof raw !== "string" || raw.length < 2 || !raw.startsWith('"') || !raw.endsWith('"')) {

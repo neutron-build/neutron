@@ -177,6 +177,49 @@ const BUCKET_OPTS: { label: string; ms: number }[] = [
 
 const MAX_BUCKETS = 500
 
+// Ingestion input: one point per line — "epoch_ms, value" or "ISO-8601, value"
+// (ISO forms are converted to epoch ms client-side; the engine's surface is
+// numeric). Values must be finite numbers. Returns one BATCHED insert select
+// (the same multi-column pattern the bucket query uses) or an error message
+// naming the bad line — nothing is sent when any line fails to parse.
+export type IngestResult = { ok: true; sql: string; count: number } | { ok: false; error: string }
+
+export function buildInsertSql(series: string, pointsInput: string): IngestResult {
+  const safeSeries = sqlStr(series)
+  const cols: string[] = []
+  let count = 0
+  for (const rawLine of pointsInput.split('\n')) {
+    const line = rawLine.trim()
+    if (!line) continue
+    const eq = line.indexOf(',')
+    if (eq === -1) return { ok: false, error: `Line ${JSON.stringify(line)}: expected "timestamp, value"` }
+    const tRaw = line.slice(0, eq).trim()
+    const vRaw = line.slice(eq + 1).trim()
+    let ms: number
+    if (/^-?\d+$/.test(tRaw)) {
+      ms = Number(tRaw)
+    } else {
+      const parsed = Date.parse(tRaw)
+      if (Number.isNaN(parsed)) return { ok: false, error: `Line ${JSON.stringify(line)}: timestamp is neither epoch-ms nor a parseable ISO-8601 date` }
+      ms = parsed
+    }
+    const v = Number(vRaw)
+    if (!Number.isFinite(v)) return { ok: false, error: `Line ${JSON.stringify(line)}: value is not a finite number` }
+    cols.push(`TS_INSERT(${safeSeries}, ${ms}, ${v})`)
+    count += 1
+  }
+  if (count === 0) return { ok: false, error: 'Enter at least one "timestamp, value" line' }
+  if (count > MAX_BUCKETS) return { ok: false, error: `${count} points exceeds the ${MAX_BUCKETS}-point batch limit` }
+  return { ok: true, sql: `SELECT ${cols.join(', ')}`, count }
+}
+
+// TS_RETENTION(max_age_ms) sets ONE policy for the ENTIRE engine — every
+// series, existing history included, drained at the next checkpoint tick
+// from wall-clock now. Destructive, retroactive, irreversible, no read-back.
+export function buildRetentionSql(days: number): string {
+  return `SELECT TS_RETENTION(${Math.round(days * 24 * 60 * 60_000)})`
+}
+
 export function TSModule({ name }: TSModuleProps) {
   const now = Date.now()
   // Series names are user-supplied (the engine has no series listing), so the
@@ -196,6 +239,16 @@ export function TSModule({ name }: TSModuleProps) {
   const stats = useSignal<{ count: number; last: number | null } | null>(null)
   const viewMode = useSignal<ViewMode>('chart')
   const rlsDenied = useSignal<string | null>(null)
+
+  // Ingestion (the ingestion -> query -> visualize journey starts here).
+  const pointsInput = useSignal('')
+  const inserting = useSignal(false)
+  // Retention: global + destructive on this engine — the control stays
+  // disabled until the acknowledgement checkbox is set, and the warning
+  // is always visible.
+  const retentionDays = useSignal('30')
+  const retentionAck = useSignal(false)
+  const settingRetention = useSignal(false)
 
   const conn = activeConnection.value!
 
@@ -224,6 +277,56 @@ export function TSModule({ name }: TSModuleProps) {
   useEffect(() => {
     loadStats()
   }, [])
+
+  async function ingestPoints() {
+    const series = seriesName.value.trim()
+    if (!series) {
+      toast('error', 'Set a series name first')
+      return
+    }
+    const parsed = buildInsertSql(series, pointsInput.value)
+    if (!parsed.ok) {
+      toast('error', parsed.error)
+      return
+    }
+    inserting.value = true
+    try {
+      const r = await api.query(parsed.sql, conn.id)
+      if (r.error) throw new Error(r.error)
+      toast('success', `Inserted ${parsed.count} point${parsed.count === 1 ? '' : 's'} into ${series}`)
+      pointsInput.value = ''
+      loadStats()
+    } catch (err: unknown) {
+      toast('error', err instanceof Error ? err.message : String(err))
+    } finally {
+      inserting.value = false
+    }
+  }
+
+  async function applyRetention() {
+    const series = seriesName.value.trim()
+    if (!series) {
+      toast('error', 'Set a series name first')
+      return
+    }
+    const days = Number(retentionDays.value)
+    if (!Number.isFinite(days) || days <= 0) {
+      toast('error', 'Retention days must be a positive number')
+      return
+    }
+    if (!retentionAck.value) return
+    settingRetention.value = true
+    try {
+      const r = await api.query(buildRetentionSql(days), conn.id)
+      if (r.error) throw new Error(r.error)
+      toast('success', `Retention set to ${days} day(s) — GLOBAL policy, applies to EVERY series at the next checkpoint`)
+      loadStats()
+    } catch (err: unknown) {
+      toast('error', err instanceof Error ? err.message : String(err))
+    } finally {
+      settingRetention.value = false
+    }
+  }
 
   async function runQuery() {
     const series = seriesName.value.trim()
@@ -341,6 +444,60 @@ export function TSModule({ name }: TSModuleProps) {
           <button class={s.runBtn} onClick={runQuery} disabled={running.value}>
             {running.value ? 'Loading...' : 'Query'}
           </button>
+        </div>
+      </div>
+
+      {/* Ingestion: write points (batched TS_INSERT select), then query and
+          visualize them — the full time-series journey in one module. */}
+      <div class={s.queryPanel}>
+        <div class={s.statsTitle}>Ingest points</div>
+        <div class={s.queryRow}>
+          <textarea
+            class={s.queryInput}
+            style={{ height: 'auto' }}
+            placeholder={'one point per line:\n1730000000000, 1.5\n2026-09-24T05:00:00Z, 2.0'}
+            value={pointsInput.value}
+            onInput={e => { pointsInput.value = (e.target as HTMLTextAreaElement).value }}
+            rows={3}
+            spellcheck={false}
+          />
+          <button class={s.runBtn} onClick={ingestPoints} disabled={inserting.value}>
+            {inserting.value ? 'Inserting…' : 'Insert'}
+          </button>
+        </div>
+      </div>
+
+      {/* Retention: honest about what the engine actually does. TS_RETENTION
+          is a single GLOBAL policy — per-series retention does not exist and
+          stays disabled here with that reason. */}
+      <div class={s.queryPanel}>
+        <div class={s.statsTitle}>Retention (global)</div>
+        <div class={s.queryRow}>
+          <input
+            class={s.fieldInput}
+            type="number"
+            style={{ width: 90 }}
+            value={retentionDays.value}
+            onInput={e => { retentionDays.value = (e.target as HTMLInputElement).value }}
+          />
+          <span class={s.fieldLabel}>days</span>
+          <label class={s.fieldLabel} style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            <input
+              type="checkbox"
+              checked={retentionAck.value}
+              onChange={e => { retentionAck.value = (e.target as HTMLInputElement).checked }}
+            />
+            I understand this is global
+          </label>
+          <button class={s.runBtn} onClick={applyRetention} disabled={!retentionAck.value || settingRetention.value}>
+            {settingRetention.value ? 'Setting…' : 'Set retention'}
+          </button>
+        </div>
+        <div class={s.chartLabel} style={{ display: 'block', marginTop: 4 }}>
+          Destructive, retroactive and irreversible: one policy for EVERY series —
+          at the next checkpoint tick the engine deletes all existing points older
+          than this age (wall-clock based), and there is no undo or dry run.
+          Per-series retention is not supported by the engine and stays disabled.
         </div>
       </div>
 

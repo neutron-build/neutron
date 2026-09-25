@@ -1,6 +1,19 @@
 // ---------------------------------------------------------------------------
-// @neutron-build/nucleus/columnar — Columnar analytics model plugin
+// @neutron-build/nucleus/columnar — Columnar analytics model plugin (X03)
 // ---------------------------------------------------------------------------
+// Durability/transaction honesty (verified live, X03 Nucleus leg): the
+// COLUMNAR_* store is fsync-durable at commit (kill -9 evidence — matches
+// the NU-006 durability table; the older "page cache only" prose in
+// MODEL_SEMANTICS is stale) and REFUSES inserts inside an explicit
+// transaction ("the columnar store is not covered by transaction rollback")
+// rather than silently persisting rolled-back rows. It is append-only:
+// COLUMNAR_INSERT is the only mutator.
+//
+// Numeric typing (X03 live finding): values bound WITHOUT type context are
+// stored as text and the numeric aggregates then answer a silent 0 / NULL
+// (engine silent-wrong-answer class, recorded upstream). insert() therefore
+// binds JS numbers with an explicit ::double precision cast so count/sum/
+// avg/min/max are real for numeric columns through this client.
 
 import type { Transport, NucleusPlugin, NucleusFeatures } from '../types.js';
 import { requireNucleus, assertIdentifier } from '../helpers.js';
@@ -51,12 +64,18 @@ class ColumnarModelImpl implements ColumnarModel {
       throw new Error('COLUMNAR_INSERT requires at least one column/value pair');
     }
     // Engine signature is variadic: COLUMNAR_INSERT(table, col1, val1, col2, val2, ...)
+    // JS numbers bind WITH a ::double precision cast: untyped params are
+    // stored as text and the numeric aggregates then silently answer 0/NULL
+    // (X03 live finding against the real engine). Text/other values bind
+    // uncast — the store is schema-less and the value's JS type is the only
+    // type information there is.
     const args: unknown[] = [table];
-    for (const [col, val] of entries) {
+    const pairs = entries.map(([col, val], i) => {
       args.push(col, val);
-    }
-    const placeholders = args.map((_, i) => `$${i + 1}`).join(', ');
-    const result = await this.transport.fetchval<string>(`SELECT COLUMNAR_INSERT(${placeholders})`, args);
+      const cast = typeof val === 'number' ? '::double precision' : '';
+      return `$${i * 2 + 2}, $${i * 2 + 3}${cast}`;
+    });
+    const result = await this.transport.fetchval<string>(`SELECT COLUMNAR_INSERT($1, ${pairs.join(', ')})`, args);
     return result === 'OK';
   }
 

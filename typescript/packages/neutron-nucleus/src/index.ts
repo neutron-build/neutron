@@ -78,8 +78,8 @@ export type { KVModel, KVSetOptions } from './kv/index.js';
 export { withVector } from './vector/index.js';
 export type { VectorModel, VectorSearchResult, VectorSearchOptions, DistanceMetric } from './vector/index.js';
 
-export { withTimeSeries } from './timeseries/index.js';
-export type { TimeSeriesModel, TimeSeriesPoint, AggFunc, BucketInterval, TimeSeriesQueryOptions } from './timeseries/index.js';
+export { withTimeSeries, probeTimeSeriesModel } from './timeseries/index.js';
+export type { TimeSeriesModel, TimeSeriesPoint, AggFunc, BucketInterval, TimeSeriesQueryOptions, TimeSeriesModelEvidence, TimeSeriesProbeCheck } from './timeseries/index.js';
 
 export { withDocument } from './document/index.js';
 export type { DocumentModel, DocFindOptions } from './document/index.js';

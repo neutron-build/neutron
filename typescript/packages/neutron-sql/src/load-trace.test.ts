@@ -81,11 +81,12 @@ console.log(JSON.stringify({
 // X01: the root import must also leave the optional capability modules
 // (/pgvector, /fts) unloaded — the SQL-only root does not pull the
 // pgvector/FTS surface until a consumer imports the entry point explicitly.
-test("load-trace: SQL-only root loads no /pgvector or /fts module", () => {
+// X03 extends the claim to /timeseries and /columnar.
+test("load-trace: SQL-only root loads no optional capability module (/pgvector, /fts, /timeseries, /columnar)", () => {
   const res = runChild(`
 const root = await import(${JSON.stringify(pathToFileURL(path.join(packageRoot, "dist", "index.js")).href)});
 const optionalModules = Object.keys(require.cache).filter(
-  (k) => k.includes("/dist/pgvector.js") || k.includes("/dist/fts.js"),
+  (k) => k.includes("/dist/pgvector.js") || k.includes("/dist/fts.js") || k.includes("/dist/timeseries.js") || k.includes("/dist/columnar.js"),
 );
 console.log(JSON.stringify({
   imported: true,
@@ -99,7 +100,30 @@ console.log(JSON.stringify({
   assert.equal(out.imported, true);
   // The deprecated root aliases are plain re-exports living in schema.js —
   // importing the root must still not load the module files themselves.
-  assert.deepEqual(out.optionalModulesLoaded, [], "the root import must not load dist/pgvector.js or dist/fts.js");
+  assert.deepEqual(out.optionalModulesLoaded, [], "the root import must not load dist/pgvector.js, dist/fts.js, dist/timeseries.js or dist/columnar.js");
+});
+
+// X03: /timeseries and /columnar import standalone, with no driver
+// resolvable — capability surfaces over the same lazy-driver substrate.
+test("load-trace: /timeseries and /columnar import standalone without drivers", () => {
+  const res = runChild(`
+const ts = await import(${JSON.stringify(pathToFileURL(path.join(packageRoot, "dist", "timeseries.js")).href)});
+const col = await import(${JSON.stringify(pathToFileURL(path.join(packageRoot, "dist", "columnar.js")).href)});
+console.log(JSON.stringify({
+  timeBucket: typeof ts.timeBucket,
+  tsBetween: typeof ts.tsBetween,
+  timeSeries: typeof ts.timeSeries,
+  hypertableSupport: typeof ts.hypertableSupport,
+  inspectColumnarStorage: typeof col.inspectColumnarStorage,
+}));
+`);
+  assert.equal(res.status, 0, `optional-module imports must succeed without drivers:\n${res.stderr}`);
+  const out = JSON.parse(res.stdout.trim().split("\n").at(-1)!);
+  assert.equal(out.timeBucket, "function");
+  assert.equal(out.tsBetween, "function");
+  assert.equal(out.timeSeries, "function");
+  assert.equal(out.hypertableSupport, "function");
+  assert.equal(out.inspectColumnarStorage, "function");
 });
 
 // X01: the optional modules import standalone, with no driver resolvable —

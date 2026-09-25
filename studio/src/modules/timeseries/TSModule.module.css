@@ -202,3 +202,11 @@
   font-size: var(--text-xs);
   color: var(--text-tertiary);
 }
+
+.statsTitle {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-tertiary);
+  margin-bottom: var(--space-2);
+}

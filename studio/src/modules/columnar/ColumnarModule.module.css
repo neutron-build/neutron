@@ -52,3 +52,11 @@
 
 .grid { flex: 1; overflow: hidden; }
 .hint { display: flex; align-items: center; justify-content: center; height: 100%; font-size: var(--text-sm); color: var(--text-tertiary); text-align: center; padding: var(--space-4); }
+
+.durabilityNote {
+  padding: var(--space-2) var(--space-4);
+  font-size: 11px;
+  color: var(--text-tertiary);
+  border-bottom: 1px solid var(--border);
+  line-height: 1.5;
+}

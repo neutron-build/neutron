@@ -416,6 +416,110 @@ withdrawn: a skipped column is later queried but nonexistent. v1 documents
 with vector columns now fail with a pointer to schema document v2 (whose
 `capabilities: ["pgvector"]` is detected per database at apply time).
 
+## Time-series and columnar workflows (X03)
+
+Time-series workflows on the SQL substrate live in an OPTIONAL capability
+module — the SQL-only root never loads it; importing the entry point is the
+explicit opt-in. Everything is core PostgreSQL: no extension, no retention
+daemon, no server-side materialization.
+
+### Time series (`@neutron-build/sql/timeseries`)
+
+```ts
+import { timeBucket, tsBetween, timeSeries, hypertableSupport } from "@neutron-build/sql/timeseries";
+
+const metrics = pgTable("metrics", {
+  id: serial("id").primaryKey(),
+  sensor: text("sensor").notNull(),
+  ts: timestamptz("ts").notNull(),
+  value: double("value").notNull(),
+});
+
+const m = timeSeries(db, metrics, {
+  timestamp: metrics.ts,
+  value: metrics.value,
+  retention: { keepSeconds: 86_400 },                        // metadata only — nothing deletes on its own
+  downsampling: [{ name: "hourly_avg", bucket: "hour", fn: "avg" }],
+});
+
+// bucketed aggregate: one statement, hand-oracle-verifiable
+await m.bucketQuery({ start: "2026-09-24T00:00:00Z", end: "2026-09-25T00:00:00Z" }, { unit: "hour" });
+
+// rolling window over the bucket sequence (Q08 composability)
+const b = timeBucket(metrics.ts, "minute");
+const bucketed = cteTable("minute_buckets", db.select({ b, v: avg(metrics.value) }).from(metrics).groupBy(b));
+await db.select({ b: bucketed.b, prev: over(lag(bucketed.v), { orderBy: [asc(bucketed.b)] }) }).from(bucketed);
+
+// retention: ONE delete with an exact boundary — a row exactly at the
+// cutoff survives, anything 1µs older drops; pin `asOf` for determinism
+await m.applyRetention();                 // reads the server clock once, then one DELETE
+await m.applyRetention("2026-09-24T12:00:00Z"); // pinned: exactly one statement
+```
+
+- `timeBucket(col, unit, { timeZone })` builds `date_trunc(...)` as a
+  structural node carrying the `ts-bucketing` capability (probe-resolved
+  with semantic controls, including the timezone argument — Nucleus 1.0.2
+  resolves `unsupported` and every bucket statement fails closed before any
+  SQL runs). Bucket results follow the lossless temporal wire form:
+  microsecond precision survives, bucket labels are exact instants. The
+  unit/zone render as validated inline literals so the same expression is
+  byte-identical in the projection, GROUP BY and ORDER BY (PostgreSQL
+  matches them as one expression; `$n` placeholders renumber per site and
+  would break the match). Zone-less `date_trunc` on `timestamptz` truncates
+  in the SESSION timezone by PostgreSQL design — pass an explicit
+  `timeZone` when bucket boundaries must be session-independent.
+- `tsBetween(col, { start, end })` is the canonical half-open range
+  `[start, end)`: start included, end excluded, boundaries validated at
+  microsecond resolution and bound through the column codec (canonical
+  strings keep all six fraction digits; Dates are millisecond exact).
+- `applyRetention` computes the boundary in exact arithmetic
+  (`asOf − keepSeconds`) and binds it as a parameter — no interval
+  arithmetic in SQL, no wall-clock nondeterminism inside the statement.
+- `continuousAggregate()` is disabled with a reason: PostgreSQL core has no
+  continuous aggregates and no automatic downsampling materialization.
+  `downsampleQuery` runs on demand instead (exact, one statement).
+  `hypertableSupport(driver)` reports the timescaledb extension state
+  honestly (installed / available / absent / unknown) and never claims
+  integration — `integrated` is `false` until an engine integration is
+  actually built and proven.
+- Retention/downsampling live as typed metadata plus executable plans;
+  PostgreSQL has no retention daemon, so retention happens only when
+  `applyRetention` runs (documented, honest).
+
+### Columnar inspection (`@neutron-build/sql/columnar`)
+
+```ts
+import { inspectColumnarStorage } from "@neutron-build/sql/columnar";
+
+const report = await inspectColumnarStorage(db.driver);
+// PostgreSQL core: { status: "heap-only", accessMethods: [{ name: "heap", columnar: false }], integrated: false }
+```
+
+Read-only `pg_am` inspection with an honest conclusion: core PostgreSQL
+stores tables heap-only; a columnar table access method exists only when an
+extension provides one, and this ORM integrates none (`integrated` is
+always `false` — inspection only, never a columnar-execution claim). Engines
+whose catalogs cannot answer report `unknown` with the server's own reason
+— never a silent "absent".
+
+### Nucleus time-series and columnar model clients
+
+The `@neutron-build/nucleus` clients (`timeseries`, `columnar` plugins) talk
+to the engine's own `TS_*` / `COLUMNAR_*` model surface — a different thing
+from the SQL substrate above. X03 gates the surfaces the X00 capability
+report records no evidence for with lazily-memoized semantic probes
+(`probeTimeSeriesModel`): `TS_RANGE` and `TIME_BUCKET` are proven real on
+the live engine (exact range points, real floor bucketing) before
+`query()`/`timeBucket()` trust them; a fake implementation fails closed
+with the probe evidence. The engine's retention is global, destructive,
+retroactive and irreversible — `retention(days)` documents exactly that,
+and per-series retention is not offered because the engine has no such
+surface. Columnar `insert()` binds numbers with an explicit cast (untyped
+binds are stored as text and the engine's numeric aggregates then
+silently answer `0`/`NULL` — an upstream defect recorded with a
+reproducer); the store refuses inserts inside explicit transactions and is
+append-only. Engine evidence: `conformance/live/orm/x03-nucleus-leg.mjs`.
+
 ## Property mapping, NULL and required keys
 
 All `select`, projections, `returning` (insert/update/delete) and relational
