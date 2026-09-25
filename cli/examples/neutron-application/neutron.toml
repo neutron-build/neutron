@@ -1,0 +1,38 @@
+[application]
+version = 1
+name = "neutron-example"
+
+# Both services follow FRAMEWORK_CONTRACT.md: no ports declared, so the
+# coordinator assigns them, passes NEUTRON_HOST/NEUTRON_PORT, waits on
+# GET /health, and gives each the contract's 30s shutdown drain.
+[application.services.api]
+path = "api"
+command = ["go", "run", "."]
+contract = "neutron/v1"
+
+# web finds the API through NEUTRON_SERVICE_API_URL, injected from depends_on.
+[application.services.web]
+path = "web"
+command = ["./node_modules/.bin/neutron-ts", "dev"]
+contract = "neutron/v1"
+depends_on = ["api"]
+
+[application.tasks.api-test]
+path = "api"
+command = ["go", "vet", "./..."]
+timeout = "5m"
+
+# Typed client: api/openapi.json is the committed, reviewed interface
+# (refresh with `neutron project spec --write --service api`; CI runs --check).
+# The web app's types are generated from it, never hand-written.
+[application.tasks.web-api-types]
+path = "web"
+command = ["./node_modules/.bin/openapi-typescript", "../api/openapi.json", "--output", "src/api.d.ts"]
+timeout = "2m"
+outputs = ["src/api.d.ts"]
+
+[application.tasks.web-typecheck]
+path = "web"
+command = ["./node_modules/.bin/tsc", "--noEmit"]
+depends_on = ["web-api-types"]
+timeout = "5m"

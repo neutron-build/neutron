@@ -1,0 +1,23 @@
+{
+  "name": "neutron-example-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "neutron-ts dev",
+    "build": "neutron-ts build",
+    "start": "neutron-ts start"
+  },
+  "dependencies": {
+    "@neutron-build/core": "file:../../../../typescript/packages/neutron",
+    "@neutron-build/cli": "file:../../../../typescript/packages/neutron-cli",
+    "preact": "^10.25.4",
+    "preact-render-to-string": "^6.5.0"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.9.4",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7",
+    "openapi-typescript": "^7.13.0",
+    "@types/node": "^22.10.0"
+  }
+}

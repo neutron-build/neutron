@@ -37,6 +37,7 @@ brew upgrade neutron   # delegated automatically for Homebrew installs
 | `new <name>` | Scaffold a new project in a chosen language (python, typescript, go, rust, zig, julia) |
 | `init` | Add a `neutron.toml` (and `migrations/`) to an existing project |
 | `dev` | Detect the project language and start its dev server |
+| `project check` / `plan` / `run` | Validate, inspect and run tasks for an experimental multi-service application |
 | `db` | Manage a local Nucleus instance -- subcommands `start`, `stop`, `status`, `reset` |
 | `migrate` | Apply SQL migrations -- subcommands `status`, `create <name>`, `down [N]` |
 | `seed` | Run a SQL seed file against the database |
@@ -76,6 +77,12 @@ Generate a typed client for a table, or every table in a schema:
 neutron generate --table users --lang ts --out ./src/db/
 neutron generate --all --lang go --out ./gen
 ```
+
+For an opt-in multi-language development session, see the
+[experimental application coordinator example](examples/application/README.md).
+An `[application]` table lets `dev` start native commands with dependency readiness
+and coordinated shutdown on macOS and Linux. Projects without that table retain
+the existing language delegation.
 
 ## neutron mcp
 
