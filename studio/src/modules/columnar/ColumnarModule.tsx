@@ -158,6 +158,20 @@ export function ColumnarModule({ name }: ColumnarModuleProps) {
 
       {rlsDenied.value && <RlsNotice detail={rlsDenied.value} />}
 
+      {/* Honest durability note (engine semantics, X03 leg evidence): the
+          COLUMNAR_* store is fsync-durable at commit (survives kill -9) and
+          REFUSES inserts inside an explicit transaction rather than silently
+          persisting rolled-back rows. Append-only: no delete exists. SQL
+          tables created WITH (engine='columnar') are a separate surface with
+          full transaction semantics. */}
+      <div class={s.durabilityNote}>
+        Columnar store: fsync-durable per commit, append-only (no delete), inserts
+        inside transactions are rejected by the engine. Numeric cells must bind
+        unquoted (this module emits numeric literals) — quoted numbers are stored
+        as text and aggregates silently answer 0/NULL. SQL tables WITH
+        (engine='columnar') are a separate surface with full transactions.
+      </div>
+
       {/* Aggregates (COLUMNAR_SUM/AVG/MIN/MAX) */}
       <div class={s.statsPanel}>
         <div class={s.statsTitle}>Aggregate</div>

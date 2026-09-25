@@ -32,6 +32,14 @@
     "./fts": {
       "types": "./dist/fts.d.ts",
       "import": "./dist/fts.js"
+    },
+    "./timeseries": {
+      "types": "./dist/timeseries.d.ts",
+      "import": "./dist/timeseries.js"
+    },
+    "./columnar": {
+      "types": "./dist/columnar.d.ts",
+      "import": "./dist/columnar.js"
     }
   },
   "files": [

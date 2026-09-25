@@ -29,6 +29,7 @@ import type {
 } from "./types.js";
 
 import { requireNucleus } from "./helpers.js";
+import { NucleusNotSupportedError } from "./errors.js";
 
 // Model plugins
 import { withSQL } from "./sql/index.js";
@@ -59,11 +60,20 @@ interface MockCall {
 class WireTransport implements Transport {
   readonly calls: MockCall[] = [];
   private responses: Map<string, unknown> = new Map();
+  private responseFns: Array<{ prefix: string; fn: (params: unknown[]) => unknown }> = [];
   private queryResponses: Map<string, unknown[]> = new Map();
 
   /** Register a fetchval response for SQL matching a prefix. */
   whenFetchval(sqlPrefix: string, result: unknown): void {
     this.responses.set(sqlPrefix, result);
+  }
+
+  /** Register a PARAM-AWARE fetchval response (checked before the constant
+   *  map): the handler sees the bound parameters, like a real engine's
+   *  evaluator would. Handlers must be registered before constant entries
+   *  they need to win against. */
+  whenFetchvalFn(sqlPrefix: string, fn: (params: unknown[]) => unknown): void {
+    this.responseFns.push({ prefix: sqlPrefix, fn });
   }
 
   /** Register a query response for SQL matching a prefix. */
@@ -89,6 +99,11 @@ class WireTransport implements Transport {
 
   async fetchval<T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> {
     this.calls.push({ method: "fetchval", sql, params });
+    for (const { prefix, fn } of this.responseFns) {
+      if (sql.includes(prefix)) {
+        return fn(params) as T;
+      }
+    }
     for (const [prefix, result] of this.responses) {
       if (sql.includes(prefix)) {
         return result as T;
@@ -494,26 +509,70 @@ describe("Integration: TimeSeries model SQL functions", () => {
     assert.equal(calls[0].params![0], 90 * 86_400_000);
   });
 
-  it("TIME_BUCKET truncates timestamp", async () => {
-    transport.whenFetchval("TIME_BUCKET", 1704067200000);
+  it("TIME_BUCKET truncates timestamp (probe-proven engine)", async () => {
+    // A REAL engine answers the semantic probe (grid flooring) before the
+    // user call is trusted; this handler models that engine exactly.
+    transport.whenFetchvalFn("TIME_BUCKET", (params) => {
+      const bs = params[0] as number;
+      const t = params[1] as number;
+      return Math.floor(t / bs) * bs;
+    });
     const bucket = await ts.timeBucket("hour", new Date("2024-01-01T12:34:56Z"));
-    assert.equal(bucket, 1704067200000);
+    assert.equal(bucket, Math.floor(new Date("2024-01-01T12:34:56Z").getTime() / 3_600_000) * 3_600_000);
     const calls = transport.sqlCalls("TIME_BUCKET");
-    assert.equal(calls[0].params![0], 3_600_000);
+    assert.equal(calls[calls.length - 1].params![0], 3_600_000);
   });
 
-  it("query without downsample reads raw points through TS_RANGE", async () => {
-    // This asserted that query REJECTS with "no raw point-range fetch". That
-    // was true of the SQL surface and false of the store, and it meant three
-    // SDKs gave three answers to one question — Python synthesised the result
-    // from sixty bucketed calls while this one threw. TS_RANGE closed the gap
-    // in the engine; the test now asserts the behaviour rather than the gap.
-    transport.whenFetchval("TS_RANGE", JSON.stringify([{ t: 0, v: 1.5 }, { t: 500, v: 2.5 }]));
+  it("TIME_BUCKET fails closed on a fake engine (echo), with probe evidence and no user call", async () => {
+    transport.whenFetchvalFn("TIME_BUCKET", (params) => params[1]);
+    await assert.rejects(
+      () => ts.timeBucket("hour", new Date("2024-01-01T12:34:56Z")),
+      (err: unknown) => {
+        assert.ok(err instanceof NucleusNotSupportedError, `expected NucleusNotSupportedError, got ${err}`);
+        assert.match(err.message, /did not floor onto the bucket grid/);
+        assert.match(err.message, /an echo returns 1/);
+        return true;
+      },
+    );
+    // only probe calls ran — the user timestamp never crossed the boundary
+    const calls = transport.sqlCalls("TIME_BUCKET");
+    assert.ok(calls.every((c) => c.params![1] !== new Date("2024-01-01T12:34:56Z").getTime()));
+  });
+
+  it("query without downsample reads raw points through TS_RANGE (probe-proven engine)", async () => {
+    // A REAL engine answers the semantic probe first: the probe series gets
+    // exactly its two in-range points; afterwards the user query passes.
+    // (The pre-probe client asserted the same behaviour against a mock that
+    // never proved anything — the X03 gate adds the evidence requirement.)
+    transport.whenFetchvalFn("TS_RANGE", (params) => {
+      const series = params[0] as string;
+      if (series.startsWith("__neutron_ts_probe_")) {
+        return JSON.stringify([{ t: 3000, v: 2 }, { t: 6000, v: 6 }]);
+      }
+      return JSON.stringify([{ t: 0, v: 1.5 }, { t: 500, v: 2.5 }]);
+    });
     const points = await ts.query("cpu", new Date(0), new Date(1000));
     assert.equal(points.length, 2);
     assert.equal(points[0].value, 1.5);
     assert.equal(points[0].timestamp.getTime(), 0);
     assert.equal(points[1].timestamp.getTime(), 500);
+  });
+
+  it("query fails closed when TS_RANGE answers globally (fake), with probe evidence", async () => {
+    // every series gets ALL probe points — a global fetch, not a range fetch
+    transport.whenFetchvalFn("TS_RANGE", () =>
+      JSON.stringify([{ t: 1000, v: 1 }, { t: 3000, v: 2 }, { t: 6000, v: 6 }, { t: 9000, v: 4 }]),
+    );
+    await assert.rejects(
+      () => ts.query("cpu", new Date(0), new Date(1000)),
+      (err: unknown) => {
+        assert.ok(err instanceof NucleusNotSupportedError, `expected NucleusNotSupportedError, got ${err}`);
+        assert.match(err.message, /did not return the exact points/);
+        return true;
+      },
+    );
+    // the user series was never queried
+    assert.equal(transport.sqlCalls("TS_RANGE").filter((c) => c.params![0] === "cpu").length, 0);
   });
 
   it("aggregate rejects unsupported aggregation functions", async () => {
