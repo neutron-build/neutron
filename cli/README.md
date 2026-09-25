@@ -128,7 +128,12 @@ Limits of the name check: it cannot see through a user-defined function, view
 or operator that wraps one of the refused functions, and on Nucleus a mutating
 function the engine adds outside its own lists would pass. Connect the MCP
 server as a low-privilege role (most of those functions need superuser or an
-explicit grant); that, not the guard, is what bounds an agent.
+explicit grant); that, not the guard, is what bounds an agent on PostgreSQL.
+On Nucleus the read-only default is **best-effort**: the engine applies no
+`READ ONLY` and nothing rolls back a wrapped write, so a view or routine that
+wraps a mutating function runs and its write persists, and its roles do not
+reliably bound this. Expose a Nucleus MCP server only to agents you would
+trust with writes.
 
 **Writes are an explicit tool.** `execute_sql` exists only when the server is
 started with `--allow-writes`; it runs one statement in its own transaction,

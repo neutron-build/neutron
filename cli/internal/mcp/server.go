@@ -217,11 +217,11 @@ type toolCallParams struct {
 
 // RunHTTP starts an HTTP server on addr (e.g. ":7700") exposing three API surfaces:
 //
-//   POST /mcp              — MCP over HTTP (JSON-RPC 2.0, same protocol as stdio)
-//   GET  /openai/tools     — OpenAI function definitions (paste into any OpenAI SDK call)
-//   POST /openai/tools/call — OpenAI-compatible tool execution
-//   GET  /tools            — plain JSON tool list (generic REST)
-//   POST /tools/{name}     — plain REST tool call with JSON body arguments
+//	POST /mcp              — MCP over HTTP (JSON-RPC 2.0, same protocol as stdio)
+//	GET  /openai/tools     — OpenAI function definitions (paste into any OpenAI SDK call)
+//	POST /openai/tools/call — OpenAI-compatible tool execution
+//	GET  /tools            — plain JSON tool list (generic REST)
+//	POST /tools/{name}     — plain REST tool call with JSON body arguments
 func (s *Server) RunHTTP(ctx context.Context, addr string) error {
 	handler, err := s.httpHandler(addr)
 	if err != nil {
