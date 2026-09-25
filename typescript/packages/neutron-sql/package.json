@@ -25,10 +25,6 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
-    "./pgvector": {
-      "types": "./dist/pgvector.d.ts",
-      "import": "./dist/pgvector.js"
-    },
     "./fts": {
       "types": "./dist/fts.d.ts",
       "import": "./dist/fts.js"
@@ -40,6 +36,10 @@
     "./columnar": {
       "types": "./dist/columnar.d.ts",
       "import": "./dist/columnar.js"
+    },
+    "./listen-notify": {
+      "types": "./dist/listen-notify.d.ts",
+      "import": "./dist/listen-notify.js"
     }
   },
   "files": [

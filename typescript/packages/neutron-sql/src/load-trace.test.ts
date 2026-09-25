@@ -82,11 +82,12 @@ console.log(JSON.stringify({
 // (/pgvector, /fts) unloaded — the SQL-only root does not pull the
 // pgvector/FTS surface until a consumer imports the entry point explicitly.
 // X03 extends the claim to /timeseries and /columnar.
-test("load-trace: SQL-only root loads no optional capability module (/pgvector, /fts, /timeseries, /columnar)", () => {
+// X05 adds /listen-notify to the same rule.
+test("load-trace: SQL-only root loads no optional capability module (/pgvector, /fts, /timeseries, /columnar, /listen-notify)", () => {
   const res = runChild(`
 const root = await import(${JSON.stringify(pathToFileURL(path.join(packageRoot, "dist", "index.js")).href)});
 const optionalModules = Object.keys(require.cache).filter(
-  (k) => k.includes("/dist/pgvector.js") || k.includes("/dist/fts.js") || k.includes("/dist/timeseries.js") || k.includes("/dist/columnar.js"),
+  (k) => k.includes("/dist/pgvector.js") || k.includes("/dist/fts.js") || k.includes("/dist/timeseries.js") || k.includes("/dist/columnar.js") || k.includes("/dist/listen-notify.js"),
 );
 console.log(JSON.stringify({
   imported: true,
@@ -100,7 +101,7 @@ console.log(JSON.stringify({
   assert.equal(out.imported, true);
   // The deprecated root aliases are plain re-exports living in schema.js —
   // importing the root must still not load the module files themselves.
-  assert.deepEqual(out.optionalModulesLoaded, [], "the root import must not load dist/pgvector.js, dist/fts.js, dist/timeseries.js or dist/columnar.js");
+  assert.deepEqual(out.optionalModulesLoaded, [], "the root import must not load dist/pgvector.js, dist/fts.js, dist/timeseries.js, dist/columnar.js or dist/listen-notify.js");
 });
 
 // X03: /timeseries and /columnar import standalone, with no driver
@@ -124,6 +125,24 @@ console.log(JSON.stringify({
   assert.equal(out.timeSeries, "function");
   assert.equal(out.hypertableSupport, "function");
   assert.equal(out.inspectColumnarStorage, "function");
+});
+
+// X05: /listen-notify imports standalone with no driver resolvable — pg is
+// loaded lazily at listener creation.
+test("load-trace: /listen-notify imports standalone without drivers", () => {
+  const res = runChild(`
+const ln = await import(${JSON.stringify(pathToFileURL(path.join(packageRoot, "dist", "listen-notify.js")).href)});
+console.log(JSON.stringify({
+  pgListener: typeof ln.pgListener,
+  postgresJsListener: typeof ln.postgresJsListener,
+  notifyStatement: typeof ln.notifyStatement,
+}));
+`);
+  assert.equal(res.status, 0, `/listen-notify import must succeed without drivers:\n${res.stderr}`);
+  const out = JSON.parse(res.stdout.trim().split("\n").at(-1)!);
+  assert.equal(out.pgListener, "function");
+  assert.equal(out.postgresJsListener, "function");
+  assert.equal(out.notifyStatement, "function");
 });
 
 // X01: the optional modules import standalone, with no driver resolvable —

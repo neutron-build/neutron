@@ -132,6 +132,12 @@ export function CDCModule() {
       {rlsDenied.value && <RlsNotice detail={rlsDenied.value} />}
       <div class={s.header}>
         <span class={s.title}>Change Data Capture</span>
+        <span
+          class={s.walPos}
+          title={'Verified on Nucleus 1.0.2: only INSERT statements emit CDC events - UPDATE and DELETE statements do not reach the log (engine defect, recorded upstream). Events carry metadata only (seq, table, change, ts) and are emitted at statement time, so rolled-back transactions appear too.'}
+        >
+          metadata only - INSERT events only (Nucleus 1.0.2)
+        </span>
         {totalCount.value != null && (
           <span class={s.walPos} title="Total change events">{totalCount.value.toLocaleString()} events</span>
         )}
