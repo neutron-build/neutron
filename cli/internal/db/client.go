@@ -164,6 +164,15 @@ func (c *Client) BeginTx(ctx context.Context) (pgx.Tx, error) {
 	return c.pool.Begin(ctx)
 }
 
+// BeginReadOnly opens a READ ONLY transaction. Callers roll it back: it
+// exists to run inspection reads under the server's own write refusal
+// (PostgreSQL rejects writes with 25006). Engines that do not apply READ
+// ONLY (Nucleus: capability report txn.read_only_rejects_writes) need a
+// separate guard.
+func (c *Client) BeginReadOnly(ctx context.Context) (pgx.Tx, error) {
+	return c.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+}
+
 // Query executes a SQL query and returns rows.
 func (c *Client) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	return c.pool.Query(ctx, sql, args...)

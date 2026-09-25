@@ -1,0 +1,1234 @@
+{
+  "nucleus": {
+    "engine": {
+      "product": "nucleus",
+      "version": "1.0.2",
+      "raw": "PostgreSQL 16.0 (Nucleus 1.0.2 — The Definitive Database)"
+    },
+    "measured": {
+      "report": "conformance/live/orm/capabilities.nucleus.json",
+      "nucleusVersion": "1.0.2",
+      "nucleusTree": "3313729ae51300b67b77b2181ee87ac5287dfdec",
+      "recorded": "2026-09-24"
+    },
+    "current": true,
+    "models": [
+      {
+        "model": "sql",
+        "label": "SQL",
+        "availability": "supported",
+        "availabilityReason": "relational SQL over pgwire; the ORM capability report lists what the ORM can rely on (71/140 probes supported through pg)",
+        "transaction": "partial",
+        "transactionNote": "DML commits and rolls back (savepoints included) and other sessions do not see uncommitted rows; DDL is NOT transactional (it survives ROLLBACK and is visible before COMMIT); isolation levels and READ ONLY are not applied (every level behaves as read committed)",
+        "durability": "survives-restart",
+        "durabilityNote": "committed rows survived SIGKILL and restart in the X04 restart battery; power loss was not measured",
+        "atomicWithSql": "supported",
+        "warnings": [
+          "DDL runs outside the transaction: a failed migration leaves earlier statements applied",
+          "BEGIN READ ONLY does not stop writes on this engine",
+          "no advisory locks, statement_timeout or query cancellation"
+        ],
+        "evidence": [
+          {
+            "source": "conformance/live/orm/capabilities.nucleus.json",
+            "ref": "txn.savepoint_rollback",
+            "observed": "supported"
+          },
+          {
+            "source": "conformance/live/orm/capabilities.nucleus.json",
+            "ref": "txn.read_committed_sees_commits",
+            "observed": "supported"
+          },
+          {
+            "source": "conformance/live/orm/capabilities.nucleus.json",
+            "ref": "ddl.error_aborts_transaction",
+            "observed": "supported"
+          },
+          {
+            "source": "conformance/live/orm/capabilities.nucleus.json",
+            "ref": "ddl.create_table_rollback",
+            "observed": "unsupported"
+          },
+          {
+            "source": "conformance/live/orm/capabilities.nucleus.json",
+            "ref": "ddl.failed_migration_all_or_nothing",
+            "observed": "unsupported"
+          },
+          {
+            "source": "conformance/live/orm/capabilities.nucleus.json",
+            "ref": "ddl.uncommitted_ddl_invisible",
+            "observed": "unsupported"
+          },
+          {
+            "source": "conformance/live/orm/capabilities.nucleus.json",
+            "ref": "txn.isolation_levels_applied",
+            "observed": "unsupported"
+          },
+          {
+            "source": "conformance/live/orm/capabilities.nucleus.json",
+            "ref": "txn.read_only_rejects_writes",
+            "observed": "unsupported"
+          },
+          {
+            "source": "conformance/live/orm/capabilities.nucleus.json",
+            "ref": "lock.advisory_session",
+            "observed": "unsupported"
+          },
+          {
+            "source": "conformance/live/orm/capabilities.nucleus.json",
+            "ref": "lock.statement_timeout",
+            "observed": "unsupported"
+          },
+          {
+            "source": "conformance/live/orm/x02-nucleus-leg.mjs",
+            "ref": "rollbackRevertsAll",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x02-nucleus-leg.mjs",
+            "ref": "dirtyReads",
+            "observed": "pass"
+          },
+          {
+            "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
+            "ref": "restart post verified",
+            "observed": "pass"
+          }
+        ]
+      },
+      {
+        "model": "kv",
+        "label": "Key-Value",
+        "availability": "supported",
+        "availabilityReason": "string/typed values, TTLs, namespaces and collections pass the X04 live battery",
+        "transaction": "unknown",
+        "transactionNote": "not measured on this build; the engine documents that ROLLBACK undoes scalar KV writes without isolating them from other sessions, and that collection (list/hash/set) writes are refused inside a transaction",
+        "durability": "survives-restart",
+        "durabilityNote": "KV state survived SIGKILL and restart in the X04 restart battery; power loss was not measured",
+        "atomicWithSql": "unsupported",
+        "warnings": [
+          "one global keyspace: namespaces are key prefixes, not permissions",
+          "other sessions can read uncommitted KV writes (engine semantics document)"
+        ],
+        "evidence": [
+          {
+            "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
+            "ref": "kv: namespace isolation live",
+            "observed": "pass"
+          },
+          {
+            "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
+            "ref": "restart post verified",
+            "observed": "pass"
+          },
+          {
+            "source": "nucleus/docs/MODEL_SEMANTICS.md",
+            "ref": "KV (scalar keys)",
+            "observed": "documented"
+          }
+        ]
+      },
+      {
+        "model": "vector",
+        "label": "Vector",
+        "availability": "unknown",
+        "availabilityReason": "pgvector-style SQL columns are unsupported on this build (the ORM's vector capability resolves unsupported, 0A000); the Nucleus VECTOR_* function surface Studio browses is not measured",
+        "transaction": "unknown",
+        "transactionNote": "not measured on this build",
+        "durability": "unknown",
+        "durabilityNote": "not measured on this build",
+        "atomicWithSql": "unknown",
+        "warnings": [
+          "vector results are not verified against an independent oracle on this engine"
+        ],
+        "evidence": [
+          {
+            "source": "conformance/live/orm/x01-nucleus-leg.mjs",
+            "ref": "vector-type",
+            "observed": "pass"
+          }
+        ]
+      },
+      {
+        "model": "timeseries",
+        "label": "TimeSeries",
+        "availability": "supported",
+        "availabilityReason": "TS_* insert, count and range reads pass the X03 leg (range scoping checked against hand oracles)",
+        "transaction": "unknown",
+        "transactionNote": "not measured on this build",
+        "durability": "survives-restart",
+        "durabilityNote": "points survived SIGKILL and restart in the X03 leg; power loss was not measured",
+        "atomicWithSql": "unknown",
+        "warnings": [
+          "retention policies are global and retroactive: they delete existing and backfilled points of every series"
+        ],
+        "evidence": [
+          {
+            "source": "conformance/live/orm/x03-nucleus-leg.mjs",
+            "ref": "afterKill9",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x03-nucleus-leg.mjs",
+            "ref": "rangeCountScopingExact",
+            "observed": "pass"
+          }
+        ]
+      },
+      {
+        "model": "document",
+        "label": "Document",
+        "availability": "supported",
+        "availabilityReason": "collection-scoped DOC_* functions resolve supported (value-asserting probes, X02)",
+        "transaction": "rollback-not-isolated",
+        "transactionNote": "ROLLBACK removes the transaction's documents and COMMIT publishes them, but other sessions read them before COMMIT; Studio and the client run each document call as its own statement",
+        "durability": "survives-restart",
+        "durabilityNote": "committed documents survived SIGKILL and restart; an open transaction's documents were gone (X02 leg); power loss was not measured",
+        "atomicWithSql": "unsupported",
+        "warnings": [
+          "no isolation: other sessions see uncommitted documents",
+          "collections are namespaces, not access control"
+        ],
+        "evidence": [
+          {
+            "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
+            "ref": "document-collections",
+            "observed": "supported"
+          },
+          {
+            "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
+            "ref": "specialty-session-isolation",
+            "observed": "unsupported"
+          },
+          {
+            "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
+            "ref": "atomic-sql-specialty-writes",
+            "observed": "unsupported"
+          },
+          {
+            "source": "conformance/live/orm/x02-nucleus-leg.mjs",
+            "ref": "rollbackRevertsAll",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x02-nucleus-leg.mjs",
+            "ref": "dirtyReads",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x02-nucleus-leg.mjs",
+            "ref": "committedDocument",
+            "observed": "pass"
+          }
+        ]
+      },
+      {
+        "model": "graph",
+        "label": "Graph",
+        "availability": "supported",
+        "availabilityReason": "GRAPH_NODE/GRAPH_NEIGHBORS and property matching resolve supported (X02); traversal is bounded client-side",
+        "transaction": "rollback-not-isolated",
+        "transactionNote": "ROLLBACK removes the transaction's nodes and COMMIT publishes them, but other sessions read them before COMMIT",
+        "durability": "survives-restart",
+        "durabilityNote": "committed nodes survived SIGKILL and restart (X02 leg); power loss was not measured",
+        "atomicWithSql": "unsupported",
+        "warnings": [
+          "one global graph: no tenant, namespace or permission boundary",
+          "no isolation: other sessions see uncommitted nodes",
+          "GRAPH_QUERY takes Cypher text only (no parameters)"
+        ],
+        "evidence": [
+          {
+            "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
+            "ref": "graph-adjacency",
+            "observed": "supported"
+          },
+          {
+            "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
+            "ref": "graph-property-match",
+            "observed": "supported"
+          },
+          {
+            "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
+            "ref": "graph-tenant-isolation",
+            "observed": "unsupported"
+          },
+          {
+            "source": "conformance/live/orm/x02-nucleus-leg.mjs",
+            "ref": "rollbackRevertsAll",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x02-nucleus-leg.mjs",
+            "ref": "dirtyReads",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x02-nucleus-leg.mjs",
+            "ref": "committedGraph",
+            "observed": "pass"
+          }
+        ]
+      },
+      {
+        "model": "fts",
+        "label": "Full-Text",
+        "availability": "unknown",
+        "availabilityReason": "PostgreSQL-style full-text functions are faked on this build (to_tsvector returns its argument, ts_rank is constant) and resolve unsupported; the FTS_* document index Studio browses is not measured",
+        "transaction": "unknown",
+        "transactionNote": "not measured on this build; the engine documents that FTS_* index writes happen at statement time and are only best-effort undone by ROLLBACK",
+        "durability": "unknown",
+        "durabilityNote": "not measured on this build",
+        "atomicWithSql": "unsupported",
+        "warnings": [
+          "FTS_* index writes are not tied to the SQL transaction (engine semantics document)"
+        ],
+        "evidence": [
+          {
+            "source": "conformance/live/orm/x01-nucleus-leg.mjs",
+            "ref": "fts-functions",
+            "observed": "pass"
+          },
+          {
+            "source": "nucleus/docs/MODEL_SEMANTICS.md",
+            "ref": "Full-text search",
+            "observed": "documented"
+          }
+        ]
+      },
+      {
+        "model": "geo",
+        "label": "Geo",
+        "availability": "supported",
+        "availabilityReason": "GEO_* functions match hand oracles; layers are ordinary SQL tables (X04 live battery)",
+        "transaction": "not-applicable",
+        "transactionNote": "pure functions hold no state; layer rows are SQL rows with SQL's limits",
+        "durability": "not-applicable",
+        "durabilityNote": "no geo store exists; layer rows are SQL rows",
+        "atomicWithSql": "supported",
+        "warnings": [],
+        "evidence": [
+          {
+            "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
+            "ref": "geo: predicates match hand oracles",
+            "observed": "pass"
+          }
+        ]
+      },
+      {
+        "model": "blob",
+        "label": "Blob",
+        "availability": "supported",
+        "availabilityReason": "byte-exact round trips, ranges and streaming pass the X04 live battery",
+        "transaction": "unknown",
+        "transactionNote": "not measured on this build",
+        "durability": "survives-restart",
+        "durabilityNote": "blobs survived SIGKILL and restart in the X04 restart battery; power loss was not measured",
+        "atomicWithSql": "unsupported",
+        "warnings": [
+          "blob writes are separate statements from any SQL row that references them"
+        ],
+        "evidence": [
+          {
+            "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
+            "ref": "blob: byte-exact round-trip",
+            "observed": "pass"
+          },
+          {
+            "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
+            "ref": "restart post verified",
+            "observed": "pass"
+          }
+        ]
+      },
+      {
+        "model": "streams",
+        "label": "Streams",
+        "availability": "supported",
+        "availabilityReason": "STREAM_* append, range, consumer groups and acks pass the X05 leg",
+        "transaction": "rollback-not-isolated",
+        "transactionNote": "ROLLBACK removes a pending append (X05 leg); isolation from other sessions is not measured",
+        "durability": "survives-restart",
+        "durabilityNote": "entries, groups, cursors and acks survived SIGKILL and restart (X05 leg); power loss was not measured",
+        "atomicWithSql": "unknown",
+        "warnings": [
+          "resume with the last entry's full id: a bare millisecond cursor silently skips entries in that millisecond",
+          "consumer-group delivery is at-most-once"
+        ],
+        "evidence": [
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "streams.rollback_removes_pending_append",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "streams.restart_entries_group_cursor_ack",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "streams.resume_cursor_full_id_vs_bare_ms",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "streams.group_at_most_once_ack",
+            "observed": "pass"
+          }
+        ]
+      },
+      {
+        "model": "columnar",
+        "label": "Columnar",
+        "availability": "supported",
+        "availabilityReason": "COLUMNAR_* store and engine='columnar' tables pass the X03 leg",
+        "transaction": "refused-in-transaction",
+        "transactionNote": "COLUMNAR_* store inserts are refused inside an explicit transaction and are append-only; engine='columnar' SQL tables honour ROLLBACK like SQL tables",
+        "durability": "survives-restart",
+        "durabilityNote": "store rows survived SIGKILL and restart (X03 leg); power loss was not measured",
+        "atomicWithSql": "unsupported",
+        "warnings": [
+          "COLUMNAR_* inserts cannot join a transaction",
+          "numbers passed as quoted text are stored as text and aggregate wrongly"
+        ],
+        "evidence": [
+          {
+            "source": "conformance/live/orm/x03-nucleus-leg.mjs",
+            "ref": "inTxInsert",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x03-nucleus-leg.mjs",
+            "ref": "rollbackOnEngineTable",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x03-nucleus-leg.mjs",
+            "ref": "afterKill9",
+            "observed": "pass"
+          }
+        ]
+      },
+      {
+        "model": "datalog",
+        "label": "Datalog",
+        "availability": "supported",
+        "availabilityReason": "DATALOG_* facts, rules and recursive queries pass the X05 leg",
+        "transaction": "unknown",
+        "transactionNote": "not measured on this build; the engine documents that a rolled-back DATALOG_ASSERT can return after a restart (its log is not compensated on rollback)",
+        "durability": "survives-restart",
+        "durabilityNote": "facts and rules survived SIGKILL and restart (X05 leg); power loss was not measured",
+        "atomicWithSql": "unsupported",
+        "warnings": [
+          "a rolled-back assertion can reappear after a restart (engine semantics document)"
+        ],
+        "evidence": [
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "datalog.facts_and_rules_survive_restart",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "datalog.roundtrip_recursion_oracle",
+            "observed": "pass"
+          },
+          {
+            "source": "nucleus/docs/MODEL_SEMANTICS.md",
+            "ref": "Datalog",
+            "observed": "documented"
+          }
+        ]
+      },
+      {
+        "model": "cdc",
+        "label": "CDC",
+        "availability": "supported",
+        "availabilityReason": "CDC_READ / CDC_TABLE_READ pass the X05 leg (metadata-only events)",
+        "transaction": "not-transactional",
+        "transactionNote": "events are emitted at statement time, before COMMIT; a rolled-back transaction's events stay in the log with no compensating record",
+        "durability": "survives-restart",
+        "durabilityNote": "the log replayed and its sequence continued after SIGKILL and restart (X05 leg); per-event fsync is not measured",
+        "atomicWithSql": "unsupported",
+        "warnings": [
+          "only INSERT statements emit events on this build: UPDATE and DELETE never reach the log",
+          "events are metadata only (seq, table, change, ts) and include rolled-back work"
+        ],
+        "evidence": [
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "cdc.delivery_shape",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "cdc.pre_commit_emission_and_gaps",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "cdc.restart_replay_seq_continues",
+            "observed": "pass"
+          }
+        ]
+      },
+      {
+        "model": "pubsub",
+        "label": "PubSub",
+        "availability": "supported",
+        "availabilityReason": "LISTEN/NOTIFY cross-connection delivery and the PUBSUB_* publish surface pass the X05 leg, with divergences",
+        "transaction": "not-transactional",
+        "transactionNote": "notifications sent inside a rolled-back transaction are still delivered",
+        "durability": "not-durable",
+        "durabilityNote": "in-memory fan-out: nothing is persisted, and a message published with no subscriber is dropped (engine semantics document)",
+        "atomicWithSql": "unsupported",
+        "warnings": [
+          "an idle listener receives nothing until it runs a statement",
+          "messages are lost on restart"
+        ],
+        "evidence": [
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "listen.rollback_tx_pre_commit_divergence",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "listen.cross_connection_delivery_flush_divergence",
+            "observed": "pass"
+          },
+          {
+            "source": "nucleus/docs/MODEL_SEMANTICS.md",
+            "ref": "Pub/Sub",
+            "observed": "documented"
+          }
+        ]
+      }
+    ]
+  },
+  "nucleusUnmeasured": {
+    "engine": {
+      "product": "nucleus",
+      "version": "9.9.9",
+      "raw": "PostgreSQL 16.0 (Nucleus 9.9.9 — The Definitive Database)"
+    },
+    "measured": {
+      "report": "conformance/live/orm/capabilities.nucleus.json",
+      "nucleusVersion": "1.0.2",
+      "nucleusTree": "3313729ae51300b67b77b2181ee87ac5287dfdec",
+      "recorded": "2026-09-24"
+    },
+    "current": false,
+    "currentNote": "limits were measured on Nucleus 1.0.2 (nucleus/ tree 3313729ae513); the connected build reports 9.9.9 and has not been measured, so every status below is unknown",
+    "models": [
+      {
+        "model": "sql",
+        "label": "SQL",
+        "availability": "unknown",
+        "availabilityReason": "measured on Nucleus 1.0.2, not on 9.9.9: relational SQL over pgwire; the ORM capability report lists what the ORM can rely on (71/140 probes supported through pg)",
+        "transaction": "unknown",
+        "transactionNote": "measured on Nucleus 1.0.2, not on 9.9.9: DML commits and rolls back (savepoints included) and other sessions do not see uncommitted rows; DDL is NOT transactional (it survives ROLLBACK and is visible before COMMIT); isolation levels and READ ONLY are not applied (every level behaves as read committed)",
+        "durability": "unknown",
+        "durabilityNote": "measured on Nucleus 1.0.2, not on 9.9.9: committed rows survived SIGKILL and restart in the X04 restart battery; power loss was not measured",
+        "atomicWithSql": "unknown",
+        "warnings": [
+          "DDL runs outside the transaction: a failed migration leaves earlier statements applied",
+          "BEGIN READ ONLY does not stop writes on this engine",
+          "no advisory locks, statement_timeout or query cancellation"
+        ],
+        "evidence": [
+          {
+            "source": "conformance/live/orm/capabilities.nucleus.json",
+            "ref": "txn.savepoint_rollback",
+            "observed": "supported"
+          },
+          {
+            "source": "conformance/live/orm/capabilities.nucleus.json",
+            "ref": "txn.read_committed_sees_commits",
+            "observed": "supported"
+          },
+          {
+            "source": "conformance/live/orm/capabilities.nucleus.json",
+            "ref": "ddl.error_aborts_transaction",
+            "observed": "supported"
+          },
+          {
+            "source": "conformance/live/orm/capabilities.nucleus.json",
+            "ref": "ddl.create_table_rollback",
+            "observed": "unsupported"
+          },
+          {
+            "source": "conformance/live/orm/capabilities.nucleus.json",
+            "ref": "ddl.failed_migration_all_or_nothing",
+            "observed": "unsupported"
+          },
+          {
+            "source": "conformance/live/orm/capabilities.nucleus.json",
+            "ref": "ddl.uncommitted_ddl_invisible",
+            "observed": "unsupported"
+          },
+          {
+            "source": "conformance/live/orm/capabilities.nucleus.json",
+            "ref": "txn.isolation_levels_applied",
+            "observed": "unsupported"
+          },
+          {
+            "source": "conformance/live/orm/capabilities.nucleus.json",
+            "ref": "txn.read_only_rejects_writes",
+            "observed": "unsupported"
+          },
+          {
+            "source": "conformance/live/orm/capabilities.nucleus.json",
+            "ref": "lock.advisory_session",
+            "observed": "unsupported"
+          },
+          {
+            "source": "conformance/live/orm/capabilities.nucleus.json",
+            "ref": "lock.statement_timeout",
+            "observed": "unsupported"
+          },
+          {
+            "source": "conformance/live/orm/x02-nucleus-leg.mjs",
+            "ref": "rollbackRevertsAll",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x02-nucleus-leg.mjs",
+            "ref": "dirtyReads",
+            "observed": "pass"
+          },
+          {
+            "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
+            "ref": "restart post verified",
+            "observed": "pass"
+          }
+        ]
+      },
+      {
+        "model": "kv",
+        "label": "Key-Value",
+        "availability": "unknown",
+        "availabilityReason": "measured on Nucleus 1.0.2, not on 9.9.9: string/typed values, TTLs, namespaces and collections pass the X04 live battery",
+        "transaction": "unknown",
+        "transactionNote": "measured on Nucleus 1.0.2, not on 9.9.9: not measured on this build; the engine documents that ROLLBACK undoes scalar KV writes without isolating them from other sessions, and that collection (list/hash/set) writes are refused inside a transaction",
+        "durability": "unknown",
+        "durabilityNote": "measured on Nucleus 1.0.2, not on 9.9.9: KV state survived SIGKILL and restart in the X04 restart battery; power loss was not measured",
+        "atomicWithSql": "unsupported",
+        "warnings": [
+          "one global keyspace: namespaces are key prefixes, not permissions",
+          "other sessions can read uncommitted KV writes (engine semantics document)"
+        ],
+        "evidence": [
+          {
+            "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
+            "ref": "kv: namespace isolation live",
+            "observed": "pass"
+          },
+          {
+            "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
+            "ref": "restart post verified",
+            "observed": "pass"
+          },
+          {
+            "source": "nucleus/docs/MODEL_SEMANTICS.md",
+            "ref": "KV (scalar keys)",
+            "observed": "documented"
+          }
+        ]
+      },
+      {
+        "model": "vector",
+        "label": "Vector",
+        "availability": "unknown",
+        "availabilityReason": "measured on Nucleus 1.0.2, not on 9.9.9: pgvector-style SQL columns are unsupported on this build (the ORM's vector capability resolves unsupported, 0A000); the Nucleus VECTOR_* function surface Studio browses is not measured",
+        "transaction": "unknown",
+        "transactionNote": "measured on Nucleus 1.0.2, not on 9.9.9: not measured on this build",
+        "durability": "unknown",
+        "durabilityNote": "measured on Nucleus 1.0.2, not on 9.9.9: not measured on this build",
+        "atomicWithSql": "unknown",
+        "warnings": [
+          "vector results are not verified against an independent oracle on this engine"
+        ],
+        "evidence": [
+          {
+            "source": "conformance/live/orm/x01-nucleus-leg.mjs",
+            "ref": "vector-type",
+            "observed": "pass"
+          }
+        ]
+      },
+      {
+        "model": "timeseries",
+        "label": "TimeSeries",
+        "availability": "unknown",
+        "availabilityReason": "measured on Nucleus 1.0.2, not on 9.9.9: TS_* insert, count and range reads pass the X03 leg (range scoping checked against hand oracles)",
+        "transaction": "unknown",
+        "transactionNote": "measured on Nucleus 1.0.2, not on 9.9.9: not measured on this build",
+        "durability": "unknown",
+        "durabilityNote": "measured on Nucleus 1.0.2, not on 9.9.9: points survived SIGKILL and restart in the X03 leg; power loss was not measured",
+        "atomicWithSql": "unknown",
+        "warnings": [
+          "retention policies are global and retroactive: they delete existing and backfilled points of every series"
+        ],
+        "evidence": [
+          {
+            "source": "conformance/live/orm/x03-nucleus-leg.mjs",
+            "ref": "afterKill9",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x03-nucleus-leg.mjs",
+            "ref": "rangeCountScopingExact",
+            "observed": "pass"
+          }
+        ]
+      },
+      {
+        "model": "document",
+        "label": "Document",
+        "availability": "unknown",
+        "availabilityReason": "measured on Nucleus 1.0.2, not on 9.9.9: collection-scoped DOC_* functions resolve supported (value-asserting probes, X02)",
+        "transaction": "unknown",
+        "transactionNote": "measured on Nucleus 1.0.2, not on 9.9.9: ROLLBACK removes the transaction's documents and COMMIT publishes them, but other sessions read them before COMMIT; Studio and the client run each document call as its own statement",
+        "durability": "unknown",
+        "durabilityNote": "measured on Nucleus 1.0.2, not on 9.9.9: committed documents survived SIGKILL and restart; an open transaction's documents were gone (X02 leg); power loss was not measured",
+        "atomicWithSql": "unsupported",
+        "warnings": [
+          "no isolation: other sessions see uncommitted documents",
+          "collections are namespaces, not access control"
+        ],
+        "evidence": [
+          {
+            "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
+            "ref": "document-collections",
+            "observed": "supported"
+          },
+          {
+            "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
+            "ref": "specialty-session-isolation",
+            "observed": "unsupported"
+          },
+          {
+            "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
+            "ref": "atomic-sql-specialty-writes",
+            "observed": "unsupported"
+          },
+          {
+            "source": "conformance/live/orm/x02-nucleus-leg.mjs",
+            "ref": "rollbackRevertsAll",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x02-nucleus-leg.mjs",
+            "ref": "dirtyReads",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x02-nucleus-leg.mjs",
+            "ref": "committedDocument",
+            "observed": "pass"
+          }
+        ]
+      },
+      {
+        "model": "graph",
+        "label": "Graph",
+        "availability": "unknown",
+        "availabilityReason": "measured on Nucleus 1.0.2, not on 9.9.9: GRAPH_NODE/GRAPH_NEIGHBORS and property matching resolve supported (X02); traversal is bounded client-side",
+        "transaction": "unknown",
+        "transactionNote": "measured on Nucleus 1.0.2, not on 9.9.9: ROLLBACK removes the transaction's nodes and COMMIT publishes them, but other sessions read them before COMMIT",
+        "durability": "unknown",
+        "durabilityNote": "measured on Nucleus 1.0.2, not on 9.9.9: committed nodes survived SIGKILL and restart (X02 leg); power loss was not measured",
+        "atomicWithSql": "unsupported",
+        "warnings": [
+          "one global graph: no tenant, namespace or permission boundary",
+          "no isolation: other sessions see uncommitted nodes",
+          "GRAPH_QUERY takes Cypher text only (no parameters)"
+        ],
+        "evidence": [
+          {
+            "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
+            "ref": "graph-adjacency",
+            "observed": "supported"
+          },
+          {
+            "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
+            "ref": "graph-property-match",
+            "observed": "supported"
+          },
+          {
+            "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
+            "ref": "graph-tenant-isolation",
+            "observed": "unsupported"
+          },
+          {
+            "source": "conformance/live/orm/x02-nucleus-leg.mjs",
+            "ref": "rollbackRevertsAll",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x02-nucleus-leg.mjs",
+            "ref": "dirtyReads",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x02-nucleus-leg.mjs",
+            "ref": "committedGraph",
+            "observed": "pass"
+          }
+        ]
+      },
+      {
+        "model": "fts",
+        "label": "Full-Text",
+        "availability": "unknown",
+        "availabilityReason": "measured on Nucleus 1.0.2, not on 9.9.9: PostgreSQL-style full-text functions are faked on this build (to_tsvector returns its argument, ts_rank is constant) and resolve unsupported; the FTS_* document index Studio browses is not measured",
+        "transaction": "unknown",
+        "transactionNote": "measured on Nucleus 1.0.2, not on 9.9.9: not measured on this build; the engine documents that FTS_* index writes happen at statement time and are only best-effort undone by ROLLBACK",
+        "durability": "unknown",
+        "durabilityNote": "measured on Nucleus 1.0.2, not on 9.9.9: not measured on this build",
+        "atomicWithSql": "unsupported",
+        "warnings": [
+          "FTS_* index writes are not tied to the SQL transaction (engine semantics document)"
+        ],
+        "evidence": [
+          {
+            "source": "conformance/live/orm/x01-nucleus-leg.mjs",
+            "ref": "fts-functions",
+            "observed": "pass"
+          },
+          {
+            "source": "nucleus/docs/MODEL_SEMANTICS.md",
+            "ref": "Full-text search",
+            "observed": "documented"
+          }
+        ]
+      },
+      {
+        "model": "geo",
+        "label": "Geo",
+        "availability": "unknown",
+        "availabilityReason": "measured on Nucleus 1.0.2, not on 9.9.9: GEO_* functions match hand oracles; layers are ordinary SQL tables (X04 live battery)",
+        "transaction": "not-applicable",
+        "transactionNote": "pure functions hold no state; layer rows are SQL rows with SQL's limits",
+        "durability": "not-applicable",
+        "durabilityNote": "no geo store exists; layer rows are SQL rows",
+        "atomicWithSql": "unknown",
+        "warnings": [],
+        "evidence": [
+          {
+            "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
+            "ref": "geo: predicates match hand oracles",
+            "observed": "pass"
+          }
+        ]
+      },
+      {
+        "model": "blob",
+        "label": "Blob",
+        "availability": "unknown",
+        "availabilityReason": "measured on Nucleus 1.0.2, not on 9.9.9: byte-exact round trips, ranges and streaming pass the X04 live battery",
+        "transaction": "unknown",
+        "transactionNote": "measured on Nucleus 1.0.2, not on 9.9.9: not measured on this build",
+        "durability": "unknown",
+        "durabilityNote": "measured on Nucleus 1.0.2, not on 9.9.9: blobs survived SIGKILL and restart in the X04 restart battery; power loss was not measured",
+        "atomicWithSql": "unsupported",
+        "warnings": [
+          "blob writes are separate statements from any SQL row that references them"
+        ],
+        "evidence": [
+          {
+            "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
+            "ref": "blob: byte-exact round-trip",
+            "observed": "pass"
+          },
+          {
+            "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
+            "ref": "restart post verified",
+            "observed": "pass"
+          }
+        ]
+      },
+      {
+        "model": "streams",
+        "label": "Streams",
+        "availability": "unknown",
+        "availabilityReason": "measured on Nucleus 1.0.2, not on 9.9.9: STREAM_* append, range, consumer groups and acks pass the X05 leg",
+        "transaction": "unknown",
+        "transactionNote": "measured on Nucleus 1.0.2, not on 9.9.9: ROLLBACK removes a pending append (X05 leg); isolation from other sessions is not measured",
+        "durability": "unknown",
+        "durabilityNote": "measured on Nucleus 1.0.2, not on 9.9.9: entries, groups, cursors and acks survived SIGKILL and restart (X05 leg); power loss was not measured",
+        "atomicWithSql": "unknown",
+        "warnings": [
+          "resume with the last entry's full id: a bare millisecond cursor silently skips entries in that millisecond",
+          "consumer-group delivery is at-most-once"
+        ],
+        "evidence": [
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "streams.rollback_removes_pending_append",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "streams.restart_entries_group_cursor_ack",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "streams.resume_cursor_full_id_vs_bare_ms",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "streams.group_at_most_once_ack",
+            "observed": "pass"
+          }
+        ]
+      },
+      {
+        "model": "columnar",
+        "label": "Columnar",
+        "availability": "unknown",
+        "availabilityReason": "measured on Nucleus 1.0.2, not on 9.9.9: COLUMNAR_* store and engine='columnar' tables pass the X03 leg",
+        "transaction": "unknown",
+        "transactionNote": "measured on Nucleus 1.0.2, not on 9.9.9: COLUMNAR_* store inserts are refused inside an explicit transaction and are append-only; engine='columnar' SQL tables honour ROLLBACK like SQL tables",
+        "durability": "unknown",
+        "durabilityNote": "measured on Nucleus 1.0.2, not on 9.9.9: store rows survived SIGKILL and restart (X03 leg); power loss was not measured",
+        "atomicWithSql": "unsupported",
+        "warnings": [
+          "COLUMNAR_* inserts cannot join a transaction",
+          "numbers passed as quoted text are stored as text and aggregate wrongly"
+        ],
+        "evidence": [
+          {
+            "source": "conformance/live/orm/x03-nucleus-leg.mjs",
+            "ref": "inTxInsert",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x03-nucleus-leg.mjs",
+            "ref": "rollbackOnEngineTable",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x03-nucleus-leg.mjs",
+            "ref": "afterKill9",
+            "observed": "pass"
+          }
+        ]
+      },
+      {
+        "model": "datalog",
+        "label": "Datalog",
+        "availability": "unknown",
+        "availabilityReason": "measured on Nucleus 1.0.2, not on 9.9.9: DATALOG_* facts, rules and recursive queries pass the X05 leg",
+        "transaction": "unknown",
+        "transactionNote": "measured on Nucleus 1.0.2, not on 9.9.9: not measured on this build; the engine documents that a rolled-back DATALOG_ASSERT can return after a restart (its log is not compensated on rollback)",
+        "durability": "unknown",
+        "durabilityNote": "measured on Nucleus 1.0.2, not on 9.9.9: facts and rules survived SIGKILL and restart (X05 leg); power loss was not measured",
+        "atomicWithSql": "unsupported",
+        "warnings": [
+          "a rolled-back assertion can reappear after a restart (engine semantics document)"
+        ],
+        "evidence": [
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "datalog.facts_and_rules_survive_restart",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "datalog.roundtrip_recursion_oracle",
+            "observed": "pass"
+          },
+          {
+            "source": "nucleus/docs/MODEL_SEMANTICS.md",
+            "ref": "Datalog",
+            "observed": "documented"
+          }
+        ]
+      },
+      {
+        "model": "cdc",
+        "label": "CDC",
+        "availability": "unknown",
+        "availabilityReason": "measured on Nucleus 1.0.2, not on 9.9.9: CDC_READ / CDC_TABLE_READ pass the X05 leg (metadata-only events)",
+        "transaction": "unknown",
+        "transactionNote": "measured on Nucleus 1.0.2, not on 9.9.9: events are emitted at statement time, before COMMIT; a rolled-back transaction's events stay in the log with no compensating record",
+        "durability": "unknown",
+        "durabilityNote": "measured on Nucleus 1.0.2, not on 9.9.9: the log replayed and its sequence continued after SIGKILL and restart (X05 leg); per-event fsync is not measured",
+        "atomicWithSql": "unsupported",
+        "warnings": [
+          "only INSERT statements emit events on this build: UPDATE and DELETE never reach the log",
+          "events are metadata only (seq, table, change, ts) and include rolled-back work"
+        ],
+        "evidence": [
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "cdc.delivery_shape",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "cdc.pre_commit_emission_and_gaps",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "cdc.restart_replay_seq_continues",
+            "observed": "pass"
+          }
+        ]
+      },
+      {
+        "model": "pubsub",
+        "label": "PubSub",
+        "availability": "unknown",
+        "availabilityReason": "measured on Nucleus 1.0.2, not on 9.9.9: LISTEN/NOTIFY cross-connection delivery and the PUBSUB_* publish surface pass the X05 leg, with divergences",
+        "transaction": "unknown",
+        "transactionNote": "measured on Nucleus 1.0.2, not on 9.9.9: notifications sent inside a rolled-back transaction are still delivered",
+        "durability": "unknown",
+        "durabilityNote": "measured on Nucleus 1.0.2, not on 9.9.9: in-memory fan-out: nothing is persisted, and a message published with no subscriber is dropped (engine semantics document)",
+        "atomicWithSql": "unsupported",
+        "warnings": [
+          "an idle listener receives nothing until it runs a statement",
+          "messages are lost on restart"
+        ],
+        "evidence": [
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "listen.rollback_tx_pre_commit_divergence",
+            "observed": "pass"
+          },
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "listen.cross_connection_delivery_flush_divergence",
+            "observed": "pass"
+          },
+          {
+            "source": "nucleus/docs/MODEL_SEMANTICS.md",
+            "ref": "Pub/Sub",
+            "observed": "documented"
+          }
+        ]
+      }
+    ]
+  },
+  "postgres": {
+    "engine": {
+      "product": "postgres",
+      "version": "17.11",
+      "raw": "PostgreSQL 17.11"
+    },
+    "measured": {
+      "report": "conformance/live/orm/capabilities.nucleus.json",
+      "nucleusVersion": "1.0.2",
+      "nucleusTree": "3313729ae51300b67b77b2181ee87ac5287dfdec",
+      "recorded": "2026-09-24"
+    },
+    "current": true,
+    "live": {
+      "fsync": "on",
+      "synchronousCommit": "on",
+      "defaultTransactionIsolation": "read committed",
+      "defaultTransactionReadOnly": "off"
+    },
+    "models": [
+      {
+        "model": "sql",
+        "label": "SQL",
+        "availability": "supported",
+        "availabilityReason": "PostgreSQL; the conformance probes pass here as the control (run.mjs --control)",
+        "transaction": "atomic",
+        "transactionNote": "PostgreSQL transactions: DML and DDL commit or roll back together; Studio row commits and schema applies each run as one transaction; default isolation on this connection: read committed",
+        "durability": "engine-documented",
+        "durabilityNote": "fsync=on, synchronous_commit=on on this connection: commits are WAL-flushed before acknowledgement",
+        "atomicWithSql": "supported",
+        "warnings": [],
+        "evidence": [
+          {
+            "source": "postgresql-documentation",
+            "ref": "Transactions / WAL reliability",
+            "observed": "documented"
+          },
+          {
+            "source": "live-connection-settings",
+            "ref": "fsync, synchronous_commit, default_transaction_isolation",
+            "observed": "read"
+          }
+        ]
+      },
+      {
+        "model": "kv",
+        "label": "Key-Value",
+        "availability": "unsupported",
+        "availabilityReason": "Nucleus model; the connected engine is PostgreSQL",
+        "transaction": "not-applicable",
+        "transactionNote": "model not available on this engine",
+        "durability": "not-applicable",
+        "durabilityNote": "model not available on this engine",
+        "atomicWithSql": "unsupported",
+        "warnings": [],
+        "evidence": []
+      },
+      {
+        "model": "vector",
+        "label": "Vector",
+        "availability": "unsupported",
+        "availabilityReason": "Nucleus vector model is not present; pgvector columns, when the extension is installed, are ordinary SQL columns with SQL's limits",
+        "transaction": "not-applicable",
+        "transactionNote": "model not available on this engine",
+        "durability": "not-applicable",
+        "durabilityNote": "model not available on this engine",
+        "atomicWithSql": "unsupported",
+        "warnings": [],
+        "evidence": []
+      },
+      {
+        "model": "timeseries",
+        "label": "TimeSeries",
+        "availability": "unsupported",
+        "availabilityReason": "Nucleus model; the connected engine is PostgreSQL",
+        "transaction": "not-applicable",
+        "transactionNote": "model not available on this engine",
+        "durability": "not-applicable",
+        "durabilityNote": "model not available on this engine",
+        "atomicWithSql": "unsupported",
+        "warnings": [],
+        "evidence": []
+      },
+      {
+        "model": "document",
+        "label": "Document",
+        "availability": "unsupported",
+        "availabilityReason": "Nucleus model; the connected engine is PostgreSQL",
+        "transaction": "not-applicable",
+        "transactionNote": "model not available on this engine",
+        "durability": "not-applicable",
+        "durabilityNote": "model not available on this engine",
+        "atomicWithSql": "unsupported",
+        "warnings": [],
+        "evidence": []
+      },
+      {
+        "model": "graph",
+        "label": "Graph",
+        "availability": "unsupported",
+        "availabilityReason": "Nucleus model; the connected engine is PostgreSQL",
+        "transaction": "not-applicable",
+        "transactionNote": "model not available on this engine",
+        "durability": "not-applicable",
+        "durabilityNote": "model not available on this engine",
+        "atomicWithSql": "unsupported",
+        "warnings": [],
+        "evidence": []
+      },
+      {
+        "model": "fts",
+        "label": "Full-Text",
+        "availability": "unsupported",
+        "availabilityReason": "Nucleus FTS model is not present; PostgreSQL tsvector columns are ordinary SQL columns with SQL's limits",
+        "transaction": "not-applicable",
+        "transactionNote": "model not available on this engine",
+        "durability": "not-applicable",
+        "durabilityNote": "model not available on this engine",
+        "atomicWithSql": "unsupported",
+        "warnings": [],
+        "evidence": []
+      },
+      {
+        "model": "geo",
+        "label": "Geo",
+        "availability": "unsupported",
+        "availabilityReason": "Nucleus model; the connected engine is PostgreSQL",
+        "transaction": "not-applicable",
+        "transactionNote": "model not available on this engine",
+        "durability": "not-applicable",
+        "durabilityNote": "model not available on this engine",
+        "atomicWithSql": "unsupported",
+        "warnings": [],
+        "evidence": []
+      },
+      {
+        "model": "blob",
+        "label": "Blob",
+        "availability": "unsupported",
+        "availabilityReason": "Nucleus model; the connected engine is PostgreSQL",
+        "transaction": "not-applicable",
+        "transactionNote": "model not available on this engine",
+        "durability": "not-applicable",
+        "durabilityNote": "model not available on this engine",
+        "atomicWithSql": "unsupported",
+        "warnings": [],
+        "evidence": []
+      },
+      {
+        "model": "streams",
+        "label": "Streams",
+        "availability": "unsupported",
+        "availabilityReason": "Nucleus model; the connected engine is PostgreSQL",
+        "transaction": "not-applicable",
+        "transactionNote": "model not available on this engine",
+        "durability": "not-applicable",
+        "durabilityNote": "model not available on this engine",
+        "atomicWithSql": "unsupported",
+        "warnings": [],
+        "evidence": []
+      },
+      {
+        "model": "columnar",
+        "label": "Columnar",
+        "availability": "unsupported",
+        "availabilityReason": "Nucleus model; the connected engine is PostgreSQL",
+        "transaction": "not-applicable",
+        "transactionNote": "model not available on this engine",
+        "durability": "not-applicable",
+        "durabilityNote": "model not available on this engine",
+        "atomicWithSql": "unsupported",
+        "warnings": [],
+        "evidence": []
+      },
+      {
+        "model": "datalog",
+        "label": "Datalog",
+        "availability": "unsupported",
+        "availabilityReason": "Nucleus model; the connected engine is PostgreSQL",
+        "transaction": "not-applicable",
+        "transactionNote": "model not available on this engine",
+        "durability": "not-applicable",
+        "durabilityNote": "model not available on this engine",
+        "atomicWithSql": "unsupported",
+        "warnings": [],
+        "evidence": []
+      },
+      {
+        "model": "cdc",
+        "label": "CDC",
+        "availability": "unsupported",
+        "availabilityReason": "Nucleus CDC is not present; Studio does not surface PostgreSQL logical decoding",
+        "transaction": "not-applicable",
+        "transactionNote": "model not available on this engine",
+        "durability": "not-applicable",
+        "durabilityNote": "model not available on this engine",
+        "atomicWithSql": "unsupported",
+        "warnings": [],
+        "evidence": []
+      },
+      {
+        "model": "pubsub",
+        "label": "PubSub",
+        "availability": "unsupported",
+        "availabilityReason": "Nucleus pub/sub is not present; PostgreSQL LISTEN/NOTIFY is reachable through @neutron-build/sql's listen-notify module, not Studio",
+        "transaction": "not-applicable",
+        "transactionNote": "model not available on this engine",
+        "durability": "not-applicable",
+        "durabilityNote": "model not available on this engine",
+        "atomicWithSql": "unsupported",
+        "warnings": [],
+        "evidence": []
+      }
+    ]
+  }
+}
