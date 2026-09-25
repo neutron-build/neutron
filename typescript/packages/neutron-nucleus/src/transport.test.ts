@@ -772,3 +772,247 @@ describe("PgTransport headers/timeout contract", () => {
     }
   });
 });
+
+// =========================================================================
+// HttpTransport — signal handling (X04 MAJOR-1)
+// =========================================================================
+//
+// request() used to arm its timer off `controller` instead of `timeout`, so
+// the DEFAULT construction (timeout undefined) plus any live signal ran
+// setTimeout(cb, undefined) — firing ~immediately, aborting the INTERNAL
+// controller, and surfacing every request as NucleusConnectionError against
+// a healthy server. These tests run against a real local HTTP server: no
+// transport in this file may carry a signal without proving it works.
+
+import http from "node:http";
+import { NucleusNotSupportedError } from "./index.js";
+
+describe("HttpTransport signal handling (X04 MAJOR-1)", () => {
+  let server: http.Server | undefined;
+
+  async function startServer(handler: (res: http.ServerResponse) => Promise<void>): Promise<number> {
+    server = http.createServer((_req, res) => {
+      void handler(res);
+    });
+    await new Promise<void>((r) => server!.listen(0, "127.0.0.1", r));
+    return (server.address() as { port: number }).port;
+  }
+
+  afterEach(async () => {
+    restoreGlobals();
+    if (server) {
+      await new Promise<void>((r) => server!.close(() => r()));
+      server = undefined;
+    }
+  });
+
+  it("default construction (no timeout) with a live signal completes normally", async () => {
+    const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const port = await startServer(async (res) => {
+      await delay(150);
+      res.end(JSON.stringify({ ok: true, data: [{ val: 42 }], rowCount: 1 }));
+    });
+    const transport = new HttpTransport(`http://127.0.0.1:${port}`); // no timeout — the default construction
+    const ac = new AbortController(); // live, never aborted
+    const result = await transport.query<{ val: number }>("SELECT 42 AS val", [], { signal: ac.signal });
+    assert.equal(result.rows[0].val, 42);
+    await transport.close();
+  });
+
+  it("signal with an explicit timeout completes when the server answers in time", async () => {
+    const port = await startServer(async (res) => {
+      res.end(JSON.stringify({ ok: true, data: [{ val: 42 }], rowCount: 1 }));
+    });
+    const transport = new HttpTransport(`http://127.0.0.1:${port}`, {}, 5000);
+    const ac = new AbortController();
+    const result = await transport.query<{ val: number }>("SELECT 42 AS val", [], { signal: ac.signal });
+    assert.equal(result.rows[0].val, 42);
+    await transport.close();
+  });
+
+  it("aborting the signal mid-flight rejects with AbortError", async () => {
+    const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const port = await startServer(async (res) => {
+      await delay(400);
+      res.end(JSON.stringify({ ok: true, data: [{ val: 42 }], rowCount: 1 }));
+    });
+    const transport = new HttpTransport(`http://127.0.0.1:${port}`); // default construction
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 50);
+    await assert.rejects(
+      () => transport.query("SELECT pg_sleep(1)", [], { signal: ac.signal }),
+      (err: unknown) => err instanceof DOMException && err.name === "AbortError",
+    );
+    await transport.close();
+  });
+
+  it("timeout=0 arms no timer — a slow-ish response still completes", async () => {
+    const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const port = await startServer(async (res) => {
+      await delay(120);
+      res.end(JSON.stringify({ ok: true, data: [{ val: 42 }], rowCount: 1 }));
+    });
+    const transport = new HttpTransport(`http://127.0.0.1:${port}`, {}, 0);
+    const result = await transport.query<{ val: number }>("SELECT 42 AS val");
+    assert.equal(result.rows[0].val, 42);
+    await transport.close();
+  });
+});
+
+// =========================================================================
+// PgTransport — queryCancelable pid-probe window honesty (X04 MAJOR-2)
+// =========================================================================
+//
+// The abort listener used to install a no-op cancelAttempt whenever the
+// pg_backend_pid probe had not answered yet (or had failed), which dodged
+// the !cancelAttempt guard: the statement resolved normally and the
+// caller's abort was silently swallowed. A failed probe meant a PERMANENT
+// silent no-cancel mode. Both paths must reject with the honest
+// could-not-be-dispatched / probe-failed error instead.
+
+interface CancelProbeCfg {
+  pidDelayMs?: number;
+  pidFails?: boolean;
+  statementMs?: number;
+  hangStatement?: boolean;
+}
+
+interface CancelProbeRecords {
+  poolQueries: Array<{ sql: string; params?: unknown[] }>;
+  releases: Array<Error | undefined>;
+}
+
+async function patchCancelPool(cfg: CancelProbeCfg): Promise<{ records: CancelProbeRecords; restore: () => void }> {
+  const mod = (await import("pg")) as unknown as { default?: Record<string, unknown> };
+  const pgExports = (mod.default ?? (mod as unknown as Record<string, unknown>)) as { Pool?: unknown };
+  const RealPool = pgExports.Pool;
+  const records: CancelProbeRecords = { poolQueries: [], releases: [] };
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const PID = 4242;
+  let cancelStatement: ((err: Error) => void) | null = null;
+  class CancelProbePool {
+    constructor() {
+      return {
+        on: () => {},
+        end: async () => {},
+        query: async (sql: string, params?: unknown[]) => {
+          records.poolQueries.push({ sql, params });
+          if (sql.includes("pg_cancel_backend")) {
+            // Mirrors the real engine: the canceled backend's statement
+            // rejects with SQLSTATE 57014.
+            cancelStatement?.(new Error("canceling statement due to user request"));
+            return { rows: [{ canceled: true }], rowCount: 1 };
+          }
+          // No-signal queries go straight through pool.query.
+          if (cfg.statementMs) await sleep(cfg.statementMs);
+          return { rows: [{ v: 42 }], rowCount: 1 };
+        },
+        connect: async () => ({
+          query: async (sql: string) => {
+            if (sql.includes("pg_backend_pid")) {
+              if (cfg.pidDelayMs) await sleep(cfg.pidDelayMs);
+              if (cfg.pidFails) throw new Error("engine lacks pg_backend_pid");
+              return { rows: [{ pid: PID }], rowCount: 1 };
+            }
+            if (cfg.hangStatement) {
+              // In flight until pg_cancel_backend arrives.
+              return new Promise((_resolve, reject) => {
+                cancelStatement = reject;
+              });
+            }
+            if (cfg.statementMs) await sleep(cfg.statementMs);
+            return { rows: [{ v: 42 }], rowCount: 1 };
+          },
+          release: (err?: Error) => {
+            records.releases.push(err);
+          },
+        }),
+      };
+    }
+  }
+  pgExports.Pool = CancelProbePool;
+  return { records, restore: () => { pgExports.Pool = RealPool; } };
+}
+
+describe("PgTransport queryCancelable pid-window honesty (X04 MAJOR-2)", () => {
+  it("abort during the pid-probe window rejects — never resolves silently", async () => {
+    const { restore } = await patchCancelPool({ pidDelayMs: 150 });
+    try {
+      const transport = new PgTransport("postgres://nucleus@localhost:5432/nucleus");
+      const ac = new AbortController();
+      setTimeout(() => ac.abort(), 40); // inside the 150 ms probe window
+      await assert.rejects(
+        () => transport.fetchval("SELECT 42 AS v", [], { signal: ac.signal }),
+        (err: unknown) => {
+          assert(err instanceof NucleusNotSupportedError);
+          assert.match(err.message, /could not be dispatched/);
+          assert.match(err.message, /completed anyway/);
+          return true;
+        },
+      );
+      await transport.close();
+    } finally {
+      restore();
+    }
+  });
+
+  it("failed pid probe + abort mid-statement rejects with the probe failure as cause", async () => {
+    const { records, restore } = await patchCancelPool({ pidFails: true, statementMs: 120 });
+    try {
+      const transport = new PgTransport("postgres://nucleus@localhost:5432/nucleus");
+      const ac = new AbortController();
+      setTimeout(() => ac.abort(), 40); // after the probe failed, statement in flight
+      await assert.rejects(
+        () => transport.fetchval("SELECT 42 AS v", [], { signal: ac.signal }),
+        (err: unknown) => {
+          assert(err instanceof NucleusNotSupportedError);
+          assert.match(err.message, /pg_backend_pid probe failed/);
+          assert.match(err.message, /completed anyway/);
+          assert.match(String((err as NucleusNotSupportedError).cause), /engine lacks pg_backend_pid/);
+          return true;
+        },
+      );
+      assert.equal(records.poolQueries.length, 0, "no pg_cancel_backend can be dispatched without a pid");
+      await transport.close();
+    } finally {
+      restore();
+    }
+  });
+
+  it("abort mid-statement with pid known dispatches pg_cancel_backend and surfaces the cancellation", async () => {
+    const { records, restore } = await patchCancelPool({ hangStatement: true });
+    try {
+      const transport = new PgTransport("postgres://nucleus@localhost:5432/nucleus");
+      const ac = new AbortController();
+      setTimeout(() => ac.abort(), 40);
+      await assert.rejects(
+        () => transport.fetchval("SELECT 1 FROM slow", [], { signal: ac.signal }),
+        /canceling statement due to user request/,
+      );
+      assert.equal(records.poolQueries.length, 1);
+      assert.match(records.poolQueries[0].sql, /pg_cancel_backend/);
+      assert.equal(records.poolQueries[0].params?.[0], 4242);
+      assert.ok(records.releases[0] instanceof Error, "canceled statement must release(err) so the pool destroys the client");
+      await transport.close();
+    } finally {
+      restore();
+    }
+  });
+
+  it("failed pid probe without an abort still runs the query (documented fallback, not a block)", async () => {
+    const { records, restore } = await patchCancelPool({ pidFails: true, statementMs: 5 });
+    try {
+      const transport = new PgTransport("postgres://nucleus@localhost:5432/nucleus");
+      const v = await transport.fetchval<number>("SELECT 42 AS v");
+      assert.equal(v, 42);
+      assert.ok(
+        records.poolQueries.every((q) => !q.sql.includes("pg_cancel_backend")),
+        "no cancel may be dispatched when nothing aborted",
+      );
+      assert.equal(records.releases[0], undefined, "clean release — nothing was canceled");
+      await transport.close();
+    } finally {
+      restore();
+    }
+  });
+});

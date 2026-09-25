@@ -1,6 +1,7 @@
 package studio
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -175,10 +176,10 @@ func (s *Server) handleBlobData(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// ServeContent honors HTTP Range/If-Range requests byte-exactly —
+		// the X04 blob journey exposes partial reads, not just whole files.
 		w.Header().Set("Content-Type", contentType)
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
-		w.WriteHeader(http.StatusOK)
-		w.Write(data) //nolint
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(data))
 	} else {
 		// PostgreSQL: SELECT data, content_type FROM <store> WHERE id = $1
 		sql := fmt.Sprintf(`SELECT data, content_type FROM %s WHERE id = $1`, quoteIdent(store))
@@ -197,9 +198,7 @@ func (s *Server) handleBlobData(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.Header().Set("Content-Type", ct)
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
-		w.WriteHeader(http.StatusOK)
-		w.Write(data) //nolint
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(data))
 	}
 }
 
