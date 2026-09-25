@@ -31,7 +31,7 @@ export function transactionText(l: Limits): [string, Tone] {
 
 export function durabilityText(l: Limits): [string, Tone] {
   switch (l.durability) {
-    case 'survives-restart': return ['survived crash restart (measured)', 'ok']
+    case 'survives-restart': return ['survived engine kill + restart (measured)', 'ok']
     case 'engine-documented': return ['durable per engine documentation', 'ok']
     case 'not-durable': return ['not durable', 'bad']
     case 'not-applicable': return ['no stored state', 'unknown']
@@ -106,10 +106,10 @@ export function ModelLimits({ model, compact }: Props) {
         <ul class={s.evidence} aria-label="Evidence">
           {l.evidence.length === 0 && <li>No evidence recorded: nothing is claimed beyond the statuses above.</li>}
           {l.evidence.map(e => (
-            <li key={`${e.source}:${e.ref}`}><code>{e.ref}</code> — {e.observed} ({e.source})</li>
+            <li key={`${e.source}:${e.ref}`}><code>{e.ref}</code> — {e.observed} ({e.source}); supports {e.supports.join(', ')}</li>
           ))}
           {report && report.engine.product === 'nucleus' && (
-            <li>Measured on Nucleus {report.measured.nucleusVersion}, nucleus/ tree {report.measured.nucleusTree.slice(0, 12)}, recorded {report.measured.recorded}.</li>
+            <li>Measured on Nucleus {report.measured.nucleusVersion}, nucleus/ tree {report.measured.nucleusTree.slice(0, 12)}, recorded {report.measured.recorded}.{report.current && report.currentNote ? ` ${report.currentNote}.` : ''}</li>
           )}
         </ul>
       )}

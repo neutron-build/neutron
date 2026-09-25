@@ -55,8 +55,10 @@ const (
 
 // Durability of acknowledged writes.
 const (
-	// DurRestart: committed writes survived a hard process kill (SIGKILL)
-	// and restart in a measured run. Power loss was not measured.
+	// DurRestart: committed writes survived a kill of the engine process
+	// and a restart in a measured run. The note names the run and whether
+	// the kill was a recorded SIGKILL; where the signal was not recorded, a
+	// clean shutdown is not ruled out. Power loss was never measured.
 	DurRestart = "survives-restart"
 	// DurDocumented: the engine documents commit durability; this program
 	// did not measure it.
@@ -86,12 +88,32 @@ const (
 // probe id and Observed its recorded status; for a conformance leg, Ref is
 // the verdict/check name found in that leg's source and Observed is "pass"
 // (the leg exits non-zero when any verdict fails); for documents, Ref is the
-// section and Observed "documented".
+// section and Observed "documented". Supports names the ModelLimits fields
+// this fact bears on; limits_report_test.go checks each against what the
+// cited probe or verdict actually measured.
 type Evidence struct {
-	Source   string `json:"source"`
-	Ref      string `json:"ref"`
-	Observed string `json:"observed"`
+	Source   string   `json:"source"`
+	Ref      string   `json:"ref"`
+	Observed string   `json:"observed"`
+	Supports []string `json:"supports"`
 }
+
+// Fields an Evidence item can support.
+const (
+	FieldAvailability  = "availability"
+	FieldTransaction   = "transaction"
+	FieldDurability    = "durability"
+	FieldAtomicWithSQL = "atomicWithSql"
+	FieldWarnings      = "warnings"
+)
+
+const (
+	fAvail = FieldAvailability
+	fTx    = FieldTransaction
+	fDur   = FieldDurability
+	fAtom  = FieldAtomicWithSQL
+	fWarn  = FieldWarnings
+)
 
 // Measured reports whether the evidence comes from a run against the named
 // engine build (capability report or leg), not from prose.
@@ -166,7 +188,8 @@ type Report struct {
 	// Current: the connected engine is the measured build (always true for
 	// PostgreSQL rows, which rest on engine semantics and live settings).
 	Current bool `json:"current"`
-	// CurrentNote explains a non-current report.
+	// CurrentNote explains a non-current report, and for a current Nucleus
+	// report how "current" was decided.
 	CurrentNote string        `json:"currentNote,omitempty"`
 	Live        *LiveSettings `json:"live,omitempty"`
 	Models      []ModelLimits `json:"models"`
@@ -248,7 +271,10 @@ func BuildReport(engine Engine, live *LiveSettings) Report {
 	case "nucleus":
 		r.Current = engine.Version == Measured.NucleusVersion
 		models := nucleusLimits()
-		if !r.Current {
+		if r.Current {
+			r.CurrentNote = "the connected engine reports Nucleus " + Measured.NucleusVersion +
+				", the measured build; builds are matched by version string only (the nucleus/ tree cannot be read over the connection), so a different tree reporting the same version is treated as measured"
+		} else {
 			r.CurrentNote = "limits were measured on Nucleus " + Measured.NucleusVersion +
 				" (nucleus/ tree " + Measured.NucleusTree[:12] + "); the connected build reports " +
 				quoteOrUnknown(engine.Version) + " and has not been measured, so every status below is unknown"
@@ -334,11 +360,11 @@ func postgresLimits(live *LiveSettings) []ModelLimits {
 		AtomicWithSQL:      Supported,
 		Warnings:           []string{},
 		Evidence: []Evidence{
-			{Source: SrcPostgresDocs, Ref: "Transactions / WAL reliability", Observed: "documented"},
+			{Source: SrcPostgresDocs, Ref: "Transactions / WAL reliability", Observed: "documented", Supports: []string{fAvail, fTx, fDur, fAtom}},
 		},
 	}
 	if live != nil {
-		sql.Evidence = append(sql.Evidence, Evidence{Source: SrcLiveSettings, Ref: "fsync, synchronous_commit, default_transaction_isolation", Observed: "read"})
+		sql.Evidence = append(sql.Evidence, Evidence{Source: SrcLiveSettings, Ref: "fsync, synchronous_commit, default_transaction_isolation", Observed: "read", Supports: []string{fDur, fTx, fWarn}})
 		switch {
 		case live.Error != "":
 			sql.Durability = DurUnknown
@@ -383,14 +409,20 @@ func postgresLimits(live *LiveSettings) []ModelLimits {
 }
 
 // report is shorthand for capability-report evidence.
-func report(probe, observed string) Evidence {
-	return Evidence{Source: SrcCapabilityReport, Ref: probe, Observed: observed}
+func report(probe, observed string, supports ...string) Evidence {
+	return Evidence{Source: SrcCapabilityReport, Ref: probe, Observed: observed, Supports: supports}
 }
 
-func leg(src, ref string) Evidence { return Evidence{Source: src, Ref: ref, Observed: "pass"} }
+func leg(src, ref string, supports ...string) Evidence {
+	return Evidence{Source: src, Ref: ref, Observed: "pass", Supports: supports}
+}
 
-func docs(section string) Evidence {
-	return Evidence{Source: SrcModelSemantics, Ref: section, Observed: "documented"}
+func gate(capability, observed string, supports ...string) Evidence {
+	return Evidence{Source: SrcSpecialtyGate, Ref: capability, Observed: observed, Supports: supports}
+}
+
+func docs(section string, supports ...string) Evidence {
+	return Evidence{Source: SrcModelSemantics, Ref: section, Observed: "documented", Supports: supports}
 }
 
 // nucleusLimits is the registry for the measured Nucleus build. Every
@@ -406,7 +438,7 @@ func nucleusLimits() []ModelLimits {
 			Transaction:        TxPartial,
 			TransactionNote:    "DML commits and rolls back (savepoints included) and other sessions do not see uncommitted rows; DDL is NOT transactional (it survives ROLLBACK and is visible before COMMIT); isolation levels and READ ONLY are not applied (every level behaves as read committed)",
 			Durability:         DurRestart,
-			DurabilityNote:     "committed rows survived SIGKILL and restart in the X04 restart battery; power loss was not measured",
+			DurabilityNote:     "committed rows survived a kill of the engine process and a restart in the X04 restart battery; the signal was not recorded (SIGKILL is not claimed) and power loss was not measured",
 			AtomicWithSQL:      Supported,
 			Warnings: []string{
 				"DDL runs outside the transaction: a failed migration leaves earlier statements applied",
@@ -414,19 +446,19 @@ func nucleusLimits() []ModelLimits {
 				"no advisory locks, statement_timeout or query cancellation",
 			},
 			Evidence: []Evidence{
-				report("txn.savepoint_rollback", "supported"),
-				report("txn.read_committed_sees_commits", "supported"),
-				report("ddl.error_aborts_transaction", "supported"),
-				report("ddl.create_table_rollback", "unsupported"),
-				report("ddl.failed_migration_all_or_nothing", "unsupported"),
-				report("ddl.uncommitted_ddl_invisible", "unsupported"),
-				report("txn.isolation_levels_applied", "unsupported"),
-				report("txn.read_only_rejects_writes", "unsupported"),
-				report("lock.advisory_session", "unsupported"),
-				report("lock.statement_timeout", "unsupported"),
-				leg(SrcX02Leg, "rollbackRevertsAll"),
-				leg(SrcX02Leg, "dirtyReads"),
-				leg(SrcX04Battery, "restart post verified"),
+				report("txn.savepoint_rollback", "supported", fAvail, fTx),
+				report("txn.read_committed_sees_commits", "supported", fTx),
+				report("ddl.error_aborts_transaction", "supported", fTx),
+				report("ddl.create_table_rollback", "unsupported", fTx, fWarn),
+				report("ddl.failed_migration_all_or_nothing", "unsupported", fTx, fWarn),
+				report("ddl.uncommitted_ddl_invisible", "unsupported", fTx),
+				report("txn.isolation_levels_applied", "unsupported", fTx),
+				report("txn.read_only_rejects_writes", "unsupported", fWarn),
+				report("lock.advisory_session", "unsupported", fWarn),
+				report("lock.statement_timeout", "unsupported", fWarn),
+				leg(SrcX02Leg, "rollbackRevertsAll", fTx),
+				leg(SrcX02Leg, "dirtyReads", fTx),
+				leg(SrcX04Battery, "restart post verified", fDur),
 			},
 		},
 		{
@@ -436,16 +468,16 @@ func nucleusLimits() []ModelLimits {
 			Transaction:        TxUnknown,
 			TransactionNote:    "not measured on this build; the engine documents that ROLLBACK undoes scalar KV writes without isolating them from other sessions, and that collection (list/hash/set) writes are refused inside a transaction",
 			Durability:         DurRestart,
-			DurabilityNote:     "KV state survived SIGKILL and restart in the X04 restart battery; power loss was not measured",
+			DurabilityNote:     "a KV value and a TTL key's remaining lifetime survived a kill of the engine process and a restart in the X04 restart battery; the signal was not recorded (SIGKILL is not claimed) and power loss was not measured",
 			AtomicWithSQL:      Unsupported,
 			Warnings: []string{
 				"one global keyspace: namespaces are key prefixes, not permissions",
 				"other sessions can read uncommitted KV writes (engine semantics document)",
 			},
 			Evidence: []Evidence{
-				leg(SrcX04Battery, "kv: namespace isolation live"),
-				leg(SrcX04Battery, "restart post verified"),
-				docs("KV (scalar keys)"),
+				leg(SrcX04Battery, "kv: namespace isolation live", fAvail, fWarn),
+				leg(SrcX04Battery, "restart post verified", fDur),
+				docs("KV (scalar keys)", fTx, fAtom, fWarn),
 			},
 		},
 		{
@@ -459,7 +491,7 @@ func nucleusLimits() []ModelLimits {
 			AtomicWithSQL:      Unknown,
 			Warnings:           []string{"vector results are not verified against an independent oracle on this engine"},
 			Evidence: []Evidence{
-				leg(SrcX01Leg, "vector-type"),
+				leg(SrcX01Leg, "vector-type", fAvail),
 			},
 		},
 		{
@@ -475,8 +507,8 @@ func nucleusLimits() []ModelLimits {
 				"retention policies are global and retroactive: they delete existing and backfilled points of every series",
 			},
 			Evidence: []Evidence{
-				leg(SrcX03Leg, "afterKill9"),
-				leg(SrcX03Leg, "rangeCountScopingExact"),
+				leg(SrcX03Leg, "afterKill9", fDur),
+				leg(SrcX03Leg, "rangeCountScopingExact", fAvail),
 			},
 		},
 		{
@@ -493,12 +525,12 @@ func nucleusLimits() []ModelLimits {
 				"collections are namespaces, not access control",
 			},
 			Evidence: []Evidence{
-				{Source: SrcSpecialtyGate, Ref: "document-collections", Observed: "supported"},
-				{Source: SrcSpecialtyGate, Ref: "specialty-session-isolation", Observed: "unsupported"},
-				{Source: SrcSpecialtyGate, Ref: "atomic-sql-specialty-writes", Observed: "unsupported"},
-				leg(SrcX02Leg, "rollbackRevertsAll"),
-				leg(SrcX02Leg, "dirtyReads"),
-				leg(SrcX02Leg, "committedDocument"),
+				gate("document-collections", "supported", fAvail),
+				gate("specialty-session-isolation", "unsupported", fTx, fWarn),
+				gate("atomic-sql-specialty-writes", "unsupported", fAtom),
+				leg(SrcX02Leg, "rollbackRevertsAll", fTx),
+				leg(SrcX02Leg, "dirtyReads", fTx, fAtom, fWarn),
+				leg(SrcX02Leg, "committedDocument", fDur),
 			},
 		},
 		{
@@ -516,12 +548,12 @@ func nucleusLimits() []ModelLimits {
 				"GRAPH_QUERY takes Cypher text only (no parameters)",
 			},
 			Evidence: []Evidence{
-				{Source: SrcSpecialtyGate, Ref: "graph-adjacency", Observed: "supported"},
-				{Source: SrcSpecialtyGate, Ref: "graph-property-match", Observed: "supported"},
-				{Source: SrcSpecialtyGate, Ref: "graph-tenant-isolation", Observed: "unsupported"},
-				leg(SrcX02Leg, "rollbackRevertsAll"),
-				leg(SrcX02Leg, "dirtyReads"),
-				leg(SrcX02Leg, "committedGraph"),
+				gate("graph-adjacency", "supported", fAvail),
+				gate("graph-property-match", "supported", fAvail),
+				gate("graph-tenant-isolation", "unsupported", fWarn),
+				leg(SrcX02Leg, "rollbackRevertsAll", fTx),
+				leg(SrcX02Leg, "dirtyReads", fTx, fAtom, fWarn),
+				leg(SrcX02Leg, "committedGraph", fDur),
 			},
 		},
 		{
@@ -535,8 +567,8 @@ func nucleusLimits() []ModelLimits {
 			AtomicWithSQL:      Unsupported,
 			Warnings:           []string{"FTS_* index writes are not tied to the SQL transaction (engine semantics document)"},
 			Evidence: []Evidence{
-				leg(SrcX01Leg, "fts-functions"),
-				docs("Full-text search"),
+				leg(SrcX01Leg, "fts-functions", fAvail),
+				docs("Full-text search", fTx, fAtom, fWarn),
 			},
 		},
 		{
@@ -550,7 +582,8 @@ func nucleusLimits() []ModelLimits {
 			AtomicWithSQL:      Supported,
 			Warnings:           []string{},
 			Evidence: []Evidence{
-				leg(SrcX04Battery, "geo: predicates match hand oracles"),
+				leg(SrcX04Battery, "geo: predicates match hand oracles", fAvail),
+				leg(SrcX04Battery, "geo: layer journey", fAtom),
 			},
 		},
 		{
@@ -560,12 +593,12 @@ func nucleusLimits() []ModelLimits {
 			Transaction:        TxUnknown,
 			TransactionNote:    "not measured on this build",
 			Durability:         DurRestart,
-			DurabilityNote:     "blobs survived SIGKILL and restart in the X04 restart battery; power loss was not measured",
+			DurabilityNote:     "a blob's bytes and content type survived a kill of the engine process and a restart in the X04 restart battery; the signal was not recorded (SIGKILL is not claimed) and power loss was not measured",
 			AtomicWithSQL:      Unsupported,
 			Warnings:           []string{"blob writes are separate statements from any SQL row that references them"},
 			Evidence: []Evidence{
-				leg(SrcX04Battery, "blob: byte-exact round-trip"),
-				leg(SrcX04Battery, "restart post verified"),
+				leg(SrcX04Battery, "blob: byte-exact round-trip", fAvail),
+				leg(SrcX04Battery, "restart post verified", fDur),
 			},
 		},
 		{
@@ -582,10 +615,11 @@ func nucleusLimits() []ModelLimits {
 				"consumer-group delivery is at-most-once",
 			},
 			Evidence: []Evidence{
-				leg(SrcX05Leg, "streams.rollback_removes_pending_append"),
-				leg(SrcX05Leg, "streams.restart_entries_group_cursor_ack"),
-				leg(SrcX05Leg, "streams.resume_cursor_full_id_vs_bare_ms"),
-				leg(SrcX05Leg, "streams.group_at_most_once_ack"),
+				leg(SrcX05Leg, "streams.roundtrip_ordering", fAvail),
+				leg(SrcX05Leg, "streams.rollback_removes_pending_append", fTx),
+				leg(SrcX05Leg, "streams.restart_entries_group_cursor_ack", fDur),
+				leg(SrcX05Leg, "streams.resume_cursor_full_id_vs_bare_ms", fWarn),
+				leg(SrcX05Leg, "streams.group_at_most_once_ack", fWarn),
 			},
 		},
 		{
@@ -602,9 +636,10 @@ func nucleusLimits() []ModelLimits {
 				"numbers passed as quoted text are stored as text and aggregate wrongly",
 			},
 			Evidence: []Evidence{
-				leg(SrcX03Leg, "inTxInsert"),
-				leg(SrcX03Leg, "rollbackOnEngineTable"),
-				leg(SrcX03Leg, "afterKill9"),
+				leg(SrcX03Leg, "castAggregatesExact", fAvail, fWarn),
+				leg(SrcX03Leg, "inTxInsert", fTx, fWarn),
+				leg(SrcX03Leg, "rollbackOnEngineTable", fTx),
+				leg(SrcX03Leg, "afterKill9", fDur),
 			},
 		},
 		{
@@ -618,9 +653,9 @@ func nucleusLimits() []ModelLimits {
 			AtomicWithSQL:      Unsupported,
 			Warnings:           []string{"a rolled-back assertion can reappear after a restart (engine semantics document)"},
 			Evidence: []Evidence{
-				leg(SrcX05Leg, "datalog.facts_and_rules_survive_restart"),
-				leg(SrcX05Leg, "datalog.roundtrip_recursion_oracle"),
-				docs("Datalog"),
+				leg(SrcX05Leg, "datalog.facts_and_rules_survive_restart", fDur),
+				leg(SrcX05Leg, "datalog.roundtrip_recursion_oracle", fAvail),
+				docs("Datalog", fTx, fAtom, fWarn),
 			},
 		},
 		{
@@ -637,9 +672,9 @@ func nucleusLimits() []ModelLimits {
 				"events are metadata only (seq, table, change, ts) and include rolled-back work",
 			},
 			Evidence: []Evidence{
-				leg(SrcX05Leg, "cdc.delivery_shape"),
-				leg(SrcX05Leg, "cdc.pre_commit_emission_and_gaps"),
-				leg(SrcX05Leg, "cdc.restart_replay_seq_continues"),
+				leg(SrcX05Leg, "cdc.delivery_shape", fAvail, fWarn),
+				leg(SrcX05Leg, "cdc.pre_commit_emission_and_gaps", fTx, fAtom, fWarn),
+				leg(SrcX05Leg, "cdc.restart_replay_seq_continues", fDur),
 			},
 		},
 		{
@@ -656,9 +691,9 @@ func nucleusLimits() []ModelLimits {
 				"messages are lost on restart",
 			},
 			Evidence: []Evidence{
-				leg(SrcX05Leg, "listen.rollback_tx_pre_commit_divergence"),
-				leg(SrcX05Leg, "listen.cross_connection_delivery_flush_divergence"),
-				docs("Pub/Sub"),
+				leg(SrcX05Leg, "listen.rollback_tx_pre_commit_divergence", fTx, fAtom),
+				leg(SrcX05Leg, "listen.cross_connection_delivery_flush_divergence", fAvail, fWarn),
+				docs("Pub/Sub", fDur, fWarn),
 			},
 		},
 	}

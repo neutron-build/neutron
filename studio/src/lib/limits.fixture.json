@@ -12,6 +12,7 @@
       "recorded": "2026-09-24"
     },
     "current": true,
+    "currentNote": "the connected engine reports Nucleus 1.0.2, the measured build; builds are matched by version string only (the nucleus/ tree cannot be read over the connection), so a different tree reporting the same version is treated as measured",
     "models": [
       {
         "model": "sql",
@@ -21,7 +22,7 @@
         "transaction": "partial",
         "transactionNote": "DML commits and rolls back (savepoints included) and other sessions do not see uncommitted rows; DDL is NOT transactional (it survives ROLLBACK and is visible before COMMIT); isolation levels and READ ONLY are not applied (every level behaves as read committed)",
         "durability": "survives-restart",
-        "durabilityNote": "committed rows survived SIGKILL and restart in the X04 restart battery; power loss was not measured",
+        "durabilityNote": "committed rows survived a kill of the engine process and a restart in the X04 restart battery; the signal was not recorded (SIGKILL is not claimed) and power loss was not measured",
         "atomicWithSql": "supported",
         "warnings": [
           "DDL runs outside the transaction: a failed migration leaves earlier statements applied",
@@ -32,67 +33,109 @@
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "txn.savepoint_rollback",
-            "observed": "supported"
+            "observed": "supported",
+            "supports": [
+              "availability",
+              "transaction"
+            ]
           },
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "txn.read_committed_sees_commits",
-            "observed": "supported"
+            "observed": "supported",
+            "supports": [
+              "transaction"
+            ]
           },
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "ddl.error_aborts_transaction",
-            "observed": "supported"
+            "observed": "supported",
+            "supports": [
+              "transaction"
+            ]
           },
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "ddl.create_table_rollback",
-            "observed": "unsupported"
+            "observed": "unsupported",
+            "supports": [
+              "transaction",
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "ddl.failed_migration_all_or_nothing",
-            "observed": "unsupported"
+            "observed": "unsupported",
+            "supports": [
+              "transaction",
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "ddl.uncommitted_ddl_invisible",
-            "observed": "unsupported"
+            "observed": "unsupported",
+            "supports": [
+              "transaction"
+            ]
           },
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "txn.isolation_levels_applied",
-            "observed": "unsupported"
+            "observed": "unsupported",
+            "supports": [
+              "transaction"
+            ]
           },
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "txn.read_only_rejects_writes",
-            "observed": "unsupported"
+            "observed": "unsupported",
+            "supports": [
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "lock.advisory_session",
-            "observed": "unsupported"
+            "observed": "unsupported",
+            "supports": [
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "lock.statement_timeout",
-            "observed": "unsupported"
+            "observed": "unsupported",
+            "supports": [
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/x02-nucleus-leg.mjs",
             "ref": "rollbackRevertsAll",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction"
+            ]
           },
           {
             "source": "conformance/live/orm/x02-nucleus-leg.mjs",
             "ref": "dirtyReads",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction"
+            ]
           },
           {
             "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
             "ref": "restart post verified",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "durability"
+            ]
           }
         ]
       },
@@ -104,7 +147,7 @@
         "transaction": "unknown",
         "transactionNote": "not measured on this build; the engine documents that ROLLBACK undoes scalar KV writes without isolating them from other sessions, and that collection (list/hash/set) writes are refused inside a transaction",
         "durability": "survives-restart",
-        "durabilityNote": "KV state survived SIGKILL and restart in the X04 restart battery; power loss was not measured",
+        "durabilityNote": "a KV value and a TTL key's remaining lifetime survived a kill of the engine process and a restart in the X04 restart battery; the signal was not recorded (SIGKILL is not claimed) and power loss was not measured",
         "atomicWithSql": "unsupported",
         "warnings": [
           "one global keyspace: namespaces are key prefixes, not permissions",
@@ -114,17 +157,29 @@
           {
             "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
             "ref": "kv: namespace isolation live",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "availability",
+              "warnings"
+            ]
           },
           {
             "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
             "ref": "restart post verified",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "durability"
+            ]
           },
           {
             "source": "nucleus/docs/MODEL_SEMANTICS.md",
             "ref": "KV (scalar keys)",
-            "observed": "documented"
+            "observed": "documented",
+            "supports": [
+              "transaction",
+              "atomicWithSql",
+              "warnings"
+            ]
           }
         ]
       },
@@ -145,7 +200,10 @@
           {
             "source": "conformance/live/orm/x01-nucleus-leg.mjs",
             "ref": "vector-type",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "availability"
+            ]
           }
         ]
       },
@@ -166,12 +224,18 @@
           {
             "source": "conformance/live/orm/x03-nucleus-leg.mjs",
             "ref": "afterKill9",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "durability"
+            ]
           },
           {
             "source": "conformance/live/orm/x03-nucleus-leg.mjs",
             "ref": "rangeCountScopingExact",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "availability"
+            ]
           }
         ]
       },
@@ -193,32 +257,53 @@
           {
             "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
             "ref": "document-collections",
-            "observed": "supported"
+            "observed": "supported",
+            "supports": [
+              "availability"
+            ]
           },
           {
             "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
             "ref": "specialty-session-isolation",
-            "observed": "unsupported"
+            "observed": "unsupported",
+            "supports": [
+              "transaction",
+              "warnings"
+            ]
           },
           {
             "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
             "ref": "atomic-sql-specialty-writes",
-            "observed": "unsupported"
+            "observed": "unsupported",
+            "supports": [
+              "atomicWithSql"
+            ]
           },
           {
             "source": "conformance/live/orm/x02-nucleus-leg.mjs",
             "ref": "rollbackRevertsAll",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction"
+            ]
           },
           {
             "source": "conformance/live/orm/x02-nucleus-leg.mjs",
             "ref": "dirtyReads",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction",
+              "atomicWithSql",
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/x02-nucleus-leg.mjs",
             "ref": "committedDocument",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "durability"
+            ]
           }
         ]
       },
@@ -241,32 +326,52 @@
           {
             "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
             "ref": "graph-adjacency",
-            "observed": "supported"
+            "observed": "supported",
+            "supports": [
+              "availability"
+            ]
           },
           {
             "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
             "ref": "graph-property-match",
-            "observed": "supported"
+            "observed": "supported",
+            "supports": [
+              "availability"
+            ]
           },
           {
             "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
             "ref": "graph-tenant-isolation",
-            "observed": "unsupported"
+            "observed": "unsupported",
+            "supports": [
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/x02-nucleus-leg.mjs",
             "ref": "rollbackRevertsAll",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction"
+            ]
           },
           {
             "source": "conformance/live/orm/x02-nucleus-leg.mjs",
             "ref": "dirtyReads",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction",
+              "atomicWithSql",
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/x02-nucleus-leg.mjs",
             "ref": "committedGraph",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "durability"
+            ]
           }
         ]
       },
@@ -287,12 +392,20 @@
           {
             "source": "conformance/live/orm/x01-nucleus-leg.mjs",
             "ref": "fts-functions",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "availability"
+            ]
           },
           {
             "source": "nucleus/docs/MODEL_SEMANTICS.md",
             "ref": "Full-text search",
-            "observed": "documented"
+            "observed": "documented",
+            "supports": [
+              "transaction",
+              "atomicWithSql",
+              "warnings"
+            ]
           }
         ]
       },
@@ -311,7 +424,18 @@
           {
             "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
             "ref": "geo: predicates match hand oracles",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "availability"
+            ]
+          },
+          {
+            "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
+            "ref": "geo: layer journey",
+            "observed": "pass",
+            "supports": [
+              "atomicWithSql"
+            ]
           }
         ]
       },
@@ -323,7 +447,7 @@
         "transaction": "unknown",
         "transactionNote": "not measured on this build",
         "durability": "survives-restart",
-        "durabilityNote": "blobs survived SIGKILL and restart in the X04 restart battery; power loss was not measured",
+        "durabilityNote": "a blob's bytes and content type survived a kill of the engine process and a restart in the X04 restart battery; the signal was not recorded (SIGKILL is not claimed) and power loss was not measured",
         "atomicWithSql": "unsupported",
         "warnings": [
           "blob writes are separate statements from any SQL row that references them"
@@ -332,12 +456,18 @@
           {
             "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
             "ref": "blob: byte-exact round-trip",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "availability"
+            ]
           },
           {
             "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
             "ref": "restart post verified",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "durability"
+            ]
           }
         ]
       },
@@ -358,23 +488,43 @@
         "evidence": [
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "streams.roundtrip_ordering",
+            "observed": "pass",
+            "supports": [
+              "availability"
+            ]
+          },
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "streams.rollback_removes_pending_append",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction"
+            ]
           },
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "streams.restart_entries_group_cursor_ack",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "durability"
+            ]
           },
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "streams.resume_cursor_full_id_vs_bare_ms",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "streams.group_at_most_once_ack",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "warnings"
+            ]
           }
         ]
       },
@@ -395,18 +545,37 @@
         "evidence": [
           {
             "source": "conformance/live/orm/x03-nucleus-leg.mjs",
+            "ref": "castAggregatesExact",
+            "observed": "pass",
+            "supports": [
+              "availability",
+              "warnings"
+            ]
+          },
+          {
+            "source": "conformance/live/orm/x03-nucleus-leg.mjs",
             "ref": "inTxInsert",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction",
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/x03-nucleus-leg.mjs",
             "ref": "rollbackOnEngineTable",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction"
+            ]
           },
           {
             "source": "conformance/live/orm/x03-nucleus-leg.mjs",
             "ref": "afterKill9",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "durability"
+            ]
           }
         ]
       },
@@ -427,17 +596,28 @@
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "datalog.facts_and_rules_survive_restart",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "durability"
+            ]
           },
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "datalog.roundtrip_recursion_oracle",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "availability"
+            ]
           },
           {
             "source": "nucleus/docs/MODEL_SEMANTICS.md",
             "ref": "Datalog",
-            "observed": "documented"
+            "observed": "documented",
+            "supports": [
+              "transaction",
+              "atomicWithSql",
+              "warnings"
+            ]
           }
         ]
       },
@@ -459,17 +639,29 @@
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "cdc.delivery_shape",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "availability",
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "cdc.pre_commit_emission_and_gaps",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction",
+              "atomicWithSql",
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "cdc.restart_replay_seq_continues",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "durability"
+            ]
           }
         ]
       },
@@ -491,17 +683,29 @@
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "listen.rollback_tx_pre_commit_divergence",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction",
+              "atomicWithSql"
+            ]
           },
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "listen.cross_connection_delivery_flush_divergence",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "availability",
+              "warnings"
+            ]
           },
           {
             "source": "nucleus/docs/MODEL_SEMANTICS.md",
             "ref": "Pub/Sub",
-            "observed": "documented"
+            "observed": "documented",
+            "supports": [
+              "durability",
+              "warnings"
+            ]
           }
         ]
       }
@@ -530,7 +734,7 @@
         "transaction": "unknown",
         "transactionNote": "measured on Nucleus 1.0.2, not on 9.9.9: DML commits and rolls back (savepoints included) and other sessions do not see uncommitted rows; DDL is NOT transactional (it survives ROLLBACK and is visible before COMMIT); isolation levels and READ ONLY are not applied (every level behaves as read committed)",
         "durability": "unknown",
-        "durabilityNote": "measured on Nucleus 1.0.2, not on 9.9.9: committed rows survived SIGKILL and restart in the X04 restart battery; power loss was not measured",
+        "durabilityNote": "measured on Nucleus 1.0.2, not on 9.9.9: committed rows survived a kill of the engine process and a restart in the X04 restart battery; the signal was not recorded (SIGKILL is not claimed) and power loss was not measured",
         "atomicWithSql": "unknown",
         "warnings": [
           "DDL runs outside the transaction: a failed migration leaves earlier statements applied",
@@ -541,67 +745,109 @@
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "txn.savepoint_rollback",
-            "observed": "supported"
+            "observed": "supported",
+            "supports": [
+              "availability",
+              "transaction"
+            ]
           },
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "txn.read_committed_sees_commits",
-            "observed": "supported"
+            "observed": "supported",
+            "supports": [
+              "transaction"
+            ]
           },
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "ddl.error_aborts_transaction",
-            "observed": "supported"
+            "observed": "supported",
+            "supports": [
+              "transaction"
+            ]
           },
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "ddl.create_table_rollback",
-            "observed": "unsupported"
+            "observed": "unsupported",
+            "supports": [
+              "transaction",
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "ddl.failed_migration_all_or_nothing",
-            "observed": "unsupported"
+            "observed": "unsupported",
+            "supports": [
+              "transaction",
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "ddl.uncommitted_ddl_invisible",
-            "observed": "unsupported"
+            "observed": "unsupported",
+            "supports": [
+              "transaction"
+            ]
           },
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "txn.isolation_levels_applied",
-            "observed": "unsupported"
+            "observed": "unsupported",
+            "supports": [
+              "transaction"
+            ]
           },
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "txn.read_only_rejects_writes",
-            "observed": "unsupported"
+            "observed": "unsupported",
+            "supports": [
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "lock.advisory_session",
-            "observed": "unsupported"
+            "observed": "unsupported",
+            "supports": [
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "lock.statement_timeout",
-            "observed": "unsupported"
+            "observed": "unsupported",
+            "supports": [
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/x02-nucleus-leg.mjs",
             "ref": "rollbackRevertsAll",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction"
+            ]
           },
           {
             "source": "conformance/live/orm/x02-nucleus-leg.mjs",
             "ref": "dirtyReads",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction"
+            ]
           },
           {
             "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
             "ref": "restart post verified",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "durability"
+            ]
           }
         ]
       },
@@ -613,7 +859,7 @@
         "transaction": "unknown",
         "transactionNote": "measured on Nucleus 1.0.2, not on 9.9.9: not measured on this build; the engine documents that ROLLBACK undoes scalar KV writes without isolating them from other sessions, and that collection (list/hash/set) writes are refused inside a transaction",
         "durability": "unknown",
-        "durabilityNote": "measured on Nucleus 1.0.2, not on 9.9.9: KV state survived SIGKILL and restart in the X04 restart battery; power loss was not measured",
+        "durabilityNote": "measured on Nucleus 1.0.2, not on 9.9.9: a KV value and a TTL key's remaining lifetime survived a kill of the engine process and a restart in the X04 restart battery; the signal was not recorded (SIGKILL is not claimed) and power loss was not measured",
         "atomicWithSql": "unsupported",
         "warnings": [
           "one global keyspace: namespaces are key prefixes, not permissions",
@@ -623,17 +869,29 @@
           {
             "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
             "ref": "kv: namespace isolation live",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "availability",
+              "warnings"
+            ]
           },
           {
             "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
             "ref": "restart post verified",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "durability"
+            ]
           },
           {
             "source": "nucleus/docs/MODEL_SEMANTICS.md",
             "ref": "KV (scalar keys)",
-            "observed": "documented"
+            "observed": "documented",
+            "supports": [
+              "transaction",
+              "atomicWithSql",
+              "warnings"
+            ]
           }
         ]
       },
@@ -654,7 +912,10 @@
           {
             "source": "conformance/live/orm/x01-nucleus-leg.mjs",
             "ref": "vector-type",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "availability"
+            ]
           }
         ]
       },
@@ -675,12 +936,18 @@
           {
             "source": "conformance/live/orm/x03-nucleus-leg.mjs",
             "ref": "afterKill9",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "durability"
+            ]
           },
           {
             "source": "conformance/live/orm/x03-nucleus-leg.mjs",
             "ref": "rangeCountScopingExact",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "availability"
+            ]
           }
         ]
       },
@@ -702,32 +969,53 @@
           {
             "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
             "ref": "document-collections",
-            "observed": "supported"
+            "observed": "supported",
+            "supports": [
+              "availability"
+            ]
           },
           {
             "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
             "ref": "specialty-session-isolation",
-            "observed": "unsupported"
+            "observed": "unsupported",
+            "supports": [
+              "transaction",
+              "warnings"
+            ]
           },
           {
             "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
             "ref": "atomic-sql-specialty-writes",
-            "observed": "unsupported"
+            "observed": "unsupported",
+            "supports": [
+              "atomicWithSql"
+            ]
           },
           {
             "source": "conformance/live/orm/x02-nucleus-leg.mjs",
             "ref": "rollbackRevertsAll",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction"
+            ]
           },
           {
             "source": "conformance/live/orm/x02-nucleus-leg.mjs",
             "ref": "dirtyReads",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction",
+              "atomicWithSql",
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/x02-nucleus-leg.mjs",
             "ref": "committedDocument",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "durability"
+            ]
           }
         ]
       },
@@ -750,32 +1038,52 @@
           {
             "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
             "ref": "graph-adjacency",
-            "observed": "supported"
+            "observed": "supported",
+            "supports": [
+              "availability"
+            ]
           },
           {
             "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
             "ref": "graph-property-match",
-            "observed": "supported"
+            "observed": "supported",
+            "supports": [
+              "availability"
+            ]
           },
           {
             "source": "typescript/packages/neutron-nucleus/src/capabilities.ts",
             "ref": "graph-tenant-isolation",
-            "observed": "unsupported"
+            "observed": "unsupported",
+            "supports": [
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/x02-nucleus-leg.mjs",
             "ref": "rollbackRevertsAll",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction"
+            ]
           },
           {
             "source": "conformance/live/orm/x02-nucleus-leg.mjs",
             "ref": "dirtyReads",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction",
+              "atomicWithSql",
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/x02-nucleus-leg.mjs",
             "ref": "committedGraph",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "durability"
+            ]
           }
         ]
       },
@@ -796,12 +1104,20 @@
           {
             "source": "conformance/live/orm/x01-nucleus-leg.mjs",
             "ref": "fts-functions",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "availability"
+            ]
           },
           {
             "source": "nucleus/docs/MODEL_SEMANTICS.md",
             "ref": "Full-text search",
-            "observed": "documented"
+            "observed": "documented",
+            "supports": [
+              "transaction",
+              "atomicWithSql",
+              "warnings"
+            ]
           }
         ]
       },
@@ -820,7 +1136,18 @@
           {
             "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
             "ref": "geo: predicates match hand oracles",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "availability"
+            ]
+          },
+          {
+            "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
+            "ref": "geo: layer journey",
+            "observed": "pass",
+            "supports": [
+              "atomicWithSql"
+            ]
           }
         ]
       },
@@ -832,7 +1159,7 @@
         "transaction": "unknown",
         "transactionNote": "measured on Nucleus 1.0.2, not on 9.9.9: not measured on this build",
         "durability": "unknown",
-        "durabilityNote": "measured on Nucleus 1.0.2, not on 9.9.9: blobs survived SIGKILL and restart in the X04 restart battery; power loss was not measured",
+        "durabilityNote": "measured on Nucleus 1.0.2, not on 9.9.9: a blob's bytes and content type survived a kill of the engine process and a restart in the X04 restart battery; the signal was not recorded (SIGKILL is not claimed) and power loss was not measured",
         "atomicWithSql": "unsupported",
         "warnings": [
           "blob writes are separate statements from any SQL row that references them"
@@ -841,12 +1168,18 @@
           {
             "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
             "ref": "blob: byte-exact round-trip",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "availability"
+            ]
           },
           {
             "source": "typescript/packages/neutron-nucleus/src/models.live.test.ts",
             "ref": "restart post verified",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "durability"
+            ]
           }
         ]
       },
@@ -867,23 +1200,43 @@
         "evidence": [
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
+            "ref": "streams.roundtrip_ordering",
+            "observed": "pass",
+            "supports": [
+              "availability"
+            ]
+          },
+          {
+            "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "streams.rollback_removes_pending_append",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction"
+            ]
           },
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "streams.restart_entries_group_cursor_ack",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "durability"
+            ]
           },
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "streams.resume_cursor_full_id_vs_bare_ms",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "streams.group_at_most_once_ack",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "warnings"
+            ]
           }
         ]
       },
@@ -904,18 +1257,37 @@
         "evidence": [
           {
             "source": "conformance/live/orm/x03-nucleus-leg.mjs",
+            "ref": "castAggregatesExact",
+            "observed": "pass",
+            "supports": [
+              "availability",
+              "warnings"
+            ]
+          },
+          {
+            "source": "conformance/live/orm/x03-nucleus-leg.mjs",
             "ref": "inTxInsert",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction",
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/x03-nucleus-leg.mjs",
             "ref": "rollbackOnEngineTable",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction"
+            ]
           },
           {
             "source": "conformance/live/orm/x03-nucleus-leg.mjs",
             "ref": "afterKill9",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "durability"
+            ]
           }
         ]
       },
@@ -936,17 +1308,28 @@
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "datalog.facts_and_rules_survive_restart",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "durability"
+            ]
           },
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "datalog.roundtrip_recursion_oracle",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "availability"
+            ]
           },
           {
             "source": "nucleus/docs/MODEL_SEMANTICS.md",
             "ref": "Datalog",
-            "observed": "documented"
+            "observed": "documented",
+            "supports": [
+              "transaction",
+              "atomicWithSql",
+              "warnings"
+            ]
           }
         ]
       },
@@ -968,17 +1351,29 @@
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "cdc.delivery_shape",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "availability",
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "cdc.pre_commit_emission_and_gaps",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction",
+              "atomicWithSql",
+              "warnings"
+            ]
           },
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "cdc.restart_replay_seq_continues",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "durability"
+            ]
           }
         ]
       },
@@ -1000,17 +1395,29 @@
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "listen.rollback_tx_pre_commit_divergence",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "transaction",
+              "atomicWithSql"
+            ]
           },
           {
             "source": "conformance/live/orm/x05-nucleus-leg.mjs",
             "ref": "listen.cross_connection_delivery_flush_divergence",
-            "observed": "pass"
+            "observed": "pass",
+            "supports": [
+              "availability",
+              "warnings"
+            ]
           },
           {
             "source": "nucleus/docs/MODEL_SEMANTICS.md",
             "ref": "Pub/Sub",
-            "observed": "documented"
+            "observed": "documented",
+            "supports": [
+              "durability",
+              "warnings"
+            ]
           }
         ]
       }
@@ -1051,12 +1458,23 @@
           {
             "source": "postgresql-documentation",
             "ref": "Transactions / WAL reliability",
-            "observed": "documented"
+            "observed": "documented",
+            "supports": [
+              "availability",
+              "transaction",
+              "durability",
+              "atomicWithSql"
+            ]
           },
           {
             "source": "live-connection-settings",
             "ref": "fsync, synchronous_commit, default_transaction_isolation",
-            "observed": "read"
+            "observed": "read",
+            "supports": [
+              "durability",
+              "transaction",
+              "warnings"
+            ]
           }
         ]
       },
