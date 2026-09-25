@@ -6,7 +6,7 @@ part of the published tarball.
 
 | Script | Needs | What it gates |
 |---|---|---|
-| `orm-gate.mjs` | `NEUTRON_TEST_DATABASE_URL` (disposable PostgreSQL) | 100-parent relation pages (0/2/20 children on two edges) and depth-3 reads: results equal to hand-written SQL and to the pinned `drizzle-orm`, one statement per read (client logger and `pg_stat_database`), index use on indexed child edges, server time within `serverRatioVsHandMax` of the hand-written statement, streaming early-exit release, absolute p95 ceilings |
+| `orm-gate.mjs` | `NEUTRON_TEST_DATABASE_URL` (disposable PostgreSQL) | 100-parent relation pages (0/2/20 children on two edges) and depth-3 reads: results equal to hand-written SQL and to the pinned `drizzle-orm`, one statement per read (client logger and `pg_stat_database`), index use on indexed child edges, server time within `serverRatioVsHandMax` of the hand-written statement, streaming early-exit release, absolute p50 ceilings |
 | `typecheck-gate.mjs` | nothing | 100-table, depth-3 consumer project type-checked against `dist/*.d.ts`: type and instantiation counts against the recorded baseline + 20% (per TypeScript version) |
 
 ```sh
@@ -23,7 +23,7 @@ node --expose-gc bench/orm-gate.mjs --profile full --compare bench/baseline.json
 CI (typescript.yml, neutron-sql live job) runs both gates with `--gate`.
 What CI enforces does not depend on the runner: equality, statement counts,
 plan shape, the same-run server-time ratio, type/instantiation counts, and
-absolute p95 ceilings set far above the reference numbers. The numbers are
+absolute p50 ceilings set far above the reference numbers. The numbers are
 regression signals, not publishable benchmarks.
 
 `budgets.json` holds every threshold with its reasoning. A failing gate is

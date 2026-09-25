@@ -139,7 +139,7 @@ jobs:
   # two edges plus depth 3; results equal to hand-written SQL and to the
   # pinned drizzle-orm, one statement per read counted client- and
   # server-side, index use, server time vs the hand-written statement,
-  # streaming early-exit release, generous p95 ceilings) and
+  # streaming early-exit release, generous p50 ceilings) and
   # typecheck-gate.mjs (100-table depth-3 consumer project; type and
   # instantiation counts are deterministic per TypeScript version).
   neutron-sql:
