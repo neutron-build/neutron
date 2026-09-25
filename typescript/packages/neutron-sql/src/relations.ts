@@ -3,9 +3,14 @@
 // ---------------------------------------------------------------------------
 // Execution model (README §3.4 default): every requested relation edge is an
 // INDEPENDENT correlated scalar subquery in the select list, at any nesting
-// depth (Q05). To-many children aggregate with jsonb_agg(... order by <keys>)
-// inside their own subquery; to-one parents build a single jsonb object that
-// is NULL when the FK misses. Sibling relations never join each other, so two
+// depth (Q05). To-many children aggregate with json_agg(... order by <keys>)
+// inside their own subquery; to-one parents build a single json object that
+// is NULL when the FK misses. The relation JSON is plain json, not jsonb: it
+// is built once and parsed once by the driver, so jsonb's binary conversion,
+// key sorting and deduplication only cost server time (measured ~1.7x on a
+// 100-parent, 20-children-per-edge page — R01 bench/orm-gate.mjs) while the
+// decoded values are identical (every leaf that JSON numbers would corrupt is
+// cast to text first; see jsonLeaf). Sibling relations never join each other, so two
 // to-many children can never multiply each other — including two relations
 // to the same target table (author + reviewer), which get separate
 // path-derived aliases. Parent where/order/limit/offset apply to parent rows
@@ -15,7 +20,7 @@
 // limit needs the aggregation to run over a limited derived table (an
 // aggregate's own output is always one row — a LIMIT on the aggregate's
 // SELECT would limit nothing), so such edges compile as
-//   (select coalesce(jsonb_agg(obj order by K) , '[]'::jsonb)
+//   (select coalesce(json_agg(obj order by K) , '[]'::json)
 //      from (select … from "child" as a where <correlation+filters>
 //            order by K limit N) as a_l).
 // The derived table projects EVERY child column: its output must feed the
@@ -186,24 +191,24 @@ function pkColumnsOf(table: AnyPgTable): AnyColumnBuilder[] {
 
 /** Nested JSON objects are labeled with declared property keys; values come
  *  from the physical columns via schema metadata (never name spelling).
- *  int8/numeric leaves render ::text: as jsonb numbers both drivers would
+ *  int8/numeric leaves render ::text: as JSON numbers both drivers would
  *  JSON.parse them into doubles (silently corrupting values beyond 2^53 and
  *  dropping numeric scale). timestamptz leaves render their UTC wall clock
  *  (session-timezone independent); other temporals and bytea leaves keep
- *  to_jsonb's exact string forms (microseconds, \x hex). Correlation
+ *  to_json's exact string forms (microseconds, \x hex). Correlation
  *  predicates and order keys stay raw column references. */
 function jsonLeaf(alias: string, column: AnyColumnBuilder): ValueNode {
   const ref = qual(alias, column.columnName);
   if (column.arrayDimensions !== undefined) return fragment(ref, "::text");
   if (column.dataType === "bigint" || column.dataType === "numeric") return fragment(ref, "::text");
-  if (column.dataType === "timestamptz") return fragment("to_jsonb(", ref, " at time zone 'UTC')");
-  // Vector has no to_jsonb cast (server error); tsvector does but its JSON
+  if (column.dataType === "timestamptz") return fragment("to_json(", ref, " at time zone 'UTC')");
+  // Vector has no json cast (server error); tsvector does but its JSON
   // string form adds nothing over the exact text. Both cross as ::text.
   if (column.dataType === "vector" || column.dataType === "tsvector") return fragment(ref, "::text");
   return ref;
 }
 
-/** The jsonb object for one child row: selected columns plus one key per
+/** The json object for one child row: selected columns plus one key per
  *  nested edge (each a correlated scalar subquery value — NULL for a missing
  *  to-one, an array for a to-many). */
 function jsonObjectForEntries(
@@ -220,7 +225,7 @@ function jsonObjectForEntries(
     args.push(fragment(quoteStringLiteral(key)));
     args.push(node);
   }
-  return exprNode("call", "jsonb_build_object", args);
+  return exprNode("call", "json_build_object", args);
 }
 
 /** Normalize driver output: some pgwire servers hand json/jsonb back as
@@ -492,7 +497,7 @@ export interface RelationalExplainPlan extends RelationalStatementPlan {
 interface EdgeBuild {
   readonly plan: RelationEdgePlan;
   /** The edge's scalar subquery as a bare value: aliased projection at the
-   *  top level, embedded as a jsonb pair value when nested. */
+   *  top level, embedded as a json pair value when nested. */
   readonly value: ValueNode;
 }
 
@@ -794,13 +799,13 @@ function andChain(pairs: ReadonlyArray<readonly [ValueNode, ValueNode]>): ValueN
   return eqs.reduce((acc, c) => exprNode("binary", "and", [acc, c]));
 }
 
-/** `coalesce(jsonb_agg(obj order by keys), '[]'::jsonb)` as one fragment —
+/** `coalesce(json_agg(obj order by keys), '[]'::json)` as one fragment —
  *  aggregate ORDER BY lives inside the call, so it interleaves trusted text
  *  with the object expression and the raw order keys. `asc` is omitted
  *  (PostgreSQL's default — keeps the historical PK-only shape byte-stable);
  *  `desc` and explicit nulls ordering render. */
 function aggWithOrder(obj: ValueNode, orderSpecs: readonly OrderSpec[]): ValueNode {
-  const parts: Array<string | ValueNode> = ["coalesce(jsonb_agg(", obj];
+  const parts: Array<string | ValueNode> = ["coalesce(json_agg(", obj];
   if (orderSpecs.length > 0) {
     parts.push(" order by ");
     orderSpecs.forEach((spec, i) => {
@@ -810,7 +815,7 @@ function aggWithOrder(obj: ValueNode, orderSpecs: readonly OrderSpec[]): ValueNo
       if (spec.nulls !== undefined) parts.push(` nulls ${spec.nulls}`);
     });
   }
-  parts.push("), '[]'::jsonb)");
+  parts.push("), '[]'::json)");
   return fragment(...parts);
 }
 
@@ -842,7 +847,7 @@ function decodeChildRow(
 
 /** Normalize + decode one relation value in place (array of child objects
  *  for to-many, object-or-null for to-one), recursing into nested edges.
- *  The compiled SQL guarantees the wire shapes (jsonb array / jsonb object
+ *  The compiled SQL guarantees the wire shapes (json array / json object
  *  or JSON null); anything else after normalization is a structurally
  *  impossible value in that key and fails loudly rather than silently
  *  degrading to [] (which would drop data). */
@@ -868,12 +873,12 @@ function decodeRelationValue(
       return;
     }
     throw new Error(
-      `relation "${key}" decode: expected a jsonb object or null for a to-one relation, got ${describeValueKind(value)}`,
+      `relation "${key}" decode: expected a json object or null for a to-one relation, got ${describeValueKind(value)}`,
     );
   }
   if (value !== undefined && value !== null && !Array.isArray(value)) {
     throw new Error(
-      `relation "${key}" decode: expected a jsonb array for a to-many relation, got ${describeValueKind(value)}`,
+      `relation "${key}" decode: expected a json array for a to-many relation, got ${describeValueKind(value)}`,
     );
   }
   const children = Array.isArray(value) ? value : [];

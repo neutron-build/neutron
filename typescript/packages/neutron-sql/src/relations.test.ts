@@ -151,7 +151,7 @@ test("q05 unit: depth-3 to-one chain (comments -> post -> author -> manager)", (
   );
   // A missing to-one at any level renders as JSON null (subquery under the
   // object key), never as a missing key.
-  assert.ok(s.includes("'manager', (select jsonb_build_object("));
+  assert.ok(s.includes("'manager', (select json_build_object("));
 });
 
 test("q05 unit: per-child where/order/limit compile inside the child subquery, remapped to its alias", () => {
@@ -387,8 +387,10 @@ test("q05 unit: explainQuery describes statements, decoders and capability requi
 test("q05 unit: buildRelationalSQL keeps the one-level shape byte-compatible", () => {
   const built = buildRelationalSQL(usersRelations.table as never, usersRelations.entries, { with: { posts: true } }, RELATIONS_BY_TABLE);
   assert.ok(built.sql.includes('select "users"."id", "users"."name", "users"."manager_id" as "managerId",'));
-  assert.ok(built.sql.includes("coalesce(jsonb_agg(jsonb_build_object("));
-  assert.ok(built.sql.includes('order by "__rel_posts"."id"), \'[]\'::jsonb)'));
+  assert.ok(built.sql.includes("coalesce(json_agg(json_build_object("));
+  assert.ok(built.sql.includes('order by "__rel_posts"."id"), \'[]\'::json)'));
+  // Relation JSON is plain json (R01 perf): no jsonb conversion per child row.
+  assert.ok(!built.sql.includes("jsonb"), built.sql);
 });
 
 test("q05 unit: bare identifiers in child predicates resolve against the child FROM", () => {
@@ -453,7 +455,7 @@ test("q05 unit: limited shape derives UNSELECTED order keys (rework M1)", () => 
   // The aggregate's order key resolves against the derived alias.
   assert.ok(s.includes('order by "__rel_posts_lim"."views" desc, "__rel_posts_lim"."id")'), s);
   // The emitted JSON still carries ONLY the selected column.
-  assert.ok(s.includes("jsonb_build_object('id', \"__rel_posts_lim\".\"id\")"), s);
+  assert.ok(s.includes("json_build_object('id', \"__rel_posts_lim\".\"id\")"), s);
   assert.ok(!s.includes("'title',"), s);
   assert.ok(!s.includes("'views',"), s);
 });
@@ -510,7 +512,7 @@ test("q05 unit: columns subset WITHOUT limit keeps the lean projection (no deriv
   });
   const s = built.sql;
   assert.ok(!s.includes("_lim"), "no limited derived table without limit/offset");
-  assert.ok(s.includes("jsonb_build_object('id', \"__rel_posts\".\"id\") order by \"__rel_posts\".\"views\" desc"), s);
+  assert.ok(s.includes("json_build_object('id', \"__rel_posts\".\"id\") order by \"__rel_posts\".\"views\" desc"), s);
   assert.ok(!s.includes("'title',"), s);
   assert.ok(!s.includes("'views',"), s);
   assert.ok(!s.includes("'author_id',"), s);

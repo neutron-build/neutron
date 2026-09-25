@@ -145,7 +145,8 @@ export function temporalExpressionSource(v: object): AnyColumnBuilder {
 
 /** Engine feature a compiled statement requires. `jsonb-functions` marks
  *  statements whose projections aggregate or acquire values through
- *  PostgreSQL jsonb functions (to_jsonb / jsonb_build_object / jsonb_agg);
+ *  PostgreSQL JSON functions (to_jsonb wire reads; to_json /
+ *  json_build_object / json_agg relational aggregation);
  *  engines without them must reject these statements rather than run them.
  *  Q08 adds window functions (and the GROUPS frame mode), row-locking
  *  clauses (strengths and SKIP LOCKED separately) and server-side cursors

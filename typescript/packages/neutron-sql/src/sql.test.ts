@@ -389,9 +389,9 @@ test("relational: findMany with posts (many) aggregates one independent subquery
   assert.equal(
     sqlText,
     'select "users"."id", "users"."email", "users"."name", "users"."active", to_jsonb("users"."created_at")::text as "createdAt", ' +
-      '(select coalesce(jsonb_agg(jsonb_build_object(\'id\', "__rel_posts"."id", \'userId\', "__rel_posts"."user_id", ' +
+      '(select coalesce(json_agg(json_build_object(\'id\', "__rel_posts"."id", \'userId\', "__rel_posts"."user_id", ' +
       '\'title\', "__rel_posts"."title", \'body\', "__rel_posts"."body", \'published\', "__rel_posts"."published") ' +
-      'order by "__rel_posts"."id"), \'[]\'::jsonb) from "posts" as "__rel_posts" where ("__rel_posts"."user_id" = "users"."id")) as "posts" ' +
+      'order by "__rel_posts"."id"), \'[]\'::json) from "posts" as "__rel_posts" where ("__rel_posts"."user_id" = "users"."id")) as "posts" ' +
       'from "users"',
   );
 });
@@ -426,7 +426,7 @@ test("relational: findFirst with author (one) nulls on missing FK", () => {
   assert.equal(
     sqlText,
     'select "posts"."id", "posts"."user_id" as "userId", "posts"."title", "posts"."body", "posts"."published", ' +
-      '(select jsonb_build_object(\'id\', "__rel_author"."id", \'email\', "__rel_author"."email", \'name\', "__rel_author"."name", ' +
+      '(select json_build_object(\'id\', "__rel_author"."id", \'email\', "__rel_author"."email", \'name\', "__rel_author"."name", ' +
       '\'active\', "__rel_author"."active", \'createdAt\', "__rel_author"."created_at") ' +
       'from "users" as "__rel_author" where ("__rel_author"."id" = "posts"."user_id")) as "author" ' +
       'from "posts"',

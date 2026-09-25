@@ -80,11 +80,15 @@ interface CapabilitySpec {
  *  genuinely proving probe. */
 const REGISTRY: Readonly<Record<string, CapabilitySpec>> = {
   "jsonb-functions": {
-    description: "to_jsonb / jsonb_build_object / jsonb_agg (lossless wire reads and relational aggregation)",
-    // jsonb and its builder/aggregate functions shipped in PostgreSQL 9.4
-    // (PostgreSQL 9.4 release notes, "JSON changes").
+    description:
+      "to_jsonb (lossless wire reads) and to_json / json_build_object / json_agg (relational aggregation); jsonb builders for the probe",
+    // jsonb, jsonb_build_object and json_build_object shipped in PostgreSQL
+    // 9.4; json_agg in 9.3, to_json in 9.2 (PostgreSQL 9.4 release notes,
+    // "JSON changes"). The probe exercises every function a statement
+    // carrying this requirement can use.
     postgresSince: [9, 4],
-    probeSql: "select to_jsonb(1)::text as a, jsonb_build_object('k', 1)::text as b, coalesce(jsonb_agg(v), '[]'::jsonb)::text as c from (values (1)) as t(v)",
+    probeSql:
+      "select to_jsonb(1)::text as a, jsonb_build_object('k', 1)::text as b, coalesce(jsonb_agg(v), '[]'::jsonb)::text as c, to_json(1)::text as d, json_build_object('k', 1)::text as e, coalesce(json_agg(v), '[]'::json)::text as f from (values (1)) as t(v)",
   },
   // Q08 rules. Version facts only (PostgreSQL release notes); no probes: a
   // statement that merely parses on another engine proves nothing about

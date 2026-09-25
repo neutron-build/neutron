@@ -79,7 +79,7 @@ rollback;
 
 \echo N13 derived-table-column-alias-list
 select v from (values (1)) as t(v);  -- PostgreSQL: 1
-select to_jsonb(1)::text as a, jsonb_build_object('k', 1)::text as b, coalesce(jsonb_agg(v), '[]'::jsonb)::text as c from (values (1)) as t(v);  -- PostgreSQL: 1 | {"k": 1} | [1] (the neutron-sql jsonb-functions capability probe, verbatim)
+select to_jsonb(1)::text as a, jsonb_build_object('k', 1)::text as b, coalesce(jsonb_agg(v), '[]'::jsonb)::text as c, to_json(1)::text as d, json_build_object('k', 1)::text as e, coalesce(json_agg(v), '[]'::json)::text as f from (values (1)) as t(v);  -- PostgreSQL: 1 | {"k": 1} | [1] | 1 | {"k" : 1} | [1] (the neutron-sql jsonb-functions capability probe, verbatim)
 
 \echo cleanup
 drop table if exists x00r_rb, x00r_base, x00r_cat, x00r_gen, x00r_ident, x00r_ch, x00r_pa, x00r_p, x00r_u, x00r_j;
