@@ -386,8 +386,18 @@ export type UpdateTypeOf<C> = C extends ColumnBuilder<infer _D, infer NN, infer 
 
 export const TABLE_SYMBOL = Symbol.for("@neutron-build/sql.table");
 
-export interface TableMetadata<Cols extends Record<string, AnyColumnBuilder> = Record<string, AnyColumnBuilder>> {
-  readonly tableName: string;
+export interface TableMetadata<
+  Cols extends Record<string, AnyColumnBuilder> = Record<string, AnyColumnBuilder>,
+  N extends string = string,
+> {
+  /** The table name as a literal type when declared with a literal (the
+   *  default for pgTable("users", …)). It is what makes two tables with the
+   *  same column shapes distinct types: nested relation typing resolves a
+   *  relation's target through the relations input, and a purely structural
+   *  match there confused `tags {id, name}` with `categories {id, name}` (and
+   *  `users {id, name, email}` with either), silently dropping their nested
+   *  relations from result types (R01). */
+  readonly tableName: N;
   /** SQL schema the table lives in (undefined = the connection's default
    *  search path, exported as public). Declared through pgSchema(); the
    *  query layer (CRUD + alias joins) renders qualified references and
@@ -403,14 +413,18 @@ export interface TableMetadata<Cols extends Record<string, AnyColumnBuilder> = R
   readonly viewDef?: ViewDefinition;
 }
 
-export interface PgTableCore<Cols extends Record<string, AnyColumnBuilder> = Record<string, AnyColumnBuilder>> {
-  readonly [TABLE_SYMBOL]: TableMetadata<Cols>;
+export interface PgTableCore<Cols extends Record<string, AnyColumnBuilder> = Record<string, AnyColumnBuilder>, N extends string = string> {
+  readonly [TABLE_SYMBOL]: TableMetadata<Cols, N>;
   readonly $inferSelect: InferSelectModelOf<Cols>;
   readonly $inferInsert: InferInsertModelOf<Cols>;
 }
 
 /** A table: symbol-keyed metadata plus its columns as top-level properties (users.email). */
-export type PgTable<Cols extends Record<string, AnyColumnBuilder> = Record<string, AnyColumnBuilder>> = PgTableCore<Cols> & Cols;
+export type PgTable<Cols extends Record<string, AnyColumnBuilder> = Record<string, AnyColumnBuilder>, N extends string = string> = PgTableCore<
+  Cols,
+  N
+> &
+  Cols;
 
 function tableMetaOf(table: AnyPgTable, who: string): TableMetadata {
   if (typeof table !== "object" || table === null) {
@@ -740,21 +754,21 @@ export function uniqueIndex(name: string): TableIndex {
   return new TableIndex(name, true);
 }
 
-export function pgTable<Cols extends Record<string, AnyColumnBuilder>>(
-  name: string,
+export function pgTable<Cols extends Record<string, AnyColumnBuilder>, N extends string = string>(
+  name: N,
   columns: Cols,
-  extras?: (t: PgTable<Cols>) => TableExtra[],
-): PgTable<Cols> {
+  extras?: (t: PgTable<Cols, N>) => TableExtra[],
+): PgTable<Cols, N> {
   return makeTable(name, columns, extras, undefined);
 }
 
-function makeTable<Cols extends Record<string, AnyColumnBuilder>>(
-  name: string,
+function makeTable<Cols extends Record<string, AnyColumnBuilder>, N extends string>(
+  name: N,
   columns: Cols,
-  extras: ((t: PgTable<Cols>) => TableExtra[]) | undefined,
+  extras: ((t: PgTable<Cols, N>) => TableExtra[]) | undefined,
   schema: string | undefined,
-): PgTable<Cols> {
-  const meta: { tableName: string; schema?: string; columns: Cols; indexes: TableIndex[]; constraints: TableConstraint[] } = {
+): PgTable<Cols, N> {
+  const meta: { tableName: N; schema?: string; columns: Cols; indexes: TableIndex[]; constraints: TableConstraint[] } = {
     tableName: name,
     columns,
     indexes: [],
@@ -767,7 +781,7 @@ function makeTable<Cols extends Record<string, AnyColumnBuilder>>(
     $inferSelect: undefined as never,
     $inferInsert: undefined as never,
     ...columns,
-  } as PgTable<Cols>;
+  } as PgTable<Cols, N>;
   for (const col of Object.values(columns)) {
     col.ownerTable = table;
   }
@@ -779,7 +793,7 @@ function makeTable<Cols extends Record<string, AnyColumnBuilder>>(
     if (!Array.isArray(extraList)) throw new Error(`pgTable("${name}"): the extras callback must return an array of index()/constraint definitions`);
     Object.assign(meta, splitExtras(extraList));
   }
-  const frozenMeta: TableMetadata<Cols> = meta;
+  const frozenMeta: TableMetadata<Cols, N> = meta;
   Object.freeze(frozenMeta);
   return table;
 }
@@ -792,11 +806,11 @@ function makeTable<Cols extends Record<string, AnyColumnBuilder>>(
  *  (db.query) reject schema-declared tables. */
 export interface PgSchemaBuilder {
   readonly schemaName: string;
-  table<Cols extends Record<string, AnyColumnBuilder>>(
-    name: string,
+  table<Cols extends Record<string, AnyColumnBuilder>, N extends string = string>(
+    name: N,
     columns: Cols,
-    extras?: (t: PgTable<Cols>) => TableExtra[],
-  ): PgTable<Cols>;
+    extras?: (t: PgTable<Cols, N>) => TableExtra[],
+  ): PgTable<Cols, N>;
   enum<const V extends readonly [string, ...string[]]>(name: string, values: V): PgEnum<V>;
   view<Cols extends Record<string, AnyColumnBuilder>>(name: string, columns: Cols, opts: ViewOptions): PgTable<Cols>;
 }
