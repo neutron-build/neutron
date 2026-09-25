@@ -1,0 +1,102 @@
+name: ORM PostgreSQL matrix
+
+# R01 / VERIFICATION "Test environments": pull requests run PostgreSQL 17 x
+# both drivers (typescript.yml neutron-sql live, cli.yml Test). This workflow
+# runs the same required-live suites on every declared major (16, 17, 18),
+# weekly and on demand before a release, so a major-specific regression is
+# caught without slowing every PR. Images carry pgvector (the X01 legs create
+# the extension); repo workflows pin no digests — record the served digest
+# from the run log when citing a result.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  neutron-sql:
+    name: neutron-sql live (Postgres ${{ matrix.pg }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [16, 17, 18]
+    services:
+      postgres:
+        image: pgvector/pgvector:pg${{ matrix.pg }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      NEUTRON_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      NEUTRON_LIVE_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: typescript/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: typescript/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        working-directory: typescript
+      - name: Test neutron-sql (live Postgres, both drivers)
+        run: pnpm --filter @neutron-build/sql run test
+        working-directory: typescript
+      - name: ORM performance and integrity gate
+        run: node --expose-gc bench/orm-gate.mjs --profile ci --gate --out orm-gate.local.json
+        working-directory: typescript/packages/neutron-sql
+      - name: Probes encode PostgreSQL (control)
+        run: node conformance/live/orm/run.mjs --control
+
+  cli:
+    name: CLI live (Postgres ${{ matrix.pg }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [16, 17, 18]
+    services:
+      postgres:
+        image: pgvector/pgvector:pg${{ matrix.pg }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      NEUTRON_E2E_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      NEUTRON_LIVE_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build Studio (embedded by the CLI)
+        run: npm ci && npm run build && cp -R dist ../cli/internal/studio/dist
+        working-directory: studio
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: cli/go.sum
+      - name: Test
+        run: go test -race ./...
+        working-directory: cli
