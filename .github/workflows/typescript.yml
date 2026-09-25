@@ -137,7 +137,10 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:17
+        # PostgreSQL 17 with the pgvector extension available (not
+        # installed): the X01 live legs create it and also assert the
+        # available-not-installed gate. Stock postgres:17 lacks it.
+        image: pgvector/pgvector:pg17
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
