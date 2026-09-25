@@ -11,7 +11,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -27,6 +29,36 @@ func isLocalhostOrigin(origin string) bool {
 		strings.HasPrefix(origin, "http://[::1]:") ||
 		origin == "http://localhost" ||
 		origin == "http://127.0.0.1"
+}
+
+// allowedHost reports whether a request's Host header names this server in
+// a form DNS rebinding cannot forge: an IP literal, localhost, or the
+// configured bind host. A rebinding page reaches the listener under its own
+// domain name, which is none of these.
+func allowedHost(hostHeader, bindHost string) bool {
+	h := hostHeader
+	if hh, _, err := net.SplitHostPort(hostHeader); err == nil {
+		h = hh
+	}
+	h = strings.TrimSuffix(strings.TrimPrefix(h, "["), "]")
+	switch {
+	case h == "":
+		return false
+	case strings.EqualFold(h, "localhost"), net.ParseIP(h) != nil:
+		return true
+	}
+	return bindHost != "" && net.ParseIP(bindHost) == nil && strings.EqualFold(h, bindHost)
+}
+
+// allowedOrigin reports whether a browser Origin may call this server: a
+// localhost origin, or the same origin the request is addressed to (a
+// Host that already passed allowedHost).
+func allowedOrigin(origin, hostHeader string) bool {
+	if origin == "" || isLocalhostOrigin(origin) {
+		return true
+	}
+	u, err := url.Parse(origin)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && strings.EqualFold(u.Host, hostHeader)
 }
 
 const protocolVersion = "2024-11-05"
@@ -191,6 +223,34 @@ type toolCallParams struct {
 //   GET  /tools            — plain JSON tool list (generic REST)
 //   POST /tools/{name}     — plain REST tool call with JSON body arguments
 func (s *Server) RunHTTP(ctx context.Context, addr string) error {
+	handler, err := s.httpHandler(addr)
+	if err != nil {
+		return err
+	}
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      handler,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 60 * time.Second,
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe() }()
+
+	log.Printf("mcp: HTTP server listening on %s", addr)
+
+	select {
+	case <-ctx.Done():
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return srv.Shutdown(shutCtx)
+	case err := <-errCh:
+		return err
+	}
+}
+
+// httpHandler builds the HTTP surfaces for a listener bound to addr.
+func (s *Server) httpHandler(addr string) (http.Handler, error) {
 	mux := http.NewServeMux()
 
 	// Optional bearer token auth via NEUTRON_MCP_TOKEN. Write tools over
@@ -198,14 +258,27 @@ func (s *Server) RunHTTP(ctx context.Context, addr string) error {
 	// must never be a mutation path.
 	mcpToken := os.Getenv("NEUTRON_MCP_TOKEN")
 	if s.env.allowWrites && mcpToken == "" {
-		return fmt.Errorf("--allow-writes over the HTTP transport requires NEUTRON_MCP_TOKEN (bearer authentication)")
+		return nil, fmt.Errorf("--allow-writes over the HTTP transport requires NEUTRON_MCP_TOKEN (bearer authentication)")
 	}
 
-	// CORS middleware wrapping all handlers (localhost origins only + optional auth)
+	bindHost, _, _ := net.SplitHostPort(addr)
+
+	// Middleware wrapping all handlers: Host/Origin checks against DNS
+	// rebinding, CORS for localhost origins only, optional auth.
 	wrap := func(h http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
-			// Restrict CORS to localhost origins only
+			// The unauthenticated listener answers only requests addressed
+			// to it by IP, localhost or its bind name, and only browser
+			// origins that are localhost or that same address.
+			if !allowedHost(r.Host, bindHost) {
+				http.Error(w, "Forbidden: Host must be localhost, an IP address or the --host name", http.StatusForbidden)
+				return
+			}
 			origin := r.Header.Get("Origin")
+			if !allowedOrigin(origin, r.Host) {
+				http.Error(w, "Forbidden: cross-origin request", http.StatusForbidden)
+				return
+			}
 			if origin == "" || isLocalhostOrigin(origin) {
 				if origin != "" {
 					w.Header().Set("Access-Control-Allow-Origin", origin)
@@ -302,26 +375,7 @@ func (s *Server) RunHTTP(ctx context.Context, addr string) error {
 		s.writeRESTResult(w, r.Context(), name, args)
 	}))
 
-	srv := &http.Server{
-		Addr:         addr,
-		Handler:      mux,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
-	}
-
-	errCh := make(chan error, 1)
-	go func() { errCh <- srv.ListenAndServe() }()
-
-	log.Printf("mcp: HTTP server listening on %s", addr)
-
-	select {
-	case <-ctx.Done():
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return srv.Shutdown(shutCtx)
-	case err := <-errCh:
-		return err
-	}
+	return mux, nil
 }
 
 // writeRESTResult answers the plain REST and OpenAI-compatible surfaces:
