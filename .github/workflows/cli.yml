@@ -113,6 +113,78 @@ jobs:
         run: go vet ./...
         working-directory: cli
 
+  # R01 (V15/V16): the REAL served Studio — this workflow's CLI binary with
+  # the Studio build embedded — in headless Chrome (preinstalled on
+  # ubuntu-latest) against a disposable PostgreSQL database. render-bench
+  # enforces the virtualization DOM bound exactly, reachability of a
+  # 10,000-row result, and the time/frame/heap ceilings in
+  # studio/scripts/render-budgets.json; journey edits, commits, reverts and
+  # conflicts through the UI with psql oracles.
+  studio-browser:
+    name: Studio in a real browser
+    needs: studio
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      NEUTRON_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch Studio dist
+        uses: actions/download-artifact@v4
+        with:
+          name: studio-dist
+          path: cli/internal/studio/dist
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: cli/go.sum
+
+      - name: Build the CLI with the embedded Studio
+        run: go build -o neutron .
+        working-directory: cli
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - run: npm ci
+        working-directory: studio
+
+      - name: Edit journey (commit, revert, conflict, atomicity)
+        run: node scripts/journey.mjs --cli ../cli/neutron --out journey.local.json
+        working-directory: studio
+
+      - name: Render budgets (10,000-row grids)
+        run: node scripts/render-bench.mjs --cli ../cli/neutron --runs 3 --gate --out render-bench.local.json
+        working-directory: studio
+
+      - name: Upload browser results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: studio-browser-${{ github.run_id }}
+          path: |
+            studio/journey.local.json
+            studio/render-bench.local.json
+          if-no-files-found: warn
+          retention-days: 14
+
   # The application coordinator supervises real process trees, so its runtime
   # support is only claimed where these run natively. Windows is cross-compiled
   # below and rejects application mode at runtime.

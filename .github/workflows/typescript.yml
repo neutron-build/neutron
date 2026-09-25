@@ -132,9 +132,23 @@ jobs:
   # skipping — locally, without the env, the same tests skip with a visible
   # reason. Image: postgres:17 (repo workflows pin no digests; majors are
   # declared/reassessed at release per VERIFICATION, 16/18 are release-time).
+  #
+  # R01: the job runs on both Node lines the repo builds with (22, 24) and,
+  # after the suite, the two gates in packages/neutron-sql/bench/ (see its
+  # README): orm-gate.mjs (100-parent relation pages at 0/2/20 children on
+  # two edges plus depth 3; results equal to hand-written SQL and to the
+  # pinned drizzle-orm, one statement per read counted client- and
+  # server-side, index use, server time vs the hand-written statement,
+  # streaming early-exit release, generous p95 ceilings) and
+  # typecheck-gate.mjs (100-table depth-3 consumer project; type and
+  # instantiation counts are deterministic per TypeScript version).
   neutron-sql:
-    name: neutron-sql live (Postgres 17)
+    name: neutron-sql live (Postgres 17, Node ${{ matrix.node }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
     services:
       postgres:
         # PostgreSQL 17 with the pgvector extension available (not
@@ -164,7 +178,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
           cache: pnpm
           cache-dependency-path: typescript/pnpm-lock.yaml
 
@@ -175,6 +189,25 @@ jobs:
       - name: Test neutron-sql (live Postgres, both drivers)
         run: pnpm --filter @neutron-build/sql run test
         working-directory: typescript
+
+      - name: ORM performance and integrity gate (CI profile)
+        run: node --expose-gc bench/orm-gate.mjs --profile ci --gate --out orm-gate.local.json
+        working-directory: typescript/packages/neutron-sql
+
+      - name: Consumer type-check cost gate (100 tables, depth 3)
+        run: node bench/typecheck-gate.mjs --gate --out typecheck-gate.local.json
+        working-directory: typescript/packages/neutron-sql
+
+      - name: Upload gate results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neutron-sql-gates-node${{ matrix.node }}-${{ github.run_id }}
+          path: |
+            typescript/packages/neutron-sql/orm-gate.local.json
+            typescript/packages/neutron-sql/typecheck-gate.local.json
+          if-no-files-found: warn
+          retention-days: 14
 
   # Browser e2e: the only tests that verify in a real browser that routing,
   # actions, and island hydration actually work end-to-end. Chromium only —
