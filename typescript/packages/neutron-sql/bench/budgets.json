@@ -1,0 +1,61 @@
+{
+  "$comment": [
+    "R01 budgets for bench/orm-gate.mjs and bench/typecheck-gate.mjs. Reference machine: Apple M4 (10 cores, 24 GiB), macOS, Node 22.23.2, PostgreSQL 17.11 (Homebrew, shared_buffers 128MB), pg 8.22.0, postgres 3.4.8, 2026-09-25; the full-profile run is bench/baseline.json.",
+    "serverRatioVsHandMax: the compiled relational statement vs the same correlated shape written by hand, EXPLAIN ANALYZE medians interleaved in one run (machine-independent). Measured 0.90-1.09 after the json_* change; the previous jsonb_* compiler measured 1.49/1.70/1.85 and must fail. 1.35 leaves room for run noise and nothing else.",
+    "ciCeilings.p95Ms: absolute client p95 ceilings for the CI profile, about 10x the reference-machine p95 (indexed) and 10x the unindexed p50, so shared runners pass and an N+1, a lost index or a cartesian product fails. Never raise one to make a regression pass.",
+    "ciCeilings.streamEarlyExitReleaseP95Ms: reference p95 0.25 ms; 250 ms is a hang detector, not a speed claim.",
+    "sameMachine: --compare against a baseline recorded on the same machine: p50 may not regress more than regressionPct unless the change is also below absoluteFloorMs (sub-millisecond scheduler noise).",
+    "typecheck: per TypeScript version, types/instantiations of the generated 100-table depth-3 consumer project (deterministic); regressionPct is the V16 20% allowance."
+  ],
+  "referenceTools": {
+    "drizzle-orm": "0.45.1"
+  },
+  "serverRatioVsHandMax": 1.35,
+  "sameMachine": {
+    "regressionPct": 20,
+    "absoluteFloorMs": 0.5
+  },
+  "ciCeilings": {
+    "p95Ms": {
+      "small": {
+        "page/k=0/indexed": 15,
+        "page/k=2/indexed": 35,
+        "page/k=20/indexed": 60,
+        "deep/k=2/indexed": 60,
+        "page/k=0/unindexed": 1500,
+        "page/k=2/unindexed": 1500,
+        "page/k=20/unindexed": 1500,
+        "deep/k=2/unindexed": 1500
+      }
+    },
+    "streamEarlyExitReleaseP95Ms": 250
+  },
+  "typecheck": {
+    "5.9.3": {
+      "regressionPct": 20,
+      "baseline": {
+        "types": 22489,
+        "instantiations": 376816
+      },
+      "reference": {
+        "checkSec": 1.55,
+        "totalSec": 1.7,
+        "memoryMiB": 141,
+        "machine": "Apple M4, Node 22.23.2"
+      }
+    },
+    "5.7.2": {
+      "regressionPct": 20,
+      "baseline": {
+        "types": 22489,
+        "instantiations": 443769
+      },
+      "reference": {
+        "checkSec": 1.75,
+        "totalSec": 1.92,
+        "memoryMiB": 118,
+        "machine": "Apple M4, Node 22.23.2"
+      }
+    }
+  }
+}
