@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -119,5 +121,56 @@ func TestHTTPWritesRequireToken(t *testing.T) {
 	err := s.RunHTTP(context.Background(), "127.0.0.1:0")
 	if err == nil || !strings.Contains(err.Error(), "NEUTRON_MCP_TOKEN") {
 		t.Fatalf("RunHTTP with writes and no token: %v", err)
+	}
+}
+
+// Review 1 MEDIUM-3: a DNS-rebinding page reaches the listener under its own
+// domain name and, once rebound, is same-origin. Such requests are refused;
+// requests addressed by loopback name, IP literal or the --host name are not.
+func TestHTTPRefusesRebindingHosts(t *testing.T) {
+	t.Setenv("NEUTRON_MCP_TOKEN", "")
+	s := &Server{env: &toolEnv{}}
+	cases := []struct {
+		bind, host, origin string
+		want               int
+	}{
+		{"127.0.0.1:7792", "attacker.example:7792", "http://attacker.example:7792", http.StatusForbidden},
+		{"127.0.0.1:7792", "attacker.example:7792", "", http.StatusForbidden},
+		{"127.0.0.1:7792", "127.0.0.1:7792", "http://attacker.example", http.StatusForbidden},
+		{"0.0.0.0:7792", "rebind.attacker.example", "", http.StatusForbidden},
+		{"127.0.0.1:7792", "127.0.0.1:7792", "", http.StatusOK},
+		{"127.0.0.1:7792", "localhost:7792", "http://localhost:3000", http.StatusOK},
+		{"127.0.0.1:7792", "[::1]:7792", "", http.StatusOK},
+		{"0.0.0.0:7792", "192.168.1.20:7792", "http://192.168.1.20:7792", http.StatusOK},
+		{"devbox:7792", "devbox:7792", "", http.StatusOK},
+	}
+	for _, c := range cases {
+		h, err := s.httpHandler(c.bind)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodGet, "/tools", nil)
+		req.Host = c.host
+		if c.origin != "" {
+			req.Header.Set("Origin", c.origin)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != c.want {
+			t.Errorf("bind %s Host %q Origin %q: %d, want %d", c.bind, c.host, c.origin, rec.Code, c.want)
+		}
+	}
+}
+
+// Review 1 L1: the agent cannot point migration_status at another directory.
+func TestMigrationStatusConfinedToConfiguredDir(t *testing.T) {
+	env := &toolEnv{engine: inspect.Engine{Product: "postgres"}, migrationsDir: "migrations"}
+	_, err := callTool(context.Background(), env, "migration_status", map[string]any{"dir": "/etc"})
+	if err == nil || !strings.Contains(err.Error(), "--migrations") {
+		t.Fatalf("dir outside --migrations: %v", err)
+	}
+	spec, _ := lookupTool("migration_status", false)
+	if _, ok := spec.def.InputSchema["properties"].(map[string]any)["dir"]; ok {
+		t.Fatalf("migration_status still advertises a dir argument")
 	}
 }
