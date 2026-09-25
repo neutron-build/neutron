@@ -432,11 +432,13 @@ func TestStudioDataEditorS03E2E(t *testing.T) {
 		ops := `"operations":[` +
 			`{"op":"update","schema":"public","table":"editors","binding":%q,"key":[{"column":"id","value":10}],"version":%q,"column":"flag","value":false},` +
 			`{"op":"update","schema":"public","table":"editors","binding":%q,"key":[{"column":"id","value":10}],"version":%q,"column":"doc","value":"{\"a\":2,\"b\":null}"}]`
-		// The second update stages the SAME original version (the SPA stages
-		// both from one read); the first update bumps xmin, so the batch
-		// must conflict — proving per-op original rechecks also for the
-		// editor's own earlier op.
-		code, body := commit("e2e", "s03-upd-conflict", fmt.Sprintf(ops, binding, ver, binding, ver))
+		// A second update carrying a DIFFERENT (stale) original conflicts
+		// the whole batch, even though the batch's own first op already
+		// holds the row: per-op original rechecks.
+		stale := `"operations":[` +
+			`{"op":"update","schema":"public","table":"editors","binding":%q,"key":[{"column":"id","value":10}],"version":%q,"column":"flag","value":false},` +
+			`{"op":"update","schema":"public","table":"editors","binding":%q,"key":[{"column":"id","value":10}],"version":"1","column":"doc","value":"{\"a\":2,\"b\":null}"}]`
+		code, body := commit("e2e", "s03-upd-conflict", fmt.Sprintf(stale, binding, ver, binding))
 		if code != http.StatusConflict || body["state"] != "conflict" {
 			t.Fatalf("second-op stale original = %d %v, want 409 conflict", code, body)
 		}
@@ -445,6 +447,18 @@ func TestStudioDataEditorS03E2E(t *testing.T) {
 		oracle(`SELECT flag, doc::text FROM editors WHERE id = 10`, &flag, &doc)
 		if flag != false || doc != `{"a": 1}` {
 			t.Fatalf("conflicted batch applied something: flag=%v doc=%s", flag, doc)
+		}
+		// Both edits staged from ONE read carry the same original: the first
+		// op verifies it and the second chains from the batch's own write
+		// (R01 — the SPA stages exactly this for two cells of one row, which
+		// previously could never commit).
+		code, body = commit("e2e", "s03-upd-samerow", fmt.Sprintf(ops, binding, ver, binding, ver))
+		if code != http.StatusOK {
+			t.Fatalf("two cells of one row from one read = %d %v, want 200", code, body)
+		}
+		oracle(`SELECT flag, doc::text FROM editors WHERE id = 10`, &flag, &doc)
+		if flag != false || doc != `{"a": 2, "b": null}` {
+			t.Fatalf("same-row batch: flag=%v doc=%s", flag, doc)
 		}
 
 		// Re-read and commit the boolean edit on the fresh version — the
