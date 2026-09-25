@@ -571,20 +571,96 @@ func TestStudioCommitProtocolV2E2E(t *testing.T) {
 		}
 	})
 
-	t.Run("a second edit of the same row inside one batch rechecks its original", func(t *testing.T) {
+	t.Run("several edits of one row in one batch apply against the one read (R01)", func(t *testing.T) {
+		// Every staged edit of a row carries the version the table read
+		// returned. Two cells of one row (and the same cell twice) must
+		// commit together: the first operation verifies the read, later ones
+		// chain from the version the batch produced. Before R01 the second
+		// operation always conflicted with the batch's own first write, so a
+		// user editing two cells of one row could never commit (found driving
+		// the served Studio in Chrome).
 		versions := readIdentities("commits")
 		ops := `"operations":[` +
 			`{"op":"update","schema":"public","table":"commits","binding":%q,"key":[{"column":"id","value":1}],"version":%q,"column":"note","value":"first-edit"},` +
+			`{"op":"update","schema":"public","table":"commits","binding":%q,"key":[{"column":"id","value":1}],"version":%q,"column":"body","value":"other-cell"},` +
 			`{"op":"update","schema":"public","table":"commits","binding":%q,"key":[{"column":"id","value":1}],"version":%q,"column":"note","value":"second-edit"}` +
 			`]`
-		code, body := commit(mainTS, mainToken, "e2e", "op-selfconflict-1", fmt.Sprintf(ops, binding, versions["1"], binding, versions["1"]))
-		if code != http.StatusConflict || body["state"] != "conflict" {
-			t.Fatalf("self-conflict = %d %v, want 409 conflict (the second edit's original is gone)", code, body)
+		v := versions["1"]
+		code, body := commit(mainTS, mainToken, "e2e", "op-samerow-1", fmt.Sprintf(ops, binding, v, binding, v, binding, v))
+		if code != http.StatusOK {
+			t.Fatalf("same-row batch = %d %v, want 200", code, body)
 		}
-		var note string
+		var note, rowBody string
 		oracle(`SELECT note FROM commits WHERE id = 1`, &note)
-		if note != "extern" {
-			t.Fatalf("note = %q, want extern (nothing applied)", note)
+		oracle(`SELECT body FROM commits WHERE id = 1`, &rowBody)
+		if note != "second-edit" || rowBody != "other-cell" {
+			t.Fatalf("row 1 = note %q body %q, want second-edit / other-cell (operations in order)", note, rowBody)
+		}
+		var xmin string
+		oracle(`SELECT xmin::text FROM commits WHERE id = 1`, &xmin)
+		results, _ := body["operations"].([]any)
+		if len(results) != 3 {
+			t.Fatalf("operations = %v", body["operations"])
+		}
+		if last, _ := results[2].(map[string]any); last["version"] != xmin {
+			t.Fatalf("last result version %v != row xmin %q", last["version"], xmin)
+		}
+
+		// Revert undoes all three in reverse order: the exact original.
+		code, body = do(mainTS, mainToken, http.MethodPost, "/api/table/v2/revert",
+			`{"connectionId":"e2e","operationId":"op-samerow-1","revertOperationId":"op-samerow-1-r"}`)
+		if code != http.StatusOK {
+			t.Fatalf("revert = %d %v", code, body)
+		}
+		oracle(`SELECT note FROM commits WHERE id = 1`, &note)
+		oracle(`SELECT body FROM commits WHERE id = 1`, &rowBody)
+		if note != "extern" || rowBody == "other-cell" {
+			t.Fatalf("revert left note %q body %q, want the pre-commit row", note, rowBody)
+		}
+	})
+
+	t.Run("a chained edit carrying a different (stale) version still conflicts, atomically", func(t *testing.T) {
+		versions := readIdentities("commits")
+		var before string
+		oracle(`SELECT row(id, body, note, big)::text FROM commits WHERE id = 1`, &before)
+		ops := `"operations":[` +
+			`{"op":"update","schema":"public","table":"commits","binding":%q,"key":[{"column":"id","value":1}],"version":%q,"column":"note","value":"applies-first"},` +
+			`{"op":"update","schema":"public","table":"commits","binding":%q,"key":[{"column":"id","value":1}],"version":"1","column":"note","value":"stale-read"}` +
+			`]`
+		code, body := commit(mainTS, mainToken, "e2e", "op-samerow-stale", fmt.Sprintf(ops, binding, versions["1"], binding))
+		if code != http.StatusConflict || body["state"] != "conflict" {
+			t.Fatalf("stale chained edit = %d %v, want 409 conflict", code, body)
+		}
+		if msg, _ := body["error"].(string); !strings.HasPrefix(msg, "operations[1]") {
+			t.Fatalf("conflict must name operations[1]: %v", body["error"])
+		}
+		var after string
+		oracle(`SELECT row(id, body, note, big)::text FROM commits WHERE id = 1`, &after)
+		if after != before {
+			t.Fatalf("nothing may apply: %q -> %q", before, after)
+		}
+	})
+
+	t.Run("an edit and a delete of one row commit, and the batch is honestly irreversible", func(t *testing.T) {
+		if err := fixture.Exec(context.Background(), `INSERT INTO commits (id, body) VALUES (877, 'edit-then-delete')`); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		versions := readIdentities("commits")
+		ops := `"operations":[` +
+			`{"op":"update","schema":"public","table":"commits","binding":%q,"key":[{"column":"id","value":877}],"version":%q,"column":"note","value":"edited"},` +
+			`{"op":"delete","schema":"public","table":"commits","binding":%q,"key":[{"column":"id","value":877}],"version":%q}` +
+			`]`
+		code, body := commit(mainTS, mainToken, "e2e", "op-samerow-del", fmt.Sprintf(ops, binding, versions["877"], binding, versions["877"]))
+		if code != http.StatusOK {
+			t.Fatalf("edit+delete = %d %v", code, body)
+		}
+		if body["reversible"] != false {
+			t.Fatalf("edit+delete of one row must be irreversible: %v", body)
+		}
+		var n int
+		oracle(`SELECT count(*) FROM commits WHERE id = 877`, &n)
+		if n != 0 {
+			t.Fatal("row 877 not deleted")
 		}
 	})
 

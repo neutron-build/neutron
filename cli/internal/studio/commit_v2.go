@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -823,9 +824,24 @@ func fkSideEffectsAffectRow(ctx context.Context, tx pgx.Tx, schemaName, tableNam
 // prefixed with its operations[N] position (S05 entry condition S03-F1):
 // execution-time failures are as attributable as prepare-time ones, so a
 // multi-op batch never pins an innocent first row.
+//
+// Several operations on ONE row (two edited cells of a row, an edit then a
+// delete) were all staged against the same read, so they all carry the
+// version that read returned. The first of them verifies it against the
+// database; from then on the row is locked by this transaction and its
+// version is the one this batch produced, so a later operation on the row
+// that carries the same originally-read version is checked against the
+// batch's current version instead (verified by the first). A later
+// operation carrying any other version is stale and conflicts as usual.
 func runCommitOps(ctx context.Context, tx pgx.Tx, prepared []*preparedOp) ([]opExecution, error) {
 	var out []opExecution
+	chain := rowVersionChains{}
 	for _, p := range prepared {
+		if p.kind == "update" || p.kind == "delete" {
+			if c, ok := chain[p.rowKey()]; ok && p.version == c.read {
+				p.version = c.current
+			}
+		}
 		switch p.kind {
 		case "insert":
 			sqlText, _ := buildInsertStatementV2(p.meta, p.schema, p.table, p.insCols)
@@ -893,6 +909,7 @@ func runCommitOps(ctx context.Context, tx pgx.Tx, prepared []*preparedOp) ([]opE
 			ex.result = opResult{Index: p.index, Op: "update", RowsAffected: n, Version: newVersion}
 			ex.before = before
 			out = append(out, ex)
+			chain.advance(p, newVersion)
 
 		case "delete":
 			tableRef := fmt.Sprintf("%s.%s", quoteIdent(p.schema), quoteIdent(p.table))
@@ -937,9 +954,44 @@ func runCommitOps(ctx context.Context, tx pgx.Tx, prepared []*preparedOp) ([]opE
 			}
 			ex.result = opResult{Index: p.index, Op: "delete", RowsAffected: n}
 			out = append(out, ex)
+			chain.advance(p, "")
 		}
 	}
 	return out, nil
+}
+
+// rowVersionChain is one row's version history inside a batch: the version
+// the client read (verified by the batch's first operation on the row) and
+// the version the batch's latest operation left ("" once deleted).
+type rowVersionChain struct {
+	read    string
+	current string
+	ops     int
+	deleted bool
+}
+
+type rowVersionChains map[string]*rowVersionChain
+
+// advance records a successful update/delete of p's row. The originally
+// read version is the one the FIRST operation on the row carried.
+func (c rowVersionChains) advance(p *preparedOp, newVersion string) {
+	k := p.rowKey()
+	e, ok := c[k]
+	if !ok {
+		e = &rowVersionChain{read: p.version}
+		c[k] = e
+	}
+	e.current = newVersion
+	e.ops++
+	if p.kind == "delete" {
+		e.deleted = true
+	}
+}
+
+// rowKey identifies the row an update/delete addresses: relation plus the
+// ordered, typed key values.
+func (p *preparedOp) rowKey() string {
+	return fmt.Sprintf("%s\x00%s\x00%s\x00%#v", p.binding, p.schema, p.table, p.keyArgs)
 }
 
 // buildInverse derives the recorded inverse of a committed batch from the
@@ -955,8 +1007,22 @@ func buildInverse(ctx context.Context, tx pgx.Tx, prepared []*preparedOp, execs 
 			refusal = fmt.Sprintf(format, args...)
 		}
 	}
+	// Each row's version after the whole batch: every inverse operation on a
+	// row carries it, because a revert starts from the state the commit left
+	// (runCommitOps chains later operations on the row from there).
+	final := rowVersionChains{}
+	for _, p := range prepared {
+		if p.kind == "update" || p.kind == "delete" {
+			final.advance(p, execs[p.index].result.Version)
+		}
+	}
 	for _, p := range prepared {
 		ex := execs[p.index]
+		if p.kind == "update" || p.kind == "delete" {
+			if c := final[p.rowKey()]; c.ops > 1 && c.deleted {
+				setRefusal("operations[%d]: the batch both edits and deletes this row; its intermediate states cannot be restored in order", p.index)
+			}
+		}
 		switch p.kind {
 		case "insert":
 			// The inserted row is deleted by its returned identity.
@@ -974,9 +1040,10 @@ func buildInverse(ctx context.Context, tx pgx.Tx, prepared []*preparedOp, execs 
 			} else if ex.fkSide {
 				setRefusal("operations[%d]: column %q is referenced by rows honoring an ON UPDATE cascade/set-null/set-default rule the inverse cannot capture", p.index, p.column)
 			}
+			rowFinal := final[p.rowKey()].current
 			inv := commitOp{
 				Op: "update", Schema: p.schema, Table: p.table, Binding: p.binding,
-				Key: p.keyCells, Version: &ex.result.Version, Column: &p.column,
+				Key: p.keyCells, Version: &rowFinal, Column: &p.column,
 			}
 			if ex.before == nil {
 				t := true
@@ -1028,6 +1095,10 @@ func buildInverse(ctx context.Context, tx pgx.Tx, prepared []*preparedOp, execs 
 			})
 		}
 	}
+	// Undo in reverse order: the last change to a row is undone first (so
+	// two edits of one cell restore the original, not the intermediate), and
+	// dependent rows inserted after their parents are deleted before them.
+	slices.Reverse(inverse)
 	if !reversible {
 		// Keep the inverse for diagnostics but mark the batch irreversible.
 		return inverse, false, refusal
