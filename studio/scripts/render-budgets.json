@@ -1,0 +1,10 @@
+{
+  "$comment": "Studio render budgets (R01, scripts/render-bench.mjs). rowHeightPx/overscanRows mirror DataGrid's DEFAULT_ROW_HEIGHT/OVERSCAN_ROWS and bound the DOM exactly. Time ceilings are ~10x the reference-machine p95 (Apple M4, headless Chrome 153, 1280x800, 2026-09-25: first rows 109-131 ms, 1000-row page 33-34 ms, 10,000-row SQL result painted 66-70 ms, scroll frame 16.8 ms = one 60 Hz frame, heap 7.4 MiB) so a shared CI runner passes and a real regression (lost virtualization, per-row fetches, a render loop) fails. Frame p95 of 50 ms allows three dropped frames at 60 Hz. Re-derive from a measured run; never raise a ceiling to hide a regression.",
+  "rowHeightPx": 28,
+  "overscanRows": 10,
+  "firstRowsP95Ms": 1500,
+  "page1000P95Ms": 500,
+  "sqlRunToRowsP95Ms": 1000,
+  "scrollFrameP95Ms": 50,
+  "sqlHeapMiB": 64
+}
