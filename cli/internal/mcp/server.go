@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/neutron-build/neutron/cli/internal/db"
+	"github.com/neutron-build/neutron/cli/internal/inspect"
 )
 
 // isLocalhostOrigin checks whether an Origin header refers to a localhost address.
@@ -29,20 +31,55 @@ func isLocalhostOrigin(origin string) bool {
 
 const protocolVersion = "2024-11-05"
 
-// Server is the MCP stdio server.
+// Server is the MCP server.
 type Server struct {
 	client  *db.Client
 	version string
+	env     *toolEnv
 }
 
-// NewServer creates a new MCP server connected to the given database URL.
+// Options are the operator's settings. The zero value is the default:
+// read-only, redaction on.
+type Options struct {
+	// AllowWrites offers the write tool (execute_sql). Off by default.
+	AllowWrites bool
+	// NoRedact disables value redaction under secret-looking names.
+	NoRedact bool
+	// MigrationsDir is the application's migrations directory.
+	MigrationsDir string
+}
+
+// NewServer creates a new MCP server connected to the given database URL
+// and identifies the engine behind it.
 func NewServer(ctx context.Context, dbURL, version string) (*Server, error) {
 	client, err := db.Connect(ctx, dbURL)
 	if err != nil {
-		return nil, fmt.Errorf("connect to database: %w", err)
+		return nil, fmt.Errorf("connect to database: %s", inspect.RedactText(err.Error()))
 	}
-	return &Server{client: client, version: version}, nil
+	engine, err := inspect.DetectEngine(ctx, client)
+	if err != nil {
+		client.Close()
+		return nil, fmt.Errorf("identify engine: %s", inspect.RedactText(err.Error()))
+	}
+	s := &Server{client: client, version: version}
+	s.env = &toolEnv{client: client, engine: engine, redactor: inspect.Redactor{Enabled: true}, migrationsDir: "migrations"}
+	return s, nil
 }
+
+// Configure applies the operator's options.
+func (s *Server) Configure(o Options) {
+	s.env.allowWrites = o.AllowWrites
+	s.env.redactor = inspect.Redactor{Enabled: !o.NoRedact}
+	if o.MigrationsDir != "" {
+		s.env.migrationsDir = o.MigrationsDir
+	}
+}
+
+// Engine reports the identified engine.
+func (s *Server) Engine() inspect.Engine { return s.env.engine }
+
+// ToolCount is the number of tools this server offers.
+func (s *Server) ToolCount() int { return len(toolList(s.env.allowWrites)) }
 
 // Close releases database resources.
 func (s *Server) Close() {
@@ -116,7 +153,7 @@ func (s *Server) dispatch(ctx context.Context, req *rpcRequest) rpcResponse {
 	case "initialize":
 		return s.handleInitialize()
 	case "tools/list":
-		return rpcResponse{Result: map[string]any{"tools": toolList()}}
+		return rpcResponse{Result: map[string]any{"tools": toolList(s.env.allowWrites)}}
 	case "tools/call":
 		return s.handleToolCall(ctx, req.Params)
 	case "ping":
@@ -156,8 +193,13 @@ type toolCallParams struct {
 func (s *Server) RunHTTP(ctx context.Context, addr string) error {
 	mux := http.NewServeMux()
 
-	// Optional bearer token auth via NEUTRON_MCP_TOKEN
+	// Optional bearer token auth via NEUTRON_MCP_TOKEN. Write tools over
+	// HTTP are only offered behind it: an unauthenticated network listener
+	// must never be a mutation path.
 	mcpToken := os.Getenv("NEUTRON_MCP_TOKEN")
+	if s.env.allowWrites && mcpToken == "" {
+		return fmt.Errorf("--allow-writes over the HTTP transport requires NEUTRON_MCP_TOKEN (bearer authentication)")
+	}
 
 	// CORS middleware wrapping all handlers (localhost origins only + optional auth)
 	wrap := func(h http.HandlerFunc) http.HandlerFunc {
@@ -213,7 +255,7 @@ func (s *Server) RunHTTP(ctx context.Context, addr string) error {
 	// OpenAI function definitions
 	mux.HandleFunc("/openai/tools", wrap(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(openAIToolDefs())
+		json.NewEncoder(w).Encode(openAIToolDefs(s.env.allowWrites))
 	}))
 
 	// OpenAI-compatible tool call: {"name":"query_sql","arguments":{"sql":"SELECT 1"}}
@@ -230,25 +272,13 @@ func (s *Server) RunHTTP(ctx context.Context, addr string) error {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
 			return
 		}
-		handler, ok := toolHandlers[body.Name]
-		if !ok {
-			http.Error(w, "unknown tool: "+body.Name, http.StatusNotFound)
-			return
-		}
-		result, err := handler(r.Context(), s.client, body.Arguments)
-		w.Header().Set("Content-Type", "application/json")
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{"result": result})
+		s.writeRESTResult(w, r.Context(), body.Name, body.Arguments)
 	}))
 
 	// Plain REST — GET /tools
 	mux.HandleFunc("/tools", wrap(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(toolList())
+		json.NewEncoder(w).Encode(toolList(s.env.allowWrites))
 	}))
 
 	// Plain REST — POST /tools/{name}  body = JSON arguments object
@@ -262,11 +292,6 @@ func (s *Server) RunHTTP(ctx context.Context, addr string) error {
 			http.Error(w, "tool name required", http.StatusBadRequest)
 			return
 		}
-		handler, ok := toolHandlers[name]
-		if !ok {
-			http.Error(w, "unknown tool: "+name, http.StatusNotFound)
-			return
-		}
 		var args map[string]any
 		if r.ContentLength != 0 {
 			if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
@@ -274,14 +299,7 @@ func (s *Server) RunHTTP(ctx context.Context, addr string) error {
 				return
 			}
 		}
-		result, err := handler(r.Context(), s.client, args)
-		w.Header().Set("Content-Type", "application/json")
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{"result": result})
+		s.writeRESTResult(w, r.Context(), name, args)
 	}))
 
 	srv := &http.Server{
@@ -306,31 +324,60 @@ func (s *Server) RunHTTP(ctx context.Context, addr string) error {
 	}
 }
 
+// writeRESTResult answers the plain REST and OpenAI-compatible surfaces:
+// "result" is the data as JSON text (the pre-X06 shape), "structured" the
+// full envelope with engine, access, limits and redactions.
+func (s *Server) writeRESTResult(w http.ResponseWriter, ctx context.Context, name string, args map[string]any) {
+	w.Header().Set("Content-Type", "application/json")
+	env, err := callTool(ctx, s.env, name, args)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errUnknownTool) {
+			status = http.StatusNotFound
+		}
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{"result": dataText(env.Data), "structured": env})
+}
+
+func dataText(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return fmt.Sprint(v)
+	}
+	return string(b)
+}
+
 func (s *Server) handleToolCall(ctx context.Context, raw json.RawMessage) rpcResponse {
 	var p toolCallParams
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return rpcResponse{Error: &rpcError{Code: -32602, Message: "invalid params: " + err.Error()}}
 	}
 
-	handler, ok := toolHandlers[p.Name]
-	if !ok {
-		return rpcResponse{Error: &rpcError{Code: -32601, Message: "unknown tool: " + p.Name}}
+	env, toolErr := callTool(ctx, s.env, p.Name, p.Arguments)
+	if errors.Is(toolErr, errUnknownTool) {
+		return rpcResponse{Error: &rpcError{Code: -32601, Message: toolErr.Error()}}
 	}
-
-	text, toolErr := handler(ctx, s.client, p.Arguments)
-
-	isError := toolErr != nil
-	content := text
-	if isError {
-		content = toolErr.Error()
+	if toolErr != nil {
+		return rpcResponse{
+			Result: map[string]any{
+				"content": []map[string]any{{"type": "text", "text": toolErr.Error()}},
+				"isError": true,
+			},
+		}
 	}
-
+	// The text content carries the whole envelope so clients without
+	// structuredContent support still see access, limits and redactions.
 	return rpcResponse{
 		Result: map[string]any{
-			"content": []map[string]any{
-				{"type": "text", "text": content},
-			},
-			"isError": isError,
+			"content":           []map[string]any{{"type": "text", "text": dataText(env)}},
+			"structuredContent": env,
+			"isError":           false,
 		},
 	}
 }

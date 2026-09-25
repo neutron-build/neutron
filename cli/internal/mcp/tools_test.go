@@ -6,15 +6,16 @@ import (
 	"testing"
 )
 
-func TestToolList(t *testing.T) {
-	tools := toolList()
-	if len(tools) == 0 {
-		t.Fatal("toolList() returned empty")
-	}
+// readOnlyToolCount is the number of tools a default (read-only) server
+// offers; --allow-writes adds execute_sql.
+const readOnlyToolCount = 24
 
-	// Should have exactly 19 tools
-	if len(tools) != 19 {
-		t.Errorf("toolList() returned %d tools, want 19", len(tools))
+func TestToolList(t *testing.T) {
+	if n := len(toolList(false)); n != readOnlyToolCount {
+		t.Errorf("toolList(false) returned %d tools, want %d", n, readOnlyToolCount)
+	}
+	if n := len(toolList(true)); n != readOnlyToolCount+1 {
+		t.Errorf("toolList(true) returned %d tools, want %d", n, readOnlyToolCount+1)
 	}
 }
 
@@ -26,23 +27,32 @@ func TestToolListNames(t *testing.T) {
 		"ts_range", "geo_distance", "blob_list",
 		"stream_range", "datalog_query", "cdc_changes",
 		"pubsub_list", "search_docs", "get_doc",
+		"engine_limits", "inspect_table", "migration_status",
+		"explain_sql", "plan_schema_changes",
 	}
-
-	tools := toolList()
 	nameSet := make(map[string]bool)
-	for _, t := range tools {
+	for _, t := range toolList(false) {
 		nameSet[t.Name] = true
 	}
-
 	for _, name := range expectedNames {
 		if !nameSet[name] {
 			t.Errorf("toolList() missing tool %q", name)
 		}
 	}
+	if nameSet["execute_sql"] {
+		t.Error("a read-only server lists execute_sql")
+	}
+	withWrites := map[string]bool{}
+	for _, t := range toolList(true) {
+		withWrites[t.Name] = true
+	}
+	if !withWrites["execute_sql"] {
+		t.Error("--allow-writes server does not list execute_sql")
+	}
 }
 
 func TestToolListHasDescriptions(t *testing.T) {
-	for _, tool := range toolList() {
+	for _, tool := range toolList(true) {
 		if tool.Description == "" {
 			t.Errorf("tool %q has empty description", tool.Name)
 		}
@@ -50,7 +60,7 @@ func TestToolListHasDescriptions(t *testing.T) {
 }
 
 func TestToolListHasInputSchemas(t *testing.T) {
-	for _, tool := range toolList() {
+	for _, tool := range toolList(true) {
 		if tool.InputSchema == nil {
 			t.Errorf("tool %q has nil inputSchema", tool.Name)
 		}
@@ -61,23 +71,31 @@ func TestToolListHasInputSchemas(t *testing.T) {
 	}
 }
 
-func TestToolHandlersRegistered(t *testing.T) {
-	tools := toolList()
-	for _, tool := range tools {
-		if _, ok := toolHandlers[tool.Name]; !ok {
-			t.Errorf("tool %q has no handler registered", tool.Name)
+// Only the explicit write tool may drop the read-only hint.
+func TestToolAnnotations(t *testing.T) {
+	for _, spec := range toolSpecs() {
+		if spec.handler == nil {
+			t.Errorf("tool %q has no handler", spec.def.Name)
+		}
+		ro, _ := spec.def.Annotations["readOnlyHint"].(bool)
+		destructive, _ := spec.def.Annotations["destructiveHint"].(bool)
+		if spec.access == accessWrite {
+			if ro || !destructive {
+				t.Errorf("write tool %q annotated readOnly=%v destructive=%v", spec.def.Name, ro, destructive)
+			}
+			if !strings.HasPrefix(spec.def.Description, "WRITE:") {
+				t.Errorf("write tool %q description does not lead with WRITE:", spec.def.Name)
+			}
+			continue
+		}
+		if !ro || destructive {
+			t.Errorf("tool %q annotated readOnly=%v destructive=%v", spec.def.Name, ro, destructive)
 		}
 	}
 }
 
-func TestToolHandlerCount(t *testing.T) {
-	if len(toolHandlers) != 19 {
-		t.Errorf("toolHandlers has %d entries, want 19", len(toolHandlers))
-	}
-}
-
 func TestDumpSchemaOpenAI(t *testing.T) {
-	out, err := DumpSchema("openai")
+	out, err := DumpSchema("openai", false)
 	if err != nil {
 		t.Fatalf("DumpSchema(openai) error: %v", err)
 	}
@@ -91,8 +109,8 @@ func TestDumpSchemaOpenAI(t *testing.T) {
 		t.Fatalf("DumpSchema(openai) returned invalid JSON: %v", err)
 	}
 
-	if len(result) != 19 {
-		t.Errorf("OpenAI schema has %d tools, want 19", len(result))
+	if len(result) != readOnlyToolCount {
+		t.Errorf("OpenAI schema has %d tools, want %d", len(result), readOnlyToolCount)
 	}
 
 	// Each entry should have type=function
@@ -112,7 +130,7 @@ func TestDumpSchemaOpenAI(t *testing.T) {
 }
 
 func TestDumpSchemaMCP(t *testing.T) {
-	out, err := DumpSchema("mcp")
+	out, err := DumpSchema("mcp", false)
 	if err != nil {
 		t.Fatalf("DumpSchema(mcp) error: %v", err)
 	}
@@ -131,7 +149,7 @@ func TestDumpSchemaMCP(t *testing.T) {
 }
 
 func TestDumpSchemaMarkdown(t *testing.T) {
-	out, err := DumpSchema("markdown")
+	out, err := DumpSchema("markdown", false)
 	if err != nil {
 		t.Fatalf("DumpSchema(markdown) error: %v", err)
 	}
@@ -147,7 +165,7 @@ func TestDumpSchemaMarkdown(t *testing.T) {
 }
 
 func TestDumpSchemaInvalidFormat(t *testing.T) {
-	_, err := DumpSchema("invalid")
+	_, err := DumpSchema("invalid", false)
 	if err == nil {
 		t.Fatal("expected error for invalid format")
 	}
@@ -240,9 +258,9 @@ func TestBoolProp(t *testing.T) {
 }
 
 func TestOpenAIToolDefs(t *testing.T) {
-	defs := openAIToolDefs()
-	if len(defs) != 19 {
-		t.Errorf("openAIToolDefs() returned %d defs, want 19", len(defs))
+	defs := openAIToolDefs(false)
+	if len(defs) != readOnlyToolCount {
+		t.Errorf("openAIToolDefs() returned %d defs, want %d", len(defs), readOnlyToolCount)
 	}
 
 	for _, def := range defs {

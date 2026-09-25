@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
+	"github.com/neutron-build/neutron/cli/internal/inspect"
 	"github.com/neutron-build/neutron/cli/internal/mcp"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -19,14 +22,28 @@ func init() {
 	mcpCmd.Flags().String("transport", "stdio", "Transport: stdio or http")
 	mcpCmd.Flags().Int("port", 7700, "HTTP port (only used with --transport http)")
 	mcpCmd.Flags().String("dump-schema", "", "Print tool schema and exit: openai, mcp, or markdown")
-	mcpCmd.Flags().Bool("allow-writes", false, "Allow query_sql tool to execute INSERT/UPDATE/DELETE/DDL (default: read-only)")
+	mcpCmd.Flags().Bool("allow-writes", false, "Offer the execute_sql write tool (default: read-only; over HTTP also requires NEUTRON_MCP_TOKEN)")
+	mcpCmd.Flags().String("host", "127.0.0.1", "HTTP bind address (only used with --transport http)")
+	mcpCmd.Flags().Bool("no-redact", false, "Return values under secret-looking names (password, token, api_key, ...) instead of redacting them")
+	mcpCmd.Flags().String("migrations", "migrations", "Application migrations directory for migration_status and inspect_table")
 	rootCmd.AddCommand(mcpCmd)
 }
 
 var mcpCmd = &cobra.Command{
 	Use:   "mcp",
 	Short: "Start a Model Context Protocol (MCP) server for Nucleus",
-	Long: `Start an MCP server that exposes all 14 Nucleus data models as tools.
+	Long: `Start an MCP server that exposes the database (PostgreSQL or Nucleus,
+all 14 Nucleus data models) as inspection and planning tools.
+
+Every tool is read-only by default: on PostgreSQL statements run inside a
+READ ONLY transaction that is rolled back; on Nucleus, which does not apply
+READ ONLY, a lexical guard refuses writes and the engine's mutating
+functions. Values under secret-looking names are redacted (--no-redact to
+disable). Results carry the engine identity and the touched models' actual
+transaction/durability limits (engine_limits reports all of them).
+--allow-writes adds one explicit write tool, execute_sql; over HTTP it also
+requires NEUTRON_MCP_TOKEN. The HTTP transport binds 127.0.0.1 unless --host
+says otherwise.
 
 Supports three transports:
 
@@ -62,14 +79,15 @@ Claude Desktop (~/.config/Claude/claude_desktop_config.json):
     }
   }
 `,
-	RunE: runMCP,
+	RunE: func(cmd *cobra.Command, args []string) error { return reportRunE(runMCP(cmd, args)) },
 }
 
 func runMCP(cmd *cobra.Command, _ []string) error {
 	// --dump-schema needs no DB connection
 	dumpFormat, _ := cmd.Flags().GetString("dump-schema")
 	if dumpFormat != "" {
-		out, err := mcp.DumpSchema(dumpFormat)
+		allowWrites, _ := cmd.Flags().GetBool("allow-writes")
+		out, err := mcp.DumpSchema(dumpFormat, allowWrites)
 		if err != nil {
 			return err
 		}
@@ -97,7 +115,7 @@ func runMCP(cmd *cobra.Command, _ []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("mcp: connecting to %s", dbURL)
+	log.Printf("mcp: connecting to %s", inspect.RedactURL(dbURL))
 
 	srv, err := mcp.NewServer(ctx, dbURL, version)
 	if err != nil {
@@ -106,21 +124,27 @@ func runMCP(cmd *cobra.Command, _ []string) error {
 	defer srv.Close()
 
 	allowWrites, _ := cmd.Flags().GetBool("allow-writes")
-	mcp.AllowWrites = allowWrites
+	noRedact, _ := cmd.Flags().GetBool("no-redact")
+	migrationsDir, _ := cmd.Flags().GetString("migrations")
+	srv.Configure(mcp.Options{AllowWrites: allowWrites, NoRedact: noRedact, MigrationsDir: migrationsDir})
 
 	transport, _ := cmd.Flags().GetString("transport")
 	switch transport {
 	case "http":
+		if allowWrites && os.Getenv("NEUTRON_MCP_TOKEN") == "" {
+			return fmt.Errorf("--allow-writes over the HTTP transport requires NEUTRON_MCP_TOKEN (bearer authentication)")
+		}
 		port, _ := cmd.Flags().GetInt("port")
-		addr := fmt.Sprintf(":%d", port)
-		fmt.Fprintf(os.Stderr, "Nucleus MCP HTTP server on http://localhost%s\n", addr)
+		host, _ := cmd.Flags().GetString("host")
+		addr := net.JoinHostPort(host, strconv.Itoa(port))
+		fmt.Fprintf(os.Stderr, "Nucleus MCP HTTP server on http://%s\n", addr)
 		fmt.Fprintf(os.Stderr, "  POST /mcp               — MCP over HTTP\n")
 		fmt.Fprintf(os.Stderr, "  GET  /openai/tools      — OpenAI function definitions\n")
 		fmt.Fprintf(os.Stderr, "  POST /openai/tools/call — OpenAI-compatible tool call\n")
 		fmt.Fprintf(os.Stderr, "  POST /tools/{name}      — plain REST\n")
 		return srv.RunHTTP(ctx, addr)
 	default: // stdio
-		log.Printf("mcp: nucleus MCP server ready — %d tools available", 17)
+		log.Printf("mcp: MCP server ready on %s %s — %d tools available (%s)", srv.Engine().Product, srv.Engine().Version, srv.ToolCount(), map[bool]string{true: "writes allowed", false: "read-only"}[allowWrites])
 		srv.Run(ctx)
 		return nil
 	}

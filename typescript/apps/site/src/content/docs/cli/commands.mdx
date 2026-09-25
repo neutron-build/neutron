@@ -215,11 +215,21 @@ neutron mcp --transport http --port 7700
 neutron mcp --dump-schema markdown
 ```
 
+Tools are read-only by default: on PostgreSQL they run inside a rolled-back
+`READ ONLY` transaction; on Nucleus, which does not apply `READ ONLY`, a
+lexical guard refuses writes and mutating model functions. Values under
+secret-looking names are redacted, and results carry each touched model's
+actual transaction and durability limits.
+
 **Flags:**
 - `--transport` — `stdio` (default) or `http`
+- `--host` — HTTP bind address (default: 127.0.0.1)
 - `--port` — HTTP port (default: 7700)
 - `--db` — Database URL
 - `--dump-schema` — Print schema and exit (`openai`, `mcp`, or `markdown`)
+- `--allow-writes` — Offer the `execute_sql` write tool (over HTTP also requires `NEUTRON_MCP_TOKEN`)
+- `--no-redact` — Return values under secret-looking names
+- `--migrations` — Migrations directory for `migration_status` and `inspect_table` (default: `migrations`)
 
 ## Diagnostics
 
