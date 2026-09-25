@@ -20,8 +20,8 @@ import (
 func TestMCPNucleusLive(t *testing.T) {
 	nurl := os.Getenv("NEUTRON_E2E_NUCLEUS_URL")
 	if nurl == "" {
-		if os.Getenv("NEUTRON_LIVE_REQUIRED") == "1" {
-			t.Fatal("NEUTRON_LIVE_REQUIRED=1 but NEUTRON_E2E_NUCLEUS_URL is not set")
+		if os.Getenv("NEUTRON_NUCLEUS_LIVE_REQUIRED") == "1" {
+			t.Fatal("NEUTRON_NUCLEUS_LIVE_REQUIRED=1 but NEUTRON_E2E_NUCLEUS_URL is not set")
 		}
 		t.Skip("NEUTRON_E2E_NUCLEUS_URL not set")
 	}
@@ -212,8 +212,8 @@ func TestMCPNucleusLive(t *testing.T) {
 func TestMCPNucleusWrappedMutatorGapIsDocumented(t *testing.T) {
 	nurl := os.Getenv("NEUTRON_E2E_NUCLEUS_URL")
 	if nurl == "" {
-		if os.Getenv("NEUTRON_LIVE_REQUIRED") == "1" {
-			t.Fatal("NEUTRON_LIVE_REQUIRED=1 but NEUTRON_E2E_NUCLEUS_URL is not set")
+		if os.Getenv("NEUTRON_NUCLEUS_LIVE_REQUIRED") == "1" {
+			t.Fatal("NEUTRON_NUCLEUS_LIVE_REQUIRED=1 but NEUTRON_E2E_NUCLEUS_URL is not set")
 		}
 		t.Skip("NEUTRON_E2E_NUCLEUS_URL not set")
 	}

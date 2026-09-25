@@ -22,12 +22,14 @@ import (
 // and the limits Studio shows for each stage. It runs against a disposable
 // engine named by NEUTRON_E2E_NUCLEUS_URL (never a shared one: it writes
 // graph nodes, which have no namespace). Skipped when unset;
-// NEUTRON_LIVE_REQUIRED=1 fails instead.
+// NEUTRON_NUCLEUS_LIVE_REQUIRED=1 fails instead (a separate flag: the
+// CLI Test job requires live PostgreSQL but has no engine; orm-live.yml
+// runs these against a Nucleus built from the same commit).
 func TestStudioX06JourneyNucleusE2E(t *testing.T) {
 	nurl := os.Getenv("NEUTRON_E2E_NUCLEUS_URL")
 	if nurl == "" {
-		if os.Getenv("NEUTRON_LIVE_REQUIRED") == "1" {
-			t.Fatal("NEUTRON_LIVE_REQUIRED=1 but NEUTRON_E2E_NUCLEUS_URL is not set")
+		if os.Getenv("NEUTRON_NUCLEUS_LIVE_REQUIRED") == "1" {
+			t.Fatal("NEUTRON_NUCLEUS_LIVE_REQUIRED=1 but NEUTRON_E2E_NUCLEUS_URL is not set")
 		}
 		t.Skip("NEUTRON_E2E_NUCLEUS_URL not set; X06 Nucleus journey skipped")
 	}

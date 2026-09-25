@@ -29,6 +29,9 @@ on:
   push:
     branches: [main]
     paths:
+      - "cli/internal/mcp/**"
+      - "cli/internal/inspect/**"
+      - "cli/internal/studio/**"
       - "nucleus/**"
       - "conformance/live/orm/**"
       - "conformance/live/scripts/**"
@@ -38,6 +41,9 @@ on:
       - ".github/workflows/orm-live.yml"
   pull_request:
     paths:
+      - "cli/internal/mcp/**"
+      - "cli/internal/inspect/**"
+      - "cli/internal/studio/**"
       - "nucleus/**"
       - "conformance/live/orm/**"
       - "conformance/live/scripts/**"
@@ -237,3 +243,55 @@ jobs:
       - name: Report
         if: always()
         run: cat /tmp/x02-leg.json || true
+
+  # X06: the read-only MCP guard and the Studio inspection journey against a
+  # Nucleus built from THIS commit. There the lexical guard is the only
+  # enforcement (the engine applies no READ ONLY), so every write form must be
+  # refused, and the documented wrapped-mutator gap must still be exactly as
+  # documented. NEUTRON_NUCLEUS_LIVE_REQUIRED=1 turns a missing engine URL
+  # into a failure instead of a skip.
+  x06:
+    name: MCP guard and inspection journey vs live Nucleus (X06)
+    needs: engine
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nucleus-bin-orm
+          path: nucleus/target/release
+      - run: chmod +x nucleus/target/release/nucleus
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The CLI embeds the Studio build (go:embed); tests compile it in.
+      - name: Build Studio for the embed
+        run: |
+          npm ci
+          npm run build
+          mkdir -p ../cli/internal/studio/dist
+          cp -R dist/. ../cli/internal/studio/dist/
+        working-directory: studio
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: cli/go.sum
+
+      - name: Start Nucleus
+        run: sh conformance/live/scripts/start-engine.sh 55432 /tmp/nucleus-live
+
+      - name: X06 Nucleus legs
+        working-directory: cli
+        env:
+          NEUTRON_E2E_NUCLEUS_URL: postgresql://postgres@127.0.0.1:55432/postgres
+          NEUTRON_NUCLEUS_LIVE_REQUIRED: "1"
+        run: go test -count=1 -run 'TestMCPNucleus|TestStudioX06JourneyNucleusE2E' -v ./internal/mcp ./internal/studio
+
+      - name: Report
+        if: always()
+        run: tail -50 /tmp/nucleus-live/server.log || true
