@@ -1858,3 +1858,744 @@ describe("Plugin names", () => {
     }
   });
 });
+
+// =========================================================================
+// X02 — documents and graph relationships: defect fixes, schema-aware
+// collections, bounded traversal, SQL identity tying. Unit level with a
+// param-aware counting transport (statement-counter proofs are first-class).
+// =========================================================================
+
+import { DocumentValidationError } from "./document/index.js";
+import { validateDocument, type DocumentSchema } from "./document/schema.js";
+import { NucleusNotSupportedError } from "./errors.js";
+import { CAPABILITY_PROBE_NAME, NucleusCapabilityError } from "./capabilities.js";
+import {
+  SQL_ID_ROW_KEY,
+  SQL_ID_SCHEMA_KEY,
+  SQL_ID_TABLE_KEY,
+  MAX_TRAVERSAL_DEPTH,
+} from "./graph/traverse.js";
+
+/**
+ * Param-aware transport: responses keyed by (sql, params[0]); counts every
+ * statement. The read-only capability probes (capabilities.ts) are answered
+ * like a Nucleus 1.0.2 engine answers them and recorded in `probeCalls`, NOT
+ * in `calls` — so `statementCount` counts the operation's own statements;
+ * probe behaviour has its own tests below. `probeMode` switches the probe
+ * answers to a missing surface (server error 42883) or a wrong value.
+ */
+class X02Transport implements Transport {
+  readonly calls: Array<{ sql: string; params: unknown[] }> = [];
+  readonly probeCalls: Array<{ sql: string; params: unknown[] }> = [];
+  probeMode: "supported" | "missing" | "wrong" | "network" = "supported";
+  private fetchvalHandlers: Array<(sql: string, params: unknown[]) => unknown> = [];
+  private queryHandler: ((sql: string, params: unknown[]) => unknown[]) | null = null;
+
+  onFetchval(handler: (sql: string, params: unknown[]) => unknown): void {
+    this.fetchvalHandlers.push(handler);
+  }
+
+  onQuery(handler: (sql: string, params: unknown[]) => unknown[]): void {
+    this.queryHandler = handler;
+  }
+
+  get statementCount(): number {
+    return this.calls.length;
+  }
+
+  async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<QueryResult<T>> {
+    this.calls.push({ sql, params });
+    const rows = this.queryHandler ? (this.queryHandler(sql, params) as T[]) : [];
+    return { rows, rowCount: rows.length };
+  }
+
+  async execute(sql: string, params: unknown[] = []): Promise<number> {
+    this.calls.push({ sql, params });
+    return 1;
+  }
+
+  private isProbe(sql: string, params: unknown[]): boolean {
+    if (params.some((p) => String(p).includes(CAPABILITY_PROBE_NAME))) return true;
+    if (sql === "SELECT GRAPH_NODE($1)" && params[0] === "0") return true;
+    if (sql === "SELECT GRAPH_NEIGHBORS($1, $2)" && params[0] === 0) return true;
+    return false;
+  }
+
+  private probeAnswer(sql: string): unknown {
+    if (this.probeMode === "network") throw new Error("socket hang up");
+    if (this.probeMode === "missing") {
+      throw Object.assign(new Error(`unknown function: ${sql.slice(7, sql.indexOf("("))}`), { code: "42883" });
+    }
+    const wrong = this.probeMode === "wrong";
+    if (sql.startsWith("SELECT DOC_COUNT")) return wrong ? 3 : 0;
+    if (sql.startsWith("SELECT GRAPH_NEIGHBORS")) return wrong ? nb([[1, 1, "X"]]) : "[]";
+    if (sql.startsWith("SELECT GRAPH_QUERY")) return wrong ? "not json" : '{"columns":["n","n.sqlref_schema"],"rows":[]}';
+    return null;
+  }
+
+  async fetchval<T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> {
+    if (this.isProbe(sql, params)) {
+      this.probeCalls.push({ sql, params });
+      return this.probeAnswer(sql) as T | null;
+    }
+    this.calls.push({ sql, params });
+    for (const h of this.fetchvalHandlers) {
+      const r = h(sql, params);
+      if (r !== undefined) return r as T;
+    }
+    return null;
+  }
+
+  async beginTransaction(_isolation?: IsolationLevel): Promise<TransactionTransport> {
+    throw new Error("not needed");
+  }
+  async close(): Promise<void> {}
+  async ping(): Promise<void> {}
+}
+
+const NEIGHBOR_SQL = "SELECT GRAPH_NEIGHBORS($1, $2)";
+const nb = (entries: Array<[number, number, string]>) =>
+  JSON.stringify(entries.map(([neighbor_id, edge_id, edge_type]) => ({ neighbor_id, edge_id, edge_type })));
+
+describe("X02 graph defect fixes", () => {
+  let transport: X02Transport;
+  let graph: ReturnType<typeof withGraph.init>["graph"];
+
+  beforeEach(() => {
+    transport = new X02Transport();
+    graph = withGraph.init(transport, nucleusFeatures()).graph;
+  });
+
+  it("D3: addNode with multiple labels fails closed with zero statements (was: silent 'A:B' munge)", async () => {
+    await assert.rejects(
+      () => graph.addNode(["Person", "Admin"]),
+      /exactly one label[\s\S]*got 2/,
+    );
+    assert.equal(transport.statementCount, 0);
+  });
+
+  it("D3: addNode sends ONE unwrapped label", async () => {
+    transport.onFetchval((sql) => (sql.startsWith("SELECT GRAPH_ADD_NODE") ? 7 : undefined));
+    const id = await graph.addNode(["Person"]);
+    assert.equal(id, 7);
+    assert.deepEqual(transport.calls[0].params, ["Person"]);
+  });
+
+  it("D2: addEdge refused for a missing endpoint names it (was: fake id 0)", async () => {
+    transport.onFetchval((sql, params) => {
+      if (sql.startsWith("SELECT GRAPH_ADD_EDGE")) return null; // engine refuses
+      if (sql.startsWith("SELECT GRAPH_NODE")) {
+        return Number(params[0]) === 1 ? '{"id":1}' : null; // node 1 exists, 99 missing
+      }
+      return undefined;
+    });
+    await assert.rejects(
+      () => graph.addEdge(1, 99, "KNOWS"),
+      (err: unknown) =>
+        err instanceof NucleusNotFoundError && /to node 99 does not exist/.test(err.message),
+    );
+  });
+
+  it("D4: query with params fails closed with zero statements (was: params silently dropped)", async () => {
+    await assert.rejects(
+      () => graph.query("MATCH (n) WHERE n.i = $target RETURN n", { target: 1 }),
+      (err: unknown) => err instanceof NucleusNotSupportedError && /no parameter substitution/.test(err.message),
+    );
+    assert.equal(transport.statementCount, 0);
+  });
+
+  it("D1: shortestPath with maxDepth never asks the unbounded engine scalar", async () => {
+    // Chain 1->2->3->4 via neighbors; the old code sent GRAPH_SHORTEST_PATH($1,$2,$3)
+    // and the engine ignored the bound (live-reproduced).
+    transport.onFetchval((sql, params) => {
+      if (sql.startsWith("SELECT GRAPH_NEIGHBORS")) {
+        const node = Number(params[0]);
+        return node < 4 ? nb([[node + 1, node, "NEXT"]]) : nb([]);
+      }
+      return undefined;
+    });
+    const withinBound = await graph.shortestPath(1, 3, 2);
+    assert.deepEqual(withinBound, [1, 2, 3]);
+    const beyondBound = await graph.shortestPath(1, 4, 2);
+    assert.deepEqual(beyondBound, []);
+    assert.ok(transport.calls.every((c) => !c.sql.includes("GRAPH_SHORTEST_PATH")));
+  });
+
+  it("D1: shortestPath without maxDepth still delegates to the engine scalar", async () => {
+    transport.onFetchval((sql) => (sql.startsWith("SELECT GRAPH_SHORTEST_PATH") ? "[1,2,3]" : undefined));
+    const path = await graph.shortestPath(1, 3);
+    assert.deepEqual(path, [1, 2, 3]);
+    assert.ok(transport.calls[0].sql.startsWith("SELECT GRAPH_SHORTEST_PATH($1, $2)"));
+  });
+});
+
+
+describe("X02 bounded traversal", () => {
+  let transport: X02Transport;
+  let graph: ReturnType<typeof withGraph.init>["graph"];
+
+  beforeEach(() => {
+    transport = new X02Transport();
+    graph = withGraph.init(transport, nucleusFeatures()).graph;
+  });
+
+  function chainAndFan(): void {
+    // 1 -> 2 -> {3, 4}; 3 -> 5; 5 -> 1 (cycle back); 4 -> 4 (self loop)
+    transport.onFetchval((sql, params) => {
+      if (sql.startsWith("SELECT GRAPH_NODE")) {
+        return Number(params[0]) <= 5 ? '{"id":1}' : null;
+      }
+      if (sql.startsWith(NEIGHBOR_SQL)) {
+        const node = Number(params[0]);
+        const map: Record<number, string> = {
+          1: nb([[2, 10, "NEXT"]]),
+          2: nb([[3, 11, "NEXT"], [4, 12, "SKIP"]]),
+          3: nb([[5, 13, "NEXT"]]),
+          4: nb([[4, 14, "LOOP"]]),
+          5: nb([[1, 15, "NEXT"]]),
+        };
+        return map[node] ?? nb([]);
+      }
+      return undefined;
+    });
+  }
+
+  it("maxDepth is required and bounded — invalid bounds throw before any statement", async () => {
+    for (const bad of [undefined, 0, -1, 1.5, MAX_TRAVERSAL_DEPTH + 1] as unknown[]) {
+      await assert.rejects(() => graph.traverse(1, { maxDepth: bad as number }), /maxDepth/);
+    }
+    assert.equal(transport.statementCount, 0);
+  });
+
+  it("BFS respects depth, reports via-edge metadata and orders by (depth, id)", async () => {
+    chainAndFan();
+    const result = await graph.traverse(1, { maxDepth: 2 });
+    assert.equal(result.startPresent, true);
+    assert.equal(result.truncated, false);
+    assert.deepEqual(
+      result.nodes.map((n) => [n.id, n.depth, n.viaEdgeType]),
+      [
+        [2, 1, "NEXT"],
+        [3, 2, "NEXT"],
+        [4, 2, "SKIP"],
+      ],
+    );
+  });
+
+  it("cycles are safe: the back-edge 5->1 and the self-loop 4->4 never re-expand a node", async () => {
+    chainAndFan();
+    const result = await graph.traverse(1, { maxDepth: 32 });
+    // Every node expanded at most once -> statements = 1 (GRAPH_NODE) + 5 expansions.
+    assert.equal(result.statements, 6);
+    const ids = result.nodes.map((n) => n.id).sort((a, b) => a - b);
+    assert.deepEqual(ids, [2, 3, 4, 5]);
+  });
+
+  it("edgeTypes filter restricts traversal client-side", async () => {
+    chainAndFan();
+    const result = await graph.traverse(1, { maxDepth: 2, edgeTypes: ["NEXT"] });
+    assert.deepEqual(
+      result.nodes.map((n) => n.id),
+      [2, 3],
+    );
+  });
+
+  it("the visit budget truncates honestly", async () => {
+    chainAndFan();
+    const result = await graph.traverse(1, { maxDepth: 2, maxNodes: 2 });
+    assert.equal(result.truncated, true);
+    assert.equal(result.nodes.length, 2);
+  });
+
+  it("a missing start node reports startPresent=false and traverses nothing", async () => {
+    chainAndFan();
+    const result = await graph.traverse(999, { maxDepth: 3 });
+    assert.equal(result.startPresent, false);
+    assert.deepEqual(result.nodes, []);
+    assert.equal(result.statements, 1);
+  });
+
+  it("direction is passed through to every hop", async () => {
+    const seenDirections: unknown[] = [];
+    transport.onFetchval((sql, params) => {
+      if (sql.startsWith(NEIGHBOR_SQL)) {
+        seenDirections.push(params[1]);
+        return nb([]);
+      }
+      if (sql.startsWith("SELECT GRAPH_NODE")) return '{"id":1}';
+      return undefined;
+    });
+    await graph.traverse(1, { maxDepth: 1, direction: "in" });
+    assert.deepEqual(seenDirections, ["in"]);
+  });
+});
+
+describe("X02 sqlNodes — SQL identity tying", () => {
+  let transport: X02Transport;
+  let graph: ReturnType<typeof withGraph.init>["graph"];
+
+  beforeEach(() => {
+    transport = new X02Transport();
+    graph = withGraph.init(transport, nucleusFeatures()).graph;
+  });
+
+  it("binding emits zero statements and validates the reference", () => {
+    const bound = graph.sqlNodes({ table: "users" });
+    assert.equal(transport.statementCount, 0);
+    assert.deepEqual(bound.boundTo, { table: "users" });
+    assert.equal(bound.idColumn, "id");
+    assert.throws(() => graph.sqlNodes({ table: 'bad "table"' }), /Invalid SQL table reference/);
+    assert.throws(() => graph.sqlNodes({ table: "users" }, { idColumn: "x; drop" }), /plain identifier/);
+  });
+
+  it("addRowNode stamps the row identity into node properties", async () => {
+    transport.onFetchval((sql) => (sql.startsWith("SELECT GRAPH_ADD_NODE") ? 42 : undefined));
+    const bound = graph.sqlNodes({ schema: "app", table: "users" });
+    const id = await bound.addRowNode(5, "User", { name: "Ada" });
+    assert.equal(id, 42);
+    // One lookup (no node yet for row 5), then the insert.
+    assert.deepEqual(transport.calls.map((c) => c.sql), ["SELECT GRAPH_QUERY($1)", "SELECT GRAPH_ADD_NODE($1, $2)"]);
+    const props = JSON.parse(transport.calls[1].params[1] as string);
+    assert.equal(props.name, "Ada");
+    assert.equal(props[SQL_ID_SCHEMA_KEY], "app");
+    assert.equal(props[SQL_ID_TABLE_KEY], "users");
+    assert.equal(props[SQL_ID_ROW_KEY], 5);
+  });
+
+  it("findNodeByRow queries by stamped properties and returns the node id", async () => {
+    transport.onFetchval((sql) => {
+      if (sql.startsWith("SELECT GRAPH_QUERY")) return '{"columns":["n"],"rows":[[7]]}';
+      return undefined;
+    });
+    const bound = graph.sqlNodes({ table: "users" });
+    assert.equal(await bound.findNodeByRow(5), 7);
+    const cypher = transport.calls[0].params[0] as string;
+    assert.match(cypher, /n\.sqlref_table = 'users'/);
+    assert.match(cypher, /n\.sqlref_row = 5\b/);
+    assert.doesNotMatch(cypher, /"--"/); // identifier-validated: no quote break-out possible
+  });
+
+  it("hydrate reports rows, deleted rows and unstamped nodes honestly", async () => {
+    transport.onFetchval((sql, params) => {
+      if (sql.startsWith("SELECT GRAPH_NODE")) {
+        const node = Number(params[0]);
+        if (node === 1)
+          return JSON.stringify({ id: 1, labels: ["User"], properties: { [SQL_ID_TABLE_KEY]: "users", [SQL_ID_ROW_KEY]: 10 } });
+        if (node === 2)
+          return JSON.stringify({ id: 2, labels: ["User"], properties: { [SQL_ID_TABLE_KEY]: "users", [SQL_ID_ROW_KEY]: 11 } });
+        if (node === 3) return JSON.stringify({ id: 3, labels: ["Tag"], properties: {} });
+        return null;
+      }
+      return undefined;
+    });
+    transport.onQuery((sql, params) => {
+      assert.match(sql, /^SELECT \* FROM "users" WHERE "id" IN \(\$1(, \$2)*\)$/);
+      // Row 10 exists; row 11 was deleted.
+      return params.map((p) => (p === 10 ? { id: 10, name: "Ada" } : null)).filter((r) => r !== null) as unknown[];
+    });
+    const bound = graph.sqlNodes({ table: "users" });
+    const hydrated = await bound.hydrate([1, 2, 3, 4]);
+    assert.equal(hydrated[0].row && (hydrated[0].row as Record<string, unknown>).name, "Ada");
+    assert.deepEqual(hydrated[0].sqlRef, { schema: undefined, table: "users", id: 10, idColumn: "id" });
+    assert.equal(hydrated[1].row, null, "deleted SQL row reads as null, not stale data");
+    assert.equal(hydrated[1].sqlRef?.id, 11);
+    assert.deepEqual(hydrated[2], { nodeId: 3, sqlRef: null, row: null }, "unstamped node has no SQL identity");
+    assert.deepEqual(hydrated[3], { nodeId: 4, sqlRef: null, row: null }, "missing graph node hydrates to nothing");
+  });
+
+  it("addRowEdge names the rows that have no node", async () => {
+    const bound = graph.sqlNodes({ table: "users" });
+    transport.onFetchval((sql, params) => {
+      if (sql.startsWith("SELECT GRAPH_QUERY")) {
+        return String(params[0]).includes("77") ? '{"columns":["n"],"rows":[]}' : '{"columns":["n"],"rows":[[3]]}';
+      }
+      if (sql.startsWith("SELECT GRAPH_ADD_EDGE")) return 50;
+      return undefined;
+    });
+    await assert.rejects(
+      () => bound.addRowEdge(9, 77, "FOLLOWS"),
+      (err: unknown) => err instanceof NucleusNotFoundError && /row 77 of "users" has no node/.test(String(err.message)),
+    );
+    const edgeId = await bound.addRowEdge(9, 10, "FOLLOWS");
+    assert.equal(edgeId, 50);
+  });
+});
+
+describe("X02 document collections — schema-aware validation", () => {
+  let transport: X02Transport;
+  let doc: ReturnType<typeof withDocument.init>["document"];
+
+  const userSchema: DocumentSchema = {
+    fields: {
+      id: { type: "integer" },
+      login: { type: "string" },
+      email: { type: "string", optional: true, nullable: true },
+      tags: { type: "array", optional: true, items: { type: "string" } },
+      profile: { type: "object", optional: true, fields: { bio: { type: "string", optional: true } }, additionalProperties: false },
+    },
+  };
+
+  beforeEach(() => {
+    transport = new X02Transport();
+    doc = withDocument.init(transport, nucleusFeatures()).document;
+  });
+
+  it("collection() validates the name and records identity metadata with zero statements", () => {
+    const c = doc.collection("tenants_a", { schema: userSchema, boundTo: { table: "users" } });
+    assert.equal(transport.statementCount, 0);
+    assert.equal(c.name, "tenants_a");
+    assert.deepEqual(c.boundTo, { table: "users" });
+    assert.throws(() => doc.collection("bad name!"), /Invalid document collection name/);
+    assert.throws(() => doc.collection(""), /non-empty name/);
+  });
+
+  it("an invalid document is rejected BEFORE any statement (counter 0) with precise paths", async () => {
+    const c = doc.collection("tenants_a", { schema: userSchema });
+    await assert.rejects(
+      () => c.insert({ id: "not-an-int", login: 5, tags: ["ok", 7], profile: { bio: "x", extra: 1 } }),
+      (err: unknown) => {
+        assert.ok(err instanceof DocumentValidationError);
+        const paths = err.issues.map((i) => i.path);
+        assert.deepEqual(paths, ["$.id", "$.login", "$.tags[1]", "$.profile.extra"]);
+        assert.match(err.issues[0].expected, /integer/);
+        assert.equal(err.issues[0].got, '"not-an-int"');
+        return true;
+      },
+    );
+    assert.equal(transport.statementCount, 0);
+  });
+
+  it("a valid document inserts through the scoped DOC_INSERT form", async () => {
+    transport.onFetchval((sql) => (sql.startsWith("SELECT DOC_INSERT") ? 12 : undefined));
+    const c = doc.collection("tenants_a", { schema: userSchema });
+    const id = await c.insert({ id: 12, login: "ada", tags: ["x"], profile: { bio: "hi" } });
+    assert.equal(id, 12);
+    assert.equal(transport.calls[0].sql, "SELECT DOC_INSERT($1, $2)");
+    assert.equal(transport.calls[0].params[0], "tenants_a");
+  });
+
+  it("integer fields reject beyond-safe integers (the engine coerces numbers to f64)", async () => {
+    const c = doc.collection("tenants_a", { schema: userSchema });
+    await assert.rejects(
+      () => c.insert({ id: 2 ** 53 + 1, login: "ada" }),
+      (err: unknown) =>
+        err instanceof DocumentValidationError && /would round it/.test(err.issues[0].expected),
+    );
+    assert.equal(transport.statementCount, 0);
+    // The boundary itself is fine (MAX_SAFE_INTEGER = 2^53 - 1).
+    transport.onFetchval(() => 1);
+    await c.insert({ id: 2 ** 53 - 1, login: "ada" });
+  });
+
+  it("update validates the MERGED document and never sends DOC_UPDATE on violation", async () => {
+    transport.onFetchval((sql) => {
+      if (sql.startsWith("SELECT DOC_GET")) return JSON.stringify({ id: 1, login: "ada" });
+      if (sql.startsWith("SELECT DOC_UPDATE")) return true;
+      return undefined;
+    });
+    const c = doc.collection("tenants_a", { schema: userSchema });
+    await assert.rejects(
+      () => c.update(1, { id: "oops" }),
+      (err: unknown) => err instanceof DocumentValidationError && err.issues[0].path === "$.id",
+    );
+    assert.ok(transport.calls.every((call) => !call.sql.includes("DOC_UPDATE")));
+    assert.equal(await c.update(1, { login: "grace" }), true);
+    const updateCall = transport.calls.find((call) => call.sql.includes("DOC_UPDATE"));
+    assert.ok(updateCall);
+    assert.equal(updateCall.sql, "SELECT DOC_UPDATE($1, $2, $3)");
+    const merged = JSON.parse(updateCall.params[2] as string);
+    assert.equal(merged.login, "grace");
+  });
+
+  it("missing/deleted records are specified: get null, update false, delete false, path null", async () => {
+    transport.onFetchval((sql) => {
+      if (sql.startsWith("SELECT DOC_GET")) return null;
+      if (sql.startsWith("SELECT DOC_UPDATE")) return false;
+      if (sql.startsWith("SELECT DOC_DELETE")) return false;
+      if (sql.startsWith("SELECT DOC_PATH_IN")) return null;
+      return undefined;
+    });
+    const c = doc.collection("tenants_a");
+    assert.equal(await c.get(99), null);
+    assert.equal(await c.update(99, { a: 1 }), false);
+    assert.equal(await c.delete(99), false);
+    assert.equal(await c.path(99, "a", "b"), null);
+  });
+
+  it("D5: a null DOC_INSERT answer throws instead of returning a fake id 0", async () => {
+    const c = doc.collection("tenants_a");
+    await assert.rejects(() => c.insert({ a: 1 }), /DOC_INSERT returned no id/);
+    await assert.rejects(() => doc.insert("", { a: 1 }), /DOC_INSERT returned no id/);
+  });
+
+  it("fail-closed on plain PostgreSQL with zero statements (new surfaces)", async () => {
+    const pgDoc = withDocument.init(transport, pgFeatures()).document;
+    const pgGraph = withGraph.init(transport, pgFeatures()).graph;
+    await assert.rejects(() => pgDoc.collection("x").insert({ a: 1 }), NucleusFeatureError);
+    await assert.rejects(() => pgGraph.traverse(1, { maxDepth: 1 }), NucleusFeatureError);
+    assert.throws(() => pgGraph.sqlNodes({ table: "t" }), NucleusFeatureError);
+    assert.equal(transport.statementCount, 0);
+  });
+});
+
+describe("X02 document schema validator — hand oracles", () => {
+  const schema: DocumentSchema = {
+    fields: {
+      a: { type: "string" },
+      b: { type: "integer", optional: true },
+      c: { type: "number", optional: true, nullable: true },
+      d: { type: "boolean" },
+    },
+    additionalProperties: true,
+  };
+
+  it("accepts the valid shapes and rejects the invalid ones at the exact path", () => {
+    assert.deepEqual(validateDocument(schema, { a: "x", d: true }), []);
+    assert.deepEqual(validateDocument(schema, { a: "x", d: true, b: 3, c: null }), []);
+    assert.deepEqual(validateDocument(schema, { a: "x", d: true, z: "open by default" }), []);
+
+    const wrongType = validateDocument(schema, { a: 1, d: true });
+    assert.equal(wrongType.length, 1);
+    assert.equal(wrongType[0].path, "$.a");
+    assert.equal(wrongType[0].got, "1");
+
+    const missing = validateDocument(schema, {});
+    assert.equal(missing[0].path, "$.a");
+    assert.equal(missing[0].got, "absent");
+
+    const nonNullableNull = validateDocument(schema, { a: "x", d: true, c: null, b: null });
+    assert.deepEqual(nonNullableNull.map((i) => i.path), ["$.b"]);
+    const requiredAbsent = validateDocument(schema, { a: "x" });
+    assert.deepEqual(requiredAbsent.map((i) => i.path), ["$.d"]);
+
+    const nonInteger = validateDocument(schema, { a: "x", d: true, b: 1.5 });
+    assert.equal(nonInteger[0].path, "$.b");
+    assert.equal(nonInteger[0].got, "1.5");
+  });
+
+  it("additionalProperties:false rejects undeclared keys at every declared level", () => {
+    const closed: DocumentSchema = {
+      fields: { o: { type: "object", fields: { x: { type: "string" } }, additionalProperties: false } },
+      additionalProperties: false,
+    };
+    assert.deepEqual(validateDocument(closed, { o: { x: "y" } }), []);
+    const issues = validateDocument(closed, { o: { x: "y", rogue: 1 }, stray: true });
+    assert.deepEqual(issues.map((i) => i.path), ["$.o.rogue", "$.stray"]);
+  });
+
+  it("a non-object document is rejected at the root", () => {
+    for (const bad of [null, 5, "x", [1]]) {
+      const issues = validateDocument({ fields: {} }, bad);
+      assert.equal(issues.length, 1);
+      assert.equal(issues[0].path, "$");
+    }
+  });
+});
+
+describe("X02 capability gate — probe-resolved, fail-closed", () => {
+  let transport: X02Transport;
+
+  beforeEach(() => {
+    transport = new X02Transport();
+  });
+
+  it("probes run once per client, before the first gated statement, and are read-only", async () => {
+    transport.onFetchval((sql) => (sql.startsWith("SELECT DOC_INSERT") ? 1 : undefined));
+    const doc = withDocument.init(transport, nucleusFeatures()).document;
+    const c = doc.collection("tenants_a");
+    await c.insert({ a: 1 });
+    await c.insert({ a: 2 });
+    assert.deepEqual(
+      transport.probeCalls.map((p) => p.sql),
+      ["SELECT DOC_COUNT($1)", "SELECT DOC_GET($1, $2)", "SELECT DOC_PATH_IN($1, $2, $3)"],
+    );
+    assert.ok(transport.probeCalls.every((p) => /^SELECT (DOC_COUNT|DOC_GET|DOC_PATH_IN)\(/.test(p.sql)));
+  });
+
+  it("a missing engine surface fails closed with NucleusCapabilityError and zero operation statements", async () => {
+    transport.probeMode = "missing";
+    const doc = withDocument.init(transport, nucleusFeatures()).document;
+    const graph = withGraph.init(transport, nucleusFeatures()).graph;
+    const isCap = (cap: string) => (err: unknown) =>
+      err instanceof NucleusCapabilityError &&
+      err instanceof NucleusNotSupportedError &&
+      err.capability === cap &&
+      err.status === "unsupported" &&
+      /42883|unknown function/.test(err.evidence);
+    await assert.rejects(() => doc.collection("a").insert({ a: 1 }), isCap("document-collections"));
+    await assert.rejects(() => doc.collection("a").get(1), isCap("document-collections"));
+    await assert.rejects(() => graph.traverse(1, { maxDepth: 2 }), isCap("graph-adjacency"));
+    await assert.rejects(() => graph.shortestPath(1, 2, 3), isCap("graph-adjacency"));
+    await assert.rejects(() => graph.sqlNodes({ table: "users" }).findNodeByRow(1), isCap("graph-property-match"));
+    await assert.rejects(() => graph.sqlNodes({ table: "users" }).hydrate([1]), isCap("graph-adjacency"));
+    assert.equal(transport.statementCount, 0);
+  });
+
+  it("a wrong probe answer resolves unsupported (value-asserting, not acceptance)", async () => {
+    transport.probeMode = "wrong";
+    const doc = withDocument.init(transport, nucleusFeatures()).document;
+    const graph = withGraph.init(transport, nucleusFeatures()).graph;
+    await assert.rejects(
+      () => doc.collection("a").count(),
+      (err: unknown) => err instanceof NucleusCapabilityError && /answered wrong: expected 0 documents/.test(err.evidence),
+    );
+    await assert.rejects(
+      () => graph.traverse(1, { maxDepth: 1 }),
+      (err: unknown) => err instanceof NucleusCapabilityError && /expected no neighbors/.test(err.evidence),
+    );
+    assert.equal(transport.statementCount, 0);
+  });
+
+  it("a transport failure during a probe is rethrown and not cached", async () => {
+    transport.probeMode = "network";
+    transport.onFetchval((sql) => (sql.startsWith("SELECT DOC_COUNT") ? 4 : undefined));
+    const doc = withDocument.init(transport, nucleusFeatures()).document;
+    const c = doc.collection("a");
+    await assert.rejects(() => c.count(), /socket hang up/);
+    transport.probeMode = "supported";
+    assert.equal(await c.count(), 4);
+  });
+
+  it("capabilities() reports probed support and the measured-absent set without probing the absent ones", async () => {
+    const graph = withGraph.init(transport, nucleusFeatures()).graph;
+    const report = await graph.capabilities();
+    const byCap = Object.fromEntries(report.map((r) => [r.capability, r.status]));
+    assert.deepEqual(byCap, {
+      "graph-adjacency": "supported",
+      "graph-property-match": "supported",
+      "graph-tenant-isolation": "unsupported",
+      "graph-query-parameters": "unsupported",
+      "graph-multi-label": "unsupported",
+      "specialty-session-isolation": "unsupported",
+      "atomic-sql-specialty-writes": "unsupported",
+    });
+    assert.equal(transport.probeCalls.length, 3); // adjacency (2) + property match (1)
+    const doc = withDocument.init(transport, nucleusFeatures()).document;
+    const docReport = await doc.capabilities();
+    assert.deepEqual(docReport.map((r) => [r.capability, r.status]), [
+      ["document-collections", "supported"],
+      ["specialty-session-isolation", "unsupported"],
+      ["atomic-sql-specialty-writes", "unsupported"],
+    ]);
+  });
+
+  it("multi-label and query parameters fail as named capabilities", async () => {
+    const graph = withGraph.init(transport, nucleusFeatures()).graph;
+    await assert.rejects(
+      () => graph.addNode(["A", "B"]),
+      (err: unknown) => err instanceof NucleusCapabilityError && err.capability === "graph-multi-label",
+    );
+    await assert.rejects(
+      () => graph.query("MATCH (n) RETURN n", { x: 1 }),
+      (err: unknown) => err instanceof NucleusCapabilityError && err.capability === "graph-query-parameters",
+    );
+    assert.equal(transport.statementCount + transport.probeCalls.length, 0);
+  });
+});
+
+describe("X02 review fixes — identity, truncation, validator edges", () => {
+  let transport: X02Transport;
+  let graph: ReturnType<typeof withGraph.init>["graph"];
+
+  beforeEach(() => {
+    transport = new X02Transport();
+    graph = withGraph.init(transport, nucleusFeatures()).graph;
+  });
+
+  it("hydrate never claims a node stamped for the same table name in another schema", async () => {
+    transport.onFetchval((sql, params) => {
+      if (sql.startsWith("SELECT GRAPH_NODE")) {
+        const node = Number(params[0]);
+        const schema = node === 1 ? "app" : node === 2 ? "other" : undefined;
+        const props: Record<string, unknown> = { [SQL_ID_TABLE_KEY]: "users", [SQL_ID_ROW_KEY]: 10 };
+        if (schema) props[SQL_ID_SCHEMA_KEY] = schema;
+        return JSON.stringify({ id: node, labels: ["User"], properties: props });
+      }
+      return undefined;
+    });
+    transport.onQuery(() => [{ id: 10, name: "Ada" }]);
+    const app = await graph.sqlNodes({ schema: "app", table: "users" }).hydrate([1, 2, 3]);
+    assert.equal(app[0].sqlRef?.schema, "app");
+    assert.equal((app[0].row as Record<string, unknown>).name, "Ada");
+    assert.deepEqual(app[1], { nodeId: 2, sqlRef: null, row: null });
+    assert.deepEqual(app[2], { nodeId: 3, sqlRef: null, row: null });
+    const unqualified = await graph.sqlNodes({ table: "users" }).hydrate([1, 3]);
+    assert.deepEqual(unqualified[0], { nodeId: 1, sqlRef: null, row: null });
+    assert.equal(unqualified[1].sqlRef?.id, 10);
+  });
+
+  it("findNodeByRow filters the schema stamp and reports duplicate stamps as a conflict", async () => {
+    transport.onFetchval((sql) =>
+      sql.startsWith("SELECT GRAPH_QUERY") ? '{"columns":["n","n.sqlref_schema"],"rows":[[7,null],[8,"app"],[9,"app"]]}' : undefined,
+    );
+    assert.equal(await graph.sqlNodes({ table: "users" }).findNodeByRow(5), 7);
+    await assert.rejects(
+      () => graph.sqlNodes({ schema: "app", table: "users" }).findNodeByRow(5),
+      (err: unknown) => err instanceof NucleusConflictError && /stamped on 2 nodes \(8, 9\)/.test(err.message),
+    );
+    assert.match(transport.calls[0].params[0] as string, /RETURN n, n\.sqlref_schema$/);
+  });
+
+  it("addRowNode refuses a second node for the same row, before any write", async () => {
+    transport.onFetchval((sql) =>
+      sql.startsWith("SELECT GRAPH_QUERY") ? '{"columns":["n","n.sqlref_schema"],"rows":[[7,null]]}' : undefined,
+    );
+    await assert.rejects(
+      () => graph.sqlNodes({ table: "users" }).addRowNode(5, "User"),
+      (err: unknown) => err instanceof NucleusConflictError && /row 5 of "users" already has node 7/.test(err.message),
+    );
+    assert.ok(transport.calls.every((c) => !c.sql.includes("GRAPH_ADD_NODE")));
+  });
+
+  it("hydrate accepts int8 keys that arrive as digit strings", async () => {
+    transport.onFetchval((sql) =>
+      sql.startsWith("SELECT GRAPH_NODE")
+        ? JSON.stringify({ id: 1, labels: ["U"], properties: { [SQL_ID_TABLE_KEY]: "users", [SQL_ID_ROW_KEY]: 10 } })
+        : undefined,
+    );
+    transport.onQuery(() => [{ id: "10", name: "Ada" }]);
+    const [h] = await graph.sqlNodes({ table: "users" }).hydrate([1]);
+    assert.equal((h.row as Record<string, unknown>).name, "Ada");
+  });
+
+  it("a truncated traversal is still ordered by (depth, id)", async () => {
+    transport.onFetchval((sql, params) => {
+      if (sql.startsWith("SELECT GRAPH_NODE")) return '{"id":1}';
+      if (sql.startsWith(NEIGHBOR_SQL)) {
+        return Number(params[0]) === 1 ? nb([[9, 1, "E"], [3, 2, "E"], [5, 3, "E"]]) : nb([]);
+      }
+      return undefined;
+    });
+    const r = await graph.traverse(1, { maxDepth: 3, maxNodes: 2 });
+    assert.equal(r.truncated, true);
+    assert.deepEqual(r.nodes.map((n) => n.id), [3, 9]);
+  });
+
+  it("addNode turns a null engine answer into an error, not node 0", async () => {
+    await assert.rejects(() => graph.addNode(["A"]), /GRAPH_ADD_NODE returned no id/);
+  });
+
+  it("collection ids must be positive safe integers — rejected before any statement", async () => {
+    const doc = withDocument.init(transport, nucleusFeatures()).document;
+    const c = doc.collection("a");
+    for (const bad of [0, -1, 1.5, Number.NaN, 2 ** 53]) {
+      await assert.rejects(() => c.get(bad), /positive safe integer/);
+      await assert.rejects(() => c.delete(bad), /positive safe integer/);
+    }
+    assert.throws(() => doc.collection("a", { boundTo: { table: "bad name" } }), /Invalid SQL table reference/);
+    assert.equal(transport.statementCount + transport.probeCalls.length, 0);
+  });
+
+  it("validator: undefined is absence, and object fields must be plain JSON objects", () => {
+    const schema: DocumentSchema = {
+      fields: { a: { type: "string", optional: true }, o: { type: "object", optional: true } },
+      additionalProperties: false,
+    };
+    assert.deepEqual(validateDocument(schema, { a: undefined, stray: undefined }), []);
+    assert.deepEqual(validateDocument({ fields: { a: { type: "string" } } }, { a: undefined }).map((i) => i.got), ["absent"]);
+    const dated = validateDocument(schema, { o: new Date(0) });
+    assert.deepEqual(dated.map((i) => [i.path, i.got]), [["$.o", "Date instance"]]);
+    assert.equal(validateDocument(schema, new Map() as unknown)[0].path, "$");
+    assert.equal(validateDocument({ fields: { n: { type: "integer" } } }, { n: 5n })[0].got, "bigint 5n");
+  });
+});

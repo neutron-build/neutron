@@ -155,6 +155,15 @@ export function DocModule({ name }: DocModuleProps) {
   const total = useSignal(0)
   const limit = 50
 
+  // X02: collection scoping. The engine scopes every DOC_* statement to one
+  // collection (a document in another collection reads as absent); an empty
+  // value is the default collection. Collections are namespaces, not
+  // permissions: any session may name any collection. The /api/query endpoint does not bind
+  // parameters yet, so the UI constrains the name to characters that
+  // cannot break out of a single-quoted literal.
+  const collection = useSignal('')
+  const COLLECTION_RE = /^[a-zA-Z0-9_-]{0,64}$/
+
   // Track if the document has been modified (for tree-view inline edits)
   const treeModified = useSignal(false)
   const treeData = useSignal<unknown>(null)
@@ -175,17 +184,24 @@ export function DocModule({ name }: DocModuleProps) {
 
   const conn = activeConnection.value!
 
+  /** Scoped-collection SQL helpers (empty = the default collection). */
+  function collLit(): string {
+    return collection.value === '' ? '' : `'${collection.value}', `
+  }
+
   async function load() {
     loading.value = true
     try {
-      // Single global document store — no collection argument. DOC_QUERY with
-      // an empty filter returns a comma-separated list of all matching ids.
-      const idRes = await api.query(`SELECT DOC_QUERY('{}')`, conn.id)
+      // DOC_QUERY with an empty filter returns a comma-separated list of all
+      // matching ids, scoped to the selected collection.
+      const idRes = await api.query(`SELECT DOC_QUERY(${collLit()}'{}')`, conn.id)
       if (idRes.error) throw new Error(idRes.error)
       const cell = idRes.rows[0]?.[0]
+      // Ids come from the engine; only plain digit tokens are kept, so
+      // nothing but an integer is ever interpolated into the fetch below.
       const allIds = (cell == null || cell === '')
         ? []
-        : String(cell).split(',').filter(Boolean)
+        : String(cell).split(',').map(t => t.trim()).filter(t => /^[0-9]+$/.test(t))
       allIds.sort((a, b) => Number(a) - Number(b))
       total.value = allIds.length
 
@@ -195,7 +211,7 @@ export function DocModule({ name }: DocModuleProps) {
         return
       }
       // Fetch each document body with DOC_GET(id) in one multi-column select.
-      const cols = pageIds.map(id => `DOC_GET(${id})`).join(', ')
+      const cols = pageIds.map(id => `DOC_GET(${collLit()}${id})`).join(', ')
       const dataRes = await api.query(`SELECT ${cols}`, conn.id)
       if (dataRes.error) throw new Error(dataRes.error)
       const row = (dataRes.rows[0] ?? []) as unknown[]
@@ -212,7 +228,7 @@ export function DocModule({ name }: DocModuleProps) {
     }
   }
 
-  useEffect(() => { load() }, [name, page.value])
+  useEffect(() => { load() }, [name, page.value, collection.value])
 
   // Clean up confirm timer on unmount
   useEffect(() => {
@@ -256,7 +272,7 @@ export function DocModule({ name }: DocModuleProps) {
     try {
       const jsonStr = JSON.stringify(parsed).replace(/'/g, "''")
       await api.query(
-        `SELECT DOC_UPDATE(${d.id}, '${jsonStr}')`,
+        `SELECT DOC_UPDATE(${collLit()}${d.id}, '${jsonStr}')`,
         conn.id
       )
       toast('success', `Document ${d.id} saved`)
@@ -277,7 +293,7 @@ export function DocModule({ name }: DocModuleProps) {
     try {
       const jsonStr = JSON.stringify(treeData.value).replace(/'/g, "''")
       await api.query(
-        `SELECT DOC_UPDATE(${d.id}, '${jsonStr}')`,
+        `SELECT DOC_UPDATE(${collLit()}${d.id}, '${jsonStr}')`,
         conn.id
       )
       toast('success', `Document ${d.id} saved`)
@@ -303,7 +319,7 @@ export function DocModule({ name }: DocModuleProps) {
     try {
       const jsonStr = JSON.stringify(parsed).replace(/'/g, "''")
       await api.query(
-        `SELECT DOC_INSERT('${jsonStr}')`,
+        `SELECT DOC_INSERT(${collLit()}'${jsonStr}')`,
         conn.id
       )
       showNewDoc.value = false
@@ -335,7 +351,7 @@ export function DocModule({ name }: DocModuleProps) {
 
   async function doDelete(id: string) {
     try {
-      await api.query(`SELECT DOC_DELETE(${id})`, conn.id)
+      await api.query(`SELECT DOC_DELETE(${collLit()}${id})`, conn.id)
       if (selected.value?.id === id) selected.value = null
       toast('info', `Document ${id} deleted`)
       await load()
@@ -354,6 +370,20 @@ export function DocModule({ name }: DocModuleProps) {
         <div class={s.listHeader}>
           <span class={s.listTitle}>{name}</span>
           <span class={s.docCount}>{total.value} docs</span>
+          <input
+            class={s.collInput}
+            value={collection.value}
+            placeholder="collection"
+            title="Document collection (empty = default). Statements are scoped to it: a document in another collection reads as absent here."
+            onInput={e => {
+              const el = e.target as HTMLInputElement
+              if (COLLECTION_RE.test(el.value)) collection.value = el.value
+              else el.value = collection.value // rejected characters never stick
+            }}
+            onKeyDown={e => { if (e.key === 'Enter') { page.value = 0; load() } }}
+            onBlur={() => { page.value = 0; load() }}
+            spellcheck={false}
+          />
           <button class={s.newDocBtn} onClick={() => { showNewDoc.value = !showNewDoc.value }} title="New Document">+</button>
           <button class={s.refreshBtn} onClick={load} disabled={loading.value}>&#8634;</button>
           <button

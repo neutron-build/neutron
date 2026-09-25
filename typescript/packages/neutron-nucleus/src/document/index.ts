@@ -3,7 +3,59 @@
 // ---------------------------------------------------------------------------
 
 import type { Transport, NucleusPlugin, NucleusFeatures } from '../types.js';
-import { requireNucleus } from '../helpers.js';
+import { requireNucleus, assertIdentifier } from '../helpers.js';
+import { NucleusError } from '../errors.js';
+import { assertSqlTableRef, type SqlTableRef } from '../identity.js';
+import type { DocumentSchema, DocumentValidationIssue } from './schema.js';
+import { validateDocument } from './schema.js';
+import {
+  SpecialtyCapabilityGate,
+  SPECIALTY_CAPABILITIES,
+  type SpecialtyCapabilityEvidence,
+} from '../capabilities.js';
+
+export { validateDocument } from './schema.js';
+export type { DocumentSchema, DocumentField, DocumentFieldType, DocumentValidationIssue } from './schema.js';
+export type { SqlTableRef, SqlRowRef } from '../identity.js';
+export { NucleusCapabilityError } from '../capabilities.js';
+export type { SpecialtyCapability, SpecialtyCapabilityEvidence, SpecialtyCapabilityStatus } from '../capabilities.js';
+
+/**
+ * Thrown when a document fails schema validation. Carries every issue, not
+ * just the first, and is raised BEFORE any statement is sent — the engine's
+ * document store has no server-side schema (DOC_INSERT accepts any JSON),
+ * so this validation is client-side and says so.
+ */
+export class DocumentValidationError extends NucleusError {
+  readonly issues: readonly DocumentValidationIssue[];
+
+  constructor(collection: string, issues: readonly DocumentValidationIssue[]) {
+    super(
+      'DOCUMENT_VALIDATION',
+      `document for collection ${JSON.stringify(collection)} failed schema validation: ${issues
+        .map((i) => `${i.path} expected ${i.expected}, got ${i.got}`)
+        .join('; ')}`,
+      { meta: { collection, issues: issues.slice() } },
+    );
+    this.name = 'DocumentValidationError';
+    this.issues = issues;
+  }
+}
+
+/** Options that bind validation and identity metadata to a collection. */
+export interface DocumentCollectionOptions {
+  /**
+   * Client-side schema validated on every insert and update (fail-closed,
+   * zero statements on violation). The engine itself accepts any JSON.
+   */
+  schema?: DocumentSchema;
+  /**
+   * SQL table this collection's documents belong beside — IDENTITY METADATA
+   * ONLY: no DDL, no columns, no migration surface. Recorded on the
+   * collection for callers that hydrate SQL rows; it creates nothing.
+   */
+  boundTo?: SqlTableRef;
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -66,6 +118,75 @@ export interface DocumentModel {
 
   /** Delete documents matching a filter. Returns count of deleted docs. */
   delete(collection: string, filter: Record<string, unknown>): Promise<number>;
+
+  /**
+   * Define a named collection with schema validation and optional SQL
+   * identity metadata (X02). The returned surface is scoped to one
+   * collection: reads of another collection's document report it absent,
+   * and writes cannot land outside the collection (engine-enforced
+   * DOC_*(collection, …) forms). Collections are namespaces, not
+   * permissions: any session can name any collection, so tenant isolation
+   * holds only when the application, not the tenant, picks the name.
+   */
+  collection<T extends Record<string, unknown> = Record<string, unknown>>(
+    name: string,
+    opts?: DocumentCollectionOptions,
+  ): DocumentCollection<T>;
+
+  /**
+   * Capability evidence for the document surfaces (X02). `document-collections`
+   * is probe-resolved (read-only, once per client); the session-isolation and
+   * atomic SQL+document entries are measured absent and never advertised.
+   */
+  capabilities(): Promise<SpecialtyCapabilityEvidence[]>;
+}
+
+/**
+ * A schema-aware, collection-scoped document surface (X02).
+ *
+ * Missing/deleted-record behavior (specified, live-pinned):
+ * - `get` returns `null` for an absent id — deleted, never
+ *   existed, or belongs to another collection (holding an id is not read
+ *   access across the boundary).
+ * - `update`/`delete` return `false` for the same absent cases.
+ * - `path` returns `null` when the document or the path is absent.
+ *
+ * Ids must be positive safe integers; anything else throws before a
+ * statement is sent. Every operation first requires the probe-resolved
+ * `document-collections` capability (NucleusCapabilityError otherwise).
+ */
+export interface DocumentCollection<T = Record<string, unknown>> {
+  /** Collection name (engine-scoped key for every statement issued here). */
+  readonly name: string;
+  /** SQL table identity metadata, when bound. Reference only — creates nothing. */
+  readonly boundTo: SqlTableRef | undefined;
+
+  /**
+   * Validate (when a schema is bound) and insert a document. Invalid
+   * documents throw `DocumentValidationError` before any statement is sent.
+   * Returns the engine-generated id.
+   */
+  insert(doc: T): Promise<number>;
+  /** Fetch by id; `null` when absent (see interface docs). */
+  get(id: number): Promise<T | null>;
+  /**
+   * Merge a patch (shallow, top-level keys) into the stored document,
+   * validating the merged result. Returns `false` when the id is absent;
+   * throws `DocumentValidationError` when the merged document violates the
+   * schema (the stored document is left untouched). This is a read, a merge
+   * and a replace — two statements with no isolation between them, so a
+   * concurrent update to the same document between the read and the replace
+   * is overwritten.
+   */
+  update(id: number, patch: Partial<T>): Promise<boolean>;
+  /** Delete by id. Returns `false` when absent. */
+  delete(id: number): Promise<boolean>;
+  /** Containment query (`@>` semantics), collection-scoped. Returns ids. */
+  query(filter: Record<string, unknown>): Promise<number[]>;
+  /** Number of documents in this collection. */
+  count(): Promise<number>;
+  /** Nested-path read; `null` when the document or the path is absent. */
+  path(id: number, ...keys: string[]): Promise<unknown>;
 }
 
 // ---------------------------------------------------------------------------
@@ -73,10 +194,14 @@ export interface DocumentModel {
 // ---------------------------------------------------------------------------
 
 class DocumentModelImpl implements DocumentModel {
+  private readonly gate: SpecialtyCapabilityGate;
+
   constructor(
     private readonly transport: Transport,
     private readonly features: NucleusFeatures,
-  ) {}
+  ) {
+    this.gate = new SpecialtyCapabilityGate(transport, features);
+  }
 
   private require(): void {
     requireNucleus(this.features, 'Document');
@@ -90,7 +215,7 @@ class DocumentModelImpl implements DocumentModel {
    * text-encoded integer id for exactly this reason, so sending the digits is
    * the supported encoding, not a workaround.
    */
-  private static id(id: number): string {
+  static id(id: number): string {
     return String(id);
   }
 
@@ -102,7 +227,14 @@ class DocumentModelImpl implements DocumentModel {
     const [sql, args] = collection
       ? ['SELECT DOC_INSERT($1, $2)', [collection, data]]
       : ['SELECT DOC_INSERT($1)', [data]];
-    return (await this.transport.fetchval<number>(sql, args)) ?? 0;
+    // DOC_INSERT answers the new id; a null answer means the transport or
+    // engine broke the contract — reporting a fake id 0 would send callers
+    // after a document that does not exist (X02 defect D5).
+    const id = await this.transport.fetchval<number>(sql, args);
+    if (id === null || id === undefined) {
+      throw new NucleusError('DOC_INSERT_CONTRACT', `DOC_INSERT returned no id for collection ${JSON.stringify(collection)}`);
+    }
+    return id;
   }
 
   /** Fetch a document's JSON text, scoped to a collection. */
@@ -340,6 +472,148 @@ class DocumentModelImpl implements DocumentModel {
     }
 
     return count;
+  }
+
+  collection<T extends Record<string, unknown> = Record<string, unknown>>(
+    name: string,
+    opts: DocumentCollectionOptions = {},
+  ): DocumentCollection<T> {
+    if (name === '') {
+      throw new Error('document collection requires a non-empty name (use the base DocumentModel API for the default collection)');
+    }
+    assertIdentifier(name, 'document collection name');
+    if (opts.boundTo !== undefined) assertSqlTableRef(opts.boundTo);
+    return new DocumentCollectionImpl(this.transport, this.features, this.gate, name, opts) as unknown as DocumentCollection<T>;
+  }
+
+  async capabilities(): Promise<SpecialtyCapabilityEvidence[]> {
+    this.require();
+    const out: SpecialtyCapabilityEvidence[] = [];
+    for (const c of SPECIALTY_CAPABILITIES) {
+      if (c === 'document-collections' || c === 'specialty-session-isolation' || c === 'atomic-sql-specialty-writes') {
+        out.push(await this.gate.status(c));
+      }
+    }
+    return out;
+  }
+}
+
+class DocumentCollectionImpl implements DocumentCollection {
+  readonly boundTo: SqlTableRef | undefined;
+  private readonly schema: DocumentSchema | undefined;
+
+  constructor(
+    private readonly transport: Transport,
+    private readonly features: NucleusFeatures,
+    private readonly gate: SpecialtyCapabilityGate,
+    readonly name: string,
+    opts: DocumentCollectionOptions,
+  ) {
+    this.boundTo = opts.boundTo;
+    this.schema = opts.schema;
+  }
+
+  /** Plain-PostgreSQL gate first (no statement), then the probe-resolved capability. */
+  private async require(op: string): Promise<void> {
+    requireNucleus(this.features, 'Document');
+    await this.gate.require('document-collections', `document collection ${JSON.stringify(this.name)} ${op}`);
+  }
+
+  /** Fail-closed validation: throws before any statement can be sent. */
+  private validate(doc: unknown): void {
+    if (this.schema) {
+      const issues = validateDocument(this.schema, doc);
+      if (issues.length > 0) {
+        throw new DocumentValidationError(this.name, issues);
+      }
+    }
+  }
+
+  async insert(doc: Record<string, unknown>): Promise<number> {
+    requireNucleus(this.features, 'Document');
+    this.validate(doc);
+    await this.require('insert');
+    const id = await this.transport.fetchval<number>('SELECT DOC_INSERT($1, $2)', [this.name, JSON.stringify(doc)]);
+    if (id === null || id === undefined) {
+      throw new NucleusError('DOC_INSERT_CONTRACT', `DOC_INSERT returned no id for collection ${JSON.stringify(this.name)}`);
+    }
+    return id;
+  }
+
+  async get(id: number): Promise<Record<string, unknown> | null> {
+    assertDocId(id);
+    await this.require('get');
+    const raw = await this.transport.fetchval<string>('SELECT DOC_GET($1, $2)', [this.name, DocumentModelImpl.id(id)]);
+    if (raw === null) return null;
+    return JSON.parse(raw) as Record<string, unknown>;
+  }
+
+  async update(id: number, patch: Partial<Record<string, unknown>>): Promise<boolean> {
+    assertDocId(id);
+    await this.require('update');
+    const current = await this.get(id);
+    if (current === null) return false;
+    const merged: Record<string, unknown> = { ...current, ...patch };
+    // Validate the MERGED document: a patch that would break the schema is
+    // rejected and the stored document stays untouched.
+    this.validate(merged);
+    return (
+      (await this.transport.fetchval<boolean>('SELECT DOC_UPDATE($1, $2, $3)', [
+        this.name,
+        DocumentModelImpl.id(id),
+        JSON.stringify(merged),
+      ])) === true
+    );
+  }
+
+  async delete(id: number): Promise<boolean> {
+    assertDocId(id);
+    await this.require('delete');
+    return (
+      (await this.transport.fetchval<boolean>('SELECT DOC_DELETE($1, $2)', [this.name, DocumentModelImpl.id(id)])) === true
+    );
+  }
+
+  async query(filter: Record<string, unknown>): Promise<number[]> {
+    await this.require('query');
+    const raw = await this.transport.fetchval<string>('SELECT DOC_QUERY($1, $2)', [this.name, JSON.stringify(filter)]);
+    if (!raw) return [];
+    return raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map(Number)
+      .filter((n) => !Number.isNaN(n));
+  }
+
+  async count(): Promise<number> {
+    await this.require('count');
+    return (await this.transport.fetchval<number>('SELECT DOC_COUNT($1)', [this.name])) ?? 0;
+  }
+
+  async path(id: number, ...keys: string[]): Promise<unknown> {
+    assertDocId(id);
+    if (keys.length === 0) {
+      throw new Error('document path requires at least one key');
+    }
+    await this.require('path');
+    const placeholders = keys.map((_, i) => `$${i + 3}`).join(', ');
+    const raw = await this.transport.fetchval<string>(
+      `SELECT DOC_PATH_IN($1, $2, ${placeholders})`,
+      [this.name, DocumentModelImpl.id(id), ...keys],
+    );
+    if (typeof raw !== 'string') return raw;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return raw;
+    }
+  }
+}
+
+function assertDocId(id: number): void {
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    throw new Error(`document id must be a positive safe integer, got ${JSON.stringify(id)}`);
   }
 }
 
