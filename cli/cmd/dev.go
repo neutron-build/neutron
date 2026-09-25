@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/neutron-build/neutron/cli/internal/delegate"
 	"github.com/neutron-build/neutron/cli/internal/detect"
@@ -14,7 +16,7 @@ import (
 )
 
 func init() {
-	devCmd.Flags().String("service", "", "application service to run with its dependencies")
+	devCmd.Flags().String("component", "", "application component to run with its dependencies")
 	rootCmd.AddCommand(devCmd)
 }
 
@@ -35,33 +37,29 @@ func runDev(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return applicationError(cmd, err)
 	}
-	selected, _ := cmd.Flags().GetString("service")
+	selected, _ := cmd.Flags().GetString("component")
 	if manifest != nil {
 		plan, err := manifest.Build(selected)
 		if err != nil {
 			return applicationError(cmd, err)
 		}
-		ctx, force, stop := interruptContext(cmd.Context())
+		ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		err = supervisor.Run(ctx, plan, supervisor.Options{Output: cmd.OutOrStdout(), Force: force})
+		err = supervisor.Run(ctx, plan, supervisor.Options{Output: cmd.OutOrStdout()})
 		if err != nil && err != context.Canceled {
 			return applicationError(cmd, err)
 		}
 		return err
 	}
 	if selected != "" {
-		return applicationError(cmd, fmt.Errorf("--service requires an [application] manifest"))
+		return applicationError(cmd, fmt.Errorf("--component requires an [application] manifest"))
 	}
 	lang := detect.DetectLanguage(cwd)
 	if lang == detect.Unknown {
 		return fmt.Errorf("could not detect project language — are you in a Neutron project directory?\nHint: run 'neutron init' to set up the project")
 	}
 
-	if lang == detect.Julia {
-		ui.Infof("Detected Julia project — running src/main.jl (the Julia SDK is a database client with no HTTP server)")
-	} else {
-		ui.Infof("Detected %s project — starting dev server...", lang.DisplayName())
-	}
+	ui.Infof("Detected %s project — starting dev server...", lang.DisplayName())
 
 	return delegate.RunDevServer(lang, cwd)
 }
