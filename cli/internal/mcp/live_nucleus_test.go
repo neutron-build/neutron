@@ -202,3 +202,59 @@ func TestMCPNucleusLive(t *testing.T) {
 	}
 	_ = oracle.Exec(ctx, "SELECT KV_DEL($1)", key)
 }
+
+// TestMCPNucleusWrappedMutatorGapIsDocumented pins a documented limitation
+// (review 2): Nucleus applies no READ ONLY and has no rollback or connection
+// reset covering the guard, so a view or routine that wraps a mutating
+// function is not caught by the name check and its write persists. The test
+// asserts the gap exists AND that the tool says so; if the engine or guard
+// ever closes it, this fails and the docs should be updated to match.
+func TestMCPNucleusWrappedMutatorGapIsDocumented(t *testing.T) {
+	nurl := os.Getenv("NEUTRON_E2E_NUCLEUS_URL")
+	if nurl == "" {
+		if os.Getenv("NEUTRON_LIVE_REQUIRED") == "1" {
+			t.Fatal("NEUTRON_LIVE_REQUIRED=1 but NEUTRON_E2E_NUCLEUS_URL is not set")
+		}
+		t.Skip("NEUTRON_E2E_NUCLEUS_URL not set")
+	}
+	ctx := context.Background()
+	oracle, err := db.Connect(ctx, nurl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer oracle.Close()
+	srv, err := NewServer(ctx, nurl, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	name := fmt.Sprintf("x06gap_%d", time.Now().UnixNano())
+	seq, view := name+"_seq", name+"_v"
+	for _, stmt := range []string{"CREATE SEQUENCE " + seq, fmt.Sprintf("CREATE VIEW %s AS SELECT NEXTVAL('%s') AS n", view, seq)} {
+		if err := oracle.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		_ = oracle.Exec(context.Background(), "DROP VIEW IF EXISTS "+view)
+		_ = oracle.Exec(context.Background(), "DROP SEQUENCE IF EXISTS "+seq)
+	})
+
+	if _, err := callTool(ctx, srv.env, "query_sql", map[string]any{"sql": "SELECT * FROM " + view}); err != nil {
+		t.Fatalf("gap closed? the wrapped mutator is now refused (%v): update the Nucleus limitation docs", err)
+	}
+	var next int64
+	if err := oracle.QueryRow(ctx, fmt.Sprintf("SELECT NEXTVAL('%s')", seq)).Scan(&next); err != nil {
+		t.Fatal(err)
+	}
+	if next < 2 {
+		t.Fatalf("gap closed? the wrapped NEXTVAL did not persist (next=%d): update the Nucleus limitation docs", next)
+	}
+
+	for _, s := range toolSpecs() {
+		if s.def.Name == "query_sql" && !strings.Contains(s.def.Description, "best-effort") {
+			t.Fatalf("query_sql description must state the Nucleus read-only default is best-effort: %q", s.def.Description)
+		}
+	}
+}

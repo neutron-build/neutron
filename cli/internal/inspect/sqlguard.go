@@ -30,7 +30,11 @@ import (
 // Nucleus does not apply READ ONLY (capability report
 // txn.read_only_rejects_writes: unsupported) and its specialty models are
 // written through ordinary SELECTs (SELECT KV_SET(...)). There the guard is
-// the only enforcement, so it is strict and fails closed: data-modifying
+// the only enforcement, so it is strict and fails closed — and best-effort:
+// a view or routine that wraps a mutating function is invisible to a name
+// check, Nucleus has no READ ONLY or rollback to catch it, and the write
+// persists (pinned by TestMCPNucleusWrappedMutatorGapIsDocumented). Its
+// roles do not reliably bound this either. Data-modifying
 // keywords anywhere, SELECT INTO, row locks, EXPLAIN ANALYZE and every
 // function the engine itself classifies as mutating are refused.
 

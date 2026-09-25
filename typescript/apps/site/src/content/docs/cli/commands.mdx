@@ -221,7 +221,10 @@ locks released), and functions whose effects escape a rollback are refused;
 on Nucleus, which does not apply `READ ONLY`, a lexical guard refuses writes,
 mutating model functions and write Cypher through `GRAPH_QUERY`. The guard
 checks names, so it cannot see through a user-defined function or view that
-wraps a refused function: connect the server as a low-privilege role. Values
+wraps a refused function: on PostgreSQL connect the server as a low-privilege
+role; on Nucleus the read-only default is best-effort (a view or routine
+wrapping a mutating function runs and its write persists), so expose it only
+to agents you would trust with writes. Values
 under secret-looking names are redacted, and results carry each touched
 model's actual transaction and durability limits. The HTTP transport answers
 only requests addressed to localhost, an IP address or the `--host` name.

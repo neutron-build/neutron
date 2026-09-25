@@ -173,11 +173,11 @@ func TestDumpSchemaInvalidFormat(t *testing.T) {
 
 func TestIntArg(t *testing.T) {
 	tests := []struct {
-		name    string
-		args    map[string]any
-		key     string
-		def     int
-		want    int
+		name string
+		args map[string]any
+		key  string
+		def  int
+		want int
 	}{
 		{"float64 value", map[string]any{"limit": float64(42)}, "limit", 10, 42},
 		{"int value", map[string]any{"limit": 42}, "limit", 10, 42},

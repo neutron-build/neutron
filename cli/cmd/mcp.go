@@ -40,8 +40,10 @@ READ ONLY transaction that is rolled back, on a connection that is closed
 afterwards (advisory locks released); on Nucleus, which does not apply
 READ ONLY, a lexical guard refuses writes, the engine's mutating functions
 and write Cypher. The guard checks names and cannot see through a
-user-defined function that wraps a refused one: connect as a low-privilege
-role. Values under secret-looking names are redacted (--no-redact to
+user-defined function or view that wraps a refused one: on PostgreSQL connect
+as a low-privilege role; on Nucleus the read-only default is best-effort (a
+wrapped write persists), so expose it only to agents you would trust with
+writes. Values under secret-looking names are redacted (--no-redact to
 disable). Results carry the engine identity and the touched models' actual
 transaction/durability limits (engine_limits reports all of them).
 --allow-writes adds one explicit write tool, execute_sql; over HTTP it also
