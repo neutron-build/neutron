@@ -36,14 +36,18 @@ var mcpCmd = &cobra.Command{
 all 14 Nucleus data models) as inspection and planning tools.
 
 Every tool is read-only by default: on PostgreSQL statements run inside a
-READ ONLY transaction that is rolled back; on Nucleus, which does not apply
-READ ONLY, a lexical guard refuses writes and the engine's mutating
-functions. Values under secret-looking names are redacted (--no-redact to
+READ ONLY transaction that is rolled back, on a connection that is closed
+afterwards (advisory locks released); on Nucleus, which does not apply
+READ ONLY, a lexical guard refuses writes, the engine's mutating functions
+and write Cypher. The guard checks names and cannot see through a
+user-defined function that wraps a refused one: connect as a low-privilege
+role. Values under secret-looking names are redacted (--no-redact to
 disable). Results carry the engine identity and the touched models' actual
 transaction/durability limits (engine_limits reports all of them).
 --allow-writes adds one explicit write tool, execute_sql; over HTTP it also
 requires NEUTRON_MCP_TOKEN. The HTTP transport binds 127.0.0.1 unless --host
-says otherwise.
+says otherwise and answers only requests addressed to localhost, an IP
+address or the --host name.
 
 Supports three transports:
 
