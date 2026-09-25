@@ -84,16 +84,23 @@ export function TypedEditor({ column, mode, edit, onChange, onCommit, onCancel, 
     else onChange({ kind: 'default' })
   }
 
+  // Keys the editor handles stop here: the grid around it has its own
+  // keyboard model, and once the editor has re-rendered away its detached
+  // target no longer looks like it is inside an editor, so Enter reached the
+  // grid and reopened the editor it had just committed (R01, real browser).
   function handleKey(e: KeyboardEvent) {
     if (e.key === 'Enter' && !e.shiftKey && onCommit) {
       e.preventDefault()
+      e.stopPropagation()
       onCommit()
     } else if (e.key === 'Escape') {
       e.preventDefault()
+      e.stopPropagation()
       onCancel?.()
     } else if (e.key === 'Tab' && onTab) {
       // The grid intercepts Tab to commit and open the next editable cell.
       e.preventDefault()
+      e.stopPropagation()
       onTab()
     }
   }
