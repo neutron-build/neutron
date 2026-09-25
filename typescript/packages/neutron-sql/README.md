@@ -409,6 +409,35 @@ const ranked = await db
 Hybrid search composes the two: order by `ts_rank(...) desc, embedding <=> $1`
 — text relevance first, vector distance as the tie-breaker, one statement.
 
+### LISTEN/NOTIFY (`@neutron-build/sql/listen-notify`)
+
+PostgreSQL's asynchronous notification channel, on ONE dedicated connection
+per listener. LISTEN is session-scoped, so the listener never holds a pool
+checkout: `pgListener({ url })` owns its connection end to end,
+`pgListener({ client })` borrows an already-dedicated `pg` client (closed
+listeners unlisten and detach but never end it), and
+`postgresJsListener({ client })` uses postgres.js's native `listen()`
+(which manages its own subscription connection).
+
+```ts
+import { pgListener } from "@neutron-build/sql/listen-notify";
+
+const listener = await pgListener({ url: DATABASE_URL, signal: controller.signal });
+await listener.listen(["orders"], (n) => console.log(n.channel, n.payload));
+await listener.notify("orders", "order-17 ready"); // payload, quoted + escaped, <=8000 bytes
+await listener.close(); // or abort controller.signal — UNLISTEN, detach, end (owned only)
+```
+
+Delivery semantics are PostgreSQL's own: notifications fire at COMMIT (a
+rolled-back NOTIFY is never delivered), arrive in commit order, only while
+the listening session is connected, and are not persisted — a disconnect is
+a gap and the `pg` listeners do NOT reconnect (postgres.js re-listens on
+reconnect; messages emitted during the gap are still lost). Nucleus
+delivers pending notifications around the listener's own statement traffic —
+pass `pollIntervalMs` to flush an otherwise-idle listener. Channel names are
+rendered as case-preserving double-quoted identifiers on both engines and
+reported back normalized.
+
 ### Vector columns in the v1 workflow (breaking, X01)
 
 The legacy v1 skip behavior (`-- NUCLEUS-ONLY (skipped on Postgres)`) is

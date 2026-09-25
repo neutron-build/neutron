@@ -81,11 +81,12 @@ console.log(JSON.stringify({
 // X01: the root import must also leave the optional capability modules
 // (/pgvector, /fts) unloaded — the SQL-only root does not pull the
 // pgvector/FTS surface until a consumer imports the entry point explicitly.
-test("load-trace: SQL-only root loads no /pgvector or /fts module", () => {
+// X05 adds /listen-notify to the same rule.
+test("load-trace: SQL-only root loads no /pgvector, /fts or /listen-notify module", () => {
   const res = runChild(`
 const root = await import(${JSON.stringify(pathToFileURL(path.join(packageRoot, "dist", "index.js")).href)});
 const optionalModules = Object.keys(require.cache).filter(
-  (k) => k.includes("/dist/pgvector.js") || k.includes("/dist/fts.js"),
+  (k) => k.includes("/dist/pgvector.js") || k.includes("/dist/fts.js") || k.includes("/dist/listen-notify.js"),
 );
 console.log(JSON.stringify({
   imported: true,
@@ -99,7 +100,25 @@ console.log(JSON.stringify({
   assert.equal(out.imported, true);
   // The deprecated root aliases are plain re-exports living in schema.js —
   // importing the root must still not load the module files themselves.
-  assert.deepEqual(out.optionalModulesLoaded, [], "the root import must not load dist/pgvector.js or dist/fts.js");
+  assert.deepEqual(out.optionalModulesLoaded, [], "the root import must not load dist/pgvector.js, dist/fts.js or dist/listen-notify.js");
+});
+
+// X05: /listen-notify imports standalone with no driver resolvable — pg is
+// loaded lazily at listener creation.
+test("load-trace: /listen-notify imports standalone without drivers", () => {
+  const res = runChild(`
+const ln = await import(${JSON.stringify(pathToFileURL(path.join(packageRoot, "dist", "listen-notify.js")).href)});
+console.log(JSON.stringify({
+  pgListener: typeof ln.pgListener,
+  postgresJsListener: typeof ln.postgresJsListener,
+  notifyStatement: typeof ln.notifyStatement,
+}));
+`);
+  assert.equal(res.status, 0, `/listen-notify import must succeed without drivers:\n${res.stderr}`);
+  const out = JSON.parse(res.stdout.trim().split("\n").at(-1)!);
+  assert.equal(out.pgListener, "function");
+  assert.equal(out.postgresJsListener, "function");
+  assert.equal(out.notifyStatement, "function");
 });
 
 // X01: the optional modules import standalone, with no driver resolvable —
