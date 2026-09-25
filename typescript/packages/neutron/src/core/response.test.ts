@@ -43,6 +43,31 @@ describe("response helpers", () => {
     expect(isResponse(json({}))).toBe(true);
   });
 
+  // @hono/node-server replaces globalThis.Response. Response.json() (and the
+  // other static factories) still build NATIVE instances, which fail
+  // `instanceof` against the replacement — the cause of an action's
+  // `Response.json(..., { status: 201 })` being served as 200 `{}`.
+  it("isResponse recognizes native and @hono/node-server Responses alike", async () => {
+    const nativeResponse = globalThis.Response;
+    const nativeRequest = globalThis.Request;
+    const { getRequestListener } = await import("@hono/node-server");
+    getRequestListener(() => new Response());
+    try {
+      expect(globalThis.Response).not.toBe(nativeResponse);
+      const fromFactory = Response.json({ ok: true }, { status: 201 });
+      const fromCtor = new Response("x", { status: 201 });
+      expect(fromFactory instanceof Response).toBe(false);
+      expect(isResponse(fromFactory)).toBe(true);
+      expect(isResponse(fromCtor)).toBe(true);
+      expect(isResponse(Response.redirect("http://localhost/", 302))).toBe(true);
+      expect(isResponse(new nativeResponse(null, { status: 204 }))).toBe(true);
+      expect(isResponse({ status: 201, headers: new Headers() })).toBe(false);
+    } finally {
+      Object.defineProperty(globalThis, "Response", { value: nativeResponse });
+      Object.defineProperty(globalThis, "Request", { value: nativeRequest });
+    }
+  });
+
   it("isResponse returns false for non-Response objects", () => {
     expect(isResponse(null)).toBe(false);
     expect(isResponse(undefined)).toBe(false);

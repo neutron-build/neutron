@@ -1,10 +1,13 @@
 package neutron
 
 import (
+	"encoding"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"reflect"
 	"strings"
+	"time"
 )
 
 // OpenAPISpec represents an OpenAPI 3.1 specification.
@@ -143,18 +146,53 @@ func OAuth2Scheme(flows OAuthFlows) SecurityScheme {
 }
 
 type OpenAPISchema struct {
-	Type        string                    `json:"type,omitempty"`
-	Format      string                    `json:"format,omitempty"`
-	Properties  map[string]*OpenAPISchema `json:"properties,omitempty"`
-	Required    []string                  `json:"required,omitempty"`
-	Items       *OpenAPISchema            `json:"items,omitempty"`
-	Ref         string                    `json:"$ref,omitempty"`
-	Description string                    `json:"description,omitempty"`
-	Enum        []string                  `json:"enum,omitempty"`
-	Minimum     *float64                  `json:"minimum,omitempty"`
-	Maximum     *float64                  `json:"maximum,omitempty"`
-	MinLength   *int                      `json:"minLength,omitempty"`
-	MaxLength   *int                      `json:"maxLength,omitempty"`
+	Type                 string                    `json:"type,omitempty"`
+	Format               string                    `json:"format,omitempty"`
+	Properties           map[string]*OpenAPISchema `json:"properties,omitempty"`
+	AdditionalProperties *OpenAPISchema            `json:"additionalProperties,omitempty"`
+	Required             []string                  `json:"required,omitempty"`
+	Items                *OpenAPISchema            `json:"items,omitempty"`
+	Ref                  string                    `json:"$ref,omitempty"`
+	Description          string                    `json:"description,omitempty"`
+	Enum                 []string                  `json:"enum,omitempty"`
+	Minimum              *float64                  `json:"minimum,omitempty"`
+	Maximum              *float64                  `json:"maximum,omitempty"`
+	MinLength            *int                      `json:"minLength,omitempty"`
+	MaxLength            *int                      `json:"maxLength,omitempty"`
+	// Nullable marks a value that may also be JSON null. OpenAPI 3.1 has no
+	// `nullable` keyword: it serializes as a type array (`["string","null"]`)
+	// or, for a $ref, as `oneOf: [{$ref}, {type: "null"}]`.
+	Nullable bool `json:"-"`
+}
+
+// MarshalJSON renders Nullable in OpenAPI 3.1 form.
+func (s *OpenAPISchema) MarshalJSON() ([]byte, error) {
+	type plain OpenAPISchema
+	if !s.Nullable || (s.Type == "" && s.Ref == "") {
+		// An untyped schema already admits null.
+		return json.Marshal((*plain)(s))
+	}
+	if s.Ref != "" {
+		return json.Marshal(struct {
+			OneOf       []map[string]string `json:"oneOf"`
+			Description string              `json:"description,omitempty"`
+		}{
+			OneOf:       []map[string]string{{"$ref": s.Ref}, {"type": "null"}},
+			Description: s.Description,
+		})
+	}
+	out := struct {
+		*plain
+		Type []string `json:"type"`
+		Enum []any    `json:"enum,omitempty"`
+	}{plain: (*plain)(s), Type: []string{s.Type, "null"}}
+	if len(s.Enum) > 0 {
+		for _, e := range s.Enum {
+			out.Enum = append(out.Enum, e)
+		}
+		out.Enum = append(out.Enum, nil)
+	}
+	return json.Marshal(out)
 }
 
 // generateOpenAPI builds the OpenAPI spec from registered routes.
@@ -168,7 +206,9 @@ func generateOpenAPI(routes []routeRecord, info OpenAPIInfo) *OpenAPISpec {
 		},
 	}
 
-	// Add the standard problem detail schema
+	// The standard problem detail schema, matching what WriteError emits:
+	// instance and errors are omitted when empty, and a validation error's
+	// value is omitted when unset.
 	spec.Components.Schemas["ProblemDetail"] = &OpenAPISchema{
 		Type: "object",
 		Properties: map[string]*OpenAPISchema{
@@ -177,8 +217,58 @@ func generateOpenAPI(routes []routeRecord, info OpenAPIInfo) *OpenAPISpec {
 			"status":   {Type: "integer", Format: "int32"},
 			"detail":   {Type: "string"},
 			"instance": {Type: "string"},
+			"errors": {
+				Type: "array",
+				Items: &OpenAPISchema{
+					Type: "object",
+					Properties: map[string]*OpenAPISchema{
+						"field":   {Type: "string"},
+						"message": {Type: "string"},
+						"value":   {},
+					},
+					Required: []string{"field", "message"},
+				},
+			},
 		},
 		Required: []string{"type", "title", "status", "detail"},
+	}
+
+	emptyType := reflect.TypeOf(Empty{})
+	isEmpty := func(t reflect.Type) bool {
+		return t == nil || t == emptyType || (t.Kind() == reflect.Ptr && t.Elem() == emptyType)
+	}
+	hasRequestBody := func(route routeRecord) bool {
+		return !isEmpty(route.InType) && route.InType.Kind() == reflect.Struct && hasBody(route.Method)
+	}
+
+	b := newSchemaBuilder(spec.Components.Schemas)
+	// A named type used both as a request body and as a response gets one
+	// component per direction.
+	inBodies := make(map[reflect.Type]bool)
+	for _, route := range routes {
+		if !route.Untyped && hasRequestBody(route) {
+			if t := componentType(route.InType); t != nil {
+				inBodies[t] = true
+			}
+		}
+	}
+	for _, route := range routes {
+		if !route.Untyped && !isEmpty(route.OutType) {
+			if t := componentType(route.OutType); t != nil && inBodies[t] {
+				b.both[t] = true
+			}
+		}
+	}
+
+	problem := func(desc string) OpenAPIResponse {
+		return OpenAPIResponse{
+			Description: desc,
+			Content: map[string]OpenAPIMediaType{
+				"application/problem+json": {
+					Schema: &OpenAPISchema{Ref: "#/components/schemas/ProblemDetail"},
+				},
+			},
+		}
 	}
 
 	for _, route := range routes {
@@ -205,10 +295,8 @@ func generateOpenAPI(routes []routeRecord, info OpenAPIInfo) *OpenAPISpec {
 			Responses:   make(map[string]OpenAPIResponse),
 		}
 
-		emptyType := reflect.TypeOf(Empty{})
-
 		// Parameters from path, query, header tags
-		if route.InType != nil && route.InType != emptyType && route.InType.Kind() == reflect.Struct {
+		if !isEmpty(route.InType) && route.InType.Kind() == reflect.Struct {
 			for i := 0; i < route.InType.NumField(); i++ {
 				f := route.InType.Field(i)
 				if pathKey := f.Tag.Get("path"); pathKey != "" {
@@ -216,40 +304,39 @@ func generateOpenAPI(routes []routeRecord, info OpenAPIInfo) *OpenAPISpec {
 						Name:     pathKey,
 						In:       "path",
 						Required: true,
-						Schema:   schemaForType(f.Type),
+						Schema:   b.typeSchema(f.Type, dirRequest, false),
 					})
 				}
 				if queryKey := f.Tag.Get("query"); queryKey != "" {
 					op.Parameters = append(op.Parameters, OpenAPIParameter{
 						Name:   queryKey,
 						In:     "query",
-						Schema: schemaForType(f.Type),
+						Schema: b.typeSchema(f.Type, dirRequest, false),
 					})
 				}
 				if headerKey := f.Tag.Get("header"); headerKey != "" {
 					op.Parameters = append(op.Parameters, OpenAPIParameter{
 						Name:   headerKey,
 						In:     "header",
-						Schema: schemaForType(f.Type),
+						Schema: b.typeSchema(f.Type, dirRequest, false),
 					})
 				}
 			}
 
 			// Request body for methods that accept a body
-			if hasBody(route.Method) {
-				schema := schemaForStructType(route.InType, spec.Components.Schemas)
+			if hasRequestBody(route) {
 				op.RequestBody = &OpenAPIRequestBody{
 					Required: true,
 					Content: map[string]OpenAPIMediaType{
-						"application/json": {Schema: schema},
+						"application/json": {Schema: b.bodySchema(route.InType, dirRequest)},
 					},
 				}
 			}
 		}
 
 		// Response
-		if route.OutType != nil && route.OutType != emptyType {
-			schema := schemaForResponseType(route.OutType, spec.Components.Schemas)
+		if !isEmpty(route.OutType) {
+			schema := b.bodySchema(route.OutType, dirResponse)
 			// POST operations use 201 Created, everything else uses 200 OK
 			statusCode := "200"
 			statusDesc := "Successful response"
@@ -267,23 +354,14 @@ func generateOpenAPI(routes []routeRecord, info OpenAPIInfo) *OpenAPISpec {
 			op.Responses["204"] = OpenAPIResponse{Description: "No content"}
 		}
 
-		// Error responses
-		op.Responses["400"] = OpenAPIResponse{
-			Description: "Bad Request",
-			Content: map[string]OpenAPIMediaType{
-				"application/problem+json": {
-					Schema: &OpenAPISchema{Ref: "#/components/schemas/ProblemDetail"},
-				},
-			},
+		// Error responses. 422 is only reachable when the input carries
+		// validate rules; the handler validates every non-Empty input.
+		op.Responses["400"] = problem("Bad Request")
+		op.Responses["404"] = problem("Not Found")
+		if !isEmpty(route.InType) && hasValidation(route.InType, map[reflect.Type]bool{}) {
+			op.Responses["422"] = problem("Validation Failed")
 		}
-		op.Responses["500"] = OpenAPIResponse{
-			Description: "Internal Server Error",
-			Content: map[string]OpenAPIMediaType{
-				"application/problem+json": {
-					Schema: &OpenAPISchema{Ref: "#/components/schemas/ProblemDetail"},
-				},
-			},
-		}
+		op.Responses["500"] = problem("Internal Server Error")
 
 		spec.Paths[pattern][method] = op
 	}
@@ -291,9 +369,163 @@ func generateOpenAPI(routes []routeRecord, info OpenAPIInfo) *OpenAPISpec {
 	return spec
 }
 
-func schemaForType(t reflect.Type) *OpenAPISchema {
+// schemaDirection distinguishes request bodies from responses. The same Go
+// type means different things in each: a request field is required when
+// validation demands it; a response field is required when encoding/json
+// always emits it.
+type schemaDirection int
+
+const (
+	dirRequest schemaDirection = iota
+	dirResponse
+)
+
+type componentKey struct {
+	t   reflect.Type
+	dir schemaDirection
+}
+
+// schemaBuilder generates component and inline schemas for one spec.
+type schemaBuilder struct {
+	schemas map[string]*OpenAPISchema
+	names   map[componentKey]string
+	taken   map[string]bool
+	// both holds named types used as a request body AND a response; their
+	// request component is suffixed "Input" so neither direction weakens the
+	// other.
+	both     map[reflect.Type]bool
+	visiting map[reflect.Type]bool
+}
+
+func newSchemaBuilder(schemas map[string]*OpenAPISchema) *schemaBuilder {
+	b := &schemaBuilder{
+		schemas:  schemas,
+		names:    make(map[componentKey]string),
+		taken:    make(map[string]bool),
+		both:     make(map[reflect.Type]bool),
+		visiting: make(map[reflect.Type]bool),
+	}
+	for name := range schemas {
+		b.taken[name] = true
+	}
+	return b
+}
+
+var (
+	timeType          = reflect.TypeOf(time.Time{})
+	rawMessageType    = reflect.TypeOf(json.RawMessage(nil))
+	jsonMarshalerType = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
+	textMarshalerType = reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()
+)
+
+// componentType returns the named struct type that would become a component
+// for a top-level body type (T, *T, []T, []*T), or nil.
+func componentType(t reflect.Type) reflect.Type {
+	if t == nil {
+		return nil
+	}
 	if t.Kind() == reflect.Ptr {
 		t = t.Elem()
+	}
+	if t.Kind() == reflect.Slice {
+		t = t.Elem()
+		if t.Kind() == reflect.Ptr {
+			t = t.Elem()
+		}
+	}
+	if t.Kind() == reflect.Struct && t.Name() != "" && !isScalarStruct(t) {
+		return t
+	}
+	return nil
+}
+
+// isScalarStruct reports struct types that encode as a JSON scalar.
+func isScalarStruct(t reflect.Type) bool {
+	return t == timeType || (t.Implements(textMarshalerType) && !t.Implements(jsonMarshalerType))
+}
+
+func (b *schemaBuilder) componentName(t reflect.Type, dir schemaDirection) string {
+	key := componentKey{t, dir}
+	if n, ok := b.names[key]; ok {
+		return n
+	}
+	base := t.Name()
+	if dir == dirRequest && b.both[t] {
+		base += "Input"
+	}
+	name := base
+	for i := 2; b.taken[name]; i++ {
+		name = fmt.Sprintf("%s%d", base, i)
+	}
+	b.taken[name] = true
+	b.names[key] = name
+	return name
+}
+
+// ref returns a $ref to t's component for dir, generating it on first use.
+func (b *schemaBuilder) ref(t reflect.Type, dir schemaDirection) *OpenAPISchema {
+	name := b.componentName(t, dir)
+	if _, exists := b.schemas[name]; !exists {
+		b.schemas[name] = b.structSchema(t, dir)
+	}
+	return &OpenAPISchema{Ref: "#/components/schemas/" + name}
+}
+
+// bodySchema describes a top-level request or response body. Named structs
+// (and slices of them) become component references; everything else inline.
+func (b *schemaBuilder) bodySchema(t reflect.Type, dir schemaDirection) *OpenAPISchema {
+	nullable := false
+	if t.Kind() == reflect.Ptr {
+		nullable = dir == dirResponse
+		t = t.Elem()
+	}
+	var s *OpenAPISchema
+	switch {
+	case componentType(t) == t:
+		s = b.ref(t, dir)
+	case t.Kind() == reflect.Slice && componentType(t) != nil:
+		items := b.ref(componentType(t), dir)
+		items.Nullable = dir == dirResponse && t.Elem().Kind() == reflect.Ptr
+		s = &OpenAPISchema{Type: "array", Items: items, Nullable: dir == dirResponse}
+	default:
+		s = b.typeSchema(t, dir, false)
+	}
+	if nullable {
+		s.Nullable = true
+	}
+	return s
+}
+
+// typeSchema maps a Go type to the schema of its encoding/json form. In the
+// response direction, kinds that encode nil as JSON null (pointer, slice,
+// map) are nullable; interfaces get the unconstrained schema. viaPtr reports
+// that the value is reached through a pointer, which makes pointer-receiver
+// marshal methods apply.
+func (b *schemaBuilder) typeSchema(t reflect.Type, dir schemaDirection, viaPtr bool) *OpenAPISchema {
+	nullable := false
+	for t.Kind() == reflect.Ptr {
+		nullable = true
+		viaPtr = true
+		t = t.Elem()
+	}
+	s := b.valueSchema(t, dir, viaPtr)
+	if nullable && dir == dirResponse {
+		s.Nullable = true
+	}
+	return s
+}
+
+func (b *schemaBuilder) valueSchema(t reflect.Type, dir schemaDirection, viaPtr bool) *OpenAPISchema {
+	implements := func(iface reflect.Type) bool {
+		return t.Implements(iface) || (viaPtr && reflect.PointerTo(t).Implements(iface))
+	}
+	switch {
+	case t == timeType:
+		return &OpenAPISchema{Type: "string", Format: "date-time"}
+	case t == rawMessageType:
+		return &OpenAPISchema{}
+	case !implements(jsonMarshalerType) && implements(textMarshalerType):
+		return &OpenAPISchema{Type: "string"}
 	}
 
 	switch t.Kind() {
@@ -314,82 +546,139 @@ func schemaForType(t reflect.Type) *OpenAPISchema {
 	case reflect.Bool:
 		return &OpenAPISchema{Type: "boolean"}
 	case reflect.Slice:
-		return &OpenAPISchema{Type: "array", Items: schemaForType(t.Elem())}
+		s := &OpenAPISchema{Type: "array", Nullable: dir == dirResponse}
+		if t.Elem().Kind() == reflect.Uint8 {
+			// encoding/json writes []byte as a base64 string.
+			s = &OpenAPISchema{Type: "string", Format: "byte", Nullable: dir == dirResponse}
+		} else {
+			s.Items = b.typeSchema(t.Elem(), dir, false)
+		}
+		return s
+	case reflect.Array:
+		return &OpenAPISchema{Type: "array", Items: b.typeSchema(t.Elem(), dir, false)}
 	case reflect.Map:
-		return &OpenAPISchema{Type: "object"}
+		return &OpenAPISchema{
+			Type:                 "object",
+			AdditionalProperties: b.typeSchema(t.Elem(), dir, false),
+			Nullable:             dir == dirResponse,
+		}
+	case reflect.Interface:
+		return &OpenAPISchema{}
 	case reflect.Struct:
-		return schemaForStructInline(t)
+		return b.structSchema(t, dir)
 	default:
 		return &OpenAPISchema{Type: "string"}
 	}
 }
 
-func schemaForStructInline(t reflect.Type) *OpenAPISchema {
-	s := &OpenAPISchema{
-		Type:       "object",
-		Properties: make(map[string]*OpenAPISchema),
+// structSchema builds an inline object schema for t in direction dir.
+func (b *schemaBuilder) structSchema(t reflect.Type, dir schemaDirection) *OpenAPISchema {
+	if b.visiting[t] {
+		// Recursive type: stop expanding rather than recurse forever.
+		return &OpenAPISchema{Type: "object"}
 	}
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-		if !f.IsExported() {
-			continue
-		}
-		name := jsonFieldName(f)
-		if name == "-" {
-			continue
-		}
-		propSchema := schemaForType(f.Type)
-		addValidationConstraints(propSchema, f)
-		s.Properties[name] = propSchema
+	b.visiting[t] = true
+	defer delete(b.visiting, t)
 
-		if isRequired(f) {
-			s.Required = append(s.Required, name)
-		}
-	}
+	s := &OpenAPISchema{Type: "object", Properties: make(map[string]*OpenAPISchema)}
+	b.addFields(s, t, dir, false)
 	return s
 }
 
-func schemaForStructType(t reflect.Type, schemas map[string]*OpenAPISchema) *OpenAPISchema {
-	name := t.Name()
-	if name == "" {
-		return schemaForStructInline(t)
+// addFields adds t's JSON-visible fields to s, promoting the fields of
+// untagged embedded structs the way encoding/json does (a shallower field
+// wins a name). viaNilPtr marks fields promoted through an embedded pointer,
+// which vanish from the output when that pointer is nil.
+func (b *schemaBuilder) addFields(s *OpenAPISchema, t reflect.Type, dir schemaDirection, viaNilPtr bool) {
+	type embed struct {
+		t   reflect.Type
+		ptr bool
 	}
-	if _, exists := schemas[name]; !exists {
-		schemas[name] = schemaForStructInline(t)
-	}
-	return &OpenAPISchema{Ref: "#/components/schemas/" + name}
-}
-
-func schemaForResponseType(t reflect.Type, schemas map[string]*OpenAPISchema) *OpenAPISchema {
-	if t.Kind() == reflect.Slice {
-		elem := t.Elem()
-		if elem.Kind() == reflect.Ptr {
-			elem = elem.Elem()
+	var embedded []embed
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		tag := f.Tag.Get("json")
+		if tag == "-" {
+			continue
 		}
-		if elem.Kind() == reflect.Struct {
-			return &OpenAPISchema{
-				Type:  "array",
-				Items: schemaForStructType(elem, schemas),
+		name, opts, _ := strings.Cut(tag, ",")
+		if f.Anonymous && name == "" {
+			ft := f.Type
+			ptr := ft.Kind() == reflect.Ptr
+			if ptr {
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct {
+				if b.visiting[ft] {
+					continue
+				}
+				embedded = append(embedded, embed{ft, ptr})
+				continue
 			}
 		}
-		return &OpenAPISchema{Type: "array", Items: schemaForType(elem)}
+		if !f.IsExported() {
+			continue
+		}
+		if name == "" {
+			name = f.Name
+		}
+		if _, dup := s.Properties[name]; dup {
+			continue
+		}
+
+		prop := b.typeSchema(f.Type, dir, false)
+		addValidationConstraints(prop, f)
+		omitted := hasJSONOption(opts, "omitempty") || hasJSONOption(opts, "omitzero")
+		if dir == dirResponse {
+			// An omitted-when-empty field is absent rather than null.
+			if omitted {
+				prop.Nullable = false
+			} else if !viaNilPtr {
+				s.Required = append(s.Required, name)
+			}
+		} else if isRequired(f) {
+			s.Required = append(s.Required, name)
+		}
+		s.Properties[name] = prop
 	}
-	if t.Kind() == reflect.Struct {
-		return schemaForStructType(t, schemas)
+	for _, e := range embedded {
+		b.visiting[e.t] = true
+		b.addFields(s, e.t, dir, viaNilPtr || e.ptr)
+		delete(b.visiting, e.t)
 	}
-	return schemaForType(t)
 }
 
-func jsonFieldName(f reflect.StructField) string {
-	tag := f.Tag.Get("json")
-	if tag == "" {
-		return f.Name
+func hasJSONOption(opts, want string) bool {
+	for opts != "" {
+		var o string
+		o, opts, _ = strings.Cut(opts, ",")
+		if o == want {
+			return true
+		}
 	}
-	parts := strings.SplitN(tag, ",", 2)
-	if parts[0] == "" {
-		return f.Name
+	return false
+}
+
+// hasValidation reports whether validating a value of t can fail, i.e. t
+// (or a struct it contains) carries validate rules.
+func hasValidation(t reflect.Type, seen map[reflect.Type]bool) bool {
+	for t.Kind() == reflect.Ptr || t.Kind() == reflect.Slice || t.Kind() == reflect.Array || t.Kind() == reflect.Map {
+		t = t.Elem()
 	}
-	return parts[0]
+	if t.Kind() != reflect.Struct || seen[t] {
+		return false
+	}
+	seen[t] = true
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if v := f.Tag.Get("validate"); v != "" && v != "-" {
+			return true
+		}
+		if hasValidation(f.Type, seen) {
+			return true
+		}
+	}
+	return false
 }
 
 func isRequired(f reflect.StructField) bool {
@@ -410,11 +699,15 @@ func addValidationConstraints(s *OpenAPISchema, f reflect.StructField) {
 	if tag == "" {
 		return
 	}
+	kind := f.Type.Kind()
+	if kind == reflect.Ptr {
+		kind = f.Type.Elem().Kind()
+	}
 	for _, rule := range strings.Split(tag, ",") {
 		rule = strings.TrimSpace(rule)
 		if strings.HasPrefix(rule, "min=") {
 			// For strings, this is minLength; for numbers, minimum
-			if f.Type.Kind() == reflect.String {
+			if kind == reflect.String {
 				if v := parseConstraint(rule); v != nil {
 					n := int(*v)
 					s.MinLength = &n
@@ -424,7 +717,7 @@ func addValidationConstraints(s *OpenAPISchema, f reflect.StructField) {
 			}
 		}
 		if strings.HasPrefix(rule, "max=") {
-			if f.Type.Kind() == reflect.String {
+			if kind == reflect.String {
 				if v := parseConstraint(rule); v != nil {
 					n := int(*v)
 					s.MaxLength = &n

@@ -10,7 +10,7 @@ export async function loader() {
 export async function action({ request }: ActionArgs) {
   const formData = await request.formData();
   const alerts = String(formData.get("alerts") || "all");
-  return Response.json({ ok: true, alerts, savedAt: new Date().toISOString() });
+  return { ok: true, alerts, savedAt: new Date().toISOString() };
 }
 
 export default function Settings(props: {

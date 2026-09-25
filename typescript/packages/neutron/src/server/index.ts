@@ -6,7 +6,6 @@ import {
   isMutationMethod,
   toError,
 } from "../core/render-app-route.js";
-import * as net from "node:net";
 import * as path from "node:path";
 import { serve, type ServerType } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
@@ -17,8 +16,11 @@ import { h } from "preact";
 import { renderToString } from "preact-render-to-string";
 import { discoverRoutes } from "../core/manifest.js";
 import { runMiddlewareChain } from "../core/middleware.js";
+import { isResponse } from "../core/response.js";
 import { createRouter } from "../core/router.js";
 import { installTransportPeer } from "./peer.js";
+import { appDefinesHealthRoute, DEFAULT_HEALTH_VERSION, healthBody } from "./health.js";
+import { onShutdownSignal } from "./shutdown.js";
 import {
   compileRouteRules,
   resolveRouteRuleHeaders,
@@ -44,7 +46,8 @@ import { createEntityTag, requestHasMatchingEtag } from "./cache-utils.js";
 import { escapeHtml } from "../core/escape.js";
 import { isProblemError, notFoundError } from "../core/problem.js";
 import {
-  buildOpenApiSpec,
+  appDefinesSpecRoute,
+  serverOpenApiSpec,
   swaggerDocsHtml,
   type NeutronOpenApiOptions,
 } from "./openapi.js";
@@ -98,6 +101,11 @@ export type {
   MemoryLoaderCacheStoreOptions,
 } from "./cache-store.js";
 export { csrfMiddleware } from "./csrf.js";
+export {
+  onShutdownSignal,
+  DEFAULT_SHUTDOWN_TIMEOUT_MS,
+  type ShutdownSignalOptions,
+} from "./shutdown.js";
 export type { CsrfOptions } from "./csrf.js";
 export { rateLimitMiddleware, apiRateLimit, imageRateLimit } from "./rate-limit.js";
 export type { RateLimitOptions } from "./rate-limit.js";
@@ -365,7 +373,7 @@ export async function createServer(
     cache,
     routes: routeRules,
     hooks,
-    version: serverVersion = "0.1.0",
+    version: serverVersion = DEFAULT_HEALTH_VERSION,
   } = options;
 
   const resolvedRootDir = path.resolve(rootDir);
@@ -571,36 +579,14 @@ export async function createServer(
   // win so it can report dependency-aware health (e.g. 503 when a backing store
   // is down) instead of the built-in returning a false 200. The catch-all below
   // then serves it like any other route.
-  const userDefinesHealthRoute = routes.some(
-    (route) => route.path === "/health" && !route.file.includes("_layout")
-  );
-  if (!userDefinesHealthRoute) {
-    app.get("/health", (c) =>
-      c.json({
-        status: "ok",
-        nucleus: "unconfigured",
-        version: serverVersion,
-      }),
-    );
+  if (!appDefinesHealthRoute(routes)) {
+    app.get("/health", (c) => c.json(healthBody(serverVersion)));
   }
 
   // FRAMEWORK_CONTRACT.md §4: /openapi.json + /docs. Like /health, suppressed
   // when the app defines its own route at the same path — the user route wins.
-  const userDefinesSpecRoute = isSsr
-    ? routes.some(
-        (route) =>
-          (route.path === "/openapi.json" || route.path === "/docs") &&
-          !route.file.includes("_layout")
-      )
-    : false;
-  if (openapi && !userDefinesSpecRoute) {
-    const spec = buildOpenApiSpec(routes, {
-      title: openapi.title,
-      version: openapi.version ?? serverVersion,
-      description: openapi.description,
-      paths: openapi.paths,
-      components: openapi.components,
-    });
+  if (openapi && !appDefinesSpecRoute(routes)) {
+    const spec = serverOpenApiSpec(routes, openapi, serverVersion);
     app.get("/openapi.json", (c) => c.json(spec));
     app.get("/docs", (c) => c.html(swaggerDocsHtml(openapi.title)));
   }
@@ -1019,9 +1005,9 @@ export async function createServer(
       // A thrown Response is a documented middleware short-circuit — and the
       // denial path of the framework's own requireOrganization()/
       // requirePermissions() (enterprise-auth). Loaders and actions get
-      // `instanceof Response` treatment in render-app-route; middleware
+      // `isResponse` treatment in render-app-route; middleware
       // throws land here and must answer as themselves, not as a 500.
-      if (error instanceof Response) {
+      if (isResponse(error)) {
         return finalize(error);
       }
       return finalize(new Response("Internal Server Error", { status: 500 }));
@@ -1831,7 +1817,6 @@ async function createSsrServer(
 ): Promise<SsrServer> {
   try {
     const vite = await import("vite");
-    const hmrPort = await getFreePort();
     const loadedConfig = await vite.loadConfigFromFile(
       { command: "serve", mode: "production" },
       undefined,
@@ -1851,9 +1836,13 @@ async function createSsrServer(
           : {}),
         server: {
           middlewareMode: true,
-          // Use a random HMR socket in SSR middleware mode to avoid
-          // fixed-port collisions when multiple servers spin up in tests.
-          hmr: { port: hmrPort },
+          // Production only loads modules through this instance. Without
+          // `ws: false`, Vite opens its own HMR WebSocket server on a second
+          // port (all interfaces) even in middleware mode — an unexpected
+          // listener on a production host. `hmr: false` stops file-change
+          // pushes; the user config cannot re-enable either.
+          hmr: false,
+          ws: false,
         },
         appType: "custom",
         logLevel: "error",
@@ -1958,28 +1947,6 @@ function createRequestId(): string {
 
 
 
-async function getFreePort(): Promise<number> {
-  return await new Promise<number>((resolve, reject) => {
-    const socket = net.createServer();
-    socket.listen(0, "127.0.0.1", () => {
-      const address = socket.address();
-      if (!address || typeof address === "string") {
-        reject(new Error("Failed to resolve free port"));
-        return;
-      }
-      const { port } = address;
-      socket.close((error) => {
-        if (error) {
-          reject(error);
-          return;
-        }
-        resolve(port);
-      });
-    });
-    socket.on("error", reject);
-  });
-}
-
 export async function startServer(
   options: NeutronServerOptions = {}
 ): Promise<NeutronServer> {
@@ -1990,39 +1957,8 @@ export async function startServer(
   console.log(`  Local:   ${url}\n`);
   console.log(`  Press Ctrl+C to stop\n`);
 
-  // Graceful shutdown with a bounded drain (FRAMEWORK_CONTRACT.md: 30s).
-  const SHUTDOWN_TIMEOUT_MS = 30_000;
-  let shuttingDown = false;
-  const shutdown = (signal: string) => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-
-    console.log(
-      `\nReceived ${signal}, draining in-flight requests (up to ${
-        SHUTDOWN_TIMEOUT_MS / 1000
-      }s)...`,
-    );
-    const forceExit = setTimeout(() => {
-      console.error("Drain timed out; forcing exit.");
-      process.exit(1);
-    }, SHUTDOWN_TIMEOUT_MS);
-
-    void close().then(
-      () => {
-        clearTimeout(forceExit);
-        console.log("Drained cleanly.");
-        process.exit(0);
-      },
-      (err) => {
-        clearTimeout(forceExit);
-        console.error("Shutdown error:", err);
-        process.exit(1);
-      },
-    );
-  };
-
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("SIGINT", () => shutdown("SIGINT"));
+  // Graceful shutdown with a bounded drain (FRAMEWORK_CONTRACT.md §8: 30s).
+  onShutdownSignal(close);
 
   // Return the handle so realtime callers can attach `wss.on("connection", ...)` while
   // still getting startServer's signal-driven graceful shutdown.

@@ -151,6 +151,32 @@ LIMIT 10
 CREATE INDEX idx ON table USING HNSW (column) WITH (metric = 'cosine', ef = 200, m = 16)
 ```
 
+The engine enforces two rules at DDL time:
+
+- An `HNSW` index requires the table to have a **single-column integer PRIMARY KEY**
+  (`INT`/`BIGINT`/`SERIAL`/`BIGSERIAL`). Postings are keyed on it; without one they would be
+  positional and resolve to the wrong rows after a `DELETE` or under a `WHERE`.
+- `WITH (metric = '…')` is accepted only on `HNSW` and `IVFFLAT` indexes. An unknown
+  `USING` method (e.g. `USING VECTOR`) silently builds a BTree, so pairing it with `metric`
+  is rejected.
+
+**Collection DDL** — every SDK's `createCollection(name, dimension, metric)` emits exactly:
+```sql
+CREATE TABLE IF NOT EXISTS <name> (rid BIGSERIAL PRIMARY KEY, id TEXT NOT NULL UNIQUE, embedding VECTOR(<dimension>), metadata JSONB DEFAULT '{}')
+CREATE INDEX IF NOT EXISTS <index> ON <name> USING HNSW (embedding) WITH (metric = '<metric>')
+```
+`<index>` is `idx_<name>_embedding` (Python: `idx_<name>_vec`). `rid` exists only to satisfy
+the HNSW rule; insert, search, delete and count address the caller's `id`, which stays
+`UNIQUE` so `ON CONFLICT (id)` upserts work.
+
+Collections created before this schema keep their old `id TEXT PRIMARY KEY` table and
+whatever index they got — both statements are `IF NOT EXISTS` and the index name is
+unchanged, so re-calling `createCollection` on one that has its index is a no-op. Such a
+collection has no HNSW index; recreate it to get one. An old-schema table with **no** index —
+left behind when `createCollection` failed its index step on an engine that already enforced
+the rules above — still fails the HNSW rule on re-call, exactly as it did before; drop and
+recreate it.
+
 ### 3.3 TimeSeries
 
 | SQL Function | Signature | Returns |
@@ -426,7 +452,7 @@ All frameworks SHOULD apply middleware in this default order (outermost first):
 
 ## 6. Configuration Environment Variables
 
-All frameworks MUST support these environment variables (with framework-specific prefix):
+All frameworks MUST support these environment variables. `{PREFIX}` is `NEUTRON` in every SDK (`NEUTRON_HOST`, `NEUTRON_PORT`, …), and the variables MUST take effect without adapter- or application-specific configuration: an app started without an explicit listen address listens on `NEUTRON_HOST`:`NEUTRON_PORT`.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
@@ -457,11 +483,11 @@ Feature detection (is the connected DB a Nucleus instance vs plain Postgres) is 
 
 All frameworks MUST:
 1. Catch `SIGTERM` and `SIGINT`
-2. Stop accepting new connections
+2. Stop accepting new connections (a connection attempted after the signal is refused, or answered `503`)
 3. Drain in-flight requests (configurable timeout, default 30s)
 4. Run OnStop lifecycle hooks in reverse registration order
 5. Close database connections
-6. Exit cleanly
+6. Exit cleanly, with status 0 after a completed drain
 
 ## 9. Workflow Event-Log Wire Format (v1)
 

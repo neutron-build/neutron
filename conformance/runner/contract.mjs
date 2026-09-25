@@ -32,6 +32,11 @@ const IR = JSON.parse(
 // Contract dimensions, in report order — from the IR.
 export const DIMENSIONS = IR.dimensions.map((d) => d.id);
 
+// Dimensions asserted on the PROCESS (how it is started, what it does when
+// signalled) rather than over HTTP by runContract below — see lifecycle.mjs.
+// They need a boot, so `--base=URL` cannot run them.
+export const LIFECYCLE_DIMENSIONS = IR.dimensions.filter((d) => d.kind === "lifecycle").map((d) => d.id);
+
 
 // Standard error codes from FRAMEWORK_CONTRACT.md §2, via the IR.
 //

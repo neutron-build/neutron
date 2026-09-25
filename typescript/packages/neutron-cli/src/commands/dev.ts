@@ -15,7 +15,9 @@ import {
   resolvePreactSsr,
   vitePreactAliases,
 } from "@neutron-build/core";
+import { onShutdownSignal } from "@neutron-build/core/server";
 import { loadNeutronConfig } from "../lib/config.js";
+import { resolveListenAddress, type ListenAddress } from "../lib/listen.js";
 
 export async function dev(): Promise<void> {
   const cwd = process.cwd();
@@ -32,23 +34,18 @@ export async function dev(): Promise<void> {
   const preactAliases = vitePreactAliases(preactSsr, runtimeAliases);
   const esbuildJsx = runtimeEsbuild(runtime);
 
-  // Parse CLI args
-  const args = process.argv.slice(3);
-  let port = 3000;
-  let host: string | undefined;
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--port" && args[i + 1]) {
-      port = parseInt(args[i + 1], 10);
-      i++;
-    } else if (args[i].startsWith("--port=")) {
-      port = parseInt(args[i].split("=")[1], 10);
-    } else if (args[i] === "--host" && args[i + 1]) {
-      host = args[i + 1];
-      i++;
-    } else if (args[i].startsWith("--host=")) {
-      host = args[i].split("=")[1];
-    }
+  let address: ListenAddress;
+  try {
+    address = resolveListenAddress({
+      argv: process.argv.slice(3),
+      env: process.env,
+      config: neutronConfig.server,
+    });
+  } catch (error) {
+    console.error(`neutron-ts dev: ${(error as Error).message}`);
+    process.exit(1);
   }
+  const { port, host } = address;
 
   await prepareContentCollections({
     rootDir: cwd,
@@ -77,6 +74,11 @@ export async function dev(): Promise<void> {
 
   const filteredPlugins = stripCliOwnedPlugins(userConfig.plugins);
 
+  // Vite installs its own SIGTERM handler that destroys every open socket and
+  // exits 143, dropping in-flight requests. Remove it; the drain below
+  // replaces it (FRAMEWORK_CONTRACT.md §8).
+  const sigtermListenersBefore = new Set(process.listeners("SIGTERM"));
+
   const server = await createServer(
     mergeConfig({ ...userConfig, plugins: filteredPlugins }, {
       esbuild: esbuildJsx,
@@ -93,6 +95,8 @@ export async function dev(): Promise<void> {
           rootDir: cwd,
           writeRouteTypes: true,
           routeRules: neutronConfig.routes,
+          version: neutronConfig.server?.version,
+          openapi: neutronConfig.server?.openapi,
         }),
       ],
       resolve: {
@@ -127,14 +131,40 @@ export async function dev(): Promise<void> {
       },
       server: {
         port,
+        // An explicitly configured port must bind or fail, not silently move.
+        strictPort: address.portExplicit,
         ...(host ? { host } : {}),
       },
     })
   );
 
+  for (const listener of process.listeners("SIGTERM")) {
+    if (!sigtermListenersBefore.has(listener)) {
+      process.off("SIGTERM", listener);
+    }
+  }
+
   await server.listen();
 
-  const resolvedPort = server.config.server.port || port;
+  onShutdownSignal(async () => {
+    const httpServer = server.httpServer;
+    if (httpServer) {
+      // Stop accepting, then wait for in-flight requests. HMR sockets are
+      // upgraded connections that never go idle, so close them first or
+      // the drain would always run to the timeout with a browser tab open.
+      const drained = new Promise<void>((resolve, reject) => {
+        httpServer.close((err) => (err ? reject(err) : resolve()));
+      });
+      (httpServer as { closeIdleConnections?: () => void }).closeIdleConnections?.();
+      await server.ws.close();
+      await drained;
+    }
+    await server.close();
+  });
+
+  const boundAddress = server.httpServer?.address();
+  const resolvedPort =
+    boundAddress && typeof boundAddress === "object" ? boundAddress.port : port;
 
   console.log(`
   Neutron dev server running:

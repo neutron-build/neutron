@@ -80,11 +80,15 @@ class VectorModelImpl implements VectorModel {
       throw new Error(`Invalid distance metric: ${metric}. Must be one of: ${VALID_METRICS.join(', ')}`);
     }
 
+    // The engine refuses an HNSW index unless the table has a single-column
+    // integer PRIMARY KEY, so `rid` is that key; the caller's `id` stays UNIQUE.
     await this.transport.execute(
-      `CREATE TABLE IF NOT EXISTS ${name} (id TEXT PRIMARY KEY, embedding VECTOR(${dimension}), metadata JSONB DEFAULT '{}')`,
+      `CREATE TABLE IF NOT EXISTS ${name} (rid BIGSERIAL PRIMARY KEY, id TEXT NOT NULL UNIQUE, embedding VECTOR(${dimension}), metadata JSONB DEFAULT '{}')`,
     );
+    // The index name is unchanged from earlier releases, so re-calling this on
+    // a collection created by one is a no-op rather than a second index.
     await this.transport.execute(
-      `CREATE INDEX IF NOT EXISTS idx_${name}_embedding ON ${name} USING VECTOR (embedding) WITH (metric = '${metric}')`,
+      `CREATE INDEX IF NOT EXISTS idx_${name}_embedding ON ${name} USING HNSW (embedding) WITH (metric = '${metric}')`,
     );
   }
 

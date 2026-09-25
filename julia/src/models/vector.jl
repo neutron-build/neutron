@@ -99,7 +99,8 @@ end
 """
     create_index!(m, table; column, metric, ef, m_param)
 
-CREATE INDEX ... USING VECTOR with the specified metric and HNSW parameters.
+CREATE INDEX ... USING HNSW with the specified metric and HNSW parameters.
+The engine requires `table` to have a single-column integer PRIMARY KEY.
 """
 function create_index!(m::VectorModel, table::String;
                        column::String="embedding",
@@ -109,7 +110,7 @@ function create_index!(m::VectorModel, table::String;
     metric_str = metric == L2 ? "l2" : metric == Cosine ? "cosine" : "inner"
     sql_str = """
         CREATE INDEX idx_$(table)_$(column) ON $table
-        USING VECTOR ($column)
+        USING HNSW ($column)
         WITH (metric = '$metric_str', ef = $ef, m = $m_param)
     """
     LibPQ.execute(m.conn, sql_str)

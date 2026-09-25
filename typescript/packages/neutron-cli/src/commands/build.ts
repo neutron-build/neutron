@@ -25,6 +25,7 @@ import {
   setActiveMarkdownConfig,
   assertRenderedFragment,
   renderSpeculationRules,
+  isResponse,
 } from "@neutron-build/core";
 import type {
   NeutronConfig,
@@ -610,9 +611,9 @@ export async function build(): Promise<void> {
             let response: Response | undefined;
             try {
               const r = await module.loader({ request, params, context: {} } as LoaderArgs);
-              if (r instanceof Response) response = r;
+              if (isResponse(r)) response = r;
             } catch (error) {
-              if (error instanceof Response) response = error;
+              if (isResponse(error)) response = error;
               else throw error;
             }
             if (response) {
@@ -635,9 +636,9 @@ export async function build(): Promise<void> {
           let response: Response | undefined;
           try {
             const result = await module.loader({ request, params: {}, context: {} } as LoaderArgs);
-            if (result instanceof Response) response = result;
+            if (isResponse(result)) response = result;
           } catch (error) {
-            if (error instanceof Response) response = error;
+            if (isResponse(error)) response = error;
             else throw error;
           }
 

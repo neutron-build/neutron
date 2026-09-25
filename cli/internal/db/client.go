@@ -169,6 +169,39 @@ func (c *Client) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, 
 	return c.pool.Query(ctx, sql, args...)
 }
 
+// Acquire checks out one dedicated pool connection. The caller owns it until
+// Release: every statement on it runs on the same server backend, which is
+// what request-scoped cancellation needs (the backend PID is known before
+// the statement is sent).
+func (c *Client) Acquire(ctx context.Context) (*pgxpool.Conn, error) {
+	return c.pool.Acquire(ctx)
+}
+
+// CancelBackend asks the server to cancel the statement currently running on
+// backend pid, via pg_cancel_backend on a separate short-lived connection.
+// The side channel deliberately bypasses the pool: a pool exhausted by long
+// statements must still be able to cancel them. Returns the server's answer
+// (false: no such backend, or it could not be signalled).
+func (c *Client) CancelBackend(ctx context.Context, pid uint32) (bool, error) {
+	// The pool's parsed connection config, not c.url: the URL may carry
+	// pool-only parameters (pool_max_conns, …) that a plain connection would
+	// send to the server as unknown runtime settings.
+	conn, err := pgx.ConnectConfig(ctx, c.pool.Config().ConnConfig.Copy())
+	if err != nil {
+		return false, fmt.Errorf("cancel side connection: %w", err)
+	}
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		conn.Close(closeCtx) //nolint
+	}()
+	var ok bool
+	if err := conn.QueryRow(ctx, "SELECT pg_cancel_backend($1)", int32(pid)).Scan(&ok); err != nil {
+		return false, err
+	}
+	return ok, nil
+}
+
 // QueryRow executes a query returning a single row.
 func (c *Client) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	return c.pool.QueryRow(ctx, sql, args...)

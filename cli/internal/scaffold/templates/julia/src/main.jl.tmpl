@@ -1,0 +1,22 @@
+# {{.Name}} — connects to Nucleus (or any PostgreSQL) and runs a query.
+#
+# NeutronJulia is a database client: there is no HTTP server in the Julia SDK.
+
+using NeutronJulia
+
+url = get(ENV, "NEUTRON_DATABASE_URL", "postgres://localhost:5432/{{.Name}}")
+
+client = try
+    NeutronJulia.connect(url)
+catch err
+    println(stderr, "could not connect to the database (set NEUTRON_DATABASE_URL): ", sprint(showerror, err))
+    exit(1)
+end
+
+try
+    row = query_one(sql(client), "SELECT 1 AS ok")
+    println("connected: SELECT 1 returned ", row.ok)
+    println("nucleus: ", client.features.is_nucleus ? "yes" : "no (plain PostgreSQL)")
+finally
+    close(client)
+end

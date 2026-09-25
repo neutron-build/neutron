@@ -32,11 +32,15 @@ defmodule Nucleus.Models.Vector do
   def create_collection(client, name, dimension, metric \\ :cosine) do
     with :ok <- Nucleus.Client.require_nucleus(client, "Vector.create_collection"),
          :ok <- validate_identifier(name) do
+      # The engine refuses an HNSW index unless the table has a single-column
+      # integer PRIMARY KEY, so `rid` is that key; the caller's `id` stays UNIQUE.
       create_sql =
-        "CREATE TABLE IF NOT EXISTS #{name} (id TEXT PRIMARY KEY, embedding VECTOR(#{dimension}), metadata JSONB DEFAULT '{}')"
+        "CREATE TABLE IF NOT EXISTS #{name} (rid BIGSERIAL PRIMARY KEY, id TEXT NOT NULL UNIQUE, embedding VECTOR(#{dimension}), metadata JSONB DEFAULT '{}')"
 
+      # The index name is unchanged from earlier releases, so re-calling this on
+      # a collection created by one is a no-op rather than a second index.
       index_sql =
-        "CREATE INDEX IF NOT EXISTS idx_#{name}_embedding ON #{name} USING VECTOR (embedding) WITH (metric = '#{metric_string(metric)}')"
+        "CREATE INDEX IF NOT EXISTS idx_#{name}_embedding ON #{name} USING HNSW (embedding) WITH (metric = '#{metric_string(metric)}')"
 
       with {:ok, _} <- Nucleus.Client.query(client, create_sql),
            {:ok, _} <- Nucleus.Client.query(client, index_sql) do

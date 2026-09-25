@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net"
 	"os"
 
 	"{{.Module}}/internal/handler"
@@ -11,9 +12,14 @@ import (
 )
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	var level slog.Level // info unless NEUTRON_LOG_LEVEL says otherwise
+	_ = level.UnmarshalText([]byte(os.Getenv("NEUTRON_LOG_LEVEL")))
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 
-	dbURL := os.Getenv("DATABASE_URL")
+	dbURL := os.Getenv("NEUTRON_DATABASE_URL")
+	if dbURL == "" {
+		dbURL = os.Getenv("DATABASE_URL")
+	}
 	if dbURL == "" {
 		dbURL = "postgres://localhost:5432/{{.Name}}"
 	}
@@ -27,16 +33,21 @@ func main() {
 	app := neutron.New(
 		neutron.WithLogger(logger),
 		neutron.WithLifecycle(db.LifecycleHook()),
+		neutron.WithNucleusChecker(db),
+		// FRAMEWORK_CONTRACT §5 order, outermost first.
+		neutron.WithMiddleware(neutron.RequestID(), neutron.Logger(logger), neutron.Recover()),
 	)
 
-	app.Use(neutron.Logger(logger), neutron.Recover(), neutron.RequestID())
+	handler.Register(app.Router())
 
-	handler.Register(app)
-
-	port := os.Getenv("PORT")
+	// FRAMEWORK_CONTRACT §6: listen on NEUTRON_HOST:NEUTRON_PORT, default :8080.
+	// GET /health is built in.
+	port := os.Getenv("NEUTRON_PORT")
 	if port == "" {
-		port = "{{.Port}}"
+		port = "8080"
 	}
-	logger.Info("starting server", "port", port)
-	app.Listen(":" + port)
+	if err := app.Run(net.JoinHostPort(os.Getenv("NEUTRON_HOST"), port)); err != nil {
+		logger.Error("server stopped", "error", err)
+		os.Exit(1)
+	}
 }

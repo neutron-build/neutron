@@ -1,0 +1,33 @@
+# {{.Name}}
+
+A Neutron Python service (Starlette + Pydantic).
+
+## Getting started
+
+```sh
+{{range .NextSteps}}{{.}}
+{{end}}```
+
+`neutron dev` runs the SDK's dev server (`python -m neutron dev app.main:app`)
+with auto-reload, using `.venv/bin/python` when it exists.
+
+The SDK (`{{.SDK.Name}}`) is installed from the Neutron repository
+(`{{.SDK.Source}}`, subdirectory `{{.SDK.Subdir}}`); it is not published on
+PyPI, where `neutron` is an unrelated package.
+
+## Endpoints
+
+- `GET /api/hello` — sample route in `app/main.py`
+- `GET /health` — built in: `{"status", "nucleus", "version"}`
+- `GET /openapi.json`, `GET /docs` — built in
+
+## Configuration
+
+Read from the environment (`.env` lists them; nothing loads it automatically):
+
+| Variable | Default |
+|---|---|
+| `NEUTRON_HOST` | `127.0.0.1` under `neutron dev`, else `0.0.0.0` |
+| `NEUTRON_PORT` | `8000` |
+| `NEUTRON_DATABASE_URL` | unset — `/health` reports `"nucleus": "unconfigured"` until you connect one |
+| `NEUTRON_LOG_LEVEL` | `info` |

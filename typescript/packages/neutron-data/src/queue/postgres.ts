@@ -1,10 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
-import cronParser from "cron-parser";
-
-const { parseExpression } = cronParser;
 import type { Job, JobHandler, QueueDriver, ScheduleOptions } from "./index.js";
 import { lazyImport } from "../internal/lazy-import.js";
+import { parseCron } from "./cron.js";
 
 /**
  * Structural slice of the postgres.js client (and its transaction handle)
@@ -97,7 +95,7 @@ const CREATE_SCHEDULES = `CREATE TABLE IF NOT EXISTS neutron_schedules (
 )`;
 
 function nextCronDate(pattern: string, from: Date): Date {
-  return parseExpression(pattern, { currentDate: from }).next().toDate();
+  return parseCron(pattern).next(from);
 }
 
 function errorMessage(error: unknown): string {

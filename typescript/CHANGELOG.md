@@ -4,6 +4,52 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **An action or loader returning `Response.json(...)` was served as 200 `{}`
+  by `neutron-ts start`.** `@hono/node-server` replaces `globalThis.Response`;
+  `Response.json()` still returns a native instance, which failed the
+  framework's `instanceof Response` checks and was treated as data.
+  `isResponse()` now recognizes both, and every loader/action/middleware
+  check uses it. Dev now also serves a Response *returned* from a loader
+  directly, as production always has.
+- **`neutron-ts start` opened a second listener**: Vite's HMR WebSocket on a
+  random port on all interfaces. The production SSR runtime now runs with
+  `hmr: false, ws: false`; only the configured port listens.
+- **`neutron-ts dev` dropped in-flight requests on SIGTERM** (exit 143).
+  Dev now drains like `start` (FRAMEWORK_CONTRACT.md §8): stop accepting,
+  finish in-flight requests (bounded at 30s), close Vite, exit 0. A second
+  SIGTERM/SIGINT exits immediately, in `start` too.
+- **`neutron-ts dev` answered 404 for `GET /health`.** It now serves the same
+  §7 body and yields to an app-defined `/health` route, as `start` does.
+- **`neutron-ts dev` ignored `server.openapi`.** `GET /openapi.json` fell
+  through to Vite's index.html (200 `text/html`). With `server.openapi`
+  configured, dev now serves `/openapi.json` and `/docs` with the same
+  document and content types as `start` (FRAMEWORK_CONTRACT.md §4), and
+  yields to an app-defined route at either path. Unconfigured, dev is
+  unchanged.
+- **`@neutron-build/auth` read a Response from another constructor as
+  session data.** Its four `instanceof Response` guards missed native
+  Responses under `@hono/node-server` (and cross-realm ones); a Better Auth
+  resolver returning one had its `Set-Cookie` forwarded. The guards now use
+  the same brand check as core's `isResponse()`, kept local because every
+  core in auth's `^0.2.0` range ships the `instanceof`-only version.
+- **The `app` and `full` templates' settings page never showed its saved
+  state.** Its action returned `Response.json(...)`, which is sent as the
+  HTTP response, so the page showed raw JSON instead of `actionData`. It now
+  returns a plain object, and every template's `AGENTS.md` states the rule:
+  plain object → `props.actionData`; a Response → sent as the response.
+
+### Changed
+
+- **`dev` and `start` read `NEUTRON_PORT` / `NEUTRON_HOST`**
+  (FRAMEWORK_CONTRACT.md §6). Precedence: `--port`/`--host` > env >
+  `neutron.config` `server.port`/`server.host` > default (3000; `start` binds
+  0.0.0.0, `dev` keeps Vite's localhost). An invalid port from a flag or the
+  environment is a startup error. `dev` now also honours `server.port`/`host`
+  from the config, and fails instead of silently moving when an explicitly
+  configured port is taken.
+
 ## [core 0.2.2, cli 0.2.3, create-neutron 0.1.5] - 2026-09-07
 
 ### Fixed

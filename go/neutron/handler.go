@@ -39,9 +39,8 @@ func Register[In, Out any](r *Router, method, pattern string, h HandlerFunc[In, 
 	if inType != nil && inType.Kind() == reflect.Ptr {
 		inType = inType.Elem()
 	}
-	if outType != nil && outType.Kind() == reflect.Ptr {
-		outType = outType.Elem()
-	}
+	// outType keeps its pointer: a nil *T handler result is sent as JSON
+	// null, and the OpenAPI response schema must say so.
 
 	emptyType := reflect.TypeOf(Empty{})
 

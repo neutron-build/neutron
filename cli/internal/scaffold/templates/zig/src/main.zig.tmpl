@@ -1,6 +1,34 @@
 const std = @import("std");
+const neutron = @import("neutron");
+
+const RequestContext = neutron.http_server.RequestContext;
+
+const VERSION = "0.1.0";
+
+// GET /health — FRAMEWORK_CONTRACT §7 body from the SDK. No database is
+// connected yet, so nucleus is "unconfigured".
+fn health(ctx: *RequestContext) anyerror!void {
+    var buf: [128]u8 = undefined;
+    const body = try neutron.app.healthJson(.unconfigured, VERSION, &buf);
+    try ctx.respondJson(200, body);
+}
+
+fn hello(ctx: *RequestContext) anyerror!void {
+    try ctx.respondJson(200, "{\"message\":\"Hello from {{.Name}}\"}");
+}
+
+const routes = [_]neutron.Route{
+    .{ .method = .GET, .path = "/health", .handler = &health, .summary = "Health" },
+    .{ .method = .GET, .path = "/api/hello", .handler = &hello, .summary = "Hello" },
+};
+
+const Routes = neutron.router.Router(&routes);
+// The SDK's default middleware stack applies the FRAMEWORK_CONTRACT §5 order.
+const App = neutron.app.App(Routes, neutron.middleware.default(.{}));
 
 pub fn main() !void {
-    const stdout = std.io.getStdOut().writer();
-    try stdout.print("Hello from {{.Name}}!\n", .{});
+    // NEUTRON_HOST / NEUTRON_PORT (default 0.0.0.0:8080), NEUTRON_DATABASE_URL, ...
+    const cfg = neutron.config.Config.fromEnv("NEUTRON");
+    var app = App.init(std.heap.page_allocator, cfg);
+    try app.run();
 }

@@ -9,14 +9,18 @@
 #     GET  /api/items               200 list (compression / request-id probe)
 #     POST /api/items               422 validation error (RFC 7807 + errors[])
 #     GET  /errors/{bad-request,…}  forced standard §2 errors
+#     GET  /slow                    200 after 1.5s (in-flight request for the §8 drain probe)
 #
 # No DATABASE_URL is set, so `Nucleus.Client` never starts and /health reports
 # `"nucleus": "unconfigured"` — which §7 calls out as "not an error".
 #
-# Listen port comes from PORT (HOST optional), so the runner can pin an
-# ephemeral port.
+# The listen address is the SDK's own: `{Neutron, router: ...}` without
+# `:port`/`:host` reads NEUTRON_HOST / NEUTRON_PORT via `Neutron.Config`
+# (contract §6). The adapter reads no variable of its own — the runner's
+# `config.env` dimension exists to catch an SDK that ignores them, and an
+# adapter-specific PORT would hide exactly that.
 #
-#     PORT=8085 elixir conformance_app.exs
+#     NEUTRON_PORT=8085 elixir conformance_app.exs
 
 # The SDK is a path dependency: this app must test the tree, not a published
 # release. Mix.install compiles it once and caches by lockfile hash.
@@ -61,6 +65,12 @@ defmodule ConformanceRouter do
       {:ok, body} -> validate_item(conn, body)
       _ -> send_error(conn, Error.bad_request("body must be JSON"))
     end
+  end
+
+  # §8 drain probe: a request that is still in flight when SIGTERM arrives.
+  get "/slow" do
+    Process.sleep(1500)
+    json(conn, 200, %{ok: true})
   end
 
   get "/errors/bad-request" do
@@ -109,15 +119,39 @@ defmodule ConformanceRouter do
   end
 end
 
-port = String.to_integer(System.get_env("PORT") || "8085")
-host = System.get_env("HOST") || "127.0.0.1"
+# The server runs the way the SDK documents it: `{Neutron, ...}` as a child in
+# the HOST APPLICATION's supervision tree (Neutron.App moduledoc). That is
+# load-bearing for §8, not ceremony. SIGTERM → `:init.stop/0`, which stops
+# APPLICATIONS in reverse start order — so the tree drains only if it belongs
+# to one. A bare `Supervisor.start_link` in this script (what the adapter used
+# to do) is linked to the script process, which `:init.stop/0` simply kills
+# after the applications are down: the in-flight request is dropped, the
+# process still exits 0, and the shutdown dimension would be measuring the
+# adapter instead of the SDK. A `mix release` app never runs that way.
+defmodule ConformanceApp do
+  use Application
 
-{:ok, _} =
-  Supervisor.start_link(
-    [{Neutron, router: ConformanceRouter, port: port, host: host}],
-    strategy: :one_for_one
+  @impl true
+  def start(_type, _args) do
+    Supervisor.start_link([{Neutron, router: ConformanceRouter}], strategy: :one_for_one)
+  end
+end
+
+:ok =
+  :application.load(
+    {:application, :conformance_app,
+     [
+       description: ~c"Neutron conformance app",
+       vsn: ~c"0.0.0",
+       modules: [ConformanceApp, ConformanceRouter],
+       registered: [],
+       applications: [:kernel, :stdlib, :elixir, :logger, :neutron],
+       mod: {ConformanceApp, []}
+     ]}
   )
 
-# `elixir file.exs` exits when the script ends; the server is a child of a
-# supervisor in this process, so block forever and let the runner kill us.
+{:ok, _} = Application.ensure_all_started(:conformance_app)
+
+# `elixir file.exs` exits when the script ends, so block forever; SIGTERM
+# stops the VM through `:init.stop/0`.
 Process.sleep(:infinity)

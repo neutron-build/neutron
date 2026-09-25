@@ -1,0 +1,34 @@
+# {{.Name}}
+
+A Neutron Zig service. Requires **Zig 0.15.x** (0.15.2): the Neutron Zig SDK
+does not compile on 0.16, which removed std APIs it uses.
+
+## Getting started
+
+```sh
+{{range .NextSteps}}{{.}}
+{{end}}```
+
+`neutron dev` runs `zig build run` with the first Zig 0.15 it finds (`zig` on
+PATH, then Homebrew's `zig@0.15`); the first build downloads the SDK. To build
+without running, use `zig build` from a Zig 0.15.x.
+
+The SDK is the `{{.SDK.Subdir}}/` directory of the Neutron repository, pinned to one
+commit in `build.zig.zon` (the Zig package manager needs a content hash). To
+move to a newer commit: `zig fetch --save=neutron <archive URL of that commit>`.
+
+## Endpoints
+
+- `GET /api/hello` — sample route in `src/main.zig`
+- `GET /health` — `{"status", "nucleus", "version"}` via the SDK's `healthJson`
+
+## Configuration
+
+Read from the environment (`.env` lists them; nothing loads it automatically):
+
+| Variable | Default |
+|---|---|
+| `NEUTRON_HOST` | `0.0.0.0` |
+| `NEUTRON_PORT` | `8080` |
+| `NEUTRON_DATABASE_URL` | unset — `/health` reports `"nucleus": "unconfigured"` |
+| `NEUTRON_LOG_LEVEL` | `info` |

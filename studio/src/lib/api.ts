@@ -4,6 +4,7 @@ import type {
   ColumnDetail, IndexDetail, SavedQuery, FKDetail,
   TableMeta, MutationOutcome, KeyCell, MatchCell, TableFilter, TableSort,
   CommitResponse, PreviewResponse, OutcomeResponse, CommitOperation,
+  CancelQueryResponse, ExplainOutcome, ExplainPlan, ExplainRefusal,
 } from './types'
 import { decodeRows } from './wire'
 
@@ -25,8 +26,10 @@ export class ApiError extends Error {
   /** The rows' relation binding is stale (reconnect or table replaced). */
   binding?: boolean
   currentVersion?: string
+  /** The parsed JSON error body, for endpoints with richer refusals. */
+  body?: Record<string, unknown>
 
-  constructor(status: number, message: string, extra?: { state?: string; auth?: string; conflict?: boolean; missing?: boolean; currentVersion?: string }) {
+  constructor(status: number, message: string, extra?: { state?: string; auth?: string; conflict?: boolean; missing?: boolean; currentVersion?: string; body?: Record<string, unknown> }) {
     super(message)
     this.name = 'ApiError'
     this.status = status
@@ -36,6 +39,7 @@ export class ApiError extends Error {
     this.missing = extra?.missing
     this.binding = extra?.state === undefined ? undefined : extra.state === 'binding'
     this.currentVersion = extra?.currentVersion
+    this.body = extra?.body
   }
 }
 
@@ -134,6 +138,7 @@ async function toApiError(res: Response): Promise<ApiError> {
           conflict: parsed.state === 'conflict',
           missing: parsed.state === 'missing',
           currentVersion: parsed.currentVersion,
+          body: parsed as Record<string, unknown>,
         })
       }
       text = raw
@@ -178,8 +183,35 @@ export const api = {
 
   // --- Query (arbitrary SQL; mutating, so it carries the session token) ---
 
-  query: (sql: string, connectionId: string, params?: unknown[]) =>
-    requestQueryResult('POST', '/query', { sql, connectionId, params }),
+  query: (sql: string, connectionId: string, params?: unknown[], requestId?: string) =>
+    requestQueryResult('POST', '/query', { sql, connectionId, params, requestId }),
+
+  /** Cancel a running editor statement server-side (pg_cancel_backend on
+   *  the backend that runs it). 404 means it already finished. */
+  cancelQuery: (connectionId: string, requestId: string) =>
+    mutationRequest<CancelQueryResponse>('POST', '/query/cancel', { connectionId, requestId }),
+
+  /** EXPLAIN a statement. analyze=false never executes it; analyze=true
+   *  executes it read-only and rolled back unless allowWrites (then writes
+   *  run and are still rolled back). Refusals (422) resolve as ok:false. */
+  explain: async (input: {
+    connectionId: string
+    sql: string
+    params?: unknown[]
+    requestId?: string
+    analyze: boolean
+    allowWrites?: boolean
+  }): Promise<ExplainOutcome> => {
+    try {
+      const plan = await mutationRequest<Omit<ExplainPlan, 'ok'>>('POST', '/query/explain', input)
+      return { ...plan, ok: true }
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 422 && err.body) {
+        return { ...(err.body as Omit<ExplainRefusal, 'ok'>), ok: false }
+      }
+      throw err
+    }
+  },
 
   // --- Schema ---
 

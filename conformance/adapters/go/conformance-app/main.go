@@ -10,17 +10,22 @@
 //	GET  /api/items         → 200 OK list (compression / request-id probe)
 //	POST /api/items         → 422 validation error on bad body (RFC 7807 + errors[])
 //	GET  /errors/bad-request, /errors/unauthorized, … → forced standard errors
+//	GET  /slow              → 200 after 1.5s (in-flight request for the §8 drain probe)
 //
-// Listen address comes from PORT (and HOST), so the runner can pin an ephemeral
-// port. The DefaultStack wires the contract middleware order.
+// The listen address is the SDK's own: Run("") reads NEUTRON_HOST and
+// NEUTRON_PORT (contract §6). The adapter deliberately does not read any
+// variable of its own — the runner's `config.env` dimension exists to catch an
+// SDK that ignores them, and an adapter-specific PORT would hide exactly that.
+// The DefaultStack wires the contract middleware order.
 //
-// Run: PORT=8081 go run .
+// Run: NEUTRON_PORT=8081 go run .
 package main
 
 import (
 	"context"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/neutron-build/neutron/go/neutron"
 )
@@ -87,12 +92,13 @@ func main() {
 		return neutron.Empty{}, neutron.ErrInternal("forced internal error")
 	})
 
-	addr := ":8081"
-	if p := os.Getenv("PORT"); p != "" {
-		host := os.Getenv("HOST")
-		addr = host + ":" + p
-	}
-	if err := app.Run(addr); err != nil {
+	// §8 drain probe: a request that is still in flight when SIGTERM arrives.
+	neutron.Get(r, "/slow", func(ctx context.Context, _ neutron.Empty) (map[string]bool, error) {
+		time.Sleep(1500 * time.Millisecond)
+		return map[string]bool{"ok": true}, nil
+	})
+
+	if err := app.Run(""); err != nil {
 		os.Exit(1)
 	}
 }

@@ -563,7 +563,7 @@ impl Neutron {
                 custom
             } else {
                 Box::pin(async {
-                    tokio::signal::ctrl_c().await.ok();
+                    default_shutdown_signal().await;
                 })
             };
 
@@ -798,7 +798,7 @@ impl Neutron {
         if let Some(signal) = self.custom_shutdown {
             signal.await;
         } else {
-            tokio::signal::ctrl_c().await.ok();
+            default_shutdown_signal().await;
         }
 
         // Run shutdown hooks.
@@ -865,7 +865,7 @@ impl Neutron {
                 custom
             } else {
                 Box::pin(async {
-                    tokio::signal::ctrl_c().await.ok();
+                    default_shutdown_signal().await;
                 })
             };
 
@@ -1080,5 +1080,29 @@ impl Neutron {
 impl Default for Neutron {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Resolves on SIGINT or, on Unix, SIGTERM (FRAMEWORK_CONTRACT §8): process
+/// managers and orchestrators stop services with SIGTERM, not Ctrl-C.
+async fn default_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(_) => {
+                tokio::signal::ctrl_c().await.ok();
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.ok();
     }
 }

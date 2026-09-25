@@ -1,24 +1,27 @@
 #!/usr/bin/env node
 // Neutron cross-SDK contract conformance runner.
 //
-// Boots each available SDK's canonical conformance app on an ephemeral port,
-// waits for /health, runs the language-agnostic contract suite, tears the server
-// down, and prints a PASS/FAIL matrix (dimension × SDK).
+// Boots each available SDK's canonical conformance app on an ephemeral port
+// given only as NEUTRON_HOST/NEUTRON_PORT, waits for /health, runs the
+// language-agnostic contract suite, then boots it again to SIGTERM it mid-
+// request, and prints a PASS/FAIL matrix (dimension × SDK).
 //
 // Usage:
 //   node run.mjs                 # build + boot + test every available SDK
 //   node run.mjs go              # only the named SDK(s)
 //   node run.mjs --no-build      # skip build step (use existing binaries)
-//   node run.mjs --base=URL      # test an already-running server (no boot)
+//   node run.mjs --base=URL      # test an already-running server (no boot;
+//                                # HTTP dimensions only — config.env and
+//                                # shutdown.sigterm need to own the process)
 //
-// Exit code is non-zero if any contract dimension FAILS (skips do not fail).
+// Exit code is non-zero if any contract dimension FAILS, or a skip is
+// unrecorded, expired or stale (see known-skips.json).
 
-import { spawn } from "node:child_process";
 import fs from "node:fs";
-import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { DIMENSIONS, runContract, waitForHealth } from "./contract.mjs";
+import { DIMENSIONS, LIFECYCLE_DIMENSIONS, runContract } from "./contract.mjs";
+import { boot, checkConfigEnv, checkShutdown, spawnNote, stop, waitHealthy } from "./lifecycle.mjs";
 import { SDKS } from "./sdks.mjs";
 
 const CONF_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -56,68 +59,63 @@ function parseArgs(argv) {
   return opts;
 }
 
-function freePort() {
-  return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.unref();
-    srv.on("error", reject);
-    srv.listen(0, "127.0.0.1", () => {
-      const { port } = srv.address();
-      srv.close(() => resolve(port));
-    });
-  });
-}
+// How long an app gets to answer /health after spawn. The first boot of an SDK
+// also pays for compilation where the toolchain compiles on start (Elixir's
+// Mix.install), so this is generous.
+const BOOT_TIMEOUT_MS = 30000;
 
+// Boot → assert → teardown for one SDK. Three dimension groups, two boots:
+//
+//   1. config.env (§6): boot with ONLY NEUTRON_HOST/NEUTRON_PORT addressing
+//      the app. If /health answers there, that same process runs the HTTP
+//      contract (contract.mjs). If it does not, the dimension fails; an SDK
+//      whose descriptor still declares an adapter-specific `portEnv` is then
+//      rebooted with it so the HTTP contract is still measured, and one that
+//      does not is broken — nothing else can be measured.
+//   2. the HTTP contract, against the process from step 1.
+//   3. shutdown.sigterm (§8): a FRESH boot, so the only connections open are
+//      the probe's own — idle keep-alives left by step 2 would otherwise make
+//      the drain depend on the runner's connection pool, not the SDK.
 async function bootAndTest(sdk) {
-  const port = await freePort();
-  const base = `http://127.0.0.1:${port}`;
-  const { command, args } = sdk.cmd();
-  const env = { ...process.env, [sdk.portEnv]: String(port) };
-  if (sdk.hostEnv) env[sdk.hostEnv] = "127.0.0.1";
-
-  const child = spawn(command, args, { env, stdio: ["ignore", "ignore", "inherit"] });
-  let exited = false;
-  // A spawn failure — a missing binary, a non-executable file — arrives on the
-  // child's 'error' event, NOT as a throw from spawn(). Without this listener
-  // it is an unhandled error that kills the runner outright: no matrix, no
-  // results for the SDKs that did run, just a stack trace. Hit for real after
-  // `cargo clean` removed the Rust conformance binary and the runner was asked
-  // to spawn it with --no-build. Captured here so it becomes an ordinary
-  // `broken` row like any other SDK that could not be exercised.
-  let spawnError = null;
-  child.on("error", (e) => {
-    spawnError = e;
-    exited = true;
-  });
-  child.on("exit", () => {
-    exited = true;
-  });
-
+  const results = [];
+  let mode = "contract";
+  let h = await boot(sdk, mode);
   try {
-    const ready = await waitForHealth(base, 30000);
-    if (spawnError) {
-      return {
-        booted: false,
-        results: [],
-        note:
-          spawnError.code === "ENOENT"
-            ? `could not start "${command}" — no such file. Was it built? (this run used --no-build)`
-            : `could not start "${command}": ${spawnError.message}`,
-      };
+    const env = await checkConfigEnv(h, BOOT_TIMEOUT_MS);
+    results.push(env);
+    if (env.status !== "pass") {
+      const note = spawnNote(h);
+      await stop(h);
+      if (note) return { booted: false, results: [], note };
+      if (!sdk.portEnv) {
+        return {
+          booted: false,
+          results,
+          note: `the app never listened on NEUTRON_PORT and its descriptor declares no adapter port variable, so nothing else could be measured`,
+        };
+      }
+      mode = "adapter";
+      h = await boot(sdk, mode);
+      if (!(await waitHealthy(h, BOOT_TIMEOUT_MS))) {
+        return { booted: false, results, note: spawnNote(h) || "server did not become healthy" };
+      }
     }
-    if (!ready || exited) {
-      return { booted: false, results: [], note: "server did not become healthy" };
-    }
-    const results = await runContract(base);
-    return { booted: true, results, note: "" };
+    results.push(...(await runContract(h.base)));
   } finally {
-    if (!exited) {
-      child.kill("SIGTERM");
-      // give graceful shutdown a moment, then SIGKILL.
-      await new Promise((r) => setTimeout(r, 1500));
-      if (!exited) child.kill("SIGKILL");
-    }
+    await stop(h);
   }
+
+  const s = await boot(sdk, mode);
+  try {
+    results.push(await checkShutdown(s, BOOT_TIMEOUT_MS));
+  } finally {
+    await stop(s);
+  }
+  return {
+    booted: true,
+    results,
+    note: mode === "adapter" ? `booted via adapter variable ${sdk.portEnv} after config.env failed` : "",
+  };
 }
 
 function glyph(status) {
@@ -136,9 +134,10 @@ function printMatrix(report) {
   for (const dim of DIMENSIONS) {
     let row = dim.padEnd(width) + " | ";
     for (const r of report) {
-      const out = r.absent || r.broken;
-      const found = out ? null : r.results.find((x) => x.dim === dim);
-      const cell = out ? "n/a" : found ? glyph(found.status) : "-";
+      // A broken SDK can still carry a result (config.env fails, and that is
+      // WHY nothing else could be measured); show it rather than hide it.
+      const found = r.absent ? null : r.results.find((x) => x.dim === dim);
+      const cell = found ? glyph(found.status) : r.absent || r.broken ? "n/a" : "-";
       row += cell.padEnd(col) + "| ";
     }
     console.log(row);
@@ -151,6 +150,7 @@ function printMatrix(report) {
     if (r.absent || r.broken) {
       const kind = r.broken ? "BROKEN" : "ABSENT";
       console.log(`[${r.name}] ${kind} — ${r.absent || r.broken}`);
+      for (const x of r.results) console.log(`   ${glyph(x.status)} ${x.dim}: ${x.detail}`);
       continue;
     }
     const pass = r.results.filter((x) => x.status === "pass").length;
@@ -228,12 +228,30 @@ async function main() {
       console.log(`[${sdk.name}] booting…`);
       const r = await bootAndTest(sdk);
       if (!r.booted) {
-        report.push({ name: sdk.name, broken: r.note, results: [] });
+        report.push({ name: sdk.name, broken: r.note, results: r.results });
       } else {
         report.push({ name: sdk.name, results: r.results, note: r.note });
       }
     } catch (e) {
       report.push({ name: sdk.name, broken: String(e.message || e), results: [] });
+    }
+  }
+
+  // A lifecycle dimension that FAILS for an SDK recorded in known-skips.json is
+  // a known gap: the SDK genuinely does not do it yet (it is not the adapter
+  // hiding it), and the entry carries the reason and the expiry. It is shown
+  // as a skip and then held to the same three rules as every other skip —
+  // unrecorded fails, expired fails, and an entry whose dimension now passes
+  // fails. Only lifecycle dimensions get this: for them the probe can only
+  // observe the gap by running into it, whereas an HTTP dimension that cannot
+  // be exercised already reports `skip` on its own.
+  const known = loadKnownSkips();
+  for (const r of report) {
+    for (const x of r.results) {
+      if (x.status === "fail" && LIFECYCLE_DIMENSIONS.includes(x.dim) && known[r.name]?.[x.dim]) {
+        x.status = "skip";
+        x.detail = `known gap (known-skips.json) — observed: ${x.detail}`;
+      }
     }
   }
 
@@ -244,7 +262,6 @@ async function main() {
   const absent = report.filter((r) => r.absent);
 
   // Skip accounting, on the same three rules as known-drift.json.
-  const known = loadKnownSkips();
   const today = new Date().toISOString().slice(0, 10);
   const unrecordedSkips = [];
   const expiredSkips = [];

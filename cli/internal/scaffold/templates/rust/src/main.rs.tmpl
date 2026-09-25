@@ -1,15 +1,41 @@
+use neutron::health::HealthCheck;
 use neutron::prelude::*;
+use serde::Serialize;
+use tracing_subscriber::EnvFilter;
 
-mod routes;
+#[derive(Serialize)]
+struct Hello {
+    message: &'static str,
+}
+
+async fn hello() -> Json<Hello> {
+    Json(Hello {
+        message: "Hello from {{.Name}}",
+    })
+}
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let app = App::new()
-        .title("{{.Name}}")
-        .version("0.1.0");
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // NEUTRON_HOST / NEUTRON_PORT (default 0.0.0.0:8080), NEUTRON_DATABASE_URL,
+    // NEUTRON_LOG_LEVEL — FRAMEWORK_CONTRACT §6.
+    let config = Config::from_env();
 
-    let app = routes::register(app);
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new(&config.log_level))
+        .init();
 
-    app.listen("0.0.0.0:{{.Port}}").await?;
-    Ok(())
+    let router = Router::new()
+        // FRAMEWORK_CONTRACT §5 order, outermost first.
+        .middleware(RequestId::new())
+        .middleware(Logger::new())
+        .middleware(CatchPanic::new())
+        // The SDK's contract health handler: {status, nucleus, version}. No
+        // database probe is registered yet, so nucleus is "unconfigured".
+        .get("/health", HealthCheck::new().contract(None, env!("CARGO_PKG_VERSION")))
+        .get("/api/hello", hello);
+
+    Neutron::new()
+        .router(router)
+        .listen(config.socket_addr())
+        .await
 }

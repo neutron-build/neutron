@@ -252,7 +252,7 @@ var oauthHTTPClient = &http.Client{Timeout: 10 * time.Second}
 func (p *OAuthProvider) validate() error {
 	if p.UserInfoURL == "" {
 		return fmt.Errorf(
-			"provider %q has no UserInfoURL: a verified userinfo endpoint is required " +
+			"provider %q has no UserInfoURL: a verified userinfo endpoint is required "+
 				"to establish user identity (token-derived identities are not)",
 			p.ProviderName,
 		)

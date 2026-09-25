@@ -26,6 +26,7 @@ import {
 import { resolveHeadDocument } from "./head.js";
 import { runMiddlewareChain } from "./middleware.js";
 import { isProblemError } from "./problem.js";
+import { isResponse } from "./response.js";
 import { withRouterProviders, type CreateElement } from "./router-providers.js";
 import { renderToString } from "preact-render-to-string";
 import type {
@@ -821,12 +822,12 @@ export async function renderAppRoute(
       if (handler) {
         try {
           const result = await handler({ request, params: match.params, context });
-          if (result instanceof Response) return result;
+          if (isResponse(result)) return result;
         } catch (error) {
           if (isProblemError(error)) {
             return error.toResponse(new URL(request.url).pathname);
           }
-          if (error instanceof Response) return error;
+          if (isResponse(error)) return error;
           throw error;
         }
       }
@@ -851,7 +852,7 @@ export async function renderAppRoute(
 
       try {
         const result = await pageModule.action(actionArgs);
-        if (result instanceof Response) {
+        if (isResponse(result)) {
           const actionEndedAt = Date.now();
           emitHook(hooks?.onActionEnd, {
             requestId: requestTrace.requestId,
@@ -888,7 +889,7 @@ export async function renderAppRoute(
         if (isProblemError(error)) {
           error = error.toResponse(new URL(request.url).pathname);
         }
-        if (error instanceof Response) {
+        if (isResponse(error)) {
           const actionEndedAt = Date.now();
           emitHook(hooks?.onActionEnd, {
             requestId: requestTrace.requestId,
@@ -1007,7 +1008,7 @@ export async function renderAppRoute(
         // streamed body) — not only throw one. Serve it directly instead of
         // treating it as component data. Matches resource-route + action
         // semantics; a plain object is still normal loader data.
-        if (data instanceof Response) {
+        if (isResponse(data)) {
           return { routeId: route.id, data: undefined, response: data };
         }
         if (loaderCacheKey && canWriteLoaderCache) {
@@ -1051,7 +1052,7 @@ export async function renderAppRoute(
         return { routeId: route.id, data };
       } catch (error) {
         const loaderEndedAt = Date.now();
-        if (error instanceof Response) {
+        if (isResponse(error)) {
           emitHook(hooks?.onLoaderEnd, {
             requestId: requestTrace.requestId,
             method: requestTrace.method,
@@ -1108,7 +1109,7 @@ export async function renderAppRoute(
         if (isProblemError(result.error)) {
           return result.error.toResponse(new URL(request.url).pathname);
         }
-        if (result.error instanceof Response) {
+        if (isResponse(result.error)) {
           return result.error;
         }
         const errorRoute = allRoutes.find(r => r.id === result.routeId);

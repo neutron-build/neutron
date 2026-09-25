@@ -2,11 +2,13 @@
 
 Proves that every Neutron language SDK implements **identical, observable behavior**
 per [`FRAMEWORK_CONTRACT.md`](../FRAMEWORK_CONTRACT.md). A single language-agnostic
-runner boots each SDK's canonical "conformance app" on an ephemeral port, asserts
-the contract over HTTP, tears the server down, and prints a PASS/FAIL matrix.
+runner boots each SDK's canonical "conformance app" on an ephemeral port given
+only as `NEUTRON_HOST`/`NEUTRON_PORT`, asserts the contract over HTTP, boots it
+again to send it SIGTERM mid-request, and prints a PASS/FAIL matrix.
 
-The suite is **transport-only**: it speaks HTTP and inspects responses, so the
-same assertions run unchanged against any SDK regardless of implementation language.
+The suite is **language-agnostic**: it speaks HTTP, sets environment variables
+and sends signals, so the same assertions run unchanged against any SDK
+regardless of implementation language.
 
 ## Quick start
 
@@ -15,16 +17,17 @@ cd conformance
 node runner/run.mjs              # build + boot + test every available SDK
 node runner/run.mjs --no-build   # reuse already-built binaries
 node runner/run.mjs go rust      # only the named SDK(s)
-node runner/run.mjs --base=http://127.0.0.1:8084   # test an already-running server
+node runner/run.mjs --base=http://127.0.0.1:8084   # test an already-running server (HTTP dimensions only)
 ```
 
-The runner exits non-zero if any contract dimension **fails** (skips do not fail),
-so it is CI-usable as-is.
+The runner exits non-zero if any contract dimension **fails**, or a skip is
+unrecorded, expired or stale in `known-skips.json`, so it is CI-usable as-is.
 
 Requires Node ≥ 18 (uses built-in `fetch`/`zlib`). Per-SDK toolchains:
 Go (`go`), Rust (`cargo`), Python (`python3` + `starlette pydantic uvicorn`),
-TypeScript (built `@neutron-build/core` — run `pnpm --filter @neutron-build/core
-build` inside `typescript/` first; the SDK auto-skips until then), Elixir
+TypeScript (built `@neutron-build/core` and `@neutron-build/cli` — run
+`pnpm --filter @neutron-build/core --filter @neutron-build/cli build` inside
+`typescript/` first; the SDK is reported absent until then), Elixir
 (`elixir` + `mix`), Zig (0.15.x pinned by `zig/build.zig.zon` — 0.16 cannot
 compile the SDK; the runner prefers `/opt/homebrew/opt/zig@0.15/bin/zig`,
 like `live/executors/zig/run.sh`).
@@ -35,7 +38,8 @@ like `live/executors/zig/run.sh`).
 conformance/
   runner/
     run.mjs        # orchestrator: free-port → boot → wait /health → assert → teardown → matrix
-    contract.mjs   # language-agnostic assertions (one fn per contract dimension)
+    contract.mjs   # language-agnostic HTTP assertions (one fn per contract dimension)
+    lifecycle.mjs  # process-level dimensions: boot env (§6) and SIGTERM drain + exit (§8)
     sdks.mjs       # per-SDK boot descriptors (build cmd, start cmd, availability)
     validate-ir.mjs# re-parses FRAMEWORK_CONTRACT.md, fails if contract-ir.json disagrees
   contract-ir.json # machine-readable single source for every constant the runner asserts
@@ -44,7 +48,7 @@ conformance/
     go/conformance-app/      # canonical no-DB Neutron Go app (own go.mod, replace → ../../../../go)
     rust/                    # → rust/crates/neutron/examples/conformance_app.rs (registered example)
     python/conformance_app.py# canonical no-DB Neutron Python app (imports in-repo SDK)
-    typescript/              # boots the built SDK headless (conformance_app.mjs + routes/) — see its README.md
+    typescript/              # `neutron-ts start` in this dir (neutron.config.mjs + routes/) — see its README.md
     elixir/conformance_app.exs
     zig/                     # builds the in-repo SDK as a standalone app (build.zig + src/main.zig)
 ```
@@ -59,6 +63,12 @@ Each conformance app is **database-free** (the `nucleus` health field reports th
 | `GET /api/items` | 200 list — compression / request-id probe |
 | `POST /api/items` | 422 validation error on a bad body (§2 validation) |
 | `GET /errors/{bad-request,unauthorized,forbidden,not-found,conflict,rate-limited,internal}` | forced standard §2 errors |
+| `GET /slow` | 200 after 1.5s — the request in flight when `shutdown.sigterm` signals the server (§8) |
+
+Each app takes its listen address from the SDK's own `NEUTRON_HOST` /
+`NEUTRON_PORT` handling and reads no addressing variable of its own. Until
+2026-09-23 every adapter pinned its port with `PORT` (or passed it explicitly),
+which is how Go and TypeScript ignoring `NEUTRON_PORT` stayed invisible.
 
 ## Contract dimensions asserted
 
@@ -76,6 +86,19 @@ Each conformance app is **database-free** (the `nucleus` health field reports th
 | `mw.requestid` | §5 | `x-request-id` response header present (RequestID middleware ran) |
 | `mw.cors` | §5 | preflight `OPTIONS` with `Origin` yields `Access-Control-Allow-Origin` |
 | `mw.compression` | §5 | `Accept-Encoding: gzip` → `Content-Encoding` + `Vary: Accept-Encoding` |
+| `config.env` | §6 | booted with **only** `NEUTRON_HOST`/`NEUTRON_PORT` addressing it (`PORT`/`HOST` removed from the environment), the app answers `GET /health` on that port |
+| `shutdown.sigterm` | §8 | SIGTERM to the server process while `GET /slow` is in flight: that request completes 200, a new connection is refused (or answered 503), and the process exits 0 within the drain + 5s |
+
+`config.env` and `shutdown.sigterm` are **lifecycle** dimensions
+(`runner/lifecycle.mjs`): they own the process rather than talk to one, so
+`--base=URL` cannot run them. The server is started directly — a built binary,
+the interpreter, or `neutron-ts`'s bin script, never a wrapper such as `go run`
+or `npx` that would take the signal in the SDK's place — and the shutdown probe
+gets a fresh boot so the only open connections are its own. A connection the
+kernel queued but the app never served (reset at exit — the Zig SDK's
+sequential accept loop) counts as refused. A lifecycle FAIL recorded in
+`known-skips.json` is reported as a known-gap `skip`, held to the same
+unrecorded / expired / stale rules.
 
 ### A note on §1 (feature detection) and §3 (KV/wire functions)
 
@@ -87,12 +110,13 @@ contract issue (KV comma-split) is documented below (resolved).
 
 ## Current PASS/FAIL matrix
 
-Produced by `node runner/run.mjs` on this machine (go1.26.6, cargo 1.97.0,
-Python 3.14.7, Node 22.23.2, Zig 0.15.2, 2026-08-21). Deterministic across runs.
+Produced by `node runner/run.mjs --strict` on this machine (go1.26.6, cargo
+1.98.0, Python 3.14.7, Node 22.23.2, Elixir 1.20.3 / OTP 29, Zig 0.15.2,
+2026-09-23).
 
 ```
 Dimension            | go      | rust    | python  | ts      | elixir  | zig     
----------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
 health.shape         | PASS    | PASS    | PASS    | PASS    | PASS    | PASS    | 
 health.types         | PASS    | PASS    | PASS    | PASS    | PASS    | PASS    | 
 error.rfc7807        | PASS    | PASS    | PASS    | PASS    | PASS    | PASS    | 
@@ -105,14 +129,17 @@ openapi.31           | PASS    | PASS    | PASS    | PASS    | PASS    | PASS   
 mw.requestid         | PASS    | PASS    | PASS    | PASS    | PASS    | PASS    | 
 mw.cors              | PASS    | PASS    | PASS    | PASS    | PASS    | PASS    | 
 mw.compression       | PASS    | PASS    | PASS    | PASS    | PASS    | PASS    | 
----------------------------------------------------------------------------------------
+config.env           | PASS    | PASS    | PASS    | PASS    | PASS    | PASS    | 
+shutdown.sigterm     | PASS    | skip    | PASS    | PASS    | PASS    | PASS    | 
+---------------------------------------------------------------------------------
 
-[go]     12 pass, 0 fail, 0 skip
-[rust]   12 pass, 0 fail, 0 skip
-[python] 12 pass, 0 fail, 0 skip
-[ts]     12 pass, 0 fail, 0 skip
-[elixir] 12 pass, 0 fail, 0 skip
-[zig]    12 pass, 0 fail, 0 skip
+[go] 14 pass, 0 fail, 0 skip
+[rust] 13 pass, 0 fail, 1 skip
+   skip shutdown.sigterm: known gap (known-skips.json) — observed: in-flight /slow was not drained: ECONNRESET; died by signal SIGTERM instead of exiting (SIGTERM not caught)
+[python] 14 pass, 0 fail, 0 skip
+[ts] 14 pass, 0 fail, 0 skip
+[elixir] 14 pass, 0 fail, 0 skip
+[zig] 14 pass, 0 fail, 0 skip
 ```
 
 **SDKs booted in this environment:** all six. The TypeScript SDK is a web/SSR
@@ -211,8 +238,39 @@ inspection.
 
 Contract §6 specifies `{PREFIX}_HOST` / `{PREFIX}_PORT`. The Rust `Config::from_env`
 used to read bare `HOST` / `PORT`; it now reads `NEUTRON_HOST` / `NEUTRON_PORT`
-(`rust/crates/neutron/src/config.rs`, commit `944b54ac`). The runner pins the
-conformance app's port via `NEUTRON_PORT`.
+(`rust/crates/neutron/src/config.rs`, commit `944b54ac`). Since 2026-09-23 the
+`config.env` dimension asserts this for every SDK (finding 6).
+
+### 6. §6 configuration and §8 shutdown were asserted nowhere — RESOLVED, one SDK gap recorded
+
+Measured 2026-09-23: the suite was green while Go (`Run("")`) and TypeScript
+(`neutron-ts dev/start`) ignored `NEUTRON_PORT`, and Python drained on SIGTERM
+but never exited. None of it was visible, for two reasons in the harness:
+every adapter pinned its port with a variable of its own (`PORT` for Go,
+Python, TS and Elixir), and nothing ever signalled a server and looked at the
+result — the runner's teardown sent SIGTERM and SIGKILLed whatever was left
+1.5s later. The SDK fixes landed first (Go `ffe4d3a0`, Python `7b6a1205`, TS
+`07ae4b2f`); the `config.env` and `shutdown.sigterm` dimensions now pin them.
+
+Each dimension was shown to catch its bug before it was trusted: with Go's
+`listenAddr` stubbed back to "use the argument as given", `config.env` FAILs
+(and nothing else can be measured, since the app never listens where it was
+told); with Python's `app.py`/`openapi.py` checked out at `7b6a1205~1`,
+`shutdown.sigterm` FAILs with "still running 6.5s after SIGTERM"; with
+`neutron-ts`'s env lookup or `startServer`'s signal handler removed from the
+built dist, the TS row FAILs the matching dimension.
+
+Adding them surfaced two more things:
+
+- **Rust does not catch SIGTERM** — a real §8 MUST violation. `Neutron::listen`
+  waits on `tokio::signal::ctrl_c()` (SIGINT) only, so SIGTERM kills the
+  process mid-request. Recorded in `known-skips.json` with the fix and an
+  expiry; the runner fails the entry the day the dimension passes.
+- **The Elixir adapter dropped in-flight requests** — an adapter artifact, not an
+  SDK gap. It ran `{Neutron, ...}` under a bare `Supervisor.start_link` in the
+  script, which `:init.stop/0` kills once the applications are down. The SDK
+  documents running it in the host application's tree; the adapter now does,
+  and the drain passes.
 
 ---
 
@@ -223,7 +281,10 @@ conformance app's port via `NEUTRON_PORT`.
   `runner/validate-ir.mjs` must still pass, so FRAMEWORK_CONTRACT.md and the IR
   have to agree first.
 - **Add an SDK:** append a descriptor to `runner/sdks.mjs` with `build()`, `cmd()`
-  (returns `{command, args}` and reads its port from the `portEnv` var), and
-  `available()` (returns `null` if bootable, else a reason string). Add a canonical
-  no-DB conformance app under `adapters/<lang>/` wiring the endpoints in the table
-  above.
+  (returns `{command, args[, cwd]}` that starts the SDK's server process itself —
+  no wrapper — listening where the SDK's own `NEUTRON_HOST`/`NEUTRON_PORT`
+  handling says), and `available()` (returns `null` if bootable, else a reason
+  string). An SDK that does not read `NEUTRON_PORT` yet may declare an adapter
+  `portEnv`; it is used only after `config.env` has failed, and that failure
+  goes in `known-skips.json`. Add a canonical no-DB conformance app under
+  `adapters/<lang>/` wiring the endpoints in the table above, `/slow` included.

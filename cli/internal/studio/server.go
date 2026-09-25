@@ -43,6 +43,9 @@ type Server struct {
 	// above the default clamp to the default — configurable downward only).
 	maxCommitOps int
 	maxMutBody   int64
+	// queries registers running SQL editor statements by request ID for
+	// server-side cancellation (S04, see sqlexec.go). Lazily initialized.
+	queries *queryRegistry
 }
 
 // NewServer creates and configures the Studio server on the given port.
@@ -115,6 +118,8 @@ func (s *Server) routes() (*http.ServeMux, error) {
 	mux.HandleFunc("/api/connections/test", s.handleTest)
 	mux.HandleFunc("/api/connections/", s.handleConnection) // /:id and /:id/connect
 	mux.HandleFunc("/api/query", s.handleQuery)
+	mux.HandleFunc("/api/query/cancel", s.handleQueryCancel)
+	mux.HandleFunc("/api/query/explain", s.handleQueryExplain)
 	mux.HandleFunc("/api/schema", s.handleSchema)
 	mux.HandleFunc("/api/features", s.handleFeatures)
 	mux.HandleFunc("/api/table", s.handleTable)

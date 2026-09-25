@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-neutron = "{{.NeutronVer}}"
-tokio = { version = "1", features = ["full"] }
+# The Neutron Rust SDK, from the Neutron repository. It is not on crates.io,
+# where `neutron` is an unrelated crate.
+{{.SDK.Name}} = { git = "{{.SDK.Source}}" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

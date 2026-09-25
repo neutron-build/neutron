@@ -10,6 +10,7 @@
 //!     GET  /api/items               200 list (compression / request-id probe)
 //!     POST /api/items               422 validation error (RFC 7807 + errors[])
 //!     GET  /errors/{bad-request,…}  forced standard §2 errors
+//!     GET  /slow                    200 after 1.5s (in-flight request for the §8 drain probe)
 //!
 //! No NEUTRON_DATABASE_URL is set, so /health reports
 //! `"nucleus": "unconfigured"` — which §7 calls out as "not an error".
@@ -133,6 +134,12 @@ fn forcedError(ctx: *RequestContext) anyerror!void {
     try app_error.sendProblem(ctx, err);
 }
 
+// §8 drain probe: a request that is still in flight when SIGTERM arrives.
+fn slow(ctx: *RequestContext) anyerror!void {
+    std.Thread.sleep(1500 * std.time.ns_per_ms);
+    try ctx.respondJson(200, "{\"ok\":true}");
+}
+
 // ── App wiring ──────────────────────────────────────────────────────────────
 
 const routes = [_]neutron.Route{
@@ -142,6 +149,7 @@ const routes = [_]neutron.Route{
     .{ .method = .GET, .path = "/api/items", .handler = &listItems, .summary = "List items" },
     .{ .method = .POST, .path = "/api/items", .handler = &createItem, .summary = "Create item" },
     .{ .method = .GET, .path = "/errors/{code}", .handler = &forcedError, .summary = "Forced standard error" },
+    .{ .method = .GET, .path = "/slow", .handler = &slow, .summary = "Slow request (drain probe)" },
 };
 
 const Routes = neutron.router.Router(&routes);

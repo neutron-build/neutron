@@ -96,8 +96,10 @@ impl VectorModel {
             return Err(NucleusError::InvalidIdentifier(name.to_string()));
         }
         let conn = self.pool.get().await?;
+        // The engine refuses an HNSW index unless the table has a single-column
+        // integer PRIMARY KEY, so `rid` is that key; the caller's `id` stays UNIQUE.
         let create_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {} (id TEXT PRIMARY KEY, embedding VECTOR({}), metadata JSONB DEFAULT '{{}}')",
+            "CREATE TABLE IF NOT EXISTS {} (rid BIGSERIAL PRIMARY KEY, id TEXT NOT NULL UNIQUE, embedding VECTOR({}), metadata JSONB DEFAULT '{{}}')",
             name, dimension
         );
         conn.client()
@@ -105,6 +107,8 @@ impl VectorModel {
             .await
             .map_err(NucleusError::Query)?;
 
+        // The index name is unchanged from earlier releases, so re-calling this
+        // on a collection created by one is a no-op rather than a second index.
         let index_sql = format!(
             "CREATE INDEX IF NOT EXISTS idx_{}_embedding ON {} USING HNSW (embedding) WITH (metric = '{}')",
             name, name, metric.as_str()

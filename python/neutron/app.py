@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
+import sys
+import threading
+import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Callable, Coroutine
 
@@ -28,6 +32,86 @@ from neutron.openapi import SecurityScheme, generate_openapi
 from neutron.router import Router
 
 logger = structlog.get_logger("neutron.lifecycle")
+
+_STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+
+_DUPLICATE_SIGNAL_WINDOW = 1.0
+"""Seconds after the first stop signal during which further signals are the
+same stop request, not a demand to force. A terminal Ctrl-C reaches every
+process in the group, so under ``neutron dev`` the worker gets SIGINT from the
+tty and then SIGTERM from uvicorn's reloader a few milliseconds later; that
+pair must still shut down gracefully."""
+
+
+class _StopSignals:
+    """Graceful-stop bookkeeping chained in front of the server's own handlers.
+
+    Contract §8. The server (uvicorn) owns the shutdown sequence: it stops
+    accepting, waits for open connections, sends lifespan shutdown and returns.
+    Neutron used to replace uvicorn's handlers with one that only set a flag, so
+    uvicorn never learned a signal had arrived and the process could only be
+    stopped with SIGKILL. This wraps instead of replacing:
+
+    * First signal: mark the app as stopping (new requests on open connections
+      get 503), arm the drain deadline, then hand the signal to the previous
+      handler so the server runs its own graceful shutdown. Lifespan shutdown
+      then runs the OnStop hooks and closes the database.
+    * Later signals (outside the duplicate window): exit immediately.
+
+    The previous handler is always told SIGINT. uvicorn re-raises the signal
+    it captured once it has finished shutting down, under the handler that was
+    installed before it started; for SIGTERM that is SIG_DFL, which turns a
+    completed graceful shutdown into death-by-signal (status 143). A re-raised
+    SIGINT becomes KeyboardInterrupt, which uvicorn's ``run()`` and its reload
+    / worker subprocess entry points already swallow, so the process exits 0.
+    Both signals mean the same thing to uvicorn's ``handle_exit`` on first
+    delivery.
+
+    Only installed on the main thread, and only over a Python-level handler:
+    a signal left at SIG_DFL/SIG_IGN is not claimed on the server's behalf.
+    """
+
+    def __init__(self, app: "App", loop: asyncio.AbstractEventLoop) -> None:
+        self._app = app
+        self._loop = loop
+        self._previous: dict[int, Callable[..., Any]] = {}
+        self._first_at: float | None = None
+
+    def install(self) -> None:
+        if threading.current_thread() is not threading.main_thread():
+            return
+        for sig in _STOP_SIGNALS:
+            previous = signal.getsignal(sig)
+            if not callable(previous):
+                continue
+            self._previous[sig] = previous
+            signal.signal(sig, self._handle)
+
+    def uninstall(self) -> None:
+        for sig, previous in self._previous.items():
+            if signal.getsignal(sig) == self._handle:
+                signal.signal(sig, previous)
+        self._previous.clear()
+
+    def _handle(self, signum: int, frame: Any) -> None:
+        name = signal.Signals(signum).name
+        now = time.monotonic()
+        if self._first_at is None:
+            self._first_at = now
+            logger.info("shutdown_signal_received", signal=name)
+            self._app._begin_stop(self._loop)
+            self._previous[signum](signal.SIGINT, frame)
+            return
+        if now - self._first_at < _DUPLICATE_SIGNAL_WINDOW:
+            return
+        logger.warning("forced_exit", signal=name, inflight=self._app._inflight)
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+        os._exit(128 + signum)
+
 
 _SWAGGER_HTML = """<!DOCTYPE html>
 <html>
@@ -144,6 +228,9 @@ class App:
         self._shutting_down = False
         self._inflight = 0
         self._inflight_zero: asyncio.Event | None = None
+        self._inflight_tasks: set[asyncio.Task[Any]] = set()
+        self._stop_deadline: float | None = None
+        self._drain_timer: asyncio.TimerHandle | None = None
 
         # Auto-add trailing slash middleware when configured
         if trailing_slash is not None:
@@ -171,6 +258,45 @@ class App:
         """
         self._on_stop_hooks.append(func)
         return func
+
+    def _begin_stop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Enter draining: refuse new requests and bound the drain.
+
+        Called from a signal handler, so it only sets plain attributes and
+        hands the timer to the loop through the signal-safe
+        ``call_soon_threadsafe``.
+        """
+        self._shutting_down = True
+        if self._stop_deadline is None:
+            self._stop_deadline = time.monotonic() + self._drain_timeout
+        try:
+            loop.call_soon_threadsafe(self._arm_drain_deadline)
+        except RuntimeError:
+            pass  # loop already closed
+
+    def _arm_drain_deadline(self) -> None:
+        if self._drain_timer is not None or self._stop_deadline is None:
+            return
+        remaining = max(0.0, self._stop_deadline - time.monotonic())
+        loop = asyncio.get_running_loop()
+        self._drain_timer = loop.call_later(remaining, self._drain_expired)
+
+    def _drain_expired(self) -> None:
+        """The drain timeout ran out: cancel what is still in flight.
+
+        The server will not finish its own shutdown while a request is open
+        (uvicorn's graceful timeout is unbounded by default), so the app
+        enforces ``drain_timeout`` itself.
+        """
+        if not self._inflight_tasks:
+            return
+        logger.warning(
+            "drain_timeout_exceeded",
+            remaining=len(self._inflight_tasks),
+            timeout=self._drain_timeout,
+        )
+        for task in list(self._inflight_tasks):
+            task.cancel("neutron drain timeout exceeded")
 
     def include_router(self, router: Router, prefix: str = "") -> None:
         """Mount an external Router with an optional path prefix."""
@@ -275,85 +401,20 @@ class App:
             neutron_app._inflight_zero = asyncio.Event()
             neutron_app._inflight_zero.set()  # No requests yet
             neutron_app._shutting_down = False
+            neutron_app._stop_deadline = None
+            neutron_app._drain_timer = None
 
-            # Register signal handlers for graceful shutdown
-            loop = asyncio.get_running_loop()
-            shutdown_event = asyncio.Event()
-
-            def _signal_handler(sig: signal.Signals) -> None:
-                logger.info(
-                    "shutdown_signal_received",
-                    signal=sig.name,
-                )
-                neutron_app._shutting_down = True
-                shutdown_event.set()
-
-            for sig in (signal.SIGTERM, signal.SIGINT):
-                try:
-                    loop.add_signal_handler(
-                        sig, _signal_handler, sig,
-                    )
-                except (NotImplementedError, OSError):
-                    # Windows doesn't support add_signal_handler for all signals
-                    pass
-
-            if user_lifespan is not None:
-                async with user_lifespan(neutron_app):
+            stop_signals = _StopSignals(neutron_app, asyncio.get_running_loop())
+            stop_signals.install()
+            try:
+                if user_lifespan is not None:
+                    async with user_lifespan(neutron_app):
+                        yield
+                else:
                     yield
-            else:
-                yield
-
-            # --- Shutdown sequence ---
-            logger.info("shutdown_started", drain_timeout=neutron_app._drain_timeout)
-            neutron_app._shutting_down = True
-
-            # 1. Wait for in-flight requests to complete (up to drain timeout)
-            if neutron_app._inflight > 0:
-                logger.info(
-                    "draining_inflight_requests",
-                    count=neutron_app._inflight,
-                )
-                try:
-                    await asyncio.wait_for(
-                        neutron_app._inflight_zero.wait(),
-                        timeout=neutron_app._drain_timeout,
-                    )
-                    logger.info("inflight_requests_drained")
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "drain_timeout_exceeded",
-                        remaining=neutron_app._inflight,
-                        timeout=neutron_app._drain_timeout,
-                    )
-
-            # 2. Run on_stop hooks in reverse registration order
-            for hook in reversed(neutron_app._on_stop_hooks):
-                hook_name = getattr(hook, "__name__", repr(hook))
-                try:
-                    logger.info("running_stop_hook", hook=hook_name)
-                    await hook()
-                except Exception:
-                    logger.exception("stop_hook_failed", hook=hook_name)
-
-            # 3. Close database connection pool
-            db = neutron_app.db
-            if db is None and hasattr(neutron_app.state, "db"):
-                db = neutron_app.state.db
-            if db is not None and hasattr(db, "close"):
-                try:
-                    logger.info("closing_database_pool")
-                    await db.close()
-                except Exception:
-                    logger.exception("database_close_failed")
-
-            # Remove signal handlers
-            for sig in (signal.SIGTERM, signal.SIGINT):
-                try:
-                    loop.remove_signal_handler(sig)
-                except (NotImplementedError, OSError):
-                    pass
-
-            logger.info("server_stopped")
+                await neutron_app._shutdown_sequence()
+            finally:
+                stop_signals.uninstall()
 
         lifespan = lifespan_wrapper
 
@@ -365,6 +426,50 @@ class App:
             debug=self._debug,
         )
         return self._starlette
+
+    async def _shutdown_sequence(self) -> None:
+        """Contract §8 steps 3-5, run from lifespan shutdown."""
+        logger.info("shutdown_started", drain_timeout=self._drain_timeout)
+        self._shutting_down = True
+        if self._stop_deadline is None:
+            self._stop_deadline = time.monotonic() + self._drain_timeout
+
+        # 1. Wait for in-flight requests, within what is left of the drain
+        # budget. Under uvicorn this is normally already zero: the server
+        # waits for open connections before sending lifespan shutdown.
+        if self._inflight > 0 and self._inflight_zero is not None:
+            logger.info("draining_inflight_requests", count=self._inflight)
+            remaining = max(0.0, self._stop_deadline - time.monotonic())
+            try:
+                await asyncio.wait_for(self._inflight_zero.wait(), timeout=remaining)
+                logger.info("inflight_requests_drained")
+            except asyncio.TimeoutError:
+                self._drain_expired()
+        if self._drain_timer is not None:
+            self._drain_timer.cancel()
+            self._drain_timer = None
+
+        # 2. Run on_stop hooks in reverse registration order
+        for hook in reversed(self._on_stop_hooks):
+            hook_name = getattr(hook, "__name__", repr(hook))
+            try:
+                logger.info("running_stop_hook", hook=hook_name)
+                await hook()
+            except Exception:
+                logger.exception("stop_hook_failed", hook=hook_name)
+
+        # 3. Close database connection pool
+        db = self.db
+        if db is None and hasattr(self.state, "db"):
+            db = self.state.db
+        if db is not None and hasattr(db, "close"):
+            try:
+                logger.info("closing_database_pool")
+                await db.close()
+            except Exception:
+                logger.exception("database_close_failed")
+
+        logger.info("server_stopped")
 
     async def __call__(
         self, scope: Scope, receive: Receive, send: Send
@@ -396,9 +501,14 @@ class App:
             self._inflight += 1
             if self._inflight_zero is not None:
                 self._inflight_zero.clear()
+            task = asyncio.current_task()
+            if task is not None:
+                self._inflight_tasks.add(task)
             try:
                 await app(scope, receive, send)
             finally:
+                if task is not None:
+                    self._inflight_tasks.discard(task)
                 self._inflight -= 1
                 if self._inflight <= 0 and self._inflight_zero is not None:
                     self._inflight_zero.set()

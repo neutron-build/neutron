@@ -1,7 +1,7 @@
 {
   "packageManager": "pnpm9",
   "packages": {
-    "count": 24,
+    "count": 25,
     "items": [
       {
         "name": "@neutron-build/agents",
@@ -54,6 +54,10 @@
       {
         "name": "@neutron-build/security",
         "path": "packages/neutron-security"
+      },
+      {
+        "name": "@neutron-build/sql",
+        "path": "packages/neutron-sql"
       },
       {
         "name": "@neutron-build/workflow",
