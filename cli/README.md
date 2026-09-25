@@ -87,9 +87,10 @@ the existing language delegation.
 ## neutron mcp
 
 The `mcp` command turns Neutron into an agent-native tool surface over the Model
-Context Protocol. It exposes 19 tools: 17 spanning all of the Nucleus data models
-(so an LLM can inspect and query your database directly), plus `search_docs` and
-`get_doc` for querying the Neutron framework documentation.
+Context Protocol. By default it offers 24 read-only tools: 17 over the SQL and
+Nucleus data models, 5 inspection and planning tools, and `search_docs` and
+`get_doc` for the Neutron documentation. `--allow-writes` adds one write tool,
+`execute_sql`.
 
 ```bash
 # stdio transport (default) -- for Claude Desktop, Cursor, Windsurf, Zed, Continue
@@ -104,9 +105,32 @@ neutron mcp --dump-schema mcp        # MCP tools/list JSON
 neutron mcp --dump-schema markdown   # human-readable, paste into a system prompt
 ```
 
-Writes are off by default. `query_sql` only accepts `SELECT`, `EXPLAIN`, `SHOW`,
-and `WITH` unless you pass `--allow-writes`, which permits `INSERT`/`UPDATE`/
-`DELETE`/DDL.
+**Read-only by default.** On PostgreSQL every read tool runs inside a
+`READ ONLY` transaction that is rolled back, so a data-modifying CTE,
+`SELECT INTO`, `nextval()` or `EXPLAIN ANALYZE` of a write fails in the server.
+Nucleus does not apply `READ ONLY`, so there a lexical guard refuses
+data-modifying keywords, row locks, `EXPLAIN ANALYZE` and every function the
+engine classifies as mutating (`KV_SET`, `DOC_INSERT`, `GRAPH_ADD_NODE`, ...).
+Both engines refuse multiple statements and functions whose effects escape a
+rollback (`pg_advisory_lock`, `pg_terminate_backend`, `dblink_exec`, ...).
+`cypher_query` refuses clauses that change the graph.
+
+**Writes are an explicit tool.** `execute_sql` exists only when the server is
+started with `--allow-writes`; it runs one statement in its own transaction,
+commits it, and reports the touched models' actual limits. `query_sql` stays
+read-only either way. Over HTTP, `--allow-writes` also requires
+`NEUTRON_MCP_TOKEN`, and the HTTP transport binds `127.0.0.1` unless `--host`
+says otherwise.
+
+**Structured, redacted results.** Each result carries the engine, the access
+class, how read-only was enforced, the touched models' transaction and
+durability limits, and the names of any redacted fields, as MCP
+`structuredContent` and as the JSON text content. Values under secret-looking
+names (`password`, `password_hash`, `token`, `api_key`, `apiKey`, `secret`, ...)
+are replaced with `[redacted]`; matching is by name, so a secret stored under
+an innocuous name is not detected. `--no-redact` turns it off. Connection
+passwords are masked in logs and errors. The REST surfaces answer
+`{"result": <data as JSON text>, "structured": <envelope>}`.
 
 Over the HTTP transport the server answers on several surfaces for maximum client
 compatibility: `POST /mcp` (JSON-RPC 2.0), `GET /openai/tools`,
@@ -118,9 +142,12 @@ compatibility: `POST /mcp` (JSON-RPC 2.0), `GET /openai/tools`,
 |------|---------|---------|
 | `--db` | -- | Database URL (overrides `DATABASE_URL` and config) |
 | `--transport` | `stdio` | Transport: `stdio` or `http` |
+| `--host` | `127.0.0.1` | HTTP bind address (only used with `--transport http`) |
 | `--port` | `7700` | HTTP port (only used with `--transport http`) |
 | `--dump-schema` | -- | Print schema and exit: `openai`, `mcp`, or `markdown` |
-| `--allow-writes` | `false` | Allow `query_sql` to execute mutations and DDL |
+| `--allow-writes` | `false` | Offer `execute_sql`; over HTTP also requires `NEUTRON_MCP_TOKEN` |
+| `--no-redact` | `false` | Return values under secret-looking names |
+| `--migrations` | `migrations` | Migrations directory for `migration_status` and `inspect_table` |
 | `--log` | `false` | Write debug logs to stderr |
 
 ### Tools
@@ -129,21 +156,27 @@ compatibility: `POST /mcp` (JSON-RPC 2.0), `GET /openai/tools`,
 |------|-------|---------|
 | `list_tables` | SQL | List SQL tables with column counts and row estimates |
 | `describe_table` | SQL | Describe a table's columns, types, nullability, and primary key |
-| `list_nucleus_models` | All | List non-SQL collections (KV, vector, FTS, doc, graph, ts, blob, geo, streams) |
-| `query_sql` | SQL | Run a SQL query (read-only unless `--allow-writes`) |
+| `list_nucleus_models` | All | Counts the engine exposes per Nucleus model |
+| `query_sql` | SQL | Run one read-only statement |
 | `kv_get` | KV | Get a single key's value |
-| `kv_scan` | KV | Scan keys by prefix, with value and TTL |
+| `kv_scan` | KV | List keys by prefix |
 | `fts_search` | FTS | Full-text search with BM25 ranking and optional fuzzy matching |
-| `vector_search` | Vector | Nearest-neighbor search (cosine, l2, or dot) |
-| `cypher_query` | Graph | Run a Cypher query over a graph store |
-| `doc_find` | Document | Query a document collection with a JSON filter |
-| `ts_range` | TimeSeries | Range query with optional bucketing and aggregation |
+| `vector_search` | Vector | Nearest-neighbor search (cosine, l2, or inner) |
+| `cypher_query` | Graph | Run a read-only Cypher query |
+| `doc_find` | Document | Query documents with a JSON filter |
+| `ts_range` | TimeSeries | Range average or count over an epoch-millisecond window |
 | `geo_distance` | Geo | Haversine distance (metres) between two lat/lon points |
-| `blob_list` | Blob | List blobs with size, content type, and hash |
-| `stream_range` | Streams | Read entries from an append-only stream between two IDs |
-| `datalog_query` | Datalog | Evaluate a Datalog query against asserted facts and rules |
-| `cdc_changes` | CDC | Read recent change events from the WAL, filtered by table/operation |
+| `blob_list` | Blob | List blob keys by prefix |
+| `stream_range` | Streams | Read entries from a stream over a time window |
+| `datalog_query` | Datalog | Evaluate a Datalog query |
+| `cdc_changes` | CDC | Read change events after a sequence number |
 | `pubsub_list` | PubSub | List active pub/sub channels |
+| `engine_limits` | All | The engine and every model's availability, transaction, durability and hazards, with evidence |
+| `inspect_table` | All | One table's schema, migrations, plan, sample rows, bound graph nodes and change events |
+| `migration_status` | SQL | Applied and pending migrations with checksum status (PostgreSQL) |
+| `explain_sql` | SQL | `EXPLAIN (FORMAT JSON)` of a read, never executed (PostgreSQL) |
+| `plan_schema_changes` | SQL | The CLI planner's statements and risk for schema edits, not applied (PostgreSQL) |
+| `execute_sql` | All | With `--allow-writes` only: run one statement and commit it |
 
 Example Claude Desktop entry (`~/.config/Claude/claude_desktop_config.json`):
 
