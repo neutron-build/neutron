@@ -895,8 +895,13 @@ for (const driverKind of ["postgres", "pg"] as const) {
     const runCase = async (isolation: "repeatable-read" | "read-committed"): Promise<number[]> => {
       await ctx.driver.execute(`update "q08_kv" set "v" = 0 where "k" = 'snap'`);
       const writer = await rawClient(ctx);
+      // The gate must be HELD before the batch starts: taking it inside the
+      // async writer raced the batch's first statement, which then passed an
+      // unheld gate, ran statement 2 before the commit and read [0, 0] under
+      // READ COMMITTED (R01: reproduced 4/4 with a 30 ms delay injected
+      // before the lock; the q08 flake earlier cards attributed to load).
+      await writer.query("select pg_advisory_lock($1)", [GATE]);
       const writerDone = (async () => {
-        await writer.query("select pg_advisory_lock($1)", [GATE]);
         await new Promise((r) => setTimeout(r, 150));
         await writer.query(`update "q08_kv" set "v" = 42 where "k" = 'snap'`);
         await writer.query("commit").catch(() => {});
@@ -930,8 +935,10 @@ for (const driverKind of ["postgres", "pg"] as const) {
       if (e.kind === "tx-begin" && e.attempt !== undefined) attemptEvents.push(e.attempt);
     });
     const writer = await rawClient(ctx);
+    // Held before the batch starts (see the snapshot test above): otherwise
+    // attempt 1 can pass an unheld gate and commit before the writer races it.
+    await writer.query("select pg_advisory_lock($1)", [GATE]);
     const writerDone = (async () => {
-      await writer.query("select pg_advisory_lock($1)", [GATE]);
       await new Promise((r) => setTimeout(r, 150));
       await writer.query(`update "q08_kv" set "v" = 100 where "k" = 'retry'`);
       await writer.query("commit").catch(() => {});
