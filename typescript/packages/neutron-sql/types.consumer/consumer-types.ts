@@ -803,3 +803,50 @@ function q08Fixtures(): void {
   void streamTyped;
 }
 void q08Fixtures;
+
+// R01: nested relation typing resolves a relation's target table through the
+// relations input. Tables with the same column shapes (tags/categories) or a
+// superset shape (users) were indistinguishable there, so their nested
+// relations vanished from result types while the runtime returned them. The
+// literal table name (pgTable("tags", …)) keeps them distinct types.
+async function sameShapeTables(): Promise<void> {
+  const users = pgTable("r01_users", { id: serial("id").primaryKey(), name: text("name").notNull(), email: text("email").notNull() });
+  const tags = pgTable("r01_tags", { id: serial("id").primaryKey(), name: text("name").notNull() });
+  const categories = pgTable("r01_categories", { id: serial("id").primaryKey(), name: text("name").notNull() });
+  const posts = pgTable("r01_posts", {
+    id: serial("id").primaryKey(),
+    authorId: integer("author_id").notNull(),
+    tagId: integer("tag_id"),
+    categoryId: integer("category_id"),
+  });
+  const usersR = relations(users, ({ many }) => ({ posts: many(posts) }));
+  const tagsR = relations(tags, ({ many }) => ({ taggedPosts: many(posts) }));
+  const categoriesR = relations(categories, ({ many }) => ({ categorizedPosts: many(posts) }));
+  const postsR = relations(posts, ({ one }) => ({
+    author: one(users, { fields: [posts.authorId], references: [users.id] }),
+    tag: one(tags, { fields: [posts.tagId], references: [tags.id] }),
+    category: one(categories, { fields: [posts.categoryId], references: [categories.id] }),
+  }));
+  const db = await createDatabase({
+    url: "postgres://type-fixture:not-run@localhost:1/none",
+    tables: { r01_users: users, r01_tags: tags, r01_categories: categories, r01_posts: posts },
+    relations: { r01_users: usersR, r01_tags: tagsR, r01_categories: categoriesR, r01_posts: postsR },
+  });
+  const rows = await db.query.r01_posts.findMany({
+    with: {
+      author: { with: { posts: { columns: ["id"] } } },
+      tag: { with: { taggedPosts: { columns: ["id"] } } },
+      category: { columns: ["name"], with: { categorizedPosts: { columns: ["id"] } } },
+    },
+  });
+  const row = rows[0];
+  const eqAuthor: AssertEq<typeof row.author, { id: number; name: string; email: string; posts: { id: number }[] } | null> = true;
+  const eqTag: AssertEq<typeof row.tag, { id: number; name: string; taggedPosts: { id: number }[] } | null> = true;
+  const eqCategory: AssertEq<typeof row.category, { name: string; categorizedPosts: { id: number }[] } | null> = true;
+  void [eqAuthor, eqTag, eqCategory];
+  if (row.tag) {
+    // @ts-expect-error a tag has no categorizedPosts relation (the same-shape table's relation must not leak)
+    void row.tag.categorizedPosts;
+  }
+}
+void sameShapeTables;
