@@ -8,6 +8,7 @@ import type {
   SchemaObjectDetail, SchemaChange, SchemaPlanResponse,
   DiagnosticsQueriesResponse, TableStatsResponse,
   ExportFormat, ExportTicket, ImportBatchRequest, ImportBatchResponse, ImportOutcomeResponse,
+  LimitsReport, JourneyResponse,
 } from './types'
 import { decodeRows } from './wire'
 
@@ -415,6 +416,18 @@ export const api = {
   tableStats: (connectionId: string, schema: string, table: string) =>
     request<TableStatsResponse>('GET',
       `/diagnostics/table-stats?connectionId=${encodeURIComponent(connectionId)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`),
+
+  // --- X06: cross-model inspection (read-only GETs) ---
+
+  /** Per-model transaction/durability limits for the connected engine. */
+  limits: (connectionId: string) =>
+    request<LimitsReport>('GET', `/inspect/limits?connectionId=${encodeURIComponent(connectionId)}`),
+
+  /** One table followed schema -> migrations -> queries -> plan -> rows ->
+   *  models -> change events, each stage with its availability. */
+  journey: (connectionId: string, schema: string, table: string) =>
+    request<JourneyResponse>('GET',
+      `/inspect/journey?connectionId=${encodeURIComponent(connectionId)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`),
 
   // --- Saved queries ---
 

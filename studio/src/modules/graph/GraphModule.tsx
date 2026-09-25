@@ -10,6 +10,8 @@ import s from './GraphModule.module.css'
 
 interface GraphModuleProps {
   name: string
+  /** X06 journey: open with this Cypher (e.g. the row-bound node lookup). */
+  initialCypher?: string
 }
 
 type ViewMode = 'table' | 'graph'
@@ -216,8 +218,8 @@ const EXAMPLE_QUERIES = [
   'MATCH p=(a)-[*1..3]->(b) RETURN p LIMIT 20',
 ]
 
-export function GraphModule({ name }: GraphModuleProps) {
-  const cypher = useSignal(EXAMPLE_QUERIES[0])
+export function GraphModule({ name, initialCypher }: GraphModuleProps) {
+  const cypher = useSignal(initialCypher || EXAMPLE_QUERIES[0])
   const result = useSignal<QueryResult | null>(null)
   const running = useSignal(false)
   const statsResult = useSignal<{ nodes: number; edges: number } | null>(null)

@@ -207,6 +207,22 @@ function TreeSection({ section, searching }: { section: Section; searching: bool
               ⓘ
             </button>
           )}
+          {!item.isView && section.kind === 'sql-browser' && (
+            <button
+              class={s.inspectBtn}
+              title={`Journey: follow ${item.sub ? item.sub + '.' : ''}${item.name} through migrations, queries, plan, rows, models and change events`}
+              aria-label={`Journey for ${item.name}`}
+              onClick={() => openTab({
+                id: crypto.randomUUID(),
+                kind: 'journey',
+                label: `Journey: ${item.name}`,
+                objectSchema: item.sub ?? 'public',
+                objectName: item.name,
+              })}
+            >
+              ⇢
+            </button>
+          )}
         </span>
       ))}
     </div>

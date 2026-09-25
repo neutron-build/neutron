@@ -15,6 +15,7 @@ import (
 
 func init() {
 	studioCmd.Flags().Int("port", 0, "Studio port (default 4983)")
+	studioCmd.Flags().String("migrations", "migrations", "application migrations directory shown in the inspection journey (applied history is read either way)")
 	rootCmd.AddCommand(studioCmd)
 }
 
@@ -38,6 +39,9 @@ func runStudio(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("init studio: %w", err)
 	}
+
+	migrationsDir, _ := cmd.Flags().GetString("migrations")
+	srv.SetMigrationsDir(migrationsDir)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

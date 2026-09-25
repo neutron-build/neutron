@@ -52,10 +52,10 @@ export function eventsToResult(events: CdcEvent[]): QueryResult {
   }
 }
 
-export function CDCModule() {
+export function CDCModule({ initialTable }: { initialTable?: string } = {}) {
   const totalCount = useSignal<number | null>(null)
   const tables = useSignal<string[]>([])
-  const filterTable = useSignal('all')
+  const filterTable = useSignal(initialTable || 'all')
   const filterOp = useSignal<Op>('all')
   const limit = useSignal(200)
   const result = useSignal<QueryResult | null>(null)
@@ -104,6 +104,8 @@ export function CDCModule() {
         events = events.slice().reverse()
         // Populate the table filter from what we have seen
         const seen = new Set(tables.value)
+        // A journey-selected table stays selectable before it has events.
+        if (filterTable.value !== 'all') seen.add(filterTable.value)
         for (const e of events) seen.add(e.table)
         tables.value = Array.from(seen).sort()
         // Operation filter is applied client-side (the JSON carries `change`).

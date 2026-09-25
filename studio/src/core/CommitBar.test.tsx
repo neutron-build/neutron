@@ -2,8 +2,10 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/preact'
 import {
   stagedEdits, stageEdit, clearStaged, commitPhase, commitError, lastCommit, lastPreview,
-  activeConnection, toasts, failedEditFocus,
+  activeConnection, toasts, failedEditFocus, limitsReport,
 } from '../lib/store'
+import limitsFixture from '../lib/limits.fixture.json'
+import type { LimitsReport } from '../lib/types'
 import { _setSessionTokenForTests, ApiError } from '../lib/api'
 import type { CommitOperation, CommitResponse, PreviewResponse } from '../lib/types'
 import { CommitBar } from './CommitBar'
@@ -54,6 +56,9 @@ beforeEach(() => {
   lastPreview.value = null
   toasts.value = []
   activeConnection.value = { id: 'c1', name: 'one', url: 'postgres://a', isNucleus: false }
+  // X06: the bar claims atomicity only when the SQL limits establish it
+  // (PostgreSQL here; the Nucleus wording is pinned below).
+  limitsReport.value = limitsFixture.postgres as LimitsReport
   _setSessionTokenForTests('test-session-token')
   commitOperations.mockReset()
   previewOperations.mockReset()
@@ -62,6 +67,7 @@ beforeEach(() => {
 
 afterEach(() => {
   activeConnection.value = null
+  limitsReport.value = null
   _setSessionTokenForTests(null)
 })
 
@@ -209,5 +215,31 @@ describe('CommitBar — staged atomic commits (S02)', () => {
     expect(ops[0].textContent).toContain('"old"')
     expect(ops[1].textContent).toContain('insert public.docs')
     expect(ops[2].textContent).toContain('id=3')
+  })
+})
+
+describe('CommitBar — engine limits wording (X06)', () => {
+  it('never says atomic on an engine whose SQL transactions are partial', async () => {
+    activeConnection.value = { id: 'c1', name: 'nuc', url: 'postgres://n', isNucleus: true }
+    limitsReport.value = limitsFixture.nucleus as LimitsReport
+    stageEdit({ connectionId: 'c1', operation: updateOp, label: 'docs.note = staged' })
+    commitOperations.mockResolvedValueOnce(okResponse)
+    render(<CommitBar />)
+    expect(screen.queryByTitle(/atomic batch/)).toBeNull()
+    const btn = screen.getByTitle(/Commit all staged edits in one transaction/)
+    expect(btn.getAttribute('title')).toContain('DDL is NOT transactional')
+    fireEvent.click(btn)
+    await waitFor(() => expect(toasts.value.some(t => t.kind === 'success')).toBe(true))
+    const msg = toasts.value.find(t => t.kind === 'success')!.message
+    expect(msg).not.toMatch(/atomically/)
+    expect(msg).toMatch(/not verified atomic/)
+  })
+
+  it('claims nothing while limits are not loaded', () => {
+    limitsReport.value = null
+    stageEdit({ connectionId: 'c1', operation: updateOp, label: 'docs.note = staged' })
+    render(<CommitBar />)
+    expect(screen.queryByTitle(/atomic batch/)).toBeNull()
+    expect(screen.getByTitle(/limits are not loaded/)).toBeTruthy()
   })
 })

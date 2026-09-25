@@ -7,6 +7,7 @@
 //   #/c/<connId>/diagnostics                performance diagnosis
 //   #/c/<connId>/diagnostics/<schema>/<table>
 //   #/c/<connId>/sql                        SQL editor
+//   #/c/<connId>/journey/<schema>/<table>   X06 cross-model inspection journey
 //
 // Names are URL-encoded, so mixed-case names and names with spaces survive.
 // Opening a browsable tab updates the hash (history.replaceState: the URL
@@ -51,6 +52,11 @@ export function parseDeepLink(hash: string): DeepLink | null {
       return { connectionId, tab: { kind: 'diagnostics', label: 'Diagnostics' } }
     case 'sql':
       return { connectionId, tab: { kind: 'sql-editor', label: 'SQL' } }
+    case 'journey': {
+      const link = withNames('journey', 1)
+      if (link) link.tab.label = `Journey: ${link.tab.objectName}`
+      return link
+    }
     default:
       return null
   }
@@ -82,6 +88,9 @@ export function serializeDeepLink(tab: Tab, connectionId: string): string | null
       // An editor seeded with a specific statement is a context, not an
       // address; a plain editor tab still deep-links.
       return tab.initialSql ? null : `${base}/sql`
+    case 'journey':
+      if (!tab.objectSchema || !tab.objectName) return null
+      return `${base}/journey/${schema}/${name}`
     default:
       return null
   }

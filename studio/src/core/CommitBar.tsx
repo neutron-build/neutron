@@ -3,11 +3,23 @@ import {
   stagedEdits, stagedCount, removeStagedEdit, discardLastStaged, clearStaged,
   commitStaged, previewStaged, revertLastCommit,
   commitPhase, commitError, lastCommit, lastPreview,
-  activeConnection, toast, bindingActive,
+  activeConnection, toast, bindingActive, limitsFor,
 } from '../lib/store'
 import { ApiError } from '../lib/api'
 import type { PreviewOpDiff } from '../lib/types'
 import s from './CommitBar.module.css'
+
+/** X06: the commit bar says "atomic" only when the connected engine's SQL
+ *  limits establish atomic transactions; otherwise it names the batch as one
+ *  transaction and points at the limits (never implying more). */
+export function commitWording(): { atomic: boolean; done: string; title: string } {
+  const sql = limitsFor('sql')
+  if (sql?.transaction === 'atomic') {
+    return { atomic: true, done: 'atomically', title: 'Commit all staged edits as one atomic batch (⌘S)' }
+  }
+  const why = sql ? `transactions on this engine: ${sql.transaction} — ${sql.transactionNote}` : 'this engine\'s transaction limits are not loaded'
+  return { atomic: false, done: 'in one transaction (not verified atomic on this engine)', title: `Commit all staged edits in one transaction (⌘S). ${why}` }
+}
 
 function previewLine(op: PreviewOpDiff): string {
   const target = `${op.schema}.${op.table}`
@@ -77,7 +89,7 @@ export function CommitBar() {
     try {
       const res = await commitStaged(conn.id)
       const reverted = res.replayed ? ' (replayed recorded outcome)' : ''
-      toast('success', `Committed ${res.rowsAffected} change${res.rowsAffected === 1 ? '' : 's'} atomically${reverted}`)
+      toast('success', `Committed ${res.rowsAffected} change${res.rowsAffected === 1 ? '' : 's'} ${commitWording().done}${reverted}`)
     } catch (err: unknown) {
       if (err instanceof Error && err.message) {
         toast('error', `Commit failed: ${err.message}`)
@@ -183,7 +195,7 @@ export function CommitBar() {
             <button class={s.revert} onClick={preview} disabled={busy} title="Dry-run this batch in a rolled-back transaction">
               Preview
             </button>
-            <button class={s.commit} onClick={commit} disabled={busy} title="Commit all staged edits as one atomic batch (⌘S)">
+            <button class={s.commit} onClick={commit} disabled={busy} title={commitWording().title}>
               Commit {count} change{count === 1 ? '' : 's'}
             </button>
           </>

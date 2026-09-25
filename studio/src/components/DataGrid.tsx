@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks'
 import type { CellEdit, QueryResult, TableMetaColumn, TableSort } from '../lib/types'
 import { formatCell } from '../lib/wire'
-import { toast } from '../lib/store'
+import { toast, limitsFor } from '../lib/store'
 import { exportResultCSV, exportResultJSON } from '../lib/export'
 import { TypedEditor } from './TypedEditor'
 import s from './DataGrid.module.css'
@@ -629,7 +629,7 @@ export function DataGrid({
         </div>
       )}
       {editable && (
-        <div class={s.editHint}>double-click a cell (or Enter/F2 on the focused cell) to stage an edit — Enter or Tab saves, Esc cancels; arrow keys move between cells, Delete stages a row delete; NULL is explicit (empty text stays an empty string); staged edits commit as one atomic batch below</div>
+        <div class={s.editHint}>double-click a cell (or Enter/F2 on the focused cell) to stage an edit — Enter or Tab saves, Esc cancels; arrow keys move between cells, Delete stages a row delete; NULL is explicit (empty text stays an empty string); staged edits commit as one {limitsFor('sql')?.transaction === 'atomic' ? 'atomic batch' : 'transaction'} below</div>
       )}
     </div>
   )
