@@ -260,76 +260,34 @@ func nucleusModels(isNucleus bool) []string {
 }
 
 // --- /api/query ---
-
-func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	// The SQL editor executes arbitrary statements — including mutations —
-	// so it is guarded exactly like the row endpoints.
-	if !s.requireMutationAuth(w, r) {
-		return
-	}
-	var body struct {
-		SQL          string `json:"sql"`
-		ConnectionID string `json:"connectionId"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON")
-		return
-	}
-	client, ok := s.clientFor(body.ConnectionID)
-	if !ok {
-		writeError(w, http.StatusBadRequest, "not connected — call /api/connections/:id/connect first")
-		return
-	}
-
-	start := time.Now()
-	rows, err := client.Query(r.Context(), body.SQL)
-	if err != nil {
-		log.Printf("studio: query error: %v", err)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"columns":  []string{},
-			"rows":     [][]any{},
-			"rowCount": 0,
-			"duration": time.Since(start).Milliseconds(),
-			"error":    sanitizeError(err),
-		})
-		return
-	}
-	defer rows.Close()
-
-	result, err := collectTaggedRows(rows)
-	if err != nil {
-		log.Printf("studio: query error: %v", err)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"columns":  result.columns,
-			"rows":     [][]any{},
-			"rowCount": 0,
-			"duration": time.Since(start).Milliseconds(),
-			"error":    sanitizeError(err),
-		})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"columns":  result.columns,
-		"rows":     result.data,
-		"rowCount": len(result.data),
-		"duration": time.Since(start).Milliseconds(),
-	})
-}
+// The SQL editor endpoints (/api/query, /api/query/cancel,
+// /api/query/explain) live in sqlexec.go.
 
 // taggedResult is a query result with cells converted to their wire forms.
 type taggedResult struct {
 	columns []string
 	data    [][]any
+	// truncated: more rows existed than the collector's cap retained.
+	truncated bool
 }
 
 // collectTaggedRows drains a pgx result, converting every cell of a tagged
 // type (int8/numeric/bytea/temporal) to its {t, v} wire form so precision
 // survives JSON. Execution errors surface after iteration (pgx behavior).
 func collectTaggedRows(rows pgx.Rows) (*taggedResult, error) {
+	return collectTaggedRowsCapped(rows, 0)
+}
+
+// maxEditorResultRows bounds one SQL editor result held in memory (S06):
+// the rows beyond it are not decoded or retained, and the response says
+// the result was truncated. Whole-table reads are streamed exports.
+const maxEditorResultRows = 10000
+
+// collectTaggedRowsCapped is collectTaggedRows keeping at most max rows
+// (max <= 0: unbounded). On reaching the cap it stops iterating and marks
+// the result truncated; the caller's rows.Close() drains the remainder
+// without decoding or retaining it.
+func collectTaggedRowsCapped(rows pgx.Rows, max int) (*taggedResult, error) {
 	fds := rows.FieldDescriptions()
 	cols := make([]string, len(fds))
 	for i, fd := range fds {
@@ -337,6 +295,9 @@ func collectTaggedRows(rows pgx.Rows) (*taggedResult, error) {
 	}
 	var data [][]any
 	for rows.Next() {
+		if max > 0 && len(data) >= max {
+			return &taggedResult{columns: cols, data: data, truncated: true}, nil
+		}
 		// A row that cannot be decoded fails the read loudly; silently
 		// skipping it would show a table with rows missing.
 		vals, err := rows.Values()
@@ -434,6 +395,109 @@ var allowedFilterOps = map[string]string{
 	"not-null": "IS NOT NULL",
 }
 
+// tableFilter is one component of a multi-filter read
+// (GET /api/table?filters=[{"column":...,"op":...,"value":...}]).
+// Filters AND together with any legacy single filter and the FK match
+// tuple.
+type tableFilter struct {
+	Column string `json:"column"`
+	Op     string `json:"op"`
+	Value  string `json:"value"`
+}
+
+// tableSort is one component of a multi-sort read
+// (GET /api/table?sorts=[{"column":...,"dir":...}]); sorts apply in array
+// order — earlier keys take precedence.
+type tableSort struct {
+	Column string `json:"column"`
+	Dir    string `json:"dir"`
+}
+
+// Read-shape bounds: a hand-built query string cannot grow unbounded work.
+const (
+	maxTableFilters = 8
+	maxTableSorts   = 4
+	// maxTableReadLimit bounds one table page (S06). The SPA's virtualized
+	// grid pages at most this many rows; larger reads are streamed exports.
+	maxTableReadLimit = 1000
+)
+
+// parseTableFilters decodes the filters parameter strictly: unknown fields,
+// unknown ops, repeated or empty columns, or a column missing from the live
+// catalog (when the catalog is known) are 400s, never a silently different
+// result set. Values are bound parameters (text; PostgreSQL casts to the
+// column type).
+func parseTableFilters(raw string, meta *tableMeta, catalogKnown bool, argOffset int) ([]string, []any, error) {
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var filters []tableFilter
+	if err := dec.Decode(&filters); err != nil {
+		return nil, nil, fmt.Errorf("filters must be a JSON array of {column, op, value}: %v", err)
+	}
+	if len(filters) == 0 || len(filters) > maxTableFilters {
+		return nil, nil, fmt.Errorf("filters must name between 1 and %d conditions", maxTableFilters)
+	}
+	seen := map[string]bool{}
+	var conds []string
+	var args []any
+	for _, f := range filters {
+		if f.Column == "" || seen[f.Column] {
+			return nil, nil, fmt.Errorf("filter column %q is empty or repeated", f.Column)
+		}
+		seen[f.Column] = true
+		if catalogKnown {
+			if _, ok := meta.Columns[f.Column]; !ok {
+				return nil, nil, fmt.Errorf("filter column %q does not exist", f.Column)
+			}
+		}
+		op, ok := allowedFilterOps[f.Op]
+		if !ok {
+			return nil, nil, fmt.Errorf("filterOp must be one of eq, ne, lt, lte, gt, gte, like, ilike, is-null, not-null")
+		}
+		if op == "IS NULL" || op == "IS NOT NULL" {
+			conds = append(conds, fmt.Sprintf("%s %s", quoteIdent(f.Column), op))
+			continue
+		}
+		args = append(args, f.Value)
+		conds = append(conds, fmt.Sprintf("%s %s $%d", quoteIdent(f.Column), op, argOffset+len(args)))
+	}
+	return conds, args, nil
+}
+
+// parseTableSorts decodes the sorts parameter with the same strictness as
+// parseTableFilters; dir is asc/desc case-insensitively. Columns are
+// qualified by the table name, matching the legacy single-sort shape.
+func parseTableSorts(raw, tableName string, meta *tableMeta, catalogKnown bool) ([]string, error) {
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var sorts []tableSort
+	if err := dec.Decode(&sorts); err != nil {
+		return nil, fmt.Errorf("sorts must be a JSON array of {column, dir}: %v", err)
+	}
+	if len(sorts) == 0 || len(sorts) > maxTableSorts {
+		return nil, fmt.Errorf("sorts must name between 1 and %d keys", maxTableSorts)
+	}
+	parts := make([]string, 0, len(sorts))
+	for _, s := range sorts {
+		if s.Column == "" {
+			return nil, fmt.Errorf("sort column is empty")
+		}
+		if catalogKnown {
+			if _, ok := meta.Columns[s.Column]; !ok {
+				return nil, fmt.Errorf("sort column %q does not exist", s.Column)
+			}
+		}
+		dir := "ASC"
+		if strings.EqualFold(s.Dir, "desc") {
+			dir = "DESC"
+		} else if !strings.EqualFold(s.Dir, "asc") {
+			return nil, fmt.Errorf("sort dir must be asc or desc, got %q", s.Dir)
+		}
+		parts = append(parts, fmt.Sprintf("%s.%s %s", quoteIdent(tableName), quoteIdent(s.Column), dir))
+	}
+	return parts, nil
+}
+
 func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -453,6 +517,14 @@ func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 
 	if connID == "" || schemaName == "" || tableName == "" {
 		writeError(w, http.StatusBadRequest, "connectionId, schema, and table are required")
+		return
+	}
+	if limit > maxTableReadLimit {
+		// Bounded pagination (S06): a page is at most maxTableReadLimit rows.
+		// Refused rather than clamped, so a caller never mistakes a shorter
+		// page for the end of the data. Whole-table reads are exports.
+		writeError(w, http.StatusBadRequest, fmt.Sprintf(
+			"limit must be at most %d rows per page; page with offset or use the streamed export for whole tables", maxTableReadLimit))
 		return
 	}
 	client, ok := s.clientFor(connID)
@@ -493,6 +565,18 @@ func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 			conds = append(conds, fmt.Sprintf("%s.%s %s $%d", quoteIdent(tableName), quoteIdent(filterColumn), op, len(args)))
 		}
 	}
+	// filters: multiple ANDed conditions (the multi-filter UI). Validated as
+	// strictly as the match tuple: a column the live catalog does not know
+	// is a 400, not a query error envelope.
+	if raw := q.Get("filters"); raw != "" {
+		fConds, fArgs, err := parseTableFilters(raw, meta, identityOK, len(args))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		conds = append(conds, fConds...)
+		args = append(args, fArgs...)
+	}
 	// match: a full-tuple equality filter (composite FK follow). Every
 	// component is a bound parameter; the tuple is ANDed as a whole.
 	if raw := q.Get("match"); raw != "" {
@@ -509,13 +593,50 @@ func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 		where = " WHERE " + strings.Join(conds, " AND ")
 	}
 
-	order := ""
+	var orderParts []string
 	if sortColumn != "" {
+		if identityOK {
+			if _, ok := meta.Columns[sortColumn]; !ok {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("sortColumn %q does not exist", sortColumn))
+				return
+			}
+		}
 		dir := "ASC"
 		if strings.EqualFold(sortDir, "desc") {
 			dir = "DESC"
 		}
-		order = fmt.Sprintf(" ORDER BY %s.%s %s", quoteIdent(tableName), quoteIdent(sortColumn), dir)
+		orderParts = append(orderParts, fmt.Sprintf("%s.%s %s", quoteIdent(tableName), quoteIdent(sortColumn), dir))
+	}
+	// sorts: multiple ordered keys (the multi-sort UI), applied after the
+	// legacy single key.
+	if raw := q.Get("sorts"); raw != "" {
+		sParts, err := parseTableSorts(raw, tableName, meta, identityOK)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		orderParts = append(orderParts, sParts...)
+	}
+	// Deterministic paging (S06): the primary key is the unique tail of
+	// every table read, so OFFSET pages neither repeat nor skip rows of an
+	// unchanged table (ties under the user's sort keys resolve by key).
+	if identityOK {
+		sortedCols := map[string]bool{}
+		if sortColumn != "" {
+			sortedCols[sortColumn] = true
+		}
+		if raw := q.Get("sorts"); raw != "" {
+			var keys []tableSort
+			_ = json.Unmarshal([]byte(raw), &keys) // validated above
+			for _, k := range keys {
+				sortedCols[k.Column] = true
+			}
+		}
+		orderParts = append(orderParts, keyTiebreakers(meta, tableName, sortedCols)...)
+	}
+	order := ""
+	if len(orderParts) > 0 {
+		order = " ORDER BY " + strings.Join(orderParts, ", ")
 	}
 
 	// Quoted identifiers throughout; filter values are bound parameters.
@@ -560,6 +681,11 @@ func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 	result, err := collectTaggedRows(rows)
 	if err != nil {
 		log.Printf("studio: table query error: %v", err)
+		s.recordStatement(loggedStatement{
+			At: time.Now(), Connection: connID, Surface: "table-read",
+			SQL: buildSQL(), DurationMs: float64(time.Since(start).Microseconds()) / 1000,
+			State: "error", Error: errorTextFor(err),
+		})
 		writeJSON(w, http.StatusOK, map[string]any{
 			"columns":  []string{},
 			"rows":     [][]any{},
@@ -568,6 +694,23 @@ func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 			"error":    sanitizeError(err),
 		})
 		return
+	}
+	s.recordStatement(loggedStatement{
+		At: time.Now(), Connection: connID, Surface: "table-read",
+		SQL: buildSQL(), DurationMs: float64(time.Since(start).Microseconds()) / 1000,
+		RowCount: len(result.data), State: "ok",
+	})
+
+	// Separated row counts: filterCount applies the SAME conditions as the
+	// read (filters + match), totalCount applies none. rowCount above stays
+	// the FETCHED count. A count failure degrades to omitted fields (the
+	// read itself stays useful), never a failed read.
+	var filterCount, totalCount int64
+	countsOK := false
+	if err := client.QueryRow(r.Context(), fmt.Sprintf(
+		"SELECT (SELECT count(*) FROM %s%s), (SELECT count(*) FROM %s)", tableRef, where, tableRef),
+		args...).Scan(&filterCount, &totalCount); err == nil {
+		countsOK = true
 	}
 
 	response := map[string]any{
@@ -578,6 +721,10 @@ func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 		"keyColumns": []string{},
 		"versioned":  false,
 		"readOnly":   true,
+	}
+	if countsOK {
+		response["filterCount"] = filterCount
+		response["totalCount"] = totalCount
 	}
 	if !identityOK {
 		response["readOnlyReason"] = fmt.Sprintf(

@@ -98,19 +98,28 @@ func TestValidateSchemaUnsupportedTypeRejected(t *testing.T) {
 	}
 }
 
-func TestValidateSchemaVectorRequiresNucleusOnly(t *testing.T) {
+// X01: vector columns fail closed in v1 documents (the nucleusOnly escape
+// and its skip behavior are withdrawn); v2 owns vector planning.
+func TestValidateSchemaVectorFailsClosedInV1(t *testing.T) {
 	s := validUsersSchema()
 	s.Tables[0].Columns = append(s.Tables[0].Columns, ColumnDef{Name: "embedding", Type: "vector", VectorDims: 3})
 	err := ValidateSchema(&s)
-	if err == nil || !strings.Contains(err.Error(), "nucleusOnly") {
-		t.Fatalf("expected non-nucleusOnly vector rejection, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "vector columns require schema document v2") {
+		t.Fatalf("expected vector fail-closed rejection, got %v", err)
 	}
 
+	// The legacy shape validates only through the dedicated upgrade reader.
+	if err := ValidateSchemaV1ForUpgrade(&s); err == nil {
+		t.Fatal("non-nucleusOnly vector must fail the legacy upgrade rule too")
+	} else if !strings.Contains(err.Error(), "must be nucleusOnly") {
+		t.Fatalf("expected the legacy upgrade rule, got %v", err)
+	}
 	s.Tables[0].Columns[3].NucleusOnly = true
-	s.Tables[0].Columns[3].VectorDims = 0
-	err = ValidateSchema(&s)
-	if err == nil || !strings.Contains(err.Error(), "vectorDimensions") {
-		t.Fatalf("expected missing-dims rejection, got %v", err)
+	if err := ValidateSchemaV1ForUpgrade(&s); err != nil {
+		t.Fatalf("legacy nucleusOnly vector shape must validate for upgrade, got %v", err)
+	}
+	if err := ValidateSchema(&s); err == nil || !strings.Contains(err.Error(), "vector columns require schema document v2") {
+		t.Fatalf("planning validation must still reject the legacy shape, got %v", err)
 	}
 }
 

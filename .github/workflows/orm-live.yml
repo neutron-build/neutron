@@ -1,0 +1,175 @@
+name: ORM vs live engines
+
+# X00 / V18: what @neutron-build/sql (and the introspection its tools rely on)
+# can actually rely on when the engine behind NEUTRON_TEST_DATABASE_URL is
+# Nucleus instead of PostgreSQL. The probes live in conformance/live/orm/ and
+# always encode PostgreSQL behaviour; two legs keep them honest:
+#
+#   control — the same probes against postgres:17 must be ALL `supported`.
+#             A probe that fails on PostgreSQL tests the probe, not the
+#             engine, and this leg fails loudly instead of letting a broken
+#             probe manufacture an `unsupported` verdict about Nucleus.
+#   nucleus — the probes run against a Nucleus built from THIS commit and
+#             `--check` compares every verdict with the tracked capability
+#             file conformance/live/orm/capabilities.nucleus.json. Any status
+#             change in either direction fails the build: the file cannot
+#             silently go stale, and an engine change that fixes or breaks a
+#             capability must be re-recorded and reviewed, never absorbed.
+#
+# Path filters are deliberately narrower than sdk-live.yml: this workflow is
+# about the ORM's contract with the engine, so it runs when the engine, the
+# probe suite, the engine start script, the SQL package, the lockfile pinning
+# its drivers or the workflow itself changes — not when an unrelated
+# Postgres-only path changes. sdk-live.yml excludes conformance/live/orm/**,
+# so a probe-only change does not rerun every SDK. The Postgres live battery for
+# neutron-sql stays in typescript.yml and is untouched by this workflow.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "nucleus/**"
+      - "conformance/live/orm/**"
+      - "conformance/live/scripts/**"
+      - "typescript/packages/neutron-sql/**"
+      - "typescript/pnpm-lock.yaml"
+      - ".github/workflows/orm-live.yml"
+  pull_request:
+    paths:
+      - "nucleus/**"
+      - "conformance/live/orm/**"
+      - "conformance/live/scripts/**"
+      - "typescript/packages/neutron-sql/**"
+      - "typescript/pnpm-lock.yaml"
+      - ".github/workflows/orm-live.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  control:
+    name: Probes encode PostgreSQL (control, Postgres 17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      NEUTRON_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: typescript/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: typescript/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: typescript
+
+      - name: Build @neutron-build/sql
+        run: pnpm --filter @neutron-build/sql build
+        working-directory: typescript
+
+      # --control fails unless EVERY probe is `supported` on PostgreSQL, both
+      # drivers. This is the no-weakening gate: a probe relaxed to tolerate
+      # Nucleus would fail here, and a probe broken by a driver update fails
+      # here too instead of misreporting the engine.
+      - name: Run all probes against PostgreSQL (must be all supported)
+        run: node conformance/live/orm/run.mjs --control
+
+      # The report's measured tables are generated from the capability file;
+      # a re-record without regenerating them (or prose citing a probe that
+      # no longer exists) fails here.
+      - name: Capability report matches the recorded capability file
+        run: node conformance/live/orm/report.mjs --check
+
+  # One engine build, reused by both driver legs (same shape as sdk-live.yml).
+  engine:
+    name: Build the engine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus
+      - name: Build nucleus
+        working-directory: nucleus
+        run: cargo build --release --bin nucleus --features server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nucleus-bin-orm
+          path: nucleus/target/release/nucleus
+          if-no-files-found: error
+          retention-days: 1
+
+  nucleus:
+    name: ORM ${{ matrix.driver }} vs live Nucleus
+    needs: engine
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        driver: [pg, postgres]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nucleus-bin-orm
+          path: nucleus/target/release
+      - run: chmod +x nucleus/target/release/nucleus
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: typescript/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: typescript/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: typescript
+
+      - name: Build @neutron-build/sql
+        run: pnpm --filter @neutron-build/sql build
+        working-directory: typescript
+
+      - name: Start Nucleus
+        run: sh conformance/live/scripts/start-engine.sh 55432 /tmp/nucleus-live
+
+      # --check fails on any verdict that differs from the tracked capability
+      # file — including a probe that used to be unsupported becoming
+      # supported. Re-run with --write against the new engine and review the
+      # diff; never hand-edit a status.
+      - name: Run probes and compare with the recorded capability file
+        env:
+          NEUTRON_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:55432/postgres
+          NUCLEUS_BIN: nucleus/target/release/nucleus
+        run: node conformance/live/orm/run.mjs --driver ${{ matrix.driver }} --check conformance/live/orm/capabilities.nucleus.json
+
+      - name: Report
+        if: always()
+        run: tail -50 /tmp/nucleus-live/server.log || true

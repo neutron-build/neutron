@@ -7,13 +7,14 @@ interface GeoModuleProps {
   name: string
 }
 
-type CalcType = 'distance' | 'within' | 'area'
+type CalcType = 'distance' | 'within' | 'area' | 'contains'
 
 // Nucleus has NO geo store to enumerate — only scalar geometry functions.
 // This module is an honest calculator over user-entered coordinates:
 //   GEO_DISTANCE(lat1,lon1,lat2,lon2)          → meters (haversine)
 //   GEO_WITHIN(lat1,lon1,lat2,lon2,radius_m)   → bool
 //   GEO_AREA(x1,y1,x2,y2,x3,y3,...)            → polygon area (>=3 pairs)
+//   ST_CONTAINS(polygon_wkt, ST_MAKEPOINT(x,y)) → bool (OGC: boundary NOT contained)
 
 // Parse a textarea of "x,y" (or "x y") pairs, one per line, into a flat
 // coordinate argument list for GEO_AREA.
@@ -39,13 +40,19 @@ export function GeoModule({ name }: GeoModuleProps) {
   const lon2 = useSignal('-118.2437')
   const radius = useSignal('600000')
 
-  // Polygon input (area) — "x,y" per line
+  // Polygon input (area/contains) — "x,y" per line
   const polygon = useSignal('0,0\n4,0\n4,3\n0,3')
+
+  // Point input (contains) — x,y against the polygon
+  const ptX = useSignal('2')
+  const ptY = useSignal('1.5')
 
   const result = useSignal<string | null>(null)
   const running = useSignal(false)
 
   const conn = activeConnection.value!
+
+  // Build a closed WKT ring from flat x,y coordinates (area/contains).
 
   async function runCalc() {
     running.value = true
@@ -65,6 +72,23 @@ export function GeoModule({ name }: GeoModuleProps) {
             throw new Error('GEO_AREA needs at least 3 coordinate pairs')
           }
           sql = `SELECT GEO_AREA(${coords.join(', ')})`
+          break
+        }
+        case 'contains': {
+          const coords = parsePolygon(polygon.value)
+          if (coords.length < 6) {
+            throw new Error('ST_CONTAINS needs at least 3 coordinate pairs')
+          }
+          const ring: Array<[number, number]> = []
+          for (let i = 0; i < coords.length; i += 2) ring.push([coords[i], coords[i + 1]])
+          if (
+            ring[0][0] !== ring[ring.length - 1][0] ||
+            ring[0][1] !== ring[ring.length - 1][1]
+          ) {
+            ring.push([ring[0][0], ring[0][1]])
+          }
+          const wkt = `POLYGON((${ring.map(([x, y]) => `${x} ${y}`).join(', ')}))`
+          sql = `SELECT ST_CONTAINS('${wkt}', ST_MAKEPOINT(${num(ptX.value)}, ${num(ptY.value)}))`
           break
         }
       }
@@ -88,13 +112,13 @@ export function GeoModule({ name }: GeoModuleProps) {
 
       <div class={s.queryPanel}>
         <div class={s.tabs}>
-          {(['distance', 'within', 'area'] as CalcType[]).map(t => (
+          {(['distance', 'within', 'area', 'contains'] as CalcType[]).map(t => (
             <button
               key={t}
               class={`${s.tab} ${calcType.value === t ? s.tabActive : ''}`}
               onClick={() => { calcType.value = t; result.value = null }}
             >
-              {t === 'distance' ? 'Distance' : t === 'within' ? 'Within Radius' : 'Polygon Area'}
+              {t === 'distance' ? 'Distance' : t === 'within' ? 'Within Radius' : t === 'area' ? 'Polygon Area' : 'Contains Point'}
             </button>
           ))}
         </div>
@@ -111,7 +135,13 @@ export function GeoModule({ name }: GeoModuleProps) {
               )}
             </>
           )}
-          {calcType.value === 'area' && (
+          {calcType.value === 'contains' && (
+            <>
+              <Field label="Point x" value={ptX.value} onChange={v => { ptX.value = v }} />
+              <Field label="Point y" value={ptY.value} onChange={v => { ptY.value = v }} />
+            </>
+          )}
+          {(calcType.value === 'area' || calcType.value === 'contains') && (
             <div class={s.field} style={{ flex: 1 }}>
               <label class={s.fieldLabel}>Polygon points (x,y per line, &ge; 3)</label>
               <textarea
@@ -151,6 +181,10 @@ function formatResult(type: CalcType, cell: unknown): string {
   if (type === 'within') {
     const b = cell === true || cell === 'true' || cell === 't'
     return b ? 'Within radius: true' : 'Within radius: false'
+  }
+  if (type === 'contains') {
+    const b = cell === true || cell === 'true' || cell === 't'
+    return b ? 'Contained: true (interior point)' : 'Contained: false (exterior or ON the boundary — boundary points are not contained)'
   }
   const n = Number(cell)
   if (isNaN(n)) return String(cell)

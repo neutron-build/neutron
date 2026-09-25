@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { decodeCell, decodeRows, encodeCell, formatCell, isTaggedCell, WireDecodeError } from './wire'
+import { decodeCell, decodeRows, encodeCell, encodeEdit, formatCell, hasUTCOffset, isTaggedCell, WireDecodeError, WireEncodeError, type WireTag } from './wire'
 
 // Fixtures pin the tagged wire format (the backend side lands with the typed
 // row-identity protocol; these tests are the format contract both ends meet):
@@ -128,5 +128,86 @@ describe('wire display and bytea editing', () => {
     expect(formatCell({ n: 1n })).toBe('{"n":"1"}')
     expect(encodeCell('\\x00ff', 'bytea')).toEqual({ t: 'bytea', v: '00ff' })
     expect(encodeCell('00ff', 'bytea')).toEqual({ t: 'bytea', v: '00ff' })
+  })
+})
+
+describe('encodeEdit — S03 typed staging to wire form', () => {
+  const col = (type: string, tag: WireTag | null = null) => ({ name: 'c', type, tag })
+
+  it('null and default never coerce into values or each other', () => {
+    expect(encodeEdit({ kind: 'null' }, col('text'))).toEqual({ kind: 'null' })
+    expect(encodeEdit({ kind: 'default' }, col('text'))).toEqual({ kind: 'omit' })
+  })
+
+  it('an empty text value is a real empty string', () => {
+    expect(encodeEdit({ kind: 'value', text: '' }, col('text'))).toEqual({ kind: 'value', value: '' })
+  })
+
+  it('tagged columns cross as tagged cells — digits never through Number', () => {
+    expect(encodeEdit({ kind: 'value', text: '9007199254740993' }, col('bigint', 'int8')))
+      .toEqual({ kind: 'value', value: { t: 'int8', v: '9007199254740993' } })
+    expect(encodeEdit({ kind: 'value', text: '12.3450' }, col('numeric', 'numeric')))
+      .toEqual({ kind: 'value', value: { t: 'numeric', v: '12.3450' } })
+    expect(encodeEdit({ kind: 'value', text: '2026-01-02T03:04:05Z' }, col('timestamptz', 'timestamptz')))
+      .toEqual({ kind: 'value', value: { t: 'timestamptz', v: '2026-01-02T03:04:05Z' } })
+  })
+
+  it('booleans cross as booleans; anything else is refused with the column named', () => {
+    expect(encodeEdit({ kind: 'value', text: 'true' }, col('boolean'))).toEqual({ kind: 'value', value: true })
+    expect(encodeEdit({ kind: 'value', text: 'false' }, col('boolean'))).toEqual({ kind: 'value', value: false })
+    expect(() => encodeEdit({ kind: 'value', text: 'yes' }, col('boolean'))).toThrow(WireEncodeError)
+    try {
+      encodeEdit({ kind: 'value', text: 'yes' }, col('boolean'))
+    } catch (err) {
+      expect((err as Error).message).toContain('c')
+    }
+  })
+
+  it('JSON columns require valid JSON text and cross as the text itself', () => {
+    expect(encodeEdit({ kind: 'value', text: '{"a":1}' }, col('jsonb')))
+      .toEqual({ kind: 'value', value: '{"a":1}' })
+    expect(() => encodeEdit({ kind: 'value', text: '{nope' }, col('json'))).toThrow(WireEncodeError)
+  })
+
+  it('plain text and bytea display forms round-trip', () => {
+    expect(encodeEdit({ kind: 'value', text: 'plain' }, col('text'))).toEqual({ kind: 'value', value: 'plain' })
+    expect(encodeEdit({ kind: 'value', text: '\\x00ff' }, col('bytea', 'bytea')))
+      .toEqual({ kind: 'value', value: { t: 'bytea', v: '00ff' } })
+  })
+})
+
+// S05: the client mirrors the server's timestamptz offset discipline —
+// offset-less values are refused at staging time with the same guidance,
+// offset-bearing and special values pass untouched.
+describe('encodeCell timestamptz offset discipline (S05)', () => {
+  it('refuses offset-less values with the canonical-form guidance', () => {
+    for (const v of ['2026-09-24 12:34:56', '2026-09-24', '2026-09-24T12:34:56.000001']) {
+      expect(() => encodeCell(v, 'timestamptz')).toThrow(WireEncodeError)
+      expect(() => encodeCell(v, 'timestamptz')).toThrow(/no UTC offset/)
+    }
+  })
+  it('accepts explicit offsets, Z and the specials', () => {
+    expect(encodeCell('2026-09-24T12:34:56Z', 'timestamptz')).toEqual({ t: 'timestamptz', v: '2026-09-24T12:34:56Z' })
+    expect(encodeCell('2026-09-24 12:34:56+02:00', 'timestamptz')).toEqual({ t: 'timestamptz', v: '2026-09-24 12:34:56+02:00' })
+    expect(encodeCell('2026-09-24T12:34:56+0530', 'timestamptz')).toEqual({ t: 'timestamptz', v: '2026-09-24T12:34:56+0530' })
+    expect(encodeCell('infinity', 'timestamptz')).toEqual({ t: 'timestamptz', v: 'infinity' })
+    expect(encodeCell('0001-01-01T00:00:00.5Z BC', 'timestamptz')).toEqual({ t: 'timestamptz', v: '0001-01-01T00:00:00.5Z BC' })
+  })
+  it('agrees with the server check (wire.go) on its accept/refuse table', () => {
+    const accept = [
+      '2026-09-24T12:34:56Z', '2026-09-24 12:34:56+02:00', '2026-09-24T12:34:56.000001-07:30',
+      '2026-09-24T12:34:56+05', '2026-09-24T12:34:56+0530', '2026-09-24 12:34:56 +02',
+      '2026-09-24 12:34:56 UTC', '2026-09-24 12:34:56.5 gmt', 'infinity', '-infinity', 'epoch',
+      '0001-01-01T00:00:00.5Z BC',
+    ]
+    const refuse = [
+      '2026-09-24 12:34:56', '2026-09-24', '2026-09-24T12:34:56.000001', '',
+      '12:34:56+02:00', '2026-09-24 12:34:56 America/Vancouver', '2026-09-24 12:34:56  +02',
+    ]
+    for (const v of accept) expect(hasUTCOffset(v), v).toBe(true)
+    for (const v of refuse) expect(hasUTCOffset(v), v).toBe(false)
+  })
+  it('leaves timestamp (without timezone) offset-less canonical values alone', () => {
+    expect(encodeCell('2026-01-01T00:00:00', 'timestamp')).toEqual({ t: 'timestamp', v: '2026-01-01T00:00:00' })
   })
 })

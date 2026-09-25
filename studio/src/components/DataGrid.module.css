@@ -109,16 +109,67 @@
 
 /* --- editing + FK follow + sort (SQL browser parity) --- */
 
-.cellInput {
-  width: 100%;
-  min-width: 6rem;
-  padding: 2px 6px;
-  border: 1px solid var(--accent, #4da3ff);
-  border-radius: 3px;
-  background: var(--bg-elevated, #1e1e2e);
+.stagedCell {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  background: color-mix(in srgb, var(--warning, #f0c674) 14%, transparent);
+  border-bottom: 1px dashed var(--warning, #f0c674);
   color: var(--text-primary, #e0e0e0);
-  font-family: var(--font-mono);
+  padding: 0 3px;
+  border-radius: 2px;
+}
+
+.trStagedDelete {
+  opacity: 0.5;
+}
+
+.trStagedDelete > td {
+  text-decoration: line-through;
+}
+
+.trFocus {
+  outline: 2px solid var(--danger, #ff6b6b);
+  outline-offset: -2px;
+}
+
+.tdFocus {
+  outline: 2px solid var(--danger, #ff6b6b);
+  outline-offset: -2px;
+  background: color-mix(in srgb, var(--danger, #ff6b6b) 12%, transparent);
+}
+
+.thAction {
+  width: 2rem;
+  padding: var(--space-2) var(--space-1);
+}
+
+.tdAction {
+  border-bottom: 1px solid var(--border-subtle);
+  padding: 0 var(--space-1);
+  text-align: center;
+}
+
+.deleteBtn {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: var(--text-tertiary, #888);
+  cursor: pointer;
   font-size: var(--text-sm);
+  line-height: 1;
+  padding: 1px 5px;
+}
+
+.deleteBtn:hover:not(:disabled) {
+  color: var(--danger, #ff6b6b);
+  border-color: var(--danger, #ff6b6b);
+}
+
+.deleteBtn:disabled {
+  opacity: 0.35;
+  cursor: default;
 }
 
 .nullBtn {
@@ -177,20 +228,82 @@
   border-top: 1px solid var(--border, #333344);
 }
 
-.cellEditor {
+/* X01: read-only vector/tsvector cells (exact text render + copy). */
+.vectorCell {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  width: 100%;
+  max-width: 100%;
 }
 
-.nullToggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  font-size: var(--text-xs);
-  color: var(--text-secondary, #aaa);
-  cursor: pointer;
-  user-select: none;
+.vectorText {
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+}
+
+.copyBtn {
+  border: none;
+  background: transparent;
+  color: var(--text-dim, #888);
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.copyBtn:hover {
+  color: var(--accent, #4af);
+}
+
+/* --- S06: virtualized rows + keyboard grid --- */
+
+/* Fixed row height: the virtualizer's window math relies on it. */
+.tr {
+  height: 28px;
+}
+
+.spacer,
+.spacer > td {
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+
+.td:focus {
+  outline: none;
+}
+
+.tdActive:focus,
+.tdActive:focus-within {
+  outline: 2px solid var(--accent, #4da3ff);
+  outline-offset: -2px;
+}
+
+.tdEditing {
+  overflow: visible;
+}
+
+.sortBtn {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  letter-spacing: inherit;
+  cursor: pointer;
+}
+
+.sortBtn:focus-visible {
+  outline: 2px solid var(--accent, #4da3ff);
+  outline-offset: 1px;
+}
+
+.truncatedNote {
+  padding: 4px 8px;
+  font-size: var(--text-xs);
+  color: var(--warning, #f0c674);
+  border-top: 1px solid var(--border, #333344);
 }

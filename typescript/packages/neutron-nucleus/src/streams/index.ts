@@ -15,25 +15,84 @@ export interface StreamEntry {
   fields: Record<string, unknown>;
 }
 
+/**
+ * A read cursor: either a bare millisecond or a full `"<ms>-<seq>"` entry id
+ * (the string `xadd` returns). The two forms are NOT interchangeable, and the
+ * bare form is a silent-loss hazard in `xread`. The engine reads a bare
+ * millisecond as "strictly after that WHOLE millisecond" (internally
+ * `<ms>-<max seq>`; engine `stream_cursor_arg`, found by the engine's own
+ * `probe_streams_oracle`): a consumer that already read up to `<ms>-0` and
+ * resumes with the bare `<ms>` is never served `<ms>-1` or any later sibling
+ * appended inside that same millisecond — those entries are skipped,
+ * silently, forever. Resuming with the LAST ENTRY'S FULL ID is the only
+ * cursor that reaches every later entry; prefer it wherever you have one.
+ */
+export type StreamCursor = number | string;
+
 // ---------------------------------------------------------------------------
 // StreamsModel interface
 // ---------------------------------------------------------------------------
 
+/**
+ * Ordering: entry ids are strictly increasing `<ms>-<seq>`; reads return
+ * entries in id order.
+ *
+ * Delivery semantics (Nucleus 1.0.x, verified live — see
+ * conformance/live/orm x05 leg): `xreadGroup` advances the group cursor and
+ * records the delivery in the same call — delivery is AT-MOST-ONCE per read.
+ * There is no XCLAIM/XAUTOCLAIM and no idle reclaim: a pending (delivered,
+ * unacked) entry is never redelivered, by any consumer, for the life of the
+ * group. Ack what you finished; anything you read but did not ack is
+ * stranded in the pending list. Exactly-once is not attempted by the engine
+ * and must not be assumed by consumers.
+ *
+ * Backpressure: pull-based. No server push exists over the SQL surface; each
+ * call bounds its own work with `count`. A consumer that stops polling
+ * accumulates entries in the stream (subject to the stream's max length
+ * trimming) — there is no per-consumer queue to overflow.
+ *
+ * Durability: entries are fsynced to the streams WAL before the append is
+ * acknowledged; consumer groups, cursors, pending lists and acks are
+ * persisted in the same log. A restart replays entries and group state. A
+ * delivery that was read but not acked before a restart stays pending (it is
+ * NOT redelivered — see above). An append inside a transaction that rolls
+ * back is removed from the stream and compensated out of the WAL.
+ */
 export interface StreamsModel {
-  /** Append an entry to a stream. Returns the generated entry ID. */
+  /** Append an entry to a stream. Returns the generated entry id (`"<ms>-<seq>"`). */
   xadd(stream: string, fields: Record<string, unknown>): Promise<string>;
 
-  /** Return the number of entries in a stream. */
+  /** Return the number of entries in a stream (0 if the stream does not exist). */
   xlen(stream: string): Promise<number>;
 
-  /** Return entries between `startMs` and `endMs` timestamps (inclusive). */
-  xrange(stream: string, startMs: number, endMs: number, count: number): Promise<StreamEntry[]>;
+  /**
+   * Return up to `count` entries whose ids fall in `[start, end]` (inclusive).
+   * Bounds accept a bare millisecond or a full `"<ms>-<seq>"` id; a bare
+   * millisecond covers its whole millisecond (start: from its first entry,
+   * end: through its last). A stream that does not exist answers an empty
+   * array, same as an empty range.
+   */
+  xrange(stream: string, start: StreamCursor, end: StreamCursor, count: number): Promise<StreamEntry[]>;
 
-  /** Read new entries after `lastIdMs`. */
-  xread(stream: string, lastIdMs: number, count: number): Promise<StreamEntry[]>;
+  /**
+   * Read up to `count` entries with id strictly greater than `lastId`.
+   * `lastId` accepts a bare millisecond or a full `"<ms>-<seq>"` id — use the
+   * full id of the last entry you processed: a bare millisecond means
+   * "strictly after that whole millisecond" and silently SKIPS any
+   * same-millisecond entries appended after your last read (the loss hazard
+   * described on {@link StreamCursor}). A stream that does not exist answers
+   * an empty array, same as "no new entries".
+   */
+  xread(stream: string, lastId: StreamCursor, count: number): Promise<StreamEntry[]>;
 
-  /** Create a consumer group on a stream. */
-  xgroupCreate(stream: string, group: string, startId: number): Promise<boolean>;
+  /**
+   * Create a consumer group starting at `startIdMs` (bare millisecond).
+   * Creating a group that already exists fails with the engine's BUSYGROUP
+   * error — a plain create never resets a live group's cursor or pending
+   * list (the engine's optional destructive `recreate` flag is deliberately
+   * not exposed here; use the SQL model if you really need it).
+   */
+  xgroupCreate(stream: string, group: string, startIdMs: number): Promise<boolean>;
 
   /**
    * Read entries from a consumer group.
@@ -45,7 +104,9 @@ export interface StreamsModel {
 
   /**
    * Acknowledge processing of an entry in a consumer group, by the id `xadd`
-   * returned. Returns the number of entries acknowledged.
+   * returned. Returns the number of entries acknowledged (0 when the id is
+   * not pending in this group — e.g. already acked, delivered to another
+   * consumer, or never delivered).
    *
    * The id is the `"<ms>-<seq>"` string xadd returns. This took idMs and idSeq as separate numbers, so the two ends of the same API did not compose — every caller split xadd's return value itself, and the consumer-group conformance case was xfail in all five SDKs for that reason.
    */
@@ -86,19 +147,19 @@ class StreamsModelImpl implements StreamsModel {
     return (await this.transport.fetchval<number>('SELECT STREAM_XLEN($1)', [stream])) ?? 0;
   }
 
-  async xrange(stream: string, startMs: number, endMs: number, count: number): Promise<StreamEntry[]> {
+  async xrange(stream: string, start: StreamCursor, end: StreamCursor, count: number): Promise<StreamEntry[]> {
     this.require();
     const raw = await this.transport.fetchval<string>('SELECT STREAM_XRANGE($1, $2, $3, $4)', [
-      stream, startMs, endMs, count,
+      stream, start, end, count,
     ]);
     if (!raw) return [];
     return JSON.parse(raw) as StreamEntry[];
   }
 
-  async xread(stream: string, lastIdMs: number, count: number): Promise<StreamEntry[]> {
+  async xread(stream: string, lastId: StreamCursor, count: number): Promise<StreamEntry[]> {
     this.require();
     const raw = await this.transport.fetchval<string>('SELECT STREAM_XREAD($1, $2, $3)', [
-      stream, lastIdMs, count,
+      stream, lastId, count,
     ]);
     if (!raw) return [];
     return JSON.parse(raw) as StreamEntry[];

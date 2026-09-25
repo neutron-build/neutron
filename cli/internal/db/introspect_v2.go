@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -176,7 +177,13 @@ SELECT ic.oid,
          SELECT array_agg(oc.opcdefault ORDER BY k.ord)
            FROM unnest(i.indclass) WITH ORDINALITY AS k(opclass, ord)
            JOIN pg_opclass oc ON oc.oid = k.opclass
-       ) AS opclass_defaults
+       ) AS opclass_defaults,
+       (
+         SELECT array_agg(oc.opcname::text ORDER BY k.ord)
+           FROM unnest(i.indclass) WITH ORDINALITY AS k(opclass, ord)
+           JOIN pg_opclass oc ON oc.oid = k.opclass
+       ) AS opclass_names,
+       COALESCE(ic.reloptions, '{}'::name[])::text[] AS index_reloptions
 FROM pg_index i
 JOIN pg_class ic ON ic.oid = i.indexrelid
 JOIN pg_am am ON am.oid = ic.relam
@@ -206,7 +213,7 @@ var introspectBaseTypes = map[string]bool{
 	"bool": true, "text": true, "varchar": true,
 	"timestamp": true, "timestamptz": true, "date": true,
 	"bytea": true, "uuid": true, "json": true, "jsonb": true,
-	"vector": true,
+	"vector": true, "tsvector": true,
 }
 
 // pgCastCompactions rewrites deparsed type-name casts into the contract's
@@ -991,6 +998,8 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 		predicate       *string
 		extOwned        bool
 		opclassDefaults []bool
+		opclassNames    []string
+		reloptions      []string
 	}
 	var rawIndexes []rawIndex
 	idxRows, err := q.Query(ctx, introspectV2IndexesSQL, rel.oid)
@@ -999,7 +1008,7 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 	}
 	for idxRows.Next() {
 		var r rawIndex
-		if err := idxRows.Scan(&r.oid, &r.name, &r.unique, &r.method, &r.nkey, &r.natt, &r.indkey, &r.indoption, &r.indcoll, &r.indexdef, &r.predicate, &r.extOwned, &r.opclassDefaults); err != nil {
+		if err := idxRows.Scan(&r.oid, &r.name, &r.unique, &r.method, &r.nkey, &r.natt, &r.indkey, &r.indoption, &r.indcoll, &r.indexdef, &r.predicate, &r.extOwned, &r.opclassDefaults, &r.opclassNames, &r.reloptions); err != nil {
 			idxRows.Close()
 			return table, nil, nil, err
 		}
@@ -1024,11 +1033,49 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 			reasons = append(reasons, fmt.Sprintf("unique index %q is NULLS NOT DISTINCT (not representable in schema document v2)", r.name))
 			continue
 		}
+		if !v2IndexMethods[r.method] {
+			reasons = append(reasons, fmt.Sprintf("index %q uses access method %q (outside the contract vocabulary btree/hash/gin/gist/spgist/brin/hnsw/ivfflat, not representable)", r.name, r.method))
+			continue
+		}
 		idx := V2Index{
 			Identity: V2Identity{Schema: rel.schema, Name: r.name},
 			Unique:   r.unique,
 			Method:   r.method,
 			Key:      []V2IndexKeyPart{},
+		}
+		// Access-method parameters (X01): reloptions `key=value` entries.
+		// Integers only in the vocabulary; anything else keeps the index
+		// (and its table) honestly unrepresentable rather than lossy.
+		if len(r.reloptions) > 0 {
+			with := make(map[string]int64, len(r.reloptions))
+			ok := true
+			for _, opt := range r.reloptions {
+				eq := strings.IndexByte(opt, '=')
+				if eq <= 0 {
+					reasons = append(reasons, fmt.Sprintf("index %q has a non key=value reloption %q (not representable)", r.name, opt))
+					ok = false
+					break
+				}
+				k, v := opt[:eq], opt[eq+1:]
+				if !v2OpclassPattern.MatchString(k) {
+					reasons = append(reasons, fmt.Sprintf("index %q has a reloption key %q (not a plain lowercase identifier, not representable)", r.name, k))
+					ok = false
+					break
+				}
+				n, err := strconv.ParseInt(v, 10, 64)
+				if err != nil {
+					reasons = append(reasons, fmt.Sprintf("index %q has a non-integer reloption %q (the contract carries integer access-method parameters only, not representable)", r.name, opt))
+					ok = false
+					break
+				}
+				with[k] = n
+			}
+			if !ok {
+				continue
+			}
+			if len(with) > 0 {
+				idx.With = with
+			}
 		}
 		bad := false
 		for i := 0; i < r.nkey; i++ {
@@ -1049,14 +1096,24 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 					nulls = strPtrV2("first")
 				}
 			}
-			// A non-default opclass is not representable (the contract key
-			// shape has no opclass slot). pg_get_indexdef(part) omits
-			// opclass/collation entirely, so this is checked against the
-			// catalog, never the deparse.
+			// A non-default operator class is REPRESENTABLE since X01: the
+			// key part carries the catalog's opcname verbatim. pg_get_indexdef
+			// omits opclass/collation for default classes only, so the name is
+			// read from the catalog, never guessed from the deparse.
+			var opclass *string
 			if i < len(r.opclassDefaults) && !r.opclassDefaults[i] {
-				reasons = append(reasons, fmt.Sprintf("index %q key part %d uses a non-default operator class (not representable)", r.name, i+1))
-				bad = true
-				break
+				if i >= len(r.opclassNames) {
+					reasons = append(reasons, fmt.Sprintf("index %q key part %d uses a non-default operator class the catalog did not name (not representable)", r.name, i+1))
+					bad = true
+					break
+				}
+				name := r.opclassNames[i]
+				if !v2OpclassPattern.MatchString(name) {
+					reasons = append(reasons, fmt.Sprintf("index %q key part %d uses operator class %q (not a plain lowercase identifier, not representable)", r.name, i+1, name))
+					bad = true
+					break
+				}
+				opclass = strPtrV2(name)
 			}
 			attnum := r.indkey[i]
 			if attnum == 0 {
@@ -1091,18 +1148,23 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 				break
 			}
 			// pg_get_indexdef(idx, part, false) returns the bare column
-			// name; anything else means a non-default decoration the
+			// name (default operator class) or `col opclass` when the class
+			// is explicit; anything else is a non-default decoration the
 			// catalog checks above did not classify.
 			partDef, err := indexPartExpressionOn(ctx, q, r.oid, i+1)
 			if err != nil {
 				return table, nil, nil, err
 			}
-			if partDef != cn && partDef != quoteIdent(cn) {
+			accepted := partDef == cn || partDef == quoteIdent(cn)
+			if !accepted && opclass != nil {
+				accepted = partDef == cn+" "+*opclass || partDef == quoteIdent(cn)+" "+*opclass
+			}
+			if !accepted {
 				reasons = append(reasons, fmt.Sprintf("index %q key part %d carries a non-default decoration (%q)", r.name, i+1, partDef))
 				bad = true
 				break
 			}
-			idx.Key = append(idx.Key, V2IndexKeyPart{Column: strPtrV2(cn), Order: order, Nulls: nulls})
+			idx.Key = append(idx.Key, V2IndexKeyPart{Column: strPtrV2(cn), Order: order, Nulls: nulls, Opclass: opclass})
 		}
 		if bad {
 			continue

@@ -127,8 +127,11 @@ export function exportTable(table: AnyPgTable): ExportedTable {
     }
     if (col.varcharLength) exported.varcharLength = col.varcharLength;
     if (col.dataType === "vector") {
-      exported.nucleusOnly = true;
-      exported.vectorDimensions = col.vectorDimensions;
+      // X01: the v1 shape cannot carry the pgvector capability; the old
+      // nucleusOnly marking (skip-on-Postgres) is withdrawn — a skipped
+      // column is a silently queried-but-nonexistent column. Export v2 owns
+      // vector columns.
+      throw new Error(`exportTable: column "${col.columnName}" of "${getTableName(table)}" is a vector column — the legacy v1 export shape cannot represent it (the pgvector capability and its dimension contract); use exportSchemaV2 (X01)`);
     }
     if (col.foreignKey) {
       const target = col.foreignKey();
@@ -210,6 +213,10 @@ export interface V2IndexKeyPart {
   readonly expression?: string;
   readonly order?: "asc" | "desc";
   readonly nulls?: "first" | "last";
+  /** Explicit operator class (X01): pgvector's hnsw/ivfflat indexes select
+   *  their distance semantics this way (vector_ops / vector_cosine_ops /
+   *  vector_ip_ops). Omitted = the method's default class for the type. */
+  readonly opclass?: string;
 }
 
 export interface V2Index {
@@ -219,6 +226,10 @@ export interface V2Index {
   readonly key: readonly V2IndexKeyPart[];
   readonly where?: string;
   readonly include?: readonly string[];
+  /** Access-method parameters (X01): `with (m = 16, ef_construction = 64)`
+   *  on HNSW, `with (lists = 100)` on IVFFlat. Integer or string values;
+   *  keys are plain identifiers. Canonical form sorts the keys. */
+  readonly with?: Readonly<Record<string, number | string>>;
 }
 
 export interface V2Enum {
@@ -266,6 +277,7 @@ const V2_TYPE_NAMES: Record<string, string> = {
   text: "text", varchar: "varchar", boolean: "bool",
   timestamp: "timestamp", timestamptz: "timestamptz", date: "date",
   json: "json", jsonb: "jsonb", uuid: "uuid", bytea: "bytea", vector: "vector",
+  tsvector: "tsvector",
 };
 const V2_TYPE_CODECS: Record<string, string> = {
   bool: "boolean", int2: "number", int4: "number", int8: "bigint",
@@ -273,8 +285,9 @@ const V2_TYPE_CODECS: Record<string, string> = {
   text: "string", varchar: "string",
   timestamp: "timestamp-string", timestamptz: "timestamptz-string", date: "date-string",
   bytea: "binary", uuid: "uuid", json: "json", jsonb: "json", vector: "vector",
+  tsvector: "tsvector",
 };
-const V2_INDEX_METHODS = new Set(["btree", "hash", "gin", "gist", "spgist", "brin"]);
+const V2_INDEX_METHODS = new Set(["btree", "hash", "gin", "gist", "spgist", "brin", "hnsw", "ivfflat"]);
 const V2_IDENTITY_TYPES = new Set(["serial", "integer", "smallint", "bigint"]);
 
 /** Default-operator-class facts for the index methods and column types in
@@ -288,10 +301,15 @@ const V2_IDENTITY_TYPES = new Set(["serial", "integer", "smallint", "bigint"]);
 const V2_INDEX_METHOD_SCALARS: Record<string, ReadonlySet<string>> = {
   btree: new Set(["text", "varchar", "bool", "int2", "int4", "int8", "float4", "float8", "numeric", "timestamp", "timestamptz", "date", "uuid", "bytea", "enum", "jsonb"]),
   hash: new Set(["text", "varchar", "bool", "int2", "int4", "int8", "float4", "float8", "numeric", "timestamp", "timestamptz", "date", "uuid", "bytea", "enum", "jsonb"]),
-  gin: new Set(["jsonb"]),
+  gin: new Set(["jsonb", "tsvector"]),
   gist: new Set(),
   spgist: new Set(["text", "varchar"]),
   brin: new Set(["text", "varchar", "int2", "int4", "int8", "float4", "float8", "numeric", "timestamp", "timestamptz", "date", "uuid", "bytea"]),
+  // pgvector access methods (X01): both apply to the vector type; the
+  // default operator class is vector_ops (L2). cosine/inner-product indexes
+  // name vector_cosine_ops / vector_ip_ops explicitly (key-part opclass).
+  hnsw: new Set(["vector"]),
+  ivfflat: new Set(["vector"]),
 };
 const V2_INDEX_METHOD_ARRAYS = new Set(["btree", "hash", "gin"]);
 
@@ -394,7 +412,7 @@ function v2TypeFor(tableId: V2Identity, column: AnyColumnBuilder): V2TypeRef {
  *  (ASC defaults to NULLS LAST, DESC to NULLS FIRST). This is exactly what
  *  introspection derives from pg_index.indoption, so desired and
  *  introspected documents canonicalize identically. */
-function v2IndexKeyPart(part: { column?: string; expression?: unknown; order?: "asc" | "desc"; nulls?: "first" | "last" }): V2IndexKeyPart {
+function v2IndexKeyPart(part: { column?: string; expression?: unknown; order?: "asc" | "desc"; nulls?: "first" | "last"; opclass?: string }): V2IndexKeyPart {
   const order = part.order === "desc" ? ("desc" as const) : undefined;
   const nulls =
     (order === undefined && part.nulls === "first") || (order === "desc" && part.nulls === "last")
@@ -405,6 +423,7 @@ function v2IndexKeyPart(part: { column?: string; expression?: unknown; order?: "
     ...(part.expression !== undefined ? { expression: part.expression as string } : {}),
     ...(order ? { order } : {}),
     ...(nulls ? { nulls } : {}),
+    ...(part.opclass !== undefined ? { opclass: part.opclass } : {}),
   };
 }
 
@@ -675,6 +694,7 @@ export function exportSchemaV2(input: SchemaV2Input): SchemaDocumentV2 {
             }
             const colType = columnTypes.get(p.column);
             if (
+              p.opclass === undefined &&
               colType !== undefined &&
               !(colType.array ? V2_INDEX_METHOD_ARRAYS.has(idx.methodValue) : (V2_INDEX_METHOD_SCALARS[idx.methodValue] ?? new Set()).has(colType.name))
             ) {
@@ -706,6 +726,18 @@ export function exportSchemaV2(input: SchemaV2Input): SchemaDocumentV2 {
             throw exportError("index-column", idxAt, `INCLUDE references unknown column ${JSON.stringify(inc)}`);
           }
         }
+        let withParams: Readonly<Record<string, number | string>> | undefined;
+        if (idx.withParams !== undefined) {
+          for (const [k, v] of Object.entries(idx.withParams)) {
+            if (!/^[a-z_][a-z0-9_]*$/.test(k)) {
+              throw exportError("invalid-index", `${idxAt}.with[${k}]`, "access-method parameter names must be plain lowercase identifiers");
+            }
+            if (typeof v !== "number" || !Number.isInteger(v)) {
+              throw exportError("invalid-index", `${idxAt}.with[${k}]`, "access-method parameters are integers (m, ef_construction, lists, fillfactor)");
+            }
+          }
+          withParams = { ...idx.withParams };
+        }
         return {
           identity: { schema: tableId.schema, name: idx.indexName },
           unique: idx.unique,
@@ -713,6 +745,7 @@ export function exportSchemaV2(input: SchemaV2Input): SchemaDocumentV2 {
           key,
           ...(idx.whereExpr !== undefined ? { where: renderSchemaExpression(idx.whereExpr, { what: `${idxAt}.where`, table }) } : {}),
           ...(idx.includeCols.length > 0 ? { include: [...idx.includeCols] } : {}),
+          ...(withParams !== undefined ? { with: withParams } : {}),
         };
       }),
     });
@@ -758,7 +791,11 @@ export function exportSchemaV2(input: SchemaV2Input): SchemaDocumentV2 {
   return {
     version: 2,
     dialect: "postgresql",
-    capabilities: hasVector ? ["nucleus"] : [],
+    // X01: vector columns mean the POSTGRESQL pgvector extension (detected
+    // per-database via pg_extension — separate from engine capabilities and
+    // from Nucleus model capabilities). Backends without it fail migrations
+    // and queries; they never skip the column.
+    capabilities: hasVector ? ["pgvector"] : [],
     schemas: [...schemas].sort(byteCompare).map((name) => ({ name })),
     tables: out,
     enums: enumList,
@@ -882,11 +919,22 @@ export function canonicalSchemaJson(doc: SchemaDocumentV2): string {
           if (part.column !== undefined) parts.push(`"column":${canonicalString(part.column)}`);
           if (part.expression !== undefined) parts.push(`${part.column !== undefined ? "," : ""}"expression":${canonicalString(part.expression)}`);
           if (part.nulls !== undefined) parts.push(`,"nulls":${canonicalString(part.nulls)}`);
+          if (part.opclass !== undefined) parts.push(`,"opclass":${canonicalString(part.opclass)}`);
           if (part.order !== undefined) parts.push(`,"order":${canonicalString(part.order)}`);
           parts.push("}");
         });
         parts.push(`],"method":${canonicalString(idx.method)},"unique":${idx.unique}`);
         if (idx.where !== undefined) parts.push(`,"where":${canonicalString(idx.where)}`);
+        if (idx.with !== undefined) {
+          const keys = Object.keys(idx.with).sort(byteCompare);
+          parts.push(`,"with":{`);
+          keys.forEach((k, n) => {
+            if (n > 0) parts.push(",");
+            const v = idx.with![k];
+            parts.push(`${canonicalString(k)}:${typeof v === "string" ? canonicalString(v) : String(v)}`);
+          });
+          parts.push("}");
+        }
         parts.push("}");
       });
     parts.push(`],"managed":${t.managed}}`);
@@ -1017,7 +1065,9 @@ export function readSchemaDocumentV1(input: unknown): SchemaDocumentV2 {
   return {
     version: 2,
     dialect: "postgresql",
-    capabilities: hasVector ? ["nucleus"] : [],
+    // X01: same capability separation as exportSchemaV2 — vector in an
+    // upgraded v1 document means the PostgreSQL pgvector extension.
+    capabilities: hasVector ? ["pgvector"] : [],
     schemas: [{ name: "public" }],
     tables,
     enums: [],

@@ -819,7 +819,10 @@ func fkSideEffectsAffectRow(ctx context.Context, tx pgx.Tx, schemaName, tableNam
 // transaction, capturing old values for the preview diff and the recorded
 // inverse. Every guarded statement rechecks the operation's originals
 // (full key + xmin version, exactly-one-row); a zero-row mutation is
-// classified conflict/missing and aborts the whole batch.
+// classified conflict/missing and aborts the whole batch. EVERY error is
+// prefixed with its operations[N] position (S05 entry condition S03-F1):
+// execution-time failures are as attributable as prepare-time ones, so a
+// multi-op batch never pins an innocent first row.
 func runCommitOps(ctx context.Context, tx pgx.Tx, prepared []*preparedOp) ([]opExecution, error) {
 	var out []opExecution
 	for _, p := range prepared {
@@ -832,7 +835,7 @@ func runCommitOps(ctx context.Context, tx pgx.Tx, prepared []*preparedOp) ([]opE
 				dest[i] = &scanVals[i]
 			}
 			if err := tx.QueryRow(ctx, sqlText, p.insArgs...).Scan(dest...); err != nil {
-				return nil, err
+				return nil, fmtOpError(p.index, err)
 			}
 			keyOut := make([]keyCell, len(p.meta.PKCols))
 			for i, pk := range p.meta.PKCols {
@@ -859,9 +862,9 @@ func runCommitOps(ctx context.Context, tx pgx.Tx, prepared []*preparedOp) ([]opE
 				p.keyArgs...).Scan(&oldValue)
 			if err != nil {
 				if errors.Is(err, pgx.ErrNoRows) {
-					return nil, explainRowConflictV2(ctx, tx, p.schema, p.table, p.keyArgs, p.keyCols, "update")
+					return nil, fmtOpError(p.index, explainRowConflictV2(ctx, tx, p.schema, p.table, p.keyArgs, p.keyCols, "update"))
 				}
-				return nil, err
+				return nil, fmtOpError(p.index, err)
 			}
 			before := wireValueOf(p.colMeta, oldValue)
 			ex := opExecution{}
@@ -882,10 +885,10 @@ func runCommitOps(ctx context.Context, tx pgx.Tx, prepared []*preparedOp) ([]opE
 			}
 			n, newVersion, err := runGuardedMutation(ctx, tx, sqlText, args...)
 			if err != nil {
-				return nil, err
+				return nil, fmtOpError(p.index, err)
 			}
 			if n != 1 {
-				return nil, explainRowConflictV2(ctx, tx, p.schema, p.table, p.keyArgs, p.keyCols, "update")
+				return nil, fmtOpError(p.index, explainRowConflictV2(ctx, tx, p.schema, p.table, p.keyArgs, p.keyCols, "update"))
 			}
 			ex.result = opResult{Index: p.index, Op: "update", RowsAffected: n, Version: newVersion}
 			ex.before = before
@@ -910,9 +913,9 @@ func runCommitOps(ctx context.Context, tx pgx.Tx, prepared []*preparedOp) ([]opE
 				p.keyArgs...).Scan(dest...)
 			if err != nil {
 				if errors.Is(err, pgx.ErrNoRows) {
-					return nil, explainRowConflictV2(ctx, tx, p.schema, p.table, p.keyArgs, p.keyCols, "delete")
+					return nil, fmtOpError(p.index, explainRowConflictV2(ctx, tx, p.schema, p.table, p.keyArgs, p.keyCols, "delete"))
 				}
-				return nil, err
+				return nil, fmtOpError(p.index, err)
 			}
 			beforeRow := make(map[string]any, len(p.meta.Order))
 			for i, col := range p.meta.Order {
@@ -927,10 +930,10 @@ func runCommitOps(ctx context.Context, tx pgx.Tx, prepared []*preparedOp) ([]opE
 			sqlText, args := buildGuardedMutationV2(p.schema, p.table, mut, p.keyArgs, p.keyCols, p.version)
 			n, _, err := runGuardedMutation(ctx, tx, sqlText, args...)
 			if err != nil {
-				return nil, err
+				return nil, fmtOpError(p.index, err)
 			}
 			if n != 1 {
-				return nil, explainRowConflictV2(ctx, tx, p.schema, p.table, p.keyArgs, p.keyCols, "delete")
+				return nil, fmtOpError(p.index, explainRowConflictV2(ctx, tx, p.schema, p.table, p.keyArgs, p.keyCols, "delete"))
 			}
 			ex.result = opResult{Index: p.index, Op: "delete", RowsAffected: n}
 			out = append(out, ex)
@@ -1395,6 +1398,41 @@ func (s *Server) handleTableRevertV2(w http.ResponseWriter, r *http.Request) {
 		})
 		writeJSON(w, status, out)
 		return
+	}
+	// runCommitOps re-probed FK side effects for every inverse update/delete
+	// INSIDE this transaction (execs[i].fkSide/fkErr). Between the commit and
+	// this revert a child row may have started honoring a cascade/set-null/
+	// set-default rule against the committed value; applying the inverse
+	// would change that child silently. Abort before Commit: the deferred
+	// Rollback discards everything, and the refusal explains what to repair
+	// (S02 review F1).
+	for i := range execs {
+		if execs[i].fkErr != nil {
+			out := map[string]any{
+				"state": "irreversible",
+				"error": fmt.Sprintf(
+					"operations[%d]: the revert could not be verified to stay row-precise (%v); nothing was applied — repair the rows that changed after the commit",
+					i, sanitizeError(execs[i].fkErr)),
+			}
+			store.finish(revertKey, func(rec *outcomeRecord) {
+				rec.State, rec.Status, rec.Response = outcomeFailed, http.StatusConflict, out
+			})
+			writeJSON(w, http.StatusConflict, out)
+			return
+		}
+		if execs[i].fkSide {
+			out := map[string]any{
+				"state": "irreversible",
+				"error": fmt.Sprintf(
+					"operations[%d]: rows now reference the committed value through an ON DELETE/UPDATE cascade/set-null/set-default rule (they appeared after the commit); reverting would change them silently — nothing was applied",
+					i),
+			}
+			store.finish(revertKey, func(rec *outcomeRecord) {
+				rec.State, rec.Status, rec.Response = outcomeFailed, http.StatusConflict, out
+			})
+			writeJSON(w, http.StatusConflict, out)
+			return
+		}
 	}
 	if err := tx.Commit(r.Context()); err != nil {
 		log.Printf("studio: revert commit error: %v", err)

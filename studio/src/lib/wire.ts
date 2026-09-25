@@ -7,7 +7,7 @@
 // studio, landed with the typed row-identity protocol); plain values pass
 // through unchanged, so connections that send untagged rows keep working.
 
-export type WireTag = 'int8' | 'numeric' | 'date' | 'timestamp' | 'timestamptz' | 'bytea'
+export type WireTag = 'int8' | 'numeric' | 'date' | 'timestamp' | 'timestamptz' | 'bytea' | 'vector' | 'tsvector'
 
 export interface TaggedCell {
   t: WireTag
@@ -21,7 +21,7 @@ export class WireDecodeError extends Error {
   }
 }
 
-const TAGS: readonly WireTag[] = ['int8', 'numeric', 'date', 'timestamp', 'timestamptz', 'bytea']
+const TAGS: readonly WireTag[] = ['int8', 'numeric', 'date', 'timestamp', 'timestamptz', 'bytea', 'vector', 'tsvector']
 
 export function isTaggedCell(value: unknown): value is TaggedCell {
   if (typeof value !== 'object' || value === null) return false
@@ -91,12 +91,42 @@ export function encodeCell(value: unknown, tag?: WireTag | null): unknown {
   if (tag && typeof value === 'string') {
     // Display form of bytea is \x-prefixed hex; the wire payload is bare hex.
     const v = tag === 'bytea' && /^\\x/i.test(value) ? value.slice(2) : value
+    // Client mirror of the server's timestamptz discipline (S05): a value
+    // without an explicit offset would be silently interpreted in the
+    // server's session timezone — refuse it here so the editor surfaces
+    // the problem at staging time with the same guidance.
+    if (tag === 'timestamptz' && !hasUTCOffset(v)) {
+      throw new WireEncodeError(
+        `"${v}" has no UTC offset: the server would interpret it in its session timezone, silently storing a different instant; append an explicit offset (e.g. "+02:00") or use the canonical UTC form (e.g. 2026-09-24T12:34:56Z)`)
+    }
     return { t: tag, v }
   }
   if (tag === 'int8' && typeof value === 'number' && Number.isInteger(value)) {
     return { t: 'int8', v: String(value) }
   }
   return value
+}
+
+/** Mirrors the server's timestamptz offset check (wire.go hasUTCOffset):
+ * Z/UTC/GMT or ±HH[:MM] after the time (optionally after one space) or
+ * after the date, plus the specials. */
+export function hasUTCOffset(v: string): boolean {
+  const s = v.trim()
+  if (s === '') return false
+  if (/^(infinity|-infinity|epoch)$/i.test(s)) return true
+  const bare = s.endsWith(' BC') ? s.slice(0, -3).trim() : s
+  const dateRest = /^(\d{4}-\d{2}-\d{2})(.*)$/.exec(bare)
+  if (!dateRest) return false
+  const rest = dateRest[2]
+  if (rest === '') return false
+  if (rest === 'Z' || rest === 'z') return true
+  if (/^[+-]\d{2}(:?\d{2})?(:\d{2}(\.\d+)?)?$/.test(rest)) return true
+  const timeMatch = /^[ T]\d{2}(:\d{2})?(:\d{2})?(\.\d+)?/.exec(rest)
+  if (!timeMatch) return false
+  // One optional space before the zone, and the UTC/GMT abbreviations, as
+  // PostgreSQL accepts them.
+  const zone = rest.slice(timeMatch[0].length).replace(/^ /, '')
+  return /^(z|utc|gmt)$/i.test(zone) || /^[+-]\d{2}(:?\d{2})?(:\d{2}(\.\d+)?)?$/.test(zone)
 }
 
 /**
@@ -115,4 +145,54 @@ export function formatCell(value: unknown): string {
     }
   }
   return String(value)
+}
+
+/**
+ * Encode a staged cell edit to its wire form for one column (S03). The
+ * three-way discipline is preserved exactly: 'null' is SQL NULL, 'default'
+ * omits the column (insert DEFAULT), and 'value' encodes per the column's
+ * authoritative type — tagged columns re-tag (bigint/decimal digits never
+ * cross through Number), booleans cross as booleans, JSON crosses as
+ * validated JSON text. Throws WireEncodeError for text that cannot be the
+ * column's value; the server re-validates strictly regardless.
+ */
+export class WireEncodeError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'WireEncodeError'
+  }
+}
+
+export interface EditableColumnShape {
+  name: string
+  type: string
+  tag: WireTag | null
+}
+
+export type EncodedEdit =
+  | { kind: 'value'; value: unknown }
+  | { kind: 'null' }
+  | { kind: 'omit' }
+
+export function encodeEdit(edit: { kind: 'value'; text: string } | { kind: 'null' } | { kind: 'default' }, col: EditableColumnShape): EncodedEdit {
+  if (edit.kind === 'null') return { kind: 'null' }
+  if (edit.kind === 'default') return { kind: 'omit' }
+  const text = edit.text
+  if (col.type === 'boolean' || col.type === 'bool') {
+    if (text === 'true') return { kind: 'value', value: true }
+    if (text === 'false') return { kind: 'value', value: false }
+    throw new WireEncodeError(`column ${col.name}: boolean value must be true or false`)
+  }
+  if (/^json(b)?$/.test(col.type)) {
+    try {
+      JSON.parse(text)
+    } catch (err) {
+      throw new WireEncodeError(`column ${col.name}: invalid JSON text (${err instanceof Error ? err.message : String(err)})`)
+    }
+    return { kind: 'value', value: text }
+  }
+  if (col.tag) {
+    return { kind: 'value', value: encodeCell(text, col.tag) }
+  }
+  return { kind: 'value', value: text }
 }

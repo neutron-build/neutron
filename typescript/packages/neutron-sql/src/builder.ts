@@ -25,7 +25,7 @@ import type {
   SelectTypeOf,
   UpdateTypeOf,
 } from "./schema.js";
-import { ALIAS_MARKER, getDerivedRecord, getTableColumns, getTableName, isAliasHandle, isPgTable, rejectAliasHandle, rejectDerivedTable, rejectViewHandle, tableRefParts } from "./schema.js";
+import { ALIAS_MARKER, ColumnBuilder, getDerivedRecord, getTableColumns, getTableName, isAliasHandle, isPgTable, rejectAliasHandle, rejectDerivedTable, rejectViewHandle, tableRefParts } from "./schema.js";
 import {
   aggregateResultColumn,
   applyProjectionDecoders,
@@ -33,8 +33,10 @@ import {
   assertColumnWritable,
   columnWireReadNode,
   encodeWriteValue,
+  isTemporalExpression,
   projectionDecoder,
   richCodecSource,
+  temporalExpressionSource,
   type BigintMode,
   type ColumnContext,
   type EncodedValue,
@@ -50,6 +52,7 @@ import {
   collectExcludedRefs,
   cte,
   defaultCell,
+  fragment,
   ident,
   insertStatement,
   isLegacySqlFragment,
@@ -63,6 +66,7 @@ import {
   qual,
   selectStatement,
   statementReferencesName,
+  collectRequirements,
   subquery as subqueryNode,
   updateStatement,
   validAlias,
@@ -984,6 +988,25 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
             pushColumn({ key, dataType: spec.dataType, readMode: spec.readMode, valueDecoder: spec.valueDecoder, canonicalText: spec.dataType === "timestamp" || spec.dataType === "timestamptz" || spec.dataType === "date" });
             continue;
           }
+          if (isTemporalExpression(value)) {
+            // X03: temporal-typed expressions from optional capability
+            // modules (timeBucket) follow the lossless temporal wire form —
+            // to_jsonb(...)::text with the UTC wall-clock projection for
+            // timestamptz — and decode through the source column's codec,
+            // exactly like a temporal column read. The node keeps its own
+            // capability requirements (collected from the final statement).
+            const src = temporalExpressionSource(value);
+            const inner = src.dataType === "timestamptz" ? fragment("to_jsonb(", value, " at time zone 'UTC')::text") : fragment("to_jsonb(", value, ")::text");
+            nodes.push(projectionNode(inner, key));
+            caps.add("jsonb-functions");
+            const synthetic = new ColumnBuilder(key, src.dataType);
+            if (src.readMode !== undefined) synthetic.readMode = src.readMode;
+            if (src.valueDecoder !== undefined) synthetic.valueDecoder = src.valueDecoder;
+            const decoder = projectionDecoder("", synthetic, key);
+            if (decoder) decoders.push(decoder);
+            pushColumn({ key, dataType: src.dataType, readMode: src.readMode as BigintMode | TemporalMode | undefined, valueDecoder: src.valueDecoder, canonicalText: src.dataType === "timestamp" || src.dataType === "timestamptz" || src.dataType === "date", source: richCodecSource(src) });
+            continue;
+          }
           collectWindowCapabilities(value, caps);
           nodes.push(projectionNode(value, key));
           pushColumn({ key, dataType: "text" });
@@ -1111,6 +1134,10 @@ export class SelectBuilder<P extends Projection | null, R0 = unknown, N extends 
     // same source (Q02 review MINOR-2): unregistered or shadowed same-name
     // references fail closed here instead of silently binding.
     assertCteRefsResolve(stmt);
+    // X01: expressions spliced by optional capability modules (/pgvector,
+    // /fts) carry their requirements on the nodes (where/having/group/
+    // order/projections/joins/CTEs); collect them from the final statement.
+    collectRequirements(stmt, caps);
     return { stmt, decoders, capabilities: [...caps], columns };
   }
 
@@ -1890,10 +1917,12 @@ export class UpdateBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
       returning: returningPlan.nodes,
     });
     assertCteRefsResolve(stmt);
+    const caps = new Set<StatementCapability>(returningPlan.capabilities);
+    collectRequirements(stmt, caps);
     return {
       ...compileStatement(stmt),
       decoders: returningPlan.decoders,
-      capabilities: returningPlan.capabilities,
+      capabilities: [...caps],
     };
   }
 
@@ -1971,10 +2000,12 @@ export class DeleteBuilder<TCols extends Record<string, AnyColumnBuilder>, R = n
       returning: returningPlan.nodes,
     });
     assertCteRefsResolve(stmt);
+    const caps = new Set<StatementCapability>(returningPlan.capabilities);
+    collectRequirements(stmt, caps);
     return {
       ...compileStatement(stmt),
       decoders: returningPlan.decoders,
-      capabilities: returningPlan.capabilities,
+      capabilities: [...caps],
     };
   }
 

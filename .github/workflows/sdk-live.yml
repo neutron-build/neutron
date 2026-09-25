@@ -27,6 +27,7 @@ on:
     paths:
       - "nucleus/**"
       - "conformance/live/**"
+      - "!conformance/live/orm/**"
       - "python/**"
       - "go/**"
       - "typescript/packages/neutron-nucleus/**"
@@ -39,6 +40,7 @@ on:
     paths:
       - "nucleus/**"
       - "conformance/live/**"
+      - "!conformance/live/orm/**"
       - "python/**"
       - "go/**"
       - "typescript/packages/neutron-nucleus/**"

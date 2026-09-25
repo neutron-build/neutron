@@ -24,6 +24,22 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./fts": {
+      "types": "./dist/fts.d.ts",
+      "import": "./dist/fts.js"
+    },
+    "./timeseries": {
+      "types": "./dist/timeseries.d.ts",
+      "import": "./dist/timeseries.js"
+    },
+    "./columnar": {
+      "types": "./dist/columnar.d.ts",
+      "import": "./dist/columnar.js"
+    },
+    "./listen-notify": {
+      "types": "./dist/listen-notify.d.ts",
+      "import": "./dist/listen-notify.js"
     }
   },
   "files": [

@@ -466,12 +466,26 @@ describe('api', () => {
         { column: 'tenant_id', value: 1 },
         { column: 'id', value: { t: 'int8', v: '9007199254740993' } },
       ]
-      await api.tableData('c1', 'public', 'docs', 200, 0, undefined, undefined, match)
+      await api.tableData('c1', 'public', 'docs', 200, 0, undefined, undefined, undefined, match)
       const url = new URL('http://x' + mockFetch.mock.calls[0][0])
       expect(url.pathname).toBe('/api/table')
       expect(JSON.parse(url.searchParams.get('match')!)).toEqual(match)
       // A GET read carries no session header.
       expect(mockFetch.mock.calls[0][1].headers).toBeUndefined()
+    })
+
+    it('tableData sends multi-filter and multi-sort arrays as JSON parameters', async () => {
+      mockOk({ columns: [], rows: [], rowCount: 0, duration: 0 })
+      const filters = [
+        { column: 'flag', op: 'eq', value: 'true' },
+        { column: 'body', op: 'is-null' },
+      ]
+      const sorts = [{ column: 'body', dir: 'asc' as const }, { column: 'id', dir: 'desc' as const }]
+      await api.tableData('c1', 'public', 'docs', 200, 0, filters, undefined, sorts)
+      const url = new URL('http://x' + mockFetch.mock.calls[0][0])
+      expect(JSON.parse(url.searchParams.get('filters')!)).toEqual(filters)
+      expect(JSON.parse(url.searchParams.get('sorts')!)).toEqual(sorts)
+      expect(url.searchParams.has('sortColumn')).toBe(false)
     })
 
     it('large keys survive the JSON round trip: tagged cells are sent verbatim', async () => {

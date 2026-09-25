@@ -54,16 +54,12 @@ test("exportSchema: relations entries are ignored (tables only)", () => {
   assert.equal(exported.tables.length, 2);
 });
 
-test("exportSchema: vector columns marked nucleusOnly with dimensions", () => {
+test("exportSchema: vector columns fail closed in the v1 shape (X01)", () => {
   const docs = pgTable("docs", {
     id: serial("id").primaryKey(),
     embedding: vector("embedding", 1536),
   });
-  const exported = exportSchema({ docs });
-  const emb = exported.tables[0].columns[1];
-  assert.equal(emb.type, "vector");
-  assert.equal(emb.nucleusOnly, true);
-  assert.equal(emb.vectorDimensions, 1536);
+  assert.throws(() => exportSchema({ docs }), /vector column.*legacy v1 export shape cannot represent it.*exportSchemaV2/s);
 });
 
 // ---------------------------------------------------------------------------
@@ -141,7 +137,7 @@ test("exportSchemaV2: deterministic across runs and input key order", () => {
     doc.tables[2].columns.map((c) => c.name),
     ["id", "email", "name", "created_at", "active", "balance"],
   );
-  assert.deepEqual(doc.capabilities, ["nucleus"]);
+  assert.deepEqual(doc.capabilities, ["pgvector"]);
 });
 
 test("exportSchemaV2: golden fixture agreement (canonical bytes + sha, Go + TS CI-pinned)", () => {
@@ -241,7 +237,7 @@ test("readSchemaDocumentV1: upgrades legacy documents to the pinned golden bytes
   assert.equal(sha256(canonical), entry.sha256, "hash agreement with the Go-recorded manifest value");
 
   const vectorDoc: SchemaDocumentV2 = readSchemaDocumentV1(JSON.parse(readFileSync(goldenDir("vector-upgrade.json"), "utf8")));
-  assert.deepEqual(vectorDoc.capabilities, ["nucleus"]);
+  assert.deepEqual(vectorDoc.capabilities, ["pgvector"]);
   const vectorCanonical = canonicalSchemaJson(vectorDoc);
   assert.equal(vectorCanonical, readFileSync(goldenDir("vector-upgrade.canonical.json"), "utf8"));
 });

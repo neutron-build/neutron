@@ -2,8 +2,12 @@ import type {
   Connection, ConnectionInput, TestResult,
   Schema, NucleusFeatures, QueryResult,
   ColumnDetail, IndexDetail, SavedQuery, FKDetail,
-  TableMeta, MutationOutcome, KeyCell, MatchCell,
+  TableMeta, MutationOutcome, KeyCell, MatchCell, TableFilter, TableSort,
   CommitResponse, PreviewResponse, OutcomeResponse, CommitOperation,
+  CancelQueryResponse, ExplainOutcome, ExplainPlan, ExplainRefusal,
+  SchemaObjectDetail, SchemaChange, SchemaPlanResponse,
+  DiagnosticsQueriesResponse, TableStatsResponse,
+  ExportFormat, ExportTicket, ImportBatchRequest, ImportBatchResponse, ImportOutcomeResponse,
 } from './types'
 import { decodeRows } from './wire'
 
@@ -25,8 +29,10 @@ export class ApiError extends Error {
   /** The rows' relation binding is stale (reconnect or table replaced). */
   binding?: boolean
   currentVersion?: string
+  /** The parsed JSON error body, for endpoints with richer refusals. */
+  body?: Record<string, unknown>
 
-  constructor(status: number, message: string, extra?: { state?: string; auth?: string; conflict?: boolean; missing?: boolean; currentVersion?: string }) {
+  constructor(status: number, message: string, extra?: { state?: string; auth?: string; conflict?: boolean; missing?: boolean; currentVersion?: string; body?: Record<string, unknown> }) {
     super(message)
     this.name = 'ApiError'
     this.status = status
@@ -36,6 +42,7 @@ export class ApiError extends Error {
     this.missing = extra?.missing
     this.binding = extra?.state === undefined ? undefined : extra.state === 'binding'
     this.currentVersion = extra?.currentVersion
+    this.body = extra?.body
   }
 }
 
@@ -134,6 +141,7 @@ async function toApiError(res: Response): Promise<ApiError> {
           conflict: parsed.state === 'conflict',
           missing: parsed.state === 'missing',
           currentVersion: parsed.currentVersion,
+          body: parsed as Record<string, unknown>,
         })
       }
       text = raw
@@ -178,8 +186,35 @@ export const api = {
 
   // --- Query (arbitrary SQL; mutating, so it carries the session token) ---
 
-  query: (sql: string, connectionId: string, params?: unknown[]) =>
-    requestQueryResult('POST', '/query', { sql, connectionId, params }),
+  query: (sql: string, connectionId: string, params?: unknown[], requestId?: string) =>
+    requestQueryResult('POST', '/query', { sql, connectionId, params, requestId }),
+
+  /** Cancel a running editor statement server-side (pg_cancel_backend on
+   *  the backend that runs it). 404 means it already finished. */
+  cancelQuery: (connectionId: string, requestId: string) =>
+    mutationRequest<CancelQueryResponse>('POST', '/query/cancel', { connectionId, requestId }),
+
+  /** EXPLAIN a statement. analyze=false never executes it; analyze=true
+   *  executes it read-only and rolled back unless allowWrites (then writes
+   *  run and are still rolled back). Refusals (422) resolve as ok:false. */
+  explain: async (input: {
+    connectionId: string
+    sql: string
+    params?: unknown[]
+    requestId?: string
+    analyze: boolean
+    allowWrites?: boolean
+  }): Promise<ExplainOutcome> => {
+    try {
+      const plan = await mutationRequest<Omit<ExplainPlan, 'ok'>>('POST', '/query/explain', input)
+      return { ...plan, ok: true }
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 422 && err.body) {
+        return { ...(err.body as Omit<ExplainRefusal, 'ok'>), ok: false }
+      }
+      throw err
+    }
+  },
 
   // --- Schema ---
 
@@ -191,13 +226,16 @@ export const api = {
   features: (connectionId: string) =>
     request<NucleusFeatures>('GET', `/features?connectionId=${connectionId}`),
 
-  // --- Table data (paginated, filterable, sortable) ---
+  // --- Table data (paginated, multi-filterable, multi-sortable) ---
 
   tableData: (
     connectionId: string, schema: string, table: string,
     limit = 200, offset = 0,
-    filter?: { column: string; op: string; value?: string },
+    /** Multiple ANDed filters (S03); legacy single-filter callers pass one. */
+    filters?: TableFilter[],
     sort?: { column: string; dir: 'asc' | 'desc' },
+    /** Ordered multi-sort keys (S03); earlier keys take precedence. */
+    sorts?: TableSort[],
     /** Full-tuple equality filter (composite FK follow); values are wire cells. */
     match?: MatchCell[],
   ) => {
@@ -205,14 +243,15 @@ export const api = {
       connectionId, schema, table,
       limit: String(limit), offset: String(offset),
     })
-    if (filter) {
-      params.set('filterColumn', filter.column)
-      params.set('filterOp', filter.op)
-      if (filter.value !== undefined) params.set('filterValue', filter.value)
+    if (filters && filters.length > 0) {
+      params.set('filters', JSON.stringify(filters))
     }
     if (sort) {
       params.set('sortColumn', sort.column)
       params.set('sortDir', sort.dir)
+    }
+    if (sorts && sorts.length > 0) {
+      params.set('sorts', JSON.stringify(sorts))
     }
     if (match && match.length > 0) {
       params.set('match', JSON.stringify(match))
@@ -225,6 +264,18 @@ export const api = {
   tableMeta: (connectionId: string, schema: string, table: string) =>
     request<TableMeta>('GET',
       `/table/v2/meta?connectionId=${connectionId}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`),
+
+  // X01: table search (vector similarity + full-text), read-only and
+  // parameter-bound server-side.
+  tableSearch: (input: {
+    connectionId: string; schema: string; table: string
+    kind: 'vector' | 'fts'
+    column: string
+    query: string
+    operator?: 'l2' | 'cosine' | 'inner-product' | 'l1'
+    config?: string
+    limit?: number
+  }) => mutationRequest<QueryResult>('POST', '/table/v2/search', input),
 
   tableInsert: (input: {
     connectionId: string; schema: string; table: string
@@ -283,6 +334,26 @@ export const api = {
     revertOperationId: string
   }) => mutationRequest<CommitResponse>('POST', '/table/v2/revert', input),
 
+  // --- S06: streamed export and batched import ---
+
+  /** Validate an export (session-guarded) and receive a single-use ticket;
+   *  the browser then downloads `url` natively (streamed to disk). */
+  tableExport: (input: {
+    connectionId: string; schema: string; table: string
+    format: ExportFormat
+    filters?: TableFilter[]
+    sorts?: TableSort[]
+    match?: MatchCell[]
+  }) => mutationRequest<ExportTicket>('POST', '/table/v2/export', input),
+
+  /** Insert one import batch atomically (all rows or none). */
+  importBatch: (input: ImportBatchRequest) =>
+    mutationRequest<ImportBatchResponse>('POST', '/table/v2/import/batch', input),
+
+  /** Resolve an import batch ID after a dropped response. */
+  importOutcome: (connectionId: string, operationId: string) =>
+    mutationRequest<ImportOutcomeResponse>('POST', '/table/v2/import/outcome', { connectionId, operationId }),
+
   // --- Interim v1 row endpoints (guarded, kept during the transition) ---
 
   tableUpdate: (input: {
@@ -315,6 +386,35 @@ export const api = {
     request<{ code: string }>('GET',
       `/codegen?connectionId=${connectionId}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}&lang=${lang}`
     ),
+
+  // --- S05: schema navigation and planning ---
+
+  /** One relation's catalog metadata from the shared v2 introspection. */
+  schemaObject: (connectionId: string, schema: string, table: string) =>
+    request<SchemaObjectDetail>('GET',
+      `/schema/object?connectionId=${encodeURIComponent(connectionId)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`),
+
+  /** Preview the migration plan for visual changes (nothing executes). */
+  schemaPlan: (input: { connectionId: string; changes: SchemaChange[] }) =>
+    mutationRequest<SchemaPlanResponse>('POST', '/schema/plan', input),
+
+  /** Apply a reviewed plan: the server re-plans under the migration lock and
+   * executes only if the fresh plan still has this planId (409 stale-plan
+   * otherwise, with the fresh plan in the error body). */
+  schemaApply: (input: { connectionId: string; changes: SchemaChange[]; planId: string; allowDestructive?: boolean }) =>
+    mutationRequest<SchemaPlanResponse>('POST', '/schema/apply', input),
+
+  // --- S05: performance diagnosis ---
+
+  /** Slow-query view over this process's duration log + pg_stat_statements probe. */
+  diagnosticsQueries: (connectionId: string, minMs = 0) =>
+    request<DiagnosticsQueriesResponse>('GET',
+      `/diagnostics/queries?connectionId=${encodeURIComponent(connectionId)}&minMs=${minMs}`),
+
+  /** Table statistics and index usage from PostgreSQL's cumulative stats. */
+  tableStats: (connectionId: string, schema: string, table: string) =>
+    request<TableStatsResponse>('GET',
+      `/diagnostics/table-stats?connectionId=${encodeURIComponent(connectionId)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`),
 
   // --- Saved queries ---
 

@@ -27,6 +27,7 @@
 // the depth bound — no WITH RECURSIVE term exists that could loop.
 
 import { type Condition, type OrderExpression } from "./expr.js";
+import { collectRequirements } from "./ast.js";
 import { getTableColumns, getTableName } from "./schema.js";
 import type { AnyColumnBuilder, AnyPgTable, Relation, RelationOne, TableRelations } from "./schema.js";
 import type { ExecContext } from "./builder.js";
@@ -196,6 +197,9 @@ function jsonLeaf(alias: string, column: AnyColumnBuilder): ValueNode {
   if (column.arrayDimensions !== undefined) return fragment(ref, "::text");
   if (column.dataType === "bigint" || column.dataType === "numeric") return fragment(ref, "::text");
   if (column.dataType === "timestamptz") return fragment("to_jsonb(", ref, " at time zone 'UTC')");
+  // Vector has no to_jsonb cast (server error); tsvector does but its JSON
+  // string form adds nothing over the exact text. Both cross as ::text.
+  if (column.dataType === "vector" || column.dataType === "tsvector") return fragment(ref, "::text");
   return ref;
 }
 
@@ -746,7 +750,11 @@ export function buildRelationalPlan(
     offset: args.offset,
   });
   const compiled = compileStatement(stmt);
-  const capabilities: StatementCapability[] = usesJsonb ? ["jsonb-functions"] : [];
+  const capabilities = new Set<StatementCapability>(usesJsonb ? ["jsonb-functions"] : []);
+  // X01: expressions spliced into where/orderBy/projections by optional
+  // capability modules (/pgvector, /fts) carry their requirements on the
+  // nodes; collect them from the final statement so they gate pre-SQL.
+  collectRequirements(stmt, capabilities);
   return {
     table: tableName,
     statementCount: 1,
@@ -754,7 +762,7 @@ export function buildRelationalPlan(
     edges: edgePlans,
     sql: compiled.sql,
     params: compiled.params as unknown[],
-    capabilities,
+    capabilities: [...capabilities],
     decoders: decoders.map((d) => ({ key: d.key, wire: d.wire, codec: d.codec, context: d.context })),
   };
 }

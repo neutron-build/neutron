@@ -52,7 +52,13 @@
       "name": "exported-v2",
       "document": "valid/exported-v2.json",
       "canonical": "valid/exported-v2.canonical.json",
-      "sha256": "3d89b22962431511b7e6a3e5249e00e40d9cc4989735f284b045ab73fbc3964c"
+      "sha256": "f50a9c66a2dc100ffb51fd051ac4caec8f32f8436d892755dd7d233eece4d550"
+    },
+    {
+      "name": "x01-pgvector",
+      "document": "valid/x01-pgvector.json",
+      "canonical": "valid/x01-pgvector.canonical.json",
+      "sha256": "31626a65ca4cbd09d564c49ae9d2249ba8ccc5d79dea443701671f6a1b1e6b66"
     },
     {
       "name": "q07-enums-arrays-namespaces",
@@ -175,6 +181,16 @@
       "name": "index-method-type-invalid",
       "document": "invalid/index-method-type-invalid.json",
       "code": "invalid-index"
+    },
+    {
+      "name": "index-with-non-integer",
+      "document": "invalid/index-with-non-integer.json",
+      "code": "invalid-index"
+    },
+    {
+      "name": "index-opclass-expression",
+      "document": "invalid/index-opclass-expression.json",
+      "code": "index-key"
     }
   ],
   "v1": [
@@ -198,7 +214,7 @@
       "name": "vector-upgrade",
       "document": "v1/vector-upgrade.json",
       "canonical": "v1/vector-upgrade.canonical.json",
-      "sha256": "10277182d649c070a59195c3292c38f66feb4fbc2c542a5431e620cc6142b857"
+      "sha256": "e261774dc01bbacc08207f70e851a85987b7ef077381ba48a28768ce20e33b72"
     }
   ]
 }

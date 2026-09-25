@@ -48,7 +48,9 @@ func UpgradeV1Schema(s *Schema) (map[string]any, error) {
 
 	capabilities := []any{}
 	if hasVector {
-		capabilities = []any{"nucleus"}
+		// X01: a vector column means the PostgreSQL pgvector extension
+		// (per-database detection), not a Nucleus capability.
+		capabilities = []any{"pgvector"}
 	}
 
 	return map[string]any{

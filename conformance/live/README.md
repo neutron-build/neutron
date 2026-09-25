@@ -35,7 +35,27 @@ conformance/live/
   spec.json                     the cases — the only place behaviour is specified
   runner/run.mjs                runs every available executor, prints the matrix, fails on drift
   executors/<sdk>/              one per SDK; maps op names to that SDK's client
+  orm/                          ORM capability probes (X00/V18) — see below
 ```
+
+## The ORM probe suite (`orm/`)
+
+A separate concern from the SDK spec above: `orm/probes.mjs` states
+**PostgreSQL behaviours the ORM, CLI introspector and Studio depend on**, and
+`orm/run.mjs` executes them through `@neutron-build/sql`'s own driver
+adapters (`pg` and `postgres.js`) against whatever engine sits behind
+`NEUTRON_TEST_DATABASE_URL`. Against PostgreSQL a throwaway database is
+created per run; against Nucleus the engine is disposable by contract.
+
+Every probe must pass on PostgreSQL (`--control` fails otherwise), so a
+probe can never be quietly relaxed to fit Nucleus. Against Nucleus the
+verdicts are recorded in `orm/capabilities.nucleus.json` (`--write`), CI
+re-checks them (`--check` fails on any drift in either direction), and the
+capability report with upstream defect reproducers is
+[`orm/ORM_CONFORMANCE.md`](orm/ORM_CONFORMANCE.md) (its measured tables are
+regenerated from the JSON by `orm/report.mjs`). `--driver pg` /
+`--driver postgres` select single-driver legs; `--only <id-prefix>` narrows
+to one area while developing.
 
 ## Running it
 

@@ -19,6 +19,8 @@ const ColumnarModule= lazy(() => import('../modules/columnar/ColumnarModule').th
 const DatalogModule = lazy(() => import('../modules/datalog/DatalogModule').then(m => ({ default: m.DatalogModule })))
 const CDCModule       = lazy(() => import('../modules/cdc/CDCModule').then(m => ({ default: m.CDCModule })))
 const SchemaDesigner  = lazy(() => import('../modules/schema/SchemaDesigner').then(m => ({ default: m.SchemaDesigner })))
+const ObjectInspector = lazy(() => import('../modules/schema/ObjectInspector').then(m => ({ default: m.ObjectInspector })))
+const DiagnosticsModule = lazy(() => import('../modules/diagnostics/DiagnosticsModule').then(m => ({ default: m.DiagnosticsModule })))
 
 function Fallback() {
   return <div class={s.loading}>Loading…</div>
@@ -45,7 +47,7 @@ export function ContentArea() {
       content = <SQLBrowser schema={tab.objectSchema!} table={tab.objectName!} initialFilter={tab.filter} initialMatch={tab.match} />
       break
     case 'sql-editor':
-      content = <SQLEditor tabId={tab.id} />
+      content = <SQLEditor tabId={tab.id} initialSql={tab.initialSql} />
       break
     case 'kv':
       content = <KVModule name={tab.objectName!} />
@@ -87,7 +89,13 @@ export function ContentArea() {
       content = <CDCModule />
       break
     case 'schema-designer':
-      content = <SchemaDesigner />
+      content = <SchemaDesigner initialSchema={tab.objectSchema} initialTable={tab.objectName} />
+      break
+    case 'schema-inspector':
+      content = <ObjectInspector schema={tab.objectSchema!} table={tab.objectName!} />
+      break
+    case 'diagnostics':
+      content = <DiagnosticsModule schema={tab.objectSchema} table={tab.objectName} />
       break
     default:
       content = <Empty />

@@ -11,20 +11,21 @@ import (
 
 // Schema represents the full schema view returned to the Studio frontend.
 type Schema struct {
-	SQL        []SQLTable        `json:"sql"`
-	KV         []KVStore         `json:"kv"`
-	Vector     []VectorIndex     `json:"vector"`
-	TimeSeries []TSMetric        `json:"timeseries"`
-	Document   []DocCollection   `json:"document"`
-	Graph      []GraphStore      `json:"graph"`
-	FTS        []FTSIndex        `json:"fts"`
-	Geo        []GeoLayer        `json:"geo"`
-	Blob       []BlobStore       `json:"blob"`
-	PubSub     []PubSubChannel   `json:"pubsub"`
-	Streams    []Stream          `json:"streams"`
-	Columnar   []ColumnarTable   `json:"columnar"`
-	Datalog    *DatalogStore     `json:"datalog"`
-	CDC        bool              `json:"cdc"`
+	SQL        []SQLTable       `json:"sql"`
+	Views      []SQLRelationRef `json:"views"`
+	KV         []KVStore        `json:"kv"`
+	Vector     []VectorIndex    `json:"vector"`
+	TimeSeries []TSMetric       `json:"timeseries"`
+	Document   []DocCollection  `json:"document"`
+	Graph      []GraphStore     `json:"graph"`
+	FTS        []FTSIndex       `json:"fts"`
+	Geo        []GeoLayer       `json:"geo"`
+	Blob       []BlobStore      `json:"blob"`
+	PubSub     []PubSubChannel  `json:"pubsub"`
+	Streams    []Stream         `json:"streams"`
+	Columnar   []ColumnarTable  `json:"columnar"`
+	Datalog    *DatalogStore    `json:"datalog"`
+	CDC        bool             `json:"cdc"`
 }
 
 type SQLTable struct {
@@ -32,6 +33,14 @@ type SQLTable struct {
 	Name     string      `json:"name"`
 	Columns  []SQLColumn `json:"columns"`
 	RowCount *int64      `json:"rowCount,omitempty"`
+}
+
+// SQLRelationRef names one relation (S05: views in the navigation tree).
+// Views are browsed read-only through /api/table and inspected through
+// /api/schema/object.
+type SQLRelationRef struct {
+	Schema string `json:"schema"`
+	Name   string `json:"name"`
 }
 
 type SQLColumn struct {
@@ -42,18 +51,56 @@ type SQLColumn struct {
 	IsPrimaryKey bool   `json:"isPrimaryKey"`
 }
 
-type KVStore        struct { Name string `json:"name"`; KeyCount int64 `json:"keyCount"` }
-type VectorIndex    struct { Name string `json:"name"`; Dimensions int `json:"dimensions"`; Metric string `json:"metric"`; Count int64 `json:"count"` }
-type TSMetric       struct { Name string `json:"name"`; Count int64 `json:"count"` }
-type DocCollection  struct { Name string `json:"name"`; Count int64 `json:"count"` }
-type GraphStore     struct { Name string `json:"name"`; NodeCount int64 `json:"nodeCount"`; EdgeCount int64 `json:"edgeCount"` }
-type FTSIndex       struct { Name string `json:"name"`; DocCount int64 `json:"docCount"` }
-type GeoLayer       struct { Name string `json:"name"`; PointCount int64 `json:"pointCount"` }
-type BlobStore      struct { Name string `json:"name"`; BlobCount int64 `json:"blobCount"` }
-type PubSubChannel  struct { Name string `json:"name"` }
-type Stream         struct { Name string `json:"name"`; Length int64 `json:"length"` }
-type ColumnarTable  struct { Name string `json:"name"`; RowCount int64 `json:"rowCount"` }
-type DatalogStore   struct { PredicateCount int `json:"predicateCount"`; RuleCount int `json:"ruleCount"` }
+type KVStore struct {
+	Name     string `json:"name"`
+	KeyCount int64  `json:"keyCount"`
+}
+type VectorIndex struct {
+	Name       string `json:"name"`
+	Dimensions int    `json:"dimensions"`
+	Metric     string `json:"metric"`
+	Count      int64  `json:"count"`
+}
+type TSMetric struct {
+	Name  string `json:"name"`
+	Count int64  `json:"count"`
+}
+type DocCollection struct {
+	Name  string `json:"name"`
+	Count int64  `json:"count"`
+}
+type GraphStore struct {
+	Name      string `json:"name"`
+	NodeCount int64  `json:"nodeCount"`
+	EdgeCount int64  `json:"edgeCount"`
+}
+type FTSIndex struct {
+	Name     string `json:"name"`
+	DocCount int64  `json:"docCount"`
+}
+type GeoLayer struct {
+	Name       string `json:"name"`
+	PointCount int64  `json:"pointCount"`
+}
+type BlobStore struct {
+	Name      string `json:"name"`
+	BlobCount int64  `json:"blobCount"`
+}
+type PubSubChannel struct {
+	Name string `json:"name"`
+}
+type Stream struct {
+	Name   string `json:"name"`
+	Length int64  `json:"length"`
+}
+type ColumnarTable struct {
+	Name     string `json:"name"`
+	RowCount int64  `json:"rowCount"`
+}
+type DatalogStore struct {
+	PredicateCount int `json:"predicateCount"`
+	RuleCount      int `json:"ruleCount"`
+}
 
 // FetchSchema loads schema information from the database.
 // For plain PostgreSQL only SQL tables are populated.
@@ -61,6 +108,7 @@ type DatalogStore   struct { PredicateCount int `json:"predicateCount"`; RuleCou
 func FetchSchema(ctx context.Context, client *db.Client, isNucleus bool) (*Schema, error) {
 	sc := &Schema{
 		SQL:        []SQLTable{},
+		Views:      []SQLRelationRef{},
 		KV:         []KVStore{},
 		Vector:     []VectorIndex{},
 		TimeSeries: []TSMetric{},
@@ -76,6 +124,16 @@ func FetchSchema(ctx context.Context, client *db.Client, isNucleus bool) (*Schem
 
 	if err := fetchSQLTables(ctx, client, sc, isNucleus); err != nil {
 		return nil, fmt.Errorf("sql schema: %w", err)
+	}
+
+	// Views (S05 navigation): listed from the same catalog listing on plain
+	// PostgreSQL. Nucleus's information_schema reporting is not verified for
+	// views (X00 catalog conformance), so the list stays empty there rather
+	// than guessing — the browser itself still accepts any view name.
+	if !isNucleus {
+		if err := fetchSQLViews(ctx, client, sc); err != nil {
+			return nil, fmt.Errorf("sql views: %w", err)
+		}
 	}
 
 	if isNucleus {
@@ -125,6 +183,29 @@ func fetchSQLTables(ctx context.Context, client *db.Client, sc *Schema, isNucleu
 		sc.SQL = append(sc.SQL, *tables[k])
 	}
 	return nil
+}
+
+// fetchSQLViews lists user-schema views for the navigation tree.
+func fetchSQLViews(ctx context.Context, client *db.Client, sc *Schema) error {
+	rows, err := client.Query(ctx, `
+		SELECT t.table_schema, t.table_name
+		FROM information_schema.tables t
+		WHERE t.table_schema NOT IN ('pg_catalog','information_schema','pg_toast')
+		  AND t.table_type = 'VIEW'
+		ORDER BY t.table_schema, t.table_name
+	`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var schema, name string
+		if err := rows.Scan(&schema, &name); err != nil {
+			continue
+		}
+		sc.Views = append(sc.Views, SQLRelationRef{Schema: schema, Name: name})
+	}
+	return rows.Err()
 }
 
 func fetchColumns(ctx context.Context, client *db.Client, tables map[string]*SQLTable) error {

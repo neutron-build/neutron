@@ -1,0 +1,43 @@
+{
+  "version": 2,
+  "dialect": "postgresql",
+  "capabilities": ["pgvector"],
+  "schemas": [{ "name": "public" }],
+  "enums": [],
+  "tables": [
+    {
+      "identity": { "schema": "public", "name": "docs" },
+      "managed": true,
+      "columns": [
+        { "name": "id", "type": { "name": "int4", "codec": "number" }, "notNull": true },
+        { "name": "embedding", "type": { "name": "vector", "codec": "vector", "params": { "dimensions": 3 } }, "notNull": false },
+        { "name": "body", "type": { "name": "tsvector", "codec": "tsvector" }, "notNull": false }
+      ],
+      "constraints": [{ "name": "docs_pkey", "type": "primary-key", "columns": ["id"] }],
+      "indexes": [
+        {
+          "identity": { "schema": "public", "name": "docs_embedding_hnsw" },
+          "unique": false,
+          "method": "hnsw",
+          "key": [{ "column": "embedding", "opclass": "vector_cosine_ops" }],
+          "with": { "ef_construction": 64, "m": 16 }
+        },
+        {
+          "identity": { "schema": "public", "name": "docs_embedding_ivfflat" },
+          "unique": false,
+          "method": "ivfflat",
+          "key": [{ "column": "embedding", "opclass": "vector_ip_ops" }],
+          "with": { "lists": 100 }
+        },
+        {
+          "identity": { "schema": "public", "name": "docs_body_gin" },
+          "unique": false,
+          "method": "gin",
+          "key": [{ "column": "body" }]
+        }
+      ]
+    }
+  ],
+  "views": [],
+  "opaque": []
+}

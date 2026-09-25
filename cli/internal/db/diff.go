@@ -166,12 +166,6 @@ func DiffSchema(desired, actual Schema, opts DiffOptions) (DiffResult, error) {
 		t := desired.Table(name)
 		deferFKs := deferred[name]
 		result.Up = append(result.Up, createTableWithDeferredFKs(*t, deferFKs))
-		for _, c := range t.Columns {
-			if c.NucleusOnly {
-				result.warn("%s: column %q is a Nucleus-only type; skipped on Postgres (add it via a Nucleus extension migration)", t.Name, c.Name)
-				result.Up = append(result.Up, fmt.Sprintf("-- NUCLEUS-ONLY (skipped on Postgres): %s.%s vector(%d)", t.Name, c.Name, c.VectorDims))
-			}
-		}
 	}
 	for _, name := range ordered {
 		t := desired.Table(name)
@@ -397,11 +391,6 @@ func diffColumns(result *DiffResult, desired, actual TableDef, opts DiffOptions,
 	// Added columns (check renames from actual columns missing in desired).
 	for _, dc := range desired.Columns {
 		if actualCols[dc.Name] {
-			continue
-		}
-		if dc.NucleusOnly {
-			result.warn("%s: column %q is a Nucleus-only type; skipped on Postgres (add it via a Nucleus extension migration)", desired.Name, dc.Name)
-			result.Up = append(result.Up, fmt.Sprintf("-- NUCLEUS-ONLY (skipped on Postgres): %s.%s vector(%d)", desired.Name, dc.Name, dc.VectorDims))
 			continue
 		}
 		key := desired.Name + "." + dc.Name

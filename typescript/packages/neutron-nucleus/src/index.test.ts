@@ -1320,6 +1320,26 @@ describe("withStreams plugin", () => {
     assert.deepEqual(await streams.xread("missing", 0, 10), []);
   });
 
+  it("xread passes a full \"<ms>-<seq>\" cursor through — the gapless resume form", async () => {
+    transport.onFetchval("SELECT STREAM_XREAD", '[{"id":"1000-1","fields":{"a":"1"}}]');
+    const entries = await streams.xread("mystream", "1000-0", 10);
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].id, "1000-1");
+    assert.deepEqual(transport.calls[0].args[1], ["mystream", "1000-0", 10]);
+  });
+
+  it("xrange accepts full id bounds and passes them through", async () => {
+    transport.onFetchval("SELECT STREAM_XRANGE", '[{"id":"1000-1","fields":{"a":"1"}}]');
+    await streams.xrange("mystream", "1000-0", "1000-5", 10);
+    assert.deepEqual(transport.calls[0].args[1], ["mystream", "1000-0", "1000-5", 10]);
+  });
+
+  it("xread keeps accepting a bare millisecond cursor (documented gap risk)", async () => {
+    transport.onFetchval("SELECT STREAM_XREAD", "[]");
+    assert.deepEqual(await streams.xread("mystream", 999, 10), []);
+    assert.deepEqual(transport.calls[0].args[1], ["mystream", 999, 10]);
+  });
+
   it("throws on PostgreSQL", async () => {
     const pgStreams = withStreams.init(transport, pgFeatures()).streams;
     await assert.rejects(() => pgStreams.xlen("s"), NucleusFeatureError);
@@ -1400,22 +1420,25 @@ describe("withDatalog plugin", () => {
     assert.equal(withDatalog.name, "datalog");
   });
 
-  it("assert sends DATALOG_ASSERT", async () => {
-    transport.onFetchval("SELECT DATALOG_ASSERT", true);
+  it("assert sends DATALOG_ASSERT and returns the engine status string", async () => {
+    transport.onFetchval("SELECT DATALOG_ASSERT", "ASSERT parent/2");
     const result = await datalog.assert("parent(alice, bob)");
-    assert.equal(result, true);
+    assert.equal(result, "ASSERT parent/2");
   });
 
-  it("retract sends DATALOG_RETRACT", async () => {
-    transport.onFetchval("SELECT DATALOG_RETRACT", true);
+  it("retract sends DATALOG_RETRACT and returns the engine status string", async () => {
+    transport.onFetchval("SELECT DATALOG_RETRACT", "RETRACT parent/2");
     const result = await datalog.retract("parent(alice, bob)");
-    assert.equal(result, true);
+    assert.equal(result, "RETRACT parent/2");
   });
 
-  it("rule sends DATALOG_RULE", async () => {
-    transport.onFetchval("SELECT DATALOG_RULE", true);
+  it("rule sends DATALOG_RULE as ONE combined parameter (verified engine surface)", async () => {
+    // The engine takes a single 'head :- body' string; the old two-parameter
+    // form was parsed as a bare fact and rejected — it never worked.
+    transport.onFetchval("SELECT DATALOG_RULE", "RULE ancestor/2");
     const result = await datalog.rule("ancestor(X, Y)", "parent(X, Y)");
-    assert.equal(result, true);
+    assert.equal(result, "RULE ancestor/2");
+    assert.deepEqual(transport.calls[0].args, ["SELECT DATALOG_RULE($1)", ["ancestor(X, Y) :- parent(X, Y)"]]);
   });
 
   it("query sends DATALOG_QUERY", async () => {
@@ -1424,16 +1447,16 @@ describe("withDatalog plugin", () => {
     assert.equal(result, '[["alice"], ["bob"]]');
   });
 
-  it("clear sends DATALOG_CLEAR", async () => {
-    transport.onFetchval("SELECT DATALOG_CLEAR", true);
+  it("clear sends DATALOG_CLEAR and returns the engine status string", async () => {
+    transport.onFetchval("SELECT DATALOG_CLEAR", "CLEAR parent");
     const result = await datalog.clear("parent");
-    assert.equal(result, true);
+    assert.equal(result, "CLEAR parent");
   });
 
-  it("importGraph sends DATALOG_IMPORT_GRAPH", async () => {
-    transport.onFetchval("SELECT DATALOG_IMPORT_GRAPH", 50);
-    const count = await datalog.importGraph("knows");
-    assert.equal(count, 50);
+  it("importGraph sends DATALOG_IMPORT_GRAPH and returns the engine status string", async () => {
+    transport.onFetchval("SELECT DATALOG_IMPORT_GRAPH", "IMPORTED 50 edges into knows");
+    const result = await datalog.importGraph("knows");
+    assert.equal(result, "IMPORTED 50 edges into knows");
   });
 
   it("throws on PostgreSQL", async () => {
@@ -1512,16 +1535,15 @@ describe("withPubSub plugin", () => {
     assert.equal(count, 3);
   });
 
-  it("channels sends PUBSUB_CHANNELS", async () => {
+  it("channels sends PUBSUB_CHANNELS() — the engine takes no pattern argument", async () => {
+    // X05: the engine's PUBSUB_CHANNELS arm reads no arguments; the old
+    // `channels(pattern)` overload sent PUBSUB_CHANNELS($1), which the engine
+    // does not filter with — the pattern was silently ignored and every
+    // channel came back. The parameter is removed; filtering client-side off
+    // the comma-separated string would fabricate a server feature.
     transport.onFetchval("SELECT PUBSUB_CHANNELS()", "chat,events");
     const result = await pubsub.channels();
     assert.equal(result, "chat,events");
-  });
-
-  it("channels with pattern sends PUBSUB_CHANNELS($1)", async () => {
-    transport.onFetchval("SELECT PUBSUB_CHANNELS($1)", "chat");
-    const result = await pubsub.channels("ch*");
-    assert.equal(result, "chat");
   });
 
   it("subscribers sends PUBSUB_SUBSCRIBERS", async () => {
