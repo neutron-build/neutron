@@ -60,7 +60,7 @@ func TestStudioSQLEditorE2E(t *testing.T) {
 		t.Fatalf("create database %s: %v", dbName, err)
 	}
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
 		if err := admin.Exec(ctx, fmt.Sprintf(
 			`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '%s' AND pid <> pg_backend_pid()`, dbName,
@@ -71,7 +71,10 @@ func TestStudioSQLEditorE2E(t *testing.T) {
 			t.Errorf("refusing to drop unexpected database %q", dbName)
 			return
 		}
-		if err := admin.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %q`, dbName)); err != nil {
+		// WITH (FORCE) (PG 13+) terminates and drops atomically: a pool
+		// reconnecting between the terminate above and a plain DROP made the
+		// drop wait out the whole deadline.
+		if err := admin.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %q WITH (FORCE)`, dbName)); err != nil {
 			t.Errorf("drop database %s: %v", dbName, err)
 		}
 	})
