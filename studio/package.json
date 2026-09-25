@@ -29,6 +29,7 @@
     "@types/node": "^22.10.7",
     "codemirror": "^6.0.1",
     "happy-dom": "^17.0.0",
+    "playwright-core": "1.62.1",
     "typescript": "^5.7.2",
     "vite": "^6.0.7",
     "vitest": "^3.0.0"
