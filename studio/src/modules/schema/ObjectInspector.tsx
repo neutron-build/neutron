@@ -58,6 +58,11 @@ export function ObjectInspector({ schema, table }: { schema: string; table: stri
               })}>Diagnose</button>
             </>
           )}
+          {d.kind === 'table' && (
+            <button class={s.action} onClick={() => openTab({
+              id: crypto.randomUUID(), kind: 'journey', label: `Journey: ${table}`, objectSchema: schema, objectName: table,
+            })}>Journey</button>
+          )}
           <button class={s.action} onClick={() => {
             void navigator.clipboard?.writeText(`${schema}.${table}`)
               .then(() => toast('success', 'Copied'))

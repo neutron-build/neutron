@@ -55,6 +55,9 @@ type Server struct {
 	// importOutcomes records import batch outcomes (S06, see import_v2.go),
 	// separate from commit outcomes so a long import never evicts them.
 	importOutcomes *outcomeStore
+	// migrationsDir is the application's migrations directory for the X06
+	// journey's migrations stage ("" = applied history only).
+	migrationsDir string
 }
 
 // NewServer creates and configures the Studio server on the given port.
@@ -136,6 +139,8 @@ func (s *Server) routes() (*http.ServeMux, error) {
 	mux.HandleFunc("/api/diagnostics/queries", s.handleDiagnosticsQueries)
 	mux.HandleFunc("/api/diagnostics/table-stats", s.handleDiagnosticsTableStats)
 	mux.HandleFunc("/api/features", s.handleFeatures)
+	mux.HandleFunc("/api/inspect/limits", s.handleInspectLimits)
+	mux.HandleFunc("/api/inspect/journey", s.handleInspectJourney)
 	mux.HandleFunc("/api/table", s.handleTable)
 	mux.HandleFunc("/api/table/v2/meta", s.handleTableRowMetaV2)
 	mux.HandleFunc("/api/table/v2/insert", s.handleTableRowInsertV2)

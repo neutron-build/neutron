@@ -1,5 +1,6 @@
 import { lazy, Suspense } from 'preact/compat'
 import { activeTab } from '../lib/store'
+import { ModelLimits, modelForTabKind } from '../components/ModelLimits'
 import s from './ContentArea.module.css'
 
 // Lazy-load every module to keep initial bundle small
@@ -21,6 +22,7 @@ const CDCModule       = lazy(() => import('../modules/cdc/CDCModule').then(m => 
 const SchemaDesigner  = lazy(() => import('../modules/schema/SchemaDesigner').then(m => ({ default: m.SchemaDesigner })))
 const ObjectInspector = lazy(() => import('../modules/schema/ObjectInspector').then(m => ({ default: m.ObjectInspector })))
 const DiagnosticsModule = lazy(() => import('../modules/diagnostics/DiagnosticsModule').then(m => ({ default: m.DiagnosticsModule })))
+const JourneyModule   = lazy(() => import('../modules/journey/JourneyModule').then(m => ({ default: m.JourneyModule })))
 
 function Fallback() {
   return <div class={s.loading}>Loading…</div>
@@ -62,7 +64,7 @@ export function ContentArea() {
       content = <DocModule name={tab.objectName!} />
       break
     case 'graph':
-      content = <GraphModule name={tab.objectName!} />
+      content = <GraphModule name={tab.objectName!} initialCypher={tab.focus} />
       break
     case 'fts':
       content = <FTSModule name={tab.objectName!} />
@@ -86,7 +88,7 @@ export function ContentArea() {
       content = <DatalogModule />
       break
     case 'cdc':
-      content = <CDCModule />
+      content = <CDCModule initialTable={tab.focus} />
       break
     case 'schema-designer':
       content = <SchemaDesigner initialSchema={tab.objectSchema} initialTable={tab.objectName} />
@@ -97,12 +99,20 @@ export function ContentArea() {
     case 'diagnostics':
       content = <DiagnosticsModule schema={tab.objectSchema} table={tab.objectName} />
       break
+    case 'journey':
+      content = <JourneyModule schema={tab.objectSchema!} table={tab.objectName!} />
+      break
     default:
       content = <Empty />
   }
 
+  // X06: every surface that acts on a model shows that model's actual
+  // transaction/durability limits above it.
+  const model = modelForTabKind(tab.kind)
+
   return (
     <div class={s.area}>
+      {model && <ModelLimits model={model} />}
       <Suspense fallback={<Fallback />}>
         {content}
       </Suspense>

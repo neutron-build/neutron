@@ -464,6 +464,7 @@ export type TabKind =
   | 'schema-designer'
   | 'schema-inspector'
   | 'diagnostics'
+  | 'journey'
   | 'kv'
   | 'vector'
   | 'timeseries'
@@ -492,6 +493,9 @@ export interface Tab {
   match?: MatchCell[]
   /** SQL editor (S05): initial statement text (e.g. from a slow-query entry). */
   initialSql?: string
+  /** X06 journey navigation into a model module: CDC opens filtered to this
+   *  table; Graph opens with this Cypher text. A context, not an address. */
+  focus?: string
 }
 
 // --- Pending changes ---
@@ -706,4 +710,154 @@ export interface ImportOutcomeResponse {
   status?: number
   response?: Record<string, unknown>
   error?: string
+}
+
+// --- X06: cross-model inspection ---
+
+export type CapabilityStatus = 'supported' | 'unsupported' | 'unknown'
+
+export type TransactionBehaviour =
+  | 'atomic'
+  | 'partial'
+  | 'rollback-not-isolated'
+  | 'refused-in-transaction'
+  | 'not-transactional'
+  | 'unknown'
+  | 'not-applicable'
+
+export type DurabilityBehaviour =
+  | 'survives-restart'
+  | 'engine-documented'
+  | 'not-durable'
+  | 'unknown'
+  | 'not-applicable'
+
+/** One fact behind a limit (probe id, conformance-leg verdict, or document). */
+export interface LimitEvidence {
+  source: string
+  ref: string
+  observed: string
+}
+
+/** What one data model on the connected engine actually guarantees
+ *  (GET /api/inspect/limits). Rendered where the user acts; the UI never
+ *  states more than this. */
+export interface ModelLimits {
+  model: string
+  label: string
+  availability: CapabilityStatus
+  availabilityReason: string
+  transaction: TransactionBehaviour
+  transactionNote: string
+  durability: DurabilityBehaviour
+  durabilityNote: string
+  atomicWithSql: CapabilityStatus
+  warnings: string[]
+  evidence: LimitEvidence[]
+}
+
+export interface LimitsReport {
+  engine: { product: 'postgres' | 'nucleus' | 'unknown'; version: string; raw: string }
+  measured: { report: string; nucleusVersion: string; nucleusTree: string; recorded: string }
+  /** The connected engine is the measured build. */
+  current: boolean
+  currentNote?: string
+  live?: {
+    fsync?: string
+    synchronousCommit?: string
+    defaultTransactionIsolation?: string
+    defaultTransactionReadOnly?: string
+    error?: string
+  }
+  models: ModelLimits[]
+}
+
+export type JourneyStageName =
+  | 'schema' | 'migrations' | 'queries' | 'plan' | 'rows' | 'models' | 'change-events'
+
+export interface JourneyTableRef {
+  constraint: string
+  schema: string
+  name: string
+  columns: string[]
+  refColumns: string[]
+}
+
+export interface JourneySchemaData {
+  source: string
+  documentSHA256?: string
+  columns: Array<{ name: string; type: string; notNull: boolean; primaryKey: boolean }>
+  keyColumns: string[]
+  references: JourneyTableRef[]
+  referencedBy: JourneyTableRef[]
+}
+
+export interface JourneyMigrationEntry {
+  version: string
+  name: string
+  applied: boolean
+  appliedAt?: string
+  checksum: 'verified' | 'mismatch' | 'unverified' | 'pending' | 'file-missing'
+  mentions: boolean
+  lines?: string[]
+}
+
+export interface JourneyMigrationsData {
+  directory?: string
+  filesNote?: string
+  history: string
+  entries: JourneyMigrationEntry[]
+  mentioning: number
+}
+
+export interface JourneyQueriesData {
+  entries: Array<{ at: string; surface: string; sql: string; durationMs: number; state: string; rowCount?: number }>
+  scope: string
+}
+
+export interface JourneyPlanData {
+  statement: string
+  plan: unknown
+  executed: boolean
+  note: string
+}
+
+export interface JourneyRowsData {
+  statement: string
+  columns: string[]
+  rows: unknown[][]
+  keyColumns: string[]
+  idColumn?: string
+  note: string
+}
+
+export interface JourneyModelsData {
+  query: string
+  graphNodes: Array<{ nodeId: string; rowId: unknown; rowSchema?: string; inSample: boolean }>
+  truncated: boolean
+  documents: string
+}
+
+export interface JourneyChangeEventsData {
+  retained: number
+  events: Array<{ seq: number; table: string; change: string; ts: number }>
+  note: string
+}
+
+export interface JourneyStage {
+  stage: JourneyStageName
+  /** The model whose limits govern this stage. */
+  model: string
+  status: 'available' | 'empty' | 'unavailable'
+  reason?: string
+  data?: unknown
+}
+
+/** GET /api/inspect/journey: one table followed across the stack. */
+export interface JourneyResponse {
+  engine: LimitsReport['engine']
+  schema: string
+  table: string
+  limits: LimitsReport
+  stages: JourneyStage[]
 }

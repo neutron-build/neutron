@@ -287,6 +287,66 @@ over silently normalizing to UTC: refusing is the only option that never
 guesses what instant the user meant. `timestamp without time zone` is
 unaffected (offset-less is its canonical form).
 
+## Cross-model inspection and model limits (X06)
+
+### Limits where you act
+
+`GET /api/inspect/limits?connectionId=` returns, for every data model on the
+connected engine, whether it is available, what its writes do inside a
+transaction (`atomic`, `partial`, `rollback-not-isolated`,
+`refused-in-transaction`, `not-transactional`, `unknown`), whether they
+survive a crash, whether they are atomic with SQL rows, the hazards to know,
+and the evidence behind each statement. Every tab that acts on a model (SQL
+browser and editor, schema designer, each model browser) shows that model's
+limits above it; the commit bar says "atomic" only when the SQL limits say
+`atomic`.
+
+- PostgreSQL: SQL is `atomic`; durability comes from the connection's own
+  `fsync` and `synchronous_commit` settings, read live (`fsync=off` is shown
+  as not durable). Nucleus models are unavailable.
+- Nucleus: the registry in `cli/internal/inspect/limits.go` states what was
+  measured on the build recorded in
+  `conformance/live/orm/capabilities.nucleus.json` (the capability report
+  and the X01-X05 conformance legs). SQL is `partial`: DML commits and rolls
+  back, DDL does not, isolation levels and `READ ONLY` are not applied.
+  Documents and graph nodes roll back but are visible to other sessions
+  before `COMMIT`; CDC and pub/sub are not transactional; COLUMNAR_* inserts
+  are refused inside transactions. Anything not measured is `unknown`.
+- A Nucleus build other than the measured one gets `unknown` everywhere, with
+  a note naming both versions. An unrecognized server gets `unknown`
+  everywhere. While limits have not loaded, the UI claims nothing.
+
+`cli/internal/inspect/limits_report_test.go` fails when a cited probe or
+verdict does not exist or has a different status, when anything but
+PostgreSQL SQL claims `atomic`, or when a positive Nucleus claim rests only on
+prose. `studio/src/lib/limits.fixture.json` is the registry's exact output
+(pinned by `fixture_test.go`), used by the UI tests.
+
+### The journey
+
+`GET /api/inspect/journey?connectionId=&schema=&table=` follows one table:
+
+| stage | PostgreSQL | Nucleus |
+|---|---|---|
+| schema | columns, key and foreign keys both ways (introspection v2) | unavailable: catalog introspection is not usable |
+| migrations | `_neutron_migrations` history joined with the files in `neutron studio --migrations <dir>` (default `migrations`): applied/pending, checksum `verified`/`mismatch`/`unverified`/`file-missing`, and the lines that name the table (a text match, not a parse) | unavailable: the CLI migration workflow targets PostgreSQL |
+| queries | statements this Studio process ran on the connection that name the table | same |
+| SQL/plan | `EXPLAIN (FORMAT JSON)` of a sample read, planned and never executed | unavailable: EXPLAIN is not verified there |
+| rows | a sample read (`LIMIT 5`) | same |
+| models | unavailable | graph nodes stamped with a row of the table (`sqlref_table`, as `@neutron-build/nucleus` `sqlNodes()` writes them) |
+| change events | unavailable | the table's latest CDC events |
+
+Every stage names the model whose limits apply and shows them. Everything is
+read-only: SQL runs in a `READ ONLY` transaction that is rolled back, and on
+Nucleus only these fixed reads run. Each stage links to the module that acts:
+inspector, designer, SQL editor, row browser, the Graph browser opened on the
+bound-node query, the CDC browser filtered to the table, and the journey of
+each table on the other end of a foreign key. Open it from the tree (`⇢`),
+the object inspector, or `#/c/<connId>/journey/<schema>/<table>`.
+
+Document collections bound to a table exist only in client code (`boundTo`
+creates nothing in the engine), so the journey cannot find them.
+
 ## Testing
 
 Frontend: `npm test` (vitest) and `npm run build` in `studio/`. Backend:

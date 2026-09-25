@@ -1,5 +1,5 @@
 import { signal, computed } from '@preact/signals'
-import type { Connection, Schema, NucleusFeatures, Tab, PendingChange, CommitOperation, CommitResponse, PreviewResponse, OutcomeResponse, KeyCell } from './types'
+import type { Connection, Schema, NucleusFeatures, Tab, PendingChange, CommitOperation, CommitResponse, PreviewResponse, OutcomeResponse, KeyCell, LimitsReport, ModelLimits } from './types'
 import { api, ApiError } from './api'
 import { serializeDeepLink } from './router'
 
@@ -22,6 +22,7 @@ export async function connectConnection(id: string): Promise<void> {
     schema.value = sc
     const conn = connections.value.find(c => c.id === id) ?? null
     if (conn) activeConnection.value = { ...conn, isNucleus: f.isNucleus }
+    void loadLimits(id)
   } catch (err: unknown) {
     connectionError.value = err instanceof Error ? err.message : String(err)
     throw err
@@ -40,6 +41,37 @@ export const features = signal<NucleusFeatures>({
 
 export const isNucleus = computed(() => features.value.isNucleus)
 
+// --- Model limits (X06) ---
+//
+// The server's per-model limits for the active connection: availability,
+// transaction behaviour, durability and hazards, each backed by evidence.
+// Every surface that acts on a model renders them; while they are not
+// loaded (or failed to load) the UI claims nothing — `limitsFor` returns
+// null and callers show the unknown state, never an assumed guarantee.
+
+export const limitsReport = signal<LimitsReport | null>(null)
+export const limitsError = signal<string | null>(null)
+
+export async function loadLimits(connectionId: string): Promise<LimitsReport | null> {
+  limitsReport.value = null
+  limitsError.value = null
+  try {
+    const report = await api.limits(connectionId)
+    // A connection switch while loading must not attach these limits to
+    // the new connection.
+    if (activeConnection.value && activeConnection.value.id !== connectionId) return null
+    limitsReport.value = report
+    return report
+  } catch (err: unknown) {
+    limitsError.value = err instanceof Error ? err.message : String(err)
+    return null
+  }
+}
+
+export function limitsFor(model: string): ModelLimits | null {
+  return limitsReport.value?.models.find(m => m.model === model) ?? null
+}
+
 // --- Schema ---
 
 export const schema = signal<Schema | null>(null)
@@ -56,7 +88,7 @@ export const activeTab = computed(() =>
 
 export function openTab(tab: Tab) {
   // Filtered views (FK follow) must not collapse into the unfiltered tab.
-  if (!tab.filter && !tab.match) {
+  if (!tab.filter && !tab.match && !tab.focus) {
     const existing = tabs.value.find(t =>
       t.kind === tab.kind &&
       t.objectSchema === tab.objectSchema &&
