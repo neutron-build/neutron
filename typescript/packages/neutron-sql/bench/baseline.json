@@ -1,0 +1,2131 @@
+{
+  "tool": "neutron-sql orm-gate",
+  "profile": "full",
+  "startedAt": "2026-09-25T18:00:31.022Z",
+  "environment": {
+    "node": "v22.23.2",
+    "platform": "darwin-arm64",
+    "cpu": "Apple M4",
+    "cpus": 10,
+    "memGiB": 24,
+    "loadavg": [
+      2.769,
+      3.228,
+      2.959
+    ],
+    "server": "PostgreSQL 17.11 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.1.1.101), 64-bit",
+    "serverVersionNum": 170011,
+    "sharedBuffers": "128MB",
+    "workMem": "4MB",
+    "drivers": {
+      "pg": "8.22.0",
+      "postgres": "3.4.8"
+    },
+    "referenceTools": {
+      "drizzle-orm": "0.45.1"
+    },
+    "exposeGc": true
+  },
+  "scales": [
+    {
+      "scale": "small",
+      "parents": 1000,
+      "rows": {
+        "users": 3000,
+        "posts": 22000,
+        "audits": 22000,
+        "comments": 4000
+      },
+      "loadMs": 151,
+      "scenarios": [
+        {
+          "label": "small/indexed/page/k=0",
+          "scale": "small",
+          "indexed": true,
+          "shape": "page",
+          "childrenPerParent": 0,
+          "drivers": {
+            "pg": {
+              "coldMs": 5.674,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 100,
+                "min": 0.384,
+                "p50": 0.468,
+                "p95": 1.064,
+                "max": 1.308,
+                "mean": 0.552,
+                "retainedHeapKiB": 171,
+                "gcCount": 6,
+                "gcMs": 5.347
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": true,
+              "drizzleClientStatementsPerCall": 1,
+              "drizzle": {
+                "n": 100,
+                "min": 0.774,
+                "p50": 1.485,
+                "p95": 1.662,
+                "max": 1.902,
+                "mean": 1.324,
+                "retainedHeapKiB": 89,
+                "gcCount": 7,
+                "gcMs": 4.826
+              },
+              "handBatched": {
+                "n": 100,
+                "min": 0.355,
+                "p50": 0.578,
+                "p95": 1.443,
+                "max": 20.638,
+                "mean": 1.005,
+                "retainedHeapKiB": 42,
+                "gcCount": 4,
+                "gcMs": 5.849
+              },
+              "handBatchedStatementsPerCall": 3,
+              "handSingle": {
+                "n": 100,
+                "min": 0.296,
+                "p50": 0.324,
+                "p95": 0.561,
+                "max": 0.8,
+                "mean": 0.356,
+                "retainedHeapKiB": 35,
+                "gcCount": 2,
+                "gcMs": 4.322
+              }
+            },
+            "postgres": {
+              "coldMs": 6.341,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 100,
+                "min": 0.442,
+                "p50": 0.523,
+                "p95": 1.35,
+                "max": 1.762,
+                "mean": 0.677,
+                "retainedHeapKiB": 115,
+                "gcCount": 5,
+                "gcMs": 6.379
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": true,
+              "drizzleClientStatementsPerCall": null,
+              "drizzle": {
+                "n": 100,
+                "min": 1.053,
+                "p50": 1.713,
+                "p95": 1.925,
+                "max": 2.118,
+                "mean": 1.688,
+                "retainedHeapKiB": 53,
+                "gcCount": 8,
+                "gcMs": 9.375
+              }
+            }
+          },
+          "plan": {
+            "executionMs": {
+              "n": 9,
+              "min": 0.157,
+              "p50": 0.158,
+              "p95": 0.217,
+              "max": 0.217,
+              "mean": 0.165
+            },
+            "handExecutionMs": {
+              "n": 9,
+              "min": 0.152,
+              "p50": 0.154,
+              "p95": 0.222,
+              "max": 0.222,
+              "mean": 0.162
+            },
+            "serverRatioVsHand": 1.026,
+            "planningMs": 0.024,
+            "nodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Index Scan(posts/posts_author_id_idx)",
+              "Index Scan(audits/audits_user_id_idx)"
+            ],
+            "handNodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Index Scan(posts/posts_author_id_idx)",
+              "Index Scan(audits/audits_user_id_idx)"
+            ],
+            "childSeqScans": [],
+            "sharedHit": 404,
+            "sharedRead": 0
+          }
+        },
+        {
+          "label": "small/indexed/page/k=2",
+          "scale": "small",
+          "indexed": true,
+          "shape": "page",
+          "childrenPerParent": 2,
+          "drivers": {
+            "pg": {
+              "coldMs": 10.573,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 100,
+                "min": 1.443,
+                "p50": 2.455,
+                "p95": 3.486,
+                "max": 3.63,
+                "mean": 2.538,
+                "retainedHeapKiB": 71,
+                "gcCount": 6,
+                "gcMs": 6.574
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": false,
+              "drizzleClientStatementsPerCall": 1,
+              "drizzle": {
+                "n": 100,
+                "min": 1.613,
+                "p50": 2.916,
+                "p95": 3.192,
+                "max": 3.329,
+                "mean": 2.883,
+                "retainedHeapKiB": 28,
+                "gcCount": 6,
+                "gcMs": 6.059
+              },
+              "handBatched": {
+                "n": 100,
+                "min": 1.213,
+                "p50": 1.568,
+                "p95": 2.091,
+                "max": 2.491,
+                "mean": 1.709,
+                "retainedHeapKiB": 76,
+                "gcCount": 4,
+                "gcMs": 6.35
+              },
+              "handBatchedStatementsPerCall": 3,
+              "handSingle": {
+                "n": 100,
+                "min": 0.542,
+                "p50": 0.785,
+                "p95": 1.17,
+                "max": 1.419,
+                "mean": 0.816,
+                "retainedHeapKiB": 30,
+                "gcCount": 3,
+                "gcMs": 5.827
+              }
+            },
+            "postgres": {
+              "coldMs": 6.104,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 100,
+                "min": 0.694,
+                "p50": 0.778,
+                "p95": 1.172,
+                "max": 1.385,
+                "mean": 0.814,
+                "retainedHeapKiB": 130,
+                "gcCount": 6,
+                "gcMs": 6.563
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": false,
+              "drizzleClientStatementsPerCall": null,
+              "drizzle": {
+                "n": 100,
+                "min": 1.694,
+                "p50": 2.942,
+                "p95": 3.43,
+                "max": 4.824,
+                "mean": 2.874,
+                "retainedHeapKiB": 81,
+                "gcCount": 7,
+                "gcMs": 11.723
+              }
+            }
+          },
+          "plan": {
+            "executionMs": {
+              "n": 9,
+              "min": 0.496,
+              "p50": 0.528,
+              "p95": 1.278,
+              "max": 1.278,
+              "mean": 0.667
+            },
+            "handExecutionMs": {
+              "n": 9,
+              "min": 0.472,
+              "p50": 0.5,
+              "p95": 1.234,
+              "max": 1.234,
+              "mean": 0.585
+            },
+            "serverRatioVsHand": 1.056,
+            "planningMs": 0.028,
+            "nodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Index Scan(posts/posts_author_id_idx)",
+              "Index Scan(audits/audits_user_id_idx)"
+            ],
+            "handNodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Index Scan(posts/posts_author_id_idx)",
+              "Index Scan(audits/audits_user_id_idx)"
+            ],
+            "childSeqScans": [],
+            "sharedHit": 605,
+            "sharedRead": 0
+          }
+        },
+        {
+          "label": "small/indexed/page/k=20",
+          "scale": "small",
+          "indexed": true,
+          "shape": "page",
+          "childrenPerParent": 20,
+          "drivers": {
+            "pg": {
+              "coldMs": 13.088,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 100,
+                "min": 3.535,
+                "p50": 3.758,
+                "p95": 5.833,
+                "max": 7.085,
+                "mean": 3.947,
+                "retainedHeapKiB": 44,
+                "gcCount": 26,
+                "gcMs": 7.92
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": false,
+              "drizzleClientStatementsPerCall": 1,
+              "drizzle": {
+                "n": 100,
+                "min": 5.714,
+                "p50": 6.77,
+                "p95": 10.51,
+                "max": 14.924,
+                "mean": 7.392,
+                "retainedHeapKiB": 51,
+                "gcCount": 22,
+                "gcMs": 10.713
+              },
+              "handBatched": {
+                "n": 100,
+                "min": 2.838,
+                "p50": 3.425,
+                "p95": 4.793,
+                "max": 6.953,
+                "mean": 3.553,
+                "retainedHeapKiB": 41,
+                "gcCount": 20,
+                "gcMs": 10.926
+              },
+              "handBatchedStatementsPerCall": 3,
+              "handSingle": {
+                "n": 100,
+                "min": 3.241,
+                "p50": 3.356,
+                "p95": 3.752,
+                "max": 4.02,
+                "mean": 3.406,
+                "retainedHeapKiB": 44,
+                "gcCount": 7,
+                "gcMs": 5.387
+              }
+            },
+            "postgres": {
+              "coldMs": 8.74,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 100,
+                "min": 3.727,
+                "p50": 3.921,
+                "p95": 4.779,
+                "max": 6.19,
+                "mean": 4.107,
+                "retainedHeapKiB": 155,
+                "gcCount": 30,
+                "gcMs": 17.429
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": false,
+              "drizzleClientStatementsPerCall": null,
+              "drizzle": {
+                "n": 100,
+                "min": 5.691,
+                "p50": 6.649,
+                "p95": 7.683,
+                "max": 8.81,
+                "mean": 6.76,
+                "retainedHeapKiB": -1371,
+                "gcCount": 33,
+                "gcMs": 22.452
+              }
+            }
+          },
+          "plan": {
+            "executionMs": {
+              "n": 9,
+              "min": 3.194,
+              "p50": 3.553,
+              "p95": 5.064,
+              "max": 5.064,
+              "mean": 3.791
+            },
+            "handExecutionMs": {
+              "n": 9,
+              "min": 3.048,
+              "p50": 3.594,
+              "p95": 5.354,
+              "max": 5.354,
+              "mean": 3.837
+            },
+            "serverRatioVsHand": 0.989,
+            "planningMs": 0.026,
+            "nodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Index Scan(posts/posts_author_id_idx)",
+              "Index Scan(audits/audits_user_id_idx)"
+            ],
+            "handNodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Index Scan(posts/posts_author_id_idx)",
+              "Index Scan(audits/audits_user_id_idx)"
+            ],
+            "childSeqScans": [],
+            "sharedHit": 630,
+            "sharedRead": 0
+          }
+        },
+        {
+          "label": "small/indexed/deep/k=2",
+          "scale": "small",
+          "indexed": true,
+          "shape": "deep",
+          "childrenPerParent": 2,
+          "drivers": {
+            "pg": {
+              "coldMs": 9.758,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 100,
+                "min": 3.562,
+                "p50": 4.044,
+                "p95": 4.734,
+                "max": 4.835,
+                "mean": 4.114,
+                "retainedHeapKiB": 77,
+                "gcCount": 10,
+                "gcMs": 5.229
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": true,
+              "drizzleClientStatementsPerCall": 1,
+              "drizzle": {
+                "n": 100,
+                "min": 2.802,
+                "p50": 5.251,
+                "p95": 5.675,
+                "max": 6.092,
+                "mean": 4.951,
+                "retainedHeapKiB": 100,
+                "gcCount": 11,
+                "gcMs": 7.014
+              }
+            },
+            "postgres": {
+              "coldMs": 18.423,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 100,
+                "min": 3.419,
+                "p50": 3.994,
+                "p95": 5.847,
+                "max": 13.695,
+                "mean": 4.3,
+                "retainedHeapKiB": 23,
+                "gcCount": 13,
+                "gcMs": 13.465
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": true,
+              "drizzleClientStatementsPerCall": null,
+              "drizzle": {
+                "n": 100,
+                "min": 2.677,
+                "p50": 4.279,
+                "p95": 5.267,
+                "max": 5.427,
+                "mean": 4.303,
+                "retainedHeapKiB": 32,
+                "gcCount": 14,
+                "gcMs": 11.51
+              }
+            }
+          },
+          "plan": {
+            "executionMs": {
+              "n": 9,
+              "min": 1.621,
+              "p50": 2.06,
+              "p95": 3.881,
+              "max": 3.881,
+              "mean": 2.349
+            },
+            "handExecutionMs": {
+              "n": 9,
+              "min": 1.679,
+              "p50": 1.895,
+              "p95": 3.837,
+              "max": 3.837,
+              "mean": 2.198
+            },
+            "serverRatioVsHand": 1.087,
+            "planningMs": 0.046,
+            "nodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Index Scan(posts/posts_author_id_idx)",
+              "Index Scan(comments/comments_post_id_idx)"
+            ],
+            "handNodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Index Scan(posts/posts_author_id_idx)",
+              "Index Scan(comments/comments_post_id_idx)"
+            ],
+            "childSeqScans": [],
+            "sharedHit": 2104,
+            "sharedRead": 0
+          }
+        },
+        {
+          "label": "small/unindexed/page/k=0",
+          "scale": "small",
+          "indexed": false,
+          "shape": "page",
+          "childrenPerParent": 0,
+          "drivers": {
+            "pg": {
+              "coldMs": 89.59,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 10,
+                "min": 84.899,
+                "p50": 85.198,
+                "p95": 152.964,
+                "max": 152.964,
+                "mean": 92.119,
+                "retainedHeapKiB": 5,
+                "gcCount": 2,
+                "gcMs": 3.837
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": true,
+              "drizzleClientStatementsPerCall": 1,
+              "drizzle": {
+                "n": 10,
+                "min": 84.815,
+                "p50": 85.964,
+                "p95": 88.522,
+                "max": 88.522,
+                "mean": 86.329,
+                "retainedHeapKiB": 70,
+                "gcCount": 2,
+                "gcMs": 8.079
+              },
+              "handBatched": {
+                "n": 10,
+                "min": 1.684,
+                "p50": 1.761,
+                "p95": 2.362,
+                "max": 2.362,
+                "mean": 1.814,
+                "retainedHeapKiB": 16,
+                "gcCount": 2,
+                "gcMs": 5.821
+              },
+              "handBatchedStatementsPerCall": 3,
+              "handSingle": {
+                "n": 10,
+                "min": 84.28,
+                "p50": 84.357,
+                "p95": 85.625,
+                "max": 85.625,
+                "mean": 84.622,
+                "retainedHeapKiB": 26,
+                "gcCount": 2,
+                "gcMs": 12.018
+              }
+            },
+            "postgres": {
+              "coldMs": 88.422,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 10,
+                "min": 85.065,
+                "p50": 85.235,
+                "p95": 112.243,
+                "max": 112.243,
+                "mean": 89.99,
+                "retainedHeapKiB": 37,
+                "gcCount": 2,
+                "gcMs": 6.545
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": true,
+              "drizzleClientStatementsPerCall": null,
+              "drizzle": {
+                "n": 10,
+                "min": 88.17,
+                "p50": 89.164,
+                "p95": 90.877,
+                "max": 90.877,
+                "mean": 89.448,
+                "retainedHeapKiB": 64,
+                "gcCount": 2,
+                "gcMs": 4.637
+              }
+            }
+          },
+          "plan": {
+            "executionMs": {
+              "n": 3,
+              "min": 84.044,
+              "p50": 84.201,
+              "p95": 84.799,
+              "max": 84.799,
+              "mean": 84.348
+            },
+            "handExecutionMs": {
+              "n": 3,
+              "min": 84.102,
+              "p50": 84.277,
+              "p95": 84.356,
+              "max": 84.356,
+              "mean": 84.245
+            },
+            "serverRatioVsHand": 0.999,
+            "planningMs": 0.024,
+            "nodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Seq Scan(posts)",
+              "Seq Scan(audits)"
+            ],
+            "handNodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Seq Scan(posts)",
+              "Seq Scan(audits)"
+            ],
+            "childSeqScans": [
+              "posts",
+              "audits"
+            ],
+            "sharedHit": 29304,
+            "sharedRead": 0
+          }
+        },
+        {
+          "label": "small/unindexed/page/k=2",
+          "scale": "small",
+          "indexed": false,
+          "shape": "page",
+          "childrenPerParent": 2,
+          "drivers": {
+            "pg": {
+              "coldMs": 92.781,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 10,
+                "min": 88.341,
+                "p50": 89.968,
+                "p95": 170.859,
+                "max": 170.859,
+                "mean": 99.654,
+                "retainedHeapKiB": 26,
+                "gcCount": 2,
+                "gcMs": 8.085
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": false,
+              "drizzleClientStatementsPerCall": 1,
+              "drizzle": {
+                "n": 10,
+                "min": 85.699,
+                "p50": 86.212,
+                "p95": 88.962,
+                "max": 88.962,
+                "mean": 86.529,
+                "retainedHeapKiB": 81,
+                "gcCount": 2,
+                "gcMs": 11.611
+              },
+              "handBatched": {
+                "n": 10,
+                "min": 1.789,
+                "p50": 1.834,
+                "p95": 2.347,
+                "max": 2.347,
+                "mean": 1.972,
+                "retainedHeapKiB": 2,
+                "gcCount": 2,
+                "gcMs": 5.373
+              },
+              "handBatchedStatementsPerCall": 3,
+              "handSingle": {
+                "n": 10,
+                "min": 83.971,
+                "p50": 84.273,
+                "p95": 95.671,
+                "max": 95.671,
+                "mean": 86.213,
+                "retainedHeapKiB": 19,
+                "gcCount": 2,
+                "gcMs": 10.828
+              }
+            },
+            "postgres": {
+              "coldMs": 90.233,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 10,
+                "min": 85.286,
+                "p50": 86.354,
+                "p95": 93.018,
+                "max": 93.018,
+                "mean": 87.841,
+                "retainedHeapKiB": 12,
+                "gcCount": 2,
+                "gcMs": 4.1
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": false,
+              "drizzleClientStatementsPerCall": null,
+              "drizzle": {
+                "n": 10,
+                "min": 85.455,
+                "p50": 86.062,
+                "p95": 87.341,
+                "max": 87.341,
+                "mean": 86.261,
+                "retainedHeapKiB": 65,
+                "gcCount": 2,
+                "gcMs": 6.84
+              }
+            }
+          },
+          "plan": {
+            "executionMs": {
+              "n": 3,
+              "min": 88.442,
+              "p50": 90.723,
+              "p95": 91.935,
+              "max": 91.935,
+              "mean": 90.367
+            },
+            "handExecutionMs": {
+              "n": 3,
+              "min": 89.736,
+              "p50": 89.766,
+              "p95": 90.879,
+              "max": 90.879,
+              "mean": 90.127
+            },
+            "serverRatioVsHand": 1.011,
+            "planningMs": 0.065,
+            "nodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Seq Scan(posts)",
+              "Seq Scan(audits)"
+            ],
+            "handNodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Seq Scan(posts)",
+              "Seq Scan(audits)"
+            ],
+            "childSeqScans": [
+              "posts",
+              "audits"
+            ],
+            "sharedHit": 29303,
+            "sharedRead": 0
+          }
+        },
+        {
+          "label": "small/unindexed/page/k=20",
+          "scale": "small",
+          "indexed": false,
+          "shape": "page",
+          "childrenPerParent": 20,
+          "drivers": {
+            "pg": {
+              "coldMs": 162.063,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 10,
+                "min": 88.826,
+                "p50": 90.884,
+                "p95": 106.967,
+                "max": 106.967,
+                "mean": 92.828,
+                "retainedHeapKiB": 31,
+                "gcCount": 4,
+                "gcMs": 12.532
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": false,
+              "drizzleClientStatementsPerCall": 1,
+              "drizzle": {
+                "n": 10,
+                "min": 89.923,
+                "p50": 94.005,
+                "p95": 102.514,
+                "max": 102.514,
+                "mean": 94.74,
+                "retainedHeapKiB": 42,
+                "gcCount": 4,
+                "gcMs": 4.845
+              },
+              "handBatched": {
+                "n": 10,
+                "min": 3.615,
+                "p50": 4.395,
+                "p95": 8.09,
+                "max": 8.09,
+                "mean": 5.034,
+                "retainedHeapKiB": 29,
+                "gcCount": 3,
+                "gcMs": 4.957
+              },
+              "handBatchedStatementsPerCall": 3,
+              "handSingle": {
+                "n": 10,
+                "min": 89.883,
+                "p50": 91.185,
+                "p95": 106.076,
+                "max": 106.076,
+                "mean": 93.627,
+                "retainedHeapKiB": 8,
+                "gcCount": 2,
+                "gcMs": 4.082
+              }
+            },
+            "postgres": {
+              "coldMs": 115.283,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 10,
+                "min": 90.226,
+                "p50": 95.914,
+                "p95": 110.933,
+                "max": 110.933,
+                "mean": 100.054,
+                "retainedHeapKiB": 15,
+                "gcCount": 4,
+                "gcMs": 7.36
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": false,
+              "drizzleClientStatementsPerCall": null,
+              "drizzle": {
+                "n": 10,
+                "min": 90.567,
+                "p50": 91.864,
+                "p95": 173.283,
+                "max": 173.283,
+                "mean": 100.799,
+                "retainedHeapKiB": 38,
+                "gcCount": 4,
+                "gcMs": 15.809
+              }
+            }
+          },
+          "plan": {
+            "executionMs": {
+              "n": 3,
+              "min": 92.944,
+              "p50": 96.445,
+              "p95": 99.544,
+              "max": 99.544,
+              "mean": 96.311
+            },
+            "handExecutionMs": {
+              "n": 3,
+              "min": 90.372,
+              "p50": 95.181,
+              "p95": 114.796,
+              "max": 114.796,
+              "mean": 100.116
+            },
+            "serverRatioVsHand": 1.013,
+            "planningMs": 0.066,
+            "nodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Seq Scan(posts)",
+              "Seq Scan(audits)"
+            ],
+            "handNodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Seq Scan(posts)",
+              "Seq Scan(audits)"
+            ],
+            "childSeqScans": [
+              "posts",
+              "audits"
+            ],
+            "sharedHit": 29305,
+            "sharedRead": 0
+          }
+        },
+        {
+          "label": "small/unindexed/deep/k=2",
+          "scale": "small",
+          "indexed": false,
+          "shape": "deep",
+          "childrenPerParent": 2,
+          "drivers": {
+            "pg": {
+              "coldMs": 69.59,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 10,
+                "min": 60.997,
+                "p50": 62.729,
+                "p95": 65.74,
+                "max": 65.74,
+                "mean": 62.852,
+                "retainedHeapKiB": 23,
+                "gcCount": 2,
+                "gcMs": 5.311
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": true,
+              "drizzleClientStatementsPerCall": 1,
+              "drizzle": {
+                "n": 10,
+                "min": 60.768,
+                "p50": 62.156,
+                "p95": 68.899,
+                "max": 68.899,
+                "mean": 62.796,
+                "retainedHeapKiB": 65,
+                "gcCount": 2,
+                "gcMs": 6.88
+              }
+            },
+            "postgres": {
+              "coldMs": 67.674,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 10,
+                "min": 67.493,
+                "p50": 71.601,
+                "p95": 118.684,
+                "max": 118.684,
+                "mean": 79.449,
+                "retainedHeapKiB": 27,
+                "gcCount": 2,
+                "gcMs": 4.637
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": true,
+              "drizzleClientStatementsPerCall": null,
+              "drizzle": {
+                "n": 10,
+                "min": 64.466,
+                "p50": 65.955,
+                "p95": 71.654,
+                "max": 71.654,
+                "mean": 66.629,
+                "retainedHeapKiB": 50,
+                "gcCount": 2,
+                "gcMs": 5.054
+              }
+            }
+          },
+          "plan": {
+            "executionMs": {
+              "n": 3,
+              "min": 61.725,
+              "p50": 61.921,
+              "p95": 94.58,
+              "max": 94.58,
+              "mean": 72.742
+            },
+            "handExecutionMs": {
+              "n": 3,
+              "min": 61.394,
+              "p50": 67.726,
+              "p95": 90.867,
+              "max": 90.867,
+              "mean": 73.329
+            },
+            "serverRatioVsHand": 0.914,
+            "planningMs": 0.086,
+            "nodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Seq Scan(posts)",
+              "Seq Scan(comments)"
+            ],
+            "handNodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Seq Scan(posts)",
+              "Seq Scan(comments)"
+            ],
+            "childSeqScans": [
+              "posts",
+              "comments"
+            ],
+            "sharedHit": 22403,
+            "sharedRead": 0
+          }
+        }
+      ]
+    },
+    {
+      "scale": "large",
+      "parents": 10000,
+      "rows": {
+        "users": 30000,
+        "posts": 220000,
+        "audits": 220000,
+        "comments": 40000
+      },
+      "loadMs": 2370,
+      "scenarios": [
+        {
+          "label": "large/indexed/page/k=0",
+          "scale": "large",
+          "indexed": true,
+          "shape": "page",
+          "childrenPerParent": 0,
+          "drivers": {
+            "pg": {
+              "coldMs": 3.241,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 100,
+                "min": 0.355,
+                "p50": 0.461,
+                "p95": 0.984,
+                "max": 1.153,
+                "mean": 0.554,
+                "retainedHeapKiB": 116,
+                "gcCount": 3,
+                "gcMs": 5.797
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": true,
+              "drizzleClientStatementsPerCall": 1,
+              "drizzle": {
+                "n": 100,
+                "min": 0.745,
+                "p50": 1.456,
+                "p95": 1.617,
+                "max": 2,
+                "mean": 1.336,
+                "retainedHeapKiB": 88,
+                "gcCount": 4,
+                "gcMs": 4.692
+              },
+              "handBatched": {
+                "n": 100,
+                "min": 0.263,
+                "p50": 0.449,
+                "p95": 0.72,
+                "max": 0.823,
+                "mean": 0.47,
+                "retainedHeapKiB": 51,
+                "gcCount": 3,
+                "gcMs": 4.588
+              },
+              "handBatchedStatementsPerCall": 3,
+              "handSingle": {
+                "n": 100,
+                "min": 0.294,
+                "p50": 0.317,
+                "p95": 0.597,
+                "max": 0.78,
+                "mean": 0.349,
+                "retainedHeapKiB": 48,
+                "gcCount": 2,
+                "gcMs": 4.207
+              }
+            },
+            "postgres": {
+              "coldMs": 5.608,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 100,
+                "min": 0.417,
+                "p50": 0.455,
+                "p95": 0.56,
+                "max": 0.989,
+                "mean": 0.479,
+                "retainedHeapKiB": 65,
+                "gcCount": 3,
+                "gcMs": 5.061
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": true,
+              "drizzleClientStatementsPerCall": null,
+              "drizzle": {
+                "n": 100,
+                "min": 0.797,
+                "p50": 1.494,
+                "p95": 1.656,
+                "max": 1.708,
+                "mean": 1.345,
+                "retainedHeapKiB": 74,
+                "gcCount": 5,
+                "gcMs": 6.071
+              }
+            }
+          },
+          "plan": {
+            "executionMs": {
+              "n": 9,
+              "min": 0.17,
+              "p50": 0.174,
+              "p95": 0.325,
+              "max": 0.325,
+              "mean": 0.2
+            },
+            "handExecutionMs": {
+              "n": 9,
+              "min": 0.164,
+              "p50": 0.169,
+              "p95": 0.242,
+              "max": 0.242,
+              "mean": 0.177
+            },
+            "serverRatioVsHand": 1.03,
+            "planningMs": 0.023,
+            "nodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Index Scan(posts/posts_author_id_idx)",
+              "Index Scan(audits/audits_user_id_idx)"
+            ],
+            "handNodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Index Scan(posts/posts_author_id_idx)",
+              "Index Scan(audits/audits_user_id_idx)"
+            ],
+            "childSeqScans": [],
+            "sharedHit": 404,
+            "sharedRead": 0
+          }
+        },
+        {
+          "label": "large/indexed/page/k=2",
+          "scale": "large",
+          "indexed": true,
+          "shape": "page",
+          "childrenPerParent": 2,
+          "drivers": {
+            "pg": {
+              "coldMs": 7.415,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 100,
+                "min": 0.748,
+                "p50": 1.113,
+                "p95": 2.42,
+                "max": 2.531,
+                "mean": 1.285,
+                "retainedHeapKiB": 67,
+                "gcCount": 5,
+                "gcMs": 5.197
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": false,
+              "drizzleClientStatementsPerCall": 1,
+              "drizzle": {
+                "n": 100,
+                "min": 1.342,
+                "p50": 2.665,
+                "p95": 2.84,
+                "max": 2.942,
+                "mean": 2.405,
+                "retainedHeapKiB": 125,
+                "gcCount": 6,
+                "gcMs": 5.16
+              },
+              "handBatched": {
+                "n": 100,
+                "min": 0.495,
+                "p50": 0.632,
+                "p95": 1.217,
+                "max": 1.48,
+                "mean": 0.727,
+                "retainedHeapKiB": 70,
+                "gcCount": 4,
+                "gcMs": 4.448
+              },
+              "handBatchedStatementsPerCall": 3,
+              "handSingle": {
+                "n": 100,
+                "min": 0.587,
+                "p50": 0.614,
+                "p95": 0.83,
+                "max": 1.137,
+                "mean": 0.648,
+                "retainedHeapKiB": 20,
+                "gcCount": 3,
+                "gcMs": 4.542
+              }
+            },
+            "postgres": {
+              "coldMs": 4.623,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 100,
+                "min": 0.729,
+                "p50": 0.788,
+                "p95": 1.195,
+                "max": 1.656,
+                "mean": 0.838,
+                "retainedHeapKiB": 104,
+                "gcCount": 6,
+                "gcMs": 6.82
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": false,
+              "drizzleClientStatementsPerCall": null,
+              "drizzle": {
+                "n": 100,
+                "min": 1.408,
+                "p50": 2.533,
+                "p95": 2.907,
+                "max": 3.573,
+                "mean": 2.379,
+                "retainedHeapKiB": 62,
+                "gcCount": 7,
+                "gcMs": 8.043
+              }
+            }
+          },
+          "plan": {
+            "executionMs": {
+              "n": 9,
+              "min": 0.496,
+              "p50": 0.505,
+              "p95": 1.232,
+              "max": 1.232,
+              "mean": 0.587
+            },
+            "handExecutionMs": {
+              "n": 9,
+              "min": 0.491,
+              "p50": 0.5,
+              "p95": 0.735,
+              "max": 0.735,
+              "mean": 0.548
+            },
+            "serverRatioVsHand": 1.01,
+            "planningMs": 0.025,
+            "nodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Index Scan(posts/posts_author_id_idx)",
+              "Index Scan(audits/audits_user_id_idx)"
+            ],
+            "handNodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Index Scan(posts/posts_author_id_idx)",
+              "Index Scan(audits/audits_user_id_idx)"
+            ],
+            "childSeqScans": [],
+            "sharedHit": 605,
+            "sharedRead": 0
+          }
+        },
+        {
+          "label": "large/indexed/page/k=20",
+          "scale": "large",
+          "indexed": true,
+          "shape": "page",
+          "childrenPerParent": 20,
+          "drivers": {
+            "pg": {
+              "coldMs": 13.131,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 100,
+                "min": 3.789,
+                "p50": 3.992,
+                "p95": 6.104,
+                "max": 7.028,
+                "mean": 4.259,
+                "retainedHeapKiB": 81,
+                "gcCount": 26,
+                "gcMs": 8.747
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": false,
+              "drizzleClientStatementsPerCall": 1,
+              "drizzle": {
+                "n": 100,
+                "min": 5.663,
+                "p50": 6.508,
+                "p95": 7.22,
+                "max": 7.446,
+                "mean": 6.534,
+                "retainedHeapKiB": 57,
+                "gcCount": 22,
+                "gcMs": 8.408
+              },
+              "handBatched": {
+                "n": 100,
+                "min": 2.579,
+                "p50": 2.961,
+                "p95": 3.364,
+                "max": 4.075,
+                "mean": 3.041,
+                "retainedHeapKiB": 59,
+                "gcCount": 20,
+                "gcMs": 7.445
+              },
+              "handBatchedStatementsPerCall": 3,
+              "handSingle": {
+                "n": 100,
+                "min": 3.192,
+                "p50": 3.336,
+                "p95": 3.963,
+                "max": 6.817,
+                "mean": 3.483,
+                "retainedHeapKiB": 52,
+                "gcCount": 7,
+                "gcMs": 6.568
+              }
+            },
+            "postgres": {
+              "coldMs": 14.447,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 100,
+                "min": 3.73,
+                "p50": 3.93,
+                "p95": 5.704,
+                "max": 9.005,
+                "mean": 4.275,
+                "retainedHeapKiB": 98,
+                "gcCount": 30,
+                "gcMs": 21.751
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": false,
+              "drizzleClientStatementsPerCall": null,
+              "drizzle": {
+                "n": 100,
+                "min": 5.92,
+                "p50": 6.764,
+                "p95": 8.655,
+                "max": 8.978,
+                "mean": 6.962,
+                "retainedHeapKiB": 159,
+                "gcCount": 31,
+                "gcMs": 23.641
+              }
+            }
+          },
+          "plan": {
+            "executionMs": {
+              "n": 9,
+              "min": 3.11,
+              "p50": 3.224,
+              "p95": 5.4,
+              "max": 5.4,
+              "mean": 3.671
+            },
+            "handExecutionMs": {
+              "n": 9,
+              "min": 3.176,
+              "p50": 3.603,
+              "p95": 5.953,
+              "max": 5.953,
+              "mean": 3.855
+            },
+            "serverRatioVsHand": 0.895,
+            "planningMs": 0.065,
+            "nodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Index Scan(posts/posts_author_id_idx)",
+              "Index Scan(audits/audits_user_id_idx)"
+            ],
+            "handNodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Index Scan(posts/posts_author_id_idx)",
+              "Index Scan(audits/audits_user_id_idx)"
+            ],
+            "childSeqScans": [],
+            "sharedHit": 629,
+            "sharedRead": 0
+          }
+        },
+        {
+          "label": "large/indexed/deep/k=2",
+          "scale": "large",
+          "indexed": true,
+          "shape": "deep",
+          "childrenPerParent": 2,
+          "drivers": {
+            "pg": {
+              "coldMs": 7.36,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 100,
+                "min": 1.758,
+                "p50": 3.56,
+                "p95": 4.037,
+                "max": 4.248,
+                "mean": 3.492,
+                "retainedHeapKiB": 56,
+                "gcCount": 10,
+                "gcMs": 5.834
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": true,
+              "drizzleClientStatementsPerCall": 1,
+              "drizzle": {
+                "n": 100,
+                "min": 2.556,
+                "p50": 4.249,
+                "p95": 5.401,
+                "max": 18.456,
+                "mean": 4.521,
+                "retainedHeapKiB": 128,
+                "gcCount": 11,
+                "gcMs": 6.428
+              }
+            },
+            "postgres": {
+              "coldMs": 16.356,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 100,
+                "min": 3.521,
+                "p50": 4.102,
+                "p95": 4.702,
+                "max": 5.068,
+                "mean": 4.125,
+                "retainedHeapKiB": 12,
+                "gcCount": 13,
+                "gcMs": 10.908
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": true,
+              "drizzleClientStatementsPerCall": null,
+              "drizzle": {
+                "n": 100,
+                "min": 2.665,
+                "p50": 5.075,
+                "p95": 5.312,
+                "max": 5.59,
+                "mean": 4.685,
+                "retainedHeapKiB": 81,
+                "gcCount": 14,
+                "gcMs": 11.217
+              }
+            }
+          },
+          "plan": {
+            "executionMs": {
+              "n": 9,
+              "min": 1.268,
+              "p50": 1.286,
+              "p95": 1.848,
+              "max": 1.848,
+              "mean": 1.355
+            },
+            "handExecutionMs": {
+              "n": 9,
+              "min": 1.319,
+              "p50": 1.351,
+              "p95": 1.677,
+              "max": 1.677,
+              "mean": 1.417
+            },
+            "serverRatioVsHand": 0.952,
+            "planningMs": 0.031,
+            "nodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Index Scan(posts/posts_author_id_idx)",
+              "Index Scan(comments/comments_post_id_idx)"
+            ],
+            "handNodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Index Scan(posts/posts_author_id_idx)",
+              "Index Scan(comments/comments_post_id_idx)"
+            ],
+            "childSeqScans": [],
+            "sharedHit": 2105,
+            "sharedRead": 0
+          }
+        },
+        {
+          "label": "large/unindexed/page/k=0",
+          "scale": "large",
+          "indexed": false,
+          "shape": "page",
+          "childrenPerParent": 0,
+          "drivers": {
+            "pg": {
+              "coldMs": 870.965,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 10,
+                "min": 860.735,
+                "p50": 894.945,
+                "p95": 1069.645,
+                "max": 1069.645,
+                "mean": 915.279,
+                "retainedHeapKiB": -57,
+                "gcCount": 6,
+                "gcMs": 9.987
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": true,
+              "drizzleClientStatementsPerCall": 1,
+              "drizzle": {
+                "n": 10,
+                "min": 876.447,
+                "p50": 896.876,
+                "p95": 1026.032,
+                "max": 1026.032,
+                "mean": 920.255,
+                "retainedHeapKiB": 21,
+                "gcCount": 6,
+                "gcMs": 5.997
+              },
+              "handBatched": {
+                "n": 10,
+                "min": 9.533,
+                "p50": 9.744,
+                "p95": 10.583,
+                "max": 10.583,
+                "mean": 9.981,
+                "retainedHeapKiB": 16,
+                "gcCount": 3,
+                "gcMs": 4.304
+              },
+              "handBatchedStatementsPerCall": 3,
+              "handSingle": {
+                "n": 10,
+                "min": 860.7,
+                "p50": 871.779,
+                "p95": 986.564,
+                "max": 986.564,
+                "mean": 896.62,
+                "retainedHeapKiB": 23,
+                "gcCount": 2,
+                "gcMs": 4.36
+              }
+            },
+            "postgres": {
+              "coldMs": 937.082,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 10,
+                "min": 858.284,
+                "p50": 864.402,
+                "p95": 953.03,
+                "max": 953.03,
+                "mean": 882.041,
+                "retainedHeapKiB": 40,
+                "gcCount": 4,
+                "gcMs": 4.522
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": true,
+              "drizzleClientStatementsPerCall": null,
+              "drizzle": {
+                "n": 10,
+                "min": 841.936,
+                "p50": 847.083,
+                "p95": 973.135,
+                "max": 973.135,
+                "mean": 872.288,
+                "retainedHeapKiB": 34,
+                "gcCount": 6,
+                "gcMs": 6.263
+              }
+            }
+          },
+          "plan": {
+            "executionMs": {
+              "n": 3,
+              "min": 890.202,
+              "p50": 895.187,
+              "p95": 903.189,
+              "max": 903.189,
+              "mean": 896.193
+            },
+            "handExecutionMs": {
+              "n": 3,
+              "min": 887.993,
+              "p50": 894.06,
+              "p95": 971.491,
+              "max": 971.491,
+              "mean": 917.848
+            },
+            "serverRatioVsHand": 1.001,
+            "planningMs": 0.065,
+            "nodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Seq Scan(posts)",
+              "Seq Scan(audits)"
+            ],
+            "handNodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Seq Scan(posts)",
+              "Seq Scan(audits)"
+            ],
+            "childSeqScans": [
+              "posts",
+              "audits"
+            ],
+            "sharedHit": 302004,
+            "sharedRead": 0
+          }
+        },
+        {
+          "label": "large/unindexed/page/k=2",
+          "scale": "large",
+          "indexed": false,
+          "shape": "page",
+          "childrenPerParent": 2,
+          "drivers": {
+            "pg": {
+              "coldMs": 947.909,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 10,
+                "min": 842.77,
+                "p50": 856.282,
+                "p95": 952.088,
+                "max": 952.088,
+                "mean": 885.829,
+                "retainedHeapKiB": 4,
+                "gcCount": 8,
+                "gcMs": 6.623
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": false,
+              "drizzleClientStatementsPerCall": 1,
+              "drizzle": {
+                "n": 10,
+                "min": 962.407,
+                "p50": 1097.742,
+                "p95": 3004.303,
+                "max": 3004.303,
+                "mean": 1336.461,
+                "retainedHeapKiB": 29,
+                "gcCount": 10,
+                "gcMs": 7.343
+              },
+              "handBatched": {
+                "n": 10,
+                "min": 11.136,
+                "p50": 11.87,
+                "p95": 12.918,
+                "max": 12.918,
+                "mean": 11.81,
+                "retainedHeapKiB": 29,
+                "gcCount": 5,
+                "gcMs": 4.7
+              },
+              "handBatchedStatementsPerCall": 3,
+              "handSingle": {
+                "n": 10,
+                "min": 951.842,
+                "p50": 973.011,
+                "p95": 1154.892,
+                "max": 1154.892,
+                "mean": 1008.179,
+                "retainedHeapKiB": 22,
+                "gcCount": 2,
+                "gcMs": 5.279
+              }
+            },
+            "postgres": {
+              "coldMs": 1023.097,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 10,
+                "min": 888.718,
+                "p50": 1020.875,
+                "p95": 1599.792,
+                "max": 1599.792,
+                "mean": 1069.716,
+                "retainedHeapKiB": 8,
+                "gcCount": 8,
+                "gcMs": 6.308
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": false,
+              "drizzleClientStatementsPerCall": null,
+              "drizzle": {
+                "n": 10,
+                "min": 864.62,
+                "p50": 900.512,
+                "p95": 975.969,
+                "max": 975.969,
+                "mean": 913.578,
+                "retainedHeapKiB": 38,
+                "gcCount": 9,
+                "gcMs": 7.156
+              }
+            }
+          },
+          "plan": {
+            "executionMs": {
+              "n": 3,
+              "min": 970.913,
+              "p50": 1327.097,
+              "p95": 3414.231,
+              "max": 3414.231,
+              "mean": 1904.08
+            },
+            "handExecutionMs": {
+              "n": 3,
+              "min": 925.843,
+              "p50": 1027.021,
+              "p95": 2898.267,
+              "max": 2898.267,
+              "mean": 1617.044
+            },
+            "serverRatioVsHand": 1.292,
+            "planningMs": 0.075,
+            "nodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Seq Scan(posts)",
+              "Seq Scan(audits)"
+            ],
+            "handNodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Seq Scan(posts)",
+              "Seq Scan(audits)"
+            ],
+            "childSeqScans": [
+              "posts",
+              "audits"
+            ],
+            "sharedHit": 302005,
+            "sharedRead": 0
+          }
+        },
+        {
+          "label": "large/unindexed/page/k=20",
+          "scale": "large",
+          "indexed": false,
+          "shape": "page",
+          "childrenPerParent": 20,
+          "drivers": {
+            "pg": {
+              "coldMs": 863.745,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 10,
+                "min": 920.31,
+                "p50": 1027.523,
+                "p95": 1381.26,
+                "max": 1381.26,
+                "mean": 1083.761,
+                "retainedHeapKiB": 3,
+                "gcCount": 11,
+                "gcMs": 11.87
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": false,
+              "drizzleClientStatementsPerCall": 1,
+              "drizzle": {
+                "n": 10,
+                "min": 878.092,
+                "p50": 943.729,
+                "p95": 1423.133,
+                "max": 1423.133,
+                "mean": 997.805,
+                "retainedHeapKiB": 28,
+                "gcCount": 6,
+                "gcMs": 6.285
+              },
+              "handBatched": {
+                "n": 10,
+                "min": 10.267,
+                "p50": 10.936,
+                "p95": 13.071,
+                "max": 13.071,
+                "mean": 11.16,
+                "retainedHeapKiB": 40,
+                "gcCount": 5,
+                "gcMs": 7.768
+              },
+              "handBatchedStatementsPerCall": 3,
+              "handSingle": {
+                "n": 10,
+                "min": 908.68,
+                "p50": 924.736,
+                "p95": 1205.755,
+                "max": 1205.755,
+                "mean": 958.005,
+                "retainedHeapKiB": 23,
+                "gcCount": 3,
+                "gcMs": 5.835
+              }
+            },
+            "postgres": {
+              "coldMs": 946.35,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 10,
+                "min": 957.875,
+                "p50": 1016.863,
+                "p95": 1516.005,
+                "max": 1516.005,
+                "mean": 1122.807,
+                "retainedHeapKiB": 19,
+                "gcCount": 16,
+                "gcMs": 11.864
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": false,
+              "drizzleClientStatementsPerCall": null,
+              "drizzle": {
+                "n": 10,
+                "min": 851.374,
+                "p50": 922.256,
+                "p95": 1071.7,
+                "max": 1071.7,
+                "mean": 947.144,
+                "retainedHeapKiB": 44,
+                "gcCount": 4,
+                "gcMs": 7.158
+              }
+            }
+          },
+          "plan": {
+            "executionMs": {
+              "n": 3,
+              "min": 926.629,
+              "p50": 946.55,
+              "p95": 953.877,
+              "max": 953.877,
+              "mean": 942.352
+            },
+            "handExecutionMs": {
+              "n": 3,
+              "min": 937.452,
+              "p50": 1000.739,
+              "p95": 1327.687,
+              "max": 1327.687,
+              "mean": 1088.626
+            },
+            "serverRatioVsHand": 0.946,
+            "planningMs": 0.066,
+            "nodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Seq Scan(posts)",
+              "Seq Scan(audits)"
+            ],
+            "handNodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Seq Scan(posts)",
+              "Seq Scan(audits)"
+            ],
+            "childSeqScans": [
+              "posts",
+              "audits"
+            ],
+            "sharedHit": 302004,
+            "sharedRead": 0
+          }
+        },
+        {
+          "label": "large/unindexed/deep/k=2",
+          "scale": "large",
+          "indexed": false,
+          "shape": "deep",
+          "childrenPerParent": 2,
+          "drivers": {
+            "pg": {
+              "coldMs": 579.024,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 10,
+                "min": 573.544,
+                "p50": 582.614,
+                "p95": 634.526,
+                "max": 634.526,
+                "mean": 587.652,
+                "retainedHeapKiB": 46,
+                "gcCount": 2,
+                "gcMs": 15.147
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": true,
+              "drizzleClientStatementsPerCall": 1,
+              "drizzle": {
+                "n": 10,
+                "min": 576.912,
+                "p50": 578.216,
+                "p95": 617.867,
+                "max": 617.867,
+                "mean": 583.545,
+                "retainedHeapKiB": 63,
+                "gcCount": 2,
+                "gcMs": 5.155
+              }
+            },
+            "postgres": {
+              "coldMs": 586.296,
+              "clientStatementsPerCall": 1,
+              "neutron": {
+                "n": 10,
+                "min": 574.672,
+                "p50": 575.452,
+                "p95": 581.218,
+                "max": 581.218,
+                "mean": 576.031,
+                "retainedHeapKiB": 4,
+                "gcCount": 2,
+                "gcMs": 14.08
+              },
+              "serverStatementsPerCall": 1,
+              "drizzleExactNumericText": true,
+              "drizzleClientStatementsPerCall": null,
+              "drizzle": {
+                "n": 10,
+                "min": 574.944,
+                "p50": 576.946,
+                "p95": 584.922,
+                "max": 584.922,
+                "mean": 578.499,
+                "retainedHeapKiB": 25,
+                "gcCount": 2,
+                "gcMs": 13.869
+              }
+            }
+          },
+          "plan": {
+            "executionMs": {
+              "n": 3,
+              "min": 584.002,
+              "p50": 586.269,
+              "p95": 589.319,
+              "max": 589.319,
+              "mean": 586.53
+            },
+            "handExecutionMs": {
+              "n": 3,
+              "min": 578.978,
+              "p50": 583.775,
+              "p95": 600.385,
+              "max": 600.385,
+              "mean": 587.713
+            },
+            "serverRatioVsHand": 1.004,
+            "planningMs": 0.071,
+            "nodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Seq Scan(posts)",
+              "Seq Scan(comments)"
+            ],
+            "handNodes": [
+              "Limit",
+              "Index Scan(users/users_pkey)",
+              "Aggregate",
+              "Sort",
+              "Seq Scan(posts)",
+              "Seq Scan(comments)"
+            ],
+            "childSeqScans": [
+              "posts",
+              "comments"
+            ],
+            "sharedHit": 222005,
+            "sharedRead": 0
+          }
+        }
+      ]
+    }
+  ],
+  "stream": [
+    {
+      "driver": "pg",
+      "firstRowMs": {
+        "n": 10,
+        "min": 0.33,
+        "p50": 0.421,
+        "p95": 5.434,
+        "max": 5.434,
+        "mean": 0.948
+      },
+      "earlyExitReleaseMs": {
+        "n": 10,
+        "min": 0.07,
+        "p50": 0.093,
+        "p95": 0.246,
+        "max": 0.246,
+        "mean": 0.127
+      }
+    },
+    {
+      "driver": "postgres",
+      "firstRowMs": {
+        "n": 10,
+        "min": 0.327,
+        "p50": 0.357,
+        "p95": 5.525,
+        "max": 5.525,
+        "mean": 0.884
+      },
+      "earlyExitReleaseMs": {
+        "n": 10,
+        "min": 0.089,
+        "p50": 0.094,
+        "p95": 0.186,
+        "max": 0.186,
+        "mean": 0.109
+      }
+    }
+  ],
+  "compile": {
+    "unit": "microseconds per compile",
+    "neutronPage": {
+      "n": 2000,
+      "min": 24.042,
+      "p50": 25.625,
+      "p95": 66.125,
+      "max": 705.667,
+      "mean": 30.684
+    },
+    "neutronDeep": {
+      "n": 2000,
+      "min": 32.208,
+      "p50": 33.583,
+      "p95": 36.542,
+      "max": 178.042,
+      "mean": 35.753
+    },
+    "drizzlePage": {
+      "n": 2000,
+      "min": 144.541,
+      "p50": 150.458,
+      "p95": 193.167,
+      "max": 514.75,
+      "mean": 159.662
+    },
+    "drizzleDeep": {
+      "n": 2000,
+      "min": 177.333,
+      "p50": 181.375,
+      "p95": 364,
+      "max": 873.333,
+      "mean": 201.941
+    }
+  },
+  "failures": [],
+  "peakRssMiB": 143,
+  "finishedAt": "2026-09-25T18:08:18.272Z"
+}
