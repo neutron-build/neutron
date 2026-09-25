@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/neutron-build/neutron/cli/internal/db"
 	"github.com/neutron-build/neutron/cli/internal/inspect"
 )
@@ -131,6 +132,94 @@ func TestMCPReadOnlyAndRedactionLive(t *testing.T) {
 		}
 		if after := state(); after != before {
 			t.Fatalf("state changed: %s -> %s", before, after)
+		}
+	})
+
+	t.Run("review 1 HIGH-1: no session effect outlives a read, and escaping built-ins are refused", func(t *testing.T) {
+		advisory := func() string {
+			return scalar(`SELECT count(*)::text FROM pg_locks WHERE locktype = 'advisory' AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`)
+		}
+		// A user-defined wrapper is invisible to any name check: this is
+		// the connection-level defence on its own.
+		if err := oracle.Exec(ctx, `CREATE FUNCTION x06_grab(k bigint) RETURNS void LANGUAGE sql AS 'SELECT pg_advisory_lock(k)'`); err != nil {
+			t.Fatal(err)
+		}
+		defer oracle.Exec(context.Background(), `DROP FUNCTION x06_grab(bigint)`) //nolint:errcheck
+
+		// Fail-before: the X06 attempt-1 read path (READ ONLY + ROLLBACK on
+		// a pooled connection that is then returned) leaves the lock held.
+		old, err := db.Connect(ctx, dbURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn, err := old.Acquire(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tx, err := conn.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, "SELECT x06_grab(4343)"); err != nil {
+			t.Fatal(err)
+		}
+		_ = tx.Rollback(ctx)
+		conn.Release()
+		if n := advisory(); n != "1" {
+			t.Fatalf("fail-before: pooled READ ONLY + ROLLBACK left %s advisory locks, want 1 (the reproduction is wrong)", n)
+		}
+		old.Close()
+		waitFor(t, func() bool { return advisory() == "0" })
+
+		// Fixed path: query_sql through the wrapper, then the oracle.
+		if _, err := call("query_sql", map[string]any{"sql": "SELECT x06_grab(4343)"}); err != nil {
+			t.Fatal(err)
+		}
+		if n := advisory(); n != "0" {
+			t.Fatalf("query_sql left %s advisory locks held", n)
+		}
+		// Every read path shares it: several reads, still nothing held and
+		// the server keeps working (the pool reconnects).
+		for i := 0; i < 3; i++ {
+			if _, err := call("query_sql", map[string]any{"sql": fmt.Sprintf("SELECT x06_grab(%d)", 5000+i)}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := call("list_tables", nil); err != nil {
+			t.Fatal(err)
+		}
+		if n := advisory(); n != "0" {
+			t.Fatalf("%s advisory locks held after repeated reads", n)
+		}
+
+		statsReset := func() string {
+			return scalar(`SELECT coalesce(stats_reset::text, 'never') FROM pg_stat_database WHERE datname = current_database()`)
+		}
+		stats := statsReset()
+		for _, sql := range guardBypasses {
+			_, err := call("query_sql", map[string]any{"sql": sql})
+			if err == nil || !strings.Contains(err.Error(), "read-only guard") {
+				t.Errorf("%q -> %v", sql, err)
+			}
+		}
+		if n := advisory(); n != "0" {
+			t.Fatalf("bypass attempts left %s advisory locks", n)
+		}
+		if got := statsReset(); got != stats {
+			t.Fatalf("pg_stat_database.stats_reset moved: %s -> %s", stats, got)
+		}
+
+		// A server with standard_conforming_strings = off ends '\'' at the
+		// second quote; the guard reads the text that way too.
+		if err := admin.Exec(ctx, fmt.Sprintf(`ALTER DATABASE %q SET standard_conforming_strings = off`, dbName)); err != nil {
+			t.Fatal(err)
+		}
+		defer admin.Exec(context.Background(), fmt.Sprintf(`ALTER DATABASE %q RESET standard_conforming_strings`, dbName)) //nolint:errcheck
+		if _, err := call("query_sql", map[string]any{"sql": `SELECT '\'', pg_advisory_lock(5151) --'`}); err == nil || !strings.Contains(err.Error(), "read-only guard") {
+			t.Fatalf("standard_conforming_strings=off form -> %v", err)
+		}
+		if n := advisory(); n != "0" {
+			t.Fatalf("%s advisory locks held", n)
 		}
 	})
 
@@ -273,6 +362,31 @@ func TestMCPReadOnlyAndRedactionLive(t *testing.T) {
 			t.Fatalf("oracle users %s", n)
 		}
 	})
+}
+
+// guardBypasses are the review 1 forms that passed the attempt-1 guard on
+// PostgreSQL (plus the \r-comment form found while fixing them).
+var guardBypasses = []string{
+	"SELECT pg_advisory_lock\v(4343)",
+	`SELECT U&"pg_\0061dvisory_lock"(4545)`,
+	`SELECT U&"pg_!0061dvisory_lock" UESCAPE '!' (4545)`,
+	"SELECT pg_catalog.pg_advisory_lock\v(4646), pg_terminate_backend\v(-1)",
+	"SELECT 1 --x\r, pg_advisory_lock(5050)",
+	"SELECT PG_ADVISORY_LOCK /* c */ (4747)",
+	"SELECT pg_stat_reset()",
+	"SELECT pg_stat_reset\v()",
+	"SELECT pg_logical_emit_message(false, 'x06', 'escaped')",
+}
+
+func waitFor(t *testing.T, ok func() bool) {
+	t.Helper()
+	for i := 0; i < 50; i++ {
+		if ok() {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("condition not reached in 5s")
 }
 
 // bypasses are statements the pre-X06 prefix guard admitted that write.
