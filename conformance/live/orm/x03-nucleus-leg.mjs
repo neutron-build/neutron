@@ -39,7 +39,7 @@ const NUCDIST = path.resolve(new URL("../../../typescript/packages/neutron-nucle
 
 const dataDir = mkdtempSync(path.join(tmpdir(), "x03-nucleus-"));
 writeFileSync(
-  path.join(dataDir, "nucleus.toml"),
+  path.join(dataDir, "neutron.toml"),
   ["[storage]", "disk_warn_free_pct = 0.5", "disk_readonly_free_pct = 0.1", "disk_min_free_mb = 128", ""].join("\n"),
 );
 

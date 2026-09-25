@@ -45,7 +45,7 @@ const dataDir = mkdtempSync(path.join(tmpdir(), "x02-nucleus-"));
 // Same watermark override as conformance/live/scripts/start-engine.sh: a
 // near-full developer disk must not turn into a conformance failure.
 writeFileSync(
-  path.join(dataDir, "nucleus.toml"),
+  path.join(dataDir, "neutron.toml"),
   "[storage]\ndisk_warn_free_pct = 0.5\ndisk_readonly_free_pct = 0.1\ndisk_min_free_mb = 128\n",
 );
 
