@@ -631,7 +631,8 @@ it applies itself.
   same builder state compiles to byte-identical SQL.
 - Compiled statements carry their projection **decode plans** (built from the
   serializable per-column `ColumnCodec`) and their engine **capability
-  requirements** (statements using `to_jsonb`/`jsonb_agg` acquisition carry
+  requirements** (statements using `to_jsonb` acquisition or `json_agg`
+  relational aggregation carry
   `jsonb-functions`; engines without those functions must reject them).
 - The compiler reserves the `__q<number>` alias namespace for generated
   derived-table aliases; user aliases in that namespace are rejected.
@@ -1183,9 +1184,12 @@ for await (const batch of db.select().from(events).streamBatches({ batchSize: 10
 `db.query.<table>.findMany/findFirst` compile every requested relation edge —
 at any nesting depth — into the **one statement** as its own independent
 correlated scalar subquery: a to-many child aggregates with
-`jsonb_agg(... order by <keys>)` inside a subquery, a to-one parent builds a
-single `jsonb_build_object` that is `null` when the foreign key misses, and a
+`json_agg(... order by <keys>)` inside a subquery, a to-one parent builds a
+single `json_build_object` that is `null` when the foreign key misses, and a
 nested `with` embeds the next level's subquery inside the child's JSON object.
+(Plain `json`, not `jsonb`: the relation JSON is built once and parsed once, so
+jsonb's conversion only cost server time — about 1.7x on a 100-parent page
+with 20 children per edge, measured by `bench/orm-gate.mjs`.)
 Sibling relations never join each other, so two to-many children (or two
 relations to the same target — `created_by` + `updated_by` both to `users`)
 return each child set exactly, with no cartesian fan-out; each edge gets its
@@ -1199,7 +1203,7 @@ own path-derived alias (`__rel_posts`, `__rel_posts__comments`, …).
   `with: { posts: { where, orderBy, limit, offset, columns, with } }`.
   `limit`/`offset` bound **each parent's** children, never the global set —
   the aggregation runs over a limited derived table
-  (`jsonb_agg` over `(select … order by … limit N)`), with the target primary
+  (`json_agg` over `(select … order by … limit N)`), with the target primary
   key appended as a deterministic tie-breaker. That derived table projects
   **every** target column: the aggregate's order keys and nested edges'
   foreign-key correlations resolve against it and may reference columns
@@ -1226,7 +1230,7 @@ own path-derived alias (`__rel_posts`, `__rel_posts__comments`, …).
   equal-valued distinct children both survive (ordering keys are raw columns —
   no `DISTINCT` collapse). A relation key that arrives as a structurally
   impossible shape (say a non-array for a to-many, on a server that hands
-  jsonb back as strings) fails loudly instead of silently degrading to `[]`.
+  json back as strings) fails loudly instead of silently degrading to `[]`.
   Composite FK keys zip by declared position on both
   sides; declaring the reversed order works and is pinned by tests.
 - **Result types are exact at every nesting depth**: requesting
@@ -1239,7 +1243,7 @@ own path-derived alias (`__rel_posts`, `__rel_posts__comments`, …).
   `bigint` leaves arrive as the column's mode value (default `bigint`),
   `numeric` leaves as exact decimal strings (rendered `::text` inside the
   aggregation), `timestamp`/`date` leaves as their canonical strings,
-  `timestamptz` leaves as their canonical UTC string (`to_jsonb(col at time
+  `timestamptz` leaves as their canonical UTC string (`to_json(col at time
   zone 'UTC')` — session-timezone independent, microseconds intact) and
   `bytea` leaves as `Uint8Array` decoded from the `\x` hex text form. The
   casts apply only to the projected JSON — correlation predicates and
@@ -1251,8 +1255,9 @@ own path-derived alias (`__rel_posts`, `__rel_posts__comments`, …).
   parameters, the serializable decode plans, capability requirements, and the
   relation edge tree (target, cardinality, alias, selected columns, filters,
   limits, depth). Both compile purely — no driver round-trip, no execution.
-- Relational statements carry the `jsonb-functions` capability requirement:
-  an engine that cannot prove jsonb support (e.g. PostgreSQL before 9.4)
+- Relational statements carry the `jsonb-functions` capability requirement
+  (its probe covers the json builders/aggregates as well as jsonb):
+  an engine that cannot prove that support (e.g. PostgreSQL before 9.4)
   rejects the query **before any statement executes** — zero partial work.
 - When a table has two foreign keys to the same target (`posts.author` +
   `posts.reviewer`), name the pair with `relationName` on both the `one()` and
