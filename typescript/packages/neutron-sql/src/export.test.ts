@@ -500,3 +500,95 @@ test("exportSchemaV2 Q07: precise rejections", () => {
   const okArrays = exportSchemaV2({ t: pgTable("t2", { id: serial("id").primaryKey(), xs: integer("xs").array().default([1, 2]) }) });
   assert.deepEqual(okArrays.tables[0].columns[1].default, { kind: "literal", sql: "'{1,2}'::int4[]" });
 });
+
+// ---------------------------------------------------------------------------
+// X02 (X01 review M2): the TS v1 upgrade reader agrees with Go's
+// ValidateSchemaV1ForUpgrade on the legacy vector shape. Same bytes, same
+// verdict, same message core ("legacy vector columns must be nucleusOnly
+// (pre-X01 shape); a non-nucleusOnly vector column never had meaning in v1").
+// ---------------------------------------------------------------------------
+
+test("X02: readSchemaDocumentV1 rejects a non-nucleusOnly v1 vector column (Go parity)", () => {
+  const doc = {
+    version: 1,
+    tables: [
+      {
+        name: "users",
+        columns: [
+          { name: "id", type: "serial", notNull: true, primaryKey: true },
+          { name: "embedding", type: "vector", notNull: true, vectorDimensions: 3 },
+        ],
+        indexes: [],
+      },
+    ],
+  };
+  assert.throws(
+    () => readSchemaDocumentV1(doc),
+    /\[invalid-legacy-vector\] tables\[public\.users\]\.columns\[embedding\]: legacy vector columns must be nucleusOnly \(pre-X01 shape\); a non-nucleusOnly vector column never had meaning in v1/,
+  );
+});
+
+test("X02: readSchemaDocumentV1 keeps accepting the legacy nucleusOnly+dims shape", () => {
+  const doc = readSchemaDocumentV1(
+    JSON.parse(readFileSync(goldenDir("vector-upgrade.json"), "utf8")),
+  );
+  assert.deepEqual(doc.capabilities, ["pgvector"]);
+});
+
+test("X02: readSchemaDocumentV1 rejects misplaced legacy vector fields like Go", () => {
+  const base: {
+    version: number;
+    tables: Array<{
+      name: string;
+      columns: Array<Record<string, unknown>>;
+      indexes: unknown[];
+    }>;
+  } = {
+    version: 1,
+    tables: [
+      {
+        name: "t",
+        columns: [
+          { name: "id", type: "serial", notNull: true, primaryKey: true },
+          { name: "label", type: "text" },
+        ],
+        indexes: [],
+      },
+    ],
+  };
+  const nucleusOnlyOnText = structuredClone(base);
+  nucleusOnlyOnText.tables[0].columns[1].nucleusOnly = true;
+  assert.throws(
+    () => readSchemaDocumentV1(nucleusOnlyOnText),
+    /nucleusOnly is only valid for vector columns/,
+  );
+  const dimsOnText = structuredClone(base);
+  dimsOnText.tables[0].columns[1].vectorDimensions = 3;
+  assert.throws(
+    () => readSchemaDocumentV1(dimsOnText),
+    /vectorDimensions is only valid for vector columns/,
+  );
+});
+
+test("X02: legacy vector dimensions must be a positive integer (Go parity)", () => {
+  for (const dims of [0, -3, 2.5]) {
+    const doc = {
+      version: 1,
+      tables: [
+        {
+          name: "t",
+          columns: [
+            { name: "id", type: "serial", notNull: true, primaryKey: true },
+            { name: "embedding", type: "vector", notNull: true, nucleusOnly: true, vectorDimensions: dims },
+          ],
+          indexes: [],
+        },
+      ],
+    };
+    assert.throws(
+      () => readSchemaDocumentV1(doc),
+      /vector type requires vectorDimensions > 0/,
+      `dims=${dims}`,
+    );
+  }
+});

@@ -411,3 +411,77 @@ test("I01: auto driver selection does not fall back on connection-class failures
   );
   await assert.rejects(() => loadDriver("not a url at all", { driver: "postgres" }), ConnectionFailedError);
 });
+
+// ---------------------------------------------------------------------------
+// X02 (X01 review M1): vector probes assert VALUES, not acceptance.
+// ---------------------------------------------------------------------------
+
+const X02_VECTOR_CAPS = [
+  "vector-type",
+  "vector-operator-l2",
+  "vector-operator-inner-product",
+  "vector-operator-cosine",
+  "vector-operator-l1",
+] as const;
+
+test("X02: every vector probe carries a value assertion with a 1/0 negative-control arm", async () => {
+  // Structural guard: a regression to parse-only probes (`select
+  // '[1]'::vector`) would certify engines that accept the syntax and compute
+  // wrong values. Every probe must be a case expression that fires 22012
+  // through `1/0` when the asserted literal is wrong.
+  const expectedLiterals: Record<(typeof X02_VECTOR_CAPS)[number], RegExp> = {
+    "vector-type": /::vector\)::text = '\[1\]' then 1/,
+    "vector-operator-l2": /<-> '\[2\]'::vector\) = 1/,
+    "vector-operator-inner-product": /<#> '\[2\]'::vector\) = -2/,
+    "vector-operator-cosine": /<=> '\[2\]'::vector\) = 0/,
+    "vector-operator-l1": /<\+> '\[2\]'::vector\) = 1/,
+  };
+  for (const cap of X02_VECTOR_CAPS) {
+    const seen: string[] = [];
+    await resolveCapabilityStatus(
+      parseVersionString("PostgreSQL 16.0 (Nucleus 1.0.2 — The Definitive Database)"),
+      cap,
+      async (sql) => {
+        seen.push(sql);
+      },
+    );
+    assert.equal(seen.length, 1, `${cap} must run exactly one probe`);
+    const probeSql = seen[0];
+    assert.match(probeSql, /case when .+ then 1 else 1\/0 end/, `${cap} probe must be value-asserting`);
+    assert.match(probeSql, expectedLiterals[cap], `${cap} probe must assert the pgvector-verified literal`);
+  }
+});
+
+test("X02: a wrong-value vector engine resolves unsupported through the negative control", async () => {
+  // A server that ACCEPTS the vector syntax but computes wrong values: the
+  // case arm's condition is false, the engine evaluates 1/0 and answers
+  // 22012 — the probe converts that into positive unsupported evidence (the
+  // same catch that exposed Nucleus's fake FTS semantics).
+  const fakeVectorEngine = async (sql: string): Promise<void> => {
+    if (/else 1\/0/.test(sql)) {
+      throw new ServerSqlError("nucleus: division by zero", { sqlstate: "22012" });
+    }
+  };
+  for (const cap of X02_VECTOR_CAPS) {
+    const verdict = await resolveCapabilityStatus(
+      parseVersionString("PostgreSQL 16.0 (Nucleus 1.0.2 — The Definitive Database)"),
+      cap,
+      fakeVectorEngine,
+    );
+    assert.equal(verdict.status, "unsupported", cap);
+    assert.match(verdict.evidence, /22012/);
+  }
+});
+
+test("X02: a correct-value vector engine resolves supported", async () => {
+  // The pgvector-faithful engine executes the case expression without error
+  // (literals verified against pgvector 0.8.6 / PostgreSQL 17).
+  for (const cap of X02_VECTOR_CAPS) {
+    const verdict = await resolveCapabilityStatus(
+      parseVersionString("PostgreSQL 16.0 (Nucleus 1.0.2 — The Definitive Database)"),
+      cap,
+      async () => {},
+    );
+    assert.equal(verdict.status, "supported", cap);
+  }
+});

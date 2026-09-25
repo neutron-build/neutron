@@ -129,25 +129,32 @@ const REGISTRY: Readonly<Record<string, CapabilitySpec>> = {
   // Extension presence/version as a SEPARATE concern (pg_extension /
   // pg_available_extensions) is exposed by the /pgvector module's
   // pgvectorExtension(), not by this registry.
+  // X02 (X01 review M1): the probes assert VALUES, not acceptance. Expected
+  // literals verified against pgvector 0.8.6 on PostgreSQL 17: text form of
+  // '[1]'::vector is '[1]'; L2([1],[2])=1; negative inner product=-2;
+  // cosine distance of equal vectors=0; L1=1 (all exactly representable in
+  // binary floating point). A wrong-value engine (constant 0 distances)
+  // hits the 1/0 arm and resolves unsupported, exactly like the FTS probes'
+  // negative control caught Nucleus's fake ts_rank.
   "vector-type": {
     description: "the pgvector `vector` column type (extension-provided)",
-    probeSql: "select '[1]'::vector as v",
+    probeSql: "select case when ('[1]'::vector)::text = '[1]' then 1 else 1/0 end",
   },
   "vector-operator-l2": {
     description: "pgvector L2 distance operator <-> (vector_l2_ops semantics)",
-    probeSql: "select ('[1]'::vector <-> '[2]'::vector) as d",
+    probeSql: "select case when ('[1]'::vector <-> '[2]'::vector) = 1 then 1 else 1/0 end",
   },
   "vector-operator-inner-product": {
     description: "pgvector negative inner product operator <#> (vector_ip_ops semantics)",
-    probeSql: "select ('[1]'::vector <#> '[2]'::vector) as d",
+    probeSql: "select case when ('[1]'::vector <#> '[2]'::vector) = -2 then 1 else 1/0 end",
   },
   "vector-operator-cosine": {
     description: "pgvector cosine distance operator <=> (vector_cosine_ops semantics)",
-    probeSql: "select ('[1]'::vector <=> '[2]'::vector) as d",
+    probeSql: "select case when ('[1]'::vector <=> '[2]'::vector) = 0 then 1 else 1/0 end",
   },
   "vector-operator-l1": {
     description: "pgvector L1 distance operator <+> (pgvector 0.7.0+)",
-    probeSql: "select ('[1]'::vector <+> '[2]'::vector) as d",
+    probeSql: "select case when ('[1]'::vector <+> '[2]'::vector) = 1 then 1 else 1/0 end",
   },
   // X01: core full-text search. Integrated into PostgreSQL in 8.3 (the
   // pre-8.3 tsearch2 contrib module is a different API); websearch_to_tsquery

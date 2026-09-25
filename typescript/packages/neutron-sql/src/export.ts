@@ -1010,6 +1010,7 @@ interface V1ColumnInput {
   defaultNow?: unknown;
   varcharLength?: unknown;
   vectorDimensions?: unknown;
+  nucleusOnly?: unknown;
   foreignKey?: unknown;
 }
 
@@ -1180,13 +1181,34 @@ function upgradeV1Column(raw: V1ColumnInput, tableName: string): { name: string;
 
   const type: { name: string; codec: string; params?: Record<string, number> } = { name: typeName, codec: V2_TYPE_CODECS[typeName] };
   if (raw.type === "vector") {
+    // X02 (X01 review M2): align with Go ValidateSchemaV1ForUpgrade — the
+    // v1 upgrade reader accepts ONLY the legacy nucleusOnly+dims shape.
+    // A non-nucleusOnly v1 vector column never had meaning (the old
+    // nucleusOnly flag WAS the pre-X01 escape hatch); both readers must
+    // give the same answer for the same bytes.
+    const nucleusOnly = raw.nucleusOnly === undefined ? false : v1Bool(raw.nucleusOnly, `${at}.nucleusOnly`);
+    if (!nucleusOnly) {
+      throw exportError(
+        "invalid-legacy-vector",
+        at,
+        "legacy vector columns must be nucleusOnly (pre-X01 shape); a non-nucleusOnly vector column never had meaning in v1",
+      );
+    }
     const dims = raw.vectorDimensions;
-    if (typeof dims !== "number" || !Number.isInteger(dims)) {
-      throw exportError("invalid-type-params", `${at}.vectorDimensions`, "vector columns require integer dimensions");
+    if (typeof dims !== "number" || !Number.isInteger(dims) || dims <= 0) {
+      throw exportError("invalid-type-params", `${at}.vectorDimensions`, "vector type requires vectorDimensions > 0");
     }
     type.params = { dimensions: dims };
-  } else if (raw.type === "varchar" && typeof raw.varcharLength === "number" && raw.varcharLength > 0) {
-    type.params = { length: raw.varcharLength };
+  } else {
+    if (raw.nucleusOnly !== undefined && v1Bool(raw.nucleusOnly, `${at}.nucleusOnly`)) {
+      throw exportError("invalid-value", `${at}.nucleusOnly`, "nucleusOnly is only valid for vector columns");
+    }
+    if (raw.vectorDimensions !== undefined && raw.vectorDimensions !== 0) {
+      throw exportError("invalid-value", `${at}.vectorDimensions`, "vectorDimensions is only valid for vector columns");
+    }
+    if (raw.type === "varchar" && typeof raw.varcharLength === "number" && raw.varcharLength > 0) {
+      type.params = { length: raw.varcharLength };
+    }
   }
 
   const v1Type = raw.type as string;
