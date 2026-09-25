@@ -168,6 +168,10 @@ export interface QueryResult {
   filterCount?: number
   /** Rows in the table ignoring all conditions. */
   totalCount?: number
+  /** SQL editor (S06): more rows existed than the server retains per
+   *  result; `rows` holds the first `rowLimit` of them. */
+  truncated?: boolean
+  rowLimit?: number
 }
 
 /** One component of a full-tuple equality filter; value is a wire cell. */
@@ -661,4 +665,45 @@ export interface TableStatsResponse {
   relSizeBytes?: number
   totalSizeBytes?: number
   sizeUnavailableReason?: string
+}
+
+// --- S06: streamed export and batched import ---
+
+export type ExportFormat = 'csv' | 'json' | 'ndjson'
+
+/** A validated export awaiting its single streamed download. */
+export interface ExportTicket {
+  ticket: string
+  /** Same-origin download URL; redeemable once, shortly. */
+  url: string
+  filename: string
+  format: ExportFormat
+  expiresIn: number
+}
+
+/** One import batch: insert-only rows, committed atomically as a unit. */
+export interface ImportBatchRequest {
+  connectionId: string
+  /** Client-generated idempotency key for this batch attempt. */
+  operationId: string
+  schema: string
+  table: string
+  binding: string
+  /** column -> wire cell; an omitted column is DEFAULT, null is SQL NULL. */
+  rows: Array<Record<string, unknown>>
+}
+
+export interface ImportBatchResponse {
+  operationId: string
+  /** Rows inserted by this batch (all of them, or the batch failed). */
+  applied: number
+  replayed?: boolean
+}
+
+export interface ImportOutcomeResponse {
+  operationId: string
+  state: OutcomeState
+  status?: number
+  response?: Record<string, unknown>
+  error?: string
 }

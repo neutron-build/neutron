@@ -49,6 +49,12 @@ type Server struct {
 	// statements records executed statement durations for the S05
 	// slow-query diagnosis view (see diagnostics.go). Lazily initialized.
 	statements *statementLog
+	// exports holds validated table exports awaiting their single streamed
+	// download (S06, see export_v2.go). Lazily initialized.
+	exports *exportTicketStore
+	// importOutcomes records import batch outcomes (S06, see import_v2.go),
+	// separate from commit outcomes so a long import never evicts them.
+	importOutcomes *outcomeStore
 }
 
 // NewServer creates and configures the Studio server on the given port.
@@ -140,6 +146,10 @@ func (s *Server) routes() (*http.ServeMux, error) {
 	mux.HandleFunc("/api/table/v2/search", s.handleTableSearchV2)
 	mux.HandleFunc("/api/table/v2/outcome", s.handleTableOutcomeV2)
 	mux.HandleFunc("/api/table/v2/revert", s.handleTableRevertV2)
+	mux.HandleFunc("/api/table/v2/export", s.handleTableExportV2)
+	mux.HandleFunc("/api/table/v2/export/download", s.handleTableExportDownloadV2)
+	mux.HandleFunc("/api/table/v2/import/batch", s.handleTableImportBatchV2)
+	mux.HandleFunc("/api/table/v2/import/outcome", s.handleTableImportOutcomeV2)
 	mux.HandleFunc("/api/table/update", s.handleTableRowUpdate)
 	mux.HandleFunc("/api/table/delete", s.handleTableRowDelete)
 	mux.HandleFunc("/api/table/fks", s.handleTableFKs)

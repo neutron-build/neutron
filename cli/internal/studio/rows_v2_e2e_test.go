@@ -275,6 +275,26 @@ func TestStudioRowProtocolV2E2E(t *testing.T) {
 		t.Fatalf("no row with %s = %v", column, value)
 		return -1
 	}
+	// rowWithTaggedValue finds the row whose column carries the tagged wire
+	// cell {t, v} (S06: reads are deterministically key-ordered, so these
+	// tests look rows up instead of assuming insertion order).
+	rowWithTaggedValue := func(body map[string]any, column, tag, value string) int {
+		t.Helper()
+		cols := body["columns"].([]any)
+		for i, c := range cols {
+			if c != column {
+				continue
+			}
+			for r, row := range body["rows"].([]any) {
+				cell, ok := row.([]any)[i].(map[string]any)
+				if ok && cell["t"] == tag && cell["v"] == value {
+					return r
+				}
+			}
+		}
+		t.Fatalf("no row with %s = %s/%s", column, tag, value)
+		return -1
+	}
 
 	// textOracle runs an independent SQL query returning one text value.
 	textOracle := func(sql string, args ...any) string {
@@ -326,11 +346,12 @@ func TestStudioRowProtocolV2E2E(t *testing.T) {
 		}
 
 		big := readTable("bigid")
-		tag, v := tagged(cell(big, 0, "id"))
+		idx := rowWithTaggedValue(big, "id", "int8", "9007199254740993")
+		tag, v := tagged(cell(big, idx, "id"))
 		if tag != "int8" || v != "9007199254740993" {
 			t.Errorf("int8 key cell = %s/%s, want int8/9007199254740993", tag, v)
 		}
-		if c := cell(big, 0, "val"); c != "nine-quad" {
+		if c := cell(big, idx, "val"); c != "nine-quad" {
 			t.Errorf("plain text cell altered: %v", c)
 		}
 
@@ -613,11 +634,12 @@ func TestStudioRowProtocolV2E2E(t *testing.T) {
 
 	t.Run("int8 key beyond 2^53 addresses the exact row", func(t *testing.T) {
 		body := readTable("bigid")
-		keyCell := cell(body, 0, "id")
+		idx := rowWithTaggedValue(body, "id", "int8", "9007199254740993")
+		keyCell := cell(body, idx, "id")
 		code, res := update(fmt.Sprintf(`{
 			"connectionId":"e2e","schema":"public","table":"bigid",
 			"key":[{"column":"id","value":%s}],"version":%q,"column":"val","value":"edited-exact"}`,
-			mustJSON(keyCell), versionOf(body, 0)))
+			mustJSON(keyCell), versionOf(body, idx)))
 		if code != http.StatusOK || res["rowsAffected"] != float64(1) {
 			t.Fatalf("bigid update = %d %v", code, res)
 		}

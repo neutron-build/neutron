@@ -546,7 +546,7 @@ export function SQLEditor({ tabId, initialSql }: SQLEditorProps) {
               )}
               {out.result.error && !out.result.canceled
                 ? <div role="alert"><DataGrid result={out.result} /></div>
-                : !out.result.canceled && <DataGrid result={out.result} />}
+                : !out.result.canceled && <DataGrid result={out.result} label="Query result" exportName="query-result" />}
             </div>
           )}
           {out?.kind === 'explain' && (

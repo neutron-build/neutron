@@ -365,3 +365,20 @@
   color: var(--text-dim, #888);
   margin-bottom: 4px;
 }
+
+/* --- S06: export / import / page size --- */
+
+.exportGroup {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.pageSize {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: var(--space-3);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
