@@ -636,6 +636,11 @@ func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 	result, err := collectTaggedRows(rows)
 	if err != nil {
 		log.Printf("studio: table query error: %v", err)
+		s.recordStatement(loggedStatement{
+			At: time.Now(), Connection: connID, Surface: "table-read",
+			SQL: buildSQL(), DurationMs: float64(time.Since(start).Microseconds()) / 1000,
+			State: "error", Error: errorTextFor(err),
+		})
 		writeJSON(w, http.StatusOK, map[string]any{
 			"columns":  []string{},
 			"rows":     [][]any{},
@@ -645,6 +650,11 @@ func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	s.recordStatement(loggedStatement{
+		At: time.Now(), Connection: connID, Surface: "table-read",
+		SQL: buildSQL(), DurationMs: float64(time.Since(start).Microseconds()) / 1000,
+		RowCount: len(result.data), State: "ok",
+	})
 
 	// Separated row counts: filterCount applies the SAME conditions as the
 	// read (filters + match), totalCount applies none. rowCount above stays

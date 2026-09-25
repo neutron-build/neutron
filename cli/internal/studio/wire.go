@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -262,6 +263,58 @@ func decodeWireValue(v any) (any, error) {
 
 var hexDigits = "0123456789abcdefABCDEF"
 
+// hasUTCOffset reports whether a timestamptz payload carries an explicit
+// zone: a trailing Z/z, a ±HH[:MM[:SS[.f]]] offset after the time (or after
+// a date-only value), or the epoch/infinity specials. PostgreSQL parses
+// offset-less input in the SESSION timezone — a silent wrong instant (the
+// S03-F2 defect: an 8-hour shift for a Vancouver user) — so the wire layer
+// refuses it instead of guessing (S05: chosen over silent UTC
+// normalization; documented in studio/README).
+func hasUTCOffset(v string) bool {
+	s := strings.TrimSpace(v)
+	if s == "" {
+		return false
+	}
+	if strings.EqualFold(s, "infinity") || s == "-infinity" || strings.EqualFold(s, "epoch") {
+		return true
+	}
+	// PostgreSQL renders the era marker after the zone: "...+02:00 BC".
+	if strings.HasSuffix(s, " BC") {
+		s = strings.TrimSpace(strings.TrimSuffix(s, " BC"))
+	}
+	if !tzDatePrefix.MatchString(s) {
+		return false
+	}
+	rest := s[10:]
+	if rest == "" {
+		return false // date-only: PostgreSQL would guess midnight session time
+	}
+	if rest == "Z" || rest == "z" {
+		return true
+	}
+	// A zone attached directly to the date (midnight in that zone).
+	if tzOffsetRe.MatchString(rest) {
+		return true
+	}
+	// A time component, then the zone.
+	m := tzTimeRe.FindStringSubmatch(rest)
+	if m == nil {
+		return false
+	}
+	// PostgreSQL also accepts the zone after one space and the UTC/GMT
+	// abbreviations ("2026-09-24 12:34:56 +02", "... UTC").
+	zone := strings.TrimPrefix(rest[len(m[0]):], " ")
+	return strings.EqualFold(zone, "Z") || strings.EqualFold(zone, "UTC") || strings.EqualFold(zone, "GMT") || tzOffsetRe.MatchString(zone)
+}
+
+var (
+	tzDatePrefix = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}`)
+	// tzTimeRe matches the time component (not the zone): " 12:34:56.78".
+	tzTimeRe = regexp.MustCompile(`^[ T]\d{2}(:\d{2})?(:\d{2})?(\.\d+)?`)
+	// tzOffsetRe matches a full-string ±HH, ±HH:MM, ±HHMM or ±HH:MM:SS[.f] zone.
+	tzOffsetRe = regexp.MustCompile(`^[+-]\d{2}(:?\d{2})?(:\d{2}(\.\d+)?)?$`)
+)
+
 func decodeTagged(cell taggedCell) (any, error) {
 	switch cell.T {
 	case "int8":
@@ -270,9 +323,19 @@ func decodeTagged(cell taggedCell) (any, error) {
 			return nil, fmt.Errorf("int8 wire cell has invalid payload %q", cell.V)
 		}
 		return i, nil
-	case "numeric", "date", "timestamp", "timestamptz":
+	case "numeric", "date", "timestamp":
 		if cell.V == "" {
 			return nil, fmt.Errorf("%s wire cell has empty payload", cell.T)
+		}
+		return cell.V, nil
+	case "timestamptz":
+		if cell.V == "" {
+			return nil, fmt.Errorf("timestamptz wire cell has empty payload")
+		}
+		if !hasUTCOffset(cell.V) {
+			return nil, fmt.Errorf(
+				"timestamptz wire cell %q has no UTC offset: PostgreSQL would interpret it in the server session timezone, silently storing a different instant; append an explicit offset (e.g. \"+02:00\") or use the canonical UTC form (e.g. 2026-09-24T12:34:56Z)",
+				cell.V)
 		}
 		return cell.V, nil
 	case "bytea":

@@ -89,12 +89,12 @@ describe('types', () => {
 
   it('should validate all TabKind values', () => {
     const kinds: TabKind[] = [
-      'sql-browser', 'sql-editor', 'schema-designer',
+      'sql-browser', 'sql-editor', 'schema-designer', 'schema-inspector', 'diagnostics',
       'kv', 'vector', 'timeseries', 'document', 'graph',
       'fts', 'geo', 'blob', 'pubsub', 'streams',
       'columnar', 'datalog', 'cdc', 'connection-manager',
     ]
-    expect(kinds.length).toBe(17)
+    expect(kinds.length).toBe(19)
   })
 
   it('should allow creating a Tab with context', () => {

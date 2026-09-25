@@ -5,6 +5,8 @@ import type {
   TableMeta, MutationOutcome, KeyCell, MatchCell, TableFilter, TableSort,
   CommitResponse, PreviewResponse, OutcomeResponse, CommitOperation,
   CancelQueryResponse, ExplainOutcome, ExplainPlan, ExplainRefusal,
+  SchemaObjectDetail, SchemaChange, SchemaPlanResponse,
+  DiagnosticsQueriesResponse, TableStatsResponse,
 } from './types'
 import { decodeRows } from './wire'
 
@@ -363,6 +365,35 @@ export const api = {
     request<{ code: string }>('GET',
       `/codegen?connectionId=${connectionId}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}&lang=${lang}`
     ),
+
+  // --- S05: schema navigation and planning ---
+
+  /** One relation's catalog metadata from the shared v2 introspection. */
+  schemaObject: (connectionId: string, schema: string, table: string) =>
+    request<SchemaObjectDetail>('GET',
+      `/schema/object?connectionId=${encodeURIComponent(connectionId)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`),
+
+  /** Preview the migration plan for visual changes (nothing executes). */
+  schemaPlan: (input: { connectionId: string; changes: SchemaChange[] }) =>
+    mutationRequest<SchemaPlanResponse>('POST', '/schema/plan', input),
+
+  /** Apply a reviewed plan: the server re-plans under the migration lock and
+   * executes only if the fresh plan still has this planId (409 stale-plan
+   * otherwise, with the fresh plan in the error body). */
+  schemaApply: (input: { connectionId: string; changes: SchemaChange[]; planId: string; allowDestructive?: boolean }) =>
+    mutationRequest<SchemaPlanResponse>('POST', '/schema/apply', input),
+
+  // --- S05: performance diagnosis ---
+
+  /** Slow-query view over this process's duration log + pg_stat_statements probe. */
+  diagnosticsQueries: (connectionId: string, minMs = 0) =>
+    request<DiagnosticsQueriesResponse>('GET',
+      `/diagnostics/queries?connectionId=${encodeURIComponent(connectionId)}&minMs=${minMs}`),
+
+  /** Table statistics and index usage from PostgreSQL's cumulative stats. */
+  tableStats: (connectionId: string, schema: string, table: string) =>
+    request<TableStatsResponse>('GET',
+      `/diagnostics/table-stats?connectionId=${encodeURIComponent(connectionId)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`),
 
   // --- Saved queries ---
 

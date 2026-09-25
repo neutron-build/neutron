@@ -1,6 +1,7 @@
 import { signal, computed } from '@preact/signals'
 import type { Connection, Schema, NucleusFeatures, Tab, PendingChange, CommitOperation, CommitResponse, PreviewResponse, OutcomeResponse, KeyCell } from './types'
 import { api, ApiError } from './api'
+import { serializeDeepLink } from './router'
 
 // --- Connection state ---
 
@@ -8,6 +9,26 @@ export const connections = signal<Connection[]>([])
 export const activeConnection = signal<Connection | null>(null)
 export const connectionLoading = signal(false)
 export const connectionError = signal<string | null>(null)
+
+/** Connect a saved connection and refresh every connection-scoped signal
+ * (features, schema, active connection). Shared by the connection manager
+ * and the S05 deep-link router so both establish the same state. */
+export async function connectConnection(id: string): Promise<void> {
+  connectionLoading.value = true
+  connectionError.value = null
+  try {
+    const { features: f, schema: sc } = await api.connections.connect(id)
+    features.value = f
+    schema.value = sc
+    const conn = connections.value.find(c => c.id === id) ?? null
+    if (conn) activeConnection.value = { ...conn, isNucleus: f.isNucleus }
+  } catch (err: unknown) {
+    connectionError.value = err instanceof Error ? err.message : String(err)
+    throw err
+  } finally {
+    connectionLoading.value = false
+  }
+}
 
 // --- Nucleus feature detection ---
 
@@ -39,10 +60,12 @@ export function openTab(tab: Tab) {
     const existing = tabs.value.find(t =>
       t.kind === tab.kind &&
       t.objectSchema === tab.objectSchema &&
-      t.objectName === tab.objectName
+      t.objectName === tab.objectName &&
+      !t.initialSql
     )
     if (existing) {
       activeTabId.value = existing.id
+      updateLocationHash(existing)
       return
     }
   }
@@ -51,6 +74,19 @@ export function openTab(tab: Tab) {
   }
   tabs.value = [...tabs.value, tab]
   activeTabId.value = tab.id
+  updateLocationHash(tab)
+}
+
+/** Keep the URL pointing at the active browsable tab (S05 deep links). */
+function updateLocationHash(tab: Tab) {
+  if (typeof window === 'undefined' || typeof history === 'undefined') return
+  const conn = activeConnection.value
+  if (!conn) return
+  const link = serializeDeepLink(tab, conn.id)
+  if (link === null) return
+  if (window.location.hash !== link) {
+    history.replaceState(null, '', link)
+  }
 }
 
 export function closeTab(id: string) {
@@ -312,6 +348,34 @@ theme.subscribe(t => {
 
 export function toggleTheme() {
   theme.value = theme.value === 'dark' ? 'light' : 'dark'
+}
+
+// --- Schema refresh (S05) ---
+//
+// The schema signal previously updated only on connect. refreshSchema
+// re-fetches the live catalog and updates the signal, so the tree,
+// completion sources and every schema-derived view converge after DDL
+// (designer applies, SQL editor DDL, the tree's refresh button for changes
+// made elsewhere).
+
+export const schemaRefreshing = signal(false)
+export const schemaRefreshError = signal<string | null>(null)
+
+export async function refreshSchema(connectionId?: string): Promise<Schema | null> {
+  const id = connectionId ?? activeConnection.value?.id
+  if (!id) return null
+  schemaRefreshing.value = true
+  schemaRefreshError.value = null
+  try {
+    const sc = await api.schema(id)
+    schema.value = sc
+    return sc
+  } catch (err: unknown) {
+    schemaRefreshError.value = err instanceof Error ? err.message : String(err)
+    return null
+  } finally {
+    schemaRefreshing.value = false
+  }
 }
 
 // --- Command palette ---

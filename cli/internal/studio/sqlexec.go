@@ -484,6 +484,25 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	canceled, hardStopped, reused := exec.finish()
 	duration := time.Since(start).Milliseconds()
 
+	// S05: the duration log behind the slow-query diagnosis view. Statement
+	// text as submitted; bound parameters are never recorded.
+	logState := "ok"
+	if errors.Is(qerr, errCanceledBeforeDispatch) || hardStopped || (canceled && isQueryCanceled(qerr)) {
+		logState = "canceled"
+	} else if qerr != nil {
+		logState = "error"
+	}
+	rowCount := 0
+	if result != nil {
+		rowCount = len(result.data)
+	}
+	s.recordStatement(loggedStatement{
+		At: time.Now(), Connection: body.ConnectionID, Surface: "editor",
+		RequestID: requestID, SQL: body.SQL, DurationMs: float64(time.Since(start).Microseconds()) / 1000,
+		RowCount: rowCount, State: logState,
+		Error: errorTextFor(qerr),
+	})
+
 	if qerr != nil {
 		if hardStopped {
 			qerr = errHardStopped

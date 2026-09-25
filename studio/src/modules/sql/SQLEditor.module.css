@@ -509,3 +509,89 @@
   overflow: auto;
   max-height: 240px;
 }
+
+/* --- S05: plan tree --- */
+
+.planViewToggle {
+  display: flex;
+  gap: var(--space-1);
+  margin-bottom: var(--space-2);
+}
+
+.planViewTab {
+  padding: 2px var(--space-3);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.planViewTabActive {
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--model-sql) 10%, transparent);
+}
+
+.planTree, .planTreeChildren {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.planTreeChildren {
+  margin-left: var(--space-4);
+  padding-left: var(--space-3);
+  border-left: 1px solid var(--border);
+}
+
+.planTreeItem { margin: var(--space-1) 0; }
+
+.planTreeNode {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: var(--space-1) 0;
+  font-size: var(--text-xs);
+}
+
+.planTreeTarget {
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+}
+
+.planTreeMetrics {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.planTreeMetric {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+.planTreeMetric[data-kind='buffers'] { color: var(--model-sql); }
+.planTreeMetricK { opacity: 0.7; }
+
+.planTreeExtras {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 11px;
+  color: var(--model-sql);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.planTreeExtrasList {
+  margin: var(--space-1) 0 0;
+  padding: var(--space-2);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+}
+.planTreeExtrasList div { display: flex; gap: var(--space-2); }
+.planTreeExtrasList dt { color: var(--text-tertiary); min-width: 12em; }
+.planTreeExtrasList dd { margin: 0; }
+.planTreeExtrasList code { font-family: var(--font-mono); word-break: break-all; }

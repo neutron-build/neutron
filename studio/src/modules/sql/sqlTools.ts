@@ -291,6 +291,120 @@ export function newRequestId(): string {
   return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')
 }
 
+// --- S05: honest plan tree ---------------------------------------------------------
+
+export interface PlanTreeNode {
+  nodeType: string
+  target?: string
+  detail?: string
+  /** Curated metrics present on this node. */
+  metrics: Array<[string, string]>
+  /** Every OTHER field PostgreSQL emitted on this node, verbatim — the
+   *  tree never drops engine evidence it does not recognize. */
+  extras: Array<[string, string]>
+  children: PlanTreeNode[]
+}
+
+/** Fields the curated metrics line covers; everything else lands in extras. */
+const CURATED_NODE_FIELDS = new Set([
+  'Node Type', 'Relation Name', 'Schema', 'Alias', 'CTE Name', 'Function Name', 'Index Name',
+  'Join Type', 'Operation', 'Index Cond', 'Hash Cond', 'Merge Cond', 'Join Filter', 'Filter',
+  'Sort Key', 'Group Key', 'Startup Cost', 'Total Cost', 'Plan Rows', 'Plan Width',
+  'Actual Startup Time', 'Actual Total Time', 'Actual Rows', 'Actual Loops', 'Plans',
+  'Parent Relationship', 'Rows Removed by Filter', 'Rows Removed by Join Filter',
+  'Shared Hit Blocks', 'Shared Read Blocks', 'Shared Dirtied Blocks', 'Shared Written Blocks',
+  'Local Hit Blocks', 'Local Read Blocks', 'Local Dirtied Blocks', 'Local Written Blocks',
+  'Temp Read Blocks', 'Temp Written Blocks',
+])
+
+function renderValue(v: unknown): string {
+  if (Array.isArray(v)) return v.map(renderValue).join(', ')
+  if (v === null) return 'null'
+  if (typeof v === 'object') return JSON.stringify(v)
+  return String(v)
+}
+
+/** Extract the plan tree with per-node metrics AND every uncurated field
+ *  PostgreSQL emitted (honest to the engine's output). Returns null for a
+ *  document that is not a PostgreSQL FORMAT JSON plan. */
+export function planTree(plan: unknown): PlanTreeNode | null {
+  const doc = Array.isArray(plan) ? plan[0] : plan
+  if (!doc || typeof doc !== 'object') return null
+  const root = (doc as Record<string, unknown>)['Plan']
+  if (!root || typeof root !== 'object') return null
+
+  const walk = (node: PlanNode): PlanTreeNode => {
+    const relation = str(node['Relation Name'])
+    const target =
+      relation !== undefined
+        ? (str(node['Schema']) ? `${str(node['Schema'])}.${relation}` : relation)
+        : str(node['CTE Name']) ?? str(node['Function Name']) ?? str(node['Index Name'])
+    const details = [
+      str(node['Join Type']),
+      str(node['Parent Relationship']),
+      str(node['Operation']),
+      str(node['Index Name']) && `using ${node['Index Name']}`,
+      str(node['Index Cond']) && `index: ${node['Index Cond']}`,
+      str(node['Hash Cond']) && `hash: ${node['Hash Cond']}`,
+      str(node['Merge Cond']) && `merge: ${node['Merge Cond']}`,
+      str(node['Join Filter']) && `join filter: ${node['Join Filter']}`,
+      str(node['Filter']) && `filter: ${node['Filter']}`,
+      num(node['Rows Removed by Filter']) !== undefined && `removed by filter: ${node['Rows Removed by Filter']}`,
+      Array.isArray(node['Sort Key']) && `sort: ${(node['Sort Key'] as unknown[]).join(', ')}`,
+      Array.isArray(node['Group Key']) && `group: ${(node['Group Key'] as unknown[]).join(', ')}`,
+    ].filter(Boolean) as string[]
+
+    const metrics: Array<[string, string]> = []
+    const push = (label: string, v: unknown) => {
+      if (v !== undefined && v !== null && v !== '') metrics.push([label, renderValue(v)])
+    }
+    const cost = num(node['Total Cost'])
+    if (cost !== undefined) metrics.push(['cost', `${num(node['Startup Cost']) ?? 0}..${cost}`])
+    push('est rows', node['Plan Rows'])
+    if (num(node['Actual Rows']) !== undefined) {
+      push('actual rows', node['Actual Rows'])
+      push('time', `${num(node['Actual Startup Time']) ?? 0}..${num(node['Actual Total Time']) ?? 0} ms`)
+      push('loops', node['Actual Loops'])
+    }
+    const buffers: string[] = []
+    const bufferKinds = ['Shared', 'Local', 'Temp'] as const
+    const bufferOps = ['Hit', 'Read', 'Dirtied', 'Written'] as const
+    for (const kind of bufferKinds) {
+      const parts: string[] = []
+      for (const op of bufferOps) {
+        const v = num(node[`${kind} ${op} Blocks`])
+        if (v !== undefined) parts.push(`${op.toLowerCase()}=${v}`)
+      }
+      if (parts.length > 0) buffers.push(`${kind.toLowerCase()}: ${parts.join(' ')}`)
+    }
+    if (buffers.length > 0) metrics.push(['buffers', buffers.join(' · ')])
+
+    const extras: Array<[string, string]> = []
+    for (const [key, value] of Object.entries(node)) {
+      if (CURATED_NODE_FIELDS.has(key)) continue
+      if (value === undefined || value === null || value === '') continue
+      extras.push([key, renderValue(value)])
+    }
+
+    const children: PlanTreeNode[] = []
+    const childNodes = node['Plans']
+    if (Array.isArray(childNodes)) {
+      for (const child of childNodes) {
+        if (child && typeof child === 'object') children.push(walk(child as PlanNode))
+      }
+    }
+    return {
+      nodeType: str(node['Node Type']) ?? '(unknown node)',
+      target,
+      detail: details.length ? details.join('; ') : undefined,
+      metrics,
+      extras,
+      children,
+    }
+  }
+  return walk(root as PlanNode)
+}
+
 // --- History (localStorage, per connection) ---------------------------------------
 
 export const HISTORY_MAX = 50
@@ -321,4 +435,12 @@ export function pushHistory(connId: string, entry: QueryHistoryEntry) {
     e.sql === entry.sql && JSON.stringify(e.params ?? []) === JSON.stringify(entry.params ?? [])
   const existing = loadHistory(connId).filter(e => !sameRun(e))
   saveHistory(connId, [entry, ...existing])
+}
+
+/** Whether a script may change the catalog (a statement starting with
+ *  CREATE/ALTER/DROP/COMMENT/TRUNCATE/GRANT/REVOKE). A heuristic used only
+ *  to trigger a schema refresh, never to classify safety. */
+export function mayChangeCatalog(sql: string): boolean {
+  const stripped = sql.replace(/--[^\n]*/g, ' ').replace(/\/\*[\s\S]*?\*\//g, ' ')
+  return /(^|;)\s*(create|alter|drop|comment\s+on|truncate|grant|revoke)\b/i.test(stripped)
 }

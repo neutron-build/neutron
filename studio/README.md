@@ -118,6 +118,124 @@ origin allowed explicitly:
 NEUTRON_STUDIO_DEV_ORIGIN=http://localhost:5173 neutron studio
 ```
 
+## Schema navigation and performance diagnosis (S05)
+
+### Navigation, search and deep links
+
+The sidebar tree lists **views alongside tables** (PostgreSQL connections;
+views browse read-only through the same table surface) and has a search box
+filtering by name across schemas, plus a refresh button that re-fetches the
+live catalog (the designer triggers the same refresh after an apply or a
+stale-plan refusal). Every browsable surface has a shareable URL:
+
+```text
+#/c/<connId>/t/<schema>/<table>          browse rows
+#/c/<connId>/v/<schema>/<view>          (views also use t/)
+#/c/<connId>/designer[/<schema>/<table>]
+#/c/<connId>/inspect/<schema>/<table>   structure detail
+#/c/<connId>/diagnostics[/<schema>/<table>]
+#/c/<connId>/sql
+```
+
+Names are URL-encoded, so `MixedCase View` survives. Opening a browsable
+tab updates the hash; loading or pasting a hash connects the named
+connection and opens the tab.
+
+### Object detail
+
+`GET /api/schema/object` returns one relation's metadata from the same
+schema document v2 the CLI works with (`neutron schema pull` writes it):
+columns with the planner's DDL type spelling and tagged defaults,
+PK/unique/check/FK constraints, indexes (method, key parts, INCLUDE,
+predicates) and FK relationships in both directions as ordered column
+tuples, or a view's definition. Objects inventoried as opaque (extension
+owned, partitioned, RLS-bearing…) are reported as exactly that. A relation
+dropped concurrently answers 404. Nucleus is refused: v2 catalog
+conformance is not established there. The schema designer loads tables
+through this endpoint, so it shows and edits the CLI's identities.
+
+### Reviewable migration plans from the designer
+
+The designer does not build DDL. It sends structured edits
+(`create-table`, `drop-table`, `add-column`, `drop-column`,
+`rename-column`, `alter-column-type`, `set/drop-not-null`,
+`set/drop-default`, `add-index`, `drop-index`) to
+`POST /api/schema/plan`, which applies them to a copy of the freshly
+introspected document and plans the difference with the CLI's own diff and
+live expression normalizer — the same inputs `neutron db push` uses. The
+response carries the statements, the per-operation risk report of
+`migrate generate` (destructive / data loss / reversibility), the planner's
+warnings, the target document, and the equivalent command:
+
+```sh
+neutron db push --dry-run --schema target.schema.json \
+  [--rename 'schema.table.old>schema.table.new'] [--allow-destructive]
+```
+
+prints the same statements, and `neutron migrate generate --mode snapshot
+--schema target.schema.json` from a `schema baseline` records the same
+operations (both are covered by an end-to-end test against the CLI binary).
+
+Edits follow PostgreSQL's own semantics, made explicit: dropping a column
+drops the table's indexes and constraints involving it as whole objects
+(listed in the review); anything that would need `CASCADE` — a foreign key
+from another table, a view, a generated column, a trigger — refuses the
+edit, as does renaming a column that SQL text elsewhere (views, CHECK
+expressions, expression indexes) refers to. Column types outside the
+document contract (`serial`, `char`, `time`, …) are refused with the
+accepted vocabulary; the SQL editor remains the surface for those.
+
+`POST /api/schema/apply` executes a reviewed plan only:
+
+- it takes the migration runner's advisory lock (a running migration or
+  push makes it wait up to 10 s, then answers `409 locked`);
+- a database with migration history answers `409 migration-managed`, as
+  `neutron db push` does — download the target document and generate a
+  migration file instead;
+- it re-plans under the lock and requires the same `planId`: if the
+  statements changed since review (a concurrent schema change), it answers
+  `409 stale-plan` with the fresh plan for review. An unrelated concurrent
+  change that leaves the statements identical does not invalidate the
+  review;
+- a plan with destructive or data-loss operations needs
+  `allowDestructive: true` (the review's acknowledgement checkbox). The
+  CLI planner drops and recreates views around table alterations, so such
+  plans count as destructive too;
+- all statements run in one transaction; afterwards the catalog is
+  re-introspected and diffed against the target (`verification: "in-sync"`,
+  or `"drift"` with the residual statements).
+
+### Performance diagnosis
+
+`GET /api/diagnostics/queries` returns this Studio process's duration log
+for the connection (editor statements and table reads, newest first, with a
+threshold filter and p50/p95/max). Durations are wall-clock as measured by
+Studio, including network and result transfer; statement text is recorded
+as submitted and bound parameters never are. When `pg_stat_statements` is
+installed and readable, the server's top statements for the database are
+included; otherwise the response says why. `GET /api/diagnostics/table-stats`
+returns the table's counters from `pg_stat_user_tables` (sequential/index
+scans, live/dead tuples, analyze/vacuum times), sizes, and per-index scan
+counts with `pg_get_indexdef` definitions; counters are cumulative since the
+last statistics reset, so a zero-scan index is an observation, not a
+verdict. EXPLAIN results render as a tree with every node field PostgreSQL
+emitted.
+
+### timestamptz input discipline
+
+A timestamptz value without an explicit UTC offset would be silently
+interpreted in the server's SESSION timezone (an 8-hour shift for a
+Vancouver user). Both write paths — the editor's tagged cells and the SQL
+editor's bound `{t:"timestamptz"}` parameters — refuse such values with a
+message naming the hazard and the fix: append an explicit offset
+(`+02:00`, optionally after one space; `UTC`/`GMT` also count) or use the
+canonical UTC form (`2026-09-24T12:34:56Z`). Named zones such as
+`America/Vancouver` are refused as well, because the client cannot validate
+them. Chosen
+over silently normalizing to UTC: refusing is the only option that never
+guesses what instant the user meant. `timestamp without time zone` is
+unaffected (offset-less is its canonical form).
+
 ## Testing
 
 Frontend: `npm test` (vitest) and `npm run build` in `studio/`. Backend:

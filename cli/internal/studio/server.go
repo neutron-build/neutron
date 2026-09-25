@@ -46,6 +46,9 @@ type Server struct {
 	// queries registers running SQL editor statements by request ID for
 	// server-side cancellation (S04, see sqlexec.go). Lazily initialized.
 	queries *queryRegistry
+	// statements records executed statement durations for the S05
+	// slow-query diagnosis view (see diagnostics.go). Lazily initialized.
+	statements *statementLog
 }
 
 // NewServer creates and configures the Studio server on the given port.
@@ -121,6 +124,11 @@ func (s *Server) routes() (*http.ServeMux, error) {
 	mux.HandleFunc("/api/query/cancel", s.handleQueryCancel)
 	mux.HandleFunc("/api/query/explain", s.handleQueryExplain)
 	mux.HandleFunc("/api/schema", s.handleSchema)
+	mux.HandleFunc("/api/schema/object", s.handleSchemaObject)
+	mux.HandleFunc("/api/schema/plan", s.handleSchemaPlan)
+	mux.HandleFunc("/api/schema/apply", s.handleSchemaApply)
+	mux.HandleFunc("/api/diagnostics/queries", s.handleDiagnosticsQueries)
+	mux.HandleFunc("/api/diagnostics/table-stats", s.handleDiagnosticsTableStats)
 	mux.HandleFunc("/api/features", s.handleFeatures)
 	mux.HandleFunc("/api/table", s.handleTable)
 	mux.HandleFunc("/api/table/v2/meta", s.handleTableRowMetaV2)

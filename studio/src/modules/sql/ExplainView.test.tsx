@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest'
-import { render, screen, cleanup } from '@testing-library/preact'
+import { render, screen, cleanup, fireEvent } from '@testing-library/preact'
 import type { ExplainPlan } from '../../lib/types'
 import { ExplainView } from './ExplainView'
 
@@ -22,10 +22,16 @@ describe('ExplainView', () => {
   it('states that a plain EXPLAIN did not execute the statement, and renders the plan tree', () => {
     render(<ExplainView outcome={planOutcome({})} />)
     expect(screen.getByText('Estimated plan. The statement was not executed.')).toBeTruthy()
+    // S05: the default view is the TREE; PG's node order is preserved.
+    const tree = screen.getByRole('tree', { name: 'Query plan tree' })
+    const nodes = Array.from(tree.querySelectorAll('.planTreeNode > .planNode, li > div > .planNode')).map(el => el.textContent)
+    expect(nodes[0]).toBe('ModifyTable')
+    expect(nodes).toContain('Seq Scan')
+    // Estimated plans have no actual-stat columns in the table view either.
+    fireEvent.click(screen.getByRole('tab', { name: 'Table' }))
     const table = screen.getByRole('table', { name: 'Query plan' })
     const cells = Array.from(table.querySelectorAll('tbody tr')).map(tr => tr.querySelector('td')!.textContent)
     expect(cells).toEqual(['ModifyTableDelete', 'Seq Scan'])
-    // Estimated plans have no actual-stat columns.
     expect(screen.queryByText('Actual rows')).toBeNull()
   })
 
@@ -36,8 +42,36 @@ describe('ExplainView', () => {
     })
     render(<ExplainView outcome={outcome} />)
     expect(screen.getByText(/executed the statement in a read-only transaction, then rolled back/)).toBeTruthy()
+    // Tree carries the actual metrics on the node.
+    const tree = screen.getByRole('tree', { name: 'Query plan tree' })
+    expect(tree.textContent).toContain('actual rows')
+    expect(tree.textContent).toContain('3')
+    fireEvent.click(screen.getByRole('tab', { name: 'Table' }))
     expect(screen.getByText('Actual rows')).toBeTruthy()
     expect(screen.getByText(/Execution 0.200 ms/)).toBeTruthy()
+  })
+
+  it('renders buffers and uncurated node fields honestly in the tree', () => {
+    const outcome = planOutcome({
+      analyze: true, executed: true,
+      plan: [{ Plan: {
+        'Node Type': 'Seq Scan', 'Relation Name': 'orders', 'Startup Cost': 0, 'Total Cost': 10, 'Plan Rows': 2,
+        'Actual Rows': 2, 'Actual Total Time': 0.05, 'Actual Loops': 1,
+        'Shared Hit Blocks': 3, 'Shared Read Blocks': 7,
+        'Sort Method' : 'quicksort', 'Sort Space Used': 25,
+      } }],
+    })
+    render(<ExplainView outcome={outcome} />)
+    const tree = screen.getByRole('tree', { name: 'Query plan tree' })
+    expect(tree.textContent).toContain('buffers')
+    expect(tree.textContent).toContain('shared: hit=3 read=7')
+    // Fields outside the curated set surface verbatim behind the extras
+    // toggle — the tree never drops engine evidence.
+    const extrasBtn = tree.querySelector('button[class*="planTreeExtras"]') as HTMLElement
+    expect(extrasBtn).toBeTruthy()
+    fireEvent.click(extrasBtn)
+    expect(tree.textContent).toContain('Sort Method')
+    expect(tree.textContent).toContain('quicksort')
   })
 
   it('states that allowed writes executed and were rolled back', () => {

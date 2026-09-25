@@ -33,6 +33,12 @@ export interface SqlTable {
   rowCount?: number
 }
 
+/** One named relation (S05: a view in the navigation tree). */
+export interface SqlRelationRef {
+  schema: string
+  name: string
+}
+
 export interface SqlColumn {
   name: string
   type: string
@@ -107,6 +113,8 @@ export interface DatalogStore {
 
 export interface Schema {
   sql: SqlTable[]
+  /** S05 navigation: user-schema views (PostgreSQL connections). */
+  views: SqlRelationRef[]
   kv: KvStore[]
   vector: VectorIndex[]
   timeseries: TsMetric[]
@@ -147,10 +155,6 @@ export interface QueryResult {
   /** Authoritative editing state of the table read (server catalog). */
   readOnly?: boolean
   readOnlyReason?: string
-  /** Rows matching the read's conditions (filters + match), unpaginated. */
-  filterCount?: number
-  /** Rows in the table ignoring all conditions. */
-  totalCount?: number
   /** SQL editor (S04): the request ID the statement ran under. */
   requestId?: string
   /** SQL editor (S04): the statement was cancelled at the user's request. */
@@ -160,6 +164,10 @@ export interface QueryResult {
   /** SQL editor (S04): after a cancel, whether the backend passed the
    *  post-cancel probe and went back to the pool (false: it was discarded). */
   connectionReused?: boolean
+  /** Rows matching the read's conditions (filters + match), unpaginated. */
+  filterCount?: number
+  /** Rows in the table ignoring all conditions. */
+  totalCount?: number
 }
 
 /** One component of a full-tuple equality filter; value is a wire cell. */
@@ -450,6 +458,8 @@ export type TabKind =
   | 'sql-browser'
   | 'sql-editor'
   | 'schema-designer'
+  | 'schema-inspector'
+  | 'diagnostics'
   | 'kv'
   | 'vector'
   | 'timeseries'
@@ -476,6 +486,8 @@ export interface Tab {
   filter?: { column: string; op: string; value: string }
   /** Pre-applied full-tuple equality filter (FK follow, incl. composite). */
   match?: MatchCell[]
+  /** SQL editor (S05): initial statement text (e.g. from a slow-query entry). */
+  initialSql?: string
 }
 
 // --- Pending changes ---
@@ -486,4 +498,167 @@ export interface PendingChange {
   label: string       // human-readable: "users.name: 'Alice' → 'Bob'"
   sql: string         // the SQL to execute on commit
   revert: () => void  // fn to undo the local state change
+}
+
+// --- S05: schema navigation and performance diagnosis ---
+
+/** Object detail from GET /api/schema/object (introspection v2). */
+export interface SchemaObjectDetail {
+  kind: 'table' | 'view' | 'opaque'
+  schema: string
+  name: string
+  source: 'introspection-v2'
+  documentSHA256: string
+  table?: {
+    columns: Array<{
+      name: string
+      type: string
+      notNull: boolean
+      isPrimaryKey: boolean
+      default?: { kind: string; sql?: string }
+      generated?: { expression: string }
+    }>
+    constraints: Array<{
+      name: string
+      type: string
+      columns?: string[]
+      expression?: string
+      references?: { table: string; columns: string[]; onDelete?: string; onUpdate?: string; match?: string }
+      deferrable?: boolean
+      initiallyDeferred?: boolean
+    }>
+    indexes: Array<{
+      name: string
+      unique: boolean
+      method: string
+      key: Array<{ column?: string; expression?: string; order?: string; nulls?: string; opclass?: string }>
+      where?: string
+      include?: string[]
+    }>
+    /** Outgoing foreign keys: the other table by schema/name; columns are
+     *  the referencing side, refColumns the referenced side (ordered tuples). */
+    references: SchemaFKEdge[]
+    /** Incoming foreign keys from other tables, same shape. */
+    referencedBy: SchemaFKEdge[]
+  }
+  view?: { definition: string; checkOption?: string; securityInvoker?: boolean }
+  opaque?: { opaqueKind: string; reason: string; owner?: string }
+}
+
+/** One visual designer edit (POST /api/schema/plan | apply). */
+export interface SchemaChange {
+  op:
+    | 'create-table' | 'drop-table'
+    | 'add-column' | 'drop-column' | 'rename-column' | 'alter-column-type'
+    | 'set-not-null' | 'drop-not-null' | 'set-default' | 'drop-default'
+    | 'add-index' | 'drop-index'
+  schema: string
+  table: string
+  column?: string
+  from?: string
+  to?: string
+  type?: string
+  notNull?: boolean
+  default?: string
+  index?: string
+  unique?: boolean
+  columns?: Array<{ name: string; type: string; notNull: boolean; default?: string; isPrimaryKey: boolean }>
+}
+
+/** One foreign-key relationship as seen from an inspected table. */
+export interface SchemaFKEdge {
+  constraint: string
+  schema: string
+  name: string
+  columns: string[]
+  refColumns: string[]
+}
+
+/** One classified plan statement (the M03 plan builder's operation). */
+export interface PlanOperation {
+  index: number
+  sql: string
+  down: string
+  destructive: boolean
+  dataLoss: boolean
+  reversibility: 'reversible' | 'irreversible' | 'manual'
+}
+
+/** A reviewable migration plan: the CLI planner's own statements for the
+ * designer's changes, with the M03 risk report and the target document. */
+export interface SchemaPlanResponse {
+  /** Binds an apply to exactly this plan's statements. */
+  planId: string
+  /** Canonical hash of the live schema document the plan starts from. */
+  baseSha256: string
+  targetSha256: string
+  up: string[]
+  down: string[]
+  warnings: string[]
+  operations: PlanOperation[]
+  risk: {
+    hasDestructive: boolean
+    hasDataLoss: boolean
+    statementCount: number
+    irreversibleCount: number
+    overallReversibility: 'reversible' | 'irreversible' | 'manual'
+  }
+  transactionMode: string
+  /** `--rename` values reproducing the plan's renames in the CLI. */
+  renameFlags: string[]
+  /** Objects PostgreSQL removes together with a dropped column, made explicit. */
+  designerNotes: string[]
+  /** The same plan through the CLI, with `target` saved as target.schema.json. */
+  cliEquivalent: string
+  /** The target schema document v2 (canonical JSON). */
+  target: unknown
+  applied: boolean
+  /** Apply only: "in-sync", "drift" (see residual) or "unverified: …". */
+  verification?: string
+  residual?: string[]
+}
+
+/** One recorded statement execution (GET /api/diagnostics/queries). */
+export interface LoggedStatement {
+  at: string
+  connectionId: string
+  surface: string
+  requestId?: string
+  sql: string
+  durationMs: number
+  rowCount?: number
+  state: 'ok' | 'error' | 'canceled'
+  error?: string
+}
+
+export interface DiagnosticsQueriesResponse {
+  entries: LoggedStatement[]
+  stats: { count: number; p50Ms: number; p95Ms: number; maxMs: number }
+  scope: string
+  pgStatStatements?:
+    | { available: true; statements: Array<{ query: string; calls: number; totalMs: number; meanMs: number }>; note: string }
+    | { available: false; reason: string }
+}
+
+/** Per-table usage statistics (GET /api/diagnostics/table-stats). */
+export interface TableStatsResponse {
+  schema: string
+  table: string
+  stats: {
+    seqScan: number
+    idxScan: number
+    idxTupFetch: number
+    nLiveTup: number
+    nDeadTup: number
+    nModSinceAnalyze: number
+    lastAnalyze?: string | null
+    lastAutoAnalyze?: string | null
+    lastVacuum?: string | null
+    lastAutoVacuum?: string | null
+  }
+  indexes: Array<{ name: string; definition: string; unique: boolean; idxScan: number; idxTupRead: number; sizeBytes: number }>
+  notes: string[]
+  relSizeBytes?: number
+  totalSizeBytes?: number
+  sizeUnavailableReason?: string
 }

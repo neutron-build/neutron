@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { decodeCell, decodeRows, encodeCell, encodeEdit, formatCell, isTaggedCell, WireDecodeError, WireEncodeError, type WireTag } from './wire'
+import { decodeCell, decodeRows, encodeCell, encodeEdit, formatCell, hasUTCOffset, isTaggedCell, WireDecodeError, WireEncodeError, type WireTag } from './wire'
 
 // Fixtures pin the tagged wire format (the backend side lands with the typed
 // row-identity protocol; these tests are the format contract both ends meet):
@@ -173,5 +173,41 @@ describe('encodeEdit — S03 typed staging to wire form', () => {
     expect(encodeEdit({ kind: 'value', text: 'plain' }, col('text'))).toEqual({ kind: 'value', value: 'plain' })
     expect(encodeEdit({ kind: 'value', text: '\\x00ff' }, col('bytea', 'bytea')))
       .toEqual({ kind: 'value', value: { t: 'bytea', v: '00ff' } })
+  })
+})
+
+// S05: the client mirrors the server's timestamptz offset discipline —
+// offset-less values are refused at staging time with the same guidance,
+// offset-bearing and special values pass untouched.
+describe('encodeCell timestamptz offset discipline (S05)', () => {
+  it('refuses offset-less values with the canonical-form guidance', () => {
+    for (const v of ['2026-09-24 12:34:56', '2026-09-24', '2026-09-24T12:34:56.000001']) {
+      expect(() => encodeCell(v, 'timestamptz')).toThrow(WireEncodeError)
+      expect(() => encodeCell(v, 'timestamptz')).toThrow(/no UTC offset/)
+    }
+  })
+  it('accepts explicit offsets, Z and the specials', () => {
+    expect(encodeCell('2026-09-24T12:34:56Z', 'timestamptz')).toEqual({ t: 'timestamptz', v: '2026-09-24T12:34:56Z' })
+    expect(encodeCell('2026-09-24 12:34:56+02:00', 'timestamptz')).toEqual({ t: 'timestamptz', v: '2026-09-24 12:34:56+02:00' })
+    expect(encodeCell('2026-09-24T12:34:56+0530', 'timestamptz')).toEqual({ t: 'timestamptz', v: '2026-09-24T12:34:56+0530' })
+    expect(encodeCell('infinity', 'timestamptz')).toEqual({ t: 'timestamptz', v: 'infinity' })
+    expect(encodeCell('0001-01-01T00:00:00.5Z BC', 'timestamptz')).toEqual({ t: 'timestamptz', v: '0001-01-01T00:00:00.5Z BC' })
+  })
+  it('agrees with the server check (wire.go) on its accept/refuse table', () => {
+    const accept = [
+      '2026-09-24T12:34:56Z', '2026-09-24 12:34:56+02:00', '2026-09-24T12:34:56.000001-07:30',
+      '2026-09-24T12:34:56+05', '2026-09-24T12:34:56+0530', '2026-09-24 12:34:56 +02',
+      '2026-09-24 12:34:56 UTC', '2026-09-24 12:34:56.5 gmt', 'infinity', '-infinity', 'epoch',
+      '0001-01-01T00:00:00.5Z BC',
+    ]
+    const refuse = [
+      '2026-09-24 12:34:56', '2026-09-24', '2026-09-24T12:34:56.000001', '',
+      '12:34:56+02:00', '2026-09-24 12:34:56 America/Vancouver', '2026-09-24 12:34:56  +02',
+    ]
+    for (const v of accept) expect(hasUTCOffset(v), v).toBe(true)
+    for (const v of refuse) expect(hasUTCOffset(v), v).toBe(false)
+  })
+  it('leaves timestamp (without timezone) offset-less canonical values alone', () => {
+    expect(encodeCell('2026-01-01T00:00:00', 'timestamp')).toEqual({ t: 'timestamp', v: '2026-01-01T00:00:00' })
   })
 })

@@ -7,6 +7,7 @@ import {
   buildCompletionNamespace, completionSchemas, defaultCompletionSchema, flattenPlan,
   isWriteStatement, leadingKeyword, loadHistory, newRequestId, parameterCount,
   pushHistory, quoteIdentIfNeeded, HISTORY_MAX,
+  mayChangeCatalog,
 } from './sqlTools'
 
 describe('parameterCount', () => {
@@ -182,5 +183,20 @@ describe('history (extends the existing per-connection store)', () => {
     expect(loadHistory('c2')).toHaveLength(HISTORY_MAX)
     localStorage.setItem('neutron:query-history:c3', '{"not":"an array"}')
     expect(loadHistory('c3')).toEqual([])
+  })
+})
+
+describe('mayChangeCatalog (S05 schema refresh trigger)', () => {
+  it('matches DDL statements anywhere in a script', () => {
+    expect(mayChangeCatalog('create table t (x int)')).toBe(true)
+    expect(mayChangeCatalog('select 1; ALTER TABLE t ADD COLUMN y int')).toBe(true)
+    expect(mayChangeCatalog('  drop view v')).toBe(true)
+    expect(mayChangeCatalog('comment on table t is \'x\'')).toBe(true)
+  })
+  it('ignores reads, DML and commented-out DDL', () => {
+    expect(mayChangeCatalog('select * from created_things')).toBe(false)
+    expect(mayChangeCatalog('update t set dropped = true')).toBe(false)
+    expect(mayChangeCatalog('-- drop table t\nselect 1')).toBe(false)
+    expect(mayChangeCatalog('/* alter table t */ select 1')).toBe(false)
   })
 })

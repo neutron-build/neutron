@@ -1,6 +1,6 @@
 import { useSignal } from '@preact/signals'
 import { useEffect, useRef } from 'preact/hooks'
-import { activeConnection, isNucleus, schema, toast } from '../../lib/store'
+import { activeConnection, isNucleus, refreshSchema, schema, toast } from '../../lib/store'
 import { api, ApiError } from '../../lib/api'
 import { DataGrid } from '../../components/DataGrid'
 import { friendlyError } from '../../lib/rls'
@@ -8,7 +8,7 @@ import type { ExplainOutcome, QueryResult, QueryHistoryEntry, SavedQuery, SqlTab
 import { ExplainView } from './ExplainView'
 import {
   buildCompletionNamespace, completionSchemas, defaultCompletionSchema,
-  isWriteStatement, loadHistory, newRequestId, parameterCount, pushHistory,
+  isWriteStatement, loadHistory, mayChangeCatalog, newRequestId, parameterCount, pushHistory,
 } from './sqlTools'
 import s from './SQLEditor.module.css'
 
@@ -50,6 +50,9 @@ const INITIAL_DOC = '-- Write your SQL query here\nSELECT 1;'
 
 interface SQLEditorProps {
   tabId: string
+  /** Initial statement text (S05: opened from a slow-query entry or a
+   *  diagnosis action). Absent keeps the default document. */
+  initialSql?: string
 }
 
 type SidePanel = 'history' | 'saved' | null
@@ -79,7 +82,7 @@ function completionConfig(tables: readonly SqlTable[], selectedSchema: string) {
   }
 }
 
-export function SQLEditor({ tabId }: SQLEditorProps) {
+export function SQLEditor({ tabId, initialSql }: SQLEditorProps) {
   const cmContainer = useRef<HTMLDivElement>(null)
   const cmView = useRef<import('@codemirror/view').EditorView | null>(null)
   const sqlCompartment = useRef<import('@codemirror/state').Compartment | null>(null)
@@ -88,7 +91,8 @@ export function SQLEditor({ tabId }: SQLEditorProps) {
   const running = useSignal<Running | null>(null)
   const cancelRequested = useSignal(false)
   const cmReady = useSignal(false)
-  const sqlText = useSignal(INITIAL_DOC)
+  const initialDoc = initialSql ?? INITIAL_DOC
+  const sqlText = useSignal(initialDoc)
 
   // Bound parameters ($1..$n), sized from the statement text.
   const params = useSignal<ParamInput[]>([])
@@ -143,7 +147,7 @@ export function SQLEditor({ tabId }: SQLEditorProps) {
       sqlCompartment.current = compartment
       const view = new EditorView({
         state: EditorState.create({
-          doc: INITIAL_DOC,
+          doc: initialDoc,
           extensions: [
             basicSetup,
             compartment.of(sql(completionConfig(schema.value?.sql ?? [], completionSchema.value))),
@@ -172,7 +176,7 @@ export function SQLEditor({ tabId }: SQLEditorProps) {
       cmView.current = null
       sqlCompartment.current = null
     }
-  }, [tabId])
+  }, [tabId, initialDoc])
 
   // Catalog-aware completion follows the live catalog and the schema choice.
   useEffect(() => {
@@ -256,6 +260,10 @@ export function SQLEditor({ tabId }: SQLEditorProps) {
         status: res.canceled ? 'canceled' : res.error ? 'error' : 'ok',
       })
       history.value = loadHistory(conn.id)
+      // DDL from the editor changes the catalog every other view reads:
+      // refresh the tree and completion sources (a refresh is harmless if
+      // the heuristic over-matches).
+      if (!res.error && !res.canceled && mayChangeCatalog(sqlSource)) void refreshSchema(conn.id)
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err)
       output.value = { kind: 'result', result: { columns: [], rows: [], rowCount: 0, duration: 0, error: message } }

@@ -46,7 +46,7 @@ func TestMigrateJournaledE2E(t *testing.T) {
 	// pre-M06 tree), pinned: after M06 lands, HEAD would contain the
 	// journal and the premises could never hold. Same pattern as the M05
 	// battery's pinned pre-M05 reference.
-	preM06Bin := buildRevisionCLIBinary(t, preM06Revision)
+	preM06Bin := buildRevisionCLIBinary(t, parentOfLanding(t, "(orm-program M06)"))
 
 	newDB := func(t *testing.T) string {
 		t.Helper()
@@ -134,8 +134,10 @@ func TestMigrateJournaledE2E(t *testing.T) {
 			t.Fatal("cannot locate test source path")
 		}
 		src := filepath.Join(filepath.Dir(thisFile), "..", "examples-src")
+		// "src/." copies the directory's contents on both BSD and GNU cp;
+		// "src/" nests the directory under dst on GNU (Linux CI).
 		dst := t.TempDir()
-		if out, err := exec.Command("cp", "-R", src+string(os.PathSeparator), dst).CombinedOutput(); err != nil {
+		if out, err := exec.Command("cp", "-R", src+string(os.PathSeparator)+".", dst).CombinedOutput(); err != nil {
 			t.Fatalf("copy examples-src: %v\n%s", err, out)
 		}
 		return filepath.Join(dst, "migrations"), filepath.Join(dst, "seeds")
@@ -1157,11 +1159,32 @@ func TestMigrateJournaledE2E(t *testing.T) {
 	})
 }
 
-// preM06Revision is the revision this battery's fail-before premises run
-// against: the M05 landing (the last tree without the journal). Pinned for
-// the same reason the M05 battery pins its own pre-M05 reference — once a
-// feature lands, HEAD contains it and "fails before" could never hold.
-const preM06Revision = "2791b3dc"
+// parentOfLanding returns the parent of the commit on HEAD's history whose
+// subject contains marker (e.g. "(orm-program M06)"): the last tree without
+// that card. Once a feature lands, HEAD contains it and "fails before"
+// could never hold, so fail-before batteries build this revision instead.
+// Located by subject rather than a pinned SHA so rebases cannot break it;
+// requires full history (CI checks out with fetch-depth: 0).
+func parentOfLanding(t *testing.T, marker string) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate test source path")
+	}
+	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+	out, err := exec.Command("git", "-C", repoRoot, "log", "--format=%H %s").Output()
+	landing := ""
+	for _, line := range strings.Split(string(out), "\n") {
+		if sha, subject, ok := strings.Cut(line, " "); ok && strings.Contains(subject, marker) {
+			landing = sha
+			break
+		}
+	}
+	if err != nil || landing == "" {
+		t.Fatalf("no commit with %q in HEAD's history (shallow clone? fetch full history): %v", marker, err)
+	}
+	return landing + "^"
+}
 
 // buildRevisionCLIBinary builds the CLI from an arbitrary pinned revision
 // via read-only `git archive` (plus the gitignored embedded Studio assets
