@@ -8,10 +8,13 @@ import { RlsNotice } from '../../components/RlsNotice'
 import s from './PubSubModule.module.css'
 
 // Nucleus pub/sub over SQL is publish-only: PUBSUB_PUBLISH(channel, message)
-// returns the subscriber count reached, PUBSUB_SUBSCRIBERS(channel) returns the
-// current count, and PUBSUB_CHANNELS() (no args) returns a comma-separated list
-// of active channels. There is NO SQL poll for messages — real subscription is
-// LISTEN/NOTIFY on a live connection, which this query UI cannot hold open.
+// returns the subscriber count reached (always 0 from a standalone SQL
+// deployment — verified live, the wire surface has no subscribe statement),
+// PUBSUB_SUBSCRIBERS(channel) returns the current count, and
+// PUBSUB_CHANNELS() (no args, no pattern support in the engine) returns a
+// comma-separated list of active channels. Real subscription needs a live
+// LISTEN connection (Nucleus delivers LISTEN/NOTIFY around the listener's own
+// statement traffic — verified live), which this query UI cannot hold open.
 interface PubSubMessage {
   id: string
   payload: string

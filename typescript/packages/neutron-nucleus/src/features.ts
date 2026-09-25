@@ -88,3 +88,38 @@ export async function detectFeatures(transport: Transport): Promise<NucleusFeatu
     version: ver,
   };
 }
+
+/**
+ * PostGIS availability on a PostgreSQL connection — detected, never assumed.
+ *
+ * The geo model's GEO_ and ST_ functions are Nucleus-only; on plain
+ * PostgreSQL the model fails closed. This probe exists so that failure can
+ * TELL THE TRUTH about why: whether a PostGIS alternative is installed,
+ * available for CREATE EXTENSION, or absent entirely. It is detection only —
+ * no PostGIS adapter is implemented or advertised by this client.
+ */
+export type PostGISStatus =
+  | { state: 'installed'; version: string }
+  | { state: 'available'; defaultVersion: string }
+  | { state: 'absent' }
+  | { state: 'unknown'; reason: string };
+
+export async function detectPostGIS(transport: Transport): Promise<PostGISStatus> {
+  try {
+    const installed = await transport.fetchval<string>(
+      "SELECT extversion FROM pg_extension WHERE extname = 'postgis' LIMIT 1",
+    );
+    if (installed) return { state: 'installed', version: installed };
+  } catch (err) {
+    return { state: 'unknown', reason: err instanceof Error ? err.message : String(err) };
+  }
+  try {
+    const available = await transport.fetchval<string>(
+      "SELECT default_version FROM pg_available_extensions WHERE name = 'postgis' LIMIT 1",
+    );
+    if (available) return { state: 'available', defaultVersion: available };
+  } catch (err) {
+    return { state: 'unknown', reason: err instanceof Error ? err.message : String(err) };
+  }
+  return { state: 'absent' };
+}

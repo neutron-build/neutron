@@ -2,7 +2,7 @@
 // Nucleus client — transport implementations
 // ---------------------------------------------------------------------------
 
-import type { Transport, TransactionTransport, QueryResult, IsolationLevel } from './types.js';
+import type { Transport, TransactionTransport, QueryResult, IsolationLevel, QuerySignalOptions } from './types.js';
 import {
   NucleusAuthError,
   NucleusError,
@@ -11,6 +11,7 @@ import {
   NucleusNotFoundError,
   NucleusQueryError,
   NucleusTransactionError,
+  NucleusNotSupportedError,
 } from './errors.js';
 
 // ---------------------------------------------------------------------------
@@ -89,10 +90,20 @@ async function request<T>(
   body: unknown,
   headers: Record<string, string>,
   timeout?: number,
+  signal?: AbortSignal,
 ): Promise<ApiResponse<T>> {
+  if (signal?.aborted) {
+    throw new DOMException('This operation was aborted', 'AbortError');
+  }
   let res: Response;
-  const controller = timeout != null ? new AbortController() : undefined;
-  const timer = controller ? setTimeout(() => controller.abort(), timeout) : undefined;
+  const controller = timeout != null || signal != null ? new AbortController() : undefined;
+  // Arm the timer only for a real timeout (> 0). undefined/0 mean "no timer":
+  // setTimeout(cb, undefined) fires ~immediately and would abort the internal
+  // controller — breaking every signal-carrying request in the default
+  // construction (X04 MAJOR-1).
+  const timer = timeout != null && timeout > 0 ? setTimeout(() => controller!.abort(), timeout) : undefined;
+  const onAbort = (): void => controller?.abort();
+  signal?.addEventListener('abort', onAbort, { once: true });
 
   try {
     res = await fetch(url, {
@@ -103,12 +114,16 @@ async function request<T>(
       keepalive: true,
     });
   } catch (err) {
+    if (signal?.aborted) {
+      throw new DOMException('This operation was aborted', 'AbortError');
+    }
     throw new NucleusConnectionError('Failed to reach Nucleus server', {
       cause: err instanceof Error ? err : undefined,
       meta: { url: sanitizeUrl(url) },
     });
   } finally {
     if (timer != null) clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
   }
 
   if (!res.ok) {
@@ -155,19 +170,19 @@ export class HttpTransport implements Transport {
     }
   }
 
-  async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<QueryResult<T>> {
-    const res = await request<T[]>(`${this.baseUrl}/api/query`, { sql, params }, this.headers, this.timeout);
+  async query<T = Record<string, unknown>>(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<QueryResult<T>> {
+    const res = await request<T[]>(`${this.baseUrl}/api/query`, { sql, params }, this.headers, this.timeout, opts?.signal);
     const rows = (res.data ?? []) as T[];
     return { rows, rowCount: res.rowCount ?? rows.length };
   }
 
-  async execute(sql: string, params: unknown[] = []): Promise<number> {
-    const res = await request<void>(`${this.baseUrl}/api/execute`, { sql, params }, this.headers, this.timeout);
+  async execute(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<number> {
+    const res = await request<void>(`${this.baseUrl}/api/execute`, { sql, params }, this.headers, this.timeout, opts?.signal);
     return res.affected ?? 0;
   }
 
-  async fetchval<T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> {
-    const result = await this.query<Record<string, unknown>>(sql, params);
+  async fetchval<T = unknown>(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<T | null> {
+    const result = await this.query<Record<string, unknown>>(sql, params, opts);
     if (result.rows.length === 0) return null;
     const first = result.rows[0];
     const keys = Object.keys(first);
@@ -222,31 +237,33 @@ class HttpTransactionTransport implements TransactionTransport {
     }
   }
 
-  async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<QueryResult<T>> {
+  async query<T = Record<string, unknown>>(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<QueryResult<T>> {
     this.assertOpen();
     const res = await request<T[]>(
       `${this.baseUrl}/api/query`,
       { sql, params, txId: this.txId },
       this.headers,
       this.timeout,
+      opts?.signal,
     );
     const rows = (res.data ?? []) as T[];
     return { rows, rowCount: res.rowCount ?? rows.length };
   }
 
-  async execute(sql: string, params: unknown[] = []): Promise<number> {
+  async execute(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<number> {
     this.assertOpen();
     const res = await request<void>(
       `${this.baseUrl}/api/execute`,
       { sql, params, txId: this.txId },
       this.headers,
       this.timeout,
+      opts?.signal,
     );
     return res.affected ?? 0;
   }
 
-  async fetchval<T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> {
-    const result = await this.query<Record<string, unknown>>(sql, params);
+  async fetchval<T = unknown>(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<T | null> {
+    const result = await this.query<Record<string, unknown>>(sql, params, opts);
     if (result.rows.length === 0) return null;
     const first = result.rows[0];
     const keys = Object.keys(first);
@@ -345,7 +362,7 @@ export class MobileTransport implements Transport {
     }
   }
 
-  async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<QueryResult<T>> {
+  async query<T = Record<string, unknown>>(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<QueryResult<T>> {
     const isRead = sql.trimStart().toUpperCase().startsWith('SELECT');
 
     // Check cache for read queries
@@ -357,7 +374,12 @@ export class MobileTransport implements Transport {
       }
     }
 
-    const result = await this.withRetry(() => this.http.query<T>(sql, params));
+    // A canceled caller must not be served a (re)tried request: abort is a
+    // caller decision, not a transient failure.
+    if (opts?.signal?.aborted) {
+      return Promise.reject(new DOMException('This operation was aborted', 'AbortError'));
+    }
+    const result = await this.withRetry(() => this.http.query<T>(sql, params, opts), opts?.signal);
 
     // Cache read results
     if (isRead && this.cacheEnabled) {
@@ -373,8 +395,15 @@ export class MobileTransport implements Transport {
     return result;
   }
 
-  async execute(sql: string, params: unknown[] = []): Promise<number> {
-    if (!this.isOnline && this.offlineQueueEnabled) {
+  async execute(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<number> {
+    if (opts?.signal?.aborted) {
+      return Promise.reject(new DOMException('This operation was aborted', 'AbortError'));
+    }
+    // Offline queueing is intentionally skipped when a signal is passed: a
+    // canceled caller must never be handed a queued/replayed result. Such
+    // calls go to the online retry path directly and reject per the signal
+    // (documented in QuerySignalOptions).
+    if (!this.isOnline && this.offlineQueueEnabled && !opts?.signal) {
       return new Promise<number>((resolve, reject) => {
         if (this.offlineQueue.length >= this.maxQueueSize) {
           reject(new NucleusConnectionError('Offline queue full', { meta: { queueSize: this.maxQueueSize } }));
@@ -383,11 +412,11 @@ export class MobileTransport implements Transport {
         this.offlineQueue.push({ resolve, reject, sql, params });
       });
     }
-    return this.withRetry(() => this.http.execute(sql, params));
+    return this.withRetry(() => this.http.execute(sql, params, opts), opts?.signal);
   }
 
-  async fetchval<T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> {
-    const result = await this.query<Record<string, unknown>>(sql, params);
+  async fetchval<T = unknown>(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<T | null> {
+    const result = await this.query<Record<string, unknown>>(sql, params, opts);
     if (result.rows.length === 0) return null;
     const first = result.rows[0];
     const keys = Object.keys(first);
@@ -429,12 +458,14 @@ export class MobileTransport implements Transport {
 
   // -- Internals ------------------------------------------------------------
 
-  private async withRetry<T>(fn: () => Promise<T>): Promise<T> {
+  private async withRetry<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     let lastError: Error | undefined;
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       try {
         return await fn();
       } catch (err: unknown) {
+        // Aborts are terminal — never retried, never swallowed into backoff.
+        if (signal?.aborted || (err as DOMException | undefined)?.name === 'AbortError') throw err;
         lastError = err instanceof Error ? err : new Error(String(err));
         // Don't retry client errors (4xx)
         const status = (err as { meta?: { status?: number } })?.meta?.status;
@@ -476,6 +507,15 @@ type InvokeFn = (cmd: string, args: Record<string, unknown>) => Promise<unknown>
  */
 export class EmbeddedTransport implements Transport {
   private readonly invoke: InvokeFn;
+  /** Reject signal usage: the embedded channel has no cancellation path. */
+  private rejectIfSignal(opts?: QuerySignalOptions): void {
+    if (opts?.signal) {
+      throw new NucleusNotSupportedError(
+        'cancellation is not supported by EmbeddedTransport: the Tauri IPC / neutron:// channel has no abort mechanism',
+      );
+    }
+  }
+
 
   constructor() {
     // Prefer Tauri's IPC invoke when available
@@ -501,7 +541,8 @@ export class EmbeddedTransport implements Transport {
     }
   }
 
-  async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<QueryResult<T>> {
+  async query<T = Record<string, unknown>>(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<QueryResult<T>> {
+    this.rejectIfSignal(opts);
     const result = (await this.invoke('nucleus_query', { sql, params })) as {
       rows?: T[];
       rowCount?: number;
@@ -511,7 +552,8 @@ export class EmbeddedTransport implements Transport {
     return { rows, rowCount: result.rowCount ?? rows.length };
   }
 
-  async execute(sql: string, params: unknown[] = []): Promise<number> {
+  async execute(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<number> {
+    this.rejectIfSignal(opts);
     const result = (await this.invoke('nucleus_execute', { sql, params })) as {
       affected?: number;
       rowsAffected?: number;
@@ -519,8 +561,8 @@ export class EmbeddedTransport implements Transport {
     return result.affected ?? result.rowsAffected ?? 0;
   }
 
-  async fetchval<T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> {
-    const result = await this.query<Record<string, unknown>>(sql, params);
+  async fetchval<T = unknown>(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<T | null> {
+    const result = await this.query<Record<string, unknown>>(sql, params, opts);
     if (result.rows.length === 0) return null;
     const first = result.rows[0];
     const keys = Object.keys(first);
@@ -562,14 +604,24 @@ class EmbeddedTransactionTransport implements TransactionTransport {
     this.txId = txId;
   }
 
+  /** Reject signal usage: the embedded channel has no cancellation path. */
+  private rejectIfSignal(opts?: QuerySignalOptions): void {
+    if (opts?.signal) {
+      throw new NucleusNotSupportedError(
+        'cancellation is not supported by EmbeddedTransport transactions: the Tauri IPC / neutron:// channel has no abort mechanism',
+      );
+    }
+  }
+
   private assertOpen(): void {
     if (this.finished) {
       throw new NucleusTransactionError('Transaction has already been committed or rolled back');
     }
   }
 
-  async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<QueryResult<T>> {
+  async query<T = Record<string, unknown>>(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<QueryResult<T>> {
     this.assertOpen();
+    this.rejectIfSignal(opts);
     const result = (await this.invoke('nucleus_query', { sql, params, txId: this.txId })) as {
       rows?: T[];
       rowCount?: number;
@@ -579,8 +631,9 @@ class EmbeddedTransactionTransport implements TransactionTransport {
     return { rows, rowCount: result.rowCount ?? rows.length };
   }
 
-  async execute(sql: string, params: unknown[] = []): Promise<number> {
+  async execute(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<number> {
     this.assertOpen();
+    this.rejectIfSignal(opts);
     const result = (await this.invoke('nucleus_execute', { sql, params, txId: this.txId })) as {
       affected?: number;
       rowsAffected?: number;
@@ -588,8 +641,8 @@ class EmbeddedTransactionTransport implements TransactionTransport {
     return result.affected ?? result.rowsAffected ?? 0;
   }
 
-  async fetchval<T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> {
-    const result = await this.query<Record<string, unknown>>(sql, params);
+  async fetchval<T = unknown>(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<T | null> {
+    const result = await this.query<Record<string, unknown>>(sql, params, opts);
     if (result.rows.length === 0) return null;
     const first = result.rows[0];
     const keys = Object.keys(first);
@@ -771,25 +824,134 @@ export class PgTransport implements Transport {
     return this.poolPromise;
   }
 
-  async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<QueryResult<T>> {
-    const pool = await this.getPool();
-    const res = await pool.query(sql, params);
+  async query<T = Record<string, unknown>>(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<QueryResult<T>> {
+    if (!opts?.signal) {
+      const pool = await this.getPool();
+      const res = await pool.query(sql, params);
+      return { rows: res.rows as T[], rowCount: res.rowCount ?? 0 };
+    }
+    const res = await this.queryCancelable(sql, params, opts.signal);
     return { rows: res.rows as T[], rowCount: res.rowCount ?? 0 };
   }
 
-  async execute(sql: string, params: unknown[] = []): Promise<number> {
-    const pool = await this.getPool();
-    const res = await pool.query(sql, params);
+  async execute(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<number> {
+    if (!opts?.signal) {
+      const pool = await this.getPool();
+      const res = await pool.query(sql, params);
+      return res.rowCount ?? 0;
+    }
+    const res = await this.queryCancelable(sql, params, opts.signal);
     return res.rowCount ?? 0;
   }
 
-  async fetchval<T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> {
-    const pool = await this.getPool();
-    const res = await pool.query(sql, params);
-    const row = res.rows[0] as Record<string, unknown> | undefined;
+  async fetchval<T = unknown>(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<T | null> {
+    const result = await this.query<Record<string, unknown>>(sql, params, opts);
+    const row = result.rows[0];
     if (row === undefined) return null;
     const value = Object.values(row)[0];
     return (value ?? null) as T | null;
+  }
+
+  /**
+   * Run one statement on a dedicated client with real cancellation armed.
+   *
+   * `pg` has no per-query AbortSignal API, so cancellation goes through the
+   * server: learn this connection's backend PID, then on abort issue
+   * `pg_cancel_backend(pid)` from the POOL — a second connection — the same
+   * discipline as the SQL ORM's I02 work. The canceled statement rejects
+   * with SQLSTATE 57014.
+   *
+   * Engines without the cancel surface (Nucleus today: pg_cancel_backend is
+   * 0A000-unknown) reject with NucleusNotSupportedError WHEN THE ABORT
+   * FIRES, while the original statement still runs to completion — the
+   * honest alternative to pretending an abort happened. The caller learns
+   * both facts from the same rejection.
+   *
+   * If the pg_backend_pid probe itself fails on this engine, the query still
+   * runs (cancellation is unavailable, not the query) — but any abort is then
+   * reported as could-not-be-dispatched with the probe failure as `cause`,
+   * NEVER silently ignored (X04 MAJOR-2).
+   */
+  private async queryCancelable(
+    sql: string,
+    params: unknown[],
+    signal: AbortSignal,
+  ): Promise<{ rows: unknown[]; rowCount: number | null }> {
+    if (signal.aborted) {
+      throw new DOMException('This operation was aborted', 'AbortError');
+    }
+    const pool = await this.getPool();
+    const client = await pool.connect();
+    let pid: number | null = null;
+    let cancelAttempt: Promise<void> | null = null;
+    let cancelDispatched = false;
+    let sawCancelUnsupported = false;
+    let pidProbeError: unknown;
+    const abortListener = (): void => {
+      if (pid == null) {
+        // The pid probe is still in flight or failed on this engine: no
+        // pg_cancel_backend can be dispatched. Do NOT create a no-op
+        // cancelAttempt — the completion path must see the abort as
+        // un-dispatched and report it (never resolve as if nothing happened).
+        return;
+      }
+      cancelDispatched = true;
+      cancelAttempt = (async () => {
+        try {
+          await pool.query('SELECT pg_cancel_backend($1) AS canceled', [pid]);
+        } catch (err) {
+          sawCancelUnsupported = true;
+          throw new NucleusNotSupportedError(
+            'statement cancellation failed: this engine does not support pg_cancel_backend ' +
+              '(Nucleus tracks this as a known gap); the original statement was NOT canceled and will complete',
+            { cause: err instanceof Error ? err : undefined },
+          );
+        }
+      })();
+    };
+    signal.addEventListener('abort', abortListener, { once: true });
+    try {
+      const pidRow = await client.query('SELECT pg_backend_pid() AS pid').catch((err: unknown) => {
+        pidProbeError = err;
+        return null;
+      });
+      const pidVal = pidRow ? (pidRow.rows[0] as { pid?: number | string } | undefined)?.pid : undefined;
+      pid = pidVal != null ? Number(pidVal) : null;
+      const res = await client.query(sql, params);
+      if (signal.aborted && cancelAttempt) {
+        try {
+          await cancelAttempt;
+        } catch {
+          // Statement completed despite the abort; the unsupported-cancel
+          // fact is reported below via sawCancelUnsupported.
+        }
+      }
+      if (signal.aborted && sawCancelUnsupported) {
+        throw new NucleusNotSupportedError(
+          'statement cancellation is unsupported on this engine (pg_cancel_backend missing); the statement completed anyway',
+        );
+      }
+      if (signal.aborted && !cancelDispatched) {
+        // The abort fired before the cancel channel was armed (pool checkout
+        // or the pid-probe window), or the pid probe failed so no cancel
+        // could ever be dispatched — and the statement completed anyway.
+        // Resolving normally would silently ignore the caller's abort.
+        throw new NucleusNotSupportedError(
+          'cancellation could not be dispatched (the abort fired before the cancel channel was armed' +
+            (pid == null ? ' or the pg_backend_pid probe failed on this engine' : '') +
+            '); the statement completed anyway',
+          pidProbeError !== undefined
+            ? { cause: pidProbeError instanceof Error ? pidProbeError : undefined }
+            : undefined,
+        );
+      }
+      return res;
+    } finally {
+      signal.removeEventListener('abort', abortListener);
+      // The cancel path can poison the connection; release with an error so
+      // the pool destroys rather than recycles it.
+      client.release(signal.aborted ? new Error('canceled by AbortSignal') : undefined);
+    }
   }
 
   async beginTransaction(isolationLevel?: IsolationLevel): Promise<TransactionTransport> {
@@ -832,20 +994,33 @@ export class PgTransactionTransport implements TransactionTransport {
     if (this.finished) throw new NucleusTransactionError('transaction already finished');
   }
 
-  async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<QueryResult<T>> {
+  // Signal support on the transaction client is pre-flight only: an
+  // already-aborted signal rejects before anything is sent. Mid-statement
+  // cancellation would need the pool for a pg_cancel_backend side channel,
+  // and this transport deliberately does not own the pool.
+  private rejectIfAborted(opts?: QuerySignalOptions): void {
+    if (opts?.signal?.aborted) {
+      throw new DOMException('This operation was aborted', 'AbortError');
+    }
+  }
+
+  async query<T = Record<string, unknown>>(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<QueryResult<T>> {
     this.assertOpen();
+    this.rejectIfAborted(opts);
     const res = await this.client.query(sql, params);
     return { rows: res.rows as T[], rowCount: res.rowCount ?? 0 };
   }
 
-  async execute(sql: string, params: unknown[] = []): Promise<number> {
+  async execute(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<number> {
     this.assertOpen();
+    this.rejectIfAborted(opts);
     const res = await this.client.query(sql, params);
     return res.rowCount ?? 0;
   }
 
-  async fetchval<T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> {
+  async fetchval<T = unknown>(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<T | null> {
     this.assertOpen();
+    this.rejectIfAborted(opts);
     const res = await this.client.query(sql, params);
     const row = res.rows[0] as Record<string, unknown> | undefined;
     if (row === undefined) return null;

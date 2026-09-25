@@ -225,3 +225,15 @@
   transition: opacity var(--transition);
 }
 .dropTableBtn:hover { opacity: 0.85; }
+
+/* --- S05: plan flow --- */
+
+.planError {
+  margin-bottom: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  color: var(--error, #e5534b);
+  border: 1px solid color-mix(in srgb, var(--error, #e5534b) 40%, transparent);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  white-space: pre-wrap;
+}

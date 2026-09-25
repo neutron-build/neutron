@@ -118,6 +118,82 @@ const REGISTRY: Readonly<Record<string, CapabilitySpec>> = {
     description: "DECLARE ... NO SCROLL CURSOR / FETCH FORWARD n / CLOSE inside a transaction (NO SCROLL: PostgreSQL 7.4 release notes)",
     postgresSince: [7, 4],
   },
+  // X01 rules. The vector family is EXTENSION-PROVIDED, so no PostgreSQL
+  // version fact can ever prove it: even the newest release lacks the
+  // operators until the pgvector extension is installed in the database.
+  // Resolution is therefore probe-only, and the probes are self-testing:
+  // each fails with a server error (42704 unknown type / 42883 unknown
+  // function) exactly when the capability is absent, on every engine —
+  // including Nucleus, whose vector MODEL is a different surface with no
+  // proven SQL-column semantics (X00 capability report records none).
+  // Extension presence/version as a SEPARATE concern (pg_extension /
+  // pg_available_extensions) is exposed by the /pgvector module's
+  // pgvectorExtension(), not by this registry.
+  // X02 (X01 review M1): the probes assert VALUES, not acceptance. Expected
+  // literals verified against pgvector 0.8.6 on PostgreSQL 17: text form of
+  // '[1]'::vector is '[1]'; L2([1],[2])=1; negative inner product=-2;
+  // cosine distance of equal vectors=0; L1=1 (all exactly representable in
+  // binary floating point). A wrong-value engine (constant 0 distances)
+  // hits the 1/0 arm and resolves unsupported, exactly like the FTS probes'
+  // negative control caught Nucleus's fake ts_rank.
+  "vector-type": {
+    description: "the pgvector `vector` column type (extension-provided)",
+    probeSql: "select case when ('[1]'::vector)::text = '[1]' then 1 else 1/0 end",
+  },
+  "vector-operator-l2": {
+    description: "pgvector L2 distance operator <-> (vector_l2_ops semantics)",
+    probeSql: "select case when ('[1]'::vector <-> '[2]'::vector) = 1 then 1 else 1/0 end",
+  },
+  "vector-operator-inner-product": {
+    description: "pgvector negative inner product operator <#> (vector_ip_ops semantics)",
+    probeSql: "select case when ('[1]'::vector <#> '[2]'::vector) = -2 then 1 else 1/0 end",
+  },
+  "vector-operator-cosine": {
+    description: "pgvector cosine distance operator <=> (vector_cosine_ops semantics)",
+    probeSql: "select case when ('[1]'::vector <=> '[2]'::vector) = 0 then 1 else 1/0 end",
+  },
+  "vector-operator-l1": {
+    description: "pgvector L1 distance operator <+> (pgvector 0.7.0+)",
+    probeSql: "select case when ('[1]'::vector <+> '[2]'::vector) = 1 then 1 else 1/0 end",
+  },
+  // X01: core full-text search. Integrated into PostgreSQL in 8.3 (the
+  // pre-8.3 tsearch2 contrib module is a different API); websearch_to_tsquery
+  // arrived in 11. Probes verify SEMANTICS with a positive AND a negative
+  // control (the 1/0 arm fires when either is wrong): a parse-only probe
+  // would certify engines that accept the syntax and always answer yes —
+  // observed on Nucleus 1.0.2, whose to_tsvector returns a constant and
+  // whose @@ is true for any non-match (recorded in the X01 Nucleus leg
+  // evidence). Match must hold for a present word and fail for an absent
+  // one; ts_rank must be positive on the match.
+  "fts-functions": {
+    description: "to_tsvector / to_tsquery / plainto_tsquery / ts_rank / @@ match (PostgreSQL 8.3 release notes)",
+    postgresSince: [8, 3],
+    probeSql: "select case when to_tsvector('english', 'quick brown fox') @@ plainto_tsquery('english', 'fox') and not (to_tsvector('english', 'quick brown fox') @@ plainto_tsquery('english', 'zebra')) and ts_rank(to_tsvector('english', 'quick brown fox'), plainto_tsquery('english', 'fox')) > 0 then 1 else 1/0 end",
+  },
+  "fts-websearch-tsquery": {
+    description: "websearch_to_tsquery (PostgreSQL 11 release notes)",
+    postgresSince: [11, 0],
+    probeSql: "select case when websearch_to_tsquery('english', 'neutron \"exact phrase\"') @@ to_tsvector('english', 'neutron exact phrase') and not (websearch_to_tsquery('english', 'neutron -zebra') @@ to_tsvector('english', 'neutron zebra')) then 1 else 1/0 end",
+  },
+  // X03: time bucketing through date_trunc(field, source [, timezone]).
+  // Probe-only on purpose: no version fact is cited (date_trunc predates
+  // cleanly citable release notes), and the probe VERIFIES SEMANTICS with
+  // positive and negative controls. Every condition uses an IMMUTABLE
+  // date_trunc form (the three-argument zone form and the naive-timestamp
+  // form): immutable conditions const-fold to true BEFORE the planner
+  // pre-evaluates the 1/0 else arm, which is what makes the arm a reliable
+  // negative control — a stable-only condition (the two-argument
+  // timestamptz form truncates in the SESSION zone) does not fold early
+  // and the arm would error spuriously. A Tokyo day boundary differing
+  // from the UTC one catches engines that parse the syntax but ignore the
+  // zone argument (the X01 fake-FTS failure class). The two-argument
+  // timestamptz form follows the session timezone by PostgreSQL design —
+  // bucket boundaries without an explicit timeZone option are
+  // session-timezone-dependent, documented in /timeseries.
+  "ts-bucketing": {
+    description: "date_trunc(field, timestamp/timestamptz [, timezone]) time bucketing (PostgreSQL core)",
+    probeSql: "select case when date_trunc('hour', timestamptz '2026-01-01 00:30:00+00', 'UTC') = timestamptz '2026-01-01 00:00:00+00' and date_trunc('hour', timestamptz '2026-01-01 00:59:59.999999+00', 'UTC') = timestamptz '2026-01-01 00:00:00+00' and date_trunc('day', timestamptz '2026-01-01 20:00:00+00', 'Asia/Tokyo') = timestamptz '2026-01-01 15:00:00+00' and date_trunc('day', timestamptz '2026-01-01 20:00:00+00', 'Asia/Tokyo') <> timestamptz '2026-01-01 00:00:00+00' and date_trunc('day', timestamp '2026-01-01 20:30:00') = timestamp '2026-01-01 00:00:00' then 1 else 1/0 end",
+  },
 };
 
 function compareVersion(version: string, since: readonly [number, number]): number | null {

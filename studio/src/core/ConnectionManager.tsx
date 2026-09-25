@@ -1,6 +1,6 @@
 import { useSignal } from '@preact/signals'
 import {
-  connections, activeConnection, features, schema,
+  connections, connectConnection,
   connectionLoading, connectionError, toast,
 } from '../lib/store'
 import { api } from '../lib/api'
@@ -91,18 +91,10 @@ export function ConnectionManager() {
   const showAdd = useSignal(false)
 
   async function connect(id: string) {
-    connectionLoading.value = true
-    connectionError.value = null
     try {
-      const { features: f, schema: sc } = await api.connections.connect(id)
-      features.value = f
-      schema.value = sc
-      const conn = connections.value.find(c => c.id === id) ?? null
-      if (conn) activeConnection.value = { ...conn, isNucleus: f.isNucleus }
-    } catch (err: unknown) {
-      connectionError.value = err instanceof Error ? err.message : String(err)
-    } finally {
-      connectionLoading.value = false
+      await connectConnection(id)
+    } catch {
+      // connectConnection records the error in the store signal.
     }
   }
 

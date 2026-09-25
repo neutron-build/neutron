@@ -98,19 +98,28 @@ func TestValidateSchemaUnsupportedTypeRejected(t *testing.T) {
 	}
 }
 
-func TestValidateSchemaVectorRequiresNucleusOnly(t *testing.T) {
+// X01: vector columns fail closed in v1 documents (the nucleusOnly escape
+// and its skip behavior are withdrawn); v2 owns vector planning.
+func TestValidateSchemaVectorFailsClosedInV1(t *testing.T) {
 	s := validUsersSchema()
 	s.Tables[0].Columns = append(s.Tables[0].Columns, ColumnDef{Name: "embedding", Type: "vector", VectorDims: 3})
 	err := ValidateSchema(&s)
-	if err == nil || !strings.Contains(err.Error(), "nucleusOnly") {
-		t.Fatalf("expected non-nucleusOnly vector rejection, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "vector columns require schema document v2") {
+		t.Fatalf("expected vector fail-closed rejection, got %v", err)
 	}
 
+	// The legacy shape validates only through the dedicated upgrade reader.
+	if err := ValidateSchemaV1ForUpgrade(&s); err == nil {
+		t.Fatal("non-nucleusOnly vector must fail the legacy upgrade rule too")
+	} else if !strings.Contains(err.Error(), "must be nucleusOnly") {
+		t.Fatalf("expected the legacy upgrade rule, got %v", err)
+	}
 	s.Tables[0].Columns[3].NucleusOnly = true
-	s.Tables[0].Columns[3].VectorDims = 0
-	err = ValidateSchema(&s)
-	if err == nil || !strings.Contains(err.Error(), "vectorDimensions") {
-		t.Fatalf("expected missing-dims rejection, got %v", err)
+	if err := ValidateSchemaV1ForUpgrade(&s); err != nil {
+		t.Fatalf("legacy nucleusOnly vector shape must validate for upgrade, got %v", err)
+	}
+	if err := ValidateSchema(&s); err == nil || !strings.Contains(err.Error(), "vector columns require schema document v2") {
+		t.Fatalf("planning validation must still reject the legacy shape, got %v", err)
 	}
 }
 
@@ -253,5 +262,43 @@ func TestSchemaJSONTablesNullRejected(t *testing.T) {
 	err = json.Unmarshal([]byte(`{"version":1,"tables":[],"bogus":true}`), &s)
 	if err == nil || !strings.Contains(err.Error(), "unknown field") {
 		t.Fatalf("expected unknown-field rejection, got %v", err)
+	}
+}
+
+// X02 (X01 review M2): reader-parity pin. The TS readSchemaDocumentV1 and
+// Go ValidateSchemaV1ForUpgrade must give the same verdict for the same
+// bytes on the non-nucleusOnly v1 vector shape. This is the Go leg of the
+// pair; the TS leg (same fixture, same message core) lives in
+// typescript/packages/neutron-sql/src/export.test.ts.
+func TestX02V1VectorReaderParityWithTS(t *testing.T) {
+	const fixture = `{
+	  "version": 1,
+	  "tables": [
+	    {"name": "users", "columns": [
+	      {"name": "id", "type": "serial", "notNull": true, "primaryKey": true},
+	      {"name": "embedding", "type": "vector", "notNull": true, "vectorDimensions": 3}
+	    ], "indexes": []}
+	  ]
+	}`
+	var s Schema
+	if err := json.Unmarshal([]byte(fixture), &s); err != nil {
+		t.Fatalf("fixture must unmarshal: %v", err)
+	}
+	err := ValidateSchemaV1ForUpgrade(&s)
+	if err == nil || !strings.Contains(err.Error(), "legacy vector columns must be nucleusOnly (pre-X01 shape); a non-nucleusOnly vector column never had meaning in v1") {
+		t.Fatalf("expected the same rejection the TS reader gives for these bytes, got %v", err)
+	}
+	// The legacy shape (nucleusOnly + positive dims) still upgrades — the
+	// TS golden vector-upgrade.json is exactly this shape.
+	s.Tables[0].Columns[1].NucleusOnly = true
+	if err := ValidateSchemaV1ForUpgrade(&s); err != nil {
+		t.Fatalf("legacy nucleusOnly vector shape must validate for upgrade, got %v", err)
+	}
+	// Misplaced legacy fields reject with the Go message the TS reader now
+	// mirrors.
+	s.Tables[0].Columns[1].Type = "text"
+	s.Tables[0].Columns[1].NucleusOnly = true
+	if err := ValidateSchemaV1ForUpgrade(&s); err == nil || !strings.Contains(err.Error(), "nucleusOnly is only valid for vector columns") {
+		t.Fatalf("expected nucleusOnly-misplacement rejection, got %v", err)
 	}
 }

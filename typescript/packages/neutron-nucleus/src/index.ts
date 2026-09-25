@@ -6,6 +6,7 @@ export { createClient } from './client.js';
 export type { NucleusClientConfig, NucleusClientBase, NucleusClientBuilder } from './client.js';
 
 export type {
+  SqlTableIdentity,
   Transport,
   TransactionTransport,
   QueryResult,
@@ -28,7 +29,8 @@ export {
 
 export { HttpTransport, MobileTransport, EmbeddedTransport, PgTransport, PgTransactionTransport, createTransport } from './transport.js';
 export type { TransportConfig, MobileTransportConfig, PgTransportConfig } from './transport.js';
-export { detectFeatures } from './features.js';
+export { detectFeatures, detectPostGIS } from './features.js';
+export type { PostGISStatus } from './features.js';
 export { requireNucleus, assertIdentifier } from './helpers.js';
 export {
   migrate,
@@ -73,13 +75,13 @@ export { withSQL } from './sql/index.js';
 export type { SQLModel } from './sql/index.js';
 
 export { withKV } from './kv/index.js';
-export type { KVModel, KVSetOptions } from './kv/index.js';
+export type { KVModel, KVSetOptions, KVScopeOptions, KVNamespace } from './kv/index.js';
 
 export { withVector } from './vector/index.js';
 export type { VectorModel, VectorSearchResult, VectorSearchOptions, DistanceMetric } from './vector/index.js';
 
-export { withTimeSeries } from './timeseries/index.js';
-export type { TimeSeriesModel, TimeSeriesPoint, AggFunc, BucketInterval, TimeSeriesQueryOptions } from './timeseries/index.js';
+export { withTimeSeries, probeTimeSeriesModel } from './timeseries/index.js';
+export type { TimeSeriesModel, TimeSeriesPoint, AggFunc, BucketInterval, TimeSeriesQueryOptions, TimeSeriesModelEvidence, TimeSeriesProbeCheck } from './timeseries/index.js';
 
 export { withDocument } from './document/index.js';
 export type { DocumentModel, DocFindOptions } from './document/index.js';
@@ -91,10 +93,11 @@ export { withFTS } from './fts/index.js';
 export type { FTSModel, FTSResult, FTSSearchOptions } from './fts/index.js';
 
 export { withGeo } from './geo/index.js';
-export type { GeoModel, GeoPoint, GeoFeature } from './geo/index.js';
+export type { GeoModel, GeoPoint, GeoFeature, GeoLayer, GeoLayerIdentity, GeoLayerOptions, GeoCalcOptions } from './geo/index.js';
 
 export { withBlob } from './blob/index.js';
-export type { BlobModel, BlobMeta, BlobPutOptions } from './blob/index.js';
+export type { BlobModel, BlobMeta, BlobPutOptions, BlobGetOptions, BlobReadStreamOptions, BlobRangeResult, BlobBucket } from './blob/index.js';
+export { BlobRangeError, BLOB_MAX_BYTES } from './blob/index.js';
 
 export { withPubSub } from './pubsub/index.js';
 export type { PubSubModel } from './pubsub/index.js';

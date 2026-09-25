@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/preact'
 import {
   stagedEdits, stageEdit, clearStaged, commitPhase, commitError, lastCommit, lastPreview,
-  activeConnection, toasts,
+  activeConnection, toasts, failedEditFocus,
 } from '../lib/store'
 import { _setSessionTokenForTests, ApiError } from '../lib/api'
 import type { CommitOperation, CommitResponse, PreviewResponse } from '../lib/types'
@@ -155,5 +155,59 @@ describe('CommitBar — staged atomic commits (S02)', () => {
     fireEvent.click(screen.getByTitle(/Commit all staged edits as one atomic batch/))
     await waitFor(() => expect(toasts.value.some(t => t.message.includes('another connection'))).toBe(true))
     expect(commitOperations).not.toHaveBeenCalled()
+  })
+
+  it('a binding refusal at commit keeps the draft and surfaces the state', async () => {
+    stageEdit({ connectionId: 'c1', operation: updateOp, label: 'docs.note = staged' })
+    commitOperations.mockRejectedValueOnce(new ApiError(409,
+      'public.docs is no longer the relation these rows were read from; reload before editing', { state: 'binding' }))
+    render(<CommitBar />)
+
+    fireEvent.click(screen.getByTitle(/Commit all staged edits as one atomic batch/))
+    await waitFor(() => expect(commitPhase.value).toBe('failed'))
+    expect(stagedEdits.value.length).toBe(1)
+    expect(screen.getByRole('alert').textContent).toContain('no longer the relation')
+  })
+
+  it('a failed commit pins the first offending staged edit (error focus)', async () => {
+    stageEdit({ connectionId: 'c1', operation: updateOp, label: 'first' })
+    stageEdit({ connectionId: 'c1', operation: { ...updateOp, value: 'second' }, label: 'second' })
+    commitOperations.mockRejectedValueOnce(new ApiError(409,
+      'operations[1]: update refused: row changed since it was read', { state: 'conflict' }))
+    render(<CommitBar />)
+
+    fireEvent.click(screen.getByTitle(/Commit all staged edits as one atomic batch/))
+    await waitFor(() => expect(commitPhase.value).toBe('failed'))
+    expect(failedEditFocus.value).not.toBeNull()
+    expect(failedEditFocus.value!.editId).toBe(stagedEdits.value[1].id)
+    // the bar announces the error and is keyboard reachable
+    const alert = screen.getByRole('alert')
+    expect(alert.textContent).toContain('operations[1]')
+    expect(alert.getAttribute('tabIndex')).toBe('-1')
+    // the draft stays staged for reconciliation
+    expect(stagedEdits.value.length).toBe(2)
+  })
+
+  it('preview detail lists the per-operation dry-run diff', async () => {
+    stageEdit({ connectionId: 'c1', operation: updateOp, label: 'docs.note = staged' })
+    const report: PreviewResponse = {
+      ok: true, counts: { insert: 1, update: 1, delete: 1 },
+      operations: [
+        { index: 0, op: 'update', schema: 'public', table: 'docs', column: 'note', before: 'old', after: 'staged' },
+        { index: 1, op: 'insert', schema: 'public', table: 'docs', after: { id: 9 } },
+        { index: 2, op: 'delete', schema: 'public', table: 'docs', key: [{ column: 'id', value: 3 }] },
+      ],
+    }
+    previewOperations.mockResolvedValueOnce(report)
+    render(<CommitBar />)
+
+    fireEvent.click(screen.getByTitle(/Dry-run this batch/))
+    await waitFor(() => expect(screen.getByText(/preview: 1\+ 1~ 1−/)).toBeTruthy())
+    fireEvent.click(screen.getByText(/preview: 1\+ 1~ 1−/))
+    const ops = screen.getAllByText(/^(\+ insert|~ update|− delete)/)
+    expect(ops.length).toBe(3)
+    expect(ops[0].textContent).toContain('"old"')
+    expect(ops[1].textContent).toContain('insert public.docs')
+    expect(ops[2].textContent).toContain('id=3')
   })
 })

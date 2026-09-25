@@ -67,8 +67,96 @@ commits and deduplicate like any other). Reverts are refused honestly
 (`409 state "irreversible"`) where the inverse cannot be exact: identity
 or serial keys that cannot be re-supplied, generated columns, values that
 cannot round-trip the wire, or FK cascade/set-null/set-default side
-effects the inverse does not capture. A batch is reversible only when
-every operation is.
+effects the inverse does not capture — including side effects that first
+appear BETWEEN commit and revert (rows that started referencing the
+committed value after the commit): the revert aborts with nothing
+applied. A batch is reversible only when every operation is.
+
+## The data editor (S03)
+
+Table views edit by STAGING: a cell edit, a row delete or a typed insert
+joins the local draft (the commit bar) instead of writing immediately;
+`Preview` dry-runs the whole draft, `Commit` sends it as ONE atomic batch
+under the S02 protocol, `Revert commit` undoes the last batch server-side.
+A failed commit keeps the draft staged and focuses the first offending
+row in its grid — the batch error names `operations[N]` and the Nth
+staged edit is pinned.
+
+Staged drafts are addressed by the full-key row identity captured at read
+time, never by row position: paging, re-sorting and re-filtering move
+rows without detaching (or re-attaching to the wrong row) — a draft whose
+row left the current page simply stays staged. Staged values render
+highlighted over the committed cell until commit or discard.
+
+Every editor is typed from the server's catalog metadata: booleans edit
+as true/false, JSON as validated JSON text, and bigint/numeric/temporal
+values as their canonical text re-tagged on the wire (digits never cross
+through a JavaScript number). Each column carries an explicit three-way
+value state — a value (empty text is a real empty string), SQL `NULL`,
+and, on insert, `DEFAULT` (omit the column). Composite foreign keys
+navigate by the whole tuple (any component's link opens the referenced
+row filtered on all of them).
+
+Reads support multiple ANDed filters and ordered multi-column sorts
+(`GET /api/table?filters=[...]&sorts=[...]`, at most 8 and 4; unknown
+columns are refused with 400) and separate the row counts: `rowCount` is
+the fetched page, `filterCount` applies the read's conditions,
+`totalCount` applies none. Connection switching never carries a draft: a
+view bound to another connection refuses to stage, the commit bar refuses
+to commit another connection's edits, and the server independently
+re-refuses any operation whose relation binding was not read through the
+request's connection.
+
+## Large results, import/export and keyboard access (S06)
+
+The result grids virtualize: only the rows in the scroll viewport plus a
+fixed overscan exist in the DOM, whatever the result size, with spacer
+rows keeping the scroll height exact. Bounded reads are the contract, not
+a courtesy: one table page is at most 1,000 rows (larger limits are
+refused with 400, never silently clamped — page with offset or export
+instead), and the SQL editor retains at most 10,000 rows of a result,
+marking it `truncated` with the limit named in the grid. Offset paging is
+deterministic: the primary key is the unique tail of every table read, so
+unchanged-data pages neither repeat nor skip rows.
+
+The grid is a WAI-ARIA `grid` usable without a mouse: one roving tab stop
+moves with the active cell, arrows/PageUp/PageDown/Home/End navigate,
+Enter/F2 open the typed editor (Enter follows a read-only FK link, Delete
+stages a row delete), and focus returns to the cell after commit/cancel.
+Column headers are named sort buttons carrying `aria-sort`; a truncated
+result announces itself through a live region.
+
+**Export** is streamed server-side: `POST /api/table/v2/export` validates
+the table, format (CSV/JSON/NDJSON) and the same filter/sort/match
+grammar, and returns a single-use ticket; `GET .../download` redeems it
+once (browser-marked cross-site requests refused) and streams rows through
+a fixed buffer — memory does not scale with the table, an abandoned
+download cancels the statement and returns the connection, and an error
+mid-stream aborts the response so the browser reports a failed download
+instead of keeping a truncated file that looks complete. Cell text is
+PostgreSQL's own `::text` under pinned output settings (ISO dates, hex
+bytea), so int8/numeric digits and microsecond timestamptz never cross a
+double or a locale formatter. CSV follows COPY conventions (NULL is an
+unquoted empty field, `""` is the empty string); JSON/NDJSON carry exact
+number literals (NaN/Infinity as strings). The SQL editor's bounded result
+exports in-memory with the same conventions. The older model-module
+exports (KV/documents/FTS/pub-sub lists) are unchanged.
+
+**Import** (CSV, JSON array or NDJSON) reads the file in streamed chunks,
+shows a mapping table and live preview (NULL vs empty string vs DEFAULT
+visible per cell), and sends batches of at most 100 rows / 900 KiB: each
+batch is ONE transaction through the S02 commit machinery — all rows or
+none — with the whole-import atomicity stated explicitly in the dialog.
+Digits stay exact end-to-end (int8 validated against its 64-bit range,
+numeric/bytea/temporal re-tagged on the wire; JSON numbers keep their
+literal text, never `JSON.parse`d into doubles). A per-batch operation ID
+plus a persisted journal make interruptions recoverable without duplicate
+rows: after a drop, restart or failure the in-flight batch is resolved
+through the server's recorded outcome first, and an honestly-unknown
+outcome is a decision (check the table, then mark committed or retry),
+never a guess. A failing batch names its source row; skip-row/skip-batch/
+retry are recorded in the journal, and resuming re-reads the same file
+(checked by name, size and mtime).
 
 ## Development
 
@@ -80,6 +168,124 @@ origin allowed explicitly:
 ```bash
 NEUTRON_STUDIO_DEV_ORIGIN=http://localhost:5173 neutron studio
 ```
+
+## Schema navigation and performance diagnosis (S05)
+
+### Navigation, search and deep links
+
+The sidebar tree lists **views alongside tables** (PostgreSQL connections;
+views browse read-only through the same table surface) and has a search box
+filtering by name across schemas, plus a refresh button that re-fetches the
+live catalog (the designer triggers the same refresh after an apply or a
+stale-plan refusal). Every browsable surface has a shareable URL:
+
+```text
+#/c/<connId>/t/<schema>/<table>          browse rows
+#/c/<connId>/v/<schema>/<view>          (views also use t/)
+#/c/<connId>/designer[/<schema>/<table>]
+#/c/<connId>/inspect/<schema>/<table>   structure detail
+#/c/<connId>/diagnostics[/<schema>/<table>]
+#/c/<connId>/sql
+```
+
+Names are URL-encoded, so `MixedCase View` survives. Opening a browsable
+tab updates the hash; loading or pasting a hash connects the named
+connection and opens the tab.
+
+### Object detail
+
+`GET /api/schema/object` returns one relation's metadata from the same
+schema document v2 the CLI works with (`neutron schema pull` writes it):
+columns with the planner's DDL type spelling and tagged defaults,
+PK/unique/check/FK constraints, indexes (method, key parts, INCLUDE,
+predicates) and FK relationships in both directions as ordered column
+tuples, or a view's definition. Objects inventoried as opaque (extension
+owned, partitioned, RLS-bearing…) are reported as exactly that. A relation
+dropped concurrently answers 404. Nucleus is refused: v2 catalog
+conformance is not established there. The schema designer loads tables
+through this endpoint, so it shows and edits the CLI's identities.
+
+### Reviewable migration plans from the designer
+
+The designer does not build DDL. It sends structured edits
+(`create-table`, `drop-table`, `add-column`, `drop-column`,
+`rename-column`, `alter-column-type`, `set/drop-not-null`,
+`set/drop-default`, `add-index`, `drop-index`) to
+`POST /api/schema/plan`, which applies them to a copy of the freshly
+introspected document and plans the difference with the CLI's own diff and
+live expression normalizer — the same inputs `neutron db push` uses. The
+response carries the statements, the per-operation risk report of
+`migrate generate` (destructive / data loss / reversibility), the planner's
+warnings, the target document, and the equivalent command:
+
+```sh
+neutron db push --dry-run --schema target.schema.json \
+  [--rename 'schema.table.old>schema.table.new'] [--allow-destructive]
+```
+
+prints the same statements, and `neutron migrate generate --mode snapshot
+--schema target.schema.json` from a `schema baseline` records the same
+operations (both are covered by an end-to-end test against the CLI binary).
+
+Edits follow PostgreSQL's own semantics, made explicit: dropping a column
+drops the table's indexes and constraints involving it as whole objects
+(listed in the review); anything that would need `CASCADE` — a foreign key
+from another table, a view, a generated column, a trigger — refuses the
+edit, as does renaming a column that SQL text elsewhere (views, CHECK
+expressions, expression indexes) refers to. Column types outside the
+document contract (`serial`, `char`, `time`, …) are refused with the
+accepted vocabulary; the SQL editor remains the surface for those.
+
+`POST /api/schema/apply` executes a reviewed plan only:
+
+- it takes the migration runner's advisory lock (a running migration or
+  push makes it wait up to 10 s, then answers `409 locked`);
+- a database with migration history answers `409 migration-managed`, as
+  `neutron db push` does — download the target document and generate a
+  migration file instead;
+- it re-plans under the lock and requires the same `planId`: if the
+  statements changed since review (a concurrent schema change), it answers
+  `409 stale-plan` with the fresh plan for review. An unrelated concurrent
+  change that leaves the statements identical does not invalidate the
+  review;
+- a plan with destructive or data-loss operations needs
+  `allowDestructive: true` (the review's acknowledgement checkbox). The
+  CLI planner drops and recreates views around table alterations, so such
+  plans count as destructive too;
+- all statements run in one transaction; afterwards the catalog is
+  re-introspected and diffed against the target (`verification: "in-sync"`,
+  or `"drift"` with the residual statements).
+
+### Performance diagnosis
+
+`GET /api/diagnostics/queries` returns this Studio process's duration log
+for the connection (editor statements and table reads, newest first, with a
+threshold filter and p50/p95/max). Durations are wall-clock as measured by
+Studio, including network and result transfer; statement text is recorded
+as submitted and bound parameters never are. When `pg_stat_statements` is
+installed and readable, the server's top statements for the database are
+included; otherwise the response says why. `GET /api/diagnostics/table-stats`
+returns the table's counters from `pg_stat_user_tables` (sequential/index
+scans, live/dead tuples, analyze/vacuum times), sizes, and per-index scan
+counts with `pg_get_indexdef` definitions; counters are cumulative since the
+last statistics reset, so a zero-scan index is an observation, not a
+verdict. EXPLAIN results render as a tree with every node field PostgreSQL
+emitted.
+
+### timestamptz input discipline
+
+A timestamptz value without an explicit UTC offset would be silently
+interpreted in the server's SESSION timezone (an 8-hour shift for a
+Vancouver user). Both write paths — the editor's tagged cells and the SQL
+editor's bound `{t:"timestamptz"}` parameters — refuse such values with a
+message naming the hazard and the fix: append an explicit offset
+(`+02:00`, optionally after one space; `UTC`/`GMT` also count) or use the
+canonical UTC form (`2026-09-24T12:34:56Z`). Named zones such as
+`America/Vancouver` are refused as well, because the client cannot validate
+them. Chosen
+over silently normalizing to UTC: refusing is the only option that never
+guesses what instant the user meant. `timestamp without time zone` is
+unaffected (offset-less is its canonical form).
 
 ## Testing
 

@@ -1652,7 +1652,7 @@ var v2DDLTypes = map[string]string{
 	"numeric": "numeric", "bool": "boolean", "text": "text",
 	"varchar": "varchar", "timestamp": "timestamp", "timestamptz": "timestamptz",
 	"date": "date", "bytea": "bytea", "uuid": "uuid",
-	"json": "json", "jsonb": "jsonb", "vector": "vector",
+	"json": "json", "jsonb": "jsonb", "vector": "vector", "tsvector": "tsvector",
 }
 
 // v2TypeDDL renders the SQL type for a contract column type.
@@ -1839,8 +1839,9 @@ func createV2IndexSQL(t V2Table, idx V2Index) (string, error) {
 	return sql + "index " + quoteIdent(idx.Identity.Name) + " on " + qualifiedNameSQL(t.Identity) + " " + body, nil
 }
 
-// indexBodySQL renders everything after the ON clause: method, key parts,
-// INCLUDE list and predicate.
+// indexBodySQL renders everything after the ON clause: method, key parts
+// (with operator classes, X01), INCLUDE list, access-method parameters and
+// predicate.
 func indexBodySQL(idx V2Index) (string, error) {
 	parts := make([]string, 0, len(idx.Key))
 	for _, k := range idx.Key {
@@ -1866,6 +1867,12 @@ func indexBodySQL(idx V2Index) (string, error) {
 				body += " nulls last"
 			}
 		}
+		// Explicit operator class (X01): `col vector_cosine_ops`. The name
+		// is carried, never resolved — a class the backend lacks fails at
+		// DDL time with the server's own error.
+		if k.Opclass != nil && *k.Opclass != "" {
+			body += " " + *k.Opclass
+		}
 		parts = append(parts, body)
 	}
 	sql := "using " + idx.Method + " (" + strings.Join(parts, ", ") + ")"
@@ -1875,6 +1882,19 @@ func indexBodySQL(idx V2Index) (string, error) {
 			inc = append(inc, quoteIdent(c))
 		}
 		sql += " include (" + strings.Join(inc, ", ") + ")"
+	}
+	if len(idx.With) > 0 {
+		// Deterministic order: sorted parameter names, integers only.
+		names := make([]string, 0, len(idx.With))
+		for k := range idx.With {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		params := make([]string, 0, len(names))
+		for _, n := range names {
+			params = append(params, fmt.Sprintf("%s = %d", n, idx.With[n]))
+		}
+		sql += " with (" + strings.Join(params, ", ") + ")"
 	}
 	if idx.Where != nil {
 		sql += " where " + *idx.Where

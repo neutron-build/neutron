@@ -8,6 +8,7 @@ import {
   paletteOpen, paletteQuery, openPalette, closePalette,
   toasts, toast, bindingActive,
   stagedEdits, stagedCount, stageEdit, removeStagedEdit, discardLastStaged, clearStaged,
+  stagedForTable, keyStringOf, firstOffendingOpIndex, failedEditFocus,
   commitStaged, previewStaged, revertLastCommit,
   commitPhase, commitError, lastCommit, lastPreview,
 } from './store'
@@ -516,5 +517,74 @@ describe('store — staged edits and commit outcomes (S02)', () => {
     const firstId = commitOperations.mock.calls[0][0].operationId
     const secondId = commitOperations.mock.calls[1][0].operationId
     expect(firstId).not.toBe(secondId)
+  })
+})
+
+describe('store — S03 table-scoped staging and error focus', () => {
+  const upd = (id: number) => ({
+    op: 'update' as const, schema: 'public', table: 'docs', binding: 'e:1',
+    key: [{ column: 'id', value: id }], version: '9',
+    column: 'note', value: `staged-${id}`,
+  })
+
+  beforeEach(() => {
+    stagedEdits.value = []
+    commitPhase.value = 'idle'
+    commitError.value = null
+    failedEditFocus.value = null
+    activeConnection.value = { id: 'c1', name: 'one', url: 'postgres://a', isNucleus: false }
+  })
+  afterEach(() => { activeConnection.value = null })
+
+  it('stagedForTable scopes by connection, schema and table', () => {
+    stageEdit({ connectionId: 'c1', operation: upd(1), label: 'a' })
+    stageEdit({ connectionId: 'c1', operation: { ...upd(2), table: 'other' }, label: 'b' })
+    stageEdit({ connectionId: 'c2', operation: upd(3), label: 'c' })
+    stageEdit({ connectionId: 'c1', operation: { op: 'insert', schema: 'public', table: 'docs', binding: 'e:1', values: { id: 9 } }, label: 'd' })
+
+    const docs = stagedForTable('c1', 'public', 'docs')
+    expect(docs.map(e => e.label)).toEqual(['a', 'd'])
+    expect(stagedForTable('c1', 'public', 'other').map(e => e.label)).toEqual(['b'])
+    expect(stagedForTable('c2', 'public', 'docs').map(e => e.label)).toEqual(['c'])
+  })
+
+  it('keyStringOf is canonical and distinct for tagged vs plain values', () => {
+    expect(keyStringOf([{ column: 'id', value: 1 }])).toBe(keyStringOf([{ column: 'id', value: 1 }]))
+    expect(keyStringOf([{ column: 'id', value: 1 }])).not.toBe(keyStringOf([{ column: 'id', value: 2 }]))
+    expect(keyStringOf([{ column: 'a', value: 1 }, { column: 'b', value: 2 }]))
+      .not.toBe(keyStringOf([{ column: 'b', value: 2 }, { column: 'a', value: 1 }]))
+    expect(keyStringOf([{ column: 'id', value: { t: 'int8', v: '9007199254740993' } }]))
+      .toBe('[["id",{"t":"int8","v":"9007199254740993"}]]')
+  })
+
+  it('firstOffendingOpIndex parses the server batch error position', () => {
+    expect(firstOffendingOpIndex('operations[3]: update refused')).toBe(3)
+    expect(firstOffendingOpIndex('operations[12]: column "x" ...')).toBe(12)
+    expect(firstOffendingOpIndex('commit limited to 100 operations')).toBe(0)
+    expect(firstOffendingOpIndex('')).toBe(0)
+  })
+
+  it('a refused commit pins the first offending staged edit for grid focus', async () => {
+    stageEdit({ connectionId: 'c1', operation: upd(1), label: 'ok-row' })
+    stageEdit({ connectionId: 'c1', operation: upd(2), label: 'bad-row' })
+    commitOperations.mockRejectedValueOnce(new ApiError(409,
+      'operations[1]: update refused: row changed since it was read (current row version 99)', { state: 'conflict' }))
+
+    await expect(commitStaged('c1')).rejects.toBeInstanceOf(ApiError)
+    expect(failedEditFocus.value).not.toBeNull()
+    expect(failedEditFocus.value!.editId).toBe(stagedEdits.value[1].id)
+    expect(failedEditFocus.value!.reason).toContain('operations[1]')
+    // the draft stays staged
+    expect(stagedCount.value).toBe(2)
+  })
+
+  it('a successful commit clears any stale focus pin', async () => {
+    failedEditFocus.value = { editId: 'stale', reason: 'x' }
+    stageEdit({ connectionId: 'c1', operation: upd(1), label: 'a' })
+    commitOperations.mockResolvedValueOnce({
+      operationId: 'op', rowsAffected: 1, operations: [], reversible: true,
+    })
+    await commitStaged('c1')
+    expect(failedEditFocus.value).toBeNull()
   })
 })

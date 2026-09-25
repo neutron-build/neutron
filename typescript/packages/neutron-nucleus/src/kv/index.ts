@@ -2,19 +2,38 @@
 // @neutron-build/nucleus/kv — KV model plugin
 // ---------------------------------------------------------------------------
 
-import type { Transport, NucleusPlugin, NucleusFeatures } from '../types.js';
-import { requireNucleus } from '../helpers.js';
+import type { Transport, NucleusPlugin, NucleusFeatures, QuerySignalOptions, SqlTableIdentity } from '../types.js';
+import { requireNucleus, assertIdentifier } from '../helpers.js';
 
 // ---------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------
 
-export interface KVSetOptions {
-  /** Time-to-live in seconds. */
-  ttl?: number;
+/**
+ * Scope + cancellation options shared by every KV operation. `namespace` is a
+ * client-side key-prefix convention — the engine keeps ONE global keyspace
+ * (MODEL_SEMANTICS.md); it is not an isolation boundary and not a SQL object.
+ */
+export interface KVScopeOptions {
   /** Key namespace prefix (prepended as `namespace:key`). */
   namespace?: string;
+  /** Abort the operation. See Transport cancellation semantics. */
+  signal?: AbortSignal;
 }
+
+export interface KVSetOptions extends KVScopeOptions {
+  /** Time-to-live in seconds. */
+  ttl?: number;
+}
+
+/**
+ * A KV namespace bound to a name (and optionally to a SQL table identity).
+ * Every key is prefixed `<schema>.<table>:<name>:` (or `<name>:` without an
+ * identity), so namespaced keys cannot collide with bare keys or with other
+ * bindings. Global operations that cannot be scoped (dbSize, flushDB) are
+ * intentionally absent.
+ */
+export type KVNamespace = Omit<KVModel, 'dbSize' | 'flushDB' | 'namespace'>;
 
 // ---------------------------------------------------------------------------
 // KVModel interface
@@ -24,10 +43,10 @@ export interface KVModel {
   // -- Base ------------------------------------------------------------------
 
   /** Get a raw string value. Returns `null` if the key does not exist. */
-  get(key: string): Promise<string | null>;
+  get(key: string, opts?: KVScopeOptions): Promise<string | null>;
 
   /** Get a value and JSON-parse it into `T`. Returns `null` if missing. */
-  getTyped<T>(key: string): Promise<T | null>;
+  getTyped<T>(key: string, opts?: KVScopeOptions): Promise<T | null>;
 
   /** Set a raw string value. */
   set(key: string, value: string, opts?: KVSetOptions): Promise<void>;
@@ -41,35 +60,35 @@ export interface KVModel {
    * the crash-safe lock acquire. `namespace` prefixes the key like every
    * other write, so namespaced callers get namespaced locks.
    */
-  setNX(key: string, value: string, opts?: { ttl?: number; namespace?: string }): Promise<boolean>;
+  setNX(key: string, value: string, opts?: { ttl?: number } & KVScopeOptions): Promise<boolean>;
 
   /** Delete a key. Returns `true` if it existed. */
-  delete(key: string): Promise<boolean>;
+  delete(key: string, opts?: KVScopeOptions): Promise<boolean>;
 
   /**
    * Delete the key only if its current value equals `expected` — the safe
    * lock release (a holder whose lease expired cannot delete the next
    * holder's lock). Returns `true` if deleted.
    */
-  cdel(key: string, expected: string): Promise<boolean>;
+  cdel(key: string, expected: string, opts?: KVScopeOptions): Promise<boolean>;
 
   /**
    * Set the TTL only if the current value equals `expected` — the lease
    * renewal heartbeat. Returns `true` if renewed.
    */
-  cexpire(key: string, expected: string, seconds: number): Promise<boolean>;
+  cexpire(key: string, expected: string, seconds: number, opts?: KVScopeOptions): Promise<boolean>;
 
   /** Check whether a key exists. */
-  exists(key: string): Promise<boolean>;
+  exists(key: string, opts?: KVScopeOptions): Promise<boolean>;
 
   /** Atomically increment a key's integer value. Returns the new value. */
-  incr(key: string, amount?: number): Promise<number>;
+  incr(key: string, amount?: number, opts?: KVScopeOptions): Promise<number>;
 
   /** Get the remaining TTL in seconds. -1 = no TTL, -2 = missing key. */
-  ttl(key: string): Promise<number>;
+  ttl(key: string, opts?: KVScopeOptions): Promise<number>;
 
   /** Set a TTL on an existing key. Returns `true` if the key existed. */
-  expire(key: string, seconds: number): Promise<boolean>;
+  expire(key: string, seconds: number, opts?: KVScopeOptions): Promise<boolean>;
 
   /** Return the total number of keys. */
   dbSize(): Promise<number>;
@@ -77,133 +96,164 @@ export interface KVModel {
   /** Delete all keys. */
   flushDB(): Promise<void>;
 
+  /**
+   * Create a namespace-bound view of this KV model. Keys written through the
+   * returned object are scoped `<schema>.<table>:<name>:` (or `<name>:`
+   * without `boundTo`). This is a resource-reference binding to a SQL
+   * identity — it emits no DDL, creates no SQL columns, and makes no
+   * cross-model atomicity claim.
+   */
+  namespace(name: string, boundTo?: SqlTableIdentity): KVNamespace;
+
   /** Scan keys matching a glob pattern (`*` wildcard). Returns matching keys, sorted. */
-  scan(pattern: string, count?: number): Promise<string[]>;
+  scan(pattern: string, count?: number, opts?: KVScopeOptions): Promise<string[]>;
 
   // -- Lists -----------------------------------------------------------------
 
   /** Prepend a value to a list. Returns the new list length. */
-  lpush(key: string, value: string): Promise<number>;
+  lpush(key: string, value: string, opts?: KVScopeOptions): Promise<number>;
 
   /** Append a value to a list. Returns the new list length. */
-  rpush(key: string, value: string): Promise<number>;
+  rpush(key: string, value: string, opts?: KVScopeOptions): Promise<number>;
 
   /** Remove and return the first element of a list. */
-  lpop(key: string): Promise<string | null>;
+  lpop(key: string, opts?: KVScopeOptions): Promise<string | null>;
 
   /** Remove and return the last element of a list. */
-  rpop(key: string): Promise<string | null>;
+  rpop(key: string, opts?: KVScopeOptions): Promise<string | null>;
 
   /** Return elements between `start` and `stop` (inclusive). */
-  lrange(key: string, start: number, stop: number): Promise<string[]>;
+  lrange(key: string, start: number, stop: number, opts?: KVScopeOptions): Promise<string[]>;
 
   /** Return the length of a list. */
-  llen(key: string): Promise<number>;
+  llen(key: string, opts?: KVScopeOptions): Promise<number>;
 
   /** Return the element at `index`. */
-  lindex(key: string, index: number): Promise<string | null>;
+  lindex(key: string, index: number, opts?: KVScopeOptions): Promise<string | null>;
 
   // -- Hashes ----------------------------------------------------------------
 
   /** Set a field in a hash. Returns `true` if the field is new. */
-  hset(key: string, field: string, value: string): Promise<boolean>;
+  hset(key: string, field: string, value: string, opts?: KVScopeOptions): Promise<boolean>;
 
   /** Get a hash field value. */
-  hget(key: string, field: string): Promise<string | null>;
+  hget(key: string, field: string, opts?: KVScopeOptions): Promise<string | null>;
 
   /** Remove a field from a hash. Returns `true` if removed. */
-  hdel(key: string, field: string): Promise<boolean>;
+  hdel(key: string, field: string, opts?: KVScopeOptions): Promise<boolean>;
 
   /** Check if a field exists in a hash. */
-  hexists(key: string, field: string): Promise<boolean>;
+  hexists(key: string, field: string, opts?: KVScopeOptions): Promise<boolean>;
 
   /** Return all fields and values of a hash. */
-  hgetall(key: string): Promise<Record<string, string>>;
+  hgetall(key: string, opts?: KVScopeOptions): Promise<Record<string, string>>;
 
   /** Return the number of fields in a hash. */
-  hlen(key: string): Promise<number>;
+  hlen(key: string, opts?: KVScopeOptions): Promise<number>;
 
   // -- Sets ------------------------------------------------------------------
 
   /** Add a member to a set. Returns `true` if it was new. */
-  sadd(key: string, member: string): Promise<boolean>;
+  sadd(key: string, member: string, opts?: KVScopeOptions): Promise<boolean>;
 
   /** Remove a member from a set. Returns `true` if removed. */
-  srem(key: string, member: string): Promise<boolean>;
+  srem(key: string, member: string, opts?: KVScopeOptions): Promise<boolean>;
 
   /** Return all members of a set. */
-  smembers(key: string): Promise<string[]>;
+  smembers(key: string, opts?: KVScopeOptions): Promise<string[]>;
 
   /** Check if a member exists in a set. */
-  sismember(key: string, member: string): Promise<boolean>;
+  sismember(key: string, member: string, opts?: KVScopeOptions): Promise<boolean>;
 
   /** Return the number of members in a set. */
-  scard(key: string): Promise<number>;
+  scard(key: string, opts?: KVScopeOptions): Promise<number>;
 
   // -- Sorted Sets -----------------------------------------------------------
 
   /** Add a member with a score to a sorted set. Returns `true` if new. */
-  zadd(key: string, score: number, member: string): Promise<boolean>;
+  zadd(key: string, score: number, member: string, opts?: KVScopeOptions): Promise<boolean>;
 
   /** Return members by rank range. */
-  zrange(key: string, start: number, stop: number): Promise<string[]>;
+  zrange(key: string, start: number, stop: number, opts?: KVScopeOptions): Promise<string[]>;
 
   /** Return members with scores between `min` and `max`. */
-  zrangeByScore(key: string, min: number, max: number): Promise<string[]>;
+  zrangeByScore(key: string, min: number, max: number, opts?: KVScopeOptions): Promise<string[]>;
 
   /** Remove a member from a sorted set. Returns `true` if removed. */
-  zrem(key: string, member: string): Promise<boolean>;
+  zrem(key: string, member: string, opts?: KVScopeOptions): Promise<boolean>;
 
   /** Return the number of members in a sorted set. */
-  zcard(key: string): Promise<number>;
+  zcard(key: string, opts?: KVScopeOptions): Promise<number>;
 
   // -- HyperLogLog -----------------------------------------------------------
 
   /** Add an element to a HyperLogLog. Returns `true` if the internal state changed. */
-  pfadd(key: string, element: string): Promise<boolean>;
+  pfadd(key: string, element: string, opts?: KVScopeOptions): Promise<boolean>;
 
   /** Return the approximate cardinality. */
-  pfcount(key: string): Promise<number>;
+  pfcount(key: string, opts?: KVScopeOptions): Promise<number>;
 }
 
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
 
-function resolveKey(key: string, namespace?: string): string {
-  return namespace ? `${namespace}:${key}` : key;
+function resolveKey(key: string, namespace?: string, prefix?: string): string {
+  let k = namespace ? `${namespace}:${key}` : key;
+  if (prefix) k = `${prefix}${k}`;
+  return k;
 }
 
 class KVModelImpl implements KVModel {
   constructor(
     private readonly transport: Transport,
     private readonly features: NucleusFeatures,
+    /** Fixed scope prefix for namespace-bound views; undefined on the root model. */
+    private readonly scopePrefix?: string,
   ) {}
 
   private require(): void {
     requireNucleus(this.features, 'KV');
   }
 
-  // -- Base ------------------------------------------------------------------
-
-  async get(key: string): Promise<string | null> {
-    this.require();
-    return this.transport.fetchval<string>('SELECT KV_GET($1)', [key]);
+  namespace(name: string, boundTo?: SqlTableIdentity): KVNamespace {
+    if (boundTo != null) {
+      assertIdentifier(boundTo.schema, 'namespace schema');
+      assertIdentifier(boundTo.table, 'namespace table');
+    }
+    if (name.includes(':')) {
+      throw new Error(
+        `Invalid KV namespace name ${JSON.stringify(name)}: ':' would make scoped keys ambiguous`,
+      );
+    }
+    const prefix = boundTo ? `${boundTo.schema}.${boundTo.table}:${name}:` : `${name}:`;
+    // Pure client-side handle: binding emits no SQL at all (no DDL, no
+    // catalog objects) — a resource reference, never a SQL column.
+    const scoped = new KVModelImpl(this.transport, this.features, (this.scopePrefix ?? '') + prefix);
+    return scoped as unknown as KVNamespace;
   }
 
-  async getTyped<T>(key: string): Promise<T | null> {
-    const raw = await this.get(key);
+  // -- Base ------------------------------------------------------------------
+
+  async get(key: string, opts?: KVScopeOptions): Promise<string | null> {
+    this.require();
+    return this.transport.fetchval<string>('SELECT KV_GET($1)', [resolveKey(key, opts?.namespace, this.scopePrefix)], { signal: opts?.signal });
+  }
+
+  async getTyped<T>(key: string, opts?: KVScopeOptions): Promise<T | null> {
+    const raw = await this.get(key, opts);
     if (raw === null) return null;
     return JSON.parse(raw) as T;
   }
 
   async set(key: string, value: string, opts?: KVSetOptions): Promise<void> {
     this.require();
-    const k = resolveKey(key, opts?.namespace);
+    const k = resolveKey(key, opts?.namespace, this.scopePrefix);
+    const q = { signal: opts?.signal };
     if (opts?.ttl !== undefined) {
-      await this.transport.execute('SELECT KV_SET($1, $2, $3)', [k, value, opts.ttl]);
+      await this.transport.execute('SELECT KV_SET($1, $2, $3)', [k, value, opts.ttl], q);
     } else {
-      await this.transport.execute('SELECT KV_SET($1, $2)', [k, value]);
+      await this.transport.execute('SELECT KV_SET($1, $2)', [k, value], q);
     }
   }
 
@@ -211,55 +261,75 @@ class KVModelImpl implements KVModel {
     await this.set(key, JSON.stringify(value), opts);
   }
 
-  async setNX(key: string, value: string, opts?: { ttl?: number; namespace?: string }): Promise<boolean> {
+  async setNX(key: string, value: string, opts?: { ttl?: number } & KVScopeOptions): Promise<boolean> {
     this.require();
-    const k = resolveKey(key, opts?.namespace);
+    const k = resolveKey(key, opts?.namespace, this.scopePrefix);
+    const q = { signal: opts?.signal };
     if (opts?.ttl !== undefined) {
       return (
-        (await this.transport.fetchval<boolean>('SELECT KV_SETNX($1, $2, $3)', [k, value, opts.ttl])) ?? false
+        (await this.transport.fetchval<boolean>('SELECT KV_SETNX($1, $2, $3)', [k, value, opts.ttl], q)) ?? false
       );
     }
-    return (await this.transport.fetchval<boolean>('SELECT KV_SETNX($1, $2)', [k, value])) ?? false;
+    return (await this.transport.fetchval<boolean>('SELECT KV_SETNX($1, $2)', [k, value], q)) ?? false;
   }
 
-  async delete(key: string): Promise<boolean> {
-    this.require();
-    return (await this.transport.fetchval<boolean>('SELECT KV_DEL($1)', [key])) ?? false;
-  }
-
-  async cdel(key: string, expected: string): Promise<boolean> {
-    this.require();
-    return (await this.transport.fetchval<boolean>('SELECT KV_CDEL($1, $2)', [key, expected])) ?? false;
-  }
-
-  async cexpire(key: string, expected: string, seconds: number): Promise<boolean> {
+  async delete(key: string, opts?: KVScopeOptions): Promise<boolean> {
     this.require();
     return (
-      (await this.transport.fetchval<boolean>('SELECT KV_CEXPIRE($1, $2, $3)', [key, expected, seconds])) ?? false
-    );
+      (await this.transport.fetchval<boolean>('SELECT KV_DEL($1)', [resolveKey(key, opts?.namespace, this.scopePrefix)], { signal: opts?.signal }))
+    ) ?? false;
   }
 
-  async exists(key: string): Promise<boolean> {
+  async cdel(key: string, expected: string, opts?: KVScopeOptions): Promise<boolean> {
     this.require();
-    return (await this.transport.fetchval<boolean>('SELECT KV_EXISTS($1)', [key])) ?? false;
+    return (
+      (await this.transport.fetchval<boolean>('SELECT KV_CDEL($1, $2)', [resolveKey(key, opts?.namespace, this.scopePrefix), expected], { signal: opts?.signal }))
+    ) ?? false;
   }
 
-  async incr(key: string, amount?: number): Promise<number> {
+  async cexpire(key: string, expected: string, seconds: number, opts?: KVScopeOptions): Promise<boolean> {
     this.require();
+    return (
+      (await this.transport.fetchval<boolean>('SELECT KV_CEXPIRE($1, $2, $3)', [resolveKey(key, opts?.namespace, this.scopePrefix), expected, seconds], { signal: opts?.signal }))
+    ) ?? false;
+  }
+
+  async exists(key: string, opts?: KVScopeOptions): Promise<boolean> {
+    this.require();
+    return (
+      (await this.transport.fetchval<boolean>('SELECT KV_EXISTS($1)', [resolveKey(key, opts?.namespace, this.scopePrefix)], { signal: opts?.signal }))
+    ) ?? false;
+  }
+
+  async incr(key: string, amount?: number, opts?: KVScopeOptions): Promise<number> {
+    this.require();
+    const k = resolveKey(key, opts?.namespace, this.scopePrefix);
+    const q = { signal: opts?.signal };
     if (amount !== undefined) {
-      return (await this.transport.fetchval<number>('SELECT KV_INCR($1, $2)', [key, amount])) ?? 0;
+      return (await this.transport.fetchval<number>('SELECT KV_INCR($1, $2)', [k, amount], q)) ?? 0;
     }
-    return (await this.transport.fetchval<number>('SELECT KV_INCR($1)', [key])) ?? 0;
+    return (await this.transport.fetchval<number>('SELECT KV_INCR($1)', [k], q)) ?? 0;
   }
 
-  async ttl(key: string): Promise<number> {
+  /**
+   * Remaining TTL in seconds. Engine semantics (verified live, X04): the
+   * value TRUNCATES toward zero (Redis rounds up), so a key set with
+   * ttl=10 usually reports 9 immediately, and ttl=1 reports 0 right after
+   * the set — 0 therefore does NOT mean expired; only a read returning
+   * null / -2 means gone.
+   */
+  async ttl(key: string, opts?: KVScopeOptions): Promise<number> {
     this.require();
-    return (await this.transport.fetchval<number>('SELECT KV_TTL($1)', [key])) ?? -2;
+    return (
+      (await this.transport.fetchval<number>('SELECT KV_TTL($1)', [resolveKey(key, opts?.namespace, this.scopePrefix)], { signal: opts?.signal }))
+    ) ?? -2;
   }
 
-  async expire(key: string, seconds: number): Promise<boolean> {
+  async expire(key: string, seconds: number, opts?: KVScopeOptions): Promise<boolean> {
     this.require();
-    return (await this.transport.fetchval<boolean>('SELECT KV_EXPIRE($1, $2)', [key, seconds])) ?? false;
+    return (
+      (await this.transport.fetchval<boolean>('SELECT KV_EXPIRE($1, $2)', [resolveKey(key, opts?.namespace, this.scopePrefix), seconds], { signal: opts?.signal }))
+    ) ?? false;
   }
 
   async dbSize(): Promise<number> {
@@ -272,78 +342,86 @@ class KVModelImpl implements KVModel {
     await this.transport.execute('SELECT KV_FLUSHDB()');
   }
 
-  async scan(pattern: string, count = 100): Promise<string[]> {
+  async scan(pattern: string, count = 100, opts?: KVScopeOptions): Promise<string[]> {
     this.require();
-    const raw = await this.transport.fetchval<string>('SELECT KV_KEYS($1)', [pattern]);
+    const raw = await this.transport.fetchval<string>(
+      'SELECT KV_KEYS($1)',
+      [resolveKey(pattern, opts?.namespace, this.scopePrefix)],
+      { signal: opts?.signal },
+    );
     if (!raw) return [];
     const keys = JSON.parse(raw) as string[];
-    return keys.slice(0, count);
+    // Strip every prefix this call added: the bound scope AND a per-call
+    // namespace — the same contract the root model gives a per-call
+    // namespace (X04 LOW: the two surfaces must not disagree).
+    const strip = (this.scopePrefix ?? '') + (opts?.namespace ? `${opts.namespace}:` : '');
+    return keys.slice(0, count).map((k) => (strip && k.startsWith(strip) ? k.slice(strip.length) : k));
   }
 
   // -- Lists -----------------------------------------------------------------
 
-  async lpush(key: string, value: string): Promise<number> {
+  async lpush(key: string, value: string, opts?: KVScopeOptions): Promise<number> {
     this.require();
-    return (await this.transport.fetchval<number>('SELECT KV_LPUSH($1, $2)', [key, value])) ?? 0;
+    return (await this.transport.fetchval<number>('SELECT KV_LPUSH($1, $2)', [resolveKey(key, opts?.namespace, this.scopePrefix), value], { signal: opts?.signal })) ?? 0;
   }
 
-  async rpush(key: string, value: string): Promise<number> {
+  async rpush(key: string, value: string, opts?: KVScopeOptions): Promise<number> {
     this.require();
-    return (await this.transport.fetchval<number>('SELECT KV_RPUSH($1, $2)', [key, value])) ?? 0;
+    return (await this.transport.fetchval<number>('SELECT KV_RPUSH($1, $2)', [resolveKey(key, opts?.namespace, this.scopePrefix), value], { signal: opts?.signal })) ?? 0;
   }
 
-  async lpop(key: string): Promise<string | null> {
+  async lpop(key: string, opts?: KVScopeOptions): Promise<string | null> {
     this.require();
-    return this.transport.fetchval<string>('SELECT KV_LPOP($1)', [key]);
+    return this.transport.fetchval<string>('SELECT KV_LPOP($1)', [resolveKey(key, opts?.namespace, this.scopePrefix)], { signal: opts?.signal });
   }
 
-  async rpop(key: string): Promise<string | null> {
+  async rpop(key: string, opts?: KVScopeOptions): Promise<string | null> {
     this.require();
-    return this.transport.fetchval<string>('SELECT KV_RPOP($1)', [key]);
+    return this.transport.fetchval<string>('SELECT KV_RPOP($1)', [resolveKey(key, opts?.namespace, this.scopePrefix)], { signal: opts?.signal });
   }
 
-  async lrange(key: string, start: number, stop: number): Promise<string[]> {
+  async lrange(key: string, start: number, stop: number, opts?: KVScopeOptions): Promise<string[]> {
     this.require();
-    const raw = await this.transport.fetchval<string>('SELECT KV_LRANGE($1, $2, $3)', [key, start, stop]);
+    const raw = await this.transport.fetchval<string>('SELECT KV_LRANGE($1, $2, $3)', [resolveKey(key, opts?.namespace, this.scopePrefix), start, stop], { signal: opts?.signal });
     if (!raw) return [];
     return JSON.parse(raw) as string[];
   }
 
-  async llen(key: string): Promise<number> {
+  async llen(key: string, opts?: KVScopeOptions): Promise<number> {
     this.require();
-    return (await this.transport.fetchval<number>('SELECT KV_LLEN($1)', [key])) ?? 0;
+    return (await this.transport.fetchval<number>('SELECT KV_LLEN($1)', [resolveKey(key, opts?.namespace, this.scopePrefix)], { signal: opts?.signal })) ?? 0;
   }
 
-  async lindex(key: string, index: number): Promise<string | null> {
+  async lindex(key: string, index: number, opts?: KVScopeOptions): Promise<string | null> {
     this.require();
-    return this.transport.fetchval<string>('SELECT KV_LINDEX($1, $2)', [key, index]);
+    return this.transport.fetchval<string>('SELECT KV_LINDEX($1, $2)', [resolveKey(key, opts?.namespace, this.scopePrefix), index], { signal: opts?.signal });
   }
 
   // -- Hashes ----------------------------------------------------------------
 
-  async hset(key: string, field: string, value: string): Promise<boolean> {
+  async hset(key: string, field: string, value: string, opts?: KVScopeOptions): Promise<boolean> {
     this.require();
-    return (await this.transport.fetchval<boolean>('SELECT KV_HSET($1, $2, $3)', [key, field, value])) ?? false;
+    return (await this.transport.fetchval<boolean>('SELECT KV_HSET($1, $2, $3)', [resolveKey(key, opts?.namespace, this.scopePrefix), field, value], { signal: opts?.signal })) ?? false;
   }
 
-  async hget(key: string, field: string): Promise<string | null> {
+  async hget(key: string, field: string, opts?: KVScopeOptions): Promise<string | null> {
     this.require();
-    return this.transport.fetchval<string>('SELECT KV_HGET($1, $2)', [key, field]);
+    return this.transport.fetchval<string>('SELECT KV_HGET($1, $2)', [resolveKey(key, opts?.namespace, this.scopePrefix), field], { signal: opts?.signal });
   }
 
-  async hdel(key: string, field: string): Promise<boolean> {
+  async hdel(key: string, field: string, opts?: KVScopeOptions): Promise<boolean> {
     this.require();
-    return (await this.transport.fetchval<boolean>('SELECT KV_HDEL($1, $2)', [key, field])) ?? false;
+    return (await this.transport.fetchval<boolean>('SELECT KV_HDEL($1, $2)', [resolveKey(key, opts?.namespace, this.scopePrefix), field], { signal: opts?.signal })) ?? false;
   }
 
-  async hexists(key: string, field: string): Promise<boolean> {
+  async hexists(key: string, field: string, opts?: KVScopeOptions): Promise<boolean> {
     this.require();
-    return (await this.transport.fetchval<boolean>('SELECT KV_HEXISTS($1, $2)', [key, field])) ?? false;
+    return (await this.transport.fetchval<boolean>('SELECT KV_HEXISTS($1, $2)', [resolveKey(key, opts?.namespace, this.scopePrefix), field], { signal: opts?.signal })) ?? false;
   }
 
-  async hgetall(key: string): Promise<Record<string, string>> {
+  async hgetall(key: string, opts?: KVScopeOptions): Promise<Record<string, string>> {
     this.require();
-    const raw = await this.transport.fetchval<string>('SELECT KV_HGETALL($1)', [key]);
+    const raw = await this.transport.fetchval<string>('SELECT KV_HGETALL($1)', [resolveKey(key, opts?.namespace, this.scopePrefix)], { signal: opts?.signal });
     if (!raw) return {};
     const result: Record<string, string> = {};
     for (const [field, value] of JSON.parse(raw) as Array<[string, string]>) {
@@ -352,81 +430,81 @@ class KVModelImpl implements KVModel {
     return result;
   }
 
-  async hlen(key: string): Promise<number> {
+  async hlen(key: string, opts?: KVScopeOptions): Promise<number> {
     this.require();
-    return (await this.transport.fetchval<number>('SELECT KV_HLEN($1)', [key])) ?? 0;
+    return (await this.transport.fetchval<number>('SELECT KV_HLEN($1)', [resolveKey(key, opts?.namespace, this.scopePrefix)], { signal: opts?.signal })) ?? 0;
   }
 
   // -- Sets ------------------------------------------------------------------
 
-  async sadd(key: string, member: string): Promise<boolean> {
+  async sadd(key: string, member: string, opts?: KVScopeOptions): Promise<boolean> {
     this.require();
-    return (await this.transport.fetchval<boolean>('SELECT KV_SADD($1, $2)', [key, member])) ?? false;
+    return (await this.transport.fetchval<boolean>('SELECT KV_SADD($1, $2)', [resolveKey(key, opts?.namespace, this.scopePrefix), member], { signal: opts?.signal })) ?? false;
   }
 
-  async srem(key: string, member: string): Promise<boolean> {
+  async srem(key: string, member: string, opts?: KVScopeOptions): Promise<boolean> {
     this.require();
-    return (await this.transport.fetchval<boolean>('SELECT KV_SREM($1, $2)', [key, member])) ?? false;
+    return (await this.transport.fetchval<boolean>('SELECT KV_SREM($1, $2)', [resolveKey(key, opts?.namespace, this.scopePrefix), member], { signal: opts?.signal })) ?? false;
   }
 
-  async smembers(key: string): Promise<string[]> {
+  async smembers(key: string, opts?: KVScopeOptions): Promise<string[]> {
     this.require();
-    const raw = await this.transport.fetchval<string>('SELECT KV_SMEMBERS($1)', [key]);
+    const raw = await this.transport.fetchval<string>('SELECT KV_SMEMBERS($1)', [resolveKey(key, opts?.namespace, this.scopePrefix)], { signal: opts?.signal });
     if (!raw) return [];
     return JSON.parse(raw) as string[];
   }
 
-  async sismember(key: string, member: string): Promise<boolean> {
+  async sismember(key: string, member: string, opts?: KVScopeOptions): Promise<boolean> {
     this.require();
-    return (await this.transport.fetchval<boolean>('SELECT KV_SISMEMBER($1, $2)', [key, member])) ?? false;
+    return (await this.transport.fetchval<boolean>('SELECT KV_SISMEMBER($1, $2)', [resolveKey(key, opts?.namespace, this.scopePrefix), member], { signal: opts?.signal })) ?? false;
   }
 
-  async scard(key: string): Promise<number> {
+  async scard(key: string, opts?: KVScopeOptions): Promise<number> {
     this.require();
-    return (await this.transport.fetchval<number>('SELECT KV_SCARD($1)', [key])) ?? 0;
+    return (await this.transport.fetchval<number>('SELECT KV_SCARD($1)', [resolveKey(key, opts?.namespace, this.scopePrefix)], { signal: opts?.signal })) ?? 0;
   }
 
   // -- Sorted Sets -----------------------------------------------------------
 
-  async zadd(key: string, score: number, member: string): Promise<boolean> {
+  async zadd(key: string, score: number, member: string, opts?: KVScopeOptions): Promise<boolean> {
     this.require();
-    return (await this.transport.fetchval<boolean>('SELECT KV_ZADD($1, $2, $3)', [key, score, member])) ?? false;
+    return (await this.transport.fetchval<boolean>('SELECT KV_ZADD($1, $2, $3)', [resolveKey(key, opts?.namespace, this.scopePrefix), score, member], { signal: opts?.signal })) ?? false;
   }
 
-  async zrange(key: string, start: number, stop: number): Promise<string[]> {
+  async zrange(key: string, start: number, stop: number, opts?: KVScopeOptions): Promise<string[]> {
     this.require();
-    const raw = await this.transport.fetchval<string>('SELECT KV_ZRANGE($1, $2, $3)', [key, start, stop]);
+    const raw = await this.transport.fetchval<string>('SELECT KV_ZRANGE($1, $2, $3)', [resolveKey(key, opts?.namespace, this.scopePrefix), start, stop], { signal: opts?.signal });
     if (!raw) return [];
     return (JSON.parse(raw) as Array<[string, number]>).map(([member]) => member);
   }
 
-  async zrangeByScore(key: string, min: number, max: number): Promise<string[]> {
+  async zrangeByScore(key: string, min: number, max: number, opts?: KVScopeOptions): Promise<string[]> {
     this.require();
-    const raw = await this.transport.fetchval<string>('SELECT KV_ZRANGEBYSCORE($1, $2, $3)', [key, min, max]);
+    const raw = await this.transport.fetchval<string>('SELECT KV_ZRANGEBYSCORE($1, $2, $3)', [resolveKey(key, opts?.namespace, this.scopePrefix), min, max], { signal: opts?.signal });
     if (!raw) return [];
     return (JSON.parse(raw) as Array<[string, number]>).map(([member]) => member);
   }
 
-  async zrem(key: string, member: string): Promise<boolean> {
+  async zrem(key: string, member: string, opts?: KVScopeOptions): Promise<boolean> {
     this.require();
-    return (await this.transport.fetchval<boolean>('SELECT KV_ZREM($1, $2)', [key, member])) ?? false;
+    return (await this.transport.fetchval<boolean>('SELECT KV_ZREM($1, $2)', [resolveKey(key, opts?.namespace, this.scopePrefix), member], { signal: opts?.signal })) ?? false;
   }
 
-  async zcard(key: string): Promise<number> {
+  async zcard(key: string, opts?: KVScopeOptions): Promise<number> {
     this.require();
-    return (await this.transport.fetchval<number>('SELECT KV_ZCARD($1)', [key])) ?? 0;
+    return (await this.transport.fetchval<number>('SELECT KV_ZCARD($1)', [resolveKey(key, opts?.namespace, this.scopePrefix)], { signal: opts?.signal })) ?? 0;
   }
 
   // -- HyperLogLog -----------------------------------------------------------
 
-  async pfadd(key: string, element: string): Promise<boolean> {
+  async pfadd(key: string, element: string, opts?: KVScopeOptions): Promise<boolean> {
     this.require();
-    return (await this.transport.fetchval<boolean>('SELECT KV_PFADD($1, $2)', [key, element])) ?? false;
+    return (await this.transport.fetchval<boolean>('SELECT KV_PFADD($1, $2)', [resolveKey(key, opts?.namespace, this.scopePrefix), element], { signal: opts?.signal })) ?? false;
   }
 
-  async pfcount(key: string): Promise<number> {
+  async pfcount(key: string, opts?: KVScopeOptions): Promise<number> {
     this.require();
-    return (await this.transport.fetchval<number>('SELECT KV_PFCOUNT($1)', [key])) ?? 0;
+    return (await this.transport.fetchval<number>('SELECT KV_PFCOUNT($1)', [resolveKey(key, opts?.namespace, this.scopePrefix)], { signal: opts?.signal })) ?? 0;
   }
 }
 

@@ -424,3 +424,13 @@
 
 .saveBtn:hover { opacity: 0.85; }
 .saveBtn:disabled { opacity: 0.5; }
+
+.collInput {
+  width: 110px;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--text-secondary, inherit);
+  background: var(--bg-primary, transparent);
+  border: 1px solid var(--border, #333);
+  border-radius: 4px;
+}

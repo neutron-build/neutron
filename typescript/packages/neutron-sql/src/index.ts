@@ -70,6 +70,7 @@ export {
   type TableIndex,
   type IndexKeyPartDef,
   type IndexMethod,
+  type IndexWithParams,
   type TableConstraint,
   type TablePrimaryKeyDef,
   type TableUniqueDef,
@@ -96,6 +97,7 @@ export {
   uuid,
   bytea,
   vector,
+  tsvector,
 } from "./schema.js";
 
 // The structural template. `sql` is the primary name (F04 collapsed the
@@ -214,6 +216,8 @@ export {
   collectExcludedRefs,
   isValueNode,
   isStatement,
+  withRequirements,
+  collectRequirements,
   lockingClause,
   assertLockingClauseValid,
   type IdentifierNode,

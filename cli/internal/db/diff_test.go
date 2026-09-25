@@ -261,7 +261,10 @@ func TestColumnDDLFK(t *testing.T) {
 	}
 }
 
-func TestDiffNucleusOnlyColumnSkipsWithComment(t *testing.T) {
+// X01: the v1 skip behavior is withdrawn — a vector column in a v1
+// document fails validation loudly (migrations fail rather than skipping a
+// column queries later depend on). This test pins the fail-closed contract.
+func TestDiffVectorColumnFailsClosedInV1(t *testing.T) {
 	desired := TableDef{
 		Name: "docs",
 		Columns: []ColumnDef{
@@ -271,28 +274,21 @@ func TestDiffNucleusOnlyColumnSkipsWithComment(t *testing.T) {
 	}
 	d := Schema{Version: 1, Tables: []TableDef{desired}}
 	a := Schema{Version: 1}
-	result, err := DiffSchema(d, a, DiffOptions{})
-	if err != nil {
-		t.Fatal(err)
+	_, err := DiffSchema(d, a, DiffOptions{})
+	if err == nil {
+		t.Fatal("v1 diff must reject vector columns (fail closed) — the skip behavior was removed in X01")
+	}
+	if !strings.Contains(err.Error(), "vector columns require schema document v2") {
+		t.Fatalf("expected the schema-document-v2 pointer, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "skipped column") {
+		t.Fatalf("expected the why (a skipped column is later queried but nonexistent), got: %v", err)
 	}
 
-	joined := strings.Join(result.Up, "\n")
-	if strings.Contains(joined, `"embedding"`) && !strings.Contains(joined, "NUCLEUS-ONLY") {
-		t.Fatalf("vector column leaked into DDL: %v", result.Up)
-	}
-	if !strings.Contains(joined, "NUCLEUS-ONLY (skipped on Postgres): docs.embedding vector(1536)") {
-		t.Fatalf("skip comment missing: %v", result.Up)
-	}
-	if !strings.Contains(joined, `create table "docs"`) || strings.Contains(strings.Split(joined, "\n")[0], "embedding") {
-		t.Fatalf("create table wrong: %v", result.Up)
-	}
-	warned := false
-	for _, w := range result.Warnings {
-		if strings.Contains(w, "Nucleus-only") {
-			warned = true
-		}
-	}
-	if !warned {
-		t.Fatalf("expected nucleus-only warning: %v", result.Warnings)
+	// Same verdict without the obsolete nucleusOnly flag.
+	desired.Columns[1].NucleusOnly = false
+	_, err = DiffSchema(Schema{Version: 1, Tables: []TableDef{desired}}, a, DiffOptions{})
+	if err == nil || !strings.Contains(err.Error(), "vector columns require schema document v2") {
+		t.Fatalf("vector without nucleusOnly must fail the same way, got: %v", err)
 	}
 }

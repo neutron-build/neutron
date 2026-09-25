@@ -1,6 +1,7 @@
 import { signal, computed } from '@preact/signals'
-import type { Connection, Schema, NucleusFeatures, Tab, PendingChange, CommitOperation, CommitResponse, PreviewResponse, OutcomeResponse } from './types'
+import type { Connection, Schema, NucleusFeatures, Tab, PendingChange, CommitOperation, CommitResponse, PreviewResponse, OutcomeResponse, KeyCell } from './types'
 import { api, ApiError } from './api'
+import { serializeDeepLink } from './router'
 
 // --- Connection state ---
 
@@ -8,6 +9,26 @@ export const connections = signal<Connection[]>([])
 export const activeConnection = signal<Connection | null>(null)
 export const connectionLoading = signal(false)
 export const connectionError = signal<string | null>(null)
+
+/** Connect a saved connection and refresh every connection-scoped signal
+ * (features, schema, active connection). Shared by the connection manager
+ * and the S05 deep-link router so both establish the same state. */
+export async function connectConnection(id: string): Promise<void> {
+  connectionLoading.value = true
+  connectionError.value = null
+  try {
+    const { features: f, schema: sc } = await api.connections.connect(id)
+    features.value = f
+    schema.value = sc
+    const conn = connections.value.find(c => c.id === id) ?? null
+    if (conn) activeConnection.value = { ...conn, isNucleus: f.isNucleus }
+  } catch (err: unknown) {
+    connectionError.value = err instanceof Error ? err.message : String(err)
+    throw err
+  } finally {
+    connectionLoading.value = false
+  }
+}
 
 // --- Nucleus feature detection ---
 
@@ -39,10 +60,12 @@ export function openTab(tab: Tab) {
     const existing = tabs.value.find(t =>
       t.kind === tab.kind &&
       t.objectSchema === tab.objectSchema &&
-      t.objectName === tab.objectName
+      t.objectName === tab.objectName &&
+      !t.initialSql
     )
     if (existing) {
       activeTabId.value = existing.id
+      updateLocationHash(existing)
       return
     }
   }
@@ -51,6 +74,19 @@ export function openTab(tab: Tab) {
   }
   tabs.value = [...tabs.value, tab]
   activeTabId.value = tab.id
+  updateLocationHash(tab)
+}
+
+/** Keep the URL pointing at the active browsable tab (S05 deep links). */
+function updateLocationHash(tab: Tab) {
+  if (typeof window === 'undefined' || typeof history === 'undefined') return
+  const conn = activeConnection.value
+  if (!conn) return
+  const link = serializeDeepLink(tab, conn.id)
+  if (link === null) return
+  if (window.location.hash !== link) {
+    history.replaceState(null, '', link)
+  }
 }
 
 export function closeTab(id: string) {
@@ -160,6 +196,41 @@ export function clearStaged(connectionId?: string) {
     : stagedEdits.value.filter(e => e.connectionId !== connectionId)
 }
 
+/** Staged edits scoped to one table on one connection (S03 grid overlay). */
+export function stagedForTable(connectionId: string, schema: string, table: string): StagedEdit[] {
+  return stagedEdits.value.filter(e =>
+    e.connectionId === connectionId &&
+    e.operation.schema === schema &&
+    e.operation.table === table)
+}
+
+/** Canonical string form of a full key tuple: stable across renders, used
+ *  to address a row's staged state and error-focus targets. Values are
+ *  wire cells (tagged cells serialize deterministically). */
+export function keyStringOf(key: KeyCell[]): string {
+  return JSON.stringify(key.map(k => [k.column, k.value]))
+}
+
+// --- Error focus (S03) ---
+//
+// A failed commit pins the first offending staged edit; the data grid
+// focuses that row so the user lands on the cause, not a generic error.
+
+export interface FailedEditFocus {
+  editId: string
+  /** Decoded error message, surfaced by the bar as well. */
+  reason: string
+}
+
+export const failedEditFocus = signal<FailedEditFocus | null>(null)
+
+/** Index of the first operation named by a server batch error
+ *  ("operations[N]: ..."), or 0 — the batch is refused as a unit. */
+export function firstOffendingOpIndex(message: string): number {
+  const m = /operations\[(\d+)\]/.exec(message)
+  return m ? Number(m[1]) : 0
+}
+
 export type CommitPhase = 'idle' | 'committing' | 'committed' | 'failed'
 
 export const commitPhase = signal<CommitPhase>('idle')
@@ -186,6 +257,7 @@ export async function commitStaged(connectionId: string): Promise<CommitResponse
   }
   commitPhase.value = 'committing'
   commitError.value = null
+  failedEditFocus.value = null
   try {
     const res = await api.commitOperations(payload)
     commitPhase.value = 'committed'
@@ -193,14 +265,16 @@ export async function commitStaged(connectionId: string): Promise<CommitResponse
     clearStaged(connectionId)
     return res
   } catch (err: unknown) {
-    return await resolveFailedCommit(connectionId, operationId, err)
+    return await resolveFailedCommit(connectionId, operationId, err, edits)
   }
 }
 
 /** A commit attempt failed: either the server refused it (nothing applied —
  *  the draft stays staged), or the response was lost mid-flight and the
- *  recorded outcome decides. Unknown outcomes never auto-retry. */
-async function resolveFailedCommit(connectionId: string, operationId: string, err: unknown): Promise<CommitResponse> {
+ *  recorded outcome decides. Unknown outcomes never auto-retry. The first
+ *  offending operation pins the error focus so the grid can land the user
+ *  on the cause. */
+async function resolveFailedCommit(connectionId: string, operationId: string, err: unknown, edits: StagedEdit[]): Promise<CommitResponse> {
   const dropped = err instanceof TypeError || (err instanceof ApiError && err.state === 'unknown')
   if (dropped) {
     let outcome: OutcomeResponse | null = null
@@ -224,6 +298,10 @@ async function resolveFailedCommit(connectionId: string, operationId: string, er
   }
   commitPhase.value = 'failed'
   commitError.value = err instanceof Error ? err.message : String(err)
+  const offender = edits[firstOffendingOpIndex(commitError.value)]
+  if (offender) {
+    failedEditFocus.value = { editId: offender.id, reason: commitError.value }
+  }
   throw err
 }
 
@@ -270,6 +348,34 @@ theme.subscribe(t => {
 
 export function toggleTheme() {
   theme.value = theme.value === 'dark' ? 'light' : 'dark'
+}
+
+// --- Schema refresh (S05) ---
+//
+// The schema signal previously updated only on connect. refreshSchema
+// re-fetches the live catalog and updates the signal, so the tree,
+// completion sources and every schema-derived view converge after DDL
+// (designer applies, SQL editor DDL, the tree's refresh button for changes
+// made elsewhere).
+
+export const schemaRefreshing = signal(false)
+export const schemaRefreshError = signal<string | null>(null)
+
+export async function refreshSchema(connectionId?: string): Promise<Schema | null> {
+  const id = connectionId ?? activeConnection.value?.id
+  if (!id) return null
+  schemaRefreshing.value = true
+  schemaRefreshError.value = null
+  try {
+    const sc = await api.schema(id)
+    schema.value = sc
+    return sc
+  } catch (err: unknown) {
+    schemaRefreshError.value = err instanceof Error ? err.message : String(err)
+    return null
+  } finally {
+    schemaRefreshing.value = false
+  }
 }
 
 // --- Command palette ---

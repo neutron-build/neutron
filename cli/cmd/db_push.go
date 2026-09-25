@@ -92,6 +92,9 @@ func runDBPush(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := verifyDocumentExtensionCapabilities(ctx, client, loaded); err != nil {
+		return err
+	}
 
 	for _, w := range result.Warnings {
 		ui.Warnf("%s", w)
@@ -123,6 +126,9 @@ func runDBPush(cmd *cobra.Command, args []string) error {
 func dbPushDryRun(ctx context.Context, client *db.Client, loaded loadedSchema, renames map[string]string, allowDestructive bool) error {
 	result, err := computeSchemaPlan(ctx, client, loaded, renames, allowDestructive)
 	if err != nil {
+		return err
+	}
+	if err := verifyDocumentExtensionCapabilities(ctx, client, loaded); err != nil {
 		return err
 	}
 	for _, w := range result.Warnings {

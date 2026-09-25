@@ -302,6 +302,91 @@ func guardProtectedObjects(ctx context.Context, client *db.Client, pendings []pe
 // migrations without the explicit --allow-destructive acknowledgement,
 // listing the classified statements (the M02/M03 gating propagated to the
 // apply path; the classification vocabulary is unchanged).
+// verifyExtensionCapabilities is the X01 fail-closed gate: a pending
+// migration whose plan requires the pgvector extension is refused BEFORE
+// any statement runs when the connected database does not have the
+// extension installed. A migration must fail rather than skip a queried
+// column; without this check the server error would only surface mid-plan
+// (still atomic, but late and vague).
+func verifyExtensionCapabilities(ctx context.Context, client *db.Client, pendings []pendingMigration) error {
+	need := false
+	for _, p := range pendings {
+		if p.Plan == nil {
+			continue
+		}
+		for _, c := range p.Plan.Capabilities {
+			if c == "pgvector" {
+				need = true
+			}
+		}
+	}
+	if !need {
+		return nil
+	}
+	st, err := client.Extension(ctx, "vector")
+	if err != nil {
+		return fmt.Errorf("verify pgvector extension precondition: %w", err)
+	}
+	if st.Installed {
+		return nil
+	}
+	var names []string
+	for _, p := range pendings {
+		if p.Plan == nil {
+			continue
+		}
+		for _, c := range p.Plan.Capabilities {
+			if c == "pgvector" {
+				names = append(names, p.File.Version+"_"+p.File.Name)
+			}
+		}
+	}
+	if st.Available {
+		return fmt.Errorf(
+			"migration(s) %s require the pgvector extension (vector columns/indexes) but it is not installed in this database — the server has pgvector %s available: run \"create extension vector\" (or add it as an explicit migration step) and re-run. Refusing to run any statement: vector objects are never skipped",
+			strings.Join(names, ", "), st.DefaultVersion)
+	}
+	return fmt.Errorf(
+		"migration(s) %s require the pgvector extension (vector columns/indexes) but this server does not carry it at all — install the pgvector extension package on the server, then \"create extension vector\". Refusing to run any statement: vector objects are never skipped",
+		strings.Join(names, ", "))
+}
+
+// verifyDocumentExtensionCapabilities is the db-push variant of the X01
+// extension gate: a pushed schema document carrying the pgvector capability
+// is refused before any statement runs when the extension is not installed.
+func verifyDocumentExtensionCapabilities(ctx context.Context, client *db.Client, loaded loadedSchema) error {
+	if loaded.V2 == nil {
+		return nil
+	}
+	m, err := db.ModelFromRoot(loaded.V2.Root)
+	if err != nil {
+		return err
+	}
+	hasPgvector := false
+	for _, c := range m.Capabilities {
+		if c == "pgvector" {
+			hasPgvector = true
+		}
+	}
+	if !hasPgvector {
+		return nil
+	}
+	st, err := client.Extension(ctx, "vector")
+	if err != nil {
+		return fmt.Errorf("verify pgvector extension precondition: %w", err)
+	}
+	if st.Installed {
+		return nil
+	}
+	if st.Available {
+		return fmt.Errorf(
+			"the schema document requires the pgvector extension (vector columns/indexes) but it is not installed in this database — the server has pgvector %s available: run \"create extension vector\" first. Refusing to push: vector objects are never skipped",
+			st.DefaultVersion)
+	}
+	return fmt.Errorf(
+		"the schema document requires the pgvector extension (vector columns/indexes) but this server does not carry it at all — install the pgvector extension package on the server, then \"create extension vector\". Refusing to push: vector objects are never skipped")
+}
+
 func requireDestructiveAcknowledgement(pendings []pendingMigration, acknowledged bool) error {
 	if acknowledged {
 		return nil
