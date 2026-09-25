@@ -732,11 +732,16 @@ export type DurabilityBehaviour =
   | 'unknown'
   | 'not-applicable'
 
-/** One fact behind a limit (probe id, conformance-leg verdict, or document). */
+/** A ModelLimits field an evidence item bears on. */
+export type LimitField = 'availability' | 'transaction' | 'durability' | 'atomicWithSql' | 'warnings'
+
+/** One fact behind a limit (probe id, conformance-leg verdict, or document)
+ *  and the fields it supports. */
 export interface LimitEvidence {
   source: string
   ref: string
   observed: string
+  supports: LimitField[]
 }
 
 /** What one data model on the connected engine actually guarantees

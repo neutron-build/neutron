@@ -79,7 +79,21 @@ describe('ModelLimits (X06)', () => {
     fireEvent.click(screen.getByText('Evidence'))
     const list = screen.getByLabelText('Evidence')
     expect(list.textContent).toContain('cdc.delivery_shape')
+    expect(list.textContent).toContain('supports availability, warnings')
     expect(list.textContent).toContain('nucleus/ tree 3313729ae513')
+    expect(list.textContent).toContain('matched by version string only')
+  })
+
+  it('never says crash for a restart whose kill signal was not recorded (X06 review 1)', () => {
+    limitsReport.value = nucleus
+    for (const model of ['sql', 'kv', 'blob']) {
+      cleanup()
+      const { container } = render(<ModelLimits model={model} />)
+      const text = container.textContent ?? ''
+      expect(text).toContain('survived engine kill + restart (measured)')
+      expect(text).not.toMatch(/crash/)
+      expect(text).toContain('SIGKILL is not claimed')
+    }
   })
 
   it('maps chip tones only from the reported status', () => {
