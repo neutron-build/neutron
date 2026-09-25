@@ -72,6 +72,15 @@ appear BETWEEN commit and revert (rows that started referencing the
 committed value after the commit): the revert aborts with nothing
 applied. A batch is reversible only when every operation is.
 
+Several operations on one row (two edited cells, the same cell twice, an
+edit then a delete) carry the version the table read returned. The first
+of them verifies it; later ones run against the version the batch itself
+produced, so the batch applies in order as one unit. A later operation
+carrying any other version is stale and conflicts the whole batch. The
+inverse undoes operations in reverse order (a twice-edited cell returns
+to its original value); a batch that both edits and deletes one row is
+irreversible.
+
 ## The data editor (S03)
 
 Table views edit by STAGING: a cell edit, a row delete or a typed insert
