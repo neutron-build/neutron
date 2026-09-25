@@ -463,6 +463,16 @@ back to the session zone only when no offset is present.
   (42703). This is the error `engine.capability.jsonb-functions` records: the
   capability probe fails here before it reaches `jsonb_agg`.
 
+- **X02-E1 — `GRAPH_SHORTEST_PATH` ignores a max-depth argument.** The
+  three-argument call is accepted and answers the unbounded path.
+  Reproducer: [`upstream/X02-E1-shortest-path-ignores-bound.sql`](upstream/X02-E1-shortest-path-ignores-bound.sql).
+- **X02-E2 — a rolled-back `CREATE TABLE` splits catalog from storage.**
+  After `ROLLBACK`, `pg_class` and `information_schema` still list the
+  table, reads fail with "not found in storage", and `CREATE TABLE` fails
+  with "already exists" until `DROP TABLE`. This refines N2 and is why
+  catalog probes and read probes disagree about whether DDL survived.
+  Reproducer: [`upstream/X02-E2-rolled-back-create-table-splits-catalog.sql`](upstream/X02-E2-rolled-back-create-table-splits-catalog.sql).
+
 Documented limitations, not defects: the numeric 96-bit/28-digit ceiling
 (`SQL_SEMANTICS.md`, reported at bind time), the RLS predicate allow-list
 and auth-boundary tenant identity (`RLS_SECURITY.md`), and partial indexes,
@@ -481,3 +491,27 @@ reached.
   PostgreSQL-only claims until N2 and N7 are fixed.
 - Consumers read `capabilities.nucleus.json`, not this prose, and must not
   advertise beyond it.
+
+## Documents and graph relationships
+
+[`x02-nucleus-leg.mjs`](x02-nucleus-leg.mjs) runs `@neutron-build/nucleus`'s
+document collections, bounded traversal and SQL-row-bound graph nodes
+against a freshly started engine and a PostgreSQL control, and exits
+non-zero if any verdict fails. On the revision above it records:
+
+- The probe-resolved capabilities `document-collections`,
+  `graph-adjacency` and `graph-property-match` are supported. Graph tenant
+  isolation, Cypher parameters, multi-label nodes, cross-session isolation
+  and atomic SQL+document/graph writes are unsupported, and the client
+  does not offer them.
+- Collections are separate scopes for get, update, delete, path, count and
+  query, including the default collection. They are names, not
+  permissions: with no password configured every login is the superuser.
+  Under a row-level-security principal the engine refuses every `DOC_*`
+  and `GRAPH_*` function.
+- `ROLLBACK` removes the SQL rows, graph nodes and documents written in the
+  transaction, and `COMMIT` publishes all three. Another session reads the
+  graph nodes and documents before `COMMIT`.
+- After `SIGKILL`, committed documents and graph nodes survive, and an open
+  transaction's graph nodes and documents are gone.
+

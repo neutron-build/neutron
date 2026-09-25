@@ -13,6 +13,7 @@ The measured result for Nucleus, with upstream defect reproducers, is
 | `capabilities.nucleus.json` | recorded Nucleus verdicts per probe and driver (canonical) |
 | `report.mjs` | regenerates the measured tables in `ORM_CONFORMANCE.md` from the JSON; `--check` fails when stale |
 | `reproducers.sql`, `upstream/` | plain-SQL engine reproducers, PostgreSQL as the oracle |
+| `x01-nucleus-leg.mjs`, `x02-nucleus-leg.mjs` | per-card legs that start an engine binary and record verdicts (`x02` exits non-zero on any failed verdict) |
 
 Rules:
 

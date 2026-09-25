@@ -19,7 +19,8 @@ name: ORM vs live engines
 # Path filters are deliberately narrower than sdk-live.yml: this workflow is
 # about the ORM's contract with the engine, so it runs when the engine, the
 # probe suite, the engine start script, the SQL package, the lockfile pinning
-# its drivers or the workflow itself changes — not when an unrelated
+# its drivers, the Nucleus client (the X02 leg below) or the workflow itself
+# changes — not when an unrelated
 # Postgres-only path changes. sdk-live.yml excludes conformance/live/orm/**,
 # so a probe-only change does not rerun every SDK. The Postgres live battery for
 # neutron-sql stays in typescript.yml and is untouched by this workflow.
@@ -32,6 +33,7 @@ on:
       - "conformance/live/orm/**"
       - "conformance/live/scripts/**"
       - "typescript/packages/neutron-sql/**"
+      - "typescript/packages/neutron-nucleus/**"
       - "typescript/pnpm-lock.yaml"
       - ".github/workflows/orm-live.yml"
   pull_request:
@@ -40,6 +42,7 @@ on:
       - "conformance/live/orm/**"
       - "conformance/live/scripts/**"
       - "typescript/packages/neutron-sql/**"
+      - "typescript/packages/neutron-nucleus/**"
       - "typescript/pnpm-lock.yaml"
       - ".github/workflows/orm-live.yml"
 
@@ -173,3 +176,64 @@ jobs:
       - name: Report
         if: always()
         run: tail -50 /tmp/nucleus-live/server.log || true
+
+  # X02: @neutron-build/nucleus document collections, bounded traversal and
+  # SQL-row-bound graph nodes against a Nucleus built from THIS commit, with
+  # a PostgreSQL control. The leg starts its own engine, records every
+  # verdict (capability gate, two-tenant isolation, traversal oracle,
+  # cross-model failures, transaction scope, restart, RLS) and exits
+  # non-zero on any failed verdict, so an engine change that alters a
+  # recorded behaviour fails here until it is reviewed.
+  x02:
+    name: Documents and graph vs live Nucleus (X02 leg)
+    needs: engine
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nucleus-bin-orm
+          path: nucleus/target/release
+      - run: chmod +x nucleus/target/release/nucleus
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: typescript/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: typescript/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: typescript
+
+      - name: Build @neutron-build/nucleus
+        run: pnpm --filter @neutron-build/nucleus build
+        working-directory: typescript
+
+      - name: Run the X02 leg
+        env:
+          NEUTRON_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: node conformance/live/orm/x02-nucleus-leg.mjs nucleus/target/release/nucleus --out /tmp/x02-leg.json
+
+      - name: Report
+        if: always()
+        run: cat /tmp/x02-leg.json || true
