@@ -295,8 +295,10 @@ unaffected (offset-less is its canonical form).
 connected engine, whether it is available, what its writes do inside a
 transaction (`atomic`, `partial`, `rollback-not-isolated`,
 `refused-in-transaction`, `not-transactional`, `unknown`), whether they
-survive a crash, whether they are atomic with SQL rows, the hazards to know,
-and the evidence behind each statement. Every tab that acts on a model (SQL
+survived a measured engine kill and restart (the note says whether the kill
+was a recorded SIGKILL; power loss was never measured), whether they are
+atomic with SQL rows, the hazards to know, and the evidence behind each
+statement with the fields it supports. Every tab that acts on a model (SQL
 browser and editor, schema designer, each model browser) shows that model's
 limits above it; the commit bar says "atomic" only when the SQL limits say
 `atomic`.
@@ -337,8 +339,9 @@ prose. `studio/src/lib/limits.fixture.json` is the registry's exact output
 | change events | unavailable | the table's latest CDC events |
 
 Every stage names the model whose limits apply and shows them. Everything is
-read-only: SQL runs in a `READ ONLY` transaction that is rolled back, and on
-Nucleus only these fixed reads run. Each stage links to the module that acts:
+read-only: SQL runs in a `READ ONLY` transaction that is rolled back, on a
+PostgreSQL connection that is closed afterwards, and on Nucleus only these
+fixed reads run. Each stage links to the module that acts:
 inspector, designer, SQL editor, row browser, the Graph browser opened on the
 bound-node query, the CDC browser filtered to the table, and the journey of
 each table on the other end of a foreign key. Open it from the tree (`⇢`),

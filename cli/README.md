@@ -108,19 +108,37 @@ neutron mcp --dump-schema markdown   # human-readable, paste into a system promp
 **Read-only by default.** On PostgreSQL every read tool runs inside a
 `READ ONLY` transaction that is rolled back, so a data-modifying CTE,
 `SELECT INTO`, `nextval()` or `EXPLAIN ANALYZE` of a write fails in the server.
-Nucleus does not apply `READ ONLY`, so there a lexical guard refuses
-data-modifying keywords, row locks, `EXPLAIN ANALYZE` and every function the
-engine classifies as mutating (`KV_SET`, `DOC_INSERT`, `GRAPH_ADD_NODE`, ...).
-Both engines refuse multiple statements and functions whose effects escape a
-rollback (`pg_advisory_lock`, `pg_terminate_backend`, `dblink_exec`, ...).
-`cypher_query` refuses clauses that change the graph.
+The connection is then closed rather than returned to the pool (after
+`pg_advisory_unlock_all()`), so a session advisory lock, dblink connection or
+setting cannot outlive a read. Built-in functions whose effects escape both
+the rollback and the session are refused by name (`pg_terminate_backend`,
+`pg_stat_reset*`, `pg_logical_emit_message`, replication slot and origin
+functions, `dblink*`, server file functions, ...).
+Nucleus does not apply `READ ONLY`, so there a lexical guard is the only
+enforcement: it refuses data-modifying keywords, row locks, `EXPLAIN ANALYZE`,
+every function the engine classifies as mutating (`KV_SET`, `DOC_INSERT`,
+`GRAPH_ADD_NODE`, `NEXTVAL`, ...) and `GRAPH_QUERY` unless its argument is one
+string literal of read-only Cypher. The guard reads names the way the servers
+do (every whitespace they accept, comments, quoted and `U&"..."` identifiers,
+any case) and refuses a name wherever it appears, not only before `(`.
+Both engines refuse multiple statements. `cypher_query` refuses clauses that
+change the graph.
+
+Limits of the name check: it cannot see through a user-defined function, view
+or operator that wraps one of the refused functions, and on Nucleus a mutating
+function the engine adds outside its own lists would pass. Connect the MCP
+server as a low-privilege role (most of those functions need superuser or an
+explicit grant); that, not the guard, is what bounds an agent.
 
 **Writes are an explicit tool.** `execute_sql` exists only when the server is
 started with `--allow-writes`; it runs one statement in its own transaction,
 commits it, and reports the touched models' actual limits. `query_sql` stays
 read-only either way. Over HTTP, `--allow-writes` also requires
 `NEUTRON_MCP_TOKEN`, and the HTTP transport binds `127.0.0.1` unless `--host`
-says otherwise.
+says otherwise. The HTTP transport answers only requests addressed to
+`localhost`, an IP address or the `--host` name, and only browser origins
+that are localhost or that same address (DNS-rebinding protection).
+`migration_status` reads only the `--migrations` directory.
 
 **Structured, redacted results.** Each result carries the engine, the access
 class, how read-only was enforced, the touched models' transaction and
