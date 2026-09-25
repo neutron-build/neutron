@@ -164,13 +164,56 @@ func (c *Client) BeginTx(ctx context.Context) (pgx.Tx, error) {
 	return c.pool.Begin(ctx)
 }
 
-// BeginReadOnly opens a READ ONLY transaction. Callers roll it back: it
-// exists to run inspection reads under the server's own write refusal
-// (PostgreSQL rejects writes with 25006). Engines that do not apply READ
-// ONLY (Nucleus: capability report txn.read_only_rejects_writes) need a
-// separate guard.
-func (c *Client) BeginReadOnly(ctx context.Context) (pgx.Tx, error) {
-	return c.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+// ReadOnlyTx runs fn inside a READ ONLY transaction on one dedicated
+// connection and always rolls back: inspection reads run under the
+// server's own write refusal (PostgreSQL rejects writes with 25006).
+// Engines that do not apply READ ONLY (Nucleus: capability report
+// txn.read_only_rejects_writes) need a separate guard.
+//
+// discardSession: a rolled-back transaction does not undo session-level
+// effects (a session advisory lock taken by the statement, a dblink
+// connection, session settings). With discardSession the connection never
+// returns to the pool: its advisory locks are released explicitly (so the
+// release is synchronous, not left to backend exit) and it is closed.
+func (c *Client) ReadOnlyTx(ctx context.Context, discardSession bool, fn func(pgx.Tx) error) error {
+	conn, err := c.pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		if discardSession {
+			closeConn(conn.Hijack())
+		} else {
+			conn.Release()
+		}
+		return err
+	}
+	fnErr := fn(tx)
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	rbErr := tx.Rollback(cleanup)
+	if !discardSession {
+		// The pool destroys a connection left mid-transaction or broken.
+		conn.Release()
+		if fnErr == nil && rbErr != nil {
+			return rbErr
+		}
+		return fnErr
+	}
+	raw := conn.Hijack()
+	_, _ = raw.Exec(cleanup, "SELECT pg_advisory_unlock_all()", pgx.QueryExecModeSimpleProtocol)
+	closeConn(raw)
+	if fnErr == nil && rbErr != nil {
+		return rbErr
+	}
+	return fnErr
+}
+
+func closeConn(conn *pgx.Conn) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn.Close(ctx) //nolint:errcheck
 }
 
 // Query executes a SQL query and returns rows.

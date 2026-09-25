@@ -438,7 +438,8 @@ func ExplainJSON(ctx context.Context, client *db.Client, stmt string) (json.RawM
 		return nil, err
 	}
 	var out json.RawMessage
-	err := ReadOnly(ctx, client, func(tx pgx.Tx) error {
+	// PostgreSQL only (callers check): the connection is discarded after.
+	err := ReadOnly(ctx, client, Engine{Product: "postgres"}, func(tx pgx.Tx) error {
 		var text string
 		if err := tx.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+stmt, pgx.QueryExecModeExec).Scan(&text); err != nil {
 			return err
@@ -450,13 +451,12 @@ func ExplainJSON(ctx context.Context, client *db.Client, stmt string) (json.RawM
 }
 
 // ReadOnly runs fn inside a READ ONLY transaction and always rolls back.
-func ReadOnly(ctx context.Context, client *db.Client, fn func(tx pgx.Tx) error) error {
-	tx, err := client.BeginReadOnly(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck
-	return fn(tx)
+// On every engine but Nucleus the connection is then discarded (advisory
+// locks released, session closed), so nothing a statement left on the
+// session outlives the read. Nucleus has no advisory locks or session reset
+// to rely on and its guard is lexical, so its connections are pooled.
+func ReadOnly(ctx context.Context, client *db.Client, engine Engine, fn func(tx pgx.Tx) error) error {
+	return client.ReadOnlyTx(ctx, engine.Product != "nucleus", fn)
 }
 
 // RowsData is the rows stage payload.
@@ -483,7 +483,7 @@ func journeyRows(ctx context.Context, client *db.Client, engine Engine, opts Jou
 		data.Note = "sample read; this engine does not apply READ ONLY, so only this fixed SELECT runs"
 	}
 	var ids []int64
-	err := ReadOnly(ctx, client, func(tx pgx.Tx) error {
+	err := ReadOnly(ctx, client, engine, func(tx pgx.Tx) error {
 		// Unnamed statement (no plan cache): the table's shape may have
 		// changed since this connection last read it.
 		rows, err := tx.Query(ctx, stmt, pgx.QueryExecModeExec)
@@ -641,7 +641,7 @@ func journeyModels(ctx context.Context, client *db.Client, engine Engine, opts J
 		Documents:  "collections bound to a table exist only in client code (boundTo creates nothing in the engine), so they cannot be discovered from the database",
 	}
 	var raw *string
-	err := ReadOnly(ctx, client, func(tx pgx.Tx) error {
+	err := ReadOnly(ctx, client, engine, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, "SELECT GRAPH_QUERY($1)", cypher).Scan(&raw)
 	})
 	if err != nil {
@@ -720,7 +720,7 @@ func journeyChangeEvents(ctx context.Context, client *db.Client, engine Engine, 
 	}
 	data := ChangeEventsData{Events: []ChangeEvent{}, Note: "latest events for this table within the last " + strconv.Itoa(cdcWindow) + " retained events; metadata only"}
 	var raw *string
-	err := ReadOnly(ctx, client, func(tx pgx.Tx) error {
+	err := ReadOnly(ctx, client, engine, func(tx pgx.Tx) error {
 		if err := tx.QueryRow(ctx, "SELECT CDC_COUNT()").Scan(&data.Retained); err != nil {
 			return err
 		}

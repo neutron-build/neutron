@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -86,7 +87,7 @@ func toolSpecs() []toolSpec {
 			"List the Nucleus data models and their sizes. Nucleus stores are global and unnamed (one store per model); this reports the counts the engine exposes (KV keys, documents, FTS docs, blobs, graph nodes, CDC events, pub/sub channels). Models without a count function are listed for reference. Read-only.",
 			schema(props{}, nil), handleListNucleusModels),
 		read("query_sql", "Query SQL (read-only)",
-			"Run ONE read-only SQL statement (SELECT, WITH, SHOW, EXPLAIN, VALUES, TABLE). On PostgreSQL it runs inside a READ ONLY transaction that is rolled back, so the server refuses any write. On Nucleus, which does not apply READ ONLY, a lexical guard refuses data-modifying keywords and every function the engine classifies as mutating. Values under secret-looking column names are redacted. Writes go through execute_sql, which exists only when the server was started with --allow-writes.",
+			"Run ONE read-only SQL statement (SELECT, WITH, SHOW, EXPLAIN, VALUES, TABLE). On PostgreSQL it runs inside a READ ONLY transaction that is rolled back, so the server refuses any write; afterwards the connection's advisory locks are released and the connection is closed, so no session state outlives the call. Built-in functions whose effects escape both (statistics resets, WAL messages, replication state, other backends, dblink, server files) are refused by name; a name check cannot see through a user-defined function, view or operator that wraps one, so connect this server as a low-privilege role. On Nucleus, which does not apply READ ONLY, a lexical guard is the only enforcement: it refuses data-modifying keywords, every function the engine classifies as mutating, and GRAPH_QUERY unless its argument is one string literal of read-only Cypher; the engine's own lists are not a complete read/write classification, so a mutating function it adds outside them would pass. Values under secret-looking column names are redacted. Writes go through execute_sql, which exists only when the server was started with --allow-writes.",
 			schema(props{
 				"sql":   strProp("The SQL statement to run"),
 				"limit": numProp("Maximum rows to return (default 100, max 1000)"),
@@ -174,8 +175,8 @@ func toolSpecs() []toolSpec {
 				"sample": numProp("Rows to sample (default 5, max 50)"),
 			}, []string{"table"}), handleInspectTable),
 		read("migration_status", "Migration status",
-			"Report applied and pending migrations: the _neutron_migrations history (read-only) joined with the migration files, each with its checksum status (verified, mismatch, unverified, pending, file-missing). PostgreSQL only.",
-			schema(props{"dir": strProp("Migrations directory (default: the server's --migrations directory)")}, nil), handleMigrationStatus),
+			"Report applied and pending migrations: the _neutron_migrations history (read-only) joined with the files in the server's --migrations directory (the only directory it reads), each with its checksum status (verified, mismatch, unverified, pending, file-missing). PostgreSQL only.",
+			schema(props{}, nil), handleMigrationStatus),
 		read("explain_sql", "Explain SQL (not executed)",
 			"Return PostgreSQL's EXPLAIN (FORMAT JSON) plan for one read-only statement. The statement is planned, never executed (no ANALYZE), inside a rolled-back READ ONLY transaction. PostgreSQL only.",
 			schema(props{"sql": strProp("The read-only statement to plan")}, []string{"sql"}), handleExplainSQL),
@@ -373,7 +374,7 @@ func parseJSONText(text string) any {
 func (e *toolEnv) readRows(ctx context.Context, limit int, sql string, args ...any) ([]any, bool, error) {
 	var out []any
 	truncated := false
-	err := inspect.ReadOnly(ctx, e.client, func(tx pgx.Tx) error {
+	err := inspect.ReadOnly(ctx, e.client, e.engine, func(tx pgx.Tx) error {
 		// Unnamed statements: arbitrary SQL must not hit a cached plan whose
 		// result shape changed after DDL elsewhere.
 		rows, err := tx.Query(ctx, sql, append([]any{pgx.QueryExecModeExec}, args...)...)
@@ -408,7 +409,7 @@ func (e *toolEnv) readRows(ctx context.Context, limit int, sql string, args ...a
 // readScalar runs a single-value read; SQL NULL is nil.
 func (e *toolEnv) readScalar(ctx context.Context, sql string, args ...any) (*string, error) {
 	var v *string
-	err := inspect.ReadOnly(ctx, e.client, func(tx pgx.Tx) error {
+	err := inspect.ReadOnly(ctx, e.client, e.engine, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, sql, args...).Scan(&v)
 	})
 	return v, err
@@ -487,7 +488,7 @@ func handleDescribeTable(ctx context.Context, env *toolEnv, args map[string]any)
 // Best-effort: empty on any error.
 func mcpPKColumns(ctx context.Context, env *toolEnv, table string) map[string]bool {
 	pk := map[string]bool{}
-	_ = inspect.ReadOnly(ctx, env.client, func(tx pgx.Tx) error {
+	_ = inspect.ReadOnly(ctx, env.client, env.engine, func(tx pgx.Tx) error {
 		var oid int32
 		if err := tx.QueryRow(ctx, `SELECT oid FROM pg_catalog.pg_class WHERE relname = $1`, table).Scan(&oid); err != nil {
 			return err
@@ -526,7 +527,7 @@ func handleListNucleusModels(ctx context.Context, env *toolEnv, _ map[string]any
 	}
 	scalarCount := func(sql string) *int64 {
 		var n int64
-		err := inspect.ReadOnly(ctx, env.client, func(tx pgx.Tx) error { return tx.QueryRow(ctx, sql).Scan(&n) })
+		err := inspect.ReadOnly(ctx, env.client, env.engine, func(tx pgx.Tx) error { return tx.QueryRow(ctx, sql).Scan(&n) })
 		if err != nil {
 			return nil
 		}
@@ -684,7 +685,7 @@ func handleDocFind(ctx context.Context, env *toolEnv, args map[string]any) (*too
 		Data any    `json:"data"`
 	}
 	docs := []any{}
-	err := inspect.ReadOnly(ctx, env.client, func(tx pgx.Tx) error {
+	err := inspect.ReadOnly(ctx, env.client, env.engine, func(tx pgx.Tx) error {
 		var ids string
 		if err := tx.QueryRow(ctx, "SELECT DOC_QUERY($1)", filter).Scan(&ids); err != nil {
 			return err
@@ -842,15 +843,22 @@ func handleInspectTable(ctx context.Context, env *toolEnv, args map[string]any) 
 }
 
 func handleMigrationStatus(ctx context.Context, env *toolEnv, args map[string]any) (*toolOutput, error) {
-	dir, _ := args["dir"].(string)
-	if dir == "" {
-		dir = env.migrationsDir
+	// The agent may not point the server at another directory: that would
+	// enumerate migration-named files anywhere the operator can read.
+	if dir, _ := args["dir"].(string); dir != "" && !sameDir(dir, env.migrationsDir) {
+		return nil, fmt.Errorf("migration_status reads only the server's --migrations directory (%s); restart the server with --migrations to inspect another", env.migrationsDir)
 	}
-	st := inspect.MigrationsStage(ctx, env.client, env.engine, dir, "", "")
+	st := inspect.MigrationsStage(ctx, env.client, env.engine, env.migrationsDir, "", "")
 	if st.Status == inspect.StageUnavailable {
 		return nil, errors.New(st.Reason)
 	}
 	return &toolOutput{Data: st.Data, Model: "sql"}, nil
+}
+
+func sameDir(a, b string) bool {
+	aa, err1 := filepath.Abs(a)
+	bb, err2 := filepath.Abs(b)
+	return err1 == nil && err2 == nil && aa == bb
 }
 
 func handleExplainSQL(ctx context.Context, env *toolEnv, args map[string]any) (*toolOutput, error) {
