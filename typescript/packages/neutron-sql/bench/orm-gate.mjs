@@ -31,7 +31,7 @@
 // Integrity failures (equality, statement counts, index use, stream release)
 // always fail. --gate additionally enforces the ceilings in bench/budgets.json
 // that are safe on shared CI runners: the same-run server-time ratio against
-// the hand-written statement and generous absolute p95 ceilings. --compare
+// the hand-written statement and generous absolute p50 ceilings. --compare
 // checks p50 against a same-machine baseline and fails on a regression above
 // the recorded tolerance — use it on the machine that produced the baseline,
 // never across machines.
@@ -780,10 +780,16 @@ async function runScale(scale) {
             }
           }
           const budgetKey = `${shape}/k=${cohort}/${indexed ? "indexed" : "unindexed"}`;
-          const ceiling = budgets.ciCeilings?.p95Ms?.[scale.name]?.[budgetKey];
+          // The absolute ceiling judges the median: at 30 samples the p95 is
+          // the second-slowest call, which one scheduler stall on a loaded
+          // runner decides (R01 measured p50 7.9 ms / p95 86 ms on a machine
+          // at load 9-26). A regression the ceiling exists for — N+1, a lost
+          // index, a cartesian product — moves the median by orders of
+          // magnitude. p95 is recorded and compared same-machine.
+          const ceiling = budgets.ciCeilings?.p50Ms?.[scale.name]?.[budgetKey];
           if (ceiling !== undefined) {
-            d.ceilingP95Ms = ceiling;
-            check(`${label} ${driver}: p95 ${d.neutron.p95} ms within the ${ceiling} ms ceiling`, () => assert.ok(d.neutron.p95 <= ceiling), "budget");
+            d.ceilingP50Ms = ceiling;
+            check(`${label} ${driver}: p50 ${d.neutron.p50} ms within the ${ceiling} ms ceiling`, () => assert.ok(d.neutron.p50 <= ceiling), "budget");
           }
           process.stderr.write(
             `  ${label} ${driver}: neutron p50 ${d.neutron.p50} p95 ${d.neutron.p95} ms | drizzle p50 ${d.drizzle.p50} ms | server ${scenario.plan.executionMs.p50} ms (hand ${scenario.plan.handExecutionMs.p50} ms)\n`,
