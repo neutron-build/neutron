@@ -257,3 +257,53 @@
 .copyBtn:hover {
   color: var(--accent, #4af);
 }
+
+/* --- S06: virtualized rows + keyboard grid --- */
+
+/* Fixed row height: the virtualizer's window math relies on it. */
+.tr {
+  height: 28px;
+}
+
+.spacer,
+.spacer > td {
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+
+.td:focus {
+  outline: none;
+}
+
+.tdActive:focus,
+.tdActive:focus-within {
+  outline: 2px solid var(--accent, #4da3ff);
+  outline-offset: -2px;
+}
+
+.tdEditing {
+  overflow: visible;
+}
+
+.sortBtn {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  letter-spacing: inherit;
+  cursor: pointer;
+}
+
+.sortBtn:focus-visible {
+  outline: 2px solid var(--accent, #4da3ff);
+  outline-offset: 1px;
+}
+
+.truncatedNote {
+  padding: 4px 8px;
+  font-size: var(--text-xs);
+  color: var(--warning, #f0c674);
+  border-top: 1px solid var(--border, #333344);
+}

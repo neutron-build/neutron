@@ -472,8 +472,13 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	if exec.dispatch() {
 		rows, err := exec.conn.Query(exec.ctx, body.SQL, args...)
 		if err == nil {
-			result, qerr = collectTaggedRows(rows)
+			result, qerr = collectTaggedRowsCapped(rows, maxEditorResultRows)
 			rows.Close()
+			if qerr == nil && result != nil && result.truncated {
+				// Rows past the cap were drained and discarded by Close; a
+				// statement that failed after the cap still reports its error.
+				qerr = rows.Err()
+			}
 		} else {
 			qerr = err
 		}
@@ -523,6 +528,10 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		"rowCount":  len(data),
 		"duration":  duration,
 		"requestId": requestID,
+	}
+	if result.truncated {
+		resp["truncated"] = true
+		resp["rowLimit"] = maxEditorResultRows
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

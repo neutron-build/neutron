@@ -107,6 +107,57 @@ to commit another connection's edits, and the server independently
 re-refuses any operation whose relation binding was not read through the
 request's connection.
 
+## Large results, import/export and keyboard access (S06)
+
+The result grids virtualize: only the rows in the scroll viewport plus a
+fixed overscan exist in the DOM, whatever the result size, with spacer
+rows keeping the scroll height exact. Bounded reads are the contract, not
+a courtesy: one table page is at most 1,000 rows (larger limits are
+refused with 400, never silently clamped — page with offset or export
+instead), and the SQL editor retains at most 10,000 rows of a result,
+marking it `truncated` with the limit named in the grid. Offset paging is
+deterministic: the primary key is the unique tail of every table read, so
+unchanged-data pages neither repeat nor skip rows.
+
+The grid is a WAI-ARIA `grid` usable without a mouse: one roving tab stop
+moves with the active cell, arrows/PageUp/PageDown/Home/End navigate,
+Enter/F2 open the typed editor (Enter follows a read-only FK link, Delete
+stages a row delete), and focus returns to the cell after commit/cancel.
+Column headers are named sort buttons carrying `aria-sort`; a truncated
+result announces itself through a live region.
+
+**Export** is streamed server-side: `POST /api/table/v2/export` validates
+the table, format (CSV/JSON/NDJSON) and the same filter/sort/match
+grammar, and returns a single-use ticket; `GET .../download` redeems it
+once (browser-marked cross-site requests refused) and streams rows through
+a fixed buffer — memory does not scale with the table, an abandoned
+download cancels the statement and returns the connection, and an error
+mid-stream aborts the response so the browser reports a failed download
+instead of keeping a truncated file that looks complete. Cell text is
+PostgreSQL's own `::text` under pinned output settings (ISO dates, hex
+bytea), so int8/numeric digits and microsecond timestamptz never cross a
+double or a locale formatter. CSV follows COPY conventions (NULL is an
+unquoted empty field, `""` is the empty string); JSON/NDJSON carry exact
+number literals (NaN/Infinity as strings). The SQL editor's bounded result
+exports in-memory with the same conventions. The older model-module
+exports (KV/documents/FTS/pub-sub lists) are unchanged.
+
+**Import** (CSV, JSON array or NDJSON) reads the file in streamed chunks,
+shows a mapping table and live preview (NULL vs empty string vs DEFAULT
+visible per cell), and sends batches of at most 100 rows / 900 KiB: each
+batch is ONE transaction through the S02 commit machinery — all rows or
+none — with the whole-import atomicity stated explicitly in the dialog.
+Digits stay exact end-to-end (int8 validated against its 64-bit range,
+numeric/bytea/temporal re-tagged on the wire; JSON numbers keep their
+literal text, never `JSON.parse`d into doubles). A per-batch operation ID
+plus a persisted journal make interruptions recoverable without duplicate
+rows: after a drop, restart or failure the in-flight batch is resolved
+through the server's recorded outcome first, and an honestly-unknown
+outcome is a decision (check the table, then mark committed or retry),
+never a guess. A failing batch names its source row; skip-row/skip-batch/
+retry are recorded in the journal, and resuming re-reads the same file
+(checked by name, size and mtime).
+
 ## Development
 
 `npm run dev` serves the SPA on port 5173 and proxies `/api` to the Go

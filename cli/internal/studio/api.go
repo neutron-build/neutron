@@ -267,12 +267,27 @@ func nucleusModels(isNucleus bool) []string {
 type taggedResult struct {
 	columns []string
 	data    [][]any
+	// truncated: more rows existed than the collector's cap retained.
+	truncated bool
 }
 
 // collectTaggedRows drains a pgx result, converting every cell of a tagged
 // type (int8/numeric/bytea/temporal) to its {t, v} wire form so precision
 // survives JSON. Execution errors surface after iteration (pgx behavior).
 func collectTaggedRows(rows pgx.Rows) (*taggedResult, error) {
+	return collectTaggedRowsCapped(rows, 0)
+}
+
+// maxEditorResultRows bounds one SQL editor result held in memory (S06):
+// the rows beyond it are not decoded or retained, and the response says
+// the result was truncated. Whole-table reads are streamed exports.
+const maxEditorResultRows = 10000
+
+// collectTaggedRowsCapped is collectTaggedRows keeping at most max rows
+// (max <= 0: unbounded). On reaching the cap it stops iterating and marks
+// the result truncated; the caller's rows.Close() drains the remainder
+// without decoding or retaining it.
+func collectTaggedRowsCapped(rows pgx.Rows, max int) (*taggedResult, error) {
 	fds := rows.FieldDescriptions()
 	cols := make([]string, len(fds))
 	for i, fd := range fds {
@@ -280,6 +295,9 @@ func collectTaggedRows(rows pgx.Rows) (*taggedResult, error) {
 	}
 	var data [][]any
 	for rows.Next() {
+		if max > 0 && len(data) >= max {
+			return &taggedResult{columns: cols, data: data, truncated: true}, nil
+		}
 		// A row that cannot be decoded fails the read loudly; silently
 		// skipping it would show a table with rows missing.
 		vals, err := rows.Values()
@@ -297,7 +315,6 @@ func collectTaggedRows(rows pgx.Rows) (*taggedResult, error) {
 	}
 	return &taggedResult{columns: cols, data: data}, nil
 }
-
 
 // --- /api/schema ---
 
@@ -400,6 +417,9 @@ type tableSort struct {
 const (
 	maxTableFilters = 8
 	maxTableSorts   = 4
+	// maxTableReadLimit bounds one table page (S06). The SPA's virtualized
+	// grid pages at most this many rows; larger reads are streamed exports.
+	maxTableReadLimit = 1000
 )
 
 // parseTableFilters decodes the filters parameter strictly: unknown fields,
@@ -499,6 +519,14 @@ func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "connectionId, schema, and table are required")
 		return
 	}
+	if limit > maxTableReadLimit {
+		// Bounded pagination (S06): a page is at most maxTableReadLimit rows.
+		// Refused rather than clamped, so a caller never mistakes a shorter
+		// page for the end of the data. Whole-table reads are exports.
+		writeError(w, http.StatusBadRequest, fmt.Sprintf(
+			"limit must be at most %d rows per page; page with offset or use the streamed export for whole tables", maxTableReadLimit))
+		return
+	}
 	client, ok := s.clientFor(connID)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "not connected")
@@ -588,6 +616,23 @@ func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		orderParts = append(orderParts, sParts...)
+	}
+	// Deterministic paging (S06): the primary key is the unique tail of
+	// every table read, so OFFSET pages neither repeat nor skip rows of an
+	// unchanged table (ties under the user's sort keys resolve by key).
+	if identityOK {
+		sortedCols := map[string]bool{}
+		if sortColumn != "" {
+			sortedCols[sortColumn] = true
+		}
+		if raw := q.Get("sorts"); raw != "" {
+			var keys []tableSort
+			_ = json.Unmarshal([]byte(raw), &keys) // validated above
+			for _, k := range keys {
+				sortedCols[k.Column] = true
+			}
+		}
+		orderParts = append(orderParts, keyTiebreakers(meta, tableName, sortedCols)...)
 	}
 	order := ""
 	if len(orderParts) > 0 {

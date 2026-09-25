@@ -5,6 +5,7 @@ import type {
   TableMeta, MutationOutcome, KeyCell, MatchCell, TableFilter, TableSort,
   CommitResponse, PreviewResponse, OutcomeResponse, CommitOperation,
   CancelQueryResponse, ExplainOutcome, ExplainPlan, ExplainRefusal,
+  ExportFormat, ExportTicket, ImportBatchRequest, ImportBatchResponse, ImportOutcomeResponse,
 } from './types'
 import { decodeRows } from './wire'
 
@@ -330,6 +331,26 @@ export const api = {
     operationId: string
     revertOperationId: string
   }) => mutationRequest<CommitResponse>('POST', '/table/v2/revert', input),
+
+  // --- S06: streamed export and batched import ---
+
+  /** Validate an export (session-guarded) and receive a single-use ticket;
+   *  the browser then downloads `url` natively (streamed to disk). */
+  tableExport: (input: {
+    connectionId: string; schema: string; table: string
+    format: ExportFormat
+    filters?: TableFilter[]
+    sorts?: TableSort[]
+    match?: MatchCell[]
+  }) => mutationRequest<ExportTicket>('POST', '/table/v2/export', input),
+
+  /** Insert one import batch atomically (all rows or none). */
+  importBatch: (input: ImportBatchRequest) =>
+    mutationRequest<ImportBatchResponse>('POST', '/table/v2/import/batch', input),
+
+  /** Resolve an import batch ID after a dropped response. */
+  importOutcome: (connectionId: string, operationId: string) =>
+    mutationRequest<ImportOutcomeResponse>('POST', '/table/v2/import/outcome', { connectionId, operationId }),
 
   // --- Interim v1 row endpoints (guarded, kept during the transition) ---
 

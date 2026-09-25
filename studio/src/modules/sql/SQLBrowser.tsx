@@ -14,6 +14,8 @@ import type {
   CellEdit, TableFilter, TableSort, TableMetaColumn, CommitOperation,
 } from '../../lib/types'
 import { TableSearchPanel } from './TableSearchPanel'
+import { ImportDialog } from './ImportDialog'
+import type { ExportFormat } from '../../lib/types'
 import s from './SQLBrowser.module.css'
 
 interface SQLBrowserProps {
@@ -23,6 +25,21 @@ interface SQLBrowserProps {
   initialFilter?: { column: string; op: string; value: string }
   /** Pre-applied full-tuple equality filter (FK follow, incl. composite FKs). */
   initialMatch?: MatchCell[]
+}
+
+/** Page sizes (S06): bounded by the server's 1000-row page limit; the grid
+ *  virtualizes whatever it holds. */
+const PAGE_SIZES = [100, 200, 500, 1000]
+
+/** Start a native browser download of a same-origin URL (streamed to disk). */
+function startDownload(url: string) {
+  const a = document.createElement('a')
+  a.href = url
+  a.rel = 'noopener'
+  a.style.display = 'none'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
 }
 
 const FILTER_OPS: Array<{ value: string; label: string }> = [
@@ -61,6 +78,10 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
   const meta = useSignal<TableMeta | null>(null)
   const showInsert = useSignal(false)
   const insertEdits = useSignal<Record<string, CellEdit>>({})
+  const exportFormat = useSignal<ExportFormat>('csv')
+  const exporting = useSignal(false)
+  const showImport = useSignal(false)
+  const importBtnRef = useRef<HTMLButtonElement | null>(null)
   const [focusCell, setFocusCell] = useState<{ rowIndex: number; column?: string } | null>(null)
 
   // The editing binding: this view's rows were loaded under exactly this
@@ -352,6 +373,43 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
     insertEdits.value = {}
   }
 
+  function setPageSize(n: number) {
+    limit.value = n
+    offset.value = 0
+    load()
+  }
+
+  /** Streamed export (S06): the server validates and issues a single-use
+   *  ticket; the browser downloads the rows straight to disk. The export
+   *  covers every row matching the applied filters, in the current sort. */
+  async function exportTable() {
+    exporting.value = true
+    try {
+      const active = appliedFilters.value.filter(f => f.column !== '')
+      const ticket = await api.tableExport({
+        connectionId: conn.id, schema: schemaName, table,
+        format: exportFormat.value,
+        filters: active.length > 0 ? active : undefined,
+        sorts: sorts.value.length > 0 ? sorts.value : undefined,
+        match: initialMatch && initialMatch.length > 0 ? initialMatch : undefined,
+      })
+      startDownload(ticket.url)
+      toast('info', `Exporting ${schemaName}.${table} as ${ticket.filename}`)
+    } catch (err: unknown) {
+      toast('error', `Export failed: ${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      exporting.value = false
+    }
+  }
+
+  function closeImport() {
+    showImport.value = false
+    importBtnRef.current?.focus()
+  }
+
+  const canImport = useComputed(() =>
+    editable.value === true && (meta.value?.columns ?? []).some(c => c.insertable === true))
+
   function handlePrev() {
     if (offset.value === 0) return
     offset.value = Math.max(0, offset.value - limit.value)
@@ -471,7 +529,37 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
               + Insert
             </button>
           )}
-          <button class={s.btnRefresh} onClick={load} disabled={loading.value} title="Refresh">
+          <span class={s.exportGroup}>
+            <select
+              class={s.filterSelect}
+              aria-label="Export format"
+              value={exportFormat.value}
+              onChange={e => { exportFormat.value = (e.target as HTMLSelectElement).value as ExportFormat }}
+            >
+              <option value="csv">CSV</option>
+              <option value="json">JSON</option>
+              <option value="ndjson">NDJSON</option>
+            </select>
+            <button
+              class={s.btnAction}
+              onClick={exportTable}
+              disabled={exporting.value}
+              title="Download every row matching the applied filters, in the current sort (streamed; not limited to this page)"
+            >
+              Export
+            </button>
+          </span>
+          {canImport.value && (
+            <button
+              ref={importBtnRef}
+              class={s.btnAction}
+              onClick={() => { if (guardBinding()) showImport.value = true }}
+              title="Import rows from a CSV or JSON file (batched; each batch is one transaction)"
+            >
+              Import…
+            </button>
+          )}
+          <button class={s.btnRefresh} onClick={load} disabled={loading.value} title="Refresh" aria-label="Refresh rows">
             ↺
           </button>
         </div>
@@ -563,7 +651,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
       )}
       <div class={s.grid}>
         {loading.value && <div class={s.loading}>Loading…</div>}
-        {!loading.value && error.value && <div class={s.error}>{error.value}</div>}
+        {!loading.value && error.value && <div class={s.error} role="alert">{error.value}</div>}
         {!loading.value && readOnlyReason.value && (
           <div class={s.readOnlyNote} role="note">{readOnlyReason.value}</div>
         )}
@@ -580,6 +668,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
             sorts={sorts.value}
             onSort={handleSort}
             focusCell={focusCell}
+            label={`${schemaName}.${table} rows`}
           />
         )}
       </div>
@@ -601,7 +690,28 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
         >
           Next →
         </button>
+        <label class={s.pageSize}>
+          rows per page
+          <select
+            class={s.filterSelect}
+            value={String(limit.value)}
+            onChange={e => setPageSize(Number((e.target as HTMLSelectElement).value))}
+          >
+            {PAGE_SIZES.map(n => <option key={n} value={String(n)}>{n}</option>)}
+          </select>
+        </label>
       </div>
+
+      {showImport.value && meta.value && (
+        <ImportDialog
+          connectionId={conn.id}
+          schema={schemaName}
+          table={table}
+          meta={meta.value}
+          onClose={closeImport}
+          onImported={load}
+        />
+      )}
     </div>
   )
 }

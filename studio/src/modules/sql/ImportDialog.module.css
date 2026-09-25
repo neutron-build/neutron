@@ -1,0 +1,247 @@
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 5vh var(--space-4, 16px);
+  z-index: 50;
+  overflow: auto;
+}
+
+.dialog {
+  background: var(--bg-panel, #1b1b24);
+  color: var(--text-primary, #e0e0e0);
+  border: 1px solid var(--border, #333344);
+  border-radius: var(--radius-md, 6px);
+  width: min(960px, 100%);
+  padding: var(--space-3, 12px) var(--space-4, 16px);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3, 12px);
+  font-size: var(--text-sm, 13px);
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.title {
+  margin: 0;
+  font-size: var(--text-md, 15px);
+  font-weight: 600;
+}
+
+.close {
+  background: none;
+  border: 1px solid transparent;
+  color: var(--text-secondary, #aaa);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
+.close:focus-visible,
+.btn:focus-visible,
+.btnPrimary:focus-visible {
+  outline: 2px solid var(--accent, #4da3ff);
+  outline-offset: 1px;
+}
+
+.row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.label {
+  font-weight: 600;
+}
+
+.options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2, 8px) var(--space-4, 16px);
+  border: 1px solid var(--border, #333344);
+  border-radius: var(--radius-sm, 4px);
+  padding: var(--space-2, 8px);
+}
+
+.inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.marker {
+  width: 6em;
+}
+
+.mapTable,
+.previewTable {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: var(--text-xs, 12px);
+}
+
+.mapTable th,
+.mapTable td,
+.previewTable th,
+.previewTable td {
+  border-bottom: 1px solid var(--border-subtle, #2a2a36);
+  padding: 3px 6px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.caption {
+  text-align: left;
+  font-weight: 600;
+  padding-bottom: 4px;
+}
+
+.colName {
+  font-family: var(--font-mono, monospace);
+}
+
+.colType {
+  color: var(--text-tertiary, #888);
+  font-family: var(--font-mono, monospace);
+}
+
+.required {
+  color: var(--warning, #f0c674);
+  margin-right: 2px;
+}
+
+.previewWrap {
+  overflow: auto;
+  max-height: 240px;
+}
+
+.previewTable td {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--font-mono, monospace);
+}
+
+.cellMarker {
+  color: var(--text-tertiary, #888);
+  font-style: italic;
+}
+
+.cellError {
+  color: var(--danger, #ff6b6b);
+}
+
+.problems {
+  margin: 0;
+  padding-left: 1.2em;
+  color: var(--danger, #ff6b6b);
+}
+
+.batching {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.atomicity {
+  margin: 0;
+  color: var(--text-secondary, #aaa);
+}
+
+.scan {
+  color: var(--text-secondary, #aaa);
+}
+
+.ok {
+  color: var(--success, #7bd88f);
+}
+
+.error {
+  color: var(--danger, #ff6b6b);
+  white-space: pre-wrap;
+}
+
+.progress {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.bar {
+  height: 6px;
+  background: var(--bg-hover, #2a2a36);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.barFill {
+  height: 100%;
+  background: var(--accent, #4da3ff);
+  transition: width 0.2s;
+}
+
+.status {
+  min-height: 1.2em;
+  color: var(--text-secondary, #aaa);
+}
+
+.resume,
+.decision {
+  border: 1px solid var(--warning, #f0c674);
+  border-radius: var(--radius-sm, 4px);
+  padding: var(--space-2, 8px);
+}
+
+.resume p,
+.decision p {
+  margin: 0 0 6px;
+}
+
+.decisionError {
+  color: var(--danger, #ff6b6b);
+  font-family: var(--font-mono, monospace);
+  font-size: var(--text-xs, 12px);
+}
+
+.actions,
+.footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2, 8px);
+}
+
+.footer {
+  justify-content: flex-end;
+}
+
+.btn,
+.btnPrimary {
+  padding: 4px 10px;
+  border: 1px solid var(--border, #333344);
+  border-radius: var(--radius-sm, 4px);
+  background: none;
+  color: var(--text-primary, #e0e0e0);
+  cursor: pointer;
+  font: inherit;
+}
+
+.btnPrimary {
+  background: var(--accent, #4da3ff);
+  border-color: var(--accent, #4da3ff);
+  color: #fff;
+}
+
+.btn:disabled,
+.btnPrimary:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
