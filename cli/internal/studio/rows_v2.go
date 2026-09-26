@@ -214,12 +214,17 @@ type readOnlyState struct {
 	versioned bool
 }
 
+const foreignDescendantReason = "has a foreign table among its inheritance children — their rows carry no local row version, so stale writes cannot be detected and the table is read-only"
+
 func tableReadOnlyState(meta *tableMeta, versioned bool) readOnlyState {
 	if !meta.Exists {
 		return readOnlyState{readOnly: true, reason: "was not found or is not an ordinary table"}
 	}
 	if len(meta.PKCols) == 0 {
 		return readOnlyState{readOnly: true, reason: "has no primary key — rows cannot be identified, so the table is read-only", versioned: versioned}
+	}
+	if meta.ForeignDescendant {
+		return readOnlyState{readOnly: true, reason: foreignDescendantReason, versioned: versioned}
 	}
 	for _, pk := range meta.PKCols {
 		col := meta.Columns[pk]

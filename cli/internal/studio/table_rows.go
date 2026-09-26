@@ -210,6 +210,10 @@ type tableMeta struct {
 	Columns   map[string]tableColumnMeta
 	Order     []tableColumnMeta // attnum order (map iteration is random)
 	CanDelete bool              // has_table_privilege(..., 'DELETE')
+	// ForeignDescendant: an inheritance descendant is a foreign table. Its
+	// rows carry no local xmin (always 0) and a remote ctid, so neither the
+	// version check nor the tuple binding can guard a write to them.
+	ForeignDescendant bool
 }
 
 // tableMetaSQL reads the table's columns, primary-key membership and key
@@ -236,7 +240,15 @@ SELECT a.attname,
        pg_catalog.has_column_privilege(c.oid, a.attnum, 'UPDATE'),
        pg_catalog.has_column_privilege(c.oid, a.attnum, 'INSERT'),
        pg_catalog.has_table_privilege(c.oid, 'DELETE'),
-       a.attnum
+       a.attnum,
+       EXISTS (
+	       WITH RECURSIVE d(oid) AS (
+		       SELECT inhrelid FROM pg_catalog.pg_inherits WHERE inhparent = c.oid
+		       UNION
+		       SELECT i.inhrelid FROM pg_catalog.pg_inherits i JOIN d ON i.inhparent = d.oid
+	       )
+	       SELECT 1 FROM d JOIN pg_catalog.pg_class k ON k.oid = d.oid WHERE k.relkind = 'f'
+       )
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
@@ -262,7 +274,7 @@ func fetchTableMeta(ctx context.Context, client *db.Client, schemaName, tableNam
 		var keyPos int32
 		if err := rows.Scan(&col.Name, &keyPos, &col.Identity, &col.Generated, &col.DefaultExpr,
 			&col.TypeOID, &col.TypeName, &col.TypType, &col.NotNull,
-			&meta.RelOID, &col.CanUpdate, &col.CanInsert, &meta.CanDelete, &col.Attnum); err != nil {
+			&meta.RelOID, &col.CanUpdate, &col.CanInsert, &meta.CanDelete, &col.Attnum, &meta.ForeignDescendant); err != nil {
 			return nil, err
 		}
 		col.KeyPos = int(keyPos)
@@ -294,6 +306,9 @@ func requireSingleColumnKey(meta *tableMeta, schemaName, tableName, claimedPK st
 	}
 	if len(meta.PKCols) == 0 {
 		return "", fmt.Sprintf("table %s.%s has no primary key; rows are read-only until full row identities land", schemaName, tableName)
+	}
+	if meta.ForeignDescendant {
+		return "", fmt.Sprintf("table %s.%s %s; mutations are rejected", schemaName, tableName, foreignDescendantReason)
 	}
 	if len(meta.PKCols) > 1 {
 		return "", fmt.Sprintf("table %s.%s has a composite primary key (%s); row edits need the full key tuple and are read-only in this interim version",
