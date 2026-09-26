@@ -1,0 +1,206 @@
+name: ORM installed artifacts
+
+# R02 / VERIFICATION V17: the ORM as a user installs it, not as the monorepo
+# builds it. Three gates, each on artifacts the previous jobs produced:
+#
+#   sql-installed  pnpm-packs @neutron-build/sql (the publish path), checks
+#                  the tarball, and installs it into clean pg-only and
+#                  postgres.js-only projects outside the checkout: exports,
+#                  declarations (TypeScript 5.7.2 and 5.9.3), every README
+#                  example compiled, no optional-peer leakage, a live round
+#                  trip per driver — on both Node lines the package claims.
+#   studio-embed   builds Studio on each OS, embeds that exact build (its
+#                  studio-manifest.json) in the CLI, packages the CLI through
+#                  cli/scripts/package.sh (the release script; Windows is not
+#                  a published target and is built plainly), and opens the
+#                  binary's served UI in Chrome. A stale embed fails the Go
+#                  tests and the gate.
+#   onboarding     the packed tarball + the packaged Linux CLI in fresh
+#                  projects, driven by the README and the CLI reference:
+#                  schema -> export -> generate -> apply -> query -> Studio
+#                  edit -> inspect, and a legacy-history upgrade.
+#
+# Nothing is published: artifacts live for one day inside this run.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "typescript/packages/neutron-sql/**"
+      - "cli/**"
+      - "studio/**"
+      - "typescript/apps/site/src/content/docs/cli/commands.mdx"
+      - ".github/workflows/orm-artifacts.yml"
+  pull_request:
+    paths:
+      - "typescript/packages/neutron-sql/**"
+      - "cli/**"
+      - "studio/**"
+      - "typescript/apps/site/src/content/docs/cli/commands.mdx"
+      - ".github/workflows/orm-artifacts.yml"
+
+jobs:
+  sql-installed:
+    name: neutron-sql installed artifact (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      NEUTRON_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      NEUTRON_LIVE_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: typescript/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+          cache-dependency-path: typescript/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        working-directory: typescript
+      - name: Pack, install and check (pg only, postgres.js only)
+        run: node scripts/installed-gate.mjs --keep-tarball "$RUNNER_TEMP/pack" --out installed-gate.local.json
+        working-directory: typescript/packages/neutron-sql
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: neutron-sql-installed-node${{ matrix.node }}-${{ github.run_id }}
+          path: typescript/packages/neutron-sql/installed-gate.local.json
+          if-no-files-found: warn
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: matrix.node == 22
+        with:
+          name: neutron-sql-tarball
+          path: ${{ runner.temp }}/pack/*.tgz
+          if-no-files-found: error
+          retention-days: 1
+
+  studio-embed:
+    name: Studio embed and CLI archive (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build Studio (writes dist/studio-manifest.json)
+        run: npm ci && npm run build
+        working-directory: studio
+      - name: Embed this build
+        run: rm -rf cli/internal/studio/dist && cp -R studio/dist cli/internal/studio/dist
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: cli/go.sum
+      - name: Embed checks (manifest, current sources, server refusal)
+        run: go test ./internal/studio -run 'Embed|StudioSource|SPAHandler' -count=1
+        working-directory: cli
+      - name: Package the CLI as a release does
+        if: runner.os != 'Windows'
+        run: |
+          archive=$(sh cli/scripts/package.sh 0.0.0-ci "$(go env GOOS)" "$(go env GOARCH)" "$RUNNER_TEMP")
+          mkdir -p "$RUNNER_TEMP/cli"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/cli"
+          "$RUNNER_TEMP/cli/neutron" version | grep -F "neutron cli  0.0.0-ci"
+          echo "CLI_BIN=$RUNNER_TEMP/cli/neutron" >> "$GITHUB_ENV"
+          echo "CLI_ARCHIVE=$archive" >> "$GITHUB_ENV"
+      - name: Build the CLI (Windows is not a published target)
+        if: runner.os == 'Windows'
+        run: |
+          mkdir -p "$RUNNER_TEMP/cli"
+          go build -o "$RUNNER_TEMP/cli/neutron.exe" .
+          echo "CLI_BIN=$RUNNER_TEMP/cli/neutron.exe" >> "$GITHUB_ENV"
+        working-directory: cli
+      - name: Served Studio is this build, and renders in Chrome
+        run: node scripts/embed-gate.mjs --cli "$CLI_BIN" --out embed-gate.local.json
+        working-directory: studio
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-embed-${{ matrix.os }}-${{ github.run_id }}
+          path: studio/embed-gate.local.json
+          if-no-files-found: warn
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: neutron-cli-linux
+          path: ${{ env.CLI_ARCHIVE }}
+          if-no-files-found: error
+          retention-days: 1
+
+  onboarding:
+    name: Onboarding from the docs (fresh + legacy upgrade)
+    needs: [sql-installed, studio-embed]
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      NEUTRON_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: neutron-sql-tarball
+          path: ${{ runner.temp }}/pack
+      - uses: actions/download-artifact@v4
+        with:
+          name: neutron-cli-linux
+          path: ${{ runner.temp }}/archive
+      - name: Install the packaged CLI
+        run: |
+          mkdir -p "$RUNNER_TEMP/cli"
+          tar -xzf "$RUNNER_TEMP"/archive/neutron_*_linux_amd64.tar.gz -C "$RUNNER_TEMP/cli"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci
+        working-directory: studio
+      - name: Fresh project and legacy upgrade, from the docs
+        run: node scripts/onboarding.mjs --cli "$RUNNER_TEMP/cli/neutron" --tarball "$(ls "$RUNNER_TEMP"/pack/*.tgz)" --out onboarding.local.json
+        working-directory: studio
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: onboarding-${{ github.run_id }}
+          path: studio/onboarding.local.json
+          if-no-files-found: warn
+          retention-days: 14

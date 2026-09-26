@@ -353,25 +353,15 @@ jobs:
         id: version
         run: echo "version=${GITHUB_REF#refs/tags/cli/v}" >> "$GITHUB_OUTPUT"
 
-      - name: Build
-        working-directory: cli
-        env:
-          GOOS: ${{ matrix.os }}
-          GOARCH: ${{ matrix.arch }}
-          CGO_ENABLED: "0"
-        run: |
-          go build -trimpath \
-            -ldflags "-s -w -X github.com/neutron-build/neutron/cli/cmd.version=${{ steps.version.outputs.version }}" \
-            -o neutron .
-
-      - name: Package
+      - name: Build and package
         id: package
         run: |
           # Versioned asset name; install.sh resolves
           # neutron_<version>_<os>_<arch>.tar.gz under the cli/v<version> release.
-          ARCHIVE="neutron_${{ steps.version.outputs.version }}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz"
-          tar czf "$ARCHIVE" -C cli neutron
-          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+          # The same script packages the CLI the ORM artifact gate exercises
+          # on every PR (orm-artifacts.yml).
+          ARCHIVE=$(sh cli/scripts/package.sh "${{ steps.version.outputs.version }}" "${{ matrix.os }}" "${{ matrix.arch }}" .)
+          echo "archive=$(basename "$ARCHIVE")" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
