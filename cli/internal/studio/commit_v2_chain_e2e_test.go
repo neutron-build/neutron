@@ -719,15 +719,39 @@ func TestStudioSameRowChainE2E(t *testing.T) {
 		}
 	}
 
+	wantForeignRefusal := func(t *testing.T, code int, body map[string]any) {
+		t.Helper()
+		msg, _ := body["error"].(string)
+		if code != http.StatusBadRequest || !strings.Contains(msg, "foreign table") {
+			t.Errorf("want 400 naming the foreign table, got %d %v", code, body)
+		}
+	}
+
+	run("A13 version 0 (every foreign-table row reads it) is never a valid row version", func(t *testing.T) {
+		rr := read("r", "id")
+		before := snapshot("r")
+		code, body := commit("a13-v0", upd("r", rr.binding, idKey(59), "0", "a", "zero"))
+		msg, _ := body["error"].(string)
+		if code != http.StatusBadRequest || !strings.Contains(msg, "version must be the row version") {
+			t.Fatalf("version 0: want 400 invalid version, got %d %v", code, body)
+		}
+		if snapshot("r") != before {
+			t.Fatal("nothing may apply")
+		}
+	})
+
 	run("A13 a stale edit of a foreign-child row is refused (the parent is read-only)", func(t *testing.T) {
 		fi := read("fitems", "id")
 		if err := fixture.Exec(ctx, `UPDATE remote.pt SET x = 'foreign' WHERE id = 1`); err != nil {
 			t.Fatalf("foreign write: %v", err)
 		}
-		code, body := commit("a13-stale", upd("fitems", fi.binding, idKey(1), fi.versions["1"], "x", "stale-client"))
-		if code == http.StatusOK {
-			t.Errorf("a stale edit of a foreign-child row committed: %v", body)
+		if v := fi.versions["1"]; v != "0" {
+			t.Fatalf("a foreign-child row read version %q, want 0", v)
 		}
+		// The read's version 0 is refused as a version (A13 version 0). A
+		// forged non-zero version reaches the table's read-only guard.
+		code, body := commit("a13-stale", upd("fitems", fi.binding, idKey(1), "12345", "x", "stale-client"))
+		wantForeignRefusal(t, code, body)
 		if x := scalar(`SELECT x FROM remote.pt WHERE id = 1`); x != "foreign" {
 			t.Fatalf("foreign write lost: x = %q", x)
 		}
@@ -736,10 +760,8 @@ func TestStudioSameRowChainE2E(t *testing.T) {
 
 	run("A13 a one-row edit of a foreign-child row cannot reach a second remote row", func(t *testing.T) {
 		fi := read("fitems2", "id")
-		code, body := commit("a13-heaps", upd("fitems2", fi.binding, idKey(1), fi.versions["1"], "x", "solo"))
-		if code == http.StatusOK {
-			t.Errorf("an edit of a foreign-child row committed: %v", body)
-		}
+		code, body := commit("a13-heaps", upd("fitems2", fi.binding, idKey(1), "12345", "x", "solo"))
+		wantForeignRefusal(t, code, body)
 		if got := scalar(`SELECT string_agg(id || ':' || x, ',' ORDER BY id) FROM remote.rt`); got != "1:a-orig,2:b-orig" {
 			t.Fatalf("remote rows changed: %s", got)
 		}
