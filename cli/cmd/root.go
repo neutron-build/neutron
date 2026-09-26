@@ -43,10 +43,11 @@ func Execute() error {
 	err := rootCmd.Execute()
 	// Every other failure is printed here exactly once: a command whose RunE
 	// returns an error without reporting it (studio's listen failure, say)
-	// used to exit 1 with no message at all.
+	// used to exit 1 with no message at all. It goes to stderr: stdout may
+	// carry a command's machine-readable output (--json).
 	var reported reportedError
 	if err != nil && !errors.As(err, &reported) {
-		ui.Errorf("%v", err)
+		fmt.Fprintf(os.Stderr, "%s %v\n", ui.CrossMark, err)
 	}
 	return err
 }
