@@ -6,7 +6,7 @@ part of the published tarball.
 
 | Script | Needs | What it gates |
 |---|---|---|
-| `orm-gate.mjs` | `NEUTRON_TEST_DATABASE_URL` (disposable PostgreSQL) | 100-parent relation pages (0/2/20 children on two edges) and depth-3 reads: results equal to hand-written SQL and to the pinned `drizzle-orm`, one statement per read (client logger and `pg_stat_database`), index use on indexed child edges, server time within `serverRatioVsHandMax` of the hand-written statement, streaming early-exit release, absolute p50 ceilings |
+| `orm-gate.mjs` | `NEUTRON_TEST_DATABASE_URL` (disposable PostgreSQL) | 100-parent relation pages (0/2/20 children on two edges) and depth-3 reads: results equal to hand-written SQL and to the pinned `drizzle-orm`, one statement per read (client logger) and one server transaction per read (`pg_stat_database`; it counts transactions, so it independently catches an autocommit N+1 only), no sequential scan anywhere under a relation edge (to-one lookups included) on indexed fixtures, server time within `serverRatioVsHandMax` of the hand-written statement, streaming early-exit release, absolute p50 ceilings |
 | `typecheck-gate.mjs` | nothing | 100-table, depth-3 consumer project type-checked against `dist/*.d.ts`: type and instantiation counts against the recorded baseline + 20% (per TypeScript version) |
 
 ```sh
