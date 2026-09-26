@@ -235,6 +235,24 @@ async function rawClient(ctx: Q08Ctx): Promise<pg.Client> {
   return client;
 }
 
+/** Waits until another backend in this database is blocked on a lock
+ *  (`wait_event`: "advisory" for a q08_gate, "transactionid"/"tuple" for a
+ *  row lock) — a condition, not a fixed sleep, so a slow runner only waits
+ *  longer. `probe` must not be inside a transaction: pg_stat_activity is
+ *  snapshotted per transaction. */
+async function waitForLockWaiter(probe: pg.Client, waitEvents: string[], timeoutMs = 30_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const res = await probe.query(
+      `select exists (select 1 from pg_stat_activity where datname = current_database() and pid <> pg_backend_pid() and wait_event_type = 'Lock' and wait_event = any($1::text[])) as waiting`,
+      [waitEvents],
+    );
+    if ((res.rows[0] as { waiting: boolean }).waiting) return;
+    if (Date.now() > deadline) throw new Error(`no backend blocked on ${waitEvents.join("/")} within ${timeoutMs}ms`);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Window functions — hand-SQL oracle twins
 // ---------------------------------------------------------------------------
@@ -536,7 +554,12 @@ for (const driverKind of ["postgres", "pg"] as const) {
         resolved = true;
         return rows;
       })();
-      await new Promise((r) => setTimeout(r, 400));
+      const probe = await rawClient(ctx);
+      try {
+        await waitForLockWaiter(probe, ["transactionid", "tuple"]);
+      } finally {
+        await probe.end();
+      }
       assert.equal(resolved, false, "FOR UPDATE must block while another transaction holds the row lock");
       await holder.query("rollback");
       const rows = (await waiter) as unknown as Array<{ id: number }>;
@@ -770,15 +793,20 @@ for (const driverKind of ["postgres", "pg"] as const) {
     // (e) This driver's own compiled SQL locks through a derived FROM: the
     // transaction holds the lock (gate); the raw probe hits 55P03 — the
     // unqualified form and OF on the derived handle both reach the base rows.
+    // The probe runs once the holder's locking read has returned (a
+    // signal, not a sleep).
     let releaseHolder!: () => void;
     const holderGate = new Promise<void>((resolve) => (releaseHolder = resolve));
+    let holderLocked!: () => void;
+    const holderHasLocks = new Promise<void>((resolve) => (holderLocked = resolve));
     const holderTx = ctx.db.transaction(async (tx) => {
       const d = derivedTable("q08_d_hold", tx.select({ id: jobs.id }).from(jobs));
       const rows = await tx.select().from(d).for("update");
       assert.equal(rows.length, 5);
+      holderLocked();
       await holderGate;
     });
-    await new Promise((r) => setTimeout(r, 300));
+    await Promise.race([holderHasLocks, holderTx]);
     const rawProbe = new pg.Client({ connectionString: ctx.dbUrl });
     await rawProbe.connect();
     try {
@@ -794,13 +822,16 @@ for (const driverKind of ["postgres", "pg"] as const) {
 
     let releaseOfHolder!: () => void;
     const ofGate = new Promise<void>((resolve) => (releaseOfHolder = resolve));
+    let ofLocked!: () => void;
+    const ofHasLocks = new Promise<void>((resolve) => (ofLocked = resolve));
     const ofTx = ctx.db.transaction(async (tx) => {
       const d = derivedTable("q08_d_of", tx.select({ id: jobs.id }).from(jobs));
       const rows = await tx.select().from(d).for("update", { of: d });
       assert.equal(rows.length, 5);
+      ofLocked();
       await ofGate;
     });
-    await new Promise((r) => setTimeout(r, 300));
+    await Promise.race([ofHasLocks, ofTx]);
     const rawProbe2 = new pg.Client({ connectionString: ctx.dbUrl });
     await rawProbe2.connect();
     try {
@@ -902,7 +933,8 @@ for (const driverKind of ["postgres", "pg"] as const) {
       // before the lock; the q08 flake earlier cards attributed to load).
       await writer.query("select pg_advisory_lock($1)", [GATE]);
       const writerDone = (async () => {
-        await new Promise((r) => setTimeout(r, 150));
+        // Commit only once statement 1 is provably blocked in the gate.
+        await waitForLockWaiter(writer, ["advisory"]);
         await writer.query(`update "q08_kv" set "v" = 42 where "k" = 'snap'`);
         await writer.query("commit").catch(() => {});
         await writer.query("begin");
@@ -939,7 +971,7 @@ for (const driverKind of ["postgres", "pg"] as const) {
     // attempt 1 can pass an unheld gate and commit before the writer races it.
     await writer.query("select pg_advisory_lock($1)", [GATE]);
     const writerDone = (async () => {
-      await new Promise((r) => setTimeout(r, 150));
+      await waitForLockWaiter(writer, ["advisory"]);
       await writer.query(`update "q08_kv" set "v" = 100 where "k" = 'retry'`);
       await writer.query("commit").catch(() => {});
       await writer.query("begin");
