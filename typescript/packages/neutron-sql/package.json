@@ -25,6 +25,10 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./pgvector": {
+      "types": "./dist/pgvector.d.ts",
+      "import": "./dist/pgvector.js"
+    },
     "./fts": {
       "types": "./dist/fts.d.ts",
       "import": "./dist/fts.js"
@@ -45,7 +49,7 @@
   "files": [
     "dist",
     "!dist/**/*.test.*",
-    "!dist/live-harness.js"
+    "!dist/live-harness.*"
   ],
   "scripts": {
     "build": "tsc",
