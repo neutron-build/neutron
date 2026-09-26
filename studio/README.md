@@ -1,7 +1,7 @@
 # Neutron Studio
 
-Visual database management for Nucleus — browse all **14** data models in one
-UI: SQL, Key-Value, Vector, Timeseries, Document, Graph, Full-Text Search, Geo,
+Visual database management for PostgreSQL and Nucleus. On Nucleus it
+browses all **14** data models in one UI: SQL, Key-Value, Vector, Timeseries, Document, Graph, Full-Text Search, Geo,
 Blob, Streams, Columnar, Datalog, CDC, and Pub/Sub, plus a schema designer and
 code generator.
 
@@ -388,6 +388,44 @@ and the UI renders) and `scripts/onboarding.mjs` (a fresh project and a
 legacy-history upgrade driven by the `@neutron-build/sql` README and the CLI
 reference). `orm-artifacts.yml` runs the embed gate on Linux and macOS (the
 published CLI targets) and onboarding on Linux.
+
+## Support and known limits
+
+- **Engines.** PostgreSQL 17 and 18 are verified: the CLI suite, which
+  carries Studio's HTTP and end-to-end tests, passes on both in the release
+  matrix (`orm-matrix.yml`); pull requests also run the real-browser
+  journey on 17. PostgreSQL 16 is not claimed (see the support matrix in
+  `typescript/packages/neutron-sql/README.md`). Nucleus connections open the
+  model modules, measured against Nucleus 1.0.2 and not advertised for
+  release; the limits registry above states what each model does. Row
+  editing on Nucleus is read-only: the catalog query that identifies keys
+  and row versions does not run there.
+- **Platforms.** The CLI that embeds Studio is released for Linux and macOS
+  (amd64 and arm64), and the embed gate runs on both. Windows builds compile
+  in CI but are neither released nor gated.
+- **Read-only tables.** A table is read-only, with the reason shown, when it
+  has no primary key, when a key column's type cannot be compared exactly,
+  when a foreign table is among its inheritance children, or when the
+  connection exposes no row versions (`xmin`).
+- **Recovery limits.** A revert is refused where the inverse cannot be exact
+  ([Atomic commits](#atomic-commits-and-retry-outcomes-s02)). Commit
+  outcomes live in the Studio process: after a restart, earlier operation
+  IDs are unknown and a retry on them is refused until the table is
+  checked. An import is atomic per batch, not per file.
+- **Open items** (each fails safely; tracked, not fixed):
+  - Tables with `DO INSTEAD` or `DO ALSO` rules refuse every edit with HTTP
+    502. Nothing is applied; the status should be a 4xx.
+  - On a table whose `AFTER` trigger updates the row it fired for, two edits
+    of one row in one batch conflict (409). Commit them in separate batches.
+  - A primary key whose index is invalid (`ALTER TABLE ONLY … ADD PRIMARY
+    KEY` on a partitioned table) is still treated as the key although
+    uniqueness is not enforced; updates and deletes stay guarded by the
+    exactly-one-row check.
+  - The legacy `/api/table/update` and `/api/table/delete` endpoints report
+    refusals as HTTP 200 with an `error` field.
+  - The CDC and Streams modules have form labels that name no control.
+  - The MCP server's read-only default is best-effort on Nucleus (see
+    `neutron mcp` in the CLI reference).
 
 ## Status
 

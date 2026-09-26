@@ -4,12 +4,10 @@ Drizzle-shaped TypeScript SQL ORM for Postgres. Schema in code, no codegen,
 one readable SQL statement per query, `toSQL()` on everything. Zero runtime
 dependencies — bring `postgres` or `pg` (or both) as optional peers.
 
-**Alpha — contained, not production-ready.** The verified support matrix is
-PostgreSQL 17 only: CI runs the live suites against the `pgvector/pgvector:pg17` image
-with both drivers; the machine that produced the recorded live evidence runs
-17.11. Postgres 16/18 are release-time matrix work and are **not** claimed.
-Nucleus and other Postgres-wire engines are untested here — no compatibility
-claim is made for them (see [Status](#status-v01)).
+**Alpha — contained, not production-ready.** Verified on PostgreSQL 17 and
+18 with both drivers; PostgreSQL 16 is not claimed, and neither are Nucleus
+or other Postgres-wire engines. See the [support matrix](#support-matrix)
+and, when coming from an earlier build, [Upgrading](#upgrading-from-earlier-builds).
 
 ## Quick start
 
@@ -132,9 +130,11 @@ default, a foreign key to a column outside the export or not covered by a
 primary-key/unique constraint — fail at export time with the contract error
 code, never as a silently invalid document.
 
-`migrate generate` diffs the exported schema against the live database
-(information_schema) and writes `{version}_{name}.up.sql` / `.down.sql` pairs.
-When a column is added and another with the same type is dropped, it prints a
+`migrate generate` diffs the exported schema against the live database by
+default and writes `{version}_{name}.up.sql` / `.down.sql` pairs;
+`--mode snapshot` plans offline from the last accepted snapshot instead
+(see `neutron migrate generate --help`). When a column is added and another
+with the same type is dropped, it prints a
 suggestion — confirm intent with `--rename 'users.old>users.new'` (the `>`
 must be quoted in the shell; without quotes the shell reads it as a redirect
 and the flag never reaches the CLI).
@@ -151,15 +151,22 @@ converges). Changing a generated column's expression uses
 alternative named, and `--mode snapshot` records `minServerMajor` in the plan
 so `neutron migrate` refuses older servers before running anything.
 
-Safety semantics (contained-alpha): generated SQL never drops `_neutron_*`
+Safety semantics: generated SQL never drops `_neutron_*`
 metadata tables, extension-owned objects, or anything absent from the schema
 unless `--allow-destructive` is passed as an explicit acknowledgement.
 Catalog structures the diff cannot represent faithfully are rejected with an
 error instead of producing a migration that falsely claims synchronization.
-The supported surface is single-column primary keys/unique/FK constraints,
-not-null and defaults, and named indexes — composite constraints, enums,
-arrays and views are not certified and are reported/rejected rather than
-silently mishandled.
+With a version-2 document the planner covers schema-qualified tables,
+composite primary-key/unique/check/foreign-key constraints, indexes with
+methods, predicates, expressions and `INCLUDE`, enums, one-dimensional
+arrays, identity and stored generated columns, and views. What the contract
+cannot represent — virtual generated columns, multi-dimensional arrays or
+arrays of temporal/bytea/vector elements, `NULLS NOT DISTINCT`, non-default
+operator classes or collations on index keys, foreign keys to views, and
+types outside its vocabulary such as domains, citext, ranges and composite
+types — fails at definition or export time in TypeScript, and is
+introspected as opaque and blocks the affected plan in the CLI. Version-1
+documents keep the older single-column surface.
 
 ## Drivers
 
@@ -794,12 +801,11 @@ query layer supports them end to end: CRUD renders qualified targets
 (`insert into "legacy"."users"`), alias joins render qualified join targets,
 and predicates/projections reference schema-qualified columns — `public`
 users and `legacy` users can be joined in one statement under distinct
-aliases. This is deliberately **query-layer only**: DDL emission
-(`schemaToDDL`), schema export (`exportSchema`/`exportSchemaV2`) and
+aliases. Schema export v2 (`exportSchemaV2`) exports them under their schema.
+The legacy paths — `schemaToDDL` and the version-1 `exportSchema` — and
 relational reads (`db.query`, the `tables`/`relations` inputs) reject
-schema-declared tables with explicit errors until their scoped work lands
-(Q05/Q07) — they would otherwise address or export the wrong (search-path)
-identity.
+schema-declared tables with explicit errors: they would otherwise address or
+export the wrong (search-path) identity.
 
 ## Subqueries, CTEs, aggregates and set operations
 
@@ -1393,6 +1399,101 @@ entries, each scoped to rows currently connected to this parent.
   savepoint — passing it there is an error pointing at
   `db.transaction(fn, options)`).
 
+## Support matrix
+
+Verified means the required-live suites passed on that version with both
+drivers; nothing outside this table is claimed.
+
+| Component | Verified | Not claimed |
+|---|---|---|
+| PostgreSQL | 17 and 18. Pull requests run the live suites on 17 (`typescript.yml`, `cli.yml`); the release matrix (`orm-matrix.yml`, run 36271280328 on `1fce3fe4`) passed this package's suite (887/887) and the CLI suite on 17.11 and 18.6 (`pgvector/pgvector` images) | 16: this package's suite passes on 16.15, but the CLI plans a generated-column expression change as `ALTER COLUMN … SET EXPRESSION`, which PostgreSQL 16 does not have (`TestQ07RoundTripModifications` fails). Majors before 16 are untested |
+| Node.js | `engines: ">=22"`; CI runs 22 and 24; the installed-artifact gate ran on 22.19, 22.23 and 24.20 | 22.0–22.18; Node 20 and older |
+| Drivers | `pg` 8.22.0 and `postgres` 3.4.8, the versions the suites resolve (peer ranges `^8.11.0` / `^3.4.7`) | other versions inside the peer ranges |
+| TypeScript | 5.7.2 (minimum) and 5.9.3, declarations checked with `skipLibCheck` off | |
+| pgvector | the extension in the `pgvector/pgvector` images, through `@neutron-build/sql/pgvector` | halfvec, sparsevec, binary quantization |
+| Runtimes | Node.js | edge and browser runtimes (no transport adapter) |
+| Engines | PostgreSQL | Nucleus and other Postgres-wire engines (below) |
+
+**Nucleus is not supported by this package.** What the ORM can rely on is
+measured, per driver, against a named build — Nucleus 1.0.2, `nucleus/` tree
+`3313729a` — in
+[`conformance/live/orm/ORM_CONFORMANCE.md`](../../../conformance/live/orm/ORM_CONFORMANCE.md)
+(`pg` / `postgres`: 71/70 of 140 probes supported). By area, supported
+out of probed with `pg`: engine 1/2, relational SQL 19/25, DML 9/14,
+constraints 7/9, codecs 9/19, catalog 2/14, DDL 3/11, RLS 3/9, locks 3/11,
+transactions 4/7, ORM paths 11/19. Relational `with` reads and lossless
+int8/numeric/temporal leaves fail closed there before any SQL runs, and the
+migration workflow is PostgreSQL-only. Engine defects N1–N16 in that report
+block these claims; N1 (`SET LOCAL ROLE` survives the transaction) is a
+security defect.
+
+The optional model modules were measured on the same build and are not
+advertised for it:
+
+| Module | PostgreSQL | Nucleus 1.0.2 |
+|---|---|---|
+| `/pgvector`, `/fts` | verified on 17 and 18 | vector types unsupported; the FTS functions fail a negative control; queries are refused before any statement runs |
+| `/timeseries`, `/columnar` | verified on 17 and 18 | `ts-bucketing` resolves unsupported and bucket statements fail closed; the engine's own time-series and columnar model clients are in `@neutron-build/nucleus` ([below](#nucleus-time-series-and-columnar-model-clients)) |
+| `/listen-notify` | verified on 17 and 18 | delivers, with the divergences documented in [LISTEN/NOTIFY](#listennotify-neutron-buildsqllisten-notify) |
+
+## Upgrading from earlier builds
+
+This package has not been published; these notes are for code written
+against the in-repo alpha. Each change is documented where it applies.
+
+Breaking corrections:
+
+- Table metadata moved behind accessors: `getTableName`,
+  `getTableColumns`, `getTableIndexes`; plain `table.tableName` /
+  `table.columns` / `table.indexes` are gone
+  ([Property mapping](#property-mapping-null-and-required-keys)).
+- Value types changed: int8 reads `bigint`, temporals read canonical
+  microsecond strings, `date` writes take `YYYY-MM-DD` strings, json writes
+  encode the JS value; explicit modes restore `string`/`number`/`Date`
+  ([Lossless value codecs](#lossless-value-codecs-and-the-corrected-pre-10-types)).
+- The `sql` template returns a structural fragment, not `{sql, params}`;
+  `asc()`/`desc()` return order specs; `sqlAst` is a deprecated alias
+  ([One compiler](#one-compiler-structural-fragments)).
+- `driverOptions` replaces the old `driver` option, which now injects an
+  adapter ([Drivers](#drivers)).
+- Version-1 schema documents with vector columns fail instead of skipping
+  the column ([Vector columns](#vector-columns-in-the-v1-workflow-breaking-x01)).
+- `engines` is `>=22` (was `>=20`).
+- The default logger no longer prints parameter values, and a nested
+  transaction passed modes is rejected at runtime instead of ignoring them
+  ([Transactions](#transactions-cancellation-and-observability-i02)).
+
+Existing databases:
+
+1. Export a version-2 document (`exportSchemaV2` +
+   `canonicalSchemaJson`, [Migrations](#migrations)).
+2. If `_neutron_migrations` was written by an older CLI or by the Go/TS
+   Nucleus SDKs, `neutron migrate` refuses to run until `neutron migrate
+   adopt` graduates the history once, in one transaction. Rows whose
+   recorded checksum reproduces from the migration file are verified; the
+   rest are kept as unverified, never given a fabricated checksum.
+3. Generate the next migration, review it, apply it. Nothing absent from
+   the schema is dropped without `--allow-destructive`.
+4. To plan offline from snapshots, record the current database once with
+   `neutron schema baseline` (read-only).
+
+Rollback and recovery limits:
+
+- Down files are not data restoration. `neutron migrate down` refuses a
+  migration its plan marks irreversible and a down file that holds only an
+  `IRREVERSIBLE` comment; forward-fix instead.
+- Migrations run only the statement kinds on the CLI's allowlist (`neutron
+  migrate --help`); functions, triggers, grants and `DO` blocks are refused
+  and no flag bypasses that.
+- A transactional migration that fails rolls back with its history row. A
+  non-transactional one (`CREATE INDEX CONCURRENTLY`, journaled steps)
+  interrupted mid-file leaves partial effects and no history row; `neutron
+  migrate resolve <version>` inspects it and never replays a statement whose
+  outcome cannot be proven.
+- Transaction-pooled proxies are unsupported for migration connections.
+- A commit that fails after the server may have committed surfaces as
+  `CommitAmbiguityError` and is never replayed automatically.
+
 ## Tests
 
 - `pnpm test` builds, type-checks the consumer type fixture against the packed
@@ -1419,9 +1520,8 @@ Alpha — contained, not production-ready. Known-unsafe paths found in review
 were fixed or converted into explicit rejections; nothing here certifies
 general-purpose use.
 
-- Verified against PostgreSQL 17 only (CI `pgvector/pgvector:pg17`; recorded live
-  evidence on 17.11), both drivers. 16/18 and non-Postgres engines: not
-  claimed.
+- Verified on PostgreSQL 17 and 18, both drivers; 16 and non-Postgres
+  engines are not claimed ([Support matrix](#support-matrix)).
 - Implemented and live-tested: typed CRUD (`select`/`insert`/`update`/
   `delete`, `returning`), batch inserts independent of key order, joins and
   aliases (inner/left/right/full/cross with typed outer-join nullability,
@@ -1479,19 +1579,20 @@ general-purpose use.
   per-round-trip cancellation, post-settle use rejected without touching
   the released connection).
 - `update`/`delete` require `.where()` (foot-gun guard).
+- Generated and identity columns (Q07): writes to generated columns and to
+  `GENERATED ALWAYS` identity columns are rejected at compile time and at
+  runtime; `serial` stays writable per PostgreSQL semantics.
 - Deferred with explicit rejection, not implemented: parent-correlated
   per-child filters (filter the parent instead) and subqueries inside
   per-child where/orderBy, relation nesting deeper than 5 levels,
-  generated/identity columns —
-  the schema cannot declare them yet, so the "generated-field writes are
-  rejected" guarantee lands with them; `serial` stays writable per PostgreSQL
-  semantics (Q07), composite constraints/enums/arrays/views in migrations
-  (M02+), schema-qualified tables in DDL emission/schema export/relational
-  reads — the query layer supports them (Q05/Q07), composite/no-key mutation
-  in Studio (S01).
-- Studio: `neutron studio` opens the SQL browser (filter, sort, FK links)
-  against a Postgres connection URL; cell edits are permitted only on tables
-  with a proven single-column primary key — composite/no-key tables are
-  read-only with an explanation (interim until full-key identities land).
+  relational reads on schema-declared tables, the Q07 schema surface in the
+  legacy paths (`schemaToDDL`, version-1 `exportSchema` — use schema export
+  v2), and the schema features the contract cannot represent
+  ([Migrations](#migrations)).
+- Studio: `neutron studio` edits tables by full primary-key identity with
+  staged, atomic, stale-checked commits; tables without a primary key, with
+  key types it cannot compare exactly, or with a foreign table among their
+  inheritance children are read-only with the reason shown. Limits and
+  open items: `studio/README.md`.
 
 MIT.
