@@ -321,16 +321,18 @@ func buildGuardedMutationV2(schemaName, tableName string, mut func(keyWhere stri
 
 // runGuardedMutation executes the guarded statement as one atomic statement
 // (implicit transaction) and returns the affected count plus the row's new
-// version. Runs identically on the pool or inside an explicit transaction.
-func runGuardedMutation(ctx context.Context, q rowQuerier, sqlText string, args ...any) (int64, string, error) {
+// version and physical tuple identity (ctid; a batch binds later operations
+// on the row to it). Runs identically on the pool or inside an explicit
+// transaction.
+func runGuardedMutation(ctx context.Context, q rowQuerier, sqlText string, args ...any) (int64, string, string, error) {
 	var n int64
-	var ver string
+	var ver, tid string
 	wrapped := fmt.Sprintf(
-		"WITH mutated AS (%s RETURNING xmin::text AS ver) SELECT count(*) AS n, COALESCE(max(ver),'') AS ver FROM mutated",
+		"WITH mutated AS (%s RETURNING xmin::text AS ver, ctid::text AS tid) SELECT count(*) AS n, COALESCE(max(ver),''), COALESCE(max(tid),'') FROM mutated",
 		sqlText,
 	)
-	err := q.QueryRow(ctx, wrapped, args...).Scan(&n, &ver)
-	return n, ver, err
+	err := q.QueryRow(ctx, wrapped, args...).Scan(&n, &ver, &tid)
+	return n, ver, tid, err
 }
 
 // explainRowConflictV2 classifies a zero-row mutation. A row found under
@@ -587,7 +589,7 @@ func (s *Server) handleTableRowUpdateV2(w http.ResponseWriter, r *http.Request) 
 	} else {
 		sqlText, args = buildGuardedMutationV2(body.Schema, body.Table, mut, keyArgs, keyCols, body.Version, value)
 	}
-	n, newVersion, err := runGuardedMutation(r.Context(), target.client, sqlText, args...)
+	n, newVersion, _, err := runGuardedMutation(r.Context(), target.client, sqlText, args...)
 	if err != nil {
 		writeMutationOutcome(w, err, "row update")
 		return
@@ -623,7 +625,7 @@ func (s *Server) handleTableRowDeleteV2(w http.ResponseWriter, r *http.Request) 
 		return fmt.Sprintf("DELETE FROM %s", tableRef)
 	}
 	sqlText, args := buildGuardedMutationV2(body.Schema, body.Table, mut, keyArgs, keyCols, body.Version)
-	n, _, err := runGuardedMutation(r.Context(), target.client, sqlText, args...)
+	n, _, _, err := runGuardedMutation(r.Context(), target.client, sqlText, args...)
 	if err != nil {
 		writeMutationOutcome(w, err, "row delete")
 		return
