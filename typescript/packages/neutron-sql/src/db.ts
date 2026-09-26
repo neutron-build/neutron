@@ -146,9 +146,13 @@ type TargetTableOf<Rel> =
 /** Relation entries declared for one table, resolved through the whole
  *  relations input by table type (the input is keyed by table name — the
  *  runtime convention). Unresolvable targets degrade to the permissive map,
- *  matching runtime rejection of unknown relations. */
+ *  matching runtime rejection of unknown relations. The match is mutual
+ *  assignability: a one-way match let a same-shape table declared with a
+ *  non-literal name (type string) absorb every literal-named table of that
+ *  shape, unioning their entries (R01 review F5). Two same-shape tables that
+ *  BOTH have non-literal names remain indistinguishable. */
 type EntriesForTarget<R extends RelationsInput, T> = UnionizeEntries<{
-  [K in keyof R]: R[K] extends TableRelations<infer TT, infer E> ? ([T] extends [TT] ? E : never) : never;
+  [K in keyof R]: R[K] extends TableRelations<infer TT, infer E> ? ([T] extends [TT] ? ([TT] extends [T] ? E : never) : never) : never;
 }>;
 type UnionizeEntries<T> = T[keyof T] extends infer U ? (U extends Record<string, Relation> ? U : never) : never;
 

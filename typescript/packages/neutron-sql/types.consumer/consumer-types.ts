@@ -850,3 +850,40 @@ async function sameShapeTables(): Promise<void> {
   }
 }
 void sameShapeTables;
+
+// R01 review F5: one same-shape table with a NON-literal name (string) must
+// not poison the typing of the literal-named tables. A one-way structural
+// match accepted "r01w_tags" where the string-named table was expected, so
+// the two entry maps unioned and tag.taggedPosts vanished again.
+async function sameShapeWithDynamicName(dynamicName: string): Promise<void> {
+  const tags = pgTable("r01w_tags", { id: serial("id").primaryKey(), name: text("name").notNull() });
+  const cats = pgTable(dynamicName, { id: serial("id").primaryKey(), name: text("name").notNull() });
+  const posts = pgTable("r01w_posts", {
+    id: serial("id").primaryKey(),
+    tagId: integer("tag_id"),
+    catId: integer("cat_id"),
+  });
+  const tagsR = relations(tags, ({ many }) => ({ taggedPosts: many(posts) }));
+  const catsR = relations(cats, ({ many }) => ({ catPosts: many(posts) }));
+  const postsR = relations(posts, ({ one }) => ({
+    tag: one(tags, { fields: [posts.tagId], references: [tags.id] }),
+    cat: one(cats, { fields: [posts.catId], references: [cats.id] }),
+  }));
+  const db = await createDatabase({
+    url: "postgres://type-fixture:not-run@localhost:1/none",
+    tables: { r01w_tags: tags, r01w_cats: cats, r01w_posts: posts },
+    relations: { r01w_tags: tagsR, r01w_cats: catsR, r01w_posts: postsR },
+  });
+  const rows = await db.query.r01w_posts.findMany({
+    with: {
+      tag: { with: { taggedPosts: { columns: ["id"] } } },
+      cat: { with: { catPosts: { columns: ["id"] } } },
+    },
+  });
+  const row = rows[0];
+  const eqTag: AssertEq<typeof row.tag, { id: number; name: string; taggedPosts: { id: number }[] } | null> = true;
+  const eqCat: AssertEq<typeof row.cat, { id: number; name: string; catPosts: { id: number }[] } | null> = true;
+  void eqTag;
+  void eqCat;
+}
+void sameShapeWithDynamicName;
