@@ -50,6 +50,42 @@ All notable changes to this project are documented in this file.
   from the config, and fails instead of silently moving when an explicitly
   configured port is taken.
 
+- **`@neutron-build/nucleus` model clients were checked against a live
+  engine** (Nucleus 1.0.2, `conformance/live/orm/`). Document collections
+  and SQL-bound graph traversal sit behind a capability gate, time-series
+  queries behind semantic probes; columnar inserts bind numbers with a cast,
+  because the engine's aggregates silently answer 0/NULL over untyped
+  values; two cancellation defects in the HTTP and pg transports are fixed.
+  Interface docs state measured engine behaviour: for example, CDC emits
+  INSERT events only, and columnar inserts are refused inside a transaction.
+
+### Breaking
+
+- **`@neutron-build/nucleus` migrations use history protocol v2**
+  (`contracts/data/MIGRATIONS.md`). The checksum is a SHA-256 digest of the
+  up SQL; a history containing rows from before the protocol is refused
+  before any change until `adoptMigrations` graduates it once (rows whose
+  old checksum reproduces from the file are verified, the rest are kept
+  unverified). A crashed runner's lock claim is no longer taken over after
+  ten minutes: release it with `forceUnlockMigrations`, after checking
+  `migrationLockInfo`. The same protocol is in the Go SDK and the CLI.
+- **`@neutron-build/nucleus` pub/sub `channels()` takes no pattern.** The
+  engine ignored it; filtering on the client would have faked a server
+  feature.
+- **`@neutron-build/nucleus` datalog `assert`, `retract`, `rule`, `clear`
+  and `importGraph` resolve to the engine's reply string** instead of a
+  boolean or number. `rule(head, body)` sends the engine's single-argument
+  form.
+
+### Added
+
+- **`@neutron-build/sql` (unpublished, alpha).** First-party PostgreSQL
+  ORM: schema in code, one compiler, lossless codecs, relational reads,
+  migrations through the CLI. Verified on PostgreSQL 17 and 18 with `pg` and
+  `postgres`; PostgreSQL 16 and Nucleus are not claimed. Its README lists
+  the support matrix, the breaking corrections made during the alpha, and
+  the upgrade and recovery limits.
+
 ## [core 0.2.2, cli 0.2.3, create-neutron 0.1.5] - 2026-09-07
 
 ### Fixed

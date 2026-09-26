@@ -89,6 +89,29 @@ neutron db reset           # interactive confirmation
 neutron db reset --force   # skip confirmation
 ```
 
+### `neutron db push`
+
+Apply a schema document straight to the database, without migration files, for prototyping.
+
+```bash
+neutron db push --schema neutron.schema.json --dry-run
+neutron db push --schema neutron.schema.json
+```
+
+The whole plan runs in one transaction, under the migration lock. Push refuses a database with migration history unless `--force`, and drops nothing absent from the schema without `--allow-destructive`; neither flag touches `_neutron_*` metadata or extension-owned objects.
+
+### `neutron schema`
+
+Work with schema documents (the cross-language contract in `contracts/data/`).
+
+```bash
+neutron schema export     # run the compiled export module, write neutron.schema.json
+neutron schema pull       # introspect the database into a document (read-only)
+neutron schema check      # desired document vs the snapshot chain (offline)
+neutron schema check --live   # database vs the applied snapshots: drift
+neutron schema baseline   # record an existing database as the chain root (read-only)
+```
+
 ## Migrations
 
 ### `neutron migrate`
@@ -146,6 +169,41 @@ Revert the latest migration, or the latest `N` migrations.
 neutron migrate down
 neutron migrate down 3
 ```
+
+Down SQL is not data restoration. Rollbacks run under the same lock and checksum verification as `neutron migrate`, and the command refuses a migration whose plan report marks it irreversible, or whose down file holds only an `IRREVERSIBLE` comment: forward-fix instead.
+
+### `neutron migrate generate`
+
+Write the next `.up.sql`/`.down.sql` pair from a schema document exported by `@neutron-build/sql`.
+
+```bash
+neutron migrate generate --schema neutron.schema.json --name add_posts
+neutron migrate generate --mode snapshot --schema neutron.schema.json
+neutron migrate generate --rename 'users.name>users.full_name'
+```
+
+`--mode live` (the default) diffs against the database; `--mode snapshot` plans offline from the last accepted snapshot, accounts for pending migrations, and writes a `.plan.json` risk and reversibility report. Nothing absent from the schema is dropped without `--allow-destructive`, `_neutron_*` metadata and extension-owned objects are never dropped, and catalog structures the planner cannot represent faithfully are refused instead of planned. Quote `--rename` values: `>` is a shell redirect.
+
+### `neutron migrate resolve <version>`
+
+Inspect and recover a migration that was interrupted outside a transaction.
+
+```bash
+neutron migrate resolve 004
+neutron migrate resolve 004 --retry
+```
+
+Transactional migrations need none of this: a failure rolls back with its history row. A non-transactional migration (`CREATE INDEX CONCURRENTLY`, journaled steps) interrupted mid-file leaves partial effects and no history row. `resolve` checks each statement's postcondition against the catalog and offers exactly one action: `--retry` skips provably applied statements, `--mark-applied` records the row only when every effect is proven, `--abort` runs the down SQL. A statement whose outcome cannot be proven (`ALTER`, DML) is never replayed automatically. Operational patterns (expand, backfill, contract, concurrent indexes) are shown in `cli/examples-src/README.md`.
+
+### Upgrading from earlier CLI builds
+
+- **Migration history.** A `_neutron_migrations` table written by an older CLI or by the Go/TS Nucleus SDKs is refused until `neutron migrate adopt` graduates it once. Adoption never fabricates checksums: rows it cannot prove stay unverified.
+- **Statement allowlist.** Migration files may contain only the statement kinds listed in `neutron migrate --help` (`SELECT` and DML, `TRUNCATE`, create/alter/drop of schema objects, `SET LOCAL`). Functions, triggers, rules, grants, `DO` blocks and database- or role-wide statements are refused before anything in the file runs; no flag bypasses this.
+- **Destructive changes.** Drops and other data-losing statements need `--allow-destructive`; `db push --force` only permits pushing onto a database that has migration history.
+- **Nucleus.** `neutron migrate` refuses Nucleus databases; the Go and TypeScript SDK runners own those, and remain experimental.
+- **MCP.** `query_sql` is always read-only; writes go through `execute_sql`, which exists only with `--allow-writes`. The HTTP transport binds to `127.0.0.1`, and writes over HTTP need `NEUTRON_MCP_TOKEN`.
+
+The migration protocol (identity, checksum, locking, adoption) is specified in `contracts/data/MIGRATIONS.md`.
 
 ## Data
 
