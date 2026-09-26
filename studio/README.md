@@ -381,6 +381,14 @@ Frontend: `npm test` (vitest) and `npm run build` in `studio/`. Backend:
 `go test ./...` in `cli/` covers `internal/studio`. CI runs both via
 `cli.yml`, which triggers on `studio/**` and `cli/**`.
 
+Real browser, against a built CLI binary (Chrome or `CHROME_PATH`):
+`scripts/journey.mjs` and `scripts/render-bench.mjs` (edit journey and render
+budgets, R01), `scripts/embed-gate.mjs` (the binary serves exactly this build
+and the UI renders) and `scripts/onboarding.mjs` (a fresh project and a
+legacy-history upgrade driven by the `@neutron-build/sql` README and the CLI
+reference). `orm-artifacts.yml` runs the embed gate on Linux, macOS and
+Windows and onboarding on Linux.
+
 ## Status
 
 Implemented and under active development — private workspace software in this
