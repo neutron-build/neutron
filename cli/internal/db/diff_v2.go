@@ -50,9 +50,6 @@ type DiffV2Options struct {
 	SnapshotBase     bool
 }
 
-// DiffV2Document produces the up/down SQL moving the database described by
-// `actual` to `desired`. Both documents must be validated v2 documents.
-
 // InternalMetadataNote ends the plan note for a neutron-internal table
 // (migration history): informational, never drift.
 const InternalMetadataNote = "is neutron-internal metadata: always left untouched"
@@ -68,6 +65,8 @@ func HasDrift(warnings []string) bool {
 	return false
 }
 
+// DiffV2Document produces the up/down SQL moving the database described by
+// `actual` to `desired`. Both documents must be validated v2 documents.
 func DiffV2Document(ctx context.Context, desired, actual *V2Document, opts DiffV2Options) (DiffResult, error) {
 	var result DiffResult
 

@@ -386,8 +386,8 @@ Real browser, against a built CLI binary (Chrome or `CHROME_PATH`):
 budgets, R01), `scripts/embed-gate.mjs` (the binary serves exactly this build
 and the UI renders) and `scripts/onboarding.mjs` (a fresh project and a
 legacy-history upgrade driven by the `@neutron-build/sql` README and the CLI
-reference). `orm-artifacts.yml` runs the embed gate on Linux, macOS and
-Windows and onboarding on Linux.
+reference). `orm-artifacts.yml` runs the embed gate on Linux and macOS (the
+published CLI targets) and onboarding on Linux.
 
 ## Status
 

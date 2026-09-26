@@ -74,11 +74,15 @@ function fencedBlocks(file) {
   const lines = readFileSync(file, "utf8").split("\n");
   const blocks = [];
   for (let i = 0; i < lines.length; i++) {
-    const m = /^```(\w+)\s*$/.exec(lines[i]);
+    const m = /^\s*```(\S*)/.exec(lines[i]);
     if (!m) continue;
     let end = i + 1;
-    while (end < lines.length && !lines[end].startsWith("```")) end++;
-    blocks.push({ lang: m[1], file, lines: lines.slice(i + 1, end).map((text, k) => ({ text, line: i + 2 + k })) });
+    while (end < lines.length && !/^\s*```\s*$/.test(lines[end])) end++;
+    // The info string's first word, case-insensitive; every shell spelling
+    // counts as bash so a ```sh or ```shell block is not silently skipped.
+    const word = m[1].toLowerCase();
+    const lang = ["sh", "shell", "console", "zsh"].includes(word) ? "bash" : word;
+    blocks.push({ lang, file, lines: lines.slice(i + 1, end).map((text, k) => ({ text, line: i + 2 + k })) });
     i = end;
   }
   return blocks;
@@ -263,7 +267,7 @@ try {
 
     const again = runDoc(project, { ...findLine(doc, "neutron migrate generate --schema", README, { prefix: true }), argv: ["neutron", "migrate", "generate", "--schema", "neutron.schema.json", "--name", "again"] }, `${README} (same command, --name again)`, env);
     const afterFiles = readdirSync(migDir).filter((f) => f.endsWith(".sql")).sort();
-    verdict("fresh.inspect: after the edit, the schema is in sync — a second generate plans nothing", again.code === 0 && afterFiles.join(",") === "001_add_users.down.sql,001_add_users.up.sql" && /No applicable changes/.test(again.out), afterFiles.join(","));
+    verdict("fresh.inspect: after the edit, the schema is in sync — a second generate plans nothing", again.code === 0 && afterFiles.join(",") === "001_add_users.down.sql,001_add_users.up.sql" && /No schema changes detected/.test(again.out) && !/not in sync/.test(again.out), afterFiles.join(","));
   }
 
   // ============================================================= legacy
