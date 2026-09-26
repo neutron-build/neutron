@@ -62,6 +62,14 @@ type Server struct {
 
 // NewServer creates and configures the Studio server on the given port.
 func NewServer(port int) (*Server, error) {
+	// Refuse a stale or partial embedded Studio before anything is announced.
+	distFS, err := fs.Sub(Dist, "dist")
+	if err != nil {
+		return nil, fmt.Errorf("embed sub: %w", err)
+	}
+	if _, err := VerifyEmbed(distFS); err != nil {
+		return nil, err
+	}
 	store, err := newConnectionStore()
 	if err != nil {
 		return nil, fmt.Errorf("connection store: %w", err)
@@ -171,8 +179,22 @@ func (s *Server) routes() (*http.ServeMux, error) {
 	if err != nil {
 		return nil, fmt.Errorf("embed sub: %w", err)
 	}
+	spa, err := spaHandler(distFS)
+	if err != nil {
+		return nil, err
+	}
+	mux.Handle("/", spa)
+	return mux, nil
+}
+
+// spaHandler serves the Studio build in distFS, falling back to index.html
+// for SPA routes. It refuses a tree that does not match its build manifest.
+func spaHandler(distFS fs.FS) (http.Handler, error) {
+	if _, err := VerifyEmbed(distFS); err != nil {
+		return nil, err
+	}
 	fileServer := http.FileServer(http.FS(distFS))
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Try the file; on 404 serve index.html for SPA routing
 		path := strings.TrimPrefix(r.URL.Path, "/")
 		if path == "" {
@@ -182,8 +204,7 @@ func (s *Server) routes() (*http.ServeMux, error) {
 			r.URL.Path = "/"
 		}
 		fileServer.ServeHTTP(w, r)
-	})
-	return mux, nil
+	}), nil
 }
 
 // URL returns the local URL for the Studio server.
