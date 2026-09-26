@@ -196,7 +196,9 @@ function readmeExamples(readme) {
     const lang = m[2].toLowerCase();
     const close = new RegExp(`^\\s*${m[1][0] === "`" ? "```" : "~~~"}[${m[1][0]}]*\\s*$`);
     const indent = indentOf(opener);
-    const inner = (l) => unquote(l, quoteDepth(l));
+    // Inside the fence only the opener's quote depth is structure; deeper
+    // ">" belongs to the code and reaches compilation unchanged.
+    const inner = (l) => unquote(l, depth);
     const start = i + 1;
     let end = start;
     // An unclosed fence ends with its container: a quoted fence when the
@@ -292,11 +294,13 @@ try {
       "```yaml", "f", "```", "```bash", "g", "```",
       // An unclosed fence in a quote ends with the quote (N9-R).
       "> ```bash", "> unclosed", "", "```ts", "h", "```",
+      // ">" inside a fence is code, not structure (N9-S).
+      "```ts", ">i", "```", "> ```ts", "> >j", "> ```",
     ].join("\n");
     const got = readmeExamples(probe);
     verdict(
       "README gate: the fence classifier sees backtick, tilde, titled, quoted and list-item fences",
-      got.blocks.map((b) => b.body).join("") === "abcdeh" && got.unknown.length === 1,
+      got.blocks.map((b) => b.body).join("") === "abcdeh>i>j" && got.unknown.length === 1,
       JSON.stringify(got),
     );
   }
