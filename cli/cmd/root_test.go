@@ -159,3 +159,27 @@ func TestCommandErrorsArePrintedOnce(t *testing.T) {
 		t.Fatalf("project check printed its error more than once:\n%s", out)
 	}
 }
+
+// A spinner failure line is the error's report: every such site must return
+// through failSpinner (marked reported) or the Execute fallback prints the
+// error a second time. migrate.go's two sites return a different, richer
+// interruption error that must still print.
+func TestSpinnerFailuresGoThroughFailSpinner(t *testing.T) {
+	allowed := map[string]int{"root.go": 1, "migrate.go": 2}
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := strings.Count(string(src), "StopWithMessage(ui.CrossMark"); n != allowed[f] {
+			t.Errorf("%s: %d direct spinner failure line(s), want %d; return failSpinner(...) instead", f, n, allowed[f])
+		}
+	}
+}

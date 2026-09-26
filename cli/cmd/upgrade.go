@@ -39,12 +39,11 @@ func runUpgrade(cmd *cobra.Command, args []string) error {
 
 	release, hasUpdate, err := checkForUpdate(version)
 	if err != nil {
-		spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Could not check: %v", err))
 		// An explicitly requested upgrade must fail loudly: scripts cannot
 		// distinguish "already latest" from a network or release-metadata
 		// failure if this returns nil. Best-effort warnings belong to
 		// optional startup notifications, not the upgrade command.
-		return fmt.Errorf("check for updates: %w", err)
+		return failSpinner(spinner, fmt.Sprintf("Could not check: %v", err), fmt.Errorf("check for updates: %w", err))
 	}
 
 	if !hasUpdate {
