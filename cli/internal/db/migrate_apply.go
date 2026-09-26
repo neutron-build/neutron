@@ -2172,9 +2172,9 @@ func (s *MigrationSession) RecordAppliedVersion(ctx context.Context, mf Migratio
 }
 
 // ApplyStatementsTx executes the statements as ONE transaction on the
-// pinned session (the session-level counterpart of Client.ApplyInTransaction,
-// so callers holding the advisory lock run their work on the locked
-// connection instead of a pool checkout).
+// pinned session, so callers holding the advisory lock run their work on
+// the locked connection instead of a pool checkout. It never splits: a
+// plan with an enum phase goes through ApplyPhases.
 func (s *MigrationSession) ApplyStatementsTx(ctx context.Context, statements []string, onApplied func(stmt string)) error {
 	tx, err := s.BeginTx(ctx)
 	if err != nil {

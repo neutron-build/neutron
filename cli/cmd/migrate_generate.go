@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +37,10 @@ var migrateGenerateCmd = &cobra.Command{
 Schema documents: version 2 (the cross-language contract in contracts/data/) plans through full catalog introspection — qualified schemas, composite PK/unique/check/foreign-key constraints, indexes with predicates and expressions, enums, arrays and views; version 1 (legacy @neutron-build/sql exportSchema output) keeps its historical behavior.
 
 Planning modes: --mode live (the default) diffs against the live database. --mode snapshot plans fully OFFLINE from the last accepted snapshot to the desired document, accounting for pending migrations — the second unapplied migration plans against the first's snapshot, no database connection is made, and nothing is written to the database. Each snapshot-mode migration also records a .plan.json risk/reversibility report and a target snapshot under migrations/snapshots/. Snapshot mode requires a schema document v2.
+
+Enum value additions: PostgreSQL cannot use an enum value inside the transaction that adds it (SQLSTATE 55P04), and each migration applies in one transaction. When a plan adds enum values and also changes anything else, generate writes the additions as their own earlier migration ("<name>_enum_values"), followed by the migration with the rest of the change; in snapshot mode each gets its own plan report and snapshot.
+
+Server versions: --mode live refuses statements the connected server cannot run (changing a generated column's expression needs ALTER COLUMN ... SET EXPRESSION, PostgreSQL 17+) and names the fix. --mode snapshot cannot know the target server: the plan report records the requirement as minServerMajor, and ` + "`neutron migrate`" + ` refuses older servers before running anything.
 
 The generated SQL never drops neutron-internal tables (_neutron_*), extension-owned objects, or anything absent from the schema unless --allow-destructive is passed as an explicit acknowledgement of data loss. Catalog structures this diff engine cannot represent faithfully are rejected with an error instead of producing a migration that falsely claims synchronization.`,
 	RunE: func(cmd *cobra.Command, args []string) error { return reportRunE(runMigrateGenerate(cmd, args)) },
@@ -151,20 +157,56 @@ func runMigrateGenerate(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	upSQL := strings.Join(result.Up, ";\n") + ";"
-	downSQL := strings.Join(reverseStrings(result.Down), ";\n") + ";"
-
-	upPath, downPath, err := db.CreateMigrationFilesWithContent(dir, name, upSQL, downSQL)
+	phases, err := db.PlanPhases(result)
 	if err != nil {
 		return err
 	}
+	names := phaseMigrationNames(name, phases)
+	var written []string
+	for i, ph := range phases {
+		upSQL := strings.Join(ph.Up, ";\n") + ";"
+		downSQL := strings.Join(reverseStrings(ph.Down), ";\n") + ";"
+		upPath, downPath, err := db.CreateMigrationFilesWithContent(dir, names[i], upSQL, downSQL)
+		if err != nil {
+			// Keep the set all-or-nothing: an enum-additions migration
+			// without its companion would change the planned sequence.
+			for _, f := range written {
+				os.Remove(f)
+			}
+			return err
+		}
+		written = append(written, upPath, downPath)
+	}
 
-	ui.Successf("Generated migration with %d statement(s):", len(result.Up))
-	fmt.Printf("  %s\n", upPath)
-	fmt.Printf("  %s\n", downPath)
+	if len(phases) > 1 {
+		ui.Infof("Enum value additions are written as their own earlier migration (%s): %s; each migration applies in one transaction.", names[0], db.EnumPhaseReason)
+	}
+	if len(phases) == 1 {
+		ui.Successf("Generated migration with %d statement(s):", len(result.Up))
+	} else {
+		ui.Successf("Generated %d migrations with %d statement(s):", len(phases), len(result.Up))
+	}
+	for _, f := range written {
+		fmt.Printf("  %s\n", f)
+	}
 	fmt.Println()
 	fmt.Println("Review the SQL, then apply with `neutron migrate`.")
 	return nil
+}
+
+// phaseMigrationNames names one migration per plan phase: a single phase
+// keeps the requested name; an enum-additions phase becomes
+// "<name>_enum_values", written first.
+func phaseMigrationNames(name string, phases []db.PlanPhase) []string {
+	out := make([]string, len(phases))
+	for i, ph := range phases {
+		if ph.EnumAdditions && len(phases) > 1 {
+			out[i] = name + "_enum_values"
+		} else {
+			out[i] = name
+		}
+	}
+	return out
 }
 
 // runMigrateGenerateSnapshot is the M03 offline path: plan from the last
@@ -229,38 +271,94 @@ func runMigrateGenerateSnapshot(cmd *cobra.Command, dir, schemaPath, name string
 	if err != nil {
 		return err
 	}
-	plan, err := db.BuildPlanArtifact(version, name, chain.HeadRef, chain.HeadSHA256, loaded.V2, renames, result)
+	phases, err := db.PlanPhases(result)
 	if err != nil {
 		return err
 	}
+	names := phaseMigrationNames(name, phases)
 
-	upSQL := strings.Join(result.Up, ";\n") + ";"
-	downSQL := strings.Join(reverseStrings(result.Down), ";\n") + ";"
-	files, err := db.MigrationArtifactSet(dir, version, name, plan, loaded.V2, upSQL, downSQL)
-	if err != nil {
-		return err
+	// One migration per phase. An enum-additions migration's target
+	// snapshot is the base plus the added values only; the next migration
+	// plans from it, so the chain records the real intermediate state.
+	type generated struct {
+		version string
+		plan    *db.PlanArtifact
+		files   []db.ArtifactFile
 	}
-	if err := db.WriteArtifactSet(files); err != nil {
+	var migs []generated
+	var all []db.ArtifactFile
+	baseRef, baseSHA := chain.HeadRef, chain.HeadSHA256
+	for i, ph := range phases {
+		target := loaded.V2
+		phaseRenames := renames
+		if ph.EnumAdditions && len(phases) > 1 {
+			target, err = db.EnumAdditionsTarget(baseDoc, loaded.V2)
+			if err != nil {
+				return err
+			}
+			phaseRenames = nil
+		}
+		if i > 0 {
+			n, err := strconv.Atoi(version)
+			if err != nil {
+				return fmt.Errorf("allocate migration version after %q: %w", version, err)
+			}
+			version = fmt.Sprintf("%03d", n+1)
+		}
+		plan, err := db.BuildPlanArtifact(version, names[i], baseRef, baseSHA, target, phaseRenames, db.DiffResult{Up: ph.Up, Down: ph.Down, Warnings: ph.Warnings})
+		if err != nil {
+			return err
+		}
+		if ph.EnumAdditions && len(phases) > 1 {
+			plan.Caveats = append(plan.Caveats, "enum value additions are their own migration: "+db.EnumPhaseReason+"; the next migration carries the rest of the change and plans from this migration's snapshot")
+		}
+		upSQL := strings.Join(ph.Up, ";\n") + ";"
+		downSQL := strings.Join(reverseStrings(ph.Down), ";\n") + ";"
+		files, err := db.MigrationArtifactSet(dir, version, names[i], plan, target, upSQL, downSQL)
+		if err != nil {
+			return err
+		}
+		migs = append(migs, generated{version: version, plan: plan, files: files})
+		all = append(all, files...)
+		baseRef = strings.TrimSuffix(filepath.Base(files[0].Path), ".up.sql")
+		baseSHA = target.SHA256Hex
+	}
+	if err := db.WriteArtifactSet(all); err != nil {
 		return err
 	}
 
 	ui.Infof("Planning base: snapshot %s (canonical SHA-256 %s)", chain.HeadRef, shortHashCLI(chain.HeadSHA256))
-	destructiveCount := 0
-	for _, op := range plan.Operations {
-		if op.Destructive {
-			destructiveCount++
+	if len(phases) > 1 {
+		ui.Infof("Enum value additions are written as their own earlier migration (%s_%s): %s; each migration applies in one transaction.", migs[0].version, names[0], db.EnumPhaseReason)
+	}
+	for i, m := range migs {
+		plan := m.plan
+		destructiveCount := 0
+		for _, op := range plan.Operations {
+			if op.Destructive {
+				destructiveCount++
+			}
+		}
+		label := "Risk report"
+		if len(migs) > 1 {
+			label += " " + m.version + "_" + names[i]
+		}
+		ui.Infof("%s: %d statement(s), %d destructive, %d irreversible — overall reversibility %s",
+			label, plan.Risk.StatementCount, destructiveCount, plan.Risk.IrreversibleCount, plan.Risk.OverallReversibility)
+		for _, op := range plan.Operations {
+			if op.Destructive || op.DataLoss {
+				ui.Warnf("operation %d is %s: %s", op.Index, riskLabel(op), firstLine(op.SQL))
+			}
+		}
+		if plan.MinServerMajor > 0 {
+			ui.Warnf("%s_%s requires PostgreSQL %d+; `neutron migrate` refuses older servers before running anything", m.version, names[i], plan.MinServerMajor)
 		}
 	}
-	ui.Infof("Risk report: %d statement(s), %d destructive, %d irreversible — overall reversibility %s",
-		plan.Risk.StatementCount, destructiveCount, plan.Risk.IrreversibleCount, plan.Risk.OverallReversibility)
-	for _, op := range plan.Operations {
-		if op.Destructive || op.DataLoss {
-			ui.Warnf("operation %d is %s: %s", op.Index, riskLabel(op), firstLine(op.SQL))
+	for i, m := range migs {
+		ui.Successf("Generated migration %s with %d statement(s):", m.version+"_"+names[i], len(m.plan.Operations))
+		for _, f := range m.files {
+			fmt.Printf("  %s\n", f.Path)
 		}
-	}
-	ui.Successf("Generated migration %s with %d statement(s):", version+"_"+name, len(result.Up))
-	for _, f := range files {
-		fmt.Printf("  %s\n", f.Path)
 	}
 	fmt.Println()
 	fmt.Println("Review the SQL and plan report, then apply with `neutron migrate`.")
@@ -332,7 +430,8 @@ func loadSchemaJSON(path string) (db.Schema, error) {
 // computeSchemaPlan diffs the desired document (either format) against the
 // live database. Version 1 keeps the exact historical behavior; version 2
 // uses introspection + diff over the schema contract v2 with a live twin
-// normalizer for expression equivalence.
+// normalizer for expression equivalence, and refuses statements the
+// connected server's version cannot run.
 func computeSchemaPlan(ctx context.Context, client *db.Client, loaded loadedSchema, renames map[string]string, allowDestructive bool) (db.DiffResult, error) {
 	if loaded.V1 != nil {
 		actual, err := client.IntrospectSchema(ctx)
@@ -354,10 +453,17 @@ func computeSchemaPlan(ctx context.Context, client *db.Client, loaded loadedSche
 		return db.DiffResult{}, err
 	}
 	defer norm.Close()
+	// The plan is for this server: statements it cannot run are refused
+	// at plan time, not left to fail at apply.
+	major, err := client.ServerMajorVersion(ctx)
+	if err != nil {
+		return db.DiffResult{}, fmt.Errorf("server version: %w", err)
+	}
 	return db.DiffV2Document(ctx, loaded.V2, actual, db.DiffV2Options{
 		Renames:          renames,
 		AllowDestructive: allowDestructive,
 		Normalizer:       norm,
+		ServerMajor:      major,
 	})
 }
 

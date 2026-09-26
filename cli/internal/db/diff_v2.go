@@ -30,6 +30,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -43,11 +44,18 @@ import (
 // against a recorded snapshot, not a live catalog, and its messages must
 // say so. Live callers leave it unset and every message keeps the
 // historical database wording byte-for-byte.
+//
+// ServerMajor is the connected server's PostgreSQL major version for plans
+// that will be applied to that server (db push, live migrate generate); 0
+// means unknown (offline snapshot planning, drift reports). With a known
+// version the planner refuses statements the server cannot run instead of
+// emitting a plan that is certain to fail at apply.
 type DiffV2Options struct {
 	Renames          map[string]string
 	AllowDestructive bool
 	Normalizer       V2Normalizer
 	SnapshotBase     bool
+	ServerMajor      int
 }
 
 // InternalMetadataNote ends the plan note for a neutron-internal table
@@ -242,9 +250,17 @@ func (p *v2Planner) desiredTable(id V2Identity) *V2Table {
 	}
 	var normalized *V2Table
 	if p.opts.Normalizer != nil && tableHasComparableExpressions(t) {
-		if n, err := p.opts.Normalizer.NormalizeTable(p.ctx, *t); err == nil {
+		n, err := p.opts.Normalizer.NormalizeTable(p.ctx, *t)
+		var partial *PartialNormalizationError
+		switch {
+		case err == nil:
 			normalized = &n
-		} else {
+		case errors.As(err, &partial):
+			// Elements normalized one by one; textual differences on
+			// this table stay flagged unverified.
+			normalized = &partial.Table
+			p.twinFailedTables[id] = true
+		default:
 			p.twinFailedTables[id] = true
 		}
 	}
@@ -547,6 +563,10 @@ func planEnumValues(p *v2Planner, de, ae V2EnumDecl) error {
 		}
 		p.warn("enum %s: value %q will be added%s (adding enum values is not reversible by generated down SQL)",
 			de.Identity, v, note)
+		p.result.EnumAdditions = append(p.result.EnumAdditions, EnumAddition{
+			Statement: stmt,
+			Warning:   p.result.Warnings[len(p.result.Warnings)-1],
+		})
 	}
 	return nil
 }
@@ -933,7 +953,12 @@ func (p *v2Planner) planColumnAttributes(table V2Identity, dc, ac V2Column) erro
 		)
 	case dc.Generated != nil && ac.Generated != nil:
 		if !p.textEqual(table, "column "+dc.Name+" generation expression", &dc.Generated.Expression, &ac.Generated.Expression) {
-			p.warn("table %s: generated column %q changes its expression via ALTER COLUMN ... SET EXPRESSION (PostgreSQL 17+; older servers reject the statement and the plan rolls back) — the table is rewritten to recompute values", table, dc.Name)
+			if p.opts.ServerMajor > 0 && p.opts.ServerMajor < SetExpressionMinServerMajor {
+				return fmt.Errorf(
+					"table %s: generated column %q changes its expression, which needs ALTER COLUMN ... SET EXPRESSION (PostgreSQL %d+); the connected server is PostgreSQL %d, so the plan would fail. Upgrade the server to PostgreSQL %d+, or replace the column explicitly in two steps: remove it from the schema and apply with --allow-destructive (its stored values are dropped), then add it back with the new expression (values are recomputed; a re-added column is placed last, so declare it last)",
+					table, dc.Name, SetExpressionMinServerMajor, p.opts.ServerMajor, SetExpressionMinServerMajor)
+			}
+			p.warn("table %s: generated column %q changes its expression via ALTER COLUMN ... SET EXPRESSION (requires PostgreSQL %d+) — the table is rewritten to recompute values", table, dc.Name, SetExpressionMinServerMajor)
 			p.emit(
 				fmt.Sprintf("alter table %s alter column %s set expression as (%s)", tq, cq, dc.Generated.Expression),
 				fmt.Sprintf("alter table %s alter column %s set expression as (%s)", tq, cq, ac.Generated.Expression),

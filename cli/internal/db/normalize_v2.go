@@ -72,10 +72,108 @@ func (n *TwinNormalizer) nextName() string {
 	return fmt.Sprintf("neutron_norm_%d", n.seq)
 }
 
+// PartialNormalizationError reports a table whose whole twin could not be
+// created, but whose expression elements were normalized one at a time:
+// Table carries every element the catalog could deparse, and the original
+// text for the rest. The typical cause is an element that uses an enum
+// value this plan adds (the live type does not have it yet), which must
+// not leave the table's unrelated expressions compared as raw text.
+// Comparisons on such a table stay flagged unverified.
+type PartialNormalizationError struct {
+	Table  V2Table
+	Failed []string
+	Err    error
+}
+
+func (e *PartialNormalizationError) Error() string {
+	return fmt.Sprintf("%v (normalized element by element; not normalized: %s)", e.Err, strings.Join(e.Failed, ", "))
+}
+
+func (e *PartialNormalizationError) Unwrap() error { return e.Err }
+
 func (n *TwinNormalizer) NormalizeTable(ctx context.Context, table V2Table) (V2Table, error) {
 	if n.conn == nil {
 		return table, fmt.Errorf("normalizer closed")
 	}
+	out, err := n.normalizeTableTwin(ctx, table)
+	if err == nil {
+		return out, nil
+	}
+	return n.normalizeTableElements(ctx, table, err)
+}
+
+// normalizeTableElements is the fallback after the whole twin failed: a
+// twin carrying only the column types must work (otherwise the original
+// error stands, e.g. a column type this plan creates), then every
+// expression element is normalized on its own twin.
+func (n *TwinNormalizer) normalizeTableElements(ctx context.Context, table V2Table, cause error) (V2Table, error) {
+	bare := table
+	bare.Columns = append([]V2Column(nil), table.Columns...)
+	for i := range bare.Columns {
+		if d := bare.Columns[i].Default; d != nil && d.Kind != "identity" {
+			bare.Columns[i].Default = nil
+		}
+		bare.Columns[i].Generated = nil
+	}
+	bare.Constraints = nil
+	bare.Indexes = nil
+	if _, err := n.normalizeTableTwin(ctx, bare); err != nil {
+		return table, cause
+	}
+
+	out := table
+	out.Columns = append([]V2Column(nil), table.Columns...)
+	out.Constraints = append([]V2Constraint(nil), table.Constraints...)
+	out.Indexes = append([]V2Index(nil), table.Indexes...)
+	var failed []string
+	for i, c := range table.Columns {
+		if c.Default != nil && (c.Default.Kind == "literal" || c.Default.Kind == "expression") {
+			one := bare
+			one.Columns = append([]V2Column(nil), bare.Columns...)
+			one.Columns[i].Default = c.Default
+			if got, err := n.normalizeTableTwin(ctx, one); err == nil {
+				out.Columns[i].Default = got.Columns[i].Default
+			} else {
+				failed = append(failed, "column "+c.Name+" default")
+			}
+		}
+		if c.Generated != nil {
+			one := bare
+			one.Columns = append([]V2Column(nil), bare.Columns...)
+			one.Columns[i].Generated = c.Generated
+			if got, err := n.normalizeTableTwin(ctx, one); err == nil {
+				out.Columns[i].Generated = got.Columns[i].Generated
+			} else {
+				failed = append(failed, "column "+c.Name+" generation expression")
+			}
+		}
+	}
+	for i, con := range table.Constraints {
+		if con.Type != "check" || con.Expression == nil {
+			continue
+		}
+		one := bare
+		one.Constraints = []V2Constraint{con}
+		if got, err := n.normalizeTableTwin(ctx, one); err == nil {
+			out.Constraints[i].Expression = got.Constraints[0].Expression
+		} else {
+			failed = append(failed, "check "+con.Name)
+		}
+	}
+	for i, idx := range table.Indexes {
+		one := bare
+		one.Indexes = []V2Index{idx}
+		if got, err := n.normalizeTableTwin(ctx, one); err == nil {
+			out.Indexes[i].Key = got.Indexes[0].Key
+			out.Indexes[i].Where = got.Indexes[0].Where
+		} else {
+			failed = append(failed, "index "+idx.Identity.Name)
+		}
+	}
+	return out, &PartialNormalizationError{Table: out, Failed: failed, Err: cause}
+}
+
+func (n *TwinNormalizer) normalizeTableTwin(ctx context.Context, table V2Table) (V2Table, error) {
 	tmp := n.nextName()
 
 	// Columns with defaults and check constraints; foreign keys and PK/

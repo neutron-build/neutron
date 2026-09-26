@@ -215,15 +215,23 @@ func TestDBPushV2E2E(t *testing.T) {
 		if code != 0 {
 			t.Fatalf("migrate generate v2 failed (%d):\n%s", code, out)
 		}
-		up := readFile(t, filepath.Join(gen, "001_to_b.up.sql"))
+		// The plan adds an enum value and changes other objects: the
+		// addition is its own earlier migration (Q09, SQLSTATE 55P04).
+		enumUp := readFile(t, filepath.Join(gen, "001_to_b_enum_values.up.sql"))
+		if !strings.Contains(enumUp, `alter type "public"."role" add value 'bot'`) || strings.Contains(enumUp, "drop index") {
+			t.Fatalf("001 must hold only the enum addition:\n%s", enumUp)
+		}
+		up := readFile(t, filepath.Join(gen, "002_to_b.up.sql"))
 		for _, want := range []string{
-			`alter type "public"."role" add value 'bot'`,
 			`drop index if exists "app"."posts_slug_idx"`,
 			`references "public"."users" ("id", "email") on delete restrict`,
 		} {
 			if !strings.Contains(up, want) {
 				t.Fatalf("generated migration missing %q:\n%s", want, up)
 			}
+		}
+		if strings.Contains(up, "add value") {
+			t.Fatalf("002 must not repeat the enum addition:\n%s", up)
 		}
 	})
 

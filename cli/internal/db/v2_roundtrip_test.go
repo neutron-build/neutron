@@ -98,7 +98,8 @@ func (h *m02Harness) queryOne(sql string) string {
 }
 
 // planAndApply diffs desired against the live database (with the twin
-// normalizer, exactly like db push) and applies the result atomically.
+// normalizer and server version, exactly like db push) and applies the
+// result through db push's apply primitive (applyLikePush).
 func (h *m02Harness) planAndApply(desiredJSON string, renames map[string]string, allowDestructive bool) DiffResult {
 	h.t.Helper()
 	desired := h.parseDoc(desiredJSON)
@@ -111,16 +112,21 @@ func (h *m02Harness) planAndApply(desiredJSON string, renames map[string]string,
 		h.t.Fatalf("normalizer: %v", err)
 	}
 	defer norm.Close()
+	major, err := h.client.ServerMajorVersion(context.Background())
+	if err != nil {
+		h.t.Fatalf("server version: %v", err)
+	}
 	result, err := DiffV2Document(context.Background(), desired, actual, DiffV2Options{
 		Renames:          renames,
 		AllowDestructive: allowDestructive,
 		Normalizer:       norm,
+		ServerMajor:      major,
 	})
 	if err != nil {
 		h.t.Fatalf("diff: %v", err)
 	}
 	if len(result.Up) > 0 {
-		if err := h.client.ApplyInTransaction(context.Background(), result.Up, nil); err != nil {
+		if err := applyLikePush(context.Background(), h.client, result); err != nil {
 			h.t.Fatalf("apply:\n%s\nerror: %v", strings.Join(result.Up, ";\n"), err)
 		}
 	}
@@ -834,13 +840,11 @@ func TestV2TwinFailureFlagsEquivalentCheckAndDefault(t *testing.T) {
 	h.exec(`CREATE INDEX t_low_idx ON t (lower(note)) WHERE slug <> ''`)
 
 	// Same expressions in hand-written spellings; optionally plus a column
-	// whose sequence default forces the twin CREATE to fail.
-	doc := func(withBrokenColumn bool) string {
-		broken := ""
-		if withBrokenColumn {
-			broken = `,{"name": "bad", "type": {"name": "int4", "codec": "number"}, "notNull": false,
+	// that makes the twin CREATE fail.
+	const seqColumn = `,{"name": "bad", "type": {"name": "int4", "codec": "number"}, "notNull": false,
 				"default": {"kind": "sequence", "sequence": {"schema": "public", "name": "no_such_seq"}}}`
-		}
+	const enumColumn = `,{"name": "bad", "type": {"name": "enum", "codec": "enum", "enum": {"schema": "public", "name": "fresh"}}, "notNull": false}`
+	doc := func(broken, enums string) string {
 		return `{
 			"version": 2, "dialect": "postgresql", "capabilities": [],
 			"schemas": [{"name": "public"}],
@@ -857,30 +861,36 @@ func TestV2TwinFailureFlagsEquivalentCheckAndDefault(t *testing.T) {
 					 "key": [{"expression": "lower(note)"}], "where": "slug <> ''"}
 				]
 			}],
-			"enums": [], "views": [], "opaque": []
+			"enums": [` + enums + `], "views": [], "opaque": []
 		}`
+	}
+	plan := func(desiredJSON string) DiffResult {
+		t.Helper()
+		desired := h.parseDoc(desiredJSON)
+		actual, err := h.client.IntrospectV2(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		norm, err := h.client.NewTwinNormalizer(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer norm.Close()
+		result, err := DiffV2Document(context.Background(), desired, actual, DiffV2Options{Normalizer: norm})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
 	}
 
 	// Control: with a working twin the equivalent spellings compare equal.
-	h.assertDiffEmpty(doc(false), nil, false)
+	h.assertDiffEmpty(doc("", ""), nil, false)
 
-	// Forced twin failure: plan (do not apply — the broken column would
-	// fail at apply) must carry unverified warnings for the check, the
-	// default and BOTH index fields.
-	desired := h.parseDoc(doc(true))
-	actual, err := h.client.IntrospectV2(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	norm, err := h.client.NewTwinNormalizer(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer norm.Close()
-	result, err := DiffV2Document(context.Background(), desired, actual, DiffV2Options{Normalizer: norm})
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Forced twin failure the normalizer cannot isolate: a column typed by
+	// an enum this plan creates first (no twin of the table can exist yet).
+	// Plan only (not applied) — it must carry unverified warnings for the
+	// check, the default and BOTH index fields.
+	result := plan(doc(enumColumn, `{"identity": {"schema": "public", "name": "fresh"}, "managed": true, "values": ["a"]}`))
 	for _, want := range []string{
 		"equivalence not verified for check constraint t_slug_check expression",
 		"equivalence not verified for column public.t.note default",
@@ -895,6 +905,21 @@ func TestV2TwinFailureFlagsEquivalentCheckAndDefault(t *testing.T) {
 		}
 		if !found {
 			t.Fatalf("missing unverified warning %q; warnings: %v", want, result.Warnings)
+		}
+	}
+
+	// Q09: a whole-twin failure caused by ONE element (here a sequence
+	// default; in practice a default or check using an enum value the plan
+	// adds) is normalized element by element: the equivalent check,
+	// default and index still compare equal through the catalog, so the
+	// plan is just the new column.
+	result = plan(doc(seqColumn, ""))
+	if len(result.Up) != 1 || !strings.Contains(result.Up[0], `add column "bad"`) {
+		t.Fatalf("only the new column may be planned, got %v", result.Up)
+	}
+	for _, w := range result.Warnings {
+		if strings.Contains(w, "equivalence not verified") {
+			t.Fatalf("elements the catalog normalized must not be reported unverified: %s", w)
 		}
 	}
 }

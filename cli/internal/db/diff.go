@@ -12,6 +12,17 @@ type DiffResult struct {
 	Up       []string
 	Down     []string
 	Warnings []string
+	// EnumAdditions are the plan's `alter type ... add value` statements
+	// (schema document v2), each with the warning it produced. PostgreSQL
+	// cannot use an enum value inside the transaction that adds it
+	// (SQLSTATE 55P04); PlanPhases gives them their own earlier unit.
+	EnumAdditions []EnumAddition
+}
+
+// EnumAddition is one planned enum value addition.
+type EnumAddition struct {
+	Statement string
+	Warning   string
 }
 
 func (d *DiffResult) warn(format string, args ...any) {

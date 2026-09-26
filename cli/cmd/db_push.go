@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -26,6 +27,10 @@ var dbPushCmd = &cobra.Command{
 	Use:   "push",
 	Short: "Push the schema directly to the database (no migration files)",
 	Long: `For prototyping: diffs the desired schema document against the live database and applies the changes immediately, in a single transaction (a mid-plan failure rolls everything back). Refuses to run when a migration history exists unless --force.
+
+One declared exception: PostgreSQL cannot use an enum value inside the transaction that adds it (SQLSTATE 55P04), so when a plan adds enum values and also changes anything else, the push runs in two reported phases — the enum value additions commit first in their own transaction, then the rest of the plan runs in one transaction. --dry-run shows the phase boundary. If the second phase fails it rolls back as a whole; the added enum values stay (PostgreSQL cannot remove them) and a re-run converges.
+
+Statements the connected server's PostgreSQL version cannot run are refused at plan time with the fix named (changing a generated column's expression needs PostgreSQL 17+).
 
 Push takes the migration runner's pinned advisory-lock session for the history check, plan and apply: a push never interleaves with a running migration. Dry-run stays lockless (it reports only).
 
@@ -109,18 +114,58 @@ func runDBPush(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Apply on the locked session: the plan's transaction runs on the same
-	// pinned connection that holds the advisory lock.
-	if err := sess.ApplyStatementsTx(ctx, result.Up, func(stmt string) {
-		ui.Infof("applied: %s", firstLine(stmt))
-	}); err != nil {
-		ui.Errorf("%v", err)
-		ui.Errorf("Rolled back — the database is unchanged (the whole plan runs in one transaction).")
-		return fmt.Errorf("push failed atomically")
+	phases, err := db.PlanPhases(result)
+	if err != nil {
+		return err
 	}
 
-	ui.Successf("Pushed %d statement(s) in one transaction.", len(result.Up))
+	// Apply on the locked session: every phase's transaction runs on the
+	// same pinned connection that holds the advisory lock.
+	if len(phases) == 1 {
+		if err := sess.ApplyPhases(ctx, phases, func(_ int, stmt string) {
+			ui.Infof("applied: %s", firstLine(stmt))
+		}); err != nil {
+			ui.Errorf("%v", errors.Unwrap(err))
+			ui.Errorf("Rolled back — the database is unchanged (the whole plan runs in one transaction).")
+			return fmt.Errorf("push failed atomically")
+		}
+		ui.Successf("Pushed %d statement(s) in one transaction.", len(result.Up))
+		return nil
+	}
+
+	// Enum value additions used by the same plan: two explicit phases.
+	started := -1
+	err = sess.ApplyPhases(ctx, phases, func(phase int, stmt string) {
+		if phase != started {
+			started = phase
+			ui.Infof("%s", phaseHeading(phase, phases))
+		}
+		ui.Infof("applied: %s", firstLine(stmt))
+	})
+	var phaseErr *db.PhaseApplyError
+	if errors.As(err, &phaseErr) {
+		ui.Errorf("%v", phaseErr.Err)
+		if phaseErr.Phase == 0 {
+			ui.Errorf("Rolled back — the database is unchanged (phase 1 of %d failed; no phase committed).", len(phases))
+			return fmt.Errorf("push failed atomically")
+		}
+		ui.Errorf("phase %d of %d rolled back as a whole — none of its statements applied.", phaseErr.Phase+1, len(phases))
+		ui.Errorf("phase 1 of %d (enum value additions) is committed and stays: PostgreSQL cannot remove enum values. The values are declared by the schema, so re-running the push after fixing the failure converges without re-adding them.", len(phases))
+		return fmt.Errorf("push failed in phase %d of %d", phaseErr.Phase+1, len(phases))
+	}
+	if err != nil {
+		return err
+	}
+	ui.Successf("Pushed %d statement(s) in %d transactions (enum value additions first).", len(result.Up), len(phases))
 	return nil
+}
+
+// phaseHeading names one transaction of a multi-phase push and its reason.
+func phaseHeading(phase int, phases []db.PlanPhase) string {
+	if phases[phase].EnumAdditions {
+		return fmt.Sprintf("phase %d of %d: enum value additions, committed in their own transaction first — %s", phase+1, len(phases), db.EnumPhaseReason)
+	}
+	return fmt.Sprintf("phase %d of %d: the rest of the plan, in one transaction", phase+1, len(phases))
 }
 
 func dbPushDryRun(ctx context.Context, client *db.Client, loaded loadedSchema, renames map[string]string, allowDestructive bool) error {
@@ -142,7 +187,18 @@ func dbPushDryRun(ctx context.Context, client *db.Client, loaded loadedSchema, r
 		}
 		return nil
 	}
-	fmt.Println(strings.Join(result.Up, ";\n") + ";")
+	phases, err := db.PlanPhases(result)
+	if err != nil {
+		return err
+	}
+	if len(phases) == 1 {
+		fmt.Println(strings.Join(result.Up, ";\n") + ";")
+		return nil
+	}
+	for i, ph := range phases {
+		fmt.Printf("-- %s\n", phaseHeading(i, phases))
+		fmt.Println(strings.Join(ph.Up, ";\n") + ";")
+	}
 	return nil
 }
 

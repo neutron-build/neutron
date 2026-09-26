@@ -53,7 +53,9 @@ session-pooled connection.
 
 Before any DDL runs, under the lock, the runner validates history shape and
 checksums, managed drift when the migrations directory carries a snapshot
-chain (changes made outside migration files abort the run; ` + "`neutron schema check --live`" + ` reports them), plan.json staleness for snapshot-workflow migrations, the statement-kind allowlist, and protected objects.
+chain (changes made outside migration files abort the run; ` + "`neutron schema check --live`" + ` reports them), plan.json staleness for snapshot-workflow migrations, the statement-kind allowlist, protected objects, and the server version: a migration whose plan.json records a minimum PostgreSQL version (minServerMajor), or that contains a statement form the planner knows to be version-gated (ALTER COLUMN ... SET EXPRESSION needs PostgreSQL 17+), is refused on an older server before any statement of the batch runs.
+
+A migration that uses an enum value it also adds cannot apply: PostgreSQL rejects the use inside the adding transaction (SQLSTATE 55P04). The migration rolls back and the error names the fix — move the ` + "`alter type ... add value`" + ` statements into their own earlier migration (` + "`neutron migrate generate`" + ` writes them that way).
 
 Migrations may contain only these statement kinds: SELECT (including WITH;
 data-modifying CTEs are target-guarded), INSERT/UPDATE/DELETE/MERGE,
@@ -342,6 +344,9 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if err := verifyExtensionCapabilities(ctx, client, pendings); err != nil {
+		return err
+	}
+	if err := verifyServerVersion(ctx, client, pendings); err != nil {
 		return err
 	}
 
