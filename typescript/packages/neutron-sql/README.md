@@ -139,6 +139,18 @@ suggestion — confirm intent with `--rename 'users.old>users.new'` (the `>`
 must be quoted in the shell; without quotes the shell reads it as a redirect
 and the flag never reaches the CLI).
 
+Enum value additions: PostgreSQL cannot use an enum value inside the
+transaction that adds it (SQLSTATE 55P04). When a plan adds enum values and
+also changes anything else, `migrate generate` writes the additions as their
+own earlier migration (`{version}_{name}_enum_values`), and `db push` applies
+them in their own reported transaction before the rest (`--dry-run` shows the
+boundary; if the second transaction fails, the added values stay and a re-run
+converges). Changing a generated column's expression uses
+`ALTER COLUMN ... SET EXPRESSION`, which needs PostgreSQL 17+: `db push` and
+`migrate generate --mode live` refuse it on older servers with the
+alternative named, and `--mode snapshot` records `minServerMajor` in the plan
+so `neutron migrate` refuses older servers before running anything.
+
 Safety semantics (contained-alpha): generated SQL never drops `_neutron_*`
 metadata tables, extension-owned objects, or anything absent from the schema
 unless `--allow-destructive` is passed as an explicit acknowledgement.

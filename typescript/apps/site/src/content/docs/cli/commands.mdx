@@ -102,6 +102,10 @@ neutron migrate --dir db/migrations    # custom directory
 
 Migrations are `.up.sql` files named `{NNN}_{name}.up.sql`. Each runs in a transaction that also records its history row (version, checksum, owner, format), so a migration is either fully applied or not applied at all.
 
+PostgreSQL cannot use an enum value inside the transaction that adds it (SQLSTATE 55P04). A migration that adds an enum value and uses it (in a view, check, default or cast) therefore rolls back, and the error names the fix: move the `alter type ... add value` statements into their own earlier migration. `neutron migrate generate` writes enum value additions that way (`{NNN}_{name}_enum_values`, then `{NNN+1}_{name}`) whenever the plan also changes anything else.
+
+Before any statement runs, migrations that need a newer PostgreSQL than the connected server are refused: a snapshot plan's recorded `minServerMajor`, or a version-gated statement such as `ALTER COLUMN ... SET EXPRESSION` (changing a generated column's expression, PostgreSQL 17+).
+
 Runners are serialized across processes with a PostgreSQL session-level advisory lock held on a dedicated connection from the history read through the final apply. Transaction-pooled proxies (for example PgBouncer in transaction mode) are unsupported for migration connections — use a direct or session-pooled connection.
 
 Applied migrations record a SHA-256 checksum of their SQL; a modified applied migration fails the next run before anything new is applied. `neutron migrate` targets PostgreSQL — for Nucleus databases use the language SDK runners (`go/nucleus`, `@neutron-build/nucleus`), which stay experimental.
