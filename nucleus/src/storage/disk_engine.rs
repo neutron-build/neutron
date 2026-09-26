@@ -1914,6 +1914,65 @@ impl DiskEngine {
         Ok(out)
     }
 
+    /// Every live tuple of `table` whose stored bytes are NOT the canonical
+    /// encoding of the table's current column list, decoded at the width it
+    /// was actually written at, with its stable row address.
+    ///
+    /// Two shapes qualify, both left behind by older engines or an interrupted
+    /// DDL rather than by damage:
+    ///
+    /// * a SHORT tuple — it decodes exactly against a leading prefix of the
+    ///   column list, i.e. it was written before an ADD COLUMN whose backfill
+    ///   did not finish. Returned with only the prefix's values
+    ///   (`row.len() < ncols`); the caller supplies the added columns.
+    /// * a full-width tuple in a legacy spelling (the pre-NU-239 zero-length
+    ///   JSONB payload): returned full-width, for re-encoding.
+    ///
+    /// Widths are tried widest first, and a tuple is only placed at a width it
+    /// decodes at EXACTLY (every byte consumed, bitmap padding clear) — never
+    /// by the lenient decode, which reads a wide tuple at a narrow width by
+    /// ignoring its tail. A tuple that fits no prefix is real corruption: the
+    /// scan fails naming it, and returns nothing, so a repair built on it
+    /// rewrites all of the table's drift or none of it.
+    fn scan_noncanonical_rows(&self, table: &str) -> Result<Vec<(usize, Row)>, StorageError> {
+        let col_types = self.col_types(table)?;
+        let pages = self.table_pages(table)?;
+        let mut out = Vec::new();
+        for page_id in pages {
+            let pg = self
+                .pool
+                .read_guard(page_id)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            let slot_count = page::read_u16(&pg, page::DATA_SLOT_COUNT);
+            for slot_idx in 0..slot_count {
+                let entry = page::read_slot(&pg, slot_idx);
+                if entry.is_dead() {
+                    continue;
+                }
+                let off = entry.offset() as usize;
+                let len = entry.length() as usize;
+                let data = &pg[off..off + len];
+                if let Some(row) = tuple::deserialize_row_exact(data, &col_types) {
+                    if tuple::serialize_row(&row, &col_types) != data {
+                        out.push((encode_row_pos(page_id, slot_idx), row));
+                    }
+                    continue;
+                }
+                let short = (1..col_types.len())
+                    .rev()
+                    .find_map(|width| tuple::deserialize_row_exact(data, &col_types[..width]));
+                let Some(row) = short else {
+                    return Err(StorageError::Corruption(format!(
+                        "page {page_id} slot {slot_idx} of '{table}' decodes at no width of \
+                         its column list — damage, not a layout this repair can widen"
+                    )));
+                };
+                out.push((encode_row_pos(page_id, slot_idx), row));
+            }
+        }
+        Ok(out)
+    }
+
     /// Push a page onto the free list for later reuse.
     fn free_page(&self, page_id: u32) -> Result<(), StorageError> {
         let mut head = self.free_list_head.lock();
@@ -2476,10 +2535,7 @@ pub(crate) struct TableSchemaSnapshot {
 impl DiskEngine {
     /// The catalog's current schema for `table`, in the form a deferred
     /// `CreateTable` replay needs. `None` when the catalog has no such table.
-    pub(crate) async fn table_schema_snapshot(
-        &self,
-        table: &str,
-    ) -> Option<TableSchemaSnapshot> {
+    pub(crate) async fn table_schema_snapshot(&self, table: &str) -> Option<TableSchemaSnapshot> {
         let def = self.catalog.get_table(table).await?;
         Some(TableSchemaSnapshot {
             col_types: def.columns.iter().map(|c| c.data_type.clone()).collect(),
@@ -2551,6 +2607,27 @@ impl StorageEngine for DiskEngine {
                 let cat_epoch = table_def.epoch;
                 let mut tables = self.tables.write();
                 if let Some(meta) = tables.get_mut(table) {
+                    // The directory records the column list the table's rows
+                    // were last written against. A catalog that EXTENDS it is
+                    // an ADD COLUMN whose backfill never finished (the catalog
+                    // is persisted first): rows on disk are still the shorter
+                    // width and will not decode against the widened schema.
+                    // Adopting the catalog is still right — it is the
+                    // authority — but say so, and name the repair.
+                    if meta.epoch == cat_epoch
+                        && col_names.len() > meta.col_names.len()
+                        && !meta.col_names.is_empty()
+                        && col_names.starts_with(&meta.col_names)
+                    {
+                        tracing::warn!(
+                            "table '{table}': catalog has {} column(s) but its stored rows were \
+                             written with {} — an ADD COLUMN did not finish its backfill. Rows \
+                             still at the old width will not read until `REPAIR TABLE {table}` \
+                             widens them",
+                            col_names.len(),
+                            meta.col_names.len()
+                        );
+                    }
                     meta.col_types = col_types;
                     meta.col_names = col_names;
                     // T0.3 epoch reconciliation: the on-disk directory records a
@@ -3108,6 +3185,10 @@ impl StorageEngine for DiskEngine {
         // Persist so the widened schema survives a restart.
         self.save_table_directory()?;
         Ok(())
+    }
+
+    async fn scan_noncanonical(&self, table: &str) -> Result<Vec<(usize, Row)>, StorageError> {
+        self.scan_noncanonical_rows(table)
     }
 
     async fn rebuild_table_indexes(&self, table: &str) -> Result<(), StorageError> {
