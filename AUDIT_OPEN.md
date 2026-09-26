@@ -1,5 +1,14 @@
 # Open audit items
 
+## 2026-09-25 — sandbox command environment
+
+SandboxExecutor previously dropped ExecOptions.env while LocalExecutor honored
+it. It now forwards the map as the daemon exec body field without interpolating
+values into the shell command. Tests preserve quotes/spaces, empty values, cwd
+and timeout and verify that callers without env retain the previous body shape.
+This requires a daemon that supports exec env; the compatible daemon validates
+names and payload limits and confines values to the command environment.
+
 Unresolved findings for this repository from the ChatGPT-led audit series.
 Read this before treating related work as done; update it when you close,
 defer, or upstream-report an item.
