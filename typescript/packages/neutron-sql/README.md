@@ -1189,7 +1189,10 @@ single `json_build_object` that is `null` when the foreign key misses, and a
 nested `with` embeds the next level's subquery inside the child's JSON object.
 (Plain `json`, not `jsonb`: the relation JSON is built once and parsed once, so
 jsonb's conversion only cost server time — about 1.7x on a 100-parent page
-with 20 children per edge, measured by `bench/orm-gate.mjs`.)
+with 20 children per edge, measured by `bench/orm-gate.mjs`. Relation leaves
+therefore decode like the same column read at the top level: a float `-0`
+keeps its sign, a `json` column keeps its key order and duplicate keys as
+the driver parses them, and a `json` column holding `\u0000` reads.)
 Sibling relations never join each other, so two to-many children (or two
 relations to the same target — `created_by` + `updated_by` both to `users`)
 return each child set exactly, with no cartesian fan-out; each edge gets its
