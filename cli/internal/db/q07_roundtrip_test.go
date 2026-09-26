@@ -83,6 +83,27 @@ func (h *q07Harness) queryOne(sql string) string {
 	return v
 }
 
+// tryPlanAndApply plans and applies like planAndApply but returns the apply
+// error instead of failing.
+func (h *q07Harness) tryPlanAndApply(desiredJSON string) error {
+	h.t.Helper()
+	desired := h.parseDoc(desiredJSON)
+	actual, err := h.client.IntrospectV2(context.Background())
+	if err != nil {
+		h.t.Fatalf("introspect: %v", err)
+	}
+	norm, err := h.client.NewTwinNormalizer(context.Background())
+	if err != nil {
+		h.t.Fatalf("normalizer: %v", err)
+	}
+	defer norm.Close()
+	result, err := DiffV2Document(context.Background(), desired, actual, DiffV2Options{Normalizer: norm})
+	if err != nil {
+		h.t.Fatalf("diff: %v", err)
+	}
+	return h.client.ApplyInTransaction(context.Background(), result.Up, nil)
+}
+
 func (h *q07Harness) planAndApply(desiredJSON string) DiffResult {
 	h.t.Helper()
 	desired := h.parseDoc(desiredJSON)
@@ -387,12 +408,31 @@ func TestQ07RoundTripModifications(t *testing.T) {
 	h.planAndApply(q07Doc1)
 	h.assertDiffEmpty(q07Doc1)
 
-	res := h.planAndApply(q07Doc2)
+	// ALTER COLUMN ... SET EXPRESSION is PostgreSQL 17+. Older servers
+	// reject the statement and the whole plan rolls back (the planner warns
+	// so); the rest of the modifications then round-trip without it.
+	doc2, newExpr := q07Doc2, true
+	if h.queryOne(`SELECT (current_setting('server_version_num')::int < 170000)::text`) == "true" {
+		if err := h.tryPlanAndApply(q07Doc2); err == nil || !strings.Contains(err.Error(), "expression") {
+			t.Fatalf("PostgreSQL before 17 must reject SET EXPRESSION, got %v", err)
+		}
+		// Rolled back, except the documented ApplyInTransaction exception:
+		// the enum addition commits first and stays.
+		if got := h.queryOne(`SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'app.tenants'::regclass AND adnum = (SELECT attnum FROM pg_attribute WHERE attrelid='app.tenants'::regclass AND attname='scores')`); strings.Contains(got, "7") {
+			t.Fatalf("the rejected plan must roll back (scores default is %q)", got)
+		}
+		if got := h.queryOne(`SELECT count(*)::text FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'mood' AND n.nspname = 'app' AND e.enumlabel = 'elated'`); got != "1" {
+			t.Fatalf("the enum addition commits ahead of the plan (documented), got %s", got)
+		}
+		doc2, newExpr = strings.Replace(q07Doc2, `"expression": "net * 3"`, `"expression": "net * 2"`, 1), false
+	}
+
+	res := h.planAndApply(doc2)
 	if len(res.Up) == 0 {
 		t.Fatal("modification plan must emit statements")
 	}
-	h.assertDiffEmpty(q07Doc2)
-	res2 := h.planAndApply(q07Doc2)
+	h.assertDiffEmpty(doc2)
+	res2 := h.planAndApply(doc2)
 	if len(res2.Up) != 0 {
 		t.Fatalf("second apply must be a no-op, got %v", res2.Up)
 	}
@@ -400,7 +440,7 @@ func TestQ07RoundTripModifications(t *testing.T) {
 	if got := h.queryOne(`SELECT indexdef FROM pg_indexes WHERE schemaname='app' AND indexname='tenants_order_idx'`); strings.Contains(got, "DESC") || !strings.Contains(got, "scores NULLS FIRST") || strings.Contains(got, "name NULLS") {
 		t.Fatalf("flipped ordering must round-trip (no DESC, scores NULLS FIRST, name plain): %s", got)
 	}
-	if got := h.queryOne(`SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'app.tenants'::regclass AND adnum = (SELECT attnum FROM pg_attribute WHERE attrelid='app.tenants'::regclass AND attname='gross')`); !strings.Contains(got, "3)") || strings.Contains(got, "2)") {
+	if got := h.queryOne(`SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'app.tenants'::regclass AND adnum = (SELECT attnum FROM pg_attribute WHERE attrelid='app.tenants'::regclass AND attname='gross')`); newExpr && (!strings.Contains(got, "3)") || strings.Contains(got, "2)")) {
 		t.Fatalf("SET EXPRESSION must round-trip, got %q", got)
 	}
 	if got := h.queryOne(`SELECT count(*)::text FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'mood' AND n.nspname = 'app'`); got != "4" {
