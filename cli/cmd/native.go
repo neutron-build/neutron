@@ -107,23 +107,20 @@ func runNativeInit(cmd *cobra.Command, args []string) error {
 
 	// Check prerequisites
 	if _, err := exec.LookPath("npx"); err != nil {
-		spinner.StopWithMessage(ui.CrossMark, "Node.js not found — install from https://nodejs.org")
-		return err
+		return failSpinner(spinner, "Node.js not found — install from https://nodejs.org", err)
 	}
 
 	// Use @react-native-community/cli to init, then overlay Neutron template
 	initCmd := exec.Command("npx", "@react-native-community/cli", "init", name, "--skip-install")
 	if out, err := initCmd.CombinedOutput(); err != nil {
-		spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("React Native init failed: %s", string(out)))
-		return err
+		return failSpinner(spinner, fmt.Sprintf("React Native init failed: %s", string(out)), err)
 	}
 
 	// Install Neutron dependencies
 	installCmd := exec.Command("npm", "install", "@neutron/native", "@neutron/native-styling", "react-native-reanimated", "react-native-gesture-handler")
 	installCmd.Dir = name
 	if out, err := installCmd.CombinedOutput(); err != nil {
-		spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("npm install failed: %s", string(out)))
-		return err
+		return failSpinner(spinner, fmt.Sprintf("npm install failed: %s", string(out)), err)
 	}
 
 	// Install Re.Pack
@@ -249,8 +246,7 @@ func runNativeBuild(cmd *cobra.Command, args []string) error {
 			"archive",
 		)
 		if out, err := buildCmd.CombinedOutput(); err != nil {
-			spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("iOS build failed: %s", string(out)))
-			return err
+			return failSpinner(spinner, fmt.Sprintf("iOS build failed: %s", string(out)), err)
 		}
 
 		spinner.StopWithMessage(ui.CheckMark, "iOS archive built")
@@ -264,8 +260,7 @@ func runNativeBuild(cmd *cobra.Command, args []string) error {
 		buildCmd := exec.Command(gradlew, "bundleRelease")
 		buildCmd.Dir = filepath.Join(root, "android")
 		if out, err := buildCmd.CombinedOutput(); err != nil {
-			spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Android build failed: %s", string(out)))
-			return err
+			return failSpinner(spinner, fmt.Sprintf("Android build failed: %s", string(out)), err)
 		}
 
 		spinner.StopWithMessage(ui.CheckMark, "Android AAB built")

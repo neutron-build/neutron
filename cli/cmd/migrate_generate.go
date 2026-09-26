@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -42,11 +43,12 @@ The generated SQL never drops neutron-internal tables (_neutron_*), extension-ow
 // reportRunE prints a RunE error where it happens and marks it reported, so
 // Execute does not print it again.
 func reportRunE(err error) error {
-	if err != nil {
+	var reported reportedError
+	if err != nil && !errors.As(err, &reported) {
 		ui.Errorf("%v", err)
 		return reportedError{err}
 	}
-	return nil
+	return err
 }
 
 // parseSchemaRenames dispatches rename-flag parsing per document format:

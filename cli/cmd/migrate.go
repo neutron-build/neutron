@@ -368,8 +368,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 						"interrupted after %d of %d pending migration(s) (%s_%s failed MID-FILE outside any transaction; its earlier statements' effects REMAIN — no rollback is pretended):\n%v\ninspect and recover explicitly: `neutron migrate resolve %s`",
 						count, len(pendings), p.File.Version, p.File.Name, err, p.File.Version)
 				}
-				spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Failed %s_%s: %v", p.File.Version, p.File.Name, err))
-				return err
+				return failSpinner(spinner, fmt.Sprintf("Failed %s_%s: %v", p.File.Version, p.File.Name, err), err)
 			}
 			spinner.StopWithMessage(ui.CheckMark, fmt.Sprintf("Applied %s_%s", p.File.Version, p.File.Name))
 			count++
@@ -652,8 +651,7 @@ func runMigrateDown(cmd *cobra.Command, args []string) error {
 	for _, f := range toRevert {
 		spinner := ui.NewSpinner(fmt.Sprintf("Reverting %s_%s...", f.Version, f.Name))
 		if err := sess.RevertMigration(ctx, f); err != nil {
-			spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Failed %s_%s: %v", f.Version, f.Name, err))
-			return err
+			return failSpinner(spinner, fmt.Sprintf("Failed %s_%s: %v", f.Version, f.Name, err), err)
 		}
 		spinner.StopWithMessage(ui.CheckMark, fmt.Sprintf("Reverted %s_%s", f.Version, f.Name))
 	}
