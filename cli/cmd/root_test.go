@@ -92,24 +92,33 @@ func TestCommandErrorsArePrintedOnce(t *testing.T) {
 	port := busy.Addr().(*net.TCPAddr).Port
 	home := t.TempDir()
 
+	var stdout string
 	run := func(args ...string) (int, string) {
 		c := exec.Command(bin, args...)
 		c.Dir = home
 		c.Env = []string{"HOME=" + home, "USERPROFILE=" + home, "SystemRoot=" + os.Getenv("SystemRoot")}
-		out, err := c.CombinedOutput()
+		var outBuf, errBuf strings.Builder
+		c.Stdout, c.Stderr = &outBuf, &errBuf
+		err := c.Run()
 		code := 0
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			code = exitErr.ExitCode()
 		} else if err != nil {
 			t.Fatalf("run %v: %v", args, err)
 		}
-		return code, string(out)
+		stdout = outBuf.String()
+		return code, outBuf.String() + errBuf.String()
 	}
 
 	code, out := run("studio", "--port", strconv.Itoa(port))
 	want := fmt.Sprintf("listen on port %d", port)
 	if code != 1 || strings.Count(out, want) != 1 {
 		t.Fatalf("studio on a busy port: exit %d, want 1 and %q once in:\n%s", code, want, out)
+	}
+	// stdout may be a command's machine-readable output (--json): the error
+	// goes to stderr.
+	if strings.Contains(stdout, want) {
+		t.Fatalf("the unreported error went to stdout:\n%s", stdout)
 	}
 	if strings.Contains(out, "Studio is running") || strings.Contains(out, "Starting Studio") {
 		t.Fatalf("studio on a busy port announced a running server:\n%s", out)
@@ -118,5 +127,16 @@ func TestCommandErrorsArePrintedOnce(t *testing.T) {
 	code, out = run("migrate", "generate", "--schema", filepath.Join(home, "absent.json"))
 	if code != 1 || strings.Count(out, "read schema") != 1 {
 		t.Fatalf("migrate generate without a schema: exit %d, want 1 and one report in:\n%s", code, out)
+	}
+
+	// Application errors report themselves ("Application: ...") once.
+	code, out = run("project", "check")
+	i := strings.Index(out, "Application: ")
+	if code != 1 || i < 0 {
+		t.Fatalf("project check outside a project: exit %d, want 1 and an Application report in:\n%s", code, out)
+	}
+	msg := strings.TrimSpace(strings.SplitN(out[i+len("Application: "):], "\n", 2)[0])
+	if strings.Count(out, msg) != 1 {
+		t.Fatalf("project check printed its error more than once:\n%s", out)
 	}
 }

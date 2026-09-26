@@ -69,5 +69,5 @@ func loadApplication(selected string) (*project.Plan, error) {
 }
 func applicationError(cmd *cobra.Command, err error) error {
 	fmt.Fprintf(cmd.ErrOrStderr(), "Application: %v\n", err)
-	return err
+	return reportedError{err}
 }
