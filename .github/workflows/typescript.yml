@@ -130,15 +130,16 @@ jobs:
   # drops its own uniquely named throwaway database. NEUTRON_LIVE_REQUIRED=1
   # means a missing URL or an unreachable server fails the run instead of
   # skipping — locally, without the env, the same tests skip with a visible
-  # reason. Image: postgres:17 (repo workflows pin no digests; majors are
+  # reason. Image: pgvector/pgvector:pg17 (repo workflows pin no digests; majors are
   # declared/reassessed at release per VERIFICATION, 16/18 are release-time).
   #
   # R01: the job runs on both Node lines the repo builds with (22, 24) and,
   # after the suite, the two gates in packages/neutron-sql/bench/ (see its
   # README): orm-gate.mjs (100-parent relation pages at 0/2/20 children on
   # two edges plus depth 3; results equal to hand-written SQL and to the
-  # pinned drizzle-orm, one statement per read counted client- and
-  # server-side, index use, server time vs the hand-written statement,
+  # pinned drizzle-orm, one statement per read (client logger) and one
+  # server transaction per read (pg_stat_database), index use under every
+  # relation edge, server time vs the hand-written statement,
   # streaming early-exit release, generous p50 ceilings) and
   # typecheck-gate.mjs (100-table depth-3 consumer project; type and
   # instantiation counts are deterministic per TypeScript version).

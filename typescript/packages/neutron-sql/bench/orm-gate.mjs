@@ -15,9 +15,14 @@
 //     SQL oracles (one correlated statement; parent + two IN-list queries
 //     assembled in JS) and against the pinned reference tool (drizzle-orm,
 //     exact devDependency pin), for both the two-edge page and a depth-3 page;
-//   - statements per call, counted twice: client-side from the structured
-//     logger and server-side from pg_stat_database transaction counters
-//     around a closed pool (an N+1 regression shows up in both);
+//   - statements per call from the structured logger (client side), and
+//     server transactions per call from pg_stat_database xact counters
+//     around a closed pool. The server counter counts TRANSACTIONS, not
+//     statements: it catches an autocommit N+1 (one transaction per extra
+//     query) independently of the client logger, but an N+1 wrapped in one
+//     transaction counts 1 there and is caught by the logger alone
+//     (pg_stat_statements would count statements, but it needs a
+//     preloaded library the CI image does not configure);
 //   - the server plan (EXPLAIN ANALYZE of the exact compiled statement,
 //     interleaved with the hand-written statement): node types, index use on
 //     child edges, server execution time and its ratio to the hand-written
@@ -492,9 +497,12 @@ const canonAmounts = (rows) => rows.map((u) => (u.audits ? { ...u, audits: u.aud
 
 // ------------------------------------------------------------------ plans
 
-function walkPlan(node, out = []) {
-  out.push({ type: node["Node Type"], relation: node["Relation Name"] ?? null, index: node["Index Name"] ?? null });
-  for (const child of node.Plans ?? []) walkPlan(child, out);
+// inSubPlan marks nodes under a SubPlan/InitPlan: the relation edges. The
+// root parent scan is the only node outside one.
+function walkPlan(node, out = [], inSubPlan = false) {
+  const sub = inSubPlan || node["Parent Relationship"] === "SubPlan" || node["Parent Relationship"] === "InitPlan";
+  out.push({ type: node["Node Type"], relation: node["Relation Name"] ?? null, index: node["Index Name"] ?? null, inSubPlan: sub });
+  for (const child of node.Plans ?? []) walkPlan(child, out, sub);
   return out;
 }
 const nodeLabel = (x) => `${x.type}${x.relation ? `(${x.relation}${x.index ? `/${x.index}` : ""})` : ""}`;
@@ -526,7 +534,9 @@ async function explainPair(neutronSql, neutronParams, handSql, handParams, runs)
       planningMs: r3(plan["Planning Time"]),
       nodes: [...new Set(nodes.map(nodeLabel))],
       handNodes: [...new Set(walkPlan(handPlan.Plan).map(nodeLabel))],
-      childSeqScans: nodes.filter((x) => x.type === "Seq Scan" && x.relation !== "users").map((x) => x.relation),
+      // Every relation-edge scan counts, including to-one lookups of users
+      // (commenter -> users at depth 3); only the root users scan is exempt.
+      childSeqScans: nodes.filter((x) => x.type === "Seq Scan" && x.inSubPlan).map((x) => x.relation),
       sharedHit: plan.Plan["Shared Hit Blocks"] ?? null,
       sharedRead: plan.Plan["Shared Read Blocks"] ?? null,
     };
@@ -582,12 +592,12 @@ async function timed(fn, iterations, warmup) {
   };
 }
 
-// Server-side statement count per call: (xacts(1 + M calls) - xacts(1 call)) / M,
+// Server-side TRANSACTION count per call: (xacts(1 + M calls) - xacts(1 call)) / M,
 // each measured around a pool that is closed before reading, so the backend
 // flushed its counters at exit. Setup statements cancel out. Foreign
 // transactions in the database (an autovacuum worker's visit) can only ADD
 // to a window, so the minimum over repetitions is the robust estimate.
-async function serverStatementsPerCall(open, call, m = 10) {
+async function serverTransactionsPerCall(open, call, m = 10) {
   async function run(n) {
     const before = await settledXacts();
     const h = await open();
@@ -730,14 +740,14 @@ async function runScale(scale) {
           } finally {
             await db.close();
           }
-          d.serverStatementsPerCall = await serverStatementsPerCall(
+          d.serverTransactionsPerCall = await serverTransactionsPerCall(
             async () => {
               const h = await openNeutron(driver, { count: 0 });
               return { db: h, close: () => h.close() };
             },
             (h) => h.db.query.users.findMany(nArgs),
           );
-          check(`${label} ${driver}: one statement per relational read (server count)`, () => assert.equal(d.serverStatementsPerCall, 1));
+          check(`${label} ${driver}: one server transaction per relational read (pg_stat_database)`, () => assert.equal(d.serverTransactionsPerCall, 1));
 
           // Pinned reference tool, same page.
           const dz = openDrizzle(driver);

@@ -5,7 +5,7 @@ one readable SQL statement per query, `toSQL()` on everything. Zero runtime
 dependencies — bring `postgres` or `pg` (or both) as optional peers.
 
 **Alpha — contained, not production-ready.** The verified support matrix is
-PostgreSQL 17 only: CI runs the live suites against the `postgres:17` image
+PostgreSQL 17 only: CI runs the live suites against the `pgvector/pgvector:pg17` image
 with both drivers; the machine that produced the recorded live evidence runs
 17.11. Postgres 16/18 are release-time matrix work and are **not** claimed.
 Nucleus and other Postgres-wire engines are untested here — no compatibility
@@ -1378,7 +1378,7 @@ Alpha — contained, not production-ready. Known-unsafe paths found in review
 were fixed or converted into explicit rejections; nothing here certifies
 general-purpose use.
 
-- Verified against PostgreSQL 17 only (CI `postgres:17`; recorded live
+- Verified against PostgreSQL 17 only (CI `pgvector/pgvector:pg17`; recorded live
   evidence on 17.11), both drivers. 16/18 and non-Postgres engines: not
   claimed.
 - Implemented and live-tested: typed CRUD (`select`/`insert`/`update`/
