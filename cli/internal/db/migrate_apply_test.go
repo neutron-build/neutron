@@ -939,3 +939,21 @@ func TestCheckStatementAllowlist(t *testing.T) {
 		}
 	}
 }
+
+// A snapshot plan names its migration by the slug the files carry: a name
+// typed with spaces or capitals ("Add Users") writes 001_add_users.* and the
+// plan must agree, or migrate refuses the pair as mismatched.
+func TestPlanArtifactRecordsTheFileSlug(t *testing.T) {
+	ops := DiffResult{Up: []string{"CREATE TABLE a (id int)"}, Down: []string{"DROP TABLE a"}}
+	doc, err := EmptyV2Document()
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := BuildPlanArtifact("001", "Add Users", "empty", doc.SHA256Hex, doc, nil, ops)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.MigrationName != "add_users" {
+		t.Fatalf("plan migrationName = %q, want the file slug add_users", plan.MigrationName)
+	}
+}
