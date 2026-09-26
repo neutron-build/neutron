@@ -43,8 +43,7 @@ func runSeed(cmd *cobra.Command, args []string) error {
 
 	spinner := ui.NewSpinner(fmt.Sprintf("Seeding from %s...", seedPath))
 	if err := client.RunSeedFile(ctx, seedPath); err != nil {
-		spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Seed failed: %v", err))
-		return err
+		return failSpinner(spinner, fmt.Sprintf("Seed failed: %v", err), err)
 	}
 
 	spinner.StopWithMessage(ui.CheckMark, fmt.Sprintf("Seeded from %s", seedPath))

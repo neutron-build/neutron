@@ -87,16 +87,14 @@ func runDBStart(cmd *cobra.Command, args []string) error {
 	spinner = ui.NewSpinner("Downloading Nucleus binary...")
 	binaryPath, err := nucleus.FindOrDownload(resolvedVer)
 	if err != nil {
-		spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Download failed: %v", err))
-		return err
+		return failSpinner(spinner, fmt.Sprintf("Download failed: %v", err), err)
 	}
 	spinner.StopWithMessage(ui.CheckMark, "Binary ready")
 
 	spinner = ui.NewSpinner(fmt.Sprintf("Starting Nucleus on port %d...", port))
 	pid, err := nucleus.Start(binaryPath, port, dataDir, memory)
 	if err != nil {
-		spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Failed to start: %v", err))
-		return err
+		return failSpinner(spinner, fmt.Sprintf("Failed to start: %v", err), err)
 	}
 	spinner.StopWithMessage(ui.CheckMark, fmt.Sprintf("Nucleus running (PID %d, port %d)", pid, port))
 
@@ -118,8 +116,7 @@ func runDBStop(cmd *cobra.Command, args []string) error {
 
 	spinner := ui.NewSpinner(fmt.Sprintf("Stopping Nucleus (PID %d)...", pid))
 	if err := nucleus.Stop(); err != nil {
-		spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Failed: %v", err))
-		return err
+		return failSpinner(spinner, fmt.Sprintf("Failed: %v", err), err)
 	}
 	spinner.StopWithMessage(ui.CheckMark, "Nucleus stopped")
 	return nil
@@ -189,8 +186,7 @@ BEGIN
 END $$;`
 
 	if err := client.Exec(ctx, dropSQL); err != nil {
-		spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Reset failed: %v", err))
-		return err
+		return failSpinner(spinner, fmt.Sprintf("Reset failed: %v", err), err)
 	}
 
 	spinner.StopWithMessage(ui.CheckMark, "Database reset complete")

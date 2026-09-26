@@ -61,8 +61,7 @@ func runUpgrade(cmd *cobra.Command, args []string) error {
 
 	spinner = ui.NewSpinner("Downloading...")
 	if err := selfupdate.DownloadAndReplace(cmd.Context(), release); err != nil {
-		spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Upgrade failed: %v", err))
-		return err
+		return failSpinner(spinner, fmt.Sprintf("Upgrade failed: %v", err), err)
 	}
 
 	spinner.StopWithMessage(ui.CheckMark, fmt.Sprintf("Upgraded to %s", release.TagName))

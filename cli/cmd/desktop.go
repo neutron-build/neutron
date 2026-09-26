@@ -135,8 +135,7 @@ func runDesktopBuild(cmd *cobra.Command, args []string) error {
 	buildCmd := exec.Command("npx", "vite", "build")
 	buildCmd.Dir = root
 	if out, err := buildCmd.CombinedOutput(); err != nil {
-		spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Frontend build failed: %s", string(out)))
-		return err
+		return failSpinner(spinner, fmt.Sprintf("Frontend build failed: %s", string(out)), err)
 	}
 
 	// Build Tauri
@@ -151,8 +150,7 @@ func runDesktopBuild(cmd *cobra.Command, args []string) error {
 	tauriCmd := exec.Command("cargo", tauriArgs...)
 	tauriCmd.Dir = filepath.Join(root, "src-tauri")
 	if out, err := tauriCmd.CombinedOutput(); err != nil {
-		spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Tauri build failed: %s", string(out)))
-		return err
+		return failSpinner(spinner, fmt.Sprintf("Tauri build failed: %s", string(out)), err)
 	}
 
 	spinner.StopWithMessage(ui.CheckMark, "Desktop app built successfully")

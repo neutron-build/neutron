@@ -54,8 +54,7 @@ func runNew(cmd *cobra.Command, args []string) error {
 	spinner := ui.NewSpinner(fmt.Sprintf("Creating %s project %q...", lang.DisplayName(), name))
 
 	if err := scaffold.ScaffoldProject(name, lang); err != nil {
-		spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Failed: %v", err))
-		return err
+		return failSpinner(spinner, fmt.Sprintf("Failed: %v", err), err)
 	}
 
 	spinner.StopWithMessage(ui.CheckMark, fmt.Sprintf("Created %s project %q", lang.DisplayName(), name))

@@ -58,6 +58,13 @@ type reportedError struct{ error }
 
 func (e reportedError) Unwrap() error { return e.error }
 
+// failSpinner stops the spinner with the failure message and returns err
+// marked as reported: the spinner line is the report.
+func failSpinner(s *ui.Spinner, message string, err error) error {
+	s.StopWithMessage(ui.CrossMark, message)
+	return reportedError{err}
+}
+
 func init() {
 	cobra.OnInitialize(initConfig)
 

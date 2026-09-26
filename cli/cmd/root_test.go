@@ -129,6 +129,25 @@ func TestCommandErrorsArePrintedOnce(t *testing.T) {
 		t.Fatalf("migrate generate without a schema: exit %d, want 1 and one report in:\n%s", code, out)
 	}
 
+	// Spinner failures report themselves ("✗ Failed: ...") once.
+	if err := os.Mkdir(filepath.Join(home, "exists"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	code, out = run("new", "exists", "--lang", "go")
+	if code != 1 || strings.Count(out, `"exists" already exists`) != 1 {
+		t.Fatalf("new into an existing directory: exit %d, want 1 and one report in:\n%s", code, out)
+	}
+	if base := os.Getenv("NEUTRON_E2E_DATABASE_URL"); base != "" {
+		seed := filepath.Join(home, "fail.sql")
+		if err := os.WriteFile(seed, []byte("SELECT 1/0;\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		code, out = run("seed", "--url", base, "-f", seed)
+		if code != 1 || strings.Count(out, "division by zero") != 1 {
+			t.Fatalf("seed with a failing statement: exit %d, want 1 and one report in:\n%s", code, out)
+		}
+	}
+
 	// Application errors report themselves ("Application: ...") once.
 	code, out = run("project", "check")
 	i := strings.Index(out, "Application: ")
