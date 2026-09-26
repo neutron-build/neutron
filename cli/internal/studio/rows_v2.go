@@ -328,7 +328,7 @@ func runGuardedMutation(ctx context.Context, q rowQuerier, sqlText string, args 
 	var n int64
 	var ver, tid string
 	wrapped := fmt.Sprintf(
-		"WITH mutated AS (%s RETURNING xmin::text AS ver, ctid::text AS tid) SELECT count(*) AS n, COALESCE(max(ver),''), COALESCE(max(tid),'') FROM mutated",
+		"WITH mutated AS (%s RETURNING xmin::text AS ver, (tableoid::oid::text || ':' || ctid::text) AS tid) SELECT count(*) AS n, COALESCE(max(ver),''), COALESCE(max(tid),'') FROM mutated",
 		sqlText,
 	)
 	err := q.QueryRow(ctx, wrapped, args...).Scan(&n, &ver, &tid)

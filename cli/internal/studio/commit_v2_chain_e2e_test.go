@@ -87,6 +87,26 @@ func TestStudioSameRowChainE2E(t *testing.T) {
 		`CREATE FUNCTION gate_wait() RETURNS trigger LANGUAGE plpgsql AS $$
 		 BEGIN PERFORM pg_advisory_xact_lock(424242); RETURN NEW; END $$`,
 		`CREATE TRIGGER gate_wait BEFORE UPDATE ON gate FOR EACH ROW EXECUTE FUNCTION gate_wait()`,
+		// Legacy inheritance: ctid is per physical table, so a cascade can put
+		// another row under the chained key at the same ctid in the child
+		// table: the edit below leaves the items row at (0,2), and the
+		// archive row reaches (0,2) with the test's one foreign write.
+		`CREATE TABLE owners (oid int PRIMARY KEY, code int UNIQUE NOT NULL)`,
+		`INSERT INTO owners VALUES (1,1),(2,2),(3,3),(4,4)`,
+		`CREATE TABLE items (id int PRIMARY KEY REFERENCES owners(code) ON UPDATE CASCADE, x text)`,
+		`CREATE TABLE items_archive (FOREIGN KEY (id) REFERENCES owners(code) ON UPDATE CASCADE) INHERITS (items)`,
+		`INSERT INTO items VALUES (1,'a-orig')`,
+		`UPDATE items SET x = 'a-edited' WHERE id = 1`,
+		`INSERT INTO items_archive VALUES (2,'b-orig')`,
+		// Declarative partitioning, A1 shape: the cascade moves rows between
+		// partitions.
+		`CREATE TABLE pparents (id int PRIMARY KEY, code text UNIQUE NOT NULL)`,
+		`INSERT INTO pparents VALUES (1,'A'),(2,'B')`,
+		`CREATE TABLE pkids (code text REFERENCES pparents(code) ON UPDATE CASCADE, n int, x text, PRIMARY KEY (code, n)) PARTITION BY LIST (code)`,
+		`CREATE TABLE pkids_a PARTITION OF pkids FOR VALUES IN ('A')`,
+		`CREATE TABLE pkids_b PARTITION OF pkids FOR VALUES IN ('B')`,
+		`CREATE TABLE pkids_rest PARTITION OF pkids DEFAULT`,
+		`INSERT INTO pkids VALUES ('A',1,'a-orig'),('B',1,'b-orig')`,
 	} {
 		if err := fixture.Exec(ctx, stmt); err != nil {
 			t.Fatalf("seed %q: %v", stmt, err)
@@ -601,6 +621,60 @@ func TestStudioSameRowChainE2E(t *testing.T) {
 			t.Fatal("nothing may apply")
 		}
 	})
+
+	ownerCode := func(binding, version string, oid, code int) string {
+		return fmt.Sprintf(`{"op":"update","schema":"public","table":"owners","binding":%q,"key":[{"column":"oid","value":%d}],"version":%q,"column":"code","value":%d}`, binding, oid, version, code)
+	}
+	for _, last := range []string{"update", "delete"} {
+		run("A11 inheritance: a cascade moves a child-table row under the chained key at the same ctid ("+last+")", func(t *testing.T) {
+			items, owners := read("items", "id"), read("owners", "oid")
+			vA := items.versions["1"]
+			if err := fixture.Exec(ctx, `UPDATE items_archive SET x = 'foreign' WHERE id = 2 AND x <> 'foreign'`); err != nil {
+				t.Fatalf("foreign write: %v", err)
+			}
+			if same := scalar(`SELECT ((SELECT ctid FROM ONLY items WHERE id = 1) = (SELECT ctid FROM items_archive WHERE id = 2))::text`); same != "true" {
+				t.Fatalf("fixture no longer puts both rows at one ctid")
+			}
+			op := upd("items", items.binding, idKey(1), vA, "x", "second")
+			if last == "delete" {
+				op = del("items", items.binding, idKey(1), vA)
+			}
+			before := snapshot("owners", "items")
+			code, body := commit("a11-"+last,
+				upd("items", items.binding, idKey(1), vA, "x", "first"),
+				ownerCode(owners.binding, owners.versions["1"], 1, 9),
+				ownerCode(owners.binding, owners.versions["2"], 2, 1),
+				op)
+			wantConflictAt(code, body, 3)
+			if after := snapshot("owners", "items"); after != before {
+				t.Fatalf("nothing may apply:\nbefore %s\nafter  %s", before, after)
+			}
+		})
+	}
+
+	for _, last := range []string{"update", "delete"} {
+		run("A12 partitioned: the cascade moves rows between partitions ("+last+")", func(t *testing.T) {
+			kids, parents := read("pkids", "code", "n"), read("pparents", "id")
+			vA := kids.versions["A|1"]
+			if err := fixture.Exec(ctx, `UPDATE pkids SET x = 'foreign' WHERE code = 'B' AND n = 1`); err != nil {
+				t.Fatalf("foreign write: %v", err)
+			}
+			op := upd("pkids", kids.binding, kidKey("A", 1), vA, "x", "second")
+			if last == "delete" {
+				op = del("pkids", kids.binding, kidKey("A", 1), vA)
+			}
+			before := snapshot("pparents", "pkids")
+			code, body := commit("a12-"+last,
+				upd("pkids", kids.binding, kidKey("A", 1), vA, "x", "first"),
+				upd("pparents", parents.binding, idKey(1), parents.versions["1"], "code", "Z"),
+				upd("pparents", parents.binding, idKey(2), parents.versions["2"], "code", "A"),
+				op)
+			wantConflictAt(code, body, 3)
+			if after := snapshot("pparents", "pkids"); after != before {
+				t.Fatalf("nothing may apply:\nbefore %s\nafter  %s", before, after)
+			}
+		})
+	}
 }
 
 // wantChainedWording checks a chained-operation conflict names the in-batch
