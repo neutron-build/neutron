@@ -8,7 +8,7 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "noEmit": true,
-    "types": []
+    "types": ["node"]
   },
   "include": ["*.ts"]
 }

@@ -622,11 +622,10 @@ void q05Fixtures;
 // builder and relational terminals, error narrowing for the cancellation
 // and commit-ambiguity states, and the redacted structured event shape.
 
-// Minimal ambient AbortSignal for this type-only fixture (the consumer
-// tsconfig runs with no DOM/node libs on purpose).
-interface AbortSignal {
-  aborted: boolean;
-}
+// The declarations name the global AbortSignal, which Node applications get
+// from @types/node (this fixture's tsconfig loads it, like the installed
+// consumers of scripts/installed-gate.mjs). A local stand-in interface here
+// left `signal` an unresolved type under skipLibCheck, so any value passed.
 
 import {
   CommitAmbiguityError,
@@ -705,8 +704,10 @@ async function i02Fixtures(): Promise<void> {
 
   // Execution options on builder terminals and relational queries.
   const execOpts: QueryExecutionOptions = { deadlineMs: 250 };
-  const withSignal: QueryExecutionOptions = { signal: { aborted: false } as AbortSignal };
-  void withSignal;
+  const withSignal: QueryExecutionOptions = { signal: new AbortController().signal };
+  // @ts-expect-error signal must be an AbortSignal
+  const badSignal: QueryExecutionOptions = { signal: { aborted: false } };
+  void [withSignal, badSignal];
   await db.select().from(users).execute(execOpts);
   await db.insert(users).values({ email: "a@x.com" }).execute(execOpts);
   await db.query.users.findMany({ with: { posts: true } }, execOpts);
@@ -787,7 +788,7 @@ function q08Fixtures(): void {
   // lifecycle; options bound the batch size and carry cancellation.
   async function streamTyped(): Promise<void> {
     const db = await createDatabase({ url: "postgres://type-fixture:not-run@localhost:1/none", tables: { users, posts } });
-    const signal: AbortSignal = { aborted: false };
+    const signal: AbortSignal = new AbortController().signal;
     const stream = db.select({ id: posts.id }).from(posts).stream({ batchSize: 50, signal });
     const iter: AsyncIterableIterator<{ id: number }> = stream;
     const plan: StreamPlan = stream.explain();
