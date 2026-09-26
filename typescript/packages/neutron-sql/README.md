@@ -18,24 +18,34 @@ it. Until then use it from the repo (`typescript/packages/neutron-sql`) as a
 workspace dependency.
 
 ```ts
-import { createDatabase, pgTable, serial, integer, text, timestamp, relations, eq } from "@neutron-build/sql";
+// schema.ts
+import { pgTable, serial, integer, text, timestamp, relations } from "@neutron-build/sql";
 
-const users = pgTable("users", {
+export const users = pgTable("users", {
   id: serial("id").primaryKey(),
   email: text("email").notNull().unique(),
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
-const posts = pgTable("posts", {
+export const posts = pgTable("posts", {
   id: serial("id").primaryKey(),
   userId: integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
   title: text("title").notNull(),
 });
 
-const usersRelations = relations(users, ({ many }) => ({ posts: many(posts) }));
-const postsRelations = relations(posts, ({ one }) => ({
+export const usersRelations = relations(users, ({ many }) => ({ posts: many(posts) }));
+export const postsRelations = relations(posts, ({ one }) => ({
   author: one(users, { fields: [posts.userId], references: [users.id] }),
 }));
+```
+
+Create the tables with the [migration workflow](#migrations) (export the
+schema, `neutron migrate generate`, `neutron migrate`), then query them:
+
+```ts
+// app.ts
+import { createDatabase, eq } from "@neutron-build/sql";
+import { users, posts, usersRelations, postsRelations } from "./schema.js";
 
 const db = await createDatabase({
   url: process.env.DATABASE_URL!,
@@ -62,8 +72,10 @@ console.log(db.select().from(users).toSQL());
 
 // Transactions
 await db.transaction(async (tx) => {
-  await tx.insert(posts).values({ userId: 1, title: "hello" });
+  await tx.insert(posts).values({ userId: inserted[0].id!, title: "hello" });
 });
+
+await db.close();
 ```
 
 Types come from the schema (`typeof users.$inferSelect` / `$inferInsert`); there is no
@@ -71,12 +83,20 @@ codegen step and `db` never types as `unknown`.
 
 ## Migrations
 
+Export the schema as JSON with a small module next to your compiled schema
+(`tsc` emits `schema.js` from `schema.ts`):
+
+```js
+// export-schema.mjs
+import { writeFileSync } from "node:fs";
+import { exportSchemaV2, canonicalSchemaJson } from "@neutron-build/sql";
+import { users, posts } from "./schema.js";
+
+writeFileSync("neutron.schema.json", canonicalSchemaJson(exportSchemaV2({ users, posts })));
+```
+
 ```bash
-# 1. export the schema as JSON — export-schema.mjs next to your schema:
-#    import { writeFileSync } from "node:fs";
-#    import { exportSchemaV2, canonicalSchemaJson } from "@neutron-build/sql";
-#    import { users, posts } from "./schema.js";
-#    writeFileSync("neutron.schema.json", canonicalSchemaJson(exportSchemaV2({ users, posts })));
+# 1. export the schema as JSON
 node export-schema.mjs
 
 # 2. point the CLI at a disposable database (env or --url)
@@ -92,10 +112,11 @@ neutron migrate          # apply (history table: _neutron_migrations)
 neutron migrate status
 ```
 
-Two export formats exist. `exportSchema()` emits the legacy version-1 shape
-the current CLI planning commands still consume. `exportSchemaV2()` emits the
-cross-language schema contract v2 (`contracts/data/schema-v2.json`) and
-`canonicalSchemaJson()` serializes it deterministically: identical bytes and
+Two export formats exist. `exportSchema()` emits the legacy version-1 shape;
+the CLI planning commands (`db push`, `migrate generate`, `schema check`)
+accept both. `exportSchemaV2()` emits the cross-language schema contract v2
+(`contracts/data/schema-v2.json`) and `canonicalSchemaJson()` serializes it
+deterministically: identical bytes and
 SHA-256 for the same schema on every machine, input key order and process
 timezone irrelevant — the Go CLI and the `contracts/data` reference consumer
 reproduce the same canonical bytes (CI-pinned by the golden fixture
@@ -144,8 +165,8 @@ adapter — see below).
 
 ### Runtime support (Node.js)
 
-This package runs on Node.js (`engines: ">= 20"`); the pg and postgres.js
-adapters use Node sockets. `createDatabase` and `loadDriver` detect the
+This package runs on Node.js (`engines: ">= 22"`; CI runs Node 22 and 24);
+the pg and postgres.js adapters use Node sockets. `createDatabase` and `loadDriver` detect the
 runtime positively (`process.versions.node` — never `typeof window`
 inference) and, on a runtime without Node compatibility, fail with one
 precise error before any driver import is attempted. In a bundler that
@@ -941,8 +962,10 @@ import { keyset, ascNullsLast, descNullsFirst } from "@neutron-build/sql";
 const pager = keyset(events, [ascNullsLast(events.occurredAt), descNullsFirst(events.rank)], { perPage: 20 });
 
 const page1 = await pager.page(db.select().from(events), undefined, 20);
-// page1.rows: up to 20 rows; page1.nextCursor: opaque string or null
-const page2 = await pager.page(db.select().from(events), page1.nextCursor, 20);
+// page1.rows: up to 20 rows; page1.nextCursor: opaque string, or null after the last page
+if (page1.nextCursor !== null) {
+  const page2 = await pager.page(db.select().from(events), page1.nextCursor, 20);
+}
 ```
 
 - **Unique ordering is enforced.** The keyset must contain a schema-declared
