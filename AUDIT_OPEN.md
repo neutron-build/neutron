@@ -14,7 +14,9 @@ the twelve new findings it raised; round 3 closed its partials; round 4
 consumer-reported snapshot-capability gap under the founder-ratified
 "WAL format v2 + snapshot lease" direction; round 5 (2026-09-18, above)
 closed the three lease-scope defects reported from the observe backup
-session and landed NU-01's unblocked compaction subset.
+session and landed NU-01's unblocked compaction subset. Separately, engine
+defects the ORM program reported upstream (N1-N16, N1 security-class) are
+open and listed at the end.
 
 ## Resolved 2026-09-18 (round 5 — lease-scope closure + NU-01 compaction subset)
 
@@ -206,8 +208,8 @@ FALSE-POSITIVE (not reproducible in source; evidence cited).
 | GO-26 | FIXED (round 2) — statusWriter.Hijack no longer emits an unsolicited 101 (zero header writes, error preserved for unsupported writers) | r2 |
 | GO-27 | FIXED (round 2) — hard 100k live-bucket ceiling: new identities refused 429+Retry-After at capacity, existing buckets keep state, expiry sweep throttled to once per 10s (was: full map scan per new key past 100k) | r2 |
 | GO-28 | FIXED (round 2) — url-encoded bodies decoded explicitly for every body-bearing method through MaxBytesReader (413 on overflow, 400 on malformed); body takes precedence over query for `form` tags; Go ParseForm ignores DELETE bodies | r2 |
-| GO-29 | FIXED (round 2 + round 3) — the whole Migrate/MigrateDown operation (history reads included) is serialized by an in-process gate, closing the appliedVersions→INSERT TOCTOU behind the consumer's 23505. Cross-process runners are now serialized too, by the `_neutron_migration_lock` ledger claim landed with Consumer-1 (round 3) | r2 + r3 |
-| GO-30 | FIXED (round 2 + round 3) — plans are copied and prevalidated before any SQL runs (round 2); applied history records a sha256 checksum over version/name/Up, enforced on every run, with legacy rows baselined from the current plan on first new-version run (round 3). History schema carries a nullable `checksum` column, upgraded in place via `ADD COLUMN IF NOT EXISTS` | r2 + r3 |
+| GO-29 | FIXED (round 2 + round 3) — the whole Migrate/MigrateDown operation (history reads included) is serialized by an in-process gate, closing the appliedVersions→INSERT TOCTOU behind the consumer's 23505. Cross-process runners are now serialized too, by the `_neutron_migration_lock` ledger claim landed with Consumer-1 (round 3). Round 3's 10-minute stale-claim takeover was removed by the ORM program's M04 (2026-09-22): a crashed holder's claim is released only by an explicit `ForceUnlockMigrations` (Go) / `forceUnlockMigrations` (TS), and the heartbeat is diagnostic. Live-engine coverage: `TestConcurrentMigrateBothClientsSucceed`, `TestMigrationLedgerLockNoStaleTakeover` | r2 + r3 + 1482690a |
+| GO-30 | FIXED (round 2 + round 3) — plans are copied and prevalidated before any SQL runs (round 2); applied history records a sha256 checksum over version/name/Up, enforced on every run, with legacy rows baselined from the current plan on first new-version run (round 3). History schema carries a nullable `checksum` column, upgraded in place via `ADD COLUMN IF NOT EXISTS`. The ORM program's M04 (2026-09-22) replaced round 3's silent baselining: the checksum is the canonical v2 digest over the up SQL (`contracts/data/MIGRATIONS.md` §3), a history with pre-protocol rows is refused before any mutation, and `AdoptMigrations` graduates it once — rows whose legacy digest reproduces from the supplied file are verified, everything else is kept unverified with no checksum. Coverage: `TestMigrateRefusesLegacyHistoryUntilAdopted`, `TestMigrateRefusesLegacyDigestHistoryUntilAdopted` | r2 + r3 + 1482690a |
 | GO-31 | FIXED (round 2 + round 3) — round 2 kept the Go client's heuristic decoder as a stopgap. Round 3 verified the engine already honors its declared result formats end to end (client-requested formats honored since `1a1b1b41`; text is the default everywhere, binary only on explicit Bind) and pinned it byte-for-byte on the wire in both directions (nucleus `wire::tests_row_description::integer_payloads_honor_the_declared_format`: ASCII decimal incl. `-123`/`i64::MIN` under format 0 for simple, extended-default, and explicit-text Bind; true big-endian int4/int8 under format 1). The Go heuristic (`scanInt`) is removed; `appliedVersions`/`MigrationStatus` scan integers natively, and a live-engine round-trip test pins the client half | r2 + r3 |
 | NU-21 | FIXED (round 2) — one shared checked frame encoder for append and compaction: payloads over the 64 MiB replay limit are rejected before the first byte, so the writer can no longer accept a record its own replay refuses | r2 |
 | NU-22 | FIXED (round 2) — index scans hold ONE registered observer for the whole statement (snapshot passed into candidate resolution, aborted only after materialization; was: snapshot detached before use while vacuum could reclaim under it, and per-key observers mixed snapshots in one range scan); observer allocation failure declines the optimization instead of a false empty result | r2 |
@@ -379,7 +381,7 @@ carry lib-suite regression tests
   current main is required before the next release; no tag was cut from
   this session.**
 
-## Reported by consumers, open (2026-09-17)
+## Reported by consumers (2026-09-17), both resolved
 
 Found by teploy-observe's live-engine verification during its 2026-09-17 audit
 close-out (its detailed upstream ledger is local to the Teploy umbrella,
@@ -400,7 +402,13 @@ them without that folder:
   (only an honest `pg_advisory_unlock_all` no-op), so no engine-backed lock
   exists to build on — the ledger claim is the contract, not a fake lock.
   Live-engine coverage: `go/nucleus/migrate_integration_test.go`
-  (`NEUTRON_TEST_DATABASE_URL`).
+  (`NEUTRON_TEST_DATABASE_URL`). **RESOLVED 2026-09-22 (ORM program M04,
+  `1482690a`)**: the claim carries an owner token and is never taken over on
+  a timer (a crashed holder is released with `ForceUnlockMigrations`); two
+  concurrent runners produce exactly one effect and one history row on the
+  Go SDK, the TS SDK and the CLI (the CLI runs PostgreSQL only, under a
+  session advisory lock on a pinned connection). Protocol:
+  `contracts/data/MIGRATIONS.md` §5.
 - **No cross-table consistent-snapshot boundary** — RESOLVED 2026-09-18
   (round 4, Consumer-2): the engine now has a database-wide snapshot lease.
   `ACQUIRE SNAPSHOT LEASE [TIMEOUT <millis>]` (inside a transaction) pins
@@ -422,6 +430,30 @@ them without that folder:
    that route through none of those (RESP-wire direct, streams/CDC appends
    from background tasks) are not lease-gated — a backup of those models
    still relies on their own snapshot/checkpoint paths.
+
+## Reported by the ORM program, open (2026-09-24, upstream engine defects)
+
+The ORM program's Nucleus conformance work (card X00 and the X01-X05 model
+legs) measured engine defects against Nucleus 1.0.2, `nucleus/` tree
+`3313729a`. They are recorded with reproducers in
+`conformance/live/orm/ORM_CONFORMANCE.md` ("Engine defects and upstream
+reproducers"); engine fixes are outside that program, and the ORM keeps
+every affected capability gated off or unadvertised on Nucleus. Listed here
+so engine sessions see them:
+
+- **N1 (security)** — `SET LOCAL ROLE` / `SET LOCAL` settings persist after
+  `COMMIT`/`ROLLBACK`, and `RESET ROLE` is a no-op: a pooled connection keeps
+  an assumed role for the next borrower.
+- **N3 (silent data corruption)** — timestamptz input ignores explicit
+  offsets and the session `TimeZone`.
+- **N2, N4-N13** — non-transactional DDL, catalog fidelity,
+  generated/identity columns, deferrable constraints, lock/cancel surface,
+  array wire codec, `UPDATE ... FROM`/`DELETE ... USING`, `jsonb_agg`,
+  isolation and `READ ONLY`, value-shape divergences, derived-table column
+  lists.
+- **N14** — columnar `SUM`/`MIN`/`MAX` over values bound without a type
+  answer 0/NULL instead of an error. **N15, N16** — stale columnar prose in
+  `nucleus/docs/MODEL_SEMANTICS.md` (durability and in-transaction insert).
 
 Out-of-repo note: Lullmail's vendored copies of the send.go / bearer-transport
 blobs (flagged in neutron-12/13/16 as affected consumers) are NOT fixed here —

@@ -473,6 +473,30 @@ back to the session zone only when no offset is present.
   catalog probes and read probes disagree about whether DDL survived.
   Reproducer: [`upstream/X02-E2-rolled-back-create-table-splits-catalog.sql`](upstream/X02-E2-rolled-back-create-table-splits-catalog.sql).
 
+Found by the time-series and columnar leg
+([`x03-nucleus-leg.mjs`](x03-nucleus-leg.mjs), same engine tree), which
+records each as a measured field:
+
+- **N14 — columnar aggregates over untyped values answer 0/NULL.**
+  `COLUMNAR_INSERT` with parameters bound without a type (the default for
+  both drivers) stores text; `COLUMNAR_COUNT` is right, but `COLUMNAR_SUM`
+  answers 0 and `COLUMNAR_MIN`/`COLUMNAR_MAX` answer NULL, with no error.
+  Values bound as `::double precision` or `::int8` aggregate exactly.
+  `@neutron-build/nucleus`'s columnar client casts numeric values, so its
+  aggregates are exact; other clients are exposed. Leg field
+  `untypedAggregateSilentlyZero`.
+- **N15 — stale columnar durability prose.**
+  [`nucleus/docs/MODEL_SEMANTICS.md`](../../../nucleus/docs/MODEL_SEMANTICS.md)
+  says columnar writes reach the page cache only; its own resolved-marker
+  table (NU-006) says the store fsyncs, and rows written just before
+  `kill -9` survive the restart (leg field `afterKill9.columnarKill9Count`).
+  The table is right; the prose is stale.
+- **N16 — stale in-transaction insert prose.** The same document says
+  `BEGIN; COLUMNAR_INSERT(...); ROLLBACK;` leaves the row stored; the engine
+  refuses `COLUMNAR_INSERT` inside a transaction and stores nothing (leg
+  field `inTxInsert.rejected`). The refusal is the safer behaviour; the
+  docs are stale.
+
 Documented limitations, not defects: the numeric 96-bit/28-digit ceiling
 (`SQL_SEMANTICS.md`, reported at bind time), the RLS predicate allow-list
 and auth-boundary tenant identity (`RLS_SECURITY.md`), and partial indexes,
