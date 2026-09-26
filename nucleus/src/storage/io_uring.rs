@@ -100,6 +100,10 @@ impl AsyncDiskOps for StandardDiskOps {
             .await?;
         file.seek(SeekFrom::Start(offset)).await?;
         file.write_all(data).await?;
+        // Tokio may still have a blocking write in flight after write_all.
+        // Wait for it before reporting completion to a reader or a subsequent
+        // sync on another handle. Durability remains the separate sync call.
+        file.flush().await?;
         Ok(())
     }
 

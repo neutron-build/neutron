@@ -180,7 +180,8 @@ impl TxnBuffer {
         let mut created = false;
         for op in &self.ops {
             match op {
-                BufferedOp::CreateTable { table: t, .. } if t == table => created = true,                BufferedOp::DropTable { table: t } if t == table => created = false,
+                BufferedOp::CreateTable { table: t, .. } if t == table => created = true,
+                BufferedOp::DropTable { table: t } if t == table => created = false,
                 _ => {}
             }
         }
@@ -596,8 +597,13 @@ impl BufferedDiskEngine {
                         seen.insert(*pos);
                     }
                 }
-                BufferedOp::UpdateIf { updates, unique_col_sets, .. } => {
-                    for (pos, expected, _) in updates.iter().filter(|(p, _, _)| !is_pending_pos(*p)) {
+                BufferedOp::UpdateIf {
+                    updates,
+                    unique_col_sets,
+                    ..
+                } => {
+                    for (pos, expected, _) in updates.iter().filter(|(p, _, _)| !is_pending_pos(*p))
+                    {
                         if seen.insert(*pos) {
                             preconds.insert(*pos, (expected.clone(), unique_col_sets.clone()));
                         }
@@ -642,7 +648,9 @@ impl BufferedDiskEngine {
                     }
                 }
                 BufferedOp::UpdateIf { updates, .. } => {
-                    for (pos, _, replacement) in updates.iter().filter(|(p, _, _)| is_pending_pos(*p)) {
+                    for (pos, _, replacement) in
+                        updates.iter().filter(|(p, _, _)| is_pending_pos(*p))
+                    {
                         if !cancelled.contains(pos) {
                             rewritten.insert(*pos, replacement.clone());
                         }
@@ -765,7 +773,11 @@ impl BufferedDiskEngine {
                         }
                     }
                 }
-                BufferedOp::UpdateIf { table, updates, unique_col_sets } => {
+                BufferedOp::UpdateIf {
+                    table,
+                    updates,
+                    unique_col_sets,
+                } => {
                     // Substitute each update's expected row with the
                     // position's ANCHORED precondition (NU-16): a conditional
                     // op that followed this transaction's own write on the
@@ -803,7 +815,11 @@ impl BufferedDiskEngine {
                     }
                     let mut applied = 0usize;
                     if !plain.is_empty() {
-                        applied += self.inner.update_if_value_unchanged(&table, &plain).await?.len();
+                        applied += self
+                            .inner
+                            .update_if_value_unchanged(&table, &plain)
+                            .await?
+                            .len();
                     }
                     if !with_sets.is_empty() {
                         applied += self
@@ -825,9 +841,7 @@ impl BufferedDiskEngine {
                     // is exactly the dependency that made CREATE + RENAME +
                     // COMMIT fail with "table '<old>' not found in storage".
                     match schema {
-                        Some(snap) => {
-                            self.inner.create_table_with_schema(&table, &snap).await?
-                        }
+                        Some(snap) => self.inner.create_table_with_schema(&table, &snap).await?,
                         None => self.inner.create_table(&table).await?,
                     }
                 }
@@ -859,7 +873,10 @@ impl BufferedDiskEngine {
         }
         let ddl: DdlView = {
             let bufs = self.txn_bufs.read();
-            match bufs.get(&current_session_id()).and_then(|b| b.overlays.get(table)) {
+            match bufs
+                .get(&current_session_id())
+                .and_then(|b| b.overlays.get(table))
+            {
                 Some(ov) if ov.dropped_in_txn => DdlView::Dropped,
                 Some(ov) if ov.created_in_txn => {
                     crate::bench_hooks::record_overlay(site, 0);
@@ -1239,6 +1256,10 @@ impl StorageEngine for BufferedDiskEngine {
 
     async fn rebuild_table_indexes(&self, table: &str) -> Result<(), StorageError> {
         self.inner.rebuild_table_indexes(table).await
+    }
+
+    async fn scan_noncanonical(&self, table: &str) -> Result<Vec<(usize, Row)>, StorageError> {
+        self.inner.scan_noncanonical(table).await
     }
 
     // -- Transaction lifecycle --
@@ -1744,7 +1765,6 @@ mod tests {
     use crate::storage::disk_engine::DiskEngine;
     use crate::types::{DataType, Value};
 
-
     /// NU-18: DROP TABLE inside a transaction must hide the committed
     /// incarnation's rows from reads in that transaction (the old overlay
     /// still served them), and a re-CREATE starts from an empty table.
@@ -1766,11 +1786,17 @@ mod tests {
         engine.begin_txn().await.unwrap();
         engine.drop_table("t").await.unwrap();
         let err = engine.scan("t").await;
-        assert!(err.is_err(), "dropped table still readable inside the transaction");
+        assert!(
+            err.is_err(),
+            "dropped table still readable inside the transaction"
+        );
 
         engine.create_table("t").await.unwrap();
         let rows = engine.scan("t").await.unwrap();
-        assert!(rows.is_empty(), "re-created table inherited the old incarnation's rows");
+        assert!(
+            rows.is_empty(),
+            "re-created table inherited the old incarnation's rows"
+        );
         engine.commit_txn().await.unwrap();
         let rows = engine.scan("t").await.unwrap();
         assert!(rows.is_empty(), "old rows reappeared after commit");
@@ -1815,7 +1841,10 @@ mod tests {
         let changed = disk
             .update(
                 "t",
-                &[(base_pos, vec![Value::Int32(1), Value::Text("from-b".into())])],
+                &[(
+                    base_pos,
+                    vec![Value::Int32(1), Value::Text("from-b".into())],
+                )],
             )
             .await
             .unwrap();

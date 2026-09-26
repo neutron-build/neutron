@@ -506,6 +506,16 @@ pub trait StorageEngine: Send + Sync {
         Ok(())
     }
 
+    /// Rows whose stored encoding does not match the table's current column
+    /// list, with their physical positions, decoded at the width they were
+    /// written at (`row.len()` short of the schema for a row an interrupted
+    /// ADD COLUMN never widened). Backs `REPAIR TABLE`. Default: none — an
+    /// engine that stores typed rows rather than schema-dependent bytes cannot
+    /// drift from its schema.
+    async fn scan_noncanonical(&self, _table: &str) -> Result<Vec<(usize, Row)>, StorageError> {
+        Ok(Vec::new())
+    }
+
     /// Scan returning only rows where column `col_idx` equals `value`, with
     /// their scan-order positions. Enables UPDATE/DELETE by PK without
     /// materialising the entire table. Default: full scan + filter.
