@@ -49,8 +49,9 @@ function AddForm({ onDone }: { onDone: () => void }) {
   return (
     <div class={s.addForm}>
       <div class={s.field}>
-        <label class={s.label}>Name</label>
+        <label class={s.label} htmlFor="connection-name">Name</label>
         <input
+          id="connection-name"
           class={s.input}
           placeholder="My Database"
           value={name.value}
@@ -58,8 +59,9 @@ function AddForm({ onDone }: { onDone: () => void }) {
         />
       </div>
       <div class={s.field}>
-        <label class={s.label}>Connection URL</label>
+        <label class={s.label} htmlFor="connection-url">Connection URL</label>
         <input
+          id="connection-url"
           class={s.input}
           type="password"
           placeholder="postgres://user:pass@host:5432/db"
