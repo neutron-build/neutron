@@ -244,7 +244,7 @@ func validateCommitOps(ops []commitOp, limit int) error {
 			return err
 		}
 		if ops[i].Op != "insert" {
-			if _, err := strconv.ParseUint(*ops[i].Version, 10, 32); err != nil {
+			if !validRowVersion(*ops[i].Version) {
 				return mutationDomainError{msg: fmt.Sprintf(
 					"operations[%d]: version must be the row version string reported by the table read", i)}
 			}

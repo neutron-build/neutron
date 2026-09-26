@@ -501,10 +501,18 @@ func validateIdentityFields(id rowIdentityRef) error {
 	if len(id.Key) == 0 {
 		return mutationDomainError{msg: "key is required: the full primary key tuple reported by the table read"}
 	}
-	if _, err := strconv.ParseUint(id.Version, 10, 32); err != nil {
+	if !validRowVersion(id.Version) {
 		return mutationDomainError{msg: "version must be the row version string reported by the table read"}
 	}
 	return nil
+}
+
+// validRowVersion accepts an xmin as the table read reports it. 0 is
+// InvalidTransactionId: no local heap row carries it, while a foreign-table
+// row reads it for every row, so it can never prove a row unchanged.
+func validRowVersion(v string) bool {
+	n, err := strconv.ParseUint(v, 10, 32)
+	return err == nil && n != 0
 }
 
 func writeDomainError(w http.ResponseWriter, err error) {
