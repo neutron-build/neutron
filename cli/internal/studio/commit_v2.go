@@ -538,6 +538,10 @@ type preparedOp struct {
 	keyCols  []string
 	keyCells []keyCell
 	version  string
+	// tuple is set when this operation chains from the batch's previous
+	// operation on the same row: the physical tuple (ctid) that operation
+	// produced, which the guarded statement must still find under the key.
+	tuple *string
 
 	// update
 	column  string
@@ -828,18 +832,24 @@ func fkSideEffectsAffectRow(ctx context.Context, tx pgx.Tx, schemaName, tableNam
 // Several operations on ONE row (two edited cells of a row, an edit then a
 // delete) were all staged against the same read, so they all carry the
 // version that read returned. The first of them verifies it against the
-// database; from then on the row is locked by this transaction and its
-// version is the one this batch produced, so a later operation on the row
-// that carries the same originally-read version is checked against the
-// batch's current version instead (verified by the first). A later
-// operation carrying any other version is stale and conflicts as usual.
+// database; from then on the row is locked by this transaction. A later
+// operation on the row that carries the same originally-read version runs
+// against the exact tuple the batch's previous operation on it produced:
+// its xmin AND its physical identity (ctid). xmin alone only proves
+// "written by this transaction", which every cascade and trigger write in
+// the batch also satisfies; any rewrite of the row in between (a trigger,
+// a rule) or a different row moved under the key (an ON UPDATE CASCADE)
+// has another ctid, so the batch conflicts instead of writing a row the
+// user never read (R01 review F1/F2). A later operation carrying any other
+// version is stale and conflicts as usual.
 func runCommitOps(ctx context.Context, tx pgx.Tx, prepared []*preparedOp) ([]opExecution, error) {
 	var out []opExecution
 	chain := rowVersionChains{}
 	for _, p := range prepared {
 		if p.kind == "update" || p.kind == "delete" {
 			if c, ok := chain[p.rowKey()]; ok && p.version == c.read {
-				p.version = c.current
+				tuple := c.tuple
+				p.version, p.tuple = c.current, &tuple
 			}
 		}
 		switch p.kind {
@@ -899,17 +909,18 @@ func runCommitOps(ctx context.Context, tx pgx.Tx, prepared []*preparedOp) ([]opE
 			} else {
 				sqlText, args = buildGuardedMutationV2(p.schema, p.table, mut, p.keyArgs, p.keyCols, p.version, p.value)
 			}
-			n, newVersion, err := runGuardedMutation(ctx, tx, sqlText, args...)
+			sqlText, args = p.bindTuple(sqlText, args, tableRef)
+			n, newVersion, newTuple, err := runGuardedMutation(ctx, tx, sqlText, args...)
 			if err != nil {
 				return nil, fmtOpError(p.index, err)
 			}
 			if n != 1 {
-				return nil, fmtOpError(p.index, explainRowConflictV2(ctx, tx, p.schema, p.table, p.keyArgs, p.keyCols, "update"))
+				return nil, fmtOpError(p.index, p.explainConflict(ctx, tx, "update"))
 			}
 			ex.result = opResult{Index: p.index, Op: "update", RowsAffected: n, Version: newVersion}
 			ex.before = before
 			out = append(out, ex)
-			chain.advance(p, newVersion)
+			chain.advance(p, newVersion, newTuple)
 
 		case "delete":
 			tableRef := fmt.Sprintf("%s.%s", quoteIdent(p.schema), quoteIdent(p.table))
@@ -945,27 +956,56 @@ func runCommitOps(ctx context.Context, tx pgx.Tx, prepared []*preparedOp) ([]opE
 				return fmt.Sprintf("DELETE FROM %s", tableRef)
 			}
 			sqlText, args := buildGuardedMutationV2(p.schema, p.table, mut, p.keyArgs, p.keyCols, p.version)
-			n, _, err := runGuardedMutation(ctx, tx, sqlText, args...)
+			sqlText, args = p.bindTuple(sqlText, args, tableRef)
+			n, _, _, err := runGuardedMutation(ctx, tx, sqlText, args...)
 			if err != nil {
 				return nil, fmtOpError(p.index, err)
 			}
 			if n != 1 {
-				return nil, fmtOpError(p.index, explainRowConflictV2(ctx, tx, p.schema, p.table, p.keyArgs, p.keyCols, "delete"))
+				return nil, fmtOpError(p.index, p.explainConflict(ctx, tx, "delete"))
 			}
 			ex.result = opResult{Index: p.index, Op: "delete", RowsAffected: n}
 			out = append(out, ex)
-			chain.advance(p, "")
+			// A deleted row has no tuple: a later chained operation on the
+			// key can never match (ctid text is never empty).
+			chain.advance(p, "", "")
 		}
 	}
 	return out, nil
 }
 
-// rowVersionChain is one row's version history inside a batch: the version
-// the client read (verified by the batch's first operation on the row) and
-// the version the batch's latest operation left ("" once deleted).
+// bindTuple narrows a chained operation's guarded statement to the exact
+// tuple the batch's previous operation on the row produced. Unchained
+// operations are returned unchanged. The clause is appended to the
+// statement's WHERE (buildGuardedMutationV2 ends with it).
+func (p *preparedOp) bindTuple(sqlText string, args []any, tableRef string) (string, []any) {
+	if p.tuple == nil {
+		return sqlText, args
+	}
+	args = append(args, *p.tuple)
+	return fmt.Sprintf("%s AND %s.ctid::text = $%d", sqlText, tableRef, len(args)), args
+}
+
+// explainConflict classifies a zero-row guarded mutation. For a chained
+// operation the row under the key is not the tuple the batch's previous
+// operation on it left: say so, rather than blaming a foreign write.
+func (p *preparedOp) explainConflict(ctx context.Context, tx pgx.Tx, verb string) error {
+	err := explainRowConflictV2(ctx, tx, p.schema, p.table, p.keyArgs, p.keyCols, verb)
+	if se, ok := err.(rowStateError); ok && p.tuple != nil && se.state == "conflict" {
+		se.msg = fmt.Sprintf("%s refused: the row now under this key is not the one this batch's earlier operation on it left (a cascade, trigger or rule rewrote it, or another row moved under the key), so the %s cannot be proven to target the row that was read; nothing was applied — reload and reapply the edits", verb, verb)
+		return se
+	}
+	return err
+}
+
+// rowVersionChain is one row's history inside a batch: the version the
+// client read (verified by the batch's first operation on the row), and the
+// version and physical tuple the batch's latest operation left ("" once
+// deleted).
 type rowVersionChain struct {
 	read    string
 	current string
+	tuple   string
 	ops     int
 	deleted bool
 }
@@ -974,14 +1014,14 @@ type rowVersionChains map[string]*rowVersionChain
 
 // advance records a successful update/delete of p's row. The originally
 // read version is the one the FIRST operation on the row carried.
-func (c rowVersionChains) advance(p *preparedOp, newVersion string) {
+func (c rowVersionChains) advance(p *preparedOp, newVersion, newTuple string) {
 	k := p.rowKey()
 	e, ok := c[k]
 	if !ok {
 		e = &rowVersionChain{read: p.version}
 		c[k] = e
 	}
-	e.current = newVersion
+	e.current, e.tuple = newVersion, newTuple
 	e.ops++
 	if p.kind == "delete" {
 		e.deleted = true
@@ -1013,7 +1053,7 @@ func buildInverse(ctx context.Context, tx pgx.Tx, prepared []*preparedOp, execs 
 	final := rowVersionChains{}
 	for _, p := range prepared {
 		if p.kind == "update" || p.kind == "delete" {
-			final.advance(p, execs[p.index].result.Version)
+			final.advance(p, execs[p.index].result.Version, "")
 		}
 	}
 	for _, p := range prepared {
