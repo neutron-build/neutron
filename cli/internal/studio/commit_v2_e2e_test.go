@@ -620,14 +620,26 @@ func TestStudioCommitProtocolV2E2E(t *testing.T) {
 	})
 
 	t.Run("a chained edit carrying a different (stale) version still conflicts, atomically", func(t *testing.T) {
-		versions := readIdentities("commits")
+		// A REAL prior version: read, commit a change to the row, read
+		// again. The batch then carries the fresh version on its first
+		// operation and the genuinely stale one on its second.
+		prior := readIdentities("commits")["1"]
+		bump := `"operations":[{"op":"update","schema":"public","table":"commits","binding":%q,` +
+			`"key":[{"column":"id","value":1}],"version":%q,"column":"big","value":{"t":"int8","v":"7"}}]`
+		if code, body := commit(mainTS, mainToken, "e2e", "op-samerow-bump", fmt.Sprintf(bump, binding, prior)); code != http.StatusOK {
+			t.Fatalf("bump = %d %v", code, body)
+		}
+		fresh := readIdentities("commits")["1"]
+		if fresh == prior {
+			t.Fatalf("row version unchanged by a commit: %q", fresh)
+		}
 		var before string
 		oracle(`SELECT row(id, body, note, big)::text FROM commits WHERE id = 1`, &before)
 		ops := `"operations":[` +
 			`{"op":"update","schema":"public","table":"commits","binding":%q,"key":[{"column":"id","value":1}],"version":%q,"column":"note","value":"applies-first"},` +
-			`{"op":"update","schema":"public","table":"commits","binding":%q,"key":[{"column":"id","value":1}],"version":"1","column":"note","value":"stale-read"}` +
+			`{"op":"update","schema":"public","table":"commits","binding":%q,"key":[{"column":"id","value":1}],"version":%q,"column":"note","value":"stale-read"}` +
 			`]`
-		code, body := commit(mainTS, mainToken, "e2e", "op-samerow-stale", fmt.Sprintf(ops, binding, versions["1"], binding))
+		code, body := commit(mainTS, mainToken, "e2e", "op-samerow-stale", fmt.Sprintf(ops, binding, fresh, binding, prior))
 		if code != http.StatusConflict || body["state"] != "conflict" {
 			t.Fatalf("stale chained edit = %d %v, want 409 conflict", code, body)
 		}

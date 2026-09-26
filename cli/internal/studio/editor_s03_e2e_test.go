@@ -432,33 +432,42 @@ func TestStudioDataEditorS03E2E(t *testing.T) {
 		ops := `"operations":[` +
 			`{"op":"update","schema":"public","table":"editors","binding":%q,"key":[{"column":"id","value":10}],"version":%q,"column":"flag","value":false},` +
 			`{"op":"update","schema":"public","table":"editors","binding":%q,"key":[{"column":"id","value":10}],"version":%q,"column":"doc","value":"{\"a\":2,\"b\":null}"}]`
-		// A second update carrying a DIFFERENT (stale) original conflicts
-		// the whole batch, even though the batch's own first op already
-		// holds the row: per-op original rechecks.
-		stale := `"operations":[` +
-			`{"op":"update","schema":"public","table":"editors","binding":%q,"key":[{"column":"id","value":10}],"version":%q,"column":"flag","value":false},` +
-			`{"op":"update","schema":"public","table":"editors","binding":%q,"key":[{"column":"id","value":10}],"version":"1","column":"doc","value":"{\"a\":2,\"b\":null}"}]`
-		code, body := commit("e2e", "s03-upd-conflict", fmt.Sprintf(stale, binding, ver, binding))
-		if code != http.StatusConflict || body["state"] != "conflict" {
-			t.Fatalf("second-op stale original = %d %v, want 409 conflict", code, body)
-		}
-		var flag bool
-		var doc string
-		oracle(`SELECT flag, doc::text FROM editors WHERE id = 10`, &flag, &doc)
-		if flag != false || doc != `{"a": 1}` {
-			t.Fatalf("conflicted batch applied something: flag=%v doc=%s", flag, doc)
-		}
 		// Both edits staged from ONE read carry the same original: the first
 		// op verifies it and the second chains from the batch's own write
 		// (R01 — the SPA stages exactly this for two cells of one row, which
 		// previously could never commit).
-		code, body = commit("e2e", "s03-upd-samerow", fmt.Sprintf(ops, binding, ver, binding, ver))
+		code, body := commit("e2e", "s03-upd-samerow", fmt.Sprintf(ops, binding, ver, binding, ver))
 		if code != http.StatusOK {
 			t.Fatalf("two cells of one row from one read = %d %v, want 200", code, body)
 		}
+		var flag bool
+		var doc string
 		oracle(`SELECT flag, doc::text FROM editors WHERE id = 10`, &flag, &doc)
 		if flag != false || doc != `{"a": 2, "b": null}` {
 			t.Fatalf("same-row batch: flag=%v doc=%s", flag, doc)
+		}
+
+		// A second update carrying a DIFFERENT, genuinely stale original
+		// (the pre-commit version above, now superseded) conflicts the whole
+		// batch, even though the batch's own first op, on the fresh
+		// version, already holds the row: per-op original rechecks.
+		prior, fresh := ver, xminOf("editors", "id = 10")
+		if fresh == prior {
+			t.Fatalf("row version unchanged by a commit: %q", fresh)
+		}
+		stale := `"operations":[` +
+			`{"op":"update","schema":"public","table":"editors","binding":%q,"key":[{"column":"id","value":10}],"version":%q,"column":"flag","value":true},` +
+			`{"op":"update","schema":"public","table":"editors","binding":%q,"key":[{"column":"id","value":10}],"version":%q,"column":"doc","value":"{\"a\":3}"}]`
+		code, body = commit("e2e", "s03-upd-conflict", fmt.Sprintf(stale, binding, fresh, binding, prior))
+		if code != http.StatusConflict || body["state"] != "conflict" {
+			t.Fatalf("second-op stale original = %d %v, want 409 conflict", code, body)
+		}
+		if msg, _ := body["error"].(string); !strings.HasPrefix(msg, "operations[1]") {
+			t.Fatalf("conflict must name operations[1]: %v", body["error"])
+		}
+		oracle(`SELECT flag, doc::text FROM editors WHERE id = 10`, &flag, &doc)
+		if flag != false || doc != `{"a": 2, "b": null}` {
+			t.Fatalf("conflicted batch applied something: flag=%v doc=%s", flag, doc)
 		}
 
 		// Re-read and commit the boolean edit on the fresh version — the
