@@ -173,7 +173,9 @@ const OTHER_LANGS = new Set(["bash", "sh", "shell", "console", "sql", "json", "t
 function readmeExamples(readme) {
   const blocks = [];
   const unknown = [];
-  const lines = readme.split("\n");
+  // Blockquote markers are stripped first, so a fence inside "> " is seen.
+  const lines = readme.split("\n").map((l) => l.replace(/^(\s*>)+\s?/, ""));
+  const indentOf = (l) => /^\s*/.exec(l)[0].length;
   for (let i = 0; i < lines.length; i++) {
     // Backtick and tilde fences (CommonMark); the closing fence repeats
     // the opening character.
@@ -181,12 +183,16 @@ function readmeExamples(readme) {
     if (!m) continue;
     const lang = m[2].toLowerCase();
     const close = new RegExp(`^\\s*${m[1][0] === "`" ? "```" : "~~~"}[${m[1][0]}]*\\s*$`);
+    const indent = indentOf(lines[i]);
     const start = i + 1;
     let end = start;
-    while (end < lines.length && !close.test(lines[end])) end++;
+    // An unclosed fence inside a list item ends with the item: a non-blank
+    // line indented less than the fence.
+    while (end < lines.length && !close.test(lines[end]) && !(indent > 0 && lines[end].trim() !== "" && indentOf(lines[end]) < indent)) end++;
+    const ended = end < lines.length && close.test(lines[end]);
     if (CODE_LANGS.has(lang)) blocks.push({ lang, line: start + 1, body: lines.slice(start, end).join("\n") });
     else if (!OTHER_LANGS.has(lang)) unknown.push(`line ${start}: ${m[1]}${m[2]}`);
-    i = end;
+    i = ended ? end : end - 1;
   }
   return { blocks, unknown };
 }
@@ -259,11 +265,16 @@ try {
   // Self-check of the classifier: every fence spelling reaches compilation
   // or is reported; nothing is skipped silently.
   {
-    const probe = ["```typescript", "a", "```", "~~~ts", "b", "~~~", "```TS title=x.ts", "c", "```", "```yaml", "d", "```", "```bash", "e", "```"].join("\n");
+    const probe = [
+      "```typescript", "a", "```", "~~~ts", "b", "~~~", "```TS title=x.ts", "c", "```",
+      "> ```ts", "> d", "> ```",
+      "- item", "   ```bash", "   unclosed", "```ts", "e", "```",
+      "```yaml", "f", "```", "```bash", "g", "```",
+    ].join("\n");
     const got = readmeExamples(probe);
     verdict(
-      "README gate: the fence classifier sees backtick, tilde and titled fences",
-      got.blocks.map((b) => b.body).join("") === "abc" && got.unknown.length === 1,
+      "README gate: the fence classifier sees backtick, tilde, titled, quoted and list-item fences",
+      got.blocks.map((b) => b.body).join("") === "abcde" && got.unknown.length === 1,
       JSON.stringify(got),
     );
   }
