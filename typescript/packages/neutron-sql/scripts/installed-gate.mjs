@@ -170,27 +170,47 @@ export const db = await createDatabase({
 const CODE_LANGS = new Set(["ts", "typescript", "tsx", "js", "javascript", "jsx", "mjs"]);
 const OTHER_LANGS = new Set(["bash", "sh", "shell", "console", "sql", "json", "text", "diff"]);
 
+// Blockquote structure: the number of leading ">" markers of a line, and
+// the line with its first n markers (plus one optional space) removed.
+const quoteDepth = (l) => /^(?:\s*>)*/.exec(l)[0].split(">").length - 1;
+function unquote(l, n) {
+  let s = l;
+  for (let k = 0; k < n; k++) s = s.replace(/^\s*>/, "");
+  return n > 0 ? s.replace(/^ /, "") : s;
+}
+
 function readmeExamples(readme) {
   const blocks = [];
   const unknown = [];
-  // Blockquote markers are stripped first, so a fence inside "> " is seen.
-  const lines = readme.split("\n").map((l) => l.replace(/^(\s*>)+\s?/, ""));
+  const lines = readme.split("\n");
   const indentOf = (l) => /^\s*/.exec(l)[0].length;
   for (let i = 0; i < lines.length; i++) {
+    // Outside a fence, blockquote markers are markdown structure: strip
+    // them so a fence inside "> " is seen, and remember the depth.
+    const depth = quoteDepth(lines[i]);
+    const opener = unquote(lines[i], depth);
     // Backtick and tilde fences (CommonMark); the closing fence repeats
     // the opening character.
-    const m = /^\s*(```|~~~)[`~]*\s*(\S*)/.exec(lines[i]);
+    const m = /^\s*(```|~~~)[`~]*\s*(\S*)/.exec(opener);
     if (!m) continue;
     const lang = m[2].toLowerCase();
     const close = new RegExp(`^\\s*${m[1][0] === "`" ? "```" : "~~~"}[${m[1][0]}]*\\s*$`);
-    const indent = indentOf(lines[i]);
+    const indent = indentOf(opener);
+    const inner = (l) => unquote(l, quoteDepth(l));
     const start = i + 1;
     let end = start;
-    // An unclosed fence inside a list item ends with the item: a non-blank
-    // line indented less than the fence.
-    while (end < lines.length && !close.test(lines[end]) && !(indent > 0 && lines[end].trim() !== "" && indentOf(lines[end]) < indent)) end++;
-    const ended = end < lines.length && close.test(lines[end]);
-    if (CODE_LANGS.has(lang)) blocks.push({ lang, line: start + 1, body: lines.slice(start, end).join("\n") });
+    // An unclosed fence ends with its container: a quoted fence when the
+    // quote depth drops below the opener's, a list-item fence at a
+    // non-blank line indented less than the fence.
+    while (
+      end < lines.length &&
+      quoteDepth(lines[end]) >= depth &&
+      !close.test(inner(lines[end])) &&
+      !(indent > 0 && inner(lines[end]).trim() !== "" && indentOf(inner(lines[end])) < indent)
+    )
+      end++;
+    const ended = end < lines.length && quoteDepth(lines[end]) >= depth && close.test(inner(lines[end]));
+    if (CODE_LANGS.has(lang)) blocks.push({ lang, line: start + 1, body: lines.slice(start, end).map(inner).join("\n") });
     else if (!OTHER_LANGS.has(lang)) unknown.push(`line ${start}: ${m[1]}${m[2]}`);
     i = ended ? end : end - 1;
   }
@@ -270,11 +290,13 @@ try {
       "> ```ts", "> d", "> ```",
       "- item", "   ```bash", "   unclosed", "```ts", "e", "```",
       "```yaml", "f", "```", "```bash", "g", "```",
+      // An unclosed fence in a quote ends with the quote (N9-R).
+      "> ```bash", "> unclosed", "", "```ts", "h", "```",
     ].join("\n");
     const got = readmeExamples(probe);
     verdict(
       "README gate: the fence classifier sees backtick, tilde, titled, quoted and list-item fences",
-      got.blocks.map((b) => b.body).join("") === "abcde" && got.unknown.length === 1,
+      got.blocks.map((b) => b.body).join("") === "abcdeh" && got.unknown.length === 1,
       JSON.stringify(got),
     );
   }
