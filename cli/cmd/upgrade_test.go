@@ -33,4 +33,10 @@ func TestRunUpgradeReturnsErrorWhenCheckFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("runUpgrade returned nil for a failed update check")
 	}
+	// The spinner line is the report: the returned error must be marked
+	// reported so Execute does not print it a second time, however the
+	// failure site is spelled.
+	if !errors.As(err, new(reportedError)) {
+		t.Fatalf("a failed update check must return a reported error (printed once), got unmarked %v", err)
+	}
 }
