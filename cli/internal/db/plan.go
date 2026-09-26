@@ -94,6 +94,10 @@ type PlanOperation struct {
 	Destructive   bool   `json:"destructive"`
 	DataLoss      bool   `json:"dataLoss"`
 	Reversibility string `json:"reversibility"`
+	// MinServerMajor is the lowest PostgreSQL major version that can run
+	// SQL (omitted when the statement has no floor above the supported
+	// matrix). Apply refuses older servers before any statement runs.
+	MinServerMajor int `json:"minServerMajor,omitempty"`
 }
 
 // PlanRisk summarizes the operation classifications.
@@ -120,6 +124,7 @@ type PlanArtifact struct {
 	TargetSHA256     string          `json:"targetSha256"`
 	Renames          []string        `json:"renames"`
 	Capabilities     []string        `json:"capabilities"`
+	MinServerMajor   int             `json:"minServerMajor,omitempty"` // highest operation floor
 	TransactionMode  string          `json:"transactionMode"`
 	Operations       []PlanOperation `json:"operations"`
 	Risk             PlanRisk        `json:"risk"`
@@ -526,6 +531,10 @@ func BuildPlanArtifact(version, name, baseSource, baseSHA string, target *V2Docu
 			Reversibility: ReversibilityReversible,
 		}
 		op.Reversibility = classifyReversibility(op.Destructive, op.DataLoss, op.Down)
+		op.MinServerMajor, _ = StatementMinServerMajor(up)
+		if op.MinServerMajor > plan.MinServerMajor {
+			plan.MinServerMajor = op.MinServerMajor
+		}
 		plan.Operations = append(plan.Operations, op)
 	}
 	plan.Risk = summarizeRisk(plan.Operations)

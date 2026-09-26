@@ -83,27 +83,19 @@ func (h *q07Harness) queryOne(sql string) string {
 	return v
 }
 
-// tryPlanAndApply plans and applies like planAndApply but returns the apply
-// error instead of failing.
-func (h *q07Harness) tryPlanAndApply(desiredJSON string) error {
+// planOptions are db push's planning options against this harness's
+// database: the twin normalizer and the connected server's major version.
+func (h *q07Harness) planOptions(norm V2Normalizer) DiffV2Options {
 	h.t.Helper()
-	desired := h.parseDoc(desiredJSON)
-	actual, err := h.client.IntrospectV2(context.Background())
+	major, err := h.client.ServerMajorVersion(context.Background())
 	if err != nil {
-		h.t.Fatalf("introspect: %v", err)
+		h.t.Fatalf("server version: %v", err)
 	}
-	norm, err := h.client.NewTwinNormalizer(context.Background())
-	if err != nil {
-		h.t.Fatalf("normalizer: %v", err)
-	}
-	defer norm.Close()
-	result, err := DiffV2Document(context.Background(), desired, actual, DiffV2Options{Normalizer: norm})
-	if err != nil {
-		h.t.Fatalf("diff: %v", err)
-	}
-	return h.client.ApplyInTransaction(context.Background(), result.Up, nil)
+	return DiffV2Options{Normalizer: norm, ServerMajor: major}
 }
 
+// planAndApply plans like db push and applies through db push's apply
+// primitive: the migration lock session, PlanPhases and ApplyPhases.
 func (h *q07Harness) planAndApply(desiredJSON string) DiffResult {
 	h.t.Helper()
 	desired := h.parseDoc(desiredJSON)
@@ -116,16 +108,31 @@ func (h *q07Harness) planAndApply(desiredJSON string) DiffResult {
 		h.t.Fatalf("normalizer: %v", err)
 	}
 	defer norm.Close()
-	result, err := DiffV2Document(context.Background(), desired, actual, DiffV2Options{Normalizer: norm})
+	result, err := DiffV2Document(context.Background(), desired, actual, h.planOptions(norm))
 	if err != nil {
 		h.t.Fatalf("diff: %v", err)
 	}
 	if len(result.Up) > 0 {
-		if err := h.client.ApplyInTransaction(context.Background(), result.Up, nil); err != nil {
+		if err := applyLikePush(context.Background(), h.client, result); err != nil {
 			h.t.Fatalf("apply:\n%s\nerror: %v", strings.Join(result.Up, ";\n"), err)
 		}
 	}
 	return result
+}
+
+// applyLikePush is db push's apply path: lock, partition into phases,
+// run each phase as one transaction on the locked session.
+func applyLikePush(ctx context.Context, client *Client, result DiffResult) error {
+	sess, err := client.LockMigrations(ctx)
+	if err != nil {
+		return err
+	}
+	defer sess.Release()
+	phases, err := PlanPhases(result)
+	if err != nil {
+		return err
+	}
+	return sess.ApplyPhases(ctx, phases, nil)
 }
 
 func (h *q07Harness) assertDiffEmpty(desiredJSON string) {
@@ -163,7 +170,7 @@ func (h *q07Harness) assertDiffError(desiredJSON, wantSubstring string) {
 		h.t.Fatalf("normalizer: %v", err)
 	}
 	defer norm.Close()
-	_, err = DiffV2Document(context.Background(), desired, actual, DiffV2Options{Normalizer: norm})
+	_, err = DiffV2Document(context.Background(), desired, actual, h.planOptions(norm))
 	if err == nil || !strings.Contains(err.Error(), wantSubstring) {
 		h.t.Fatalf("expected diff error containing %q, got %v", wantSubstring, err)
 	}
@@ -408,21 +415,16 @@ func TestQ07RoundTripModifications(t *testing.T) {
 	h.planAndApply(q07Doc1)
 	h.assertDiffEmpty(q07Doc1)
 
-	// ALTER COLUMN ... SET EXPRESSION is PostgreSQL 17+. Older servers
-	// reject the statement and the plan rolls back (the planner warns so);
-	// the rest of the modifications then round-trip without it.
+	// ALTER COLUMN ... SET EXPRESSION is PostgreSQL 17+. On older servers
+	// the planner refuses it up front (Q09) with the fix named; the rest
+	// of the modifications then round-trip without it.
 	doc2, newExpr := q07Doc2, true
 	if h.queryOne(`SELECT (current_setting('server_version_num')::int < 170000)::text`) == "true" {
-		if err := h.tryPlanAndApply(q07Doc2); err == nil || !strings.Contains(err.Error(), "expression") {
-			t.Fatalf("PostgreSQL before 17 must reject SET EXPRESSION, got %v", err)
-		}
-		// The main transaction rolled back. (How this harness's
-		// ApplyInTransaction treats the enum addition is not the product
-		// contract and is not asserted here.)
-		if got := h.queryOne(`SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'app.tenants'::regclass AND adnum = (SELECT attnum FROM pg_attribute WHERE attrelid='app.tenants'::regclass AND attname='scores')`); strings.Contains(got, "7") {
-			t.Fatalf("the rejected plan must roll back (scores default is %q)", got)
-		}
+		h.assertDiffError(q07Doc2, "SET EXPRESSION (PostgreSQL 17+)")
 		doc2, newExpr = strings.Replace(q07Doc2, `"expression": "net * 3"`, `"expression": "net * 2"`, 1), false
+		if doc2 == q07Doc2 {
+			t.Fatal("expression fixture edit did not apply")
+		}
 	}
 
 	res := h.planAndApply(doc2)
@@ -438,8 +440,15 @@ func TestQ07RoundTripModifications(t *testing.T) {
 	if got := h.queryOne(`SELECT indexdef FROM pg_indexes WHERE schemaname='app' AND indexname='tenants_order_idx'`); strings.Contains(got, "DESC") || !strings.Contains(got, "scores NULLS FIRST") || strings.Contains(got, "name NULLS") {
 		t.Fatalf("flipped ordering must round-trip (no DESC, scores NULLS FIRST, name plain): %s", got)
 	}
-	if got := h.queryOne(`SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'app.tenants'::regclass AND adnum = (SELECT attnum FROM pg_attribute WHERE attrelid='app.tenants'::regclass AND attname='gross')`); newExpr && (!strings.Contains(got, "3)") || strings.Contains(got, "2)")) {
-		t.Fatalf("SET EXPRESSION must round-trip, got %q", got)
+	gross := h.queryOne(`SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'app.tenants'::regclass AND adnum = (SELECT attnum FROM pg_attribute WHERE attrelid='app.tenants'::regclass AND attname='gross')`)
+	if newExpr && (!strings.Contains(gross, "3)") || strings.Contains(gross, "2)")) {
+		t.Fatalf("SET EXPRESSION must round-trip, got %q", gross)
+	}
+	if !newExpr && (!strings.Contains(gross, "2)") || strings.Contains(gross, "3)")) {
+		t.Fatalf("without SET EXPRESSION the expression must stay net * 2, got %q", gross)
+	}
+	if got := h.queryOne(`SELECT count(*)::text FROM app.glad_tenants`); got != "0" {
+		t.Fatalf("the view using the added enum value must be queryable, got %s", got)
 	}
 	if got := h.queryOne(`SELECT count(*)::text FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'mood' AND n.nspname = 'app'`); got != "4" {
 		t.Fatalf("enum value must be appended, got %s", got)
@@ -898,7 +907,7 @@ func TestQ07AlterToSequenceDefaultLifecycle(t *testing.T) {
 	if len(dropRes.Up) == 0 {
 		t.Fatalf("expected a drop plan")
 	}
-	if err := h.client.ApplyInTransaction(context.Background(), dropRes.Up, nil); err != nil {
+	if err := applyLikePush(context.Background(), h.client, dropRes); err != nil {
 		t.Fatalf("apply drop: %v", err)
 	}
 	if reg := h.queryOne(`select coalesce(to_regclass('public.alt_n_seq')::text, 'gone')`); reg != "gone" {

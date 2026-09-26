@@ -351,6 +351,51 @@ func verifyExtensionCapabilities(ctx context.Context, client *db.Client, pending
 		strings.Join(names, ", "))
 }
 
+// verifyServerVersion refuses pending migrations that need a newer
+// PostgreSQL than the connected server, before any statement runs (Q09):
+// the floor a snapshot plan records (plan.json minServerMajor) and the
+// floor of every statement form the planner knows to be version-gated —
+// the latter covers files without a plan (live-generated against another
+// server, or hand-written). A late server error would still roll the
+// failing migration back, but earlier migrations of the batch would
+// already be committed and the error would not name the fix.
+func verifyServerVersion(ctx context.Context, client *db.Client, pendings []pendingMigration) error {
+	major, err := client.ServerMajorVersion(ctx)
+	if err != nil {
+		return fmt.Errorf("verify server version precondition: %w", err)
+	}
+	if major == 0 {
+		return nil // the server reported no version: nothing to compare
+	}
+	return checkServerVersion(major, pendings)
+}
+
+func checkServerVersion(major int, pendings []pendingMigration) error {
+	var lines []string
+	for _, p := range pendings {
+		stem := p.File.Version + "_" + p.File.Name
+		found := false
+		for _, stmt := range p.Statements {
+			if !hasExecutableStmt(stmt) {
+				continue
+			}
+			if need, feature := db.StatementMinServerMajor(stmt); need > major {
+				lines = append(lines, fmt.Sprintf("  %s: %s — %s needs PostgreSQL %d+", stem, firstLine(strings.TrimSpace(stmt)), feature, need))
+				found = true
+			}
+		}
+		if !found && p.Plan != nil && p.Plan.MinServerMajor > major {
+			lines = append(lines, fmt.Sprintf("  %s: its plan report records minServerMajor %d (needs PostgreSQL %d+)", stem, p.Plan.MinServerMajor, p.Plan.MinServerMajor))
+		}
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"pending migration(s) need a newer server than the connected PostgreSQL %d; refusing before any statement runs:\n%s\nupgrade the server, or replace the migration: a generated column's expression change on older servers is a drop of the column followed by an add with the new expression (regenerate with the column removed, then re-added last)",
+		major, strings.Join(lines, "\n"))
+}
+
 // verifyDocumentExtensionCapabilities is the db-push variant of the X01
 // extension gate: a pushed schema document carrying the pgvector capability
 // is refused before any statement runs when the extension is not installed.

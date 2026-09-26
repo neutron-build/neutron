@@ -278,6 +278,9 @@ func (s *MigrationSession) ApplyMigration(ctx context.Context, mf MigrationFile)
 	defer tx.Rollback(ctx)
 
 	if _, err := tx.Exec(ctx, mf.SQL); err != nil {
+		if isUnsafeNewEnumValue(err) {
+			return &EnumValueUseError{Version: mf.Version, Err: err}
+		}
 		return fmt.Errorf("execute migration %s: %w", mf.Version, err)
 	}
 
