@@ -8,9 +8,13 @@
 // is NULL when the FK misses. The relation JSON is plain json, not jsonb: it
 // is built once and parsed once by the driver, so jsonb's binary conversion,
 // key sorting and deduplication only cost server time (measured ~1.7x on a
-// 100-parent, 20-children-per-edge page — R01 bench/orm-gate.mjs) while the
-// decoded values are identical (every leaf that JSON numbers would corrupt is
-// cast to text first; see jsonLeaf). Sibling relations never join each other, so two
+// 100-parent, 20-children-per-edge page — R01 bench/orm-gate.mjs). Every leaf
+// that JSON numbers would corrupt is cast to text first (see jsonLeaf). The
+// decoded values are NOT identical to a jsonb build in three places, each
+// now matching the same column read at the top level: float -0 keeps its
+// sign, a json column keeps its key order, and a json column holding
+// "\u0000" reads (jsonb refuses it) — pinned by
+// live.relation-json.postgres.test.ts. Sibling relations never join each other, so two
 // to-many children can never multiply each other — including two relations
 // to the same target table (author + reviewer), which get separate
 // path-derived aliases. Parent where/order/limit/offset apply to parent rows
