@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -675,6 +676,75 @@ func TestStudioSameRowChainE2E(t *testing.T) {
 			}
 		})
 	}
+
+	// A foreign-table inheritance child: its rows read xmin 0 and a remote
+	// ctid, so no version or tuple check can guard them. The parent is
+	// read-only. A loopback postgres_fdw server makes the rows real.
+	quoteLiteral := func(v string) string { return "'" + strings.ReplaceAll(v, "'", "''") + "'" }
+	mapping := `CREATE USER MAPPING FOR CURRENT_USER SERVER loop`
+	if u, err := url.Parse(base); err == nil && u.User != nil {
+		if pw, ok := u.User.Password(); ok {
+			mapping += fmt.Sprintf(` OPTIONS (user %s, password %s)`, quoteLiteral(u.User.Username()), quoteLiteral(pw))
+		}
+	}
+	for _, stmt := range []string{
+		`CREATE EXTENSION postgres_fdw`,
+		fmt.Sprintf(`CREATE SERVER loop FOREIGN DATA WRAPPER postgres_fdw OPTIONS (host '127.0.0.1', port %s, dbname %s)`,
+			quoteLiteral(scalar(`SELECT current_setting('port')`)), quoteLiteral(dbName)),
+		mapping,
+		`CREATE SCHEMA remote`,
+		`CREATE TABLE remote.pt (id int, x text)`,
+		`INSERT INTO remote.pt VALUES (1,'orig')`,
+		`CREATE TABLE fitems (id int PRIMARY KEY, x text)`,
+		`CREATE FOREIGN TABLE fitems_f () INHERITS (fitems) SERVER loop OPTIONS (schema_name 'remote', table_name 'pt')`,
+		// The remote relation spans two tables: postgres_fdw updates by the
+		// remote ctid, which matches a row in each.
+		`CREATE TABLE remote.rt (id int, x text)`,
+		`CREATE TABLE remote.rt_c () INHERITS (remote.rt)`,
+		`INSERT INTO remote.rt VALUES (1,'a-orig')`,
+		`INSERT INTO remote.rt_c VALUES (2,'b-orig')`,
+		`CREATE TABLE fitems2 (id int PRIMARY KEY, x text)`,
+		`CREATE FOREIGN TABLE fitems2_f () INHERITS (fitems2) SERVER loop OPTIONS (schema_name 'remote', table_name 'rt')`,
+	} {
+		if err := fixture.Exec(ctx, stmt); err != nil {
+			t.Fatalf("seed %q: %v", stmt, err)
+		}
+	}
+	wantForeignReadOnly := func(t *testing.T, table string) {
+		t.Helper()
+		code, body := do(http.MethodGet, "/api/table?connectionId=e2e&schema=public&table="+table, "")
+		reason, _ := body["readOnlyReason"].(string)
+		if code != http.StatusOK || body["readOnly"] != true || !strings.Contains(reason, "foreign table") {
+			t.Fatalf("%s must read as read-only for its foreign child: %d readOnly=%v reason=%q", table, code, body["readOnly"], reason)
+		}
+	}
+
+	run("A13 a stale edit of a foreign-child row is refused (the parent is read-only)", func(t *testing.T) {
+		fi := read("fitems", "id")
+		if err := fixture.Exec(ctx, `UPDATE remote.pt SET x = 'foreign' WHERE id = 1`); err != nil {
+			t.Fatalf("foreign write: %v", err)
+		}
+		code, body := commit("a13-stale", upd("fitems", fi.binding, idKey(1), fi.versions["1"], "x", "stale-client"))
+		if code == http.StatusOK {
+			t.Errorf("a stale edit of a foreign-child row committed: %v", body)
+		}
+		if x := scalar(`SELECT x FROM remote.pt WHERE id = 1`); x != "foreign" {
+			t.Fatalf("foreign write lost: x = %q", x)
+		}
+		wantForeignReadOnly(t, "fitems")
+	})
+
+	run("A13 a one-row edit of a foreign-child row cannot reach a second remote row", func(t *testing.T) {
+		fi := read("fitems2", "id")
+		code, body := commit("a13-heaps", upd("fitems2", fi.binding, idKey(1), fi.versions["1"], "x", "solo"))
+		if code == http.StatusOK {
+			t.Errorf("an edit of a foreign-child row committed: %v", body)
+		}
+		if got := scalar(`SELECT string_agg(id || ':' || x, ',' ORDER BY id) FROM remote.rt`); got != "1:a-orig,2:b-orig" {
+			t.Fatalf("remote rows changed: %s", got)
+		}
+		wantForeignReadOnly(t, "fitems2")
+	})
 }
 
 // wantChainedWording checks a chained-operation conflict names the in-batch
