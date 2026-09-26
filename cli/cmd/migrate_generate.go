@@ -39,12 +39,14 @@ The generated SQL never drops neutron-internal tables (_neutron_*), extension-ow
 	RunE: func(cmd *cobra.Command, args []string) error { return reportRunE(runMigrateGenerate(cmd, args)) },
 }
 
-// reportRunE surfaces RunE errors: main() only exits 1 without printing.
+// reportRunE prints a RunE error where it happens and marks it reported, so
+// Execute does not print it again.
 func reportRunE(err error) error {
 	if err != nil {
 		ui.Errorf("%v", err)
+		return reportedError{err}
 	}
-	return err
+	return nil
 }
 
 // parseSchemaRenames dispatches rename-flag parsing per document format:

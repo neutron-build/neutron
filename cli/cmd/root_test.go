@@ -1,6 +1,13 @@
 package cmd
 
 import (
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -69,5 +76,44 @@ func TestExecuteReturnsNoErrorForHelp(t *testing.T) {
 	err := rootCmd.Execute()
 	if err != nil {
 		t.Errorf("Execute() with --help returned error: %v", err)
+	}
+}
+
+// A command error reaches the user exactly once: studio's listen failure
+// (its RunE returns the error without printing it) used to exit 1 with no
+// output, and errors reportRunE already printed must not print twice.
+func TestCommandErrorsArePrintedOnce(t *testing.T) {
+	bin := buildCLIBinary(t)
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+	port := busy.Addr().(*net.TCPAddr).Port
+	home := t.TempDir()
+
+	run := func(args ...string) (int, string) {
+		c := exec.Command(bin, args...)
+		c.Dir = home
+		c.Env = []string{"HOME=" + home, "USERPROFILE=" + home, "SystemRoot=" + os.Getenv("SystemRoot")}
+		out, err := c.CombinedOutput()
+		code := 0
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			code = exitErr.ExitCode()
+		} else if err != nil {
+			t.Fatalf("run %v: %v", args, err)
+		}
+		return code, string(out)
+	}
+
+	code, out := run("studio", "--port", strconv.Itoa(port))
+	want := fmt.Sprintf("listen on port %d", port)
+	if code != 1 || strings.Count(out, want) != 1 {
+		t.Fatalf("studio on a busy port: exit %d, want 1 and %q once in:\n%s", code, want, out)
+	}
+
+	code, out = run("migrate", "generate", "--schema", filepath.Join(home, "absent.json"))
+	if code != 1 || strings.Count(out, "read schema") != 1 {
+		t.Fatalf("migrate generate without a schema: exit %d, want 1 and one report in:\n%s", code, out)
 	}
 }

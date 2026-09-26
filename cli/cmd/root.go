@@ -1,10 +1,12 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
+	"github.com/neutron-build/neutron/cli/internal/ui"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -36,10 +38,24 @@ func Execute() error {
 	// FlagErrorFunc fires only on flag parsing, so nothing double-prints).
 	rootCmd.SetFlagErrorFunc(func(c *cobra.Command, err error) error {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return err
+		return reportedError{err}
 	})
-	return rootCmd.Execute()
+	err := rootCmd.Execute()
+	// Every other failure is printed here exactly once: a command whose RunE
+	// returns an error without reporting it (studio's listen failure, say)
+	// used to exit 1 with no message at all.
+	var reported reportedError
+	if err != nil && !errors.As(err, &reported) {
+		ui.Errorf("%v", err)
+	}
+	return err
 }
+
+// reportedError marks an error that was already printed (reportRunE, flag
+// parsing), so Execute does not print it a second time.
+type reportedError struct{ error }
+
+func (e reportedError) Unwrap() error { return e.error }
 
 func init() {
 	cobra.OnInitialize(initConfig)
