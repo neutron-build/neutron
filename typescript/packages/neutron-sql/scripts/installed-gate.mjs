@@ -163,19 +163,29 @@ export const db = await createDatabase({
 });
 `;
 
+// Every fenced block is classified by its info string's first word, case-
+// insensitively: code languages are compiled, known prose/shell languages
+// are skipped, and anything else is reported (a new spelling such as
+// ```typescript must not slip past compilation).
+const CODE_LANGS = new Set(["ts", "typescript", "tsx", "js", "javascript", "jsx", "mjs"]);
+const OTHER_LANGS = new Set(["bash", "sh", "shell", "console", "sql", "json", "text", "diff"]);
+
 function readmeExamples(readme) {
   const blocks = [];
+  const unknown = [];
   const lines = readme.split("\n");
   for (let i = 0; i < lines.length; i++) {
-    const m = /^```(ts|js)\s*$/.exec(lines[i]);
+    const m = /^\s*```(\S*)/.exec(lines[i]);
     if (!m) continue;
+    const lang = m[1].toLowerCase();
     const start = i + 1;
     let end = start;
-    while (end < lines.length && !lines[end].startsWith("```")) end++;
-    blocks.push({ lang: m[1], line: start + 1, body: lines.slice(start, end).join("\n") });
+    while (end < lines.length && !/^\s*```\s*$/.test(lines[end])) end++;
+    if (CODE_LANGS.has(lang)) blocks.push({ lang, line: start + 1, body: lines.slice(start, end).join("\n") });
+    else if (!OTHER_LANGS.has(lang)) unknown.push(`line ${start}: \`\`\`${m[1]}`);
     i = end;
   }
-  return blocks;
+  return { blocks, unknown };
 }
 
 const cleanups = [];
@@ -186,6 +196,9 @@ try {
   if (!KEEP_WORK) cleanups.push(() => rmSync(work, { recursive: true, force: true }));
   const rel = path.relative(REPO, work);
   verdict("setup: consumers live outside the monorepo", rel.startsWith("..") || path.isAbsolute(rel), work);
+  // A clean build: tsc never deletes outputs of removed sources, and pnpm
+  // pack ships whatever dist/ holds.
+  rmSync(path.join(PKG, "dist"), { recursive: true, force: true });
   run(pnpm, ["run", "build"], PKG);
   const packDir = path.join(work, "pack");
   mkdirSync(packDir);
@@ -240,7 +253,8 @@ try {
   verdict("README: every documented import path is exported", notExported.length === 0, notExported.join(", ") || documented.join(" "));
 
   // ---------------------------------------------------------- consumers
-  const examples = readmeExamples(readme);
+  const { blocks: examples, unknown: unclassified } = readmeExamples(readme);
+  verdict("README: every fenced block has a known language", unclassified.length === 0, unclassified.join(" | ") || "ok");
   const unregistered = examples.filter((b) => !(b.body.split("\n")[0] in EXAMPLE_CONTEXT));
   verdict(
     "README: every TypeScript/JavaScript example is registered for compilation",
