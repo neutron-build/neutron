@@ -188,7 +188,7 @@ NEUTRON_STUDIO_DEV_ORIGIN=http://localhost:5173 neutron studio
 
 The CLI embeds the build: `npm run build` writes `dist/` plus
 `dist/studio-manifest.json` (the sha256 of every built file and of the
-sources it was built from, `scripts/embed-manifest.mjs`); copy `dist/` to
+current sources, `scripts/embed-manifest.mjs`); copy `dist/` to
 `cli/internal/studio/dist` before building the CLI. A binary whose embedded
 files differ from the manifest refuses to start Studio, and `go test` in
 `cli/` fails when the embedded build is not the build of the current

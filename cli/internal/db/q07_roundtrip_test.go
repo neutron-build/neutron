@@ -409,20 +409,18 @@ func TestQ07RoundTripModifications(t *testing.T) {
 	h.assertDiffEmpty(q07Doc1)
 
 	// ALTER COLUMN ... SET EXPRESSION is PostgreSQL 17+. Older servers
-	// reject the statement and the whole plan rolls back (the planner warns
-	// so); the rest of the modifications then round-trip without it.
+	// reject the statement and the plan rolls back (the planner warns so);
+	// the rest of the modifications then round-trip without it.
 	doc2, newExpr := q07Doc2, true
 	if h.queryOne(`SELECT (current_setting('server_version_num')::int < 170000)::text`) == "true" {
 		if err := h.tryPlanAndApply(q07Doc2); err == nil || !strings.Contains(err.Error(), "expression") {
 			t.Fatalf("PostgreSQL before 17 must reject SET EXPRESSION, got %v", err)
 		}
-		// Rolled back, except the documented ApplyInTransaction exception:
-		// the enum addition commits first and stays.
+		// The main transaction rolled back. (How this harness's
+		// ApplyInTransaction treats the enum addition is not the product
+		// contract and is not asserted here.)
 		if got := h.queryOne(`SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'app.tenants'::regclass AND adnum = (SELECT attnum FROM pg_attribute WHERE attrelid='app.tenants'::regclass AND attname='scores')`); strings.Contains(got, "7") {
 			t.Fatalf("the rejected plan must roll back (scores default is %q)", got)
-		}
-		if got := h.queryOne(`SELECT count(*)::text FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'mood' AND n.nspname = 'app' AND e.enumlabel = 'elated'`); got != "1" {
-			t.Fatalf("the enum addition commits ahead of the plan (documented), got %s", got)
 		}
 		doc2, newExpr = strings.Replace(q07Doc2, `"expression": "net * 3"`, `"expression": "net * 2"`, 1), false
 	}

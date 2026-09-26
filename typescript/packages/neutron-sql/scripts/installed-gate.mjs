@@ -175,14 +175,17 @@ function readmeExamples(readme) {
   const unknown = [];
   const lines = readme.split("\n");
   for (let i = 0; i < lines.length; i++) {
-    const m = /^\s*```(\S*)/.exec(lines[i]);
+    // Backtick and tilde fences (CommonMark); the closing fence repeats
+    // the opening character.
+    const m = /^\s*(```|~~~)[`~]*\s*(\S*)/.exec(lines[i]);
     if (!m) continue;
-    const lang = m[1].toLowerCase();
+    const lang = m[2].toLowerCase();
+    const close = new RegExp(`^\\s*${m[1][0] === "`" ? "```" : "~~~"}[${m[1][0]}]*\\s*$`);
     const start = i + 1;
     let end = start;
-    while (end < lines.length && !/^\s*```\s*$/.test(lines[end])) end++;
+    while (end < lines.length && !close.test(lines[end])) end++;
     if (CODE_LANGS.has(lang)) blocks.push({ lang, line: start + 1, body: lines.slice(start, end).join("\n") });
-    else if (!OTHER_LANGS.has(lang)) unknown.push(`line ${start}: \`\`\`${m[1]}`);
+    else if (!OTHER_LANGS.has(lang)) unknown.push(`line ${start}: ${m[1]}${m[2]}`);
     i = end;
   }
   return { blocks, unknown };
@@ -253,6 +256,17 @@ try {
   verdict("README: every documented import path is exported", notExported.length === 0, notExported.join(", ") || documented.join(" "));
 
   // ---------------------------------------------------------- consumers
+  // Self-check of the classifier: every fence spelling reaches compilation
+  // or is reported; nothing is skipped silently.
+  {
+    const probe = ["```typescript", "a", "```", "~~~ts", "b", "~~~", "```TS title=x.ts", "c", "```", "```yaml", "d", "```", "```bash", "e", "```"].join("\n");
+    const got = readmeExamples(probe);
+    verdict(
+      "README gate: the fence classifier sees backtick, tilde and titled fences",
+      got.blocks.map((b) => b.body).join("") === "abc" && got.unknown.length === 1,
+      JSON.stringify(got),
+    );
+  }
   const { blocks: examples, unknown: unclassified } = readmeExamples(readme);
   verdict("README: every fenced block has a known language", unclassified.length === 0, unclassified.join(" | ") || "ok");
   const unregistered = examples.filter((b) => !(b.body.split("\n")[0] in EXAMPLE_CONTEXT));
