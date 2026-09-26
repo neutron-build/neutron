@@ -1394,6 +1394,12 @@ entries, each scoped to rows currently connected to this parent.
   unreachable server, or a run that executes zero live cases into failures.
   Locally, with no URL configured, every live test skips with a printed
   reason and the unit suites still run.
+- `node scripts/installed-gate.mjs` packs the package as `pnpm publish`
+  would and installs it into clean pg-only and postgres.js-only projects
+  outside the repository: tarball contents, exports, declarations with the
+  minimum and current TypeScript, every example in this README compiled,
+  no optional-peer leakage, and a live round trip per driver
+  (`NEUTRON_TEST_DATABASE_URL`; CI: `orm-artifacts.yml`).
 
 ## Status (v0.1)
 
