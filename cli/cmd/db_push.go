@@ -101,7 +101,7 @@ func runDBPush(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(result.Up) == 0 {
-		if len(result.Warnings) > 0 {
+		if db.HasDrift(result.Warnings) {
 			ui.Infof("No applicable changes; see the notes above — objects reported as left untouched are not in sync with the schema.")
 		} else {
 			ui.Infof("Schema is already in sync.")
@@ -135,7 +135,7 @@ func dbPushDryRun(ctx context.Context, client *db.Client, loaded loadedSchema, r
 		ui.Warnf("%s", w)
 	}
 	if len(result.Up) == 0 {
-		if len(result.Warnings) > 0 {
+		if db.HasDrift(result.Warnings) {
 			ui.Infof("No applicable changes; see the notes above — objects reported as left untouched are not in sync with the schema.")
 		} else {
 			ui.Infof("Schema is already in sync.")

@@ -254,7 +254,7 @@ func prepareHistoryRun(ctx context.Context, client *db.Client, sess *db.Migratio
 		return applied, nil
 	case db.HistoryLegacyText, db.HistoryLegacyInteger:
 		return nil, fmt.Errorf(
-			"migration history is in the legacy %s shape and must be adopted once before it can be run on — "+
+			"migration history is in the %s shape and must be adopted once before it can be run on — "+
 				"run `neutron migrate adopt` (explicit, transactional; unprovable rows stay unverified)",
 			shape)
 	case db.HistoryV2Integer:
@@ -462,7 +462,7 @@ func runMigrateStatus(cmd *cobra.Command, args []string) error {
 	}
 	switch shape {
 	case db.HistoryLegacyText, db.HistoryLegacyInteger:
-		ui.Warnf("History is in the legacy %s shape; `neutron migrate` will refuse until `neutron migrate adopt` runs once", shape)
+		ui.Warnf("History is in the %s shape; `neutron migrate` will refuse until `neutron migrate adopt` runs once", shape)
 	case db.HistoryV2Integer:
 		ui.Warnf("History uses the SDK integer-version shape; CLI migrations refuse — use the SDK runners or `neutron migrate adopt`")
 	case db.HistoryIncompatible:

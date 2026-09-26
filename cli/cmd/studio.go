@@ -46,6 +46,9 @@ func runStudio(cmd *cobra.Command, args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	if err := srv.Listen(); err != nil {
+		return err
+	}
 	url := srv.URL()
 	ui.Infof("Starting Studio at %s", url)
 

@@ -497,3 +497,18 @@ func TestDiffUnsupportedTypeTableDropHasHonestDown(t *testing.T) {
 		t.Fatalf("down must carry an explicit irreversible marker, got: %s", down)
 	}
 }
+
+// The internal-metadata note alone is not drift: a no-op plan must not tell
+// the user objects are out of sync with the schema.
+func TestHasDriftIgnoresInternalMetadataNote(t *testing.T) {
+	note := `table "public"."_neutron_migrations" ` + InternalMetadataNote
+	if HasDrift([]string{note}) {
+		t.Fatalf("internal-metadata note alone reported as drift")
+	}
+	if !HasDrift([]string{note, `table "public"."extra" exists in the database but not in the schema: left untouched`}) {
+		t.Fatalf("an untracked table must be drift")
+	}
+	if HasDrift(nil) {
+		t.Fatalf("no warnings is no drift")
+	}
+}

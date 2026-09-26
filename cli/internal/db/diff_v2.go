@@ -52,6 +52,22 @@ type DiffV2Options struct {
 
 // DiffV2Document produces the up/down SQL moving the database described by
 // `actual` to `desired`. Both documents must be validated v2 documents.
+
+// InternalMetadataNote ends the plan note for a neutron-internal table
+// (migration history): informational, never drift.
+const InternalMetadataNote = "is neutron-internal metadata: always left untouched"
+
+// HasDrift reports whether any plan warning names an object that is out of
+// sync with the schema, as opposed to the internal-metadata note.
+func HasDrift(warnings []string) bool {
+	for _, w := range warnings {
+		if !strings.HasSuffix(w, InternalMetadataNote) {
+			return true
+		}
+	}
+	return false
+}
+
 func DiffV2Document(ctx context.Context, desired, actual *V2Document, opts DiffV2Options) (DiffResult, error) {
 	var result DiffResult
 
@@ -1451,7 +1467,7 @@ func (p *v2Planner) planTableDrops() {
 			continue
 		}
 		if isProtectedTableName(t.Identity.Name) {
-			p.warn("table %s is neutron-internal metadata: always left untouched", t.Identity)
+			p.warn("table %s %s", t.Identity, InternalMetadataNote)
 			continue
 		}
 		if !p.opts.AllowDestructive {

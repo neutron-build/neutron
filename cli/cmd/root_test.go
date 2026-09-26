@@ -111,6 +111,9 @@ func TestCommandErrorsArePrintedOnce(t *testing.T) {
 	if code != 1 || strings.Count(out, want) != 1 {
 		t.Fatalf("studio on a busy port: exit %d, want 1 and %q once in:\n%s", code, want, out)
 	}
+	if strings.Contains(out, "Studio is running") || strings.Contains(out, "Starting Studio") {
+		t.Fatalf("studio on a busy port announced a running server:\n%s", out)
+	}
 
 	code, out = run("migrate", "generate", "--schema", filepath.Join(home, "absent.json"))
 	if code != 1 || strings.Count(out, "read schema") != 1 {
