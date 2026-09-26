@@ -29,6 +29,7 @@ type Server struct {
 	epochs map[string]string
 	mu     sync.RWMutex
 	srv    *http.Server
+	ln     net.Listener
 	// sessionToken is the per-launch CSRF-class token required on every
 	// mutating endpoint (see session.go). Empty only for hand-constructed
 	// Servers in tests that never call requireMutationAuth.
@@ -97,19 +98,35 @@ func NewServer(port int) (*Server, error) {
 }
 
 // Start begins listening. Blocks until the context is cancelled.
+// Listen binds the Studio port. Start calls it when the caller has not, so
+// a caller can report a bound server (or the bind error) before serving.
+func (s *Server) Listen() error {
+	if s.ln != nil {
+		return nil
+	}
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", s.port))
+	if err != nil {
+		return fmt.Errorf("listen on port %d: %w", s.port, err)
+	}
+	s.ln = ln
+	return nil
+}
+
 func (s *Server) Start(ctx context.Context) error {
 	mux, err := s.routes()
 	if err != nil {
+		if s.ln != nil {
+			s.ln.Close()
+		}
 		return err
 	}
-	s.srv = &http.Server{
-		Addr:    fmt.Sprintf("127.0.0.1:%d", s.port),
-		Handler: s.corsMiddleware(mux),
+	if err := s.Listen(); err != nil {
+		return err
 	}
-
-	ln, err := net.Listen("tcp", s.srv.Addr)
-	if err != nil {
-		return fmt.Errorf("listen on port %d: %w", s.port, err)
+	ln := s.ln
+	s.srv = &http.Server{
+		Addr:    ln.Addr().String(),
+		Handler: s.corsMiddleware(mux),
 	}
 
 	go func() {

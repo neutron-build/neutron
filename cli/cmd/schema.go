@@ -248,7 +248,7 @@ func runSchemaCheck(cmd *cobra.Command, args []string) error {
 	switch shape {
 	case db.HistoryV2Text, db.HistoryAbsent:
 	case db.HistoryLegacyText, db.HistoryLegacyInteger:
-		return fmt.Errorf("migration history is in the legacy %s shape — applied state is unknown until adopted (`neutron migrate adopt`) or re-baselined; refusing to guess", shape)
+		return fmt.Errorf("migration history is in the %s shape — applied state is unknown until adopted (`neutron migrate adopt`) or re-baselined; refusing to guess", shape)
 	case db.HistoryV2Integer:
 		return fmt.Errorf("migration history uses the SDK integer-version shape — the CLI file workflow cannot identify applied state; refusing to guess")
 	default:
