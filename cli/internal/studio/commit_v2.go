@@ -983,7 +983,7 @@ func (p *preparedOp) bindTuple(sqlText string, args []any, tableRef string) (str
 		return sqlText, args
 	}
 	args = append(args, *p.tuple)
-	return fmt.Sprintf("%s AND %s.ctid::text = $%d", sqlText, tableRef, len(args)), args
+	return fmt.Sprintf("%s AND (%s.tableoid::oid::text || ':' || %s.ctid::text) = $%d", sqlText, tableRef, tableRef, len(args)), args
 }
 
 // explainConflict classifies a zero-row guarded mutation. For a chained
