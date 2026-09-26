@@ -596,7 +596,9 @@ async function timed(fn, iterations, warmup) {
 // each measured around a pool that is closed before reading, so the backend
 // flushed its counters at exit. Setup statements cancel out. Foreign
 // transactions in the database (an autovacuum worker's visit) can only ADD
-// to a window, so the minimum over repetitions is the robust estimate.
+// to a window, so each window's minimum over repetitions is its robust
+// estimate. The minimum of the difference is not: a foreign transaction in
+// the 1-call window lowers it (CI saw 0.6).
 async function serverTransactionsPerCall(open, call, m = 10) {
   async function run(n) {
     const before = await settledXacts();
@@ -605,14 +607,18 @@ async function serverTransactionsPerCall(open, call, m = 10) {
     await h.close();
     return (await settledXacts()) - before;
   }
-  let best = Infinity;
-  for (let rep = 0; rep < 3; rep++) {
-    const one = await run(1);
-    const many = await run(1 + m);
-    best = Math.min(best, (many - one) / m);
-    if (Number.isInteger(best) && best <= 1) break;
+  let one = Infinity;
+  let many = Infinity;
+  let estimate = NaN;
+  for (let rep = 0; rep < 5; rep++) {
+    one = Math.min(one, await run(1));
+    many = Math.min(many, await run(1 + m));
+    estimate = (many - one) / m;
+    // A read is at least one transaction; a fractional or zero estimate
+    // means a window still carries foreign transactions.
+    if (Number.isInteger(estimate) && estimate >= 1) break;
   }
-  return best;
+  return estimate;
 }
 
 // ----------------------------------------------------------------- scenario
