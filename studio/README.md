@@ -74,12 +74,16 @@ applied. A batch is reversible only when every operation is.
 
 Several operations on one row (two edited cells, the same cell twice, an
 edit then a delete) carry the version the table read returned. The first
-of them verifies it; later ones run against the version the batch itself
-produced, so the batch applies in order as one unit. A later operation
-carrying any other version is stale and conflicts the whole batch. The
-inverse undoes operations in reverse order (a twice-edited cell returns
-to its original value); a batch that both edits and deletes one row is
-irreversible.
+of them verifies it; later ones run against the exact row the batch's
+previous operation on it produced (its version and physical tuple), and
+only while no other operation, cascade, trigger or rule has rewritten that
+row or moved another row under its key; otherwise the whole batch
+conflicts. A later operation carrying any other version is stale and
+conflicts the whole batch. The inverse undoes operations in reverse order
+(a twice-edited cell returns to its original value); a batch that both
+edits and deletes one row is irreversible. Two operations address the same
+row only when their key values are identical as sent: the same key spelled
+differently (`" 8"` for `8`) does not chain and conflicts.
 
 ## The data editor (S03)
 
