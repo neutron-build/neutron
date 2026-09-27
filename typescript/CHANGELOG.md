@@ -62,7 +62,10 @@ All notable changes to this project are documented in this file.
   so `--name "Add Users"` produces an appliable migration. With `--rename`,
   `db push` and live `migrate generate` compare a renamed column's generated
   expressions, checks and indexes as PostgreSQL rewrites them, so a rename
-  alone plans only `RENAME COLUMN`, and its down file reverts.
+  alone plans only `RENAME COLUMN`, and its down file reverts, including
+  changed keys, foreign keys and indexes on the column. Offline snapshot
+  renames that an expression names are refused with a two-migration path
+  instead of a table rewrite whose down file could not run.
 
 - **`@neutron-build/nucleus` model clients were checked against a live
   engine** (Nucleus 1.0.2, `conformance/live/orm/`). Document collections

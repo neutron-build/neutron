@@ -141,16 +141,19 @@ must be quoted in the shell; without quotes the shell reads it as a redirect
 and the flag never reaches the CLI). A rename alone plans only `RENAME COLUMN`
 in `db push` and `migrate generate --mode live`: PostgreSQL rewrites the
 generated columns, checks and indexes that name the column, and the planner
-compares against that. Current limit: `--mode snapshot` has no database to
-compare against, so it still re-plans those definitions (a check or
-expression index dropped and re-created, a generated column given `SET
-EXPRESSION`, which rewrites the table and needs PostgreSQL 17+), and its
-down file for such a rename does not run. Generate renames with `--mode
-live`. Live mode has one current limit: when the plan renames a column
-and also changes a unique, primary-key or foreign-key constraint on it
-(or, on a table with no expressions, an index keyed on it or `INCLUDE`-ing
-it), the down file re-adds the old definition under the old column name,
-so `neutron migrate down` fails (SQLSTATE 42703) and rolls back.
+compares against that; the down file reverts the rename, including changed
+keys, foreign keys and indexes on the column. `--mode snapshot` has no
+database to compare against: a rename that no generated column, check or
+index expression names plans the same way, and one that such an expression
+names is refused with the elements listed and a two-migration path (keep the
+old name while changing them, then rename). A live plan is refused the same
+way when the planner cannot copy the table to compare it (for example a
+check with a whole-row reference); the message gives the `ALTER TABLE ...
+RENAME COLUMN` to run by hand first.
+Current limits, each failing at apply and rolling back: a new table whose
+foreign key references a column renamed in the same plan; and the down file
+of a plan that drops a column together with an index on it, or drops tables
+that reference each other. Split such changes into separate migrations.
 
 Enum value additions: PostgreSQL cannot use an enum value inside the
 transaction that adds it (SQLSTATE 55P04). When a plan adds enum values and
