@@ -607,7 +607,7 @@ func TestQ10UnrenamedLiveRunAdvice(t *testing.T) {
 		return runCLIProcess(t, bin, dbURL, args...)
 	}
 
-	const byHand = `rename by hand first with alter table "app"."t" rename column "net" to "amount" (PostgreSQL rewrites the expressions that reference it), then re-run without --rename`
+	const byHand = `rename by hand first with alter table "app"."t" rename column "net" to "amount" (PostgreSQL rewrites the expressions that reference it), then re-run without the --rename flags for app.t (keep any others)`
 	code, out := run("db", "push", "--dry-run", "--schema", after, "--rename", "app.t.net>app.t.amount")
 	if major < 17 {
 		if code == 0 || !strings.Contains(out, `generated column "gross" could not be verified`) {

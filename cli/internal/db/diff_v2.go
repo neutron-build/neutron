@@ -1023,7 +1023,7 @@ func (p *v2Planner) planColumnAttributes(table V2Identity, dc, ac V2Column) erro
 						// matching its spelling is no fix.
 						fix = fmt.Sprintf("The text %s holds predates the rename of %s, and it could not be compared under the rename. ", p.baseNoun(), renamed)
 						if p.opts.Normalizer != nil {
-							fix += fmt.Sprintf("Rename the column by hand first: %s (PostgreSQL rewrites the expressions that reference it), then re-run without --rename", strings.Join(p.renameStatements(table), "; "))
+							fix += fmt.Sprintf("Rename the column by hand first: %s (PostgreSQL rewrites the expressions that reference it), then re-run without the --rename flags for %s (keep any others)", strings.Join(p.renameStatements(table), "; "), table)
 						} else {
 							fix += "Re-run with --mode live, which compares it under the rename"
 						}
@@ -1492,7 +1492,7 @@ func (p *v2Planner) textEqual(table V2Identity, element, what string, desired, a
 			// A live run already had a normalizer; the copy under the
 			// rename is what failed.
 			if p.opts.Normalizer != nil {
-				fix = fmt.Sprintf("rename by hand first with %s (PostgreSQL rewrites the expressions that reference it), then re-run without --rename", strings.Join(p.renameStatements(table), "; "))
+				fix = fmt.Sprintf("rename by hand first with %s (PostgreSQL rewrites the expressions that reference it), then re-run without the --rename flags for %s (keep any others)", strings.Join(p.renameStatements(table), "; "), table)
 			} else {
 				fix = "re-run with --mode live, which compares it under the rename"
 			}
