@@ -115,8 +115,9 @@ func runMigrateGenerate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--mode must be live or snapshot, got %q", mode)
 	}
 
-	if name == "" {
-		name = "generated"
+	name, err := generatedMigrationName(name)
+	if err != nil {
+		return err
 	}
 
 	loaded, err := loadSchemaDocument(schemaPath)
@@ -194,6 +195,15 @@ func runMigrateGenerate(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// generatedMigrationName is the --name as its files spell it, so every
+// message and header names the migration the way the directory does.
+func generatedMigrationName(name string) (string, error) {
+	if name == "" {
+		name = "generated"
+	}
+	return db.MigrationNameSlug(name)
+}
+
 // phaseMigrationNames names one migration per plan phase: a single phase
 // keeps the requested name; an enum-additions phase becomes
 // "<name>_enum_values", written first.
@@ -216,8 +226,9 @@ func phaseMigrationNames(name string, phases []db.PlanPhase) []string {
 // artifacts (up/down SQL, plan report, target snapshot) are written
 // all-or-nothing and never overwrite existing files.
 func runMigrateGenerateSnapshot(cmd *cobra.Command, dir, schemaPath, name string, renameFlags []string, allowDestructive bool) error {
-	if name == "" {
-		name = "generated"
+	name, err := generatedMigrationName(name)
+	if err != nil {
+		return err
 	}
 
 	loaded, err := loadSchemaDocument(schemaPath)
