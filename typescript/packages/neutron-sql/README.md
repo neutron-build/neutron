@@ -1417,7 +1417,7 @@ drivers; nothing outside this table is claimed.
 
 | Component | Verified | Not claimed |
 |---|---|---|
-| PostgreSQL | 16, 17 and 18. Pull requests run the live suites on 17 (`typescript.yml`, `cli.yml`); the release matrix (`orm-matrix.yml`, run 36300933279 on `c1568b95`) passed this package's suite (887/887) and the CLI suite on 16.15, 17.11 and 18.6 (`pgvector/pgvector` images). On 16, a generated-column expression change is refused before anything runs, because `ALTER COLUMN … SET EXPRESSION` is PostgreSQL 17+ | Majors before 16 are untested |
+| PostgreSQL | 16, 17 and 18. Pull requests run the live suites on 17 (`typescript.yml`, `cli.yml`); the release matrix (`orm-matrix.yml`, run 36310624335 on `6fcf145d`) passed this package's suite (887/887) and the CLI suite on 16.15, 17.11 and 18.6 (`pgvector/pgvector` images). On 16, a generated-column expression change is refused before anything runs, because `ALTER COLUMN … SET EXPRESSION` is PostgreSQL 17+ | Majors before 16 are untested |
 | Node.js | `engines: ">=22"`; CI runs 22 and 24; the installed-artifact gate ran on 22.19, 22.23 and 24.20 | 22.0–22.18; Node 20 and older |
 | Drivers | `pg` 8.22.0 and `postgres` 3.4.8, the versions the suites resolve (peer ranges `^8.11.0` / `^3.4.7`) | other versions inside the peer ranges |
 | TypeScript | 5.7.2 (minimum) and 5.9.3, declarations checked with `skipLibCheck` off | |
