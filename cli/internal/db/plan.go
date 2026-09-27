@@ -938,6 +938,9 @@ func WithoutInternalMetadata(doc *V2Document) (*V2Document, []V2Identity, error)
 	if len(removed) == 0 {
 		return doc, nil, nil
 	}
+	if refs := foreignKeysInto(kept, removed); len(refs) > 0 {
+		return nil, nil, &InternalReferenceError{Refs: refs}
+	}
 	root["tables"] = kept
 	raw, err := json.Marshal(root)
 	if err != nil {
@@ -948,6 +951,66 @@ func WithoutInternalMetadata(doc *V2Document) (*V2Document, []V2Identity, error)
 		return nil, nil, fmt.Errorf("the schema document without its neutron-internal tables (%s) is invalid: %w", IdentityList(removed), err)
 	}
 	return out, removed, nil
+}
+
+// InternalReference is a user table's foreign key into a neutron-internal
+// table.
+type InternalReference struct {
+	Table      V2Identity
+	Constraint string
+	Target     V2Identity
+}
+
+// InternalReferenceError refuses a document whose user tables keep foreign
+// keys into neutron-internal tables: those tables can never be declared, so
+// no schema document can hold the keys.
+type InternalReferenceError struct {
+	Refs []InternalReference
+}
+
+func (e *InternalReferenceError) Error() string {
+	parts := make([]string, len(e.Refs))
+	for i, r := range e.Refs {
+		parts[i] = fmt.Sprintf("table %s has foreign key %s referencing %s", r.Table, r.Constraint, r.Target)
+	}
+	return strings.Join(parts, "; ") + " — _neutron_* tables are neutron-managed (created and upgraded by neutron itself, such as the migration history and the job queues' _neutron_jobs) and cannot be declared in a schema document, so no schema document can hold a foreign key into one"
+}
+
+// foreignKeysInto lists the foreign keys of tables that reference one of
+// targets, in document order.
+func foreignKeysInto(tables []any, targets []V2Identity) []InternalReference {
+	target := make(map[V2Identity]bool, len(targets))
+	for _, id := range targets {
+		target[id] = true
+	}
+	var refs []InternalReference
+	for _, t := range tables {
+		obj, _ := t.(map[string]any)
+		ident, _ := obj["identity"].(map[string]any)
+		schema, _ := ident["schema"].(string)
+		name, _ := ident["name"].(string)
+		constraints, _ := obj["constraints"].([]any)
+		for _, c := range constraints {
+			con, _ := c.(map[string]any)
+			if typ, _ := con["type"].(string); typ != "foreign-key" {
+				continue
+			}
+			ref, _ := con["references"].(map[string]any)
+			refTable, _ := ref["table"].(map[string]any)
+			rschema, _ := refTable["schema"].(string)
+			rname, _ := refTable["name"].(string)
+			if !target[V2Identity{Schema: rschema, Name: rname}] {
+				continue
+			}
+			cname, _ := con["name"].(string)
+			refs = append(refs, InternalReference{
+				Table:      V2Identity{Schema: schema, Name: name},
+				Constraint: cname,
+				Target:     V2Identity{Schema: rschema, Name: rname},
+			})
+		}
+	}
+	return refs
 }
 
 // IdentityList renders identities as a comma-separated "schema.name" list.

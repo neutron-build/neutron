@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -73,6 +74,10 @@ var schemaPullCmd = &cobra.Command{
 contract cannot represent faithfully are recorded as a read-only opaque inventory in
 the document and listed in the output. Neutron-internal metadata tables (_neutron_*)
 are left out: they are managed automatically and a schema document may not list them.
+A user table with a foreign key into one of them (for example to _neutron_jobs, the
+job queues' table) cannot be described by any schema document: pull refuses, names
+the table, the key and its target, and writes nothing. Drop the key or point it at a
+table you own, or keep that database off the schema document workflow.
 Pull never modifies the database.`,
 	RunE: func(cmd *cobra.Command, args []string) error { return reportRunE(runSchemaPull(cmd, args)) },
 }
@@ -107,7 +112,10 @@ it first). Migration history is OBSERVED and reported, never adopted or upgraded
 history graduation is neutron migrate adopt's job. Nothing in the database is
 created, altered or dropped. The baseline holds the migration lock while it reads
 the database and its history, so a concurrent neutron migrate waits for it (and it
-waits for a running one, within --timeout).`,
+waits for a running one, within --timeout). A user table with a foreign key into a
+_neutron_* table (for example to _neutron_jobs, the job queues' table) cannot be
+described by any schema document: the baseline refuses, names the table, the key and
+its target, and writes nothing.`,
 	RunE: func(cmd *cobra.Command, args []string) error { return reportRunE(runSchemaBaseline(cmd, args)) },
 }
 
@@ -173,7 +181,7 @@ func runSchemaPull(cmd *cobra.Command, args []string) error {
 	}
 	doc, internal, err := db.WithoutInternalMetadata(doc)
 	if err != nil {
-		return err
+		return withInternalReferenceOptions(err)
 	}
 	if err := db.WriteAtomicReplace(out, append([]byte(nil), doc.Canonical...)); err != nil {
 		return err
@@ -182,6 +190,25 @@ func runSchemaPull(cmd *cobra.Command, args []string) error {
 	reportInternalExcluded(internal)
 	ui.Successf("Pulled schema document: %s", out)
 	return nil
+}
+
+// withInternalReferenceOptions adds the ways out to a pull or baseline
+// refused because user tables keep foreign keys into neutron-internal
+// tables; other errors pass through.
+func withInternalReferenceOptions(err error) error {
+	var ref *db.InternalReferenceError
+	if !errors.As(err, &ref) {
+		return err
+	}
+	var tables []string
+	seen := map[db.V2Identity]bool{}
+	for _, r := range ref.Refs {
+		if !seen[r.Table] {
+			seen[r.Table] = true
+			tables = append(tables, r.Table.String())
+		}
+	}
+	return fmt.Errorf("%w. Options: drop the foreign key or replace it with one to a table you own, then run this command again; or leave %s unmanaged — no schema document can describe this database while the key exists, so keep it on hand-written migrations (neutron migrate) without schema pull or baseline", err, strings.Join(tables, ", "))
 }
 
 // reportInternalExcluded names the neutron-internal tables left out of a
@@ -441,7 +468,7 @@ func runSchemaBaseline(cmd *cobra.Command, args []string) error {
 	}
 	doc, internal, err := db.WithoutInternalMetadata(doc)
 	if err != nil {
-		return err
+		return withInternalReferenceOptions(err)
 	}
 	if schemaBaselineAfterIntrospect != nil {
 		schemaBaselineAfterIntrospect()
