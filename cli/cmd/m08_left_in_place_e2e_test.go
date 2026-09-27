@@ -447,6 +447,55 @@ func TestM08LeftInPlaceSnapshotChain(t *testing.T) {
 		refused(t, dbURL, []string{"modified since they were applied"}, "migrate", "--dir", mig)
 	})
 
+	// M08 review-2 finding 1 (P6, P6b): the chain is read as recorded, so
+	// an up file edited while generate runs cannot shape the snapshot it
+	// writes. Edit 001's up file (applied or pending), generate 002, restore
+	// 001 as migrate's refusal says: 002 records no phantom and the chain
+	// stays consistent after both apply.
+	for _, applied := range []bool{true, false} {
+		name := "EditedUpFileDoesNotShapeSnapshot/pending"
+		if applied {
+			name = "EditedUpFileDoesNotShapeSnapshot/applied"
+		}
+		t.Run(name, func(t *testing.T) {
+			label := "m08p6b"
+			if applied {
+				label = "m08p6"
+			}
+			dbURL, fx := newM02CommandDB(t, label)
+			if err := fx.Exec(context.Background(), `CREATE TABLE t (id integer PRIMARY KEY, keep text, old integer)`); err != nil {
+				t.Fatal(err)
+			}
+			work := t.TempDir()
+			mig := filepath.Join(work, "migrations")
+			must(t, dbURL, "schema", "baseline", "--dir", mig)
+			pulled := filepath.Join(work, "pulled.json")
+			must(t, dbURL, "schema", "pull", "--out", pulled)
+			d1, d2 := filepath.Join(work, "d1.json"), filepath.Join(work, "d2.json")
+			doc := strings.Replace(string(mustReadFile(t, pulled)), `,{"name":"old","notNull":false,"type":{"codec":"number","name":"int4"}}`, "", 1)
+			writeFile(t, d1, doc)
+			writeFile(t, d2, strings.Replace(doc, `{"name":"keep","notNull":false,"type":{"codec":"string","name":"text"}}`, `{"name":"keep","notNull":false,"type":{"codec":"string","name":"text"}},{"name":"n2","notNull":false,"type":{"codec":"number","name":"int4"}}`, 1))
+			must(t, unreachable, "migrate", "generate", "--mode", "snapshot", "--dir", mig, "--schema", d1, "--name", "drop_old", "--allow-destructive")
+			if applied {
+				must(t, dbURL, "migrate", "--dir", mig, "--allow-destructive")
+			}
+			up := filepath.Join(mig, "001_drop_old.up.sql")
+			original := string(mustReadFile(t, up))
+			writeFile(t, up, "-- Migration: drop_old\n\nselect 1;\n")
+			must(t, unreachable, "migrate", "generate", "--mode", "snapshot", "--dir", mig, "--schema", d2, "--name", "add_n2")
+			if strings.Contains(string(mustReadFile(t, filepath.Join(mig, "snapshots", "002_add_n2.snapshot.json"))), `"old"`) {
+				t.Fatalf("002 records a phantom old read from the edited up file")
+			}
+			writeFile(t, up, original)
+			must(t, dbURL, "schema", "check", "--live", "--dir", mig)
+			must(t, dbURL, "migrate", "--dir", mig, "--allow-destructive")
+			must(t, dbURL, "schema", "check", "--live", "--dir", mig)
+			if got := q09Query(t, fx, m08Columns); got != "id,keep,n2" {
+				t.Fatalf("t columns %s", got)
+			}
+		})
+	}
+
 	// M08 review-2 (review INFO 5): the pre-flight refuses a history row
 	// without the v2 format marker, as `neutron migrate` does.
 	t.Run("HistoryFormatVerified", func(t *testing.T) {
