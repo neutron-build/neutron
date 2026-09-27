@@ -163,6 +163,11 @@ converges). Changing a generated column's expression uses
 `migrate generate --mode live` refuse it on older servers with the
 alternative named, and `--mode snapshot` records `minServerMajor` in the plan
 so `neutron migrate` refuses older servers before running anything.
+Current limit: changing a column's type to an enum while a check on that
+column compares it with text fails at apply (SQLSTATE 42883) and rolls
+back: the type change runs while the old check still exists. Drop the
+check in an earlier push or migration, then change the type and add the
+new check.
 
 Safety semantics: generated SQL never drops `_neutron_*`
 metadata tables, extension-owned objects, or anything absent from the schema
