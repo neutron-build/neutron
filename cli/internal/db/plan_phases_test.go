@@ -272,6 +272,74 @@ func TestQ09SetExpressionRefusalSaysWhenUnverified(t *testing.T) {
 	}
 }
 
+// q09PartialNormalizer stands in for a twin normalizer that normalized the
+// table element by element and could not normalize the listed elements.
+type q09PartialNormalizer struct{ failed []string }
+
+func (n q09PartialNormalizer) NormalizeTable(_ context.Context, t V2Table) (V2Table, error) {
+	return t, &PartialNormalizationError{Table: t, Failed: n.failed, Err: errors.New("twin table failed")}
+}
+
+func (q09PartialNormalizer) NormalizeView(_ context.Context, v V2View) (V2View, error) {
+	return v, nil
+}
+
+func (q09PartialNormalizer) Close() {}
+
+// Review-2 finding 1: an element the normalizer could not normalize (the
+// default of a column typed by an enum the plan creates, say) must not
+// make the table's other, catalog-normalized elements "unverified". A real
+// change to the normalized generated expression keeps the verified
+// refusal on PostgreSQL 16 and plans SET EXPRESSION without an unverified
+// warning on 17+; only an element that actually failed is unverified.
+func TestQ09UnverifiedIsScopedToFailedElements(t *testing.T) {
+	base := q09Doc(t, `"expression": "net * 2"`, `"expression": "(net * (2)::numeric)"`)
+	desired := q09Doc(t, `"expression": "net * 2"`, `"expression": "(net * (3)::numeric)"`)
+	other := q09PartialNormalizer{failed: []string{"column size default", "index tenants_size_idx"}}
+	gross := q09PartialNormalizer{failed: []string{"column size default", "column gross generation expression"}}
+
+	_, err := DiffV2Document(context.Background(), desired, base, DiffV2Options{ServerMajor: 16, Normalizer: other})
+	if err == nil || !strings.Contains(err.Error(), `generated column "gross" changes its expression`) {
+		t.Fatalf("PostgreSQL 16: a normalized difference is a verified change: %v", err)
+	}
+	for _, bad := range []string{"could not be verified", "may be spelling only", "equivalence not verified"} {
+		if strings.Contains(err.Error(), bad) {
+			t.Fatalf("PostgreSQL 16: another element's failure must not unverify gross (%q): %v", bad, err)
+		}
+	}
+	res, err := DiffV2Document(context.Background(), desired, base, DiffV2Options{ServerMajor: 17, Normalizer: other})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(res.Up, "\n"), `alter column "gross" set expression as ((net * (3)::numeric))`) {
+		t.Fatalf("PostgreSQL 17: SET EXPRESSION expected, got %v", res.Up)
+	}
+	for _, w := range res.Warnings {
+		if strings.Contains(w, "equivalence not verified") {
+			t.Fatalf("PostgreSQL 17: a normalized element must not be reported unverified: %s", w)
+		}
+	}
+
+	_, err = DiffV2Document(context.Background(), desired, base, DiffV2Options{ServerMajor: 16, Normalizer: gross})
+	if err == nil || !strings.Contains(err.Error(), `generated column "gross" could not be verified`) ||
+		!strings.Contains(err.Error(), "equivalence not verified for column gross generation expression") {
+		t.Fatalf("PostgreSQL 16: the failed element keeps the unverified wording: %v", err)
+	}
+	res, err = DiffV2Document(context.Background(), desired, base, DiffV2Options{ServerMajor: 17, Normalizer: gross})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var unverified []string
+	for _, w := range res.Warnings {
+		if strings.Contains(w, "equivalence not verified") {
+			unverified = append(unverified, w)
+		}
+	}
+	if len(unverified) != 1 || !strings.Contains(unverified[0], "column gross generation expression") {
+		t.Fatalf("PostgreSQL 17: exactly the failed element is unverified, got %v", unverified)
+	}
+}
+
 func TestQ09StatementMinServerMajor(t *testing.T) {
 	for _, stmt := range []string{
 		`alter table "app"."t" alter column "g" set expression as ((a * 3))`,

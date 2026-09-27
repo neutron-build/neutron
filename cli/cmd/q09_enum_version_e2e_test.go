@@ -530,6 +530,71 @@ func TestQ09PushNewEnumColumnKeepsUnchangedExpressions(t *testing.T) {
 	}
 }
 
+// Review-2 finding 1: a new-enum column with a default (its default cannot
+// be normalized before the type exists) made the whole table unverified,
+// so a real change to the generated expression was refused on
+// PostgreSQL 16 as "could not be verified ... may be spelling only" and
+// planned on 17+ with a false "equivalence not verified" warning. Only an
+// element that actually failed may be unverified: gross rewritten to use
+// the new column keeps the honest wording.
+func TestQ09NewEnumColumnUnverifiesOnlyFailedElements(t *testing.T) {
+	dbURL, fx := newM02CommandDB(t, "q09scopedunverified")
+	bin := buildCLIBinary(t)
+	work := t.TempDir()
+	r1, v2, v4b := filepath.Join(work, "r1.json"), filepath.Join(work, "v2.json"), filepath.Join(work, "v4b.json")
+	newSize := func(expr, sizeColumn string) string {
+		return strings.NewReplacer(
+			`"values": ["red", "blue"]}`,
+			`"values": ["red", "blue"]},
+		{"identity": {"schema": "app", "name": "size"}, "managed": true, "values": ["s", "m", "l"]}`,
+			`"generated": {"expression": "net * 2"}}`,
+			`"generated": {"expression": "`+expr+`"}},
+			`+sizeColumn,
+		).Replace(q09DocR1)
+	}
+	writeFile(t, r1, q09DocR1)
+	writeFile(t, v2, newSize("net * 3", `{"name": "size", "type": {"name": "enum", "codec": "enum", "enum": {"schema": "app", "name": "size"}}, "notNull": true,
+			 "default": {"kind": "literal", "sql": "'m'::app.size"}}`))
+	writeFile(t, v4b, newSize("net * case when size = 's' then 1 else 2 end", `{"name": "size", "type": {"name": "enum", "codec": "enum", "enum": {"schema": "app", "name": "size"}}, "notNull": false}`))
+	major := q09ServerMajor(t, fx)
+	run := func(args ...string) (int, string) {
+		t.Helper()
+		return runCLIProcess(t, bin, dbURL, args...)
+	}
+	if code, out := run("db", "push", "--schema", r1); code != 0 {
+		t.Fatalf("push r1 failed (%d):\n%s", code, out)
+	}
+
+	code, out := run("db", "push", "--schema", v2, "--dry-run")
+	if major < 17 {
+		if code == 0 || !strings.Contains(out, `generated column "gross" changes its expression`) {
+			t.Fatalf("PostgreSQL %d: the verified change must be refused as a change (%d):\n%s", major, code, out)
+		}
+		for _, bad := range []string{"could not be verified", "may be spelling only", "equivalence not verified"} {
+			if strings.Contains(out, bad) {
+				t.Fatalf("PostgreSQL %d: the size default's failure must not unverify gross (%q):\n%s", major, bad, out)
+			}
+		}
+	} else {
+		if code != 0 || !strings.Contains(out, `alter column "gross" set expression as ((net * (3)::numeric))`) {
+			t.Fatalf("PostgreSQL %d: the dry run must plan SET EXPRESSION (%d):\n%s", major, code, out)
+		}
+		if strings.Contains(out, "equivalence not verified") {
+			t.Fatalf("PostgreSQL %d: no element here is unverified:\n%s", major, out)
+		}
+	}
+
+	code, out = run("db", "push", "--schema", v4b, "--dry-run")
+	if major < 17 {
+		if code == 0 || !strings.Contains(out, `generated column "gross" could not be verified`) ||
+			!strings.Contains(out, "equivalence not verified for column gross generation expression") {
+			t.Fatalf("PostgreSQL %d: gross references the new column and keeps the unverified wording (%d):\n%s", major, code, out)
+		}
+	} else if code != 0 || !strings.Contains(out, "equivalence not verified for column gross generation expression") {
+		t.Fatalf("PostgreSQL %d: gross references the new column and stays flagged unverified (%d):\n%s", major, code, out)
+	}
+}
+
 // Review-1 finding 2: `migrate resolve --retry` and `--abort` run SQL too,
 // so they refuse a server below the migration's floor before anything
 // runs, exactly as `migrate` does (resolve accepts a never-attempted
