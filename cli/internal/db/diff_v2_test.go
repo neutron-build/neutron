@@ -290,7 +290,10 @@ func TestDiffV2EnumValueRules(t *testing.T) {
 	}
 }
 
-func TestDiffV2ColumnReorderRejected(t *testing.T) {
+// TestDiffV2ColumnReorderIsNoted pins M08 review-2: PostgreSQL cannot
+// reorder columns without rebuilding the table, so an order difference is
+// noted (never drift) and nothing is planned for it.
+func TestDiffV2ColumnReorderIsNoted(t *testing.T) {
 	table := func(order []string) V2Table {
 		cols := make([]V2Column, 0, len(order))
 		for _, n := range order {
@@ -316,9 +319,13 @@ func TestDiffV2ColumnReorderRejected(t *testing.T) {
 		Tables:  []V2Table{table([]string{"id", "a", "b"})},
 		Enums:   []V2EnumDecl{}, Views: []V2View{}, Opaque: []V2Opaque{},
 	})
-	_, err := DiffV2Document(context.Background(), desired, actual, DiffV2Options{})
-	if err == nil || !strings.Contains(err.Error(), "cannot reorder columns") {
-		t.Fatalf("expected column-order rejection, got %v", err)
+	res, err := DiffV2Document(context.Background(), desired, actual, DiffV2Options{})
+	if err != nil {
+		t.Fatalf("an order difference must not refuse: %v", err)
+	}
+	if len(res.Up) != 0 || len(res.Warnings) != 1 || !strings.HasSuffix(res.Warnings[0], ColumnOrderUnplanned) ||
+		!strings.Contains(res.Warnings[0], "attnum order [id a b]") || HasDrift(res.Warnings) {
+		t.Fatalf("want only the column-order note, got up %v warnings %q", res.Up, res.Warnings)
 	}
 }
 
@@ -758,11 +765,12 @@ func TestDiffV2NoActionAndSimpleMatchFKConverge(t *testing.T) {
 	}
 }
 
-// TestDiffV2ColumnReorderWithAddRejected pins the MAJOR-3 rework: a column
-// reorder must be rejected even when a column is added simultaneously (the
-// length guard used to let it through, applying a plan the next run
-// rejected). Reviewer scenario: live (a,b,c), desired (b,a,c,d).
-func TestDiffV2ColumnReorderWithAddRejected(t *testing.T) {
+// TestDiffV2ColumnReorderWithAddOrDropIsNoted: with columns added or
+// dropped at the same time, the order difference of the matched columns is
+// still only noted, and the plan carries exactly the add or the drop
+// (added columns are appended). Reviewer scenario: live (a,b,c), desired
+// (b,a,c,d). Superseded rule: MAJOR-3 rejected it (M08 review-2).
+func TestDiffV2ColumnReorderWithAddOrDropIsNoted(t *testing.T) {
 	table := func(order []string) V2Table {
 		cols := make([]V2Column, 0, len(order))
 		for i, n := range order {
@@ -785,16 +793,30 @@ func TestDiffV2ColumnReorderWithAddRejected(t *testing.T) {
 		})
 	}
 
-	// Reorder + add: must reject at plan time.
-	_, err := DiffV2Document(context.Background(), doc([]string{"b", "a", "c", "d"}), doc([]string{"a", "b", "c"}), DiffV2Options{})
-	if err == nil || !strings.Contains(err.Error(), "cannot reorder columns") {
-		t.Fatalf("reorder+add must be rejected with the reorder error, got: %v", err)
+	noted := func(res DiffResult) bool {
+		for _, w := range res.Warnings {
+			if strings.HasSuffix(w, ColumnOrderUnplanned) {
+				return true
+			}
+		}
+		return false
 	}
-
-	// Reorder + drop (equal lengths, changed set): also rejected now.
-	_, err = DiffV2Document(context.Background(), doc([]string{"b", "a", "c"}), doc([]string{"a", "b", "c", "d"}), DiffV2Options{})
-	if err == nil || !strings.Contains(err.Error(), "cannot reorder columns") {
-		t.Fatalf("reorder+drop must be rejected with the reorder error, got: %v", err)
+	for _, c := range []struct {
+		name            string
+		desired, actual []string
+		destructive     bool
+		want            string
+	}{
+		{"reorder+add", []string{"a", "c", "b", "d"}, []string{"a", "b", "c"}, false, `add column "d"`},
+		{"reorder+drop", []string{"a", "c", "b"}, []string{"a", "b", "c", "d"}, true, `drop column if exists "d"`},
+	} {
+		res, err := DiffV2Document(context.Background(), doc(c.desired), doc(c.actual), DiffV2Options{AllowDestructive: c.destructive})
+		if err != nil {
+			t.Fatalf("%s must plan: %v", c.name, err)
+		}
+		if len(res.Up) != 1 || !strings.Contains(res.Up[0], c.want) || !noted(res) {
+			t.Fatalf("%s: want only %s plus the order note, got up %v warnings %q", c.name, c.want, res.Up, res.Warnings)
+		}
 	}
 
 	// Plain add at the end and add in the middle stay plannable.

@@ -18,16 +18,14 @@ package db
 // planner reconciles them in every mode, so a base constraint the desired
 // document omits is always dropped.
 //
-// The same derivation reads chains written by earlier CLIs, whose target
-// snapshots omitted those objects (LoadSnapshotChain): each migration
-// snapshot is read as its recorded document plus what its up file left in
-// place from the previous snapshot.
+// It runs on the plan the planner just produced, when the snapshot is
+// written. The chain is always read as recorded: snapshots written before
+// M08 that omit such objects recover by re-baselining (the drift refusal
+// names it).
 
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -58,41 +56,6 @@ func RetainedList(objs []RetainedObject) string {
 		parts[i] = o.String()
 	}
 	return strings.Join(parts, ", ")
-}
-
-// SnapshotRetained lists what an earlier CLI's snapshot omitted although
-// its migration left it in place, and the tables whose columns it recorded
-// in declared rather than database order; the chain reads them as the
-// database holds them.
-type SnapshotRetained struct {
-	Stem      string
-	Version   string
-	Objects   []RetainedObject
-	Reordered []V2Identity
-}
-
-// SnapshotReadError is a snapshot the chain could not read with what its up
-// file leaves in place.
-type SnapshotReadError struct {
-	Stem    string
-	Version string
-	Err     string
-}
-
-func (e SnapshotReadError) String() string {
-	return fmt.Sprintf("snapshot %s cannot be read with what its up file leaves in place: %s", e.Stem, e.Err)
-}
-
-// Describe renders what the chain reads differently from the file.
-func (r SnapshotRetained) Describe() string {
-	var parts []string
-	if len(r.Objects) > 0 {
-		parts = append(parts, "left in place: "+RetainedList(r.Objects))
-	}
-	if len(r.Reordered) > 0 {
-		parts = append(parts, "columns in database order: "+IdentityList(r.Reordered))
-	}
-	return strings.Join(parts, "; ")
 }
 
 // SnapshotTarget returns the target snapshot of a plan from base to desired
@@ -452,72 +415,6 @@ func undeclaredReference(root map[string]any, retained []RetainedObject) error {
 func asMap(v any) map[string]any {
 	m, _ := v.(map[string]any)
 	return m
-}
-
-// readRetained reads each migration snapshot as its recorded document, in
-// the column order the database holds, plus what its up file left in place
-// from the previous snapshot. Snapshots
-// written by this CLI already record those objects and read unchanged;
-// earlier CLIs recorded the desired document only. The recorded target
-// hash still anchors the chain, and no file is rewritten. A snapshot that
-// cannot be read this way keeps its recorded document (and the drift gate
-// then reports the difference, as before); the reason is kept in
-// RetainedErrors.
-func (c *SnapshotChain) readRetained(migrationsDir string) error {
-	var prev *V2Document
-	var err error
-	if c.Baseline != nil {
-		prev, err = ParseV2Document(c.Baseline.Document)
-	} else {
-		prev, err = EmptyV2Document()
-	}
-	if err != nil {
-		return err
-	}
-	empty, err := EmptyV2Document()
-	if err != nil {
-		return err
-	}
-	gens := nextColumnGenerations(nil, empty, prev, nil, 0)
-	defer func() { c.headGens = gens }()
-	for i := range c.Snapshots {
-		s := &c.Snapshots[i]
-		recorded, err := ParseV2Document(s.Document)
-		if err != nil {
-			return fmt.Errorf("snapshot %s document is invalid: %w", s.Stem(), err)
-		}
-		upSQL, err := os.ReadFile(filepath.Join(migrationsDir, s.Stem()+".up.sql"))
-		if err != nil {
-			return fmt.Errorf("read %s.up.sql: %w", s.Stem(), err)
-		}
-		up := SplitSQLStatements(string(upSQL))
-		renames := plannedRenames(up)
-		// Earlier CLIs recorded columns in declared order; the migration
-		// appended its new columns after the previous state's.
-		aligned, notes, err := AlignColumnOrder(recorded, prev, renames, gens)
-		if err == nil {
-			var target *V2Document
-			var retained []RetainedObject
-			target, retained, err = SnapshotTarget(prev, aligned, up)
-			if err == nil {
-				if target.SHA256Hex != recorded.SHA256Hex {
-					r := SnapshotRetained{Stem: s.Stem(), Version: s.Version, Objects: retained}
-					for _, n := range notes {
-						r.Reordered = append(r.Reordered, n.Table)
-					}
-					s.Document = append(json.RawMessage(nil), target.Canonical...)
-					c.Retained = append(c.Retained, r)
-				}
-				gens = nextColumnGenerations(gens, prev, target, renames, i+1)
-				prev = target
-				continue
-			}
-		}
-		c.RetainedErrors = append(c.RetainedErrors, SnapshotReadError{Stem: s.Stem(), Version: s.Version, Err: err.Error()})
-		gens = nextColumnGenerations(gens, prev, recorded, renames, i+1)
-		prev = recorded
-	}
-	return nil
 }
 
 // statementKey is a statement's significant token stream (comments and a

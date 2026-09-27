@@ -64,8 +64,12 @@ Sequences that are **ordered tuples** are preserved verbatim:
 
 - table `columns` — physical column order (PostgreSQL `attnum`) is part of
   the schema state: two documents that differ only in column order describe
-  different schemas (README section 4.1 "include ordered columns"), so the
-  array is preserved exactly as declared and never sorted;
+  different schemas and hash differently (README section 4.1 "include
+  ordered columns"), so the array is preserved exactly as declared and never
+  sorted. A plan cannot act on an order difference: PostgreSQL appends added
+  columns and cannot reorder existing ones without rebuilding the table, so
+  the CLI planner reports it and plans nothing for it, and a snapshot records
+  the order the database holds;
 - constraint `columns` (primary-key, unique, foreign-key) — composite key
   order is semantic;
 - `references.columns` (must be positionally aligned with the FK's `columns`);

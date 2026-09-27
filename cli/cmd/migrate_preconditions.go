@@ -181,9 +181,6 @@ func managedDriftUnderLock(ctx context.Context, client *db.Client, chain *db.Sna
 		return nil
 	}
 
-	if err := retainedAnchorError(chain, applied); err != nil {
-		return err
-	}
 	expected, _, expectedRef, err := expectedAppliedDocument(chain, appliedVersions)
 	if err != nil {
 		return err
@@ -214,54 +211,24 @@ func managedDriftUnderLock(ctx context.Context, client *db.Client, chain *db.Sna
 	for _, stmt := range result.Up {
 		lines = append(lines, "  "+firstLine(stmt)+";")
 	}
-	if hint := retainedDriftHint(chain); hint != "" {
+	if hint := extraObjectsHint(ctx, expected, actual, norm); hint != "" {
 		lines = append(lines, hint)
 	}
 	return fmt.Errorf("%s", strings.Join(lines, "\n"))
 }
 
-// retainedAnchorError refuses a database comparison whose expected state
-// would rest on an up file nothing verifies (M08 review-1). The chain reads
-// a snapshot with what its up file leaves in place (chain.Retained); the
-// snapshot's own hash does not cover that file. An applied file is anchored
-// by its history checksum — VerifyAppliedChecksums refuses a mismatch, and
-// a row without a checksum cannot anchor it. A pending file is what will
-// run (apply refuses one that no longer matches its plan), so it anchors
-// itself, but only after the applied state: one that precedes the newest
-// applied snapshot would shape the expected state without being run.
-//
-// A snapshot the chain could not read that way (chain.RetainedErrors) is
-// read as recorded, which may omit what its up file left in place; a
-// comparison whose expected state includes it refuses rather than trust it
-// (the text match fails closed).
-func retainedAnchorError(chain *db.SnapshotChain, applied []db.MigrationRecord) error {
-	if chain == nil || len(chain.Retained)+len(chain.RetainedErrors) == 0 {
-		return nil
+// extraObjectsHint names the way out when drift consists only of objects the
+// database has and the applied snapshot does not record: the plan without
+// --allow-destructive, which leaves such objects in place, is empty. Snapshot
+// plans written before M08 left objects the schema no longer declared in
+// place without recording them, which produces exactly this drift; the
+// chain is read as recorded, so a re-baseline records the database state.
+func extraObjectsHint(ctx context.Context, expected, actual *db.V2Document, norm db.V2Normalizer) string {
+	plain, err := db.DiffV2Document(ctx, expected, actual, db.DiffV2Options{Normalizer: norm})
+	if err != nil || len(plain.Up) != 0 {
+		return ""
 	}
-	records := make(map[string]db.MigrationRecord, len(applied))
-	newest := ""
-	for _, r := range applied {
-		records[r.Version] = r
-		if chain.SnapshotForVersion(r.Version) != nil && (newest == "" || db.CompareVersions(r.Version, newest) > 0) {
-			newest = r.Version
-		}
-	}
-	const rebaseline = "re-baseline at the current state (apply the pending migration files or move them out, delete the snapshots directory, run `neutron schema baseline`)"
-	for _, e := range chain.RetainedErrors {
-		if _, ok := records[e.Version]; ok || (newest != "" && db.CompareVersions(e.Version, newest) < 0) {
-			return fmt.Errorf("%s — the expected state after it is unknown, so nothing is compared against it; %s", e, rebaseline)
-		}
-	}
-	for _, r := range chain.Retained {
-		rec, ok := records[r.Version]
-		switch {
-		case ok && rec.Checksum == nil:
-			return fmt.Errorf("snapshot %s is read with what its up file leaves in place, but its history row records no checksum, so nothing verifies that the file is the one that ran — refusing to derive the expected state from it; %s", r.Stem, rebaseline)
-		case !ok && newest != "" && db.CompareVersions(r.Version, newest) < 0:
-			return fmt.Errorf("snapshot %s is read with what its up file leaves in place and precedes applied snapshot %s, but it is not applied, so no checksum verifies its up file — refusing to derive the expected state from it; apply it or %s", r.Stem, newest, rebaseline)
-		}
-	}
-	return nil
+	return "The drift consists only of objects the database has and the applied snapshot does not record. Snapshot plans written before M08 left objects the schema no longer declared in place without recording them; if that is how they got here, re-baseline at the current state: apply the pending migration files or move them out of the migrations directory, delete migrations/snapshots, and run `neutron schema baseline`, then generate again. If they were created outside migrations, drop them, or re-baseline the same way to adopt them"
 }
 
 // validateStatementAllowlist refuses migrations containing any statement

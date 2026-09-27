@@ -32,6 +32,8 @@ One declared exception: PostgreSQL cannot use an enum value inside the transacti
 
 Statements the connected server's PostgreSQL version cannot run are refused at plan time with the fix named (changing a generated column's expression needs PostgreSQL 17+).
 
+Column order is informational: PostgreSQL appends added columns and cannot reorder existing ones without rebuilding the table, so a column declared between existing ones is added last, and an order difference is noted and plans nothing.
+
 Push takes the migration runner's pinned advisory-lock session for the history check, plan and apply: a push never interleaves with a running migration. Dry-run stays lockless (it reports only).
 
 Schema documents: version 2 (the cross-language contract in contracts/data/) plans through full catalog introspection — qualified schemas, composite PK/unique/check/foreign-key constraints, indexes with predicates and expressions, enums, arrays and views; version 1 (legacy @neutron-build/sql exportSchema output) keeps its historical behavior.

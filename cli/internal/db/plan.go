@@ -196,24 +196,6 @@ type SnapshotChain struct {
 	// into the baseline document. They are left out of the loaded
 	// Baseline.Document; the recorded target hash still anchors the chain.
 	BaselineInternal []V2Identity
-
-	// Retained lists migration snapshots written by an earlier CLI that
-	// omit objects their migration left in place or record columns in
-	// declared order (M08). The loaded Document holds the database state;
-	// the recorded target hash still anchors the
-	// chain. RetainedErrors names snapshots that could not be read this
-	// way: they keep their recorded document, which may omit what their up
-	// file left in place, so database comparisons refuse over them.
-	Retained       []SnapshotRetained
-	RetainedErrors []SnapshotReadError
-
-	headGens ColumnGenerations
-}
-
-// HeadColumnGenerations reports which chain entry each column of the head
-// document entered its table in (see ColumnGenerations).
-func (c *SnapshotChain) HeadColumnGenerations() ColumnGenerations {
-	return c.headGens
 }
 
 // Empty reports whether the chain has no baseline and no snapshots.
@@ -469,9 +451,6 @@ func LoadSnapshotChain(migrationsDir string) (*SnapshotChain, error) {
 		}
 	}
 
-	if err := chain.readRetained(migrationsDir); err != nil {
-		return nil, err
-	}
 	return chain, nil
 }
 

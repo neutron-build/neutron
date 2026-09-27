@@ -42,7 +42,7 @@ Enum value additions: PostgreSQL cannot use an enum value inside the transaction
 
 Server versions: --mode live refuses statements the connected server cannot run (changing a generated column's expression needs ALTER COLUMN ... SET EXPRESSION, PostgreSQL 17+) and names the fix. --mode snapshot cannot know the target server: the plan report records the requirement as minServerMajor, and ` + "`neutron migrate`" + ` refuses older servers before running anything.
 
-The generated SQL never drops neutron-internal tables (_neutron_*), extension-owned objects, or anything absent from the schema unless --allow-destructive is passed as an explicit acknowledgement of data loss. In snapshot mode, what a plan leaves in place is recorded in its target snapshot, so the chain keeps matching the database and a later plan with --allow-destructive drops it; snapshots written by earlier CLIs, which omitted it, are read as if they had recorded it (the files are not rewritten). Column order: PostgreSQL appends added columns and cannot reorder existing ones, so snapshot mode records the order the database holds — a new column declared between existing ones is added last (a note names the table), while a changed relative order of existing columns is refused as in live mode; earlier CLIs' snapshots that recorded the declared order are read in database order. Catalog structures this diff engine cannot represent faithfully are rejected with an error instead of producing a migration that falsely claims synchronization.`,
+The generated SQL never drops neutron-internal tables (_neutron_*), extension-owned objects, or anything absent from the schema unless --allow-destructive is passed as an explicit acknowledgement of data loss. In snapshot mode, what a plan leaves in place is recorded in its target snapshot, so the chain keeps matching the database and a later plan with --allow-destructive drops it (snapshots written before M08 omitted it; that drift recovers by re-baselining, which the drift refusal names). Column order is informational in every mode: PostgreSQL appends added columns and cannot reorder existing ones without rebuilding the table, so a column declared between existing ones is added last, a document whose order differs from the database's is noted and plans nothing for it, and snapshot mode records the order the database holds. Catalog structures this diff engine cannot represent faithfully are rejected with an error instead of producing a migration that falsely claims synchronization.`,
 	RunE: func(cmd *cobra.Command, args []string) error { return reportRunE(runMigrateGenerate(cmd, args)) },
 }
 
@@ -244,7 +244,6 @@ func runMigrateGenerateSnapshot(cmd *cobra.Command, dir, schemaPath, name string
 		return err
 	}
 	reportBaselineInternal(chain)
-	reportChainRetained(chain)
 	baseDoc, err := chain.HeadDocument()
 	if err != nil {
 		return err
@@ -257,7 +256,7 @@ func runMigrateGenerateSnapshot(cmd *cobra.Command, dir, schemaPath, name string
 
 	// Columns compare by name: the ones the base has keep its order and
 	// new ones follow, the order PostgreSQL gives them (M08).
-	aligned, orderNotes, err := db.AlignColumnOrder(loaded.V2, baseDoc, db.RenamesByTable(renames), chain.HeadColumnGenerations())
+	aligned, orderNotes, err := db.AlignColumnOrder(loaded.V2, baseDoc, db.RenamesByTable(renames))
 	if err != nil {
 		return err
 	}

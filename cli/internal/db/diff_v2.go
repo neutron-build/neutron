@@ -23,10 +23,12 @@ package db
 //     expressions, view definitions) compare through the optional
 //     Normalizer (catalog-aware equivalence). Without one, comparison is
 //     strict text and any resulting change is flagged as unverified.
-//   - Column order is semantic (contract §4.1/attnum): a desired table
-//     whose columns are reordered relative to the live table is rejected —
-//     PostgreSQL cannot reorder columns without a rewrite (M03 mirrors this
-//     for snapshot planning; introspection never normalizes it away).
+//   - Column order is part of a document (contract §4.1/attnum;
+//     introspection never normalizes it away), but a plan cannot change
+//     it: PostgreSQL cannot reorder columns without rebuilding the table
+//     and appends added ones. A desired table whose matched columns are
+//     ordered differently from the live table is noted (ColumnOrderUnplanned)
+//     and nothing is planned for the order; added columns are appended.
 
 import (
 	"context"
@@ -63,11 +65,16 @@ type DiffV2Options struct {
 // (migration history): informational, never drift.
 const InternalMetadataNote = "is neutron-internal metadata: always left untouched"
 
+// ColumnOrderUnplanned ends the plan note for a table whose declared column
+// order differs from the database's: informational, never drift.
+const ColumnOrderUnplanned = "PostgreSQL cannot reorder columns without rebuilding the table, so the database keeps its order and nothing is planned for it"
+
 // HasDrift reports whether any plan warning names an object that is out of
-// sync with the schema, as opposed to the internal-metadata note.
+// sync with the schema, as opposed to the internal-metadata and
+// column-order notes.
 func HasDrift(warnings []string) bool {
 	for _, w := range warnings {
-		if !strings.HasSuffix(w, InternalMetadataNote) {
+		if !strings.HasSuffix(w, InternalMetadataNote) && !strings.HasSuffix(w, ColumnOrderUnplanned) {
 			return true
 		}
 	}
@@ -764,12 +771,13 @@ func (p *v2Planner) planSharedTables() error {
 	}
 	sort.Slice(shared, func(i, j int) bool { return shared[i].Identity.String() < shared[j].Identity.String() })
 
-	// Column-order rejection: PostgreSQL cannot reorder columns without a
-	// rewrite, so the MATCHED columns (present in both documents, renames
-	// resolved) must keep their relative order — including when columns
-	// are added or dropped simultaneously. A reorder smuggled past a
-	// same-length guard would apply a non-converging plan and surface the
-	// error only on the next run.
+	// Column order is informational (M08 review-2): PostgreSQL cannot
+	// reorder columns without rebuilding the table, and appends added ones.
+	// No document can tell a column a later plan appended but declared
+	// elsewhere from a wish to reorder, and refusing either is a permanent
+	// dead end, so an order difference of the MATCHED columns (present in
+	// both documents, renames resolved) is noted and never planned; added
+	// columns are appended.
 	for _, dt := range shared {
 		at := p.actual.Table(dt.Identity)
 		actualPos := make(map[string]int, len(at.Columns))
@@ -792,9 +800,8 @@ func (p *v2Planner) planSharedTables() error {
 			}
 		}
 		if !ordered {
-			return fmt.Errorf(
-				"table %s: the desired column order differs from %s (attnum order %v) — PostgreSQL cannot reorder columns without rewriting the table; align the document order or plan a manual migration",
-				dt.Identity, p.baseTableNoun(), columnNames(*at))
+			p.warn("table %s: the desired column order differs from %s (attnum order %v) — %s",
+				dt.Identity, p.baseTableNoun(), columnNames(*at), ColumnOrderUnplanned)
 		}
 	}
 
