@@ -391,10 +391,10 @@ published CLI targets) and onboarding on Linux.
 
 ## Support and known limits
 
-- **Engines.** PostgreSQL 17 and 18 are verified: the CLI suite, which
-  carries Studio's HTTP and end-to-end tests, passes on both in the release
-  matrix (`orm-matrix.yml`); pull requests also run the real-browser
-  journey on 17. PostgreSQL 16 is not claimed (see the support matrix in
+- **Engines.** PostgreSQL 16, 17 and 18 are verified: the CLI suite, which
+  carries Studio's HTTP and end-to-end tests, passes on all three in the
+  release matrix (`orm-matrix.yml`); pull requests also run the real-browser
+  journey on 17 (see the support matrix in
   `typescript/packages/neutron-sql/README.md`). Nucleus connections open the
   model modules, measured against Nucleus 1.0.2 and not advertised for
   release; the limits registry above states what each model does. Row

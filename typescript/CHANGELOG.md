@@ -50,6 +50,17 @@ All notable changes to this project are documented in this file.
   from the config, and fails instead of silently moving when an explicitly
   configured port is taken.
 
+- **CLI: enum value additions are their own earlier step.** PostgreSQL
+  cannot use an enum value in the transaction that adds it (55P04). When a
+  change adds enum values alongside anything else, `db push` applies the
+  additions in their own reported transaction first, and `migrate generate`
+  writes them as a separate `{version}_{name}_enum_values` migration. A
+  migration that adds and uses a value in one file fails with a message
+  naming the split. Changing a generated column's expression is refused on
+  PostgreSQL 16 before anything runs; snapshot plans record
+  `minServerMajor`. A snapshot plan now records the migration's file slug,
+  so `--name "Add Users"` produces an appliable migration.
+
 - **`@neutron-build/nucleus` model clients were checked against a live
   engine** (Nucleus 1.0.2, `conformance/live/orm/`). Document collections
   and SQL-bound graph traversal sit behind a capability gate, time-series
@@ -81,8 +92,9 @@ All notable changes to this project are documented in this file.
 
 - **`@neutron-build/sql` (unpublished, alpha).** First-party PostgreSQL
   ORM: schema in code, one compiler, lossless codecs, relational reads,
-  migrations through the CLI. Verified on PostgreSQL 17 and 18 with `pg` and
-  `postgres`; PostgreSQL 16 and Nucleus are not claimed. Its README lists
+  migrations through the CLI. Verified on PostgreSQL 16, 17 and 18 with `pg`
+  and `postgres` (generated-column expression changes need 17+); Nucleus is
+  not claimed. Its README lists
   the support matrix, the breaking corrections made during the alpha, and
   the upgrade and recovery limits.
 
