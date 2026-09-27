@@ -150,17 +150,27 @@ old name while changing them, then rename). A live plan is refused the same
 way when the planner cannot copy the table to compare it (for example a
 check with a whole-row reference); the message gives the `ALTER TABLE ...
 RENAME COLUMN` to run by hand first.
-Current limits, each failing at apply and rolling back: a new table whose
-foreign key references a column renamed in the same plan; dropping a column
-together with a stored generated column that reads it (SQLSTATE 2BP01);
-changing the type of a column that a generated column, or a view the schema
-does not declare, reads (0A000); and the down file of a plan that drops a
-column together with an index on it, or drops tables that reference each
-other. Split such changes into separate migrations. Removing a schema from
-the document stops the planner tracking its objects; declaring it again plans
-`create table` for tables that still exist, which fails (42P07). Keep a
-schema declared while its tables exist; after removing one in snapshot
-mode, recover by re-baselining (step 4 below).
+Current limits, each failing at apply and rolling back:
+- a new table whose foreign key references a column renamed in the same plan,
+  the down file of a plan that drops a column together with an index on it,
+  and the down file of a plan that drops tables referencing each other: split
+  such changes into separate migrations;
+- dropping a column together with a stored generated column that reads it
+  (SQLSTATE 2BP01): drop the generated column in one migration and the
+  column in the next;
+- changing the type of a column a generated column reads (0A000): three
+  migrations (drop the generated column, change the type, add it back);
+- changing the type of a column that a view the schema does not declare reads
+  (0A000): declare the view, so the planner drops and re-creates it around the
+  change, or drop it with `--allow-destructive`.
+
+In `--mode snapshot`, removing a schema from the document stops the chain
+tracking its objects, and declaring it again plans `create table` for tables
+that still exist, which fails (42P07). Keep a schema declared while its tables
+exist; if it happens, recover by re-baselining (step 4 below), not with
+`neutron migrate resolve --mark-applied`, which would record a migration that
+never ran. Live mode and `db push` compare against the database and are not
+affected.
 
 Enum value additions: PostgreSQL cannot use an enum value inside the
 transaction that adds it (SQLSTATE 55P04). When a plan adds enum values and
