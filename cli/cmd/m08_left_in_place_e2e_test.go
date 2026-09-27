@@ -391,8 +391,8 @@ func TestM08LeftInPlaceSnapshotChain(t *testing.T) {
 			t.Fatalf("u columns %s", got)
 		}
 		must(t, dbURL, "schema", "check", "--live", "--dir", mig)
-		if !writeFirst && !strings.Contains(out, "the database holds them as (id, a, b, mid)") {
-			t.Fatalf("generate must note the database order:\n%s", out)
+		if !writeFirst && !strings.Contains(out, "the chain records them as (id, a, b, mid)") {
+			t.Fatalf("generate must note the recorded order:\n%s", out)
 		}
 		must(t, dbURL, "schema", "check", "--dir", mig, "--schema", d1)
 
@@ -526,7 +526,7 @@ func TestM08LeftInPlaceSnapshotChain(t *testing.T) {
 		m08ColumnsAs(t, pulled, swap, "id", "b", "a")
 		m08ColumnsAs(t, pulled, swapAdd, "id", "b", "mid", "a")
 		out := must(t, unreachable, "migrate", "generate", "--mode", "snapshot", "--dir", mig, "--schema", swap, "--name", "swap")
-		if !strings.Contains(out, "No schema changes detected") || !strings.Contains(out, "the database holds them as (id, a, b)") {
+		if !strings.Contains(out, "No schema changes detected") || !strings.Contains(out, "the chain records them as (id, a, b)") {
 			t.Fatalf("a swap alone plans nothing and is noted:\n%s", out)
 		}
 		must(t, unreachable, "schema", "check", "--dir", mig, "--schema", swap)

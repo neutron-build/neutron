@@ -68,8 +68,8 @@ Sequences that are **ordered tuples** are preserved verbatim:
   ordered columns"), so the array is preserved exactly as declared and never
   sorted. A plan cannot act on an order difference: PostgreSQL appends added
   columns and cannot reorder existing ones without rebuilding the table, so
-  the CLI planner reports it and plans nothing for it, and a snapshot records
-  the order the database holds;
+  the CLI planner reports it and plans nothing for it, and a snapshot keeps
+  existing columns in the chain's recorded order and appends new ones;
 - constraint `columns` (primary-key, unique, foreign-key) — composite key
   order is semantic;
 - `references.columns` (must be positionally aligned with the FK's `columns`);

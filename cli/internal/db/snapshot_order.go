@@ -28,7 +28,7 @@ type ColumnOrderNote struct {
 }
 
 func (n ColumnOrderNote) String() string {
-	return fmt.Sprintf("table %s: the schema declares columns (%s), the database holds them as (%s) — PostgreSQL appends added columns and cannot reorder existing ones, so the snapshot records the database order",
+	return fmt.Sprintf("table %s: the schema declares columns (%s), the chain records them as (%s) — PostgreSQL appends added columns and cannot reorder existing ones, so the snapshot keeps the recorded order",
 		n.Table, strings.Join(n.Declared, ", "), strings.Join(n.Recorded, ", "))
 }
 

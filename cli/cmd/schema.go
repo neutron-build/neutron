@@ -90,8 +90,8 @@ snapshot — a non-empty diff means pending schema changes, reported and exit 1.
 Objects a migration left in place because the document no longer declares them
 are recorded in the chain, so their drops stay listed as pending until a plan
 with --allow-destructive drops them or the document declares them again.
-Column order is informational: the chain records the order the database holds,
-and a document that declares another order is noted, not a pending change
+Column order is informational: the chain keeps existing columns in their recorded
+order and appends new ones, and a document that declares another order is noted, not a pending change
 (PostgreSQL cannot reorder columns without rebuilding the table).
 
 With --live: introspects the database and compares it against the snapshot of the
