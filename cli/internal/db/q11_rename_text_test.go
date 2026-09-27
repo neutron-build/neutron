@@ -7,6 +7,7 @@ package db
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -48,14 +49,18 @@ func TestQ11TextMayNameRename(t *testing.T) {
 		"app.t.label":   "Note",
 		"app.u.renamed": "other",
 	}}}
+	long := strings.Repeat("a", 63)
+	p.opts.Renames["app.t.b"] = long
 	for text, want := range map[string]bool{
-		`(net > (0)::numeric)`: true,
-		`abs("Net")`:           false, // a different column
-		`"Note" <> ''`:         true,
-		`note <> ''`:           false, // folds to note, not Note
-		`abs(other)`:           false, // renamed on another table
-		`(other * 2)`:          false,
-		`label = 'net'`:        false, // a literal is no reference
+		long + "a > 0":                   true,  // PostgreSQL truncates it to the 63-byte column name
+		strings.Repeat("é", 32) + " > 0": false, // cut at a rune boundary, not a match
+		`(net > (0)::numeric)`:           true,
+		`abs("Net")`:                     false, // a different column
+		`"Note" <> ''`:                   true,
+		`note <> ''`:                     false, // folds to note, not Note
+		`abs(other)`:                     false, // renamed on another table
+		`(other * 2)`:                    false,
+		`label = 'net'`:                  false, // a literal is no reference
 		`(row_to_json(t.*) ->> 'net') IS NOT NULL`: true, // whole row
 		`U&"\006Eet" > 0`:                          true, // unreadable counts as naming
 	} {

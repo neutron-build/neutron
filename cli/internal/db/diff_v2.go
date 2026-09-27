@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // DiffV2Options parameterizes DiffV2Document. Renames maps the qualified
@@ -1038,6 +1039,9 @@ func (p *v2Planner) textMayNameRename(table V2Identity, text string) bool {
 	}
 	prefix := table.String() + "."
 	for _, ident := range idents {
+		// PostgreSQL truncates identifiers to 63 bytes, so a longer
+		// spelling names the same column.
+		ident = truncateIdentifier(ident)
 		if ident == table.Name {
 			return true
 		}
@@ -1048,6 +1052,20 @@ func (p *v2Planner) textMayNameRename(table V2Identity, text string) bool {
 		}
 	}
 	return false
+}
+
+// truncateIdentifier cuts an identifier to PostgreSQL's 63-byte limit
+// (NAMEDATALEN - 1) at a UTF-8 boundary, as the server does.
+func truncateIdentifier(ident string) string {
+	const maxIdentifierBytes = 63
+	if len(ident) <= maxIdentifierBytes {
+		return ident
+	}
+	n := maxIdentifierBytes
+	for n > 0 && !utf8.RuneStart(ident[n]) {
+		n--
+	}
+	return ident[:n]
 }
 
 // sqlIdentifiers returns the identifiers of SQL expression text: quoted
