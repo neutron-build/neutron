@@ -11,6 +11,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -251,7 +252,7 @@ func TestM08LeftInPlaceSnapshotChain(t *testing.T) {
 			t.Fatalf("t columns %s", got)
 		}
 		// Offline, the desired document lacks what the chain records.
-		refused(t, unreachable, []string{"pending change", "other_app"}, "schema", "check", "--dir", mig, "--schema", filepath.Join(work, "d2.json"))
+		refused(t, unreachable, []string{"pending change", "other_app", "left in place", "declare them in the schema, or plan their drop with `neutron migrate generate --mode snapshot --allow-destructive`"}, "schema", "check", "--dir", mig, "--schema", filepath.Join(work, "d2.json"))
 		dropAndCheck(t, dbURL, fx, work, mig, "003")
 	})
 
@@ -329,7 +330,7 @@ func TestM08LeftInPlaceSnapshotChain(t *testing.T) {
 		before := mustReadFile(t, snap001)
 
 		out := must(t, dbURL, "schema", "check", "--live", "--dir", mig)
-		if !strings.Contains(out, "written by an earlier CLI") || !strings.Contains(out, "001_add_note, 002_add_note2") {
+		if !strings.Contains(out, "do not record the state their up files leave") || !strings.Contains(out, "001_add_note, 002_add_note2") {
 			t.Fatalf("the check notes the earlier snapshots:\n%s", out)
 		}
 		must(t, dbURL, "migrate", "--dir", mig)
@@ -396,6 +397,200 @@ func TestM08LeftInPlaceSnapshotChain(t *testing.T) {
 	}
 	t.Run("ColumnAddedMidTable", func(t *testing.T) { midTable(t, "m08mid", false) })
 	t.Run("ColumnAddedMidTableEarlierCLI", func(t *testing.T) { midTable(t, "m08midold", true) })
+
+	// Review-1 F1: the expected state is read with what applied up files
+	// left in place, so those files must be the ones that ran. Editing the
+	// applied up file of a destructive migration must not turn real drift
+	// into "Database matches" (the reviewer's T2).
+	t.Run("EditedAppliedUpFileRefused", func(t *testing.T) {
+		dbURL, fx := newM02CommandDB(t, "m08tamper")
+		if err := fx.Exec(context.Background(), `CREATE TABLE t (id integer PRIMARY KEY, keep text, old integer)`); err != nil {
+			t.Fatal(err)
+		}
+		work := t.TempDir()
+		mig := filepath.Join(work, "migrations")
+		must(t, dbURL, "schema", "baseline", "--dir", mig)
+		pulled := filepath.Join(work, "pulled.json")
+		must(t, dbURL, "schema", "pull", "--out", pulled)
+		desired := filepath.Join(work, "d.json")
+		writeFile(t, desired, strings.Replace(string(mustReadFile(t, pulled)), `,{"name":"old","notNull":false,"type":{"codec":"number","name":"int4"}}`, "", 1))
+		if strings.Contains(string(mustReadFile(t, desired)), `"old"`) {
+			t.Fatalf("fixture: old must be gone from the desired document")
+		}
+		must(t, unreachable, "migrate", "generate", "--mode", "snapshot", "--dir", mig, "--schema", desired, "--name", "drop_old", "--allow-destructive")
+		must(t, dbURL, "migrate", "--dir", mig, "--allow-destructive")
+		must(t, dbURL, "schema", "check", "--live", "--dir", mig)
+		if err := fx.Exec(context.Background(), `ALTER TABLE t ADD COLUMN old integer`); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, dbURL, []string{"drift", `drop column if exists "old"`}, "schema", "check", "--live", "--dir", mig)
+		writeFile(t, filepath.Join(mig, "001_drop_old.up.sql"), "-- Migration: drop_old\n\nselect 1;\n")
+		refused(t, dbURL, []string{"modified since they were applied", "001"}, "schema", "check", "--live", "--dir", mig)
+		refused(t, dbURL, []string{"modified since they were applied"}, "migrate", "--dir", mig)
+	})
+
+	// Review-1 F1: an applied snapshot the chain reads from its up file
+	// needs a history checksum to anchor that file.
+	t.Run("UpFileWithoutChecksumRefused", func(t *testing.T) {
+		dbURL, fx, work, mig := setup(t, "m08nosum")
+		m08PreM08Migration(t, mig, "001", "add_note", filepath.Join(work, "d1.json"))
+		must(t, dbURL, "migrate", "--dir", mig)
+		m08PreM08Migration(t, mig, "002", "add_note2", filepath.Join(work, "d2.json"))
+		must(t, dbURL, "schema", "check", "--live", "--dir", mig)
+		if err := fx.Exec(context.Background(), `UPDATE _neutron_migrations SET checksum = NULL WHERE version = '001'`); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, dbURL, []string{"001_add_note", "records no checksum"}, "schema", "check", "--live", "--dir", mig)
+		refused(t, dbURL, []string{"001_add_note", "records no checksum"}, "migrate", "--dir", mig)
+		if got := q09Query(t, fx, m08Columns); got != "id,keep,old,note" {
+			t.Fatalf("a refused migrate applied something: t columns %s", got)
+		}
+	})
+
+	// Review-1 F3: a changed relative order of existing columns is refused
+	// in snapshot mode as in live mode and db push; new columns declared
+	// between existing ones stay accepted (ColumnAddedMidTable).
+	t.Run("SwapOfExistingColumnsRefused", func(t *testing.T) {
+		dbURL, fx := newM02CommandDB(t, "m08swap")
+		if err := fx.Exec(context.Background(), `CREATE TABLE u (id integer PRIMARY KEY, a text, b text)`); err != nil {
+			t.Fatal(err)
+		}
+		work := t.TempDir()
+		mig := filepath.Join(work, "migrations")
+		pulled := filepath.Join(work, "pulled.json")
+		must(t, dbURL, "schema", "baseline", "--dir", mig)
+		must(t, dbURL, "schema", "pull", "--out", pulled)
+		for i, order := range [][]string{{"id", "b", "a"}, {"id", "b", "mid", "a"}} {
+			doc := filepath.Join(work, fmt.Sprintf("swap%d.json", i))
+			m08ColumnsAs(t, pulled, doc, order...)
+			want := []string{"the desired column order differs from the planning-base table (attnum order [id a b])", "cannot reorder columns"}
+			refused(t, unreachable, want, "migrate", "generate", "--mode", "snapshot", "--dir", mig, "--schema", doc, "--name", "swap")
+			refused(t, unreachable, want, "schema", "check", "--dir", mig, "--schema", doc)
+			if entries, _ := os.ReadDir(mig); len(entries) != 1 {
+				t.Fatalf("a refused generate writes nothing: %d entries", len(entries))
+			}
+			if code, out := runCLIProcess(t, bin, dbURL, "db", "push", "--schema", doc, "--dry-run", "--force"); code == 0 || !strings.Contains(out, "cannot reorder columns") {
+				t.Fatalf("live planning refuses the same document (%d):\n%s", code, out)
+			}
+		}
+	})
+
+	// Review-1 F5: a table left in place whose foreign key points into a
+	// schema the document does not declare: the refusal names the target
+	// to declare, once, and declaring it works.
+	t.Run("UndeclaredReferenceNamesTarget", func(t *testing.T) {
+		dbURL, fx := newM02CommandDB(t, "m08ref")
+		if err := fx.Exec(context.Background(), `CREATE SCHEMA s2; CREATE TABLE s2.x (id integer PRIMARY KEY); CREATE TABLE t (id integer PRIMARY KEY); CREATE TABLE audit (id integer PRIMARY KEY, x_id integer REFERENCES s2.x (id))`); err != nil {
+			t.Fatal(err)
+		}
+		work := t.TempDir()
+		mig := filepath.Join(work, "migrations")
+		pulled := filepath.Join(work, "pulled.json")
+		must(t, dbURL, "schema", "baseline", "--dir", mig)
+		must(t, dbURL, "schema", "pull", "--out", pulled)
+		shape := func(out string, keepS2 bool) {
+			doc, err := db.ParseV2Document(mustReadFile(t, pulled))
+			if err != nil {
+				t.Fatal(err)
+			}
+			m, err := db.ModelFromRoot(doc.Root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var tables []db.V2Table
+			for _, tb := range m.Tables {
+				switch {
+				case tb.Identity.Name == "t":
+					tb.Columns = append(tb.Columns, db.V2Column{Name: "note", Type: db.V2ColumnType{Name: "int4", Codec: "number"}})
+					tables = append(tables, tb)
+				case keepS2 && tb.Identity.Schema == "s2":
+					tables = append(tables, tb)
+				}
+			}
+			m.Tables = tables
+			if !keepS2 {
+				m.Schemas = []db.V2SchemaDecl{{Name: "public"}}
+			}
+			root, err := db.RootFromModel(m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := json.Marshal(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeFile(t, out, string(raw))
+		}
+		d1, d2 := filepath.Join(work, "d1.json"), filepath.Join(work, "d2.json")
+		shape(d1, false)
+		shape(d2, true)
+		code, out := runCLIProcess(t, bin, unreachable, "migrate", "generate", "--mode", "snapshot", "--dir", mig, "--schema", d1, "--name", "add_note")
+		refusal := ""
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, "✗") {
+				refusal = line
+			}
+		}
+		if code == 0 || !strings.Contains(refusal, "references table s2.x") || !strings.Contains(refusal, "declare schema s2 and table s2.x in the schema document") || strings.Count(refusal, "--allow-destructive") != 1 {
+			t.Fatalf("want one refusal naming s2.x (%d):\n%s", code, out)
+		}
+		must(t, unreachable, "migrate", "generate", "--mode", "snapshot", "--dir", mig, "--schema", d2, "--name", "add_note")
+		must(t, dbURL, "migrate", "--dir", mig)
+		must(t, dbURL, "schema", "check", "--live", "--dir", mig)
+	})
+
+	// Review-1 F6: a drop spelled other than the planner renders it is read
+	// as leaving the object in place, so the expected state keeps it and
+	// the drift gate refuses once it is gone. A snapshot that cannot be read
+	// at all refuses too. Either way the mismatch fails closed.
+	t.Run("UnrecognisedDropFailsClosed", func(t *testing.T) {
+		respell := func(t *testing.T, mig, stem, from, to string) {
+			t.Helper()
+			up := filepath.Join(mig, stem+".up.sql")
+			text := string(mustReadFile(t, up))
+			if !strings.Contains(text, from) {
+				t.Fatalf("%s lacks %s:\n%s", up, from, text)
+			}
+			writeFile(t, up, strings.Replace(text, from, to, 1))
+			planPath := filepath.Join(mig, stem+".plan.json")
+			var plan map[string]any
+			if err := json.Unmarshal(mustReadFile(t, planPath), &plan); err != nil {
+				t.Fatal(err)
+			}
+			for _, op := range plan["operations"].([]any) {
+				o := op.(map[string]any)
+				if o["sql"] == from {
+					o["sql"] = to
+				}
+			}
+			raw, err := json.MarshalIndent(plan, "", "  ")
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeFile(t, planPath, string(raw)+"\n")
+		}
+		for _, c := range []struct{ label, from, to, want string }{
+			// Read as left in place: drift once it is gone.
+			{"m08spell", `alter table "public"."t" drop column if exists "old"`, `ALTER TABLE public.t DROP COLUMN old`, `add column "old"`},
+			// other_app's enum is dropped canonically, so other_app cannot be
+			// recorded: the snapshot is unreadable, and that refuses.
+			{"m08unread", `drop table if exists "public"."other_app"`, `drop table public.other_app cascade`, "cannot be read with what its up file leaves in place"},
+		} {
+			t.Run(c.label, func(t *testing.T) {
+				dbURL, fx, work, mig := setup(t, c.label)
+				must(t, unreachable, "migrate", "generate", "--mode", "snapshot", "--dir", mig, "--schema", filepath.Join(work, "d1.json"), "--name", "drop_all", "--allow-destructive")
+				respell(t, mig, "001_drop_all", c.from, c.to)
+				must(t, dbURL, "migrate", "--dir", mig, "--allow-destructive")
+				if got := q09Query(t, fx, m08Relations); got != "t,t_pkey" {
+					t.Fatalf("the respelled migration applied: relations %s", got)
+				}
+				refused(t, dbURL, []string{c.want}, "schema", "check", "--live", "--dir", mig)
+				// A pending migration brings migrate to its drift gate.
+				m08PreM08Migration(t, mig, "002", "next", filepath.Join(work, "d2.json"))
+				refused(t, dbURL, []string{c.want}, "migrate", "--dir", mig)
+			})
+		}
+	})
 
 	// An earlier CLI drifted the chain and the user then dropped the column
 	// by hand to get past the drift gate. The upgraded CLI reads the column

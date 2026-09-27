@@ -360,8 +360,11 @@ func TestSnapshotTargetScope(t *testing.T) {
 		desired := m08Doc(t, m08Desired("note"))
 		res := m08Plan(t, desired, base, false, nil)
 		_, _, err := SnapshotTarget(base, desired, res.Up)
-		if err == nil || !strings.Contains(err.Error(), "fk-target") || !strings.Contains(err.Error(), "table public.other_app") {
-			t.Fatalf("want an invalid-target refusal, got %v", err)
+		if err == nil || !strings.Contains(err.Error(), "table public.other_app is left in place") ||
+			!strings.Contains(err.Error(), "references table app.x") ||
+			!strings.Contains(err.Error(), "declare schema app and table app.x in the schema document") ||
+			strings.Count(err.Error(), "--allow-destructive") != 1 {
+			t.Fatalf("want a refusal naming the undeclared target once, got %v", err)
 		}
 	})
 
@@ -521,7 +524,7 @@ func TestSnapshotChainReadsWhatEarlierCLIsLeftOut(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(chain.Retained) != 0 || len(chain.RetainedErrors) != 1 || !strings.Contains(chain.RetainedErrors[0], "001_rename") ||
+		if len(chain.Retained) != 0 || len(chain.RetainedErrors) != 1 || chain.RetainedErrors[0].Stem != "001_rename" || !strings.Contains(chain.RetainedErrors[0].Err, "may reference column") ||
 			m08Hash(t, chain.Snapshots[0].Document) != desired.SHA256Hex {
 			t.Fatalf("errors %q", chain.RetainedErrors)
 		}
@@ -553,6 +556,11 @@ func m08Cols(t *testing.T, doc *V2Document) string {
 func TestSnapshotTargetRecordsDatabaseColumnOrder(t *testing.T) {
 	base := m08OrderDoc(t, "a", "b")
 	declared := m08OrderDoc(t, "a", "mid", "b")
+	empty, err := EmptyV2Document()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gens0 := nextColumnGenerations(nil, empty, base, nil, 0)
 
 	// The planner alone refuses the next plan against a snapshot in
 	// declared order; that rule stays (diff_v2.go).
@@ -560,7 +568,7 @@ func TestSnapshotTargetRecordsDatabaseColumnOrder(t *testing.T) {
 		t.Fatalf("planner rule changed: %v", err)
 	}
 
-	aligned, notes, err := AlignColumnOrder(declared, base, nil)
+	aligned, notes, err := AlignColumnOrder(declared, base, nil, gens0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -575,11 +583,15 @@ func TestSnapshotTargetRecordsDatabaseColumnOrder(t *testing.T) {
 	if got := m08Cols(t, target); got != "id,a,b,mid" {
 		t.Fatalf("target records %s, the database order is id,a,b,mid", got)
 	}
+	gens1 := nextColumnGenerations(gens0, base, target, nil, 1)
+	if !reflect.DeepEqual(gens1[m08ID("public", "t")], map[string]int{"id": 0, "a": 0, "b": 0, "mid": 1}) {
+		t.Fatalf("generations %v", gens1)
+	}
 
-	// Next plan: the same declared order plus another column in the
-	// middle plans only that column, with no order refusal.
+	// Next plan: mid (appended by migration 1) is still declared between a
+	// and b, and another new column comes first: only mid2 is planned.
 	next := m08OrderDoc(t, "mid2", "a", "mid", "b")
-	aligned2, _, err := AlignColumnOrder(next, target, nil)
+	aligned2, _, err := AlignColumnOrder(next, target, nil, gens1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -591,23 +603,48 @@ func TestSnapshotTargetRecordsDatabaseColumnOrder(t *testing.T) {
 	if got := m08Cols(t, target2); got != "id,a,b,mid,mid2" {
 		t.Fatalf("next target %s", got)
 	}
+	gens2 := nextColumnGenerations(gens1, target, target2, nil, 2)
 	// Unchanged document, no plan.
-	aligned3, _, _ := AlignColumnOrder(next, target2, nil)
+	aligned3, _, err := AlignColumnOrder(next, target2, nil, gens2)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if res3 := m08Plan(t, aligned3, target2, false, nil); len(res3.Up) != 0 {
 		t.Fatalf("an order difference alone plans %q", res3.Up)
 	}
+	// Columns of different generations may be declared in any order.
+	if _, _, err := AlignColumnOrder(m08OrderDoc(t, "mid", "mid2", "b", "a"), target2, nil, gens2); err == nil {
+		t.Fatalf("b before a (both baseline columns) must be refused")
+	}
+	if _, _, err := AlignColumnOrder(m08OrderDoc(t, "mid2", "mid", "a", "b"), target2, nil, gens2); err != nil {
+		t.Fatalf("mid2 before mid (different migrations) is how they were appended: %v", err)
+	}
 
-	// A declared swap of existing columns is tolerated the same way: the
-	// database keeps its order and the snapshot records it.
-	swapped, notes, _ := AlignColumnOrder(m08OrderDoc(t, "b", "a"), base, nil)
-	if got := m08Cols(t, swapped); got != "id,a,b" || len(notes) != 1 {
-		t.Fatalf("swap aligned %s", got)
+	// Review-1 F3: a changed relative order of existing columns that
+	// entered together is refused with the planner's message, alone or
+	// with an added column; so is a swap of two columns one migration added.
+	for _, cols := range [][]string{{"b", "a"}, {"b", "mid", "a"}, {"mid", "b", "a"}} {
+		if _, _, err := AlignColumnOrder(m08OrderDoc(t, cols...), base, nil, gens0); err == nil ||
+			!strings.Contains(err.Error(), "the desired column order differs from the planning-base table (attnum order [id a b])") {
+			t.Fatalf("%v: want the reorder refusal, got %v", cols, err)
+		}
+	}
+	twoAdded := m08OrderDoc(t, "a", "b", "m1", "m2")
+	gensTwo := nextColumnGenerations(gens0, base, twoAdded, nil, 1)
+	if _, _, err := AlignColumnOrder(m08OrderDoc(t, "a", "b", "m2", "m1"), twoAdded, nil, gensTwo); err == nil || !strings.Contains(err.Error(), "cannot reorder") {
+		t.Fatalf("m1 and m2 were added together: a swap must be refused, got %v", err)
+	}
+	// New columns anywhere, existing order kept: accepted.
+	for _, cols := range [][]string{{"mid", "a", "b"}, {"a", "b", "mid"}, {"x", "a", "y", "b", "z"}} {
+		if _, _, err := AlignColumnOrder(m08OrderDoc(t, cols...), base, nil, gens0); err != nil {
+			t.Fatalf("%v: %v", cols, err)
+		}
 	}
 
 	// With renames and a column left in place.
 	withOld := m08OrderDoc(t, "a", "old", "b")
 	renamed := m08OrderDoc(t, "mid", "a2", "b")
-	aligned4, _, err := AlignColumnOrder(renamed, withOld, RenamesByTable(map[string]string{"public.t.a2": "a"}))
+	aligned4, _, err := AlignColumnOrder(renamed, withOld, RenamesByTable(map[string]string{"public.t.a2": "a"}), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -642,5 +679,70 @@ func TestSnapshotChainReadsEarlierDeclaredColumnOrder(t *testing.T) {
 	}
 	if got := m08Cols(t, head); got != "id,a,b,mid" || chain.HeadSHA256 != declared.SHA256Hex {
 		t.Fatalf("head reads %s (recorded hash kept: %v)", got, chain.HeadSHA256 == declared.SHA256Hex)
+	}
+
+	// A second pre-M08 snapshot, planned from the recorded (declared)
+	// order, still declares mid between a and b: the loader keeps mid's
+	// generation and reads it in database order too.
+	declared2 := m08OrderDoc(t, "mid2", "a", "mid", "b")
+	res2 := m08Plan(t, declared2, declared, false, nil)
+	m08WriteMigration(t, dir, "002", "add_mid2", "001_add_mid", declared, declared2, res2)
+	chain, err = LoadSnapshotChain(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chain.Retained) != 2 || len(chain.RetainedErrors) != 0 {
+		t.Fatalf("Retained %+v, errors %q", chain.Retained, chain.RetainedErrors)
+	}
+	head, err = chain.HeadDocument()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m08Cols(t, head); got != "id,a,b,mid,mid2" {
+		t.Fatalf("head reads %s", got)
+	}
+	if got := chain.HeadColumnGenerations()[m08ID("public", "t")]; !reflect.DeepEqual(got, map[string]int{"id": 0, "a": 0, "b": 0, "mid": 1, "mid2": 2}) {
+		t.Fatalf("generations %v", got)
+	}
+}
+
+// Review-1 F6: "stays" is decided by matching the planner's rendering. Any
+// other spelling of a drop is read as leaving the object in place, so the
+// expected state keeps it and the drift gate refuses once it is gone:
+// a mismatch always fails closed.
+func TestSnapshotTargetUnrecognisedDropFailsClosed(t *testing.T) {
+	base := m08Doc(t, m08Base())
+	dm := m08Desired("note")
+	dm.Enums = m08Base().Enums // other_app's column type stays declared
+	desired := m08Doc(t, dm)
+	canonical := m08Plan(t, desired, base, true, nil).Up
+	if _, retained := m08Target(t, base, desired, canonical); len(retained) != 0 {
+		t.Fatalf("the planner's own drops leave nothing in place: %q", retained)
+	}
+	for _, spelling := range []string{
+		`drop table public.other_app`,
+		`DROP TABLE "public"."other_app" CASCADE`,
+		`drop table other_app`,
+		`drop table "public"."other_app", "public"."x"`,
+		`drop table "Public"."other_app"`,
+		`-- drop table if exists "public"."other_app"`,
+		`select 'drop table if exists "public"."other_app"'`,
+		`DO $$ BEGIN drop table if exists "public"."other_app"; END $$`,
+	} {
+		var up []string
+		for _, u := range canonical {
+			if u == `drop table if exists "public"."other_app"` {
+				u = spelling
+			}
+			up = append(up, u)
+		}
+		_, retained := m08Target(t, base, desired, up)
+		found := false
+		for _, r := range retained {
+			found = found || r == "table public.other_app"
+		}
+		if !found {
+			t.Fatalf("%q: other_app must be read as left in place (fail closed), retained %q", spelling, retained)
+		}
 	}
 }

@@ -90,8 +90,9 @@ snapshot — a non-empty diff means pending schema changes, reported and exit 1.
 Objects a migration left in place because the document no longer declares them
 are recorded in the chain, so their drops stay listed as pending until a plan
 with --allow-destructive drops them or the document declares them again.
-Columns compare by name: the chain records the order the database holds, and a
-document that declares another order is noted, not a pending change.
+The chain records the column order the database holds: a new column declared
+between existing ones is noted, not a pending change; a changed relative order
+of existing columns is refused, as PostgreSQL cannot reorder columns.
 
 With --live: introspects the database and compares it against the snapshot of the
 newest APPLIED migration (or the baseline). Any managed-scope difference is drift:
@@ -236,9 +237,10 @@ func reportBaselineInternal(chain *db.SnapshotChain) {
 	ui.Infof("baseline %s_%s lists neutron-internal metadata %s (written by an earlier CLI): ignored — internal tables are never managed", db.BaselineVersion, db.BaselineName, db.IdentityList(chain.BaselineInternal))
 }
 
-// reportChainRetained notes migration snapshots an earlier CLI wrote without
-// the objects their migration left in place, or with columns in declared
-// order; the chain loader reads them as the database holds them.
+// reportChainRetained notes migration snapshots that do not record what
+// their up files leave in place, or record columns in declared order (CLIs
+// before M08 wrote them so); the chain loader reads them as the up files
+// leave the database.
 func reportChainRetained(chain *db.SnapshotChain) {
 	if chain == nil {
 		return
@@ -249,22 +251,22 @@ func reportChainRetained(chain *db.SnapshotChain) {
 			stems[i] = r.Stem
 		}
 		last := chain.Retained[n-1]
-		ui.Infof("snapshot(s) %s, written by an earlier CLI, do not record the database state their migrations produced (%s: %s): read as the database holds it — the files are unchanged", strings.Join(stems, ", "), last.Stem, last.Describe())
+		ui.Infof("snapshot(s) %s do not record the state their up files leave (%s: %s) — CLIs before M08 omitted it; read as the up files leave it. The snapshot files are unchanged; `neutron migrate` and `neutron schema check --live` verify applied up files against their recorded checksums first", strings.Join(stems, ", "), last.Stem, last.Describe())
 	}
 	for _, e := range chain.RetainedErrors {
-		ui.Warnf("%s", e)
+		ui.Warnf("%s — read as recorded; comparing a database against it refuses", e)
 	}
 }
 
-// retainedDriftHint is the way out when drift meets snapshots an earlier
-// CLI wrote: they are read with what their migrations left in place, so
+// retainedDriftHint is the way out when drift meets snapshots read with
+// what their up files left in place (written before M08), so
 // objects dropped by hand since show as drift that re-creates them, and no
 // migration can record a state its own chain says it never reached.
 func retainedDriftHint(chain *db.SnapshotChain) string {
 	if chain == nil || len(chain.Retained) == 0 {
 		return ""
 	}
-	return "snapshots written by an earlier CLI are read with what their migrations left in place (noted above). If the drift re-creates objects that were dropped by hand since, re-baseline at that state: apply the pending migration files or move them out, delete the snapshots directory, run `neutron schema baseline`, then generate again"
+	return "snapshots are read with what their up files left in place (noted above). If the drift re-creates objects that were dropped by hand since, re-baseline at that state: apply the pending migration files or move them out, delete the snapshots directory, run `neutron schema baseline`, then generate again"
 }
 
 func reportDocumentSummary(doc *db.V2Document) {
@@ -312,7 +314,7 @@ func runSchemaCheck(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		desired, orderNotes, err := db.AlignColumnOrder(loaded.V2, base, nil)
+		desired, orderNotes, err := db.AlignColumnOrder(loaded.V2, base, nil, chain.HeadColumnGenerations())
 		if err != nil {
 			return err
 		}
@@ -333,7 +335,21 @@ func runSchemaCheck(cmd *cobra.Command, args []string) error {
 			ui.Successf("Desired schema is in sync with snapshot %s (canonical SHA-256 %s)", chain.HeadRef, shortHashCLI(chain.HeadSHA256))
 			return nil
 		}
-		ui.Warnf("Desired schema has %d pending change(s) vs snapshot %s — generate with `neutron migrate generate --mode snapshot`:", len(result.Up), chain.HeadRef)
+		// What a plan without --allow-destructive would do: the rest are
+		// drops of objects the chain records and the schema does not
+		// declare (left in place), which a plain generate never plans.
+		plain, err := db.DiffV2Document(cmd.Context(), desired, base, db.DiffV2Options{SnapshotBase: true})
+		if err != nil {
+			return err
+		}
+		switch {
+		case len(plain.Up) == 0:
+			ui.Warnf("Desired schema has %d pending change(s) vs snapshot %s, all drops of objects the chain records but the schema does not declare (left in place) — declare them in the schema, or plan their drop with `neutron migrate generate --mode snapshot --allow-destructive`:", len(result.Up), chain.HeadRef)
+		case len(plain.Up) < len(result.Up):
+			ui.Warnf("Desired schema has %d pending change(s) vs snapshot %s — generate with `neutron migrate generate --mode snapshot`; the drops of objects the schema does not declare (left in place) need `--allow-destructive`, or declare them in the schema:", len(result.Up), chain.HeadRef)
+		default:
+			ui.Warnf("Desired schema has %d pending change(s) vs snapshot %s — generate with `neutron migrate generate --mode snapshot`:", len(result.Up), chain.HeadRef)
+		}
 		for _, stmt := range result.Up {
 			fmt.Printf("  %s;\n", firstLine(stmt))
 		}
@@ -369,6 +385,27 @@ func runSchemaCheck(cmd *cobra.Command, args []string) error {
 	// files missing from the baseline's covers both land here.
 	if unknown := unchainableAppliedVersions(chain, applied); len(unknown) > 0 {
 		return fmt.Errorf("applied history version(s) %s are unknown to the snapshot chain — no snapshot carries them and the baseline's covered files do not list them (foreign-branch history or unrecorded pre-baseline migrations); refusing to guess the applied state. Reconcile the history with the chain, or delete the baseline and re-baseline at the true applied state", strings.Join(unknown, ", "))
+	}
+
+	// The expected state may be read with what applied up files left in
+	// place, so those files must be the ones that ran: verify them against
+	// their recorded checksums exactly as `neutron migrate` does, before
+	// anything is compared (M08 review-1).
+	if shape == db.HistoryV2Text {
+		files, err := db.ReadMigrationFiles(dir)
+		if err != nil {
+			return err
+		}
+		records, err := client.AppliedMigrations(ctx)
+		if err != nil {
+			return fmt.Errorf("read migration history: %w", err)
+		}
+		if _, err := db.VerifyAppliedChecksums(files, records); err != nil {
+			return err
+		}
+		if err := retainedAnchorError(chain, records); err != nil {
+			return err
+		}
 	}
 
 	expected, pending, expectedRef, err := expectedAppliedDocument(chain, applied)

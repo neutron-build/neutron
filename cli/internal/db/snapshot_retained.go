@@ -66,8 +66,21 @@ func RetainedList(objs []RetainedObject) string {
 // database holds them.
 type SnapshotRetained struct {
 	Stem      string
+	Version   string
 	Objects   []RetainedObject
 	Reordered []V2Identity
+}
+
+// SnapshotReadError is a snapshot the chain could not read with what its up
+// file leaves in place.
+type SnapshotReadError struct {
+	Stem    string
+	Version string
+	Err     string
+}
+
+func (e SnapshotReadError) String() string {
+	return fmt.Sprintf("snapshot %s cannot be read with what its up file leaves in place: %s", e.Stem, e.Err)
 }
 
 // Describe renders what the chain reads differently from the file.
@@ -343,17 +356,102 @@ func carryRetained(base, desired *V2Document, bm V2DocumentModel, retained []Ret
 		dt["columns"] = out
 	}
 
+	if err := undeclaredReference(root, retained); err != nil {
+		return nil, err
+	}
 	raw, err := json.Marshal(root)
 	if err != nil {
 		return nil, fmt.Errorf("encode target snapshot: %w", err)
 	}
 	doc, err := ParseV2Document(raw)
 	if err != nil {
-		return nil, fmt.Errorf("recording the objects this plan leaves in place (%s) makes the target snapshot an invalid schema document: %w", RetainedList(retained), err)
+		return nil, fmt.Errorf("recording the objects this plan leaves in place (%s) makes the target snapshot an invalid schema document: %w — declare them in the schema document, or drop them with --allow-destructive", RetainedList(retained), err)
 	}
 	// Re-read the canonical bytes, so the next plan from this document
 	// walks it in canonical order, exactly as when it is read from disk.
 	return ParseV2Document(doc.Canonical)
+}
+
+// undeclaredReference refuses a carried table whose foreign key, or a
+// carried column whose enum type, points at an object the target does not
+// declare (typically in a schema outside the document). A snapshot cannot
+// record the object without its target, and the way out is to declare the
+// target, not the carried object.
+func undeclaredReference(root map[string]any, retained []RetainedObject) error {
+	schemas := map[string]bool{}
+	for _, e := range asList(root["schemas"]) {
+		m, _ := e.(map[string]any)
+		name, _ := m["name"].(string)
+		schemas[name] = true
+	}
+	declared := func(key string, id V2Identity) bool {
+		for _, e := range asList(root[key]) {
+			if m, ok := e.(map[string]any); ok && entryIdentity(m) == id {
+				return true
+			}
+		}
+		return false
+	}
+	advice := func(kind string, target V2Identity, object string) string {
+		what := kind + " " + target.String()
+		if !schemas[target.Schema] {
+			what = "schema " + target.Schema + " and " + what
+		}
+		return fmt.Sprintf("declare %s in the schema document as they are in the database, or drop %s with --allow-destructive", what, object)
+	}
+	table := func(id V2Identity) map[string]any {
+		for _, e := range asList(root["tables"]) {
+			if m, ok := e.(map[string]any); ok && entryIdentity(m) == id {
+				return m
+			}
+		}
+		return nil
+	}
+	enumOf := func(col map[string]any) (V2Identity, bool) {
+		typ, _ := col["type"].(map[string]any)
+		enum, ok := typ["enum"].(map[string]any)
+		return identityFrom(enum), ok
+	}
+	for _, r := range retained {
+		switch r.Kind {
+		case "table":
+			t := table(r.Identity)
+			for _, c := range asList(t["constraints"]) {
+				con, _ := c.(map[string]any)
+				ref, _ := con["references"].(map[string]any)
+				if ref == nil {
+					continue
+				}
+				target := identityFrom(asMap(ref["table"]))
+				if !declared("tables", target) {
+					name, _ := con["name"].(string)
+					return fmt.Errorf("table %s is left in place, and its foreign key %s references table %s, which the schema document does not declare — the target snapshot cannot record the table without it; %s", r.Identity, name, target, advice("table", target, "table "+r.Identity.String()))
+				}
+			}
+			for _, c := range asList(t["columns"]) {
+				col, _ := c.(map[string]any)
+				if enum, ok := enumOf(col); ok && !declared("enums", enum) {
+					return fmt.Errorf("table %s is left in place, and its column %v has type enum %s, which the schema document does not declare — the target snapshot cannot record the table without it; %s", r.Identity, col["name"], enum, advice("enum", enum, "table "+r.Identity.String()))
+				}
+			}
+		case "column":
+			for _, c := range asList(table(r.Identity)["columns"]) {
+				col, _ := c.(map[string]any)
+				if name, _ := col["name"].(string); name != r.Column {
+					continue
+				}
+				if enum, ok := enumOf(col); ok && !declared("enums", enum) {
+					return fmt.Errorf("column %s.%s is left in place, and its type is enum %s, which the schema document does not declare — the target snapshot cannot record the column without it; %s", r.Identity, r.Column, enum, advice("enum", enum, "the column"))
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func asMap(v any) map[string]any {
+	m, _ := v.(map[string]any)
+	return m
 }
 
 // readRetained reads each migration snapshot as its recorded document, in
@@ -376,6 +474,12 @@ func (c *SnapshotChain) readRetained(migrationsDir string) error {
 	if err != nil {
 		return err
 	}
+	empty, err := EmptyV2Document()
+	if err != nil {
+		return err
+	}
+	gens := nextColumnGenerations(nil, empty, prev, nil, 0)
+	defer func() { c.headGens = gens }()
 	for i := range c.Snapshots {
 		s := &c.Snapshots[i]
 		recorded, err := ParseV2Document(s.Document)
@@ -387,27 +491,30 @@ func (c *SnapshotChain) readRetained(migrationsDir string) error {
 			return fmt.Errorf("read %s.up.sql: %w", s.Stem(), err)
 		}
 		up := SplitSQLStatements(string(upSQL))
+		renames := plannedRenames(up)
 		// Earlier CLIs recorded columns in declared order; the migration
 		// appended its new columns after the previous state's.
-		aligned, notes, err := AlignColumnOrder(recorded, prev, plannedRenames(up))
+		aligned, notes, err := AlignColumnOrder(recorded, prev, renames, gens)
 		if err == nil {
 			var target *V2Document
 			var retained []RetainedObject
 			target, retained, err = SnapshotTarget(prev, aligned, up)
 			if err == nil {
 				if target.SHA256Hex != recorded.SHA256Hex {
-					r := SnapshotRetained{Stem: s.Stem(), Objects: retained}
+					r := SnapshotRetained{Stem: s.Stem(), Version: s.Version, Objects: retained}
 					for _, n := range notes {
 						r.Reordered = append(r.Reordered, n.Table)
 					}
 					s.Document = append(json.RawMessage(nil), target.Canonical...)
 					c.Retained = append(c.Retained, r)
 				}
+				gens = nextColumnGenerations(gens, prev, target, renames, i+1)
 				prev = target
 				continue
 			}
 		}
-		c.RetainedErrors = append(c.RetainedErrors, fmt.Sprintf("snapshot %s is read as recorded: %v", s.Stem(), err))
+		c.RetainedErrors = append(c.RetainedErrors, SnapshotReadError{Stem: s.Stem(), Version: s.Version, Err: err.Error()})
+		gens = nextColumnGenerations(gens, prev, recorded, renames, i+1)
 		prev = recorded
 	}
 	return nil

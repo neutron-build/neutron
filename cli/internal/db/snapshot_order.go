@@ -5,16 +5,18 @@ package db
 // PostgreSQL appends an added column after every existing one and cannot
 // reorder columns without a rewrite. A schema document that declares a new
 // column between existing ones therefore describes an order the database
-// never reaches. Snapshot planning compares columns by name: before the
-// planner runs, AlignColumnOrder puts every column the planning base
-// already has in the base's order (following renames) and the new columns
-// after them in the order the document declares them, which is the order
-// the plan adds them. The target snapshot then records the order the
-// database holds, and the next plan compares against it without churn or
-// an order refusal. The planner's own rule (DiffV2Document refuses a
-// reorder of matched columns, diff_v2.go planSharedTables) is unchanged: it
-// still applies to live planning, db push and the drift gate, where the
-// expected document is a snapshot in database order.
+// never reaches. Before the planner runs, AlignColumnOrder moves the new
+// columns after the ones the planning base already has, in the order the
+// document declares them, which is the order the plan adds them. The
+// target snapshot then records the order the database holds, and the next
+// plan compares against it without churn or an order refusal. A changed
+// relative order of existing columns that entered the table together is
+// still refused, with the planner's message; the chain's column
+// generations (ColumnGenerations) tell them apart from a column a later
+// migration appended. The planner's own rule (DiffV2Document refuses a reorder of
+// matched columns, diff_v2.go planSharedTables) is unchanged: it still
+// applies to live planning, db push and the drift gate, where the expected
+// document is a snapshot in database order.
 
 import (
 	"encoding/json"
@@ -22,6 +24,45 @@ import (
 	"sort"
 	"strings"
 )
+
+// ColumnGenerations records, per table, which chain entry each column
+// entered the table in: 0 for the baseline (or a table's creation), then
+// the position of the migration snapshot that added it. PostgreSQL appends
+// an added column, so the database order is the generations in turn; only
+// columns of one generation have a relative order the document must keep.
+// A nil map puts every column in one generation (the strict rule).
+type ColumnGenerations map[V2Identity]map[string]int
+
+// nextColumnGenerations derives the generations of doc, the state after the
+// chain entry at index, from prev's: a column prev has (under its old name
+// when the entry renames it) keeps its generation; any other is new.
+func nextColumnGenerations(prevGens ColumnGenerations, prev, doc *V2Document, renames map[V2Identity]map[string]string, index int) ColumnGenerations {
+	var pm, dm V2DocumentModel
+	_ = json.Unmarshal(prev.Canonical, &pm)
+	_ = json.Unmarshal(doc.Canonical, &dm)
+	out := ColumnGenerations{}
+	for _, t := range dm.Tables {
+		from := map[string]string{}
+		for old, n := range renames[t.Identity] {
+			from[n] = old
+		}
+		pt := pm.Table(t.Identity)
+		gens := map[string]int{}
+		for _, c := range t.Columns {
+			old := c.Name
+			if o, ok := from[c.Name]; ok {
+				old = o
+			}
+			if pt != nil && pt.Column(old) != nil {
+				gens[c.Name] = prevGens[t.Identity][old]
+			} else {
+				gens[c.Name] = index
+			}
+		}
+		out[t.Identity] = gens
+	}
+	return out
+}
 
 // ColumnOrderNote is a table whose declared column order differs from the
 // order the database holds (or will hold after the plan).
@@ -32,7 +73,7 @@ type ColumnOrderNote struct {
 }
 
 func (n ColumnOrderNote) String() string {
-	return fmt.Sprintf("table %s: the schema declares columns (%s), the database holds them as (%s) — PostgreSQL appends added columns and cannot reorder existing ones, so plans compare columns by name and the snapshot records the database order",
+	return fmt.Sprintf("table %s: the schema declares columns (%s), the database holds them as (%s) — PostgreSQL appends added columns, so the snapshot records the database order (declare new columns last to match it)",
 		n.Table, strings.Join(n.Declared, ", "), strings.Join(n.Recorded, ", "))
 }
 
@@ -62,9 +103,15 @@ func RenamesByTable(renames map[string]string) map[V2Identity]map[string]string 
 // AlignColumnOrder returns desired with the columns of every managed table
 // the base also has in database order: the columns the base has (matched
 // by name, or by rename) in base order, then the others in declared order.
-// Every other entry keeps its bytes; desired is returned as is when no
-// table changes. The notes name the tables whose order changed.
-func AlignColumnOrder(desired, base *V2Document, renames map[V2Identity]map[string]string) (*V2Document, []ColumnOrderNote, error) {
+// Only new columns move. A document that changes the relative order of
+// existing columns that entered the table together (gens: in the base
+// state, or through one migration) is refused with the planner's reorder
+// message, exactly as live planning and db push refuse it (that order stays
+// schema state, contracts/data/CANONICAL.md); a column a later migration
+// appended may be declared anywhere, which is how it got appended. Every
+// other entry keeps its bytes; desired is returned as is when no table
+// changes. The notes name the tables whose order changed.
+func AlignColumnOrder(desired, base *V2Document, renames map[V2Identity]map[string]string, gens ColumnGenerations) (*V2Document, []ColumnOrderNote, error) {
 	var bm V2DocumentModel
 	if err := json.Unmarshal(base.Canonical, &bm); err != nil {
 		return nil, nil, fmt.Errorf("decode planning base: %w", err)
@@ -92,6 +139,32 @@ func AlignColumnOrder(desired, base *V2Document, renames map[V2Identity]map[stri
 			name, _ := m["name"].(string)
 			byName[name] = c
 			declared = append(declared, name)
+		}
+		// Existing columns that entered the table together (in the base
+		// state, or through one migration) keep their relative order; a
+		// column a later migration appended may be declared anywhere.
+		basePos := map[string]int{}
+		baseGen := map[string]int{}
+		for i, bc := range bt.Columns {
+			name := bc.Name
+			if n := renames[id][name]; n != "" {
+				name = n
+			}
+			basePos[name] = i
+			baseGen[name] = gens[id][bc.Name]
+		}
+		last := map[int]int{}
+		for _, name := range declared {
+			pos, ok := basePos[name]
+			if !ok {
+				continue
+			}
+			if prev, seen := last[baseGen[name]]; seen && pos < prev {
+				return nil, nil, fmt.Errorf(
+					"table %s: the desired column order differs from the planning-base table (attnum order %v) — PostgreSQL cannot reorder columns without rewriting the table; align the document order or plan a manual migration",
+					id, columnNames(*bt))
+			}
+			last[baseGen[name]] = pos
 		}
 		used := map[string]bool{}
 		var ordered []any
