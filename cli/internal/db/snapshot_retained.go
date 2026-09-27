@@ -61,10 +61,25 @@ func RetainedList(objs []RetainedObject) string {
 }
 
 // SnapshotRetained lists what an earlier CLI's snapshot omitted although
-// its migration left it in place; the chain reads it as recorded.
+// its migration left it in place, and the tables whose columns it recorded
+// in declared rather than database order; the chain reads them as the
+// database holds them.
 type SnapshotRetained struct {
-	Stem    string
-	Objects []RetainedObject
+	Stem      string
+	Objects   []RetainedObject
+	Reordered []V2Identity
+}
+
+// Describe renders what the chain reads differently from the file.
+func (r SnapshotRetained) Describe() string {
+	var parts []string
+	if len(r.Objects) > 0 {
+		parts = append(parts, "left in place: "+RetainedList(r.Objects))
+	}
+	if len(r.Reordered) > 0 {
+		parts = append(parts, "columns in database order: "+IdentityList(r.Reordered))
+	}
+	return strings.Join(parts, "; ")
 }
 
 // SnapshotTarget returns the target snapshot of a plan from base to desired
@@ -341,8 +356,9 @@ func carryRetained(base, desired *V2Document, bm V2DocumentModel, retained []Ret
 	return ParseV2Document(doc.Canonical)
 }
 
-// readRetained reads each migration snapshot as its recorded document plus
-// what its up file left in place from the previous snapshot. Snapshots
+// readRetained reads each migration snapshot as its recorded document, in
+// the column order the database holds, plus what its up file left in place
+// from the previous snapshot. Snapshots
 // written by this CLI already record those objects and read unchanged;
 // earlier CLIs recorded the desired document only. The recorded target
 // hash still anchors the chain, and no file is rewritten. A snapshot that
@@ -370,17 +386,29 @@ func (c *SnapshotChain) readRetained(migrationsDir string) error {
 		if err != nil {
 			return fmt.Errorf("read %s.up.sql: %w", s.Stem(), err)
 		}
-		target, retained, err := SnapshotTarget(prev, recorded, SplitSQLStatements(string(upSQL)))
-		if err != nil {
-			c.RetainedErrors = append(c.RetainedErrors, fmt.Sprintf("snapshot %s is read as recorded: %v", s.Stem(), err))
-			prev = recorded
-			continue
+		up := SplitSQLStatements(string(upSQL))
+		// Earlier CLIs recorded columns in declared order; the migration
+		// appended its new columns after the previous state's.
+		aligned, notes, err := AlignColumnOrder(recorded, prev, plannedRenames(up))
+		if err == nil {
+			var target *V2Document
+			var retained []RetainedObject
+			target, retained, err = SnapshotTarget(prev, aligned, up)
+			if err == nil {
+				if target.SHA256Hex != recorded.SHA256Hex {
+					r := SnapshotRetained{Stem: s.Stem(), Objects: retained}
+					for _, n := range notes {
+						r.Reordered = append(r.Reordered, n.Table)
+					}
+					s.Document = append(json.RawMessage(nil), target.Canonical...)
+					c.Retained = append(c.Retained, r)
+				}
+				prev = target
+				continue
+			}
 		}
-		if len(retained) > 0 {
-			s.Document = append(json.RawMessage(nil), target.Canonical...)
-			c.Retained = append(c.Retained, SnapshotRetained{Stem: s.Stem(), Objects: retained})
-		}
-		prev = target
+		c.RetainedErrors = append(c.RetainedErrors, fmt.Sprintf("snapshot %s is read as recorded: %v", s.Stem(), err))
+		prev = recorded
 	}
 	return nil
 }

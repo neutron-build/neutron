@@ -527,3 +527,120 @@ func TestSnapshotChainReadsWhatEarlierCLIsLeftOut(t *testing.T) {
 		}
 	})
 }
+
+// m08OrderDoc is public.t with the given integer columns (id first, the
+// primary key).
+func m08OrderDoc(t *testing.T, cols ...string) *V2Document {
+	t.Helper()
+	m := m08Desired()
+	m.Tables[0].Columns = []V2Column{m08Col("id", "int4", true)}
+	m.Tables[0].Constraints = m.Tables[0].Constraints[:1]
+	for _, c := range cols {
+		m.Tables[0].Columns = append(m.Tables[0].Columns, m08Col(c, "int4", false))
+	}
+	return m08Doc(t, m)
+}
+
+func m08Cols(t *testing.T, doc *V2Document) string {
+	t.Helper()
+	m := m08Model(t, doc)
+	return strings.Join(columnNames(*m.Table(m08ID("public", "t"))), ",")
+}
+
+// P1: a column declared between existing ones is appended by PostgreSQL.
+// The target snapshot records the database order and the next plan
+// compares columns by name.
+func TestSnapshotTargetRecordsDatabaseColumnOrder(t *testing.T) {
+	base := m08OrderDoc(t, "a", "b")
+	declared := m08OrderDoc(t, "a", "mid", "b")
+
+	// The planner alone refuses the next plan against a snapshot in
+	// declared order; that rule stays (diff_v2.go).
+	if _, err := DiffV2Document(context.Background(), declared, m08OrderDoc(t, "a", "b", "mid"), DiffV2Options{SnapshotBase: true}); err == nil || !strings.Contains(err.Error(), "cannot reorder") {
+		t.Fatalf("planner rule changed: %v", err)
+	}
+
+	aligned, notes, err := AlignColumnOrder(declared, base, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m08Cols(t, aligned); got != "id,a,b,mid" || len(notes) != 1 || strings.Join(notes[0].Declared, ",") != "id,a,mid,b" {
+		t.Fatalf("aligned %s, notes %+v", got, notes)
+	}
+	res := m08Plan(t, aligned, base, false, nil)
+	if !reflect.DeepEqual(res.Up, []string{`alter table "public"."t" add column "mid" integer`}) {
+		t.Fatalf("plan %q", res.Up)
+	}
+	target, _ := m08Target(t, base, aligned, res.Up)
+	if got := m08Cols(t, target); got != "id,a,b,mid" {
+		t.Fatalf("target records %s, the database order is id,a,b,mid", got)
+	}
+
+	// Next plan: the same declared order plus another column in the
+	// middle plans only that column, with no order refusal.
+	next := m08OrderDoc(t, "mid2", "a", "mid", "b")
+	aligned2, _, err := AlignColumnOrder(next, target, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res2 := m08Plan(t, aligned2, target, false, nil)
+	if !reflect.DeepEqual(res2.Up, []string{`alter table "public"."t" add column "mid2" integer`}) {
+		t.Fatalf("next plan %q", res2.Up)
+	}
+	target2, _ := m08Target(t, target, aligned2, res2.Up)
+	if got := m08Cols(t, target2); got != "id,a,b,mid,mid2" {
+		t.Fatalf("next target %s", got)
+	}
+	// Unchanged document, no plan.
+	aligned3, _, _ := AlignColumnOrder(next, target2, nil)
+	if res3 := m08Plan(t, aligned3, target2, false, nil); len(res3.Up) != 0 {
+		t.Fatalf("an order difference alone plans %q", res3.Up)
+	}
+
+	// A declared swap of existing columns is tolerated the same way: the
+	// database keeps its order and the snapshot records it.
+	swapped, notes, _ := AlignColumnOrder(m08OrderDoc(t, "b", "a"), base, nil)
+	if got := m08Cols(t, swapped); got != "id,a,b" || len(notes) != 1 {
+		t.Fatalf("swap aligned %s", got)
+	}
+
+	// With renames and a column left in place.
+	withOld := m08OrderDoc(t, "a", "old", "b")
+	renamed := m08OrderDoc(t, "mid", "a2", "b")
+	aligned4, _, err := AlignColumnOrder(renamed, withOld, RenamesByTable(map[string]string{"public.t.a2": "a"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m08Cols(t, aligned4); got != "id,a2,b,mid" {
+		t.Fatalf("aligned with rename %s", got)
+	}
+	res4 := m08Plan(t, aligned4, withOld, false, map[string]string{"public.t.a2": "a"})
+	target4, retained := m08Target(t, withOld, aligned4, res4.Up)
+	if got := m08Cols(t, target4); got != "id,a2,old,b,mid" || !reflect.DeepEqual(retained, []string{"column public.t.old"}) {
+		t.Fatalf("target %s, retained %q", got, retained)
+	}
+}
+
+func TestSnapshotChainReadsEarlierDeclaredColumnOrder(t *testing.T) {
+	dir := t.TempDir()
+	base := m08OrderDoc(t, "a", "b")
+	m08WriteBaseline(t, dir, base)
+	declared := m08OrderDoc(t, "a", "mid", "b")
+	res := m08Plan(t, declared, base, false, nil) // the pre-M08 planner accepts it
+	m08WriteMigration(t, dir, "001", "add_mid", "000_baseline", base, declared, res)
+
+	chain, err := LoadSnapshotChain(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chain.Retained) != 1 || len(chain.Retained[0].Objects) != 0 || IdentityList(chain.Retained[0].Reordered) != "public.t" || len(chain.RetainedErrors) != 0 {
+		t.Fatalf("Retained %+v, errors %q", chain.Retained, chain.RetainedErrors)
+	}
+	head, err := chain.HeadDocument()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m08Cols(t, head); got != "id,a,b,mid" || chain.HeadSHA256 != declared.SHA256Hex {
+		t.Fatalf("head reads %s (recorded hash kept: %v)", got, chain.HeadSHA256 == declared.SHA256Hex)
+	}
+}

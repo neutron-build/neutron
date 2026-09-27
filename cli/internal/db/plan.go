@@ -198,8 +198,9 @@ type SnapshotChain struct {
 	BaselineInternal []V2Identity
 
 	// Retained lists migration snapshots written by an earlier CLI that
-	// omit objects their migration left in place (M08). The loaded
-	// Document includes them; the recorded target hash still anchors the
+	// omit objects their migration left in place or record columns in
+	// declared order (M08). The loaded Document holds the database state;
+	// the recorded target hash still anchors the
 	// chain. RetainedErrors names snapshots that could not be read this
 	// way and keep their recorded document.
 	Retained       []SnapshotRetained
