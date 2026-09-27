@@ -59,7 +59,10 @@ All notable changes to this project are documented in this file.
   naming the split. Changing a generated column's expression is refused on
   PostgreSQL 16 before anything runs; snapshot plans record
   `minServerMajor`. A snapshot plan now records the migration's file slug,
-  so `--name "Add Users"` produces an appliable migration.
+  so `--name "Add Users"` produces an appliable migration. With `--rename`,
+  `db push` and live `migrate generate` compare a renamed column's generated
+  expressions, checks and indexes as PostgreSQL rewrites them, so a rename
+  alone plans only `RENAME COLUMN`, and its down file reverts.
 
 - **`@neutron-build/nucleus` model clients were checked against a live
   engine** (Nucleus 1.0.2, `conformance/live/orm/`). Document collections

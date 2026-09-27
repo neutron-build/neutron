@@ -138,14 +138,15 @@ writes `{version}_{name}.up.sql` / `.down.sql` pairs;
 with the same type is dropped, it prints a
 suggestion — confirm intent with `--rename 'users.old>users.new'` (the `>`
 must be quoted in the shell; without quotes the shell reads it as a redirect
-and the flag never reaches the CLI). Current limit: renaming a column also
-re-plans the definitions whose expressions name it. A check constraint, or an
-index whose expression or predicate references the column, is dropped and
-re-created on every supported version (a validation scan or an index
-rebuild); an index keyed on the column itself is untouched. A generated
-column that references it gets `SET EXPRESSION`, which rewrites the table on
-17+, and on 16 the plan is refused. Nothing is lost; rename such columns by
-hand until this is fixed.
+and the flag never reaches the CLI). A rename alone plans only `RENAME COLUMN`
+in `db push` and `migrate generate --mode live`: PostgreSQL rewrites the
+generated columns, checks and indexes that name the column, and the planner
+compares against that. Current limit: `--mode snapshot` has no database to
+compare against, so it still re-plans those definitions (a check or
+expression index dropped and re-created, a generated column given `SET
+EXPRESSION`, which rewrites the table and needs PostgreSQL 17+), and its
+down file for such a rename does not run. Generate renames with `--mode
+live`.
 
 Enum value additions: PostgreSQL cannot use an enum value inside the
 transaction that adds it (SQLSTATE 55P04). When a plan adds enum values and
