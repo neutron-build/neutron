@@ -412,10 +412,12 @@ func TestQ10GenerateLiveRename(t *testing.T) {
 }
 
 // migrate generate --mode snapshot has no catalog: it cannot compare under
-// the rename, so it must not claim the expressions are unchanged. It plans
-// them as changes, flags each comparison as unverified, and says the
-// planning base's text predates the rename.
-func TestQ10GenerateSnapshotRenameStaysUnverified(t *testing.T) {
+// the rename, so it must not claim the expressions are unchanged, and a
+// plan of them as changes would carry down statements that name the old
+// column before the rename is reverted. It refuses, names every element
+// whose planning-base text predates the rename, and names the offline fix
+// (Q11; TestQ11GenerateSnapshotRenameRefused follows it).
+func TestQ10GenerateSnapshotRenameIsRefused(t *testing.T) {
 	bin := buildCLIBinary(t)
 	work := t.TempDir()
 	all := q10Elements{generated: "%s * 2", check: "%s > 0", exprIndex: "abs(%s)", partial: "%s > 1"}
@@ -431,25 +433,24 @@ func TestQ10GenerateSnapshotRenameStaysUnverified(t *testing.T) {
 		t.Fatalf("snapshot generate init failed (%d):\n%s", code, out)
 	}
 	code, out := run("migrate", "generate", "--mode", "snapshot", "--schema", after, "--dir", mig, "--name", "rename", "--rename", "app.t.net>app.t.amount")
-	if code != 0 {
-		t.Fatalf("snapshot generate rename failed (%d):\n%s", code, out)
+	if code == 0 {
+		t.Fatalf("snapshot generate must refuse a rename its expressions depend on:\n%s", out)
 	}
-	plan := readFile(t, filepath.Join(mig, "002_rename.plan.json"))
-	for _, elem := range []string{"column gross generation expression", "check constraint t_c expression", "index app.t_expr_idx key part", "index app.t_part_idx predicate"} {
-		note := "equivalence not verified for " + elem
-		if !strings.Contains(out, note) || !strings.Contains(plan, note) {
-			t.Fatalf("offline planning must flag %q as unverified:\n%s\n%s", elem, out, plan)
+	for _, elem := range []string{
+		`column gross generation expression: "amount * 2" (desired) vs "net * 2" (planning-base)`,
+		`check constraint t_c expression: "amount > 0" (desired) vs "net > 0" (planning-base)`,
+		`index app.t_expr_idx key part: "abs(amount)" (desired) vs "abs(net)" (planning-base)`,
+		`index app.t_part_idx predicate: "amount > 1" (desired) vs "net > 1" (planning-base)`,
+	} {
+		if !strings.Contains(out, elem) {
+			t.Fatalf("the refusal must name %q:\n%s", elem, out)
 		}
 	}
-	if n := strings.Count(out, "predates the rename of net to amount"); n != 4 {
-		t.Fatalf("each unverified note must say the base text predates the rename (%d found):\n%s", n, out)
+	if !strings.Contains(out, "predates the rename of net to amount") || !strings.Contains(out, "Plan it as two migrations instead") || strings.Contains(out, "live normalizer") {
+		t.Fatalf("the refusal must name the rename and the offline fix:\n%s", out)
 	}
-	if n := strings.Count(out, "— re-run with --mode live, which compares it under the rename"); n != 4 || strings.Contains(out, "live normalizer") {
-		t.Fatalf("each unverified note must point to --mode live (%d found):\n%s", n, out)
-	}
-	up := q10FileStatements(t, filepath.Join(mig, "002_rename.up.sql"))
-	if len(up) < 2 || up[0] != `alter table "app"."t" rename column "net" to "amount"` {
-		t.Fatalf("offline planning must not reduce an unverified comparison to the rename alone: %q", up)
+	if m, _ := filepath.Glob(filepath.Join(mig, "002_*")); len(m) != 0 {
+		t.Fatalf("a refused plan writes nothing: %v", m)
 	}
 }
 
@@ -569,11 +570,12 @@ func TestQ10GenerateLiveRenameInclude(t *testing.T) {
 
 // When the live table cannot be copied to compare it under the rename (a
 // whole-row reference in a check names the table, and the copy has another
-// name), a live run names the fix that works: rename the column by hand,
-// which lets PostgreSQL rewrite the expressions, and re-run without
-// --rename. It never says to spell the expression as the database does
-// (the database spells it with the old name) or to re-run with a live
-// normalizer (this run had one).
+// name), a live run refuses on every server version (Q11: the plan's down
+// would carry the old name) and names the fix that works: rename the
+// column by hand, which lets PostgreSQL rewrite the expressions, and
+// re-run without --rename. It never says to spell the expression as the
+// database does (the database spells it with the old name) or to re-run
+// with a live normalizer (this run had one).
 func TestQ10UnrenamedLiveRunAdvice(t *testing.T) {
 	dbURL, fx := newM02CommandDB(t, "q10advice")
 	bin := buildCLIBinary(t)
@@ -607,20 +609,13 @@ func TestQ10UnrenamedLiveRunAdvice(t *testing.T) {
 		return runCLIProcess(t, bin, dbURL, args...)
 	}
 
-	const byHand = `rename by hand first with alter table "app"."t" rename column "net" to "amount" (PostgreSQL rewrites the expressions that reference it), then re-run without the --rename flags for app.t (keep any others)`
+	const byHand = `Rename the column by hand first: alter table "app"."t" rename column "net" to "amount" (PostgreSQL rewrites the expressions that reference it), then re-run without the --rename flags for app.t (keep any others)`
 	code, out := run("db", "push", "--dry-run", "--schema", after, "--rename", "app.t.net>app.t.amount")
-	if major < 17 {
-		if code == 0 || !strings.Contains(out, `generated column "gross" could not be verified`) {
-			t.Fatalf("PostgreSQL %d: an unverified SET EXPRESSION is refused (%d):\n%s", major, code, out)
-		}
-		if !strings.Contains(out, "Rename the column by hand first: "+`alter table "app"."t" rename column "net" to "amount"`) {
-			t.Fatalf("PostgreSQL %d: the refusal must name the hand rename:\n%s", major, out)
-		}
-	} else if code != 0 {
-		t.Fatalf("PostgreSQL %d: dry run failed (%d):\n%s", major, code, out)
+	if code == 0 || !strings.Contains(out, "The plan is refused") {
+		t.Fatalf("PostgreSQL %d: a comparison that could not follow the rename is refused (%d):\n%s", major, code, out)
 	}
-	if !strings.Contains(out, "equivalence not verified for column gross generation expression") || !strings.Contains(out, "predates the rename of net to amount") || !strings.Contains(out, byHand) {
-		t.Fatalf("PostgreSQL %d: the unverified note must name the rename and the hand rename:\n%s", major, out)
+	if !strings.Contains(out, `column gross generation expression: "(amount * (2)::numeric)" (desired) vs "(net * (2)::numeric)" (live)`) || !strings.Contains(out, "predates the rename of net to amount") || !strings.Contains(out, byHand) {
+		t.Fatalf("PostgreSQL %d: the refusal must name the element, the rename and the hand rename:\n%s", major, out)
 	}
 	for _, bad := range []string{"spells it", "live normalizer"} {
 		if strings.Contains(out, bad) {

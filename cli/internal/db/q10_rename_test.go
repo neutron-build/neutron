@@ -89,41 +89,37 @@ func TestQ10RenamedLiveExpressionsDecideTheComparison(t *testing.T) {
 
 }
 
-// Without the renamed live text (offline planning, or a failed twin) the
-// comparison is unverified and says the live text predates the rename.
-func TestQ10UnrenamedComparisonIsUnverified(t *testing.T) {
+// Without the renamed live text (offline planning, or a failed twin) a
+// difference cannot be told from the rename, and its down statement would
+// name the old column before the rename is reverted: the plan is refused
+// with the fix for the mode (Q11), on every server version.
+func TestQ10UnrenamedComparisonIsRefused(t *testing.T) {
 	base := q09Doc(t)
 	desired := q09Doc(t, q10Renamed...)
 	renames := map[string]string{"app.tenants.amount": "net"}
-	const hint = "the live text predates the rename of net to amount"
+	const hint = "predates the rename of net to amount"
+	const element = `column gross generation expression: "amount * 2" (desired) vs "net * 2" (live)`
 
-	res, err := DiffV2Document(context.Background(), desired, base, DiffV2Options{Renames: renames})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if w := strings.Join(res.Warnings, "\n"); !strings.Contains(w, hint) || !strings.Contains(w, hint+" that PostgreSQL applies to it — re-run with --mode live, which compares it under the rename") || strings.Contains(w, "live normalizer") {
-		t.Fatalf("offline planning must name the rename in its unverified note and point to --mode live:\n%s", w)
+	_, err := DiffV2Document(context.Background(), desired, base, DiffV2Options{Renames: renames})
+	if err == nil || !strings.Contains(err.Error(), hint) || !strings.Contains(err.Error(), element) ||
+		!strings.Contains(err.Error(), "Plan it as two migrations instead") || strings.Contains(err.Error(), "live normalizer") {
+		t.Fatalf("offline planning must refuse, name the rename and the offline fix: %v", err)
 	}
 
 	// A live run whose rename twin failed already had a normalizer, and the
 	// database spells the expression with the old name: the advice is the
 	// hand rename, never "write it as the database spells it" or "re-run
 	// with a live normalizer".
-	const byHand = `rename by hand first with alter table "app"."tenants" rename column "net" to "amount" (PostgreSQL rewrites the expressions that reference it), then re-run without the --rename flags for app.tenants (keep any others)`
-	_, err = DiffV2Document(context.Background(), desired, base, DiffV2Options{Renames: renames, Normalizer: q10RenameNormalizer{fail: true}, ServerMajor: 16})
-	if err == nil || !strings.Contains(err.Error(), `generated column "gross" could not be verified`) || !strings.Contains(err.Error(), hint) {
-		t.Fatalf("a failed rename twin leaves the comparison unverified: %v", err)
-	}
-	if msg := err.Error(); !strings.Contains(msg, `The text the database holds predates the rename of net to amount, and it could not be compared under the rename. Rename the column by hand first: alter table "app"."tenants" rename column "net" to "amount" (PostgreSQL rewrites the expressions that reference it), then re-run without the --rename flags for app.tenants (keep any others)`) ||
-		!strings.Contains(msg, byHand) || strings.Contains(msg, "spells it") || strings.Contains(msg, "live normalizer") {
-		t.Fatalf("a live refusal must name the hand rename:\n%s", msg)
-	}
-	res, err = DiffV2Document(context.Background(), desired, base, DiffV2Options{Renames: renames, Normalizer: q10RenameNormalizer{fail: true}, ServerMajor: 17})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if w := strings.Join(res.Warnings, "\n"); !strings.Contains(w, byHand) || strings.Contains(w, "live normalizer") {
-		t.Fatalf("a live run's unverified note must name the hand rename:\n%s", w)
+	const byHand = `Rename the column by hand first: alter table "app"."tenants" rename column "net" to "amount" (PostgreSQL rewrites the expressions that reference it), then re-run without the --rename flags for app.tenants (keep any others)`
+	for _, major := range []int{16, 17} {
+		_, err = DiffV2Document(context.Background(), desired, base, DiffV2Options{Renames: renames, Normalizer: q10RenameNormalizer{fail: true}, ServerMajor: major})
+		if err == nil {
+			t.Fatalf("PostgreSQL %d: a failed rename twin must refuse the plan", major)
+		}
+		if msg := err.Error(); !strings.Contains(msg, hint) || !strings.Contains(msg, element) || !strings.Contains(msg, byHand) ||
+			strings.Contains(msg, "spells it") || strings.Contains(msg, "live normalizer") {
+			t.Fatalf("PostgreSQL %d: a live refusal must name the hand rename:\n%s", major, msg)
+		}
 	}
 }
 
