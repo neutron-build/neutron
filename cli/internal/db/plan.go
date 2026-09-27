@@ -508,10 +508,14 @@ func BuildPlanArtifact(version, name, baseSource, baseSHA string, target *V2Docu
 		return nil, fmt.Errorf("diff produced %d up statements but %d down statements — refusing to pair them; this is a planner defect", len(res.Up), len(res.Down))
 	}
 	// The plan names the migration as its files do (the slug), or apply's
-	// name check refuses a name typed with spaces or capitals.
-	name, err := migrationNameSlug(name)
-	if err != nil {
-		return nil, err
+	// name check refuses a name typed with spaces or capitals. Previews
+	// (Studio's designer) carry no name.
+	if name != "" {
+		slug, err := migrationNameSlug(name)
+		if err != nil {
+			return nil, err
+		}
+		name = slug
 	}
 	plan := &PlanArtifact{
 		FormatVersion:    PlanFormatVersion,
