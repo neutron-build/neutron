@@ -4,9 +4,9 @@ Drizzle-shaped TypeScript SQL ORM for Postgres. Schema in code, no codegen,
 one readable SQL statement per query, `toSQL()` on everything. Zero runtime
 dependencies — bring `postgres` or `pg` (or both) as optional peers.
 
-**Alpha — contained, not production-ready.** Verified on PostgreSQL 17 and
-18 with both drivers; PostgreSQL 16 is not claimed, and neither are Nucleus
-or other Postgres-wire engines. See the [support matrix](#support-matrix)
+**Alpha — contained, not production-ready.** Verified on PostgreSQL 16, 17
+and 18 with both drivers (changing a generated column's expression needs 17+);
+Nucleus and other Postgres-wire engines are not claimed. See the [support matrix](#support-matrix)
 and, when coming from an earlier build, [Upgrading](#upgrading-from-earlier-builds).
 
 ## Quick start
@@ -1406,7 +1406,7 @@ drivers; nothing outside this table is claimed.
 
 | Component | Verified | Not claimed |
 |---|---|---|
-| PostgreSQL | 17 and 18. Pull requests run the live suites on 17 (`typescript.yml`, `cli.yml`); the release matrix (`orm-matrix.yml`, run 36271280328 on `1fce3fe4`) passed this package's suite (887/887) and the CLI suite on 17.11 and 18.6 (`pgvector/pgvector` images) | 16: this package's suite passes on 16.15, but the CLI plans a generated-column expression change as `ALTER COLUMN … SET EXPRESSION`, which PostgreSQL 16 does not have (`TestQ07RoundTripModifications` fails). Majors before 16 are untested |
+| PostgreSQL | 16, 17 and 18. Pull requests run the live suites on 17 (`typescript.yml`, `cli.yml`); the release matrix (`orm-matrix.yml`, run 36293875713 on `273ac365`) passed this package's suite (887/887) and the CLI suite on 16.15, 17.11 and 18.6 (`pgvector/pgvector` images). On 16, a generated-column expression change is refused before anything runs, because `ALTER COLUMN … SET EXPRESSION` is PostgreSQL 17+ | Majors before 16 are untested |
 | Node.js | `engines: ">=22"`; CI runs 22 and 24; the installed-artifact gate ran on 22.19, 22.23 and 24.20 | 22.0–22.18; Node 20 and older |
 | Drivers | `pg` 8.22.0 and `postgres` 3.4.8, the versions the suites resolve (peer ranges `^8.11.0` / `^3.4.7`) | other versions inside the peer ranges |
 | TypeScript | 5.7.2 (minimum) and 5.9.3, declarations checked with `skipLibCheck` off | |
@@ -1520,8 +1520,8 @@ Alpha — contained, not production-ready. Known-unsafe paths found in review
 were fixed or converted into explicit rejections; nothing here certifies
 general-purpose use.
 
-- Verified on PostgreSQL 17 and 18, both drivers; 16 and non-Postgres
-  engines are not claimed ([Support matrix](#support-matrix)).
+- Verified on PostgreSQL 16, 17 and 18, both drivers (generated-column
+  expression changes need 17+); non-Postgres engines are not claimed ([Support matrix](#support-matrix)).
 - Implemented and live-tested: typed CRUD (`select`/`insert`/`update`/
   `delete`, `returning`), batch inserts independent of key order, joins and
   aliases (inner/left/right/full/cross with typed outer-join nullability,
