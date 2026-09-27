@@ -1,9 +1,9 @@
 ---
 title: Schema Designer
-description: Visual table editor with code generation and migration export.
+description: Visual table editor with code generation and reviewable migration plans.
 ---
 
-The Schema Designer lets you create and modify database tables visually, generate model code, and export migration files.
+The Schema Designer lets you create and modify database tables visually, generate model code, and review every planned change before it runs.
 
 ## Browsing Tables
 
@@ -18,7 +18,7 @@ The left sidebar shows all tables in the database. Click a table to view its col
    - **Nullable** — Allow NULL values
    - **Primary Key** — Mark as primary key
    - **Default** — Default value expression
-3. Click **Save** to execute the CREATE TABLE statement
+3. Click **Plan Create Table**, then review and apply the plan ([Plan Review](#plan-review))
 
 ## Editing Tables
 
@@ -48,17 +48,14 @@ Generate model boilerplate from your schema in four languages:
 
 Switch between language tabs instantly. Copy to clipboard with one click.
 
-## Migration Export
+## Plan Review
 
-Export pending schema changes as a SQL migration file:
+The designer does not run DDL directly. **Plan Create Table**, **Plan Changes**, **+ Plan Index** and **Plan Drop Table** send the edits to the CLI's own planner (the one `neutron db push` uses) and open a review of the planned statements, their risk (destructive, data loss, reversibility), the down statements, and the equivalent `neutron db push --dry-run` command. From the review:
 
-1. Make changes in the designer
-2. Click **Export Migration**
-3. Downloads a timestamped `.sql` file (e.g., `20260308T143000_users.sql`)
-4. File contains the appropriate ALTER TABLE or CREATE TABLE statements
-
-Use with `neutron migrate` to apply migrations consistently across environments.
+- **Apply plan** runs the statements in one transaction. A plan that drops objects or can lose data needs the acknowledgement checkbox first. If the live schema changed since the review so that the statements differ, nothing is applied and the fresh plan is shown for review. A database with migration history (`_neutron_migrations`) refuses apply, as `neutron db push` does.
+- **Download target document** saves `target.schema.json`, the schema document with the edits applied. On a migration-managed database, generate a migration from it with `neutron migrate generate --schema target.schema.json --name <name>` (add `--mode snapshot` after a `neutron schema baseline`), review it, then run `neutron migrate`.
+- **Download SQL** saves `plan-<id>.sql` for review: the up statements wrapped in one transaction, with the down statements as comments. It is not a migration file: `neutron migrate` reads only `{version}_{name}.up.sql` files.
 
 ## Dropping Tables
 
-Select a table and click **Drop Table**. A confirmation dialog prevents accidental deletion.
+Select a table and click **Plan Drop Table**. The plan review marks the drop as destructive, and **Apply plan** stays disabled until you tick the acknowledgement.
