@@ -368,10 +368,10 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				var partial *db.NontransactionalPartialError
 				if errors.As(err, &partial) {
-					spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Failed %s_%s: %v", p.File.Version, p.File.Name, err))
-					return fmt.Errorf(
+					interrupted := fmt.Errorf(
 						"interrupted after %d of %d pending migration(s) (%s_%s failed MID-FILE outside any transaction; its earlier statements' effects REMAIN — no rollback is pretended):\n%v\ninspect and recover explicitly: `neutron migrate resolve %s`",
 						count, len(pendings), p.File.Version, p.File.Name, err, p.File.Version)
+					return failSpinner(spinner, interrupted.Error(), interrupted)
 				}
 				return failSpinner(spinner, fmt.Sprintf("Failed %s_%s: %v", p.File.Version, p.File.Name, err), err)
 			}
@@ -382,11 +382,12 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 
 		spinner := ui.NewSpinner(fmt.Sprintf("Applying %s_%s...", p.File.Version, p.File.Name))
 		if err := sess.ApplyMigration(ctx, p.File); err != nil {
-			spinner.StopWithMessage(ui.CrossMark, fmt.Sprintf("Failed %s_%s: %v", p.File.Version, p.File.Name, err))
 			// Name the interruption boundary: a partial batch is a
-			// different operational state than an untouched one.
-			return fmt.Errorf("interrupted after %d of %d pending migration(s) (failed at %s_%s): %w",
+			// different operational state than an untouched one. The
+			// spinner line is the one report of the failure.
+			interrupted := fmt.Errorf("interrupted after %d of %d pending migration(s) (failed at %s_%s): %w",
 				count, len(pendings), p.File.Version, p.File.Name, err)
+			return failSpinner(spinner, interrupted.Error(), interrupted)
 		}
 		spinner.StopWithMessage(ui.CheckMark, fmt.Sprintf("Applied %s_%s", p.File.Version, p.File.Name))
 		count++

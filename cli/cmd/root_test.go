@@ -146,6 +146,25 @@ func TestCommandErrorsArePrintedOnce(t *testing.T) {
 		if code != 1 || strings.Count(out, "division by zero") != 1 {
 			t.Fatalf("seed with a failing statement: exit %d, want 1 and one report in:\n%s", code, out)
 		}
+
+		// A failing migration reports its interruption boundary and cause
+		// once (Q09 review-1: the long 55P04 fix-naming error printed twice).
+		dbURL, _ := newM02CommandDB(t, "printonce")
+		mig := filepath.Join(home, "mig")
+		if err := os.Mkdir(mig, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(mig, "001_init.up.sql"), "create type printonce_mood as enum ('sad', 'ok');\ncreate table printonce_t (tone printonce_mood);")
+		writeFile(t, filepath.Join(mig, "002_mood.up.sql"), "alter type printonce_mood add value 'glad';\ncreate view printonce_glad as select tone from printonce_t where tone = 'glad';")
+		code, out = run("migrate", "--url", dbURL, "--dir", mig)
+		if code != 1 || !strings.Contains(out, "55P04") {
+			t.Fatalf("migrate with a failing migration: exit %d, want 1 and the 55P04 report in:\n%s", code, out)
+		}
+		for _, once := range []string{"interrupted after 1 of 2 pending migration(s)", "delete this unapplied migration"} {
+			if strings.Count(out, once) != 1 {
+				t.Fatalf("migrate printed %q %d times, want once:\n%s", once, strings.Count(out, once), out)
+			}
+		}
 	}
 
 	// Application errors report themselves ("Application: ...") once.
@@ -162,10 +181,9 @@ func TestCommandErrorsArePrintedOnce(t *testing.T) {
 
 // A spinner failure line is the error's report: every such site must return
 // through failSpinner (marked reported) or the Execute fallback prints the
-// error a second time. migrate.go's two sites return a different, richer
-// interruption error that must still print.
+// error a second time.
 func TestSpinnerFailuresGoThroughFailSpinner(t *testing.T) {
-	allowed := map[string]int{"root.go": 1, "migrate.go": 2}
+	allowed := map[string]int{"root.go": 1}
 	files, err := filepath.Glob("*.go")
 	if err != nil {
 		t.Fatal(err)
