@@ -82,13 +82,21 @@ func (n *TwinNormalizer) nextName() string {
 // deparse, and the original text for the rest (Failed). The typical cause
 // is an element that uses an enum value this plan adds (the live type does
 // not have it yet), which must not leave the table's unrelated expressions
-// compared as raw text. Comparisons on such a table stay flagged
-// unverified.
+// compared as raw text. Comparisons of the Failed elements stay flagged
+// unverified; the table's other elements are catalog-normalized.
 type PartialNormalizationError struct {
 	Table  V2Table
-	Failed []string
+	Failed []string // element keys (v2DefaultElement and friends)
 	Err    error
 }
+
+// Element keys name one expression element of a table, in
+// PartialNormalizationError.Failed and in the diff's per-element
+// verification.
+func v2DefaultElement(column string) string   { return "column " + column + " default" }
+func v2GeneratedElement(column string) string { return "column " + column + " generation expression" }
+func v2CheckElement(constraint string) string { return "check " + constraint }
+func v2IndexElement(index string) string      { return "index " + index }
 
 func (e *PartialNormalizationError) Error() string {
 	return fmt.Sprintf("%v (normalized element by element; not normalized: %s)", e.Err, strings.Join(e.Failed, ", "))
@@ -165,7 +173,7 @@ func (n *TwinNormalizer) normalizeTableElements(ctx context.Context, table V2Tab
 				}
 			}
 			if !normalized {
-				failed = append(failed, "column "+c.Name+" default")
+				failed = append(failed, v2DefaultElement(c.Name))
 			}
 		}
 		if c.Generated != nil {
@@ -180,7 +188,7 @@ func (n *TwinNormalizer) normalizeTableElements(ctx context.Context, table V2Tab
 				}
 			}
 			if !normalized {
-				failed = append(failed, "column "+c.Name+" generation expression")
+				failed = append(failed, v2GeneratedElement(c.Name))
 			}
 		}
 	}
@@ -193,7 +201,7 @@ func (n *TwinNormalizer) normalizeTableElements(ctx context.Context, table V2Tab
 		if got, err := n.normalizeTableTwin(ctx, one); err == nil {
 			out.Constraints[i].Expression = got.Constraints[0].Expression
 		} else {
-			failed = append(failed, "check "+con.Name)
+			failed = append(failed, v2CheckElement(con.Name))
 		}
 	}
 	for i, idx := range table.Indexes {
@@ -203,7 +211,7 @@ func (n *TwinNormalizer) normalizeTableElements(ctx context.Context, table V2Tab
 			out.Indexes[i].Key = got.Indexes[0].Key
 			out.Indexes[i].Where = got.Indexes[0].Where
 		} else {
-			failed = append(failed, "index "+idx.Identity.Name)
+			failed = append(failed, v2IndexElement(idx.Identity.Name))
 		}
 	}
 	if len(failed) == 0 {

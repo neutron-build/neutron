@@ -102,6 +102,7 @@ func DiffV2Document(ctx context.Context, desired, actual *V2Document, opts DiffV
 		normalizedTables: map[V2Identity]*V2Table{},
 		normalizedViews:  map[V2Identity]*V2View{},
 		twinFailedTables: map[V2Identity]bool{},
+		twinFailedElems:  map[V2Identity]map[string]bool{},
 		twinFailedViews:  map[V2Identity]bool{},
 	}
 
@@ -169,6 +170,7 @@ type v2Planner struct {
 	normalizedTables map[V2Identity]*V2Table
 	normalizedViews  map[V2Identity]*V2View
 	twinFailedTables map[V2Identity]bool
+	twinFailedElems  map[V2Identity]map[string]bool
 	twinFailedViews  map[V2Identity]bool
 	unverified       []string
 }
@@ -256,10 +258,14 @@ func (p *v2Planner) desiredTable(id V2Identity) *V2Table {
 		case err == nil:
 			normalized = &n
 		case errors.As(err, &partial):
-			// Elements normalized one by one; textual differences on
-			// this table stay flagged unverified.
+			// Elements normalized one by one; textual differences of
+			// the elements that failed stay flagged unverified.
 			normalized = &partial.Table
-			p.twinFailedTables[id] = true
+			failed := make(map[string]bool, len(partial.Failed))
+			for _, e := range partial.Failed {
+				failed[e] = true
+			}
+			p.twinFailedElems[id] = failed
 		default:
 			p.twinFailedTables[id] = true
 		}
@@ -952,11 +958,11 @@ func (p *v2Planner) planColumnAttributes(table V2Identity, dc, ac V2Column) erro
 			fmt.Sprintf("-- column %s: no down statement — PostgreSQL cannot attach a generation expression to an existing column (was: generated always as (%s) stored)", cq, ac.Generated.Expression),
 		)
 	case dc.Generated != nil && ac.Generated != nil:
-		if !p.textEqual(table, "column "+dc.Name+" generation expression", &dc.Generated.Expression, &ac.Generated.Expression) {
+		if !p.textEqual(table, v2GeneratedElement(dc.Name), "column "+dc.Name+" generation expression", &dc.Generated.Expression, &ac.Generated.Expression) {
 			if p.opts.ServerMajor > 0 && p.opts.ServerMajor < SetExpressionMinServerMajor {
-				if !p.comparisonVerified(table) {
-					// No catalog oracle for this table: the difference may
-					// be spelling only. Say so, and carry the unverified
+				if !p.comparisonVerified(table, v2GeneratedElement(dc.Name)) {
+					// No catalog oracle for this expression: the difference
+					// may be spelling only. Say so, and carry the unverified
 					// notes the refusal would otherwise drop.
 					return fmt.Errorf(
 						"table %s: generated column %q could not be verified: the schema writes its expression %q and %s holds %q, and without a catalog comparison the difference may be spelling only. A real change needs ALTER COLUMN ... SET EXPRESSION (PostgreSQL %d+), which the connected PostgreSQL %d cannot run, so the plan is refused. If the expression is unchanged, write it as %s spells it; if it changed, upgrade the server to PostgreSQL %d+, or replace the column explicitly in two steps: remove it from the schema and apply with --allow-destructive (its stored values are dropped), then add it back with the new expression (values are recomputed; a re-added column is placed last, so declare it last)\n%s",
@@ -1250,7 +1256,7 @@ func (p *v2Planner) constraintsEqual(table V2Identity, a, b V2Constraint) bool {
 	if !equalStringSlices(a.Columns, b.Columns) {
 		return false
 	}
-	if !p.textEqual(table, "check constraint "+a.Name+" expression", a.Expression, b.Expression) {
+	if !p.textEqual(table, v2CheckElement(a.Name), "check constraint "+a.Name+" expression", a.Expression, b.Expression) {
 		return false
 	}
 	if (a.References == nil) != (b.References == nil) {
@@ -1342,10 +1348,11 @@ func (p *v2Planner) planIndexChanges(table V2Identity, desired, actual *V2Table)
 	return nil
 }
 
-// comparisonVerified reports whether expression comparisons for this table
-// had a catalog oracle (live twin normalizer that succeeded).
-func (p *v2Planner) comparisonVerified(table V2Identity) bool {
-	return p.opts.Normalizer != nil && !p.twinFailedTables[table]
+// comparisonVerified reports whether the comparison of one expression
+// element (v2DefaultElement and friends) of this table had a catalog oracle:
+// a live twin normalizer that normalized that element.
+func (p *v2Planner) comparisonVerified(table V2Identity, element string) bool {
+	return p.opts.Normalizer != nil && !p.twinFailedTables[table] && !p.twinFailedElems[table][element]
 }
 
 // indexEqualAfterRenames compares index metadata with the live column
@@ -1374,12 +1381,12 @@ func (p *v2Planner) indexEqualAfterRenames(table V2Identity, di, ai V2Index) boo
 				}
 				continue
 			}
-			if !p.textEqual(table, "index "+di.Identity.String()+" key part", di.Key[i].Expression, ai.Key[i].Expression) {
+			if !p.textEqual(table, v2IndexElement(di.Identity.Name), "index "+di.Identity.String()+" key part", di.Key[i].Expression, ai.Key[i].Expression) {
 				equal = false
 			}
 		}
 	}
-	if !p.textEqual(table, "index "+di.Identity.String()+" predicate", di.Where, ai.Where) {
+	if !p.textEqual(table, v2IndexElement(di.Identity.Name), "index "+di.Identity.String()+" predicate", di.Where, ai.Where) {
 		equal = false
 	}
 	return equal
@@ -1406,14 +1413,14 @@ func sameKeyPartOrdering(a, b V2IndexKeyPart) bool {
 	return ad == bd && an == bn
 }
 
-func (p *v2Planner) textEqual(table V2Identity, what string, desired, actual *string) bool {
+func (p *v2Planner) textEqual(table V2Identity, element, what string, desired, actual *string) bool {
 	if desired == nil || actual == nil {
 		return desired == nil && actual == nil
 	}
 	if *desired == *actual {
 		return true
 	}
-	if !p.comparisonVerified(table) {
+	if !p.comparisonVerified(table, element) {
 		p.unverified = append(p.unverified, fmt.Sprintf("%s: %q (desired) vs %q (live) — compared textually without a catalog oracle", what, *desired, *actual))
 	}
 	return false
@@ -1431,7 +1438,7 @@ func (p *v2Planner) defaultsEqual(table V2Identity, column string, d, a *V2Colum
 		return false
 	}
 	if d.Kind == "literal" || d.Kind == "expression" {
-		return p.textEqual(table, "column "+table.String()+"."+column+" default", d.SQL, a.SQL)
+		return p.textEqual(table, v2DefaultElement(column), "column "+table.String()+"."+column+" default", d.SQL, a.SQL)
 	}
 	return d.SameAs(*a)
 }
