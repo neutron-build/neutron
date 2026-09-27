@@ -413,6 +413,8 @@ published CLI targets) and onboarding on Linux.
   IDs are unknown and a retry on them is refused until the table is
   checked. An import is atomic per batch, not per file.
 - **Open items** (each fails safely; tracked, not fixed):
+  - A rename whose new name contains a dot is mis-mapped: its down statement
+    fails and the review's `--rename` flag is wrong. Avoid dots in names.
   - Tables with `DO INSTEAD` or `DO ALSO` rules refuse every edit with HTTP
     502. Nothing is applied; the status should be a 4xx.
   - On a table whose `AFTER` trigger updates the row it fired for, two edits
