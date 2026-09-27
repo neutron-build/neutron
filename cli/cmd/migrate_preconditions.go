@@ -371,6 +371,45 @@ func verifyServerVersion(ctx context.Context, client *db.Client, pendings []pend
 }
 
 func checkServerVersion(major int, pendings []pendingMigration) error {
+	lines := serverVersionShortfalls(major, pendings)
+	if len(lines) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"pending migration(s) need a newer server than the connected PostgreSQL %d; refusing before any statement runs:\n%s\nupgrade the server, or replace the migration: a generated column's expression change on older servers is a drop of the column followed by an add with the new expression (regenerate with the column removed, then re-added last)",
+		major, strings.Join(lines, "\n"))
+}
+
+// verifyDownServerVersion is verifyServerVersion for `migrate resolve
+// --abort`: the statements that would run are the down SQL's.
+func verifyDownServerVersion(ctx context.Context, client *db.Client, p pendingMigration) error {
+	major, err := client.ServerMajorVersion(ctx)
+	if err != nil {
+		return fmt.Errorf("verify server version precondition: %w", err)
+	}
+	if major == 0 {
+		return nil
+	}
+	return checkDownServerVersion(major, p)
+}
+
+func checkDownServerVersion(major int, p pendingMigration) error {
+	if p.DownFile == nil {
+		return nil
+	}
+	down := pendingMigration{File: p.File, Statements: db.SplitSQLStatements(p.DownFile.SQL)}
+	lines := serverVersionShortfalls(major, []pendingMigration{down})
+	if len(lines) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"cannot abort %s: its down SQL needs a newer server than the connected PostgreSQL %d; refusing before any statement runs:\n%s\nupgrade the server, or remove the partial effects by hand",
+		p.File.Version, major, strings.Join(lines, "\n"))
+}
+
+// serverVersionShortfalls lists, per migration, the statements (or the
+// plan's recorded floor) that need a newer server than major.
+func serverVersionShortfalls(major int, pendings []pendingMigration) []string {
 	var lines []string
 	for _, p := range pendings {
 		stem := p.File.Version + "_" + p.File.Name
@@ -388,12 +427,7 @@ func checkServerVersion(major int, pendings []pendingMigration) error {
 			lines = append(lines, fmt.Sprintf("  %s: its plan report records minServerMajor %d (needs PostgreSQL %d+)", stem, p.Plan.MinServerMajor, p.Plan.MinServerMajor))
 		}
 	}
-	if len(lines) == 0 {
-		return nil
-	}
-	return fmt.Errorf(
-		"pending migration(s) need a newer server than the connected PostgreSQL %d; refusing before any statement runs:\n%s\nupgrade the server, or replace the migration: a generated column's expression change on older servers is a drop of the column followed by an add with the new expression (regenerate with the column removed, then re-added last)",
-		major, strings.Join(lines, "\n"))
+	return lines
 }
 
 // verifyDocumentExtensionCapabilities is the db-push variant of the X01
