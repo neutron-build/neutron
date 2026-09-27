@@ -76,6 +76,46 @@ func m08Desired(t *testing.T, pulled, out string, add ...string) {
 	writeFile(t, out, string(raw))
 }
 
+// m08ColumnsAs writes the pulled document with table u's columns in the
+// given order: existing columns by name, any other name as a new integer
+// column.
+func m08ColumnsAs(t *testing.T, pulled, out string, order ...string) {
+	t.Helper()
+	doc, err := db.ParseV2Document(mustReadFile(t, pulled))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := db.ModelFromRoot(doc.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range m.Tables {
+		if m.Tables[i].Identity.Name != "u" {
+			continue
+		}
+		var cols []db.V2Column
+		for _, name := range order {
+			if c := m.Tables[i].Column(name); c != nil {
+				cols = append(cols, *c)
+			} else {
+				cols = append(cols, db.V2Column{Name: name, Type: db.V2ColumnType{Name: "int4", Codec: "number"}})
+			}
+		}
+		m.Tables[i].Columns = cols
+	}
+	root, err := db.RootFromModel(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, out, string(raw))
+}
+
+const m08UColumns = `SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'u'`
+
 // m08PreM08Migration writes a snapshot migration exactly as CLIs before M08
 // did: planned from the chain head, target snapshot = the desired document.
 func m08PreM08Migration(t *testing.T, mig, version, name, desiredPath string) {
@@ -302,6 +342,60 @@ func TestM08LeftInPlaceSnapshotChain(t *testing.T) {
 		}
 		dropAndCheck(t, dbURL, fx, work, mig, "003")
 	})
+
+	// P1: the schema declares a new column between existing ones.
+	// PostgreSQL appends it; the snapshot records the database order, and
+	// the next plan compares columns by name. writeFirst writes 001 the
+	// pre-M08 way (declared order recorded) instead of through the CLI.
+	midTable := func(t *testing.T, label string, writeFirst bool) {
+		dbURL, fx := newM02CommandDB(t, label)
+		if err := fx.Exec(context.Background(), `CREATE TABLE u (id serial PRIMARY KEY, a text, b text); INSERT INTO u (a, b) VALUES ('a1', 'b1')`); err != nil {
+			t.Fatal(err)
+		}
+		work := t.TempDir()
+		mig := filepath.Join(work, "migrations")
+		pulled := filepath.Join(work, "pulled.json")
+		d1, d2 := filepath.Join(work, "d1.json"), filepath.Join(work, "d2.json")
+		must(t, dbURL, "schema", "baseline", "--dir", mig)
+		must(t, dbURL, "schema", "pull", "--out", pulled)
+		m08ColumnsAs(t, pulled, d1, "id", "a", "mid", "b")
+		m08ColumnsAs(t, pulled, d2, "id", "mid2", "a", "mid", "b")
+
+		out := ""
+		if writeFirst {
+			m08PreM08Migration(t, mig, "001", "add_mid", d1)
+		} else {
+			out = must(t, unreachable, "migrate", "generate", "--mode", "snapshot", "--dir", mig, "--schema", d1, "--name", "add_mid")
+		}
+		must(t, dbURL, "migrate", "--dir", mig)
+		if got := q09Query(t, fx, m08UColumns); got != "id,a,b,mid" {
+			t.Fatalf("u columns %s", got)
+		}
+		must(t, dbURL, "schema", "check", "--live", "--dir", mig)
+		if !writeFirst && !strings.Contains(out, "the database holds them as (id, a, b, mid)") {
+			t.Fatalf("generate must note the database order:\n%s", out)
+		}
+		must(t, dbURL, "schema", "check", "--dir", mig, "--schema", d1)
+
+		must(t, unreachable, "migrate", "generate", "--mode", "snapshot", "--dir", mig, "--schema", d2, "--name", "add_mid2")
+		if up := string(mustReadFile(t, filepath.Join(mig, "002_add_mid2.up.sql"))); !strings.Contains(up, `add column "mid2"`) || strings.Count(up, ";") != 1 {
+			t.Fatalf("the next plan adds mid2 only:\n%s", up)
+		}
+		must(t, dbURL, "migrate", "--dir", mig)
+		must(t, dbURL, "schema", "check", "--live", "--dir", mig)
+		must(t, dbURL, "schema", "check", "--dir", mig, "--schema", d2)
+		if out := must(t, unreachable, "migrate", "generate", "--mode", "snapshot", "--dir", mig, "--schema", d2); !strings.Contains(out, "No schema changes detected") {
+			t.Fatalf("an order difference alone plans nothing:\n%s", out)
+		}
+		if got := q09Query(t, fx, m08UColumns); got != "id,a,b,mid,mid2" {
+			t.Fatalf("u columns %s", got)
+		}
+		if got := q09Query(t, fx, `SELECT a || b FROM u`); got != "a1b1" {
+			t.Fatalf("u rows %s", got)
+		}
+	}
+	t.Run("ColumnAddedMidTable", func(t *testing.T) { midTable(t, "m08mid", false) })
+	t.Run("ColumnAddedMidTableEarlierCLI", func(t *testing.T) { midTable(t, "m08midold", true) })
 
 	// An earlier CLI drifted the chain and the user then dropped the column
 	// by hand to get past the drift gate. The upgraded CLI reads the column

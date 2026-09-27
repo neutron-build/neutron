@@ -90,6 +90,8 @@ snapshot — a non-empty diff means pending schema changes, reported and exit 1.
 Objects a migration left in place because the document no longer declares them
 are recorded in the chain, so their drops stay listed as pending until a plan
 with --allow-destructive drops them or the document declares them again.
+Columns compare by name: the chain records the order the database holds, and a
+document that declares another order is noted, not a pending change.
 
 With --live: introspects the database and compares it against the snapshot of the
 newest APPLIED migration (or the baseline). Any managed-scope difference is drift:
@@ -235,7 +237,8 @@ func reportBaselineInternal(chain *db.SnapshotChain) {
 }
 
 // reportChainRetained notes migration snapshots an earlier CLI wrote without
-// the objects their migration left in place; the chain loader reads them in.
+// the objects their migration left in place, or with columns in declared
+// order; the chain loader reads them as the database holds them.
 func reportChainRetained(chain *db.SnapshotChain) {
 	if chain == nil {
 		return
@@ -246,7 +249,7 @@ func reportChainRetained(chain *db.SnapshotChain) {
 			stems[i] = r.Stem
 		}
 		last := chain.Retained[n-1]
-		ui.Infof("snapshot(s) %s, written by an earlier CLI, omit what their migrations left in place (%s: %s): read as still in place — the files are unchanged", strings.Join(stems, ", "), last.Stem, db.RetainedList(last.Objects))
+		ui.Infof("snapshot(s) %s, written by an earlier CLI, do not record the database state their migrations produced (%s: %s): read as the database holds it — the files are unchanged", strings.Join(stems, ", "), last.Stem, last.Describe())
 	}
 	for _, e := range chain.RetainedErrors {
 		ui.Warnf("%s", e)
@@ -309,7 +312,14 @@ func runSchemaCheck(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		result, err := db.DiffV2Document(cmd.Context(), loaded.V2, base, db.DiffV2Options{
+		desired, orderNotes, err := db.AlignColumnOrder(loaded.V2, base, nil)
+		if err != nil {
+			return err
+		}
+		for _, n := range orderNotes {
+			ui.Infof("%s", n)
+		}
+		result, err := db.DiffV2Document(cmd.Context(), desired, base, db.DiffV2Options{
 			AllowDestructive: true, // surface drops as pending changes; nothing is executed
 			SnapshotBase:     true, // the comparison base is a chain snapshot, not a live catalog
 		})
