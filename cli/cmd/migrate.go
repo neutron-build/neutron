@@ -157,11 +157,12 @@ Adoption matches existing history rows to the supplied files by exact text ID
 textually distinct IDs are a reconciliation error). Rows whose recorded
 content can be proven — a legacy Go SDK checksum that reproduces from the
 supplied file — are adopted as verified. Rows with no recorded checksum, or
-with no file of the same ID, are adopted as UNVERIFIED: the checksum stays
-empty and the row is reported. A recorded checksum that matches neither the
-file's legacy nor its v2 digest refuses the whole adoption and changes
-nothing: restore the applied SQL or reconcile the row by hand. Nothing is
-ever silently baselined.`,
+with no file of the same ID, are adopted as UNVERIFIED: the checksum is set
+to NULL (a recorded checksum with no file of the same ID is cleared) and the
+row is reported. A recorded checksum that matches neither the file's legacy
+nor its v2 digest refuses the whole adoption and changes nothing: restore
+the applied SQL or reconcile the row by hand. Nothing is ever silently
+baselined.`,
 	RunE: func(cmd *cobra.Command, args []string) error { return reportRunE(runMigrateAdopt(cmd, args)) },
 }
 
@@ -445,7 +446,7 @@ func runMigrateAdopt(cmd *cobra.Command, args []string) error {
 		ui.Successf("adopted %s: verified (recorded checksum reproduced from the supplied file)", v)
 	}
 	for _, v := range res.Unverified {
-		ui.Warnf("adopted %s: UNVERIFIED — no proof of what was applied (checksum left empty)", v)
+		ui.Warnf("adopted %s: UNVERIFIED — no proof of what was applied (checksum set to NULL)", v)
 	}
 	ui.Successf("Adoption complete: %d verified, %d unverified", len(res.Verified), len(res.Unverified))
 	return nil
