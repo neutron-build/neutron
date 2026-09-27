@@ -400,8 +400,9 @@ func (n *TwinNormalizer) normalizeTableTwin(ctx context.Context, table V2Table) 
 	}
 
 	// Expression text can declare columns of its own (a check that closes
-	// its parenthesis early); a twin with any column the document does not
-	// declare would resolve references against it.
+	// its parenthesis early, or a comment that swallows a declaration); a
+	// twin whose columns are not exactly the document's would resolve
+	// references against them.
 	if len(twin.Columns) != len(table.Columns) {
 		return table, fmt.Errorf("twin table %s has %d columns, the document declares %d", table.Identity, len(twin.Columns), len(table.Columns))
 	}
@@ -414,6 +415,9 @@ func (n *TwinNormalizer) normalizeTableTwin(ctx context.Context, table V2Table) 
 		tc, ok := byName[out.Columns[i].Name]
 		if !ok {
 			return table, fmt.Errorf("twin table %s lacks column %q", table.Identity, out.Columns[i].Name)
+		}
+		if !tc.Type.SameAs(out.Columns[i].Type) {
+			return table, fmt.Errorf("twin table %s declares column %q with another type", table.Identity, out.Columns[i].Name)
 		}
 		if out.Columns[i].Default != nil && (out.Columns[i].Default.Kind == "literal" || out.Columns[i].Default.Kind == "expression") {
 			if tc.Default != nil && tc.Default.Kind == out.Columns[i].Default.Kind {

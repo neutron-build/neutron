@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1052,22 +1053,26 @@ func TestQ09TwinFallbackNormalizesTogether(t *testing.T) {
 	assertNormalized(got, "c03")
 }
 
-// TestQ09TwinRunsOnlyTheDocumentsTable pins review-3 finding 1 live. Twin
-// DDL embeds the document's expression text: a check that closes its
-// parenthesis early must not give the twin a column the document does not
+// TestQ09TwinRunsOnlyTheDocumentsTable pins review-3 finding 1 and review-4
+// live. Twin DDL embeds the document's expression text: a check that closes
+// its parenthesis early, or a default that opens a comment over a later
+// declaration, must not give the twin a column the document does not
 // declare, which would let another element resolve against it and pass as
 // normalized. Nor may planning run a statement appended to an expression;
-// the validator refuses a separator, so that case sets the text directly.
+// the validator refuses a separator in a check, so that case sets the text
+// directly, and view definitions admit one.
 func TestQ09TwinRunsOnlyTheDocumentsTable(t *testing.T) {
 	h := newM02Harness(t, "twinonly")
-	normalize := func(checks string, override string) []string {
+	h.exec(`CREATE TYPE public.sz AS ENUM ('s', 'm')`)
+	normalize := func(columns, checks string, override string) []string {
 		t.Helper()
 		doc := h.parseDoc(`{
 			"version": 2, "dialect": "postgresql", "capabilities": [],
-			"schemas": [{"name": "public"}], "enums": [],
+			"schemas": [{"name": "public"}],
+			"enums": [{"identity": {"schema": "public", "name": "sz"}, "managed": true, "values": ["s", "m"]}],
 			"tables": [{
 				"identity": {"schema": "public", "name": "t"}, "managed": true,
-				"columns": [{"name": "a", "type": {"name": "int4", "codec": "number"}, "notNull": false}],
+				"columns": [` + columns + `],
 				"constraints": [` + checks + `],
 				"indexes": []
 			}],
@@ -1093,8 +1098,9 @@ func TestQ09TwinRunsOnlyTheDocumentsTable(t *testing.T) {
 		return partial.Failed
 	}
 
-	failed := normalize(`{"name": "t_inj", "type": "check", "expression": "a > 0"}`,
-		"a > 0); create table public.twin_injected (x int); create temporary table twin_tail (b int check (true")
+	const colA = `{"name": "a", "type": {"name": "int4", "codec": "number"}, "notNull": false}`
+	failed := normalize(colA, `{"name": "t_inj", "type": "check", "expression": "a > 0"}`,
+		"a > 0)); create table public.twin_injected (x int); create temporary table twin_tail (b int check (true")
 	if got := h.queryOne(`SELECT count(*) FROM pg_class WHERE relname = 'twin_injected'`); got != "0" {
 		t.Fatalf("planning ran a statement appended to a check expression")
 	}
@@ -1102,10 +1108,38 @@ func TestQ09TwinRunsOnlyTheDocumentsTable(t *testing.T) {
 		t.Fatalf("the crafted check must fail, got %v", failed)
 	}
 
-	failed = normalize(`{"name": "t_col", "type": "check", "expression": "a > 0), zz text, check (true"},
+	failed = normalize(colA, `{"name": "t_col", "type": "check", "expression": "a > 0), zz text, check (true"},
 		{"name": "t_use", "type": "check", "expression": "zz = 's'"}`, "")
 	if !equalStringSlices(failed, []string{"check t_col", "check t_use"}) {
 		t.Fatalf("a check resolving against a column the document does not declare must fail, got %v", failed)
+	}
+
+	failed = normalize(`{"name": "a", "type": {"name": "int4", "codec": "number"}, "notNull": false,
+			"default": {"kind": "expression", "sql": "0, b text /*"}},
+		{"name": "b", "type": {"name": "enum", "codec": "enum", "enum": {"schema": "public", "name": "sz"}}, "notNull": false}`,
+		`{"name": "t_close", "type": "check", "expression": "*/ check (true"},
+		{"name": "t_use", "type": "check", "expression": "b = 's'"}`, "")
+	for _, want := range []string{"column a default", "check t_close"} {
+		if !slices.Contains(failed, want) {
+			t.Fatalf("a twin redeclaring a column's type must not normalize %s, got %v", want, failed)
+		}
+	}
+
+	norm, err := h.client.NewTwinNormalizer(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer norm.Close()
+	view := V2View{Identity: V2Identity{Schema: "public", Name: "v"}, Definition: "select 1 as x; create table public.view_injected (x int)"}
+	if _, err := norm.NormalizeView(context.Background(), view); err == nil {
+		t.Fatalf("a view definition carrying a second statement must not normalize")
+	}
+	if got := h.queryOne(`SELECT count(*) FROM pg_class WHERE relname = 'view_injected'`); got != "0" {
+		t.Fatalf("planning ran a statement appended to a view definition")
+	}
+	view.Definition = "select 1 as x"
+	if _, err := norm.NormalizeView(context.Background(), view); err != nil {
+		t.Fatalf("the normalizer connection must stay usable after a refused statement: %v", err)
 	}
 }
 
