@@ -446,7 +446,7 @@ func TestQ10GenerateSnapshotRenameIsRefused(t *testing.T) {
 			t.Fatalf("the refusal must name %q:\n%s", elem, out)
 		}
 	}
-	if !strings.Contains(out, "predates the rename of net to amount") || !strings.Contains(out, "Plan it as two migrations instead") || strings.Contains(out, "live normalizer") {
+	if !strings.Contains(out, "predates the rename of net to amount") || !strings.Contains(out, "Plan it as two migrations instead: first generate one that keeps the column under its old name (net) and leaves out the elements listed below, without --rename") || strings.Contains(out, "live normalizer") {
 		t.Fatalf("the refusal must name the rename and the offline fix:\n%s", out)
 	}
 	if m, _ := filepath.Glob(filepath.Join(mig, "002_*")); len(m) != 0 {
@@ -609,7 +609,7 @@ func TestQ10UnrenamedLiveRunAdvice(t *testing.T) {
 		return runCLIProcess(t, bin, dbURL, args...)
 	}
 
-	const byHand = `Rename the column by hand first: alter table "app"."t" rename column "net" to "amount" (PostgreSQL rewrites the expressions that reference it), then re-run without the --rename flags for app.t (keep any others)`
+	const byHand = `Rename the column by hand first: alter table "app"."t" rename column "net" to "amount" (PostgreSQL rewrites the expressions that reference it), then plan the remaining changes again, leaving out the rename of net to amount (the database already holds the new name; keep any other renames)`
 	code, out := run("db", "push", "--dry-run", "--schema", after, "--rename", "app.t.net>app.t.amount")
 	if code == 0 || !strings.Contains(out, "The plan is refused") {
 		t.Fatalf("PostgreSQL %d: a comparison that could not follow the rename is refused (%d):\n%s", major, code, out)
@@ -617,7 +617,7 @@ func TestQ10UnrenamedLiveRunAdvice(t *testing.T) {
 	if !strings.Contains(out, `column gross generation expression: "(amount * (2)::numeric)" (desired) vs "(net * (2)::numeric)" (live)`) || !strings.Contains(out, "predates the rename of net to amount") || !strings.Contains(out, byHand) {
 		t.Fatalf("PostgreSQL %d: the refusal must name the element, the rename and the hand rename:\n%s", major, out)
 	}
-	for _, bad := range []string{"spells it", "live normalizer"} {
+	for _, bad := range []string{"spells it", "live normalizer", "--rename flags"} {
 		if strings.Contains(out, bad) {
 			t.Fatalf("PostgreSQL %d: %q is not advice a live rename run can follow:\n%s", major, bad, out)
 		}

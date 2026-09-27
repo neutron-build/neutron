@@ -102,7 +102,7 @@ func TestQ10UnrenamedComparisonIsRefused(t *testing.T) {
 
 	_, err := DiffV2Document(context.Background(), desired, base, DiffV2Options{Renames: renames})
 	if err == nil || !strings.Contains(err.Error(), hint) || !strings.Contains(err.Error(), element) ||
-		!strings.Contains(err.Error(), "Plan it as two migrations instead") || strings.Contains(err.Error(), "live normalizer") {
+		!strings.Contains(err.Error(), "Plan it as two migrations instead: first generate one that keeps the column under its old name (net) and leaves out the elements listed below, without --rename") || strings.Contains(err.Error(), "live normalizer") {
 		t.Fatalf("offline planning must refuse, name the rename and the offline fix: %v", err)
 	}
 
@@ -110,15 +110,15 @@ func TestQ10UnrenamedComparisonIsRefused(t *testing.T) {
 	// database spells the expression with the old name: the advice is the
 	// hand rename, never "write it as the database spells it" or "re-run
 	// with a live normalizer".
-	const byHand = `Rename the column by hand first: alter table "app"."tenants" rename column "net" to "amount" (PostgreSQL rewrites the expressions that reference it), then re-run without the --rename flags for app.tenants (keep any others)`
+	const byHand = `Rename the column by hand first: alter table "app"."tenants" rename column "net" to "amount" (PostgreSQL rewrites the expressions that reference it), then plan the remaining changes again, leaving out the rename of net to amount (the database already holds the new name; keep any other renames)`
 	for _, major := range []int{16, 17} {
 		_, err = DiffV2Document(context.Background(), desired, base, DiffV2Options{Renames: renames, Normalizer: q10RenameNormalizer{fail: true}, ServerMajor: major})
 		if err == nil {
 			t.Fatalf("PostgreSQL %d: a failed rename twin must refuse the plan", major)
 		}
 		if msg := err.Error(); !strings.Contains(msg, hint) || !strings.Contains(msg, element) || !strings.Contains(msg, byHand) ||
-			strings.Contains(msg, "spells it") || strings.Contains(msg, "live normalizer") {
-			t.Fatalf("PostgreSQL %d: a live refusal must name the hand rename:\n%s", major, msg)
+			strings.Contains(msg, "spells it") || strings.Contains(msg, "live normalizer") || strings.Contains(msg, "--rename") {
+			t.Fatalf("PostgreSQL %d: a live refusal must name the hand rename, and no CLI flag (Studio has none):\n%s", major, msg)
 		}
 	}
 }

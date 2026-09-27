@@ -886,7 +886,7 @@ func (p *v2Planner) planSharedTables() error {
 				continue
 			}
 			if ac.Generated != nil {
-				p.blockOnRename(dt.Identity, v2GeneratedElement(ac.Name), fmt.Sprintf("generated column %s is dropped, and its down statement re-adds it as %q", ac.Name, ac.Generated.Expression))
+				p.blockOnRename(dt.Identity, v2GeneratedElement(ac.Name), fmt.Sprintf("generated column %s is dropped, and its down statement re-adds it as %q", ac.Name, ac.Generated.Expression), ac.Generated.Expression)
 			}
 			p.warn("table %s: column %q will be dropped (data lost unless it is a rename — see --rename)", dt.Identity, ac.Name)
 			acDDL, err := v2ColumnDDL(ac)
@@ -916,8 +916,9 @@ func (p *v2Planner) planSharedTables() error {
 // rename alone compares equal and a real change still differs. Down
 // statements run before the renames are reverted and need the renamed
 // spelling too. Without a normalizer (offline snapshot planning) or when
-// the twin fails, the live text keeps its old names and differences on the
-// table stay unverified.
+// the twin fails, the live text keeps its old names, and the plan is
+// refused if it depends on text that may name a renamed column
+// (blockOnRename).
 func (p *v2Planner) renameActual(table V2Identity) {
 	prefix := table.String() + "."
 	renames := map[string]string{}
@@ -995,9 +996,22 @@ func (p *v2Planner) renameStructure() {
 // whose live text still predates its renames (no catalog, or the rename
 // copy failed): a difference cannot be told from the rename, and a down
 // statement carrying the text would name the old column before the rename
-// is reverted. planSharedTables refuses the plan when any is recorded.
-func (p *v2Planner) blockOnRename(table V2Identity, element, what string) bool {
+// is reverted. texts are the element's live expression texts; the element
+// is recorded only when one of them may name a renamed column
+// (textMayNameRename). planSharedTables refuses the plan when any is
+// recorded.
+func (p *v2Planner) blockOnRename(table V2Identity, element, what string, texts ...string) bool {
 	if p.unrenamedTables[table] == "" {
+		return false
+	}
+	names := false
+	for _, text := range texts {
+		if p.textMayNameRename(table, text) {
+			names = true
+			break
+		}
+	}
+	if !names {
 		return false
 	}
 	if p.renameBlocked[table] == nil {
@@ -1007,6 +1021,197 @@ func (p *v2Planner) blockOnRename(table V2Identity, element, what string) bool {
 		p.renameBlocked[table][element] = what
 	}
 	return true
+}
+
+// textMayNameRename reports whether live expression text of a table may
+// name one of the table's renamed columns under its old name. It reads the
+// text's identifiers as PostgreSQL does (quoted ones exactly, unquoted ones
+// folded to lower case; string literals and comments are skipped). The
+// table's own name counts too: a whole-row reference (t.*) carries every
+// column, and its meaning can depend on their names. Text it cannot read
+// counts as naming one. A rename leaves text that names none of these
+// unchanged, so it compares and reverts as written.
+func (p *v2Planner) textMayNameRename(table V2Identity, text string) bool {
+	idents, ok := sqlIdentifiers(text)
+	if !ok {
+		return true
+	}
+	prefix := table.String() + "."
+	for _, ident := range idents {
+		if ident == table.Name {
+			return true
+		}
+		for target, source := range p.opts.Renames {
+			if source == ident && strings.HasPrefix(target, prefix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sqlIdentifiers returns the identifiers of SQL expression text: quoted
+// identifiers unescaped, unquoted ones (keywords and function names
+// included) with ASCII letters folded to lower case, as PostgreSQL's lexer
+// reads them. String literals (escape, bit, hex and dollar-quoted ones
+// too) and comments contribute nothing. ok is false for text it does not
+// fully read: an unterminated quote or comment, a Unicode-escaped string or
+// identifier (U&), a parameter ($1), or a number run into an identifier.
+func sqlIdentifiers(text string) (idents []string, ok bool) {
+	identStart := func(c byte) bool {
+		return c == '_' || c >= 0x80 || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+	}
+	identPart := func(c byte) bool {
+		return identStart(c) || c == '$' || (c >= '0' && c <= '9')
+	}
+	digit := func(c byte) bool { return c >= '0' && c <= '9' }
+	// skipString returns the index after the literal opening at i.
+	skipString := func(i int, escapes bool) (int, bool) {
+		for j := i + 1; j < len(text); j++ {
+			switch {
+			case escapes && text[j] == '\\':
+				j++
+			case text[j] == '\'':
+				if j+1 < len(text) && text[j+1] == '\'' {
+					j++
+					continue
+				}
+				return j + 1, true
+			}
+		}
+		return 0, false
+	}
+	for i := 0; i < len(text); {
+		c := text[i]
+		switch {
+		case c == '\'':
+			end, ok := skipString(i, false)
+			if !ok {
+				return nil, false
+			}
+			i = end
+		case c == '"':
+			var b strings.Builder
+			j := i + 1
+			for {
+				if j >= len(text) {
+					return nil, false
+				}
+				if text[j] == '"' {
+					if j+1 < len(text) && text[j+1] == '"' {
+						b.WriteByte('"')
+						j += 2
+						continue
+					}
+					break
+				}
+				b.WriteByte(text[j])
+				j++
+			}
+			idents = append(idents, b.String())
+			i = j + 1
+		case c == '-' && i+1 < len(text) && text[i+1] == '-':
+			for i < len(text) && text[i] != '\n' {
+				i++
+			}
+		case c == '/' && i+1 < len(text) && text[i+1] == '*':
+			depth := 0
+			for {
+				if i+1 >= len(text) {
+					return nil, false
+				}
+				if text[i] == '/' && text[i+1] == '*' {
+					depth++
+					i += 2
+					continue
+				}
+				if text[i] == '*' && text[i+1] == '/' {
+					depth--
+					i += 2
+					if depth == 0 {
+						break
+					}
+					continue
+				}
+				i++
+			}
+		case c == '$':
+			j := i + 1
+			if j < len(text) && digit(text[j]) {
+				return nil, false
+			}
+			for j < len(text) && text[j] != '$' {
+				if !identPart(text[j]) || (j == i+1 && !identStart(text[j])) {
+					return nil, false
+				}
+				j++
+			}
+			if j >= len(text) {
+				return nil, false
+			}
+			tag := text[i : j+1]
+			end := strings.Index(text[j+1:], tag)
+			if end < 0 {
+				return nil, false
+			}
+			i = j + 1 + end + len(tag)
+		case digit(c) || (c == '.' && i+1 < len(text) && digit(text[i+1])):
+			j := i
+			if c == '0' && i+1 < len(text) && strings.ContainsRune("xXoObB", rune(text[i+1])) {
+				j += 2
+				for j < len(text) && (text[j] == '_' || digit(text[j]) || (text[j] >= 'a' && text[j] <= 'f') || (text[j] >= 'A' && text[j] <= 'F')) {
+					j++
+				}
+			} else {
+				for j < len(text) && (digit(text[j]) || text[j] == '_' || text[j] == '.') {
+					j++
+				}
+				if j < len(text) && (text[j] == 'e' || text[j] == 'E') {
+					k := j + 1
+					if k < len(text) && (text[k] == '+' || text[k] == '-') {
+						k++
+					}
+					if k < len(text) && digit(text[k]) {
+						j = k
+						for j < len(text) && (digit(text[j]) || text[j] == '_') {
+							j++
+						}
+					}
+				}
+			}
+			if j < len(text) && identPart(text[j]) {
+				return nil, false
+			}
+			i = j
+		case identStart(c):
+			j := i
+			for j < len(text) && identPart(text[j]) {
+				j++
+			}
+			word := text[i:j]
+			if j < len(text) && text[j] == '\'' && len(word) == 1 && strings.ContainsRune("eEbBxXnN", rune(word[0])) {
+				end, ok := skipString(j, word == "e" || word == "E")
+				if !ok {
+					return nil, false
+				}
+				i = end
+				continue
+			}
+			if (word == "u" || word == "U") && j < len(text) && text[j] == '&' {
+				return nil, false
+			}
+			idents = append(idents, strings.Map(func(r rune) rune {
+				if r >= 'A' && r <= 'Z' {
+					return r + ('a' - 'A')
+				}
+				return r
+			}, word))
+			i = j
+		default:
+			i++
+		}
+	}
+	return idents, true
 }
 
 // renameRefusal is the error for the tables blockOnRename recorded, or nil.
@@ -1028,19 +1233,38 @@ func (p *v2Planner) renameRefusal() error {
 		sort.Strings(items)
 		var fix string
 		if p.opts.Normalizer != nil {
-			fix = fmt.Sprintf("it could not be compared under the rename on this database. Rename the column by hand first: %s (PostgreSQL rewrites the expressions that reference it), then re-run without the --rename flags for %s (keep any others)", strings.Join(p.renameStatements(table), "; "), table)
+			// Worded for the CLI and Studio alike: Studio has no flags.
+			fix = fmt.Sprintf("it could not be compared under the rename on this database. Rename the column by hand first: %s (PostgreSQL rewrites the expressions that reference it), then plan the remaining changes again, leaving out the rename of %s (the database already holds the new name; keep any other renames)", strings.Join(p.renameStatements(table), "; "), p.unrenamedTables[table])
 		} else {
 			// --mode live is no fix here: a snapshot plan with a rename
 			// always has a chain, and the runner refuses a migration
 			// without a snapshot in it. Two offline migrations never
 			// compare text across the rename.
-			fix = "offline planning has no catalog to compare it under the rename. Plan it as two migrations instead: first generate one without the elements listed below and without --rename (removing a generated column needs --allow-destructive and recomputes its values when it is added back), then one with the --rename and the elements you keep written with the new name (a re-added column is placed last, so declare it last)"
+			fix = fmt.Sprintf("offline planning has no catalog to compare it under the rename. Plan it as two migrations instead: first generate one that keeps %s and leaves out the elements listed below, without --rename (removing a generated column needs --allow-destructive and recomputes its values when it is added back), then one with the --rename and the elements you keep written with the new name (a re-added column is placed last, so declare it last)", p.oldNamesKept(table))
 		}
 		msgs = append(msgs, fmt.Sprintf(
 			"table %s: the plan depends on expression text in %s that predates the rename of %s. PostgreSQL rewrites that text on RENAME COLUMN, so without comparing it under the rename a rename alone cannot be told from a change, and a down statement carrying it would name the old column before the rename is reverted. The plan is refused; %s:\n%s",
 			table, p.baseNoun(), p.unrenamedTables[table], fix, strings.Join(items, "\n")))
 	}
 	return errors.New(strings.Join(msgs, "\n"))
+}
+
+// oldNamesKept names a table's renamed columns under their old names, for
+// the first migration of the offline fix: the column stays, so its data
+// does.
+func (p *v2Planner) oldNamesKept(table V2Identity) string {
+	prefix := table.String() + "."
+	var olds []string
+	for target, source := range p.opts.Renames {
+		if strings.HasPrefix(target, prefix) {
+			olds = append(olds, source)
+		}
+	}
+	sort.Strings(olds)
+	if len(olds) == 1 {
+		return "the column under its old name (" + olds[0] + ")"
+	}
+	return "the columns under their old names (" + strings.Join(olds, ", ") + ")"
 }
 
 // renameStatements are the planned RENAME COLUMN statements of a table,
@@ -1331,13 +1555,20 @@ func (p *v2Planner) planConstraintChanges(table V2Identity, desired, actual *V2T
 		if ac.Type == "primary-key" && desiredPKName != "" {
 			continue // paired with the desired PK by slot above
 		}
-		if ac.Expression != nil {
-			p.blockOnRename(table, v2CheckElement(ac.Name), fmt.Sprintf("check constraint %s is dropped, and its down statement re-adds %q", ac.Name, *ac.Expression))
-		}
 		drops = append(drops, ac.Name)
 	}
 
 	for _, name := range drops {
+		// A dropped or replaced check is re-added from its live text by the
+		// down statement, whatever replaced it (a changed check whose text
+		// differs was already recorded by the comparison).
+		if ac := actual.Constraint(name); ac != nil && ac.Expression != nil {
+			verb := "dropped"
+			if desired.Constraint(name) != nil {
+				verb = "replaced"
+			}
+			p.blockOnRename(table, v2CheckElement(name), fmt.Sprintf("check constraint %s is %s, and its down statement re-adds %q", name, verb, *ac.Expression), *ac.Expression)
+		}
 		p.emit(
 			fmt.Sprintf("alter table %s drop constraint if exists %s", tq, quoteIdent(name)),
 			fmt.Sprintf("alter table %s add constraint %s %s", tq, quoteIdent(name), p.constraintFragmentFor(table, actual, name)),
@@ -1486,6 +1717,9 @@ func (p *v2Planner) planIndexChanges(table V2Identity, desired, actual *V2Table)
 		if err != nil {
 			oldDDL = fmt.Sprintf("-- index %s (unrepresentable old definition; no down statement)", di.Identity)
 		}
+		// The down statement re-creates the live definition, whatever the
+		// difference was (key parts, predicate, method...).
+		p.blockOnRename(table, v2IndexElement(ai.Identity.Name), fmt.Sprintf("index %s is re-created, and its down statement re-creates it as %q", ai.Identity.Name, oldDDL), indexTexts(*ai)...)
 		newDDL, err := createV2IndexSQL(*desired, di)
 		if err != nil {
 			return err
@@ -1506,9 +1740,7 @@ func (p *v2Planner) planIndexChanges(table V2Identity, desired, actual *V2Table)
 		if err != nil {
 			return err
 		}
-		if indexHasExpressions(ai) {
-			p.blockOnRename(table, v2IndexElement(ai.Identity.Name), fmt.Sprintf("index %s is dropped, and its down statement re-creates it as %q", ai.Identity.Name, oldDDL))
-		}
+		p.blockOnRename(table, v2IndexElement(ai.Identity.Name), fmt.Sprintf("index %s is dropped, and its down statement re-creates it as %q", ai.Identity.Name, oldDDL), indexTexts(ai)...)
 		p.emit(fmt.Sprintf("drop index if exists %s", qualifiedNameSQL(ai.Identity)), oldDDL)
 		p.warn("index %q on table %s will be dropped", ai.Identity.Name, table)
 	}
@@ -1519,7 +1751,7 @@ func (p *v2Planner) planIndexChanges(table V2Identity, desired, actual *V2Table)
 // element (v2DefaultElement and friends) of this table had a catalog oracle:
 // a live twin normalizer that normalized that element.
 func (p *v2Planner) comparisonVerified(table V2Identity, element string) bool {
-	return p.opts.Normalizer != nil && !p.twinFailedTables[table] && !p.twinFailedElems[table][element] && p.unrenamedTables[table] == ""
+	return p.opts.Normalizer != nil && !p.twinFailedTables[table] && !p.twinFailedElems[table][element]
 }
 
 // indexEqualAfterRenames compares index metadata with the live column
@@ -1590,7 +1822,7 @@ func (p *v2Planner) textEqual(table V2Identity, element, what string, desired, a
 	// A column default cannot reference a column, so only the other
 	// expression elements can differ because of a rename.
 	isDefault := strings.HasPrefix(element, "column ") && strings.HasSuffix(element, " default")
-	if !isDefault && p.blockOnRename(table, element, fmt.Sprintf("%s: %q (desired) vs %q (%s)", what, *desired, *actual, p.baseLiveNoun())) {
+	if !isDefault && p.blockOnRename(table, element, fmt.Sprintf("%s: %q (desired) vs %q (%s)", what, *desired, *actual, p.baseLiveNoun()), *actual) {
 		return false
 	}
 	if !p.comparisonVerified(table, element) {
@@ -1600,16 +1832,19 @@ func (p *v2Planner) textEqual(table V2Identity, element, what string, desired, a
 	return false
 }
 
-func indexHasExpressions(idx V2Index) bool {
-	if idx.Where != nil {
-		return true
-	}
+// indexTexts are an index's expression texts: key expressions and the
+// predicate.
+func indexTexts(idx V2Index) []string {
+	var texts []string
 	for _, k := range idx.Key {
 		if k.Expression != nil {
-			return true
+			texts = append(texts, *k.Expression)
 		}
 	}
-	return false
+	if idx.Where != nil {
+		texts = append(texts, *idx.Where)
+	}
+	return texts
 }
 
 // defaultsEqual compares defaults structurally; literal/expression SQL

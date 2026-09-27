@@ -4,9 +4,9 @@ package cmd
 // against the renamed state, so every column they name before the rename is
 // reverted must be the new name. Structural column lists (constraint and
 // foreign-key columns, index key columns and INCLUDE) follow the rename;
-// offline plans that depend on expression text written before the rename
-// are refused, with a two-migration fix that never compares text across
-// the rename.
+// plans that depend on expression text written before the rename (offline,
+// or when the live rename copy fails) are refused when that text may name a
+// renamed column, with a fix that never compares text across the rename.
 //
 // Every case runs the real binary: migrate generate, migrate, migrate down.
 // The oracle is the catalog's own text (pg_get_constraintdef,
@@ -189,7 +189,24 @@ func TestQ11GenerateSnapshotStructuralDownReverts(t *testing.T) {
 			`CREATE INDEX t_k ON app.t (net)`, `CREATE INDEX t_i ON app.t (id) INCLUDE (net)`},
 		target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, amount numeric, other int, CONSTRAINT t_u UNIQUE (amount, id), CONSTRAINT t_o CHECK (other > 0))`,
 			`CREATE INDEX t_k ON app.t (amount, other)`, `CREATE INDEX t_i ON app.t (id, other) INCLUDE (amount)`},
-		data: []string{`INSERT INTO app.t VALUES (1, 5, 1)`}}} {
+		data: []string{`INSERT INTO app.t VALUES (1, 5, 1)`}}, {
+		// Expressions on other columns only: a default, a check, a generated
+		// column, an expression index and a partial index.
+		name: "unrelated expressions", renames: []string{"app.t.net>app.t.amount"},
+		live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net numeric, other int, ts timestamptz DEFAULT now(), o2 int GENERATED ALWAYS AS (other * 2) STORED, CONSTRAINT t_o CHECK (other > 0), CONSTRAINT t_nu UNIQUE (net))`,
+			`CREATE INDEX t_e ON app.t (abs(other))`, `CREATE INDEX t_p ON app.t (id) WHERE other > 1`, `CREATE INDEX t_n ON app.t (net) INCLUDE (other)`},
+		target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, amount numeric, other int, ts timestamptz DEFAULT now(), o2 int GENERATED ALWAYS AS (other * 2) STORED, CONSTRAINT t_o CHECK (other > 0), CONSTRAINT t_nu UNIQUE (amount))`,
+			`CREATE INDEX t_e ON app.t (abs(other))`, `CREATE INDEX t_p ON app.t (id) WHERE other > 1`, `CREATE INDEX t_n ON app.t (amount) INCLUDE (other)`},
+		data: []string{`INSERT INTO app.t (id, net, other) VALUES (1, 5, 3)`}}, {
+		// Q11 review-1: expressions that name no renamed column change,
+		// are re-created or are dropped along with the rename; their text
+		// is the same before and after it.
+		name: "unrelated expressions change", renames: []string{"app.t.net>app.t.amount"},
+		live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net numeric, other int, CONSTRAINT t_o CHECK (other > 0))`,
+			`CREATE INDEX t_e ON app.t (abs(other))`, `CREATE INDEX t_p ON app.t (id) WHERE other > 1`},
+		target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, amount numeric, other int, CONSTRAINT t_o CHECK (other > 1))`,
+			`CREATE INDEX t_p ON app.t (id, other) WHERE other > 1`},
+		data: []string{`INSERT INTO app.t VALUES (1, 5, 3)`}}} {
 		if c.name == "unique" {
 			// Its check names the renamed column: offline, that is refused
 			// (TestQ11GenerateSnapshotRenameRefused).
@@ -220,9 +237,9 @@ func TestQ11GenerateSnapshotStructuralDownReverts(t *testing.T) {
 }
 
 // Snapshot mode refuses a plan that depends on expression text written
-// before the rename: a compared element (check, generated column,
-// expression key, predicate) or a dropped element whose down statement
-// would carry it. Nothing is written, and the named fix works offline:
+// before the rename and naming the renamed column: a compared element
+// (check, generated column, expression key, predicate), or a dropped or
+// re-created element whose down statement would carry it. Nothing is written, and the named fix works offline:
 // one migration without the elements, then one with the rename and the
 // elements written with the new name; both down files revert.
 func TestQ11GenerateSnapshotRenameRefused(t *testing.T) {
@@ -253,6 +270,24 @@ func TestQ11GenerateSnapshotRenameRefused(t *testing.T) {
 				`generated column gross is dropped, and its down statement re-adds it as "(net * (2)::numeric)"`,
 				`index t_p is dropped, and its down statement re-creates it as "create index \"t_p\" on \"app\".\"t\" using btree (\"id\") where (net > (1)::numeric)"`,
 			}},
+		// Q11 review-1 finding 1: elements that differ for another reason
+		// than their text are dropped and re-created from the live text too.
+		{name: "key part count changes",
+			live:   []string{`CREATE TABLE app.t (id int PRIMARY KEY, net numeric)`, `CREATE INDEX t_e ON app.t (abs(net))`},
+			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, amount numeric)`, `CREATE INDEX t_e ON app.t (abs(amount), id)`},
+			want:   []string{`index t_e is re-created, and its down statement re-creates it as "create index \"t_e\" on \"app\".\"t\" using btree ((abs(net)))"`}},
+		{name: "predicate removed",
+			live:   []string{`CREATE TABLE app.t (id int PRIMARY KEY, net numeric)`, `CREATE INDEX t_p ON app.t (id) WHERE net > 1`},
+			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, amount numeric)`, `CREATE INDEX t_p ON app.t (id)`},
+			want:   []string{`index t_p is re-created, and its down statement re-creates it as "create index \"t_p\" on \"app\".\"t\" using btree (\"id\") where (net > (1)::numeric)"`}},
+		{name: "expression key part becomes a column",
+			live:   []string{`CREATE TABLE app.t (id int PRIMARY KEY, net numeric)`, `CREATE INDEX t_x ON app.t (abs(net))`},
+			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, amount numeric)`, `CREATE INDEX t_x ON app.t (amount)`},
+			want:   []string{`index t_x is re-created, and its down statement re-creates it as "create index \"t_x\" on \"app\".\"t\" using btree ((abs(net)))"`}},
+		{name: "check replaced by another constraint type",
+			live:   []string{`CREATE TABLE app.t (id int PRIMARY KEY, net numeric, CONSTRAINT t_c CHECK (net > 0))`},
+			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, amount numeric, CONSTRAINT t_c UNIQUE (amount))`},
+			want:   []string{`check constraint t_c is replaced, and its down statement re-adds "(net > (0)::numeric)"`}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -288,7 +323,7 @@ func TestQ11GenerateSnapshotRenameRefused(t *testing.T) {
 				t.Fatalf("snapshot planning must refuse:\n%s", out)
 			}
 			if !strings.Contains(out, "table app.t: the plan depends on expression text in the planning base (snapshot) that predates the rename of net to amount") ||
-				!strings.Contains(out, "Plan it as two migrations instead: first generate one without the elements listed below and without --rename") {
+				!strings.Contains(out, "Plan it as two migrations instead: first generate one that keeps the column under its old name (net) and leaves out the elements listed below, without --rename") {
 				t.Fatalf("the refusal must name the rename and the offline fix:\n%s", out)
 			}
 			for _, w := range c.want {
@@ -329,4 +364,77 @@ func TestQ11GenerateSnapshotRenameRefused(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A live run whose rename copy failed (a whole-row check: the copy is
+// made under another table name) refuses exactly the elements whose down
+// statement would carry text naming the renamed column, whatever made
+// them differ; the others plan, apply and revert (Q11 review-1).
+func TestQ11GenerateLiveUnrenamedText(t *testing.T) {
+	bin := buildCLIBinary(t)
+	const rowCheck = `CONSTRAINT t_row CHECK (row_to_json(t.*) IS NOT NULL)`
+
+	t.Run("elements naming the renamed column are refused", func(t *testing.T) {
+		work := t.TempDir()
+		desired := filepath.Join(work, "desired.json")
+		q11Target(t, bin, desired, []string{
+			`CREATE TABLE app.t (id int PRIMARY KEY, amount numeric, other int, ` + rowCheck + `, CONSTRAINT t_c UNIQUE (amount))`,
+			`CREATE INDEX t_e ON app.t (abs(amount), id)`, `CREATE INDEX t_p ON app.t (id)`, `CREATE INDEX t_x ON app.t (amount)`})
+		dbURL, fx := newM02CommandDB(t, "q11unr")
+		for _, stmt := range []string{`CREATE SCHEMA app`,
+			`CREATE TABLE app.t (id int PRIMARY KEY, net numeric, other int, ` + rowCheck + `, CONSTRAINT t_c CHECK (net > 0))`,
+			`CREATE INDEX t_e ON app.t (abs(net))`, `CREATE INDEX t_p ON app.t (id) WHERE net > 1`, `CREATE INDEX t_x ON app.t (abs(net))`,
+			`INSERT INTO app.t VALUES (1, 5, 3)`} {
+			if err := fx.Exec(context.Background(), stmt); err != nil {
+				t.Fatalf("%q: %v", stmt, err)
+			}
+		}
+		before := q09Query(t, fx, q11Catalog)
+		mig := filepath.Join(work, "migrations")
+		code, out := runCLIProcess(t, bin, dbURL, "migrate", "generate", "--mode", "live", "--schema", desired, "--dir", mig, "--name", "rn", "--allow-destructive", "--rename", "app.t.net>app.t.amount")
+		if code == 0 {
+			t.Fatalf("a plan whose down statements carry the old column name must be refused:\n%s", out)
+		}
+		for _, w := range []string{
+			`table app.t: the plan depends on expression text in the database that predates the rename of net to amount`,
+			`Rename the column by hand first: alter table "app"."t" rename column "net" to "amount" (PostgreSQL rewrites the expressions that reference it), then plan the remaining changes again, leaving out the rename of net to amount (the database already holds the new name; keep any other renames)`,
+			`check constraint t_c is replaced, and its down statement re-adds "(net > (0)::numeric)"`,
+			`index t_e is re-created, and its down statement re-creates it as "create index \"t_e\" on \"app\".\"t\" using btree ((abs(net)))"`,
+			`index t_p is re-created, and its down statement re-creates it as "create index \"t_p\" on \"app\".\"t\" using btree (\"id\") where (net > (1)::numeric)"`,
+			`index t_x is re-created, and its down statement re-creates it as "create index \"t_x\" on \"app\".\"t\" using btree ((abs(net)))"`,
+		} {
+			if !strings.Contains(out, w) {
+				t.Fatalf("the refusal must name %s:\n%s", w, out)
+			}
+		}
+		if strings.Contains(out, "t_row") || strings.Contains(out, "--rename flags") {
+			t.Fatalf("the unchanged whole-row check is no element of the refusal, and the advice names no flags:\n%s", out)
+		}
+		if m, _ := filepath.Glob(filepath.Join(mig, "*_rn*")); len(m) != 0 {
+			t.Fatalf("a refused plan writes nothing: %v", m)
+		}
+		if got := q09Query(t, fx, q11Catalog); got != before {
+			t.Fatalf("the database must be untouched:\n got: %s\nwant: %s", got, before)
+		}
+	})
+
+	t.Run("unrelated elements plan and revert", func(t *testing.T) {
+		c := q11Case{name: "unrelated", renames: []string{"app.t.net>app.t.amount"},
+			live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net numeric, other int, g int GENERATED ALWAYS AS (other * 2) STORED, ` + rowCheck + `, CONSTRAINT t_o CHECK (other > 0))`,
+				`CREATE INDEX t_e ON app.t (abs(other))`, `CREATE INDEX t_q ON app.t (id) WHERE other > 1`},
+			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, amount numeric, other int, ` + rowCheck + `, CONSTRAINT t_o CHECK (other > 1))`,
+				`CREATE INDEX t_q ON app.t (id, other) WHERE other > 1`},
+			data: []string{`INSERT INTO app.t (id, net, other) VALUES (1, 5, 3)`}}
+		work := t.TempDir()
+		desired := filepath.Join(work, "desired.json")
+		wantUp := q11Target(t, bin, desired, c.target)
+		dbURL, fx := newM02CommandDB(t, "q11unr")
+		for _, stmt := range append(append([]string{`CREATE SCHEMA app`}, c.live...), c.data...) {
+			if err := fx.Exec(context.Background(), stmt); err != nil {
+				t.Fatalf("%q: %v", stmt, err)
+			}
+		}
+		query := func(sql string) string { return q09Query(t, fx, sql) }
+		q11RoundTrip(t, bin, dbURL, "live", desired, filepath.Join(work, "migrations"), wantUp, c, query(q11Catalog), query(q11Rows), query)
+	})
 }
