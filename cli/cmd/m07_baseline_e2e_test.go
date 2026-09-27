@@ -2,9 +2,9 @@ package cmd
 
 // M07 live coverage through the REAL CLI binary: the documented upgrade
 // path (history -> baseline -> snapshot generate -> migrate -> schema check
-// --live) on a database that already has neutron's history table, and a
+// --live) on a database that already has neutron's history table, a
 // baseline written before M07 (internal table included) that must keep
-// working. Skipped unless NEUTRON_E2E_DATABASE_URL is set
+// working, and baselines refused while migration files are not applied. Skipped unless NEUTRON_E2E_DATABASE_URL is set
 // (NEUTRON_LIVE_REQUIRED=1 fails instead).
 
 import (
@@ -35,7 +35,15 @@ const m07Desired = `{
 	"enums": [], "views": [], "opaque": []
 }`
 
+// m07DesiredBio also lists the bio column a hand-written migration adds.
+var m07DesiredBio = strings.Replace(m07Desired,
+	`{"name": "nick",`,
+	`{"name": "bio", "type": {"name": "text", "codec": "string"}, "notNull": false},
+			{"name": "nick",`, 1)
+
 const m07InitSQL = `CREATE TABLE users (id integer PRIMARY KEY, email text NOT NULL)`
+
+const m07BioSQL = `ALTER TABLE users ADD COLUMN bio text`
 
 const m07NickCount = `SELECT count(*)::text FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'nick'`
 
@@ -129,6 +137,24 @@ func TestM07BaselineUpgradePath(t *testing.T) {
 		}
 	}
 
+	// refusedBaseline asserts a baseline is refused naming want, and that
+	// nothing was written.
+	refusedBaseline := func(t *testing.T, bin, dbURL, mig string, want ...string) {
+		t.Helper()
+		code, out := runCLIProcess(t, bin, dbURL, "schema", "baseline", "--dir", mig)
+		if code == 0 {
+			t.Fatalf("baseline must be refused:\n%s", out)
+		}
+		for _, w := range want {
+			if !strings.Contains(out, w) {
+				t.Fatalf("baseline refusal must mention %q:\n%s", w, out)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(mig, "snapshots")); !os.IsNotExist(err) {
+			t.Fatalf("a refused baseline must write nothing (snapshots dir: %v)", err)
+		}
+	}
+
 	assertNoInternal := func(t *testing.T, path string) {
 		t.Helper()
 		tables := m07DocTables(t, path)
@@ -150,6 +176,8 @@ func TestM07BaselineUpgradePath(t *testing.T) {
 		if code, out := runCLIProcess(t, bin, dbURL, "migrate", "--dir", mig); code == 0 || !strings.Contains(out, "adopt") {
 			t.Fatalf("legacy history must be refused until adopted (%d):\n%s", code, out)
 		}
+		// Which files are applied is unknown until adoption.
+		refusedBaseline(t, bin, dbURL, mig, "legacy-text", "neutron migrate adopt")
 		must(t, bin, dbURL, "migrate", "adopt", "--dir", mig)
 		must(t, bin, dbURL, "schema", "baseline", "--dir", mig)
 		assertNoInternal(t, filepath.Join(mig, "snapshots", "000_baseline.snapshot.json"))
@@ -179,6 +207,65 @@ func TestM07BaselineUpgradePath(t *testing.T) {
 		must(t, bin, dbURL, "schema", "baseline", "--dir", mig)
 		generateApplyCheck(t, bin, dbURL, fx, mig, desired, "002", "001,002")
 		assertNoInternal(t, filepath.Join(mig, "snapshots", "000_baseline.snapshot.json"))
+	})
+
+	// History written by the current runner (v2 shape) with a hand-written
+	// migration not applied yet: the baseline refuses until it is applied,
+	// then covers it, and the next plan does not repeat it.
+	t.Run("RunnerHistoryUnappliedFile", func(t *testing.T) {
+		dbURL, fx := newM02CommandDB(t, "m07unapplied")
+		bin := built
+		work := t.TempDir()
+		mig := filepath.Join(work, "migrations")
+		desired := filepath.Join(work, "desired.json")
+		writeFile(t, desired, m07DesiredBio)
+		if err := os.MkdirAll(mig, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(mig, "001_init.up.sql"), m07InitSQL+";\n")
+		must(t, bin, dbURL, "migrate", "--dir", mig)
+		writeFile(t, filepath.Join(mig, "002_hand_bio.up.sql"), m07BioSQL+";\n")
+
+		refusedBaseline(t, bin, dbURL, mig, "002", "not applied")
+		must(t, bin, dbURL, "migrate", "--dir", mig)
+		must(t, bin, dbURL, "schema", "baseline", "--dir", mig)
+		baseline := filepath.Join(mig, "snapshots", "000_baseline.snapshot.json")
+		assertNoInternal(t, baseline)
+		var snap struct{ Covers []string }
+		if err := json.Unmarshal(mustReadFile(t, baseline), &snap); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Join(snap.Covers, ",") != "001,002" {
+			t.Fatalf("covers = %v, want the applied 001,002", snap.Covers)
+		}
+		generateApplyCheck(t, bin, dbURL, fx, mig, desired, "003", "001,002,003")
+	})
+
+	// R03 attempt-3: a history-free database with a hand-written migration
+	// not applied yet.
+	t.Run("NoHistoryUnappliedFile", func(t *testing.T) {
+		dbURL, fx := newM02CommandDB(t, "m07nohist")
+		bin := built
+		ctx := context.Background()
+		work := t.TempDir()
+		mig := filepath.Join(work, "migrations")
+		desired := filepath.Join(work, "desired.json")
+		writeFile(t, desired, m07DesiredBio)
+		if err := fx.Exec(ctx, m07InitSQL); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(mig, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(mig, "001_hand_bio.up.sql"), m07BioSQL+";\n")
+
+		refusedBaseline(t, bin, dbURL, mig, "001", "not applied")
+		if got := q09Query(t, fx, `SELECT count(*)::text FROM pg_tables WHERE tablename = '_neutron_migrations'`); got != "0" {
+			t.Fatalf("a refused baseline must not create history")
+		}
+		must(t, bin, dbURL, "migrate", "--dir", mig)
+		must(t, bin, dbURL, "schema", "baseline", "--dir", mig)
+		generateApplyCheck(t, bin, dbURL, fx, mig, desired, "002", "001,002")
 	})
 
 	// A baseline written before M07 lists _neutron_migrations. It keeps

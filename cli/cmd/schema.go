@@ -99,7 +99,11 @@ and reports unmanaged objects. Neutron-internal metadata tables (_neutron_*) are
 out of the baseline: they are managed automatically and never part of a plan (a
 baseline written by an earlier CLI that lists them still works — they are ignored on
 read). Existing migration files at baseline time are recorded as covered by the
-baseline; migration history is OBSERVED and reported, never adopted or upgraded —
+baseline, so every one of them must already be applied: a file the migration history
+does not list refuses the baseline (apply it with neutron migrate, record changes
+already made by other means with neutron migrate resolve <version> --mark-applied, or
+move the file out), and so does a legacy or SDK history while any file exists (adopt
+it first). Migration history is OBSERVED and reported, never adopted or upgraded —
 history graduation is neutron migrate adopt's job. Nothing in the database is
 created, altered or dropped.`,
 	RunE: func(cmd *cobra.Command, args []string) error { return reportRunE(runSchemaBaseline(cmd, args)) },
@@ -431,6 +435,9 @@ func runSchemaBaseline(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("read migration history: %w", err)
 	}
+	if err := baselineCoversApplied(covers, applied, shape); err != nil {
+		return err
+	}
 
 	history := db.BaselineHistory{Shape: shape.String(), AppliedVersions: applied}
 	switch shape {
@@ -471,6 +478,40 @@ func runSchemaBaseline(cmd *cobra.Command, args []string) error {
 	ui.Successf("Baseline written: %s (canonical SHA-256 %s)", baselinePath, shortHashCLI(doc.SHA256Hex))
 	ui.Infof("The baseline document is your ownership manifest: everything it lists is managed from here on. Remove objects you do not own before generating.")
 	return nil
+}
+
+// baselineCoversApplied refuses a baseline whose covers would include a
+// migration file that is not applied. The baseline document is the applied
+// state and its covers are the files already reflected in it; a covered
+// file that runs later is never recorded in the chain, so snapshot planning
+// from the baseline would plan its changes again and the drift gate would
+// then refuse (R03 attempt-3). Applied state is read only from a history
+// the CLI runner can use; a legacy or SDK history is unknown until adopted.
+func baselineCoversApplied(covers, applied []string, shape db.HistoryShape) error {
+	if len(covers) == 0 {
+		return nil
+	}
+	switch shape {
+	case db.HistoryV2Text, db.HistoryAbsent:
+	case db.HistoryLegacyText, db.HistoryLegacyInteger:
+		return fmt.Errorf("migration history is in the %s shape, so which migration files (%s) are applied is unknown — a baseline covers only applied migrations and never guesses; run `neutron migrate adopt` first, then baseline", shape, strings.Join(covers, ", "))
+	default:
+		return fmt.Errorf("migration history has the %s shape, which the CLI file workflow cannot read as applied state — a baseline covers only applied migrations and never guesses (migration files: %s)", shape, strings.Join(covers, ", "))
+	}
+	appliedSet := make(map[string]bool, len(applied))
+	for _, v := range applied {
+		appliedSet[v] = true
+	}
+	var pending []string
+	for _, v := range covers {
+		if !appliedSet[v] {
+			pending = append(pending, v)
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	return fmt.Errorf("migration file(s) %s are not applied to this database — a baseline records the applied state and covers only applied migrations (a covered file that ran later would be planned again). Apply them first (`neutron migrate`), record changes already made by other means with `neutron migrate resolve <version> --mark-applied`, or move the files out of the migrations directory, then baseline", strings.Join(pending, ", "))
 }
 
 // connectPostgresOnly connects and refuses Nucleus servers: the schema
