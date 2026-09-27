@@ -277,6 +277,8 @@ func TestQ09StatementMinServerMajor(t *testing.T) {
 		`alter table "app"."t" alter column "g" set expression as ((a * 3))`,
 		`ALTER TABLE app.t ALTER g SET EXPRESSION AS (a * 3)`,
 		`alter table app.t /* c */ alter column g set /* c */ expression as (a)`,
+		"alter table app.t alter column g set -- c\n expression as (a)",
+		`alter table only "app"."t" alter column "g" set expression as ('a' || b)`,
 	} {
 		if n, feature := StatementMinServerMajor(stmt); n != 17 || feature == "" {
 			t.Fatalf("%s: floor %d %q, want 17", stmt, n, feature)
@@ -287,6 +289,16 @@ func TestQ09StatementMinServerMajor(t *testing.T) {
 		`alter table app.t add column g numeric generated always as (a * 2) stored`,
 		`-- alter table app.t alter column g set expression as (a)`,
 		`insert into notes (body) values ('alter table x alter column y set expression as (1)')`,
+		// Review-1 finding 3: the form spelled inside an ALTER TABLE's
+		// literals, quoted identifiers, dollar quotes or comments.
+		`alter table app.tenants add constraint memo_ck check (coalesce(tone::text, '') <> ' set expression as ')`,
+		`ALTER TABLE app.t ADD CONSTRAINT c CHECK (note <> E'x\' set expression as ')`,
+		`alter table app.t add constraint c check (note <> $$ set expression as $$)`,
+		`alter table app.t add constraint c check (note <> $q$set expression as$q$)`,
+		`alter table app.t add column "set" int, add column "expression as" int`,
+		`alter table app.t rename column a to "set expression as"`,
+		`alter table app.t add column memo text -- set expression as (a)`,
+		`alter table app.t add column memo text /* set expression as (a) */`,
 	} {
 		if n, _ := StatementMinServerMajor(stmt); n != 0 {
 			t.Fatalf("%s: no floor expected, got %d", stmt, n)

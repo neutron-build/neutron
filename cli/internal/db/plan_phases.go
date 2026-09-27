@@ -26,7 +26,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -38,12 +37,19 @@ const SetExpressionMinServerMajor = 17
 // StatementMinServerMajor returns the lowest PostgreSQL major version that
 // can run a statement form this package's planner emits, with the feature
 // name, or (0, "") when the statement has no floor above the supported
-// matrix. It reads the single tokenizer's significant-token rendering, so
-// comments cannot hide the form; it is not a SQL parser.
+// matrix. It matches bare keyword tokens of the single tokenizer, so
+// comments cannot hide the form and string literals, dollar quotes and
+// quoted identifiers spelling it cannot fake it; it is not a SQL parser.
 func StatementMinServerMajor(sql string) (int, string) {
-	s := normalizedStatementText(sql)
-	if strings.HasPrefix(s, "alter table") && strings.Contains(s, " set expression as ") {
-		return SetExpressionMinServerMajor, "ALTER COLUMN ... SET EXPRESSION"
+	toks := significantTokens(sql)
+	word := func(i int, w string) bool { return toks[i].kind == 'w' && toks[i].text == w }
+	if len(toks) < 2 || !word(0, "alter") || !word(1, "table") {
+		return 0, ""
+	}
+	for i := 2; i+2 < len(toks); i++ {
+		if word(i, "set") && word(i+1, "expression") && word(i+2, "as") {
+			return SetExpressionMinServerMajor, "ALTER COLUMN ... SET EXPRESSION"
+		}
 	}
 	return 0, ""
 }
