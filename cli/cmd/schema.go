@@ -33,7 +33,7 @@ func init() {
 	schemaCheckCmd.Flags().Duration("timeout", 30*time.Second, "time budget for the live check")
 
 	schemaBaselineCmd.Flags().String("dir", "", "migrations directory (default migrations, or [migrations].dir)")
-	schemaBaselineCmd.Flags().Duration("timeout", 30*time.Second, "time budget for introspection")
+	schemaBaselineCmd.Flags().Duration("timeout", 30*time.Second, "time budget for connecting, waiting for the migration lock and introspection")
 
 	schemaCmd.AddCommand(schemaExportCmd)
 	schemaCmd.AddCommand(schemaPullCmd)
@@ -112,7 +112,9 @@ it first). Migration history is OBSERVED and reported, never adopted or upgraded
 history graduation is neutron migrate adopt's job. Nothing in the database is
 created, altered or dropped. The baseline holds the migration lock while it reads
 the database and its history, so a concurrent neutron migrate waits for it (and it
-waits for a running one, within --timeout). A user table with a foreign key into a
+waits for a running one, within --timeout; unlike the runners, --timeout 0 does not
+mean no deadline). Holding the lock takes a second database connection: a pool or
+role limited to one connection fails at the deadline. A user table with a foreign key into a
 _neutron_* table (for example to _neutron_jobs, the job queues' table) cannot be
 described by any schema document: the baseline refuses, names the table, the key and
 its target, and writes nothing.`,
