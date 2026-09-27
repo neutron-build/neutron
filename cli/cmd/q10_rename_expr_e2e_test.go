@@ -444,6 +444,9 @@ func TestQ10GenerateSnapshotRenameStaysUnverified(t *testing.T) {
 	if n := strings.Count(out, "predates the rename of net to amount"); n != 4 {
 		t.Fatalf("each unverified note must say the base text predates the rename (%d found):\n%s", n, out)
 	}
+	if n := strings.Count(out, "— re-run with --mode live, which compares it under the rename"); n != 4 || strings.Contains(out, "live normalizer") {
+		t.Fatalf("each unverified note must point to --mode live (%d found):\n%s", n, out)
+	}
 	up := q10FileStatements(t, filepath.Join(mig, "002_rename.up.sql"))
 	if len(up) < 2 || up[0] != `alter table "app"."t" rename column "net" to "amount"` {
 		t.Fatalf("offline planning must not reduce an unverified comparison to the rename alone: %q", up)
@@ -561,5 +564,76 @@ func TestQ10GenerateLiveRenameInclude(t *testing.T) {
 	}
 	if got := q09Query(t, fx, `SELECT row_to_json(t)::text FROM app.t t`); got != `{"id":1,"net":5}` {
 		t.Fatalf("PostgreSQL %d: rows changed: %s", major, got)
+	}
+}
+
+// When the live table cannot be copied to compare it under the rename (a
+// whole-row reference in a check names the table, and the copy has another
+// name), a live run names the fix that works: rename the column by hand,
+// which lets PostgreSQL rewrite the expressions, and re-run without
+// --rename. It never says to spell the expression as the database does
+// (the database spells it with the old name) or to re-run with a live
+// normalizer (this run had one).
+func TestQ10UnrenamedLiveRunAdvice(t *testing.T) {
+	dbURL, fx := newM02CommandDB(t, "q10advice")
+	bin := buildCLIBinary(t)
+	work := t.TempDir()
+	after := filepath.Join(work, "after.json")
+	writeFile(t, after, `{
+	"version": 2, "dialect": "postgresql", "capabilities": [],
+	"schemas": [{"name": "app"}], "enums": [],
+	"tables": [{"identity": {"schema": "app", "name": "t"}, "managed": true,
+		"columns": [
+			{"name": "id", "type": {"name": "int4", "codec": "number"}, "notNull": true},
+			{"name": "amount", "type": {"name": "numeric", "codec": "decimal-string"}, "notNull": false},
+			{"name": "gross", "type": {"name": "numeric", "codec": "decimal-string"}, "notNull": false, "generated": {"expression": "(amount * (2)::numeric)"}}],
+		"constraints": [{"name": "t_pkey", "type": "primary-key", "columns": ["id"]},
+			{"name": "t_row", "type": "check", "expression": "(row_to_json(t.*) IS NOT NULL)"}],
+		"indexes": []}],
+	"views": [], "opaque": []
+}`)
+	major := q09ServerMajor(t, fx)
+	for _, stmt := range []string{
+		`CREATE SCHEMA app`,
+		`CREATE TABLE app.t (id int4 PRIMARY KEY, net numeric, gross numeric GENERATED ALWAYS AS (net * 2) STORED, CONSTRAINT t_row CHECK (row_to_json(t.*) IS NOT NULL))`,
+		`INSERT INTO app.t (id, net) VALUES (1, 5)`,
+	} {
+		if err := fx.Exec(context.Background(), stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := func(args ...string) (int, string) {
+		t.Helper()
+		return runCLIProcess(t, bin, dbURL, args...)
+	}
+
+	const byHand = `rename by hand first with alter table "app"."t" rename column "net" to "amount" (PostgreSQL rewrites the expressions that reference it), then re-run without --rename`
+	code, out := run("db", "push", "--dry-run", "--schema", after, "--rename", "app.t.net>app.t.amount")
+	if major < 17 {
+		if code == 0 || !strings.Contains(out, `generated column "gross" could not be verified`) {
+			t.Fatalf("PostgreSQL %d: an unverified SET EXPRESSION is refused (%d):\n%s", major, code, out)
+		}
+		if !strings.Contains(out, "Rename the column by hand first: "+`alter table "app"."t" rename column "net" to "amount"`) {
+			t.Fatalf("PostgreSQL %d: the refusal must name the hand rename:\n%s", major, out)
+		}
+	} else if code != 0 {
+		t.Fatalf("PostgreSQL %d: dry run failed (%d):\n%s", major, code, out)
+	}
+	if !strings.Contains(out, "equivalence not verified for column gross generation expression") || !strings.Contains(out, "predates the rename of net to amount") || !strings.Contains(out, byHand) {
+		t.Fatalf("PostgreSQL %d: the unverified note must name the rename and the hand rename:\n%s", major, out)
+	}
+	for _, bad := range []string{"spells it", "live normalizer"} {
+		if strings.Contains(out, bad) {
+			t.Fatalf("PostgreSQL %d: %q is not advice a live rename run can follow:\n%s", major, bad, out)
+		}
+	}
+
+	// Following the advice: after the hand rename, the plan without
+	// --rename compares the renamed text and finds nothing to do.
+	if err := fx.Exec(context.Background(), `ALTER TABLE app.t RENAME COLUMN net TO amount`); err != nil {
+		t.Fatal(err)
+	}
+	if code, out := run("db", "push", "--dry-run", "--schema", after); code != 0 || !strings.Contains(out, "in sync") {
+		t.Fatalf("PostgreSQL %d: after the hand rename the schema is in sync (%d):\n%s", major, code, out)
 	}
 }
