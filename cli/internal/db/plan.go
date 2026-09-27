@@ -202,9 +202,18 @@ type SnapshotChain struct {
 	// declared order (M08). The loaded Document holds the database state;
 	// the recorded target hash still anchors the
 	// chain. RetainedErrors names snapshots that could not be read this
-	// way and keep their recorded document.
+	// way: they keep their recorded document, which may omit what their up
+	// file left in place, so database comparisons refuse over them.
 	Retained       []SnapshotRetained
-	RetainedErrors []string
+	RetainedErrors []SnapshotReadError
+
+	headGens ColumnGenerations
+}
+
+// HeadColumnGenerations reports which chain entry each column of the head
+// document entered its table in (see ColumnGenerations).
+func (c *SnapshotChain) HeadColumnGenerations() ColumnGenerations {
+	return c.headGens
 }
 
 // Empty reports whether the chain has no baseline and no snapshots.

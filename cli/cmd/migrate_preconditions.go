@@ -181,6 +181,9 @@ func managedDriftUnderLock(ctx context.Context, client *db.Client, chain *db.Sna
 		return nil
 	}
 
+	if err := retainedAnchorError(chain, applied); err != nil {
+		return err
+	}
 	expected, _, expectedRef, err := expectedAppliedDocument(chain, appliedVersions)
 	if err != nil {
 		return err
@@ -215,6 +218,50 @@ func managedDriftUnderLock(ctx context.Context, client *db.Client, chain *db.Sna
 		lines = append(lines, hint)
 	}
 	return fmt.Errorf("%s", strings.Join(lines, "\n"))
+}
+
+// retainedAnchorError refuses a database comparison whose expected state
+// would rest on an up file nothing verifies (M08 review-1). The chain reads
+// a snapshot with what its up file leaves in place (chain.Retained); the
+// snapshot's own hash does not cover that file. An applied file is anchored
+// by its history checksum — VerifyAppliedChecksums refuses a mismatch, and
+// a row without a checksum cannot anchor it. A pending file is what will
+// run (apply refuses one that no longer matches its plan), so it anchors
+// itself, but only after the applied state: one that precedes the newest
+// applied snapshot would shape the expected state without being run.
+//
+// A snapshot the chain could not read that way (chain.RetainedErrors) is
+// read as recorded, which may omit what its up file left in place; a
+// comparison whose expected state includes it refuses rather than trust it
+// (the text match fails closed).
+func retainedAnchorError(chain *db.SnapshotChain, applied []db.MigrationRecord) error {
+	if chain == nil || len(chain.Retained)+len(chain.RetainedErrors) == 0 {
+		return nil
+	}
+	records := make(map[string]db.MigrationRecord, len(applied))
+	newest := ""
+	for _, r := range applied {
+		records[r.Version] = r
+		if chain.SnapshotForVersion(r.Version) != nil && (newest == "" || db.CompareVersions(r.Version, newest) > 0) {
+			newest = r.Version
+		}
+	}
+	const rebaseline = "re-baseline at the current state (apply the pending migration files or move them out, delete the snapshots directory, run `neutron schema baseline`)"
+	for _, e := range chain.RetainedErrors {
+		if _, ok := records[e.Version]; ok || (newest != "" && db.CompareVersions(e.Version, newest) < 0) {
+			return fmt.Errorf("%s — the expected state after it is unknown, so nothing is compared against it; %s", e, rebaseline)
+		}
+	}
+	for _, r := range chain.Retained {
+		rec, ok := records[r.Version]
+		switch {
+		case ok && rec.Checksum == nil:
+			return fmt.Errorf("snapshot %s is read with what its up file leaves in place, but its history row records no checksum, so nothing verifies that the file is the one that ran — refusing to derive the expected state from it; %s", r.Stem, rebaseline)
+		case !ok && newest != "" && db.CompareVersions(r.Version, newest) < 0:
+			return fmt.Errorf("snapshot %s is read with what its up file leaves in place and precedes applied snapshot %s, but it is not applied, so no checksum verifies its up file — refusing to derive the expected state from it; apply it or %s", r.Stem, newest, rebaseline)
+		}
+	}
+	return nil
 }
 
 // validateStatementAllowlist refuses migrations containing any statement
