@@ -431,3 +431,101 @@ func TestQ09GeneratedExpressionServerVersionGate(t *testing.T) {
 		t.Fatal("no statement of the batch may run")
 	}
 }
+
+// q09DocR1 / q09DocR2 are review-1's r1.json / r2.json: r2 adds a new enum
+// type and a column of that type to a table that has a generated column,
+// a check and an expression index, all unchanged.
+const q09DocR1 = `{
+	"version": 2, "dialect": "postgresql", "capabilities": [],
+	"schemas": [{"name": "app"}],
+	"enums": [
+		{"identity": {"schema": "app", "name": "mood"}, "managed": true, "values": ["sad", "ok", "glad"]},
+		{"identity": {"schema": "app", "name": "color"}, "managed": true, "values": ["red", "blue"]}
+	],
+	"tables": [{
+		"identity": {"schema": "app", "name": "tenants"},
+		"managed": true,
+		"columns": [
+			{"name": "id", "type": {"name": "int4", "codec": "number"}, "notNull": true},
+			{"name": "tone", "type": {"name": "enum", "codec": "enum", "enum": {"schema": "app", "name": "mood"}}, "notNull": false,
+			 "default": {"kind": "literal", "sql": "'ok'::app.mood"}},
+			{"name": "net", "type": {"name": "numeric", "codec": "decimal-string"}, "notNull": false},
+			{"name": "gross", "type": {"name": "numeric", "codec": "decimal-string"}, "notNull": false,
+			 "generated": {"expression": "net * 2"}}
+		],
+		"constraints": [
+			{"name": "tenants_pkey", "type": "primary-key", "columns": ["id"]},
+			{"name": "tenants_net_pos", "type": "check", "expression": "net > 0"}
+		],
+		"indexes": [{"identity": {"schema": "app", "name": "tenants_lnet_idx"}, "unique": false, "method": "btree",
+			"key": [{"expression": "abs(net)"}], "where": "net > 1"}]
+	}],
+	"views": [],
+	"opaque": []
+}`
+
+var q09DocR2 = strings.NewReplacer(
+	`"values": ["red", "blue"]}`,
+	`"values": ["red", "blue"]},
+		{"identity": {"schema": "app", "name": "size"}, "managed": true, "values": ["s", "m", "l"]}`,
+	`"generated": {"expression": "net * 2"}}`,
+	`"generated": {"expression": "net * 2"}},
+			{"name": "size", "type": {"name": "enum", "codec": "enum", "enum": {"schema": "app", "name": "size"}}, "notNull": false}`,
+).Replace(q09DocR1)
+
+// Review-1 finding 1: a column typed by an enum the same change creates
+// made the table's whole twin fail, so its unchanged generated expression,
+// check and index were compared as raw text — a false SET EXPRESSION
+// refusal on PostgreSQL 16, and on 17+ a table rewrite plus check and
+// index churn. The plan must be just the new type and column.
+func TestQ09PushNewEnumColumnKeepsUnchangedExpressions(t *testing.T) {
+	dbURL, fx := newM02CommandDB(t, "q09newenumcol")
+	bin := buildCLIBinary(t)
+	work := t.TempDir()
+	r1, r2 := filepath.Join(work, "r1.json"), filepath.Join(work, "r2.json")
+	if q09DocR2 == q09DocR1 || strings.Count(q09DocR2, `"size"`) != 3 {
+		t.Fatal("r2 fixture edits did not apply")
+	}
+	writeFile(t, r1, q09DocR1)
+	writeFile(t, r2, q09DocR2)
+	major := q09ServerMajor(t, fx)
+	run := func(args ...string) (int, string) {
+		t.Helper()
+		return runCLIProcess(t, bin, dbURL, args...)
+	}
+
+	if code, out := run("db", "push", "--schema", r1); code != 0 {
+		t.Fatalf("push r1 failed (%d):\n%s", code, out)
+	}
+	const identity = `SELECT format('%s/%s/%s',
+		(SELECT relfilenode FROM pg_class WHERE oid = 'app.tenants'::regclass),
+		(SELECT oid FROM pg_constraint WHERE conrelid = 'app.tenants'::regclass AND conname = 'tenants_net_pos'),
+		(SELECT relfilenode FROM pg_class WHERE oid = 'app.tenants_lnet_idx'::regclass))`
+	before := q09Query(t, fx, identity)
+
+	code, out := run("db", "push", "--schema", r2, "--dry-run")
+	if code != 0 {
+		t.Fatalf("PostgreSQL %d: the dry run must plan, not refuse (%d):\n%s", major, code, out)
+	}
+	for _, bad := range []string{"set expression", "SET EXPRESSION", "drop constraint", "drop index", "equivalence not verified"} {
+		if strings.Contains(out, bad) {
+			t.Fatalf("PostgreSQL %d: unchanged expressions must compare equal (%q in the plan):\n%s", major, bad, out)
+		}
+	}
+	for _, want := range []string{`create type "app"."size"`, `add column "size"`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("the plan must carry %q:\n%s", want, out)
+		}
+	}
+
+	code, out = run("db", "push", "--schema", r2)
+	if code != 0 {
+		t.Fatalf("PostgreSQL %d: push r2 failed (%d):\n%s", major, code, out)
+	}
+	if after := q09Query(t, fx, identity); after != before {
+		t.Fatalf("PostgreSQL %d: no table rewrite, check re-add or index rebuild expected (table/check/index %s -> %s):\n%s", major, before, after, out)
+	}
+	if code, out := run("db", "push", "--schema", r2, "--dry-run"); code != 0 || !strings.Contains(out, "in sync") {
+		t.Fatalf("r2 must converge (%d):\n%s", code, out)
+	}
+}

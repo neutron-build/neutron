@@ -826,13 +826,13 @@ func TestV2ViewWithInsteadOfTriggerOpaqueAndBlocking(t *testing.T) {
 }
 
 // TestV2TwinFailureFlagsEquivalentCheckAndDefault pins the MAJOR-2 rework
-// live: when the twin normalizer cannot materialize the desired table
-// (here: a sequence default naming a nonexistent sequence), textual
-// comparisons of equivalent check/default/index expressions must be
-// flagged "equivalence not verified" — with a working twin the same
-// document compares equal (control). Spellings are hand-written forms the
-// catalog normalizes: 'x' vs 'x'::varchar, bare check/index text vs the
-// deparsed parenthesized forms.
+// live: when the twin normalizer cannot materialize the desired table,
+// equivalent check/default/index expressions it can still normalize one by
+// one compare equal, and an expression it cannot normalize is flagged
+// "equivalence not verified" instead of silently planned — with a working
+// twin the same document compares equal (control). Spellings are
+// hand-written forms the catalog normalizes: 'x' vs 'x'::varchar, bare
+// check/index text vs the deparsed parenthesized forms.
 func TestV2TwinFailureFlagsEquivalentCheckAndDefault(t *testing.T) {
 	h := newM02Harness(t, "twinfail")
 	h.exec(`CREATE TABLE t (slug text NOT NULL, note varchar(10) NOT NULL DEFAULT 'x')`)
@@ -844,7 +844,7 @@ func TestV2TwinFailureFlagsEquivalentCheckAndDefault(t *testing.T) {
 	const seqColumn = `,{"name": "bad", "type": {"name": "int4", "codec": "number"}, "notNull": false,
 				"default": {"kind": "sequence", "sequence": {"schema": "public", "name": "no_such_seq"}}}`
 	const enumColumn = `,{"name": "bad", "type": {"name": "enum", "codec": "enum", "enum": {"schema": "public", "name": "fresh"}}, "notNull": false}`
-	doc := func(broken, enums string) string {
+	doc := func(broken, enums, check string) string {
 		return `{
 			"version": 2, "dialect": "postgresql", "capabilities": [],
 			"schemas": [{"name": "public"}],
@@ -855,7 +855,7 @@ func TestV2TwinFailureFlagsEquivalentCheckAndDefault(t *testing.T) {
 					{"name": "note", "type": {"name": "varchar", "codec": "string", "params": {"length": 10}}, "notNull": true,
 					 "default": {"kind": "literal", "sql": "'x'"}}` + broken + `
 				],
-				"constraints": [{"name": "t_slug_check", "type": "check", "expression": "length(slug) > 0"}],
+				"constraints": [{"name": "t_slug_check", "type": "check", "expression": "` + check + `"}],
 				"indexes": [
 					{"identity": {"schema": "public", "name": "t_low_idx"}, "unique": false, "method": "btree",
 					 "key": [{"expression": "lower(note)"}], "where": "slug <> ''"}
@@ -884,27 +884,39 @@ func TestV2TwinFailureFlagsEquivalentCheckAndDefault(t *testing.T) {
 	}
 
 	// Control: with a working twin the equivalent spellings compare equal.
-	h.assertDiffEmpty(doc("", ""), nil, false)
+	h.assertDiffEmpty(doc("", "", "length(slug) > 0"), nil, false)
 
-	// Forced twin failure the normalizer cannot isolate: a column typed by
-	// an enum this plan creates first (no twin of the table can exist yet).
-	// Plan only (not applied) — it must carry unverified warnings for the
-	// check, the default and BOTH index fields.
-	result := plan(doc(enumColumn, `{"identity": {"schema": "public", "name": "fresh"}, "managed": true, "values": ["a"]}`))
-	for _, want := range []string{
-		"equivalence not verified for check constraint t_slug_check expression",
-		"equivalence not verified for column public.t.note default",
-		"equivalence not verified for index public.t_low_idx key part",
-		"equivalence not verified for index public.t_low_idx predicate",
-	} {
-		found := false
-		for _, w := range result.Warnings {
-			if strings.Contains(w, want) {
-				found = true
-			}
+	// Q09 review-1: a column typed by an enum this plan creates first
+	// makes the whole twin fail; the fallback twin leaves that column out,
+	// so the equivalent check, default and index still compare equal
+	// through the catalog and the plan is just the new type and column.
+	const freshEnum = `{"identity": {"schema": "public", "name": "fresh"}, "managed": true, "values": ["a"]}`
+	result := plan(doc(enumColumn, freshEnum, "length(slug) > 0"))
+	if len(result.Up) != 2 || !strings.Contains(result.Up[0], "create type") || !strings.Contains(result.Up[1], `add column "bad"`) {
+		t.Fatalf("only the new type and column may be planned, got %v", result.Up)
+	}
+	for _, w := range result.Warnings {
+		if strings.Contains(w, "equivalence not verified") {
+			t.Fatalf("elements the catalog normalized must not be reported unverified: %s", w)
 		}
-		if !found {
-			t.Fatalf("missing unverified warning %q; warnings: %v", want, result.Warnings)
+	}
+
+	// An element that references the left-out column cannot be normalized
+	// on any twin yet: its textual difference is flagged unverified (the
+	// others still compare equal and stay out of the plan).
+	result = plan(doc(enumColumn, freshEnum, "length(slug) > 0 and bad is not null"))
+	var unverified []string
+	for _, w := range result.Warnings {
+		if strings.Contains(w, "equivalence not verified") {
+			unverified = append(unverified, w)
+		}
+	}
+	if len(unverified) != 1 || !strings.Contains(unverified[0], "check constraint t_slug_check expression") {
+		t.Fatalf("exactly the check must be flagged unverified, got %v", unverified)
+	}
+	for _, stmt := range result.Up {
+		if strings.Contains(stmt, "t_low_idx") || strings.Contains(stmt, "default") {
+			t.Fatalf("the normalized default and index must not be re-planned: %v", result.Up)
 		}
 	}
 
@@ -913,7 +925,7 @@ func TestV2TwinFailureFlagsEquivalentCheckAndDefault(t *testing.T) {
 	// adds) is normalized element by element: the equivalent check,
 	// default and index still compare equal through the catalog, so the
 	// plan is just the new column.
-	result = plan(doc(seqColumn, ""))
+	result = plan(doc(seqColumn, "", "length(slug) > 0"))
 	if len(result.Up) != 1 || !strings.Contains(result.Up[0], `add column "bad"`) {
 		t.Fatalf("only the new column may be planned, got %v", result.Up)
 	}

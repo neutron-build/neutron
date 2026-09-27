@@ -15,10 +15,14 @@ package db
 //
 // Temporary objects live in pg_temp and vanish with the session; no user
 // object is read-modified-written. Normalization is best-effort: when the
-// twin cannot be created (e.g. the desired table uses an enum this plan
-// would create first, or a base table does not exist yet), the desired
-// document text is used unchanged and the diff marks any resulting textual
-// difference as unverified instead of silently guessing equivalence.
+// twin cannot be created (e.g. an element uses an enum value this plan
+// adds, or a column is typed by an enum this plan creates first), the
+// table is normalized element by element on twins without the columns
+// whose type does not exist yet. An element that still cannot be
+// normalized (a view whose base table does not exist yet, an element of
+// such a column) keeps the desired document text, and the diff marks any
+// resulting textual difference as unverified instead of silently guessing
+// equivalence.
 
 import (
 	"context"
@@ -73,12 +77,13 @@ func (n *TwinNormalizer) nextName() string {
 }
 
 // PartialNormalizationError reports a table whose whole twin could not be
-// created, but whose expression elements were normalized one at a time:
-// Table carries every element the catalog could deparse, and the original
-// text for the rest. The typical cause is an element that uses an enum
-// value this plan adds (the live type does not have it yet), which must
-// not leave the table's unrelated expressions compared as raw text.
-// Comparisons on such a table stay flagged unverified.
+// created, and some of whose expression elements could not be normalized
+// one at a time either: Table carries every element the catalog could
+// deparse, and the original text for the rest (Failed). The typical cause
+// is an element that uses an enum value this plan adds (the live type does
+// not have it yet), which must not leave the table's unrelated expressions
+// compared as raw text. Comparisons on such a table stay flagged
+// unverified.
 type PartialNormalizationError struct {
 	Table  V2Table
 	Failed []string
@@ -102,23 +107,43 @@ func (n *TwinNormalizer) NormalizeTable(ctx context.Context, table V2Table) (V2T
 	return n.normalizeTableElements(ctx, table, err)
 }
 
-// normalizeTableElements is the fallback after the whole twin failed: a
-// twin carrying only the column types must work (otherwise the original
-// error stands, e.g. a column type this plan creates), then every
-// expression element is normalized on its own twin.
+// normalizeTableElements is the fallback after the whole twin failed. The
+// twin carries only the column types that can exist yet: a column typed by
+// something this plan creates first (a new enum, say) is left out, found by
+// creating each column alone. Every expression element is then normalized
+// on its own twin; an element that references a left-out column fails
+// there and keeps its original text. When every element normalized, the
+// table is fully normalized: the left-out columns carry no expression the
+// diff compares against the catalog.
 func (n *TwinNormalizer) normalizeTableElements(ctx context.Context, table V2Table, cause error) (V2Table, error) {
-	bare := table
-	bare.Columns = append([]V2Column(nil), table.Columns...)
-	for i := range bare.Columns {
-		if d := bare.Columns[i].Default; d != nil && d.Kind != "identity" {
-			bare.Columns[i].Default = nil
+	typesOnly := make([]V2Column, len(table.Columns))
+	for i, c := range table.Columns {
+		if d := c.Default; d != nil && d.Kind != "identity" {
+			c.Default = nil
 		}
-		bare.Columns[i].Generated = nil
+		c.Generated = nil
+		typesOnly[i] = c
 	}
+	bare := table
+	bare.Columns = typesOnly
 	bare.Constraints = nil
 	bare.Indexes = nil
 	if _, err := n.normalizeTableTwin(ctx, bare); err != nil {
-		return table, cause
+		bare.Columns = nil
+		for _, c := range typesOnly {
+			one := bare
+			one.Columns = []V2Column{c}
+			if _, err := n.normalizeTableTwin(ctx, one); err == nil {
+				bare.Columns = append(bare.Columns, c)
+			}
+		}
+		if _, err := n.normalizeTableTwin(ctx, bare); err != nil {
+			return table, cause
+		}
+	}
+	bareIdx := map[string]int{}
+	for j, c := range bare.Columns {
+		bareIdx[c.Name] = j
 	}
 
 	out := table
@@ -127,23 +152,34 @@ func (n *TwinNormalizer) normalizeTableElements(ctx context.Context, table V2Tab
 	out.Indexes = append([]V2Index(nil), table.Indexes...)
 	var failed []string
 	for i, c := range table.Columns {
+		j, ok := bareIdx[c.Name]
 		if c.Default != nil && (c.Default.Kind == "literal" || c.Default.Kind == "expression") {
-			one := bare
-			one.Columns = append([]V2Column(nil), bare.Columns...)
-			one.Columns[i].Default = c.Default
-			if got, err := n.normalizeTableTwin(ctx, one); err == nil {
-				out.Columns[i].Default = got.Columns[i].Default
-			} else {
+			normalized := false
+			if ok {
+				one := bare
+				one.Columns = append([]V2Column(nil), bare.Columns...)
+				one.Columns[j].Default = c.Default
+				if got, err := n.normalizeTableTwin(ctx, one); err == nil {
+					out.Columns[i].Default = got.Columns[j].Default
+					normalized = true
+				}
+			}
+			if !normalized {
 				failed = append(failed, "column "+c.Name+" default")
 			}
 		}
 		if c.Generated != nil {
-			one := bare
-			one.Columns = append([]V2Column(nil), bare.Columns...)
-			one.Columns[i].Generated = c.Generated
-			if got, err := n.normalizeTableTwin(ctx, one); err == nil {
-				out.Columns[i].Generated = got.Columns[i].Generated
-			} else {
+			normalized := false
+			if ok {
+				one := bare
+				one.Columns = append([]V2Column(nil), bare.Columns...)
+				one.Columns[j].Generated = c.Generated
+				if got, err := n.normalizeTableTwin(ctx, one); err == nil {
+					out.Columns[i].Generated = got.Columns[j].Generated
+					normalized = true
+				}
+			}
+			if !normalized {
 				failed = append(failed, "column "+c.Name+" generation expression")
 			}
 		}
@@ -169,6 +205,9 @@ func (n *TwinNormalizer) normalizeTableElements(ctx context.Context, table V2Tab
 		} else {
 			failed = append(failed, "index "+idx.Identity.Name)
 		}
+	}
+	if len(failed) == 0 {
+		return out, nil
 	}
 	return out, &PartialNormalizationError{Table: out, Failed: failed, Err: cause}
 }
