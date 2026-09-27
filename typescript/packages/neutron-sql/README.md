@@ -137,7 +137,11 @@ default and writes `{version}_{name}.up.sql` / `.down.sql` pairs;
 with the same type is dropped, it prints a
 suggestion — confirm intent with `--rename 'users.old>users.new'` (the `>`
 must be quoted in the shell; without quotes the shell reads it as a redirect
-and the flag never reaches the CLI).
+and the flag never reaches the CLI). Known limit: renaming a column that a
+generated column, check or index references also rewrites those definitions
+(on PostgreSQL 17+ a `SET EXPRESSION` and a drop and re-create of the check or
+index; on 16 the rename is refused). Nothing is lost, but the table is
+rewritten; rename such columns by hand until this is fixed.
 
 Enum value additions: PostgreSQL cannot use an enum value inside the
 transaction that adds it (SQLSTATE 55P04). When a plan adds enum values and
