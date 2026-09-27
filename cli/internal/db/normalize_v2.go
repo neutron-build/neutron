@@ -71,6 +71,13 @@ func (n *TwinNormalizer) Close() {
 	}
 }
 
+// exec runs one twin statement over the extended protocol, which refuses
+// more than one command: twin DDL embeds the document's expression text,
+// and planning must not run anything a crafted expression appends.
+func (n *TwinNormalizer) exec(ctx context.Context, sql string) error {
+	return n.conn.Conn().PgConn().ExecParams(ctx, sql, nil, nil, nil, nil).Read().Err
+}
+
 func (n *TwinNormalizer) nextName() string {
 	n.seq++
 	return fmt.Sprintf("neutron_norm_%d", n.seq)
@@ -356,7 +363,7 @@ func (n *TwinNormalizer) normalizeTableTwin(ctx context.Context, table V2Table) 
 		lines = append(lines, fmt.Sprintf("constraint %s check (%s)", quoteIdent(con.Name), *con.Expression))
 	}
 	create := fmt.Sprintf("create temporary table %s (%s)", quoteIdent(tmp), strings.Join(lines, ", "))
-	if _, err := n.conn.Exec(ctx, create); err != nil {
+	if err := n.exec(ctx, create); err != nil {
 		return table, fmt.Errorf("twin table for %s: %w", table.Identity, err)
 	}
 	defer n.conn.Exec(context.WithoutCancel(ctx), fmt.Sprintf("drop table if exists %s", quoteIdent(tmp)))
@@ -374,7 +381,7 @@ func (n *TwinNormalizer) normalizeTableTwin(ctx context.Context, table V2Table) 
 			stmt += "unique "
 		}
 		stmt += fmt.Sprintf("index %s on %s.%s %s", quoteIdent(idx.Identity.Name), quoteIdent("pg_temp"), quoteIdent(tmp), ddl)
-		if _, err := n.conn.Exec(ctx, stmt); err != nil {
+		if err := n.exec(ctx, stmt); err != nil {
 			return table, fmt.Errorf("twin index for %s.%s: %w", table.Identity, idx.Identity.Name, err)
 		}
 	}
@@ -392,6 +399,12 @@ func (n *TwinNormalizer) normalizeTableTwin(ctx context.Context, table V2Table) 
 		return table, fmt.Errorf("twin table %s could not be introspected: %s", table.Identity, strings.Join(reasons, "; "))
 	}
 
+	// Expression text can declare columns of its own (a check that closes
+	// its parenthesis early); a twin with any column the document does not
+	// declare would resolve references against it.
+	if len(twin.Columns) != len(table.Columns) {
+		return table, fmt.Errorf("twin table %s has %d columns, the document declares %d", table.Identity, len(twin.Columns), len(table.Columns))
+	}
 	out := table
 	byName := map[string]V2Column{}
 	for _, tc := range twin.Columns {
@@ -451,7 +464,7 @@ func (n *TwinNormalizer) NormalizeView(ctx context.Context, view V2View) (V2View
 		CheckOption:     view.CheckOption,
 		SecurityInvoker: view.SecurityInvoker,
 	})
-	if _, err := n.conn.Exec(ctx, create); err != nil {
+	if err := n.exec(ctx, create); err != nil {
 		return view, fmt.Errorf("twin view for %s: %w", view.Identity, err)
 	}
 	defer n.conn.Exec(context.WithoutCancel(ctx), fmt.Sprintf("drop view if exists %s", quoteIdent(tmp)))

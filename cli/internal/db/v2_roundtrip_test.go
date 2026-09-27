@@ -1052,6 +1052,63 @@ func TestQ09TwinFallbackNormalizesTogether(t *testing.T) {
 	assertNormalized(got, "c03")
 }
 
+// TestQ09TwinRunsOnlyTheDocumentsTable pins review-3 finding 1 live. Twin
+// DDL embeds the document's expression text: a check that closes its
+// parenthesis early must not give the twin a column the document does not
+// declare, which would let another element resolve against it and pass as
+// normalized. Nor may planning run a statement appended to an expression;
+// the validator refuses a separator, so that case sets the text directly.
+func TestQ09TwinRunsOnlyTheDocumentsTable(t *testing.T) {
+	h := newM02Harness(t, "twinonly")
+	normalize := func(checks string, override string) []string {
+		t.Helper()
+		doc := h.parseDoc(`{
+			"version": 2, "dialect": "postgresql", "capabilities": [],
+			"schemas": [{"name": "public"}], "enums": [],
+			"tables": [{
+				"identity": {"schema": "public", "name": "t"}, "managed": true,
+				"columns": [{"name": "a", "type": {"name": "int4", "codec": "number"}, "notNull": false}],
+				"constraints": [` + checks + `],
+				"indexes": []
+			}],
+			"views": [], "opaque": []
+		}`)
+		m, err := ModelFromRoot(doc.Root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if override != "" {
+			m.Tables[0].Constraints[0].Expression = &override
+		}
+		norm, err := h.client.NewTwinNormalizer(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer norm.Close()
+		_, err = norm.NormalizeTable(context.Background(), m.Tables[0])
+		var partial *PartialNormalizationError
+		if !errors.As(err, &partial) {
+			t.Fatalf("expected a partial normalization, got %v", err)
+		}
+		return partial.Failed
+	}
+
+	failed := normalize(`{"name": "t_inj", "type": "check", "expression": "a > 0"}`,
+		"a > 0); create table public.twin_injected (x int); create temporary table twin_tail (b int check (true")
+	if got := h.queryOne(`SELECT count(*) FROM pg_class WHERE relname = 'twin_injected'`); got != "0" {
+		t.Fatalf("planning ran a statement appended to a check expression")
+	}
+	if !equalStringSlices(failed, []string{"check t_inj"}) {
+		t.Fatalf("the crafted check must fail, got %v", failed)
+	}
+
+	failed = normalize(`{"name": "t_col", "type": "check", "expression": "a > 0), zz text, check (true"},
+		{"name": "t_use", "type": "check", "expression": "zz = 's'"}`, "")
+	if !equalStringSlices(failed, []string{"check t_col", "check t_use"}) {
+		t.Fatalf("a check resolving against a column the document does not declare must fail, got %v", failed)
+	}
+}
+
 func v2TestCheck(tbl V2Table, name string) string {
 	for _, c := range tbl.Constraints {
 		if c.Name == name && c.Expression != nil {
