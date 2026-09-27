@@ -221,6 +221,9 @@ func resolveAbort(ctx context.Context, client *db.Client, sess *db.MigrationSess
 	if err := guardProtectedObjects(ctx, client, []pendingMigration{p}, true); err != nil {
 		return err
 	}
+	if err := verifyDownServerVersion(ctx, client, p); err != nil {
+		return err
+	}
 	ui.Infof("Running the down SQL for %s in one transaction — partial effects are removed, history stays empty", p.File.Version)
 	if err := sess.ApplyStatementsTx(ctx, db.SplitSQLStatements(p.DownFile.SQL), func(stmt string) {
 		ui.Infof("undone: %s", firstLine(stmt))
@@ -242,6 +245,9 @@ func resolveRetry(ctx context.Context, client *db.Client, sess *db.MigrationSess
 		return err
 	}
 	if err := guardProtectedObjects(ctx, client, []pendingMigration{p}, false); err != nil {
+		return err
+	}
+	if err := verifyServerVersion(ctx, client, []pendingMigration{p}); err != nil {
 		return err
 	}
 	if p.Journal != nil {

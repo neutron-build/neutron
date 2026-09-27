@@ -529,3 +529,86 @@ func TestQ09PushNewEnumColumnKeepsUnchangedExpressions(t *testing.T) {
 		t.Fatalf("r2 must converge (%d):\n%s", code, out)
 	}
 }
+
+// Review-1 finding 2: `migrate resolve --retry` and `--abort` run SQL too,
+// so they refuse a server below the migration's floor before anything
+// runs, exactly as `migrate` does (resolve accepts a never-attempted
+// pending migration, so this is reachable without a server downgrade).
+// The plan's recorded floor is raised above the connected server so the
+// retry refusal is exercised on every server; the abort refusal (the down
+// SQL's own SET EXPRESSION) needs a server older than 17.
+func TestQ09ResolveHonorsServerFloor(t *testing.T) {
+	dbURL, fx := newM02CommandDB(t, "q09resolvefloor")
+	bin := buildCLIBinary(t)
+	work, docA, _, docExpr := q09Fixtures(t)
+	major := q09ServerMajor(t, fx)
+	mig := filepath.Join(work, "snap")
+	run := func(args ...string) (int, string) {
+		t.Helper()
+		return runCLIProcess(t, bin, dbURL, args...)
+	}
+
+	if code, out := run("migrate", "generate", "--mode", "snapshot", "--schema", docA, "--dir", mig, "--name", "init"); code != 0 {
+		t.Fatalf("snapshot generate A failed (%d):\n%s", code, out)
+	}
+	if code, out := run("migrate", "generate", "--mode", "snapshot", "--schema", docExpr, "--dir", mig, "--name", "expr"); code != 0 {
+		t.Fatalf("snapshot generate expr failed (%d):\n%s", code, out)
+	}
+	planPath := filepath.Join(mig, "002_expr.plan.json")
+	plan, err := db.LoadPlanArtifact(planPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	floor := major + 1
+	plan.MinServerMajor = floor
+	raw, err := db.MarshalPlanJSON(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, planPath, string(raw))
+
+	if code, out := run("migrate", "resolve", "001", "--retry", "--dir", mig); code != 0 {
+		t.Fatalf("resolve 001 --retry must apply the ungated migration (%d):\n%s", code, out)
+	}
+	if code, out := run("migrate", "--dir", mig); code == 0 || !strings.Contains(out, "002_expr") {
+		t.Fatalf("migrate must refuse 002 below its floor (%d):\n%s", code, out)
+	}
+
+	code, out := run("migrate", "resolve", "002", "--retry", "--dir", mig)
+	if code == 0 {
+		t.Fatalf("resolve --retry must refuse a server below the migration's floor:\n%s", out)
+	}
+	for _, want := range []string{"002_expr", "PostgreSQL " + strconv.Itoa(floor) + "+", "PostgreSQL " + strconv.Itoa(major), "before any statement runs"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("resolve --retry refusal must mention %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "Retrying") || strings.Contains(out, "SQLSTATE") {
+		t.Fatalf("the refusal happens before the migration runs:\n%s", out)
+	}
+	if got := q09Query(t, fx, `SELECT string_agg(version, ',' ORDER BY version) FROM _neutron_migrations`); got != "001" {
+		t.Fatalf("history = %s, want only 001", got)
+	}
+	if got := q09Query(t, fx, `SELECT count(*)::text FROM pg_attribute WHERE attrelid = 'app.tenants'::regclass AND attname = 'memo'`); got != "0" {
+		t.Fatal("no statement of 002 may run")
+	}
+
+	if major >= 17 {
+		return
+	}
+	code, out = run("migrate", "resolve", "002", "--abort", "--dir", mig)
+	if code == 0 {
+		t.Fatalf("resolve --abort must refuse a down SQL the server cannot run:\n%s", out)
+	}
+	for _, want := range []string{"cannot abort 002", "down SQL", "SET EXPRESSION needs PostgreSQL 17+", "before any statement runs"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("resolve --abort refusal must mention %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "undone:") || strings.Contains(out, "SQLSTATE") {
+		t.Fatalf("the refusal happens before the down SQL runs:\n%s", out)
+	}
+	if got := q09Query(t, fx, q09GrossExpr); !strings.Contains(got, "2") {
+		t.Fatalf("expression must be unchanged, got %q", got)
+	}
+}

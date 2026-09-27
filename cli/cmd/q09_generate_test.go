@@ -122,3 +122,33 @@ func TestQ09CheckServerVersionRefusesGatedMigrations(t *testing.T) {
 		t.Fatalf("a server at the recorded floor passes: %v", err)
 	}
 }
+
+// Review-1 finding 2: `migrate resolve --abort` runs the down SQL, so its
+// floor is the down statements'.
+func TestQ09CheckDownServerVersion(t *testing.T) {
+	gated := pendingMigration{
+		File:     db.MigrationFile{Version: "002", Name: "expr"},
+		DownFile: &db.MigrationFile{Version: "002", Name: "expr", SQL: "alter table \"app\".\"tenants\" drop column \"memo\";\nalter table \"app\".\"tenants\" alter column \"gross\" set expression as (net * 2);"},
+	}
+	err := checkDownServerVersion(16, gated)
+	if err == nil {
+		t.Fatal("PostgreSQL 16 cannot run a down SQL with SET EXPRESSION; abort must refuse")
+	}
+	for _, want := range []string{"cannot abort 002", "down SQL", "PostgreSQL 16", "002_expr", "SET EXPRESSION needs PostgreSQL 17+", "before any statement runs"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("refusal must mention %q: %v", want, err)
+		}
+	}
+	if err := checkDownServerVersion(17, gated); err != nil {
+		t.Fatalf("PostgreSQL 17 runs SET EXPRESSION: %v", err)
+	}
+	plain := gated
+	plain.DownFile = &db.MigrationFile{Version: "002", Name: "expr", SQL: `drop table app.t;`}
+	plain.Plan = &db.PlanArtifact{MinServerMajor: 17}
+	if err := checkDownServerVersion(16, plain); err != nil {
+		t.Fatalf("an ungated down SQL runs on any server: %v", err)
+	}
+	if err := checkDownServerVersion(16, pendingMigration{File: gated.File}); err != nil {
+		t.Fatalf("no down file: nothing to check: %v", err)
+	}
+}
