@@ -954,6 +954,14 @@ func (p *v2Planner) planColumnAttributes(table V2Identity, dc, ac V2Column) erro
 	case dc.Generated != nil && ac.Generated != nil:
 		if !p.textEqual(table, "column "+dc.Name+" generation expression", &dc.Generated.Expression, &ac.Generated.Expression) {
 			if p.opts.ServerMajor > 0 && p.opts.ServerMajor < SetExpressionMinServerMajor {
+				if !p.comparisonVerified(table) {
+					// No catalog oracle for this table: the difference may
+					// be spelling only. Say so, and carry the unverified
+					// notes the refusal would otherwise drop.
+					return fmt.Errorf(
+						"table %s: generated column %q could not be verified: the schema writes its expression %q and %s holds %q, and without a catalog comparison the difference may be spelling only. A real change needs ALTER COLUMN ... SET EXPRESSION (PostgreSQL %d+), which the connected PostgreSQL %d cannot run, so the plan is refused. If the expression is unchanged, write it as %s spells it; if it changed, upgrade the server to PostgreSQL %d+, or replace the column explicitly in two steps: remove it from the schema and apply with --allow-destructive (its stored values are dropped), then add it back with the new expression (values are recomputed; a re-added column is placed last, so declare it last)\n%s",
+						table, dc.Name, dc.Generated.Expression, p.baseNoun(), ac.Generated.Expression, SetExpressionMinServerMajor, p.opts.ServerMajor, p.baseNoun(), SetExpressionMinServerMajor, p.unverifiedNotes())
+				}
 				return fmt.Errorf(
 					"table %s: generated column %q changes its expression, which needs ALTER COLUMN ... SET EXPRESSION (PostgreSQL %d+); the connected server is PostgreSQL %d, so the plan would fail. Upgrade the server to PostgreSQL %d+, or replace the column explicitly in two steps: remove it from the schema and apply with --allow-destructive (its stored values are dropped), then add it back with the new expression (values are recomputed; a re-added column is placed last, so declare it last)",
 					table, dc.Name, SetExpressionMinServerMajor, p.opts.ServerMajor, SetExpressionMinServerMajor)
@@ -1670,9 +1678,21 @@ func (p *v2Planner) reportOutOfScope() {
 	}
 }
 
+const unverifiedFormat = "equivalence not verified for %s — re-run with a live normalizer or align spellings"
+
+// unverifiedNotes renders the unverified notes collected so far, one per
+// line, for a refusal that returns before reportUnverified runs.
+func (p *v2Planner) unverifiedNotes() string {
+	lines := make([]string, 0, len(p.unverified))
+	for _, u := range p.unverified {
+		lines = append(lines, "  "+fmt.Sprintf(unverifiedFormat, u))
+	}
+	return strings.Join(lines, "\n")
+}
+
 func (p *v2Planner) reportUnverified() {
 	for _, u := range p.unverified {
-		p.warn("equivalence not verified for %s — re-run with a live normalizer or align spellings", u)
+		p.warn(unverifiedFormat, u)
 	}
 	p.result.Up = p.upOps
 	p.result.Down = p.downOps

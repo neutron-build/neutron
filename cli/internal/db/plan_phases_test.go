@@ -6,6 +6,7 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -213,6 +214,61 @@ func TestQ09SetExpressionServerFloor(t *testing.T) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&back); err != nil || back.MinServerMajor != 17 {
 		t.Fatalf("strict decode of a gated plan: %v (floor %d)", err, back.MinServerMajor)
+	}
+}
+
+// q09StubNormalizer stands in for the twin normalizer: fail reports every
+// table as not normalizable (the twin could not be created); otherwise
+// the desired table is returned as the catalog's spelling.
+type q09StubNormalizer struct{ fail bool }
+
+func (n q09StubNormalizer) NormalizeTable(_ context.Context, t V2Table) (V2Table, error) {
+	if n.fail {
+		return t, errors.New("twin table failed")
+	}
+	return t, nil
+}
+
+func (n q09StubNormalizer) NormalizeView(_ context.Context, v V2View) (V2View, error) {
+	if n.fail {
+		return v, errors.New("twin view failed")
+	}
+	return v, nil
+}
+
+func (q09StubNormalizer) Close() {}
+
+// Review-1 finding 1: when the generated expression could not be compared
+// through the catalog, the PostgreSQL 16 refusal must say the difference
+// is unverified (possibly spelling only) and carry the unverified notes
+// the early return would otherwise drop; a verified difference keeps the
+// "changes its expression" refusal.
+func TestQ09SetExpressionRefusalSaysWhenUnverified(t *testing.T) {
+	base := q09Doc(t, `"expression": "net * 2"`, `"expression": "(net * (2)::numeric)"`)
+	desired := q09Doc(t)
+
+	_, err := DiffV2Document(context.Background(), desired, base, DiffV2Options{ServerMajor: 16, Normalizer: q09StubNormalizer{fail: true}})
+	if err == nil {
+		t.Fatal("an unverified difference still cannot be applied on PostgreSQL 16; the planner must refuse")
+	}
+	for _, want := range []string{
+		`generated column "gross" could not be verified`,
+		"may be spelling only",
+		`"net * 2"`, `"(net * (2)::numeric)"`,
+		"PostgreSQL 16", "SET EXPRESSION (PostgreSQL 17+)", "--allow-destructive",
+		`equivalence not verified for column gross generation expression: "net * 2" (desired) vs "(net * (2)::numeric)" (live)`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("unverified refusal must mention %q: %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "changes its expression") {
+		t.Fatalf("an unverified difference must not be called a change: %v", err)
+	}
+
+	_, err = DiffV2Document(context.Background(), desired, base, DiffV2Options{ServerMajor: 16, Normalizer: q09StubNormalizer{}})
+	if err == nil || !strings.Contains(err.Error(), `generated column "gross" changes its expression`) || strings.Contains(err.Error(), "could not be verified") {
+		t.Fatalf("a catalog-verified difference is a change: %v", err)
 	}
 }
 
