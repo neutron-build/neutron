@@ -61,7 +61,7 @@ jobs:
     # studio row-safety in ./internal/studio). They read NEUTRON_E2E_DATABASE_URL
     # and skip with a reason locally; NEUTRON_LIVE_REQUIRED=1 flips a missing
     # URL into a failure here so the live leg can never silently disappear.
-    # Image: postgres:17 (repo workflows pin no digests; see typescript.yml).
+    # Image: pgvector/pgvector:pg17 (repo workflows pin no digests; see typescript.yml).
     services:
       postgres:
         # PostgreSQL 17 with the pgvector extension available (not
