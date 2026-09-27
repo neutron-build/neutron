@@ -336,6 +336,12 @@ func migrationNameSlug(name string) (string, error) {
 	return slug, nil
 }
 
+// MigrationNameSlug is the file-name form of a migration name ("Add Mood"
+// becomes "add_mood"), validated as CreateMigrationFiles validates it.
+func MigrationNameSlug(name string) (string, error) {
+	return migrationNameSlug(name)
+}
+
 // CreateMigrationFiles generates a new pair of .up.sql and .down.sql files.
 func CreateMigrationFiles(dir, name string) (string, string, error) {
 	return CreateMigrationFilesWithContent(dir, name, "", "")

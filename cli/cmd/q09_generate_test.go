@@ -6,6 +6,7 @@ package cmd
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -150,5 +151,35 @@ func TestQ09CheckDownServerVersion(t *testing.T) {
 	}
 	if err := checkDownServerVersion(16, pendingMigration{File: gated.File}); err != nil {
 		t.Fatalf("no down file: nothing to check: %v", err)
+	}
+}
+
+// Review-1 finding 5: generate's messages and file headers name a
+// migration the way its files do ("002_add_mood_enum_values"), not by
+// the raw --name ("Add Mood").
+func TestQ09GenerateMessagesUseTheFileSlug(t *testing.T) {
+	bin := buildCLIBinary(t)
+	work, docA, docB, _ := q09Fixtures(t)
+	mig := filepath.Join(work, "mig")
+	run := func(args ...string) string {
+		t.Helper()
+		out, err := exec.Command(bin, args...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out)
+		}
+		return string(out)
+	}
+	out := run("migrate", "generate", "--mode", "snapshot", "--schema", docA, "--dir", mig, "--name", "Init Schema")
+	out += run("migrate", "generate", "--mode", "snapshot", "--schema", docB, "--dir", mig, "--name", "Add Mood")
+	for _, want := range []string{"001_init_schema", "002_add_mood_enum_values", "003_add_mood"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output must name %s:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "Add Mood") || strings.Contains(out, "Init Schema") {
+		t.Fatalf("output must not use the raw --name:\n%s", out)
+	}
+	if up := readFile(t, filepath.Join(mig, "002_add_mood_enum_values.up.sql")); !strings.HasPrefix(up, "-- Migration: add_mood_enum_values\n") {
+		t.Fatalf("the header must name the file's migration:\n%s", up)
 	}
 }
