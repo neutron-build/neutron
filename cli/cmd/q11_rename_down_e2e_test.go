@@ -21,14 +21,16 @@ import (
 )
 
 // q11Catalog is the catalog's text of every column, constraint and index
-// in schema app, plus the rows of every table.
+// in schema app, plus the rows of every table. NOT NULL constraints
+// (PostgreSQL 18 catalogs them, named after the column at creation and
+// kept across a rename) are left out: the columns carry not null.
 const q11Catalog = `SELECT concat_ws(E'\n',
 	(SELECT string_agg(format('%s.%s %s%s', c.relname, a.attname, format_type(a.atttypid, a.atttypmod), CASE WHEN a.attnotnull THEN ' not null' ELSE '' END), ', ' ORDER BY c.relname, a.attnum)
 		FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE n.nspname = 'app' AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped),
 	(SELECT string_agg(format('%s.%s %s', c.relname, co.conname, pg_get_constraintdef(co.oid)), ' | ' ORDER BY c.relname, co.conname)
 		FROM pg_constraint co JOIN pg_class c ON c.oid = co.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname = 'app'),
+		WHERE n.nspname = 'app' AND co.contype <> 'n'),
 	(SELECT string_agg(pg_get_indexdef(i.indexrelid), ' | ' ORDER BY i.indexrelid::regclass::text)
 		FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE n.nspname = 'app'))`
