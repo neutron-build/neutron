@@ -23,10 +23,15 @@ package db
 // such a column) keeps the desired document text, and the diff marks any
 // resulting textual difference as unverified instead of silently guessing
 // equivalence.
+//
+// A table with planned column renames is compared against its live
+// expressions as they will read after the rename: RenameTable twins the
+// live table, lets PostgreSQL rename the twin's columns, and deparses.
 
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -44,6 +49,11 @@ type V2Normalizer interface {
 	// NormalizeView returns the desired view with its definition replaced
 	// by the catalog's deparse of that definition.
 	NormalizeView(ctx context.Context, view V2View) (V2View, error)
+	// RenameTable returns a live table with its expression fields (the
+	// same fields NormalizeTable replaces) as the catalog deparses them
+	// after renaming its columns (renames: live name -> new name).
+	// Column names and structural fields are untouched.
+	RenameTable(ctx context.Context, table V2Table, renames map[string]string) (V2Table, error)
 	Close()
 }
 
@@ -120,6 +130,18 @@ func (n *TwinNormalizer) NormalizeTable(ctx context.Context, table V2Table) (V2T
 		return out, nil
 	}
 	return n.normalizeTableElements(ctx, table, err)
+}
+
+// RenameTable materializes the live table as a twin under its live column
+// names, renames the twin's columns and reads the expressions back:
+// PostgreSQL rewrites generation expressions, checks and index definitions
+// on RENAME COLUMN itself, so the twin holds exactly what the live catalog
+// will hold after the planned rename. No expression text is rewritten here.
+func (n *TwinNormalizer) RenameTable(ctx context.Context, table V2Table, renames map[string]string) (V2Table, error) {
+	if n.conn == nil {
+		return table, fmt.Errorf("normalizer closed")
+	}
+	return n.twin(ctx, table, renames)
 }
 
 // normalizeTableElements is the fallback after the whole twin failed. The
@@ -344,6 +366,12 @@ func indexNamesColumn(idx V2Index, columns map[string]bool) bool {
 }
 
 func (n *TwinNormalizer) normalizeTableTwin(ctx context.Context, table V2Table) (V2Table, error) {
+	return n.twin(ctx, table, nil)
+}
+
+// twin creates the table's twin, renames its columns (live name -> new
+// name) and returns the table with the twin's deparsed expressions.
+func (n *TwinNormalizer) twin(ctx context.Context, table V2Table, renames map[string]string) (V2Table, error) {
 	tmp := n.nextName()
 
 	// Columns with defaults and check constraints; foreign keys and PK/
@@ -385,6 +413,17 @@ func (n *TwinNormalizer) normalizeTableTwin(ctx context.Context, table V2Table) 
 			return table, fmt.Errorf("twin index for %s.%s: %w", table.Identity, idx.Identity.Name, err)
 		}
 	}
+	olds := make([]string, 0, len(renames))
+	for old := range renames {
+		olds = append(olds, old)
+	}
+	sort.Strings(olds)
+	for _, old := range olds {
+		stmt := fmt.Sprintf("alter table %s.%s rename column %s to %s", quoteIdent("pg_temp"), quoteIdent(tmp), quoteIdent(old), quoteIdent(renames[old]))
+		if err := n.exec(ctx, stmt); err != nil {
+			return table, fmt.Errorf("twin rename for %s.%s: %w", table.Identity, old, err)
+		}
+	}
 
 	var oid uint32
 	if err := n.conn.QueryRow(ctx, `SELECT $1::regclass::oid`, "pg_temp."+tmp).Scan(&oid); err != nil {
@@ -407,12 +446,19 @@ func (n *TwinNormalizer) normalizeTableTwin(ctx context.Context, table V2Table) 
 		return table, fmt.Errorf("twin table %s has %d columns, the document declares %d", table.Identity, len(twin.Columns), len(table.Columns))
 	}
 	out := table
+	out.Columns = append([]V2Column(nil), table.Columns...)
+	out.Constraints = append([]V2Constraint(nil), table.Constraints...)
+	out.Indexes = append([]V2Index(nil), table.Indexes...)
 	byName := map[string]V2Column{}
 	for _, tc := range twin.Columns {
 		byName[tc.Name] = tc
 	}
 	for i := range out.Columns {
-		tc, ok := byName[out.Columns[i].Name]
+		name := out.Columns[i].Name
+		if to, ok := renames[name]; ok {
+			name = to
+		}
+		tc, ok := byName[name]
 		if !ok {
 			return table, fmt.Errorf("twin table %s lacks column %q", table.Identity, out.Columns[i].Name)
 		}

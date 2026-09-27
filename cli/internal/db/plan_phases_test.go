@@ -236,6 +236,13 @@ func (n q09StubNormalizer) NormalizeView(_ context.Context, v V2View) (V2View, e
 	return v, nil
 }
 
+func (n q09StubNormalizer) RenameTable(_ context.Context, t V2Table, _ map[string]string) (V2Table, error) {
+	if n.fail {
+		return t, errors.New("twin table failed")
+	}
+	return t, nil
+}
+
 func (q09StubNormalizer) Close() {}
 
 // Review-1 finding 1: when the generated expression could not be compared
@@ -282,6 +289,10 @@ func (n q09PartialNormalizer) NormalizeTable(_ context.Context, t V2Table) (V2Ta
 
 func (q09PartialNormalizer) NormalizeView(_ context.Context, v V2View) (V2View, error) {
 	return v, nil
+}
+
+func (q09PartialNormalizer) RenameTable(_ context.Context, t V2Table, _ map[string]string) (V2Table, error) {
+	return t, nil
 }
 
 func (q09PartialNormalizer) Close() {}
