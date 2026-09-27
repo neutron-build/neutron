@@ -104,6 +104,7 @@ func DiffV2Document(ctx context.Context, desired, actual *V2Document, opts DiffV
 		twinFailedTables: map[V2Identity]bool{},
 		twinFailedElems:  map[V2Identity]map[string]bool{},
 		twinFailedViews:  map[V2Identity]bool{},
+		unrenamedTables:  map[V2Identity]string{},
 	}
 
 	for _, s := range d.Schemas {
@@ -172,6 +173,7 @@ type v2Planner struct {
 	twinFailedTables map[V2Identity]bool
 	twinFailedElems  map[V2Identity]map[string]bool
 	twinFailedViews  map[V2Identity]bool
+	unrenamedTables  map[V2Identity]string // live text kept its pre-rename names
 	unverified       []string
 }
 
@@ -793,6 +795,10 @@ func (p *v2Planner) planSharedTables() error {
 		}
 	}
 
+	for _, dt := range shared {
+		p.renameActual(dt.Identity)
+	}
+
 	// Phase 1: renames.
 	for _, dt := range shared {
 		for _, dc := range dt.Columns {
@@ -896,6 +902,38 @@ func (p *v2Planner) planSharedTables() error {
 		}
 	}
 	return nil
+}
+
+// renameActual replaces a renamed table's live expressions with the
+// catalog's deparse after the planned RENAME COLUMNs: PostgreSQL rewrites
+// generation expressions, checks and index definitions on rename, so a
+// rename alone compares equal and a real change still differs. Down
+// statements run before the renames are reverted and need the renamed
+// spelling too. Without a normalizer (offline snapshot planning) or when
+// the twin fails, the live text keeps its old names and differences on the
+// table stay unverified.
+func (p *v2Planner) renameActual(table V2Identity) {
+	prefix := table.String() + "."
+	renames := map[string]string{}
+	var described []string
+	for target, source := range p.opts.Renames {
+		if strings.HasPrefix(target, prefix) {
+			renames[source] = target[len(prefix):]
+			described = append(described, source+" to "+target[len(prefix):])
+		}
+	}
+	at := p.actual.Table(table)
+	if len(renames) == 0 || at == nil || !tableHasComparableExpressions(at) {
+		return
+	}
+	if p.opts.Normalizer != nil {
+		if renamed, err := p.opts.Normalizer.RenameTable(p.ctx, *at, renames); err == nil {
+			*at = renamed
+			return
+		}
+	}
+	sort.Strings(described)
+	p.unrenamedTables[table] = strings.Join(described, ", ")
 }
 
 func columnNames(t V2Table) []string {
@@ -1352,7 +1390,7 @@ func (p *v2Planner) planIndexChanges(table V2Identity, desired, actual *V2Table)
 // element (v2DefaultElement and friends) of this table had a catalog oracle:
 // a live twin normalizer that normalized that element.
 func (p *v2Planner) comparisonVerified(table V2Identity, element string) bool {
-	return p.opts.Normalizer != nil && !p.twinFailedTables[table] && !p.twinFailedElems[table][element]
+	return p.opts.Normalizer != nil && !p.twinFailedTables[table] && !p.twinFailedElems[table][element] && p.unrenamedTables[table] == ""
 }
 
 // indexEqualAfterRenames compares index metadata with the live column
@@ -1421,7 +1459,11 @@ func (p *v2Planner) textEqual(table V2Identity, element, what string, desired, a
 		return true
 	}
 	if !p.comparisonVerified(table, element) {
-		p.unverified = append(p.unverified, fmt.Sprintf("%s: %q (desired) vs %q (live) — compared textually without a catalog oracle", what, *desired, *actual))
+		note := fmt.Sprintf("%s: %q (desired) vs %q (live) — compared textually without a catalog oracle", what, *desired, *actual)
+		if renamed := p.unrenamedTables[table]; renamed != "" {
+			note += fmt.Sprintf(", and the live text predates the rename of %s that PostgreSQL applies to it", renamed)
+		}
+		p.unverified = append(p.unverified, note)
 	}
 	return false
 }
