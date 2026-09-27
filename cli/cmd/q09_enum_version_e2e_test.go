@@ -225,8 +225,8 @@ func TestQ09GenerateLiveSplitsEnumAdditions(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("generate B failed (%d):\n%s", code, out)
 	}
-	if !strings.Contains(out, "55P04") {
-		t.Fatalf("generate must say why the enum addition is its own migration:\n%s", out)
+	if !strings.Contains(out, "55P04") || !strings.Contains(out, "(002_mood_enum_values)") {
+		t.Fatalf("generate must say why the enum addition is its own migration, named by its file:\n%s", out)
 	}
 	enumUp := readFile(t, filepath.Join(mig, "002_mood_enum_values.up.sql"))
 	restUp := readFile(t, filepath.Join(mig, "003_mood.up.sql"))
