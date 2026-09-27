@@ -449,3 +449,117 @@ func TestQ10GenerateSnapshotRenameStaysUnverified(t *testing.T) {
 		t.Fatalf("offline planning must not reduce an unverified comparison to the rename alone: %q", up)
 	}
 }
+
+// q10IncludeDoc renders app.t with column col and index t_inc_idx on (id)
+// include (col) where pred.
+func q10IncludeDoc(col, pred string) string {
+	return fmt.Sprintf(`{
+	"version": 2, "dialect": "postgresql", "capabilities": [],
+	"schemas": [{"name": "app"}], "enums": [],
+	"tables": [{"identity": {"schema": "app", "name": "t"}, "managed": true,
+		"columns": [
+			{"name": "id", "type": {"name": "int4", "codec": "number"}, "notNull": true},
+			{"name": %[1]q, "type": {"name": "numeric", "codec": "decimal-string"}, "notNull": false}],
+		"constraints": [{"name": "t_pkey", "type": "primary-key", "columns": ["id"]}],
+		"indexes": [{"identity": {"schema": "app", "name": "t_inc_idx"}, "unique": false, "method": "btree", "key": [{"column": "id"}], "include": [%[1]q], "where": %[2]q}]}],
+	"views": [], "opaque": []
+}`, col, pred)
+}
+
+// A renamed column in an index's INCLUDE list: the down file recreates the
+// index under the renamed spelling in full (it runs before the rename is
+// reverted), so migrate down restores the original definition.
+func TestQ10GenerateLiveRenameInclude(t *testing.T) {
+	dbURL, fx := newM02CommandDB(t, "q10geninc")
+	bin := buildCLIBinary(t)
+	work := t.TempDir()
+	before, after, changed := filepath.Join(work, "before.json"), filepath.Join(work, "after.json"), filepath.Join(work, "changed.json")
+	writeFile(t, before, q10IncludeDoc("net", "net > 1"))
+	writeFile(t, after, q10IncludeDoc("amount", "amount > 1"))
+	writeFile(t, changed, q10IncludeDoc("amount", "amount > 2"))
+	major := q09ServerMajor(t, fx)
+	mig := filepath.Join(work, "migrations")
+	run := func(args ...string) (int, string) {
+		t.Helper()
+		return runCLIProcess(t, bin, dbURL, args...)
+	}
+
+	if code, out := run("migrate", "generate", "--mode", "live", "--schema", before, "--dir", mig, "--name", "init"); code != 0 {
+		t.Fatalf("generate init failed (%d):\n%s", code, out)
+	}
+	if code, out := run("migrate", "--dir", mig); code != 0 {
+		t.Fatalf("migrate init failed (%d):\n%s", code, out)
+	}
+	if err := fx.Exec(context.Background(), `INSERT INTO app.t (id, net) VALUES (1, 5)`); err != nil {
+		t.Fatal(err)
+	}
+	identity := q09Query(t, fx, q10Identity)
+	defsBefore := q09Query(t, fx, q10Definitions)
+	if want := `CREATE INDEX t_inc_idx ON app.t USING btree (id) INCLUDE (net) WHERE (net > (1)::numeric)`; defsBefore != want {
+		t.Fatalf("PostgreSQL %d: initial definition %s", major, defsBefore)
+	}
+
+	// A rename alone: the INCLUDE list follows the rename in the catalog.
+	if code, out := run("migrate", "generate", "--mode", "live", "--schema", after, "--dir", mig, "--name", "rename", "--rename", "app.t.net>app.t.amount"); code != 0 {
+		t.Fatalf("PostgreSQL %d: generate rename failed (%d):\n%s", major, code, out)
+	}
+	up := q10FileStatements(t, filepath.Join(mig, "002_rename.up.sql"))
+	down := q10FileStatements(t, filepath.Join(mig, "002_rename.down.sql"))
+	if len(up) != 1 || up[0] != `alter table "app"."t" rename column "net" to "amount"` ||
+		len(down) != 1 || down[0] != `alter table "app"."t" rename column "amount" to "net"` {
+		t.Fatalf("PostgreSQL %d: a rename alone is the rename and its reverse:\nup   %q\ndown %q", major, up, down)
+	}
+	if code, out := run("migrate", "--dir", mig); code != 0 {
+		t.Fatalf("PostgreSQL %d: migrate rename failed (%d):\n%s", major, code, out)
+	}
+	if got := q09Query(t, fx, q10Identity); got != identity {
+		t.Fatalf("PostgreSQL %d: no rebuild expected: %s -> %s", major, identity, got)
+	}
+	if code, out := run("migrate", "down", "--dir", mig); code != 0 {
+		t.Fatalf("PostgreSQL %d: migrate down failed (%d):\n%s", major, code, out)
+	}
+	if got := q09Query(t, fx, q10Definitions); got != defsBefore {
+		t.Fatalf("PostgreSQL %d: down must restore the definition:\n got %s\nwant %s", major, got, defsBefore)
+	}
+	for _, f := range []string{"002_rename.up.sql", "002_rename.down.sql"} {
+		if err := os.Remove(filepath.Join(mig, f)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A rename plus a changed predicate rebuilds the index; its down
+	// recreates the old predicate with the INCLUDE list renamed as well.
+	if code, out := run("migrate", "generate", "--mode", "live", "--schema", changed, "--dir", mig, "--name", "change", "--rename", "app.t.net>app.t.amount"); code != 0 {
+		t.Fatalf("PostgreSQL %d: generate change failed (%d):\n%s", major, code, out)
+	}
+	up = q10FileStatements(t, filepath.Join(mig, "002_change.up.sql"))
+	down = q10FileStatements(t, filepath.Join(mig, "002_change.down.sql"))
+	wantUp := []string{
+		`alter table "app"."t" rename column "net" to "amount"`,
+		`drop index if exists "app"."t_inc_idx"`,
+		`create index "t_inc_idx" on "app"."t" using btree ("id") include ("amount") where (amount > (2)::numeric)`,
+	}
+	wantDown := []string{
+		`drop index if exists "app"."t_inc_idx"`,
+		`create index "t_inc_idx" on "app"."t" using btree ("id") include ("amount") where (amount > (1)::numeric)`,
+		`alter table "app"."t" rename column "amount" to "net"`,
+	}
+	if strings.Join(up, "\n") != strings.Join(wantUp, "\n") || strings.Join(down, "\n") != strings.Join(wantDown, "\n") {
+		t.Fatalf("PostgreSQL %d: rename plus predicate change:\nup   %q\ndown %q", major, up, down)
+	}
+	if code, out := run("migrate", "--dir", mig, "--allow-destructive"); code != 0 {
+		t.Fatalf("PostgreSQL %d: migrate change failed (%d):\n%s", major, code, out)
+	}
+	if got, want := q09Query(t, fx, q10Definitions), `CREATE INDEX t_inc_idx ON app.t USING btree (id) INCLUDE (amount) WHERE (amount > (2)::numeric)`; got != want {
+		t.Fatalf("PostgreSQL %d: definition after the change:\n got %s\nwant %s", major, got, want)
+	}
+	if code, out := run("migrate", "down", "--dir", mig); code != 0 {
+		t.Fatalf("PostgreSQL %d: migrate down of the change failed (%d):\n%s", major, code, out)
+	}
+	if got := q09Query(t, fx, q10Definitions); got != defsBefore {
+		t.Fatalf("PostgreSQL %d: down must restore the definition:\n got %s\nwant %s", major, got, defsBefore)
+	}
+	if got := q09Query(t, fx, `SELECT row_to_json(t)::text FROM app.t t`); got != `{"id":1,"net":5}` {
+		t.Fatalf("PostgreSQL %d: rows changed: %s", major, got)
+	}
+}

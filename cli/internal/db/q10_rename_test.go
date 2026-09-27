@@ -126,7 +126,7 @@ func TestQ10RenameTableTwinLive(t *testing.T) {
 		gross numeric GENERATED ALWAYS AS (abs(abs) + "Net" + length('abs')) STORED,
 		CONSTRAINT t_c CHECK ("Net" > 0 AND label <> 'Net' AND label <> 'abs')
 	)`)
-	h.exec(`CREATE INDEX t_expr_idx ON app.t (abs(abs), label) WHERE "Net" > 1 AND label <> 'Net'`)
+	h.exec(`CREATE INDEX t_expr_idx ON app.t (abs(abs), label) INCLUDE ("Net") WHERE "Net" > 1 AND label <> 'Net'`)
 	actual, err := h.client.IntrospectV2(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -158,6 +158,9 @@ func TestQ10RenameTableTwinLive(t *testing.T) {
 	idx := got.Index("t_expr_idx")
 	if k := *idx.Key[0].Expression; k != `abs(val)` || idx.Key[1].Column == nil || *idx.Key[1].Column != "label" {
 		t.Fatalf("index key after the rename: %+v", idx.Key)
+	}
+	if len(idx.Include) != 1 || idx.Include[0] != "amount" {
+		t.Fatalf("index INCLUDE after the rename: %q", idx.Include)
 	}
 	if w := *idx.Where; w != `((amount > (1)::numeric) AND (label <> 'Net'::text))` {
 		t.Fatalf("index predicate after the rename: %s", w)

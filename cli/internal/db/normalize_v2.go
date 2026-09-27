@@ -51,8 +51,10 @@ type V2Normalizer interface {
 	NormalizeView(ctx context.Context, view V2View) (V2View, error)
 	// RenameTable returns a live table with its expression fields (the
 	// same fields NormalizeTable replaces) as the catalog deparses them
-	// after renaming its columns (renames: live name -> new name).
-	// Column names and structural fields are untouched.
+	// after renaming its columns (renames: live name -> new name). Index
+	// key and INCLUDE columns come back renamed as well, as the index
+	// reads after the rename; column names and the other structural
+	// fields are untouched.
 	RenameTable(ctx context.Context, table V2Table, renames map[string]string) (V2Table, error)
 	Close()
 }
@@ -499,6 +501,9 @@ func (n *TwinNormalizer) twin(ctx context.Context, table V2Table, renames map[st
 		}
 		out.Indexes[i].Key = ti.Key
 		out.Indexes[i].Where = ti.Where
+		if len(renames) > 0 {
+			out.Indexes[i].Include = ti.Include
+		}
 	}
 	return out, nil
 }
