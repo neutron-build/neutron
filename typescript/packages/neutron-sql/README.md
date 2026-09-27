@@ -176,7 +176,14 @@ Safety semantics: generated SQL never drops `_neutron_*`
 metadata tables, extension-owned objects, or anything absent from the schema
 unless `--allow-destructive` is passed as an explicit acknowledgement. The
 `_neutron_` table prefix is reserved: such tables cannot be declared in a
-schema, and `schema pull` and `schema baseline` leave them out.
+schema, and `schema pull` and `schema baseline` leave them out. In
+`--mode snapshot`, what a plan leaves in place is recorded in its target
+snapshot, so the chain keeps matching the database; its drops stay listed as
+pending until a plan with `--allow-destructive` drops it or the schema
+declares it again. Column order is informational: PostgreSQL appends added
+columns and cannot reorder existing ones without rebuilding the table, so a
+schema that declares another order is noted and plans nothing (insert with
+column lists, not by position).
 Catalog structures the diff cannot represent faithfully are rejected with an
 error instead of producing a migration that falsely claims synchronization.
 With a version-2 document the planner covers schema-qualified tables,
@@ -1531,6 +1538,13 @@ Existing databases:
       baseline`. The new baseline covers every applied file, including
       snapshot migrations already applied.
    4. Regenerate the moved-out changes with `--mode snapshot`.
+
+   An earlier CLI's snapshot plan could also omit objects it left in place
+   (without `--allow-destructive`), after which `neutron migrate` and
+   `neutron schema check --live` refuse with drift for objects the database
+   has and the chain lacks. The refusal names the recovery: move out the
+   pending snapshot migrations, delete `migrations/snapshots/`, run
+   `neutron schema baseline`, and generate again.
 
 Rollback and recovery limits:
 
