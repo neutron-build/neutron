@@ -87,6 +87,9 @@ var schemaCheckCmd = &cobra.Command{
 	Short: "Check the schema against the snapshot chain",
 	Long: `Offline (default): diffs the desired schema document against the chain head
 snapshot — a non-empty diff means pending schema changes, reported and exit 1.
+Objects a migration left in place because the document no longer declares them
+are recorded in the chain, so their drops stay listed as pending until a plan
+with --allow-destructive drops them or the document declares them again.
 
 With --live: introspects the database and compares it against the snapshot of the
 newest APPLIED migration (or the baseline). Any managed-scope difference is drift:
@@ -231,6 +234,36 @@ func reportBaselineInternal(chain *db.SnapshotChain) {
 	ui.Infof("baseline %s_%s lists neutron-internal metadata %s (written by an earlier CLI): ignored — internal tables are never managed", db.BaselineVersion, db.BaselineName, db.IdentityList(chain.BaselineInternal))
 }
 
+// reportChainRetained notes migration snapshots an earlier CLI wrote without
+// the objects their migration left in place; the chain loader reads them in.
+func reportChainRetained(chain *db.SnapshotChain) {
+	if chain == nil {
+		return
+	}
+	if n := len(chain.Retained); n > 0 {
+		stems := make([]string, n)
+		for i, r := range chain.Retained {
+			stems[i] = r.Stem
+		}
+		last := chain.Retained[n-1]
+		ui.Infof("snapshot(s) %s, written by an earlier CLI, omit what their migrations left in place (%s: %s): read as still in place — the files are unchanged", strings.Join(stems, ", "), last.Stem, db.RetainedList(last.Objects))
+	}
+	for _, e := range chain.RetainedErrors {
+		ui.Warnf("%s", e)
+	}
+}
+
+// retainedDriftHint is the way out when drift meets snapshots an earlier
+// CLI wrote: they are read with what their migrations left in place, so
+// objects dropped by hand since show as drift that re-creates them, and no
+// migration can record a state its own chain says it never reached.
+func retainedDriftHint(chain *db.SnapshotChain) string {
+	if chain == nil || len(chain.Retained) == 0 {
+		return ""
+	}
+	return "snapshots written by an earlier CLI are read with what their migrations left in place (noted above). If the drift re-creates objects that were dropped by hand since, re-baseline at that state: apply the pending migration files or move them out, delete the snapshots directory, run `neutron schema baseline`, then generate again"
+}
+
 func reportDocumentSummary(doc *db.V2Document) {
 	var model db.V2DocumentModel
 	if err := json.Unmarshal(doc.Canonical, &model); err == nil {
@@ -259,6 +292,7 @@ func runSchemaCheck(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	reportBaselineInternal(chain)
+	reportChainRetained(chain)
 	if chain.Empty() {
 		return fmt.Errorf("no snapshot chain in %s — generate a migration (`neutron migrate generate --mode snapshot`) or baseline an existing database (`neutron schema baseline`) first", dir)
 	}
@@ -360,6 +394,9 @@ func runSchemaCheck(cmd *cobra.Command, args []string) error {
 	ui.Errorf("Drift: the database differs from snapshot %s in %d statement(s) — changes made outside migration files must be captured before apply:", expectedRef, len(result.Up))
 	for _, stmt := range result.Up {
 		fmt.Printf("  %s;\n", firstLine(stmt))
+	}
+	if hint := retainedDriftHint(chain); hint != "" {
+		ui.Infof("%s", hint)
 	}
 	return fmt.Errorf("managed schema drift detected (run this check before `neutron migrate`)")
 }

@@ -42,7 +42,7 @@ Enum value additions: PostgreSQL cannot use an enum value inside the transaction
 
 Server versions: --mode live refuses statements the connected server cannot run (changing a generated column's expression needs ALTER COLUMN ... SET EXPRESSION, PostgreSQL 17+) and names the fix. --mode snapshot cannot know the target server: the plan report records the requirement as minServerMajor, and ` + "`neutron migrate`" + ` refuses older servers before running anything.
 
-The generated SQL never drops neutron-internal tables (_neutron_*), extension-owned objects, or anything absent from the schema unless --allow-destructive is passed as an explicit acknowledgement of data loss. Catalog structures this diff engine cannot represent faithfully are rejected with an error instead of producing a migration that falsely claims synchronization.`,
+The generated SQL never drops neutron-internal tables (_neutron_*), extension-owned objects, or anything absent from the schema unless --allow-destructive is passed as an explicit acknowledgement of data loss. In snapshot mode, what a plan leaves in place is recorded in its target snapshot, so the chain keeps matching the database and a later plan with --allow-destructive drops it; snapshots written by earlier CLIs, which omitted it, are read as if they had recorded it (the files are not rewritten). Catalog structures this diff engine cannot represent faithfully are rejected with an error instead of producing a migration that falsely claims synchronization.`,
 	RunE: func(cmd *cobra.Command, args []string) error { return reportRunE(runMigrateGenerate(cmd, args)) },
 }
 
@@ -244,6 +244,7 @@ func runMigrateGenerateSnapshot(cmd *cobra.Command, dir, schemaPath, name string
 		return err
 	}
 	reportBaselineInternal(chain)
+	reportChainRetained(chain)
 	baseDoc, err := chain.HeadDocument()
 	if err != nil {
 		return err
@@ -299,7 +300,9 @@ func runMigrateGenerateSnapshot(cmd *cobra.Command, dir, schemaPath, name string
 	}
 	var migs []generated
 	var all []db.ArtifactFile
+	var retained []db.RetainedObject
 	baseRef, baseSHA := chain.HeadRef, chain.HeadSHA256
+	phaseBase := baseDoc
 	for i, ph := range phases {
 		target := loaded.V2
 		phaseRenames := renames
@@ -309,7 +312,15 @@ func runMigrateGenerateSnapshot(cmd *cobra.Command, dir, schemaPath, name string
 				return err
 			}
 			phaseRenames = nil
+		} else {
+			// Objects this plan leaves in place stay in the database, so
+			// the target snapshot records them (M08).
+			target, retained, err = db.SnapshotTarget(phaseBase, loaded.V2, ph.Up)
+			if err != nil {
+				return fmt.Errorf("%w; declare them in the schema document, or drop them with --allow-destructive", err)
+			}
 		}
+		phaseBase = target
 		if i > 0 {
 			n, err := strconv.Atoi(version)
 			if err != nil {
@@ -323,6 +334,8 @@ func runMigrateGenerateSnapshot(cmd *cobra.Command, dir, schemaPath, name string
 		}
 		if ph.EnumAdditions && len(phases) > 1 {
 			plan.Caveats = append(plan.Caveats, "enum value additions are their own migration: "+db.EnumPhaseReason+"; the next migration carries the rest of the change and plans from this migration's snapshot")
+		} else if len(retained) > 0 {
+			plan.Caveats = append(plan.Caveats, retainedNote(retained))
 		}
 		upSQL := strings.Join(ph.Up, ";\n") + ";"
 		downSQL := strings.Join(reverseStrings(ph.Down), ";\n") + ";"
@@ -366,6 +379,9 @@ func runMigrateGenerateSnapshot(cmd *cobra.Command, dir, schemaPath, name string
 			ui.Warnf("%s_%s requires PostgreSQL %d+; `neutron migrate` refuses older servers before running anything", m.version, names[i], plan.MinServerMajor)
 		}
 	}
+	if len(retained) > 0 {
+		ui.Infof("%s", retainedNote(retained))
+	}
 	for i, m := range migs {
 		ui.Successf("Generated migration %s with %d statement(s):", m.version+"_"+names[i], len(m.plan.Operations))
 		for _, f := range m.files {
@@ -375,6 +391,12 @@ func runMigrateGenerateSnapshot(cmd *cobra.Command, dir, schemaPath, name string
 	fmt.Println()
 	fmt.Println("Review the SQL and plan report, then apply with `neutron migrate`.")
 	return nil
+}
+
+// retainedNote says what a target snapshot records although the schema
+// document does not declare it.
+func retainedNote(retained []db.RetainedObject) string {
+	return fmt.Sprintf("the target snapshot records what this plan leaves in place, so the chain keeps matching the database: %s — the schema document does not declare them; a plan with --allow-destructive drops them", db.RetainedList(retained))
 }
 
 func riskLabel(op db.PlanOperation) string {

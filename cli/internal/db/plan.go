@@ -196,6 +196,14 @@ type SnapshotChain struct {
 	// into the baseline document. They are left out of the loaded
 	// Baseline.Document; the recorded target hash still anchors the chain.
 	BaselineInternal []V2Identity
+
+	// Retained lists migration snapshots written by an earlier CLI that
+	// omit objects their migration left in place (M08). The loaded
+	// Document includes them; the recorded target hash still anchors the
+	// chain. RetainedErrors names snapshots that could not be read this
+	// way and keep their recorded document.
+	Retained       []SnapshotRetained
+	RetainedErrors []string
 }
 
 // Empty reports whether the chain has no baseline and no snapshots.
@@ -451,6 +459,9 @@ func LoadSnapshotChain(migrationsDir string) (*SnapshotChain, error) {
 		}
 	}
 
+	if err := chain.readRetained(migrationsDir); err != nil {
+		return nil, err
+	}
 	return chain, nil
 }
 

@@ -211,6 +211,9 @@ func managedDriftUnderLock(ctx context.Context, client *db.Client, chain *db.Sna
 	for _, stmt := range result.Up {
 		lines = append(lines, "  "+firstLine(stmt)+";")
 	}
+	if hint := retainedDriftHint(chain); hint != "" {
+		lines = append(lines, hint)
+	}
 	return fmt.Errorf("%s", strings.Join(lines, "\n"))
 }
 
