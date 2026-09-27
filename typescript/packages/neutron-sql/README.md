@@ -146,7 +146,11 @@ compare against, so it still re-plans those definitions (a check or
 expression index dropped and re-created, a generated column given `SET
 EXPRESSION`, which rewrites the table and needs PostgreSQL 17+), and its
 down file for such a rename does not run. Generate renames with `--mode
-live`.
+live`. Live mode has one current limit: when the plan renames a column
+and also changes a unique, primary-key or foreign-key constraint on it
+(or, on a table with no expressions, an index keyed on it or `INCLUDE`-ing
+it), the down file re-adds the old definition under the old column name,
+so `neutron migrate down` fails (SQLSTATE 42703) and rolls back.
 
 Enum value additions: PostgreSQL cannot use an enum value inside the
 transaction that adds it (SQLSTATE 55P04). When a plan adds enum values and
