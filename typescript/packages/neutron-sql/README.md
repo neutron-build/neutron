@@ -1502,11 +1502,27 @@ Existing databases:
    `--mode snapshot` (or set `[migrations] snapshots = true`).
 
    A baseline written by an earlier CLI that recorded `_neutron_migrations`
-   keeps working after upgrading the CLI; do not delete or re-baseline it
-   (a later snapshot chains to its hash). An earlier CLI also let a
-   baseline cover migration files that were not applied yet; such a file,
-   applied later, is reported as drift. Check with `neutron schema check
-   --live` after upgrading.
+   keeps working after upgrading the CLI: leave it in place. Once a
+   snapshot migration has been generated from it, that migration chains to
+   its hash, so deleting the baseline alone leaves a gap that `neutron
+   migrate` refuses.
+
+   An earlier CLI also let a baseline cover migration files that were not
+   applied yet. `neutron schema check --live` passes until such a file is
+   applied, and reports drift after that. After upgrading, compare the
+   `covers` list in `migrations/snapshots/000_baseline.snapshot.json` with
+   the pending files in `neutron migrate status`. If a covered file is
+   pending, or drift is reported for the change a covered file made,
+   re-baseline once:
+
+   1. Move out every snapshot migration that is not applied yet (its
+      `.up.sql`, `.down.sql`, `.plan.json` and `snapshots/` file).
+   2. Apply the covered files that are still pending with `neutron
+      migrate`.
+   3. Delete the `migrations/snapshots/` directory and run `neutron schema
+      baseline`. The new baseline covers every applied file, including
+      snapshot migrations already applied.
+   4. Regenerate the moved-out changes with `--mode snapshot`.
 
 Rollback and recovery limits:
 
