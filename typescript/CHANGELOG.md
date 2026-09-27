@@ -65,7 +65,12 @@ All notable changes to this project are documented in this file.
   alone plans only `RENAME COLUMN`, and its down file reverts, including
   changed keys, foreign keys and indexes on the column. Offline snapshot
   renames that an expression names are refused with a two-migration path
-  instead of a table rewrite whose down file could not run.
+  instead of a table rewrite whose down file could not run. Snapshot plans
+  record what they leave in place, and a declared column order that differs
+  from the table's is noted instead of refused, so the chain keeps matching
+  the database and a second `db push` after adding a column mid-table
+  converges. `schema baseline` leaves out `_neutron_*` tables and refuses
+  while migration files are unapplied.
 
 - **`@neutron-build/nucleus` model clients were checked against a live
   engine** (Nucleus 1.0.2, `conformance/live/orm/`). Document collections
