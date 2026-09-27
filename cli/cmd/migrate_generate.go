@@ -180,7 +180,7 @@ func runMigrateGenerate(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(phases) > 1 {
-		ui.Infof("Enum value additions are written as their own earlier migration (%s): %s; each migration applies in one transaction.", names[0], db.EnumPhaseReason)
+		ui.Infof("Enum value additions are written as their own earlier migration (%s): %s; each migration applies in one transaction.", strings.TrimSuffix(filepath.Base(written[0]), ".up.sql"), db.EnumPhaseReason)
 	}
 	if len(phases) == 1 {
 		ui.Successf("Generated migration with %d statement(s):", len(result.Up))
