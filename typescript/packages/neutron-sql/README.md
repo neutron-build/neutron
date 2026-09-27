@@ -151,9 +151,16 @@ way when the planner cannot copy the table to compare it (for example a
 check with a whole-row reference); the message gives the `ALTER TABLE ...
 RENAME COLUMN` to run by hand first.
 Current limits, each failing at apply and rolling back: a new table whose
-foreign key references a column renamed in the same plan; and the down file
-of a plan that drops a column together with an index on it, or drops tables
-that reference each other. Split such changes into separate migrations.
+foreign key references a column renamed in the same plan; dropping a column
+together with a stored generated column that reads it (SQLSTATE 2BP01);
+changing the type of a column that a generated column, or a view the schema
+does not declare, reads (0A000); and the down file of a plan that drops a
+column together with an index on it, or drops tables that reference each
+other. Split such changes into separate migrations. Removing a schema from
+the document stops the planner tracking its objects; declaring it again plans
+`create table` for tables that still exist, which fails (42P07). Keep a
+schema declared while its tables exist; after removing one in snapshot
+mode, recover by re-baselining (step 4 below).
 
 Enum value additions: PostgreSQL cannot use an enum value inside the
 transaction that adds it (SQLSTATE 55P04). When a plan adds enum values and
@@ -182,8 +189,8 @@ snapshot, so the chain keeps matching the database; its drops stay listed as
 pending until a plan with `--allow-destructive` drops it or the schema
 declares it again. Column order is informational: PostgreSQL appends added
 columns and cannot reorder existing ones without rebuilding the table, so a
-schema that declares another order is noted and plans nothing (insert with
-column lists, not by position).
+schema that declares another order plans nothing, and the next plan notes
+the difference (insert with column lists, not by position).
 Catalog structures the diff cannot represent faithfully are rejected with an
 error instead of producing a migration that falsely claims synchronization.
 With a version-2 document the planner covers schema-qualified tables,
