@@ -109,12 +109,12 @@ func TestQ10UnrenamedComparisonIsUnverified(t *testing.T) {
 	// database spells the expression with the old name: the advice is the
 	// hand rename, never "write it as the database spells it" or "re-run
 	// with a live normalizer".
-	const byHand = `rename by hand first with alter table "app"."tenants" rename column "net" to "amount" (PostgreSQL rewrites the expressions that reference it), then re-run without --rename`
+	const byHand = `rename by hand first with alter table "app"."tenants" rename column "net" to "amount" (PostgreSQL rewrites the expressions that reference it), then re-run without the --rename flags for app.tenants (keep any others)`
 	_, err = DiffV2Document(context.Background(), desired, base, DiffV2Options{Renames: renames, Normalizer: q10RenameNormalizer{fail: true}, ServerMajor: 16})
 	if err == nil || !strings.Contains(err.Error(), `generated column "gross" could not be verified`) || !strings.Contains(err.Error(), hint) {
 		t.Fatalf("a failed rename twin leaves the comparison unverified: %v", err)
 	}
-	if msg := err.Error(); !strings.Contains(msg, `The text the database holds predates the rename of net to amount, and it could not be compared under the rename. Rename the column by hand first: alter table "app"."tenants" rename column "net" to "amount" (PostgreSQL rewrites the expressions that reference it), then re-run without --rename`) ||
+	if msg := err.Error(); !strings.Contains(msg, `The text the database holds predates the rename of net to amount, and it could not be compared under the rename. Rename the column by hand first: alter table "app"."tenants" rename column "net" to "amount" (PostgreSQL rewrites the expressions that reference it), then re-run without the --rename flags for app.tenants (keep any others)`) ||
 		!strings.Contains(msg, byHand) || strings.Contains(msg, "spells it") || strings.Contains(msg, "live normalizer") {
 		t.Fatalf("a live refusal must name the hand rename:\n%s", msg)
 	}
