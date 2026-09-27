@@ -438,97 +438,44 @@ func m08WriteBaseline(t *testing.T, dir string, base *V2Document) {
 	}
 }
 
-func TestSnapshotChainReadsWhatEarlierCLIsLeftOut(t *testing.T) {
+// M08 review-2: the chain is read exactly as recorded. A pre-M08 snapshot
+// that omits what its migration left in place stays as written (the drift
+// it causes recovers by re-baselining), and its up file does not change
+// what the chain reads.
+func TestSnapshotChainReadsSnapshotsAsRecorded(t *testing.T) {
 	base := m08Doc(t, m08Base())
 	desired := m08Doc(t, m08Desired("note"))
 	desired2 := m08Doc(t, m08Desired("note", "note2"))
 
-	t.Run("EarlierCLIChain", func(t *testing.T) {
-		dir := t.TempDir()
-		m08WriteBaseline(t, dir, base)
-		res := m08Plan(t, desired, base, false, nil)
-		m08WriteMigration(t, dir, "001", "add_note", "000_baseline", base, desired, res) // pre-M08: target = desired
-		// A second pre-M08 migration planned from the recorded head.
-		res2 := m08Plan(t, desired2, desired, false, nil)
-		m08WriteMigration(t, dir, "002", "add_note2", "001_add_note", desired, desired2, res2)
-		snapPath := filepath.Join(dir, SnapshotDir, "001_add_note.snapshot.json")
-		before, _ := os.ReadFile(snapPath)
+	dir := t.TempDir()
+	m08WriteBaseline(t, dir, base)
+	res := m08Plan(t, desired, base, false, nil)
+	m08WriteMigration(t, dir, "001", "add_note", "000_baseline", base, desired, res) // pre-M08: target = desired
+	if err := os.WriteFile(filepath.Join(dir, "001_add_note.up.sql"), []byte("select 1;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
-		chain, err := LoadSnapshotChain(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(chain.Retained) != 2 || chain.Retained[0].Stem != "001_add_note" || chain.Retained[1].Stem != "002_add_note2" || len(chain.RetainedErrors) != 0 {
-			t.Fatalf("Retained = %+v, errors %q", chain.Retained, chain.RetainedErrors)
-		}
-		if chain.HeadSHA256 != desired2.SHA256Hex {
-			t.Fatalf("the recorded hash anchors the chain")
-		}
-		head, err := chain.HeadDocument()
-		if err != nil {
-			t.Fatal(err)
-		}
-		hm := m08Model(t, head)
-		if got := strings.Join(columnNames(*hm.Table(m08ID("public", "t"))), ","); got != "id,keep,old,note,note2" || hm.Table(m08ID("public", "other_app")) == nil {
-			t.Fatalf("head must read the objects left in place: t(%s)", got)
-		}
-		if after, _ := os.ReadFile(snapPath); !bytes.Equal(before, after) {
-			t.Fatalf("the snapshot file must not be rewritten")
-		}
+	chain, err := LoadSnapshotChain(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := chain.HeadDocument()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head.SHA256Hex != desired.SHA256Hex || chain.HeadSHA256 != desired.SHA256Hex {
+		t.Fatalf("the head must read as recorded")
+	}
 
-		// A new plan from the chain records them, and the chain it
-		// extends then loads with only the earlier snapshots noted.
-		desired3 := m08Doc(t, m08Desired("note", "note2", "note3"))
-		res3 := m08Plan(t, desired3, head, false, nil)
-		target, retained := m08Target(t, head, desired3, res3.Up)
-		if !reflect.DeepEqual(retained, m08Retained) {
-			t.Fatalf("retained = %q", retained)
-		}
-		m08WriteMigration(t, dir, "003", "add_note3", "002_add_note2", desired2, target, res3)
-		chain, err = LoadSnapshotChain(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(chain.Retained) != 2 || chain.HeadSHA256 != target.SHA256Hex {
-			t.Fatalf("a snapshot written by this CLI reads as recorded: %+v", chain.Retained)
-		}
-	})
-
-	t.Run("DestructiveMigrationReadsAsRecorded", func(t *testing.T) {
-		dir := t.TempDir()
-		m08WriteBaseline(t, dir, base)
-		res := m08Plan(t, desired, base, true, nil)
-		m08WriteMigration(t, dir, "001", "drop_all", "000_baseline", base, desired, res)
-		chain, err := LoadSnapshotChain(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(chain.Retained) != 0 || m08Hash(t, chain.Snapshots[0].Document) != desired.SHA256Hex {
-			t.Fatalf("a migration that dropped them left nothing in place: %+v", chain.Retained)
-		}
-	})
-
-	t.Run("UnreadableKeepsRecorded", func(t *testing.T) {
-		dir := t.TempDir()
-		bm := m08Base()
-		bm.Views[0].Definition = " SELECT t.keep FROM public.t;"
-		base := m08Doc(t, bm)
-		m08WriteBaseline(t, dir, base)
-		dm := m08Desired("note")
-		dm.Tables[0].Columns[1].Name = "kept"
-		dm.Tables[0].Constraints[1].Columns = []string{"kept"}
-		desired := m08Doc(t, dm)
-		res := m08Plan(t, desired, base, false, map[string]string{"public.t.kept": "keep"})
-		m08WriteMigration(t, dir, "001", "rename", "000_baseline", base, desired, res)
-		chain, err := LoadSnapshotChain(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(chain.Retained) != 0 || len(chain.RetainedErrors) != 1 || chain.RetainedErrors[0].Stem != "001_rename" || !strings.Contains(chain.RetainedErrors[0].Err, "may reference column") ||
-			m08Hash(t, chain.Snapshots[0].Document) != desired.SHA256Hex {
-			t.Fatalf("errors %q", chain.RetainedErrors)
-		}
-	})
+	res2 := m08Plan(t, desired2, head, false, nil)
+	target, retained := m08Target(t, head, desired2, res2.Up)
+	if len(retained) != 0 || target.SHA256Hex != desired2.SHA256Hex {
+		t.Fatalf("the recorded head holds nothing the schema omits, so nothing is carried: %q", retained)
+	}
+	m08WriteMigration(t, dir, "002", "add_note2", "001_add_note", desired, target, res2)
+	if chain, err = LoadSnapshotChain(dir); err != nil || chain.HeadSHA256 != desired2.SHA256Hex {
+		t.Fatalf("the chain extends as recorded: %v", err)
+	}
 }
 
 // m08OrderDoc is public.t with the given integer columns (id first, the
@@ -556,19 +503,8 @@ func m08Cols(t *testing.T, doc *V2Document) string {
 func TestSnapshotTargetRecordsDatabaseColumnOrder(t *testing.T) {
 	base := m08OrderDoc(t, "a", "b")
 	declared := m08OrderDoc(t, "a", "mid", "b")
-	empty, err := EmptyV2Document()
-	if err != nil {
-		t.Fatal(err)
-	}
-	gens0 := nextColumnGenerations(nil, empty, base, nil, 0)
 
-	// The planner alone refuses the next plan against a snapshot in
-	// declared order; that rule stays (diff_v2.go).
-	if _, err := DiffV2Document(context.Background(), declared, m08OrderDoc(t, "a", "b", "mid"), DiffV2Options{SnapshotBase: true}); err == nil || !strings.Contains(err.Error(), "cannot reorder") {
-		t.Fatalf("planner rule changed: %v", err)
-	}
-
-	aligned, notes, err := AlignColumnOrder(declared, base, nil, gens0)
+	aligned, notes, err := AlignColumnOrder(declared, base, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -583,15 +519,11 @@ func TestSnapshotTargetRecordsDatabaseColumnOrder(t *testing.T) {
 	if got := m08Cols(t, target); got != "id,a,b,mid" {
 		t.Fatalf("target records %s, the database order is id,a,b,mid", got)
 	}
-	gens1 := nextColumnGenerations(gens0, base, target, nil, 1)
-	if !reflect.DeepEqual(gens1[m08ID("public", "t")], map[string]int{"id": 0, "a": 0, "b": 0, "mid": 1}) {
-		t.Fatalf("generations %v", gens1)
-	}
 
-	// Next plan: mid (appended by migration 1) is still declared between a
-	// and b, and another new column comes first: only mid2 is planned.
+	// Next plan: mid is still declared between a and b, another new
+	// column comes first: only mid2 is planned.
 	next := m08OrderDoc(t, "mid2", "a", "mid", "b")
-	aligned2, _, err := AlignColumnOrder(next, target, nil, gens1)
+	aligned2, _, err := AlignColumnOrder(next, target, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -603,48 +535,31 @@ func TestSnapshotTargetRecordsDatabaseColumnOrder(t *testing.T) {
 	if got := m08Cols(t, target2); got != "id,a,b,mid,mid2" {
 		t.Fatalf("next target %s", got)
 	}
-	gens2 := nextColumnGenerations(gens1, target, target2, nil, 2)
-	// Unchanged document, no plan.
-	aligned3, _, err := AlignColumnOrder(next, target2, nil, gens2)
-	if err != nil {
-		t.Fatal(err)
-	}
+	aligned3, _, _ := AlignColumnOrder(next, target2, nil)
 	if res3 := m08Plan(t, aligned3, target2, false, nil); len(res3.Up) != 0 {
 		t.Fatalf("an order difference alone plans %q", res3.Up)
 	}
-	// Columns of different generations may be declared in any order.
-	if _, _, err := AlignColumnOrder(m08OrderDoc(t, "mid", "mid2", "b", "a"), target2, nil, gens2); err == nil {
-		t.Fatalf("b before a (both baseline columns) must be refused")
-	}
-	if _, _, err := AlignColumnOrder(m08OrderDoc(t, "mid2", "mid", "a", "b"), target2, nil, gens2); err != nil {
-		t.Fatalf("mid2 before mid (different migrations) is how they were appended: %v", err)
-	}
 
-	// Review-1 F3: a changed relative order of existing columns that
-	// entered together is refused with the planner's message, alone or
-	// with an added column; so is a swap of two columns one migration added.
-	for _, cols := range [][]string{{"b", "a"}, {"b", "mid", "a"}, {"mid", "b", "a"}} {
-		if _, _, err := AlignColumnOrder(m08OrderDoc(t, cols...), base, nil, gens0); err == nil ||
-			!strings.Contains(err.Error(), "the desired column order differs from the planning-base table (attnum order [id a b])") {
-			t.Fatalf("%v: want the reorder refusal, got %v", cols, err)
-		}
-	}
-	twoAdded := m08OrderDoc(t, "a", "b", "m1", "m2")
-	gensTwo := nextColumnGenerations(gens0, base, twoAdded, nil, 1)
-	if _, _, err := AlignColumnOrder(m08OrderDoc(t, "a", "b", "m2", "m1"), twoAdded, nil, gensTwo); err == nil || !strings.Contains(err.Error(), "cannot reorder") {
-		t.Fatalf("m1 and m2 were added together: a swap must be refused, got %v", err)
-	}
-	// New columns anywhere, existing order kept: accepted.
-	for _, cols := range [][]string{{"mid", "a", "b"}, {"a", "b", "mid"}, {"x", "a", "y", "b", "z"}} {
-		if _, _, err := AlignColumnOrder(m08OrderDoc(t, cols...), base, nil, gens0); err != nil {
-			t.Fatalf("%v: %v", cols, err)
+	// M08 review-2: a swap of existing columns is informational too; the
+	// snapshot keeps the database order and new columns are appended.
+	for _, c := range []struct {
+		cols []string
+		want string
+	}{
+		{[]string{"b", "a"}, "id,a,b"},
+		{[]string{"b", "mid", "a"}, "id,a,b,mid"},
+		{[]string{"mid", "b", "a"}, "id,a,b,mid"},
+	} {
+		got, notes, err := AlignColumnOrder(m08OrderDoc(t, c.cols...), base, nil)
+		if err != nil || len(notes) != 1 || m08Cols(t, got) != c.want {
+			t.Fatalf("%v: err %v, notes %+v, aligned %s, want %s", c.cols, err, notes, m08Cols(t, got), c.want)
 		}
 	}
 
 	// With renames and a column left in place.
 	withOld := m08OrderDoc(t, "a", "old", "b")
 	renamed := m08OrderDoc(t, "mid", "a2", "b")
-	aligned4, _, err := AlignColumnOrder(renamed, withOld, RenamesByTable(map[string]string{"public.t.a2": "a"}), nil)
+	aligned4, _, err := AlignColumnOrder(renamed, withOld, RenamesByTable(map[string]string{"public.t.a2": "a"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -658,51 +573,30 @@ func TestSnapshotTargetRecordsDatabaseColumnOrder(t *testing.T) {
 	}
 }
 
-func TestSnapshotChainReadsEarlierDeclaredColumnOrder(t *testing.T) {
+// A pre-M08 snapshot recorded the declared order. The chain reads it as
+// recorded; compared against the database order it is not drift.
+func TestSnapshotChainDeclaredOrderIsOnlyNoted(t *testing.T) {
 	dir := t.TempDir()
 	base := m08OrderDoc(t, "a", "b")
 	m08WriteBaseline(t, dir, base)
 	declared := m08OrderDoc(t, "a", "mid", "b")
-	res := m08Plan(t, declared, base, false, nil) // the pre-M08 planner accepts it
+	res := m08Plan(t, declared, base, false, nil)
 	m08WriteMigration(t, dir, "001", "add_mid", "000_baseline", base, declared, res)
-
 	chain, err := LoadSnapshotChain(dir)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if len(chain.Retained) != 1 || len(chain.Retained[0].Objects) != 0 || IdentityList(chain.Retained[0].Reordered) != "public.t" || len(chain.RetainedErrors) != 0 {
-		t.Fatalf("Retained %+v, errors %q", chain.Retained, chain.RetainedErrors)
 	}
 	head, err := chain.HeadDocument()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := m08Cols(t, head); got != "id,a,b,mid" || chain.HeadSHA256 != declared.SHA256Hex {
-		t.Fatalf("head reads %s (recorded hash kept: %v)", got, chain.HeadSHA256 == declared.SHA256Hex)
+	if got := m08Cols(t, head); got != "id,a,mid,b" {
+		t.Fatalf("head reads %s, as recorded", got)
 	}
-
-	// A second pre-M08 snapshot, planned from the recorded (declared)
-	// order, still declares mid between a and b: the loader keeps mid's
-	// generation and reads it in database order too.
-	declared2 := m08OrderDoc(t, "mid2", "a", "mid", "b")
-	res2 := m08Plan(t, declared2, declared, false, nil)
-	m08WriteMigration(t, dir, "002", "add_mid2", "001_add_mid", declared, declared2, res2)
-	chain, err = LoadSnapshotChain(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(chain.Retained) != 2 || len(chain.RetainedErrors) != 0 {
-		t.Fatalf("Retained %+v, errors %q", chain.Retained, chain.RetainedErrors)
-	}
-	head, err = chain.HeadDocument()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := m08Cols(t, head); got != "id,a,b,mid,mid2" {
-		t.Fatalf("head reads %s", got)
-	}
-	if got := chain.HeadColumnGenerations()[m08ID("public", "t")]; !reflect.DeepEqual(got, map[string]int{"id": 0, "a": 0, "b": 0, "mid": 1, "mid2": 2}) {
-		t.Fatalf("generations %v", got)
+	// The drift gate's comparison: recorded snapshot against the database.
+	drift := m08Plan(t, head, m08OrderDoc(t, "a", "b", "mid"), true, nil)
+	if len(drift.Up) != 0 || HasDrift(drift.Warnings) {
+		t.Fatalf("an order difference is not drift: up %q warnings %q", drift.Up, drift.Warnings)
 	}
 }
 

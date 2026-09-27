@@ -463,20 +463,16 @@ func TestSnapshotModeWordNamesPlanningBase(t *testing.T) {
 		t.Fatalf("plan.json caveat carries live wording")
 	}
 
-	// The column-order rejection in snapshot mode names the planning base.
-	dir2 := t.TempDir()
-	if _, err := generateIntoDir(t, dir2, "add_users", testV2Doc(t, usersDocJSON), nil, false); err != nil {
-		t.Fatalf("base: %v", err)
-	}
+	// The column-order note in snapshot mode names the planning base.
 	reordered := strings.Replace(usersDocJSON,
 		`{"name": "id", "type": {"name": "int4", "codec": "number"}, "notNull": true},
 			{"name": "name", "type": {"name": "text", "codec": "string"}, "notNull": true}`,
 		`{"name": "name", "type": {"name": "text", "codec": "string"}, "notNull": true},
 			{"name": "id", "type": {"name": "int4", "codec": "number"}, "notNull": true}`,
 		1)
-	_, err = generateIntoDir(t, dir2, "reorder", testV2Doc(t, reordered), nil, false)
-	if err == nil || !strings.Contains(err.Error(), "planning-base table") {
-		t.Fatalf("snapshot-mode reorder rejection does not name the planning base: %v", err)
+	noted, err := DiffV2Document(context.Background(), testV2Doc(t, reordered), testV2Doc(t, usersDocJSON), DiffV2Options{SnapshotBase: true})
+	if err != nil || len(noted.Warnings) != 1 || !strings.Contains(noted.Warnings[0], "planning-base table") {
+		t.Fatalf("snapshot-mode column-order note does not name the planning base: %v %q", err, noted.Warnings)
 	}
 
 	// Live-mode default wording is byte-stable: the same fresh-chain diff
@@ -523,30 +519,27 @@ func TestSnapshotChainTamperedTargetHash(t *testing.T) {
 	}
 }
 
-func TestColumnReorderRejectedAtPlanTime(t *testing.T) {
+// TestColumnReorderNotedAtPlanTime: the SAME columns in swapped order.
+// PostgreSQL cannot reorder without rebuilding the table, so the planner
+// plans nothing for it and writes nothing (M08 review-2; the M01 rule that
+// refused it made the difference a permanent dead end).
+func TestColumnReorderNotedAtPlanTime(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := generateIntoDir(t, dir, "add_users", testV2Doc(t, usersDocJSON), nil, false); err != nil {
 		t.Fatalf("base: %v", err)
 	}
-	// Desired document with the SAME columns in swapped order: PostgreSQL
-	// cannot reorder without a rewrite; the planner must reject, never
-	// encode (M01 consumer contract).
 	reordered := strings.Replace(usersDocJSON,
 		`{"name": "id", "type": {"name": "int4", "codec": "number"}, "notNull": true},
 			{"name": "name", "type": {"name": "text", "codec": "string"}, "notNull": true}`,
 		`{"name": "name", "type": {"name": "text", "codec": "string"}, "notNull": true},
 			{"name": "id", "type": {"name": "int4", "codec": "number"}, "notNull": true}`,
 		1)
-	_, err := generateIntoDir(t, dir, "reorder", testV2Doc(t, reordered), nil, false)
-	if err == nil {
-		t.Fatalf("column reorder was planned instead of rejected")
+	plan, err := generateIntoDir(t, dir, "reorder", testV2Doc(t, reordered), nil, false)
+	if err != nil || plan != nil {
+		t.Fatalf("a column reorder alone must plan nothing: plan %v, err %v", plan, err)
 	}
-	if !strings.Contains(err.Error(), "reorder") && !strings.Contains(err.Error(), "order") {
-		t.Fatalf("reorder error does not explain the cause: %v", err)
-	}
-	// Nothing was written by the failed run.
 	if _, statErr := os.Stat(filepath.Join(dir, "002_reorder.up.sql")); !os.IsNotExist(statErr) {
-		t.Fatalf("failed reorder run left artifacts behind")
+		t.Fatalf("an order difference alone must write no migration")
 	}
 }
 

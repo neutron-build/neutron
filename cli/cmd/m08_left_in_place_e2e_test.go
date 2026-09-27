@@ -11,7 +11,6 @@ package cmd
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -315,10 +314,12 @@ func TestM08LeftInPlaceSnapshotChain(t *testing.T) {
 		}
 	})
 
-	// The recovery for a chain an earlier CLI left drifted: upgrading is
-	// all it takes. 001 is applied, 002 is pending, both written the pre-M08
-	// way; every command before M08 refused from here on.
-	t.Run("EarlierCLIChainRecovery", func(t *testing.T) {
+	// The recovery for a chain an earlier CLI left drifted (M08 review-2):
+	// the chain is read as recorded, so the drift the pre-M08 snapshot
+	// causes is refused with a hint naming the re-baseline, and the
+	// re-baseline recovers it. 001 is applied, 002 is pending, both written
+	// the pre-M08 way.
+	t.Run("EarlierCLIChainRebaseline", func(t *testing.T) {
 		dbURL, fx, work, mig := setup(t, "m08old")
 		m08PreM08Migration(t, mig, "001", "add_note", filepath.Join(work, "d1.json"))
 		must(t, dbURL, "migrate", "--dir", mig)
@@ -327,19 +328,36 @@ func TestM08LeftInPlaceSnapshotChain(t *testing.T) {
 		if got := strings.Join(m07DocTables(t, snap001), ","); got != "public.t" {
 			t.Fatalf("fixture must be the pre-M08 snapshot shape, lists %s", got)
 		}
-		before := mustReadFile(t, snap001)
+		hint := []string{"drift", "only of objects the database has and the applied snapshot does not record", "delete migrations/snapshots", "neutron schema baseline"}
+		refused(t, dbURL, hint, "schema", "check", "--live", "--dir", mig)
+		refused(t, dbURL, hint, "migrate", "--dir", mig)
+		if got := q09Query(t, fx, m08Columns); got != "id,keep,old,note" {
+			t.Fatalf("a refused migrate applied something: t columns %s", got)
+		}
 
-		out := must(t, dbURL, "schema", "check", "--live", "--dir", mig)
-		if !strings.Contains(out, "do not record the state their up files leave") || !strings.Contains(out, "001_add_note, 002_add_note2") {
-			t.Fatalf("the check notes the earlier snapshots:\n%s", out)
+		// The recovery the hint names: the pending 002 moves out (it is
+		// generated again), the snapshots go, the baseline records the
+		// database and covers the applied 001.
+		for _, f := range []string{"002_add_note2.up.sql", "002_add_note2.down.sql", "002_add_note2.plan.json"} {
+			if err := os.Remove(filepath.Join(mig, f)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.RemoveAll(filepath.Join(mig, "snapshots")); err != nil {
+			t.Fatal(err)
+		}
+		if out := must(t, dbURL, "schema", "baseline", "--dir", mig); !strings.Contains(out, "covered by the baseline: 001") {
+			t.Fatalf("the re-baseline covers the applied file:\n%s", out)
+		}
+		must(t, dbURL, "schema", "check", "--live", "--dir", mig)
+		out := must(t, unreachable, "migrate", "generate", "--mode", "snapshot", "--dir", mig, "--schema", filepath.Join(work, "d2.json"), "--name", "add_note2")
+		if !strings.Contains(out, "the target snapshot records what this plan leaves in place") {
+			t.Fatalf("the regenerated 002 records what stays:\n%s", out)
 		}
 		must(t, dbURL, "migrate", "--dir", mig)
 		must(t, dbURL, "schema", "check", "--live", "--dir", mig)
 		if got := q09Query(t, fx, m08Columns); got != "id,keep,old,note,note2" {
 			t.Fatalf("t columns %s", got)
-		}
-		if string(mustReadFile(t, snap001)) != string(before) {
-			t.Fatalf("the earlier snapshot file must not be rewritten")
 		}
 		dropAndCheck(t, dbURL, fx, work, mig, "003")
 	})
@@ -429,28 +447,23 @@ func TestM08LeftInPlaceSnapshotChain(t *testing.T) {
 		refused(t, dbURL, []string{"modified since they were applied"}, "migrate", "--dir", mig)
 	})
 
-	// Review-1 F1: an applied snapshot the chain reads from its up file
-	// needs a history checksum to anchor that file.
-	t.Run("UpFileWithoutChecksumRefused", func(t *testing.T) {
-		dbURL, fx, work, mig := setup(t, "m08nosum")
-		m08PreM08Migration(t, mig, "001", "add_note", filepath.Join(work, "d1.json"))
+	// M08 review-2 (review INFO 5): the pre-flight refuses a history row
+	// without the v2 format marker, as `neutron migrate` does.
+	t.Run("HistoryFormatVerified", func(t *testing.T) {
+		dbURL, fx, work, mig := setup(t, "m08format")
+		must(t, unreachable, "migrate", "generate", "--mode", "snapshot", "--dir", mig, "--schema", filepath.Join(work, "d1.json"), "--name", "add_note")
 		must(t, dbURL, "migrate", "--dir", mig)
-		m08PreM08Migration(t, mig, "002", "add_note2", filepath.Join(work, "d2.json"))
 		must(t, dbURL, "schema", "check", "--live", "--dir", mig)
-		if err := fx.Exec(context.Background(), `UPDATE _neutron_migrations SET checksum = NULL WHERE version = '001'`); err != nil {
+		if err := fx.Exec(context.Background(), `UPDATE _neutron_migrations SET format = NULL WHERE version = '001'`); err != nil {
 			t.Fatal(err)
 		}
-		refused(t, dbURL, []string{"001_add_note", "records no checksum"}, "schema", "check", "--live", "--dir", mig)
-		refused(t, dbURL, []string{"001_add_note", "records no checksum"}, "migrate", "--dir", mig)
-		if got := q09Query(t, fx, m08Columns); got != "id,keep,old,note" {
-			t.Fatalf("a refused migrate applied something: t columns %s", got)
-		}
+		refused(t, dbURL, []string{"001", "without the v2 format marker", "neutron migrate adopt"}, "schema", "check", "--live", "--dir", mig)
 	})
 
-	// Review-1 F3: a changed relative order of existing columns is refused
-	// in snapshot mode as in live mode and db push; new columns declared
-	// between existing ones stay accepted (ColumnAddedMidTable).
-	t.Run("SwapOfExistingColumnsRefused", func(t *testing.T) {
+	// M08 review-2: a swap of existing columns is informational: noted,
+	// nothing planned for it; a new column in the same document is added
+	// last and the snapshot records the database order.
+	t.Run("SwapOfExistingColumnsIsNoted", func(t *testing.T) {
 		dbURL, fx := newM02CommandDB(t, "m08swap")
 		if err := fx.Exec(context.Background(), `CREATE TABLE u (id integer PRIMARY KEY, a text, b text)`); err != nil {
 			t.Fatal(err)
@@ -460,18 +473,23 @@ func TestM08LeftInPlaceSnapshotChain(t *testing.T) {
 		pulled := filepath.Join(work, "pulled.json")
 		must(t, dbURL, "schema", "baseline", "--dir", mig)
 		must(t, dbURL, "schema", "pull", "--out", pulled)
-		for i, order := range [][]string{{"id", "b", "a"}, {"id", "b", "mid", "a"}} {
-			doc := filepath.Join(work, fmt.Sprintf("swap%d.json", i))
-			m08ColumnsAs(t, pulled, doc, order...)
-			want := []string{"the desired column order differs from the planning-base table (attnum order [id a b])", "cannot reorder columns"}
-			refused(t, unreachable, want, "migrate", "generate", "--mode", "snapshot", "--dir", mig, "--schema", doc, "--name", "swap")
-			refused(t, unreachable, want, "schema", "check", "--dir", mig, "--schema", doc)
-			if entries, _ := os.ReadDir(mig); len(entries) != 1 {
-				t.Fatalf("a refused generate writes nothing: %d entries", len(entries))
-			}
-			if code, out := runCLIProcess(t, bin, dbURL, "db", "push", "--schema", doc, "--dry-run", "--force"); code == 0 || !strings.Contains(out, "cannot reorder columns") {
-				t.Fatalf("live planning refuses the same document (%d):\n%s", code, out)
-			}
+		swap, swapAdd := filepath.Join(work, "swap.json"), filepath.Join(work, "swap_add.json")
+		m08ColumnsAs(t, pulled, swap, "id", "b", "a")
+		m08ColumnsAs(t, pulled, swapAdd, "id", "b", "mid", "a")
+		out := must(t, unreachable, "migrate", "generate", "--mode", "snapshot", "--dir", mig, "--schema", swap, "--name", "swap")
+		if !strings.Contains(out, "No schema changes detected") || !strings.Contains(out, "the database holds them as (id, a, b)") {
+			t.Fatalf("a swap alone plans nothing and is noted:\n%s", out)
+		}
+		must(t, unreachable, "schema", "check", "--dir", mig, "--schema", swap)
+		must(t, unreachable, "migrate", "generate", "--mode", "snapshot", "--dir", mig, "--schema", swapAdd, "--name", "add_mid")
+		if up := string(mustReadFile(t, filepath.Join(mig, "001_add_mid.up.sql"))); !strings.Contains(up, `add column "mid"`) || strings.Count(up, ";") != 1 {
+			t.Fatalf("only mid is planned:\n%s", up)
+		}
+		must(t, dbURL, "migrate", "--dir", mig)
+		must(t, dbURL, "schema", "check", "--live", "--dir", mig)
+		must(t, unreachable, "schema", "check", "--dir", mig, "--schema", swapAdd)
+		if got := q09Query(t, fx, m08UColumns); got != "id,a,b,mid" {
+			t.Fatalf("u columns %s", got)
 		}
 	})
 
@@ -539,88 +557,15 @@ func TestM08LeftInPlaceSnapshotChain(t *testing.T) {
 		must(t, dbURL, "schema", "check", "--live", "--dir", mig)
 	})
 
-	// Review-1 F6: a drop spelled other than the planner renders it is read
-	// as leaving the object in place, so the expected state keeps it and
-	// the drift gate refuses once it is gone. A snapshot that cannot be read
-	// at all refuses too. Either way the mismatch fails closed.
-	t.Run("UnrecognisedDropFailsClosed", func(t *testing.T) {
-		respell := func(t *testing.T, mig, stem, from, to string) {
-			t.Helper()
-			up := filepath.Join(mig, stem+".up.sql")
-			text := string(mustReadFile(t, up))
-			if !strings.Contains(text, from) {
-				t.Fatalf("%s lacks %s:\n%s", up, from, text)
-			}
-			writeFile(t, up, strings.Replace(text, from, to, 1))
-			planPath := filepath.Join(mig, stem+".plan.json")
-			var plan map[string]any
-			if err := json.Unmarshal(mustReadFile(t, planPath), &plan); err != nil {
-				t.Fatal(err)
-			}
-			for _, op := range plan["operations"].([]any) {
-				o := op.(map[string]any)
-				if o["sql"] == from {
-					o["sql"] = to
-				}
-			}
-			raw, err := json.MarshalIndent(plan, "", "  ")
-			if err != nil {
-				t.Fatal(err)
-			}
-			writeFile(t, planPath, string(raw)+"\n")
-		}
-		for _, c := range []struct{ label, from, to, want string }{
-			// Read as left in place: drift once it is gone.
-			{"m08spell", `alter table "public"."t" drop column if exists "old"`, `ALTER TABLE public.t DROP COLUMN old`, `add column "old"`},
-			// other_app's enum is dropped canonically, so other_app cannot be
-			// recorded: the snapshot is unreadable, and that refuses.
-			{"m08unread", `drop table if exists "public"."other_app"`, `drop table public.other_app cascade`, "cannot be read with what its up file leaves in place"},
-		} {
-			t.Run(c.label, func(t *testing.T) {
-				dbURL, fx, work, mig := setup(t, c.label)
-				must(t, unreachable, "migrate", "generate", "--mode", "snapshot", "--dir", mig, "--schema", filepath.Join(work, "d1.json"), "--name", "drop_all", "--allow-destructive")
-				respell(t, mig, "001_drop_all", c.from, c.to)
-				must(t, dbURL, "migrate", "--dir", mig, "--allow-destructive")
-				if got := q09Query(t, fx, m08Relations); got != "t,t_pkey" {
-					t.Fatalf("the respelled migration applied: relations %s", got)
-				}
-				refused(t, dbURL, []string{c.want}, "schema", "check", "--live", "--dir", mig)
-				// A pending migration brings migrate to its drift gate.
-				m08PreM08Migration(t, mig, "002", "next", filepath.Join(work, "d2.json"))
-				refused(t, dbURL, []string{c.want}, "migrate", "--dir", mig)
-			})
-		}
-	})
-
-	// An earlier CLI drifted the chain and the user then dropped the column
-	// by hand to get past the drift gate. The upgraded CLI reads the column
-	// as still in place, so this is drift; the documented way out is a
-	// re-baseline at the state the user made.
-	t.Run("HandDroppedRebaseline", func(t *testing.T) {
+	// An earlier CLI drifted the chain and the user then dropped the objects
+	// by hand to get past the drift gate. The chain is read as recorded, so
+	// that state matches it and the workflow simply continues.
+	t.Run("HandDroppedAfterEarlierCLI", func(t *testing.T) {
 		dbURL, fx, work, mig := setup(t, "m08hand")
 		m08PreM08Migration(t, mig, "001", "add_note", filepath.Join(work, "d1.json"))
 		must(t, dbURL, "migrate", "--dir", mig)
-		m08PreM08Migration(t, mig, "002", "add_note2", filepath.Join(work, "d2.json"))
-		ctx := context.Background()
-		if err := fx.Exec(ctx, `DROP VIEW v_other; DROP TABLE other_app; DROP TYPE mood; ALTER TABLE t DROP COLUMN old`); err != nil {
+		if err := fx.Exec(context.Background(), `DROP VIEW v_other; DROP TABLE other_app; DROP TYPE mood; ALTER TABLE t DROP COLUMN old`); err != nil {
 			t.Fatal(err)
-		}
-		refused(t, dbURL, []string{"drift", `add column "old"`, "re-baseline", "neutron schema baseline"}, "schema", "check", "--live", "--dir", mig)
-		refused(t, dbURL, []string{"drift", `add column "old"`, "re-baseline"}, "migrate", "--dir", mig)
-
-		// The pending 002 cannot be applied (the gate refuses), so it
-		// moves out and is generated again after the baseline.
-		for _, f := range []string{"002_add_note2.up.sql", "002_add_note2.down.sql", "002_add_note2.plan.json"} {
-			if err := os.Remove(filepath.Join(mig, f)); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if err := os.RemoveAll(filepath.Join(mig, "snapshots")); err != nil {
-			t.Fatal(err)
-		}
-		out := must(t, dbURL, "schema", "baseline", "--dir", mig)
-		if !strings.Contains(out, "covered by the baseline: 001") {
-			t.Fatalf("the re-baseline covers the applied file:\n%s", out)
 		}
 		must(t, dbURL, "schema", "check", "--live", "--dir", mig)
 		must(t, unreachable, "migrate", "generate", "--mode", "snapshot", "--dir", mig, "--schema", filepath.Join(work, "d2.json"), "--name", "add_note2")

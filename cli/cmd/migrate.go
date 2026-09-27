@@ -324,7 +324,6 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	reportBaselineInternal(chain)
-	reportChainRetained(chain)
 	if err := managedDriftUnderLock(ctx, client, chain, applied); err != nil {
 		return err
 	}
