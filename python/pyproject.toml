@@ -2,6 +2,7 @@
 name = "neutron-py"
 version = "0.1.0"
 description = "The AI application development framework for Python"
+readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
@@ -15,8 +16,15 @@ dependencies = [
     "cyclopts>=3.0",
 ]
 
+[project.urls]
+Homepage = "https://neutron.build/"
+Documentation = "https://neutron.build/docs/python/overview"
+Repository = "https://github.com/neutron-build/neutron"
+Issues = "https://github.com/neutron-build/neutron/issues"
+
 [project.optional-dependencies]
 test = [
+    "editables>=0.5",
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "httpx>=0.27.0",
@@ -56,16 +64,9 @@ packages = ["neutron"]
 # Confirmed: from a venv with `pip install -e <this>`, `import tests` resolved to
 # Neutron's own tests package.
 #
-# dev-mode-exact writes an `import _editable_impl_neutron_py` shim instead, which
-# maps the package exactly and exposes nothing else. This was previously deferred
-# on the belief that the shim requires `editables` in the consuming venv and that
-# neutron would stop importing without it. Measured: hatchling declares
-# `editables` as a dependency OF THE EDITABLE INSTALL, so pip pulls it in
-# automatically (editables 0.6 appeared unprompted). Verified in a clean venv --
-# `neutron` imports, `import tests` raises ModuleNotFoundError.
-#
-# The one case that would still bite is an editable install done with --no-deps,
-# where the shim's dependency is skipped.
+# dev-mode-exact maps the package exactly, exposing nothing else. The shim
+# requires `editables`; the test extra declares it explicitly because a clean
+# uv editable install did not install it from hatchling's editable metadata.
 dev-mode-exact = true
 
 [tool.pytest.ini_options]
