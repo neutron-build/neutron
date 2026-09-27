@@ -207,7 +207,7 @@ Transactional migrations need none of this: a failure rolls back with its histor
 - **Statement allowlist.** Migration files may contain only the statement kinds listed in `neutron migrate --help` (`SELECT` and DML, `TRUNCATE`, create/alter/drop of schema objects, `SET LOCAL`). Functions, triggers, rules, grants, `DO` blocks and database- or role-wide statements are refused before anything in the file runs; no flag bypasses this.
 - **Destructive changes.** Drops and other data-losing statements need `--allow-destructive`; `db push --force` only permits pushing onto a database that has migration history.
 - **Nucleus.** `neutron migrate` refuses Nucleus databases; the Go and TypeScript SDK runners own those, and remain experimental.
-- **MCP.** `query_sql` is read-only (best-effort on Nucleus; see `neutron mcp` below); writes go through `execute_sql`, which exists only with `--allow-writes`. The HTTP transport binds to `127.0.0.1`, and writes over HTTP need `NEUTRON_MCP_TOKEN`.
+- **MCP.** `query_sql` is read-only (best-effort on Nucleus; see `neutron mcp` below); writes go through `execute_sql`, which exists only with `--allow-writes`. The HTTP transport binds to `127.0.0.1` unless `--host` says otherwise, and writes over HTTP need `NEUTRON_MCP_TOKEN`.
 
 The migration protocol (identity, checksum, locking, adoption) is specified in `contracts/data/MIGRATIONS.md`.
 
