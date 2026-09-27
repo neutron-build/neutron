@@ -131,17 +131,21 @@ primary-key/unique constraint — fail at export time with the contract error
 code, never as a silently invalid document.
 
 `migrate generate` diffs the exported schema against the live database by
-default and writes `{version}_{name}.up.sql` / `.down.sql` pairs;
+default (unless `neutron.toml` sets `[migrations] snapshots = true`) and
+writes `{version}_{name}.up.sql` / `.down.sql` pairs;
 `--mode snapshot` plans offline from the last accepted snapshot instead
 (see `neutron migrate generate --help`). When a column is added and another
 with the same type is dropped, it prints a
 suggestion — confirm intent with `--rename 'users.old>users.new'` (the `>`
 must be quoted in the shell; without quotes the shell reads it as a redirect
-and the flag never reaches the CLI). Known limit: renaming a column that a
-generated column, check or index references also rewrites those definitions
-(on PostgreSQL 17+ a `SET EXPRESSION` and a drop and re-create of the check or
-index; on 16 the rename is refused). Nothing is lost, but the table is
-rewritten; rename such columns by hand until this is fixed.
+and the flag never reaches the CLI). Current limit: renaming a column also
+re-plans the definitions whose expressions name it. A check constraint, or an
+index whose expression or predicate references the column, is dropped and
+re-created on every supported version (a validation scan or an index
+rebuild); an index keyed on the column itself is untouched. A generated
+column that references it gets `SET EXPRESSION`, which rewrites the table on
+17+, and on 16 the plan is refused. Nothing is lost; rename such columns by
+hand until this is fixed.
 
 Enum value additions: PostgreSQL cannot use an enum value inside the
 transaction that adds it (SQLSTATE 55P04). When a plan adds enum values and
@@ -1436,9 +1440,9 @@ advertised for it:
 
 | Module | PostgreSQL | Nucleus 1.0.2 |
 |---|---|---|
-| `/pgvector`, `/fts` | verified on 17 and 18 | vector types unsupported; the FTS functions fail a negative control; queries are refused before any statement runs |
-| `/timeseries`, `/columnar` | verified on 17 and 18 | `ts-bucketing` resolves unsupported and bucket statements fail closed; the engine's own time-series and columnar model clients are in `@neutron-build/nucleus` ([below](#nucleus-time-series-and-columnar-model-clients)) |
-| `/listen-notify` | verified on 17 and 18 | delivers, with the divergences documented in [LISTEN/NOTIFY](#listennotify-neutron-buildsqllisten-notify) |
+| `/pgvector`, `/fts` | verified on 16, 17 and 18 | vector types unsupported; the FTS functions fail a negative control; queries are refused before any statement runs |
+| `/timeseries`, `/columnar` | verified on 16, 17 and 18 | `ts-bucketing` resolves unsupported and bucket statements fail closed; the engine's own time-series and columnar model clients are in `@neutron-build/nucleus` ([below](#nucleus-time-series-and-columnar-model-clients)) |
+| `/listen-notify` | verified on 16, 17 and 18 | delivers, with the divergences documented in [LISTEN/NOTIFY](#listennotify-neutron-buildsqllisten-notify) |
 
 ## Upgrading from earlier builds
 
@@ -1474,12 +1478,19 @@ Existing databases:
 2. If `_neutron_migrations` was written by an older CLI or by the Go/TS
    Nucleus SDKs, `neutron migrate` refuses to run until `neutron migrate
    adopt` graduates the history once, in one transaction. Rows whose
-   recorded checksum reproduces from the migration file are verified; the
-   rest are kept as unverified, never given a fabricated checksum.
+   recorded checksum reproduces from the migration file are verified; rows
+   with no recorded checksum, or with no file of the same version, are kept
+   as unverified, never given a fabricated checksum. A recorded checksum
+   that does not match its file refuses the whole adoption: restore the
+   applied SQL or reconcile the row by hand.
 3. Generate the next migration, review it, apply it. Nothing absent from
    the schema is dropped without `--allow-destructive`.
 4. To plan offline from snapshots, record the current database once with
-   `neutron schema baseline` (read-only).
+   `neutron schema baseline` (read-only). This is one way: once the baseline
+   exists, `neutron migrate` refuses any migration without a snapshot,
+   including files from `migrate create` and from `migrate generate` in live
+   mode, so generate with `--mode snapshot` (or set
+   `[migrations] snapshots = true`).
 
 Rollback and recovery limits:
 
@@ -1569,8 +1580,8 @@ general-purpose use.
   capability requirements, and schema export v2 is deterministic and
   cross-language-pinned (Go + reference consumer agree byte-for-byte);
   importing the root loads no driver module until a connection is requested.
-- Implemented and live-tested on PostgreSQL 17, both drivers: window
-  functions (ranking, value and distribution functions with PostgreSQL
+- Implemented and live-tested on PostgreSQL 16, 17 and 18, both drivers:
+  window functions (ranking, value and distribution functions with PostgreSQL
   result typing, rows/range/groups frames with exclude variants, aggregates
   as windows, placement enforced at the compile choke point), row locking
   (four strengths, nowait, skip locked, `of` targeting the from table, join
