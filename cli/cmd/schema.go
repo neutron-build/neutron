@@ -105,7 +105,9 @@ already made by other means with neutron migrate resolve <version> --mark-applie
 move the file out), and so does a legacy or SDK history while any file exists (adopt
 it first). Migration history is OBSERVED and reported, never adopted or upgraded —
 history graduation is neutron migrate adopt's job. Nothing in the database is
-created, altered or dropped.`,
+created, altered or dropped. The baseline holds the migration lock while it reads
+the database and its history, so a concurrent neutron migrate waits for it (and it
+waits for a running one, within --timeout).`,
 	RunE: func(cmd *cobra.Command, args []string) error { return reportRunE(runSchemaBaseline(cmd, args)) },
 }
 
@@ -422,6 +424,17 @@ func runSchemaBaseline(cmd *cobra.Command, args []string) error {
 	}
 	defer client.Close()
 
+	// The document and the history must describe one state: a runner that
+	// commits a migration between the two reads would leave a baseline that
+	// covers a file its document does not reflect. Every runner (migrate,
+	// adopt, resolve, down, db push, Studio apply) takes the migration lock,
+	// so hold it across both reads; like them, wait for it within --timeout.
+	sess, err := client.LockMigrations(ctx)
+	if err != nil {
+		return err
+	}
+	defer sess.Release()
+
 	doc, err := client.IntrospectV2(ctx)
 	if err != nil {
 		return fmt.Errorf("introspect: %w", err)
@@ -429,6 +442,9 @@ func runSchemaBaseline(cmd *cobra.Command, args []string) error {
 	doc, internal, err := db.WithoutInternalMetadata(doc)
 	if err != nil {
 		return err
+	}
+	if schemaBaselineAfterIntrospect != nil {
+		schemaBaselineAfterIntrospect()
 	}
 
 	applied, shape, err := client.AppliedVersionsReadOnly(ctx)
@@ -479,6 +495,10 @@ func runSchemaBaseline(cmd *cobra.Command, args []string) error {
 	ui.Infof("The baseline document is your ownership manifest: everything it lists is managed from here on. Remove objects you do not own before generating.")
 	return nil
 }
+
+// schemaBaselineAfterIntrospect is a test seam: when set, it runs between
+// the baseline's introspection and its history read.
+var schemaBaselineAfterIntrospect func()
 
 // baselineCoversApplied refuses a baseline whose covers would include a
 // migration file that is not applied. The baseline document is the applied
