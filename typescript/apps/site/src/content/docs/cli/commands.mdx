@@ -98,7 +98,11 @@ neutron db push --schema neutron.schema.json --dry-run
 neutron db push --schema neutron.schema.json
 ```
 
-The whole plan runs in one transaction, under the migration lock. Push refuses a database with migration history unless `--force`, and drops nothing absent from the schema without `--allow-destructive`; neither flag touches `_neutron_*` metadata or extension-owned objects.
+The plan runs in one transaction, under the migration lock, with one exception: PostgreSQL cannot use an enum value inside the transaction that adds it (SQLSTATE 55P04), so when a plan adds enum values and also changes anything else, push runs two reported transactions. The enum value additions commit first, then the rest of the plan runs in one transaction; `--dry-run` shows the boundary. If the second transaction fails it rolls back as a whole, the added values stay (PostgreSQL cannot remove them), and a re-run converges.
+
+Statements the connected server cannot run are refused at plan time, before anything is applied: changing a generated column's expression needs `ALTER COLUMN ... SET EXPRESSION`, PostgreSQL 17+.
+
+Push refuses a database with migration history unless `--force`, and drops nothing absent from the schema without `--allow-destructive`; neither flag touches `_neutron_*` metadata or extension-owned objects.
 
 ### `neutron schema`
 
@@ -111,6 +115,8 @@ neutron schema check      # desired document vs the snapshot chain (offline)
 neutron schema check --live   # database vs the applied snapshots: drift
 neutron schema baseline   # record an existing database as the chain root (read-only)
 ```
+
+A baseline moves the migrations directory to the snapshot workflow, one way: from then on `neutron migrate` refuses any migration without a snapshot ("the snapshot chain is incomplete"), including files from `neutron migrate create` and from `neutron migrate generate` in live mode. Generate later migrations with `--mode snapshot`, or set `[migrations] snapshots = true`. `schema baseline` refuses to run while a baseline exists.
 
 ## Migrations
 
@@ -141,7 +147,7 @@ Adopt a legacy migration history into the current protocol, in one transaction.
 neutron migrate adopt
 ```
 
-Databases with histories written by an older CLI, or by the Go/TS Nucleus SDKs (integer version columns), are refused by `neutron migrate` until adopted once. Adoption matches history rows to files by exact version text (`001` and `1` are never treated as the same migration), verifies what can be proven (a legacy SDK checksum that reproduces from the supplied file), and reports everything else as unverified — checksums are never fabricated.
+Databases with histories written by an older CLI, or by the Go/TS Nucleus SDKs (integer version columns), are refused by `neutron migrate` until adopted once. Adoption matches history rows to files by exact version text (`001` and `1` are never treated as the same migration), verifies what can be proven (a legacy SDK checksum that reproduces from the supplied file), and reports rows with no recorded checksum, or with no file of the same version, as unverified — checksums are never fabricated. A recorded checksum that does not match its file refuses the whole adoption and changes nothing: restore the applied SQL or reconcile the row by hand.
 
 ### `neutron migrate status`
 
@@ -182,7 +188,7 @@ neutron migrate generate --mode snapshot --schema neutron.schema.json
 neutron migrate generate --rename 'users.name>users.full_name'
 ```
 
-`--mode live` (the default) diffs against the database; `--mode snapshot` plans offline from the last accepted snapshot, accounts for pending migrations, and writes a `.plan.json` risk and reversibility report. Nothing absent from the schema is dropped without `--allow-destructive`, `_neutron_*` metadata and extension-owned objects are never dropped, and catalog structures the planner cannot represent faithfully are refused instead of planned. Quote `--rename` values: `>` is a shell redirect.
+`--mode live` (the default, unless `neutron.toml` sets `[migrations] snapshots = true`) diffs against the database; `--mode snapshot` plans offline from the last accepted snapshot, accounts for pending migrations, and writes a `.plan.json` risk and reversibility report. When a plan adds enum values and also changes anything else, generate writes the additions as their own earlier migration (`{NNN}_{name}_enum_values`, then `{NNN+1}_{name}`); in snapshot mode each gets its own plan report and snapshot. `--mode live` refuses statements the connected server cannot run (changing a generated column's expression needs PostgreSQL 17+). `--mode snapshot` cannot know the target server, so the plan report records the requirement as `minServerMajor` and `neutron migrate` refuses older servers before running anything. Nothing absent from the schema is dropped without `--allow-destructive`, `_neutron_*` metadata and extension-owned objects are never dropped, and catalog structures the planner cannot represent faithfully are refused instead of planned. Quote `--rename` values: `>` is a shell redirect.
 
 ### `neutron migrate resolve <version>`
 
@@ -197,11 +203,11 @@ Transactional migrations need none of this: a failure rolls back with its histor
 
 ### Upgrading from earlier CLI builds
 
-- **Migration history.** A `_neutron_migrations` table written by an older CLI or by the Go/TS Nucleus SDKs is refused until `neutron migrate adopt` graduates it once. Adoption never fabricates checksums: rows it cannot prove stay unverified.
+- **Migration history.** A `_neutron_migrations` table written by an older CLI or by the Go/TS Nucleus SDKs is refused until `neutron migrate adopt` graduates it once. Adoption never fabricates checksums: rows it cannot prove stay unverified, and a recorded checksum that does not match its file refuses the adoption.
 - **Statement allowlist.** Migration files may contain only the statement kinds listed in `neutron migrate --help` (`SELECT` and DML, `TRUNCATE`, create/alter/drop of schema objects, `SET LOCAL`). Functions, triggers, rules, grants, `DO` blocks and database- or role-wide statements are refused before anything in the file runs; no flag bypasses this.
 - **Destructive changes.** Drops and other data-losing statements need `--allow-destructive`; `db push --force` only permits pushing onto a database that has migration history.
 - **Nucleus.** `neutron migrate` refuses Nucleus databases; the Go and TypeScript SDK runners own those, and remain experimental.
-- **MCP.** `query_sql` is always read-only; writes go through `execute_sql`, which exists only with `--allow-writes`. The HTTP transport binds to `127.0.0.1`, and writes over HTTP need `NEUTRON_MCP_TOKEN`.
+- **MCP.** `query_sql` is read-only (best-effort on Nucleus; see `neutron mcp` below); writes go through `execute_sql`, which exists only with `--allow-writes`. The HTTP transport binds to `127.0.0.1`, and writes over HTTP need `NEUTRON_MCP_TOKEN`.
 
 The migration protocol (identity, checksum, locking, adoption) is specified in `contracts/data/MIGRATIONS.md`.
 
