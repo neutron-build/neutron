@@ -156,10 +156,12 @@ Adoption matches existing history rows to the supplied files by exact text ID
 ("001" and "1" are never treated as the same migration; numerically equal but
 textually distinct IDs are a reconciliation error). Rows whose recorded
 content can be proven — a legacy Go SDK checksum that reproduces from the
-supplied file — are adopted as verified. Everything else is adopted as
-UNVERIFIED: the checksum stays empty and the row is reported. Unknown
-checksums are unverified history, not proof of integrity — nothing is ever
-silently baselined.`,
+supplied file — are adopted as verified. Rows with no recorded checksum, or
+with no file of the same ID, are adopted as UNVERIFIED: the checksum stays
+empty and the row is reported. A recorded checksum that matches neither the
+file's legacy nor its v2 digest refuses the whole adoption and changes
+nothing: restore the applied SQL or reconcile the row by hand. Nothing is
+ever silently baselined.`,
 	RunE: func(cmd *cobra.Command, args []string) error { return reportRunE(runMigrateAdopt(cmd, args)) },
 }
 

@@ -73,7 +73,7 @@ Full guide: **[neutron.build/docs](https://neutron.build/docs)**.
 
 Each language ships an idiomatic Nucleus client. The Nucleus engine's 14 data models are SQL, KV, Vector, TimeSeries, Document, Graph, FTS, Geo, Blob, Streams, Columnar, Datalog, CDC, PubSub — per-SDK model coverage varies and is not collectively certified; each bullet below states its own scope.
 
-- **TypeScript** — `@neutron-build/sql` (alpha): Drizzle-shaped schema in code, no codegen, typed CRUD + one-level relational reads (`db.query.users.findFirst({ with: { posts: true } })`), one readable SQL statement per call, `toSQL()` everywhere; live-tested against PostgreSQL 17 with both `postgres` and `pg` drivers (CI service container; other majors and Nucleus not claimed yet). Existing Drizzle users keep Drizzle through `@neutron-build/data`'s typed interop wrapper.
+- **TypeScript** — `@neutron-build/sql` (alpha): Drizzle-shaped schema in code, no codegen, typed CRUD + nested relational reads in one statement (`db.query.users.findFirst({ with: { posts: true } })`), one readable SQL statement per call, `toSQL()` everywhere; verified on PostgreSQL 16, 17 and 18 with both `postgres` and `pg` drivers (changing a generated column's expression needs 17+; Nucleus not claimed). See its [support matrix](./typescript/packages/neutron-sql/README.md#support-matrix). Existing Drizzle users keep Drizzle through `@neutron-build/data`'s typed interop wrapper.
 - **Rust** — Typed model handles via `NucleusClient`
 - **Go** — Typed generics, struct tags
 - **Python** — Pydantic models, async

@@ -76,8 +76,10 @@ All notable changes to this project are documented in this file.
   (`contracts/data/MIGRATIONS.md`). The checksum is a SHA-256 digest of the
   up SQL; a history containing rows from before the protocol is refused
   before any change until `adoptMigrations` graduates it once (rows whose
-  old checksum reproduces from the file are verified, the rest are kept
-  unverified). A crashed runner's lock claim is no longer taken over after
+  old checksum reproduces from the file are verified; rows with no checksum,
+  or with no migration of the same version, are kept unverified; a recorded
+  checksum that does not match its migration refuses the adoption). A crashed
+  runner's lock claim is no longer taken over after
   ten minutes: release it with `forceUnlockMigrations`, after checking
   `migrationLockInfo`. The same protocol is in the Go SDK and the CLI.
 - **`@neutron-build/nucleus` pub/sub `channels()` takes no pattern.** The
