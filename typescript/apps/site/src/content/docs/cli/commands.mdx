@@ -116,7 +116,7 @@ neutron schema check --live   # database vs the applied snapshots: drift
 neutron schema baseline   # record an existing database as the chain root (read-only)
 ```
 
-A baseline moves the migrations directory to the snapshot workflow, one way: from then on `neutron migrate` refuses any migration without a snapshot ("the snapshot chain is incomplete"), including files from `neutron migrate create` and from `neutron migrate generate` in live mode. Generate later migrations with `--mode snapshot`, or set `[migrations] snapshots = true`. `schema baseline` refuses to run while a baseline exists.
+A baseline moves the migrations directory to the snapshot workflow, one way: from then on `neutron migrate` refuses any migration without a snapshot ("the snapshot chain is incomplete"), including files from `neutron migrate create` and from `neutron migrate generate` in live mode. Generate later migrations with `--mode snapshot`, or set `[migrations] snapshots = true`. `schema baseline` refuses to run while a baseline exists, and while any migration file is unapplied or older history is not adopted; it leaves out the `_neutron_*` tables the CLI manages. A baseline from an earlier CLI that recorded `_neutron_migrations` keeps working: do not delete or re-baseline it.
 
 ## Migrations
 

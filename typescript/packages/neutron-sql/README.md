@@ -161,7 +161,9 @@ so `neutron migrate` refuses older servers before running anything.
 
 Safety semantics: generated SQL never drops `_neutron_*`
 metadata tables, extension-owned objects, or anything absent from the schema
-unless `--allow-destructive` is passed as an explicit acknowledgement.
+unless `--allow-destructive` is passed as an explicit acknowledgement. The
+`_neutron_` table prefix is reserved: such tables cannot be declared in a
+schema, and `schema pull` and `schema baseline` leave them out.
 Catalog structures the diff cannot represent faithfully are rejected with an
 error instead of producing a migration that falsely claims synchronization.
 With a version-2 document the planner covers schema-qualified tables,
@@ -1486,11 +1488,20 @@ Existing databases:
 3. Generate the next migration, review it, apply it. Nothing absent from
    the schema is dropped without `--allow-destructive`.
 4. To plan offline from snapshots, record the current database once with
-   `neutron schema baseline` (read-only). This is one way: once the baseline
-   exists, `neutron migrate` refuses any migration without a snapshot,
-   including files from `migrate create` and from `migrate generate` in live
-   mode, so generate with `--mode snapshot` (or set
-   `[migrations] snapshots = true`).
+   `neutron schema baseline` (read-only), after every migration file is
+   applied and any older history is adopted: the baseline refuses while a
+   file is unapplied, and it leaves out the `_neutron_*` tables the CLI
+   manages. This is one way: once the baseline exists, `neutron migrate`
+   refuses any migration without a snapshot, including files from `migrate
+   create` and from `migrate generate` in live mode, so generate with
+   `--mode snapshot` (or set `[migrations] snapshots = true`).
+
+   A baseline written by an earlier CLI that recorded `_neutron_migrations`
+   keeps working after upgrading the CLI; do not delete or re-baseline it
+   (a later snapshot chains to its hash). An earlier CLI also let a
+   baseline cover migration files that were not applied yet; such a file,
+   applied later, is reported as drift. Check with `neutron schema check
+   --live` after upgrading.
 
 Rollback and recovery limits:
 
