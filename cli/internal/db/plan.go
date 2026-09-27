@@ -191,6 +191,11 @@ type SnapshotChain struct {
 	RootSHA256 string          // baseline target hash, or the empty-document hash
 	HeadSHA256 string          // newest snapshot target hash, or root
 	HeadRef    string          // "empty" | "000_baseline" | migration stem
+
+	// BaselineInternal lists neutron-internal tables an earlier CLI wrote
+	// into the baseline document. They are left out of the loaded
+	// Baseline.Document; the recorded target hash still anchors the chain.
+	BaselineInternal []V2Identity
 }
 
 // Empty reports whether the chain has no baseline and no snapshots.
@@ -353,6 +358,20 @@ func LoadSnapshotChain(migrationsDir string) (*SnapshotChain, error) {
 		}
 		if doc.SHA256Hex != chain.Baseline.TargetSHA256 {
 			return nil, fmt.Errorf("baseline snapshot records target sha256 %s but its document hashes to %s — the artifact is corrupt", shortHash(chain.Baseline.TargetSHA256), shortHash(doc.SHA256Hex))
+		}
+		// Baselines written before M07 list the internal tables. Nothing
+		// can manage a table in that set — the diff refuses it in any
+		// document — so it is dropped from the loaded document (after the
+		// integrity check above, which covers the file as written). Only
+		// the baseline is read this way: migration snapshots come from
+		// validated desired documents and never legitimately list one.
+		filtered, internal, err := WithoutInternalMetadata(doc)
+		if err != nil {
+			return nil, fmt.Errorf("baseline snapshot: %w", err)
+		}
+		if len(internal) > 0 {
+			chain.Baseline.Document = append(json.RawMessage(nil), filtered.Canonical...)
+			chain.BaselineInternal = internal
 		}
 		chain.RootSHA256 = chain.Baseline.TargetSHA256
 		chain.HeadSHA256 = chain.Baseline.TargetSHA256
@@ -887,6 +906,57 @@ func PlanMatchesUpSQL(plan *PlanArtifact, upSQL string) error {
 // bytes preserved verbatim.
 func MarshalSnapshotJSON(snap *SnapshotArtifact) ([]byte, error) {
 	return marshalDeterministic(snap)
+}
+
+// WithoutInternalMetadata returns doc without its neutron-internal tables
+// (the IsProtectedTableName set the diff refuses in a schema document) and
+// the identities it removed. Documents written from live introspection —
+// the baseline, a pulled document — go through it: internal tables are
+// managed automatically and are never part of a diff or plan, so a document
+// listing them could not be used as a desired or expected state. Every
+// other entry is kept byte-for-byte; a document with no internal tables is
+// returned as is.
+func WithoutInternalMetadata(doc *V2Document) (*V2Document, []V2Identity, error) {
+	var root map[string]any
+	if err := json.Unmarshal(doc.Canonical, &root); err != nil {
+		return nil, nil, fmt.Errorf("decode schema document: %w", err)
+	}
+	tables, _ := root["tables"].([]any)
+	kept := make([]any, 0, len(tables))
+	var removed []V2Identity
+	for _, t := range tables {
+		obj, _ := t.(map[string]any)
+		ident, _ := obj["identity"].(map[string]any)
+		schema, _ := ident["schema"].(string)
+		name, _ := ident["name"].(string)
+		if isProtectedTableName(name) {
+			removed = append(removed, V2Identity{Schema: schema, Name: name})
+			continue
+		}
+		kept = append(kept, t)
+	}
+	if len(removed) == 0 {
+		return doc, nil, nil
+	}
+	root["tables"] = kept
+	raw, err := json.Marshal(root)
+	if err != nil {
+		return nil, nil, fmt.Errorf("encode schema document: %w", err)
+	}
+	out, err := ParseV2Document(raw)
+	if err != nil {
+		return nil, nil, fmt.Errorf("the schema document without its neutron-internal tables (%s) is invalid: %w", IdentityList(removed), err)
+	}
+	return out, removed, nil
+}
+
+// IdentityList renders identities as a comma-separated "schema.name" list.
+func IdentityList(ids []V2Identity) string {
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = id.String()
+	}
+	return strings.Join(parts, ", ")
 }
 
 // BaselineSnapshotFor builds the chain-root snapshot of an existing

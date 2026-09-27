@@ -323,6 +323,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	reportBaselineInternal(chain)
 	if err := managedDriftUnderLock(ctx, client, chain, applied); err != nil {
 		return err
 	}

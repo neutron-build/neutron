@@ -243,6 +243,7 @@ func runMigrateGenerateSnapshot(cmd *cobra.Command, dir, schemaPath, name string
 	if err != nil {
 		return err
 	}
+	reportBaselineInternal(chain)
 	baseDoc, err := chain.HeadDocument()
 	if err != nil {
 		return err

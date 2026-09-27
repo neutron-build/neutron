@@ -71,7 +71,9 @@ var schemaPullCmd = &cobra.Command{
 	Long: `Introspects the live PostgreSQL catalog into a canonical schema document v2
 (the same introspection the diff engine uses) and writes it atomically. Objects the
 contract cannot represent faithfully are recorded as a read-only opaque inventory in
-the document and listed in the output. Pull never modifies the database.`,
+the document and listed in the output. Neutron-internal metadata tables (_neutron_*)
+are left out: they are managed automatically and a schema document may not list them.
+Pull never modifies the database.`,
 	RunE: func(cmd *cobra.Command, args []string) error { return reportRunE(runSchemaPull(cmd, args)) },
 }
 
@@ -93,10 +95,13 @@ var schemaBaselineCmd = &cobra.Command{
 	Short: "Record an existing database as the snapshot chain root",
 	Long: `Initial ownership workflow for an existing database: introspects the database
 (read-only), writes migrations/snapshots/000_baseline.snapshot.json as the chain root,
-and reports unmanaged objects. Existing migration files at baseline time are recorded
-as covered by the baseline; migration history is OBSERVED and reported, never adopted
-or upgraded — history graduation is neutron migrate adopt's job. Nothing in the
-database is created, altered or dropped.`,
+and reports unmanaged objects. Neutron-internal metadata tables (_neutron_*) are left
+out of the baseline: they are managed automatically and never part of a plan (a
+baseline written by an earlier CLI that lists them still works — they are ignored on
+read). Existing migration files at baseline time are recorded as covered by the
+baseline; migration history is OBSERVED and reported, never adopted or upgraded —
+history graduation is neutron migrate adopt's job. Nothing in the database is
+created, altered or dropped.`,
 	RunE: func(cmd *cobra.Command, args []string) error { return reportRunE(runSchemaBaseline(cmd, args)) },
 }
 
@@ -160,12 +165,35 @@ func runSchemaPull(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("introspect: %w", err)
 	}
+	doc, internal, err := db.WithoutInternalMetadata(doc)
+	if err != nil {
+		return err
+	}
 	if err := db.WriteAtomicReplace(out, append([]byte(nil), doc.Canonical...)); err != nil {
 		return err
 	}
 	reportDocumentSummary(doc)
+	reportInternalExcluded(internal)
 	ui.Successf("Pulled schema document: %s", out)
 	return nil
+}
+
+// reportInternalExcluded names the neutron-internal tables left out of a
+// document written from introspection.
+func reportInternalExcluded(internal []db.V2Identity) {
+	if len(internal) == 0 {
+		return
+	}
+	ui.Infof("neutron-internal metadata left out of the document (managed automatically, never part of a plan): %s", db.IdentityList(internal))
+}
+
+// reportBaselineInternal notes internal tables a baseline written by an
+// earlier CLI still lists; the chain loader ignores them.
+func reportBaselineInternal(chain *db.SnapshotChain) {
+	if chain == nil || len(chain.BaselineInternal) == 0 {
+		return
+	}
+	ui.Infof("baseline %s_%s lists neutron-internal metadata %s (written by an earlier CLI): ignored — internal tables are never managed", db.BaselineVersion, db.BaselineName, db.IdentityList(chain.BaselineInternal))
 }
 
 func reportDocumentSummary(doc *db.V2Document) {
@@ -195,6 +223,7 @@ func runSchemaCheck(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	reportBaselineInternal(chain)
 	if chain.Empty() {
 		return fmt.Errorf("no snapshot chain in %s — generate a migration (`neutron migrate generate --mode snapshot`) or baseline an existing database (`neutron schema baseline`) first", dir)
 	}
@@ -393,6 +422,10 @@ func runSchemaBaseline(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("introspect: %w", err)
 	}
+	doc, internal, err := db.WithoutInternalMetadata(doc)
+	if err != nil {
+		return err
+	}
 
 	applied, shape, err := client.AppliedVersionsReadOnly(ctx)
 	if err != nil {
@@ -423,6 +456,7 @@ func runSchemaBaseline(cmd *cobra.Command, args []string) error {
 	}
 
 	reportDocumentSummary(doc)
+	reportInternalExcluded(internal)
 	if len(covers) > 0 {
 		ui.Infof("existing migration files recorded as covered by the baseline: %s", strings.Join(covers, ", "))
 	}
