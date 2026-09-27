@@ -105,6 +105,7 @@ func DiffV2Document(ctx context.Context, desired, actual *V2Document, opts DiffV
 		twinFailedElems:  map[V2Identity]map[string]bool{},
 		twinFailedViews:  map[V2Identity]bool{},
 		unrenamedTables:  map[V2Identity]string{},
+		renameBlocked:    map[V2Identity]map[string]string{},
 	}
 
 	for _, s := range d.Schemas {
@@ -173,8 +174,9 @@ type v2Planner struct {
 	twinFailedTables map[V2Identity]bool
 	twinFailedElems  map[V2Identity]map[string]bool
 	twinFailedViews  map[V2Identity]bool
-	unrenamedTables  map[V2Identity]string // live text kept its pre-rename names
-	unverified       []string              // rendered "equivalence not verified" lines
+	unrenamedTables  map[V2Identity]string            // live text kept its pre-rename names
+	renameBlocked    map[V2Identity]map[string]string // element -> what depends on its pre-rename text
+	unverified       []string                         // rendered "equivalence not verified" lines
 }
 
 func (p *v2Planner) warn(format string, args ...any) {
@@ -798,6 +800,7 @@ func (p *v2Planner) planSharedTables() error {
 	for _, dt := range shared {
 		p.renameActual(dt.Identity)
 	}
+	p.renameStructure()
 
 	// Phase 1: renames.
 	for _, dt := range shared {
@@ -882,6 +885,9 @@ func (p *v2Planner) planSharedTables() error {
 				p.warn("table %s: column %q exists in %s but not in the schema: left untouched (dropping requires explicit destructive acknowledgement, --allow-destructive)", dt.Identity, ac.Name, p.baseNoun())
 				continue
 			}
+			if ac.Generated != nil {
+				p.blockOnRename(dt.Identity, v2GeneratedElement(ac.Name), fmt.Sprintf("generated column %s is dropped, and its down statement re-adds it as %q", ac.Name, ac.Generated.Expression))
+			}
 			p.warn("table %s: column %q will be dropped (data lost unless it is a rename — see --rename)", dt.Identity, ac.Name)
 			acDDL, err := v2ColumnDDL(ac)
 			if err != nil {
@@ -901,7 +907,7 @@ func (p *v2Planner) planSharedTables() error {
 			return err
 		}
 	}
-	return nil
+	return p.renameRefusal()
 }
 
 // renameActual replaces a renamed table's live expressions with the
@@ -934,6 +940,107 @@ func (p *v2Planner) renameActual(table V2Identity) {
 	}
 	sort.Strings(described)
 	p.unrenamedTables[table] = strings.Join(described, ", ")
+}
+
+// renameStructure maps the column-name lists of the live model through the
+// planned renames: constraint columns, foreign-key referenced columns (by
+// the referenced table's renames), index key columns and INCLUDE lists.
+// PostgreSQL rewrites all of them on RENAME COLUMN, and every down
+// statement built from them runs before the renames are reverted, so it
+// must name the new columns. These are structural lists, not expression
+// text. Comparisons are unaffected: they translate old names to new ones,
+// and a new name is never a live name (validateRenames).
+func (p *v2Planner) renameStructure() {
+	if len(p.opts.Renames) == 0 {
+		return
+	}
+	mapped := func(table V2Identity, cols []string) []string {
+		if cols == nil {
+			return nil
+		}
+		out := make([]string, len(cols))
+		for i, c := range cols {
+			out[i] = p.actualToDesiredName(table, c)
+		}
+		return out
+	}
+	for ti := range p.actual.Tables {
+		t := &p.actual.Tables[ti]
+		t.Constraints = append([]V2Constraint(nil), t.Constraints...)
+		for ci := range t.Constraints {
+			con := &t.Constraints[ci]
+			con.Columns = mapped(t.Identity, con.Columns)
+			if con.References != nil {
+				ref := *con.References
+				ref.Columns = mapped(ref.Table, ref.Columns)
+				con.References = &ref
+			}
+		}
+		t.Indexes = append([]V2Index(nil), t.Indexes...)
+		for ii := range t.Indexes {
+			idx := &t.Indexes[ii]
+			idx.Key = append([]V2IndexKeyPart(nil), idx.Key...)
+			for ki := range idx.Key {
+				if c := idx.Key[ki].Column; c != nil {
+					name := p.actualToDesiredName(t.Identity, *c)
+					idx.Key[ki].Column = &name
+				}
+			}
+			idx.Include = mapped(t.Identity, idx.Include)
+		}
+	}
+}
+
+// blockOnRename records that the plan depends on an element of a table
+// whose live text still predates its renames (no catalog, or the rename
+// copy failed): a difference cannot be told from the rename, and a down
+// statement carrying the text would name the old column before the rename
+// is reverted. planSharedTables refuses the plan when any is recorded.
+func (p *v2Planner) blockOnRename(table V2Identity, element, what string) bool {
+	if p.unrenamedTables[table] == "" {
+		return false
+	}
+	if p.renameBlocked[table] == nil {
+		p.renameBlocked[table] = map[string]string{}
+	}
+	if _, seen := p.renameBlocked[table][element]; !seen {
+		p.renameBlocked[table][element] = what
+	}
+	return true
+}
+
+// renameRefusal is the error for the tables blockOnRename recorded, or nil.
+func (p *v2Planner) renameRefusal() error {
+	if len(p.renameBlocked) == 0 {
+		return nil
+	}
+	tables := make([]V2Identity, 0, len(p.renameBlocked))
+	for t := range p.renameBlocked {
+		tables = append(tables, t)
+	}
+	sort.Slice(tables, func(i, j int) bool { return tables[i].String() < tables[j].String() })
+	var msgs []string
+	for _, table := range tables {
+		var items []string
+		for _, what := range p.renameBlocked[table] {
+			items = append(items, "  "+what)
+		}
+		sort.Strings(items)
+		var fix string
+		if p.opts.Normalizer != nil {
+			fix = fmt.Sprintf("it could not be compared under the rename on this database. Rename the column by hand first: %s (PostgreSQL rewrites the expressions that reference it), then re-run without the --rename flags for %s (keep any others)", strings.Join(p.renameStatements(table), "; "), table)
+		} else {
+			// --mode live is no fix here: a snapshot plan with a rename
+			// always has a chain, and the runner refuses a migration
+			// without a snapshot in it. Two offline migrations never
+			// compare text across the rename.
+			fix = "offline planning has no catalog to compare it under the rename. Plan it as two migrations instead: first generate one without the elements listed below and without --rename (removing a generated column needs --allow-destructive and recomputes its values when it is added back), then one with the --rename and the elements you keep written with the new name (a re-added column is placed last, so declare it last)"
+		}
+		msgs = append(msgs, fmt.Sprintf(
+			"table %s: the plan depends on expression text in %s that predates the rename of %s. PostgreSQL rewrites that text on RENAME COLUMN, so without comparing it under the rename a rename alone cannot be told from a change, and a down statement carrying it would name the old column before the rename is reverted. The plan is refused; %s:\n%s",
+			table, p.baseNoun(), p.unrenamedTables[table], fix, strings.Join(items, "\n")))
+	}
+	return errors.New(strings.Join(msgs, "\n"))
 }
 
 // renameStatements are the planned RENAME COLUMN statements of a table,
@@ -1010,7 +1117,7 @@ func (p *v2Planner) planColumnAttributes(table V2Identity, dc, ac V2Column) erro
 			fmt.Sprintf("-- column %s: no down statement — PostgreSQL cannot attach a generation expression to an existing column (was: generated always as (%s) stored)", cq, ac.Generated.Expression),
 		)
 	case dc.Generated != nil && ac.Generated != nil:
-		if !p.textEqual(table, v2GeneratedElement(dc.Name), "column "+dc.Name+" generation expression", &dc.Generated.Expression, &ac.Generated.Expression) {
+		if !p.textEqual(table, v2GeneratedElement(dc.Name), "column "+dc.Name+" generation expression", &dc.Generated.Expression, &ac.Generated.Expression) && p.renameBlocked[table][v2GeneratedElement(dc.Name)] == "" {
 			if p.opts.ServerMajor > 0 && p.opts.ServerMajor < SetExpressionMinServerMajor {
 				if !p.comparisonVerified(table, v2GeneratedElement(dc.Name)) {
 					// No catalog oracle for this expression: the difference
@@ -1018,16 +1125,6 @@ func (p *v2Planner) planColumnAttributes(table V2Identity, dc, ac V2Column) erro
 					// notes the refusal would otherwise drop.
 					fix := fmt.Sprintf("If the expression is unchanged, write it as %s spells it; if it changed, upgrade the server to PostgreSQL %d+, or replace the column explicitly in two steps: remove it from the schema and apply with --allow-destructive (its stored values are dropped), then add it back with the new expression (values are recomputed; a re-added column is placed last, so declare it last)",
 						p.baseNoun(), SetExpressionMinServerMajor)
-					if renamed := p.unrenamedTables[table]; renamed != "" {
-						// The database spells it with the old name, so
-						// matching its spelling is no fix.
-						fix = fmt.Sprintf("The text %s holds predates the rename of %s, and it could not be compared under the rename. ", p.baseNoun(), renamed)
-						if p.opts.Normalizer != nil {
-							fix += fmt.Sprintf("Rename the column by hand first: %s (PostgreSQL rewrites the expressions that reference it), then re-run without the --rename flags for %s (keep any others)", strings.Join(p.renameStatements(table), "; "), table)
-						} else {
-							fix += "Re-run with --mode live, which compares it under the rename"
-						}
-					}
 					return fmt.Errorf(
 						"table %s: generated column %q could not be verified: the schema writes its expression %q and %s holds %q, and without a catalog comparison the difference may be spelling only. A real change needs ALTER COLUMN ... SET EXPRESSION (PostgreSQL %d+), which the connected PostgreSQL %d cannot run, so the plan is refused. %s\n%s",
 						table, dc.Name, dc.Generated.Expression, p.baseNoun(), ac.Generated.Expression, SetExpressionMinServerMajor, p.opts.ServerMajor, fix, p.unverifiedNotes())
@@ -1234,6 +1331,9 @@ func (p *v2Planner) planConstraintChanges(table V2Identity, desired, actual *V2T
 		if ac.Type == "primary-key" && desiredPKName != "" {
 			continue // paired with the desired PK by slot above
 		}
+		if ac.Expression != nil {
+			p.blockOnRename(table, v2CheckElement(ac.Name), fmt.Sprintf("check constraint %s is dropped, and its down statement re-adds %q", ac.Name, *ac.Expression))
+		}
 		drops = append(drops, ac.Name)
 	}
 
@@ -1406,6 +1506,9 @@ func (p *v2Planner) planIndexChanges(table V2Identity, desired, actual *V2Table)
 		if err != nil {
 			return err
 		}
+		if indexHasExpressions(ai) {
+			p.blockOnRename(table, v2IndexElement(ai.Identity.Name), fmt.Sprintf("index %s is dropped, and its down statement re-creates it as %q", ai.Identity.Name, oldDDL))
+		}
 		p.emit(fmt.Sprintf("drop index if exists %s", qualifiedNameSQL(ai.Identity)), oldDDL)
 		p.warn("index %q on table %s will be dropped", ai.Identity.Name, table)
 	}
@@ -1484,20 +1587,27 @@ func (p *v2Planner) textEqual(table V2Identity, element, what string, desired, a
 	if *desired == *actual {
 		return true
 	}
+	// A column default cannot reference a column, so only the other
+	// expression elements can differ because of a rename.
+	isDefault := strings.HasPrefix(element, "column ") && strings.HasSuffix(element, " default")
+	if !isDefault && p.blockOnRename(table, element, fmt.Sprintf("%s: %q (desired) vs %q (%s)", what, *desired, *actual, p.baseLiveNoun())) {
+		return false
+	}
 	if !p.comparisonVerified(table, element) {
 		note := fmt.Sprintf("%s: %q (desired) vs %q (live) — compared textually without a catalog oracle", what, *desired, *actual)
-		fix := unverifiedFix
-		if renamed := p.unrenamedTables[table]; renamed != "" {
-			note += fmt.Sprintf(", and the live text predates the rename of %s that PostgreSQL applies to it", renamed)
-			// A live run already had a normalizer; the copy under the
-			// rename is what failed.
-			if p.opts.Normalizer != nil {
-				fix = fmt.Sprintf("rename by hand first with %s (PostgreSQL rewrites the expressions that reference it), then re-run without the --rename flags for %s (keep any others)", strings.Join(p.renameStatements(table), "; "), table)
-			} else {
-				fix = "re-run with --mode live, which compares it under the rename"
-			}
+		p.unverified = append(p.unverified, fmt.Sprintf(unverifiedFormat, note, unverifiedFix))
+	}
+	return false
+}
+
+func indexHasExpressions(idx V2Index) bool {
+	if idx.Where != nil {
+		return true
+	}
+	for _, k := range idx.Key {
+		if k.Expression != nil {
+			return true
 		}
-		p.unverified = append(p.unverified, fmt.Sprintf(unverifiedFormat, note, fix))
 	}
 	return false
 }
