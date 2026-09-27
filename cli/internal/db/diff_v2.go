@@ -174,7 +174,7 @@ type v2Planner struct {
 	twinFailedElems  map[V2Identity]map[string]bool
 	twinFailedViews  map[V2Identity]bool
 	unrenamedTables  map[V2Identity]string // live text kept its pre-rename names
-	unverified       []string
+	unverified       []string              // rendered "equivalence not verified" lines
 }
 
 func (p *v2Planner) warn(format string, args ...any) {
@@ -936,6 +936,20 @@ func (p *v2Planner) renameActual(table V2Identity) {
 	p.unrenamedTables[table] = strings.Join(described, ", ")
 }
 
+// renameStatements are the planned RENAME COLUMN statements of a table,
+// sorted.
+func (p *v2Planner) renameStatements(table V2Identity) []string {
+	prefix := table.String() + "."
+	var stmts []string
+	for target, source := range p.opts.Renames {
+		if strings.HasPrefix(target, prefix) {
+			stmts = append(stmts, fmt.Sprintf("alter table %s rename column %s to %s", qualifiedNameSQL(table), quoteIdent(source), quoteIdent(target[len(prefix):])))
+		}
+	}
+	sort.Strings(stmts)
+	return stmts
+}
+
 func columnNames(t V2Table) []string {
 	out := make([]string, 0, len(t.Columns))
 	for _, c := range t.Columns {
@@ -1002,9 +1016,21 @@ func (p *v2Planner) planColumnAttributes(table V2Identity, dc, ac V2Column) erro
 					// No catalog oracle for this expression: the difference
 					// may be spelling only. Say so, and carry the unverified
 					// notes the refusal would otherwise drop.
+					fix := fmt.Sprintf("If the expression is unchanged, write it as %s spells it; if it changed, upgrade the server to PostgreSQL %d+, or replace the column explicitly in two steps: remove it from the schema and apply with --allow-destructive (its stored values are dropped), then add it back with the new expression (values are recomputed; a re-added column is placed last, so declare it last)",
+						p.baseNoun(), SetExpressionMinServerMajor)
+					if renamed := p.unrenamedTables[table]; renamed != "" {
+						// The database spells it with the old name, so
+						// matching its spelling is no fix.
+						fix = fmt.Sprintf("The text %s holds predates the rename of %s, and it could not be compared under the rename. ", p.baseNoun(), renamed)
+						if p.opts.Normalizer != nil {
+							fix += fmt.Sprintf("Rename the column by hand first: %s (PostgreSQL rewrites the expressions that reference it), then re-run without --rename", strings.Join(p.renameStatements(table), "; "))
+						} else {
+							fix += "Re-run with --mode live, which compares it under the rename"
+						}
+					}
 					return fmt.Errorf(
-						"table %s: generated column %q could not be verified: the schema writes its expression %q and %s holds %q, and without a catalog comparison the difference may be spelling only. A real change needs ALTER COLUMN ... SET EXPRESSION (PostgreSQL %d+), which the connected PostgreSQL %d cannot run, so the plan is refused. If the expression is unchanged, write it as %s spells it; if it changed, upgrade the server to PostgreSQL %d+, or replace the column explicitly in two steps: remove it from the schema and apply with --allow-destructive (its stored values are dropped), then add it back with the new expression (values are recomputed; a re-added column is placed last, so declare it last)\n%s",
-						table, dc.Name, dc.Generated.Expression, p.baseNoun(), ac.Generated.Expression, SetExpressionMinServerMajor, p.opts.ServerMajor, p.baseNoun(), SetExpressionMinServerMajor, p.unverifiedNotes())
+						"table %s: generated column %q could not be verified: the schema writes its expression %q and %s holds %q, and without a catalog comparison the difference may be spelling only. A real change needs ALTER COLUMN ... SET EXPRESSION (PostgreSQL %d+), which the connected PostgreSQL %d cannot run, so the plan is refused. %s\n%s",
+						table, dc.Name, dc.Generated.Expression, p.baseNoun(), ac.Generated.Expression, SetExpressionMinServerMajor, p.opts.ServerMajor, fix, p.unverifiedNotes())
 				}
 				return fmt.Errorf(
 					"table %s: generated column %q changes its expression, which needs ALTER COLUMN ... SET EXPRESSION (PostgreSQL %d+); the connected server is PostgreSQL %d, so the plan would fail. Upgrade the server to PostgreSQL %d+, or replace the column explicitly in two steps: remove it from the schema and apply with --allow-destructive (its stored values are dropped), then add it back with the new expression (values are recomputed; a re-added column is placed last, so declare it last)",
@@ -1460,10 +1486,18 @@ func (p *v2Planner) textEqual(table V2Identity, element, what string, desired, a
 	}
 	if !p.comparisonVerified(table, element) {
 		note := fmt.Sprintf("%s: %q (desired) vs %q (live) — compared textually without a catalog oracle", what, *desired, *actual)
+		fix := unverifiedFix
 		if renamed := p.unrenamedTables[table]; renamed != "" {
 			note += fmt.Sprintf(", and the live text predates the rename of %s that PostgreSQL applies to it", renamed)
+			// A live run already had a normalizer; the copy under the
+			// rename is what failed.
+			if p.opts.Normalizer != nil {
+				fix = fmt.Sprintf("rename by hand first with %s (PostgreSQL rewrites the expressions that reference it), then re-run without --rename", strings.Join(p.renameStatements(table), "; "))
+			} else {
+				fix = "re-run with --mode live, which compares it under the rename"
+			}
 		}
-		p.unverified = append(p.unverified, note)
+		p.unverified = append(p.unverified, fmt.Sprintf(unverifiedFormat, note, fix))
 	}
 	return false
 }
@@ -1691,7 +1725,7 @@ func (p *v2Planner) viewEqual(dv, av V2View) bool {
 		return true
 	}
 	if p.opts.Normalizer == nil || p.twinFailedViews[dv.Identity] {
-		p.unverified = append(p.unverified, fmt.Sprintf("view %s definition: %q (desired) vs %q (live) — compared textually without a catalog oracle", dv.Identity, dv.Definition, av.Definition))
+		p.unverified = append(p.unverified, fmt.Sprintf(unverifiedFormat, fmt.Sprintf("view %s definition: %q (desired) vs %q (live) — compared textually without a catalog oracle", dv.Identity, dv.Definition, av.Definition), unverifiedFix))
 	}
 	return false
 }
@@ -1727,21 +1761,24 @@ func (p *v2Planner) reportOutOfScope() {
 	}
 }
 
-const unverifiedFormat = "equivalence not verified for %s — re-run with a live normalizer or align spellings"
+const (
+	unverifiedFormat = "equivalence not verified for %s — %s"
+	unverifiedFix    = "re-run with a live normalizer or align spellings"
+)
 
 // unverifiedNotes renders the unverified notes collected so far, one per
 // line, for a refusal that returns before reportUnverified runs.
 func (p *v2Planner) unverifiedNotes() string {
 	lines := make([]string, 0, len(p.unverified))
 	for _, u := range p.unverified {
-		lines = append(lines, "  "+fmt.Sprintf(unverifiedFormat, u))
+		lines = append(lines, "  "+u)
 	}
 	return strings.Join(lines, "\n")
 }
 
 func (p *v2Planner) reportUnverified() {
 	for _, u := range p.unverified {
-		p.warn(unverifiedFormat, u)
+		p.warn("%s", u)
 	}
 	p.result.Up = p.upOps
 	p.result.Down = p.downOps

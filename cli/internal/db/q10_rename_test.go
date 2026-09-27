@@ -101,13 +101,29 @@ func TestQ10UnrenamedComparisonIsUnverified(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(strings.Join(res.Warnings, "\n"), hint) {
-		t.Fatalf("offline planning must name the rename in its unverified note:\n%s", strings.Join(res.Warnings, "\n"))
+	if w := strings.Join(res.Warnings, "\n"); !strings.Contains(w, hint) || !strings.Contains(w, hint+" that PostgreSQL applies to it — re-run with --mode live, which compares it under the rename") || strings.Contains(w, "live normalizer") {
+		t.Fatalf("offline planning must name the rename in its unverified note and point to --mode live:\n%s", w)
 	}
 
+	// A live run whose rename twin failed already had a normalizer, and the
+	// database spells the expression with the old name: the advice is the
+	// hand rename, never "write it as the database spells it" or "re-run
+	// with a live normalizer".
+	const byHand = `rename by hand first with alter table "app"."tenants" rename column "net" to "amount" (PostgreSQL rewrites the expressions that reference it), then re-run without --rename`
 	_, err = DiffV2Document(context.Background(), desired, base, DiffV2Options{Renames: renames, Normalizer: q10RenameNormalizer{fail: true}, ServerMajor: 16})
 	if err == nil || !strings.Contains(err.Error(), `generated column "gross" could not be verified`) || !strings.Contains(err.Error(), hint) {
 		t.Fatalf("a failed rename twin leaves the comparison unverified: %v", err)
+	}
+	if msg := err.Error(); !strings.Contains(msg, `The text the database holds predates the rename of net to amount, and it could not be compared under the rename. Rename the column by hand first: alter table "app"."tenants" rename column "net" to "amount" (PostgreSQL rewrites the expressions that reference it), then re-run without --rename`) ||
+		!strings.Contains(msg, byHand) || strings.Contains(msg, "spells it") || strings.Contains(msg, "live normalizer") {
+		t.Fatalf("a live refusal must name the hand rename:\n%s", msg)
+	}
+	res, err = DiffV2Document(context.Background(), desired, base, DiffV2Options{Renames: renames, Normalizer: q10RenameNormalizer{fail: true}, ServerMajor: 17})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := strings.Join(res.Warnings, "\n"); !strings.Contains(w, byHand) || strings.Contains(w, "live normalizer") {
+		t.Fatalf("a live run's unverified note must name the hand rename:\n%s", w)
 	}
 }
 
