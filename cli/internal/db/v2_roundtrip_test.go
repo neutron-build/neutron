@@ -16,6 +16,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -934,6 +935,130 @@ func TestV2TwinFailureFlagsEquivalentCheckAndDefault(t *testing.T) {
 			t.Fatalf("elements the catalog normalized must not be reported unverified: %s", w)
 		}
 	}
+}
+
+// TestQ09TwinFallbackNormalizesTogether pins review-2 finding 3 live: when
+// a column's type cannot exist yet, the elements that do not name it are
+// normalized together on one twin (twins stay linear in the column count,
+// not columns x elements), and every element that references the left-out
+// column still fails, including one the name scan cannot see (an unquoted
+// non-ASCII name) and one that fails for another reason (a missing
+// sequence), both of which send the table element by element.
+func TestQ09TwinFallbackNormalizesTogether(t *testing.T) {
+	h := newM02Harness(t, "twintogether")
+	const width = 40
+	table := func(badName string, extraChecks string, c03Default string) V2Table {
+		cols := make([]string, 0, width+1)
+		for i := 1; i <= width; i++ {
+			def := `{"kind": "literal", "sql": "'x'"}`
+			if i == 3 && c03Default != "" {
+				def = c03Default
+			}
+			cols = append(cols, fmt.Sprintf(`{"name": "c%02d", "type": {"name": "varchar", "codec": "string", "params": {"length": 10}}, "notNull": false, "default": %s}`, i, def))
+		}
+		cols = append(cols, `{"name": "`+badName+`", "type": {"name": "enum", "codec": "enum", "enum": {"schema": "public", "name": "fresh"}}, "notNull": false,
+			"default": {"kind": "literal", "sql": "'a'::public.fresh"}}`)
+		doc := h.parseDoc(`{
+			"version": 2, "dialect": "postgresql", "capabilities": [],
+			"schemas": [{"name": "public"}],
+			"enums": [{"identity": {"schema": "public", "name": "fresh"}, "managed": true, "values": ["a"]}],
+			"tables": [{
+				"identity": {"schema": "public", "name": "t"}, "managed": true,
+				"columns": [` + strings.Join(cols, ",") + `],
+				"constraints": [{"name": "t_ok", "type": "check", "expression": "length(c01) > 0"}` + extraChecks + `],
+				"indexes": [{"identity": {"schema": "public", "name": "t_low_idx"}, "unique": false, "method": "btree",
+					"key": [{"expression": "lower(c02)"}], "where": "c01 <> 'bad'"}]
+			}],
+			"views": [], "opaque": []
+		}`)
+		m, err := ModelFromRoot(doc.Root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m.Tables[0]
+	}
+	normalize := func(tbl V2Table) (V2Table, []string, int) {
+		t.Helper()
+		norm, err := h.client.NewTwinNormalizer(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer norm.Close()
+		got, err := norm.NormalizeTable(context.Background(), tbl)
+		var failed []string
+		if err != nil {
+			var partial *PartialNormalizationError
+			if !errors.As(err, &partial) {
+				t.Fatalf("expected a partial normalization, got %v", err)
+			}
+			failed = partial.Failed
+		}
+		return got, failed, norm.seq
+	}
+	assertNormalized := func(got V2Table, skipDefault string) {
+		t.Helper()
+		for _, c := range got.Columns[:width] {
+			if c.Name != skipDefault && *c.Default.SQL != "'x'::varchar" {
+				t.Fatalf("column %s default must be the catalog's spelling, got %q", c.Name, *c.Default.SQL)
+			}
+		}
+		if check := v2TestCheck(got, "t_ok"); check != "(length((c01)::text) > 0)" {
+			t.Fatalf("check t_ok must be the catalog's spelling, got %q", check)
+		}
+		if got.Indexes[0].Where == nil || *got.Indexes[0].Where != "((c01)::text <> 'bad'::text)" {
+			t.Fatalf("index predicate must be the catalog's spelling, got %v", got.Indexes[0].Where)
+		}
+	}
+	// whole twin + types-only twin + one probe per column + reduced twin.
+	const probes = 2 + width + 1 + 1
+
+	got, failed, twins := normalize(table("bad", "", ""))
+	if !equalStringSlices(failed, []string{"column bad default"}) {
+		t.Fatalf("only the left-out column's default may fail, got %v", failed)
+	}
+	assertNormalized(got, "")
+	if twins != probes+1 {
+		t.Fatalf("the elements must be normalized on one twin: %d twins, want %d", twins, probes+1)
+	}
+
+	// A check naming the left-out column fails on its own twin; the rest
+	// still go together.
+	got, failed, twins = normalize(table("bad", `, {"name": "t_bad", "type": "check", "expression": "bad is not null"}`, ""))
+	if !equalStringSlices(failed, []string{"column bad default", "check t_bad"}) {
+		t.Fatalf("the check naming the left-out column must fail, got %v", failed)
+	}
+	assertNormalized(got, "")
+	if check := v2TestCheck(got, "t_bad"); check != "bad is not null" {
+		t.Fatalf("a failed element keeps its text, got %q", check)
+	}
+	if twins != probes+2 {
+		t.Fatalf("one twin for the rest plus one for the check: %d twins, want %d", twins, probes+2)
+	}
+
+	// The name scan does not see an unquoted non-ASCII name; the shared
+	// twin fails on the reference and the table goes element by element.
+	got, failed, _ = normalize(table("größe", `, {"name": "t_bad", "type": "check", "expression": "größe is not null"}`, ""))
+	if !equalStringSlices(failed, []string{"column größe default", "check t_bad"}) {
+		t.Fatalf("the check referencing the left-out column must fail, got %v", failed)
+	}
+	assertNormalized(got, "")
+
+	// An element failing for another reason: element by element, and only
+	// that element fails.
+	got, failed, _ = normalize(table("bad", "", `{"kind": "expression", "sql": "nextval('no_such_seq')::text"}`))
+	if !equalStringSlices(failed, []string{"column c03 default", "column bad default"}) {
+		t.Fatalf("only the unresolvable default and the left-out column's may fail, got %v", failed)
+	}
+	assertNormalized(got, "c03")
+}
+
+func v2TestCheck(tbl V2Table, name string) string {
+	for _, c := range tbl.Constraints {
+		if c.Name == name && c.Expression != nil {
+			return *c.Expression
+		}
+	}
+	return ""
 }
 
 // TestV2UnchangedViewGrantLossWarned pins the MINOR-1 rework live: an

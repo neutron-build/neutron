@@ -118,11 +118,13 @@ func (n *TwinNormalizer) NormalizeTable(ctx context.Context, table V2Table) (V2T
 // normalizeTableElements is the fallback after the whole twin failed. The
 // twin carries only the column types that can exist yet: a column typed by
 // something this plan creates first (a new enum, say) is left out, found by
-// creating each column alone. Every expression element is then normalized
-// on its own twin; an element that references a left-out column fails
-// there and keeps its original text. When every element normalized, the
-// table is fully normalized: the left-out columns carry no expression the
-// diff compares against the catalog.
+// creating each column alone. The elements that do not name a left-out
+// column are then normalized together on one twin; only when that fails,
+// or for an element that names one, is an element normalized on its own
+// twin. An element that references a left-out column fails there and
+// keeps its original text. When every element normalized, the table is
+// fully normalized: the left-out columns carry no expression the diff
+// compares against the catalog.
 func (n *TwinNormalizer) normalizeTableElements(ctx context.Context, table V2Table, cause error) (V2Table, error) {
 	typesOnly := make([]V2Column, len(table.Columns))
 	for i, c := range table.Columns {
@@ -136,13 +138,17 @@ func (n *TwinNormalizer) normalizeTableElements(ctx context.Context, table V2Tab
 	bare.Columns = typesOnly
 	bare.Constraints = nil
 	bare.Indexes = nil
+	var left map[string]bool
 	if _, err := n.normalizeTableTwin(ctx, bare); err != nil {
 		bare.Columns = nil
+		left = map[string]bool{}
 		for _, c := range typesOnly {
 			one := bare
 			one.Columns = []V2Column{c}
 			if _, err := n.normalizeTableTwin(ctx, one); err == nil {
 				bare.Columns = append(bare.Columns, c)
+			} else {
+				left[strings.ToLower(c.Name)] = true
 			}
 		}
 		if _, err := n.normalizeTableTwin(ctx, bare); err != nil {
@@ -158,10 +164,14 @@ func (n *TwinNormalizer) normalizeTableElements(ctx context.Context, table V2Tab
 	out.Columns = append([]V2Column(nil), table.Columns...)
 	out.Constraints = append([]V2Constraint(nil), table.Constraints...)
 	out.Indexes = append([]V2Index(nil), table.Indexes...)
+	done := map[string]bool{}
+	if len(left) > 0 {
+		done = n.normalizeTogether(ctx, table, bare, bareIdx, left, &out)
+	}
 	var failed []string
 	for i, c := range table.Columns {
 		j, ok := bareIdx[c.Name]
-		if c.Default != nil && (c.Default.Kind == "literal" || c.Default.Kind == "expression") {
+		if c.Default != nil && (c.Default.Kind == "literal" || c.Default.Kind == "expression") && !done[v2DefaultElement(c.Name)] {
 			normalized := false
 			if ok {
 				one := bare
@@ -176,7 +186,7 @@ func (n *TwinNormalizer) normalizeTableElements(ctx context.Context, table V2Tab
 				failed = append(failed, v2DefaultElement(c.Name))
 			}
 		}
-		if c.Generated != nil {
+		if c.Generated != nil && !done[v2GeneratedElement(c.Name)] {
 			normalized := false
 			if ok {
 				one := bare
@@ -193,7 +203,7 @@ func (n *TwinNormalizer) normalizeTableElements(ctx context.Context, table V2Tab
 		}
 	}
 	for i, con := range table.Constraints {
-		if con.Type != "check" || con.Expression == nil {
+		if con.Type != "check" || con.Expression == nil || done[v2CheckElement(con.Name)] {
 			continue
 		}
 		one := bare
@@ -205,6 +215,9 @@ func (n *TwinNormalizer) normalizeTableElements(ctx context.Context, table V2Tab
 		}
 	}
 	for i, idx := range table.Indexes {
+		if done[v2IndexElement(idx.Identity.Name)] {
+			continue
+		}
 		one := bare
 		one.Indexes = []V2Index{idx}
 		if got, err := n.normalizeTableTwin(ctx, one); err == nil {
@@ -218,6 +231,109 @@ func (n *TwinNormalizer) normalizeTableElements(ctx context.Context, table V2Tab
 		return out, nil
 	}
 	return out, &PartialNormalizationError{Table: out, Failed: failed, Err: cause}
+}
+
+// normalizeTogether normalizes, on one twin of the reduced columns, every
+// element that does not name a left-out column, writes their deparsed
+// spelling into out and returns their element keys. When that twin fails
+// (an element fails for another reason, such as an enum value the plan
+// adds) it returns none and the caller goes element by element. The name
+// scan only picks the candidates: an element that references a left-out
+// column cannot be created on the reduced twin, so a missed reference
+// fails the twin instead of passing as normalized.
+func (n *TwinNormalizer) normalizeTogether(ctx context.Context, table V2Table, bare V2Table, bareIdx map[string]int, left map[string]bool, out *V2Table) map[string]bool {
+	all := bare
+	all.Columns = append([]V2Column(nil), bare.Columns...)
+	var keys []string
+	var defaults, generated, checks, indexes []int
+	for i, c := range table.Columns {
+		j, ok := bareIdx[c.Name]
+		if !ok {
+			continue
+		}
+		if c.Default != nil && (c.Default.Kind == "literal" || c.Default.Kind == "expression") && !namesColumn(c.Default.SQL, left) {
+			all.Columns[j].Default = c.Default
+			defaults = append(defaults, i)
+			keys = append(keys, v2DefaultElement(c.Name))
+		}
+		if c.Generated != nil && !namesColumn(&c.Generated.Expression, left) {
+			all.Columns[j].Generated = c.Generated
+			generated = append(generated, i)
+			keys = append(keys, v2GeneratedElement(c.Name))
+		}
+	}
+	for i, con := range table.Constraints {
+		if con.Type == "check" && con.Expression != nil && !namesColumn(con.Expression, left) {
+			all.Constraints = append(all.Constraints, con)
+			checks = append(checks, i)
+			keys = append(keys, v2CheckElement(con.Name))
+		}
+	}
+	for i, idx := range table.Indexes {
+		if !indexNamesColumn(idx, left) {
+			all.Indexes = append(all.Indexes, idx)
+			indexes = append(indexes, i)
+			keys = append(keys, v2IndexElement(idx.Identity.Name))
+		}
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	got, err := n.normalizeTableTwin(ctx, all)
+	if err != nil {
+		return nil
+	}
+	for _, i := range defaults {
+		out.Columns[i].Default = got.Columns[bareIdx[table.Columns[i].Name]].Default
+	}
+	for _, i := range generated {
+		out.Columns[i].Generated = got.Columns[bareIdx[table.Columns[i].Name]].Generated
+	}
+	for k, i := range checks {
+		out.Constraints[i].Expression = got.Constraints[k].Expression
+	}
+	for k, i := range indexes {
+		out.Indexes[i].Key = got.Indexes[k].Key
+		out.Indexes[i].Where = got.Indexes[k].Where
+	}
+	done := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		done[k] = true
+	}
+	return done
+}
+
+// namesColumn reports whether SQL text may name one of the columns (keys
+// lowercased): a bare word or a quoted identifier equal to a name without
+// regard to case. It over-matches rather than under-matches (a mention
+// inside a string literal is not a reference); see normalizeTogether.
+func namesColumn(sql *string, columns map[string]bool) bool {
+	if sql == nil {
+		return false
+	}
+	for _, t := range significantTokens(*sql) {
+		if (t.kind == 'w' || t.kind == 'q') && columns[strings.ToLower(t.text)] {
+			return true
+		}
+	}
+	return false
+}
+
+func indexNamesColumn(idx V2Index, columns map[string]bool) bool {
+	for _, k := range idx.Key {
+		if k.Column != nil && columns[strings.ToLower(*k.Column)] {
+			return true
+		}
+		if namesColumn(k.Expression, columns) {
+			return true
+		}
+	}
+	for _, c := range idx.Include {
+		if columns[strings.ToLower(c)] {
+			return true
+		}
+	}
+	return namesColumn(idx.Where, columns)
 }
 
 func (n *TwinNormalizer) normalizeTableTwin(ctx context.Context, table V2Table) (V2Table, error) {
