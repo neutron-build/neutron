@@ -458,9 +458,11 @@ func TestStudioSchemaNavDiagnosticsE2E(t *testing.T) {
 		if !strings.Contains(strings.Join(stringifySlice(body["warnings"]), "\n"), "dropped and recreated around the table alterations") {
 			t.Fatalf("view recreate warning not surfaced: %v", body["warnings"])
 		}
-		// Object identity: the base hash is the live document's hash (the one
-		// `neutron schema pull` writes); the target document is valid and
-		// hashes to targetSha256.
+		// Object identity: the base hash is the hash of the full live
+		// document, internal tables included (`neutron schema pull` leaves
+		// _neutron_* tables out, so its hash matches only on a database
+		// without them, as here); the target document is valid and hashes
+		// to targetSha256.
 		live, err := studioClient.IntrospectV2(context.Background())
 		if err != nil {
 			t.Fatalf("introspect: %v", err)
