@@ -584,66 +584,16 @@ func v2NotSingleExpression(s string) string {
 	return ""
 }
 
-// v2TextFullyTokenizes reports whether every character of s belongs to a
-// token the tokenizer closed: an unterminated quote, dollar quote or block
-// comment leaves a gap the reconstructed token spans would not cover.
+// v2TextFullyTokenizes reports whether the tokenizer closed every quote,
+// quoted identifier, dollar quote and block comment in s: it marks a token
+// open when it reached the end of the text without the terminator.
 func v2TextFullyTokenizes(s string) bool {
-	toks := tokenizeSQL(s)
-	pos := 0
-	for _, t := range toks {
-		for pos < t.start && pos < len(s) {
-			switch s[pos] {
-			case ' ', '\t', '\n', '\r', '\f', '\v':
-				pos++
-			default:
-				return false
-			}
-		}
-		if t.start != pos {
-			return false
-		}
-		// An unterminated quote/dollar-quote/comment: the closing byte is
-		// missing, so the token text is shorter than it would be closed.
-		switch t.kind {
-		case 's':
-			if !v2StringClosed(s[t.start:t.end]) {
-				return false
-			}
-		case 'q':
-			if !(len(s[t.start:t.end]) >= 2 && s[t.end-1] == '"') {
-				return false
-			}
-		case 'c':
-			frag := s[t.start:t.end]
-			if strings.HasPrefix(frag, "/*") && !strings.HasSuffix(frag, "*/") {
-				return false
-			}
-		}
-		pos = t.end
-	}
-	for pos < len(s) {
-		switch s[pos] {
-		case ' ', '\t', '\n', '\r', '\f', '\v':
-			pos++
-		default:
+	for _, t := range tokenizeSQL(s) {
+		if t.open {
 			return false
 		}
 	}
 	return true
-}
-
-// v2StringClosed reports whether a lexed string token has its closing
-// delimiter: '...'/E'...' end in ', a $tag$...$tag$ ends in its tag.
-func v2StringClosed(tok string) bool {
-	if strings.HasPrefix(tok, "$") {
-		i := strings.IndexByte(tok[1:], '$')
-		if i < 0 {
-			return false
-		}
-		tag := tok[:i+2]
-		return len(tok) >= 2*len(tag) && strings.HasSuffix(tok, tag)
-	}
-	return len(tok) >= 2 && strings.HasSuffix(tok, "'")
 }
 
 // v2HasSecondStatement reports whether SQL text carries anything after a

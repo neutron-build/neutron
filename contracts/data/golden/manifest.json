@@ -216,6 +216,26 @@
       "name": "check-expression-extra-clause",
       "document": "invalid/check-expression-extra-clause.json",
       "code": "check-expression"
+    },
+    {
+      "name": "default-unterminated-doubled-quote",
+      "document": "invalid/default-unterminated-doubled-quote.json",
+      "code": "invalid-value"
+    },
+    {
+      "name": "default-unterminated-escaped-quote",
+      "document": "invalid/default-unterminated-escaped-quote.json",
+      "code": "invalid-value"
+    },
+    {
+      "name": "default-unterminated-quoted-identifier",
+      "document": "invalid/default-unterminated-quoted-identifier.json",
+      "code": "invalid-value"
+    },
+    {
+      "name": "default-unterminated-nested-comment",
+      "document": "invalid/default-unterminated-nested-comment.json",
+      "code": "invalid-value"
     }
   ],
   "v1": [
