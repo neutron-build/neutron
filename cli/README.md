@@ -21,6 +21,10 @@ From source (Go 1.23+):
 cd cli && go build -o bin/neutron . && ./bin/neutron --help
 ```
 
+Platforms: Linux and macOS, amd64 and arm64, natively. Windows is supported
+through WSL (install and run the Linux build inside it); a native Windows
+build compiles in CI but is not released.
+
 Release binaries are published on GitHub under `cli/v*` tags as
 `neutron_<version>_<os>_<arch>` archives with a `checksums.txt`. Once installed,
 the CLI updates itself:
