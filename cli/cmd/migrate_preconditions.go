@@ -503,7 +503,7 @@ func requireDestructiveAcknowledgement(pendings []pendingMigration, acknowledged
 		return nil
 	}
 	return fmt.Errorf(
-		"%d pending statement(s) are destructive or data-losing — dropping tables, columns, indexes or types requires an explicit acknowledgement:\n%s\nre-run with --allow-destructive to apply them",
+		"%d pending statement(s) are destructive or data-losing — dropping tables, columns, indexes or types, truncating tables, dropping materialized views, dropping domains with CASCADE, or dropping or retyping composite-type attributes requires an explicit acknowledgement:\n%s\nre-run with --allow-destructive to apply them",
 		count, strings.Join(lines, "\n"))
 }
 

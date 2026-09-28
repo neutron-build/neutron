@@ -629,6 +629,62 @@ func statementDestructive(sql string) bool {
 			return true
 		}
 	}
+	return destroysDataOutsideTables(sql)
+}
+
+// destroysDataOutsideTables classifies the statements outside DROP
+// TABLE/SCHEMA/TYPE and ALTER TABLE that destroy data: TRUNCATE (every
+// row), DROP MATERIALIZED VIEW (its stored rows), DROP DOMAIN ... CASCADE
+// (drops the columns of that domain), and a composite type's ALTER TYPE
+// ... DROP ATTRIBUTE or ALTER ATTRIBUTE ... TYPE (with CASCADE they reach
+// the table columns of that type). They are destructive and data-losing,
+// so they need the destructive acknowledgement.
+func destroysDataOutsideTables(sql string) bool {
+	toks := significantTokens(sql)
+	switch {
+	case isWordAt(toks, 0, "truncate"):
+		return true
+	case isWordAt(toks, 0, "drop") && isWordAt(toks, 1, "materialized") && isWordAt(toks, 2, "view"):
+		return true
+	case isWordAt(toks, 0, "drop") && isWordAt(toks, 1, "domain"):
+		for i := range toks {
+			if isWordAt(toks, i, "cascade") {
+				return true
+			}
+		}
+		return false
+	case isWordAt(toks, 0, "alter") && isWordAt(toks, 1, "type"):
+		_, i, ok := nameAt(toks, 2)
+		if !ok {
+			return false
+		}
+		depth, start := 0, i
+		for j := i; j <= len(toks); j++ {
+			if j == len(toks) || (depth == 0 && toks[j].kind == 'p' && toks[j].text == ",") {
+				action := toks[start:j]
+				if isWordAt(action, 0, "drop") && isWordAt(action, 1, "attribute") {
+					return true
+				}
+				if isWordAt(action, 0, "alter") && isWordAt(action, 1, "attribute") {
+					for k := 2; k < len(action); k++ {
+						if isWordAt(action, k, "type") {
+							return true
+						}
+					}
+				}
+				start = j + 1
+				continue
+			}
+			if toks[j].kind == 'p' {
+				switch toks[j].text {
+				case "(", "[":
+					depth++
+				case ")", "]":
+					depth--
+				}
+			}
+		}
+	}
 	return false
 }
 
@@ -721,7 +777,7 @@ func statementDataLoss(sql string) bool {
 			return true
 		}
 	}
-	return false
+	return destroysDataOutsideTables(sql)
 }
 
 func renameDisplayList(renames map[string]string) []string {

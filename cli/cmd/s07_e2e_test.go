@@ -334,3 +334,33 @@ func TestS07IncludeOrderIsNotAChange(t *testing.T) {
 		t.Fatalf("a different INCLUDE set must rebuild the index (%d):\n%s", code, out)
 	}
 }
+
+// TestS07R3TruncateNeedsAcknowledgement: a migration that truncates a table
+// is refused without --allow-destructive and applies with it (S07 review-3
+// R5).
+func TestS07R3TruncateNeedsAcknowledgement(t *testing.T) {
+	bin := buildCLIBinary(t)
+	dbURL, fx := newM02CommandDB(t, "s07trunc")
+	if err := fx.Exec(context.Background(), `CREATE TABLE t (id int PRIMARY KEY); INSERT INTO t VALUES (1), (2)`); err != nil {
+		t.Fatal(err)
+	}
+	mig := filepath.Join(t.TempDir(), "migrations")
+	if err := os.MkdirAll(mig, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(mig, "001_clear.up.sql"), "TRUNCATE t;\n")
+	writeFile(t, filepath.Join(mig, "001_clear.down.sql"), "SELECT 1;\n")
+	code, out := runCLIProcess(t, bin, dbURL, "migrate", "--dir", mig)
+	if code == 0 || !strings.Contains(out, "TRUNCATE t") || !strings.Contains(out, "--allow-destructive") {
+		t.Fatalf("TRUNCATE must need the acknowledgement (%d):\n%s", code, out)
+	}
+	if got := q09Query(t, fx, `SELECT count(*)::text FROM t`); got != "2" {
+		t.Fatalf("a refused migration truncated t: %s rows", got)
+	}
+	if code, out := runCLIProcess(t, bin, dbURL, "migrate", "--dir", mig, "--allow-destructive"); code != 0 {
+		t.Fatalf("with --allow-destructive the migration applies (%d):\n%s", code, out)
+	}
+	if got := q09Query(t, fx, `SELECT count(*)::text FROM t`); got != "0" {
+		t.Fatalf("t rows after the acknowledged truncate: %s", got)
+	}
+}

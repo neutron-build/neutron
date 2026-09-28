@@ -33,3 +33,38 @@ func TestS07R3SetLocalAllowlist(t *testing.T) {
 		}
 	}
 }
+
+// TestS07R3DataLossOutsideTables: TRUNCATE, DROP MATERIALIZED VIEW,
+// DROP DOMAIN ... CASCADE and a composite type's DROP/ALTER ATTRIBUTE are
+// destructive and data-losing, so they need --allow-destructive (S07
+// review-3 R5). Look-alikes that keep data are not.
+func TestS07R3DataLossOutsideTables(t *testing.T) {
+	for _, sql := range []string{
+		"TRUNCATE t",
+		"TRUNCATE TABLE s.t RESTART IDENTITY",
+		"DROP MATERIALIZED VIEW mv",
+		"DROP MATERIALIZED VIEW IF EXISTS s.mv",
+		"DROP DOMAIN d CASCADE",
+		"ALTER TYPE comp DROP ATTRIBUTE a",
+		"ALTER TYPE s.comp DROP ATTRIBUTE IF EXISTS a CASCADE",
+		"ALTER TYPE comp ALTER ATTRIBUTE a TYPE bigint",
+		"ALTER TYPE comp ALTER ATTRIBUTE a SET DATA TYPE bigint CASCADE",
+		"ALTER TYPE comp ADD ATTRIBUTE b int, DROP ATTRIBUTE a",
+	} {
+		if d, l := ClassifyStatementRisk(sql); !d || !l {
+			t.Errorf("ClassifyStatementRisk(%q) = %v, %v; want destructive and data-losing", sql, d, l)
+		}
+	}
+	for _, sql := range []string{
+		"DROP DOMAIN d",
+		"ALTER TYPE comp ADD ATTRIBUTE b int",
+		"ALTER TYPE comp RENAME ATTRIBUTE a TO b",
+		"ALTER TYPE mood ADD VALUE 'x'",
+		"ALTER TYPE mood RENAME TO feeling",
+		"SELECT 'truncate t'",
+	} {
+		if d, l := ClassifyStatementRisk(sql); d || l {
+			t.Errorf("ClassifyStatementRisk(%q) = %v, %v; want neither", sql, d, l)
+		}
+	}
+}
