@@ -155,9 +155,17 @@ added after them, in every table; constraints and indexes drop before the
 columns they name change type or are dropped, and are re-created after; a
 generated column drops before a column it reads; a new table's foreign key
 onto a column or key the plan adds, renames, retypes or changes is added
-after that change; and a down file re-creates dropped columns before their
-indexes and dropped tables before the foreign keys between them, so these
-plans apply and their down files revert.
+after that change; a table the plan drops is dropped before any key its
+foreign keys reference; declared views are dropped dependents first and
+created bases first; an index whose operator class changes (for example
+`text_pattern_ops` under a type change) is rebuilt; and a down file
+re-creates dropped columns before their indexes and dropped tables before the
+foreign keys between them, so these plans apply and their down files revert.
+A foreign key of a table the plan keeps but does not manage (left in place,
+or in a schema the document does not declare) onto a key the plan drops
+refuses the plan, naming the foreign key: declare the table, or let
+`--allow-destructive` drop a left-in-place one (the refusal lists what else
+it drops), or drop the foreign key by hand.
 Changing the type of a column a stored generated column reads drops the
 generated column before the change and adds it back after it, with its
 indexes, constraints and the foreign keys onto it (PostgreSQL cannot change

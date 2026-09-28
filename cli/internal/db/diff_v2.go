@@ -250,6 +250,8 @@ type v2Planner struct {
 	unrenamedTables  map[V2Identity]string            // live text kept its pre-rename names
 	renameBlocked    map[V2Identity]map[string]string // element -> what depends on its pre-rename text
 	unverified       []string                         // rendered "equivalence not verified" lines
+	tableDropStmts   int                              // buffered statements that drop tables (not table alterations)
+	droppedTables    map[V2Identity]bool              // tables this plan drops
 	retyped          map[V2Identity]map[string]string // desired name -> live name of matched columns whose type changes
 	changed          map[V2Identity]map[string]string // live column name -> what the plan does to it (type change, drop)
 	rebuilt          map[V2Identity]map[string]string // desired name -> live name of generated columns dropped and added back
@@ -257,6 +259,54 @@ type v2Planner struct {
 
 // What the plan does to a column, for dependency refusals.
 const changedType = "whose type changes"
+
+// viewsBasesFirst orders views so that each comes after the views it
+// reads: a definition reads a view when it names the view (and its schema,
+// unless the schema is public, which the deparse may leave unqualified),
+// or when extra says so. Ties and cycles keep the given order; a spurious
+// textual reference can only reorder, never drop, a view.
+func viewsBasesFirst(ids []V2Identity, defs map[V2Identity]string, extra map[V2Identity][]V2Identity) []V2Identity {
+	in := map[V2Identity]bool{}
+	for _, id := range ids {
+		in[id] = true
+	}
+	reads := map[V2Identity][]V2Identity{}
+	for _, id := range ids {
+		idents, ok := sqlIdentifiers(defs[id])
+		names := map[string]bool{}
+		for _, ident := range idents {
+			names[truncateIdentifier(ident)] = true
+		}
+		for _, other := range ids {
+			if other != id && ok && names[other.Name] && (names[other.Schema] || other.Schema == "public") {
+				reads[id] = append(reads[id], other)
+			}
+		}
+		for _, other := range extra[id] {
+			if in[other] && other != id {
+				reads[id] = append(reads[id], other)
+			}
+		}
+	}
+	var out []V2Identity
+	state := map[V2Identity]int{} // 1 visiting, 2 done
+	var visit func(id V2Identity)
+	visit = func(id V2Identity) {
+		if state[id] != 0 {
+			return
+		}
+		state[id] = 1
+		for _, r := range reads[id] {
+			visit(r)
+		}
+		state[id] = 2
+		out = append(out, id)
+	}
+	for _, id := range ids {
+		visit(id)
+	}
+	return out
+}
 
 // v2StmtPair is one up statement and its down statement. Constraint and
 // index pairs also carry what cross-table ordering needs: fk marks a
@@ -783,8 +833,8 @@ func (p *v2Planner) planTables() error {
 		p.emitRaw(fk.up, fk.down)
 	}
 
-	// Destructive drops, reverse dependency order.
-	p.planTableDrops()
+	// Enums drop after the tables and columns that use them.
+	p.planEnumDrops(p.droppedTables)
 	return nil
 }
 
@@ -797,7 +847,11 @@ func (p *v2Planner) planTables() error {
 // round-trip. Without alterations, only genuinely changed/new/removed
 // views are planned.
 func (p *v2Planner) planViewsAroundAlters() error {
-	type stmtPair struct{ up, down string }
+	type stmtPair struct {
+		up, down string
+		id       V2Identity
+		def      string // the definition the statement pair orders by
+	}
 	dropIds := map[V2Identity]bool{}
 	createIds := map[V2Identity]bool{}
 	var drops, creates []stmtPair
@@ -812,20 +866,20 @@ func (p *v2Planner) planViewsAroundAlters() error {
 			if p.opts.Normalizer != nil && p.twinFailedViews[dv.Identity] {
 				p.warn("view %s definition could not be normalized against the catalog; it will be created verbatim — schema-qualify relation references in the definition (introspection always emits schema-qualified SQL)", dv.Identity)
 			}
-			creates = append(creates, stmtPair{createV2ViewSQL(*dvn), fmt.Sprintf("drop view if exists %s", qualifiedNameSQL(dv.Identity))})
+			creates = append(creates, stmtPair{createV2ViewSQL(*dvn), fmt.Sprintf("drop view if exists %s", qualifiedNameSQL(dv.Identity)), dv.Identity, dvn.Definition})
 			createIds[dv.Identity] = true
 			continue
 		}
 		equal := p.viewEqual(*dvn, *av)
-		if equal && len(p.alterUps) == 0 {
+		if equal && len(p.alterUps) == p.tableDropStmts {
 			continue
 		}
 		if !dropIds[dv.Identity] {
-			drops = append(drops, stmtPair{fmt.Sprintf("drop view if exists %s", qualifiedNameSQL(dv.Identity)), createV2ViewSQL(*av)})
+			drops = append(drops, stmtPair{fmt.Sprintf("drop view if exists %s", qualifiedNameSQL(dv.Identity)), createV2ViewSQL(*av), dv.Identity, av.Definition})
 			dropIds[dv.Identity] = true
 		}
 		if !createIds[dv.Identity] {
-			creates = append(creates, stmtPair{createV2ViewSQL(*dvn), fmt.Sprintf("drop view if exists %s", qualifiedNameSQL(dv.Identity))})
+			creates = append(creates, stmtPair{createV2ViewSQL(*dvn), fmt.Sprintf("drop view if exists %s", qualifiedNameSQL(dv.Identity)), dv.Identity, dvn.Definition})
 			createIds[dv.Identity] = true
 		}
 		if !equal {
@@ -844,7 +898,7 @@ func (p *v2Planner) planViewsAroundAlters() error {
 		}
 		p.warn("view %s will be dropped", av.Identity)
 		if !dropIds[av.Identity] {
-			drops = append(drops, stmtPair{fmt.Sprintf("drop view if exists %s", qualifiedNameSQL(av.Identity)), createV2ViewSQL(av)})
+			drops = append(drops, stmtPair{fmt.Sprintf("drop view if exists %s", qualifiedNameSQL(av.Identity)), createV2ViewSQL(av), av.Identity, av.Definition})
 			dropIds[av.Identity] = true
 		}
 	}
@@ -852,6 +906,55 @@ func (p *v2Planner) planViewsAroundAlters() error {
 	if err := p.checkDependents(dropIds); err != nil {
 		return err
 	}
+	// Views over views: a view is created after the views it reads and
+	// dropped before them (the reverse). The references are read from the
+	// definitions; live, the catalog's dependencies between the dropped
+	// views are added (Q12).
+	ids := func(pairs []stmtPair) []V2Identity {
+		out := make([]V2Identity, len(pairs))
+		for i, s := range pairs {
+			out[i] = s.id
+		}
+		return out
+	}
+	defs := func(pairs []stmtPair) map[V2Identity]string {
+		out := map[V2Identity]string{}
+		for _, s := range pairs {
+			out[s.id] = s.def
+		}
+		return out
+	}
+	reorder := func(pairs []stmtPair, order []V2Identity) []stmtPair {
+		at := map[V2Identity]stmtPair{}
+		for _, s := range pairs {
+			at[s.id] = s
+		}
+		out := make([]stmtPair, 0, len(pairs))
+		for _, id := range order {
+			out = append(out, at[id])
+		}
+		return out
+	}
+	extra := map[V2Identity][]V2Identity{}
+	if insp, ok := p.opts.Normalizer.(V2DependencyInspector); ok {
+		for _, s := range drops {
+			deps, err := insp.RelationDependents(p.ctx, s.id)
+			if err != nil {
+				return err
+			}
+			for _, d := range deps {
+				if dropIds[d.Identity] {
+					extra[d.Identity] = append(extra[d.Identity], s.id)
+				}
+			}
+		}
+	}
+	dropOrder := viewsBasesFirst(ids(drops), defs(drops), extra)
+	for i, j := 0, len(dropOrder)-1; i < j; i, j = i+1, j-1 {
+		dropOrder[i], dropOrder[j] = dropOrder[j], dropOrder[i]
+	}
+	drops = reorder(drops, dropOrder)
+	creates = reorder(creates, viewsBasesFirst(ids(creates), defs(creates), nil))
 	emitAll := func(pairs []stmtPair) {
 		for _, s := range pairs {
 			p.emitRaw(s.up, s.down)
@@ -983,6 +1086,9 @@ func (p *v2Planner) planSharedTables() error {
 			}
 		}
 	}
+	if err := p.refuseKeptForeignKeys(droppedKeys); err != nil {
+		return err
+	}
 	for i := range plans {
 		tp := &plans[i]
 		at := p.actual.Table(tp.dt.Identity)
@@ -1043,8 +1149,13 @@ func (p *v2Planner) planSharedTables() error {
 		}
 	}
 
-	// Phase 3: constraint drops, foreign keys first.
+	// Phase 3: constraint drops, foreign keys first; then the tables the
+	// plan drops (reverse dependency order), before any key a foreign key
+	// of theirs references is dropped; then the other constraints.
 	emitConstraints(false, true)
+	before := len(p.alterUps)
+	p.planTableDrops()
+	p.tableDropStmts = len(p.alterUps) - before
 	emitConstraints(false, false)
 
 	// Phase 4: index drops (dropped, and the drop half of re-created ones).
@@ -1273,26 +1384,6 @@ func (p *v2Planner) planRebuilds() error {
 			p.rebuilt[dt.Identity][dc.Name] = acName
 			mark(dt.Identity, acName, "which is dropped and added back (it is a generated column reading a column whose type changes)")
 			p.warn("table %s: generated column %q reads column %q, whose type changes; PostgreSQL cannot change the type under it, so it is dropped before the change and added back after it (destructive: its values are recomputed, it is placed last in the table, and privileges or comments on it are not kept; the down file adds it back last as well)", dt.Identity, dc.Name, read)
-		}
-	}
-
-	// A foreign key the plan does not re-create cannot stay on a generated
-	// column that drops and comes back.
-	for _, ut := range p.actual.Tables {
-		if p.desiredTables[ut.Identity] {
-			continue
-		}
-		for _, con := range ut.Constraints {
-			if con.Type != "foreign-key" || con.References == nil {
-				continue
-			}
-			for desiredName, liveName := range p.rebuilt[con.References.Table] {
-				for _, c := range con.References.Columns {
-					if c == liveName {
-						return fmt.Errorf("table %s: generated column %q must be dropped and added back (a column it reads changes type), but foreign key %s of table %s, which the schema does not manage here, references it. Plan it as three migrations: remove the column (and that foreign key) from the schema, then change the type, then add the column back", con.References.Table, desiredName, con.Name, ut.Identity)
-					}
-				}
-			}
 		}
 	}
 
@@ -2435,6 +2526,64 @@ func (p *v2Planner) planIndexChanges(table V2Identity, desired, actual *V2Table)
 	return dropPairs, createPairs, nil
 }
 
+// tableDroppedByPlan mirrors planTableDrops: a managed-scope table the
+// schema does not declare drops with --allow-destructive.
+func (p *v2Planner) tableDroppedByPlan(id V2Identity) bool {
+	return p.scope[id.Schema] && !p.desiredTables[id] && !isProtectedTableName(id.Name) && p.opts.AllowDestructive
+}
+
+// refuseKeptForeignKeys refuses a plan that drops a key a foreign key of
+// a table it neither manages nor drops references (left in place, or in a
+// schema the document does not manage): the plan cannot drop and re-add
+// that foreign key, and PostgreSQL refuses the key drop (2BP01). A table
+// the plan drops is dropped before the key (phase 3).
+func (p *v2Planner) refuseKeptForeignKeys(droppedKeys map[V2Identity][][]string) error {
+	recreated := map[V2Identity]bool{}
+	for table := range droppedKeys {
+		dt := p.desiredTable(table)
+		if dt == nil {
+			continue
+		}
+		for _, k := range droppedKeys[table] {
+			for _, dc := range dt.Constraints {
+				if (dc.Type == "primary-key" || dc.Type == "unique") && sameColumnSetIn(dc.Columns, [][]string{k}) {
+					recreated[table] = true
+				}
+			}
+		}
+	}
+	var refusals []string
+	for _, ut := range p.actual.Tables {
+		if p.desiredTables[ut.Identity] || p.tableDroppedByPlan(ut.Identity) || isProtectedTableName(ut.Identity.Name) {
+			continue
+		}
+		for _, con := range ut.Constraints {
+			if con.Type != "foreign-key" || con.References == nil || !sameColumnSetIn(con.References.Columns, droppedKeys[con.References.Table]) {
+				continue
+			}
+			what := "drops"
+			if recreated[con.References.Table] {
+				what = "drops (and re-creates)"
+			}
+			var why, fix string
+			if p.scope[ut.Identity.Schema] {
+				why = "a table the schema does not declare"
+				fix = fmt.Sprintf("Declare table %s in the schema (the plan then drops and re-adds the foreign key around the change), or drop it: re-run with --allow-destructive, which drops tables the schema does not declare%s", ut.Identity, p.flagScope())
+			} else {
+				why = "a table the schema document does not manage"
+				fix = fmt.Sprintf("Drop the foreign key by hand before applying and re-add it after, or declare schema %q and table %s in the schema (the plan then drops and re-adds the foreign key around the change)", ut.Identity.Schema, ut.Identity)
+			}
+			refusals = append(refusals, fmt.Sprintf("foreign key %s of table %s references the key (%s) of table %s, which this plan %s, and the plan cannot drop and re-add a foreign key of %s. PostgreSQL refuses to drop a key a foreign key depends on, so the plan would fail at apply and is refused. %s",
+				con.Name, ut.Identity, strings.Join(con.References.Columns, ", "), con.References.Table, what, why, fix))
+		}
+	}
+	if len(refusals) == 0 {
+		return nil
+	}
+	sort.Strings(refusals)
+	return errors.New(strings.Join(refusals, "\n"))
+}
+
 // sameColumnSetIn reports whether cols, as a set, equals one of keys.
 func sameColumnSetIn(cols []string, keys [][]string) bool {
 	for _, k := range keys {
@@ -2518,6 +2667,9 @@ func (p *v2Planner) indexEqualAfterRenames(table V2Identity, di, ai V2Index) boo
 				if *di.Key[i].Column != p.actualToDesiredName(table, *ai.Key[i].Column) {
 					equal = false
 				}
+				if !p.opclassEqual(table, di.Method, *di.Key[i].Column, di.Key[i].Opclass, ai.Key[i].Opclass) {
+					equal = false
+				}
 				continue
 			}
 			if !p.textEqual(table, v2IndexElement(di.Identity.Name), "index "+di.Identity.String()+" key part", di.Key[i].Expression, ai.Key[i].Expression) {
@@ -2529,6 +2681,40 @@ func (p *v2Planner) indexEqualAfterRenames(table V2Identity, di, ai V2Index) boo
 		equal = false
 	}
 	return equal
+}
+
+// opclassEqual compares the operator classes of two column key parts.
+// Introspection records a class only when it is not the column type's
+// default, so an absent live class is the default: a desired class equal
+// to that default compares equal when a live catalog can name it
+// (V2OpclassResolver). Offline, an explicitly named default differs from
+// an absent one, and the plan rebuilds the index (the chain then records
+// the desired spelling, so the next plan converges).
+func (p *v2Planner) opclassEqual(table V2Identity, method, column string, desired, actual *string) bool {
+	d, a := "", ""
+	if desired != nil {
+		d = *desired
+	}
+	if actual != nil {
+		a = *actual
+	}
+	if d == a {
+		return true
+	}
+	if a != "" || d == "" {
+		return false
+	}
+	res, ok := p.opts.Normalizer.(V2OpclassResolver)
+	dt := p.desired.Table(table)
+	if !ok || dt == nil || dt.Column(column) == nil {
+		return false
+	}
+	typ, err := v2TypeDDL(dt.Column(column).Type)
+	if err != nil {
+		return false
+	}
+	def, err := res.DefaultOpclass(p.ctx, method, typ)
+	return err == nil && def == d
 }
 
 // canonicalKeyPartOrdering reduces a key part's ordering to its effective
@@ -2677,8 +2863,8 @@ func (p *v2Planner) planTableDrops() {
 		toDrop = append(toDrop, t)
 		droppedInPlan[t.Identity] = true
 	}
+	p.droppedTables = droppedInPlan
 	if len(toDrop) == 0 {
-		p.planEnumDrops(nil)
 		return
 	}
 	sort.Slice(toDrop, func(i, j int) bool { return toDrop[i].Identity.String() < toDrop[j].Identity.String() })
@@ -2757,7 +2943,6 @@ func (p *v2Planner) planTableDrops() {
 		}
 	}
 
-	p.planEnumDrops(droppedInPlan)
 }
 
 // planEnumDrops plans destructive drops of enums absent from the desired

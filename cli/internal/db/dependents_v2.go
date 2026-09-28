@@ -134,3 +134,37 @@ func (n *TwinNormalizer) ColumnDependents(ctx context.Context, table V2Identity,
 func (n *TwinNormalizer) RelationDependents(ctx context.Context, view V2Identity) ([]V2Dependent, error) {
 	return n.dependents(ctx, view, nil, true)
 }
+
+// V2OpclassResolver names the default operator class of a column type for
+// an index method, so an explicitly spelled default compares equal to the
+// absent class introspection records for it.
+type V2OpclassResolver interface {
+	DefaultOpclass(ctx context.Context, method, typeSQL string) (string, error)
+}
+
+// defaultOpclassSQL finds the default class of method $1 for type $2: for
+// the type itself, a type binary-coercible to it, or the polymorphic
+// array and enum classes.
+const defaultOpclassSQL = `
+WITH t AS (SELECT to_regtype($2) AS oid)
+SELECT c.opcname::text
+FROM pg_opclass c
+JOIN pg_am a ON a.oid = c.opcmethod
+JOIN t ON true
+JOIN pg_type ty ON ty.oid = t.oid
+WHERE a.amname = $1 AND c.opcdefault AND (
+	c.opcintype = t.oid
+	OR EXISTS (SELECT 1 FROM pg_cast k WHERE k.castsource = t.oid AND k.casttarget = c.opcintype AND k.castmethod = 'b')
+	OR (c.opcintype = 'anyarray'::regtype AND ty.typcategory = 'A')
+	OR (c.opcintype = 'anyenum'::regtype AND ty.typtype = 'e'))
+ORDER BY c.opcintype = t.oid DESC
+LIMIT 1`
+
+// DefaultOpclass implements V2OpclassResolver.
+func (n *TwinNormalizer) DefaultOpclass(ctx context.Context, method, typeSQL string) (string, error) {
+	var name string
+	if err := n.conn.QueryRow(ctx, defaultOpclassSQL, method, typeSQL).Scan(&name); err != nil {
+		return "", fmt.Errorf("default operator class of %s for %s: %w", typeSQL, method, err)
+	}
+	return name, nil
+}
