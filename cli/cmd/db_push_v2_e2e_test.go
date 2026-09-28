@@ -12,11 +12,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/neutron-build/neutron/cli/internal/db"
 )
+
+var m02CommandDBSeq atomic.Int64
 
 func newM02CommandDB(t *testing.T, label string) (string, *db.Client) {
 	t.Helper()
@@ -27,7 +30,10 @@ func newM02CommandDB(t *testing.T, label string) (string, *db.Client) {
 		}
 		t.Skip("NEUTRON_E2E_DATABASE_URL not set; v2 push E2E skipped (set it to a disposable Postgres URL to run)")
 	}
-	dbName := fmt.Sprintf("m02_cmd_%s_%d_%d", label, os.Getpid(), time.Now().UnixNano()%1_000_000)
+	// The sequence keeps names unique within the process: the clock term
+	// alone repeats every millisecond on a microsecond clock (macOS), and a
+	// test holding several databases at once collided (R04).
+	dbName := fmt.Sprintf("m02_cmd_%s_%d_%d_%d", label, os.Getpid(), time.Now().UnixNano()%1_000_000, m02CommandDBSeq.Add(1))
 	dbURL := deriveDatabaseURL(t, base, dbName)
 	admin, err := db.Connect(context.Background(), base)
 	if err != nil {

@@ -601,7 +601,9 @@ func TestQ09NewEnumColumnUnverifiesOnlyFailedElements(t *testing.T) {
 // pending migration, so this is reachable without a server downgrade).
 // The plan's recorded floor is raised above the connected server so the
 // retry refusal is exercised on every server; the abort refusal (the down
-// SQL's own SET EXPRESSION) needs a server older than 17.
+// SQL's own SET EXPRESSION) needs a server older than 17. Below 16 the
+// statement scan's floor (17) is the higher one and the refusal names it,
+// so the recorded floor is never set below it (R04: PostgreSQL 14 and 15).
 func TestQ09ResolveHonorsServerFloor(t *testing.T) {
 	dbURL, fx := newM02CommandDB(t, "q09resolvefloor")
 	bin := buildCLIBinary(t)
@@ -624,7 +626,7 @@ func TestQ09ResolveHonorsServerFloor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	floor := major + 1
+	floor := max(major+1, db.SetExpressionMinServerMajor)
 	plan.MinServerMajor = floor
 	raw, err := db.MarshalPlanJSON(plan)
 	if err != nil {
