@@ -184,6 +184,54 @@ Fixture families (V12): CLI legacy (TEXT table, no v2 columns), TS SDK legacy
 (INTEGER table, no checksum), Go SDK legacy (INTEGER + legacy digests +
 `_neutron_migration_lock`), and partially applied histories in each.
 
+## 6a. Apply-time statement rules and the trust model
+
+Every statement of a migration (and every statement `neutron db push`,
+`neutron schema apply` and `neutron migrate resolve` run) is executed one
+at a time over the extended query protocol, which runs exactly one command
+per message. The CLI splits a migration file, classifies each statement,
+and runs each as its own `ExecParams`; a statement the server would read
+as more than one command is refused (SQLSTATE 42601). Because statements
+run one at a time, a statement may not change how the server reads the
+next one:
+
+- **Statement-kind allowlist.** A migration may contain only SELECT
+  (including `WITH`, with data-modifying CTEs target-guarded),
+  INSERT/UPDATE/DELETE/MERGE, TRUNCATE, CREATE/ALTER/DROP of schema
+  objects, and `SET LOCAL`. Everything else is refused before any
+  statement runs.
+- **Session settings.** `SET LOCAL` may set only `lock_timeout`,
+  `statement_timeout` and `maintenance_work_mem` — the timeout and
+  index-build knobs, none of which changes lexing or name resolution.
+  Any other `SET`/`SET LOCAL` setting is refused, and `set_config(...)`
+  is refused anywhere in a statement. `search_path` is deliberately not
+  allowed: the guards resolve unqualified names, so a mid-file
+  `search_path` change would move what a later statement's names refer to.
+  `client_encoding` and `standard_conforming_strings` change how statement
+  text is read; before and after every statement the runner verifies the
+  session still reads text as the checks did (`client_encoding` UTF8,
+  `standard_conforming_strings` on) and refuses otherwise, so a database or
+  role whose default is different is refused before anything runs.
+- **Expression fields.** A v2 document's expression fields (column
+  defaults, generated expressions, check expressions, index key
+  expressions and predicates) must each hold exactly one expression: a
+  top-level comma or `;`, or text the lexer cannot close, is refused.
+  A view definition must be a single statement.
+
+**Trust model.** The destructive-change acknowledgement
+(`--allow-destructive`), the protected-object guard
+(`_neutron_*` and extension-owned objects), and these statement rules are
+**accident protection for the operator's own schema and migration files**:
+they stop a review from being bypassed by a comment, a quoted spelling or
+a stray clause, and they keep an ordinary migration from dropping data or
+neutron's own metadata by mistake. They are **not a security boundary
+against a hostile migration author**. Anyone who can write the SQL a
+migration runs, or hand it a document to apply, already has the database
+access that migration will run with; the guards do not, and are not meant
+to, contain such an author. Review migration files and schema documents
+from the same position of trust as any other code that reaches the
+database.
+
 ## 7. Runner compatibility rules
 
 | Runner sees | Verdict |

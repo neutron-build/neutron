@@ -50,44 +50,57 @@ func TestS07ApplyPathsRunOneStatementEach(t *testing.T) {
 			[]string{"create index concurrently a1 on victim (id); drop table victim"}, nil)
 		survives(t, errors.Unwrap(err))
 	})
-	// A statement can change how the server reads the next one, now that
-	// they are sent one at a time: with standard_conforming_strings off,
-	// 'a\'' ends at its second quote, where the scanner (which assumes the
-	// setting on) reads a doubled quote and sees one statement, and the
-	// server would run the hidden drop as a statement of its own.
-	scsOff := func(t *testing.T, err error) {
+	// Statements reach the server one at a time, so a setting one statement
+	// changes applies to how the next is read. The allowlist refuses those
+	// statements before apply; at execution the session is checked before
+	// and after each statement (each batch, when pipelined), and a change
+	// stops the apply with nothing kept (S07 review-2 N1).
+	settingChanged := func(t *testing.T, err error) {
 		t.Helper()
-		if err == nil || !strings.Contains(err.Error(), "turned standard_conforming_strings off") {
-			t.Fatalf("turning standard_conforming_strings off must be refused, got %v", err)
+		if err == nil || !strings.Contains(err.Error(), "the session's standard_conforming_strings is off") {
+			t.Fatalf("a changed reading setting must stop the apply, got %v", err)
 		}
-		if got := h.queryOne(`SELECT count(*)::text FROM pg_class WHERE relname = 'victim'`); got != "1" {
-			t.Fatal("victim was dropped")
+		if got := h.queryOne(`SELECT count(*)::text FROM pg_class WHERE relname = 'a4'`); got != "0" {
+			t.Fatal("a refused transactional apply kept its effects")
 		}
 		if got := h.queryOne(`SHOW standard_conforming_strings`); got != "on" {
 			t.Fatalf("standard_conforming_strings left %s", got)
 		}
 	}
-	for _, turnOff := range []string{
+	for _, change := range []string{
 		"SET LOCAL standard_conforming_strings = off",
-		"select set_config('standard_' || 'conforming_strings', 'off', true)",
+		"select set_config('standard_conforming_strings', 'off', true)",
 	} {
-		sql := turnOff + ";\nselect 'a\\''; drop table victim; select 'b';\n"
-		t.Run("transactional migration: "+turnOff, func(t *testing.T) {
-			if n := len(SplitSQLStatements(sql)); n != 2 {
-				t.Fatalf("fixture: the scanner must see 2 statements, sees %d", n)
-			}
-			scsOff(t, sess.ApplyMigration(ctx, MigrationFile{Version: "901", Name: "scs", SQL: sql}))
+		sql := change + ";\ncreate table a4 (id int);\n"
+		t.Run("transactional migration: "+change, func(t *testing.T) {
+			settingChanged(t, sess.ApplyMigration(ctx, MigrationFile{Version: "901", Name: "scs", SQL: sql}))
 			if got := h.queryOne(`SELECT count(*)::text FROM _neutron_migrations`); got != "0" {
 				t.Fatal("a refused migration recorded history")
 			}
 		})
-		t.Run("down migration: "+turnOff, func(t *testing.T) {
-			scsOff(t, sess.RevertMigration(ctx, MigrationFile{Version: "902", Name: "d", SQL: sql}))
+		t.Run("down migration: "+change, func(t *testing.T) {
+			settingChanged(t, sess.RevertMigration(ctx, MigrationFile{Version: "902", Name: "d", SQL: sql}))
 		})
 	}
 	t.Run("nontransactional: a session-level change is reset", func(t *testing.T) {
-		scsOff(t, sess.ApplyNontransactionalMigration(ctx, MigrationFile{Version: "903", Name: "n"},
-			[]string{"select set_config('standard_conforming_strings', 'off', false)", "select 1"}, nil))
+		settingChanged(t, sess.ApplyNontransactionalMigration(ctx, MigrationFile{Version: "903", Name: "n"},
+			[]string{"select set_config('standard_conforming_strings', 'off', false)", "create table a4 (id int)"}, nil))
+	})
+	t.Run("a session that does not read text as the checks did is refused before anything runs", func(t *testing.T) {
+		for _, set := range []string{"SET client_encoding = 'LATIN1'", "SET standard_conforming_strings = off"} {
+			if err := sess.Exec(ctx, set); err != nil {
+				t.Fatal(err)
+			}
+			err := sess.ApplyStatementsTx(ctx, []string{"create table a4 (id int)"}, nil)
+			_ = sess.Exec(ctx, "RESET client_encoding")
+			_ = sess.Exec(ctx, "RESET standard_conforming_strings")
+			if err == nil || !strings.Contains(err.Error(), "refused before") {
+				t.Fatalf("%s: apply must be refused before the statement, got %v", set, err)
+			}
+			if got := h.queryOne(`SELECT count(*)::text FROM pg_class WHERE relname = 'a4'`); got != "0" {
+				t.Fatalf("%s: the statement ran", set)
+			}
+		}
 	})
 	t.Run("journaled steps", func(t *testing.T) {
 		_, err := sess.execTransactionalStep(ctx, &JournaledStep{Index: 1, Statement: "create table a2 (id int); drop table victim"})
