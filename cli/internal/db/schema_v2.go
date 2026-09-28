@@ -537,6 +537,25 @@ func v2CheckSQLText(s, path string, expression bool) error {
 	return nil
 }
 
+// v2HasSecondStatement reports whether SQL text carries anything after a
+// top-level statement separator. A view definition is one statement, which
+// pg_get_viewdef ends with a separator; a separator inside a string
+// literal, quoted identifier, dollar quote or comment is text, not a
+// separator (the migration runner's own tokenizer decides). Unlike an
+// expression position, a view definition may therefore contain ';'.
+func v2HasSecondStatement(s string) bool {
+	separated := false
+	for _, t := range significantTokens(s) {
+		if separated {
+			return true
+		}
+		if t.kind == 'p' && t.text == ";" {
+			separated = true
+		}
+	}
+	return false
+}
+
 func v2CheckIdentity(v any, path string) (schema, name string, err error) {
 	m, err := v2Object(v, path)
 	if err != nil {
@@ -1450,6 +1469,9 @@ func v2ValidateViews(root map[string]any, st *v2State) error {
 		}
 		if err := v2CheckSQLText(def, path+".definition", false); err != nil {
 			return err
+		}
+		if v2HasSecondStatement(def) {
+			return contractErr("invalid-value", path+".definition", "view definition must be a single statement: a statement separator may only end it")
 		}
 		if co, ok := m["checkOption"]; ok {
 			s, err := v2String(co, path+".checkOption")

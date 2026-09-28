@@ -185,6 +185,95 @@ const checkSQLText = (s: string, at: string, expression: boolean): void => {
     fail("invalid-value", at, "expression must not contain a statement separator");
   }
 };
+// hasSecondStatement mirrors the Go validator's v2HasSecondStatement and the
+// migration tokenizer it uses (cli/internal/db/migrate_apply.go): anything
+// significant after a top-level ";" is a second statement. Separators inside
+// '...' (with '' doubling), E'...' (backslash escapes), "..." identifiers,
+// $tag$...$tag$ bodies and -- or nested /* */ comments are text.
+const isWordChar = (c: string): boolean => /^[A-Za-z0-9_]$/.test(c);
+const hasSecondStatement = (s: string): boolean => {
+  const n = s.length;
+  let i = 0;
+  let separated = false;
+  const significant = (): boolean => separated;
+  while (i < n) {
+    const c = s[i];
+    if (c === " " || c === "\t" || c === "\n" || c === "\r") {
+      i++;
+    } else if (c === "-" && s[i + 1] === "-") {
+      const j = s.indexOf("\n", i);
+      i = j < 0 ? n : j;
+    } else if (c === "/" && s[i + 1] === "*") {
+      let depth = 1;
+      let j = i + 2;
+      while (j < n && depth > 0) {
+        if (s[j] === "/" && s[j + 1] === "*") {
+          depth++;
+          j += 2;
+        } else if (s[j] === "*" && s[j + 1] === "/") {
+          depth--;
+          j += 2;
+        } else {
+          j++;
+        }
+      }
+      i = Math.min(j, n);
+    } else if (c === '"') {
+      if (significant()) return true;
+      let j = i + 1;
+      while (j < n) {
+        if (s[j] === '"') {
+          if (s[j + 1] === '"') {
+            j += 2;
+            continue;
+          }
+          break;
+        }
+        j++;
+      }
+      i = Math.min(j + 1, n);
+    } else if (c === "'" || ((c === "e" || c === "E") && s[i + 1] === "'")) {
+      if (significant()) return true;
+      const esc = c !== "'";
+      let j = esc ? i + 2 : i + 1;
+      while (j < n) {
+        if (esc && s[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (s[j] === "'") {
+          if (s[j + 1] === "'") {
+            j += 2;
+            continue;
+          }
+          j++;
+          break;
+        }
+        j++;
+      }
+      i = Math.min(j, n);
+    } else if (c === "$") {
+      if (significant()) return true;
+      let j = i + 1;
+      while (j < n && isWordChar(s[j])) j++;
+      if (j < n && s[j] === "$") {
+        const delim = s.slice(i, j + 1);
+        const end = s.indexOf(delim, j + 1);
+        i = end < 0 ? n : end + delim.length;
+      } else {
+        i++;
+      }
+    } else if (isWordChar(c)) {
+      if (significant()) return true;
+      while (i < n && isWordChar(s[i])) i++;
+    } else {
+      if (significant()) return true;
+      if (c === ";") separated = true;
+      i++;
+    }
+  }
+  return false;
+};
 const checkIdentity = (v: Json, at: string): { schema: string; name: string } => {
   const m = isObj(v, at);
   for (const k of Object.keys(m)) {
@@ -296,7 +385,11 @@ const validateDocument = (root: Obj): void => {
     onlyFields(m, at, ["identity", "managed", "definition", "checkOption", "securityInvoker"], ["identity", "managed", "definition"]);
     const id = checkIdentity(m.identity, `${at}.identity`);
     isBool(m.managed, `${at}.managed`);
-    checkSQLText(isStr(m.definition, `${at}.definition`), `${at}.definition`, false);
+    const definition = isStr(m.definition, `${at}.definition`);
+    checkSQLText(definition, `${at}.definition`, false);
+    if (hasSecondStatement(definition)) {
+      fail("invalid-value", `${at}.definition`, "view definition must be a single statement: a statement separator may only end it");
+    }
     if ("checkOption" in m) {
       const co = isStr(m.checkOption, `${at}.checkOption`);
       if (co !== "local" && co !== "cascaded") fail("invalid-value", `${at}.checkOption`, 'checkOption must be "local" or "cascaded"');
@@ -976,6 +1069,34 @@ for (const fx of manifest.valid) {
     note(false, 'version "2" rejected', "accepted instead");
   } catch (err) {
     note(err instanceof ContractError && err.code === "invalid-number", 'version "2" rejected [invalid-number]', String(err));
+  }
+}
+
+// A view definition is one statement (the Go test pins the same cases):
+// a trailing separator and separators inside literals, identifiers, dollar
+// quotes and comments are accepted; a second statement is refused.
+{
+  const viewDoc = (def: string): string =>
+    JSON.stringify({ version: 2, dialect: "postgresql", capabilities: [], schemas: [{ name: "public" }], tables: [], enums: [],
+      views: [{ identity: { schema: "public", name: "v" }, managed: true, definition: def }], opaque: [] });
+  for (const def of ["select 1 as x", " SELECT 1 AS x;", "select 1 as x;\n  ", "select 1 as x; -- trailing comment",
+    "select 1 as x; /* trailing ; comment */", "select 'a;b' as x", "select E'a\\';b' as x", 'select 1 as "a;b"',
+    "select $q$;drop table t;$q$ as x", "select 1 as x -- ; not a separator"]) {
+    try {
+      parseValidateHash(viewDoc(def));
+      note(true, `view definition ${JSON.stringify(def)} accepted`);
+    } catch (err) {
+      note(false, `view definition ${JSON.stringify(def)} accepted`, String(err));
+    }
+  }
+  for (const def of ['select 1 as x; drop table if exists "public"."other_app"', "select 1 as x;;", "select 1 as x; select 2",
+    "select 'a' as x;/* c */select 2"]) {
+    try {
+      parseValidateHash(viewDoc(def));
+      note(false, `view definition ${JSON.stringify(def)} rejected [invalid-value]`, "accepted instead");
+    } catch (err) {
+      note(err instanceof ContractError && err.code === "invalid-value", `view definition ${JSON.stringify(def)} rejected [invalid-value]`, String(err));
+    }
   }
 }
 

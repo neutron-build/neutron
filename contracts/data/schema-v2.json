@@ -58,7 +58,7 @@
       "type": "string",
       "minLength": 1,
       "pattern": "^[^\\u0000]+$",
-      "description": "SQL text (expression, predicate, view definition, reason). Stored and hashed verbatim; must be non-empty and free of NUL. No statement separator is permitted in expression positions (enforced by validators for single expressions)."
+      "description": "SQL text (expression, predicate, view definition, reason). Stored and hashed verbatim; must be non-empty and free of NUL. No statement separator is permitted in expression positions (enforced by validators for single expressions); a view definition is one statement, so a separator may only end it (enforced by validators, which treat separators inside literals, quoted identifiers, dollar quotes and comments as text)."
     },
     "identity": {
       "type": "object",
