@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // ---------------------------------------------------------------------------
@@ -144,11 +146,14 @@ func tokenizeSQL(s string) []sqlToken {
 				i++
 			}
 		case isWordChar(c):
+			// A word continues through '$' once started, as PostgreSQL's
+			// ident_cont does: "a$x$" is one identifier, so only a '$' at
+			// a token start can open a dollar quote.
 			j := i
-			for j < n && isWordChar(s[j]) {
+			for j < n && isWordCont(s[j]) {
 				j++
 			}
-			emit('w', strings.ToLower(s[i:j]), i, j)
+			emit('w', asciiLower(s[i:j]), i, j)
 			i = j
 		default:
 			emit('p', string(c), i, i+1)
@@ -236,6 +241,9 @@ func fragmentIsLineCommentsOnly(s string) bool {
 func dollarQuoteEnd(sql string, start int) (int, bool) {
 	j := start + 1
 	n := len(sql)
+	if j < n && sql[j] >= '0' && sql[j] <= '9' {
+		return 0, false
+	}
 	for j < n && isDollarTagChar(sql[j]) {
 		j++
 	}
@@ -249,8 +257,10 @@ func dollarQuoteEnd(sql string, start int) (int, bool) {
 	return n, true
 }
 
+// isDollarTagChar matches PostgreSQL's dolq_cont; a tag may not start
+// with a digit (dolq_start), so "$1$" is a parameter, not a quote.
 func isDollarTagChar(c byte) bool {
-	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+	return c == '_' || c >= 0x80 || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 }
 
 func stripTrailingSemicolon(s string) string {
@@ -675,12 +685,30 @@ func (q QualifiedName) String() string {
 	return q.Name
 }
 
-// isWordChar matches PostgreSQL bare-identifier characters. Dollar is
-// deliberately absent: outside dollar-quoted strings a `$` is punctuation
-// (parameters like $1), never part of a name — the guard never matches
-// object names through it.
+// isWordChar matches the characters that start a bare word: PostgreSQL's
+// ident_start (letters, '_', and every byte >= 0x80) plus digits, which
+// start numbers. A '$' at a word start is punctuation or a dollar quote
+// (parameters like $1, $tag$).
 func isWordChar(c byte) bool {
-	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+	return c == '_' || c >= 0x80 || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+}
+
+// isWordCont matches the characters that continue a word: PostgreSQL's
+// ident_cont, which adds '$' to the start set.
+func isWordCont(c byte) bool {
+	return isWordChar(c) || c == '$'
+}
+
+// asciiLower folds ASCII letters only, as PostgreSQL folds unquoted
+// identifiers in UTF-8 databases; other bytes are kept as written.
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
 }
 
 // nameAt parses an optionally schema-qualified name at token position i
@@ -2135,6 +2163,35 @@ func (e *NontransactionalPartialError) Error() string {
 
 func (e *NontransactionalPartialError) Unwrap() error { return e.Err }
 
+// ExecOneStatement runs one statement over the extended query protocol.
+// The server refuses text that holds more than one command there (42601,
+// "cannot insert multiple commands into a prepared statement"), while the
+// simple protocol pgx uses for an argument-less Exec runs every command in
+// the text. Every planned and migration statement goes through here, so
+// when a scanner and PostgreSQL disagree about where a statement ends, the
+// apply fails closed instead of running a statement no check saw.
+//
+// Statements now reach the server one at a time, so a statement can change
+// how the server reads the next one. standard_conforming_strings is the one
+// setting that moves literal boundaries (with it off, '\'' ends where the
+// scanner, which assumes it on, reads a doubled quote); a statement that
+// turns it off (SET LOCAL, set_config) is refused before anything else
+// runs. The server reports the setting after every statement.
+func ExecOneStatement(ctx context.Context, conn *pgconn.PgConn, sql string) (pgconn.CommandTag, error) {
+	res := conn.ExecParams(ctx, sql, nil, nil, nil, nil).Read()
+	if res.Err != nil {
+		return res.CommandTag, res.Err
+	}
+	if scs := conn.ParameterStatus("standard_conforming_strings"); scs != "" && scs != "on" {
+		if conn.TxStatus() == 'I' {
+			// Outside a transaction no rollback restores it.
+			_ = conn.ExecParams(ctx, "SET standard_conforming_strings = on", nil, nil, nil, nil).Read()
+		}
+		return res.CommandTag, fmt.Errorf("%q turned standard_conforming_strings off: statements after it would be read differently than the checks before apply read them (backslashes in string literals become escapes); refused — migration SQL must keep standard_conforming_strings on", firstSQLLine(sql))
+	}
+	return res.CommandTag, nil
+}
+
 // ApplyNontransactionalMigration executes each statement as its own implicit
 // transaction on the pinned session (required for CREATE INDEX CONCURRENTLY),
 // then records the history row once every statement succeeded. The row write
@@ -2154,7 +2211,7 @@ func (s *MigrationSession) ApplyNontransactionalMigration(ctx context.Context, m
 		if !hasExecutableSQL(stmt) {
 			continue
 		}
-		if _, err := s.conn.Exec(ctx, stmt); err != nil {
+		if _, err := ExecOneStatement(ctx, s.conn.Conn().PgConn(), stmt); err != nil {
 			return &NontransactionalPartialError{Applied: applied, Total: total, Err: err}
 		}
 		applied++
@@ -2200,7 +2257,7 @@ func (s *MigrationSession) ApplyStatementsTx(ctx context.Context, statements []s
 			}
 			continue
 		}
-		if _, err := tx.Exec(ctx, stmt); err != nil {
+		if _, err := ExecOneStatement(ctx, tx.Conn().PgConn(), stmt); err != nil {
 			return fmt.Errorf("apply %q: %w", firstSQLLine(stmt), err)
 		}
 		if onApplied != nil {

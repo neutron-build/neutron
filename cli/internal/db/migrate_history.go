@@ -277,7 +277,7 @@ func (s *MigrationSession) ApplyMigration(ctx context.Context, mf MigrationFile)
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, mf.SQL); err != nil {
+	if err := execStatementsTx(ctx, tx, mf.SQL); err != nil {
 		if isUnsafeNewEnumValue(err) {
 			return &EnumValueUseError{Version: mf.Version, Err: err}
 		}
@@ -294,6 +294,21 @@ func (s *MigrationSession) ApplyMigration(ctx context.Context, mf MigrationFile)
 	return tx.Commit(ctx)
 }
 
+// execStatementsTx runs a migration file statement by statement inside tx,
+// each over the extended protocol (ExecOneStatement): the statements the
+// checks before apply classified are exactly the statements that run.
+func execStatementsTx(ctx context.Context, tx pgx.Tx, sql string) error {
+	for _, stmt := range SplitSQLStatements(sql) {
+		if !hasExecutableSQL(stmt) {
+			continue
+		}
+		if _, err := ExecOneStatement(ctx, tx.Conn().PgConn(), stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // RevertMigration executes one down migration and deletes its history row in
 // one transaction on the pinned session. Checksum verification of the up
 // file happens before any revert runs (VerifyAppliedChecksums).
@@ -304,7 +319,7 @@ func (s *MigrationSession) RevertMigration(ctx context.Context, mf MigrationFile
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, mf.SQL); err != nil {
+	if err := execStatementsTx(ctx, tx, mf.SQL); err != nil {
 		return fmt.Errorf("execute down migration %s: %w", mf.Version, err)
 	}
 

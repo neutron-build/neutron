@@ -919,7 +919,7 @@ func (s *MigrationSession) execConcurrent(ctx context.Context, client *Client, s
 		}()
 	}
 
-	tag, err := s.conn.Exec(ctx, sql)
+	tag, err := ExecOneStatement(ctx, s.conn.Conn().PgConn(), sql)
 	if err != nil {
 		return 0, fmt.Errorf("execute %q: %w", firstSQLLine(sql), err)
 	}
@@ -943,11 +943,11 @@ func (s *MigrationSession) execTransactionalStep(ctx context.Context, step *Jour
 		return 0, fmt.Errorf("set step statement_timeout: %w", err)
 	}
 	for _, cfg := range step.ConfigSQL {
-		if _, err := tx.Exec(ctx, cfg); err != nil {
+		if _, err := ExecOneStatement(ctx, tx.Conn().PgConn(), cfg); err != nil {
 			return 0, fmt.Errorf("step SET LOCAL %q: %w", firstSQLLine(cfg), err)
 		}
 	}
-	tag, err := tx.Exec(ctx, step.Statement)
+	tag, err := ExecOneStatement(ctx, tx.Conn().PgConn(), step.Statement)
 	if err != nil {
 		return 0, fmt.Errorf("execute %q: %w", step.FirstLine, err)
 	}
