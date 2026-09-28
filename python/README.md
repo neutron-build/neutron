@@ -1,14 +1,14 @@
-# neutron-py
+# neutron-framework
 
 The AI application development framework for Python — Starlette underneath,
-Pydantic throughout, with a first-class client for [Nucleus](../nucleus), the
+Pydantic throughout, with a first-class client for [Nucleus](https://github.com/neutron-build/neutron/tree/main/nucleus), the
 multi-model database the rest of Neutron is built on.
 
 ```bash
-pip install neutron-py
+pip install neutron-framework
 ```
 
-> The distribution is **`neutron-py`**, not `neutron` — that name on PyPI
+> The distribution is **`neutron-framework`**, not `neutron` — that name on PyPI
 > belongs to OpenStack's networking service.
 
 ## A first app
@@ -49,17 +49,17 @@ Return a Pydantic model and you get validation, serialisation and an OpenAPI
 | Nucleus client — all 14 data models | `neutron/nucleus/` |
 | AI: providers, agents, RAG, MCP | `neutron/ai/` |
 | Auth, cache, jobs, realtime | `neutron/auth/`, `cache/`, `jobs/`, `realtime/` |
-| CLI (`neutron` command) | `neutron/cli.py` |
+| CLI (`python -m neutron`) | `neutron/cli.py` |
 | Test helpers | `neutron/test/` |
 
 ## Extras
 
 ```bash
-pip install "neutron-py[ai]"      # AI providers, agents, RAG
-pip install "neutron-py[crypto]"  # password hashing
-pip install "neutron-py[granian]" # the Granian server
-pip install "neutron-py[rich]"    # richer CLI output
-pip install "neutron-py[all]"     # everything above
+pip install "neutron-framework[ai]"      # AI providers, agents, RAG
+pip install "neutron-framework[crypto]"  # password hashing
+pip install "neutron-framework[granian]" # the Granian server
+pip install "neutron-framework[rich]"    # richer CLI output
+pip install "neutron-framework[all]"     # everything above
 ```
 
 `[test]` is the development extra and is what CI installs.
@@ -85,9 +85,9 @@ available if you would rather not use this client at all.
 ## Documentation
 
 Published docs — overview, quickstart, routing, middleware, database, realtime,
-deployment — are at **https://neutron.build/docs/python**. The wire-level
+deployment — start at **https://neutron.build/docs/python/overview**. The wire-level
 contract every Neutron SDK implements is
-[`FRAMEWORK_CONTRACT.md`](../FRAMEWORK_CONTRACT.md); this SDK scores 12/12 on
+[`FRAMEWORK_CONTRACT.md`](https://github.com/neutron-build/neutron/blob/main/FRAMEWORK_CONTRACT.md); this SDK scores 12/12 on
 its conformance matrix.
 
 ## Development
@@ -97,14 +97,5 @@ pip install -e ".[test]"
 pytest
 ```
 
-565 tests. The live-database cases skip unless `NEUTRON_TEST_DATABASE_URL`
-points at a running Nucleus; CI runs them against one it builds in-job.
-
----
-
-*This file replaced a pre-implementation design document on 2026-08-17. That
-document described a package called `neutron-nucleus` with `[vector]` and
-`[mojo]` extras, said Nucleus had 9 data models, and ended with "Status:
-Planned — not yet implemented" — for a package that was by then shipping with
-533 tests and published docs. Every install line in it failed. Found by the
-S101 scoring pass.*
+Live-database tests skip unless `NEUTRON_TEST_DATABASE_URL` points at a running
+Nucleus instance.
