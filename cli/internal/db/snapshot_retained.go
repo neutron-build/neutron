@@ -56,7 +56,7 @@ func flagDropsNote(retained []RetainedObject) string {
 	if len(retained) <= 1 {
 		return ""
 	}
-	return ". Note that --allow-destructive drops every object this plan leaves in place, which here is: " + RetainedList(retained) + "; declare in the schema what must stay before using it"
+	return ". Note that the flag drops every object this plan leaves in place, which here is: " + RetainedList(retained) + "; declare in the schema what must stay before using it"
 }
 
 // RetainedList renders retained objects for messages.
