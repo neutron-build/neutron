@@ -182,21 +182,22 @@ const REGISTRY: Readonly<Record<string, CapabilitySpec>> = {
   // X03: time bucketing through date_trunc(field, source [, timezone]).
   // Probe-only on purpose: no version fact is cited (date_trunc predates
   // cleanly citable release notes), and the probe VERIFIES SEMANTICS with
-  // positive and negative controls. Every condition uses an IMMUTABLE
-  // date_trunc form (the three-argument zone form and the naive-timestamp
-  // form): immutable conditions const-fold to true BEFORE the planner
-  // pre-evaluates the 1/0 else arm, which is what makes the arm a reliable
-  // negative control — a stable-only condition (the two-argument
-  // timestamptz form truncates in the SESSION zone) does not fold early
-  // and the arm would error spuriously. A Tokyo day boundary differing
+  // positive and negative controls. The negative control divides by the
+  // conditions' verdict (1 when all hold, 0 otherwise) instead of using a
+  // `case ... else 1/0` arm: the planner const-folds a literal 1/0 arm
+  // whenever the conditions do not fold first, and the three-argument zone
+  // form is STABLE before PostgreSQL 16 (immutable from 16), so the arm
+  // form failed spuriously on 14 and 15 (R04). Divided by the verdict, the
+  // division errors only when a condition is false, whether it is folded
+  // at plan time or evaluated at run time. A Tokyo day boundary differing
   // from the UTC one catches engines that parse the syntax but ignore the
   // zone argument (the X01 fake-FTS failure class). The two-argument
-  // timestamptz form follows the session timezone by PostgreSQL design —
-  // bucket boundaries without an explicit timeZone option are
-  // session-timezone-dependent, documented in /timeseries.
+  // timestamptz form follows the session timezone by PostgreSQL design, so
+  // it is not probed; bucket boundaries without an explicit timeZone option
+  // are session-timezone-dependent, documented in /timeseries.
   "ts-bucketing": {
     description: "date_trunc(field, timestamp/timestamptz [, timezone]) time bucketing (PostgreSQL core)",
-    probeSql: "select case when date_trunc('hour', timestamptz '2026-01-01 00:30:00+00', 'UTC') = timestamptz '2026-01-01 00:00:00+00' and date_trunc('hour', timestamptz '2026-01-01 00:59:59.999999+00', 'UTC') = timestamptz '2026-01-01 00:00:00+00' and date_trunc('day', timestamptz '2026-01-01 20:00:00+00', 'Asia/Tokyo') = timestamptz '2026-01-01 15:00:00+00' and date_trunc('day', timestamptz '2026-01-01 20:00:00+00', 'Asia/Tokyo') <> timestamptz '2026-01-01 00:00:00+00' and date_trunc('day', timestamp '2026-01-01 20:30:00') = timestamp '2026-01-01 00:00:00' then 1 else 1/0 end",
+    probeSql: "select 1/(case when date_trunc('hour', timestamptz '2026-01-01 00:30:00+00', 'UTC') = timestamptz '2026-01-01 00:00:00+00' and date_trunc('hour', timestamptz '2026-01-01 00:59:59.999999+00', 'UTC') = timestamptz '2026-01-01 00:00:00+00' and date_trunc('day', timestamptz '2026-01-01 20:00:00+00', 'Asia/Tokyo') = timestamptz '2026-01-01 15:00:00+00' and date_trunc('day', timestamptz '2026-01-01 20:00:00+00', 'Asia/Tokyo') <> timestamptz '2026-01-01 00:00:00+00' and date_trunc('day', timestamp '2026-01-01 20:30:00') = timestamp '2026-01-01 00:00:00' then 1 else 0 end)",
   },
 };
 
