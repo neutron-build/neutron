@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1108,21 +1107,37 @@ func TestQ09TwinRunsOnlyTheDocumentsTable(t *testing.T) {
 		t.Fatalf("the crafted check must fail, got %v", failed)
 	}
 
-	failed = normalize(colA, `{"name": "t_col", "type": "check", "expression": "a > 0), zz text, check (true"},
-		{"name": "t_use", "type": "check", "expression": "zz = 's'"}`, "")
-	if !equalStringSlices(failed, []string{"check t_col", "check t_use"}) {
-		t.Fatalf("a check resolving against a column the document does not declare must fail, got %v", failed)
+	// An expression crafted to inject columns or a statement into the twin
+	// (unbalanced parens, a comma adding a clause, an unclosed comment) is
+	// now refused at document validation, before the normalizer (S07
+	// review-2 N3). Each of these documents is contract-invalid.
+	for _, doc := range []string{
+		`{"name": "t_col", "type": "check", "expression": "a > 0), zz text, check (true"}`,
+		`{"name": "t_col", "type": "check", "expression": "a > 0, zz text"}`,
+	} {
+		if _, err := ParseV2Document([]byte(`{
+			"version": 2, "dialect": "postgresql", "capabilities": [], "schemas": [{"name": "public"}],
+			"enums": [], "views": [], "opaque": [],
+			"tables": [{"identity": {"schema": "public", "name": "t"}, "managed": true,
+				"columns": [` + colA + `], "constraints": [` + doc + `], "indexes": []}]}`)); err == nil {
+			t.Fatalf("a check expression that opens a clause must be refused at validation: %s", doc)
+		}
+	}
+	if _, err := ParseV2Document([]byte(`{
+		"version": 2, "dialect": "postgresql", "capabilities": [], "schemas": [{"name": "public"}],
+		"enums": [], "views": [], "opaque": [],
+		"tables": [{"identity": {"schema": "public", "name": "t"}, "managed": true,
+			"columns": [{"name": "a", "type": {"name": "int4", "codec": "number"}, "notNull": false,
+				"default": {"kind": "expression", "sql": "0, b text /*"}}], "constraints": [], "indexes": []}]}`)); err == nil {
+		t.Fatal("a default expression that opens a clause and an unclosed comment must be refused at validation")
 	}
 
-	failed = normalize(`{"name": "a", "type": {"name": "int4", "codec": "number"}, "notNull": false,
-			"default": {"kind": "expression", "sql": "0, b text /*"}},
-		{"name": "b", "type": {"name": "enum", "codec": "enum", "enum": {"schema": "public", "name": "sz"}}, "notNull": false}`,
-		`{"name": "t_close", "type": "check", "expression": "*/ check (true"},
-		{"name": "t_use", "type": "check", "expression": "b = 's'"}`, "")
-	for _, want := range []string{"column a default", "check t_close"} {
-		if !slices.Contains(failed, want) {
-			t.Fatalf("a twin redeclaring a column's type must not normalize %s, got %v", want, failed)
-		}
+	// A single, well-formed expression that resolves against a column the
+	// document does not declare still fails to normalize (the twin has only
+	// the document's columns).
+	failed = normalize(colA, `{"name": "t_use", "type": "check", "expression": "zz = 's'"}`, "")
+	if !equalStringSlices(failed, []string{"check t_use"}) {
+		t.Fatalf("a check resolving against a column the document does not declare must fail, got %v", failed)
 	}
 
 	norm, err := h.client.NewTwinNormalizer(context.Background())

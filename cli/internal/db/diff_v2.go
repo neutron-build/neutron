@@ -1136,7 +1136,7 @@ func sqlIdentifiers(text string) (idents []string, ok bool) {
 			idents = append(idents, b.String())
 			i = j + 1
 		case c == '-' && i+1 < len(text) && text[i+1] == '-':
-			for i < len(text) && text[i] != '\n' {
+			for i < len(text) && text[i] != '\n' && text[i] != '\r' {
 				i++
 			}
 		case c == '/' && i+1 < len(text) && text[i+1] == '*':
