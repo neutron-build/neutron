@@ -865,6 +865,16 @@ func LoadPlanArtifact(path string) (*PlanArtifact, error) {
 // VerifyPlanIdentity refuses a plan artifact that names a different
 // migration than the file it sits next to (renamed or copied artifacts).
 func VerifyPlanIdentity(plan *PlanArtifact, version, name string) error {
+	// CLIs before Q09 recorded the raw --name ("Init Schema") while naming
+	// the files by its slug. The plan is otherwise the one generated for
+	// these files; name the one-field fix.
+	if plan.MigrationVersion == version && plan.MigrationName != name {
+		if slug, err := migrationNameSlug(plan.MigrationName); err == nil && slug == name {
+			return fmt.Errorf(
+				"plan records migration name %q, which an earlier CLI wrote unslugged; its files are named %s_%s — set \"migrationName\" to %q in %s_%s.plan.json (nothing else changes), or regenerate the migration",
+				plan.MigrationName, version, name, name, version, name)
+		}
+	}
 	if plan.MigrationVersion != version || plan.MigrationName != name {
 		return fmt.Errorf(
 			"plan records migration %s_%s but sits next to %s_%s — filename/content identity mismatch; the chain refuses ambiguous artifacts",
