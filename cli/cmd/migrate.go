@@ -18,7 +18,7 @@ import (
 func init() {
 	migrateCmd.Flags().String("dir", "migrations", "migrations directory")
 	migrateCmd.Flags().Duration("timeout", 60*time.Second, "total time budget for the migration batch (0 = no deadline)")
-	migrateCmd.Flags().Bool("allow-destructive", false, "acknowledge data loss: apply pending migrations whose statements drop tables, columns, indexes or types (migrations may contain only allowlisted statement kinds — SELECT/INSERT/UPDATE/DELETE/MERGE, TRUNCATE, CREATE/ALTER/DROP of schema objects, SET LOCAL; anything else is refused whatever flags are passed, and within those kinds neutron-internal metadata and extension-owned objects are never touched by any drop form, cascade, alteration, row write or WITH-wrapped data-modifying CTE)")
+	migrateCmd.Flags().Bool("allow-destructive", false, "acknowledge data loss: apply pending migrations whose statements drop tables, columns, indexes or types, truncate tables, drop materialized views, drop domains with CASCADE, or drop or retype composite-type attributes (migrations may contain only allowlisted statement kinds — SELECT/INSERT/UPDATE/DELETE/MERGE, TRUNCATE, CREATE/ALTER/DROP of schema objects, SET LOCAL; anything else is refused whatever flags are passed, and within those kinds neutron-internal metadata and extension-owned objects are never touched by any drop form, cascade, alteration, row write or WITH-wrapped data-modifying CTE)")
 
 	migrateStatusCmd.Flags().String("dir", "migrations", "migrations directory")
 	migrateStatusCmd.Flags().Duration("timeout", 10*time.Second, "time budget for the status query (0 = no deadline)")
