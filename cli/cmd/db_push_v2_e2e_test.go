@@ -271,13 +271,22 @@ func TestDBPushV2E2E(t *testing.T) {
 		docCPath := filepath.Join(work, "c.json")
 		writeFile(t, docCPath, docC)
 
-		// Without the flag the push is destructive-refusing, not a rename.
-		code, _ := run("db", "push", "--schema", docCPath)
-		if code == 0 {
-			t.Fatal("push without rename flag must not silently succeed")
+		// Without the flag the plan is not a rename, and it loses nothing:
+		// it adds contact and leaves email, with its data, in place (named
+		// as left untouched). The dry run shows it; the rename push below
+		// needs contact to be absent. (Before Q12 review-1 this push failed
+		// at apply, but only because a foreign key was added before the
+		// unique key it references, 42830.)
+		code, out := run("db", "push", "--dry-run", "--schema", docCPath)
+		if code != 0 || !strings.Contains(out, `add column "contact"`) || strings.Contains(out, "drop column") ||
+			!strings.Contains(out, `column "email" exists in the database but not in the schema: left untouched`) {
+			t.Fatalf("a push without the rename flag must add contact and keep email (%d):\n%s", code, out)
+		}
+		if got := queryStr(`SELECT count(*)::text FROM public.users WHERE email = 'seed@x.com'`); got != "1" {
+			t.Fatalf("the dry run must leave the row in email")
 		}
 
-		code, out := run("db", "push", "--schema", docCPath, "--rename", "public.users.email>public.users.contact")
+		code, out = run("db", "push", "--schema", docCPath, "--rename", "public.users.email>public.users.contact")
 		if code != 0 {
 			t.Fatalf("rename push failed (%d):\n%s", code, out)
 		}

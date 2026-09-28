@@ -116,6 +116,7 @@ func DiffV2Document(ctx context.Context, desired, actual *V2Document, opts DiffV
 		renameBlocked:    map[V2Identity]map[string]string{},
 		retyped:          map[V2Identity]map[string]string{},
 		rebuilt:          map[V2Identity]map[string]string{},
+		changed:          map[V2Identity]map[string]string{},
 	}
 
 	for _, s := range d.Schemas {
@@ -158,6 +159,68 @@ func DiffV2Document(ctx context.Context, desired, actual *V2Document, opts DiffV
 	return pl.result, nil
 }
 
+// flagScope completes a refusal that recommends --allow-destructive: the
+// flag also drops every managed-scope object the schema does not declare
+// (the drops planTableDrops, planDroppedColumns, planIndexChanges,
+// planViewsAroundAlters and planEnumDrops gate on it), so the refusal
+// names them.
+func (p *v2Planner) flagScope() string {
+	if p.opts.AllowDestructive {
+		return ""
+	}
+	var objs []string
+	dropped := map[V2Identity]bool{}
+	for _, t := range p.actual.Tables {
+		if !p.scope[t.Identity.Schema] || isProtectedTableName(t.Identity.Name) {
+			continue
+		}
+		if !p.desiredTables[t.Identity] {
+			if p.desired.Table(t.Identity) == nil {
+				objs = append(objs, "table "+t.Identity.String())
+				dropped[t.Identity] = true
+			}
+			continue
+		}
+		dt := p.desired.Table(t.Identity)
+		for _, ac := range t.Columns {
+			if dt.Column(ac.Name) == nil && p.actualToDesiredName(t.Identity, ac.Name) == ac.Name {
+				objs = append(objs, fmt.Sprintf("column %s.%s", t.Identity, ac.Name))
+			}
+		}
+		for _, ai := range t.Indexes {
+			if dt.Index(ai.Identity.Name) == nil {
+				objs = append(objs, "index "+ai.Identity.String())
+			}
+		}
+	}
+	for _, v := range p.actual.Views {
+		if p.scope[v.Identity.Schema] && !p.desiredViews[v.Identity] {
+			objs = append(objs, "view "+v.Identity.String())
+		}
+	}
+	for _, e := range p.actual.Enums {
+		if !p.scope[e.Identity.Schema] || p.desiredEnums[e.Identity] {
+			continue
+		}
+		used := false
+		for _, t := range p.actual.Tables {
+			for _, c := range t.Columns {
+				if !dropped[t.Identity] && c.Type.Enum != nil && *c.Type.Enum == e.Identity {
+					used = true
+				}
+			}
+		}
+		if !used {
+			objs = append(objs, "enum "+e.Identity.String())
+		}
+	}
+	if len(objs) == 0 {
+		return " (with this schema, --allow-destructive drops nothing else)"
+	}
+	sort.Strings(objs)
+	return fmt.Sprintf(". Note that --allow-destructive also drops every object the schema does not declare, which here is: %s; declare in the schema what must stay before using it", strings.Join(objs, ", "))
+}
+
 // v2Planner carries diff state between the per-collection planning passes.
 type v2Planner struct {
 	ctx     context.Context
@@ -188,11 +251,24 @@ type v2Planner struct {
 	renameBlocked    map[V2Identity]map[string]string // element -> what depends on its pre-rename text
 	unverified       []string                         // rendered "equivalence not verified" lines
 	retyped          map[V2Identity]map[string]string // desired name -> live name of matched columns whose type changes
+	changed          map[V2Identity]map[string]string // live column name -> what the plan does to it (type change, drop)
 	rebuilt          map[V2Identity]map[string]string // desired name -> live name of generated columns dropped and added back
 }
 
-// v2StmtPair is one up statement and its down statement.
-type v2StmtPair struct{ up, down string }
+// What the plan does to a column, for dependency refusals.
+const changedType = "whose type changes"
+
+// v2StmtPair is one up statement and its down statement. Constraint and
+// index pairs also carry what cross-table ordering needs: fk marks a
+// foreign-key drop or add, name the constraint or index, and keyCols the
+// (desired-named) columns of a primary key, unique constraint or plain
+// unique index that the pair drops.
+type v2StmtPair struct {
+	up, down string
+	fk       bool
+	name     string
+	keyCols  []string
+}
 
 func (p *v2Planner) warn(format string, args ...any) {
 	p.result.warn(format, args...)
@@ -634,7 +710,7 @@ func (p *v2Planner) planTables() error {
 				postAlter[id] = map[string]bool{}
 			}
 			postAlter[id][con.Name] = true
-			postAlterFKs = append(postAlterFKs, v2StmtPair{stmt, fmt.Sprintf("alter table %s drop constraint if exists %s", qualifiedNameSQL(id), quoteIdent(con.Name))})
+			postAlterFKs = append(postAlterFKs, v2StmtPair{up: stmt, down: fmt.Sprintf("alter table %s drop constraint if exists %s", qualifiedNameSQL(id), quoteIdent(con.Name))})
 		}
 	}
 	for _, id := range ordered {
@@ -700,7 +776,9 @@ func (p *v2Planner) planTables() error {
 		return err
 	}
 	p.bufferAlters = false
-	p.planViewsAroundAlters()
+	if err := p.planViewsAroundAlters(); err != nil {
+		return err
+	}
 	for _, fk := range postAlterFKs {
 		p.emitRaw(fk.up, fk.down)
 	}
@@ -718,7 +796,7 @@ func (p *v2Planner) planTables() error {
 // privileges, comments and other unmodeled properties do not survive the
 // round-trip. Without alterations, only genuinely changed/new/removed
 // views are planned.
-func (p *v2Planner) planViewsAroundAlters() {
+func (p *v2Planner) planViewsAroundAlters() error {
 	type stmtPair struct{ up, down string }
 	dropIds := map[V2Identity]bool{}
 	createIds := map[V2Identity]bool{}
@@ -771,6 +849,9 @@ func (p *v2Planner) planViewsAroundAlters() {
 		}
 	}
 
+	if err := p.checkDependents(dropIds); err != nil {
+		return err
+	}
 	emitAll := func(pairs []stmtPair) {
 		for _, s := range pairs {
 			p.emitRaw(s.up, s.down)
@@ -785,6 +866,7 @@ func (p *v2Planner) planViewsAroundAlters() {
 		p.emitRaw(up, down)
 	}
 	emitAll(creates)
+	return nil
 }
 
 func (c V2Column) HasDefaultLike() bool {
@@ -889,9 +971,67 @@ func (p *v2Planner) planSharedTables() error {
 		}
 		plans = append(plans, tp)
 	}
+	// A foreign key onto a key this plan drops (changed, dropped, or taken
+	// along by a rebuilt column) cannot stay while the key is gone:
+	// PostgreSQL refuses the drop (2BP01). It is dropped before and
+	// re-added after, unchanged.
+	droppedKeys := map[V2Identity][][]string{}
+	for _, tp := range plans {
+		for _, pair := range append(append([]v2StmtPair(nil), tp.conDrops...), tp.idxDrops...) {
+			if len(pair.keyCols) > 0 {
+				droppedKeys[tp.dt.Identity] = append(droppedKeys[tp.dt.Identity], pair.keyCols)
+			}
+		}
+	}
+	for i := range plans {
+		tp := &plans[i]
+		at := p.actual.Table(tp.dt.Identity)
+		dtn := p.desiredTable(tp.dt.Identity)
+		dropped := map[string]bool{}
+		for _, pair := range tp.conDrops {
+			dropped[pair.name] = true
+		}
+		for _, ac := range at.Constraints {
+			if ac.Type != "foreign-key" || ac.References == nil || dropped[ac.Name] || !sameColumnSetIn(ac.References.Columns, droppedKeys[ac.References.Table]) {
+				continue
+			}
+			dc := dtn.Constraint(ac.Name)
+			if dc == nil {
+				continue
+			}
+			stmt, err := addV2ConstraintSQL(*dtn, *dc)
+			if err != nil {
+				return err
+			}
+			tq := qualifiedNameSQL(tp.dt.Identity)
+			tp.conDrops = append(tp.conDrops, v2StmtPair{
+				up:   fmt.Sprintf("alter table %s drop constraint if exists %s", tq, quoteIdent(ac.Name)),
+				down: fmt.Sprintf("alter table %s add constraint %s %s", tq, quoteIdent(ac.Name), p.constraintFragmentFor(tp.dt.Identity, at, ac.Name)),
+				fk:   true, name: ac.Name,
+			})
+			tp.conAdds = append(tp.conAdds, v2StmtPair{up: stmt, down: fmt.Sprintf("alter table %s drop constraint if exists %s", tq, quoteIdent(ac.Name)), fk: true, name: ac.Name})
+			p.warn("table %s: foreign key %q references a key of %s that this plan drops and re-creates; it is dropped before and re-added after, unchanged", tp.dt.Identity, ac.Name, ac.References.Table)
+		}
+	}
 	emitPairs := func(pairs []v2StmtPair) {
 		for _, s := range pairs {
 			p.emit(s.up, s.down)
+		}
+	}
+	// emitConstraints emits the foreign-key pairs (fk) or the others of
+	// every table: foreign keys drop before the keys they reference and are
+	// added after them, in every table order.
+	emitConstraints := func(adds, fk bool) {
+		for _, tp := range plans {
+			pairs := tp.conDrops
+			if adds {
+				pairs = tp.conAdds
+			}
+			for _, s := range pairs {
+				if s.fk == fk {
+					p.emit(s.up, s.down)
+				}
+			}
 		}
 	}
 
@@ -903,10 +1043,9 @@ func (p *v2Planner) planSharedTables() error {
 		}
 	}
 
-	// Phase 3: constraint drops.
-	for _, tp := range plans {
-		emitPairs(tp.conDrops)
-	}
+	// Phase 3: constraint drops, foreign keys first.
+	emitConstraints(false, true)
+	emitConstraints(false, false)
 
 	// Phase 4: index drops (dropped, and the drop half of re-created ones).
 	for _, tp := range plans {
@@ -944,15 +1083,14 @@ func (p *v2Planner) planSharedTables() error {
 		}
 	}
 
-	// Phase 8: constraint adds.
-	for _, tp := range plans {
-		emitPairs(tp.conAdds)
-	}
-
-	// Phase 9: index creates.
+	// Phase 8: constraint adds other than foreign keys, then index creates,
+	// then foreign keys (a foreign key needs the key or unique index it
+	// references).
+	emitConstraints(true, false)
 	for _, tp := range plans {
 		emitPairs(tp.idxCreates)
 	}
+	emitConstraints(true, true)
 
 	// Phase 10: other dropped columns (destructive), after the attribute
 	// changes (a generation expression may stop reading one).
@@ -1062,8 +1200,7 @@ func (p *v2Planner) planDroppedColumns(dt V2Table, generated bool) error {
 // 2BP01): a view the plan leaves in place over such a column refuses the
 // plan, naming the view and the ways out.
 func (p *v2Planner) planRebuilds() error {
-	// changed: table -> live column name -> what the plan does to it.
-	changed := map[V2Identity]map[string]string{}
+	changed := p.changed
 	mark := func(table V2Identity, column, what string) {
 		if changed[table] == nil {
 			changed[table] = map[string]string{}
@@ -1088,7 +1225,7 @@ func (p *v2Planner) planRebuilds() error {
 				p.retyped[dt.Identity] = map[string]string{}
 			}
 			p.retyped[dt.Identity][dc.Name] = acName
-			mark(dt.Identity, acName, "whose type changes")
+			mark(dt.Identity, acName, changedType)
 		}
 		if p.opts.AllowDestructive {
 			for _, ac := range at.Columns {
@@ -1128,14 +1265,14 @@ func (p *v2Planner) planRebuilds() error {
 				continue
 			}
 			if !p.opts.AllowDestructive {
-				return fmt.Errorf("table %s: generated column %q reads column %q, whose type changes. PostgreSQL cannot change the type of a column a generated column reads, so the plan drops %q before the change and adds it back after it: its stored values are recomputed, it is placed last in the table, and privileges or comments on it are not kept. Re-run with --allow-destructive to acknowledge that", dt.Identity, dc.Name, read, dc.Name)
+				return fmt.Errorf("table %s: generated column %q reads column %q, whose type changes. PostgreSQL cannot change the type of a column a generated column reads, so the plan drops %q before the change and adds it back after it: its stored values are recomputed, it is placed last in the table, and privileges or comments on it are not kept (the down file adds it back last as well). Re-run with --allow-destructive to acknowledge that%s", dt.Identity, dc.Name, read, dc.Name, p.flagScope())
 			}
 			if p.rebuilt[dt.Identity] == nil {
 				p.rebuilt[dt.Identity] = map[string]string{}
 			}
 			p.rebuilt[dt.Identity][dc.Name] = acName
 			mark(dt.Identity, acName, "which is dropped and added back (it is a generated column reading a column whose type changes)")
-			p.warn("table %s: generated column %q reads column %q, whose type changes; PostgreSQL cannot change the type under it, so it is dropped before the change and added back after it (destructive: its values are recomputed, it is placed last in the table, and privileges or comments on it are not kept)", dt.Identity, dc.Name, read)
+			p.warn("table %s: generated column %q reads column %q, whose type changes; PostgreSQL cannot change the type under it, so it is dropped before the change and added back after it (destructive: its values are recomputed, it is placed last in the table, and privileges or comments on it are not kept; the down file adds it back last as well)", dt.Identity, dc.Name, read)
 		}
 	}
 
@@ -1159,16 +1296,114 @@ func (p *v2Planner) planRebuilds() error {
 		}
 	}
 
-	// Views the plan leaves in place: out of the managed schemas, or not
-	// declared without --allow-destructive. Declared ones drop and are
-	// re-created around the table alterations.
-	if len(changed) == 0 {
+	return nil
+}
+
+// checkDependents refuses a plan whose type changes or column drops
+// (p.changed) something the plan does not handle depends on, and a plan
+// that drops a view something else depends on (dropViews: the views it
+// drops and re-creates, or drops). Live planning reads the dependencies
+// from the catalog; offline planning, which only has the planning base,
+// matches the definitions of the views that base records by their text.
+func (p *v2Planner) checkDependents(dropViews map[V2Identity]bool) error {
+	var refusals []string
+	if insp, ok := p.opts.Normalizer.(V2DependencyInspector); ok {
+		var err error
+		if refusals, err = p.catalogDependents(insp, dropViews); err != nil {
+			return err
+		}
+	} else {
+		refusals = p.textDependents(dropViews)
+	}
+	if len(refusals) == 0 {
+		return nil
+	}
+	sort.Strings(refusals)
+	return errors.New(strings.Join(refusals, "\n"))
+}
+
+// viewFix names the ways out for a view the plan leaves in place.
+func (p *v2Planner) viewFix(view V2Identity) (where, fix string) {
+	if p.scope[view.Schema] {
+		return "is not declared in the schema", "Declare the view in the schema (the plan then drops it and re-creates it around the change), or drop it: re-run with --allow-destructive, which drops views the schema does not declare" + p.flagScope()
+	}
+	return fmt.Sprintf("is in schema %q, which the schema document does not manage", view.Schema),
+		fmt.Sprintf("Drop it by hand before applying and re-create it after, or declare schema %q and the view in the schema (the plan then drops it and re-creates it around the change)", view.Schema)
+}
+
+const dependentsRefused = "PostgreSQL cannot change the type of, or drop, a column another object depends on, or drop a view another object depends on, so the plan would fail at apply and is refused"
+
+func (p *v2Planner) catalogDependents(insp V2DependencyInspector, dropViews map[V2Identity]bool) ([]string, error) {
+	var refusals []string
+	tables := make([]V2Identity, 0, len(p.changed))
+	for t := range p.changed {
+		tables = append(tables, t)
+	}
+	sort.Slice(tables, func(i, j int) bool { return tables[i].String() < tables[j].String() })
+	for _, table := range tables {
+		cols := make([]string, 0, len(p.changed[table]))
+		rowType := false
+		for c, what := range p.changed[table] {
+			cols = append(cols, c)
+			rowType = rowType || what == changedType
+		}
+		sort.Strings(cols)
+		deps, err := insp.ColumnDependents(p.ctx, table, cols, rowType)
+		if err != nil {
+			return nil, err
+		}
+		for _, d := range deps {
+			if d.Kind == "view" && dropViews[d.Identity] {
+				continue
+			}
+			subject := fmt.Sprintf("column %s.%s (%s)", table, d.Column, strings.TrimPrefix(strings.TrimPrefix(p.changed[table][d.Column], "whose "), "which "))
+			if d.Kind == "row-type column" {
+				subject = fmt.Sprintf("the row type of table %s (a column of it changes type)", table)
+			}
+			if d.Kind == "view" {
+				where, fix := p.viewFix(d.Identity)
+				refusals = append(refusals, fmt.Sprintf("view %s %s, so the plan leaves it in place, but it uses %s. %s. %s", d.Identity, where, subject, dependentsRefused, fix))
+				continue
+			}
+			refusals = append(refusals, fmt.Sprintf("%s is used by %s, which the schema does not describe. %s. Drop it by hand before applying and re-create it after", subject, d.Display, dependentsRefused))
+		}
+	}
+	views := make([]V2Identity, 0, len(dropViews))
+	for v := range dropViews {
+		views = append(views, v)
+	}
+	sort.Slice(views, func(i, j int) bool { return views[i].String() < views[j].String() })
+	for _, v := range views {
+		deps, err := insp.RelationDependents(p.ctx, v)
+		if err != nil {
+			return nil, err
+		}
+		for _, d := range deps {
+			if (d.Kind == "view" || d.Kind == "materialized view") && dropViews[d.Identity] {
+				continue
+			}
+			fix := "Drop it by hand before applying and re-create it after"
+			if d.Kind == "view" {
+				_, fix = p.viewFix(d.Identity)
+			}
+			refusals = append(refusals, fmt.Sprintf("view %s is dropped by this plan (to re-create it around the table changes, or because the schema does not declare it), but %s depends on it. %s. %s", v, d.Display, dependentsRefused, fix))
+		}
+	}
+	return refusals, nil
+}
+
+// textDependents is the offline check: a view of the planning base that
+// the plan leaves in place, and whose definition names both a changed
+// column and its table, refuses the plan. It is conservative (a view over
+// a same-named column of another table matches too); the base records
+// only the managed schemas' views.
+func (p *v2Planner) textDependents(dropViews map[V2Identity]bool) []string {
+	if len(p.changed) == 0 {
 		return nil
 	}
 	var refusals []string
 	for _, av := range p.actual.Views {
-		inScope := p.scope[av.Identity.Schema]
-		if inScope && (p.desiredViews[av.Identity] || p.opts.AllowDestructive) {
+		if dropViews[av.Identity] {
 			continue
 		}
 		idents, ok := sqlIdentifiers(av.Definition)
@@ -1177,7 +1412,7 @@ func (p *v2Planner) planRebuilds() error {
 			names[truncateIdentifier(ident)] = true
 		}
 		var reads []string
-		for table, cols := range changed {
+		for table, cols := range p.changed {
 			if ok && !names[table.Name] {
 				continue
 			}
@@ -1191,19 +1426,10 @@ func (p *v2Planner) planRebuilds() error {
 			continue
 		}
 		sort.Strings(reads)
-		fix := "Declare the view in the schema (the plan then drops it and re-creates it around the change), or drop it: re-run with --allow-destructive, which drops views the schema does not declare"
-		where := "is not declared in the schema"
-		if !inScope {
-			where = fmt.Sprintf("is in schema %q, which the schema document does not manage", av.Identity.Schema)
-			fix = fmt.Sprintf("Drop it by hand before applying and re-create it after, or declare schema %q and the view in the schema (the plan then drops it and re-creates it around the change)", av.Identity.Schema)
-		}
-		refusals = append(refusals, fmt.Sprintf("view %s %s, so the plan leaves it in place, but its definition names %s. PostgreSQL cannot change the type of, or drop, a column a view reads, so the plan would fail at apply and is refused. %s", av.Identity, where, strings.Join(reads, "; "), fix))
+		where, fix := p.viewFix(av.Identity)
+		refusals = append(refusals, fmt.Sprintf("view %s %s, so the plan leaves it in place, but its definition names %s. %s. %s", av.Identity, where, strings.Join(reads, "; "), dependentsRefused, fix))
 	}
-	if len(refusals) > 0 {
-		sort.Strings(refusals)
-		return errors.New(strings.Join(refusals, "\n"))
-	}
-	return nil
+	return refusals
 }
 
 // textReadsColumns returns the column (by its value in names) that
@@ -1232,19 +1458,69 @@ func textReadsColumns(text string, names map[string]string, self string) string 
 	return ""
 }
 
-// referencesAlteredColumn reports whether a foreign key references a
-// column of an existing table that this plan renames, retypes or drops and
-// adds back: a new table's foreign key onto it is added after the table
-// alterations.
+// referencesAlteredColumn reports whether a foreign key references an
+// existing table in a way the table alterations must settle first: a
+// column this plan adds, renames, retypes or drops and adds back, or a key
+// that does not exist unchanged in the database (added or changed by this
+// plan). A new table's foreign key onto it is added after the alterations.
 func (p *v2Planner) referencesAlteredColumn(ref V2FKReference) bool {
 	if !p.actualTables[ref.Table] {
 		return false
 	}
+	at := p.actual.Table(ref.Table)
 	for _, c := range ref.Columns {
 		if _, renamed := p.opts.Renames[ref.Table.String()+"."+c]; renamed {
 			return true
 		}
 		if p.retyped[ref.Table][c] != "" || p.rebuilt[ref.Table][c] != "" {
+			return true
+		}
+		if p.matchedActualName(ref.Table, at, c) == "" {
+			return true
+		}
+	}
+	return !p.liveKeyKept(ref.Table, ref.Columns)
+}
+
+// liveKeyKept reports whether the database already has a primary key,
+// unique constraint or plain unique index over exactly these (desired)
+// columns of a table, and the desired table keeps it with the same
+// definition.
+func (p *v2Planner) liveKeyKept(table V2Identity, cols []string) bool {
+	at, dt := p.actual.Table(table), p.desired.Table(table)
+	if at == nil || dt == nil {
+		return false
+	}
+	mapped := func(names []string) []string {
+		out := make([]string, len(names))
+		for i, n := range names {
+			out[i] = p.actualToDesiredName(table, n)
+		}
+		return out
+	}
+	for _, ac := range at.Constraints {
+		if ac.Type != "primary-key" && ac.Type != "unique" {
+			continue
+		}
+		acCols := mapped(ac.Columns)
+		if !sameColumnSetIn(cols, [][]string{acCols}) {
+			continue
+		}
+		dc := dt.Constraint(ac.Name)
+		if dc == nil && ac.Type == "primary-key" {
+			dc = dt.PrimaryKey()
+		}
+		if dc != nil && dc.Type == ac.Type && equalStringSlices(dc.Columns, acCols) &&
+			equalBoolPtrs(dc.Deferrable, ac.Deferrable) && equalBoolPtrs(dc.InitiallyDeferred, ac.InitiallyDeferred) {
+			return true
+		}
+	}
+	for _, ai := range at.Indexes {
+		aiCols := uniqueIndexColumns(ai)
+		if aiCols == nil || !sameColumnSetIn(cols, [][]string{mapped(aiCols)}) {
+			continue
+		}
+		if di := dt.Index(ai.Identity.Name); di != nil && equalStringSlices(uniqueIndexColumns(*di), mapped(aiCols)) && di.Method == ai.Method {
 			return true
 		}
 	}
@@ -1735,15 +2011,15 @@ func (p *v2Planner) planColumnAttributes(table V2Identity, dc, ac V2Column) erro
 					// No catalog oracle for this expression: the difference
 					// may be spelling only. Say so, and carry the unverified
 					// notes the refusal would otherwise drop.
-					fix := fmt.Sprintf("If the expression is unchanged, write it as %s spells it; if it changed, upgrade the server to PostgreSQL %d+, or replace the column explicitly in two steps: remove it from the schema and apply with --allow-destructive (its stored values are dropped), then add it back with the new expression (values are recomputed; a re-added column is placed last, so declare it last)",
-						p.baseNoun(), SetExpressionMinServerMajor)
+					fix := fmt.Sprintf("If the expression is unchanged, write it as %s spells it; if it changed, upgrade the server to PostgreSQL %d+, or replace the column explicitly in two steps: remove it from the schema and apply with --allow-destructive (its stored values are dropped), then add it back with the new expression (values are recomputed; a re-added column is placed last, so declare it last)%s",
+						p.baseNoun(), SetExpressionMinServerMajor, p.flagScope())
 					return fmt.Errorf(
 						"table %s: generated column %q could not be verified: the schema writes its expression %q and %s holds %q, and without a catalog comparison the difference may be spelling only. A real change needs ALTER COLUMN ... SET EXPRESSION (PostgreSQL %d+), which the connected PostgreSQL %d cannot run, so the plan is refused. %s\n%s",
 						table, dc.Name, dc.Generated.Expression, p.baseNoun(), ac.Generated.Expression, SetExpressionMinServerMajor, p.opts.ServerMajor, fix, p.unverifiedNotes())
 				}
 				return fmt.Errorf(
-					"table %s: generated column %q changes its expression, which needs ALTER COLUMN ... SET EXPRESSION (PostgreSQL %d+); the connected server is PostgreSQL %d, so the plan would fail. Upgrade the server to PostgreSQL %d+, or replace the column explicitly in two steps: remove it from the schema and apply with --allow-destructive (its stored values are dropped), then add it back with the new expression (values are recomputed; a re-added column is placed last, so declare it last)",
-					table, dc.Name, SetExpressionMinServerMajor, p.opts.ServerMajor, SetExpressionMinServerMajor)
+					"table %s: generated column %q changes its expression, which needs ALTER COLUMN ... SET EXPRESSION (PostgreSQL %d+); the connected server is PostgreSQL %d, so the plan would fail. Upgrade the server to PostgreSQL %d+, or replace the column explicitly in two steps: remove it from the schema and apply with --allow-destructive (its stored values are dropped), then add it back with the new expression (values are recomputed; a re-added column is placed last, so declare it last)%s",
+					table, dc.Name, SetExpressionMinServerMajor, p.opts.ServerMajor, SetExpressionMinServerMajor, p.flagScope())
 			}
 			p.warn("table %s: generated column %q changes its expression via ALTER COLUMN ... SET EXPRESSION (requires PostgreSQL %d+) — the table is rewritten to recompute values", table, dc.Name, SetExpressionMinServerMajor)
 			p.emit(
@@ -1957,17 +2233,25 @@ func (p *v2Planner) planConstraintChanges(table V2Identity, desired, actual *V2T
 			}
 			p.blockOnRename(table, v2CheckElement(name), fmt.Sprintf("check constraint %s is %s, and its down statement re-adds %q", name, verb, *ac.Expression), *ac.Expression)
 		}
-		dropPairs = append(dropPairs, v2StmtPair{
-			fmt.Sprintf("alter table %s drop constraint if exists %s", tq, quoteIdent(name)),
-			fmt.Sprintf("alter table %s add constraint %s %s", tq, quoteIdent(name), p.constraintFragmentFor(table, actual, name)),
-		})
+		pair := v2StmtPair{
+			up:   fmt.Sprintf("alter table %s drop constraint if exists %s", tq, quoteIdent(name)),
+			down: fmt.Sprintf("alter table %s add constraint %s %s", tq, quoteIdent(name), p.constraintFragmentFor(table, actual, name)),
+			name: name,
+		}
+		if ac := actual.Constraint(name); ac != nil {
+			pair.fk = ac.Type == "foreign-key"
+			if ac.Type == "primary-key" || ac.Type == "unique" {
+				pair.keyCols = ac.Columns
+			}
+		}
+		dropPairs = append(dropPairs, pair)
 	}
 	for _, con := range adds {
 		stmt, err := addV2ConstraintSQL(*desired, con)
 		if err != nil {
 			return nil, nil, err
 		}
-		addPairs = append(addPairs, v2StmtPair{stmt, fmt.Sprintf("alter table %s drop constraint if exists %s", tq, quoteIdent(con.Name))})
+		addPairs = append(addPairs, v2StmtPair{up: stmt, down: fmt.Sprintf("alter table %s drop constraint if exists %s", tq, quoteIdent(con.Name)), fk: con.Type == "foreign-key", name: con.Name})
 		if con.Type == "primary-key" {
 			p.warn("table %s: primary key %q will be (re)created — PostgreSQL scans the table and requires the key columns to be NOT NULL and unique", table, con.Name)
 		}
@@ -2104,7 +2388,7 @@ func (p *v2Planner) planIndexChanges(table V2Identity, desired, actual *V2Table)
 			if err != nil {
 				return nil, nil, err
 			}
-			createPairs = append(createPairs, v2StmtPair{stmt, fmt.Sprintf("drop index if exists %s", qualifiedNameSQL(di.Identity))})
+			createPairs = append(createPairs, v2StmtPair{up: stmt, down: fmt.Sprintf("drop index if exists %s", qualifiedNameSQL(di.Identity))})
 			continue
 		}
 		equal := p.indexEqualAfterRenames(table, di, *ai)
@@ -2124,8 +2408,8 @@ func (p *v2Planner) planIndexChanges(table V2Identity, desired, actual *V2Table)
 		if err != nil {
 			return nil, nil, err
 		}
-		dropPairs = append(dropPairs, v2StmtPair{fmt.Sprintf("drop index if exists %s", qualifiedNameSQL(di.Identity)), oldDDL})
-		createPairs = append(createPairs, v2StmtPair{newDDL, fmt.Sprintf("drop index if exists %s", qualifiedNameSQL(di.Identity))})
+		dropPairs = append(dropPairs, v2StmtPair{up: fmt.Sprintf("drop index if exists %s", qualifiedNameSQL(di.Identity)), down: oldDDL, name: ai.Identity.Name, keyCols: uniqueIndexColumns(*ai)})
+		createPairs = append(createPairs, v2StmtPair{up: newDDL, down: fmt.Sprintf("drop index if exists %s", qualifiedNameSQL(di.Identity))})
 		if equal {
 			p.warn("table %s: index %q names a generated column that is dropped and added back; it will be dropped and recreated with it", table, di.Identity.Name)
 		} else {
@@ -2145,10 +2429,50 @@ func (p *v2Planner) planIndexChanges(table V2Identity, desired, actual *V2Table)
 			return nil, nil, err
 		}
 		p.blockOnRename(table, v2IndexElement(ai.Identity.Name), fmt.Sprintf("index %s is dropped, and its down statement re-creates it as %q", ai.Identity.Name, oldDDL), indexTexts(ai)...)
-		dropPairs = append(dropPairs, v2StmtPair{fmt.Sprintf("drop index if exists %s", qualifiedNameSQL(ai.Identity)), oldDDL})
+		dropPairs = append(dropPairs, v2StmtPair{up: fmt.Sprintf("drop index if exists %s", qualifiedNameSQL(ai.Identity)), down: oldDDL, name: ai.Identity.Name, keyCols: uniqueIndexColumns(ai)})
 		p.warn("index %q on table %s will be dropped", ai.Identity.Name, table)
 	}
 	return dropPairs, createPairs, nil
+}
+
+// sameColumnSetIn reports whether cols, as a set, equals one of keys.
+func sameColumnSetIn(cols []string, keys [][]string) bool {
+	for _, k := range keys {
+		if len(k) != len(cols) {
+			continue
+		}
+		set := map[string]bool{}
+		for _, c := range k {
+			set[c] = true
+		}
+		all := true
+		for _, c := range cols {
+			if !set[c] {
+				all = false
+				break
+			}
+		}
+		if all {
+			return true
+		}
+	}
+	return false
+}
+
+// uniqueIndexColumns returns the key columns of a unique index a foreign
+// key can reference (no predicate, no expression key parts), or nil.
+func uniqueIndexColumns(idx V2Index) []string {
+	if !idx.Unique || idx.Where != nil {
+		return nil
+	}
+	cols := make([]string, 0, len(idx.Key))
+	for _, k := range idx.Key {
+		if k.Column == nil {
+			return nil
+		}
+		cols = append(cols, *k.Column)
+	}
+	return cols
 }
 
 // indexTouchesRebuilt reports whether a live index names a generated

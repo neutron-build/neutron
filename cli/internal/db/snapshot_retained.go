@@ -49,6 +49,16 @@ func (r RetainedObject) String() string {
 	return r.Kind + " " + r.Identity.String()
 }
 
+// flagDropsNote completes a refusal that recommends --allow-destructive:
+// with the flag, the plan drops every object it would leave in place, not
+// only the one the refusal names (Q12 review-1 F2).
+func flagDropsNote(retained []RetainedObject) string {
+	if len(retained) <= 1 {
+		return ""
+	}
+	return ". Note that --allow-destructive drops every object this plan leaves in place, which here is: " + RetainedList(retained) + "; declare in the schema what must stay before using it"
+}
+
 // RetainedList renders retained objects for messages.
 func RetainedList(objs []RetainedObject) string {
 	parts := make([]string, len(objs))
@@ -224,7 +234,7 @@ func carryRetained(base, desired *V2Document, bm V2DocumentModel, retained []Ret
 			entry := baseEntry("views", r.Identity)
 			def, _ := entry["definition"].(string)
 			if name := firstMentioned(def, renamedNames); name != "" {
-				return nil, fmt.Errorf("view %s is left in place, and its definition may reference column %q, which this plan renames — an offline plan cannot rewrite the definition, so the target snapshot could not record the view as the database keeps it; declare the view in the schema document, or drop it with --allow-destructive", r.Identity, name)
+				return nil, fmt.Errorf("view %s is left in place, and its definition may reference column %q, which this plan renames — an offline plan cannot rewrite the definition, so the target snapshot could not record the view as the database keeps it; declare the view in the schema document, or drop it with --allow-destructive%s", r.Identity, name, flagDropsNote(retained))
 			}
 			place("views", entry)
 		case "enum":
@@ -259,7 +269,7 @@ func carryRetained(base, desired *V2Document, bm V2DocumentModel, retained []Ret
 				}
 				for _, e := range exprs {
 					if name := firstMentioned(e, old); name != "" {
-						return nil, fmt.Errorf("index %s on table %s is left in place, and its expression or predicate may reference column %q, which this plan renames — an offline plan cannot rewrite it, so the target snapshot could not record the index as the database keeps it; declare the index in the schema document, or drop it with --allow-destructive", r.Identity, r.Table, name)
+						return nil, fmt.Errorf("index %s on table %s is left in place, and its expression or predicate may reference column %q, which this plan renames — an offline plan cannot rewrite it, so the target snapshot could not record the index as the database keeps it; declare the index in the schema document, or drop it with --allow-destructive%s", r.Identity, r.Table, name, flagDropsNote(retained))
 					}
 				}
 				if inc, ok := entry["include"]; ok {
@@ -297,7 +307,7 @@ func carryRetained(base, desired *V2Document, bm V2DocumentModel, retained []Ret
 				if g, ok := col["generated"].(map[string]any); ok && len(to) > 0 {
 					expr, _ := g["expression"].(string)
 					if name := firstMentioned(expr, sortedKeys(to)); name != "" {
-						return nil, fmt.Errorf("column %s.%s is left in place, and its generation expression may reference column %q, which this plan renames — an offline plan cannot rewrite it, so the target snapshot could not record the column as the database keeps it; declare the column in the schema document, or drop it with --allow-destructive", id, bc.Name, name)
+						return nil, fmt.Errorf("column %s.%s is left in place, and its generation expression may reference column %q, which this plan renames — an offline plan cannot rewrite it, so the target snapshot could not record the column as the database keeps it; declare the column in the schema document, or drop it with --allow-destructive%s", id, bc.Name, name, flagDropsNote(retained))
 					}
 				}
 				after[anchor] = append(after[anchor], rawCols[i])
@@ -328,7 +338,7 @@ func carryRetained(base, desired *V2Document, bm V2DocumentModel, retained []Ret
 	}
 	doc, err := ParseV2Document(raw)
 	if err != nil {
-		return nil, fmt.Errorf("recording the objects this plan leaves in place (%s) makes the target snapshot an invalid schema document: %w — declare them in the schema document, or drop them with --allow-destructive", RetainedList(retained), err)
+		return nil, fmt.Errorf("recording the objects this plan leaves in place (%s) makes the target snapshot an invalid schema document: %w — declare them in the schema document, or drop them with --allow-destructive%s", RetainedList(retained), err, flagDropsNote(retained))
 	}
 	// Re-read the canonical bytes, so the next plan from this document
 	// walks it in canonical order, exactly as when it is read from disk.
@@ -360,7 +370,7 @@ func undeclaredReference(root map[string]any, retained []RetainedObject) error {
 		if !schemas[target.Schema] {
 			what = "schema " + target.Schema + " and " + what
 		}
-		return fmt.Sprintf("declare %s in the schema document as they are in the database, or drop %s with --allow-destructive", what, object)
+		return fmt.Sprintf("declare %s in the schema document as they are in the database, or drop %s with --allow-destructive%s", what, object, flagDropsNote(retained))
 	}
 	table := func(id V2Identity) map[string]any {
 		for _, e := range asList(root["tables"]) {

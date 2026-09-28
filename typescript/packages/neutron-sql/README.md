@@ -150,28 +150,38 @@ old name while changing them, then rename). A live plan is refused the same
 way when the planner cannot copy the table to compare it (for example a
 check with a whole-row reference); the message gives the `ALTER TABLE ...
 RENAME COLUMN` to run by hand first.
-Statement order: constraints and indexes drop before the columns they name
-change type or are dropped, and are re-created after; a generated column
-drops before a column it reads; a new table's foreign key onto a column the
-plan renames or retypes is added after that change; and a down file re-creates
-dropped columns before their indexes and dropped tables before the foreign
-keys between them, so these plans apply and their down files revert.
+Statement order: foreign keys drop before the keys they reference and are
+added after them, in every table; constraints and indexes drop before the
+columns they name change type or are dropped, and are re-created after; a
+generated column drops before a column it reads; a new table's foreign key
+onto a column or key the plan adds, renames, retypes or changes is added
+after that change; and a down file re-creates dropped columns before their
+indexes and dropped tables before the foreign keys between them, so these
+plans apply and their down files revert.
 Changing the type of a column a stored generated column reads drops the
 generated column before the change and adds it back after it, with its
-indexes and constraints (PostgreSQL cannot change the type under it): the
-plan needs `--allow-destructive`, the values are recomputed, and the column is
-placed last. It is refused, with a three-migration path, when a foreign key
-the schema does not manage references the generated column.
-A view the plan leaves in place (not declared, or in a schema the document
-does not manage) whose definition names a column whose type changes or that
-is dropped refuses the plan, naming the view: declare it, so the planner drops
-and re-creates it around the change, or drop it (`--allow-destructive` drops
-undeclared views in the managed schemas). The check reads the view's text, so
-a view naming a same-named column of another table is refused too.
-Current limit: objects a schema document does not describe (materialized
-views, policies, triggers with column lists) that depend on a column whose
-type changes or that is dropped still fail at apply and roll back; drop them
-by hand first.
+indexes, constraints and the foreign keys onto it (PostgreSQL cannot change
+the type under it): the plan needs `--allow-destructive`, the values are
+recomputed, and the column is placed last; its down file adds it back last
+too, so the original column order is not restored. It is refused, with a
+three-migration path, when a foreign key the schema does not manage
+references the generated column. A refusal that suggests
+`--allow-destructive` lists every other object the flag would drop (it drops
+everything in the managed schemas the schema does not declare).
+Objects that depend on a column whose type changes or that is dropped, and
+that the plan does not handle, refuse the plan by name. `db push` and
+`migrate generate --mode live` read them from the catalog: views and
+materialized views (including a view over a function that returns the
+table's rows), functions with a `BEGIN ATOMIC` body, policies, triggers with
+a column list, rules, other tables' columns that store the table's row type,
+and anything that depends on a declared view the plan drops and re-creates.
+Declare such a view, so the planner drops and re-creates it around the
+change, or drop it (`--allow-destructive` drops undeclared views in the
+managed schemas); drop the other objects by hand before the change and
+re-create them after. `--mode snapshot` has no catalog: it checks the views
+the chain records by their text, which is conservative (a view naming a
+same-named column of another table is refused too), and objects the chain
+does not record still fail at apply and roll back.
 
 In `--mode snapshot`, removing a schema from the document stops the chain
 tracking its objects, and declaring it again plans `create table` for tables
