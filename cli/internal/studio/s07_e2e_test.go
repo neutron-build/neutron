@@ -263,3 +263,36 @@ func TestStudioS07DottedRenameTarget(t *testing.T) {
 		t.Fatalf("after the down, the catalog must equal the original:\n got: %s\nwant: %s", got, before)
 	}
 }
+
+// TestStudioS07MigrationManagedRefusalNamesRenames: on a database with
+// migration history, the apply refusal's migrate generate command carries
+// the review's --rename flags, so following it plans a rename (not an
+// added column).
+func TestStudioS07MigrationManagedRefusalNamesRenames(t *testing.T) {
+	fixture, _ := newS07StudioDB(t, "managed")
+	s07Exec(t, fixture,
+		`CREATE TABLE orders (id int PRIMARY KEY, note text)`,
+		`CREATE TABLE _neutron_migrations (version text PRIMARY KEY)`,
+		`INSERT INTO _neutron_migrations VALUES ('001')`,
+	)
+	ts, token := s06Server(t, map[string]*db.Client{"e2e": fixture})
+	defer ts.Close()
+	auth := map[string]string{sessionHeader: token, "Content-Type": "application/json"}
+	changes := `[{"op":"rename-column","schema":"public","table":"orders","from":"note","to":"remark"}]`
+	code, plan := s06Do(t, ts, http.MethodPost, "/api/schema/plan", `{"connectionId":"e2e","changes":`+changes+`}`, auth)
+	if code != http.StatusOK {
+		t.Fatalf("plan: %d %v", code, plan)
+	}
+	code, body := s06Do(t, ts, http.MethodPost, "/api/schema/apply",
+		fmt.Sprintf(`{"connectionId":"e2e","changes":%s,"planId":%q}`, changes, plan["planId"]), auth)
+	msg := fmt.Sprint(body["error"])
+	if code != http.StatusConflict || body["state"] != "migration-managed" {
+		t.Fatalf("apply = %d %v, want 409 migration-managed", code, body)
+	}
+	if want := "neutron migrate generate --schema target.schema.json --name <name> --rename 'public.orders.note>public.orders.remark'"; !strings.Contains(msg, want) {
+		t.Fatalf("the refusal must give the review's flags:\n got: %s\nwant: %s", msg, want)
+	}
+	if got := s07Text(t, fixture, `SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name = 'orders'`); got != "id,note" {
+		t.Fatalf("nothing is applied: orders columns %s", got)
+	}
+}

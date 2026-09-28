@@ -249,8 +249,11 @@ neutron db push --dry-run --schema target.schema.json \
 ```
 
 prints the same statements, and `neutron migrate generate --mode snapshot
---schema target.schema.json` from a `schema baseline` records the same
-operations (both are covered by an end-to-end test against the CLI binary).
+--schema target.schema.json` with the same `--rename` flags, from a
+`schema baseline`, records the same operations (both are covered by an
+end-to-end test against the CLI binary); without the flags a rename plans
+an added column. On a database with migration history, apply refuses (409)
+and gives that `migrate generate` command with the review's flags.
 
 Edits follow PostgreSQL's own semantics, made explicit: dropping a column
 drops the table's indexes and constraints involving it as whole objects
