@@ -191,6 +191,11 @@
       "name": "index-opclass-expression",
       "document": "invalid/index-opclass-expression.json",
       "code": "index-key"
+    },
+    {
+      "name": "view-second-statement",
+      "document": "invalid/view-second-statement.json",
+      "code": "invalid-value"
     }
   ],
   "v1": [
