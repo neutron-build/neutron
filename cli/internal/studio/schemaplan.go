@@ -231,12 +231,18 @@ func planFingerprint(p *StudioPlan) string {
 }
 
 // renameFlags renders the diff's rename map ("schema.table.new" -> old) as
-// the CLI's --rename values, sorted.
+// the CLI's --rename values, sorted. The key is split as the diff splits
+// it: schema and table up to the first two dots, the new column name is
+// the rest, so a new name containing a dot stays whole.
 func renameFlags(renames map[string]string) []string {
 	out := make([]string, 0, len(renames))
 	for key, from := range renames {
-		i := strings.LastIndexByte(key, '.')
-		out = append(out, key[:i+1]+from+">"+key)
+		parts := strings.SplitN(key, ".", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		table := parts[0] + "." + parts[1] + "."
+		out = append(out, table+from+">"+key)
 	}
 	sort.Strings(out)
 	return out

@@ -1322,7 +1322,7 @@ func columnNames(t V2Table) []string {
 func (p *v2Planner) actualToDesiredName(table V2Identity, actualName string) string {
 	for target, source := range p.opts.Renames {
 		if source == actualName && strings.HasPrefix(target, table.String()+".") {
-			return target[strings.LastIndexByte(target, '.')+1:]
+			return target[len(table.String())+1:]
 		}
 	}
 	return actualName

@@ -543,7 +543,9 @@ func parseRenames(flags []string) (map[string]string, error) {
 // parseRenamesV2 parses schema-qualified rename flags for schema document
 // v2: "schema.table.old>schema.table.new". Unqualified two-part values are
 // accepted only when unambiguous is non-nil and exactly one candidate table
-// matches.
+// matches. A qualified value splits at its first two dots, so a column name
+// may itself contain dots ("app.t.net>app.t.a.b" renames net to "a.b"), as
+// the planner splits its rename keys.
 func parseRenamesV2(flags []string, unambiguous func(table string) (string, bool)) (map[string]string, error) {
 	if len(flags) == 0 {
 		return nil, nil
@@ -556,7 +558,7 @@ func parseRenamesV2(flags []string, unambiguous func(table string) (string, bool
 		}
 		from := strings.TrimSpace(parts[0])
 		to := strings.TrimSpace(parts[1])
-		fromParts, toParts := strings.Split(from, "."), strings.Split(to, ".")
+		fromParts, toParts := strings.SplitN(from, ".", 3), strings.SplitN(to, ".", 3)
 		if len(fromParts) != len(toParts) {
 			return nil, fmt.Errorf("--rename %q mixes qualified and unqualified names", f)
 		}

@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/neutron-build/neutron/cli/internal/db"
 )
 
@@ -198,5 +200,66 @@ func TestStudioS07LegacyRowEndpointsRetired(t *testing.T) {
 	}
 	if got := s07Text(t, fixture, `SELECT string_agg(id || ':' || v, ',') FROM memo`); got != "1:a" {
 		t.Fatalf("memo = %s", got)
+	}
+}
+
+// TestStudioS07DottedRenameTarget: a designer rename whose new name
+// contains a dot maps the whole new name (not the text after its last
+// dot): no spurious churn, the down file reverts cleanly, and the CLI
+// flag names the table and both columns.
+func TestStudioS07DottedRenameTarget(t *testing.T) {
+	fixture, dbURL := newS07StudioDB(t, "dotted")
+	s07Exec(t, fixture,
+		`CREATE SCHEMA app`,
+		`CREATE TABLE app.t (id int PRIMARY KEY, net numeric NOT NULL, CONSTRAINT t_u UNIQUE (net))`,
+		`CREATE INDEX t_n ON app.t (net)`,
+		`INSERT INTO app.t VALUES (1, 5)`,
+	)
+	ctx := context.Background()
+	catalog := func() string { t.Helper(); return s07Text(t, fixture, q11StudioCatalog) }
+	before := catalog()
+	plan, err := PlanSchemaChanges(ctx, fixture, []SchemaChange{{Op: "rename-column", Schema: "app", Table: "t", From: "net", To: "a.b"}})
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if len(plan.Up) != 1 || plan.Up[0] != `alter table "app"."t" rename column "net" to "a.b"` {
+		t.Fatalf("a rename alone plans only the rename, got up:\n%s", strings.Join(plan.Up, "\n"))
+	}
+	if want := "app.t.net>app.t.a.b"; len(plan.RenameFlags) != 1 || plan.RenameFlags[0] != want {
+		t.Fatalf("rename flags = %v, want [%s]", plan.RenameFlags, want)
+	}
+	apply := func(stmts []string) error {
+		conn, err := pgx.Connect(ctx, dbURL)
+		if err != nil {
+			return err
+		}
+		defer conn.Close(ctx)
+		tx, err := conn.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		for _, s := range stmts {
+			if !db.HasExecutableSQL(s) {
+				continue
+			}
+			if _, err := tx.Exec(ctx, s); err != nil {
+				_ = tx.Rollback(ctx)
+				return fmt.Errorf("%s: %w", s, err)
+			}
+		}
+		return tx.Commit(ctx)
+	}
+	if err := apply(plan.Up); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	down := make([]string, 0, len(plan.Down))
+	for i := len(plan.Down) - 1; i >= 0; i-- {
+		down = append(down, plan.Down[i])
+	}
+	if err := apply(down); err != nil {
+		t.Fatalf("down: %v\ndown:\n%s", err, strings.Join(down, "\n"))
+	}
+	if got := catalog(); got != before {
+		t.Fatalf("after the down, the catalog must equal the original:\n got: %s\nwant: %s", got, before)
 	}
 }
