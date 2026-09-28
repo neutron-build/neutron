@@ -223,16 +223,18 @@ type tableMeta struct {
 
 // tableMetaSQL reads the table's columns, primary-key membership and key
 // position, type, generated/identity/default flags and the current role's
-// privileges from pg_catalog. Studio-owned introspection
-// (kept here rather than in internal/db): mutations must re-verify key
-// metadata at request time, independent of what the browser claims.
+// privileges from pg_catalog. Studio-owned introspection (kept here rather
+// than in internal/db): mutations must re-verify key metadata at request
+// time, independent of what the browser claims. Only a valid primary index
+// is a key: an invalid one (ALTER TABLE ONLY ... ADD PRIMARY KEY on a
+// partitioned table) enforces no uniqueness, so it cannot identify a row.
 const tableMetaSQL = `
 SELECT a.attname,
        COALESCE((
 	       SELECT u.ord
 	       FROM pg_catalog.pg_index i
 	       CROSS JOIN LATERAL pg_catalog.unnest(i.indkey) WITH ORDINALITY AS u(k, ord)
-	       WHERE i.indrelid = c.oid AND i.indisprimary AND u.k = a.attnum
+	       WHERE i.indrelid = c.oid AND i.indisprimary AND i.indisvalid AND u.k = a.attnum
        ), 0) AS key_pos,
        COALESCE(a.attidentity::text, ''),
        COALESCE(a.attgenerated::text, ''),

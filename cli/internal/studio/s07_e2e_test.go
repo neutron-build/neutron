@@ -146,3 +146,35 @@ func TestStudioS07RuleTablesRefuseEditsWith4xx(t *testing.T) {
 		}
 	})
 }
+
+// TestStudioS07InvalidPrimaryIndexIsNoKey: a primary key whose index is
+// invalid (ALTER TABLE ONLY on a partitioned table) enforces no
+// uniqueness, so it is not a row identity: the table reads as having no
+// usable key and edits are refused.
+func TestStudioS07InvalidPrimaryIndexIsNoKey(t *testing.T) {
+	fixture, _ := newS07StudioDB(t, "invalidpk")
+	s07Exec(t, fixture,
+		`CREATE TABLE pq (id int NOT NULL, v text) PARTITION BY RANGE (id)`,
+		`CREATE TABLE pq1 PARTITION OF pq FOR VALUES FROM (0) TO (100)`,
+		`ALTER TABLE ONLY pq ADD PRIMARY KEY (id)`,
+		`INSERT INTO pq VALUES (1, 'a'), (1, 'b')`,
+	)
+	if got := s07Text(t, fixture, `SELECT i.indisvalid::text FROM pg_index i WHERE i.indrelid = 'pq'::regclass AND i.indisprimary`); got != "false" {
+		t.Fatalf("fixture must hold an invalid primary index, indisvalid=%s", got)
+	}
+	ts, token := s06Server(t, map[string]*db.Client{"e2e": fixture})
+	defer ts.Close()
+	auth := map[string]string{sessionHeader: token, "Content-Type": "application/json"}
+	code, body := s06Do(t, ts, http.MethodGet, "/api/table?connectionId=e2e&schema=public&table=pq", "", auth)
+	if code != http.StatusOK {
+		t.Fatalf("read pq: %d %v", code, body)
+	}
+	if keys, _ := body["keyColumns"].([]any); len(keys) != 0 || body["readOnly"] != true || !strings.Contains(fmt.Sprint(body["readOnlyReason"]), "no primary key") {
+		t.Fatalf("an invalid primary index must not be the key: keyColumns %v readOnly %v reason %v", body["keyColumns"], body["readOnly"], body["readOnlyReason"])
+	}
+	binding, _ := body["binding"].(string)
+	code, body = s06Do(t, ts, http.MethodPost, "/api/table/v2/insert", fmt.Sprintf(`{"connectionId":"e2e","binding":%q,"schema":"public","table":"pq","values":{"id":2,"v":"c"}}`, binding), auth)
+	if code != http.StatusBadRequest || !strings.Contains(fmt.Sprint(body["error"]), "no primary key") {
+		t.Fatalf("insert on pq = %d %v, want 400 no primary key", code, body)
+	}
+}
