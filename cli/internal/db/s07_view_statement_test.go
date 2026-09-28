@@ -31,6 +31,9 @@ func TestS07ViewDefinitionSingleStatement(t *testing.T) {
 		`select 1 as "a;b"`,
 		"select $q$;drop table t;$q$ as x",
 		"select 1 as x -- ; not a separator",
+		"select 1 as a$x$",
+		"select 1 as a$x$, 2 as \u00e9$x$",
+		"select $$;$$ as x",
 	} {
 		if _, err := ParseV2Document([]byte(doc(def))); err != nil {
 			t.Errorf("single statement %q refused: %v", def, err)
@@ -41,6 +44,10 @@ func TestS07ViewDefinitionSingleStatement(t *testing.T) {
 		"select 1 as x;;",
 		"select 1 as x; select 2",
 		"select 'a' as x;/* c */select 2",
+		// S07 review-1 F2: '$' continues an identifier, so "a$x$" does not
+		// open a dollar quote that hides the separators.
+		"select 1 as a$x$; drop table if exists public.victim; select 1 as b$x$",
+		"select 1 as \u00e9$x$; drop table if exists public.victim; select 1 as b$x$",
 	} {
 		_, err := ParseV2Document([]byte(doc(def)))
 		if err == nil || !strings.Contains(err.Error(), "[invalid-value]") || !strings.Contains(err.Error(), "view definition must be a single statement") {

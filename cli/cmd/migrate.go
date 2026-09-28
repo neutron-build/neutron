@@ -126,6 +126,11 @@ one transaction and never carry the journal marker; a backfill that
 rewrites values must ship an IRREVERSIBLE down stub, which this runner
 refuses honestly instead of pretending to roll back.
 
+Statements run one at a time, each exactly as the checks before apply
+classified it: a statement the server would read as more than one command
+fails, and so does one that turns standard_conforming_strings off (the
+statements after it would be read differently than they were checked).
+
 Targets PostgreSQL. Nucleus migration runners live in the language SDKs and
 remain experimental. Databases with pre-protocol histories (older CLI, or
 Go/TS SDK integer-version tables) are refused until adopted once with

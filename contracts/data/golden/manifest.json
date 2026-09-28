@@ -196,6 +196,11 @@
       "name": "view-second-statement",
       "document": "invalid/view-second-statement.json",
       "code": "invalid-value"
+    },
+    {
+      "name": "view-dollar-identifier",
+      "document": "invalid/view-dollar-identifier.json",
+      "code": "invalid-value"
     }
   ],
   "v1": [

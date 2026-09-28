@@ -189,8 +189,13 @@ const checkSQLText = (s: string, at: string, expression: boolean): void => {
 // migration tokenizer it uses (cli/internal/db/migrate_apply.go): anything
 // significant after a top-level ";" is a second statement. Separators inside
 // '...' (with '' doubling), E'...' (backslash escapes), "..." identifiers,
-// $tag$...$tag$ bodies and -- or nested /* */ comments are text.
-const isWordChar = (c: string): boolean => /^[A-Za-z0-9_]$/.test(c);
+// $tag$...$tag$ bodies and -- or nested /* */ comments are text. As in
+// PostgreSQL's lexer, a word continues through "$" once started ("a$x$" is
+// one identifier), so only a "$" at a token start opens a dollar quote, and
+// a dollar-quote tag cannot start with a digit. Non-ASCII characters are
+// identifier characters (ident_start covers every byte >= 0x80).
+const isWordChar = (c: string): boolean => /^[A-Za-z0-9_\u0080-\uffff]$/.test(c);
+const isWordCont = (c: string): boolean => c === "$" || isWordChar(c);
 const hasSecondStatement = (s: string): boolean => {
   const n = s.length;
   let i = 0;
@@ -254,8 +259,12 @@ const hasSecondStatement = (s: string): boolean => {
       i = Math.min(j, n);
     } else if (c === "$") {
       if (significant()) return true;
+      // A tag is dolq_start dolq_cont*: it cannot start with a digit ($1 is
+      // a parameter).
       let j = i + 1;
-      while (j < n && isWordChar(s[j])) j++;
+      if (j < n && !/^[0-9]$/.test(s[j])) {
+        while (j < n && isWordChar(s[j])) j++;
+      }
       if (j < n && s[j] === "$") {
         const delim = s.slice(i, j + 1);
         const end = s.indexOf(delim, j + 1);
@@ -265,7 +274,7 @@ const hasSecondStatement = (s: string): boolean => {
       }
     } else if (isWordChar(c)) {
       if (significant()) return true;
-      while (i < n && isWordChar(s[i])) i++;
+      while (i < n && isWordCont(s[i])) i++;
     } else {
       if (significant()) return true;
       if (c === ";") separated = true;
@@ -1081,7 +1090,8 @@ for (const fx of manifest.valid) {
       views: [{ identity: { schema: "public", name: "v" }, managed: true, definition: def }], opaque: [] });
   for (const def of ["select 1 as x", " SELECT 1 AS x;", "select 1 as x;\n  ", "select 1 as x; -- trailing comment",
     "select 1 as x; /* trailing ; comment */", "select 'a;b' as x", "select E'a\\';b' as x", 'select 1 as "a;b"',
-    "select $q$;drop table t;$q$ as x", "select 1 as x -- ; not a separator"]) {
+    "select $q$;drop table t;$q$ as x", "select 1 as x -- ; not a separator",
+    "select 1 as a$x$", "select 1 as a$x$, 2 as \u00e9$x$", "select $$;$$ as x"]) {
     try {
       parseValidateHash(viewDoc(def));
       note(true, `view definition ${JSON.stringify(def)} accepted`);
@@ -1090,7 +1100,9 @@ for (const fx of manifest.valid) {
     }
   }
   for (const def of ['select 1 as x; drop table if exists "public"."other_app"', "select 1 as x;;", "select 1 as x; select 2",
-    "select 'a' as x;/* c */select 2"]) {
+    "select 'a' as x;/* c */select 2",
+    "select 1 as a$x$; drop table if exists public.victim; select 1 as b$x$",
+    "select 1 as \u00e9$x$; drop table if exists public.victim; select 1 as b$x$"]) {
     try {
       parseValidateHash(viewDoc(def));
       note(false, `view definition ${JSON.stringify(def)} rejected [invalid-value]`, "accepted instead");
