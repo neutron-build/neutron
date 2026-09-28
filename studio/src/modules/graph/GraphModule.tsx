@@ -17,14 +17,14 @@ interface GraphModuleProps {
 type ViewMode = 'table' | 'graph'
 
 // --- Graph data types ---
-interface GraphNode {
+export interface GraphNode {
   id: string
   label: string
   x: number
   y: number
 }
 
-interface GraphEdge {
+export interface GraphEdge {
   source: string
   target: string
   type: string
@@ -40,7 +40,7 @@ function sqlStr(s: string): string {
   return `'${s.replace(/'/g, "''")}'`
 }
 
-function colorForLabel(label: string, labelMap: Map<string, number>): string {
+export function colorForLabel(label: string, labelMap: Map<string, number>): string {
   if (!labelMap.has(label)) {
     labelMap.set(label, labelMap.size)
   }
@@ -48,7 +48,7 @@ function colorForLabel(label: string, labelMap: Map<string, number>): string {
 }
 
 // --- Force-directed layout ---
-function forceLayout(nodes: GraphNode[], edges: GraphEdge[], width: number, height: number): void {
+export function forceLayout(nodes: GraphNode[], edges: GraphEdge[], width: number, height: number): void {
   const ITERATIONS = 50
   const REPULSION = 5000
   const ATTRACTION = 0.005
@@ -132,7 +132,7 @@ function forceLayout(nodes: GraphNode[], edges: GraphEdge[], width: number, heig
 }
 
 // --- Parse query results into graph nodes and edges ---
-function parseGraphData(result: QueryResult): { nodes: GraphNode[]; edges: GraphEdge[] } | null {
+export function parseGraphData(result: QueryResult): { nodes: GraphNode[]; edges: GraphEdge[] } | null {
   const cols = result.columns.map(c => c.toLowerCase())
   const nodeMap = new Map<string, GraphNode>()
   const edges: GraphEdge[] = []
