@@ -29,6 +29,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -74,10 +75,11 @@ type q12Case struct {
 	target      []string // DDL of the desired state (pulled as the schema document)
 	data        []string
 	renames     []string
-	destructive bool // generate needs --allow-destructive
-	lossy       bool // rows do not survive the round trip
-	byName      bool // the plan moves a column last: compare columns by name
-	noSnapshot  bool // offline planning refuses the shape (Q11 rename rule)
+	destructive bool     // generate needs --allow-destructive
+	lossy       bool     // rows do not survive the round trip
+	byName      bool     // the plan moves a column last: compare columns by name
+	noSnapshot  bool     // offline planning refuses the shape (Q11 rename rule)
+	unmanaged   []string // schemas built in the target but left out of the schema document
 }
 
 var q12Cases = []q12Case{
@@ -162,6 +164,71 @@ var q12Cases = []q12Case{
 			`CREATE TABLE app.t (id int PRIMARY KEY, size app.size, CONSTRAINT t_sz CHECK (size <> 'xl'))`,
 			`CREATE INDEX t_sz_idx ON app.t (size) WHERE size <> 'x'`},
 		data: []string{`INSERT INTO app.t VALUES (1, 'm')`}},
+	// Q12 review-1 F1: a rebuilt generated column carries a key that a
+	// foreign key references, from a table sorting before it (c02), after
+	// it (c03), and from itself (c25). Foreign keys drop before any key and
+	// are added after every key.
+	{name: "rebuilt key referenced from a table sorting before", destructive: true,
+		live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net numeric, gross numeric GENERATED ALWAYS AS (net * 2) STORED, CONSTRAINT t_g UNIQUE (gross))`,
+			`CREATE TABLE app.a (id int PRIMARY KEY, g numeric, CONSTRAINT a_g FOREIGN KEY (g) REFERENCES app.t (gross))`},
+		target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net bigint, gross numeric GENERATED ALWAYS AS (net * 2) STORED, CONSTRAINT t_g UNIQUE (gross))`,
+			`CREATE TABLE app.a (id int PRIMARY KEY, g numeric, CONSTRAINT a_g FOREIGN KEY (g) REFERENCES app.t (gross))`},
+		data: []string{`INSERT INTO app.t (id, net) VALUES (1, 5)`, `INSERT INTO app.a VALUES (1, 10)`}},
+	{name: "rebuilt key referenced from a table sorting after", destructive: true,
+		live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net numeric, gross numeric GENERATED ALWAYS AS (net * 2) STORED, CONSTRAINT t_g UNIQUE (gross))`,
+			`CREATE TABLE app.z (id int PRIMARY KEY, g numeric, CONSTRAINT z_g FOREIGN KEY (g) REFERENCES app.t (gross))`},
+		target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net bigint, gross numeric GENERATED ALWAYS AS (net * 2) STORED, CONSTRAINT t_g UNIQUE (gross))`,
+			`CREATE TABLE app.z (id int PRIMARY KEY, g numeric, CONSTRAINT z_g FOREIGN KEY (g) REFERENCES app.t (gross))`},
+		data: []string{`INSERT INTO app.t (id, net) VALUES (1, 5)`, `INSERT INTO app.z VALUES (1, 10)`}},
+	{name: "rebuilt primary key with a self-referencing foreign key", destructive: true, byName: true,
+		live:   []string{`CREATE TABLE app.t (net numeric, gross numeric GENERATED ALWAYS AS (net * 2) STORED, parent numeric, CONSTRAINT t_pk PRIMARY KEY (gross), CONSTRAINT t_parent FOREIGN KEY (parent) REFERENCES app.t (gross))`},
+		target: []string{`CREATE TABLE app.t (net bigint, gross numeric GENERATED ALWAYS AS (net * 2) STORED, parent numeric, CONSTRAINT t_pk PRIMARY KEY (gross), CONSTRAINT t_parent FOREIGN KEY (parent) REFERENCES app.t (gross))`},
+		data:   []string{`INSERT INTO app.t (net, parent) VALUES (5, NULL)`, `INSERT INTO app.t (net, parent) VALUES (6, 10)`}},
+	// The three cross-table siblings that failed before Q12 too (review-1
+	// c07, c08, c13).
+	{name: "drop a foreign key and the unique it references",
+		live: []string{`CREATE TABLE app.a (id int PRIMARY KEY, code int, CONSTRAINT a_code UNIQUE (code))`,
+			`CREATE TABLE app.z (id int PRIMARY KEY, c int, CONSTRAINT z_c FOREIGN KEY (c) REFERENCES app.a (code))`},
+		target: []string{`CREATE TABLE app.a (id int PRIMARY KEY, code int)`, `CREATE TABLE app.z (id int PRIMARY KEY, c int)`},
+		data:   []string{`INSERT INTO app.a VALUES (1, 7)`, `INSERT INTO app.z VALUES (1, 7)`}},
+	{name: "add a unique and a foreign key onto it",
+		live: []string{`CREATE TABLE app.a (id int PRIMARY KEY, c int)`, `CREATE TABLE app.z (id int PRIMARY KEY, code int)`},
+		target: []string{`CREATE TABLE app.z (id int PRIMARY KEY, code int, CONSTRAINT z_code UNIQUE (code))`,
+			`CREATE TABLE app.a (id int PRIMARY KEY, c int, CONSTRAINT a_c FOREIGN KEY (c) REFERENCES app.z (code))`},
+		data: []string{`INSERT INTO app.z VALUES (1, 7)`, `INSERT INTO app.a VALUES (1, 7)`}},
+	{name: "widen a primary key and the foreign key onto it",
+		live: []string{`CREATE TABLE app.p (id int, k int, CONSTRAINT p_pkey PRIMARY KEY (id))`, `CREATE TABLE app.c (id int PRIMARY KEY, pid int, CONSTRAINT c_fk FOREIGN KEY (pid) REFERENCES app.p (id))`},
+		target: []string{`CREATE TABLE app.p (id int, k int NOT NULL, CONSTRAINT p_pkey PRIMARY KEY (id, k))`,
+			`CREATE TABLE app.c (id int PRIMARY KEY, pid int, pk int, CONSTRAINT c_fk FOREIGN KEY (pid, pk) REFERENCES app.p (id, k))`},
+		data: []string{`INSERT INTO app.p VALUES (1, 1)`, `INSERT INTO app.c VALUES (1, 1)`}},
+	// An unchanged foreign key onto a key that is replaced (here renamed):
+	// it is dropped and re-added around the key.
+	{name: "unchanged foreign key onto a changed key",
+		live: []string{`CREATE TABLE app.p (id int PRIMARY KEY, code int, CONSTRAINT p_code UNIQUE (code))`,
+			`CREATE TABLE app.a (id int PRIMARY KEY, c int, CONSTRAINT a_c FOREIGN KEY (c) REFERENCES app.p (code))`},
+		target: []string{`CREATE TABLE app.p (id int PRIMARY KEY, code int, CONSTRAINT p_code_key UNIQUE (code))`,
+			`CREATE TABLE app.a (id int PRIMARY KEY, c int, CONSTRAINT a_c FOREIGN KEY (c) REFERENCES app.p (code))`},
+		data: []string{`INSERT INTO app.p VALUES (1, 7)`, `INSERT INTO app.a VALUES (1, 7)`}},
+	// Q12 review-1 F5: a new table's foreign key onto a column (c20) or a
+	// unique (c21) the plan adds to an existing table.
+	{name: "new table references a column the plan adds",
+		live: []string{`CREATE TABLE app.p (id int PRIMARY KEY)`},
+		target: []string{`CREATE TABLE app.p (id int PRIMARY KEY, code int, CONSTRAINT p_code UNIQUE (code))`,
+			`CREATE TABLE app.n (id int PRIMARY KEY, c int, CONSTRAINT n_c FOREIGN KEY (c) REFERENCES app.p (code))`},
+		data: []string{`INSERT INTO app.p VALUES (1)`}},
+	{name: "new table references a unique the plan adds",
+		live: []string{`CREATE TABLE app.p (id int PRIMARY KEY, code int)`},
+		target: []string{`CREATE TABLE app.p (id int PRIMARY KEY, code int, CONSTRAINT p_code UNIQUE (code))`,
+			`CREATE TABLE app.n (id int PRIMARY KEY, c int, CONSTRAINT n_c FOREIGN KEY (c) REFERENCES app.p (code))`},
+		data: []string{`INSERT INTO app.p VALUES (1, 1)`}},
+	// Q12 review-1 F3: a view over a same-named table and column in
+	// another schema does not block the change (live: the catalog knows
+	// it reads rep.t). Offline, the text check is conservative and
+	// refuses it, so there is no snapshot leg.
+	{name: "view over a same-named column of another schema", noSnapshot: true, unmanaged: []string{"rep"},
+		live:   []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep int)`, `CREATE SCHEMA rep`, `CREATE TABLE rep.t (id int, keep int)`, `CREATE VIEW rep.v AS SELECT keep FROM rep.t`},
+		target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep bigint)`, `CREATE SCHEMA rep`, `CREATE TABLE rep.t (id int, keep int)`, `CREATE VIEW rep.v AS SELECT keep FROM rep.t`},
+		data:   []string{`INSERT INTO app.t VALUES (1, 2)`}},
 }
 
 // q12Pulled caches pulled documents and catalogs by their DDL: the three
@@ -194,6 +261,44 @@ func q12Target(t *testing.T, bin, path string, ddl []string, byName bool) string
 	catalog := q09Query(t, fx, q12CatalogSQL(byName))
 	q12Pulled.m[key] = [2]string{readFile(t, path), catalog}
 	return catalog
+}
+
+// q12Unmanage removes schemas (and their tables, views and enums) from a
+// pulled schema document: the target database has them, the document does
+// not manage them.
+func q12Unmanage(t *testing.T, path string, schemas []string) {
+	t.Helper()
+	if len(schemas) == 0 {
+		return
+	}
+	drop := map[string]bool{}
+	for _, s := range schemas {
+		drop[s] = true
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(readFile(t, path)), &doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"schemas", "tables", "views", "enums", "opaque"} {
+		list, _ := doc[key].([]any)
+		kept := []any{}
+		for _, e := range list {
+			m, _ := e.(map[string]any)
+			name, _ := m["name"].(string)
+			if id, ok := m["identity"].(map[string]any); ok {
+				name, _ = id["schema"].(string)
+			}
+			if !drop[name] {
+				kept = append(kept, e)
+			}
+		}
+		doc[key] = kept
+	}
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, path, string(raw))
 }
 
 func q12Flags(c q12Case) []string {
@@ -265,6 +370,7 @@ func TestQ12GenerateLiveRoundTrip(t *testing.T) {
 			work := t.TempDir()
 			desired := filepath.Join(work, "desired.json")
 			wantUp := q12Target(t, bin, desired, c.target, c.byName)
+			q12Unmanage(t, desired, c.unmanaged)
 			dbURL, fx := newM02CommandDB(t, "q12live")
 			q12Seed(t, fx, c)
 			query := func(sql string) string { return q09Query(t, fx, sql) }
@@ -314,6 +420,7 @@ func TestQ12DBPush(t *testing.T) {
 			work := t.TempDir()
 			desired := filepath.Join(work, "desired.json")
 			wantUp := q12Target(t, bin, desired, c.target, c.byName)
+			q12Unmanage(t, desired, c.unmanaged)
 			dbURL, fx := newM02CommandDB(t, "q12push")
 			q12Seed(t, fx, c)
 			args := append([]string{"db", "push", "--schema", desired}, q12Flags(c)...)
@@ -324,7 +431,9 @@ func TestQ12DBPush(t *testing.T) {
 				t.Fatalf("after the push, the catalog must equal the target's:\n got: %s\nwant: %s", got, wantUp)
 			}
 			code, out := runCLIProcess(t, bin, dbURL, "db", "push", "--dry-run", "--schema", desired)
-			if code != 0 || !strings.Contains(out, "Schema is already in sync") {
+			inSync := strings.Contains(out, "Schema is already in sync") ||
+				len(c.unmanaged) > 0 && strings.Contains(out, "No applicable changes") && !strings.Contains(out, "alter table")
+			if code != 0 || !inSync {
 				t.Fatalf("a second plan must be in sync (%d):\n%s", code, out)
 			}
 		})
@@ -347,8 +456,11 @@ func TestQ12Refusals(t *testing.T) {
 			live:   []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep int, other int)`, `CREATE VIEW app.v AS SELECT id, keep FROM app.t`, `CREATE VIEW app.w AS SELECT id, other FROM app.t`},
 			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep bigint, other int)`},
 			want: []string{
-				`view app.v is not declared in the schema, so the plan leaves it in place, but its definition names column app.t.keep, whose type changes. PostgreSQL cannot change the type of, or drop, a column a view reads, so the plan would fail at apply and is refused.`,
-				`Declare the view in the schema (the plan then drops it and re-creates it around the change), or drop it: re-run with --allow-destructive, which drops views the schema does not declare`,
+				`view app.v is not declared in the schema, so the plan leaves it in place, but `,
+				`column app.t.keep`,
+				`so the plan would fail at apply and is refused. Declare the view in the schema (the plan then drops it and re-creates it around the change), or drop it: re-run with --allow-destructive, which drops views the schema does not declare`,
+				// F2: the refusal names everything else the flag drops.
+				`Note that --allow-destructive also drops every object the schema does not declare, which here is: view app.v, view app.w; declare in the schema what must stay before using it`,
 			}},
 		// Shape 4, a view outside the managed schemas.
 		{name: "view in an unmanaged schema over a type change",
@@ -356,7 +468,7 @@ func TestQ12Refusals(t *testing.T) {
 			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep bigint)`},
 			flags:  []string{"--allow-destructive"},
 			want: []string{
-				`view rep.v is in schema "rep", which the schema document does not manage, so the plan leaves it in place, but its definition names column app.t.keep, whose type changes.`,
+				`view rep.v is in schema "rep", which the schema document does not manage, so the plan leaves it in place, but it uses column app.t.keep (type changes).`,
 				`Drop it by hand before applying and re-create it after, or declare schema "rep" and the view in the schema`,
 			}},
 		// Shape 4 for a dropped column (2BP01).
@@ -364,12 +476,41 @@ func TestQ12Refusals(t *testing.T) {
 			live:   []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep int, old int)`, `CREATE SCHEMA rep`, `CREATE VIEW rep.v AS SELECT id, old FROM app.t`},
 			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep int)`},
 			flags:  []string{"--allow-destructive"},
-			want:   []string{`view rep.v is in schema "rep", which the schema document does not manage, so the plan leaves it in place, but its definition names column app.t.old, which is dropped.`}},
+			want:   []string{`view rep.v is in schema "rep", which the schema document does not manage, so the plan leaves it in place, but it uses column app.t.old (is dropped).`}},
 		// Shape 3 needs the destructive acknowledgement.
 		{name: "type change under a generated column without acknowledgement", snapshot: true,
 			live:   []string{`CREATE TABLE app.t (id int PRIMARY KEY, net numeric, gross numeric GENERATED ALWAYS AS (net * 2) STORED)`},
 			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net bigint, gross numeric GENERATED ALWAYS AS (net * 2) STORED)`},
-			want:   []string{`table app.t: generated column "gross" reads column "net", whose type changes. PostgreSQL cannot change the type of a column a generated column reads, so the plan drops "gross" before the change and adds it back after it: its stored values are recomputed, it is placed last in the table, and privileges or comments on it are not kept. Re-run with --allow-destructive to acknowledge that`}},
+			want:   []string{`table app.t: generated column "gross" reads column "net", whose type changes. PostgreSQL cannot change the type of a column a generated column reads, so the plan drops "gross" before the change and adds it back after it: its stored values are recomputed, it is placed last in the table, and privileges or comments on it are not kept (the down file adds it back last as well). Re-run with --allow-destructive to acknowledge that (with this schema, --allow-destructive drops nothing else)`}},
+		// Q12 review-1 F2: the refusal names what else the flag drops.
+		{name: "type change under a generated column names what the flag also drops", snapshot: true,
+			live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net numeric, gross numeric GENERATED ALWAYS AS (net * 2) STORED, legacy text)`,
+				`CREATE TABLE app.audit (id int PRIMARY KEY, msg text)`, `CREATE INDEX t_legacy ON app.t (legacy)`},
+			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net bigint, gross numeric GENERATED ALWAYS AS (net * 2) STORED, legacy text)`},
+			want:   []string{`Re-run with --allow-destructive to acknowledge that. Note that --allow-destructive also drops every object the schema does not declare, which here is: index app.t_legacy, table app.audit; declare in the schema what must stay before using it`}},
+		// Q12 review-1 F4: dependencies the view text does not show, read
+		// from the catalog (live only; offline plans have no catalog).
+		{name: "view over a function returning the table's rows",
+			live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep int, other int)`,
+				`CREATE FUNCTION app.f() RETURNS SETOF app.t LANGUAGE sql AS 'select * from app.t'`, `CREATE VIEW app.v AS SELECT * FROM app.f()`},
+			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep bigint, other int)`},
+			want:   []string{`view app.v is not declared in the schema, so the plan leaves it in place, but it uses column app.t.keep (type changes).`}},
+		{name: "unmanaged view over a declared view",
+			live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep int)`, `CREATE VIEW app.v AS SELECT id, keep FROM app.t`,
+				`CREATE SCHEMA rep`, `CREATE VIEW rep.w AS SELECT id, keep FROM app.v`},
+			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep bigint)`, `CREATE VIEW app.v AS SELECT id, keep FROM app.t`},
+			want:   []string{`view app.v is dropped by this plan (to re-create it around the table changes, or because the schema does not declare it), but view rep.w depends on it.`, `Drop it by hand before applying and re-create it after, or declare schema "rep" and the view in the schema`}},
+		{name: "BEGIN ATOMIC function over the column",
+			live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep int)`, `CREATE SCHEMA rep`,
+				`CREATE FUNCTION rep.g(n int) RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT keep FROM app.t WHERE id = n; END`},
+			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep bigint)`},
+			want:   []string{`column app.t.keep (type changes) is used by function rep.g(integer), which the schema does not describe.`, `Drop it by hand before applying and re-create it after`}},
+		{name: "materialized view and row-type column",
+			live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep int)`, `CREATE SCHEMA rep`,
+				`CREATE MATERIALIZED VIEW rep.m AS SELECT keep FROM app.t`, `CREATE TABLE rep.u (x app.t)`},
+			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep bigint)`},
+			want: []string{`column app.t.keep (type changes) is used by materialized view rep.m, which the schema does not describe.`,
+				`the row type of table app.t (a column of it changes type) is used by column rep.u.x (it stores the row type of app.t)`}},
 		// Shape 3 with a foreign key the plan does not manage onto the
 		// generated column.
 		{name: "type change under a referenced generated column",
