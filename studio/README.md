@@ -423,8 +423,6 @@ published CLI targets) and onboarding on Linux.
     constraint is on the renamed column. Avoid dots in names.
   - On a table whose `AFTER` trigger updates the row it fired for, two edits
     of one row in one batch conflict (409). Commit them in separate batches.
-  - The legacy `/api/table/update` and `/api/table/delete` endpoints report
-    refusals as HTTP 200 with an `error` field.
   - The CDC and Streams modules have form labels that name no control.
   - The MCP server's read-only default is best-effort on Nucleus (see
     `neutron mcp` in the CLI reference).

@@ -180,8 +180,6 @@ func (s *Server) routes() (*http.ServeMux, error) {
 	mux.HandleFunc("/api/table/v2/export/download", s.handleTableExportDownloadV2)
 	mux.HandleFunc("/api/table/v2/import/batch", s.handleTableImportBatchV2)
 	mux.HandleFunc("/api/table/v2/import/outcome", s.handleTableImportOutcomeV2)
-	mux.HandleFunc("/api/table/update", s.handleTableRowUpdate)
-	mux.HandleFunc("/api/table/delete", s.handleTableRowDelete)
 	mux.HandleFunc("/api/table/fks", s.handleTableFKs)
 	mux.HandleFunc("/api/columns", s.handleColumns)
 	mux.HandleFunc("/api/ddl", s.handleDDL)
@@ -190,6 +188,12 @@ func (s *Server) routes() (*http.ServeMux, error) {
 	mux.HandleFunc("/api/saved-queries/", s.handleSavedQuery)
 	mux.HandleFunc("/api/blob/upload", s.handleBlobUpload)
 	mux.HandleFunc("/api/blob/", s.handleBlob)
+	// Any other /api/ path is not an endpoint (for example the retired
+	// /api/table/update and /api/table/delete): answer 404, never the SPA's
+	// index.html with 200.
+	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, http.StatusNotFound, "no such Studio API endpoint: "+r.URL.Path)
+	})
 
 	// SPA static files
 	distFS, err := fs.Sub(Dist, "dist")

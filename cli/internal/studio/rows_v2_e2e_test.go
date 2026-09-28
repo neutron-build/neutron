@@ -1061,17 +1061,6 @@ func TestStudioRowProtocolV2E2E(t *testing.T) {
 		if got := textOracle(`SELECT string_agg(val, ',' ORDER BY id) FROM neighbours`); got != "even,odd-edited" {
 			t.Errorf("neighbours = %q, want even,odd-edited", got)
 		}
-		// The interim B04 endpoint decodes numbers exactly too (it used to
-		// round 9007199254740993 onto 9007199254740992).
-		req := httptest.NewRequest(http.MethodPost, "/api/table/update", strings.NewReader(
-			`{"connectionId":"e2e","schema":"public","table":"neighbours","pkColumn":"id","pkValue":9007199254740993,"column":"val","value":"interim"}`))
-		req.Header.Set("Origin", "http://localhost:59999")
-		req.Header.Set(sessionHeader, s.sessionToken)
-		rec := httptest.NewRecorder()
-		s.handleTableRowUpdate(rec, req)
-		if got := textOracle(`SELECT string_agg(val, ',' ORDER BY id) FROM neighbours`); got != "even,interim" {
-			t.Errorf("interim precision: neighbours = %q (response %s), want even,interim", got, rec.Body.String())
-		}
 	})
 
 	t.Run("uuid and enum keys address exactly one row", func(t *testing.T) {
