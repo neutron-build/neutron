@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import type { QueryResult } from '../../lib/types'
 
 // Tests for GraphModule utility functions: forceLayout, parseGraphData, colorForLabel
@@ -313,15 +313,30 @@ describe('GraphModule — forceLayout', () => {
     expect(nodes[0].y).toBeGreaterThan(0)
   })
 
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  // Seeds forceLayout's random initial placement with a fixed sequence.
+  const seedRandom = (values: number[]) => {
+    let i = 0
+    vi.spyOn(Math, 'random').mockImplementation(() => values[i++ % values.length])
+  }
+
   it('should separate two unconnected nodes', () => {
+    // The initial placement is random; this seed stacks the two nodes on
+    // one vertical line, so repulsion separates them in y only. The
+    // assertion is on their distance, not on one axis (an x-only check
+    // failed whenever the placement happened to align them).
+    seedRandom([0.5, 0.49, 0.5, 0.51])
     const nodes: GraphNode[] = [
       { id: 'n1', label: 'A', x: 400, y: 300 },
       { id: 'n2', label: 'B', x: 401, y: 300 },
     ]
     forceLayout(nodes, [], 800, 600)
     // Repulsion should push them apart
-    const dx = Math.abs(nodes[0].x - nodes[1].x)
-    expect(dx).toBeGreaterThan(10)
+    const dist = Math.hypot(nodes[0].x - nodes[1].x, nodes[0].y - nodes[1].y)
+    expect(dist).toBeGreaterThan(10)
   })
 
   it('should keep nodes within bounds', () => {
