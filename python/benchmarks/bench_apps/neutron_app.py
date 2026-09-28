@@ -1,4 +1,4 @@
-"""neutron-py benchmark app.
+"""neutron-framework benchmark app.
 
 Two measured configurations, selected by NEUTRON_BENCH_STACK at import:
 

@@ -83,7 +83,7 @@ jobs:
         working-directory: conformance
 
   build:
-    # Build and validate the neutron-py distribution. Publish deliberately NOT
+    # Build and validate the neutron-framework distribution. Publish deliberately NOT
     # here: releasing is done locally by design (2FA/OTP), so this job stops at
     # proving the sdist and wheel are buildable and twine-clean.
     name: Build distribution

@@ -2,7 +2,7 @@
 
 ``FastAPI()`` as it ships (docs/openapi routes present but not measured).
 The mutate body is validated through a pydantic model, which is FastAPI's
-idiomatic request path and neutron-py's as well.
+idiomatic request path and neutron-framework's as well.
 """
 
 from fastapi import FastAPI, Request

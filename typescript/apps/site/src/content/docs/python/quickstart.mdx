@@ -6,14 +6,14 @@ description: Build a Python API server in minutes.
 ## Install
 
 ```bash
-pip install neutron-py
+pip install neutron-framework
 ```
 
 Or with extras:
 
 ```bash
-pip install "neutron-py[ai]"   # AI providers, agents, RAG
-pip install "neutron-py[all]"  # every extra
+pip install "neutron-framework[ai]"   # AI providers, agents, RAG
+pip install "neutron-framework[all]"  # every extra
 ```
 
 The full set is `ai`, `crypto`, `granian`, `rich`, `all` — plus `test` for
@@ -30,8 +30,7 @@ python3 -m venv .venv
 neutron dev
 ```
 
-The generated `pyproject.toml` installs `neutron-py` from the Neutron
-repository (`git+https://github.com/neutron-build/neutron.git#subdirectory=python`).
+The generated `pyproject.toml` installs `neutron-framework` from PyPI.
 `neutron dev` runs `python -m neutron dev app.main:app` with the project's
 `.venv`, on `NEUTRON_PORT` (default 8000).
 

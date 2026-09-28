@@ -16,7 +16,7 @@ export default function PythonPage() {
       { label: "Runtime", value: "Python 3.11+, Starlette, and Uvicorn" },
       { label: "Validation", value: "Pydantic v2 request and configuration models" },
       { label: "Data", value: "Async PostgreSQL-wire access through asyncpg" },
-      { label: "Package", value: "neutron-py" },
+      { label: "Package", value: "neutron-framework" },
     ]}
   />;
 }

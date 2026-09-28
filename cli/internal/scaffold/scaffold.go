@@ -65,7 +65,7 @@ func sdkFor(lang detect.Language) (sdk, cli Dependency) {
 	case detect.Go:
 		sdk = Dependency{Name: "github.com/neutron-build/neutron/go", Version: "v0.1.0"}
 	case detect.Python:
-		sdk = Dependency{Name: "neutron-py", Source: "git+" + Repo + ".git", Subdir: "python"}
+		sdk = Dependency{Name: "neutron-framework", Version: ">=0.1.0,<0.2.0"}
 	case detect.TypeScript:
 		sdk = Dependency{Name: "@neutron-build/core", Version: "^0.2.2"}
 		cli = Dependency{Name: "@neutron-build/cli", Version: "^0.2.3"}

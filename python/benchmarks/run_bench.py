@@ -1,4 +1,4 @@
-"""ASGI benchmark orchestrator: neutron-py vs FastAPI, Starlette, Litestar.
+"""ASGI benchmark orchestrator: neutron-framework vs FastAPI, Starlette, Litestar.
 
 Measures the same eight scenarios as the TypeScript harness
 (``typescript/benchmarks/run-comparison.mjs``), with the same client
@@ -364,7 +364,7 @@ def provenance() -> dict:
         },
         "python": sys.version.split()[0],
         "packages": {
-            "neutron-py": ver("neutron-py"),
+            "neutron-framework": ver("neutron-framework"),
             "starlette": ver("starlette"),
             "fastapi": ver("fastapi"),
             "litestar": ver("litestar"),

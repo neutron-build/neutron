@@ -2,7 +2,7 @@
 
 ``Litestar()`` as it ships (openapi routes at /schema/* present but not
 measured). POST handlers force status_code=200 for parity with the other
-apps (Litestar, like neutron-py, defaults POST to 201).
+apps (Litestar, like neutron-framework, defaults POST to 201).
 """
 
 from litestar import Litestar, Request, Response, get, post
