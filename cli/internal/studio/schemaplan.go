@@ -262,6 +262,22 @@ func cliEquivalent(p *StudioPlan) string {
 	return strings.Join(parts, " ")
 }
 
+// migrateGenerateEquivalent is the migrate generate command that records
+// the reviewed plan as a migration file: the same --rename flags and, for
+// explicit drops, --allow-destructive, as cliEquivalent gives db push.
+func migrateGenerateEquivalent(p *StudioPlan) string {
+	parts := []string{"neutron", "migrate", "generate", "--schema", "target.schema.json", "--name", "<name>"}
+	if p != nil {
+		for _, f := range p.RenameFlags {
+			parts = append(parts, "--rename", shellQuote(f))
+		}
+		if p.explicitDrops {
+			parts = append(parts, "--allow-destructive")
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
 // shellQuote single-quotes a POSIX shell word.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
@@ -926,8 +942,15 @@ func (s *Server) handleSchemaApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if has {
+		// The command carries the review's flags: without --rename a
+		// designer rename would plan an added column. A change set that
+		// does not plan gets the command without them.
+		var reviewed *StudioPlan
+		if plan, err := PlanSchemaChanges(r.Context(), client, req.Changes); err == nil {
+			reviewed = plan
+		}
 		writeJSON(w, http.StatusConflict, map[string]any{
-			"error": "this database has a migration history (_neutron_migrations): schema changes belong in migration files, exactly like `neutron db push` refuses here. Download the target document and run `neutron migrate generate --schema target.schema.json --name <name>`, then `neutron migrate`. Nothing was applied.",
+			"error": "this database has a migration history (_neutron_migrations): schema changes belong in migration files, exactly like `neutron db push` refuses here. Download the target document and run `" + migrateGenerateEquivalent(reviewed) + "`, then `neutron migrate`. Nothing was applied.",
 			"state": "migration-managed",
 		})
 		return
