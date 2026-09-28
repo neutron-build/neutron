@@ -24,6 +24,14 @@ cd my-app && npm run dev
 
 Full guide: **[neutron.build/docs](https://neutron.build/docs)**.
 
+For Python, install the published framework directly:
+
+```bash
+pip install neutron-framework
+```
+
+The package imports as `neutron`. See the [Python quickstart](https://neutron.build/docs/python/quickstart).
+
 ## Why Neutron
 
 - **8 languages, one contract.** TypeScript, Rust, Go, Python, Elixir, Zig, Julia, and Mojo. The six web-framework SDKs (TypeScript, Rust, Go, Python, Elixir, Zig) implement the same [framework contract](./FRAMEWORK_CONTRACT.md) — RFC 7807 errors, a standard middleware order, `GET /health`, graceful shutdown — while the code stays idiomatic in each language. A language-agnostic conformance matrix in [`conformance/`](./conformance) verifies this live: **all six booted SDKs pass 12/12 dimensions** (Go, Rust, Python, TypeScript, Elixir, Zig — measured 2026-08-22). Julia (scientific computing) and Mojo (ML) are client libraries, not web SDKs.
@@ -96,7 +104,7 @@ pnpm install && pnpm test
 go build ./... && go test ./...
 
 # Python
-pip install -e ".[dev]" && pytest
+cd python && pip install -e ".[test]" && pytest
 ```
 
 See [AGENTS.md](./AGENTS.md) for contributor and AI-agent guidance, and [CLAUDE.md](./CLAUDE.md) for the full ecosystem map. Each package directory has its own README.

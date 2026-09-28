@@ -1,6 +1,6 @@
 # Python ASGI Benchmark Protocol
 
-Measures `neutron-py` against its real peer set — **FastAPI, Starlette,
+Measures `neutron-framework` against its real peer set — **FastAPI, Starlette,
 Litestar** — on the same eight scenarios the TypeScript harness uses
 (`typescript/benchmarks/run-comparison.mjs`), with the same client
 (autocannon), so the two suites share vocabulary and scenario shapes.
@@ -12,7 +12,7 @@ Litestar** — on the same eight scenarios the TypeScript harness uses
     overhead on top of the Starlette it wraps)
   - `neutron-default` — `App(middleware=default_stack())`, the documented
     production posture: a uuid4 request-id plus a structlog event per request
-  - `starlette` — bare Starlette, the floor both neutron-py and FastAPI sit on
+  - `starlette` — bare Starlette, the floor both neutron-framework and FastAPI sit on
   - `fastapi` — `FastAPI()` defaults, pydantic-validated body
   - `litestar` — `Litestar()` defaults, pydantic body via DTO
 - Scenarios (exact ports of the TS routes; see `bench_apps/common.py` for the

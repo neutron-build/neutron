@@ -1,7 +1,7 @@
 """Bare Starlette benchmark app — the floor of the comparison.
 
 Routes only, no user middleware, JSON bodies parsed by hand. This is
-Starlette as it ships; it is also the layer neutron-py and FastAPI are
+Starlette as it ships; it is also the layer neutron-framework and FastAPI are
 built on, so neutron-vs-starlette and fastapi-vs-starlette isolate each
 framework's added per-request cost.
 """

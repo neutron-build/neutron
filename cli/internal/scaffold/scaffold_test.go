@@ -45,6 +45,14 @@ func TestScaffoldPython(t *testing.T) {
 		}
 	}
 
+	project, err := os.ReadFile(filepath.Join(dir, "test-app/pyproject.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(project), `"neutron-framework>=0.1.0,<0.2.0"`) {
+		t.Errorf("Python scaffold should install the published SDK from PyPI: %s", project)
+	}
+
 	// Verify neutron.toml contents
 	data, _ := os.ReadFile(filepath.Join(dir, "test-app/neutron.toml"))
 	if len(data) == 0 {

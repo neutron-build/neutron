@@ -30,7 +30,7 @@ mdurl==0.1.2
 msgspec==0.21.1
 multidict==6.7.1
 multipart==2.0.0
-# neutron-py itself is installed editable from this repo, not pinned here:
+# neutron-framework itself is installed editable from this repo, not pinned here:
 #   uv pip install -e ../[crypto]
 # The line that used to sit here was an absolute `file:///Users/...` URL
 # captured by `pip freeze`, which made this file unusable on any machine but
