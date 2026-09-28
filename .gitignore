@@ -227,6 +227,15 @@ Cargo.lock
 
 uv.lock
 
+# Go CLI build output. `go build` in cli/ names the binary after the module
+# (`cli`); the Makefiles write `bin/neutron`; the Studio scripts and the
+# release checklist build `cli/neutron`. Release archives come from
+# cli/scripts/package.sh, never from a committed binary.
+cli/cli
+cli/neutron
+cli/neutron-cli
+cli/bin/
+
 # Conformance executor build output. `go build ./...` in the executor directory
 # drops a binary named after its module; it is a 10 MB artifact of running the
 # suite, not part of it.
