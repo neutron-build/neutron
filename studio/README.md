@@ -407,7 +407,9 @@ published CLI targets) and onboarding on Linux.
 - **Read-only tables.** A table is read-only, with the reason shown, when it
   has no primary key, when a key column's type cannot be compared exactly,
   when a foreign table is among its inheritance children, or when the
-  connection exposes no row versions (`xmin`).
+  connection exposes no row versions (`xmin`). A write that a rule
+  (`CREATE RULE … DO INSTEAD / DO ALSO`) on the table rewrites is refused
+  with HTTP 400 naming the rule; writes no rule covers stay editable.
 - **Recovery limits.** A revert is refused where the inverse cannot be exact
   ([Atomic commits](#atomic-commits-and-retry-outcomes-s02)). Commit
   outcomes live in the Studio process: after a restart, earlier operation
@@ -417,8 +419,6 @@ published CLI targets) and onboarding on Linux.
   - A rename whose new name contains a dot is mis-mapped: the review's
     `--rename` flag is wrong, and the down statement fails when an index or
     constraint is on the renamed column. Avoid dots in names.
-  - Tables with `DO INSTEAD` or `DO ALSO` rules refuse every edit with HTTP
-    502. Nothing is applied; the status should be a 4xx.
   - On a table whose `AFTER` trigger updates the row it fired for, two edits
     of one row in one batch conflict (409). Commit them in separate batches.
   - A primary key whose index is invalid (`ALTER TABLE ONLY … ADD PRIMARY
