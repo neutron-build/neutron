@@ -42,6 +42,10 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- **Every package requires Node.js 22 or later** (`engines.node` is
+  `">=22"`; it was `">=20"`). Node 20 reached end of life on 2026-04-30,
+  and CI runs 22 and 24.
+
 - **`dev` and `start` read `NEUTRON_PORT` / `NEUTRON_HOST`**
   (FRAMEWORK_CONTRACT.md §6). Precedence: `--port`/`--host` > env >
   `neutron.config` `server.port`/`server.host` > default (3000; `start` binds

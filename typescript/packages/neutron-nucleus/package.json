@@ -108,7 +108,7 @@
     "access": "public"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "optionalDependencies": {
     "pg": "^8.11.0"
