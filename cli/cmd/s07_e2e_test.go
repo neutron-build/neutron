@@ -254,3 +254,63 @@ func TestS07UnsluggedPlanNameNamesTheFix(t *testing.T) {
 		t.Fatalf("t columns %s", got)
 	}
 }
+
+// TestS07IncludeOrderIsNotAChange: an index whose INCLUDE list the
+// database holds in another order than the document plans nothing (Q10
+// review-2 INFO 3). PostgreSQL gives INCLUDE columns no order semantics
+// (non-key payload, disregarded for search and uniqueness), and the
+// contract's canonical form sorts the list. A different set still
+// rebuilds the index.
+func TestS07IncludeOrderIsNotAChange(t *testing.T) {
+	bin := buildCLIBinary(t)
+	dbURL, fx := newM02CommandDB(t, "s07inc")
+	if err := fx.Exec(context.Background(), `CREATE SCHEMA app; CREATE TABLE app.t (id int PRIMARY KEY, a int, b int); CREATE INDEX t_inc_idx ON app.t (id) INCLUDE (b, a)`); err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir()
+	pulled := filepath.Join(work, "pulled.json")
+	run := func(args ...string) (int, string) {
+		t.Helper()
+		return runCLIProcess(t, bin, dbURL, args...)
+	}
+	if code, out := run("schema", "pull", "--out", pulled); code != 0 {
+		t.Fatalf("pull (%d):\n%s", code, out)
+	}
+	withInclude := func(name string, include ...string) string {
+		t.Helper()
+		doc, err := db.ParseV2Document(mustReadFile(t, pulled))
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := db.ModelFromRoot(doc.Root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for ti := range m.Tables {
+			for ii := range m.Tables[ti].Indexes {
+				if m.Tables[ti].Indexes[ii].Identity.Name == "t_inc_idx" {
+					m.Tables[ti].Indexes[ii].Include = include
+				}
+			}
+		}
+		root, err := db.RootFromModel(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := json.Marshal(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(work, name)
+		writeFile(t, path, string(raw))
+		return path
+	}
+	for _, doc := range []string{pulled, withInclude("ab.json", "a", "b"), withInclude("ba.json", "b", "a")} {
+		if code, out := run("db", "push", "--dry-run", "--schema", doc); code != 0 || !strings.Contains(out, "in sync") || strings.Contains(out, "t_inc_idx") {
+			t.Fatalf("%s: an INCLUDE order difference must plan nothing (%d):\n%s", filepath.Base(doc), code, out)
+		}
+	}
+	if code, out := run("db", "push", "--dry-run", "--schema", withInclude("a.json", "a")); code != 0 || !strings.Contains(out, `create index "t_inc_idx"`) || !strings.Contains(out, `include ("a")`) {
+		t.Fatalf("a different INCLUDE set must rebuild the index (%d):\n%s", code, out)
+	}
+}

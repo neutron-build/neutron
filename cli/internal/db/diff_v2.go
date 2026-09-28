@@ -1789,7 +1789,7 @@ func (p *v2Planner) indexEqualAfterRenames(table V2Identity, di, ai V2Index) boo
 	for _, c := range ai.Include {
 		aiInclude = append(aiInclude, p.actualToDesiredName(table, c))
 	}
-	if !equalStringSlices(di.Include, aiInclude) {
+	if !sameIncludeColumns(di.Include, aiInclude) {
 		equal = false
 	}
 	if len(di.Key) != len(ai.Key) {
