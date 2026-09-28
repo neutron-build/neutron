@@ -150,19 +150,28 @@ old name while changing them, then rename). A live plan is refused the same
 way when the planner cannot copy the table to compare it (for example a
 check with a whole-row reference); the message gives the `ALTER TABLE ...
 RENAME COLUMN` to run by hand first.
-Current limits, each failing at apply and rolling back:
-- a new table whose foreign key references a column renamed in the same plan,
-  the down file of a plan that drops a column together with an index on it,
-  and the down file of a plan that drops tables referencing each other: split
-  such changes into separate migrations;
-- dropping a column together with a stored generated column that reads it
-  (SQLSTATE 2BP01): drop the generated column in one migration and the
-  column in the next;
-- changing the type of a column a generated column reads (0A000): three
-  migrations (drop the generated column, change the type, add it back);
-- changing the type of a column that a view the schema does not declare reads
-  (0A000): declare the view, so the planner drops and re-creates it around the
-  change, or drop it with `--allow-destructive`.
+Statement order: constraints and indexes drop before the columns they name
+change type or are dropped, and are re-created after; a generated column
+drops before a column it reads; a new table's foreign key onto a column the
+plan renames or retypes is added after that change; and a down file re-creates
+dropped columns before their indexes and dropped tables before the foreign
+keys between them, so these plans apply and their down files revert.
+Changing the type of a column a stored generated column reads drops the
+generated column before the change and adds it back after it, with its
+indexes and constraints (PostgreSQL cannot change the type under it): the
+plan needs `--allow-destructive`, the values are recomputed, and the column is
+placed last. It is refused, with a three-migration path, when a foreign key
+the schema does not manage references the generated column.
+A view the plan leaves in place (not declared, or in a schema the document
+does not manage) whose definition names a column whose type changes or that
+is dropped refuses the plan, naming the view: declare it, so the planner drops
+and re-creates it around the change, or drop it (`--allow-destructive` drops
+undeclared views in the managed schemas). The check reads the view's text, so
+a view naming a same-named column of another table is refused too.
+Current limit: objects a schema document does not describe (materialized
+views, policies, triggers with column lists) that depend on a column whose
+type changes or that is dropped still fail at apply and roll back; drop them
+by hand first.
 
 In `--mode snapshot`, removing a schema from the document stops the chain
 tracking its objects, and declaring it again plans `create table` for tables
@@ -183,11 +192,9 @@ converges). Changing a generated column's expression uses
 `migrate generate --mode live` refuse it on older servers with the
 alternative named, and `--mode snapshot` records `minServerMajor` in the plan
 so `neutron migrate` refuses older servers before running anything.
-Current limit: changing a column's type to an enum while a check on that
-column compares it with text fails at apply (SQLSTATE 42883) and rolls
-back: the type change runs while the old check still exists. Drop the
-check in an earlier push or migration, then change the type and add the
-new check.
+Changing a column's type to an enum while a check or index compares it with
+text drops the check and index before the type change and re-creates them
+after it.
 
 Safety semantics: generated SQL never drops `_neutron_*`
 metadata tables, extension-owned objects, or anything absent from the schema
