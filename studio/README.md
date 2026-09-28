@@ -418,9 +418,6 @@ published CLI targets) and onboarding on Linux.
   IDs are unknown and a retry on them is refused until the table is
   checked. An import is atomic per batch, not per file.
 - **Open items** (each fails safely; tracked, not fixed):
-  - A rename whose new name contains a dot is mis-mapped: the review's
-    `--rename` flag is wrong, and the down statement fails when an index or
-    constraint is on the renamed column. Avoid dots in names.
   - On a table whose `AFTER` trigger updates the row it fired for, two edits
     of one row in one batch conflict (409). Commit them in separate batches.
   - The CDC and Streams modules have form labels that name no control.
