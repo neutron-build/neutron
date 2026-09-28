@@ -698,11 +698,12 @@ func CheckStatementAllowlist(sql string) error {
 // the session's search_path; statements run one at a time, so a setting
 // changed by one statement applies to how the next is read and resolved.
 // Allowed are the settings that change neither lexing nor name
-// resolution: the lock and statement timeouts (the journal's knobs) and
-// maintenance_work_mem (index builds). search_path, client_encoding,
+// resolution: the lock and statement timeouts (the journal's knobs),
+// maintenance_work_mem (index builds) and work_mem (data migrations).
+// search_path, client_encoding,
 // standard_conforming_strings, role and every other setting are refused.
 var setLocalAllowed = map[string]bool{
-	"lock_timeout": true, "statement_timeout": true, "maintenance_work_mem": true,
+	"lock_timeout": true, "statement_timeout": true, "maintenance_work_mem": true, "work_mem": true,
 }
 
 // checkSessionSettingChange refuses the statements that change session

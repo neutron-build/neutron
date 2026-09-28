@@ -76,6 +76,19 @@ All notable changes to this project are documented in this file.
   converges. `schema baseline` leaves out `_neutron_*` tables and refuses
   while migration files are unapplied.
 
+- **CLI (behaviour change): migration statements may change only four
+  session settings.** `neutron migrate` now runs each statement on its own,
+  so a setting changed by one statement would apply to how the next is
+  read. `SET LOCAL` in a migration may set only `lock_timeout`,
+  `statement_timeout`, `maintenance_work_mem` and `work_mem`; any other
+  setting (for example `search_path`, `role`, `time zone`) and
+  `set_config(...)` anywhere in a statement are refused before anything
+  runs, with a message naming the allowed settings. Migration files that
+  set other settings must drop those statements or qualify names instead.
+  A session whose `client_encoding` is not UTF8 or whose
+  `standard_conforming_strings` is off (a database or role default) is
+  refused before the first statement.
+
 - **`@neutron-build/nucleus` model clients were checked against a live
   engine** (Nucleus 1.0.2, `conformance/live/orm/`). Document collections
   and SQL-bound graph traversal sit behind a capability gate, time-series
