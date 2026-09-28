@@ -745,3 +745,43 @@ func copyDir(t *testing.T, src, dst string) {
 		return os.WriteFile(target, data, 0o644)
 	})
 }
+
+// TestS07AlterTableDropClassification: the destructive/data-loss check
+// reads ALTER TABLE actions token by token, so the optional COLUMN keyword,
+// IF EXISTS, ONLY and multi-action forms are all classified (S07 review-2
+// N4).
+func TestS07AlterTableDropClassification(t *testing.T) {
+	destructive := []string{
+		"ALTER TABLE t DROP COLUMN c",
+		"ALTER TABLE t DROP c",
+		"ALTER TABLE t DROP IF EXISTS c",
+		"ALTER TABLE ONLY s.t DROP c",
+		"ALTER TABLE t ADD COLUMN a int, DROP c",
+		"ALTER TABLE t DROP CONSTRAINT ck",
+	}
+	for _, sql := range destructive {
+		if !statementDestructive(sql) {
+			t.Errorf("statementDestructive(%q) = false, want true", sql)
+		}
+	}
+	dataLoss := map[string]bool{
+		"ALTER TABLE t DROP c":                              true,
+		"ALTER TABLE t DROP COLUMN c":                       true,
+		"ALTER TABLE t ALTER c TYPE bigint":                 true,
+		"ALTER TABLE t ALTER COLUMN c SET DATA TYPE bigint": true,
+		"ALTER TABLE t DROP CONSTRAINT ck":                  false, // structure, not data
+		"ALTER TABLE t ADD COLUMN a int":                    false,
+		"ALTER TABLE t RENAME c TO d":                       false,
+		"ALTER TABLE t RENAME COLUMN c TO d":                false,
+	}
+	for sql, want := range dataLoss {
+		if got := statementDataLoss(sql); got != want {
+			t.Errorf("statementDataLoss(%q) = %v, want %v", sql, got, want)
+		}
+	}
+	// A column named "constraint" must not read as DROP CONSTRAINT (still
+	// destructive and data-losing).
+	if !statementDataLoss(`ALTER TABLE t DROP COLUMN "constraint"`) {
+		t.Error(`DROP COLUMN "constraint" must be data loss`)
+	}
+}

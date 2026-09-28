@@ -624,10 +624,85 @@ func statementDestructive(sql string) bool {
 			return true
 		}
 	}
-	if strings.HasPrefix(s, "alter table") {
-		return strings.Contains(s, " drop column ") || strings.Contains(s, " drop constraint ")
+	for _, action := range alterTableActions(sql) {
+		if isWordAt(action, 0, "drop") {
+			return true
+		}
 	}
 	return false
+}
+
+// alterTableActions splits an ALTER TABLE statement into its actions (the
+// comma-separated subcommands after the table name), as significant
+// tokens. Optional keywords are PostgreSQL's: IF EXISTS and ONLY before
+// the name, and inside actions COLUMN (DROP [COLUMN], ALTER [COLUMN]).
+// Not ALTER TABLE: nil.
+func alterTableActions(sql string) [][]sqlToken {
+	toks := significantTokens(sql)
+	if !isWordAt(toks, 0, "alter") || !isWordAt(toks, 1, "table") {
+		return nil
+	}
+	i := 2
+	if isWordAt(toks, i, "if") && isWordAt(toks, i+1, "exists") {
+		i += 2
+	}
+	if isWordAt(toks, i, "only") {
+		i++
+	}
+	_, i, ok := nameAt(toks, i)
+	if !ok {
+		return nil
+	}
+	if i < len(toks) && toks[i].kind == 'p' && toks[i].text == "*" {
+		i++
+	}
+	var actions [][]sqlToken
+	depth, start := 0, i
+	for j := i; j <= len(toks); j++ {
+		if j == len(toks) || (depth == 0 && toks[j].kind == 'p' && (toks[j].text == "," || toks[j].text == ";")) {
+			if j > start {
+				actions = append(actions, toks[start:j])
+			}
+			start = j + 1
+			continue
+		}
+		if toks[j].kind == 'p' {
+			switch toks[j].text {
+			case "(", "[":
+				depth++
+			case ")", "]":
+				depth--
+			}
+		}
+	}
+	return actions
+}
+
+// alterActionDropsColumn: DROP [COLUMN] [IF EXISTS] name — every DROP
+// action except DROP CONSTRAINT.
+func alterActionDropsColumn(action []sqlToken) bool {
+	return isWordAt(action, 0, "drop") && !isWordAt(action, 1, "constraint")
+}
+
+// alterActionChangesType: ALTER [COLUMN] name [SET DATA] TYPE ...
+func alterActionChangesType(action []sqlToken) bool {
+	if !isWordAt(action, 0, "alter") {
+		return false
+	}
+	i := 1
+	if isWordAt(action, i, "column") {
+		i++
+	} else if isWordAt(action, i, "constraint") {
+		return false
+	}
+	if i >= len(action) || (action[i].kind != 'w' && action[i].kind != 'q') {
+		return false
+	}
+	i++
+	if isWordAt(action, i, "set") && isWordAt(action, i+1, "data") {
+		i += 2
+	}
+	return isWordAt(action, i, "type")
 }
 
 // statementDataLoss marks operations that can destroy row data or column
@@ -641,11 +716,8 @@ func statementDataLoss(sql string) bool {
 			return true
 		}
 	}
-	if strings.HasPrefix(s, "alter table") {
-		if strings.Contains(s, " drop column ") {
-			return true
-		}
-		if strings.Contains(s, " alter column ") && strings.Contains(s, " type ") {
+	for _, action := range alterTableActions(sql) {
+		if alterActionDropsColumn(action) || alterActionChangesType(action) {
 			return true
 		}
 	}
