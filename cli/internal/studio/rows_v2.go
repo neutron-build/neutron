@@ -242,19 +242,32 @@ func tableReadOnlyState(meta *tableMeta, versioned bool) readOnlyState {
 // ruleEventTypes maps a write verb to its pg_rewrite ev_type.
 var ruleEventTypes = map[string]string{"update": "2", "insert": "3", "delete": "4"}
 
-// ruleRefusal refuses a write that a rule on the table would rewrite. The
-// guarded, version-checked statements run inside WITH and return the row
-// version; PostgreSQL refuses a DO ALSO or conditional rule there and
-// RETURNING through a DO INSTEAD rule, so the write could never apply.
-// Refusing up front names the cause (a 4xx) instead of passing the
-// server's error on as a 5xx. Writes no rule covers stay editable.
+// ruleRefusal refuses exactly the writes PostgreSQL refuses for the
+// statement Studio sends, naming the cause (a 4xx) instead of passing the
+// server's error on as a 5xx:
+//   - update and delete run as a data-modifying statement in WITH, and
+//     PostgreSQL refuses every rule that fires for one there (DO ALSO,
+//     conditional or multi-action DO INSTEAD, DO INSTEAD NOTHING; a single
+//     unconditional DO INSTEAD cannot return the row version);
+//   - insert is a plain INSERT ... RETURNING, which runs through DO ALSO
+//     rules but not through a DO INSTEAD rule, conditional or not (the row
+//     would not be in this table, and its key and version cannot be
+//     returned).
+//
+// Rules that do not fire (disabled, or replica-only in an origin session)
+// refuse nothing; tableMetaSQL collects only the refused events.
 func ruleRefusal(meta *tableMeta, schemaName, tableName, verb string) error {
 	ev := ruleEventTypes[verb]
 	if ev == "" || !strings.Contains(meta.RuleEvents, ev) {
 		return nil
 	}
+	if verb == "insert" {
+		return mutationDomainError{msg: fmt.Sprintf(
+			"%s.%s has a DO INSTEAD rule on INSERT (CREATE RULE): the row would not be inserted into this table, so its key and version cannot be returned and PostgreSQL refuses Studio's INSERT ... RETURNING; nothing was applied — make this change with SQL",
+			schemaName, tableName)}
+	}
 	return mutationDomainError{msg: fmt.Sprintf(
-		"%s.%s has a rule on %s (CREATE RULE ... DO INSTEAD / DO ALSO), and Studio's guarded %s cannot run through a rule rewrite; nothing was applied — make this change with SQL",
+		"%s.%s has a rule on %s (CREATE RULE), and PostgreSQL refuses rules on the version-guarded %s Studio runs (a data-modifying statement in WITH); nothing was applied — make this change with SQL",
 		schemaName, tableName, strings.ToUpper(verb), verb)}
 }
 

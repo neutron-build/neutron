@@ -412,9 +412,12 @@ published CLI targets) and onboarding on Linux.
   ONLY … ADD PRIMARY KEY` leaves on a partitioned table: it enforces no
   uniqueness), when a key column's type cannot be compared exactly,
   when a foreign table is among its inheritance children, or when the
-  connection exposes no row versions (`xmin`). A write that a rule
-  (`CREATE RULE … DO INSTEAD / DO ALSO`) on the table rewrites is refused
-  with HTTP 400 naming the rule; writes no rule covers stay editable.
+  connection exposes no row versions (`xmin`). Writes that PostgreSQL
+  refuses because of a table rule (`CREATE RULE`) are refused with HTTP 400
+  naming the rule: an update or delete with any rule that fires for it
+  (they run as data-modifying statements in `WITH`), an insert with a
+  `DO INSTEAD` rule. Inserts through `DO ALSO` rules apply, and disabled
+  rules do not count.
 - **Recovery limits.** A revert is refused where the inverse cannot be exact
   ([Atomic commits](#atomic-commits-and-retry-outcomes-s02)). Commit
   outcomes live in the Studio process: after a restart, earlier operation
