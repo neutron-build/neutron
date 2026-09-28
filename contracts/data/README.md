@@ -38,7 +38,7 @@ fixtures and accept the cross-object ones (ajv gate in
 | Required fields, unknown fields, types/enums/consts | yes | yes |
 | Names: non-empty, no control characters (C0 incl. NUL, DEL) | yes | yes |
 | SQL text: non-empty, no NUL | yes | yes |
-| View definition is one statement (a separator only at its end; separators in literals, quoted identifiers, dollar quotes and comments are text) | no | yes |
+| View definition is one statement (a separator only at its end; separators in literals, quoted identifiers, dollar quotes and comments are text; as in PostgreSQL, `$` continues an identifier, so only a `$` at a token start opens a dollar quote) | no | yes |
 | Literal-default token pattern | yes | yes |
 | Integer-only numbers | yes (type) | yes (type + safe-range ±(2^53−1)) |
 | Type-parameter ranges (length/precision/scale/dimensions caps) | no | yes |
