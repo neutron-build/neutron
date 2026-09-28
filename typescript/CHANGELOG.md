@@ -109,8 +109,8 @@ All notable changes to this project are documented in this file.
 
 - **`@neutron-build/sql` (unpublished, alpha).** First-party PostgreSQL
   ORM: schema in code, one compiler, lossless codecs, relational reads,
-  migrations through the CLI. Verified on PostgreSQL 16, 17 and 18 with `pg`
-  and `postgres` (generated-column expression changes need 17+); Nucleus is
+  migrations through the CLI. Verified on PostgreSQL 15, 16, 17 and 18 with
+  `pg` and `postgres` (generated-column expression changes need 17+); Nucleus is
   not claimed. Its README lists
   the support matrix, the breaking corrections made during the alpha, and
   the upgrade and recovery limits.
