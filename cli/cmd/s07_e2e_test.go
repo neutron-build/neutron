@@ -7,6 +7,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -96,5 +97,60 @@ func TestS07PushDottedRenameTarget(t *testing.T) {
 	}
 	if got := q09Query(t, fx, `SELECT "a.b"::text FROM app.t`); got != "5" {
 		t.Fatalf("row after rename: %s", got)
+	}
+}
+
+// TestS07ChainIncompleteHintAfterBaseline: a hand-authored file in a
+// baselined snapshot chain is refused, and the hint names steps that work
+// while the baseline exists (`schema baseline` alone refuses then); the
+// re-baseline route it gives is followed to a clean check.
+func TestS07ChainIncompleteHintAfterBaseline(t *testing.T) {
+	bin := buildCLIBinary(t)
+	dbURL, fx := newM02CommandDB(t, "s07chain")
+	if err := fx.Exec(context.Background(), `CREATE TABLE t (id int PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	mig := filepath.Join(t.TempDir(), "migrations")
+	must := func(args ...string) string {
+		t.Helper()
+		code, out := runCLIProcess(t, bin, dbURL, args...)
+		if code != 0 {
+			t.Fatalf("neutron %s exited %d:\n%s", strings.Join(args, " "), code, out)
+		}
+		return out
+	}
+	must("schema", "baseline", "--dir", mig)
+	writeFile(t, filepath.Join(mig, "001_hand.up.sql"), "ALTER TABLE t ADD COLUMN note text;\n")
+	writeFile(t, filepath.Join(mig, "001_hand.down.sql"), "ALTER TABLE t DROP COLUMN note;\n")
+
+	code, out := runCLIProcess(t, bin, dbURL, "migrate", "--dir", mig)
+	if code == 0 {
+		t.Fatalf("a file without a snapshot must be refused:\n%s", out)
+	}
+	for _, w := range []string{
+		"001_hand has a .up.sql file but no snapshot — the snapshot chain is incomplete",
+		"move the file out of the migrations directory and plan its change with `neutron migrate generate --mode snapshot`",
+		"or re-baseline around it: delete migrations/snapshots, apply it with `neutron migrate`, then run `neutron schema baseline`",
+	} {
+		if !strings.Contains(out, w) {
+			t.Fatalf("the refusal must say %q:\n%s", w, out)
+		}
+	}
+	// The step the old hint named refuses while the baseline exists.
+	if code, out := runCLIProcess(t, bin, dbURL, "schema", "baseline", "--dir", mig); code == 0 || !strings.Contains(out, "baseline snapshot already exists") {
+		t.Fatalf("baseline must refuse while one exists (%d):\n%s", code, out)
+	}
+
+	// The hint's re-baseline route works as written.
+	if err := os.RemoveAll(filepath.Join(mig, "snapshots")); err != nil {
+		t.Fatal(err)
+	}
+	must("migrate", "--dir", mig)
+	if out := must("schema", "baseline", "--dir", mig); !strings.Contains(out, "covered by the baseline: 001") {
+		t.Fatalf("the re-baseline covers the applied file:\n%s", out)
+	}
+	must("schema", "check", "--live", "--dir", mig)
+	if got := q09Query(t, fx, `SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name = 't'`); got != "id,note" {
+		t.Fatalf("t columns %s", got)
 	}
 }
