@@ -485,3 +485,21 @@ test("X02: a correct-value vector engine resolves supported", async () => {
     assert.equal(verdict.status, "supported", cap);
   }
 });
+
+test("R04: the ts-bucketing negative control does not depend on the planner folding the conditions first", async () => {
+  // date_trunc(text, timestamptz, text) is STABLE on PostgreSQL 14 and 15
+  // (immutable from 16). A `case when ... then 1 else 1/0 end` probe lets
+  // the planner const-fold the literal 1/0 arm there, so the probe failed
+  // with 22012 on correct servers. The division must be by the verdict.
+  const seen: string[] = [];
+  await resolveCapabilityStatus(
+    parseVersionString("PostgreSQL 16.0 (Nucleus 1.0.2 — The Definitive Database)"),
+    "ts-bucketing",
+    async (sql) => {
+      seen.push(sql);
+    },
+  );
+  assert.equal(seen.length, 1);
+  assert.match(seen[0], /^select 1\/\(case when .+ then 1 else 0 end\)$/);
+  assert.doesNotMatch(seen[0], /1\/0/);
+});

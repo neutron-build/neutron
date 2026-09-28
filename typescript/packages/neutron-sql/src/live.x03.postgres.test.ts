@@ -3,7 +3,7 @@ import test from "node:test";
 import { createDatabase, pgTable, serial, text, double, timestamptz, avg, count, asc, cteTable, over, lag, type NeutronDatabase } from "./index.js";
 import { timeBucket, tsBetween, timeSeries, hypertableSupport, microsToCanonical, instantMicros } from "./timeseries.js";
 import { inspectColumnarStorage } from "./columnar.js";
-import { CapabilityRequirementError, capabilityGate } from "./engine.js";
+import { CapabilityRequirementError, capabilityGate, parseVersionString, resolveCapabilityStatus } from "./engine.js";
 import { ServerSqlError } from "./errors.js";
 import { TEST_URL, ensureLive, uniqueDbName } from "./live-harness.js";
 
@@ -146,6 +146,27 @@ for (const driverKind of ["postgres", "pg"] as const) {
       assert.equal(String(rows[0].a), "true");
       assert.equal(String(rows[0].b), "true");
       assert.equal(String(rows[0].c), "true");
+    });
+  });
+
+  test(`live x03 (${driverKind}): the ts-bucketing probe passes here and its negative control fires (R04: 14 and 15 fold a literal 1/0 arm)`, async () => {
+    await withDatabase(driverKind, async (fx) => {
+      const seen: string[] = [];
+      await resolveCapabilityStatus(parseVersionString("PostgreSQL 16.0 (Nucleus 1.0.2 — The Definitive Database)"), "ts-bucketing", async (sql) => {
+        seen.push(sql);
+      });
+      const probeSql = seen[0];
+      await fx.db.driver.query(probeSql);
+      // An engine that ignores the zone argument: the Tokyo day would start
+      // at 00:00Z. The same probe with that expectation must fail with 22012.
+      const tokyo = "date_trunc('day', timestamptz '2026-01-01 20:00:00+00', 'Asia/Tokyo') = timestamptz '2026-01-01 15:00:00+00'";
+      assert.ok(probeSql.includes(tokyo));
+      const wrong = probeSql.replace(tokyo, "date_trunc('day', timestamptz '2026-01-01 20:00:00+00', 'Asia/Tokyo') = timestamptz '2026-01-01 00:00:00+00'");
+      await assert.rejects(fx.db.driver.query(wrong), (err: unknown) => {
+        assert.ok(err instanceof ServerSqlError, `expected ServerSqlError, got ${err}`);
+        assert.equal(err.sqlstate, "22012");
+        return true;
+      });
     });
   });
 

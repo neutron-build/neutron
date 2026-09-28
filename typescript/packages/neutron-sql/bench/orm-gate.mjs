@@ -266,15 +266,21 @@ async function serverXacts() {
 }
 async function settledXacts() {
   // Wait until no backend is connected to the bench database (exiting
-  // backends flush their counters) and three consecutive reads agree.
+  // backends flush their counters) and consecutive reads agree. Before
+  // PostgreSQL 15 the counters come from the statistics collector, whose
+  // snapshot file may be up to PGSTAT_STAT_INTERVAL (500 ms) old when read,
+  // so the reads must agree over longer than that (R04: on 14 a 200 ms
+  // window measured 0 and 1.3 transactions per read). From 15 the counters
+  // live in shared memory and are current once the backends have exited.
   for (let i = 0; i < 100; i++) {
     const r = await admin.query("select count(*)::int as n from pg_stat_activity where datname = $1", [DB_NAME]);
     if (r.rows[0].n === 0) break;
     await sleep(50);
   }
+  const needStable = results.environment.serverVersionNum < 150000 ? 7 : 2;
   let prev = await serverXacts();
   let stable = 0;
-  for (let i = 0; i < 60 && stable < 2; i++) {
+  for (let i = 0; i < 60 && stable < needStable; i++) {
     await sleep(100);
     const cur = await serverXacts();
     stable = cur === prev ? stable + 1 : 0;
