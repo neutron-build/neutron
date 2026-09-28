@@ -46,6 +46,9 @@ type sqlToken struct {
 	text  string
 	start int
 	end   int
+	// open: a quote, quoted identifier, dollar quote or block comment the
+	// scanner reached the end of the text inside, without its terminator.
+	open bool
 }
 
 // tokenizeSQL splits SQL text into the token stream above. It is the only
@@ -93,9 +96,10 @@ func tokenizeSQL(s string) []sqlToken {
 			}
 			end := min(j, n)
 			emit('c', s[i:end], i, end)
+			toks[len(toks)-1].open = depth > 0
 			i = end
 		case c == '"':
-			j, buf := i+1, strings.Builder{}
+			j, buf, closed := i+1, strings.Builder{}, false
 			for j < n {
 				if s[j] == '"' {
 					if j+1 < n && s[j+1] == '"' {
@@ -103,6 +107,7 @@ func tokenizeSQL(s string) []sqlToken {
 						j += 2
 						continue
 					}
+					closed = true
 					break
 				}
 				buf.WriteByte(s[j])
@@ -110,6 +115,7 @@ func tokenizeSQL(s string) []sqlToken {
 			}
 			end := min(j+1, n)
 			emit('q', buf.String(), i, end)
+			toks[len(toks)-1].open = !closed
 			i = end
 		case c == '\'' || ((c == 'e' || c == 'E') && i+1 < n && s[i+1] == '\''):
 			// Standard-conforming literal ('it''s') or E'...' escape
@@ -119,6 +125,7 @@ func tokenizeSQL(s string) []sqlToken {
 			if esc {
 				j++
 			}
+			closed := false
 			for j < n {
 				if esc && s[j] == '\\' {
 					j += 2
@@ -130,16 +137,19 @@ func tokenizeSQL(s string) []sqlToken {
 						continue
 					}
 					j++
+					closed = true
 					break
 				}
 				j++
 			}
 			end := min(j, n)
 			emit('s', s[i:end], i, end)
+			toks[len(toks)-1].open = !closed
 			i = end
 		case c == '$':
 			if end, ok := dollarQuoteEnd(s, i); ok {
 				emit('s', s[i:end], i, end)
+				toks[len(toks)-1].open = !dollarQuoteClosed(s[i:end])
 				i = end
 			} else {
 				// Not a dollar-quote opener (e.g. a $1 parameter);
@@ -257,6 +267,18 @@ func dollarQuoteEnd(sql string, start int) (int, bool) {
 		return j + 1 + idx + len(delim), true
 	}
 	return n, true
+}
+
+// dollarQuoteClosed reports whether a lexed dollar-quoted token ends with
+// a second copy of its opening tag (dollarQuoteEnd runs an unterminated
+// body to the end of the text).
+func dollarQuoteClosed(tok string) bool {
+	k := strings.IndexByte(tok[1:], '$')
+	if k < 0 {
+		return false
+	}
+	tag := tok[:k+2]
+	return len(tok) >= 2*len(tag) && strings.HasSuffix(tok, tag)
 }
 
 // isDollarTagChar matches PostgreSQL's dolq_cont; a tag may not start

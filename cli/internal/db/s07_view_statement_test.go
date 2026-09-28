@@ -83,6 +83,12 @@ func TestS07ExpressionSingleExpression(t *testing.T) {
 		"'unterminated":             "unterminated",
 		"$q$ open":                  "unterminated",
 		"a /* open":                 "unterminated",
+		// S07 review-3 R1: the closing character is consumed as an escape
+		// or doubled delimiter, so the token is still open.
+		"'abc''":         "unterminated",
+		"E'abc\\'":       "unterminated",
+		"\"abc\"\"":      "unterminated",
+		"1 /* a /* b */": "unterminated",
 	}
 	for e, want := range bad {
 		r := v2NotSingleExpression(e)
