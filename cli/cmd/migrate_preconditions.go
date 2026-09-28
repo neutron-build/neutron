@@ -228,7 +228,7 @@ func extraObjectsHint(ctx context.Context, expected, actual *db.V2Document, norm
 	if err != nil || len(plain.Up) != 0 {
 		return ""
 	}
-	return "The drift consists only of objects the database has and the applied snapshot does not record. Snapshot plans written before M08 left objects the schema no longer declared in place without recording them; if that is how they got here, re-baseline at the current state: apply the pending migration files or move them out of the migrations directory, delete migrations/snapshots, and run `neutron schema baseline`, then generate again. If they were created outside migrations, drop them, or re-baseline the same way to adopt them"
+	return "The drift consists only of objects the database has and the applied snapshot does not record. Snapshot plans written before M08 left objects the schema no longer declared in place without recording them; if that is how they got here, re-baseline at the current state: move the pending migration files (their .up.sql, .down.sql and .plan.json) out of the migrations directory, because this drift refusal also blocks applying them; delete migrations/snapshots; run `neutron schema baseline`; then generate the moved-out changes again with `neutron migrate generate --mode snapshot`. If they were created outside migrations, drop them, or re-baseline the same way to adopt them"
 }
 
 // validateStatementAllowlist refuses migrations containing any statement

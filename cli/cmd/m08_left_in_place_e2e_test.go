@@ -328,9 +328,16 @@ func TestM08LeftInPlaceSnapshotChain(t *testing.T) {
 		if got := strings.Join(m07DocTables(t, snap001), ","); got != "public.t" {
 			t.Fatalf("fixture must be the pre-M08 snapshot shape, lists %s", got)
 		}
-		hint := []string{"drift", "only of objects the database has and the applied snapshot does not record", "delete migrations/snapshots", "neutron schema baseline"}
+		hint := []string{"drift", "only of objects the database has and the applied snapshot does not record", "move the pending migration files", "out of the migrations directory", "delete migrations/snapshots", "neutron schema baseline", "generate the moved-out changes again"}
 		refused(t, dbURL, hint, "schema", "check", "--live", "--dir", mig)
 		refused(t, dbURL, hint, "migrate", "--dir", mig)
+		// The drift refusal blocks applying the pending file, so the hint
+		// must not offer that as a step (M08 review-3 INFO 5).
+		for _, args := range [][]string{{"schema", "check", "--live", "--dir", mig}, {"migrate", "--dir", mig}} {
+			if _, out := runCLIProcess(t, bin, dbURL, args...); strings.Contains(out, "apply the pending") {
+				t.Fatalf("neutron %s: the hint offers a step the drift gate refuses:\n%s", strings.Join(args, " "), out)
+			}
+		}
 		if got := q09Query(t, fx, m08Columns); got != "id,keep,old,note" {
 			t.Fatalf("a refused migrate applied something: t columns %s", got)
 		}
