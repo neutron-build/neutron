@@ -229,6 +229,42 @@ var q12Cases = []q12Case{
 		live:   []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep int)`, `CREATE SCHEMA rep`, `CREATE TABLE rep.t (id int, keep int)`, `CREATE VIEW rep.v AS SELECT keep FROM rep.t`},
 		target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep bigint)`, `CREATE SCHEMA rep`, `CREATE TABLE rep.t (id int, keep int)`, `CREATE VIEW rep.v AS SELECT keep FROM rep.t`},
 		data:   []string{`INSERT INTO app.t VALUES (1, 2)`}},
+	// Declared views over declared views drop dependents first and are
+	// created bases first, whatever their names sort as: the base sorts
+	// first (the drop order was wrong, 2BP01) or last (the create order
+	// was wrong, 42P01).
+	{name: "declared view over a declared view sorting after it",
+		live:   []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep int)`, `CREATE VIEW app.a AS SELECT id, keep FROM app.t`, `CREATE VIEW app.b AS SELECT id, keep FROM app.a`},
+		target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep bigint)`, `CREATE VIEW app.a AS SELECT id, keep FROM app.t`, `CREATE VIEW app.b AS SELECT id, keep FROM app.a`},
+		data:   []string{`INSERT INTO app.t VALUES (1, 2)`}},
+	{name: "declared view over a declared view sorting before it",
+		live:   []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep int)`, `CREATE VIEW app.z AS SELECT id, keep FROM app.t`, `CREATE VIEW app.a AS SELECT id, keep FROM app.z`},
+		target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep bigint)`, `CREATE VIEW app.z AS SELECT id, keep FROM app.t`, `CREATE VIEW app.a AS SELECT id, keep FROM app.z`},
+		data:   []string{`INSERT INTO app.t VALUES (1, 2)`}},
+	// An index's operator class is compared: a type change whose index
+	// keeps a class of the old type (review-1 INFO 10, 42804), and a class
+	// that changes on its own.
+	{name: "type change under an index with an operator class",
+		live:   []string{`CREATE TABLE app.t (id int PRIMARY KEY, v text)`, `CREATE INDEX t_v ON app.t (v text_pattern_ops)`},
+		target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, v int)`, `CREATE INDEX t_v ON app.t (v)`},
+		data:   []string{`INSERT INTO app.t VALUES (1, '2')`}},
+	{name: "index operator class changes",
+		live:   []string{`CREATE TABLE app.t (id int PRIMARY KEY, v text)`, `CREATE INDEX t_v ON app.t (v text_pattern_ops)`},
+		target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, v text)`, `CREATE INDEX t_v ON app.t (v)`},
+		data:   []string{`INSERT INTO app.t VALUES (1, 'x')`}},
+	// A table the plan drops has a foreign key onto a key the plan drops:
+	// the table drops before the key, and its down re-creates it after the
+	// key is back.
+	{name: "dropped table references a dropped key", destructive: true, lossy: true,
+		live: []string{`CREATE TABLE app.p (id int PRIMARY KEY, code int, CONSTRAINT p_code UNIQUE (code))`,
+			`CREATE TABLE app.x (id int PRIMARY KEY, c int, CONSTRAINT x_c FOREIGN KEY (c) REFERENCES app.p (code))`},
+		target: []string{`CREATE TABLE app.p (id int PRIMARY KEY, code int)`},
+		data:   []string{`INSERT INTO app.p VALUES (1, 7)`, `INSERT INTO app.x VALUES (1, 7)`}},
+	{name: "dropped table references a rebuilt generated key", destructive: true, lossy: true,
+		live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net numeric, gross numeric GENERATED ALWAYS AS (net * 2) STORED, CONSTRAINT t_g UNIQUE (gross))`,
+			`CREATE TABLE app.x (id int PRIMARY KEY, g numeric, CONSTRAINT x_g FOREIGN KEY (g) REFERENCES app.t (gross))`},
+		target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net bigint, gross numeric GENERATED ALWAYS AS (net * 2) STORED, CONSTRAINT t_g UNIQUE (gross))`},
+		data:   []string{`INSERT INTO app.t (id, net) VALUES (1, 5)`, `INSERT INTO app.x VALUES (1, 10)`}},
 }
 
 // q12Pulled caches pulled documents and catalogs by their DDL: the three
@@ -518,7 +554,21 @@ func TestQ12Refusals(t *testing.T) {
 				`CREATE SCHEMA rep`, `CREATE TABLE rep.r (id int PRIMARY KEY, g numeric, CONSTRAINT r_g FOREIGN KEY (g) REFERENCES app.t (gross))`},
 			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net bigint, gross numeric GENERATED ALWAYS AS (net * 2) STORED, CONSTRAINT t_g UNIQUE (gross))`},
 			flags:  []string{"--allow-destructive"},
-			want:   []string{`table app.t: generated column "gross" must be dropped and added back (a column it reads changes type), but foreign key r_g of table rep.r, which the schema does not manage here, references it. Plan it as three migrations: remove the column (and that foreign key) from the schema, then change the type, then add the column back`}},
+			want:   []string{`foreign key r_g of table rep.r references the key (gross) of table app.t, which this plan drops (and re-creates), and the plan cannot drop and re-add a foreign key of a table the schema document does not manage.`, `Drop the foreign key by hand before applying and re-add it after, or declare schema "rep" and table rep.r in the schema (the plan then drops and re-adds the foreign key around the change)`}},
+		// A table the plan leaves in place, and one in an unmanaged
+		// schema, reference a key the plan drops.
+		{name: "left-in-place table references a dropped key", snapshot: true,
+			live: []string{`CREATE TABLE app.p (id int PRIMARY KEY, code int, CONSTRAINT p_code UNIQUE (code))`,
+				`CREATE TABLE app.x (id int PRIMARY KEY, c int, CONSTRAINT x_c FOREIGN KEY (c) REFERENCES app.p (code))`},
+			target: []string{`CREATE TABLE app.p (id int PRIMARY KEY, code int)`},
+			want: []string{`foreign key x_c of table app.x references the key (code) of table app.p, which this plan drops, and the plan cannot drop and re-add a foreign key of a table the schema does not declare.`,
+				`Declare table app.x in the schema (the plan then drops and re-adds the foreign key around the change), or drop it: re-run with --allow-destructive, which drops tables the schema does not declare. Note that --allow-destructive also drops every object the schema does not declare, which here is: table app.x;`}},
+		{name: "unmanaged table references a dropped key",
+			live: []string{`CREATE TABLE app.p (id int PRIMARY KEY, code int, CONSTRAINT p_code UNIQUE (code))`,
+				`CREATE SCHEMA rep`, `CREATE TABLE rep.x (id int PRIMARY KEY, c int, CONSTRAINT x_c FOREIGN KEY (c) REFERENCES app.p (code))`},
+			target: []string{`CREATE TABLE app.p (id int PRIMARY KEY, code int)`},
+			flags:  []string{"--allow-destructive"},
+			want:   []string{`foreign key x_c of table rep.x references the key (code) of table app.p, which this plan drops, and the plan cannot drop and re-add a foreign key of a table the schema document does not manage.`, `Drop the foreign key by hand before applying and re-add it after, or declare schema "rep" and table rep.x in the schema`}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -565,5 +615,30 @@ func TestQ12Refusals(t *testing.T) {
 				t.Fatalf("a refused plan writes nothing: %v", m)
 			}
 		})
+	}
+}
+
+// An operator class the schema names explicitly although it is the
+// column type's default compares equal to the database's (introspection
+// records only non-default classes), so a live plan converges.
+func TestQ12OpclassExplicitDefaultConverges(t *testing.T) {
+	bin := buildCLIBinary(t)
+	work := t.TempDir()
+	desired := filepath.Join(work, "desired.json")
+	q12Target(t, bin, desired, []string{`CREATE TABLE app.t (id int PRIMARY KEY, v text)`, `CREATE INDEX t_v ON app.t (v)`}, false)
+	doc := readFile(t, desired)
+	edited := strings.Replace(doc, `{"column":"v"}`, `{"column":"v","opclass":"text_ops"}`, 1)
+	if edited == doc {
+		edited = strings.Replace(doc, `"column": "v"`, `"column": "v", "opclass": "text_ops"`, 1)
+	}
+	if edited == doc {
+		t.Fatalf("the pulled document has no key part to edit:\n%s", doc)
+	}
+	writeFile(t, desired, edited)
+	dbURL, fx := newM02CommandDB(t, "q12opc")
+	q12Seed(t, fx, q12Case{live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, v text)`, `CREATE INDEX t_v ON app.t (v)`}})
+	code, out := runCLIProcess(t, bin, dbURL, "db", "push", "--dry-run", "--schema", desired)
+	if code != 0 || !strings.Contains(out, "Schema is already in sync") {
+		t.Fatalf("an explicit default operator class must compare equal (%d):\n%s", code, out)
 	}
 }
