@@ -22,9 +22,15 @@ INSTALL_DIR="${NEUTRON_INSTALL_DIR:-$HOME/.local/bin}"
 case "$(uname -s)" in
   Darwin) OS="darwin" ;;
   Linux)  OS="linux" ;;
+  MINGW*|MSYS*|CYGWIN*)
+    echo "neutron: Windows is supported through WSL, not natively." >&2
+    echo "         Install WSL (wsl --install), then run this installer inside the Linux shell." >&2
+    echo "         See https://neutron.build/docs/cli" >&2
+    exit 1
+    ;;
   *)
     echo "neutron: unsupported OS: $(uname -s)" >&2
-    echo "         supported: macOS, Linux. See https://neutron.build/docs/cli" >&2
+    echo "         supported: macOS, Linux, and Windows through WSL. See https://neutron.build/docs/cli" >&2
     exit 1
     ;;
 esac

@@ -401,8 +401,9 @@ published CLI targets) and onboarding on Linux.
   editing on Nucleus is read-only: the catalog query that identifies keys
   and row versions does not run there.
 - **Platforms.** The CLI that embeds Studio is released for Linux and macOS
-  (amd64 and arm64), and the embed gate runs on both. Windows builds compile
-  in CI but are neither released nor gated.
+  (amd64 and arm64), and the embed gate runs on both. On Windows, run the CLI
+  inside WSL; native Windows builds compile in CI but are neither released
+  nor gated.
 - **Read-only tables.** A table is read-only, with the reason shown, when it
   has no primary key, when a key column's type cannot be compared exactly,
   when a foreign table is among its inheritance children, or when the
