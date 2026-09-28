@@ -69,7 +69,7 @@ impl Response {
     /// Create an error response with RFC 7807 Problem Details.
     pub fn error(status: u16, title: &str, detail: &str) -> Self {
         let problem = serde_json::json!({
-            "type": format!("about:blank"),
+            "type": "about:blank".to_string(),
             "title": title,
             "status": status,
             "detail": detail,
