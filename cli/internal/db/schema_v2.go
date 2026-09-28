@@ -1802,6 +1802,25 @@ func v2SortedStrings(v any) []any {
 	return out
 }
 
+// sameIncludeColumns compares two INCLUDE lists as the contract does: the
+// canonical form sorts them (CANONICAL.md), and PostgreSQL gives INCLUDE
+// columns no order semantics (non-key payload, disregarded for search and
+// uniqueness), so a list held in another order is the same index.
+func sameIncludeColumns(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	as, bs := append([]string(nil), a...), append([]string(nil), b...)
+	sort.Strings(as)
+	sort.Strings(bs)
+	for i := range as {
+		if as[i] != bs[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // v2AppendValue serializes a validated tree in canonical JSON form. All
 // numbers in a validated document are safe integers, so float64 values
 // convert to int64 losslessly.
