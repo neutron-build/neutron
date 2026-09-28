@@ -405,7 +405,9 @@ published CLI targets) and onboarding on Linux.
   inside WSL; native Windows builds compile in CI but are neither released
   nor gated.
 - **Read-only tables.** A table is read-only, with the reason shown, when it
-  has no primary key, when a key column's type cannot be compared exactly,
+  has no primary key (or only one whose index is invalid, as `ALTER TABLE
+  ONLY … ADD PRIMARY KEY` leaves on a partitioned table: it enforces no
+  uniqueness), when a key column's type cannot be compared exactly,
   when a foreign table is among its inheritance children, or when the
   connection exposes no row versions (`xmin`). A write that a rule
   (`CREATE RULE … DO INSTEAD / DO ALSO`) on the table rewrites is refused
@@ -421,10 +423,6 @@ published CLI targets) and onboarding on Linux.
     constraint is on the renamed column. Avoid dots in names.
   - On a table whose `AFTER` trigger updates the row it fired for, two edits
     of one row in one batch conflict (409). Commit them in separate batches.
-  - A primary key whose index is invalid (`ALTER TABLE ONLY … ADD PRIMARY
-    KEY` on a partitioned table) is still treated as the key although
-    uniqueness is not enforced; updates and deletes stay guarded by the
-    exactly-one-row check.
   - The legacy `/api/table/update` and `/api/table/delete` endpoints report
     refusals as HTTP 200 with an `error` field.
   - The CDC and Streams modules have form labels that name no control.
