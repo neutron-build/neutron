@@ -178,3 +178,25 @@ func TestStudioS07InvalidPrimaryIndexIsNoKey(t *testing.T) {
 		t.Fatalf("insert on pq = %d %v, want 400 no primary key", code, body)
 	}
 }
+
+// TestStudioS07LegacyRowEndpointsRetired: the pre-S01 /api/table/update and
+// /api/table/delete endpoints (refusals as 200 with an error field) are
+// gone; nothing in the SPA calls them.
+func TestStudioS07LegacyRowEndpointsRetired(t *testing.T) {
+	fixture, _ := newS07StudioDB(t, "legacy")
+	s07Exec(t, fixture, `CREATE TABLE memo (id int PRIMARY KEY, v text)`, `INSERT INTO memo VALUES (1, 'a')`)
+	ts, token := s06Server(t, map[string]*db.Client{"e2e": fixture})
+	defer ts.Close()
+	auth := map[string]string{sessionHeader: token, "Content-Type": "application/json"}
+	for path, body := range map[string]string{
+		"/api/table/update": `{"connectionId":"e2e","schema":"public","table":"memo","pkColumn":"id","pkValue":1,"column":"v","value":"legacy"}`,
+		"/api/table/delete": `{"connectionId":"e2e","schema":"public","table":"memo","pkColumn":"id","pkValue":1}`,
+	} {
+		if code, res := s06Do(t, ts, http.MethodPost, path, body, auth); code != http.StatusNotFound || !strings.Contains(fmt.Sprint(res["error"]), "no such Studio API endpoint") {
+			t.Errorf("%s = %d %v, want 404 (retired)", path, code, res)
+		}
+	}
+	if got := s07Text(t, fixture, `SELECT string_agg(id || ':' || v, ',') FROM memo`); got != "1:a" {
+		t.Fatalf("memo = %s", got)
+	}
+}

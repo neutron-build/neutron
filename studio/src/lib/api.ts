@@ -355,19 +355,6 @@ export const api = {
   importOutcome: (connectionId: string, operationId: string) =>
     mutationRequest<ImportOutcomeResponse>('POST', '/table/v2/import/outcome', { connectionId, operationId }),
 
-  // --- Interim v1 row endpoints (guarded, kept during the transition) ---
-
-  tableUpdate: (input: {
-    connectionId: string; schema: string; table: string
-    pkColumn: string; pkValue: unknown
-    column: string; value?: unknown; isNull?: boolean
-  }) => mutationRequest<{ rowsAffected: number; error?: string }>('POST', '/table/update', input),
-
-  tableDeleteRow: (input: {
-    connectionId: string; schema: string; table: string
-    pkColumn: string; pkValue: unknown
-  }) => mutationRequest<{ rowsAffected: number; error?: string }>('POST', '/table/delete', input),
-
   tableFKs: (connectionId: string, schema: string, table: string) =>
     request<{ fks: FKDetail[]; error?: string }>('GET',
       `/table/fks?connectionId=${connectionId}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`

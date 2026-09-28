@@ -106,7 +106,7 @@ func TestMutationAuthMatrix(t *testing.T) {
 	older := &Server{port: 59999, sessionToken: "replayed-earlier-launch"}
 
 	post := func(origin, token string) int {
-		req := httptest.NewRequest(http.MethodPost, "/api/table/update", strings.NewReader(`{}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/table/v2/update", strings.NewReader(`{}`))
 		if origin != "" {
 			req.Header.Set("Origin", origin)
 		}
@@ -114,7 +114,7 @@ func TestMutationAuthMatrix(t *testing.T) {
 			req.Header.Set(sessionHeader, token)
 		}
 		rec := httptest.NewRecorder()
-		s.handleTableRowUpdate(rec, req)
+		s.handleTableRowUpdateV2(rec, req)
 		return rec.Code
 	}
 
