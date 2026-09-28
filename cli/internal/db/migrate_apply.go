@@ -2126,6 +2126,9 @@ type NontransactionalPartialError struct {
 }
 
 func (e *NontransactionalPartialError) Error() string {
+	if e.Applied == 0 {
+		return fmt.Sprintf("statement 1 of %d failed; no earlier statement had run: %v", e.Total, e.Err)
+	}
 	return fmt.Sprintf("statement %d of %d failed after %d statement(s) had already taken effect outside any transaction: %v",
 		e.Applied+1, e.Total, e.Applied, e.Err)
 }
@@ -2139,13 +2142,22 @@ func (e *NontransactionalPartialError) Unwrap() error { return e.Err }
 // and the row leaves fully-applied effects with no history — exactly the
 // state `neutron migrate resolve --mark-applied` verifies and closes.
 func (s *MigrationSession) ApplyNontransactionalMigration(ctx context.Context, mf MigrationFile, stmts []string, onApplied func(index int, stmt string)) error {
+	// Applied and Total count executable statements only: a comment-only
+	// fragment (the file header) is not a statement that ran.
+	total, applied := 0, 0
+	for _, stmt := range stmts {
+		if hasExecutableSQL(stmt) {
+			total++
+		}
+	}
 	for i, stmt := range stmts {
 		if !hasExecutableSQL(stmt) {
 			continue
 		}
 		if _, err := s.conn.Exec(ctx, stmt); err != nil {
-			return &NontransactionalPartialError{Applied: i, Total: len(stmts), Err: err}
+			return &NontransactionalPartialError{Applied: applied, Total: total, Err: err}
 		}
+		applied++
 		if onApplied != nil {
 			onApplied(i, stmt)
 		}

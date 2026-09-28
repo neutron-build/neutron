@@ -372,9 +372,16 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				var partial *db.NontransactionalPartialError
 				if errors.As(err, &partial) {
+					where := "failed MID-FILE outside any transaction; its earlier statements' effects REMAIN — no rollback is pretended"
+					if partial.Applied == 0 {
+						// Nothing of the file ran before the failing statement,
+						// though a failed CREATE INDEX CONCURRENTLY can itself
+						// leave an invalid index, which resolve inspects.
+						where = "failed at its first statement, outside any transaction; no earlier statement of it ran"
+					}
 					interrupted := fmt.Errorf(
-						"interrupted after %d of %d pending migration(s) (%s_%s failed MID-FILE outside any transaction; its earlier statements' effects REMAIN — no rollback is pretended):\n%v\ninspect and recover explicitly: `neutron migrate resolve %s`",
-						count, len(pendings), p.File.Version, p.File.Name, err, p.File.Version)
+						"interrupted after %d of %d pending migration(s) (%s_%s %s):\n%v\ninspect and recover explicitly: `neutron migrate resolve %s`",
+						count, len(pendings), p.File.Version, p.File.Name, where, err, p.File.Version)
 					return failSpinner(spinner, interrupted.Error(), interrupted)
 				}
 				return failSpinner(spinner, fmt.Sprintf("Failed %s_%s: %v", p.File.Version, p.File.Name, err), err)

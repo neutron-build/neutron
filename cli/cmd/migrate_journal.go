@@ -98,9 +98,13 @@ func applyJournaledMigration(ctx context.Context, client *db.Client, sess *db.Mi
 	}
 	var partial *db.NontransactionalPartialError
 	if errors.As(err, &partial) {
+		earlier := "earlier steps' effects REMAIN — no rollback is pretended"
+		if partial.Applied == 0 {
+			earlier = "no earlier step ran"
+		}
 		return fmt.Errorf(
-			"interrupted after %d of %d pending migration(s) (%s_%s failed at journaled step %d of %d; earlier steps' effects REMAIN — no rollback is pretended):\n%v\ninspect and recover explicitly: `neutron migrate resolve %s`",
-			batchDone, batchTotal, p.File.Version, p.File.Name, partial.Applied+1, partial.Total, err, p.File.Version)
+			"interrupted after %d of %d pending migration(s) (%s_%s failed at journaled step %d of %d; %s):\n%v\ninspect and recover explicitly: `neutron migrate resolve %s`",
+			batchDone, batchTotal, p.File.Version, p.File.Name, partial.Applied+1, partial.Total, earlier, err, p.File.Version)
 	}
 	var ident *db.JournaledIdentityError
 	if errors.As(err, &ident) {
