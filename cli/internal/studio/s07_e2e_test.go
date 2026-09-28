@@ -78,10 +78,13 @@ func s07Text(t *testing.T, client *db.Client, query string) string {
 	return out
 }
 
-// TestStudioS07RuleTablesRefuseEditsWith4xx: a table with a DO ALSO or DO
-// INSTEAD rule on a write refuses that write with 400 and a message naming
-// the rule, never a 502 from the rewritten statement. Writes no rule
-// covers still apply.
+// TestStudioS07RuleTablesRefuseEditsWith4xx: a write PostgreSQL refuses
+// because of a table rule is refused with 400 naming the rule, never a
+// 502; writes PostgreSQL runs through the rules still apply (S07 review-1
+// F1). Update and delete run in WITH, where every firing rule is refused;
+// insert is a plain INSERT ... RETURNING, which runs through DO ALSO
+// rules (conditional or not) and not through DO INSTEAD ones. Disabled and
+// replica-only rules do not fire.
 func TestStudioS07RuleTablesRefuseEditsWith4xx(t *testing.T) {
 	fixture, _ := newS07StudioDB(t, "rules")
 	s07Exec(t, fixture,
@@ -93,6 +96,21 @@ func TestStudioS07RuleTablesRefuseEditsWith4xx(t *testing.T) {
 		`CREATE RULE r_also AS ON UPDATE TO ruled_also DO ALSO INSERT INTO audit VALUES (NEW.id, NEW.v)`,
 		`CREATE RULE r_instead AS ON DELETE TO ruled_instead DO INSTEAD UPDATE ruled_instead SET v = 'deleted' WHERE id = OLD.id`,
 		`CREATE RULE r_nothing AS ON INSERT TO ruled_instead DO INSTEAD NOTHING`,
+		// Inserts through DO ALSO audit rules, one conditional.
+		`CREATE TABLE audited (id int PRIMARY KEY, v text)`,
+		`CREATE RULE r_audit AS ON INSERT TO audited DO ALSO INSERT INTO audit VALUES (NEW.id, 'ins')`,
+		`CREATE RULE r_audit_x AS ON INSERT TO audited WHERE NEW.v = 'x' DO ALSO INSERT INTO audit VALUES (NEW.id, 'x')`,
+		// Rules that do not fire.
+		`CREATE TABLE quiet (id int PRIMARY KEY, v text)`,
+		`INSERT INTO quiet VALUES (1, 'q')`,
+		`CREATE RULE r_off AS ON UPDATE TO quiet DO ALSO INSERT INTO audit VALUES (NEW.id, 'off')`,
+		`ALTER TABLE quiet DISABLE RULE r_off`,
+		`CREATE RULE r_replica AS ON DELETE TO quiet DO INSTEAD NOTHING`,
+		`ALTER TABLE quiet ENABLE REPLICA RULE r_replica`,
+		// A conditional DO INSTEAD rule on INSERT is refused by PostgreSQL
+		// for INSERT ... RETURNING.
+		`CREATE TABLE cond_instead (id int PRIMARY KEY, v text)`,
+		`CREATE RULE r_cond AS ON INSERT TO cond_instead WHERE NEW.v = 'x' DO INSTEAD INSERT INTO audit VALUES (NEW.id, NEW.v)`,
 	)
 	ts, token := s06Server(t, map[string]*db.Client{"e2e": fixture})
 	defer ts.Close()
@@ -100,10 +118,14 @@ func TestStudioS07RuleTablesRefuseEditsWith4xx(t *testing.T) {
 	read := func(table string) (string, string) {
 		t.Helper()
 		code, body := s06Do(t, ts, http.MethodGet, "/api/table?connectionId=e2e&schema=public&table="+table, "", auth)
-		if versions, _ := body["versions"].([]any); code != http.StatusOK || body["readOnly"] != false || len(versions) != 1 {
+		versions, _ := body["versions"].([]any)
+		if code != http.StatusOK || body["readOnly"] != false {
 			t.Fatalf("read %s: %d %v", table, code, body)
 		}
-		return body["binding"].(string), body["versions"].([]any)[0].(string)
+		if len(versions) == 0 {
+			return body["binding"].(string), ""
+		}
+		return body["binding"].(string), versions[0].(string)
 	}
 	commit := func(opID, op string) (int, map[string]any) {
 		t.Helper()
@@ -113,7 +135,11 @@ func TestStudioS07RuleTablesRefuseEditsWith4xx(t *testing.T) {
 	wantRefused := func(t *testing.T, code int, body map[string]any, verb string) {
 		t.Helper()
 		msg := fmt.Sprint(body["error"])
-		if code != http.StatusBadRequest || !strings.Contains(msg, "has a rule on "+verb) || !strings.Contains(msg, "nothing was applied") {
+		want := "has a rule on " + verb
+		if verb == "INSERT" {
+			want = "has a DO INSTEAD rule on INSERT"
+		}
+		if code != http.StatusBadRequest || !strings.Contains(msg, want) || !strings.Contains(msg, "nothing was applied") {
 			t.Fatalf("%s on a rule table = %d %v, want 400 naming the rule", verb, code, body)
 		}
 	}
@@ -145,6 +171,40 @@ func TestStudioS07RuleTablesRefuseEditsWith4xx(t *testing.T) {
 		}
 		if got := s07Text(t, fixture, `SELECT string_agg(id || ':' || v, ',' ORDER BY id) FROM ruled_instead`); got != "1:j" {
 			t.Fatalf("ruled_instead = %s", got)
+		}
+	})
+	t.Run("conditional DO INSTEAD insert", func(t *testing.T) {
+		binding, _ := read("cond_instead")
+		code, body := commit("s07-cond-ins", fmt.Sprintf(`{"op":"insert","schema":"public","table":"cond_instead","binding":%q,"values":{"id":1,"v":"a"}}`, binding))
+		wantRefused(t, code, body, "INSERT")
+	})
+	t.Run("inserts through DO ALSO audit rules apply", func(t *testing.T) {
+		binding, _ := read("audited")
+		code, body := s06Do(t, ts, http.MethodPost, "/api/table/v2/insert", fmt.Sprintf(`{"connectionId":"e2e","binding":%q,"schema":"public","table":"audited","values":{"id":1,"v":"a"}}`, binding), auth)
+		if code != http.StatusOK {
+			t.Fatalf("v2 insert through DO ALSO = %d %v", code, body)
+		}
+		code, body = commit("s07-audit-ins", fmt.Sprintf(`{"op":"insert","schema":"public","table":"audited","binding":%q,"values":{"id":2,"v":"x"}}`, binding))
+		if code != http.StatusOK || body["reversible"] != true {
+			t.Fatalf("commit insert through conditional DO ALSO = %d %v", code, body)
+		}
+		if got := s07Text(t, fixture, `SELECT (SELECT string_agg(id || ':' || v, ',' ORDER BY id) FROM audited) || '/' || (SELECT string_agg(id || ':' || note, ',' ORDER BY id, note) FROM audit)`); got != "1:a,2:x/1:ins,2:ins,2:x" {
+			t.Fatalf("audited/audit = %s", got)
+		}
+	})
+	t.Run("disabled and replica-only rules do not refuse", func(t *testing.T) {
+		binding, version := read("quiet")
+		code, body := commit("s07-quiet-upd", fmt.Sprintf(`{"op":"update","schema":"public","table":"quiet","binding":%q,"key":[{"column":"id","value":1}],"version":%q,"column":"v","value":"r"}`, binding, version))
+		if code != http.StatusOK {
+			t.Fatalf("update with a disabled rule = %d %v", code, body)
+		}
+		_, version = read("quiet")
+		code, body = s06Do(t, ts, http.MethodPost, "/api/table/v2/delete", fmt.Sprintf(`{"connectionId":"e2e","binding":%q,"schema":"public","table":"quiet","key":[{"column":"id","value":1}],"version":%q}`, binding, version), auth)
+		if code != http.StatusOK {
+			t.Fatalf("delete with a replica-only rule = %d %v", code, body)
+		}
+		if got := s07Text(t, fixture, `SELECT count(*)::text FROM quiet`); got != "0" {
+			t.Fatalf("quiet rows = %s", got)
 		}
 	})
 }

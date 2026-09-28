@@ -52,10 +52,10 @@ type tableMeta struct {
 	// rows carry no local xmin (always 0) and a remote ctid, so neither the
 	// version check nor the tuple binding can guard a write to them.
 	ForeignDescendant bool
-	// RuleEvents holds the pg_rewrite ev_type of every rule on a write to
-	// the table ('2' UPDATE, '3' INSERT, '4' DELETE). A rule rewrites the
-	// guarded statement, which PostgreSQL then refuses (a DO ALSO rule in
-	// WITH, RETURNING through DO INSTEAD); see ruleRefusal.
+	// RuleEvents holds the pg_rewrite ev_type of each write whose Studio
+	// statement a rule makes PostgreSQL refuse ('2' UPDATE, '3' INSERT,
+	// '4' DELETE); see ruleRefusal. Only rules that fire count (enabled,
+	// or replica-only under session_replication_role = replica).
 	RuleEvents string
 }
 
@@ -98,6 +98,9 @@ SELECT a.attname,
 	       SELECT pg_catalog.string_agg(DISTINCT r.ev_type::text, '')
 	       FROM pg_catalog.pg_rewrite r
 	       WHERE r.ev_class = c.oid AND r.ev_type IN ('2','3','4')
+	         AND r.ev_enabled::text IN ('A', CASE pg_catalog.current_setting('session_replication_role')
+	                                         WHEN 'replica' THEN 'R' ELSE 'O' END)
+	         AND (r.ev_type <> '3' OR r.is_instead)
        ), '')
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
