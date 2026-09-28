@@ -129,9 +129,11 @@ refuses honestly instead of pretending to roll back.
 Statements run one at a time, each exactly as the checks before apply
 classified it: a statement the server would read as more than one command
 fails. Because one statement's session settings would apply to the next,
-SET LOCAL may set only lock_timeout, statement_timeout and
-maintenance_work_mem, set_config is refused, and the session must read text
-as the checks did (client_encoding UTF8, standard_conforming_strings on).
+SET LOCAL may set only lock_timeout, statement_timeout, maintenance_work_mem
+and work_mem, set_config is refused, and the session must read text as the
+checks did (client_encoding UTF8, standard_conforming_strings on): checked
+before the first statement and after each statement, or after each
+pipelined batch inside a transaction, before commit.
 
 Targets PostgreSQL. Nucleus migration runners live in the language SDKs and
 remain experimental. Databases with pre-protocol histories (older CLI, or

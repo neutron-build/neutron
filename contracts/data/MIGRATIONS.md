@@ -201,17 +201,22 @@ next one:
   objects, and `SET LOCAL`. Everything else is refused before any
   statement runs.
 - **Session settings.** `SET LOCAL` may set only `lock_timeout`,
-  `statement_timeout` and `maintenance_work_mem` — the timeout and
-  index-build knobs, none of which changes lexing or name resolution.
+  `statement_timeout`, `maintenance_work_mem` and `work_mem` — the timeout
+  and memory knobs, none of which changes lexing or name resolution.
   Any other `SET`/`SET LOCAL` setting is refused, and `set_config(...)`
   is refused anywhere in a statement. `search_path` is deliberately not
   allowed: the guards resolve unqualified names, so a mid-file
   `search_path` change would move what a later statement's names refer to.
   `client_encoding` and `standard_conforming_strings` change how statement
-  text is read; before and after every statement the runner verifies the
-  session still reads text as the checks did (`client_encoding` UTF8,
-  `standard_conforming_strings` on) and refuses otherwise, so a database or
-  role whose default is different is refused before anything runs.
+  text is read. The runner verifies the session still reads text as the
+  checks did (`client_encoding` UTF8, `standard_conforming_strings` on)
+  before the first statement, and after each statement — or, for
+  statements pipelined inside a transaction, after each pipelined batch,
+  before commit — and refuses otherwise, so a database or role whose
+  default is different is refused before anything runs. The runtime check
+  covers these two reported settings; `search_path` is kept fixed by the
+  allowlist (no `SET LOCAL search_path`, no `set_config`), not checked at
+  run time.
 - **Expression fields.** A v2 document's expression fields (column
   defaults, generated expressions, check expressions, index key
   expressions and predicates) must each hold exactly one expression: a
