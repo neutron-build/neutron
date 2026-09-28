@@ -2,9 +2,11 @@ name: ORM PostgreSQL matrix
 
 # R01 / VERIFICATION "Test environments": pull requests run PostgreSQL 17 x
 # both drivers (typescript.yml neutron-sql live, cli.yml Test). This workflow
-# runs the same required-live suites on every declared major (16, 17, 18),
-# weekly and on demand before a release, so a major-specific regression is
-# caught without slowing every PR. Images carry pgvector (the X01 legs create
+# runs the same required-live suites on every declared major (15, 16, 17,
+# 18), weekly and on demand before a release, so a major-specific regression
+# is caught without slowing every PR. PostgreSQL 14 is not declared (R04): the
+# planner emits `security_invoker` views, which 14 rejects at apply; add it
+# here once that has a version floor. Images carry pgvector (the X01 legs create
 # the extension); repo workflows pin no digests — record the served digest
 # from the run log when citing a result.
 
@@ -20,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: [16, 17, 18]
+        pg: [15, 16, 17, 18]
     services:
       postgres:
         image: pgvector/pgvector:pg${{ matrix.pg }}
@@ -65,7 +67,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: [16, 17, 18]
+        pg: [15, 16, 17, 18]
     services:
       postgres:
         image: pgvector/pgvector:pg${{ matrix.pg }}

@@ -1453,7 +1453,7 @@ drivers; nothing outside this table is claimed.
 
 | Component | Verified | Not claimed |
 |---|---|---|
-| PostgreSQL | 16, 17 and 18. Pull requests run the live suites on 17 (`typescript.yml`, `cli.yml`); the release matrix (`orm-matrix.yml`, run 36341271630 on `073da630`) passed this package's suite (887/887) and the CLI suite on 16.15, 17.11 and 18.6 (`pgvector/pgvector` images). On 16, a generated-column expression change is refused before anything runs, because `ALTER COLUMN … SET EXPRESSION` is PostgreSQL 17+ | Majors before 16 are untested |
+| PostgreSQL | 15, 16, 17 and 18. Pull requests run the live suites on 17 (`typescript.yml`, `cli.yml`); the release matrix (`orm-matrix.yml`, run 36341271630 on `073da630`) passed this package's suite (887/887) and the CLI suite on 16.15, 17.11 and 18.6 (`pgvector/pgvector` images). 15 was added to the matrix after local runs on 15.19 passed this package's suite (890/890), the ORM gate and the CLI suite. On 15 and 16, a generated-column expression change is refused before anything runs, because `ALTER COLUMN … SET EXPRESSION` is PostgreSQL 17+ | 14: the suites were run and it is not claimed, because a view declared with `securityInvoker` (PostgreSQL 15+) fails at apply and rolls back instead of being refused at plan time. 13 and older are end of life and untested |
 | Node.js | `engines: ">=22"`; CI runs 22 and 24; the installed-artifact gate ran on 22.19, 22.23 and 24.20 | 22.0–22.18; Node 20 and older |
 | Drivers | `pg` 8.22.0 and `postgres` 3.4.8, the versions the suites resolve (peer ranges `^8.11.0` / `^3.4.7`) | other versions inside the peer ranges |
 | TypeScript | 5.7.2 (minimum) and 5.9.3, declarations checked with `skipLibCheck` off | |
@@ -1479,9 +1479,9 @@ advertised for it:
 
 | Module | PostgreSQL | Nucleus 1.0.2 |
 |---|---|---|
-| `/pgvector`, `/fts` | verified on 16, 17 and 18 | vector types unsupported; the FTS functions fail a negative control; queries are refused before any statement runs |
-| `/timeseries`, `/columnar` | verified on 16, 17 and 18 | `ts-bucketing` resolves unsupported and bucket statements fail closed; the engine's own time-series and columnar model clients are in `@neutron-build/nucleus` ([below](#nucleus-time-series-and-columnar-model-clients)) |
-| `/listen-notify` | verified on 16, 17 and 18 | delivers, with the divergences documented in [LISTEN/NOTIFY](#listennotify-neutron-buildsqllisten-notify) |
+| `/pgvector`, `/fts` | verified on 15, 16, 17 and 18 | vector types unsupported; the FTS functions fail a negative control; queries are refused before any statement runs |
+| `/timeseries`, `/columnar` | verified on 15, 16, 17 and 18 | `ts-bucketing` resolves unsupported and bucket statements fail closed; the engine's own time-series and columnar model clients are in `@neutron-build/nucleus` ([below](#nucleus-time-series-and-columnar-model-clients)) |
+| `/listen-notify` | verified on 15, 16, 17 and 18 | delivers, with the divergences documented in [LISTEN/NOTIFY](#listennotify-neutron-buildsqllisten-notify) |
 
 ## Upgrading from earlier builds
 
@@ -1606,7 +1606,7 @@ Alpha — contained, not production-ready. Known-unsafe paths found in review
 were fixed or converted into explicit rejections; nothing here certifies
 general-purpose use.
 
-- Verified on PostgreSQL 16, 17 and 18, both drivers (generated-column
+- Verified on PostgreSQL 15, 16, 17 and 18, both drivers (generated-column
   expression changes need 17+); non-Postgres engines are not claimed ([Support matrix](#support-matrix)).
 - Implemented and live-tested: typed CRUD (`select`/`insert`/`update`/
   `delete`, `returning`), batch inserts independent of key order, joins and
@@ -1651,7 +1651,7 @@ general-purpose use.
   capability requirements, and schema export v2 is deterministic and
   cross-language-pinned (Go + reference consumer agree byte-for-byte);
   importing the root loads no driver module until a connection is requested.
-- Implemented and live-tested on PostgreSQL 16, 17 and 18, both drivers:
+- Implemented and live-tested on PostgreSQL 15, 16, 17 and 18, both drivers:
   window functions (ranking, value and distribution functions with PostgreSQL
   result typing, rows/range/groups frames with exclude variants, aggregates
   as windows, placement enforced at the compile choke point), row locking
