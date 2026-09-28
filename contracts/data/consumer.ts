@@ -181,9 +181,98 @@ const checkName = (s: string, at: string): void => {
 const checkSQLText = (s: string, at: string, expression: boolean): void => {
   if (s === "") fail("invalid-value", at, "SQL text must not be empty");
   if (s.includes("\u0000")) fail("invalid-value", at, "SQL text must not contain NUL");
-  if (expression && s.includes(";")) {
-    fail("invalid-value", at, "expression must not contain a statement separator");
+  if (expression) {
+    const reason = notSingleExpression(s);
+    if (reason) fail("invalid-value", at, reason);
   }
+};
+
+// notSingleExpression mirrors the Go validator's v2NotSingleExpression: an
+// expression field holds exactly one expression, so a top-level comma
+// (a second clause), a top-level ";" (a second statement), or text the
+// lexer cannot close (an open quote, dollar quote, comment or paren) is
+// refused. Commas and semicolons inside parentheses, brackets, string
+// literals, quoted identifiers, dollar quotes and comments are part of the
+// expression. It uses the same lexing rules as hasSecondStatement.
+const notSingleExpression = (s: string): string => {
+  const n = s.length;
+  let i = 0;
+  let depth = 0;
+  while (i < n) {
+    const c = s[i];
+    if (c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f" || c === "\v") {
+      i++;
+    } else if (c === "-" && s[i + 1] === "-") {
+      let j = i;
+      while (j < n && s[j] !== "\n" && s[j] !== "\r") j++;
+      i = j;
+    } else if (c === "/" && s[i + 1] === "*") {
+      let d = 1;
+      let j = i + 2;
+      while (j < n && d > 0) {
+        if (s[j] === "/" && s[j + 1] === "*") { d++; j += 2; }
+        else if (s[j] === "*" && s[j + 1] === "/") { d--; j += 2; }
+        else j++;
+      }
+      if (d > 0) return "expression has an unterminated string, quoted identifier, dollar-quoted string or comment";
+      i = j;
+    } else if (c === '"') {
+      let j = i + 1;
+      let closed = false;
+      while (j < n) {
+        if (s[j] === '"') {
+          if (s[j + 1] === '"') { j += 2; continue; }
+          closed = true;
+          break;
+        }
+        j++;
+      }
+      if (!closed) return "expression has an unterminated string, quoted identifier, dollar-quoted string or comment";
+      i = j + 1;
+    } else if (c === "'" || ((c === "e" || c === "E") && s[i + 1] === "'")) {
+      const esc = c !== "'";
+      let j = esc ? i + 2 : i + 1;
+      let closed = false;
+      while (j < n) {
+        if (esc && s[j] === "\\") { j += 2; continue; }
+        if (s[j] === "'") {
+          if (s[j + 1] === "'") { j += 2; continue; }
+          j++; closed = true; break;
+        }
+        j++;
+      }
+      if (!closed) return "expression has an unterminated string, quoted identifier, dollar-quoted string or comment";
+      i = j;
+    } else if (c === "$") {
+      let j = i + 1;
+      if (j < n && !/^[0-9]$/.test(s[j])) {
+        while (j < n && isWordChar(s[j])) j++;
+      }
+      if (j < n && s[j] === "$") {
+        const delim = s.slice(i, j + 1);
+        const end = s.indexOf(delim, j + 1);
+        if (end < 0) return "expression has an unterminated string, quoted identifier, dollar-quoted string or comment";
+        i = end + delim.length;
+      } else {
+        i++;
+      }
+    } else if (isWordChar(c)) {
+      while (i < n && isWordCont(s[i])) i++;
+    } else {
+      if (c === "(" || c === "[") depth++;
+      else if (c === ")" || c === "]") {
+        depth--;
+        if (depth < 0) return "expression has an unbalanced closing parenthesis or bracket";
+      } else if (c === "," && depth === 0) {
+        return "expression must be a single expression: a top-level comma would add a clause";
+      } else if (c === ";" && depth === 0) {
+        return "expression must not contain a statement separator";
+      }
+      i++;
+    }
+  }
+  if (depth !== 0) return "expression has an unbalanced opening parenthesis or bracket";
+  return "";
 };
 // hasSecondStatement mirrors the Go validator's v2HasSecondStatement and the
 // migration tokenizer it uses (cli/internal/db/migrate_apply.go): anything
@@ -203,11 +292,13 @@ const hasSecondStatement = (s: string): boolean => {
   const significant = (): boolean => separated;
   while (i < n) {
     const c = s[i];
-    if (c === " " || c === "\t" || c === "\n" || c === "\r") {
+    if (c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f" || c === "\v") {
       i++;
     } else if (c === "-" && s[i + 1] === "-") {
-      const j = s.indexOf("\n", i);
-      i = j < 0 ? n : j;
+      // PostgreSQL ends a line comment at LF or CR (newline = [\n\r]).
+      let j = i;
+      while (j < n && s[j] !== "\n" && s[j] !== "\r") j++;
+      i = j;
     } else if (c === "/" && s[i + 1] === "*") {
       let depth = 1;
       let j = i + 2;
@@ -672,9 +763,11 @@ const validateConstraint = (item: Json, at: string, colNames: Set<string>, table
   }
   if (ctype === "check") {
     const expr = isStr(m.expression, `${at}.expression`);
-    if (expr === "" || expr.includes(";")) {
-      fail("check-expression", `${at}.expression`, "check expression must be non-empty and must not contain a statement separator");
+    if (expr === "") {
+      fail("check-expression", `${at}.expression`, "check expression must be non-empty");
     }
+    const reason = notSingleExpression(expr);
+    if (reason) fail("check-expression", `${at}.expression`, `check ${reason}`);
     return [name, false];
   }
   // foreign-key

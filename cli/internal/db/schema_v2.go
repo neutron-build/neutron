@@ -279,7 +279,7 @@ var v2TypeParams = map[string]map[string]bool{
 }
 
 var v2ReferentialActions = map[string]bool{"cascade": true, "restrict": true, "no action": true, "set null": true, "set default": true}
-var v2FKMatches    = map[string]bool{"simple": true, "full": true, "partial": true}
+var v2FKMatches = map[string]bool{"simple": true, "full": true, "partial": true}
 var v2IndexMethods = map[string]bool{"btree": true, "hash": true, "gin": true, "gist": true, "spgist": true, "brin": true, "hnsw": true, "ivfflat": true}
 
 // Default-operator-class facts for the index methods and column types in
@@ -305,10 +305,10 @@ var v2IndexMethodScalars = map[string]map[string]bool{
 }
 var v2IndexMethodArrays = map[string]bool{"btree": true, "hash": true, "gin": true}
 
-var v2OpaqueKinds  = map[string]bool{"extension-table": true, "extension-object": true, "unsupported-table": true, "unsupported-object": true}
+var v2OpaqueKinds = map[string]bool{"extension-table": true, "extension-object": true, "unsupported-table": true, "unsupported-object": true}
 
 // v2LiteralPattern matches exactly one SQL literal token, optionally cast:
-// a single-quoted string with '' doubling, a numeric literal, true, false or
+// a single-quoted string with ” doubling, a numeric literal, true, false or
 // null. Kept in lockstep with the pattern in schema-v2.json and consumer.ts.
 const v2LiteralPattern = `^('([^']|'')*'(::[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?(\[\])*)?|-?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?|true|false|null)$`
 
@@ -364,18 +364,18 @@ type v2ColumnType struct {
 
 // v2State accumulates what cross-reference checks need across collections.
 type v2State struct {
-	capabilities   map[string]bool
-	schemas        map[string]bool
-	tables         map[string]map[string]any // "schema.name" -> table object
-	tableColumns   map[string]map[string]bool
-	tableKeyTuples map[string][][]string // exact PK/unique column tuples
-	enums          map[string]bool
-	views          map[string]bool
-	indexIdents    map[string]string
-	opaqueIdents   map[string]bool
-	opaqueSchemas  []string
+	capabilities    map[string]bool
+	schemas         map[string]bool
+	tables          map[string]map[string]any // "schema.name" -> table object
+	tableColumns    map[string]map[string]bool
+	tableKeyTuples  map[string][][]string // exact PK/unique column tuples
+	enums           map[string]bool
+	views           map[string]bool
+	indexIdents     map[string]string
+	opaqueIdents    map[string]bool
+	opaqueSchemas   []string
 	sequenceSchemas []string
-	enumRefs       []v2EnumRef
+	enumRefs        []v2EnumRef
 }
 
 type v2EnumRef struct {
@@ -531,10 +531,119 @@ func v2CheckSQLText(s, path string, expression bool) error {
 	if strings.ContainsRune(s, 0) {
 		return contractErr("invalid-value", path, "SQL text must not contain NUL")
 	}
-	if expression && strings.Contains(s, ";") {
-		return contractErr("invalid-value", path, "expression must not contain a statement separator")
+	if expression {
+		if reason := v2NotSingleExpression(s); reason != "" {
+			return contractErr("invalid-value", path, "%s", reason)
+		}
 	}
 	return nil
+}
+
+// v2NotSingleExpression returns why SQL text is not one expression, or "".
+// An expression field (a column default, a generated or check expression,
+// an index key expression or predicate) must hold exactly one expression,
+// which the planner drops into a larger statement. A top-level comma would
+// add a clause (a second ALTER TABLE action, an extra index column); a
+// top-level ';' would add a statement; text the tokenizer cannot close
+// (an open quote, dollar quote or comment, an unbalanced paren or bracket)
+// could swallow or escape what follows it. Commas and semicolons inside
+// parentheses, brackets, string literals, quoted identifiers, dollar
+// quotes and comments are part of the expression (function-call
+// arguments, array subscripts, row constructors).
+func v2NotSingleExpression(s string) string {
+	toks := significantTokens(s)
+	depth := 0
+	for _, t := range toks {
+		if t.kind != 'p' {
+			continue
+		}
+		switch t.text {
+		case "(", "[":
+			depth++
+		case ")", "]":
+			depth--
+			if depth < 0 {
+				return "expression has an unbalanced closing parenthesis or bracket"
+			}
+		case ",":
+			if depth == 0 {
+				return "expression must be a single expression: a top-level comma would add a clause"
+			}
+		case ";":
+			if depth == 0 {
+				return "expression must not contain a statement separator"
+			}
+		}
+	}
+	if depth != 0 {
+		return "expression has an unbalanced opening parenthesis or bracket"
+	}
+	if !v2TextFullyTokenizes(s) {
+		return "expression has an unterminated string, quoted identifier, dollar-quoted string or comment"
+	}
+	return ""
+}
+
+// v2TextFullyTokenizes reports whether every character of s belongs to a
+// token the tokenizer closed: an unterminated quote, dollar quote or block
+// comment leaves a gap the reconstructed token spans would not cover.
+func v2TextFullyTokenizes(s string) bool {
+	toks := tokenizeSQL(s)
+	pos := 0
+	for _, t := range toks {
+		for pos < t.start && pos < len(s) {
+			switch s[pos] {
+			case ' ', '\t', '\n', '\r', '\f', '\v':
+				pos++
+			default:
+				return false
+			}
+		}
+		if t.start != pos {
+			return false
+		}
+		// An unterminated quote/dollar-quote/comment: the closing byte is
+		// missing, so the token text is shorter than it would be closed.
+		switch t.kind {
+		case 's':
+			if !v2StringClosed(s[t.start:t.end]) {
+				return false
+			}
+		case 'q':
+			if !(len(s[t.start:t.end]) >= 2 && s[t.end-1] == '"') {
+				return false
+			}
+		case 'c':
+			frag := s[t.start:t.end]
+			if strings.HasPrefix(frag, "/*") && !strings.HasSuffix(frag, "*/") {
+				return false
+			}
+		}
+		pos = t.end
+	}
+	for pos < len(s) {
+		switch s[pos] {
+		case ' ', '\t', '\n', '\r', '\f', '\v':
+			pos++
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// v2StringClosed reports whether a lexed string token has its closing
+// delimiter: '...'/E'...' end in ', a $tag$...$tag$ ends in its tag.
+func v2StringClosed(tok string) bool {
+	if strings.HasPrefix(tok, "$") {
+		i := strings.IndexByte(tok[1:], '$')
+		if i < 0 {
+			return false
+		}
+		tag := tok[:i+2]
+		return len(tok) >= 2*len(tag) && strings.HasSuffix(tok, tag)
+	}
+	return len(tok) >= 2 && strings.HasSuffix(tok, "'")
 }
 
 // v2HasSecondStatement reports whether SQL text carries anything after a
@@ -1165,8 +1274,11 @@ func v2ValidateConstraint(item any, path string, colNames map[string]bool, table
 		if err != nil {
 			return "", false, err
 		}
-		if expr == "" || strings.Contains(expr, ";") {
-			return "", false, contractErr("check-expression", path+".expression", "check expression must be non-empty and must not contain a statement separator")
+		if expr == "" {
+			return "", false, contractErr("check-expression", path+".expression", "check expression must be non-empty")
+		}
+		if reason := v2NotSingleExpression(expr); reason != "" {
+			return "", false, contractErr("check-expression", path+".expression", "check %s", reason)
 		}
 		return name, false, nil
 	case "foreign-key":
@@ -1425,7 +1537,7 @@ func v2ValidateIndex(item any, path string, colNames map[string]bool, colTypes m
 			// JSON numbers decode as float64; the vocabulary takes integers.
 			f, ok := v.(float64)
 			if !ok || f != math.Trunc(f) {
-					return contractErr("invalid-index", wpath+"."+k, "access-method parameters are integers (m, ef_construction, lists, fillfactor); non-integer reloptions keep the index unrepresentable")
+				return contractErr("invalid-index", wpath+"."+k, "access-method parameters are integers (m, ef_construction, lists, fillfactor); non-integer reloptions keep the index unrepresentable")
 			}
 		}
 	}

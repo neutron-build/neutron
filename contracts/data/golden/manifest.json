@@ -201,6 +201,21 @@
       "name": "view-dollar-identifier",
       "document": "invalid/view-dollar-identifier.json",
       "code": "invalid-value"
+    },
+    {
+      "name": "view-cr-comment",
+      "document": "invalid/view-cr-comment.json",
+      "code": "invalid-value"
+    },
+    {
+      "name": "default-expression-extra-clause",
+      "document": "invalid/default-expression-extra-clause.json",
+      "code": "invalid-value"
+    },
+    {
+      "name": "check-expression-extra-clause",
+      "document": "invalid/check-expression-extra-clause.json",
+      "code": "check-expression"
     }
   ],
   "v1": [

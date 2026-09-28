@@ -1,0 +1,51 @@
+{
+	"version": 2,
+	"dialect": "postgresql",
+	"capabilities": [],
+	"schemas": [
+		{
+			"name": "public"
+		}
+	],
+	"tables": [
+		{
+			"identity": {
+				"schema": "public",
+				"name": "t"
+			},
+			"managed": true,
+			"columns": [
+				{
+					"name": "id",
+					"type": {
+						"name": "int4",
+						"codec": "number"
+					},
+					"notNull": true
+				}
+			],
+			"constraints": [
+				{
+					"name": "t_pkey",
+					"type": "primary-key",
+					"columns": [
+						"id"
+					]
+				}
+			],
+			"indexes": []
+		}
+	],
+	"enums": [],
+	"views": [
+		{
+			"identity": {
+				"schema": "public",
+				"name": "v"
+			},
+			"managed": true,
+			"definition": "select 1 as x -- c\r; drop table if exists public.other"
+		}
+	],
+	"opaque": []
+}
