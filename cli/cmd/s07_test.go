@@ -26,12 +26,18 @@ func TestS07DownRefusalNamesThePlanGrade(t *testing.T) {
 			[]string{"no plan report grades it", "write the down SQL by hand"}, "irreversible"},
 		{"IRREVERSIBLE stub, no plan", nil,
 			[]string{"the file itself marks it irreversible", "no plan report grades it", "forward-fix"}, "by hand"},
+		// S07 review-1 F6: the word outside the marker form is not a marker.
+		{"word in prose, no plan", nil,
+			[]string{"no plan report grades it", "write the down SQL by hand"}, "marks it irreversible"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			down := stub
 			if strings.HasPrefix(c.name, "IRREVERSIBLE") {
 				down = &db.MigrationFile{Version: "002", Name: "enum_values", SQL: "-- IRREVERSIBLE: no restoration possible\n"}
+			}
+			if strings.HasPrefix(c.name, "word in prose") {
+				down = &db.MigrationFile{Version: "002", Name: "enum_values", SQL: "-- enum value 'irreversible' cannot be removed; this change is not IRREVERSIBLE by nature\n"}
 			}
 			err := validateDownReversibility(pendingMigration{File: db.MigrationFile{Version: "002", Name: "enum_values"}, DownFile: down, Plan: c.plan})
 			if err == nil {

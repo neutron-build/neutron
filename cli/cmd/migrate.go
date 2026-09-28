@@ -715,7 +715,7 @@ func validateDownReversibility(p pendingMigration) error {
 		if p.Plan != nil {
 			grade = "its plan grades it " + p.Plan.Risk.OverallReversibility
 		}
-		marked := strings.Contains(strings.ToUpper(p.DownFile.SQL), "IRREVERSIBLE")
+		marked := hasIrreversibleMarker(p.DownFile.SQL)
 		if marked {
 			grade = "the file itself marks it irreversible; " + grade
 		}
@@ -733,6 +733,20 @@ func validateDownReversibility(p pendingMigration) error {
 			p.File.Version, p.Plan.Risk.IrreversibleCount)
 	}
 	return nil
+}
+
+// hasIrreversibleMarker reports whether a down file carries the explicit
+// marker comment the planner writes: a line comment that starts with
+// "IRREVERSIBLE" ("-- IRREVERSIBLE: ..."). The word elsewhere (an enum
+// value, prose inside a comment) is not a marker.
+func hasIrreversibleMarker(sql string) bool {
+	for _, line := range strings.Split(sql, "\n") {
+		line = strings.TrimSpace(line)
+		if rest, ok := strings.CutPrefix(line, "--"); ok && strings.HasPrefix(strings.TrimSpace(rest), "IRREVERSIBLE") {
+			return true
+		}
+	}
+	return false
 }
 
 // selectRevertFrontier returns the down migrations to revert: the newest
