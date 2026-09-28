@@ -696,9 +696,24 @@ func validateDownReversibility(p pendingMigration) error {
 		}
 	}
 	if !executable {
+		// Name the grade the plan actually records: "manual" means no down
+		// was recorded for a benign change, which a hand-written down can
+		// revert; only "irreversible" rules that out.
+		grade := "no plan report grades it"
+		if p.Plan != nil {
+			grade = "its plan grades it " + p.Plan.Risk.OverallReversibility
+		}
+		marked := strings.Contains(strings.ToUpper(p.DownFile.SQL), "IRREVERSIBLE")
+		if marked {
+			grade = "the file itself marks it irreversible; " + grade
+		}
+		advice := "write the down SQL by hand if the change can be reverted, or forward-fix instead of pretending to roll back"
+		if marked || (p.Plan != nil && p.Plan.Risk.OverallReversibility == db.ReversibilityIrreversible) {
+			advice = "forward-fix instead of pretending to roll back"
+		}
 		return fmt.Errorf(
-			"aborting rollback: down migration for applied version %s contains no executable SQL (an IRREVERSIBLE marker, not a restoration) — the plan classifies it irreversible; forward-fix instead of pretending to roll back",
-			p.File.Version)
+			"aborting rollback: down migration for applied version %s contains no executable SQL, so it restores nothing (%s); %s",
+			p.File.Version, grade, advice)
 	}
 	if p.Plan != nil && p.Plan.Risk.OverallReversibility == db.ReversibilityIrreversible {
 		return fmt.Errorf(
