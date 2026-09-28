@@ -6,7 +6,7 @@ Comprehensive benchmarks comparing Neutron ORM against Drizzle and Prisma on var
 
 ### Prerequisites
 
-Node.js 20+, pnpm
+Node.js 22+, pnpm
 
 ### Install & Run
 
