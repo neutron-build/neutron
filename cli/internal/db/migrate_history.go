@@ -295,18 +295,18 @@ func (s *MigrationSession) ApplyMigration(ctx context.Context, mf MigrationFile)
 }
 
 // execStatementsTx runs a migration file statement by statement inside tx,
-// each over the extended protocol (ExecOneStatement): the statements the
-// checks before apply classified are exactly the statements that run.
+// each its own single-command extended-protocol query, pipelined
+// (ExecStatementsPipelined): the statements the checks before apply
+// classified are exactly the statements that run.
 func execStatementsTx(ctx context.Context, tx pgx.Tx, sql string) error {
+	var exec []string
 	for _, stmt := range SplitSQLStatements(sql) {
-		if !hasExecutableSQL(stmt) {
-			continue
-		}
-		if _, err := ExecOneStatement(ctx, tx.Conn().PgConn(), stmt); err != nil {
-			return err
+		if hasExecutableSQL(stmt) {
+			exec = append(exec, stmt)
 		}
 	}
-	return nil
+	_, err := ExecStatementsPipelined(ctx, tx.Conn().PgConn(), exec, nil)
+	return err
 }
 
 // RevertMigration executes one down migration and deletes its history row in

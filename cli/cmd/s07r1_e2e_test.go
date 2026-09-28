@@ -81,7 +81,9 @@ func TestS07R1DollarIdentifierCannotHideAStatement(t *testing.T) {
 		}
 		writeFile(t, filepath.Join(mig, "001_scs.up.sql"), "SET LOCAL standard_conforming_strings = off;\nselect 'a\\''; drop table victim; select 'b';\n")
 		writeFile(t, filepath.Join(mig, "001_scs.down.sql"), "select 1;\n")
-		refused(t, bin, dbURL, []string{"turned standard_conforming_strings off", "refused"}, "migrate", "--dir", mig)
+		// The setting change is refused before apply: SET LOCAL may set only
+		// the timeout and index-build knobs (S07 review-2 N1).
+		refused(t, bin, dbURL, []string{"SET LOCAL standard_conforming_strings is refused"}, "migrate", "--dir", mig)
 		if victim() != "1" {
 			t.Fatal("victim was dropped by a statement no check saw")
 		}

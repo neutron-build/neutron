@@ -17,6 +17,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -63,10 +64,11 @@ func tokenizeSQL(s string) []sqlToken {
 	for i < n {
 		c := s[i]
 		switch {
-		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v':
 			i++
 		case c == '-' && i+1 < n && s[i+1] == '-':
-			j := strings.IndexByte(s[i:], '\n')
+			// PostgreSQL ends a line comment at LF or CR (newline = [\n\r]).
+			j := strings.IndexAny(s[i:], "\n\r")
 			if j < 0 {
 				emit('c', s[i:], i, n)
 				i = n
@@ -226,7 +228,7 @@ func SplitSQLStatements(sql string) []string {
 // fragmentIsLineCommentsOnly reports whether a fragment so far holds
 // nothing but whitespace and `--` comment lines.
 func fragmentIsLineCommentsOnly(s string) bool {
-	for _, line := range strings.Split(s, "\n") {
+	for _, line := range strings.FieldsFunc(s, func(r rune) bool { return r == '\n' || r == '\r' }) {
 		trimmed := strings.TrimSpace(line)
 		if trimmed != "" && !strings.HasPrefix(trimmed, "--") {
 			return false
@@ -659,13 +661,57 @@ func CheckStatementAllowlist(sql string) error {
 	if !hasExecutableSQL(sql) {
 		return nil
 	}
-	if StatementKind(sql) != "" {
-		return nil
+	if kind := StatementKind(sql); kind != "" {
+		return checkSessionSettingChange(sql, kind)
 	}
 	label := statementKindLabel(sql)
 	return fmt.Errorf(
 		"statement kind %s is refused in migration SQL: %s — migrations may contain only these statement kinds: SELECT (including WITH, with data-modifying CTEs target-guarded), INSERT/UPDATE/DELETE/MERGE, TRUNCATE, CREATE/ALTER/DROP of schema objects, and SET LOCAL; anything else is refused before any statement runs",
 		label, allowlistRefusalReason(label))
+}
+
+// setLocalAllowed are the settings a migration may change with SET LOCAL.
+// The checks before apply read statement text as UTF-8 with
+// standard_conforming_strings on, and resolve unqualified names through
+// the session's search_path; statements run one at a time, so a setting
+// changed by one statement applies to how the next is read and resolved.
+// Allowed are the settings that change neither lexing nor name
+// resolution: the lock and statement timeouts (the journal's knobs) and
+// maintenance_work_mem (index builds). search_path, client_encoding,
+// standard_conforming_strings, role and every other setting are refused.
+var setLocalAllowed = map[string]bool{
+	"lock_timeout": true, "statement_timeout": true, "maintenance_work_mem": true,
+}
+
+// checkSessionSettingChange refuses the statements that change session
+// settings outside setLocalAllowed: SET LOCAL of another setting, and
+// set_config() anywhere in a statement.
+func checkSessionSettingChange(sql, kind string) error {
+	toks := significantTokens(sql)
+	if kind == "set local" {
+		if len(toks) < 3 || (toks[2].kind != 'w' && toks[2].kind != 'q') || !setLocalAllowed[strings.ToLower(toks[2].text)] {
+			name := "(unnamed)"
+			if len(toks) >= 3 {
+				name = toks[2].text
+			}
+			return fmt.Errorf("SET LOCAL %s is refused in migration SQL: statements run one at a time, so a setting changed here would apply to how later statements are read and resolved, which the checks before apply cannot see — migrations may SET LOCAL only %s", name, strings.Join(sortedSettingNames(setLocalAllowed), ", "))
+		}
+	}
+	for _, t := range toks {
+		if (t.kind == 'w' || t.kind == 'q') && strings.EqualFold(t.text, "set_config") {
+			return fmt.Errorf("set_config() is refused in migration SQL: it changes session settings, which would apply to how later statements are read and resolved; use SET LOCAL with one of %s", strings.Join(sortedSettingNames(setLocalAllowed), ", "))
+		}
+	}
+	return nil
+}
+
+func sortedSettingNames(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -2163,33 +2209,135 @@ func (e *NontransactionalPartialError) Error() string {
 
 func (e *NontransactionalPartialError) Unwrap() error { return e.Err }
 
+// sessionReadError reports a session whose settings would make the server
+// read statement text differently than the checks before apply read it:
+// they tokenize UTF-8 text with standard_conforming_strings on. It is
+// checked before every statement and after it (statements reach the server
+// one at a time, so one statement's setting would apply to the next).
+// The server reports both settings whenever they change.
+func sessionReadError(conn *pgconn.PgConn) error {
+	if enc := conn.ParameterStatus("client_encoding"); enc != "" && !strings.EqualFold(enc, "UTF8") {
+		return fmt.Errorf("the session's client_encoding is %s: migration statements are checked as UTF-8 text and run only with client_encoding UTF8", enc)
+	}
+	if scs := conn.ParameterStatus("standard_conforming_strings"); scs != "" && scs != "on" {
+		return fmt.Errorf("the session's standard_conforming_strings is %s: migration statements are checked with it on (backslashes in string literals are ordinary characters) and run only with it on — set it on for the database or role (ALTER DATABASE ... SET standard_conforming_strings = on)", scs)
+	}
+	return nil
+}
+
 // ExecOneStatement runs one statement over the extended query protocol.
 // The server refuses text that holds more than one command there (42601,
 // "cannot insert multiple commands into a prepared statement"), while the
 // simple protocol pgx uses for an argument-less Exec runs every command in
-// the text. Every planned and migration statement goes through here, so
-// when a scanner and PostgreSQL disagree about where a statement ends, the
-// apply fails closed instead of running a statement no check saw.
+// the text. Every planned and migration statement goes through here or
+// ExecStatementsPipelined, so when a scanner and PostgreSQL disagree about
+// where a statement ends, the apply fails closed instead of running a
+// statement no check saw. Returned rows are discarded unread.
 //
-// Statements now reach the server one at a time, so a statement can change
-// how the server reads the next one. standard_conforming_strings is the one
-// setting that moves literal boundaries (with it off, '\'' ends where the
-// scanner, which assumes it on, reads a doubled quote); a statement that
-// turns it off (SET LOCAL, set_config) is refused before anything else
-// runs. The server reports the setting after every statement.
+// The session must read text as the checks did (sessionReadError) before
+// the statement runs and after it; the migration allowlist refuses the
+// statements that change those settings (SET LOCAL beyond its allowed
+// settings, set_config), and this check covers any other route.
 func ExecOneStatement(ctx context.Context, conn *pgconn.PgConn, sql string) (pgconn.CommandTag, error) {
-	res := conn.ExecParams(ctx, sql, nil, nil, nil, nil).Read()
-	if res.Err != nil {
-		return res.CommandTag, res.Err
+	if err := sessionReadError(conn); err != nil {
+		return pgconn.CommandTag{}, fmt.Errorf("refused before %q ran: %w", firstSQLLine(sql), err)
 	}
-	if scs := conn.ParameterStatus("standard_conforming_strings"); scs != "" && scs != "on" {
-		if conn.TxStatus() == 'I' {
-			// Outside a transaction no rollback restores it.
-			_ = conn.ExecParams(ctx, "SET standard_conforming_strings = on", nil, nil, nil, nil).Read()
+	tag, err := conn.ExecParams(ctx, sql, nil, nil, nil, nil).Close()
+	if err != nil {
+		return tag, err
+	}
+	if err := afterStatement(ctx, conn, sql); err != nil {
+		return tag, err
+	}
+	return tag, nil
+}
+
+// afterStatement refuses to go on once a statement changed a setting
+// sessionReadError requires. Outside a transaction no rollback restores
+// the setting, so it is reset.
+func afterStatement(ctx context.Context, conn *pgconn.PgConn, sql string) error {
+	err := sessionReadError(conn)
+	if err == nil {
+		return nil
+	}
+	if conn.TxStatus() == 'I' {
+		_, _ = conn.ExecParams(ctx, "RESET client_encoding", nil, nil, nil, nil).Close()
+		_, _ = conn.ExecParams(ctx, "RESET standard_conforming_strings", nil, nil, nil, nil).Close()
+	}
+	return fmt.Errorf("refused after %q ran: %w", firstSQLLine(sql), err)
+}
+
+// pipelineBatch bounds how many statements are in flight per round trip.
+const pipelineBatch = 1000
+
+// ExecStatementsPipelined runs statements inside the caller's transaction,
+// each as its own extended-protocol query (single command, as in
+// ExecOneStatement), sending up to pipelineBatch of them per round trip.
+// A statement that fails stops the rest: the server skips everything after
+// an error up to the batch's sync point. It returns the index of the
+// failing statement with its error; onDone is called, in order, for each
+// statement that completed. The session settings are checked before the
+// first statement and after each batch; within a batch, the allowlist is
+// what keeps a statement from changing them.
+func ExecStatementsPipelined(ctx context.Context, conn *pgconn.PgConn, stmts []string, onDone func(i int)) (int, error) {
+	if len(stmts) == 0 {
+		return 0, nil
+	}
+	if err := sessionReadError(conn); err != nil {
+		return 0, fmt.Errorf("refused before %q ran: %w", firstSQLLine(stmts[0]), err)
+	}
+	for start := 0; start < len(stmts); start += pipelineBatch {
+		end := min(start+pipelineBatch, len(stmts))
+		p := conn.StartPipeline(ctx)
+		for _, stmt := range stmts[start:end] {
+			p.SendQueryParams(stmt, nil, nil, nil, nil)
 		}
-		return res.CommandTag, fmt.Errorf("%q turned standard_conforming_strings off: statements after it would be read differently than the checks before apply read them (backslashes in string literals become escapes); refused — migration SQL must keep standard_conforming_strings on", firstSQLLine(sql))
+		if err := p.Sync(); err != nil {
+			_ = p.Close()
+			return start, err
+		}
+		next, failed := start, -1
+		var failure error
+	drain:
+		for {
+			res, err := p.GetResults()
+			switch r := res.(type) {
+			case *pgconn.ResultReader:
+				_, err = r.Close()
+			case *pgconn.PipelineSync:
+				break drain
+			case nil:
+				if err == nil {
+					break drain
+				}
+			default:
+				continue
+			}
+			if err != nil {
+				var pgErr *pgconn.PgError
+				if !errors.As(err, &pgErr) {
+					_ = p.Close()
+					return next, err
+				}
+				if failure == nil {
+					failed, failure = next, err
+				}
+			} else if failure == nil && onDone != nil {
+				onDone(next)
+			}
+			next++
+		}
+		if err := p.Close(); err != nil && failure == nil {
+			return next, err
+		}
+		if failure != nil {
+			return failed, failure
+		}
+		if err := afterStatement(ctx, conn, stmts[end-1]); err != nil {
+			return end - 1, err
+		}
 	}
-	return res.CommandTag, nil
+	return len(stmts), nil
 }
 
 // ApplyNontransactionalMigration executes each statement as its own implicit
@@ -2250,20 +2398,28 @@ func (s *MigrationSession) ApplyStatementsTx(ctx context.Context, statements []s
 		return fmt.Errorf("begin transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
-	for _, stmt := range statements {
-		if !hasExecutableSQL(stmt) {
-			if onApplied != nil {
-				onApplied(stmt)
-			}
-			continue
-		}
-		if _, err := ExecOneStatement(ctx, tx.Conn().PgConn(), stmt); err != nil {
-			return fmt.Errorf("apply %q: %w", firstSQLLine(stmt), err)
-		}
-		if onApplied != nil {
-			onApplied(stmt)
+	// Comment-only entries are reported in order without being sent.
+	var exec []string
+	var at []int
+	for i, stmt := range statements {
+		if hasExecutableSQL(stmt) {
+			exec = append(exec, stmt)
+			at = append(at, i)
 		}
 	}
+	reported := 0
+	report := func(upTo int) {
+		for ; reported < upTo; reported++ {
+			if onApplied != nil {
+				onApplied(statements[reported])
+			}
+		}
+	}
+	failed, err := ExecStatementsPipelined(ctx, tx.Conn().PgConn(), exec, func(i int) { report(at[i] + 1) })
+	if err != nil {
+		return fmt.Errorf("apply %q: %w", firstSQLLine(exec[min(failed, len(exec)-1)]), err)
+	}
+	report(len(statements))
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit: %w", err)
 	}
