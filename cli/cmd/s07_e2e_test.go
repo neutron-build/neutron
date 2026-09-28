@@ -201,3 +201,56 @@ func TestS07NontransactionalFailureWording(t *testing.T) {
 		})
 	}
 }
+
+// s07NoteDoc is table public.t (id) plus a text column note.
+const s07NoteDoc = `{"version": 2, "dialect": "postgresql", "capabilities": [], "schemas": [{"name": "public"}],
+	"tables": [{"identity": {"schema": "public", "name": "t"}, "managed": true,
+		"columns": [{"name": "id", "type": {"name": "int4", "codec": "number"}, "notNull": true}, {"name": "note", "type": {"name": "text", "codec": "string"}, "notNull": false}],
+		"constraints": [{"name": "t_pkey", "type": "primary-key", "columns": ["id"]}], "indexes": []}],
+	"enums": [], "views": [], "opaque": []}`
+
+// TestS07UnsluggedPlanNameNamesTheFix: a plan.json an earlier CLI wrote
+// with the raw --name ("Init Schema") next to files named by its slug is
+// refused with the fix spelled out, and applying that fix works (Q09
+// review-1 INFO 6).
+func TestS07UnsluggedPlanNameNamesTheFix(t *testing.T) {
+	bin := buildCLIBinary(t)
+	dbURL, fx := newM02CommandDB(t, "s07slug")
+	if err := fx.Exec(context.Background(), `CREATE TABLE t (id integer PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir()
+	mig := filepath.Join(work, "migrations")
+	doc := filepath.Join(work, "d.json")
+	writeFile(t, doc, s07NoteDoc)
+	for _, args := range [][]string{
+		{"schema", "baseline", "--dir", mig},
+		{"migrate", "generate", "--mode", "snapshot", "--dir", mig, "--schema", doc, "--name", "Init Schema"},
+	} {
+		if code, out := runCLIProcess(t, bin, dbURL, args...); code != 0 {
+			t.Fatalf("neutron %s exited %d:\n%s", strings.Join(args, " "), code, out)
+		}
+	}
+	planPath := filepath.Join(mig, "001_init_schema.plan.json")
+	current := string(mustReadFile(t, planPath))
+	old := strings.Replace(current, `"migrationName": "init_schema"`, `"migrationName": "Init Schema"`, 1)
+	if old == current {
+		t.Fatalf("fixture: plan.json does not record the slug:\n%s", current)
+	}
+	writeFile(t, planPath, old)
+
+	code, out := runCLIProcess(t, bin, dbURL, "migrate", "--dir", mig)
+	if code == 0 {
+		t.Fatalf("the unslugged plan must be refused:\n%s", out)
+	}
+	if w := `set "migrationName" to "init_schema" in 001_init_schema.plan.json`; !strings.Contains(out, w) {
+		t.Fatalf("the refusal must name the fix %q:\n%s", w, out)
+	}
+	writeFile(t, planPath, current)
+	if code, out := runCLIProcess(t, bin, dbURL, "migrate", "--dir", mig); code != 0 {
+		t.Fatalf("after the named fix, migrate must apply (%d):\n%s", code, out)
+	}
+	if got := q09Query(t, fx, `SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name = 't'`); got != "id,note" {
+		t.Fatalf("t columns %s", got)
+	}
+}
