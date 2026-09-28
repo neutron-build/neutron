@@ -175,7 +175,7 @@ func TestS07NontransactionalFailureWording(t *testing.T) {
 			want:    []string{"002_idx failed MID-FILE outside any transaction; its earlier statements' effects REMAIN", "statement 2 of 2 failed after 1 statement(s) had already taken effect", "neutron migrate resolve 002"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			dbURL, _ := newM02CommandDB(t, "s07ntx")
+			dbURL, fx := newM02CommandDB(t, "s07ntx")
 			mig := filepath.Join(t.TempDir(), "migrations")
 			if err := os.MkdirAll(mig, 0o755); err != nil {
 				t.Fatal(err)
@@ -197,6 +197,26 @@ func TestS07NontransactionalFailureWording(t *testing.T) {
 				if strings.Contains(out, w) {
 					t.Errorf("output must not say %q:\n%s", w, out)
 				}
+			}
+			if c.name != "second statement" {
+				return
+			}
+			// resolve numbers the statements as migrate did (S07 review-1
+			// F3): the header comment is not statement 1.
+			code, out = runCLIProcess(t, bin, dbURL, "migrate", "resolve", "002", "--dir", mig)
+			for _, w := range []string{"statement 1 [satisfied] index-create: CREATE INDEX CONCURRENTLY t_v", "statement 2 [unsatisfied] index-create: CREATE INDEX CONCURRENTLY t_nope"} {
+				if !strings.Contains(out, w) {
+					t.Errorf("resolve must say %q (%d):\n%s", w, code, out)
+				}
+			}
+			// The retry maps the numbering back to the file's statements:
+			// it skips statement 1 and re-runs statement 2.
+			if err := fx.Exec(context.Background(), `ALTER TABLE t ADD COLUMN nope int`); err != nil {
+				t.Fatal(err)
+			}
+			code, out = runCLIProcess(t, bin, dbURL, "migrate", "resolve", "002", "--retry", "--dir", mig)
+			if code != 0 || !strings.Contains(out, "skipping statement 1 — effect already present: CREATE INDEX CONCURRENTLY t_v") || !strings.Contains(out, "applied: CREATE INDEX CONCURRENTLY t_nope") {
+				t.Fatalf("resolve --retry (%d):\n%s", code, out)
 			}
 		})
 	}

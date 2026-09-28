@@ -287,7 +287,7 @@ func resolveRetry(ctx context.Context, client *db.Client, sess *db.MigrationSess
 				ui.Infof("skipping statement %d — effect already present: %s", e.Index, e.FirstLine)
 				continue
 			}
-			remaining = append(remaining, p.Statements[e.Index-1])
+			remaining = append(remaining, p.Statements[e.fragment])
 		}
 		ui.Infof("Re-running %d remaining statement(s) of %s outside a transaction (concurrent operations)", len(remaining), p.File.Version)
 		if err := sess.ApplyNontransactionalMigration(ctx, p.File, remaining, func(i int, stmt string) {

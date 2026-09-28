@@ -534,7 +534,13 @@ func refuseNontransactionalDataChanges(pendings []pendingMigration) error {
 
 // statementEffect is one statement's durable-state verdict.
 type statementEffect struct {
+	// Index numbers executable statements from 1, as migrate's failure
+	// report does; comment-only fragments (the file header) are not
+	// counted. fragment is the statement's position in
+	// db.SplitSQLStatements output, which pendingMigration.Statements
+	// holds.
 	Index        int
+	fragment     int
 	FirstLine    string
 	Kind         string
 	State        string // "satisfied" | "unsatisfied" | "invalid" | "unverifiable"
@@ -621,11 +627,13 @@ func inspectEffects(ctx context.Context, client *db.Client, f db.MigrationFile) 
 		return inspectJournaledEffects(ctx, client, jf)
 	}
 	report := &effectsReport{}
+	n := 0
 	for i, stmt := range db.SplitSQLStatements(f.SQL) {
 		if !hasExecutableStmt(stmt) {
 			continue
 		}
-		effect := statementEffect{Index: i + 1, FirstLine: firstLine(stmt), State: "unverifiable"}
+		n++
+		effect := statementEffect{Index: n, fragment: i, FirstLine: firstLine(stmt), State: "unverifiable"}
 		if post, ok := db.StatementPostconditionOf(stmt); ok {
 			effect.Kind = post.Kind
 			effect.CreationSide = post.IsCreationSide()
