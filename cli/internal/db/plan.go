@@ -439,7 +439,7 @@ func LoadSnapshotChain(migrationsDir string) (*SnapshotChain, error) {
 		if other, ok := snapByVersion[stemVersion(stem)]; ok {
 			return nil, fmt.Errorf("migration file %s.up.sql has no snapshot of its own — snapshot %s shares version %q but a same-version snapshot covers only its own migration (merge residue or duplicate ID); reconcile the directory by hand", stem, other, stemVersion(stem))
 		}
-		return nil, fmt.Errorf("migration %s has a .up.sql file but no snapshot — the snapshot chain is incomplete (hand-authored migrations need `neutron schema baseline` at the current applied state, or generate them with `neutron migrate generate --mode snapshot`)", stem)
+		return nil, fmt.Errorf("migration %s has a .up.sql file but no snapshot — the snapshot chain is incomplete: move the file out of the migrations directory and plan its change with `neutron migrate generate --mode snapshot`, or re-baseline around it: delete migrations/snapshots, apply it with `neutron migrate`, then run `neutron schema baseline`", stem)
 	}
 	upStemSet := map[string]bool{}
 	for _, stem := range upStems {
