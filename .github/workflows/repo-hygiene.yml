@@ -57,7 +57,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
       # Lives here rather than in the conformance workflow because that one is
       # path-filtered to the SDK trees, and the thing most likely to break this
       # is an edit to FRAMEWORK_CONTRACT.md itself. Dependency-free and boots no

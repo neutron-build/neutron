@@ -25,12 +25,12 @@ case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
     echo "neutron: Windows is supported through WSL, not natively." >&2
     echo "         Install WSL (wsl --install), then run this installer inside the Linux shell." >&2
-    echo "         See https://neutron.build/docs/cli" >&2
+    echo "         See https://neutron.build/docs/cli/overview" >&2
     exit 1
     ;;
   *)
     echo "neutron: unsupported OS: $(uname -s)" >&2
-    echo "         supported: macOS, Linux, and Windows through WSL. See https://neutron.build/docs/cli" >&2
+    echo "         supported: macOS, Linux, and Windows through WSL. See https://neutron.build/docs/cli/overview" >&2
     exit 1
     ;;
 esac
@@ -40,7 +40,7 @@ case "$(uname -m)" in
   arm64|aarch64) ARCH="arm64" ;;
   *)
     echo "neutron: unsupported architecture: $(uname -m)" >&2
-    echo "         supported: x86_64, arm64. See https://neutron.build/docs/cli" >&2
+    echo "         supported: x86_64, arm64. See https://neutron.build/docs/cli/overview" >&2
     exit 1
     ;;
 esac

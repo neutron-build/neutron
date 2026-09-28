@@ -393,8 +393,7 @@ published CLI targets) and onboarding on Linux.
 
 - **Engines.** PostgreSQL 15, 16, 17 and 18 are verified: the CLI suite,
   which carries Studio's HTTP and end-to-end tests, passes on all four
-  (`orm-matrix.yml`; 15 from local runs on 15.19, before its first matrix
-  run). PostgreSQL 14 is not supported. Pull requests also run the
+  (`orm-matrix.yml` run 36373029021). PostgreSQL 14 is not supported. Pull requests also run the
   real-browser journey on 17 (see the support matrix in
   `typescript/packages/neutron-sql/README.md`). Nucleus connections open the
   model modules, measured against Nucleus 1.0.2 and not advertised for
