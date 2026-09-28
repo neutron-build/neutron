@@ -567,6 +567,9 @@ func (s *Server) prepareCommitOps(ctx context.Context, connID string, ops []comm
 		if err != nil {
 			return nil, fmtOpError(i, err)
 		}
+		if err := ruleRefusal(target.meta, op.Schema, op.Table, op.Op); err != nil {
+			return nil, fmtOpError(i, err)
+		}
 		p := &preparedOp{
 			index:   i,
 			kind:    op.Op,

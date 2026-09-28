@@ -239,6 +239,25 @@ func tableReadOnlyState(meta *tableMeta, versioned bool) readOnlyState {
 	return readOnlyState{versioned: true}
 }
 
+// ruleEventTypes maps a write verb to its pg_rewrite ev_type.
+var ruleEventTypes = map[string]string{"update": "2", "insert": "3", "delete": "4"}
+
+// ruleRefusal refuses a write that a rule on the table would rewrite. The
+// guarded, version-checked statements run inside WITH and return the row
+// version; PostgreSQL refuses a DO ALSO or conditional rule there and
+// RETURNING through a DO INSTEAD rule, so the write could never apply.
+// Refusing up front names the cause (a 4xx) instead of passing the
+// server's error on as a 5xx. Writes no rule covers stay editable.
+func ruleRefusal(meta *tableMeta, schemaName, tableName, verb string) error {
+	ev := ruleEventTypes[verb]
+	if ev == "" || !strings.Contains(meta.RuleEvents, ev) {
+		return nil
+	}
+	return mutationDomainError{msg: fmt.Sprintf(
+		"%s.%s has a rule on %s (CREATE RULE ... DO INSTEAD / DO ALSO), and Studio's guarded %s cannot run through a rule rewrite; nothing was applied — make this change with SQL",
+		schemaName, tableName, strings.ToUpper(verb), verb)}
+}
+
 // probeVersioned reports whether xmin is usable on this table/connection.
 // The probe selects zero rows, so empty tables are probed correctly.
 // Degrading to false (and the table becoming read-only) is the fail-safe
@@ -560,6 +579,10 @@ func (s *Server) handleTableRowUpdateV2(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	meta := target.meta
+	if err := ruleRefusal(meta, body.Schema, body.Table, "update"); err != nil {
+		writeDomainError(w, err)
+		return
+	}
 	keyArgs, keyCols, err := validateKeyTuple(meta, body.Key)
 	if err != nil {
 		writeDomainError(w, err)
@@ -628,6 +651,10 @@ func (s *Server) handleTableRowDeleteV2(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
+	if err := ruleRefusal(target.meta, body.Schema, body.Table, "delete"); err != nil {
+		writeDomainError(w, err)
+		return
+	}
 	keyArgs, keyCols, err := validateKeyTuple(target.meta, body.Key)
 	if err != nil {
 		writeDomainError(w, err)
@@ -668,6 +695,10 @@ func (s *Server) handleTableRowInsertV2(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	meta := target.meta
+	if err := ruleRefusal(meta, body.Schema, body.Table, "insert"); err != nil {
+		writeDomainError(w, err)
+		return
+	}
 
 	colNames, args, err := validateInsertValues(meta, body.Values, body.Schema, body.Table)
 	if err != nil {

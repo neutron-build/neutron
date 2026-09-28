@@ -214,6 +214,11 @@ type tableMeta struct {
 	// rows carry no local xmin (always 0) and a remote ctid, so neither the
 	// version check nor the tuple binding can guard a write to them.
 	ForeignDescendant bool
+	// RuleEvents holds the pg_rewrite ev_type of every rule on a write to
+	// the table ('2' UPDATE, '3' INSERT, '4' DELETE). A rule rewrites the
+	// guarded statement, which PostgreSQL then refuses (a DO ALSO rule in
+	// WITH, RETURNING through DO INSTEAD); see ruleRefusal.
+	RuleEvents string
 }
 
 // tableMetaSQL reads the table's columns, primary-key membership and key
@@ -248,7 +253,12 @@ SELECT a.attname,
 		       SELECT i.inhrelid FROM pg_catalog.pg_inherits i JOIN d ON i.inhparent = d.oid
 	       )
 	       SELECT 1 FROM d JOIN pg_catalog.pg_class k ON k.oid = d.oid WHERE k.relkind = 'f'
-       )
+       ),
+       COALESCE((
+	       SELECT pg_catalog.string_agg(DISTINCT r.ev_type::text, '')
+	       FROM pg_catalog.pg_rewrite r
+	       WHERE r.ev_class = c.oid AND r.ev_type IN ('2','3','4')
+       ), '')
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
@@ -274,7 +284,7 @@ func fetchTableMeta(ctx context.Context, client *db.Client, schemaName, tableNam
 		var keyPos int32
 		if err := rows.Scan(&col.Name, &keyPos, &col.Identity, &col.Generated, &col.DefaultExpr,
 			&col.TypeOID, &col.TypeName, &col.TypType, &col.NotNull,
-			&meta.RelOID, &col.CanUpdate, &col.CanInsert, &meta.CanDelete, &col.Attnum, &meta.ForeignDescendant); err != nil {
+			&meta.RelOID, &col.CanUpdate, &col.CanInsert, &meta.CanDelete, &col.Attnum, &meta.ForeignDescendant, &meta.RuleEvents); err != nil {
 			return nil, err
 		}
 		col.KeyPos = int(keyPos)
