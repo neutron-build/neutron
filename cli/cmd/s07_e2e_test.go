@@ -154,3 +154,50 @@ func TestS07ChainIncompleteHintAfterBaseline(t *testing.T) {
 		t.Fatalf("t columns %s", got)
 	}
 }
+
+// TestS07NontransactionalFailureWording: a nontransactional migration that
+// fails at its first statement says so (nothing of it ran before), and one
+// that fails later still reports the earlier statements' effects as
+// remaining (Q09 review-2 INFO 4).
+func TestS07NontransactionalFailureWording(t *testing.T) {
+	bin := buildCLIBinary(t)
+	for _, c := range []struct {
+		name, up string
+		want     []string
+		notWant  []string
+	}{
+		{name: "first statement",
+			up:      "-- Migration: idx\nCREATE INDEX CONCURRENTLY t_nope ON t (nope);\n",
+			want:    []string{"002_idx failed at its first statement, outside any transaction; no earlier statement of it ran", "statement 1 of 1 failed; no earlier statement had run", "neutron migrate resolve 002"},
+			notWant: []string{"MID-FILE", "REMAIN", "already taken effect"}},
+		{name: "second statement",
+			up:      "-- Migration: idx\nCREATE INDEX CONCURRENTLY t_v ON t (v);\nCREATE INDEX CONCURRENTLY t_nope ON t (nope);\n",
+			want:    []string{"002_idx failed MID-FILE outside any transaction; its earlier statements' effects REMAIN", "statement 2 of 2 failed after 1 statement(s) had already taken effect", "neutron migrate resolve 002"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dbURL, _ := newM02CommandDB(t, "s07ntx")
+			mig := filepath.Join(t.TempDir(), "migrations")
+			if err := os.MkdirAll(mig, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			writeFile(t, filepath.Join(mig, "001_init.up.sql"), "CREATE TABLE t (id int PRIMARY KEY, v int);\n")
+			writeFile(t, filepath.Join(mig, "001_init.down.sql"), "DROP TABLE t;\n")
+			writeFile(t, filepath.Join(mig, "002_idx.up.sql"), c.up)
+			writeFile(t, filepath.Join(mig, "002_idx.down.sql"), "DROP INDEX IF EXISTS t_v;\n")
+			code, out := runCLIProcess(t, bin, dbURL, "migrate", "--dir", mig)
+			if code == 0 {
+				t.Fatalf("the migration must fail:\n%s", out)
+			}
+			for _, w := range c.want {
+				if !strings.Contains(out, w) {
+					t.Errorf("output must say %q:\n%s", w, out)
+				}
+			}
+			for _, w := range c.notWant {
+				if strings.Contains(out, w) {
+					t.Errorf("output must not say %q:\n%s", w, out)
+				}
+			}
+		})
+	}
+}
