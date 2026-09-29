@@ -6980,7 +6980,7 @@ impl Executor {
                     Ok(r) => r,
                     Err(e) => {
                         block.close(false);
-                        return Err(e.into());
+                        return Err(e);
                     }
                 }
             };
