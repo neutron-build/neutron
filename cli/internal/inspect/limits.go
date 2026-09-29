@@ -162,12 +162,16 @@ type MeasuredBuild struct {
 	Recorded       string `json:"recorded"`
 }
 
-// Measured is the build the capability report and the X01-X05 legs ran on.
+// Measured is the build the capability report was recorded on. The X01-X05
+// leg evidence cited by the limits was measured on nucleus tree
+// 3313729ae51300b67b77b2181ee87ac5287dfdec (2026-09-24). The engine changes
+// since (transaction-scoped SET state, row-lock rechecks) do not touch those
+// model families, and their legs have not been re-run on the newer tree.
 var Measured = MeasuredBuild{
 	Report:         SrcCapabilityReport,
 	NucleusVersion: "1.0.2",
-	NucleusTree:    "3313729ae51300b67b77b2181ee87ac5287dfdec",
-	Recorded:       "2026-09-24",
+	NucleusTree:    "665c76c18ac3f6edb142e6d6950ac53b9d7fa583",
+	Recorded:       "2026-09-29",
 }
 
 // LiveSettings are PostgreSQL settings read from the connection itself: the
