@@ -110,9 +110,30 @@ fn query_ids(ex: &Executor, sql: &str) -> Vec<i64> {
     }
 }
 
-/// True top-k ids for `q` by brute force over the reference model.
-fn brute_topk(model: &BTreeMap<i64, Vec<f32>>, q: &[f32], k: usize) -> Vec<i64> {
-    let mut scored: Vec<(f64, i64)> = model.iter().map(|(id, v)| (l2_sq(q, v), *id)).collect();
+/// Cosine distance (1 - cos), the metric `VECTOR_DISTANCE(.., 'cosine')` orders by.
+fn cosine_dist(a: &[f32], b: &[f32]) -> f64 {
+    let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+    for (x, y) in a.iter().zip(b.iter()) {
+        let (x, y) = (*x as f64, *y as f64);
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 1.0;
+    }
+    1.0 - dot / (na.sqrt() * nb.sqrt())
+}
+
+/// True top-k ids for `q` by brute force over the reference model, under the
+/// same metric the indexed query orders by (ranking by L2 for a cosine query
+/// scores the index against the wrong ground truth).
+fn brute_topk(model: &BTreeMap<i64, Vec<f32>>, q: &[f32], k: usize, metric: &str) -> Vec<i64> {
+    let dist = |v: &[f32]| match metric {
+        "cosine" => cosine_dist(q, v),
+        _ => l2_sq(q, v),
+    };
+    let mut scored: Vec<(f64, i64)> = model.iter().map(|(id, v)| (dist(v), *id)).collect();
     scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
     scored.into_iter().take(k).map(|(_, id)| id).collect()
 }
@@ -132,7 +153,7 @@ fn measure_recall(
     let mut sum = 0.0;
     for _ in 0..queries {
         let q = rand_vec(rng);
-        let truth: std::collections::HashSet<i64> = brute_topk(model, &q, k).into_iter().collect();
+        let truth: std::collections::HashSet<i64> = brute_topk(model, &q, k, metric).into_iter().collect();
         let sql = format!(
             "SELECT id FROM vr ORDER BY VECTOR_DISTANCE(v, {}, '{metric}') ASC LIMIT {k}",
             vec_lit(&q)
