@@ -366,9 +366,16 @@ session-level changes, ROLLBACK (also COMMIT of an aborted transaction, pool
 return and disconnect) restores the BEGIN snapshot, `ROLLBACK TO SAVEPOINT`
 restores the savepoint's. `RESET ROLE` and `DISCARD ALL` drop an
 assumed role, as in PostgreSQL. A multi-statement simple query gets an
-implicit block for `SET` state, as in PostgreSQL 17 (`set local role x; select
-current_user` runs the SELECT as `x`; the role ends with the message; an error
-reverts the message's `SET`s); `SET LOCAL` in a single-statement message, or
+implicit block for `SET` / `SET LOCAL` / `SET ROLE` state only, matching
+PostgreSQL 17 on the scripted cases (`set local role x; select current_user`
+runs the SELECT as `x`; the role ends with the message; an error or a
+cancelled message reverts the message's `SET`s; COMMIT or ROLLBACK inside the
+message ends the block and the next statement opens a new one). **Known
+divergence, out of scope here:** the block does not cover data. Statements in a
+multi-statement message still autocommit one by one, so the data effects of
+earlier statements persist when a later one fails, where PostgreSQL rolls the
+whole message back. Candidate follow-up: "multi-statement simple queries are
+not atomic". `SET LOCAL` in a single-statement message, or
 outside a block, does nothing (server-side warning only, no client NOTICE).
 `lock_timeout` is per session and follows the same scoping (it was one
 engine-global value). A COMMIT or ROLLBACK whose storage step fails returns the
