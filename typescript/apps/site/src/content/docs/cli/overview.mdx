@@ -8,7 +8,7 @@ The Neutron CLI is a single binary that works across all languages in the ecosys
 ## Install
 
 Download a prebuilt Go CLI archive from the
-[GitHub releases](https://github.com/neutron-build/neutron/releases/tag/cli%2Fv0.1.0),
+[GitHub releases](https://github.com/neutron-build/neutron/releases/tag/cli%2Fv0.3.0),
 or build the current source:
 
 ```bash
@@ -33,9 +33,10 @@ npx neutron-ts --help
 
 | Area | Commands |
 |------|----------|
-| **Projects** | `new`, `init`, `dev`, `desktop`, `native` |
-| **Database** | `db start`, `db stop`, `db status`, `db reset` |
-| **Migrations** | `migrate`, `migrate status`, `migrate create` |
+| **Projects** | `new`, `init`, `dev`, `desktop`, `native`, `project` |
+| **Database** | `db start`, `db stop`, `db status`, `db reset`, `db push` |
+| **Schema** | `schema export`, `schema pull`, `schema check`, `schema baseline` |
+| **Migrations** | `migrate`, `migrate status`, `migrate create`, `migrate generate`, `migrate down`, `migrate adopt`, `migrate resolve` |
 | **Data** | `seed`, `repl` |
 | **Tools** | `generate`, `studio`, `mcp`, `doctor`, `upgrade`, `completion`, `version` |
 

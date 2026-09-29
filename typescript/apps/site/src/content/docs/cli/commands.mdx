@@ -40,6 +40,8 @@ Delegates to the language-specific dev server based on auto-detection.
 
 If `neutron.toml` has an `[application]` table, `neutron dev` instead starts its services in dependency order; `--service NAME` selects one service plus its dependencies. See [Multi-service applications](/docs/cli/applications), which also covers `neutron project check`, `plan` and `run`.
 
+Application projects (`neutron.toml` with an `[application]` table) also have `neutron project check`, `plan`, `run` and `spec`; see [Multi-service applications](/docs/cli/applications).
+
 ### `neutron generate`
 
 Generate typed models from one database table or every table in a schema.
@@ -50,6 +52,8 @@ neutron generate --all --schema public --lang go --out internal/models/
 ```
 
 Supported targets are Go, TypeScript (`ts`), Rust, Python, Elixir, and Zig.
+
+**Flags:** `--table`, `--all`, `--schema` (default `public`), `--lang` (`go`, `ts`, `rust`, `python`, `elixir`, `zig`), `--out` (file or directory; `-` for stdout, the default).
 
 ## Database
 
@@ -102,7 +106,9 @@ The plan runs in one transaction, under the migration lock, with one exception: 
 
 Statements the connected server cannot run are refused at plan time, before anything is applied: changing a generated column's expression needs `ALTER COLUMN ... SET EXPRESSION`, PostgreSQL 17+.
 
-Push refuses a database with migration history unless `--force`, and drops nothing absent from the schema without `--allow-destructive`; neither flag touches `_neutron_*` metadata or extension-owned objects.
+Push refuses a database with migration history unless `--force`, and drops nothing absent from the schema without `--allow-destructive`; neither flag touches `_neutron_*` metadata or extension-owned objects. Column order is informational: a column declared between existing ones is added last, and an order difference plans nothing.
+
+**Flags:** `--schema` (schema document, default `neutron.schema.json`), `--dry-run`, `--force`, `--allow-destructive`, `--rename table.old>table.new` (repeatable; quote it, `>` is a shell redirect), `--timeout` (default 1m).
 
 ### `neutron schema`
 
@@ -115,6 +121,12 @@ neutron schema check      # desired document vs the snapshot chain (offline)
 neutron schema check --live   # database vs the applied snapshots: drift
 neutron schema baseline   # record an existing database as the chain root (read-only)
 ```
+
+**Flags:**
+- `schema export` — `--module` (compiled schema module, default `export-schema.mjs` or `[migrations].module`), `--out` (default `neutron.schema.json` or `[migrations].schema`), `--timeout` (default 2m). The module runs as a direct `node` child process, prints one schema document v2 to stdout, and the result is written atomically.
+- `schema pull` — `--out` (default `neutron.schema.pulled.json`), `--timeout` (default 30s). A user table with a foreign key into a `_neutron_*` table cannot be described by a schema document: pull refuses and names it.
+- `schema check` — `--schema`, `--dir`, `--live`, `--timeout` (default 30s). Exits 1 when the document has pending changes, or with `--live` when the database has drifted.
+- `schema baseline` — `--dir`, `--timeout` (default 30s). Holds the migration lock while it reads, so it needs a second connection.
 
 A baseline moves the migrations directory to the snapshot workflow, one way: from then on `neutron migrate` refuses any migration without a snapshot ("the snapshot chain is incomplete"), including files from `neutron migrate create` and from `neutron migrate generate` in live mode. Generate later migrations with `--mode snapshot`, or set `[migrations] snapshots = true`. `schema baseline` refuses to run while a baseline exists, while any migration file is unapplied, and while older history is not adopted and migration files exist (with no migration files it writes the baseline and warns that the history is not adopted); it leaves out the `_neutron_*` tables the CLI manages. A baseline from an earlier CLI that recorded `_neutron_migrations` keeps working: leave it in place, because later snapshots chain to its hash. An earlier CLI also let a baseline cover files that were not applied yet; `schema check --live` passes until such a file is applied, then reports drift. Compare the baseline's `covers` list with the pending files in `neutron migrate status`, and if a covered file is pending, re-baseline once as the upgrade steps in the `@neutron-build/sql` README describe.
 
@@ -129,6 +141,8 @@ neutron migrate
 neutron migrate --dir db/migrations    # custom directory
 ```
 
+**Flags:** `--dir` (default `migrations`), `--timeout` (total budget for the batch, default 1m, `0` for none), `--allow-destructive` (acknowledge data loss: drops, `TRUNCATE`, and similar).
+
 Migrations are `.up.sql` files named `{NNN}_{name}.up.sql`. Each runs in a transaction that also records its history row (version, checksum, owner, format), so a migration is either fully applied or not applied at all.
 
 PostgreSQL cannot use an enum value inside the transaction that adds it (SQLSTATE 55P04). A migration that adds an enum value and uses it (in a view, check, default or cast) therefore rolls back, and the error names the fix: move the `alter type ... add value` statements into their own earlier migration. `neutron migrate generate` writes enum value additions that way (`{NNN}_{name}_enum_values`, then `{NNN+1}_{name}`) whenever the plan also changes anything else.
@@ -136,6 +150,18 @@ PostgreSQL cannot use an enum value inside the transaction that adds it (SQLSTAT
 Before any statement runs, migrations that need a newer PostgreSQL than the connected server are refused: a snapshot plan's recorded `minServerMajor`, or a version-gated statement such as `ALTER COLUMN ... SET EXPRESSION` (changing a generated column's expression, PostgreSQL 17+). `neutron migrate resolve --retry` applies the same check, and `--abort` checks the down SQL it would run.
 
 Runners are serialized across processes with a PostgreSQL session-level advisory lock held on a dedicated connection from the history read through the final apply. Transaction-pooled proxies (for example PgBouncer in transaction mode) are unsupported for migration connections — use a direct or session-pooled connection.
+
+Migration files may contain only these statement kinds: `SELECT` and DML (`INSERT`/`UPDATE`/`DELETE`/`MERGE`), `TRUNCATE`, create/alter/drop of schema objects (including `CREATE INDEX CONCURRENTLY`), and `SET LOCAL`. Anything else is refused before the file runs; no flag bypasses this.
+
+Operational migrations (concurrent indexes on large tables, bounded backfills) can opt into the step journal with a `-- neutron:journaled` line before the first statement. Each step then carries a verification, either a built-in structural postcondition or a declared one:
+
+```sql
+-- neutron:journaled
+-- neutron:step verify="SELECT count(*) FROM t WHERE col IS NULL" expect="0"
+UPDATE t SET col = 0 WHERE col IS NULL AND id <= 500;
+```
+
+Verified steps are skipped on apply and on `migrate resolve --retry`, so an interrupted backfill resumes from its checkpoint. Steps accept `lock_timeout=` and `statement_timeout=` annotations.
 
 Applied migrations record a SHA-256 checksum of their SQL; a modified applied migration fails the next run before anything new is applied. `neutron migrate` targets PostgreSQL — for Nucleus databases use the language SDK runners (`go/nucleus`, `@neutron-build/nucleus`), which stay experimental.
 
@@ -147,6 +173,8 @@ Adopt a legacy migration history into the current protocol, in one transaction.
 neutron migrate adopt
 ```
 
+**Flags:** `--dir`, `--timeout` (default 1m).
+
 Databases with histories written by an older CLI, or by the Go/TS Nucleus SDKs (integer version columns), are refused by `neutron migrate` until adopted once. Adoption matches history rows to files by exact version text (`001` and `1` are never treated as the same migration), verifies what can be proven (a legacy SDK checksum that reproduces from the supplied file), and reports rows with no recorded checksum, or with no file of the same version, as unverified — checksums are never fabricated. A recorded checksum that does not match its file refuses the whole adoption and changes nothing: restore the applied SQL or reconcile the row by hand.
 
 ### `neutron migrate status`
@@ -157,6 +185,8 @@ Show applied and pending migrations.
 neutron migrate status
 ```
 
+**Flags:** `--dir`, `--timeout` (default 10s).
+
 ### `neutron migrate create <name>`
 
 Generate new migration files.
@@ -165,7 +195,7 @@ Generate new migration files.
 neutron migrate create add_role_column
 ```
 
-Creates `{version}_{name}.up.sql` and `{version}_{name}.down.sql`.
+Creates `{version}_{name}.up.sql` and `{version}_{name}.down.sql`. **Flags:** `--dir`.
 
 ### `neutron migrate down [N]`
 
@@ -176,7 +206,7 @@ neutron migrate down
 neutron migrate down 3
 ```
 
-Down SQL is not data restoration. Rollbacks run under the same lock and checksum verification as `neutron migrate`, and the command refuses a migration whose plan report marks it irreversible, or whose down file holds only an `IRREVERSIBLE` comment: forward-fix instead.
+Down SQL is not data restoration. Rollbacks run under the same lock and checksum verification as `neutron migrate`, and the command refuses a migration whose plan report marks it irreversible, or whose down file holds only an `IRREVERSIBLE` comment: forward-fix instead. **Flags:** `--dir`, `--timeout` (default 1m).
 
 ### `neutron migrate generate`
 
@@ -190,6 +220,8 @@ neutron migrate generate --rename 'users.name>users.full_name'
 
 `--mode live` (the default, unless `neutron.toml` sets `[migrations] snapshots = true`) diffs against the database; `--mode snapshot` plans offline from the last accepted snapshot, accounts for pending migrations, and writes a `.plan.json` risk and reversibility report. When a plan adds enum values and also changes anything else, generate writes the additions as their own earlier migration (`{NNN}_{name}_enum_values`, then `{NNN+1}_{name}`); in snapshot mode each gets its own plan report and snapshot. `--mode live` refuses statements the connected server cannot run (changing a generated column's expression needs PostgreSQL 17+). `--mode snapshot` cannot know the target server, so the plan report records the requirement as `minServerMajor` and `neutron migrate` refuses older servers before running anything. Nothing absent from the schema is dropped without `--allow-destructive` (in snapshot mode, what a plan leaves in place stays in its target snapshot, so a later `--allow-destructive` plan drops it), column order differences are noted and never planned (PostgreSQL appends added columns), `_neutron_*` metadata and extension-owned objects are never dropped, and catalog structures the planner cannot represent faithfully are refused instead of planned. Quote `--rename` values: `>` is a shell redirect.
 
+**Flags:** `--schema` (default `neutron.schema.json`), `--name`, `--mode` (`live` or `snapshot`), `--rename` (repeatable; `schema.table.old>schema.table.new` for v2 documents, and `table.old>table.new` when the table name is unambiguous), `--allow-destructive`, `--dir`, `--timeout` (default 30s).
+
 ### `neutron migrate resolve <version>`
 
 Inspect and recover a migration that was interrupted outside a transaction.
@@ -199,7 +231,7 @@ neutron migrate resolve 004
 neutron migrate resolve 004 --retry
 ```
 
-Transactional migrations need none of this: a failure rolls back with its history row. A non-transactional migration (`CREATE INDEX CONCURRENTLY`, journaled steps) interrupted mid-file leaves partial effects and no history row. `resolve` checks each statement's postcondition against the catalog and offers exactly one action: `--retry` skips provably applied statements, `--mark-applied` records the row only when every effect is proven, `--abort` runs the down SQL. A statement whose outcome cannot be proven (`ALTER`, DML) is never replayed automatically. Operational patterns (expand, backfill, contract, concurrent indexes) are shown in `cli/examples-src/README.md`.
+Transactional migrations need none of this: a failure rolls back with its history row. A non-transactional migration (`CREATE INDEX CONCURRENTLY`, journaled steps) interrupted mid-file leaves partial effects and no history row. `resolve` checks each statement's postcondition against the catalog and offers exactly one action: `--retry` skips provably applied statements, `--mark-applied` records the row only when every effect is proven, `--abort` runs the down SQL. A statement whose outcome cannot be proven (`ALTER`, DML) is never replayed automatically. With no action it prints the inspection report only. `--abort` runs the down SQL in one transaction and is allowed whenever a clean state cannot be proven. **Flags:** `--retry`, `--mark-applied`, `--abort` (exactly one), `--dir`, `--timeout` (default 1m). Operational patterns (expand, backfill, contract, concurrent indexes) are shown in `cli/examples-src/README.md`.
 
 ### Upgrading from earlier CLI builds
 
@@ -219,7 +251,7 @@ Execute a SQL seed file.
 
 ```bash
 neutron seed                          # default: seeds/seed.sql
-neutron seed --file data/demo.sql     # custom file
+neutron seed --file data/demo.sql     # custom file (-f)
 ```
 
 ### `neutron repl`
@@ -244,6 +276,8 @@ neutron desktop build
 neutron desktop preview
 ```
 
+**Flags:** `dev --port` (Vite port, default 5173); `build --target` (for example `aarch64-apple-darwin`) and `--release` (default true).
+
 ### `neutron native`
 
 Scaffold, develop, run, or build an iOS/Android application.
@@ -255,6 +289,8 @@ neutron native run ios
 neutron native build --ios --android
 ```
 
+**Flags:** `dev --port` (bundler port, default 8081); `build --ios`, `--android`, `--release` (default true).
+
 ## Studio
 
 ### `neutron studio`
@@ -264,6 +300,7 @@ Launch the web-based database manager.
 ```bash
 neutron studio               # opens http://localhost:4983
 neutron studio --port 8080   # custom port
+neutron studio --migrations db/migrations   # migrations directory shown in the inspection journey
 ```
 
 ## MCP Server
@@ -306,6 +343,7 @@ only requests addressed to localhost, an IP address or the `--host` name.
 - `--allow-writes` — Offer the `execute_sql` write tool (over HTTP also requires `NEUTRON_MCP_TOKEN`)
 - `--no-redact` — Return values under secret-looking names
 - `--migrations` — Migrations directory for `migration_status` and `inspect_table` (default: `migrations`)
+- `--log` — Write debug logs to stderr (default: silent)
 
 ## Diagnostics
 

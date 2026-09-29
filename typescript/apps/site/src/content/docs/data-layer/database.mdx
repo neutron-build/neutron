@@ -48,8 +48,23 @@ The returned object contains:
 - `nucleus` — the optional multi-model client when using Nucleus.
 - `close()` — closes the created clients.
 
-The `db` and `client` fields are currently exposed as `unknown`; narrow them to
-the installed driver's types, as in the example above.
+From the root import, `db` and `client` are typed `unknown`; narrow them to the
+installed driver's types, as in the example above. The `@neutron-build/data/drizzle`
+subpath returns genuine Drizzle types when you pass an explicit `profile`:
+
+```ts
+import { createDrizzleDatabase } from "@neutron-build/data/drizzle";
+
+const database = await createDrizzleDatabase({
+  profile: { provider: "postgres", connectionString: process.env.DATABASE_URL! },
+  schema,
+});
+// database.db is a PostgresJsDatabase<typeof schema>; database.close() closes it.
+```
+
+This package is the Drizzle interop path. For new application SQL, Neutron's own
+schema, query and migration surface is `@neutron-build/sql`, whose schema
+documents feed `neutron migrate generate` and `neutron db push`.
 
 ## Select a provider
 
