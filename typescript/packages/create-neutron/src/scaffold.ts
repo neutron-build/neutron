@@ -164,8 +164,8 @@ export function isTemplateName(value: string): value is TemplateName {
 // pair, not float on `latest` — every site that drifted onto an untested
 // combination was created by that fallback.
 const PINNED_DEPENDENCY_VERSIONS = {
-  neutron: "^0.2.2",
-  neutronCli: "^0.2.3",
+  neutron: "^0.2.3",
+  neutronCli: "^0.2.4",
 };
 
 function resolveDependencyVersions(targetDir: string): {

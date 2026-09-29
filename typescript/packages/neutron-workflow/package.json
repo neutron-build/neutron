@@ -1,6 +1,6 @@
 {
   "name": "@neutron-build/workflow",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Durable workflow engine for Neutron. Event-sourced replay on Nucleus: workflows that suspend, survive restarts, and resume days later.",
   "author": "Tyler",
   "license": "MIT",
