@@ -415,11 +415,9 @@ func TestScaffoldGoRuns(t *testing.T) {
 	t.Setenv("NEUTRON_DATABASE_URL", dbURL)
 	port := freePort(t)
 	s := startDev(t, detect.Go, project, port)
-	// Shape only: the published Go SDK v0.1.0 that the scaffold pins reports
-	// {"status": "ok", "nucleus": "disconnected"} for a reachable plain
-	// PostgreSQL (feature detection, not health). The SDK on main is fixed;
-	// the strict check applies once a release with the fix is pinned.
-	checkHealth(t, s, port, 3*time.Minute, false)
+	// Strict: the Go SDK v0.2.0 that the scaffold pins reports health
+	// correctly for a reachable plain PostgreSQL.
+	checkHealth(t, s, port, 3*time.Minute, true)
 }
 
 func TestScaffoldPythonRuns(t *testing.T) {

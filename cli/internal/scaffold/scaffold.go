@@ -63,7 +63,7 @@ const (
 func sdkFor(lang detect.Language) (sdk, cli Dependency) {
 	switch lang {
 	case detect.Go:
-		sdk = Dependency{Name: "github.com/neutron-build/neutron/go", Version: "v0.1.0"}
+		sdk = Dependency{Name: "github.com/neutron-build/neutron/go", Version: "v0.2.0"}
 	case detect.Python:
 		sdk = Dependency{Name: "neutron-framework", Version: ">=0.1.0,<0.2.0"}
 	case detect.TypeScript:
