@@ -251,16 +251,32 @@ impl Executor {
                 // the statement never emits — measured: `LIMIT 3` over six
                 // rows locked all six, and the next claimant found every
                 // row held and starved.
+                //
+                // Each round locks up to the remaining budget, then re-reads
+                // the locked rows (see `retain_current`): a candidate that
+                // changed while the walk was reaching it is dropped and its
+                // slot goes back to the walk.
                 let mut kept: Vec<crate::types::Row> = Vec::with_capacity(rows.len());
-                for row in rows.drain(..) {
-                    if let Some(b) = limit_hint
-                        && kept.len() >= b
-                    {
+                let mut candidates = std::mem::take(rows).into_iter();
+                loop {
+                    let mut locked: Vec<crate::types::Row> = Vec::new();
+                    for row in candidates.by_ref() {
+                        if let Some(b) = limit_hint
+                            && kept.len() + locked.len() >= b
+                        {
+                            break;
+                        }
+                        let key = key_of(&row);
+                        if self.row_locks.try_lock(session, &key)? == RowTry::Acquired {
+                            locked.push(row);
+                        }
+                    }
+                    if locked.is_empty() {
                         break;
                     }
-                    let key = key_of(&row);
-                    if self.row_locks.try_lock(session, &key)? == RowTry::Acquired {
-                        kept.push(row);
+                    kept.extend(self.retain_current(ctx, col_meta, locked, &pk_idx).await?);
+                    if limit_hint.is_some_and(|b| kept.len() >= b) {
+                        break;
                     }
                 }
                 *rows = kept;
@@ -294,10 +310,88 @@ impl Executor {
                 }
             }
         }
+        if ctx.nonblock != Some(ast::NonBlock::SkipLocked) {
+            let locked = std::mem::take(rows);
+            *rows = self.retain_current(ctx, col_meta, locked, &pk_idx).await?;
+        }
         self.metrics
             .row_locks_held
             .set(self.row_locks.held_count() as i64);
         Ok(())
+    }
+
+    /// Keep only the locked rows that are still what the scan saw.
+    ///
+    /// The scan that produced `rows` ran BEFORE their locks were taken, so a
+    /// transaction that held a row when the scan ran can commit its change
+    /// and release the lock in between. The lock then succeeds against a row
+    /// that no longer matches the query, and the claimer would act on a stale
+    /// image: a claim UPDATE either fails at commit with WriteConflict
+    /// ("buffered row changed before commit") or, if its own read landed after
+    /// the commit, applies twice. PostgreSQL re-evaluates the row after
+    /// locking it (EvalPlanQual) and drops it if it no longer qualifies; this
+    /// is the same recheck, done by re-reading the table now that the locks
+    /// are held and comparing the row image. A row that changed or vanished
+    /// is dropped.
+    ///
+    /// Tables under row security or masking are not rechecked: the scan's
+    /// rows are filtered or masked, so they cannot be compared with a raw
+    /// read.
+    async fn retain_current(
+        &self,
+        ctx: &RowLockContext,
+        col_meta: &[super::ColMeta],
+        locked: Vec<crate::types::Row>,
+        pk_idx: &[usize],
+    ) -> Result<Vec<crate::types::Row>, ExecError> {
+        if locked.is_empty() || self.table_is_secured(&ctx.table) {
+            return Ok(locked);
+        }
+        let table_def = self.get_table(&ctx.table).await?;
+        let mut columns: Vec<(usize, usize)> = Vec::new();
+        let mut current_pk: Vec<usize> = Vec::with_capacity(ctx.pk_columns.len());
+        for (ti, col) in table_def.columns.iter().enumerate() {
+            if let Some(mi) = col_meta
+                .iter()
+                .position(|m| m.name.eq_ignore_ascii_case(&col.name))
+            {
+                columns.push((mi, ti));
+            }
+        }
+        for name in &ctx.pk_columns {
+            match table_def
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(name))
+            {
+                Some(ti) => current_pk.push(ti),
+                None => return Ok(locked),
+            }
+        }
+        let key_at = |row: &crate::types::Row, idx: &[usize]| -> Vec<Value> {
+            idx.iter()
+                .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                .collect()
+        };
+        let wanted: std::collections::HashSet<Vec<Value>> =
+            locked.iter().map(|r| key_at(r, pk_idx)).collect();
+        let now = self.storage_for(&ctx.table).scan(&ctx.table).await?;
+        let mut latest: std::collections::HashMap<Vec<Value>, crate::types::Row> =
+            std::collections::HashMap::with_capacity(wanted.len());
+        for row in now {
+            let key = key_at(&row, &current_pk);
+            if wanted.contains(&key) {
+                latest.insert(key, row);
+            }
+        }
+        Ok(locked
+            .into_iter()
+            .filter(|row| {
+                latest
+                    .get(&key_at(row, pk_idx))
+                    .is_some_and(|cur| columns.iter().all(|&(mi, ti)| row.get(mi) == cur.get(ti)))
+            })
+            .collect())
     }
 
     /// Release every row lock this session holds. Called at COMMIT, ROLLBACK,

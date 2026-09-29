@@ -293,6 +293,64 @@ async fn plain_for_update_blocks_then_proceeds_after_commit() {
     assert_eq!(claimed_ids(&out), vec![1]);
 }
 
+/// The interleaving behind the `two_workers_drain_fifty_jobs_exactly_once`
+/// flake, forced. B's scan reads job 1 as pending and then blocks on A's lock;
+/// A claims the row and commits; B's lock is granted against a row that is no
+/// longer pending. The stale image must not come back: B re-checks the row
+/// after locking (PostgreSQL's EvalPlanQual) and drops it. Without the recheck
+/// B returns job 1, and a claim built on it fails at commit with WriteConflict
+/// or applies twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_changed_while_waiting_for_its_lock_is_not_returned_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = disk_executor(dir.path());
+    seed_jobs(&ex, 2).await;
+
+    let a = ex.create_session();
+    let b = ex.create_session();
+    ex.execute_with_session(a, "BEGIN").await.unwrap();
+    let got_a = claimed_ids(
+        &ex.execute_with_session(
+            a,
+            "UPDATE jobs SET status = 'active', attempts = attempts + 1 \
+             WHERE id IN (SELECT id FROM jobs WHERE status = 'pending' \
+             ORDER BY id LIMIT 1 FOR UPDATE) RETURNING id",
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(got_a, vec![1]);
+
+    let ex2 = ex.clone();
+    let waiter = tokio::spawn(async move {
+        ex2.execute_with_session(b, "BEGIN").await.unwrap();
+        let r = ex2
+            .execute_with_session(
+                b,
+                "SELECT id FROM jobs WHERE status = 'pending' ORDER BY id LIMIT 1 FOR UPDATE",
+            )
+            .await;
+        let _ = ex2.execute_with_session(b, "COMMIT").await;
+        r
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(
+        !waiter.is_finished(),
+        "control: B must be waiting on A's lock over job 1"
+    );
+
+    ex.execute_with_session(a, "COMMIT").await.unwrap();
+    let out = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+        .await
+        .expect("must be granted soon after the holder commits")
+        .unwrap()
+        .expect("the post-commit read must succeed");
+    assert!(
+        !claimed_ids(&out).contains(&1),
+        "job 1 is active now; B must not be handed its stale pending image"
+    );
+}
+
 /// ROLLBACK releases the rows the transaction locked: nothing it read
 /// changed, so nothing stays claimable-blocked.
 #[tokio::test]
