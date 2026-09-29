@@ -152,10 +152,10 @@ pub(crate) mod row_batch;
 mod row_locks;
 mod scalar_fns;
 mod scan_stream;
-#[cfg(feature = "server")]
-mod snapshot_lease;
 mod schema_types;
 mod session;
+#[cfg(feature = "server")]
+mod snapshot_lease;
 mod spill;
 mod txn;
 mod types;
@@ -166,8 +166,8 @@ use helpers::*;
 #[cfg(feature = "server")]
 pub(crate) use scalar_fns::{extension_scalar_return_type, side_effecting_return_type};
 use schema_types::*;
-pub use session::Session;
 pub(crate) use session::CURRENT_SESSION;
+pub use session::Session;
 pub use types::PreparedStmtHandle;
 use types::*;
 
@@ -3442,11 +3442,12 @@ impl Executor {
         // abort, which left engine writes from the returned connection
         // applied (see `drop_session`).
         if session.txn_active.load(Ordering::SeqCst) {
-            let restore = CURRENT_SESSION.scope(
-                session.clone(),
-                STORAGE_SESSION_ID.scope(id, self.rollback_transaction()),
-            )
-            .await;
+            let restore = CURRENT_SESSION
+                .scope(
+                    session.clone(),
+                    STORAGE_SESSION_ID.scope(id, self.rollback_transaction()),
+                )
+                .await;
             if let Err(e) = restore {
                 tracing::error!(
                     "reset_session {id}: rolling back the abandoned transaction \
@@ -4424,13 +4425,14 @@ impl Executor {
     async fn gate_mutation_on_snapshot_lease(&self) -> Result<(), ExecError> {
         let session_id = unique_gate::gate_session_id();
         if let Some((holder, _remaining)) = self.snapshot_leases.holder()
-            && holder == session_id {
-                return Err(ExecError::Runtime(
-                    "this session holds the snapshot lease; its point-in-time view is \
+            && holder == session_id
+        {
+            return Err(ExecError::Runtime(
+                "this session holds the snapshot lease; its point-in-time view is \
                      read-only — RELEASE SNAPSHOT LEASE (or COMMIT/ROLLBACK) first"
-                        .into(),
-                ));
-            }
+                    .into(),
+            ));
+        }
         self.snapshot_leases
             .wait_for_mutation_window(session_id)
             .await;
@@ -6375,6 +6377,7 @@ impl Executor {
                 b'R' => {
                     !Self::starts_with_ci(trimmed, "REFRESH")
                         && !Self::starts_with_ci(trimmed, "RELEASE SNAPSHOT")
+                        && !Self::starts_with_ci(trimmed, "REPAIR TABLE")
                 }
                 _ => false,
             };
@@ -6452,6 +6455,10 @@ impl Executor {
             #[cfg(feature = "server")]
             if upper == "SHOW SNAPSHOT LEASE" || upper == "SHOW SNAPSHOT LEASE;" {
                 return Ok(vec![self.execute_show_snapshot_lease()?]);
+            }
+            if let Some(rest) = upper.strip_prefix("REPAIR TABLE ") {
+                let name = &trimmed[trimmed.len() - rest.len()..];
+                return Ok(vec![self.execute_repair_table(name).await?]);
             }
             if upper == "MEMORY PRESSURE" || upper == "MEMORY PRESSURE;" {
                 return Ok(vec![self.execute_memory_pressure().await]);
@@ -6708,8 +6715,8 @@ impl Executor {
         sql: &str,
         #[cfg_attr(not(feature = "server"), allow(unused_mut))] mut statements: Vec<Statement>,
     ) -> Result<Vec<ExecResult>, ExecError> {
-    #[cfg(not(feature = "server"))]
-    let _ = sql;
+        #[cfg(not(feature = "server"))]
+        let _ = sql;
         self.recompute_session_context(&self.current_session());
         // Snapshot-lease writer gate (Consumer-2): while a lease is held,
         // other sessions' mutations wait for the window to open; the
@@ -6727,7 +6734,9 @@ impl Executor {
         // reports: the SQL scalar functions are how every SQL client
         // writes KV, so the lease must see them.
         #[cfg(feature = "server")]
-        if statements.iter().any(Self::statement_blocks_on_snapshot_lease)
+        if statements
+            .iter()
+            .any(Self::statement_blocks_on_snapshot_lease)
             || (self.snapshot_leases.holder().is_some()
                 && statements
                     .iter()
@@ -6741,9 +6750,7 @@ impl Executor {
         if let Some(ref cluster_arc) = self.cluster {
             let mode = { cluster_arc.read().mode() };
             if mode != crate::distributed::ClusterMode::Standalone {
-                let has_security_ddl = statements
-                    .iter()
-                    .any(Self::statement_is_security_ddl);
+                let has_security_ddl = statements.iter().any(Self::statement_is_security_ddl);
                 let has_dml = statements.iter().any(Self::statement_is_dml);
                 if has_security_ddl {
                     // Authenticate authority before proposing a command that
@@ -7509,7 +7516,12 @@ impl Executor {
                 // untouched; this is log text only.
                 let preview = statement_text
                     .as_deref()
-                    .map(|s| crate::ops::redact_sql(s).chars().take(200).collect::<String>())
+                    .map(|s| {
+                        crate::ops::redact_sql(s)
+                            .chars()
+                            .take(200)
+                            .collect::<String>()
+                    })
                     .unwrap_or_default();
                 tracing::warn!(
                     query_id,

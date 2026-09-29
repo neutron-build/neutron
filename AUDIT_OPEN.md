@@ -1,5 +1,35 @@
 # Open audit items
 
+## 2026-09-25 — legacy tuple repair candidate
+
+The candidate recognizes the historical zero-length JSONB null representation
+without accepting other malformed payloads. ADD COLUMN scans and validates
+defaults before publishing a wider catalog. If the actual rewrite fails after
+publication, it keeps the wider schema and reports repair required; narrowing
+the catalog would strand any rows already widened. Admin-only `REPAIR TABLE`
+preflights noncanonical rows, fills missing values from column defaults, and
+rebuilds indexes. Unknown corruption and missing NOT NULL defaults refuse.
+Four integration cases reconstruct old tuple layouts, interrupted widening and
+corruption; decoder and DDL probes pass. A real affected-data copy and full
+recovery/fault probe gates remain required before calling this production-ready.
+
+## 2026-09-25 — core-only build and asynchronous disk-write completion
+
+Two embedded transaction tests outside the test module lacked `cfg(test)`,
+causing a normal core-only build to expand runtime-dependent test macros. They
+are now test-only; the core check passes. A wire security child test also
+required a newline before its marker to separate libtest output; child exit
+status is now checked, with all security assertions retained.
+
+A full Linux library run then exposed `batch_queue_submit_and_execute` reading
+incorrect bytes after a successful StandardDiskOps write. Tokio file writes
+can remain in flight after `write_all`; dropping that handle does not wait.
+`write_page` now awaits `flush` before reporting completion. Explicit `sync`
+remains the durability barrier. Decoder/DDL release probes, the four legacy-row integration cases, clippy and
+core-only compilation pass after the flush fix. The complete Linux library
+run passes: 4,958 passed, zero failed, eight existing ignored tests. Repository-wide formatting also fails on a clean checkout of the
+base commit, in the same files. This is not a production-cutover receipt.
+
 Unresolved findings for this repository from the ChatGPT-led audit series.
 Read this before treating related work as done; update it when you close,
 defer, or upstream-report an item.

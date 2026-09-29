@@ -79,6 +79,93 @@ pub(super) struct TableEngineMeta {
 }
 
 impl Executor {
+    /// `REPAIR TABLE <name>` — bring every stored row of a table to the
+    /// canonical encoding of its current column list.
+    ///
+    /// Exists for two layouts an in-place engine upgrade can inherit, neither
+    /// of them damage (observe-nucleus `llm_traces`, 2026-09-24):
+    ///
+    /// * rows SHORT of the column list — written before an ADD COLUMN whose
+    ///   backfill failed after the catalog had already been persisted (fixed
+    ///   in ADD COLUMN itself, but existing directories keep the residue).
+    ///   Each is widened with the added columns' defaults, evaluated per row
+    ///   exactly as ADD COLUMN's backfill does.
+    /// * rows in a legacy spelling (the pre-NU-239 zero-length JSONB payload),
+    ///   re-encoded as the value they always read as.
+    ///
+    /// All-or-nothing up to the write: the scan fails without writing if any
+    /// row fits no prefix of the column list (that is real corruption and
+    /// stays reported), and a NOT NULL column with no default refuses before
+    /// anything is written. Idempotent: a repaired table has nothing left to
+    /// find, so a second run reports zero rows.
+    pub(super) async fn execute_repair_table(&self, raw: &str) -> Result<ExecResult, ExecError> {
+        self.require_security_admin("repair tables")?;
+        let raw = raw.trim().trim_end_matches(';').trim();
+        let table_name = if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+            raw[1..raw.len() - 1].to_string()
+        } else {
+            raw.strip_prefix("public.")
+                .unwrap_or(raw)
+                .to_ascii_lowercase()
+        };
+        if table_name.is_empty() {
+            return Err(ExecError::Unsupported(
+                "REPAIR TABLE requires a table name".into(),
+            ));
+        }
+        let table_def = self.get_table(&table_name).await?;
+        let engine = self.storage_for(&table_name);
+        let _rewrite = RewriteGuard::new(engine.clone(), &table_name);
+        // The engine's cached column list can trail the catalog after an
+        // interrupted ADD COLUMN on a server that was never restarted; the
+        // repair is defined against the catalog.
+        engine.sync_schema(&table_name).await?;
+        let found = engine.scan_noncanonical(&table_name).await?;
+        let ncols = table_def.columns.len();
+        let (mut widened, mut reencoded) = (0i64, 0i64);
+        let mut updates: Vec<(usize, Row)> = Vec::with_capacity(found.len());
+        for (pos, mut row) in found {
+            if row.len() < ncols {
+                widened += 1;
+                for col in &table_def.columns[row.len()..] {
+                    let value = self.eval_column_default(col)?;
+                    if value == Value::Null && !col.nullable {
+                        return Err(ExecError::ConstraintViolation(format!(
+                            "REPAIR TABLE {table_name}: column \"{}\" is NOT NULL with no \
+                             default, so rows written before it existed cannot be widened; \
+                             nothing was changed",
+                            col.name
+                        )));
+                    }
+                    row.push(value);
+                }
+            } else {
+                reencoded += 1;
+            }
+            updates.push((pos, row));
+        }
+        if !updates.is_empty() {
+            engine.update(&table_name, &updates).await?;
+            engine.rebuild_table_indexes(&table_name).await?;
+            tracing::warn!(
+                "REPAIR TABLE {table_name}: widened {widened} short row(s), re-encoded \
+                 {reencoded} legacy row(s)"
+            );
+        }
+        Ok(ExecResult::Select {
+            columns: vec![
+                ("table_name".into(), DataType::Text),
+                ("rows_widened".into(), DataType::Int64),
+                ("rows_reencoded".into(), DataType::Int64),
+            ],
+            rows: vec![vec![
+                Value::Text(table_name),
+                Value::Int64(widened),
+                Value::Int64(reencoded),
+            ]],
+        })
+    }
+
     // ========================================================================
     // Per-table engine sidecar (engines.json) + durable engine storage
     // ========================================================================
@@ -3100,7 +3187,6 @@ impl Executor {
                     };
                     let mut updated = (*table_def).clone();
                     updated.columns.push(new_col.clone());
-                    self.catalog.update_table(updated).await?;
 
                     let engine = self.storage_for(&table_name);
                     let _rewrite = RewriteGuard::new(engine.clone(), &table_name);
@@ -3111,6 +3197,16 @@ impl Executor {
                     // enumeration positions drift from them under concurrent
                     // churn, and the rewrite then lands on the WRONG rows
                     // (duplicated PKs under the concurrency probe).
+                    //
+                    // The scan and the per-row defaults run BEFORE the catalog
+                    // learns the column. They used to run after it, so a
+                    // failure here (observe-nucleus, 2026-09-24: a row that
+                    // would not decode) left the catalog persisted with the
+                    // new column over rows that never got it. A re-run of the
+                    // same `ADD COLUMN IF NOT EXISTS` then found the column
+                    // "already there" and skipped, and the migration ledger
+                    // recorded the DDL as applied over a table whose rows
+                    // could no longer be read at the catalog's width.
                     let rows = engine.scan_physical(&table_name).await?;
                     // Evaluate the default PER ROW (INSERT-time defaults
                     // already are — eval_column_default): a volatile default
@@ -3125,20 +3221,39 @@ impl Executor {
                             Ok((vidx, r))
                         })
                         .collect::<Result<Vec<_>, ExecError>>()?;
-                    // Sync the engine's cached column schema to the new shape
-                    // before writing the widened rows — otherwise an engine that
-                    // caches col_types (the disk engine) serializes them against
-                    // the stale count and corrupts the tuples. Also runs when the
-                    // table is empty so future INSERTs use the new shape.
-                    engine.sync_schema(&table_name).await?;
-                    if !updates.is_empty() {
-                        engine.update(&table_name, &updates).await?;
+                    self.catalog.update_table(updated).await?;
+                    let widened: Result<(), ExecError> = async {
+                        // Sync the engine's cached column schema to the new
+                        // shape before writing the widened rows — otherwise an
+                        // engine that caches col_types (the disk engine)
+                        // serializes them against the stale count and corrupts
+                        // the tuples. Also runs when the table is empty so
+                        // future INSERTs use the new shape.
+                        engine.sync_schema(&table_name).await?;
+                        if !updates.is_empty() {
+                            engine.update(&table_name, &updates).await?;
+                        }
+                        // The row rewrite above maintains indexes incrementally
+                        // against the pre-widen tuples, which can leave stale
+                        // entries; rebuild the table's indexes from the widened
+                        // rows to keep lookups correct.
+                        engine.rebuild_table_indexes(&table_name).await?;
+                        Ok(())
                     }
-                    // The row rewrite above maintains indexes incrementally
-                    // against the pre-widen tuples, which can leave stale
-                    // entries; rebuild the table's indexes from the widened
-                    // rows to keep lookups correct.
-                    engine.rebuild_table_indexes(&table_name).await?;
+                    .await;
+                    if let Err(error) = widened {
+                        // Some rows may already have been widened, or the
+                        // index rebuild may have failed after every row was
+                        // written. Reverting ONLY the catalog would decode
+                        // those bytes with the old null-bitmap width. Keep the
+                        // widened schema and report the incomplete rewrite;
+                        // REPAIR TABLE can still widen the remaining rows.
+                        tracing::error!(
+                            "ALTER TABLE {table_name} ADD COLUMN {col_name} failed after schema publication ({error}); \
+                             the widened schema is retained for explicit repair"
+                        );
+                        return Err(error);
+                    }
                 }
                 ast::AlterTableOperation::DropColumn {
                     column_names,

@@ -2527,6 +2527,7 @@ mod tests {
 /// the second BEGIN warned and silently joined the first transaction, both
 /// commits hit the same session, and dropping one handle rolled back the
 /// other's open transaction.
+#[cfg(test)]
 #[tokio::test]
 async fn embedded_transaction_handles_do_not_share_a_session() {
     let db = Database::mvcc();
@@ -2559,6 +2560,7 @@ async fn embedded_transaction_handles_do_not_share_a_session() {
 
 /// An explicit rollback ends the session cleanly and the database stays
 /// usable afterwards — no leaked open transaction on any shared session.
+#[cfg(test)]
 #[tokio::test]
 async fn embedded_transaction_rollback_leaves_database_usable() {
     let db = Database::mvcc();

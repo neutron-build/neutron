@@ -18,7 +18,7 @@
 //! * `VACUUM` — reclaims space inside the data files.
 //! * `CHECKPOINT` — flushes and truncates WAL segments.
 
-use sqlparser::ast::{self, Visit, Statement};
+use sqlparser::ast::{self, Statement, Visit};
 
 use super::{ExecError, Executor};
 
@@ -188,7 +188,8 @@ struct MutatingFnVisitor {
     found: bool,
 }
 
-impl sqlparser::ast::Visitor for MutatingFnVisitor {    type Break = ();
+impl sqlparser::ast::Visitor for MutatingFnVisitor {
+    type Break = ();
 
     fn pre_visit_expr(&mut self, expr: &ast::Expr) -> std::ops::ControlFlow<Self::Break> {
         if let ast::Expr::Function(func) = expr {
@@ -282,7 +283,7 @@ impl Executor {
         if admitted {
             return Ok(());
         }
-        let mutating: [(&str, &str); 18] = [
+        let mutating: [(&str, &str); 19] = [
             ("CREATE MASKING POLICY", "CREATE MASKING POLICY"),
             ("DROP MASKING POLICY", "DROP MASKING POLICY"),
             ("ALTER SEQUENCE ", "ALTER SEQUENCE"),
@@ -301,6 +302,7 @@ impl Executor {
             ("CREATE OR REPLACE PROCEDURE ", "CREATE PROCEDURE"),
             ("DROP PROCEDURE ", "DROP PROCEDURE"),
             ("SUBSCRIBE ", "SUBSCRIBE"),
+            ("REPAIR TABLE ", "REPAIR TABLE"),
         ];
         for (prefix, label) in mutating {
             if cmd.starts_with(prefix) {

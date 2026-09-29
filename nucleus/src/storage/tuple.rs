@@ -161,8 +161,66 @@ pub fn serialize_row(row: &Row, col_types: &[DataType]) -> Vec<u8> {
     buf
 }
 
+/// Decode a stored JSONB payload.
+///
+/// A ZERO-LENGTH payload is not damage: it is how engines before NU-239
+/// (`be60f6b1`, first shipped in v0.1.8) stored a JSONB column that had been
+/// handed a Text value — `''` was written with the Text layout, a zero length
+/// prefix and no bytes — and those engines read it back as the JSON `null`
+/// document. NU-239 made every undecodable payload a reported corruption,
+/// which is right for damaged bytes, but it also turned those legacy rows into
+/// "corrupt tuple" and made whole tables unreadable after an in-place engine
+/// upgrade (observe-nucleus `llm_traces`, 2026-09-24). Nothing written since
+/// can produce this spelling: the write path parses Text into JSONB and
+/// refuses `''`, and the encoder stores a valid `null` document when a value
+/// cannot be serialized. So the empty payload decodes to exactly what it
+/// always meant, and any NON-empty payload that does not parse is still
+/// corruption.
+fn decode_jsonb_payload(bytes: &[u8]) -> Option<serde_json::Value> {
+    if bytes.is_empty() {
+        return Some(serde_json::Value::Null);
+    }
+    serde_json::from_slice::<serde_json::Value>(bytes).ok()
+}
+
 /// Deserialize a row from bytes given the column types.
+///
+/// Lenient about trailing bytes (it stops after the last declared column);
+/// see [`deserialize_row_exact`] for the strict form.
 pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
+    deserialize_row_consumed(data, col_types).map(|(row, _)| row)
+}
+
+/// Deserialize a row only if `data` is EXACTLY one tuple of `col_types`: every
+/// byte consumed, and the null bitmap's padding bits (past the last column)
+/// clear, as the encoder always leaves them.
+///
+/// The tuple format carries no column count, so this is the only way to ask
+/// "was this tuple written at this width?". A tuple written before an ADD
+/// COLUMN finished is one column-set short; `deserialize_row` against the
+/// widened schema fails on it, and against a narrower schema it would happily
+/// decode a WIDER tuple by ignoring its tail. Layout repair needs the question
+/// answered without either of those guesses.
+pub fn deserialize_row_exact(data: &[u8], col_types: &[DataType]) -> Option<Row> {
+    let ncols = col_types.len();
+    let bitmap_bytes = ncols.div_ceil(8);
+    if ncols % 8 != 0 && bitmap_bytes > 0 {
+        let pad_mask = !((1u8 << (ncols % 8)) - 1);
+        if data
+            .get(bitmap_bytes - 1)
+            .is_some_and(|b| b & pad_mask != 0)
+        {
+            return None;
+        }
+    }
+    match deserialize_row_consumed(data, col_types) {
+        Some((row, consumed)) if consumed == data.len() => Some(row),
+        _ => None,
+    }
+}
+
+/// [`deserialize_row`], also reporting how many bytes the row occupied.
+fn deserialize_row_consumed(data: &[u8], col_types: &[DataType]) -> Option<(Row, usize)> {
     let ncols = col_types.len();
     let bitmap_bytes = ncols.div_ceil(8);
     if data.len() < bitmap_bytes {
@@ -276,10 +334,9 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                 // the row or null the column", it is "report corruption or
                 // answer a query with a value that was never stored", and a
                 // silent wrong answer is the worse of those.
-                let Ok(v) = serde_json::from_slice::<serde_json::Value>(&data[pos..pos + len])
-                else {
-                    return None;
-                };
+                // One exception, and only one: the legacy zero-length
+                // payload (see `decode_jsonb_payload`).
+                let v = decode_jsonb_payload(&data[pos..pos + len])?;
                 row.push(Value::Jsonb(v));
                 pos += len;
             }
@@ -575,7 +632,7 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
         }
     }
 
-    Some(row)
+    Some((row, pos))
 }
 
 /// Compute the byte size of a single non-null column value at `data[pos..]`.
@@ -825,7 +882,7 @@ fn decode_column_at(data: &[u8], pos: usize, dtype: &DataType) -> Option<Value> 
             // A projected read that answered `null` where the full read
             // errored would also make the two paths disagree about the same
             // bytes.
-            let v: serde_json::Value = serde_json::from_slice(&data[start..start + len]).ok()?;
+            let v = decode_jsonb_payload(&data[start..start + len])?;
             Some(Value::Jsonb(v))
         }
         DataType::Date => {
@@ -1149,6 +1206,81 @@ mod tests {
         let bytes = serialize_row(&row, &types);
         let out = deserialize_row(&bytes, &types).expect("a null JSON document is valid");
         assert_eq!(out[0], Value::Jsonb(serde_json::Value::Null));
+    }
+
+    /// The legacy spelling: an engine before NU-239 stored a Text `''` handed
+    /// to a JSONB column with the Text layout — length prefix 0, no bytes — and
+    /// read it back as the JSON null document. Live observe-nucleus
+    /// `llm_traces` page 6 slot 0 is exactly this (2026-09-24), and NU-239's
+    /// strict decode made the whole table unreadable. Built here with the
+    /// Text encoder, byte for byte what the old engine wrote.
+    #[test]
+    fn legacy_zero_length_jsonb_reads_as_the_null_document() {
+        let text_types = vec![DataType::Text, DataType::Text];
+        let legacy = serialize_row(
+            &vec![Value::Text("t0".into()), Value::Text(String::new())],
+            &text_types,
+        );
+        let types = vec![DataType::Text, DataType::Jsonb];
+        let row = deserialize_row(&legacy, &types).expect("the legacy empty payload must decode");
+        assert_eq!(row[1], Value::Jsonb(serde_json::Value::Null));
+        assert_eq!(
+            deserialize_row_projected(&legacy, &types, &[1]),
+            Some(vec![Value::Jsonb(serde_json::Value::Null)]),
+            "the projected path must agree with the full path"
+        );
+        assert!(deserialize_row_exact(&legacy, &types).is_some());
+
+        // Only the EMPTY payload is legacy. A non-empty payload that does not
+        // parse is still corruption (NU-239 stands).
+        let bad = serialize_row(
+            &vec![Value::Text("t0".into()), Value::Text("~".into())],
+            &text_types,
+        );
+        assert!(deserialize_row(&bad, &types).is_none());
+        assert!(deserialize_row_projected(&bad, &types, &[1]).is_none());
+    }
+
+    /// `deserialize_row_exact` answers "was this tuple written at this width",
+    /// which the plain decode cannot: it reads a WIDER tuple as a narrower one
+    /// by ignoring the tail.
+    #[test]
+    fn exact_decode_tells_tuple_widths_apart() {
+        let narrow_t = vec![DataType::Text, DataType::Jsonb];
+        let wide_t = vec![
+            DataType::Text,
+            DataType::Jsonb,
+            DataType::Text,
+            DataType::Text,
+        ];
+        let narrow = serialize_row(
+            &vec![
+                Value::Text("a".into()),
+                Value::Jsonb(serde_json::json!({"k": 1})),
+            ],
+            &narrow_t,
+        );
+        let wide = serialize_row(
+            &vec![
+                Value::Text("a".into()),
+                Value::Null,
+                Value::Text(String::new()),
+                Value::Text("x".into()),
+            ],
+            &wide_t,
+        );
+        // The lenient decode reads the wide tuple at the narrow width.
+        assert!(deserialize_row(&wide, &narrow_t).is_some());
+        // The exact decode does not, and places each tuple at its own width.
+        assert!(deserialize_row_exact(&wide, &narrow_t).is_none());
+        assert!(deserialize_row_exact(&wide, &wide_t).is_some());
+        assert!(deserialize_row_exact(&narrow, &narrow_t).is_some());
+        assert!(deserialize_row_exact(&narrow, &wide_t).is_none());
+
+        // Padding bits past the last column must be clear.
+        let mut padded = narrow.clone();
+        padded[0] |= 0b1000_0000;
+        assert!(deserialize_row_exact(&padded, &narrow_t).is_none());
     }
 
     #[test]

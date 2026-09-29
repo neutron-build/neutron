@@ -8267,7 +8267,7 @@ mod security_tests {
             single_eval_pgwire::simple_query(&mut client, "SELECT STREAM_XADD('once','k','v')")
                 .await;
         println!(
-            "OK1 {errs} {err} {}",
+            "\nOK1 {errs} {err} {}",
             row.first().cloned().unwrap_or_default()
         );
 
@@ -8313,6 +8313,7 @@ mod security_tests {
             .expect("spawn child");
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "child failed:\n{stdout}\n{stderr}");
         assert!(
             stdout.contains("DONE"),
             "child did not finish:\n{stdout}\n{stderr}"
