@@ -14,6 +14,7 @@ use super::helpers::{
     grantee_name, parse_grant_objects, parse_lock_timeout, parse_privileges, parse_time_zone,
 };
 use super::schema_types::{CursorDef, RoleDef};
+use super::session::Session;
 use super::{ExecError, ExecResult, Executor};
 
 impl Executor {
@@ -43,10 +44,25 @@ impl Executor {
     // SET / SHOW
     // ========================================================================
 
+    /// Assume (or drop) a role. `local` ties the change to the open
+    /// transaction; outside one, PostgreSQL warns and leaves the role alone.
+    fn assign_role(session: &Session, local: bool, role: Option<String>) {
+        if local && !session.guc_in_txn() {
+            tracing::warn!("SET LOCAL ROLE can only be used in transaction blocks");
+            return;
+        }
+        session.guc_note_role(local);
+        *session.current_role.write() = role;
+    }
+
     pub(super) fn execute_set(&self, set: ast::Set) -> Result<ExecResult, ExecError> {
         let session = self.current_session();
         match &set {
-            ast::Set::SetRole { role_name, .. } => {
+            ast::Set::SetRole {
+                role_name,
+                context_modifier,
+            } => {
+                let local = matches!(context_modifier, Some(ast::ContextModifier::Local));
                 let Some(login_user) = session.authenticated_user.read().clone() else {
                     return Err(ExecError::PermissionDenied(
                         "session has no authenticated principal".into(),
@@ -83,9 +99,9 @@ impl Executor {
                             "permission denied to set role '{target}'"
                         )));
                     }
-                    *session.current_role.write() = Some(target);
+                    Self::assign_role(&session, local, Some(target));
                 } else {
-                    *session.current_role.write() = None;
+                    Self::assign_role(&session, local, None);
                 }
                 self.recompute_session_context(&session);
                 return Ok(ExecResult::Command {
@@ -123,7 +139,11 @@ impl Executor {
                         ));
                     }
                 }
-                *session.current_role.write() = target;
+                Self::assign_role(
+                    &session,
+                    matches!(param.scope, ast::ContextModifier::Local),
+                    target,
+                );
                 self.recompute_session_context(&session);
                 return Ok(ExecResult::Command {
                     tag: "SET SESSION AUTHORIZATION".into(),
@@ -135,9 +155,13 @@ impl Executor {
 
         // Store SET values for SHOW to retrieve
         if let ast::Set::SingleAssignment {
-            variable, values, ..
+            scope,
+            variable,
+            values,
+            ..
         } = &set
         {
+            let local = matches!(scope, Some(ast::ContextModifier::Local));
             let var_name = variable.to_string().to_lowercase();
             let val_str: Vec<String> = values.iter().map(|v| v.to_string()).collect();
             let mut val = val_str.join(", ");
@@ -174,7 +198,15 @@ impl Executor {
                 self.storage.set_lock_timeout_ms(ms);
             }
 
-            session.settings.write().insert(var_name.clone(), val);
+            // SET LOCAL is transaction-scoped: it is undone at COMMIT and
+            // ROLLBACK (`Session::guc_commit` / `guc_rollback`). Outside a
+            // transaction block PostgreSQL warns and does nothing.
+            if local && !session.guc_in_txn() {
+                tracing::warn!("SET LOCAL {var_name} can only be used in transaction blocks");
+            } else {
+                session.guc_note_setting(&var_name, local);
+                session.settings.write().insert(var_name.clone(), val);
+            }
         }
         Ok(ExecResult::Command {
             tag: "SET".into(),
