@@ -3974,10 +3974,7 @@ impl Executor {
                                 // Index may not exist (e.g., CHECK constraints have no backing index).
                             }
                             self.btree_indexes.retain(|_, name| name != &index_name);
-                            let _ = self
-                                .storage_for(&table_name)
-                                .drop_index(&index_name)
-                                .await;
+                            let _ = self.storage_for(&table_name).drop_index(&index_name).await;
                         }
                     }
                 }
