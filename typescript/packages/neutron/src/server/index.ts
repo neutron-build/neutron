@@ -1655,7 +1655,11 @@ async function readCachedAppResponse(
   // copy (slice) guards the stored entry against any downstream mutation of
   // the view; the buffer is a plain ArrayBuffer (entries are built from
   // arrayBuffer()).
-  const body = entry.body.slice();
+  // A store may still hold an entry written before `body` became bytes
+  // (core <= 0.2.2 stored a string, and a Redis entry outlives an upgrade):
+  // encode it rather than serve an empty body.
+  const stored: Uint8Array | string = entry.body;
+  const body = typeof stored === "string" ? new TextEncoder().encode(stored) : stored.slice();
   return new Response(body.buffer as ArrayBuffer, {
     status: entry.status,
     statusText: entry.statusText,

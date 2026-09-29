@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { serializeTransportData } from "@neutron-build/core";
 import {
   createRedisNeutronCacheStoresFromClient,
   type RedisLikeClient,
@@ -423,3 +424,25 @@ function wildcardToRegExp(pattern: string): RegExp {
   const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`^${escaped.replace(/\*/g, ".*")}$`);
 }
+
+test("app.get reads an entry written with a string body by core <= 0.2.2", async () => {
+  const client = new FakeRedisClient(true);
+  const stores = createRedisNeutronCacheStoresFromClient(client, { keyPrefix: "test:" });
+  await client.set(
+    "test:app:html:/legacy",
+    serializeTransportData({
+      status: 200,
+      statusText: "OK",
+      headers: [["content-type", "text/html"]],
+      body: "<h1>caf\u00e9</h1>",
+      expiresAt: Date.now() + 60_000,
+    }),
+    "EX",
+    60
+  );
+
+  const entry = await stores.app.get("html:/legacy");
+  assert.ok(entry);
+  assert.ok(entry.body instanceof Uint8Array);
+  assert.equal(new TextDecoder().decode(entry.body), "<h1>caf\u00e9</h1>");
+});
