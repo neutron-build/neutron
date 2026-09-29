@@ -182,11 +182,11 @@ pub(crate) async fn lock_context(
     // under row security or masking the scan's rows are filtered or masked,
     // so the re-read could neither be compared with them nor be shown to the
     // caller. Refuse rather than let the stale-lock window stay open silently.
-    if ex.table_is_secured(&table) {
+    if ex.session_is_policed_on(&table) {
         return Err(ExecError::Unsupported(format!(
-            "FOR UPDATE is not supported on '{table}': it carries row-level security or \
-             column masking, and a locked row cannot be re-checked after its lock is \
-             taken without bypassing the policy"
+            "FOR UPDATE / FOR SHARE is not supported on '{table}': the current role is \
+             subject to row-level security or column masking on it, and a locked row \
+             cannot be re-checked after its lock is taken without bypassing the policy"
         )));
     }
 
@@ -253,7 +253,16 @@ impl Executor {
         };
 
         let candidates = std::mem::take(rows);
-        let mut kept: Vec<crate::types::Row> = Vec::with_capacity(candidates.len());
+        // A locked candidate: its position in the scan (output order), the row
+        // image, its lock key, and whether the session already owned the lock
+        // before this statement (an owned lock is never released early).
+        struct Locked {
+            idx: usize,
+            row: crate::types::Row,
+            key: RowLockKey,
+            held_before: bool,
+        }
+        let mut kept: Vec<Locked> = Vec::with_capacity(candidates.len());
         let mut next = 0usize;
         while next < candidates.len() {
             let need = match limit_hint {
@@ -262,10 +271,8 @@ impl Executor {
                 None => None,
             };
 
-            // One round: lock up to `need` candidates. `held_before` records
-            // which keys this session already owned (re-entrant), so a row
-            // dropped by the recheck releases only what this round took.
-            let mut batch: Vec<(crate::types::Row, RowLockKey, bool)> = Vec::new();
+            // One round: lock up to `need` candidates.
+            let mut batch: Vec<Locked> = Vec::new();
             match ctx.nonblock {
                 Some(ast::NonBlock::SkipLocked) => {
                     // Walk in result order, filling the budget — PostgreSQL's
@@ -275,36 +282,42 @@ impl Executor {
                     // parked rows the statement never emitted, and the next
                     // claimant found every row held and starved).
                     while next < candidates.len() && need.is_none_or(|n| batch.len() < n) {
-                        let row = &candidates[next];
+                        let idx = next;
                         next += 1;
-                        let key = key_of(row);
+                        let key = key_of(&candidates[idx]);
                         let held_before = self.row_locks.holds(session, &key);
                         if self.row_locks.try_lock(session, &key)? == RowTry::Acquired {
-                            batch.push((row.clone(), key, held_before));
+                            batch.push(Locked {
+                                idx,
+                                row: candidates[idx].clone(),
+                                key,
+                                held_before,
+                            });
                         }
                     }
                 }
                 Some(ast::NonBlock::Nowait) | None => {
-                    // The next `need` candidates, locked in sorted key order:
-                    // every statement climbs the same (table, key) order, so
-                    // two locking statements — the claim pattern — cannot wait
-                    // on each other. Only the rows that can still be emitted
-                    // need locks.
                     let end = need.map_or(candidates.len(), |n| (next + n).min(candidates.len()));
-                    let mut round: Vec<(RowLockKey, usize)> = candidates[next..end]
-                        .iter()
-                        .enumerate()
-                        .map(|(i, r)| (key_of(r), next + i))
+                    let mut round: Vec<Locked> = (next..end)
+                        .map(|idx| {
+                            let key = key_of(&candidates[idx]);
+                            let held_before = self.row_locks.holds(session, &key);
+                            Locked {
+                                idx,
+                                row: candidates[idx].clone(),
+                                key,
+                                held_before,
+                            }
+                        })
                         .collect();
                     next = end;
-                    round.sort();
-                    round.dedup_by(|a, b| a.0 == b.0);
-                    let mut acquired: std::collections::HashMap<RowLockKey, bool> =
-                        std::collections::HashMap::with_capacity(round.len());
-                    for (key, _) in &round {
-                        let held_before = self.row_locks.holds(session, key);
-                        if ctx.nonblock.is_some() {
-                            if self.row_locks.try_lock(session, key)? == RowTry::HeldElsewhere {
+                    round.sort_by(|a, b| a.key.cmp(&b.key));
+                    round.dedup_by(|a, b| a.key == b.key);
+
+                    if ctx.nonblock.is_some() {
+                        // NOWAIT never waits: contention is the error.
+                        for l in &round {
+                            if self.row_locks.try_lock(session, &l.key)? == RowTry::HeldElsewhere {
                                 // The `lock_not_available` wording is what the
                                 // wire codec maps to SQLSTATE 55P03,
                                 // PostgreSQL's code for exactly this refusal.
@@ -313,42 +326,92 @@ impl Executor {
                                         "lock_not_available: row in table '{}' could not \
                                          be locked (key {:?}): NOWAIT was requested and \
                                          another transaction holds it",
-                                        key.0, key.1
+                                        l.key.0, l.key.1
                                     ),
                                 )));
                             }
-                        } else {
-                            // Plain FOR UPDATE: wait for each holder's
-                            // transaction to end, bounded by lock_timeout
-                            // (55P03 on expiry, not 40001 — a held row is not
-                            // a conflict a retry can win).
+                        }
+                    } else if kept.is_empty() {
+                        // Plain FOR UPDATE, nothing held yet by this
+                        // statement: wait for each holder in sorted key
+                        // order, bounded by lock_timeout (55P03 on expiry,
+                        // not 40001 — a held row is not a conflict a retry
+                        // can win). Nothing this statement already took is
+                        // held while it waits, and every statement climbs the
+                        // same (table, key) order, so claims cannot wait on
+                        // each other in a cycle.
+                        for l in &round {
                             self.row_locks
-                                .lock(session, key)
+                                .lock(session, &l.key)
                                 .await
                                 .map_err(ExecError::Storage)?;
                         }
-                        acquired.insert(key.clone(), held_before);
+                    } else {
+                        // A refill: this statement already holds `kept`. Waiting
+                        // for a later candidate while holding them would break
+                        // the global order (a candidate can sort BEFORE a held
+                        // row, and two claims with opposite ORDER BY then wait
+                        // on each other). Take the new candidates without
+                        // waiting; on any contention give back everything this
+                        // statement newly took and re-take the whole set in
+                        // sorted order, holding nothing while waiting.
+                        let mut acquired = 0usize;
+                        let mut contended = false;
+                        for l in &round {
+                            if self.row_locks.try_lock(session, &l.key)? == RowTry::Acquired {
+                                acquired += 1;
+                            } else {
+                                contended = true;
+                                break;
+                            }
+                        }
+                        if contended {
+                            for l in round.iter().take(acquired) {
+                                if !l.held_before {
+                                    self.row_locks.release_key(session, &l.key);
+                                }
+                            }
+                            for k in &kept {
+                                if !k.held_before {
+                                    self.row_locks.release_key(session, &k.key);
+                                }
+                            }
+                            round.append(&mut kept);
+                            round.sort_by(|a, b| a.key.cmp(&b.key));
+                            for l in &round {
+                                self.row_locks
+                                    .lock(session, &l.key)
+                                    .await
+                                    .map_err(ExecError::Storage)?;
+                            }
+                        }
                     }
                     // Back to result order for the recheck and the output.
-                    let mut ordered: Vec<(usize, RowLockKey)> =
-                        round.into_iter().map(|(k, i)| (i, k)).collect();
-                    ordered.sort_by_key(|(i, _)| *i);
-                    for (i, key) in ordered {
-                        let held_before = acquired[&key];
-                        batch.push((candidates[i].clone(), key, held_before));
-                    }
+                    round.sort_by_key(|l| l.idx);
+                    batch = round;
                 }
             }
             if batch.is_empty() {
                 break;
             }
 
-            let keys: Vec<RowLockKey> = batch.iter().map(|(_, k, _)| k.clone()).collect();
+            let keys: Vec<RowLockKey> = batch.iter().map(|l| l.key.clone()).collect();
             let table_def = self.get_table(&ctx.table).await?;
             let current = self.read_locked_rows(ctx, &table_def, &keys).await?;
-            for (row, key, held_before) in batch {
+            for Locked {
+                idx,
+                row,
+                key,
+                held_before,
+            } in batch
+            {
                 match self.recheck_locked(ctx, &table_def, col_meta, row, current.get(&key.1))? {
-                    Some(row) => kept.push(row),
+                    Some(row) => kept.push(Locked {
+                        idx,
+                        row,
+                        key,
+                        held_before,
+                    }),
                     None => {
                         if !held_before {
                             self.row_locks.release_key(session, &key);
@@ -357,7 +420,8 @@ impl Executor {
                 }
             }
         }
-        *rows = kept;
+        kept.sort_by_key(|l| l.idx);
+        *rows = kept.into_iter().map(|l| l.row).collect();
         self.metrics
             .row_locks_held
             .set(self.row_locks.held_count() as i64);
@@ -391,11 +455,16 @@ impl Executor {
                 .collect()
         };
         let mut out = std::collections::HashMap::with_capacity(keys.len());
-        if pk_pos.len() == 1 {
+        // Point read through any single-column index on a key column (a
+        // single-column key's own index; for a composite key, an index on one
+        // of its columns, the full key then matched on the candidates). No
+        // such index means one scan for the round.
+        for (slot, &col) in pk_pos.iter().enumerate() {
             let mut indexed = true;
+            out.clear();
             for key in keys {
                 match self
-                    .indexed_eq_positions(&ctx.table, table_def, pk_pos[0], &key.1[0])
+                    .indexed_eq_positions(&ctx.table, table_def, col, &key.1[slot])
                     .await?
                 {
                     Some(hits) => {
@@ -415,8 +484,8 @@ impl Executor {
             if indexed {
                 return Ok(out);
             }
-            out.clear();
         }
+        out.clear();
         let wanted: std::collections::HashSet<&Vec<Value>> = keys.iter().map(|k| &k.1).collect();
         for row in self.storage_for(&ctx.table).scan(&ctx.table).await? {
             let k = key_at(&row);
@@ -441,7 +510,7 @@ impl Executor {
     /// A WHERE that cannot be evaluated against a bare row (a subquery, say)
     /// cannot be re-judged, so a changed row fails closed with a retryable
     /// conflict instead of being returned stale.
-    fn recheck_locked(
+    pub(super) fn recheck_locked(
         &self,
         ctx: &RowLockContext,
         table_def: &crate::catalog::TableDef,
