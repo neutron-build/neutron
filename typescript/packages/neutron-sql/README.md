@@ -168,11 +168,21 @@ declaration order if that is ambiguous); an index whose operator class changes
 file re-creates dropped columns before their indexes, and dropped tables (with
 the sequences they owned) before the foreign keys between them, so these plans
 apply and their down files revert.
+A table, view or enum a hand-edited document declares with `managed: false` is
+not Neutron's: no plan creates, alters or drops it (`--allow-destructive`
+included), it is not compared, so it is never drift (`schema check --live`, the
+drift gate before `migrate`), and the plan only notes it. A managed table may
+reference it; a plan that adds such a foreign key needs the table to exist, and
+a live plan against a database without it is refused (a snapshot plan cannot
+tell). `schema pull` writes every table it finds as managed, but keeps the
+marker of the document it overwrites; the TypeScript exporter always writes
+`managed: true`. In `--mode snapshot` the chain records the marker, and keeps
+it when a later document stops declaring the table.
 A foreign key of a table the plan keeps but does not manage (left in place,
 declared with `managed: false`, or in a schema the document does not declare)
 onto a key or table the plan drops refuses the plan, naming the foreign key:
-declare the table as managed, or let `--allow-destructive` drop a left-in-place
-one, or drop the foreign key by hand.
+declare the table as managed, or (for a left-in-place one) let
+`--allow-destructive` drop it, or drop the foreign key by hand.
 Changing the type of a column a stored generated column reads drops the
 generated column before the change and adds it back after it, with its
 indexes, constraints and the foreign keys onto it (PostgreSQL cannot change
@@ -181,8 +191,8 @@ recomputed, and the column is placed last; its down file adds it back last
 too, so the original column order is not restored.
 A refusal that suggests `--allow-destructive` lists every other object the flag
 would drop. The flag drops everything in the managed schemas that the schema
-does not declare as managed: tables (including ones declared with `managed:
-false`), columns, indexes, views and enums. The list and the plan use the same
+does not declare: tables, columns, indexes, views and enums (objects declared
+with `managed: false` are never dropped). The list and the plan use the same
 rules.
 Objects that depend on a column whose type changes or that is dropped, and
 that the plan does not handle, refuse the plan by name. `db push` and

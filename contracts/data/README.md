@@ -53,6 +53,19 @@ fixtures and accept the cross-object ones (ajv gate in
 | Codec/type consistency, vector capability | no | yes |
 | Index method has a default operator class for the key column type (else SQLSTATE 42704 at apply); expression keys only with btree | no | yes |
 
+## What `managed` means
+
+`managed` on a table, enum or view records whether the object is inside the
+managed scope of the workflow that produced the document. It is never
+inferred: introspection (`schema pull`, baseline) and the TypeScript exporter
+write `managed: true`; only a hand-edited desired document marks an object
+`managed: false`. A planner treats such an object as not its own: it never
+creates, alters or drops it (`--allow-destructive` included), does not compare
+its state, does not report drift on it and does not record it as left in place.
+The entry stays in the document so managed objects can reference it (a foreign
+key from a managed table onto an unmanaged one). The entry's content is
+descriptive and is not checked against the database.
+
 ## Status
 
 Version 2 documents can be validated and hashed by the CLI today; the
