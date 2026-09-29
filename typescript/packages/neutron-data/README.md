@@ -114,7 +114,7 @@ projects that never touch Drizzle do not need drizzle-orm's types to compile.
 
 ## Runtime support (Node.js)
 
-This package requires Node.js (`engines: ">= 20"`). The `/drizzle` entry
+This package requires Node.js (`engines: ">=22"`). The `/drizzle` entry
 evaluates without any Node builtin (its `node:path` use is lazy), and
 `createDrizzleDatabase` checks for a Node process positively
 (`process.versions.node`) and fails with one precise error on runtimes
@@ -136,7 +136,7 @@ drift outside the declared ranges):
 | `drizzle-orm` | `^0.44.5` | 0.44.7 |
 | `postgres` | `^3.4.7` | 3.4.8 |
 | `@libsql/client` | `^0.17.0` | 0.17.0 |
-| `@neutron-build/nucleus` | `workspace:^` | 0.1.2 (import + connect-failure path only; no live Nucleus engine is claimed) |
+| `@neutron-build/nucleus` | `^0.2.0` | 0.2.0 (import + connect-failure path only; no live Nucleus engine is claimed) |
 
 Live coverage: the Postgres leg runs typed CRUD + Drizzle transactions
 against a real server (disposable `i03_`-prefixed databases); the SQLite leg
