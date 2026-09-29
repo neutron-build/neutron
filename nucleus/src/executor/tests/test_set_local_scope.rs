@@ -117,14 +117,22 @@ async fn aborted_transaction_and_commit_of_aborted_revert() {
 
     sql(&ex, sid, "BEGIN").await;
     sql(&ex, sid, "SET LOCAL ROLE n1_app").await;
-    assert!(ex.execute_with_session(sid, "SELECT * FROM no_such_table").await.is_err());
+    assert!(
+        ex.execute_with_session(sid, "SELECT * FROM no_such_table")
+            .await
+            .is_err()
+    );
     sql(&ex, sid, "ROLLBACK").await;
     assert_eq!(user(&ex, sid).await, login);
 
     // COMMIT of an aborted transaction is a ROLLBACK: session SET reverts too.
     sql(&ex, sid, "BEGIN").await;
     sql(&ex, sid, "SET ROLE n1_app").await;
-    assert!(ex.execute_with_session(sid, "SELECT * FROM no_such_table").await.is_err());
+    assert!(
+        ex.execute_with_session(sid, "SELECT * FROM no_such_table")
+            .await
+            .is_err()
+    );
     sql(&ex, sid, "COMMIT").await;
     assert_eq!(user(&ex, sid).await, login);
 }
@@ -216,4 +224,134 @@ async fn show_or_empty(ex: &Executor, sid: u64, name: &str) -> String {
         },
         Err(_) => String::new(),
     }
+}
+
+// ---------------------------------------------------------------------
+// Review-1 (F1, F4, F6)
+// ---------------------------------------------------------------------
+
+/// F1: PostgreSQL gives a multi-statement simple query an implicit
+/// transaction block, so SET LOCAL applies to the rest of the message and
+/// ends with it. Silently ignoring the SET LOCAL there would run the later
+/// statements with MORE privilege than the caller scoped them to.
+#[tokio::test]
+async fn multi_statement_message_is_an_implicit_block_for_set_local() {
+    let (ex, sid) = fixture().await;
+    let login = user(&ex, sid).await;
+
+    let mut r = sql(
+        &ex,
+        sid,
+        "SET LOCAL ROLE n1_app; SELECT current_user; SET LOCAL app.tenant = 't'",
+    )
+    .await;
+    assert_eq!(
+        text_of(r.remove(1)),
+        "n1_app",
+        "role applies inside the message"
+    );
+    assert_eq!(user(&ex, sid).await, login, "role ended with the message");
+    assert_ne!(show_or_empty(&ex, sid, "app.tenant").await, "'t'");
+
+    // A session-level SET in a message that succeeds persists.
+    sql(&ex, sid, "SET app.tenant = 'kept'; SELECT 1").await;
+    assert_eq!(show(&ex, sid, "app.tenant").await, "'kept'");
+
+    // An error reverts the message's SET state, as the aborted implicit
+    // block does in PostgreSQL.
+    let failed = ex
+        .execute_with_session(
+            sid,
+            "SET app.tenant = 'lost'; SET ROLE n1_app; SELECT * FROM no_such_table",
+        )
+        .await;
+    assert!(failed.is_err());
+    assert_eq!(user(&ex, sid).await, login);
+    assert_eq!(show(&ex, sid, "app.tenant").await, "'kept'");
+}
+
+#[tokio::test]
+async fn explicit_begin_inside_a_message_takes_over_the_block() {
+    let (ex, sid) = fixture().await;
+    let login = user(&ex, sid).await;
+
+    // SET LOCAL before and after BEGIN in one message lasts until COMMIT.
+    let mut r = sql(
+        &ex,
+        sid,
+        "SET LOCAL ROLE n1_app; BEGIN; SELECT current_user",
+    )
+    .await;
+    assert_eq!(text_of(r.remove(2)), "n1_app");
+    assert_eq!(
+        user(&ex, sid).await,
+        "n1_app",
+        "the explicit block is still open"
+    );
+    sql(&ex, sid, "COMMIT").await;
+    assert_eq!(user(&ex, sid).await, login);
+
+    // BEGIN; SET LOCAL; COMMIT inside one message ends the block cleanly.
+    sql(&ex, sid, "BEGIN; SET LOCAL ROLE n1_app; COMMIT; SELECT 1").await;
+    assert_eq!(user(&ex, sid).await, login);
+}
+
+/// F4: PostgreSQL keeps an assumed role across RESET ALL; here RESET ALL
+/// drops it (documented deviation, fails closed).
+#[tokio::test]
+async fn reset_all_drops_the_assumed_role_inside_a_transaction_too() {
+    let (ex, sid) = fixture().await;
+    let login = user(&ex, sid).await;
+    sql(&ex, sid, "BEGIN").await;
+    sql(&ex, sid, "SET LOCAL ROLE n1_app").await;
+    sql(&ex, sid, "RESET ALL").await;
+    assert_eq!(user(&ex, sid).await, login);
+    sql(&ex, sid, "COMMIT").await;
+    assert_eq!(user(&ex, sid).await, login);
+}
+
+/// F6: a COMMIT whose storage commit fails leaves the transaction open for
+/// a retry, but not under the role it assumed.
+#[cfg(feature = "server")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_commit_does_not_leave_the_assumed_role() {
+    use crate::storage::MvccStorageAdapter;
+
+    let storage: std::sync::Arc<dyn crate::storage::StorageEngine> =
+        std::sync::Arc::new(MvccStorageAdapter::new());
+    let ex = Executor::new(std::sync::Arc::new(crate::catalog::Catalog::new()), storage);
+    exec(&ex, "CREATE ROLE n1_app").await;
+    exec(
+        &ex,
+        "CREATE TABLE skew (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)",
+    )
+    .await;
+    exec(&ex, "INSERT INTO skew VALUES (1,1),(2,1)").await;
+    exec(&ex, "GRANT SELECT, UPDATE ON skew TO n1_app").await;
+
+    let t = ex.create_session();
+    let login = user(&ex, t).await;
+    sql(&ex, t, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+    sql(&ex, t, "SET LOCAL ROLE n1_app").await;
+    sql(&ex, t, "SELECT v FROM skew WHERE id = 2").await;
+
+    let other = ex.create_session();
+    sql(&ex, other, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+    sql(&ex, other, "SELECT v FROM skew WHERE id = 1").await;
+    sql(&ex, other, "UPDATE skew SET v = 0 WHERE id = 2").await;
+    sql(&ex, other, "COMMIT").await;
+
+    sql(&ex, t, "UPDATE skew SET v = 0 WHERE id = 1").await;
+    assert!(
+        ex.execute_with_session(t, "COMMIT").await.is_err(),
+        "the write-skew commit must fail"
+    );
+    // The aborted transaction rejects statements, so read the state directly.
+    assert_eq!(
+        ex.get_session(t).current_role.read().clone(),
+        None,
+        "role survived a failed COMMIT"
+    );
+    sql(&ex, t, "ROLLBACK").await;
+    assert_eq!(user(&ex, t).await, login);
 }

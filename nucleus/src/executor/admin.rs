@@ -44,6 +44,22 @@ impl Executor {
     // SET / SHOW
     // ========================================================================
 
+    /// Push this session's `lock_timeout` setting to the storage engine, which
+    /// applies it to this session's lock waits only. Called after every change
+    /// to the setting, including the restores at COMMIT, ROLLBACK and
+    /// ROLLBACK TO SAVEPOINT, so the engine never holds a value the session
+    /// setting no longer has. Must run inside a statement (storage session
+    /// scope); pool return and disconnect clear the entry by session id.
+    pub(super) fn sync_lock_timeout(&self, session: &Session) {
+        let ms = session
+            .settings
+            .read()
+            .get("lock_timeout")
+            .and_then(|v| parse_lock_timeout(v).ok());
+        self.storage
+            .set_session_lock_timeout_ms(super::unique_gate::gate_session_id(), ms);
+    }
+
     /// Assume (or drop) a role. `local` ties the change to the open
     /// transaction; outside one, PostgreSQL warns and leaves the role alone.
     fn assign_role(session: &Session, local: bool, role: Option<String>) {
@@ -193,9 +209,10 @@ impl Executor {
             // `SET lock_timeout = '5s'` / `= 5000` — how long a SERIALIZABLE
             // transaction may block on a table lock before giving up. Same name
             // and same units (milliseconds) as PostgreSQL, 0 to disable.
+            // Validated here; applied below, per session, with the setting
+            // itself (`sync_lock_timeout`) so SET LOCAL and ROLLBACK scope it.
             if var_name == "lock_timeout" {
-                let ms = parse_lock_timeout(&val)?;
-                self.storage.set_lock_timeout_ms(ms);
+                parse_lock_timeout(&val)?;
             }
 
             // SET LOCAL is transaction-scoped: it is undone at COMMIT and
@@ -206,6 +223,9 @@ impl Executor {
             } else {
                 session.guc_note_setting(&var_name, local);
                 session.settings.write().insert(var_name.clone(), val);
+                if var_name == "lock_timeout" {
+                    self.sync_lock_timeout(&session);
+                }
             }
         }
         Ok(ExecResult::Command {

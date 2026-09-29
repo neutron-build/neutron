@@ -364,8 +364,18 @@ per-transaction `SET` state (BEGIN snapshot, values `SET LOCAL` displaced,
 a snapshot per savepoint); COMMIT restores the displaced values and keeps
 session-level changes, ROLLBACK (also COMMIT of an aborted transaction, pool
 return and disconnect) restores the BEGIN snapshot, `ROLLBACK TO SAVEPOINT`
-restores the savepoint's. `RESET ROLE`, `RESET ALL` and `DISCARD ALL` drop an
-assumed role; `SET LOCAL` outside a transaction block warns and does nothing.
+restores the savepoint's. `RESET ROLE` and `DISCARD ALL` drop an
+assumed role, as in PostgreSQL. A multi-statement simple query gets an
+implicit block for `SET` state, as in PostgreSQL 17 (`set local role x; select
+current_user` runs the SELECT as `x`; the role ends with the message; an error
+reverts the message's `SET`s); `SET LOCAL` in a single-statement message, or
+outside a block, does nothing (server-side warning only, no client NOTICE).
+`lock_timeout` is per session and follows the same scoping (it was one
+engine-global value). A COMMIT or ROLLBACK whose storage step fails returns the
+session to its BEGIN-time role and settings while leaving the transaction open.
+**Deliberate deviation:** `RESET ALL` also drops an assumed role, where
+PostgreSQL excludes `role` and `session_authorization` from `RESET ALL`; this
+fails closed (less authority, never more).
 Evidence: engine regressions in
 `nucleus/src/executor/tests/test_set_local_scope.rs`; probes
 `rls.set_local_role_transaction_local`, `rls.set_local_role_rolled_back`,

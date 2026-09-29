@@ -118,6 +118,11 @@ pub struct LockManager {
     /// indefinitely, which is indistinguishable from a hang to everyone
     /// involved. PostgreSQL exposes the same escape hatch as `lock_timeout`.
     timeout_ms: AtomicU64,
+    /// Per-session `lock_timeout` overrides (`SET lock_timeout`), keyed by the
+    /// storage session id. A session's setting must bound only its own waits:
+    /// this used to be the single value above, so one tenant's `SET LOCAL
+    /// lock_timeout` changed every session's and was never restored.
+    session_timeouts: Mutex<HashMap<u64, u64>>,
 }
 
 #[derive(Default)]
@@ -140,12 +145,34 @@ impl LockManager {
             txns: Mutex::new(HashMap::new()),
             released: Notify::new(),
             timeout_ms: AtomicU64::new(DEFAULT_LOCK_TIMEOUT_MS),
+            session_timeouts: Mutex::new(HashMap::new()),
         }
     }
 
     /// Set the lock wait bound. 0 disables it.
     pub fn set_timeout_ms(&self, ms: u64) {
         self.timeout_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Set (or, with `None`, clear) one session's lock wait bound.
+    pub fn set_session_timeout_ms(&self, session: u64, ms: Option<u64>) {
+        let mut map = self.session_timeouts.lock();
+        match ms {
+            Some(ms) => {
+                map.insert(session, ms);
+            }
+            None => {
+                map.remove(&session);
+            }
+        }
+    }
+
+    fn budget_for(&self, session: u64) -> u64 {
+        self.session_timeouts
+            .lock()
+            .get(&session)
+            .copied()
+            .unwrap_or_else(|| self.timeout_ms())
     }
 
     pub fn timeout_ms(&self) -> u64 {
@@ -265,7 +292,7 @@ impl LockManager {
             return Ok(AcquireOutcome::Immediate);
         }
         let started = std::time::Instant::now();
-        let budget = self.timeout_ms();
+        let budget = self.budget_for(txn);
         let mut woken = Some(woken);
         loop {
             let wait = match woken.take() {

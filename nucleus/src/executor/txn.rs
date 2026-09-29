@@ -144,6 +144,11 @@ impl Executor {
         if self.storage.supports_mvcc()
             && let Err(error) = self.storage.commit_txn().await
         {
+            // The transaction stays open for a retry, but not under the role
+            // it assumed: see `Session::guc_fail_close`.
+            sess.guc_fail_close();
+            self.recompute_session_context(&sess);
+            self.sync_lock_timeout(&sess);
             // Publication and persistence happen only AFTER this decision
             // (see below), so a failed commit has published nothing and
             // persisted nothing: the staged catalog stays staged, the
@@ -201,6 +206,7 @@ impl Executor {
         // SET LOCAL ends with the transaction; session-level SET stays.
         sess.guc_commit();
         self.recompute_session_context(&sess);
+        self.sync_lock_timeout(&sess);
         self.metrics.open_transactions.dec();
         drop(txn);
 
@@ -303,8 +309,13 @@ impl Executor {
         self.snapshot_leases
             .release(super::unique_gate::gate_session_id());
 
-        if self.storage.supports_mvcc() {
-            self.storage.abort_txn().await?;
+        if self.storage.supports_mvcc()
+            && let Err(error) = self.storage.abort_txn().await
+        {
+            sess.guc_fail_close();
+            self.recompute_session_context(&sess);
+            self.sync_lock_timeout(&sess);
+            return Err(error.into());
         }
         // Non-MVCC engines restore from the lazily captured before-images
         // below (`engine_snapshots`), which now cover the default engine as
@@ -348,6 +359,7 @@ impl Executor {
         // Every SET, SET LOCAL and SET ROLE of the transaction is undone.
         sess.guc_rollback();
         self.recompute_session_context(&sess);
+        self.sync_lock_timeout(&sess);
 
         self.metrics.open_transactions.dec();
         drop(txn);
@@ -536,6 +548,7 @@ impl Executor {
         txn.aborted = false;
         sess.guc_rollback_to_savepoint(name);
         self.recompute_session_context(&sess);
+        self.sync_lock_timeout(&sess);
         drop(txn);
 
         for (table, original) in &engine_revert {

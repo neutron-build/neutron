@@ -583,12 +583,15 @@ async fn set_lock_timeout_bounds_the_wait() {
     let dir = tempfile::tempdir().unwrap();
     let ex = disk_executor(dir.path());
     seed_accounts(&ex).await;
-    exec(&ex, "SET lock_timeout = '80ms'").await;
 
     // `holder` locks first and never lets go, so `waiter` is OLDER-safe: it
     // waits rather than dying, which is the case a timeout has to rescue.
     let waiter_s = ex.create_session();
     let holder_s = ex.create_session();
+    // lock_timeout is per session: set it on the session that waits.
+    ex.execute_with_session(waiter_s, "SET lock_timeout = '80ms'")
+        .await
+        .unwrap();
     ex.execute_with_session(waiter_s, BEGIN_SER).await.unwrap();
     ex.execute_with_session(waiter_s, "SELECT * FROM accounts")
         .await
@@ -655,4 +658,96 @@ async fn the_disk_engine_accepts_every_isolation_level() {
         exec(&ex, "ROLLBACK").await;
     }
     exec(&ex, "SET transaction_isolation = 'serializable'").await;
+}
+
+/// N1-class: `lock_timeout` used to be one engine-global value, so one
+/// session's `SET` (or `SET LOCAL`, never restored) changed every session's
+/// lock waits. Now it is per session and, like every setting, transaction-
+/// scoped.
+///
+/// `contended_wait` parks an older serializable transaction behind a younger
+/// holder's exclusive lock and reports whether it gave up with a lock timeout
+/// (`Some(Err)`) or was still waiting after 5s (`None`, the pre-fix hang when
+/// another session had set the timeout to 0).
+async fn contended_wait(ex: &Arc<Executor>, waiter: u64, table: &str) -> Option<ExecError> {
+    exec(ex, &format!("CREATE TABLE {table} (id INT, v INT)")).await;
+    exec(ex, &format!("INSERT INTO {table} VALUES (1, 1)")).await;
+    ex.execute_with_session(waiter, BEGIN_SER).await.unwrap();
+    ex.execute_with_session(waiter, "SELECT * FROM accounts")
+        .await
+        .unwrap();
+    let holder = ex.create_session();
+    ex.execute_with_session(holder, BEGIN_SER).await.unwrap();
+    ex.execute_with_session(holder, &format!("UPDATE {table} SET v = 2 WHERE id = 1"))
+        .await
+        .unwrap();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ex.execute_with_session(waiter, &format!("SELECT * FROM {table}")),
+    )
+    .await;
+    let _ = ex.execute_with_session(waiter, "ROLLBACK").await;
+    let _ = ex.execute_with_session(holder, "ROLLBACK").await;
+    match outcome {
+        Ok(Err(e)) => Some(e),
+        Ok(Ok(_)) => panic!("the waiter should not have obtained the lock"),
+        Err(_) => None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lock_timeout_is_session_scoped_not_engine_global() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = Arc::new(Catalog::new());
+    let disk = Arc::new(DiskEngine::open(&dir.path().join("t.db"), catalog.clone()).unwrap());
+    let buffered = Arc::new(BufferedDiskEngine::new(disk));
+    buffered.set_lock_timeout_ms(80);
+    let engine: Arc<dyn StorageEngine> = buffered.clone();
+    let ex = Arc::new(Executor::new(catalog, engine));
+    seed_accounts(&ex).await;
+
+    // Session A disables the timeout for itself.
+    let a = ex.create_session();
+    let b = ex.create_session();
+    ex.execute_with_session(a, "SET lock_timeout = 0")
+        .await
+        .unwrap();
+    let e = contended_wait(&ex, b, "side1")
+        .await
+        .expect("session B's waits are bounded by the engine default, not by A's SET");
+    assert!(format!("{e:?}").contains("lock_not_available"), "{e:?}");
+
+    // SET LOCAL lock_timeout lasts to the end of the transaction only, and
+    // outside a transaction block it does nothing.
+    let c = ex.create_session();
+    ex.execute_with_session(c, "BEGIN").await.unwrap();
+    ex.execute_with_session(c, "SET LOCAL lock_timeout = 0")
+        .await
+        .unwrap();
+    ex.execute_with_session(c, "COMMIT").await.unwrap();
+    let e = contended_wait(&ex, c, "side2")
+        .await
+        .expect("SET LOCAL lock_timeout survived COMMIT");
+    assert!(format!("{e:?}").contains("lock_not_available"), "{e:?}");
+
+    let d = ex.create_session();
+    ex.execute_with_session(d, "SET LOCAL lock_timeout = 0")
+        .await
+        .unwrap();
+    let e = contended_wait(&ex, d, "side3")
+        .await
+        .expect("SET LOCAL lock_timeout outside a transaction must do nothing");
+    assert!(format!("{e:?}").contains("lock_not_available"), "{e:?}");
+
+    // A session-level SET inside a rolled-back transaction reverts too.
+    let f = ex.create_session();
+    ex.execute_with_session(f, "BEGIN").await.unwrap();
+    ex.execute_with_session(f, "SET lock_timeout = 0")
+        .await
+        .unwrap();
+    ex.execute_with_session(f, "ROLLBACK").await.unwrap();
+    let e = contended_wait(&ex, f, "side4")
+        .await
+        .expect("SET lock_timeout survived ROLLBACK");
+    assert!(format!("{e:?}").contains("lock_not_available"), "{e:?}");
 }
