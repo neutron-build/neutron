@@ -593,6 +593,29 @@ impl RowLockManager {
         }
     }
 
+    /// Whether `session` itself holds the lock on `key`.
+    pub fn holds(&self, session: u64, key: &RowLockKey) -> bool {
+        self.held.lock().owner.get(key) == Some(&session)
+    }
+
+    /// Release one row lock `session` holds, ahead of transaction end. Used
+    /// when a locked candidate is dropped after its recheck: a row the
+    /// statement does not return must not stay held. No-op if the session
+    /// does not hold it.
+    pub fn release_key(&self, session: u64, key: &RowLockKey) {
+        {
+            let mut held = self.held.lock();
+            if held.owner.get(key) != Some(&session) {
+                return;
+            }
+            held.owner.remove(key);
+            if let Some(keys) = held.by_session.get_mut(&session) {
+                keys.retain(|k| k != key);
+            }
+        }
+        self.released.notify_waiters();
+    }
+
     /// Rows currently locked, across all sessions. Test/observability.
     pub fn held_count(&self) -> usize {
         self.held.lock().owner.len()

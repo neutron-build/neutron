@@ -3123,7 +3123,7 @@ impl Executor {
     ///   their encoded form, so an index can return a row whose key merely
     ///   encodes alike; every candidate is re-checked against the original
     ///   value before it is handed on.
-    async fn indexed_eq_positions(
+    pub(super) async fn indexed_eq_positions(
         &self,
         table: &str,
         table_def: &crate::catalog::TableDef,
