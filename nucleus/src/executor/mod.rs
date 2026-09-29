@@ -288,13 +288,15 @@ impl<'a> ImplicitSetBlock<'a> {
 impl Drop for ImplicitSetBlock<'_> {
     fn drop(&mut self) {
         // Reached still owning the block only when the future was dropped
-        // mid-flight. Roll the SET state back; the security context is
-        // recomputed at the start of the next dispatch, and the engine-side
+        // mid-flight (cancellation or a panic unwinding). Roll the SET state
+        // back and recompute the security context here, synchronously, so no
+        // stale context is visible before the next dispatch; the engine-side
         // lock_timeout is re-derived here because no statement scope exists.
         if !self.owned || self.session.txn_active.load(Ordering::SeqCst) {
             return;
         }
         self.session.guc_rollback();
+        self.executor.recompute_session_context(&self.session);
         let ms = self
             .session
             .settings
@@ -6956,8 +6958,11 @@ impl Executor {
         // is one transaction). The SET values of a failed message are
         // reverted, as the aborted block's would be.
         //
-        // A COMMIT or ROLLBACK in the message ends the block and the next
-        // statement opens a new one, as in PostgreSQL. A message that opens an
+        // A COMMIT or ROLLBACK in the message ends the SET block and the next
+        // statement opens a new one, as in PostgreSQL. That parity is for SET
+        // state only: an in-message ROLLBACK does not undo data (`insert 1;
+        // rollback; insert 2; select count(*)` counts 2 here, 1 on
+        // PostgreSQL). A message that opens an
         // explicit BEGIN hands the block to that transaction. The guard closes
         // the block if this future is dropped mid-flight (statement timeout,
         // CancelRequest), so nothing leaks into the next message.
