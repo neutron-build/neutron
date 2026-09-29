@@ -709,7 +709,7 @@ impl Executor {
                     Vec::new()
                 } else {
                     use crate::catalog::TableConstraint;
-                    table_def
+                    let mut sets: Vec<Vec<usize>> = table_def
                         .constraints
                         .iter()
                         .filter_map(|c| match c {
@@ -723,7 +723,13 @@ impl Executor {
                             }
                             _ => None,
                         })
-                        .collect()
+                        .collect();
+                    for idxs in self.unique_index_col_sets(&table_name, &table_def).await {
+                        if !sets.contains(&idxs) {
+                            sets.push(idxs);
+                        }
+                    }
+                    sets
                 };
             // Keys duplicated *within* this statement are invisible to the
             // per-row `check_unique_constraints` above: the earlier rows are
@@ -1001,6 +1007,29 @@ impl Executor {
         }
     }
 
+    /// Column sets of `CREATE UNIQUE INDEX` indexes on the table. They enforce
+    /// uniqueness exactly like a table UNIQUE constraint.
+    pub(super) async fn unique_index_col_sets(
+        &self,
+        table_name: &str,
+        table_def: &TableDef,
+    ) -> Vec<Vec<usize>> {
+        self.catalog
+            .get_indexes(table_name)
+            .await
+            .iter()
+            .filter(|index| index.unique)
+            .filter_map(|index| {
+                let idxs: Vec<usize> = index
+                    .columns
+                    .iter()
+                    .filter_map(|n| table_def.column_index(n))
+                    .collect();
+                (idxs.len() == index.columns.len()).then_some(idxs)
+            })
+            .collect()
+    }
+
     /// Check UNIQUE and PRIMARY KEY constraints for a row.
     /// `skip_row_idx` is used during UPDATE to skip the row being updated.
     pub(super) async fn check_unique_constraints(
@@ -1041,6 +1070,12 @@ impl Executor {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        for indices in self.unique_index_col_sets(table_name, table_def).await {
+            if !unique_col_sets.contains(&indices) {
+                unique_col_sets.push(indices);
             }
         }
 
@@ -2368,6 +2403,11 @@ impl Executor {
         let mut check_fk = false;
         let mut check_unique = false;
         let mut has_check_constraints = false;
+        for idxs in self.unique_index_col_sets(&table_name, &table_def).await {
+            if idxs.iter().any(|idx| updated_col_indices.contains(idx)) {
+                check_unique = true;
+            }
+        }
         for constraint in &table_def.constraints {
             match constraint {
                 crate::catalog::TableConstraint::PrimaryKey { columns, .. }
@@ -2597,7 +2637,7 @@ impl Executor {
         let count = if check_unique && !updates.is_empty() {
             let unique_col_sets: Vec<Vec<usize>> = {
                 use crate::catalog::TableConstraint;
-                table_def
+                let mut sets: Vec<Vec<usize>> = table_def
                     .constraints
                     .iter()
                     .filter_map(|c| match c {
@@ -2611,7 +2651,13 @@ impl Executor {
                         }
                         _ => None,
                     })
-                    .collect()
+                    .collect();
+                for idxs in self.unique_index_col_sets(&table_name, &table_def).await {
+                    if !sets.contains(&idxs) {
+                        sets.push(idxs);
+                    }
+                }
+                sets
             };
             // Same read-modify-write retry as the plain path. This branch is
             // taken when the statement changes a PRIMARY KEY or UNIQUE column,
