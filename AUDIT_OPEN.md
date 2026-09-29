@@ -16,7 +16,7 @@ consumer-reported snapshot-capability gap under the founder-ratified
 closed the three lease-scope defects reported from the observe backup
 session and landed NU-01's unblocked compaction subset. Separately, engine
 defects the ORM program reported upstream (N1-N16, N1 security-class) are
-open and listed at the end.
+listed at the end; N1 was closed 2026-09-28 (X07), the rest are open.
 
 ## Resolved 2026-09-18 (round 5 — lease-scope closure + NU-01 compaction subset)
 
@@ -441,9 +441,15 @@ reproducers"); engine fixes are outside that program, and the ORM keeps
 every affected capability gated off or unadvertised on Nucleus. Listed here
 so engine sessions see them:
 
-- **N1 (security)** — `SET LOCAL ROLE` / `SET LOCAL` settings persist after
-  `COMMIT`/`ROLLBACK`, and `RESET ROLE` is a no-op: a pooled connection keeps
-  an assumed role for the next borrower.
+- **N1 (security) — CLOSED 2026-09-28 (orm-program X07, commit `081183f9`)** —
+  `SET LOCAL ROLE` / `SET LOCAL` settings persisted after `COMMIT`/`ROLLBACK`,
+  and `RESET ROLE` was a no-op: a pooled connection kept an assumed role for
+  the next borrower. Transaction-scoped `SET` state is now restored at COMMIT,
+  ROLLBACK, aborted-transaction COMMIT, `ROLLBACK TO SAVEPOINT`, pool return;
+  `RESET ROLE`/`RESET ALL`/`DISCARD ALL` drop the role. Regressions:
+  `nucleus/src/executor/tests/test_set_local_scope.rs`; live probes
+  `rls.set_local_*` / `rls.set_session_setting_transaction_scope`
+  (`conformance/live/orm/`). `set_config()` remains missing (N-list, unchanged).
 - **N3 (silent data corruption)** — timestamptz input ignores explicit
   offsets and the session `TimeZone`.
 - **N2, N4-N13** — non-transactional DDL, catalog fidelity,
