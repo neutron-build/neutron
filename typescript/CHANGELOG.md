@@ -6,6 +6,9 @@ All notable changes to this project are documented in this file.
 
 ## [core 0.2.3, cli 0.2.4, create-neutron 0.1.6, auth 0.1.4, cache-redis 0.1.3, security 0.1.3] - 2026-09-28
 
+**Requires Node.js 22 or later** (`engines.node` is `">=22"`; it was
+`">=20"`) for every package released here.
+
 ### Fixed
 
 - **An action or loader returning `Response.json(...)` was served as 200 `{}`
@@ -64,6 +67,9 @@ All notable changes to this project are documented in this file.
   credentials and read a bounded body, a missing `sharp` is 503 and
   undecodable input is 415 (the raw-bytes fallbacks are gone), and cache
   entries publish atomically.
+- **`@neutron-build/core` declared `ws` types it did not install.** Its
+  declarations import `WebSocketServer` from `ws`; with `skipLibCheck` off a
+  consumer got TS7016. `@types/ws` is now a dependency.
 - **`@neutron-build/security` rate limiting bucketed every visitor together.**
   `createRateLimitMiddleware` without a `key` function called
   `resolveClientIp(request)` without the proxy options, which always returned
@@ -96,6 +102,23 @@ All notable changes to this project are documented in this file.
   `@neutron-build/cli` `^0.2.4`** for scaffolds created outside the
   workspace.
 
+### Breaking
+
+- **`@neutron-build/core`: `NeutronAppResponseCacheEntry.body` is a
+  `Uint8Array`** (it was a `string`; the type is exported from
+  `@neutron-build/core` and `@neutron-build/core/server`). The cache is
+  byte-exact now, where the string round-trip altered binary and non-UTF-8
+  bodies. A custom `NeutronAppCacheStore` must store and return bytes and
+  fails to type-check until it does. Entries written as strings by earlier
+  versions are still served: the server encodes a string body, and
+  `@neutron-build/cache-redis` returns such entries as bytes.
+- **`@neutron-build/core`: several behaviours are stricter** (listed in the
+  server hardening entry above). Startup rejects instead of serving an ungated
+  static server; an image request with no `sharp` answers 503 and undecodable
+  input 415, where the raw source bytes were returned; CSRF same-origin
+  compares scheme, host and port; configured `ignoredMethods` are upper-cased.
+  Apps that relied on the old behaviour need a change.
+
 ### Added
 
 - **`maxRequestBodyBytes` on `NeutronServerOptions`.** The server adapter
@@ -105,6 +128,9 @@ All notable changes to this project are documented in this file.
   lie. The `Content-Length` check stays as the early rejection.
 
 ## [nucleus 0.2.0, data 0.2.0, sql 0.1.0] - 2026-09-28
+
+**Requires Node.js 22 or later** (`engines.node` is `">=22"`; it was
+`">=20"`) for every package released here.
 
 ### Breaking
 
@@ -117,7 +143,8 @@ All notable changes to this project are documented in this file.
   checksum that does not match its migration refuses the adoption). A crashed
   runner's lock claim is no longer taken over after
   ten minutes: release it with `forceUnlockMigrations`, after checking
-  `migrationLockInfo`. The same protocol is in the Go SDK and the CLI.
+  `migrationLockInfo`. The same protocol is in the Go SDK (released as
+  `go/v0.2.0` with this release) and the CLI.
 - **`@neutron-build/nucleus` pub/sub `channels()` takes no pattern.** The
   engine ignored it; filtering on the client would have faked a server
   feature.
@@ -191,6 +218,9 @@ All notable changes to this project are documented in this file.
 
 ## [agents 0.2.0, ai 0.1.1, mcp 0.1.1, workflow 0.1.1] - 2026-09-28
 
+**Requires Node.js 22 or later** (`engines.node` is `">=22"`; it was
+`">=20"`) for every package released here.
+
 ### Breaking
 
 - **`@neutron-build/agents` refuses an unauthenticated exec-backed mount.**
@@ -224,6 +254,39 @@ All notable changes to this project are documented in this file.
 - **`@neutron-build/workflow` `PostgresEventStore`.** A durable event log
   (keyed by run and sequence, first writer wins) with executor leases on
   PostgreSQL, structurally typed against the `postgres` client.
+
+## [Go SDK 0.2.0] - 2026-09-28
+
+Tag `go/v0.2.0` (module `github.com/neutron-build/neutron/go`).
+
+### Breaking
+
+- **Migration history uses protocol v2**: history checksums, a pinned advisory
+  lock, and explicit adoption (`AdoptMigrations`). A history from before the
+  protocol is refused until adopted; see the `@neutron-build/nucleus` entry
+  and `contracts/data/MIGRATIONS.md`.
+- **Stricter request handling** from the Go audit: strict binding, a JSON
+  commit path, a strict JWT policy, verified OAuth identity, fail-closed
+  session commit and CSRF hardening. Apps that relied on the old leniency
+  need a change.
+
+### Fixed
+
+- Router group middleware applies to `Mount`, `Static` and `StaticFS` routes;
+  an exact mount root is normalized and application 404/405 responses are no
+  longer rewritten.
+- The HTTP cache honors `Vary` and freshness metadata, keeps streaming, and
+  includes the request host in its key.
+- CORS and compression correctness, a gzip state machine, a rate-limit bucket
+  ceiling, and `DELETE` form bodies.
+- Migration ledger lock, history checksums, and native integer scans.
+- `Run("")` reads `NEUTRON_HOST` / `NEUTRON_PORT`; OpenAPI schemas match the
+  wire; a lifecycle start rollback no longer runs on the success path; vector
+  collections satisfy the engine's HNSW DDL gates.
+
+### Added
+
+- A snapshot-lease client surface with typed conflicts.
 
 ## [Go CLI 0.3.0] - 2026-09-28
 

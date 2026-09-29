@@ -1,156 +1,82 @@
-# Render-core package release
+# Publishing the TypeScript packages
 
-## Pending release: core 0.1.7 (core only)
+All packages under `typescript/packages/*` publish together from the workspace
+root. `pnpm publish -r` publishes every package whose version is not yet on the
+registry, in dependency order, and skips the rest, so a package is released by
+bumping its `version`. `workspace:^` dependency ranges are rewritten to the real
+version at publish time.
 
-Version already bumped. Fixes a build-breaking bug for **hydrating** sites: the
-server-only content module (`getCollection`/`getEntry`, which use node:crypto/fs/
-MDX) leaked into the client/island bundle when a component both loaded content
-and rendered an `<Island>`, failing with "createHash is not exported". Static
-sites (e.g. neutron.build) were unaffected. Verified end-to-end against
-teploy-site (islands + getCollection): builds clean and still emits the island
-bundle.
+## Current release
 
-Only `core` changed. `cli@0.1.5` depends on core `^0.1.6`, so a site on cli 0.1.5
-auto-resolves the fixed core; no cli bump needed.
+The release prepared for the ORM program, with the versions in this tree:
 
-Publish runbook (you run this — login needs your security key/OTP):
+| Package | Version |
+|---|---|
+| `@neutron-build/sql` | 0.1.0 (first publish, alpha) |
+| `@neutron-build/nucleus` | 0.2.0 |
+| `@neutron-build/data` | 0.2.0 |
+| `@neutron-build/agents` | 0.2.0 |
+| `@neutron-build/core` | 0.2.3 |
+| `@neutron-build/cli` | 0.2.4 |
+| `create-neutron` | 0.1.6 |
+| `@neutron-build/auth` | 0.1.4 |
+| `@neutron-build/cache-redis` | 0.1.3 |
+| `@neutron-build/security` | 0.1.3 |
+| `@neutron-build/ai` | 0.1.1 |
+| `@neutron-build/mcp` | 0.1.1 |
+| `@neutron-build/workflow` | 0.1.1 |
 
-```bash
-cd Neutron/typescript
-pnpm --filter @neutron-build/core build
-npm login --auth-type=web   # if not still logged in
-(cd packages/neutron && pnpm publish --no-git-checks --access public)   # core 0.1.7
-npm view @neutron-build/core version   # expect 0.1.7
-```
+`@neutron-build/ops` (0.1.2), `@neutron-build/otel` (0.1.2) and
+`@neutron-build/mail` (0.1.0) are unchanged and stay on the registry as they are.
+What changed in each package is in `CHANGELOG.md`. Check the registry for what is
+live: `npm view <package> version`.
 
-After publish, hydrating sites (teploy-site, and any island-using site) can bump
-`@neutron-build/core` to `^0.1.7`, drop their pnpm patches, and build.
+## Publish
 
-## Released: core 0.1.6 / cli 0.1.5
+Publishing is the owner's step. Two routes:
 
-Versions already bumped (`package.json`). These ship framework bug fixes that
-affect every Neutron site, so downstream sites (teploy.com, DLBS) should update
-after publish and can drop any local pnpm patches for these fixes.
-
-What's in it (since core 0.1.5 / cli 0.1.4):
-- **Anchor links (core):** the SPA click interceptor + `navigate()` no longer
-  strip the URL hash — in-page anchors (`#section`, `/page#section`) scroll
-  again. Was broken on every hydrating Neutron site.
-- **Heading IDs (core):** markdown AND MDX headings get slugified `id`s, so the
-  "on this page" TOC anchors resolve (fixes teploy.com's TOC).
-- **Resource routes (core + cli):** dynamic resource routes + catch-all-with-
-  literal-suffix routing — enables per-page endpoints like `/docs/<slug>.md`.
-- **MCP (cli):** `search_docs` / `get_doc` tools added to `neutron mcp`.
-
-Publish runbook (you run this — the login step needs your security key):
+**Locally** (works with 2FA; the CI route fails with EOTP unless the token
+bypasses 2FA):
 
 ```bash
-cd Neutron/typescript
-pnpm -r build
+cd typescript
+pnpm install --frozen-lockfile
+pnpm --filter "./packages/*" run build
 npm login --auth-type=web
-(cd packages/neutron     && pnpm publish --no-git-checks --access public)   # core 0.1.6 FIRST
-(cd packages/neutron-cli && pnpm publish --no-git-checks --access public)   # cli 0.1.5 (workspace:^ rewritten to core 0.1.6)
-for p in core cli; do echo -n "@neutron-build/$p: "; npm view @neutron-build/$p version; done
+pnpm publish -r --access public --no-git-checks
 ```
 
-Only `core` and `cli` changed this cycle — `ai`/`workflow`/`agents` stay put.
+**From CI:** push a `ts/vX.Y.Z` tag. `.github/workflows/typescript-publish.yml`
+runs build and tests, then `pnpm publish -r` with `secrets.NPM_TOKEN`, which must
+be an npm token that can publish `@neutron-build/*` and `create-neutron` and
+bypasses 2FA.
 
-## Release status (completed 2026-07-14)
+If a publish stops partway, fix the cause and run it again: versions already on
+the registry are skipped.
 
-The render-core packages are published and publicly available:
-
-- `@neutron-build/core@0.1.5`
-- `@neutron-build/cli@0.1.4` (published dependency: core `^0.1.5`)
-- `@neutron-build/ai@0.1.0`
-- `@neutron-build/workflow@0.1.0`
-- `@neutron-build/agents@0.1.0`
-
-The commands below are retained as the verified manual release procedure for a
-future version. Run pnpm from inside each package directory: using
-`pnpm --dir <package> publish` with pnpm 9.15.4 and npm 11.17.0 produced a
-malformed npm invocation.
-
-The render-core-unification work added new `@neutron-build/core/runtime-edge`
-exports (`renderAppRoute`, `isMutationMethod`, `isJsonRequest`,
-`createMemoryLoaderCacheStore`), and the CLI's generated prod entry now imports
-them. `core@0.1.4` and `cli@0.1.3` are already published at those exact versions,
-so this **requires a version bump** (npm forbids overwriting) and the CLI must
-resolve a core that has the new exports.
-
-`cli` depends on core via `workspace:^`, so pnpm rewrites it to the real core
-version **at publish time** — bump core first and the pin is automatic.
-
-## Branch state (verified 2026-07-14)
-
-`feat/render-core-unification` is a clean fast-forward from main (main is 0
-ahead). It contains the original five render-core commits plus the follow-on
-head-resolution/render-guards commit `e3f19e9`.
+## Verify
 
 ```bash
-# (optional, recommended) merge the finished branch — it's a clean fast-forward
-git checkout main && git merge --ff-only feat/render-core-unification
+for p in create-neutron @neutron-build/core @neutron-build/cli @neutron-build/data \
+         @neutron-build/nucleus @neutron-build/sql; do
+  echo "$p $(npm view $p version)"; done
 ```
 
-Note: another workstream may have uncommitted `nucleus/*.rs` changes in the
-working tree — commit/stash those before switching branches.
+Before publishing, `pnpm publish -r --access public --no-git-checks --dry-run`
+lists exactly what would go out and in what order, and
+`pnpm pack --pack-destination <dir>` in a package shows its tarball (check the
+packed `package.json` has no `workspace:` ranges).
 
-## Steps
+## Rules that keep a release consistent
 
-```bash
-cd Neutron/typescript
-git checkout feat/render-core-unification      # (or main, if you merged above)
-
-# 1. Bump the two already-published packages past the taken versions.
-#    (ai/workflow/agents are 0.1.0 and unpublished — leave as-is.)
-npm --prefix packages/neutron        version patch --no-git-tag-version   # core 0.1.4 -> 0.1.5
-npm --prefix packages/neutron-cli    version patch --no-git-tag-version   # cli  0.1.3 -> 0.1.4
-
-# 2. Build everything.
-pnpm -r build
-
-# 3. Log in through the browser/security-key flow.
-npm login --auth-type=web
-
-# 4. Publish in dependency order — core FIRST. pnpm rewrites workspace:^.
-(cd packages/neutron          && pnpm publish --no-git-checks --access public)
-(cd packages/neutron-cli      && pnpm publish --no-git-checks --access public)
-(cd packages/neutron-ai       && pnpm publish --no-git-checks --access public)
-(cd packages/neutron-workflow && pnpm publish --no-git-checks --access public)
-(cd packages/neutron-agents   && pnpm publish --no-git-checks --access public)
-
-# 5. Verify.
-for p in core cli ai workflow agents; do echo -n "@neutron-build/$p: "; npm view @neutron-build/$p version; done
-```
-
-Sanity check before publishing cli: `npm pack --dry-run packages/neutron-cli` and
-confirm the resolved `@neutron-build/core` dependency is `^0.1.5` (not
-`workspace:^`).
-
-## Ship de-vendoring (R5)
-
-Ship previously installed the SDKs from packed tarballs because they were ahead
-of npm. The `Teploy/teploy-ship` deployment image now uses the published
-versions directly.
-
-In `Teploy/teploy-ship`:
-
-1. `deploy/package.ship.json` — replace the `file:./vendor/*.tgz` deps:
-   ```json
-   "@neutron-build/agents":  "^0.1.0",
-   "@neutron-build/ai":      "^0.1.0",
-   "@neutron-build/workflow":"^0.1.0",
-   ```
-2. `deploy/package.web.json` — replace the vendored core/cli:
-   ```json
-   "@neutron-build/cli":  "^0.1.4",
-   "@neutron-build/core": "^0.1.5",
-   ```
-3. `deploy/build-image.sh` — remove the `pnpm pack … deploy/vendor` step and the
-   `COPY deploy/vendor/ vendor/` line in the Dockerfile.
-4. Rebuild the Ship image and smoke-test (`docker build` + `web`/`worker` boot).
-
-## Notes
-- Monorepo/Ship-from-source are unaffected either way (they use `link:`/`file:`);
-  this coupling only bites external npm consumers, so it's not urgent — but don't
-  publish cli without publishing the bumped core in the same pass.
-- `nucleus@0.1.2` is already on the registry; no action.
+- npm versions are immutable. A change to a published package needs a new
+  version; metadata (description, keywords, engines) cannot be edited afterwards.
+- Bump a package whenever its code or dependencies changed, and its dependents
+  follow only when a range has to move. Publishing `cli` requires the matching
+  `core` and `create-neutron` in the same pass, or the packed `cli` cannot
+  resolve them.
+- `create-neutron` pins the released `core` and `cli` pair for external
+  projects (`src/scaffold.ts`, and the same numbers in `src/index.test.ts`).
+  Update both when either version moves.
+- The Go CLI has its own tag (`cli/vX.Y.Z`, `.github/workflows/cli.yml`); the
+  Go SDK module is tagged `go/vX.Y.Z`. Neither is published by this procedure.
