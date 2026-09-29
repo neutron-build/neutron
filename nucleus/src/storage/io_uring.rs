@@ -100,6 +100,11 @@ impl AsyncDiskOps for StandardDiskOps {
             .await?;
         file.seek(SeekFrom::Start(offset)).await?;
         file.write_all(data).await?;
+        // tokio::fs::File hands writes to a blocking thread and does NOT wait
+        // for them on drop. Without this flush, write_page returned (and the
+        // handle was dropped) before the bytes reached the file, so a read
+        // issued right after could still see the old page contents.
+        file.flush().await?;
         Ok(())
     }
 
@@ -852,6 +857,25 @@ mod tests {
                 }
                 _ => panic!("expected ReadComplete"),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn write_page_is_visible_to_an_immediately_following_read() {
+        let dir = TempDir::new().unwrap();
+        let ops = setup_standard(&dir);
+        let mut buf = vec![0u8; TEST_PAGE_SIZE];
+        for round in 0..400u32 {
+            let fill = (round % 251) as u8 + 1;
+            let page_id = round % 8;
+            ops.write_page(page_id, &vec![fill; TEST_PAGE_SIZE])
+                .await
+                .unwrap();
+            ops.read_page(page_id, &mut buf).await.unwrap();
+            assert!(
+                buf.iter().all(|&b| b == fill),
+                "round {round}: read after write returned stale page contents"
+            );
         }
     }
 
