@@ -58,7 +58,7 @@ func q12CatalogSQL(byName bool) string {
 		WHERE n.nspname = 'app'),
 	(SELECT string_agg(format('view %%s.%%s %%s', n.nspname, c.relname, pg_get_viewdef(c.oid)), ' | ' ORDER BY n.nspname, c.relname)
 		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname IN ('app', 'rep') AND c.relkind = 'v'),
+		WHERE n.nspname IN ('app', 'rep', 'public') AND c.relkind = 'v'),
 	(SELECT string_agg(format('enum %%s %%s', t.typname, e.enumlabel), ', ' ORDER BY t.typname, e.enumsortorder)
 		FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid JOIN pg_namespace n ON n.oid = t.typnamespace
 		WHERE n.nspname = 'app'))`, order)
@@ -78,8 +78,9 @@ type q12Case struct {
 	destructive bool     // generate needs --allow-destructive
 	lossy       bool     // rows do not survive the round trip
 	byName      bool     // the plan moves a column last: compare columns by name
-	noSnapshot  bool     // offline planning refuses the shape (Q11 rename rule)
+	noSnapshot  bool     // offline planning refuses the shape (Q11 rename rule), or needs a live catalog
 	unmanaged   []string // schemas built in the target but left out of the schema document
+	searchPath  bool     // the database sets search_path: view text comes back unqualified, so compare without the schema prefix
 }
 
 var q12Cases = []q12Case{
@@ -252,6 +253,77 @@ var q12Cases = []q12Case{
 		live:   []string{`CREATE TABLE app.t (id int PRIMARY KEY, v text)`, `CREATE INDEX t_v ON app.t (v text_pattern_ops)`},
 		target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, v text)`, `CREATE INDEX t_v ON app.t (v)`},
 		data:   []string{`INSERT INTO app.t VALUES (1, 'x')`}},
+	// Q12 review-2 R2-1: the view order never inverts a real dependency.
+	// n01b: on a fresh database, a base view aliases a column as its
+	// dependent's name.
+	{name: "new views where the base aliases a column as the dependent's name",
+		live: []string{`CREATE TABLE app.orders (id int PRIMARY KEY, customer int, total numeric)`},
+		target: []string{`CREATE TABLE app.orders (id int PRIMARY KEY, customer int, total numeric)`,
+			`CREATE VIEW app.customer_totals AS SELECT customer, sum(total) AS summary FROM app.orders GROUP BY customer`,
+			`CREATE VIEW app.summary AS SELECT count(*) AS n FROM app.customer_totals`},
+		data: []string{`INSERT INTO app.orders VALUES (1, 1, 5)`}},
+	// n01: the same views exist, and a type change drops and re-creates them.
+	{name: "existing views where the base aliases a column as the dependent's name",
+		live: []string{`CREATE TABLE app.orders (id int PRIMARY KEY, customer int, total numeric)`,
+			`CREATE VIEW app.customer_totals AS SELECT customer, sum(total) AS summary FROM app.orders GROUP BY customer`,
+			`CREATE VIEW app.summary AS SELECT count(*) AS n FROM app.customer_totals`},
+		target: []string{`CREATE TABLE app.orders (id int PRIMARY KEY, customer bigint, total numeric)`,
+			`CREATE VIEW app.customer_totals AS SELECT customer, sum(total) AS summary FROM app.orders GROUP BY customer`,
+			`CREATE VIEW app.summary AS SELECT count(*) AS n FROM app.customer_totals`},
+		data: []string{`INSERT INTO app.orders VALUES (1, 1, 5)`}},
+	// A table alias and a column named like the dependent view.
+	{name: "new views where the base has a table alias named like the dependent",
+		live: []string{`CREATE TABLE app.t (id int PRIMARY KEY)`},
+		target: []string{`CREATE TABLE app.t (id int PRIMARY KEY)`,
+			`CREATE VIEW app.a AS SELECT summary.id FROM app.t summary`, `CREATE VIEW app.summary AS SELECT id FROM app.a`}},
+	{name: "new views where the base reads a column named like the dependent",
+		live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, summary int)`},
+		target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, summary int)`,
+			`CREATE VIEW app.a AS SELECT id, summary FROM app.t`, `CREATE VIEW app.summary AS SELECT id FROM app.a`}},
+	// Schema-qualified across two managed schemas, and views in public
+	// (the deparse leaves public unqualified).
+	{name: "new views reading across managed schemas",
+		live: []string{`CREATE TABLE app.t (id int PRIMARY KEY)`, `CREATE SCHEMA rep`},
+		target: []string{`CREATE TABLE app.t (id int PRIMARY KEY)`, `CREATE SCHEMA rep`,
+			`CREATE VIEW rep.a AS SELECT b.id FROM app.t b`, `CREATE VIEW app.b AS SELECT id FROM rep.a`}},
+	{name: "new views in public where the base aliases a column as the dependent's name",
+		live: []string{`CREATE TABLE app.orders (id int PRIMARY KEY, customer int, total numeric)`},
+		target: []string{`CREATE TABLE app.orders (id int PRIMARY KEY, customer int, total numeric)`,
+			`CREATE VIEW public.customer_totals AS SELECT customer, sum(total) AS summary FROM app.orders GROUP BY customer`,
+			`CREATE VIEW public.summary AS SELECT count(*) AS n FROM public.customer_totals`}},
+	// R2-7: a database search_path makes the deparse unqualified; the live
+	// order comes from pg_depend (live and push only).
+	{name: "existing view chain under a database search_path", noSnapshot: true, searchPath: true,
+		live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep int)`, `CREATE VIEW app.c AS SELECT id, keep FROM app.t`,
+			`CREATE VIEW app.b AS SELECT id, keep FROM app.c`, `CREATE VIEW app.a AS SELECT id, keep FROM app.b`},
+		target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep bigint)`, `CREATE VIEW app.c AS SELECT id, keep FROM app.t`,
+			`CREATE VIEW app.b AS SELECT id, keep FROM app.c`, `CREATE VIEW app.a AS SELECT id, keep FROM app.b`},
+		data: []string{`INSERT INTO app.t VALUES (1, 2)`,
+			`DO $$ BEGIN EXECUTE format('ALTER DATABASE %I SET search_path = public, app', current_database()); END $$`}},
+	// R2-3: a shared table's default uses the dropped table's sequence; the
+	// default (n07a) or the column (n07b) goes before the table.
+	{name: "dropped table's sequence used by a removed default", destructive: true, lossy: true,
+		live: []string{`CREATE TABLE app.a (id serial PRIMARY KEY)`,
+			`CREATE TABLE app.b (id int NOT NULL DEFAULT nextval('app.a_id_seq'), x int)`},
+		target: []string{`CREATE TABLE app.b (id int NOT NULL, x int)`},
+		data:   []string{`INSERT INTO app.a DEFAULT VALUES`, `INSERT INTO app.b (x) VALUES (1)`}},
+	// (Live and push only: a snapshot chain creates both tables from the
+	// document, which hands the shared sequence to the later column.)
+	{name: "dropped table's sequence used by a dropped column", destructive: true, lossy: true, noSnapshot: true,
+		live: []string{`CREATE TABLE app.a (id serial PRIMARY KEY)`,
+			`CREATE TABLE app.b (id int PRIMARY KEY, y int DEFAULT nextval('app.a_id_seq'))`},
+		target: []string{`CREATE TABLE app.b (id int PRIMARY KEY)`},
+		data:   []string{`INSERT INTO app.a DEFAULT VALUES`, `INSERT INTO app.b (id) VALUES (1)`}},
+	// R2-5: a foreign table storing the row type does not block a type
+	// change (PostgreSQL does not check foreign tables).
+	{name: "foreign table storing the row type", noSnapshot: true, unmanaged: []string{"rep"},
+		live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, x int)`, `CREATE EXTENSION IF NOT EXISTS postgres_fdw`,
+			`CREATE SERVER q12_srv FOREIGN DATA WRAPPER postgres_fdw`, `CREATE SCHEMA rep`,
+			`CREATE FOREIGN TABLE rep.ft (id int, w app.t) SERVER q12_srv`},
+		target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, x bigint)`, `CREATE EXTENSION IF NOT EXISTS postgres_fdw`,
+			`CREATE SERVER q12_srv FOREIGN DATA WRAPPER postgres_fdw`, `CREATE SCHEMA rep`,
+			`CREATE FOREIGN TABLE rep.ft (id int, w app.t) SERVER q12_srv`},
+		data: []string{`INSERT INTO app.t VALUES (1, 2)`}},
 	// A table the plan drops has a foreign key onto a key the plan drops:
 	// the table drops before the key, and its down re-creates it after the
 	// key is back.
@@ -337,6 +409,32 @@ func q12Unmanage(t *testing.T, path string, schemas []string) {
 	writeFile(t, path, string(raw))
 }
 
+// q12MarkUnmanaged sets managed: false on tables of a pulled document.
+func q12MarkUnmanaged(t *testing.T, path string, tables []string) {
+	t.Helper()
+	if len(tables) == 0 {
+		return
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(readFile(t, path)), &doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range doc["tables"].([]any) {
+		m := e.(map[string]any)
+		id := m["identity"].(map[string]any)
+		for _, name := range tables {
+			if id["schema"].(string)+"."+id["name"].(string) == name {
+				m["managed"] = false
+			}
+		}
+	}
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, path, string(raw))
+}
+
 func q12Flags(c q12Case) []string {
 	var flags []string
 	for _, r := range c.renames {
@@ -383,6 +481,12 @@ func q12RoundTrip(t *testing.T, bin, dbURL, mode, desired, mig, wantUp, before, 
 		t.Fatalf("migrate failed (%d):\n%s\nup file:\n%s", code, out, up)
 	}
 	catalog := q12CatalogSQL(c.byName)
+	if c.searchPath {
+		plain := func(s string) string { return strings.ReplaceAll(s, "app.", "") }
+		query0, want0, before0 := query, wantUp, before
+		query = func(sql string) string { return plain(query0(sql)) }
+		wantUp, before = plain(want0), plain(before0)
+	}
 	if got := query(catalog); got != wantUp {
 		t.Fatalf("after the up, the catalog must equal the target's:\n got: %s\nwant: %s", got, wantUp)
 	}
@@ -481,11 +585,12 @@ func TestQ12DBPush(t *testing.T) {
 func TestQ12Refusals(t *testing.T) {
 	bin := buildCLIBinary(t)
 	cases := []struct {
-		name         string
-		live, target []string
-		flags        []string
-		want         []string
-		snapshot     bool
+		name          string
+		live, target  []string
+		flags         []string
+		want          []string
+		snapshot      bool
+		markUnmanaged []string // tables the schema document declares with managed: false
 	}{
 		// Shape 4: a view the schema does not declare reads the column.
 		{name: "undeclared view over a type change", snapshot: true,
@@ -496,7 +601,7 @@ func TestQ12Refusals(t *testing.T) {
 				`column app.t.keep`,
 				`so the plan would fail at apply and is refused. Declare the view in the schema (the plan then drops it and re-creates it around the change), or drop it: re-run with --allow-destructive, which drops views the schema does not declare`,
 				// F2: the refusal names everything else the flag drops.
-				`Note that --allow-destructive also drops every object the schema does not declare, which here is: view app.v, view app.w; declare in the schema what must stay before using it`,
+				`Note that --allow-destructive also drops every object the schema does not declare as managed, which here is: view app.v, view app.w; declare in the schema what must stay before using it`,
 			}},
 		// Shape 4, a view outside the managed schemas.
 		{name: "view in an unmanaged schema over a type change",
@@ -523,7 +628,7 @@ func TestQ12Refusals(t *testing.T) {
 			live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net numeric, gross numeric GENERATED ALWAYS AS (net * 2) STORED, legacy text)`,
 				`CREATE TABLE app.audit (id int PRIMARY KEY, msg text)`, `CREATE INDEX t_legacy ON app.t (legacy)`},
 			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net bigint, gross numeric GENERATED ALWAYS AS (net * 2) STORED, legacy text)`},
-			want:   []string{`Re-run with --allow-destructive to acknowledge that. Note that --allow-destructive also drops every object the schema does not declare, which here is: index app.t_legacy, table app.audit; declare in the schema what must stay before using it`}},
+			want:   []string{`Re-run with --allow-destructive to acknowledge that. Note that --allow-destructive also drops every object the schema does not declare as managed, which here is: index app.t_legacy, table app.audit; declare in the schema what must stay before using it`}},
 		// Q12 review-1 F4: dependencies the view text does not show, read
 		// from the catalog (live only; offline plans have no catalog).
 		{name: "view over a function returning the table's rows",
@@ -555,6 +660,43 @@ func TestQ12Refusals(t *testing.T) {
 			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net bigint, gross numeric GENERATED ALWAYS AS (net * 2) STORED, CONSTRAINT t_g UNIQUE (gross))`},
 			flags:  []string{"--allow-destructive"},
 			want:   []string{`foreign key r_g of table rep.r references the key (gross) of table app.t, which this plan drops (and re-creates), and the plan cannot drop and re-add a foreign key of a table the schema document does not manage.`, `Drop the foreign key by hand before applying and re-add it after, or declare schema "rep" and table rep.r in the schema (the plan then drops and re-adds the foreign key around the change)`}},
+		// R2-6: the catalog check covers a function SETOF a declared view,
+		// the row type stored through a composite type and a domain, and
+		// publication row filters and column lists.
+		{name: "function returning a declared view's rows",
+			live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep int)`, `CREATE VIEW app.v AS SELECT id, keep FROM app.t`,
+				`CREATE SCHEMA rep`, `CREATE FUNCTION rep.f() RETURNS SETOF app.v LANGUAGE sql AS 'select * from app.v'`},
+			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep bigint)`, `CREATE VIEW app.v AS SELECT id, keep FROM app.t`},
+			want:   []string{`view app.v is dropped by this plan (to re-create it around the table changes, or because the schema does not declare it), but function rep.f() depends on it.`}},
+		{name: "row type stored through a composite type and a domain",
+			live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep int)`, `CREATE SCHEMA rep`,
+				`CREATE TYPE rep.ct AS (a app.t)`, `CREATE TABLE rep.u (c rep.ct)`, `CREATE DOMAIN rep.dt AS app.t`, `CREATE TABLE rep.w (d rep.dt)`},
+			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep bigint)`},
+			want: []string{`is used by column rep.u.c (it stores the row type of app.t through type rep.ct)`,
+				`is used by column rep.w.d (it stores the row type of app.t through type rep.dt)`}},
+		{name: "publication row filter and column list",
+			live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep int, old int)`,
+				`CREATE PUBLICATION q12_pf FOR TABLE app.t WHERE (keep > 0)`, `CREATE PUBLICATION q12_pc FOR TABLE app.t (id, old)`},
+			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep bigint)`},
+			flags:  []string{"--allow-destructive"},
+			want: []string{`column app.t.keep (type changes) is used by publication q12_pf (its row filter or column list for app.t)`,
+				`column app.t.old (is dropped) is used by publication q12_pc (its row filter or column list for app.t)`}},
+		// INFO 10: a table in an unmanaged schema references a table the
+		// plan drops.
+		{name: "unmanaged table references a dropped table",
+			live: []string{`CREATE TABLE app.keep (id int PRIMARY KEY)`, `CREATE TABLE app.p (id int PRIMARY KEY)`,
+				`CREATE SCHEMA rep`, `CREATE TABLE rep.x (id int PRIMARY KEY, pid int, CONSTRAINT x_p FOREIGN KEY (pid) REFERENCES app.p (id))`},
+			target: []string{`CREATE TABLE app.keep (id int PRIMARY KEY)`},
+			flags:  []string{"--allow-destructive"},
+			want:   []string{`foreign key x_p of table rep.x references table app.p, which this plan drops, and the plan cannot drop and re-add a foreign key of a table the schema document does not manage.`}},
+		// R2-4: a table declared with managed: false is dropped by the
+		// flag, and the refusal lists it.
+		{name: "refusal lists a managed-false table the flag drops", markUnmanaged: []string{"app.k"},
+			live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net numeric, gross numeric GENERATED ALWAYS AS (net * 2) STORED)`,
+				`CREATE TABLE app.k (id int PRIMARY KEY)`},
+			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net bigint, gross numeric GENERATED ALWAYS AS (net * 2) STORED)`,
+				`CREATE TABLE app.k (id int PRIMARY KEY)`},
+			want: []string{`Note that --allow-destructive also drops every object the schema does not declare as managed, which here is: table app.k;`}},
 		// A table the plan leaves in place, and one in an unmanaged
 		// schema, reference a key the plan drops.
 		{name: "left-in-place table references a dropped key", snapshot: true,
@@ -562,7 +704,7 @@ func TestQ12Refusals(t *testing.T) {
 				`CREATE TABLE app.x (id int PRIMARY KEY, c int, CONSTRAINT x_c FOREIGN KEY (c) REFERENCES app.p (code))`},
 			target: []string{`CREATE TABLE app.p (id int PRIMARY KEY, code int)`},
 			want: []string{`foreign key x_c of table app.x references the key (code) of table app.p, which this plan drops, and the plan cannot drop and re-add a foreign key of a table the schema does not declare.`,
-				`Declare table app.x in the schema (the plan then drops and re-adds the foreign key around the change), or drop it: re-run with --allow-destructive, which drops tables the schema does not declare. Note that --allow-destructive also drops every object the schema does not declare, which here is: table app.x;`}},
+				`Declare table app.x in the schema (the plan then drops and re-adds the foreign key around the change), or drop it: re-run with --allow-destructive, which drops tables the schema does not declare. Note that --allow-destructive also drops every object the schema does not declare as managed, which here is: table app.x;`}},
 		{name: "unmanaged table references a dropped key",
 			live: []string{`CREATE TABLE app.p (id int PRIMARY KEY, code int, CONSTRAINT p_code UNIQUE (code))`,
 				`CREATE SCHEMA rep`, `CREATE TABLE rep.x (id int PRIMARY KEY, c int, CONSTRAINT x_c FOREIGN KEY (c) REFERENCES app.p (code))`},
@@ -575,6 +717,7 @@ func TestQ12Refusals(t *testing.T) {
 			work := t.TempDir()
 			desired, base := filepath.Join(work, "desired.json"), filepath.Join(work, "base.json")
 			q12Target(t, bin, desired, c.target, false)
+			q12MarkUnmanaged(t, desired, c.markUnmanaged)
 			check := func(flow string, code int, out string) {
 				t.Helper()
 				if code == 0 {
@@ -618,27 +761,58 @@ func TestQ12Refusals(t *testing.T) {
 	}
 }
 
-// An operator class the schema names explicitly although it is the
-// column type's default compares equal to the database's (introspection
-// records only non-default classes), so a live plan converges.
-func TestQ12OpclassExplicitDefaultConverges(t *testing.T) {
+// Q12 review-2 R2-2: the default operator class resolves as PostgreSQL's
+// GetDefaultOpClass does: varchar's is text_ops (the preferred type of the
+// string category). bpchar is outside the document vocabulary; the
+// resolver's answer for it is checked in internal/db. Live plans converge, and a
+// snapshot chain that spells the class keeps passing the drift gate.
+func TestQ12OpclassDefaultResolution(t *testing.T) {
 	bin := buildCLIBinary(t)
-	work := t.TempDir()
-	desired := filepath.Join(work, "desired.json")
-	q12Target(t, bin, desired, []string{`CREATE TABLE app.t (id int PRIMARY KEY, v text)`, `CREATE INDEX t_v ON app.t (v)`}, false)
-	doc := readFile(t, desired)
-	edited := strings.Replace(doc, `{"column":"v"}`, `{"column":"v","opclass":"text_ops"}`, 1)
-	if edited == doc {
-		edited = strings.Replace(doc, `"column": "v"`, `"column": "v", "opclass": "text_ops"`, 1)
-	}
-	if edited == doc {
-		t.Fatalf("the pulled document has no key part to edit:\n%s", doc)
-	}
-	writeFile(t, desired, edited)
-	dbURL, fx := newM02CommandDB(t, "q12opc")
-	q12Seed(t, fx, q12Case{live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, v text)`, `CREATE INDEX t_v ON app.t (v)`}})
-	code, out := runCLIProcess(t, bin, dbURL, "db", "push", "--dry-run", "--schema", desired)
-	if code != 0 || !strings.Contains(out, "Schema is already in sync") {
-		t.Fatalf("an explicit default operator class must compare equal (%d):\n%s", code, out)
+	for _, c := range []struct{ typ, class string }{{"varchar(20)", "text_ops"}, {"text", "text_ops"}} {
+		t.Run(c.typ, func(t *testing.T) {
+			work := t.TempDir()
+			ddl := []string{`CREATE TABLE app.t (id int PRIMARY KEY, v ` + c.typ + `)`, `CREATE INDEX t_v ON app.t (v)`}
+			desired := filepath.Join(work, "desired.json")
+			q12Target(t, bin, desired, ddl, false)
+			doc := readFile(t, desired)
+			edited := strings.Replace(doc, `{"column":"v"}`, `{"column":"v","opclass":"`+c.class+`"}`, 1)
+			if edited == doc {
+				t.Fatalf("the pulled document has no key part to edit:\n%s", doc)
+			}
+			writeFile(t, desired, edited)
+			dbURL, fx := newM02CommandDB(t, "q12opc")
+			q12Seed(t, fx, q12Case{live: ddl})
+			code, out := runCLIProcess(t, bin, dbURL, "db", "push", "--dry-run", "--schema", desired)
+			if code != 0 || !strings.Contains(out, "Schema is already in sync") {
+				t.Fatalf("an explicit default operator class must compare equal (%d):\n%s", code, out)
+			}
+			// A snapshot chain spelling it: the drift gate before the second
+			// migration compares the recorded target with the live database.
+			snapURL, _ := newM02CommandDB(t, "q12opcsnap")
+			mig := filepath.Join(work, "migrations")
+			if code, out := runCLIProcess(t, bin, snapURL, "migrate", "generate", "--mode", "snapshot", "--schema", desired, "--dir", mig, "--name", "init"); code != 0 {
+				t.Fatalf("snapshot generate init failed (%d):\n%s", code, out)
+			}
+			if code, out := runCLIProcess(t, bin, snapURL, "migrate", "--dir", mig); code != 0 {
+				t.Fatalf("migrate init failed (%d):\n%s", code, out)
+			}
+			next := filepath.Join(work, "next.json")
+			var d map[string]any
+			if err := json.Unmarshal([]byte(edited), &d); err != nil {
+				t.Fatal(err)
+			}
+			for _, e := range d["tables"].([]any) {
+				m := e.(map[string]any)
+				m["columns"] = append(m["columns"].([]any), map[string]any{"name": "extra", "type": map[string]any{"name": "int4", "codec": "number"}, "notNull": false})
+			}
+			raw, _ := json.Marshal(d)
+			writeFile(t, next, string(raw))
+			if code, out := runCLIProcess(t, bin, snapURL, "migrate", "generate", "--mode", "snapshot", "--schema", next, "--dir", mig, "--name", "extra"); code != 0 {
+				t.Fatalf("snapshot generate extra failed (%d):\n%s", code, out)
+			}
+			if code, out := runCLIProcess(t, bin, snapURL, "migrate", "--dir", mig); code != 0 {
+				t.Fatalf("the second migration must pass the drift gate (%d):\n%s", code, out)
+			}
+		})
 	}
 }

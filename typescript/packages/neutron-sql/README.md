@@ -155,41 +155,50 @@ added after them, in every table; constraints and indexes drop before the
 columns they name change type or are dropped, and are re-created after; a
 generated column drops before a column it reads; a new table's foreign key
 onto a column or key the plan adds, renames, retypes or changes is added
-after that change; a table the plan drops is dropped before any key its
-foreign keys reference; declared views are dropped dependents first and
-created bases first; an index whose operator class changes (for example
-`text_pattern_ops` under a type change) is rebuilt; and a down file
-re-creates dropped columns before their indexes and dropped tables before the
-foreign keys between them, so these plans apply and their down files revert.
+after that change; tables the plan drops go last, after the defaults and
+columns that use their sequences, with only their foreign keys onto keys the
+plan drops removed earlier; declared views are dropped dependents first and
+created bases first (live, in the order the catalog records; offline, from
+the relations each definition names after `FROM` and `JOIN`, falling back to
+declaration order if that is ambiguous); an index whose operator class changes
+(for example `text_pattern_ops` under a type change) is rebuilt; and a down
+file re-creates dropped columns before their indexes, and dropped tables (with
+the sequences they owned) before the foreign keys between them, so these plans
+apply and their down files revert.
 A foreign key of a table the plan keeps but does not manage (left in place,
-or in a schema the document does not declare) onto a key the plan drops
-refuses the plan, naming the foreign key: declare the table, or let
-`--allow-destructive` drop a left-in-place one (the refusal lists what else
-it drops), or drop the foreign key by hand.
+declared with `managed: false`, or in a schema the document does not declare)
+onto a key or table the plan drops refuses the plan, naming the foreign key:
+declare the table as managed, or let `--allow-destructive` drop a left-in-place
+one, or drop the foreign key by hand.
 Changing the type of a column a stored generated column reads drops the
 generated column before the change and adds it back after it, with its
 indexes, constraints and the foreign keys onto it (PostgreSQL cannot change
 the type under it): the plan needs `--allow-destructive`, the values are
 recomputed, and the column is placed last; its down file adds it back last
-too, so the original column order is not restored. It is refused, with a
-three-migration path, when a foreign key the schema does not manage
-references the generated column. A refusal that suggests
-`--allow-destructive` lists every other object the flag would drop (it drops
-everything in the managed schemas the schema does not declare).
+too, so the original column order is not restored.
+A refusal that suggests `--allow-destructive` lists every other object the flag
+would drop. The flag drops everything in the managed schemas that the schema
+does not declare as managed: tables (including ones declared with `managed:
+false`), columns, indexes, views and enums. The list and the plan use the same
+rules.
 Objects that depend on a column whose type changes or that is dropped, and
 that the plan does not handle, refuse the plan by name. `db push` and
 `migrate generate --mode live` read them from the catalog: views and
 materialized views (including a view over a function that returns the
 table's rows), functions with a `BEGIN ATOMIC` body, policies, triggers with
-a column list, rules, other tables' columns that store the table's row type,
-and anything that depends on a declared view the plan drops and re-creates.
-Declare such a view, so the planner drops and re-creates it around the
-change, or drop it (`--allow-destructive` drops undeclared views in the
-managed schemas); drop the other objects by hand before the change and
-re-create them after. `--mode snapshot` has no catalog: it checks the views
-the chain records by their text, which is conservative (a view naming a
-same-named column of another table is refused too), and objects the chain
-does not record still fail at apply and roll back.
+a column list, rules, publication row filters and column lists, and the
+columns of tables, partitioned tables and materialized views that store the
+table's row type directly, in an array, or through a composite type or
+domain (foreign tables are not checked, as in PostgreSQL). For a declared
+view the plan drops and re-creates, they also read what depends on the view
+or on its row type (another view, a function returning `SETOF` the view, a
+column storing its row type). Declare such a view, so the planner drops and
+re-creates it around the change, or drop it (`--allow-destructive` drops
+undeclared views in the managed schemas); drop the other objects by hand
+before the change and re-create them after. `--mode snapshot` has no catalog:
+it checks the views the chain records by their text, which is conservative
+(a view naming a same-named column of another table is refused too), and
+objects the chain does not record still fail at apply and roll back.
 
 In `--mode snapshot`, removing a schema from the document stops the chain
 tracking its objects, and declaring it again plans `create table` for tables
