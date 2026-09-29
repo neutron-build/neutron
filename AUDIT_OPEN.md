@@ -448,7 +448,10 @@ so engine sessions see them:
   ROLLBACK, aborted-transaction COMMIT, `ROLLBACK TO SAVEPOINT`, pool return;
   `RESET ROLE`/`RESET ALL`/`DISCARD ALL` drop the role (RESET ALL
   deliberately differs from PostgreSQL, fails closed); multi-statement messages get an
-  implicit block; `lock_timeout` is per session. Regressions:
+  implicit block for SET state only (not data); `lock_timeout` is per session.
+  **Known divergence, candidate follow-up: multi-statement simple queries are
+  not atomic** (earlier statements' data effects persist when a later one
+  fails; PostgreSQL rolls the whole message back). Regressions:
   `nucleus/src/executor/tests/test_set_local_scope.rs`; live probes
   `rls.set_local_*` / `rls.set_session_setting_transaction_scope`
   (`conformance/live/orm/`). `set_config()` remains missing (N-list, unchanged).

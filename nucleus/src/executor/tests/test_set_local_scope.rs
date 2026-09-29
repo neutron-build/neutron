@@ -355,3 +355,97 @@ async fn failed_commit_does_not_leave_the_assumed_role() {
     sql(&ex, t, "ROLLBACK").await;
     assert_eq!(user(&ex, t).await, login);
 }
+
+// ---------------------------------------------------------------------
+// Review-2 (cancelled message, COMMIT inside a message)
+// ---------------------------------------------------------------------
+
+/// R2-1: the wire layer drops the executor future on a statement timeout or
+/// CancelRequest. The implicit block of a multi-statement message must not
+/// outlive that: the next message runs as the login role with the settings it
+/// had before the cancelled one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_multi_statement_message_leaves_no_role_or_setting() {
+    let (ex, sid) = fixture().await;
+    exec(&ex, "CREATE TABLE n1_rows (id INT PRIMARY KEY, v INT)").await;
+    exec(&ex, "INSERT INTO n1_rows VALUES (1, 1)").await;
+    exec(&ex, "GRANT SELECT, UPDATE ON n1_rows TO n1_app").await;
+    let login = user(&ex, sid).await;
+    sql(&ex, sid, "SET app.tenant = 'base'").await;
+
+    // Another session holds the row, so the message blocks after its SETs.
+    let holder = ex.create_session();
+    sql(&ex, holder, "BEGIN").await;
+    sql(
+        &ex,
+        holder,
+        "SELECT id FROM n1_rows WHERE id = 1 FOR UPDATE",
+    )
+    .await;
+
+    let blocked = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        ex.execute_with_session(
+            sid,
+            "SET LOCAL ROLE n1_app; SET LOCAL app.tenant = 'x'; \
+             SET LOCAL search_path = leak; \
+             SELECT id FROM n1_rows WHERE id = 1 FOR UPDATE",
+        ),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "the message must still be blocked when cancelled"
+    );
+
+    assert_eq!(
+        user(&ex, sid).await,
+        login,
+        "role leaked into the next message"
+    );
+    assert_eq!(show(&ex, sid, "app.tenant").await, "'base'");
+    assert_eq!(show(&ex, sid, "search_path").await, "public");
+    // The stale frame used to make a later SET LOCAL outside a block stick.
+    sql(&ex, sid, "SET LOCAL search_path = leak2").await;
+    assert_eq!(show(&ex, sid, "search_path").await, "public");
+    sql(&ex, holder, "ROLLBACK").await;
+}
+
+/// R2-2: COMMIT (or ROLLBACK) inside a multi-statement message ends the
+/// implicit block; the next statement opens a new one, as in PostgreSQL.
+#[tokio::test]
+async fn commit_inside_a_message_ends_the_block_and_the_next_statement_opens_one() {
+    let (ex, sid) = fixture().await;
+    exec(&ex, "CREATE ROLE n1_other").await;
+    let login = user(&ex, sid).await;
+
+    let mut r = sql(
+        &ex,
+        sid,
+        "SET LOCAL ROLE n1_app; COMMIT; SELECT current_user",
+    )
+    .await;
+    assert_eq!(
+        text_of(r.remove(2)),
+        login,
+        "COMMIT ends the implicit block"
+    );
+
+    let mut r = sql(
+        &ex,
+        sid,
+        "BEGIN; SET LOCAL ROLE n1_app; COMMIT; SET LOCAL ROLE n1_other; SELECT current_user",
+    )
+    .await;
+    assert_eq!(text_of(r.remove(4)), "n1_other");
+    assert_eq!(user(&ex, sid).await, login);
+
+    let mut r = sql(
+        &ex,
+        sid,
+        "SET LOCAL ROLE n1_app; ROLLBACK; SET LOCAL ROLE n1_other; SELECT current_user",
+    )
+    .await;
+    assert_eq!(text_of(r.remove(3)), "n1_other");
+    assert_eq!(user(&ex, sid).await, login);
+}

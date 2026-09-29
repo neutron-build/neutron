@@ -90,6 +90,11 @@ impl Executor {
         let mut txn = sess.txn_state.write().await;
 
         if !txn.active {
+            // COMMIT with no explicit transaction ends the implicit block of a
+            // multi-statement message (a no-op outside one).
+            sess.guc_commit();
+            self.recompute_session_context(&sess);
+            self.sync_lock_timeout(&sess);
             return Ok(ExecResult::Command {
                 tag: "WARNING: no transaction in progress".into(),
                 rows_affected: 0,

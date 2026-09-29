@@ -229,6 +229,83 @@ impl Drop for StatementDepthGuard<'_> {
     }
 }
 
+/// The implicit SET block of a multi-statement simple query (see
+/// `execute_statements_dispatch`). Owns the block only while it holds a frame
+/// it opened itself, and closes it on every exit: `close` on normal completion
+/// or statement error, `Drop` when the future is cancelled at an await point.
+/// A frame that belongs to an explicit transaction (`txn_active`) is never
+/// touched here.
+struct ImplicitSetBlock<'a> {
+    executor: &'a Executor,
+    session: std::sync::Arc<Session>,
+    storage: Arc<dyn StorageEngine>,
+    storage_session: u64,
+    enabled: bool,
+    owned: bool,
+}
+
+impl<'a> ImplicitSetBlock<'a> {
+    fn new(executor: &'a Executor, session: std::sync::Arc<Session>, enabled: bool) -> Self {
+        Self {
+            executor,
+            session,
+            storage: executor.storage.clone(),
+            storage_session: unique_gate::gate_session_id(),
+            enabled,
+            owned: false,
+        }
+    }
+
+    /// Before each statement: a message that has ended its block (COMMIT,
+    /// ROLLBACK) starts a new one for the rest of the message.
+    fn open_if_needed(&mut self) {
+        if self.enabled
+            && !self.session.txn_active.load(Ordering::SeqCst)
+            && self.session.guc_begin_implicit()
+        {
+            self.owned = true;
+        }
+    }
+
+    fn close(&mut self, commit: bool) {
+        if !self.owned {
+            return;
+        }
+        self.owned = false;
+        if self.session.txn_active.load(Ordering::SeqCst) {
+            return;
+        }
+        if commit {
+            self.session.guc_commit();
+        } else {
+            self.session.guc_rollback();
+        }
+        self.executor.recompute_session_context(&self.session);
+        self.executor.sync_lock_timeout(&self.session);
+    }
+}
+
+impl Drop for ImplicitSetBlock<'_> {
+    fn drop(&mut self) {
+        // Reached still owning the block only when the future was dropped
+        // mid-flight. Roll the SET state back; the security context is
+        // recomputed at the start of the next dispatch, and the engine-side
+        // lock_timeout is re-derived here because no statement scope exists.
+        if !self.owned || self.session.txn_active.load(Ordering::SeqCst) {
+            return;
+        }
+        self.session.guc_rollback();
+        let ms = self
+            .session
+            .settings
+            .read()
+            .get("lock_timeout")
+            .and_then(|v| helpers::parse_lock_timeout(v).ok());
+        self.storage
+            .set_session_lock_timeout_ms(self.storage_session, ms);
+    }
+}
+
 /// Drive a session-teardown future from synchronous `drop_session` code.
 ///
 /// Same strategy as `session::sync_block_on`, plus a no-runtime fallback for
@@ -6872,36 +6949,45 @@ impl Executor {
         // PostgreSQL runs a multi-statement simple query in an implicit
         // transaction block, so `SET LOCAL ROLE x; SELECT ...` in one message
         // applies the role to the SELECT and ends with the message. Only the
-        // SET state gets that block here (statements still autocommit): the
-        // SET LOCAL values end with the message, and an error in it reverts
-        // the message's SETs as PostgreSQL's abort of the block would. A
-        // message that opens an explicit BEGIN hands the block to it.
+        // SET state gets that block here: the block covers SET / SET LOCAL /
+        // SET ROLE and nothing else. Statements still autocommit one by one,
+        // so the data effects of earlier statements persist when a later one
+        // fails (a known divergence from PostgreSQL, where the whole message
+        // is one transaction). The SET values of a failed message are
+        // reverted, as the aborted block's would be.
+        //
+        // A COMMIT or ROLLBACK in the message ends the block and the next
+        // statement opens a new one, as in PostgreSQL. A message that opens an
+        // explicit BEGIN hands the block to that transaction. The guard closes
+        // the block if this future is dropped mid-flight (statement timeout,
+        // CancelRequest), so nothing leaks into the next message.
         let session = self.current_session();
-        let implicit = !single && session.guc_begin_implicit();
-        let run = async {
-            let mut results = Vec::new();
-            for stmt in statements {
-                let r = self.execute_statement(stmt).await?;
-                let r = if single && r.is_stream() {
-                    r
-                } else {
-                    r.materialize().await?
-                };
-                results.push(r);
-            }
-            Ok::<_, ExecError>(results)
-        };
-        let outcome = run.await;
-        if implicit && !session.txn_active.load(Ordering::SeqCst) {
-            if outcome.is_ok() {
-                session.guc_commit();
+        let mut block = ImplicitSetBlock::new(self, session.clone(), !single);
+        let mut results = Vec::new();
+        for stmt in statements {
+            block.open_if_needed();
+            let r = match self.execute_statement(stmt).await {
+                Ok(r) => r,
+                Err(e) => {
+                    block.close(false);
+                    return Err(e);
+                }
+            };
+            let r = if single && r.is_stream() {
+                r
             } else {
-                session.guc_rollback();
-            }
-            self.recompute_session_context(&session);
-            self.sync_lock_timeout(&session);
+                match r.materialize().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        block.close(false);
+                        return Err(e.into());
+                    }
+                }
+            };
+            results.push(r);
         }
-        outcome
+        block.close(true);
+        Ok(results)
     }
 
     /// Apply a SQL command already authenticated and committed by Raft.
