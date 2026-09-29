@@ -577,6 +577,186 @@ async fn for_update_on_a_table_with_row_security_is_refused() {
     );
 }
 
+/// Two blocking claims with opposite ORDER BY, both blocked behind A, both
+/// dropping a row when A commits. Each then needs the row the other kept, so
+/// a refill that waits while holding its kept row deadlocks: both stall until
+/// lock_timeout and fail with 55P03. Acquisition must follow one global order
+/// (primary key), so both finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opposite_order_blocking_claims_do_not_deadlock_on_refill() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = disk_executor(dir.path());
+    seed_jobs(&ex, 4).await;
+
+    let a = ex.create_session();
+    ex.execute_with_session(a, "BEGIN").await.unwrap();
+    ex.execute_with_session(
+        a,
+        "SELECT id FROM jobs WHERE id IN (1, 4) ORDER BY id FOR UPDATE",
+    )
+    .await
+    .unwrap();
+
+    let mut waiters = Vec::new();
+    for sql in [
+        "SELECT id FROM jobs WHERE status = 'pending' ORDER BY id LIMIT 2 FOR UPDATE",
+        "SELECT id FROM jobs WHERE status = 'pending' ORDER BY id DESC LIMIT 2 FOR UPDATE",
+    ] {
+        let ex2 = ex.clone();
+        let sid = ex.create_session();
+        waiters.push(tokio::spawn(async move {
+            ex2.execute_with_session(sid, "BEGIN").await.unwrap();
+            let r = ex2.execute_with_session(sid, sql).await;
+            let _ = ex2.execute_with_session(sid, "COMMIT").await;
+            r
+        }));
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        waiters.iter().all(|w| !w.is_finished()),
+        "control: both claims must be waiting on A"
+    );
+
+    ex.execute_with_session(a, "UPDATE jobs SET status = 'active' WHERE id IN (1, 4)")
+        .await
+        .unwrap();
+    ex.execute_with_session(a, "COMMIT").await.unwrap();
+    for w in waiters {
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), w)
+            .await
+            .expect("a refill deadlocked: the claim is still waiting")
+            .unwrap()
+            .expect("neither claim may fail");
+        assert_eq!(claimed_ids(&out).len(), 2, "each claim fills its LIMIT");
+    }
+}
+
+/// Masking is per role: a role no policy names is not refused because some
+/// other role is masked on the table.
+#[tokio::test]
+async fn for_update_is_refused_only_for_the_masked_role() {
+    let ex = test_executor();
+    ex.execute("CREATE TABLE people (id INT PRIMARY KEY, ssn TEXT)")
+        .await
+        .unwrap();
+    ex.execute("INSERT INTO people VALUES (1, '123')")
+        .await
+        .unwrap();
+    for role in ["analyst", "worker"] {
+        ex.execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'p'"))
+            .await
+            .unwrap();
+        ex.execute(&format!("GRANT SELECT, UPDATE ON people TO {role}"))
+            .await
+            .unwrap();
+    }
+    ex.execute("CREATE MASKING POLICY ON people (ssn) TO analyst USING REDACT '***'")
+        .await
+        .unwrap();
+
+    let worker = ex.create_session();
+    ex.bind_authenticated_session(worker, "worker")
+        .await
+        .unwrap();
+    let ok = ex
+        .execute_with_session(worker, "SELECT id FROM people FOR UPDATE")
+        .await;
+    assert!(ok.is_ok(), "an unmasked role must not be refused: {ok:?}");
+
+    let analyst = ex.create_session();
+    ex.bind_authenticated_session(analyst, "analyst")
+        .await
+        .unwrap();
+    let err = ex
+        .execute_with_session(analyst, "SELECT id FROM people FOR UPDATE")
+        .await
+        .expect_err("the masked role must be refused");
+    assert!(err.to_string().contains("masking"), "unexpected: {err}");
+}
+
+/// A changed row whose WHERE clause cannot be evaluated on a bare row must
+/// fail closed with a retryable conflict, not be returned as stale. No SQL
+/// shape tried reaches this (the evaluator handles everything a claim uses),
+/// so the branch is driven directly with a predicate that cannot resolve.
+#[tokio::test]
+async fn an_unevaluable_predicate_on_a_changed_row_fails_closed() {
+    let ex = test_executor();
+    seed_jobs(&ex, 1).await;
+    let table_def = ex.get_table("jobs").await.unwrap();
+    let col_meta = ex.table_col_meta(&table_def);
+    let ctx = row_locks::RowLockContext {
+        table: "jobs".into(),
+        pk_columns: vec!["id".into()],
+        nonblock: None,
+        selection: Some(
+            sqlparser::parser::Parser::new(&sqlparser::dialect::GenericDialect {})
+                .try_with_sql("no_such_column > 3")
+                .unwrap()
+                .parse_expr()
+                .unwrap(),
+        ),
+    };
+    let scanned = vec![
+        Value::Int32(1),
+        Value::Text("pending".into()),
+        Value::Int32(0),
+    ];
+    let changed = vec![
+        Value::Int32(1),
+        Value::Text("pending".into()),
+        Value::Int32(1),
+    ];
+
+    // Unchanged: no re-evaluation needed, kept as scanned.
+    let same = ex
+        .recheck_locked(&ctx, &table_def, &col_meta, scanned.clone(), Some(&scanned))
+        .unwrap();
+    assert_eq!(same, Some(scanned.clone()));
+    // Changed: cannot be judged, so it must not come back stale.
+    let err = ex
+        .recheck_locked(&ctx, &table_def, &col_meta, scanned, Some(&changed))
+        .expect_err("must fail closed");
+    assert!(
+        matches!(
+            err,
+            ExecError::Storage(crate::storage::StorageError::WriteConflict(_))
+        ),
+        "unexpected: {err}"
+    );
+}
+
+/// Composite primary key: the lock and the recheck work without a
+/// single-column key index (the recheck falls back to one scan per round).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn composite_primary_key_rows_are_locked_and_rechecked() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = disk_executor(dir.path());
+    ex.execute("CREATE TABLE lines (a INT, b INT, qty INT, PRIMARY KEY (a, b))")
+        .await
+        .unwrap();
+    ex.execute("INSERT INTO lines VALUES (1, 1, 10), (1, 2, 20)")
+        .await
+        .unwrap();
+
+    let (a, b) = (ex.create_session(), ex.create_session());
+    ex.execute_with_session(a, "BEGIN").await.unwrap();
+    ex.execute_with_session(a, "SELECT qty FROM lines WHERE a = 1 AND b = 2 FOR UPDATE")
+        .await
+        .unwrap();
+    let h = blocked_reader(
+        &ex,
+        b,
+        "SELECT qty FROM lines WHERE a = 1 AND b = 2 FOR UPDATE",
+    )
+    .await;
+    ex.execute_with_session(a, "UPDATE lines SET qty = qty + 5 WHERE a = 1 AND b = 2")
+        .await
+        .unwrap();
+    ex.execute_with_session(a, "COMMIT").await.unwrap();
+    assert_eq!(claimed_ids(&wait_for(h).await), vec![25]);
+    ex.execute_with_session(b, "COMMIT").await.unwrap();
+}
+
 /// N workers drain a queue with the given claim; every job exactly once, no
 /// error from any worker. `plain` uses blocking FOR UPDATE (no SKIP LOCKED).
 async fn drain(workers: usize, jobs: i64, limit: usize, plain: bool) {

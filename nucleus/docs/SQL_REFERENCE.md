@@ -160,9 +160,22 @@ differential harness vs PostgreSQL 17) or [`SQL_SEMANTICS.md`](SQL_SEMANTICS.md)
 9. **FETCH FIRST/NEXT folds into LIMIT** (`src/executor/mod.rs:639-658`); `WITH TIES`
    and `PERCENT` are **refused** rather than approximated. (The historical bug — FETCH
    silently dropped, Hibernate pagination returning the whole table — is fixed.)
-10. **`FOR UPDATE SKIP LOCKED` / `NOWAIT` are refused** (`reject_unsupported_row_locks`,
-    `src/executor/mod.rs:811`); they were previously parsed and ignored, silently
-    removing the guarantee.
+10. **`FOR UPDATE` / `FOR SHARE` [`SKIP LOCKED` | `NOWAIT`] take real row locks**
+    (`src/executor/row_locks.rs`), keyed by primary key and held to COMMIT/ROLLBACK.
+    After a row's lock is taken it is re-read and re-judged (PostgreSQL's
+    EvalPlanQual): a row changed while its lock was awaited is returned in its new
+    state if the WHERE clause still matches, dropped (and its lock released) if not,
+    and `LIMIT` is refilled from later candidates that are locked in turn. These are
+    **refused by name** rather than approximated: joins, subqueries/table functions
+    in FROM, set operations, DISTINCT, GROUP BY, HAVING, aggregates and window
+    functions; **tables with no primary key** (no tuple id to lock with, so a UNIQUE
+    key alone is not enough); and **tables the current role is subject to row-level
+    security or column masking on** (the post-lock re-read is a raw read and cannot
+    honour the policy; superusers and roles no masking policy names are not
+    affected). `FOR SHARE` takes the same exclusive lock as `FOR UPDATE`. A changed
+    row whose WHERE clause cannot be re-evaluated on a bare row fails with a
+    retryable write conflict instead of being returned stale. Composite primary keys
+    are re-read without a dedicated index and may scan the table.
 11. **Window function over a grouped aggregate returns no rows** —
     `rank() OVER (ORDER BY SUM(v)) ... GROUP BY` is unsupported; plain windows and
     plain aggregates both work.

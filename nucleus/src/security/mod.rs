@@ -1090,6 +1090,14 @@ impl MaskingEngine {
         self.policies.iter().any(|p| p.table == table)
     }
 
+    /// Whether a masking policy on `table` names a role `ctx` holds, i.e.
+    /// whether this session is actually subject to masking on it.
+    pub fn applies_to_session(&self, table: &str, ctx: &SessionContext) -> bool {
+        self.policies
+            .iter()
+            .any(|p| p.table == table && ctx.has_role(&p.role))
+    }
+
     pub fn get_rule(&self, table: &str, column: &str, ctx: &SessionContext) -> &MaskingRule {
         for policy in &self.policies {
             if policy.table == table && policy.column == column && ctx.has_role(&policy.role) {

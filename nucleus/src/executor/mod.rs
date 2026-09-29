@@ -4070,6 +4070,22 @@ impl Executor {
         self.with_visible_security(|security| security.masking.covers_table(table))
     }
 
+    /// Whether this session's role is itself subject to row security or masking
+    /// on `table` — narrower than [`Self::table_is_secured`], which is true when
+    /// ANY role has a masking policy on the table. Used where refusing a role
+    /// that no policy touches would be wrong.
+    pub(super) fn session_is_policed_on(&self, table: &str) -> bool {
+        if self.rls_active(table) {
+            return true;
+        }
+        let session = self.current_session();
+        let ctx = session.session_context.read();
+        if ctx.is_superuser {
+            return false;
+        }
+        self.with_visible_security(|security| security.masking.applies_to_session(table, &ctx))
+    }
+
     /// Whether `table` carries ANY row- or column-level policy for this session.
     ///
     /// Every fast path that returns rows without going through the secured
