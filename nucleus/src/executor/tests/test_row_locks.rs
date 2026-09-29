@@ -351,6 +351,293 @@ async fn a_row_changed_while_waiting_for_its_lock_is_not_returned_stale() {
     );
 }
 
+/// Spawn B: BEGIN, run `sql`, COMMIT-less; returns the result and leaves B's
+/// transaction open so its locks can be probed. The caller ends it.
+async fn blocked_reader(
+    ex: &Arc<Executor>,
+    b: u64,
+    sql: &'static str,
+) -> tokio::task::JoinHandle<Result<Vec<ExecResult>, ExecError>> {
+    let ex2 = ex.clone();
+    let h = tokio::spawn(async move {
+        ex2.execute_with_session(b, "BEGIN").await.unwrap();
+        ex2.execute_with_session(b, sql).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(!h.is_finished(), "control: B must be waiting on A's lock");
+    h
+}
+
+async fn wait_for(
+    h: tokio::task::JoinHandle<Result<Vec<ExecResult>, ExecError>>,
+) -> Vec<ExecResult> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), h)
+        .await
+        .expect("must be granted soon after the holder ends")
+        .unwrap()
+        .expect("the post-lock read must succeed")
+}
+
+async fn balances(ex: &Executor, sid: u64, sql: &str) -> Vec<i64> {
+    claimed_ids(&ex.execute_with_session(sid, sql).await.unwrap())
+}
+
+/// Read-modify-write: A adds 50 to a locked row and commits. B, waiting on
+/// the same row, must get it in its NEW state (bal=150) — PostgreSQL
+/// re-evaluates WHERE on the newest version — not zero rows and not the old
+/// image.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_updated_while_waiting_is_returned_in_its_new_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = disk_executor(dir.path());
+    ex.execute("CREATE TABLE acct (id INT PRIMARY KEY, bal INT)")
+        .await
+        .unwrap();
+    ex.execute("INSERT INTO acct VALUES (1, 100)")
+        .await
+        .unwrap();
+
+    let (a, b) = (ex.create_session(), ex.create_session());
+    ex.execute_with_session(a, "BEGIN").await.unwrap();
+    ex.execute_with_session(a, "SELECT bal FROM acct WHERE id = 1 FOR UPDATE")
+        .await
+        .unwrap();
+    let h = blocked_reader(&ex, b, "SELECT bal FROM acct WHERE id = 1 FOR UPDATE").await;
+    ex.execute_with_session(a, "UPDATE acct SET bal = bal + 50 WHERE id = 1")
+        .await
+        .unwrap();
+    ex.execute_with_session(a, "COMMIT").await.unwrap();
+    assert_eq!(claimed_ids(&wait_for(h).await), vec![150]);
+    ex.execute_with_session(b, "COMMIT").await.unwrap();
+}
+
+/// A blocking claim with LIMIT 1: the top row is claimed and committed by A
+/// while B waits. B's LIMIT must be refilled from the next candidate WITH its
+/// lock taken — a third session's NOWAIT on that row must be refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refilled_limit_slot_is_locked_not_borrowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = disk_executor(dir.path());
+    seed_jobs(&ex, 3).await;
+
+    let (a, b, c) = (
+        ex.create_session(),
+        ex.create_session(),
+        ex.create_session(),
+    );
+    ex.execute_with_session(a, "BEGIN").await.unwrap();
+    ex.execute_with_session(
+        a,
+        "UPDATE jobs SET status = 'active' WHERE id IN \
+         (SELECT id FROM jobs WHERE status = 'pending' ORDER BY id LIMIT 1 FOR UPDATE)",
+    )
+    .await
+    .unwrap();
+    let h = blocked_reader(
+        &ex,
+        b,
+        "SELECT id FROM jobs WHERE status = 'pending' ORDER BY id LIMIT 1 FOR UPDATE",
+    )
+    .await;
+    ex.execute_with_session(a, "COMMIT").await.unwrap();
+    assert_eq!(claimed_ids(&wait_for(h).await), vec![2]);
+
+    let probe = ex
+        .execute_with_session(c, "SELECT id FROM jobs WHERE id = 2 FOR UPDATE NOWAIT")
+        .await;
+    assert!(
+        probe.is_err(),
+        "job 2 was returned to B, so B must hold its lock; NOWAIT from C got {probe:?}"
+    );
+    ex.execute_with_session(b, "COMMIT").await.unwrap();
+}
+
+/// A locked row that is dropped after the recheck must not stay held: B is
+/// not returned job 1 (now active), so a third session can lock it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_row_releases_its_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = disk_executor(dir.path());
+    seed_jobs(&ex, 1).await;
+
+    let (a, b, c) = (
+        ex.create_session(),
+        ex.create_session(),
+        ex.create_session(),
+    );
+    ex.execute_with_session(a, "BEGIN").await.unwrap();
+    ex.execute_with_session(
+        a,
+        "UPDATE jobs SET status = 'active' WHERE id IN \
+         (SELECT id FROM jobs WHERE id = 1 FOR UPDATE)",
+    )
+    .await
+    .unwrap();
+    let h = blocked_reader(
+        &ex,
+        b,
+        "SELECT id FROM jobs WHERE status = 'pending' FOR UPDATE",
+    )
+    .await;
+    ex.execute_with_session(a, "COMMIT").await.unwrap();
+    assert!(claimed_ids(&wait_for(h).await).is_empty());
+
+    let probe = ex
+        .execute_with_session(c, "SELECT id FROM jobs WHERE id = 1 FOR UPDATE NOWAIT")
+        .await;
+    assert!(
+        probe.is_ok(),
+        "B dropped job 1, so B's transaction must not still hold it: {probe:?}"
+    );
+    ex.execute_with_session(b, "COMMIT").await.unwrap();
+}
+
+/// A row deleted by the holder while B waits is gone: B gets nothing for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_deleted_while_waiting_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = disk_executor(dir.path());
+    seed_jobs(&ex, 2).await;
+
+    let (a, b) = (ex.create_session(), ex.create_session());
+    ex.execute_with_session(a, "BEGIN").await.unwrap();
+    ex.execute_with_session(a, "SELECT id FROM jobs WHERE id = 1 FOR UPDATE")
+        .await
+        .unwrap();
+    let h = blocked_reader(&ex, b, "SELECT id FROM jobs ORDER BY id FOR UPDATE").await;
+    ex.execute_with_session(a, "DELETE FROM jobs WHERE id = 1")
+        .await
+        .unwrap();
+    ex.execute_with_session(a, "COMMIT").await.unwrap();
+    assert_eq!(claimed_ids(&wait_for(h).await), vec![2]);
+    ex.execute_with_session(b, "COMMIT").await.unwrap();
+}
+
+/// A transaction's own uncommitted writes are what its locking read returns.
+#[tokio::test]
+async fn a_locking_read_sees_the_transactions_own_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = disk_executor(dir.path());
+    seed_jobs(&ex, 2).await;
+
+    let a = ex.create_session();
+    ex.execute_with_session(a, "BEGIN").await.unwrap();
+    ex.execute_with_session(a, "UPDATE jobs SET attempts = 7 WHERE id = 1")
+        .await
+        .unwrap();
+    ex.execute_with_session(a, "INSERT INTO jobs VALUES (3, 'pending', 0)")
+        .await
+        .unwrap();
+    assert_eq!(
+        balances(&ex, a, "SELECT attempts FROM jobs WHERE id = 1 FOR UPDATE").await,
+        vec![7]
+    );
+    assert_eq!(
+        balances(
+            &ex,
+            a,
+            "SELECT id FROM jobs WHERE status = 'pending' ORDER BY id FOR UPDATE SKIP LOCKED"
+        )
+        .await,
+        vec![1, 2, 3]
+    );
+    ex.execute_with_session(a, "COMMIT").await.unwrap();
+}
+
+/// A table under row security is refused, not silently left with the stale
+/// lock window: the recheck is a raw read and cannot honour the policy.
+#[tokio::test]
+async fn for_update_on_a_table_with_row_security_is_refused() {
+    let ex = test_executor();
+    ex.execute("CREATE TABLE docs (id INT PRIMARY KEY, owner TEXT)")
+        .await
+        .unwrap();
+    ex.execute("INSERT INTO docs VALUES (1, 'ada')")
+        .await
+        .unwrap();
+    ex.execute("CREATE ROLE reader LOGIN PASSWORD 'p'")
+        .await
+        .unwrap();
+    ex.execute("GRANT SELECT ON docs TO reader").await.unwrap();
+    ex.execute("CREATE POLICY p ON docs FOR SELECT TO reader USING (owner = 'ada')")
+        .await
+        .unwrap();
+    ex.execute("ALTER TABLE docs ENABLE ROW LEVEL SECURITY")
+        .await
+        .unwrap();
+    let sid = ex.create_session();
+    ex.bind_authenticated_session(sid, "reader").await.unwrap();
+    let err = ex
+        .execute_with_session(sid, "SELECT id FROM docs FOR UPDATE")
+        .await
+        .expect_err("must be refused, not served with an open stale-lock window");
+    assert!(
+        err.to_string().contains("row-level security"),
+        "unexpected error: {err}"
+    );
+}
+
+/// N workers drain a queue with the given claim; every job exactly once, no
+/// error from any worker. `plain` uses blocking FOR UPDATE (no SKIP LOCKED).
+async fn drain(workers: usize, jobs: i64, limit: usize, plain: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = disk_executor(dir.path());
+    seed_jobs(&ex, jobs).await;
+    let claim = format!(
+        "UPDATE jobs SET status = 'active', attempts = attempts + 1 WHERE id IN (\
+           SELECT id FROM jobs WHERE status = 'pending' ORDER BY id LIMIT {limit} \
+           FOR UPDATE{}) RETURNING id",
+        if plain { "" } else { " SKIP LOCKED" }
+    );
+    let mut tasks = Vec::new();
+    for _ in 0..workers {
+        let ex = ex.clone();
+        let claim = claim.clone();
+        tasks.push(tokio::spawn(async move {
+            let sid = ex.create_session();
+            let mut got: Vec<i64> = Vec::new();
+            loop {
+                ex.execute_with_session(sid, "BEGIN").await.unwrap();
+                let ids = claimed_ids(&ex.execute_with_session(sid, &claim).await.unwrap());
+                if ids.is_empty() {
+                    ex.execute_with_session(sid, "ROLLBACK").await.unwrap();
+                    break;
+                }
+                got.extend(ids);
+                ex.execute_with_session(sid, "COMMIT").await.unwrap();
+            }
+            got
+        }));
+    }
+    let mut all: Vec<i64> = Vec::new();
+    for t in tasks {
+        all.extend(t.await.unwrap());
+    }
+    all.sort();
+    let want: Vec<i64> = (1..=jobs).collect();
+    assert_eq!(all, want, "every job exactly once");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_workers_limit_1_skip_locked_drain_exactly_once() {
+    drain(3, 30, 1, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn four_workers_limit_3_skip_locked_drain_exactly_once() {
+    drain(4, 50, 3, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn four_workers_limit_5_skip_locked_drain_exactly_once() {
+    drain(4, 60, 5, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_workers_limit_1_plain_for_update_drain_exactly_once() {
+    drain(3, 30, 1, true).await;
+}
+
 /// ROLLBACK releases the rows the transaction locked: nothing it read
 /// changed, so nothing stays claimable-blocked.
 #[tokio::test]
