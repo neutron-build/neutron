@@ -1,6 +1,6 @@
 {
   "name": "@neutron-build/mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Model Context Protocol for Neutron. Server and client over streamable HTTP, with pluggable auth and capability scoping.",
   "author": "Tyler",
   "license": "MIT",

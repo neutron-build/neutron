@@ -1,6 +1,6 @@
 {
   "name": "@neutron-build/agents",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Neutron Agents. File-based agent authoring — agent.ts, instructions.md, tools/ — composing the AI SDK and Workflow SDK into durable agents.",
   "author": "Tyler",
   "license": "MIT",
