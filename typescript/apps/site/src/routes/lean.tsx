@@ -1,107 +1,70 @@
 import ProductPage from "../components/ProductPage";
 import FeatureGrid from "../components/FeatureGrid";
-import ComparisonTable from "../components/ComparisonTable";
-import CodeBlock from "../components/CodeBlock";
 
 export function head() {
   return {
-    title: "Lean 4 Proofs - Neutron",
-    description: "Machine-checked Lean 4 proofs of the algorithms behind Nucleus. 26 files, 92 theorems, zero sorry. MVCC, B-tree, WAL, Raft, HMAC, Bloom, LRU &mdash; the designs proven correct, not just tested.",
+    title: "Neutron Lean — Verification Framework · Coming Soon",
+    description: "The verification framework for Neutron’s multi-language ecosystem. Reusable models, application proofs, and a shared verification workflow — coming soon. Explore the existing Nucleus proof suite today.",
   };
 }
 
 export default function LeanPage() {
   return (
     <ProductPage
-      title="Lean 4 Proofs"
-      description="Machine-checked correctness proofs for the algorithms Nucleus is built on. 26 files, 92 theorems, zero uses of sorry. Each proof covers a Lean model of the algorithm &mdash; MVCC, B-tree, WAL, Raft and more &mdash; correct for every input, not just the cases a test happened to try."
-      category="tool"
-      status="available"
-      accent="var(--accent-lean)"
-      heroAccentRgb="59, 130, 246"
-      heroTagline="Don't just test. Prove."
-      stats={[
-        { value: '26', label: 'Model Files' },
-        { value: '92', label: 'Theorems' },
-        { value: '0', label: 'Uses of sorry' },
-        { value: '3', label: 'Axioms' },
+      title="Neutron Lean"
+      description="Prove the rules your application depends on. The verification framework for Neutron’s multi-language ecosystem — bringing Lean models, reusable proofs, and application contracts into one development workflow."
+      category="language"
+      status="coming-soon"
+      actions={[
+        { label: "Explore the direction", href: "#framework" },
+        { label: "Existing proof suite", href: "/docs/verification/lean4" },
       ]}
     >
-      <section>
-        <h2>The algorithms that can't get this wrong.</h2>
-        <p>Nucleus handles your transactions, indexes your data, and signs your tokens &mdash; tests alone aren't enough for that kind of code. Neutron's Lean 4 suite contains machine-checked proofs of the core algorithms: MVCC snapshot isolation, B-tree invariants, write-ahead log durability, Raft safety, HMAC verification, Bloom filter false-positive bounds, LRU eviction correctness, and sliding-window rate limiting. Every proof compiles with zero use of <code>sorry</code> &mdash; against precise Lean models of each algorithm, resting on nothing but Lean&rsquo;s own axioms and three stated assumptions about SHA-256, which no proof can discharge.</p>
+      <section id="framework">
+        <h2>One ecosystem. A language for correctness.</h2>
+        <p>Neutron gives each language a role: TypeScript for interfaces, Go and Rust for services, Python for AI applications, and specialist libraries for scientific computing and ML. The application frameworks share a behavioral contract and connect to Nucleus through its PostgreSQL wire protocol.</p>
+        <p>Lean adds a place to express the rules those applications depend on: valid state transitions, authorization decisions, resource limits, and the properties of core algorithms. The planned framework brings that work into Neutron projects as a reusable component alongside the languages that run the application.</p>
+        <p><strong>Coming soon:</strong> application-facing proof libraries, connections to the language SDKs, and integrated build tooling are planned. The Nucleus algorithm-model proof suite is available today.</p>
       </section>
 
-      <CodeBlock filename="proofs/MVCC.lean" annotation="A sample of what's in the suite. The full file proves snapshot isolation.">
-        <pre><code>{`namespace Nucleus.MVCC
-
-/-- Two transactions that read the same key must see the same value
-    under snapshot isolation, regardless of concurrent writes. -/
-theorem snapshot_read_consistency
-    (t₁ t₂ : Txn) (k : Key) (db : Database)
-    (h_same_snapshot : t₁.snapshot = t₂.snapshot) :
-    t₁.read db k = t₂.read db k := by
-  unfold Txn.read
-  rw [h_same_snapshot]
-  rfl
-
-end Nucleus.MVCC`}</code></pre>
-      </CodeBlock>
+      <section>
+        <h2>Define. Prove. Connect.</h2>
+        <p>The intended workflow starts with a small, explicit model of an important rule. Prove the properties that rule must preserve, then connect the model to the application through implementation checks. Keep the model, assumptions, and implementation checks together as the application changes.</p>
+      </section>
 
       <FeatureGrid columns={3} accentRgb="59, 130, 246">
         <div class="feature-card">
-          <div class="feature-card__title">MVCC &amp; B-tree</div>
-          <div class="feature-card__desc">Snapshot isolation rules proven. B-tree structural invariants (ordering, balance, split correctness) proven.</div>
+          <div class="feature-card__title">Model your application rules</div>
+          <div class="feature-card__desc">Planned libraries for describing state, operations, and invariants in Lean. Start with a critical part of an application, such as an inventory reservation or an access policy.</div>
         </div>
         <div class="feature-card">
-          <div class="feature-card__title">WAL &amp; Raft</div>
-          <div class="feature-card__desc">Write-ahead log durability across crashes proven. Raft leader election and log safety proven from the original TLA+ spec.</div>
+          <div class="feature-card__title">Build on reusable proofs</div>
+          <div class="feature-card__desc">A planned foundation of models and lemmas that projects can compose and extend, building on the existing work on Nucleus algorithm models.</div>
         </div>
         <div class="feature-card">
-          <div class="feature-card__title">Crypto primitives</div>
-          <div class="feature-card__desc">HMAC message authentication proven correct against the RFC 2104 spec. Constant-time comparison proven timing-safe.</div>
-        </div>
-        <div class="feature-card">
-          <div class="feature-card__title">Data structures</div>
-          <div class="feature-card__desc">Bloom filter false-positive bound proven. LRU eviction ordering proven. Sliding-window rate limiter proven fair.</div>
-        </div>
-        <div class="feature-card">
-          <div class="feature-card__title">Zero sorry, axioms in the open</div>
-          <div class="feature-card__desc">No <code>sorry</code> anywhere in the suite. The facts we don't derive from scratch &mdash; bitwise identities, standard crypto assumptions &mdash; are declared as explicit axioms you can read and audit, not hidden.</div>
-        </div>
-        <div class="feature-card">
-          <div class="feature-card__title">Executable models</div>
-          <div class="feature-card__desc">Lean 4 is a real programming language, so each proof runs against an executable model of the algorithm. Nucleus implements the same design in Rust &mdash; the proof pins down what "correct" means for the hard parts.</div>
+          <div class="feature-card__title">Connect across languages</div>
+          <div class="feature-card__desc">Planned conformance checks to compare application behavior with its model. Each language integration needs an explicit boundary between what is proven and what is tested.</div>
         </div>
       </FeatureGrid>
 
-      <ComparisonTable
-        headers={['', 'Unit tests', 'Property tests', 'Lean 4 proof']}
-        rows={[
-          ['What it covers', 'Hand-picked cases', 'Random cases', 'Every input to the model'],
-          ['Subject', 'The Rust', 'The Rust', 'A Lean model of the algorithm'],
-          ['Strength of result', 'Likely correct', 'Probably correct', 'Proven, modulo stated axioms'],
-          ['When the code changes', 'Rerun the tests', 'Rerun the tests', 'Proof still holds; the model may no longer match'],
-          ['Runtime cost', 'Zero', 'Zero', 'Zero'],
-        ]}
-        highlightColumn={3}
-        accentRgb="59, 130, 246"
-      />
-
       <section>
-        <h3>What the proofs do not cover</h3>
-        <p>Two limits worth stating plainly, because a proof that is oversold is worse than no proof. First, the models are hand-written Lean, not extracted from the Rust &mdash; so a proof guarantees the <em>design</em> is sound, and keeping the implementation faithful to the design is still ordinary engineering work done by tests and review. Second, 3 declarations in the suite are <code>axiom</code>s rather than derived results, and all three are assumptions about an opaque SHA-256 &mdash; its output length, collision resistance, and HMAC's PRF security &mdash; which no proof can discharge. The structural obligations in the Bloom filter and LRU models were open until August 2026 and are now proven; a script walks every theorem and fails the build if one rests on an axiom outside that list of three.</p>
+        <h2>From a business rule to a checked model.</h2>
+        <p>Consider an inventory service written in Go with a TypeScript storefront. The intended Lean workflow would model reservations and cancellations, then prove that accepted operations preserve the model’s stock limits. Integration checks would exercise the Go service against that model.</p>
+        <p>The proof establishes a property of the Lean model under its assumptions. Tests, implementation review, and any future verified translation establish how the running service relates to that model. Sharing Nucleus or an API contract alone does not transfer a proof to another language.</p>
       </section>
 
       <section>
-        <h3>Where this shows up in Neutron</h3>
-        <p>Most algorithms modeled here are ones Nucleus runs. The B-tree is the SQL index. The WAL is every durable write. HMAC signs every JWT. Raft is modeled because it is the replication design Nucleus is building toward &mdash; the distributed/Raft mode in the shipping engine is incomplete and unsupported today. The proofs don't certify the compiled binary &mdash; they pin down the designs it's built on, so the parts that are hardest to get right are specified and machine-checked instead of improvised.</p>
+        <h2>A foundation you can inspect today.</h2>
+        <p>The repository already contains hand-written Lean models and proofs for Nucleus algorithms, including MVCC visibility, B-tree structure, write-ahead logging, caching, and cryptographic constructions. The suite uses Lean’s kernel to check proofs and an axiom audit to track their assumptions.</p>
+        <p>These are proofs about algorithm models. They do not certify the shipping Nucleus binary or application code. The broader Neutron Lean framework will build on this foundation; its application integrations are still to be built.</p>
+        <p><a href="/docs/verification/lean4">Read the current suite documentation</a> or <a href="https://github.com/neutron-build/neutron/tree/main/lean4">inspect the models and proofs</a>.</p>
+      </section>
 
-        <h3>What about my application code?</h3>
-        <p>You don't need to write Lean to use Nucleus &mdash; the proofs are ours to maintain. For your own code, <a href="/docs/verification/overview">Neutron's verification overview</a> covers Kani (bounded model checking for Rust), Shuttle (concurrency testing), Verus (SMT verification), and Quint (protocol modeling). Different tools for different problems.</p>
-
-        <h3>Part of a bigger system</h3>
-        <p>Lean sits underneath Nucleus. Your app talks to Nucleus. Nucleus runs the algorithms whose designs are proven in Lean. The proof doesn't replace the tests on the Rust &mdash; it means the algorithm those tests exercise is known, mathematically, to be sound.</p>
+      <section>
+        <h2>Verification that fits the whole system.</h2>
+        <p><a href="/docs/modeling/architecture">Explore the proposed architecture</a> for proof libraries, language adapters, and reproducible evidence across Neutron.</p>
+        <p>Lean’s proposed role is reusable models and deductive proofs. <a href="/quint">Quint</a> models stateful protocols, while <a href="/docs/verification/verus">Verus</a> supports verification of annotated Rust. Neutron Lean is intended to connect proof work to the wider development experience, with each tool’s scope and assumptions kept explicit.</p>
+        <p>The planned release includes project setup, reusable application models, language integration examples, and build checks. APIs and language coverage will be documented as those integrations are implemented.</p>
       </section>
     </ProductPage>
   );

@@ -50,12 +50,15 @@ type Dependency struct {
 // Repo is the monorepo the unpublished SDKs are fetched from.
 const Repo = "https://github.com/neutron-build/neutron"
 
+// Pin generated Python projects to a tested SDK revision.
+const pythonSDKCommit = "31147324c1a870723b9732e7075e3449bf52bb53"
+
 // zigSDKCommit is the monorepo commit the Zig scaffold's build.zig.zon pins.
 // The Zig package manager needs a content hash, so the pin is a fixed commit;
 // bump both constants together (`zig fetch <archive URL>` prints the hash).
 const (
-	zigSDKCommit = "cf1f86a74fc7badec5fe88a35a9c25021051619d"
-	zigSDKHash   = "N-V-__8AAHgD3AVMDUEHbuqIi70cy3xdrYy8uqWf4x5EIimG"
+	zigSDKCommit    = "cf1f86a74fc7badec5fe88a35a9c25021051619d"
+	zigSDKHash      = "N-V-__8AAHgD3AVMDUEHbuqIi70cy3xdrYy8uqWf4x5EIimG"
 )
 
 // sdkFor returns the SDK dependency (and, for TypeScript, the CLI package)
@@ -65,7 +68,7 @@ func sdkFor(lang detect.Language) (sdk, cli Dependency) {
 	case detect.Go:
 		sdk = Dependency{Name: "github.com/neutron-build/neutron/go", Version: "v0.1.0"}
 	case detect.Python:
-		sdk = Dependency{Name: "neutron-py", Source: "git+" + Repo + ".git", Subdir: "python"}
+		sdk = Dependency{Name: "neutron-py", Source: "git+" + Repo + ".git@" + pythonSDKCommit, Subdir: "python"}
 	case detect.TypeScript:
 		sdk = Dependency{Name: "@neutron-build/core", Version: "^0.2.2"}
 		cli = Dependency{Name: "@neutron-build/cli", Version: "^0.2.3"}

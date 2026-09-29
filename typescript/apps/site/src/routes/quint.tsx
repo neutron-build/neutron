@@ -1,104 +1,58 @@
 import ProductPage from "../components/ProductPage";
 import FeatureGrid from "../components/FeatureGrid";
-import ComparisonTable from "../components/ComparisonTable";
-import CodeBlock from "../components/CodeBlock";
 
 export function head() {
   return {
-    title: "Quint Protocol Verification - Neutron",
-    description: "15 Quint specs for Neutron protocols: Multi-Raft, resharding, distributed transactions, real-time presence. TLA+ under the hood with modern syntax.",
+    title: "Neutron Quint — Protocol Modeling",
+    description: "Model state transitions, concurrency, and failure scenarios across Neutron. Existing protocol specifications and simulation tools, with live implementation integration still in progress.",
   };
 }
 
 export default function QuintPage() {
   return (
     <ProductPage
-      title="Quint Verification"
-      description="15 Quint specs covering Nucleus, framework, and realtime protocols. Multi-Raft consensus, resharding, distributed transactions, presence CRDTs &mdash; modeled and explored before the implementation."
+      title="Neutron Quint"
+      description="Model how your system behaves when events race, messages arrive late, or a process fails. Protocol modeling for Neutron’s multi-language ecosystem."
       category="tool"
-      status="available"
-      accent="var(--accent-quint)"
-      heroAccentRgb="245, 158, 11"
-      heroTagline="Break the design before the design breaks production."
-      stats={[
-        { value: '15', label: 'Spec Files' },
-        { value: '14', label: 'Test Files' },
-        { value: 'TLA+', label: 'Model Checker' },
-        { value: 'TS-like', label: 'Syntax' },
+      status="in-progress"
+      actions={[
+        { label: "Explore the specifications", href: "/docs/verification/quint" },
+        { label: "How the components fit", href: "/docs/modeling/architecture" },
       ]}
     >
       <section>
-        <h2>Design bugs are the expensive ones.</h2>
-        <p>Distributed systems don't fail where your tests look. They fail when a message arrives in the wrong order, a node crashes mid-commit, a network partition flips a leader. Quint lets you model the protocol first, explore every reachable state with TLC under the hood, and find the 40-step trace that violates your invariant &mdash; before you write a line of Go or Rust.</p>
+        <h2>Make the protocol explicit.</h2>
+        <p>A service’s behavior spans more than one request. Sessions expire, workers retry, replicas exchange messages, and clients reconnect. Quint expresses those behaviors as states, actions, and invariants that can be explored independently of the implementation language.</p>
+        <p>Neutron already contains Quint models for database protocols, framework state machines, and real-time communication. The application-facing workflow and direct checks against live implementations are still in development.</p>
       </section>
-
-      <CodeBlock filename="specs/raft/log_safety.qnt" annotation="Simplified fragment. The real spec models elections, replication, and crash recovery.">
-        <pre><code>{`module raftLogSafety {
-  var log: Node -> List[Entry]
-  var commitIndex: Node -> Int
-  var currentTerm: Node -> Int
-
-  action appendEntry(leader: Node, follower: Node, entry: Entry): bool = {
-    // ... transition rules ...
-  }
-
-  val logMatchingInvariant =
-    forall n1, n2 in nodes:
-      forall i in 0.to(min(length(log.get(n1)), length(log.get(n2))) - 1):
-        log.get(n1)[i].term == log.get(n2)[i].term
-          implies log.get(n1)[i] == log.get(n2)[i]
-}`}</code></pre>
-      </CodeBlock>
-
       <FeatureGrid columns={3} accentRgb="245, 158, 11">
         <div class="feature-card">
-          <div class="feature-card__title">Nucleus specs</div>
-          <div class="feature-card__desc">Multi-Raft replication, resharding, distributed transactions, vector-clock merge rules. Each spec has invariant properties checked exhaustively.</div>
+          <div class="feature-card__title">Database protocols</div>
+          <div class="feature-card__desc">Models for Multi-Raft, resharding, distributed transactions, replication, membership, and snapshot transfer. A model describes a design; it does not establish that the corresponding production feature is complete.</div>
         </div>
         <div class="feature-card">
-          <div class="feature-card__title">Framework specs</div>
-          <div class="feature-card__desc">Middleware ordering, request-context isolation, graceful-shutdown drain semantics &mdash; the protocol-level guarantees the SDKs must uphold.</div>
+          <div class="feature-card__title">Service state machines</div>
+          <div class="feature-card__desc">Circuit breakers, rate limiting, CSRF tokens, and sessions. Explore the transitions and invariants that services depend on.</div>
         </div>
         <div class="feature-card">
-          <div class="feature-card__title">Realtime specs</div>
-          <div class="feature-card__desc">Presence CRDTs, channel membership under node failure, pubsub fan-out ordering. Correctness you can't get from testing alone.</div>
-        </div>
-        <div class="feature-card">
-          <div class="feature-card__title">Modern syntax</div>
-          <div class="feature-card__desc">TypeScript-ish keywords, structural types, pattern matching. Compiles to TLA+ where the actual checking happens.</div>
-        </div>
-        <div class="feature-card">
-          <div class="feature-card__title">Simulation mode</div>
-          <div class="feature-card__desc">Run randomized simulations for fast feedback (seconds). Switch to exhaustive checking for the final pass (minutes).</div>
-        </div>
-        <div class="feature-card">
-          <div class="feature-card__title">Counterexample traces</div>
-          <div class="feature-card__desc">When an invariant fails, Quint prints the exact sequence of events that violated it. Fix the design, re-run.</div>
+          <div class="feature-card__title">Real-time behavior</div>
+          <div class="feature-card__desc">WebSocket hub and hot-reload models cover scoped delivery and version ordering, with scenarios for exercising their behavior.</div>
         </div>
       </FeatureGrid>
-
-      <ComparisonTable
-        headers={['', 'Unit tests', 'Integration tests', 'Quint + TLC']}
-        rows={[
-          ['Concurrency coverage', 'One interleaving', 'A few', 'Every reachable state'],
-          ['Failure modes', 'Mocked manually', 'Chaos tools sample', 'All crash / delay combos'],
-          ['Runs in', 'Milliseconds', 'Seconds', 'Seconds to minutes'],
-          ['Caught before implementation', 'No', 'No', 'Yes'],
-          ['Output when broken', 'Assertion fail', 'Flaky test', 'Exact counterexample trace'],
-        ]}
-        highlightColumn={3}
-        accentRgb="245, 158, 11"
-      />
-
       <section>
-        <h3>Where this shows up in Neutron</h3>
-        <p>Every distributed protocol in Nucleus has a Quint spec. When we design a new one &mdash; say, a change to resharding &mdash; the spec comes first. We run exhaustive model checking, fix the invariant violations the checker finds, and only then implement. The spec and the implementation live in the same repo; they drift together, they're reviewed together.</p>
-
-        <h3>What about my application code?</h3>
-        <p>You don't need to write Quint specs for a regular web app &mdash; the hard protocols are ours to verify. If you're designing a custom distributed algorithm, Quint is the tool. If you want to verify Rust implementation code, use <a href="/docs/verification/shuttle">Shuttle</a> or <a href="/docs/verification/kani">Kani</a> instead.</p>
-
-        <h3>Part of a bigger system</h3>
-        <p>Quint at the design layer. Lean 4 for algorithm-level correctness. Verus for Rust code proofs. Shuttle for concurrency bugs in running Rust. Four complementary tools; each finds what the others can't.</p>
+        <h2>Different checks answer different questions.</h2>
+        <p>Type checking checks the specification’s structure. Scenario tests exercise selected traces. Random simulation samples possible behaviors. Model checking evaluates properties within the selected model and checker configuration.</p>
+        <p>The repository’s CI gate runs type checking, random simulation, Quint conformance scenarios, and a Rust model harness. A passing gate is not evidence that every reachable state or production execution has been checked.</p>
+        <p>Quint is the specification language. TLA+ is related specification technology; Apalache and TLC are model checkers. Current Quint supports both backends. See the <a href="https://quint.sh/docs/model-checkers">Quint model-checker documentation</a> for their different bounds and behavior.</p>
+      </section>
+      <section>
+        <h2>Connect the model to the system.</h2>
+        <p>The intended next step is to replay model traces against real Neutron services, compare observable results, and preserve failing traces as regression cases. That connection makes specifications useful across Rust, Go, Python, TypeScript, and other implementations.</p>
+        <p>Today the Rust conformance harness reimplements modeled state machines. It does not drive the live Nucleus engine. Direct model-to-implementation integration remains unfinished.</p>
+      </section>
+      <section>
+        <h2>Part of the same Neutron system.</h2>
+        <p><a href="/lean">Neutron Lean</a> is the planned home for reusable models and deductive proofs. Quint explores stateful protocols. <a href="/modelica">Neutron Modelica</a> simulates physical systems. Each contributes a different kind of evidence, with its assumptions and scope kept explicit.</p>
       </section>
     </ProductPage>
   );

@@ -1,73 +1,31 @@
 ---
-title: Overview
-description: 4-layer systems library — wire codecs to application framework.
+title: Zig Systems Framework
+description: Layered wire codecs, networking, protocol servers, application services, and Nucleus access.
 ---
 
-Neutron for Zig is a composable systems library with 4 opt-in layers. Each layer builds on the previous, but you can use any layer independently via compile-time build flags. It targets zero-allocation, freestanding use at the lowest layer and scales up to a full web framework with a Nucleus client.
+Neutron for Zig is a composable systems library and application framework. Lower layers can be built without the layers above them. The full SDK includes a Nucleus client over the PostgreSQL wire protocol.
 
-- [Quickstart](/docs/zig/quickstart) — a running HTTP server and database connection.
-- [Layers](/docs/zig/layers) — wire codecs, HAL networking, protocol servers, application framework.
-- [Nucleus client](/docs/zig/nucleus-client) — the typed client for all 14 data models.
+## Layers
 
-## Architecture
+| Source directory | Role |
+|---|---|
+| `src/layer0/` | Binary codecs, HTTP parser, pgwire, WebSocket framing |
+| `src/layer1/` | TCP, connection pooling, timers |
+| `src/layer2/` | HTTP server, database client, SSE, static files, WebSockets |
+| `src/layer3/` | App/router, middleware, errors, auth, cache, OpenAPI, lifecycle |
+| `src/nucleus/` | Feature detection, transactions, retry, and data-model modules |
 
-```
-Layer 3: Application    ← Router, middleware, OpenAPI, config
-Layer 2: Protocol       ← HTTP server, PG client, WebSocket server
-Layer 1: HAL            ← TCP, I/O multiplexing, connection pool, timers
-Layer 0: Wire           ← pgwire, HTTP, WebSocket, binary codecs
-```
+Wire codecs are allocation-free. Higher-level components, including the full database client, use an allocator. Embedded-target suitability depends on the selected layers and target validation.
 
-### Build Flags
+## Build
+
+The repository pins **Zig 0.15.2**. From `zig/`:
 
 ```bash
-# Full stack (default)
-zig build
-
-# Wire codecs only (zero-alloc, freestanding — no std required)
-zig build -Dlayer1=false -Dlayer2=false -Dlayer3=false -Dnucleus=false
-
-# Wire + networking (no HTTP server, no framework)
+zig build test
 zig build -Dlayer2=false -Dlayer3=false
-
-# Everything except Nucleus client
-zig build -Dnucleus=false
 ```
 
-Minimum Zig version: **0.14.0**
+The second command selects the lower layers. Check `build.zig` for the full flag set and `build.zig.zon` for the toolchain requirement.
 
-## Project Structure
-
-```
-zig/
-├── build.zig           # Build system with layer flags
-├── build.zig.zon       # Package manifest
-└── src/
-    ├── wire/           # Layer 0: Codecs
-    │   ├── pgwire/     # PostgreSQL protocol
-    │   ├── http.zig    # HTTP/1.1
-    │   ├── websocket.zig
-    │   └── binary.zig
-    ├── hal/            # Layer 1: Networking
-    │   ├── tcp.zig
-    │   ├── io.zig      # epoll/kqueue
-    │   ├── pool.zig
-    │   └── timer.zig
-    ├── protocol/       # Layer 2: Servers
-    │   ├── http_server.zig
-    │   ├── pg_client.zig
-    │   ├── ws_server.zig
-    │   └── static.zig
-    ├── app/            # Layer 3: Framework
-    │   ├── app.zig
-    │   ├── router.zig
-    │   ├── middleware.zig
-    │   ├── config.zig
-    │   └── openapi.zig
-    └── nucleus/        # Multi-model client
-        ├── client.zig
-        ├── sql.zig
-        ├── kv.zig
-        ├── vector.zig
-        └── ...         # 15 model files
-```
+See the [quickstart](/docs/zig/quickstart), [layer guide](/docs/zig/layers), and [Nucleus client guide](/docs/zig/nucleus-client) for more detail. The source layout above is the current layout; older examples using `wire/`, `hal/`, `protocol/`, or `app/` directory names refer to an earlier design.

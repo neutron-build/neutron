@@ -9,7 +9,7 @@ interface ProductPageProps {
   title: string;
   description: string;
   category: 'language' | 'platform' | 'database' | 'tool';
-  status: 'available' | 'in-progress' | 'planned';
+  status: 'available' | 'in-progress' | 'planned' | 'coming-soon';
   accent?: string;
   heroAccentRgb?: string;
   heroTagline?: string;
@@ -30,7 +30,7 @@ export default function ProductPage({
   actions = [],
   children,
 }: ProductPageProps) {
-  const statusLabel = status === 'available' ? 'Available' : status === 'in-progress' ? 'In progress' : 'Planned';
+  const statusLabel = status === 'available' ? 'Available' : status === 'in-progress' ? 'In progress' : status === 'coming-soon' ? 'Coming soon' : 'Planned';
 
   return (
     <main id="main-content">

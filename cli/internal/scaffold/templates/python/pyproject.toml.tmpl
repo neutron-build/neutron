@@ -5,8 +5,8 @@ description = ""
 requires-python = ">=3.11"
 dependencies = [
     # The Neutron Python SDK is the `neutron-py` distribution, installed from
-    # the Neutron repository. It is not on PyPI, and `neutron` there is
-    # OpenStack's networking service.
+    # a pinned commit in the Neutron repository. It is not on PyPI;
+    # `neutron` there is OpenStack's networking service.
     "{{.SDK.Name}} @ {{.SDK.Source}}#subdirectory={{.SDK.Subdir}}",
 ]
 

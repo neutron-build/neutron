@@ -4,9 +4,15 @@ The AI application development framework for Python — Starlette underneath,
 Pydantic throughout, with a first-class client for [Nucleus](../nucleus), the
 multi-model database the rest of Neutron is built on.
 
+The Python distribution is not on PyPI yet. Install it from the public Git
+repository in a virtual environment:
+
 ```bash
-pip install neutron-py
+python -m pip install 'neutron-py @ git+https://github.com/neutron-build/neutron.git@main#subdirectory=python'
 ```
+
+For an application deployment, pin a full Git commit instead of `main` so
+every install receives the same source.
 
 > The distribution is **`neutron-py`**, not `neutron` — that name on PyPI
 > belongs to OpenStack's networking service.
@@ -54,13 +60,14 @@ Return a Pydantic model and you get validation, serialisation and an OpenAPI
 
 ## Extras
 
+Add an extra to the Git requirement when needed, for example:
+
 ```bash
-pip install "neutron-py[ai]"      # AI providers, agents, RAG
-pip install "neutron-py[crypto]"  # password hashing
-pip install "neutron-py[granian]" # the Granian server
-pip install "neutron-py[rich]"    # richer CLI output
-pip install "neutron-py[all]"     # everything above
+python -m pip install 'neutron-py[all] @ git+https://github.com/neutron-build/neutron.git@main#subdirectory=python'
 ```
+
+Available extras are `ai` (providers and agents), `crypto` (password hashing),
+`granian` (server), `rich` (CLI output), and `all` (all four).
 
 `[test]` is the development extra and is what CI installs.
 

@@ -33,11 +33,11 @@ export function head() {
     ],
     openGraph: {
       type: "website",
-      image: "/og-image.png",
+      image: "https://neutron.build/og-neutron.png",
     },
     twitter: {
       card: "summary_large_image" as const,
-      image: "/og-image.png",
+      image: "https://neutron.build/og-neutron.png",
     },
   } as any;
 }

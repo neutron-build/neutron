@@ -1396,3 +1396,17 @@ body.nav-drawer-open { overflow: hidden; }
   color: var(--text-secondary);
   border-color: var(--border-strong);
 }
+
+/* Availability stays visible wherever a forthcoming language is listed. */
+.nav__soon {
+  display: inline-block;
+  margin-left: 5px;
+  padding: 2px 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: 9px;
+  font-weight: 500;
+  line-height: 1;
+  vertical-align: middle;
+}

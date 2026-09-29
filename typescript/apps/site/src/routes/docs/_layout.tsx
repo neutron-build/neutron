@@ -172,9 +172,11 @@ export const docsNavigation = [
     ],
   },
   {
-    label: "Verification",
+    label: "Modeling & Verification",
     items: [
-      { label: "Overview", link: "/docs/verification/overview" },
+      { label: "Architecture", link: "/docs/modeling/architecture" },
+      { label: "Simulation", link: "/docs/modeling/modelica" },
+      { label: "Verification tools", link: "/docs/verification/overview" },
       { label: "Kani", link: "/docs/verification/kani" },
       { label: "Shuttle", link: "/docs/verification/shuttle" },
       { label: "Verus", link: "/docs/verification/verus" },

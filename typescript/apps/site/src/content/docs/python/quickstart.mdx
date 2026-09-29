@@ -5,15 +5,19 @@ description: Build a Python API server in minutes.
 
 ## Install
 
+The Python distribution is not on PyPI yet. Install it from Git:
+
 ```bash
-pip install neutron-py
+python -m pip install 'neutron-py @ git+https://github.com/neutron-build/neutron.git@main#subdirectory=python'
 ```
+
+For a deployment, replace `main` with a full commit hash to keep installs
+reproducible.
 
 Or with extras:
 
 ```bash
-pip install "neutron-py[ai]"   # AI providers, agents, RAG
-pip install "neutron-py[all]"  # every extra
+python -m pip install 'neutron-py[all] @ git+https://github.com/neutron-build/neutron.git@main#subdirectory=python'
 ```
 
 The full set is `ai`, `crypto`, `granian`, `rich`, `all` — plus `test` for

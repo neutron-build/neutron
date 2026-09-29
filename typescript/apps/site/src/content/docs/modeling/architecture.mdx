@@ -1,0 +1,61 @@
+---
+title: Modeling and Verification Architecture
+description: How Lean, Quint, and physical simulation fit Neutron, with current boundaries and a proposed integration architecture.
+---
+
+Neutron is a modular, multi-language ecosystem. Application SDKs share observable behavior through the framework contract, and Nucleus provides a common database protocol. Specialist components contribute models, computation, or verification without needing to implement an HTTP framework.
+
+## Current structure
+
+| Component | Present in the repository | Integration boundary still missing |
+|---|---|---|
+| Lean | A Lake library of hand-written Nucleus models, specifications, proofs, and an axiom audit | Reusable application libraries and a checked connection to application implementations |
+| Quint | Protocol specs, scenario tests, random simulation, and a Rust model harness | Trace replay against production services; the Rust harness currently mirrors the models |
+| Modelica | Python modeling and SciPy simulation, optional FMI/Julia integrations, result storage and visualization | Complete distribution of the source packages and independently validated executable FMU export |
+
+These are useful foundations. They do not yet form a single application-facing modeling workflow. The architecture below is a **proposed direction**, not an API available today.
+
+## Keep each tool responsible for its own semantics
+
+Lean should own pure models, invariants, and deductive proofs. Separate reusable application libraries from the existing Nucleus-specific library, preserving its module names and proof history. Check declared assumptions as well as successful compilation. Keep I/O at explicit boundaries so a theorem’s statement makes clear which part of the application it covers.
+
+Quint should own state transitions, concurrent actions, and failure scenarios. Keep model checking distinct from sampled simulation. Record the checker, bounds, constants, seed, and property for each run. Connect replayable traces to real implementations through small adapters that compare observable state and results.
+
+Modelica integration should own numerical simulation workflows. Keep Python orchestration, Julia numerical backends, external Modelica compilation, and FMI execution behind explicit interfaces. Preserve solver tolerances, units, parameters, initial conditions, and backend versions with results. Use an external Modelica compiler for Modelica-language source instead of assuming the Python modeling API implements that language.
+
+A single universal intermediate representation for proofs, protocol models, and differential equations would lose important distinctions. Prefer small, versioned contracts at the points where these components actually exchange data.
+
+## Connect through artifacts and adapters
+
+The proposed shared workflow would record a model identifier and revision, inputs, tool versions, assumptions, outputs, and evidence files. Tool-specific fields stay intact: proof dependencies for Lean, traces and bounds for Quint, and solver configuration and trajectories for simulation.
+
+Language adapters should translate explicit operations and observations. For example, a Quint reservation action can invoke a real Go endpoint and compare its response and resulting state with the model. Passing those checks is conformance evidence for the tested traces, not a proof of all Go executions.
+
+Nucleus can store results for comparison and presentation. Local files should remain usable for development and CI without requiring a database. Shared storage does not establish semantic equivalence between two implementations.
+
+## Validate one complete example before generalizing
+
+1. **Lean:** model an inventory reservation rule, prove preservation of its invariant, and connect an implementation test to the same inputs and expected outcomes. Make the boundary between theorem and implementation test visible.
+2. **Quint:** replay a session or circuit-breaker trace against the existing Rust implementation. Include a deliberately faulty implementation that the comparison must reject. Preserve failing traces as regression fixtures.
+3. **Simulation:** run a small physical model against an analytical reference, store and reload its results, and render them in a TypeScript application. Validate an imported FMU using its external runtime; validate any portable export in an independent FMI tool.
+
+After those examples work, add project templates and a common CLI entry point that delegates to the tools. Build automation should report missing dependencies as unavailable or skipped, and required release checks should fail if their backend did not run.
+
+## Release criteria
+
+- A clean consumer installation works outside the monorepo.
+- Examples exercise real SDK implementations and actual optional backends where required.
+- Reports distinguish proofs, bounded checks, sampled tests, and numerical results.
+- Negative controls demonstrate that a broken invariant or implementation is detected.
+- Changes to a model, schema, toolchain, or solver make previous evidence identifiable as belonging to the earlier revision.
+
+For Lean, retain the axiom audit and document any future extraction toolchain. For Quint, do not treat a mirrored Rust model as a live-engine adapter. For simulation, round-tripping a Python object does not establish executable FMI interoperability.
+
+## References
+
+- [Neutron Lean](/lean) and the [existing proof suite](/docs/verification/lean4)
+- [Quint specifications and checks](/docs/verification/quint)
+- [Simulation implementation and limitations](/docs/modeling/modelica)
+- [Lean’s elaboration and kernel](https://lean-lang.org/doc/reference/latest/Elaboration-and-Compilation/)
+- [Quint model checkers](https://quint.sh/docs/model-checkers)
+- [FMI specification](https://fmi-standard.org/docs/main/)

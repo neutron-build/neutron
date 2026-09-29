@@ -30,6 +30,7 @@ export default function Footer() {
           <nav class="footer__group" aria-label="Resources">
             <span>Resources</span>
             <a href="/docs">Documentation</a>
+            <a href="/docs/verification/overview">Verification</a>
             <a href="/blog">Blog</a>
             <a href="/cli">CLI</a>
             <a href="https://github.com/neutron-build/neutron" target="_blank" rel="noopener noreferrer">GitHub</a>

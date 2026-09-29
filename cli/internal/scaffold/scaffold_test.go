@@ -44,6 +44,14 @@ func TestScaffoldPython(t *testing.T) {
 			t.Errorf("expected file %s to exist, got error: %v", f, err)
 		}
 	}
+	project, err := os.ReadFile(filepath.Join(dir, "test-app/pyproject.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dependency := "neutron-py @ git+" + Repo + ".git@" + pythonSDKCommit + "#subdirectory=python"
+	if !bytes.Contains(project, []byte(dependency)) {
+		t.Errorf("Python scaffold must pin its installable Neutron SDK to %s", pythonSDKCommit)
+	}
 
 	// Verify neutron.toml contents
 	data, _ := os.ReadFile(filepath.Join(dir, "test-app/neutron.toml"))

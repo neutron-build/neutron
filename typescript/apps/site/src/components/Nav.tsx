@@ -11,12 +11,12 @@ const languages = [
   { id: "mojo", label: "Mojo", href: "/mojo" },
   { id: "zig", label: "Zig", href: "/zig" },
   { id: "julia", label: "Julia", href: "/julia" },
+  { id: "lean", label: "Lean", href: "/lean", comingSoon: true },
 ];
 
-const verification = [
-  { id: "lean", label: "Lean 4", desc: "Machine-checked proofs", href: "/lean" },
-  { id: "quint", label: "Quint", desc: "Protocol verification", href: "/quint" },
-  { id: "modelica", label: "Modelica", desc: "Physics simulation", href: "/modelica" },
+const modeling = [
+  { id: "quint", label: "Quint", desc: "Protocol models · In progress", href: "/quint" },
+  { id: "modelica", label: "Modelica", desc: "Simulation tools · In progress", href: "/modelica" },
 ];
 
 const platforms = [
@@ -84,15 +84,8 @@ export default function Nav({ activeProduct }: NavProps) {
               <span class="nav__label">Languages</span>
               <div class="nav__group-items">
                 {languages.map((lang) => (
-                  <a href={lang.href} class="nav__item" key={lang.id}>{lang.label}</a>
+                  <a href={lang.href} class="nav__item" key={lang.id}>{lang.label}{lang.comingSoon && <span class="nav__soon">Soon</span>}</a>
                 ))}
-              </div>
-            </div>
-            <span class="nav__divider"></span>
-            <div class="nav__group">
-              <span class="nav__label">Proof</span>
-              <div class="nav__group-items">
-                <a href="/lean" class="nav__item">Lean 4</a>
               </div>
             </div>
             <span class="nav__divider"></span>
@@ -148,10 +141,11 @@ export default function Nav({ activeProduct }: NavProps) {
                 {languages.map((l) => (
                   <a href={l.href} class="nav__tile nav__tile--compact" key={l.id}>
                     <span class="nav__tile-label">{l.label}</span>
+                    {l.comingSoon && <span class="nav__tile-desc">Verification framework · Coming soon</span>}
                   </a>
                 ))}
                 <div class="nav__tile-divider"></div>
-                {verification.map((v) => (
+                {modeling.map((v) => (
                   <a href={v.href} class="nav__tile nav__tile--compact" key={v.id}>
                     <span class="nav__tile-label">{v.label}</span>
                     <span class="nav__tile-desc">{v.desc}</span>
@@ -212,12 +206,12 @@ export default function Nav({ activeProduct }: NavProps) {
             <div class="nav__drawer-section">
               <h3 class="nav__drawer-title">Languages</h3>
               {languages.map((l) => (
-                <a href={l.href} class="nav__drawer-link" key={l.id}>{l.label}</a>
+                <a href={l.href} class="nav__drawer-link" key={l.id}>{l.label}{l.comingSoon && <span class="nav__soon">Soon</span>}</a>
               ))}
             </div>
             <div class="nav__drawer-section">
-              <h3 class="nav__drawer-title">Verification</h3>
-              {verification.map((v) => (
+              <h3 class="nav__drawer-title">Modeling</h3>
+              {modeling.map((v) => (
                 <a href={v.href} class="nav__drawer-link" key={v.id}>{v.label}</a>
               ))}
             </div>
@@ -242,6 +236,7 @@ export default function Nav({ activeProduct }: NavProps) {
             <div class="nav__drawer-section">
               <a href="/cli" class="nav__drawer-link nav__drawer-link--primary">CLI</a>
               <a href="/docs" class="nav__drawer-link nav__drawer-link--primary">Docs</a>
+              <a href="/docs/verification/overview" class="nav__drawer-link">Verification</a>
               <a href="https://github.com/neutron-build/neutron" class="nav__drawer-link nav__drawer-link--primary" target="_blank" rel="noopener noreferrer">GitHub</a>
             </div>
           </nav>
