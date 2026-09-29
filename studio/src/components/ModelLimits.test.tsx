@@ -80,7 +80,7 @@ describe('ModelLimits (X06)', () => {
     const list = screen.getByLabelText('Evidence')
     expect(list.textContent).toContain('cdc.delivery_shape')
     expect(list.textContent).toContain('supports availability, warnings')
-    expect(list.textContent).toContain('nucleus/ tree 3313729ae513')
+    expect(list.textContent).toContain(`nucleus/ tree ${limitsFixture.nucleus.measured.nucleusTree.slice(0, 12)}`)
     expect(list.textContent).toContain('matched by version string only')
   })
 
