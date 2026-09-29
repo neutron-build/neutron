@@ -368,7 +368,7 @@ func TestSnapshotTargetScope(t *testing.T) {
 		}
 	})
 
-	t.Run("UnmanagedDeclarationIsRecordedAsDeclared", func(t *testing.T) {
+	t.Run("UnmanagedDeclarationKeepsKnownBaseMetadata", func(t *testing.T) {
 		base := m08Doc(t, m08Base())
 		dm := m08Desired("note")
 		dm.Views = []V2View{{Identity: m08ID("public", "v_other"), Managed: false, Definition: "select 1"}}
@@ -382,8 +382,8 @@ func TestSnapshotTargetScope(t *testing.T) {
 				t.Fatalf("a managed: false view is declared, not left in place: %q", retained)
 			}
 		}
-		if v == nil || v.Managed || v.Definition != "select 1" {
-			t.Fatalf("the target records the unmanaged declaration as written: %+v", v)
+		if v == nil || v.Managed || v.Definition != m08Base().Views[0].Definition {
+			t.Fatalf("the target keeps known unmanaged dependencies: %+v", v)
 		}
 	})
 

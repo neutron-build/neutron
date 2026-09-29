@@ -126,12 +126,49 @@ type dependentsFunc func(schema, table, column string) ([]columnDependent, error
 // of it and plans the transition exactly as the CLI would plan the
 // resulting target document against the same database.
 func PlanSchemaChanges(ctx context.Context, client *db.Client, changes []SchemaChange) (*StudioPlan, error) {
+	return planSchemaChanges(ctx, client, changes, nil)
+}
+
+func planSchemaChanges(ctx context.Context, client *db.Client, changes []SchemaChange, ownership *db.V2Document) (*StudioPlan, error) {
+	if ownership != nil {
+		scope, err := db.ModelFromRoot(ownership.Root)
+		if err != nil {
+			return nil, err
+		}
+		unmanaged := map[db.V2Identity]bool{}
+		for _, t := range scope.Tables {
+			if !t.Managed {
+				unmanaged[t.Identity] = true
+			}
+		}
+		for _, v := range scope.Views {
+			if !v.Managed {
+				unmanaged[v.Identity] = true
+			}
+		}
+		for _, e := range scope.Enums {
+			if !e.Managed {
+				unmanaged[e.Identity] = true
+			}
+		}
+		for _, ch := range changes {
+			if unmanaged[db.V2Identity{Schema: ch.Schema, Name: ch.Table}] {
+				return nil, mutationDomainError{msg: fmt.Sprintf("%s.%s is unmanaged in the Studio schema source; schema edits are refused", ch.Schema, ch.Table)}
+			}
+		}
+	}
 	if isNucleus, _, err := client.IsNucleus(ctx); err == nil && isNucleus {
 		return nil, errUnsupportedEngine{"migration planning uses the schema contract v2 diff, which is verified on PostgreSQL only; Nucleus planning conformance is not established (X00)"}
 	}
 	live, err := client.IntrospectV2(ctx)
 	if err != nil {
 		return nil, errIntrospection{err}
+	}
+	if ownership != nil {
+		live, _, err = db.PreserveUnmanaged(live, ownership)
+		if err != nil {
+			return nil, errIntrospection{err}
+		}
 	}
 	model, err := db.ModelFromRoot(live.Root)
 	if err != nil {
@@ -899,7 +936,7 @@ func (s *Server) handleSchemaPlan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "planId and allowDestructive belong to /api/schema/apply; a preview never executes")
 		return
 	}
-	plan, err := PlanSchemaChanges(r.Context(), client, req.Changes)
+	plan, err := s.planSchemaChanges(r.Context(), client, req.Changes)
 	if err != nil {
 		writePlanError(w, err)
 		return
@@ -946,7 +983,7 @@ func (s *Server) handleSchemaApply(w http.ResponseWriter, r *http.Request) {
 		// designer rename would plan an added column. A change set that
 		// does not plan gets the command without them.
 		var reviewed *StudioPlan
-		if plan, err := PlanSchemaChanges(r.Context(), client, req.Changes); err == nil {
+		if plan, err := s.planSchemaChanges(r.Context(), client, req.Changes); err == nil {
 			reviewed = plan
 		}
 		writeJSON(w, http.StatusConflict, map[string]any{
@@ -956,7 +993,7 @@ func (s *Server) handleSchemaApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	plan, err := PlanSchemaChanges(r.Context(), client, req.Changes)
+	plan, err := s.planSchemaChanges(r.Context(), client, req.Changes)
 	if err != nil {
 		writePlanError(w, err)
 		return

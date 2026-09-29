@@ -1104,20 +1104,24 @@ func PreserveUnmanaged(pulled, previous *V2Document) (*V2Document, []string, err
 	if err := json.Unmarshal(previous.Canonical, &prev); err != nil {
 		return nil, nil, fmt.Errorf("decode previous schema document: %w", err)
 	}
-	unmanaged := map[string]bool{}
+	type objectIdentity struct {
+		kind string
+		id   V2Identity
+	}
+	unmanaged := map[objectIdentity]bool{}
 	for _, t := range prev.Tables {
 		if !t.Managed {
-			unmanaged["tables/"+t.Identity.String()] = true
+			unmanaged[objectIdentity{"tables", t.Identity}] = true
 		}
 	}
 	for _, v := range prev.Views {
 		if !v.Managed {
-			unmanaged["views/"+v.Identity.String()] = true
+			unmanaged[objectIdentity{"views", v.Identity}] = true
 		}
 	}
 	for _, e := range prev.Enums {
 		if !e.Managed {
-			unmanaged["enums/"+e.Identity.String()] = true
+			unmanaged[objectIdentity{"enums", e.Identity}] = true
 		}
 	}
 	if len(unmanaged) == 0 {
@@ -1136,7 +1140,7 @@ func PreserveUnmanaged(pulled, previous *V2Document) (*V2Document, []string, err
 			schema, _ := ident["schema"].(string)
 			name, _ := ident["name"].(string)
 			id := V2Identity{Schema: schema, Name: name}
-			if unmanaged[key+"/"+id.String()] {
+			if unmanaged[objectIdentity{key, id}] {
 				obj["managed"] = false
 				kept = append(kept, strings.TrimSuffix(key, "s")+" "+id.String())
 			}
