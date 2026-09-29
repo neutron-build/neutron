@@ -153,7 +153,8 @@ fn measure_recall(
     let mut sum = 0.0;
     for _ in 0..queries {
         let q = rand_vec(rng);
-        let truth: std::collections::HashSet<i64> = brute_topk(model, &q, k, metric).into_iter().collect();
+        let truth: std::collections::HashSet<i64> =
+            brute_topk(model, &q, k, metric).into_iter().collect();
         let sql = format!(
             "SELECT id FROM vr ORDER BY VECTOR_DISTANCE(v, {}, '{metric}') ASC LIMIT {k}",
             vec_lit(&q)
