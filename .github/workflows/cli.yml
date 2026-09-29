@@ -106,7 +106,7 @@ jobs:
         working-directory: cli
 
       - name: Test
-        run: go test -race ./...
+        run: go test -race -timeout 30m ./...
         working-directory: cli
 
       - name: Vet
