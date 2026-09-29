@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [core 0.2.3, cli 0.2.4, create-neutron 0.1.6, auth 0.1.4, cache-redis 0.1.3, security 0.1.3] - 2026-09-28
+
 ### Fixed
 
 - **An action or loader returning `Response.json(...)` was served as 200 `{}`
@@ -39,12 +41,48 @@ All notable changes to this project are documented in this file.
   HTTP response, so the page showed raw JSON instead of `actionData`. It now
   returns a plain object, and every template's `AGENTS.md` states the rule:
   plain object → `props.actionData`; a Response → sent as the response.
+- **Server hardening from the framework audit (core).** Startup fails closed:
+  a global-middleware load failure or a required SSR runtime failure now
+  rejects `createServer` instead of serving an ungated static server. The
+  response cache keys on origin, `Accept-Language` and `X-Neutron-Data` /
+  `X-Neutron-Routes`, honors request `no-store` / `no-cache`, checks `Vary`
+  against the keyed set, caps the TTL by `s-maxage` / `max-age`, stores
+  bodies as bytes with a per-entry budget, and no longer shares an in-flight
+  Response between requests (which duplicated its `Set-Cookie`). Cache
+  invalidation matches exact path fields (`/user` no longer sweeps `/users`).
+  A cache hit still runs auth and rate-limit middleware. Unsupported methods
+  and mutations on routes with no action answer 405 with `Allow`. A thrown
+  `null`, `0` or `""` from a loader renders the error path. Shutdown stages
+  run in order and `close()` drains HTTP before the SSR runtime; proxy trust
+  comes from the socket peer, never from `X-Forwarded-For` / `X-Real-IP`
+  alone. Sessions, CSRF and CORS: session and CSRF cookies survive
+  immutable-header redirects, memory sessions evict correctly and are
+  deep-cloned, CSRF same-origin compares scheme, host and port, CORS
+  responses always carry `Vary: Origin`, the rate limiter refuses new keys at
+  its live-key cap, and input limits cover `DELETE` bodies. Images: source
+  paths are realpath-contained, remote fetches refuse redirects and URL
+  credentials and read a bounded body, a missing `sharp` is 503 and
+  undecodable input is 415 (the raw-bytes fallbacks are gone), and cache
+  entries publish atomically.
+- **`@neutron-build/security` rate limiting bucketed every visitor together.**
+  `createRateLimitMiddleware` without a `key` function called
+  `resolveClientIp(request)` without the proxy options, which always returned
+  null, so one abusive client rate-limited the whole site. The options now
+  flow through (`RateLimitMiddlewareOptions` extends `TrustedProxyOptions`);
+  behind a proxy, set `trustProxy` or supply `key`. With no trusted IP the
+  shared bucket remains the fallback.
+- **`@neutron-build/cache-redis` shortened an index's TTL and invalidated
+  paths non-atomically.** The index TTL is never shortened, and path
+  invalidation is rename-atomic.
 
 ### Changed
 
 - **Every package requires Node.js 22 or later** (`engines.node` is
   `">=22"`; it was `">=20"`). Node 20 reached end of life on 2026-04-30,
-  and CI runs 22 and 24.
+  and CI runs 22 and 24. `@neutron-build/ops`, `@neutron-build/otel` and
+  `@neutron-build/mail` have no other change and are not republished in this
+  release; their published `engines` still read `>=20` until their next
+  release.
 
 - **`dev` and `start` read `NEUTRON_PORT` / `NEUTRON_HOST`**
   (FRAMEWORK_CONTRACT.md §6). Precedence: `--port`/`--host` > env >
@@ -54,49 +92,19 @@ All notable changes to this project are documented in this file.
   from the config, and fails instead of silently moving when an explicitly
   configured port is taken.
 
-- **CLI: enum value additions are their own earlier step.** PostgreSQL
-  cannot use an enum value in the transaction that adds it (55P04). When a
-  change adds enum values alongside anything else, `db push` applies the
-  additions in their own reported transaction first, and `migrate generate`
-  writes them as a separate `{version}_{name}_enum_values` migration. A
-  migration that adds and uses a value in one file fails with a message
-  naming the split. Changing a generated column's expression is refused on
-  PostgreSQL 16 before anything runs; snapshot plans record
-  `minServerMajor`. A snapshot plan now records the migration's file slug,
-  so `--name "Add Users"` produces an appliable migration. With `--rename`,
-  `db push` and live `migrate generate` compare a renamed column's generated
-  expressions, checks and indexes as PostgreSQL rewrites them, so a rename
-  alone plans only `RENAME COLUMN`, and its down file reverts, including
-  changed keys, foreign keys and indexes on the column. Offline snapshot
-  renames that an expression names are refused with a two-migration path
-  instead of a table rewrite whose down file could not run. Snapshot plans
-  record what they leave in place, and a declared column order that differs
-  from the table's is noted instead of refused, so the chain keeps matching
-  the database and a second `db push` after adding a column mid-table
-  converges. `schema baseline` leaves out `_neutron_*` tables and refuses
-  while migration files are unapplied.
+- **`create-neutron` pins `@neutron-build/core` `^0.2.3` and
+  `@neutron-build/cli` `^0.2.4`** for scaffolds created outside the
+  workspace.
 
-- **CLI (behaviour change): migration statements may change only four
-  session settings.** `neutron migrate` now runs each statement on its own,
-  so a setting changed by one statement would apply to how the next is
-  read. `SET LOCAL` in a migration may set only `lock_timeout`,
-  `statement_timeout`, `maintenance_work_mem` and `work_mem`; any other
-  setting (for example `search_path`, `role`, `time zone`) and
-  `set_config(...)` anywhere in a statement are refused before anything
-  runs, with a message naming the allowed settings. Migration files that
-  set other settings must drop those statements or qualify names instead.
-  A session whose `client_encoding` is not UTF8 or whose
-  `standard_conforming_strings` is off (a database or role default) is
-  refused before the first statement.
+### Added
 
-- **`@neutron-build/nucleus` model clients were checked against a live
-  engine** (Nucleus 1.0.2, `conformance/live/orm/`). Document collections
-  and SQL-bound graph traversal sit behind a capability gate, time-series
-  queries behind semantic probes; columnar inserts bind numbers with a cast,
-  because the engine's aggregates silently answer 0/NULL over untyped
-  values; two cancellation defects in the HTTP and pg transports are fixed.
-  Interface docs state measured engine behaviour: for example, CDC emits
-  INSERT events only, and columnar inserts are refused inside a transaction.
+- **`maxRequestBodyBytes` on `NeutronServerOptions`.** The server adapter
+  counts request-body bytes as they are read: reading past the cap fails the
+  read (413 through the app error handler) and cancels the sender, which
+  covers chunked bodies with no `Content-Length` and declared lengths that
+  lie. The `Content-Length` check stays as the early rejection.
+
+## [nucleus 0.2.0, data 0.2.0, sql 0.1.0] - 2026-09-28
 
 ### Breaking
 
@@ -118,15 +126,214 @@ All notable changes to this project are documented in this file.
   boolean or number. `rule(head, body)` sends the engine's single-argument
   form.
 
+- **`@neutron-build/data` `QueueDriver` gains `schedule()` and
+  `unschedule()`.** A custom driver must implement both. The in-memory,
+  BullMQ and new Postgres drivers do.
+- **`@neutron-build/data` in-memory queue retries.** `InMemoryQueueDriver`
+  now runs a failing handler up to three times, then records the job in
+  `deadLetters` instead of dropping it on the first throw.
+- **`@neutron-build/data` peer range for `@neutron-build/nucleus` is
+  `^0.2.0`** (it was `^0.1.2`), following the nucleus release above.
+
+### Changed
+
+- **`@neutron-build/nucleus` model clients were checked against a live
+  engine** (Nucleus 1.0.2, `conformance/live/orm/`). Document collections
+  and SQL-bound graph traversal sit behind a capability gate, time-series
+  queries behind semantic probes; columnar inserts bind numbers with a cast,
+  because the engine's aggregates silently answer 0/NULL over untyped
+  values; two cancellation defects in the HTTP and pg transports are fixed.
+  Interface docs state measured engine behaviour: for example, CDC emits
+  INSERT events only, and columnar inserts are refused inside a transaction.
+
+- **`@neutron-build/data` cache TTLs are anchored at creation.**
+  `MemoryCacheClient.incr` and the Nucleus cache's `incr` set the expiry only
+  on the creating increment, as Redis does; later increments no longer extend
+  it.
+- **`@neutron-build/data` fixes.** `InMemoryRealtimeBus` logs and skips a
+  subscriber that throws instead of aborting delivery to the rest. The Redis
+  bus retries a channel whose `SUBSCRIBE` failed and no longer drops
+  subscribers that joined meanwhile. The Nucleus storage driver returns the
+  stored content type. The queue drivers no longer bundle `luxon` (the
+  `cron-parser` dependency is replaced by a built-in five/six-field cron
+  parser).
+- **`@neutron-build/nucleus` clients match the engine.** Model wrappers were
+  aligned with the engine's real functions (for example `kv.scan` uses
+  `KV_KEYS`; time-series `query()` throws `NucleusNotSupportedError`). `int8`
+  results are coerced to numbers (they arrived as strings under `pg`), so
+  `kv.incr()` and the count functions return numbers. `datalog.clear()` and
+  `importGraph()` send their argument. `document.update` / `delete` use the
+  engine's `DOC_UPDATE` / `DOC_DELETE`. `vector.count` exists.
+
 ### Added
 
-- **`@neutron-build/sql` (unpublished, alpha).** First-party PostgreSQL
-  ORM: schema in code, one compiler, lossless codecs, relational reads,
-  migrations through the CLI. Verified on PostgreSQL 15, 16, 17 and 18 with
-  `pg` and `postgres` (generated-column expression changes need 17+); Nucleus is
-  not claimed. Its README lists
-  the support matrix, the breaking corrections made during the alpha, and
-  the upgrade and recovery limits.
+- **`@neutron-build/sql` 0.1.0 (first publish, alpha).** First-party
+  PostgreSQL ORM: schema in code, one compiler, lossless codecs, relational
+  reads, migrations through the CLI. Verified on PostgreSQL 15, 16, 17 and 18
+  with `pg` and `postgres` (generated-column expression changes need 17+);
+  Nucleus is not claimed. Its README lists the support matrix, the breaking
+  corrections made during the alpha, and the upgrade and recovery limits.
+- **`@neutron-build/data` Postgres queue driver.**
+  `createPostgresQueueDriver` / `PostgresQueueDriver`: a durable queue on
+  PostgreSQL with a Nucleus-friendly claim query, and schedules persisted in
+  `neutron_schedules`. `schedule(id, pattern, payload)` takes a five- or
+  six-field cron pattern on all three drivers (the in-memory driver's
+  schedules are development-only).
+- **`@neutron-build/data/drizzle` subpath.** The Drizzle interop with real
+  `drizzle-orm` result types (Postgres and SQLite overloads). The root
+  `createDrizzleDatabase` keeps the loosely typed surface, so importing the
+  root needs no `drizzle-orm` types.
+- **`@neutron-build/nucleus` PostgreSQL wire transport.** `postgres://` URLs
+  connect through `PgTransport` (optional peer `pg`); `http(s)://` still uses
+  the gateway transport. Also `withRetry` for serialization failures
+  (SQLSTATE 40001), `setNX` with a TTL, and `cdel` / `cexpire` lease
+  primitives.
+
+## [agents 0.2.0, ai 0.1.1, mcp 0.1.1, workflow 0.1.1] - 2026-09-28
+
+### Breaking
+
+- **`@neutron-build/agents` refuses an unauthenticated exec-backed mount.**
+  `createAgentHandler` with an `executor` and no `auth` hook now answers 500
+  instead of running, because body-supplied `toolApprovals` self-approve.
+  Pass `auth` (return a Response to refuse, `null` to continue), or set
+  `allowUnauthenticated: true` for local development.
+- **`@neutron-build/agents` `LocalExecutor` strips well-known credential
+  variables by default** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+  `GITHUB_TOKEN`, `AWS_*`, `NPM_TOKEN`, `DATABASE_URL` and others). Pass
+  `envDenylist: []` to restore full inheritance; explicit `env` values still
+  win.
+
+### Fixed
+
+- **`@neutron-build/agents`**: a `LocalExecutor` timeout kills the whole
+  process group, not just the shell; the sandbox client bounds each HTTP
+  round trip to the daemon and cancels the exec stream on early exit.
+- **`@neutron-build/ai`**: a connection that drops mid-stream now ends in an
+  error instead of reporting a truncated response as complete; a consumer that
+  stops reading no longer leaves the provider connection open or `await
+  result.text` pending forever; harness sessions are bounded (LRU, default
+  64); the Anthropic adapter can be relabelled for gateway error attribution.
+- **`@neutron-build/mcp`**: `tools/call` validates arguments against the
+  tool's `inputSchema`.
+- **`@neutron-build/workflow`**: fixes from the framework audit, including a
+  step timeout that never fired and a sequence-space partition.
+
+### Added
+
+- **`@neutron-build/workflow` `PostgresEventStore`.** A durable event log
+  (keyed by run and sequence, first writer wins) with executor leases on
+  PostgreSQL, structurally typed against the `postgres` client.
+
+## [Go CLI 0.3.0] - 2026-09-28
+
+Tag `cli/v0.3.0`. Behaviour changes are listed first; `neutron migrate` and
+`neutron db push` users should read them before upgrading.
+
+### Breaking
+
+- **Migration history uses protocol v2.** A history written by an older CLI
+  or SDK is refused until `neutron migrate adopt` graduates it once (see the
+  `@neutron-build/nucleus` entry above and `contracts/data/MIGRATIONS.md`).
+  A crashed runner's lock is not taken over automatically.
+- **Migration statements may change only four session settings** (details
+  under Changed below).
+- **`--allow-destructive` covers more statements.** `TRUNCATE`,
+  `DROP MATERIALIZED VIEW`, `DROP DOMAIN ... CASCADE`, and a composite type's
+  `ALTER TYPE ... DROP ATTRIBUTE` / `ALTER ATTRIBUTE ... TYPE` now need it, as
+  `DROP TABLE` and column drops already did. The `migrate` help and the
+  refusal message list them.
+- **Studio's legacy `/api/table/update` and `/api/table/delete` endpoints are
+  removed**; unknown `/api/` paths answer 404 JSON. Row edits go through the
+  identity-checked commit endpoints.
+
+### Changed
+
+- **Plans are ordered so each `up` applies and each `down` reverts.** Shared
+  table changes are emitted as renames, plain adds, constraint drops, index
+  drops, generated-column drops, attribute changes, generated-column adds,
+  constraint adds, index creates, then plain column drops. Shapes that failed
+  and rolled back now apply: a new table with a foreign key onto a renamed
+  column; dropping a column together with the generated column that reads it;
+  the `down` of a column dropped with an index on it; the `down` of tables
+  dropped in a foreign-key cycle; changing a column to an enum under a text
+  check. Declared views drop dependents first and are created bases first.
+  Index key parts compare operator classes (an explicit default class equals
+  the implicit one), so a class change rebuilds the index.
+- **Changing the type of a column a generated column reads** plans as drop,
+  change type and re-add in one migration. It needs `--allow-destructive`
+  (values are recomputed) and no longer needs PostgreSQL 17. Changing the type
+  of a column an **undeclared view** reads is refused at plan time, with two
+  ways out: declare the view, or drop it with `--allow-destructive`.
+- **A write that a table rule rewrites is refused in Studio with a 400**
+  naming the rule (it was 502). An invalid primary index is no longer taken as
+  the key. A rename target containing a dot maps as one name, in Studio and in
+  `--rename`.
+- **Messages.** The re-baseline and incomplete-chain hints give steps that
+  work behind the drift gate; `migrate down` states the plan's actual grade
+  for an empty `down`; a first-statement failure is no longer called
+  "MID-FILE"; an unslugged `plan.json` refusal names its one-field fix; each
+  command error prints once. `INCLUDE` lists compare regardless of order, and
+  the v2 validators (Go and TypeScript) refuse a view definition that carries a
+  second statement.
+- **Platforms.** Native on Linux and macOS (amd64 and arm64). On Windows the
+  installer points to WSL; there is no native Windows release. PostgreSQL
+  15 to 18 are verified; 14 is not claimed.
+
+- **Enum value additions are their own earlier step.** PostgreSQL
+  cannot use an enum value in the transaction that adds it (55P04). When a
+  change adds enum values alongside anything else, `db push` applies the
+  additions in their own reported transaction first, and `migrate generate`
+  writes them as a separate `{version}_{name}_enum_values` migration. A
+  migration that adds and uses a value in one file fails with a message
+  naming the split. Changing a generated column's expression is refused on
+  PostgreSQL 16 before anything runs; snapshot plans record
+  `minServerMajor`. A snapshot plan now records the migration's file slug,
+  so `--name "Add Users"` produces an appliable migration. With `--rename`,
+  `db push` and live `migrate generate` compare a renamed column's generated
+  expressions, checks and indexes as PostgreSQL rewrites them, so a rename
+  alone plans only `RENAME COLUMN`, and its down file reverts, including
+  changed keys, foreign keys and indexes on the column. Offline snapshot
+  renames that an expression names are refused with a two-migration path
+  instead of a table rewrite whose down file could not run. Snapshot plans
+  record what they leave in place, and a declared column order that differs
+  from the table's is noted instead of refused, so the chain keeps matching
+  the database and a second `db push` after adding a column mid-table
+  converges. `schema baseline` leaves out `_neutron_*` tables and refuses
+  while migration files are unapplied.
+
+- **Migration statements may change only four session settings.** `neutron migrate` now runs each statement on its own,
+  so a setting changed by one statement would apply to how the next is
+  read. `SET LOCAL` in a migration may set only `lock_timeout`,
+  `statement_timeout`, `maintenance_work_mem` and `work_mem`; any other
+  setting (for example `search_path`, `role`, `time zone`) and
+  `set_config(...)` anywhere in a statement are refused before anything
+  runs, with a message naming the allowed settings. Migration files that
+  set other settings must drop those statements or qualify names instead.
+  A session whose `client_encoding` is not UTF8 or whose
+  `standard_conforming_strings` is off (a database or role default) is
+  refused before the first statement.
+
+### Added
+
+- **Snapshot-based planning and schema commands.** `neutron schema export`,
+  `pull`, `check` and `baseline`; `neutron migrate generate --mode snapshot`
+  plans offline from the last accepted snapshot; `neutron migrate adopt`.
+  Introspection and diff cover the schema contract v2 surface
+  (`contracts/data/`).
+- **Guarded apply.** Migrations run only an allowlist of statement kinds,
+  each statement on its own; `neutron migrate resolve <version>` inspects and
+  recovers a non-transactional migration interrupted mid-file and never
+  replays a statement whose outcome it cannot prove. Operational migrations
+  (for example `CREATE INDEX CONCURRENTLY`) are journaled with identity-pinned
+  steps.
+- **Studio data editor.** Single-row edits by full primary-key identity,
+  staged and committed atomically with stale checks, typed editors, virtualized
+  large results, lossless import and export.
+- **`neutron mcp` inspection tools** (read-only, redacted, per-model limits)
+  and a cross-model inspection journey in Studio.
+- **Experimental application coordinator.** `neutron project check`, `plan`,
+  `run` and `spec` for multi-service applications.
 
 ## [core 0.2.2, cli 0.2.3, create-neutron 0.1.5] - 2026-09-07
 

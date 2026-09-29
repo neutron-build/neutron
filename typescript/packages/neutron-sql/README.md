@@ -4,16 +4,19 @@ Drizzle-shaped TypeScript SQL ORM for Postgres. Schema in code, no codegen,
 one readable SQL statement per query, `toSQL()` on everything. Zero runtime
 dependencies — bring `postgres` or `pg` (or both) as optional peers.
 
-**Alpha — contained, not production-ready.** Verified on PostgreSQL 16, 17
-and 18 with both drivers (changing a generated column's expression needs 17+);
+**Alpha — contained, not production-ready.** Verified on PostgreSQL 15, 16,
+17 and 18 with both drivers (changing a generated column's expression needs 17+);
 Nucleus and other Postgres-wire engines are not claimed. See the [support matrix](#support-matrix)
 and, when coming from an earlier build, [Upgrading](#upgrading-from-earlier-builds).
 
 ## Quick start
 
-Not yet published to npm — the first `ts/v*` tag of this monorepo publishes
-it. Until then use it from the repo (`typescript/packages/neutron-sql`) as a
-workspace dependency.
+```bash
+npm install @neutron-build/sql pg     # or: postgres
+```
+
+Requires Node.js 22 or later. `pg` and `postgres` are optional peers; install
+the one you use.
 
 ```ts
 // schema.ts
@@ -1519,8 +1522,8 @@ advertised for it:
 
 ## Upgrading from earlier builds
 
-This package has not been published; these notes are for code written
-against the in-repo alpha. Each change is documented where it applies.
+These notes are for code written against the in-repo alpha before 0.1.0 was
+published. Each change is documented where it applies.
 
 Breaking corrections:
 
