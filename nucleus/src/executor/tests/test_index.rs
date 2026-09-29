@@ -1763,3 +1763,29 @@ async fn test_comma_join_index_nl_applies_left_pushdown() {
     assert_eq!(r[0][0], Value::Int32(3));
     assert_eq!(r[0][1], Value::Int32(3));
 }
+
+#[tokio::test]
+async fn test_unique_index_created_after_rows_is_enforced() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE ui (id INT PRIMARY KEY, email TEXT)").await;
+    exec(&ex, "INSERT INTO ui VALUES (1, 'a'), (2, 'b')").await;
+    exec(&ex, "CREATE UNIQUE INDEX ui_email ON ui (email)").await;
+    assert!(
+        ex.execute("INSERT INTO ui VALUES (3, 'a')").await.is_err(),
+        "insert duplicating an existing key must be rejected"
+    );
+    assert!(
+        ex.execute("UPDATE ui SET email = 'a' WHERE id = 2")
+            .await
+            .is_err(),
+        "update onto an existing key must be rejected"
+    );
+    exec(&ex, "CREATE TABLE ud (id INT, email TEXT)").await;
+    exec(&ex, "INSERT INTO ud VALUES (1, 'x'), (2, 'x')").await;
+    assert!(
+        ex.execute("CREATE UNIQUE INDEX ud_email ON ud (email)")
+            .await
+            .is_err(),
+        "building a unique index over existing duplicates must fail"
+    );
+}
