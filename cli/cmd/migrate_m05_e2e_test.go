@@ -2273,9 +2273,10 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 		dirD := writeMigrations(t, map[string]string{
 			"001_legdom.up.sql": "DROP DOMAIN leg_s.d CASCADE;",
 		})
-		// DROP DOMAIN carries no acknowledgement (documented ack
-		// vocabulary) — it applies with no flags.
-		if code, out := runCLI(t, dbD, "migrate", "--dir", dirD); code != 0 {
+		// DROP DOMAIN ... CASCADE drops the domain's columns, so it needs
+		// the destructive acknowledgement (S07 review-3 R5); the guard
+		// still lets it through over user dependents.
+		if code, out := runCLI(t, dbD, "migrate", "--dir", dirD, "--allow-destructive"); code != 0 {
 			t.Fatalf("legit DROP DOMAIN CASCADE over user dependents refused (over-refusal): %s", out)
 		}
 		if got := query(t, dbD, `SELECT count(*) FROM information_schema.columns WHERE table_name='leg_t' AND column_name='c'`); got != "0" {
@@ -2667,7 +2668,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE MATERIALIZED VIEW pt_mview.legal1 AS SELECT 1 AS x; CREATE VIEW pt_mview.legal2 AS SELECT x FROM pt_mview.legal1;`},
-					drop:  "DROP MATERIALIZED VIEW pt_mview.legal1 CASCADE;",
+					drop:  "DROP MATERIALIZED VIEW pt_mview.legal1 CASCADE;", ack: true,
 					check: [][2]string{{`SELECT count(*) FROM pg_class WHERE relname='legal2'`, "0"}},
 				},
 			},
@@ -2731,7 +2732,7 @@ func TestMigrateApplySafetyE2E(t *testing.T) {
 				preM05Applies: true,
 				legal: &legalSpec{
 					plant: []string{`CREATE DOMAIN pt_domain.ld AS int; CREATE TABLE pt_domain.lt (c pt_domain.ld);`},
-					drop:  "DROP DOMAIN pt_domain.ld CASCADE;",
+					drop:  "DROP DOMAIN pt_domain.ld CASCADE;", ack: true,
 					check: [][2]string{{`SELECT count(*) FROM information_schema.columns WHERE table_name='lt'`, "0"}},
 				},
 			},
