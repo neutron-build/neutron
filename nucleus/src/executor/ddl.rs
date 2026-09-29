@@ -4899,6 +4899,7 @@ impl Executor {
                 // the connection with it must not hand over the role.
                 *sess.current_role.write() = None;
                 self.recompute_session_context(&sess);
+                self.sync_lock_timeout(&sess);
                 let mut txn = sess.txn_state.write().await;
                 *txn = super::session::TxnState::new();
                 Ok(ExecResult::Command {
@@ -4933,17 +4934,25 @@ impl Executor {
         let sess = self.current_session();
         match reset_stmt.reset {
             Reset::ALL => {
-                // RESET ALL also drops an assumed role.
+                // Deliberate deviation from PostgreSQL: there `role` and
+                // `session_authorization` are excluded from RESET ALL, so an
+                // assumed role survives it. Here RESET ALL also drops the
+                // role. That fails closed (the session ends up with less
+                // authority, never more) and matches what a pooler expects
+                // of a reset.
                 sess.guc_note_role(false);
                 *sess.current_role.write() = None;
                 self.recompute_session_context(&sess);
                 sess.guc_note_all_settings();
-                let mut settings = sess.settings.write();
-                settings.clear();
-                settings.insert("search_path".to_string(), "public".to_string());
-                settings.insert("client_encoding".to_string(), "UTF8".to_string());
-                settings.insert("standard_conforming_strings".to_string(), "on".to_string());
-                settings.insert("timezone".to_string(), "UTC".to_string());
+                {
+                    let mut settings = sess.settings.write();
+                    settings.clear();
+                    settings.insert("search_path".to_string(), "public".to_string());
+                    settings.insert("client_encoding".to_string(), "UTF8".to_string());
+                    settings.insert("standard_conforming_strings".to_string(), "on".to_string());
+                    settings.insert("timezone".to_string(), "UTC".to_string());
+                }
+                self.sync_lock_timeout(&sess);
                 Ok(ExecResult::Command {
                     tag: "RESET".into(),
                     rows_affected: 0,
@@ -4963,6 +4972,7 @@ impl Executor {
                 }
                 sess.guc_note_setting(&param_name, false);
                 let mut settings = sess.settings.write();
+                let is_lock_timeout = param_name == "lock_timeout";
                 match param_name.as_str() {
                     "search_path" => {
                         settings.insert(param_name, "public".to_string());
@@ -4979,6 +4989,10 @@ impl Executor {
                     _ => {
                         settings.remove(&param_name);
                     }
+                }
+                drop(settings);
+                if is_lock_timeout {
+                    self.sync_lock_timeout(&sess);
                 }
                 Ok(ExecResult::Command {
                     tag: "RESET".into(),

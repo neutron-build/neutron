@@ -429,8 +429,14 @@ impl Session {
         self.guc_txn.lock().is_some()
     }
 
-    /// BEGIN: start recording `SET` state for this transaction.
+    /// BEGIN: start recording `SET` state for this transaction. A frame that
+    /// already exists is the implicit block of the multi-statement message
+    /// this BEGIN arrived in (`guc_begin_implicit`); it is kept, so `SET
+    /// LOCAL` made earlier in the message lasts until the explicit block ends.
     pub(super) fn guc_begin(&self) {
+        if self.guc_txn.lock().is_some() {
+            return;
+        }
         let begin = self.guc_snapshot(HashMap::new(), None);
         *self.guc_txn.lock() = Some(GucTxn {
             begin,
@@ -438,6 +444,34 @@ impl Session {
             local_role: None,
             savepoints: Vec::new(),
         });
+    }
+
+    /// Open the implicit transaction block PostgreSQL gives a multi-statement
+    /// simple query. Returns whether this call opened it (false when a block
+    /// is already open).
+    pub(super) fn guc_begin_implicit(&self) -> bool {
+        if self.guc_txn.lock().is_some() {
+            return false;
+        }
+        self.guc_begin();
+        true
+    }
+
+    /// A COMMIT or ROLLBACK whose storage step failed leaves the transaction
+    /// open for a retry, but it must not leave the assumed role or the
+    /// transaction's settings in place: return to the BEGIN state and keep the
+    /// block open. Savepoint levels are dropped, since restoring one later
+    /// would re-assume what this just took away.
+    pub(super) fn guc_fail_close(&self) {
+        let mut guard = self.guc_txn.lock();
+        let Some(txn) = guard.as_mut() else {
+            return;
+        };
+        txn.local_settings.clear();
+        txn.local_role = None;
+        txn.savepoints.clear();
+        *self.settings.write() = txn.begin.settings.clone();
+        *self.current_role.write() = txn.begin.role.clone();
     }
 
     /// COMMIT: `SET LOCAL` values revert, session-level `SET` stays.

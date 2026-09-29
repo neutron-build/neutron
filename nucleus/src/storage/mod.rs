@@ -735,6 +735,11 @@ pub trait StorageEngine: Send + Sync {
     /// no locks to wait on.
     fn set_lock_timeout_ms(&self, _ms: u64) {}
 
+    /// Bound one session's lock waits (`None` = the engine default again).
+    /// Per session so that `SET lock_timeout` cannot change another
+    /// connection's behaviour. Default: no-op, as above.
+    fn set_session_lock_timeout_ms(&self, _session: u64, _ms: Option<u64>) {}
+
     fn max_isolation_level(&self) -> IsolationLevel {
         IsolationLevel::ReadCommitted
     }

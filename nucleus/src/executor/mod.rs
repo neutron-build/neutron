@@ -3478,6 +3478,7 @@ impl Executor {
         // Perform the actual reset
         session.reset().await;
         self.recompute_session_context(&session);
+        self.storage.set_session_lock_timeout_ms(id, None);
 
         actions
     }
@@ -6868,17 +6869,39 @@ impl Executor {
         // (tests, embedded, RESP, binary wire) still materializes because the
         // producer only emits a stream when the session opted in (stream_results).
         let single = statements.len() == 1;
-        let mut results = Vec::new();
-        for stmt in statements {
-            let r = self.execute_statement(stmt).await?;
-            let r = if single && r.is_stream() {
-                r
+        // PostgreSQL runs a multi-statement simple query in an implicit
+        // transaction block, so `SET LOCAL ROLE x; SELECT ...` in one message
+        // applies the role to the SELECT and ends with the message. Only the
+        // SET state gets that block here (statements still autocommit): the
+        // SET LOCAL values end with the message, and an error in it reverts
+        // the message's SETs as PostgreSQL's abort of the block would. A
+        // message that opens an explicit BEGIN hands the block to it.
+        let session = self.current_session();
+        let implicit = !single && session.guc_begin_implicit();
+        let run = async {
+            let mut results = Vec::new();
+            for stmt in statements {
+                let r = self.execute_statement(stmt).await?;
+                let r = if single && r.is_stream() {
+                    r
+                } else {
+                    r.materialize().await?
+                };
+                results.push(r);
+            }
+            Ok::<_, ExecError>(results)
+        };
+        let outcome = run.await;
+        if implicit && !session.txn_active.load(Ordering::SeqCst) {
+            if outcome.is_ok() {
+                session.guc_commit();
             } else {
-                r.materialize().await?
-            };
-            results.push(r);
+                session.guc_rollback();
+            }
+            self.recompute_session_context(&session);
+            self.sync_lock_timeout(&session);
         }
-        Ok(results)
+        outcome
     }
 
     /// Apply a SQL command already authenticated and committed by Raft.

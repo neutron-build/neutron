@@ -446,7 +446,9 @@ so engine sessions see them:
   and `RESET ROLE` was a no-op: a pooled connection kept an assumed role for
   the next borrower. Transaction-scoped `SET` state is now restored at COMMIT,
   ROLLBACK, aborted-transaction COMMIT, `ROLLBACK TO SAVEPOINT`, pool return;
-  `RESET ROLE`/`RESET ALL`/`DISCARD ALL` drop the role. Regressions:
+  `RESET ROLE`/`RESET ALL`/`DISCARD ALL` drop the role (RESET ALL
+  deliberately differs from PostgreSQL, fails closed); multi-statement messages get an
+  implicit block; `lock_timeout` is per session. Regressions:
   `nucleus/src/executor/tests/test_set_local_scope.rs`; live probes
   `rls.set_local_*` / `rls.set_session_setting_transaction_scope`
   (`conformance/live/orm/`). `set_config()` remains missing (N-list, unchanged).

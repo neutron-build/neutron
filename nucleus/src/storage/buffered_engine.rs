@@ -1476,6 +1476,7 @@ impl StorageEngine for BufferedDiskEngine {
         self.txn_bufs.write().remove(&id);
         self.pending_level.write().remove(&id);
         self.pending_enlistment.write().remove(&id);
+        self.locks.set_session_timeout_ms(id, None);
         self.end_serializable_txn(id);
     }
 
@@ -1514,6 +1515,11 @@ impl StorageEngine for BufferedDiskEngine {
     /// long wait behind a slow or idle-in-transaction holder.
     fn set_lock_timeout_ms(&self, ms: u64) {
         self.locks.set_timeout_ms(ms);
+    }
+
+    /// Per-session form of the bound above (`SET lock_timeout`).
+    fn set_session_lock_timeout_ms(&self, session: u64, ms: Option<u64>) {
+        self.locks.set_session_timeout_ms(session, ms);
     }
 
     fn set_next_isolation_level(&self, level: &str) {
