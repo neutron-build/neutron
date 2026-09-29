@@ -67,8 +67,8 @@ func sdkFor(lang detect.Language) (sdk, cli Dependency) {
 	case detect.Python:
 		sdk = Dependency{Name: "neutron-framework", Version: ">=0.1.0,<0.2.0"}
 	case detect.TypeScript:
-		sdk = Dependency{Name: "@neutron-build/core", Version: "^0.2.2"}
-		cli = Dependency{Name: "@neutron-build/cli", Version: "^0.2.3"}
+		sdk = Dependency{Name: "@neutron-build/core", Version: "^0.2.3"}
+		cli = Dependency{Name: "@neutron-build/cli", Version: "^0.2.4"}
 	case detect.Rust:
 		sdk = Dependency{Name: "neutron", Source: Repo}
 	case detect.Zig:
