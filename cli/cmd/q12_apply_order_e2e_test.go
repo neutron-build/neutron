@@ -601,7 +601,7 @@ func TestQ12Refusals(t *testing.T) {
 				`column app.t.keep`,
 				`so the plan would fail at apply and is refused. Declare the view in the schema (the plan then drops it and re-creates it around the change), or drop it: re-run with --allow-destructive, which drops views the schema does not declare`,
 				// F2: the refusal names everything else the flag drops.
-				`Note that --allow-destructive also drops every object the schema does not declare as managed, which here is: view app.v, view app.w; declare in the schema what must stay before using it`,
+				`Note that --allow-destructive also drops every object the schema does not declare (an object declared managed: false is never dropped), which here is: view app.v, view app.w; declare in the schema what must stay before using it`,
 			}},
 		// Shape 4, a view outside the managed schemas.
 		{name: "view in an unmanaged schema over a type change",
@@ -628,7 +628,7 @@ func TestQ12Refusals(t *testing.T) {
 			live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net numeric, gross numeric GENERATED ALWAYS AS (net * 2) STORED, legacy text)`,
 				`CREATE TABLE app.audit (id int PRIMARY KEY, msg text)`, `CREATE INDEX t_legacy ON app.t (legacy)`},
 			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net bigint, gross numeric GENERATED ALWAYS AS (net * 2) STORED, legacy text)`},
-			want:   []string{`Re-run with --allow-destructive to acknowledge that. Note that --allow-destructive also drops every object the schema does not declare as managed, which here is: index app.t_legacy, table app.audit; declare in the schema what must stay before using it`}},
+			want:   []string{`Re-run with --allow-destructive to acknowledge that. Note that --allow-destructive also drops every object the schema does not declare (an object declared managed: false is never dropped), which here is: index app.t_legacy, table app.audit; declare in the schema what must stay before using it`}},
 		// Q12 review-1 F4: dependencies the view text does not show, read
 		// from the catalog (live only; offline plans have no catalog).
 		{name: "view over a function returning the table's rows",
@@ -689,14 +689,14 @@ func TestQ12Refusals(t *testing.T) {
 			target: []string{`CREATE TABLE app.keep (id int PRIMARY KEY)`},
 			flags:  []string{"--allow-destructive"},
 			want:   []string{`foreign key x_p of table rep.x references table app.p, which this plan drops, and the plan cannot drop and re-add a foreign key of a table the schema document does not manage.`}},
-		// R2-4: a table declared with managed: false is dropped by the
-		// flag, and the refusal lists it.
-		{name: "refusal lists a managed-false table the flag drops", markUnmanaged: []string{"app.k"},
+		// X14: a table declared with managed: false is not dropped by the
+		// flag and the refusal does not list it; the undeclared one is.
+		{name: "refusal omits a managed-false table", markUnmanaged: []string{"app.k"},
 			live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net numeric, gross numeric GENERATED ALWAYS AS (net * 2) STORED)`,
-				`CREATE TABLE app.k (id int PRIMARY KEY)`},
+				`CREATE TABLE app.k (id int PRIMARY KEY)`, `CREATE TABLE app.u (id int PRIMARY KEY)`},
 			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, net bigint, gross numeric GENERATED ALWAYS AS (net * 2) STORED)`,
 				`CREATE TABLE app.k (id int PRIMARY KEY)`},
-			want: []string{`Note that --allow-destructive also drops every object the schema does not declare as managed, which here is: table app.k;`}},
+			want: []string{`which here is: table app.u; declare in the schema what must stay`}},
 		// A table the plan leaves in place, and one in an unmanaged
 		// schema, reference a key the plan drops.
 		{name: "left-in-place table references a dropped key", snapshot: true,
@@ -704,7 +704,7 @@ func TestQ12Refusals(t *testing.T) {
 				`CREATE TABLE app.x (id int PRIMARY KEY, c int, CONSTRAINT x_c FOREIGN KEY (c) REFERENCES app.p (code))`},
 			target: []string{`CREATE TABLE app.p (id int PRIMARY KEY, code int)`},
 			want: []string{`foreign key x_c of table app.x references the key (code) of table app.p, which this plan drops, and the plan cannot drop and re-add a foreign key of a table the schema does not declare.`,
-				`Declare table app.x in the schema (the plan then drops and re-adds the foreign key around the change), or drop it: re-run with --allow-destructive, which drops tables the schema does not declare. Note that --allow-destructive also drops every object the schema does not declare as managed, which here is: table app.x;`}},
+				`Declare table app.x in the schema (the plan then drops and re-adds the foreign key around the change), or drop it: re-run with --allow-destructive, which drops tables the schema does not declare. Note that --allow-destructive also drops every object the schema does not declare (an object declared managed: false is never dropped), which here is: table app.x;`}},
 		{name: "unmanaged table references a dropped key",
 			live: []string{`CREATE TABLE app.p (id int PRIMARY KEY, code int, CONSTRAINT p_code UNIQUE (code))`,
 				`CREATE SCHEMA rep`, `CREATE TABLE rep.x (id int PRIMARY KEY, c int, CONSTRAINT x_c FOREIGN KEY (c) REFERENCES app.p (code))`},

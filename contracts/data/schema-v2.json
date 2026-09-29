@@ -303,7 +303,7 @@
         "identity": { "$ref": "#/$defs/identity" },
         "managed": {
           "type": "boolean",
-          "description": "Managed-scope metadata: whether this object is inside the managed scope of the workflow that produced the document. Desired documents declare their objects managed; introspected documents mark scope explicitly. Never inferred."
+          "description": "Managed-scope metadata: whether this object is inside the managed scope of the workflow that produced the document. Desired documents declare their objects managed; introspected documents mark scope explicitly. Never inferred. A planner treats an object with managed: false as not its own: it never creates, alters or drops it, does not compare it, and does not report drift on it; a managed object may still reference it (for example a foreign key onto an unmanaged table)."
         },
         "columns": {
           "type": "array",

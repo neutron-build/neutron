@@ -18,7 +18,7 @@ func init() {
 	dbPushCmd.Flags().StringArray("rename", nil, "explicit column rename: table.old>table.new (repeatable)")
 	dbPushCmd.Flags().Duration("timeout", 60*time.Second, "time budget for the push")
 	dbPushCmd.Flags().Bool("force", false, "push even when a migration history exists (does NOT permit destructive changes or bypass any protection)")
-	dbPushCmd.Flags().Bool("allow-destructive", false, "acknowledge data loss: permit dropping tables, columns, and indexes that exist in the database but are absent from the schema (neutron-internal metadata and extension-owned objects are never touched)")
+	dbPushCmd.Flags().Bool("allow-destructive", false, "acknowledge data loss: permit dropping tables, columns, and indexes that exist in the database but are absent from the schema (neutron-internal metadata, extension-owned objects and objects declared managed: false are never touched)")
 	dbPushCmd.Flags().Bool("dry-run", false, "print the SQL without applying")
 	dbCmd.AddCommand(dbPushCmd)
 }
@@ -37,6 +37,8 @@ Column order is informational: PostgreSQL appends added columns and cannot reord
 Push takes the migration runner's pinned advisory-lock session for the history check, plan and apply: a push never interleaves with a running migration. Dry-run stays lockless (it reports only).
 
 Schema documents: version 2 (the cross-language contract in contracts/data/) plans through full catalog introspection — qualified schemas, composite PK/unique/check/foreign-key constraints, indexes with predicates and expressions, enums, arrays and views; version 1 (legacy @neutron-build/sql exportSchema output) keeps its historical behavior.
+
+Tables, views and enums the schema document declares with managed: false are not neutron's: they are never created, altered or dropped (--allow-destructive included), never compared for drift, and never recorded as left in place; managed tables may reference them, and a foreign key of one onto a key or table the plan drops refuses the plan.
 
 Safety rails (not bypassed by any flag): neutron-internal tables (_neutron_*), extension-owned objects, and schema metadata are never dropped or modified; objects absent from the schema are only dropped with --allow-destructive as an explicit acknowledgement of data loss; catalog structures this diff engine cannot represent faithfully are rejected with an error instead of being silently "synchronized".`,
 	RunE: func(cmd *cobra.Command, args []string) error { return reportRunE(runDBPush(cmd, args)) },

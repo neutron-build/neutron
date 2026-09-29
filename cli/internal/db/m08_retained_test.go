@@ -368,7 +368,7 @@ func TestSnapshotTargetScope(t *testing.T) {
 		}
 	})
 
-	t.Run("UnmanagedDeclarationIsReplaced", func(t *testing.T) {
+	t.Run("UnmanagedDeclarationIsRecordedAsDeclared", func(t *testing.T) {
 		base := m08Doc(t, m08Base())
 		dm := m08Desired("note")
 		dm.Views = []V2View{{Identity: m08ID("public", "v_other"), Managed: false, Definition: "select 1"}}
@@ -377,8 +377,40 @@ func TestSnapshotTargetScope(t *testing.T) {
 		target, retained := m08Target(t, base, desired, res.Up)
 		tm := m08Model(t, target)
 		v := tm.View(m08ID("public", "v_other"))
-		if !reflect.DeepEqual(retained, m08Retained) || v == nil || !v.Managed || v.Definition != m08Base().Views[0].Definition {
-			t.Fatalf("the base view replaces the unmanaged declaration: %+v (retained %q)", v, retained)
+		for _, r := range retained {
+			if strings.HasPrefix(r, "view ") {
+				t.Fatalf("a managed: false view is declared, not left in place: %q", retained)
+			}
+		}
+		if v == nil || v.Managed || v.Definition != "select 1" {
+			t.Fatalf("the target records the unmanaged declaration as written: %+v", v)
+		}
+	})
+
+	t.Run("UnmanagedBaseEntryIsCarriedNotReported", func(t *testing.T) {
+		bm := m08Base()
+		for i := range bm.Tables {
+			if bm.Tables[i].Identity == m08ID("public", "other_app") {
+				bm.Tables[i].Managed = false
+			}
+		}
+		base := m08Doc(t, bm)
+		desired := m08Doc(t, m08Desired("note"))
+		res := m08Plan(t, desired, base, true, nil)
+		for _, stmt := range res.Up {
+			if strings.Contains(stmt, "other_app") {
+				t.Fatalf("a table the chain records managed: false is never dropped: %q", res.Up)
+			}
+		}
+		target, retained := m08Target(t, base, desired, res.Up)
+		for _, r := range retained {
+			if r == "table public.other_app" {
+				t.Fatalf("carried, not reported: %q", retained)
+			}
+		}
+		tm := m08Model(t, target)
+		if tt := tm.Table(m08ID("public", "other_app")); tt == nil || tt.Managed {
+			t.Fatalf("the unmanaged entry is carried forward as recorded: %+v", tt)
 		}
 	})
 }

@@ -78,7 +78,10 @@ A user table with a foreign key into one of them (for example to _neutron_jobs, 
 job queues' table) cannot be described by any schema document: pull refuses, names
 the table, the key and its target, and writes nothing. Drop the key or point it at a
 table you own, or keep that database off the schema document workflow.
-Pull never modifies the database.`,
+Introspection never infers ownership: every object it lists is written managed: true,
+except that an object the existing document at --out marks managed: false (neutron
+never creates, alters or drops it, and does not compare it) keeps that marker, with its
+content refreshed from the database. Pull never modifies the database.`,
 	RunE: func(cmd *cobra.Command, args []string) error { return reportRunE(runSchemaPull(cmd, args)) },
 }
 
@@ -90,7 +93,7 @@ snapshot — a non-empty diff means pending schema changes, reported and exit 1.
 Objects a migration left in place because the document no longer declares them
 are recorded in the chain, so their drops stay listed as pending until a plan
 with --allow-destructive drops them or the document declares them again.
-Column order is informational: the chain keeps existing columns in their recorded
+Tables, views and enums declared managed: false are not compared. Column order is informational: the chain keeps existing columns in their recorded
 order and appends new ones, and a document that declares another order is noted, not a pending change
 (PostgreSQL cannot reorder columns without rebuilding the table).
 
@@ -106,7 +109,9 @@ var schemaBaselineCmd = &cobra.Command{
 	Short: "Record an existing database as the snapshot chain root",
 	Long: `Initial ownership workflow for an existing database: introspects the database
 (read-only), writes migrations/snapshots/000_baseline.snapshot.json as the chain root,
-and reports unmanaged objects. Neutron-internal metadata tables (_neutron_*) are left
+and reports unmanaged objects (opaque inventory; a baseline lists every table as
+managed, so mark the ones neutron must never touch managed: false in your schema
+document, not in the baseline). Neutron-internal metadata tables (_neutron_*) are left
 out of the baseline: they are managed automatically and never part of a plan (a
 baseline written by an earlier CLI that lists them still works — they are ignored on
 read). Existing migration files at baseline time are recorded as covered by the
@@ -191,11 +196,20 @@ func runSchemaPull(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return withInternalReferenceOptions(err)
 	}
+	var keptUnmanaged []string
+	if prev, err := loadSchemaDocument(out); err == nil && prev.V2 != nil {
+		if doc, keptUnmanaged, err = db.PreserveUnmanaged(doc, prev.V2); err != nil {
+			return err
+		}
+	}
 	if err := db.WriteAtomicReplace(out, append([]byte(nil), doc.Canonical...)); err != nil {
 		return err
 	}
 	reportDocumentSummary(doc)
 	reportInternalExcluded(internal)
+	if len(keptUnmanaged) > 0 {
+		ui.Infof("kept managed: false from the previous document (neutron never creates, alters or drops these): %s", strings.Join(keptUnmanaged, ", "))
+	}
 	ui.Successf("Pulled schema document: %s", out)
 	return nil
 }
