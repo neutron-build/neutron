@@ -936,6 +936,39 @@ const rlsProbes = [
     const after = (await drv.query(`select current_user as u`))[0].u;
     assert.equal(after, before, `current_user after COMMIT is "${after}", expected "${before}"`);
   }),
+  rlsProbe("rls.set_local_role_rolled_back", "SET LOCAL ROLE and a session SET ROLE made in a rolled-back transaction do not survive it", async (drv, t, role) => {
+    const before = (await drv.query(`select current_user as u`))[0].u;
+    await inRolledBackTx(drv, async (tx) => {
+      await tx.execute(`set local role ${role}`);
+      assert.equal((await tx.query(`select current_user as u`))[0].u, role, "role assumed inside the transaction");
+    });
+    const afterLocal = (await drv.query(`select current_user as u`))[0].u;
+    assert.equal(afterLocal, before, `current_user after ROLLBACK of SET LOCAL ROLE is "${afterLocal}", expected "${before}"`);
+    await inRolledBackTx(drv, (tx) => tx.execute(`set role ${role}`));
+    const afterSession = (await drv.query(`select current_user as u`))[0].u;
+    assert.equal(afterSession, before, `current_user after ROLLBACK of SET ROLE is "${afterSession}", expected "${before}"`);
+  }),
+  rlsProbe("rls.set_local_setting_transaction_local", "SET LOCAL <setting> reverts at COMMIT and at ROLLBACK", async (drv) => {
+    const show = async () => String((await drv.query(`show search_path`))[0].search_path).replace(/["\s]/g, "");
+    const before = await show();
+    await drv.begin(async (tx) => {
+      await tx.execute(`set local search_path = n1_elsewhere`);
+      const inside = String((await tx.query(`show search_path`))[0].search_path);
+      assert.equal(inside, "n1_elsewhere", "setting applied inside the transaction");
+    });
+    assert.equal(await show(), before, "search_path survived COMMIT");
+    await inRolledBackTx(drv, (tx) => tx.execute(`set local search_path = n1_elsewhere`));
+    assert.equal(await show(), before, "search_path survived ROLLBACK");
+  }),
+  rlsProbe("rls.set_session_setting_transaction_scope", "a session-level SET inside a transaction persists at COMMIT and reverts at ROLLBACK", async (drv) => {
+    const show = async () => String((await drv.query(`show search_path`))[0].search_path).replace(/["\s]/g, "");
+    const before = await show();
+    await inRolledBackTx(drv, (tx) => tx.execute(`set search_path = n1_elsewhere`));
+    assert.equal(await show(), before, "session SET survived ROLLBACK");
+    await drv.begin((tx) => tx.execute(`set search_path = n1_kept`));
+    assert.equal(await show(), "n1_kept", "session SET did not persist at COMMIT");
+    await drv.execute(`reset search_path`);
+  }),
   rlsProbe("rls.privilege_denied_without_grant", "a role without a grant gets 42501 on read", async (drv, t, role) => {
     await setup(drv, [`create table ${t}_secret (id int primary key)`]);
     await expectState(() => asRole(drv, role, undefined, (tx) => tx.query(`select * from ${t}_secret`)), "42501", "select without grant");

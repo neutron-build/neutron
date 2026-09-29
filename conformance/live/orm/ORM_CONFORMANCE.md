@@ -49,19 +49,19 @@ is re-recorded and reviewed.
 | fact | value |
 |---|---|
 | engine | PostgreSQL 16.0 (Nucleus 1.0.2 — The Definitive Database) |
-| source commit (`--write` run) | `8bc0f2b51eeaa6337217190bb093c42697f780de` |
-| `nucleus/` tree SHA (the engine identity) | `3313729ae51300b67b77b2181ee87ac5287dfdec` |
-| binary SHA-256 (provenance only; release builds are not bit-reproducible) | `4a2d5b1723065342d73dc44e77ce526d4e92d4a2c176d97b6ac1fdaffe8d12f4` |
+| source commit (`--write` run) | `081183f948523bf3092fa30392759467fc733187` |
+| `nucleus/` tree SHA (the engine identity) | `665c76c18ac3f6edb142e6d6950ac53b9d7fa583` |
+| binary SHA-256 (provenance only; release builds are not bit-reproducible) | `106b1b5937f5ba02094b5352b5e71a2deb60d3b88eba179adbc3ba2e6ddbaa27` |
 | drivers | `pg` 8.22.0, `postgres` 3.4.8 |
 | runtime | Node v22.23.2, `@neutron-build/sql` 0.1.0 |
-| recorded | 2026-09-24 |
+| recorded | 2026-09-29 |
 
 ### Totals
 
 | driver | probes | supported | unsupported | unknown |
 |---|---|---|---|---|
-| `pg` | 140 | 71 | 68 | 1 |
-| `postgres` | 140 | 70 | 69 | 1 |
+| `pg` | 143 | 76 | 66 | 1 |
+| `postgres` | 143 | 75 | 67 | 1 |
 
 Driver-divergent verdicts: `relation.any_array_param` (pg supported, postgres unsupported).
 
@@ -76,7 +76,7 @@ Driver-divergent verdicts: `relation.any_array_param` (pg supported, postgres un
 | codec | 19 | 9 / 10 / 0 | 9 / 10 / 0 |
 | catalog | 14 | 2 / 12 / 0 | 2 / 12 / 0 |
 | ddl | 11 | 3 / 8 / 0 | 3 / 8 / 0 |
-| rls | 9 | 3 / 5 / 1 | 3 / 5 / 1 |
+| rls | 12 | 8 / 3 / 1 | 8 / 3 / 1 |
 | locks | 11 | 3 / 8 / 0 | 3 / 8 / 0 |
 | transactions | 7 | 4 / 3 / 0 | 4 / 3 / 0 |
 | orm | 19 | 11 / 8 / 0 | 11 / 8 / 0 |
@@ -184,7 +184,7 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | probe | pg | postgres | SQLSTATE | evidence |
 |---|---|---|---|---|
 | `catalog.information_schema_columns` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected [ [ 'id', |
-| `catalog.pg_class_relations` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected + [] - [ - 'x00k_b86339_child_id_seq', |
+| `catalog.pg_class_relations` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected + [] - [ - 'x00k_b216b2_child_id_seq', |
 | `catalog.introspect_relations_query` | unsupported | unsupported |  | wrong result: sequence row 0 !== 1 |
 | `catalog.pg_attribute_types` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected ... Skipped lines [ [ |
 | `catalog.format_type` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected [ 'bigint', - 'character varying(20)', |
@@ -204,7 +204,7 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 |---|---|---|---|---|
 | `ddl.create_table_rollback` | unsupported | unsupported |  | wrong result: table must not survive ROLLBACK true !== false |
 | `ddl.alter_add_column_rollback` | unsupported | unsupported |  | wrong result: column must not survive ROLLBACK true !== false |
-| `ddl.drop_table_rollback` | unsupported | unsupported | 42P01 | server error: ServerSqlError [42P01]: pg: relation "x00d_5c2667_base" does not exist |
+| `ddl.drop_table_rollback` | unsupported | unsupported | 42P01 | server error: ServerSqlError [42P01]: pg: relation "x00d_9a55bb_base" does not exist |
 | `ddl.create_index_rollback` | unsupported | unsupported |  | wrong result: index relation must not survive ROLLBACK true !== false |
 | `ddl.rename_column_rollback` | unsupported | unsupported |  | wrong result: original column name must be back false !== true |
 | `ddl.failed_migration_all_or_nothing` | unsupported | unsupported |  | wrong result: first CREATE TABLE must be rolled back true !== false |
@@ -219,13 +219,16 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | probe | pg | postgres | SQLSTATE | evidence |
 |---|---|---|---|---|
 | `rls.policy_filters_rows` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: unsupported row-security predicate 'current_setting('app.tenant')::INT'; supported forms are boolean constants, column equality to a lite… |
-| `rls.current_user_policy` | unsupported | unsupported |  | wrong result: superuser creator still sees all rows 1 !== 3 |
+| `rls.current_user_policy` | supported | supported |  |  |
 | `rls.with_check_blocks_insert` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: unsupported row-security predicate 'current_setting('app.tenant')::INT'; supported forms are boolean constants, column equality to a lite… |
 | `rls.no_policy_default_deny` | supported | supported |  |  |
-| `rls.owner_bypass_unless_forced` | unknown | unknown |  | setup failed: ServerSqlError [0A000]: pg: ALTER TABLE operation not yet supported: OWNER TO x00s_45a004_app — in: alter table x00s_45a004_docs owner to x00s_45a004_app |
+| `rls.owner_bypass_unless_forced` | unknown | unknown |  | setup failed: ServerSqlError [0A000]: pg: ALTER TABLE operation not yet supported: OWNER TO x00s_191fbc_app — in: alter table x00s_191fbc_docs owner to x00s_191fbc_app |
 | `rls.set_config_transaction_local` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: unknown function: SET_CONFIG |
 | `rls.pg_policies_introspection` | supported | supported |  |  |
-| `rls.set_local_role_transaction_local` | unsupported | unsupported |  | wrong result: current_user after COMMIT is "x00s_51fe64_app", expected "nucleus" + actual - expected + 'x00s_51fe64_app' - 'nucleus' |
+| `rls.set_local_role_transaction_local` | supported | supported |  |  |
+| `rls.set_local_role_rolled_back` | supported | supported |  |  |
+| `rls.set_local_setting_transaction_local` | supported | supported |  |  |
+| `rls.set_session_setting_transaction_scope` | supported | supported |  |  |
 | `rls.privilege_denied_without_grant` | supported | supported |  |  |
 
 #### locks
@@ -340,8 +343,8 @@ experimental.
    `current_setting('app.tenant')` policy idiom is rejected at
    `CREATE POLICY` (only a restricted predicate list is accepted, see
    [`nucleus/RLS_SECURITY.md`](../../../nucleus/RLS_SECURITY.md)),
-   `set_config` and `ALTER TABLE ... OWNER TO` are missing, and `SET LOCAL`
-   is not transaction-scoped for roles or settings (N1). Default-deny,
+   `set_config` and `ALTER TABLE ... OWNER TO` are missing (`SET LOCAL` roles
+   and settings are transaction-scoped since N1 was closed, X07). Default-deny,
    `pg_policies` and grant enforcement work.
 
 ## Engine defects and upstream reproducers
@@ -352,7 +355,27 @@ against a disposable engine and, as the oracle, a throwaway PostgreSQL 17
 database. Source locations are the suspected sites, for the engine owners to
 confirm; this report changes no engine code.
 
-### N1 — `SET LOCAL` is not transaction-scoped; `RESET ROLE` is a no-op (security)
+### N1 — `SET LOCAL` is not transaction-scoped; `RESET ROLE` is a no-op (security) — CLOSED (X07)
+
+**Closed by orm-program X07** (commit `081183f9`; `nucleus/` tree recorded
+above). The table below is the defect as measured on Nucleus 1.0.2, tree
+`3313729a`; every row now matches PostgreSQL 17. `Session::guc_txn` records
+per-transaction `SET` state (BEGIN snapshot, values `SET LOCAL` displaced,
+a snapshot per savepoint); COMMIT restores the displaced values and keeps
+session-level changes, ROLLBACK (also COMMIT of an aborted transaction, pool
+return and disconnect) restores the BEGIN snapshot, `ROLLBACK TO SAVEPOINT`
+restores the savepoint's. `RESET ROLE`, `RESET ALL` and `DISCARD ALL` drop an
+assumed role; `SET LOCAL` outside a transaction block warns and does nothing.
+Evidence: engine regressions in
+`nucleus/src/executor/tests/test_set_local_scope.rs`; probes
+`rls.set_local_role_transaction_local`, `rls.set_local_role_rolled_back`,
+`rls.set_local_setting_transaction_local`,
+`rls.set_session_setting_transaction_scope` unsupported before, supported
+after (and on PostgreSQL 17.11); the reproducer below prints the PostgreSQL
+result on the fixed engine. `rls.current_user_policy`, recorded unsupported
+because the leaked role reached the next statement, is now supported. Still
+open in the same area: `set_config(..., true)` does not exist (probe
+`rls.set_config_transaction_local`), so it cannot leak but is unusable.
 
 Reproducer: [`upstream/N1-set-local-role.sql`](upstream/N1-set-local-role.sql).
 Probe: `rls.set_local_role_transaction_local`.
