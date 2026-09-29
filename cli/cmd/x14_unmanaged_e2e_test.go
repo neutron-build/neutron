@@ -225,3 +225,23 @@ func TestX14PullKeepsUnmanagedMarker(t *testing.T) {
 		}
 	}
 }
+
+func TestX14PullRefusesInvalidPreviousDocument(t *testing.T) {
+	bin := buildCLIBinary(t)
+	doc := filepath.Join(t.TempDir(), "schema.json")
+	dbURL, fx := newM02CommandDB(t, "x14invalid")
+	x14Exec(t, fx, `CREATE TABLE k (id int PRIMARY KEY)`)
+	// A damaged document may contain ownership markers that cannot be read.
+	// Pull must preserve it and refuse rather than silently taking ownership.
+	previous := `{"version":2,"tables":[{"managed":false` + "\n"
+	if err := os.WriteFile(doc, []byte(previous), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, out := runCLIProcess(t, bin, dbURL, "schema", "pull", "--out", doc)
+	if code == 0 || !strings.Contains(out, "previous schema") {
+		t.Fatalf("want a refusal to read the previous schema (%d):\n%s", code, out)
+	}
+	if got := readFile(t, doc); got != previous {
+		t.Fatalf("pull overwrote the invalid ownership document: %q", got)
+	}
+}

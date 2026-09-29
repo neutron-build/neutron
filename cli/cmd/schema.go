@@ -81,7 +81,9 @@ table you own, or keep that database off the schema document workflow.
 Introspection never infers ownership: every object it lists is written managed: true,
 except that an object the existing document at --out marks managed: false (neutron
 never creates, alters or drops it, and does not compare it) keeps that marker, with its
-content refreshed from the database. Pull never modifies the database.`,
+content refreshed from the database. If the existing document cannot be read or
+validated, pull refuses to overwrite it because its ownership markers cannot be
+preserved. Pull never modifies the database.`,
 	RunE: func(cmd *cobra.Command, args []string) error { return reportRunE(runSchemaPull(cmd, args)) },
 }
 
@@ -197,7 +199,11 @@ func runSchemaPull(cmd *cobra.Command, args []string) error {
 		return withInternalReferenceOptions(err)
 	}
 	var keptUnmanaged []string
-	if prev, err := loadSchemaDocument(out); err == nil && prev.V2 != nil {
+	prev, err := loadSchemaDocument(out)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read previous schema before preserving ownership: %w", err)
+	}
+	if err == nil && prev.V2 != nil {
 		if doc, keptUnmanaged, err = db.PreserveUnmanaged(doc, prev.V2); err != nil {
 			return err
 		}
