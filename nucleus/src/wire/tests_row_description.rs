@@ -94,12 +94,7 @@ fn data_row_values(payload: &[u8]) -> Vec<Option<&[u8]>> {
     let mut out = Vec::with_capacity(n);
     let mut i = 2;
     for _ in 0..n {
-        let len = i32::from_be_bytes([
-            payload[i],
-            payload[i + 1],
-            payload[i + 2],
-            payload[i + 3],
-        ]);
+        let len = i32::from_be_bytes([payload[i], payload[i + 1], payload[i + 2], payload[i + 3]]);
         if len < 0 {
             out.push(None);
         } else {
@@ -174,9 +169,12 @@ async fn drain(stream: &mut tokio::net::TcpStream) -> Answer {
             b'n' => answer.fields = Some(Vec::new()),
             b'D' => {
                 answer.row_widths.push(data_row_width(&m.payload));
-                answer
-                    .values
-                    .push(data_row_values(&m.payload).into_iter().map(|v| v.map(Into::into)).collect());
+                answer.values.push(
+                    data_row_values(&m.payload)
+                        .into_iter()
+                        .map(|v| v.map(Into::into))
+                        .collect(),
+                );
             }
             b'E' => answer.errors.push(error_text(&m.payload)),
             b'Z' => return answer,
@@ -392,11 +390,7 @@ async fn integer_payloads_honor_the_declared_format() {
         .expect("connect");
     startup(&mut client).await;
 
-    let setup = simple_query(
-        &mut client,
-        "CREATE TABLE fmt_t (a INT, b BIGINT)",
-    )
-    .await;
+    let setup = simple_query(&mut client, "CREATE TABLE fmt_t (a INT, b BIGINT)").await;
     assert!(setup.errors.is_empty(), "setup: {:?}", setup.errors);
     for (a, b) in [(7i64, i64::MAX), (-123, i64::MIN), (0, 0)] {
         let r = simple_query(
@@ -413,10 +407,7 @@ async fn integer_payloads_honor_the_declared_format() {
     // Every text-declaring mode must ship ASCII decimal, and nothing else.
     let text_answers = vec![
         ("simple", simple_query(&mut client, sql).await),
-        (
-            "extended-default",
-            extended_query(&mut client, sql).await,
-        ),
+        ("extended-default", extended_query(&mut client, sql).await),
         (
             "extended-text",
             extended_query_formats(&mut client, sql, &[0]).await,
@@ -450,12 +441,12 @@ async fn integer_payloads_honor_the_declared_format() {
         "declared {formats:?}, want all binary"
     );
     let expected: [(&[u8], &[u8]); 3] = [
-        (
-            &[0xff, 0xff, 0xff, 0x85],
-            &[0x80, 0, 0, 0, 0, 0, 0, 0],
-        ),
+        (&[0xff, 0xff, 0xff, 0x85], &[0x80, 0, 0, 0, 0, 0, 0, 0]),
         (&[0, 0, 0, 0], &[0; 8]),
-        (&[0, 0, 0, 7], &[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+        (
+            &[0, 0, 0, 7],
+            &[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+        ),
     ];
     for (row, (want_a, want_b)) in binary.values.iter().zip(expected) {
         assert_eq!(row[0].as_deref(), Some(want_a), "binary int4 payload");

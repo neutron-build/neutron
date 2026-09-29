@@ -119,7 +119,11 @@ async fn compaction_reclaims_mints_and_survives_reopen() {
     {
         let (ex, adapter) = open(dir.path());
         let ids = visible_ids(&ex, "t").await;
-        assert_eq!(ids, vec![0, 1, 2, 3, 4, 99], "reopen changed the logical state");
+        assert_eq!(
+            ids,
+            vec![0, 1, 2, 3, 4, 99],
+            "reopen changed the logical state"
+        );
         let physical = adapter.scan_physical("t").await.unwrap();
         assert!(
             physical.iter().all(|(idx, _)| *idx < 5 || *idx >= 10),
@@ -163,7 +167,10 @@ async fn compaction_keeps_live_ids_stable_across_updates_and_reopen() {
         // above the dead one. No live row moved.
         let live: Vec<usize> = physical.iter().map(|(i, _)| *i).collect();
         assert!(live.contains(&0) && live.contains(&2) && live.contains(&3));
-        assert!(live.iter().all(|i| *i != 4), "dead slot 4 must be gone or stay dead");
+        assert!(
+            live.iter().all(|i| *i != 4),
+            "dead slot 4 must be gone or stay dead"
+        );
     }
     {
         let (ex, _adapter) = open(dir.path());

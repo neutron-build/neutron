@@ -62,11 +62,9 @@ async fn commit_time_policy_persist_failure_never_wipes_or_leaks() {
     ex.execute("ALTER TABLE guarded ENABLE ROW LEVEL SECURITY")
         .await
         .expect("enable rls");
-    ex.execute(
-        "CREATE POLICY other_policy ON guarded TO PUBLIC USING (owner = CURRENT_USER)",
-    )
-    .await
-    .expect("committed policy");
+    ex.execute("CREATE POLICY other_policy ON guarded TO PUBLIC USING (owner = CURRENT_USER)")
+        .await
+        .expect("committed policy");
 
     // The transaction stages its own policy plus a data row, then COMMITs:
     // the storage commit succeeds, publication happens, and the meta.json
@@ -91,7 +89,10 @@ async fn commit_time_policy_persist_failure_never_wipes_or_leaks() {
 
     // The transaction's data committed (the commit decision preceded the
     // persist attempt) — the surfaced error is about durability, not data.
-    let mut r = ex.execute("SELECT COUNT(*) FROM guarded").await.expect("count");
+    let mut r = ex
+        .execute("SELECT COUNT(*) FROM guarded")
+        .await
+        .expect("count");
     match r.pop().unwrap() {
         nucleus::executor::ExecResult::Select { rows, .. } => assert_eq!(
             rows[0][0],
@@ -101,7 +102,9 @@ async fn commit_time_policy_persist_failure_never_wipes_or_leaks() {
         other => panic!("expected SELECT, got {other:?}"),
     }
     // The session is idle and usable after the failed COMMIT.
-    ex.execute_with_session(sid, "SELECT 1").await.expect("idle");
+    ex.execute_with_session(sid, "SELECT 1")
+        .await
+        .expect("idle");
 
     // In memory: the other session's policy survived, the transaction's own
     // staged policy was un-published with the error.

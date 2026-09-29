@@ -18,7 +18,9 @@
 //! * `VACUUM` — reclaims space inside the data files.
 //! * `CHECKPOINT` — flushes and truncates WAL segments.
 
-use sqlparser::ast::{self, Visit, Statement};
+use sqlparser::ast::Statement;
+#[cfg(feature = "server")]
+use sqlparser::ast::{self, Visit};
 
 use super::{ExecError, Executor};
 
@@ -184,11 +186,14 @@ fn side_effecting(_fname: &str) -> bool {
 /// time and therefore must see the mutation in the AST — the eval-time guard
 /// (`scalar_fns.rs`'s degraded-mode check) fires too late to WAIT, and a
 /// sync eval cannot take the async gate.
+#[cfg(feature = "server")]
 struct MutatingFnVisitor {
     found: bool,
 }
 
-impl sqlparser::ast::Visitor for MutatingFnVisitor {    type Break = ();
+#[cfg(feature = "server")]
+impl sqlparser::ast::Visitor for MutatingFnVisitor {
+    type Break = ();
 
     fn pre_visit_expr(&mut self, expr: &ast::Expr) -> std::ops::ControlFlow<Self::Break> {
         if let ast::Expr::Function(func) = expr {

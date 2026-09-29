@@ -547,88 +547,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-// ── Preflight: a rejected restore never touches the destination (A23) ──
+    // ── Preflight: a rejected restore never touches the destination (A23) ──
 
-/// Rejections that can be decided up front (target older than the base,
-/// missing time index) must fire BEFORE the base replaces the destination —
-/// the old order swapped the destination to the base first and only then
-/// refused, so a "failed" PITR had already destroyed the target directory.
-#[test]
-fn pitr_rejections_leave_the_destination_untouched() {
-    let root = tmp("preflight");
-    let _ = std::fs::remove_dir_all(&root);
-    let data = root.join("data");
-    std::fs::create_dir_all(&data).unwrap();
-    // A WAL with real records, so the base backup records consistent_lsn > 0.
-    let w = SegmentedWal::open(&data.join("nucleus.wal.d"), 10 * 1024 * 1024).unwrap();
-    let mut last = 0;
-    for i in 0..10u32 {
-        last = w.log_page_write(1, i, &page_with((i % 7) as u8 + 1)).unwrap();
+    /// Rejections that can be decided up front (target older than the base,
+    /// missing time index) must fire BEFORE the base replaces the destination —
+    /// the old order swapped the destination to the base first and only then
+    /// refused, so a "failed" PITR had already destroyed the target directory.
+    #[test]
+    fn pitr_rejections_leave_the_destination_untouched() {
+        let root = tmp("preflight");
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        // A WAL with real records, so the base backup records consistent_lsn > 0.
+        let w = SegmentedWal::open(&data.join("nucleus.wal.d"), 10 * 1024 * 1024).unwrap();
+        let mut last = 0;
+        for i in 0..10u32 {
+            last = w
+                .log_page_write(1, i, &page_with((i % 7) as u8 + 1))
+                .unwrap();
+        }
+        w.sync().unwrap();
+        drop(w);
+        let base = root.join("base");
+        let manifest = crate::backup::backup_data_dir(&data, &base, false, "0.1.1").unwrap();
+        assert!(
+            manifest.consistent_lsn >= last,
+            "fixture: base must be consistent at its WAL head ({} >= {})",
+            manifest.consistent_lsn,
+            last
+        );
+
+        // A distinct, existing destination the operator expects to survive a
+        // refused restore.
+        let dest = root.join("live_db");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("precious.txt"), b"still here").unwrap();
+        let no_archive = root.join("no_archive");
+
+        // (a) Target OLDER than the base: refused with InvalidInput.
+        let err = restore_pitr(
+            &base,
+            &no_archive,
+            PitrTarget::Lsn(manifest.consistent_lsn - 1),
+            &dest,
+            "nucleus.db",
+            "0.1.1",
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("only moves forward"), "{err}");
+        assert_eq!(
+            std::fs::read(dest.join("precious.txt")).unwrap(),
+            b"still here",
+            "a rejected restore must leave the destination untouched"
+        );
+
+        // (b) Time-based target with NO archive index: refused with NotFound,
+        // destination untouched.
+        std::fs::create_dir_all(&no_archive).unwrap();
+        let err = restore_pitr(
+            &base,
+            &no_archive,
+            PitrTarget::UnixSeconds(1_700_000_000),
+            &dest,
+            "nucleus.db",
+            "0.1.1",
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("archive index"), "{err}");
+        assert_eq!(
+            std::fs::read(dest.join("precious.txt")).unwrap(),
+            b"still here"
+        );
+
+        // No staging image debris after clean rejections.
+        let debris: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".pitr-image"))
+            .collect();
+        assert!(debris.is_empty(), "staging debris: {debris:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
-    w.sync().unwrap();
-    drop(w);
-    let base = root.join("base");
-    let manifest = crate::backup::backup_data_dir(&data, &base, false, "0.1.1").unwrap();
-    assert!(
-        manifest.consistent_lsn >= last,
-        "fixture: base must be consistent at its WAL head ({} >= {})",
-        manifest.consistent_lsn,
-        last
-    );
-
-    // A distinct, existing destination the operator expects to survive a
-    // refused restore.
-    let dest = root.join("live_db");
-    std::fs::create_dir_all(&dest).unwrap();
-    std::fs::write(dest.join("precious.txt"), b"still here").unwrap();
-    let no_archive = root.join("no_archive");
-
-    // (a) Target OLDER than the base: refused with InvalidInput.
-    let err = restore_pitr(
-        &base,
-        &no_archive,
-        PitrTarget::Lsn(manifest.consistent_lsn - 1),
-        &dest,
-        "nucleus.db",
-        "0.1.1",
-        true,
-    )
-    .unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    assert!(err.to_string().contains("only moves forward"), "{err}");
-    assert_eq!(
-        std::fs::read(dest.join("precious.txt")).unwrap(),
-        b"still here",
-        "a rejected restore must leave the destination untouched"
-    );
-
-    // (b) Time-based target with NO archive index: refused with NotFound,
-    // destination untouched.
-    std::fs::create_dir_all(&no_archive).unwrap();
-    let err = restore_pitr(
-        &base,
-        &no_archive,
-        PitrTarget::UnixSeconds(1_700_000_000),
-        &dest,
-        "nucleus.db",
-        "0.1.1",
-        true,
-    )
-    .unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::NotFound);
-    assert!(err.to_string().contains("archive index"), "{err}");
-    assert_eq!(
-        std::fs::read(dest.join("precious.txt")).unwrap(),
-        b"still here"
-    );
-
-    // No staging image debris after clean rejections.
-    let debris: Vec<_> = std::fs::read_dir(&root)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().contains(".pitr-image"))
-        .collect();
-    assert!(debris.is_empty(), "staging debris: {debris:?}");
-    let _ = std::fs::remove_dir_all(&root);
-}
 }

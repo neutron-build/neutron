@@ -790,7 +790,8 @@ async fn discard_all_refuses_inside_transaction_and_rollback_still_restores() {
         .await
         .expect_err("DISCARD ALL must refuse inside a transaction");
     assert!(
-        err.to_string().contains("cannot run inside a transaction block"),
+        err.to_string()
+            .contains("cannot run inside a transaction block"),
         "wrong refusal: {err}"
     );
 
@@ -916,8 +917,7 @@ async fn cancelled_statement_releases_depth_and_row_locks() {
     // waiting for A's lock on row 2 — mid-statement, at depth 1.
     let b = ex.create_session();
     let claim = ex.execute_with_session(b, "SELECT id FROM cl WHERE id IN (1, 2) FOR UPDATE");
-    let parked =
-        tokio::time::timeout(std::time::Duration::from_millis(300), claim).await;
+    let parked = tokio::time::timeout(std::time::Duration::from_millis(300), claim).await;
     assert!(parked.is_err(), "claim should be parked on A's row lock");
 
     // The dropped future must have returned the depth to zero...
@@ -963,8 +963,7 @@ async fn cancelled_statement_aborts_open_transaction() {
     let b = ex.create_session();
     ex.execute_with_session(b, "BEGIN").await.unwrap();
     let claim = ex.execute_with_session(b, "SELECT id FROM ca WHERE id = 2 FOR UPDATE");
-    let parked =
-        tokio::time::timeout(std::time::Duration::from_millis(300), claim).await;
+    let parked = tokio::time::timeout(std::time::Duration::from_millis(300), claim).await;
     assert!(parked.is_err(), "claim should be parked on A's row lock");
 
     let rejected = ex.execute_with_session(b, "SELECT 1").await;
@@ -1037,7 +1036,11 @@ async fn failed_commit_publishes_no_policy_and_keeps_other_sessions_changes() {
     let storage: std::sync::Arc<dyn crate::storage::StorageEngine> = adapter.clone();
     let ex = Executor::new(std::sync::Arc::new(crate::catalog::Catalog::new()), storage);
     exec(&ex, "CREATE TABLE guarded (id INT, owner TEXT)").await;
-    exec(&ex, "CREATE TABLE skew (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)").await;
+    exec(
+        &ex,
+        "CREATE TABLE skew (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)",
+    )
+    .await;
     exec(&ex, "INSERT INTO skew VALUES (1,1),(2,1)").await;
 
     // T stages policy DDL and its read half of the write skew.
@@ -1147,7 +1150,14 @@ async fn commit_merges_staged_policy_with_concurrent_committed_policy() {
 
     ex.execute_with_session(stager, "COMMIT").await.unwrap();
 
-    let names = rows(&exec(&ex, "SELECT policyname FROM pg_policies ORDER BY policyname").await[0]).clone();
+    let names = rows(
+        &exec(
+            &ex,
+            "SELECT policyname FROM pg_policies ORDER BY policyname",
+        )
+        .await[0],
+    )
+    .clone();
     let listed: Vec<String> = names
         .iter()
         .map(|r| match &r[0] {
@@ -1191,7 +1201,11 @@ async fn commit_merges_staged_policy_with_concurrent_rls_toggle() {
 
     // The staged policy published, and the concurrent disable survived it.
     assert!(
-        ex.security.read().rls.policy("guarded", "staged_p").is_some(),
+        ex.security
+            .read()
+            .rls
+            .policy("guarded", "staged_p")
+            .is_some(),
         "the staged policy must publish"
     );
     assert!(

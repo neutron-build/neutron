@@ -41,7 +41,6 @@ pub(super) fn text_of(result: ExecResult) -> String {
 }
 
 mod test_2pl_census; // R6: serializable anomaly census for the DISK engine (strict 2PL)
-mod test_upstream_teploy_2026_09_18; // rename-in-txn visibility + replacing upsert loss (2026-09-18 upstream reports)
 mod test_admin;
 mod test_aggregate_overflow_checked; // QPP-4 family: aggregate overflow errors on every path
 mod test_alter_policy; // N14: ALTER POLICY and policy introspection
@@ -77,8 +76,8 @@ mod test_memory_budget; // T1.2: query memory-budget enforcement (gating)
 mod test_meta_persistence;
 mod test_module_wiring;
 mod test_multimodel;
-mod test_mvcc_gc_compaction; // NU-01 tail compaction: reclaim dead tails, ids never reused (WAL v2 subset)
 mod test_mv_writetime; // Phase 3: Write-time materialized view refresh
+mod test_mvcc_gc_compaction; // NU-01 tail compaction: reclaim dead tails, ids never reused (WAL v2 subset)
 mod test_observability; // M11: observability ledger surfaces (CHECKPOINT, WAL/txn state, health)
 mod test_password_lifecycle; // N16: password creation, rotation, expiry
 mod test_pk_write_cost;
@@ -96,12 +95,12 @@ mod test_s33_executor_edges; // S33-11/S33-14: hash-join decline + SIMD case-ins
 mod test_scalar_fns;
 mod test_semi_anti_joins; // QPP-1a/QPP-12: SEMI/ANTI refusals + hash-join residual propagation
 mod test_session_limits; // per-session caps (row locks, PREPARE, cursors) + bounded-cache eviction churn
+mod test_snapshot_lease; // Consumer-2: cross-table snapshot lease + mutation-blocking window
 mod test_specialty_persistence;
 mod test_specialty_surface_guard; // N15: the specialty fail-closed guard, audited against the dispatcher
 mod test_spill_sweep; // B2: executor sweeps orphaned query-spill files on startup
 mod test_sql_wal_ack_durability; // R4: an acked autocommit SQL write is fsync-durable
 mod test_ssi_census; // B1: end-to-end SSI anomaly census (gate for MVCC scan changes)
-mod test_snapshot_lease; // Consumer-2: cross-table snapshot lease + mutation-blocking window
 mod test_streaming_aggregate; // Grace hash aggregation: bounded-memory GROUP BY with spill
 mod test_streaming_filter; // Phase 1.2 read-side: streaming WHERE filter (SIREAD-safe full scan)
 mod test_streaming_join; // Grace hash join: bounded-memory two-table equi-JOIN with spill
@@ -114,4 +113,5 @@ mod test_temporal_predicates; // mixed temporal literal/column comparisons
 mod test_temporal_range_cost; // S66: TIMESTAMP/DATE range predicates must prune // S65: UPDATE/DELETE by PK must not scan the table
 mod test_triggers; // EXE-2: row-binding tables must never touch user tables named _new/_old
 mod test_txn;
-mod test_txn_lazy_snapshot; // R8: BEGIN/SAVEPOINT do not clone the whole database // Phase 4: JSONB @> containment, GIN indexes, subscript syntax
+mod test_txn_lazy_snapshot;
+mod test_upstream_teploy_2026_09_18; // rename-in-txn visibility + replacing upsert loss (2026-09-18 upstream reports) // R8: BEGIN/SAVEPOINT do not clone the whole database // Phase 4: JSONB @> containment, GIN indexes, subscript syntax

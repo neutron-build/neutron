@@ -227,9 +227,7 @@ impl Executor {
         // changes survive) and surfaces the error. The rows are already
         // committed at that point; the error tells the caller the policy
         // change did not stick and must be re-run.
-        if policy_dirty
-            && let Some(pending) = security_pending
-        {
+        if policy_dirty && let Some(pending) = security_pending {
             let before = self.security.read().clone_policy_state();
             // A6: publish this session's DELTAS onto the live catalog, not the
             // staged whole-catalog clone. The clone was taken at this

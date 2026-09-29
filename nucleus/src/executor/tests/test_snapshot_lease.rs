@@ -21,8 +21,8 @@
 //! at acquisition (bounded by the lease's own TIMEOUT) plus an
 //! acquire-time snapshot refresh on versioning engines.
 
-use super::tests::{exec, rows, test_executor};
 use super::Executor;
+use super::tests::{exec, rows, test_executor};
 
 use crate::types::Value;
 
@@ -30,9 +30,9 @@ use crate::types::Value;
 /// server builds with a data directory, where two of the three reported
 /// defects lived.
 fn disk_executor(dir: &std::path::Path) -> Executor {
+    use crate::storage::StorageEngine;
     use crate::storage::buffered_engine::BufferedDiskEngine;
     use crate::storage::disk_engine::DiskEngine;
-    use crate::storage::StorageEngine;
     let catalog = std::sync::Arc::new(crate::catalog::Catalog::new());
     let disk = std::sync::Arc::new(DiskEngine::open(&dir.join("t.db"), catalog.clone()).unwrap());
     let engine: std::sync::Arc<dyn StorageEngine> =
@@ -43,11 +43,10 @@ fn disk_executor(dir: &std::path::Path) -> Executor {
 /// An executor over the in-memory versioning stack (`--memory` server
 /// shape, embedded `durable_mvcc`).
 fn mvcc_executor() -> Executor {
-    use crate::storage::mvcc::MvccStorageAdapter;
     use crate::storage::StorageEngine;
+    use crate::storage::mvcc::MvccStorageAdapter;
     let catalog = std::sync::Arc::new(crate::catalog::Catalog::new());
-    let engine: std::sync::Arc<dyn StorageEngine> =
-        std::sync::Arc::new(MvccStorageAdapter::new());
+    let engine: std::sync::Arc<dyn StorageEngine> = std::sync::Arc::new(MvccStorageAdapter::new());
     Executor::new(catalog, engine)
 }
 
@@ -121,8 +120,16 @@ async fn lease_gives_point_in_time_reads_and_blocks_then_releases_writers() {
         .execute_with_session(holder, "SELECT id FROM b ORDER BY id")
         .await
         .unwrap();
-    assert_eq!(rows(&a[0]).len(), 1, "holder sees the pre-write moment in a");
-    assert_eq!(rows(&b[0]).len(), 1, "holder sees the pre-write moment in b");
+    assert_eq!(
+        rows(&a[0]).len(),
+        1,
+        "holder sees the pre-write moment in a"
+    );
+    assert_eq!(
+        rows(&b[0]).len(),
+        1,
+        "holder sees the pre-write moment in b"
+    );
     let third = ex
         .execute_with_session(30, "SELECT COUNT(*) FROM a")
         .await
@@ -227,7 +234,10 @@ async fn rollback_releases_the_lease() {
     ex.execute_with_session(6, "ACQUIRE SNAPSHOT LEASE TIMEOUT 60000")
         .await
         .unwrap();
-    let show = ex.execute_with_session(6, "SHOW SNAPSHOT LEASE").await.unwrap();
+    let show = ex
+        .execute_with_session(6, "SHOW SNAPSHOT LEASE")
+        .await
+        .unwrap();
     assert_eq!(rows(&show[0])[0][0], Value::Int64(6));
 }
 
@@ -396,10 +406,7 @@ async fn mutating_scalar_calls_in_where_pg_catalog_and_collections_also_gate() {
 
     ex.execute_with_session(holder, "COMMIT").await.unwrap();
     writes.await.expect("writer task panicked");
-    let member = ex
-        .execute("SELECT KV_SCARD('lease:s')")
-        .await
-        .unwrap();
+    let member = ex.execute("SELECT KV_SCARD('lease:s')").await.unwrap();
     assert_eq!(
         i64_of(&member[0]),
         1,
@@ -429,7 +436,9 @@ async fn acquire_drains_parked_writers_so_uncommitted_rows_never_enter_the_windo
     // Park an uncommitted INSERT (the observe shape: an ingest transaction
     // in flight when the backup starts).
     ex.execute_with_session(writer, "BEGIN").await.unwrap();
-    ex.execute_with_session(writer, "INSERT INTO ev VALUES (1)").await.unwrap();
+    ex.execute_with_session(writer, "INSERT INTO ev VALUES (1)")
+        .await
+        .unwrap();
 
     ex.execute_with_session(holder, "BEGIN").await.unwrap();
     let acquire = {
@@ -461,7 +470,9 @@ async fn acquire_drains_parked_writers_so_uncommitted_rows_never_enter_the_windo
     ex.execute_with_session(holder, "COMMIT").await.unwrap();
     assert_eq!(count_of(&ex, writer, "ev").await, 0);
     ex.execute_with_session(writer, "BEGIN").await.unwrap();
-    ex.execute_with_session(writer, "INSERT INTO ev VALUES (2)").await.unwrap();
+    ex.execute_with_session(writer, "INSERT INTO ev VALUES (2)")
+        .await
+        .unwrap();
     ex.execute_with_session(writer, "COMMIT").await.unwrap();
     ex.execute_with_session(holder, "BEGIN").await.unwrap();
     ex.execute_with_session(holder, "ACQUIRE SNAPSHOT LEASE TIMEOUT 30000")
@@ -500,7 +511,9 @@ async fn mid_window_commit_cannot_advance_the_holder_moment() {
     let writer = ex.create_session();
 
     ex.execute_with_session(writer, "BEGIN").await.unwrap();
-    ex.execute_with_session(writer, "INSERT INTO t VALUES (1)").await.unwrap();
+    ex.execute_with_session(writer, "INSERT INTO t VALUES (1)")
+        .await
+        .unwrap();
 
     ex.execute_with_session(holder, "BEGIN").await.unwrap();
     let acquire = {
@@ -556,7 +569,9 @@ async fn acquire_pins_to_the_acquire_moment_not_begin_on_versioning_engines() {
 
     ex.execute_with_session(holder, "BEGIN").await.unwrap();
     // Committed AFTER the holder's BEGIN, BEFORE its ACQUIRE.
-    ex.execute_with_session(writer, "INSERT INTO t VALUES (1)").await.unwrap();
+    ex.execute_with_session(writer, "INSERT INTO t VALUES (1)")
+        .await
+        .unwrap();
 
     ex.execute_with_session(holder, "ACQUIRE SNAPSHOT LEASE TIMEOUT 30000")
         .await
@@ -596,7 +611,9 @@ async fn acquire_times_out_behind_a_writer_that_never_drains() {
     let writer = ex.create_session();
 
     ex.execute_with_session(writer, "BEGIN").await.unwrap();
-    ex.execute_with_session(writer, "INSERT INTO t VALUES (1)").await.unwrap();
+    ex.execute_with_session(writer, "INSERT INTO t VALUES (1)")
+        .await
+        .unwrap();
 
     ex.execute_with_session(holder, "BEGIN").await.unwrap();
     let err = ex
@@ -608,10 +625,7 @@ async fn acquire_times_out_behind_a_writer_that_never_drains() {
         "error must name the drain: {err}"
     );
     // The failed acquisition holds no lease.
-    let show = ex
-        .execute("SHOW SNAPSHOT LEASE")
-        .await
-        .unwrap();
+    let show = ex.execute("SHOW SNAPSHOT LEASE").await.unwrap();
     assert!(rows(&show[0]).is_empty());
     ex.execute_with_session(writer, "ROLLBACK").await.unwrap();
 }
@@ -626,7 +640,9 @@ async fn acquire_refuses_a_write_bearing_transaction() {
     exec(&ex, "CREATE TABLE t (id INT)").await;
     let holder = ex.create_session();
     ex.execute_with_session(holder, "BEGIN").await.unwrap();
-    ex.execute_with_session(holder, "INSERT INTO t VALUES (1)").await.unwrap();
+    ex.execute_with_session(holder, "INSERT INTO t VALUES (1)")
+        .await
+        .unwrap();
     let err = ex
         .execute_with_session(holder, "ACQUIRE SNAPSHOT LEASE TIMEOUT 30000")
         .await
@@ -689,10 +705,7 @@ async fn backup_under_lease_is_one_moment_across_models() {
     for _ in 0..2 {
         assert_eq!(count_of(&ex, holder, "heap_t").await, 1);
         assert_eq!(count_of(&ex, holder, "mt_t").await, 1);
-        assert_eq!(
-            kv_get(&ex, holder, "bk:x").await,
-            Value::Text("one".into())
-        );
+        assert_eq!(kv_get(&ex, holder, "bk:x").await, Value::Text("one".into()));
     }
 
     ex.execute_with_session(holder, "COMMIT").await.unwrap();
@@ -700,8 +713,5 @@ async fn backup_under_lease_is_one_moment_across_models() {
     // After release the writes are all visible.
     assert_eq!(count_of(&ex, writer, "heap_t").await, 2);
     assert_eq!(count_of(&ex, writer, "mt_t").await, 2);
-    assert_eq!(
-        kv_get(&ex, writer, "bk:x").await,
-        Value::Text("two".into())
-    );
+    assert_eq!(kv_get(&ex, writer, "bk:x").await, Value::Text("two".into()));
 }

@@ -229,8 +229,9 @@ async fn version_ids_are_stable_across_restarts_and_never_reused() {
         "ids must be strictly increasing, got {ids:?}"
     );
     assert!(
-        t.rows.iter().all(|(id, row)| (*id as usize) < t.next_version_id as usize
-            || !row.is_empty()),
+        t.rows
+            .iter()
+            .all(|(id, row)| (*id as usize) < t.next_version_id as usize || !row.is_empty()),
         "every live id sits below the floor",
     );
     assert!(t.next_version_id > *ids.iter().max().unwrap());

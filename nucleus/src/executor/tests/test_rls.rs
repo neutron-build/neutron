@@ -626,7 +626,9 @@ async fn bypassrls_bypasses_rows_but_not_grants_or_masks() {
     .await;
 
     let sid = ex.create_session();
-    ex.bind_authenticated_session(sid, "freepass").await.unwrap();
+    ex.bind_authenticated_session(sid, "freepass")
+        .await
+        .unwrap();
 
     // (a) No grant: denied, exactly as for any non-superuser.
     let err = exec_session(&ex, sid, "SELECT id FROM guarded").await;
@@ -646,7 +648,11 @@ async fn bypassrls_bypasses_rows_but_not_grants_or_masks() {
     let result = exec_session(&ex, sid, "SELECT id FROM guarded ORDER BY id")
         .await
         .unwrap();
-    assert_eq!(rows(&result[0]).len(), 2, "BYPASSRLS must bypass row policies");
+    assert_eq!(
+        rows(&result[0]).len(),
+        2,
+        "BYPASSRLS must bypass row policies"
+    );
 
     // (c) Masking still applies: the mask is a per-role VALUE policy, and row
     // bypass is not a license to read masked columns.
@@ -714,11 +720,7 @@ async fn in_subquery_membership_never_crosses_tenants_of_one_principal() {
     let rows_b = fut_b.await.expect("tenant-b executes fine");
     let rows_a = fut_a.await.expect("tenant-a executes fine");
 
-    assert_eq!(
-        rows(&rows_b[0]).len(),
-        1,
-        "tenant-b sees only its own row"
-    );
+    assert_eq!(rows(&rows_b[0]).len(), 1, "tenant-b sees only its own row");
     assert_eq!(
         rows(&rows_a[0]).len(),
         2,

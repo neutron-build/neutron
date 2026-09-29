@@ -101,6 +101,7 @@ impl Executor {
     /// shape. The catalog is the durable record (`record_table_engine`); the
     /// sidecar is a cache of it, so a missing sidecar entry must not mean
     /// "plain heap table" when the catalog says otherwise.
+    #[cfg(feature = "server")]
     fn catalog_engine_meta(&self, table: &str) -> Option<TableEngineMeta> {
         let spec = self.catalog.table_engine(table)?;
         Some(TableEngineMeta {
