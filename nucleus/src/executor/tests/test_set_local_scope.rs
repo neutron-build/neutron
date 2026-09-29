@@ -449,3 +449,106 @@ async fn commit_inside_a_message_ends_the_block_and_the_next_statement_opens_one
     assert_eq!(text_of(r.remove(3)), "n1_other");
     assert_eq!(user(&ex, sid).await, login);
 }
+
+// ---------------------------------------------------------------------
+// Review-3 (explicit BEGIN under cancellation, error after COMMIT, panic)
+// ---------------------------------------------------------------------
+
+/// The guard must stay out of the way when the message opened an explicit
+/// transaction: the frame belongs to that transaction (aborted by the
+/// cancellation) and ROLLBACK ends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_message_with_explicit_begin_leaves_the_transaction_to_rollback() {
+    let (ex, sid) = fixture().await;
+    exec(&ex, "CREATE TABLE n1_rows (id INT PRIMARY KEY, v INT)").await;
+    exec(&ex, "INSERT INTO n1_rows VALUES (1, 1)").await;
+    exec(&ex, "GRANT SELECT, UPDATE ON n1_rows TO n1_app").await;
+    let login = user(&ex, sid).await;
+
+    let holder = ex.create_session();
+    sql(&ex, holder, "BEGIN").await;
+    sql(
+        &ex,
+        holder,
+        "SELECT id FROM n1_rows WHERE id = 1 FOR UPDATE",
+    )
+    .await;
+
+    let blocked = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        ex.execute_with_session(
+            sid,
+            "BEGIN; SET LOCAL ROLE n1_app; SELECT id FROM n1_rows WHERE id = 1 FOR UPDATE",
+        ),
+    )
+    .await;
+    assert!(blocked.is_err());
+    assert!(
+        ex.session_in_transaction(sid),
+        "the explicit transaction stays open for the client to end"
+    );
+    sql(&ex, sid, "ROLLBACK").await;
+    assert_eq!(user(&ex, sid).await, login);
+    assert!(!ex.session_in_transaction(sid));
+    sql(&ex, holder, "ROLLBACK").await;
+}
+
+/// An error after an in-message COMMIT rolls back only the second implicit
+/// block: the first block's session SET was committed and stays.
+#[tokio::test]
+async fn error_after_an_in_message_commit_reverts_only_the_second_block() {
+    let (ex, sid) = fixture().await;
+    let login = user(&ex, sid).await;
+    sql(&ex, sid, "SET app.tenant = 'base'").await;
+
+    let failed = ex
+        .execute_with_session(
+            sid,
+            "SET app.tenant = 'first'; COMMIT; SET app.tenant = 'second'; \
+             SET ROLE n1_app; SELECT * FROM no_such_table",
+        )
+        .await;
+    assert!(failed.is_err());
+    assert_eq!(show(&ex, sid, "app.tenant").await, "'first'");
+    assert_eq!(user(&ex, sid).await, login);
+}
+
+/// Panic path: unwinding runs the guard's `Drop`, which restores the SET
+/// state and the security context. A statement that panics on purpose is not
+/// available in the engine (the fault layer's catch_unwind wraps subsystems,
+/// not the dispatch), so the guard is driven directly and unwound with a real
+/// panic; the cancellation tests above cover the same `Drop` from a dropped
+/// future.
+#[tokio::test]
+async fn panic_unwinding_through_the_guard_restores_state() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let (ex, sid) = fixture().await;
+    let login = user(&ex, sid).await;
+    let session = ex.get_session(sid);
+
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let mut block = super::super::ImplicitSetBlock::new(&ex, session.clone(), true);
+        block.open_if_needed();
+        session.guc_note_role(true);
+        *session.current_role.write() = Some("n1_app".into());
+        session.guc_note_setting("app.tenant", true);
+        session
+            .settings
+            .write()
+            .insert("app.tenant".into(), "'x'".into());
+        ex.recompute_session_context(&session);
+        assert_eq!(session.session_context.read().user, "n1_app");
+        panic!("statement panicked inside the guarded region");
+    }));
+    assert!(outcome.is_err());
+    assert_eq!(session.current_role.read().clone(), None);
+    assert!(session.settings.read().get("app.tenant").is_none());
+    assert!(!session.guc_in_txn(), "the implicit frame was closed");
+    assert_eq!(
+        session.session_context.read().user,
+        login,
+        "security context must be recomputed by the guard itself"
+    );
+    assert_eq!(user(&ex, sid).await, login);
+}
