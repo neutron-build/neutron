@@ -2476,10 +2476,7 @@ pub(crate) struct TableSchemaSnapshot {
 impl DiskEngine {
     /// The catalog's current schema for `table`, in the form a deferred
     /// `CreateTable` replay needs. `None` when the catalog has no such table.
-    pub(crate) async fn table_schema_snapshot(
-        &self,
-        table: &str,
-    ) -> Option<TableSchemaSnapshot> {
+    pub(crate) async fn table_schema_snapshot(&self, table: &str) -> Option<TableSchemaSnapshot> {
         let def = self.catalog.get_table(table).await?;
         Some(TableSchemaSnapshot {
             col_types: def.columns.iter().map(|c| c.data_type.clone()).collect(),

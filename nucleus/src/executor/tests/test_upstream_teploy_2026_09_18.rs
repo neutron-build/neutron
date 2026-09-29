@@ -29,9 +29,9 @@ use std::sync::Arc;
 
 use super::*;
 use crate::catalog::Catalog;
+use crate::storage::StorageEngine;
 use crate::storage::buffered_engine::BufferedDiskEngine;
 use crate::storage::disk_engine::DiskEngine;
-use crate::storage::StorageEngine;
 
 /// An executor over `BufferedDiskEngine(DiskEngine)` — the exact storage
 /// shape a server builds with a data directory, where both defects lived.
@@ -90,7 +90,11 @@ async fn migration_027_rebuild_shape_in_one_tx() {
     let dir = tempfile::tempdir().unwrap();
     let ex = disk_executor(dir.path());
     exec(&ex, "CREATE TABLE events (event_id TEXT, ver INT)").await;
-    exec(&ex, "INSERT INTO events VALUES ('a', 1), ('b', 2), ('c', 3)").await;
+    exec(
+        &ex,
+        "INSERT INTO events VALUES ('a', 1), ('b', 2), ('c', 3)",
+    )
+    .await;
     exec(
         &ex,
         "BEGIN; \
@@ -145,7 +149,10 @@ async fn mergetree_override_rename_in_tx() {
     )
     .await;
     let count = i64_of(&exec(&ex, "SELECT count(*) FROM m_events").await[0]);
-    assert_eq!(count, 2, "override-engine rename must copy rows inside the tx");
+    assert_eq!(
+        count, 2,
+        "override-engine rename must copy rows inside the tx"
+    );
     let old = i64_of(&exec(&ex, "SELECT count(*) FROM m_events_pre").await[0]);
     assert_eq!(old, 2, "renamed-aside override table must remain readable");
 }
@@ -274,10 +281,17 @@ async fn replacing_upsert_multi_table_tx_survives_and_survives_merges() {
             )
             .await[0],
         );
-        assert_eq!(lost, 0, "after merge-pressure chunk {chunk}: a committed upsert was dropped");
+        assert_eq!(
+            lost, 0,
+            "after merge-pressure chunk {chunk}: a committed upsert was dropped"
+        );
     }
 
     // The child rows of the multi-table txs must all be there too.
     let children = i64_of(&exec(&ex, "SELECT count(*) FROM replay_events").await[0]);
-    assert_eq!(children, ITERS * 2, "child rows from the multi-table txs were lost");
+    assert_eq!(
+        children,
+        ITERS * 2,
+        "child rows from the multi-table txs were lost"
+    );
 }

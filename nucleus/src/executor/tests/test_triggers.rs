@@ -164,7 +164,9 @@ async fn drop_trigger_requires_security_admin() {
 
     let sid = ex.create_session();
     ex.bind_authenticated_session(sid, "nobody").await.unwrap();
-    let err = ex.execute_with_session(sid, "DROP TRIGGER trg ON t_a").await;
+    let err = ex
+        .execute_with_session(sid, "DROP TRIGGER trg ON t_a")
+        .await;
     match err {
         Err(ExecError::PermissionDenied(msg)) => {
             assert!(msg.contains("superuser"), "got: {msg}")
@@ -188,7 +190,11 @@ async fn drop_trigger_if_exists_with_wrong_relation_is_a_noop() {
     two_same_named_triggers(&ex).await;
 
     exec(&ex, "DROP TRIGGER IF EXISTS trg ON missing_table").await;
-    assert_eq!(trigger_names(&ex).await.len(), 2, "IF EXISTS must be a no-op");
+    assert_eq!(
+        trigger_names(&ex).await.len(),
+        2,
+        "IF EXISTS must be a no-op"
+    );
 
     assert!(
         ex.execute("DROP TRIGGER nope ON t_a").await.is_err(),

@@ -1587,239 +1587,242 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-// ── Durability of an acknowledged backup (audit A25) ────────────────
+    // ── Durability of an acknowledged backup (audit A25) ────────────────
 
-/// Every acknowledged (Ok-returned) backup must verify against its own
-/// manifest and restore — including a forced rebuild that replaces a
-/// previous generation — and leave no temp/staging debris. The fsync and
-/// atomic-manifest work exists to make that true ACROSS a power loss; the
-/// crash-probe harness owns the kill -9 half (see DURABILITY.md).
-#[test]
-fn an_acknowledged_backup_verifies_and_restores_cleanly() {
-    let root = unique_tmp("durable");
-    let _ = std::fs::remove_dir_all(&root);
-    let data = root.join("data_dir");
-    write(&data, "catalog.json", b"{\"gen\":1}");
-    write(&data, "wal/000001.wal", &[0u8, 1, 2, 3]);
-    let dest = root.join("snap");
+    /// Every acknowledged (Ok-returned) backup must verify against its own
+    /// manifest and restore — including a forced rebuild that replaces a
+    /// previous generation — and leave no temp/staging debris. The fsync and
+    /// atomic-manifest work exists to make that true ACROSS a power loss; the
+    /// crash-probe harness owns the kill -9 half (see DURABILITY.md).
+    #[test]
+    fn an_acknowledged_backup_verifies_and_restores_cleanly() {
+        let root = unique_tmp("durable");
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data_dir");
+        write(&data, "catalog.json", b"{\"gen\":1}");
+        write(&data, "wal/000001.wal", &[0u8, 1, 2, 3]);
+        let dest = root.join("snap");
 
-    let m1 = backup_data_dir(&data, &dest, false, "0.1.1").unwrap();
-    write(&data, "catalog.json", b"{\"gen\":2}");
-    let m2 = backup_data_dir(&data, &dest, true, "0.1.1").unwrap();
-    assert_ne!(m1.files, m2.files, "the rebuild must replace the generation");
+        let m1 = backup_data_dir(&data, &dest, false, "0.1.1").unwrap();
+        write(&data, "catalog.json", b"{\"gen\":2}");
+        let m2 = backup_data_dir(&data, &dest, true, "0.1.1").unwrap();
+        assert_ne!(
+            m1.files, m2.files,
+            "the rebuild must replace the generation"
+        );
 
-    verify_snapshot(&dest, &m2).expect("an acknowledged backup verifies");
+        verify_snapshot(&dest, &m2).expect("an acknowledged backup verifies");
 
-    let restored = root.join("restored");
-    restore_data_dir(&dest, &restored, false, "0.1.1").unwrap();
-    assert_eq!(
-        std::fs::read(restored.join("catalog.json")).unwrap(),
-        b"{\"gen\":2}"
-    );
+        let restored = root.join("restored");
+        restore_data_dir(&dest, &restored, false, "0.1.1").unwrap();
+        assert_eq!(
+            std::fs::read(restored.join("catalog.json")).unwrap(),
+            b"{\"gen\":2}"
+        );
 
-    // The atomic manifest write leaves no temp siblings, and staged
-    // publication leaves no staging directory.
-    let debris: Vec<String> = std::fs::read_dir(&root)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.contains(".tmp") || n.contains(".staging-"))
-        .collect();
-    assert!(debris.is_empty(), "debris after clean backups: {debris:?}");
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-// ── Lock sentinel (audit A24) ────────────────────────────────────────
-
-/// Drop must unlock WITHOUT unlinking. The old unlock-then-remove raced:
-/// after A unlocked, B acquired the old inode; A's remove deleted the
-/// pathname; C created and locked a fresh file at the same path — two
-/// holders. The acceptance sequence: A unlock, B acquire, (the cleanup the
-/// old Drop would have done must NOT have happened), C acquire fails.
-#[test]
-fn lock_release_leaves_a_reusable_sentinel_for_the_next_holder() {
-    let root = unique_tmp("sentinel");
-    let _ = std::fs::remove_dir_all(&root);
-    let data = root.join("data_dir");
-    write(&data, "catalog.json", b"{}");
-    let lock_path = data.join(LOCK_NAME);
-
-    // A holds the directory, then releases (drops) — under the fix, the
-    // sentinel file REMAINS (unlocked).
-    {
-        let a = DataDirLock::acquire(&data).unwrap().expect("A acquires");
-        drop(a);
+        // The atomic manifest write leaves no temp siblings, and staged
+        // publication leaves no staging directory.
+        let debris: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp") || n.contains(".staging-"))
+            .collect();
+        assert!(debris.is_empty(), "debris after clean backups: {debris:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
-    assert!(
-        lock_path.exists(),
-        "release must leave the coordination inode in place"
-    );
-    assert!(!DataDirLock::is_locked(&data), "and it must be unlocked");
 
-    // B acquires the SAME sentinel inode.
-    let b = DataDirLock::acquire(&data).unwrap().expect("B acquires");
-    assert!(DataDirLock::is_locked(&data), "B is discoverable via the path");
+    // ── Lock sentinel (audit A24) ────────────────────────────────────────
 
-    // The cleanup the old Drop performed (unlinking) is exactly what let a
-    // third party in; under the fix nobody unlinks, so C — opening whatever
-    // file the path names — cannot acquire.
-    let c = DataDirLock::acquire(&data).unwrap();
-    assert!(c.is_none(), "C must fail to acquire while B holds the lock");
+    /// Drop must unlock WITHOUT unlinking. The old unlock-then-remove raced:
+    /// after A unlocked, B acquired the old inode; A's remove deleted the
+    /// pathname; C created and locked a fresh file at the same path — two
+    /// holders. The acceptance sequence: A unlock, B acquire, (the cleanup the
+    /// old Drop would have done must NOT have happened), C acquire fails.
+    #[test]
+    fn lock_release_leaves_a_reusable_sentinel_for_the_next_holder() {
+        let root = unique_tmp("sentinel");
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data_dir");
+        write(&data, "catalog.json", b"{}");
+        let lock_path = data.join(LOCK_NAME);
 
-    drop(b);
-    assert!(!DataDirLock::is_locked(&data));
-    // The unlocked sentinel is directly reusable by the next instance.
-    DataDirLock::acquire(&data)
-        .unwrap()
-        .expect("stale unlocked sentinel stays reusable");
-    let _ = std::fs::remove_dir_all(&root);
-}
+        // A holds the directory, then releases (drops) — under the fix, the
+        // sentinel file REMAINS (unlocked).
+        {
+            let a = DataDirLock::acquire(&data).unwrap().expect("A acquires");
+            drop(a);
+        }
+        assert!(
+            lock_path.exists(),
+            "release must leave the coordination inode in place"
+        );
+        assert!(!DataDirLock::is_locked(&data), "and it must be unlocked");
 
-/// A stale sentinel written by hand (a crashed instance's leftover) is
-/// unlocked, does not read as in-use, and does not block a backup.
-#[test]
-fn hand_written_stale_sentinel_is_not_in_use() {
-    let root = unique_tmp("stale_sentinel");
-    let _ = std::fs::remove_dir_all(&root);
-    let data = root.join("data_dir");
-    write(&data, "catalog.json", b"{}");
-    write(&data, LOCK_NAME, b"pid 999999 since 0\n");
+        // B acquires the SAME sentinel inode.
+        let b = DataDirLock::acquire(&data).unwrap().expect("B acquires");
+        assert!(
+            DataDirLock::is_locked(&data),
+            "B is discoverable via the path"
+        );
 
-    assert!(!DataDirLock::is_locked(&data));
-    backup_data_dir(&data, &root.join("snap"), false, "0.1.1")
-        .expect("a stale sentinel must not block a backup");
-    // And the snapshot must not capture the lock file.
-    assert!(!root.join("snap").join(DATA_SUBDIR).join(LOCK_NAME).exists());
-    let _ = std::fs::remove_dir_all(&root);
-}
+        // The cleanup the old Drop performed (unlinking) is exactly what let a
+        // third party in; under the fix nobody unlinks, so C — opening whatever
+        // file the path names — cannot acquire.
+        let c = DataDirLock::acquire(&data).unwrap();
+        assert!(c.is_none(), "C must fail to acquire while B holds the lock");
 
-// ── Path fences + staged publication (audit A22) ─────────────────────
+        drop(b);
+        assert!(!DataDirLock::is_locked(&data));
+        // The unlocked sentinel is directly reusable by the next instance.
+        DataDirLock::acquire(&data)
+            .unwrap()
+            .expect("stale unlocked sentinel stays reusable");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
-/// A forced backup to an ANCESTOR of the data directory must be refused
-/// before any mutation: `prepare_output_dir(force)` used to begin with
-/// `remove_dir_all(destination)` — which deleted the database being backed
-/// up. Equal and descendant cases are refused for the copy-recursion they
-/// cause; the ancestor case is the destructive one.
-#[test]
-fn backup_destination_ancestor_equal_and_descendant_are_refused_untouched() {
-    let root = unique_tmp("fence");
-    let _ = std::fs::remove_dir_all(&root);
-    let data = root.join("nest").join("data");
-    write(&data, "catalog.json", b"{\"tables\":1}");
+    /// A stale sentinel written by hand (a crashed instance's leftover) is
+    /// unlocked, does not read as in-use, and does not block a backup.
+    #[test]
+    fn hand_written_stale_sentinel_is_not_in_use() {
+        let root = unique_tmp("stale_sentinel");
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data_dir");
+        write(&data, "catalog.json", b"{}");
+        write(&data, LOCK_NAME, b"pid 999999 since 0\n");
 
-    let before = dir_fingerprint(&root);
+        assert!(!DataDirLock::is_locked(&data));
+        backup_data_dir(&data, &root.join("snap"), false, "0.1.1")
+            .expect("a stale sentinel must not block a backup");
+        // And the snapshot must not capture the lock file.
+        assert!(!root.join("snap").join(DATA_SUBDIR).join(LOCK_NAME).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
-    // Ancestor: the destination CONTAINS the source.
-    let err = backup_data_dir(&data, &root.join("nest"), true, "0.1.1").unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    assert!(
-        err.to_string().contains("ancestor"),
-        "refusal must name the ancestor problem: {err}"
-    );
+    // ── Path fences + staged publication (audit A22) ─────────────────────
 
-    // Equal: the destination IS the source.
-    let err = backup_data_dir(&data, &data, true, "0.1.1").unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    /// A forced backup to an ANCESTOR of the data directory must be refused
+    /// before any mutation: `prepare_output_dir(force)` used to begin with
+    /// `remove_dir_all(destination)` — which deleted the database being backed
+    /// up. Equal and descendant cases are refused for the copy-recursion they
+    /// cause; the ancestor case is the destructive one.
+    #[test]
+    fn backup_destination_ancestor_equal_and_descendant_are_refused_untouched() {
+        let root = unique_tmp("fence");
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("nest").join("data");
+        write(&data, "catalog.json", b"{\"tables\":1}");
 
-    // Descendant (the classic): the destination is inside the source.
-    let err = backup_data_dir(&data, &data.join("snap"), true, "0.1.1").unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    assert!(
-        err.to_string().contains("inside the data directory"),
-        "nested refusal message must stay recognizable: {err}"
-    );
+        let before = dir_fingerprint(&root);
 
-    assert_eq!(
-        before,
-        dir_fingerprint(&root),
-        "a refused backup must not touch either tree"
-    );
-    let _ = std::fs::remove_dir_all(&root);
-}
+        // Ancestor: the destination CONTAINS the source.
+        let err = backup_data_dir(&data, &root.join("nest"), true, "0.1.1").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("ancestor"),
+            "refusal must name the ancestor problem: {err}"
+        );
 
-/// Restoring a snapshot onto ITSELF (or onto an ancestor of the snapshot)
-/// must be refused before `remove_dir_all(data_dir)` destroys the input.
-#[test]
-fn restore_onto_its_own_snapshot_is_refused_untouched() {
-    let root = unique_tmp("restore_fence");
-    let _ = std::fs::remove_dir_all(&root);
-    let data = root.join("data_dir");
-    write(&data, "catalog.json", b"{\"tables\":1}");
-    let snap = root.join("snap");
-    backup_data_dir(&data, &snap, false, "0.1.1").unwrap();
+        // Equal: the destination IS the source.
+        let err = backup_data_dir(&data, &data, true, "0.1.1").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
-    let before = dir_fingerprint(&root);
+        // Descendant (the classic): the destination is inside the source.
+        let err = backup_data_dir(&data, &data.join("snap"), true, "0.1.1").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("inside the data directory"),
+            "nested refusal message must stay recognizable: {err}"
+        );
 
-    // Onto itself.
-    let err = restore_data_dir(&snap, &snap, true, "0.1.1").unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            before,
+            dir_fingerprint(&root),
+            "a refused backup must not touch either tree"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
-    // Onto an ancestor of the snapshot (removing the destination would
-    // remove the snapshot with it).
-    let err = restore_data_dir(&snap, &root, true, "0.1.1").unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    assert!(
-        err.to_string().contains("ancestor"),
-        "refusal must name the ancestor problem: {err}"
-    );
+    /// Restoring a snapshot onto ITSELF (or onto an ancestor of the snapshot)
+    /// must be refused before `remove_dir_all(data_dir)` destroys the input.
+    #[test]
+    fn restore_onto_its_own_snapshot_is_refused_untouched() {
+        let root = unique_tmp("restore_fence");
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data_dir");
+        write(&data, "catalog.json", b"{\"tables\":1}");
+        let snap = root.join("snap");
+        backup_data_dir(&data, &snap, false, "0.1.1").unwrap();
 
-    assert_eq!(
-        before,
-        dir_fingerprint(&root),
-        "a refused restore must not touch either tree"
-    );
-    let _ = std::fs::remove_dir_all(&root);
-}
+        let before = dir_fingerprint(&root);
 
-/// A failed forced rebuild must leave the previous generation at the
-/// destination intact (staged publication): the old snapshot is removed only
-/// after the new one is complete. Failure injected as an unreadable source
-/// file.
-#[cfg(unix)]
-#[test]
-fn a_failed_rebuild_keeps_the_previous_generation() {
-    let root = unique_tmp("staged");
-    let _ = std::fs::remove_dir_all(&root);
-    let data = root.join("data_dir");
-    write(&data, "catalog.json", b"v1");
-    let dest = root.join("snap");
-    backup_data_dir(&data, &dest, false, "0.1.1").unwrap();
+        // Onto itself.
+        let err = restore_data_dir(&snap, &snap, true, "0.1.1").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
-    // Grow the source, then break it: one unreadable file.
-    write(&data, "storage/big.dat", b"v2-payload");
-    let victim = data.join("storage").join("big.dat");
-    std::fs::set_permissions(&victim, std::os::unix::fs::PermissionsExt::from_mode(0o000))
-        .unwrap();
+        // Onto an ancestor of the snapshot (removing the destination would
+        // remove the snapshot with it).
+        let err = restore_data_dir(&snap, &root, true, "0.1.1").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("ancestor"),
+            "refusal must name the ancestor problem: {err}"
+        );
 
-    let before = dir_fingerprint(&dest);
-    let err = backup_data_dir(&data, &dest, true, "0.1.1");
-    std::fs::set_permissions(&victim, std::os::unix::fs::PermissionsExt::from_mode(0o644))
-        .unwrap();
-    assert!(
-        err.is_err(),
-        "the unreadable source file must fail the rebuild (test would be vacuous as root)"
-    );
+        assert_eq!(
+            before,
+            dir_fingerprint(&root),
+            "a refused restore must not touch either tree"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
-    assert_eq!(
-        before,
-        dir_fingerprint(&dest),
-        "the previous generation must survive a failed rebuild"
-    );
-    // No staging debris left behind after a clean (non-crash) failure.
-    let debris: Vec<_> = std::fs::read_dir(&root)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().contains(".staging-"))
-        .collect();
-    assert!(debris.is_empty(), "staging debris: {debris:?}");
+    /// A failed forced rebuild must leave the previous generation at the
+    /// destination intact (staged publication): the old snapshot is removed only
+    /// after the new one is complete. Failure injected as an unreadable source
+    /// file.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_rebuild_keeps_the_previous_generation() {
+        let root = unique_tmp("staged");
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data_dir");
+        write(&data, "catalog.json", b"v1");
+        let dest = root.join("snap");
+        backup_data_dir(&data, &dest, false, "0.1.1").unwrap();
 
-    // And the destination still restores.
-    let restored = root.join("restored");
-    restore_data_dir(&dest, &restored, false, "0.1.1").unwrap();
-    assert_eq!(
-        std::fs::read(restored.join("catalog.json")).unwrap(),
-        b"v1"
-    );
-    let _ = std::fs::remove_dir_all(&root);
-}
+        // Grow the source, then break it: one unreadable file.
+        write(&data, "storage/big.dat", b"v2-payload");
+        let victim = data.join("storage").join("big.dat");
+        std::fs::set_permissions(&victim, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+
+        let before = dir_fingerprint(&dest);
+        let err = backup_data_dir(&data, &dest, true, "0.1.1");
+        std::fs::set_permissions(&victim, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .unwrap();
+        assert!(
+            err.is_err(),
+            "the unreadable source file must fail the rebuild (test would be vacuous as root)"
+        );
+
+        assert_eq!(
+            before,
+            dir_fingerprint(&dest),
+            "the previous generation must survive a failed rebuild"
+        );
+        // No staging debris left behind after a clean (non-crash) failure.
+        let debris: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".staging-"))
+            .collect();
+        assert!(debris.is_empty(), "staging debris: {debris:?}");
+
+        // And the destination still restores.
+        let restored = root.join("restored");
+        restore_data_dir(&dest, &restored, false, "0.1.1").unwrap();
+        assert_eq!(std::fs::read(restored.join("catalog.json")).unwrap(), b"v1");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

@@ -184,11 +184,7 @@ enum TriState {
 
 impl From<bool> for TriState {
     fn from(b: bool) -> Self {
-        if b {
-            TriState::True
-        } else {
-            TriState::False
-        }
+        if b { TriState::True } else { TriState::False }
     }
 }
 
@@ -802,11 +798,7 @@ impl RlsEngine {
             .flat_map(|(table, policies)| policies.iter().map(move |p| (table, &p.name)))
             .collect();
         for (table, name) in keys {
-            fn find<'e>(
-                engine: &'e RlsEngine,
-                table: &str,
-                name: &str,
-            ) -> Option<&'e RlsPolicy> {
+            fn find<'e>(engine: &'e RlsEngine, table: &str, name: &str) -> Option<&'e RlsPolicy> {
                 engine
                     .policies
                     .get(table)
@@ -1065,9 +1057,10 @@ impl MaskingEngine {
             if find(base, table, column, role) != find(staged, table, column, role) {
                 match find(staged, table, column, role) {
                     Some(staged_policy) => {
-                        let existing = merged.policies.iter_mut().find(|p| {
-                            p.table == *table && p.column == *column && p.role == *role
-                        });
+                        let existing = merged
+                            .policies
+                            .iter_mut()
+                            .find(|p| p.table == *table && p.column == *column && p.role == *role);
                         match existing {
                             Some(slot) => *slot = staged_policy.clone(),
                             None => merged.policies.push(staged_policy.clone()),
@@ -1271,7 +1264,9 @@ impl SecurityManager {
     pub fn merge_policy_state(&self, base: &Self, staged: &Self) -> Self {
         Self {
             rls: self.rls.merge_with_staged(&base.rls, &staged.rls),
-            masking: self.masking.merge_with_staged(&base.masking, &staged.masking),
+            masking: self
+                .masking
+                .merge_with_staged(&base.masking, &staged.masking),
             audit: AuditLog::new(),
         }
     }

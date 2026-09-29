@@ -322,11 +322,7 @@ async fn slow_query_capture_scrubs_password_literals() {
             .map(|i| format!("c{attempt}_{i}"))
             .collect::<Vec<_>>()
             .join(", ");
-        exec(
-            &ex,
-            &format!("CREATE ROLE {names} LOGIN PASSWORD {form}"),
-        )
-        .await;
+        exec(&ex, &format!("CREATE ROLE {names} LOGIN PASSWORD {form}")).await;
         if let Some((_, _, statement)) = ex.last_slow_query() {
             assert!(
                 !statement.contains("canary"),

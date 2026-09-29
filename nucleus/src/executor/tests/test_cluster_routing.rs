@@ -244,7 +244,9 @@ async fn embedded_parsed_and_prepared_entries_route_through_the_cluster_gate() {
 #[tokio::test]
 async fn embedded_prepared_entry_works_in_standalone() {
     let ex = test_executor();
-    ex.execute("CREATE TABLE prep (id INT, name TEXT)").await.unwrap();
+    ex.execute("CREATE TABLE prep (id INT, name TEXT)")
+        .await
+        .unwrap();
 
     let handle = ex.prepare("INSERT INTO prep VALUES ($1, $2)").unwrap();
     ex.execute_prepared(&handle, &[Value::Int64(1), Value::Text("one".into())])

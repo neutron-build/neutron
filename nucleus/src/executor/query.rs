@@ -10864,11 +10864,10 @@ impl Executor {
                         let (n, k) = (tb.len(), kb.len());
                         n >= k
                             && tb[n - k..].eq_ignore_ascii_case(kb)
-                            && (n == k
-                                || {
-                                    let prev = tb[n - k - 1];
-                                    !(prev.is_ascii_alphanumeric() || prev == b'_')
-                                })
+                            && (n == k || {
+                                let prev = tb[n - k - 1];
+                                !(prev.is_ascii_alphanumeric() || prev == b'_')
+                            })
                     };
                     ends_with_kw("limit") || ends_with_kw("offset")
                 };
@@ -11025,11 +11024,10 @@ impl Executor {
                         let (n, k) = (tb.len(), kb.len());
                         n >= k
                             && tb[n - k..].eq_ignore_ascii_case(kb)
-                            && (n == k
-                                || {
-                                    let prev = tb[n - k - 1];
-                                    !(prev.is_ascii_alphanumeric() || prev == b'_')
-                                })
+                            && (n == k || {
+                                let prev = tb[n - k - 1];
+                                !(prev.is_ascii_alphanumeric() || prev == b'_')
+                            })
                     };
                     ends_with_kw("limit") || ends_with_kw("offset")
                 };

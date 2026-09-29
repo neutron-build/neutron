@@ -116,7 +116,10 @@ fn flip_in_last_record_payload_is_crc_rejected() {
         "error must name corruption: {err}"
     );
     let after = std::fs::read(&wal).unwrap();
-    assert_eq!(after, torn, "the refused open must leave the WAL unmodified");
+    assert_eq!(
+        after, torn,
+        "the refused open must leave the WAL unmodified"
+    );
 }
 
 #[test]

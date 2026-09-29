@@ -165,7 +165,11 @@ async fn test_on_conflict_do_update() {
 // ======================================================================
 
 async fn upsert_priv_fixture(ex: &Executor) {
-    exec(ex, "CREATE TABLE upsert_priv (id INT PRIMARY KEY, name TEXT)").await;
+    exec(
+        ex,
+        "CREATE TABLE upsert_priv (id INT PRIMARY KEY, name TEXT)",
+    )
+    .await;
     exec(ex, "INSERT INTO upsert_priv VALUES (1, 'alice')").await;
     exec(ex, "CREATE ROLE writer LOGIN PASSWORD 'x'").await;
 }
@@ -921,9 +925,17 @@ async fn upsert_key_change_respects_on_update_restrict() {
 
     // Neither side changed: no orphaned child, no half-moved parent.
     let p = exec(&ex, "SELECT id FROM uq_parent WHERE code = 'C1'").await;
-    assert_eq!(rows(&p[0])[0][0], Value::Int32(1), "parent key must be unmoved");
+    assert_eq!(
+        rows(&p[0])[0][0],
+        Value::Int32(1),
+        "parent key must be unmoved"
+    );
     let c = exec(&ex, "SELECT pid FROM uq_child WHERE id = 10").await;
-    assert_eq!(rows(&c[0])[0][0], Value::Int32(1), "child must still point at 1");
+    assert_eq!(
+        rows(&c[0])[0][0],
+        Value::Int32(1),
+        "child must still point at 1"
+    );
 }
 
 #[tokio::test]

@@ -121,20 +121,18 @@ impl SnapshotLeaseRegistry {
     }
 
     /// Try to take the lease for `session_id`.
-    pub(crate) fn try_acquire(
-        &self,
-        session_id: u64,
-        timeout_ms: u64,
-    ) -> Result<(), LeaseRefusal> {
+    pub(crate) fn try_acquire(&self, session_id: u64, timeout_ms: u64) -> Result<(), LeaseRefusal> {
         let now = tokio::time::Instant::now();
         let mut guard = self.state.lock();
         if let Some(existing) = *guard
-            && existing.deadline > now && existing.session_id != session_id {
-                return Err(LeaseRefusal::HeldByOther(
-                    existing.deadline.duration_since(now).as_millis() as u64,
-                ));
-            }
-            // Same session re-acquire, or an expired lease: replace.
+            && existing.deadline > now
+            && existing.session_id != session_id
+        {
+            return Err(LeaseRefusal::HeldByOther(
+                existing.deadline.duration_since(now).as_millis() as u64,
+            ));
+        }
+        // Same session re-acquire, or an expired lease: replace.
         *guard = Some(Lease {
             session_id,
             deadline: now + Duration::from_millis(timeout_ms),
@@ -164,8 +162,12 @@ impl SnapshotLeaseRegistry {
     /// The holder's session id and remaining milliseconds, for SHOW.
     pub(crate) fn holder(&self) -> Option<(u64, u64)> {
         let now = tokio::time::Instant::now();
-        self.active(now)
-            .map(|l| (l.session_id, l.deadline.duration_since(now).as_millis() as u64))
+        self.active(now).map(|l| {
+            (
+                l.session_id,
+                l.deadline.duration_since(now).as_millis() as u64,
+            )
+        })
     }
 
     /// The writer gate. For a session that is not the holder: wait until
@@ -206,10 +208,7 @@ impl super::Executor {
     /// engine's own buffers are asked through
     /// [`StorageEngine::session_has_uncommitted_writes`].
     async fn session_txn_has_uncommitted_writes(&self, id: u64, session: &super::Session) -> bool {
-        if !session
-            .txn_active
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if !session.txn_active.load(std::sync::atomic::Ordering::SeqCst) {
             return false;
         }
         if self.storage.session_has_uncommitted_writes(id) {
@@ -274,10 +273,7 @@ impl super::Executor {
         sql: &str,
     ) -> Result<super::ExecResult, super::ExecError> {
         let sess = self.current_session();
-        if !sess
-            .txn_active
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if !sess.txn_active.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(super::ExecError::Runtime(
                 "ACQUIRE SNAPSHOT LEASE requires an active transaction (BEGIN first) — \
                  the lease is released at that transaction's COMMIT/ROLLBACK"
@@ -407,7 +403,8 @@ impl super::Executor {
 }
 
 #[cfg(test)]
-mod tests {    use super::*;
+mod tests {
+    use super::*;
 
     #[tokio::test]
     async fn acquire_release_and_second_holder() {
@@ -437,7 +434,10 @@ mod tests {    use super::*;
         let reg = SnapshotLeaseRegistry::new();
         reg.try_acquire(1, 50).unwrap();
         tokio::time::advance(Duration::from_millis(60)).await;
-        assert!(reg.holder().is_none(), "expired lease must not report a holder");
+        assert!(
+            reg.holder().is_none(),
+            "expired lease must not report a holder"
+        );
         reg.try_acquire(2, 60_000)
             .expect("expired lease must not block acquisition");
     }

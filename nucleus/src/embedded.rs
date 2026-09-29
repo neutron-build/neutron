@@ -1180,7 +1180,10 @@ impl Transaction {
     /// Run SQL on THIS transaction's session.
     async fn run(&self, sql: &str) -> Result<Vec<ExecResult>, ExecError> {
         #[cfg(feature = "server")]
-        return self.executor.execute_with_session(self.session_id, sql).await;
+        return self
+            .executor
+            .execute_with_session(self.session_id, sql)
+            .await;
         // Core/WASM builds have no task-local scopes; they drive futures on
         // one thread, so the session context is established through the
         // thread-local cells instead — set for the call, restored after, so a
@@ -1268,9 +1271,7 @@ impl Drop for Transaction {
                 let session_id = self.session_id;
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     handle.spawn(async move {
-                        let _ = executor
-                            .execute_with_session(session_id, "ROLLBACK")
-                            .await;
+                        let _ = executor.execute_with_session(session_id, "ROLLBACK").await;
                         executor.drop_session(session_id);
                     });
                 } else {
@@ -1585,8 +1586,12 @@ mod tests {
             db.execute("CREATE TABLE t (id INT PRIMARY KEY, owner TEXT)")
                 .await
                 .unwrap();
-            db.execute("INSERT INTO t VALUES (1, 'alice')").await.unwrap();
-            db.execute("CREATE VIEW v AS SELECT id FROM t").await.unwrap();
+            db.execute("INSERT INTO t VALUES (1, 'alice')")
+                .await
+                .unwrap();
+            db.execute("CREATE VIEW v AS SELECT id FROM t")
+                .await
+                .unwrap();
             db.execute("ALTER TABLE t ENABLE ROW LEVEL SECURITY")
                 .await
                 .unwrap();
@@ -1615,7 +1620,10 @@ mod tests {
             );
             let rows = db.query("SELECT id FROM v").await.unwrap();
             assert_eq!(rows.len(), 1, "the view must survive a reopen");
-            let policies = db.query("SELECT policyname FROM pg_policies").await.unwrap();
+            let policies = db
+                .query("SELECT policyname FROM pg_policies")
+                .await
+                .unwrap();
             assert_eq!(
                 policies.len(),
                 1,
@@ -1654,7 +1662,9 @@ mod tests {
 
         {
             let db = Database::open(&db_path).unwrap();
-            db.execute("CREATE TABLE t (id INT NOT NULL)").await.unwrap();
+            db.execute("CREATE TABLE t (id INT NOT NULL)")
+                .await
+                .unwrap();
         }
 
         let sidecar_catalog = db_path.with_file_name("c.ndb.d").join("catalog.json");
@@ -2516,115 +2526,126 @@ mod tests {
             "the refused open must not rewrite the corrupt meta.json"
         );
     }
-}
 
-// ======================================================================
-// Explicit transaction handle isolation (audit A3)
-// ======================================================================
+    // ======================================================================
+    // Explicit transaction handle isolation (audit A3)
+    // ======================================================================
 
-/// Two `Transaction` handles from one `Database` must be isolated
-/// transactions. Both used to run on the executor's shared DEFAULT session:
-/// the second BEGIN warned and silently joined the first transaction, both
-/// commits hit the same session, and dropping one handle rolled back the
-/// other's open transaction.
-#[tokio::test]
-async fn embedded_transaction_handles_do_not_share_a_session() {
-    let db = Database::mvcc();
-    db.execute("CREATE TABLE tx (id INT PRIMARY KEY)").await.unwrap();
-
-    let tx1 = db.begin().await.unwrap();
-    let tx2 = db.begin().await.unwrap();
-    tx1.execute("INSERT INTO tx VALUES (1)").await.unwrap();
-    tx2.execute("INSERT INTO tx VALUES (2)").await.unwrap();
-
-    // Each handle sees only its own writes until commit.
-    let seen1 = tx1.query("SELECT id FROM tx ORDER BY id").await.unwrap();
-    assert_eq!(seen1.len(), 1, "tx1 must not see tx2's uncommitted row");
-    let seen2 = tx2.query("SELECT id FROM tx ORDER BY id").await.unwrap();
-    assert_eq!(seen2.len(), 1, "tx2 must not see tx1's uncommitted row");
-
-    tx1.commit().await.unwrap();
-    // Dropping tx2 rolls back only tx2's transaction; tx1's committed row
-    // survives and tx2's vanished row never appears.
-    drop(tx2);
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    let rows = db.query("SELECT id FROM tx").await.unwrap();
-    assert_eq!(
-        rows,
-        vec![vec![Value::Int32(1)]],
-        "a dropped handle must roll back only its own transaction"
-    );
-}
-
-/// An explicit rollback ends the session cleanly and the database stays
-/// usable afterwards — no leaked open transaction on any shared session.
-#[tokio::test]
-async fn embedded_transaction_rollback_leaves_database_usable() {
-    let db = Database::mvcc();
-    db.execute("CREATE TABLE txr (id INT PRIMARY KEY)").await.unwrap();
-
-    let tx = db.begin().await.unwrap();
-    tx.execute("INSERT INTO txr VALUES (1)").await.unwrap();
-    tx.rollback().await.unwrap();
-
-    let rows = db.query("SELECT id FROM txr").await.unwrap();
-    assert!(rows.is_empty(), "rollback must discard the write");
-    // Autocommit still works on the database afterwards.
-    db.execute("INSERT INTO txr VALUES (2)").await.unwrap();
-    let rows = db.query("SELECT id FROM txr").await.unwrap();
-    assert_eq!(rows, vec![vec![Value::Int32(2)]]);
-}
-
-/// A FAILED commit resolves its outcome before the handle finishes: the
-/// transaction gets the rollback the failure owes, on its own session, and
-/// the caller sees the error. Driven with a SERIALIZABLE write-skew so the
-/// storage commit itself fails deterministically. `Database::begin` issues a
-/// plain BEGIN, so the handles are built here on sessions already opened at
-/// SERIALIZABLE — same construction, different isolation selection.
-#[cfg(feature = "server")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn embedded_transaction_failed_commit_rolls_back_its_own_transaction() {
-    async fn serializable_tx(db: &Database) -> Transaction {
-        let session_id = db.executor.create_session();
-        db.executor
-            .execute_with_session(session_id, "BEGIN ISOLATION LEVEL SERIALIZABLE")
+    /// Two `Transaction` handles from one `Database` must be isolated
+    /// transactions. Both used to run on the executor's shared DEFAULT session:
+    /// the second BEGIN warned and silently joined the first transaction, both
+    /// commits hit the same session, and dropping one handle rolled back the
+    /// other's open transaction.
+    #[tokio::test]
+    async fn embedded_transaction_handles_do_not_share_a_session() {
+        let db = Database::mvcc();
+        db.execute("CREATE TABLE tx (id INT PRIMARY KEY)")
             .await
             .unwrap();
-        Transaction {
-            executor: db.executor.clone(),
-            session_id,
-            finished: false,
-        }
+
+        let tx1 = db.begin().await.unwrap();
+        let tx2 = db.begin().await.unwrap();
+        tx1.execute("INSERT INTO tx VALUES (1)").await.unwrap();
+        tx2.execute("INSERT INTO tx VALUES (2)").await.unwrap();
+
+        // Each handle sees only its own writes until commit.
+        let seen1 = tx1.query("SELECT id FROM tx ORDER BY id").await.unwrap();
+        assert_eq!(seen1.len(), 1, "tx1 must not see tx2's uncommitted row");
+        let seen2 = tx2.query("SELECT id FROM tx ORDER BY id").await.unwrap();
+        assert_eq!(seen2.len(), 1, "tx2 must not see tx1's uncommitted row");
+
+        tx1.commit().await.unwrap();
+        // Dropping tx2 rolls back only tx2's transaction; tx1's committed row
+        // survives and tx2's vanished row never appears.
+        drop(tx2);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let rows = db.query("SELECT id FROM tx").await.unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![Value::Int32(1)]],
+            "a dropped handle must roll back only its own transaction"
+        );
     }
 
-    let db = Database::mvcc();
-    db.execute("CREATE TABLE skew (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
-        .await
-        .unwrap();
-    db.execute("INSERT INTO skew VALUES (1,1),(2,1)").await.unwrap();
+    /// An explicit rollback ends the session cleanly and the database stays
+    /// usable afterwards — no leaked open transaction on any shared session.
+    #[tokio::test]
+    async fn embedded_transaction_rollback_leaves_database_usable() {
+        let db = Database::mvcc();
+        db.execute("CREATE TABLE txr (id INT PRIMARY KEY)")
+            .await
+            .unwrap();
 
-    // The handle's transaction: read half of the write skew now.
-    let tx = serializable_tx(&db).await;
-    tx.query("SELECT v FROM skew WHERE id = 2").await.unwrap();
+        let tx = db.begin().await.unwrap();
+        tx.execute("INSERT INTO txr VALUES (1)").await.unwrap();
+        tx.rollback().await.unwrap();
 
-    // A concurrent handle closes the cycle and commits first.
-    let winner = serializable_tx(&db).await;
-    winner.query("SELECT v FROM skew WHERE id = 1").await.unwrap();
-    winner
-        .execute("UPDATE skew SET v = 0 WHERE id = 2")
-        .await
-        .unwrap();
-    winner.commit().await.unwrap();
+        let rows = db.query("SELECT id FROM txr").await.unwrap();
+        assert!(rows.is_empty(), "rollback must discard the write");
+        // Autocommit still works on the database afterwards.
+        db.execute("INSERT INTO txr VALUES (2)").await.unwrap();
+        let rows = db.query("SELECT id FROM txr").await.unwrap();
+        assert_eq!(rows, vec![vec![Value::Int32(2)]]);
+    }
 
-    tx.execute("UPDATE skew SET v = 0 WHERE id = 1").await.unwrap();
-    let failed = tx.commit().await;
-    assert!(failed.is_err(), "the write-skew commit must fail");
+    /// A FAILED commit resolves its outcome before the handle finishes: the
+    /// transaction gets the rollback the failure owes, on its own session, and
+    /// the caller sees the error. Driven with a SERIALIZABLE write-skew so the
+    /// storage commit itself fails deterministically. `Database::begin` issues a
+    /// plain BEGIN, so the handles are built here on sessions already opened at
+    /// SERIALIZABLE — same construction, different isolation selection.
+    #[cfg(feature = "server")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embedded_transaction_failed_commit_rolls_back_its_own_transaction() {
+        async fn serializable_tx(db: &Database) -> Transaction {
+            let session_id = db.executor.create_session();
+            db.executor
+                .execute_with_session(session_id, "BEGIN ISOLATION LEVEL SERIALIZABLE")
+                .await
+                .unwrap();
+            Transaction {
+                executor: db.executor.clone(),
+                session_id,
+                finished: false,
+            }
+        }
 
-    // The failed handle's write was rolled back with its session; the
-    // winner's committed write stands.
-    let rows = db.query("SELECT v FROM skew ORDER BY id").await.unwrap();
-    assert_eq!(rows, vec![vec![Value::Int32(1)], vec![Value::Int32(0)]]);
-    // And the database remains usable in autocommit.
-    db.execute("INSERT INTO skew VALUES (3, 3)").await.unwrap();
+        let db = Database::mvcc();
+        db.execute("CREATE TABLE skew (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+            .await
+            .unwrap();
+        db.execute("INSERT INTO skew VALUES (1,1),(2,1)")
+            .await
+            .unwrap();
+
+        // The handle's transaction: read half of the write skew now.
+        let tx = serializable_tx(&db).await;
+        tx.query("SELECT v FROM skew WHERE id = 2").await.unwrap();
+
+        // A concurrent handle closes the cycle and commits first.
+        let winner = serializable_tx(&db).await;
+        winner
+            .query("SELECT v FROM skew WHERE id = 1")
+            .await
+            .unwrap();
+        winner
+            .execute("UPDATE skew SET v = 0 WHERE id = 2")
+            .await
+            .unwrap();
+        winner.commit().await.unwrap();
+
+        tx.execute("UPDATE skew SET v = 0 WHERE id = 1")
+            .await
+            .unwrap();
+        let failed = tx.commit().await;
+        assert!(failed.is_err(), "the write-skew commit must fail");
+
+        // The failed handle's write was rolled back with its session; the
+        // winner's committed write stands.
+        let rows = db.query("SELECT v FROM skew ORDER BY id").await.unwrap();
+        assert_eq!(rows, vec![vec![Value::Int32(1)], vec![Value::Int32(0)]]);
+        // And the database remains usable in autocommit.
+        db.execute("INSERT INTO skew VALUES (3, 3)").await.unwrap();
+    }
 }

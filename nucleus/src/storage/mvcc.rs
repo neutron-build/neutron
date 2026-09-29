@@ -17,8 +17,8 @@ use std::sync::atomic::Ordering;
 use parking_lot::RwLock;
 
 use super::txn::{
-    IsolationLevel, RowVersion, Snapshot, TXN_COMMITTED_BEFORE_ALL, TXN_INVALID, TransactionManager,
-    TxnStatus,
+    IsolationLevel, RowVersion, Snapshot, TXN_COMMITTED_BEFORE_ALL, TXN_INVALID,
+    TransactionManager, TxnStatus,
 };
 use crate::types::{Row, Value};
 
@@ -934,11 +934,7 @@ impl MvccMemoryEngine {
         row: Row,
     ) -> Result<(), MvccError> {
         let tbl = self.get_table(table)?;
-        tbl.recover_insert(
-            version_id.min(usize::MAX as u64) as usize,
-            txn_id,
-            row,
-        );
+        tbl.recover_insert(version_id.min(usize::MAX as u64) as usize, txn_id, row);
         Ok(())
     }
 
@@ -1170,9 +1166,7 @@ struct AutoTxnGuard<'a> {
 
 impl Drop for AutoTxnGuard<'_> {
     fn drop(&mut self) {
-        if self.adapter.engine.txn_mgr().get_status(self.txn_id)
-            == super::txn::TxnStatus::Active
-        {
+        if self.adapter.engine.txn_mgr().get_status(self.txn_id) == super::txn::TxnStatus::Active {
             self.adapter.auto_txn_abort(self.txn_id);
         }
     }
@@ -1194,7 +1188,11 @@ pub(super) enum UndoOp {
     Insert { table: String, vidx: usize },
     /// This transaction deleted the pre-existing row at `vidx` (whose
     /// content was `row`).
-    DeleteMark { table: String, vidx: usize, row: Row },
+    DeleteMark {
+        table: String,
+        vidx: usize,
+        row: Row,
+    },
     /// This transaction superseded `old_vidx` (content `old_row`) with a new
     /// version appended at `new_vidx`.
     Update {
@@ -1910,12 +1908,7 @@ impl MvccStorageAdapter {
 
     /// Undo one of this transaction's inserts: tombstone the row and log the
     /// compensating Delete.
-    fn undo_own_insert(
-        &self,
-        table: &str,
-        vidx: usize,
-        txn_id: u64,
-    ) -> Result<(), StorageError> {
+    fn undo_own_insert(&self, table: &str, vidx: usize, txn_id: u64) -> Result<(), StorageError> {
         if let Ok(tbl) = self.engine.get_table(table) {
             let rows = tbl.rows.read();
             if let Some(row) = rows.get(vidx)
@@ -1951,6 +1944,7 @@ impl MvccStorageAdapter {
     /// `created_by != txn_id` guard left the tombstone in place and silently
     /// dropped it. Ownership is still checked via the observed `deleted_by`
     /// value, so a marker not owned by this transaction is never touched.
+    #[cfg_attr(not(feature = "server"), allow(unused_variables))]
     fn undo_own_delete(
         &self,
         table: &str,
@@ -1973,9 +1967,7 @@ impl MvccStorageAdapter {
                             Ordering::Acquire,
                         )
                         .map_err(|_| {
-                            StorageError::Io(
-                                "savepoint undo ownership changed mid-rollback".into(),
-                            )
+                            StorageError::Io("savepoint undo ownership changed mid-rollback".into())
                         })?;
                 }
             }
@@ -1994,6 +1986,7 @@ impl MvccStorageAdapter {
 
     /// Undo one of this transaction's updates: restore the old version,
     /// tombstone the new one, and log both compensations.
+    #[cfg_attr(not(feature = "server"), allow(unused_variables))]
     fn undo_own_update(
         &self,
         table: &str,
@@ -2054,7 +2047,6 @@ impl MvccStorageAdapter {
         Ok(())
     }
 
-
     /// Resolve cached index candidates to snapshot-visible rows (NU-14).
     ///
     /// `idx.map` entries are keyed by stable version index, so each candidate
@@ -2100,9 +2092,7 @@ impl MvccStorageAdapter {
     /// Begin ONE observer for an autocommit index scan and return
     /// `(transaction, snapshot)` (NU-22 round 2). The caller keeps the
     /// observer alive until every candidate is materialized, then aborts it.
-    fn index_scan_observer(
-        &self,
-    ) -> Option<(super::txn::Transaction, super::txn::Snapshot)> {
+    fn index_scan_observer(&self) -> Option<(super::txn::Transaction, super::txn::Snapshot)> {
         let observer = self
             .engine
             .txn_mgr()
@@ -2285,7 +2275,6 @@ fn value_cmp_coerced(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     }
 }
 
-
 #[async_trait::async_trait]
 impl StorageEngine for MvccStorageAdapter {
     fn sync(&self) -> Result<(), StorageError> {
@@ -2353,9 +2342,7 @@ impl StorageEngine for MvccStorageAdapter {
     }
 
     async fn drop_table(&self, table: &str) -> Result<(), StorageError> {
-        self.engine
-            .drop_table(table)
-            .map_err(StorageError::from)?;
+        self.engine.drop_table(table).map_err(StorageError::from)?;
         wal_log!(
             self,
             MvccWalRecord::DropTable {
@@ -2508,6 +2495,7 @@ impl StorageEngine for MvccStorageAdapter {
         // own id (same formats, replay already understands them); a failure
         // writes Abort and the prefix is excluded. Single-row batches keep
         // the cheap txn-0 record (atomic by itself).
+        #[cfg_attr(not(feature = "server"), allow(unused_variables))]
         let wal_txn_id = match (auto, rows.len()) {
             (true, n) if n > 1 => {
                 wal_log!(self, MvccWalRecord::Begin { txn_id })?;
@@ -2582,14 +2570,10 @@ impl StorageEngine for MvccStorageAdapter {
         Ok(())
     }
 
-
     async fn scan(&self, table: &str) -> Result<Vec<Row>, StorageError> {
         let (_txn_id, snap, auto) = self.current_or_auto()?;
         // Use scan() (not scan_rows) to get version indices for SSI tracking
-        let results = self
-            .engine
-            .scan(table, &snap)
-            .map_err(StorageError::from)?;
+        let results = self.engine.scan(table, &snap).map_err(StorageError::from)?;
         // Record SIREAD locks for SERIALIZABLE transactions
         if !auto {
             let indices: Vec<usize> = results.iter().map(|(idx, _)| *idx).collect();
@@ -2613,10 +2597,7 @@ impl StorageEngine for MvccStorageAdapter {
         limit: Option<usize>,
     ) -> Result<Vec<Row>, StorageError> {
         let (_txn_id, snap, auto) = self.current_or_auto()?;
-        let results = self
-            .engine
-            .scan(table, &snap)
-            .map_err(StorageError::from)?;
+        let results = self.engine.scan(table, &snap).map_err(StorageError::from)?;
         // The read set is every version the snapshot exposed, regardless of
         // how few columns the query kept — narrowing must not shrink it.
         if !auto {
@@ -2639,10 +2620,7 @@ impl StorageEngine for MvccStorageAdapter {
         // rebuilds, which are not part of the transaction's logical read set and
         // must not introduce spurious SSI rw-conflicts.
         let (txn_id, snap, auto) = self.current_or_auto()?;
-        let results = self
-            .engine
-            .scan(table, &snap)
-            .map_err(StorageError::from)?;
+        let results = self.engine.scan(table, &snap).map_err(StorageError::from)?;
         let rows: Vec<Row> = results.into_iter().map(|(_, r)| (*r).clone()).collect();
         if auto {
             self.auto_commit(txn_id);
@@ -2656,10 +2634,7 @@ impl StorageEngine for MvccStorageAdapter {
     /// trait default (which would return scan-order positions).
     async fn scan_physical(&self, table: &str) -> Result<Vec<(usize, Row)>, StorageError> {
         let (_txn_id, snap, auto) = self.current_or_auto()?;
-        let results = self
-            .engine
-            .scan(table, &snap)
-            .map_err(StorageError::from)?;
+        let results = self.engine.scan(table, &snap).map_err(StorageError::from)?;
         if !auto {
             let indices: Vec<usize> = results.iter().map(|(idx, _)| *idx).collect();
             self.maybe_record_siread(_txn_id, table, &indices);
@@ -3177,6 +3152,7 @@ impl StorageEngine for MvccStorageAdapter {
         // NU-07: multi-row auto-commit deletions are one statement and get a
         // real WAL transaction (Begin/records/Commit-or-Abort); single-row
         // autos keep the txn-0 record.
+        #[cfg_attr(not(feature = "server"), allow(unused_variables))]
         let wal_txn_id = match (auto, sorted.len()) {
             (true, n) if n > 1 => {
                 wal_log!(self, MvccWalRecord::Begin { txn_id })?;
@@ -3389,10 +3365,7 @@ impl StorageEngine for MvccStorageAdapter {
         // partway has in-memory state and WAL compensations diverging; a
         // COMMIT could publish a partial rollback. Refuse — the caller must
         // ROLLBACK the whole transaction.
-        if sess
-            .doomed
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if sess.doomed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(StorageError::Io(
                 "transaction requires rollback: a savepoint rollback failed".into(),
             ));
@@ -3449,7 +3422,11 @@ impl StorageEngine for MvccStorageAdapter {
             // w.r.t. other serializable committers, with the durable decision
             // sandwiched between them under the same commit-point lock.
             let _commit_point = self.engine.txn_mgr().serial_commit_lock();
-            match self.engine.txn_mgr().check_serializable_commit(commit_txn_id) {
+            match self
+                .engine
+                .txn_mgr()
+                .check_serializable_commit(commit_txn_id)
+            {
                 Err(e) => Err(StorageError::SerializationFailure(e)),
                 Ok(()) => match wal_log_commit!(self, commit_txn_id, xact) {
                     Err(e) => Err(e),
@@ -3476,8 +3453,7 @@ impl StorageEngine for MvccStorageAdapter {
             // further write until recovery, and the indeterminate error has
             // already reached the caller. A serialization failure is a
             // definite abort (nothing was written).
-            if self.engine.txn_mgr().get_status(commit_txn_id) == super::txn::TxnStatus::Active
-            {
+            if self.engine.txn_mgr().get_status(commit_txn_id) == super::txn::TxnStatus::Active {
                 self.engine.release_unique(commit_txn_id);
                 self.engine.txn_mgr().abort(txn);
             } else {
@@ -3565,13 +3541,9 @@ impl StorageEngine for MvccStorageAdapter {
 
     async fn savepoint(&self, name: &str) -> Result<(), StorageError> {
         let sess = self.mvcc_session();
-        if sess
-            .doomed
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if sess.doomed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(StorageError::Io(
-                "transaction is doomed by a failed savepoint rollback; ROLLBACK required"
-                    .into(),
+                "transaction is doomed by a failed savepoint rollback; ROLLBACK required".into(),
             ));
         }
         // A savepoint is a MARK into the transaction's undo journal
@@ -3598,13 +3570,9 @@ impl StorageEngine for MvccStorageAdapter {
         // Roll back the journal AFTER the mark, in reverse. Nested savepoints
         // established after this one are discarded; the target stays live
         // (Postgres semantics — it can be rolled back to again).
-        if sess
-            .doomed
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if sess.doomed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(StorageError::Io(
-                "transaction is doomed by a failed savepoint rollback; ROLLBACK required"
-                    .into(),
+                "transaction is doomed by a failed savepoint rollback; ROLLBACK required".into(),
             ));
         }
         let (offset, truncate_to) = {
@@ -3648,9 +3616,7 @@ impl StorageEngine for MvccStorageAdapter {
         };
         for op in undone.iter().rev() {
             let outcome = match op {
-                UndoOp::Insert { table, vidx } => {
-                    self.undo_own_insert(table, *vidx, txn_id)
-                }
+                UndoOp::Insert { table, vidx } => self.undo_own_insert(table, *vidx, txn_id),
                 UndoOp::DeleteMark { table, vidx, row } => {
                     self.undo_own_delete(table, *vidx, row.clone(), txn_id)
                 }
@@ -3678,13 +3644,9 @@ impl StorageEngine for MvccStorageAdapter {
     /// for unknown names.
     async fn release_savepoint(&self, name: &str) -> Result<(), StorageError> {
         let sess = self.mvcc_session();
-        if sess
-            .doomed
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if sess.doomed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(StorageError::Io(
-                "transaction is doomed by a failed savepoint rollback; ROLLBACK required"
-                    .into(),
+                "transaction is doomed by a failed savepoint rollback; ROLLBACK required".into(),
             ));
         }
         if sess.session_txn.read().is_none() {
@@ -3765,8 +3727,7 @@ impl StorageEngine for MvccStorageAdapter {
             // transaction that pinned the GC horizon forever.
             let scanned = self.engine.scan_versions_with_visibility(table, &snap);
             self.engine.txn_mgr().abort(&mut read_txn);
-            let results =
-                scanned.map_err(StorageError::from)?;
+            let results = scanned.map_err(StorageError::from)?;
             let mut map: std::collections::BTreeMap<Value, HashMap<usize, Row>> =
                 std::collections::BTreeMap::new();
             let mut version_map: HashMap<Value, Vec<usize>> = HashMap::new();
@@ -4000,17 +3961,13 @@ impl StorageEngine for MvccStorageAdapter {
         Some(resolved_rows)
     }
 
-
     fn supports_mvcc(&self) -> bool {
         true
     }
 
     fn refresh_statement_snapshot(&self) {
         let sess = self.mvcc_session();
-        if sess
-            .lease_pinned
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if sess.lease_pinned.load(std::sync::atomic::Ordering::Acquire) {
             // A lease holder's snapshot is pinned to the ACQUIRE moment;
             // the per-statement READ COMMITTED refresh would move it.
             return;
@@ -4304,11 +4261,19 @@ mod tests {
         let watermark = txn_mgr.gc_watermark();
         engine.gc(watermark);
         let reclaimed = engine.compact_tails(watermark);
-        assert_eq!(reclaimed, 0, "a dead slot below live slots is never reclaimed");
+        assert_eq!(
+            reclaimed, 0,
+            "a dead slot below live slots is never reclaimed"
+        );
         assert_eq!(engine.table_version_count("t"), 6);
         // And ids survive unmoved: a scan returns the survivors at 0,1,3,4,5.
         let r = txn_mgr.begin(IsolationLevel::Snapshot);
-        let ids: Vec<usize> = engine.scan("t", &r.snapshot).unwrap().into_iter().map(|(i, _)| i).collect();
+        let ids: Vec<usize> = engine
+            .scan("t", &r.snapshot)
+            .unwrap()
+            .into_iter()
+            .map(|(i, _)| i)
+            .collect();
         assert_eq!(ids, vec![0, 1, 3, 4, 5]);
     }
 
@@ -4530,7 +4495,11 @@ mod tests {
         // and pending mutations address rows by — are never reassigned.
         let gc_count = engine.gc(t2.id + 10);
         assert_eq!(gc_count, 1);
-        assert_eq!(engine.total_versions(), 2, "slots are retained; identities are stable");
+        assert_eq!(
+            engine.total_versions(),
+            2,
+            "slots are retained; identities are stable"
+        );
         // The dead version is invisible to a fresh snapshot.
         let mut reader = txn_mgr.begin(IsolationLevel::Snapshot);
         assert_eq!(engine.scan_rows("t1", &reader.snapshot).unwrap().len(), 1);
@@ -4568,7 +4537,10 @@ mod tests {
         assert_eq!(engine.total_versions(), 1);
         let mut after = txn_mgr.begin(IsolationLevel::Snapshot);
         assert!(
-            engine.scan_rows("gc_horizon", &after.snapshot).unwrap().is_empty(),
+            engine
+                .scan_rows("gc_horizon", &after.snapshot)
+                .unwrap()
+                .is_empty(),
             "the collected version must be invisible"
         );
         txn_mgr.abort(&mut after);
@@ -4637,8 +4609,18 @@ mod tests {
         );
         assert_eq!(engine.total_versions(), 2);
         let mut after = txn_mgr.begin(IsolationLevel::Snapshot);
-        assert!(engine.scan_rows("gc_one", &after.snapshot).unwrap().is_empty());
-        assert!(engine.scan_rows("gc_two", &after.snapshot).unwrap().is_empty());
+        assert!(
+            engine
+                .scan_rows("gc_one", &after.snapshot)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            engine
+                .scan_rows("gc_two", &after.snapshot)
+                .unwrap()
+                .is_empty()
+        );
         txn_mgr.abort(&mut after);
     }
 
@@ -4854,10 +4836,7 @@ mod tests {
         {
             let mut indexes = adapter.indexes.write();
             let idx = indexes.get_mut("t_pkey").unwrap();
-            idx.version_map
-                .get_mut(&Value::Int32(1))
-                .unwrap()
-                .push(0);
+            idx.version_map.get_mut(&Value::Int32(1)).unwrap().push(0);
         }
 
         let matches = adapter
@@ -5134,7 +5113,8 @@ mod tests {
         adapter.insert("t", adapter_row(&[2])).await.unwrap();
 
         let sess = adapter.mvcc_session();
-        sess.doomed.store(true, std::sync::atomic::Ordering::Release);
+        sess.doomed
+            .store(true, std::sync::atomic::Ordering::Release);
 
         let commit = adapter.commit_txn().await;
         assert!(commit.is_err(), "doomed transaction must not commit");
@@ -5145,9 +5125,7 @@ mod tests {
 
         // Full ROLLBACK is the sanctioned exit and clears the doom.
         adapter.abort_txn().await.unwrap();
-        assert!(!sess
-            .doomed
-            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(!sess.doomed.load(std::sync::atomic::Ordering::Acquire));
 
         // The session works again afterwards.
         adapter.begin_txn().await.unwrap();
@@ -6028,7 +6006,6 @@ mod tests {
         txn_mgr.abort(&mut fresh);
     }
 
-
     // ── Audit regression tests (2026-09-17 sweep) ─────────────────────────
 
     /// NU-13: adjacent Int64 values above 2^53 must not compare Equal via
@@ -6118,9 +6095,7 @@ mod tests {
 
         // Mutating by the survivor's identity still hits the survivor.
         let mut w = txn_mgr.begin(IsolationLevel::Snapshot);
-        engine
-            .update("t", survivor_idx, w.id, row(&[42]))
-            .unwrap();
+        engine.update("t", survivor_idx, w.id, row(&[42])).unwrap();
         txn_mgr.commit(&mut w);
         let mut check = txn_mgr.begin(IsolationLevel::Snapshot);
         let rows = engine.scan_rows("t", &check.snapshot).unwrap();
@@ -6189,7 +6164,10 @@ mod tests {
         adapter.release_savepoint("outer").await.unwrap();
 
         let err = adapter.rollback_to_savepoint("inner").await;
-        assert!(err.is_err(), "nested savepoint survived its parent's RELEASE");
+        assert!(
+            err.is_err(),
+            "nested savepoint survived its parent's RELEASE"
+        );
         let err = adapter.release_savepoint("nope").await;
         assert!(err.is_err(), "unknown savepoint name silently succeeded");
         adapter.commit_txn().await.unwrap();
@@ -6679,6 +6657,7 @@ impl MvccStorageAdapter {
         let mut count = 0;
         // NU-07: multi-row auto-commit updates are one statement and get a
         // real WAL transaction; single-row autos keep the txn-0 record.
+        #[cfg_attr(not(feature = "server"), allow(unused_variables))]
         let wal_txn_id = match (auto, updates.len()) {
             (true, n) if n > 1 => {
                 wal_log!(self, MvccWalRecord::Begin { txn_id })?;
