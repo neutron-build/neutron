@@ -1490,7 +1490,7 @@ drivers; nothing outside this table is claimed.
 
 | Component | Verified | Not claimed |
 |---|---|---|
-| PostgreSQL | 15, 16, 17 and 18. Pull requests run the live suites on 17 (`typescript.yml`, `cli.yml`); the release matrix (`orm-matrix.yml`, run 36373029021) passed this package's suite (890/890) and the CLI suite on 15.19, 16.15, 17.11 and 18.6 (`pgvector/pgvector` images). On 15 and 16, a generated-column expression change is refused before anything runs, because `ALTER COLUMN … SET EXPRESSION` is PostgreSQL 17+ | 14: the suites were run and it is not claimed, because a view declared with `securityInvoker` (PostgreSQL 15+) fails at apply and rolls back instead of being refused at plan time. 13 and older are end of life and untested |
+| PostgreSQL | 15, 16, 17 and 18. Pull requests run the live suites on 17 (`typescript.yml`, `cli.yml`); the release matrix (`orm-matrix.yml`, run MATRIX_RUN_ID_TBD, on the release merge commit) passed this package's suite (890/890) and the CLI suite on 15.19, 16.15, 17.11 and 18.6 (`pgvector/pgvector` images). On 15 and 16, a generated-column expression change is refused before anything runs, because `ALTER COLUMN … SET EXPRESSION` is PostgreSQL 17+ | 14: the suites were run and it is not claimed, because a view declared with `securityInvoker` (PostgreSQL 15+) fails at apply and rolls back instead of being refused at plan time. 13 and older are end of life and untested |
 | Node.js | `engines: ">=22"`; CI runs 22 and 24; the installed-artifact gate ran on 22.19, 22.23 and 24.20 | 22.0–22.18; Node 20 and older |
 | Drivers | `pg` 8.22.0 and `postgres` 3.4.8, the versions the suites resolve (peer ranges `^8.11.0` / `^3.4.7`) | other versions inside the peer ranges |
 | TypeScript | 5.7.2 (minimum) and 5.9.3, declarations checked with `skipLibCheck` off | |
@@ -1501,7 +1501,7 @@ drivers; nothing outside this table is claimed.
 **Nucleus is not supported by this package.** What the ORM can rely on is
 measured, per driver, against a named build — Nucleus 1.0.2, `nucleus/` tree
 `3313729a` — in
-[`conformance/live/orm/ORM_CONFORMANCE.md`](../../../conformance/live/orm/ORM_CONFORMANCE.md)
+[`conformance/live/orm/ORM_CONFORMANCE.md`](https://github.com/neutron-build/neutron/blob/main/conformance/live/orm/ORM_CONFORMANCE.md)
 (`pg` / `postgres`: 71/70 of 140 probes supported). By area, supported
 out of probed with `pg`: engine 1/2, relational SQL 19/25, DML 9/14,
 constraints 7/9, codecs 9/19, catalog 2/14, DDL 3/11, RLS 3/9, locks 3/11,
