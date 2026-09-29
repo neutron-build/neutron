@@ -177,7 +177,12 @@ a live plan against a database without it is refused (a snapshot plan cannot
 tell). `schema pull` writes every table it finds as managed, but keeps the
 marker of the document it overwrites; the TypeScript exporter always writes
 `managed: true`. In `--mode snapshot` the chain records the marker, and keeps
-it when a later document stops declaring the table.
+it when a later document stops declaring the table. The chain retains known
+base metadata and foreign keys for an unmanaged object; a descriptive declaration
+cannot erase dependencies that would make a later drop unsafe. Offline plans
+cannot discover external changes after the snapshot. Studio designer plans use
+these ownership markers when launched with `--schema` or an existing configured
+`migrations.schema` file; edits to unmanaged objects are refused.
 A foreign key of a table the plan keeps but does not manage (left in place,
 declared with `managed: false`, or in a schema the document does not declare)
 onto a key or table the plan drops refuses the plan, naming the foreign key:

@@ -64,11 +64,21 @@ creates, alters or drops it (`--allow-destructive` included), does not compare
 its state, does not report drift on it and does not record it as left in place.
 The entry stays in the document so managed objects can reference it (a foreign
 key from a managed table onto an unmanaged one). The entry's content is
-descriptive and is not checked against the database.
+descriptive and is not checked against the database. Snapshot planning preserves
+previously known metadata and dependencies for an existing unmanaged object,
+with its ownership marker set to false. A stale declaration cannot erase a known
+foreign key and permit a later destructive plan. Offline plans cannot discover
+external changes made after the snapshot.
+
+Studio uses the same ownership boundary when launched with `--schema path.json`,
+or when the configured `migrations.schema` file exists (default
+`neutron.schema.json`). This file applies to designer plans for every connection
+in that launch. Preview and apply reload it; unmanaged edits and a missing or
+invalid bound file are refused. Without a schema source, the designer operates
+on explicitly selected live objects. SQL editor statements remain explicit SQL.
 
 ## Status
 
-Version 2 documents can be validated and hashed by the CLI today; the
-migration planning commands still consume version 1 exports and reject
-version 2 input explicitly. Introspection, diffing and planning on v2 land
-with the migration lifecycle work that follows.
+The CLI validates and hashes version 2 documents, introspects and plans live
+changes, and generates snapshot migrations from them. Version 1 input has an
+explicit compatibility reader. Studio schema plans use the same v2 planner.

@@ -16,10 +16,10 @@ package db
 // the managed scope, exactly as for the planner; objects of other schemas
 // are out of scope and not recorded. Constraints are not carried: the
 // planner reconciles them in every mode, so a base constraint the desired
-// document omits is always dropped. An object the desired document declares
-// with managed: false is not neutron's and is recorded as the document has
-// it; one the chain records that way and the document omits is carried
-// forward and not reported as left in place.
+// document omits is always dropped. For managed: false objects, known base
+// metadata is retained with the ownership marker, because their constraints
+// and dependencies still exist even when the declaration omits them. They
+// are carried forward without being reported as left in place.
 //
 // It runs on the plan the planner just produced, when the snapshot is
 // written. The chain is always read as recorded: snapshots written before
@@ -109,7 +109,8 @@ func SnapshotTarget(base, desired *V2Document, up []string) (*V2Document, []Reta
 		}
 		dt := dm.Table(id)
 		if dt != nil && !dt.Managed {
-			continue // declared managed: false: recorded as the document has it
+			carried = append(carried, RetainedObject{Kind: "table", Identity: id})
+			continue
 		}
 		if dt == nil && !bt.Managed {
 			// The chain records it managed: false and the document omits it:
@@ -146,7 +147,10 @@ func SnapshotTarget(base, desired *V2Document, up []string) (*V2Document, []Reta
 			continue
 		}
 		if dv := dm.View(bv.Identity); dv != nil {
-			continue // declared (managed: false is recorded as the document has it)
+			if !dv.Managed {
+				carried = append(carried, RetainedObject{Kind: "view", Identity: bv.Identity})
+			}
+			continue
 		}
 		if !bv.Managed {
 			carried = append(carried, RetainedObject{Kind: "view", Identity: bv.Identity})
@@ -161,7 +165,10 @@ func SnapshotTarget(base, desired *V2Document, up []string) (*V2Document, []Reta
 			continue
 		}
 		if de := dm.Enum(be.Identity); de != nil {
-			continue // declared (managed: false is recorded as the document has it)
+			if !de.Managed {
+				carried = append(carried, RetainedObject{Kind: "enum", Identity: be.Identity})
+			}
+			continue
 		}
 		if !be.Managed {
 			carried = append(carried, RetainedObject{Kind: "enum", Identity: be.Identity})
@@ -211,6 +218,9 @@ func carryRetained(base, desired *V2Document, bm V2DocumentModel, retained []Ret
 		out := make([]any, 0, len(list)+1)
 		for _, e := range list {
 			if m, ok := e.(map[string]any); ok && entryIdentity(m) == id {
+				if managed, ok := m["managed"].(bool); ok && !managed {
+					entry["managed"] = false
+				}
 				continue
 			}
 			out = append(out, e)

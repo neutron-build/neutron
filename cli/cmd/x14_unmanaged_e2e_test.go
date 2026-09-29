@@ -245,3 +245,40 @@ func TestX14PullRefusesInvalidPreviousDocument(t *testing.T) {
 		t.Fatalf("pull overwrote the invalid ownership document: %q", got)
 	}
 }
+
+// A descriptive unmanaged declaration must not erase dependencies that the
+// baseline already knew. An unsafe later drop must fail at generation.
+func TestX14SnapshotPreservesKnownForeignKey(t *testing.T) {
+	bin := buildCLIBinary(t)
+	work := t.TempDir()
+	mig := filepath.Join(work, "migrations")
+	dbURL, fx := newM02CommandDB(t, "x14dependency")
+	x14Exec(t, fx, `CREATE SCHEMA app`, `CREATE TABLE app.parent (id int PRIMARY KEY)`,
+		`CREATE TABLE app.external (id int PRIMARY KEY, parent_id int REFERENCES app.parent(id))`,
+		`INSERT INTO app.parent VALUES (1)`, `INSERT INTO app.external VALUES (1,1)`)
+	if code, out := runCLIProcess(t, bin, dbURL, "schema", "baseline", "--dir", mig); code != 0 {
+		t.Fatalf("baseline: %d %s", code, out)
+	}
+	first := filepath.Join(work, "first.json")
+	q12Target(t, bin, first, []string{`CREATE TABLE app.parent (id int PRIMARY KEY, extra text)`, `CREATE TABLE app.external (id int PRIMARY KEY)`}, false)
+	q12MarkUnmanaged(t, first, []string{"app.external"})
+	if code, out := runCLIProcess(t, bin, dbURL, "migrate", "generate", "--mode", "snapshot", "--schema", first, "--dir", mig, "--name", "ownership", "--allow-destructive"); code != 0 {
+		t.Fatalf("first generation: %d %s", code, out)
+	}
+	if code, out := runCLIProcess(t, bin, dbURL, "migrate", "--dir", mig, "--allow-destructive"); code != 0 {
+		t.Fatalf("first apply: %d %s", code, out)
+	}
+	second := filepath.Join(work, "second.json")
+	q12Target(t, bin, second, []string{`CREATE TABLE app.external (id int PRIMARY KEY)`}, false)
+	q12MarkUnmanaged(t, second, []string{"app.external"})
+	code, out := runCLIProcess(t, bin, dbURL, "migrate", "generate", "--mode", "snapshot", "--schema", second, "--dir", mig, "--name", "unsafe_drop", "--allow-destructive")
+	if code == 0 || !strings.Contains(out, "external_parent_id_fkey") {
+		t.Fatalf("unsafe generation must name retained FK: %d %s", code, out)
+	}
+	if files, _ := filepath.Glob(filepath.Join(mig, "*_unsafe_drop.up.sql")); len(files) != 0 {
+		t.Fatalf("refused generation wrote SQL: %v", files)
+	}
+	if got := q09Query(t, fx, `SELECT count(*)::text FROM app.external e JOIN app.parent p ON p.id=e.parent_id`); got != "1" {
+		t.Fatalf("sentinel rows: %s", got)
+	}
+}

@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -14,6 +15,7 @@ import (
 )
 
 func init() {
+	studioCmd.Flags().String("schema", "", "v2 schema source for designer ownership (defaults to migrations.schema when present)")
 	studioCmd.Flags().Int("port", 0, "Studio port (default 4983)")
 	studioCmd.Flags().String("migrations", "migrations", "application migrations directory shown in the inspection journey (applied history is read either way)")
 	rootCmd.AddCommand(studioCmd)
@@ -38,6 +40,17 @@ func runStudio(cmd *cobra.Command, args []string) error {
 	srv, err := studio.NewServer(port)
 	if err != nil {
 		return fmt.Errorf("init studio: %w", err)
+	}
+
+	schemaSource, _ := cmd.Flags().GetString("schema")
+	explicitSchema := cmd.Flags().Changed("schema")
+	if !explicitSchema {
+		schemaSource = config.MigrationsSchemaSource()
+	}
+	if _, err := os.Stat(schemaSource); explicitSchema || err == nil || !os.IsNotExist(err) {
+		if err := srv.SetSchemaSource(schemaSource); err != nil {
+			return err
+		}
 	}
 
 	migrationsDir, _ := cmd.Flags().GetString("migrations")

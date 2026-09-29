@@ -176,3 +176,48 @@ func TestX14PreserveUnmanaged(t *testing.T) {
 		t.Fatalf("no markers: unchanged, got %v %v", kept, err)
 	}
 }
+
+func TestX14SnapshotKeepsKnownUnmanagedDependencies(t *testing.T) {
+	baseModel := m08Base()
+	base := m08Doc(t, baseModel)
+	desiredModel := m08Base()
+	desiredModel.Tables[0].Columns = append(desiredModel.Tables[0].Columns, m08Col("note", "text", false))
+	desiredModel.Tables[1].Managed = false
+	// The declaration is not authoritative for the external table's shape.
+	// Its live FK still exists even when it is absent from this document.
+	desiredModel.Tables[1].Constraints = desiredModel.Tables[1].Constraints[:1]
+	desired := m08Doc(t, desiredModel)
+	plan := x14Diff(t, desired, base, true, true)
+	target, _, err := SnapshotTarget(base, desired, plan.Up)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tm := m08Model(t, target)
+	external := tm.Table(m08ID("public", "other_app"))
+	if external.Managed || len(external.Constraints) != 2 {
+		t.Fatalf("known external FK must survive with managed: false: %+v", external)
+	}
+	desiredModel.Tables = desiredModel.Tables[1:]
+	_, err = DiffV2Document(context.Background(), m08Doc(t, desiredModel), target, DiffV2Options{AllowDestructive: true, SnapshotBase: true})
+	if err == nil || !strings.Contains(err.Error(), "other_app_t_keep_fkey") {
+		t.Fatalf("dropping the referenced table must be refused before apply: %v", err)
+	}
+}
+
+func TestX14OwnershipUsesSchemaAndNameSeparately(t *testing.T) {
+	previousModel := m08Desired()
+	previousModel.Schemas = []V2SchemaDecl{{Name: "a"}, {Name: "a.b"}}
+	previousModel.Tables[0].Identity = m08ID("a.b", "c")
+	previousModel.Tables[0].Managed = false
+	pulledModel := m08Desired()
+	pulledModel.Schemas = previousModel.Schemas
+	pulledModel.Tables[0].Identity = m08ID("a", "b.c")
+	pulled := m08Doc(t, pulledModel)
+	result, kept, err := PreserveUnmanaged(pulled, m08Doc(t, previousModel))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kept) != 0 || result.SHA256Hex != pulled.SHA256Hex {
+		t.Fatalf("quoted identities a.b.c are different tuples: kept=%q", kept)
+	}
+}

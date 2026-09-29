@@ -264,6 +264,15 @@ expressions, expression indexes) refers to. Column types outside the
 document contract (`serial`, `char`, `time`, …) are refused with the
 accepted vocabulary; the SQL editor remains the surface for those.
 
+Launch with `neutron studio --schema neutron.schema.json` to bind designer edits
+to the document's ownership. Studio also uses `migrations.schema` when its file
+exists (default `neutron.schema.json`). Objects declared `managed: false` cannot
+be created, altered or dropped in the designer, even with destructive approval.
+The file applies to every connection in the launch and is reread at preview and
+apply; a missing or invalid bound file refuses planning. Without a schema file,
+the designer plans explicit edits to live objects. The SQL editor runs explicit
+SQL independently of this schema ownership boundary.
+
 `POST /api/schema/apply` executes a reviewed plan only:
 
 - it takes the migration runner's advisory lock (a running migration or
