@@ -12,7 +12,10 @@
 //!
 //! Then we reopen and assert the durability contract:
 //!
-//!   1. Reopen NEVER panics / aborts.
+//!   1. Reopen NEVER panics / aborts, and a TRUNCATED tail (the real crash
+//!      artifact) always recovers. A byte FLIP is damage, not a crash artifact:
+//!      WAL v2 fails closed on it (NU-04), so a refused open is accepted for
+//!      flips as long as the WAL file is left byte-identical.
 //!   2. Recovery yields a CONSISTENT state: every recovered row was actually
 //!      committed AT SOME POINT before the crash. Because replay stops at the
 //!      torn record boundary, the recovered state is the state after applying a
@@ -366,6 +369,7 @@ fn main_impl() {
     let mut resurrected = 0usize; // recovered a non-committed / wrong-value row
     let mut findings = 0usize;
     let mut cov_nonempty = 0usize; // cycles where rows survived the tear (real verification work)
+    let mut cov_refused = 0usize; // flip tears the v2 WAL refused (fail-closed) with the file untouched
     let mut cov_partial = 0usize; // cycles where the tear dropped >=1 committed record (lossy recovery)
 
     'outer: for iter in 0..iterations {
@@ -500,16 +504,27 @@ fn main_impl() {
             total += 1;
             let db = match open(&tmp.0) {
                 Ok(Ok(d)) => d,
-                Ok(Err(_e)) => {
-                    // An Err (not a panic) on reopen of a torn WAL is itself a
-                    // durability defect: recovery should tolerate a torn tail.
-                    findings += 1;
-                    panics += 1;
-                    if findings <= max_report {
-                        println!(
-                            "─── REOPEN ERROR (torn WAL, iter {iter}) ── tear={:?}\n",
-                            tear
-                        );
+                Ok(Err(e)) => {
+                    // WAL v2 fails closed on damage: a byte flip is corruption,
+                    // not a crash artifact (a crash truncates), so a refused
+                    // open is the contract for it - provided the file is left
+                    // exactly as found. A truncation is the real torn tail and
+                    // must always recover.
+                    let untouched = std::fs::read(tmp.wal()).map(|b| b == torn).unwrap_or(false);
+                    let refusal_ok = !matches!(tear, Tear::Truncate(_))
+                        && untouched
+                        && e.contains("left unmodified");
+                    if refusal_ok {
+                        cov_refused += 1;
+                    } else {
+                        findings += 1;
+                        panics += 1;
+                        if findings <= max_report {
+                            println!(
+                                "--- REOPEN ERROR (torn WAL, iter {iter}) tear={:?} wal_untouched={untouched}\n  {e}\n",
+                                tear
+                            );
+                        }
                     }
                     // restore original so subsequent variants start clean
                     let _ = std::fs::write(tmp.wal(), &original);
@@ -605,6 +620,7 @@ fn main_impl() {
     println!("torn-recover cycles : {total}");
     println!("  rows survived tear: {cov_nonempty}  (non-empty recovered set)");
     println!("  lossy recoveries  : {cov_partial}  (torn tail dropped committed records)");
+    println!("  refused (flips)   : {cov_refused}  (fail-closed, WAL left unmodified)");
     println!("reopen panics/errors: {panics}");
     println!("resurrected rows    : {resurrected}");
     println!("total findings      : {findings}");
