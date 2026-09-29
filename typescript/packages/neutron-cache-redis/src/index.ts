@@ -110,6 +110,12 @@ function createAppCacheStore(
         await client.del(appEntryKey(keyPrefix, key));
         return null;
       }
+      // Entries written by core <= 0.2.2 carry a string body; entries outlive
+      // an upgrade in Redis, so read them as the UTF-8 bytes they encoded.
+      const stored: unknown = entry.body;
+      if (typeof stored === "string") {
+        return { ...entry, body: new TextEncoder().encode(stored) };
+      }
       return entry;
     },
     async set(key, entry) {
