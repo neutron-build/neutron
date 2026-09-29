@@ -4895,6 +4895,10 @@ impl Executor {
                     settings.insert("standard_conforming_strings".to_string(), "on".to_string());
                     settings.insert("timezone".to_string(), "UTC".to_string());
                 }
+                // DISCARD ALL also ends any assumed role: a pooler that reuses
+                // the connection with it must not hand over the role.
+                *sess.current_role.write() = None;
+                self.recompute_session_context(&sess);
                 let mut txn = sess.txn_state.write().await;
                 *txn = super::session::TxnState::new();
                 Ok(ExecResult::Command {
@@ -4929,6 +4933,11 @@ impl Executor {
         let sess = self.current_session();
         match reset_stmt.reset {
             Reset::ALL => {
+                // RESET ALL also drops an assumed role.
+                sess.guc_note_role(false);
+                *sess.current_role.write() = None;
+                self.recompute_session_context(&sess);
+                sess.guc_note_all_settings();
                 let mut settings = sess.settings.write();
                 settings.clear();
                 settings.insert("search_path".to_string(), "public".to_string());
@@ -4942,6 +4951,17 @@ impl Executor {
             }
             Reset::ConfigurationParameter(param) => {
                 let param_name = param.to_string().to_lowercase();
+                // RESET ROLE is SET ROLE NONE; a role never lives in the map.
+                if matches!(param_name.as_str(), "role" | "session_authorization") {
+                    sess.guc_note_role(false);
+                    *sess.current_role.write() = None;
+                    self.recompute_session_context(&sess);
+                    return Ok(ExecResult::Command {
+                        tag: "RESET".into(),
+                        rows_affected: 0,
+                    });
+                }
+                sess.guc_note_setting(&param_name, false);
                 let mut settings = sess.settings.write();
                 match param_name.as_str() {
                     "search_path" => {

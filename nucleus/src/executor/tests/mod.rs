@@ -112,6 +112,7 @@ mod test_table_engine_checkpoint; // R4: per-table engine WAL compaction is reac
 mod test_temporal_predicates; // mixed temporal literal/column comparisons
 mod test_temporal_range_cost; // S66: TIMESTAMP/DATE range predicates must prune // S65: UPDATE/DELETE by PK must not scan the table
 mod test_triggers; // EXE-2: row-binding tables must never touch user tables named _new/_old
+mod test_set_local_scope; // N1: SET LOCAL and SET ROLE are transaction-scoped
 mod test_txn;
 mod test_txn_lazy_snapshot;
 mod test_upstream_teploy_2026_09_18; // rename-in-txn visibility + replacing upsert loss (2026-09-18 upstream reports) // R8: BEGIN/SAVEPOINT do not clone the whole database // Phase 4: JSONB @> containment, GIN indexes, subscript syntax

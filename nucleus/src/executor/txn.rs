@@ -70,6 +70,7 @@ impl Executor {
         txn.engine_snapshots.clear();
         txn.engine_savepoints.clear();
         txn.aborted = false;
+        sess.guc_begin();
 
         txn.active = true;
         // Mirror kept in the same critical section — see `Session::txn_active`.
@@ -197,6 +198,9 @@ impl Executor {
         txn.engine_snapshots.clear();
         txn.engine_savepoints.clear();
         *sess.cross_model.lock() = None; // Discard the write-set on commit
+        // SET LOCAL ends with the transaction; session-level SET stays.
+        sess.guc_commit();
+        self.recompute_session_context(&sess);
         self.metrics.open_transactions.dec();
         drop(txn);
 
@@ -341,6 +345,9 @@ impl Executor {
         txn.derived_dirty_tables.clear();
         txn.engine_snapshots.clear();
         txn.engine_savepoints.clear();
+        // Every SET, SET LOCAL and SET ROLE of the transaction is undone.
+        sess.guc_rollback();
+        self.recompute_session_context(&sess);
 
         self.metrics.open_transactions.dec();
         drop(txn);
@@ -405,6 +412,7 @@ impl Executor {
             policy_dirty: txn.policy_dirty,
         };
         txn.security_savepoints.push(sp);
+        sess.guc_savepoint(name);
 
         // Open a cross-model level for this savepoint. Its before-images are
         // captured lazily at the first write after this point, so a savepoint
@@ -445,6 +453,7 @@ impl Executor {
         {
             txn.security_savepoints.truncate(pos);
         }
+        sess.guc_release_savepoint(name);
         // Releasing keeps the writes; every level below already recorded them,
         // so the level is simply discarded.
         if let Some(cm) = sess.cross_model.lock().as_mut()
@@ -525,6 +534,8 @@ impl Executor {
         // savepoint, failed engine restore) deliberately leave it set. Every
         // fallible step is past by here; the reverts below are best-effort.
         txn.aborted = false;
+        sess.guc_rollback_to_savepoint(name);
+        self.recompute_session_context(&sess);
         drop(txn);
 
         for (table, original) in &engine_revert {

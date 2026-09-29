@@ -174,6 +174,38 @@ pub(super) struct SecuritySavepoint {
     pub policy_dirty: bool,
 }
 
+/// Session-scoped configuration as one restorable unit: ordinary settings and
+/// the assumed role (which is also authority, so it travels with them).
+#[derive(Clone)]
+pub(super) struct GucSnapshot {
+    pub settings: HashMap<String, String>,
+    pub role: Option<String>,
+    /// Values `SET LOCAL` displaced, as of the snapshot (see `GucTxn`).
+    pub local_settings: HashMap<String, Option<String>>,
+    pub local_role: Option<Option<String>>,
+}
+
+/// Transaction-scoped bookkeeping for `SET`, `SET LOCAL` and `SET ROLE`.
+///
+/// PostgreSQL scopes these to the transaction: a `SET LOCAL` reverts at COMMIT
+/// and at ROLLBACK, a plain `SET` reverts only at ROLLBACK, and
+/// `ROLLBACK TO SAVEPOINT` reverts both back to the savepoint. Kept apart from
+/// `TxnState` because `SET` runs synchronously and `TxnState` sits behind an
+/// async lock. `None` on the session means no transaction is open.
+pub(super) struct GucTxn {
+    /// State at BEGIN: what ROLLBACK restores.
+    pub begin: GucSnapshot,
+    /// For each setting a `SET LOCAL` changed, the value to put back at
+    /// COMMIT (`None` = the setting did not exist). A later session-level
+    /// `SET` of the same name drops the entry: it makes the value the
+    /// transaction's committed one.
+    pub local_settings: HashMap<String, Option<String>>,
+    /// The same for the assumed role (`Some(None)` = no role assumed).
+    pub local_role: Option<Option<String>>,
+    /// State as of each SQL savepoint, for `ROLLBACK TO SAVEPOINT`.
+    pub savepoints: Vec<(String, GucSnapshot)>,
+}
+
 /// Transaction state for the current session.
 pub(super) struct TxnState {
     /// Whether a transaction is currently active.
@@ -275,6 +307,8 @@ pub struct Session {
     pub(super) authenticated_user: parking_lot::RwLock<Option<String>>,
     /// Effective role selected through the authorized SET ROLE path.
     pub(super) current_role: parking_lot::RwLock<Option<String>>,
+    /// Transaction-scoped `SET` bookkeeping; `None` outside a transaction.
+    pub(super) guc_txn: parking_lot::Mutex<Option<GucTxn>>,
     /// Tenant claim installed by a trusted boundary, never by generic SET.
     pub(super) trusted_tenant_id: parking_lot::RwLock<Option<String>>,
     pub(super) active_ctes: parking_lot::RwLock<CteTableMap>,
@@ -350,6 +384,7 @@ impl Session {
             settings: parking_lot::RwLock::new(default_settings),
             authenticated_user: parking_lot::RwLock::new(Some("nucleus".to_string())),
             current_role: parking_lot::RwLock::new(None),
+            guc_txn: parking_lot::Mutex::new(None),
             trusted_tenant_id: parking_lot::RwLock::new(None),
             active_ctes: parking_lot::RwLock::new(HashMap::new()),
             // Default identity is the bootstrap superuser, so an unconfigured
@@ -373,6 +408,143 @@ impl Session {
             cancel_requested: AtomicBool::new(false),
             statement_depth: AtomicU64::new(0),
             plan_cache_key_hint: parking_lot::Mutex::new(None),
+        }
+    }
+
+    fn guc_snapshot(
+        &self,
+        local_settings: HashMap<String, Option<String>>,
+        local_role: Option<Option<String>>,
+    ) -> GucSnapshot {
+        GucSnapshot {
+            settings: self.settings.read().clone(),
+            role: self.current_role.read().clone(),
+            local_settings,
+            local_role,
+        }
+    }
+
+    /// Whether a transaction block is open, for `SET LOCAL`.
+    pub(super) fn guc_in_txn(&self) -> bool {
+        self.guc_txn.lock().is_some()
+    }
+
+    /// BEGIN: start recording `SET` state for this transaction.
+    pub(super) fn guc_begin(&self) {
+        let begin = self.guc_snapshot(HashMap::new(), None);
+        *self.guc_txn.lock() = Some(GucTxn {
+            begin,
+            local_settings: HashMap::new(),
+            local_role: None,
+            savepoints: Vec::new(),
+        });
+    }
+
+    /// COMMIT: `SET LOCAL` values revert, session-level `SET` stays.
+    pub(super) fn guc_commit(&self) {
+        let Some(txn) = self.guc_txn.lock().take() else {
+            return;
+        };
+        let mut settings = self.settings.write();
+        for (name, prior) in txn.local_settings {
+            match prior {
+                Some(value) => {
+                    settings.insert(name, value);
+                }
+                None => {
+                    settings.remove(&name);
+                }
+            }
+        }
+        drop(settings);
+        if let Some(role) = txn.local_role {
+            *self.current_role.write() = role;
+        }
+    }
+
+    /// ROLLBACK (and every abort path): all `SET` state returns to BEGIN.
+    pub(super) fn guc_rollback(&self) {
+        let Some(txn) = self.guc_txn.lock().take() else {
+            return;
+        };
+        *self.settings.write() = txn.begin.settings;
+        *self.current_role.write() = txn.begin.role;
+    }
+
+    /// SAVEPOINT: remember `SET` state at this level.
+    pub(super) fn guc_savepoint(&self, name: &str) {
+        let mut guard = self.guc_txn.lock();
+        if let Some(txn) = guard.as_mut() {
+            let snap = self.guc_snapshot(txn.local_settings.clone(), txn.local_role.clone());
+            txn.savepoints.push((name.to_string(), snap));
+        }
+    }
+
+    /// RELEASE SAVEPOINT: keep the state, drop the level.
+    pub(super) fn guc_release_savepoint(&self, name: &str) {
+        if let Some(txn) = self.guc_txn.lock().as_mut()
+            && let Some(pos) = txn.savepoints.iter().rposition(|(n, _)| n == name)
+        {
+            txn.savepoints.truncate(pos);
+        }
+    }
+
+    /// ROLLBACK TO SAVEPOINT: `SET` and `SET LOCAL` made since revert. The
+    /// savepoint itself stays, as in PostgreSQL.
+    pub(super) fn guc_rollback_to_savepoint(&self, name: &str) {
+        let mut guard = self.guc_txn.lock();
+        let Some(txn) = guard.as_mut() else {
+            return;
+        };
+        let Some(pos) = txn.savepoints.iter().rposition(|(n, _)| n == name) else {
+            return;
+        };
+        let snap = txn.savepoints[pos].1.clone();
+        txn.savepoints.truncate(pos + 1);
+        txn.local_settings = snap.local_settings;
+        txn.local_role = snap.local_role;
+        *self.settings.write() = snap.settings;
+        *self.current_role.write() = snap.role;
+    }
+
+    /// Record a setting change about to be made while a transaction is open.
+    /// `local` remembers the displaced value for COMMIT; a session-level
+    /// change forgets any earlier local one, because it now owns the value.
+    /// Call before the write.
+    pub(super) fn guc_note_setting(&self, name: &str, local: bool) {
+        let mut guard = self.guc_txn.lock();
+        let Some(txn) = guard.as_mut() else {
+            return;
+        };
+        if local {
+            if !txn.local_settings.contains_key(name) {
+                let prior = self.settings.read().get(name).cloned();
+                txn.local_settings.insert(name.to_string(), prior);
+            }
+        } else {
+            txn.local_settings.remove(name);
+        }
+    }
+
+    /// `RESET ALL` in a transaction: every setting is now session-owned.
+    pub(super) fn guc_note_all_settings(&self) {
+        if let Some(txn) = self.guc_txn.lock().as_mut() {
+            txn.local_settings.clear();
+        }
+    }
+
+    /// The same for the assumed role. Call before the write.
+    pub(super) fn guc_note_role(&self, local: bool) {
+        let mut guard = self.guc_txn.lock();
+        let Some(txn) = guard.as_mut() else {
+            return;
+        };
+        if local {
+            if txn.local_role.is_none() {
+                txn.local_role = Some(self.current_role.read().clone());
+            }
+        } else {
+            txn.local_role = None;
         }
     }
 
@@ -410,6 +582,7 @@ impl Session {
             txn.derived_dirty_tables.clear();
         }
         *self.cross_model.lock() = None;
+        *self.guc_txn.lock() = None;
         // Clear prepared statements
         self.prepared_stmts.write().await.clear();
         // Clear cursors
