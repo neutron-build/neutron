@@ -2,7 +2,7 @@
 
 Redis cache provider for Neutron.
 
-Redis-backed caching with serialization and tag-based invalidation.
+Redis-backed caching with serialization and path-based invalidation.
 
 ## Installation
 

@@ -2,7 +2,7 @@
 
 Security middleware for Neutron.
 
-CSRF protection, rate limiting, input validation, and tenant isolation.
+CSP nonces, CSRF protection, rate limiting with trusted-proxy handling, and secure cookie defaults.
 
 ## Installation
 
