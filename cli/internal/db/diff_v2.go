@@ -159,11 +159,69 @@ func DiffV2Document(ctx context.Context, desired, actual *V2Document, opts DiffV
 	return pl.result, nil
 }
 
+// The predicates below decide which objects --allow-destructive drops
+// (objects in the managed scope the schema does not declare as managed).
+// The drop sites and flagScope both use them, so a refusal's list of what
+// the flag drops cannot drift from what the plan drops.
+
+// flagDropsTable: planTableDrops. A table declared with managed: false
+// drops too (it is not a managed desired table).
+func (p *v2Planner) flagDropsTable(id V2Identity) bool {
+	return p.scope[id.Schema] && !p.desiredTables[id] && !isProtectedTableName(id.Name)
+}
+
+// sharedTable: a managed desired table the base has; its undeclared columns
+// and indexes are the ones the flag drops.
+func (p *v2Planner) sharedTable(id V2Identity) bool {
+	return p.desiredTables[id] && p.actualTables[id] && !isProtectedTableName(id.Name)
+}
+
+// flagDropsColumn: planDroppedColumns (a column renamed away is not dropped).
+func (p *v2Planner) flagDropsColumn(table V2Identity, desired *V2Table, column string) bool {
+	if desired.Column(column) != nil {
+		return false
+	}
+	for target, source := range p.opts.Renames {
+		if source == column && strings.HasPrefix(target, table.String()+".") {
+			return false
+		}
+	}
+	return true
+}
+
+// flagDropsIndex: planIndexChanges.
+func (p *v2Planner) flagDropsIndex(desired *V2Table, index string) bool {
+	return desired.Index(index) == nil
+}
+
+// flagDropsView: planViewsAroundAlters.
+func (p *v2Planner) flagDropsView(id V2Identity) bool {
+	return p.scope[id.Schema] && !p.desiredViews[id]
+}
+
+// flagDropsEnum: planEnumDrops. It returns the column that keeps the enum
+// in use ("" when it drops): any column of a table the plan does not drop.
+func (p *v2Planner) enumKeptBy(e V2Identity, droppedTables map[V2Identity]bool) string {
+	for _, t := range p.actual.Tables {
+		if droppedTables[t.Identity] {
+			continue // the using table drops earlier in this same plan
+		}
+		for _, c := range t.Columns {
+			if c.Type.Enum != nil && *c.Type.Enum == e {
+				return t.Identity.String() + "." + c.Name
+			}
+		}
+	}
+	return ""
+}
+
+func (p *v2Planner) flagDropsEnum(id V2Identity) bool {
+	return p.scope[id.Schema] && !p.desiredEnums[id]
+}
+
 // flagScope completes a refusal that recommends --allow-destructive: the
 // flag also drops every managed-scope object the schema does not declare
-// (the drops planTableDrops, planDroppedColumns, planIndexChanges,
-// planViewsAroundAlters and planEnumDrops gate on it), so the refusal
-// names them.
+// as managed, so the refusal names them, with the drop sites' predicates.
 func (p *v2Planner) flagScope() string {
 	if p.opts.AllowDestructive {
 		return ""
@@ -171,46 +229,33 @@ func (p *v2Planner) flagScope() string {
 	var objs []string
 	dropped := map[V2Identity]bool{}
 	for _, t := range p.actual.Tables {
-		if !p.scope[t.Identity.Schema] || isProtectedTableName(t.Identity.Name) {
+		if p.flagDropsTable(t.Identity) {
+			objs = append(objs, "table "+t.Identity.String())
+			dropped[t.Identity] = true
 			continue
 		}
-		if !p.desiredTables[t.Identity] {
-			if p.desired.Table(t.Identity) == nil {
-				objs = append(objs, "table "+t.Identity.String())
-				dropped[t.Identity] = true
-			}
+		if !p.sharedTable(t.Identity) {
 			continue
 		}
 		dt := p.desired.Table(t.Identity)
 		for _, ac := range t.Columns {
-			if dt.Column(ac.Name) == nil && p.actualToDesiredName(t.Identity, ac.Name) == ac.Name {
+			if p.flagDropsColumn(t.Identity, dt, ac.Name) {
 				objs = append(objs, fmt.Sprintf("column %s.%s", t.Identity, ac.Name))
 			}
 		}
 		for _, ai := range t.Indexes {
-			if dt.Index(ai.Identity.Name) == nil {
+			if p.flagDropsIndex(dt, ai.Identity.Name) {
 				objs = append(objs, "index "+ai.Identity.String())
 			}
 		}
 	}
 	for _, v := range p.actual.Views {
-		if p.scope[v.Identity.Schema] && !p.desiredViews[v.Identity] {
+		if p.flagDropsView(v.Identity) {
 			objs = append(objs, "view "+v.Identity.String())
 		}
 	}
 	for _, e := range p.actual.Enums {
-		if !p.scope[e.Identity.Schema] || p.desiredEnums[e.Identity] {
-			continue
-		}
-		used := false
-		for _, t := range p.actual.Tables {
-			for _, c := range t.Columns {
-				if !dropped[t.Identity] && c.Type.Enum != nil && *c.Type.Enum == e.Identity {
-					used = true
-				}
-			}
-		}
-		if !used {
+		if p.flagDropsEnum(e.Identity) && p.enumKeptBy(e.Identity, dropped) == "" {
 			objs = append(objs, "enum "+e.Identity.String())
 		}
 	}
@@ -218,7 +263,7 @@ func (p *v2Planner) flagScope() string {
 		return " (with this schema, --allow-destructive drops nothing else)"
 	}
 	sort.Strings(objs)
-	return fmt.Sprintf(". Note that --allow-destructive also drops every object the schema does not declare, which here is: %s; declare in the schema what must stay before using it", strings.Join(objs, ", "))
+	return fmt.Sprintf(". Note that --allow-destructive also drops every object the schema does not declare as managed, which here is: %s; declare in the schema what must stay before using it", strings.Join(objs, ", "))
 }
 
 // v2Planner carries diff state between the per-collection planning passes.
@@ -250,8 +295,9 @@ type v2Planner struct {
 	unrenamedTables  map[V2Identity]string            // live text kept its pre-rename names
 	renameBlocked    map[V2Identity]map[string]string // element -> what depends on its pre-rename text
 	unverified       []string                         // rendered "equivalence not verified" lines
-	tableDropStmts   int                              // buffered statements that drop tables (not table alterations)
 	droppedTables    map[V2Identity]bool              // tables this plan drops
+	preDroppedFKs    map[V2Identity][]string          // foreign keys of dropped tables dropped ahead of the keys they reference
+	viewDepCache     map[V2Identity][]V2Dependent     // catalog dependents of the views the plan drops
 	retyped          map[V2Identity]map[string]string // desired name -> live name of matched columns whose type changes
 	changed          map[V2Identity]map[string]string // live column name -> what the plan does to it (type change, drop)
 	rebuilt          map[V2Identity]map[string]string // desired name -> live name of generated columns dropped and added back
@@ -260,52 +306,143 @@ type v2Planner struct {
 // What the plan does to a column, for dependency refusals.
 const changedType = "whose type changes"
 
-// viewsBasesFirst orders views so that each comes after the views it
-// reads: a definition reads a view when it names the view (and its schema,
-// unless the schema is public, which the deparse may leave unqualified),
-// or when extra says so. Ties and cycles keep the given order; a spurious
-// textual reference can only reorder, never drop, a view.
-func viewsBasesFirst(ids []V2Identity, defs map[V2Identity]string, extra map[V2Identity][]V2Identity) []V2Identity {
+// orderViews orders views so that each comes after the views it reads
+// (reads[a] lists the views a reads), keeping the given order among views
+// that are free to go. When the edges form a cycle (they cannot for real
+// dependencies, so an edge is wrong) it returns the given order unchanged:
+// the order main used.
+func orderViews(ids []V2Identity, reads map[V2Identity][]V2Identity) []V2Identity {
+	in := map[V2Identity]bool{}
+	for _, id := range ids {
+		in[id] = true
+	}
+	done := map[V2Identity]bool{}
+	out := make([]V2Identity, 0, len(ids))
+	for len(out) < len(ids) {
+		progressed := false
+		for _, id := range ids {
+			if done[id] {
+				continue
+			}
+			ready := true
+			for _, r := range reads[id] {
+				if r != id && in[r] && !done[r] {
+					ready = false
+					break
+				}
+			}
+			if ready {
+				done[id] = true
+				out = append(out, id)
+				progressed = true
+				break
+			}
+		}
+		if !progressed {
+			return append([]V2Identity(nil), ids...)
+		}
+	}
+	return out
+}
+
+// relationRefs returns the relations a query names in a relation position:
+// right after FROM or JOIN (through ONLY, LATERAL and opening parentheses
+// of a parenthesized join), and after each comma of a FROM list. A name
+// followed by "(" is a function, not a relation. Aliases, column names and
+// anything else are never returned. ok is false for text it cannot read.
+func relationRefs(text string) (refs [][]string, ok bool) {
+	// The package's SQL lexer (tokenizeSQL): 'w' bare words (lower case),
+	// 'q' quoted identifiers, 'p' punctuation; literals are opaque.
+	toks := significantTokens(text)
+	isIdent := func(i int) bool { return i < len(toks) && (toks[i].kind == 'w' || toks[i].kind == 'q') }
+	punct := func(i int, c string) bool { return i < len(toks) && toks[i].kind == 'p' && toks[i].text == c }
+	kw := func(i int, words ...string) bool {
+		if i >= len(toks) || toks[i].kind != 'w' {
+			return false
+		}
+		for _, w := range words {
+			if toks[i].text == w {
+				return true
+			}
+		}
+		return false
+	}
+	ends := []string{"where", "group", "having", "order", "limit", "offset", "window", "union", "intersect", "except", "on", "using", "fetch", "for", "returning", "select"}
+	fromDepth := -1 // paren depth of the FROM list being read, -1 outside one
+	depth := 0
+	expect := false
+	for i := 0; i < len(toks); i++ {
+		switch {
+		case punct(i, "("):
+			depth++
+			if expect && !kw(i+1, "select", "values", "with", "table") {
+				continue // a parenthesized join: the relation follows
+			}
+			expect = false
+		case punct(i, ")"):
+			if depth == fromDepth {
+				fromDepth = -1
+			}
+			depth--
+			expect = false
+		case punct(i, ","):
+			expect = fromDepth == depth
+		case kw(i, "from"):
+			fromDepth, expect = depth, true
+		case kw(i, "join"):
+			expect = true
+		case kw(i, ends...):
+			if depth == fromDepth {
+				fromDepth = -1
+			}
+			expect = false
+		case expect && kw(i, "only", "lateral"):
+		case expect && isIdent(i):
+			name := []string{toks[i].text}
+			for punct(i+1, ".") && isIdent(i+2) {
+				name = append(name, toks[i+2].text)
+				i += 2
+			}
+			if !punct(i+1, "(") {
+				refs = append(refs, name)
+			}
+			expect = false
+		default:
+			expect = false
+		}
+	}
+	return refs, true
+}
+
+// viewReadsByText lists, for each view, the views of ids it names in a
+// relation position of its definition: schema-qualified, or unqualified
+// for a view in public (the deparse leaves public unqualified under the
+// default search_path). Unreadable text adds nothing.
+func viewReadsByText(ids []V2Identity, defs map[V2Identity]string) map[V2Identity][]V2Identity {
 	in := map[V2Identity]bool{}
 	for _, id := range ids {
 		in[id] = true
 	}
 	reads := map[V2Identity][]V2Identity{}
 	for _, id := range ids {
-		idents, ok := sqlIdentifiers(defs[id])
-		names := map[string]bool{}
-		for _, ident := range idents {
-			names[truncateIdentifier(ident)] = true
+		refs, ok := relationRefs(defs[id])
+		if !ok {
+			continue
 		}
-		for _, other := range ids {
-			if other != id && ok && names[other.Name] && (names[other.Schema] || other.Schema == "public") {
-				reads[id] = append(reads[id], other)
+		for _, r := range refs {
+			var target V2Identity
+			switch len(r) {
+			case 1:
+				target = V2Identity{Schema: "public", Name: r[0]}
+			default:
+				target = V2Identity{Schema: r[len(r)-2], Name: r[len(r)-1]}
+			}
+			if in[target] && target != id {
+				reads[id] = append(reads[id], target)
 			}
 		}
-		for _, other := range extra[id] {
-			if in[other] && other != id {
-				reads[id] = append(reads[id], other)
-			}
-		}
 	}
-	var out []V2Identity
-	state := map[V2Identity]int{} // 1 visiting, 2 done
-	var visit func(id V2Identity)
-	visit = func(id V2Identity) {
-		if state[id] != 0 {
-			return
-		}
-		state[id] = 1
-		for _, r := range reads[id] {
-			visit(r)
-		}
-		state[id] = 2
-		out = append(out, id)
-	}
-	for _, id := range ids {
-		visit(id)
-	}
-	return out
+	return reads
 }
 
 // v2StmtPair is one up statement and its down statement. Constraint and
@@ -833,6 +970,10 @@ func (p *v2Planner) planTables() error {
 		p.emitRaw(fk.up, fk.down)
 	}
 
+	// Destructive drops, reverse dependency order, after every column and
+	// default that may use a dropped table's sequences or types.
+	p.planTableDrops()
+
 	// Enums drop after the tables and columns that use them.
 	p.planEnumDrops(p.droppedTables)
 	return nil
@@ -871,7 +1012,7 @@ func (p *v2Planner) planViewsAroundAlters() error {
 			continue
 		}
 		equal := p.viewEqual(*dvn, *av)
-		if equal && len(p.alterUps) == p.tableDropStmts {
+		if equal && len(p.alterUps) == 0 {
 			continue
 		}
 		if !dropIds[dv.Identity] {
@@ -889,7 +1030,7 @@ func (p *v2Planner) planViewsAroundAlters() error {
 		}
 	}
 	for _, av := range p.actual.Views {
-		if !p.scope[av.Identity.Schema] || p.desiredViews[av.Identity] {
+		if !p.flagDropsView(av.Identity) {
 			continue
 		}
 		if !p.opts.AllowDestructive {
@@ -907,9 +1048,10 @@ func (p *v2Planner) planViewsAroundAlters() error {
 		return err
 	}
 	// Views over views: a view is created after the views it reads and
-	// dropped before them (the reverse). The references are read from the
-	// definitions; live, the catalog's dependencies between the dropped
-	// views are added (Q12).
+	// dropped before them. Live, the order of the views that exist is the
+	// catalog's (pg_depend); offline, and for the definitions a create
+	// uses, a view reads another when its text names it in a relation
+	// position. Edges that form a cycle fall back to the order main used.
 	ids := func(pairs []stmtPair) []V2Identity {
 		out := make([]V2Identity, len(pairs))
 		for i, s := range pairs {
@@ -935,26 +1077,38 @@ func (p *v2Planner) planViewsAroundAlters() error {
 		}
 		return out
 	}
-	extra := map[V2Identity][]V2Identity{}
-	if insp, ok := p.opts.Normalizer.(V2DependencyInspector); ok {
-		for _, s := range drops {
-			deps, err := insp.RelationDependents(p.ctx, s.id)
-			if err != nil {
-				return err
-			}
-			for _, d := range deps {
-				if dropIds[d.Identity] {
-					extra[d.Identity] = append(extra[d.Identity], s.id)
+	var dropReads map[V2Identity][]V2Identity
+	createReads := viewReadsByText(ids(creates), defs(creates))
+	if _, ok := p.opts.Normalizer.(V2DependencyInspector); ok {
+		deps, err := p.viewDependents(dropIds)
+		if err != nil {
+			return err
+		}
+		dropReads = map[V2Identity][]V2Identity{}
+		for base, ds := range deps {
+			for _, d := range ds {
+				if d.Kind == "view" && dropIds[d.Identity] && d.Identity != base {
+					dropReads[d.Identity] = append(dropReads[d.Identity], base)
+					if createIds[d.Identity] && createIds[base] {
+						createReads[d.Identity] = append(createReads[d.Identity], base)
+					}
 				}
 			}
 		}
+	} else {
+		dropReads = viewReadsByText(ids(drops), defs(drops))
 	}
-	dropOrder := viewsBasesFirst(ids(drops), defs(drops), extra)
+	dropOrder := orderViews(ids(drops), dropReads)
 	for i, j := 0, len(dropOrder)-1; i < j; i, j = i+1, j-1 {
 		dropOrder[i], dropOrder[j] = dropOrder[j], dropOrder[i]
 	}
+	if len(dropReads) == 0 {
+		dropOrder = ids(drops) // no edges: main's order
+	}
 	drops = reorder(drops, dropOrder)
-	creates = reorder(creates, viewsBasesFirst(ids(creates), defs(creates), nil))
+	if len(createReads) > 0 {
+		creates = reorder(creates, orderViews(ids(creates), createReads))
+	}
 	emitAll := func(pairs []stmtPair) {
 		for _, s := range pairs {
 			p.emitRaw(s.up, s.down)
@@ -1089,6 +1243,28 @@ func (p *v2Planner) planSharedTables() error {
 	if err := p.refuseKeptForeignKeys(droppedKeys); err != nil {
 		return err
 	}
+	// A table the plan drops keeps its foreign keys until the end of the
+	// plan; one onto a key the plan drops comes off in phase 3 instead, and
+	// its down statement re-adds it after the key and the table are back.
+	var preDropFKs []v2StmtPair
+	p.preDroppedFKs = map[V2Identity][]string{}
+	for _, ut := range p.actual.Tables {
+		if !p.tableDroppedByPlan(ut.Identity) {
+			continue
+		}
+		for _, con := range ut.Constraints {
+			if con.Type != "foreign-key" || con.References == nil || !sameColumnSetIn(con.References.Columns, droppedKeys[con.References.Table]) {
+				continue
+			}
+			tq := qualifiedNameSQL(ut.Identity)
+			preDropFKs = append(preDropFKs, v2StmtPair{
+				up:   fmt.Sprintf("alter table %s drop constraint if exists %s", tq, quoteIdent(con.Name)),
+				down: fmt.Sprintf("alter table %s add constraint %s %s", tq, quoteIdent(con.Name), p.constraintFragmentFor(ut.Identity, p.actual.Table(ut.Identity), con.Name)),
+				fk:   true, name: con.Name,
+			})
+			p.preDroppedFKs[ut.Identity] = append(p.preDroppedFKs[ut.Identity], con.Name)
+		}
+	}
 	for i := range plans {
 		tp := &plans[i]
 		at := p.actual.Table(tp.dt.Identity)
@@ -1149,13 +1325,12 @@ func (p *v2Planner) planSharedTables() error {
 		}
 	}
 
-	// Phase 3: constraint drops, foreign keys first; then the tables the
-	// plan drops (reverse dependency order), before any key a foreign key
-	// of theirs references is dropped; then the other constraints.
+	// Phase 3: constraint drops, foreign keys first (including those of
+	// tables the plan drops that reference a key it drops); then the other
+	// constraints. The tables themselves drop at the end of the plan, after
+	// the defaults and columns that may use their sequences or types.
 	emitConstraints(false, true)
-	before := len(p.alterUps)
-	p.planTableDrops()
-	p.tableDropStmts = len(p.alterUps) - before
+	emitPairs(preDropFKs)
 	emitConstraints(false, false)
 
 	// Phase 4: index drops (dropped, and the drop half of re-created ones).
@@ -1269,17 +1444,7 @@ func (p *v2Planner) planDroppedColumns(dt V2Table, generated bool) error {
 		}
 	}
 	for _, ac := range at.Columns {
-		if (ac.Generated != nil) != generated || dtn.Column(ac.Name) != nil {
-			continue
-		}
-		renamedAway := false
-		for target, source := range p.opts.Renames {
-			if source == ac.Name && strings.HasPrefix(target, dt.Identity.String()+".") {
-				renamedAway = true
-				break
-			}
-		}
-		if renamedAway {
+		if (ac.Generated != nil) != generated || !p.flagDropsColumn(dt.Identity, dtn, ac.Name) {
 			continue
 		}
 		if !p.opts.AllowDestructive {
@@ -1390,6 +1555,29 @@ func (p *v2Planner) planRebuilds() error {
 	return nil
 }
 
+// viewDependents reads, once per plan and in one query, what depends on
+// the views the plan drops (through the view or its row type).
+func (p *v2Planner) viewDependents(views map[V2Identity]bool) (map[V2Identity][]V2Dependent, error) {
+	if p.viewDepCache != nil {
+		return p.viewDepCache, nil
+	}
+	insp, ok := p.opts.Normalizer.(V2DependencyInspector)
+	if !ok {
+		return nil, nil
+	}
+	list := make([]V2Identity, 0, len(views))
+	for v := range views {
+		list = append(list, v)
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].String() < list[j].String() })
+	deps, err := insp.ViewDependents(p.ctx, list)
+	if err != nil {
+		return nil, err
+	}
+	p.viewDepCache = deps
+	return deps, nil
+}
+
 // checkDependents refuses a plan whose type changes or column drops
 // (p.changed) something the plan does not handle depends on, and a plan
 // that drops a view something else depends on (dropViews: the views it
@@ -1464,12 +1652,12 @@ func (p *v2Planner) catalogDependents(insp V2DependencyInspector, dropViews map[
 		views = append(views, v)
 	}
 	sort.Slice(views, func(i, j int) bool { return views[i].String() < views[j].String() })
+	all, err := p.viewDependents(dropViews)
+	if err != nil {
+		return nil, err
+	}
 	for _, v := range views {
-		deps, err := insp.RelationDependents(p.ctx, v)
-		if err != nil {
-			return nil, err
-		}
-		for _, d := range deps {
+		for _, d := range all[v] {
 			if (d.Kind == "view" || d.Kind == "materialized view") && dropViews[d.Identity] {
 				continue
 			}
@@ -2508,7 +2696,7 @@ func (p *v2Planner) planIndexChanges(table V2Identity, desired, actual *V2Table)
 		}
 	}
 	for _, ai := range actual.Indexes {
-		if desired.Index(ai.Identity.Name) != nil {
+		if !p.flagDropsIndex(desired, ai.Identity.Name) {
 			continue
 		}
 		if !p.opts.AllowDestructive {
@@ -2529,7 +2717,7 @@ func (p *v2Planner) planIndexChanges(table V2Identity, desired, actual *V2Table)
 // tableDroppedByPlan mirrors planTableDrops: a managed-scope table the
 // schema does not declare drops with --allow-destructive.
 func (p *v2Planner) tableDroppedByPlan(id V2Identity) bool {
-	return p.scope[id.Schema] && !p.desiredTables[id] && !isProtectedTableName(id.Name) && p.opts.AllowDestructive
+	return p.flagDropsTable(id) && p.opts.AllowDestructive
 }
 
 // refuseKeptForeignKeys refuses a plan that drops a key a foreign key of
@@ -2558,23 +2746,36 @@ func (p *v2Planner) refuseKeptForeignKeys(droppedKeys map[V2Identity][][]string)
 			continue
 		}
 		for _, con := range ut.Constraints {
-			if con.Type != "foreign-key" || con.References == nil || !sameColumnSetIn(con.References.Columns, droppedKeys[con.References.Table]) {
+			if con.Type != "foreign-key" || con.References == nil {
 				continue
 			}
-			what := "drops"
-			if recreated[con.References.Table] {
-				what = "drops (and re-creates)"
+			target := ""
+			switch {
+			case p.tableDroppedByPlan(con.References.Table):
+				target = fmt.Sprintf("table %s, which this plan drops", con.References.Table)
+			case sameColumnSetIn(con.References.Columns, droppedKeys[con.References.Table]):
+				what := "drops"
+				if recreated[con.References.Table] {
+					what = "drops (and re-creates)"
+				}
+				target = fmt.Sprintf("the key (%s) of table %s, which this plan %s", strings.Join(con.References.Columns, ", "), con.References.Table, what)
+			default:
+				continue
 			}
 			var why, fix string
-			if p.scope[ut.Identity.Schema] {
+			switch {
+			case p.scope[ut.Identity.Schema] && p.desired.Table(ut.Identity) != nil:
+				why = "a table the schema declares as not managed"
+				fix = fmt.Sprintf("Declare table %s as managed in the schema (the plan then drops and re-adds the foreign key around the change), or drop it: re-run with --allow-destructive, which drops tables the schema does not declare as managed%s", ut.Identity, p.flagScope())
+			case p.scope[ut.Identity.Schema]:
 				why = "a table the schema does not declare"
 				fix = fmt.Sprintf("Declare table %s in the schema (the plan then drops and re-adds the foreign key around the change), or drop it: re-run with --allow-destructive, which drops tables the schema does not declare%s", ut.Identity, p.flagScope())
-			} else {
+			default:
 				why = "a table the schema document does not manage"
 				fix = fmt.Sprintf("Drop the foreign key by hand before applying and re-add it after, or declare schema %q and table %s in the schema (the plan then drops and re-adds the foreign key around the change)", ut.Identity.Schema, ut.Identity)
 			}
-			refusals = append(refusals, fmt.Sprintf("foreign key %s of table %s references the key (%s) of table %s, which this plan %s, and the plan cannot drop and re-add a foreign key of %s. PostgreSQL refuses to drop a key a foreign key depends on, so the plan would fail at apply and is refused. %s",
-				con.Name, ut.Identity, strings.Join(con.References.Columns, ", "), con.References.Table, what, why, fix))
+			refusals = append(refusals, fmt.Sprintf("foreign key %s of table %s references %s, and the plan cannot drop and re-add a foreign key of %s. PostgreSQL refuses to drop a key or table a foreign key depends on, so the plan would fail at apply and is refused. %s",
+				con.Name, ut.Identity, target, why, fix))
 		}
 	}
 	if len(refusals) == 0 {
@@ -2846,14 +3047,11 @@ func (p *v2Planner) planTableDrops() {
 	var toDrop []V2Table
 	droppedInPlan := map[V2Identity]bool{}
 	for _, t := range p.actual.Tables {
-		if !p.scope[t.Identity.Schema] {
-			continue
-		}
-		if p.desiredTables[t.Identity] {
-			continue
-		}
-		if isProtectedTableName(t.Identity.Name) {
+		if p.scope[t.Identity.Schema] && !p.desiredTables[t.Identity] && isProtectedTableName(t.Identity.Name) {
 			p.warn("table %s %s", t.Identity, InternalMetadataNote)
+			continue
+		}
+		if !p.flagDropsTable(t.Identity) {
 			continue
 		}
 		if !p.opts.AllowDestructive {
@@ -2934,9 +3132,11 @@ func (p *v2Planner) planTableDrops() {
 		sort.Slice(droppable, func(i, j int) bool { return droppable[i].String() < droppable[j].String() })
 		for _, id := range droppable {
 			p.warn("table %s exists in %s but not in the schema: it will be dropped (all rows lost)", id, p.baseNoun())
-			ddl, err := createV2TableSQL(*p.actual.Table(id), droppedFKs[id])
+			ddl, err := createV2TableSQL(*p.actual.Table(id), append(append([]string(nil), droppedFKs[id]...), p.preDroppedFKs[id]...))
 			if err != nil {
 				ddl = fmt.Sprintf("-- IRREVERSIBLE: table %s carries unrepresentable structure; no down statement can re-create it", id)
+			} else {
+				ddl = p.withOwnedSequences(id, ddl)
 			}
 			p.emit(fmt.Sprintf("drop table if exists %s", qualifiedNameSQL(id)), ddl)
 			delete(remaining, id)
@@ -2945,33 +3145,45 @@ func (p *v2Planner) planTableDrops() {
 
 }
 
+// withOwnedSequences wraps the re-create of a dropped table so its down
+// works when a column default uses a sequence the table owned (serial): the
+// sequence dies with the table, so the down creates it first and hands
+// ownership back after (the mirror of the create path). A standalone
+// sequence (an inventoried opaque object) survives the drop and is left
+// alone. The counter's value is not restored: the rows are gone as well.
+func (p *v2Planner) withOwnedSequences(table V2Identity, ddl string) string {
+	var before, after []string
+	for _, c := range p.actual.Table(table).Columns {
+		if c.Default == nil || c.Default.Kind != "sequence" || c.Default.Sequence == nil {
+			continue
+		}
+		seq := *c.Default.Sequence
+		if p.actual.OpaqueEntry("unsupported-object", seq) != nil || p.actual.OpaqueEntry("extension-object", seq) != nil {
+			continue
+		}
+		q := qualifiedNameSQL(seq)
+		before = append(before, fmt.Sprintf("create sequence if not exists %s", q))
+		after = append(after, fmt.Sprintf("alter sequence %s owned by %s.%s", q, qualifiedNameSQL(table), quoteIdent(c.Name)))
+	}
+	if len(before) == 0 {
+		return ddl
+	}
+	return strings.Join(append(append(before, ddl), after...), ";\n")
+}
+
 // planEnumDrops plans destructive drops of enums absent from the desired
 // document, after the tables (tables dropping in the same plan do not
 // block their enums).
 func (p *v2Planner) planEnumDrops(droppedInPlan map[V2Identity]bool) {
 	for _, e := range p.actual.Enums {
-		if !p.scope[e.Identity.Schema] || p.desiredEnums[e.Identity] {
+		if !p.flagDropsEnum(e.Identity) {
 			continue
 		}
 		if !p.opts.AllowDestructive {
 			p.warn("enum %s exists in %s but not in the schema: left untouched (dropping requires explicit destructive acknowledgement, --allow-destructive)", e.Identity, p.baseNoun())
 			continue
 		}
-		usedBy := ""
-		for _, t := range p.actual.Tables {
-			if droppedInPlan[t.Identity] {
-				continue // the using table drops earlier in this same plan
-			}
-			for _, c := range t.Columns {
-				if c.Type.Enum != nil && *c.Type.Enum == e.Identity {
-					usedBy = t.Identity.String() + "." + c.Name
-					break
-				}
-			}
-			if usedBy != "" {
-				break
-			}
-		}
+		usedBy := p.enumKeptBy(e.Identity, droppedInPlan)
 		if usedBy != "" {
 			p.warn("enum %s is still used by column %s: not dropped", e.Identity, usedBy)
 			continue
