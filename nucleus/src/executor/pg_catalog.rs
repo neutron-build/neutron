@@ -86,8 +86,8 @@ impl OidMap {
         let mut n = fnv1a(&key) % OID_SPAN;
         loop {
             let oid = (FIRST_USER_OID as u64 + n) as i32;
-            if !self.by_oid.contains_key(&oid) {
-                self.by_oid.insert(oid, key.clone());
+            if let std::collections::hash_map::Entry::Vacant(slot) = self.by_oid.entry(oid) {
+                slot.insert(key.clone());
                 self.by_key.insert(key, oid);
                 return oid;
             }
