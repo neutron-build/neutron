@@ -172,6 +172,13 @@ struct DiskTxnState {
 }
 
 /// Disk-backed storage engine.
+#[cfg(test)]
+struct IndexPublishHook {
+    index_name: String,
+    remaining_matches: usize,
+    pause: Box<dyn FnOnce() + Send>,
+}
+
 pub struct DiskEngine {
     /// Path of the primary data file (its `.wal` / `.wal.d` siblings hold the
     /// WAL). Needed by physical backup, which must copy this file through the
@@ -182,6 +189,8 @@ pub struct DiskEngine {
     tables: RwLock<HashMap<String, TableMeta>>,
     /// Index name → index metadata.
     indexes: RwLock<HashMap<String, IndexMeta>>,
+    #[cfg(test)]
+    index_publish_hook: parking_lot::Mutex<Option<IndexPublishHook>>,
     /// Reference to the catalog for looking up column types.
     catalog: Arc<Catalog>,
     /// Head of the on-disk free page list (linked via FREE_NEXT_PAGE pointers).
@@ -827,6 +836,8 @@ impl DiskEngine {
             pool,
             tables: RwLock::new(HashMap::new()),
             indexes: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            index_publish_hook: parking_lot::Mutex::new(None),
             catalog,
             free_list_head: parking_lot::Mutex::new(fl_head),
             free_page_count: parking_lot::Mutex::new(fl_count),
@@ -3630,6 +3641,25 @@ impl DiskEngine {
             page_id = next;
         }
 
+        #[cfg(test)]
+        {
+            let hook = {
+                let mut hook = self.index_publish_hook.lock();
+                if let Some(armed) = hook.as_mut().filter(|hook| hook.index_name == index_name) {
+                    if armed.remaining_matches > 1 {
+                        armed.remaining_matches -= 1;
+                        None
+                    } else {
+                        hook.take()
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(hook) = hook {
+                (hook.pause)();
+            }
+        }
         let mut indexes = self.indexes.write();
         indexes.insert(
             index_name.to_string(),
@@ -8343,6 +8373,91 @@ mod tests {
             assert_eq!(rows.len(), 200, "mixed concurrent paths lost rows");
         })
         .await;
+    }
+    /// A nonincremental executor refresh must not publish a stale storage
+    /// B-tree over an insert completed while its detached scan was paused.
+    #[test]
+    fn ordinary_update_refresh_preserves_concurrent_secondary_posting() {
+        use crate::executor::Executor;
+        use crate::storage::BufferedDiskEngine;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        enum Event {
+            Paused,
+            Done(Result<(), String>),
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = rt.block_on(setup_engine(tmp.path()));
+        let engine = Arc::new(engine);
+        let storage: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(engine.clone()));
+        let executor = Arc::new(Executor::new(catalog, storage));
+        rt.block_on(executor.execute("CREATE TABLE posting_race (id BIGINT PRIMARY KEY, val INT, code TEXT); CREATE INDEX posting_val ON posting_race (val); CREATE INDEX posting_code ON posting_race USING encrypted (code); INSERT INTO posting_race VALUES (1, 37, 'one')")).unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let pause_tx = event_tx.clone();
+        *engine.index_publish_hook.lock() = Some(IndexPublishHook {
+            index_name: "posting_val".into(),
+            // Maintenance used to create each catalog index, then rebuild it
+            // again. Pause the final publication so the second scan cannot
+            // repair the lost posting before the invariant is checked.
+            remaining_matches: 2,
+            pause: Box::new(move || {
+                pause_tx.send(Event::Paused).unwrap();
+                resume_rx.recv().unwrap();
+            }),
+        });
+        let writer = executor.clone();
+        let handle = rt.handle().clone();
+        let sid = executor.create_session();
+        let worker = std::thread::spawn(move || {
+            let result = handle
+                .block_on(writer.execute_with_session(
+                    sid,
+                    "UPDATE posting_race SET code = 'changed' WHERE id = 1",
+                ))
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            writer.drop_session(sid);
+            event_tx.send(Event::Done(result)).unwrap();
+        });
+        // The channel selects an actual paused rebuild or a completed UPDATE.
+        // A watchdog expiry is always a failure, never evidence of completion.
+        let first = event_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("UPDATE neither paused nor completed");
+        let sid = executor.create_session();
+        rt.block_on(
+            executor.execute_with_session(sid, "INSERT INTO posting_race VALUES (2, 37, 'two')"),
+        )
+        .unwrap();
+        executor.drop_session(sid);
+        match first {
+            Event::Paused => {
+                resume_tx.send(()).unwrap();
+                match event_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("paused UPDATE did not finish")
+                {
+                    Event::Done(result) => result.unwrap(),
+                    Event::Paused => panic!("one-shot rebuild hook paused twice"),
+                }
+            }
+            Event::Done(result) => result.unwrap(),
+        }
+        worker.join().unwrap();
+        for predicate in ["val = 37", "val >= 37 AND val <= 37", "val + 0 = 37"] {
+            let sql = format!("SELECT id FROM posting_race WHERE {predicate} ORDER BY id");
+            let results = rt.block_on(executor.execute(&sql)).unwrap();
+            let crate::executor::ExecResult::Select { rows, .. } = &results[0] else {
+                panic!("expected SELECT");
+            };
+            assert_eq!(
+                rows,
+                &vec![vec![Value::Int64(1)], vec![Value::Int64(2)]],
+                "concurrent insert lost through {predicate}"
+            );
+        }
     }
     /// Dense secondary keys must remain complete after different rows on the
     /// same heap pages are updated, deleted, and reinserted concurrently.
