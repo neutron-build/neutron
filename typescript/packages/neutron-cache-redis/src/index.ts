@@ -204,7 +204,9 @@ function extractLoaderPathFromKey(cacheKey: string): string {
   if (separator === -1) {
     return normalizePathname(cacheKey) ?? "/";
   }
-  return normalizePathname(cacheKey.slice(0, separator)) ?? "/";
+  // Core has already canonicalized this field. Decoding again would turn a
+  // literal percent-encoded segment into another route's pathname.
+  return cacheKey.slice(0, separator);
 }
 
 function normalizePathname(pathname: string): string | null {

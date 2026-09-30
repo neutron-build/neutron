@@ -65,6 +65,26 @@ test("real Redis atomic publication, invalidation, epochs and concurrent fills",
     assert.ok(await client.ttl!(`${prefix}idx:app:/race`)>=595);
     await stores.app.deleteByPath("/race");
     assert.equal(await stores.app.get(appKey),null);
+    // Current cache keys contain canonical paths, whereas public path
+    // invalidation accepts encoded paths and decodes exactly once.
+    for (const [canonical, encoded] of [
+      ["/a%20b", "/a%2520b"], ["/a%b", "/a%25b"],
+      ["/a?b", "/a%3Fb"], ["/a#b", "/a%23b"],
+    ]) {
+      const app = `html\nhttps://a.example\n${canonical}\n`;
+      const loader = `${canonical}::route`;
+      await stores.app.set(app,entry);
+      await stores.loader.set(loader,{data:canonical,expiresAt:Date.now()+60000});
+      assert.ok((await client.smembers(`${prefix}idx:ldr:${canonical}`)).includes(`${prefix}ldr:${loader}`));
+      await stores.loader.set("/sentinel::route",{data:"preserved",expiresAt:Date.now()+60000});
+      assert.ok(await stores.app.get(app));
+      assert.ok(await stores.loader.get(loader));
+      await stores.app.deleteByPath(encoded);
+      await stores.loader.deleteByPath(encoded);
+      assert.equal(await stores.app.get(app),null);
+      assert.equal(await stores.loader.get(loader),null);
+      assert.ok(await stores.loader.get("/sentinel::route"));
+    }
   } finally {
     // A unique test namespace has no concurrent consumers; cleanup is safe.
     const keys = await client.keys(`${prefix}*`);
