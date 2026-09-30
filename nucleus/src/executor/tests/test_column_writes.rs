@@ -702,3 +702,17 @@ async fn x10_parent_update_subset_keeps_untouched_unique_keys_and_child_rows() {
         [[1], [2], [3]]
     );
 }
+
+#[tokio::test]
+async fn x10_paged_cascade_skips_its_physical_child_row_after_a_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = super::test_meta_persistence::open_executor(dir.path()).await;
+    exec(&ex, "CREATE TABLE physical_parent(id INT PRIMARY KEY)").await;
+    exec(&ex, "CREATE TABLE physical_child(id INT PRIMARY KEY, p INT REFERENCES physical_parent(id) ON UPDATE CASCADE, g INT GENERATED ALWAYS AS(abs(p)) STORED UNIQUE)").await;
+    exec(&ex, "INSERT INTO physical_parent VALUES(1),(2)").await;
+    exec(&ex, "INSERT INTO physical_child(id,p) VALUES(11,1),(22,2)").await;
+    exec(&ex, "DELETE FROM physical_child WHERE id=11").await;
+    exec(&ex, "UPDATE physical_parent SET id=-2 WHERE id=2").await;
+    assert_eq!(ints(&ex, "SELECT id,p,g FROM physical_child").await, [[22,-2,2]]);
+    assert_eq!(ints(&ex, "SELECT id FROM physical_parent ORDER BY id").await, [[-2],[1]]);
+}
