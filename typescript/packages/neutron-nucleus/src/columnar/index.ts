@@ -2,16 +2,17 @@
 // @neutron-build/nucleus/columnar — Columnar analytics model plugin (X03)
 // ---------------------------------------------------------------------------
 // Durability/transaction honesty (verified live, X03 Nucleus leg): the
-// COLUMNAR_* store is fsync-durable at commit (kill -9 evidence — matches
-// the NU-006 durability table; the older "page cache only" prose in
-// MODEL_SEMANTICS is stale) and REFUSES inserts inside an explicit
+// COLUMNAR_* store uses the attached server WAL with synchronous_commit=on;
+// tested values survived SIGKILL and restart. This does not establish
+// power-loss durability or cover memory/off modes or failed WAL appends.
+// It REFUSES inserts inside an explicit
 // transaction ("the columnar store is not covered by transaction rollback")
 // rather than silently persisting rolled-back rows. It is append-only:
 // COLUMNAR_INSERT is the only mutator.
 //
-// Numeric typing (X03 live finding): values bound WITHOUT type context are
-// stored as text and the numeric aggregates then answer a silent 0 / NULL
-// (engine silent-wrong-answer class, recorded upstream). insert() therefore
+// Numeric typing (current X03 live finding): values bound WITHOUT type context
+// are stored as text; numeric aggregates refuse those values with 0A000.
+// insert() therefore
 // binds JS numbers with an explicit ::double precision cast so count/sum/
 // avg/min/max are real for numeric columns through this client.
 
@@ -65,8 +66,8 @@ class ColumnarModelImpl implements ColumnarModel {
     }
     // Engine signature is variadic: COLUMNAR_INSERT(table, col1, val1, col2, val2, ...)
     // JS numbers bind WITH a ::double precision cast: untyped params are
-    // stored as text and the numeric aggregates then silently answer 0/NULL
-    // (X03 live finding against the real engine). Text/other values bind
+    // stored as text and numeric aggregates refuse them with 0A000
+    // (current X03 live finding). Text/other values bind
     // uncast — the store is schema-less and the value's JS type is the only
     // type information there is.
     const args: unknown[] = [table];
