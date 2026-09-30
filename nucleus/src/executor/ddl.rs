@@ -2184,6 +2184,16 @@ impl Executor {
             ));
         }
 
+        // IndexDef and the storage indexes retain ascending keys only. Refuse
+        // requested ordering rather than publishing different catalog metadata.
+        if create_index.columns.iter().any(|column| {
+            column.column.options.asc == Some(false) || column.column.options.nulls_first.is_some()
+        }) {
+            return Err(ExecError::Unsupported(
+                "index DESC and explicit NULLS ordering are not implemented".into(),
+            ));
+        }
+
         // Verify table exists and reject duplicate names before constructing
         // any live index state. Otherwise `IF NOT EXISTS` could overwrite an
         // existing in-memory index and only then discover the catalog entry.

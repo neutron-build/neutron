@@ -38,7 +38,9 @@ use sqlparser::parser::Parser;
 
 use super::types::ColMeta;
 use super::{ExecError, Executor};
-use crate::catalog::{DeclaredType, FkAction, IndexDef, IndexType, TableConstraint, TableDef};
+use crate::catalog::{
+    DeclaredType, Deferrable, FkAction, IndexDef, IndexType, TableConstraint, TableDef,
+};
 use crate::types::{DataType, Row, Value};
 
 /// `public`.
@@ -1152,6 +1154,7 @@ fn pg_constraint_rel(label: &str, snap: &PgSnapshot) -> (Vec<ColMeta>, Vec<Row>)
                     ref_columns,
                     on_delete,
                     on_update,
+                    deferrable,
                     ..
                 } => {
                     let target = snap.table(ref_table);
@@ -1163,8 +1166,8 @@ fn pg_constraint_rel(label: &str, snap: &PgSnapshot) -> (Vec<ColMeta>, Vec<Row>)
                     row.extend([
                         Value::Int32(ref_oid),
                         text("f"),
-                        Value::Bool(false),
-                        Value::Bool(false),
+                        Value::Bool(*deferrable != Deferrable::NotDeferrable),
+                        Value::Bool(*deferrable == Deferrable::InitiallyDeferred),
                         Value::Bool(true),
                         int_array(columns.iter().map(|c| attnum_of(t, c))),
                         int_array(ref_keys),
@@ -2239,6 +2242,7 @@ fn constraint_def(t: &TableDef, con: &TableConstraint, snap: &PgSnapshot) -> Str
             ref_columns,
             on_delete,
             on_update,
+            deferrable,
             ..
         } => {
             let mut out = format!(
@@ -2259,6 +2263,11 @@ fn constraint_def(t: &TableDef, con: &TableConstraint, snap: &PgSnapshot) -> Str
             }
             if let Some(a) = action(on_delete) {
                 out.push_str(&format!(" ON DELETE {a}"));
+            }
+            match deferrable {
+                Deferrable::NotDeferrable => {}
+                Deferrable::InitiallyImmediate => out.push_str(" DEFERRABLE"),
+                Deferrable::InitiallyDeferred => out.push_str(" DEFERRABLE INITIALLY DEFERRED"),
             }
             out
         }
