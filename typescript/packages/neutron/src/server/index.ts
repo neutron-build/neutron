@@ -37,6 +37,7 @@ import {
   type CorsOptions,
 } from "./http-headers.js";
 import {
+  assertAtomicCacheStore,
   createMemoryAppCacheStore,
   createMemoryLoaderCacheStore,
   type NeutronAppCacheStore,
@@ -392,6 +393,8 @@ export async function createServer(
   // the Vite SSR runtime, serves assets, and registers the HTML catch-all. "api"/"raw"
   // skip all of it (no fs walk, no hard-fail on a missing routes dir).
   const isSsr = mode === "ssr";
+  if (cache?.app) assertAtomicCacheStore(cache.app);
+  if (cache?.loader) assertAtomicCacheStore(cache.loader);
 
   const routes = isSsr ? discoverRoutes({ routesDir: resolvedRoutesDir }) : [];
   const router = createRouter();
@@ -899,6 +902,8 @@ export async function createServer(
       const cacheReadsPermitted =
         appCacheKey !== null && (method === "GET" || method === "HEAD");
       const requestEpoch = appCacheEpoch;
+      const appGeneration = await appResponseCacheStore.getGeneration!();
+      const loaderGeneration = await loaderDataCacheStore.getGeneration!();
 
       // The shared-cache boundary is applied INSIDE the route middleware
       // chain (see renderAppRoute): a cache hit still executes every request
@@ -935,7 +940,8 @@ export async function createServer(
                 response,
                 appCacheMaxAge,
                 c.req.raw.headers.get("cache-control"),
-                () => appCacheEpoch === requestEpoch
+                () => appCacheEpoch === requestEpoch,
+                appGeneration
               ).catch(() => {});
               appPendingStores.set(appCacheKey, store);
               void store.then(() => {
@@ -963,7 +969,7 @@ export async function createServer(
         // epoch is captured per request and re-checked immediately before a
         // loader result is committed, so a GET that began before a mutation
         // completed cannot republish the pre-mutation loader data.
-        { stillValid: () => appCacheEpoch === requestEpoch }
+        { stillValid: () => appCacheEpoch === requestEpoch, generation: loaderGeneration }
       );
 
       if (isMutationMethod(method)) {
@@ -1191,6 +1197,7 @@ async function handleAppRouteRequest(
     store: (response: Response) => void;
   },
   loaderCacheFence?: {
+    generation?: string;
     stillValid: () => boolean;
   }
 ): Promise<Response> {
@@ -1692,7 +1699,8 @@ async function maybeStoreAppResponse(
   response: Response,
   maxAgeSec: number,
   requestCacheControl: string | null,
-  stillValid: () => boolean
+  stillValid: () => boolean,
+  generation: string
 ): Promise<void> {
   if (maxAgeSec <= 0 || response.status !== 200) {
     return;
@@ -1789,13 +1797,13 @@ async function maybeStoreAppResponse(
     headerPairs.push([name, value]);
   });
 
-  await cache.set(key, {
+  await cache.setIfGeneration!(key, {
     status: response.status,
     statusText: response.statusText,
     headers: headerPairs,
     body,
     expiresAt: Date.now() + effectiveMaxAge * 1000,
-  });
+  }, generation);
 }
 
 function tryReadStaticHtml(distDir: string, pathname: string): string | null {

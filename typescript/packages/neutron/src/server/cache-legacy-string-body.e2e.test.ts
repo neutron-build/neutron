@@ -39,6 +39,8 @@ export default function Page() {
 `;
 
 const legacyStore: NeutronAppCacheStore = {
+  async getGeneration() { return '0'; },
+  async setIfGeneration() { return false; },
   async get() {
     const legacy = {
       status: 200,

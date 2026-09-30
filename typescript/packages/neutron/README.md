@@ -44,6 +44,18 @@ shared cache from a server request. Custom Node HTTP adapters must establish
 request isolation themselves; without the Neutron adapter there is no implicit
 server cache.
 
+## Shared response and loader stores
+
+The default memory response and loader stores support atomic invalidation.
+Custom stores supplied to `createServer({ cache })` must implement
+`getGeneration()` and `setIfGeneration(key, entry, expectedGeneration)`.
+`deleteByPath()` and `clear()` must advance the backing store generation even
+when no existing entry matches. Compare the generation and write the entry in
+one backing-store transaction or server-side script. This prevents a delayed
+fill from restoring stale data after a mutation completes, including across
+servers sharing a store. Stores with only the former `get/set/deleteByPath/clear`
+interface are refused at startup; migrate their implementation before upgrading.
+
 ## Documentation
 
 [neutron.build](https://neutron.build)

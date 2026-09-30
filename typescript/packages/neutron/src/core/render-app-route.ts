@@ -94,6 +94,7 @@ export interface RenderAppRouteOptions {
    * that began before the invalidation.
    */
   loaderCacheFence?: {
+    generation?: string;
     stillValid: () => boolean;
   };
 }
@@ -241,7 +242,8 @@ async function storeLoaderDataCache(
   cache: NeutronLoaderCacheStore,
   key: string,
   data: unknown,
-  maxAgeSec: number
+  maxAgeSec: number,
+  generation: string
 ): Promise<void> {
   if (maxAgeSec <= 0) {
     return;
@@ -254,10 +256,10 @@ async function storeLoaderDataCache(
     return;
   }
 
-  await cache.set(key, {
+  await cache.setIfGeneration!(key, {
     data,
     expiresAt: Date.now() + maxAgeSec * 1000,
-  });
+  }, generation);
 }
 
 function resolveRequestedDataRouteIds(
@@ -968,11 +970,18 @@ export async function renderAppRoute(
       const canCacheLoaderData =
         loaderCacheMaxAge > 0 && isLoaderDataCacheableRequest(request);
       const canReadLoaderCache =
-        canCacheLoaderData && isLoaderDataCacheReadableMethod(request.method);
+        canCacheLoaderData && isLoaderDataCacheReadableMethod(request.method) &&
+        typeof loaderDataCache.getGeneration === 'function' &&
+        typeof loaderDataCache.setIfGeneration === 'function';
       // Writes are GET/HEAD only (TS-07): a mutation-method loader run
       // happens mid-action-pipeline and its result can publish AFTER the
       // action's cache invalidation, resurrecting the pre-mutation view.
-      const canWriteLoaderCache = canReadLoaderCache;
+      const canWriteLoaderCache = canReadLoaderCache &&
+        typeof loaderDataCache.getGeneration === 'function' &&
+        typeof loaderDataCache.setIfGeneration === 'function';
+      const loaderGeneration = canWriteLoaderCache
+        ? loaderCacheFence?.generation ?? await loaderDataCache.getGeneration!()
+        : undefined;
       const loaderCacheKey = canCacheLoaderData
         ? buildLoaderDataCacheKey(request, route.id, routeParams)
         : null;
@@ -1033,7 +1042,8 @@ export async function renderAppRoute(
             loaderDataCache,
             loaderCacheKey,
             data,
-            loaderCacheMaxAge
+            loaderCacheMaxAge,
+            loaderGeneration!
           );
         }
         const loaderEndedAt = Date.now();

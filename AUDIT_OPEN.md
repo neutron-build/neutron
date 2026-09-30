@@ -134,7 +134,7 @@ FALSE-POSITIVE (not reproducible in source; evidence cited).
 | TS-04 | FIXED — cache keys carry origin, Accept-Language, X-Neutron-Data/Routes | c31736eb |
 | TS-05 | FIXED — case-insensitive directive parsing, request no-store/no-cache honored, Vary checked against keyed set, TTL capped by s-maxage/max-age | c31736eb |
 | TS-06 | FIXED-PARTIAL — byte-exact bodies with per-entry budget and Content-Length validation; aggregate store budget + concurrent-fill cap not added (entry-count bound remains) | c31736eb |
-| TS-07 | FIXED-PARTIAL — epoch advances at mutation START and again at COMPLETION (round-2 dispute repaired); loader fills re-check a generation fence before publishing; for async EXTERNAL cache stores the fence is best-effort (check-then-set is not atomic across a network boundary) | r2 |
+| TS-07 | FIXED — mutation start/completion invalidation advances the backing-store generation; response and loader fills publish only through atomic `setIfGeneration`. Custom server stores without the contract are refused before resources open. The delayed external loader publication regression proves a completed mutation cannot be overwritten by a stale fill. | r2 + `cache-atomic-publication.e2e.test.ts` |
 | TS-08 | FIXED — segment-based traversal matching the serving path; invalidation matches exact cache-key path fields (no /user sweeping /users) | c31736eb |
 | TS-09 | FIXED — static HTML cache never answers X-Neutron-Data/JSON requests | c31736eb |
 | TS-10 | FIXED — backslash/NUL rejected in URL paths; image source resolution is realpath-contained (escaping symlinks refused). @hono/node-server's serveStatic is library surface, not modified here | 67ff9c6b |
@@ -501,3 +501,14 @@ verified by these model legs and are not advertised as verified.
 Out-of-repo note: Lullmail's vendored copies of the send.go / bearer-transport
 blobs (flagged in neutron-12/13/16 as affected consumers) are NOT fixed here —
 that is a separate repo and needs its own sync.
+
+## Cached-function privacy and bounded retention (2026-09-30)
+
+The core `cache()` previously keyed only on a prefix and arguments in a process
+map: different functions collided, and authenticated HTTP requests could receive
+another request's result. Function identities and Node request-local scopes now
+isolate results. Server calls outside a request have no implicit cache; public
+process sharing requires `scope: "shared"`. Entry ceilings and complete tag/timer
+cleanup bound retention. `request-cache-security.test.ts` checks sequential and
+concurrent authenticated requests over HTTP, including within-request
+single-flight behavior; `cache.test.ts` covers identity, limits and cleanup.
