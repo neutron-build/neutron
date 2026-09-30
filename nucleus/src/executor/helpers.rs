@@ -2176,6 +2176,225 @@ pub(super) fn value_to_ast_expr(val: &Value) -> Expr {
     })
 }
 
+/// Preserve the declared element type when a correlated array value has no
+/// non-NULL elements from which a literal constructor could recover it.
+fn typed_value_to_ast_expr(value: &Value, dtype: &DataType) -> Expr {
+    let expr = value_to_ast_expr(value);
+    if !matches!(dtype, DataType::Array(_)) {
+        return expr;
+    }
+    let dialect = sqlparser::dialect::PostgreSqlDialect {};
+    let data_type = sqlparser::parser::Parser::new(&dialect)
+        .try_with_sql(&dtype.to_string())
+        .and_then(|mut parser| parser.parse_data_type());
+    match data_type {
+        Ok(data_type) => Expr::Cast {
+            kind: ast::CastKind::Cast,
+            expr: Box::new(expr),
+            data_type,
+            array: false,
+            format: None,
+        },
+        Err(_) => expr,
+    }
+}
+
+impl super::Executor {
+    /// Resolve scalar-subquery output metadata from its own relation scope.
+    /// This reads schemas and virtual catalog metadata, never evaluates the
+    /// subquery projection or its predicates to discover a type.
+    pub(super) fn infer_projection_type(&self, expr: &Expr, outer: &[ColMeta]) -> DataType {
+        let Expr::Subquery(query) = expr else {
+            return infer_expr_type(expr, outer);
+        };
+        self.infer_scalar_subquery_type(query, outer)
+            .unwrap_or(DataType::Text)
+    }
+
+    fn infer_scalar_subquery_type(
+        &self,
+        query: &ast::Query,
+        outer: &[ColMeta],
+    ) -> Option<DataType> {
+        use core::ops::ControlFlow;
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            return None;
+        };
+        // CTEs and derived relations need their own scope-aware metadata path.
+        if query.with.is_some() || select.projection.len() != 1 {
+            return None;
+        }
+        let mut local = Vec::new();
+        let mut labels = Vec::new();
+        for from in &select.from {
+            for factor in
+                std::iter::once(&from.relation).chain(from.joins.iter().map(|j| &j.relation))
+            {
+                let (label, mut meta) = match factor {
+                    ast::TableFactor::Table {
+                        name,
+                        alias,
+                        args: None,
+                        ..
+                    } => {
+                        let name = crate::sql::object_name_key(name);
+                        let label = alias
+                            .as_ref()
+                            .map(|a| a.name.value.clone())
+                            .unwrap_or_else(|| name.clone());
+                        let meta = if let Some(meta) = self.build_col_meta_from_cache(&name, &label)
+                        {
+                            meta
+                        } else {
+                            super::session::sync_block_on(
+                                self.load_virtual_table(&name.to_lowercase(), &label),
+                            )
+                            .ok()??
+                            .0
+                        };
+                        (label, meta)
+                    }
+                    ast::TableFactor::UNNEST {
+                        alias,
+                        array_exprs,
+                        with_ordinality,
+                        ..
+                    } => {
+                        let label = alias
+                            .as_ref()
+                            .map(|a| a.name.value.clone())
+                            .unwrap_or_else(|| "unnest".into());
+                        let mut meta = Vec::new();
+                        for expr in array_exprs {
+                            let mut dtype = infer_expr_type(expr, outer);
+                            if !matches!(dtype, DataType::Array(_)) {
+                                return None;
+                            }
+                            while let DataType::Array(inner) = dtype {
+                                dtype = *inner;
+                            }
+                            meta.push(ColMeta {
+                                table: Some(label.clone()),
+                                name: "unnest".into(),
+                                dtype,
+                            });
+                        }
+                        if *with_ordinality {
+                            meta.push(ColMeta {
+                                table: Some(label.clone()),
+                                name: "ordinality".into(),
+                                dtype: DataType::Int64,
+                            });
+                        }
+                        (label, meta)
+                    }
+                    _ => return None,
+                };
+                let alias = match factor {
+                    ast::TableFactor::Table { alias, .. }
+                    | ast::TableFactor::UNNEST { alias, .. } => alias,
+                    _ => unreachable!(),
+                };
+                if let Some(alias) = alias {
+                    for (col, alias_col) in meta.iter_mut().zip(&alias.columns) {
+                        col.name = alias_col.name.value.clone();
+                    }
+                }
+                labels.push(label);
+                local.extend(meta);
+            }
+        }
+        let mut expr = match &select.projection[0] {
+            ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } => {
+                expr.clone()
+            }
+            _ => return None,
+        };
+        let mut unresolved = false;
+        let _ = sqlparser::ast::visit_expressions_mut(&mut expr, |node| {
+            let (qualifier, name) = match node {
+                Expr::Identifier(id) => (None, id.value.clone()),
+                Expr::CompoundIdentifier(ids) if ids.len() == 2 => {
+                    (Some(ids[0].value.clone()), ids[1].value.clone())
+                }
+                Expr::Subquery(_) => {
+                    unresolved = true;
+                    return ControlFlow::<()>::Break(());
+                }
+                _ => return ControlFlow::<()>::Continue(()),
+            };
+            let matches = |col: &&ColMeta| {
+                col.name.eq_ignore_ascii_case(&name)
+                    && qualifier.as_ref().is_none_or(|q| {
+                        col.table
+                            .as_ref()
+                            .is_some_and(|t| t.eq_ignore_ascii_case(q))
+                    })
+            };
+            let mut candidates = local.iter().filter(matches);
+            let local_col = candidates.next();
+            if candidates.next().is_some() {
+                unresolved = true;
+                return ControlFlow::Break(());
+            }
+            let col = local_col.or_else(|| {
+                if qualifier
+                    .as_ref()
+                    .is_some_and(|q| labels.iter().any(|l| l.eq_ignore_ascii_case(q)))
+                {
+                    return None;
+                }
+                let mut candidates = outer.iter().filter(matches);
+                let col = candidates.next();
+                if candidates.next().is_some() {
+                    None
+                } else {
+                    col
+                }
+            });
+            if let Some(col) = col {
+                let dialect = sqlparser::dialect::PostgreSqlDialect {};
+                if let Ok(data_type) = sqlparser::parser::Parser::new(&dialect)
+                    .try_with_sql(&col.dtype.to_string())
+                    .and_then(|mut p| p.parse_data_type())
+                {
+                    *node = Expr::Cast {
+                        kind: ast::CastKind::Cast,
+                        expr: Box::new(Expr::value(ast::Value::Null)),
+                        data_type,
+                        array: false,
+                        format: None,
+                    };
+                } else {
+                    unresolved = true;
+                }
+            } else {
+                unresolved = true;
+            }
+            ControlFlow::Continue(())
+        });
+        if unresolved {
+            None
+        } else {
+            Some(infer_expr_type(&expr, &[]))
+        }
+    }
+
+    pub(super) fn projected_expr_type(
+        &self,
+        expr: &Expr,
+        value: &Value,
+        meta: &[ColMeta],
+    ) -> DataType {
+        let inferred = self.infer_projection_type(expr, meta);
+        if matches!(value, Value::Null) || matches!(inferred, DataType::Array(_)) {
+            inferred
+        } else {
+            value_type(value)
+        }
+    }
+}
+
 /// Substitute outer column references in an expression tree with literal values.
 /// Used for correlated subqueries where inner expressions reference outer table columns.
 /// Substitute outer column references throughout a correlated subquery —
@@ -2207,7 +2426,7 @@ pub(super) fn substitute_outer_refs_in_query(
                             .is_some_and(|last| last.eq_ignore_ascii_case(&qual_last)))
                     && let Some(val) = outer_row.get(i)
                 {
-                    *node = value_to_ast_expr(val);
+                    *node = typed_value_to_ast_expr(val, &meta.dtype);
                     break;
                 }
             }
