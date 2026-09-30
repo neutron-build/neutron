@@ -29,7 +29,7 @@ class InstallerTests(unittest.TestCase):
             commands.mkdir()
             # Isolated PATH makes missing hashing tools a genuine condition.
             for name in ["awk", "grep", "head", "sed", "mktemp", "rm", "tar",
-                         "mkdir", "cp", "chmod", "mv", "dirname", "sh"]:
+                         "mkdir", "cp", "chmod", "mv", "dirname", "sh", "gzip"]:
                 os.symlink(shutil.which(name), commands / name)
             if hash_tool:
                 os.symlink(shutil.which(hash_tool), commands / hash_tool)
