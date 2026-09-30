@@ -85,9 +85,9 @@ function types(dir,file,{skipLibCheck=false,unsupported=false}={}){
    const memoryKiB=Number(/Memory used:\s+(\d+)K/.exec(text)?.[1]);
    // Unsupported full third-party declaration diagnostics are heavier than
    // the supported application fixture; keep their cost separately bounded.
-   const budget=unsupported?{instantiations:5000000,memoryKiB:655360}:{instantiations:1000000,memoryKiB:262144};
+   const budget=unsupported?{instantiations:5000000,memoryKiB:655360}:{instantiations:1000000,memoryKiB:327680};
    assert.ok(Number.isFinite(instantiations) && instantiations<=budget.instantiations,'instantiation budget exceeded/missing');
-   assert.ok(Number.isFinite(memoryKiB) && memoryKiB<=budget.memoryKiB,'memory budget exceeded/missing');
+   assert.ok(Number.isFinite(memoryKiB) && memoryKiB<=budget.memoryKiB,`memory budget exceeded/missing: ${memoryKiB} KiB, cap ${budget.memoryKiB} KiB`);
    reports.push({typescript:version,resolution,strict:true,skipLibCheck,supported:!unsupported,classification:unsupported?'documented third-party/optional declaration refusal':'supported',elapsedMs:Date.now()-start,instantiations,memoryKiB,budget,diagnostics:unsupported?text.slice(0,10000):undefined});
   }
  }

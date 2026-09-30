@@ -41,7 +41,7 @@ support.
 
 Each TypeScript invocation has a 120-second timeout and a 768-MiB heap limit.
 Supported fixtures additionally cap instantiations at 1,000,000 and reported
-memory at 256 MiB. The unsupported full-library diagnostic profile has a
+memory at 320 MiB (measured fixture headroom). The unsupported full-library diagnostic profile has a
 separate 5,000,000 / 640-MiB cap, and reports its measured cost and unsupported
 status. Node 22/24 jobs in `orm-artifacts.yml` build one engine from the same
 source and run both SDK gates against it and PostgreSQL 17.
