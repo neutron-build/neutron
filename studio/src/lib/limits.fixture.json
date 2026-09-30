@@ -8,8 +8,8 @@
     "measured": {
       "report": "conformance/live/orm/capabilities.nucleus.json",
       "nucleusVersion": "1.0.2",
-      "nucleusTree": "665c76c18ac3f6edb142e6d6950ac53b9d7fa583",
-      "recorded": "2026-09-29"
+      "nucleusTree": "133683ef5a14e645cad18e238db5d28d5aaf7eff",
+      "recorded": "2026-09-30"
     },
     "current": true,
     "currentNote": "the connected engine reports Nucleus 1.0.2, the measured build; builds are matched by version string only (the nucleus/ tree cannot be read over the connection), so a different tree reporting the same version is treated as measured",
@@ -18,15 +18,15 @@
         "model": "sql",
         "label": "SQL",
         "availability": "supported",
-        "availabilityReason": "relational SQL over pgwire; the ORM capability report lists what the ORM can rely on (71/140 probes supported through pg)",
+        "availabilityReason": "relational SQL over pgwire; the recorded ORM capability report lists the contracts verified through each driver",
         "transaction": "partial",
-        "transactionNote": "DML commits and rolls back (savepoints included) and other sessions do not see uncommitted rows; DDL is NOT transactional (it survives ROLLBACK and is visible before COMMIT); isolation levels and READ ONLY are not applied (every level behaves as read committed)",
+        "transactionNote": "DML commits and rolls back (savepoints included) and other sessions do not see uncommitted rows; DDL is NOT transactional (it survives ROLLBACK and is visible before COMMIT); READ ONLY is enforced; the default buffered disk engine supports READ COMMITTED and refuses higher isolation levels",
         "durability": "survives-restart",
         "durabilityNote": "committed rows survived a kill of the engine process and a restart in the X04 restart battery; the signal was not recorded (SIGKILL is not claimed) and power loss was not measured",
         "atomicWithSql": "supported",
         "warnings": [
           "DDL runs outside the transaction: a failed migration leaves earlier statements applied",
-          "BEGIN READ ONLY does not stop writes on this engine",
+          "higher isolation is unavailable on the default buffered disk engine",
           "no advisory locks, statement_timeout or query cancellation"
         ],
         "evidence": [
@@ -92,9 +92,9 @@
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "txn.read_only_rejects_writes",
-            "observed": "unsupported",
+            "observed": "supported",
             "supports": [
-              "warnings"
+              "transaction"
             ]
           },
           {
@@ -540,7 +540,7 @@
         "atomicWithSql": "unsupported",
         "warnings": [
           "COLUMNAR_* inserts cannot join a transaction",
-          "numbers passed as quoted text are stored as text and aggregate wrongly"
+          "text-valued numbers require explicit casts; numeric aggregates refuse text with SQLSTATE 0A000"
         ],
         "evidence": [
           {
@@ -549,6 +549,14 @@
             "observed": "pass",
             "supports": [
               "availability",
+              "warnings"
+            ]
+          },
+          {
+            "source": "conformance/live/orm/x03-nucleus-leg.mjs",
+            "ref": "untypedAggregateRefusals",
+            "observed": "pass",
+            "supports": [
               "warnings"
             ]
           },
@@ -720,25 +728,25 @@
     "measured": {
       "report": "conformance/live/orm/capabilities.nucleus.json",
       "nucleusVersion": "1.0.2",
-      "nucleusTree": "665c76c18ac3f6edb142e6d6950ac53b9d7fa583",
-      "recorded": "2026-09-29"
+      "nucleusTree": "133683ef5a14e645cad18e238db5d28d5aaf7eff",
+      "recorded": "2026-09-30"
     },
     "current": false,
-    "currentNote": "limits were measured on Nucleus 1.0.2 (nucleus/ tree 665c76c18ac3); the connected build reports 9.9.9 and has not been measured, so every status below is unknown",
+    "currentNote": "limits were measured on Nucleus 1.0.2 (nucleus/ tree 133683ef5a14); the connected build reports 9.9.9 and has not been measured, so every status below is unknown",
     "models": [
       {
         "model": "sql",
         "label": "SQL",
         "availability": "unknown",
-        "availabilityReason": "measured on Nucleus 1.0.2, not on 9.9.9: relational SQL over pgwire; the ORM capability report lists what the ORM can rely on (71/140 probes supported through pg)",
+        "availabilityReason": "measured on Nucleus 1.0.2, not on 9.9.9: relational SQL over pgwire; the recorded ORM capability report lists the contracts verified through each driver",
         "transaction": "unknown",
-        "transactionNote": "measured on Nucleus 1.0.2, not on 9.9.9: DML commits and rolls back (savepoints included) and other sessions do not see uncommitted rows; DDL is NOT transactional (it survives ROLLBACK and is visible before COMMIT); isolation levels and READ ONLY are not applied (every level behaves as read committed)",
+        "transactionNote": "measured on Nucleus 1.0.2, not on 9.9.9: DML commits and rolls back (savepoints included) and other sessions do not see uncommitted rows; DDL is NOT transactional (it survives ROLLBACK and is visible before COMMIT); READ ONLY is enforced; the default buffered disk engine supports READ COMMITTED and refuses higher isolation levels",
         "durability": "unknown",
         "durabilityNote": "measured on Nucleus 1.0.2, not on 9.9.9: committed rows survived a kill of the engine process and a restart in the X04 restart battery; the signal was not recorded (SIGKILL is not claimed) and power loss was not measured",
         "atomicWithSql": "unknown",
         "warnings": [
           "DDL runs outside the transaction: a failed migration leaves earlier statements applied",
-          "BEGIN READ ONLY does not stop writes on this engine",
+          "higher isolation is unavailable on the default buffered disk engine",
           "no advisory locks, statement_timeout or query cancellation"
         ],
         "evidence": [
@@ -804,9 +812,9 @@
           {
             "source": "conformance/live/orm/capabilities.nucleus.json",
             "ref": "txn.read_only_rejects_writes",
-            "observed": "unsupported",
+            "observed": "supported",
             "supports": [
-              "warnings"
+              "transaction"
             ]
           },
           {
@@ -1252,7 +1260,7 @@
         "atomicWithSql": "unsupported",
         "warnings": [
           "COLUMNAR_* inserts cannot join a transaction",
-          "numbers passed as quoted text are stored as text and aggregate wrongly"
+          "text-valued numbers require explicit casts; numeric aggregates refuse text with SQLSTATE 0A000"
         ],
         "evidence": [
           {
@@ -1261,6 +1269,14 @@
             "observed": "pass",
             "supports": [
               "availability",
+              "warnings"
+            ]
+          },
+          {
+            "source": "conformance/live/orm/x03-nucleus-leg.mjs",
+            "ref": "untypedAggregateRefusals",
+            "observed": "pass",
+            "supports": [
               "warnings"
             ]
           },
@@ -1432,8 +1448,8 @@
     "measured": {
       "report": "conformance/live/orm/capabilities.nucleus.json",
       "nucleusVersion": "1.0.2",
-      "nucleusTree": "665c76c18ac3f6edb142e6d6950ac53b9d7fa583",
-      "recorded": "2026-09-29"
+      "nucleusTree": "133683ef5a14e645cad18e238db5d28d5aaf7eff",
+      "recorded": "2026-09-30"
     },
     "current": true,
     "live": {

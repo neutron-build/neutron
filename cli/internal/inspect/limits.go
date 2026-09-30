@@ -162,16 +162,13 @@ type MeasuredBuild struct {
 	Recorded       string `json:"recorded"`
 }
 
-// Measured is the build the capability report was recorded on. The X01-X05
-// leg evidence cited by the limits was measured on nucleus tree
-// 3313729ae51300b67b77b2181ee87ac5287dfdec (2026-09-24). The engine changes
-// since (transaction-scoped SET state, row-lock rechecks) do not touch those
-// model families, and their legs have not been re-run on the newer tree.
+// Measured names the engine tree used for the fresh ORM and model legs.
+// A version match over pgwire cannot prove a source tree match.
 var Measured = MeasuredBuild{
 	Report:         SrcCapabilityReport,
 	NucleusVersion: "1.0.2",
-	NucleusTree:    "665c76c18ac3f6edb142e6d6950ac53b9d7fa583",
-	Recorded:       "2026-09-29",
+	NucleusTree:    "133683ef5a14e645cad18e238db5d28d5aaf7eff",
+	Recorded:       "2026-09-30",
 }
 
 // LiveSettings are PostgreSQL settings read from the connection itself: the
@@ -438,15 +435,15 @@ func nucleusLimits() []ModelLimits {
 		{
 			Model: "sql", Label: "SQL",
 			Availability:       Supported,
-			AvailabilityReason: "relational SQL over pgwire; the ORM capability report lists what the ORM can rely on (71/140 probes supported through pg)",
+			AvailabilityReason: "relational SQL over pgwire; the recorded ORM capability report lists the contracts verified through each driver",
 			Transaction:        TxPartial,
-			TransactionNote:    "DML commits and rolls back (savepoints included) and other sessions do not see uncommitted rows; DDL is NOT transactional (it survives ROLLBACK and is visible before COMMIT); isolation levels and READ ONLY are not applied (every level behaves as read committed)",
+			TransactionNote:    "DML commits and rolls back (savepoints included) and other sessions do not see uncommitted rows; DDL is NOT transactional (it survives ROLLBACK and is visible before COMMIT); READ ONLY is enforced; the default buffered disk engine supports READ COMMITTED and refuses higher isolation levels",
 			Durability:         DurRestart,
 			DurabilityNote:     "committed rows survived a kill of the engine process and a restart in the X04 restart battery; the signal was not recorded (SIGKILL is not claimed) and power loss was not measured",
 			AtomicWithSQL:      Supported,
 			Warnings: []string{
 				"DDL runs outside the transaction: a failed migration leaves earlier statements applied",
-				"BEGIN READ ONLY does not stop writes on this engine",
+				"higher isolation is unavailable on the default buffered disk engine",
 				"no advisory locks, statement_timeout or query cancellation",
 			},
 			Evidence: []Evidence{
@@ -457,7 +454,7 @@ func nucleusLimits() []ModelLimits {
 				report("ddl.failed_migration_all_or_nothing", "unsupported", fTx, fWarn),
 				report("ddl.uncommitted_ddl_invisible", "unsupported", fTx),
 				report("txn.isolation_levels_applied", "unsupported", fTx),
-				report("txn.read_only_rejects_writes", "unsupported", fWarn),
+				report("txn.read_only_rejects_writes", "supported", fTx),
 				report("lock.advisory_session", "unsupported", fWarn),
 				report("lock.statement_timeout", "unsupported", fWarn),
 				leg(SrcX02Leg, "rollbackRevertsAll", fTx),
@@ -637,10 +634,11 @@ func nucleusLimits() []ModelLimits {
 			AtomicWithSQL:      Unsupported,
 			Warnings: []string{
 				"COLUMNAR_* inserts cannot join a transaction",
-				"numbers passed as quoted text are stored as text and aggregate wrongly",
+				"text-valued numbers require explicit casts; numeric aggregates refuse text with SQLSTATE 0A000",
 			},
 			Evidence: []Evidence{
 				leg(SrcX03Leg, "castAggregatesExact", fAvail, fWarn),
+				leg(SrcX03Leg, "untypedAggregateRefusals", fWarn),
 				leg(SrcX03Leg, "inTxInsert", fTx, fWarn),
 				leg(SrcX03Leg, "rollbackOnEngineTable", fTx),
 				leg(SrcX03Leg, "afterKill9", fDur),

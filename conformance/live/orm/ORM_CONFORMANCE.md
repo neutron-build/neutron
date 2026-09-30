@@ -10,6 +10,8 @@ canonical; the tables below are generated from it by
 [`report.mjs`](report.mjs), and CI fails when they disagree. Every probe
 states one PostgreSQL behaviour and passes on PostgreSQL 17 (`--control`)
 before any Nucleus verdict is trusted. Nothing was relaxed to fit the engine.
+A supported verdict covers its stated probe contract; it does not certify
+universal PostgreSQL compatibility or every concurrency path.
 
 | verdict | meaning |
 |---|---|
@@ -49,37 +51,37 @@ is re-recorded and reviewed.
 | fact | value |
 |---|---|
 | engine | PostgreSQL 16.0 (Nucleus 1.0.2 — The Definitive Database) |
-| source commit (`--write` run) | `081183f948523bf3092fa30392759467fc733187` |
-| `nucleus/` tree SHA (the engine identity) | `665c76c18ac3f6edb142e6d6950ac53b9d7fa583` |
-| binary SHA-256 (provenance only; release builds are not bit-reproducible) | `106b1b5937f5ba02094b5352b5e71a2deb60d3b88eba179adbc3ba2e6ddbaa27` |
+| source commit (`--write` run) | `df718e66cb3db718622f3c689f442e9fe6caabd0` |
+| `nucleus/` tree SHA (the engine identity) | `133683ef5a14e645cad18e238db5d28d5aaf7eff` |
+| binary SHA-256 (provenance only; release builds are not bit-reproducible) | `41abd49b904e633f7f8796c9b36e41ac40dc8af4d336b16d93ebd84e0315beae` |
 | drivers | `pg` 8.22.0, `postgres` 3.4.8 |
 | runtime | Node v22.23.2, `@neutron-build/sql` 0.1.0 |
-| recorded | 2026-09-29 |
+| recorded | 2026-09-30 |
 
 ### Totals
 
 | driver | probes | supported | unsupported | unknown |
 |---|---|---|---|---|
-| `pg` | 143 | 76 | 66 | 1 |
-| `postgres` | 143 | 75 | 67 | 1 |
+| `pg` | 143 | 108 | 34 | 1 |
+| `postgres` | 143 | 107 | 35 | 1 |
 
-Driver-divergent verdicts: `relation.any_array_param` (pg supported, postgres unsupported).
+Driver-divergent verdicts: `codec.text_array_param` (pg supported, postgres unsupported).
 
 ### By area (supported / unsupported / unknown)
 
 | area | probes | `pg` | `postgres` |
 |---|---|---|---|
-| engine | 2 | 1 / 1 / 0 | 1 / 1 / 0 |
-| relation-sql | 25 | 19 / 6 / 0 | 18 / 7 / 0 |
-| dml | 14 | 9 / 5 / 0 | 9 / 5 / 0 |
-| constraints | 9 | 7 / 2 / 0 | 7 / 2 / 0 |
-| codec | 19 | 9 / 10 / 0 | 9 / 10 / 0 |
-| catalog | 14 | 2 / 12 / 0 | 2 / 12 / 0 |
+| engine | 2 | 2 / 0 / 0 | 2 / 0 / 0 |
+| relation-sql | 25 | 24 / 1 / 0 | 24 / 1 / 0 |
+| dml | 14 | 12 / 2 / 0 | 12 / 2 / 0 |
+| constraints | 9 | 9 / 0 / 0 | 9 / 0 / 0 |
+| codec | 19 | 15 / 4 / 0 | 14 / 5 / 0 |
+| catalog | 14 | 9 / 5 / 0 | 9 / 5 / 0 |
 | ddl | 11 | 3 / 8 / 0 | 3 / 8 / 0 |
 | rls | 12 | 8 / 3 / 1 | 8 / 3 / 1 |
 | locks | 11 | 3 / 8 / 0 | 3 / 8 / 0 |
 | transactions | 7 | 4 / 3 / 0 | 4 / 3 / 0 |
-| orm | 19 | 11 / 8 / 0 | 11 / 8 / 0 |
+| orm | 19 | 19 / 0 / 0 | 19 / 0 / 0 |
 
 ### Every probe
 
@@ -90,7 +92,7 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | probe | pg | postgres | SQLSTATE | evidence |
 |---|---|---|---|---|
 | `engine.identity` | supported | supported |  |  |
-| `engine.capability.jsonb-functions` | unsupported | unsupported |  | probe failed with server error sqlstate 42703 on nucleus 1.0.2: pg: column "v" does not exist |
+| `engine.capability.jsonb-functions` | supported | supported |  |  |
 
 #### relation-sql
 
@@ -98,11 +100,11 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 |---|---|---|---|---|
 | `relation.correlated_scalar_subquery` | supported | supported |  |  |
 | `relation.jsonb_build_object` | supported | supported |  |  |
-| `relation.jsonb_agg_order_by` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: unknown function: JSONB_AGG |
+| `relation.jsonb_agg_order_by` | supported | supported |  |  |
 | `relation.coalesce_empty_jsonb_array` | supported | supported |  |  |
-| `relation.correlated_derived_table_limit` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: unknown function: JSONB_AGG |
-| `relation.nested_correlation` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: unknown function: JSONB_AGG |
-| `relation.to_jsonb_text_leaf` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected { i: '9223372036854775807', + n: '12345678901234567000', |
+| `relation.correlated_derived_table_limit` | supported | supported |  |  |
+| `relation.nested_correlation` | supported | supported |  |  |
+| `relation.to_jsonb_text_leaf` | supported | supported |  |  |
 | `relation.lateral_join` | supported | supported |  |  |
 | `relation.left_join_lateral` | supported | supported |  |  |
 | `relation.left_join_nulls` | supported | supported |  |  |
@@ -111,12 +113,12 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | `relation.cte_recursive` | supported | supported |  |  |
 | `relation.set_operations` | supported | supported |  |  |
 | `relation.distinct_on` | supported | supported |  |  |
-| `relation.window_row_number` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: unknown function: ROW_NUMBER |
+| `relation.window_row_number` | supported | supported |  |  |
 | `relation.aggregate_filter` | supported | supported |  |  |
 | `relation.group_by_having` | supported | supported |  |  |
 | `relation.exists_subquery` | supported | supported |  |  |
 | `relation.in_subquery` | supported | supported |  |  |
-| `relation.any_array_param` | supported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected + [] - [ - 1, |
+| `relation.any_array_param` | supported | supported |  |  |
 | `relation.order_nulls_last` | supported | supported |  |  |
 | `relation.limit_offset_params` | supported | supported |  |  |
 | `relation.schema_qualified` | supported | supported |  |  |
@@ -130,16 +132,16 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | `dml.update_returning` | supported | supported |  |  |
 | `dml.delete_returning` | supported | supported |  |  |
 | `dml.multirow_values_default` | supported | supported |  |  |
-| `dml.default_values` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: INSERT without VALUES |
+| `dml.default_values` | supported | supported |  |  |
 | `dml.on_conflict_do_update` | supported | supported |  |  |
 | `dml.on_conflict_do_nothing` | supported | supported |  |  |
 | `dml.on_conflict_where` | supported | supported |  |  |
 | `dml.on_conflict_unique_column` | supported | supported |  |  |
-| `dml.update_from` | unsupported | unsupported | 42703 | server error: ServerSqlError [42703]: pg: column "u.id" does not exist |
-| `dml.delete_using` | unsupported | unsupported | 42703 | server error: ServerSqlError [42703]: pg: column "u.id" does not exist |
+| `dml.update_from` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: UPDATE FROM |
+| `dml.delete_using` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: DELETE USING |
 | `dml.affected_row_counts` | supported | supported |  |  |
-| `dml.identity_column` | unsupported | unsupported |  | wrong result: explicit identity value: expected SQLSTATE 428C9, statement succeeded |
-| `dml.generated_stored_column` | unsupported | unsupported |  | wrong result: Expected values to be strictly equal: 0 !== 6 |
+| `dml.identity_column` | supported | supported |  |  |
+| `dml.generated_stored_column` | supported | supported |  |  |
 
 #### constraints
 
@@ -152,8 +154,8 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | `constraint.check` | supported | supported |  |  |
 | `constraint.fk_on_delete_cascade` | supported | supported |  |  |
 | `constraint.composite_foreign_key` | supported | supported |  |  |
-| `constraint.deferrable_fk` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: deferrable constraints are not supported; constraints are immediate |
-| `constraint.varchar_length` | unsupported | unsupported |  | wrong result: varchar(3) overflow: expected SQLSTATE 22001, statement succeeded |
+| `constraint.deferrable_fk` | supported | supported |  |  |
+| `constraint.varchar_length` | supported | supported |  |  |
 
 #### codec
 
@@ -163,39 +165,39 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | `codec.numeric_precision` | unsupported | unsupported | 22000 | server error: ServerSqlError [22000]: pg: invalid value for column 'v' (NUMERIC): numeric value '12345678901234567890.12345678901234567890' exceeds NUMERIC precision ceiling: Nucl… |
 | `codec.numeric_unconstrained` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected [ + '1.5', - '1.50', |
 | `codec.timestamp_microseconds` | supported | supported |  |  |
-| `codec.timestamptz_utc` | unsupported | unsupported |  | wrong result: Expected values to be strictly equal: + actual - expected + '2026-01-02 03:04:05.123456+00' - '2026-01-02 01:04:05.123456+00' ^ |
-| `codec.timestamptz_session_timezone` | unsupported | unsupported |  | wrong result: Expected values to be strictly equal: + actual - expected + '2026-01-02 00:00:00+00' - '2026-01-02 09:00:00+09' ^ |
+| `codec.timestamptz_utc` | supported | supported |  |  |
+| `codec.timestamptz_session_timezone` | supported | supported |  |  |
 | `codec.date` | unsupported | unsupported | 22000 | server error: ServerSqlError [22000]: pg: invalid value for column 'v' (DATE): invalid date value: infinity |
-| `codec.bytea` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: ENCODE requires text input |
+| `codec.bytea` | supported | supported |  |  |
 | `codec.jsonb_roundtrip` | supported | supported |  |  |
 | `codec.jsonb_null_vs_sql_null` | supported | supported |  |  |
 | `codec.uuid` | supported | supported |  |  |
 | `codec.float8_special` | supported | supported |  |  |
 | `codec.boolean` | supported | supported |  |  |
-| `codec.text_array_param` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected [ + 4, + null, |
-| `codec.int_array_result` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected + '{1,2,3}' - [ - 1, |
+| `codec.text_array_param` | supported | unsupported | 22000 | server error: ServerSqlError [22000]: postgres: invalid input syntax for array: expected an array literal or array value |
+| `codec.int_array_result` | supported | supported |  |  |
 | `codec.param_typed_int` | supported | supported |  |  |
 | `codec.param_typed_jsonb` | supported | supported |  |  |
 | `codec.enum` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected [ + 'happy', + 'ok', |
-| `codec.interval` | unsupported | unsupported |  | wrong result: Expected values to be strictly equal: + actual - expected + '1 day 02:03:04.500000' - '1 day 02:03:04.5' ^ |
+| `codec.interval` | supported | supported |  |  |
 
 #### catalog
 
 | probe | pg | postgres | SQLSTATE | evidence |
 |---|---|---|---|---|
-| `catalog.information_schema_columns` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected [ [ 'id', |
-| `catalog.pg_class_relations` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected + [] - [ - 'x00k_b216b2_child_id_seq', |
-| `catalog.introspect_relations_query` | unsupported | unsupported |  | wrong result: sequence row 0 !== 1 |
-| `catalog.pg_attribute_types` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected ... Skipped lines [ [ |
-| `catalog.format_type` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected [ 'bigint', - 'character varying(20)', |
-| `catalog.pg_constraint` | unsupported | unsupported |  | wrong result: one pk, one fk, one check + actual - expected + [] - [ - 'c', |
-| `catalog.pg_get_constraintdef` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected + [] - [ - 'CHECK ((qty > 0))', |
-| `catalog.pg_index` | unsupported | unsupported | 42703 | server error: ServerSqlError [42703]: pg: column "i.indisready" does not exist |
+| `catalog.information_schema_columns` | supported | supported |  |  |
+| `catalog.pg_class_relations` | supported | supported |  |  |
+| `catalog.introspect_relations_query` | unsupported | unsupported |  | wrong result: serial sequence is attached to its column via pg_depend 't' !== true |
+| `catalog.pg_attribute_types` | supported | supported |  |  |
+| `catalog.format_type` | supported | supported |  |  |
+| `catalog.pg_constraint` | unsupported | unsupported |  | wrong result: Expected values to be strictly equal: + actual - expected + 'check((qty > 0))' - '(qty > 0)' |
+| `catalog.pg_get_constraintdef` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected [ + 'CHECK ((check((qty > 0))))', - 'CHECK ((qty > 0))', |
+| `catalog.pg_index` | supported | supported |  |  |
 | `catalog.partial_index` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: partial indexes (CREATE INDEX ... WHERE) are not implemented. The predicate was previously parsed and discarded, which built a FULL index… |
 | `catalog.pg_get_indexdef` | supported | supported |  |  |
-| `catalog.regclass_cast` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: cast to oid |
-| `catalog.pg_enum` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected + [] - [ - 'draft', |
-| `catalog.views` | unsupported | unsupported |  | error: TypeError: Cannot read properties of undefined (reading 'k') |
+| `catalog.regclass_cast` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected [ true, + '672113329' |
+| `catalog.pg_enum` | supported | supported |  |  |
+| `catalog.views` | supported | supported |  |  |
 | `catalog.current_schema_and_search_path` | supported | supported |  |  |
 
 #### ddl
@@ -204,7 +206,7 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 |---|---|---|---|---|
 | `ddl.create_table_rollback` | unsupported | unsupported |  | wrong result: table must not survive ROLLBACK true !== false |
 | `ddl.alter_add_column_rollback` | unsupported | unsupported |  | wrong result: column must not survive ROLLBACK true !== false |
-| `ddl.drop_table_rollback` | unsupported | unsupported | 42P01 | server error: ServerSqlError [42P01]: pg: relation "x00d_9a55bb_base" does not exist |
+| `ddl.drop_table_rollback` | unsupported | unsupported | 42P01 | server error: ServerSqlError [42P01]: pg: relation "x00d_99e4a8_base" does not exist |
 | `ddl.create_index_rollback` | unsupported | unsupported |  | wrong result: index relation must not survive ROLLBACK true !== false |
 | `ddl.rename_column_rollback` | unsupported | unsupported |  | wrong result: original column name must be back false !== true |
 | `ddl.failed_migration_all_or_nothing` | unsupported | unsupported |  | wrong result: first CREATE TABLE must be rolled back true !== false |
@@ -222,7 +224,7 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | `rls.current_user_policy` | supported | supported |  |  |
 | `rls.with_check_blocks_insert` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: unsupported row-security predicate 'current_setting('app.tenant')::INT'; supported forms are boolean constants, column equality to a lite… |
 | `rls.no_policy_default_deny` | supported | supported |  |  |
-| `rls.owner_bypass_unless_forced` | unknown | unknown |  | setup failed: ServerSqlError [0A000]: pg: ALTER TABLE operation not yet supported: OWNER TO x00s_191fbc_app — in: alter table x00s_191fbc_docs owner to x00s_191fbc_app |
+| `rls.owner_bypass_unless_forced` | unknown | unknown |  | setup failed: ServerSqlError [0A000]: pg: ALTER TABLE operation not yet supported: OWNER TO x00s_68e605_app — in: alter table x00s_68e605_docs owner to x00s_68e605_app |
 | `rls.set_config_transaction_local` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: unknown function: SET_CONFIG |
 | `rls.pg_policies_introspection` | supported | supported |  |  |
 | `rls.set_local_role_transaction_local` | supported | supported |  |  |
@@ -240,7 +242,7 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | `lock.advisory_xact` | unsupported | unsupported | 25P02 | server error: ServerSqlError [25P02]: pg: current transaction is aborted, commands ignored until end of transaction block |
 | `lock.select_for_update_nowait` | supported | supported |  |  |
 | `lock.select_for_update_skip_locked` | supported | supported |  |  |
-| `lock.row_lock_timeout` | unsupported | unsupported |  | wrong result: update of a row locked by an open transaction: expected SQLSTATE 55P03, got ServerSqlError [XX000]: pg: I/O error: timed out after 10002ms waiting for another transa… |
+| `lock.row_lock_timeout` | unsupported | unsupported |  | wrong result: update of a row locked by an open transaction: expected SQLSTATE 55P03, got ServerSqlError [XX000]: pg: I/O error: timed out after 10001ms waiting for another transa… |
 | `lock.blocked_update_waits_then_applies` | supported | supported |  |  |
 | `lock.lock_table_nowait` | unsupported | unsupported | 42601 | server error: ServerSqlError [42601]: pg: parse error: SQL parse error: sql parser error: Expected: an SQL statement, found: lock at Line: 1, Column: 1 |
 | `lock.statement_timeout` | unsupported | unsupported |  | wrong result: pg_sleep past statement_timeout: expected SQLSTATE 57014, got ServerSqlError [0A000]: pg: unknown function: PG_SLEEP |
@@ -251,11 +253,11 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 
 | probe | pg | postgres | SQLSTATE | evidence |
 |---|---|---|---|---|
-| `txn.isolation_levels_applied` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected [ 'read committed', + 'read committed', |
-| `txn.read_only_rejects_writes` | unsupported | unsupported |  | wrong result: write in READ ONLY: expected SQLSTATE 25006, statement succeeded |
-| `txn.repeatable_read_snapshot` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected [ 3, + 4 |
+| `txn.isolation_levels_applied` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: isolation level REPEATABLE READ is not available on this storage engine, which provides READ COMMITTED. Accepting it would run your trans… |
+| `txn.read_only_rejects_writes` | supported | supported |  |  |
+| `txn.repeatable_read_snapshot` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: isolation level REPEATABLE READ is not available on this storage engine, which provides READ COMMITTED. Accepting it would run your trans… |
 | `txn.read_committed_sees_commits` | supported | supported |  |  |
-| `txn.serializable_write_skew` | supported | supported |  |  |
+| `txn.serializable_write_skew` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: isolation level SERIALIZABLE is not available on this storage engine, which provides READ COMMITTED. Accepting it would run your transact… |
 | `txn.savepoint_rollback` | supported | supported |  |  |
 | `txn.savepoint_recovers_error` | supported | supported |  |  |
 
@@ -264,88 +266,79 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | probe | pg | postgres | SQLSTATE | evidence |
 |---|---|---|---|---|
 | `orm.schema_ddl` | supported | supported |  |  |
-| `orm.insert_returning` | unsupported | unsupported |  | error: CapabilityRequirementError: statement requires capabilities the connected engine does not prove: |
+| `orm.insert_returning` | supported | supported |  |  |
 | `orm.batch_insert_defaults` | supported | supported |  |  |
 | `orm.select_where_order_limit` | supported | supported |  |  |
 | `orm.update_returning` | supported | supported |  |  |
-| `orm.delete_returning` | unsupported | unsupported |  | error: CapabilityRequirementError: statement requires capabilities the connected engine does not prove: |
-| `orm.upsert` | unsupported | unsupported |  | error: CapabilityRequirementError: statement requires capabilities the connected engine does not prove: |
+| `orm.delete_returning` | supported | supported |  |  |
+| `orm.upsert` | supported | supported |  |  |
 | `orm.left_join` | supported | supported |  |  |
 | `orm.aggregate_group_by` | supported | supported |  |  |
 | `orm.cte` | supported | supported |  |  |
 | `orm.set_operation` | supported | supported |  |  |
-| `orm.relations_nested` | unsupported | unsupported |  | error: CapabilityRequirementError: statement requires capabilities the connected engine does not prove: |
-| `orm.relations_to_one` | unsupported | unsupported |  | error: CapabilityRequirementError: statement requires capabilities the connected engine does not prove: |
+| `orm.relations_nested` | supported | supported |  |  |
+| `orm.relations_to_one` | supported | supported |  |  |
 | `orm.keyset_pagination` | supported | supported |  |  |
 | `orm.prepared_statement` | supported | supported |  |  |
-| `orm.transaction_commit_rollback` | unsupported | unsupported |  | error: CapabilityRequirementError: statement requires capabilities the connected engine does not prove: |
-| `orm.transaction_nested_savepoint` | unsupported | unsupported |  | error: CapabilityRequirementError: statement requires capabilities the connected engine does not prove: |
-| `orm.codec_values` | unsupported | unsupported |  | error: CapabilityRequirementError: statement requires capabilities the connected engine does not prove: |
+| `orm.transaction_commit_rollback` | supported | supported |  |  |
+| `orm.transaction_nested_savepoint` | supported | supported |  |  |
+| `orm.codec_values` | supported | supported |  |  |
 | `orm.jsonb_null_distinct` | supported | supported |  |  |
 
 <!-- END GENERATED -->
 
 ## What works
 
-Through the ORM, both drivers: `schemaToDDL` output executes; batch insert
-with per-row `DEFAULT`; select/where/order/limit; `update ... returning`; left
-joins with null extension; `count()` with `GROUP BY`/`HAVING`; CTEs; `UNION`;
-keyset pagination; prepared statements; `jsonb` SQL NULL vs JSON null. The
-other eight ORM probes (insert and delete with `returning`, upsert, both
-relation reads, both transaction probes, codec values) fail closed with
-`CapabilityRequirementError` because their statements carry lossless
-int8/numeric/temporal leaves (blocker 4); they are gated, not wrong.
+All recorded ORM-level probes pass through both drivers: schema DDL,
+batch insert with per-row DEFAULT, select/update/delete with RETURNING,
+upsert, joins, grouped queries, CTEs, set operations, nested and to-one
+relations, keyset pagination, prepared statements, transaction rollback and
+nested savepoints, codec values, and SQL NULL versus JSON null.
+The jsonb-functions gate resolves supported for the bounded lossless
+relational reads exercised by these probes.
 
-As plain SQL on both drivers: `INSERT`/`UPDATE`/`DELETE ... RETURNING`,
-multi-row `VALUES` with `DEFAULT`, all four `ON CONFLICT` shapes, exact
-affected-row counts, scalar subqueries, `LATERAL`, `WITH RECURSIVE`, set
-operations, `DISTINCT ON`, `FILTER`, `EXISTS`/`IN`, `NULLS FIRST/LAST`, bound
-`LIMIT`/`OFFSET`, schema-qualified and quoted identifiers; NOT NULL, unique,
-FK, check, cascade and composite-key constraints; savepoints including error
-recovery; `FOR UPDATE` with `NOWAIT`/`SKIP LOCKED`; blocked updates that wait
-and apply without lost updates; `CREATE INDEX CONCURRENTLY`; int8 extremes,
-microsecond `timestamp`, uuid, float8 specials, boolean, `jsonb` round trips.
+Plain SQL coverage includes lateral/correlated queries, JSONB_AGG ordering,
+ROW_NUMBER, derived-table aliases, typed integer-array results, ANY array
+parameters, supported exact NUMERIC values, session-zone TIMESTAMPTZ,
+BYTEA encoding, generated/identity columns, deferred foreign keys and
+READ ONLY. The generated table is the full per-driver contract list.
 
-Two `supported` verdicts are narrower than they read:
-`relation.coalesce_empty_jsonb_array` passes only because an aggregate over
-zero rows is never evaluated (`jsonb_agg` itself does not exist, N10), and
-`txn.serializable_write_skew` observes the expected single 40001 although
-every isolation level reports `read committed` (N11), so the mechanism is not
-PostgreSQL's SSI.
+Driver differences remain: codec.text_array_param passes through pg but is
+refused through postgres.js with SQLSTATE 22000. Selected catalog queries
+pass, but catalog.introspect_relations_query still fails on a boolean value
+shape ('t' versus true). CHECK rendering and regclass output also differ.
+Scalar Text emits VARCHAR OID 1043 rather than PostgreSQL TEXT OID 25;
+correct TEXT[] OID 1009 does not establish scalar type identity.
 
-## Blockers
+## Remaining limits
 
-Each is independently sufficient to keep Nucleus support for the ORM
-experimental.
+Nucleus support remains bounded by the recorded contracts:
 
-1. **Catalog introspection is not usable** (catalog area). Wrong
-   `information_schema.columns` types, empty `pg_class`/`pg_constraint`/
-   `pg_enum` under the introspector's filters, missing `pg_get_expr`,
-   `format_type` and `::regclass`, `pg_index` without `indisready`. Schema
-   pull, diff and migration planning cannot run against Nucleus (N4).
-2. **DDL is not transactional.** DDL survives ROLLBACK, is visible to other
-   sessions before COMMIT, and a failing statement mid-migration leaves the
-   earlier DDL applied (N2). Atomic migrations are impossible.
-3. **No migration-locking or cancellation surface.** Advisory locks,
-   `LOCK TABLE`, `pg_sleep` and `pg_cancel_backend` are missing, so
-   `statement_timeout` and query cancellation cannot even be exercised; a
-   row-lock wait ignores `SET LOCAL lock_timeout = '300ms'` and fails after
-   about 10 s with `XX000` instead of `55P03` (N7).
-4. **Lossless relational reads are gated off.** The `jsonb-functions`
-   capability probe fails, so nested `with` reads, per-parent limits and the
-   lossless int8/numeric/temporal wire forms fail closed with
-   `CapabilityRequirementError` before any SQL runs (the gate working as
-   designed). Two defects stand behind it: the probe's derived-table column
-   list `(values (1)) as t(v)` is rejected (N13, the error actually recorded
-   by `engine.capability.jsonb-functions`), and `jsonb_agg` does not exist
-   (N10). Both must be fixed before the gate can resolve `supported`.
-5. **RLS and session state differ from PostgreSQL.** The
-   `current_setting('app.tenant')` policy idiom is rejected at
-   `CREATE POLICY` (only a restricted predicate list is accepted, see
-   [`nucleus/RLS_SECURITY.md`](../../../nucleus/RLS_SECURITY.md)),
-   `set_config` and `ALTER TABLE ... OWNER TO` are missing (`SET LOCAL` roles
-   and settings are transaction-scoped since N1 was closed, X07). Default-deny,
-   `pg_policies` and grant enforcement work.
+1. **DDL is not transactional.** Catalog changes survive ROLLBACK and are
+   visible before COMMIT; failed migration statements leave earlier DDL
+   applied (N2). Data-message rollback does not make migrations atomic.
+2. **Migration locking and SQL cancellation differ.** Advisory locks,
+   LOCK TABLE, pg_sleep and pg_cancel_backend remain unavailable. The
+   row-lock timeout probe receives XX000 after about 10 seconds instead
+   of PostgreSQL 55P03 under its requested timeout (N7).
+3. **Buffered storage supplies READ COMMITTED only.** REPEATABLE READ and
+   SERIALIZABLE refuse with 0A000. The SERIALIZABLE write-skew contract is
+   unsupported; refusal is not PostgreSQL SSI (N11).
+4. **Catalog compatibility is incomplete.** Full relation-introspection
+   boolean shape, CHECK definitions, regclass output and scalar Text OID
+   limits remain; partial indexes are explicitly refused (N4).
+5. **RLS and session forms are restricted.** The app.tenant current_setting
+   policy idiom is rejected; only the documented predicate subset is
+   admitted. set_config and ALTER TABLE OWNER TO are unavailable. Default
+   deny, grants and transaction-scoped SET LOCAL contracts pass.
+6. **Joined DML and value forms remain unavailable.** UPDATE FROM,
+   DELETE USING and row-value comparison refuse before mutation. Arbitrary
+   numeric precision, numeric scale preservation, date infinity and enum
+   declaration-order sorting retain the recorded limits.
+
+Ordinary SQL physical B-tree maintenance has a bounded concurrency repair;
+it does not certify detached encrypted, vector, FTS or zone-map refreshes.
+See [`MODEL_SEMANTICS.md`](../../../nucleus/docs/MODEL_SEMANTICS.md).
 
 ## Engine defects and upstream reproducers
 
@@ -357,27 +350,27 @@ confirm; this report changes no engine code.
 
 ### N1 — `SET LOCAL` is not transaction-scoped; `RESET ROLE` is a no-op (security) — CLOSED (X07)
 
-**Closed by orm-program X07** (commit `081183f9`; `nucleus/` tree recorded
-above). The table below is the defect as measured on Nucleus 1.0.2, tree
+**Closed by orm-program X07** (historical commit `081183f9`). The table
+below records the old defect measured on Nucleus 1.0.2, tree
 `3313729a`; every row now matches PostgreSQL 17. `Session::guc_txn` records
 per-transaction `SET` state (BEGIN snapshot, values `SET LOCAL` displaced,
 a snapshot per savepoint); COMMIT restores the displaced values and keeps
 session-level changes, ROLLBACK (also COMMIT of an aborted transaction, pool
 return and disconnect) restores the BEGIN snapshot, `ROLLBACK TO SAVEPOINT`
 restores the savepoint's. `RESET ROLE` and `DISCARD ALL` drop an
-assumed role, as in PostgreSQL. A multi-statement simple query gets an
-implicit block for `SET` / `SET LOCAL` / `SET ROLE` state only, matching
+assumed role, as in PostgreSQL. X07 originally gave a multi-statement simple
+query an implicit block for `SET` / `SET LOCAL` / `SET ROLE` state, matching
 PostgreSQL 17 on the scripted cases (`set local role x; select current_user`
 runs the SELECT as `x`; the role ends with the message; an error or a
 cancelled message reverts the message's `SET`s; COMMIT or ROLLBACK inside the
 message ends the SET block and the next statement opens a new one). The parity
-is for SET state only. **Known divergence, out of scope here: multi-statement
-simple queries are not atomic.** Statements in a message autocommit one by one:
-earlier statements' data persists when a later one fails, and an in-message
-ROLLBACK does not undo data (`insert 1; rollback; insert 2; select count(*)`
-gives 1 on PostgreSQL 17 and 2 on Nucleus). Cancellation of a message has no
-PostgreSQL comparison (Nucleus has no `pg_sleep`); unit tests cover it. `SET LOCAL` in a single-statement message, or
-outside a block, does nothing (server-side warning only, no client NOTICE).
+was initially for SET state only. **X08 also supplies implicit data-message
+rollback on the server path:** a later statement failure reverts prior data
+writes in the same block, and an explicit COMMIT or ROLLBACK ends that block.
+The earlier data-autocommit divergence was repaired and checked separately;
+this does not establish transactional DDL or universal custom-engine and
+cancellation parity. SET LOCAL in a single-statement message or outside a
+block does nothing (server-side warning only, no client NOTICE).
 `lock_timeout` is per session and follows the same scoping (it was one
 engine-global value). A COMMIT or ROLLBACK whose storage step fails returns the
 session to its BEGIN-time role and settings while leaving the transaction open.
@@ -398,7 +391,7 @@ open in the same area: `set_config(..., true)` does not exist (probe
 Reproducer: [`upstream/N1-set-local-role.sql`](upstream/N1-set-local-role.sql).
 Probe: `rls.set_local_role_transaction_local`.
 
-| step | PostgreSQL 17 | Nucleus |
+| historical step | PostgreSQL 17 | Nucleus before X07 |
 |---|---|---|
 | login role | `postgres` | `nucleus` |
 | `BEGIN; SET LOCAL ROLE app; COMMIT;` then `current_user` | login role | `app` |
@@ -408,54 +401,19 @@ Probe: `rls.set_local_role_transaction_local`.
 | `BEGIN; SET ROLE app; ROLLBACK;` then `current_user` | login role | `app` |
 | `BEGIN; SET LOCAL search_path = x; COMMIT;` then `SHOW search_path` | unchanged | `x` |
 
-Impact: a pooled connection that assumes a role (or sets a tenant-scoped
-setting) inside a transaction keeps it for the next borrower. When the
-assumed role is more privileged than the login role, the next request runs
-with those privileges.
+Historical impact: a pooled connection that assumed a role (or set a
+tenant-scoped setting) inside a transaction kept it for the next borrower. When that role was more privileged than the login role, the next request
+ran with those privileges. The repaired contracts now pass.
 
-Suspected sites: `nucleus/src/executor/admin.rs:49` matches
-`ast::Set::SetRole { role_name, .. }` and discards `context_modifier`, then
-writes `session.current_role` (`admin.rs:86`) with no snapshot or restore at
-COMMIT/ROLLBACK; `admin.rs:137` likewise ignores the `SET LOCAL` scope of
-ordinary settings before `session.settings.write().insert` (`admin.rs:177`);
-`RESET ROLE` reaches `Reset::ConfigurationParameter` in
-`nucleus/src/executor/ddl.rs:4942` and only removes a `role` entry from the
-settings map (`ddl.rs:4959`), never touching `current_role`. Fix direction:
-record LOCAL assignments (role and settings) per transaction and restore
-them at transaction end, revert session-level `SET` on ROLLBACK, and make
-`RESET ROLE` equal to `SET ROLE NONE`.
+### N3 — TIMESTAMPTZ offsets and session zones — repaired bounded contracts
 
-### N3 — timestamptz ignores explicit offsets on input and the session TimeZone on output
-
-Reproducer: [`upstream/N3-timestamptz-offset.sql`](upstream/N3-timestamptz-offset.sql).
-Probes: `codec.timestamptz_utc`, `codec.timestamptz_session_timezone`.
-
-| step | PostgreSQL 17 | Nucleus |
-|---|---|---|
-| `SET TIME ZONE 'UTC'`; `'2026-01-02 03:04:05.123456+02'::timestamptz::text` | `2026-01-02 01:04:05.123456+00` | `2026-01-02 03:04:05.123456+00` |
-| `'… 03:04:05+02'::timestamptz = '… 01:04:05+00'::timestamptz` | `t` | `f` |
-| `extract(epoch from '2026-01-02 03:04:05+02'::timestamptz)` | `1767315845` | `1767323045` (+7200 s) |
-| INSERT `'2026-01-02 03:04:05+02'` into a timestamptz column, read back | `01:04:05+00` | `03:04:05+00` |
-| `SET TIME ZONE 'Asia/Tokyo'; SHOW timezone` | `Asia/Tokyo` | `UTC` (statement accepted, no effect) |
-| `SET timezone = 'Asia/Tokyo'`; read the stored value | `2026-01-02 10:04:05+09` | `2026-01-02 03:04:05+00` |
-| under `Asia/Tokyo`: `extract(epoch from '2026-01-02 00:00:00+00'::timestamptz)` | `1767312000` | `1767279600` (read as Tokyo local) |
-
-Impact: any timestamptz written with a non-zero offset, or under a non-UTC
-session zone, is stored at the wrong instant; this is silent data
-corruption, not a formatting difference.
-
-Suspected sites: all three text-to-timestamptz paths call
-`types::parse_timestamp` (which by contract drops the offset) and then
-re-interpret the wall clock in the session zone —
-`nucleus/src/executor/expr.rs:1068` (typed literal),
-`expr.rs:1992` (`CAST`), `nucleus/src/executor/dml.rs:98` (INSERT
-coercion); `types::parse_timestamptz` (`nucleus/src/types/mod.rs:397`)
-applies the offset but is unused on these paths, and none of them falls
-back to the session zone only when no offset is present.
-`ast::Set::SetTimeZone` is not matched in `execute_set` (it falls through
-`admin.rs:133` and returns `SET` without storing anything). Output: the
-`Value::TimestampTz` display arm (`types/mod.rs:124`) always renders UTC with
-`+00`.
+The fresh codec.timestamptz_utc and codec.timestamptz_session_timezone probes
+pass on both drivers. Explicit offsets preserve the instant; session zones
+control output. Ambiguous/nonexistent bare local DST times are refused;
+use an explicit offset. These replace the historical wrong-instant results
+in [`upstream/N3-timestamptz-offset.sql`](upstream/N3-timestamptz-offset.sql).
+See [`SQL_SEMANTICS.md`](../../../nucleus/docs/SQL_SEMANTICS.md) for supported
+forms and remaining limits.
 
 ### Other defects (reproducers in `reproducers.sql`)
 
@@ -464,11 +422,13 @@ back to the session zone only when no offset is present.
   `executor/ddl.rs`) and is not undone by ROLLBACK. Probes
   `ddl.create_table_rollback`, `ddl.failed_migration_all_or_nothing`,
   `ddl.uncommitted_ddl_invisible`, `ddl.create_index_concurrently_in_tx_rejected`.
-- **N4 — catalog fidelity.** See blocker 1; every `catalog.*` probe except
-  `catalog.pg_get_indexdef` and `catalog.current_schema_and_search_path`.
-- **N5 — generated/identity columns.** Source changes implemented in X10;
-  final integrated regression/live verification is pending. The recorded
-  verdicts above predate these changes and must be re-recorded.
+- **N4 — catalog fidelity, partial.** Selected information-schema,
+  pg_class, pg_attribute, pg_index, enum, format_type and expression queries
+  pass. Full relation-introspection boolean shape, CHECK rendering, regclass
+  output and scalar wire-OID limits remain; full catalog parity is not claimed.
+- **N5 — generated/identity columns.** Fresh X13
+  generated_stored_column and identity_column contracts pass on both drivers
+  after X10; integrated regression also passed.
   `GENERATED ALWAYS AS (expr) STORED` is computed on INSERT and on every
   UPDATE (`executor/column_writes.rs`); an explicit value into a generated
   column, or into a `GENERATED ALWAYS AS IDENTITY` column without
@@ -486,8 +446,8 @@ back to the session zone only when no offset is present.
   do not exist in PostgreSQL 17 either. Probes `dml.generated_stored_column`,
   `dml.identity_column`. Regressions:
   `nucleus/src/executor/tests/test_column_writes.rs`.
-- **N6 — deferrable constraints.** Foreign-key source changes implemented
-  in X10; final integrated regression/live verification is pending:
+- **N6 — deferrable constraints.** The fresh X13
+  constraint.deferrable_fk contract passes on both drivers after X10:
   `DEFERRABLE [INITIALLY DEFERRED | IMMEDIATE]` is stored on the constraint
   and, inside an explicit transaction, a deferred foreign key is checked at
   COMMIT (a violation fails the COMMIT with 23503 and rolls the transaction
@@ -498,43 +458,34 @@ back to the session zone only when no offset is present.
   SET NULL / SET DEFAULT actions still act per statement, as in PostgreSQL.
   Not deferred, and refused rather than accepted: `DEFERRABLE` on PRIMARY KEY
   and UNIQUE constraints (their uniqueness is settled per statement by the
-  storage layer; 0A000 names this). Statements outside an explicit
-  transaction stay immediate (the statement is the transaction), including
-  the implicit block of a multi-statement simple-query message. Probe
+  storage layer; 0A000 names this). Single-statement autocommit writes stay immediate. The contract described
+  here is the explicit-transaction deferred-FK path. Probe
   `constraint.deferrable_fk`; regressions in `test_column_writes.rs`.
 - **N7 — no lock/cancel surface.** See blocker 3; every `lock.*` probe except
   the two `FOR UPDATE` probes and `lock.blocked_update_waits_then_applies`.
-- **N8 — array wire codec.** `int4[]` results arrive as the text
-  `'{1,2,3}'` (`pg_typeof` says `array`); text-encoded array parameters are
-  mis-parsed. `= ANY($1::int[])` works through `pg` (binary parameter) and
-  returns no rows through postgres.js: `relation.any_array_param` is the one
-  driver-divergent verdict. Probes `codec.int_array_result`,
-  `codec.text_array_param`.
-- **N9 — `UPDATE ... FROM` / `DELETE ... USING` cannot reference the joined
-  table** (`column "u.id" does not exist`). Probes `dml.update_from`,
-  `dml.delete_using`.
-- **N10 — `jsonb_agg` does not exist**; `jsonb_build_object`/`to_jsonb` do,
-  and `jsonb::text` renders `{"a":1}` where PostgreSQL renders `{"a": 1}`.
-  Probes `relation.jsonb_agg_order_by`,
-  `relation.correlated_derived_table_limit`, `relation.nested_correlation`.
-- **N11 — isolation level and `READ ONLY` not applied.** Every level reports
-  `read committed`; an INSERT inside `BEGIN READ ONLY` succeeds. Probes
-  `txn.isolation_levels_applied`, `txn.read_only_rejects_writes`,
-  `txn.repeatable_read_snapshot`.
-- **N12 — value-shape divergences, each low blast radius:** unconstrained
-  `numeric` drops trailing zeros; `date 'infinity'` rejected;
-  `encode(bytea, 'hex')` rejects bytea; enum `ORDER BY` sorts lexically;
-  interval renders `02:03:04.500000`; `INSERT ... DEFAULT VALUES` rejected
-  (FIXED in X10); row-value comparison unsupported (the ORM's keyset
-  pagination expands the predicate and stays correct); `row_number()`
-  missing; `varchar(n)` overflow not enforced (FIXED in X10: `varchar(n)` /
-  `char(n)` lengths are enforced on write with 22001, see
-  [`nucleus/docs/SQL_SEMANTICS.md`](../../../nucleus/docs/SQL_SEMANTICS.md);
-  `numeric(p,s)` remains unenforced).
-- **N13 — derived-table column lists are not applied.**
-  `select v from (values (1)) as t(v)` fails with `column "v" does not exist`
-  (42703). This is the error `engine.capability.jsonb-functions` records: the
-  capability probe fails here before it reaches `jsonb_agg`.
+- **N8 — array codec, bounded repair.** Integer-array results and ANY
+  parameters pass on both drivers. Text-array parameters pass through pg;
+  postgres.js still receives 22000 in the recorded text-array probe. Typed
+  empty/all-NULL arrays preserve metadata. Stored multidimensional, interval
+  and vector arrays remain refused; every array wire form is not certified.
+- **N9 — joined DML unavailable.** UPDATE FROM and DELETE USING refuse
+  with 0A000 before mutation; they are not implemented joined writes.
+- **N10 — JSONB aggregates, bounded repair.** JSONB_AGG ordering,
+  correlated derived-table limits and nested correlation pass on both
+  drivers. SQL NULL inputs become JSON null; empty input returns SQL NULL.
+  JSON_OBJECT_AGG remains refused because JSONB loses duplicate object keys.
+- **N11 — modes applied within engine support.** READ ONLY rejects writes.
+  Buffered storage reports READ COMMITTED and refuses higher isolation with
+  0A000; repeatable snapshots and SERIALIZABLE write-skew remain unsupported
+  there. Higher isolation requires MVCC storage.
+- **N12 — remaining value-shape limits:** numeric drops trailing zeros,
+  has a 96-bit coefficient with at most 28 fractional digits, and does not
+  enforce numeric(p,s); date infinity is rejected; enum ORDER BY is lexical;
+  row-value comparison is unavailable. BYTEA encoding, ROW_NUMBER, DEFAULT
+  VALUES, interval output and varchar/char length contracts now pass.
+- **N13 — derived-table column lists repaired.** Positional aliases and
+  the jsonb-functions gate pass on both drivers. Alias lists longer than
+  the source projection are explicitly refused.
 
 - **X02-E1 — `GRAPH_SHORTEST_PATH` ignores a max-depth argument.** The
   three-argument call is accepted and answers the unbounded path.
@@ -581,13 +532,13 @@ reached.
 
 ## Consequences
 
-- The `jsonb-functions` capability stays engine-probed and resolves
-  `unsupported` on Nucleus; relational `with` reads and wrapped temporal wire
-  forms stay unavailable there until N10 and N13 are fixed.
-- Migration atomicity and advisory-locked migration history remain
-  PostgreSQL-only claims until N2 and N7 are fixed.
-- Consumers read `capabilities.nucleus.json`, not this prose, and must not
-  advertise beyond it.
+- The jsonb-functions gate resolves supported for measured relational reads;
+  retain engine probing and do not extrapolate beyond those contracts.
+- Atomic DDL migrations and advisory-locked history remain PostgreSQL-only
+  claims while N2 and N7 remain unresolved.
+- Consumers read capabilities.nucleus.json and model-family probe results;
+  they must not advertise universal datatype identity, higher isolation on
+  buffered storage, or unverified derived-index concurrency.
 
 ## Documents and graph relationships
 

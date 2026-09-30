@@ -433,48 +433,59 @@ them without that folder:
 
 ## Reported by the ORM program, open (2026-09-24, upstream engine defects)
 
-The ORM program's Nucleus conformance work (card X00 and the X01-X05 model
-legs) measured engine defects against Nucleus 1.0.2, `nucleus/` tree
-`3313729a`. They are recorded with reproducers in
-`conformance/live/orm/ORM_CONFORMANCE.md` ("Engine defects and upstream
-reproducers"); engine fixes are outside that program, and the ORM keeps
-every affected capability gated off or unadvertised on Nucleus. Listed here
-so engine sessions see them:
+The ORM program's Nucleus defects were originally measured on tree
+`3313729a`. X07–X12 repairs and the fresh X13 recording now distinguish
+verified bounded contracts from remaining limits. The canonical per-driver
+results and source identity are in
+`conformance/live/orm/capabilities.nucleus.json`; generated tables and
+reproducers are in `conformance/live/orm/ORM_CONFORMANCE.md`.
 
-- **N1 (security) — CLOSED 2026-09-28 (orm-program X07, commit `081183f9`)** —
-  `SET LOCAL ROLE` / `SET LOCAL` settings persisted after `COMMIT`/`ROLLBACK`,
-  and `RESET ROLE` was a no-op: a pooled connection kept an assumed role for
-  the next borrower. Transaction-scoped `SET` state is now restored at COMMIT,
-  ROLLBACK, aborted-transaction COMMIT, `ROLLBACK TO SAVEPOINT`, pool return;
-  `RESET ROLE`/`RESET ALL`/`DISCARD ALL` drop the role (RESET ALL
-  deliberately differs from PostgreSQL, fails closed); multi-statement messages get an
-  implicit block for SET state only (COMMIT/ROLLBACK in a message match
-  PostgreSQL for SET state, not data); `lock_timeout` is per session.
-  **Known divergence, candidate follow-up: multi-statement simple queries are
-  not atomic** (earlier statements' data persists when a later one fails, and
-  an in-message ROLLBACK does not undo data: `insert 1; rollback; insert 2;
-  select count(*)` gives 1 on PostgreSQL 17, 2 here). Regressions:
-  `nucleus/src/executor/tests/test_set_local_scope.rs`; live probes
-  `rls.set_local_*` / `rls.set_session_setting_transaction_scope`
-  (`conformance/live/orm/`). `set_config()` remains missing (N-list, unchanged).
-- **N3 (silent data corruption)** — timestamptz input ignores explicit
-  offsets and the session `TimeZone`.
-- **N2, N4-N13** — non-transactional DDL, catalog fidelity, lock/cancel
-  surface, array wire codec, `UPDATE ... FROM`/`DELETE ... USING`,
-  `jsonb_agg`, isolation and `READ ONLY`, value-shape divergences,
-  derived-table column lists. **N5 and N6 have source changes in X10;
-  final integrated regression/live verification remains pending:** stored generated
-  and identity columns (428C9, `OVERRIDING`), deferrable foreign keys with
-  `SET CONSTRAINTS` (DEFERRABLE on PRIMARY KEY / UNIQUE stays refused), and
-  from N12 `INSERT ... DEFAULT VALUES` and `varchar(n)` / `char(n)` overflow
-  (22001). Generated expressions admit only a bounded scalar/row subset;
-  UDFs, unknown/stateful/qualified functions, casts and subqueries are refused
-  (details in `nucleus/docs/SQL_SEMANTICS.md`; 42P17 parity is not claimed).
-  Remaining column-integrity regressions cover identity-sequence dump restore,
-  default evaluation failures/overflow and cascaded update failure atomicity.
-- **N14** — columnar `SUM`/`MIN`/`MAX` over values bound without a type
-  answer 0/NULL instead of an error. **N15, N16** — stale columnar prose in
-  `nucleus/docs/MODEL_SEMANTICS.md` (durability and in-transaction insert).
+- **N1 (security) — closed bounded scope.** Transaction-scoped SET LOCAL,
+  role reset, rollback/savepoints and session cleanup were repaired in X07.
+  X08 additionally supplies implicit simple-message data rollback on the
+  server path and explicit COMMIT/ROLLBACK block separation. The old blanket
+  non-atomic-message claim is obsolete; transactional DDL and universal
+  cancellation/custom-engine parity are not established. set_config remains
+  unavailable. RESET ALL also drops the role, a deliberate fail-closed
+  PostgreSQL difference.
+- **N3 — repaired bounded temporal contracts.** Fresh X13 probes for
+  TIMESTAMPTZ explicit offsets and session zones pass on both drivers.
+  Ambiguous/nonexistent bare local DST inputs are refused; date infinity
+  remains unavailable.
+- **N5/N6 — verified bounded column and FK contracts.** Fresh generated,
+  identity and deferred-FK probes pass on both drivers after X10, with
+  integrated regression coverage. Generated expressions admit only the
+  documented scalar/row subset; unverified forms are refused. Deferred
+  PRIMARY KEY/UNIQUE remain refused; PostgreSQL 42P17 parity is not claimed.
+  DEFAULT VALUES and varchar/char write-length contracts also pass;
+  numeric(p,s) typemods remain unenforced.
+- **N8/N10/N13 — bounded repairs.** Integer-array result/ANY, JSONB_AGG,
+  correlated relational reads and positional derived aliases pass on both
+  drivers. Text-array parameters still fail through postgres.js while pg
+  passes. Stored multidimensional/interval/vector arrays and overlong alias
+  lists are refused. No universal array or scalar-OID parity is claimed.
+- **N11 — modes enforced, engine limits retained.** READ ONLY rejects
+  writes. Buffered storage supplies READ COMMITTED and explicitly refuses
+  REPEATABLE READ/SERIALIZABLE with 0A000; those isolation probes remain
+  unsupported. Higher isolation requires MVCC storage.
+- **N2/N4/N7/N9/N12 — remaining limits.** DDL catalog changes are not
+  transactional. Selected catalog queries pass, but full introspection
+  boolean shape, CHECK rendering, regclass output and scalar Text OID 1043
+  versus PostgreSQL 25 remain. Advisory locking, LOCK TABLE and SQL sleep/
+  cancellation functions are unavailable; the row-lock timeout probe still
+  returns XX000 after about 10 seconds. UPDATE FROM/DELETE USING refuse before
+  mutation. Numeric range/scale, enum sorting and row comparisons retain
+  their recorded limits. None are advertised as PostgreSQL parity.
+- **N14/N15/N16 — fresh X03 verification pending.** Source now refuses
+  text/untyped columnar aggregates instead of silent 0/NULL. Documentation
+  correction df718e66 describes attached-WAL/synchronous_commit=on fsync,
+  memory/off distinctions and COLUMNAR_INSERT transaction refusal. Fresh
+  model-leg results are required before closing these recorded findings.
+- **Concurrent derived state — bounded physical B-tree repair.** Ordinary
+  DML preserves engine-maintained physical postings; controlled before/after
+  and structural physical-posting regressions passed. Detached encrypted,
+  vector, FTS and zone-map scan/publication paths remain independently
+  unverified; a selected passing soak does not certify universal coherence.
 
 Out-of-repo note: Lullmail's vendored copies of the send.go / bearer-transport
 blobs (flagged in neutron-12/13/16 as affected consumers) are NOT fixed here —
