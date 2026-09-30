@@ -514,14 +514,35 @@ async fn coherence_failures(db: &HarnessDb) -> Vec<String> {
                                 "heap",
                                 format!("SELECT id, val FROM soak WHERE val + 0 = {v} ORDER BY id"),
                             ),
+                            (
+                                "wide-range",
+                                "SELECT id, val FROM soak WHERE val >= 0 AND val <= 63 ORDER BY id"
+                                    .into(),
+                            ),
                         ] {
                             match db.executor().execute_with_session(sid, &sql).await {
                                 Ok(results) => {
                                     for result in results {
                                         if let nucleus::executor::ExecResult::Select {
-                                            rows, ..
+                                            mut rows,
+                                            ..
                                         } = result
                                         {
+                                            if path == "wide-range" {
+                                                // Begin descent below the target key:
+                                                // a tight range shares point lookup's
+                                                // starting leaf and can miss the same
+                                                // entry when that descent is wrong.
+                                                let total = rows.len();
+                                                rows.retain(|row| {
+                                                    row.get(1).is_some_and(|value| {
+                                                        value.loose_eq(&Value::Int64(v))
+                                                    })
+                                                });
+                                                fails.push(format!(
+                                                    "val={v} wide-range total rows: {total}"
+                                                ));
+                                            }
                                             fails.push(format!(
                                                 "val={v} {path} rows in fresh session: {rows:?}"
                                             ));
