@@ -154,11 +154,19 @@ export {
   type Session,
   type SessionData,
   type SessionStorage,
+  type SessionReplacement,
   type SessionRecord,
   type SessionMiddlewareOptions,
   type SessionCookieOptions,
   type MemorySessionStorageOptions,
 } from "./server/session.js";
+export {
+  createSQLSessionStorage,
+  type SessionSQLPool,
+  type SessionSQLConnection,
+  type SQLSessionStorage,
+  type SQLSessionOptions,
+} from "./server/session-sql.js";
 export {
   installTransportPeer,
   transportPeer,

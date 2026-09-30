@@ -1,9 +1,11 @@
 package neutronauth
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,11 +15,12 @@ import (
 
 // memoryStore implements SessionStore for testing.
 type memoryStore struct {
-	data map[string]map[string]any
+	data     map[string]map[string]any
+	versions map[string]string
 }
 
 func newMemoryStore() *memoryStore {
-	return &memoryStore{data: make(map[string]map[string]any)}
+	return &memoryStore{data: make(map[string]map[string]any), versions: make(map[string]string)}
 }
 
 func (m *memoryStore) Get(_ context.Context, id string) (map[string]any, error) {
@@ -26,11 +29,13 @@ func (m *memoryStore) Get(_ context.Context, id string) (map[string]any, error) 
 
 func (m *memoryStore) Set(_ context.Context, id string, data map[string]any, ttl time.Duration) error {
 	m.data[id] = data
+	m.versions[id] = generateSessionID()
 	return nil
 }
 
 func (m *memoryStore) Delete(_ context.Context, id string) error {
 	delete(m.data, id)
+	delete(m.versions, id)
 	return nil
 }
 
@@ -105,15 +110,20 @@ func TestSessionSave(t *testing.T) {
 func TestSessionDestroy(t *testing.T) {
 	store := newMemoryStore()
 	store.data["sess-1"] = map[string]any{"key": "value"}
-
-	s := &Session{
-		ID:    "sess-1",
-		Data:  map[string]any{"key": "value"},
-		store: store,
-		ttl:   time.Hour,
+	loaded, err := store.LoadSession(context.Background(), "sess-1")
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	err := s.Destroy(context.Background())
+	s := &Session{
+		ID:      "sess-1",
+		Data:    map[string]any{"key": "value"},
+		store:   store,
+		ttl:     time.Hour,
+		version: loaded.Version,
+	}
+
+	err = s.Destroy(context.Background())
 	if err != nil {
 		t.Fatalf("Destroy error: %v", err)
 	}
@@ -716,5 +726,191 @@ func TestCommitErrorHandlerCannotCorruptTheResponse(t *testing.T) {
 	}
 	if len(rec.Result().Cookies()) != 0 {
 		t.Fatal("rotated cookie was written for a rotation that failed")
+	}
+}
+
+func TestStaleSessionCannotResurrectAfterRevoke(t *testing.T) {
+	store := newMemoryStore()
+	store.data["revoked-race"] = map[string]any{"user": "alice"}
+	reached, resume, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var saveErr error
+	staleWriter := httptest.NewRecorder()
+	stale := SessionMiddleware(store)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s := SessionFromContext(r.Context())
+		close(reached)
+		<-resume
+		s.Set("lastVisit", 1)
+		saveErr = s.Save(r.Context())
+		w.Write([]byte("sensitive old response"))
+	}))
+	request := func() *http.Request {
+		r := httptest.NewRequest("GET", "https://example.test/", nil)
+		r.AddCookie(&http.Cookie{Name: "session_id", Value: "revoked-race"})
+		return r
+	}
+	go func() { defer close(done); stale.ServeHTTP(staleWriter, request()) }()
+	<-reached
+	logout := SessionMiddleware(store)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := SessionFromContext(r.Context()).Destroy(r.Context()); err != nil {
+			t.Error(err)
+		}
+		w.WriteHeader(200)
+	}))
+	logout.ServeHTTP(httptest.NewRecorder(), request())
+	close(resume)
+	<-done
+	if got, _ := store.Get(context.Background(), "revoked-race"); got != nil {
+		t.Fatalf("stale request recreated revoked session: %v", got)
+	}
+	if saveErr == nil {
+		t.Error("stale Save succeeded")
+	}
+	if staleWriter.Code != 503 || strings.Contains(staleWriter.Body.String(), "sensitive") || staleWriter.Header().Get("Set-Cookie") != "" {
+		t.Errorf("stale response leaked: status%d body%q cookie%q", staleWriter.Code, staleWriter.Body.String(), staleWriter.Header().Get("Set-Cookie"))
+	}
+}
+
+// The test store implements the same atomic revision contract as built-in
+// stores; failure wrappers below inject failures at that contract boundary.
+func (m *memoryStore) LoadSession(ctx context.Context, id string) (*SessionRecord, error) {
+	data, err := m.Get(ctx, id)
+	if err != nil || data == nil {
+		return nil, err
+	}
+	if m.versions[id] == "" {
+		m.versions[id] = generateSessionID()
+	}
+	clone, err := cloneSessionData(data)
+	return &SessionRecord{Data: clone, Version: m.versions[id]}, err
+}
+func (m *memoryStore) CommitSession(ctx context.Context, id, expected string, next *SessionReplacement, ttl time.Duration) (string, error) {
+	if m.versions[id] != expected {
+		return "", ErrSessionConflict
+	}
+	if next != nil && next.ID != id && m.data[next.ID] != nil {
+		return "", ErrSessionConflict
+	}
+	if next == nil {
+		return "", m.Delete(ctx, id)
+	}
+	data, err := cloneSessionData(next.Data)
+	if err != nil {
+		return "", err
+	}
+	m.Delete(ctx, id)
+	m.Set(ctx, next.ID, data, ttl)
+	return m.versions[next.ID], nil
+}
+func (f *failingStore) LoadSession(ctx context.Context, id string) (*SessionRecord, error) {
+	if f.failGet != nil {
+		return nil, f.failGet
+	}
+	return f.memoryStore.LoadSession(ctx, id)
+}
+func (f *failingStore) CommitSession(ctx context.Context, id, expected string, next *SessionReplacement, ttl time.Duration) (string, error) {
+	if next != nil && f.failSet != nil {
+		return "", f.failSet
+	}
+	if (next == nil || next.ID != id) && f.failDelete != nil {
+		return "", f.failDelete
+	}
+	return f.memoryStore.CommitSession(ctx, id, expected, next, ttl)
+}
+
+func TestMemorySessionRevisionRotationAndABA(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemorySessionStore(2)
+	if err := store.Set(ctx, "old", map[string]any{"user": "alice"}, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := store.LoadSession(ctx, "old")
+	store.Set(ctx, "occupied", map[string]any{"user": "bob"}, time.Hour)
+	if _, err := store.CommitSession(ctx, "old", before.Version, &SessionReplacement{ID: "occupied", Data: before.Data}, time.Hour); !errors.Is(err, ErrSessionConflict) {
+		t.Fatalf("collision: %v", err)
+	}
+	if got, _ := store.LoadSession(ctx, "old"); got.Version != before.Version {
+		t.Fatal("collision removed source")
+	}
+	if _, err := store.CommitSession(ctx, "old", before.Version, &SessionReplacement{ID: "new", Data: before.Data}, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := store.LoadSession(ctx, "old"); got != nil {
+		t.Fatal("rotation left old session")
+	}
+	if _, err := store.CommitSession(ctx, "old", before.Version, &SessionReplacement{ID: "old", Data: before.Data}, time.Hour); !errors.Is(err, ErrSessionConflict) {
+		t.Fatal("stale writer recreated rotated session")
+	}
+	store.Set(ctx, "old", map[string]any{"user": "charlie"}, time.Hour)
+	if _, err := store.CommitSession(ctx, "old", before.Version, &SessionReplacement{ID: "old", Data: before.Data}, time.Hour); !errors.Is(err, ErrSessionConflict) {
+		t.Fatal("stale token overwrote reused ID")
+	}
+}
+func TestLegacySessionStoreFailsClosed(t *testing.T) {
+	store := struct{ SessionStore }{newMemoryStore()}
+	ran := false
+	handler := SessionMiddleware(store)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { ran = true }))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
+	if ran || w.Code != 500 || w.Header().Get("Set-Cookie") != "" {
+		t.Fatalf("unsafe legacy store: ran%v status%d", ran, w.Code)
+	}
+}
+func TestMemorySessionDataIsOwnedAndBounded(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemorySessionStore(1)
+	data := map[string]any{"nested": map[string]any{"n": 1}}
+	store.Set(ctx, "one", data, time.Hour)
+	data["nested"].(map[string]any)["n"] = 2
+	got, _ := store.Get(ctx, "one")
+	if got["nested"].(map[string]any)["n"] != 1 {
+		t.Fatal("ingress aliases")
+	}
+	got["nested"].(map[string]any)["n"] = 3
+	again, _ := store.Get(ctx, "one")
+	if again["nested"].(map[string]any)["n"] != 1 {
+		t.Fatal("egress aliases")
+	}
+	store.Set(ctx, "two", map[string]any{}, time.Hour)
+	if len(store.records) != 1 {
+		t.Fatal("capacity exceeded")
+	}
+}
+
+type emptyRevisionSessionStore struct{ *MemorySessionStore }
+
+func (s emptyRevisionSessionStore) CommitSession(context.Context, string, string, *SessionReplacement, time.Duration) (string, error) {
+	return "", nil
+}
+func TestSessionEmptyCommitRevisionFailsClosed(t *testing.T) {
+	handler := SessionMiddleware(emptyRevisionSessionStore{NewMemorySessionStore()})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s := SessionFromContext(r.Context())
+		s.Set("user", "alice")
+		_ = s.Save(r.Context())
+		w.Write([]byte("sensitive success"))
+	}))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest("GET", "/", nil))
+	if response.Code != http.StatusServiceUnavailable || strings.Contains(response.Body.String(), "sensitive success") || response.Header().Get("Set-Cookie") != "" {
+		t.Fatalf("unsafe receipt %d %s", response.Code, response.Body.String())
+	}
+}
+
+type sessionHijackRecorder struct {
+	*httptest.ResponseRecorder
+	called bool
+}
+
+func (w *sessionHijackRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	w.called = true
+	return nil, nil, nil
+}
+func TestSessionFailedCommitCannotHijack(t *testing.T) {
+	response := &sessionHijackRecorder{ResponseRecorder: httptest.NewRecorder()}
+	writer := &sessionWriter{ResponseWriter: response, req: httptest.NewRequest("GET", "/", nil), finalize: func() error { return errFailedSessionCommit }}
+	if _, _, err := writer.Hijack(); err == nil {
+		t.Fatal("failed commit allowed protocol switch")
+	}
+	if response.Code != http.StatusServiceUnavailable || response.called {
+		t.Fatalf("status %d hijacked %v", response.Code, response.called)
 	}
 }

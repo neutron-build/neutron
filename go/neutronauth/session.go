@@ -24,6 +24,29 @@ type SessionStore interface {
 	Delete(ctx context.Context, id string) error
 }
 
+// VersionedSessionStore atomically fences writes against the revision loaded
+// by the request. Empty expectedVersion creates only if absent. nil next
+// revokes; a different next.ID rotates. Compare, old-ID removal and new-ID
+// insertion MUST be one atomic operation, including across processes.
+// SessionMiddleware rejects legacy stores that lack this capability.
+type VersionedSessionStore interface {
+	SessionStore
+	LoadSession(context.Context, string) (*SessionRecord, error)
+	CommitSession(context.Context, string, string, *SessionReplacement, time.Duration) (string, error)
+}
+type SessionRecord struct {
+	Data      map[string]any
+	Version   string
+	ExpiresAt time.Time
+}
+type SessionReplacement struct {
+	ID   string
+	Data map[string]any
+}
+
+var ErrSessionConflict = errors.New("neutronauth: session revision changed or expired")
+var ErrUnversionedSessionStore = errors.New("neutronauth: session store requires atomic versioned operations")
+
 // Session provides access to session data from the request context.
 //
 // The cookie that addresses a session is written when the response headers are
@@ -39,6 +62,8 @@ type Session struct {
 	// new session. Rotation and destruction are both defined against it.
 	originalID string
 	destroyed  bool
+	version    string
+	failure    error
 }
 
 // Get returns a session value.
@@ -65,18 +90,54 @@ func (s *Session) Save(ctx context.Context) error {
 	if s.destroyed {
 		return ErrSessionDestroyed
 	}
-	return s.store.Set(ctx, s.ID, s.Data, s.ttl)
+	store, ok := s.store.(VersionedSessionStore)
+	if !ok {
+		s.failure = ErrUnversionedSessionStore
+		return s.failure
+	}
+	from := s.originalID
+	if from == "" || s.version == "" {
+		from = s.ID
+	}
+	version, err := store.CommitSession(ctx, from, s.version, &SessionReplacement{ID: s.ID, Data: s.Data}, s.ttl)
+	if err != nil {
+		s.failure = err
+		return err
+	}
+	if version == "" {
+		s.failure = ErrUnversionedSessionStore
+		return s.failure
+	}
+	s.originalID = s.ID
+	s.version = version
+	return nil
 }
 
 // Destroy removes the session and expires the browser cookie.
 //
 // The session is marked destroyed for the rest of the request: a later Save
-// cannot resurrect it, and the record the request arrived with is deleted at
-// finalization even if the ID was rotated first.
+// cannot resurrect it, and the persisted identity is revoked immediately, even if the in-memory
+// ID was rotated first.
 func (s *Session) Destroy(ctx context.Context) error {
 	s.destroyed = true
 	s.Data = make(map[string]any)
-	return s.store.Delete(ctx, s.ID)
+	if s.version == "" {
+		return nil
+	} // No persisted identity to revoke.
+	store, ok := s.store.(VersionedSessionStore)
+	if !ok {
+		s.failure = ErrUnversionedSessionStore
+		return s.failure
+	}
+	from := s.originalID
+	if from == "" {
+		from = s.ID
+	}
+	_, err := store.CommitSession(ctx, from, s.version, nil, s.ttl)
+	if err != nil {
+		s.failure = err
+	}
+	return err
 }
 
 // Regenerate creates a new session ID, preserving data. Call after
@@ -129,6 +190,12 @@ func SessionMiddleware(store SessionStore, opts ...SessionOption) neutron.Middle
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			versioned, ok := store.(VersionedSessionStore)
+			if !ok {
+				o.onError(w, r, ErrUnversionedSessionStore)
+				return
+			}
+			var version string
 			var sessionID string
 			cookie, err := r.Cookie(o.cookieName)
 			if err == nil {
@@ -141,12 +208,19 @@ func SessionMiddleware(store SessionStore, opts ...SessionOption) neutron.Middle
 				// as "no session" minted a fresh anonymous session instead,
 				// so a backend blip looked like a mass logout to users and
 				// like nothing at all to operators.
-				loaded, err := store.Get(r.Context(), sessionID)
+				loaded, err := versioned.LoadSession(r.Context(), sessionID)
 				if err != nil {
 					o.onError(w, r, err)
 					return
 				}
-				data = loaded
+				if loaded != nil {
+					if loaded.Version == "" {
+						o.onError(w, r, ErrUnversionedSessionStore)
+						return
+					}
+					data = loaded.Data
+					version = loaded.Version
+				}
 			}
 			if data == nil {
 				sessionID = generateSessionID()
@@ -159,6 +233,7 @@ func SessionMiddleware(store SessionStore, opts ...SessionOption) neutron.Middle
 				store:      store,
 				ttl:        o.ttl,
 				originalID: sessionID,
+				version:    version,
 			}
 
 			// The cookie is written when the response headers are committed,
@@ -200,32 +275,18 @@ const sessionCleanupBudget = 5 * time.Second
 // store errors stay out of the response; the onCommitError hook still fires
 // for observability.
 func finalizeSession(ctx context.Context, r *http.Request, w http.ResponseWriter, s *Session, o *sessionOpts) error {
-	switch {
-	case s.destroyed:
-		// Delete both ends: Destroy removed the current ID, but a handler that
-		// regenerated first would otherwise leave the original behind.
-		if s.originalID != "" && s.originalID != s.ID {
-			if err := s.store.Delete(ctx, s.originalID); err != nil {
-				o.onCommitError(r, err)
-				return errFailedSessionCommit
-			}
-		}
+	if s.failure != nil {
+		o.onCommitError(r, s.failure)
+		return errFailedSessionCommit
+	}
+	if s.destroyed {
 		http.SetCookie(w, sessionCookieFor(o, "", -1))
 		return nil
-
-	case s.ID != s.originalID:
-		// Rotation completes here so Regenerate alone is sufficient: the data
-		// moves to the new ID and the old record stops resolving. Both writes
-		// must succeed before success is acknowledged.
-		if err := s.store.Set(ctx, s.ID, s.Data, s.ttl); err != nil {
+	}
+	if s.ID != s.originalID || s.version == "" {
+		if err := s.Save(ctx); err != nil {
 			o.onCommitError(r, err)
 			return errFailedSessionCommit
-		}
-		if s.originalID != "" {
-			if err := s.store.Delete(ctx, s.originalID); err != nil {
-				o.onCommitError(r, err)
-				return errFailedSessionCommit
-			}
 		}
 	}
 
@@ -322,6 +383,9 @@ func (w *sessionWriter) Flush() {
 
 func (w *sessionWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	w.commit()
+	if w.failed {
+		return nil, nil, errFailedSessionCommit
+	}
 	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
 		return h.Hijack()
 	}
@@ -393,7 +457,9 @@ type NucleusSessionStore struct {
 	kv *nucleus.KVModel
 }
 
-// NewNucleusSessionStore creates a session store backed by Nucleus KV.
+// NewNucleusSessionStore creates a legacy KV store without atomic revisions.
+// Deprecated: SessionMiddleware fails closed for this store. Use
+// NewSQLSessionStore or implement VersionedSessionStore atomically.
 func NewNucleusSessionStore(kv *nucleus.KVModel) *NucleusSessionStore {
 	return &NucleusSessionStore{kv: kv}
 }
@@ -428,7 +494,7 @@ func (s *NucleusSessionStore) Delete(ctx context.Context, id string) error {
 // The discarded error is deliberate and not a swallowed failure: since Go 1.24
 // crypto/rand.Read "never returns an error, and always fills b entirely",
 // crashing the program instead if the system source fails. go.mod requires
-// 1.24, so there is no build of this package where the error can be non-nil
+// Go 1.26, so there is no build of this package where the error can be non-nil
 // and no path that returns a zeroed ID. Making this return (string, error)
 // would add a permanently nil error to the public API.
 func generateSessionID() string {

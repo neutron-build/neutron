@@ -14,7 +14,7 @@ go get github.com/neutron-build/neutron/go
 |---|---|
 | `nucleus` | Nucleus client — feature detection, transactions, all 14 data models |
 | `neutron` | HTTP app: router, composable middleware, OpenAPI 3.1, RFC 7807 errors |
-| `neutronauth` | JWT, OAuth, WebAuthn, sessions, RBAC, API keys |
+| `neutronauth` | JWT, OAuth, WebAuthn, sessions, RBAC, API keys ([session and WebAuthn migration](neutronauth/README.md)) |
 | `neutroncache` | Tiered / LRU / HTTP-response caching |
 | `neutronjobs` | Background job queue and cron |
 | `neutronrealtime` | WebSocket hub, SSE, Nucleus stream subscriptions |
