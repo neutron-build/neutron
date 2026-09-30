@@ -30,17 +30,21 @@ export class CacheScope {
 }
 
 const sharedCache = new CacheScope();
-let requestScope: () => CacheScope | undefined = () => undefined;
-let functionId = 0;
+type CacheRuntime = { requestScope: () => CacheScope | undefined; functionId: number };
+// SSR module loaders can evaluate this module separately from the HTTP adapter.
+// One realm-wide provider and identity counter connects those module graphs.
+const runtimeKey = Symbol.for('@neutron-build/core/request-cache/runtime');
+const realm = globalThis as unknown as Record<symbol, CacheRuntime | undefined>;
+const runtime = realm[runtimeKey] ??= { requestScope: () => undefined, functionId: 0 };
 
 /** Installed by the Node server adapter; keeps Node imports out of client bundles. */
 export function installRequestCacheScope(provider: () => CacheScope | undefined): void {
-  requestScope = provider;
+  runtime.requestScope = provider;
 }
 
 function activeScope(shared = false): CacheScope | undefined {
   if (shared) return sharedCache;
-  const request = requestScope();
+  const request = runtime.requestScope();
   if (request) return request;
   return typeof window !== 'undefined' ? sharedCache : undefined;
 }
@@ -109,7 +113,7 @@ export function cache<TArgs extends any[], TReturn>(
   if (!Number.isInteger(maxEntries) || maxEntries < 1 || maxEntries > 4096) {
     throw new RangeError('Cache maxEntries must be an integer between 1 and 4096');
   }
-  const identity = ++functionId;
+  const identity = ++runtime.functionId;
   return (...args: TArgs): Promise<TReturn> => {
     const state = activeScope(options.scope === 'shared');
     // Outside a server request, no implicit process cache may retain private data.
