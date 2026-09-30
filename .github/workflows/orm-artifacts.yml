@@ -20,6 +20,11 @@ name: ORM installed artifacts
 #                  schema -> export -> generate -> apply -> query -> Studio
 #                  edit -> inspect, and a legacy-history upgrade.
 #
+# SDK consumers additionally cover neutron-nucleus and neutron-data on both
+# Node lines, using installed tarballs and a freshly built live engine. Data
+# Drizzle library declaration refusals are recorded separately from supported
+# strict application typing; importing a model never certifies its parity.
+#
 # Nothing is published: artifacts live for one day inside this run.
 
 on:
@@ -27,6 +32,13 @@ on:
     branches: [main]
     paths:
       - "typescript/packages/neutron-sql/**"
+      - "typescript/packages/neutron-nucleus/**"
+      - "typescript/packages/neutron-data/**"
+      - "typescript/scripts/installed-sdk*/**"
+      - "typescript/scripts/installed-sdk-gate.mjs"
+      - "typescript/pnpm-lock.yaml"
+      - "nucleus/**"
+      - "conformance/live/scripts/**"
       - "cli/**"
       - "studio/**"
       - "typescript/apps/site/src/content/docs/cli/commands.mdx"
@@ -34,6 +46,13 @@ on:
   pull_request:
     paths:
       - "typescript/packages/neutron-sql/**"
+      - "typescript/packages/neutron-nucleus/**"
+      - "typescript/packages/neutron-data/**"
+      - "typescript/scripts/installed-sdk*/**"
+      - "typescript/scripts/installed-sdk-gate.mjs"
+      - "typescript/pnpm-lock.yaml"
+      - "nucleus/**"
+      - "conformance/live/scripts/**"
       - "cli/**"
       - "studio/**"
       - "typescript/apps/site/src/content/docs/cli/commands.mdx"
@@ -94,6 +113,89 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  sdk-engine:
+    name: Build engine for installed SDK consumers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus
+      - run: cargo build --release --bin nucleus --features server
+        working-directory: nucleus
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nucleus-bin-installed
+          path: nucleus/target/release/nucleus
+          if-no-files-found: error
+          retention-days: 1
+
+  sdk-installed:
+    name: neutron-${{ matrix.package }} installed artifact (Node ${{ matrix.node }})
+    needs: sdk-engine
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+        package: [nucleus, data]
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      NEUTRON_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+      NEUTRON_NUCLEUS_TEST_URL: postgres://postgres@127.0.0.1:55432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: nucleus-bin-installed
+          path: ${{ runner.temp }}/installed-engine
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: typescript/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+          cache-dependency-path: typescript/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile --filter '@neutron-build/nucleus' --filter '@neutron-build/data'
+        working-directory: typescript
+      - name: Start this source's engine
+        run: |
+          chmod +x "$RUNNER_TEMP/installed-engine/nucleus"
+          NUCLEUS_BIN="$RUNNER_TEMP/installed-engine/nucleus" sh conformance/live/scripts/start-engine.sh 55432 "$RUNNER_TEMP/nucleus-installed"
+      - name: Pack and install into real clean consumers
+        run: node typescript/scripts/installed-sdk-gate.mjs --package '${{ matrix.package }}' --keep-tarball "$RUNNER_TEMP/sdk-pack" --out installed-sdk.local.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: neutron-${{ matrix.package }}-installed-node${{ matrix.node }}-${{ github.run_id }}
+          path: |
+            installed-sdk.local.json
+            ${{ runner.temp }}/nucleus-installed/server.log
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Stop owned engine
+        if: always()
+        run: |
+          if test -f "$RUNNER_TEMP/nucleus-installed/server.pid"; then
+            kill "$(cat "$RUNNER_TEMP/nucleus-installed/server.pid")" || true
+          fi
+
   studio-embed:
     name: Studio embed and CLI archive (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -118,7 +220,7 @@ jobs:
         run: rm -rf cli/internal/studio/dist && cp -R studio/dist cli/internal/studio/dist
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.26"
           cache-dependency-path: cli/go.sum
       - name: Embed checks (manifest, current sources, server refusal)
         run: go test ./internal/studio -run 'Embed|StudioSource|SPAHandler' -count=1
