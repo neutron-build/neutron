@@ -4753,6 +4753,26 @@ impl Executor {
                         i += 1;
                     }
                 }
+                "START" => {
+                    let skip = if tokens
+                        .get(i + 1)
+                        .is_some_and(|t| t.eq_ignore_ascii_case("WITH"))
+                    {
+                        2
+                    } else {
+                        1
+                    };
+                    let value = tokens
+                        .get(i + skip)
+                        .and_then(|t| t.parse::<i64>().ok())
+                        .ok_or_else(|| {
+                            ExecError::Unsupported("START WITH requires a number".into())
+                        })?;
+                    // START sets the default for a later bare RESTART; it does
+                    // not reposition a sequence that has already been called.
+                    seq.start = value;
+                    i += skip + 1;
+                }
                 "CYCLE" => {
                     return Err(ExecError::Unsupported(
                         "ALTER SEQUENCE ... CYCLE is not supported: sequences do not wrap".into(),

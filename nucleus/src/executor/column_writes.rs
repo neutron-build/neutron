@@ -158,32 +158,36 @@ impl Executor {
     }
 }
 
-/// Functions whose value is not a function of the row; PostgreSQL requires
-/// generation expressions to be immutable.
-const NON_IMMUTABLE_FUNCTIONS: &[&str] = &[
-    "now",
-    "random",
-    "nextval",
-    "currval",
-    "setval",
-    "clock_timestamp",
-    "statement_timestamp",
-    "transaction_timestamp",
-    "timeofday",
-    "gen_random_uuid",
-    "uuid_generate_v4",
-    "current_setting",
-    "current_user",
-    "session_user",
-    "current_date",
-    "current_time",
-    "current_timestamp",
-    "localtime",
-    "localtimestamp",
+/// A deliberately bounded set of scalar builtins implemented without session
+/// state or database access. Unknown functions (including SQL UDFs) are refused
+/// until the catalog carries volatility metadata and bodies can be validated.
+const IMMUTABLE_GENERATION_FUNCTIONS: &[&str] = &[
+    "abs",
+    "lower",
+    "upper",
+    "length",
+    "char_length",
+    "character_length",
+    "octet_length",
+    "bit_length",
+    "trim",
+    "ltrim",
+    "rtrim",
+    "replace",
+    "concat",
+    "concat_ws",
+    "coalesce",
+    "nullif",
+    "greatest",
+    "least",
+    "round",
+    "ceil",
+    "ceiling",
+    "floor",
 ];
 
 /// CREATE TABLE / ADD COLUMN rules for generated and identity columns
-/// (PostgreSQL SQLSTATE 42P17 for all of them).
+/// The supported expression subset fails closed on unverified forms.
 pub(super) fn validate_generated_columns(columns: &[ColumnDef]) -> Result<(), ExecError> {
     use std::ops::ControlFlow;
     for col in columns {
@@ -218,7 +222,13 @@ pub(super) fn validate_generated_columns(columns: &[ColumnDef]) -> Result<(), Ex
                 Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
                 Expr::Function(f) => {
                     let name = f.name.to_string().to_ascii_lowercase();
-                    if NON_IMMUTABLE_FUNCTIONS.contains(&name.as_str()) {
+                    if !IMMUTABLE_GENERATION_FUNCTIONS.contains(&name.as_str())
+                        || f.over.is_some()
+                        || f.filter.is_some()
+                        || !f.within_group.is_empty()
+                        || !matches!(f.parameters, sqlparser::ast::FunctionArguments::None)
+                        || matches!(f.args, sqlparser::ast::FunctionArguments::Subquery(_))
+                    {
                         problem = Some(ExecError::Runtime(format!(
                             "generation expression is not immutable: {name}()"
                         )));
@@ -226,13 +236,42 @@ pub(super) fn validate_generated_columns(columns: &[ColumnDef]) -> Result<(), Ex
                     }
                     None
                 }
-                Expr::Subquery(_) => {
+                Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
                     problem = Some(ExecError::Runtime(
                         "cannot use subquery in column generation expression".into(),
                     ));
                     return ControlFlow::Break(());
                 }
-                _ => None,
+                // Keep the admitted expression language bounded. In particular,
+                // temporal casts and special expressions can depend on session
+                // timezone/current time even without an ordinary function call.
+                Expr::Value(_)
+                | Expr::Nested(_)
+                | Expr::BinaryOp { .. }
+                | Expr::UnaryOp { .. }
+                | Expr::Case { .. }
+                | Expr::IsNull(_)
+                | Expr::IsNotNull(_)
+                | Expr::IsTrue(_)
+                | Expr::IsNotTrue(_)
+                | Expr::IsFalse(_)
+                | Expr::IsNotFalse(_)
+                | Expr::IsUnknown(_)
+                | Expr::IsNotUnknown(_)
+                | Expr::IsDistinctFrom(_, _)
+                | Expr::IsNotDistinctFrom(_, _)
+                | Expr::Between { .. }
+                | Expr::InList { .. }
+                | Expr::Like { .. }
+                | Expr::ILike { .. }
+                | Expr::Substring { .. }
+                | Expr::Trim { .. } => None,
+                _ => {
+                    problem = Some(ExecError::Unsupported(
+                        "unverified expression form in stored generation expression".into(),
+                    ));
+                    return ControlFlow::Break(());
+                }
             };
             if let Some(name) = ident {
                 match columns.iter().find(|c| c.name == name) {

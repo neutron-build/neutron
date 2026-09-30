@@ -339,9 +339,11 @@ async fn deferred_foreign_key_is_checked_at_commit() {
     exec(&ex, "BEGIN").await;
     exec(&ex, "DELETE FROM pa WHERE id = 5").await;
     assert_eq!(sqlstate(&ex, "COMMIT").await, "23503");
+    // Parent 8 was deleted with its child; failed COMMIT restores parent 5.
+    assert_eq!(ints(&ex, "SELECT id FROM pa ORDER BY id").await, [[5]]);
     assert_eq!(
-        ints(&ex, "SELECT COUNT(*) FROM pa").await,
-        [[2 - 1 + 1 - 1 + 1]]
+        ints(&ex, "SELECT id, pa FROM ch ORDER BY id").await,
+        [[1, 5]]
     );
 }
 

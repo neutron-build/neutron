@@ -731,8 +731,32 @@ impl super::Executor {
         if !sequences.is_empty() {
             out.push('\n');
         }
+        let identity_sequences: HashSet<String> = tables
+            .iter()
+            .flat_map(|table| {
+                table.columns.iter().filter_map(|col| {
+                    matches!(
+                        col.generation,
+                        Some(
+                            ColumnGeneration::IdentityAlways | ColumnGeneration::IdentityByDefault
+                        )
+                    )
+                    .then(|| format!("{}_{}_seq", table.name, col.name))
+                })
+            })
+            .collect();
         for (name, seq) in &sequences {
-            out.push_str(&render_create_sequence(name, seq));
+            if identity_sequences.contains(name) {
+                // CREATE TABLE already created and owns this sequence. Alter it
+                // in place: duplicate CREATE fails, and skipping it loses the
+                // source increment/bounds/restart default.
+                out.push_str(&format!(
+                    "ALTER SEQUENCE {name} INCREMENT BY {} MINVALUE {} MAXVALUE {} START WITH {};",
+                    seq.increment, seq.min_value, seq.max_value, seq.start,
+                ));
+            } else {
+                out.push_str(&render_create_sequence(name, seq));
+            }
             out.push('\n');
         }
 

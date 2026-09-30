@@ -1086,28 +1086,35 @@ impl Executor {
         &self,
         col: &crate::catalog::ColumnDef,
     ) -> Result<Value, ExecError> {
-        if let Some(ref default_expr) = col.default_expr {
-            let parsed = sql::parse(&format!("SELECT {default_expr}"));
-            if let Ok(stmts) = parsed
-                && let Some(Statement::Query(q)) = stmts.into_iter().next()
-                && let SetExpr::Select(sel) = *q.body
-                && let Some(SelectItem::UnnamedExpr(expr)) = sel.projection.first()
-            {
-                let empty_row: Row = Vec::new();
-                let empty_meta: Vec<ColMeta> = Vec::new();
-                if let Ok(val) = self.eval_row_expr(expr, &empty_row, &empty_meta) {
-                    // Coerce the default value to match the column's declared type.
-                    // This handles SERIAL (Int32) columns whose nextval() returns Int64.
-                    let coerced = match (&col.data_type, &val) {
-                        (DataType::Int32, Value::Int64(n)) => Value::Int32(*n as i32),
-                        (DataType::Int64, Value::Int32(n)) => Value::Int64(*n as i64),
-                        _ => val,
-                    };
-                    return Ok(coerced);
-                }
-            }
+        let Some(default_expr) = &col.default_expr else {
+            return Ok(Value::Null);
+        };
+        let parsed = sql::parse(&format!("SELECT {default_expr}"))?;
+        let Some(Statement::Query(q)) = parsed.into_iter().next() else {
+            return Err(ExecError::Runtime(
+                "invalid column default expression".into(),
+            ));
+        };
+        let SetExpr::Select(sel) = *q.body else {
+            return Err(ExecError::Runtime(
+                "invalid column default expression".into(),
+            ));
+        };
+        let Some(SelectItem::UnnamedExpr(expr)) = sel.projection.first() else {
+            return Err(ExecError::Runtime(
+                "invalid column default expression".into(),
+            ));
+        };
+        let val = self.eval_row_expr(expr, &Vec::new(), &Vec::new())?;
+        // SERIAL's nextval returns int8; narrowing must reject overflow rather
+        // than wrap, just as writing an explicit value does.
+        match (&col.data_type, val) {
+            (DataType::Int32, Value::Int64(n)) => i32::try_from(n)
+                .map(Value::Int32)
+                .map_err(|_| ExecError::Runtime("integer out of range in column default".into())),
+            (DataType::Int64, Value::Int32(n)) => Ok(Value::Int64(i64::from(n))),
+            (_, val) => Ok(val),
         }
-        Ok(Value::Null)
     }
 
     /// Get conflict target columns from ON CONFLICT clause.
