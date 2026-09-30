@@ -1,4 +1,4 @@
-//! Tests that specialty indexes (IvfFlat, encrypted) survive a server restart.
+//! Tests specialty-index recovery and explicit retirement of insecure legacy indexes.
 //!
 //! Each test simulates a restart by dropping the first `Executor` and opening a
 //! new one from the same directory, then calling `rebuild_specialty_indexes()`.
@@ -356,40 +356,64 @@ async fn test_kv_write_is_fsync_durable_on_ack() {
 // ── Encrypted index persistence ───────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_encrypted_index_survives_restart() {
+async fn test_legacy_encrypted_index_is_retired_without_losing_base_rows() {
     let dir = tempfile::tempdir().unwrap();
-
-    // Use a 32-byte key via env var
-    // SAFETY: single-threaded test; no other thread reads this env var.
-    unsafe {
-        std::env::set_var("NUCLEUS_ENCRYPTION_KEY", "abcdefghijklmnopqrstuvwxyz012345");
-    }
-
     {
         let ex = open_executor(dir.path()).await;
         exec(&ex, "CREATE TABLE secrets (id INT, token TEXT)").await;
-        exec(&ex, "INSERT INTO secrets VALUES (1, 'alpha')").await;
-        exec(&ex, "INSERT INTO secrets VALUES (2, 'beta')").await;
-        exec(&ex, "INSERT INTO secrets VALUES (3, 'gamma')").await;
         exec(
             &ex,
-            "CREATE INDEX idx_secrets_token ON secrets USING ENCRYPTED (token)",
+            "INSERT INTO secrets VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')",
         )
         .await;
+        let error = ex
+            .execute("CREATE INDEX refused_secret ON secrets USING ENCRYPTED (token)")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ExecError::Unsupported(ref message) if message == crate::storage::encrypted_index::UNSUPPORTED_ENCRYPTION)
+        );
+        assert!(ex.catalog.get_indexes("secrets").await.is_empty());
+        // Simulate a persisted legacy definition without process environment mutation.
+        exec(&ex, "CREATE INDEX legacy_secret ON secrets (token)").await;
+        let mut legacy = ex
+            .catalog
+            .get_indexes("secrets")
+            .await
+            .into_iter()
+            .find(|index| index.name == "legacy_secret")
+            .unwrap();
+        legacy
+            .options
+            .insert("encryption_mode".into(), "Deterministic".into());
+        ex.catalog.drop_index("legacy_secret").await.unwrap();
+        ex.catalog.create_index(legacy).await.unwrap();
+        CatalogPersistence::new(&dir.path().join("catalog.json"))
+            .save_catalog(&ex.catalog)
+            .await
+            .unwrap();
     }
-
-    {
-        let ex = open_executor(dir.path()).await;
-
-        // Table data and encrypted index both survive
-        let r = exec(&ex, "SELECT COUNT(*) FROM secrets").await;
-        let count = match rows(&r[0]).first().and_then(|row| row.first()) {
-            Some(Value::Int64(n)) => *n,
-            Some(Value::Int32(n)) => *n as i64,
-            _ => -1,
-        };
-        assert_eq!(count, 3, "secrets table should have 3 rows after restart");
-    }
+    let ex = open_executor(dir.path()).await;
+    assert!(
+        ex.encrypted_indexes.read().is_empty(),
+        "legacy token prototype was reconstructed as encryption"
+    );
+    let result = exec(&ex, "SELECT id, token FROM secrets ORDER BY id").await;
+    assert_eq!(
+        rows(&result[0]),
+        &vec![
+            vec![Value::Int32(1), Value::Text("alpha".into())],
+            vec![Value::Int32(2), Value::Text("beta".into())],
+            vec![Value::Int32(3), Value::Text("gamma".into())]
+        ]
+    );
+    let error = ex
+        .execute("SELECT ENCRYPTED_LOOKUP('legacy_secret', 'alpha')")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, ExecError::Unsupported(ref message) if message == crate::storage::encrypted_index::UNSUPPORTED_ENCRYPTION)
+    );
 }
 
 // ── Table-attached FTS persistence ────────────────────────────────────────────

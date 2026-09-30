@@ -2252,73 +2252,9 @@ impl Executor {
                     );
                 }
                 crate::catalog::IndexType::BTree if idx.options.contains_key("encryption_mode") => {
-                    // Encrypted index: try to rebuild using env key.
-                    let key_bytes: Option<[u8; 32]> =
-                        std::env::var("NUCLEUS_ENCRYPTION_KEY").ok().and_then(|k| {
-                            let b = k.into_bytes();
-                            if b.len() == 32 {
-                                let mut arr = [0u8; 32];
-                                arr.copy_from_slice(&b);
-                                Some(arr)
-                            } else {
-                                None
-                            }
-                        });
-                    let Some(key) = key_bytes else {
-                        tracing::warn!(
-                            "Encrypted index '{}' not restored: NUCLEUS_ENCRYPTION_KEY not available",
-                            idx.name
-                        );
-                        continue;
-                    };
-
-                    let mode_str = idx
-                        .options
-                        .get("encryption_mode")
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
-                    let mode = if mode_str.contains("Order") || mode_str.contains("OPE") {
-                        crate::storage::encrypted_index::EncryptionMode::OrderPreserving
-                    } else if mode_str.contains("Random") {
-                        crate::storage::encrypted_index::EncryptionMode::Randomized
-                    } else {
-                        crate::storage::encrypted_index::EncryptionMode::Deterministic
-                    };
-
-                    let col_name = match idx.columns.first() {
-                        Some(c) => c.clone(),
-                        None => continue,
-                    };
-                    let table_def = match self.catalog.get_table(&idx.table_name).await {
-                        Some(d) => d,
-                        None => continue,
-                    };
-                    let col_idx = table_def.column_index(&col_name);
-
-                    let mut enc_idx =
-                        crate::storage::encrypted_index::EncryptedIndex::new(key, mode);
-                    if let Some(ci) = col_idx {
-                        let rows = self.storage.scan(&idx.table_name).await.unwrap_or_default();
-                        for (row_id, row) in rows.iter().enumerate() {
-                            if ci < row.len() {
-                                let plaintext = self.value_to_text_string(&row[ci]);
-                                enc_idx.insert(plaintext.as_bytes(), row_id as u64);
-                            }
-                        }
-                        tracing::info!(
-                            "Rebuilt encrypted index '{}' from {} rows",
-                            idx.name,
-                            rows.len()
-                        );
-                    }
-
-                    self.encrypted_indexes.write().insert(
-                        idx.name.clone(),
-                        EncryptedIndexEntry {
-                            table_name: idx.table_name.clone(),
-                            column_name: col_name,
-                            index: enc_idx,
-                        },
+                    tracing::warn!(
+                        "Legacy encrypted index '{}' is unavailable: no secure encryption mode is implemented; base table rows remain readable",
+                        idx.name
                     );
                 }
                 _ => {}
@@ -2573,11 +2509,8 @@ impl Executor {
         #[cfg(test)]
         self.pause_derived_publish("position", table_name);
 
-        let key = std::env::var("NUCLEUS_ENCRYPTION_KEY")
-            .ok()
-            .and_then(|value| value.as_bytes().try_into().ok());
         let mut vectors = Vec::new();
-        let mut encrypted = Vec::new();
+        let encrypted: Vec<(String, EncryptedIndexEntry)> = Vec::new();
         for definition in definitions {
             let Some(column_name) = definition.columns.first().cloned() else {
                 continue;
@@ -2654,41 +2587,10 @@ impl Executor {
                 crate::catalog::IndexType::BTree
                     if definition.options.contains_key("encryption_mode") =>
                 {
-                    let Some(key) = key else {
-                        tracing::warn!(
-                            "encrypted index '{}' disabled during rebuild: NUCLEUS_ENCRYPTION_KEY is unavailable",
-                            definition.name
-                        );
-                        continue;
-                    };
-                    let mode = match definition
-                        .options
-                        .get("encryption_mode")
-                        .map(String::as_str)
-                    {
-                        Some(value) if value.contains("Order") || value.contains("OPE") => {
-                            crate::storage::encrypted_index::EncryptionMode::OrderPreserving
-                        }
-                        Some(value) if value.contains("Random") => {
-                            crate::storage::encrypted_index::EncryptionMode::Randomized
-                        }
-                        _ => crate::storage::encrypted_index::EncryptionMode::Deterministic,
-                    };
-                    let mut index = crate::storage::encrypted_index::EncryptedIndex::new(key, mode);
-                    for (row_id, row) in rows.iter().enumerate() {
-                        if let Some(value) = row.get(column_index) {
-                            let plaintext = self.value_to_text_string(value);
-                            index.insert(plaintext.as_bytes(), row_id as u64);
-                        }
-                    }
-                    encrypted.push((
-                        definition.name.clone(),
-                        EncryptedIndexEntry {
-                            table_name: table_name.to_string(),
-                            column_name,
-                            index,
-                        },
-                    ));
+                    tracing::warn!(
+                        "Legacy encrypted index '{}' is unavailable: no secure encryption mode is implemented",
+                        definition.name
+                    );
                 }
                 _ => {}
             }
@@ -9118,13 +9020,6 @@ impl Executor {
                 entry.index.remove(plaintext.as_bytes(), row_pos as u64);
             }
         }
-    }
-
-    /// Look up rows via an encrypted index (equality match).
-    fn encrypted_index_lookup(&self, index_name: &str, value: &[u8]) -> Option<Vec<u64>> {
-        let indexes = self.encrypted_indexes.read();
-        let entry = indexes.get(index_name)?;
-        Some(entry.index.lookup_equal(value))
     }
 
     // ========================================================================

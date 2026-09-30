@@ -2152,6 +2152,17 @@ impl Executor {
         &self,
         create_index: ast::CreateIndex,
     ) -> Result<ExecResult, ExecError> {
+        if create_index.using.as_ref().is_some_and(|using| {
+            using
+                .to_string()
+                .to_ascii_uppercase()
+                .starts_with("ENCRYPTED")
+        }) || Self::extract_index_with_option(&create_index.with, "encryption_mode").is_some()
+        {
+            return Err(ExecError::Unsupported(
+                crate::storage::encrypted_index::UNSUPPORTED_ENCRYPTION.into(),
+            ));
+        }
         let derived_generation = self.derived_coherence.generation();
         let index_name = create_index
             .name
@@ -2353,75 +2364,6 @@ impl Executor {
         }
         let mut vec_col_idx: Option<usize> = None;
         let mut vec_dims: usize = 0;
-
-        // For encrypted indexes, build the encrypted index data structure.
-        let encryption_mode = match create_index
-            .using
-            .as_ref()
-            .map(|u| u.to_string().to_uppercase())
-        {
-            Some(ref s) if s.starts_with("ENCRYPTED") => {
-                let mode = if s.contains("OPE") || s.contains("ORDER") {
-                    crate::storage::encrypted_index::EncryptionMode::OrderPreserving
-                } else if s.contains("RANDOM") {
-                    crate::storage::encrypted_index::EncryptionMode::Randomized
-                } else {
-                    crate::storage::encrypted_index::EncryptionMode::Deterministic
-                };
-                Some(mode)
-            }
-            _ => None,
-        };
-
-        if let Some(mode) = encryption_mode {
-            let table_def = self.get_table(&table_name).await?;
-            let col_name = columns.first().cloned().unwrap_or_default();
-            let col_idx = table_def.column_index(&col_name);
-
-            // Derive encryption key from environment (exactly 32 bytes for AES-256-GCM).
-            let key: [u8; 32] = match std::env::var("NUCLEUS_ENCRYPTION_KEY") {
-                Ok(env_key) => {
-                    let bytes = env_key.as_bytes();
-                    if bytes.len() != 32 {
-                        return Err(ExecError::Unsupported(format!(
-                            "NUCLEUS_ENCRYPTION_KEY must be exactly 32 bytes (got {})",
-                            bytes.len()
-                        )));
-                    }
-                    let mut k = [0u8; 32];
-                    k.copy_from_slice(bytes);
-                    k
-                }
-                Err(_) => {
-                    return Err(ExecError::Unsupported(
-                        "encrypted indexes require NUCLEUS_ENCRYPTION_KEY (32-byte secret)".into(),
-                    ));
-                }
-            };
-            let mut enc_idx = crate::storage::encrypted_index::EncryptedIndex::new(key, mode);
-
-            // Index existing rows.
-            if let Some(ci) = col_idx {
-                let existing_rows = self.storage.scan(&table_name).await.unwrap_or_default();
-                for (row_id, row) in existing_rows.iter().enumerate() {
-                    if ci < row.len() {
-                        let plaintext = self.value_to_text_string(&row[ci]);
-                        enc_idx.insert(plaintext.as_bytes(), row_id as u64);
-                    }
-                }
-            }
-
-            options.insert("encryption_mode".to_string(), format!("{mode:?}"));
-
-            self.encrypted_indexes.write().insert(
-                index_name.clone(),
-                EncryptedIndexEntry {
-                    table_name: table_name.clone(),
-                    column_name: col_name,
-                    index: enc_idx,
-                },
-            );
-        }
 
         // For vector indexes, extract column type to determine dimensions
         if matches!(

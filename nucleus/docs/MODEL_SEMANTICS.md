@@ -1192,40 +1192,20 @@ written to disk. Not in `CrossModelSnapshots`. `SPARSE_` prefix guarded —
 
 ---
 
-## Encrypted indexes
+## Encrypted indexes — explicitly unavailable
 
-`CREATE INDEX … USING ENCRYPTED[_OPE|_RANDOM]` (`src/executor/ddl.rs:1330-1396`)
-plus `ENCRYPTED_LOOKUP` (`src/executor/scalar_fns.rs:2844`). Genuinely wired into
-DML: insert hook at `src/executor/mod.rs:5522`, delete hook at `:5548`.
+`CREATE INDEX ... USING ENCRYPTED`, `ENCRYPTED_OPE`, `ENCRYPTED_RANDOM` and
+`ENCRYPTED_LOOKUP` refuse with Unsupported / SQLSTATE `0A000` before adding
+index metadata. The public Rust constructor also returns an error. No secure
+encryption mode is implemented. The retired prototype used XOR/FNV tokens
+and a counter, lacked authenticated encryption, and its reversible mode
+exposed plaintext to a chosen-zeroes query. Historical encoding tests use a
+private test-only prototype; they do not certify cryptography.
 
-**Durability: derived, and correctly so.** The index structure is an in-memory
-`BTreeMap` never written to disk; what persists is the index *definition* in
-`catalog.json`, and the index is rebuilt on restart by re-scanning plaintext base
-rows (`src/executor/mod.rs:1121-1190`). It is in `derived_dirty_tables`
-(`src/executor/dml.rs:1822` → `src/executor/txn.rs:179, 258`), so it is repaired
-after both COMMIT and ROLLBACK, and there is a restart regression
-(`src/executor/tests/test_specialty_persistence.rs:357`). If
-`NUCLEUS_ENCRYPTION_KEY` is absent the rebuild is skipped with a `tracing::warn!`
-(`:1136-1142`) and `ENCRYPTED_LOOKUP` then fails with "index not found" —
-degradation rather than a clear error.
-
-**The cryptography does not match the documentation.** **[code]** Doc comments
-claim "AES-256 key" (`src/storage/encrypted_index.rs:74`), "AES-GCM style"
-(`:29`), and "AES-256-GCM" (`src/executor/ddl.rs:1352`). **There is no AES.** The
-primitives are `fnv1a_64`, a non-cryptographic hash (`:37-47`); deterministic
-mode is cyclic XOR with the key then FNV-1a to an 8-byte token (`:126-136`);
-order-preserving mode is XOR with a constant per-position keystream byte
-(`:106-112`), i.e. a substitution cipher that leaks full ordering and is
-recoverable from a few known plaintexts; randomized mode prepends an
-`AtomicU64` counter (`:57`), not a CSPRNG nonce. The key is read verbatim from
-`NUCLEUS_ENCRYPTION_KEY` with no KDF, no keystore, no rotation, no wrapping.
-**And the base table itself is stored in plaintext** — only the index tokens are
-transformed. Treat this as obfuscation, not encryption, and do not document it
-as AES.
-
-`ENCRYPTED_` prefix guarded — **[verified]** `ENCRYPTED_LOOKUP` denied under RLS.
-
----
+Recovery retains historical catalog definitions and base table rows but does
+not reconstruct legacy encrypted sidecars. Base rows were always plaintext;
+this retirement does not encrypt them. A future secure implementation needs
+an explicit cryptographic format and key-management migration.
 
 ## Stored procedures
 
