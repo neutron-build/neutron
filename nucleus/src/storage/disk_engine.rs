@@ -8580,6 +8580,41 @@ mod tests {
                 "renamed column and rollback must preserve index answers"
             );
         }
+        rt.block_on(executor.execute(
+            "BEGIN; ALTER TABLE structural_index RENAME TO renamed_structural_index; COMMIT",
+        ))
+        .unwrap();
+        for predicate in ["new_val = 37", "new_val + 0 = 37"] {
+            let results = rt
+                .block_on(executor.execute(&format!(
+                    "SELECT id FROM renamed_structural_index WHERE {predicate} ORDER BY id"
+                )))
+                .unwrap();
+            let ExecResult::Select { rows, .. } = &results[0] else {
+                panic!("expected SELECT");
+            };
+            assert_eq!(
+                rows, &expected,
+                "TABLE RENAME commit must preserve surviving identities"
+            );
+        }
+        let indexed = rt
+            .block_on(engine.index_lookup(
+                "renamed_structural_index",
+                "structural_val",
+                &Value::Int32(37),
+            ))
+            .expect("renamed table must own its physical index")
+            .expect("disk engine must serve renamed physical index");
+        let mut ids: Vec<Row> = indexed
+            .into_iter()
+            .map(|row| vec![row[0].clone()])
+            .collect();
+        ids.sort_by(|a, b| a[0].to_string().cmp(&b[0].to_string()));
+        assert_eq!(
+            ids, expected,
+            "TABLE RENAME commit must reconstruct physical postings under the new table name"
+        );
     }
 
     /// Dense secondary keys must remain complete after different rows on the
