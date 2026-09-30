@@ -549,3 +549,15 @@ each poll, including pending, nested and unwinding polls, so suspended embedded
 executions do not inherit another future's reader or writer generation. Server
 builds retain Tokio task-local scopes. The core-only scope tests exercise
 interleaved polls, nesting, panic restoration and cancellation without a runtime.
+
+## Native FTS recovery refusal (2026-09-30)
+
+Native FTS recovery combines a checkpoint with its subsequent WAL tail. A corrupt
+or unreadable existing checkpoint, or an unopenable declared FTS WAL, now refuses
+persistent executor construction instead of serving an incomplete or volatile
+index. `try_new_with_persistence` returns the recovery error; the compatibility
+constructor refuses with a clear panic. The server and maintenance opener use
+the fallible constructor. Missing checkpoints remain valid for fresh/WAL-only
+recovery. Tests reproduce all three unsafe successes before the fix, preserve
+the failed files, and verify checkpoint-plus-tail recovery remains writable
+across a second reopen. This does not establish power-loss durability.
