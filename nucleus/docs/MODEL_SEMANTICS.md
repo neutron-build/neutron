@@ -54,7 +54,7 @@ power failure loses up to `wal.checkpoint_interval_secs` (default **300 s**,
 | Branch / version | **none** | **NO** | **refused inside a transaction** (2026-08-19) | **no** | yes |
 | Tensor | **none** | **NO** | **refused inside a transaction** (2026-08-19) | **no** | yes |
 | Sparse | **none** | **NO** | **refused inside a transaction** (2026-08-19) | **no** | yes |
-| Encrypted index | derived | rebuilt from plaintext rows | repaired by rebuild | n/a | yes |
+| Encrypted index | **unavailable** — legacy modes refuse `0A000` | historical definitions/base rows retained; no sidecar rebuild | n/a | n/a | no runtime support |
 | Stored procedures | **none** | **NO** | **not transactional** (registration is immediate and survives ROLLBACK) | **no** | partial (`CALL` ungated) |
 
 **"Refused inside a transaction" (2026-08-19).** A mutation that `ROLLBACK`
