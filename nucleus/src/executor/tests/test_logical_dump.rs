@@ -542,3 +542,79 @@ async fn dump_round_trips_comparison_in_list_and_null_predicates() {
     );
     assert_eq!(rows(&visible[0])[0][0], Value::Int32(2));
 }
+
+#[tokio::test]
+async fn logical_dump_refuses_retired_encrypted_metadata_until_operator_drops_it() {
+    for mode in ["Deterministic", "OrderPreserving", "Randomized"] {
+        let src = test_executor();
+        exec(
+            &src,
+            "CREATE TABLE legacy_tokens (id INT PRIMARY KEY, token TEXT)",
+        )
+        .await;
+        exec(
+            &src,
+            "INSERT INTO legacy_tokens VALUES (1, 'alpha'), (2, 'beta')",
+        )
+        .await;
+        exec(
+            &src,
+            "CREATE INDEX retired_token_index ON legacy_tokens (token)",
+        )
+        .await;
+        // Persisted old releases used BTree definitions with an encryption option.
+        // Inject that historical metadata without invoking the refused constructor.
+        let mut legacy = src
+            .catalog
+            .get_indexes("legacy_tokens")
+            .await
+            .into_iter()
+            .find(|index| index.name == "retired_token_index")
+            .unwrap()
+            .as_ref()
+            .clone();
+        legacy.options.insert("encryption_mode".into(), mode.into());
+        src.catalog.drop_index("retired_token_index").await.unwrap();
+        src.catalog.create_index(legacy).await.unwrap();
+        let before = all_rows(&src, "SELECT id, token FROM legacy_tokens ORDER BY id").await;
+        let dump = src.dump_logical().await;
+        assert!(
+            matches!(dump, Err(ExecError::Unsupported(ref message))
+            if message.contains("retired_token_index") && message.contains("DROP INDEX")),
+            "legacy {mode} metadata produced an unreplayable success: {dump:?}"
+        );
+        assert_eq!(
+            all_rows(&src, "SELECT id, token FROM legacy_tokens ORDER BY id").await,
+            before
+        );
+        assert!(
+            src.catalog
+                .get_indexes("legacy_tokens")
+                .await
+                .iter()
+                .any(|index| index.name == "retired_token_index"),
+            "failed export silently removed metadata"
+        );
+        exec(&src, "DROP INDEX retired_token_index").await;
+        exec(&src, "CREATE INDEX token_lookup ON legacy_tokens (token)").await;
+        let script = src.dump_logical().await.unwrap();
+        assert!(!script.contains("retired_token_index"));
+        let dst = test_executor();
+        dst.restore_logical(&script).await.unwrap();
+        assert_eq!(
+            all_rows(&dst, "SELECT id, token FROM legacy_tokens ORDER BY id").await,
+            before
+        );
+        assert_eq!(
+            all_rows(&dst, "SELECT id FROM legacy_tokens WHERE token = 'beta'").await,
+            vec![vec![Value::Int32(2)]]
+        );
+        assert!(
+            dst.catalog
+                .get_indexes("legacy_tokens")
+                .await
+                .iter()
+                .any(|index| index.name == "token_lookup")
+        );
+    }
+}
