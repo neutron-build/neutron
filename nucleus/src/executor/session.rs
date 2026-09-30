@@ -246,6 +246,9 @@ pub(super) struct TxnState {
     /// COMMIT or ROLLBACK.  Vector/encrypted indexes are shared across sessions,
     /// so an aborted transaction must repair them from committed base rows too.
     pub derived_dirty_tables: HashSet<String>,
+    /// Structural DDL removed or reshaped engine-local index structures.
+    /// Ordinary DML maintains those postings inside the storage engine.
+    pub storage_index_dirty_tables: HashSet<String>,
     /// PostgreSQL transaction-error state: once a statement errors inside an
     /// explicit transaction, the whole transaction is aborted — every later
     /// statement is rejected until ROLLBACK (or COMMIT, which becomes a
@@ -267,6 +270,7 @@ impl TxnState {
             policy_dirty: false,
             gin_dirty: false,
             derived_dirty_tables: HashSet::new(),
+            storage_index_dirty_tables: HashSet::new(),
             aborted: false,
         }
     }
@@ -642,6 +646,7 @@ impl Session {
             txn.savepoints.clear();
             txn.gin_dirty = false;
             txn.derived_dirty_tables.clear();
+            txn.storage_index_dirty_tables.clear();
         }
         *self.cross_model.lock() = None;
         *self.guc_txn.lock() = None;

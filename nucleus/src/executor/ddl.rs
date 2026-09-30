@@ -2778,7 +2778,8 @@ impl Executor {
             // Index definitions survive TRUNCATE. Recreate engine-local index
             // structures and replace every in-memory posting map with the
             // authoritative empty-table image.
-            self.rebuild_table_derived_state(&table_name).await;
+            self.rebuild_table_storage_and_derived_state(&table_name)
+                .await;
         }
         Ok(ExecResult::Command {
             tag: "TRUNCATE TABLE".into(),
@@ -2978,7 +2979,7 @@ impl Executor {
                         table_name.hash(&mut hasher);
                         self.zone_map_index.clear_table(hasher.finish());
                     }
-                    self.rebuild_table_derived_state(&new).await;
+                    self.rebuild_table_storage_and_derived_state(&new).await;
                     {
                         let mut security = self.security.write();
                         security.rls.rename_table(&table_name, &new);
@@ -4081,7 +4082,8 @@ impl Executor {
             self.table_columns
                 .write()
                 .insert(table_name.clone(), col_info);
-            self.rebuild_table_derived_state(&table_name).await;
+            self.rebuild_table_storage_and_derived_state(&table_name)
+                .await;
         } else {
             self.table_columns.write().remove(&table_name);
         }

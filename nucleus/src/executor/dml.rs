@@ -2404,9 +2404,17 @@ impl Executor {
         }
     }
 
-    /// Repair every derived representation whose row IDs or values can become
-    /// stale after UPDATE/DELETE, FK actions, or a schema rewrite.
+    /// Refresh executor-owned representations after ordinary row mutations.
+    /// Storage engines already maintain their own B-tree postings.
     pub(super) async fn rebuild_table_derived_state(&self, table_name: &str) {
+        self.maintain_table_derived_state(table_name, false).await;
+    }
+
+    pub(super) async fn rebuild_table_storage_and_derived_state(&self, table_name: &str) {
+        self.maintain_table_derived_state(table_name, true).await;
+    }
+
+    async fn maintain_table_derived_state(&self, table_name: &str, rebuild_storage: bool) {
         // Inside an explicit transaction this is deferred to COMMIT/ROLLBACK,
         // which already rebuild every table in `derived_dirty_tables`.
         //
@@ -2428,43 +2436,58 @@ impl Executor {
             let mut txn = session.txn_state.write().await;
             if txn.active {
                 txn.derived_dirty_tables.insert(table_name.to_string());
+                if rebuild_storage {
+                    txn.storage_index_dirty_tables
+                        .insert(table_name.to_string());
+                }
                 return;
             }
         }
 
-        self.rebuild_committed_table_derived_state(table_name).await;
+        self.rebuild_committed_derived_state(table_name, rebuild_storage)
+            .await;
     }
 
     /// Rebuild from storage after a commit/abort decision, even while rollback
     /// retains active transaction state and before-images for cancellation recovery.
     pub(super) async fn rebuild_committed_table_derived_state(&self, table_name: &str) {
-        // TRUNCATE recreates the physical table and therefore removes its
-        // engine-local indexes while catalog definitions remain. Re-create any
-        // missing physical indexes before rebuilding their postings.
-        if let Some(table_def) = self.catalog.get_table(table_name).await {
-            for index in self.catalog.get_indexes(table_name).await {
-                if matches!(
-                    index.index_type,
-                    crate::catalog::IndexType::BTree | crate::catalog::IndexType::Hash
-                ) && !index.options.contains_key("encryption_mode")
-                    && let Some(column) = index.columns.first()
-                    && let Some(column_index) = table_def.column_index(column)
-                {
-                    let _ = self
-                        .storage_for(table_name)
-                        .create_index(table_name, &index.name, column_index)
-                        .await;
-                    self.btree_indexes
-                        .insert((table_name.to_string(), column.clone()), index.name.clone());
+        self.rebuild_committed_derived_state(table_name, true).await;
+    }
+
+    async fn rebuild_committed_derived_state(&self, table_name: &str, rebuild_storage: bool) {
+        // Ordinary DML already updates storage B-trees with its heap writes.
+        // Publishing a detached full rebuild here can overwrite postings from
+        // a concurrent writer that committed after the rebuild scanned them.
+        // Schema replacement and rollback still need physical reconstruction.
+        if rebuild_storage {
+            // TRUNCATE recreates the physical table and therefore removes its
+            // engine-local indexes while catalog definitions remain. Re-create any
+            // missing physical indexes before rebuilding their postings.
+            if let Some(table_def) = self.catalog.get_table(table_name).await {
+                for index in self.catalog.get_indexes(table_name).await {
+                    if matches!(
+                        index.index_type,
+                        crate::catalog::IndexType::BTree | crate::catalog::IndexType::Hash
+                    ) && !index.options.contains_key("encryption_mode")
+                        && let Some(column) = index.columns.first()
+                        && let Some(column_index) = table_def.column_index(column)
+                    {
+                        let _ = self
+                            .storage_for(table_name)
+                            .create_index(table_name, &index.name, column_index)
+                            .await;
+                        self.btree_indexes
+                            .insert((table_name.to_string(), column.clone()), index.name.clone());
+                    }
                 }
             }
-        }
-        if let Err(error) = self
-            .storage_for(table_name)
-            .rebuild_table_indexes(table_name)
-            .await
-        {
-            tracing::warn!("failed to rebuild storage indexes for '{table_name}': {error}");
+            if let Err(error) = self
+                .storage_for(table_name)
+                .rebuild_table_indexes(table_name)
+                .await
+            {
+                tracing::warn!("failed to rebuild storage indexes for '{table_name}': {error}");
+            }
         }
         self.rebuild_zone_map(table_name).await;
         self.mark_gin_committed_write();

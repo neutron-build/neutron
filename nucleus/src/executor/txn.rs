@@ -121,6 +121,7 @@ impl Executor {
         txn.policy_dirty = false;
         txn.gin_dirty = false;
         txn.derived_dirty_tables.clear();
+        txn.storage_index_dirty_tables.clear();
         txn.engine_snapshots.clear();
         txn.engine_savepoints.clear();
         txn.aborted = false;
@@ -234,6 +235,7 @@ impl Executor {
 
         let gin_dirty = txn.gin_dirty;
         let derived_dirty_tables: Vec<String> = txn.derived_dirty_tables.iter().cloned().collect();
+        let storage_index_dirty_tables = txn.storage_index_dirty_tables.clone();
         let policy_dirty = txn.policy_dirty;
         // Snapshot lease (Consumer-2): the lease's lifetime is the holding
         // transaction's — COMMIT releases it. Released AFTER the storage
@@ -273,6 +275,7 @@ impl Executor {
         txn.policy_dirty = false;
         txn.gin_dirty = false;
         txn.derived_dirty_tables.clear();
+        txn.storage_index_dirty_tables.clear();
         txn.engine_snapshots.clear();
         txn.engine_savepoints.clear();
         *sess.cross_model.lock() = None; // Discard the write-set on commit
@@ -292,7 +295,11 @@ impl Executor {
             self.rebuild_all_gin_indexes().await;
         }
         for table in derived_dirty_tables {
-            self.rebuild_table_derived_state(&table).await;
+            if storage_index_dirty_tables.contains(&table) {
+                self.rebuild_committed_table_derived_state(&table).await;
+            } else {
+                self.rebuild_table_derived_state(&table).await;
+            }
         }
 
         // Policy publication is tied to the commit decision (A7): the staged
@@ -442,6 +449,7 @@ impl Executor {
         txn.policy_dirty = false;
         txn.gin_dirty = false;
         txn.derived_dirty_tables.clear();
+        txn.storage_index_dirty_tables.clear();
         txn.engine_snapshots.clear();
         txn.engine_savepoints.clear();
         sess.guc_rollback();
