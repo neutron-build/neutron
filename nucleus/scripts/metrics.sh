@@ -213,7 +213,23 @@ assert_public_value() {
 
 assert_public_value "$README" "LOC" "$LOC_FMT lines of Rust" || fail=1
 assert_public_value "$README" "declared tests" "$DECLARED_TESTS_FMT declared tests" || fail=1
-assert_public_value "$HOMEPAGE" "declared tests" ">$DECLARED_TESTS_FMT<" || fail=1
+# Validate the labeled statistic, not an unrelated number elsewhere on the page.
+# A prior update accidentally put the test count under Languages while leaving
+# the actual Declared tests value stale; the generic substring check missed it.
+homepage_stat() {
+    awk -v label="$1" '
+        /class="stats__number"/ {
+            value=$0; sub(/^.*stats__number">/, "", value); sub(/<.*/, "", value)
+        }
+        index($0, "class=\"stats__label\">" label "</span>") { print value }
+    ' "$HOMEPAGE"
+}
+if [ "$(homepage_stat "Declared tests")" = "$DECLARED_TESTS_FMT" ]; then
+    echo "OK: homepage labeled declared tests=$DECLARED_TESTS_FMT"
+else
+    echo "FAIL: homepage Declared tests statistic must be $DECLARED_TESTS_FMT" >&2
+    fail=1
+fi
 
 # Backstop sweep. Positive assertions cover the figures we know are cited; this
 # catches a retired figure reappearing somewhere new on the front door. Scoped
