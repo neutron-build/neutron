@@ -8494,11 +8494,31 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (engine, catalog) = rt.block_on(setup_engine(tmp.path()));
         let engine = Arc::new(engine);
-        let storage: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(engine));
+        let storage: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(engine.clone()));
         let executor = Executor::new(catalog, storage);
         rt.block_on(executor.execute("CREATE TABLE structural_index (id BIGINT PRIMARY KEY, val INT); CREATE INDEX structural_val ON structural_index (val); INSERT INTO structural_index VALUES (1, 11)")).unwrap();
         rt.block_on(executor.execute("BEGIN; TRUNCATE structural_index; INSERT INTO structural_index VALUES (2,37),(3,37); COMMIT")).unwrap();
         let expected = vec![vec![Value::Int64(2)], vec![Value::Int64(3)]];
+        let assert_physical_index = || {
+            let indexed = rt
+                .block_on(engine.index_lookup(
+                    "structural_index",
+                    "structural_val",
+                    &Value::Int32(37),
+                ))
+                .expect("physical index must exist after structural maintenance")
+                .expect("disk engine must serve physical index lookup");
+            let mut ids: Vec<Row> = indexed
+                .into_iter()
+                .map(|row| vec![row[0].clone()])
+                .collect();
+            ids.sort_by(|a, b| a[0].to_string().cmp(&b[0].to_string()));
+            assert_eq!(
+                ids, expected,
+                "physical postings must match surviving heap identities"
+            );
+        };
+        assert_physical_index();
         for predicate in ["val = 37", "val + 0 = 37"] {
             let results = rt
                 .block_on(executor.execute(&format!(
@@ -8518,6 +8538,7 @@ mod tests {
                 .execute("BEGIN; ALTER TABLE structural_index ADD COLUMN n INT DEFAULT 7; COMMIT"),
         )
         .unwrap();
+        assert_physical_index();
         for predicate in ["val = 37", "val + 0 = 37"] {
             let results = rt
                 .block_on(executor.execute(&format!(
@@ -8542,7 +8563,9 @@ mod tests {
             ),
         )
         .unwrap();
+        assert_physical_index();
         rt.block_on(executor.execute("BEGIN; UPDATE structural_index SET new_val=38 WHERE id=2; INSERT INTO structural_index VALUES (4,37,9); ROLLBACK")).unwrap();
+        assert_physical_index();
         for predicate in ["new_val = 37", "new_val + 0 = 37"] {
             let results = rt
                 .block_on(executor.execute(&format!(
