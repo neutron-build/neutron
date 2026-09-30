@@ -32,6 +32,33 @@ const GRANULE_SIZE: usize = 8192;
 
 /// Compute a stable table_id from a table name for zone map indexing.
 #[allow(dead_code)]
+/// Apply a derived-table column list (`... AS t(a, b)`) to the columns of the
+/// relation it names. PostgreSQL renames the leading columns and leaves the
+/// rest under their own names; naming more columns than exist is an error.
+pub(super) fn apply_alias_columns(
+    meta: &mut [ColMeta],
+    alias: Option<&ast::TableAlias>,
+) -> Result<(), ExecError> {
+    let Some(alias) = alias else {
+        return Ok(());
+    };
+    if alias.columns.is_empty() {
+        return Ok(());
+    }
+    if alias.columns.len() > meta.len() {
+        return Err(ExecError::Runtime(format!(
+            "table \"{}\" has {} columns available but {} columns specified",
+            alias.name.value,
+            meta.len(),
+            alias.columns.len()
+        )));
+    }
+    for (col, named) in meta.iter_mut().zip(alias.columns.iter()) {
+        col.name = named.name.value.clone();
+    }
+    Ok(())
+}
+
 fn table_name_to_id(name: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     name.hash(&mut hasher);
@@ -1298,10 +1325,10 @@ impl Executor {
                 let name = func.name.to_string().to_uppercase();
                 match name.as_str() {
                     "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "ARRAY_AGG" | "STRING_AGG"
-                    | "JSON_AGG" | "BOOL_AND" | "BOOL_OR" | "STDDEV" | "VARIANCE"
-                    | "STDDEV_POP" | "STDDEV_SAMP" | "VAR_POP" | "VAR_SAMP" | "ARGMAX"
-                    | "ARG_MAX" | "ARGMIN" | "ARG_MIN" | "PERCENTILE_CONT" | "PERCENTILE_DISC"
-                    | "MEDIAN" | "QUANTILE" => {
+                    | "JSON_AGG" | "JSONB_AGG" | "JSON_OBJECT_AGG" | "JSONB_OBJECT_AGG"
+                    | "BOOL_AND" | "BOOL_OR" | "STDDEV" | "VARIANCE" | "STDDEV_POP"
+                    | "STDDEV_SAMP" | "VAR_POP" | "VAR_SAMP" | "ARGMAX" | "ARG_MAX" | "ARGMIN"
+                    | "ARG_MIN" | "PERCENTILE_CONT" | "PERCENTILE_DISC" | "MEDIAN" | "QUANTILE" => {
                         out.push(format!("{expr}"));
                     }
                     _ => {}
@@ -8946,6 +8973,12 @@ impl Executor {
 
         let has_group_by = matches!(&select.group_by, ast::GroupByExpr::Expressions(exprs, _) if !exprs.is_empty());
 
+        if has_window && (has_aggregates || has_group_by || select.having.is_some()) {
+            return Err(ExecError::Unsupported(
+                "window functions combined with grouping or aggregates".into(),
+            ));
+        }
+
         if has_window {
             // Window function query -- evaluate projection with window context
             Ok(SelectResult::Projected(
@@ -9401,17 +9434,19 @@ impl Executor {
                         .as_ref()
                         .and_then(|a| a.columns.first())
                         .map(|c| c.name.value.clone());
-                    return self.execute_table_function(
+                    let (mut meta, rows) = self.execute_table_function(
                         &func_name,
                         &arg_values,
                         &label,
                         col_alias.as_deref(),
-                    );
+                    )?;
+                    apply_alias_columns(&mut meta, alias.as_ref())?;
+                    return Ok((meta, rows));
                 }
 
                 // Check CTE first
                 if let Some((meta, rows)) = cte_tables.get(&table_name) {
-                    let relabeled: Vec<ColMeta> = meta
+                    let mut relabeled: Vec<ColMeta> = meta
                         .iter()
                         .map(|c| ColMeta {
                             table: Some(label.clone()),
@@ -9419,6 +9454,7 @@ impl Executor {
                             dtype: c.dtype.clone(),
                         })
                         .collect();
+                    apply_alias_columns(&mut relabeled, alias.as_ref())?;
                     return Ok((relabeled, rows.clone()));
                 }
 
@@ -9581,7 +9617,7 @@ impl Executor {
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| "subquery".into());
                 if let ExecResult::Select { columns, rows } = sub_result {
-                    let col_meta: Vec<ColMeta> = columns
+                    let mut col_meta: Vec<ColMeta> = columns
                         .iter()
                         .map(|(name, dtype)| ColMeta {
                             table: Some(alias_name.clone()),
@@ -9589,6 +9625,7 @@ impl Executor {
                             dtype: dtype.clone(),
                         })
                         .collect();
+                    apply_alias_columns(&mut col_meta, alias.as_ref())?;
                     Ok((col_meta, rows))
                 } else {
                     Err(ExecError::Unsupported("subquery must return rows".into()))
@@ -9618,7 +9655,14 @@ impl Executor {
                     .as_ref()
                     .and_then(|a| a.columns.first())
                     .map(|c| c.name.value.clone());
-                self.execute_table_function(&func_name, &fn_args, &alias_name, col_alias.as_deref())
+                let (mut meta, rows) = self.execute_table_function(
+                    &func_name,
+                    &fn_args,
+                    &alias_name,
+                    col_alias.as_deref(),
+                )?;
+                apply_alias_columns(&mut meta, alias.as_ref())?;
+                Ok((meta, rows))
             }
             TableFactor::UNNEST {
                 alias, array_exprs, ..
@@ -9627,11 +9671,12 @@ impl Executor {
                     .as_ref()
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| "unnest".into());
-                let col_meta = vec![ColMeta {
+                let mut col_meta = vec![ColMeta {
                     table: Some(alias_name.clone()),
                     name: "unnest".into(),
                     dtype: DataType::Text,
                 }];
+                apply_alias_columns(&mut col_meta, alias.as_ref())?;
                 let mut rows = Vec::new();
                 for expr in array_exprs {
                     if let Ok(Value::Array(vals)) = self.eval_const_expr(expr) {
@@ -9688,7 +9733,7 @@ impl Executor {
                 continue;
             };
 
-            let right_meta: Vec<ColMeta> = sub_cols
+            let mut right_meta: Vec<ColMeta> = sub_cols
                 .iter()
                 .map(|(name, dtype)| ColMeta {
                     table: Some(alias_name.clone()),
@@ -9696,6 +9741,7 @@ impl Executor {
                     dtype: dtype.clone(),
                 })
                 .collect();
+            apply_alias_columns(&mut right_meta, alias.as_ref())?;
 
             if result_meta.is_none() {
                 let combined: Vec<ColMeta> =

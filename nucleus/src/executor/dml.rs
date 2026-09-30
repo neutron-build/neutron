@@ -2486,6 +2486,9 @@ impl Executor {
         &self,
         update: ast::Update,
     ) -> Result<ExecResult, ExecError> {
+        if update.from.is_some() {
+            return Err(ExecError::Unsupported("UPDATE FROM".into()));
+        }
         let table_name = match &update.table.relation {
             TableFactor::Table { name, .. } => crate::sql::object_name_key(name),
             _ => return Err(ExecError::Unsupported("complex UPDATE target".into())),
@@ -2993,6 +2996,13 @@ impl Executor {
         &self,
         delete: ast::Delete,
     ) -> Result<ExecResult, ExecError> {
+        if delete
+            .using
+            .as_ref()
+            .is_some_and(|tables| !tables.is_empty())
+        {
+            return Err(ExecError::Unsupported("DELETE USING".into()));
+        }
         let tables_with_joins = match delete.from {
             ast::FromTable::WithFromKeyword(t) | ast::FromTable::WithoutKeyword(t) => t,
         };

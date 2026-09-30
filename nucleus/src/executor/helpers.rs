@@ -308,7 +308,7 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
             match name.as_str() {
                 "DECODE" => DataType::Bytea,
                 "MAKE_INTERVAL" | "PG_CATALOG.MAKE_INTERVAL" => DataType::Interval,
-                "COUNT" => DataType::Int64,
+                "COUNT" | "ROW_NUMBER" | "RANK" | "DENSE_RANK" => DataType::Int64,
                 "AVG"
                     if matches!(
                         arg_expr.map(|expr| infer_expr_type(expr, col_meta)),
@@ -338,7 +338,9 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
                         .unwrap_or(DataType::Text);
                     DataType::Array(Box::new(inner))
                 }
-                "JSON_AGG" => DataType::Jsonb,
+                "JSON_AGG" | "JSONB_AGG" | "JSON_OBJECT_AGG" | "JSONB_OBJECT_AGG" => {
+                    DataType::Jsonb
+                }
                 // Nucleus scalar extensions with integer/bool returns: without
                 // these the wire layer described e.g. KV_INCR's result as TEXT
                 // while the executor returned Int64, so pgx got binary int
@@ -910,6 +912,9 @@ pub(super) fn contains_aggregate(expr: &Expr) -> bool {
                     | "STRING_AGG"
                     | "ARRAY_AGG"
                     | "JSON_AGG"
+                    | "JSONB_AGG"
+                    | "JSON_OBJECT_AGG"
+                    | "JSONB_OBJECT_AGG"
                     | "BOOL_AND"
                     | "BOOL_OR"
                     | "EVERY"
@@ -968,13 +973,74 @@ pub(super) fn contains_aggregate(expr: &Expr) -> bool {
 
 pub(super) fn contains_window_function(expr: &Expr) -> bool {
     match expr {
-        Expr::Function(func) => func.over.is_some(),
-        Expr::BinaryOp { left, right, .. } => {
-            contains_window_function(left) || contains_window_function(right)
+        Expr::Function(func) if func.over.is_some() => true,
+        _ => {
+            let mut found = false;
+            // Children of a scalar wrapper (cast, arithmetic, CASE, a plain
+            // function call, ...). Subqueries are not entered: a window inside
+            // one belongs to that query.
+            let mut probe = expr.clone();
+            for_each_scalar_child_mut(&mut probe, &mut |child| {
+                found |= contains_window_function(child);
+            });
+            found
         }
-        Expr::UnaryOp { expr, .. } => contains_window_function(expr),
-        Expr::Nested(inner) => contains_window_function(inner),
-        _ => false,
+    }
+}
+
+/// Visit the direct scalar sub-expressions of `expr` (not subqueries).
+pub(super) fn for_each_scalar_child_mut(expr: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            f(left);
+            f(right);
+        }
+        Expr::UnaryOp { expr: e, .. }
+        | Expr::Nested(e)
+        | Expr::Cast { expr: e, .. }
+        | Expr::IsNull(e)
+        | Expr::IsNotNull(e)
+        | Expr::IsTrue(e)
+        | Expr::IsFalse(e) => f(e),
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            f(e);
+            f(low);
+            f(high);
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(o) = operand {
+                f(o);
+            }
+            for cw in conditions {
+                f(&mut cw.condition);
+                f(&mut cw.result);
+            }
+            if let Some(e) = else_result {
+                f(e);
+            }
+        }
+        Expr::Function(func) if func.over.is_none() => {
+            if let ast::FunctionArguments::List(list) = &mut func.args {
+                for arg in &mut list.args {
+                    if let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))
+                    | ast::FunctionArg::Named {
+                        arg: ast::FunctionArgExpr::Expr(e),
+                        ..
+                    } = arg
+                    {
+                        f(e);
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1995,7 +2061,7 @@ pub(super) fn value_to_csv_string_impl(value: &Value) -> String {
             u[14],
             u[15]
         ),
-        Value::Jsonb(j) => j.to_string(),
+        Value::Jsonb(j) => crate::types::jsonb_text(j),
         Value::Array(arr) => format!(
             "{{{}}}",
             arr.iter()
@@ -2052,7 +2118,7 @@ pub(super) fn value_to_text_string_impl(value: &Value) -> String {
             u[14],
             u[15]
         ),
-        Value::Jsonb(j) => j.to_string(),
+        Value::Jsonb(j) => crate::types::jsonb_text(j),
         Value::Array(arr) => format!(
             "{{{}}}",
             arr.iter()
@@ -2100,7 +2166,50 @@ pub(super) fn value_to_ast_expr(val: &Value) -> Expr {
         Value::Int64(n) => ast::Value::Number(n.to_string(), false),
         Value::Float64(f) => ast::Value::Number(f.to_string(), false),
         Value::Text(s) => ast::Value::SingleQuotedString(s.clone()),
-        _ => ast::Value::Null,
+        // Every remaining value round-trips through its text form under an
+        // explicit cast. This used to fall through to NULL, which silently
+        // turned a jsonb/date/timestamp/numeric/uuid outer reference or
+        // aggregate result into NULL.
+        Value::Jsonb(_)
+        | Value::Date(_)
+        | Value::Timestamp(_)
+        | Value::TimestampTz(_)
+        | Value::Numeric(_)
+        | Value::Uuid(_)
+        | Value::Bytea(_)
+        | Value::Interval { .. } => {
+            let data_type = match val {
+                Value::Jsonb(_) => ast::DataType::JSONB,
+                Value::Date(_) => ast::DataType::Date,
+                Value::Timestamp(_) => {
+                    ast::DataType::Timestamp(None, ast::TimezoneInfo::WithoutTimeZone)
+                }
+                Value::TimestampTz(_) => {
+                    ast::DataType::Timestamp(None, ast::TimezoneInfo::WithTimeZone)
+                }
+                Value::Numeric(_) => ast::DataType::Numeric(ast::ExactNumberInfo::None),
+                Value::Uuid(_) => ast::DataType::Uuid,
+                Value::Bytea(_) => ast::DataType::Bytea,
+                _ => ast::DataType::Interval {
+                    fields: None,
+                    precision: None,
+                },
+            };
+            return Expr::Cast {
+                kind: ast::CastKind::Cast,
+                expr: Box::new(Expr::value(ast::Value::SingleQuotedString(val.to_string()))),
+                data_type,
+                array: false,
+                format: None,
+            };
+        }
+        Value::Array(items) => {
+            return Expr::Array(ast::Array {
+                elem: items.iter().map(value_to_ast_expr).collect(),
+                named: true,
+            });
+        }
+        Value::Vector(_) => ast::Value::Null,
     };
     Expr::Value(ast::ValueWithSpan {
         value: v,
@@ -2287,24 +2396,27 @@ pub(super) fn value_to_json(val: &Value) -> serde_json::Value {
         Value::Float64(n) => serde_json::json!(*n),
         Value::Text(s) => serde_json::Value::String(s.clone()),
         Value::Jsonb(v) => v.clone(),
-        Value::Date(d) => serde_json::json!(d),
-        Value::Timestamp(us) => serde_json::json!(us),
-        Value::TimestampTz(us) => serde_json::json!(us),
-        Value::Numeric(s) => serde_json::Value::String(s.clone()),
+        // PostgreSQL's to_jsonb renders temporal values as ISO 8601 strings.
+        Value::Date(_) => serde_json::Value::String(val.to_string()),
+        Value::Timestamp(_) | Value::TimestampTz(_) => {
+            serde_json::Value::String(val.to_string().replacen(' ', "T", 1))
+        }
+        Value::Numeric(s) => numeric_to_json(s),
         Value::Uuid(b) => serde_json::Value::String(Value::Uuid(*b).to_string()),
         Value::Bytea(b) => serde_json::Value::String(Value::Bytea(b.clone()).to_string()),
         Value::Array(vals) => serde_json::Value::Array(vals.iter().map(value_to_json).collect()),
         Value::Vector(vec) => {
             serde_json::Value::Array(vec.iter().map(|f| serde_json::json!(f)).collect())
         }
-        Value::Interval {
-            months,
-            days,
-            microseconds,
-        } => {
-            serde_json::json!({ "months": months, "days": days, "microseconds": microseconds })
-        }
+        Value::Interval { .. } => serde_json::Value::String(val.to_string()),
     }
+}
+
+/// Preserve decimal digits and JSON number identity without an f64 conversion.
+fn numeric_to_json(s: &str) -> serde_json::Value {
+    s.parse::<serde_json::Number>()
+        .map(serde_json::Value::Number)
+        .unwrap_or_else(|_| serde_json::Value::String(s.to_string()))
 }
 
 /// Convert a Value (JSON array or text) to a Vector for vector operations.

@@ -206,7 +206,10 @@ impl Executor {
             Expr::Cast {
                 expr, data_type, ..
             } => {
-                let val = self.eval_const_expr(expr)?;
+                let val = match numeric_literal_text(expr, data_type) {
+                    Some(text) => Value::Text(text),
+                    None => self.eval_const_expr(expr)?,
+                };
                 self.eval_cast(val, data_type)
             }
             Expr::Function(func) => {
@@ -354,7 +357,7 @@ impl Executor {
         let result = self.eval_json_arrow(left, key)?;
         match result {
             Value::Jsonb(serde_json::Value::String(s)) => Ok(Value::Text(s)),
-            Value::Jsonb(v) => Ok(Value::Text(v.to_string())),
+            Value::Jsonb(v) => Ok(Value::Text(crate::types::jsonb_text(&v))),
             Value::Null => Ok(Value::Null),
             other => Ok(Value::Text(other.to_string())),
         }
@@ -414,7 +417,7 @@ impl Executor {
         let result = self.eval_json_path_arrow(left, path)?;
         match result {
             Value::Jsonb(serde_json::Value::String(s)) => Ok(Value::Text(s)),
-            Value::Jsonb(v) => Ok(Value::Text(v.to_string())),
+            Value::Jsonb(v) => Ok(Value::Text(crate::types::jsonb_text(&v))),
             Value::Null => Ok(Value::Null),
             other => Ok(Value::Text(other.to_string())),
         }
@@ -1203,7 +1206,10 @@ impl Executor {
             Expr::Cast {
                 expr, data_type, ..
             } => {
-                let val = self.eval_row_expr(expr, row, col_meta)?;
+                let val = match numeric_literal_text(expr, data_type) {
+                    Some(text) => Value::Text(text),
+                    None => self.eval_row_expr(expr, row, col_meta)?,
+                };
                 self.eval_cast(val, data_type)
             }
             Expr::InList {
@@ -2322,6 +2328,25 @@ fn coerce_to_array(v: Value) -> Option<Vec<Value>> {
                 _ => None,
             }
         }
+        _ => None,
+    }
+}
+
+/// A numeric literal cast straight to numeric keeps its digits: evaluating the
+/// bare literal first would round it through f64 and lose everything past
+/// about 17 significant digits.
+fn numeric_literal_text(expr: &Expr, data_type: &ast::DataType) -> Option<String> {
+    if !matches!(
+        data_type,
+        ast::DataType::Numeric(_) | ast::DataType::Decimal(_) | ast::DataType::Dec(_)
+    ) {
+        return None;
+    }
+    match expr {
+        Expr::Value(v) => match &v.value {
+            ast::Value::Number(s, _) => Some(s.clone()),
+            _ => None,
+        },
         _ => None,
     }
 }

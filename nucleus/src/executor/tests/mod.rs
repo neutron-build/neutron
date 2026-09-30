@@ -120,3 +120,4 @@ mod test_txn_lazy_snapshot;
 mod test_upstream_teploy_2026_09_18; // rename-in-txn visibility + replacing upsert loss (2026-09-18 upstream reports) // R8: BEGIN/SAVEPOINT do not clone the whole database // Phase 4: JSONB @> containment, GIN indexes, subscript syntax
 
 mod test_x09_array_semantics;
+mod test_x11_review_regressions;

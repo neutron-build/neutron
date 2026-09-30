@@ -4498,6 +4498,19 @@ impl Executor {
                 let store = self.columnar_store.read();
                 let mut total = 0.0f64;
                 for batch in store.batches_all(&table) {
+                    match batch.column(&col_name) {
+                        Some(
+                            crate::columnar::ColumnData::Int32(_)
+                            | crate::columnar::ColumnData::Int64(_)
+                            | crate::columnar::ColumnData::Float64(_),
+                        ) => {}
+                        Some(_) => {
+                            return Err(ExecError::Unsupported(format!(
+                                "{fname} requires numeric stored values; cast COLUMNAR_INSERT inputs explicitly",
+                            )));
+                        }
+                        None => return Err(ExecError::ColumnNotFound(col_name.clone())),
+                    }
                     total += crate::columnar::aggregate_sum(&batch, &col_name);
                 }
                 Ok(Value::Float64(total))
@@ -4517,6 +4530,19 @@ impl Executor {
                 let mut total_sum = 0.0f64;
                 let mut total_count = 0usize;
                 for batch in store.batches_all(&table) {
+                    match batch.column(&col_name) {
+                        Some(
+                            crate::columnar::ColumnData::Int32(_)
+                            | crate::columnar::ColumnData::Int64(_)
+                            | crate::columnar::ColumnData::Float64(_),
+                        ) => {}
+                        Some(_) => {
+                            return Err(ExecError::Unsupported(format!(
+                                "{fname} requires numeric stored values; cast COLUMNAR_INSERT inputs explicitly",
+                            )));
+                        }
+                        None => return Err(ExecError::ColumnNotFound(col_name.clone())),
+                    }
                     if let Some(col) = batch.column(&col_name) {
                         let cnt = crate::columnar::count_non_null(col);
                         total_sum += crate::columnar::aggregate_sum(&batch, &col_name);
@@ -4543,6 +4569,19 @@ impl Executor {
                 let store = self.columnar_store.read();
                 let mut result: Option<f64> = None;
                 for batch in store.batches_all(&table) {
+                    match batch.column(&col_name) {
+                        Some(
+                            crate::columnar::ColumnData::Int32(_)
+                            | crate::columnar::ColumnData::Int64(_)
+                            | crate::columnar::ColumnData::Float64(_),
+                        ) => {}
+                        Some(_) => {
+                            return Err(ExecError::Unsupported(format!(
+                                "{fname} requires numeric stored values; cast COLUMNAR_INSERT inputs explicitly",
+                            )));
+                        }
+                        None => return Err(ExecError::ColumnNotFound(col_name.clone())),
+                    }
                     let v = match crate::columnar::aggregate_min(&batch, &col_name) {
                         crate::columnar::AggValue::Float64(v) => Some(v),
                         crate::columnar::AggValue::Int64(v) => Some(v as f64),
@@ -4572,6 +4611,19 @@ impl Executor {
                 let store = self.columnar_store.read();
                 let mut result: Option<f64> = None;
                 for batch in store.batches_all(&table) {
+                    match batch.column(&col_name) {
+                        Some(
+                            crate::columnar::ColumnData::Int32(_)
+                            | crate::columnar::ColumnData::Int64(_)
+                            | crate::columnar::ColumnData::Float64(_),
+                        ) => {}
+                        Some(_) => {
+                            return Err(ExecError::Unsupported(format!(
+                                "{fname} requires numeric stored values; cast COLUMNAR_INSERT inputs explicitly",
+                            )));
+                        }
+                        None => return Err(ExecError::ColumnNotFound(col_name.clone())),
+                    }
                     let v = match crate::columnar::aggregate_max(&batch, &col_name) {
                         crate::columnar::AggValue::Float64(v) => Some(v),
                         crate::columnar::AggValue::Int64(v) => Some(v as f64),

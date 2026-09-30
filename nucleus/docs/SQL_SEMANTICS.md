@@ -157,3 +157,25 @@ PRIMARY KEY enforcement is not supported.
 
 Foreign-key CASCADE, SET NULL and SET DEFAULT updates recompute stored generated
 columns and validate their resulting constraints before writing child rows.
+
+### Query behavior and explicit limits
+
+JSONB_AGG retains SQL NULL inputs as JSON null, returns SQL NULL for an empty
+input, and supports ordering, filtering and DISTINCT. JSON numbers retain
+number identity and decimal digits instead of becoming strings through an
+f64 conversion. JSONB text uses PostgreSQL spacing and key ordering; exponent
+expansion is bounded by the engine's decimal range. JSON_OBJECT_AGG is refused
+because JSONB storage cannot preserve JSON duplicate keys.
+
+Derived-table column alias lists rename columns positionally and reject lists
+longer than the source projection. Scalar expressions can wrap ROW_NUMBER,
+RANK and DENSE_RANK; empty wrapped results retain inferred types. Window
+functions combined with grouping, aggregates or HAVING are refused.
+UPDATE FROM and DELETE USING are refused before mutation. Row-value comparison
+remains unsupported.
+
+COLUMNAR_SUM, COLUMNAR_AVG, COLUMNAR_MIN and COLUMNAR_MAX require numeric stored
+values. Text or untyped inputs are refused rather than silently returning zero
+or NULL. Cast COLUMNAR_INSERT inputs explicitly; COLUMNAR_COUNT still reports
+the stored row count. COLUMNAR_INSERT is refused inside a SQL transaction
+because the store has no rollback mechanism.

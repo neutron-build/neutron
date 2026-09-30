@@ -123,7 +123,7 @@ impl fmt::Display for Value {
             }
             Value::Float64(n) => write!(f, "{}", pg_float_text(*n)),
             Value::Text(s) => write!(f, "{s}"),
-            Value::Jsonb(v) => write!(f, "{v}"),
+            Value::Jsonb(v) => write!(f, "{}", jsonb_text(v)),
             Value::Date(days) => {
                 let (y, m, d) = days_to_ymd(*days);
                 write!(f, "{y:04}-{m:02}-{d:02}")
@@ -325,6 +325,56 @@ pub fn ymd_to_days(year: i32, month: u32, day: u32) -> i32 {
 /// notation while the exponent is in [-4, 15), otherwise scientific with a
 /// signed, two-digit-minimum exponent ("1e+100", "1e-05") — matching
 /// PostgreSQL 12+ shortest-Ryu output.
+/// Render a jsonb value the way PostgreSQL's `jsonb_out` does: `, ` between
+/// elements, `": "` after object keys, and object keys ordered by length and
+/// then bytewise (the order jsonb stores them in), not alphabetically.
+pub fn jsonb_text(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    write_jsonb_text(v, &mut out);
+    out
+}
+
+fn write_jsonb_text(v: &serde_json::Value, out: &mut String) {
+    match v {
+        serde_json::Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_jsonb_text(item, out);
+            }
+            out.push(']');
+        }
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(b.0)));
+            out.push('{');
+            for (i, (k, item)) in entries.into_iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&serde_json::Value::String(k.clone()).to_string());
+                out.push_str(": ");
+                write_jsonb_text(item, out);
+            }
+            out.push('}');
+        }
+        serde_json::Value::Number(n) => {
+            let text = n.to_string();
+            if text.contains(['e', 'E'])
+                && let Ok(decimal) = rust_decimal::Decimal::from_scientific(&text)
+            {
+                out.push_str(&decimal.to_string());
+            } else {
+                out.push_str(&text);
+            }
+        }
+
+        other => out.push_str(&other.to_string()),
+    }
+}
+
 pub fn pg_float_text(n: f64) -> String {
     if n.is_nan() {
         return "NaN".into();

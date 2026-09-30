@@ -5419,7 +5419,7 @@ fn encode_value(
             buf.extend_from_slice(json.as_bytes());
             encoder.encode_field(&Some(buf.as_slice()))
         }
-        Value::Jsonb(v) => encoder.encode_field(&Some(v.to_string().as_str())),
+        Value::Jsonb(v) => encoder.encode_field(&Some(crate::types::jsonb_text(v).as_str())),
         // In TEXT format, temporal values render via Nucleus's Display, which
         // matches PostgreSQL's text form — most importantly it OMITS a
         // `.000000` fractional part when microseconds are zero (chrono's

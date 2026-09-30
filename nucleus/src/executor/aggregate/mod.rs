@@ -19,8 +19,8 @@ use crate::simd;
 use crate::types::{DataType, Row, Value};
 
 use super::helpers::{
-    compare_values, compute_window_frame_bounds, contains_aggregate, infer_expr_type,
-    value_to_ast_expr, value_to_f64, value_to_i64, value_type,
+    compare_values, compute_window_frame_bounds, contains_aggregate, contains_window_function,
+    infer_expr_type, value_to_ast_expr, value_to_f64, value_to_i64, value_type,
 };
 use super::types::ColMeta;
 use super::{ExecError, ExecResult, Executor};
@@ -108,6 +108,9 @@ pub(super) fn validate_grouped_projection(
                         | "STRING_AGG"
                         | "ARRAY_AGG"
                         | "JSON_AGG"
+                        | "JSONB_AGG"
+                        | "JSON_OBJECT_AGG"
+                        | "JSONB_OBJECT_AGG"
                         | "BOOL_AND"
                         | "BOOL_OR"
                         | "EVERY"
@@ -774,6 +777,9 @@ impl Executor {
                 | "STRING_AGG"
                 | "ARRAY_AGG"
                 | "JSON_AGG"
+                | "JSONB_AGG"
+                | "JSON_OBJECT_AGG"
+                | "JSONB_OBJECT_AGG"
                 | "BOOL_AND"
                 | "BOOL_OR"
                 | "EVERY"
@@ -1470,28 +1476,52 @@ impl Executor {
                 let vals = collect_values(expr)?;
                 Ok(Value::Array(vals))
             }
-            "JSON_AGG" => {
-                // Collect all non-null values into a JSON array
+            "JSON_AGG" | "JSONB_AGG" => {
+                // Unlike the other aggregates, json_agg keeps NULL inputs as
+                // JSON null; a group with no input rows yields NULL.
                 let expr = arg_expr.ok_or_else(|| {
-                    ExecError::Unsupported("JSON_AGG requires an argument".into())
+                    ExecError::Unsupported("JSONB_AGG requires an argument".into())
                 })?;
-                let acc = collect_values(expr)?;
-                let arr: Vec<serde_json::Value> = acc
-                    .iter()
-                    .map(|v| match v {
-                        Value::Null => serde_json::Value::Null,
-                        Value::Bool(b) => serde_json::Value::Bool(*b),
-                        Value::Int32(n) => serde_json::Value::Number((*n).into()),
-                        Value::Int64(n) => serde_json::Value::Number((*n).into()),
-                        Value::Float64(f) => serde_json::Value::Number(
-                            serde_json::Number::from_f64(*f).unwrap_or(serde_json::Number::from(0)),
-                        ),
-                        Value::Text(s) => serde_json::Value::String(s.clone()),
-                        Value::Jsonb(v) => v.clone(),
-                        other => serde_json::Value::String(other.to_string()),
-                    })
-                    .collect();
+                if effective_indices.is_empty() {
+                    return Ok(Value::Null);
+                }
+                let mut arr = Vec::with_capacity(effective_indices.len());
+                let mut seen = HashSet::new();
+                for &idx in effective_indices {
+                    let v = self.eval_row_expr(expr, &all_rows[idx], col_meta)?;
+                    if is_distinct && !seen.insert(v.clone()) {
+                        continue;
+                    }
+                    arr.push(super::helpers::value_to_json(&v));
+                }
                 Ok(Value::Jsonb(serde_json::Value::Array(arr)))
+            }
+            "JSON_OBJECT_AGG" => Err(ExecError::Unsupported(
+                "JSON_OBJECT_AGG requires duplicate-key-preserving JSON storage".into(),
+            )),
+            "JSONB_OBJECT_AGG" => {
+                let (Some(key_expr), Some(val_expr)) = (arg_expr, arg_expr_2) else {
+                    return Err(ExecError::Unsupported(
+                        "JSONB_OBJECT_AGG requires a key and a value argument".into(),
+                    ));
+                };
+                if effective_indices.is_empty() {
+                    return Ok(Value::Null);
+                }
+                let mut map = serde_json::Map::new();
+                for &idx in effective_indices {
+                    let k = self.eval_row_expr(key_expr, &all_rows[idx], col_meta)?;
+                    let key = match k {
+                        Value::Null => {
+                            return Err(ExecError::Runtime("field name must not be null".into()));
+                        }
+                        Value::Text(s) => s,
+                        other => other.to_string(),
+                    };
+                    let v = self.eval_row_expr(val_expr, &all_rows[idx], col_meta)?;
+                    map.insert(key, super::helpers::value_to_json(&v));
+                }
+                Ok(Value::Jsonb(serde_json::Value::Object(map)))
             }
             "BOOL_AND" | "EVERY" => {
                 let expr = arg_expr.ok_or_else(|| {
@@ -1687,6 +1717,31 @@ impl Executor {
                 continue;
             }
 
+            // Window call nested inside a scalar wrapper (`row_number() over
+            // (...)::int`, `rank() over (...) + 1`): compute each window call
+            // over the whole row set, then evaluate the wrapper per row with
+            // the call replaced by its value for that row.
+            if contains_window_function(expr) {
+                let mut template = expr.clone();
+                let mut computed: Vec<Vec<Value>> = Vec::new();
+                self.extract_window_calls(&mut template, &rows, col_meta, &mut computed)?;
+                let mut column_vals = Vec::with_capacity(rows.len());
+                for (ri, row) in rows.iter().enumerate() {
+                    let mut per_row = template.clone();
+                    fill_window_placeholders(&mut per_row, &computed, ri);
+                    column_vals.push(self.eval_row_expr(&per_row, row, col_meta)?);
+                }
+                let dtype = column_vals
+                    .first()
+                    .map(value_type)
+                    .unwrap_or_else(|| infer_expr_type(expr, col_meta));
+                result_columns.push((col_name, dtype));
+                for (ri, val) in column_vals.into_iter().enumerate() {
+                    result_rows[ri].push(val);
+                }
+                continue;
+            }
+
             // Regular expression — eval per row
             let dtype = if let Some(first_row) = rows.first() {
                 let val = self.eval_row_expr(expr, first_row, col_meta)?;
@@ -1705,6 +1760,34 @@ impl Executor {
             columns: result_columns,
             rows: result_rows,
         })
+    }
+
+    /// Replace every window call in `expr` with a `$wN` placeholder and push
+    /// its per-row values to `computed[N]`.
+    fn extract_window_calls(
+        &self,
+        expr: &mut Expr,
+        rows: &[Row],
+        col_meta: &[ColMeta],
+        computed: &mut Vec<Vec<Value>>,
+    ) -> Result<(), ExecError> {
+        if let Expr::Function(func) = expr
+            && func.over.is_some()
+        {
+            let vals = self.eval_window_function(func, rows, col_meta)?;
+            *expr = Expr::value(ast::Value::Placeholder(format!("$w{}", computed.len())));
+            computed.push(vals);
+            return Ok(());
+        }
+        let mut err = None;
+        crate::executor::helpers::for_each_scalar_child_mut(expr, &mut |child| {
+            if err.is_none()
+                && let Err(e) = self.extract_window_calls(child, rows, col_meta, computed)
+            {
+                err = Some(e);
+            }
+        });
+        err.map_or(Ok(()), Err)
     }
 
     fn eval_window_function(
@@ -2151,4 +2234,20 @@ impl Executor {
             _ => None,
         }
     }
+}
+
+/// Substitute the `$wN` placeholders left by `extract_window_calls` with the
+/// value of window call N for row `ri`.
+fn fill_window_placeholders(expr: &mut Expr, computed: &[Vec<Value>], ri: usize) {
+    if let Expr::Value(v) = expr
+        && let ast::Value::Placeholder(p) = &v.value
+        && let Some(n) = p.strip_prefix("$w").and_then(|n| n.parse::<usize>().ok())
+        && let Some(val) = computed.get(n).and_then(|col| col.get(ri))
+    {
+        *expr = crate::executor::helpers::value_to_ast_expr(val);
+        return;
+    }
+    crate::executor::helpers::for_each_scalar_child_mut(expr, &mut |child| {
+        fill_window_placeholders(child, computed, ri);
+    });
 }
