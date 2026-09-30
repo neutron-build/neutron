@@ -7822,3 +7822,51 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod failed_append_regressions {
+    use super::*;
+
+    #[test]
+    fn failed_columnar_append_leaves_rows_and_dictionary_unchanged() {
+        for variant in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = ColumnarStore::open(dir.path()).unwrap();
+            store.create_table("events");
+            store.wal_group_sync().unwrap();
+            let before = std::fs::read(dir.path().join("columnar.wal")).unwrap();
+            store.wal.as_ref().unwrap().fail_next_append();
+            let batch = ColumnBatch::new(vec![(
+                "category".into(),
+                ColumnData::Text(vec![Some("same".into()); DICT_AUTO_MIN_ROWS]),
+            )]);
+            match variant {
+                0 => {
+                    let _ = store.append("events", batch);
+                }
+                1 => {
+                    let _ = store.append_with_dict("events", batch);
+                }
+                _ => {
+                    let _ = store.append_with_dict_in_xact("events", batch, 42);
+                }
+            }
+            assert_eq!(
+                store.row_count("events"),
+                0,
+                "failed variant {variant} mutated rows"
+            );
+            assert!(store.get_dict_columns("events").is_none());
+            assert_eq!(
+                std::fs::read(dir.path().join("columnar.wal")).unwrap(),
+                before
+            );
+            assert!(!store.wal_is_dirty());
+            drop(store);
+            assert_eq!(
+                ColumnarStore::open(dir.path()).unwrap().row_count("events"),
+                0
+            );
+        }
+    }
+}

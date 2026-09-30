@@ -134,6 +134,8 @@ pub struct ColumnarWal {
     /// Test-only one-shot checkpoint-reopen fault; see `checkpoint_named`.
     #[cfg(test)]
     fail_reopen_once: AtomicBool,
+    #[cfg(test)]
+    fail_append_once: AtomicBool,
 }
 
 impl ColumnarWal {
@@ -183,6 +185,8 @@ impl ColumnarWal {
                 max_xact_id,
                 #[cfg(test)]
                 fail_reopen_once: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_append_once: AtomicBool::new(false),
             },
             state,
         ))
@@ -373,6 +377,12 @@ impl ColumnarWal {
         Ok(())
     }
 
+    /// Per-instance fault, before the first WAL byte, for mutation atomicity tests.
+    #[cfg(test)]
+    pub(crate) fn fail_next_append(&self) {
+        self.fail_append_once.store(true, Ordering::Release);
+    }
+
     // ─── Internal helpers ─────────────────────────────────────────────────────
 
     fn append(
@@ -384,6 +394,10 @@ impl ColumnarWal {
         payload: &[u8],
     ) -> io::Result<()> {
         let mut w = self.writer.lock();
+        #[cfg(test)]
+        if self.fail_append_once.swap(false, Ordering::AcqRel) {
+            return Err(io::Error::other("injected columnar WAL append failure"));
+        }
         self.reattach_if_stranded(&mut w)?;
         write_entry(&mut *w, plain, xact_tagged, xact, name, payload)?;
         w.flush()?;
