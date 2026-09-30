@@ -490,6 +490,14 @@ reproducers are in `conformance/live/orm/ORM_CONFORMANCE.md`.
   vector, FTS and zone-map scan/publication paths remain independently
   unverified; a selected passing soak does not certify universal coherence.
 
+Advertised family contracts are scoped in
+`conformance/live/orm/ORM_CONFORMANCE.md`: relational SQL, KV, documents,
+graph, time series, columnar, geo, blob, streams and Datalog retain their
+measured limits. CDC/Pub/Sub expose bounded notification or model inspection,
+not commit confirmation, replay or exactly-once delivery. pgvector columns
+and FTS function probes remain unsupported; native vector/FTS APIs were not
+verified by these model legs and are not advertised as verified.
+
 Out-of-repo note: Lullmail's vendored copies of the send.go / bearer-transport
 blobs (flagged in neutron-12/13/16 as affected consumers) are NOT fixed here —
 that is a separate repo and needs its own sync.

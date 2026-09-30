@@ -542,6 +542,41 @@ reached.
   they must not advertise universal datatype identity, higher isolation on
   buffered storage, or unverified derived-index concurrency.
 
+## Advertised model families
+
+The fresh X01–X05 legs use the recorded engine tree. A passing leg can
+confirm an explicit refusal or a measured divergence; it does not make that
+surface PostgreSQL-compatible. Advertise these bounded contracts:
+
+| Family | Measured contract | Retained boundary |
+|---|---|---|
+| Relational SQL / ORM | The per-driver supported probes above, including relational reads, DML rollback and savepoints | Nontransactional DDL, catalog/value differences, and READ COMMITTED only on buffered storage |
+| Documents / graph | Scoped document CRUD, adjacency/property reads and client-bounded graph traversal; tested rollback and restart recovery | Collection names are not permissions; graph tenant isolation, parameters, multi-label nodes, cross-session isolation and client atomic SQL+specialty writes remain unsupported |
+| Time series | Scoped count/range/average, microsecond timestamp keys, and tested restart recovery | These queries do not certify every retention or transaction combination |
+| Columnar model / engine | Exact typed aggregates and tested restart recovery; model transactional insert refusal; SQL-engine table rollback | Cast numeric model inputs; untyped aggregates refuse, and model writes have no SQL rollback boundary |
+| KV / blob / geo | The X04 round-trip, TTL, byte-range, scoping and geometry-oracle contracts; owned process-kill recovery | Model guards and table policies have different boundaries; process recovery is not power-loss certification |
+| Streams / Datalog | Tested stream ordering, full-ID resume, group/cursor/ack restart and rollback; Datalog recursion and facts/rules restart | Bare millisecond stream cursors skip same-millisecond siblings; this is not universal Redis or Datalog parity |
+| CDC / LISTEN | Measured notification inspection and client polling behavior | CDC is not commit confirmation: rolled-back INSERT is visible, and the leg observes no UPDATE/DELETE events. LISTEN delivery can wait for statement traffic; rolled-back notifications can be delivered |
+
+Pub/Sub is limited to SQL publish/channel inspection in this evidence; SQL
+subscription delivery, replay and exactly-once behavior are not advertised.
+CDC likewise requires reconciliation with source rows, without replay or
+exactly-once guarantees.
+
+The pgvector column/operator and FTS function capability probes remain
+unsupported on this engine and reject client queries before sending SQL.
+Native vector and native FTS model APIs were not verified by these legs and
+remain unadvertised as verified. Accepted CREATE EXTENSION or
+individual scalar calls do not establish those contracts. Extension detection
+is unknown when pg_available_extensions is unavailable. SQL Pub/Sub has no
+subscription surface in the measured leg, so wire delivery is not advertised.
+
+Cancellation claims are equally bounded: X04 verifies preflight refusal and
+honest failure when an abort fires before the cancel channel is armed. In that
+latter case the statement actually completes and its key exists. This is not
+successful cancellation of an arbitrary running statement. The SQL sleep and
+cancel-function probes above remain unavailable.
+
 ## Documents and graph relationships
 
 [`x02-nucleus-leg.mjs`](x02-nucleus-leg.mjs) runs `@neutron-build/nucleus`'s
