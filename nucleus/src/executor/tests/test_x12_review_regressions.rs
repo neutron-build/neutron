@@ -214,3 +214,55 @@ async fn x12_unsupported_index_ordering_is_refused_before_catalog_mutation() {
         &Value::Text("CREATE INDEX x12_ascending ON public.x12_ordering USING btree (id)".into())
     );
 }
+
+#[tokio::test]
+async fn x12_unnest_ordinality_has_bigint_position_and_preserves_nulls() {
+    let ex = test_executor();
+    let result = exec(&ex, "SELECT value, position FROM UNNEST(ARRAY[4,NULL,9]) WITH ORDINALITY AS k(value,position) ORDER BY position").await;
+    assert_eq!(
+        rows(&result[0]),
+        &vec![
+            vec![Value::Int32(4), Value::Int64(1)],
+            vec![Value::Null, Value::Int64(2)],
+            vec![Value::Int32(9), Value::Int64(3)]
+        ]
+    );
+    let result = exec(
+        &ex,
+        "SELECT * FROM UNNEST(ARRAY[1,2], ARRAY[7]) WITH ORDINALITY AS k(a,b,n) ORDER BY n",
+    )
+    .await;
+    assert_eq!(
+        rows(&result[0]),
+        &vec![
+            vec![Value::Int32(1), Value::Int32(7), Value::Int64(1)],
+            vec![Value::Int32(2), Value::Null, Value::Int64(2)]
+        ]
+    );
+}
+
+#[tokio::test]
+async fn x12_catalog_ordinality_and_studio_lateral_queries_run() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE x12_ordinal (id INT PRIMARY KEY, amount INT)",
+    )
+    .await;
+    let result = exec(&ex, "SELECT c.conname, (SELECT array_agg(k.attnum ORDER BY k.ord) FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum,ord)) FROM pg_constraint c WHERE c.conrelid='x12_ordinal'::regclass").await;
+    assert_eq!(
+        rows(&result[0]),
+        &vec![vec![
+            Value::Text("x12_ordinal_pkey".into()),
+            Value::Array(vec![Value::Int32(1)])
+        ]]
+    );
+    let result = exec(&ex, "SELECT a.attname, COALESCE((SELECT u.ord FROM pg_catalog.pg_index i CROSS JOIN LATERAL pg_catalog.unnest(i.indkey) WITH ORDINALITY AS u(k,ord) WHERE i.indrelid=c.oid AND i.indisprimary AND i.indisvalid AND u.k=a.attnum),0) AS key_pos FROM pg_catalog.pg_class c JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 WHERE c.relname='x12_ordinal' ORDER BY a.attnum").await;
+    assert_eq!(
+        rows(&result[0]),
+        &vec![
+            vec![Value::Text("id".into()), Value::Int64(1)],
+            vec![Value::Text("amount".into()), Value::Int32(0)]
+        ]
+    );
+}
