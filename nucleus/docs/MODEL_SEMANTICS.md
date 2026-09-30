@@ -878,6 +878,15 @@ Columnar SQL-engine tables have a separate transaction boundary. **[code]**
 table into `Vec<Row>` under the write lock — an O(dataset) allocation and a full
 stall every checkpoint.
 
+**Checkpoint publication boundary (both columnar surfaces).**
+`ColumnarWal::checkpoint_named` delegates to
+`src/storage/wal_util.rs::atomic_replace_wal`, which fsyncs a complete temporary
+file and renames it over the WAL without syncing the parent directory. This is
+a process-crash replacement mechanism, not established durable namespace
+publication under power loss. Row fsync and SIGKILL recovery checks do not prove
+that stronger guarantee. The per-table engine fences a replacement that was
+published but could not reopen its writer until recovery resolves the outcome.
+
 ### Columnar storage engine — `CREATE TABLE … WITH (engine='columnar')`
 
 File: `<data_dir>/columnar_engines/<table>_<crc32c>/columnar.wal`
