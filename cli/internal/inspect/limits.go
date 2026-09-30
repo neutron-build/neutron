@@ -444,7 +444,7 @@ func nucleusLimits() []ModelLimits {
 			Warnings: []string{
 				"DDL runs outside the transaction: a failed migration leaves earlier statements applied",
 				"higher isolation is unavailable on the default buffered disk engine",
-				"no advisory locks, statement_timeout or query cancellation",
+				"SQL advisory locks and pg_cancel_backend are unavailable; the pg_sleep-based statement_timeout contract is unsupported",
 			},
 			Evidence: []Evidence{
 				report("txn.savepoint_rollback", "supported", fAvail, fTx),
