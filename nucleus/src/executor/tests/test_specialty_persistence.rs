@@ -1091,3 +1091,32 @@ fn fts_fallible_recovery_keeps_checkpoint_tail_and_future_writes() {
     );
     assert_eq!(std::fs::read(checkpoint).unwrap(), b"broken-base");
 }
+
+#[test]
+fn fts_unopenable_wal_refuses_persistent_executor_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let obstructed_wal = dir.path().join("fts").join("fts.wal");
+    std::fs::create_dir_all(&obstructed_wal).unwrap();
+    std::fs::write(
+        obstructed_wal.join("retained-marker"),
+        b"preserve WAL obstruction",
+    )
+    .unwrap();
+    let reopened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Executor::new_with_persistence(
+            Arc::new(Catalog::new()),
+            Arc::new(crate::storage::MemoryEngine::new()),
+            Some(dir.path().join("catalog.json")),
+            Some(dir.path()),
+        )
+    }));
+    assert!(
+        reopened.is_err(),
+        "declared durable FTS recovery returned a volatile index after WAL open failure"
+    );
+    assert!(obstructed_wal.is_dir());
+    assert_eq!(
+        std::fs::read(obstructed_wal.join("retained-marker")).unwrap(),
+        b"preserve WAL obstruction"
+    );
+}
