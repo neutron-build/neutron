@@ -9730,7 +9730,7 @@ impl Executor {
                         flatten(item, &mut values);
                     }
                 }
-                Value::Null => {}
+                Value::Null if outer_row.is_none() || matches!(dtype, DataType::Array(_)) => {}
                 _ => {
                     return Err(ExecError::Unsupported(
                         "UNNEST requires array arguments".into(),

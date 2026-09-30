@@ -684,16 +684,6 @@ fn int_array(v: impl IntoIterator<Item = i32>) -> Value {
     Value::Array(v.into_iter().map(Value::Int32).collect())
 }
 
-/// A space-separated `int2vector`/`oidvector` spelling.
-fn vector_text(v: impl IntoIterator<Item = i32>) -> Value {
-    Value::Text(
-        v.into_iter()
-            .map(|n| n.to_string())
-            .collect::<Vec<_>>()
-            .join(" "),
-    )
-}
-
 fn fk_code(a: &FkAction) -> &'static str {
     match a {
         FkAction::NoAction => "a",
@@ -1225,6 +1215,9 @@ fn expr_mentions(expr: &str, column: &str) -> bool {
 }
 
 fn pg_index_rel(label: &str, snap: &PgSnapshot) -> (Vec<ColMeta>, Vec<Row>) {
+    // PostgreSQL's int2vector/oidvector fields are array-like to UNNEST and
+    // casts. The engine exposes typed int4 arrays here until those dedicated
+    // vector OIDs exist, keeping CLI and Studio semantics truthful.
     let cols = meta(
         label,
         &[
@@ -1234,15 +1227,15 @@ fn pg_index_rel(label: &str, snap: &PgSnapshot) -> (Vec<ColMeta>, Vec<Row>) {
             ("indnkeyatts", DataType::Int32),
             ("indisunique", DataType::Bool),
             ("indisprimary", DataType::Bool),
-            ("indkey", DataType::Text),
+            ("indkey", DataType::Array(Box::new(DataType::Int32))),
             ("indisclustered", DataType::Bool),
             ("indisvalid", DataType::Bool),
             ("indisready", DataType::Bool),
             ("indislive", DataType::Bool),
             ("indisreplident", DataType::Bool),
-            ("indoption", DataType::Text),
-            ("indcollation", DataType::Text),
-            ("indclass", DataType::Text),
+            ("indoption", DataType::Array(Box::new(DataType::Int32))),
+            ("indcollation", DataType::Array(Box::new(DataType::Int32))),
+            ("indclass", DataType::Array(Box::new(DataType::Int32))),
             ("indexprs", DataType::Text),
             ("indpred", DataType::Text),
             ("indnullsnotdistinct", DataType::Bool),
@@ -1272,15 +1265,15 @@ fn pg_index_rel(label: &str, snap: &PgSnapshot) -> (Vec<ColMeta>, Vec<Row>) {
             Value::Int32(ix.columns.len() as i32),
             Value::Bool(ix.unique),
             Value::Bool(ix.primary),
-            vector_text(keys),
+            int_array(keys),
             Value::Bool(false),
             Value::Bool(true),
             Value::Bool(true),
             Value::Bool(true),
             Value::Bool(false),
-            vector_text(ix.columns.iter().map(|_| 0)),
-            vector_text(ix.columns.iter().map(|_| 0)),
-            vector_text(classes),
+            int_array(ix.columns.iter().map(|_| 0)),
+            int_array(ix.columns.iter().map(|_| 0)),
+            int_array(classes),
             if exprs.is_empty() {
                 Value::Null
             } else {

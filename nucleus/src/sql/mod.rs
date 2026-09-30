@@ -350,8 +350,13 @@ pub fn parse(sql: &str) -> Result<Vec<ast::Statement>, ParseError> {
     // which itself is below the default-50 recursion guard.
     let dialect = PostgreSqlDialect {};
     let normalized = normalize_unnest_table_syntax(&dialect, sql);
-    let parser_sql = normalized.as_deref().unwrap_or(sql);
-    let stmts = match Parser::parse_sql(&dialect, parser_sql) {
+    let parsed = match normalized {
+        Some(tokens) => Parser::new(&dialect)
+            .with_tokens_with_locations(tokens)
+            .parse_statements(),
+        None => Parser::parse_sql(&dialect, sql),
+    };
+    let stmts = match parsed {
         Ok(stmts) => stmts,
         // sqlparser has no grammar for `OVERRIDING {SYSTEM | USER} VALUE` or
         // `SET CONSTRAINTS`; rewrite them into parseable statements that carry
@@ -377,25 +382,28 @@ pub fn parse(sql: &str) -> Result<Vec<ast::Statement>, ParseError> {
 /// PostgreSQL UNNEST is implicitly lateral, so its UNNEST table-factor branch
 /// represents the same semantics. Normalize only unquoted builtin tokens;
 /// quoted names, strings, comments and unrelated functions remain untouched.
-fn normalize_unnest_table_syntax(dialect: &PostgreSqlDialect, sql: &str) -> Option<String> {
+fn normalize_unnest_table_syntax(
+    dialect: &PostgreSqlDialect,
+    sql: &str,
+) -> Option<Vec<sqlparser::tokenizer::TokenWithSpan>> {
     use sqlparser::tokenizer::{Token, Tokenizer};
-    let tokens = Tokenizer::new(dialect, sql).tokenize().ok()?;
+    let tokens = Tokenizer::new(dialect, sql).tokenize_with_location().ok()?;
     let significant: Vec<usize> = (0..tokens.len())
-        .filter(|&i| !matches!(tokens[i], Token::Whitespace(_)))
+        .filter(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
         .collect();
-    let word = |i: usize, value: &str| matches!(&tokens[i], Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(value));
+    let word = |i: usize, value: &str| matches!(&tokens[i].token, Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(value));
     let mut remove = std::collections::HashSet::new();
     for (pos, &index) in significant.iter().enumerate() {
         if !word(index, "unnest")
             || !significant
                 .get(pos + 1)
-                .is_some_and(|&i| matches!(tokens[i], Token::LParen))
+                .is_some_and(|&i| matches!(tokens[i].token, Token::LParen))
         {
             continue;
         }
         let mut start = pos;
         if pos >= 2
-            && matches!(tokens[significant[pos - 1]], Token::Period)
+            && matches!(tokens[significant[pos - 1]].token, Token::Period)
             && word(significant[pos - 2], "pg_catalog")
         {
             remove.insert(significant[pos - 2]);
@@ -411,10 +419,10 @@ fn normalize_unnest_table_syntax(dialect: &PostgreSqlDialect, sql: &str) -> Opti
     }
     Some(
         tokens
-            .iter()
+            .into_iter()
             .enumerate()
             .filter(|(i, _)| !remove.contains(i))
-            .map(|(_, t)| t.to_string())
+            .map(|(_, t)| t)
             .collect(),
     )
 }
