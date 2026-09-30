@@ -724,7 +724,8 @@ async fn embedded_stress(stats: StatsMap, concurrency: usize, duration: Duration
                             ]);
                             db.columnar()
                                 .write()
-                                .append(&format!("emb_col_{}", task_id), batch);
+                                .append(&format!("emb_col_{}", task_id), batch)
+                                .map_err(|e| e.to_string())?;
                             Ok(())
                         }
                         Model::Datalog => {

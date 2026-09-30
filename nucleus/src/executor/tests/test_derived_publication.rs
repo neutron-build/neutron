@@ -325,7 +325,7 @@ async fn conditional_delete_commit_rejects_same_key_revision_replacement() {
                 storage.begin_txn().await.unwrap();
                 assert_eq!(
                     storage
-                        .delete_if_unchanged("sessions", &[target.clone()])
+                        .delete_if_unchanged("sessions", std::slice::from_ref(&target))
                         .await
                         .unwrap(),
                     1

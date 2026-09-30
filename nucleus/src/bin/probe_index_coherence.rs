@@ -493,7 +493,7 @@ fn main_impl() {
     std::panic::set_hook(Box::new(|_| {}));
 
     let args: Vec<String> = std::env::args().collect();
-    let mut seed: u64 = 0xC0FFEE_1234_5678;
+    let mut seed: u64 = 0x00C0_FFEE_1234_5678;
     let mut iterations: usize = 300;
     let mut ops: usize = 40;
     let mut max_report: u64 = 15;
