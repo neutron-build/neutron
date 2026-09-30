@@ -266,3 +266,48 @@ async fn x12_catalog_ordinality_and_studio_lateral_queries_run() {
         ]
     );
 }
+
+#[tokio::test]
+async fn x12_ordinal_parser_preserves_escaped_literals_unicode_and_quotes() {
+    let ex = test_executor();
+    let result = exec(&ex, "SELECT 'it''s café', E'line\\n', 'pg_catalog.unnest', \"u界\".\"v\" FROM LATERAL /* keep 'quotes' */ pg_catalog.unnest(ARRAY[1]) AS \"u界\"(\"v\")").await;
+    assert_eq!(
+        rows(&result[0]),
+        &vec![vec![
+            Value::Text("it's café".into()),
+            Value::Text("line\n".into()),
+            Value::Text("pg_catalog.unnest".into()),
+            Value::Int32(1)
+        ]]
+    );
+}
+
+#[tokio::test]
+async fn x12_unnest_null_array_and_left_padding_are_distinct() {
+    let ex = test_executor();
+    assert!(
+        ex.execute("SELECT * FROM UNNEST(NULL::integer)")
+            .await
+            .is_err()
+    );
+    let empty = exec(
+        &ex,
+        "SELECT * FROM UNNEST(NULL::integer[]) WITH ORDINALITY AS u(v,n)",
+    )
+    .await;
+    assert!(rows(&empty[0]).is_empty());
+    let real_null = exec(
+        &ex,
+        "SELECT * FROM UNNEST(ARRAY[NULL]::integer[]) WITH ORDINALITY AS u(v,n)",
+    )
+    .await;
+    assert_eq!(
+        rows(&real_null[0]),
+        &vec![vec![Value::Null, Value::Int64(1)]]
+    );
+    let padded = exec(&ex, "SELECT t.id,u.v,u.n FROM (SELECT 7 AS id) AS t LEFT JOIN UNNEST(NULL::integer[]) WITH ORDINALITY AS u(v,n) ON true").await;
+    assert_eq!(
+        rows(&padded[0]),
+        &vec![vec![Value::Int32(7), Value::Null, Value::Null]]
+    );
+}
