@@ -136,6 +136,8 @@ pub struct ColumnarWal {
     fail_reopen_once: AtomicBool,
     #[cfg(test)]
     fail_append_once: AtomicBool,
+    #[cfg(test)]
+    fail_checkpoint_once: AtomicBool,
 }
 
 impl ColumnarWal {
@@ -187,6 +189,8 @@ impl ColumnarWal {
                 fail_reopen_once: AtomicBool::new(false),
                 #[cfg(test)]
                 fail_append_once: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_checkpoint_once: AtomicBool::new(false),
             },
             state,
         ))
@@ -307,6 +311,10 @@ impl ColumnarWal {
 
     /// `checkpoint`, preserving each table's column names.
     pub fn checkpoint_named(&self, tables: &[(&str, Vec<String>, &[Row])]) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_checkpoint_once.swap(false, Ordering::AcqRel) {
+            return Err(io::Error::other("injected columnar WAL checkpoint failure"));
+        }
         // Build snapshot payload.
         let mut payload = Vec::new();
         payload.extend_from_slice(&(tables.len() as u32).to_le_bytes());
@@ -381,6 +389,11 @@ impl ColumnarWal {
     #[cfg(test)]
     pub(crate) fn fail_next_append(&self) {
         self.fail_append_once.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_checkpoint(&self) {
+        self.fail_checkpoint_once.store(true, Ordering::Release);
     }
 
     // ─── Internal helpers ─────────────────────────────────────────────────────

@@ -2479,3 +2479,72 @@ mod intra_part_narrowing_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod failed_mutation_regressions {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_columnar_engine_mutations_preserve_live_and_reopened_rows() {
+        for operation in ["create", "drop", "batch", "update", "delete"] {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = ColumnarStorageEngine::open(dir.path()).unwrap();
+            engine.create_table("t").await.unwrap();
+            let original = vec![Value::Int64(1), Value::Text("original".into())];
+            engine.insert("t", original.clone()).await.unwrap();
+            engine.flush_all_dirty().await.unwrap();
+            let before = std::fs::read(dir.path().join("columnar.wal")).unwrap();
+            let wal = engine.wal.as_ref().unwrap();
+            if matches!(operation, "update" | "delete") {
+                wal.fail_next_checkpoint();
+            } else {
+                wal.fail_next_append();
+            }
+            let outcome = match operation {
+                "create" => engine.create_table("new_table").await,
+                "drop" => engine.drop_table("t").await,
+                "batch" => {
+                    engine
+                        .insert_batch("t", vec![vec![Value::Int64(2), Value::Text("new".into())]])
+                        .await
+                }
+                "update" => engine
+                    .update(
+                        "t",
+                        &[(0, vec![Value::Int64(1), Value::Text("changed".into())])],
+                    )
+                    .await
+                    .map(|_| ()),
+                _ => engine.delete("t", &[0]).await.map(|_| ()),
+            };
+            assert!(
+                matches!(outcome, Err(StorageError::Io(_))),
+                "{operation}: {outcome:?}"
+            );
+            assert_eq!(
+                engine.scan("t").await.unwrap(),
+                vec![original.clone()],
+                "failed {operation} changed live rows"
+            );
+            assert!(matches!(
+                engine.scan("new_table").await,
+                Err(StorageError::TableNotFound(_))
+            ));
+            assert_eq!(
+                std::fs::read(dir.path().join("columnar.wal")).unwrap(),
+                before
+            );
+            drop(engine);
+            let reopened = ColumnarStorageEngine::open(dir.path()).unwrap();
+            assert_eq!(
+                reopened.scan("t").await.unwrap(),
+                vec![original],
+                "{operation} reopen differs"
+            );
+            assert!(matches!(
+                reopened.scan("new_table").await,
+                Err(StorageError::TableNotFound(_))
+            ));
+        }
+    }
+}
