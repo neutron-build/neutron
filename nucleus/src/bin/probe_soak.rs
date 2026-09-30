@@ -7,7 +7,7 @@
 //!     oldest), so table size plateaus and any RSS growth is a leak, not data;
 //!   * no crashes / no unexpected error storm under concurrency;
 //!   * index coherence survives sustained churn (PK uniqueness, btree and
-//!     encrypted equality) — the same bug class the coherence oracle guards;
+//!     code-index equality) — the same bug class the coherence oracle guards;
 //!   * durability: after closing and reopening, committed rows survive and
 //!     stay coherent.
 //!
@@ -320,7 +320,8 @@ async fn create_schema(db: &HarnessDb) -> Result<(), String> {
         "CREATE TABLE soak (id BIGINT PRIMARY KEY, val INT, code TEXT, v VECTOR(4))",
         "CREATE INDEX soak_val ON soak (val)",
         "CREATE INDEX soak_v ON soak USING hnsw (v)",
-        "CREATE INDEX soak_code ON soak USING encrypted (code)",
+        "CREATE INDEX soak_code ON soak (code)",
+        "CREATE INDEX soak_v_ivf ON soak USING ivfflat (v)",
     ];
     for sql in stmts {
         db.execute(sql)
@@ -401,7 +402,7 @@ async fn coherence_failures(db: &HarnessDb) -> Vec<String> {
         _ => {}
     }
 
-    // Sample live rows: PK equality returns exactly one, encrypted code exactly one.
+    // Sample live rows: PK equality returns exactly one, code equality returns exactly one.
     let sample = db
         .query("SELECT id FROM soak LIMIT 40")
         .await
@@ -455,18 +456,13 @@ async fn coherence_failures(db: &HarnessDb) -> Vec<String> {
             Err(e) => fails.push(format!("pk id={rid} query failed: {e}")),
             _ => {}
         }
-        let enc = db
-            .query_one(&format!(
-                "SELECT ENCRYPTED_LOOKUP('soak_code', 'k{rid}') FROM soak LIMIT 1"
-            ))
-            .await;
-        if let Ok(Some(Value::Text(s))) = enc {
-            let n = s.split(',').filter(|p| !p.trim().is_empty()).count();
-            if n != 1 {
-                fails.push(format!(
-                    "encrypted lookup k{rid}: {n} postings (expected 1)"
-                ));
-            }
+        match db
+            .query(&format!("SELECT id FROM soak WHERE code = 'k{rid}'"))
+            .await
+        {
+            Ok(rows) if rows.len() == 1 && rows[0].first() == Some(&Value::Int64(rid)) => {}
+            Ok(rows) => fails.push(format!("code index k{rid}: {rows:?} (expected id {rid})")),
+            Err(error) => fails.push(format!("code index k{rid} query failed: {error}")),
         }
         if fails.len() > 10 {
             break;

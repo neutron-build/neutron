@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use super::super::Executor;
+use super::super::{ExecError, Executor};
 use super::{exec, rows, scalar};
 use crate::catalog::Catalog;
 use crate::storage::persistence::CatalogPersistence;
@@ -382,7 +382,9 @@ async fn test_legacy_encrypted_index_is_retired_without_losing_base_rows() {
             .await
             .into_iter()
             .find(|index| index.name == "legacy_secret")
-            .unwrap();
+            .unwrap()
+            .as_ref()
+            .clone();
         legacy
             .options
             .insert("encryption_mode".into(), "Deterministic".into());

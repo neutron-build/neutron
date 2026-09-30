@@ -30,9 +30,7 @@ use super::schema_types::{
     FunctionDef, FunctionKind, FunctionLanguage, SequenceDef, TriggerDef, TriggerEvent,
     TriggerTiming, ViewDef,
 };
-use super::types::{
-    ColMeta, EncryptedIndexEntry, FtsIndexEntry, GinIndexEntry, VectorIndexEntry, VectorIndexKind,
-};
+use super::types::{ColMeta, FtsIndexEntry, GinIndexEntry, VectorIndexEntry, VectorIndexKind};
 use super::{ExecError, ExecResult, Executor};
 
 /// RAII bracket for a wholesale table rewrite (ALTER column add/drop): tells
