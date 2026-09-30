@@ -185,18 +185,48 @@ fn corpus() -> Vec<(&'static str, Vec<DataType>, Row)> {
             ],
         ),
         (
+            // SQL write coercion makes every non-NULL leaf match the declared
+            // type; heterogeneous leaves are not a valid persisted Text[].
             "array",
             vec![DataType::Array(Box::new(DataType::Text)), DataType::Int32],
             vec![
                 Value::Array(vec![
                     Value::Text("a".into()),
-                    Value::Int32(2),
+                    Value::Text("2".into()),
                     Value::Null,
-                    Value::Bool(true),
-                    Value::Float64(0.25),
-                    Value::Int64(-5),
+                    Value::Text("true".into()),
+                    Value::Text("0.25".into()),
+                    Value::Text("-5".into()),
                 ]),
                 Value::Int32(77),
+            ],
+        ),
+        (
+            "array_typed",
+            vec![
+                DataType::Array(Box::new(DataType::Int32)),
+                DataType::Array(Box::new(DataType::Int64)),
+                DataType::Array(Box::new(DataType::Float64)),
+                DataType::Array(Box::new(DataType::Bool)),
+            ],
+            vec![
+                Value::Array(vec![Value::Int32(-7), Value::Null, Value::Int32(42)]),
+                Value::Array(vec![Value::Int64(i64::MIN + 3), Value::Null]),
+                Value::Array(vec![Value::Float64(1.5), Value::Null]),
+                Value::Array(vec![Value::Bool(true), Value::Null, Value::Bool(false)]),
+            ],
+        ),
+        (
+            "array_restored",
+            vec![
+                DataType::Array(Box::new(DataType::Date)),
+                DataType::Array(Box::new(DataType::TimestampTz)),
+                DataType::Array(Box::new(DataType::Bytea)),
+            ],
+            vec![
+                Value::Array(vec![Value::Date(9000), Value::Null]),
+                Value::Array(vec![Value::TimestampTz(-42), Value::Null]),
+                Value::Array(vec![Value::Bytea(vec![0, 255, 42]), Value::Null]),
             ],
         ),
         (
