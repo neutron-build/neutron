@@ -167,7 +167,7 @@ function resolveDependencyVersions(targetDir: string): {
 } {
   const workspaceRoot = findWorkspaceRoot(path.dirname(targetDir));
   if (!workspaceRoot) {
-    return { neutron: "^0.2.3", neutronCli: "^0.2.4" };
+    return { neutron: "^0.3.0", neutronCli: "^0.3.0" };
   }
   return { neutron: "workspace:*", neutronCli: "workspace:*" };
 }

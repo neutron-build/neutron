@@ -95,7 +95,7 @@ var goModTmpl = `module {{.Module}}
 go 1.26.0
 
 require (
-	github.com/neutron-build/neutron/go v0.1.0
+	github.com/neutron-build/neutron/go v0.3.0
 )
 `
 
