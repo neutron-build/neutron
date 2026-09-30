@@ -12042,6 +12042,9 @@ impl Executor {
         col_id: u32,
         predicate: &FilterPredicate,
     ) -> Vec<Row> {
+        if !self.derived_coherence.current("zone", table_name) {
+            return rows;
+        }
         let zm_table_id = table_name_to_id(table_name);
         let granules = self.zone_map_index.get_table_granules(zm_table_id);
         if granules.is_empty() {

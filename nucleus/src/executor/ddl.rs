@@ -2152,6 +2152,7 @@ impl Executor {
         &self,
         create_index: ast::CreateIndex,
     ) -> Result<ExecResult, ExecError> {
+        let derived_generation = self.derived_coherence.generation();
         let index_name = create_index
             .name
             .map(|n| n.to_string())
@@ -2708,6 +2709,17 @@ impl Executor {
             }
         }
 
+        if matches!(
+            index_type,
+            crate::catalog::IndexType::Hnsw | crate::catalog::IndexType::IvfFlat
+        ) {
+            self.derived_coherence
+                .publish(derived_generation, "position", &table_name, || {});
+        }
+        if matches!(index_type, crate::catalog::IndexType::Fts) {
+            self.derived_coherence
+                .publish(derived_generation, "fts", &table_name, || {});
+        }
         match self.catalog.create_index(index_def).await {
             Ok(()) => {
                 tracing::info!("Created index {index_name} on {table_name}");

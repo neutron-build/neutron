@@ -134,8 +134,8 @@ mod cross_model;
 mod ddl;
 mod deferred_fk;
 pub(crate) use deferred_fk::SET_CONSTRAINTS_SETTING;
-mod dml;
 mod derived_coherence;
+mod dml;
 pub(crate) mod enlistment;
 mod expr;
 mod helpers;
@@ -871,6 +871,7 @@ pub struct Executor {
     /// Tracks min/max per column per 8K-row granule. Expected speedup: 5-10x on selective queries.
     #[allow(dead_code)]
     zone_map_index: crate::storage::granule_stats::ZoneMapIndex,
+    derived_coherence: derived_coherence::DerivedCoherence,
     #[cfg(test)]
     derived_publish_hook: parking_lot::Mutex<Option<derived_coherence::PublishHook>>,
     /// Memory pressure flag: set by the watchdog when RSS exceeds the critical
@@ -1259,6 +1260,7 @@ impl Executor {
             plan_cache: parking_lot::RwLock::new(PlanCache::new(1024)),
             ast_cache: parking_lot::RwLock::new(AstCache::new(4096)),
             zone_map_index: crate::storage::granule_stats::ZoneMapIndex::new(),
+            derived_coherence: derived_coherence::DerivedCoherence::default(),
             #[cfg(test)]
             derived_publish_hook: parking_lot::Mutex::new(None),
             memory_critical: Arc::new(AtomicBool::new(false)),
@@ -2151,6 +2153,14 @@ impl Executor {
     /// HNSW and Graph indexes are handled by their own WAL-based recovery and do not
     /// need to be rebuilt here.
     pub async fn rebuild_specialty_indexes(&self) {
+        let writer = self.derived_coherence.begin_write();
+        derived_coherence::WRITER_GENERATION
+            .scope(writer.generation, self.rebuild_specialty_indexes_inner())
+            .await;
+    }
+
+    async fn rebuild_specialty_indexes_inner(&self) {
+        let generation = self.derived_coherence.generation();
         let all_indexes = self.catalog.get_all_indexes().await;
 
         // Snapshot the set of already-loaded HNSW vector indexes (don't overwrite them).
@@ -2374,6 +2384,26 @@ impl Executor {
         }
 
         self.rebuild_all_gin_indexes().await;
+        let vector_tables: Vec<_> = self
+            .vector_indexes
+            .read()
+            .values()
+            .map(|entry| entry.table_name.clone())
+            .collect();
+        let fts_tables: Vec<_> = self
+            .fts_column_indexes
+            .read()
+            .values()
+            .map(|entry| entry.table_name.clone())
+            .collect();
+        for table in vector_tables {
+            self.derived_coherence
+                .publish(generation, "position", &table, || {});
+        }
+        for table in fts_tables {
+            self.derived_coherence
+                .publish(generation, "fts", &table, || {});
+        }
     }
 
     /// Rebuild the live GIN indexes for one table from its current logical rows.
@@ -2524,6 +2554,7 @@ impl Executor {
             return;
         }
 
+        let generation = self.derived_coherence.generation();
         let Some(table_def) = self.catalog.get_table(table_name).await else {
             self.vector_indexes
                 .write()
@@ -2663,15 +2694,22 @@ impl Executor {
             }
         }
 
+        if !self
+            .derived_coherence
+            .publish(generation, "position", table_name, || {
+                {
+                    let mut live = self.vector_indexes.write();
+                    live.retain(|_, entry| entry.table_name != table_name);
+                    live.extend(vectors);
+                }
+                {
+                    let mut live = self.encrypted_indexes.write();
+                    live.retain(|_, entry| entry.table_name != table_name);
+                    live.extend(encrypted);
+                }
+            })
         {
-            let mut live = self.vector_indexes.write();
-            live.retain(|_, entry| entry.table_name != table_name);
-            live.extend(vectors);
-        }
-        {
-            let mut live = self.encrypted_indexes.write();
-            live.retain(|_, entry| entry.table_name != table_name);
-            live.extend(encrypted);
+            return;
         }
         self.save_vector_index_meta();
         if let Err(error) = self.checkpoint_vector_wal() {
@@ -4194,6 +4232,24 @@ impl Executor {
     /// and masking and produces the correct error or the masked result.
     // Only reachable from server-gated code, same as `table_is_fk_referenced`
     // above; without this the core-only clippy gate fails on dead_code.
+    #[cfg(feature = "server")]
+    fn table_has_specialty_relational_index(&self, table: &str) -> bool {
+        self.vector_indexes
+            .read()
+            .values()
+            .any(|entry| entry.table_name == table)
+            || self
+                .encrypted_indexes
+                .read()
+                .values()
+                .any(|entry| entry.table_name == table)
+            || self
+                .fts_column_indexes
+                .read()
+                .values()
+                .any(|entry| entry.table_name == table)
+    }
+
     #[cfg(feature = "server")]
     pub(super) fn fast_path_table_secured(&self, table: &str) -> bool {
         self.table_is_secured(table) || self.privileges_enforced_for_session()
@@ -6168,13 +6224,17 @@ impl Executor {
             return Some(Err(e));
         }
 
+        let _derived_writer = (!matches!(cmd, SqlFastPathCommand::PointSelect { .. }))
+            .then(|| self.derived_coherence.begin_write());
         match cmd {
             SqlFastPathCommand::PointSelect {
                 table,
                 where_col,
                 where_val,
             } => {
-                if self.fast_path_table_secured(table) {
+                if self.fast_path_table_secured(table)
+                    || self.table_has_specialty_relational_index(table)
+                {
                     return None;
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
@@ -6239,7 +6299,9 @@ impl Executor {
             }
 
             SqlFastPathCommand::SimpleInsert { table, values } => {
-                if self.fast_path_table_secured(table) {
+                if self.fast_path_table_secured(table)
+                    || self.table_has_specialty_relational_index(table)
+                {
                     return None;
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
@@ -6335,7 +6397,9 @@ impl Executor {
                 where_col,
                 where_val,
             } => {
-                if self.fast_path_table_secured(table) {
+                if self.fast_path_table_secured(table)
+                    || self.table_has_specialty_relational_index(table)
+                {
                     return None;
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
@@ -6438,7 +6502,9 @@ impl Executor {
                 where_col,
                 where_val,
             } => {
-                if self.fast_path_table_secured(table) {
+                if self.fast_path_table_secured(table)
+                    || self.table_has_specialty_relational_index(table)
+                {
                     return None;
                 }
                 // The fast path deletes without enforcing referential
@@ -7237,13 +7303,36 @@ impl Executor {
         {
             return Err(ExecError::Unsupported("schema changes with pending deferred foreign keys are not supported; complete or roll back the transaction first".into()));
         }
+        let outermost = derived_coherence::WRITER_GENERATION
+            .try_with(|_| ())
+            .is_err();
+        let mutates = admission::statement_mutates(&stmt)
+            || matches!(&stmt, Statement::Commit { .. } | Statement::Rollback { .. });
+        #[cfg(feature = "server")]
+        let mutates = mutates || admission::statement_carries_mutating_scalar_fn(&stmt);
+        let writer = (outermost && mutates).then(|| self.derived_coherence.begin_write());
+        let read_generation = self.derived_coherence.generation();
         session.statement_depth.fetch_add(1, Ordering::SeqCst);
         let mut guard = StatementDepthGuard {
             executor: self,
             session: session.clone(),
             completed: false,
         };
-        let result = self.execute_statement_inner(stmt).await;
+        let execution = derived_coherence::READ_GENERATION
+            .scope(read_generation, self.execute_statement_inner(stmt));
+        let result = if let Some(ref writer) = writer {
+            derived_coherence::WRITER_GENERATION
+                .scope(writer.generation, execution)
+                .await
+        } else {
+            execution.await
+        };
+
+        if result.is_ok()
+            && let Some(ref writer) = writer
+        {
+            self.derived_coherence.finish_success(writer.generation);
+        }
         guard.completed = true;
         drop(guard);
         if result.is_err() {
@@ -8217,6 +8306,7 @@ impl Executor {
         // column recorded on the index entry (recovery-safe: persisted in the
         // sidecar, independent of the live catalog's constraints) and located in
         // the scanned rows via col_meta. IvfFlat and no-PK indexes stay positional.
+        let coherence = self.derived_coherence.view();
         let vi = self.vector_indexes.read();
         let mut found: Option<(&VectorIndexEntry, Option<usize>)> = None;
         for entry in vi.values() {
@@ -8234,6 +8324,9 @@ impl Executor {
             }
         }
         let (entry, pk_col) = found?;
+        if !coherence.current("position", &entry.table_name) {
+            return None;
+        }
 
         // VEC-1: the metric argument must agree with the index's metric. An
         // absent args[2] means L2 — the same default scalar_fns
@@ -8838,6 +8931,7 @@ impl Executor {
         let Some(table_def) = self.catalog.get_table(table_name).await else {
             return;
         };
+        let generation = self.derived_coherence.generation();
         let rows = self
             .storage_for(table_name)
             .scan_for_maintenance(table_name)
@@ -8847,28 +8941,31 @@ impl Executor {
         #[cfg(test)]
         self.pause_derived_publish("fts", table_name);
 
-        let mut indexes = self.fts_column_indexes.write();
-        for entry in indexes.values_mut() {
-            if entry.table_name != table_name {
-                continue;
-            }
-            let (Some(col_idx), Some(pk_idx)) = (
-                table_def.column_index(&entry.column_name),
-                table_def.column_index(&entry.pk_column),
-            ) else {
-                continue;
-            };
-            let mut rebuilt = crate::fts::InvertedIndex::new();
-            for row in &rows {
-                let Some(doc_id) = Self::stable_row_id(row, pk_idx) else {
-                    continue;
-                };
-                if let Some(Value::Text(text)) = row.get(col_idx) {
-                    rebuilt.add_document(doc_id, text);
+        self.derived_coherence
+            .publish(generation, "fts", table_name, || {
+                let mut indexes = self.fts_column_indexes.write();
+                for entry in indexes.values_mut() {
+                    if entry.table_name != table_name {
+                        continue;
+                    }
+                    let (Some(col_idx), Some(pk_idx)) = (
+                        table_def.column_index(&entry.column_name),
+                        table_def.column_index(&entry.pk_column),
+                    ) else {
+                        continue;
+                    };
+                    let mut rebuilt = crate::fts::InvertedIndex::new();
+                    for row in &rows {
+                        let Some(doc_id) = Self::stable_row_id(row, pk_idx) else {
+                            continue;
+                        };
+                        if let Some(Value::Text(text)) = row.get(col_idx) {
+                            rebuilt.add_document(doc_id, text);
+                        }
+                    }
+                    entry.index = rebuilt;
                 }
-            }
-            entry.index = rebuilt;
-        }
+            });
     }
 
     /// Candidate row ids for `column @@ query`, from the table-attached FTS
@@ -8882,6 +8979,10 @@ impl Executor {
         column: &str,
         query: &str,
     ) -> Option<(String, std::collections::HashSet<u64>)> {
+        let coherence = self.derived_coherence.view();
+        if !coherence.current("fts", table_name) {
+            return None;
+        }
         let indexes = self.fts_column_indexes.read();
         let entry = indexes.values().find(|e| {
             e.table_name.eq_ignore_ascii_case(table_name)
@@ -8907,6 +9008,10 @@ impl Executor {
         column: &str,
         query: &str,
     ) -> Option<usize> {
+        let coherence = self.derived_coherence.view();
+        if !coherence.current("fts", table_name) {
+            return None;
+        }
         let indexes = self.fts_column_indexes.read();
         let entry = indexes.values().find(|e| {
             e.table_name.eq_ignore_ascii_case(table_name)
@@ -8927,6 +9032,7 @@ impl Executor {
         column: &str,
         query: &str,
     ) -> Option<crate::fts::Bm25Stats> {
+        let coherence = self.derived_coherence.view();
         let indexes = self.fts_column_indexes.read();
         let mut matches = indexes.values().filter(|e| {
             e.column_name.eq_ignore_ascii_case(column)
@@ -8935,6 +9041,9 @@ impl Executor {
         let entry = matches.next()?;
         // Ambiguous unqualified column: refuse rather than guess a corpus.
         if table.is_none() && matches.next().is_some() {
+            return None;
+        }
+        if !coherence.current("fts", &entry.table_name) {
             return None;
         }
         Some(entry.index.bm25_stats(query))
