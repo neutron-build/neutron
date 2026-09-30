@@ -1527,6 +1527,52 @@ impl Executor {
         Ok(())
     }
 
+    /// Check the final keys of a staged batch before any related table is
+    /// changed. Per-row snapshot checks cannot see another staged row's key.
+    fn check_staged_unique_constraints<'a>(
+        table_def: &TableDef,
+        rows: impl IntoIterator<Item = &'a Row>,
+    ) -> Result<(), ExecError> {
+        use crate::catalog::TableConstraint;
+        if crate::columnar::replacing_config(&table_def.name).is_some() {
+            return Ok(());
+        }
+        let rows: Vec<&Row> = rows.into_iter().collect();
+        for constraint in &table_def.constraints {
+            let columns = match constraint {
+                TableConstraint::PrimaryKey { columns, .. }
+                | TableConstraint::Unique { columns, .. } => columns,
+                _ => continue,
+            };
+            let indices: Vec<usize> = columns
+                .iter()
+                .filter_map(|c| table_def.column_index(c))
+                .collect();
+            if indices.len() != columns.len() {
+                return Err(ExecError::Runtime(
+                    "unique constraint references missing column".into(),
+                ));
+            }
+            let mut seen = HashSet::with_capacity(rows.len());
+            for row in &rows {
+                let key: Vec<Value> = indices
+                    .iter()
+                    .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                    .collect();
+                if key.iter().any(|v| matches!(v, Value::Null)) {
+                    continue;
+                }
+                if !seen.insert(key) {
+                    return Err(ExecError::ConstraintViolation(format!(
+                        "duplicate key value violates unique constraint on ({})",
+                        columns.join(", ")
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Validate the complete child-row constraint envelope before applying an
     /// implicit foreign-key action. Cascades are writes, so they must not bypass
     /// NOT NULL, CHECK, ENUM, UNIQUE, or unrelated foreign keys.
@@ -1620,6 +1666,85 @@ impl Executor {
                         let child_generated = self.generated_exprs(child_table_def)?;
                         let child_col_meta = self.table_col_meta(child_table_def);
                         let child_storage = self.storage_for_write(child_table).await;
+
+                        // Deterministic child actions can also collide across
+                        // different parent rows (for example abs(fk) UNIQUE).
+                        // Project all affected children together during the
+                        // read-only pass, including untouched rows, before the
+                        // apply pass changes the first child.
+                        if !apply
+                            && child_table_def.constraints.iter().any(|constraint| {
+                                matches!(
+                                    constraint,
+                                    TableConstraint::PrimaryKey { .. }
+                                        | TableConstraint::Unique { .. }
+                                )
+                            })
+                        {
+                            let action = if new_parent_rows.is_some() {
+                                on_update
+                            } else {
+                                on_delete
+                            };
+                            if matches!(action, FkAction::SetNull)
+                                || (new_parent_rows.is_some()
+                                    && matches!(action, FkAction::Cascade))
+                            {
+                                let mut final_children = child_storage.scan(child_table).await?;
+                                for row in &mut final_children {
+                                    let replacement = if let Some(pairs) = new_parent_rows {
+                                        pairs.iter().find_map(|(old, new)| {
+                                            let old_key: Vec<&Value> =
+                                                ref_col_indices.iter().map(|&i| &old[i]).collect();
+                                            let new_key: Vec<&Value> =
+                                                ref_col_indices.iter().map(|&i| &new[i]).collect();
+                                            (old_key != new_key
+                                                && !old_key
+                                                    .iter()
+                                                    .any(|v| matches!(v, Value::Null))
+                                                && child_col_indices
+                                                    .iter()
+                                                    .zip(&old_key)
+                                                    .all(|(&i, v)| row.get(i) == Some(*v)))
+                                            .then(|| {
+                                                new_key.into_iter().cloned().collect::<Vec<Value>>()
+                                            })
+                                        })
+                                    } else {
+                                        deleted_rows.iter().find_map(|old| {
+                                            let key: Vec<&Value> =
+                                                ref_col_indices.iter().map(|&i| &old[i]).collect();
+                                            (!key.iter().any(|v| matches!(v, Value::Null))
+                                                && child_col_indices
+                                                    .iter()
+                                                    .zip(&key)
+                                                    .all(|(&i, v)| row.get(i) == Some(*v)))
+                                            .then(|| vec![Value::Null; child_col_indices.len()])
+                                        })
+                                    };
+                                    if let Some(values) = replacement {
+                                        for (&index, value) in child_col_indices.iter().zip(values)
+                                        {
+                                            row[index] = if matches!(action, FkAction::SetNull) {
+                                                Value::Null
+                                            } else {
+                                                value
+                                            };
+                                        }
+                                        self.apply_generated(
+                                            &child_generated,
+                                            child_table_def,
+                                            &child_col_meta,
+                                            row,
+                                        )?;
+                                    }
+                                }
+                                Self::check_staged_unique_constraints(
+                                    child_table_def,
+                                    &final_children,
+                                )?;
+                            }
+                        }
 
                         if let Some(update_pairs) = new_parent_rows {
                             // -- ON UPDATE handling --
@@ -2766,6 +2891,22 @@ impl Executor {
 
                 updates.push((*pos, new_row));
             }
+        }
+
+        // Validate the entire final parent state BEFORE applying child actions.
+        // Storage's atomic unique update runs later; discovering a duplicate
+        // there would leave a preceding cascade behind after this error.
+        if check_unique && !updates.is_empty() {
+            let staged: std::collections::HashMap<usize, &Row> = updates
+                .iter()
+                .map(|(position, row)| (*position, row))
+                .collect();
+            Self::check_staged_unique_constraints(
+                &table_def,
+                all_rows
+                    .iter()
+                    .map(|(position, old)| staged.get(position).copied().unwrap_or(old)),
+            )?;
         }
 
         // Build position→row lookup for FK enforcement and change notification

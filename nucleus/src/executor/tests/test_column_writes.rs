@@ -652,3 +652,53 @@ async fn x10_alter_sequence_start_with_semicolon_changes_restart_default_only() 
     exec(&ex, "ALTER SEQUENCE semicolon_start RESTART;").await;
     assert_eq!(ints(&ex, "SELECT nextval('semicolon_start')").await, [[11]]);
 }
+
+#[tokio::test]
+async fn x10_distinct_parent_keys_cannot_stage_duplicate_generated_child_keys() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE staged_parent(id INT PRIMARY KEY)").await;
+    exec(&ex, "CREATE TABLE staged_child(p INT REFERENCES staged_parent(id) ON UPDATE CASCADE, g INT GENERATED ALWAYS AS(abs(p)) STORED UNIQUE)").await;
+    exec(&ex, "INSERT INTO staged_parent VALUES(1),(2)").await;
+    exec(&ex, "INSERT INTO staged_child(p) VALUES(1),(2)").await;
+    assert_eq!(
+        sqlstate(
+            &ex,
+            "UPDATE staged_parent SET id=CASE WHEN id=1 THEN -3 ELSE 3 END"
+        )
+        .await,
+        "23505"
+    );
+    assert_eq!(
+        ints(&ex, "SELECT id FROM staged_parent ORDER BY id").await,
+        [[1], [2]]
+    );
+    assert_eq!(
+        ints(&ex, "SELECT p,g FROM staged_child ORDER BY p").await,
+        [[1, 1], [2, 2]]
+    );
+}
+
+#[tokio::test]
+async fn x10_parent_update_subset_keeps_untouched_unique_keys_and_child_rows() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE subset_parent(id INT PRIMARY KEY)").await;
+    exec(
+        &ex,
+        "CREATE TABLE subset_child(p INT REFERENCES subset_parent(id) ON UPDATE CASCADE)",
+    )
+    .await;
+    exec(&ex, "INSERT INTO subset_parent VALUES(1),(2),(3)").await;
+    exec(&ex, "INSERT INTO subset_child VALUES(1),(2),(3)").await;
+    assert_eq!(
+        sqlstate(&ex, "UPDATE subset_parent SET id=3 WHERE id<3").await,
+        "23505"
+    );
+    assert_eq!(
+        ints(&ex, "SELECT id FROM subset_parent ORDER BY id").await,
+        [[1], [2], [3]]
+    );
+    assert_eq!(
+        ints(&ex, "SELECT p FROM subset_child ORDER BY p").await,
+        [[1], [2], [3]]
+    );
+}
