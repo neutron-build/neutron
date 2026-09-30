@@ -121,3 +121,4 @@ mod test_upstream_teploy_2026_09_18; // rename-in-txn visibility + replacing ups
 
 mod test_x09_array_semantics;
 mod test_x11_review_regressions;
+mod test_x12_review_regressions;

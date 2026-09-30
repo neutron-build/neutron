@@ -375,13 +375,13 @@ async fn test_information_schema_columns_udt_name() {
     assert_eq!(r[0][0], Value::Text("id".into()));
     assert_eq!(r[0][1], Value::Int32(1));
     assert_eq!(r[0][2], Value::Text("NO".into()));
-    assert_eq!(r[0][3], Value::Text("INTEGER".into()));
+    assert_eq!(r[0][3], Value::Text("integer".into()));
     assert_eq!(r[0][4], Value::Text("int4".into()));
     // name column
     assert_eq!(r[1][0], Value::Text("name".into()));
     assert_eq!(r[1][1], Value::Int32(2));
     assert_eq!(r[1][2], Value::Text("YES".into()));
-    assert_eq!(r[1][3], Value::Text("TEXT".into()));
+    assert_eq!(r[1][3], Value::Text("text".into()));
     assert_eq!(r[1][4], Value::Text("text".into()));
 }
 

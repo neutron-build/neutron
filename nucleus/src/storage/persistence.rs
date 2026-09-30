@@ -191,6 +191,16 @@ struct TableEngineSer {
     count_columns: Vec<String>,
 }
 
+/// Serializable form of a column's declared PostgreSQL type. See
+/// [`crate::catalog::DeclaredType`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeclaredTypeSer {
+    table: String,
+    column_id: u32,
+    typname: String,
+    typmod: i32,
+}
+
 /// The full catalog snapshot, serializable to JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CatalogSnapshot {
@@ -206,6 +216,10 @@ struct CatalogSnapshot {
     /// the loaded tables' epochs.
     #[serde(default)]
     next_table_epoch: u64,
+    /// Declared PostgreSQL types of columns whose `DataType` is coarser than
+    /// the declaration (varchar(n), smallint, ...). Absent in older files.
+    #[serde(default)]
+    declared_types: Vec<DeclaredTypeSer>,
 }
 
 /// Convert an internal `DataType` to its string representation for persistence.
@@ -443,6 +457,16 @@ impl CatalogPersistence {
                 specs
             },
             next_table_epoch: catalog.peek_next_table_epoch(),
+            declared_types: catalog
+                .declared_types_snapshot()
+                .into_iter()
+                .map(|(table, column_id, d)| DeclaredTypeSer {
+                    table,
+                    column_id,
+                    typname: d.typname,
+                    typmod: d.typmod,
+                })
+                .collect(),
         };
 
         let json = serde_json::to_string_pretty(&snapshot)
@@ -514,6 +538,17 @@ impl CatalogPersistence {
 
         let max_epoch = snapshot.tables.iter().map(|t| t.epoch).max().unwrap_or(0);
         catalog.restore_table_epoch_counter(snapshot.next_table_epoch.max(max_epoch + 1));
+
+        for d in &snapshot.declared_types {
+            catalog.set_declared_type(
+                &d.table,
+                d.column_id,
+                crate::catalog::DeclaredType {
+                    typname: d.typname.clone(),
+                    typmod: d.typmod,
+                },
+            );
+        }
 
         for e in &snapshot.table_engines {
             catalog.set_table_engine(
@@ -603,6 +638,17 @@ impl CatalogPersistence {
         // (defends against a pre-v2 file that has table epochs but no counter).
         let max_epoch = snapshot.tables.iter().map(|t| t.epoch).max().unwrap_or(0);
         catalog.restore_table_epoch_counter(snapshot.next_table_epoch.max(max_epoch + 1));
+
+        for d in &snapshot.declared_types {
+            catalog.set_declared_type(
+                &d.table,
+                d.column_id,
+                crate::catalog::DeclaredType {
+                    typname: d.typname.clone(),
+                    typmod: d.typmod,
+                },
+            );
+        }
 
         for e in &snapshot.table_engines {
             catalog.set_table_engine(

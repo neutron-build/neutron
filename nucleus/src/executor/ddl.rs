@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use sqlparser::ast::{self, Expr, Statement};
 
+use super::pg_catalog;
 use crate::catalog::TableDef;
 use crate::planner;
 use crate::sql;
@@ -1253,6 +1254,17 @@ impl Executor {
 
         match self.catalog.create_table(table_def.clone()).await {
             Ok(()) => {
+                // Remember the declared PostgreSQL types the engine's DataType
+                // cannot express (varchar(n), numeric(p,s), smallint, ...), so
+                // the pg_catalog emulation reports what was written.
+                self.catalog.clear_declared_types(&table_name);
+                for col in &create.columns {
+                    if let Some(declared) = pg_catalog::declared_type_of(&col.data_type)
+                        && let Some(id) = table_def.column_id(&col.name.value)
+                    {
+                        self.catalog.set_declared_type(&table_name, id, declared);
+                    }
+                }
                 // Route to per-table engine if engine override was specified.
                 let is_mergetree = matches!(
                     engine_name.as_deref(),
@@ -3142,6 +3154,11 @@ impl Executor {
                     let generated_exprs = self.generated_exprs(&updated)?;
                     let updated_meta = self.table_col_meta(&updated);
                     self.catalog.update_table(updated.clone()).await?;
+                    self.catalog.remove_declared_type(&table_name, new_col.id);
+                    if let Some(declared) = pg_catalog::declared_type_of(&column_def.data_type) {
+                        self.catalog
+                            .set_declared_type(&table_name, new_col.id, declared);
+                    }
 
                     let engine = self.storage_for(&table_name);
                     let _rewrite = RewriteGuard::new(engine.clone(), &table_name);
@@ -3368,6 +3385,8 @@ impl Executor {
                     drop_indices.dedup();
                     drop_indices.reverse();
                     for idx in &drop_indices {
+                        self.catalog
+                            .remove_declared_type(&table_name, updated.columns[*idx].id);
                         updated.columns.remove(*idx);
                     }
                     self.catalog.update_table(updated).await?;
@@ -3604,6 +3623,8 @@ impl Executor {
                         .ok_or_else(|| ExecError::ColumnNotFound(column_name.value.clone()))?;
                     // Set when SetDataType changes the type: triggers a physical rewrite below.
                     let mut retype: Option<DataType> = None;
+                    let mut declared_change: Option<(u32, Option<crate::catalog::DeclaredType>)> =
+                        None;
                     let mut validate_not_null = false;
                     {
                         let col = &mut updated.columns[col_idx];
@@ -3639,6 +3660,8 @@ impl Executor {
                                 }
                                 col.data_type = new_type;
                                 col.max_len = sql::declared_max_len(data_type);
+                                declared_change =
+                                    Some((col.id, pg_catalog::declared_type_of(data_type)));
                             }
                             _ => {
                                 return Err(ExecError::Unsupported(format!(
@@ -3754,6 +3777,14 @@ impl Executor {
                         storage.rebuild_table_indexes(&table_name).await?;
                     } else {
                         self.catalog.update_table(updated).await?;
+                    }
+                    // The declared type follows the column's new type: kept if
+                    // the new declaration is finer than the engine's type,
+                    // dropped otherwise.
+                    match declared_change {
+                        Some((id, Some(d))) => self.catalog.set_declared_type(&table_name, id, d),
+                        Some((id, None)) => self.catalog.remove_declared_type(&table_name, id),
+                        None => {}
                     }
                 }
                 // ── ADD CONSTRAINT ──────────────────────────────────────────────

@@ -179,3 +179,18 @@ values. Text or untyped inputs are refused rather than silently returning zero
 or NULL. Cast COLUMNAR_INSERT inputs explicitly; COLUMNAR_COUNT still reports
 the stored row count. COLUMNAR_INSERT is refused inside a SQL transaction
 because the store has no rollback mechanism.
+
+### Catalog metadata
+
+Catalog relations use a coherent snapshot of live schema objects. Declared
+varchar, numeric and array modifiers survive introspection and persistence;
+dropping a column clears its declaration before its identifier can be reused.
+Independent indexes are not inferred to belong to constraints merely because
+their columns match. Generated expressions and identity flags reflect live
+column metadata in pg_attribute, pg_attrdef and information_schema.columns.
+Named-user column privilege queries check the named role's table-level grants.
+
+This remains a compatibility catalog. Raw int2[] catalog fields use the engine's
+int4[] representation, and integer-vector casts accept space-separated catalog
+values. Unsupported PostgreSQL catalog features are not evidence of support
+for the corresponding engine feature.

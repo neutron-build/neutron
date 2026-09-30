@@ -1805,8 +1805,7 @@ impl Executor {
     /// snapshot; fixed system-catalog OIDs resolve through the static map.
     fn regclass_name(&self, oid: i32) -> Option<String> {
         if oid >= 16384 {
-            let tables = self.catalog.list_tables_sync()?;
-            return tables.get((oid - 16384) as usize).map(|t| t.name.clone());
+            return self.regclass_by_oid(oid);
         }
         match oid {
             1247 => Some("pg_type".into()),
@@ -1864,17 +1863,13 @@ impl Executor {
             // meta-command needs.
             ast::DataType::Regclass => Ok(match &val {
                 Value::Text(s) => regclass_oid(s).map(Value::Int32).unwrap_or_else(|| {
-                    // User table: resolve the synthetic OID (16384 + catalog
-                    // position — the same assignment the virtual pg_catalog
-                    // arms use). Quotes are stripped wholesale: real Nucleus
-                    // names never contain '"', but introspection SQL passes
-                    // spellings like '"public"."post_tags"'.
-                    let bare = s.replace('"', "");
-                    let bare = bare.strip_prefix("public.").unwrap_or(&bare);
-                    self.catalog
-                        .list_tables_sync()
-                        .and_then(|ts| ts.iter().position(|t| t.name == bare))
-                        .map(|i| Value::Int32(16384 + i as i32))
+                    // User relation: the OID is derived from the object's kind
+                    // and name (see pg_catalog.rs). Quotes are stripped
+                    // wholesale: real Nucleus names never contain '"', but
+                    // introspection SQL passes spellings like
+                    // '"public"."post_tags"'.
+                    self.regclass_by_name(s)
+                        .map(Value::Int32)
                         .unwrap_or(Value::Null)
                 }),
                 // OID -> regclass renders as the relation NAME (Postgres
@@ -1891,6 +1886,33 @@ impl Executor {
                     .unwrap_or(Value::Int32(*n as i32)),
                 _ => Value::Null,
             }),
+            // ::oid and ::name. sqlparser has no first-class OID/NAME, so they
+            // arrive as custom types. An OID is an unsigned 32-bit number,
+            // held in the engine's Int32; a relation name (what
+            // `regclass::text` produced) resolves to the relation's OID.
+            ast::DataType::Custom(name, _) if name.to_string().eq_ignore_ascii_case("oid") => {
+                match &val {
+                    Value::Int32(_) => Ok(val),
+                    Value::Int64(n) => u32::try_from(*n)
+                        .map(|u| Value::Int32(u as i32))
+                        .map_err(|_| ExecError::Runtime("OID out of range".into())),
+                    Value::Text(s) => match s.trim().parse::<i64>() {
+                        Ok(n) => u32::try_from(n)
+                            .map(|u| Value::Int32(u as i32))
+                            .map_err(|_| ExecError::Runtime("OID out of range".into())),
+                        Err(_) => Ok(regclass_oid(s)
+                            .or_else(|| self.regclass_by_name(s))
+                            .map(Value::Int32)
+                            .unwrap_or(Value::Null)),
+                    },
+                    _ => Err(ExecError::Unsupported(format!(
+                        "cannot cast {val:?} to OID"
+                    ))),
+                }
+            }
+            ast::DataType::Custom(name, _) if name.to_string().eq_ignore_ascii_case("name") => {
+                Ok(Value::Text(val.to_string()))
+            }
             // ::regproc — function-name pseudo-type. Nucleus renders regproc
             // values as their text name already, so the cast is the identity
             // on text (prisma casts pg_type.typinput::regproc::text).
@@ -2123,6 +2145,22 @@ impl Executor {
                     ast::ArrayElemTypeDef::None => None,
                 };
                 match (&val, elem_type) {
+                    // An int2vector / oidvector column (pg_index.indkey and
+                    // friends) is text of space-separated integers.
+                    (Value::Text(s), Some(et))
+                        if !s.trim().starts_with('{')
+                            && s.split_whitespace().all(|p| p.parse::<i64>().is_ok())
+                            && matches!(
+                                self.eval_cast(Value::Text("0".into()), et),
+                                Ok(Value::Int32(_)) | Ok(Value::Int64(_))
+                            ) =>
+                    {
+                        let mut out = Vec::new();
+                        for part in s.split_whitespace() {
+                            out.push(self.eval_cast(Value::Text(part.to_string()), et)?);
+                        }
+                        Ok(Value::Array(out))
+                    }
                     (Value::Text(s), Some(et)) if s.trim().starts_with(['{', '[']) => {
                         let items = crate::types::parse_array_literal(s).map_err(|error| {
                             ExecError::Runtime(format!(

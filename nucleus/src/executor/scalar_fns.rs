@@ -2278,10 +2278,15 @@ impl Executor {
                 Ok(Value::Null)
             }
             "PG_GET_SERIAL_SEQUENCE" => {
-                // No sequence objects exist; NULL matches Postgres for a
-                // column with no owned sequence. ORM introspection (drizzle)
-                // calls this per column to detect serial columns.
-                Ok(Value::Null)
+                // The sequence a serial column owns, else NULL. ORM
+                // introspection (drizzle) calls this per column to detect
+                // serial columns.
+                match (args.first(), args.get(1)) {
+                    (Some(Value::Text(t)), Some(Value::Text(c))) => {
+                        Ok(self.pg_get_serial_sequence(t, c))
+                    }
+                    _ => Ok(Value::Null),
+                }
             }
             "TXID_CURRENT" => Ok(Value::Int64(1)),
             "OBJ_DESCRIPTION" => {
@@ -2311,33 +2316,8 @@ impl Executor {
                     Some(Value::Int64(n)) => *n as i32,
                     _ => -1,
                 };
-                let type_name = match oid {
-                    16 => "boolean".to_string(),
-                    20 => "bigint".to_string(),
-                    21 => "smallint".to_string(),
-                    23 => "integer".to_string(),
-                    25 => "text".to_string(),
-                    700 => "real".to_string(),
-                    701 => "double precision".to_string(),
-                    1043 if typmod > 4 => format!("character varying({})", typmod - 4),
-                    1043 => "character varying".to_string(),
-                    1082 => "date".to_string(),
-                    1114 => "timestamp without time zone".to_string(),
-                    1184 => "timestamp with time zone".to_string(),
-                    1186 => "interval".to_string(),
-                    1700 => "numeric".to_string(),
-                    2950 => "uuid".to_string(),
-                    3802 => "jsonb".to_string(),
-                    17 => "bytea".to_string(),
-                    1042 => "character".to_string(),
-                    1005 => "smallint[]".to_string(),
-                    1007 => "integer[]".to_string(),
-                    1009 => "text[]".to_string(),
-                    1016 => "bigint[]".to_string(),
-                    16385 if typmod > 0 => format!("vector({typmod})"),
-                    16385 => "vector".to_string(),
-                    _ => "unknown".to_string(),
-                };
+                let snap = sync_block_on(self.pg_snapshot());
+                let type_name = self.format_type_with_snapshot(&snap, oid as i32, typmod);
                 Ok(Value::Text(type_name))
             }
             "PG_GET_EXPR" => {
@@ -2355,7 +2335,41 @@ impl Executor {
                 // Stub: always returns true
                 Ok(Value::Bool(true))
             }
+            "HAS_COLUMN_PRIVILEGE" => {
+                // has_column_privilege([user,] table, column, privilege): the
+                // engine grants per table, so this is the table-level answer.
+                let args = self.relation_oids_to_names(args);
+                let n = args.len();
+                if n == 4 {
+                    if let (Value::Text(user), Value::Text(table), Value::Text(privilege)) =
+                        (&args[0], &args[1], &args[3])
+                    {
+                        let privilege = privilege.to_uppercase();
+                        let key = privilege.split_whitespace().next().unwrap_or(&privilege);
+                        return Ok(Value::Bool(sync_block_on(
+                            self.check_privilege_for_role(user, table, key),
+                        )));
+                    }
+                    return Err(ExecError::Unsupported(
+                        "has_column_privilege argument types".into(),
+                    ));
+                }
+                if n < 3 {
+                    return Ok(Value::Bool(true));
+                }
+                let (Some(Value::Text(t)), Some(Value::Text(p))) =
+                    (args.get(n - 3), args.get(n - 1))
+                else {
+                    return Ok(Value::Bool(true));
+                };
+                let priv_upper = p.to_uppercase();
+                let priv_key = priv_upper.split_whitespace().next().unwrap_or(&priv_upper);
+                Ok(Value::Bool(sync_block_on(
+                    self.check_privilege(t, priv_key),
+                )))
+            }
             "HAS_TABLE_PRIVILEGE" => {
+                let args = self.relation_oids_to_names(args);
                 // has_table_privilege(table, privilege) or has_table_privilege(user, table, privilege)
                 // 3-arg form names the principal to test. Answering about the
                 // CALLER instead reported `true` for every table whenever a
@@ -2455,8 +2469,24 @@ impl Executor {
                 Ok(Value::Text("nucleus".to_string()))
             }
             "PG_GET_CONSTRAINTDEF" => {
-                // Stub: returns NULL
-                Ok(Value::Null)
+                // pg_get_constraintdef(constraint_oid[, pretty]) — the
+                // constraint clause as PostgreSQL deparses it. Unknown OID -> NULL.
+                let oid = match args.first() {
+                    Some(Value::Int32(n)) => *n,
+                    Some(Value::Int64(n)) => *n as i32,
+                    _ => return Ok(Value::Null),
+                };
+                let snap = sync_block_on(self.pg_snapshot());
+                Ok(self.pg_get_constraintdef_by_oid(&snap, oid))
+            }
+            "PG_GET_VIEWDEF" => {
+                let oid = match args.first() {
+                    Some(Value::Int32(n)) => *n,
+                    Some(Value::Int64(n)) => *n as i32,
+                    _ => return Ok(Value::Null),
+                };
+                let snap = sync_block_on(self.pg_snapshot());
+                Ok(self.pg_get_viewdef_by_oid(&snap, oid))
             }
             "PG_GET_INDEXDEF" => {
                 // pg_get_indexdef(index_oid[, colno, pretty]) — synthesize the
@@ -2467,23 +2497,8 @@ impl Executor {
                     Some(Value::Int64(n)) => *n,
                     _ => return Ok(Value::Null),
                 };
-                let tables = sync_block_on(self.catalog.list_tables());
-                let indexes = sync_block_on(self.catalog.get_all_indexes());
-                // Index OIDs are assigned positionally after table OIDs
-                // (16384 + tables.len() + i) — must match pg_class/pg_index.
-                let pos = oid - 16384 - tables.len() as i64;
-                if pos < 0 || pos as usize >= indexes.len() {
-                    return Ok(Value::Null);
-                }
-                let idx = &indexes[pos as usize];
-                let unique = if idx.unique { "UNIQUE " } else { "" };
-                Ok(Value::Text(format!(
-                    "CREATE {}INDEX {} ON public.{} USING btree ({})",
-                    unique,
-                    idx.name,
-                    idx.table_name,
-                    idx.columns.join(", ")
-                )))
+                let snap = sync_block_on(self.pg_snapshot());
+                Ok(self.pg_get_indexdef_by_oid(&snap, oid as i32))
             }
             "ARRAY_TO_STRING" => {
                 // array_to_string(array, sep [, null_string]) — used by \l on

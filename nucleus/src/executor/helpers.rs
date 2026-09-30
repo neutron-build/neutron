@@ -15,28 +15,6 @@ use chrono_tz::Tz;
 use sqlparser::ast::{self, Expr};
 use std::collections::HashMap;
 
-/// Map a Nucleus DataType to its PostgreSQL `udt_name` (the short type name used in pg_type).
-pub(super) fn datatype_to_udt_name(dt: &DataType) -> &'static str {
-    match dt {
-        DataType::Bool => "bool",
-        DataType::Int32 => "int4",
-        DataType::Int64 => "int8",
-        DataType::Float64 => "float8",
-        DataType::Text => "text",
-        DataType::Jsonb => "jsonb",
-        DataType::Date => "date",
-        DataType::Timestamp => "timestamp",
-        DataType::TimestampTz => "timestamptz",
-        DataType::Numeric => "numeric",
-        DataType::Uuid => "uuid",
-        DataType::Bytea => "bytea",
-        DataType::Array(_) => "_text",
-        DataType::Vector(_) => "vector",
-        DataType::Interval => "interval",
-        DataType::UserDefined(_) => "text",
-    }
-}
-
 /// Return (oid, typlen, typtype, typcategory) for a Nucleus DataType,
 /// matching real PostgreSQL pg_type values.
 pub(super) fn pg_type_info(dt: &DataType) -> (i32, i32, &'static str, &'static str) {
@@ -59,26 +37,6 @@ pub(super) fn pg_type_info(dt: &DataType) -> (i32, i32, &'static str, &'static s
         DataType::UserDefined(_) => (25, -1, "e", "E"), // enum → text-like, typtype='e'
     }
 }
-
-/// Base PostgreSQL types that should always appear in pg_type.
-pub(super) const BASE_PG_TYPES: &[(i32, &str, i32, &str, &str)] = &[
-    (16, "bool", 1, "b", "B"),
-    (23, "int4", 4, "b", "N"),
-    (20, "int8", 8, "b", "N"),
-    (701, "float8", 8, "b", "N"),
-    (25, "text", -1, "b", "S"),
-    (3802, "jsonb", -1, "b", "U"),
-    (1082, "date", 4, "b", "D"),
-    (1114, "timestamp", 8, "b", "D"),
-    (1184, "timestamptz", 8, "b", "D"),
-    (1700, "numeric", -1, "b", "N"),
-    (2950, "uuid", 16, "b", "U"),
-    (17, "bytea", -1, "b", "U"),
-    (21, "int2", 2, "b", "N"),
-    (700, "float4", 4, "b", "N"),
-    (1043, "varchar", -1, "b", "S"),
-    (1042, "bpchar", -1, "b", "S"),
-];
 
 /// The four `pg_type` I/O function names for a type: `(in, out, recv, send)`.
 ///

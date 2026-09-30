@@ -63,6 +63,26 @@ impl TableEngineSpec {
     }
 }
 
+/// The PostgreSQL type a column was DECLARED with, where the engine's
+/// `DataType` is coarser than the declaration.
+///
+/// `DataType` has one `Text` for text/varchar(n)/char(n), one `Int32` for
+/// smallint/integer, one `Float64` for real/double, one `Jsonb` for json/jsonb
+/// and one `Numeric` with no precision. That is a fine storage model but a
+/// lossy schema record: `neutron schema pull` would turn `varchar(20)` into
+/// `text` and `numeric(10,2)` into bare `numeric`. This side record keeps the
+/// declaration (`typname` in pg_type terms plus the raw `atttypmod`) so the
+/// pg_catalog emulation can report it. It is keyed by the column's stable id
+/// (see [`ColumnDef::id`]), so renames follow it and drops remove it, and it is
+/// only trusted while the column's `DataType` still agrees with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredType {
+    /// pg_type name: `int2`, `float4`, `varchar`, `bpchar`, `json`, `numeric`, ...
+    pub typname: String,
+    /// PostgreSQL `atttypmod`: -1 when unconstrained, `n + 4` for varchar(n).
+    pub typmod: i32,
+}
+
 /// Column definition in a table.
 #[derive(Debug, Clone)]
 pub struct ColumnDef {
@@ -348,6 +368,8 @@ pub struct Catalog {
     table_engines: parking_lot::RwLock<HashMap<String, TableEngineSpec>>,
     /// User-defined enum types: type_name → ordered list of label strings.
     enum_types: RwLock<HashMap<String, Vec<String>>>,
+    /// (table, column id) -> declared PostgreSQL type. See [`DeclaredType`].
+    declared_types: parking_lot::RwLock<HashMap<(String, u32), DeclaredType>>,
 
     // ── Sync read cache (session-level metadata cache) ──────────────────────
     //
@@ -380,6 +402,7 @@ impl Catalog {
             indexes: RwLock::new(HashMap::new()),
             table_engines: parking_lot::RwLock::new(HashMap::new()),
             enum_types: RwLock::new(HashMap::new()),
+            declared_types: parking_lot::RwLock::new(HashMap::new()),
             catalog_epoch: AtomicU64::new(0),
             next_table_epoch: AtomicU64::new(1),
             table_cache: parking_lot::RwLock::new(HashMap::new()),
@@ -479,12 +502,54 @@ impl Catalog {
         self.table_engines.write().remove(table);
     }
 
+    /// Record the declared PostgreSQL type of one column. See [`DeclaredType`].
+    pub fn set_declared_type(&self, table: &str, column_id: u32, declared: DeclaredType) {
+        self.declared_types
+            .write()
+            .insert((table.to_string(), column_id), declared);
+    }
+
+    /// Forget the declared type of one column (DROP COLUMN, or a type change
+    /// whose new type carries no finer declaration).
+    pub fn remove_declared_type(&self, table: &str, column_id: u32) {
+        self.declared_types
+            .write()
+            .remove(&(table.to_string(), column_id));
+    }
+
+    /// Forget every declared type of a table (DROP TABLE, or the start of a
+    /// CREATE TABLE that must not inherit a rolled-back predecessor's).
+    pub fn clear_declared_types(&self, table: &str) {
+        self.declared_types.write().retain(|(t, _), _| t != table);
+    }
+
+    /// The declared type of a column, if one was recorded.
+    pub fn declared_type(&self, table: &str, column_id: u32) -> Option<DeclaredType> {
+        self.declared_types
+            .read()
+            .get(&(table.to_string(), column_id))
+            .cloned()
+    }
+
+    /// Every recorded declaration, for persistence, in a stable order.
+    pub fn declared_types_snapshot(&self) -> Vec<(String, u32, DeclaredType)> {
+        let mut all: Vec<_> = self
+            .declared_types
+            .read()
+            .iter()
+            .map(|((t, id), d)| (t.clone(), *id, d.clone()))
+            .collect();
+        all.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+        all
+    }
+
     pub async fn drop_table(&self, name: &str) -> Result<(), CatalogError> {
         let mut tables = self.tables.write().await;
         if tables.remove(name).is_none() {
             return Err(CatalogError::TableNotFound(name.to_string()));
         }
         self.table_engines.write().remove(name);
+        self.clear_declared_types(name);
         // Also drop every index that belonged to this table.
         let mut indexes = self.indexes.write().await;
         indexes.retain(|_, idx| idx.table_name != name);
@@ -534,6 +599,19 @@ impl Catalog {
             let mut engines = self.table_engines.write();
             if let Some(spec) = engines.remove(old_name) {
                 engines.insert(new_name.to_string(), spec);
+            }
+        }
+        {
+            let mut declared = self.declared_types.write();
+            let moved: Vec<_> = declared
+                .keys()
+                .filter(|(t, _)| t == old_name)
+                .cloned()
+                .collect();
+            for key in moved {
+                if let Some(d) = declared.remove(&key) {
+                    declared.insert((new_name.to_string(), key.1), d);
+                }
             }
         }
 
