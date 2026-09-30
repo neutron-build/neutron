@@ -4135,8 +4135,14 @@ impl Executor {
     // Only reachable from server-gated code, same as `table_is_fk_referenced`
     // above; without this the core-only clippy gate fails on dead_code.
     /// A shared derived map cannot narrow another session's committed rows
-    /// while transaction-local hooks have changed it. Busy active state fails closed.
+    /// while transaction-local hooks have changed it. A reader in an explicit
+    /// transaction may retain an older storage snapshot after other writers
+    /// commit; shared sidecars carry current epochs, not that reader's snapshot.
+    /// Busy active state also fails closed.
     fn has_uncommitted_derived_writes(&self) -> bool {
+        if self.current_session().txn_active.load(Ordering::Acquire) {
+            return true;
+        }
         let dirty = |session: &Session| match session.txn_state.try_read() {
             Ok(txn) => txn.active && !txn.derived_dirty_tables.is_empty(),
             Err(_) => session.txn_active.load(Ordering::Acquire),
