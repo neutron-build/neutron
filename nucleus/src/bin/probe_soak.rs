@@ -495,6 +495,45 @@ async fn coherence_failures(db: &HarnessDb) -> Vec<String> {
                             "val={v}: index path returned {:?} but heap scan returned {:?}",
                             a[0], b[0]
                         ));
+                        // Preserve the original invariant and identify which
+                        // rows disagree. Counts alone cannot distinguish a
+                        // lost B-tree entry from a plan/count-path defect.
+                        let sid = db.executor().create_session();
+                        for (path, sql) in [
+                            (
+                                "point",
+                                format!("SELECT id, val FROM soak WHERE val = {v} ORDER BY id"),
+                            ),
+                            (
+                                "range",
+                                format!(
+                                    "SELECT id, val FROM soak WHERE val >= {v} AND val <= {v} ORDER BY id"
+                                ),
+                            ),
+                            (
+                                "heap",
+                                format!("SELECT id, val FROM soak WHERE val + 0 = {v} ORDER BY id"),
+                            ),
+                        ] {
+                            match db.executor().execute_with_session(sid, &sql).await {
+                                Ok(results) => {
+                                    for result in results {
+                                        if let nucleus::executor::ExecResult::Select {
+                                            rows, ..
+                                        } = result
+                                        {
+                                            fails.push(format!(
+                                                "val={v} {path} rows in fresh session: {rows:?}"
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    fails.push(format!("val={v} {path} diagnostic failed: {error}"))
+                                }
+                            }
+                        }
+                        db.executor().drop_session(sid);
                     }
                 }
             }
