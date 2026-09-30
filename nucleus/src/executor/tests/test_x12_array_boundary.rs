@@ -172,3 +172,65 @@ async fn array_agg_order_and_distinct_keep_null_elements() {
         &vec![vec![Value::Array(vec![Value::Int32(1), Value::Null])]]
     );
 }
+
+#[tokio::test]
+async fn array_agg_keeps_integer_widening_from_later_values_rows() {
+    let e = test_executor();
+    for aggregate in ["array_agg(x)", "array_agg(DISTINCT x ORDER BY x)"] {
+        let result = exec(
+            &e,
+            &format!("SELECT {aggregate} FROM (VALUES (1),(9000000000000000001::bigint)) t(x)"),
+        )
+        .await;
+        assert_eq!(
+            column_type(&result[0]),
+            &DataType::Array(Box::new(DataType::Int64))
+        );
+        let Value::Array(values) = &rows(&result[0])[0][0] else {
+            panic!("expected array");
+        };
+        assert_eq!(
+            values.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec!["1", "9000000000000000001"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn array_agg_nullable_values_keep_their_nonnull_element_types() {
+    let e = test_executor();
+    for (values, ty, expected) in [
+        (
+            "(1),(2)",
+            DataType::Int32,
+            vec![Value::Null, Value::Int32(1), Value::Int32(2)],
+        ),
+        (
+            "(true),(false)",
+            DataType::Bool,
+            vec![Value::Null, Value::Bool(true), Value::Bool(false)],
+        ),
+        (
+            "(decode('00ff','hex'))",
+            DataType::Bytea,
+            vec![Value::Null, Value::Bytea(vec![0, 255])],
+        ),
+    ] {
+        let result = exec(
+            &e,
+            &format!("SELECT array_agg(x) FROM (VALUES (NULL),{values}) t(x)"),
+        )
+        .await;
+        assert_eq!(column_type(&result[0]), &DataType::Array(Box::new(ty)));
+        assert_eq!(rows(&result[0]), &vec![vec![Value::Array(expected)]]);
+    }
+    let result = exec(
+        &e,
+        "SELECT array_agg(x) FROM (VALUES (NULL::bigint),(1),(2)) t(x)",
+    )
+    .await;
+    assert_eq!(
+        column_type(&result[0]),
+        &DataType::Array(Box::new(DataType::Int64))
+    );
+}

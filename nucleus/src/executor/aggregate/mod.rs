@@ -199,12 +199,23 @@ pub(super) fn validate_grouped_projection(
 
 fn agg_column_type(val: &Value, expr: &Expr, col_meta: &[ColMeta]) -> DataType {
     let inferred = infer_expr_type(expr, col_meta);
+    let observed = value_type(val);
+    // Real elements retain their established runtime type, including integer
+    // widening and VALUES sources whose first NULL has no declared type.
+    // An empty/all-NULL array instead needs the expression's declared type.
+    let null_only_array =
+        matches!(val, Value::Array(items) if items.iter().all(|v| matches!(v, Value::Null)));
     if matches!(val, Value::Null)
-        || (matches!(val, Value::Array(_)) && matches!(inferred, DataType::Array(_)))
+        || (null_only_array && matches!(inferred, DataType::Array(_)))
+        || matches!(
+            (&inferred, &observed),
+            (DataType::Array(declared), DataType::Array(actual))
+                if **declared == DataType::Int64 && **actual == DataType::Int32
+        )
     {
         inferred
     } else {
-        value_type(val)
+        observed
     }
 }
 
