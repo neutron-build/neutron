@@ -895,7 +895,9 @@ fn bench_columnar(db: &Database, scale: Scale) -> Vec<BenchResult> {
                 "value".to_string(),
                 nucleus::columnar::ColumnData::Float64(values),
             )]);
-            col.write().append("metrics", batch);
+            col.write()
+                .append("metrics", batch)
+                .expect("columnar benchmark batch must be stored");
             stats.record(t.elapsed());
         }
         let total = start.elapsed();
