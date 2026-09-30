@@ -415,7 +415,7 @@ func TestScaffoldGoRuns(t *testing.T) {
 	t.Setenv("NEUTRON_DATABASE_URL", dbURL)
 	port := freePort(t)
 	s := startDev(t, detect.Go, project, port)
-	// Strict: the Go SDK v0.2.0 that the scaffold pins reports health
+	// Strict: the Go SDK v0.3.0 that the scaffold pins reports health
 	// correctly for a reachable plain PostgreSQL.
 	checkHealth(t, s, port, 3*time.Minute, true)
 }

@@ -2,7 +2,7 @@ module example.local/neutron-api
 
 go 1.26.0
 
-require github.com/neutron-build/neutron/go v0.1.0
+require github.com/neutron-build/neutron/go v0.3.0
 
 require (
 	github.com/gabriel-vasile/mimetype v1.4.12 // indirect
@@ -15,6 +15,6 @@ require (
 	golang.org/x/text v0.42.0 // indirect
 )
 
-// The example tracks the SDK in this repository (NEUTRON_HOST/NEUTRON_PORT
-// support is newer than the published v0.1.0).
+// The example tracks the SDK in this repository for local development.
+// Remove this replacement when consuming the tagged SDK independently.
 replace github.com/neutron-build/neutron/go => ../../../../go
