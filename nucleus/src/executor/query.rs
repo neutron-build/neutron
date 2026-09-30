@@ -12042,7 +12042,8 @@ impl Executor {
         col_id: u32,
         predicate: &FilterPredicate,
     ) -> Vec<Row> {
-        if !self.derived_coherence.current("zone", table_name) {
+        let coherence = self.derived_coherence.view();
+        if self.has_uncommitted_derived_writes() || !coherence.current("zone", table_name) {
             return rows;
         }
         let zm_table_id = table_name_to_id(table_name);

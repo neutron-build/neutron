@@ -4232,6 +4232,16 @@ impl Executor {
     /// and masking and produces the correct error or the masked result.
     // Only reachable from server-gated code, same as `table_is_fk_referenced`
     // above; without this the core-only clippy gate fails on dead_code.
+    /// A shared derived map cannot narrow another session's committed rows
+    /// while transaction-local hooks have changed it. Busy active state fails closed.
+    fn has_uncommitted_derived_writes(&self) -> bool {
+        let dirty = |session: &Session| match session.txn_state.try_read() {
+            Ok(txn) => txn.active && !txn.derived_dirty_tables.is_empty(),
+            Err(_) => session.txn_active.load(Ordering::Acquire),
+        };
+        dirty(&self.default_session) || self.sessions.read().values().any(|session| dirty(session))
+    }
+
     #[cfg(feature = "server")]
     fn table_has_specialty_relational_index(&self, table: &str) -> bool {
         self.vector_indexes
@@ -7329,6 +7339,7 @@ impl Executor {
         };
 
         if result.is_ok()
+            && !session.txn_active.load(Ordering::Acquire)
             && let Some(ref writer) = writer
         {
             self.derived_coherence.finish_success(writer.generation);
@@ -8234,6 +8245,9 @@ impl Executor {
         rows: &[Row],
         col_meta: &[ColMeta],
     ) -> Option<Vec<Row>> {
+        if self.has_uncommitted_derived_writes() {
+            return None;
+        }
         // Check vector subsystem health before attempting index scan.
         if self.check_subsystem("vector").is_err() {
             return None; // Fall back to full scan.
@@ -8979,6 +8993,9 @@ impl Executor {
         column: &str,
         query: &str,
     ) -> Option<(String, std::collections::HashSet<u64>)> {
+        if self.has_uncommitted_derived_writes() {
+            return None;
+        }
         let coherence = self.derived_coherence.view();
         if !coherence.current("fts", table_name) {
             return None;
@@ -9008,6 +9025,9 @@ impl Executor {
         column: &str,
         query: &str,
     ) -> Option<usize> {
+        if self.has_uncommitted_derived_writes() {
+            return None;
+        }
         let coherence = self.derived_coherence.view();
         if !coherence.current("fts", table_name) {
             return None;
@@ -9032,6 +9052,9 @@ impl Executor {
         column: &str,
         query: &str,
     ) -> Option<crate::fts::Bm25Stats> {
+        if self.has_uncommitted_derived_writes() {
+            return None;
+        }
         let coherence = self.derived_coherence.view();
         let indexes = self.fts_column_indexes.read();
         let mut matches = indexes.values().filter(|e| {
