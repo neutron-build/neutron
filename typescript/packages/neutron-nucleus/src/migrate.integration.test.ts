@@ -141,6 +141,57 @@ describe("Integration: migration protocol v2 (live engine)", { skip: !live() && 
     );
   });
 
+  it("refused adoption does not add nullable metadata columns", async () => {
+    await reset(t);
+    await t.execute("CREATE TABLE _neutron_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT)");
+    await t.execute("INSERT INTO _neutron_migrations VALUES (1, 'first', 'deadbeef')");
+    await assert.rejects(() => adoptMigrations(t, plan), /neither/);
+    const columns = await t.query<{ column_name: string }>(
+      "SELECT column_name FROM information_schema.columns WHERE table_name = '_neutron_migrations' AND column_name IN ('owner', 'format')");
+    assert.deepEqual(columns.rows, []);
+    const row = await t.query<{ checksum: string }>("SELECT checksum FROM _neutron_migrations WHERE version = 1");
+    assert.equal(row.rows[0].checksum, 'deadbeef');
+  });
+
+  it("rolls history back after an injected post-upgrade update failure", async () => {
+    await reset(t);
+    await t.execute("CREATE TABLE _neutron_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)");
+    await t.execute("INSERT INTO _neutron_migrations VALUES (1, 'first'), (2, 'second')");
+    const begin = t.beginTransaction.bind(t);
+    let updates = 0;
+    t.beginTransaction = async (...args) => {
+      const tx = await begin(...args);
+      const execute = tx.execute.bind(tx);
+      tx.execute = async (sql, params, opts) => {
+        if (sql.startsWith('UPDATE _neutron_migrations') && ++updates === 2) {
+          throw new Error('injected adoption update failure');
+        }
+        return execute(sql, params, opts);
+      };
+      return tx;
+    };
+    try {
+      await assert.rejects(() => adoptMigrations(t, plan), /injected adoption update failure/);
+    } finally {
+      t.beginTransaction = begin;
+    }
+    assert.equal(updates, 2, 'must fail after one history update, not before DDL');
+    const version = String(await t.fetchval('SELECT version()'));
+    const columns = await t.query<{ column_name: string }>(
+      "SELECT column_name FROM information_schema.columns WHERE table_name = '_neutron_migrations' AND column_name IN ('checksum', 'owner', 'format')");
+    if (version.includes('Nucleus')) {
+      // Catalog rollback is unsupported, but every history graduation rolls back.
+      assert.equal(columns.rows.length, 3);
+      const rows = await t.query<{ checksum: string | null; owner: string | null; format: string | null }>(
+        'SELECT checksum, owner, format FROM _neutron_migrations');
+      assert.equal(rows.rows.length, 2);
+      for (const row of rows.rows) assert.deepEqual(row, { checksum: null, owner: null, format: null });
+    } else {
+      assert.match(version, /PostgreSQL/);
+      assert.equal(columns.rows.length, 0);
+    }
+  });
+
   it("serializes two runners (separate pools) with exactly-once effects", async () => {
     await reset(t);
     // Four runners, not two: the bootstrap DDL (CREATE TABLE IF NOT EXISTS)
@@ -157,7 +208,7 @@ describe("Integration: migration protocol v2 (live engine)", { skip: !live() && 
       await tx.close().catch(() => {});
     }
     for (const r of results) {
-      assert.equal(r.status, "fulfilled");
+      assert.equal(r.status, "fulfilled", r.status === "rejected" ? String(r.reason) : undefined);
     }
     const rows = await t.query<{ version: number }>("SELECT version FROM _neutron_migrations");
     assert.equal(rows.rows.length, 2);

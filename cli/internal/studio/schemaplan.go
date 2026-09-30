@@ -966,7 +966,7 @@ func (s *Server) handleSchemaApply(w http.ResponseWriter, r *http.Request) {
 	cancelLock()
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]any{
-			"error": "the migration lock is held (a migration or push is running) or could not be taken; nothing was applied: " + sanitizeError(err),
+			"error": "the migration lock is held (a migration, baseline, or push is running) or could not be taken; nothing was applied: " + sanitizeError(err),
 			"state": "locked",
 		})
 		return

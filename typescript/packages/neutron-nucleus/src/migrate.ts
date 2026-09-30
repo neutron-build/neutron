@@ -415,7 +415,9 @@ export async function migrateDown(
 
 /**
  * Explicitly graduate a legacy history into protocol v2, in one
- * transaction (contracts/data/MIGRATIONS.md §6). Never fabricates trust:
+ * transaction (contracts/data/MIGRATIONS.md §6). PostgreSQL also rolls back
+ * metadata-column DDL; Nucleus may retain nullable columns after a later
+ * failure. Digest mismatches are refused before that DDL. Never fabricates trust:
  * a recorded legacy Go SDK digest that reproduces from the supplied plan
  * adopts the row as verified; everything else adopts as unverified with a
  * NULL checksum; a recorded checksum matching neither digest aborts the
@@ -436,15 +438,39 @@ export async function adoptMigrations(
     const exists = await transport.fetchval<number>(
       'SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = \'_neutron_migrations\')');
     if (!exists) throw new Error('nucleus: nothing to adopt: no migration history exists');
-    await ensureTable(transport);
 
     const byVersion = new Map(plan.map((m) => [m.version, m]));
-    const history = await transport.query<{ version: number; name: string; checksum: string | null }>(
-      'SELECT version, name, checksum FROM _neutron_migrations');
-
     const report: MigrationAdoptionReport = { verified: [], unverified: [] };
-    const tx = await transport.beginTransaction();
+    const isNucleus = String(await transport.fetchval('SELECT version()')).includes('Nucleus');
+    let tx = await transport.beginTransaction();
     try {
+      const hasChecksum = await tx.fetchval<boolean>(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = '_neutron_migrations' AND column_name = 'checksum')");
+      const history = await tx.query<{ version: number; name: string; checksum: string | null }>(
+        hasChecksum ? 'SELECT version, name, checksum FROM _neutron_migrations' :
+          'SELECT version, name, NULL AS checksum FROM _neutron_migrations');
+      // Validate every digest before nullable-column DDL: catalog DDL is not
+      // rolled back by Nucleus, whereas PostgreSQL rolls it back with this tx.
+      for (const row of history.rows) {
+        const version = Number(row.version);
+        const m = byVersion.get(version);
+        if (m && row.checksum != null && row.checksum !== migrationChecksum(m.up) &&
+            row.checksum !== legacyGoSdkChecksum(version, row.name, m.up)) {
+          throw new Error(`nucleus: adoption refused: migration ${version} (${row.name}) has a recorded checksum that matches neither the supplied plan nor the legacy Go SDK digest — restore the applied SQL or reconcile manually`);
+        }
+      }
+      if (isNucleus) {
+        // Finish the old tuple-layout snapshot before nontransactional DDL.
+        // The same ledger claim covers preflight, upgrade, and graduation.
+        await tx.rollback();
+        await ensureTable(transport);
+        tx = await transport.beginTransaction();
+      } else {
+        // Do not retry a DDL error inside an aborted PostgreSQL transaction.
+        for (const ddl of [MIGRATIONS_ADD_CHECKSUM, MIGRATIONS_ADD_OWNER, MIGRATIONS_ADD_FORMAT]) {
+          await tx.execute(ddl);
+        }
+      }
       for (const row of history.rows) {
         const version = Number(row.version);
         const m = byVersion.get(version);
