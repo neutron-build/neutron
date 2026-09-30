@@ -1148,8 +1148,6 @@ impl StorageEngine for ColumnarStorageEngine {
         limit: Option<usize>,
         prune: Option<(&str, &crate::storage::granule_stats::FilterPredicate)>,
     ) -> Result<Vec<Row>, StorageError> {
-        let _mutation = self.mutation_gate.lock();
-        self.ensure_healthy()?;
         let Some((col, predicate)) = prune else {
             return self.scan_projected(table, projection, limit).await;
         };
@@ -1157,6 +1155,8 @@ impl StorageEngine for ColumnarStorageEngine {
         if bounds.is_empty() {
             return self.scan_projected(table, projection, limit).await;
         }
+        let _mutation = self.mutation_gate.lock();
+        self.ensure_healthy()?;
         self.flush_write_buffer(table);
         let store = self.store.read();
         if !store.table_exists(table) {
