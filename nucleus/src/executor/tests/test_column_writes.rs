@@ -518,3 +518,124 @@ async fn x10_generated_checks_guard_cascades_before_any_write() {
     assert_eq!(ints(&ex, "SELECT id FROM parent").await, [[1]]);
     assert_eq!(ints(&ex, "SELECT p,g FROM child").await, [[1, 2]]);
 }
+
+#[tokio::test]
+async fn x10_generated_expressions_refuse_unverified_functions() {
+    let ex = test_executor();
+    exec(&ex, "CREATE SEQUENCE generated_side_effect_seq").await;
+    exec(&ex, "CREATE FUNCTION generated_side_effect() RETURNS BIGINT LANGUAGE SQL AS $$ SELECT nextval('generated_side_effect_seq') $$").await;
+    for (name, expr) in [
+        ("udf", "generated_side_effect()"),
+        ("pid", "pg_backend_pid()"),
+        ("role", "current_role"),
+        ("qualified", "pg_catalog.random()"),
+        ("kv", "kv_incr('generated_side_effect_key')"),
+    ] {
+        let sql = format!(
+            "CREATE TABLE generated_bad_{name} (a INT, b TEXT GENERATED ALWAYS AS ({expr}) STORED)"
+        );
+        assert!(ex.execute(&sql).await.is_err(), "accepted {sql}");
+        assert!(
+            ex.catalog
+                .get_table(&format!("generated_bad_{name}"))
+                .await
+                .is_none()
+        );
+    }
+    exec(&ex, "CREATE TABLE generated_good (a INT, s TEXT, b INT GENERATED ALWAYS AS (abs(a)) STORED, t TEXT GENERATED ALWAYS AS (upper(s)) STORED)").await;
+    exec(&ex, "INSERT INTO generated_good(a,s) VALUES (-3,'ok')").await;
+    assert_eq!(ints(&ex, "SELECT a,b FROM generated_good").await, [[-3, 3]]);
+    assert_eq!(
+        rows(&exec(&ex, "SELECT t FROM generated_good").await[0])[0],
+        vec![Value::Text("OK".into())]
+    );
+}
+
+#[tokio::test]
+async fn x10_default_errors_are_not_replaced_with_null_or_wrapped_integers() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE default_zero (a INT DEFAULT (1/0))").await;
+    assert_eq!(
+        sqlstate(&ex, "INSERT INTO default_zero DEFAULT VALUES").await,
+        "22012"
+    );
+    assert_eq!(ints(&ex, "SELECT count(*) FROM default_zero").await, [[0]]);
+    exec(&ex, "CREATE TABLE default_wide (a INT DEFAULT 2147483648)").await;
+    assert_eq!(
+        sqlstate(&ex, "INSERT INTO default_wide DEFAULT VALUES").await,
+        "22003"
+    );
+    assert_eq!(ints(&ex, "SELECT count(*) FROM default_wide").await, [[0]]);
+}
+
+#[tokio::test]
+async fn x10_identity_dump_preserves_sequence_definition_and_position() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE identity_dump (id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY)",
+    )
+    .await;
+    // Exercise the complete sequence definition, including the restart default.
+    {
+        let seqs = ex.sequences.read();
+        let mut seq = seqs.get("identity_dump_id_seq").unwrap().lock();
+        seq.increment = 3;
+        seq.min_value = 2;
+        seq.max_value = 200;
+        seq.start = 11;
+        seq.current = 8;
+    }
+    exec(&ex, "INSERT INTO identity_dump DEFAULT VALUES").await;
+    let dump = ex.dump_logical().await.unwrap();
+    let restored = test_executor();
+    restored.restore_logical(&dump).await.unwrap();
+    {
+        let seqs = restored.sequences.read();
+        let seq = seqs.get("identity_dump_id_seq").unwrap().lock();
+        assert_eq!(
+            (
+                seq.increment,
+                seq.min_value,
+                seq.max_value,
+                seq.start,
+                seq.current
+            ),
+            (3, 2, 200, 11, 11)
+        );
+    }
+    assert_eq!(
+        ints(
+            &restored,
+            "INSERT INTO identity_dump DEFAULT VALUES RETURNING id"
+        )
+        .await,
+        [[14]]
+    );
+    exec(&restored, "ALTER SEQUENCE identity_dump_id_seq RESTART").await;
+    assert_eq!(
+        ints(&restored, "SELECT nextval('identity_dump_id_seq')").await,
+        [[11]]
+    );
+}
+
+#[tokio::test]
+async fn x10_cascade_duplicate_parent_batch_leaves_both_tables_unchanged() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE atomic_parent(id INT PRIMARY KEY)").await;
+    exec(&ex, "CREATE TABLE atomic_child(p INT REFERENCES atomic_parent(id) ON UPDATE CASCADE, g INT GENERATED ALWAYS AS(p*2) STORED UNIQUE)").await;
+    exec(&ex, "INSERT INTO atomic_parent VALUES (1),(2)").await;
+    exec(&ex, "INSERT INTO atomic_child(p) VALUES (1),(2)").await;
+    assert_eq!(
+        sqlstate(&ex, "UPDATE atomic_parent SET id=3").await,
+        "23505"
+    );
+    assert_eq!(
+        ints(&ex, "SELECT id FROM atomic_parent ORDER BY id").await,
+        [[1], [2]]
+    );
+    assert_eq!(
+        ints(&ex, "SELECT p,g FROM atomic_child ORDER BY p").await,
+        [[1, 2], [2, 4]]
+    );
+}
