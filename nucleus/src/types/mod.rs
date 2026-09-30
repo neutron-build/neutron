@@ -2022,3 +2022,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod jsonb_tests;

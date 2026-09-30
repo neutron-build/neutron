@@ -165,3 +165,41 @@ async fn x11_delete_using_empty_source_refuses_before_mutation() {
     let result = exec(&ex, "SELECT id FROM x11_delete_target").await;
     assert_eq!(scalar(&result[0]), &Value::Int32(1));
 }
+
+#[tokio::test]
+async fn x11_jsonb_numeric_scale_does_not_change_equality_distinct_or_joins() {
+    let ex = test_executor();
+    for sql in [
+        "SELECT '1.0'::jsonb = '1.00'::jsonb",
+        "SELECT '{\"x\":[1.0]}'::jsonb = '{\"x\":[1.00]}'::jsonb",
+    ] {
+        assert_eq!(
+            scalar(&exec(&ex, sql).await[0]),
+            &Value::Bool(true),
+            "{sql}"
+        );
+    }
+    exec(&ex, "CREATE TABLE x11_json_keys (id int, v jsonb)").await;
+    exec(
+        &ex,
+        "INSERT INTO x11_json_keys VALUES (1, '{\"x\":[1.0]}'), (2, '{\"x\":[1.00]}')",
+    )
+    .await;
+    let result = exec(&ex, "SELECT JSONB_AGG(DISTINCT v) FROM x11_json_keys").await;
+    let Value::Jsonb(serde_json::Value::Array(values)) = scalar(&result[0]) else {
+        panic!("JSONB array expected");
+    };
+    assert_eq!(values.len(), 1);
+    let result = exec(&ex, "SELECT DISTINCT v FROM x11_json_keys").await;
+    assert_eq!(rows(&result[0]).len(), 1);
+    assert_eq!(
+        scalar(
+            &exec(
+                &ex,
+                "SELECT COUNT(*) FROM x11_json_keys a JOIN x11_json_keys b ON a.v = b.v"
+            )
+            .await[0]
+        ),
+        &Value::Int64(4)
+    );
+}
