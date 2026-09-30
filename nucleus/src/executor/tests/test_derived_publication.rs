@@ -350,3 +350,91 @@ async fn conditional_delete_commit_rejects_same_key_revision_replacement() {
         vec![vec![Value::Int32(1), Value::Text("winner".into())]]
     );
 }
+
+#[tokio::test]
+async fn pinned_read_transaction_fts_matches_its_visible_heap_after_writer_commit() {
+    let catalog = Arc::new(Catalog::new());
+    let storage: Arc<dyn StorageEngine> = Arc::new(crate::storage::MvccStorageAdapter::new());
+    let executor = Executor::new(catalog, storage);
+    exec(
+        &executor,
+        "CREATE TABLE snapshot_articles (id INT PRIMARY KEY, body TEXT)",
+    )
+    .await;
+    let fillers: Vec<_> = (2..514).map(|id| format!("({id}, 'filler')")).collect();
+    exec(
+        &executor,
+        &format!(
+            "INSERT INTO snapshot_articles VALUES (1, 'needle'), {}",
+            fillers.join(",")
+        ),
+    )
+    .await;
+    exec(
+        &executor,
+        "CREATE INDEX snapshot_articles_fts ON snapshot_articles USING FTS (body)",
+    )
+    .await;
+    executor
+        .execute_with_session(83, "BEGIN READ ONLY")
+        .await
+        .unwrap();
+    let initial = executor
+        .execute_with_session(
+            83,
+            "SELECT id FROM snapshot_articles WHERE (body || '') @@ 'needle' ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows(&initial[0]), &vec![vec![Value::Int32(1)]]);
+    let changed = executor
+        .execute_with_session(
+            84,
+            "UPDATE snapshot_articles SET body = 'changed' WHERE id = 1",
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        &changed[0],
+        ExecResult::Command {
+            rows_affected: 1,
+            ..
+        }
+    ));
+    let current = executor
+        .execute_with_session(
+            84,
+            "SELECT id FROM snapshot_articles WHERE (body || '') @@ 'needle' ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert!(
+        rows(&current[0]).is_empty(),
+        "competing update did not commit"
+    );
+    let heap = executor
+        .execute_with_session(
+            83,
+            "SELECT id FROM snapshot_articles WHERE (body || '') @@ 'needle' ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&heap[0]),
+        &vec![vec![Value::Int32(1)]],
+        "reader snapshot was not pinned"
+    );
+    let indexed = executor
+        .execute_with_session(
+            83,
+            "SELECT id FROM snapshot_articles WHERE body @@ 'needle' ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&indexed[0]),
+        rows(&heap[0]),
+        "current sidecar hid older snapshot row"
+    );
+    executor.execute_with_session(83, "ROLLBACK").await.unwrap();
+}
