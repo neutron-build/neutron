@@ -2566,6 +2566,8 @@ mod tests {
                     default_expr: None,
                     id: 1,
                     analyzer: None,
+                    generation: None,
+                    max_len: None,
                 },
                 crate::catalog::ColumnDef {
                     name: "status".into(),
@@ -2574,6 +2576,8 @@ mod tests {
                     default_expr: None,
                     id: 2,
                     analyzer: None,
+                    generation: None,
+                    max_len: None,
                 },
             ],
             constraints: vec![],
