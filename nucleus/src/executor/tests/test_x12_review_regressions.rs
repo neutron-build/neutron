@@ -145,3 +145,72 @@ async fn x12_generation_metadata_matches_real_column_behavior() {
     .await;
     assert_eq!(scalar(&result[0]), &Value::Int64(2));
 }
+
+#[tokio::test]
+async fn x12_foreign_key_modes_match_catalog_and_deparsed_definition() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE x12_fk_parent (id INT PRIMARY KEY)").await;
+    for (name, clause, can_defer, starts_deferred, suffix) in [
+        ("x12_fk_fixed", "NOT DEFERRABLE", false, false, ""),
+        (
+            "x12_fk_immediate",
+            "DEFERRABLE INITIALLY IMMEDIATE",
+            true,
+            false,
+            " DEFERRABLE",
+        ),
+        (
+            "x12_fk_deferred",
+            "DEFERRABLE INITIALLY DEFERRED",
+            true,
+            true,
+            " DEFERRABLE INITIALLY DEFERRED",
+        ),
+    ] {
+        exec(&ex, &format!("CREATE TABLE {name} (id INT, CONSTRAINT {name}_ref FOREIGN KEY (id) REFERENCES x12_fk_parent (id) {clause})")).await;
+        let result = exec(&ex, &format!("SELECT condeferrable, condeferred, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = '{name}_ref'")).await;
+        assert_eq!(
+            rows(&result[0]),
+            &vec![vec![
+                Value::Bool(can_defer),
+                Value::Bool(starts_deferred),
+                Value::Text(format!(
+                    "FOREIGN KEY (id) REFERENCES x12_fk_parent(id){suffix}"
+                )),
+            ]]
+        );
+    }
+}
+
+#[tokio::test]
+async fn x12_unsupported_index_ordering_is_refused_before_catalog_mutation() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE x12_ordering (id INT)").await;
+    for (name, keys) in [
+        ("x12_desc", "id DESC"),
+        ("x12_null_first", "id NULLS FIRST"),
+        ("x12_null_last", "id ASC NULLS LAST"),
+    ] {
+        let error = ex
+            .execute(&format!("CREATE INDEX {name} ON x12_ordering ({keys})"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ExecError::Unsupported(_)), "{error:?}");
+        let result = exec(
+            &ex,
+            &format!("SELECT count(*) FROM pg_class WHERE relname = '{name}'"),
+        )
+        .await;
+        assert_eq!(scalar(&result[0]), &Value::Int64(0));
+    }
+    exec(&ex, "CREATE INDEX x12_ascending ON x12_ordering (id ASC)").await;
+    let result = exec(
+        &ex,
+        "SELECT pg_get_indexdef(oid) FROM pg_class WHERE relname = 'x12_ascending'",
+    )
+    .await;
+    assert_eq!(
+        scalar(&result[0]),
+        &Value::Text("CREATE INDEX x12_ascending ON public.x12_ordering USING btree (id)".into())
+    );
+}
