@@ -2,7 +2,7 @@
 
 Go SDK for the Neutron ecosystem — an HTTP application framework and a Nucleus
 database client covering all 14 data models, in one Go module:
-`github.com/neutron-build/neutron/go` (Go 1.24+).
+`github.com/neutron-build/neutron/go` (Go 1.26+).
 
 ```bash
 go get github.com/neutron-build/neutron/go

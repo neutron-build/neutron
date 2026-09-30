@@ -92,7 +92,7 @@ func writeTemplate(path, tmplStr string, data any) error {
 
 var goModTmpl = `module {{.Module}}
 
-go 1.22
+go 1.26.0
 
 require (
 	github.com/neutron-build/neutron/go v0.1.0
