@@ -124,3 +124,4 @@ mod test_x11_review_regressions;
 mod test_x12_review_regressions;
 
 mod test_x12_array_boundary;
+mod test_x12_recursive_cte;
