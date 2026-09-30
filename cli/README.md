@@ -43,7 +43,7 @@ brew upgrade neutron   # delegated automatically for Homebrew installs
 | `dev` | Detect the project language and start its dev server |
 | `project check` / `plan` / `run` | Validate, inspect and run tasks for an experimental multi-service application |
 | `db` | Manage a local Nucleus instance -- subcommands `start`, `stop`, `status`, `reset` |
-| `migrate` | Apply SQL migrations -- subcommands `status`, `create <name>`, `down [N]` |
+| `migrate` | Apply SQL migrations to PostgreSQL (Nucleus refused) -- subcommands `status`, `create <name>`, `down [N]` |
 | `seed` | Run a SQL seed file against the database |
 | `generate` | Generate typed code from a table schema (go, ts, rust, python, elixir, zig) |
 | `studio` | Launch the embedded Studio web UI in the browser |
@@ -67,13 +67,18 @@ brew upgrade neutron   # delegated automatically for Homebrew installs
 
 ## Quick Start
 
-```bash
-neutron new my-api --lang go   # scaffold a Go project (omit --lang to pick interactively)
-cd my-api
-neutron db start               # download + start a local Nucleus instance
-neutron migrate                # apply pending migrations
-neutron dev                    # start the language-appropriate dev server
-```
+For migrations, provision a PostgreSQL database first and set `DATABASE_URL`
+to its connection URL. Scaffold with `neutron new my-api --lang go`, enter the
+project, then run `neutron --url "$DATABASE_URL" migrate` to apply pending
+migration files. The generated Go application reads `NEUTRON_DATABASE_URL`
+before `DATABASE_URL`; ensure it selects that same PostgreSQL database before
+starting `neutron dev`.
+
+For experimental local Nucleus development, `neutron db start` downloads and
+starts the local engine. It does not make `neutron migrate` applicable:
+the CLI file workflow refuses Nucleus. Use the experimental language SDK
+migration APIs (`go/nucleus` or `@neutron-build/nucleus`) within their documented
+limits; SDK startup is not a promise to apply CLI migration files.
 
 Generate a typed client for a table, or every table in a schema:
 

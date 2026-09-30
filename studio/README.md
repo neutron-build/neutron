@@ -409,8 +409,10 @@ published CLI targets) and onboarding on Linux.
   (`orm-matrix.yml` run 36614418202 on main 071759ea). PostgreSQL 14 is not supported. Pull requests also run the
   real-browser journey on 17 (see the support matrix in
   `typescript/packages/neutron-sql/README.md`). Nucleus connections open the
-  model modules, measured against Nucleus 1.0.2 and not advertised for
-  release; the limits registry above states what each model does. Row
+  model modules, with historical evidence in the named
+  [2026-09-30 ORM recording](../conformance/live/orm/ORM_CONFORMANCE.md),
+  whose binary/source identity is not current-checkout certification and whose
+  Nucleus profile remains unsupported; the limits registry above states what each model does. Row
   editing on Nucleus is read-only: the catalog query that identifies keys
   and row versions does not run there.
 - **Platforms.** The CLI that embeds Studio is released for Linux and macOS
@@ -442,8 +444,10 @@ published CLI targets) and onboarding on Linux.
 
 ## Status
 
-Implemented and under active development — private workspace software in this
-monorepo, not a published product.
+Implemented and under active development in this monorepo. Studio is distributed
+as the embedded browser UI in CLI archives, rather than as a standalone package.
+The embed gate checks bundled asset identity; this statement does not certify a
+particular downloaded release artifact.
 
 ---
 

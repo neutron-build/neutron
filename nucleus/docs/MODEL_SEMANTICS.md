@@ -4,13 +4,18 @@ What each data model actually promises: durability, transactions, policy, and
 consistency. `DURABILITY.md` inventories the *files*; this document states the
 *guarantees*, per model, with `file:line` evidence.
 
-Written against branch `streaming/tranche-a-groundwork` @ `1d3a16c`. Claims
+Historical verification labels below were written against branch
+`streaming/tranche-a-groundwork` @ `1d3a16c`. Claims
 marked **[verified]** were exercised end-to-end against a running
 `nucleus 0.1.1` release binary over pgwire; claims marked **[code]** were read
 from source but not executed; **[unverified]** means neither.
 
-Read this before choosing a model. **Only the SQL/relational model has the
-guarantees a PostgreSQL user expects.** Every other model is a shared in-process
+Current source corrections describe implementation and harness scope; they are
+not new executions of the historical release probes.
+
+Read this before choosing a model. **SQL also has material PostgreSQL limits:**
+buffered disk admits only READ COMMITTED, and ordinary catalog DDL is eager.
+Every other model is a shared in-process
 store reached through SQL functions, with materially weaker atomicity,
 isolation, and (for several) no durability at all.
 
@@ -33,29 +38,37 @@ power failure loses up to `wal.checkpoint_interval_secs` (default **300 s**,
 | Model | Durable on ack | Survives restart | Undone by ROLLBACK | Crash-atomic with SQL | RLS fail-closed |
 |---|---|---|---|---|---|
 | SQL / relational | **fsync** | yes | **yes** | n/a (is the SQL commit) | **enforced** (policies) |
-| KV (scalar) | fsync | yes | yes, **session-scoped** | **no** | yes (SQL); **no** over RESP |
-| KV collections | fsync | yes | **refused inside a transaction** (2026-08-19) | **no** | yes (SQL); **no** over RESP |
-| Document | fsync (**2026-08-18**, NU-006) | yes | yes, **session-scoped** | **no** | yes |
-| Graph | fsync | yes | yes, **session-scoped** | **no** | yes |
+| KV (scalar) | fsync | yes | yes, **session-scoped** | **tagged recovery** (scoped below) | yes (SQL); **no** over RESP |
+| KV collections | fsync | yes | **refused inside a transaction** (2026-08-19) | **writes refused in transactions** | yes (SQL); **no** over RESP |
+| Document | fsync (**2026-08-18**, NU-006) | yes | yes, **session-scoped** | **tagged recovery** (scoped below) | yes |
+| Graph | fsync | yes | yes, **session-scoped** | **tagged recovery** (scoped below) | yes |
 | FTS — table index (`USING FTS`, `@@`, `BM25`) | n/a — derived from rows | rebuilt from base rows at startup | **yes** (rebuilt from committed rows on abort) | n/a — the rows are the SQL commit | **enforced** (rows go through table policies) |
 | FTS — document store (`FTS_*`) | fsync (**2026-08-18**, NU-006) | yes, via `fts_index.json` (see below) | partial (undo log, best-effort) | **no** | yes (refused while RLS active) |
 | Geo | **none** | n/a — no state | n/a | n/a | n/a (pure functions) |
 | Vector (HNSW) | fsync | yes — **transaction-tagged** (2026-08-26, S63 vector slice: row writes commit/roll back/discard with the SQL transaction) | yes, **session-scoped** | **yes** for row writes (tagged records + recovery filter) | decorative (see below) |
 | Vector (IvfFlat) | **none** (rebuilt) | rebuilt from base rows | via rebuild | n/a | decorative |
-| Time series | fsync | yes | yes, **session-scoped** | **no** | yes |
-| Columnar *store* (`COLUMNAR_*`) | fsync (**2026-08-18**, NU-006) | yes | **refused inside a transaction** (2026-08-19) | **no** | yes |
+| Time series | fsync | yes | yes, **session-scoped** | **tagged recovery** (scoped below) | yes |
+| Columnar *store* (`COLUMNAR_*`) | fsync (**2026-08-18**, NU-006) | yes | **refused inside a transaction** (2026-08-19) | **writes refused in transactions** | yes |
 | Columnar *engine* (`engine='columnar'`) | **fsync** | yes | **yes** | yes | via table policies |
-| Datalog | fsync | yes (**fixed 2026-08-17**, NU-013) | yes (in-memory) | **no** | yes |
-| Streams (SQL `STREAM_*`) | fsync | entries yes; groups/cursors/PEL/acks yes (**2026-08-20**, S31-05) | yes, **session-scoped** (`9820d85a`), WAL-compensated (**2026-08-20**, S31-04) | **no** | yes |
+| Datalog | fsync | yes (**fixed 2026-08-17**, NU-013) | yes (in-memory) | **tagged recovery** (scoped below) | yes |
+| Streams (SQL `STREAM_*`) | fsync | entries yes; groups/cursors/PEL/acks yes (**2026-08-20**, S31-05) | yes, **session-scoped** (`9820d85a`), WAL-compensated (**2026-08-20**, S31-04) | **tagged recovery** (scoped below) | yes |
 | Streams (RESP `XADD`) | **none** | **NO** | **no** | **no** | **no** |
-| CDC | page cache; checkpoint durability | checkpointed events; recent tail may be lost | **no** | **no** — emitted pre-commit (NU-107 open) | yes (metadata only) |
-| Blob / large objects | fsync for manifests (**2026-08-18**, NU-006) | manifests yes; payload racy | yes, **session-scoped** | **no** | yes |
+| CDC | page cache; checkpoint durability | checkpointed events; recent tail may be lost | **no** | **no** — emitted pre-commit (NU-107 decided) | yes (metadata only) |
+| Blob / large objects | fsync for manifests (**2026-08-18**, NU-006) | manifests yes; payload racy | yes, **session-scoped** | **tagged recovery** (scoped below) | yes |
 | Pub/Sub | **none** | **NO** | **refused inside a transaction** (delivery is immediate) | **no** | yes |
 | Branch / version | **none** | **NO** | **refused inside a transaction** (2026-08-19) | **no** | yes |
 | Tensor | **none** | **NO** | **refused inside a transaction** (2026-08-19) | **no** | yes |
 | Sparse | **none** | **NO** | **refused inside a transaction** (2026-08-19) | **no** | yes |
 | Encrypted index | **unavailable** — legacy modes refuse `0A000` | historical definitions/base rows retained; no sidecar rebuild | n/a | n/a | no runtime support |
 | Stored procedures | **none** | **NO** | **not transactional** (registration is immediate and survives ROLLBACK) | **no** | partial (`CALL` ungated) |
+
+**Tagged recovery** describes enlisted write paths in
+`src/executor/enlistment.rs` and the eight surface modes in
+`src/bin/probe_crossmodel_atomicity.rs`; this edit does not rerun that harness.
+`probe_crossmodel_commit_order` checks SQL-survives implies KV-survives only.
+Neither mechanism supplies cross-session specialty isolation or certifies the
+public SQL-plus-specialty client profile, which remains unsupported in the
+[retained ORM report](../../conformance/live/orm/ORM_CONFORMANCE.md).
 
 **"Refused inside a transaction" (2026-08-19).** A mutation that `ROLLBACK`
 cannot revert is no longer accepted where a client would expect it to be
@@ -296,46 +309,24 @@ error state is implemented: a statement error aborts the transaction and a later
 that way — **[verified]** an open transaction saw a row another session
 committed after its `BEGIN`.
 
-`SERIALIZABLE` is available on both shipping engines, by two different
-mechanisms:
+**Current buffered-disk SQL boundary [code].**
+`BufferedDiskEngine::max_isolation_level` admits READ COMMITTED only;
+REPEATABLE READ and SERIALIZABLE are refused through executor admission.
+Internal storage callers can exercise table-level 2PL, but read-committed and
+autocommit writers bypass that lock protocol. Its internal census is therefore
+not a public serializability guarantee. See `src/storage/buffered_engine.rs`
+and `src/executor/txn.rs`.
 
-- **`BufferedDiskEngine`** (what `main.rs` builds for every server deployment)
-  uses **table-level strict two-phase locking** (`src/storage/lock_manager.rs`).
-  It has no versioning, so SSI — which needs a stable read snapshot to detect
-  antidependencies against — is not available to it; 2PL yields
-  conflict-serializable schedules from the lock discipline alone. Table
-  granularity is deliberate: serializability must exclude phantoms, and a row
-  lock cannot lock a row that does not exist yet.
-- **`MvccStorageAdapter`** (`--memory`, and embedded `durable_mvcc`) uses
-  **SSI**: snapshots plus rw-antidependency tracking, with the conflict check
-  at commit.
+`MvccStorageAdapter` implements SSI (snapshots and rw-antidependency tracking).
+An engine that cannot honour a requested level refuses it instead of silently
+downgrading. Historical disk lost-update observations and the 2026-08-19
+internal 2PL census are retained in
+[DATABASE_COMPLETION.md](../DATABASE_COMPLETION.md); they do not override the
+current SQL admission boundary.
 
-Consequences worth knowing before you turn it on:
-
-- **Only SERIALIZABLE transactions take locks.** As in PostgreSQL, the
-  guarantee holds *among serializable transactions*; a concurrent
-  read-committed session can still write a table a serializable transaction is
-  reading. Every non-serializable session is unaffected and pays nothing.
-- **Under 2PL the loser BLOCKS**, where under SSI it proceeds and fails at
-  commit. Deadlock is prevented by wait-die (older waits, younger dies), so
-  there is no detector and no false negatives — but a younger transaction can
-  be killed before it has done anything wrong. It returns **SQLSTATE 40001**
-  and should be retried, exactly like an SSI abort.
-- **Waits are bounded by `lock_timeout`** (default 10s, `SET lock_timeout =
-  '5s'`, `0` disables). Exceeding it returns **SQLSTATE 55P03
-  `lock_not_available`** — deliberately *not* 40001, because the holder is
-  still there and retrying will not help.
-- **Table-level locking serializes a hot table.** A write-heavy serializable
-  workload on one table will effectively run one transaction at a time. That is
-  correct but slow; use it where you need the guarantee, not by default.
-- Observability: `nucleus_lock_waits_total`,
-  `nucleus_lock_wait_duration_seconds`, `nucleus_lock_deadlock_kills_total`,
-  `nucleus_lock_timeouts_total`, `nucleus_locks_held`.
-
-An engine that cannot honour a requested level now **refuses** it rather than
-silently downgrading (`MemoryEngine` does this). Before that, `BEGIN ISOLATION
-LEVEL SERIALIZABLE` on the disk engine was accepted and run at read-committed,
-and two concurrent read-modify-writes both committed with one increment lost.
+Ordinary catalog CREATE/ALTER/DROP operations are eager shared-catalog changes,
+not transactional DML. DML rollback does not establish catalog DDL rollback or
+cross-session DDL isolation. Transactional security settings are separate.
 
 **Policy.** RLS is enforced here and only here as real policy: `USING` filters
 `SELECT`/`UPDATE`/`DELETE`, `WITH CHECK` validates `INSERT`/`UPDATE`, filtering
