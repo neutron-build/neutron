@@ -278,3 +278,75 @@ async fn open_transaction_fts_update_does_not_hide_committed_rows_from_other_ses
         );
     }
 }
+
+/// The storage used by the server must reject a buffered conditional delete
+/// after another transaction replaces that same primary key at the same slot.
+#[tokio::test]
+async fn conditional_delete_commit_rejects_same_key_revision_replacement() {
+    use crate::storage::buffered_engine::BufferedDiskEngine;
+    use crate::storage::disk_engine::DiskEngine;
+    use crate::storage::{STORAGE_SESSION_ID, StorageError};
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = Arc::new(Catalog::new());
+    let disk = Arc::new(DiskEngine::open(&dir.path().join("cas.db"), catalog.clone()).unwrap());
+    let storage = Arc::new(BufferedDiskEngine::new(disk.clone()));
+    let executor = Executor::new(catalog, storage.clone());
+    exec(
+        &executor,
+        "CREATE TABLE sessions (id INT PRIMARY KEY, revision TEXT)",
+    )
+    .await;
+    exec(&executor, "INSERT INTO sessions VALUES (1, 'old')").await;
+    let target = storage.scan_physical("sessions").await.unwrap()[0].clone();
+    for sid in [91, 92] {
+        STORAGE_SESSION_ID
+            .scope(sid, async {
+                storage.begin_txn().await.unwrap();
+                assert_eq!(
+                    storage
+                        .delete_if_unchanged("sessions", &[target.clone()])
+                        .await
+                        .unwrap(),
+                    1
+                );
+            })
+            .await;
+    }
+    STORAGE_SESSION_ID
+        .scope(91, async {
+            storage
+                .insert(
+                    "sessions",
+                    vec![Value::Int32(1), Value::Text("winner".into())],
+                )
+                .await
+                .unwrap();
+            storage.commit_txn().await.unwrap();
+        })
+        .await;
+    let replacement = disk.scan_physical("sessions").await.unwrap()[0].clone();
+    assert_eq!(
+        replacement.0, target.0,
+        "fixture did not exercise slot recycling"
+    );
+    let loser = STORAGE_SESSION_ID
+        .scope(92, async {
+            storage
+                .insert(
+                    "sessions",
+                    vec![Value::Int32(1), Value::Text("loser".into())],
+                )
+                .await
+                .unwrap();
+            storage.commit_txn().await
+        })
+        .await;
+    assert!(
+        matches!(loser, Err(StorageError::WriteConflict(_))),
+        "both revision-conditional transactions acknowledged success: {loser:?}"
+    );
+    assert_eq!(
+        disk.scan("sessions").await.unwrap(),
+        vec![vec![Value::Int32(1), Value::Text("winner".into())]]
+    );
+}
