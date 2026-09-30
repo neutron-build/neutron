@@ -13,6 +13,24 @@
 
 use crate::types::{DataType, Row, Value};
 
+/// SQL writes coerce array leaves before persistence. A physical tag for a
+/// different declared leaf type is corruption, not a request for SQL casting.
+fn array_tag_matches_declared_type(tag: u8, element_type: &DataType) -> bool {
+    if tag == 5 {
+        return true;
+    } // NULL is valid for every declared leaf type.
+    let expected = match element_type {
+        DataType::Bool => 0,
+        DataType::Int32 => 1,
+        DataType::Int64 => 2,
+        DataType::Float64 => 3,
+        // Temporal, numeric and binary leaves use the encoder's text fallback
+        // and restore their declared logical type after decoding that text.
+        _ => 4,
+    };
+    tag == expected
+}
+
 /// Serialize a row into bytes given the column types.
 pub fn serialize_row(row: &Row, col_types: &[DataType]) -> Vec<u8> {
     debug_assert_eq!(row.len(), col_types.len());
@@ -392,6 +410,9 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                     }
                     let tag = data[pos];
                     pos += 1;
+                    if !array_tag_matches_declared_type(tag, element_type) {
+                        return None;
+                    }
                     match tag {
                         0 => {
                             // Bool
@@ -943,6 +964,9 @@ fn decode_column_at(data: &[u8], pos: usize, dtype: &DataType) -> Option<Value> 
                 }
                 let tag = data[apos];
                 apos += 1;
+                if !array_tag_matches_declared_type(tag, element_type) {
+                    return None;
+                }
                 match tag {
                     0 => {
                         if apos >= arr_end {
@@ -1556,7 +1580,10 @@ mod tests {
         // And the honest case still decodes, so the guard is not just "always
         // refuse arrays".
         let good = serialize_row(
-            &vec![Value::Array(vec![Value::Text("a".into()), Value::Int32(2)])],
+            &vec![Value::Array(vec![
+                Value::Text("a".into()),
+                Value::Text("2".into()),
+            ])],
             &types,
         );
         assert!(deserialize_row(&good, &types).is_some());
