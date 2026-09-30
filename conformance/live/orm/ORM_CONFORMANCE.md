@@ -555,7 +555,7 @@ surface PostgreSQL-compatible. Advertise these bounded contracts:
 | Time series | Scoped count/range/average, microsecond timestamp keys, and tested restart recovery | These queries do not certify every retention or transaction combination |
 | Columnar model / engine | Exact typed aggregates and tested restart recovery; model transactional insert refusal; SQL-engine table rollback | Cast numeric model inputs; untyped aggregates refuse, and model writes have no SQL rollback boundary |
 | KV / blob / geo | The X04 round-trip, TTL, byte-range, scoping and geometry-oracle contracts; owned process-kill recovery | Model guards and table policies have different boundaries; process recovery is not power-loss certification |
-| Streams / Datalog | Tested stream ordering, full-ID resume, group/cursor/ack restart and rollback; Datalog recursion and facts/rules restart | Bare millisecond stream cursors skip same-millisecond siblings; this is not universal Redis or Datalog parity |
+| Streams / Datalog | Tested stream ordering, full-ID resume, pending-append rollback and group/cursor/ack restart; Datalog recursion and facts/rules restart | Bare millisecond stream cursors skip same-millisecond siblings; this is not universal Redis or Datalog parity |
 | CDC / LISTEN | Measured notification inspection and client polling behavior | CDC is not commit confirmation: rolled-back INSERT is visible, and the leg observes no UPDATE/DELETE events. LISTEN delivery can wait for statement traffic; rolled-back notifications can be delivered |
 
 Pub/Sub is limited to SQL publish/channel inspection in this evidence; SQL
