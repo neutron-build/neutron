@@ -9154,7 +9154,10 @@ impl Executor {
 
         for join in &first.joins {
             // Check for LATERAL derived table
-            if matches!(&join.relation, TableFactor::Derived { lateral: true, .. }) {
+            if matches!(
+                &join.relation,
+                TableFactor::Derived { lateral: true, .. } | TableFactor::UNNEST { .. }
+            ) {
                 let (new_meta, new_rows) = self
                     .execute_lateral_join(
                         &col_meta,
@@ -9665,30 +9668,107 @@ impl Executor {
                 Ok((meta, rows))
             }
             TableFactor::UNNEST {
-                alias, array_exprs, ..
+                alias,
+                array_exprs,
+                with_ordinality,
+                with_offset,
+                ..
             } => {
-                let alias_name = alias
-                    .as_ref()
-                    .map(|a| a.name.value.clone())
-                    .unwrap_or_else(|| "unnest".into());
-                let mut col_meta = vec![ColMeta {
-                    table: Some(alias_name.clone()),
-                    name: "unnest".into(),
-                    dtype: DataType::Text,
-                }];
-                apply_alias_columns(&mut col_meta, alias.as_ref())?;
-                let mut rows = Vec::new();
-                for expr in array_exprs {
-                    if let Ok(Value::Array(vals)) = self.eval_const_expr(expr) {
-                        for v in vals {
-                            rows.push(vec![v]);
-                        }
-                    }
+                if *with_offset {
+                    return Err(ExecError::Unsupported(
+                        "UNNEST WITH OFFSET is not implemented".into(),
+                    ));
                 }
-                Ok((col_meta, rows))
+                self.unnest_rows(
+                    alias.as_ref(),
+                    array_exprs,
+                    *with_ordinality,
+                    Some(&Vec::new()),
+                    &[],
+                )
             }
             _ => Err(ExecError::Unsupported("unsupported table factor".into())),
         }
+    }
+
+    /// PostgreSQL zips multiple UNNEST inputs, padding shorter inputs with
+    /// NULL. Nested array values flatten in storage order; ordinality counts
+    /// emitted rows from one and always has bigint metadata.
+    fn unnest_rows(
+        &self,
+        alias: Option<&ast::TableAlias>,
+        exprs: &[Expr],
+        ordinal: bool,
+        outer_row: Option<&Row>,
+        outer_meta: &[ColMeta],
+    ) -> Result<(Vec<ColMeta>, Vec<Row>), ExecError> {
+        fn flatten(value: Value, values: &mut Vec<Value>) {
+            match value {
+                Value::Array(items) => {
+                    for item in items {
+                        flatten(item, values);
+                    }
+                }
+                value => values.push(value),
+            }
+        }
+        let label = alias
+            .map(|a| a.name.value.clone())
+            .unwrap_or_else(|| "unnest".into());
+        let mut meta = Vec::new();
+        let mut arrays = Vec::new();
+        for expr in exprs {
+            let value = match outer_row {
+                Some(row) => self.eval_row_expr(expr, row, outer_meta)?,
+                None => Value::Null,
+            };
+            let mut dtype = projected_column_type(expr, &value, outer_meta);
+            let mut values = Vec::new();
+            match value {
+                Value::Array(items) => {
+                    for item in items {
+                        flatten(item, &mut values);
+                    }
+                }
+                Value::Null => {}
+                _ => {
+                    return Err(ExecError::Unsupported(
+                        "UNNEST requires array arguments".into(),
+                    ));
+                }
+            }
+            while let DataType::Array(element) = dtype {
+                dtype = *element;
+            }
+            meta.push(ColMeta {
+                table: Some(label.clone()),
+                name: "unnest".into(),
+                dtype,
+            });
+            arrays.push(values);
+        }
+        if ordinal {
+            meta.push(ColMeta {
+                table: Some(label),
+                name: "ordinality".into(),
+                dtype: DataType::Int64,
+            });
+        }
+        apply_alias_columns(&mut meta, alias)?;
+        let length = arrays.iter().map(Vec::len).max().unwrap_or(0);
+        let rows = (0..length)
+            .map(|i| {
+                let mut row: Row = arrays
+                    .iter()
+                    .map(|array| array.get(i).cloned().unwrap_or(Value::Null))
+                    .collect();
+                if ordinal {
+                    row.push(Value::Int64(i as i64 + 1));
+                }
+                row
+            })
+            .collect();
+        Ok((meta, rows))
     }
 
     /// Execute a LATERAL join: for each left row, substitute outer references
@@ -9701,6 +9781,55 @@ impl Executor {
         join_operator: &ast::JoinOperator,
         _cte_tables: &CteTableMap,
     ) -> Result<(Vec<ColMeta>, Vec<Row>), ExecError> {
+        if let TableFactor::UNNEST {
+            alias,
+            array_exprs,
+            with_ordinality,
+            with_offset,
+            ..
+        } = right_factor
+        {
+            if *with_offset
+                || matches!(
+                    join_operator,
+                    ast::JoinOperator::Right(_)
+                        | ast::JoinOperator::RightOuter(_)
+                        | ast::JoinOperator::FullOuter(_)
+                )
+            {
+                return Err(ExecError::Unsupported(
+                    "unsupported correlated UNNEST join".into(),
+                ));
+            }
+            let (empty_meta, _) = self.unnest_rows(
+                alias.as_ref(),
+                array_exprs,
+                *with_ordinality,
+                None,
+                left_meta,
+            )?;
+            let mut meta = left_meta.iter().chain(empty_meta.iter()).cloned().collect();
+            let mut rows = Vec::new();
+            for row in left_rows {
+                let (right_meta, right_rows) = self.unnest_rows(
+                    alias.as_ref(),
+                    array_exprs,
+                    *with_ordinality,
+                    Some(row),
+                    left_meta,
+                )?;
+                let (joined_meta, joined) = self.execute_join(
+                    left_meta,
+                    std::slice::from_ref(row),
+                    &right_meta,
+                    &right_rows,
+                    join_operator,
+                )?;
+                meta = joined_meta;
+                rows.extend(joined);
+            }
+            return Ok((meta, rows));
+        }
         let TableFactor::Derived {
             subquery, alias, ..
         } = right_factor

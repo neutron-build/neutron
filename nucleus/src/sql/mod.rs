@@ -349,7 +349,9 @@ pub fn parse(sql: &str) -> Result<Vec<ast::Statement>, ParseError> {
     // the load-bearing defense — the CAST cap sits below sqlparser's ~48 cliff,
     // which itself is below the default-50 recursion guard.
     let dialect = PostgreSqlDialect {};
-    let stmts = match Parser::parse_sql(&dialect, sql) {
+    let normalized = normalize_unnest_table_syntax(&dialect, sql);
+    let parser_sql = normalized.as_deref().unwrap_or(sql);
+    let stmts = match Parser::parse_sql(&dialect, parser_sql) {
         Ok(stmts) => stmts,
         // sqlparser has no grammar for `OVERRIDING {SYSTEM | USER} VALUE` or
         // `SET CONSTRAINTS`; rewrite them into parseable statements that carry
@@ -369,6 +371,52 @@ pub fn parse(sql: &str) -> Result<Vec<ast::Statement>, ParseError> {
     check_final_modifier(&stmts)?;
 
     Ok(stmts)
+}
+
+/// sqlparser's LATERAL function branch cannot carry WITH ORDINALITY.
+/// PostgreSQL UNNEST is implicitly lateral, so its UNNEST table-factor branch
+/// represents the same semantics. Normalize only unquoted builtin tokens;
+/// quoted names, strings, comments and unrelated functions remain untouched.
+fn normalize_unnest_table_syntax(dialect: &PostgreSqlDialect, sql: &str) -> Option<String> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let tokens = Tokenizer::new(dialect, sql).tokenize().ok()?;
+    let significant: Vec<usize> = (0..tokens.len())
+        .filter(|&i| !matches!(tokens[i], Token::Whitespace(_)))
+        .collect();
+    let word = |i: usize, value: &str| matches!(&tokens[i], Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(value));
+    let mut remove = std::collections::HashSet::new();
+    for (pos, &index) in significant.iter().enumerate() {
+        if !word(index, "unnest")
+            || !significant
+                .get(pos + 1)
+                .is_some_and(|&i| matches!(tokens[i], Token::LParen))
+        {
+            continue;
+        }
+        let mut start = pos;
+        if pos >= 2
+            && matches!(tokens[significant[pos - 1]], Token::Period)
+            && word(significant[pos - 2], "pg_catalog")
+        {
+            remove.insert(significant[pos - 2]);
+            remove.insert(significant[pos - 1]);
+            start -= 2;
+        }
+        if start > 0 && word(significant[start - 1], "lateral") {
+            remove.insert(significant[start - 1]);
+        }
+    }
+    if remove.is_empty() {
+        return None;
+    }
+    Some(
+        tokens
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !remove.contains(i))
+            .map(|(_, t)| t.to_string())
+            .collect(),
+    )
 }
 
 /// `OVERRIDING SYSTEM VALUE` / `OVERRIDING USER VALUE` on an INSERT.
