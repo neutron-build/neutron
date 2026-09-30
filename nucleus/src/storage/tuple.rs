@@ -1587,3 +1587,32 @@ mod x09_typed_array_roundtrip {
         }
     }
 }
+
+#[cfg(test)]
+mod x09_array_physical_tag_corruption {
+    use super::*;
+
+    #[test]
+    fn x09_array_same_width_wrong_tag_is_refused_in_both_read_paths() {
+        for (dtype, leaf, original_tag, wrong_tag) in [
+            (DataType::Float64, Value::Float64(1.5), 3, 2),
+            (DataType::Int64, Value::Int64(42), 2, 3),
+        ] {
+            let types = vec![DataType::Int32, DataType::Array(Box::new(dtype))];
+            let row = vec![Value::Int32(7), Value::Array(vec![leaf, Value::Null])];
+            let clean = serialize_row(&row, &types);
+            assert_eq!(deserialize_row(&clean, &types), Some(row.clone()));
+            assert_eq!(
+                deserialize_row_projected(&clean, &types, &[1]),
+                Some(vec![row[1].clone()])
+            );
+            // Bitmap (1), integer prefix column (4), array byte span (4),
+            // element count (4): the first element's physical tag is byte13.
+            assert_eq!(clean[13], original_tag);
+            let mut corrupt = clean;
+            corrupt[13] = wrong_tag;
+            assert_eq!(deserialize_row(&corrupt, &types), None);
+            assert_eq!(deserialize_row_projected(&corrupt, &types, &[1]), None);
+        }
+    }
+}
