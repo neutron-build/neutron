@@ -31,7 +31,7 @@ use crate::reactive::{ChangeEvent, ChangeNotifier, ChangeType, SubscriptionManag
 use crate::sql;
 #[cfg(feature = "server")]
 use crate::storage::STORAGE_SESSION_ID;
-use crate::storage::StorageEngine;
+use crate::storage::{StorageEngine, StorageError};
 use crate::types::{DataType, Row, Value};
 use crate::vector;
 
