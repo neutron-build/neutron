@@ -24,7 +24,7 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 372079; Source Rust files: 332; Top-level modules: 53.
+- Source LOC: 372118; Source Rust files: 332; Top-level modules: 53.
 - Declared unit tests: 5122; Declared integration tests: 460; Ignored tests: 53.
   These are static declarations, not executed-test claims.
 - The previously recorded successful full library run executed 4,861 passing tests, 0 failing
