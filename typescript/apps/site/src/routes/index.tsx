@@ -80,7 +80,7 @@ export default function HomePage() {
           <div class="container">
             <div class="stats__grid">
               <div class="stats__item" data-animate>
-                <span class="stats__number">5,567</span>
+                <span class="stats__number">5,580</span>
                 <span class="stats__label">Languages</span>
               </div>
               <div
