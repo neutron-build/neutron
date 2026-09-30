@@ -36,6 +36,9 @@ fn detached_fts_rebuild_preserves_completed_concurrent_insert() {
         )
         .await;
     });
+    let first_session = executor.create_session();
+    let second_session = executor.create_session();
+    assert_ne!(first_session, second_session);
     let (entered, paused) = std::sync::mpsc::channel();
     let (resume, resumed) = std::sync::mpsc::channel();
     *executor.derived_publish_hook.lock() = Some(super::super::derived_coherence::PublishHook {
@@ -51,7 +54,7 @@ fn detached_fts_rebuild_preserves_completed_concurrent_insert() {
             .build()
             .unwrap()
             .block_on(writer.execute_with_session(
-                71,
+                first_session,
                 "UPDATE articles SET body = 'needle changed' WHERE id = 1",
             ))
     });
@@ -65,7 +68,7 @@ fn detached_fts_rebuild_preserves_completed_concurrent_insert() {
         panic!("UPDATE never reached detached publication: {error}");
     }
     let insertion = runtime.block_on(executor.execute_with_session(
-        72,
+        second_session,
         "INSERT INTO articles VALUES (2, 'needle', VECTOR('[1,0,0,0]'))",
     ));
     resume.send(()).unwrap();
@@ -130,6 +133,9 @@ fn detached_zone_map_rebuild_preserves_same_count_concurrent_update() {
         )
         .await;
     });
+    let first_session = executor.create_session();
+    let second_session = executor.create_session();
+    assert_ne!(first_session, second_session);
     let (entered, paused) = std::sync::mpsc::channel();
     let (resume, resumed) = std::sync::mpsc::channel();
     *executor.derived_publish_hook.lock() = Some(super::super::derived_coherence::PublishHook {
@@ -144,7 +150,10 @@ fn detached_zone_map_rebuild_preserves_same_count_concurrent_update() {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(writer.execute_with_session(73, "UPDATE zoned SET val = 38 WHERE id = 1"))
+            .block_on(
+                writer
+                    .execute_with_session(first_session, "UPDATE zoned SET val = 38 WHERE id = 1"),
+            )
     });
     if let Err(error) = paused.recv_timeout(std::time::Duration::from_secs(10)) {
         if update.is_finished() {
@@ -155,8 +164,9 @@ fn detached_zone_map_rebuild_preserves_same_count_concurrent_update() {
         }
         panic!("UPDATE never reached detached publication: {error}");
     }
-    let second = runtime
-        .block_on(executor.execute_with_session(74, "UPDATE zoned SET val = 99 WHERE id = 2"));
+    let second = runtime.block_on(
+        executor.execute_with_session(second_session, "UPDATE zoned SET val = 99 WHERE id = 2"),
+    );
     resume.send(()).unwrap();
     let second = second.unwrap();
     assert!(matches!(
@@ -218,11 +228,17 @@ async fn open_transaction_fts_update_does_not_hide_committed_rows_from_other_ses
         "CREATE INDEX committed_articles_fts ON committed_articles USING FTS (body)",
     )
     .await;
+    let writer_session = executor.create_session();
+    let reader_session = executor.create_session();
+    assert_ne!(writer_session, reader_session);
     for completion in ["ROLLBACK", "COMMIT"] {
-        executor.execute_with_session(81, "BEGIN").await.unwrap();
+        executor
+            .execute_with_session(writer_session, "BEGIN")
+            .await
+            .unwrap();
         let changed = executor
             .execute_with_session(
-                81,
+                writer_session,
                 "UPDATE committed_articles SET body = 'changed' WHERE id = 1",
             )
             .await
@@ -236,7 +252,7 @@ async fn open_transaction_fts_update_does_not_hide_committed_rows_from_other_ses
         ));
         let heap = executor
             .execute_with_session(
-                82,
+                reader_session,
                 "SELECT id FROM committed_articles WHERE (body || '') @@ 'needle' ORDER BY id",
             )
             .await
@@ -248,7 +264,7 @@ async fn open_transaction_fts_update_does_not_hide_committed_rows_from_other_ses
         );
         let indexed = executor
             .execute_with_session(
-                82,
+                reader_session,
                 "SELECT id FROM committed_articles WHERE body @@ 'needle' ORDER BY id",
             )
             .await
@@ -258,10 +274,13 @@ async fn open_transaction_fts_update_does_not_hide_committed_rows_from_other_ses
             rows(&heap[0]),
             "uncommitted FTS hook hid a committed row"
         );
-        executor.execute_with_session(81, completion).await.unwrap();
+        executor
+            .execute_with_session(writer_session, completion)
+            .await
+            .unwrap();
         let after = executor
             .execute_with_session(
-                82,
+                reader_session,
                 "SELECT id FROM committed_articles WHERE body @@ 'needle' ORDER BY id",
             )
             .await
@@ -298,7 +317,9 @@ async fn conditional_delete_commit_rejects_same_key_revision_replacement() {
     .await;
     exec(&executor, "INSERT INTO sessions VALUES (1, 'old')").await;
     let target = storage.scan_physical("sessions").await.unwrap()[0].clone();
-    for sid in [91, 92] {
+    let first_session = executor.create_session();
+    let second_session = executor.create_session();
+    for sid in [first_session, second_session] {
         STORAGE_SESSION_ID
             .scope(sid, async {
                 storage.begin_txn().await.unwrap();
@@ -313,7 +334,7 @@ async fn conditional_delete_commit_rejects_same_key_revision_replacement() {
             .await;
     }
     STORAGE_SESSION_ID
-        .scope(91, async {
+        .scope(first_session, async {
             storage
                 .insert(
                     "sessions",
@@ -330,7 +351,7 @@ async fn conditional_delete_commit_rejects_same_key_revision_replacement() {
         "fixture did not exercise slot recycling"
     );
     let loser = STORAGE_SESSION_ID
-        .scope(92, async {
+        .scope(second_session, async {
             storage
                 .insert(
                     "sessions",
@@ -375,13 +396,16 @@ async fn pinned_read_transaction_fts_matches_its_visible_heap_after_writer_commi
         "CREATE INDEX snapshot_articles_fts ON snapshot_articles USING FTS (body)",
     )
     .await;
+    let reader_session = executor.create_session();
+    let writer_session = executor.create_session();
+    assert_ne!(reader_session, writer_session);
     executor
-        .execute_with_session(83, "BEGIN READ ONLY")
+        .execute_with_session(reader_session, "BEGIN READ ONLY")
         .await
         .unwrap();
     let initial = executor
         .execute_with_session(
-            83,
+            reader_session,
             "SELECT id FROM snapshot_articles WHERE (body || '') @@ 'needle' ORDER BY id",
         )
         .await
@@ -389,7 +413,7 @@ async fn pinned_read_transaction_fts_matches_its_visible_heap_after_writer_commi
     assert_eq!(rows(&initial[0]), &vec![vec![Value::Int32(1)]]);
     let changed = executor
         .execute_with_session(
-            84,
+            writer_session,
             "UPDATE snapshot_articles SET body = 'changed' WHERE id = 1",
         )
         .await
@@ -403,7 +427,7 @@ async fn pinned_read_transaction_fts_matches_its_visible_heap_after_writer_commi
     ));
     let current = executor
         .execute_with_session(
-            84,
+            writer_session,
             "SELECT id FROM snapshot_articles WHERE (body || '') @@ 'needle' ORDER BY id",
         )
         .await
@@ -414,7 +438,7 @@ async fn pinned_read_transaction_fts_matches_its_visible_heap_after_writer_commi
     );
     let heap = executor
         .execute_with_session(
-            83,
+            reader_session,
             "SELECT id FROM snapshot_articles WHERE (body || '') @@ 'needle' ORDER BY id",
         )
         .await
@@ -426,7 +450,7 @@ async fn pinned_read_transaction_fts_matches_its_visible_heap_after_writer_commi
     );
     let indexed = executor
         .execute_with_session(
-            83,
+            reader_session,
             "SELECT id FROM snapshot_articles WHERE body @@ 'needle' ORDER BY id",
         )
         .await
@@ -436,5 +460,8 @@ async fn pinned_read_transaction_fts_matches_its_visible_heap_after_writer_commi
         rows(&heap[0]),
         "current sidecar hid older snapshot row"
     );
-    executor.execute_with_session(83, "ROLLBACK").await.unwrap();
+    executor
+        .execute_with_session(reader_session, "ROLLBACK")
+        .await
+        .unwrap();
 }
