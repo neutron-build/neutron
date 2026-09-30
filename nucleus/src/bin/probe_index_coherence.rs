@@ -146,17 +146,24 @@ impl Report {
     }
 }
 
+/// Attribution shared by every check in one engine/iteration fixture.
+#[derive(Clone, Copy)]
+struct FixtureIdentity<'a> {
+    engine: &'a str,
+    iter: usize,
+}
+
 /// Run one table's full lifecycle on `ex`, checking coherence after each op.
 fn run_lifecycle(
     ex: &Executor,
-    engine: &str,
-    iter: usize,
+    fixture: FixtureIdentity<'_>,
     ops: usize,
     use_hnsw: bool,
     use_code_index: bool,
     rng: &mut Rng,
     rep: &mut Report,
 ) {
+    let FixtureIdentity { engine, iter } = fixture;
     let mut log: Vec<String> = Vec::new();
     macro_rules! stmt {
         ($sql:expr) => {{
@@ -253,7 +260,7 @@ fn run_lifecycle(
         check_pk_uniqueness(ex, engine, iter, &log, &model, rng, rep);
         check_vector(ex, engine, iter, &log, &model, rng, rep);
         if use_code_index {
-            check_code_index(ex, engine, iter, &log, &model, &recently_deleted, rng, rep);
+            check_code_index(ex, fixture, &log, &model, &recently_deleted, rng, rep);
         }
     }
 
@@ -385,14 +392,14 @@ fn check_vector(
 
 fn check_code_index(
     ex: &Executor,
-    engine: &str,
-    iter: usize,
+    fixture: FixtureIdentity<'_>,
     log: &[String],
     model: &BTreeMap<i64, RefRow>,
     recently_deleted: &[i64],
     rng: &mut Rng,
     rep: &mut Report,
 ) {
+    let FixtureIdentity { engine, iter } = fixture;
     if model.is_empty() {
         return;
     }
@@ -547,8 +554,7 @@ fn main_impl() {
             let use_code_index = iter % 3 != 0;
             run_lifecycle(
                 &ex,
-                engine,
-                iter,
+                FixtureIdentity { engine, iter },
                 ops,
                 use_hnsw,
                 use_code_index,
