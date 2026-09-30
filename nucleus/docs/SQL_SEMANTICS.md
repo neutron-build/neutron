@@ -124,3 +124,25 @@ and SQL `pg_cancel_backend` remain unavailable. Wire cancellation and row-lock
 timeouts have their existing surfaces; a deadlock timeout is not evidence of
 PostgreSQL deadlock detection. Cross-model rollback covers only the stores
 listed in MODEL_SEMANTICS.md, not every model in a message.
+
+### Arrays, temporal output and bytea
+
+Array casts and writes convert each leaf to the declared type. Empty arrays
+and arrays containing only NULL retain their declared result type. Array
+literals preserve escaped NULL text and escaped whitespace; ragged shapes,
+explicit dimension decorations and mixed numeric element types are refused.
+Stored multidimensional arrays, interval arrays and vector arrays are refused
+because the tuple codec cannot preserve their full representation. Binary
+array parameters support one dimension with lower bound 1; malformed payloads,
+other lower bounds and mismatched element OIDs are refused.
+
+TIMESTAMPTZ casts, array writes and output use the session time zone. Ambiguous
+or nonexistent bare local times are refused; use an explicit offset. EXTRACT
+and DATE_PART preserve fractional seconds and epoch fractions for timestamp
+values. DECODE returns
+raw BYTEA for hex/base64 input, and ENCODE preserves those bytes.
+
+These fixes do not establish full PostgreSQL scalar parity. Date infinity,
+enum declaration-order sorting and arbitrary numeric precision/scale remain
+limits. Large bare numeric literals may pass through floating-point parsing;
+use an exact text-to-NUMERIC cast within the engine's supported decimal range.

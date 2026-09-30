@@ -189,11 +189,34 @@ pub(super) fn projected_column_type(
     value: &Value,
     col_meta: &[ColMeta],
 ) -> DataType {
-    if matches!(value, Value::Null) {
-        infer_expr_type(expr, col_meta)
+    let inferred = infer_expr_type(expr, col_meta);
+    if matches!(value, Value::Null) || matches!(inferred, DataType::Array(_)) {
+        inferred
     } else {
         value_type(value)
     }
+}
+
+/// Element type of a non-column array value: that of its non-NULL elements
+/// (integers of mixed width widen to bigint), nested arrays by their leaves,
+/// text when there is nothing to go on.
+fn array_element_type(items: &[Value]) -> DataType {
+    let mut found: Option<DataType> = None;
+    for item in items {
+        let ty = match item {
+            Value::Null => continue,
+            Value::Array(inner) => array_element_type(inner),
+            other => value_type(other),
+        };
+        found = Some(match (found, ty) {
+            (None, ty) => ty,
+            (Some(DataType::Int32), DataType::Int64) | (Some(DataType::Int64), DataType::Int32) => {
+                DataType::Int64
+            }
+            (Some(prev), _) => prev,
+        });
+    }
+    found.unwrap_or(DataType::Text)
 }
 
 pub(super) fn value_type(value: &Value) -> DataType {
@@ -211,7 +234,7 @@ pub(super) fn value_type(value: &Value) -> DataType {
         Value::Numeric(_) => DataType::Numeric,
         Value::Uuid(_) => DataType::Uuid,
         Value::Bytea(_) => DataType::Bytea,
-        Value::Array(_) => DataType::Array(Box::new(DataType::Text)),
+        Value::Array(items) => DataType::Array(Box::new(array_element_type(items))),
         Value::Vector(v) => DataType::Vector(v.len()),
         Value::Interval { .. } => DataType::Interval,
     }
@@ -283,6 +306,7 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
                 _ => None,
             };
             match name.as_str() {
+                "DECODE" => DataType::Bytea,
                 "MAKE_INTERVAL" | "PG_CATALOG.MAKE_INTERVAL" => DataType::Interval,
                 "COUNT" => DataType::Int64,
                 "AVG"
@@ -467,7 +491,15 @@ pub(super) fn parse_lock_timeout(value: &str) -> Result<u64, ExecError> {
 pub(super) fn parse_time_zone(value: &str) -> Result<Tz, ExecError> {
     let name = value.trim().trim_matches(['\'', '"']);
     name.parse::<Tz>()
-        .map_err(|_| ExecError::Runtime(format!("time zone '{name}' is not recognized")))
+        .ok()
+        // PostgreSQL matches zone names case-insensitively ('asia/tokyo').
+        .or_else(|| {
+            chrono_tz::TZ_VARIANTS
+                .iter()
+                .find(|zone| zone.name().eq_ignore_ascii_case(name))
+                .copied()
+        })
+        .ok_or_else(|| ExecError::Runtime(format!("time zone '{name}' is not recognized")))
 }
 
 const POSTGRES_UNIX_EPOCH_SECONDS: i64 = 946_684_800;
@@ -697,8 +729,12 @@ fn coerce_text_and_compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         (Value::Date(d), Value::Text(s)) => parse_date_string(s).map(|v| d.cmp(&v)),
         (Value::Text(s), Value::Timestamp(t)) => text_to_timestamp_us(s).map(|v| v.cmp(t)),
         (Value::Timestamp(t), Value::Text(s)) => text_to_timestamp_us(s).map(|v| t.cmp(&v)),
-        (Value::Text(s), Value::TimestampTz(t)) => text_to_timestamp_us(s).map(|v| v.cmp(t)),
-        (Value::TimestampTz(t), Value::Text(s)) => text_to_timestamp_us(s).map(|v| t.cmp(&v)),
+        (Value::Text(s), Value::TimestampTz(t)) => {
+            super::timestamptz::timestamptz_text_to_instant(s).map(|v| v.cmp(t))
+        }
+        (Value::TimestampTz(t), Value::Text(s)) => {
+            super::timestamptz::timestamptz_text_to_instant(s).map(|v| t.cmp(&v))
+        }
         // text vs uuid — accept the canonical 8-4-4-4-12 hex form.
         (Value::Text(s), Value::Uuid(u)) => parse_uuid_text(s).map(|v| v.cmp(u)),
         (Value::Uuid(u), Value::Text(s)) => parse_uuid_text(s).map(|v| u.cmp(&v)),

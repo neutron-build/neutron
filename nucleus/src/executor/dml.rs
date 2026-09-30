@@ -78,14 +78,54 @@ fn coerce_value_for_write(
     // Postgres array-literal text (`{a,b}`) into a real Array. Without this an
     // ARRAY column can only be written from an ARRAY[...] expression — a text
     // literal, which is all COPY has, would fail the cast below.
-    if matches!(column.data_type, DataType::Array(_))
-        && let Value::Text(text) = value
-    {
-        let trimmed = text.trim();
-        if trimmed.starts_with('{') && trimmed.ends_with('}') {
-            *value = Value::Array(super::expr::parse_pg_array_literal(trimmed));
+    if let DataType::Array(element) = &column.data_type {
+        if matches!(
+            element.as_ref(),
+            DataType::Array(_) | DataType::Interval | DataType::Vector(_)
+        ) {
+            return Err(ExecError::Unsupported(
+                "stored arrays of this element type are not supported by the tuple codec".into(),
+            ));
+        }
+        let mut leaf = column.clone();
+        leaf.data_type = *element.clone();
+        if let Value::Text(text) = value {
+            let items = crate::types::parse_array_literal(text).map_err(ExecError::Runtime)?;
+            *value = crate::types::array_value_from_literal(&items, &mut |s| {
+                let mut item = Value::Text(s.to_string());
+                coerce_value_for_write(&mut item, &leaf, session_time_zone)
+                    .map_err(|error| error.to_string())?;
+                Ok(item)
+            })
+            .map_err(ExecError::Runtime)?;
+        }
+        if let Value::Array(items) = value {
+            if items.iter().any(|item| matches!(item, Value::Array(_))) {
+                return Err(ExecError::Unsupported(
+                    "stored multidimensional arrays are not supported by the tuple codec".into(),
+                ));
+            }
+            crate::types::validate_array_shape(items).map_err(ExecError::Runtime)?;
+            fn coerce(
+                items: &mut [Value],
+                leaf: &ColumnDef,
+                tz: chrono_tz::Tz,
+            ) -> Result<(), ExecError> {
+                for item in items {
+                    match item {
+                        Value::Array(inner) => coerce(inner, leaf, tz)?,
+                        other => coerce_value_for_write(other, leaf, tz)?,
+                    }
+                }
+                Ok(())
+            }
+            coerce(items, &leaf, session_time_zone)?;
             return Ok(());
         }
+        return Err(ExecError::Runtime(format!(
+            "invalid array value for column '{}'",
+            column.name
+        )));
     }
     if matches!(column.data_type, DataType::Interval)
         && let Value::Text(text) = value
@@ -94,15 +134,26 @@ fn coerce_value_for_write(
         return Ok(());
     }
     if matches!(column.data_type, DataType::TimestampTz) {
+        // Text: an explicit offset or zone name decides the instant, only a
+        // bare literal is wall time in the session zone.
+        if let Value::Text(text) = value {
+            let instant = super::timestamptz::parse_timestamptz_text(text, session_time_zone)
+                .map_err(|error| {
+                    ExecError::Runtime(format!(
+                        "invalid value for column '{}' ({}): {}",
+                        column.name,
+                        column.data_type,
+                        match error {
+                            ExecError::Runtime(message) => message,
+                            other => other.to_string(),
+                        }
+                    ))
+                })?;
+            *value = Value::TimestampTz(instant);
+            return Ok(());
+        }
         let local = match value {
-            Value::Text(text) => Some(crate::types::parse_timestamp(text).map_err(|error| {
-                ExecError::Runtime(format!(
-                    "invalid value for column '{}' ({}): {error}",
-                    column.name, column.data_type
-                ))
-            })?),
             Value::Timestamp(timestamp) => Some(*timestamp),
-            Value::TimestampTz(_) => None,
             _ => None,
         };
         if let Some(local) = local {

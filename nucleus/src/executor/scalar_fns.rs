@@ -1171,27 +1171,39 @@ impl Executor {
                             ))),
                         }
                     }
-                    Value::Timestamp(ts) => {
-                        let total_secs = *ts / 1_000_000;
-                        let days = (total_secs / 86400) as i32;
-                        let time_secs = total_secs % 86400;
-                        let (y, m, day) = crate::types::days_to_ymd(days);
-                        match field.as_str() {
-                            "year" => Ok(Value::Int32(y)),
-                            "month" => Ok(Value::Int32(m as i32)),
-                            "day" => Ok(Value::Int32(day as i32)),
-                            "hour" => Ok(Value::Int32((time_secs / 3600) as i32)),
-                            "minute" => Ok(Value::Int32(((time_secs % 3600) / 60) as i32)),
-                            "second" => Ok(Value::Int32((time_secs % 60) as i32)),
-                            "epoch" => Ok(Value::Int64(total_secs)),
-                            "dow" | "dayofweek" => {
-                                let jdn = days + 2451545;
-                                Ok(Value::Int32(jdn.rem_euclid(7)))
-                            }
-                            _ => Err(ExecError::Unsupported(format!(
-                                "EXTRACT({field}) from timestamp"
-                            ))),
+                    // A timestamp's fields are its wall clock; a timestamptz's
+                    // are its wall clock in the session zone (its epoch is the
+                    // instant). `epoch` is seconds since 1970, not 2000.
+                    Value::Timestamp(_) | Value::TimestampTz(_) => {
+                        let (wall, instant) = match &args[1] {
+                            Value::TimestampTz(instant) => (
+                                timestamptz_at_time_zone(*instant, self.session_time_zone()?)?,
+                                *instant,
+                            ),
+                            Value::Timestamp(ts) => (*ts, *ts),
+                            _ => unreachable!(),
+                        };
+                        if field == "second" || field == "epoch" {
+                            let micros = if field == "second" {
+                                i128::from(wall.rem_euclid(60_000_000))
+                            } else {
+                                i128::from(instant) + 946_684_800_000_000i128
+                            };
+                            let decimal = rust_decimal::Decimal::from_i128_with_scale(micros, 6);
+                            return if fname == "DATE_PART" {
+                                Ok(Value::Float64(micros as f64 / 1_000_000.0))
+                            } else {
+                                Ok(Value::Numeric(decimal.to_string()))
+                            };
                         }
+                        super::timestamptz::wall_clock_field(&field, wall, instant)
+                            .map(|n| match n {
+                                n if field == "epoch" => Value::Int64(n),
+                                n => Value::Int32(n as i32),
+                            })
+                            .ok_or_else(|| {
+                                ExecError::Unsupported(format!("EXTRACT({field}) from timestamp"))
+                            })
                     }
                     Value::Int64(v) => {
                         // Treat as epoch seconds
@@ -1248,29 +1260,19 @@ impl Executor {
                     }
                 };
                 match &args[1] {
-                    Value::Timestamp(ts) => {
-                        let total_secs = *ts / 1_000_000;
-                        let days = (total_secs / 86400) as i32;
-                        let time_secs = total_secs % 86400;
-                        let (y, m, _d) = crate::types::days_to_ymd(days);
-                        let truncated_us = match field.as_str() {
-                            "year" => crate::types::ymd_to_days(y, 1, 1) as i64 * 86400 * 1_000_000,
-                            "month" => {
-                                crate::types::ymd_to_days(y, m, 1) as i64 * 86400 * 1_000_000
-                            }
-                            "day" => days as i64 * 86400 * 1_000_000,
-                            "hour" => {
-                                days as i64 * 86400 * 1_000_000
-                                    + (time_secs / 3600) * 3600 * 1_000_000
-                            }
-                            "minute" => {
-                                days as i64 * 86400 * 1_000_000 + (time_secs / 60) * 60 * 1_000_000
-                            }
-                            _ => {
-                                return Err(ExecError::Unsupported(format!("DATE_TRUNC({field})")));
-                            }
-                        };
-                        Ok(Value::Timestamp(truncated_us))
+                    Value::Timestamp(ts) => super::timestamptz::truncate_wall_clock(&field, *ts)
+                        .map(Value::Timestamp)
+                        .ok_or_else(|| ExecError::Unsupported(format!("DATE_TRUNC({field})"))),
+                    // Truncate on the session-zone wall clock, then read the
+                    // result back as an instant in that zone.
+                    Value::TimestampTz(us) => {
+                        let tz = self.session_time_zone()?;
+                        let wall = timestamptz_at_time_zone(*us, tz)?;
+                        let truncated = super::timestamptz::truncate_wall_clock(&field, wall)
+                            .ok_or_else(|| {
+                                ExecError::Unsupported(format!("DATE_TRUNC({field})"))
+                            })?;
+                        local_timestamp_at_time_zone(truncated, tz).map(Value::TimestampTz)
                     }
                     Value::Date(d) => {
                         let (y, m, _) = crate::types::days_to_ymd(*d);
@@ -2022,8 +2024,10 @@ impl Executor {
             "ENCODE" => {
                 require_args(fname, &args, 2)?;
                 let data = match &args[0] {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Bytea(bytes) => bytes.clone(),
                     Value::Text(s) => s.as_bytes().to_vec(),
-                    _ => return Err(ExecError::Unsupported("ENCODE requires text input".into())),
+                    _ => return Err(ExecError::Unsupported("ENCODE requires bytea input".into())),
                 };
                 let format = match &args[1] {
                     Value::Text(s) => s.to_lowercase(),
@@ -2048,6 +2052,7 @@ impl Executor {
             "DECODE" => {
                 require_args(fname, &args, 2)?;
                 let encoded = match &args[0] {
+                    Value::Null => return Ok(Value::Null),
                     Value::Text(s) => s.clone(),
                     _ => return Err(ExecError::Unsupported("DECODE requires text input".into())),
                 };
@@ -2081,14 +2086,12 @@ impl Executor {
                             }
                             i += 2;
                         }
-                        Ok(Value::Text(String::from_utf8_lossy(&bytes).to_string()))
+                        Ok(Value::Bytea(bytes))
                     }
                     "base64" => {
                         use base64::Engine;
                         match base64::engine::general_purpose::STANDARD.decode(&encoded) {
-                            Ok(bytes) => {
-                                Ok(Value::Text(String::from_utf8_lossy(&bytes).to_string()))
-                            }
+                            Ok(bytes) => Ok(Value::Bytea(bytes)),
                             Err(e) => {
                                 Err(ExecError::Unsupported(format!("base64 decode error: {e}")))
                             }

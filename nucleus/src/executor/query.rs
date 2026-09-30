@@ -5635,7 +5635,14 @@ impl Executor {
             }
             ast::DataType::Varchar(_)
             | ast::DataType::Text
-            | ast::DataType::CharacterVarying(_) => Value::Text(v.to_string()),
+            | ast::DataType::CharacterVarying(_) => match v {
+                // Rendered in the session TimeZone, as the AST cast does.
+                Value::TimestampTz(us) => Value::Text(crate::types::format_timestamptz(
+                    us,
+                    super::timestamptz::ambient_time_zone(),
+                )),
+                other => Value::Text(other.to_string()),
+            },
             ast::DataType::Boolean => match &v {
                 Value::Bool(_) => v,
                 Value::Int32(n) => Value::Bool(*n != 0),
@@ -7586,6 +7593,13 @@ impl Executor {
             // so we share behavior with explicit CAST(...) expressions. On
             // parse failure, fall back to the original text — storage will
             // miss the row, the post-scan WHERE filter will catch it.
+            // A timestamptz literal reads its zone (or, bare, the session
+            // TimeZone) the same way a cast does.
+            (Value::Text(text), DataType::TimestampTz) => {
+                super::timestamptz::timestamptz_text_to_instant(text)
+                    .map(Value::TimestampTz)
+                    .unwrap_or_else(|| val.clone())
+            }
             (
                 Value::Text(_),
                 DataType::Int32
@@ -7595,7 +7609,6 @@ impl Executor {
                 | DataType::Numeric
                 | DataType::Date
                 | DataType::Timestamp
-                | DataType::TimestampTz
                 | DataType::Uuid,
             ) => val.cast(target).unwrap_or_else(|_| val.clone()),
             // NUMERIC is exact and stored as text, so an int/float literal never
@@ -7977,6 +7990,9 @@ impl Executor {
         );
         if already_matches {
             return Some(val);
+        }
+        if let (Value::Text(text), DataType::TimestampTz) = (&val, dtype) {
+            return super::timestamptz::timestamptz_text_to_instant(text).map(Value::TimestampTz);
         }
         // Cross-type: use the canonical Value::cast (text→numeric, int→bigint,
         // etc.). Errors are folded into None per the doc-comment contract.

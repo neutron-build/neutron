@@ -166,6 +166,16 @@ impl Executor {
                     rows_affected: 0,
                 });
             }
+            // `SET [LOCAL] TIME ZONE x` is `SET [LOCAL] timezone = x`; it used
+            // to fall through and store nothing.
+            ast::Set::SetTimeZone { local, value } => {
+                return self.execute_set(ast::Set::SingleAssignment {
+                    scope: local.then_some(ast::ContextModifier::Local),
+                    hivevar: false,
+                    variable: ast::ObjectName::from(vec![ast::Ident::new("timezone")]),
+                    values: vec![value.clone()],
+                });
+            }
             _ => {}
         }
 
@@ -194,7 +204,21 @@ impl Executor {
                 ));
             }
             if var_name == "timezone" {
-                val = parse_time_zone(&val)?.to_string();
+                val = if matches!(
+                    val.trim().to_ascii_lowercase().as_str(),
+                    "default" | "local"
+                ) {
+                    "UTC".to_string()
+                } else {
+                    parse_time_zone(&val)
+                        .map_err(|_| {
+                            ExecError::Runtime(format!(
+                                "invalid value for parameter \"TimeZone\": \"{}\"",
+                                val.trim().trim_matches(['\'', '"'])
+                            ))
+                        })?
+                        .to_string()
+                };
             }
 
             if matches!(

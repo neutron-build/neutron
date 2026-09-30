@@ -971,6 +971,23 @@ impl NucleusHandler {
     /// server must never choose binary unilaterally — a text-mode client
     /// decodes the raw bytes as a number string and reads garbage.
     fn build_response(result: ExecResult, formats: Option<&Format>) -> PgWireResult<Response> {
+        Self::build_response_tz(result, formats, chrono_tz::Tz::UTC)
+    }
+
+    /// The session's TimeZone, which timestamptz text output renders in.
+    fn session_time_zone(&self, session_id: u64) -> chrono_tz::Tz {
+        self.executor
+            .get_session_setting(session_id, "timezone")
+            .and_then(|name| name.trim().trim_matches(['\'', '"']).parse().ok())
+            .unwrap_or(chrono_tz::Tz::UTC)
+    }
+
+    /// [`Self::build_response`] with the session TimeZone for timestamptz text.
+    fn build_response_tz(
+        result: ExecResult,
+        formats: Option<&Format>,
+        tz: chrono_tz::Tz,
+    ) -> PgWireResult<Response> {
         match result {
             ExecResult::Select { columns, rows } => {
                 let schema: Vec<FieldInfo> = columns
@@ -1002,8 +1019,8 @@ impl NucleusHandler {
                         for (i, value) in row.iter().enumerate() {
                             let fmt = schema.get(i).map_or(FieldFormat::Text, |f| f.format());
                             match col_types.get(i) {
-                                Some(dt) => encode_value_typed(&mut encoder, value, dt, fmt)?,
-                                None => encode_value(&mut encoder, value, fmt)?,
+                                Some(dt) => encode_value_typed(&mut encoder, value, dt, fmt, tz)?,
+                                None => encode_value(&mut encoder, value, fmt, tz)?,
                             }
                         }
                         encoded.push(encoder.finish()?);
@@ -1018,8 +1035,8 @@ impl NucleusHandler {
                         for (i, value) in row.iter().enumerate() {
                             let fmt = schema_ref.get(i).map_or(FieldFormat::Text, |f| f.format());
                             match col_types_ref.get(i) {
-                                Some(dt) => encode_value_typed(&mut encoder, value, dt, fmt)?,
-                                None => encode_value(&mut encoder, value, fmt)?,
+                                Some(dt) => encode_value_typed(&mut encoder, value, dt, fmt, tz)?,
+                                None => encode_value(&mut encoder, value, fmt, tz)?,
                             }
                         }
                         encoder.finish()
@@ -1126,10 +1143,14 @@ impl NucleusHandler {
                                         let fmt =
                                             schema.get(i).map_or(FieldFormat::Text, |f| f.format());
                                         match col_types.get(i) {
-                                            Some(dt) => {
-                                                encode_value_typed(&mut encoder, value, dt, fmt)?
-                                            }
-                                            None => encode_value(&mut encoder, value, fmt)?,
+                                            Some(dt) => encode_value_typed(
+                                                &mut encoder,
+                                                value,
+                                                dt,
+                                                fmt,
+                                                tz,
+                                            )?,
+                                            None => encode_value(&mut encoder, value, fmt, tz)?,
                                         }
                                     }
                                     encoder.finish()
@@ -1452,6 +1473,7 @@ impl NucleusHandler {
     ) -> Vec<sqlparser::ast::Statement> {
         let param_count = portal.parameter_len();
         let mut param_values = Vec::with_capacity(param_count);
+        let mut param_casts = Vec::with_capacity(param_count);
 
         // Re-derive inferred parameter types from the cached AST so binary
         // numeric/bool params get decoded with the right type even when the
@@ -1474,12 +1496,17 @@ impl NucleusHandler {
                 | Some(DecodedParam::Text(s)) => Self::pg_string_to_value(&s, &type_hint),
             };
             param_values.push(value);
+            param_casts.push(array_parameter_cast(&type_hint));
         }
 
         // Clone the AST and substitute parameters
         let mut statements = cached_ast.to_vec();
         for stmt in &mut statements {
-            crate::executor::param_subst::substitute_params_in_stmt(stmt, &param_values);
+            crate::executor::param_subst::substitute_params_with_types(
+                stmt,
+                &param_values,
+                &param_casts,
+            );
         }
         statements
     }
@@ -1525,9 +1552,40 @@ impl NucleusHandler {
                 "f" | "false" | "FALSE" | "0" => Value::Bool(false),
                 _ => Value::Text(s.to_owned()),
             },
+            // Arrays retain literal text until a session-aware executor cast.
             _ => Value::Text(s.to_owned()),
         }
     }
+}
+
+fn array_parameter_cast(hint: &Type) -> Option<sqlparser::ast::DataType> {
+    use sqlparser::ast::{ArrayElemTypeDef, DataType as AstType, TimezoneInfo};
+    let element = match *hint {
+        Type::BOOL_ARRAY => AstType::Boolean,
+        Type::INT2_ARRAY => AstType::SmallInt(None),
+        Type::INT4_ARRAY => AstType::Int(None),
+        Type::INT8_ARRAY => AstType::BigInt(None),
+        Type::FLOAT4_ARRAY => AstType::Real,
+        Type::FLOAT8_ARRAY => AstType::DoublePrecision,
+        Type::TEXT_ARRAY | Type::VARCHAR_ARRAY => AstType::Text,
+        Type::NUMERIC_ARRAY => AstType::Numeric(sqlparser::ast::ExactNumberInfo::None),
+        Type::DATE_ARRAY => AstType::Date,
+        Type::TIMESTAMP_ARRAY => AstType::Timestamp(None, TimezoneInfo::None),
+        Type::TIMESTAMPTZ_ARRAY => AstType::Timestamp(None, TimezoneInfo::Tz),
+        Type::UUID_ARRAY => AstType::Uuid,
+        Type::BYTEA_ARRAY => AstType::Bytea,
+        Type::JSON_ARRAY => AstType::JSON,
+        Type::JSONB_ARRAY => AstType::JSONB,
+        Type::INTERVAL_ARRAY => AstType::Interval {
+            fields: None,
+            precision: None,
+        },
+        _ => return None,
+    };
+    Some(AstType::Array(ArrayElemTypeDef::SquareBracket(
+        Box::new(element),
+        None,
+    )))
 }
 
 fn sanitize_sql_text_literal(value: &str) -> String {
@@ -1967,9 +2025,10 @@ impl SimpleQueryHandler for NucleusHandler {
                 .await
         {
             self.flush_pending_notifications(client).await?;
-            return Ok(vec![Self::build_response(
+            return Ok(vec![Self::build_response_tz(
                 result.map_err(exec_error_to_pgwire)?,
                 None,
+                self.session_time_zone(session_id),
             )?]);
         }
         // Fall through to normal path if fast-path couldn't handle it
@@ -2141,7 +2200,11 @@ impl SimpleQueryHandler for NucleusHandler {
             }
             // Approximate wire bytes: count rows * avg 64 bytes per row + header
             bytes_estimate += Self::estimate_result_bytes(&result);
-            responses.push(Self::build_response(result, None)?);
+            responses.push(Self::build_response_tz(
+                result,
+                None,
+                self.session_time_zone(session_id),
+            )?);
         }
         if bytes_estimate > 0 {
             self.executor.metrics().bytes_sent.inc_by(bytes_estimate);
@@ -2631,7 +2694,11 @@ impl ExtendedQueryHandler for NucleusHandler {
             // Flush pending notifications before the response (before ReadyForQuery).
             self.flush_pending_notifications(client).await?;
             self.sync_transaction_status(client, session_id);
-            Self::build_response(result, Some(&portal.result_column_format))
+            Self::build_response_tz(
+                result,
+                Some(&portal.result_column_format),
+                self.session_time_zone(session_id),
+            )
         } else {
             self.flush_pending_notifications(client).await?;
             self.sync_transaction_status(client, session_id);
@@ -3755,14 +3822,20 @@ enum DecodedParam {
 fn decode_binary_param_typed(oid: u32, bytes: &[u8]) -> Option<DecodedParam> {
     match oid {
         // timestamp / timestamptz: i64 BE microseconds since 2000-01-01.
-        // Value::Timestamp's Display renders "YYYY-MM-DD HH:MM:SS[.ffffff]",
-        // which parse_timestamp accepts for both ts and tstz columns.
+        // A timestamp is wall-clock text; a timestamptz is a UTC instant, so it
+        // carries an explicit `+00` (a bare literal would be read in the
+        // session TimeZone).
         1114 | 1184 => {
             if bytes.len() != 8 {
                 return None;
             }
             let us = i64::from_be_bytes(bytes.try_into().ok()?);
-            Some(DecodedParam::Text(Value::Timestamp(us).to_string()))
+            let text = if oid == 1184 {
+                Value::TimestampTz(us).to_string()
+            } else {
+                Value::Timestamp(us).to_string()
+            };
+            Some(DecodedParam::Text(text))
         }
         // date: i32 BE days since 2000-01-01 → "YYYY-MM-DD".
         1082 => {
@@ -3836,9 +3909,8 @@ fn decode_binary_param_typed(oid: u32, bytes: &[u8]) -> Option<DecodedParam> {
         // text form ('{a,b}') that the executor's ANY/ALL and array casts
         // accept. Layout: i32 ndim, i32 dataoffset, u32 elemtype, then per
         // dim (i32 len, i32 lower bound), then per element i32 len + payload.
-        1009 | 1015 | 1005 | 1007 | 1016 | 1000 | 2951 | 1021 | 1022 => {
-            decode_binary_array(bytes).map(DecodedParam::Text)
-        }
+        1009 | 1015 | 1005 | 1007 | 1016 | 1000 | 2951 | 1021 | 1022 | 1115 | 1185 | 1182
+        | 1231 | 1001 | 1187 => decode_binary_array(bytes).map(DecodedParam::Text),
         _ => None,
     }
 }
@@ -3854,12 +3926,15 @@ fn decode_binary_array(bytes: &[u8]) -> Option<String> {
     let ndim = i32::from_be_bytes(bytes[0..4].try_into().ok()?);
     let elem_oid = u32::from_be_bytes(bytes[8..12].try_into().ok()?);
     if ndim == 0 {
-        return Some("{}".into());
+        return (bytes.len() == 12).then(|| "{}".into());
     }
     if ndim != 1 || bytes.len() < 20 {
         return None;
     }
-    let count = i32::from_be_bytes(bytes[12..16].try_into().ok()?).max(0) as usize;
+    let count = usize::try_from(i32::from_be_bytes(bytes[12..16].try_into().ok()?)).ok()?;
+    if i32::from_be_bytes(bytes[16..20].try_into().ok()?) != 1 {
+        return None;
+    }
     let mut off = 20;
     // `count` is client-supplied over pgwire. `max(0)` only stops negatives: a
     // positive ~2.1e9 asks `with_capacity` for ~51 GB of `String`, and a Rust
@@ -3877,20 +3952,23 @@ fn decode_binary_array(bytes: &[u8]) -> Option<String> {
         }
         let len = i32::from_be_bytes(bytes[off..off + 4].try_into().ok()?);
         off += 4;
-        if len < 0 {
+        if len == -1 {
             parts.push("NULL".into());
             continue;
         }
-        let len = len as usize;
+        let len = usize::try_from(len).ok()?;
         if bytes.len() < off + len {
             return None;
         }
         let payload = &bytes[off..off + len];
         off += len;
         let rendered = match elem_oid {
-            16 => (payload == [1u8])
-                .then(|| "t".to_string())
-                .or(Some("f".to_string()))?,
+            16 => {
+                if payload.len() != 1 {
+                    return None;
+                }
+                if payload[0] != 0 { "t" } else { "f" }.to_string()
+            }
             21 => i16::from_be_bytes(payload.try_into().ok()?).to_string(),
             23 => i32::from_be_bytes(payload.try_into().ok()?).to_string(),
             20 => i64::from_be_bytes(payload.try_into().ok()?).to_string(),
@@ -3927,11 +4005,20 @@ fn decode_binary_array(bytes: &[u8]) -> Option<String> {
                 let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
                 format!("\"{escaped}\"")
             }
-            _ => return None,
+            // Every other element type has a typed binary decoder of its own
+            // (dates, timestamps, numeric, bytea, interval): render the text
+            // form it produces, quoted as an array element.
+            other => match decode_binary_param_typed(other, payload)? {
+                DecodedParam::Text(t) | DecodedParam::Numeric(t) | DecodedParam::Bool(t) => {
+                    let escaped = t.replace('\\', "\\\\").replace('"', "\\\"");
+                    format!("\"{escaped}\"")
+                }
+                DecodedParam::Null => "NULL".to_string(),
+            },
         };
         parts.push(rendered);
     }
-    Some(format!("{{{}}}", parts.join(",")))
+    (off == bytes.len()).then(|| format!("{{{}}}", parts.join(",")))
 }
 
 /// Decode PostgreSQL's binary NUMERIC wire format into an exact decimal
@@ -4005,6 +4092,25 @@ fn decode_pg_param(
         return Some(DecodedParam::Null);
     };
     let is_binary = portal.parameter_format.is_binary(idx);
+
+    // A malformed or unrepresentable declared binary array must never fall
+    // through to the unknown-OID integer/UTF-8 guesses. Its array cast refuses
+    // this diagnostic text before any write or result can succeed.
+    if is_binary && array_parameter_cast(type_hint).is_some() {
+        let valid_element = bytes
+            .get(8..12)
+            .and_then(|raw| <[u8; 4]>::try_from(raw).ok())
+            .is_some_and(|raw| u32::from_be_bytes(raw) == array_element_oid(type_hint));
+        return Some(
+            valid_element
+                .then(|| decode_binary_array(bytes))
+                .flatten()
+                .map(DecodedParam::Text)
+                .unwrap_or_else(|| {
+                    DecodedParam::Text("invalid or unsupported binary array encoding".into())
+                }),
+        );
+    }
 
     // Typed non-integer binary encodings (temporal/uuid/bytea/numeric/interval)
     // — previously these fell through to the fixed-width-integer catch-all and
@@ -4936,6 +5042,237 @@ fn scalar_to_array_type(t: &Type) -> Type {
     }
 }
 
+/// The array type a column of `Array(element)` advertises. PostgreSQL has one
+/// array type per element type whatever the nesting, so nested arrays report
+/// their leaf's. Elements with no wire type of their own travel as text[].
+fn array_pg_type(element: &DataType) -> Type {
+    match array_leaf(element) {
+        DataType::Bool => Type::BOOL_ARRAY,
+        DataType::Int32 => Type::INT4_ARRAY,
+        DataType::Int64 => Type::INT8_ARRAY,
+        DataType::Float64 => Type::FLOAT8_ARRAY,
+        DataType::Jsonb => Type::JSONB_ARRAY,
+        DataType::Date => Type::DATE_ARRAY,
+        DataType::Timestamp => Type::TIMESTAMP_ARRAY,
+        DataType::TimestampTz => Type::TIMESTAMPTZ_ARRAY,
+        DataType::Numeric => Type::NUMERIC_ARRAY,
+        DataType::Uuid => Type::UUID_ARRAY,
+        DataType::Bytea => Type::BYTEA_ARRAY,
+        DataType::Interval => Type::INTERVAL_ARRAY,
+        _ => Type::TEXT_ARRAY,
+    }
+}
+
+fn array_leaf(dt: &DataType) -> &DataType {
+    match dt {
+        DataType::Array(inner) => array_leaf(inner),
+        other => other,
+    }
+}
+
+/// Element OID of an array type produced by [`array_pg_type`].
+fn array_element_oid(array: &Type) -> u32 {
+    match *array {
+        Type::BOOL_ARRAY => Type::BOOL.oid(),
+        Type::INT4_ARRAY => Type::INT4.oid(),
+        Type::INT8_ARRAY => Type::INT8.oid(),
+        Type::FLOAT8_ARRAY => Type::FLOAT8.oid(),
+        Type::JSONB_ARRAY => Type::JSONB.oid(),
+        Type::DATE_ARRAY => Type::DATE.oid(),
+        Type::TIMESTAMP_ARRAY => Type::TIMESTAMP.oid(),
+        Type::TIMESTAMPTZ_ARRAY => Type::TIMESTAMPTZ.oid(),
+        Type::NUMERIC_ARRAY => Type::NUMERIC.oid(),
+        Type::UUID_ARRAY => Type::UUID.oid(),
+        Type::BYTEA_ARRAY => Type::BYTEA.oid(),
+        Type::INTERVAL_ARRAY => Type::INTERVAL.oid(),
+        _ => Type::TEXT.oid(),
+    }
+}
+
+/// Shape of a (possibly nested) array: the length at each depth. Ragged
+/// nesting has no PostgreSQL representation.
+fn array_dims(vals: &[Value]) -> Result<Vec<i32>, String> {
+    let len = i32::try_from(vals.len()).map_err(|_| "array too large".to_string())?;
+    let mut dims = vec![len];
+    let mut inner: Option<Vec<i32>> = None;
+    for v in vals {
+        let these = match v {
+            Value::Array(items) => array_dims(items)?,
+            _ => Vec::new(),
+        };
+        match &inner {
+            None => inner = Some(these),
+            Some(seen) if *seen == these => {}
+            Some(_) => {
+                return Err(
+                    "multidimensional arrays must have array expressions with matching dimensions"
+                        .into(),
+                );
+            }
+        }
+    }
+    dims.extend(inner.unwrap_or_default());
+    Ok(dims)
+}
+
+fn flatten_array<'a>(vals: &'a [Value], out: &mut Vec<&'a Value>) {
+    for v in vals {
+        match v {
+            Value::Array(inner) => flatten_array(inner, out),
+            other => out.push(other),
+        }
+    }
+}
+
+/// NUMERIC binary form (NBASE 10000 words) of a decimal string, keeping the
+/// written scale.
+fn numeric_binary(text: &str) -> Result<Vec<u8>, String> {
+    let bad = || format!("numeric value not binary-encodable: {text}");
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (int_part, frac_part) = digits.split_once('.').unwrap_or((digits, ""));
+    if int_part.is_empty() && frac_part.is_empty()
+        || !int_part
+            .chars()
+            .chain(frac_part.chars())
+            .all(|c| c.is_ascii_digit())
+    {
+        return Err(bad());
+    }
+    let dscale = frac_part.len();
+    let int_padded = format!("{}{}", "0".repeat((4 - int_part.len() % 4) % 4), int_part);
+    let frac_padded = format!("{}{}", frac_part, "0".repeat((4 - frac_part.len() % 4) % 4));
+    let mut words: Vec<u16> = Vec::new();
+    for chunk in int_padded
+        .as_bytes()
+        .chunks(4)
+        .chain(frac_padded.as_bytes().chunks(4))
+    {
+        words.push(
+            std::str::from_utf8(chunk)
+                .map_err(|_| bad())?
+                .parse()
+                .map_err(|_| bad())?,
+        );
+    }
+    let mut weight = (int_padded.len() / 4) as i32 - 1;
+    while words.first() == Some(&0) {
+        words.remove(0);
+        weight -= 1;
+    }
+    while words.last() == Some(&0) {
+        words.pop();
+    }
+    if words.is_empty() {
+        weight = 0;
+    }
+    let mut out = Vec::with_capacity(8 + words.len() * 2);
+    out.extend_from_slice(&(words.len() as u16).to_be_bytes());
+    out.extend_from_slice(&(weight as i16).to_be_bytes());
+    out.extend_from_slice(
+        &(if negative && !words.is_empty() {
+            0x4000u16
+        } else {
+            0
+        })
+        .to_be_bytes(),
+    );
+    out.extend_from_slice(&(dscale as u16).to_be_bytes());
+    for w in words {
+        out.extend_from_slice(&w.to_be_bytes());
+    }
+    Ok(out)
+}
+
+/// One array element's binary payload in the element type's own format.
+fn array_element_binary(value: &Value, leaf: &DataType) -> Result<Vec<u8>, String> {
+    let target = match leaf {
+        DataType::Bool
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Float64
+        | DataType::Jsonb
+        | DataType::Date
+        | DataType::Timestamp
+        | DataType::TimestampTz
+        | DataType::Numeric
+        | DataType::Uuid
+        | DataType::Bytea
+        | DataType::Interval => Some(leaf),
+        _ => None,
+    };
+    let Some(target) = target else {
+        return Ok(value.to_string().into_bytes());
+    };
+    let v = value.cast(target)?;
+    Ok(match v {
+        Value::Bool(b) => vec![u8::from(b)],
+        Value::Int32(n) => n.to_be_bytes().to_vec(),
+        Value::Int64(n) => n.to_be_bytes().to_vec(),
+        Value::Float64(n) => n.to_be_bytes().to_vec(),
+        Value::Jsonb(j) => {
+            let mut buf = vec![1u8];
+            buf.extend_from_slice(j.to_string().as_bytes());
+            buf
+        }
+        // Nucleus dates and timestamps count from 2000-01-01, PostgreSQL's epoch.
+        Value::Date(d) => d.to_be_bytes().to_vec(),
+        Value::Timestamp(us) | Value::TimestampTz(us) => us.to_be_bytes().to_vec(),
+        Value::Numeric(s) => numeric_binary(&s)?,
+        Value::Uuid(b) => b.to_vec(),
+        Value::Bytea(b) => b,
+        Value::Interval {
+            months,
+            days,
+            microseconds,
+        } => {
+            let mut buf = microseconds.to_be_bytes().to_vec();
+            buf.extend_from_slice(&days.to_be_bytes());
+            buf.extend_from_slice(&months.to_be_bytes());
+            buf
+        }
+        other => other.to_string().into_bytes(),
+    })
+}
+
+/// Binary array wire form: ndim, has-null flag, element OID, then a
+/// length/lower-bound pair per dimension and each element length-prefixed
+/// (-1 for NULL), row-major.
+fn array_binary(vals: &[Value], element: &DataType) -> Result<Vec<u8>, String> {
+    let leaf = array_leaf(element);
+    let elem_oid = array_element_oid(&array_pg_type(element));
+    let mut out = Vec::new();
+    if vals.is_empty() {
+        out.extend_from_slice(&0i32.to_be_bytes());
+        out.extend_from_slice(&0i32.to_be_bytes());
+        out.extend_from_slice(&elem_oid.to_be_bytes());
+        return Ok(out);
+    }
+    let dims = array_dims(vals)?;
+    let mut flat = Vec::new();
+    flatten_array(vals, &mut flat);
+    let has_null = flat.iter().any(|v| matches!(v, Value::Null));
+    out.extend_from_slice(&(dims.len() as i32).to_be_bytes());
+    out.extend_from_slice(&i32::from(has_null).to_be_bytes());
+    out.extend_from_slice(&elem_oid.to_be_bytes());
+    for d in &dims {
+        out.extend_from_slice(&d.to_be_bytes());
+        out.extend_from_slice(&1i32.to_be_bytes());
+    }
+    for v in flat {
+        if matches!(v, Value::Null) {
+            out.extend_from_slice(&(-1i32).to_be_bytes());
+        } else {
+            let payload = array_element_binary(v, leaf)?;
+            out.extend_from_slice(&(payload.len() as i32).to_be_bytes());
+            out.extend_from_slice(&payload);
+        }
+    }
+    Ok(out)
+}
+
 fn data_type_to_pg(dt: &DataType) -> Type {
     match dt {
         DataType::Bool => Type::BOOL,
@@ -4950,7 +5287,7 @@ fn data_type_to_pg(dt: &DataType) -> Type {
         DataType::Numeric => Type::NUMERIC,
         DataType::Uuid => Type::UUID,
         DataType::Bytea => Type::BYTEA,
-        DataType::Array(_) => Type::TEXT, // Arrays sent as text for now
+        DataType::Array(element) => array_pg_type(element),
         DataType::Vector(_) => Type::TEXT, // Vectors sent as text for now
         DataType::Interval => Type::VARCHAR, // Intervals sent as text for now
         DataType::UserDefined(_) => Type::VARCHAR, // Enum values sent as text
@@ -4986,6 +5323,7 @@ fn encode_value_typed(
     value: &Value,
     target: &DataType,
     fmt: FieldFormat,
+    tz: chrono_tz::Tz,
 ) -> PgWireResult<()> {
     match (value, target) {
         (Value::Int32(n), DataType::Int64) => return encoder.encode_field(&Some(*n as i64)),
@@ -4996,15 +5334,48 @@ fn encode_value_typed(
         }
         (Value::Int32(n), DataType::Float64) => return encoder.encode_field(&Some(*n as f64)),
         (Value::Int64(n), DataType::Float64) => return encoder.encode_field(&Some(*n as f64)),
+        // Arrays carry the element type's own text/binary form under the
+        // advertised array type OID.
+        (Value::Array(vals), DataType::Array(element)) => {
+            return match fmt {
+                FieldFormat::Text => {
+                    let text = crate::types::format_array(vals, &|v| match v {
+                        Value::TimestampTz(us) => crate::types::format_timestamptz(*us, tz),
+                        other => crate::types::array_element_text(other),
+                    });
+                    encoder.encode_field_with_type_and_format(
+                        &Some(text.as_str()),
+                        &Type::TEXT,
+                        FieldFormat::Text,
+                        &pgwire::types::format::FormatOptions::default(),
+                    )
+                }
+                FieldFormat::Binary => {
+                    let bytes =
+                        array_binary(vals, element).map_err(|e| PgWireError::ApiError(e.into()))?;
+                    encoder.encode_field_with_type_and_format(
+                        &Some(bytes.as_slice()),
+                        &Type::BYTEA,
+                        FieldFormat::Binary,
+                        &pgwire::types::format::FormatOptions::default(),
+                    )
+                }
+            };
+        }
         _ => {}
     }
-    encode_value(encoder, value, fmt)
+    encode_value(encoder, value, fmt, tz)
 }
 
 /// Encode a Nucleus Value into a pgwire DataRowEncoder field. `fmt` is the
 /// column's wire format (Text/Binary) — temporal values render differently in
 /// text (see below).
-fn encode_value(encoder: &mut DataRowEncoder, value: &Value, fmt: FieldFormat) -> PgWireResult<()> {
+fn encode_value(
+    encoder: &mut DataRowEncoder,
+    value: &Value,
+    fmt: FieldFormat,
+    tz: chrono_tz::Tz,
+) -> PgWireResult<()> {
     match value {
         Value::Null => encoder.encode_field(&None::<&str>),
         Value::Bool(b) => encoder.encode_field(&Some(*b)),
@@ -5054,9 +5425,14 @@ fn encode_value(encoder: &mut DataRowEncoder, value: &Value, fmt: FieldFormat) -
         // `.000000` fractional part when microseconds are zero (chrono's
         // ToSqlText always writes it). Binary format still uses the native
         // chrono impls below so binary clients decode correctly.
-        Value::Timestamp(_) | Value::TimestampTz(_) | Value::Date(_)
-            if matches!(fmt, FieldFormat::Text) =>
-        {
+        //
+        // A timestamptz renders in the session TimeZone with its offset
+        // (PostgreSQL's `DateStyle ISO` text form); binary carries the UTC
+        // instant and the client formats it.
+        Value::TimestampTz(us) if matches!(fmt, FieldFormat::Text) => {
+            encoder.encode_field(&Some(crate::types::format_timestamptz(*us, tz).as_str()))
+        }
+        Value::Timestamp(_) | Value::Date(_) if matches!(fmt, FieldFormat::Text) => {
             encoder.encode_field(&Some(value.to_string().as_str()))
         }
         // Temporal/decimal/bytea values encode through their native
@@ -5837,6 +6213,26 @@ mod tests {
             decode_binary_array(&bytes).is_none(),
             "two declared elements with one present must fail"
         );
+    }
+
+    #[test]
+    fn x09_binary_array_lower_bounds_and_junk_are_refused() {
+        let mut bytes = binary_array_header(1, 23, 1);
+        bytes.extend_from_slice(&4i32.to_be_bytes());
+        bytes.extend_from_slice(&7i32.to_be_bytes());
+        assert_eq!(decode_binary_array(&bytes), Some("{7}".into()));
+        bytes[16..20].copy_from_slice(&0i32.to_be_bytes());
+        assert!(decode_binary_array(&bytes).is_none());
+        bytes[16..20].copy_from_slice(&1i32.to_be_bytes());
+        bytes.push(0);
+        assert!(decode_binary_array(&bytes).is_none());
+        let mut boolean = binary_array_header(1, 16, 1);
+        boolean.extend_from_slice(&1i32.to_be_bytes());
+        boolean.push(2);
+        assert_eq!(decode_binary_array(&boolean), Some("{t}".into()));
+        boolean[20..24].copy_from_slice(&0i32.to_be_bytes());
+        boolean.pop();
+        assert!(decode_binary_array(&boolean).is_none());
     }
 
     #[test]

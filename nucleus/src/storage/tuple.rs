@@ -364,7 +364,7 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                 row.push(Value::Bytea(data[pos..pos + len].to_vec()));
                 pos += len;
             }
-            DataType::Array(_) => {
+            DataType::Array(element_type) => {
                 // Deserialize array: [total_len: u32] [elem_count: u32] [elements...]
                 if pos + 4 > data.len() {
                     return None;
@@ -489,7 +489,11 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                 if pos != arr_end {
                     return None;
                 }
-                row.push(Value::Array(elems));
+                let typed = elems
+                    .into_iter()
+                    .map(|item| item.cast(element_type).ok())
+                    .collect::<Option<Vec<_>>>()?;
+                row.push(Value::Array(typed));
             }
             DataType::Vector(_) => {
                 // Deserialize packed floats.
@@ -900,7 +904,7 @@ fn decode_column_at(data: &[u8], pos: usize, dtype: &DataType) -> Option<Value> 
             }
             Some(Value::Bytea(data[start..start + len].to_vec()))
         }
-        DataType::Array(_) => {
+        DataType::Array(element_type) => {
             if pos + 4 > data.len() {
                 return None;
             }
@@ -1026,7 +1030,11 @@ fn decode_column_at(data: &[u8], pos: usize, dtype: &DataType) -> Option<Value> 
             if apos != arr_end {
                 return None;
             }
-            Some(Value::Array(elems))
+            let typed = elems
+                .into_iter()
+                .map(|item| item.cast(element_type).ok())
+                .collect::<Option<Vec<_>>>()?;
+            Some(Value::Array(typed))
         }
         DataType::Vector(_) => {
             // The stored count is authoritative; the declared dimension is not
@@ -1553,5 +1561,29 @@ mod tests {
         );
         assert!(deserialize_row(&good, &types).is_some());
         assert!(deserialize_row_projected(&good, &types, &[0]).is_some());
+    }
+}
+
+#[cfg(test)]
+mod x09_typed_array_roundtrip {
+    use super::*;
+
+    #[test]
+    fn x09_flat_arrays_retain_leaf_types_in_full_and_projected_decoding() {
+        for (dtype, value) in [
+            (DataType::TimestampTz, Value::TimestampTz(1234567)),
+            (DataType::Date, Value::Date(42)),
+            (DataType::Numeric, Value::Numeric("1234567890.25".into())),
+            (DataType::Bytea, Value::Bytea(vec![0, 255, 42])),
+        ] {
+            let types = vec![DataType::Int32, DataType::Array(Box::new(dtype))];
+            let row = vec![Value::Int32(7), Value::Array(vec![value, Value::Null])];
+            let bytes = serialize_row(&row, &types);
+            assert_eq!(deserialize_row(&bytes, &types), Some(row.clone()));
+            assert_eq!(
+                deserialize_row_projected(&bytes, &types, &[1]),
+                Some(vec![row[1].clone()])
+            );
+        }
     }
 }

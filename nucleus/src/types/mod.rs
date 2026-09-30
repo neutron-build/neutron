@@ -5,6 +5,14 @@ use std::hash::{Hash, Hasher};
 
 use rust_decimal::Decimal;
 
+mod array;
+pub use array::{
+    ArrayLit, array_element_text, array_value_from_literal, format_array, guess_array_element,
+    parse_array_literal, validate_array_shape,
+};
+mod timestamptz;
+pub use timestamptz::{format_timestamptz, zone_offset_seconds};
+
 /// Parse the bounded exact NUMERIC representation used by Nucleus. The current
 /// physical type is rust_decimal (96-bit coefficient, scale <= 28); values
 /// outside that range reject explicitly instead of degrading to f64.
@@ -155,16 +163,7 @@ impl fmt::Display for Value {
                 }
                 Ok(())
             }
-            Value::Array(vals) => {
-                write!(f, "{{")?;
-                for (i, v) in vals.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ",")?;
-                    }
-                    write!(f, "{v}")?;
-                }
-                write!(f, "}}")
-            }
+            Value::Array(vals) => write!(f, "{}", format_array(vals, &array_element_text)),
             Value::Vector(vec) => {
                 write!(f, "[")?;
                 for (i, v) in vec.iter().enumerate() {
@@ -209,7 +208,11 @@ impl fmt::Display for Value {
                     let frac = total_us % 1_000_000;
                     let sign = if *microseconds < 0 { "-" } else { "" };
                     if frac > 0 {
-                        parts.push(format!("{sign}{h:02}:{m:02}:{s:02}.{frac:06}"));
+                        let fraction = format!("{frac:06}");
+                        parts.push(format!(
+                            "{sign}{h:02}:{m:02}:{s:02}.{}",
+                            fraction.trim_end_matches('0')
+                        ));
                     } else {
                         parts.push(format!("{sign}{h:02}:{m:02}:{s:02}"));
                     }
@@ -391,11 +394,62 @@ pub fn parse_timestamp(value: &str) -> Result<i64, String> {
     parse_timestamp_with_zone(value).map(|(us, _)| us)
 }
 
-/// ISO timestamp parser for `timestamptz`: a trailing UTC offset shifts the
+/// The zone written after a timestamp literal: a numeric UTC offset in
+/// seconds (`+02`, `-05:30`, `Z`) or a zone name (`UTC`, `America/New_York`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimestampZone {
+    Offset(i64),
+    Named(String),
+}
+
+/// Parse a timestamp literal for `timestamptz`, returning the wall-clock
+/// microseconds exactly as written plus the zone that qualified them, if any.
+/// The caller resolves the zone (an explicit one wins over the session
+/// TimeZone, which only applies to a literal that names none).
+pub fn parse_timestamptz_zoned(value: &str) -> Result<(i64, Option<TimestampZone>), String> {
+    parse_timestamp_with_zone(value)
+}
+
+/// Session-less `timestamptz` parser: a trailing UTC offset shifts the
 /// wall-clock time to UTC (PostgreSQL stores timestamptz normalized to UTC).
-/// Without an offset the value is taken as already-UTC (server runs in UTC).
+/// Without a zone the value is taken as already-UTC; only `UTC`/`GMT` are
+/// understood as names here, other names need a session (see
+/// `executor::timestamptz`).
 pub fn parse_timestamptz(value: &str) -> Result<i64, String> {
-    parse_timestamp_with_zone(value).map(|(us, offset)| us - offset.unwrap_or(0) * 1_000_000)
+    let (us, zone) = parse_timestamp_with_zone(value)?;
+    match zone {
+        None => Ok(us),
+        Some(TimestampZone::Offset(offset)) => Ok(us - offset * 1_000_000),
+        Some(TimestampZone::Named(name))
+            if ["utc", "gmt", "etc/utc", "etc/gmt", "zulu"]
+                .contains(&name.to_ascii_lowercase().as_str()) =>
+        {
+            Ok(us)
+        }
+        Some(TimestampZone::Named(name)) => Err(format!("time zone '{name}' is not recognized")),
+    }
+}
+
+/// Split the zone qualifier off the time part of a timestamp literal:
+/// `03:04:05+02`, `03:04:05 +02`, `03:04:05Z`, `03:04:05 UTC`,
+/// `03:04:05 America/New_York`.
+fn split_zone_spec(time: &str) -> Result<(&str, Option<TimestampZone>), String> {
+    if let Some((clock, zone)) = time.split_once(char::is_whitespace) {
+        let zone = zone.trim();
+        if zone.is_empty() {
+            return Ok((clock, None));
+        }
+        if zone.starts_with(['+', '-']) || zone.eq_ignore_ascii_case("z") {
+            let (_, offset) = split_zone_suffix(zone)?;
+            return Ok((clock, offset.map(TimestampZone::Offset)));
+        }
+        if zone.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            return Ok((clock, Some(TimestampZone::Named(zone.to_string()))));
+        }
+        return Err(format!("invalid time zone: {zone}"));
+    }
+    let (clock, offset) = split_zone_suffix(time)?;
+    Ok((clock, offset.map(TimestampZone::Offset)))
 }
 
 /// Split a trailing UTC-offset suffix (`Z`, `±HH`, `±HH:MM`, `±HHMM`,
@@ -433,10 +487,10 @@ fn split_zone_suffix(time: &str) -> Result<(&str, Option<i64>), String> {
     Ok((time, Some(sign * (hours * 3600 + minutes * 60 + seconds))))
 }
 
-fn parse_timestamp_with_zone(value: &str) -> Result<(i64, Option<i64>), String> {
+fn parse_timestamp_with_zone(value: &str) -> Result<(i64, Option<TimestampZone>), String> {
     let value = value.trim();
     let (date, time) = value.split_once([' ', 'T']).unwrap_or((value, "00:00:00"));
-    let (time, zone_offset) = split_zone_suffix(time)?;
+    let (time, zone_offset) = split_zone_spec(time)?;
     let time = time.trim_end();
     let days = parse_date(date)? as i64;
     let pieces: Vec<&str> = time.split(':').collect();
@@ -481,8 +535,10 @@ fn parse_timestamp_with_zone(value: &str) -> Result<(i64, Option<i64>), String> 
 
 /// Format microseconds since 2000-01-01 as "YYYY-MM-DD HH:MM:SS.ffffff".
 fn format_timestamp(f: &mut fmt::Formatter<'_>, us: i64) -> fmt::Result {
-    let total_secs = us / 1_000_000;
-    let frac = (us % 1_000_000).unsigned_abs() as u32;
+    // Floor division: a truncating split rendered a pre-2000 instant with a
+    // fractional second as the wrong second (-0.5s -> 00:00:00.5).
+    let total_secs = us.div_euclid(1_000_000);
+    let frac = us.rem_euclid(1_000_000) as u32;
     let days = total_secs.div_euclid(86400) as i32;
     let time_secs = total_secs.rem_euclid(86400) as u32;
     let (y, m, d) = days_to_ymd(days);
@@ -490,9 +546,12 @@ fn format_timestamp(f: &mut fmt::Formatter<'_>, us: i64) -> fmt::Result {
     let minute = (time_secs % 3600) / 60;
     let second = time_secs % 60;
     if frac > 0 {
+        // PostgreSQL drops trailing zeros of the fraction (`.5`, not `.500000`).
+        let fraction = format!("{frac:06}");
         write!(
             f,
-            "{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}:{second:02}.{frac:06}"
+            "{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}:{second:02}.{}",
+            fraction.trim_end_matches('0')
         )
     } else {
         write!(f, "{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}:{second:02}")

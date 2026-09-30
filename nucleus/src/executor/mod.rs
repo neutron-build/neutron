@@ -157,6 +157,7 @@ mod session;
 #[cfg(feature = "server")]
 mod snapshot_lease;
 mod spill;
+mod timestamptz;
 mod txn;
 mod txn_modes;
 mod types;
@@ -6164,6 +6165,14 @@ impl Executor {
                     return None;
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
+                // These searches/writes require session-aware casts.
+                if table_def
+                    .columns
+                    .iter()
+                    .any(|col| matches!(col.data_type, DataType::Array(_) | DataType::TimestampTz))
+                {
+                    return None;
+                }
                 let col_idx = table_def.column_index(where_col)?;
                 // Coerce the wire-parsed literal to the column's declared
                 // type. Without this, pgx's SimpleProtocol-style text
@@ -6221,6 +6230,14 @@ impl Executor {
                     return None;
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
+                // These searches/writes require session-aware casts.
+                if table_def
+                    .columns
+                    .iter()
+                    .any(|col| matches!(col.data_type, DataType::Array(_) | DataType::TimestampTz))
+                {
+                    return None;
+                }
                 // Correctness gate: this fast path writes straight to storage and
                 // does NOT enforce constraints. Fall through to the full executor
                 // (execute_sql_session — which enforces PRIMARY KEY / UNIQUE /
@@ -6300,6 +6317,14 @@ impl Executor {
                     return None;
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
+                // These searches/writes require session-aware casts.
+                if table_def
+                    .columns
+                    .iter()
+                    .any(|col| matches!(col.data_type, DataType::Array(_) | DataType::TimestampTz))
+                {
+                    return None;
+                }
                 // The fast path writes new column values WITHOUT constraint
                 // enforcement. Decline (fall back to the full UPDATE path,
                 // which enforces) whenever an assigned column participates in a
@@ -6402,6 +6427,14 @@ impl Executor {
                     return None;
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
+                // These searches/writes require session-aware casts.
+                if table_def
+                    .columns
+                    .iter()
+                    .any(|col| matches!(col.data_type, DataType::Array(_) | DataType::TimestampTz))
+                {
+                    return None;
+                }
                 let col_idx = table_def.column_index(where_col)?;
                 // Coerce text literal to the column's declared type — see
                 // PointSelect for the pgx SimpleProtocol rationale.

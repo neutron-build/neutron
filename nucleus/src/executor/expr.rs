@@ -1064,13 +1064,16 @@ impl Executor {
                 };
                 match &ts.data_type {
                     ast::DataType::Timestamp(_, tz) => {
-                        let timestamp =
-                            crate::types::parse_timestamp(&s).map_err(ExecError::Runtime)?;
                         if matches!(tz, ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::Tz) {
-                            local_timestamp_at_time_zone(timestamp, self.session_time_zone()?)
-                                .map(Value::TimestampTz)
+                            super::timestamptz::parse_timestamptz_text(
+                                &s,
+                                self.session_time_zone()?,
+                            )
+                            .map(Value::TimestampTz)
                         } else {
-                            Ok(Value::Timestamp(timestamp))
+                            crate::types::parse_timestamp(&s)
+                                .map(Value::Timestamp)
+                                .map_err(ExecError::Runtime)
                         }
                     }
                     ast::DataType::TimestampNtz(_) => crate::types::parse_timestamp(&s)
@@ -1475,7 +1478,28 @@ impl Executor {
                             ))),
                         }
                     }
-                    Value::Timestamp(ts) | Value::TimestampTz(ts) => {
+                    Value::Timestamp(_) | Value::TimestampTz(_) => {
+                        // The calendar fields of a timestamptz are those of
+                        // its wall clock in the session zone; the epoch is the
+                        // instant itself.
+                        let (ts, instant) = match val {
+                            Value::TimestampTz(instant) => (
+                                timestamptz_at_time_zone(instant, self.session_time_zone()?)?,
+                                instant,
+                            ),
+                            Value::Timestamp(ts) => (ts, ts),
+                            _ => unreachable!(),
+                        };
+                        if field_str == "second" || field_str == "epoch" {
+                            let micros = if field_str == "second" {
+                                i128::from(ts.rem_euclid(60_000_000))
+                            } else {
+                                i128::from(instant) + 946_684_800_000_000i128
+                            };
+                            return Ok(Value::Numeric(
+                                rust_decimal::Decimal::from_i128_with_scale(micros, 6).to_string(),
+                            ));
+                        }
                         let total_secs = ts.div_euclid(1_000_000);
                         let days = total_secs.div_euclid(86400) as i32;
                         let time_secs = total_secs.rem_euclid(86400);
@@ -1492,7 +1516,9 @@ impl Executor {
                                 let jan1 = crate::types::ymd_to_days(y, 1, 1);
                                 Ok(Value::Int32(days - jan1 + 1))
                             }
-                            "epoch" => Ok(Value::Int64(total_secs + PG_EPOCH_OFFSET_SECS)),
+                            "epoch" => Ok(Value::Int64(
+                                instant.div_euclid(1_000_000) + PG_EPOCH_OFFSET_SECS,
+                            )),
                             _ => Err(ExecError::Unsupported(format!(
                                 "EXTRACT({field_str}) from timestamp"
                             ))),
@@ -1634,6 +1660,7 @@ impl Executor {
                 for e in elem {
                     vals.push(self.eval_row_expr(e, row, col_meta)?);
                 }
+                crate::types::validate_array_shape(&vals).map_err(ExecError::Runtime)?;
                 Ok(Value::Array(vals))
             }
             // -- Subquery expressions (with correlated subquery support) --
@@ -1708,6 +1735,23 @@ impl Executor {
                                 }
                             };
                             let key = self.eval_row_expr(key_expr, row, col_meta)?;
+                            // `arr[i]` is 1-based; out of range is NULL.
+                            if let Value::Array(items) = &base {
+                                let index = match &key {
+                                    Value::Int32(n) => Some(i64::from(*n)),
+                                    Value::Int64(n) => Some(*n),
+                                    Value::Null => None,
+                                    _ => {
+                                        return Err(ExecError::Runtime(
+                                            "array subscript must have type integer".into(),
+                                        ));
+                                    }
+                                };
+                                return Ok(index
+                                    .and_then(|i| usize::try_from(i - 1).ok())
+                                    .and_then(|i| items.get(i).cloned())
+                                    .unwrap_or(Value::Null));
+                            }
                             self.eval_json_arrow(&base, &key)
                         }
                         // Composite field access `(expr).field` — PostgreSQL
@@ -1861,6 +1905,10 @@ impl Executor {
             },
             ast::DataType::Text | ast::DataType::Varchar(_) => match val {
                 Value::Null => Ok(Value::Null),
+                Value::TimestampTz(us) => Ok(Value::Text(crate::types::format_timestamptz(
+                    us,
+                    self.session_time_zone()?,
+                ))),
                 _ => Ok(Value::Text(val.to_string())),
             },
             ast::DataType::Int(_) | ast::DataType::Integer(_) | ast::DataType::Int4(_) => match val
@@ -1964,7 +2012,16 @@ impl Executor {
                 },
                 _ => Err(ExecError::Unsupported("cannot cast to BOOLEAN".to_string())),
             },
-            ast::DataType::Date => val.cast(&DataType::Date).map_err(ExecError::Runtime),
+            // The date of a timestamptz is the date on the session-zone clock.
+            ast::DataType::Date => match val {
+                Value::TimestampTz(us) => {
+                    let local = timestamptz_at_time_zone(us, self.session_time_zone()?)?;
+                    Value::Timestamp(local)
+                        .cast(&DataType::Date)
+                        .map_err(ExecError::Runtime)
+                }
+                other => other.cast(&DataType::Date).map_err(ExecError::Runtime),
+            },
             ast::DataType::Timestamp(_, timezone) => {
                 let with_timezone = matches!(
                     timezone,
@@ -1988,9 +2045,7 @@ impl Executor {
                     )
                     .map(Value::TimestampTz),
                     (Value::Text(text), true) => {
-                        let local =
-                            crate::types::parse_timestamp(&text).map_err(ExecError::Runtime)?;
-                        local_timestamp_at_time_zone(local, self.session_time_zone()?)
+                        super::timestamptz::parse_timestamptz_text(&text, self.session_time_zone()?)
                             .map(Value::TimestampTz)
                     }
                     (value, false) => value.cast(&DataType::Timestamp).map_err(ExecError::Runtime),
@@ -2050,22 +2105,40 @@ impl Executor {
                     ast::ArrayElemTypeDef::None => None,
                 };
                 match (&val, elem_type) {
-                    (Value::Text(s), Some(et)) if s.trim().starts_with('{') => {
-                        let inner = s.trim().trim_start_matches('{').trim_end_matches('}');
-                        let mut out = Vec::new();
-                        for part in inner.split(',') {
-                            let part = part.trim().trim_matches('"');
-                            if part.is_empty() {
-                                continue;
-                            }
-                            out.push(self.eval_cast(Value::Text(part.to_string()), et)?);
-                        }
-                        Ok(Value::Array(out))
+                    (Value::Text(s), Some(et)) if s.trim().starts_with(['{', '[']) => {
+                        let items = crate::types::parse_array_literal(s).map_err(|error| {
+                            ExecError::Runtime(format!(
+                                "invalid input syntax for type array: {error}"
+                            ))
+                        })?;
+                        crate::types::array_value_from_literal(&items, &mut |element| {
+                            self.eval_cast(Value::Text(element.to_string()), et)
+                                .map_err(|error| error.to_string())
+                        })
+                        .map_err(ExecError::Runtime)
                     }
-                    _ => match val {
-                        Value::Array(_) => Ok(val),
-                        _ => Ok(Value::Array(vec![val])),
-                    },
+                    (Value::Array(items), Some(et)) => {
+                        crate::types::validate_array_shape(items).map_err(ExecError::Runtime)?;
+                        fn cast_items(
+                            ex: &Executor,
+                            items: &[Value],
+                            target: &ast::DataType,
+                        ) -> Result<Value, ExecError> {
+                            items
+                                .iter()
+                                .map(|item| match item {
+                                    Value::Array(inner) => cast_items(ex, inner, target),
+                                    other => ex.eval_cast(other.clone(), target),
+                                })
+                                .collect::<Result<Vec<_>, _>>()
+                                .map(Value::Array)
+                        }
+                        cast_items(self, items, et)
+                    }
+                    _ => Err(ExecError::Runtime(
+                        "invalid input syntax for array: expected an array literal or array value"
+                            .into(),
+                    )),
                 }
             }
             ast::DataType::Char(_) | ast::DataType::Character(_) => {
@@ -2229,61 +2302,16 @@ fn coerce_to_array(v: Value) -> Option<Vec<Value>> {
     match v {
         Value::Array(vals) => Some(vals),
         Value::Text(s) if s.trim().starts_with('{') && s.trim().ends_with('}') => {
-            Some(parse_pg_array_literal(s.trim()))
+            let items = crate::types::parse_array_literal(&s).ok()?;
+            match crate::types::array_value_from_literal(&items, &mut |e| {
+                Ok(crate::types::guess_array_element(e))
+            }) {
+                Ok(Value::Array(vals)) => Some(vals),
+                _ => None,
+            }
         }
         _ => None,
     }
-}
-
-/// Parse a one-dimensional Postgres array literal ('{a,"b,c",NULL}').
-pub(super) fn parse_pg_array_literal(s: &str) -> Vec<Value> {
-    let inner = &s[1..s.len() - 1];
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_quotes = false;
-    let mut was_quoted = false;
-    let mut chars = inner.chars().peekable();
-    let push = |cur: &mut String, was_quoted: bool, out: &mut Vec<Value>| {
-        let raw = std::mem::take(cur);
-        let trimmed = if was_quoted {
-            raw
-        } else {
-            raw.trim().to_string()
-        };
-        if trimmed.is_empty() && !was_quoted {
-            return;
-        }
-        if !was_quoted && trimmed.eq_ignore_ascii_case("null") {
-            out.push(Value::Null);
-        } else if !was_quoted && let Ok(n) = trimmed.parse::<i64>() {
-            out.push(Value::Int64(n));
-        } else if !was_quoted && let Ok(f) = trimmed.parse::<f64>() {
-            out.push(Value::Float64(f));
-        } else {
-            out.push(Value::Text(trimmed));
-        }
-    };
-    while let Some(c) = chars.next() {
-        match c {
-            '"' if !in_quotes => {
-                in_quotes = true;
-                was_quoted = true;
-            }
-            '"' if in_quotes => in_quotes = false,
-            '\\' if in_quotes => {
-                if let Some(esc) = chars.next() {
-                    cur.push(esc);
-                }
-            }
-            ',' if !in_quotes => {
-                push(&mut cur, was_quoted, &mut out);
-                was_quoted = false;
-            }
-            _ => cur.push(c),
-        }
-    }
-    push(&mut cur, was_quoted, &mut out);
-    out
 }
 
 #[cfg(test)]
