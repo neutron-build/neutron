@@ -6540,6 +6540,7 @@ impl Executor {
                         ref left,
                         ref right,
                     } = *cte.query.body
+                    && Self::cte_arm_references_name(right, &cte_name)
                 {
                     let is_all = matches!(
                         set_quantifier,
@@ -6652,6 +6653,25 @@ impl Executor {
             }
             Ok(cte_tables)
         })
+    }
+
+    // WITH RECURSIVE also permits ordinary, nonrecursive UNION CTEs.
+    // Only unqualified relation names can refer to the CTE itself. This
+    // structural walk is conservative for nested WITH clauses that shadow
+    // the same name; it is not a full lexical CTE name-resolution pass.
+    fn cte_arm_references_name(body: &SetExpr, cte_name: &str) -> bool {
+        ast::visit_relations(body, |relation| {
+            if relation.0.len() == 1
+                && relation.0[0]
+                    .as_ident()
+                    .is_some_and(|ident| ident.value.eq_ignore_ascii_case(cte_name))
+            {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        })
+        .is_break()
     }
 
     // Nested SELECTs in either arm must see the same working set and

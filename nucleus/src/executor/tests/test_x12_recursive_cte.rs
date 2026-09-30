@@ -100,3 +100,35 @@ async fn x12_actual_studio_table_metadata_sql_runs_with_recursive_union() {
         assert_eq!(column[14], Value::Bool(false));
     }
 }
+
+#[tokio::test]
+async fn x12_with_recursive_nonrecursive_union_executes_each_arm_once() {
+    let ex = test_executor();
+    for quantifier in ["UNION", "UNION ALL"] {
+        let result = exec(
+            &ex,
+            &format!(
+                "WITH RECURSIVE c(x) AS (SELECT 1 {quantifier} SELECT 2) SELECT x FROM c ORDER BY x"
+            ),
+        )
+        .await;
+        assert_eq!(
+            rows(&result[0]),
+            &vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        );
+    }
+    // A string containing the CTE name is not a relation reference.
+    let result = exec(
+        &ex,
+        "WITH RECURSIVE c(x) AS (SELECT 'first' UNION ALL SELECT 'c') SELECT x FROM c ORDER BY x",
+    )
+    .await;
+    assert_eq!(
+        rows(&result[0]),
+        &vec![
+            vec![Value::Text("c".into())],
+            vec![Value::Text("first".into())]
+        ]
+    );
+    assert!(ex.current_session().active_ctes.read().is_empty());
+}
