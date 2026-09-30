@@ -1733,6 +1733,7 @@ impl Executor {
                 }
                 let dtype = column_vals
                     .first()
+                    .filter(|value| !matches!(value, Value::Null))
                     .map(value_type)
                     .unwrap_or_else(|| infer_expr_type(expr, col_meta));
                 result_columns.push((col_name, dtype));
