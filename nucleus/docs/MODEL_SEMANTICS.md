@@ -48,7 +48,7 @@ power failure loses up to `wal.checkpoint_interval_secs` (default **300 s**,
 | Datalog | fsync | yes (**fixed 2026-08-17**, NU-013) | yes (in-memory) | **no** | yes |
 | Streams (SQL `STREAM_*`) | fsync | entries yes; groups/cursors/PEL/acks yes (**2026-08-20**, S31-05) | yes, **session-scoped** (`9820d85a`), WAL-compensated (**2026-08-20**, S31-04) | **no** | yes |
 | Streams (RESP `XADD`) | **none** | **NO** | **no** | **no** | **no** |
-| CDC | fsync (**2026-08-18**, NU-006) | yes | **no** | **no** — emitted pre-commit (NU-107 open) | yes (metadata only) |
+| CDC | page cache; checkpoint durability | checkpointed events; recent tail may be lost | **no** | **no** — emitted pre-commit (NU-107 open) | yes (metadata only) |
 | Blob / large objects | fsync for manifests (**2026-08-18**, NU-006) | manifests yes; payload racy | yes, **session-scoped** | **no** | yes |
 | Pub/Sub | **none** | **NO** | **refused inside a transaction** (delivery is immediate) | **no** | yes |
 | Branch / version | **none** | **NO** | **refused inside a transaction** (2026-08-19) | **no** | yes |
@@ -152,10 +152,10 @@ These claims in the current tracked docs are **wrong or stale**:
 |---|---|---|
 | `DURABILITY.md:25` | `geo/geo.wal` — "R-tree mutations / Replayed on open" | Nothing ever appends to it and the replayed state is discarded (`src/executor/mod.rs:809`). **[verified]** the file is 0 bytes on a live server after geo use. There is no R-tree in the executor at all. |
 | `DURABILITY.md:30` | `datalog/datalog.wal` — "Facts and rules / Replayed on open" | **Was false, FIXED 2026-08-17 (NU-013).** `datalog_wal` was opened, stored and **never written**; the file stayed 0 bytes after `DATALOG_ASSERT` and the facts were gone after restart. All four mutators (`ASSERT`/`RULE`/`RETRACT`/`CLEAR`) now append, and a failed append fails the statement. Pinned by `datalog_facts_and_rules_survive_restart`, which asserts through SQL across a restart — the only place the gap was visible. |
-| ~~`DURABILITY.md:49`~~ | ~~`fsync` mode — "Data + metadata flushed before a commit is acknowledged"~~ | **RESOLVED 2026-08-18 (NU-006).** Document, FTS, blob, the columnar store and CDC are now in `force_specialty_durability`, and `acked_specialty_writes_are_fsync_durable` fails if any block is removed. `sync_mode` still applies only to the segmented SQL WAL — the specialty logs always full-`fsync`. |
+| ~~`DURABILITY.md:49`~~ | ~~`fsync` mode — "Data + metadata flushed before a commit is acknowledged"~~ | **RESOLVED 2026-08-18 (NU-006).** Document, FTS, blob, the columnar store and geo are included in `force_specialty_durability`. With an attached WAL and `synchronous_commit=on`, this boundary propagates sync errors. CDC is deliberately excluded and relies on checkpoints. `sync_mode` applies to the segmented SQL WAL; included specialty logs use full fsync at this boundary. |
 | `DURABILITY.md:12-13` | "anything absent from this list is derived and rebuildable" | Branch/version, tensor, sparse, and stored procedures are absent **and not rebuildable** — there is no authoritative source to rebuild them from. |
 | `RLS_SECURITY.md:64-66` | specialty surfaces "fail closed while RLS is active" | Holds for the unqualified names **[verified for 27 functions]**, but is defeated by the `pg_catalog.` prefix **[verified]**, and does not cover the RESP protocol at all. |
-| `src/executor/txn.rs:6-7` | "**All** specialty stores (KV, Graph, Doc, Datalog, FTS, TimeSeries, Blob, Vector) are snapshotted at BEGIN and restored on ROLLBACK" | **Corrected in M8.** The parenthetical list was accurate; the word "All" was not. KV *collections*, columnar store, streams, CDC, pub/sub, branch, version, tensor, sparse, and procedures are still outside the enlisted set and are never rolled back. |
+| `src/executor/txn.rs:6-7` | "**All** specialty stores (KV, Graph, Doc, Datalog, FTS, TimeSeries, Blob, Vector) are snapshotted at BEGIN and restored on ROLLBACK" | **Corrected in M8.** The parenthetical list was accurate; the word "All" was not. The rollback boundary is per surface, not universal. Non-revertible mutators such as KV collections and `COLUMNAR_INSERT` are refused inside explicit transactions before mutation; accepted exceptions such as CDC notifications and procedure registration have the limits stated in the matrix. |
 | `src/storage/mod.rs:413-423` + `src/storage/buffered_engine.rs` | `StorageEngine::savepoint` / `rollback_to_savepoint` / `release_savepoint` default to `Ok(())` | **Fixed in M8.** `BufferedDiskEngine` inherited all three while also reporting `supports_mvcc() == true`, so on every disk deployment `ROLLBACK TO SAVEPOINT` acknowledged success and discarded nothing. The defaults are still silent no-ops for any other engine that forgets to override them. |
 | `RLS_SECURITY.md:66` (list) | names `vector search/mutation` as guarded | The three guarded names — `VECTOR_SEARCH`, `VECTOR_INSERT`, `VECTOR_DELETE` — **do not exist**. **[verified]** all three return `unknown function`. The real vector surface (`VECTOR_DISTANCE`, `VECTOR_DIMS`, `VECTOR_L2_DISTANCE`, …) escapes the guard. |
 
@@ -208,29 +208,25 @@ live; `RELEASE` discards the level and keeps the writes. Writes are recorded
 into every open level, so rolling back to an outer savepoint still reverts work
 done while an inner one was open.
 
-**Commit-time fsync covers six of the fourteen WALs.**
-`force_specialty_durability` (`src/executor/mod.rs:3074-3110`) group-syncs KV
-(`:3080`), KV collections (`:3085`), time series (`:3090`), vector (`:3096`),
-graph (`:3101`), and streams (`:3107`). It runs at
-`src/executor/mod.rs:4908-4910`, gated on
-`result.is_ok() && (is_commit || !in_txn) && synchronous_commit_enabled()`.
-It has a second caller, `kv_fast_path_durability`
-(`src/executor/mod.rs:3906-3911`), which covers the wire-level KV fast path that
-bypasses `execute()` entirely — so that path fsyncs too, under the same
-`synchronous_commit` / not-in-transaction gate.
-Document, FTS, blob, the columnar store, and CDC are absent. CDC's exclusion is
-deliberate and documented (`src/executor/mod.rs:3066-3072`); the others are not
-explained anywhere.
+**Commit-time specialty fsync is gated on acknowledgement mode.**
+`force_specialty_durability` (`src/executor/mod.rs`, same-named function)
+group-syncs dirty attached WALs for KV strings, KV collections, time series,
+vector, graph, streams, document, FTS, blob manifests, the columnar store and
+geo. Blob payload segments are synced before their manifest WAL. Sync errors
+propagate to the caller. The successful autocommit/COMMIT path invokes it only
+when `synchronous_commit` is enabled; the wire KV fast path has the same
+acknowledgement-mode and transaction gate through `kv_fast_path_durability`.
+Memory-only stores have no attached WAL, and `synchronous_commit=off` skips
+this acknowledgement barrier. A process-kill restart test alone does not prove
+power-loss durability.
 
-For everything else, the background `WalCheckpoint` task
-(`src/main.rs:1414-1487`, period `wal.checkpoint_interval_secs`, default 300 s)
-is the only thing that ever reaches stable storage — via `atomic_replace_wal`
-(`src/storage/wal_util.rs:101-116`), which writes a temp file, fsyncs it, and
-renames. Note the rename's containing directory is **not** fsynced there, unlike
-the SQL WAL compaction path.
+CDC is deliberately excluded: its events are notifications, not commit
+confirmations. Its durability comes from `checkpoint_cdc_wal` in the periodic
+specialty checkpoint pass, so a crash can lose the recent feed tail even when
+the source SQL rows are durable. See the CDC section below.
 
-**WAL append errors do not reach the client.** Every specialty store logs a
-failed append with `tracing::error!`, `eprintln!`, or discards it with `let _ =`,
+**Some specialty WAL append errors do not reach the client.** Several stores
+log a failed append with `tracing::error!`, `eprintln!`, or discards it with `let _ =`,
 then completes the in-memory mutation and returns success. A full disk produces
 an acknowledged write that is not in the log. Sites include
 `src/kv/mod.rs:295`, `src/kv/collections.rs:333`, `src/document/mod.rs:532`,
@@ -854,20 +850,26 @@ is the most important distinction in this document.**
 (`src/executor/scalar_fns.rs:3792-3940`). File:
 `<data_dir>/columnar/columnar.wal`.
 
-**Durability — page cache only.** `ColumnarWal::append`
-(`src/storage/columnar_wal.rs:193-200`) never fsyncs, `ColumnarStore` exposes no
-`sync`/`group_sync`/`is_dirty` at all, and the store is **absent from
-`force_specialty_durability`**. The only fsync is the background checkpoint at
-`src/main.rs:1484`. **Crash-loss window for acked columnar writes: the full
-checkpoint interval, 300 s by default, regardless of `synchronous_commit`.**
-Errors swallowed (`src/columnar/mod.rs:793, 2508`). Same lossy Text fallback for
-exotic types (`src/storage/columnar_wal.rs:274-283`) — JSON/UUID/Array/Vector
-columns come back as strings.
+**Durability — fsync before acknowledgement with an attached server WAL and
+`synchronous_commit=on`.** `ColumnarWal::append` itself flushes to the OS;
+`ColumnarStore::wal_is_dirty` and `wal_group_sync` (`src/columnar/mod.rs`)
+connect it to `Executor::force_specialty_durability`. The successful
+autocommit boundary group-syncs dirty records and propagates sync errors.
+Memory-only stores have no WAL; `synchronous_commit=off` skips this barrier,
+so neither configuration promises fsync before acknowledgement. **[code]**
 
-**Transactions — none.** Columnar is not in `CrossModelSnapshots`
-(`src/executor/session.rs:156-166`). `BEGIN; COLUMNAR_INSERT(…); ROLLBACK;`
-leaves the row in the store and in the WAL permanently. **[code]** The one
-upside: having no rollback makes it immune to the cross-session clobber bug.
+Append errors are a separate limitation: `ColumnarStore::append` and
+`append_with_dict_tagged` log failed WAL appends and still mutate memory.
+The later sync cannot recover a record that was never appended. Exotic-type
+encoding also uses a Text fallback (`src/storage/columnar_wal.rs`), so
+JSON/UUID/Array/Vector values can lose their type across replay.
+
+**Transactions — mutations refused inside explicit transactions.** The scalar
+dispatcher checks `refused_in_transaction` before calling `COLUMNAR_INSERT`
+and returns Unsupported / SQLSTATE `0A000`. The store has no SQL rollback
+before-image; insert outside an explicit transaction instead. This refusal
+prevents accepting a write that a subsequent ROLLBACK could not undo.
+Columnar SQL-engine tables have a separate transaction boundary. **[code]**
 
 **Policy.** `COLUMNAR_` prefix — **[verified]** `COLUMNAR_COUNT` denied.
 
@@ -881,7 +883,7 @@ stall every checkpoint.
 File: `<data_dir>/columnar_engines/<table>_<crc32c>/columnar.wal`
 (`src/executor/ddl.rs:153-156`).
 
-**Materially stronger on three axes** and the option to prefer:
+**Prefer the engine for transactional table writes:**
 1. **fsync at commit** — `make_durable` (`src/storage/columnar_engine.rs:1507`)
    calls `group_sync` at `:1513`, invoked by `force_wal_durability`
    (`src/executor/mod.rs:3036-3054`) on the commit boundary.
@@ -1261,6 +1263,19 @@ procedural surface this section covers.
 
 ---
 
+## Concurrent derived-index maintenance
+
+Ordinary SQL DML preserves physical B-tree postings maintained by the storage
+engine; executor derived-state refresh does not replace those trees with a
+separately scanned copy (`src/executor/dml.rs`,
+`maintain_table_derived_state`). Structural schema changes and rollback retain
+physical reconstruction, including deferred structural work at COMMIT.
+
+This bounded repair does not establish universal concurrent derived-index
+coherence. Encrypted, vector, FTS and zone-map refreshes have separate scan and
+publication paths. Their concurrency guarantees require independent evidence;
+a passing selected soak workload does not certify every such path. **[code]**
+
 ## Recommendations for users
 
 - **Put anything you cannot lose in relational tables.** It is the only model
@@ -1279,6 +1294,8 @@ procedural surface this section covers.
   `pg_catalog.` ordering is fixed and the RESP surface is gated. And note that
   in the default (passwordless) configuration RLS never engages at all.
 - **Prefer `engine='columnar'` tables over `COLUMNAR_*` functions** — the engine
-  has commit fsync, propagated errors, and rollback; the store has none of them.
+  supports table rollback and propagates append errors. The store also has
+  fsync on acknowledgement with an attached WAL and `synchronous_commit=on`,
+  but refuses transactional inserts and retains the append-error limit above.
 - **Do not set `TS_RETENTION` before reading the time-series section.** It is
   global, retroactive, applied to user-supplied timestamps, and irreversible.

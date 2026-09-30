@@ -25,8 +25,8 @@ import (
 //
 // Each stage reports whether it is available on the connected engine, why
 // not when it is not, and which model's limits govern it. Everything here
-// is read-only: SQL runs inside a rolled-back READ ONLY transaction, and on
-// engines that do not apply READ ONLY only fixed, guard-checked reads run.
+// requests READ ONLY transactions and rolls them back. Non-PostgreSQL
+// inspection stages additionally restrict SQL to fixed, guard-checked reads.
 
 // Stage names, in journey order.
 const (
@@ -418,7 +418,7 @@ func sampleStatement(opts JourneyOptions) string {
 
 func journeyPlan(ctx context.Context, client *db.Client, engine Engine, opts JourneyOptions) Stage {
 	if engine.Product != "postgres" {
-		return unavailable(StagePlan, "sql", "EXPLAIN output and its read-only guarantee are not verified on this engine (capability report txn.read_only_rejects_writes)")
+		return unavailable(StagePlan, "sql", "This inspection stage requires PostgreSQL EXPLAIN (FORMAT JSON) output, which is unverified on this engine")
 	}
 	stmt := sampleStatement(opts)
 	raw, err := ExplainJSON(ctx, client, stmt)
@@ -454,7 +454,8 @@ func ExplainJSON(ctx context.Context, client *db.Client, stmt string) (json.RawM
 // On every engine but Nucleus the connection is then discarded (advisory
 // locks released, session closed), so nothing a statement left on the
 // session outlives the read. Nucleus has no advisory locks or session reset
-// to rely on and its guard is lexical, so its connections are pooled.
+// to rely on; it also has an additional lexical inspection guard, and its
+// connections are pooled.
 func ReadOnly(ctx context.Context, client *db.Client, engine Engine, fn func(tx pgx.Tx) error) error {
 	return client.ReadOnlyTx(ctx, engine.Product != "nucleus", fn)
 }
@@ -480,7 +481,7 @@ func journeyRows(ctx context.Context, client *db.Client, engine Engine, opts Jou
 	if engine.Product == "postgres" {
 		data.Note = "sample read in a rolled-back READ ONLY transaction; browse the table for keyed, editable rows"
 	} else {
-		data.Note = "sample read; this engine does not apply READ ONLY, so only this fixed SELECT runs"
+		data.Note = "sample read in a requested READ ONLY transaction that is rolled back; this inspection stage additionally permits only this fixed SELECT"
 	}
 	var ids []int64
 	err := ReadOnly(ctx, client, engine, func(tx pgx.Tx) error {

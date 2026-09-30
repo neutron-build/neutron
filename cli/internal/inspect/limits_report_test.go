@@ -151,8 +151,8 @@ func TestLimitsNeverOverclaim(t *testing.T) {
 			}
 		}
 	}
-	// SQL on Nucleus must carry the non-transactional DDL and ignored
-	// READ ONLY facts: the report records both unsupported.
+	// SQL on Nucleus must carry the non-transactional DDL and enforced
+	// READ ONLY facts: DDL remains unsupported while READ ONLY is enforced.
 	sql, _ := nucleus.Model("sql")
 	if sql.Transaction != TxPartial || !strings.Contains(sql.TransactionNote, "DDL is NOT transactional") {
 		t.Errorf("nucleus/sql transaction = %s %q", sql.Transaction, sql.TransactionNote)
@@ -263,7 +263,7 @@ var measuredFacts = map[string]fact{
 	SrcCapabilityReport + "|ddl.failed_migration_all_or_nothing": {models: one("sql", map[string][]string{fTx: none, fWarn: none})},
 	SrcCapabilityReport + "|ddl.uncommitted_ddl_invisible":       {models: one("sql", map[string][]string{fTx: none})},
 	SrcCapabilityReport + "|txn.isolation_levels_applied":        {models: one("sql", map[string][]string{fTx: none})},
-	SrcCapabilityReport + "|txn.read_only_rejects_writes":        {models: one("sql", map[string][]string{fWarn: none})},
+	SrcCapabilityReport + "|txn.read_only_rejects_writes":        {models: one("sql", map[string][]string{fTx: partialTx})},
 	SrcCapabilityReport + "|lock.advisory_session":               {models: one("sql", map[string][]string{fWarn: none})},
 	SrcCapabilityReport + "|lock.statement_timeout":              {models: one("sql", map[string][]string{fWarn: none})},
 	// X02: one transaction wrote a SQL row, a graph node and a document.
@@ -293,7 +293,8 @@ var measuredFacts = map[string]fact{
 	SrcX01Leg + "|vector-type":   {models: one("vector", map[string][]string{fAvail: none})},
 	SrcX01Leg + "|fts-functions": {models: one("fts", map[string][]string{fAvail: none})},
 	// X03.
-	SrcX03Leg + "|rangeCountScopingExact": {models: one("timeseries", map[string][]string{fAvail: avail})},
+	SrcX03Leg + "|untypedAggregateRefusals": {models: one("columnar", map[string][]string{fWarn: none})},
+	SrcX03Leg + "|rangeCountScopingExact":   {models: one("timeseries", map[string][]string{fAvail: avail})},
 	SrcX03Leg + "|afterKill9": {models: map[string]map[string][]string{
 		"timeseries": {fDur: survives}, "columnar": {fDur: survives},
 	}, sigkill: true},

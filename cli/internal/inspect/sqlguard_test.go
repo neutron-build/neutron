@@ -58,8 +58,8 @@ func TestCheckReadOnlySQLBothEngines(t *testing.T) {
 	}
 }
 
-// On Nucleus the guard is the only enforcement: everything PostgreSQL's
-// READ ONLY transaction would refuse must be refused lexically.
+// Nucleus inspection adds a strict lexical restriction alongside the
+// requested READ ONLY transaction, including writes and execution of ANALYZE.
 func TestCheckReadOnlySQLNucleusStrict(t *testing.T) {
 	cases := []string{
 		"WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",

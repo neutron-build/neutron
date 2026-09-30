@@ -867,7 +867,7 @@ func handleExplainSQL(ctx context.Context, env *toolEnv, args map[string]any) (*
 		return nil, fmt.Errorf("sql argument is required")
 	}
 	if env.engine.Product != "postgres" {
-		return nil, fmt.Errorf("EXPLAIN is offered on PostgreSQL only: this engine's plan format and read-only guarantee are not verified (capability report txn.read_only_rejects_writes)")
+		return nil, fmt.Errorf("EXPLAIN is offered on PostgreSQL only: PostgreSQL EXPLAIN (FORMAT JSON) output is unverified on this engine")
 	}
 	raw, err := inspect.ExplainJSON(ctx, env.client, strings.TrimRight(strings.TrimSpace(sql), ";"))
 	if err != nil {

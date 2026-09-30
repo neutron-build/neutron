@@ -118,8 +118,10 @@ setting cannot outlive a read. Built-in functions whose effects escape both
 the rollback and the session are refused by name (`pg_terminate_backend`,
 `pg_stat_reset*`, `pg_logical_emit_message`, replication slot and origin
 functions, `dblink*`, server file functions, ...).
-Nucleus does not apply `READ ONLY`, so there a lexical guard is the only
-enforcement: it refuses data-modifying keywords, row locks, `EXPLAIN ANALYZE`,
+Nucleus database reads also request a rolled-back `READ ONLY` transaction.
+The measured engine refuses `NEXTVAL` through views, scalar subqueries and
+`WHERE` predicates without advancing the sequence. An additional lexical
+guard refuses data-modifying keywords, row locks, `EXPLAIN ANALYZE`,
 every function the engine classifies as mutating (`KV_SET`, `DOC_INSERT`,
 `GRAPH_ADD_NODE`, `NEXTVAL`, ...) and `GRAPH_QUERY` unless its argument is one
 string literal of read-only Cypher. The guard reads names the way the servers
@@ -133,11 +135,9 @@ or operator that wraps one of the refused functions, and on Nucleus a mutating
 function the engine adds outside its own lists would pass. Connect the MCP
 server as a low-privilege role (most of those functions need superuser or an
 explicit grant); that, not the guard, is what bounds an agent on PostgreSQL.
-On Nucleus the read-only default is **best-effort**: the engine applies no
-`READ ONLY` and nothing rolls back a wrapped write, so a view or routine that
-wraps a mutating function runs and its write persists, and its roles do not
-reliably bound this. Expose a Nucleus MCP server only to agents you would
-trust with writes.
+Protection for unverified Nucleus specialty functions and their wrappers
+remains **best-effort**. Use a trusted principal; the tested `NEXTVAL` paths
+do not establish complete specialty read-only enforcement.
 
 **Writes are an explicit tool.** `execute_sql` exists only when the server is
 started with `--allow-writes`; it runs one statement in its own transaction,

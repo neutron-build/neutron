@@ -27,21 +27,18 @@ import (
 // inspection reads under a low-privilege role (most of them require
 // superuser or explicit grants), which is what actually bounds them.
 //
-// Nucleus does not apply READ ONLY (capability report
-// txn.read_only_rejects_writes: unsupported) and its specialty models are
-// written through ordinary SELECTs (SELECT KV_SET(...)). There the guard is
-// the only enforcement, so it is strict and fails closed — and best-effort:
-// a view or routine that wraps a mutating function is invisible to a name
-// check, Nucleus has no READ ONLY or rollback to catch it, and the write
-// persists (pinned by TestMCPNucleusWrappedMutatorGapIsDocumented). Its
-// roles do not reliably bound this either. Data-modifying
-// keywords anywhere, SELECT INTO, row locks, EXPLAIN ANALYZE and every
-// function the engine itself classifies as mutating are refused.
+// Nucleus enforces READ ONLY for the measured SQL writes and NEXTVAL
+// wrappers. Its specialty models can be written through ordinary SELECTs
+// (SELECT KV_SET(...)), so inspection also uses a strict lexical guard.
+// This additional restriction refuses data-modifying keywords anywhere,
+// SELECT INTO, row locks, EXPLAIN ANALYZE and every function the engine
+// itself classifies as mutating. A name check cannot see through every
+// user-defined wrapper; unverified specialty paths remain best-effort.
 
 // ReadOnlyEnforcement names who enforces a read-only statement.
 const (
 	EnforcedByEngine  = "engine: BEGIN READ ONLY, then ROLLBACK; the session is then closed (advisory locks released)"
-	EnforcedLexically = "lexical guard only: this engine does not apply READ ONLY (capability report txn.read_only_rejects_writes)"
+	EnforcedLexically = "additional strict lexical inspection guard; database reads request a rolled-back READ ONLY transaction"
 )
 
 // GuardError is a refusal by the read-only guard.
@@ -555,8 +552,9 @@ func singleStatement(toks []sqlToken) ([]sqlToken, error) {
 }
 
 // CheckReadOnlySQL refuses statements an inspection tool must not run.
-// product is the engine product ("postgres" enforces READ ONLY itself;
-// anything else gets the strict lexical guard).
+// product is the engine product; non-PostgreSQL products get an additional
+// strict lexical inspection restriction alongside the requested READ ONLY
+// transaction.
 //
 // Function names are refused wherever they occur as a name, not only when a
 // '(' follows: what the server accepts between a name and its argument list
@@ -624,14 +622,14 @@ func checkReadTokens(toks []sqlToken, product string) error {
 		}
 		switch {
 		case dataModifyingWords[t.text]:
-			return refuse("%s makes this statement a write (this engine does not enforce READ ONLY, so it is refused lexically)", t.text)
+			return refuse("%s makes this statement a write and is refused by the additional lexical inspection guard", t.text)
 		case t.text == "INTO":
 			return refuse("SELECT INTO creates a table")
 		case t.text == "FOR" && i+1 < len(toks) && toks[i+1].kind == tkWord &&
 			(toks[i+1].text == "UPDATE" || toks[i+1].text == "SHARE" || toks[i+1].text == "NO" || toks[i+1].text == "KEY"):
 			return refuse("row-locking clauses are not inspection reads")
 		case t.text == "ANALYZE" && lead.text == "EXPLAIN":
-			return refuse("EXPLAIN ANALYZE executes the statement; this engine does not enforce READ ONLY")
+			return refuse("EXPLAIN ANALYZE executes the statement and is refused by the additional lexical inspection guard")
 		}
 	}
 	return nil
