@@ -322,9 +322,11 @@ export async function forceUnlockMigrations(transport: Transport): Promise<void>
 /**
  * Run all pending migrations in ascending version order.
  *
- * Each migration runs inside its own transaction with its DDL, checksum,
- * owner and format committed atomically. Serialized across runners by the
- * ledger claim; a legacy history is refused until adoptMigrations graduates
+ * Each migration runs inside its own transaction, including checksum,
+ * owner and format history updates. PostgreSQL rolls back migration DDL;
+ * Nucleus catalog DDL can remain after failure and requires reconciliation
+ * before retry. Serialized across runners by the ledger claim; a legacy
+ * history is refused until adoptMigrations graduates
  * it. Returns the names of the migrations that were applied.
  */
 export async function migrate(

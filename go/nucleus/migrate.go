@@ -607,7 +607,9 @@ func (c *Client) AdoptMigrations(ctx context.Context, migrations []Migration) (*
 //
 // Checksums: every applied migration records the protocol-v2 checksum
 // (SHA-256 over the up SQL) plus owner/format metadata, in the same
-// transaction as its DDL. History rows in legacy formats (written before
+// transaction as its DDL. PostgreSQL rolls back that DDL on failure;
+// Nucleus catalog DDL can remain and requires reconciliation before retry.
+// History rows in legacy formats (written before
 // protocol v2) are refused before any mutation and graduate through
 // AdoptMigrations — the GO-30 silent baselining is superseded.
 func (c *Client) Migrate(ctx context.Context, migrations []Migration) error {
