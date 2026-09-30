@@ -75,12 +75,12 @@ pub async fn open_persistent_executor(
     let db_path = data_dir.join("nucleus.db");
     let engine = Arc::new(DiskEngine::open(&db_path, catalog.clone()).map_err(ExecError::Storage)?);
     let storage: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(engine));
-    let ex = Arc::new(super::Executor::new_with_persistence(
+    let ex = Arc::new(super::Executor::try_new_with_persistence(
         catalog,
         storage,
         Some(catalog_path),
         Some(data_dir),
-    ));
+    )?);
     // Roles, RLS policies, views, sequences, and functions live in meta.json,
     // NOT in catalog.json. Without this the executor opens with an empty
     // security/metadata catalog and the dump silently emits only tables+rows —

@@ -607,35 +607,34 @@ ranks.
 `FTS_MATCH`, `FTS_RANK`, `FTS_DOC_COUNT`, `FTS_TERM_COUNT`
 (`src/executor/scalar_fns.rs:4149-4389`).
 
-**Durability — page cache only, and after the first restart the WAL is
-detached.** `FtsWal` has no `WalSync` and no `group_sync`
-(`src/fts/fts_wal.rs:83-99`), and FTS is absent from
-`force_specialty_durability`.
+**Durability — checkpoint plus WAL tail.** `FtsWal` has `WalSync` and
+`group_sync`; an attached WAL participates in `force_specialty_durability`
+when `synchronous_commit=on`. Memory-only mode has no attached log and
+`synchronous_commit=off` skips that acknowledgement barrier.
 
-Worse: there are **two** persistence mechanisms and the weaker one wins. On
-startup the executor first opens the WAL-backed index
-(`src/executor/mod.rs:701-703`), then unconditionally overwrites it with
-`fts_index.json` if that file parses (`:842` → `load_fts_index` at `:886-895`).
-The WAL handle is `#[serde(skip)]` (`src/fts/mod.rs:387-388`), so the replacement
-index has `wal: None` — from that point `add_document` takes the no-WAL branch
-(`:445`) and `checkpoint_wal` is a no-op (`:632`). Since `save_fts_index` creates
-the JSON on the first `FTS_INDEX`, **from the second boot onward `fts.wal` is
-frozen and never appended to again**. **[verified]** on a restarted server,
-`FTS_INDEX(42, …)` grew `fts_index.json` from 313 to 636 bytes while
-`fts/fts.wal` stayed at 32 bytes.
+`load_fts_index` (`src/executor/mod.rs`) loads `fts_index.json` as the base,
+reattaches the WAL handle, and applies recovered tail operations before
+publishing the index. `save_fts_index` uses temp-file write, file fsync and
+rename through `storage::atomic_write::atomic_write` before truncating the
+covered tail. That helper's directory sync is best effort; this is not a
+power-cut verification claim. A truncation failure retains the tail and logs
+a warning. The historical detached-WAL/frozen-second-boot behavior is repaired.
 
-`fts_index.json` is written with a bare `std::fs::write`
-(`src/executor/mod.rs:876`) — no temp file, no rename, no fsync. A crash
-mid-write leaves truncated JSON, `from_json` fails at `:891`, and the executor
-**silently falls back to the stale WAL-replayed index** with no warning.
+An existing unreadable or malformed checkpoint now refuses recovery: the
+WAL tail may omit documents already folded into that checkpoint. Missing
+checkpoint files remain valid for a fresh/WAL-only instance. Preserve damaged
+checkpoint bytes and restore a verified backup; deleting the base is not a
+repair. The server and maintenance opener propagate the fallible constructor
+error; the compatibility `new_with_persistence` constructor panics with a
+recovery diagnostic rather than returning an incomplete index.
 
 **Transactions.** FTS already had a real op-scoped undo log, so it never
 clobbered other sessions — `undo` only reverses this session's own operations.
 M8 fixed the two gaps around it: recording no longer uses a non-blocking
 `try_write()` on the async transaction lock (which silently dropped the undo
 record under contention, leaving a mutation that `ROLLBACK` could not undo), and
-`save_fts_index` now runs as part of the revert, so the on-disk JSON — the file
-that wins over the WAL on reopen — no longer retains the rolled-back document.
+`save_fts_index` runs as part of the revert, so the checkpoint base does not
+retain the rolled-back document when its WAL tail is truncated.
 Savepoints now cover it, via a mark into the op log.
 **Still true:** if A adds doc 7 and B overwrites doc 7, A's rollback deletes B's
 version. That is a write-write conflict on one id and needs isolation.

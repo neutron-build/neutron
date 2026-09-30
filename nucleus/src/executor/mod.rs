@@ -1307,12 +1307,26 @@ impl Executor {
         }
     }
 
+    /// Compatibility constructor. Invalid persisted FTS checkpoints refuse
+    /// construction with a diagnostic panic; use `try_new_with_persistence`
+    /// to handle recovery errors without unwinding.
     pub fn new_with_persistence(
         catalog: Arc<Catalog>,
         storage: Arc<dyn StorageEngine>,
         catalog_path: Option<std::path::PathBuf>,
         data_dir: Option<&std::path::Path>,
     ) -> Self {
+        Self::try_new_with_persistence(catalog, storage, catalog_path, data_dir)
+            .unwrap_or_else(|error| panic!("executor recovery refused: {error}"))
+    }
+
+    /// Recover persistent model state, refusing an incomplete FTS checkpoint base.
+    pub fn try_new_with_persistence(
+        catalog: Arc<Catalog>,
+        storage: Arc<dyn StorageEngine>,
+        catalog_path: Option<std::path::PathBuf>,
+        data_dir: Option<&std::path::Path>,
+    ) -> Result<Self, ExecError> {
         let mut exec = Self::new(catalog, storage);
         exec.catalog_path = catalog_path;
         exec.data_dir = data_dir.map(|d| d.to_path_buf());
@@ -1628,8 +1642,8 @@ impl Executor {
             exec.stats_path = Some(sp);
         }
 
-        exec.load_fts_index();
-        exec
+        exec.load_fts_index()?;
+        Ok(exec)
     }
 
     /// Return the path used for persisting the FTS index alongside the catalog.
@@ -1690,108 +1704,40 @@ impl Executor {
         Ok(())
     }
 
-    /// Load the FTS index from disk at startup (called by new_with_persistence).
-    /// Load the legacy `fts_index.json`, which **overrides** the WAL-backed
-    /// index opened above.
-    ///
-    /// Two things about this are measured facts, not readings of the code, and
-    /// both matter before anyone "fixes" the override:
-    ///
-    /// 1. From the SECOND boot onward the FTS WAL receives nothing. Once this
-    ///    file exists, the index is replaced by a `from_json` one, and
-    ///    `InvertedIndex::wal` is `#[serde(skip)]`, so the live index has
-    ///    `wal: None` and all three WAL write sites are `if let Some(wal)`.
-    ///    Measured: WAL directory 64 bytes before a second session's write and
-    ///    64 bytes after it; the document was searchable only while the JSON
-    ///    was present.
-    /// 2. The obvious fix — let the WAL win — would DESTROY DATA on upgrade,
-    ///    because every existing deployment's WAL has been stale since its own
-    ///    second boot, and the JSON is the only copy of everything written
-    ///    since.
-    ///
-    /// And it cannot be migrated the easy way either: the WAL stores original
-    /// document text and replays it, while the JSON stores derived postings and
-    /// `DocInfo` keeps only a length. There is no text to rebuild a WAL from, so
-    /// JSON -> WAL is not a conversion, it is a re-index from base tables. That
-    /// is a product decision with a migration, not a bug fix, and it is filed
-    /// rather than taken here.
-    ///
-    /// What IS fixed here: the read and parse errors used to be swallowed
-    /// entirely — `if let Ok(..) && let Ok(..)` — so a corrupt legacy file
-    /// silently reverted FTS to whatever the stale WAL happened to hold, with
-    /// no message anywhere. Given this file is the authoritative store, that is
-    /// the same silent-empty-recovery shape as the rest of this class.
-    ///
-    /// **NU-014, 2026-08-19: the checkpoint/tail split above is now what
-    /// happens.** The two are no longer rivals. `fts_index.json` is loaded as
-    /// the base, the WAL handle is RE-ATTACHED to it (the `serde(skip)` is the
-    /// whole bug — a deserialized index had `wal: None` and every write site is
-    /// an `if let Some(wal)`), and the WAL's recovered state is applied on top
-    /// as a tail. `save_fts_index` then truncates the tail after each
-    /// checkpoint, so the two cannot diverge again.
-    ///
-    /// No migration: an existing deployment's JSON is the seed, exactly as
-    /// before, and its stale WAL contributes whatever it holds — which is a
-    /// subset of the JSON, so applying it is a no-op.
-    fn load_fts_index(&mut self) {
+    /// Load the checkpoint base, reattach its durable WAL, and replay the tail.
+    /// A missing checkpoint is valid on first boot. An existing unreadable or
+    /// malformed base cannot be replaced by the tail: successful checkpoints
+    /// truncate that tail, so doing so would silently lose checkpointed docs.
+    fn load_fts_index(&mut self) -> Result<(), ExecError> {
         let Some(path) = self.fts_persist_path() else {
-            return;
+            return Ok(());
         };
         let data = match std::fs::read_to_string(&path) {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-            Err(e) => {
-                tracing::error!(
-                    target: "nucleus::startup",
-                    "FTS index at {} exists but could not be read: {e}. Falling back to the \
-                     WAL-backed index, which has not been written to since this file was \
-                     first created — expect missing documents.",
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(ExecError::Storage(StorageError::Io(format!(
+                    "FTS checkpoint {} could not be read: {error}; recovery refused because the WAL tail may omit checkpointed documents. Preserve the checkpoint and restore a verified backup",
                     path.display()
-                );
-                return;
+                ))));
             }
         };
-        match fts::InvertedIndex::from_json(&data) {
-            Ok(mut idx) => {
-                // Carry the WAL handle across from the index the WAL built, so
-                // this session's writes are logged. Without this the
-                // checkpoint replaced a live index with a dead one.
-                let wal = self.fts_index.read().wal_handle();
-                match wal {
-                    Some(wal) => idx.attach_wal(wal),
-                    None => tracing::warn!(
-                        target: "nucleus::startup",
-                        "FTS: no WAL handle to re-attach after loading {}. Writes this session \
-                         will not be logged; the checkpoint file is the only durable copy.",
-                        path.display()
-                    ),
-                }
-                // Then the tail on top. Idempotent: re-applying an entry the
-                // checkpoint already holds re-indexes the same document.
-                if let Some(tail) = self.fts_wal_tail.take() {
-                    let (docs, removed) = (tail.docs.len(), tail.removed.len());
-                    idx.apply_wal_tail(&tail);
-                    if docs > 0 || removed > 0 {
-                        tracing::info!(
-                            target: "nucleus::startup",
-                            "FTS: applied a WAL tail of {docs} document(s) and {removed} \
-                             removal(s) on top of {}",
-                            path.display()
-                        );
-                    }
-                }
-                *self.fts_index.write() = idx;
-            }
-            Err(e) => {
-                tracing::error!(
-                    target: "nucleus::startup",
-                    "FTS index at {} did not parse: {e}. Falling back to the WAL-backed index, \
-                     which has not been written to since this file was first created — expect \
-                     missing documents.",
-                    path.display()
-                );
-            }
+        let mut index = fts::InvertedIndex::from_json(&data).map_err(|error| {
+            ExecError::Storage(StorageError::Io(format!(
+                "FTS checkpoint {} did not parse: {error}; recovery refused because the WAL tail may omit checkpointed documents. Preserve the checkpoint and restore a verified backup",
+                path.display()
+            )))
+        })?;
+        // A deserialized checkpoint has no handle (`serde(skip)`). Preserve the
+        // attached WAL opened earlier before publishing the reconstructed index.
+        if let Some(wal) = self.fts_index.read().wal_handle() {
+            index.attach_wal(wal);
         }
+        if let Some(tail) = self.fts_wal_tail.take() {
+            index.apply_wal_tail(&tail);
+        }
+        *self.fts_index.write() = index;
+        Ok(())
     }
 
     /// Synchronously persist only the sequence state to `sequences.json`.
