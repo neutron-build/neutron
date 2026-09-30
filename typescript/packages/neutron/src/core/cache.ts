@@ -1,20 +1,61 @@
 // Request-level deduplication cache
 // Inspired by SolidStart's cache() API + Next.js 16 cache tags
 
-type CacheEntry<T> = {
-  promise: Promise<T>;
+type CacheEntry = {
+  promise: Promise<unknown>;
   expiresAt: number;
-  tags?: string[]; // NEW: Associated tags
+  tags?: string[];
+  timer?: ReturnType<typeof setTimeout>;
 };
 
-const globalCache = new Map<string, CacheEntry<any>>();
-const tagCache = new Map<string, Set<string>>(); // tag -> Set of cache keys
+/** Internal state for one request or the bounded browser cache. */
+export class CacheScope {
+  readonly entries = new Map<string, CacheEntry>();
+  readonly tags = new Map<string, Set<string>>();
+  constructor(readonly request = false) {}
+  remove(key: string): void {
+    const entry = this.entries.get(key);
+    if (!entry) return;
+    this.entries.delete(key);
+    if (entry.timer) clearTimeout(entry.timer);
+    for (const tag of entry.tags ?? []) {
+      const keys = this.tags.get(tag);
+      keys?.delete(key);
+      if (!keys?.size) this.tags.delete(tag);
+    }
+  }
+  clear(): void {
+    for (const key of this.entries.keys()) this.remove(key);
+  }
+}
+
+const sharedCache = new CacheScope();
+let requestScope: () => CacheScope | undefined = () => undefined;
+let functionId = 0;
+
+/** Installed by the Node server adapter; keeps Node imports out of client bundles. */
+export function installRequestCacheScope(provider: () => CacheScope | undefined): void {
+  requestScope = provider;
+}
+
+function activeScope(shared = false): CacheScope | undefined {
+  if (shared) return sharedCache;
+  const request = requestScope();
+  if (request) return request;
+  return typeof window !== 'undefined' ? sharedCache : undefined;
+}
 
 export interface CacheOptions {
   /**
    * Time-to-live in milliseconds (default: 5000ms on client, request lifetime on server)
    */
   ttl?: number;
+
+  /** Explicit process-wide caching for public data. Default server caching is request-local. */
+  scope?: 'request' | 'shared';
+
+  /** Entry limit for the current scope (default 1024, maximum 4096). */
+  maxEntries?: number;
 
   /**
    * Cache key prefix for namespacing
@@ -61,74 +102,43 @@ export function cache<TArgs extends any[], TReturn>(
   fn: (...args: TArgs) => Promise<TReturn>,
   options: CacheOptions = {}
 ): (...args: TArgs) => Promise<TReturn> {
-  const { ttl = 5000, keyPrefix = 'cache', tags: tagsFn } = options;
-
+  const { ttl, keyPrefix = 'cache', tags: tagsFn, maxEntries = 1024 } = options;
+  if (ttl !== undefined && (!Number.isFinite(ttl) || ttl < 0 || ttl > 2147483647)) {
+    throw new RangeError('Cache ttl must be between 0 and 2147483647 milliseconds');
+  }
+  if (!Number.isInteger(maxEntries) || maxEntries < 1 || maxEntries > 4096) {
+    throw new RangeError('Cache maxEntries must be an integer between 1 and 4096');
+  }
+  const identity = ++functionId;
   return (...args: TArgs): Promise<TReturn> => {
-    // Generate cache key from function args
-    const key = `${keyPrefix}:${JSON.stringify(args)}`;
-
-    // Check if we have a valid cached entry
-    const cached = globalCache.get(key);
-    if (cached && cached.expiresAt > Date.now()) {
-      return cached.promise;
-    }
-
-    // Create new promise and cache it
+    const state = activeScope(options.scope === 'shared');
+    // Outside a server request, no implicit process cache may retain private data.
+    if (!state) return fn(...args);
+    const key = `${keyPrefix}:${identity}:${JSON.stringify(args)}`;
+    const now = Date.now();
+    const existing = state.entries.get(key);
+    if (existing && existing.expiresAt > now) return existing.promise as Promise<TReturn>;
+    state.remove(key);
+    const tags = tagsFn ? [...new Set(tagsFn(...args))] : undefined;
     const promise = fn(...args);
-
-    // Generate tags for this cache entry
-    const tags = tagsFn ? tagsFn(...args) : undefined;
-
-    const expiresAt = Date.now() + ttl;
-    globalCache.set(key, { promise, expiresAt, tags });
-
-    // A settled rejection is a failed attempt, not a result: keep the entry
-    // only while the promise is in flight (concurrent callers share the
-    // failure), then evict it so the next call retries instead of being
-    // re-served the cached error for the whole TTL. Tag references go with
-    // the entry, exactly as on TTL expiry.
-    promise.catch(() => {
-      const entry = globalCache.get(key);
-      if (entry && entry.promise === promise) {
-        globalCache.delete(key);
-        if (entry.tags) {
-          for (const tag of entry.tags) {
-            tagCache.get(tag)?.delete(key);
-            if (tagCache.get(tag)?.size === 0) {
-              tagCache.delete(tag);
-            }
-          }
-        }
-      }
-    });
-
-    // Register cache key with tags
-    if (tags) {
-      for (const tag of tags) {
-        if (!tagCache.has(tag)) {
-          tagCache.set(tag, new Set());
-        }
-        tagCache.get(tag)!.add(key);
-      }
+    const lifetime = ttl ?? (state.request ? Infinity : 5000);
+    const entry: CacheEntry = { promise, expiresAt: now + lifetime, tags };
+    while (state.entries.size >= maxEntries) state.remove(state.entries.keys().next().value!);
+    state.entries.set(key, entry);
+    for (const tag of tags ?? []) {
+      if (!state.tags.has(tag)) state.tags.set(tag, new Set());
+      state.tags.get(tag)!.add(key);
     }
-
-    // Clean up expired entry after TTL
-    setTimeout(() => {
-      const entry = globalCache.get(key);
-      if (entry && entry.expiresAt <= Date.now()) {
-        globalCache.delete(key);
-        // Clean up tag references
-        if (entry.tags) {
-          for (const tag of entry.tags) {
-            tagCache.get(tag)?.delete(key);
-            if (tagCache.get(tag)?.size === 0) {
-              tagCache.delete(tag);
-            }
-          }
-        }
-      }
-    }, ttl);
-
+    promise.catch(() => {
+      if (state.entries.get(key) === entry) state.remove(key);
+    });
+    if (Number.isFinite(lifetime)) {
+      entry.timer = setTimeout(() => {
+        if (state.entries.get(key) === entry) state.remove(key);
+      }, lifetime);
+      // Explicit shared caches must not keep a Node process alive.
+      (entry.timer as unknown as { unref?: () => void }).unref?.();
+    }
     return promise;
   };
 }
@@ -136,28 +146,27 @@ export function cache<TArgs extends any[], TReturn>(
 /**
  * Clears all cached entries
  */
-export function clearCache(): void {
-  globalCache.clear();
+export function clearCache(scope?: 'request' | 'shared'): void {
+  (activeScope(scope === 'shared') ?? sharedCache).clear();
 }
 
 /**
  * Clears cached entries matching a key prefix
  */
-export function clearCacheByPrefix(prefix: string): void {
-  for (const key of globalCache.keys()) {
-    if (key.startsWith(prefix)) {
-      globalCache.delete(key);
-    }
+export function clearCacheByPrefix(prefix: string, scope?: 'request' | 'shared'): void {
+  const state = activeScope(scope === 'shared') ?? sharedCache;
+  if (!state) return;
+  for (const key of state.entries.keys()) {
+    if (key.startsWith(prefix)) state.remove(key);
   }
 }
 
 /**
  * Clears the cache after each server request (for SSR)
- * Call this in your server request handler
+ * The server adapter creates isolated request scopes automatically.
  */
 export function resetRequestCache(): void {
-  globalCache.clear();
-  tagCache.clear();
+  activeScope()?.clear();
 }
 
 /**
@@ -177,30 +186,10 @@ export function resetRequestCache(): void {
  * revalidateTag('user:123'); // Invalidates only user 123's cache
  * ```
  */
-export function revalidateTag(tag: string): void {
-  const keys = tagCache.get(tag);
-  if (!keys) return;
-
-  // Delete all cache entries with this tag
-  for (const key of keys) {
-    const entry = globalCache.get(key);
-    globalCache.delete(key);
-
-    // Clean up other tag references for this key
-    if (entry?.tags) {
-      for (const t of entry.tags) {
-        if (t !== tag) {
-          tagCache.get(t)?.delete(key);
-          if (tagCache.get(t)?.size === 0) {
-            tagCache.delete(t);
-          }
-        }
-      }
-    }
-  }
-
-  // Delete tag mapping
-  tagCache.delete(tag);
+export function revalidateTag(tag: string, scope?: 'request' | 'shared'): void {
+  const state = activeScope(scope === 'shared') ?? sharedCache;
+  if (!state) return;
+  for (const key of [...(state.tags.get(tag) ?? [])]) state.remove(key);
 }
 
 /**
@@ -211,9 +200,9 @@ export function revalidateTag(tag: string): void {
  * revalidateTags(['user:123', 'posts:user:123']);
  * ```
  */
-export function revalidateTags(tags: string[]): void {
+export function revalidateTags(tags: string[], scope?: 'request' | 'shared'): void {
   for (const tag of tags) {
-    revalidateTag(tag);
+    revalidateTag(tag, scope);
   }
 }
 
@@ -221,15 +210,15 @@ export function revalidateTags(tags: string[]): void {
  * Gets all tags currently registered in the cache
  * Useful for debugging
  */
-export function getCacheTags(): string[] {
-  return Array.from(tagCache.keys());
+export function getCacheTags(scope?: 'request' | 'shared'): string[] {
+  return Array.from((activeScope(scope === 'shared') ?? sharedCache).tags.keys());
 }
 
 /**
  * Gets all cache keys associated with a tag
  * Useful for debugging
  */
-export function getCacheKeysByTag(tag: string): string[] {
-  const keys = tagCache.get(tag);
+export function getCacheKeysByTag(tag: string, scope?: 'request' | 'shared'): string[] {
+  const keys = (activeScope(scope === 'shared') ?? sharedCache).tags.get(tag);
   return keys ? Array.from(keys) : [];
 }

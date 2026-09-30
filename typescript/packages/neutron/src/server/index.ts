@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import { runWithRequestCache } from "./request-cache.js";
 import {
   renderAppRoute,
   emitHook,
@@ -465,6 +466,7 @@ export async function createServer(
   }
 
   const app = new Hono<{ Variables: { requestId: string } }>();
+  app.use("*", (_c, next) => runWithRequestCache(next));
 
   // FRAMEWORK_CONTRACT.md §2: errors are RFC 7807 problem+json. A ProblemError
   // thrown from a route mounted directly on the Hono app (api/raw mode, or

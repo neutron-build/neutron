@@ -1,9 +1,61 @@
+// @vitest-environment happy-dom
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { cache, clearCache, clearCacheByPrefix, resetRequestCache, revalidateTag, revalidateTags, getCacheTags, getCacheKeysByTag } from './cache.js';
 
 describe('cache()', () => {
   beforeEach(() => {
     clearCache();
+  });
+
+  it('never shares results between different functions with identical arguments', async () => {
+    const user = cache(async (id: string) => `user:${id}`);
+    const invoice = cache(async (id: string) => `invoice:${id}`);
+    expect(await user('42')).toBe('user:42');
+    expect(await invoice('42')).toBe('invoice:42');
+  });
+
+  it('keeps different functions isolated even with the same explicit prefix', async () => {
+    const first = cache(async () => 'first', { keyPrefix: 'shared' });
+    const second = cache(async () => 'second', { keyPrefix: 'shared' });
+    expect(await first()).toBe('first');
+    expect(await second()).toBe('second');
+  });
+
+  it('removes tag references when clearing all entries', async () => {
+    const tagged = cache(async () => 'value', { tags: () => ['clear-test'] });
+    await tagged();
+    expect(getCacheKeysByTag('clear-test')).toHaveLength(1);
+    clearCache();
+    expect(getCacheKeysByTag('clear-test')).toEqual([]);
+  });
+
+  it('bounds entries and removes evicted tag references', async () => {
+    let calls = 0;
+    const bounded = cache(async (id: number) => { calls++; return id; }, {
+      maxEntries: 2, tags: id => [`item:${id}`],
+    });
+    await bounded(1); await bounded(2); await bounded(3);
+    expect(getCacheTags()).toEqual(['item:2', 'item:3']);
+    expect(getCacheKeysByTag('item:1')).toEqual([]);
+    await bounded(1);
+    expect(calls).toBe(4);
+    expect(getCacheTags()).toEqual(['item:3', 'item:1']);
+  });
+
+  it('cleans tag references when clearing by prefix', async () => {
+    await cache(async () => 1, { keyPrefix: 'remove', tags: () => ['removed'] })();
+    await cache(async () => 2, { keyPrefix: 'keep', tags: () => ['kept'] })();
+    clearCacheByPrefix('remove');
+    expect(getCacheTags()).toEqual(['kept']);
+  });
+
+  it('rejects invalid lifetimes and entry limits', () => {
+    for (const ttl of [-1, NaN, Infinity, 2147483648]) {
+      expect(() => cache(async () => 1, { ttl })).toThrow(RangeError);
+    }
+    for (const maxEntries of [0, 1.5, 4097, Infinity]) {
+      expect(() => cache(async () => 1, { maxEntries })).toThrow(RangeError);
+    }
   });
 
   it('deduplicates identical calls', async () => {
