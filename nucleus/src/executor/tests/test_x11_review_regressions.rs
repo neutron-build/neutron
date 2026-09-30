@@ -233,3 +233,40 @@ async fn x11_jsonb_numeric_scale_does_not_change_containment() {
     }
     assert_eq!(scalar(&exec(&ex, "SELECT '[1234567890123456789012345678901234567890]'::jsonb @> '[1234567890123456789012345678901234567891]'::jsonb").await[0]), &Value::Bool(false));
 }
+
+#[tokio::test]
+async fn x11_fromless_where_filters_before_projection_and_empty_aggregation() {
+    let ex = test_executor();
+    for sql in [
+        "SELECT 1 AS x WHERE FALSE",
+        "SELECT 1 AS x WHERE NULL",
+        "SELECT 1 AS x WHERE 1 = 2",
+    ] {
+        let result = exec(&ex, sql).await;
+        match &result[0] {
+            ExecResult::Select { columns, rows } => {
+                assert_eq!(columns, &vec![("x".into(), DataType::Int32)]);
+                assert!(rows.is_empty(), "{sql}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(
+        scalar(&exec(&ex, "SELECT 1 AS x WHERE TRUE").await[0]),
+        &Value::Int32(1)
+    );
+    for sql in [
+        "SELECT JSONB_AGG(x) FROM (SELECT 1 AS x WHERE FALSE) t",
+        "SELECT JSONB_AGG(x) FROM (SELECT 1 AS x WHERE NULL) t",
+    ] {
+        let result = exec(&ex, sql).await;
+        match &result[0] {
+            ExecResult::Select { columns, rows } => {
+                assert_eq!(columns[0].1, DataType::Jsonb);
+                assert_eq!(rows, &vec![vec![Value::Null]], "{sql}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(ex.execute("SELECT 1 WHERE 7").await.is_err());
+}
