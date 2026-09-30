@@ -135,6 +135,17 @@ async fn pg_type_carries_all_four_io_function_columns() {
     ];
     for row in &rows {
         let name = text(&row[0]);
+        // Array types share PostgreSQL's generic array I/O functions; their
+        // catalog names (_bool, _int4, ...) are not function-name stems.
+        if name.starts_with('_') {
+            for (i, expected) in ["array_in", "array_out", "array_recv", "array_send"]
+                .into_iter()
+                .enumerate()
+            {
+                assert_eq!(text(&row[i + 1]), expected, "array I/O/{name}");
+            }
+            continue;
+        }
         let sep = if underscored.contains(&name.as_str()) {
             "_"
         } else {
@@ -263,4 +274,46 @@ async fn array_constructor_from_subquery_runs() {
         }
         o => panic!("expected SELECT, got {o:?}"),
     }
+}
+
+/// Named enum and enum-array rows use generic I/O functions too. PostgreSQL
+/// reports enum_in/out/recv/send for an enum, and array_in/out/recv/send for
+/// its array regardless of the user-selected type name.
+#[tokio::test]
+async fn enum_and_array_io_names_match_postgresql() {
+    let db = db().await;
+    db.execute("CREATE TYPE bootstrap_color AS ENUM ('red', 'blue')")
+        .await
+        .unwrap();
+    let rows = match db.execute("SELECT typname, typinput, typoutput, typreceive, typsend FROM pg_type WHERE typname IN ('bootstrap_color', '_bootstrap_color') ORDER BY typname")
+        .await.unwrap().pop().unwrap()
+    {
+        ExecResult::Select { rows, .. } => rows,
+        other => panic!("{other:?}"),
+    };
+    use nucleus::types::Value;
+    let expected = [
+        [
+            "_bootstrap_color",
+            "array_in",
+            "array_out",
+            "array_recv",
+            "array_send",
+        ],
+        [
+            "bootstrap_color",
+            "enum_in",
+            "enum_out",
+            "enum_recv",
+            "enum_send",
+        ],
+    ]
+    .into_iter()
+    .map(|row| {
+        row.into_iter()
+            .map(|value| Value::Text(value.into()))
+            .collect::<Vec<_>>()
+    })
+    .collect::<Vec<_>>();
+    assert_eq!(rows, expected);
 }

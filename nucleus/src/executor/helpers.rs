@@ -58,6 +58,8 @@ pub(super) fn pg_type_info(dt: &DataType) -> (i32, i32, &'static str, &'static s
 pub(super) fn pg_type_io_names(typname: &str) -> (String, String, String, String) {
     // Types whose I/O functions carry an underscore in real PostgreSQL.
     const UNDERSCORED: &[&str] = &[
+        "array",
+        "enum",
         "json",
         "jsonb",
         "date",
