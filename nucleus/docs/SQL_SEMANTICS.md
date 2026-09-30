@@ -45,8 +45,9 @@ rejects** rather than silently using binary ordering.
 
 ## Constraints
 
-`PRIMARY KEY`, `UNIQUE`, `CHECK`, `NOT NULL` and `FOREIGN KEY` are immediate
-and persist across restart.
+`PRIMARY KEY`, `UNIQUE`, `CHECK` and `NOT NULL` are immediate and persist
+across restart. Foreign keys are immediate unless declared DEFERRABLE; see
+[deferred foreign keys](#deferred-foreign-keys-and-generated-writes) below.
 
 Foreign keys:
 
@@ -56,7 +57,7 @@ Foreign keys:
 - Cascades are preflighted as one logical operation and enforce the child
   table's full constraint **and RLS** envelope.
 
-Rejected explicitly rather than silently ignored: deferred constraints,
+Rejected explicitly rather than silently ignored: deferred PRIMARY KEY/UNIQUE,
 `MATCH FULL`, `MATCH PARTIAL`, `UNIQUE NULLS NOT DISTINCT`, and dependency
 `DROP ... CASCADE`.
 
@@ -209,10 +210,14 @@ their columns match. Generated expressions and identity flags reflect live
 column metadata in pg_attribute, pg_attrdef and information_schema.columns.
 Named-user column privilege queries check the named role's table-level grants.
 
-This remains a compatibility catalog. Raw int2[] catalog fields use the engine's
-int4[] representation, and integer-vector casts accept space-separated catalog
-values. Unsupported PostgreSQL catalog features are not evidence of support
-for the corresponding engine feature.
+This remains a compatibility catalog. Raw int2[] and pg_index vector fields use
+the engine's int4[] representation; this does not establish PostgreSQL
+int2vector/oidvector wire-type parity. Integer-vector casts accept
+space-separated catalog values. UNNEST supports typed arrays and WITH ORDINALITY
+for the CLI and Studio catalog queries, including implicit lateral references
+and LEFT JOIN padding. Scalar NULL arguments are refused. Unsupported
+PostgreSQL catalog features are not evidence of support for the corresponding
+engine feature.
 
 JSONB numeric equality and hashing compare exact values recursively, so numeric
 scale and exponent notation do not split DISTINCT or join keys. Display retains
