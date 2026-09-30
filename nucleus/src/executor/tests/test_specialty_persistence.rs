@@ -972,3 +972,73 @@ async fn doc_sql_writes_fail_loudly_when_the_wal_append_fails() {
         "the acknowledged document must still exist after reopen"
     );
 }
+
+fn fts_checkpoint_recovery_must_refuse_invalid_existing_base(unreadable: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog_path = dir.path().join("catalog.json");
+    let checkpoint = dir.path().join("fts_index.json");
+    // Missing checkpoint is valid on a fresh durable instance.
+    let fresh = Executor::new_with_persistence(
+        Arc::new(Catalog::new()),
+        Arc::new(crate::storage::MemoryEngine::new()),
+        Some(catalog_path.clone()),
+        Some(dir.path()),
+    );
+    assert_eq!(fresh.fts_index().read().doc_count(), 0);
+    fresh
+        .fts_index()
+        .write()
+        .add_document(41, "checkpoint-only document");
+    fresh.save_fts_index().unwrap();
+    assert_eq!(fresh.fts_index().read().doc_count(), 1);
+    drop(fresh);
+    // Checkpointing consumed the tail: fallback cannot reconstruct this document.
+    let (_wal, state) = crate::fts::fts_wal::FtsWal::open(&dir.path().join("fts")).unwrap();
+    assert!(state.docs.is_empty());
+    drop(_wal);
+    if unreadable {
+        std::fs::remove_file(&checkpoint).unwrap();
+        std::fs::create_dir(&checkpoint).unwrap();
+        std::fs::write(
+            checkpoint.join("retained-marker"),
+            b"do not replace this directory",
+        )
+        .unwrap();
+    } else {
+        std::fs::write(&checkpoint, b"{ corrupt checkpoint bytes").unwrap();
+    }
+    let reopened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Executor::new_with_persistence(
+            Arc::new(Catalog::new()),
+            Arc::new(crate::storage::MemoryEngine::new()),
+            Some(catalog_path),
+            Some(dir.path()),
+        )
+    }));
+    assert!(
+        reopened.is_err(),
+        "invalid checkpoint recovery served an incomplete FTS index"
+    );
+    if unreadable {
+        assert!(checkpoint.is_dir());
+        assert_eq!(
+            std::fs::read(checkpoint.join("retained-marker")).unwrap(),
+            b"do not replace this directory"
+        );
+    } else {
+        assert_eq!(
+            std::fs::read(&checkpoint).unwrap(),
+            b"{ corrupt checkpoint bytes"
+        );
+    }
+}
+
+#[test]
+fn fts_corrupt_checkpoint_refuses_incomplete_wal_tail_recovery() {
+    fts_checkpoint_recovery_must_refuse_invalid_existing_base(false);
+}
+
+#[test]
+fn fts_unreadable_checkpoint_refuses_incomplete_wal_tail_recovery() {
+    fts_checkpoint_recovery_must_refuse_invalid_existing_base(true);
+}
