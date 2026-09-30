@@ -203,3 +203,16 @@ async fn x11_jsonb_numeric_scale_does_not_change_equality_distinct_or_joins() {
         &Value::Int64(4)
     );
 }
+
+#[tokio::test]
+async fn x11_first_null_wrapped_window_retains_declared_metadata() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE x11_null_window (v INT)").await;
+    exec(&ex, "INSERT INTO x11_null_window VALUES (1), (2)").await;
+    let result = exec(&ex, "SELECT (CASE WHEN ROW_NUMBER() OVER (ORDER BY v) = 1 THEN NULL ELSE ROW_NUMBER() OVER (ORDER BY v) END)::BIGINT FROM x11_null_window").await;
+    let ExecResult::Select { columns, rows, .. } = &result[0] else {
+        panic!("SELECT expected")
+    };
+    assert_eq!(rows, &vec![vec![Value::Null], vec![Value::Int64(2)]]);
+    assert_eq!(columns[0].1, DataType::Int64);
+}
