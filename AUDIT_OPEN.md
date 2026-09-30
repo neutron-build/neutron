@@ -483,11 +483,13 @@ reproducers are in `conformance/live/orm/ORM_CONFORMANCE.md`.
   ROLLBACK leaves the fixture count unchanged. Clean restart and SIGKILL
   recovery pass for the tested stores; SIGKILL alone does not prove power-loss
   durability. Columnar-model writes remain outside SQL rollback.
-- **Concurrent derived state — bounded physical B-tree repair.** Ordinary
+- **Concurrent derived state — bounded physical B-tree repair at X13.** Ordinary
   DML preserves engine-maintained physical postings; controlled before/after
-  and structural physical-posting regressions passed. Detached encrypted,
-  vector, FTS and zone-map scan/publication paths remain independently
-  unverified; a selected passing soak does not certify universal coherence.
+  and structural physical-posting regressions passed. The later 2026-09-30
+  repair below adds writer-generation checks, a demonstrated FTS regression
+  and zone-map/transaction visibility invariants, and retires encrypted modes.
+  These bounded results do not certify universal vector, FTS or zone-map
+  scan/publication coherence; a selected passing soak does not do so either.
 
 Advertised family contracts are scoped in
 `conformance/live/orm/ORM_CONFORMANCE.md`: relational SQL, KV, documents,
