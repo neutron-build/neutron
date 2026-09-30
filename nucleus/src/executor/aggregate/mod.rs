@@ -198,8 +198,11 @@ pub(super) fn validate_grouped_projection(
 }
 
 fn agg_column_type(val: &Value, expr: &Expr, col_meta: &[ColMeta]) -> DataType {
-    if matches!(val, Value::Null) {
-        infer_expr_type(expr, col_meta)
+    let inferred = infer_expr_type(expr, col_meta);
+    if matches!(val, Value::Null)
+        || (matches!(val, Value::Array(_)) && matches!(inferred, DataType::Array(_)))
+    {
+        inferred
     } else {
         value_type(val)
     }
@@ -1473,8 +1476,21 @@ impl Executor {
                 let expr = arg_expr.ok_or_else(|| {
                     ExecError::Unsupported("ARRAY_AGG requires an argument".into())
                 })?;
-                let vals = collect_values(expr)?;
-                Ok(Value::Array(vals))
+                // Array aggregates retain NULL elements, including one NULL
+                // for DISTINCT; other aggregates use the NULL-skipping collector.
+                let mut vals = Vec::with_capacity(effective_indices.len());
+                let mut seen = HashSet::new();
+                for &idx in effective_indices {
+                    let value = self.eval_row_expr(expr, &all_rows[idx], col_meta)?;
+                    if !is_distinct || seen.insert(value.clone()) {
+                        vals.push(value);
+                    }
+                }
+                if vals.is_empty() {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Array(vals))
+                }
             }
             "JSON_AGG" | "JSONB_AGG" => {
                 // Unlike the other aggregates, json_agg keeps NULL inputs as

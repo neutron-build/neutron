@@ -89,3 +89,86 @@ async fn subquery_type_uses_inner_alias_when_it_shadows_outer_alias() {
         &DataType::Array(Box::new(DataType::Bool))
     );
 }
+
+#[tokio::test]
+async fn array_agg_empty_inputs_are_typed_null_and_null_elements_are_retained() {
+    let e = test_executor();
+    exec(
+        &e,
+        "CREATE TABLE x12_aggregate_empty (i integer, b boolean, t text)",
+    )
+    .await;
+    for (column, ty) in [
+        ("i", DataType::Int32),
+        ("b", DataType::Bool),
+        ("t", DataType::Text),
+    ] {
+        let result = exec(
+            &e,
+            &format!("SELECT array_agg({column}) FROM x12_aggregate_empty"),
+        )
+        .await;
+        assert_eq!(column_type(&result[0]), &DataType::Array(Box::new(ty)));
+        assert_eq!(rows(&result[0]), &vec![vec![Value::Null]]);
+    }
+    exec(
+        &e,
+        "INSERT INTO x12_aggregate_empty VALUES (NULL, NULL, NULL), (NULL, NULL, NULL)",
+    )
+    .await;
+    for (column, ty) in [
+        ("i", DataType::Int32),
+        ("b", DataType::Bool),
+        ("t", DataType::Text),
+    ] {
+        let result = exec(&e, &format!("SELECT array_agg({column}), array_agg({column}) FILTER (WHERE false) FROM x12_aggregate_empty")).await;
+        assert_eq!(
+            column_type(&result[0]),
+            &DataType::Array(Box::new(ty.clone()))
+        );
+        match &result[0] {
+            ExecResult::Select { columns, .. } => {
+                assert_eq!(columns[1].1, DataType::Array(Box::new(ty)))
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            rows(&result[0]),
+            &vec![vec![
+                Value::Array(vec![Value::Null, Value::Null]),
+                Value::Null
+            ]]
+        );
+    }
+}
+
+#[tokio::test]
+async fn array_agg_order_and_distinct_keep_null_elements() {
+    let e = test_executor();
+    let result = exec(
+        &e,
+        "SELECT array_agg(x ORDER BY n) FROM (VALUES (1,2),(2,NULL::integer),(3,1)) t(n,x)",
+    )
+    .await;
+    assert_eq!(
+        column_type(&result[0]),
+        &DataType::Array(Box::new(DataType::Int32))
+    );
+    assert_eq!(
+        rows(&result[0]),
+        &vec![vec![Value::Array(vec![
+            Value::Int32(2),
+            Value::Null,
+            Value::Int32(1)
+        ])]]
+    );
+    let result = exec(&e, "SELECT array_agg(DISTINCT x ORDER BY x) FROM (VALUES (NULL::integer),(NULL::integer),(1),(1)) t(x)").await;
+    assert_eq!(
+        column_type(&result[0]),
+        &DataType::Array(Box::new(DataType::Int32))
+    );
+    assert_eq!(
+        rows(&result[0]),
+        &vec![vec![Value::Array(vec![Value::Int32(1), Value::Null])]]
+    );
+}
