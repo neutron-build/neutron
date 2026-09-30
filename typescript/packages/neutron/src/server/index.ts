@@ -1856,6 +1856,10 @@ async function createSsrServer(
     const viteServer = await vite.createServer(
       vite.mergeConfig(userConfig, {
         root: rootDir,
+        // Fixtures and apps without their own package.json otherwise inherit
+        // an ancestor's node_modules/.vite directory. Different roots can
+        // then clear one another's optimizer cache during concurrent startup.
+        cacheDir: userConfig.cacheDir ?? path.join(rootDir, ".neutron", "vite-ssr"),
         plugins: [neutronPlugin({ routesDir })],
         ...(runtimeAliases ? { resolve: { alias: runtimeAliases } } : {}),
         ...(runtimeNoExternal.length > 0
