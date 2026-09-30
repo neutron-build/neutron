@@ -641,3 +641,14 @@ async fn x10_cascade_duplicate_parent_batch_leaves_both_tables_unchanged() {
         [[1, 2], [2, 4]]
     );
 }
+
+#[tokio::test]
+async fn x10_alter_sequence_start_with_semicolon_changes_restart_default_only() {
+    let ex = test_executor();
+    exec(&ex, "CREATE SEQUENCE semicolon_start").await;
+    assert_eq!(ints(&ex, "SELECT nextval('semicolon_start')").await, [[1]]);
+    exec(&ex, "ALTER SEQUENCE semicolon_start START WITH 11;").await;
+    assert_eq!(ints(&ex, "SELECT nextval('semicolon_start')").await, [[2]]);
+    exec(&ex, "ALTER SEQUENCE semicolon_start RESTART;").await;
+    assert_eq!(ints(&ex, "SELECT nextval('semicolon_start')").await, [[11]]);
+}

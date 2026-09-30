@@ -4722,7 +4722,11 @@ impl Executor {
     ///
     /// Supports: ALTER SEQUENCE name RESTART [WITH n] | INCREMENT [BY] n | MINVALUE n | MAXVALUE n
     pub(super) fn execute_alter_sequence_raw(&self, sql: &str) -> Result<ExecResult, ExecError> {
-        let tokens: Vec<&str> = sql.split_whitespace().collect();
+        let tokens: Vec<&str> = sql
+            .trim()
+            .trim_end_matches(';')
+            .split_whitespace()
+            .collect();
         // tokens[0]="ALTER", tokens[1]="SEQUENCE", tokens[2]=name
         if tokens.len() < 4 {
             return Err(ExecError::Unsupported(
