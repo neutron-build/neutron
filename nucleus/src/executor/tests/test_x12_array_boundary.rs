@@ -28,7 +28,7 @@ async fn catalog_index_subqueries_describe_arrays_for_empty_and_populated_rows()
         ("oc.opcdefault", DataType::Bool),
         ("oc.opcname::text", DataType::Text),
     ] {
-        for suffix in ["", " LIMIT 0"] {
+        for suffix in ["", " WHERE false", " LIMIT 0"] {
             let query = format!(
                 "SELECT (SELECT array_agg({expression} ORDER BY k.ord) FROM unnest(i.indclass) WITH ORDINALITY AS k(opclass, ord) JOIN pg_opclass oc ON oc.oid = k.opclass) AS values FROM pg_index i{suffix}"
             );
