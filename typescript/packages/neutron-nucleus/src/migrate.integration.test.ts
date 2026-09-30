@@ -192,6 +192,78 @@ describe("Integration: migration protocol v2 (live engine)", { skip: !live() && 
     }
   });
 
+  it("captures migration records before waiting for a real ledger claim", async () => {
+    await reset(t);
+    await migrate(t, []);
+    await t.execute("INSERT INTO _neutron_migration_lock (id, token, owner) VALUES (1, 123, 'input-snapshot-holder')");
+    const supplied = [{ ...plan[0] }];
+    const execute = t.execute.bind(t);
+    let entered!: () => void;
+    const queued = new Promise<void>(resolve => { entered = resolve; });
+    t.execute = async (sql, params, opts) => {
+      const count = await execute(sql, params, opts);
+      if (sql.startsWith('INSERT INTO _neutron_migration_lock') && count === 0) entered();
+      return count;
+    };
+    const running = migrate(t, supplied);
+    try {
+      await queued;
+      Object.assign(supplied[0], { version: 99, name: 'changed', up: 'CREATE TABLE ts_b (id INT)', down: 'SELECT 999' });
+      await execute('DELETE FROM _neutron_migration_lock WHERE id = 1 AND token = 123');
+      assert.deepEqual(await running, ['first']);
+    } finally {
+      t.execute = execute;
+      await execute('DELETE FROM _neutron_migration_lock WHERE id = 1 AND token = 123');
+      await running.catch(() => {});
+    }
+    const history = await t.query<{ version: number; name: string; checksum: string }>(
+      'SELECT version, name, checksum FROM _neutron_migrations');
+    assert.deepEqual(history.rows, [{ version: 1, name: 'first', checksum: migrationChecksum(plan[0].up) }]);
+    const table = await t.fetchval("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'ts_a')");
+    assert.equal(table, true);
+  });
+
+  it("records the checksum of executed SQL when the caller edits during execution", async () => {
+    await reset(t);
+    const supplied = [{ ...plan[0] }];
+    const begin = t.beginTransaction.bind(t);
+    t.beginTransaction = async (...args) => {
+      const tx = await begin(...args);
+      const execute = tx.execute.bind(tx);
+      tx.execute = async (sql, params, opts) => {
+        const count = await execute(sql, params, opts);
+        if (sql === plan[0].up) supplied[0].up = 'CREATE TABLE ts_b (id BIGINT)';
+        return count;
+      };
+      return tx;
+    };
+    try {
+      assert.deepEqual(await migrate(t, supplied), ['first']);
+    } finally {
+      t.beginTransaction = begin;
+    }
+    assert.equal(await t.fetchval('SELECT checksum FROM _neutron_migrations WHERE version = 1'),
+      migrationChecksum(plan[0].up));
+  });
+
+  it("retries duplicate-table cold bootstrap without replaying user migration SQL", async () => {
+    await reset(t);
+    const execute = t.execute.bind(t);
+    let creates = 0;
+    t.execute = async (sql, params, opts) => {
+      if (/^\s*CREATE TABLE IF NOT EXISTS _neutron_migration_lock\b/.test(sql) && ++creates === 1) {
+        throw Object.assign(new Error('relation _neutron_migration_lock already exists'), { code: '42P07' });
+      }
+      return execute(sql, params, opts);
+    };
+    try {
+      assert.deepEqual(await migrate(t, [plan[0]]), ['first']);
+      assert.equal(creates, 2);
+    } finally {
+      t.execute = execute;
+    }
+  });
+
   it("serializes two runners (separate pools) with exactly-once effects", async () => {
     await reset(t);
     // Four runners, not two: the bootstrap DDL (CREATE TABLE IF NOT EXISTS)

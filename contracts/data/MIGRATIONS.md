@@ -152,6 +152,10 @@ or a session-pooled endpoint.
 
 ### Nucleus (Go/TS SDKs)
 
+SDK migration functions copy supplied version, name, up SQL, and down SQL into a
+private plan before the first asynchronous wait. Later caller edits cannot change
+the SQL executed or the checksum recorded by that invocation.
+
 The engine has no advisory locks (verified in engine source; the only advisory
 function is an honest `pg_advisory_unlock_all` no-op), so serialization is the
 `_neutron_migration_lock` ledger claim:
@@ -183,8 +187,8 @@ history into protocol v2. It never fabricates trust:
 1. It runs under the same serialization as migration (advisory lock / claim).
 2. Collision check first (§1): any numerically-equal-but-distinct ID pair in
    history∪files aborts the adoption with a reconciliation error.
-3. SDKs read legacy rows and preflight every recorded digest before nullable
-   metadata-column DDL; a mismatched digest leaves the table shape unchanged.
+3. SDKs read legacy rows and preflight recorded digests for every row with a
+   supplied matching-version plan before nullable metadata-column DDL; a mismatched digest leaves the table shape unchanged.
    On PostgreSQL, table shape is upgraded in the adoption's transaction
    (columns added;
    for SDK-shaped history adopted by the CLI, `version` is converted

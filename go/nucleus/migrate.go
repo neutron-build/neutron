@@ -176,7 +176,9 @@ func (c *Client) acquireMigrationLock(ctx context.Context) (int64, error) {
 
 		select {
 		case <-ctx.Done():
-			info, _ := c.MigrationLockInfo(context.WithoutCancel(ctx))
+			diagnosticCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			info, _ := c.MigrationLockInfo(diagnosticCtx)
+			cancel()
 			if info.Held {
 				return 0, fmt.Errorf(
 					"nucleus: migration lock is held by %s (heartbeat %s); no automatic takeover — "+
@@ -198,7 +200,9 @@ func (c *Client) acquireMigrationLock(ctx context.Context) (int64, error) {
 // releases, its work is committed, and an unreleased claim is recoverable
 // via ForceUnlockMigrations (it does NOT self-heal by timeout anymore).
 func (c *Client) releaseMigrationLock(ctx context.Context, token int64) {
-	_, _ = c.pool.Exec(ctx,
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_, _ = c.pool.Exec(cleanupCtx,
 		"DELETE FROM _neutron_migration_lock WHERE id = 1 AND token = $1",
 		sqlParam(token))
 }

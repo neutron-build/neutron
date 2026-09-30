@@ -124,8 +124,8 @@ ALTER TABLE _neutron_migration_lock ADD COLUMN IF NOT EXISTS owner TEXT`;
 
 /** Bootstrap DDL is written IF NOT EXISTS, but two cold runners racing the
  * same statement can both decide to create: Postgres breaks the tie with a
- * unique violation on the catalog row (pg_type_typname_nsp_index, SQLSTATE
- * 23505) and the loser's statement fails despite IF NOT EXISTS. Retry with
+ * catalog unique violation (23505) or duplicate table (42P07), and the
+ * loser's statement fails despite IF NOT EXISTS. Retry with
  * backoff — the winner's create commits and the re-run is a no-op. */
 async function executeBootstrapDdl(transport: Transport, sql: string): Promise<void> {
   for (let attempt = 0; ; attempt++) {
@@ -133,7 +133,9 @@ async function executeBootstrapDdl(transport: Transport, sql: string): Promise<v
       await transport.execute(sql);
       return;
     } catch (err) {
-      if (attempt >= 5 || sqlState(err) !== '23505') throw err;
+      const code = sqlState(err);
+      const coldCreateRace = code === '42P07' && /^\s*CREATE TABLE IF NOT EXISTS\b/i.test(sql);
+      if (attempt >= 5 || (code !== '23505' && !coldCreateRace)) throw err;
       await sleep(25 * (attempt + 1));
     }
   }
@@ -169,7 +171,10 @@ async function appliedRows(transport: Transport): Promise<Map<number, AppliedRow
 /** Sort a copy ascending by version and validate the plan before any SQL
  * runs: duplicates and empty names/up are refused up front. */
 function prepareMigrations(migrations: Migration[]): Migration[] {
-  const sorted = [...migrations].sort((a, b) => a.version - b.version);
+  // Copy primitive fields before the first await: callers retain their array
+  // and records while a claim wait or statement execution is in progress.
+  const sorted = migrations.map(({ version, name, up, down }) => ({ version, name, up, down }))
+    .sort((a, b) => a.version - b.version);
   const seen = new Set<number>();
   for (const m of sorted) {
     if (!Number.isInteger(m.version) || m.version <= 0) {
