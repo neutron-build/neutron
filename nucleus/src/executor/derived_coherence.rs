@@ -43,10 +43,71 @@ struct State {
     published: HashMap<String, u64>,
 }
 
+#[cfg(feature = "server")]
 tokio::task_local! {
     pub(super) static WRITER_GENERATION: u64;
     pub(super) static READ_GENERATION: u64;
 }
+
+// Core/WASM has no Tokio runtime. Scope values around each future poll,
+// never across suspension, so interleaved embedded executions remain isolated.
+#[cfg(not(feature = "server"))]
+mod core_scopes {
+    use std::cell::Cell;
+    use std::future::{Future, poll_fn};
+
+    thread_local! {
+        static WRITER: Cell<Option<u64>> = const { Cell::new(None) };
+        static READER: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    pub static WRITER_GENERATION: GenerationLocal = GenerationLocal(&WRITER);
+    pub static READ_GENERATION: GenerationLocal = GenerationLocal(&READER);
+
+    pub struct GenerationLocal(&'static std::thread::LocalKey<Cell<Option<u64>>>);
+
+    #[derive(Debug)]
+    pub struct AccessError;
+
+    struct Restore {
+        key: &'static std::thread::LocalKey<Cell<Option<u64>>>,
+        previous: Option<u64>,
+    }
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            self.key.with(|cell| cell.set(self.previous));
+        }
+    }
+
+    impl GenerationLocal {
+        pub fn try_with<R>(&self, f: impl FnOnce(&u64) -> R) -> Result<R, AccessError> {
+            self.0
+                .try_with(|cell| cell.get().map(|value| f(&value)))
+                .map_err(|_| AccessError)?
+                .ok_or(AccessError)
+        }
+
+        pub fn scope<F: Future>(
+            &'static self,
+            value: u64,
+            future: F,
+        ) -> impl Future<Output = F::Output> {
+            let mut future = Box::pin(future);
+            poll_fn(move |context| {
+                let previous = self.0.with(|cell| cell.replace(Some(value)));
+                let _restore = Restore {
+                    key: self.0,
+                    previous,
+                };
+                future.as_mut().poll(context)
+            })
+        }
+    }
+}
+
+#[cfg(not(feature = "server"))]
+pub(super) use core_scopes::{READ_GENERATION, WRITER_GENERATION};
 
 pub(super) struct WriterGuard<'a> {
     state: &'a DerivedCoherence,
@@ -129,5 +190,93 @@ impl CurrentView<'_> {
                 .try_with(|read| *read == self.state.generation)
                 .unwrap_or(true)
             && self.state.published.get(&format!("{kind}/{table}")) == Some(&self.state.generation)
+    }
+}
+
+#[cfg(all(test, not(feature = "server")))]
+mod core_scope_tests {
+    use super::{READ_GENERATION, WRITER_GENERATION};
+    use std::future::{Future, poll_fn};
+    use std::task::{Context, Poll, Waker};
+
+    #[test]
+    fn core_generation_scopes_restore_between_interleaved_polls() {
+        let mut first_poll = true;
+        let mut first = Box::pin(READ_GENERATION.scope(
+            11,
+            WRITER_GENERATION.scope(
+                7,
+                poll_fn(|_| {
+                    assert_eq!(READ_GENERATION.try_with(|value| *value).unwrap(), 11);
+                    assert_eq!(WRITER_GENERATION.try_with(|value| *value).unwrap(), 7);
+                    if first_poll {
+                        first_poll = false;
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(())
+                    }
+                }),
+            ),
+        ));
+        let mut second = Box::pin(WRITER_GENERATION.scope(9, async {
+            assert_eq!(WRITER_GENERATION.try_with(|value| *value).unwrap(), 9);
+            assert!(READ_GENERATION.try_with(|_| ()).is_err());
+        }));
+        fn require_send<T: Send>(_: &T) {}
+        require_send(&first);
+        require_send(&second);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(first.as_mut().poll(&mut context).is_pending());
+        assert!(WRITER_GENERATION.try_with(|_| ()).is_err());
+        assert!(READ_GENERATION.try_with(|_| ()).is_err());
+        assert!(second.as_mut().poll(&mut context).is_ready());
+        assert!(WRITER_GENERATION.try_with(|_| ()).is_err());
+        assert!(first.as_mut().poll(&mut context).is_ready());
+        assert!(WRITER_GENERATION.try_with(|_| ()).is_err());
+        assert!(READ_GENERATION.try_with(|_| ()).is_err());
+    }
+
+    #[test]
+    fn core_generation_nested_scope_restores_outer_value() {
+        let mut future = Box::pin(WRITER_GENERATION.scope(5, async {
+            WRITER_GENERATION
+                .scope(9, async {
+                    assert_eq!(WRITER_GENERATION.try_with(|value| *value).unwrap(), 9);
+                })
+                .await;
+            assert_eq!(WRITER_GENERATION.try_with(|value| *value).unwrap(), 5);
+        }));
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+        assert!(WRITER_GENERATION.try_with(|_| ()).is_err());
+    }
+
+    #[test]
+    fn core_generation_scope_restores_after_panic_and_cancellation() {
+        let mut panic_future =
+            Box::pin(WRITER_GENERATION.scope(13, async { panic!("poll failed") }));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                panic_future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+            }))
+            .is_err()
+        );
+        assert!(WRITER_GENERATION.try_with(|_| ()).is_err());
+        let mut pending = Box::pin(READ_GENERATION.scope(17, std::future::pending::<()>()));
+        assert!(READ_GENERATION.try_with(|_| ()).is_err());
+        assert!(
+            pending
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(pending);
+        assert!(READ_GENERATION.try_with(|_| ()).is_err());
     }
 }

@@ -541,3 +541,11 @@ The encrypted-index prototype exposed plaintext under a chosen-zeroes query.
 Public construction and SQL admissions now refuse all legacy encrypted modes;
 recovery preserves base rows without rebuilding insecure sidecars. No secure
 replacement cryptographic format is implemented or advertised.
+
+
+Core-only and WASM derived-index generation scopes use poll-scoped thread-local
+values instead of requiring Tokio's server runtime. The value is restored after
+each poll, including pending, nested and unwinding polls, so suspended embedded
+executions do not inherit another future's reader or writer generation. Server
+builds retain Tokio task-local scopes. The core-only scope tests exercise
+interleaved polls, nesting, panic restoration and cancellation without a runtime.
