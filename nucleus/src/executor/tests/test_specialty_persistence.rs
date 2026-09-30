@@ -1042,3 +1042,52 @@ fn fts_corrupt_checkpoint_refuses_incomplete_wal_tail_recovery() {
 fn fts_unreadable_checkpoint_refuses_incomplete_wal_tail_recovery() {
     fts_checkpoint_recovery_must_refuse_invalid_existing_base(true);
 }
+
+#[test]
+fn fts_fallible_recovery_keeps_checkpoint_tail_and_future_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog_path = dir.path().join("catalog.json");
+    let open = || {
+        Executor::try_new_with_persistence(
+            Arc::new(Catalog::new()),
+            Arc::new(crate::storage::MemoryEngine::new()),
+            Some(catalog_path.clone()),
+            Some(dir.path()),
+        )
+    };
+    let initial = open().unwrap();
+    initial
+        .fts_index()
+        .write()
+        .add_document(1, "checkpointbase");
+    initial.save_fts_index().unwrap();
+    initial.fts_index().write().add_document(2, "waltail");
+    initial.fts_index().read().wal_group_sync().unwrap();
+    drop(initial);
+    let reopened = open().unwrap();
+    assert_eq!(reopened.fts_index().read().doc_count(), 2);
+    reopened.fts_index().write().add_document(3, "afterrestart");
+    reopened.fts_index().read().wal_group_sync().unwrap();
+    drop(reopened);
+    let twice = open().unwrap();
+    assert_eq!(twice.fts_index().read().doc_count(), 3);
+    for (id, term) in [(1, "checkpointbase"), (2, "waltail"), (3, "afterrestart")] {
+        let ids: Vec<_> = twice
+            .fts_index()
+            .read()
+            .search_scored(term, 10)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec![id]);
+    }
+    drop(twice);
+    let checkpoint = dir.path().join("fts_index.json");
+    std::fs::write(&checkpoint, b"broken-base").unwrap();
+    let refused = open();
+    assert!(
+        matches!(refused, Err(ExecError::Storage(crate::storage::StorageError::Io(ref message)))
+        if message.contains("FTS checkpoint") && message.contains("recovery refused"))
+    );
+    assert_eq!(std::fs::read(checkpoint).unwrap(), b"broken-base");
+}
