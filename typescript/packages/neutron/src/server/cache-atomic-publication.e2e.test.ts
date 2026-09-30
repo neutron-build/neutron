@@ -111,3 +111,60 @@ it('evicts a GET fill published during an ordinary action when the mutation comp
     await running.close(); await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+
+it('fences a delayed fill begun during another server’s action at the shared backing store', { timeout: 30_000 }, async () => {
+  const root = await fs.mkdtemp(path.join(process.cwd(), '.tmp-neutron-cross-server-cache-'));
+  await fs.mkdir(path.join(root, 'src/routes'), { recursive: true });
+  let actionStarted!: () => void, releaseAction!: () => void;
+  let fillStarted!: () => void, releaseFill!: () => void;
+  const actionWaiting = new Promise<void>(resolve => { actionStarted = resolve; });
+  const actionReleased = new Promise<void>(resolve => { releaseAction = resolve; });
+  const fillWaiting = new Promise<void>(resolve => { fillStarted = resolve; });
+  const fillReleased = new Promise<void>(resolve => { releaseFill = resolve; });
+  const key = `neutron-cross-server-action-${root}`;
+  (globalThis as any)[key] = { version: 0, actionStarted, actionReleased };
+  await fs.writeFile(path.join(root, 'src/routes/item.ts'), `
+    export const config = { mode: 'app', cache: { loaderMaxAge: 120 } };
+    export async function loader() { return { version: globalThis[${JSON.stringify(key)}].version }; }
+    export async function action() {
+      const control = globalThis[${JSON.stringify(key)}];
+      control.actionStarted(); await control.actionReleased;
+      control.version++; return { ok: true };
+    }
+    export default function Page() { return null; }
+  `);
+  const backing = createMemoryLoaderCacheStore();
+  let firstFill = true;
+  const store: NeutronLoaderCacheStore = {
+    ...backing,
+    async setIfGeneration(key, entry, generation) {
+      if (firstFill) { firstFill = false; fillStarted(); await fillReleased; }
+      return backing.setIfGeneration!(key, entry, generation);
+    },
+  };
+  const servers = [] as Awaited<ReturnType<typeof createServer>>[];
+  try {
+    for (let index = 0; index < 2; index++) servers.push(await createServer({ rootDir: root,
+      host: '127.0.0.1', port: 0, compress: false, cache: { loader: store } }));
+    const urls = await Promise.all(servers.map(async running => {
+      if (!running.server.listening) await once(running.server, 'listening');
+      const address = running.server.address();
+      if (!address || typeof address === 'string') throw new Error('No HTTP port');
+      return `http://127.0.0.1:${address.port}/item`;
+    }));
+    const mutation = fetch(urls[1], { method: 'POST', headers: { Accept: 'application/json' } });
+    await actionWaiting;
+    const staleRead = fetch(urls[0], { headers: { Accept: 'application/json' } });
+    await fillWaiting;
+    releaseAction(); expect((await mutation).status).toBe(200);
+    releaseFill(); expect((await staleRead).status).toBe(200);
+    const response = await fetch(urls[0], { headers: { Accept: 'application/json' } });
+    const payload = decodeSerializedPayload<Record<string, { version: number }>>(await response.json());
+    expect(Object.values(payload)[0].version).toBe(1);
+  } finally {
+    releaseAction(); releaseFill(); delete (globalThis as any)[key];
+    await Promise.all(servers.map(running => running.close()));
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

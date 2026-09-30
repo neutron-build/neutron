@@ -29,13 +29,19 @@ export class CacheScope {
   }
 }
 
-const sharedCache = new CacheScope();
-type CacheRuntime = { requestScope: () => CacheScope | undefined; functionId: number };
+type CacheRuntime = {
+  requestScope: () => CacheScope | undefined;
+  functionId: number;
+  sharedScope?: CacheScope;
+};
 // SSR module loaders can evaluate this module separately from the HTTP adapter.
 // One realm-wide provider and identity counter connects those module graphs.
 const runtimeKey = Symbol.for('@neutron-build/core/request-cache/runtime');
 const realm = globalThis as unknown as Record<symbol, CacheRuntime | undefined>;
 const runtime = realm[runtimeKey] ??= { requestScope: () => undefined, functionId: 0 };
+// Explicit shared caches and their invalidators must also cross SSR/adapter
+// module graphs. Initialize lazily for an already-installed runtime provider.
+const sharedCache = runtime.sharedScope ??= new CacheScope();
 
 /** Installed by the Node server adapter; keeps Node imports out of client bundles. */
 export function installRequestCacheScope(provider: () => CacheScope | undefined): void {

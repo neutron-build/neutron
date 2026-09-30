@@ -979,6 +979,11 @@ export async function createServer(
         // this final delete. The pre-mutation bump alone fenced only GETs
         // that began before the mutation.
         appCacheEpoch++;
+        // GETs may have published old data after the start invalidation while
+        // the action was running. Evict those entries and fence remote fills
+        // at completion even when the action emits no invalidation header.
+        await appResponseCacheStore.deleteByPath(effectivePathname);
+        await loaderDataCacheStore.deleteByPath(effectivePathname);
         await applyMutationInvalidationFromResponse(
           appResponseCacheStore,
           effectivePathname,

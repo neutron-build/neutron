@@ -129,7 +129,7 @@ FALSE-POSITIVE (not reproducible in source; evidence cited).
 | TS-04 | FIXED — cache keys carry origin, Accept-Language, X-Neutron-Data/Routes | c31736eb |
 | TS-05 | FIXED — case-insensitive directive parsing, request no-store/no-cache honored, Vary checked against keyed set, TTL capped by s-maxage/max-age | c31736eb |
 | TS-06 | FIXED-PARTIAL — byte-exact bodies with per-entry budget and Content-Length validation; aggregate store budget + concurrent-fill cap not added (entry-count bound remains) | c31736eb |
-| TS-07 | FIXED — mutation start/completion invalidation advances the backing-store generation; response and loader fills publish only through atomic `setIfGeneration`. Custom server stores without the contract are refused before resources open. The delayed external loader publication regression proves a completed mutation cannot be overwritten by a stale fill. | r2 + `cache-atomic-publication.e2e.test.ts` |
+| TS-07 | FIXED — mutation start/completion invalidation advances the backing-store generation; response and loader fills publish only through atomic `setIfGeneration`. Custom server stores without the contract are refused before resources open. Completion always invalidates the mutation path, including actions without an invalidation header. Delayed external publication and during-action GET regressions cover already-published fills and fills through a second server sharing the backing store. | r2 + `cache-atomic-publication.e2e.test.ts` |
 | TS-08 | FIXED — segment-based traversal matching the serving path; invalidation matches exact cache-key path fields (no /user sweeping /users) | c31736eb |
 | TS-09 | FIXED — static HTML cache never answers X-Neutron-Data/JSON requests | c31736eb |
 | TS-10 | FIXED — backslash/NUL rejected in URL paths; image source resolution is realpath-contained (escaping symlinks refused). @hono/node-server's serveStatic is library surface, not modified here | 67ff9c6b |
@@ -511,6 +511,10 @@ process sharing requires `scope: "shared"`. Entry ceilings and complete tag/time
 cleanup bound retention. `request-cache-security.test.ts` checks sequential and
 concurrent authenticated requests over HTTP, including within-request
 single-flight behavior; `cache.test.ts` covers identity, limits and cleanup.
+The request provider, function identities and explicit shared scope are realm-wide
+so real SSR and HTTP adapter module graphs share tag invalidation.
+`request-cache-ssr.e2e.test.ts` exercises both request deduplication and shared
+tag invalidation through the real SSR runtime.
 
 ## Durable override failures and retired crypto modes (2026-09-30)
 
