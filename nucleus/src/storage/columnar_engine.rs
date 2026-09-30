@@ -2623,6 +2623,73 @@ mod intra_part_narrowing_tests {
 mod failed_mutation_regressions {
     use super::*;
 
+    async fn checkpoint_rewrite_preserves_other_tables(operation: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = ColumnarStorageEngine::open(dir.path()).unwrap();
+        for name in ["a", "b", "c"] {
+            engine.create_table(name).await.unwrap();
+        }
+        let a = vec![Value::Int64(1), Value::Text("target".into())];
+        let b = vec![Value::Int64(2), Value::Text("acknowledged-buffer".into())];
+        let c_base = vec![Value::Int64(3), Value::Text("stored".into())];
+        let c_tail = vec![Value::Int64(4), Value::Text("buffered-tail".into())];
+        engine.insert("a", a).await.unwrap();
+        engine.insert("b", b.clone()).await.unwrap();
+        engine
+            .insert_batch("c", vec![c_base.clone()])
+            .await
+            .unwrap();
+        engine.insert("c", c_tail.clone()).await.unwrap();
+        engine.make_durable().await.unwrap();
+        // Do not scan these tables: read paths would drain their buffers and
+        // mask omission of acknowledged rows from the replacement checkpoint.
+        assert_eq!(engine.write_buffers.read().get("b").unwrap().len(), 1);
+        assert_eq!(engine.write_buffers.read().get("c").unwrap().len(), 1);
+        let expected_a = match operation {
+            "update" => {
+                let changed = vec![Value::Int64(1), Value::Text("changed".into())];
+                assert_eq!(
+                    engine.update("a", &[(0, changed.clone())]).await.unwrap(),
+                    1
+                );
+                vec![changed]
+            }
+            "delete" => {
+                assert_eq!(engine.delete("a", &[0]).await.unwrap(), 1);
+                vec![]
+            }
+            _ => unreachable!(),
+        };
+        engine.make_durable().await.unwrap();
+        drop(engine);
+        let reopened = ColumnarStorageEngine::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.scan("a").await.unwrap(),
+            expected_a,
+            "target mutation was not recovered"
+        );
+        assert_eq!(
+            reopened.scan("b").await.unwrap(),
+            vec![b],
+            "{operation} checkpoint lost another table's acknowledged row"
+        );
+        assert_eq!(
+            reopened.scan("c").await.unwrap(),
+            vec![c_base, c_tail],
+            "{operation} checkpoint omitted buffered tail after stored batches"
+        );
+    }
+
+    #[tokio::test]
+    async fn columnar_update_checkpoint_preserves_other_tables_buffered_rows() {
+        checkpoint_rewrite_preserves_other_tables("update").await;
+    }
+
+    #[tokio::test]
+    async fn columnar_delete_checkpoint_preserves_other_tables_buffered_rows() {
+        checkpoint_rewrite_preserves_other_tables("delete").await;
+    }
+
     #[tokio::test]
     async fn failed_columnar_engine_mutations_preserve_live_and_reopened_rows() {
         for operation in ["create", "drop", "batch", "update", "delete"] {
