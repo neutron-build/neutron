@@ -8762,8 +8762,10 @@ impl Executor {
                 "window functions are not allowed in HAVING".into(),
             ));
         }
-        // Expression-only query: SELECT 1, SELECT 'hello', SELECT 1+1
-        if select.from.is_empty() {
+        // An unfiltered expression-only query can project its one implicit
+        // input row directly. WHERE must use the regular filtering path,
+        // including FALSE/NULL removing that row before projection or aggregates.
+        if select.from.is_empty() && select.selection.is_none() {
             return Ok(SelectResult::Projected(
                 self.execute_select_expressions(&select.projection)?,
             ));
