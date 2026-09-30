@@ -412,6 +412,7 @@ impl ColumnarWal {
 
     /// A checkpoint published replacement bytes but could not reattach its writer.
     /// Higher layers staging a new image must fence their old memory image.
+    #[cfg(feature = "server")]
     pub(crate) fn is_stranded(&self) -> bool {
         self.stranded.load(Ordering::Acquire)
     }
