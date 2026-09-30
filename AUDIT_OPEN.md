@@ -476,11 +476,14 @@ reproducers are in `conformance/live/orm/ORM_CONFORMANCE.md`.
   returns XX000 after about 10 seconds. UPDATE FROM/DELETE USING refuse before
   mutation. Numeric range/scale, enum sorting and row comparisons retain
   their recorded limits. None are advertised as PostgreSQL parity.
-- **N14/N15/N16 — fresh X03 verification pending.** Source now refuses
-  text/untyped columnar aggregates instead of silent 0/NULL. Documentation
-  correction df718e66 describes attached-WAL/synchronous_commit=on fsync,
-  memory/off distinctions and COLUMNAR_INSERT transaction refusal. Fresh
-  model-leg results are required before closing these recorded findings.
+- **N14/N15/N16 — closed bounded findings in X13.** Fresh X03 checks
+  confirm SUM/AVG/MIN/MAX over untyped columnar values all refuse with 0A000;
+  typed numeric aggregates remain exact. Documentation correction df718e66
+  states attached-WAL/synchronous_commit=on fsync with memory/off and append
+  error limits. COLUMNAR_INSERT inside BEGIN refuses before mutation and
+  ROLLBACK leaves the fixture count unchanged. Clean restart and SIGKILL
+  recovery pass for the tested stores; SIGKILL alone does not prove power-loss
+  durability. Columnar-model writes remain outside SQL rollback.
 - **Concurrent derived state — bounded physical B-tree repair.** Ordinary
   DML preserves engine-maintained physical postings; controlled before/after
   and structural physical-posting regressions passed. Detached encrypted,

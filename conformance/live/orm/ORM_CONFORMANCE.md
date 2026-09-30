@@ -461,8 +461,10 @@ forms and remaining limits.
   storage layer; 0A000 names this). Single-statement autocommit writes stay immediate. The contract described
   here is the explicit-transaction deferred-FK path. Probe
   `constraint.deferrable_fk`; regressions in `test_column_writes.rs`.
-- **N7 — no lock/cancel surface.** See blocker 3; every `lock.*` probe except
-  the two `FOR UPDATE` probes and `lock.blocked_update_waits_then_applies`.
+- **N7 — limited locking and SQL cancellation.** Advisory locking,
+  LOCK TABLE and SQL sleep/cancel functions remain unavailable; row-lock
+  timeout behavior differs. FOR UPDATE and blocked-update contracts pass.
+  These SQL-function failures do not negate bounded wire cancellation.
 - **N8 — array codec, bounded repair.** Integer-array results and ANY
   parameters pass on both drivers. Text-array parameters pass through pg;
   postgres.js still receives 22000 in the recorded text-array probe. Typed
@@ -497,29 +499,29 @@ forms and remaining limits.
   catalog probes and read probes disagree about whether DDL survived.
   Reproducer: [`upstream/X02-E2-rolled-back-create-table-splits-catalog.sql`](upstream/X02-E2-rolled-back-create-table-splits-catalog.sql).
 
-Found by the time-series and columnar leg
-([`x03-nucleus-leg.mjs`](x03-nucleus-leg.mjs), same engine tree), which
-records each as a measured field:
+The fresh time-series and columnar leg
+([`x03-nucleus-leg.mjs`](x03-nucleus-leg.mjs)) ran against the recorded final
+engine tree. Its assertions distinguish typed numeric aggregates from explicit
+refusal and clean restart from process-kill recovery:
 
-- **N14 — columnar aggregates over untyped values answer 0/NULL.**
-  `COLUMNAR_INSERT` with parameters bound without a type (the default for
-  both drivers) stores text; `COLUMNAR_COUNT` is right, but `COLUMNAR_SUM`
-  answers 0 and `COLUMNAR_MIN`/`COLUMNAR_MAX` answer NULL, with no error.
-  Values bound as `::double precision` or `::int8` aggregate exactly.
-  `@neutron-build/nucleus`'s columnar client casts numeric values, so its
-  aggregates are exact; other clients are exposed. Leg field
-  `untypedAggregateSilentlyZero`.
-- **N15 — stale columnar durability prose.**
-  [`nucleus/docs/MODEL_SEMANTICS.md`](../../../nucleus/docs/MODEL_SEMANTICS.md)
-  says columnar writes reach the page cache only; its own resolved-marker
-  table (NU-006) says the store fsyncs, and rows written just before
-  `kill -9` survive the restart (leg field `afterKill9.columnarKill9Count`).
-  The table is right; the prose is stale.
-- **N16 — stale in-transaction insert prose.** The same document says
-  `BEGIN; COLUMNAR_INSERT(...); ROLLBACK;` leaves the row stored; the engine
-  refuses `COLUMNAR_INSERT` inside a transaction and stores nothing (leg
-  field `inTxInsert.rejected`). The refusal is the safer behaviour; the
-  docs are stale.
+- **N14 — silent untyped aggregates repaired by refusal.** All four
+  COLUMNAR_SUM/AVG/MIN/MAX calls over untyped stored values now return
+  0A000. Explicitly cast numeric inputs produce exact sums 10 and 100,
+  average 2.5, minimum 1 and maximum 4 in the leg fixture. Clients must cast
+  numeric COLUMNAR_INSERT inputs; this is not automatic numeric coercion.
+- **N15 — durability prose corrected.**
+  [`MODEL_SEMANTICS.md`](../../../nucleus/docs/MODEL_SEMANTICS.md) now states
+  that an attached server WAL is synced before acknowledgement with
+  synchronous_commit=on. Memory-only mode and synchronous_commit=off do not
+  promise that barrier; WAL append failures remain a separate limit.
+  The fresh leg preserves model-store count 4 and sum 10 after a clean
+  restart, and newly inserted time-series, model-columnar and engine-columnar
+  records each survive SIGKILL. Process-kill recovery is not power-loss proof;
+  the fsync claim is backed by the source acknowledgement path.
+- **N16 — transaction-refusal prose corrected.** COLUMNAR_INSERT inside
+  BEGIN returns 0A000 before mutation; after ROLLBACK the fixture count stays
+  4. The model store has no SQL rollback boundary. Columnar-engine tables
+  separately pass the leg's SQL rollback and restart assertions.
 
 Documented limitations, not defects: the numeric 96-bit/28-digit ceiling
 (`SQL_SEMANTICS.md`, reported at bind time), the RLS predicate allow-list
