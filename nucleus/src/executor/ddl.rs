@@ -417,33 +417,23 @@ impl Executor {
     pub(super) fn open_columnar_engine(
         &self,
         table: &str,
-    ) -> Arc<crate::storage::ColumnarStorageEngine> {
+    ) -> Result<Arc<crate::storage::ColumnarStorageEngine>, ExecError> {
         if let Some(dir) = self.table_engine_dir(table) {
-            match crate::storage::ColumnarStorageEngine::open(&dir) {
-                Ok(eng) => return Arc::new(eng),
-                Err(e) => tracing::warn!(
-                    "columnar engine for '{table}': WAL open failed ({e}); \
-                     falling back to in-memory (NOT crash-durable)"
-                ),
-            }
+            return Ok(Arc::new(crate::storage::ColumnarStorageEngine::open(&dir)?));
         }
-        Arc::new(crate::storage::ColumnarStorageEngine::new())
+        Ok(Arc::new(crate::storage::ColumnarStorageEngine::new()))
     }
 
-    /// Create the per-table LSM engine, disk-backed whenever the executor has
-    /// a data directory. Using `new()` here made `WITH (engine='lsm')` silently
-    /// ephemeral even in an otherwise durable database.
+    /// A declared durable engine must never silently become memory-only.
     #[cfg(feature = "server")]
-    pub(super) fn open_lsm_engine(&self, table: &str) -> Arc<crate::storage::LsmStorageEngine> {
+    pub(super) fn open_lsm_engine(
+        &self,
+        table: &str,
+    ) -> Result<Arc<crate::storage::LsmStorageEngine>, ExecError> {
         if let Some(dir) = self.table_engine_dir(table) {
-            match crate::storage::LsmStorageEngine::open(&dir) {
-                Ok(engine) => return Arc::new(engine),
-                Err(error) => tracing::warn!(
-                    "LSM engine for '{table}': open failed ({error}); falling back to in-memory (NOT crash-durable)"
-                ),
-            }
+            return Ok(Arc::new(crate::storage::LsmStorageEngine::open(&dir)?));
         }
-        Arc::new(crate::storage::LsmStorageEngine::new())
+        Ok(Arc::new(crate::storage::LsmStorageEngine::new()))
     }
 
     /// Reconcile every table's declared storage engine with what is actually
@@ -469,7 +459,7 @@ impl Executor {
     /// already exists. Everything else keeps the engine it has, and the
     /// executor applies replacing dedup on its behalf.
     #[cfg(feature = "server")]
-    pub async fn restore_table_engines(&self) {
+    pub async fn restore_table_engines(&self) -> Result<(), ExecError> {
         use crate::catalog::TableEngineSpec;
 
         let sidecar = self.load_engines_meta();
@@ -503,7 +493,7 @@ impl Executor {
             );
         }
         if specs.is_empty() {
-            return;
+            return Ok(());
         }
         // And backfill the sidecar from the catalog, so an operator reading
         // engines.json sees the same set the engine is using.
@@ -548,10 +538,8 @@ impl Executor {
                     );
                     continue;
                 }
-                let engine = self.open_lsm_engine(&table);
-                if let Err(error) = engine.create_table(&table).await {
-                    tracing::warn!("restore LSM engine '{table}': create_table failed: {error}");
-                }
+                let engine = self.open_lsm_engine(&table)?;
+                engine.create_table(&table).await?;
                 tracing::info!("restored LSM engine for table '{table}'");
                 self.table_engines.write().insert(table, engine);
                 continue;
@@ -571,10 +559,8 @@ impl Executor {
             // directory: its rows are in the default engine, and routing reads
             // to an empty one would lose the table.
             let serving: Option<Arc<dyn StorageEngine>> = if self.table_engine_dir_exists(&table) {
-                let eng = self.open_columnar_engine(&table);
-                if let Err(e) = eng.create_table(&table).await {
-                    tracing::warn!("restore engine '{table}': create_table failed: {e}");
-                }
+                let eng = self.open_columnar_engine(&table)?;
+                eng.create_table(&table).await?;
                 eng.store_table_schema(&table, &col_info);
                 let dynamic: Arc<dyn StorageEngine> = eng;
                 self.table_engines
@@ -608,6 +594,7 @@ impl Executor {
             }
             tracing::info!("restored '{}' engine for table '{table}'", spec.engine);
         }
+        Ok(())
     }
 
     /// Whether a per-table engine's storage directory already exists — i.e.
@@ -723,9 +710,9 @@ impl Executor {
         let old_engine = self.storage_for(old);
         let rows = old_engine.scan(old).await?;
         let new_engine: Arc<dyn StorageEngine> = if meta.engine == "lsm" {
-            self.open_lsm_engine(new) as Arc<dyn StorageEngine>
+            self.open_lsm_engine(new)? as Arc<dyn StorageEngine>
         } else {
-            self.open_columnar_engine(new) as Arc<dyn StorageEngine>
+            self.open_columnar_engine(new)? as Arc<dyn StorageEngine>
         };
         new_engine.create_table(new).await?;
         for row in rows {
@@ -1252,6 +1239,20 @@ impl Executor {
         Self::validate_constraint_names(&table_def)?;
         self.validate_foreign_key_definitions(&table_def).await?;
 
+        #[cfg(feature = "server")]
+        let prepared_override: Option<Arc<dyn StorageEngine>> =
+            if self.catalog.get_table(&table_name).await.is_none() {
+                match engine_name.as_deref() {
+                    Some(
+                        "columnar" | "mergetree" | "replacing_mergetree" | "aggregating_mergetree",
+                    ) => Some(self.open_columnar_engine(&table_name)?),
+                    Some("lsm") => Some(self.open_lsm_engine(&table_name)?),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
         match self.catalog.create_table(table_def.clone()).await {
             Ok(()) => {
                 // Remember the declared PostgreSQL types the engine's DataType
@@ -1270,32 +1271,23 @@ impl Executor {
                     engine_name.as_deref(),
                     Some("mergetree") | Some("replacing_mergetree") | Some("aggregating_mergetree")
                 );
-                let tbl_storage: Arc<dyn StorageEngine> = match engine_name.as_deref() {
-                    #[cfg(feature = "server")]
-                    Some("columnar")
-                    | Some("mergetree")
-                    | Some("replacing_mergetree")
-                    | Some("aggregating_mergetree") => {
-                        // Columnar/MergeTree tables route to a per-table
-                        // columnar engine — WAL-backed when a data dir exists
-                        // so the rows survive restarts and crashes.
-                        let eng = self.open_columnar_engine(&table_name);
-                        self.table_engines
-                            .write()
-                            .insert(table_name.clone(), eng.clone() as Arc<dyn StorageEngine>);
-                        eng
-                    }
-                    #[cfg(feature = "server")]
-                    Some("lsm") => {
-                        let eng = self.open_lsm_engine(&table_name);
-                        self.table_engines
-                            .write()
-                            .insert(table_name.clone(), eng.clone());
-                        eng
-                    }
-                    _ => self.storage.clone(),
-                };
-                tbl_storage.create_table(&table_name).await?;
+                #[cfg(feature = "server")]
+                let tbl_storage = prepared_override
+                    .clone()
+                    .unwrap_or_else(|| self.storage.clone());
+                #[cfg(not(feature = "server"))]
+                let tbl_storage = self.storage.clone();
+                if let Err(error) = tbl_storage.create_table(&table_name).await {
+                    self.catalog.drop_table(&table_name).await?;
+                    self.catalog.clear_declared_types(&table_name);
+                    return Err(error.into());
+                }
+                #[cfg(feature = "server")]
+                if prepared_override.is_some() {
+                    self.table_engines
+                        .write()
+                        .insert(table_name.clone(), tbl_storage.clone());
+                }
 
                 // The declared engine, as one value. It is recorded in the
                 // CATALOG (the durable record), mirrored into `engines.json`
@@ -2896,6 +2888,17 @@ impl Executor {
                             obj.to_string()
                         }
                     };
+                    #[cfg(feature = "server")]
+                    if let Some(meta) = self
+                        .catalog_engine_meta(&table_name)
+                        .or_else(|| self.load_engines_meta().remove(&table_name))
+                    {
+                        if meta.engine == "lsm" {
+                            self.open_lsm_engine(&new)?;
+                        } else {
+                            self.open_columnar_engine(&new)?;
+                        }
+                    }
                     self.catalog.rename_table(&table_name, &new).await?;
 
                     // A table created `WITH (engine=...)` lives in a per-table

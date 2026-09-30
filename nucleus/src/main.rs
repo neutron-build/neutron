@@ -1390,7 +1390,10 @@ async fn cmd_start(cfg: StartConfig) {
     // engines.json: reopens their WAL-backed storage and restores
     // replacing-dedup configs. Without this, engine tables silently fell back
     // to the default heap engine after every restart.
-    executor.restore_table_engines().await;
+    if let Err(error) = executor.restore_table_engines().await {
+        eprintln!("nucleus: refusing to start: declared table engine recovery failed: {error}");
+        std::process::exit(1);
+    }
 
     // Rebuild specialty indexes (IvfFlat, encrypted) from table data after restart.
     executor.rebuild_specialty_indexes().await;

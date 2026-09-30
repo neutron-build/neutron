@@ -40,7 +40,7 @@ async fn open_segmented(dir: &Path) -> Executor {
     let storage: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(engine));
     let ex = Executor::new_with_persistence(catalog, storage, Some(catalog_path), Some(dir));
     ex.load_meta().await;
-    ex.restore_table_engines().await;
+    ex.restore_table_engines().await.unwrap();
     ex
 }
 

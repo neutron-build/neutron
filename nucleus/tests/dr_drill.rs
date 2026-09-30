@@ -54,7 +54,7 @@ async fn boot(data: &Path) -> (Arc<Executor>, Arc<BufferedDiskEngine>) {
         Some(catalog_path),
         Some(data),
     ));
-    exec.restore_table_engines().await;
+    exec.restore_table_engines().await.unwrap();
     (exec, buffered)
 }
 
