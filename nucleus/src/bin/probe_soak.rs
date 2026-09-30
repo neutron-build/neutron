@@ -147,10 +147,11 @@ impl Shared {
 
 /// Runs one statement, times it, records it, and reports whether it succeeded.
 /// The DB error is mapped to a short string for the sample log.
-async fn timed(db: &HarnessDb, shared: &Shared, op: Op, sql: &str) -> bool {
+async fn timed(db: &HarnessDb, sid: u64, shared: &Shared, op: Op, sql: &str) -> bool {
     let t = Instant::now();
     let r = db
-        .execute(sql)
+        .executor()
+        .execute_with_session(sid, sql)
         .await
         .map(|_| ())
         .map_err(|e| format!("{sql} -> {e}"));
@@ -201,6 +202,10 @@ async fn worker(
     deadline: Instant,
     preloaded_rows: i64,
 ) {
+    // Model independent client connections: each worker serializes commands
+    // within its own session, as the production wire protocol does. The default
+    // HarnessDb entry point uses one session and its parser/plan hint state.
+    let sid = db.executor().create_session();
     let base: i64 = (id as i64 + 1) * 1_000_000_000;
     let mut counter: i64 = 0;
     let mut live: VecDeque<i64> = VecDeque::new();
@@ -220,7 +225,8 @@ async fn worker(
             );
             let t = Instant::now();
             let r = db
-                .execute(&sql)
+                .executor()
+                .execute_with_session(sid, &sql)
                 .await
                 .map(|_| ())
                 .map_err(|e| format!("{sql} -> {e}"));
@@ -240,7 +246,7 @@ async fn worker(
             let val = rng.below(64) as i64;
             let (vsql, vvals) = vlit(&mut rng);
             let sql = format!("UPDATE soak SET val = {val}, v = {vsql} WHERE id = {rid}");
-            timed(&db, &shared, Op::Update, &sql).await;
+            timed(&db, sid, &shared, Op::Update, &sql).await;
 
             shared.logical_bytes.fetch_add(
                 logical_row_bytes(rid, val, &format!("k{rid}"), &vvals),
@@ -263,7 +269,8 @@ async fn worker(
             };
             let t = Instant::now();
             let r = db
-                .query(&q)
+                .executor()
+                .execute_with_session(sid, &q)
                 .await
                 .map(|_| ())
                 .map_err(|e| format!("{q} -> {e}"));
@@ -272,12 +279,13 @@ async fn worker(
             // KV op — a different model sharing the same engine.
             let k = base + rng.below(256) as i64;
             let sql = format!("SELECT KV_SET('sk{k}', 'v{counter}')");
-            timed(&db, &shared, Op::Kv, &sql).await;
+            timed(&db, sid, &shared, Op::Kv, &sql).await;
         } else if !live.is_empty() {
             // DELETE the oldest — this is the position-shifting op.
             let rid = live.pop_front().unwrap();
             if timed(
                 &db,
+                sid,
                 &shared,
                 Op::Delete,
                 &format!("DELETE FROM soak WHERE id = {rid}"),
@@ -293,6 +301,7 @@ async fn worker(
             let rid = live.pop_front().unwrap();
             if timed(
                 &db,
+                sid,
                 &shared,
                 Op::Delete,
                 &format!("DELETE FROM soak WHERE id = {rid}"),
@@ -303,6 +312,7 @@ async fn worker(
             }
         }
     }
+    db.executor().drop_session(sid);
 }
 
 async fn create_schema(db: &HarnessDb) -> Result<(), String> {
