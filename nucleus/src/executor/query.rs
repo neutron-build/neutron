@@ -6451,7 +6451,16 @@ impl Executor {
                         first
                             .iter()
                             .enumerate()
-                            .map(|(i, v)| (format!("column{}", i + 1), value_type(v)))
+                            .map(|(i, v)| {
+                                (
+                                    format!("column{}", i + 1),
+                                    super::helpers::projected_column_type(
+                                        &values.rows[0][i],
+                                        v,
+                                        &[],
+                                    ),
+                                )
+                            })
                             .collect()
                     } else {
                         Vec::new()
