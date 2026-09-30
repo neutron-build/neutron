@@ -10,14 +10,16 @@ fn detached_fts_rebuild_preserves_completed_concurrent_insert() {
     runtime.block_on(async {
         exec(
             &executor,
-            "CREATE TABLE articles (id INT PRIMARY KEY, body TEXT)",
+            "CREATE TABLE articles (id INT PRIMARY KEY, body TEXT, v VECTOR(4))",
         )
         .await;
-        let fillers: Vec<_> = (3..515).map(|id| format!("({id}, 'filler')")).collect();
+        let fillers: Vec<_> = (3..515)
+            .map(|id| format!("({id}, 'filler', VECTOR('[1,0,0,0]'))"))
+            .collect();
         exec(
             &executor,
             &format!(
-                "INSERT INTO articles VALUES (1, 'needle'), {}",
+                "INSERT INTO articles VALUES (1, 'needle', VECTOR('[1,0,0,0]')), {}",
                 fillers.join(",")
             ),
         )
@@ -25,6 +27,12 @@ fn detached_fts_rebuild_preserves_completed_concurrent_insert() {
         exec(
             &executor,
             "CREATE INDEX articles_fts ON articles USING FTS (body)",
+        )
+        .await;
+        // Positional IVF maintenance forces the full derived refresh path.
+        exec(
+            &executor,
+            "CREATE INDEX articles_vector ON articles USING IVFFLAT (v)",
         )
         .await;
     });
@@ -47,11 +55,19 @@ fn detached_fts_rebuild_preserves_completed_concurrent_insert() {
                 "UPDATE articles SET body = 'needle changed' WHERE id = 1",
             ))
     });
-    paused
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("UPDATE never reached detached publication");
-    let insertion = runtime
-        .block_on(executor.execute_with_session(72, "INSERT INTO articles VALUES (2, 'needle')"));
+    if let Err(error) = paused.recv_timeout(std::time::Duration::from_secs(10)) {
+        if update.is_finished() {
+            panic!(
+                "UPDATE completed before detached publication: {:?}",
+                update.join().unwrap()
+            );
+        }
+        panic!("UPDATE never reached detached publication: {error}");
+    }
+    let insertion = runtime.block_on(executor.execute_with_session(
+        72,
+        "INSERT INTO articles VALUES (2, 'needle', VECTOR('[1,0,0,0]'))",
+    ));
     resume.send(()).unwrap();
     insertion.unwrap();
     let update = update.join().unwrap().unwrap();
