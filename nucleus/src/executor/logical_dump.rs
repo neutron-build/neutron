@@ -220,20 +220,27 @@ pub(super) fn render_create_table(def: &TableDef) -> String {
     format!("CREATE TABLE {} (\n  {}\n);", def.name, items.join(",\n  "))
 }
 
-/// Render `CREATE INDEX` DDL. Encrypted indexes (BTree + an `encryption_mode`
-/// option) round-trip as `USING encrypted`; vector/GIN/etc. use their type.
-pub(super) fn render_create_index(idx: &IndexDef) -> String {
+/// Reject metadata whose emitted definition cannot be replayed by this engine.
+fn validate_replayable_index(idx: &IndexDef) -> Result<(), ExecError> {
+    if idx.options.contains_key("encryption_mode") {
+        return Err(ExecError::Unsupported(format!(
+            "logical dump cannot replay retired encrypted index '{}'; base rows remain readable and unchanged. Review and DROP INDEX the retired definition before retrying export; an ordinary replacement index provides no encryption",
+            idx.name
+        )));
+    }
+    Ok(())
+}
+
+/// Render supported `CREATE INDEX` DDL; retired definitions fail explicitly.
+pub(super) fn render_create_index(idx: &IndexDef) -> Result<String, ExecError> {
     use crate::catalog::IndexType;
-    let using = if idx.options.contains_key("encryption_mode") {
-        Some("encrypted".to_string())
-    } else {
-        match &idx.index_type {
-            IndexType::BTree => None,
-            other => Some(other.to_string().to_lowercase()),
-        }
+    validate_replayable_index(idx)?;
+    let using = match &idx.index_type {
+        IndexType::BTree => None,
+        other => Some(other.to_string().to_lowercase()),
     };
     let unique = if idx.unique { "UNIQUE " } else { "" };
-    match using {
+    Ok(match using {
         Some(u) => format!(
             "CREATE {unique}INDEX {} ON {} USING {u} ({});",
             idx.name,
@@ -246,7 +253,7 @@ pub(super) fn render_create_index(idx: &IndexDef) -> String {
             idx.table_name,
             idx.columns.join(", ")
         ),
-    }
+    })
 }
 
 /// Render an `INSERT` for one row against a table definition.
@@ -632,6 +639,13 @@ impl super::Executor {
     /// Statements are emitted in dependency-correct order and every collection is
     /// name-sorted, so the same database always produces the same script.
     pub async fn dump_logical(&self) -> Result<String, ExecError> {
+        // Validate even constraint-backed definitions before any row scans or
+        // script assembly. A refused export returns no partial SQL script.
+        let mut indexes = self.catalog.get_all_indexes().await;
+        indexes.sort_by(|a, b| a.name.cmp(&b.name));
+        for index in indexes {
+            validate_replayable_index(&index)?;
+        }
         let mut out = String::new();
         out.push_str("-- Nucleus logical dump (portable SQL, replayable through the executor)\n");
 
@@ -818,7 +832,7 @@ impl super::Executor {
                     out.push('\n');
                     wrote_index_header = true;
                 }
-                out.push_str(&render_create_index(&idx));
+                out.push_str(&render_create_index(&idx)?);
                 out.push('\n');
             }
         }

@@ -1207,6 +1207,14 @@ not reconstruct legacy encrypted sidecars. Base rows were always plaintext;
 this retirement does not encrypt them. A future secure implementation needs
 an explicit cryptographic format and key-management migration.
 
+Logical SQL export refuses databases containing a historical index definition
+with `encryption_mode`, returning an error without a partial SQL script. It does
+not silently omit that definition or alter the base rows. Review the retired
+index and explicitly `DROP INDEX index_name` before retrying export. If needed,
+create an ordinary replacement index for lookup performance; it provides no
+encryption. Physical backup can retain historical metadata, but recovery still
+does not recreate the retired sidecar.
+
 ## Stored procedures
 
 `PROC_REGISTER`, `PROC_DROP`, `PROC_LIST`
