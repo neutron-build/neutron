@@ -189,3 +189,92 @@ fn detached_zone_map_rebuild_preserves_same_count_concurrent_update() {
         );
     });
 }
+
+#[tokio::test]
+async fn open_transaction_fts_update_does_not_hide_committed_rows_from_other_session() {
+    use crate::storage::buffered_engine::BufferedDiskEngine;
+    use crate::storage::disk_engine::DiskEngine;
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = Arc::new(Catalog::new());
+    let disk = Arc::new(DiskEngine::open(&dir.path().join("t.db"), catalog.clone()).unwrap());
+    let storage: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(disk));
+    let executor = Executor::new(catalog, storage);
+    exec(
+        &executor,
+        "CREATE TABLE committed_articles (id INT PRIMARY KEY, body TEXT)",
+    )
+    .await;
+    let fillers: Vec<_> = (2..514).map(|id| format!("({id}, 'filler')")).collect();
+    exec(
+        &executor,
+        &format!(
+            "INSERT INTO committed_articles VALUES (1, 'needle'), {}",
+            fillers.join(",")
+        ),
+    )
+    .await;
+    exec(
+        &executor,
+        "CREATE INDEX committed_articles_fts ON committed_articles USING FTS (body)",
+    )
+    .await;
+    for completion in ["ROLLBACK", "COMMIT"] {
+        executor.execute_with_session(81, "BEGIN").await.unwrap();
+        let changed = executor
+            .execute_with_session(
+                81,
+                "UPDATE committed_articles SET body = 'changed' WHERE id = 1",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            &changed[0],
+            ExecResult::Command {
+                rows_affected: 1,
+                ..
+            }
+        ));
+        let heap = executor
+            .execute_with_session(
+                82,
+                "SELECT id FROM committed_articles WHERE (body || '') @@ 'needle' ORDER BY id",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(&heap[0]),
+            &vec![vec![Value::Int32(1)]],
+            "reader did not see committed old heap value"
+        );
+        let indexed = executor
+            .execute_with_session(
+                82,
+                "SELECT id FROM committed_articles WHERE body @@ 'needle' ORDER BY id",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(&indexed[0]),
+            rows(&heap[0]),
+            "uncommitted FTS hook hid a committed row"
+        );
+        executor.execute_with_session(81, completion).await.unwrap();
+        let after = executor
+            .execute_with_session(
+                82,
+                "SELECT id FROM committed_articles WHERE body @@ 'needle' ORDER BY id",
+            )
+            .await
+            .unwrap();
+        let expected = if completion == "ROLLBACK" {
+            vec![vec![Value::Int32(1)]]
+        } else {
+            vec![]
+        };
+        assert_eq!(
+            rows(&after[0]),
+            &expected,
+            "wrong FTS result after {completion}"
+        );
+    }
+}
