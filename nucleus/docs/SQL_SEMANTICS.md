@@ -174,9 +174,10 @@ function-volatility catalog. Refusal SQLSTATEs depend on the validation error;
 
 Column default parse/evaluation errors propagate instead of becoming NULL;
 int8-to-int4 defaults reject overflow. Logical identity dumps retain the owned
-sequence's definition and current position. Final integrated regression and
-live verification of these column changes is pending; this source assessment
-is not an end-to-end compatibility certification.
+sequence's definition and current position. The supported forms and explicit
+refusals above are bounded contracts; they
+do not establish end-to-end compatibility for every generated/default
+expression or schema-migration pattern.
 
 ### Query behavior and explicit limits
 
@@ -201,6 +202,11 @@ the stored row count. COLUMNAR_INSERT is refused inside a SQL transaction
 because the store has no rollback mechanism.
 
 ### Catalog metadata
+
+Scalar `DataType::Text` currently emits PostgreSQL VARCHAR OID 1043, including
+`NULL::text`, where PostgreSQL emits TEXT OID 25. Text arrays use TEXT[] OID
+1009. Correct array metadata does not establish scalar wire-type identity
+(`src/wire/mod.rs`, `data_type_to_pg` and `array_pg_type`).
 
 Catalog relations use a coherent snapshot of live schema objects. Declared
 varchar, numeric and array modifiers survive introspection and persistence;
