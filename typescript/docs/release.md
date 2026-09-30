@@ -5,7 +5,8 @@
 
 ## Versioning
 
-- Use semver.
+- Use semver. Before 1.0, a minor version may introduce breaking changes; document
+them explicitly and require consumers to migrate before updating.
 - `MAJOR`: breaking API/runtime behavior.
 - `MINOR`: backward-compatible features.
 - `PATCH`: backward-compatible fixes.
@@ -51,13 +52,13 @@ Each release entry should include date and version.
 1. Bump package versions.
 2. Commit version + changelog updates.
 3. Create git tag: `ts/vX.Y.Z` (the `ts/` prefix scopes the tag to the TypeScript implementation; the `typescript-publish.yml` workflow fires on `ts/v*`). Other implementations use parallel prefixes: e.g. `rust/v*`, `nucleus/v*`, `cli/v*`.
-4. Push the tag to `origin` (Forgejo). The push mirrors to GitHub, which triggers `typescript-publish.yml`. That workflow runs the **build + test gate** (scoped to `./packages/*`, on Node 24) — but see the publishing note below: the `publish` step cannot complete in CI.
+4. Push the tag to `origin` (Forgejo). The push mirrors to GitHub, which triggers `typescript-publish.yml`. That workflow validates the **build + test gate** (scoped to `./packages/*`, on Node 24). It does not publish npm packages; a green validation run is not publication evidence.
 
 ## Publishing (must be done locally)
 
-The npm account enforces interactive two-factor auth for publishing, which a CI
-token cannot satisfy — the workflow's `publish` step fails with `EOTP`. So the
-build/test job is the gate, and the actual publish is run locally:
+The npm account requires interactive two-factor authentication for publication.
+No npm publishing token is configured for this workflow. After release validation
+passes, publish locally from an authenticated session:
 
 ```bash
 npm login --auth-type=web        # approve in browser with your security key
@@ -65,13 +66,22 @@ cd typescript
 pnpm publish -r --access public --no-git-checks
 ```
 
+For a release where the CLI depends on a new scaffolder version and the
+scaffolder generates new CLI pins, stage all new tarballs with `--tag next`.
+Verify every version and dependency in the registry before promoting `latest`;
+promote the scaffolder last so newly generated projects can resolve every pin.
+Record published package versions and registry integrity values separately from
+the validation workflow result.
+
 - `pnpm publish -r` skips any version already on the registry, so it is safe to
   re-run if it stops partway (e.g. an OTP prompt lapses mid-run).
 - After publishing, the npm registry can lag for several minutes — `npm view`
   may report a just-published package as missing. Confirm against the registry's
   `versions` map (`https://registry.npmjs.org/<pkg>`), not just `npm view`.
-- `workspace:*` cross-package deps are rewritten to the concrete version on
-  publish (verified: `@neutron-build/data` ships `@neutron-build/nucleus: "0.1.0"`).
+- Workspace dependency protocols are rewritten during pack/publish. Inspect the
+  tarball metadata: `workspace:^` becomes a compatible version range, while
+  `workspace:*` becomes the concrete version. Publish dependencies before their
+  consumers, and publish scaffolders only after every generated pin resolves.
 
 ## Support Policy
 
