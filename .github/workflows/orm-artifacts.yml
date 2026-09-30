@@ -34,6 +34,10 @@ on:
       - "typescript/packages/neutron-sql/**"
       - "typescript/packages/neutron-nucleus/**"
       - "typescript/packages/neutron-data/**"
+      - "typescript/packages/neutron/src/server/session*.ts"
+      - "go/neutronauth/**"
+      - "go/go.mod"
+      - "go/go.sum"
       - "typescript/scripts/installed-sdk*/**"
       - "typescript/scripts/installed-sdk-gate.mjs"
       - "typescript/pnpm-lock.yaml"
@@ -48,6 +52,10 @@ on:
       - "typescript/packages/neutron-sql/**"
       - "typescript/packages/neutron-nucleus/**"
       - "typescript/packages/neutron-data/**"
+      - "typescript/packages/neutron/src/server/session*.ts"
+      - "go/neutronauth/**"
+      - "go/go.mod"
+      - "go/go.sum"
       - "typescript/scripts/installed-sdk*/**"
       - "typescript/scripts/installed-sdk-gate.mjs"
       - "typescript/pnpm-lock.yaml"
@@ -172,12 +180,52 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: pnpm
           cache-dependency-path: typescript/pnpm-lock.yaml
-      - run: pnpm install --frozen-lockfile --filter '@neutron-build/nucleus' --filter '@neutron-build/data'
+      - run: pnpm install --frozen-lockfile --filter '@neutron-build/nucleus' --filter '@neutron-build/data' --filter '@neutron-build/core'
         working-directory: typescript
+      - uses: actions/setup-go@v5
+        if: matrix.package == 'nucleus'
+        with:
+          go-version: "1.26"
+          cache-dependency-path: go/go.sum
+      - name: Install authentication test dependencies
+        if: matrix.package == 'nucleus'
+        run: |
+          # pg belongs to the consuming application, not the core package.
+          # Install it outside the checkout and expose it only to this test run.
+          npm install --prefix "$RUNNER_TEMP/auth-driver" --no-audit --no-fund --ignore-scripts pg@8.22.0
+          ln -s "$RUNNER_TEMP/auth-driver/node_modules/pg" typescript/packages/neutron/node_modules/pg
       - name: Start this source's engine
         run: |
           chmod +x "$RUNNER_TEMP/installed-engine/nucleus"
           NUCLEUS_BIN="$RUNNER_TEMP/installed-engine/nucleus" sh conformance/live/scripts/start-engine.sh 55432 "$RUNNER_TEMP/nucleus-installed"
+      - name: Verify authentication against PostgreSQL and this source's engine
+        if: matrix.package == 'nucleus'
+        env:
+          NEUTRON_LIVE_REQUIRED: "1"
+        run: |
+          set -euo pipefail
+          for runtime in postgres nucleus; do
+            if [ "$runtime" = postgres ]; then
+              export NEUTRON_AUTH_TEST_DATABASE_URL="$NEUTRON_TEST_PG_URL"
+            else
+              export NEUTRON_AUTH_TEST_DATABASE_URL="$NEUTRON_NUCLEUS_TEST_URL"
+            fi
+            (cd go && go test -race -json ./neutronauth) > "$RUNNER_TEMP/auth-$runtime-go.jsonl"
+            (cd typescript/packages/neutron && pnpm exec vitest run src/server/session.test.ts src/server/session-sql.integration.test.ts --maxWorkers=1 --fileParallelism=false --reporter=json --outputFile="$RUNNER_TEMP/auth-$runtime-ts.json")
+            node --input-type=module - "$RUNNER_TEMP/auth-$runtime-go.jsonl" "$RUNNER_TEMP/auth-$runtime-ts.json" <<'JS'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const events = readFileSync(process.argv[2], 'utf8').trim().split('\n').map(JSON.parse);
+          assert.ok(events.some(event => event.Test && event.Action === 'pass'), 'Go auth suite was empty');
+          assert.ok(!events.some(event => event.Action === 'skip' || event.Action === 'fail'), 'Go auth skipped or failed');
+          const tests = JSON.parse(readFileSync(process.argv[3], 'utf8'));
+          assert.ok(tests.numTotalTests > 0, 'TS auth suite was empty');
+          assert.equal(tests.numFailedTests, 0);
+          assert.equal(tests.numPendingTests, 0);
+          assert.equal(tests.numTodoTests, 0);
+          assert.equal(tests.numPassedTests, tests.numTotalTests);
+          JS
+          done
       - name: Pack and install into real clean consumers
         run: node typescript/scripts/installed-sdk-gate.mjs --package '${{ matrix.package }}' --keep-tarball "$RUNNER_TEMP/sdk-pack" --out installed-sdk.local.json
       - uses: actions/upload-artifact@v4
@@ -186,6 +234,8 @@ jobs:
           name: neutron-${{ matrix.package }}-installed-node${{ matrix.node }}-${{ github.run_id }}
           path: |
             installed-sdk.local.json
+            ${{ runner.temp }}/auth-*-go.jsonl
+            ${{ runner.temp }}/auth-*-ts.json
             ${{ runner.temp }}/nucleus-installed/server.log
           if-no-files-found: warn
           retention-days: 14
