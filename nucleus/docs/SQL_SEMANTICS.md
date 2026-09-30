@@ -136,11 +136,14 @@ because the tuple codec cannot preserve their full representation. Binary
 array parameters support one dimension with lower bound 1; malformed payloads,
 other lower bounds and mismatched element OIDs are refused.
 
-TIMESTAMPTZ casts, array writes and output use the session time zone. Ambiguous
+TIMESTAMPTZ casts, scalar and array writes and output use the session time zone.
+DATE assignments use midnight in that zone. Ambiguous
 or nonexistent bare local times are refused; use an explicit offset. EXTRACT
 and DATE_PART preserve fractional seconds and epoch fractions for timestamp
-values. DECODE returns
-raw BYTEA for hex/base64 input, and ENCODE preserves those bytes.
+values. EXTRACT returns NUMERIC and DATE_PART returns DOUBLE PRECISION,
+including empty-result metadata. DECODE returns raw BYTEA for hex/base64 input,
+and ENCODE preserves those bytes. Both functions return NULL when either
+argument is NULL.
 
 These fixes do not establish full PostgreSQL scalar parity. Date infinity,
 enum declaration-order sorting and arbitrary numeric precision/scale remain
