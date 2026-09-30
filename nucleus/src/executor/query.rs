@@ -6525,11 +6525,14 @@ impl Executor {
     > {
         let with = with.clone();
         Box::pin(async move {
-            let mut cte_tables = HashMap::new();
+            // Nested WITH clauses inherit their enclosing CTE scope. Local names
+            // replace inherited names as their definitions become available.
+            let mut cte_tables = self.current_session().active_ctes.read().clone();
             for cte in &with.cte_tables {
                 let cte_name = cte.alias.name.value.clone();
 
-                // Check for recursive CTE (WITH RECURSIVE ... UNION ALL)
+                // UNION uses a visited set: only previously unseen rows enter
+                // the next working set. UNION ALL retains every produced row.
                 if with.recursive
                     && let SetExpr::SetOperation {
                         op: ast::SetOperator::Union,
@@ -6542,51 +6545,65 @@ impl Executor {
                         set_quantifier,
                         ast::SetQuantifier::All | ast::SetQuantifier::AllByName
                     );
-                    if is_all {
-                        // Execute base case (left side of UNION ALL)
-                        let base_result = self
-                            .execute_set_expr(*left.clone(), &cte_tables, &[], false)
-                            .await?;
-                        let (base_cols, base_rows) = self.select_result_to_rows(base_result)?;
-                        // Apply CTE alias column names if provided
-                        let cte_col_names: Vec<String> = cte
-                            .alias
-                            .columns
-                            .iter()
-                            .map(|c| c.name.value.clone())
-                            .collect();
-                        let col_meta: Vec<ColMeta> = base_cols
-                            .iter()
-                            .enumerate()
-                            .map(|(i, (name, dtype))| ColMeta {
-                                table: Some(cte_name.clone()),
-                                name: cte_col_names
-                                    .get(i)
-                                    .cloned()
-                                    .unwrap_or_else(|| name.clone()),
-                                dtype: dtype.clone(),
-                            })
-                            .collect();
-                        let mut all_rows = base_rows.clone();
-                        let mut working_rows = base_rows;
-                        const MAX_RECURSION: usize = 1000;
-                        for _iteration in 0..MAX_RECURSION {
-                            // Make current working set available as the CTE
-                            cte_tables.insert(cte_name.clone(), (col_meta.clone(), working_rows));
-                            // Execute recursive part (right side of UNION ALL)
-                            let rec_result = self
-                                .execute_set_expr(*right.clone(), &cte_tables, &[], false)
-                                .await?;
-                            let (_rec_cols, new_rows) = self.select_result_to_rows(rec_result)?;
-                            if new_rows.is_empty() {
-                                break; // fixpoint reached
-                            }
-                            all_rows.extend(new_rows.clone());
-                            working_rows = new_rows;
-                        }
-                        cte_tables.insert(cte_name, (col_meta, all_rows));
-                        continue;
+                    let base_result = self
+                        .execute_cte_set_expr(*left.clone(), &cte_tables)
+                        .await?;
+                    let (base_cols, mut base_rows) = self.select_result_to_rows(base_result)?;
+                    let cte_col_names: Vec<String> = cte
+                        .alias
+                        .columns
+                        .iter()
+                        .map(|c| c.name.value.clone())
+                        .collect();
+                    let col_meta: Vec<ColMeta> = base_cols
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (name, dtype))| ColMeta {
+                            table: Some(cte_name.clone()),
+                            name: cte_col_names
+                                .get(i)
+                                .cloned()
+                                .unwrap_or_else(|| name.clone()),
+                            dtype: dtype.clone(),
+                        })
+                        .collect();
+                    let mut visited = HashSet::new();
+                    if !is_all {
+                        base_rows.retain(|row| visited.insert(row.clone()));
                     }
+                    let mut all_rows = base_rows.clone();
+                    let mut working_rows = base_rows;
+                    const MAX_RECURSION: usize = 1000;
+                    let mut reached_fixpoint = working_rows.is_empty();
+                    for _iteration in 0..MAX_RECURSION {
+                        if reached_fixpoint {
+                            break;
+                        }
+                        cte_tables.insert(cte_name.clone(), (col_meta.clone(), working_rows));
+                        let rec_result = self
+                            .execute_cte_set_expr(*right.clone(), &cte_tables)
+                            .await?;
+                        let (rec_cols, mut new_rows) = self.select_result_to_rows(rec_result)?;
+                        if rec_cols.len() != base_cols.len() {
+                            return Err(ExecError::Unsupported(
+                                "each recursive UNION query must have the same number of columns"
+                                    .into(),
+                            ));
+                        }
+                        if !is_all {
+                            new_rows.retain(|row| visited.insert(row.clone()));
+                        }
+                        reached_fixpoint = new_rows.is_empty();
+                        all_rows.extend(new_rows.clone());
+                        working_rows = new_rows;
+                    }
+                    if !reached_fixpoint {
+                        return Err(ExecError::Unsupported(format!(
+                            "recursive CTE {cte_name} exceeded {MAX_RECURSION} iterations"
+                        )));
+                    }
+                    cte_tables.insert(cte_name, (col_meta, all_rows));
+                    continue;
                 }
 
                 // Non-recursive CTE.
@@ -6634,6 +6651,24 @@ impl Executor {
                 }
             }
             Ok(cte_tables)
+        })
+    }
+
+    // Nested SELECTs in either arm must see the same working set and
+    // siblings as the direct SELECT path. Restore scope on errors as well.
+    fn execute_cte_set_expr<'a>(
+        &'a self,
+        body: SetExpr,
+        cte_tables: &'a CteTableMap,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<SelectResult, ExecError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let sess = self.current_session();
+            let saved = std::mem::replace(&mut *sess.active_ctes.write(), cte_tables.clone());
+            let result = self.execute_set_expr(body, cte_tables, &[], false).await;
+            *sess.active_ctes.write() = saved;
+            result
         })
     }
 
