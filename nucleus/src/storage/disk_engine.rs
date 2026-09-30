@@ -8379,7 +8379,7 @@ mod tests {
     #[test]
     fn ordinary_update_refresh_preserves_concurrent_secondary_posting() {
         use crate::executor::Executor;
-        use crate::storage::BufferedDiskEngine;
+        use crate::storage::buffered_engine::BufferedDiskEngine;
         use std::sync::mpsc;
         use std::time::Duration;
         enum Event {
