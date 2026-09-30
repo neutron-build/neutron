@@ -289,6 +289,7 @@ impl<'a> ImplicitTxnBlock<'a> {
 
     /// Whether the block still owns an open implicit transaction (an explicit
     /// BEGIN converts it, COMMIT and ROLLBACK end it).
+    #[cfg(feature = "server")]
     fn holds_txn(&self) -> bool {
         self.session.txn_active.load(Ordering::SeqCst)
             && self.session.implicit_txn.load(Ordering::SeqCst)

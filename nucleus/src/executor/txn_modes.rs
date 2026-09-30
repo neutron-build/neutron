@@ -23,7 +23,9 @@ use sqlparser::ast::Visit;
 use sqlparser::ast::{self, Statement};
 use std::sync::atomic::Ordering;
 
-use super::admission::{scalar_fn_mutates, statement_label, statement_mutates};
+#[cfg(feature = "server")]
+use super::admission::scalar_fn_mutates;
+use super::admission::{statement_label, statement_mutates};
 use super::{ExecError, ExecResult, Executor};
 
 /// Modes named by a `BEGIN` / `SET TRANSACTION` statement. `None` = not named.

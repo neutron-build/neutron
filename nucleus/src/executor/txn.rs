@@ -28,6 +28,7 @@ impl Executor {
     /// When the storage engine supports MVCC, this delegates to the engine's
     /// snapshot-based transaction management. Otherwise, falls back to the
     /// legacy approach of cloning all table data for rollback.
+    #[cfg(feature = "server")]
     pub(super) async fn begin_transaction(&self) -> Result<ExecResult, ExecError> {
         self.begin_transaction_with(TxnModes::default()).await
     }
