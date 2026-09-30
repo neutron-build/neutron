@@ -216,3 +216,20 @@ async fn x11_first_null_wrapped_window_retains_declared_metadata() {
     assert_eq!(rows, &vec![vec![Value::Null], vec![Value::Int64(2)]]);
     assert_eq!(columns[0].1, DataType::Int64);
 }
+
+#[tokio::test]
+async fn x11_jsonb_numeric_scale_does_not_change_containment() {
+    let ex = test_executor();
+    for sql in [
+        "SELECT '1.0'::jsonb @> '1.00'::jsonb",
+        "SELECT '{\"x\":[1.0]}'::jsonb @> '{\"x\":[1.00]}'::jsonb",
+        "SELECT '{\"x\":[1.0]}'::jsonb <@ '{\"x\":[1.00]}'::jsonb",
+    ] {
+        assert_eq!(
+            scalar(&exec(&ex, sql).await[0]),
+            &Value::Bool(true),
+            "{sql}"
+        );
+    }
+    assert_eq!(scalar(&exec(&ex, "SELECT '[1234567890123456789012345678901234567890]'::jsonb @> '[1234567890123456789012345678901234567891]'::jsonb").await[0]), &Value::Bool(false));
+}
