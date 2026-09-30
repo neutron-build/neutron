@@ -223,6 +223,7 @@ impl ColumnarStorageEngine {
 
     fn snapshot_tables(&self) -> Vec<(String, Vec<Row>)> {
         let _mutation = self.mutation_gate.lock();
+        self.flush_all_write_buffers();
         let store = self.store.read();
         store
             .table_names()
@@ -952,6 +953,23 @@ impl ColumnarStorageEngine {
         self.update_indexes_at_positions(table, &buf, starting_pos);
     }
 
+    /// A WAL replacement snapshot supersedes every table's append frames.
+    /// Drain all acknowledged insert buffers before collecting any such image,
+    /// under the same mutation gate as writers and before taking store locks.
+    fn flush_all_write_buffers(&self) {
+        let _mutation = self.mutation_gate.lock();
+        let tables: Vec<String> = self
+            .write_buffers
+            .read()
+            .iter()
+            .filter(|(_, rows)| !rows.is_empty())
+            .map(|(table, _)| table.clone())
+            .collect();
+        for table in tables {
+            self.flush_write_buffer(&table);
+        }
+    }
+
     fn rebuild_indexes(&self, table: &str) {
         let _mutation = self.mutation_gate.lock();
         // Ensure buffered rows are in the store before rebuilding index.
@@ -1251,7 +1269,11 @@ impl StorageEngine for ColumnarStorageEngine {
         if positions.is_empty() {
             return Ok(0);
         }
-        self.flush_write_buffer(table);
+        if self.wal.is_some() {
+            self.flush_all_write_buffers();
+        } else {
+            self.flush_write_buffer(table);
+        }
         let pos_set: std::collections::HashSet<usize> = positions.iter().copied().collect();
         let count = {
             let mut store = self.store.write();
@@ -1304,7 +1326,11 @@ impl StorageEngine for ColumnarStorageEngine {
         if updates.is_empty() {
             return Ok(0);
         }
-        self.flush_write_buffer(table);
+        if self.wal.is_some() {
+            self.flush_all_write_buffers();
+        } else {
+            self.flush_write_buffer(table);
+        }
         let update_map: HashMap<usize, &Row> = updates.iter().map(|(p, r)| (*p, r)).collect();
         let count = {
             let mut store = self.store.write();
@@ -1940,11 +1966,7 @@ impl StorageEngine for ColumnarStorageEngine {
     async fn flush_all_dirty(&self) -> Result<(), StorageError> {
         let _mutation = self.mutation_gate.lock();
         self.ensure_healthy()?;
-        // Flush all per-table write buffers to the columnar store.
-        let tables: Vec<String> = self.write_buffers.read().keys().cloned().collect();
-        for table in tables {
-            self.flush_write_buffer(&table);
-        }
+        self.flush_all_write_buffers();
         // Checkpoint WAL to a compact single-snapshot file.
         if let Some(wal) = &self.wal {
             let snap = self.snapshot_tables();
