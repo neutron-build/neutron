@@ -31,6 +31,28 @@ fn array_tag_matches_declared_type(tag: u8, element_type: &DataType) -> bool {
     tag == expected
 }
 
+/// Restore a typed array leaf without accepting a physical representation
+/// that the encoder cannot reproduce. SQL input casting accepts aliases, but
+/// persisted tuple decoding must not normalize damaged text into another value.
+fn restore_array_leaf(item: Value, element_type: &DataType) -> Option<Value> {
+    if let Value::Text(raw) = &item {
+        let restored = if matches!(element_type, DataType::Numeric) {
+            // Retain an exact, validated stored decimal spelling, including
+            // scale; the ordinary SQL cast would normalize trailing zeroes.
+            crate::types::parse_numeric(raw).ok()?;
+            Value::Numeric(raw.clone())
+        } else {
+            item.cast(element_type).ok()?
+        };
+        if restored.to_string() != *raw {
+            return None;
+        }
+        Some(restored)
+    } else {
+        item.cast(element_type).ok()
+    }
+}
+
 /// Serialize a row into bytes given the column types.
 pub fn serialize_row(row: &Row, col_types: &[DataType]) -> Vec<u8> {
     debug_assert_eq!(row.len(), col_types.len());
@@ -512,7 +534,7 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                 }
                 let typed = elems
                     .into_iter()
-                    .map(|item| item.cast(element_type).ok())
+                    .map(|item| restore_array_leaf(item, element_type))
                     .collect::<Option<Vec<_>>>()?;
                 row.push(Value::Array(typed));
             }
@@ -1056,7 +1078,7 @@ fn decode_column_at(data: &[u8], pos: usize, dtype: &DataType) -> Option<Value> 
             }
             let typed = elems
                 .into_iter()
-                .map(|item| item.cast(element_type).ok())
+                .map(|item| restore_array_leaf(item, element_type))
                 .collect::<Option<Vec<_>>>()?;
             Some(Value::Array(typed))
         }
@@ -1641,5 +1663,69 @@ mod x09_array_physical_tag_corruption {
             assert_eq!(deserialize_row(&corrupt, &types), None);
             assert_eq!(deserialize_row_projected(&corrupt, &types, &[1]), None);
         }
+    }
+}
+
+#[cfg(test)]
+mod x09_array_fallback_corruption {
+    use super::*;
+
+    #[test]
+    fn x09_array_fallback_text_must_preserve_its_physical_representation() {
+        for (dtype, leaf, needle, replacement) in [
+            (
+                DataType::Bytea,
+                Value::Bytea(vec![0, 255, 42]),
+                "\\x00ff2a",
+                b'y',
+            ),
+            (
+                DataType::TimestampTz,
+                Value::TimestampTz(-42),
+                "1999-12-31 23:59:59.999958+00",
+                b'1',
+            ),
+        ] {
+            let types = vec![DataType::Int32, DataType::Array(Box::new(dtype))];
+            let row = vec![Value::Int32(7), Value::Array(vec![leaf, Value::Null])];
+            let clean = serialize_row(&row, &types);
+            assert_eq!(deserialize_row(&clean, &types), Some(row.clone()));
+            assert_eq!(
+                deserialize_row_projected(&clean, &types, &[1]),
+                Some(vec![row[1].clone()])
+            );
+            let start = clean
+                .windows(needle.len())
+                .position(|w| w == needle.as_bytes())
+                .unwrap();
+            let mut corrupt = clean;
+            let offset = if replacement == b'y' {
+                1
+            } else {
+                needle.len() - 1
+            };
+            corrupt[start + offset] = replacement;
+            assert_eq!(deserialize_row(&corrupt, &types), None);
+            assert_eq!(deserialize_row_projected(&corrupt, &types, &[1]), None);
+        }
+    }
+
+    #[test]
+    fn x09_array_numeric_restoration_retains_exact_stored_scale() {
+        let types = vec![DataType::Array(Box::new(DataType::Numeric))];
+        let clean = serialize_row(
+            &vec![Value::Array(vec![
+                Value::Numeric("1.00".into()),
+                Value::Null,
+            ])],
+            &types,
+        );
+        let restored = deserialize_row(&clean, &types).unwrap();
+        assert_eq!(restored[0].to_string(), "{1.00,NULL}");
+        assert_eq!(serialize_row(&restored, &types), clean);
+        assert_eq!(
+            deserialize_row_projected(&clean, &types, &[0]),
+            Some(restored)
+        );
     }
 }
