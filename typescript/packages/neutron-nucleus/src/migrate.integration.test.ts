@@ -205,13 +205,24 @@ describe("Integration: migration protocol v2 (live engine)", { skip: !live() && 
       if (sql.startsWith('INSERT INTO _neutron_migration_lock') && count === 0) entered();
       return count;
     };
-    const running = migrate(t, supplied);
+    const controller = new AbortController();
+    const running = migrate(t, supplied, { signal: controller.signal });
+    let queueTimer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await queued;
+      await Promise.race([
+        queued,
+        running.then(() => { throw new Error('migration completed before observing the held claim'); }),
+        new Promise<never>((_, reject) => {
+          queueTimer = setTimeout(() => reject(new Error('migration did not observe the held claim within 10 seconds')), 10_000);
+        }),
+      ]);
+      clearTimeout(queueTimer);
       Object.assign(supplied[0], { version: 99, name: 'changed', up: 'CREATE TABLE ts_b (id INT)', down: 'SELECT 999' });
       await execute('DELETE FROM _neutron_migration_lock WHERE id = 1 AND token = 123');
       assert.deepEqual(await running, ['first']);
     } finally {
+      clearTimeout(queueTimer);
+      controller.abort();
       t.execute = execute;
       await execute('DELETE FROM _neutron_migration_lock WHERE id = 1 AND token = 123');
       await running.catch(() => {});
