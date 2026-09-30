@@ -462,11 +462,16 @@ so engine sessions see them:
 - **N2, N4-N13** — non-transactional DDL, catalog fidelity, lock/cancel
   surface, array wire codec, `UPDATE ... FROM`/`DELETE ... USING`,
   `jsonb_agg`, isolation and `READ ONLY`, value-shape divergences,
-  derived-table column lists. **N5 and N6 are FIXED (X10):** stored generated
+  derived-table column lists. **N5 and N6 have source changes in X10;
+  final integrated regression/live verification remains pending:** stored generated
   and identity columns (428C9, `OVERRIDING`), deferrable foreign keys with
   `SET CONSTRAINTS` (DEFERRABLE on PRIMARY KEY / UNIQUE stays refused), and
   from N12 `INSERT ... DEFAULT VALUES` and `varchar(n)` / `char(n)` overflow
-  (22001).
+  (22001). Generated expressions admit only a bounded scalar/row subset;
+  UDFs, unknown/stateful/qualified functions, casts and subqueries are refused
+  (details in `nucleus/docs/SQL_SEMANTICS.md`; 42P17 parity is not claimed).
+  Remaining column-integrity regressions cover identity-sequence dump restore,
+  default evaluation failures/overflow and cascaded update failure atomicity.
 - **N14** — columnar `SUM`/`MIN`/`MAX` over values bound without a type
   answer 0/NULL instead of an error. **N15, N16** — stale columnar prose in
   `nucleus/docs/MODEL_SEMANTICS.md` (durability and in-transaction insert).

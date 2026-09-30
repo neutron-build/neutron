@@ -466,8 +466,9 @@ back to the session zone only when no offset is present.
   `ddl.uncommitted_ddl_invisible`, `ddl.create_index_concurrently_in_tx_rejected`.
 - **N4 — catalog fidelity.** See blocker 1; every `catalog.*` probe except
   `catalog.pg_get_indexdef` and `catalog.current_schema_and_search_path`.
-- **N5 — generated/identity columns.** FIXED in X10 (engine change; the
-  recorded verdicts above predate it and are re-recorded by the orchestrator).
+- **N5 — generated/identity columns.** Source changes implemented in X10;
+  final integrated regression/live verification is pending. The recorded
+  verdicts above predate these changes and must be re-recorded.
   `GENERATED ALWAYS AS (expr) STORED` is computed on INSERT and on every
   UPDATE (`executor/column_writes.rs`); an explicit value into a generated
   column, or into a `GENERATED ALWAYS AS IDENTITY` column without
@@ -476,13 +477,17 @@ back to the session zone only when no offset is present.
   the catalog (`ColumnDef.generation`, persisted, dumped and restored) and
   reported by `information_schema.columns` and `pg_attribute`
   (`attgenerated`, `attidentity`). Limits: a generation expression may not
-  read another generated column or call a volatile function (42P17, as in
-  PostgreSQL); `ADD COLUMN ... GENERATED AS IDENTITY` and
+  read another generated column. Only a bounded set of verified scalar
+  builtins and row expressions is admitted (see `nucleus/docs/SQL_SEMANTICS.md`);
+  UDFs, unknown/stateful/qualified functions, casts, subqueries and windows are
+  refused. Validation does not promise PostgreSQL 42P17 SQLSTATE parity.
+  `ADD COLUMN ... GENERATED AS IDENTITY` and
   `ALTER COLUMN ... ADD GENERATED` are refused; `VIRTUAL` generated columns
   do not exist in PostgreSQL 17 either. Probes `dml.generated_stored_column`,
   `dml.identity_column`. Regressions:
   `nucleus/src/executor/tests/test_column_writes.rs`.
-- **N6 — deferrable constraints.** FIXED for foreign keys in X10:
+- **N6 — deferrable constraints.** Foreign-key source changes implemented
+  in X10; final integrated regression/live verification is pending:
   `DEFERRABLE [INITIALLY DEFERRED | IMMEDIATE]` is stored on the constraint
   and, inside an explicit transaction, a deferred foreign key is checked at
   COMMIT (a violation fails the COMMIT with 23503 and rolls the transaction

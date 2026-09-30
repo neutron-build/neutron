@@ -161,6 +161,22 @@ PRIMARY KEY enforcement is not supported.
 Foreign-key CASCADE, SET NULL and SET DEFAULT updates recompute stored generated
 columns and validate their resulting constraints before writing child rows.
 
+Stored generation expressions use a bounded row-expression language: arithmetic,
+comparisons, NULL tests, CASE, substring/trim, and the scalar builtins ABS,
+LOWER/UPPER, LENGTH/CHAR_LENGTH/CHARACTER_LENGTH, OCTET_LENGTH/BIT_LENGTH,
+TRIM/LTRIM/RTRIM, REPLACE, CONCAT/CONCAT_WS, COALESCE/NULLIF, GREATEST/LEAST,
+ROUND/CEIL/CEILING/FLOOR. UDFs, qualified function names, unknown or stateful
+functions, subqueries, windows, casts and other unverified expression forms are
+refused. This is a conservative subset; it does not implement PostgreSQL's
+function-volatility catalog. Refusal SQLSTATEs depend on the validation error;
+42P17 parity is not promised.
+
+Column default parse/evaluation errors propagate instead of becoming NULL;
+int8-to-int4 defaults reject overflow. Logical identity dumps retain the owned
+sequence's definition and current position. Final integrated regression and
+live verification of these column changes is pending; this source assessment
+is not an end-to-end compatibility certification.
+
 ### Query behavior and explicit limits
 
 JSONB_AGG retains SQL NULL inputs as JSON null, returns SQL NULL for an empty
