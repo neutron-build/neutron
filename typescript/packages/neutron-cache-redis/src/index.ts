@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   deserializeTransportData,
   serializeTransportData,
@@ -15,6 +16,8 @@ export interface RedisNeutronCacheOptions {
 }
 
 export interface RedisLikeClient {
+  /** Required: generation checks and mutations execute in one Redis script. */
+  eval(script: string, numberOfKeys: number, ...args: Array<string | number>): Promise<unknown>;
   get(key: string): Promise<string | null>;
   set(key: string, value: string, mode?: "EX", ttlSec?: number): Promise<unknown>;
   del(...keys: string[]): Promise<unknown>;
@@ -26,19 +29,9 @@ export interface RedisLikeClient {
     cursor: string,
     ...args: Array<string | number>
   ): Promise<[nextCursor: string, keys: string[]]>;
-  /**
-   * Remaining TTL in seconds, -1 for a key with no expiry, -2 for a
-   * missing key. Used to keep the pathname index alive at least as long as
-   * its longest-lived member (audit neutron-14). Optional: without it the
-   * index TTL is reset to the standard floor on every write.
-   */
+  /** Optional inspection helper. Cache index TTL changes run inside EVAL. */
   ttl?(key: string): Promise<number>;
-  /**
-   * Atomically renames a key. Used to claim the pathname index during
-   * invalidation so a concurrent writer cannot lose its index membership
-   * (audit neutron-15). Optional: without it invalidation falls back to
-   * the non-atomic SMEMBERS/DEL sequence.
-   */
+  /** Optional legacy client helper; invalidation now runs entirely in EVAL. */
   rename?(source: string, destination: string): Promise<unknown>;
   quit(): Promise<unknown>;
 }
@@ -53,6 +46,7 @@ export function createRedisNeutronCacheStoresFromClient(
   client: RedisLikeClient,
   options: Pick<RedisNeutronCacheOptions, "keyPrefix"> = {}
 ): RedisNeutronCacheStores {
+  if (typeof client.eval !== "function") throw new TypeError("Redis cache clients require atomic EVAL support");
   const keyPrefix = options.keyPrefix || "neutron:";
   const app = createAppCacheStore(client, keyPrefix);
   const loader = createLoaderCacheStore(client, keyPrefix);
@@ -94,247 +88,99 @@ export async function createRedisNeutronCacheStores(
   return createRedisNeutronCacheStoresFromClient(client, { keyPrefix });
 }
 
-function createAppCacheStore(
-  client: RedisLikeClient,
-  keyPrefix: string
-): NeutronAppCacheStore {
+// Opaque epochs prevent old tokens becoming valid after control-key eviction.
+const INITIALIZE = `
+local generation = redis.call('HGET', KEYS[1], 'generation')
+local epoch = redis.call('HGET', KEYS[1], 'epoch')
+if not generation or not epoch then
+  generation = ARGV[1]
+  epoch = ARGV[1]
+  redis.call('HSET', KEYS[1], 'generation', generation, 'epoch', epoch)
+end
+`;
+const GENERATION = INITIALIZE + `return generation`;
+const READ = INITIALIZE + `
+local raw = redis.call('GET', KEYS[2])
+if not raw then return false end
+local ok, entry = pcall(cjson.decode, raw)
+if not ok or type(entry) ~= 'table' or entry.neutronCacheV ~= 1 or entry.epoch ~= epoch then return false end
+return entry.payload
+`;
+const PUBLISH = INITIALIZE + `
+if ARGV[2] ~= '' and ARGV[2] ~= generation then return 0 end
+local ttl = tonumber(ARGV[4])
+if ttl <= 0 then return 0 end
+redis.call('SET', KEYS[2], cjson.encode({neutronCacheV=1, epoch=epoch, payload=ARGV[3]}), 'EX', ttl)
+redis.call('SADD', KEYS[3], KEYS[2])
+local desired = math.max(ttl, 60)
+if redis.call('TTL', KEYS[3]) < desired then redis.call('EXPIRE', KEYS[3], desired) end
+return 1
+`;
+const INVALIDATE = INITIALIZE + `
+redis.call('HSET', KEYS[1], 'generation', ARGV[2])
+for _, key in ipairs(redis.call('SMEMBERS', KEYS[2])) do redis.call('DEL', key) end
+redis.call('DEL', KEYS[2])
+return 1
+`;
+const CLEAR = INITIALIZE + `
+redis.call('HSET', KEYS[1], 'generation', ARGV[2], 'epoch', ARGV[2])
+return 1
+`;
+
+function createStore<T extends { expiresAt: number }>(
+  client: RedisLikeClient, prefix: string, kind: "app" | "ldr", pathFromKey: (key: string) => string
+) {
+  const controlKey = `${prefix}control:${kind}`;
+  const entryKey = (key: string) => `${prefix}${kind}:${key}`;
+  const indexKey = (pathname: string) => `${prefix}idx:${kind}:${pathname}`;
+  async function publish(key: string, entry: T, expected: string): Promise<boolean> {
+    return Number(await client.eval(PUBLISH, 3, controlKey, entryKey(key), indexKey(pathFromKey(key)),
+      randomUUID(), expected, serializeTransportData(entry), ttlFromExpiresAt(entry.expiresAt))) === 1;
+  }
   return {
-    async get(key) {
-      const raw = await client.get(appEntryKey(keyPrefix, key));
-      if (!raw) {
-        return null;
-      }
-
-      const entry = deserializeTransportData<NeutronAppResponseCacheEntry>(raw);
-      if (entry.expiresAt <= Date.now()) {
-        await client.del(appEntryKey(keyPrefix, key));
-        return null;
-      }
-      // Entries written by core <= 0.2.2 carry a string body; entries outlive
-      // an upgrade in Redis, so read them as the UTF-8 bytes they encoded.
-      const stored: unknown = entry.body;
-      if (typeof stored === "string") {
-        return { ...entry, body: new TextEncoder().encode(stored) };
-      }
-      return entry;
+    async get(key: string): Promise<T | null> {
+      const raw = await client.eval(READ, 2, controlKey, entryKey(key), randomUUID());
+      if (typeof raw !== "string") return null;
+      const entry = deserializeTransportData<T>(raw);
+      // A newer writer may replace an expired read; never delete it here.
+      return entry.expiresAt > Date.now() ? entry : null;
     },
-    async set(key, entry) {
-      const ttlSec = ttlFromExpiresAt(entry.expiresAt);
-      if (ttlSec <= 0) {
-        await client.del(appEntryKey(keyPrefix, key));
-        return;
-      }
-
-      const entryKey = appEntryKey(keyPrefix, key);
-      const pathname = extractAppPathFromKey(key);
-      const indexKey = appPathIndexKey(keyPrefix, pathname);
-      const payload = serializeTransportData(entry);
-      await client.set(entryKey, payload, "EX", ttlSec);
-      await client.sadd(indexKey, entryKey);
-      await extendIndexTtl(client, indexKey, Math.max(ttlSec, 60));
+    async getGeneration(): Promise<string> {
+      return String(await client.eval(GENERATION, 1, controlKey, randomUUID()));
     },
-    async deleteByPath(pathname) {
-      await deleteIndexedPathKeys(client, appPathIndexKey(keyPrefix, pathname));
+    async setIfGeneration(key: string, entry: T, expected: string): Promise<boolean> {
+      if (!expected) return false;
+      return publish(key, entry, expected);
     },
-    async clear() {
-      await clearByPatterns(client, [
-        `${keyPrefix}app:*`,
-        `${keyPrefix}idx:app:*`,
-      ]);
+    async set(key: string, entry: T): Promise<void> { await publish(key, entry, ""); },
+    async deleteByPath(pathname: string): Promise<void> {
+      const normalized = normalizePathname(pathname);
+      if (!normalized) return;
+      await client.eval(INVALIDATE, 2, controlKey, indexKey(normalized), randomUUID(), randomUUID());
+    },
+    async clear(): Promise<void> {
+      // Logical O(1) clear: old payloads/indexes expire through their TTLs.
+      // No scan/delete can race a fill admitted into the new epoch.
+      await client.eval(CLEAR, 1, controlKey, randomUUID(), randomUUID());
     },
   };
 }
-
-function createLoaderCacheStore(
-  client: RedisLikeClient,
-  keyPrefix: string
-): NeutronLoaderCacheStore {
-  return {
-    async get(key) {
-      const raw = await client.get(loaderEntryKey(keyPrefix, key));
-      if (!raw) {
-        return null;
-      }
-
-      const entry = deserializeTransportData<NeutronLoaderDataCacheEntry>(raw);
-      if (entry.expiresAt <= Date.now()) {
-        await client.del(loaderEntryKey(keyPrefix, key));
-        return null;
-      }
-      return entry;
-    },
-    async set(key, entry) {
-      const ttlSec = ttlFromExpiresAt(entry.expiresAt);
-      if (ttlSec <= 0) {
-        await client.del(loaderEntryKey(keyPrefix, key));
-        return;
-      }
-
-      const entryKey = loaderEntryKey(keyPrefix, key);
-      const pathname = extractLoaderPathFromKey(key);
-      const indexKey = loaderPathIndexKey(keyPrefix, pathname);
-      const payload = serializeTransportData(entry);
-      await client.set(entryKey, payload, "EX", ttlSec);
-      await client.sadd(indexKey, entryKey);
-      await extendIndexTtl(client, indexKey, Math.max(ttlSec, 60));
-    },
-    async deleteByPath(pathname) {
-      await deleteIndexedPathKeys(client, loaderPathIndexKey(keyPrefix, pathname));
-    },
-    async clear() {
-      await clearByPatterns(client, [
-        `${keyPrefix}ldr:*`,
-        `${keyPrefix}idx:ldr:*`,
-      ]);
-    },
-  };
+function createAppCacheStore(client: RedisLikeClient, prefix: string): NeutronAppCacheStore {
+  const store = createStore<NeutronAppResponseCacheEntry>(client, prefix, "app", extractAppPathFromKey);
+  return { ...store, async get(key) {
+    const entry = await store.get(key);
+    if (!entry) return null;
+    const stored: unknown = entry.body;
+    return typeof stored === "string" ? { ...entry, body: new TextEncoder().encode(stored) } : entry;
+  } };
 }
-
-/**
- * Keeps the pathname index alive at least until the latest member expiry.
- *
- * EXPIRE always sets an absolute TTL, so a short-lived variant written
- * after a long-lived one used to shorten the shared index below the
- * long-lived entry's remaining life — after which deleteByPath could no
- * longer discover it (audit neutron-14). With a ttl() available the index
- * TTL is only ever extended, never shortened; -1 (no expiry) and -2
- * (missing) both compare below any positive desired value, so those states
- * also (re)arm expiry.
- */
-async function extendIndexTtl(
-  client: RedisLikeClient,
-  indexKey: string,
-  desiredSec: number
-): Promise<void> {
-  if (typeof client.ttl !== "function") {
-    await client.expire(indexKey, desiredSec);
-    return;
-  }
-  const currentSec = await client.ttl(indexKey);
-  if (currentSec < desiredSec) {
-    await client.expire(indexKey, desiredSec);
-  }
-}
-
-let invalidationCounter = 0;
-
-/**
- * Deletes every entry indexed under a pathname, then the index itself.
- *
- * When the client supports RENAME, the index is atomically claimed first:
- * writers that SADD after the rename repopulate a fresh index, so no live
- * entry can permanently lose its index membership while an invalidation is
- * in flight (audit neutron-15). Without RENAME the old SMEMBERS/DEL
- * sequence is used and a writer racing the final index deletion can be
- * orphaned until its own TTL.
- */
-async function deleteIndexedPathKeys(
-  client: RedisLikeClient,
-  indexKey: string
-): Promise<void> {
-  if (typeof client.rename !== "function") {
-    const members = await client.smembers(indexKey);
-    if (members.length > 0) {
-      await client.del(...members);
-    }
-    await client.del(indexKey);
-    return;
-  }
-
-  const claimedKey = `${indexKey}:invalidated:${Date.now().toString(36)}:${invalidationCounter++}`;
-  try {
-    await client.rename(indexKey, claimedKey);
-  } catch (error) {
-    // RENAME fails with "no such key" when nothing is indexed under the
-    // path — there is nothing to delete. Any other failure is real and
-    // must surface.
-    if (!String(error).includes("no such key")) {
-      throw error;
-    }
-    return;
-  }
-
-  // Everything SADDed before the rename is in the claimed set; writers
-  // after it are in the fresh index and stay invalidatable.
-  const members = await client.smembers(claimedKey);
-  if (members.length > 0) {
-    await client.del(...members, claimedKey);
-  } else {
-    await client.del(claimedKey);
-  }
-}
-
-async function clearByPatterns(
-  client: RedisLikeClient,
-  patterns: string[]
-): Promise<void> {
-  for (const pattern of patterns) {
-    if (typeof client.scan === "function") {
-      await clearByScan(client, pattern);
-      continue;
-    }
-
-    const keys = await client.keys(pattern);
-    await deleteKeysInChunks(client, keys);
-  }
-}
-
-async function clearByScan(
-  client: RedisLikeClient,
-  pattern: string
-): Promise<void> {
-  if (!client.scan) {
-    return;
-  }
-
-  let cursor = "0";
-  do {
-    const [nextCursor, keys] = await client.scan(
-      cursor,
-      "MATCH",
-      pattern,
-      "COUNT",
-      500
-    );
-    await deleteKeysInChunks(client, keys);
-    cursor = nextCursor;
-  } while (cursor !== "0");
-}
-
-async function deleteKeysInChunks(
-  client: RedisLikeClient,
-  keys: string[]
-): Promise<void> {
-  if (keys.length === 0) {
-    return;
-  }
-
-  const chunkSize = 500;
-  for (let index = 0; index < keys.length; index += chunkSize) {
-    const chunk = keys.slice(index, index + chunkSize);
-    if (chunk.length > 0) {
-      await client.del(...chunk);
-    }
-  }
-}
-
-function appEntryKey(prefix: string, key: string): string {
-  return `${prefix}app:${key}`;
-}
-
-function loaderEntryKey(prefix: string, key: string): string {
-  return `${prefix}ldr:${key}`;
-}
-
-function appPathIndexKey(prefix: string, pathname: string): string {
-  return `${prefix}idx:app:${normalizePathname(pathname)}`;
-}
-
-function loaderPathIndexKey(prefix: string, pathname: string): string {
-  return `${prefix}idx:ldr:${normalizePathname(pathname)}`;
+function createLoaderCacheStore(client: RedisLikeClient, prefix: string): NeutronLoaderCacheStore {
+  return createStore<NeutronLoaderDataCacheEntry>(client, prefix, "ldr", extractLoaderPathFromKey);
 }
 
 function extractAppPathFromKey(cacheKey: string): string {
+  const fields = cacheKey.split("\n");
+  if (fields.length >= 3) return fields[2];
   const separator = cacheKey.indexOf(":");
   if (separator === -1) {
     return "/";
@@ -343,31 +189,31 @@ function extractAppPathFromKey(cacheKey: string): string {
   const routePart = cacheKey.slice(separator + 1);
   const querySeparator = routePart.indexOf("?");
   if (querySeparator === -1) {
-    return normalizePathname(routePart);
+    return normalizePathname(routePart) ?? "/";
   }
-  return normalizePathname(routePart.slice(0, querySeparator));
+  return normalizePathname(routePart.slice(0, querySeparator)) ?? "/";
 }
 
 function extractLoaderPathFromKey(cacheKey: string): string {
   const separator = cacheKey.indexOf("::");
   if (separator === -1) {
-    return normalizePathname(cacheKey);
+    return normalizePathname(cacheKey) ?? "/";
   }
-  return normalizePathname(cacheKey.slice(0, separator));
+  return normalizePathname(cacheKey.slice(0, separator)) ?? "/";
 }
 
-function normalizePathname(pathname: string): string {
+function normalizePathname(pathname: string): string | null {
   try {
     const decoded = decodeURIComponent(pathname || "/");
-    if (!decoded.startsWith("/") || decoded.includes("..")) {
-      return "/";
+    if (!decoded.startsWith("/") || decoded.split("/").includes("..")) {
+      return null;
     }
     if (decoded.length > 1 && decoded.endsWith("/")) {
       return decoded.slice(0, -1);
     }
     return decoded;
   } catch {
-    return "/";
+    return null;
   }
 }
 
