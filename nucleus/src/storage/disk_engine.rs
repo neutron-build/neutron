@@ -8392,7 +8392,7 @@ mod tests {
         let engine = Arc::new(engine);
         let storage: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(engine.clone()));
         let executor = Arc::new(Executor::new(catalog, storage));
-        rt.block_on(executor.execute("CREATE TABLE posting_race (id BIGINT PRIMARY KEY, val INT, code TEXT); CREATE INDEX posting_val ON posting_race (val); CREATE INDEX posting_code ON posting_race USING encrypted (code); INSERT INTO posting_race VALUES (1, 37, 'one')")).unwrap();
+        rt.block_on(executor.execute("CREATE TABLE posting_race (id BIGINT PRIMARY KEY, val INT, code TEXT, v VECTOR(4)); CREATE INDEX posting_val ON posting_race (val); INSERT INTO posting_race VALUES (1, 37, 'one', VECTOR('[1,0,0,0]')); CREATE INDEX posting_vector ON posting_race USING IVFFLAT (v)")).unwrap();
         let (event_tx, event_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
         let pause_tx = event_tx.clone();
@@ -8416,8 +8416,22 @@ mod tests {
                     sid,
                     "UPDATE posting_race SET code = 'changed' WHERE id = 1",
                 ))
-                .map(|_| ())
-                .map_err(|error| error.to_string());
+                .map_err(|error| error.to_string())
+                .and_then(|results| {
+                    if results.iter().any(|result| {
+                        matches!(
+                            result,
+                            crate::executor::ExecResult::Command {
+                                rows_affected: 1,
+                                ..
+                            }
+                        )
+                    }) {
+                        Ok(())
+                    } else {
+                        Err("UPDATE did not affect exactly one row".into())
+                    }
+                });
             writer.drop_session(sid);
             event_tx.send(Event::Done(result)).unwrap();
         });
@@ -8427,9 +8441,10 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("UPDATE neither paused nor completed");
         let sid = executor.create_session();
-        rt.block_on(
-            executor.execute_with_session(sid, "INSERT INTO posting_race VALUES (2, 37, 'two')"),
-        )
+        rt.block_on(executor.execute_with_session(
+            sid,
+            "INSERT INTO posting_race VALUES (2, 37, 'two', VECTOR('[0,1,0,0]'))",
+        ))
         .unwrap();
         executor.drop_session(sid);
         match first {
@@ -8446,6 +8461,17 @@ mod tests {
             Event::Done(result) => result.unwrap(),
         }
         worker.join().unwrap();
+        let mutation = rt
+            .block_on(executor.execute("SELECT code FROM posting_race WHERE id + 0 = 1"))
+            .unwrap();
+        let crate::executor::ExecResult::Select { rows, .. } = &mutation[0] else {
+            panic!("expected SELECT");
+        };
+        assert_eq!(
+            rows,
+            &vec![vec![Value::Text("changed".into())]],
+            "UPDATE must change the heap before publication is tested"
+        );
         for predicate in ["val = 37", "val >= 37 AND val <= 37", "val + 0 = 37"] {
             let sql = format!("SELECT id FROM posting_race WHERE {predicate} ORDER BY id");
             let results = rt.block_on(executor.execute(&sql)).unwrap();
@@ -8459,6 +8485,80 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn structural_ddl_commit_preserves_physical_index_answers() {
+        use crate::executor::{ExecResult, Executor};
+        use crate::storage::buffered_engine::BufferedDiskEngine;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = rt.block_on(setup_engine(tmp.path()));
+        let engine = Arc::new(engine);
+        let storage: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(engine));
+        let executor = Executor::new(catalog, storage);
+        rt.block_on(executor.execute("CREATE TABLE structural_index (id BIGINT PRIMARY KEY, val INT); CREATE INDEX structural_val ON structural_index (val); INSERT INTO structural_index VALUES (1, 11)")).unwrap();
+        rt.block_on(executor.execute("BEGIN; TRUNCATE structural_index; INSERT INTO structural_index VALUES (2,37),(3,37); COMMIT")).unwrap();
+        let expected = vec![vec![Value::Int64(2)], vec![Value::Int64(3)]];
+        for predicate in ["val = 37", "val + 0 = 37"] {
+            let results = rt
+                .block_on(executor.execute(&format!(
+                    "SELECT id FROM structural_index WHERE {predicate} ORDER BY id"
+                )))
+                .unwrap();
+            let ExecResult::Select { rows, .. } = &results[0] else {
+                panic!("expected SELECT");
+            };
+            assert_eq!(
+                rows, &expected,
+                "TRUNCATE commit must restore index structures"
+            );
+        }
+        rt.block_on(
+            executor
+                .execute("BEGIN; ALTER TABLE structural_index ADD COLUMN n INT DEFAULT 7; COMMIT"),
+        )
+        .unwrap();
+        for predicate in ["val = 37", "val + 0 = 37"] {
+            let results = rt
+                .block_on(executor.execute(&format!(
+                    "SELECT id, n FROM structural_index WHERE {predicate} ORDER BY id"
+                )))
+                .unwrap();
+            let ExecResult::Select { rows, .. } = &results[0] else {
+                panic!("expected SELECT");
+            };
+            assert_eq!(
+                rows,
+                &vec![
+                    vec![Value::Int64(2), Value::Int32(7)],
+                    vec![Value::Int64(3), Value::Int32(7)]
+                ],
+                "ADD COLUMN commit must retain postings and backfilled defaults"
+            );
+        }
+        rt.block_on(
+            executor.execute(
+                "BEGIN; ALTER TABLE structural_index RENAME COLUMN val TO new_val; COMMIT",
+            ),
+        )
+        .unwrap();
+        rt.block_on(executor.execute("BEGIN; UPDATE structural_index SET new_val=38 WHERE id=2; INSERT INTO structural_index VALUES (4,37,9); ROLLBACK")).unwrap();
+        for predicate in ["new_val = 37", "new_val + 0 = 37"] {
+            let results = rt
+                .block_on(executor.execute(&format!(
+                    "SELECT id FROM structural_index WHERE {predicate} ORDER BY id"
+                )))
+                .unwrap();
+            let ExecResult::Select { rows, .. } = &results[0] else {
+                panic!("expected SELECT");
+            };
+            assert_eq!(
+                rows, &expected,
+                "renamed column and rollback must preserve index answers"
+            );
+        }
+    }
+
     /// Dense secondary keys must remain complete after different rows on the
     /// same heap pages are updated, deleted, and reinserted concurrently.
     /// The heap is the oracle; compare identities rather than just counts.
