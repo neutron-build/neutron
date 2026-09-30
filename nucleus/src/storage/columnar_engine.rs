@@ -2722,4 +2722,40 @@ mod failed_mutation_regressions {
             vec![vec![Value::Int64(2)], vec![Value::Int64(4)]]
         );
     }
+    #[tokio::test]
+    async fn columnar_append_flush_failure_fences_uncertain_write_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = ColumnarStorageEngine::open(dir.path()).unwrap();
+        engine.create_table("t").await.unwrap();
+        engine.insert("t", vec![Value::Int64(1)]).await.unwrap();
+        engine.flush_all_dirty().await.unwrap();
+        engine.wal.as_ref().unwrap().fail_next_flush();
+        assert!(matches!(
+            engine.insert_batch("t", vec![vec![Value::Int64(2)]]).await,
+            Err(StorageError::Io(_))
+        ));
+        assert!(engine.durability_pending());
+        assert!(matches!(engine.scan("t").await, Err(StorageError::Io(_))));
+        assert!(matches!(
+            engine.insert("t", vec![Value::Int64(3)]).await,
+            Err(StorageError::Io(_))
+        ));
+        assert!(matches!(
+            engine.make_durable().await,
+            Err(StorageError::Io(_))
+        ));
+        assert!(engine.wal.as_ref().unwrap().group_sync().is_err());
+        drop(engine);
+        // The fully encoded frame may reach disk despite the error (including
+        // BufWriter's final flush). Recovery resolves this uncertain outcome;
+        // the failed operation was never reported successful and later id3
+        // was never allowed to append beyond it.
+        let reopened = ColumnarStorageEngine::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.scan("t").await.unwrap(),
+            vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        );
+        reopened.insert("t", vec![Value::Int64(4)]).await.unwrap();
+        assert_eq!(reopened.scan("t").await.unwrap().len(), 3);
+    }
 }

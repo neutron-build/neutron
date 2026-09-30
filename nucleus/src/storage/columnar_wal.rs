@@ -141,6 +141,8 @@ pub struct ColumnarWal {
     fail_append_once: AtomicBool,
     #[cfg(test)]
     fail_checkpoint_once: AtomicBool,
+    #[cfg(test)]
+    fail_flush_once: AtomicBool,
 }
 
 impl ColumnarWal {
@@ -195,6 +197,8 @@ impl ColumnarWal {
                 fail_append_once: AtomicBool::new(false),
                 #[cfg(test)]
                 fail_checkpoint_once: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_flush_once: AtomicBool::new(false),
             },
             state,
         ))
@@ -209,7 +213,8 @@ impl ColumnarWal {
 
     /// Whether appends exist that no completed fsync covers yet.
     pub fn is_dirty(&self) -> bool {
-        self.synced.load(Ordering::Acquire) < self.appends.load(Ordering::Acquire)
+        self.has_write_failure()
+            || self.synced.load(Ordering::Acquire) < self.appends.load(Ordering::Acquire)
     }
 
     /// Fsync the log and record the append mark the sync covered.
@@ -412,6 +417,11 @@ impl ColumnarWal {
     }
 
     #[cfg(test)]
+    pub(crate) fn fail_next_flush(&self) {
+        self.fail_flush_once.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
     pub(crate) fn fail_next_reopen(&self) {
         self.fail_reopen_once.store(true, Ordering::Release);
     }
@@ -445,7 +455,15 @@ impl ColumnarWal {
         }
         self.reattach_if_stranded(&mut w)?;
         if let Err(error) =
-            write_entry(&mut *w, plain, xact_tagged, xact, name, payload).and_then(|_| w.flush())
+            write_entry(&mut *w, plain, xact_tagged, xact, name, payload).and_then(|_| {
+                #[cfg(test)]
+                if self.fail_flush_once.swap(false, Ordering::AcqRel) {
+                    return Err(io::Error::other(
+                        "injected columnar WAL flush failure after encoding",
+                    ));
+                }
+                w.flush()
+            })
         {
             self.write_failed.store(true, Ordering::Release);
             return Err(error);
