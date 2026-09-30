@@ -115,7 +115,7 @@ The SQL-callable **model functions** (the multi-model surface) by family:
 | `GEO_*`, `ST_*` | `GEO_DISTANCE`, `GEO_WITHIN`, `GEO_AREA`, `ST_DISTANCE`, `ST_CONTAINS`, `ST_MAKEPOINT` | Geo (computational only — nothing persists) |
 | `VERSION_*`, `DB_BRANCH_*` | `VERSION_COMMIT`, `VERSION_BRANCH`, `DB_BRANCH_CREATE`, `DB_BRANCH_MERGE`, `DB_BRANCH_DIFF` | Versioning / branching |
 | `PROC_*` | `PROC_REGISTER`, `PROC_LIST`, `PROC_DROP` | Stored procedures |
-| `ENCRYPTED_LOOKUP` | | Encrypted index |
+| `ENCRYPTED_LOOKUP` | | Unavailable: refuses with SQLSTATE `0A000`; legacy encrypted modes are retired |
 | `RETENTION_*` | `RETENTION_SET`, `RETENTION_CHECK` | Registers a policy **nothing enforces** (see deviations) |
 | `PREDICT`, `EMBED`, `CLASSIFY` | | Registered-model inference |
 | `PII_DETECT`, `GDPR_DELETE_PLAN` | | Compliance helpers |

@@ -512,3 +512,29 @@ process sharing requires `scope: "shared"`. Entry ceilings and complete tag/time
 cleanup bound retention. `request-cache-security.test.ts` checks sequential and
 concurrent authenticated requests over HTTP, including within-request
 single-flight behavior; `cache.test.ts` covers identity, limits and cleanup.
+
+## Durable override failures and retired crypto modes (2026-09-30)
+
+Declared disk-backed columnar and LSM engines now propagate open failures rather
+than silently selecting memory storage. CREATE opens its intended storage before
+publishing catalog metadata; startup refuses failed override recovery. A real
+filesystem obstruction regression verifies refusal and original-row recovery.
+
+Columnar append and checkpoint failures propagate to callers. Operations refused
+before WAL publication leave live state unchanged. An I/O failure after encoded
+bytes were written can have an uncertain outcome; the engine fences further
+reads, writes and durability acknowledgements until reopen. Fault tests distinguish
+these outcomes rather than claiming arbitrary-I/O failure atomicity or power-loss
+proof.
+
+Detached specialty publication uses writer generations, and readers decline
+stale or in-flight images. The FTS regression reproduces a completed concurrent
+INSERT missing from indexed results before the fix; generation checks preserve
+its authoritative result afterwards. Zone-map and cross-session transaction
+visibility tests are additional invariants, not separate demonstrated before
+failures.
+
+The encrypted-index prototype exposed plaintext under a chosen-zeroes query.
+Public construction and SQL admissions now refuse all legacy encrypted modes;
+recovery preserves base rows without rebuilding insecure sidecars. No secure
+replacement cryptographic format is implemented or advertised.
