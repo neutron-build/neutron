@@ -116,15 +116,6 @@ impl DerivedCoherence {
             state: self.state.lock(),
         }
     }
-
-    pub fn current(&self, kind: &str, table: &str) -> bool {
-        let state = self.state.lock();
-        state.writers == 0
-            && READ_GENERATION
-                .try_with(|read| *read == state.generation)
-                .unwrap_or(true)
-            && state.published.get(&format!("{kind}/{table}")) == Some(&state.generation)
-    }
 }
 
 pub(super) struct CurrentView<'a> {
