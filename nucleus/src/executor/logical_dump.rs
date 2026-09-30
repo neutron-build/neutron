@@ -734,15 +734,19 @@ impl super::Executor {
         let identity_sequences: HashSet<String> = tables
             .iter()
             .flat_map(|table| {
-                table.columns.iter().filter_map(|col| {
-                    matches!(
-                        col.generation,
-                        Some(
-                            ColumnGeneration::IdentityAlways | ColumnGeneration::IdentityByDefault
+                table
+                    .columns
+                    .iter()
+                    .filter(|col| {
+                        matches!(
+                            col.generation,
+                            Some(
+                                ColumnGeneration::IdentityAlways
+                                    | ColumnGeneration::IdentityByDefault
+                            )
                         )
-                    )
-                    .then(|| format!("{}_{}_seq", table.name, col.name))
-                })
+                    })
+                    .map(|col| format!("{}_{}_seq", table.name, col.name))
             })
             .collect();
         for (name, seq) in &sequences {
