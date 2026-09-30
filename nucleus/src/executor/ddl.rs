@@ -2394,6 +2394,33 @@ impl Executor {
             None => crate::fts::Analyzer::default(),
         };
 
+        if create_index.unique {
+            let table_def = self.get_table(&table_name).await?;
+            let indices: Vec<usize> = columns
+                .iter()
+                .filter_map(|c| table_def.column_index(c))
+                .collect();
+            if indices.len() == columns.len() {
+                let rows = self.storage_for(&table_name).scan(&table_name).await?;
+                let mut seen = HashSet::new();
+                for row in &rows {
+                    let key: Vec<Value> = indices
+                        .iter()
+                        .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                        .collect();
+                    // Repeated NULLs are distinct, as in PostgreSQL.
+                    if key.iter().any(|v| matches!(v, Value::Null)) {
+                        continue;
+                    }
+                    if !seen.insert(key) {
+                        return Err(ExecError::ConstraintViolation(format!(
+                            "could not create unique index \"{index_name}\": table \"{table_name}\" contains duplicate values"
+                        )));
+                    }
+                }
+            }
+        }
+
         // Register the index in the catalog
         let index_def = crate::catalog::IndexDef {
             name: index_name.clone(),
@@ -3964,6 +3991,13 @@ impl Executor {
                                 }
                                 _ => None,
                             });
+                    let removed_is_pk = updated.constraints.iter().any(|constraint| {
+                        matches!(
+                            constraint,
+                            crate::catalog::TableConstraint::PrimaryKey { name, .. }
+                                if name.as_deref() == Some(constraint_name.as_str())
+                        )
+                    });
                     if let Some(columns) = &removed_unique_columns {
                         let dependent = self.catalog.list_tables().await.into_iter().any(|table| {
                             table.constraints.iter().any(|constraint| {
@@ -4007,16 +4041,28 @@ impl Executor {
                         // IF EXISTS: silently succeed
                     } else {
                         self.catalog.update_table(updated).await?;
-                        // Drop any backing index that matches the constraint name.
-                        if let Err(_e) = self.catalog.drop_index(&constraint_name).await {
-                            // Index may not exist (e.g., CHECK constraints have no backing index).
+                        // Drop any backing index: the one named for the constraint,
+                        // and the implicit one `create_implicit_unique_indexes`
+                        // built (named `<table>_pkey` / `<table>_<col>_key`), which
+                        // would otherwise keep enforcing the dropped constraint.
+                        let mut backing = vec![constraint_name.clone()];
+                        if let Some(columns) = &removed_unique_columns
+                            && columns.len() == 1
+                        {
+                            let implicit = if removed_is_pk {
+                                format!("{}_pkey", table_name)
+                            } else {
+                                format!("{}_{}_key", table_name, columns[0])
+                            };
+                            backing.push(implicit);
                         }
-                        self.btree_indexes
-                            .retain(|_, name| name != &constraint_name);
-                        let _ = self
-                            .storage_for(&table_name)
-                            .drop_index(&constraint_name)
-                            .await;
+                        for index_name in backing {
+                            if let Err(_e) = self.catalog.drop_index(&index_name).await {
+                                // Index may not exist (e.g., CHECK constraints have no backing index).
+                            }
+                            self.btree_indexes.retain(|_, name| name != &index_name);
+                            let _ = self.storage_for(&table_name).drop_index(&index_name).await;
+                        }
                     }
                 }
                 _ => {
