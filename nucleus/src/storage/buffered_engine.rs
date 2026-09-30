@@ -1484,27 +1484,12 @@ impl StorageEngine for BufferedDiskEngine {
         true // We provide transaction atomicity + rollback
     }
 
-    /// Read committed, or SERIALIZABLE — with nothing in between.
-    ///
-    /// The gap is not an oversight. This engine has no versioning: reads go
-    /// straight to the inner engine's current state, so another session's
-    /// commit becomes visible mid-transaction. REPEATABLE READ and SNAPSHOT
-    /// are defined by what a stable read snapshot shows, and there is no
-    /// snapshot here to stabilise — providing them would mean putting MVCC on
-    /// disk. SERIALIZABLE is reachable without any of that, because strict 2PL
-    /// (see `storage::lock_manager`) delivers conflict-serializable schedules
-    /// from the lock discipline alone.
-    ///
-    /// So the ladder is not monotonic in implementation cost, only in strength,
-    /// and `IsolationLevel`'s ordering is what the executor compares against.
-    /// Reporting SERIALIZABLE here therefore also accepts the two levels
-    /// beneath it, which is correct rather than convenient: SERIALIZABLE is
-    /// strictly stronger than both, so running a REPEATABLE READ transaction
-    /// under 2PL gives the client more than it asked for and never less. That
-    /// is exactly what PostgreSQL's own docs permit ("a level may provide
-    /// stronger guarantees than requested").
+    /// Only READ COMMITTED is safe at the SQL boundary. Higher-level
+    /// transactions take 2PL locks, but read-committed and autocommit writers
+    /// bypass that protocol, so they can change a protected reader's data.
+    /// Refuse higher levels until every writer participates in the protocol.
     fn max_isolation_level(&self) -> crate::storage::IsolationLevel {
-        crate::storage::IsolationLevel::Serializable
+        crate::storage::IsolationLevel::ReadCommitted
     }
 
     /// Record the level for this session's next transaction.
@@ -1530,9 +1515,8 @@ impl StorageEngine for BufferedDiskEngine {
             Some(super::IsolationLevel::ReadCommitted) | None => {
                 self.pending_level.write().remove(&id);
             }
-            // Everything above read-committed is served by 2PL. See
-            // `max_isolation_level` for why serving a weaker request with a
-            // stronger mechanism is correct.
+            // Internal storage callers can exercise 2PL, but the SQL
+            // boundary refuses these levels through max_isolation_level.
             Some(_) => {
                 self.pending_level
                     .write()

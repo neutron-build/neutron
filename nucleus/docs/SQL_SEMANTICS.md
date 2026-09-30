@@ -96,3 +96,31 @@ persisted across restart — since 2026-08-23), and the executor enforces it on
 row-returning paths. See
 [`../RLS_SECURITY.md`](../RLS_SECURITY.md) for the predicate forms and
 coverage; the masking DDL surface is listed in `SQL_REFERENCE.md`.
+
+### Transaction modes and simple-query messages
+
+`BEGIN` applies READ COMMITTED by default, or the requested supported isolation
+level, to the storage engine. READ ONLY refuses DML, DDL, row locks and mutating
+scalar functions. `SET TRANSACTION` changes current modes before queries;
+`SET SESSION CHARACTERISTICS AS TRANSACTION` sets transaction-scoped session
+defaults. Engines that cannot supply the requested isolation level refuse it.
+The buffered disk engine supports READ COMMITTED only. REPEATABLE READ,
+SNAPSHOT and SERIALIZABLE are refused because other sessions' writers do not
+all participate in its locking protocol. Higher isolation levels require the
+MVCC engine. READ UNCOMMITTED currently uses and reports READ COMMITTED. Generic
+`SET transaction_isolation` and `SET transaction_read_only` are refused; use
+the dedicated `SET TRANSACTION` syntax.
+
+With the server feature, one multi-statement simple-query message has one
+implicit data transaction. An error or cancellation rolls its data back;
+COMMIT or ROLLBACK inside the message ends that block, and BEGIN converts it
+to an explicit transaction. Rollback keeps recovery images until restoration
+finishes, including cancellation during cleanup. Without the server feature,
+implicit message scoping covers settings only.
+
+DDL catalog changes remain outside data rollback. Do not use this behavior as
+an atomic-migration guarantee. PostgreSQL advisory-lock functions, `pg_sleep`
+and SQL `pg_cancel_backend` remain unavailable. Wire cancellation and row-lock
+timeouts have their existing surfaces; a deadlock timeout is not evidence of
+PostgreSQL deadlock detection. Cross-model rollback covers only the stores
+listed in MODEL_SEMANTICS.md, not every model in a message.

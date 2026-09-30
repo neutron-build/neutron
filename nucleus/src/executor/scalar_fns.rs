@@ -2236,7 +2236,9 @@ impl Executor {
                 let missing_ok = matches!(args.get(1), Some(Value::Bool(true)));
                 let key = name.to_lowercase();
                 let sess = self.current_session();
-                let user_val = sess.settings.read().get(&key).cloned();
+                let user_val = self
+                    .transaction_mode_setting(&key)
+                    .or_else(|| sess.settings.read().get(&key).cloned());
                 let value = user_val.or_else(|| {
                     Some(match key.as_str() {
                         "server_version" => "16.0 (Nucleus)".into(),

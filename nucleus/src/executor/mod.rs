@@ -158,6 +158,7 @@ mod session;
 mod snapshot_lease;
 mod spill;
 mod txn;
+mod txn_modes;
 mod types;
 mod unique_gate;
 
@@ -229,13 +230,19 @@ impl Drop for StatementDepthGuard<'_> {
     }
 }
 
-/// The implicit SET block of a multi-statement simple query (see
-/// `execute_statements_dispatch`). Owns the block only while it holds a frame
-/// it opened itself, and closes it on every exit: `close` on normal completion
-/// or statement error, `Drop` when the future is cancelled at an await point.
-/// A frame that belongs to an explicit transaction (`txn_active`) is never
-/// touched here.
-struct ImplicitSetBlock<'a> {
+/// The implicit transaction of a multi-statement simple query (see
+/// `execute_statements_dispatch`). PostgreSQL runs such a message as one
+/// transaction: the data effects and the SET state of every statement commit
+/// together at the end of the message or none do. Owns the transaction only
+/// while it opened it itself, and closes it on every exit: `close` on normal
+/// completion or statement error, `Drop` when the future is cancelled at an
+/// await point. A transaction the client opened (`txn_active` and not
+/// `implicit_txn`) is never touched here.
+///
+/// Without the `server` feature there is no per-session storage scoping to
+/// roll a cancelled message back with, so the block covers SET state only
+/// (the pre-existing behaviour).
+struct ImplicitTxnBlock<'a> {
     executor: &'a Executor,
     session: std::sync::Arc<Session>,
     storage: Arc<dyn StorageEngine>,
@@ -244,7 +251,7 @@ struct ImplicitSetBlock<'a> {
     owned: bool,
 }
 
-impl<'a> ImplicitSetBlock<'a> {
+impl<'a> ImplicitTxnBlock<'a> {
     fn new(executor: &'a Executor, session: std::sync::Arc<Session>, enabled: bool) -> Self {
         Self {
             executor,
@@ -258,41 +265,97 @@ impl<'a> ImplicitSetBlock<'a> {
 
     /// Before each statement: a message that has ended its block (COMMIT,
     /// ROLLBACK) starts a new one for the rest of the message.
-    fn open_if_needed(&mut self) {
-        if self.enabled
-            && !self.session.txn_active.load(Ordering::SeqCst)
-            && self.session.guc_begin_implicit()
+    async fn open_if_needed(&mut self) -> Result<(), ExecError> {
+        if !self.enabled || self.session.txn_active.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        #[cfg(feature = "server")]
         {
+            self.executor.begin_transaction().await?;
+            self.session.implicit_txn.store(true, Ordering::SeqCst);
             self.owned = true;
         }
+        #[cfg(not(feature = "server"))]
+        if self.session.guc_begin_implicit() {
+            self.owned = true;
+        }
+        Ok(())
     }
 
-    fn close(&mut self, commit: bool) {
+    /// Whether the block still owns an open implicit transaction (an explicit
+    /// BEGIN converts it, COMMIT and ROLLBACK end it).
+    fn holds_txn(&self) -> bool {
+        self.session.txn_active.load(Ordering::SeqCst)
+            && self.session.implicit_txn.load(Ordering::SeqCst)
+    }
+
+    async fn close(&mut self, commit: bool) -> Result<(), ExecError> {
         if !self.owned {
-            return;
+            return Ok(());
         }
-        self.owned = false;
-        if self.session.txn_active.load(Ordering::SeqCst) {
-            return;
+        #[cfg(feature = "server")]
+        {
+            if !self.holds_txn() {
+                self.owned = false;
+                return Ok(());
+            }
+            // Keep Drop armed across every await, including COMMIT itself.
+            // A cancelled close still owns the unclosed implicit block.
+            if commit && let Err(e) = self.executor.commit_transaction().await {
+                // A failed COMMIT leaves the transaction open for a retry;
+                // the message is over, so roll it back.
+                let _ = self.executor.rollback_transaction().await;
+                return Err(e);
+            }
+            if !commit {
+                self.executor.rollback_transaction().await?;
+            }
+            self.owned = false;
+            Ok(())
         }
-        if commit {
-            self.session.guc_commit();
-        } else {
-            self.session.guc_rollback();
+        #[cfg(not(feature = "server"))]
+        {
+            self.owned = false;
+            if self.session.txn_active.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            if commit {
+                self.session.guc_commit();
+            } else {
+                self.session.guc_rollback();
+            }
+            self.executor.recompute_session_context(&self.session);
+            self.executor.sync_lock_timeout(&self.session);
+            Ok(())
         }
-        self.executor.recompute_session_context(&self.session);
-        self.executor.sync_lock_timeout(&self.session);
     }
 }
 
-impl Drop for ImplicitSetBlock<'_> {
+impl Drop for ImplicitTxnBlock<'_> {
     fn drop(&mut self) {
         // Reached still owning the block only when the future was dropped
-        // mid-flight (cancellation or a panic unwinding). Roll the SET state
-        // back and recompute the security context here, synchronously, so no
-        // stale context is visible before the next dispatch; the engine-side
-        // lock_timeout is re-derived here because no statement scope exists.
-        if !self.owned || self.session.txn_active.load(Ordering::SeqCst) {
+        // mid-flight (cancellation or a panic unwinding). The transaction is
+        // rolled back here, synchronously, so no uncommitted write or stale
+        // security context is visible to the next dispatch.
+        if !self.owned {
+            return;
+        }
+        #[cfg(feature = "server")]
+        if self.holds_txn() {
+            let restore = CURRENT_SESSION.scope(
+                self.session.clone(),
+                STORAGE_SESSION_ID
+                    .scope(self.storage_session, self.executor.rollback_transaction()),
+            );
+            if let Err(e) = block_on_session_teardown(restore) {
+                tracing::error!(
+                    "cancelled multi-statement message: rolling back its implicit \
+                     transaction failed: {e}"
+                );
+            }
+            return;
+        }
+        if self.session.txn_active.load(Ordering::SeqCst) {
             return;
         }
         self.session.guc_rollback();
@@ -6964,33 +7027,38 @@ impl Executor {
         // (tests, embedded, RESP, binary wire) still materializes because the
         // producer only emits a stream when the session opted in (stream_results).
         let single = statements.len() == 1;
-        // PostgreSQL runs a multi-statement simple query in an implicit
-        // transaction block, so `SET LOCAL ROLE x; SELECT ...` in one message
-        // applies the role to the SELECT and ends with the message. Only the
-        // SET state gets that block here: the block covers SET / SET LOCAL /
-        // SET ROLE and nothing else. Statements still autocommit one by one,
-        // so the data effects of earlier statements persist when a later one
-        // fails (a known divergence from PostgreSQL, where the whole message
-        // is one transaction). The SET values of a failed message are
-        // reverted, as the aborted block's would be.
+        // PostgreSQL runs a multi-statement simple query as one implicit
+        // transaction: `insert 1; insert 2; <failing insert>` keeps no row,
+        // `SET LOCAL ROLE x; SELECT ...` applies the role to the SELECT and
+        // ends with the message, and an in-message ROLLBACK undoes the data
+        // before it. The block is a real storage transaction (the same one a
+        // client BEGIN opens), committed at the end of the message and
+        // rolled back on the first error.
         //
-        // A COMMIT or ROLLBACK in the message ends the SET block and the next
-        // statement opens a new one, as in PostgreSQL. That parity is for SET
-        // state only: an in-message ROLLBACK does not undo data (`insert 1;
-        // rollback; insert 2; select count(*)` counts 2 here, 1 on
-        // PostgreSQL). A message that opens an
-        // explicit BEGIN hands the block to that transaction. The guard closes
-        // the block if this future is dropped mid-flight (statement timeout,
+        // A COMMIT or ROLLBACK in the message ends the block and the next
+        // statement opens a new one, as in PostgreSQL. A message that opens
+        // an explicit BEGIN converts the block into that transaction, earlier
+        // statements included, and leaves it open. The guard closes the block
+        // if this future is dropped mid-flight (statement timeout,
         // CancelRequest), so nothing leaks into the next message.
+        //
+        // Not covered: DDL is not transactional (N2), so a CREATE TABLE
+        // earlier in a failed message survives; the data written after it does
+        // not. Statements PostgreSQL refuses inside a transaction block
+        // (CREATE INDEX CONCURRENTLY, VACUUM) run here as they do inside an
+        // explicit transaction.
         let session = self.current_session();
-        let mut block = ImplicitSetBlock::new(self, session.clone(), !single);
+        let mut block = ImplicitTxnBlock::new(self, session.clone(), !single);
         let mut results = Vec::new();
         for stmt in statements {
-            block.open_if_needed();
+            if let Err(e) = block.open_if_needed().await {
+                let _ = block.close(false).await;
+                return Err(e);
+            }
             let r = match self.execute_statement(stmt).await {
                 Ok(r) => r,
                 Err(e) => {
-                    block.close(false);
+                    let _ = block.close(false).await;
                     return Err(e);
                 }
             };
@@ -7000,14 +7068,14 @@ impl Executor {
                 match r.materialize().await {
                     Ok(r) => r,
                     Err(e) => {
-                        block.close(false);
+                        let _ = block.close(false).await;
                         return Err(e);
                     }
                 }
             };
             results.push(r);
         }
-        block.close(true);
+        block.close(true).await?;
         Ok(results)
     }
 
@@ -7093,6 +7161,19 @@ impl Executor {
         // The guard (not a trailing fetch_sub) owns the decrement so a
         // cancelled statement future cannot leak the slot (A12).
         let session = self.current_session();
+        if !matches!(
+            &stmt,
+            Statement::Set(_)
+                | Statement::ShowVariable { .. }
+                | Statement::StartTransaction { .. }
+                | Statement::Commit { .. }
+                | Statement::Rollback { .. }
+                | Statement::Savepoint { .. }
+                | Statement::ReleaseSavepoint { .. }
+        ) {
+            // `SET TRANSACTION` is only allowed before the first query.
+            session.txn_stmts.fetch_add(1, Ordering::Relaxed);
+        }
         session.statement_depth.fetch_add(1, Ordering::SeqCst);
         let mut guard = StatementDepthGuard {
             executor: self,
@@ -7117,6 +7198,7 @@ impl Executor {
         // durable state before it touches storage. One relaxed atomic load on
         // the healthy path.
         self.admit_statement(&stmt)?;
+        self.check_read_only(&stmt)?;
         self.recompute_session_context(&self.current_session());
         // Track whether this is a DDL statement that modifies the catalog or metadata.
         let is_ddl = matches!(
@@ -7373,20 +7455,11 @@ impl Executor {
             } => self.execute_drop(object_type, names, if_exists).await,
             Statement::CreateIndex(create_index) => self.execute_create_index(create_index).await,
             Statement::StartTransaction { ref modes, .. } => {
-                // Extract isolation level from BEGIN TRANSACTION ISOLATION LEVEL ...
-                for mode in modes {
-                    if let ast::TransactionMode::IsolationLevel(lvl) = mode {
-                        let level_str = match lvl {
-                            ast::TransactionIsolationLevel::ReadCommitted => "read committed",
-                            ast::TransactionIsolationLevel::RepeatableRead => "repeatable read",
-                            ast::TransactionIsolationLevel::Serializable => "serializable",
-                            ast::TransactionIsolationLevel::ReadUncommitted => "read committed",
-                            ast::TransactionIsolationLevel::Snapshot => "snapshot",
-                        };
-                        self.require_isolation_level(level_str)?;
-                    }
-                }
-                self.begin_transaction().await
+                // ISOLATION LEVEL and READ ONLY are applied to the transaction
+                // (`begin_transaction_with`); a level the engine cannot provide
+                // is refused there rather than run weaker than reported.
+                self.begin_transaction_with(txn_modes::TxnModes::from_ast(modes))
+                    .await
             }
             Statement::Commit { .. } => self.commit_transaction().await,
             Statement::Rollback {
@@ -7398,6 +7471,9 @@ impl Executor {
             Statement::ReleaseSavepoint { name } => {
                 self.execute_release_savepoint(&name.value).await
             }
+            Statement::Set(ast::Set::SetTransaction {
+                ref modes, session, ..
+            }) => self.execute_set_transaction(modes, session).await,
             Statement::Set(set) => self.execute_set(set),
             Statement::ShowVariable { variable } => self.execute_show(variable).await,
             Statement::ShowTables { .. } => self.execute_show_tables().await,

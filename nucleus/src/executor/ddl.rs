@@ -1811,18 +1811,26 @@ impl Executor {
     /// Put `table` back to `original`, through the engine that actually serves
     /// it. Used to undo writes to a per-table engine on ROLLBACK.
     pub(super) async fn restore_table_from(&self, table: &str, original: &[Row]) {
+        if let Err(error) = self.restore_table_from_checked(table, original).await {
+            tracing::error!("restoring table {table} failed: {error}");
+        }
+    }
+
+    pub(super) async fn restore_table_from_checked(
+        &self,
+        table: &str,
+        original: &[Row],
+    ) -> Result<(), ExecError> {
         let engine = self.storage_for(table);
-        // Positions come from `scan_physical`, never `0..len` — an engine is
-        // free to address rows by something other than a dense scan ordinal.
-        if let Ok(current) = engine.scan_physical(table).await
-            && !current.is_empty()
-        {
+        let current = engine.scan_physical(table).await?;
+        if !current.is_empty() {
             let positions: Vec<usize> = current.iter().map(|(pos, _)| *pos).collect();
-            let _ = engine.delete(table, &positions).await;
+            engine.delete(table, &positions).await?;
         }
         for row in original {
-            let _ = engine.insert(table, row.clone()).await;
+            engine.insert(table, row.clone()).await?;
         }
+        Ok(())
     }
 
     pub(super) async fn execute_drop(

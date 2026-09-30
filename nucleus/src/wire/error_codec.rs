@@ -68,6 +68,14 @@ pub enum ErrorCode {
     DiskFull,
     /// A write was attempted while the server is in read-only mode
     ReadOnlySqlTransaction,
+    /// The wait-for graph closed a cycle: PostgreSQL `deadlock_detected` (40P01)
+    DeadlockDetected,
+    /// A statement that must not run (or a mode that can no longer change)
+    /// inside an open transaction: PostgreSQL `active_sql_transaction` (25001)
+    ActiveSqlTransaction,
+    /// The session's backend was terminated by an administrator
+    /// (`pg_terminate_backend`): PostgreSQL `admin_shutdown` (57P01)
+    AdminShutdown,
 }
 
 /// Protocol-independent error details.
@@ -189,6 +197,8 @@ impl ErrorCodec for PgWireErrorCodec {
                     // classified XX000, which tells a driver nothing. 25P02 is
                     // what PostgreSQL sends and what clients act on.
                     ErrorCode::InFailedSqlTransaction
+                } else if msg.contains("deadlock_detected") {
+                    ErrorCode::DeadlockDetected
                 } else if msg.contains("too_many_row_locks") {
                     // Per-session lock-table exhaustion: 53200
                     // (out_of_memory), the class PostgreSQL uses when
@@ -217,6 +227,14 @@ impl ErrorCodec for PgWireErrorCodec {
                     ErrorCode::InFailedSqlTransaction
                 } else if msg.contains("canceling statement") {
                     ErrorCode::QueryCanceled
+                } else if msg.contains("deadlock detected") {
+                    ErrorCode::DeadlockDetected
+                } else if msg.contains("must be set before any query")
+                    || msg.contains("cannot run inside a transaction block")
+                {
+                    ErrorCode::ActiveSqlTransaction
+                } else if msg.contains("terminating connection due to administrator command") {
+                    ErrorCode::AdminShutdown
                 } else {
                     ErrorCode::DataException
                 };
@@ -260,6 +278,9 @@ impl ErrorCodec for PgWireErrorCodec {
             ErrorCode::InsufficientResources => "53200".to_string(),
             ErrorCode::DiskFull => "53100".to_string(),
             ErrorCode::ReadOnlySqlTransaction => "25006".to_string(),
+            ErrorCode::DeadlockDetected => "40P01".to_string(),
+            ErrorCode::ActiveSqlTransaction => "25001".to_string(),
+            ErrorCode::AdminShutdown => "57P01".to_string(),
             ErrorCode::ProgramLimitExceeded => "54000".to_string(),
         }
     }
@@ -357,6 +378,8 @@ impl ErrorCodec for BinaryErrorCodec {
                     // classified XX000, which tells a driver nothing. 25P02 is
                     // what PostgreSQL sends and what clients act on.
                     ErrorCode::InFailedSqlTransaction
+                } else if msg.contains("deadlock_detected") {
+                    ErrorCode::DeadlockDetected
                 } else if msg.contains("too_many_row_locks") {
                     // Per-session lock-table exhaustion: 53200
                     // (out_of_memory), the class PostgreSQL uses when
@@ -426,6 +449,9 @@ impl ErrorCodec for BinaryErrorCodec {
             ErrorCode::InsufficientResources => "5002".to_string(),
             ErrorCode::DiskFull => "5003".to_string(),
             ErrorCode::ReadOnlySqlTransaction => "5004".to_string(),
+            ErrorCode::DeadlockDetected => "3005".to_string(),
+            ErrorCode::ActiveSqlTransaction => "3006".to_string(),
+            ErrorCode::AdminShutdown => "3007".to_string(),
             ErrorCode::ProgramLimitExceeded => "5005".to_string(),
         }
     }

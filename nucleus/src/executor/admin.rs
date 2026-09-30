@@ -197,8 +197,16 @@ impl Executor {
                 val = parse_time_zone(&val)?.to_string();
             }
 
-            // Handle SET TRANSACTION ISOLATION LEVEL
-            if var_name == "transaction_isolation" || var_name == "default_transaction_isolation" {
+            if matches!(
+                var_name.as_str(),
+                "transaction_isolation" | "transaction_read_only"
+            ) {
+                return Err(ExecError::Unsupported(
+                    "SET transaction_isolation/transaction_read_only is not supported; use SET TRANSACTION ISOLATION LEVEL or SET TRANSACTION READ ONLY/READ WRITE".into(),
+                ));
+            }
+            // Validate the default used by future transactions.
+            if var_name == "default_transaction_isolation" {
                 let level = val.trim_matches('\'').trim_matches('"').to_lowercase();
                 // Same refusal as BEGIN ISOLATION LEVEL: a SET that reports
                 // success and silently gives a weaker level is the same bug
@@ -254,6 +262,13 @@ impl Executor {
         // settings guard is released before any await below (the executor's
         // futures must stay Send).
         let sess = self.current_session();
+        // The transaction's own mode, not whatever a SET stored under the name.
+        if let Some(val) = self.transaction_mode_setting(&var_lower) {
+            return Ok(ExecResult::Select {
+                columns: vec![(var_name, DataType::Text)],
+                rows: vec![vec![Value::Text(val)]],
+            });
+        }
         let user_val = sess.settings.read().get(&var_lower).cloned();
         if let Some(val) = user_val {
             return Ok(ExecResult::Select {
@@ -398,6 +413,8 @@ impl Executor {
             ("search_path", "\"$user\", public".to_string()),
             ("max_connections", "100".to_string()),
             ("transaction_isolation", "read committed".to_string()),
+            ("transaction_read_only", "off".to_string()),
+            ("default_transaction_read_only", "off".to_string()),
             (
                 "default_transaction_isolation",
                 "read committed".to_string(),
