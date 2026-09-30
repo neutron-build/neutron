@@ -2708,7 +2708,7 @@ pub(super) fn json_contains(left: &serde_json::Value, right: &serde_json::Value)
         (serde_json::Value::Array(a), serde_json::Value::Array(b)) => {
             b.iter().all(|bv| a.iter().any(|av| json_contains(av, bv)))
         }
-        (a, b) => a == b,
+        (a, b) => crate::types::compare_jsonb(a, b).is_eq(),
     }
 }
 
