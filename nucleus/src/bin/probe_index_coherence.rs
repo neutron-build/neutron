@@ -1,29 +1,11 @@
 //! Coherence oracle for derived/secondary indexes.
 //!
-//! Hammers a table carrying a btree index (scalar col), a vector index
-//! (HNSW/IVFFlat), and an encrypted index with a randomized, interleaved
-//! stream of INSERT / UPDATE / DELETE / TRUNCATE, while maintaining a
-//! brute-force in-memory reference model. After every op it checks the
-//! indexed query paths against ground truth.
-//!
-//! The whole workload runs against each storage engine, which differ in
-//! delete semantics: memory compacts (positions shift), mvcc tombstones,
-//! columnar rewrites. Position-addressed index postings (vector/encrypted)
-//! are exactly what break under those shifts, so this is the safety net for
-//! making index maintenance incremental instead of full-rebuild-per-DML.
-//!
-//! Checks are chosen to be sensitive to incoherence but robust to the vector
-//! indexes' approximate recall: btree equality, PK uniqueness, and encrypted
-//! equality are EXACT (the encrypted index shares the vector index's
-//! position-addressed maintenance path, so it is the exact detector for the
-//! position-staleness bug class). Vector KNN is checked by SOUNDNESS only (all
-//! returned ids live, no duplicates) — recall (self-match, ordering, top-k
-//! completeness) is deliberately not asserted because HNSW/IVFFlat are
-//! approximate and would false-positive.
-//!
-//! `cargo run --release --features server --bin probe_index_coherence`
-#![cfg(feature = "server")]
-#![allow(clippy::too_many_arguments, clippy::unusual_byte_groupings)]
+//! Hammers scalar B-tree indexes and HNSW/IVFFlat vector indexes with a
+//! randomized INSERT / UPDATE / DELETE / TRUNCATE stream and an independent
+//! reference model. B-tree equality, duplicate-code row membership and PK
+//! uniqueness are exact; approximate vector KNN checks soundness only.
+//! The retired encryption prototype provides no security or coherence coverage.
+//! Additional IVF Flat fixtures preserve full-rebuild maintenance pressure.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -77,16 +59,13 @@ fn vec_lit(v: &[f32]) -> String {
     format!("VECTOR('[{}]')", body.join(","))
 }
 
-/// Number of distinct encrypted `code` values. Deliberately smaller than a
-/// typical live set so multiple rows share a code — the encrypted index then
-/// sees DUPLICATE values, which is what stresses positional-id maintenance. A
-/// unique-per-row code (the old `c{id}`) never exercises the collision path
-/// where the len()-as-row-id bug lived.
-const ENC_CODE_GROUPS: i64 = 8;
+/// Duplicate code values exercise multi-row equality memberships and deletion
+/// of one member while the others remain live.
+const CODE_GROUPS: i64 = 8;
 
-/// The (non-unique) encrypted code for a row id.
+/// The (non-unique) code for a row id.
 fn code_for(id: i64) -> String {
-    format!("c{}", id.rem_euclid(ENC_CODE_GROUPS))
+    format!("c{}", id.rem_euclid(CODE_GROUPS))
 }
 
 /// Run a statement; true on success. Panic-safe.
@@ -174,7 +153,7 @@ fn run_lifecycle(
     iter: usize,
     ops: usize,
     use_hnsw: bool,
-    use_encrypted: bool,
+    use_code_index: bool,
     rng: &mut Rng,
     rep: &mut Report,
 ) {
@@ -213,11 +192,13 @@ fn run_lifecycle(
 
     stmt!("CREATE INDEX t_val ON t (val)".to_string());
     stmt!(format!("CREATE INDEX t_v ON t USING {idx_kind} (v)"));
-    // Omitting the encrypted index makes an HNSW + integer-PK table eligible for
-    // the incremental DELETE fast path, so those iterations exercise it with the
-    // exact btree/PK checks below.
-    if use_encrypted {
-        stmt!("CREATE INDEX t_code ON t USING encrypted (code)".to_string());
+    // Add a real IVF Flat index on these fixtures to exercise full maintenance;
+    // the remaining HNSW fixtures retain the incremental DELETE path.
+    if use_code_index {
+        stmt!("CREATE INDEX t_code ON t (code)".to_string());
+        if use_hnsw {
+            stmt!("CREATE INDEX t_v_ivf ON t USING ivfflat (v)".to_string());
+        }
     }
 
     for _ in 0..ops {
@@ -271,8 +252,8 @@ fn run_lifecycle(
         check_btree(ex, engine, iter, &log, &model, rng, rep);
         check_pk_uniqueness(ex, engine, iter, &log, &model, rng, rep);
         check_vector(ex, engine, iter, &log, &model, rng, rep);
-        if use_encrypted {
-            check_encrypted(ex, engine, iter, &log, &model, &recently_deleted, rng, rep);
+        if use_code_index {
+            check_code_index(ex, engine, iter, &log, &model, &recently_deleted, rng, rep);
         }
     }
 
@@ -399,15 +380,10 @@ fn check_vector(
     // completeness, or distance ordering): HNSW/IVFFlat are approximate, so a
     // missed or reordered result is expected recall behavior, not incoherence,
     // and IVFFlat legitimately returns nothing on a few-row untrained index.
-    // The position-staleness / mis-assignment bug class that a
-    // full-rebuild-to-incremental refactor could reintroduce is caught EXACTLY
-    // by the encrypted-index check, which exercises the identical
-    // `rebuild_position_indexes_for_table` maintenance path and asserts the
-    // postings are a permutation of {0..N-1} under duplicate codes.
     let _ = probe;
 }
 
-fn check_encrypted(
+fn check_code_index(
     ex: &Executor,
     engine: &str,
     iter: usize,
@@ -420,38 +396,34 @@ fn check_encrypted(
     if model.is_empty() {
         return;
     }
-    // (1) Well-formedness — the strong, engine-independent invariant. Every live
-    // row is indexed exactly once at its scan position, so the postings over ALL
-    // live codes must be a permutation of {0..N-1}. Under DUPLICATE codes this
-    // catches both a collision (two rows sharing a position) and a gap (a row
-    // missing a position) — the exact corruption the len()-as-row-id insert bug
-    // produced (`c1` twice, no `c2`). A unique-code, count-only check cannot:
-    // the buggy counts were individually correct.
+    // Every live row appears once across all duplicate-code equality queries.
+    // Compare actual row identities, not just independent per-code counts.
     let mut live_codes: Vec<String> = model.keys().map(|id| code_for(*id)).collect();
     live_codes.sort();
     live_codes.dedup();
     let mut positions: Vec<i64> = Vec::new();
     for code in &live_codes {
-        match encrypted_positions(ex, code) {
+        match code_ids(ex, code) {
             Some(mut p) => positions.append(&mut p),
             None => {
-                rep.fail(engine, iter, log, format!("encrypted lookup {code} failed"));
+                rep.fail(
+                    engine,
+                    iter,
+                    log,
+                    format!("code equality lookup {code} failed"),
+                );
                 return;
             }
         }
     }
     positions.sort();
-    let expected: Vec<i64> = (0..model.len() as i64).collect();
+    let expected: Vec<i64> = model.keys().copied().collect();
     if positions != expected {
         rep.fail(
             engine,
             iter,
             log,
-            format!(
-                "encrypted postings are not a permutation of 0..{}: got {positions:?} \
-                 (duplicate position = collision, missing position = unindexed row)",
-                model.len()
-            ),
+            format!("code index membership mismatch: got {positions:?}, expected {expected:?}"),
         );
         return;
     }
@@ -461,13 +433,13 @@ fn check_encrypted(
     let probe_id = ids[rng.below(ids.len())];
     let code = code_for(probe_id);
     let want = model.keys().filter(|k| code_for(**k) == code).count();
-    let got = encrypted_count(ex, &code);
+    let got = code_count(ex, &code);
     if got != Some(want) {
         rep.fail(
             engine,
             iter,
             log,
-            format!("encrypted lookup {code} (live): expected {want} postings, got {got:?}"),
+            format!("code equality lookup {code} (live): expected {want} postings, got {got:?}"),
         );
         return;
     }
@@ -480,46 +452,37 @@ fn check_encrypted(
     if !candidates.is_empty() {
         let d = candidates[rng.below(candidates.len())];
         let dead_code = code_for(d);
-        let dead_count = encrypted_count(ex, &dead_code);
+        let dead_count = code_count(ex, &dead_code);
         if dead_count != Some(0) {
             rep.fail(
                 engine,
                 iter,
                 log,
                 format!(
-                    "encrypted lookup {dead_code} (no live rows): expected 0 postings, got {dead_count:?}"
+                    "code equality lookup {dead_code} (no live rows): expected 0 postings, got {dead_count:?}"
                 ),
             );
         }
     }
 }
 
-/// Count postings ENCRYPTED_LOOKUP returns for `code`. None on query failure.
-fn encrypted_count(ex: &Executor, code: &str) -> Option<usize> {
-    Some(encrypted_positions(ex, code)?.len())
+/// Exact equality result membership. Query errors are failures, not zero hits.
+fn code_count(ex: &Executor, code: &str) -> Option<usize> {
+    Some(code_ids(ex, code)?.len())
 }
 
-/// The row positions ENCRYPTED_LOOKUP returns for `code`. None on query failure.
-fn encrypted_positions(ex: &Executor, code: &str) -> Option<Vec<i64>> {
-    let sql = format!("SELECT ENCRYPTED_LOOKUP('t_code', '{code}') FROM t LIMIT 1");
-    let rows = query(ex, &sql)?;
-    let cell = rows.first().and_then(|r| r.first())?;
-    let text = match cell {
-        Value::Text(s) => s.clone(),
-        Value::Null => String::new(),
-        other => format!("{other:?}"),
-    };
-    Some(
-        text.split(',')
-            .filter_map(|s| s.trim().parse::<i64>().ok())
-            .collect(),
-    )
+fn code_ids(ex: &Executor, code: &str) -> Option<Vec<i64>> {
+    query(ex, &format!("SELECT id FROM t WHERE code = '{code}'"))?
+        .into_iter()
+        .map(|row| match row.first() {
+            Some(Value::Int32(id)) => Some(i64::from(*id)),
+            Some(Value::Int64(id)) => Some(*id),
+            _ => None,
+        })
+        .collect()
 }
 
 fn main_impl() {
-    unsafe {
-        std::env::set_var("NUCLEUS_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef");
-    }
     std::panic::set_hook(Box::new(|_| {}));
 
     let args: Vec<String> = std::env::args().collect();
@@ -580,16 +543,15 @@ fn main_impl() {
             let storage = make_engine(engine, &catalog, &format!("{engine}_{iter}"));
             let ex = Arc::new(Executor::new(catalog, storage));
             let use_hnsw = iter % 2 == 0;
-            // Skip the encrypted index on ~1/3 of iterations so HNSW + integer-PK
-            // tables become eligible for the incremental DELETE fast path.
-            let use_encrypted = iter % 3 != 0;
+            // Alternate full-rebuild IVF Flat and incremental HNSW fixtures.
+            let use_code_index = iter % 3 != 0;
             run_lifecycle(
                 &ex,
                 engine,
                 iter,
                 ops,
                 use_hnsw,
-                use_encrypted,
+                use_code_index,
                 &mut rng,
                 &mut rep,
             );
