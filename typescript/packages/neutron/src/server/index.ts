@@ -883,8 +883,8 @@ export async function createServer(
         // in-flight cacheable GET that started before this mutation must not
         // publish its (now stale) fill afterwards.
         appCacheEpoch++;
-        await appResponseCacheStore.deleteByPath(effectivePathname);
-        await loaderDataCacheStore.deleteByPath(effectivePathname);
+        await appResponseCacheStore.deleteByPath(encodeCacheInvalidationPath(effectivePathname));
+        await loaderDataCacheStore.deleteByPath(encodeCacheInvalidationPath(effectivePathname));
       }
 
       const appCacheMaxAge = match.route.config.cache?.maxAge ?? 0;
@@ -982,8 +982,8 @@ export async function createServer(
         // GETs may have published old data after the start invalidation while
         // the action was running. Evict those entries and fence remote fills
         // at completion even when the action emits no invalidation header.
-        await appResponseCacheStore.deleteByPath(effectivePathname);
-        await loaderDataCacheStore.deleteByPath(effectivePathname);
+        await appResponseCacheStore.deleteByPath(encodeCacheInvalidationPath(effectivePathname));
+        await loaderDataCacheStore.deleteByPath(encodeCacheInvalidationPath(effectivePathname));
         await applyMutationInvalidationFromResponse(
           appResponseCacheStore,
           effectivePathname,
@@ -1561,6 +1561,14 @@ function requestCarriesCredentials(request: Request): boolean {
 
 
 
+/** Stores accept URL-encoded paths and decode exactly once. The router and
+ * explicit invalidation parsing already produced decoded canonical paths;
+ * re-encode their segments to preserve literal percent and reserved characters.
+ */
+function encodeCacheInvalidationPath(pathname: string): string {
+  return pathname.split('/').map(segment => encodeURIComponent(segment)).join('/');
+}
+
 async function applyMutationInvalidationFromResponse(
   cache: NeutronAppCacheStore,
   pathname: string,
@@ -1587,13 +1595,13 @@ async function applyMutationInvalidationFromResponse(
     }
 
     if (token === "self") {
-      await cache.deleteByPath(pathname);
+      await cache.deleteByPath(encodeCacheInvalidationPath(pathname));
       continue;
     }
 
     const normalized = normalizePathname(token);
     if (normalized) {
-      await cache.deleteByPath(normalized);
+      await cache.deleteByPath(encodeCacheInvalidationPath(normalized));
     }
   }
 }
@@ -1624,13 +1632,13 @@ async function applyMutationInvalidationToLoaderDataCache(
     }
 
     if (token === "self") {
-      await cache.deleteByPath(pathname);
+      await cache.deleteByPath(encodeCacheInvalidationPath(pathname));
       continue;
     }
 
     const normalized = normalizePathname(token);
     if (normalized) {
-      await cache.deleteByPath(normalized);
+      await cache.deleteByPath(encodeCacheInvalidationPath(normalized));
     }
   }
 }
