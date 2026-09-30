@@ -1712,20 +1712,23 @@ mod x09_array_fallback_corruption {
 
     #[test]
     fn x09_array_numeric_restoration_retains_exact_stored_scale() {
-        let types = vec![DataType::Array(Box::new(DataType::Numeric))];
+        let types = vec![
+            DataType::Int32,
+            DataType::Array(Box::new(DataType::Numeric)),
+        ];
         let clean = serialize_row(
-            &vec![Value::Array(vec![
-                Value::Numeric("1.00".into()),
-                Value::Null,
-            ])],
+            &vec![
+                Value::Int32(7),
+                Value::Array(vec![Value::Numeric("1.00".into()), Value::Null]),
+            ],
             &types,
         );
         let restored = deserialize_row(&clean, &types).unwrap();
-        assert_eq!(restored[0].to_string(), "{1.00,NULL}");
+        assert_eq!(restored[1].to_string(), "{1.00,NULL}");
         assert_eq!(serialize_row(&restored, &types), clean);
         assert_eq!(
-            deserialize_row_projected(&clean, &types, &[0]),
-            Some(restored)
+            deserialize_row_projected(&clean, &types, &[1]),
+            Some(vec![restored[1].clone()])
         );
     }
 }
