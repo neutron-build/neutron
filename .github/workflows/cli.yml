@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     paths:
+      - "scripts/install.sh"
       - "cli/**"
       - "studio/**"
       - "go/**"
@@ -14,6 +15,7 @@ on:
       - "cli/v*"
   pull_request:
     paths:
+      - "scripts/install.sh"
       - "cli/**"
       - "studio/**"
       - "go/**"
@@ -25,6 +27,14 @@ permissions:
   contents: write
 
 jobs:
+  installer:
+    name: Verified installer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 cli/scripts/test-install.py
+      - run: python3 cli/scripts/test-installer-host.py
+
   # The CLI embeds the compiled Studio frontend (//go:embed all:dist in
   # cli/internal/studio/embed.go). studio/dist is a build artifact, not
   # committed, so build it once here and share it with every go-build job.
@@ -98,7 +108,7 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.26"
           cache-dependency-path: cli/go.sum
 
       - name: Build
@@ -152,7 +162,7 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.26"
           cache-dependency-path: cli/go.sum
 
       - name: Build the CLI with the embedded Studio
@@ -207,7 +217,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.26"
           cache-dependency-path: cli/go.sum
 
       - uses: actions/setup-node@v4
@@ -249,7 +259,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.26"
           cache-dependency-path: |
             cli/go.sum
             cli/examples/neutron-application/api/go.sum
@@ -310,7 +320,7 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.26"
           cache-dependency-path: cli/go.sum
 
       - name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
@@ -319,7 +329,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.os }}-${{ matrix.arch }}
-    needs: [test, cross-compile]
+    needs: [installer, test, cross-compile]
     if: startsWith(github.ref, 'refs/tags/cli/v')
     runs-on: ubuntu-latest
     strategy:
@@ -346,7 +356,7 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.26"
           cache-dependency-path: cli/go.sum
 
       - name: Extract version
@@ -376,6 +386,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/cli/v')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -383,10 +394,13 @@ jobs:
           pattern: neutron-*
           merge-multiple: true
 
+      - name: Include the canonical installer
+        run: cp scripts/install.sh artifacts/install.sh
+
       - name: Generate checksums
         working-directory: artifacts
         run: |
-          sha256sum neutron_*.tar.gz > checksums.txt
+          sha256sum neutron_*.tar.gz install.sh > checksums.txt
           cat checksums.txt
 
       - name: Extract version
@@ -401,6 +415,7 @@ jobs:
           files: |
             artifacts/neutron_*.tar.gz
             artifacts/checksums.txt
+            artifacts/install.sh
           body: |
             ## Neutron CLI v${{ steps.version.outputs.version }}
 

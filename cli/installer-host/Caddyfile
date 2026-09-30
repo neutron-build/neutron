@@ -1,0 +1,17 @@
+{
+    auto_https off
+}
+:80 {
+    @installer path / /install.sh
+    handle @installer {
+        root * /var/www
+        rewrite * /install.sh
+        header Content-Type "text/plain; charset=utf-8"
+        header Cache-Control "no-cache"
+        header X-Content-Type-Options "nosniff"
+        file_server
+    }
+    handle {
+        respond "Not found" 404
+    }
+}
