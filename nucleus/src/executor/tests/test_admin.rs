@@ -545,7 +545,7 @@ async fn test_pg_index() {
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Bool(true)); // unique
     assert_eq!(r[0][1], Value::Bool(false)); // not primary
-    assert_eq!(r[0][2], Value::Text("2".into())); // email is column 2
+    assert_eq!(r[0][2], Value::Array(vec![Value::Int32(2)])); // email is column 2
 }
 
 #[tokio::test]

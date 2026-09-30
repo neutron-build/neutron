@@ -1848,7 +1848,7 @@ impl Executor {
                                                 child_table,
                                                 child_table_def,
                                                 &updated_row,
-                                                pos,
+                                                child_positions[pos],
                                                 Some((parent_table, columns, ref_columns)),
                                             )
                                             .await?;
@@ -1911,7 +1911,7 @@ impl Executor {
                                                 child_table,
                                                 child_table_def,
                                                 &updated_row,
-                                                pos,
+                                                child_positions[pos],
                                                 None,
                                             )
                                             .await?;
@@ -1994,7 +1994,7 @@ impl Executor {
                                                 child_table,
                                                 child_table_def,
                                                 &updated_row,
-                                                pos,
+                                                child_positions[pos],
                                                 references_pending_new_key.then_some((
                                                     parent_table,
                                                     columns,
@@ -2187,7 +2187,7 @@ impl Executor {
                                                 child_table,
                                                 child_table_def,
                                                 &updated_row,
-                                                pos,
+                                                child_positions[pos],
                                                 None,
                                             )
                                             .await?;
@@ -2252,7 +2252,7 @@ impl Executor {
                                                 child_table,
                                                 child_table_def,
                                                 &updated_row,
-                                                pos,
+                                                child_positions[pos],
                                                 None,
                                             )
                                             .await?;
