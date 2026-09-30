@@ -713,6 +713,12 @@ async fn x10_paged_cascade_skips_its_physical_child_row_after_a_delete() {
     exec(&ex, "INSERT INTO physical_child(id,p) VALUES(11,1),(22,2)").await;
     exec(&ex, "DELETE FROM physical_child WHERE id=11").await;
     exec(&ex, "UPDATE physical_parent SET id=-2 WHERE id=2").await;
-    assert_eq!(ints(&ex, "SELECT id,p,g FROM physical_child").await, [[22,-2,2]]);
-    assert_eq!(ints(&ex, "SELECT id FROM physical_parent ORDER BY id").await, [[-2],[1]]);
+    assert_eq!(
+        ints(&ex, "SELECT id,p,g FROM physical_child").await,
+        [[22, -2, 2]]
+    );
+    assert_eq!(
+        ints(&ex, "SELECT id FROM physical_parent ORDER BY id").await,
+        [[-2], [1]]
+    );
 }
