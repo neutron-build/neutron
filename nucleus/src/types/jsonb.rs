@@ -135,7 +135,7 @@ fn add_signed_decimal(left: &str, right: &str) -> String {
 }
 
 /// Expand scientific notation lexically, retaining all mantissa digits and
-/// scale. Keep the original exponent form when expansion would be too large.
+/// scale. Keep exact scientific notation when expansion would be too large.
 pub(super) fn expanded_text(text: &str) -> Option<String> {
     const MAX_RENDER_BYTES: i128 = 16_384;
     let (mantissa, exponent) = text.split_once(['e', 'E'])?;

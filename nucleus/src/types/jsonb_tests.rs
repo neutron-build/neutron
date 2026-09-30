@@ -58,10 +58,27 @@ fn x11_jsonb_scientific_text_preserves_every_digit_and_scale() {
         ("[-0e3]", "[0]"),
         (
             "[1e999999999999999999999999999999]",
-            "[1e999999999999999999999999999999]",
+            "[1e+999999999999999999999999999999]",
         ),
     ] {
-        assert_eq!(json(input).to_string(), expected);
+        let rendered = json(input).to_string();
+        assert_eq!(rendered, expected);
+        assert_eq!(
+            json(&rendered),
+            json(input),
+            "rendering must preserve exact value"
+        );
     }
     assert_eq!(json("1.00").to_string(), "1.00");
+    // serde_json normalizes a missing positive exponent sign to '+'. The
+    // fallback retains every coefficient/exponent digit, rather than the
+    // source token's spelling, and never expands beyond the render guard.
+    for input in [
+        "[123456789012345678901234567890123e20000]",
+        "[123456789012345678901234567890123e-20000]",
+    ] {
+        let rendered = json(input).to_string();
+        assert!(rendered.len() < 100);
+        assert_eq!(json(&rendered), json(input));
+    }
 }
