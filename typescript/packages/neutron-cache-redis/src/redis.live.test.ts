@@ -4,7 +4,9 @@ import { randomUUID } from "node:crypto";
 import { createRedisNeutronCacheStoresFromClient, type RedisLikeClient } from "./index.js";
 
 const url = process.env.NEUTRON_TEST_REDIS_URL;
-test("real Redis atomic publication, invalidation, epochs and concurrent fills", { skip: !url && "NEUTRON_TEST_REDIS_URL not set" }, async () => {
+const required = process.env.NEUTRON_REDIS_LIVE_REQUIRED === "1";
+test("real Redis atomic publication, invalidation, epochs and concurrent fills", { skip: !url && !required && "NEUTRON_TEST_REDIS_URL not set" }, async () => {
+  assert.ok(url, "NEUTRON_TEST_REDIS_URL is required for the live Redis gate");
   const imported = await new Function("return import('ioredis')")() as {default: new(url:string)=>RedisLikeClient};
   const client = new imported.default(url!);
   const peer = new imported.default(url!);
