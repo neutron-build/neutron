@@ -364,10 +364,15 @@ fn write_jsonb_text(v: &serde_json::Value, out: &mut String) {
         }
         serde_json::Value::Number(n) => {
             let text = n.to_string();
-            if let Some(expanded) = jsonb::expanded_text(&text) {
+            // JSONB normalizes zero's sign while retaining its display scale.
+            let lexical = text
+                .strip_prefix('-')
+                .filter(|mantissa| mantissa.bytes().all(|byte| matches!(byte, b'0' | b'.')))
+                .unwrap_or(&text);
+            if let Some(expanded) = jsonb::expanded_text(lexical) {
                 out.push_str(&expanded);
             } else {
-                out.push_str(&text);
+                out.push_str(lexical);
             }
         }
 

@@ -152,10 +152,11 @@ pub(super) fn expanded_text(text: &str) -> Option<String> {
     } else {
         point.max(digits.len() as i128).checked_add(1)?
     };
+    let output_len = output_len.checked_add(i128::from(negative))?;
     if output_len > MAX_RENDER_BYTES {
         return None;
     }
-    let mut out = String::with_capacity(output_len as usize + 1);
+    let mut out = String::with_capacity(output_len as usize);
     if negative && digits.bytes().any(|ch| ch != b'0') {
         out.push('-');
     }

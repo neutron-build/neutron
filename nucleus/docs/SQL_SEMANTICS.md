@@ -183,7 +183,7 @@ JSONB_AGG retains SQL NULL inputs as JSON null, returns SQL NULL for an empty
 input, and supports ordering, filtering and DISTINCT. JSON numbers retain
 number identity and decimal digits instead of becoming strings through an
 f64 conversion. JSONB text uses PostgreSQL spacing and key ordering; exponent
-expansion is bounded by the engine's decimal range. JSON_OBJECT_AGG is refused
+expansion is bounded at 16,384 rendered bytes; larger expansions retain the original exponent form. JSON_OBJECT_AGG is refused
 because JSONB storage cannot preserve JSON duplicate keys.
 
 Derived-table column alias lists rename columns positionally and reject lists
