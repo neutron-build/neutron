@@ -326,12 +326,9 @@ async fn lost_update_same_row_is_prevented() {
 ///
 /// Losing a write is worse than refusing a connection setting: the application
 /// cannot detect it, and the data is gone.
-/// The subject is `MemoryEngine`, which implements no isolation machinery at
-/// all and therefore inherits the weakest declaration. It used to be
-/// `BufferedDiskEngine`; that engine now provides real SERIALIZABLE through
-/// strict 2PL (R6, see `test_2pl_census`), so it is no longer an example of an
-/// engine that must refuse. The CONTRACT under test is unchanged and is the
-/// point: an engine that cannot provide a level says so instead of pretending.
+/// MemoryEngine and BufferedDiskEngine both refuse higher levels; the disk
+/// engine's internal 2PL is incomplete for mixed-isolation traffic. The MVCC
+/// adapter has a separate supported-isolation test below.
 #[tokio::test]
 async fn test_an_engine_refuses_isolation_it_cannot_provide() {
     let catalog = std::sync::Arc::new(crate::catalog::Catalog::new());
@@ -358,11 +355,13 @@ async fn test_an_engine_refuses_isolation_it_cannot_provide() {
     exec(&ex, "ROLLBACK").await;
 
     // And the same refusal through SET, which is the other door into it.
+    exec(&ex, "BEGIN").await;
     let err = ex
-        .execute("SET transaction_isolation = 'serializable'")
+        .execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
         .await
         .expect_err("SET must refuse it too");
     assert!(format!("{err}").contains("READ COMMITTED"), "{err}");
+    exec(&ex, "ROLLBACK").await;
 }
 
 /// The MVCC engine has SSI, so it must still accept every level.
@@ -381,5 +380,9 @@ async fn test_the_mvcc_engine_still_accepts_serializable() {
         exec(&ex, &format!("BEGIN TRANSACTION ISOLATION LEVEL {level}")).await;
         exec(&ex, "ROLLBACK").await;
     }
-    exec(&ex, "SET transaction_isolation = 'serializable'").await;
+    exec(&ex, "BEGIN").await;
+    exec(&ex, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").await;
+    let mode = exec(&ex, "SHOW transaction_isolation").await;
+    assert_eq!(scalar(&mode[0]), &Value::Text("serializable".into()));
+    exec(&ex, "ROLLBACK").await;
 }

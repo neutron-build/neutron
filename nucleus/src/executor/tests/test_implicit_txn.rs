@@ -462,3 +462,39 @@ async fn x08_disk_refuses_isolation_it_cannot_enforce() {
         assert!(matches!(result, Err(ExecError::Unsupported(_))));
     }
 }
+
+/// Rollback repair must run even while its cancellation recovery state remains
+/// active. A failed message previously left a one-row zone map for its ghost
+/// insert, which pruned the surviving committed row on a range scan.
+#[tokio::test]
+async fn failed_message_rebuilds_derived_state_from_restored_rows() {
+    for (name, ex) in engines() {
+        let sid = ex.create_session();
+        exec_on(
+            &ex,
+            sid,
+            "CREATE TABLE x08_derived (id INT PRIMARY KEY, val INT)",
+        )
+        .await;
+        exec_on(&ex, sid, "INSERT INTO x08_derived VALUES (3, 17), (11, 11)").await;
+        exec_on(&ex, sid, "DELETE FROM x08_derived WHERE id = 11").await;
+        let err = ex
+            .execute_with_session(
+                sid,
+                "INSERT INTO x08_derived VALUES (12, 12); INSERT INTO x08_derived VALUES (12, 12)",
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{name}: {err}");
+        let result = ex
+            .execute_with_session(sid, "SELECT id FROM x08_derived WHERE val > 13")
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(&result[0]),
+            &vec![vec![Value::Int32(3)]],
+            "{name}: ghost granule pruned committed data"
+        );
+        assert!(!ex.get_session(sid).txn_active.load(Ordering::SeqCst));
+    }
+}

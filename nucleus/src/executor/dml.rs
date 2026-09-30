@@ -2432,6 +2432,12 @@ impl Executor {
             }
         }
 
+        self.rebuild_committed_table_derived_state(table_name).await;
+    }
+
+    /// Rebuild from storage after a commit/abort decision, even while rollback
+    /// retains active transaction state and before-images for cancellation recovery.
+    pub(super) async fn rebuild_committed_table_derived_state(&self, table_name: &str) {
         // TRUNCATE recreates the physical table and therefore removes its
         // engine-local indexes while catalog definitions remain. Re-create any
         // missing physical indexes before rebuilding their postings.
@@ -2461,15 +2467,10 @@ impl Executor {
             tracing::warn!("failed to rebuild storage indexes for '{table_name}': {error}");
         }
         self.rebuild_zone_map(table_name).await;
-        self.refresh_gin_after_write(table_name).await;
+        self.mark_gin_committed_write();
+        self.rebuild_gin_indexes_for_table(table_name).await;
         self.rebuild_position_indexes_for_table(table_name).await;
         self.rebuild_fts_indexes_for_table(table_name).await;
-
-        let session = self.current_session();
-        let mut txn = session.txn_state.write().await;
-        if txn.active {
-            txn.derived_dirty_tables.insert(table_name.to_string());
-        }
     }
 
     /// Write the rows an UPDATE resolved, re-reading and re-evaluating any that

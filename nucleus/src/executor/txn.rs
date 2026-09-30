@@ -423,7 +423,7 @@ impl Executor {
             self.restore_table_from_checked(table, original).await?;
         }
         for table in derived_dirty_tables {
-            self.rebuild_table_derived_state(&table).await;
+            self.rebuild_committed_table_derived_state(&table).await;
         }
         let mut txn = sess.txn_state.write().await;
         self.release_unique_slots(super::unique_gate::gate_session_id());
