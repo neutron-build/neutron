@@ -4,19 +4,14 @@ Unresolved findings for this repository from the ChatGPT-led audit series.
 Read this before treating related work as done; update it when you close,
 defer, or upstream-report an item.
 
-Open items: **2 deferral clusters** (5 and 6 below — WebAuthn and the
-versioned/CAS session store; both need external-library or public-API
-decisions). Everything else is fixed, partially fixed with the remainder
-scoped, or recorded as a false positive with evidence. The 2026-09-17
-round-2 re-verification repaired all five disputed closures and resolved
-the twelve new findings it raised; round 3 closed its partials; round 4
-(2026-09-18, below) closed the four WAL-format deferral clusters and the
-consumer-reported snapshot-capability gap under the founder-ratified
-"WAL format v2 + snapshot lease" direction; round 5 (2026-09-18, above)
-closed the three lease-scope defects reported from the observe backup
-session and landed NU-01's unblocked compaction subset. Separately, engine
-defects the ORM program reported upstream (N1-N16, N1 security-class) are
-listed at the end; N1 was closed 2026-09-28 (X07), the rest are open.
+The WebAuthn and versioned session-store deferrals were implemented on
+2026-09-30 with explicit migration requirements. Earlier audit findings are
+fixed, partially fixed with the remainder scoped, or recorded as false
+positives with evidence. The 2026-09-17 through 2026-09-18 re-verifications
+resolved the disputed closures, WAL-format and snapshot-lease defects, and
+NU-01's bounded compaction subset. The ORM program's N1–N16 findings are
+tracked below as verified bounded contracts and remaining unsupported
+behavior; their original blanket open status no longer describes the source.
 
 ## Resolved 2026-09-18 (round 5 — lease-scope closure + NU-01 compaction subset)
 
@@ -146,7 +141,7 @@ FALSE-POSITIVE (not reproducible in source; evidence cited).
 | TS-16 | FIXED — eviction always makes progress (no floor(0.1n)=0 for n<10); replacement refreshes LRU recency | 67ff9c6b |
 | TS-17 | FIXED — session/CSRF middleware rewrap responses before appending Set-Cookie (immutable headers no longer throw post-persistence) | 67ff9c6b |
 | TS-18 | FIXED — Set-Cookie values appended (getSetCookie), parent/child cookies preserved | acf405c0 |
-| TS-19 | DEFERRED — revocation fencing needs a versioned/CAS session-store contract; that is a public API redesign (SessionStorage interface, store schema), not a patch | — |
+| TS-19 | FIXED — middleware requires atomic revision-conditional commit, rotation and revocation. Memory and SQL adapters implement the contract; stale persistence suppresses the original response/cookie with 503. Legacy custom stores are refused. This fences stored state, not already executing application work. | `session.test.ts`, `session-sql.integration.test.ts`; migration: `go/neutronauth/README.md` |
 | TS-20 | FIXED — memory session and loader-cache data deep-cloned at ingress and egress | 67ff9c6b |
 | TS-21 | FIXED-PARTIAL — live-key cap admits no new keys (controlled 429), options validated, first-request headers emitted; populating context.clientAddress from the transport remains a feature (the missing-address warning is already in place) | 67ff9c6b |
 | TS-22 | FIXED — DELETE bodies covered; Content-Length stays as the early check (middleware + adapter). Round 4 landed the actual-byte half: `maxRequestBodyBytes` makes the server adapter wrap every body-bearing request's stream so reading past the cap fails with 413 and cancels the sender — covering chunked (no Content-Length) bodies and lying declared lengths | 67ff9c6b + r4 |
@@ -173,8 +168,8 @@ FALSE-POSITIVE (not reproducible in source; evidence cited).
 | GO-13 | FIXED-PARTIAL — built-ins yield to method-equivalent user routes; OpenAPI regenerates on a registration-generation mismatch. Mount/Static route-record unification not redesigned (mounts stay opaque to OpenAPI by design) | 4f743588 |
 | GO-14 | FIXED — >=32-byte keys, pinned JOSE header, UseNumber decode, duplicate-key and trailing-JSON rejection, mandatory numeric exp checked at now>=exp, nbf honored | 086e0253 |
 | GO-15 | FIXED — caller's claims map copied; nil map works; positive-lifetime validation | 086e0253 |
-| GO-16 | DEFERRED — a complete WebAuthn registration ceremony requires a full CBOR/WebAuthn library integration (new dependency + store/API redesign). FinishRegistration carries an explicit unsafe-scaffold warning until then | — |
-| GO-17 | FIXED-PARTIAL — RP ID hash, minimum authData length, UP flag verified; failed counter persistence fails the login. Full ceremony validation rides the GO-16 deferral | 086e0253 |
+| GO-16 | FIXED — go-webauthn parses and verifies registration/assertion ceremonies with single-consume challenge state and versioned credentials. Legacy registrations require authenticated re-enrollment. Default none attestation does not establish hardware provenance. | `go/neutronauth/webauthn_test.go`; migration: `go/neutronauth/README.md` |
+| GO-17 | FIXED — library verification covers challenge, origin, RP ID, presence/verification, signature and counter semantics; failed credential CAS refuses login. Zero counters follow library semantics and are not proof against cloning. | `go/neutronauth/webauthn_test.go` |
 | GO-18 | FIXED — token-prefix identity fallback removed; verified userinfo endpoint required; numeric subjects decode with UseNumber; empty subject rejected | 086e0253 |
 | GO-19 | FIXED — bounded owned HTTP client, inbound-context outbound requests, trimmed body classification, limit+1 truncation rejection, >=32-byte state secrets, query-preserving authorization URL | 086e0253 |
 | GO-20 | FIXED — rotation/revocation failure replaces the response with 503, suppresses body and cookie; onCommitError retained for observability | 086e0253 |
@@ -222,9 +217,13 @@ FALSE-POSITIVE (not reproducible in source; evidence cited).
 2. ~~**Atomic cross-model commit record**~~ — resolved 2026-09-18 (round 4).
 3. ~~**Lossless WAL schema codec**~~ — resolved 2026-09-18 (round 4).
 4. ~~**Versioned WAL framing**~~ — resolved 2026-09-18 (round 4).
-5. **WebAuthn library integration** (GO-16): new dependency + ceremony/persistence API.
-6. **Versioned/CAS session store contract** (TS-19, and the fenced half of
-   GO-20/GO-21): public API redesign across the TS and Go SDKs.
+5. ~~**WebAuthn library integration**~~ (GO-16) — resolved 2026-09-30;
+   ceremony verification and credential persistence require the documented migration.
+6. ~~**Versioned/CAS session store contract**~~ (TS-19 and the fenced half of
+   GO-20/GO-21) — resolved 2026-09-30; unversioned stores are refused.
+
+The session/WebAuthn contract migration and operational limits are documented in
+[`go/neutronauth/README.md`](go/neutronauth/README.md).
 
 ## Resolved deferrals (2026-09-18, round 4 — WAL format v2 + snapshot lease)
 
@@ -431,7 +430,7 @@ them without that folder:
    from background tasks) are not lease-gated — a backup of those models
    still relies on their own snapshot/checkpoint paths.
 
-## Reported by the ORM program, open (2026-09-24, upstream engine defects)
+## ORM program findings and remaining boundaries (reported 2026-09-24)
 
 The ORM program's Nucleus defects were originally measured on tree
 `3313729a`. X07–X12 repairs and the fresh X13 recording now distinguish
