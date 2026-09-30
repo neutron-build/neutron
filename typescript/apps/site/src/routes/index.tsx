@@ -80,7 +80,7 @@ export default function HomePage() {
           <div class="container">
             <div class="stats__grid">
               <div class="stats__item" data-animate>
-                <span class="stats__number">5,588</span>
+                <span class="stats__number">8</span>
                 <span class="stats__label">Languages</span>
               </div>
               <div
@@ -104,7 +104,7 @@ export default function HomePage() {
                 data-animate
                 style="--animate-delay: 0.3s"
               >
-                <span class="stats__number">5,552</span>
+                <span class="stats__number">5,607</span>
                 <span class="stats__label">Declared tests</span>
               </div>
             </div>
@@ -391,7 +391,7 @@ export default function HomePage() {
                     </span>
                   </div>
                   <p class="products__desc">
-                    Type-safe queries for all 14 models. Schema-in-code ORM planned.
+                    Modular APIs for 14 models, with documented maturity and transaction limits. Schema-in-code ORM planned.
                   </p>
                 </div>
               </a>

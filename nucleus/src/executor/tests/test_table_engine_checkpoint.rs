@@ -111,7 +111,7 @@ async fn checkpoint_table_engines_recovers_after_restart() {
     }
     // Reopen from the compacted snapshot exactly as main.rs would.
     let ex2 = open_executor(dir.path()).await;
-    let eng = ex2.open_columnar_engine("t");
+    let eng = ex2.open_columnar_engine("t").unwrap();
     let rows = eng.scan("t").await.unwrap();
     assert_eq!(
         rows.len(),
@@ -185,4 +185,83 @@ async fn checkpoint_table_engines_is_lossless_for_lsm() {
         other => panic!("expected Select, got {other:?}"),
     };
     assert_eq!(n, 100, "LSM checkpoint must not lose or duplicate rows");
+}
+
+#[tokio::test]
+async fn failed_durable_override_open_never_creates_an_ephemeral_table() {
+    for kind in ["columnar", "lsm"] {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = open_executor(dir.path()).await;
+        // A regular file in place of the parent directory forces a real,
+        // deterministic filesystem error without relying on permissions.
+        let blocked = dir.path().join("columnar_engines");
+        std::fs::write(&blocked, b"operator-owned obstruction").unwrap();
+        let result = ex
+            .execute(&format!(
+                "CREATE TABLE blocked (id INT) WITH (engine='{kind}')"
+            ))
+            .await;
+        assert!(result.is_err(), "{kind} must refuse a failed durable open");
+        assert!(
+            ex.catalog.get_table("blocked").await.is_none(),
+            "{kind} must not publish a table after the failed open"
+        );
+        assert_eq!(
+            std::fs::read(&blocked).unwrap(),
+            b"operator-owned obstruction"
+        );
+        std::fs::remove_file(&blocked).unwrap();
+        exec(
+            &ex,
+            &format!("CREATE TABLE blocked (id INT) WITH (engine='{kind}')"),
+        )
+        .await;
+        exec(&ex, "INSERT INTO blocked VALUES (7)").await;
+        let selected = exec(&ex, "SELECT id FROM blocked").await;
+        assert_eq!(super::rows(&selected[0]).len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn durable_override_recovery_refuses_open_failure_and_recovers_original_rows() {
+    for kind in ["columnar", "lsm"] {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = open_executor(dir.path()).await;
+        exec(
+            &ex,
+            &format!("CREATE TABLE t (id INT) WITH (engine='{kind}')"),
+        )
+        .await;
+        exec(&ex, "INSERT INTO t VALUES (7)").await;
+        ex.checkpoint_table_engines().await;
+        let engine_dir = ex.table_engine_dir("t").unwrap();
+        let preserved = engine_dir.with_extension("preserved");
+        let catalog = ex.catalog.clone();
+        drop(ex);
+        std::fs::rename(&engine_dir, &preserved).unwrap();
+        std::fs::write(&engine_dir, b"cannot open as a directory").unwrap();
+        let recovery = Executor::new_with_persistence(
+            catalog,
+            Arc::new(crate::storage::MemoryEngine::new()),
+            None,
+            Some(dir.path()),
+        );
+        assert!(
+            recovery.restore_table_engines().await.is_err(),
+            "{kind} failed recovery must refuse startup, not register an empty engine"
+        );
+        assert!(recovery.table_engines.read().is_empty());
+        assert_eq!(
+            std::fs::read(&engine_dir).unwrap(),
+            b"cannot open as a directory"
+        );
+        std::fs::remove_file(&engine_dir).unwrap();
+        std::fs::rename(&preserved, &engine_dir).unwrap();
+        recovery.restore_table_engines().await.unwrap();
+        let selected = exec(&recovery, "SELECT id FROM t").await;
+        assert_eq!(
+            super::rows(&selected[0]),
+            &vec![vec![crate::types::Value::Int32(7)]]
+        );
+    }
 }

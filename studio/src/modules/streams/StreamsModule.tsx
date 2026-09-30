@@ -1,5 +1,5 @@
 import { useSignal } from '@preact/signals'
-import { useEffect } from 'preact/hooks'
+import { useEffect, useId } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
 import { api } from '../../lib/api'
 import { DataGrid } from '../../components/DataGrid'
@@ -47,6 +47,7 @@ const sqlStr = (v: string) => `'${v.replace(/'/g, "''")}'`
 const MAX_MS = 9999999999999
 
 export function StreamsModule({ name }: StreamsModuleProps) {
+  const controlsId = useId()
   // Stream names are user-supplied (the engine has no stream listing), so the
   // tab label is only the starting value.
   const streamName = useSignal(name)
@@ -287,8 +288,9 @@ export function StreamsModule({ name }: StreamsModuleProps) {
         {showCreateGroup.value && (
           <div class={s.createGroupForm}>
             <div class={s.formRow}>
-              <label class={s.formLabel}>Group name</label>
+              <label class={s.formLabel} htmlFor={`${controlsId}-new-group`}>Group name</label>
               <input
+                id={`${controlsId}-new-group`}
                 class={s.formInput}
                 placeholder="my-consumer-group"
                 value={newGroupName.value}
@@ -296,8 +298,9 @@ export function StreamsModule({ name }: StreamsModuleProps) {
               />
             </div>
             <div class={s.formRow}>
-              <label class={s.formLabel}>Start (ms)</label>
+              <label class={s.formLabel} htmlFor={`${controlsId}-group-start`}>Start (ms)</label>
               <input
+                id={`${controlsId}-group-start`}
                 class={s.formInput}
                 type="number"
                 placeholder="0"
@@ -318,8 +321,9 @@ export function StreamsModule({ name }: StreamsModuleProps) {
         {/* Consume as group */}
         <div class={s.createGroupForm}>
           <div class={s.formRow}>
-            <label class={s.formLabel}>Group</label>
+            <label class={s.formLabel} htmlFor={`${controlsId}-group`}>Group</label>
             <input
+              id={`${controlsId}-group`}
               class={s.formInput}
               placeholder="group"
               value={consumeGroup.value}
@@ -327,8 +331,9 @@ export function StreamsModule({ name }: StreamsModuleProps) {
             />
           </div>
           <div class={s.formRow}>
-            <label class={s.formLabel}>Consumer</label>
+            <label class={s.formLabel} htmlFor={`${controlsId}-consumer`}>Consumer</label>
             <input
+              id={`${controlsId}-consumer`}
               class={s.formInput}
               placeholder="consumer"
               value={consumeConsumer.value}

@@ -15,7 +15,7 @@ this platform) with no runtime dependencies.
 
 ## Install
 
-From source (Go 1.23+):
+From source (Go 1.26+):
 
 ```bash
 cd cli && go build -o bin/neutron . && ./bin/neutron --help

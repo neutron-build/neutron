@@ -454,7 +454,9 @@ pub trait StorageEngine: Send + Sync {
     }
 
     /// Delete counterpart of [`update_if_unchanged`](Self::update_if_unchanged):
-    /// `(position, row the caller read)`.
+    /// `(position, row the caller read)`. The complete observed value must
+    /// still match; retaining the same primary key does not preserve a revision
+    /// predicate after a competing replacement.
     ///
     /// Default: ignore the positions and re-resolve each target against a fresh
     /// scan by matching the row. An engine whose positions are dense scan

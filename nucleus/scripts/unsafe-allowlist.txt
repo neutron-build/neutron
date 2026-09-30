@@ -37,7 +37,4 @@ src/config/mod.rs
 # probe entry point, before any thread that could observe the environment
 # concurrently is spawned.
 src/bin/compete.rs
-src/bin/probe_index_coherence.rs
 src/bin/probe_soak.rs
-src/executor/tests/test_index.rs
-src/executor/tests/test_specialty_persistence.rs

@@ -4,14 +4,14 @@
   "generatedAt": "2026-09-30",
   "engine": {
     "product": "nucleus",
-    "version": "1.0.2",
-    "raw": "PostgreSQL 16.0 (Nucleus 1.0.2 — The Definitive Database)"
+    "version": "1.2.0",
+    "raw": "PostgreSQL 16.0 (Nucleus 1.2.0 — The Definitive Database)"
   },
   "source": {
-    "commit": "df718e66cb3db718622f3c689f442e9fe6caabd0",
-    "nucleusTree": "133683ef5a14e645cad18e238db5d28d5aaf7eff",
+    "commit": "59fad7aed7889dff2d2efbb65c5aa4c6f14f8ea5",
+    "nucleusTree": "3c5c6035b5e6602cf65ba23c917fe83848888571",
     "nucleusDirty": false,
-    "binarySha256": "41abd49b904e633f7f8796c9b36e41ac40dc8af4d336b16d93ebd84e0315beae"
+    "binarySha256": "be4fc47554fd2be9d060d3221b14425b11db52dc3bfa0852e1be7943990e1c6a"
   },
   "drivers": {
     "pg": "8.22.0",
@@ -39,8 +39,8 @@
         "postgres": "supported"
       },
       "detail": {
-        "pg": "nucleus 1.0.2",
-        "postgres": "nucleus 1.0.2"
+        "pg": "nucleus 1.2.0",
+        "postgres": "nucleus 1.2.0"
       }
     },
     {
@@ -52,8 +52,8 @@
         "postgres": "supported"
       },
       "detail": {
-        "pg": "probe succeeded on nucleus 1.0.2 (\"select to_jsonb(1)::text as a, jsonb_build_object('k', 1)::t...\")",
-        "postgres": "probe succeeded on nucleus 1.0.2 (\"select to_jsonb(1)::text as a, jsonb_build_object('k', 1)::t...\")"
+        "pg": "probe succeeded on nucleus 1.2.0 (\"select to_jsonb(1)::text as a, jsonb_build_object('k', 1)::t...\")",
+        "postgres": "probe succeeded on nucleus 1.2.0 (\"select to_jsonb(1)::text as a, jsonb_build_object('k', 1)::t...\")"
       }
     },
     {
@@ -1093,8 +1093,8 @@
         "postgres": "unsupported"
       },
       "detail": {
-        "pg": "wrong result: Expected values to be strictly deep-equal: + actual - expected    [     true, +   '672113329'",
-        "postgres": "wrong result: Expected values to be strictly deep-equal: + actual - expected    [     true, +   '1022078885'"
+        "pg": "wrong result: Expected values to be strictly deep-equal: + actual - expected    [     true, +   '956476087'",
+        "postgres": "wrong result: Expected values to be strictly deep-equal: + actual - expected    [     true, +   '86069939'"
       }
     },
     {
@@ -1171,8 +1171,8 @@
         "postgres": "unsupported"
       },
       "detail": {
-        "pg": "server error: ServerSqlError [42P01]: pg: relation \"x00d_99e4a8_base\" does not exist",
-        "postgres": "server error: ServerSqlError [42P01]: postgres: relation \"x00d_9b1ad1_base\" does not exist"
+        "pg": "server error: ServerSqlError [42P01]: pg: relation \"x00d_a6699b_base\" does not exist",
+        "postgres": "server error: ServerSqlError [42P01]: postgres: relation \"x00d_fd9b70_base\" does not exist"
       },
       "sqlstate": {
         "pg": "42P01",
@@ -1352,8 +1352,8 @@
         "postgres": "unknown"
       },
       "detail": {
-        "pg": "setup failed: ServerSqlError [0A000]: pg: ALTER TABLE operation not yet supported: OWNER TO x00s_68e605_app — in: alter table x00s_68e605_docs owner to x00s_68e605_app",
-        "postgres": "setup failed: ServerSqlError [0A000]: postgres: ALTER TABLE operation not yet supported: OWNER TO x00s_1a8372_app — in: alter table x00s_1a8372_docs owner to x00s_1a8372_app"
+        "pg": "setup failed: ServerSqlError [0A000]: pg: ALTER TABLE operation not yet supported: OWNER TO x00s_ed4c52_app — in: alter table x00s_ed4c52_docs owner to x00s_ed4c52_app",
+        "postgres": "setup failed: ServerSqlError [0A000]: postgres: ALTER TABLE operation not yet supported: OWNER TO x00s_b2377b_app — in: alter table x00s_b2377b_docs owner to x00s_b2377b_app"
       }
     },
     {
@@ -1537,8 +1537,8 @@
         "postgres": "unsupported"
       },
       "detail": {
-        "pg": "wrong result: update of a row locked by an open transaction: expected SQLSTATE 55P03, got ServerSqlError [XX000]: pg: I/O error: timed out after 10001ms waiting for another transaction to release a conflicting unique key on 'x00l_b97cde'",
-        "postgres": "wrong result: update of a row locked by an open transaction: expected SQLSTATE 55P03, got ServerSqlError [XX000]: postgres: I/O error: timed out after 10002ms waiting for another transaction to release a conflicting unique key on 'x00l_1bac64'"
+        "pg": "wrong result: update of a row locked by an open transaction: expected SQLSTATE 55P03, got ServerSqlError [XX000]: pg: I/O error: timed out after 10002ms waiting for another transaction to release a conflicting unique key on 'x00l_290a18'",
+        "postgres": "wrong result: update of a row locked by an open transaction: expected SQLSTATE 55P03, got ServerSqlError [XX000]: postgres: I/O error: timed out after 10001ms waiting for another transaction to release a conflicting unique key on 'x00l_7ccf02'"
       }
     },
     {

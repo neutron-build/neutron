@@ -124,8 +124,8 @@ ALTER TABLE _neutron_migration_lock ADD COLUMN IF NOT EXISTS owner TEXT`;
 
 /** Bootstrap DDL is written IF NOT EXISTS, but two cold runners racing the
  * same statement can both decide to create: Postgres breaks the tie with a
- * unique violation on the catalog row (pg_type_typname_nsp_index, SQLSTATE
- * 23505) and the loser's statement fails despite IF NOT EXISTS. Retry with
+ * catalog unique violation (23505) or duplicate table (42P07), and the
+ * loser's statement fails despite IF NOT EXISTS. Retry with
  * backoff — the winner's create commits and the re-run is a no-op. */
 async function executeBootstrapDdl(transport: Transport, sql: string): Promise<void> {
   for (let attempt = 0; ; attempt++) {
@@ -133,7 +133,9 @@ async function executeBootstrapDdl(transport: Transport, sql: string): Promise<v
       await transport.execute(sql);
       return;
     } catch (err) {
-      if (attempt >= 5 || sqlState(err) !== '23505') throw err;
+      const code = sqlState(err);
+      const coldCreateRace = code === '42P07' && /^\s*CREATE TABLE IF NOT EXISTS\b/i.test(sql);
+      if (attempt >= 5 || (code !== '23505' && !coldCreateRace)) throw err;
       await sleep(25 * (attempt + 1));
     }
   }
@@ -169,7 +171,10 @@ async function appliedRows(transport: Transport): Promise<Map<number, AppliedRow
 /** Sort a copy ascending by version and validate the plan before any SQL
  * runs: duplicates and empty names/up are refused up front. */
 function prepareMigrations(migrations: Migration[]): Migration[] {
-  const sorted = [...migrations].sort((a, b) => a.version - b.version);
+  // Copy primitive fields before the first await: callers retain their array
+  // and records while a claim wait or statement execution is in progress.
+  const sorted = migrations.map(({ version, name, up, down }) => ({ version, name, up, down }))
+    .sort((a, b) => a.version - b.version);
   const seen = new Set<number>();
   for (const m of sorted) {
     if (!Number.isInteger(m.version) || m.version <= 0) {
@@ -317,9 +322,11 @@ export async function forceUnlockMigrations(transport: Transport): Promise<void>
 /**
  * Run all pending migrations in ascending version order.
  *
- * Each migration runs inside its own transaction with its DDL, checksum,
- * owner and format committed atomically. Serialized across runners by the
- * ledger claim; a legacy history is refused until adoptMigrations graduates
+ * Each migration runs inside its own transaction, including checksum,
+ * owner and format history updates. PostgreSQL rolls back migration DDL;
+ * Nucleus catalog DDL can remain after failure and requires reconciliation
+ * before retry. Serialized across runners by the ledger claim; a legacy
+ * history is refused until adoptMigrations graduates
  * it. Returns the names of the migrations that were applied.
  */
 export async function migrate(
@@ -415,7 +422,9 @@ export async function migrateDown(
 
 /**
  * Explicitly graduate a legacy history into protocol v2, in one
- * transaction (contracts/data/MIGRATIONS.md §6). Never fabricates trust:
+ * transaction (contracts/data/MIGRATIONS.md §6). PostgreSQL also rolls back
+ * metadata-column DDL; Nucleus may retain nullable columns after a later
+ * failure. Digest mismatches are refused before that DDL. Never fabricates trust:
  * a recorded legacy Go SDK digest that reproduces from the supplied plan
  * adopts the row as verified; everything else adopts as unverified with a
  * NULL checksum; a recorded checksum matching neither digest aborts the
@@ -436,15 +445,39 @@ export async function adoptMigrations(
     const exists = await transport.fetchval<number>(
       'SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = \'_neutron_migrations\')');
     if (!exists) throw new Error('nucleus: nothing to adopt: no migration history exists');
-    await ensureTable(transport);
 
     const byVersion = new Map(plan.map((m) => [m.version, m]));
-    const history = await transport.query<{ version: number; name: string; checksum: string | null }>(
-      'SELECT version, name, checksum FROM _neutron_migrations');
-
     const report: MigrationAdoptionReport = { verified: [], unverified: [] };
-    const tx = await transport.beginTransaction();
+    const isNucleus = String(await transport.fetchval('SELECT version()')).includes('Nucleus');
+    let tx = await transport.beginTransaction();
     try {
+      const hasChecksum = await tx.fetchval<boolean>(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = '_neutron_migrations' AND column_name = 'checksum')");
+      const history = await tx.query<{ version: number; name: string; checksum: string | null }>(
+        hasChecksum ? 'SELECT version, name, checksum FROM _neutron_migrations' :
+          'SELECT version, name, NULL AS checksum FROM _neutron_migrations');
+      // Validate every digest before nullable-column DDL: catalog DDL is not
+      // rolled back by Nucleus, whereas PostgreSQL rolls it back with this tx.
+      for (const row of history.rows) {
+        const version = Number(row.version);
+        const m = byVersion.get(version);
+        if (m && row.checksum != null && row.checksum !== migrationChecksum(m.up) &&
+            row.checksum !== legacyGoSdkChecksum(version, row.name, m.up)) {
+          throw new Error(`nucleus: adoption refused: migration ${version} (${row.name}) has a recorded checksum that matches neither the supplied plan nor the legacy Go SDK digest — restore the applied SQL or reconcile manually`);
+        }
+      }
+      if (isNucleus) {
+        // Finish the old tuple-layout snapshot before nontransactional DDL.
+        // The same ledger claim covers preflight, upgrade, and graduation.
+        await tx.rollback();
+        await ensureTable(transport);
+        tx = await transport.beginTransaction();
+      } else {
+        // Do not retry a DDL error inside an aborted PostgreSQL transaction.
+        for (const ddl of [MIGRATIONS_ADD_CHECKSUM, MIGRATIONS_ADD_OWNER, MIGRATIONS_ADD_FORMAT]) {
+          await tx.execute(ddl);
+        }
+      }
       for (const row of history.rows) {
         const version = Number(row.version);
         const m = byVersion.get(version);

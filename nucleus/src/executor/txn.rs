@@ -145,6 +145,19 @@ impl Executor {
 
     /// COMMIT -- end the transaction, making all changes permanent.
     pub(super) async fn commit_transaction(&self) -> Result<ExecResult, ExecError> {
+        if super::derived_coherence::WRITER_GENERATION
+            .try_with(|_| ())
+            .is_ok()
+        {
+            return self.commit_transaction_inner().await;
+        }
+        let writer = self.derived_coherence.begin_write();
+        super::derived_coherence::WRITER_GENERATION
+            .scope(writer.generation, self.commit_transaction_inner())
+            .await
+    }
+
+    async fn commit_transaction_inner(&self) -> Result<ExecResult, ExecError> {
         let sess = self.current_session();
         // Deferred foreign keys are checked while the transaction is still
         // open, before its state lock is taken (the checks read tables). A
@@ -379,6 +392,19 @@ impl Executor {
     /// With MVCC, this marks the transaction as aborted so its writes become
     /// invisible. Without MVCC, restores all tables from the cloned snapshot.
     pub(super) async fn rollback_transaction(&self) -> Result<ExecResult, ExecError> {
+        if super::derived_coherence::WRITER_GENERATION
+            .try_with(|_| ())
+            .is_ok()
+        {
+            return self.rollback_transaction_inner().await;
+        }
+        let writer = self.derived_coherence.begin_write();
+        super::derived_coherence::WRITER_GENERATION
+            .scope(writer.generation, self.rollback_transaction_inner())
+            .await
+    }
+
+    async fn rollback_transaction_inner(&self) -> Result<ExecResult, ExecError> {
         let sess = self.current_session();
         sess.reset_deferred_fks();
         let txn = sess.txn_state.write().await;

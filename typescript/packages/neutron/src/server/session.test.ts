@@ -274,3 +274,73 @@ function extractCookieValue(header: string, name: string): string {
   }
   return "";
 }
+
+it('does not recreate a session revoked while a request is in flight', async () => {
+  const storage = createMemorySessionStorage();
+  await storage.setSession('revoked-race', { userId: 'alice' });
+  const middleware = sessionMiddleware({ storage, cookie: { name: 'sid' } });
+  let entered!: () => void;
+  let resume!: () => void;
+  const reached = new Promise<void>(r => { entered = r; });
+  const blocked = new Promise<void>(r => { resume = r; });
+  const staleContext: AppContext = {};
+  const logoutContext: AppContext = {};
+  const stale = runMiddlewareChain([middleware], new Request('https://example.test/', {headers: {Cookie: 'sid=revoked-race'}}), staleContext, async () => {
+    entered();
+    await blocked;
+    // The old request updates authenticated data after logout completed.
+    getSessionFromContext(staleContext)?.set('lastVisit', 1);
+    return new Response('sensitive old response');
+  });
+  await reached;
+  await runMiddlewareChain([middleware], new Request('https://example.test/', {headers: {Cookie: 'sid=revoked-race'}}), logoutContext, async () => {
+    getSessionFromContext(logoutContext)?.destroy();
+    return new Response('logged out');
+  });
+  resume();
+  const response = await stale;
+  expect(await storage.getSession('revoked-race')).toBeNull();
+  expect(response.status).toBe(503);
+  expect(response.headers.get('Set-Cookie')).toBeNull();
+  expect(await response.text()).not.toContain('sensitive');
+});
+
+it('atomically rotates and rejects stale writes and target collisions', async () => {
+ const storage=createMemorySessionStorage();
+ await storage.setSession('old',{user:'alice'});
+ const before=(await storage.getSession('old'))!;
+ await storage.setSession('occupied',{user:'bob'});
+ expect(await storage.commitSession!('old',before.revision!,{id:'occupied',data:{user:'alice'}})).toBe(false);
+ expect((await storage.getSession('old'))?.revision).toBe(before.revision);
+ expect((await storage.getSession('occupied'))?.data.user).toBe('bob');
+ expect(await storage.commitSession!('old',before.revision!,{id:'new',data:{user:'alice'}})).toBe(true);
+ expect(await storage.getSession('old')).toBeNull();
+ expect((await storage.getSession('new'))?.data.user).toBe('alice');
+ expect(await storage.commitSession!('old',before.revision!,{id:'old',data:{user:'alice'}})).toBe(false);
+});
+
+it('rejects stale revision after deletion and reuse of the same ID', async () => {
+ const storage=createMemorySessionStorage();
+ await storage.setSession('reused',{user:'alice'});
+ const old=(await storage.getSession('reused'))!;
+ await storage.deleteSession('reused');
+ await storage.setSession('reused',{user:'bob'});
+ expect(await storage.commitSession!('reused',old.revision!,{id:'reused',data:{user:'alice'}})).toBe(false);
+ expect((await storage.getSession('reused'))?.data.user).toBe('bob');
+});
+
+it('does not run handlers with an unversioned store', async () => {
+ let ran=false;
+ const middleware=sessionMiddleware({storage:{getSession:async()=>null,setSession:async()=>{},deleteSession:async()=>{}}});
+ const response=await runMiddlewareChain([middleware],new Request('https://example.test/'),{},async()=>{ran=true;return new Response('secret');});
+ expect(ran).toBe(false);expect(response.status).toBe(503);
+ expect(response.headers.get('Set-Cookie')).toBeNull();
+});
+
+it('suppresses response and cookie when atomic commit fails', async () => {
+ const storage=createMemorySessionStorage();storage.commitSession=async()=>{throw new Error('private backend details');};
+ const middleware=sessionMiddleware({storage});
+ const response=await runMiddlewareChain([middleware],new Request('https://example.test/'),{},async()=>new Response('secret'));
+ expect(response.status).toBe(503);expect(response.headers.get('Set-Cookie')).toBeNull();
+ expect(await response.text()).not.toMatch(/secret|private/);
+});

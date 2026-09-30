@@ -436,7 +436,7 @@ published CLI targets) and onboarding on Linux.
 - **Open items** (each fails safely; tracked, not fixed):
   - On a table whose `AFTER` trigger updates the row it fired for, two edits
     of one row in one batch conflict (409). Commit them in separate batches.
-  - The CDC and Streams modules have form labels that name no control.
+  - CDC and Streams form labels target their controls with IDs unique to each mounted module.
   - The MCP server's read-only default is best-effort on Nucleus (see
     `neutron mcp` in the CLI reference).
 

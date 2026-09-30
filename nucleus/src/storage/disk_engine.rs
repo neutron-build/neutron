@@ -1669,8 +1669,10 @@ impl DiskEngine {
 
     /// Delete tuples at stable row addresses. `expected` is the row the caller
     /// read; when present, the tuple is deleted only if it still holds that
-    /// row's identity, so a position whose slot was recycled by a later insert
-    /// cannot delete the row that took its place.
+    /// complete value. Primary-key identity alone cannot validate a conditional
+    /// delete: a competing transaction may replace the same key with a newer
+    /// revision in the recycled slot. Check the observed tuple under the page
+    /// write latch before deleting it.
     fn delete_at(
         &self,
         table: &str,
@@ -1681,8 +1683,6 @@ impl DiskEngine {
             let indexes = self.indexes.read();
             indexes.values().any(|idx| idx.table == table)
         };
-        let verifying = targets.iter().any(|(_, expected)| expected.is_some());
-        let identity = verifying.then(|| self.identity_cols(table)).flatten();
         let mut count = 0usize;
 
         // Index maintenance for the rows removed on the current page. Collected
@@ -1719,8 +1719,7 @@ impl DiskEngine {
                     let current = tuple::deserialize_row(&pg[off..off + len], &col_types);
                     if let Some(expected) = &expected {
                         match &current {
-                            Some(row)
-                                if Self::same_row_identity(expected, row, identity.as_ref()) => {}
+                            Some(row) if row == expected => {}
                             // A different row occupies the address now — the slot
                             // was freed and recycled while the caller was resolving
                             // the rest of the statement. Leave it alone.

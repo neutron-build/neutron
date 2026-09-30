@@ -198,12 +198,12 @@ func commandContext(cmd *cobra.Command) (context.Context, context.CancelFunc) {
 }
 
 // migrateSessionGuard connects, refuses Nucleus targets (SDK runners own
-// Nucleus migrations; the CLI file workflow targets PostgreSQL), reads the
-// migration files, then acquires the advisory-lock session. Files are read
-// before locking so the lock is never held across local disk I/O; the lock
+// Nucleus migrations; the CLI file workflow targets PostgreSQL), captures
+// an immutable bundle, then acquires the advisory-lock session. Files are read
+// before locking; later validation reads only that private bundle. The lock
 // wait itself honors the run's deadline/cancellation. The returned release
 // function must be deferred by the caller.
-func migrateSessionGuard(ctx context.Context, dir string) (*db.Client, []db.MigrationFile, *db.MigrationSession, func(), error) {
+func migrateSessionGuard(ctx context.Context, dir string) (*db.Client, *migrationInputs, *db.MigrationSession, func(), error) {
 	url := config.DatabaseURL()
 
 	client, err := db.Connect(ctx, url)
@@ -213,25 +213,29 @@ func migrateSessionGuard(ctx context.Context, dir string) (*db.Client, []db.Migr
 	closeAll := func() { client.Close() }
 
 	if isNucleus, _, err := client.IsNucleus(ctx); err == nil && isNucleus {
-		return nil, nil, nil, closeAll, fmt.Errorf(
+		closeAll()
+		return nil, nil, nil, nil, fmt.Errorf(
 			"this database is a Nucleus server: `neutron migrate` targets PostgreSQL — " +
 				"Nucleus migration runners are the language SDKs (go/nucleus, @neutron-build/nucleus) and stay experimental")
 	}
 
-	files, err := db.ReadMigrationFiles(dir)
+	inputs, removeInputs, err := captureMigrationInputs(dir)
 	if err != nil {
-		return nil, nil, nil, closeAll, err
+		closeAll()
+		return nil, nil, nil, nil, err
 	}
+	closeAll = func() { removeInputs(); client.Close() }
 
 	sess, err := client.LockMigrations(ctx)
 	if err != nil {
-		return nil, nil, nil, closeAll, err
+		closeAll()
+		return nil, nil, nil, nil, err
 	}
 	release := func() {
 		sess.Release()
-		client.Close()
+		closeAll()
 	}
-	return client, files, sess, release, nil
+	return client, inputs, sess, release, nil
 }
 
 // prepareHistoryRun validates the history shape and returns the applied
@@ -288,16 +292,18 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 	ctx, cancel := commandContext(cmd)
 	defer cancel()
 
-	client, files, sess, release, err := migrateSessionGuard(ctx, dir)
+	client, inputs, sess, release, err := migrateSessionGuard(ctx, dir)
 	if err != nil {
 		return err
 	}
 	defer release()
+	files := inputs.files
 
 	if len(files) == 0 {
 		ui.Warnf("No migration files found in %s", dir)
 		return nil
 	}
+	dir = inputs.dir
 
 	applied, err := prepareHistoryRun(ctx, client, sess, files)
 	if err != nil {
@@ -433,11 +439,13 @@ func runMigrateAdopt(cmd *cobra.Command, args []string) error {
 	ctx, cancel := commandContext(cmd)
 	defer cancel()
 
-	client, files, sess, release, err := migrateSessionGuard(ctx, dir)
+	client, inputs, sess, release, err := migrateSessionGuard(ctx, dir)
 	if err != nil {
 		return err
 	}
 	defer release()
+	dir = inputs.dir
+	files := inputs.files
 
 	shape, err := client.InspectMigrationHistory(ctx)
 	if err != nil {
@@ -600,11 +608,12 @@ func runMigrateDown(cmd *cobra.Command, args []string) error {
 	ctx, cancel := commandContext(cmd)
 	defer cancel()
 
-	client, _, sess, release, err := migrateSessionGuard(ctx, dir)
+	client, inputs, sess, release, err := migrateSessionGuard(ctx, dir)
 	if err != nil {
 		return err
 	}
 	defer release()
+	dir = inputs.dir
 
 	downFiles, err := db.ReadDownMigrationFiles(dir)
 	if err != nil {

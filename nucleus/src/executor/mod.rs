@@ -31,7 +31,7 @@ use crate::reactive::{ChangeEvent, ChangeNotifier, ChangeType, SubscriptionManag
 use crate::sql;
 #[cfg(feature = "server")]
 use crate::storage::STORAGE_SESSION_ID;
-use crate::storage::StorageEngine;
+use crate::storage::{StorageEngine, StorageError};
 use crate::types::{DataType, Row, Value};
 use crate::vector;
 
@@ -134,6 +134,7 @@ mod cross_model;
 mod ddl;
 mod deferred_fk;
 pub(crate) use deferred_fk::SET_CONSTRAINTS_SETTING;
+mod derived_coherence;
 mod dml;
 pub(crate) mod enlistment;
 mod expr;
@@ -870,6 +871,9 @@ pub struct Executor {
     /// Tracks min/max per column per 8K-row granule. Expected speedup: 5-10x on selective queries.
     #[allow(dead_code)]
     zone_map_index: crate::storage::granule_stats::ZoneMapIndex,
+    derived_coherence: derived_coherence::DerivedCoherence,
+    #[cfg(test)]
+    derived_publish_hook: parking_lot::Mutex<Option<derived_coherence::PublishHook>>,
     /// Memory pressure flag: set by the watchdog when RSS exceeds the critical
     /// threshold (90% of --max-memory). Write operations (INSERT, UPDATE, DELETE,
     /// TRUNCATE) are rejected while this flag is set. Cleared when RSS drops
@@ -1256,6 +1260,9 @@ impl Executor {
             plan_cache: parking_lot::RwLock::new(PlanCache::new(1024)),
             ast_cache: parking_lot::RwLock::new(AstCache::new(4096)),
             zone_map_index: crate::storage::granule_stats::ZoneMapIndex::new(),
+            derived_coherence: derived_coherence::DerivedCoherence::default(),
+            #[cfg(test)]
+            derived_publish_hook: parking_lot::Mutex::new(None),
             memory_critical: Arc::new(AtomicBool::new(false)),
             reject_writes_on_memory_critical: Arc::new(AtomicBool::new(false)),
             security: parking_lot::RwLock::new(crate::security::SecurityManager::new()),
@@ -1300,12 +1307,26 @@ impl Executor {
         }
     }
 
+    /// Compatibility constructor. Invalid persisted FTS checkpoints refuse
+    /// construction with a diagnostic panic; use `try_new_with_persistence`
+    /// to handle recovery errors without unwinding.
     pub fn new_with_persistence(
         catalog: Arc<Catalog>,
         storage: Arc<dyn StorageEngine>,
         catalog_path: Option<std::path::PathBuf>,
         data_dir: Option<&std::path::Path>,
     ) -> Self {
+        Self::try_new_with_persistence(catalog, storage, catalog_path, data_dir)
+            .unwrap_or_else(|error| panic!("executor recovery refused: {error}"))
+    }
+
+    /// Recover persistent model state, refusing an incomplete FTS checkpoint base.
+    pub fn try_new_with_persistence(
+        catalog: Arc<Catalog>,
+        storage: Arc<dyn StorageEngine>,
+        catalog_path: Option<std::path::PathBuf>,
+        data_dir: Option<&std::path::Path>,
+    ) -> Result<Self, ExecError> {
         let mut exec = Self::new(catalog, storage);
         exec.catalog_path = catalog_path;
         exec.data_dir = data_dir.map(|d| d.to_path_buf());
@@ -1376,18 +1397,14 @@ impl Executor {
             // FTS index: WAL-backed crash-recovery (open replays all logged operations)
             let fts_dir = dir.join("fts");
             std::fs::create_dir_all(&fts_dir).ok();
-            if let Some((idx, tail)) = Self::open_durable(
-                "FTS",
-                &fts_dir,
-                fts::InvertedIndex::open_with_tail(&fts_dir),
-            ) {
-                *exec.fts_index.write() = idx;
-                // Kept so `load_fts_index` can apply it on top of the
-                // `fts_index.json` checkpoint (NU-014). Without it the
-                // checkpoint would silently discard everything written since
-                // the last one.
-                exec.fts_wal_tail = Some(tail);
-            }
+            let (index, tail) = fts::InvertedIndex::open_with_tail(&fts_dir).map_err(|error| {
+                ExecError::Storage(StorageError::Io(format!(
+                    "FTS WAL at {} could not open: {error}; recovery refused because its tail is required for complete durable state",
+                    fts_dir.display()
+                )))
+            })?;
+            *exec.fts_index.write() = index;
+            exec.fts_wal_tail = Some(tail);
 
             // Vector indexes: WAL + snapshot recovery
             let vec_dir = dir.join("vector");
@@ -1621,8 +1638,8 @@ impl Executor {
             exec.stats_path = Some(sp);
         }
 
-        exec.load_fts_index();
-        exec
+        exec.load_fts_index()?;
+        Ok(exec)
     }
 
     /// Return the path used for persisting the FTS index alongside the catalog.
@@ -1683,108 +1700,40 @@ impl Executor {
         Ok(())
     }
 
-    /// Load the FTS index from disk at startup (called by new_with_persistence).
-    /// Load the legacy `fts_index.json`, which **overrides** the WAL-backed
-    /// index opened above.
-    ///
-    /// Two things about this are measured facts, not readings of the code, and
-    /// both matter before anyone "fixes" the override:
-    ///
-    /// 1. From the SECOND boot onward the FTS WAL receives nothing. Once this
-    ///    file exists, the index is replaced by a `from_json` one, and
-    ///    `InvertedIndex::wal` is `#[serde(skip)]`, so the live index has
-    ///    `wal: None` and all three WAL write sites are `if let Some(wal)`.
-    ///    Measured: WAL directory 64 bytes before a second session's write and
-    ///    64 bytes after it; the document was searchable only while the JSON
-    ///    was present.
-    /// 2. The obvious fix — let the WAL win — would DESTROY DATA on upgrade,
-    ///    because every existing deployment's WAL has been stale since its own
-    ///    second boot, and the JSON is the only copy of everything written
-    ///    since.
-    ///
-    /// And it cannot be migrated the easy way either: the WAL stores original
-    /// document text and replays it, while the JSON stores derived postings and
-    /// `DocInfo` keeps only a length. There is no text to rebuild a WAL from, so
-    /// JSON -> WAL is not a conversion, it is a re-index from base tables. That
-    /// is a product decision with a migration, not a bug fix, and it is filed
-    /// rather than taken here.
-    ///
-    /// What IS fixed here: the read and parse errors used to be swallowed
-    /// entirely — `if let Ok(..) && let Ok(..)` — so a corrupt legacy file
-    /// silently reverted FTS to whatever the stale WAL happened to hold, with
-    /// no message anywhere. Given this file is the authoritative store, that is
-    /// the same silent-empty-recovery shape as the rest of this class.
-    ///
-    /// **NU-014, 2026-08-19: the checkpoint/tail split above is now what
-    /// happens.** The two are no longer rivals. `fts_index.json` is loaded as
-    /// the base, the WAL handle is RE-ATTACHED to it (the `serde(skip)` is the
-    /// whole bug — a deserialized index had `wal: None` and every write site is
-    /// an `if let Some(wal)`), and the WAL's recovered state is applied on top
-    /// as a tail. `save_fts_index` then truncates the tail after each
-    /// checkpoint, so the two cannot diverge again.
-    ///
-    /// No migration: an existing deployment's JSON is the seed, exactly as
-    /// before, and its stale WAL contributes whatever it holds — which is a
-    /// subset of the JSON, so applying it is a no-op.
-    fn load_fts_index(&mut self) {
+    /// Load the checkpoint base, reattach its durable WAL, and replay the tail.
+    /// A missing checkpoint is valid on first boot. An existing unreadable or
+    /// malformed base cannot be replaced by the tail: successful checkpoints
+    /// truncate that tail, so doing so would silently lose checkpointed docs.
+    fn load_fts_index(&mut self) -> Result<(), ExecError> {
         let Some(path) = self.fts_persist_path() else {
-            return;
+            return Ok(());
         };
         let data = match std::fs::read_to_string(&path) {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-            Err(e) => {
-                tracing::error!(
-                    target: "nucleus::startup",
-                    "FTS index at {} exists but could not be read: {e}. Falling back to the \
-                     WAL-backed index, which has not been written to since this file was \
-                     first created — expect missing documents.",
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(ExecError::Storage(StorageError::Io(format!(
+                    "FTS checkpoint {} could not be read: {error}; recovery refused because the WAL tail may omit checkpointed documents. Preserve the checkpoint and restore a verified backup",
                     path.display()
-                );
-                return;
+                ))));
             }
         };
-        match fts::InvertedIndex::from_json(&data) {
-            Ok(mut idx) => {
-                // Carry the WAL handle across from the index the WAL built, so
-                // this session's writes are logged. Without this the
-                // checkpoint replaced a live index with a dead one.
-                let wal = self.fts_index.read().wal_handle();
-                match wal {
-                    Some(wal) => idx.attach_wal(wal),
-                    None => tracing::warn!(
-                        target: "nucleus::startup",
-                        "FTS: no WAL handle to re-attach after loading {}. Writes this session \
-                         will not be logged; the checkpoint file is the only durable copy.",
-                        path.display()
-                    ),
-                }
-                // Then the tail on top. Idempotent: re-applying an entry the
-                // checkpoint already holds re-indexes the same document.
-                if let Some(tail) = self.fts_wal_tail.take() {
-                    let (docs, removed) = (tail.docs.len(), tail.removed.len());
-                    idx.apply_wal_tail(&tail);
-                    if docs > 0 || removed > 0 {
-                        tracing::info!(
-                            target: "nucleus::startup",
-                            "FTS: applied a WAL tail of {docs} document(s) and {removed} \
-                             removal(s) on top of {}",
-                            path.display()
-                        );
-                    }
-                }
-                *self.fts_index.write() = idx;
-            }
-            Err(e) => {
-                tracing::error!(
-                    target: "nucleus::startup",
-                    "FTS index at {} did not parse: {e}. Falling back to the WAL-backed index, \
-                     which has not been written to since this file was first created — expect \
-                     missing documents.",
-                    path.display()
-                );
-            }
+        let mut index = fts::InvertedIndex::from_json(&data).map_err(|error| {
+            ExecError::Storage(StorageError::Io(format!(
+                "FTS checkpoint {} did not parse: {error}; recovery refused because the WAL tail may omit checkpointed documents. Preserve the checkpoint and restore a verified backup",
+                path.display()
+            )))
+        })?;
+        // A deserialized checkpoint has no handle (`serde(skip)`). Preserve the
+        // attached WAL opened earlier before publishing the reconstructed index.
+        if let Some(wal) = self.fts_index.read().wal_handle() {
+            index.attach_wal(wal);
         }
+        if let Some(tail) = self.fts_wal_tail.take() {
+            index.apply_wal_tail(&tail);
+        }
+        *self.fts_index.write() = index;
+        Ok(())
     }
 
     /// Synchronously persist only the sequence state to `sequences.json`.
@@ -2146,6 +2095,14 @@ impl Executor {
     /// HNSW and Graph indexes are handled by their own WAL-based recovery and do not
     /// need to be rebuilt here.
     pub async fn rebuild_specialty_indexes(&self) {
+        let writer = self.derived_coherence.begin_write();
+        derived_coherence::WRITER_GENERATION
+            .scope(writer.generation, self.rebuild_specialty_indexes_inner())
+            .await;
+    }
+
+    async fn rebuild_specialty_indexes_inner(&self) {
+        let generation = self.derived_coherence.generation();
         let all_indexes = self.catalog.get_all_indexes().await;
 
         // Snapshot the set of already-loaded HNSW vector indexes (don't overwrite them).
@@ -2237,73 +2194,9 @@ impl Executor {
                     );
                 }
                 crate::catalog::IndexType::BTree if idx.options.contains_key("encryption_mode") => {
-                    // Encrypted index: try to rebuild using env key.
-                    let key_bytes: Option<[u8; 32]> =
-                        std::env::var("NUCLEUS_ENCRYPTION_KEY").ok().and_then(|k| {
-                            let b = k.into_bytes();
-                            if b.len() == 32 {
-                                let mut arr = [0u8; 32];
-                                arr.copy_from_slice(&b);
-                                Some(arr)
-                            } else {
-                                None
-                            }
-                        });
-                    let Some(key) = key_bytes else {
-                        tracing::warn!(
-                            "Encrypted index '{}' not restored: NUCLEUS_ENCRYPTION_KEY not available",
-                            idx.name
-                        );
-                        continue;
-                    };
-
-                    let mode_str = idx
-                        .options
-                        .get("encryption_mode")
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
-                    let mode = if mode_str.contains("Order") || mode_str.contains("OPE") {
-                        crate::storage::encrypted_index::EncryptionMode::OrderPreserving
-                    } else if mode_str.contains("Random") {
-                        crate::storage::encrypted_index::EncryptionMode::Randomized
-                    } else {
-                        crate::storage::encrypted_index::EncryptionMode::Deterministic
-                    };
-
-                    let col_name = match idx.columns.first() {
-                        Some(c) => c.clone(),
-                        None => continue,
-                    };
-                    let table_def = match self.catalog.get_table(&idx.table_name).await {
-                        Some(d) => d,
-                        None => continue,
-                    };
-                    let col_idx = table_def.column_index(&col_name);
-
-                    let mut enc_idx =
-                        crate::storage::encrypted_index::EncryptedIndex::new(key, mode);
-                    if let Some(ci) = col_idx {
-                        let rows = self.storage.scan(&idx.table_name).await.unwrap_or_default();
-                        for (row_id, row) in rows.iter().enumerate() {
-                            if ci < row.len() {
-                                let plaintext = self.value_to_text_string(&row[ci]);
-                                enc_idx.insert(plaintext.as_bytes(), row_id as u64);
-                            }
-                        }
-                        tracing::info!(
-                            "Rebuilt encrypted index '{}' from {} rows",
-                            idx.name,
-                            rows.len()
-                        );
-                    }
-
-                    self.encrypted_indexes.write().insert(
-                        idx.name.clone(),
-                        EncryptedIndexEntry {
-                            table_name: idx.table_name.clone(),
-                            column_name: col_name,
-                            index: enc_idx,
-                        },
+                    tracing::warn!(
+                        "Legacy encrypted index '{}' is unavailable: no secure encryption mode is implemented; base table rows remain readable",
+                        idx.name
                     );
                 }
                 _ => {}
@@ -2369,6 +2262,26 @@ impl Executor {
         }
 
         self.rebuild_all_gin_indexes().await;
+        let vector_tables: Vec<_> = self
+            .vector_indexes
+            .read()
+            .values()
+            .map(|entry| entry.table_name.clone())
+            .collect();
+        let fts_tables: Vec<_> = self
+            .fts_column_indexes
+            .read()
+            .values()
+            .map(|entry| entry.table_name.clone())
+            .collect();
+        for table in vector_tables {
+            self.derived_coherence
+                .publish(generation, "position", &table, || {});
+        }
+        for table in fts_tables {
+            self.derived_coherence
+                .publish(generation, "fts", &table, || {});
+        }
     }
 
     /// Rebuild the live GIN indexes for one table from its current logical rows.
@@ -2519,6 +2432,7 @@ impl Executor {
             return;
         }
 
+        let generation = self.derived_coherence.generation();
         let Some(table_def) = self.catalog.get_table(table_name).await else {
             self.vector_indexes
                 .write()
@@ -2534,11 +2448,11 @@ impl Executor {
             .await
             .unwrap_or_default();
 
-        let key = std::env::var("NUCLEUS_ENCRYPTION_KEY")
-            .ok()
-            .and_then(|value| value.as_bytes().try_into().ok());
+        #[cfg(test)]
+        self.pause_derived_publish("position", table_name);
+
         let mut vectors = Vec::new();
-        let mut encrypted = Vec::new();
+        let encrypted: Vec<(String, EncryptedIndexEntry)> = Vec::new();
         for definition in definitions {
             let Some(column_name) = definition.columns.first().cloned() else {
                 continue;
@@ -2615,55 +2529,31 @@ impl Executor {
                 crate::catalog::IndexType::BTree
                     if definition.options.contains_key("encryption_mode") =>
                 {
-                    let Some(key) = key else {
-                        tracing::warn!(
-                            "encrypted index '{}' disabled during rebuild: NUCLEUS_ENCRYPTION_KEY is unavailable",
-                            definition.name
-                        );
-                        continue;
-                    };
-                    let mode = match definition
-                        .options
-                        .get("encryption_mode")
-                        .map(String::as_str)
-                    {
-                        Some(value) if value.contains("Order") || value.contains("OPE") => {
-                            crate::storage::encrypted_index::EncryptionMode::OrderPreserving
-                        }
-                        Some(value) if value.contains("Random") => {
-                            crate::storage::encrypted_index::EncryptionMode::Randomized
-                        }
-                        _ => crate::storage::encrypted_index::EncryptionMode::Deterministic,
-                    };
-                    let mut index = crate::storage::encrypted_index::EncryptedIndex::new(key, mode);
-                    for (row_id, row) in rows.iter().enumerate() {
-                        if let Some(value) = row.get(column_index) {
-                            let plaintext = self.value_to_text_string(value);
-                            index.insert(plaintext.as_bytes(), row_id as u64);
-                        }
-                    }
-                    encrypted.push((
-                        definition.name.clone(),
-                        EncryptedIndexEntry {
-                            table_name: table_name.to_string(),
-                            column_name,
-                            index,
-                        },
-                    ));
+                    tracing::warn!(
+                        "Legacy encrypted index '{}' is unavailable: no secure encryption mode is implemented",
+                        definition.name
+                    );
                 }
                 _ => {}
             }
         }
 
+        if !self
+            .derived_coherence
+            .publish(generation, "position", table_name, || {
+                {
+                    let mut live = self.vector_indexes.write();
+                    live.retain(|_, entry| entry.table_name != table_name);
+                    live.extend(vectors);
+                }
+                {
+                    let mut live = self.encrypted_indexes.write();
+                    live.retain(|_, entry| entry.table_name != table_name);
+                    live.extend(encrypted);
+                }
+            })
         {
-            let mut live = self.vector_indexes.write();
-            live.retain(|_, entry| entry.table_name != table_name);
-            live.extend(vectors);
-        }
-        {
-            let mut live = self.encrypted_indexes.write();
-            live.retain(|_, entry| entry.table_name != table_name);
-            live.extend(encrypted);
+            return;
         }
         self.save_vector_index_meta();
         if let Err(error) = self.checkpoint_vector_wal() {
@@ -4186,6 +4076,40 @@ impl Executor {
     /// and masking and produces the correct error or the masked result.
     // Only reachable from server-gated code, same as `table_is_fk_referenced`
     // above; without this the core-only clippy gate fails on dead_code.
+    /// A shared derived map cannot narrow another session's committed rows
+    /// while transaction-local hooks have changed it. A reader in an explicit
+    /// transaction may retain an older storage snapshot after other writers
+    /// commit; shared sidecars carry current epochs, not that reader's snapshot.
+    /// Busy active state also fails closed.
+    fn has_uncommitted_derived_writes(&self) -> bool {
+        if self.current_session().txn_active.load(Ordering::Acquire) {
+            return true;
+        }
+        let dirty = |session: &Session| match session.txn_state.try_read() {
+            Ok(txn) => txn.active && !txn.derived_dirty_tables.is_empty(),
+            Err(_) => session.txn_active.load(Ordering::Acquire),
+        };
+        dirty(&self.default_session) || self.sessions.read().values().any(|session| dirty(session))
+    }
+
+    #[cfg(feature = "server")]
+    fn table_has_specialty_relational_index(&self, table: &str) -> bool {
+        self.vector_indexes
+            .read()
+            .values()
+            .any(|entry| entry.table_name == table)
+            || self
+                .encrypted_indexes
+                .read()
+                .values()
+                .any(|entry| entry.table_name == table)
+            || self
+                .fts_column_indexes
+                .read()
+                .values()
+                .any(|entry| entry.table_name == table)
+    }
+
     #[cfg(feature = "server")]
     pub(super) fn fast_path_table_secured(&self, table: &str) -> bool {
         self.table_is_secured(table) || self.privileges_enforced_for_session()
@@ -6160,13 +6084,17 @@ impl Executor {
             return Some(Err(e));
         }
 
+        let _derived_writer = (!matches!(cmd, SqlFastPathCommand::PointSelect { .. }))
+            .then(|| self.derived_coherence.begin_write());
         match cmd {
             SqlFastPathCommand::PointSelect {
                 table,
                 where_col,
                 where_val,
             } => {
-                if self.fast_path_table_secured(table) {
+                if self.fast_path_table_secured(table)
+                    || self.table_has_specialty_relational_index(table)
+                {
                     return None;
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
@@ -6231,7 +6159,9 @@ impl Executor {
             }
 
             SqlFastPathCommand::SimpleInsert { table, values } => {
-                if self.fast_path_table_secured(table) {
+                if self.fast_path_table_secured(table)
+                    || self.table_has_specialty_relational_index(table)
+                {
                     return None;
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
@@ -6327,7 +6257,9 @@ impl Executor {
                 where_col,
                 where_val,
             } => {
-                if self.fast_path_table_secured(table) {
+                if self.fast_path_table_secured(table)
+                    || self.table_has_specialty_relational_index(table)
+                {
                     return None;
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
@@ -6430,7 +6362,9 @@ impl Executor {
                 where_col,
                 where_val,
             } => {
-                if self.fast_path_table_secured(table) {
+                if self.fast_path_table_secured(table)
+                    || self.table_has_specialty_relational_index(table)
+                {
                     return None;
                 }
                 // The fast path deletes without enforcing referential
@@ -7229,13 +7163,37 @@ impl Executor {
         {
             return Err(ExecError::Unsupported("schema changes with pending deferred foreign keys are not supported; complete or roll back the transaction first".into()));
         }
+        let outermost = derived_coherence::WRITER_GENERATION
+            .try_with(|_| ())
+            .is_err();
+        let mutates = admission::statement_mutates(&stmt)
+            || matches!(&stmt, Statement::Commit { .. } | Statement::Rollback { .. });
+        #[cfg(feature = "server")]
+        let mutates = mutates || admission::statement_carries_mutating_scalar_fn(&stmt);
+        let writer = (outermost && mutates).then(|| self.derived_coherence.begin_write());
+        let read_generation = self.derived_coherence.generation();
         session.statement_depth.fetch_add(1, Ordering::SeqCst);
         let mut guard = StatementDepthGuard {
             executor: self,
             session: session.clone(),
             completed: false,
         };
-        let result = self.execute_statement_inner(stmt).await;
+        let execution = derived_coherence::READ_GENERATION
+            .scope(read_generation, self.execute_statement_inner(stmt));
+        let result = if let Some(ref writer) = writer {
+            derived_coherence::WRITER_GENERATION
+                .scope(writer.generation, execution)
+                .await
+        } else {
+            execution.await
+        };
+
+        if result.is_ok()
+            && !session.txn_active.load(Ordering::Acquire)
+            && let Some(ref writer) = writer
+        {
+            self.derived_coherence.finish_success(writer.generation);
+        }
         guard.completed = true;
         drop(guard);
         if result.is_err() {
@@ -8137,6 +8095,9 @@ impl Executor {
         rows: &[Row],
         col_meta: &[ColMeta],
     ) -> Option<Vec<Row>> {
+        if self.has_uncommitted_derived_writes() {
+            return None;
+        }
         // Check vector subsystem health before attempting index scan.
         if self.check_subsystem("vector").is_err() {
             return None; // Fall back to full scan.
@@ -8209,6 +8170,7 @@ impl Executor {
         // column recorded on the index entry (recovery-safe: persisted in the
         // sidecar, independent of the live catalog's constraints) and located in
         // the scanned rows via col_meta. IvfFlat and no-PK indexes stay positional.
+        let coherence = self.derived_coherence.view();
         let vi = self.vector_indexes.read();
         let mut found: Option<(&VectorIndexEntry, Option<usize>)> = None;
         for entry in vi.values() {
@@ -8226,6 +8188,9 @@ impl Executor {
             }
         }
         let (entry, pk_col) = found?;
+        if !coherence.current("position", &entry.table_name) {
+            return None;
+        }
 
         // VEC-1: the metric argument must agree with the index's metric. An
         // absent args[2] means L2 — the same default scalar_fns
@@ -8830,34 +8795,41 @@ impl Executor {
         let Some(table_def) = self.catalog.get_table(table_name).await else {
             return;
         };
+        let generation = self.derived_coherence.generation();
         let rows = self
             .storage_for(table_name)
             .scan_for_maintenance(table_name)
             .await
             .unwrap_or_default();
 
-        let mut indexes = self.fts_column_indexes.write();
-        for entry in indexes.values_mut() {
-            if entry.table_name != table_name {
-                continue;
-            }
-            let (Some(col_idx), Some(pk_idx)) = (
-                table_def.column_index(&entry.column_name),
-                table_def.column_index(&entry.pk_column),
-            ) else {
-                continue;
-            };
-            let mut rebuilt = crate::fts::InvertedIndex::new();
-            for row in &rows {
-                let Some(doc_id) = Self::stable_row_id(row, pk_idx) else {
-                    continue;
-                };
-                if let Some(Value::Text(text)) = row.get(col_idx) {
-                    rebuilt.add_document(doc_id, text);
+        #[cfg(test)]
+        self.pause_derived_publish("fts", table_name);
+
+        self.derived_coherence
+            .publish(generation, "fts", table_name, || {
+                let mut indexes = self.fts_column_indexes.write();
+                for entry in indexes.values_mut() {
+                    if entry.table_name != table_name {
+                        continue;
+                    }
+                    let (Some(col_idx), Some(pk_idx)) = (
+                        table_def.column_index(&entry.column_name),
+                        table_def.column_index(&entry.pk_column),
+                    ) else {
+                        continue;
+                    };
+                    let mut rebuilt = crate::fts::InvertedIndex::new();
+                    for row in &rows {
+                        let Some(doc_id) = Self::stable_row_id(row, pk_idx) else {
+                            continue;
+                        };
+                        if let Some(Value::Text(text)) = row.get(col_idx) {
+                            rebuilt.add_document(doc_id, text);
+                        }
+                    }
+                    entry.index = rebuilt;
                 }
-            }
-            entry.index = rebuilt;
-        }
+            });
     }
 
     /// Candidate row ids for `column @@ query`, from the table-attached FTS
@@ -8871,6 +8843,13 @@ impl Executor {
         column: &str,
         query: &str,
     ) -> Option<(String, std::collections::HashSet<u64>)> {
+        if self.has_uncommitted_derived_writes() {
+            return None;
+        }
+        let coherence = self.derived_coherence.view();
+        if !coherence.current("fts", table_name) {
+            return None;
+        }
         let indexes = self.fts_column_indexes.read();
         let entry = indexes.values().find(|e| {
             e.table_name.eq_ignore_ascii_case(table_name)
@@ -8896,6 +8875,13 @@ impl Executor {
         column: &str,
         query: &str,
     ) -> Option<usize> {
+        if self.has_uncommitted_derived_writes() {
+            return None;
+        }
+        let coherence = self.derived_coherence.view();
+        if !coherence.current("fts", table_name) {
+            return None;
+        }
         let indexes = self.fts_column_indexes.read();
         let entry = indexes.values().find(|e| {
             e.table_name.eq_ignore_ascii_case(table_name)
@@ -8916,6 +8902,10 @@ impl Executor {
         column: &str,
         query: &str,
     ) -> Option<crate::fts::Bm25Stats> {
+        if self.has_uncommitted_derived_writes() {
+            return None;
+        }
+        let coherence = self.derived_coherence.view();
         let indexes = self.fts_column_indexes.read();
         let mut matches = indexes.values().filter(|e| {
             e.column_name.eq_ignore_ascii_case(column)
@@ -8924,6 +8914,9 @@ impl Executor {
         let entry = matches.next()?;
         // Ambiguous unqualified column: refuse rather than guess a corpus.
         if table.is_none() && matches.next().is_some() {
+            return None;
+        }
+        if !coherence.current("fts", &entry.table_name) {
             return None;
         }
         Some(entry.index.bm25_stats(query))
@@ -8975,13 +8968,6 @@ impl Executor {
                 entry.index.remove(plaintext.as_bytes(), row_pos as u64);
             }
         }
-    }
-
-    /// Look up rows via an encrypted index (equality match).
-    fn encrypted_index_lookup(&self, index_name: &str, value: &[u8]) -> Option<Vec<u64>> {
-        let indexes = self.encrypted_indexes.read();
-        let entry = indexes.get(index_name)?;
-        Some(entry.index.lookup_equal(value))
     }
 
     // ========================================================================

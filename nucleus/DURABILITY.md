@@ -96,9 +96,10 @@ effectively equal to `fsync` there rather than weaker. It is opt-in, and the
 default remains `fsync` — durability should only be traded away deliberately.
 
 `fsync` is the default and the only mode the crash matrix asserts against. A
-commit acknowledged under `fsync` must survive a power loss; that is the
-contract `probe_crash_points` invariant 3 checks directly by comparing the
-child's last fsynced id against what recovery returns.
+commit acknowledged under `fsync` is intended to survive a power loss. The
+`probe_crash_points` invariant compares the child's last fsynced id against
+recovery after a process abort; that check does not interrupt the OS or device
+and is not a power-cut proof.
 
 **This mode applies to the SQL WAL only.** At the commit boundary
 `force_specialty_durability()` fsyncs every specialty log: KV, KV-collections,
@@ -134,12 +135,24 @@ unit tests do — so `is_dirty()` is always false in a running server. See the
 executor at all. The wiring is there so that whenever geo does get a write
 path, it is durable by construction rather than by remembering.
 
+### Columnar checkpoint publication boundary
+
+Both the `COLUMNAR_*` store and `ColumnarStorageEngine` replace snapshots through
+`ColumnarWal::checkpoint_named` and `storage::wal_util::atomic_replace_wal`.
+The helper fsyncs a complete temporary file and atomically renames it over the
+live WAL, but does not fsync the containing directory. This protects the
+replacement image across a process crash; durable publication of that renamed
+path across sudden power loss has not been established. A successful row fsync
+or SIGKILL recovery test does not close this namespace durability gap. The
+columnar engine fences a published replacement whose writer cannot reopen;
+reopening resolves that uncertain outcome before accepting further writes.
+
 ## Crash-injection coverage
 
 `storage::crashpoint` declares named durability boundaries. With
 `NUCLEUS_CRASHPOINT=<name>` set, the process calls `abort()` on reaching that
-point — no unwinding, no `Drop`, no buffer flush, which is power-loss
-equivalent at a chosen instruction. `NUCLEUS_CRASHPOINT_SKIP=n` lets `n`
+point — no unwinding, no `Drop`, no userspace buffer flush. This exercises a
+process crash at a chosen instruction; the OS and device remain running. `NUCLEUS_CRASHPOINT_SKIP=n` lets `n`
 arrivals pass first, so a boundary can be hit during setup, early steady state,
 and deep steady state.
 
@@ -320,7 +333,7 @@ figure below is a property of the code as it stands, not a target.
 | Scenario | Worst-case loss | Control |
 |---|---|---|
 | Process crash / `kill -9`, `synchronous_commit=on` | **Nothing acknowledged.** The SQL WAL and every specialty log are fsynced at the commit boundary | `wal.sync_mode`, `synchronous_commit` |
-| Power loss, `sync_mode = fsync` / `fdatasync` | Nothing acknowledged | default |
+| Power loss, `sync_mode = fsync` / `fdatasync` | SQL WAL durability contract; columnar replacement-path publication remains unverified as described above | default |
 | Power loss, `sync_mode = flush_os` | Writes in the drive's volatile cache. Survives OS panic and `kill -9`, **not** a power cut | `wal.sync_mode` |
 | Power loss, `sync_mode = none` | Everything the OS had not flushed | `wal.sync_mode` |
 | Restore from a physical snapshot | Everything committed after the snapshot | backup cadence |

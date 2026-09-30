@@ -2365,6 +2365,7 @@ impl Executor {
     /// granules in scan order so they align with `apply_zone_map_pruning`'s
     /// chunking. On any failure, clear the map (pruning then safely no-ops).
     async fn rebuild_zone_map(&self, table_name: &str) {
+        let generation = self.derived_coherence.generation();
         let zm_table_id = table_name_to_id(table_name);
         let col_count = match self.get_table(table_name).await {
             Ok(def) => def.columns.len(),
@@ -2387,21 +2388,23 @@ impl Executor {
                 return;
             }
         };
-        self.zone_map_index.clear_table(zm_table_id);
-        if rows.is_empty() {
-            return;
-        }
-        let column_ids: Vec<u32> = (0..col_count as u32).collect();
-        for (granule_id, chunk) in rows.chunks(GRANULE_SIZE as usize).enumerate() {
-            let stats = crate::storage::granule_stats::compute_granule_stats(
-                chunk,
-                &column_ids,
-                zm_table_id,
-                granule_id as u32,
-            );
-            self.zone_map_index
-                .update_granule(zm_table_id, granule_id as u32, stats);
-        }
+        #[cfg(test)]
+        self.pause_derived_publish("zone", table_name);
+        self.derived_coherence
+            .publish(generation, "zone", table_name, || {
+                self.zone_map_index.clear_table(zm_table_id);
+                let column_ids: Vec<u32> = (0..col_count as u32).collect();
+                for (granule_id, chunk) in rows.chunks(GRANULE_SIZE as usize).enumerate() {
+                    let stats = crate::storage::granule_stats::compute_granule_stats(
+                        chunk,
+                        &column_ids,
+                        zm_table_id,
+                        granule_id as u32,
+                    );
+                    self.zone_map_index
+                        .update_granule(zm_table_id, granule_id as u32, stats);
+                }
+            });
     }
 
     /// Refresh executor-owned representations after ordinary row mutations.

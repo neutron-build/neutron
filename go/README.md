@@ -2,7 +2,7 @@
 
 Go SDK for the Neutron ecosystem — an HTTP application framework and a Nucleus
 database client covering all 14 data models, in one Go module:
-`github.com/neutron-build/neutron/go` (Go 1.24+).
+`github.com/neutron-build/neutron/go` (Go 1.26+).
 
 ```bash
 go get github.com/neutron-build/neutron/go
@@ -14,7 +14,7 @@ go get github.com/neutron-build/neutron/go
 |---|---|
 | `nucleus` | Nucleus client — feature detection, transactions, all 14 data models |
 | `neutron` | HTTP app: router, composable middleware, OpenAPI 3.1, RFC 7807 errors |
-| `neutronauth` | JWT, OAuth, WebAuthn, sessions, RBAC, API keys |
+| `neutronauth` | JWT, OAuth, WebAuthn, sessions, RBAC, API keys ([session and WebAuthn migration](neutronauth/README.md)) |
 | `neutroncache` | Tiered / LRU / HTTP-response caching |
 | `neutronjobs` | Background job queue and cron |
 | `neutronrealtime` | WebSocket hub, SSE, Nucleus stream subscriptions |

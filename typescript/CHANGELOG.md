@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+Planned release: core 0.3.0, CLI 0.3.0, create-neutron 0.1.7, Nucleus SDK
+0.2.1, data 0.2.1 and cache-redis 0.2.0. Core-dependent adapters receive patch releases for the
+new dependency range. Requires Node.js 22 or later.
+
+- Request-local function caches separate authenticated requests, distinguish
+  function identities and bound retained entries. Process sharing requires
+  explicit `scope: "shared"`.
+- Response and loader cache stores must implement atomic generation-conditional
+  publication. Custom server stores without that capability are refused.
+- Redis cache adapters require atomic EVAL support for generation-conditional
+  publication. Existing unversioned entries become cold misses on migration.
+- Session middleware requires atomic revision-conditional persistence for save,
+  rotation and revocation. Legacy stores fail closed; switching stores requires
+  fresh login. See [authentication migration](../go/neutronauth/README.md).
+- Migration plans snapshot their primitive inputs before waiting for ownership.
+  Adoption validates every checksum before upgrading history metadata. Engine
+  limits on transactional DDL remain documented.
+- The data package's installed SQL consumer no longer needs optional libsql
+  declarations merely to import its default entry point.
+- New scaffolds pin the released core/CLI pair rather than older compatible
+  ranges. Go scaffolds require Go 1.26 and SDK v0.3.0.
+
 ## [core 0.2.3, cli 0.2.4, create-neutron 0.1.6, auth 0.1.4, cache-redis 0.1.3, security 0.1.3] - 2026-09-28
 
 **Requires Node.js 22 or later** (`engines.node` is `">=22"`; it was

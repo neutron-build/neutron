@@ -1,19 +1,16 @@
 package neutronauth
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/big"
 	"net/http"
 	"time"
 
+	"github.com/go-webauthn/webauthn/protocol"
+	"github.com/go-webauthn/webauthn/protocol/webauthncose"
+	wa "github.com/go-webauthn/webauthn/webauthn"
 	"github.com/neutron-build/neutron/go/neutron"
 )
 
@@ -23,9 +20,14 @@ import (
 
 // WebAuthnCredential represents a stored passkey / platform authenticator credential.
 type WebAuthnCredential struct {
+	// Complete library-verified COSE key, flags and attestation metadata.
+	VerifiedCredential *wa.Credential `json:"verified_credential,omitempty"`
+	// Opaque revision fences concurrent assertion commits, including zero counters.
+	Revision string `json:"revision,omitempty"`
 	// CredentialID is the unique identifier assigned by the authenticator (base64url).
 	CredentialID string `json:"credential_id"`
-	// PublicKey is the ECDSA P-256 public key in uncompressed SEC1 form (base64url).
+	// PublicKey is the legacy SEC1 field. New ceremonies use VerifiedCredential;
+	// credentials lacking verified metadata must be registered again.
 	PublicKey string `json:"public_key"`
 	// UserID is the application's user identifier that owns this credential.
 	UserID string `json:"user_id"`
@@ -39,6 +41,9 @@ type WebAuthnCredential struct {
 
 // WebAuthnConfig configures the WebAuthn relying party.
 type WebAuthnConfig struct {
+	// Defaults to "required". Explicit "preferred" allows presence-only
+	// authenticators; applications must not claim MFA for that policy.
+	UserVerification string
 	// RPID is the relying party identifier (typically the domain, e.g. "example.com").
 	RPID string
 	// RPName is the human-readable relying party name shown to the user.
@@ -89,12 +94,15 @@ type authenticatorSelection struct {
 // RegistrationResponse is the JSON payload the browser sends back after
 // navigator.credentials.create() succeeds.
 type RegistrationResponse struct {
-	ID       string `json:"id"`
-	RawID    string `json:"rawId"`
-	Type     string `json:"type"`
-	Response struct {
-		AttestationObject string `json:"attestationObject"`
-		ClientDataJSON    string `json:"clientDataJSON"`
+	ClientExtensionResults  map[string]any `json:"clientExtensionResults,omitempty"`
+	AuthenticatorAttachment string         `json:"authenticatorAttachment,omitempty"`
+	ID                      string         `json:"id"`
+	RawID                   string         `json:"rawId"`
+	Type                    string         `json:"type"`
+	Response                struct {
+		AttestationObject string                            `json:"attestationObject"`
+		Transports        []protocol.AuthenticatorTransport `json:"transports,omitempty"`
+		ClientDataJSON    string                            `json:"clientDataJSON"`
 	} `json:"response"`
 }
 
@@ -119,10 +127,12 @@ type allowCredentialDesc struct {
 // AuthenticationResponse is the JSON payload the browser sends back after
 // navigator.credentials.get() succeeds.
 type AuthenticationResponse struct {
-	ID       string `json:"id"`
-	RawID    string `json:"rawId"`
-	Type     string `json:"type"`
-	Response struct {
+	ClientExtensionResults  map[string]any `json:"clientExtensionResults,omitempty"`
+	AuthenticatorAttachment string         `json:"authenticatorAttachment,omitempty"`
+	ID                      string         `json:"id"`
+	RawID                   string         `json:"rawId"`
+	Type                    string         `json:"type"`
+	Response                struct {
 		AuthenticatorData string `json:"authenticatorData"`
 		ClientDataJSON    string `json:"clientDataJSON"`
 		Signature         string `json:"signature"`
@@ -146,11 +156,12 @@ type clientData struct {
 
 // WebAuthnStore is the interface for persisting WebAuthn credentials and challenges.
 type WebAuthnStore interface {
-	// StoreChallenge persists a challenge for later verification (keyed by userID or session).
+	// StoreChallenge stores complete serialized SessionData with enforced TTL.
 	StoreChallenge(key, challenge string, ttl time.Duration) error
-	// GetChallenge retrieves and deletes a stored challenge.
+	// GetChallenge atomically retrieves and deletes serialized ceremony state;
+	// concurrent callers must not receive the same state.
 	GetChallenge(key string) (string, error)
-	// SaveCredential persists a new credential.
+	// SaveCredential persists the complete credential and rejects duplicate IDs.
 	SaveCredential(cred WebAuthnCredential) error
 	// GetCredentialsByUser returns all credentials for a user.
 	GetCredentialsByUser(userID string) ([]WebAuthnCredential, error)
@@ -158,279 +169,241 @@ type WebAuthnStore interface {
 	UpdateSignCount(credentialID string, newCount uint32) error
 }
 
-// WebAuthnService handles the server side of WebAuthn registration and
-// authentication ceremonies using P-256 ECDSA.
-type WebAuthnService struct {
-	config WebAuthnConfig
-	store  WebAuthnStore
+// AtomicWebAuthnStore commits an assertion only if expectedRevision matches
+// the stored credential, in one atomic operation. Legacy stores remain
+// source-compatible but authentication fails closed without this capability.
+type AtomicWebAuthnStore interface {
+	WebAuthnStore
+	CompareAndSwapCredential(credentialID, expectedRevision string, replacement WebAuthnCredential) error
 }
 
-// NewWebAuthnService creates a WebAuthnService with the given config and store.
+// WebAuthnService delegates complete ceremony verification to go-webauthn.
+// StoreChallenge/GetChallenge persist and atomically consume the ENTIRE
+// serialized library SessionData, not just its challenge string.
+type WebAuthnService struct {
+	config   WebAuthnConfig
+	store    WebAuthnStore
+	verifier *wa.WebAuthn
+	initErr  error
+}
+
 func NewWebAuthnService(config WebAuthnConfig, store WebAuthnStore) *WebAuthnService {
 	if config.Timeout == 0 {
 		config.Timeout = 60 * time.Second
 	}
-	return &WebAuthnService{config: config, store: store}
+	verification := protocol.UserVerificationRequirement(config.UserVerification)
+	if verification == "" {
+		verification = protocol.VerificationRequired
+	}
+	s := &WebAuthnService{config: config, store: store}
+	if config.Timeout <= 0 || (verification != protocol.VerificationRequired && verification != protocol.VerificationPreferred && verification != protocol.VerificationDiscouraged) {
+		s.initErr = fmt.Errorf("neutronauth: invalid WebAuthn policy")
+		return s
+	}
+	s.verifier, s.initErr = wa.New(&wa.Config{RPID: config.RPID, RPDisplayName: config.RPName, RPOrigins: []string{config.RPOrigin}, AttestationPreference: protocol.PreferNoAttestation, AuthenticatorSelection: protocol.AuthenticatorSelection{ResidentKey: protocol.ResidentKeyRequirementPreferred, UserVerification: verification}})
+	if store == nil {
+		s.initErr = fmt.Errorf("neutronauth: WebAuthn store is required")
+	}
+	return s
 }
 
-// ---------------------------------------------------------------------------
-// Registration
-// ---------------------------------------------------------------------------
+type webauthnUser struct {
+	id, name, display string
+	credentials       []wa.Credential
+}
 
-// BeginRegistration generates a RegistrationOptions payload for the browser.
-// The challenge is stored server-side keyed by userID.
+func (u webauthnUser) WebAuthnID() []byte                   { return []byte(u.id) }
+func (u webauthnUser) WebAuthnName() string                 { return u.name }
+func (u webauthnUser) WebAuthnDisplayName() string          { return u.display }
+func (u webauthnUser) WebAuthnCredentials() []wa.Credential { return u.credentials }
+func (s *WebAuthnService) user(id, name, display string, requireCredentials bool) (webauthnUser, []WebAuthnCredential, error) {
+	u := webauthnUser{id: id, name: name, display: display}
+	if s.initErr != nil {
+		return u, nil, s.initErr
+	}
+	if len([]byte(id)) == 0 || len([]byte(id)) > 64 {
+		return u, nil, fmt.Errorf("neutronauth: WebAuthn user ID must contain 1-64 bytes")
+	}
+	records, err := s.store.GetCredentialsByUser(id)
+	if err != nil {
+		return u, nil, err
+	}
+	for _, r := range records {
+		if r.VerifiedCredential == nil || r.Revision == "" {
+			if requireCredentials {
+				return u, nil, fmt.Errorf("neutronauth: legacy unverified credential requires re-registration")
+			}
+			continue
+		}
+		if r.UserID != id || base64.RawURLEncoding.EncodeToString(r.VerifiedCredential.ID) != r.CredentialID || r.SignCount != r.VerifiedCredential.Authenticator.SignCount {
+			return u, nil, fmt.Errorf("neutronauth: inconsistent stored credential")
+		}
+		raw, err := json.Marshal(r.VerifiedCredential)
+		if err != nil {
+			return u, nil, err
+		}
+		var credential wa.Credential
+		if err = json.Unmarshal(raw, &credential); err != nil {
+			return u, nil, err
+		}
+		u.credentials = append(u.credentials, credential)
+	}
+	return u, records, nil
+}
+func (s *WebAuthnService) persistCeremony(key string, session *wa.SessionData) error {
+	session.Expires = time.Now().Add(s.config.Timeout)
+	raw, err := json.Marshal(session)
+	if err != nil {
+		return err
+	}
+	return s.store.StoreChallenge(key, string(raw), s.config.Timeout)
+}
+func (s *WebAuthnService) consumeCeremony(key string) (wa.SessionData, error) {
+	var session wa.SessionData
+	if s.initErr != nil {
+		return session, s.initErr
+	}
+	raw, err := s.store.GetChallenge(key)
+	if err != nil {
+		return session, err
+	}
+	if len(raw) > 64*1024 {
+		return session, fmt.Errorf("neutronauth: ceremony state exceeds limit")
+	}
+	if err = json.Unmarshal([]byte(raw), &session); err != nil {
+		return session, fmt.Errorf("neutronauth: invalid ceremony state: %w", err)
+	}
+	if session.Challenge == "" || session.Expires.IsZero() || !session.Expires.After(time.Now()) {
+		return session, fmt.Errorf("neutronauth: ceremony expired or invalid")
+	}
+	return session, nil
+}
 func (s *WebAuthnService) BeginRegistration(userID, userName, displayName string) (*RegistrationOptions, error) {
-	challenge, err := generateWebAuthnChallenge()
+	user, _, err := s.user(userID, userName, displayName, false)
 	if err != nil {
-		return nil, fmt.Errorf("neutronauth: generate challenge: %w", err)
+		return nil, err
 	}
-
-	if err := s.store.StoreChallenge("reg:"+userID, challenge, s.config.Timeout+30*time.Second); err != nil {
-		return nil, fmt.Errorf("neutronauth: store challenge: %w", err)
+	options, session, err := s.verifier.BeginRegistration(user, wa.WithCredentialParameters([]protocol.CredentialParameter{{Type: "public-key", Algorithm: webauthncose.AlgES256}}))
+	if err != nil {
+		return nil, err
 	}
-
-	opts := &RegistrationOptions{
-		Challenge: challenge,
-		RP: rpEntity{
-			ID:   s.config.RPID,
-			Name: s.config.RPName,
-		},
-		User: userEntity{
-			ID:          base64.RawURLEncoding.EncodeToString([]byte(userID)),
-			Name:        userName,
-			DisplayName: displayName,
-		},
-		PubKeyCredParams: []pubKeyCredParam{
-			{Type: "public-key", Alg: -7}, // ES256 (ECDSA w/ SHA-256 on P-256)
-		},
-		Timeout:     int(s.config.Timeout.Milliseconds()),
-		Attestation: "none",
-		AuthenticatorSel: authenticatorSelection{
-			ResidentKey:      "preferred",
-			UserVerification: "preferred",
-		},
+	if err = s.persistCeremony("reg:"+userID, session); err != nil {
+		return nil, err
 	}
-
-	return opts, nil
+	raw, err := json.Marshal(options.Response)
+	if err != nil {
+		return nil, err
+	}
+	var result RegistrationOptions
+	err = json.Unmarshal(raw, &result)
+	result.Timeout = int(s.config.Timeout.Milliseconds())
+	return &result, err
 }
-
-// FinishRegistration verifies the browser's RegistrationResponse, extracts
-// the P-256 public key, and stores the credential.
-//
-// SECURITY: the attestation-object parse below is a byte-scanning scaffold,
-// NOT a CBOR/WebAuthn verifier — it does not validate the attestation
-// statement's relationship to the credential, authenticator flags, or COSE
-// algorithm semantics. Registration ceremonies must not be exposed to
-// untrusted clients until this is replaced with a complete WebAuthn
-// implementation (audit GO-16, deferred: the fix is a full library
-// integration, which is an API/dependency decision rather than a patch).
-func (s *WebAuthnService) FinishRegistration(userID string, resp RegistrationResponse) (*WebAuthnCredential, error) {
-	// 1. Retrieve the stored challenge.
-	challenge, err := s.store.GetChallenge("reg:" + userID)
+func (s *WebAuthnService) FinishRegistration(userID string, response RegistrationResponse) (*WebAuthnCredential, error) {
+	session, err := s.consumeCeremony("reg:" + userID)
 	if err != nil {
-		return nil, fmt.Errorf("neutronauth: retrieve challenge: %w", err)
+		return nil, err
 	}
-
-	// 2. Parse and verify clientDataJSON.
-	clientDataBytes, err := base64.RawURLEncoding.DecodeString(resp.Response.ClientDataJSON)
+	user, _, err := s.user(userID, userID, userID, false)
 	if err != nil {
-		return nil, fmt.Errorf("neutronauth: decode clientDataJSON: %w", err)
+		return nil, err
 	}
-
-	var cd clientData
-	if err := json.Unmarshal(clientDataBytes, &cd); err != nil {
-		return nil, fmt.Errorf("neutronauth: parse clientDataJSON: %w", err)
+	raw, err := json.Marshal(response)
+	if err != nil {
+		return nil, err
 	}
-
-	if cd.Type != "webauthn.create" {
-		return nil, fmt.Errorf("neutronauth: unexpected ceremony type: %s", cd.Type)
+	if len(raw) > 1024*1024 {
+		return nil, fmt.Errorf("neutronauth: registration response exceeds limit")
 	}
-	if cd.Challenge != challenge {
-		return nil, fmt.Errorf("neutronauth: challenge mismatch")
+	parsed, err := protocol.ParseCredentialCreationResponseBytes(raw)
+	if err != nil {
+		return nil, err
 	}
-	if cd.Origin != s.config.RPOrigin {
-		return nil, fmt.Errorf("neutronauth: origin mismatch: got %s, want %s", cd.Origin, s.config.RPOrigin)
+	credential, err := s.verifier.CreateCredential(user, session, parsed)
+	if err != nil {
+		return nil, err
 	}
-
-	// 3. Parse attestationObject to extract the public key.
-	// In a production implementation this would fully parse the CBOR
-	// attestation object, verify attestation statements, and extract the
-	// COSE key.  For this scaffold we extract the credential ID and expect
-	// the caller to supply the public key via the raw attestation or an
-	// external CBOR library.
-	//
-	// Minimal extraction: we store the credential ID from the response and
-	// generate a placeholder for the public key that must be replaced with
-	// actual CBOR parsing in production.
-	pubKey, credErr := extractPublicKeyFromAttestation(resp.Response.AttestationObject)
-	if credErr != nil {
-		return nil, fmt.Errorf("neutronauth: extract public key: %w", credErr)
+	result := WebAuthnCredential{CredentialID: base64.RawURLEncoding.EncodeToString(credential.ID), UserID: userID, SignCount: credential.Authenticator.SignCount, CreatedAt: time.Now(), VerifiedCredential: credential, Revision: generateSessionID()}
+	if err = s.store.SaveCredential(result); err != nil {
+		return nil, err
 	}
-
-	cred := WebAuthnCredential{
-		CredentialID: resp.ID,
-		PublicKey:    pubKey,
-		UserID:       userID,
-		SignCount:    0,
-		CreatedAt:    time.Now(),
-	}
-
-	if err := s.store.SaveCredential(cred); err != nil {
-		return nil, fmt.Errorf("neutronauth: save credential: %w", err)
-	}
-
-	return &cred, nil
+	return &result, nil
 }
-
-// ---------------------------------------------------------------------------
-// Authentication
-// ---------------------------------------------------------------------------
-
-// BeginAuthentication generates an AuthenticationOptions payload for the browser.
 func (s *WebAuthnService) BeginAuthentication(userID string) (*AuthenticationOptions, error) {
-	challenge, err := generateWebAuthnChallenge()
+	if s.initErr != nil {
+		return nil, s.initErr
+	}
+	if _, ok := s.store.(AtomicWebAuthnStore); !ok {
+		return nil, fmt.Errorf("neutronauth: authentication requires atomic credential revision commits")
+	}
+	user, _, err := s.user(userID, userID, userID, true)
 	if err != nil {
-		return nil, fmt.Errorf("neutronauth: generate challenge: %w", err)
+		return nil, err
 	}
-
-	if err := s.store.StoreChallenge("auth:"+userID, challenge, s.config.Timeout+30*time.Second); err != nil {
-		return nil, fmt.Errorf("neutronauth: store challenge: %w", err)
-	}
-
-	creds, err := s.store.GetCredentialsByUser(userID)
+	options, session, err := s.verifier.BeginLogin(user)
 	if err != nil {
-		return nil, fmt.Errorf("neutronauth: get credentials: %w", err)
+		return nil, err
 	}
-
-	allowList := make([]allowCredentialDesc, len(creds))
-	for i, c := range creds {
-		allowList[i] = allowCredentialDesc{
-			Type: "public-key",
-			ID:   c.CredentialID,
-		}
+	if err = s.persistCeremony("auth:"+userID, session); err != nil {
+		return nil, err
 	}
-
-	opts := &AuthenticationOptions{
-		Challenge:        challenge,
-		RPID:             s.config.RPID,
-		Timeout:          int(s.config.Timeout.Milliseconds()),
-		UserVerification: "preferred",
-		AllowCredentials: allowList,
+	raw, err := json.Marshal(options.Response)
+	if err != nil {
+		return nil, err
 	}
-
-	return opts, nil
+	var result AuthenticationOptions
+	err = json.Unmarshal(raw, &result)
+	result.Timeout = int(s.config.Timeout.Milliseconds())
+	return &result, err
 }
-
-// FinishAuthentication verifies the browser's AuthenticationResponse against
-// the stored credential using P-256 ECDSA.
-func (s *WebAuthnService) FinishAuthentication(userID string, resp AuthenticationResponse) (*WebAuthnCredential, error) {
-	// 1. Retrieve the stored challenge.
-	challenge, err := s.store.GetChallenge("auth:" + userID)
+func (s *WebAuthnService) FinishAuthentication(userID string, response AuthenticationResponse) (*WebAuthnCredential, error) {
+	if s.initErr != nil {
+		return nil, s.initErr
+	}
+	store, ok := s.store.(AtomicWebAuthnStore)
+	if !ok {
+		return nil, fmt.Errorf("neutronauth: authentication requires atomic credential revision commits")
+	}
+	session, err := s.consumeCeremony("auth:" + userID)
 	if err != nil {
-		return nil, fmt.Errorf("neutronauth: retrieve challenge: %w", err)
+		return nil, err
 	}
-
-	// 2. Parse and verify clientDataJSON.
-	clientDataBytes, err := base64.RawURLEncoding.DecodeString(resp.Response.ClientDataJSON)
+	user, records, err := s.user(userID, userID, userID, true)
 	if err != nil {
-		return nil, fmt.Errorf("neutronauth: decode clientDataJSON: %w", err)
+		return nil, err
 	}
-
-	var cd clientData
-	if err := json.Unmarshal(clientDataBytes, &cd); err != nil {
-		return nil, fmt.Errorf("neutronauth: parse clientDataJSON: %w", err)
-	}
-
-	if cd.Type != "webauthn.get" {
-		return nil, fmt.Errorf("neutronauth: unexpected ceremony type: %s", cd.Type)
-	}
-	if cd.Challenge != challenge {
-		return nil, fmt.Errorf("neutronauth: challenge mismatch")
-	}
-	if cd.Origin != s.config.RPOrigin {
-		return nil, fmt.Errorf("neutronauth: origin mismatch: got %s, want %s", cd.Origin, s.config.RPOrigin)
-	}
-
-	// 3. Find the matching credential.
-	creds, err := s.store.GetCredentialsByUser(userID)
+	raw, err := json.Marshal(response)
 	if err != nil {
-		return nil, fmt.Errorf("neutronauth: get credentials: %w", err)
+		return nil, err
 	}
-
-	var matched *WebAuthnCredential
-	for i := range creds {
-		if creds[i].CredentialID == resp.ID {
-			matched = &creds[i]
-			break
+	if len(raw) > 1024*1024 {
+		return nil, fmt.Errorf("neutronauth: assertion response exceeds limit")
+	}
+	parsed, err := protocol.ParseCredentialRequestResponseBytes(raw)
+	if err != nil {
+		return nil, err
+	}
+	credential, err := s.verifier.ValidateLogin(user, session, parsed)
+	if err != nil {
+		return nil, err
+	}
+	if credential.Authenticator.CloneWarning {
+		return nil, fmt.Errorf("neutronauth: authenticator counter regression")
+	}
+	id := base64.RawURLEncoding.EncodeToString(credential.ID)
+	for _, record := range records {
+		if record.CredentialID == id {
+			expected := record.Revision
+			record.VerifiedCredential = credential
+			record.SignCount = credential.Authenticator.SignCount
+			record.Revision = generateSessionID()
+			if err = store.CompareAndSwapCredential(id, expected, record); err != nil {
+				return nil, err
+			}
+			return &record, nil
 		}
 	}
-	if matched == nil {
-		return nil, fmt.Errorf("neutronauth: credential not found: %s", resp.ID)
-	}
-
-	// 4. Verify the signature.
-	// The signed data is: authenticatorData || SHA-256(clientDataJSON)
-	authData, err := base64.RawURLEncoding.DecodeString(resp.Response.AuthenticatorData)
-	if err != nil {
-		return nil, fmt.Errorf("neutronauth: decode authenticatorData: %w", err)
-	}
-
-	// Authenticator-data structure checks (GO-17): the minimum length is
-	// rpIdHash(32) + flags(1) + signCount(4) = 37 bytes; the RP ID hash must
-	// match this relying party (a signature from a credential minted for a
-	// different RP is otherwise accepted on signature alone); and the UP
-	// (user presence) flag must be set.
-	if len(authData) < 37 {
-		return nil, fmt.Errorf("neutronauth: authenticatorData too short (%d bytes)", len(authData))
-	}
-	rpIDHash := sha256.Sum256([]byte(s.config.RPID))
-	if !hmac.Equal(authData[:32], rpIDHash[:]) {
-		return nil, fmt.Errorf("neutronauth: authenticatorData RP ID hash mismatch")
-	}
-	const flagUP = 0x01
-	if authData[32]&flagUP == 0 {
-		return nil, fmt.Errorf("neutronauth: user presence flag not set in authenticatorData")
-	}
-
-	clientDataHash := sha256.Sum256(clientDataBytes)
-	signedData := make([]byte, len(authData)+len(clientDataHash))
-	copy(signedData, authData)
-	copy(signedData[len(authData):], clientDataHash[:])
-
-	sigBytes, err := base64.RawURLEncoding.DecodeString(resp.Response.Signature)
-	if err != nil {
-		return nil, fmt.Errorf("neutronauth: decode signature: %w", err)
-	}
-
-	pubKeyBytes, err := base64.RawURLEncoding.DecodeString(matched.PublicKey)
-	if err != nil {
-		return nil, fmt.Errorf("neutronauth: decode public key: %w", err)
-	}
-
-	if err := verifyES256(pubKeyBytes, signedData, sigBytes); err != nil {
-		return nil, fmt.Errorf("neutronauth: signature verification failed: %w", err)
-	}
-
-	// 5. Update the signature counter (clone detection).
-	//
-	// A zero new counter is allowed (synced passkeys legitimately use zero
-	// counters); the regression check fires only when both stored and new
-	// counters are positive. A FAILED counter update fails the login
-	// (GO-17): succeeding silently would leave the stored security state
-	// stale, which is exactly what the counter exists to prevent.
-	newCount := uint32(authData[33])<<24 | uint32(authData[34])<<16 |
-		uint32(authData[35])<<8 | uint32(authData[36])
-	if newCount > 0 && matched.SignCount > 0 && newCount <= matched.SignCount {
-		return nil, fmt.Errorf("neutronauth: signature counter regression (possible cloned authenticator)")
-	}
-	if newCount > matched.SignCount {
-		if err := s.store.UpdateSignCount(matched.CredentialID, newCount); err != nil {
-			return nil, fmt.Errorf("neutronauth: persist signature counter: %w", err)
-		}
-		matched.SignCount = newCount
-	}
-
-	return matched, nil
+	return nil, fmt.Errorf("neutronauth: credential not found")
 }
 
 // ---------------------------------------------------------------------------
@@ -478,101 +451,4 @@ func (s *WebAuthnService) BeginAuthenticationHandler(getUserID func(r *http.Requ
 
 		neutron.JSON(w, http.StatusOK, opts)
 	})
-}
-
-// ---------------------------------------------------------------------------
-// P-256 ECDSA verification
-// ---------------------------------------------------------------------------
-
-// verifyES256 verifies an ECDSA P-256 signature over SHA-256.
-// pubKeyBytes must be the uncompressed SEC1 point (65 bytes: 0x04 || X || Y).
-// sig must be the DER-encoded ASN.1 ECDSA signature.
-func verifyES256(pubKeyBytes, data, sig []byte) error {
-	if len(pubKeyBytes) != 65 || pubKeyBytes[0] != 0x04 {
-		return fmt.Errorf("invalid uncompressed P-256 public key (expected 65 bytes starting with 0x04)")
-	}
-
-	x := new(big.Int).SetBytes(pubKeyBytes[1:33])
-	y := new(big.Int).SetBytes(pubKeyBytes[33:65])
-	pubKey := &ecdsa.PublicKey{
-		Curve: elliptic.P256(),
-		X:     x,
-		Y:     y,
-	}
-
-	hash := sha256.Sum256(data)
-	if !ecdsa.VerifyASN1(pubKey, hash[:], sig) {
-		return fmt.Errorf("ECDSA signature verification failed")
-	}
-
-	return nil
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-func generateWebAuthnChallenge() (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(b), nil
-}
-
-// extractPublicKeyFromAttestation performs minimal parsing of the attestation
-// object to extract the COSE public key.  This is a simplified implementation
-// that expects the "none" attestation format with a P-256 key.
-//
-// In production, use a full CBOR parser (e.g. fxamacker/cbor) to properly
-// decode the attestation object and verify attestation statements.
-func extractPublicKeyFromAttestation(attestationObjectB64 string) (string, error) {
-	data, err := base64.RawURLEncoding.DecodeString(attestationObjectB64)
-	if err != nil {
-		return "", fmt.Errorf("decode attestation object: %w", err)
-	}
-
-	// The attestation object is CBOR-encoded.  We scan for the COSE key
-	// markers for a P-256 key.  The uncompressed public key is 65 bytes
-	// starting with 0x04.
-	//
-	// This is intentionally minimal — a production deployment must use a
-	// proper CBOR library.  We search for the x-coordinate tag (-2, CBOR
-	// negative int 0x21) followed by a 32-byte byte string (0x5820) to
-	// locate the key material.
-	xIdx := findCBORByteString(data, 32)
-	if xIdx < 0 || xIdx+32 > len(data) {
-		return "", fmt.Errorf("could not locate P-256 x-coordinate in attestation object")
-	}
-	xCoord := data[xIdx : xIdx+32]
-
-	// Look for the y-coordinate after the x-coordinate
-	remaining := data[xIdx+32:]
-	yIdx := findCBORByteString(remaining, 32)
-	if yIdx < 0 || yIdx+32 > len(remaining) {
-		return "", fmt.Errorf("could not locate P-256 y-coordinate in attestation object")
-	}
-	yCoord := remaining[yIdx : yIdx+32]
-
-	// Build uncompressed SEC1 point: 0x04 || X || Y
-	uncompressed := make([]byte, 65)
-	uncompressed[0] = 0x04
-	copy(uncompressed[1:33], xCoord)
-	copy(uncompressed[33:65], yCoord)
-
-	return base64.RawURLEncoding.EncodeToString(uncompressed), nil
-}
-
-// findCBORByteString scans for a CBOR byte string header (major type 2) of
-// the given length and returns the index of the first payload byte, or -1.
-func findCBORByteString(data []byte, length int) int {
-	// CBOR byte string of 32 bytes: 0x5820 (major type 2, additional info 24, length 32)
-	if length == 32 {
-		for i := 0; i < len(data)-1; i++ {
-			if data[i] == 0x58 && data[i+1] == 0x20 && i+2+32 <= len(data) {
-				return i + 2
-			}
-		}
-	}
-	return -1
 }

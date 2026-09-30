@@ -710,10 +710,26 @@ impl BufferedDiskEngine {
                     }
                 }
                 BufferedOp::DeleteIf { table, targets } => {
-                    let targets: Vec<(usize, Row)> = targets
+                    let positions: Vec<usize> = targets
                         .into_iter()
-                        .filter(|(p, _)| !is_pending_pos(*p))
-                        .filter(|(p, _)| last_touch.get(p) == Some(&i))
+                        .map(|(position, _)| position)
+                        .filter(|position| !is_pending_pos(*position))
+                        .filter(|position| last_touch.get(position) == Some(&i))
+                        .collect();
+                    // Folding skips our preceding UPDATEs. The deciding DELETE
+                    // observed their overlay value, not the committed tuple;
+                    // validate the original first-touch anchor instead. A first
+                    // unconditional write owns the position without an anchor,
+                    // exactly as in the plain DELETE replay branch above.
+                    let (plain, conditional): (Vec<usize>, Vec<usize>) = positions
+                        .into_iter()
+                        .partition(|position| !preconds.contains_key(position));
+                    if !plain.is_empty() {
+                        self.inner.delete(&table, &plain).await?;
+                    }
+                    let targets: Vec<(usize, Row)> = conditional
+                        .into_iter()
+                        .map(|position| (position, preconds[&position].0.clone()))
                         .collect();
                     if !targets.is_empty() {
                         let changed = self.inner.delete_if_unchanged(&table, &targets).await?;

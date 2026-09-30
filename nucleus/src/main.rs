@@ -1255,16 +1255,22 @@ async fn cmd_start(cfg: StartConfig) {
     let cache_bytes = config.cache.max_memory_mb * 1024 * 1024;
     let store_dir = if memory { None } else { Some(data.as_path()) };
     let mut executor_build =
-        Executor::new_with_persistence(catalog, storage, catalog_path, store_dir)
-            .with_cache_size(cache_bytes)
-            .with_query_cache_max_bytes(config.limits.max_query_cache_bytes)
-            .with_allocator_budget(config.server.max_memory_mb * 1024 * 1024)
-            .with_metrics(metrics.clone())
-            .with_replication(replication.clone())
-            .with_conn_pool(conn_pool.clone())
-            .with_cluster(cluster.clone())
-            .with_slow_query_default_ms(config.server.slow_query_log_ms)
-            .with_specialty_skip_warn_every(config.wal.specialty_checkpoint_warn_every);
+        match Executor::try_new_with_persistence(catalog, storage, catalog_path, store_dir) {
+            Ok(executor) => executor,
+            Err(error) => {
+                eprintln!("Startup recovery refused: {error}");
+                std::process::exit(1);
+            }
+        }
+        .with_cache_size(cache_bytes)
+        .with_query_cache_max_bytes(config.limits.max_query_cache_bytes)
+        .with_allocator_budget(config.server.max_memory_mb * 1024 * 1024)
+        .with_metrics(metrics.clone())
+        .with_replication(replication.clone())
+        .with_conn_pool(conn_pool.clone())
+        .with_cluster(cluster.clone())
+        .with_slow_query_default_ms(config.server.slow_query_log_ms)
+        .with_specialty_skip_warn_every(config.wal.specialty_checkpoint_warn_every);
     if config.storage.spill_budget_mb > 0 {
         executor_build =
             executor_build.with_spill_budget(config.storage.spill_budget_mb * 1024 * 1024);
@@ -1390,7 +1396,10 @@ async fn cmd_start(cfg: StartConfig) {
     // engines.json: reopens their WAL-backed storage and restores
     // replacing-dedup configs. Without this, engine tables silently fell back
     // to the default heap engine after every restart.
-    executor.restore_table_engines().await;
+    if let Err(error) = executor.restore_table_engines().await {
+        eprintln!("nucleus: refusing to start: declared table engine recovery failed: {error}");
+        std::process::exit(1);
+    }
 
     // Rebuild specialty indexes (IvfFlat, encrypted) from table data after restart.
     executor.rebuild_specialty_indexes().await;

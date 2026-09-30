@@ -20,7 +20,9 @@ import { assertNodeRuntime } from "../internal/node-runtime.js";
 
 import type { Sql } from "postgres";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
-import type { Client as LibSqlClient } from "@libsql/client";
+// Derive the SQLite client from Drizzle's own return type instead of
+// importing an optional driver directly into this shared declaration.
+type LibSqlClient = ReturnType<typeof import("drizzle-orm/libsql").drizzle>["$client"];
 import type { LibSQLDatabase } from "drizzle-orm/libsql";
 
 /** A `DatabaseProfile` narrowed to one provider — the overload key that

@@ -33,7 +33,7 @@ async fn open_executor(dir: &Path) -> Executor {
     let engine = DiskEngine::open(&db_path, catalog.clone()).unwrap();
     let storage: Arc<dyn StorageEngine> = Arc::new(engine);
     let ex = Executor::new_with_persistence(catalog, storage, Some(catalog_path), Some(dir));
-    ex.restore_table_engines().await;
+    ex.restore_table_engines().await.unwrap();
     ex
 }
 

@@ -3092,39 +3092,9 @@ impl Executor {
                 Ok(Value::Text(lines.join("\n")))
             }
 
-            "ENCRYPTED_LOOKUP" => {
-                // encrypted_lookup(index_name, value) — look up row IDs via encrypted index.
-                require_args(fname, &args, 2)?;
-                let idx_name = match &args[0] {
-                    Value::Text(s) => s.clone(),
-                    _ => {
-                        return Err(ExecError::Unsupported(
-                            "ENCRYPTED_LOOKUP arg 1 must be index name text".into(),
-                        ));
-                    }
-                };
-                let lookup_val = match &args[1] {
-                    Value::Text(s) => s.as_bytes().to_vec(),
-                    Value::Int32(n) => n.to_string().into_bytes(),
-                    Value::Int64(n) => n.to_string().into_bytes(),
-                    Value::Null => return Ok(Value::Null),
-                    other => format!("{other:?}").into_bytes(),
-                };
-                match self.encrypted_index_lookup(&idx_name, &lookup_val) {
-                    Some(ids) => {
-                        // Return as a comma-separated list of row IDs.
-                        let id_strs: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
-                        Ok(Value::Text(id_strs.join(",")))
-                    }
-                    None => Err(ExecError::Unsupported(format!(
-                        "encrypted index '{idx_name}' not found"
-                    ))),
-                }
-            }
-
-            // ================================================================
-            // KV store functions (Redis-compatible via SQL)
-            // ================================================================
+            "ENCRYPTED_LOOKUP" => Err(ExecError::Unsupported(
+                crate::storage::encrypted_index::UNSUPPORTED_ENCRYPTION.into(),
+            )),
             "KV_GET" => {
                 // kv_get(key) → value or NULL
                 require_args(fname, &args, 1)?;
@@ -4501,7 +4471,12 @@ impl Executor {
                 {
                     let mut store = self.columnar_store.write();
                     let xact = self.cross_model_before_columnar(&store);
-                    store.append_with_dict_in_xact(&table, batch, xact);
+                    if let Err(error) = store.append_with_dict_in_xact(&table, batch, xact) {
+                        self.memory_allocator.lock().release("columnar", estimated);
+                        return Err(ExecError::Storage(crate::storage::StorageError::Io(
+                            error.to_string(),
+                        )));
+                    }
                 }
                 Ok(Value::Text("OK".into()))
             }

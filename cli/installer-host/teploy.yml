@@ -1,0 +1,4 @@
+app: neutron-installer
+domain: get.neutron.build
+server: deploy-ovh
+port: 80

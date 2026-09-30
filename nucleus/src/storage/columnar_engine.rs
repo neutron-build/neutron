@@ -11,9 +11,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use parking_lot::RwLock;
+use parking_lot::{ReentrantMutex, RwLock};
 
 use crate::columnar::{
     ColumnBatch, ColumnData, ColumnarStore, aggregate_count, aggregate_sum, group_by_text_agg_f64,
@@ -115,6 +116,11 @@ struct ColIdx {
 /// - `ColumnarStorageEngine::open(dir)` — persists mutations to a WAL file
 ///   in `dir` and recovers state on restart.
 pub struct ColumnarStorageEngine {
+    /// Every operation is synchronous within its async wrapper. Keep WAL and
+    /// memory publication in one boundary, including read-triggered buffer flushes.
+    /// Reentrancy permits index helpers to flush while an operation holds the gate.
+    mutation_gate: ReentrantMutex<()>,
+    checkpoint_poisoned: AtomicBool,
     store: RwLock<ColumnarStore>,
     /// index_name → ColIdx
     indexes: RwLock<HashMap<String, ColIdx>>,
@@ -143,6 +149,7 @@ impl ColumnarStorageEngine {
         order_by: Vec<String>,
         strategy: crate::columnar::MergeStrategy,
     ) {
+        let _mutation = self.mutation_gate.lock();
         self.store
             .write()
             .create_merge_tree_table_with_strategy(table, order_by, strategy);
@@ -150,6 +157,8 @@ impl ColumnarStorageEngine {
 
     pub fn new() -> Self {
         Self {
+            mutation_gate: ReentrantMutex::new(()),
+            checkpoint_poisoned: AtomicBool::new(false),
             store: RwLock::new(ColumnarStore::new()),
             indexes: RwLock::new(HashMap::new()),
             table_idx_names: RwLock::new(HashMap::new()),
@@ -170,10 +179,14 @@ impl ColumnarStorageEngine {
         for (table_name, rows) in &state.tables {
             store.create_table(table_name);
             if !rows.is_empty() {
-                store.append(table_name, rows_to_batch(rows.clone()));
+                store
+                    .append(table_name, rows_to_batch(rows.clone()))
+                    .expect("per-table engine uses a memory-only ColumnarStore");
             }
         }
         Ok(Self {
+            mutation_gate: ReentrantMutex::new(()),
+            checkpoint_poisoned: AtomicBool::new(false),
             store: RwLock::new(store),
             indexes: RwLock::new(HashMap::new()),
             table_idx_names: RwLock::new(HashMap::new()),
@@ -183,7 +196,34 @@ impl ColumnarStorageEngine {
     }
 
     /// Collect current table state for WAL checkpoint / snapshot.
+    fn checkpoint_candidate(
+        &self,
+        wal: &ColumnarWal,
+        tables: &[(&str, Vec<Row>)],
+    ) -> Result<(), StorageError> {
+        wal.checkpoint(tables).map_err(|error| {
+            if wal.is_stranded() {
+                self.checkpoint_poisoned.store(true, Ordering::Release);
+            }
+            StorageError::Io(error.to_string())
+        })
+    }
+
+    fn ensure_healthy(&self) -> Result<(), StorageError> {
+        if self.checkpoint_poisoned.load(Ordering::Acquire) {
+            return Err(StorageError::Io("columnar checkpoint replacement was published but its writer could not reopen; engine is fenced until reopen".into()));
+        }
+        if self.wal.as_ref().is_some_and(|wal| wal.has_write_failure()) {
+            return Err(StorageError::Io(
+                "columnar WAL write outcome is uncertain; engine is fenced until reopen".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn snapshot_tables(&self) -> Vec<(String, Vec<Row>)> {
+        let _mutation = self.mutation_gate.lock();
+        self.flush_all_write_buffers();
         let store = self.store.read();
         store
             .table_names()
@@ -204,6 +244,7 @@ impl Default for ColumnarStorageEngine {
 
 impl std::fmt::Debug for ColumnarStorageEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _mutation = self.mutation_gate.lock();
         f.debug_struct("ColumnarStorageEngine").finish()
     }
 }
@@ -871,6 +912,7 @@ impl ColumnarStorageEngine {
     /// in every active index for `table`. Must only be called after the rows have
     /// been appended to the ColumnarStore (so positions are stable).
     fn update_indexes_at_positions(&self, table: &str, new_rows: &[Row], starting_pos: usize) {
+        let _mutation = self.mutation_gate.lock();
         let names: Vec<String> = {
             let m = self.table_idx_names.read();
             m.get(table).cloned().unwrap_or_default()
@@ -893,6 +935,7 @@ impl ColumnarStorageEngine {
     /// then update all active indexes with the correct positions for those rows.
     /// WAL logging for these rows already happened in `insert()`.
     fn flush_write_buffer(&self, table: &str) {
+        let _mutation = self.mutation_gate.lock();
         let buf = {
             let mut bufs = self.write_buffers.write();
             match bufs.get_mut(table) {
@@ -902,12 +945,33 @@ impl ColumnarStorageEngine {
         };
         // The starting position for buffered rows = current store row count (before append).
         let starting_pos = self.store.read().row_count(table);
-        self.store.write().append(table, rows_to_batch(buf.clone()));
+        self.store
+            .write()
+            .append(table, rows_to_batch(buf.clone()))
+            .expect("per-table engine uses a memory-only ColumnarStore");
         // Now assign stable positions to the newly flushed rows.
         self.update_indexes_at_positions(table, &buf, starting_pos);
     }
 
+    /// A WAL replacement snapshot supersedes every table's append frames.
+    /// Drain all acknowledged insert buffers before collecting any such image,
+    /// under the same mutation gate as writers and before taking store locks.
+    fn flush_all_write_buffers(&self) {
+        let _mutation = self.mutation_gate.lock();
+        let tables: Vec<String> = self
+            .write_buffers
+            .read()
+            .iter()
+            .filter(|(_, rows)| !rows.is_empty())
+            .map(|(table, _)| table.clone())
+            .collect();
+        for table in tables {
+            self.flush_write_buffer(&table);
+        }
+    }
+
     fn rebuild_indexes(&self, table: &str) {
+        let _mutation = self.mutation_gate.lock();
         // Ensure buffered rows are in the store before rebuilding index.
         self.flush_write_buffer(table);
         // Rebuild position-based index from store contents.
@@ -947,25 +1011,28 @@ impl StorageEngine for ColumnarStorageEngine {
     }
 
     async fn create_table(&self, table: &str) -> Result<(), StorageError> {
-        self.store.write().create_table(table);
+        let _mutation = self.mutation_gate.lock();
+        self.ensure_healthy()?;
         if let Some(wal) = &self.wal {
             wal.log_create_table(None, table)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
         }
+        self.store.write().create_table(table);
         Ok(())
     }
 
     async fn drop_table(&self, table: &str) -> Result<(), StorageError> {
-        // Discard any pending write buffer for this table.
-        self.write_buffers.write().remove(table);
-        let existed = self.store.write().drop_table(table);
-        if !existed {
+        let _mutation = self.mutation_gate.lock();
+        self.ensure_healthy()?;
+        if !self.store.read().table_exists(table) {
             return Err(StorageError::TableNotFound(table.to_string()));
         }
         if let Some(wal) = &self.wal {
             wal.log_drop_table(None, table)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
         }
+        self.write_buffers.write().remove(table);
+        self.store.write().drop_table(table);
         // Remove index entries for this table.
         let names: Vec<String> = {
             let mut tnames = self.table_idx_names.write();
@@ -981,6 +1048,8 @@ impl StorageEngine for ColumnarStorageEngine {
     }
 
     async fn insert(&self, table: &str, row: Row) -> Result<(), StorageError> {
+        let _mutation = self.mutation_gate.lock();
+        self.ensure_healthy()?;
         // Verify table exists before buffering.
         if !self.store.read().table_exists(table) {
             return Err(StorageError::TableNotFound(table.to_string()));
@@ -1008,35 +1077,38 @@ impl StorageEngine for ColumnarStorageEngine {
     }
 
     async fn insert_batch(&self, table: &str, rows: Vec<Row>) -> Result<(), StorageError> {
+        let _mutation = self.mutation_gate.lock();
+        self.ensure_healthy()?;
         if rows.is_empty() {
             return Ok(());
         }
-        // Compute starting position before appending (store count before rows land).
-        let starting_pos = self.store.read().row_count(table);
-        {
-            let mut store = self.store.write();
-            if !store.table_exists(table) {
-                return Err(StorageError::TableNotFound(table.to_string()));
-            }
-            // Single contiguous batch for all rows — the key perf win.
-            // Use append_with_dict so low-cardinality text columns (browser, OS,
-            // country, etc.) get automatic dictionary compression.
-            store.append_with_dict(table, rows_to_batch(rows.clone()));
+        if !self.store.read().table_exists(table) {
+            return Err(StorageError::TableNotFound(table.to_string()));
         }
+        // Flush older buffered inserts so physical positions preserve write order.
+        self.flush_write_buffer(table);
         if let Some(wal) = &self.wal {
             wal.log_insert_rows(table, &rows)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
         }
+        let starting_pos = self.store.read().row_count(table);
+        self.store
+            .write()
+            .append_with_dict(table, rows_to_batch(rows.clone()))
+            .expect("per-table engine uses a memory-only ColumnarStore");
         // Rows are now in the store with stable positions — update indexes immediately.
         self.update_indexes_at_positions(table, &rows, starting_pos);
         Ok(())
     }
 
     fn dedups_replacing(&self) -> bool {
+        let _mutation = self.mutation_gate.lock();
         true
     }
 
     async fn scan(&self, table: &str) -> Result<Vec<Row>, StorageError> {
+        let _mutation = self.mutation_gate.lock();
+        self.ensure_healthy()?;
         self.flush_write_buffer(table);
         let store = self.store.read();
         if !store.table_exists(table) {
@@ -1063,6 +1135,8 @@ impl StorageEngine for ColumnarStorageEngine {
         projection: &[usize],
         limit: Option<usize>,
     ) -> Result<Vec<Row>, StorageError> {
+        let _mutation = self.mutation_gate.lock();
+        self.ensure_healthy()?;
         self.flush_write_buffer(table);
         let store = self.store.read();
         if !store.table_exists(table) {
@@ -1099,6 +1173,8 @@ impl StorageEngine for ColumnarStorageEngine {
         if bounds.is_empty() {
             return self.scan_projected(table, projection, limit).await;
         }
+        let _mutation = self.mutation_gate.lock();
+        self.ensure_healthy()?;
         self.flush_write_buffer(table);
         let store = self.store.read();
         if !store.table_exists(table) {
@@ -1123,6 +1199,8 @@ impl StorageEngine for ColumnarStorageEngine {
     }
 
     async fn scan_limit(&self, table: &str, limit: usize) -> Result<Vec<Row>, StorageError> {
+        let _mutation = self.mutation_gate.lock();
+        self.ensure_healthy()?;
         // Early-exit: assemble only the first `limit` rows from the (already
         // dedup-resolved) batches. Same order as scan(), so equals
         // scan()[..limit]. Safe here (the columnar engine records no SIREAD).
@@ -1145,6 +1223,8 @@ impl StorageEngine for ColumnarStorageEngine {
         col_idx: usize,
         value: &Value,
     ) -> Result<Vec<(usize, Row)>, StorageError> {
+        let _mutation = self.mutation_gate.lock();
+        self.ensure_healthy()?;
         // UPDATE/DELETE need every physical row matching the predicate, so
         // mutations remove/overwrite all versions of a logical PK. The
         // default impl calls scan() which deduplicates for replacing tables —
@@ -1166,6 +1246,8 @@ impl StorageEngine for ColumnarStorageEngine {
     }
 
     async fn scan_physical(&self, table: &str) -> Result<Vec<(usize, Row)>, StorageError> {
+        let _mutation = self.mutation_gate.lock();
+        self.ensure_healthy()?;
         // Same reasoning as scan_where_eq_positions, but for the no-WHERE-PK
         // path of UPDATE/DELETE: return physical batches (NOT batches_all_for_select)
         // so positions map to the rows update()/delete() actually rewrite.
@@ -1182,10 +1264,16 @@ impl StorageEngine for ColumnarStorageEngine {
     }
 
     async fn delete(&self, table: &str, positions: &[usize]) -> Result<usize, StorageError> {
+        let _mutation = self.mutation_gate.lock();
+        self.ensure_healthy()?;
         if positions.is_empty() {
             return Ok(0);
         }
-        self.flush_write_buffer(table);
+        if self.wal.is_some() {
+            self.flush_all_write_buffers();
+        } else {
+            self.flush_write_buffer(table);
+        }
         let pos_set: std::collections::HashSet<usize> = positions.iter().copied().collect();
         let count = {
             let mut store = self.store.write();
@@ -1201,31 +1289,48 @@ impl StorageEngine for ColumnarStorageEngine {
                 .map(|(_, r)| r)
                 .collect();
             let kept = new_rows.len();
+            if let Some(wal) = &self.wal {
+                let tables: Vec<_> = store
+                    .table_names()
+                    .into_iter()
+                    .map(|name| {
+                        let rows = if name == table {
+                            new_rows.clone()
+                        } else {
+                            batches_to_rows(&store.batches_all(&name))
+                        };
+                        (name, rows)
+                    })
+                    .collect();
+                let refs: Vec<_> = tables
+                    .iter()
+                    .map(|(name, rows)| (name.as_str(), rows.clone()))
+                    .collect();
+                self.checkpoint_candidate(wal, &refs)?;
+            }
             store.clear(table);
             if !new_rows.is_empty() {
-                store.append(table, rows_to_batch(new_rows));
+                store
+                    .append(table, rows_to_batch(new_rows))
+                    .expect("per-table engine uses a memory-only ColumnarStore");
             }
             total - kept
         };
         self.rebuild_indexes(table);
-        // DELETE can't be expressed as an INSERT — checkpoint full state.
-        if let Some(wal) = &self.wal {
-            let tables = self.snapshot_tables();
-            let refs: Vec<(&str, Vec<Row>)> = tables
-                .iter()
-                .map(|(n, r)| (n.as_str(), r.clone()))
-                .collect();
-            wal.checkpoint(&refs)
-                .map_err(|e| StorageError::Io(e.to_string()))?;
-        }
         Ok(count)
     }
 
     async fn update(&self, table: &str, updates: &[(usize, Row)]) -> Result<usize, StorageError> {
+        let _mutation = self.mutation_gate.lock();
+        self.ensure_healthy()?;
         if updates.is_empty() {
             return Ok(0);
         }
-        self.flush_write_buffer(table);
+        if self.wal.is_some() {
+            self.flush_all_write_buffers();
+        } else {
+            self.flush_write_buffer(table);
+        }
         let update_map: HashMap<usize, &Row> = updates.iter().map(|(p, r)| (*p, r)).collect();
         let count = {
             let mut store = self.store.write();
@@ -1246,23 +1351,34 @@ impl StorageEngine for ColumnarStorageEngine {
                     }
                 })
                 .collect();
+            if let Some(wal) = &self.wal {
+                let tables: Vec<_> = store
+                    .table_names()
+                    .into_iter()
+                    .map(|name| {
+                        let rows = if name == table {
+                            new_rows.clone()
+                        } else {
+                            batches_to_rows(&store.batches_all(&name))
+                        };
+                        (name, rows)
+                    })
+                    .collect();
+                let refs: Vec<_> = tables
+                    .iter()
+                    .map(|(name, rows)| (name.as_str(), rows.clone()))
+                    .collect();
+                self.checkpoint_candidate(wal, &refs)?;
+            }
             store.clear(table);
             if !new_rows.is_empty() {
-                store.append(table, rows_to_batch(new_rows));
+                store
+                    .append(table, rows_to_batch(new_rows))
+                    .expect("per-table engine uses a memory-only ColumnarStore");
             }
             changed
         };
         self.rebuild_indexes(table);
-        // UPDATE can't be expressed as an INSERT — checkpoint full state.
-        if let Some(wal) = &self.wal {
-            let tables = self.snapshot_tables();
-            let refs: Vec<(&str, Vec<Row>)> = tables
-                .iter()
-                .map(|(n, r)| (n.as_str(), r.clone()))
-                .collect();
-            wal.checkpoint(&refs)
-                .map_err(|e| StorageError::Io(e.to_string()))?;
-        }
         Ok(count)
     }
 
@@ -1272,6 +1388,8 @@ impl StorageEngine for ColumnarStorageEngine {
         index_name: &str,
         col_idx: usize,
     ) -> Result<(), StorageError> {
+        let _mutation = self.mutation_gate.lock();
+        self.ensure_healthy()?;
         // Flush write buffer so all rows have stable positions in the store.
         self.flush_write_buffer(table);
         let rows = {
@@ -1302,6 +1420,8 @@ impl StorageEngine for ColumnarStorageEngine {
     }
 
     async fn drop_index(&self, index_name: &str) -> Result<(), StorageError> {
+        let _mutation = self.mutation_gate.lock();
+        self.ensure_healthy()?;
         self.indexes.write().remove(index_name);
         let mut tnames = self.table_idx_names.write();
         for names in tnames.values_mut() {
@@ -1320,6 +1440,8 @@ impl StorageEngine for ColumnarStorageEngine {
         index_name: &str,
         value: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
+        let _mutation = self.mutation_gate.lock();
+        self.ensure_healthy()?;
         self.index_lookup_sync(table, index_name, value)
     }
 
@@ -1330,6 +1452,8 @@ impl StorageEngine for ColumnarStorageEngine {
         low: std::ops::Bound<&Value>,
         high: std::ops::Bound<&Value>,
     ) -> Result<Option<Vec<Row>>, StorageError> {
+        let _mutation = self.mutation_gate.lock();
+        self.ensure_healthy()?;
         self.index_lookup_range_sync(table, index_name, low, high)
     }
 
@@ -1339,6 +1463,8 @@ impl StorageEngine for ColumnarStorageEngine {
         index_name: &str,
         value: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
+        let _mutation = self.mutation_gate.lock();
+        self.ensure_healthy()?;
         // Flush write buffer so all single-row inserts have stable positions.
         self.flush_write_buffer(table);
         let positions: Vec<usize> = {
@@ -1378,6 +1504,8 @@ impl StorageEngine for ColumnarStorageEngine {
         low: std::ops::Bound<&Value>,
         high: std::ops::Bound<&Value>,
     ) -> Result<Option<Vec<Row>>, StorageError> {
+        let _mutation = self.mutation_gate.lock();
+        self.ensure_healthy()?;
         if crate::storage::range_cannot_match(low, high) {
             return Ok(Some(Vec::new()));
         }
@@ -1409,6 +1537,10 @@ impl StorageEngine for ColumnarStorageEngine {
     // ─── Aggregate fast paths ─────────────────────────────────────────────────
 
     fn fast_count_all(&self, table: &str) -> Option<usize> {
+        let _mutation = self.mutation_gate.lock();
+        if self.ensure_healthy().is_err() {
+            return None;
+        }
         self.flush_write_buffer(table);
         let store = self.store.read();
         if !store.table_exists(table) {
@@ -1425,6 +1557,10 @@ impl StorageEngine for ColumnarStorageEngine {
     }
 
     fn fast_topk(&self, table: &str, sort_col: usize, desc: bool, k: usize) -> Option<Vec<Row>> {
+        let _mutation = self.mutation_gate.lock();
+        if self.ensure_healthy().is_err() {
+            return None;
+        }
         if k == 0 {
             return Some(Vec::new());
         }
@@ -1481,6 +1617,10 @@ impl StorageEngine for ColumnarStorageEngine {
     }
 
     fn fast_sum_f64(&self, table: &str, col_idx: usize) -> Option<(f64, usize)> {
+        let _mutation = self.mutation_gate.lock();
+        if self.ensure_healthy().is_err() {
+            return None;
+        }
         self.flush_write_buffer(table);
         let col_name = col_idx.to_string();
         let store = self.store.read();
@@ -1503,6 +1643,10 @@ impl StorageEngine for ColumnarStorageEngine {
         key_col: usize,
         val_col: Option<usize>,
     ) -> Option<Vec<(Value, i64, Option<f64>)>> {
+        let _mutation = self.mutation_gate.lock();
+        if self.ensure_healthy().is_err() {
+            return None;
+        }
         self.flush_write_buffer(table);
         let key_col_name = key_col.to_string();
         let val_col_name = val_col.map(|c| c.to_string());
@@ -1594,6 +1738,10 @@ impl StorageEngine for ColumnarStorageEngine {
         filter_col: usize,
         filter_val: &Value,
     ) -> Option<usize> {
+        let _mutation = self.mutation_gate.lock();
+        if self.ensure_healthy().is_err() {
+            return None;
+        }
         self.flush_write_buffer(table);
         let store = self.store.read();
         if !store.table_exists(table) {
@@ -1621,6 +1769,10 @@ impl StorageEngine for ColumnarStorageEngine {
         filter_col: usize,
         filter_val: &Value,
     ) -> Option<(f64, usize)> {
+        let _mutation = self.mutation_gate.lock();
+        if self.ensure_healthy().is_err() {
+            return None;
+        }
         self.flush_write_buffer(table);
         let val_col_name = val_col.to_string();
         let filter_col_name = filter_col.to_string();
@@ -1653,6 +1805,10 @@ impl StorageEngine for ColumnarStorageEngine {
         op: FilterOp,
         filter_val: &Value,
     ) -> Option<usize> {
+        let _mutation = self.mutation_gate.lock();
+        if self.ensure_healthy().is_err() {
+            return None;
+        }
         self.flush_write_buffer(table);
         let store = self.store.read();
         if !store.table_exists(table) {
@@ -1679,6 +1835,10 @@ impl StorageEngine for ColumnarStorageEngine {
         op: FilterOp,
         filter_val: &Value,
     ) -> Option<(f64, usize)> {
+        let _mutation = self.mutation_gate.lock();
+        if self.ensure_healthy().is_err() {
+            return None;
+        }
         self.flush_write_buffer(table);
         let val_col_name = val_col.to_string();
         let filter_col_name = filter_col.to_string();
@@ -1705,6 +1865,10 @@ impl StorageEngine for ColumnarStorageEngine {
     }
 
     fn fast_min_f64(&self, table: &str, col_idx: usize) -> Option<f64> {
+        let _mutation = self.mutation_gate.lock();
+        if self.ensure_healthy().is_err() {
+            return None;
+        }
         self.flush_write_buffer(table);
         let col_name = col_idx.to_string();
         let store = self.store.read();
@@ -1740,6 +1904,10 @@ impl StorageEngine for ColumnarStorageEngine {
     }
 
     fn fast_max_f64(&self, table: &str, col_idx: usize) -> Option<f64> {
+        let _mutation = self.mutation_gate.lock();
+        if self.ensure_healthy().is_err() {
+            return None;
+        }
         self.flush_write_buffer(table);
         let col_name = col_idx.to_string();
         let store = self.store.read();
@@ -1780,6 +1948,10 @@ impl StorageEngine for ColumnarStorageEngine {
         filter_col: usize,
         filter_val: &Value,
     ) -> Option<(Vec<Row>, usize)> {
+        let _mutation = self.mutation_gate.lock();
+        if self.ensure_healthy().is_err() {
+            return None;
+        }
         self.flush_write_buffer(table);
         let store = self.store.read();
         if !store.table_exists(table) {
@@ -1792,23 +1964,22 @@ impl StorageEngine for ColumnarStorageEngine {
     }
 
     async fn flush_all_dirty(&self) -> Result<(), StorageError> {
-        // Flush all per-table write buffers to the columnar store.
-        let tables: Vec<String> = self.write_buffers.read().keys().cloned().collect();
-        for table in tables {
-            self.flush_write_buffer(&table);
-        }
+        let _mutation = self.mutation_gate.lock();
+        self.ensure_healthy()?;
+        self.flush_all_write_buffers();
         // Checkpoint WAL to a compact single-snapshot file.
         if let Some(wal) = &self.wal {
             let snap = self.snapshot_tables();
             let refs: Vec<(&str, Vec<Row>)> =
                 snap.iter().map(|(n, r)| (n.as_str(), r.clone())).collect();
-            wal.checkpoint(&refs)
-                .map_err(|e| StorageError::Io(e.to_string()))?;
+            self.checkpoint_candidate(wal, &refs)?;
         }
         Ok(())
     }
 
     async fn make_durable(&self) -> Result<(), StorageError> {
+        let _mutation = self.mutation_gate.lock();
+        self.ensure_healthy()?;
         // Mutations are appended to the WAL as they happen (inserts as row
         // batches, updates/deletes as snapshot rewrites) but only `write()`n
         // into the OS page cache. The commit point fsyncs via group commit.
@@ -1820,6 +1991,7 @@ impl StorageEngine for ColumnarStorageEngine {
     }
 
     fn durability_pending(&self) -> bool {
+        let _mutation = self.mutation_gate.lock();
         self.wal.as_ref().is_some_and(|w| w.is_dirty())
     }
 }
@@ -2466,5 +2638,213 @@ mod intra_part_narrowing_tests {
             scanned, 5,
             "a 5-row window in a 50,000-row part should hand the scan 5 rows, not {scanned}"
         );
+    }
+}
+
+#[cfg(test)]
+mod failed_mutation_regressions {
+    use super::*;
+
+    async fn checkpoint_rewrite_preserves_other_tables(operation: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = ColumnarStorageEngine::open(dir.path()).unwrap();
+        for name in ["a", "b", "c"] {
+            engine.create_table(name).await.unwrap();
+        }
+        let a = vec![Value::Int64(1), Value::Text("target".into())];
+        let b = vec![Value::Int64(2), Value::Text("acknowledged-buffer".into())];
+        let c_base = vec![Value::Int64(3), Value::Text("stored".into())];
+        let c_tail = vec![Value::Int64(4), Value::Text("buffered-tail".into())];
+        engine.insert("a", a).await.unwrap();
+        engine.insert("b", b.clone()).await.unwrap();
+        engine
+            .insert_batch("c", vec![c_base.clone()])
+            .await
+            .unwrap();
+        engine.insert("c", c_tail.clone()).await.unwrap();
+        engine.make_durable().await.unwrap();
+        // Do not scan these tables: read paths would drain their buffers and
+        // mask omission of acknowledged rows from the replacement checkpoint.
+        assert_eq!(engine.write_buffers.read().get("b").unwrap().len(), 1);
+        assert_eq!(engine.write_buffers.read().get("c").unwrap().len(), 1);
+        let expected_a = match operation {
+            "update" => {
+                let changed = vec![Value::Int64(1), Value::Text("changed".into())];
+                assert_eq!(
+                    engine.update("a", &[(0, changed.clone())]).await.unwrap(),
+                    1
+                );
+                vec![changed]
+            }
+            "delete" => {
+                assert_eq!(engine.delete("a", &[0]).await.unwrap(), 1);
+                vec![]
+            }
+            _ => unreachable!(),
+        };
+        engine.make_durable().await.unwrap();
+        drop(engine);
+        let reopened = ColumnarStorageEngine::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.scan("a").await.unwrap(),
+            expected_a,
+            "target mutation was not recovered"
+        );
+        assert_eq!(
+            reopened.scan("b").await.unwrap(),
+            vec![b],
+            "{operation} checkpoint lost another table's acknowledged row"
+        );
+        assert_eq!(
+            reopened.scan("c").await.unwrap(),
+            vec![c_base, c_tail],
+            "{operation} checkpoint omitted buffered tail after stored batches"
+        );
+    }
+
+    #[tokio::test]
+    async fn columnar_update_checkpoint_preserves_other_tables_buffered_rows() {
+        checkpoint_rewrite_preserves_other_tables("update").await;
+    }
+
+    #[tokio::test]
+    async fn columnar_delete_checkpoint_preserves_other_tables_buffered_rows() {
+        checkpoint_rewrite_preserves_other_tables("delete").await;
+    }
+
+    #[tokio::test]
+    async fn failed_columnar_engine_mutations_preserve_live_and_reopened_rows() {
+        for operation in ["create", "drop", "batch", "update", "delete"] {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = ColumnarStorageEngine::open(dir.path()).unwrap();
+            engine.create_table("t").await.unwrap();
+            let original = vec![Value::Int64(1), Value::Text("original".into())];
+            engine.insert("t", original.clone()).await.unwrap();
+            engine.flush_all_dirty().await.unwrap();
+            let before = std::fs::read(dir.path().join("columnar.wal")).unwrap();
+            let wal = engine.wal.as_ref().unwrap();
+            if matches!(operation, "update" | "delete") {
+                wal.fail_next_checkpoint();
+            } else {
+                wal.fail_next_append();
+            }
+            let outcome = match operation {
+                "create" => engine.create_table("new_table").await,
+                "drop" => engine.drop_table("t").await,
+                "batch" => {
+                    engine
+                        .insert_batch("t", vec![vec![Value::Int64(2), Value::Text("new".into())]])
+                        .await
+                }
+                "update" => engine
+                    .update(
+                        "t",
+                        &[(0, vec![Value::Int64(1), Value::Text("changed".into())])],
+                    )
+                    .await
+                    .map(|_| ()),
+                _ => engine.delete("t", &[0]).await.map(|_| ()),
+            };
+            assert!(
+                matches!(outcome, Err(StorageError::Io(_))),
+                "{operation}: {outcome:?}"
+            );
+            assert_eq!(
+                engine.scan("t").await.unwrap(),
+                vec![original.clone()],
+                "failed {operation} changed live rows"
+            );
+            assert!(matches!(
+                engine.scan("new_table").await,
+                Err(StorageError::TableNotFound(_))
+            ));
+            assert_eq!(
+                std::fs::read(dir.path().join("columnar.wal")).unwrap(),
+                before
+            );
+            drop(engine);
+            let reopened = ColumnarStorageEngine::open(dir.path()).unwrap();
+            assert_eq!(
+                reopened.scan("t").await.unwrap(),
+                vec![original],
+                "{operation} reopen differs"
+            );
+            assert!(matches!(
+                reopened.scan("new_table").await,
+                Err(StorageError::TableNotFound(_))
+            ));
+        }
+    }
+    #[tokio::test]
+    async fn columnar_checkpoint_reopen_failure_fences_until_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = ColumnarStorageEngine::open(dir.path()).unwrap();
+        engine.create_table("t").await.unwrap();
+        engine.insert("t", vec![Value::Int64(1)]).await.unwrap();
+        engine.flush_all_dirty().await.unwrap();
+        engine.wal.as_ref().unwrap().fail_next_reopen();
+        assert!(matches!(
+            engine.update("t", &[(0, vec![Value::Int64(2)])]).await,
+            Err(StorageError::Io(_))
+        ));
+        // Replacement was published but the client received an error. Do not
+        // read the old image or acknowledge later mutations over an uncertain outcome.
+        assert!(matches!(engine.scan("t").await, Err(StorageError::Io(_))));
+        assert!(engine.fast_count_all("t").is_none());
+        assert!(matches!(
+            engine.insert("t", vec![Value::Int64(3)]).await,
+            Err(StorageError::Io(_))
+        ));
+        assert!(matches!(
+            engine.make_durable().await,
+            Err(StorageError::Io(_))
+        ));
+        drop(engine);
+        let recovered = ColumnarStorageEngine::open(dir.path()).unwrap();
+        assert_eq!(
+            recovered.scan("t").await.unwrap(),
+            vec![vec![Value::Int64(2)]]
+        );
+        recovered.insert("t", vec![Value::Int64(4)]).await.unwrap();
+        assert_eq!(
+            recovered.scan("t").await.unwrap(),
+            vec![vec![Value::Int64(2)], vec![Value::Int64(4)]]
+        );
+    }
+    #[tokio::test]
+    async fn columnar_append_flush_failure_fences_uncertain_write_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = ColumnarStorageEngine::open(dir.path()).unwrap();
+        engine.create_table("t").await.unwrap();
+        engine.insert("t", vec![Value::Int64(1)]).await.unwrap();
+        engine.flush_all_dirty().await.unwrap();
+        engine.wal.as_ref().unwrap().fail_next_flush();
+        assert!(matches!(
+            engine.insert_batch("t", vec![vec![Value::Int64(2)]]).await,
+            Err(StorageError::Io(_))
+        ));
+        assert!(engine.durability_pending());
+        assert!(matches!(engine.scan("t").await, Err(StorageError::Io(_))));
+        assert!(matches!(
+            engine.insert("t", vec![Value::Int64(3)]).await,
+            Err(StorageError::Io(_))
+        ));
+        assert!(matches!(
+            engine.make_durable().await,
+            Err(StorageError::Io(_))
+        ));
+        assert!(engine.wal.as_ref().unwrap().group_sync().is_err());
+        drop(engine);
+        // The fully encoded frame may reach disk despite the error (including
+        // BufWriter's final flush). Recovery resolves this uncertain outcome;
+        // the failed operation was never reported successful and later id3
+        // was never allowed to append beyond it.
+        let reopened = ColumnarStorageEngine::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.scan("t").await.unwrap(),
+            vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        );
+        reopened.insert("t", vec![Value::Int64(4)]).await.unwrap();
+        assert_eq!(reopened.scan("t").await.unwrap().len(), 3);
     }
 }

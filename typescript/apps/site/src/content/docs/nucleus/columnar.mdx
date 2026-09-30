@@ -1,64 +1,53 @@
 ---
 title: Columnar Analytics
-description: Column-oriented storage for OLAP workloads.
+description: Typed SQL analytics and the native columnar ingestion boundary.
 ---
 
-Nucleus includes a built-in columnar engine for analytics workloads. Run aggregations over millions of rows with vectorized execution — no ClickHouse or separate OLAP database needed.
+Nucleus can store a typed SQL table in its columnar engine. Use ordinary SQL
+aggregates over declared numeric columns. The separate `COLUMNAR_*` ingestion
+functions accept untyped key-value data and have a narrower aggregation contract.
 
-## Inserting Data
-
-```sql
--- Insert rows as key-value pairs
-SELECT COLUMNAR_INSERT('events', 'user_id', '42', 'action', 'click', 'duration', '1.5');
-SELECT COLUMNAR_INSERT('events', 'user_id', '43', 'action', 'view', 'duration', '3.2');
-SELECT COLUMNAR_INSERT('events', 'user_id', '42', 'action', 'purchase', 'duration', '12.0');
-```
-
-## Aggregations
+## Typed SQL Tables
 
 ```sql
--- Count rows
-SELECT COLUMNAR_COUNT('events');
--- → 3
+CREATE TABLE analytics_events (
+  user_id INT,
+  action TEXT,
+  duration DOUBLE PRECISION
+) WITH (engine='columnar');
 
--- Sum a column
-SELECT COLUMNAR_SUM('events', 'duration');
--- → 16.7
+INSERT INTO analytics_events VALUES
+  (42, 'click', 1.5),
+  (43, 'view', 3.2),
+  (42, 'purchase', 12.0);
 
--- Average
-SELECT COLUMNAR_AVG('events', 'duration');
--- → 5.57
-
--- Min / Max
-SELECT COLUMNAR_MIN('events', 'duration');
--- → 1.5
-SELECT COLUMNAR_MAX('events', 'duration');
--- → 12.0
+SELECT COUNT(*), SUM(duration), AVG(duration), MIN(duration), MAX(duration)
+FROM analytics_events;
 ```
 
-## Why Columnar?
+Typed columns give SQL aggregation a numeric schema. This path differs from
+native untyped ingestion; it does not infer numbers from text values.
 
-Traditional row-oriented storage reads entire rows even when you only need one column. Columnar storage reads only the columns you reference:
+## Native Untyped Ingestion
 
-| Query | Row Store | Column Store |
-|-------|-----------|-------------|
-| `SELECT AVG(price) FROM products` | Reads all columns | Reads only `price` |
-| `SELECT * FROM products WHERE id = 5` | Reads one row | Reads all columns |
+```sql
+SELECT COLUMNAR_INSERT('raw_events', 'user_id', '42', 'duration', '1.5');
+SELECT COLUMNAR_INSERT('raw_events', 'user_id', '43', 'duration', '3.2');
+SELECT COLUMNAR_COUNT('raw_events');
+-- Counts the two ingested rows.
+```
 
-**Best for:** Aggregations, analytics, reporting, dashboards.
-**Not ideal for:** Point lookups, transactional updates.
+`COLUMNAR_SUM`, `COLUMNAR_AVG`, `COLUMNAR_MIN`, and `COLUMNAR_MAX` refuse untyped
+values with SQLSTATE `0A000`. Use a typed SQL table for numeric analytics.
 
-## How It Works
+## Storage and Failures
 
-- **Type-aligned columns** — Values stored contiguously by type (Bool, Int32, Int64, Float64, Text)
-- **Vectorized execution** — Processes data in batches for CPU cache efficiency
-- **Compression** — Similar values in sequence compress better than mixed rows
-- **Parallel aggregation** — Multi-threaded across column batches
+A declared columnar SQL table uses disk-backed storage when the database has a
+data directory, and memory storage in memory mode. A failed durable open refuses
+the operation or startup instead of silently selecting memory storage.
 
-## Use Cases
-
-- **Analytics dashboards** — Fast aggregations over large datasets
-- **Event tracking** — Aggregate user actions, clicks, pageviews
-- **Log analysis** — Count and summarize structured log entries
-- **Business intelligence** — Revenue, conversion, retention metrics
-- **Time-series rollups** — Pre-aggregated summaries
+Native ingestion is durable only when its WAL is attached and the selected
+commit mode synchronizes it. WAL failures propagate to the caller. An I/O error
+can leave an uncertain outcome that requires recovery; an error is not a durable
+acknowledgement. These boundaries do not establish power-loss survival from a
+successful process-restart test.

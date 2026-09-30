@@ -1,106 +1,61 @@
 #!/bin/sh
-# Neutron CLI installer.
-#
-# Usage:   curl -fsSL https://get.neutron.build | sh
-#
-# Environment variables:
-#   NEUTRON_INSTALL_DIR   target directory (default: $HOME/.local/bin)
-#   NEUTRON_VERSION       pin a specific version (e.g. "0.1.0"); default: latest
-#
-# Source: https://github.com/neutron-build/neutron/blob/main/scripts/install.sh
-# Hosted at: https://get.neutron.build (served as a static file by Caddy on OVH)
-
+# Neutron CLI installer. Usage: curl -fsSL https://get.neutron.build | sh
+# NEUTRON_VERSION pins a release; NEUTRON_INSTALL_DIR defaults to ~/.local/bin.
 set -eu
 
-OWNER="neutron-build"
-REPO="neutron"
-BIN="neutron"
-INSTALL_DIR="${NEUTRON_INSTALL_DIR:-$HOME/.local/bin}"
-
-# ---- detect platform ------------------------------------------------------
-
+fail() { echo "neutron: $*" >&2; exit 1; }
+REPO=neutron-build/neutron
+INSTALL_DIR=${NEUTRON_INSTALL_DIR:-"$HOME/.local/bin"}
 case "$(uname -s)" in
-  Darwin) OS="darwin" ;;
-  Linux)  OS="linux" ;;
-  MINGW*|MSYS*|CYGWIN*)
-    echo "neutron: Windows is supported through WSL, not natively." >&2
-    echo "         Install WSL (wsl --install), then run this installer inside the Linux shell." >&2
-    echo "         See https://neutron.build/docs/cli/overview" >&2
-    exit 1
-    ;;
-  *)
-    echo "neutron: unsupported OS: $(uname -s)" >&2
-    echo "         supported: macOS, Linux, and Windows through WSL. See https://neutron.build/docs/cli/overview" >&2
-    exit 1
-    ;;
+    Darwin) os=darwin ;;
+    Linux) os=linux ;;
+    MINGW*|MSYS*|CYGWIN*) fail "Windows is supported through WSL; run this installer inside its Linux shell" ;;
+    *) fail "supported operating systems: macOS and Linux (Windows through WSL)" ;;
 esac
-
 case "$(uname -m)" in
-  x86_64|amd64)  ARCH="amd64" ;;
-  arm64|aarch64) ARCH="arm64" ;;
-  *)
-    echo "neutron: unsupported architecture: $(uname -m)" >&2
-    echo "         supported: x86_64, arm64. See https://neutron.build/docs/cli/overview" >&2
-    exit 1
-    ;;
+    x86_64|amd64) arch=amd64 ;;
+    arm64|aarch64) arch=arm64 ;;
+    *) fail "supported architectures: x86_64 and arm64" ;;
 esac
-
-# ---- resolve version ------------------------------------------------------
-
-if [ -n "${NEUTRON_VERSION:-}" ]; then
-  VERSION="$NEUTRON_VERSION"
+if command -v sha256sum >/dev/null 2>&1; then
+    hash_tool=sha256sum
+elif command -v shasum >/dev/null 2>&1; then
+    hash_tool=shasum
 else
-  # Find the most recent release whose tag starts with cli/v
-  VERSION=$(curl -fsSL "https://api.github.com/repos/${OWNER}/${REPO}/releases" 2>/dev/null \
-    | grep -oE '"tag_name":[[:space:]]*"cli/v[^"]+"' \
-    | head -1 \
-    | sed -E 's/.*"cli\/v([^"]+)".*/\1/')
-  if [ -z "$VERSION" ]; then
-    echo "neutron: no published CLI release found." >&2
-    echo "         See https://github.com/${OWNER}/${REPO}/releases" >&2
-    echo "         Or install via npm:  npx @neutron-build/cli --help" >&2
-    exit 1
-  fi
+    fail "SHA-256 verification requires sha256sum or shasum; nothing was installed"
 fi
-
-ASSET="neutron_${VERSION}_${OS}_${ARCH}.tar.gz"
-URL="https://github.com/${OWNER}/${REPO}/releases/download/cli/v${VERSION}/${ASSET}"
-
-echo "Installing neutron CLI v${VERSION} (${OS}/${ARCH})"
-echo "  from ${URL}"
-
-# ---- download + extract + install ----------------------------------------
-
-TMP=$(mktemp -d 2>/dev/null || mktemp -d -t neutron)
-trap 'rm -rf "$TMP"' EXIT INT TERM
-
-if ! curl -fsSL "$URL" | tar -xz -C "$TMP"; then
-  echo "neutron: download or extract failed for ${ASSET}" >&2
-  echo "         verify the release exists at https://github.com/${OWNER}/${REPO}/releases/tag/cli/v${VERSION}" >&2
-  exit 1
+version=${NEUTRON_VERSION:-}
+if [ -z "$version" ]; then
+    releases=$(curl --proto '=https' --tlsv1.2 -fsSL "https://api.github.com/repos/$REPO/releases") || fail "cannot read releases"
+    version=$(printf '%s\n' "$releases" | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"cli/v[^"]+"' | head -1 | sed -E 's/.*"cli\/v([^"]+)"/\1/')
 fi
-
-if [ ! -f "${TMP}/${BIN}" ]; then
-  echo "neutron: archive did not contain ./${BIN} — bug, please report." >&2
-  exit 1
-fi
-
-mkdir -p "$INSTALL_DIR"
-mv "${TMP}/${BIN}" "${INSTALL_DIR}/${BIN}"
-chmod +x "${INSTALL_DIR}/${BIN}"
-
-echo ""
-echo "  installed: ${INSTALL_DIR}/${BIN}"
-
-# ---- PATH hint ------------------------------------------------------------
-
-case ":${PATH}:" in
-  *":${INSTALL_DIR}:"*)
-    echo "  ready:  ${BIN} --version"
-    ;;
-  *)
-    echo ""
-    echo "  ${INSTALL_DIR} is not on your PATH. Add it to your shell profile:"
-    echo "    export PATH=\"${INSTALL_DIR}:\$PATH\""
-    ;;
+case "$version" in
+    ''|*[!0-9A-Za-z.+-]*|[!0-9]*) fail "no valid CLI release version; set NEUTRON_VERSION to a published version" ;;
 esac
+archive=neutron_${version}_${os}_${arch}.tar.gz
+base=https://github.com/$REPO/releases/download/cli/v$version
+task_tmp=$(mktemp -d)
+trap 'rm -rf "$task_tmp"' EXIT HUP INT TERM
+curl --proto '=https' --tlsv1.2 -fsSL -o "$task_tmp/$archive" "$base/$archive" || fail "archive download failed"
+curl --proto '=https' --tlsv1.2 -fsSL -o "$task_tmp/checksums.txt" "$base/checksums.txt" || fail "checksum download failed"
+expected=$(awk -v name="$archive" '$2 == name || $2 == "*" name {print $1}' "$task_tmp/checksums.txt")
+[ "${#expected}" -eq 64 ] || fail "expected exactly one SHA-256 checksum for $archive"
+case "$expected" in *[!0-9a-fA-F]*) fail "invalid SHA-256 checksum for $archive" ;; esac
+if [ "$hash_tool" = sha256sum ]; then
+    actual=$(sha256sum "$task_tmp/$archive" | awk '{print $1}')
+else
+    actual=$(shasum -a 256 "$task_tmp/$archive" | awk '{print $1}')
+fi
+[ "$actual" = "$expected" ] || fail "checksum mismatch; nothing was installed"
+# Release archives contain exactly one regular file, named neutron.
+entries=$(tar -tzf "$task_tmp/$archive") || fail "invalid archive"
+[ "$entries" = neutron ] || fail "archive must contain only neutron"
+tar -xzf "$task_tmp/$archive" -C "$task_tmp" || fail "archive extraction failed"
+[ -f "$task_tmp/neutron" ] && [ ! -L "$task_tmp/neutron" ] || fail "archive binary is not a regular file"
+mkdir -p "$INSTALL_DIR"
+staged=$(mktemp "$INSTALL_DIR/.neutron-install.XXXXXX")
+trap 'rm -rf "$task_tmp"; rm -f "$staged"' EXIT HUP INT TERM
+cp "$task_tmp/neutron" "$staged"
+chmod 755 "$staged"
+mv -f "$staged" "$INSTALL_DIR/neutron"
+printf 'Installed neutron CLI %s to %s/neutron\nRun: neutron version\n' "$version" "$INSTALL_DIR"
