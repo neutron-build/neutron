@@ -973,7 +973,10 @@ async fn persistent_stress(duration: Duration) {
                         "id".to_string(),
                         ColumnData::Int64(vec![Some(counter as i64)]),
                     )]);
-                    db.columnar().write().append("persist_col", batch);
+                    db.columnar()
+                        .write()
+                        .append("persist_col", batch)
+                        .expect("columnar append must succeed");
                     columnar_count.fetch_add(1, Ordering::Relaxed);
                 }
                 8 => {

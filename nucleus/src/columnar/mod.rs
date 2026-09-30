@@ -855,14 +855,12 @@ impl ColumnarStore {
     /// If the table has a MergeTree backing store, the batch is inserted there
     /// (sorted by PK, zone-mapped). Otherwise falls back to raw batch storage.
     /// If a WAL is attached the rows are logged before the in-memory update.
-    pub fn append(&mut self, table: &str, batch: ColumnBatch) {
+    pub fn append(&mut self, table: &str, batch: ColumnBatch) -> std::io::Result<()> {
         self.poll_all_merge_results();
         if let Some(ref wal) = self.wal {
             let rows = batch_to_rows(&batch);
             let names = column_names(&batch);
-            if let Err(e) = wal.log_insert_rows_named(None, table, &names, &rows) {
-                eprintln!("columnar WAL: failed to log insert_rows for {table}: {e}");
-            }
+            wal.log_insert_rows_named(None, table, &names, &rows)?;
         }
         if let Some(mt) = self.merge_trees.get_mut(table) {
             mt.insert(batch);
@@ -872,6 +870,7 @@ impl ColumnarStore {
                 .or_default()
                 .push(batch);
         }
+        Ok(())
     }
 
     /// Get all batches for a table as a slice reference.
@@ -2673,26 +2672,34 @@ impl ColumnarStore {
     /// and the column has < `DICT_AUTO_MAX_CARDINALITY` distinct values.
     ///
     /// Dictionary-encoded columns are stored alongside the batch in `dict_columns`.
-    pub fn append_with_dict_in_xact(&mut self, table: &str, batch: ColumnBatch, xact: u64) {
-        self.append_with_dict_tagged(table, batch, Some(xact));
+    pub fn append_with_dict_in_xact(
+        &mut self,
+        table: &str,
+        batch: ColumnBatch,
+        xact: u64,
+    ) -> std::io::Result<()> {
+        self.append_with_dict_tagged(table, batch, Some(xact))
     }
 
     /// [`Self::append_with_dict_in_xact`](Self::append_with_dict_in_xact)
     /// writing the legacy UNTAGGED record: used by callers with no
     /// transaction identity (the per-table storage engine's in-memory
     /// store), whose records therefore keep unconditionally on replay.
-    pub fn append_with_dict(&mut self, table: &str, batch: ColumnBatch) {
-        self.append_with_dict_tagged(table, batch, None);
+    pub fn append_with_dict(&mut self, table: &str, batch: ColumnBatch) -> std::io::Result<()> {
+        self.append_with_dict_tagged(table, batch, None)
     }
 
-    fn append_with_dict_tagged(&mut self, table: &str, batch: ColumnBatch, xact: Option<u64>) {
+    fn append_with_dict_tagged(
+        &mut self,
+        table: &str,
+        batch: ColumnBatch,
+        xact: Option<u64>,
+    ) -> std::io::Result<()> {
         self.poll_all_merge_results();
         if let Some(ref wal) = self.wal {
             let rows = batch_to_rows(&batch);
             let names = column_names(&batch);
-            if let Err(e) = wal.log_insert_rows_named(xact, table, &names, &rows) {
-                eprintln!("columnar WAL: failed to log insert_rows (dict) for {table}: {e}");
-            }
+            wal.log_insert_rows_named(xact, table, &names, &rows)?;
         }
         let row_count = batch.row_count;
         if row_count >= DICT_AUTO_MIN_ROWS {
@@ -2726,6 +2733,7 @@ impl ColumnarStore {
                 .or_default()
                 .push(batch);
         }
+        Ok(())
     }
 
     /// Retrieve dictionary-encoded columns for a table, if any.
@@ -4685,7 +4693,7 @@ mod tests {
     fn columnar_store_basic() {
         let mut store = ColumnarStore::new();
         let batch = sample_batch();
-        store.append("employees", batch);
+        store.append("employees", batch).unwrap();
 
         assert_eq!(store.row_count("employees"), 5);
         assert_eq!(store.batches("employees").len(), 1);
@@ -4735,7 +4743,7 @@ mod tests {
             ),
         ]);
         assert_eq!(batch.row_count, 4);
-        store.append("mixed", batch);
+        store.append("mixed", batch).unwrap();
         let batches = store.batches("mixed");
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].row_count, 4);
@@ -4856,7 +4864,7 @@ mod tests {
                 "id".into(),
                 ColumnData::Int64(vec![Some(base + 1), Some(base + 2), Some(base + 3)]),
             )]);
-            store.append("events", batch);
+            store.append("events", batch).unwrap();
         }
         assert_eq!(store.batches("events").len(), 3);
         assert_eq!(store.row_count("events"), 9);
@@ -5342,8 +5350,8 @@ mod tests {
         ]);
 
         let mut store = ColumnarStore::new();
-        store.append("people", young_batch);
-        store.append("people", old_batch);
+        store.append("people", young_batch).unwrap();
+        store.append("people", old_batch).unwrap();
 
         let target = ScalarValue::Int64(40);
         let mut results = Vec::new();
@@ -5813,7 +5821,7 @@ mod tests {
         ]);
 
         let mut store = ColumnarStore::new();
-        store.append_with_dict("orders", batch);
+        store.append_with_dict("orders", batch).unwrap();
 
         // Should have auto-encoded the "status" column
         let dict_cols = store.get_dict_columns("orders").unwrap();
@@ -5835,7 +5843,7 @@ mod tests {
         let batch = ColumnBatch::new(vec![("label".into(), ColumnData::Text(values))]);
 
         let mut store = ColumnarStore::new();
-        store.append_with_dict("small", batch);
+        store.append_with_dict("small", batch).unwrap();
 
         // Should NOT have dict columns — batch too small
         assert!(store.get_dict_columns("small").is_none());
@@ -5851,7 +5859,7 @@ mod tests {
         let batch = ColumnBatch::new(vec![("category".into(), ColumnData::Text(cat_vals))]);
 
         let mut store = ColumnarStore::new();
-        store.append_with_dict("products", batch);
+        store.append_with_dict("products", batch).unwrap();
 
         // Use the dict-aware group by
         let groups = store.dict_group_by_count_for("products", "category");
@@ -5879,7 +5887,7 @@ mod tests {
         )]);
 
         let mut store = ColumnarStore::new();
-        store.append("colors", batch); // regular append, no dict
+        store.append("colors", batch).unwrap(); // regular append, no dict
 
         let groups = store.dict_group_by_count_for("colors", "color");
         assert_eq!(groups.len(), 2);
@@ -6009,7 +6017,7 @@ mod tests {
                 ("val".into(), ColumnData::Float64(vals)),
                 ("name".into(), ColumnData::Text(names)),
             ]);
-            store.append("t", batch);
+            store.append("t", batch).unwrap();
         }
         store
     }
@@ -6193,7 +6201,7 @@ mod tests {
                 ColumnData::Float64(vec![Some(0.9), Some(0.5), Some(0.7)]),
             ),
         ]);
-        store.append("events", batch);
+        store.append("events", batch).unwrap();
 
         assert_eq!(store.row_count("events"), 3);
 
@@ -6220,7 +6228,7 @@ mod tests {
                 ColumnData::Float64((1..=10).map(|i| Some(i as f64)).collect()),
             ),
         ]);
-        store.append("events", batch1);
+        store.append("events", batch1).unwrap();
 
         let batch2 = ColumnBatch::new(vec![
             (
@@ -6232,7 +6240,7 @@ mod tests {
                 ColumnData::Float64((100..=110).map(|i| Some(i as f64)).collect()),
             ),
         ]);
-        store.append("events", batch2);
+        store.append("events", batch2).unwrap();
 
         // Scan with predicate that should prune part 1
         let pruned = store.scan_merge_tree("events", "id", CmpOp::Gt, &ScalarValue::Int64(50));
@@ -6274,7 +6282,7 @@ mod tests {
                 ]),
             ),
         ]);
-        store.append("logs", batch);
+        store.append("logs", batch).unwrap();
 
         let batches = store.batches_all("logs");
         assert_eq!(batches.len(), 1);
@@ -6309,7 +6317,7 @@ mod tests {
             "id".into(),
             ColumnData::Int64(vec![Some(3), Some(1), Some(2)]),
         )]);
-        store.append("raw", batch);
+        store.append("raw", batch).unwrap();
 
         // Raw tables don't sort
         let batches = store.batches("raw");
@@ -6329,7 +6337,7 @@ mod tests {
             "id".into(),
             ColumnData::Int64(vec![Some(1), Some(2)]),
         )]);
-        store.append("t", batch);
+        store.append("t", batch).unwrap();
         assert_eq!(store.row_count("t"), 2);
 
         // Clear should reset the MergeTree
@@ -6339,7 +6347,7 @@ mod tests {
 
         // Re-insert after clear
         let batch2 = ColumnBatch::new(vec![("id".into(), ColumnData::Int64(vec![Some(10)]))]);
-        store.append("t", batch2);
+        store.append("t", batch2).unwrap();
         assert_eq!(store.row_count("t"), 1);
 
         // Drop should remove MergeTree
@@ -6368,7 +6376,7 @@ mod tests {
                     ColumnData::Float64(vec![Some(3.0), Some(1.0), Some(2.0)]),
                 ),
             ]);
-            store.append("events", batch);
+            store.append("events", batch).unwrap();
             assert_eq!(store.row_count("events"), 3);
         }
 
@@ -6394,17 +6402,21 @@ mod tests {
             store.create_merge_tree_table("mt", vec!["ts".into()]);
             // Many small appends so the WAL accumulates one INSERT_ROWS entry each.
             for i in 0..50i64 {
-                store.append(
-                    "raw",
-                    ColumnBatch::new(vec![("k".into(), ColumnData::Int64(vec![Some(i)]))]),
-                );
-                store.append(
-                    "mt",
-                    ColumnBatch::new(vec![
-                        ("ts".into(), ColumnData::Int64(vec![Some(i)])),
-                        ("v".into(), ColumnData::Float64(vec![Some(i as f64)])),
-                    ]),
-                );
+                store
+                    .append(
+                        "raw",
+                        ColumnBatch::new(vec![("k".into(), ColumnData::Int64(vec![Some(i)]))]),
+                    )
+                    .unwrap();
+                store
+                    .append(
+                        "mt",
+                        ColumnBatch::new(vec![
+                            ("ts".into(), ColumnData::Int64(vec![Some(i)])),
+                            ("v".into(), ColumnData::Float64(vec![Some(i as f64)])),
+                        ]),
+                    )
+                    .unwrap();
             }
             let before = std::fs::metadata(&wal_path).unwrap().len();
 
@@ -6470,13 +6482,15 @@ mod tests {
 
         {
             let mut store = ColumnarStore::open(p).unwrap();
-            store.append(
-                "metrics",
-                ColumnBatch::new(vec![
-                    ("metric".into(), ColumnData::Int64(vec![Some(99)])),
-                    ("host".into(), ColumnData::Text(vec![Some("a".into())])),
-                ]),
-            );
+            store
+                .append(
+                    "metrics",
+                    ColumnBatch::new(vec![
+                        ("metric".into(), ColumnData::Int64(vec![Some(99)])),
+                        ("host".into(), ColumnData::Text(vec![Some("a".into())])),
+                    ]),
+                )
+                .unwrap();
             assert_eq!(sum(&store, "metrics", "metric"), 99.0, "control: live");
         }
 
@@ -6520,7 +6534,7 @@ mod tests {
                 ColumnData::Float64(vec![Some(10.0), Some(20.0), Some(30.0)]),
             ),
         ]);
-        store.append("metrics", batch);
+        store.append("metrics", batch).unwrap();
 
         // batches_all should work for MergeTree tables
         let all = store.batches_all("metrics");
@@ -7422,22 +7436,26 @@ mod tests {
         assert!(store.table_exists("events"));
         assert!(store.is_merge_tree("events"));
 
-        store.append(
-            "events",
-            ColumnBatch::new(vec![
-                ("id".into(), ColumnData::Int64(vec![Some(1)])),
-                ("ver".into(), ColumnData::Int64(vec![Some(1)])),
-                ("data".into(), ColumnData::Text(vec![Some("old".into())])),
-            ]),
-        );
-        store.append(
-            "events",
-            ColumnBatch::new(vec![
-                ("id".into(), ColumnData::Int64(vec![Some(1)])),
-                ("ver".into(), ColumnData::Int64(vec![Some(2)])),
-                ("data".into(), ColumnData::Text(vec![Some("new".into())])),
-            ]),
-        );
+        store
+            .append(
+                "events",
+                ColumnBatch::new(vec![
+                    ("id".into(), ColumnData::Int64(vec![Some(1)])),
+                    ("ver".into(), ColumnData::Int64(vec![Some(1)])),
+                    ("data".into(), ColumnData::Text(vec![Some("old".into())])),
+                ]),
+            )
+            .unwrap();
+        store
+            .append(
+                "events",
+                ColumnBatch::new(vec![
+                    ("id".into(), ColumnData::Int64(vec![Some(1)])),
+                    ("ver".into(), ColumnData::Int64(vec![Some(2)])),
+                    ("data".into(), ColumnData::Text(vec![Some("new".into())])),
+                ]),
+            )
+            .unwrap();
 
         // Optimize via MergeTree
         store.get_merge_tree_mut("events").unwrap().optimize();
@@ -7463,22 +7481,26 @@ mod tests {
             },
         );
 
-        store.append(
-            "stats",
-            ColumnBatch::new(vec![
-                ("page".into(), ColumnData::Text(vec![Some("/home".into())])),
-                ("views".into(), ColumnData::Int64(vec![Some(100)])),
-                ("visits".into(), ColumnData::Int64(vec![Some(50)])),
-            ]),
-        );
-        store.append(
-            "stats",
-            ColumnBatch::new(vec![
-                ("page".into(), ColumnData::Text(vec![Some("/home".into())])),
-                ("views".into(), ColumnData::Int64(vec![Some(200)])),
-                ("visits".into(), ColumnData::Int64(vec![Some(75)])),
-            ]),
-        );
+        store
+            .append(
+                "stats",
+                ColumnBatch::new(vec![
+                    ("page".into(), ColumnData::Text(vec![Some("/home".into())])),
+                    ("views".into(), ColumnData::Int64(vec![Some(100)])),
+                    ("visits".into(), ColumnData::Int64(vec![Some(50)])),
+                ]),
+            )
+            .unwrap();
+        store
+            .append(
+                "stats",
+                ColumnBatch::new(vec![
+                    ("page".into(), ColumnData::Text(vec![Some("/home".into())])),
+                    ("views".into(), ColumnData::Int64(vec![Some(200)])),
+                    ("visits".into(), ColumnData::Int64(vec![Some(75)])),
+                ]),
+            )
+            .unwrap();
 
         store.get_merge_tree_mut("stats").unwrap().optimize();
 
@@ -7503,33 +7525,39 @@ mod tests {
                 version_column: Some("ver".into()),
             },
         );
-        store.append(
-            "t",
-            ColumnBatch::new(vec![
-                ("id".into(), ColumnData::Int64(vec![Some(1)])),
-                ("ver".into(), ColumnData::Int64(vec![Some(1)])),
-            ]),
-        );
+        store
+            .append(
+                "t",
+                ColumnBatch::new(vec![
+                    ("id".into(), ColumnData::Int64(vec![Some(1)])),
+                    ("ver".into(), ColumnData::Int64(vec![Some(1)])),
+                ]),
+            )
+            .unwrap();
         assert_eq!(store.row_count("t"), 1);
 
         store.clear("t");
         assert_eq!(store.row_count("t"), 0);
 
         // Re-insert and verify strategy still works
-        store.append(
-            "t",
-            ColumnBatch::new(vec![
-                ("id".into(), ColumnData::Int64(vec![Some(1)])),
-                ("ver".into(), ColumnData::Int64(vec![Some(1)])),
-            ]),
-        );
-        store.append(
-            "t",
-            ColumnBatch::new(vec![
-                ("id".into(), ColumnData::Int64(vec![Some(1)])),
-                ("ver".into(), ColumnData::Int64(vec![Some(2)])),
-            ]),
-        );
+        store
+            .append(
+                "t",
+                ColumnBatch::new(vec![
+                    ("id".into(), ColumnData::Int64(vec![Some(1)])),
+                    ("ver".into(), ColumnData::Int64(vec![Some(1)])),
+                ]),
+            )
+            .unwrap();
+        store
+            .append(
+                "t",
+                ColumnBatch::new(vec![
+                    ("id".into(), ColumnData::Int64(vec![Some(1)])),
+                    ("ver".into(), ColumnData::Int64(vec![Some(2)])),
+                ]),
+            )
+            .unwrap();
         store.get_merge_tree_mut("t").unwrap().optimize();
         assert_eq!(store.row_count("t"), 1); // deduped
     }
@@ -7803,7 +7831,9 @@ mod tests {
     fn registering_a_merge_tree_adopts_rows_already_in_the_plain_table() {
         let mut store = ColumnarStore::new();
         store.create_table("adopt_tbl");
-        store.append("adopt_tbl", positional_part(&[1, 2], &[1, 1], &[10, 20]));
+        store
+            .append("adopt_tbl", positional_part(&[1, 2], &[1, 1], &[10, 20]))
+            .unwrap();
         assert_eq!(store.row_count("adopt_tbl"), 2);
 
         store.create_merge_tree_table_with_strategy(
@@ -7840,17 +7870,17 @@ mod failed_append_regressions {
                 "category".into(),
                 ColumnData::Text(vec![Some("same".into()); DICT_AUTO_MIN_ROWS]),
             )]);
-            match variant {
-                0 => {
-                    let _ = store.append("events", batch);
-                }
-                1 => {
-                    let _ = store.append_with_dict("events", batch);
-                }
-                _ => {
-                    let _ = store.append_with_dict_in_xact("events", batch, 42);
-                }
-            }
+            let result = match variant {
+                0 => store.append("events", batch),
+                1 => store.append_with_dict("events", batch),
+                _ => store.append_with_dict_in_xact("events", batch, 42),
+            };
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected columnar WAL append failure")
+            );
             assert_eq!(
                 store.row_count("events"),
                 0,

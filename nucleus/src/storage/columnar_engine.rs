@@ -170,7 +170,9 @@ impl ColumnarStorageEngine {
         for (table_name, rows) in &state.tables {
             store.create_table(table_name);
             if !rows.is_empty() {
-                store.append(table_name, rows_to_batch(rows.clone()));
+                store
+                    .append(table_name, rows_to_batch(rows.clone()))
+                    .expect("per-table engine uses a memory-only ColumnarStore");
             }
         }
         Ok(Self {
@@ -902,7 +904,10 @@ impl ColumnarStorageEngine {
         };
         // The starting position for buffered rows = current store row count (before append).
         let starting_pos = self.store.read().row_count(table);
-        self.store.write().append(table, rows_to_batch(buf.clone()));
+        self.store
+            .write()
+            .append(table, rows_to_batch(buf.clone()))
+            .expect("per-table engine uses a memory-only ColumnarStore");
         // Now assign stable positions to the newly flushed rows.
         self.update_indexes_at_positions(table, &buf, starting_pos);
     }
@@ -1021,7 +1026,9 @@ impl StorageEngine for ColumnarStorageEngine {
             // Single contiguous batch for all rows — the key perf win.
             // Use append_with_dict so low-cardinality text columns (browser, OS,
             // country, etc.) get automatic dictionary compression.
-            store.append_with_dict(table, rows_to_batch(rows.clone()));
+            store
+                .append_with_dict(table, rows_to_batch(rows.clone()))
+                .expect("per-table engine uses a memory-only ColumnarStore");
         }
         if let Some(wal) = &self.wal {
             wal.log_insert_rows(table, &rows)
@@ -1203,7 +1210,9 @@ impl StorageEngine for ColumnarStorageEngine {
             let kept = new_rows.len();
             store.clear(table);
             if !new_rows.is_empty() {
-                store.append(table, rows_to_batch(new_rows));
+                store
+                    .append(table, rows_to_batch(new_rows))
+                    .expect("per-table engine uses a memory-only ColumnarStore");
             }
             total - kept
         };
@@ -1248,7 +1257,9 @@ impl StorageEngine for ColumnarStorageEngine {
                 .collect();
             store.clear(table);
             if !new_rows.is_empty() {
-                store.append(table, rows_to_batch(new_rows));
+                store
+                    .append(table, rows_to_batch(new_rows))
+                    .expect("per-table engine uses a memory-only ColumnarStore");
             }
             changed
         };

@@ -859,7 +859,7 @@ Memory-only stores have no WAL; `synchronous_commit=off` skips this barrier,
 so neither configuration promises fsync before acknowledgement. **[code]**
 
 Append errors are a separate limitation: `ColumnarStore::append` and
-`append_with_dict_tagged` log failed WAL appends and still mutate memory.
+`append_with_dict_tagged` return failed WAL appends before inserting rows or changing dictionary state. `COLUMNAR_INSERT` propagates that error and releases its reserved memory.
 The later sync cannot recover a record that was never appended. Exotic-type
 encoding also uses a Text fallback (`src/storage/columnar_wal.rs`), so
 JSON/UUID/Array/Vector values can lose their type across replay.

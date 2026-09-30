@@ -4501,7 +4501,12 @@ impl Executor {
                 {
                     let mut store = self.columnar_store.write();
                     let xact = self.cross_model_before_columnar(&store);
-                    store.append_with_dict_in_xact(&table, batch, xact);
+                    if let Err(error) = store.append_with_dict_in_xact(&table, batch, xact) {
+                        self.memory_allocator.lock().release("columnar", estimated);
+                        return Err(ExecError::Storage(crate::storage::StorageError::Io(
+                            error.to_string(),
+                        )));
+                    }
                 }
                 Ok(Value::Text("OK".into()))
             }
