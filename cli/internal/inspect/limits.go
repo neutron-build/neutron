@@ -166,7 +166,7 @@ type MeasuredBuild struct {
 // A version match over pgwire cannot prove a source tree match.
 var Measured = MeasuredBuild{
 	Report:         SrcCapabilityReport,
-	NucleusVersion: "1.2.0",
+	NucleusVersion: "1.0.2",
 	NucleusTree:    "133683ef5a14e645cad18e238db5d28d5aaf7eff",
 	Recorded:       "2026-09-30",
 }
