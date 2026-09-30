@@ -126,7 +126,7 @@ fn add_signed_decimal(left: &str, right: &str) -> String {
     };
     digits.reverse();
     let mut result = String::with_capacity(digits.len() + 1);
-    if negative && digits != [b'0'] {
+    if negative && digits != *b"0" {
         result.push('-');
     }
     // Every byte above is an ASCII digit.

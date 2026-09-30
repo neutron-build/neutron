@@ -687,12 +687,12 @@ async fn the_disk_engine_refuses_unverified_isolation_levels() {
 async fn contended_wait(ex: &Arc<Executor>, waiter: u64, table: &str) -> Option<ExecError> {
     exec(ex, &format!("CREATE TABLE {table} (id INT, v INT)")).await;
     exec(ex, &format!("INSERT INTO {table} VALUES (1, 1)")).await;
-    begin_2pl(&ex, waiter).await.unwrap();
+    begin_2pl(ex, waiter).await.unwrap();
     ex.execute_with_session(waiter, "SELECT * FROM accounts")
         .await
         .unwrap();
     let holder = ex.create_session();
-    begin_2pl(&ex, holder).await.unwrap();
+    begin_2pl(ex, holder).await.unwrap();
     ex.execute_with_session(holder, &format!("UPDATE {table} SET v = 2 WHERE id = 1"))
         .await
         .unwrap();
