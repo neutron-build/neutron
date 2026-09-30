@@ -345,14 +345,14 @@ operations, COPY, caches, and all five storage engines. See `RLS_SECURITY.md`.
 **[verified]** a policy-restricted principal saw 1 of 2 rows, including through
 an `ORDER BY VECTOR_DISTANCE(...)` KNN query.
 
-**Consistency caveats.** Query and result caches, GIN, and position-addressed
-derived indexes (vector, encrypted) are shared across sessions. DML inside a
-transaction deliberately leaves GIN on the committed image and rebuilds after
-COMMIT (`src/executor/txn.rs:175-178`); vector/encrypted indexes are marked
-dirty and repaired after COMMIT *or* ROLLBACK (`:179-181`, `:258-260`). Between
-the DML and that rebuild, other sessions query an index reflecting
-transaction-local, possibly-to-be-aborted state — a documented dirty-read window
-on the *index*, not on the rows (`src/executor/session.rs:188-191`).
+**Consistency boundaries (2026-09-30).** Derived specialty publication is
+protected by writer generations. Readers decline stale or in-flight candidate
+images, and explicit transaction snapshots decline shared FTS/vector/zone-map
+optimizations in favor of authoritative scans. These conservative paths protect
+visibility at the cost of optimization. The detached FTS insertion regression
+reproduces and fixes a missing committed row; zone-map, open-transaction and
+pinned repeatable-read tests are additional invariants. Legacy encrypted-index
+modes are retired, rather than advertised as coherent encrypted storage.
 
 ---
 
@@ -901,13 +901,14 @@ File: `<data_dir>/columnar_engines/<table>_<crc32c>/columnar.wal`
 3. **Real rollback** — as a `StorageEngine` it participates in the normal
    transaction path.
 
-Engine-specific weaknesses **[code]**: `UPDATE` and `DELETE` are O(entire table)
-— read all rows, clear, re-append, then rewrite the whole WAL as a fresh snapshot
-(`:929-938`, `:973-982`). And if the WAL fails to open,
-`src/executor/ddl.rs:167-174` falls back to `ColumnarStorageEngine::new()`, which
-has `wal: None`; `durability_pending()` then returns false, `force_wal_durability`
-skips it silently, and **the table accepts acknowledged writes that will never
-survive a restart**, behind a single `tracing::warn!`.
+**Engine boundaries (2026-09-30).** UPDATE and DELETE rebuild table batches
+and rewrite the WAL snapshot. Every table's acknowledged insert buffer is
+included before that replacement, verified by UPDATE/DELETE reopen regressions.
+Declared durable engines now refuse open failures at CREATE/startup rather than
+silently falling back to memory. Failures before WAL publication preserve live
+state; failures after bytes may have been written fence reads, writes and
+durability acknowledgements until reopen because the operation's outcome can be
+uncertain. These checks do not establish power-loss namespace durability.
 
 ---
 
