@@ -1397,18 +1397,14 @@ impl Executor {
             // FTS index: WAL-backed crash-recovery (open replays all logged operations)
             let fts_dir = dir.join("fts");
             std::fs::create_dir_all(&fts_dir).ok();
-            if let Some((idx, tail)) = Self::open_durable(
-                "FTS",
-                &fts_dir,
-                fts::InvertedIndex::open_with_tail(&fts_dir),
-            ) {
-                *exec.fts_index.write() = idx;
-                // Kept so `load_fts_index` can apply it on top of the
-                // `fts_index.json` checkpoint (NU-014). Without it the
-                // checkpoint would silently discard everything written since
-                // the last one.
-                exec.fts_wal_tail = Some(tail);
-            }
+            let (index, tail) = fts::InvertedIndex::open_with_tail(&fts_dir).map_err(|error| {
+                ExecError::Storage(StorageError::Io(format!(
+                    "FTS WAL at {} could not open: {error}; recovery refused because its tail is required for complete durable state",
+                    fts_dir.display()
+                )))
+            })?;
+            *exec.fts_index.write() = index;
+            exec.fts_wal_tail = Some(tail);
 
             // Vector indexes: WAL + snapshot recovery
             let vec_dir = dir.join("vector");

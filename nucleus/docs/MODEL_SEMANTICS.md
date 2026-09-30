@@ -621,7 +621,9 @@ power-cut verification claim. A truncation failure retains the tail and logs
 a warning. The historical detached-WAL/frozen-second-boot behavior is repaired.
 
 An existing unreadable or malformed checkpoint now refuses recovery: the
-WAL tail may omit documents already folded into that checkpoint. Missing
+WAL tail may omit documents already folded into that checkpoint. Failure to
+open the configured FTS WAL also refuses recovery instead of substituting a
+volatile or checkpoint-only index. Missing
 checkpoint files remain valid for a fresh/WAL-only instance. Preserve damaged
 checkpoint bytes and restore a verified backup; deleting the base is not a
 repair. The server and maintenance opener propagate the fallible constructor
