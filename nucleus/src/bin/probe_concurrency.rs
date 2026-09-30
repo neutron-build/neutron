@@ -379,7 +379,7 @@ fn check_rollback_discards(ctx: &Ctx, tbl: &str, key: i64, val: i64, v: &mut Vio
 /// same count as its first read (snapshot isolation, not read-committed).
 fn check_repeatable_read(ctx: &Ctx, tbl: &str, key: i64, val: i64, v: &mut Violations) {
     // B opens its snapshot first.
-    if ctx.b("BEGIN").is_err() {
+    if ctx.b("BEGIN ISOLATION LEVEL REPEATABLE READ").is_err() {
         return;
     }
     let count_before = match ctx.b_count(tbl) {
@@ -485,9 +485,9 @@ fn check_rollback_count(ctx: &Ctx, tbl: &str, rng: &mut Rng, v: &mut Violations)
 /// Whether the engine gives a transaction a stable snapshot for its lifetime.
 ///
 /// This is not cosmetic bookkeeping — invariant 5 is only meaningful where it
-/// holds. The MVCC family defaults to `IsolationLevel::Snapshot`
-/// (`src/storage/mvcc.rs:824`), but the paged engines behave as **read
-/// committed**, which `docs/MODEL_SEMANTICS.md:263-271` records as verified:
+/// holds. The MVCC family supports explicit REPEATABLE READ; the prober
+/// requests that mode for invariant 5. Plain SQL BEGIN uses READ COMMITTED.
+/// The paged engines currently support only READ COMMITTED:
 /// an open transaction there legitimately sees rows another session committed
 /// after its `BEGIN`. Asserting stable re-reads against a read-committed engine
 /// reports the documented contract as a violation, so invariant 5 is skipped
