@@ -41,6 +41,7 @@ class FakeRedisClient implements RedisLikeClient {
     }
     control.generation = args[1];
     if (script.includes("SMEMBERS")) {
+      if (!this.sets.has(keys[1])) control.epoch = args[1];
       for (const key of this.sets.get(keys[1]) ?? []) { this.kv.delete(key); this.expiresAt.delete(key); }
       this.sets.delete(keys[1]); this.expiresAt.delete(keys[1]);
     } else control.epoch = args[1];

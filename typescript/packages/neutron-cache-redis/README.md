@@ -28,7 +28,11 @@ atomically; invalidation and index expiry updates also execute atomically.
 become misses and older in-flight fills are refused. Old payloads and pathname
 indexes remain physically present until their TTLs expire; clear does not scan
 and delete keys belonging to newly admitted fills. App and loader epochs are
-independent. Path invalidation removes exactly that path's indexed variants.
+independent. Path invalidation removes that path's indexed variants. If its
+index is missing (including independent Redis eviction), invalidation switches
+the entire store to a fresh epoch: other paths become cold misses too. This
+conservative fallback prevents an orphaned old payload from surviving a missing
+index.
 
 Clients passed to `createRedisNeutronCacheStoresFromClient` must support `EVAL`;
 clients without it are refused. Unversioned entries from earlier adapter releases

@@ -47,6 +47,18 @@ test("real Redis atomic publication, invalidation, epochs and concurrent fills",
     assert.notEqual(await stores.app.getGeneration!(),old);
     assert.equal(await stores.app.get(appKey),null);
     assert.equal(await stores.app.setIfGeneration!(appKey,entry,old),false);
+    // Redis may evict an index independently from its payloads. Invalidation
+    // must fail closed, rather than leaving an unreachable old value live.
+    for (const [store, key, payload, kind] of [
+      [stores.app, appKey, entry, "app"],
+      [stores.loader, "/race::route", {data:1,expiresAt:Date.now()+60000}, "ldr"],
+    ] as const) {
+      await store.set(key,payload as never);
+      assert.ok(await store.get(key));
+      await peer.del(`${prefix}idx:${kind}:/race`);
+      await store.deleteByPath("/race");
+      assert.equal(await store.get(key),null);
+    }
     // Lua atomically extends rather than shortens the path index's expiry.
     await stores.app.set(appKey,{...entry,expiresAt:Date.now()+600000});
     await other.app.set("html\nhttps://a.example\n/race\n?short\nen",{...entry,expiresAt:Date.now()+10000});

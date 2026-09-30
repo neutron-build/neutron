@@ -118,6 +118,11 @@ return 1
 `;
 const INVALIDATE = INITIALIZE + `
 redis.call('HSET', KEYS[1], 'generation', ARGV[2])
+-- An independently evicted index cannot prove which entries to delete.
+-- Refuse all older entries in this store rather than serving an orphan.
+if redis.call('EXISTS', KEYS[2]) == 0 then
+  redis.call('HSET', KEYS[1], 'epoch', ARGV[2])
+end
 for _, key in ipairs(redis.call('SMEMBERS', KEYS[2])) do redis.call('DEL', key) end
 redis.call('DEL', KEYS[2])
 return 1
