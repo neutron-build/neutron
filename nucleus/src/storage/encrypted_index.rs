@@ -475,3 +475,25 @@ mod tests {
         assert_ne!(ca, cb, "different keys must produce different ciphertext");
     }
 }
+
+#[cfg(test)]
+mod security_admission_regression {
+    use super::*;
+
+    #[test]
+    fn encrypted_ope_cannot_disclose_secret_from_chosen_zeroes() {
+        let index = EncryptedIndex::new([0x42; 32], EncryptionMode::OrderPreserving);
+        let secret = b"private-account";
+        let known = index.encrypt_value(&vec![0; secret.len()]);
+        let observed = index.encrypt_value(secret);
+        let recovered: Vec<_> = observed[8..]
+            .iter()
+            .zip(&known[8..])
+            .map(|(cipher, zero)| cipher ^ zero)
+            .collect();
+        assert_ne!(
+            recovered, secret,
+            "chosen zeroes revealed the complete supposedly encrypted plaintext without its key"
+        );
+    }
+}
