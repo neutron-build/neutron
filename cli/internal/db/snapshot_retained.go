@@ -16,7 +16,10 @@ package db
 // the managed scope, exactly as for the planner; objects of other schemas
 // are out of scope and not recorded. Constraints are not carried: the
 // planner reconciles them in every mode, so a base constraint the desired
-// document omits is always dropped.
+// document omits is always dropped. For managed: false objects, known base
+// metadata is retained with the ownership marker, because their constraints
+// and dependencies still exist even when the declaration omits them. They
+// are carried forward without being reported as left in place.
 //
 // It runs on the plan the planner just produced, when the snapshot is
 // written. The chain is always read as recorded: snapshots written before
@@ -98,13 +101,24 @@ func SnapshotTarget(base, desired *V2Document, up []string) (*V2Document, []Reta
 	renames := plannedRenames(up)
 	declared := func(t *V2Table) bool { return t != nil && t.Managed }
 
-	var retained []RetainedObject
+	var retained, carried []RetainedObject
 	for _, bt := range bm.Tables {
 		id := bt.Identity
 		if !scope[id.Schema] || isProtectedTableName(id.Name) {
 			continue
 		}
 		dt := dm.Table(id)
+		if dt != nil && !dt.Managed {
+			carried = append(carried, RetainedObject{Kind: "table", Identity: id})
+			continue
+		}
+		if dt == nil && !bt.Managed {
+			// The chain records it managed: false and the document omits it:
+			// still not neutron's, so it stays and is carried without being
+			// reported as left in place.
+			carried = append(carried, RetainedObject{Kind: "table", Identity: id})
+			continue
+		}
 		if !declared(dt) {
 			if !dropped("drop table if exists %s", qualifiedNameSQL(id)) {
 				retained = append(retained, RetainedObject{Kind: "table", Identity: id})
@@ -132,7 +146,14 @@ func SnapshotTarget(base, desired *V2Document, up []string) (*V2Document, []Reta
 		if !scope[bv.Identity.Schema] {
 			continue
 		}
-		if dv := dm.View(bv.Identity); dv != nil && dv.Managed {
+		if dv := dm.View(bv.Identity); dv != nil {
+			if !dv.Managed {
+				carried = append(carried, RetainedObject{Kind: "view", Identity: bv.Identity})
+			}
+			continue
+		}
+		if !bv.Managed {
+			carried = append(carried, RetainedObject{Kind: "view", Identity: bv.Identity})
 			continue
 		}
 		if !dropped("drop view if exists %s", qualifiedNameSQL(bv.Identity)) {
@@ -143,18 +164,25 @@ func SnapshotTarget(base, desired *V2Document, up []string) (*V2Document, []Reta
 		if !scope[be.Identity.Schema] {
 			continue
 		}
-		if de := dm.Enum(be.Identity); de != nil && de.Managed {
+		if de := dm.Enum(be.Identity); de != nil {
+			if !de.Managed {
+				carried = append(carried, RetainedObject{Kind: "enum", Identity: be.Identity})
+			}
+			continue
+		}
+		if !be.Managed {
+			carried = append(carried, RetainedObject{Kind: "enum", Identity: be.Identity})
 			continue
 		}
 		if !dropped("drop type if exists %s", qualifiedNameSQL(be.Identity)) {
 			retained = append(retained, RetainedObject{Kind: "enum", Identity: be.Identity})
 		}
 	}
-	if len(retained) == 0 {
+	if len(retained) == 0 && len(carried) == 0 {
 		return desired, nil, nil
 	}
 
-	target, err := carryRetained(base, desired, bm, retained, renames)
+	target, err := carryRetained(base, desired, bm, append(append([]RetainedObject(nil), retained...), carried...), renames)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -183,14 +211,16 @@ func carryRetained(base, desired *V2Document, bm V2DocumentModel, retained []Ret
 		}
 		return nil
 	}
-	// place replaces an unmanaged desired entry of the same identity (the
-	// planner treats it as undeclared) or appends.
+	// place replaces a desired entry of the same identity or appends.
 	place := func(key string, entry map[string]any) {
 		id := entryIdentity(entry)
 		list := asList(root[key])
 		out := make([]any, 0, len(list)+1)
 		for _, e := range list {
 			if m, ok := e.(map[string]any); ok && entryIdentity(m) == id {
+				if managed, ok := m["managed"].(bool); ok && !managed {
+					entry["managed"] = false
+				}
 				continue
 			}
 			out = append(out, e)

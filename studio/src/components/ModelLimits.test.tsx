@@ -41,7 +41,7 @@ describe('ModelLimits (X06)', () => {
     render(<ModelLimits model="sql" />)
     expect(screen.getByText('transactions: partial')).toBeTruthy()
     expect(screen.getByText(/DDL runs outside the transaction/)).toBeTruthy()
-    expect(screen.getByText(/Nucleus 1\.0\.2/)).toBeTruthy()
+    expect(screen.getByText(`SQL on Nucleus ${nucleus.engine.version}`)).toBeTruthy()
   })
 
   it('names PostgreSQL SQL atomic and shows the live durability settings', () => {

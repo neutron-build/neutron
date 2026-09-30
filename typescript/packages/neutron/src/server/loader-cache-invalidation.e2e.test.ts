@@ -35,7 +35,7 @@ async function getFreePort(): Promise<number> {
 const PARAM_ROUTE = `
 import { h } from "preact";
 let loadCount = 0;
-export const config = { mode: "app", cache: { loaderMaxAge: 120 } };
+export const config = { mode: "app", cache: { loaderMaxAge: 120, maxAge: 120 } };
 export async function loader() {
   loadCount += 1;
   return { loadCount };
@@ -55,6 +55,17 @@ async function writeFixtureApp(rootDir: string): Promise<void> {
   const body = PARAM_ROUTE;
   await fs.writeFile(path.join(rootDir, "src", "routes", "docs", "[slug].ts"), body, "utf-8");
   await fs.writeFile(path.join(rootDir, "src", "routes", "notes", "index.ts"), body, "utf-8");
+  await fs.writeFile(path.join(rootDir, 'src/routes/invalidate.ts'), `
+    export const config = { mode: 'app' };
+    export async function action({ request }) {
+      const target = new URL(request.url).searchParams.get('target');
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { 'Content-Type': 'application/json', 'x-neutron-invalidate': target }
+      });
+    }
+    export default function Page() { return null; }
+  `);
+
 }
 
 async function getLoadCount(url: string): Promise<number> {
@@ -130,3 +141,31 @@ describe("loader-cache invalidation matches how keys are written", () => {
     expect(await getLoadCount(`${baseUrl}/notes/`)).toBe(3);
   });
 });
+
+
+describe('mutation invalidation preserves already-decoded path characters', () => {
+  it.each(['a%2520b', 'a%25b', 'a%3Fb', 'a%23b'])(
+    'evicts loader data for /docs/%s', { timeout: 30_000 }, async (slug) => {
+      const url = `${baseUrl}/docs/${slug}`;
+      const before = await getLoadCount(url);
+      expect(await getLoadCount(url)).toBe(before);
+      const mutation = await fetch(url, { method: 'POST', headers: { Accept: 'application/json' } });
+      expect(mutation.status).toBe(200);
+      expect(await getLoadCount(url)).toBe(before + 2);
+    }
+  );
+});
+
+
+it.each(['a%2520b', 'a%25b', 'a%3Fb', 'a%23b'])(
+  'explicit invalidation preserves path characters for /docs/header-%s', { timeout: 30_000 }, async (slug) => {
+    const target = `/docs/header-${slug}`;
+    const before = await getLoadCount(`${baseUrl}${target}`);
+    expect(await getLoadCount(`${baseUrl}${target}`)).toBe(before);
+    const mutation = await fetch(`${baseUrl}/invalidate?target=${encodeURIComponent(target)}`, {
+      method: 'POST', headers: { Accept: 'application/json' },
+    });
+    expect(mutation.status).toBe(200);
+    expect(await getLoadCount(`${baseUrl}${target}`)).toBe(before + 1);
+  }
+);

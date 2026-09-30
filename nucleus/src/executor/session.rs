@@ -246,6 +246,9 @@ pub(super) struct TxnState {
     /// COMMIT or ROLLBACK.  Vector/encrypted indexes are shared across sessions,
     /// so an aborted transaction must repair them from committed base rows too.
     pub derived_dirty_tables: HashSet<String>,
+    /// Structural DDL removed or reshaped engine-local index structures.
+    /// Ordinary DML maintains those postings inside the storage engine.
+    pub storage_index_dirty_tables: HashSet<String>,
     /// PostgreSQL transaction-error state: once a statement errors inside an
     /// explicit transaction, the whole transaction is aborted — every later
     /// statement is rejected until ROLLBACK (or COMMIT, which becomes a
@@ -267,6 +270,7 @@ impl TxnState {
             policy_dirty: false,
             gin_dirty: false,
             derived_dirty_tables: HashSet::new(),
+            storage_index_dirty_tables: HashSet::new(),
             aborted: false,
         }
     }
@@ -295,6 +299,20 @@ pub struct Session {
     /// section; `txn_active_mirrors_state` asserts they agree across BEGIN,
     /// COMMIT, ROLLBACK and reset.
     pub(super) txn_active: std::sync::atomic::AtomicBool,
+    /// The open transaction is the implicit one of a multi-statement simple
+    /// query (`ImplicitTxnBlock`), not a client BEGIN. An explicit BEGIN in
+    /// the message converts it (clears the flag); COMMIT, ROLLBACK and the
+    /// end of the message close it. Only ever true while `txn_active` is.
+    pub(super) implicit_txn: std::sync::atomic::AtomicBool,
+    /// Access mode and isolation level of the open transaction, as
+    /// PostgreSQL reports them (`transaction_read_only`,
+    /// `transaction_isolation`). Meaningful only while `txn_active` is; set at
+    /// BEGIN, from the statement's modes or the session defaults.
+    pub(super) txn_read_only: std::sync::atomic::AtomicBool,
+    pub(super) txn_isolation: parking_lot::Mutex<&'static str>,
+    /// Statements the open transaction has run since BEGIN, so `SET
+    /// TRANSACTION` can tell whether it still comes "before any query".
+    pub(super) txn_stmts: std::sync::atomic::AtomicU64,
     /// Per-session cross-model write-set for the open transaction (`None`
     /// outside a transaction). Deliberately a `parking_lot` mutex, not part of
     /// the async `txn_state`: every specialty mutation site is synchronous, and
@@ -354,6 +372,11 @@ pub struct Session {
     /// back"; `None` was indeed safe, a stale `Some` from another session was
     /// not.
     pub(super) plan_cache_key_hint: parking_lot::Mutex<Option<String>>,
+    /// Deferred foreign-key state of the open transaction (see
+    /// `executor::deferred_fk`).
+    pub(super) deferred_fks: parking_lot::Mutex<super::deferred_fk::DeferredFks>,
+    pub(super) deferred_fk_savepoints:
+        parking_lot::Mutex<Vec<(String, super::deferred_fk::DeferredFks)>>,
 }
 
 impl Default for Session {
@@ -378,6 +401,10 @@ impl Session {
         Self {
             txn_state: RwLock::new(TxnState::new()),
             txn_active: std::sync::atomic::AtomicBool::new(false),
+            implicit_txn: std::sync::atomic::AtomicBool::new(false),
+            txn_read_only: std::sync::atomic::AtomicBool::new(false),
+            txn_isolation: parking_lot::Mutex::new("read committed"),
+            txn_stmts: std::sync::atomic::AtomicU64::new(0),
             cross_model: parking_lot::Mutex::new(None),
             prepared_stmts: RwLock::new(HashMap::new()),
             cursors: RwLock::new(HashMap::new()),
@@ -408,6 +435,8 @@ impl Session {
             cancel_requested: AtomicBool::new(false),
             statement_depth: AtomicU64::new(0),
             plan_cache_key_hint: parking_lot::Mutex::new(None),
+            deferred_fks: parking_lot::Mutex::new(Default::default()),
+            deferred_fk_savepoints: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -449,6 +478,7 @@ impl Session {
     /// Open the implicit transaction block PostgreSQL gives a multi-statement
     /// simple query. Returns whether this call opened it (false when a block
     /// is already open).
+    #[cfg(not(feature = "server"))]
     pub(super) fn guc_begin_implicit(&self) -> bool {
         if self.guc_txn.lock().is_some() {
             return false;
@@ -610,10 +640,13 @@ impl Session {
             txn.active = false;
             self.txn_active
                 .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.implicit_txn
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             txn.snapshot = None;
             txn.savepoints.clear();
             txn.gin_dirty = false;
             txn.derived_dirty_tables.clear();
+            txn.storage_index_dirty_tables.clear();
         }
         *self.cross_model.lock() = None;
         *self.guc_txn.lock() = None;

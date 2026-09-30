@@ -199,6 +199,8 @@ impl DatabaseBuilder {
                     default_expr: None,
                     id: 0,
                     analyzer: None,
+                    generation: None,
+                    max_len: None,
                 })
                 .collect();
             let epoch = recovered_epochs.get(&name).copied().unwrap_or(0);
@@ -2177,12 +2179,12 @@ mod tests {
                 "value".to_string(),
                 ColumnData::Float64(vec![Some(42.0)]),
             )]);
-            c.append("metrics", batch);
+            c.append("metrics", batch).unwrap();
             let batch2 = ColumnBatch::new(vec![(
                 "value".to_string(),
                 ColumnData::Float64(vec![Some(58.0)]),
             )]);
-            c.append("metrics", batch2);
+            c.append("metrics", batch2).unwrap();
         }
         {
             let c = col.read();

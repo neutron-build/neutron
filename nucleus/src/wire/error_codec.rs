@@ -52,6 +52,10 @@ pub enum ErrorCode {
     DivisionByZero,
     /// Numeric value out of range
     NumericValueOutOfRange,
+    /// Value too long for a `varchar(n)` / `char(n)` column (22001)
+    StringDataRightTruncation,
+    /// Explicit value for a generated column or GENERATED ALWAYS identity (428C9)
+    GeneratedAlways,
     /// Other data exception
     DataException,
     /// Internal server error
@@ -68,6 +72,14 @@ pub enum ErrorCode {
     DiskFull,
     /// A write was attempted while the server is in read-only mode
     ReadOnlySqlTransaction,
+    /// The wait-for graph closed a cycle: PostgreSQL `deadlock_detected` (40P01)
+    DeadlockDetected,
+    /// A statement that must not run (or a mode that can no longer change)
+    /// inside an open transaction: PostgreSQL `active_sql_transaction` (25001)
+    ActiveSqlTransaction,
+    /// The session's backend was terminated by an administrator
+    /// (`pg_terminate_backend`): PostgreSQL `admin_shutdown` (57P01)
+    AdminShutdown,
 }
 
 /// Protocol-independent error details.
@@ -189,6 +201,8 @@ impl ErrorCodec for PgWireErrorCodec {
                     // classified XX000, which tells a driver nothing. 25P02 is
                     // what PostgreSQL sends and what clients act on.
                     ErrorCode::InFailedSqlTransaction
+                } else if msg.contains("deadlock_detected") {
+                    ErrorCode::DeadlockDetected
                 } else if msg.contains("too_many_row_locks") {
                     // Per-session lock-table exhaustion: 53200
                     // (out_of_memory), the class PostgreSQL uses when
@@ -211,12 +225,26 @@ impl ErrorCodec for PgWireErrorCodec {
             ExecError::Runtime(msg) => {
                 let code = if msg.contains("division by zero") {
                     ErrorCode::DivisionByZero
+                } else if msg.contains("value too long for type") {
+                    ErrorCode::StringDataRightTruncation
+                } else if msg.contains("non-DEFAULT value into column")
+                    || msg.contains("can only be updated to DEFAULT")
+                {
+                    ErrorCode::GeneratedAlways
                 } else if msg.contains("out of range") {
                     ErrorCode::NumericValueOutOfRange
                 } else if msg.contains("current transaction is aborted") {
                     ErrorCode::InFailedSqlTransaction
                 } else if msg.contains("canceling statement") {
                     ErrorCode::QueryCanceled
+                } else if msg.contains("deadlock detected") {
+                    ErrorCode::DeadlockDetected
+                } else if msg.contains("must be set before any query")
+                    || msg.contains("cannot run inside a transaction block")
+                {
+                    ErrorCode::ActiveSqlTransaction
+                } else if msg.contains("terminating connection due to administrator command") {
+                    ErrorCode::AdminShutdown
                 } else {
                     ErrorCode::DataException
                 };
@@ -254,12 +282,17 @@ impl ErrorCodec for PgWireErrorCodec {
             ErrorCode::StorageError => "XX000".to_string(),
             ErrorCode::DivisionByZero => "22012".to_string(),
             ErrorCode::NumericValueOutOfRange => "22003".to_string(),
+            ErrorCode::StringDataRightTruncation => "22001".to_string(),
+            ErrorCode::GeneratedAlways => "428C9".to_string(),
             ErrorCode::DataException => "22000".to_string(),
             ErrorCode::InternalError => "XX000".to_string(),
             ErrorCode::RuntimeError => "22000".to_string(),
             ErrorCode::InsufficientResources => "53200".to_string(),
             ErrorCode::DiskFull => "53100".to_string(),
             ErrorCode::ReadOnlySqlTransaction => "25006".to_string(),
+            ErrorCode::DeadlockDetected => "40P01".to_string(),
+            ErrorCode::ActiveSqlTransaction => "25001".to_string(),
+            ErrorCode::AdminShutdown => "57P01".to_string(),
             ErrorCode::ProgramLimitExceeded => "54000".to_string(),
         }
     }
@@ -357,6 +390,8 @@ impl ErrorCodec for BinaryErrorCodec {
                     // classified XX000, which tells a driver nothing. 25P02 is
                     // what PostgreSQL sends and what clients act on.
                     ErrorCode::InFailedSqlTransaction
+                } else if msg.contains("deadlock_detected") {
+                    ErrorCode::DeadlockDetected
                 } else if msg.contains("too_many_row_locks") {
                     // Per-session lock-table exhaustion: 53200
                     // (out_of_memory), the class PostgreSQL uses when
@@ -379,6 +414,12 @@ impl ErrorCodec for BinaryErrorCodec {
             ExecError::Runtime(msg) => {
                 let code = if msg.contains("division by zero") {
                     ErrorCode::DivisionByZero
+                } else if msg.contains("value too long for type") {
+                    ErrorCode::StringDataRightTruncation
+                } else if msg.contains("non-DEFAULT value into column")
+                    || msg.contains("can only be updated to DEFAULT")
+                {
+                    ErrorCode::GeneratedAlways
                 } else if msg.contains("out of range") {
                     ErrorCode::NumericValueOutOfRange
                 } else {
@@ -420,12 +461,17 @@ impl ErrorCodec for BinaryErrorCodec {
             ErrorCode::StorageError => "5001".to_string(),
             ErrorCode::DivisionByZero => "4001".to_string(),
             ErrorCode::NumericValueOutOfRange => "4002".to_string(),
+            ErrorCode::StringDataRightTruncation => "4003".to_string(),
+            ErrorCode::GeneratedAlways => "1009".to_string(),
             ErrorCode::DataException => "4000".to_string(),
             ErrorCode::InternalError => "5000".to_string(),
             ErrorCode::RuntimeError => "4999".to_string(),
             ErrorCode::InsufficientResources => "5002".to_string(),
             ErrorCode::DiskFull => "5003".to_string(),
             ErrorCode::ReadOnlySqlTransaction => "5004".to_string(),
+            ErrorCode::DeadlockDetected => "3005".to_string(),
+            ErrorCode::ActiveSqlTransaction => "3006".to_string(),
+            ErrorCode::AdminShutdown => "3007".to_string(),
             ErrorCode::ProgramLimitExceeded => "5005".to_string(),
         }
     }

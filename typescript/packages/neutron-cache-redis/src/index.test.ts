@@ -17,6 +17,37 @@ class FakeRedisClient implements RedisLikeClient {
   private readonly sets = new Map<string, Set<string>>();
   private readonly expiresAt = new Map<string, number>();
 
+  private readonly controls = new Map<string, { generation: string; epoch: string }>();
+  // Model outcomes only; a separate real-server suite verifies the Lua scripts.
+  async eval(script: string, count: number, ...values: Array<string | number>): Promise<unknown> {
+    this.pruneExpired();
+    const keys = values.slice(0, count).map(String), args = values.slice(count).map(String);
+    let control = this.controls.get(keys[0]);
+    if (!control) { control = { generation: args[0], epoch: args[0] }; this.controls.set(keys[0], control); }
+    if (script.endsWith("return generation")) return control.generation;
+    if (script.includes("entry.payload")) {
+      const raw = this.kv.get(keys[1]); if (!raw) return null;
+      const entry = JSON.parse(raw);
+      return entry.neutronCacheV === 1 && entry.epoch === control.epoch ? entry.payload : null;
+    }
+    if (script.includes("local ttl =")) {
+      if ((args[1] && args[1] !== control.generation) || Number(args[3]) <= 0) return 0;
+      this.kv.set(keys[1], JSON.stringify({ neutronCacheV: 1, epoch: control.epoch, payload: args[2] }));
+      this.expiresAt.set(keys[1], Date.now() + Number(args[3]) * 1000);
+      const members = this.sets.get(keys[2]) ?? new Set<string>();
+      members.add(keys[1]); this.sets.set(keys[2], members);
+      this.expiresAt.set(keys[2], Math.max(this.expiresAt.get(keys[2]) ?? 0, Date.now() + Math.max(Number(args[3]),60)*1000));
+      return 1;
+    }
+    control.generation = args[1];
+    if (script.includes("SMEMBERS")) {
+      if (!this.sets.has(keys[1])) control.epoch = args[1];
+      for (const key of this.sets.get(keys[1]) ?? []) { this.kv.delete(key); this.expiresAt.delete(key); }
+      this.sets.delete(keys[1]); this.expiresAt.delete(keys[1]);
+    } else control.epoch = args[1];
+    return 1;
+  }
+
   constructor(enableScan: boolean) {
     if (enableScan) {
       this.scan = async (
@@ -172,277 +203,67 @@ class FakeRedisClient implements RedisLikeClient {
   }
 }
 
-test("app.clear uses SCAN when client supports it", async () => {
-  const client = new FakeRedisClient(true);
-  const stores = createRedisNeutronCacheStoresFromClient(client, {
-    keyPrefix: "test:",
-  });
-
-  await stores.app.set("html:/home", {
-    status: 200,
-    statusText: "OK",
-    headers: [],
-    body: new TextEncoder().encode("<h1>Home</h1>"),
-    expiresAt: Date.now() + 60_000,
-  });
-  await stores.loader.set("/home::route::{}", {
-    data: { ok: true },
-    expiresAt: Date.now() + 60_000,
-  });
-
-  await stores.app.clear();
-
-  assert.equal(client.scanCallCount > 0, true);
-  assert.equal(client.keysCallCount, 0);
-  assert.equal(client.hasKey("test:app:html:/home"), false);
-  assert.equal(client.hasKey("test:idx:app:/home"), false);
-  assert.equal(client.hasKey("test:ldr:/home::route::{}"), true);
-});
-
-test("app.clear falls back to KEYS when scan is unavailable", async () => {
-  const client = new FakeRedisClient(false);
-  const stores = createRedisNeutronCacheStoresFromClient(client, {
-    keyPrefix: "test:",
-  });
-
-  await stores.app.set("html:/about", {
-    status: 200,
-    statusText: "OK",
-    headers: [],
-    body: new TextEncoder().encode("<h1>About</h1>"),
-    expiresAt: Date.now() + 60_000,
-  });
-
-  await stores.app.clear();
-
-  assert.equal(client.keysCallCount > 0, true);
-  assert.equal(client.hasKey("test:app:html:/about"), false);
-  assert.equal(client.hasKey("test:idx:app:/about"), false);
-});
-
-test("app.deleteByPath removes indexed entries for the selected pathname only", async () => {
-  const client = new FakeRedisClient(true);
-  const stores = createRedisNeutronCacheStoresFromClient(client, {
-    keyPrefix: "test:",
-  });
-
-  await stores.app.set("html:/home?view=1", {
-    status: 200,
-    statusText: "OK",
-    headers: [],
-    body: new TextEncoder().encode("<h1>Home A</h1>"),
-    expiresAt: Date.now() + 60_000,
-  });
-  await stores.app.set("html:/home?view=2", {
-    status: 200,
-    statusText: "OK",
-    headers: [],
-    body: new TextEncoder().encode("<h1>Home B</h1>"),
-    expiresAt: Date.now() + 60_000,
-  });
-  await stores.app.set("html:/about", {
-    status: 200,
-    statusText: "OK",
-    headers: [],
-    body: new TextEncoder().encode("<h1>About</h1>"),
-    expiresAt: Date.now() + 60_000,
-  });
-
-  await stores.app.deleteByPath("/home");
-
-  assert.equal(client.hasKey("test:app:html:/home?view=1"), false);
-  assert.equal(client.hasKey("test:app:html:/home?view=2"), false);
-  assert.equal(client.hasKey("test:idx:app:/home"), false);
-  assert.equal(client.hasKey("test:app:html:/about"), true);
-  assert.equal(client.hasKey("test:idx:app:/about"), true);
-});
-
-test("app.clear deletes keys in bounded chunks when many keys match", async () => {
-  const client = new FakeRedisClient(false);
-  const stores = createRedisNeutronCacheStoresFromClient(client, {
-    keyPrefix: "test:",
-  });
-
-  for (let i = 0; i < 1_205; i++) {
-    await client.set(`test:app:key-${i}`, `value-${i}`);
-  }
-
-  await stores.app.clear();
-
-  assert.equal(client.hasKey("test:app:key-0"), false);
-  assert.equal(client.hasKey("test:app:key-1204"), false);
-  assert.equal(client.delBatchSizes.length >= 3, true);
-  assert.equal(client.delBatchSizes.every((size) => size <= 500), true);
-});
-
-// A short-lived variant written after a long-lived one must not shorten the
-// shared pathname index below the long-lived entry's life, or the entry
-// becomes uninvalidatable until its own expiry (audit neutron-14).
-test("app path index ttl is never shortened by a shorter-lived variant", async () => {
-  const client = new FakeRedisClient(true);
-  const stores = createRedisNeutronCacheStoresFromClient(client, {
-    keyPrefix: "test:",
-  });
-
-  const longEntry = {
-    status: 200 as const,
-    statusText: "OK",
-    headers: [] as [],
-    body: new TextEncoder().encode("<h1>long lived</h1>"),
-    expiresAt: Date.now() + 600_000,
-  };
-  await stores.app.set("html:/deep", longEntry);
-  const indexKey = "test:idx:app:/deep";
-  const ttlAfterLong = await client.ttl(indexKey);
-  assert.equal(ttlAfterLong >= 595, true);
-
-  await stores.app.set("html:/deep?view=quick", {
-    ...longEntry,
-    body: new TextEncoder().encode("<h1>short lived</h1>"),
-    expiresAt: Date.now() + 10_000,
-  });
-  const ttlAfterShort = await client.ttl(indexKey);
-  assert.equal(
-    ttlAfterShort >= 595,
-    true,
-    `index ttl dropped to ${ttlAfterShort} after a 10s variant; the 600s entry would lose invalidation`
-  );
-
-  // Invalidation must still reach the long-lived entry.
-  await stores.app.deleteByPath("/deep");
-  assert.equal(client.hasKey("test:app:html:/deep"), false);
-  assert.equal(client.hasKey("test:app:html:/deep?view=quick"), false);
-  assert.equal(client.hasKey(indexKey), false);
-});
-
-// The same guarantee for the loader store.
-test("loader path index ttl is never shortened by a shorter-lived variant", async () => {
-  const client = new FakeRedisClient(true);
-  const stores = createRedisNeutronCacheStoresFromClient(client, {
-    keyPrefix: "test:",
-  });
-
-  await stores.loader.set("/page::route::{}", {
-    data: { ok: true },
-    expiresAt: Date.now() + 600_000,
-  });
-  await stores.loader.set("/page::route::{lang:fr}", {
-    data: { ok: true },
-    expiresAt: Date.now() + 10_000,
-  });
-
-  const ttlAfter = await client.ttl("test:idx:ldr:/page");
-  assert.equal(ttlAfter >= 595, true);
-
-  await stores.loader.deleteByPath("/page");
-  assert.equal(client.hasKey("test:ldr:/page::route::{}"), false);
-});
-
-// A writer that lands between an invalidation's claim and its deletes must
-// stay indexed: the index is claimed atomically via RENAME, so the writer
-// SADDs into a fresh index and a subsequent invalidation can still reach
-// it (audit neutron-15).
-test("concurrent write during invalidation stays invalidatable", async () => {
-  const client = new FakeRedisClient(true);
-  const stores = createRedisNeutronCacheStoresFromClient(client, {
-    keyPrefix: "test:",
-  });
-
-  await stores.app.set("html:/race?v=1", {
-    status: 200,
-    statusText: "OK",
-    headers: [],
-    body: new TextEncoder().encode("variant 1"),
-    expiresAt: Date.now() + 60_000,
-  });
-
-  // Barrier: pause the first invalidation after RENAME, before the member
-  // deletes — the exact window where a writer used to be orphaned.
-  let releaseDeletes: (() => void) | undefined;
-  const deletesGate = new Promise<void>((resolve) => {
-    releaseDeletes = resolve;
-  });
-  const originalDel = client.del.bind(client);
-  let delIntercepted = false;
-  client.del = async (...keys: string[]) => {
-    if (!delIntercepted) {
-      delIntercepted = true;
-      await deletesGate;
-    }
-    return originalDel(...keys);
-  };
-
-  const firstInvalidation = stores.app.deleteByPath("/race");
-  // Wait until the rename has happened: the original index key is gone,
-  // replaced by the claimed one.
-  await new Promise<void>((resolve) => {
-    const poll = () => {
-      if (!client.hasKey("test:idx:app:/race")) {
-        resolve();
-        return;
-      }
-      setTimeout(poll, 1);
-    };
-    poll();
-  });
-
-  // The racing write: SADDs into the fresh index the rename made possible.
-  await stores.app.set("html:/race?v=2", {
-    status: 200,
-    statusText: "OK",
-    headers: [],
-    body: new TextEncoder().encode("variant 2"),
-    expiresAt: Date.now() + 60_000,
-  });
-  assert.equal(client.hasKey("test:idx:app:/race"), true);
-
-  releaseDeletes!();
-  await firstInvalidation;
-
-  // Variant 1 is gone from the first invalidation; variant 2 survived it
-  // (it raced in) but a SECOND complete invalidation must reach it — that
-  // is the defect: the orphaned variant used to be unreachable forever.
-  await stores.app.deleteByPath("/race");
-
-  assert.equal(client.hasKey("test:app:html:/race?v=1"), false);
-  assert.equal(client.hasKey("test:app:html:/race?v=2"), false);
-  assert.equal(client.hasKey("test:idx:app:/race"), false);
-});
-
-// Deleting a path that was never indexed is a no-op, not an error.
-test("deleteByPath on an unknown path is a no-op", async () => {
-  const client = new FakeRedisClient(true);
-  const stores = createRedisNeutronCacheStoresFromClient(client, {
-    keyPrefix: "test:",
-  });
-
-  await stores.app.deleteByPath("/never-indexed");
-  await stores.loader.deleteByPath("/never-indexed");
-});
 
 function wildcardToRegExp(pattern: string): RegExp {
-  const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`^${escaped.replace(/\*/g, ".*")}$`);
+  return new RegExp(`^${pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g,".*")}$`);
 }
+const appEntry = (ttl = 60000) => ({ status: 200, statusText: "OK", headers: [] as [string,string][], body: new Uint8Array([0,255,128]), expiresAt: Date.now()+ttl });
 
-test("app.get reads an entry written with a string body by core <= 0.2.2", async () => {
+test("path invalidation matches current app keys exactly and preserves other paths", async () => {
+  const stores = createRedisNeutronCacheStoresFromClient(new FakeRedisClient(true));
+  const key = "html\nhttps://app.example\n/a..b\n?q=1\nen";
+  await stores.app.set(key, appEntry());
+  await stores.app.set("html:/a..bc", appEntry());
+  assert.deepEqual((await stores.app.get(key))?.body, new Uint8Array([0,255,128]));
+  await stores.app.deleteByPath("/a..b/");
+  assert.equal(await stores.app.get(key), null);
+  assert.ok(await stores.app.get("html:/a..bc"));
+});
+test("empty path invalidation rejects delayed app and loader publications", async () => {
+  const stores = createRedisNeutronCacheStoresFromClient(new FakeRedisClient(true));
+  for (const store of [stores.app, stores.loader]) {
+    const generation = await store.getGeneration!();
+    await store.deleteByPath("/absent");
+    assert.notEqual(await store.getGeneration!(), generation);
+  }
+  const old = await stores.app.getGeneration!();
+  await stores.app.deleteByPath("/a");
+  assert.equal(await stores.app.setIfGeneration!("html:/a", appEntry(),old),false);
+  assert.equal(await stores.app.get("html:/a"),null);
+});
+test("clear logically removes its store without scanning and admits new fills", async () => {
   const client = new FakeRedisClient(true);
-  const stores = createRedisNeutronCacheStoresFromClient(client, { keyPrefix: "test:" });
-  await client.set(
-    "test:app:html:/legacy",
-    serializeTransportData({
-      status: 200,
-      statusText: "OK",
-      headers: [["content-type", "text/html"]],
-      body: "<h1>caf\u00e9</h1>",
-      expiresAt: Date.now() + 60_000,
-    }),
-    "EX",
-    60
-  );
-
-  const entry = await stores.app.get("html:/legacy");
-  assert.ok(entry);
-  assert.ok(entry.body instanceof Uint8Array);
-  assert.equal(new TextDecoder().decode(entry.body), "<h1>caf\u00e9</h1>");
+  const stores = createRedisNeutronCacheStoresFromClient(client);
+  await stores.app.set("html:/a", appEntry());
+  await stores.loader.set("/a::route", {data: 1,expiresAt:Date.now()+60000});
+  const old = await stores.app.getGeneration!();
+  await stores.app.clear();
+  assert.equal(await stores.app.get("html:/a"),null);
+  assert.ok(await stores.loader.get("/a::route"));
+  assert.equal(await stores.app.setIfGeneration!("html:/a",appEntry(),old),false);
+  assert.equal(await stores.app.setIfGeneration!("html:/a",appEntry(),await stores.app.getGeneration!()),true);
+  assert.ok(await stores.app.get("html:/a"));
+  assert.equal(client.scanCallCount+client.keysCallCount,0);
+});
+test("index TTL retains the longest app and loader variant", async () => {
+  const client = new FakeRedisClient(true);
+  const stores = createRedisNeutronCacheStoresFromClient(client,{keyPrefix:"test:"});
+  await stores.app.set("html:/a",appEntry(600000));
+  await stores.app.set("html:/a?q=short",appEntry(10000));
+  await stores.loader.set("/b::long",{data:1,expiresAt:Date.now()+600000});
+  await stores.loader.set("/b::short",{data:2,expiresAt:Date.now()+10000});
+  assert.ok(await client.ttl("test:idx:app:/a")>=595);
+  assert.ok(await client.ttl("test:idx:ldr:/b")>=595);
+  await stores.loader.deleteByPath("/b");
+  assert.equal(await stores.loader.get("/b::long"),null);
+});
+test("legacy unversioned payloads are cold misses after upgrade", async () => {
+  const client = new FakeRedisClient(true);
+  await client.set("test:app:html:/legacy",serializeTransportData(appEntry()),"EX",60);
+  assert.equal(await createRedisNeutronCacheStoresFromClient(client,{keyPrefix:"test:"}).app.get("html:/legacy"),null);
+});
+test("clients without EVAL are refused before stores are created", () => {
+  const client = new FakeRedisClient(true);
+  Object.assign(client,{eval:undefined});
+  assert.throws(()=>createRedisNeutronCacheStoresFromClient(client),/atomic EVAL/);
 });

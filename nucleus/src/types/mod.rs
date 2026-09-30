@@ -5,6 +5,16 @@ use std::hash::{Hash, Hasher};
 
 use rust_decimal::Decimal;
 
+mod array;
+mod jsonb;
+pub use array::{
+    ArrayLit, array_element_text, array_value_from_literal, format_array, guess_array_element,
+    parse_array_literal, validate_array_shape,
+};
+pub(crate) use jsonb::compare as compare_jsonb;
+mod timestamptz;
+pub use timestamptz::{format_timestamptz, zone_offset_seconds};
+
 /// Parse the bounded exact NUMERIC representation used by Nucleus. The current
 /// physical type is rust_decimal (96-bit coefficient, scale <= 28); values
 /// outside that range reject explicitly instead of degrading to f64.
@@ -115,7 +125,7 @@ impl fmt::Display for Value {
             }
             Value::Float64(n) => write!(f, "{}", pg_float_text(*n)),
             Value::Text(s) => write!(f, "{s}"),
-            Value::Jsonb(v) => write!(f, "{v}"),
+            Value::Jsonb(v) => write!(f, "{}", jsonb_text(v)),
             Value::Date(days) => {
                 let (y, m, d) = days_to_ymd(*days);
                 write!(f, "{y:04}-{m:02}-{d:02}")
@@ -155,16 +165,7 @@ impl fmt::Display for Value {
                 }
                 Ok(())
             }
-            Value::Array(vals) => {
-                write!(f, "{{")?;
-                for (i, v) in vals.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ",")?;
-                    }
-                    write!(f, "{v}")?;
-                }
-                write!(f, "}}")
-            }
+            Value::Array(vals) => write!(f, "{}", format_array(vals, &array_element_text)),
             Value::Vector(vec) => {
                 write!(f, "[")?;
                 for (i, v) in vec.iter().enumerate() {
@@ -209,7 +210,11 @@ impl fmt::Display for Value {
                     let frac = total_us % 1_000_000;
                     let sign = if *microseconds < 0 { "-" } else { "" };
                     if frac > 0 {
-                        parts.push(format!("{sign}{h:02}:{m:02}:{s:02}.{frac:06}"));
+                        let fraction = format!("{frac:06}");
+                        parts.push(format!(
+                            "{sign}{h:02}:{m:02}:{s:02}.{}",
+                            fraction.trim_end_matches('0')
+                        ));
                     } else {
                         parts.push(format!("{sign}{h:02}:{m:02}:{s:02}"));
                     }
@@ -322,6 +327,59 @@ pub fn ymd_to_days(year: i32, month: u32, day: u32) -> i32 {
 /// notation while the exponent is in [-4, 15), otherwise scientific with a
 /// signed, two-digit-minimum exponent ("1e+100", "1e-05") — matching
 /// PostgreSQL 12+ shortest-Ryu output.
+/// Render a jsonb value the way PostgreSQL's `jsonb_out` does: `, ` between
+/// elements, `": "` after object keys, and object keys ordered by length and
+/// then bytewise (the order jsonb stores them in), not alphabetically.
+pub fn jsonb_text(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    write_jsonb_text(v, &mut out);
+    out
+}
+
+fn write_jsonb_text(v: &serde_json::Value, out: &mut String) {
+    match v {
+        serde_json::Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_jsonb_text(item, out);
+            }
+            out.push(']');
+        }
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(b.0)));
+            out.push('{');
+            for (i, (k, item)) in entries.into_iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&serde_json::Value::String(k.clone()).to_string());
+                out.push_str(": ");
+                write_jsonb_text(item, out);
+            }
+            out.push('}');
+        }
+        serde_json::Value::Number(n) => {
+            let text = n.to_string();
+            // JSONB normalizes zero's sign while retaining its display scale.
+            let lexical = text
+                .strip_prefix('-')
+                .filter(|mantissa| mantissa.bytes().all(|byte| matches!(byte, b'0' | b'.')))
+                .unwrap_or(&text);
+            if let Some(expanded) = jsonb::expanded_text(lexical) {
+                out.push_str(&expanded);
+            } else {
+                out.push_str(lexical);
+            }
+        }
+
+        other => out.push_str(&other.to_string()),
+    }
+}
+
 pub fn pg_float_text(n: f64) -> String {
     if n.is_nan() {
         return "NaN".into();
@@ -391,11 +449,62 @@ pub fn parse_timestamp(value: &str) -> Result<i64, String> {
     parse_timestamp_with_zone(value).map(|(us, _)| us)
 }
 
-/// ISO timestamp parser for `timestamptz`: a trailing UTC offset shifts the
+/// The zone written after a timestamp literal: a numeric UTC offset in
+/// seconds (`+02`, `-05:30`, `Z`) or a zone name (`UTC`, `America/New_York`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimestampZone {
+    Offset(i64),
+    Named(String),
+}
+
+/// Parse a timestamp literal for `timestamptz`, returning the wall-clock
+/// microseconds exactly as written plus the zone that qualified them, if any.
+/// The caller resolves the zone (an explicit one wins over the session
+/// TimeZone, which only applies to a literal that names none).
+pub fn parse_timestamptz_zoned(value: &str) -> Result<(i64, Option<TimestampZone>), String> {
+    parse_timestamp_with_zone(value)
+}
+
+/// Session-less `timestamptz` parser: a trailing UTC offset shifts the
 /// wall-clock time to UTC (PostgreSQL stores timestamptz normalized to UTC).
-/// Without an offset the value is taken as already-UTC (server runs in UTC).
+/// Without a zone the value is taken as already-UTC; only `UTC`/`GMT` are
+/// understood as names here, other names need a session (see
+/// `executor::timestamptz`).
 pub fn parse_timestamptz(value: &str) -> Result<i64, String> {
-    parse_timestamp_with_zone(value).map(|(us, offset)| us - offset.unwrap_or(0) * 1_000_000)
+    let (us, zone) = parse_timestamp_with_zone(value)?;
+    match zone {
+        None => Ok(us),
+        Some(TimestampZone::Offset(offset)) => Ok(us - offset * 1_000_000),
+        Some(TimestampZone::Named(name))
+            if ["utc", "gmt", "etc/utc", "etc/gmt", "zulu"]
+                .contains(&name.to_ascii_lowercase().as_str()) =>
+        {
+            Ok(us)
+        }
+        Some(TimestampZone::Named(name)) => Err(format!("time zone '{name}' is not recognized")),
+    }
+}
+
+/// Split the zone qualifier off the time part of a timestamp literal:
+/// `03:04:05+02`, `03:04:05 +02`, `03:04:05Z`, `03:04:05 UTC`,
+/// `03:04:05 America/New_York`.
+fn split_zone_spec(time: &str) -> Result<(&str, Option<TimestampZone>), String> {
+    if let Some((clock, zone)) = time.split_once(char::is_whitespace) {
+        let zone = zone.trim();
+        if zone.is_empty() {
+            return Ok((clock, None));
+        }
+        if zone.starts_with(['+', '-']) || zone.eq_ignore_ascii_case("z") {
+            let (_, offset) = split_zone_suffix(zone)?;
+            return Ok((clock, offset.map(TimestampZone::Offset)));
+        }
+        if zone.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            return Ok((clock, Some(TimestampZone::Named(zone.to_string()))));
+        }
+        return Err(format!("invalid time zone: {zone}"));
+    }
+    let (clock, offset) = split_zone_suffix(time)?;
+    Ok((clock, offset.map(TimestampZone::Offset)))
 }
 
 /// Split a trailing UTC-offset suffix (`Z`, `±HH`, `±HH:MM`, `±HHMM`,
@@ -433,10 +542,10 @@ fn split_zone_suffix(time: &str) -> Result<(&str, Option<i64>), String> {
     Ok((time, Some(sign * (hours * 3600 + minutes * 60 + seconds))))
 }
 
-fn parse_timestamp_with_zone(value: &str) -> Result<(i64, Option<i64>), String> {
+fn parse_timestamp_with_zone(value: &str) -> Result<(i64, Option<TimestampZone>), String> {
     let value = value.trim();
     let (date, time) = value.split_once([' ', 'T']).unwrap_or((value, "00:00:00"));
-    let (time, zone_offset) = split_zone_suffix(time)?;
+    let (time, zone_offset) = split_zone_spec(time)?;
     let time = time.trim_end();
     let days = parse_date(date)? as i64;
     let pieces: Vec<&str> = time.split(':').collect();
@@ -481,8 +590,10 @@ fn parse_timestamp_with_zone(value: &str) -> Result<(i64, Option<i64>), String> 
 
 /// Format microseconds since 2000-01-01 as "YYYY-MM-DD HH:MM:SS.ffffff".
 fn format_timestamp(f: &mut fmt::Formatter<'_>, us: i64) -> fmt::Result {
-    let total_secs = us / 1_000_000;
-    let frac = (us % 1_000_000).unsigned_abs() as u32;
+    // Floor division: a truncating split rendered a pre-2000 instant with a
+    // fractional second as the wrong second (-0.5s -> 00:00:00.5).
+    let total_secs = us.div_euclid(1_000_000);
+    let frac = us.rem_euclid(1_000_000) as u32;
     let days = total_secs.div_euclid(86400) as i32;
     let time_secs = total_secs.rem_euclid(86400) as u32;
     let (y, m, d) = days_to_ymd(days);
@@ -490,9 +601,12 @@ fn format_timestamp(f: &mut fmt::Formatter<'_>, us: i64) -> fmt::Result {
     let minute = (time_secs % 3600) / 60;
     let second = time_secs % 60;
     if frac > 0 {
+        // PostgreSQL drops trailing zeros of the fraction (`.5`, not `.500000`).
+        let fraction = format!("{frac:06}");
         write!(
             f,
-            "{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}:{second:02}.{frac:06}"
+            "{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}:{second:02}.{}",
+            fraction.trim_end_matches('0')
         )
     } else {
         write!(f, "{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}:{second:02}")
@@ -923,7 +1037,7 @@ impl PartialEq for Value {
             // sorted or hashed container corrupts it.
             (Value::Float64(a), Value::Float64(b)) => a == b || (a.is_nan() && b.is_nan()),
             (Value::Text(a), Value::Text(b)) => a == b,
-            (Value::Jsonb(a), Value::Jsonb(b)) => a == b,
+            (Value::Jsonb(a), Value::Jsonb(b)) => compare_jsonb(a, b).is_eq(),
             (Value::Date(a), Value::Date(b)) => a == b,
             (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
             (Value::TimestampTz(a), Value::TimestampTz(b)) => a == b,
@@ -1016,7 +1130,7 @@ impl Hash for Value {
             Value::Numeric(s) => canonical_numeric(s)
                 .unwrap_or_else(|_| s.clone())
                 .hash(state),
-            Value::Jsonb(v) => format!("{v}").hash(state),
+            Value::Jsonb(v) => jsonb::hash(v, state),
             Value::Uuid(u) => u.hash(state),
             Value::Bytea(b) => b.hash(state),
             Value::Array(a) => a.hash(state),
@@ -1076,6 +1190,7 @@ impl Ord for Value {
                 }
             }
             (Value::Text(a), Value::Text(b)) => a.cmp(b),
+            (Value::Jsonb(a), Value::Jsonb(b)) => compare_jsonb(a, b),
             (Value::Numeric(a), Value::Numeric(b)) => match (parse_numeric(a), parse_numeric(b)) {
                 (Ok(a), Ok(b)) => a.cmp(&b),
                 _ => a.cmp(b),
@@ -1913,3 +2028,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod jsonb_tests;

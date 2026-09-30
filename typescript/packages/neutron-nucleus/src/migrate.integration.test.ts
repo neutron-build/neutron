@@ -141,6 +141,140 @@ describe("Integration: migration protocol v2 (live engine)", { skip: !live() && 
     );
   });
 
+  it("refused adoption does not add nullable metadata columns", async () => {
+    await reset(t);
+    await t.execute("CREATE TABLE _neutron_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT)");
+    await t.execute("INSERT INTO _neutron_migrations VALUES (1, 'first', 'deadbeef')");
+    await assert.rejects(() => adoptMigrations(t, plan), /neither/);
+    const columns = await t.query<{ column_name: string }>(
+      "SELECT column_name FROM information_schema.columns WHERE table_name = '_neutron_migrations' AND column_name IN ('owner', 'format')");
+    assert.deepEqual(columns.rows, []);
+    const row = await t.query<{ checksum: string }>("SELECT checksum FROM _neutron_migrations WHERE version = 1");
+    assert.equal(row.rows[0].checksum, 'deadbeef');
+  });
+
+  it("rolls history back after an injected post-upgrade update failure", async () => {
+    await reset(t);
+    await t.execute("CREATE TABLE _neutron_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)");
+    await t.execute("INSERT INTO _neutron_migrations VALUES (1, 'first'), (2, 'second')");
+    const begin = t.beginTransaction.bind(t);
+    let updates = 0;
+    t.beginTransaction = async (...args) => {
+      const tx = await begin(...args);
+      const execute = tx.execute.bind(tx);
+      tx.execute = async (sql, params, opts) => {
+        if (sql.startsWith('UPDATE _neutron_migrations') && ++updates === 2) {
+          throw new Error('injected adoption update failure');
+        }
+        return execute(sql, params, opts);
+      };
+      return tx;
+    };
+    try {
+      await assert.rejects(() => adoptMigrations(t, plan), /injected adoption update failure/);
+    } finally {
+      t.beginTransaction = begin;
+    }
+    assert.equal(updates, 2, 'must fail after one history update, not before DDL');
+    const version = String(await t.fetchval('SELECT version()'));
+    const columns = await t.query<{ column_name: string }>(
+      "SELECT column_name FROM information_schema.columns WHERE table_name = '_neutron_migrations' AND column_name IN ('checksum', 'owner', 'format')");
+    if (version.includes('Nucleus')) {
+      // Catalog rollback is unsupported, but every history graduation rolls back.
+      assert.equal(columns.rows.length, 3);
+      const rows = await t.query<{ checksum: string | null; owner: string | null; format: string | null }>(
+        'SELECT checksum, owner, format FROM _neutron_migrations');
+      assert.equal(rows.rows.length, 2);
+      for (const row of rows.rows) assert.deepEqual(row, { checksum: null, owner: null, format: null });
+    } else {
+      assert.match(version, /PostgreSQL/);
+      assert.equal(columns.rows.length, 0);
+    }
+  });
+
+  it("captures migration records before waiting for a real ledger claim", async () => {
+    await reset(t);
+    await migrate(t, []);
+    await t.execute("INSERT INTO _neutron_migration_lock (id, token, owner) VALUES (1, 123, 'input-snapshot-holder')");
+    const supplied = [{ ...plan[0] }];
+    const execute = t.execute.bind(t);
+    let entered!: () => void;
+    const queued = new Promise<void>(resolve => { entered = resolve; });
+    t.execute = async (sql, params, opts) => {
+      const count = await execute(sql, params, opts);
+      if (sql.startsWith('INSERT INTO _neutron_migration_lock') && count === 0) entered();
+      return count;
+    };
+    const controller = new AbortController();
+    const running = migrate(t, supplied, { signal: controller.signal });
+    let queueTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        queued,
+        running.then(() => { throw new Error('migration completed before observing the held claim'); }),
+        new Promise<never>((_, reject) => {
+          queueTimer = setTimeout(() => reject(new Error('migration did not observe the held claim within 10 seconds')), 10_000);
+        }),
+      ]);
+      clearTimeout(queueTimer);
+      Object.assign(supplied[0], { version: 99, name: 'changed', up: 'CREATE TABLE ts_b (id INT)', down: 'SELECT 999' });
+      await execute('DELETE FROM _neutron_migration_lock WHERE id = 1 AND token = 123');
+      assert.deepEqual(await running, ['first']);
+    } finally {
+      clearTimeout(queueTimer);
+      controller.abort();
+      t.execute = execute;
+      await execute('DELETE FROM _neutron_migration_lock WHERE id = 1 AND token = 123');
+      await running.catch(() => {});
+    }
+    const history = await t.query<{ version: number; name: string; checksum: string }>(
+      'SELECT version, name, checksum FROM _neutron_migrations');
+    assert.deepEqual(history.rows, [{ version: 1, name: 'first', checksum: migrationChecksum(plan[0].up) }]);
+    const table = await t.fetchval("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'ts_a')");
+    assert.equal(table, true);
+  });
+
+  it("records the checksum of executed SQL when the caller edits during execution", async () => {
+    await reset(t);
+    const supplied = [{ ...plan[0] }];
+    const begin = t.beginTransaction.bind(t);
+    t.beginTransaction = async (...args) => {
+      const tx = await begin(...args);
+      const execute = tx.execute.bind(tx);
+      tx.execute = async (sql, params, opts) => {
+        const count = await execute(sql, params, opts);
+        if (sql === plan[0].up) supplied[0].up = 'CREATE TABLE ts_b (id BIGINT)';
+        return count;
+      };
+      return tx;
+    };
+    try {
+      assert.deepEqual(await migrate(t, supplied), ['first']);
+    } finally {
+      t.beginTransaction = begin;
+    }
+    assert.equal(await t.fetchval('SELECT checksum FROM _neutron_migrations WHERE version = 1'),
+      migrationChecksum(plan[0].up));
+  });
+
+  it("retries duplicate-table cold bootstrap without replaying user migration SQL", async () => {
+    await reset(t);
+    const execute = t.execute.bind(t);
+    let creates = 0;
+    t.execute = async (sql, params, opts) => {
+      if (/^\s*CREATE TABLE IF NOT EXISTS _neutron_migration_lock\b/.test(sql) && ++creates === 1) {
+        throw Object.assign(new Error('relation _neutron_migration_lock already exists'), { code: '42P07' });
+      }
+      return execute(sql, params, opts);
+    };
+    try {
+      assert.deepEqual(await migrate(t, [plan[0]]), ['first']);
+      assert.equal(creates, 2);
+    } finally {
+      t.execute = execute;
+    }
+  });
+
   it("serializes two runners (separate pools) with exactly-once effects", async () => {
     await reset(t);
     // Four runners, not two: the bootstrap DDL (CREATE TABLE IF NOT EXISTS)
@@ -157,7 +291,7 @@ describe("Integration: migration protocol v2 (live engine)", { skip: !live() && 
       await tx.close().catch(() => {});
     }
     for (const r of results) {
-      assert.equal(r.status, "fulfilled");
+      assert.equal(r.status, "fulfilled", r.status === "rejected" ? String(r.reason) : undefined);
     }
     const rows = await t.query<{ version: number }>("SELECT version FROM _neutron_migrations");
     assert.equal(rows.rows.length, 2);

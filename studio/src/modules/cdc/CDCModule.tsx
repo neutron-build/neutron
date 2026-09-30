@@ -1,5 +1,5 @@
 import { useSignal } from '@preact/signals'
-import { useEffect, useRef } from 'preact/hooks'
+import { useEffect, useId, useRef } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
 import { api } from '../../lib/api'
 import { DataGrid } from '../../components/DataGrid'
@@ -53,6 +53,7 @@ export function eventsToResult(events: CdcEvent[]): QueryResult {
 }
 
 export function CDCModule({ initialTable }: { initialTable?: string } = {}) {
+  const controlsId = useId()
   const totalCount = useSignal<number | null>(null)
   const tables = useSignal<string[]>([])
   const filterTable = useSignal(initialTable || 'all')
@@ -144,8 +145,9 @@ export function CDCModule({ initialTable }: { initialTable?: string } = {}) {
           <span class={s.walPos} title="Total change events">{totalCount.value.toLocaleString()} events</span>
         )}
         <div class={s.refreshControl}>
-          <label class={s.refreshLabel}>Auto-refresh</label>
+          <label class={s.refreshLabel} htmlFor={`${controlsId}-refresh`}>Auto-refresh</label>
           <select
+            id={`${controlsId}-refresh`}
             class={s.refreshSelect}
             value={refreshInterval.value}
             onChange={e => { refreshInterval.value = (e.target as HTMLSelectElement).value as RefreshInterval }}
@@ -163,16 +165,16 @@ export function CDCModule({ initialTable }: { initialTable?: string } = {}) {
 
       <div class={s.filterBar}>
         <div class={s.filterGroup}>
-          <label class={s.filterLabel}>Table</label>
-          <select class={s.filterSelect} value={filterTable.value}
+          <label class={s.filterLabel} htmlFor={`${controlsId}-table`}>Table</label>
+          <select id={`${controlsId}-table`} class={s.filterSelect} value={filterTable.value}
             onChange={e => { filterTable.value = (e.target as HTMLSelectElement).value; loadChanges() }}>
             <option value="all">All tables</option>
             {tables.value.map(t => <option key={t} value={t}>{t}</option>)}
           </select>
         </div>
         <div class={s.filterGroup}>
-          <label class={s.filterLabel}>Operation</label>
-          <select class={s.filterSelect} value={filterOp.value}
+          <label class={s.filterLabel} htmlFor={`${controlsId}-operation`}>Operation</label>
+          <select id={`${controlsId}-operation`} class={s.filterSelect} value={filterOp.value}
             onChange={e => { filterOp.value = (e.target as HTMLSelectElement).value as Op; loadChanges() }}>
             <option value="all">All</option>
             <option value="INSERT">INSERT</option>
@@ -181,8 +183,8 @@ export function CDCModule({ initialTable }: { initialTable?: string } = {}) {
           </select>
         </div>
         <div class={s.filterGroup}>
-          <label class={s.filterLabel}>Limit</label>
-          <select class={s.filterSelect} value={limit.value}
+          <label class={s.filterLabel} htmlFor={`${controlsId}-limit`}>Limit</label>
+          <select id={`${controlsId}-limit`} class={s.filterSelect} value={limit.value}
             onChange={e => { limit.value = parseInt((e.target as HTMLSelectElement).value); loadChanges() }}>
             <option value={100}>100</option>
             <option value={200}>200</option>

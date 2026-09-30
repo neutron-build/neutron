@@ -176,7 +176,9 @@ func (c *Client) acquireMigrationLock(ctx context.Context) (int64, error) {
 
 		select {
 		case <-ctx.Done():
-			info, _ := c.MigrationLockInfo(context.WithoutCancel(ctx))
+			diagnosticCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			info, _ := c.MigrationLockInfo(diagnosticCtx)
+			cancel()
 			if info.Held {
 				return 0, fmt.Errorf(
 					"nucleus: migration lock is held by %s (heartbeat %s); no automatic takeover — "+
@@ -198,7 +200,9 @@ func (c *Client) acquireMigrationLock(ctx context.Context) (int64, error) {
 // releases, its work is committed, and an unreleased claim is recoverable
 // via ForceUnlockMigrations (it does NOT self-heal by timeout anymore).
 func (c *Client) releaseMigrationLock(ctx context.Context, token int64) {
-	_, _ = c.pool.Exec(ctx,
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_, _ = c.pool.Exec(cleanupCtx,
 		"DELETE FROM _neutron_migration_lock WHERE id = 1 AND token = $1",
 		sqlParam(token))
 }
@@ -419,8 +423,11 @@ type MigrationAdoptionReport struct {
 	Unverified []int
 }
 
-// AdoptMigrations graduates a legacy history into protocol v2 in ONE
-// transaction (contracts/data/MIGRATIONS.md §6). It never fabricates trust:
+// AdoptMigrations graduates legacy history rows into protocol v2 in one
+// transaction (contracts/data/MIGRATIONS.md §6). PostgreSQL also rolls back
+// metadata-column DDL; Nucleus may retain idempotent nullable columns after
+// a later failure. Digest mismatches are refused before that DDL on both.
+// It never fabricates trust:
 //
 //   - a row whose recorded legacy Go SDK digest reproduces from the
 //     supplied plan is adopted as VERIFIED and re-recorded under the v2
@@ -460,16 +467,33 @@ func (c *Client) AdoptMigrations(ctx context.Context, migrations []Migration) (*
 	if !exists {
 		return nil, fmt.Errorf("nucleus: nothing to adopt: no migration history exists")
 	}
-	if err := c.ensureMigrationsTable(ctx); err != nil {
-		return nil, err
-	}
 
 	byVersion := make(map[int]Migration, len(plan))
 	for _, m := range plan {
 		byVersion[m.Version] = m
 	}
 
-	rows, err := c.pool.Query(ctx, "SELECT version, name, checksum FROM _neutron_migrations")
+	tx, err := c.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("nucleus: begin adoption tx: %w", err)
+	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = tx.Rollback(cleanupCtx)
+	}()
+
+	// A legacy TS table has no checksum column. Read it as NULL without
+	// upgrading the schema before all recorded content has been validated.
+	var hasChecksum bool
+	if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = '_neutron_migrations' AND column_name = 'checksum')").Scan(&hasChecksum); err != nil {
+		return nil, err
+	}
+	historySQL := "SELECT version, name, NULL AS checksum FROM _neutron_migrations"
+	if hasChecksum {
+		historySQL = "SELECT version, name, checksum FROM _neutron_migrations"
+	}
+	rows, err := tx.Query(ctx, historySQL)
 	if err != nil {
 		return nil, fmt.Errorf("nucleus: read history for adoption: %w", err)
 	}
@@ -494,11 +518,37 @@ func (c *Client) AdoptMigrations(ctx context.Context, migrations []Migration) (*
 
 	report := &MigrationAdoptionReport{}
 
-	tx, err := c.pool.Begin(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("nucleus: begin adoption tx: %w", err)
+	// Refuse mismatches before even idempotent nullable-column DDL. Nucleus
+	// does not roll catalog DDL back; PostgreSQL does. The history updates
+	// below remain one transaction on both engines.
+	for _, r := range history {
+		m, ok := byVersion[r.version]
+		if ok && r.checksum != nil && *r.checksum != migrationChecksum(m) && *r.checksum != legacyMigrationChecksum(r.version, r.name, m.Up) {
+			return nil, fmt.Errorf("nucleus: adoption refused: migration %d (%s) has a recorded checksum that matches neither the supplied plan nor the legacy Go SDK digest — restore the applied SQL or reconcile manually", r.version, r.name)
+		}
 	}
-	defer tx.Rollback(ctx)
+	if c.features.IsNucleus {
+		// Nucleus catalog DDL is not transactional. End the preflight read
+		// snapshot before upgrading tuple layouts, then graduate history in
+		// a fresh transaction while retaining the same ledger claim.
+		if err := tx.Rollback(ctx); err != nil {
+			return nil, err
+		}
+		if err := c.ensureMigrationsTable(ctx); err != nil {
+			return nil, err
+		}
+		nextTx, err := c.pool.Begin(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("nucleus: begin history graduation: %w", err)
+		}
+		tx = nextTx
+	} else {
+		for _, stmt := range []string{migrationsAddColumns, migrationsAddOwner, migrationsAddFormat} {
+			if _, err := tx.Exec(ctx, stmt); err != nil {
+				return nil, fmt.Errorf("nucleus: prepare adoption table: %w", err)
+			}
+		}
+	}
 
 	for _, r := range history {
 		m, hasPlan := byVersion[r.version]
@@ -557,7 +607,9 @@ func (c *Client) AdoptMigrations(ctx context.Context, migrations []Migration) (*
 //
 // Checksums: every applied migration records the protocol-v2 checksum
 // (SHA-256 over the up SQL) plus owner/format metadata, in the same
-// transaction as its DDL. History rows in legacy formats (written before
+// transaction as its DDL. PostgreSQL rolls back that DDL on failure;
+// Nucleus catalog DDL can remain and requires reconciliation before retry.
+// History rows in legacy formats (written before
 // protocol v2) are refused before any mutation and graduate through
 // AdoptMigrations — the GO-30 silent baselining is superseded.
 func (c *Client) Migrate(ctx context.Context, migrations []Migration) error {

@@ -24,6 +24,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 const args = process.argv.slice(2);
@@ -38,7 +39,7 @@ if (!BIN) {
 }
 const PORT = Number(flag("--port") ?? 55942);
 const OUT = flag("--out");
-const DIST = path.resolve(new URL("../../../typescript/packages/neutron-nucleus/dist", import.meta.url).pathname);
+const DIST = fileURLToPath(new URL("../../../typescript/packages/neutron-nucleus/dist", import.meta.url));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const dataDir = mkdtempSync(path.join(tmpdir(), "x02-nucleus-"));

@@ -273,7 +273,7 @@ async fn a_write_after_restart_rebuilds_the_index_it_needs() {
             Some(catalog_path),
             Some(data),
         ));
-        ex.restore_table_engines().await;
+        ex.restore_table_engines().await.unwrap();
         ex
     }
 
@@ -445,7 +445,7 @@ async fn a_read_after_restart_is_still_indexed() {
             Some(catalog_path),
             Some(data),
         ));
-        ex.restore_table_engines().await;
+        ex.restore_table_engines().await.unwrap();
         if rebuild {
             ex.rebuild_persistent_indexes().await;
         }

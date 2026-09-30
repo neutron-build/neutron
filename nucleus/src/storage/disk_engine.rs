@@ -171,6 +171,13 @@ struct DiskTxnState {
     page_count_at_begin: u32,
 }
 
+#[cfg(test)]
+struct IndexPublishHook {
+    index_name: String,
+    remaining_matches: usize,
+    pause: Box<dyn FnOnce() + Send>,
+}
+
 /// Disk-backed storage engine.
 pub struct DiskEngine {
     /// Path of the primary data file (its `.wal` / `.wal.d` siblings hold the
@@ -182,6 +189,8 @@ pub struct DiskEngine {
     tables: RwLock<HashMap<String, TableMeta>>,
     /// Index name → index metadata.
     indexes: RwLock<HashMap<String, IndexMeta>>,
+    #[cfg(test)]
+    index_publish_hook: parking_lot::Mutex<Option<IndexPublishHook>>,
     /// Reference to the catalog for looking up column types.
     catalog: Arc<Catalog>,
     /// Head of the on-disk free page list (linked via FREE_NEXT_PAGE pointers).
@@ -827,6 +836,8 @@ impl DiskEngine {
             pool,
             tables: RwLock::new(HashMap::new()),
             indexes: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            index_publish_hook: parking_lot::Mutex::new(None),
             catalog,
             free_list_head: parking_lot::Mutex::new(fl_head),
             free_page_count: parking_lot::Mutex::new(fl_count),
@@ -1658,8 +1669,10 @@ impl DiskEngine {
 
     /// Delete tuples at stable row addresses. `expected` is the row the caller
     /// read; when present, the tuple is deleted only if it still holds that
-    /// row's identity, so a position whose slot was recycled by a later insert
-    /// cannot delete the row that took its place.
+    /// complete value. Primary-key identity alone cannot validate a conditional
+    /// delete: a competing transaction may replace the same key with a newer
+    /// revision in the recycled slot. Check the observed tuple under the page
+    /// write latch before deleting it.
     fn delete_at(
         &self,
         table: &str,
@@ -1670,8 +1683,6 @@ impl DiskEngine {
             let indexes = self.indexes.read();
             indexes.values().any(|idx| idx.table == table)
         };
-        let verifying = targets.iter().any(|(_, expected)| expected.is_some());
-        let identity = verifying.then(|| self.identity_cols(table)).flatten();
         let mut count = 0usize;
 
         // Index maintenance for the rows removed on the current page. Collected
@@ -1708,8 +1719,7 @@ impl DiskEngine {
                     let current = tuple::deserialize_row(&pg[off..off + len], &col_types);
                     if let Some(expected) = &expected {
                         match &current {
-                            Some(row)
-                                if Self::same_row_identity(expected, row, identity.as_ref()) => {}
+                            Some(row) if row == expected => {}
                             // A different row occupies the address now — the slot
                             // was freed and recycled while the caller was resolving
                             // the rest of the statement. Leave it alone.
@@ -3630,6 +3640,25 @@ impl DiskEngine {
             page_id = next;
         }
 
+        #[cfg(test)]
+        {
+            let hook = {
+                let mut hook = self.index_publish_hook.lock();
+                if let Some(armed) = hook.as_mut().filter(|hook| hook.index_name == index_name) {
+                    if armed.remaining_matches > 1 {
+                        armed.remaining_matches -= 1;
+                        None
+                    } else {
+                        hook.take()
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(hook) = hook {
+                (hook.pause)();
+            }
+        }
         let mut indexes = self.indexes.write();
         indexes.insert(
             index_name.to_string(),
@@ -4201,6 +4230,8 @@ mod tests {
                         default_expr: None,
                         id: 0,
                         analyzer: None,
+                        generation: None,
+                        max_len: None,
                     },
                     ColumnDef {
                         name: "name".into(),
@@ -4209,6 +4240,8 @@ mod tests {
                         default_expr: None,
                         id: 0,
                         analyzer: None,
+                        generation: None,
+                        max_len: None,
                     },
                 ],
                 constraints: vec![],
@@ -4881,6 +4914,8 @@ mod tests {
                         default_expr: None,
                         id: 0,
                         analyzer: None,
+                        generation: None,
+                        max_len: None,
                     },
                     ColumnDef {
                         name: "label".into(),
@@ -4889,6 +4924,8 @@ mod tests {
                         default_expr: None,
                         id: 0,
                         analyzer: None,
+                        generation: None,
+                        max_len: None,
                     },
                     ColumnDef {
                         name: "score".into(),
@@ -4897,6 +4934,8 @@ mod tests {
                         default_expr: None,
                         id: 0,
                         analyzer: None,
+                        generation: None,
+                        max_len: None,
                     },
                     ColumnDef {
                         name: "active".into(),
@@ -4905,6 +4944,8 @@ mod tests {
                         default_expr: None,
                         id: 0,
                         analyzer: None,
+                        generation: None,
+                        max_len: None,
                     },
                 ],
                 constraints: vec![],
@@ -5535,6 +5576,8 @@ mod tests {
                     default_expr: None,
                     id: 0,
                     analyzer: None,
+                    generation: None,
+                    max_len: None,
                 },
                 ColumnDef {
                     name: "b".into(),
@@ -5543,6 +5586,8 @@ mod tests {
                     default_expr: None,
                     id: 0,
                     analyzer: None,
+                    generation: None,
+                    max_len: None,
                 },
                 ColumnDef {
                     name: "c".into(),
@@ -5551,6 +5596,8 @@ mod tests {
                     default_expr: None,
                     id: 0,
                     analyzer: None,
+                    generation: None,
+                    max_len: None,
                 },
                 ColumnDef {
                     name: "d".into(),
@@ -5559,6 +5606,8 @@ mod tests {
                     default_expr: None,
                     id: 0,
                     analyzer: None,
+                    generation: None,
+                    max_len: None,
                 },
                 ColumnDef {
                     name: "e".into(),
@@ -5567,6 +5616,8 @@ mod tests {
                     default_expr: None,
                     id: 0,
                     analyzer: None,
+                    generation: None,
+                    max_len: None,
                 },
             ],
             constraints: vec![],
@@ -8321,6 +8372,457 @@ mod tests {
             assert_eq!(rows.len(), 200, "mixed concurrent paths lost rows");
         })
         .await;
+    }
+    /// A nonincremental executor refresh must not publish a stale storage
+    /// B-tree over an insert completed while its detached scan was paused.
+    #[test]
+    fn ordinary_update_refresh_preserves_concurrent_secondary_posting() {
+        use crate::executor::Executor;
+        use crate::storage::buffered_engine::BufferedDiskEngine;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        enum Event {
+            Paused,
+            Done(Result<(), String>),
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = rt.block_on(setup_engine(tmp.path()));
+        let engine = Arc::new(engine);
+        let storage: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(engine.clone()));
+        let executor = Arc::new(Executor::new(catalog, storage));
+        rt.block_on(executor.execute("CREATE TABLE posting_race (id BIGINT PRIMARY KEY, val INT, code TEXT, v VECTOR(4)); CREATE INDEX posting_val ON posting_race (val); INSERT INTO posting_race VALUES (1, 37, 'one', VECTOR('[1,0,0,0]')); CREATE INDEX posting_vector ON posting_race USING IVFFLAT (v)")).unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let pause_tx = event_tx.clone();
+        *engine.index_publish_hook.lock() = Some(IndexPublishHook {
+            index_name: "posting_val".into(),
+            // Maintenance used to create each catalog index, then rebuild it
+            // again. Pause the final publication so the second scan cannot
+            // repair the lost posting before the invariant is checked.
+            remaining_matches: 2,
+            pause: Box::new(move || {
+                pause_tx.send(Event::Paused).unwrap();
+                resume_rx.recv().unwrap();
+            }),
+        });
+        let writer = executor.clone();
+        let handle = rt.handle().clone();
+        let sid = executor.create_session();
+        let worker = std::thread::spawn(move || {
+            let result = handle
+                .block_on(writer.execute_with_session(
+                    sid,
+                    "UPDATE posting_race SET code = 'changed' WHERE id = 1",
+                ))
+                .map_err(|error| error.to_string())
+                .and_then(|results| {
+                    if results.iter().any(|result| {
+                        matches!(
+                            result,
+                            crate::executor::ExecResult::Command {
+                                rows_affected: 1,
+                                ..
+                            }
+                        )
+                    }) {
+                        Ok(())
+                    } else {
+                        Err("UPDATE did not affect exactly one row".into())
+                    }
+                });
+            writer.drop_session(sid);
+            event_tx.send(Event::Done(result)).unwrap();
+        });
+        // The channel selects an actual paused rebuild or a completed UPDATE.
+        // A watchdog expiry is always a failure, never evidence of completion.
+        let first = event_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("UPDATE neither paused nor completed");
+        let sid = executor.create_session();
+        rt.block_on(executor.execute_with_session(
+            sid,
+            "INSERT INTO posting_race VALUES (2, 37, 'two', VECTOR('[0,1,0,0]'))",
+        ))
+        .unwrap();
+        executor.drop_session(sid);
+        match first {
+            Event::Paused => {
+                resume_tx.send(()).unwrap();
+                match event_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("paused UPDATE did not finish")
+                {
+                    Event::Done(result) => result.unwrap(),
+                    Event::Paused => panic!("one-shot rebuild hook paused twice"),
+                }
+            }
+            Event::Done(result) => result.unwrap(),
+        }
+        worker.join().unwrap();
+        let mutation = rt
+            .block_on(executor.execute("SELECT code FROM posting_race WHERE id + 0 = 1"))
+            .unwrap();
+        let crate::executor::ExecResult::Select { rows, .. } = &mutation[0] else {
+            panic!("expected SELECT");
+        };
+        assert_eq!(
+            rows,
+            &vec![vec![Value::Text("changed".into())]],
+            "UPDATE must change the heap before publication is tested"
+        );
+        for predicate in ["val = 37", "val >= 37 AND val <= 37", "val + 0 = 37"] {
+            let sql = format!("SELECT id FROM posting_race WHERE {predicate} ORDER BY id");
+            let results = rt.block_on(executor.execute(&sql)).unwrap();
+            let crate::executor::ExecResult::Select { rows, .. } = &results[0] else {
+                panic!("expected SELECT");
+            };
+            assert_eq!(
+                rows,
+                &vec![vec![Value::Int64(1)], vec![Value::Int64(2)]],
+                "concurrent insert lost through {predicate}"
+            );
+        }
+    }
+
+    #[test]
+    fn structural_ddl_commit_preserves_physical_index_answers() {
+        use crate::executor::{ExecResult, Executor};
+        use crate::storage::buffered_engine::BufferedDiskEngine;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = rt.block_on(setup_engine(tmp.path()));
+        let engine = Arc::new(engine);
+        let storage: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(engine.clone()));
+        let executor = Executor::new(catalog, storage);
+        rt.block_on(executor.execute("CREATE TABLE structural_index (id BIGINT PRIMARY KEY, val INT); CREATE INDEX structural_val ON structural_index (val); INSERT INTO structural_index VALUES (1, 11)")).unwrap();
+        rt.block_on(executor.execute("BEGIN; TRUNCATE structural_index; INSERT INTO structural_index VALUES (2,37),(3,37); COMMIT")).unwrap();
+        let expected = vec![vec![Value::Int64(2)], vec![Value::Int64(3)]];
+        let assert_physical_index = || {
+            let indexed = rt
+                .block_on(engine.index_lookup(
+                    "structural_index",
+                    "structural_val",
+                    &Value::Int32(37),
+                ))
+                .expect("physical index must exist after structural maintenance")
+                .expect("disk engine must serve physical index lookup");
+            let mut ids: Vec<Row> = indexed
+                .into_iter()
+                .map(|row| vec![row[0].clone()])
+                .collect();
+            ids.sort_by(|a, b| a[0].to_string().cmp(&b[0].to_string()));
+            assert_eq!(
+                ids, expected,
+                "physical postings must match surviving heap identities"
+            );
+        };
+        assert_physical_index();
+        for predicate in ["val = 37", "val + 0 = 37"] {
+            let results = rt
+                .block_on(executor.execute(&format!(
+                    "SELECT id FROM structural_index WHERE {predicate} ORDER BY id"
+                )))
+                .unwrap();
+            let ExecResult::Select { rows, .. } = &results[0] else {
+                panic!("expected SELECT");
+            };
+            assert_eq!(
+                rows, &expected,
+                "TRUNCATE commit must restore index structures"
+            );
+        }
+        rt.block_on(
+            executor
+                .execute("BEGIN; ALTER TABLE structural_index ADD COLUMN n INT DEFAULT 7; COMMIT"),
+        )
+        .unwrap();
+        assert_physical_index();
+        for predicate in ["val = 37", "val + 0 = 37"] {
+            let results = rt
+                .block_on(executor.execute(&format!(
+                    "SELECT id, n FROM structural_index WHERE {predicate} ORDER BY id"
+                )))
+                .unwrap();
+            let ExecResult::Select { rows, .. } = &results[0] else {
+                panic!("expected SELECT");
+            };
+            assert_eq!(
+                rows,
+                &vec![
+                    vec![Value::Int64(2), Value::Int32(7)],
+                    vec![Value::Int64(3), Value::Int32(7)]
+                ],
+                "ADD COLUMN commit must retain postings and backfilled defaults"
+            );
+        }
+        rt.block_on(
+            executor.execute(
+                "BEGIN; ALTER TABLE structural_index RENAME COLUMN val TO new_val; COMMIT",
+            ),
+        )
+        .unwrap();
+        assert_physical_index();
+        rt.block_on(executor.execute("BEGIN; UPDATE structural_index SET new_val=38 WHERE id=2; INSERT INTO structural_index VALUES (4,37,9); ROLLBACK")).unwrap();
+        assert_physical_index();
+        for predicate in ["new_val = 37", "new_val + 0 = 37"] {
+            let results = rt
+                .block_on(executor.execute(&format!(
+                    "SELECT id FROM structural_index WHERE {predicate} ORDER BY id"
+                )))
+                .unwrap();
+            let ExecResult::Select { rows, .. } = &results[0] else {
+                panic!("expected SELECT");
+            };
+            assert_eq!(
+                rows, &expected,
+                "renamed column and rollback must preserve index answers"
+            );
+        }
+        rt.block_on(executor.execute(
+            "BEGIN; ALTER TABLE structural_index RENAME TO renamed_structural_index; COMMIT",
+        ))
+        .unwrap();
+        for predicate in ["new_val = 37", "new_val + 0 = 37"] {
+            let results = rt
+                .block_on(executor.execute(&format!(
+                    "SELECT id FROM renamed_structural_index WHERE {predicate} ORDER BY id"
+                )))
+                .unwrap();
+            let ExecResult::Select { rows, .. } = &results[0] else {
+                panic!("expected SELECT");
+            };
+            assert_eq!(
+                rows, &expected,
+                "TABLE RENAME commit must preserve surviving identities"
+            );
+        }
+        let indexed = rt
+            .block_on(engine.index_lookup(
+                "renamed_structural_index",
+                "structural_val",
+                &Value::Int32(37),
+            ))
+            .expect("renamed table must own its physical index")
+            .expect("disk engine must serve renamed physical index");
+        let mut ids: Vec<Row> = indexed
+            .into_iter()
+            .map(|row| vec![row[0].clone()])
+            .collect();
+        ids.sort_by(|a, b| a[0].to_string().cmp(&b[0].to_string()));
+        assert_eq!(
+            ids, expected,
+            "TABLE RENAME commit must reconstruct physical postings under the new table name"
+        );
+    }
+
+    /// Dense secondary keys must remain complete after different rows on the
+    /// same heap pages are updated, deleted, and reinserted concurrently.
+    /// The heap is the oracle; compare identities rather than just counts.
+    #[test]
+    fn concurrent_secondary_index_churn_matches_heap() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = rt.block_on(setup_engine(tmp.path()));
+        rt.block_on(register_simple_table(&catalog, "t"));
+        rt.block_on(engine.create_table("t")).unwrap();
+        rt.block_on(engine.create_index("t", "secondary", 1))
+            .unwrap();
+        const WORKERS: i32 = 8;
+        const ROWS: i32 = 128;
+        for id in 0..WORKERS * ROWS {
+            rt.block_on(engine.insert("t", simple_row(id, &format!("v{:02}", id % 64))))
+                .unwrap();
+        }
+        let engine = Arc::new(engine);
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|worker| {
+                let engine = engine.clone();
+                let handle = rt.handle().clone();
+                std::thread::spawn(move || {
+                    for round in 0..16 {
+                        for row in 0..ROWS {
+                            let id = worker * ROWS + row;
+                            let found = handle
+                                .block_on(engine.scan_where_eq_positions("t", 0, &Value::Int32(id)))
+                                .unwrap();
+                            assert_eq!(found.len(), 1);
+                            let (position, old) = &found[0];
+                            let name = format!("v{:02}", (id + round * 17) % 64);
+                            if (id + round) % 3 == 0 {
+                                assert_eq!(
+                                    handle
+                                        .block_on(
+                                            engine.delete_if_unchanged(
+                                                "t",
+                                                &[(*position, old.clone())]
+                                            )
+                                        )
+                                        .unwrap(),
+                                    1
+                                );
+                                handle
+                                    .block_on(engine.insert("t", simple_row(id, &name)))
+                                    .unwrap();
+                            } else {
+                                assert_eq!(
+                                    handle
+                                        .block_on(engine.update_if_unchanged(
+                                            "t",
+                                            &[(*position, old.clone(), simple_row(id, &name))]
+                                        ))
+                                        .unwrap(),
+                                    1
+                                );
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let heap = rt.block_on(engine.scan("t")).unwrap();
+        assert_eq!(heap.len(), (WORKERS * ROWS) as usize);
+        for key in 0..64 {
+            let value = Value::Text(format!("v{key:02}"));
+            let mut expected: Vec<Row> =
+                heap.iter().filter(|row| row[1] == value).cloned().collect();
+            let mut actual = rt
+                .block_on(engine.index_lookup("t", "secondary", &value))
+                .unwrap()
+                .unwrap();
+            let sort = |a: &Row, b: &Row| a[0].to_string().cmp(&b[0].to_string());
+            expected.sort_by(sort);
+            actual.sort_by(sort);
+            assert_eq!(
+                actual, expected,
+                "secondary key {key} lost or duplicated row identities"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_numeric_secondary_relocation_matches_heap() {
+        fn churn_row(id: i32, key: i32, wide: bool) -> Row {
+            vec![
+                Value::Int64(1_000_000_000 + id as i64),
+                Value::Int64(key as i64),
+                Value::Text(format!("k{id}{}", "x".repeat(if wide { 1536 } else { 8 }))),
+                Value::Vector(vec![key as f32, id as f32, 1.0, -1.0]),
+            ]
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = rt.block_on(setup_engine(tmp.path()));
+        let columns = [
+            ("id", DataType::Int64),
+            ("val", DataType::Int32),
+            ("code", DataType::Text),
+            ("v", DataType::Vector(4)),
+        ]
+        .into_iter()
+        .map(|(name, data_type)| ColumnDef {
+            name: name.into(),
+            data_type,
+            nullable: false,
+            default_expr: None,
+            id: 0,
+            analyzer: None,
+            generation: None,
+            max_len: None,
+        })
+        .collect();
+        rt.block_on(catalog.create_table(TableDef {
+            name: "t".into(),
+            columns,
+            constraints: vec![],
+            append_only: false,
+            epoch: 0,
+        }))
+        .unwrap();
+        rt.block_on(engine.create_table("t")).unwrap();
+        rt.block_on(engine.create_index("t", "primary", 0)).unwrap();
+        rt.block_on(engine.create_index("t", "secondary", 1))
+            .unwrap();
+        const WORKERS: i32 = 8;
+        const ROWS: i32 = 64;
+        for id in 0..WORKERS * ROWS {
+            rt.block_on(engine.insert("t", churn_row(id, id % 64, false)))
+                .unwrap();
+        }
+        let engine = Arc::new(engine);
+        let workers: Vec<_> =
+            (0..WORKERS)
+                .map(|worker| {
+                    let engine = engine.clone();
+                    let handle = rt.handle().clone();
+                    std::thread::spawn(move || {
+                        for round in 0..8 {
+                            for row in 0..ROWS {
+                                let id = worker * ROWS + row;
+                                let found = handle
+                                    .block_on(engine.scan_where_eq_positions(
+                                        "t",
+                                        0,
+                                        &Value::Int64(1_000_000_000 + id as i64),
+                                    ))
+                                    .unwrap();
+                                assert_eq!(found.len(), 1);
+                                let (position, old) = &found[0];
+                                let new = churn_row(id, (id + round * 17) % 64, round % 2 == 0);
+                                if (id + round) % 3 == 0 {
+                                    assert_eq!(
+                                        handle
+                                            .block_on(engine.delete_if_unchanged(
+                                                "t",
+                                                &[(*position, old.clone())]
+                                            ))
+                                            .unwrap(),
+                                        1
+                                    );
+                                    handle.block_on(engine.insert("t", new)).unwrap();
+                                } else {
+                                    assert_eq!(
+                                        handle
+                                            .block_on(engine.update_if_unchanged(
+                                                "t",
+                                                &[(*position, old.clone(), new)]
+                                            ))
+                                            .unwrap(),
+                                        1
+                                    );
+                                }
+                            }
+                        }
+                    })
+                })
+                .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let heap = rt.block_on(engine.scan("t")).unwrap();
+        assert_eq!(heap.len(), (WORKERS * ROWS) as usize);
+        for key in 0..64 {
+            let value = Value::Int64(key);
+            let mut expected: Vec<Row> = heap
+                .iter()
+                .filter(|row| row[1].loose_eq(&value))
+                .cloned()
+                .collect();
+            let mut actual = rt
+                .block_on(engine.index_lookup("t", "secondary", &value))
+                .unwrap()
+                .unwrap();
+            let sort = |a: &Row, b: &Row| a[0].to_string().cmp(&b[0].to_string());
+            expected.sort_by(sort);
+            actual.sort_by(sort);
+            assert_eq!(
+                actual, expected,
+                "numeric secondary key {key} lost or duplicated rows after relocation"
+            );
+        }
     }
 }
 

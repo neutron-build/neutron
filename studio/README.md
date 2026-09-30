@@ -264,6 +264,15 @@ expressions, expression indexes) refers to. Column types outside the
 document contract (`serial`, `char`, `time`, …) are refused with the
 accepted vocabulary; the SQL editor remains the surface for those.
 
+Launch with `neutron studio --schema neutron.schema.json` to bind designer edits
+to the document's ownership. Studio also uses `migrations.schema` when its file
+exists (default `neutron.schema.json`). Objects declared `managed: false` cannot
+be created, altered or dropped in the designer, even with destructive approval.
+The file applies to every connection in the launch and is reread at preview and
+apply; a missing or invalid bound file refuses planning. Without a schema file,
+the designer plans explicit edits to live objects. The SQL editor runs explicit
+SQL independently of this schema ownership boundary.
+
 `POST /api/schema/apply` executes a reviewed plan only:
 
 - it takes the migration runner's advisory lock (a running migration or
@@ -338,7 +347,8 @@ limits above it; the commit bar says "atomic" only when the SQL limits say
   measured on the build recorded in
   `conformance/live/orm/capabilities.nucleus.json` (the capability report
   and the X01-X05 conformance legs). SQL is `partial`: DML commits and rolls
-  back, DDL does not, isolation levels and `READ ONLY` are not applied.
+  back, DDL does not; `READ COMMITTED` is supported, higher isolation levels
+  are refused, and `READ ONLY` rejects the measured writes.
   Documents and graph nodes roll back but are visible to other sessions
   before `COMMIT`; CDC and pub/sub are not transactional; COLUMNAR_* inserts
   are refused inside transactions. Anything not measured is `unknown`.
@@ -426,7 +436,7 @@ published CLI targets) and onboarding on Linux.
 - **Open items** (each fails safely; tracked, not fixed):
   - On a table whose `AFTER` trigger updates the row it fired for, two edits
     of one row in one batch conflict (409). Commit them in separate batches.
-  - The CDC and Streams modules have form labels that name no control.
+  - CDC and Streams form labels target their controls with IDs unique to each mounted module.
   - The MCP server's read-only default is best-effort on Nucleus (see
     `neutron mcp` in the CLI reference).
 

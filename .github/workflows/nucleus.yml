@@ -42,6 +42,26 @@ jobs:
         run: cargo build
         working-directory: nucleus
 
+      # Attributed binaries let reviewers run live probes without rebuilding
+      # on a workstation constrained by disk space. These are CI artifacts,
+      # not published releases.
+      - name: Record validation binary source
+        if: github.event_name == 'pull_request'
+        run: |
+          git rev-parse HEAD > nucleus/target/debug/source-commit.txt
+          git rev-parse HEAD^{tree} > nucleus/target/debug/source-tree.txt
+
+      - name: Upload validation binary
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nucleus-validation-${{ matrix.os }}
+          path: |
+            nucleus/target/debug/nucleus
+            nucleus/target/debug/source-commit.txt
+            nucleus/target/debug/source-tree.txt
+          retention-days: 3
+
       # Reports target/ sizes on every run so growth is visible in the log, and
       # fails past a ceiling. Nothing prunes target/; nucleus/target/debug once
       # reached 60 GB and took a machine to zero bytes free. A-017.

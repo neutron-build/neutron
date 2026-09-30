@@ -186,6 +186,34 @@ impl Executor {
         // The catalog key is the canonical (already case-resolved) name, so it
         // must be quoted back verbatim rather than re-folded by the parser.
         let target = table.split('.').map(quote).collect::<Vec<_>>().join(".");
+        // COPY without a column list skips stored generated columns (they are
+        // computed), as PostgreSQL does.
+        let default_columns: Option<Vec<String>> = match columns {
+            Some(cols) if !cols.is_empty() => None,
+            _ => self.catalog.get_table_cached(table).and_then(|def| {
+                def.columns
+                    .iter()
+                    .any(|c| {
+                        matches!(
+                            c.generation,
+                            Some(crate::catalog::ColumnGeneration::Stored(_))
+                        )
+                    })
+                    .then(|| {
+                        def.columns
+                            .iter()
+                            .filter(|c| {
+                                !matches!(
+                                    c.generation,
+                                    Some(crate::catalog::ColumnGeneration::Stored(_))
+                                )
+                            })
+                            .map(|c| c.name.clone())
+                            .collect()
+                    })
+            }),
+        };
+        let columns = default_columns.as_deref().or(columns);
         let col_clause = match columns {
             Some(cols) if !cols.is_empty() => format!(
                 " ({})",
@@ -200,6 +228,8 @@ impl Executor {
                 "COPY target is not a valid insert target: {table}"
             )));
         };
+        // COPY writes identity columns as given, like OVERRIDING SYSTEM VALUE.
+        insert.priority = Some(ast::MysqlInsertPriority::HighPriority);
         let value_rows: Vec<Vec<ast::Expr>> = rows
             .into_iter()
             .map(|fields| fields.into_iter().map(copy_field_expr).collect())

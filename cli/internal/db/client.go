@@ -98,8 +98,9 @@ func (c *Client) BeginTx(ctx context.Context) (pgx.Tx, error) {
 // ReadOnlyTx runs fn inside a READ ONLY transaction on one dedicated
 // connection and always rolls back: inspection reads run under the
 // server's own write refusal (PostgreSQL rejects writes with 25006).
-// Engines that do not apply READ ONLY (Nucleus: capability report
-// txn.read_only_rejects_writes) need a separate guard.
+// Nucleus inspection additionally applies a lexical guard; measured SQL
+// writes and NEXTVAL wrappers are refused by its READ ONLY transaction,
+// while unverified specialty paths must not assume complete protection.
 //
 // discardSession: a rolled-back transaction does not undo session-level
 // effects (a session advisory lock taken by the statement, a dblink

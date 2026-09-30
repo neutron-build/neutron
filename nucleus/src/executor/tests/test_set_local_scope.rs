@@ -527,9 +527,13 @@ async fn panic_unwinding_through_the_guard_restores_state() {
     let login = user(&ex, sid).await;
     let session = ex.get_session(sid);
 
+    let mut block = super::super::ImplicitTxnBlock::new(&ex, session.clone(), true);
+    crate::executor::CURRENT_SESSION
+        .scope(session.clone(), block.open_if_needed())
+        .await
+        .unwrap();
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        let mut block = super::super::ImplicitSetBlock::new(&ex, session.clone(), true);
-        block.open_if_needed();
+        let _block = &mut block;
         session.guc_note_role(true);
         *session.current_role.write() = Some("n1_app".into());
         session.guc_note_setting("app.tenant", true);
@@ -542,6 +546,7 @@ async fn panic_unwinding_through_the_guard_restores_state() {
         panic!("statement panicked inside the guarded region");
     }));
     assert!(outcome.is_err());
+    drop(block);
     assert_eq!(session.current_role.read().clone(), None);
     assert!(session.settings.read().get("app.tenant").is_none());
     assert!(!session.guc_in_txn(), "the implicit frame was closed");

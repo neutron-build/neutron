@@ -706,11 +706,11 @@ func (s *Server) handleQueryExplain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if isNucleus {
-		// No conformance evidence yet for Nucleus EXPLAIN (plan shape,
-		// read-only transactions, non-execution of mutations), so Studio
+		// No conformance evidence yet for Nucleus EXPLAIN (PostgreSQL
+		// FORMAT JSON plan shape and non-execution), so Studio
 		// does not offer it rather than guessing its semantics.
 		unprocessable("unsupported",
-			"EXPLAIN is not available for Nucleus connections in Studio: the engine's plan format and its read-only guarantees are not yet verified by the conformance suite",
+			"EXPLAIN is not available for Nucleus connections in Studio: PostgreSQL EXPLAIN (FORMAT JSON) output and non-execution are not yet verified by the conformance suite",
 			map[string]any{"engine": "nucleus"})
 		return
 	}

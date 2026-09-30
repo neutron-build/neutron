@@ -1,4 +1,4 @@
-//! Tests that specialty indexes (IvfFlat, encrypted) survive a server restart.
+//! Tests specialty-index recovery and explicit retirement of insecure legacy indexes.
 //!
 //! Each test simulates a restart by dropping the first `Executor` and opening a
 //! new one from the same directory, then calling `rebuild_specialty_indexes()`.
@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use super::super::Executor;
+use super::super::{ExecError, Executor};
 use super::{exec, rows, scalar};
 use crate::catalog::Catalog;
 use crate::storage::persistence::CatalogPersistence;
@@ -356,40 +356,66 @@ async fn test_kv_write_is_fsync_durable_on_ack() {
 // ── Encrypted index persistence ───────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_encrypted_index_survives_restart() {
+async fn test_legacy_encrypted_index_is_retired_without_losing_base_rows() {
     let dir = tempfile::tempdir().unwrap();
-
-    // Use a 32-byte key via env var
-    // SAFETY: single-threaded test; no other thread reads this env var.
-    unsafe {
-        std::env::set_var("NUCLEUS_ENCRYPTION_KEY", "abcdefghijklmnopqrstuvwxyz012345");
-    }
-
     {
         let ex = open_executor(dir.path()).await;
         exec(&ex, "CREATE TABLE secrets (id INT, token TEXT)").await;
-        exec(&ex, "INSERT INTO secrets VALUES (1, 'alpha')").await;
-        exec(&ex, "INSERT INTO secrets VALUES (2, 'beta')").await;
-        exec(&ex, "INSERT INTO secrets VALUES (3, 'gamma')").await;
         exec(
             &ex,
-            "CREATE INDEX idx_secrets_token ON secrets USING ENCRYPTED (token)",
+            "INSERT INTO secrets VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')",
         )
         .await;
+        let error = ex
+            .execute("CREATE INDEX refused_secret ON secrets USING ENCRYPTED (token)")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ExecError::Unsupported(ref message) if message == crate::storage::encrypted_index::UNSUPPORTED_ENCRYPTION)
+        );
+        assert!(ex.catalog.get_indexes("secrets").await.is_empty());
+        // Simulate a persisted legacy definition without process environment mutation.
+        exec(&ex, "CREATE INDEX legacy_secret ON secrets (token)").await;
+        let mut legacy = ex
+            .catalog
+            .get_indexes("secrets")
+            .await
+            .into_iter()
+            .find(|index| index.name == "legacy_secret")
+            .unwrap()
+            .as_ref()
+            .clone();
+        legacy
+            .options
+            .insert("encryption_mode".into(), "Deterministic".into());
+        ex.catalog.drop_index("legacy_secret").await.unwrap();
+        ex.catalog.create_index(legacy).await.unwrap();
+        CatalogPersistence::new(&dir.path().join("catalog.json"))
+            .save_catalog(&ex.catalog)
+            .await
+            .unwrap();
     }
-
-    {
-        let ex = open_executor(dir.path()).await;
-
-        // Table data and encrypted index both survive
-        let r = exec(&ex, "SELECT COUNT(*) FROM secrets").await;
-        let count = match rows(&r[0]).first().and_then(|row| row.first()) {
-            Some(Value::Int64(n)) => *n,
-            Some(Value::Int32(n)) => *n as i64,
-            _ => -1,
-        };
-        assert_eq!(count, 3, "secrets table should have 3 rows after restart");
-    }
+    let ex = open_executor(dir.path()).await;
+    assert!(
+        ex.encrypted_indexes.read().is_empty(),
+        "legacy token prototype was reconstructed as encryption"
+    );
+    let result = exec(&ex, "SELECT id, token FROM secrets ORDER BY id").await;
+    assert_eq!(
+        rows(&result[0]),
+        &vec![
+            vec![Value::Int32(1), Value::Text("alpha".into())],
+            vec![Value::Int32(2), Value::Text("beta".into())],
+            vec![Value::Int32(3), Value::Text("gamma".into())]
+        ]
+    );
+    let error = ex
+        .execute("SELECT ENCRYPTED_LOOKUP('legacy_secret', 'alpha')")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, ExecError::Unsupported(ref message) if message == crate::storage::encrypted_index::UNSUPPORTED_ENCRYPTION)
+    );
 }
 
 // ── Table-attached FTS persistence ────────────────────────────────────────────
@@ -944,5 +970,153 @@ async fn doc_sql_writes_fail_loudly_when_the_wal_append_fails() {
     assert!(
         ex.doc_store.read().get(id as u64).is_some(),
         "the acknowledged document must still exist after reopen"
+    );
+}
+
+fn fts_checkpoint_recovery_must_refuse_invalid_existing_base(unreadable: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog_path = dir.path().join("catalog.json");
+    let checkpoint = dir.path().join("fts_index.json");
+    // Missing checkpoint is valid on a fresh durable instance.
+    let fresh = Executor::new_with_persistence(
+        Arc::new(Catalog::new()),
+        Arc::new(crate::storage::MemoryEngine::new()),
+        Some(catalog_path.clone()),
+        Some(dir.path()),
+    );
+    assert_eq!(fresh.fts_index().read().doc_count(), 0);
+    fresh
+        .fts_index()
+        .write()
+        .add_document(41, "checkpoint-only document");
+    fresh.save_fts_index().unwrap();
+    assert_eq!(fresh.fts_index().read().doc_count(), 1);
+    drop(fresh);
+    // Checkpointing consumed the tail: fallback cannot reconstruct this document.
+    let (_wal, state) = crate::fts::fts_wal::FtsWal::open(&dir.path().join("fts")).unwrap();
+    assert!(state.docs.is_empty());
+    drop(_wal);
+    if unreadable {
+        std::fs::remove_file(&checkpoint).unwrap();
+        std::fs::create_dir(&checkpoint).unwrap();
+        std::fs::write(
+            checkpoint.join("retained-marker"),
+            b"do not replace this directory",
+        )
+        .unwrap();
+    } else {
+        std::fs::write(&checkpoint, b"{ corrupt checkpoint bytes").unwrap();
+    }
+    let reopened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Executor::new_with_persistence(
+            Arc::new(Catalog::new()),
+            Arc::new(crate::storage::MemoryEngine::new()),
+            Some(catalog_path),
+            Some(dir.path()),
+        )
+    }));
+    assert!(
+        reopened.is_err(),
+        "invalid checkpoint recovery served an incomplete FTS index"
+    );
+    if unreadable {
+        assert!(checkpoint.is_dir());
+        assert_eq!(
+            std::fs::read(checkpoint.join("retained-marker")).unwrap(),
+            b"do not replace this directory"
+        );
+    } else {
+        assert_eq!(
+            std::fs::read(&checkpoint).unwrap(),
+            b"{ corrupt checkpoint bytes"
+        );
+    }
+}
+
+#[test]
+fn fts_corrupt_checkpoint_refuses_incomplete_wal_tail_recovery() {
+    fts_checkpoint_recovery_must_refuse_invalid_existing_base(false);
+}
+
+#[test]
+fn fts_unreadable_checkpoint_refuses_incomplete_wal_tail_recovery() {
+    fts_checkpoint_recovery_must_refuse_invalid_existing_base(true);
+}
+
+#[test]
+fn fts_fallible_recovery_keeps_checkpoint_tail_and_future_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog_path = dir.path().join("catalog.json");
+    let open = || {
+        Executor::try_new_with_persistence(
+            Arc::new(Catalog::new()),
+            Arc::new(crate::storage::MemoryEngine::new()),
+            Some(catalog_path.clone()),
+            Some(dir.path()),
+        )
+    };
+    let initial = open().unwrap();
+    initial
+        .fts_index()
+        .write()
+        .add_document(1, "checkpointbase");
+    initial.save_fts_index().unwrap();
+    initial.fts_index().write().add_document(2, "waltail");
+    initial.fts_index().read().wal_group_sync().unwrap();
+    drop(initial);
+    let reopened = open().unwrap();
+    assert_eq!(reopened.fts_index().read().doc_count(), 2);
+    reopened.fts_index().write().add_document(3, "afterrestart");
+    reopened.fts_index().read().wal_group_sync().unwrap();
+    drop(reopened);
+    let twice = open().unwrap();
+    assert_eq!(twice.fts_index().read().doc_count(), 3);
+    for (id, term) in [(1, "checkpointbase"), (2, "waltail"), (3, "afterrestart")] {
+        let ids: Vec<_> = twice
+            .fts_index()
+            .read()
+            .search_scored(term, 10)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec![id]);
+    }
+    drop(twice);
+    let checkpoint = dir.path().join("fts_index.json");
+    std::fs::write(&checkpoint, b"broken-base").unwrap();
+    let refused = open();
+    assert!(
+        matches!(refused, Err(ExecError::Storage(crate::storage::StorageError::Io(ref message)))
+        if message.contains("FTS checkpoint") && message.contains("recovery refused"))
+    );
+    assert_eq!(std::fs::read(checkpoint).unwrap(), b"broken-base");
+}
+
+#[test]
+fn fts_unopenable_wal_refuses_persistent_executor_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let obstructed_wal = dir.path().join("fts").join("fts.wal");
+    std::fs::create_dir_all(&obstructed_wal).unwrap();
+    std::fs::write(
+        obstructed_wal.join("retained-marker"),
+        b"preserve WAL obstruction",
+    )
+    .unwrap();
+    let reopened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Executor::new_with_persistence(
+            Arc::new(Catalog::new()),
+            Arc::new(crate::storage::MemoryEngine::new()),
+            Some(dir.path().join("catalog.json")),
+            Some(dir.path()),
+        )
+    }));
+    assert!(
+        reopened.is_err(),
+        "declared durable FTS recovery returned a volatile index after WAL open failure"
+    );
+    assert!(obstructed_wal.is_dir());
+    assert_eq!(
+        std::fs::read(obstructed_wal.join("retained-marker")).unwrap(),
+        b"preserve WAL obstruction"
     );
 }

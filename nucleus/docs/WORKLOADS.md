@@ -34,7 +34,7 @@ churn, leak-free steady state, and recovery after the run.
 inserts with the rest split across update/select/kv/delete
 (`src/bin/probe_soak.rs`; workers' op mix at `:215-289`). Post-run coherence
 checks PK point lookups against same-key range scans and seq scans (with a
-discriminator that names the failing mechanism), encrypted-index postings, and
+discriminator that names the failing mechanism), and
 — because the `val` secondary index is the dense duplicate-key regime
 (64 distinct values across every row) — per-value agreement between the index
 path (`WHERE val = v`) and the heap path (`val + 0`). Defaults:

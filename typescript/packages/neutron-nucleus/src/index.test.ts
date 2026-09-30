@@ -1590,6 +1590,22 @@ describe("migrate", () => {
     assert.deepEqual(ran, ["create_users", "add_email", "create_posts"]);
   });
 
+  it("records the SQL actually executed when caller records change during execution", async () => {
+    const migration: Migration = { version: 1, name: "first", up: "SELECT 1" };
+    const execute = transport.execute.bind(transport);
+    transport.execute = async (sql, params) => {
+      const result = await execute(sql, params);
+      if (sql === "SELECT 1") Object.assign(migration, { version: 9, name: "changed", up: "SELECT 999" });
+      return result;
+    };
+    const ran = await migrate(transport, [migration]);
+    const inserted = transport.calls.find((c) => c.method === "execute" &&
+      String(c.args[0]).startsWith("INSERT INTO _neutron_migrations "));
+    assert.ok(inserted);
+    assert.deepEqual((inserted.args[1] as unknown[]).slice(0, 3), [1, "first", migrationChecksum("SELECT 1")]);
+    assert.deepEqual(ran, ["first"]);
+  });
+
   it("skips already applied migrations", async () => {
     transport.onQuery("SELECT version", [v2Row(migrations[0])]);
     const ran = await migrate(transport, migrations);
@@ -1715,6 +1731,27 @@ describe("migrateDown", () => {
 });
 
 describe("adoptMigrations", () => {
+  it("validates the captured plan when caller records change during preflight", async () => {
+    const transport = new MockTransport();
+    transport.executeResult = 1;
+    const migration: Migration = { version: 1, name: "first", up: "SELECT 1" };
+    transport.onFetchval("SELECT EXISTS", 1);
+    transport.onQuery("SELECT version, name", [
+      { version: 1, name: "first", checksum: legacyGoSdkChecksum(1, "first", "SELECT 1") },
+    ]);
+    const query = transport.query.bind(transport);
+    transport.query = async <T>(sql: string, params?: unknown[]) => {
+      const result = await query<T>(sql, params);
+      if (sql.startsWith("SELECT version, name")) migration.up = "SELECT 999";
+      return result;
+    };
+    assert.deepEqual(await adoptMigrations(transport, [migration]), { verified: [1], unverified: [] });
+    const update = transport.calls.find((c) => c.method === "execute" &&
+      String(c.args[0]).startsWith("UPDATE _neutron_migrations SET checksum"));
+    assert.ok(update);
+    assert.equal((update.args[1] as unknown[])[0], migrationChecksum("SELECT 1"));
+  });
+
   it("verifies rows whose legacy Go SDK digest reproduces from the plan", async () => {
     const transport = new MockTransport();
     transport.executeResult = 1;

@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import { runWithRequestCache } from "./request-cache.js";
 import {
   renderAppRoute,
   emitHook,
@@ -36,6 +37,7 @@ import {
   type CorsOptions,
 } from "./http-headers.js";
 import {
+  assertAtomicCacheStore,
   createMemoryAppCacheStore,
   createMemoryLoaderCacheStore,
   type NeutronAppCacheStore,
@@ -391,6 +393,8 @@ export async function createServer(
   // the Vite SSR runtime, serves assets, and registers the HTML catch-all. "api"/"raw"
   // skip all of it (no fs walk, no hard-fail on a missing routes dir).
   const isSsr = mode === "ssr";
+  if (cache?.app) assertAtomicCacheStore(cache.app);
+  if (cache?.loader) assertAtomicCacheStore(cache.loader);
 
   const routes = isSsr ? discoverRoutes({ routesDir: resolvedRoutesDir }) : [];
   const router = createRouter();
@@ -465,6 +469,7 @@ export async function createServer(
   }
 
   const app = new Hono<{ Variables: { requestId: string } }>();
+  app.use("*", (_c, next) => runWithRequestCache(next));
 
   // FRAMEWORK_CONTRACT.md §2: errors are RFC 7807 problem+json. A ProblemError
   // thrown from a route mounted directly on the Hono app (api/raw mode, or
@@ -878,8 +883,8 @@ export async function createServer(
         // in-flight cacheable GET that started before this mutation must not
         // publish its (now stale) fill afterwards.
         appCacheEpoch++;
-        await appResponseCacheStore.deleteByPath(effectivePathname);
-        await loaderDataCacheStore.deleteByPath(effectivePathname);
+        await appResponseCacheStore.deleteByPath(encodeCacheInvalidationPath(effectivePathname));
+        await loaderDataCacheStore.deleteByPath(encodeCacheInvalidationPath(effectivePathname));
       }
 
       const appCacheMaxAge = match.route.config.cache?.maxAge ?? 0;
@@ -897,6 +902,8 @@ export async function createServer(
       const cacheReadsPermitted =
         appCacheKey !== null && (method === "GET" || method === "HEAD");
       const requestEpoch = appCacheEpoch;
+      const appGeneration = await appResponseCacheStore.getGeneration!();
+      const loaderGeneration = await loaderDataCacheStore.getGeneration!();
 
       // The shared-cache boundary is applied INSIDE the route middleware
       // chain (see renderAppRoute): a cache hit still executes every request
@@ -933,7 +940,8 @@ export async function createServer(
                 response,
                 appCacheMaxAge,
                 c.req.raw.headers.get("cache-control"),
-                () => appCacheEpoch === requestEpoch
+                () => appCacheEpoch === requestEpoch,
+                appGeneration
               ).catch(() => {});
               appPendingStores.set(appCacheKey, store);
               void store.then(() => {
@@ -961,7 +969,7 @@ export async function createServer(
         // epoch is captured per request and re-checked immediately before a
         // loader result is committed, so a GET that began before a mutation
         // completed cannot republish the pre-mutation loader data.
-        { stillValid: () => appCacheEpoch === requestEpoch }
+        { stillValid: () => appCacheEpoch === requestEpoch, generation: loaderGeneration }
       );
 
       if (isMutationMethod(method)) {
@@ -971,6 +979,11 @@ export async function createServer(
         // this final delete. The pre-mutation bump alone fenced only GETs
         // that began before the mutation.
         appCacheEpoch++;
+        // GETs may have published old data after the start invalidation while
+        // the action was running. Evict those entries and fence remote fills
+        // at completion even when the action emits no invalidation header.
+        await appResponseCacheStore.deleteByPath(encodeCacheInvalidationPath(effectivePathname));
+        await loaderDataCacheStore.deleteByPath(encodeCacheInvalidationPath(effectivePathname));
         await applyMutationInvalidationFromResponse(
           appResponseCacheStore,
           effectivePathname,
@@ -1189,6 +1202,7 @@ async function handleAppRouteRequest(
     store: (response: Response) => void;
   },
   loaderCacheFence?: {
+    generation?: string;
     stillValid: () => boolean;
   }
 ): Promise<Response> {
@@ -1547,6 +1561,14 @@ function requestCarriesCredentials(request: Request): boolean {
 
 
 
+/** Stores accept URL-encoded paths and decode exactly once. The router and
+ * explicit invalidation parsing already produced decoded canonical paths;
+ * re-encode their segments to preserve literal percent and reserved characters.
+ */
+function encodeCacheInvalidationPath(pathname: string): string {
+  return pathname.split('/').map(segment => encodeURIComponent(segment)).join('/');
+}
+
 async function applyMutationInvalidationFromResponse(
   cache: NeutronAppCacheStore,
   pathname: string,
@@ -1573,13 +1595,13 @@ async function applyMutationInvalidationFromResponse(
     }
 
     if (token === "self") {
-      await cache.deleteByPath(pathname);
+      await cache.deleteByPath(encodeCacheInvalidationPath(pathname));
       continue;
     }
 
     const normalized = normalizePathname(token);
     if (normalized) {
-      await cache.deleteByPath(normalized);
+      await cache.deleteByPath(encodeCacheInvalidationPath(normalized));
     }
   }
 }
@@ -1610,13 +1632,13 @@ async function applyMutationInvalidationToLoaderDataCache(
     }
 
     if (token === "self") {
-      await cache.deleteByPath(pathname);
+      await cache.deleteByPath(encodeCacheInvalidationPath(pathname));
       continue;
     }
 
     const normalized = normalizePathname(token);
     if (normalized) {
-      await cache.deleteByPath(normalized);
+      await cache.deleteByPath(encodeCacheInvalidationPath(normalized));
     }
   }
 }
@@ -1690,7 +1712,8 @@ async function maybeStoreAppResponse(
   response: Response,
   maxAgeSec: number,
   requestCacheControl: string | null,
-  stillValid: () => boolean
+  stillValid: () => boolean,
+  generation: string
 ): Promise<void> {
   if (maxAgeSec <= 0 || response.status !== 200) {
     return;
@@ -1787,13 +1810,13 @@ async function maybeStoreAppResponse(
     headerPairs.push([name, value]);
   });
 
-  await cache.set(key, {
+  await cache.setIfGeneration!(key, {
     status: response.status,
     statusText: response.statusText,
     headers: headerPairs,
     body,
     expiresAt: Date.now() + effectiveMaxAge * 1000,
-  });
+  }, generation);
 }
 
 function tryReadStaticHtml(distDir: string, pathname: string): string | null {
@@ -1833,6 +1856,10 @@ async function createSsrServer(
     const viteServer = await vite.createServer(
       vite.mergeConfig(userConfig, {
         root: rootDir,
+        // Fixtures and apps without their own package.json otherwise inherit
+        // an ancestor's node_modules/.vite directory. Different roots can
+        // then clear one another's optimizer cache during concurrent startup.
+        cacheDir: userConfig.cacheDir ?? path.join(rootDir, ".neutron", "vite-ssr"),
         plugins: [neutronPlugin({ routesDir })],
         ...(runtimeAliases ? { resolve: { alias: runtimeAliases } } : {}),
         ...(runtimeNoExternal.length > 0

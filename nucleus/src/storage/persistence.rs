@@ -14,7 +14,8 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::{
-    Catalog, ColumnDef, FkAction, IndexDef, IndexType, TableConstraint, TableDef,
+    Catalog, ColumnDef, ColumnGeneration, Deferrable, FkAction, IndexDef, IndexType,
+    TableConstraint, TableDef,
 };
 use crate::types::DataType;
 
@@ -67,6 +68,51 @@ struct ColumnDefSer {
     /// and a deserialize failure degrades to an empty catalog.
     #[serde(default)]
     id: u32,
+    /// Stored generation expression (`GENERATED ALWAYS AS (expr) STORED`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    generated: Option<String>,
+    /// Identity kind: `"always"` or `"by_default"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity: Option<String>,
+    /// Declared `varchar(n)` / `char(n)` length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_len: Option<u32>,
+}
+
+fn generation_to_ser(g: &Option<ColumnGeneration>) -> (Option<String>, Option<String>) {
+    match g {
+        Some(ColumnGeneration::Stored(expr)) => (Some(expr.clone()), None),
+        Some(ColumnGeneration::IdentityAlways) => (None, Some("always".into())),
+        Some(ColumnGeneration::IdentityByDefault) => (None, Some("by_default".into())),
+        None => (None, None),
+    }
+}
+
+fn generation_from_ser(c: &ColumnDefSer) -> Option<ColumnGeneration> {
+    if let Some(expr) = &c.generated {
+        return Some(ColumnGeneration::Stored(expr.clone()));
+    }
+    match c.identity.as_deref() {
+        Some("always") => Some(ColumnGeneration::IdentityAlways),
+        Some("by_default") => Some(ColumnGeneration::IdentityByDefault),
+        _ => None,
+    }
+}
+
+fn deferrable_to_string(d: &Deferrable) -> Option<String> {
+    match d {
+        Deferrable::NotDeferrable => None,
+        Deferrable::InitiallyImmediate => Some("immediate".into()),
+        Deferrable::InitiallyDeferred => Some("deferred".into()),
+    }
+}
+
+fn string_to_deferrable(s: &Option<String>) -> Deferrable {
+    match s.as_deref() {
+        Some("immediate") => Deferrable::InitiallyImmediate,
+        Some("deferred") => Deferrable::InitiallyDeferred,
+        _ => Deferrable::NotDeferrable,
+    }
 }
 
 /// Serializable representation of a table constraint.
@@ -95,6 +141,8 @@ enum TableConstraintSer {
         on_delete: String,
         #[serde(default = "default_fk_action_str")]
         on_update: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deferrable: Option<String>,
     },
 }
 
@@ -143,6 +191,16 @@ struct TableEngineSer {
     count_columns: Vec<String>,
 }
 
+/// Serializable form of a column's declared PostgreSQL type. See
+/// [`crate::catalog::DeclaredType`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeclaredTypeSer {
+    table: String,
+    column_id: u32,
+    typname: String,
+    typmod: i32,
+}
+
 /// The full catalog snapshot, serializable to JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CatalogSnapshot {
@@ -158,6 +216,10 @@ struct CatalogSnapshot {
     /// the loaded tables' epochs.
     #[serde(default)]
     next_table_epoch: u64,
+    /// Declared PostgreSQL types of columns whose `DataType` is coarser than
+    /// the declaration (varchar(n), smallint, ...). Absent in older files.
+    #[serde(default)]
+    declared_types: Vec<DeclaredTypeSer>,
 }
 
 /// Convert an internal `DataType` to its string representation for persistence.
@@ -268,6 +330,7 @@ fn constraint_to_ser(c: &TableConstraint) -> TableConstraintSer {
             ref_columns,
             on_delete,
             on_update,
+            deferrable,
         } => TableConstraintSer::ForeignKey {
             name: name.clone(),
             columns: columns.clone(),
@@ -275,6 +338,7 @@ fn constraint_to_ser(c: &TableConstraint) -> TableConstraintSer {
             ref_columns: ref_columns.clone(),
             on_delete: fk_action_to_string(on_delete),
             on_update: fk_action_to_string(on_update),
+            deferrable: deferrable_to_string(deferrable),
         },
     }
 }
@@ -301,6 +365,7 @@ fn ser_to_constraint(c: &TableConstraintSer) -> TableConstraint {
             ref_columns,
             on_delete,
             on_update,
+            deferrable,
         } => TableConstraint::ForeignKey {
             name: name.clone(),
             columns: columns.clone(),
@@ -308,6 +373,7 @@ fn ser_to_constraint(c: &TableConstraintSer) -> TableConstraint {
             ref_columns: ref_columns.clone(),
             on_delete: string_to_fk_action(on_delete),
             on_update: string_to_fk_action(on_update),
+            deferrable: string_to_deferrable(deferrable),
         },
     }
 }
@@ -348,6 +414,9 @@ impl CatalogPersistence {
                             nullable: c.nullable,
                             default_expr: c.default_expr.clone(),
                             id: c.id,
+                            generated: generation_to_ser(&c.generation).0,
+                            identity: generation_to_ser(&c.generation).1,
+                            max_len: c.max_len,
                         })
                         .collect(),
                     constraints: t.constraints.iter().map(constraint_to_ser).collect(),
@@ -388,6 +457,16 @@ impl CatalogPersistence {
                 specs
             },
             next_table_epoch: catalog.peek_next_table_epoch(),
+            declared_types: catalog
+                .declared_types_snapshot()
+                .into_iter()
+                .map(|(table, column_id, d)| DeclaredTypeSer {
+                    table,
+                    column_id,
+                    typname: d.typname,
+                    typmod: d.typmod,
+                })
+                .collect(),
         };
 
         let json = serde_json::to_string_pretty(&snapshot)
@@ -428,6 +507,8 @@ impl CatalogPersistence {
                         default_expr: c.default_expr.clone(),
                         id: c.id,
                         analyzer: None,
+                        generation: generation_from_ser(c),
+                        max_len: c.max_len,
                     })
                 })
                 .collect();
@@ -457,6 +538,17 @@ impl CatalogPersistence {
 
         let max_epoch = snapshot.tables.iter().map(|t| t.epoch).max().unwrap_or(0);
         catalog.restore_table_epoch_counter(snapshot.next_table_epoch.max(max_epoch + 1));
+
+        for d in &snapshot.declared_types {
+            catalog.set_declared_type(
+                &d.table,
+                d.column_id,
+                crate::catalog::DeclaredType {
+                    typname: d.typname.clone(),
+                    typmod: d.typmod,
+                },
+            );
+        }
 
         for e in &snapshot.table_engines {
             catalog.set_table_engine(
@@ -512,6 +604,8 @@ impl CatalogPersistence {
                         default_expr: c.default_expr.clone(),
                         id: c.id,
                         analyzer: None,
+                        generation: generation_from_ser(c),
+                        max_len: c.max_len,
                     })
                 })
                 .collect();
@@ -544,6 +638,17 @@ impl CatalogPersistence {
         // (defends against a pre-v2 file that has table epochs but no counter).
         let max_epoch = snapshot.tables.iter().map(|t| t.epoch).max().unwrap_or(0);
         catalog.restore_table_epoch_counter(snapshot.next_table_epoch.max(max_epoch + 1));
+
+        for d in &snapshot.declared_types {
+            catalog.set_declared_type(
+                &d.table,
+                d.column_id,
+                crate::catalog::DeclaredType {
+                    typname: d.typname.clone(),
+                    typmod: d.typmod,
+                },
+            );
+        }
 
         for e in &snapshot.table_engines {
             catalog.set_table_engine(
@@ -1002,6 +1107,8 @@ mod tests {
                         default_expr: None,
                         id: 0,
                         analyzer: None,
+                        generation: None,
+                        max_len: None,
                     },
                     ColumnDef {
                         name: "email".into(),
@@ -1010,6 +1117,8 @@ mod tests {
                         default_expr: None,
                         id: 0,
                         analyzer: None,
+                        generation: None,
+                        max_len: None,
                     },
                     ColumnDef {
                         name: "active".into(),
@@ -1018,6 +1127,8 @@ mod tests {
                         default_expr: Some("true".into()),
                         id: 0,
                         analyzer: None,
+                        generation: None,
+                        max_len: None,
                     },
                 ],
                 constraints: vec![TableConstraint::PrimaryKey {
@@ -1041,6 +1152,8 @@ mod tests {
                         default_expr: None,
                         id: 0,
                         analyzer: None,
+                        generation: None,
+                        max_len: None,
                     },
                     ColumnDef {
                         name: "amount".into(),
@@ -1049,6 +1162,8 @@ mod tests {
                         default_expr: None,
                         id: 0,
                         analyzer: None,
+                        generation: None,
+                        max_len: None,
                     },
                     ColumnDef {
                         name: "tags".into(),
@@ -1057,6 +1172,8 @@ mod tests {
                         default_expr: None,
                         id: 0,
                         analyzer: None,
+                        generation: None,
+                        max_len: None,
                     },
                 ],
                 constraints: vec![],
@@ -1527,6 +1644,8 @@ mod tests {
                         default_expr: None,
                         id: 0,
                         analyzer: None,
+                        generation: None,
+                        max_len: None,
                     }],
                     constraints: vec![],
                     append_only: false,

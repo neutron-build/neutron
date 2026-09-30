@@ -59,6 +59,8 @@ type Server struct {
 	// migrationsDir is the application's migrations directory for the X06
 	// journey's migrations stage ("" = applied history only).
 	migrationsDir string
+	// schemaSource binds schema ownership to a server-side v2 document.
+	schemaSource string
 }
 
 // NewServer creates and configures the Studio server on the given port.

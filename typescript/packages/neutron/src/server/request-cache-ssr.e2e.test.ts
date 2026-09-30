@@ -1,0 +1,68 @@
+import { once } from 'node:events';
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
+import { expect, it } from 'vitest';
+import { decodeSerializedPayload } from '../core/serialization.js';
+import { createServer } from './index.js';
+
+it('shares request scope with cached functions loaded through the real SSR runtime', async () => {
+  const root = await fs.mkdtemp(path.join(process.cwd(), '.tmp-neutron-request-scope-'));
+  await fs.mkdir(path.join(root, 'src/routes'), { recursive: true });
+  await fs.writeFile(path.join(root, 'src/routes/value.ts'), `
+    import { cache } from '@neutron-build/core';
+    let calls = 0;
+    const read = cache(async () => ++calls);
+    export const config = { mode: 'app' };
+    export async function loader() {
+      const first = read(); const second = read();
+      return { value: await first, same: first === second };
+    }
+    export default function Page() { return null; }
+  `);
+  const running = await createServer({ rootDir: root, host: '127.0.0.1', port: 0, compress: false });
+  try {
+    if (!running.server.listening) await once(running.server, 'listening');
+    const address = running.server.address();
+    if (!address || typeof address === 'string') throw new Error('No HTTP port');
+    for (const value of [1, 2]) {
+      const response = await fetch(`http://127.0.0.1:${address.port}/value`, { headers: { Accept: 'application/json' } });
+      const payload = decodeSerializedPayload<Record<string, unknown>>(await response.json());
+      expect(Object.values(payload)[0]).toEqual({ value, same: true });
+    }
+  } finally { await running.close(); await fs.rm(root, { recursive: true, force: true }); }
+});
+
+
+it('invalidates shared cached SSR values through the HTTP adapter module graph', async () => {
+  const root = await fs.mkdtemp(path.join(process.cwd(), '.tmp-neutron-shared-scope-'));
+  await fs.mkdir(path.join(root, 'src/routes'), { recursive: true });
+  // Real Vite SSR evaluates this checkout's cache source in a separate graph.
+  const cacheModule = path.resolve('src/core/cache.ts');
+  await fs.writeFile(path.join(root, 'src/routes/value.ts'), `
+    import { cache } from ${JSON.stringify(cacheModule)};
+    let calls = 0;
+    const read = cache(async () => ++calls, { scope: 'shared', tags: () => ['ssr-public-value'] });
+    export const config = { mode: 'app' };
+    export async function loader() { return { value: await read() }; }
+    export default function Page() { return null; }
+  `);
+  const { revalidateTag, clearCache } = await import('../core/cache.js');
+  const running = await createServer({ rootDir: root, host: '127.0.0.1', port: 0, compress: false });
+  try {
+    if (!running.server.listening) await once(running.server, 'listening');
+    const address = running.server.address();
+    if (!address || typeof address === 'string') throw new Error('No HTTP port');
+    const read = async () => {
+      const response = await fetch(`http://127.0.0.1:${address.port}/value`, { headers: { Accept: 'application/json' } });
+      const payload = decodeSerializedPayload<Record<string, { value: number }>>(await response.json());
+      return Object.values(payload)[0].value;
+    };
+    expect(await read()).toBe(1);
+    expect(await read()).toBe(1);
+    revalidateTag('ssr-public-value', 'shared');
+    expect(await read()).toBe(2);
+  } finally {
+    clearCache('shared'); await running.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

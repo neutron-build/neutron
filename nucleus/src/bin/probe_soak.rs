@@ -7,7 +7,7 @@
 //!     oldest), so table size plateaus and any RSS growth is a leak, not data;
 //!   * no crashes / no unexpected error storm under concurrency;
 //!   * index coherence survives sustained churn (PK uniqueness, btree and
-//!     encrypted equality) — the same bug class the coherence oracle guards;
+//!     code-index equality) — the same bug class the coherence oracle guards;
 //!   * durability: after closing and reopening, committed rows survive and
 //!     stay coherent.
 //!
@@ -147,10 +147,11 @@ impl Shared {
 
 /// Runs one statement, times it, records it, and reports whether it succeeded.
 /// The DB error is mapped to a short string for the sample log.
-async fn timed(db: &HarnessDb, shared: &Shared, op: Op, sql: &str) -> bool {
+async fn timed(db: &HarnessDb, sid: u64, shared: &Shared, op: Op, sql: &str) -> bool {
     let t = Instant::now();
     let r = db
-        .execute(sql)
+        .executor()
+        .execute_with_session(sid, sql)
         .await
         .map(|_| ())
         .map_err(|e| format!("{sql} -> {e}"));
@@ -201,6 +202,10 @@ async fn worker(
     deadline: Instant,
     preloaded_rows: i64,
 ) {
+    // Model independent client connections: each worker serializes commands
+    // within its own session, as the production wire protocol does. The default
+    // HarnessDb entry point uses one session and its parser/plan hint state.
+    let sid = db.executor().create_session();
     let base: i64 = (id as i64 + 1) * 1_000_000_000;
     let mut counter: i64 = 0;
     let mut live: VecDeque<i64> = VecDeque::new();
@@ -220,7 +225,8 @@ async fn worker(
             );
             let t = Instant::now();
             let r = db
-                .execute(&sql)
+                .executor()
+                .execute_with_session(sid, &sql)
                 .await
                 .map(|_| ())
                 .map_err(|e| format!("{sql} -> {e}"));
@@ -240,7 +246,7 @@ async fn worker(
             let val = rng.below(64) as i64;
             let (vsql, vvals) = vlit(&mut rng);
             let sql = format!("UPDATE soak SET val = {val}, v = {vsql} WHERE id = {rid}");
-            timed(&db, &shared, Op::Update, &sql).await;
+            timed(&db, sid, &shared, Op::Update, &sql).await;
 
             shared.logical_bytes.fetch_add(
                 logical_row_bytes(rid, val, &format!("k{rid}"), &vvals),
@@ -263,7 +269,8 @@ async fn worker(
             };
             let t = Instant::now();
             let r = db
-                .query(&q)
+                .executor()
+                .execute_with_session(sid, &q)
                 .await
                 .map(|_| ())
                 .map_err(|e| format!("{q} -> {e}"));
@@ -272,12 +279,13 @@ async fn worker(
             // KV op — a different model sharing the same engine.
             let k = base + rng.below(256) as i64;
             let sql = format!("SELECT KV_SET('sk{k}', 'v{counter}')");
-            timed(&db, &shared, Op::Kv, &sql).await;
+            timed(&db, sid, &shared, Op::Kv, &sql).await;
         } else if !live.is_empty() {
             // DELETE the oldest — this is the position-shifting op.
             let rid = live.pop_front().unwrap();
             if timed(
                 &db,
+                sid,
                 &shared,
                 Op::Delete,
                 &format!("DELETE FROM soak WHERE id = {rid}"),
@@ -293,6 +301,7 @@ async fn worker(
             let rid = live.pop_front().unwrap();
             if timed(
                 &db,
+                sid,
                 &shared,
                 Op::Delete,
                 &format!("DELETE FROM soak WHERE id = {rid}"),
@@ -303,6 +312,7 @@ async fn worker(
             }
         }
     }
+    db.executor().drop_session(sid);
 }
 
 async fn create_schema(db: &HarnessDb) -> Result<(), String> {
@@ -310,7 +320,8 @@ async fn create_schema(db: &HarnessDb) -> Result<(), String> {
         "CREATE TABLE soak (id BIGINT PRIMARY KEY, val INT, code TEXT, v VECTOR(4))",
         "CREATE INDEX soak_val ON soak (val)",
         "CREATE INDEX soak_v ON soak USING hnsw (v)",
-        "CREATE INDEX soak_code ON soak USING encrypted (code)",
+        "CREATE INDEX soak_code ON soak (code)",
+        "CREATE INDEX soak_v_ivf ON soak USING ivfflat (v)",
     ];
     for sql in stmts {
         db.execute(sql)
@@ -391,7 +402,7 @@ async fn coherence_failures(db: &HarnessDb) -> Vec<String> {
         _ => {}
     }
 
-    // Sample live rows: PK equality returns exactly one, encrypted code exactly one.
+    // Sample live rows: PK equality returns exactly one, code equality returns exactly one.
     let sample = db
         .query("SELECT id FROM soak LIMIT 40")
         .await
@@ -445,18 +456,13 @@ async fn coherence_failures(db: &HarnessDb) -> Vec<String> {
             Err(e) => fails.push(format!("pk id={rid} query failed: {e}")),
             _ => {}
         }
-        let enc = db
-            .query_one(&format!(
-                "SELECT ENCRYPTED_LOOKUP('soak_code', 'k{rid}') FROM soak LIMIT 1"
-            ))
-            .await;
-        if let Ok(Some(Value::Text(s))) = enc {
-            let n = s.split(',').filter(|p| !p.trim().is_empty()).count();
-            if n != 1 {
-                fails.push(format!(
-                    "encrypted lookup k{rid}: {n} postings (expected 1)"
-                ));
-            }
+        match db
+            .query(&format!("SELECT id FROM soak WHERE code = 'k{rid}'"))
+            .await
+        {
+            Ok(rows) if rows.len() == 1 && rows[0].first() == Some(&Value::Int64(rid)) => {}
+            Ok(rows) => fails.push(format!("code index k{rid}: {rows:?} (expected id {rid})")),
+            Err(error) => fails.push(format!("code index k{rid} query failed: {error}")),
         }
         if fails.len() > 10 {
             break;
@@ -485,6 +491,66 @@ async fn coherence_failures(db: &HarnessDb) -> Vec<String> {
                             "val={v}: index path returned {:?} but heap scan returned {:?}",
                             a[0], b[0]
                         ));
+                        // Preserve the original invariant and identify which
+                        // rows disagree. Counts alone cannot distinguish a
+                        // lost B-tree entry from a plan/count-path defect.
+                        let sid = db.executor().create_session();
+                        for (path, sql) in [
+                            (
+                                "point",
+                                format!("SELECT id, val FROM soak WHERE val = {v} ORDER BY id"),
+                            ),
+                            (
+                                "range",
+                                format!(
+                                    "SELECT id, val FROM soak WHERE val >= {v} AND val <= {v} ORDER BY id"
+                                ),
+                            ),
+                            (
+                                "heap",
+                                format!("SELECT id, val FROM soak WHERE val + 0 = {v} ORDER BY id"),
+                            ),
+                            (
+                                "wide-range",
+                                "SELECT id, val FROM soak WHERE val >= 0 AND val <= 63 ORDER BY id"
+                                    .into(),
+                            ),
+                        ] {
+                            match db.executor().execute_with_session(sid, &sql).await {
+                                Ok(results) => {
+                                    for result in results {
+                                        if let nucleus::executor::ExecResult::Select {
+                                            mut rows,
+                                            ..
+                                        } = result
+                                        {
+                                            if path == "wide-range" {
+                                                // Begin descent below the target key:
+                                                // a tight range shares point lookup's
+                                                // starting leaf and can miss the same
+                                                // entry when that descent is wrong.
+                                                let total = rows.len();
+                                                rows.retain(|row| {
+                                                    row.get(1).is_some_and(|value| {
+                                                        value.loose_eq(&Value::Int64(v))
+                                                    })
+                                                });
+                                                fails.push(format!(
+                                                    "val={v} wide-range total rows: {total}"
+                                                ));
+                                            }
+                                            fails.push(format!(
+                                                "val={v} {path} rows in fresh session: {rows:?}"
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    fails.push(format!("val={v} {path} diagnostic failed: {error}"))
+                                }
+                            }
+                        }
+                        db.executor().drop_session(sid);
                     }
                 }
             }
@@ -1178,7 +1244,7 @@ async fn run_soak(args: Args) -> bool {
         )));
     }
     for h in handles {
-        let _ = h.await;
+        h.await.expect("soak worker panicked or was cancelled");
     }
     shared.stop.store(true, Ordering::Relaxed);
     let series = sampler.await.unwrap_or_default();

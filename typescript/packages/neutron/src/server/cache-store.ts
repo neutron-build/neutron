@@ -17,14 +17,26 @@ export interface NeutronLoaderDataCacheEntry {
   expiresAt: number;
 }
 
-export interface NeutronAppCacheStore {
+/**
+ * Shared cache invalidation must be atomic with conditional publication.
+ * Every successful deleteByPath/clear advances this opaque generation in the
+ * backing store, including when no matching entry currently exists.
+ * External adapters implement the comparison and write in one transaction or
+ * server-side script. A client-side check followed by set is insufficient.
+ */
+export interface AtomicCachePublication<T> {
+  getGeneration(): Promise<string>;
+  setIfGeneration(key: string, entry: T, generation: string): Promise<boolean>;
+}
+
+export interface NeutronAppCacheStore extends Partial<AtomicCachePublication<NeutronAppResponseCacheEntry>> {
   get(key: string): Promise<NeutronAppResponseCacheEntry | null>;
   set(key: string, entry: NeutronAppResponseCacheEntry): Promise<void>;
   deleteByPath(pathname: string): Promise<void>;
   clear(): Promise<void>;
 }
 
-export interface NeutronLoaderCacheStore {
+export interface NeutronLoaderCacheStore extends Partial<AtomicCachePublication<NeutronLoaderDataCacheEntry>> {
   get(key: string): Promise<NeutronLoaderDataCacheEntry | null>;
   set(key: string, entry: NeutronLoaderDataCacheEntry): Promise<void>;
   deleteByPath(pathname: string): Promise<void>;
@@ -51,10 +63,21 @@ export function createMemoryAppCacheStore(
   options: MemoryAppCacheStoreOptions = {}
 ): NeutronAppCacheStore {
   const cache = new Map<string, NeutronAppResponseCacheEntry>();
+  let generation = 0n;
   const maxEntries = resolveMaxEntries(
     options.maxEntries,
     DEFAULT_MEMORY_APP_CACHE_ENTRIES
   );
+
+  function storeEntry(key: string, entry: NeutronAppResponseCacheEntry): void {
+    if (!cache.has(key) && cache.size >= maxEntries) {
+      const oldest = cache.keys().next().value;
+      if (typeof oldest === "string") {
+        cache.delete(oldest);
+      }
+    }
+    cache.set(key, entry);
+  }
 
   return {
     async get(key) {
@@ -72,21 +95,21 @@ export function createMemoryAppCacheStore(
       cache.set(key, entry);
       return entry;
     },
-    async set(key, entry) {
-      if (!cache.has(key) && cache.size >= maxEntries) {
-        const oldest = cache.keys().next().value;
-        if (typeof oldest === "string") {
-          cache.delete(oldest);
-        }
-      }
-      cache.set(key, entry);
+    async getGeneration() { return generation.toString(); },
+    async setIfGeneration(key, entry, expected) {
+      if (generation.toString() !== expected) return false;
+      storeEntry(key, entry);
+      return true;
     },
+    async set(key, entry) { storeEntry(key, entry); },
+
     async deleteByPath(pathname) {
       const normalized = normalizeCachePathname(pathname);
       if (!normalized) {
         return;
       }
 
+      generation++;
       // App-cache keys are `variant\norigin\npath\nsearch\n...` (see
       // buildAppCacheKey). Match the path field EXACTLY: the previous
       // `startsWith("html:/user")` prefix test also invalidated `/users` and
@@ -99,6 +122,7 @@ export function createMemoryAppCacheStore(
       }
     },
     async clear() {
+      generation++;
       cache.clear();
     },
   };
@@ -108,10 +132,22 @@ export function createMemoryLoaderCacheStore(
   options: MemoryLoaderCacheStoreOptions = {}
 ): NeutronLoaderCacheStore {
   const cache = new Map<string, NeutronLoaderDataCacheEntry>();
+  let generation = 0n;
   const maxEntries = resolveMaxEntries(
     options.maxEntries,
     DEFAULT_MEMORY_LOADER_CACHE_ENTRIES
   );
+
+  function storeEntry(key: string, entry: NeutronLoaderDataCacheEntry): void {
+    if (!cache.has(key) && cache.size >= maxEntries) {
+      const oldest = cache.keys().next().value;
+      if (typeof oldest === "string") {
+        cache.delete(oldest);
+      }
+    }
+    // Clone at ingress too: the caller keeps its reference after storing.
+    cache.set(key, cloneLoaderEntry(entry));
+  }
 
   return {
     async get(key) {
@@ -131,22 +167,21 @@ export function createMemoryLoaderCacheStore(
       // request will read from the cache.
       return cloneLoaderEntry(entry);
     },
-    async set(key, entry) {
-      if (!cache.has(key) && cache.size >= maxEntries) {
-        const oldest = cache.keys().next().value;
-        if (typeof oldest === "string") {
-          cache.delete(oldest);
-        }
-      }
-      // Clone at ingress too: the caller keeps its reference after storing.
-      cache.set(key, cloneLoaderEntry(entry));
+    async getGeneration() { return generation.toString(); },
+    async setIfGeneration(key, entry, expected) {
+      if (generation.toString() !== expected) return false;
+      storeEntry(key, entry);
+      return true;
     },
+    async set(key, entry) { storeEntry(key, entry); },
+
     async deleteByPath(pathname) {
       const normalized = normalizeCachePathname(pathname);
       if (!normalized) {
         return;
       }
 
+      generation++;
       const prefix = `${normalized}::`;
       for (const key of cache.keys()) {
         if (key.startsWith(prefix)) {
@@ -155,6 +190,7 @@ export function createMemoryLoaderCacheStore(
       }
     },
     async clear() {
+      generation++;
       cache.clear();
     },
   };
@@ -206,4 +242,11 @@ export function normalizeCachePathname(pathname: string): string | null {
   }
 
   return decoded;
+}
+
+/** Refuse unsafe external adapters before creating any server resources. */
+export function assertAtomicCacheStore(store: NeutronAppCacheStore | NeutronLoaderCacheStore): void {
+  if (typeof store.getGeneration !== 'function' || typeof store.setIfGeneration !== 'function') {
+    throw new TypeError('Cache stores require atomic getGeneration/setIfGeneration publication and generation-advancing invalidation');
+  }
 }

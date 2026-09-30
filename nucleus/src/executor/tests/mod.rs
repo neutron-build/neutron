@@ -51,6 +51,7 @@ mod test_cache_coherence; // M2: cache + specialty-index invalidation oracle
 mod test_call_pipeline; // EXE-1/5 + PRC-1/3/4/5/7: the CALL pipeline end-to-end
 mod test_cluster_routing; // A14/A15: both execution entries route + fail closed
 mod test_collections;
+mod test_column_writes; // X10: generated/identity columns, deferrable FKs, DEFAULT VALUES, varchar(n)
 mod test_copy; // COPY FROM STDIN payload reconstruction
 mod test_cross_model;
 mod test_cross_model_atomicity; // S63 slice 1: SQL+streams discard-on-no-commit-record
@@ -63,6 +64,7 @@ mod test_durability_format; // M3: format rejection + full-state recovery
 mod test_e2e_smoke; // End-to-end smoke tests exercising all Nucleus capabilities
 mod test_filter_lazy; // Phase 2C: Lazy materialization for WHERE clause filtering
 mod test_fts_index; // Table-attached FTS: USING FTS, @@, BM25, hybrid RRF
+mod test_implicit_txn; // X08: a multi-statement simple query is one implicit transaction
 mod test_index;
 mod test_index_path_coverage; // which WHERE forms actually reach an index
 mod test_integration;
@@ -116,3 +118,13 @@ mod test_triggers; // EXE-2: row-binding tables must never touch user tables nam
 mod test_txn;
 mod test_txn_lazy_snapshot;
 mod test_upstream_teploy_2026_09_18; // rename-in-txn visibility + replacing upsert loss (2026-09-18 upstream reports) // R8: BEGIN/SAVEPOINT do not clone the whole database // Phase 4: JSONB @> containment, GIN indexes, subscript syntax
+
+mod test_x09_array_semantics;
+mod test_x11_review_regressions;
+mod test_x12_review_regressions;
+
+mod test_x12_array_boundary;
+mod test_x12_recursive_cte;
+
+#[cfg(feature = "server")]
+mod test_derived_publication;

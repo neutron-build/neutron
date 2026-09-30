@@ -127,12 +127,34 @@ pinned connection**, held from the history read through the final apply:
 - acquiring honors the run's deadline/cancellation; a waiter that times out
   fails cleanly without side effects.
 
+`schema baseline` also holds this lock across catalog introspection and
+history observation, while `db push` and Studio apply use it for their schema
+changes. Baseline currently reads through other connections in the same client
+pool; its lock excludes cooperating runners connected to the same PostgreSQL
+server, not arbitrary SQL writers or writers on a primary when baseline reads a
+standby. Take baselines on the migration primary with external DDL writers
+quiesced. The client needs capacity for the pinned lock connection and its
+introspection/history reads.
+
+CLI `migrate`, `migrate down`, `migrate adopt`, and `migrate resolve` capture up
+SQL, down SQL, plans, and snapshots into one private read-only local bundle before
+waiting for this lock. All subsequent file validation and execution use that
+bundle; edits made while waiting affect the next invocation. Capture compares two
+complete reads and refuses observed changes or nonregular input files. This does
+not lock the filesystem or guarantee an atomic filesystem snapshot against an
+uncooperative writer: stop local generators/editors while capture runs, or publish
+an immutable migrations directory. The database lock does not protect local files.
+
 Transaction-pooled proxies (PgBouncer transaction mode and equivalents) are
 **unsupported** for migration connections: a session-level lock cannot survive
 a pooler that reassigns the session between statements. Use a direct connection
 or a session-pooled endpoint.
 
 ### Nucleus (Go/TS SDKs)
+
+SDK migration functions copy supplied version, name, up SQL, and down SQL into a
+private plan before the first asynchronous wait. Later caller edits cannot change
+the SQL executed or the checksum recorded by that invocation.
 
 The engine has no advisory locks (verified in engine source; the only advisory
 function is an honest `pg_advisory_unlock_all` no-op), so serialization is the
@@ -165,7 +187,10 @@ history into protocol v2. It never fabricates trust:
 1. It runs under the same serialization as migration (advisory lock / claim).
 2. Collision check first (§1): any numerically-equal-but-distinct ID pair in
    history∪files aborts the adoption with a reconciliation error.
-3. Table shape is upgraded in the adoption's transaction (columns added;
+3. SDKs read legacy rows and preflight recorded digests for every row with a
+   supplied matching-version plan before nullable metadata-column DDL; a mismatched digest leaves the table shape unchanged.
+   On PostgreSQL, table shape is upgraded in the adoption's transaction
+   (columns added;
    for SDK-shaped history adopted by the CLI, `version` is converted
    `INTEGER → TEXT USING version::text` — explicit, never implicit).
 4. Each history row is matched to a supplied file by exact text ID:
@@ -179,6 +204,17 @@ history into protocol v2. It never fabricates trust:
 5. All rows are stamped `format = 'v2'` and the adopting owner. Verified and
    unverified versions are reported; partially applied histories are fine
    (pending files are simply not adoption's concern).
+
+PostgreSQL rolls back both the schema upgrade and history changes if adoption
+fails, including failures after the columns have been added. Nucleus does not
+support transactional catalog DDL rollback: after successful preflight, SDKs
+end the read transaction, add nullable columns outside a transaction, and
+graduate the captured history rows in a fresh transaction under the same claim.
+Idempotent nullable `checksum`, `owner`, and `format` additions can remain after a later execution failure. Those
+columns alone do not graduate any row; the history updates commit together or
+roll back, and a retry can reuse the upgraded shape. The SDK claim-lock table is
+bootstrapped outside adoption's transaction on both engines. Adoption therefore
+never promises to remove that serialization metadata on failure.
 
 Fixture families (V12): CLI legacy (TEXT table, no v2 columns), TS SDK legacy
 (INTEGER table, no checksum), Go SDK legacy (INTEGER + legacy digests +

@@ -9,7 +9,6 @@ use crate::types::Row;
 
 use super::ExecError;
 use super::Executor;
-use super::helpers::infer_expr_type;
 use super::types::{ColMeta, ProjectedResult};
 
 impl Executor {
@@ -70,12 +69,12 @@ impl Executor {
                         let val = self.eval_row_expr(expr, first, col_meta)?;
                         columns.push((
                             super::helpers::default_output_name(expr),
-                            super::helpers::projected_column_type(expr, &val, col_meta),
+                            self.projected_expr_type(expr, &val, col_meta),
                         ));
                     } else {
                         columns.push((
                             super::helpers::default_output_name(expr),
-                            infer_expr_type(expr, col_meta),
+                            self.infer_projection_type(expr, col_meta),
                         ));
                     }
                     col_indices.push(usize::MAX); // sentinel
@@ -86,10 +85,13 @@ impl Executor {
                         let val = self.eval_row_expr(expr, first, col_meta)?;
                         columns.push((
                             alias.value.clone(),
-                            super::helpers::projected_column_type(expr, &val, col_meta),
+                            self.projected_expr_type(expr, &val, col_meta),
                         ));
                     } else {
-                        columns.push((alias.value.clone(), infer_expr_type(expr, col_meta)));
+                        columns.push((
+                            alias.value.clone(),
+                            self.infer_projection_type(expr, col_meta),
+                        ));
                     }
                     col_indices.push(usize::MAX);
                     expr_items.push(Some(expr));

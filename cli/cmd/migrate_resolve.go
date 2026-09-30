@@ -92,11 +92,12 @@ func runMigrateResolve(cmd *cobra.Command, args []string) error {
 	ctx, cancel := commandContext(cmd)
 	defer cancel()
 
-	client, files, sess, release, err := migrateSessionGuard(ctx, dir)
+	client, inputs, sess, release, err := migrateSessionGuard(ctx, dir)
 	if err != nil {
 		return err
 	}
 	defer release()
+	files := inputs.files
 
 	var file db.MigrationFile
 	found := false
@@ -109,6 +110,8 @@ func runMigrateResolve(cmd *cobra.Command, args []string) error {
 	if !found {
 		return fmt.Errorf("version %s has no migration file in %s — `neutron migrate status` lists the directory's versions", version, dir)
 	}
+
+	dir = inputs.dir
 
 	applied, err := prepareHistoryRun(ctx, client, sess, files)
 	if err != nil {

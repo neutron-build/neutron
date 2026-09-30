@@ -1,9 +1,7 @@
-//! Encrypted indexes for querying encrypted columns (Phase 6).
+//! Retired encrypted-index prototype.
 //!
-//! Supports three encryption modes:
-//!   - Deterministic: enables equality queries on encrypted data
-//!   - Order-preserving: enables range queries on encrypted data
-//!   - Randomized: maximum security, no queryable index
+//! Runtime construction is refused. Legacy XOR/FNV token algorithms remain
+//! only for historical test fixtures; no secure encryption mode is implemented.
 
 use std::collections::BTreeMap;
 
@@ -11,22 +9,16 @@ use std::collections::BTreeMap;
 // Encryption modes
 // ---------------------------------------------------------------------------
 
-/// Encryption mode for an encrypted index.
-///
-/// Each mode trades off queryability against security:
-///   - `Deterministic`: same plaintext always yields the same ciphertext,
-///     enabling equality lookups.
-///   - `OrderPreserving`: ciphertext order matches plaintext order, enabling
-///     range queries.
-///   - `Randomized`: standard non-deterministic encryption — maximum security
-///     but no queryable index support.
+/// Explicit runtime refusal for every legacy encrypted-index mode.
+pub const UNSUPPORTED_ENCRYPTION: &str = "encrypted indexes are unavailable: the legacy XOR/FNV prototype is not authenticated encryption; no secure mode is implemented";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncryptionMode {
-    /// Same plaintext always produces the same ciphertext (equality queries).
+    /// Legacy deterministic token mode; runtime use is unavailable.
     Deterministic,
-    /// Ciphertext order matches plaintext order (range queries).
+    /// Legacy reversible XOR mode; neither ordered nor secure.
     OrderPreserving,
-    /// Standard AES-GCM style — different ciphertext each time (no querying).
+    /// Legacy counter-based token mode; runtime use is unavailable.
     Randomized,
 }
 
@@ -70,7 +62,7 @@ static RANDOM_COUNTER: AtomicU64 = AtomicU64::new(0);
 ///   - `Randomized` → no indexed queries (insert-only; lookups return empty)
 #[derive(Debug)]
 pub struct EncryptedIndex {
-    /// AES-256 key (used for all encryption operations).
+    /// Legacy 32-byte token key; no runtime construction is supported.
     key: [u8; 32],
     /// Encryption mode governing how values are encrypted and queryable.
     mode: EncryptionMode,
@@ -84,8 +76,15 @@ pub struct EncryptedIndex {
 }
 
 impl EncryptedIndex {
-    /// Create a new, empty encrypted index with the given key and mode.
-    pub fn new(key: [u8; 32], mode: EncryptionMode) -> Self {
+    /// Runtime construction is refused until an authenticated cryptographic
+    /// implementation and durable format migration exist. The former XOR/FNV
+    /// prototype is not encryption and cannot protect secrets.
+    pub fn new(_key: [u8; 32], _mode: EncryptionMode) -> Result<Self, &'static str> {
+        Err(UNSUPPORTED_ENCRYPTION)
+    }
+
+    #[cfg(test)]
+    fn prototype_for_test(key: [u8; 32], mode: EncryptionMode) -> Self {
         Self {
             key,
             mode,
@@ -94,16 +93,8 @@ impl EncryptedIndex {
         }
     }
 
-    /// Derive a per-position offset from the key for order-preserving encryption.
-    ///
-    /// Uses modular addition (`byte + offset mod 256`) rather than XOR so that
-    /// the ordering of ciphertext bytes matches the ordering of plaintext
-    /// bytes:  if `a < b` then `(a + k) mod 256 < (b + k) mod 256` is NOT
-    /// universally true, but we only need the *relative* ordering to be
-    /// preserved for the BTreeMap range queries.  To guarantee this we use a
-    /// *constant* offset per position — all values at position `i` are shifted
-    /// by the same amount, so their relative order is preserved even across
-    /// the modular wrap-around (the BTreeMap compares raw bytes).
+    /// Legacy XOR keystream byte. This transformation does not preserve order
+    /// and is vulnerable to chosen-plaintext disclosure; runtime use is refused.
     fn ope_keystream_byte(&self, i: usize) -> u8 {
         let mut buf = Vec::with_capacity(self.key.len() + 8);
         buf.extend_from_slice(&self.key);
@@ -111,14 +102,12 @@ impl EncryptedIndex {
         (fnv1a_64(&buf) & 0xFF) as u8
     }
 
-    /// Encrypt a plaintext value according to the index's encryption mode.
+    /// Encode a legacy prototype value. This is not secure encryption.
     ///
     /// - **Deterministic**: XOR key with plaintext cyclically, then FNV-1a
     ///   hash to produce a fixed 8-byte deterministic token.
-    /// - **OrderPreserving**: XOR each plaintext byte with a key-derived
-    ///   keystream byte, prepended with a constant 8-byte tag.  The XOR
-    ///   cipher obscures the data while preserving lexicographic ordering
-    ///   (since the keystream is constant for each position).
+    /// - **OrderPreserving**: legacy XOR bytes with an 8-byte tag; neither
+    ///   cryptographic security nor ciphertext ordering is provided.
     /// - **Randomized**: prepend a unique counter value to the plaintext
     ///   before XOR + hash, ensuring each call produces a distinct ciphertext.
     pub fn encrypt_value(&self, plaintext: &[u8]) -> Vec<u8> {
@@ -141,8 +130,7 @@ impl EncryptedIndex {
                 // NOTE: XOR does not preserve lexicographic byte ordering,
                 // so range queries use a linear scan over all entries with
                 // decryption rather than relying on BTreeMap ordering.  This
-                // trades O(n) range queries for the security guarantee that
-                // plaintext is never stored directly.
+                // uses O(n) range queries; it provides no cryptographic security.
                 let tag = fnv1a_64(&self.key).to_le_bytes();
                 let mut out = Vec::with_capacity(8 + plaintext.len());
                 out.extend_from_slice(&tag);
@@ -215,7 +203,7 @@ impl EncryptedIndex {
     /// Because the XOR transformation does not preserve lexicographic byte
     /// ordering, this performs a linear scan over all entries, decrypting
     /// each and checking whether the plaintext falls within the requested
-    /// range.  This is O(n) but guarantees correctness and security.
+    /// range.  This is O(n); the prototype does not provide cryptographic security.
     pub fn lookup_range(&self, start: &[u8], end: &[u8]) -> Vec<u64> {
         let mut results = Vec::new();
         for (ciphertext, row_ids) in &self.entries {
@@ -291,7 +279,7 @@ mod tests {
 
     #[test]
     fn test_deterministic_equality_lookup() {
-        let mut idx = EncryptedIndex::new(test_key(), EncryptionMode::Deterministic);
+        let mut idx = EncryptedIndex::prototype_for_test(test_key(), EncryptionMode::Deterministic);
 
         idx.insert(b"alice", 1);
         idx.insert(b"bob", 2);
@@ -310,7 +298,7 @@ mod tests {
 
     #[test]
     fn test_deterministic_same_value_same_ciphertext() {
-        let idx = EncryptedIndex::new(test_key(), EncryptionMode::Deterministic);
+        let idx = EncryptedIndex::prototype_for_test(test_key(), EncryptionMode::Deterministic);
 
         let c1 = idx.encrypt_value(b"hello");
         let c2 = idx.encrypt_value(b"hello");
@@ -330,7 +318,8 @@ mod tests {
 
     #[test]
     fn test_order_preserving_range_query() {
-        let mut idx = EncryptedIndex::new(test_key(), EncryptionMode::OrderPreserving);
+        let mut idx =
+            EncryptedIndex::prototype_for_test(test_key(), EncryptionMode::OrderPreserving);
 
         // Insert values whose natural byte order is: aaa < bbb < ccc < ddd < eee
         idx.insert(b"aaa", 10);
@@ -359,7 +348,7 @@ mod tests {
 
     #[test]
     fn test_randomized_different_ciphertexts() {
-        let idx = EncryptedIndex::new(test_key(), EncryptionMode::Randomized);
+        let idx = EncryptedIndex::prototype_for_test(test_key(), EncryptionMode::Randomized);
 
         let c1 = idx.encrypt_value(b"same");
         let c2 = idx.encrypt_value(b"same");
@@ -369,7 +358,7 @@ mod tests {
         );
 
         // Equality lookup should therefore return nothing (no deterministic match).
-        let mut ridx = EncryptedIndex::new(test_key(), EncryptionMode::Randomized);
+        let mut ridx = EncryptedIndex::prototype_for_test(test_key(), EncryptionMode::Randomized);
         ridx.insert(b"data", 100);
         let result = ridx.lookup_equal(b"data");
         assert!(
@@ -384,7 +373,7 @@ mod tests {
 
     #[test]
     fn test_insert_and_remove() {
-        let mut idx = EncryptedIndex::new(test_key(), EncryptionMode::Deterministic);
+        let mut idx = EncryptedIndex::prototype_for_test(test_key(), EncryptionMode::Deterministic);
 
         idx.insert(b"key1", 1);
         idx.insert(b"key1", 2);
@@ -412,12 +401,12 @@ mod tests {
 
     #[test]
     fn test_empty_index() {
-        let idx = EncryptedIndex::new(test_key(), EncryptionMode::Deterministic);
+        let idx = EncryptedIndex::prototype_for_test(test_key(), EncryptionMode::Deterministic);
         assert_eq!(idx.len(), 0);
         assert!(idx.is_empty());
         assert!(idx.lookup_equal(b"anything").is_empty());
 
-        let ope = EncryptedIndex::new(test_key(), EncryptionMode::OrderPreserving);
+        let ope = EncryptedIndex::prototype_for_test(test_key(), EncryptionMode::OrderPreserving);
         assert!(ope.lookup_range(b"a", b"z").is_empty());
     }
 
@@ -427,7 +416,8 @@ mod tests {
 
     #[test]
     fn test_order_preserving_equality_lookup() {
-        let mut idx = EncryptedIndex::new(test_key(), EncryptionMode::OrderPreserving);
+        let mut idx =
+            EncryptedIndex::prototype_for_test(test_key(), EncryptionMode::OrderPreserving);
 
         idx.insert(b"foo", 1);
         idx.insert(b"bar", 2);
@@ -446,7 +436,7 @@ mod tests {
 
     #[test]
     fn test_order_preserving_does_not_store_plaintext() {
-        let idx = EncryptedIndex::new(test_key(), EncryptionMode::OrderPreserving);
+        let idx = EncryptedIndex::prototype_for_test(test_key(), EncryptionMode::OrderPreserving);
 
         let plaintext = b"sensitive_data";
         let encrypted = idx.encrypt_value(plaintext);
@@ -467,11 +457,58 @@ mod tests {
         let key_a = [0xAAu8; 32];
         let key_b = [0xBBu8; 32];
 
-        let idx_a = EncryptedIndex::new(key_a, EncryptionMode::Deterministic);
-        let idx_b = EncryptedIndex::new(key_b, EncryptionMode::Deterministic);
+        let idx_a = EncryptedIndex::prototype_for_test(key_a, EncryptionMode::Deterministic);
+        let idx_b = EncryptedIndex::prototype_for_test(key_b, EncryptionMode::Deterministic);
 
         let ca = idx_a.encrypt_value(b"secret");
         let cb = idx_b.encrypt_value(b"secret");
         assert_ne!(ca, cb, "different keys must produce different ciphertext");
+    }
+}
+
+#[cfg(test)]
+mod security_admission_regression {
+    use super::*;
+
+    #[test]
+    fn encrypted_ope_cannot_disclose_secret_from_chosen_zeroes() {
+        let Ok(index) = EncryptedIndex::new([0x42; 32], EncryptionMode::OrderPreserving) else {
+            assert_eq!(
+                EncryptedIndex::new([0x42; 32], EncryptionMode::OrderPreserving).err(),
+                Some(UNSUPPORTED_ENCRYPTION)
+            );
+            return;
+        };
+        let secret = b"private-account";
+        let known = index.encrypt_value(&vec![0; secret.len()]);
+        let observed = index.encrypt_value(secret);
+        let recovered: Vec<_> = observed[8..]
+            .iter()
+            .zip(&known[8..])
+            .map(|(cipher, zero)| cipher ^ zero)
+            .collect();
+        assert_ne!(
+            recovered, secret,
+            "chosen zeroes revealed the complete supposedly encrypted plaintext without its key"
+        );
+    }
+}
+
+#[cfg(test)]
+mod runtime_security_modes {
+    use super::*;
+
+    #[test]
+    fn runtime_encrypted_modes_are_explicitly_unavailable() {
+        for mode in [
+            EncryptionMode::Deterministic,
+            EncryptionMode::OrderPreserving,
+            EncryptionMode::Randomized,
+        ] {
+            assert_eq!(
+                EncryptedIndex::new([0x42; 32], mode).err(),
+                Some(UNSUPPORTED_ENCRYPTION)
+            );
+        }
     }
 }

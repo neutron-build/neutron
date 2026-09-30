@@ -44,9 +44,24 @@ export interface SessionStorage {
   getSession(sessionId: string): Promise<SessionRecord | null>;
   setSession(sessionId: string, data: SessionData, expiresAt?: number): Promise<void>;
   deleteSession(sessionId: string): Promise<void>;
+  /** Atomically compare the current revision, then replace, rotate or revoke.
+   * null expectedRevision creates only if absent. null replacement revokes.
+   * Rotation checks that the target ID is absent and removes the old ID in
+   * the SAME atomic operation. A mismatch returns false with no effects.
+   * Middleware fails closed when this capability is absent. */
+  commitSession?(sessionId: string, expectedRevision: string | null,
+    replacement: SessionReplacement | null): Promise<boolean>;
+}
+
+export interface SessionReplacement {
+  id: string;
+  data: SessionData;
+  expiresAt?: number;
 }
 
 export interface SessionRecord {
+  /** Opaque, unique revision; never reuse one after replacement or expiry. */
+  revision?: string;
   data: SessionData;
   expiresAt?: number;
 }
@@ -182,6 +197,7 @@ export function createMemorySessionStorage(
       // compatible — persistent backends JSON-encode it anyway.
       return {
         data: structuredClone(record.data),
+        revision: record.revision,
         expiresAt: record.expiresAt,
       };
     },
@@ -196,6 +212,7 @@ export function createMemorySessionStorage(
         // Deep clone at ingress (TS-20): the caller keeps its reference
         // after saving, and a shallow copy left nested objects shared.
         data: structuredClone(data),
+        revision: randomUUID(),
         expiresAt: ttlExpiry,
       });
       lazySweep();
@@ -203,6 +220,26 @@ export function createMemorySessionStorage(
 
     async deleteSession(sessionId) {
       map.delete(sessionId);
+    },
+    async commitSession(sessionId, expectedRevision, replacement) {
+      let current = map.get(sessionId);
+      if (current?.expiresAt !== undefined && current.expiresAt <= Date.now()) {
+        map.delete(sessionId);
+        current = undefined;
+      }
+      if ((current?.revision ?? null) !== expectedRevision) return false;
+      if (replacement && replacement.id !== sessionId && map.has(replacement.id)) return false;
+      // Clone before mutation: rejected non-cloneable data leaves the old
+      // session valid instead of partially completing a rotation.
+      const next = replacement ? {
+        data: structuredClone(replacement.data),
+        revision: randomUUID(),
+        expiresAt: replacement.expiresAt ?? (defaultTtlMs ? Date.now() + defaultTtlMs : undefined),
+      } : null;
+      map.delete(sessionId);
+      if (replacement && next) map.set(replacement.id, next);
+      lazySweep();
+      return true;
     },
   };
 }
@@ -217,10 +254,17 @@ export function sessionMiddleware(options: SessionMiddlewareOptions): Middleware
   const trustedProxies = options.trustedProxies;
 
   return async (request, context, next) => {
+    const unavailable = () => new Response(JSON.stringify({
+      type: "about:blank", title: "Service Unavailable", status: 503,
+      detail: "session persistence unavailable",
+    }), { status: 503, headers: { "Content-Type": "application/problem+json" } });
+    const commit = options.storage.commitSession;
+    if (!commit) return unavailable();
     const cookieSessionId = getCookie(request, cookieName);
     const loadedRecord = cookieSessionId
       ? await options.storage.getSession(cookieSessionId)
       : null;
+    if (loadedRecord && !loadedRecord.revision) return unavailable();
     const cookieOptions = resolveCookieOptionsForRequest(baseCookieOptions, request, trustedProxies);
 
     const session = createSessionImpl(
@@ -233,38 +277,28 @@ export function sessionMiddleware(options: SessionMiddlewareOptions): Middleware
 
     const response = await next();
 
-    if (session.isDestroyed) {
-      if (cookieSessionId) {
-        await options.storage.deleteSession(cookieSessionId);
+    const expectedRevision = loadedRecord?.revision ?? null;
+    try {
+      if (session.isDestroyed) {
+        if (loadedRecord && !await commit.call(options.storage, cookieSessionId!, expectedRevision, null)) {
+          return unavailable();
+        }
+        return withSetCookie(response, serializeCookie(cookieName, "", {
+          ...cookieOptions, maxAge: 0, expires: new Date(0),
+        }));
       }
-      return withSetCookie(
-        response,
-        serializeCookie(cookieName, "", {
-          ...cookieOptions,
-          maxAge: 0,
-          expires: new Date(0),
-        })
-      );
-    }
-
-    if (session.isDirty || session.isNew) {
-      // SECURITY: Delete old session if regenerated (prevents session fixation)
-      if (session.isRegenerated && cookieSessionId) {
-        await options.storage.deleteSession(cookieSessionId);
+      if (session.isDirty || session.isNew) {
+        const expiresAt = ttlSeconds ? Date.now() + ttlSeconds * 1000 : undefined;
+        const fromId = loadedRecord ? cookieSessionId! : session.id;
+        if (!await commit.call(options.storage, fromId, expectedRevision, {
+          id: session.id, data: session.toJSON(), expiresAt,
+        })) return unavailable();
+        return withSetCookie(response, serializeCookie(cookieName, session.id, {
+          ...cookieOptions, ...(ttlSeconds ? { maxAge: ttlSeconds } : {}),
+        }));
       }
-      // Delete orphaned session from storage if the ID changed
-      else if (cookieSessionId && cookieSessionId !== session.id) {
-        await options.storage.deleteSession(cookieSessionId);
-      }
-      const expiresAt = ttlSeconds ? Date.now() + ttlSeconds * 1000 : undefined;
-      await options.storage.setSession(session.id, session.toJSON(), expiresAt);
-      return withSetCookie(
-        response,
-        serializeCookie(cookieName, session.id, {
-          ...cookieOptions,
-          ...(ttlSeconds ? { maxAge: ttlSeconds } : {}),
-        })
-      );
+    } catch {
+      return unavailable();
     }
 
     return response;

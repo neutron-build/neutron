@@ -24,13 +24,17 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 362876; Source Rust files: 316; Top-level modules: 53.
-- Declared unit tests: 5017; Declared integration tests: 459; Ignored tests: 53.
+Legacy encrypted-index modes are retired: new construction and SQL admissions
+refuse with `0A000`; base rows remain available. Earlier milestone sections are
+dated evidence, not a claim that those prototype modes remain supported.
+
+- Source LOC: 374339; Source Rust files: 334; Top-level modules: 53.
+- Declared unit tests: 5148; Declared integration tests: 460; Ignored tests: 53.
   These are static declarations, not executed-test claims.
-- The most recent full library run executed 4,861 passing tests, 0 failing
+- The previously recorded successful full library run executed 4,861 passing tests, 0 failing
   (8 ignored, all classified).
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
-  families, specialty indexes, encryption, TLS, embedded mode, physical backup v1, probes, Raft
+  families, specialty indexes, page-level encryption, TLS, embedded mode, physical backup v1, probes, Raft
   state-machine/runtime scaffolding, trusted SCRAM identities, role assumption, and RLS enforcement
   exist in the current worktree.
 - Trusted identity and RLS are checkpointed in commit `7982289`.

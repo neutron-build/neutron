@@ -14,7 +14,7 @@ use crate::graph::cypher_executor::execute_cypher;
 #[cfg(feature = "server")]
 use crate::reactive::ChangeType;
 use crate::timeseries;
-use crate::types::{Row, Value};
+use crate::types::{DataType, Row, Value};
 use crate::vector;
 use sqlparser::ast;
 use std::collections::{HashMap, HashSet};
@@ -1145,6 +1145,9 @@ impl Executor {
             }
             "EXTRACT" | "DATE_PART" => {
                 require_args(fname, &args, 2)?;
+                if args.iter().any(|value| matches!(value, Value::Null)) {
+                    return Ok(Value::Null);
+                }
                 let field = match &args[0] {
                     Value::Text(s) => s.to_lowercase(),
                     _ => return Err(ExecError::Unsupported("EXTRACT field must be text".into())),
@@ -1158,40 +1161,51 @@ impl Executor {
                             "day" => Ok(Value::Int32(day as i32)),
                             "dow" | "dayofweek" => {
                                 // 0 = Sunday
-                                let jdn = *d + 2451545;
-                                Ok(Value::Int32(jdn.rem_euclid(7)))
+                                Ok(Value::Int32((*d + 6).rem_euclid(7)))
                             }
                             "doy" | "dayofyear" => {
                                 let jan1 = crate::types::ymd_to_days(y, 1, 1);
                                 Ok(Value::Int32(*d - jan1 + 1))
                             }
-                            "epoch" => Ok(Value::Int64(*d as i64 * 86400)),
+                            "epoch" => Ok(Value::Int64(*d as i64 * 86400 + 946_684_800)),
                             _ => Err(ExecError::Unsupported(format!(
                                 "EXTRACT({field}) from date"
                             ))),
                         }
                     }
-                    Value::Timestamp(ts) => {
-                        let total_secs = *ts / 1_000_000;
-                        let days = (total_secs / 86400) as i32;
-                        let time_secs = total_secs % 86400;
-                        let (y, m, day) = crate::types::days_to_ymd(days);
-                        match field.as_str() {
-                            "year" => Ok(Value::Int32(y)),
-                            "month" => Ok(Value::Int32(m as i32)),
-                            "day" => Ok(Value::Int32(day as i32)),
-                            "hour" => Ok(Value::Int32((time_secs / 3600) as i32)),
-                            "minute" => Ok(Value::Int32(((time_secs % 3600) / 60) as i32)),
-                            "second" => Ok(Value::Int32((time_secs % 60) as i32)),
-                            "epoch" => Ok(Value::Int64(total_secs)),
-                            "dow" | "dayofweek" => {
-                                let jdn = days + 2451545;
-                                Ok(Value::Int32(jdn.rem_euclid(7)))
-                            }
-                            _ => Err(ExecError::Unsupported(format!(
-                                "EXTRACT({field}) from timestamp"
-                            ))),
+                    // A timestamp's fields are its wall clock; a timestamptz's
+                    // are its wall clock in the session zone (its epoch is the
+                    // instant). `epoch` is seconds since 1970, not 2000.
+                    Value::Timestamp(_) | Value::TimestampTz(_) => {
+                        let (wall, instant) = match &args[1] {
+                            Value::TimestampTz(instant) => (
+                                timestamptz_at_time_zone(*instant, self.session_time_zone()?)?,
+                                *instant,
+                            ),
+                            Value::Timestamp(ts) => (*ts, *ts),
+                            _ => unreachable!(),
+                        };
+                        if field == "second" || field == "epoch" {
+                            let micros = if field == "second" {
+                                i128::from(wall.rem_euclid(60_000_000))
+                            } else {
+                                i128::from(instant) + 946_684_800_000_000i128
+                            };
+                            let decimal = rust_decimal::Decimal::from_i128_with_scale(micros, 6);
+                            return if fname == "DATE_PART" {
+                                Ok(Value::Float64(micros as f64 / 1_000_000.0))
+                            } else {
+                                Ok(Value::Numeric(decimal.to_string()))
+                            };
                         }
+                        super::timestamptz::wall_clock_field(&field, wall, instant)
+                            .map(|n| match n {
+                                n if field == "epoch" => Value::Int64(n),
+                                n => Value::Int32(n as i32),
+                            })
+                            .ok_or_else(|| {
+                                ExecError::Unsupported(format!("EXTRACT({field}) from timestamp"))
+                            })
                     }
                     Value::Int64(v) => {
                         // Treat as epoch seconds
@@ -1220,7 +1234,7 @@ impl Executor {
                                 "year" => Ok(Value::Int32(y)),
                                 "month" => Ok(Value::Int32(m as i32)),
                                 "day" => Ok(Value::Int32(day as i32)),
-                                "epoch" => Ok(Value::Int64(d as i64 * 86400)),
+                                "epoch" => Ok(Value::Int64(d as i64 * 86400 + 946_684_800)),
                                 _ => Err(ExecError::Unsupported(format!(
                                     "EXTRACT({field}) from text"
                                 ))),
@@ -1236,6 +1250,14 @@ impl Executor {
                         "EXTRACT requires date/timestamp".into(),
                     )),
                 }
+                .and_then(|value| {
+                    let result_type = if fname == "DATE_PART" {
+                        DataType::Float64
+                    } else {
+                        DataType::Numeric
+                    };
+                    value.cast(&result_type).map_err(ExecError::Runtime)
+                })
             }
             "DATE_TRUNC" => {
                 require_args(fname, &args, 2)?;
@@ -1248,29 +1270,19 @@ impl Executor {
                     }
                 };
                 match &args[1] {
-                    Value::Timestamp(ts) => {
-                        let total_secs = *ts / 1_000_000;
-                        let days = (total_secs / 86400) as i32;
-                        let time_secs = total_secs % 86400;
-                        let (y, m, _d) = crate::types::days_to_ymd(days);
-                        let truncated_us = match field.as_str() {
-                            "year" => crate::types::ymd_to_days(y, 1, 1) as i64 * 86400 * 1_000_000,
-                            "month" => {
-                                crate::types::ymd_to_days(y, m, 1) as i64 * 86400 * 1_000_000
-                            }
-                            "day" => days as i64 * 86400 * 1_000_000,
-                            "hour" => {
-                                days as i64 * 86400 * 1_000_000
-                                    + (time_secs / 3600) * 3600 * 1_000_000
-                            }
-                            "minute" => {
-                                days as i64 * 86400 * 1_000_000 + (time_secs / 60) * 60 * 1_000_000
-                            }
-                            _ => {
-                                return Err(ExecError::Unsupported(format!("DATE_TRUNC({field})")));
-                            }
-                        };
-                        Ok(Value::Timestamp(truncated_us))
+                    Value::Timestamp(ts) => super::timestamptz::truncate_wall_clock(&field, *ts)
+                        .map(Value::Timestamp)
+                        .ok_or_else(|| ExecError::Unsupported(format!("DATE_TRUNC({field})"))),
+                    // Truncate on the session-zone wall clock, then read the
+                    // result back as an instant in that zone.
+                    Value::TimestampTz(us) => {
+                        let tz = self.session_time_zone()?;
+                        let wall = timestamptz_at_time_zone(*us, tz)?;
+                        let truncated = super::timestamptz::truncate_wall_clock(&field, wall)
+                            .ok_or_else(|| {
+                                ExecError::Unsupported(format!("DATE_TRUNC({field})"))
+                            })?;
+                        local_timestamp_at_time_zone(truncated, tz).map(Value::TimestampTz)
                     }
                     Value::Date(d) => {
                         let (y, m, _) = crate::types::days_to_ymd(*d);
@@ -2021,9 +2033,14 @@ impl Executor {
             }
             "ENCODE" => {
                 require_args(fname, &args, 2)?;
+                if args.iter().any(|value| matches!(value, Value::Null)) {
+                    return Ok(Value::Null);
+                }
                 let data = match &args[0] {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Bytea(bytes) => bytes.clone(),
                     Value::Text(s) => s.as_bytes().to_vec(),
-                    _ => return Err(ExecError::Unsupported("ENCODE requires text input".into())),
+                    _ => return Err(ExecError::Unsupported("ENCODE requires bytea input".into())),
                 };
                 let format = match &args[1] {
                     Value::Text(s) => s.to_lowercase(),
@@ -2047,7 +2064,11 @@ impl Executor {
             }
             "DECODE" => {
                 require_args(fname, &args, 2)?;
+                if args.iter().any(|value| matches!(value, Value::Null)) {
+                    return Ok(Value::Null);
+                }
                 let encoded = match &args[0] {
+                    Value::Null => return Ok(Value::Null),
                     Value::Text(s) => s.clone(),
                     _ => return Err(ExecError::Unsupported("DECODE requires text input".into())),
                 };
@@ -2081,14 +2102,12 @@ impl Executor {
                             }
                             i += 2;
                         }
-                        Ok(Value::Text(String::from_utf8_lossy(&bytes).to_string()))
+                        Ok(Value::Bytea(bytes))
                     }
                     "base64" => {
                         use base64::Engine;
                         match base64::engine::general_purpose::STANDARD.decode(&encoded) {
-                            Ok(bytes) => {
-                                Ok(Value::Text(String::from_utf8_lossy(&bytes).to_string()))
-                            }
+                            Ok(bytes) => Ok(Value::Bytea(bytes)),
                             Err(e) => {
                                 Err(ExecError::Unsupported(format!("base64 decode error: {e}")))
                             }
@@ -2236,7 +2255,9 @@ impl Executor {
                 let missing_ok = matches!(args.get(1), Some(Value::Bool(true)));
                 let key = name.to_lowercase();
                 let sess = self.current_session();
-                let user_val = sess.settings.read().get(&key).cloned();
+                let user_val = self
+                    .transaction_mode_setting(&key)
+                    .or_else(|| sess.settings.read().get(&key).cloned());
                 let value = user_val.or_else(|| {
                     Some(match key.as_str() {
                         "server_version" => "16.0 (Nucleus)".into(),
@@ -2273,10 +2294,15 @@ impl Executor {
                 Ok(Value::Null)
             }
             "PG_GET_SERIAL_SEQUENCE" => {
-                // No sequence objects exist; NULL matches Postgres for a
-                // column with no owned sequence. ORM introspection (drizzle)
-                // calls this per column to detect serial columns.
-                Ok(Value::Null)
+                // The sequence a serial column owns, else NULL. ORM
+                // introspection (drizzle) calls this per column to detect
+                // serial columns.
+                match (args.first(), args.get(1)) {
+                    (Some(Value::Text(t)), Some(Value::Text(c))) => {
+                        Ok(self.pg_get_serial_sequence(t, c))
+                    }
+                    _ => Ok(Value::Null),
+                }
             }
             "TXID_CURRENT" => Ok(Value::Int64(1)),
             "OBJ_DESCRIPTION" => {
@@ -2306,33 +2332,8 @@ impl Executor {
                     Some(Value::Int64(n)) => *n as i32,
                     _ => -1,
                 };
-                let type_name = match oid {
-                    16 => "boolean".to_string(),
-                    20 => "bigint".to_string(),
-                    21 => "smallint".to_string(),
-                    23 => "integer".to_string(),
-                    25 => "text".to_string(),
-                    700 => "real".to_string(),
-                    701 => "double precision".to_string(),
-                    1043 if typmod > 4 => format!("character varying({})", typmod - 4),
-                    1043 => "character varying".to_string(),
-                    1082 => "date".to_string(),
-                    1114 => "timestamp without time zone".to_string(),
-                    1184 => "timestamp with time zone".to_string(),
-                    1186 => "interval".to_string(),
-                    1700 => "numeric".to_string(),
-                    2950 => "uuid".to_string(),
-                    3802 => "jsonb".to_string(),
-                    17 => "bytea".to_string(),
-                    1042 => "character".to_string(),
-                    1005 => "smallint[]".to_string(),
-                    1007 => "integer[]".to_string(),
-                    1009 => "text[]".to_string(),
-                    1016 => "bigint[]".to_string(),
-                    16385 if typmod > 0 => format!("vector({typmod})"),
-                    16385 => "vector".to_string(),
-                    _ => "unknown".to_string(),
-                };
+                let snap = sync_block_on(self.pg_snapshot());
+                let type_name = self.format_type_with_snapshot(&snap, oid as i32, typmod);
                 Ok(Value::Text(type_name))
             }
             "PG_GET_EXPR" => {
@@ -2350,7 +2351,41 @@ impl Executor {
                 // Stub: always returns true
                 Ok(Value::Bool(true))
             }
+            "HAS_COLUMN_PRIVILEGE" => {
+                // has_column_privilege([user,] table, column, privilege): the
+                // engine grants per table, so this is the table-level answer.
+                let args = self.relation_oids_to_names(args);
+                let n = args.len();
+                if n == 4 {
+                    if let (Value::Text(user), Value::Text(table), Value::Text(privilege)) =
+                        (&args[0], &args[1], &args[3])
+                    {
+                        let privilege = privilege.to_uppercase();
+                        let key = privilege.split_whitespace().next().unwrap_or(&privilege);
+                        return Ok(Value::Bool(sync_block_on(
+                            self.check_privilege_for_role(user, table, key),
+                        )));
+                    }
+                    return Err(ExecError::Unsupported(
+                        "has_column_privilege argument types".into(),
+                    ));
+                }
+                if n < 3 {
+                    return Ok(Value::Bool(true));
+                }
+                let (Some(Value::Text(t)), Some(Value::Text(p))) =
+                    (args.get(n - 3), args.get(n - 1))
+                else {
+                    return Ok(Value::Bool(true));
+                };
+                let priv_upper = p.to_uppercase();
+                let priv_key = priv_upper.split_whitespace().next().unwrap_or(&priv_upper);
+                Ok(Value::Bool(sync_block_on(
+                    self.check_privilege(t, priv_key),
+                )))
+            }
             "HAS_TABLE_PRIVILEGE" => {
+                let args = self.relation_oids_to_names(args);
                 // has_table_privilege(table, privilege) or has_table_privilege(user, table, privilege)
                 // 3-arg form names the principal to test. Answering about the
                 // CALLER instead reported `true` for every table whenever a
@@ -2450,8 +2485,24 @@ impl Executor {
                 Ok(Value::Text("nucleus".to_string()))
             }
             "PG_GET_CONSTRAINTDEF" => {
-                // Stub: returns NULL
-                Ok(Value::Null)
+                // pg_get_constraintdef(constraint_oid[, pretty]) — the
+                // constraint clause as PostgreSQL deparses it. Unknown OID -> NULL.
+                let oid = match args.first() {
+                    Some(Value::Int32(n)) => *n,
+                    Some(Value::Int64(n)) => *n as i32,
+                    _ => return Ok(Value::Null),
+                };
+                let snap = sync_block_on(self.pg_snapshot());
+                Ok(self.pg_get_constraintdef_by_oid(&snap, oid))
+            }
+            "PG_GET_VIEWDEF" => {
+                let oid = match args.first() {
+                    Some(Value::Int32(n)) => *n,
+                    Some(Value::Int64(n)) => *n as i32,
+                    _ => return Ok(Value::Null),
+                };
+                let snap = sync_block_on(self.pg_snapshot());
+                Ok(self.pg_get_viewdef_by_oid(&snap, oid))
             }
             "PG_GET_INDEXDEF" => {
                 // pg_get_indexdef(index_oid[, colno, pretty]) — synthesize the
@@ -2462,23 +2513,8 @@ impl Executor {
                     Some(Value::Int64(n)) => *n,
                     _ => return Ok(Value::Null),
                 };
-                let tables = sync_block_on(self.catalog.list_tables());
-                let indexes = sync_block_on(self.catalog.get_all_indexes());
-                // Index OIDs are assigned positionally after table OIDs
-                // (16384 + tables.len() + i) — must match pg_class/pg_index.
-                let pos = oid - 16384 - tables.len() as i64;
-                if pos < 0 || pos as usize >= indexes.len() {
-                    return Ok(Value::Null);
-                }
-                let idx = &indexes[pos as usize];
-                let unique = if idx.unique { "UNIQUE " } else { "" };
-                Ok(Value::Text(format!(
-                    "CREATE {}INDEX {} ON public.{} USING btree ({})",
-                    unique,
-                    idx.name,
-                    idx.table_name,
-                    idx.columns.join(", ")
-                )))
+                let snap = sync_block_on(self.pg_snapshot());
+                Ok(self.pg_get_indexdef_by_oid(&snap, oid as i32))
             }
             "ARRAY_TO_STRING" => {
                 // array_to_string(array, sep [, null_string]) — used by \l on
@@ -3056,39 +3092,9 @@ impl Executor {
                 Ok(Value::Text(lines.join("\n")))
             }
 
-            "ENCRYPTED_LOOKUP" => {
-                // encrypted_lookup(index_name, value) — look up row IDs via encrypted index.
-                require_args(fname, &args, 2)?;
-                let idx_name = match &args[0] {
-                    Value::Text(s) => s.clone(),
-                    _ => {
-                        return Err(ExecError::Unsupported(
-                            "ENCRYPTED_LOOKUP arg 1 must be index name text".into(),
-                        ));
-                    }
-                };
-                let lookup_val = match &args[1] {
-                    Value::Text(s) => s.as_bytes().to_vec(),
-                    Value::Int32(n) => n.to_string().into_bytes(),
-                    Value::Int64(n) => n.to_string().into_bytes(),
-                    Value::Null => return Ok(Value::Null),
-                    other => format!("{other:?}").into_bytes(),
-                };
-                match self.encrypted_index_lookup(&idx_name, &lookup_val) {
-                    Some(ids) => {
-                        // Return as a comma-separated list of row IDs.
-                        let id_strs: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
-                        Ok(Value::Text(id_strs.join(",")))
-                    }
-                    None => Err(ExecError::Unsupported(format!(
-                        "encrypted index '{idx_name}' not found"
-                    ))),
-                }
-            }
-
-            // ================================================================
-            // KV store functions (Redis-compatible via SQL)
-            // ================================================================
+            "ENCRYPTED_LOOKUP" => Err(ExecError::Unsupported(
+                crate::storage::encrypted_index::UNSUPPORTED_ENCRYPTION.into(),
+            )),
             "KV_GET" => {
                 // kv_get(key) → value or NULL
                 require_args(fname, &args, 1)?;
@@ -4465,7 +4471,12 @@ impl Executor {
                 {
                     let mut store = self.columnar_store.write();
                     let xact = self.cross_model_before_columnar(&store);
-                    store.append_with_dict_in_xact(&table, batch, xact);
+                    if let Err(error) = store.append_with_dict_in_xact(&table, batch, xact) {
+                        self.memory_allocator.lock().release("columnar", estimated);
+                        return Err(ExecError::Storage(crate::storage::StorageError::Io(
+                            error.to_string(),
+                        )));
+                    }
                 }
                 Ok(Value::Text("OK".into()))
             }
@@ -4493,6 +4504,19 @@ impl Executor {
                 let store = self.columnar_store.read();
                 let mut total = 0.0f64;
                 for batch in store.batches_all(&table) {
+                    match batch.column(&col_name) {
+                        Some(
+                            crate::columnar::ColumnData::Int32(_)
+                            | crate::columnar::ColumnData::Int64(_)
+                            | crate::columnar::ColumnData::Float64(_),
+                        ) => {}
+                        Some(_) => {
+                            return Err(ExecError::Unsupported(format!(
+                                "{fname} requires numeric stored values; cast COLUMNAR_INSERT inputs explicitly",
+                            )));
+                        }
+                        None => return Err(ExecError::ColumnNotFound(col_name.clone())),
+                    }
                     total += crate::columnar::aggregate_sum(&batch, &col_name);
                 }
                 Ok(Value::Float64(total))
@@ -4512,6 +4536,19 @@ impl Executor {
                 let mut total_sum = 0.0f64;
                 let mut total_count = 0usize;
                 for batch in store.batches_all(&table) {
+                    match batch.column(&col_name) {
+                        Some(
+                            crate::columnar::ColumnData::Int32(_)
+                            | crate::columnar::ColumnData::Int64(_)
+                            | crate::columnar::ColumnData::Float64(_),
+                        ) => {}
+                        Some(_) => {
+                            return Err(ExecError::Unsupported(format!(
+                                "{fname} requires numeric stored values; cast COLUMNAR_INSERT inputs explicitly",
+                            )));
+                        }
+                        None => return Err(ExecError::ColumnNotFound(col_name.clone())),
+                    }
                     if let Some(col) = batch.column(&col_name) {
                         let cnt = crate::columnar::count_non_null(col);
                         total_sum += crate::columnar::aggregate_sum(&batch, &col_name);
@@ -4538,6 +4575,19 @@ impl Executor {
                 let store = self.columnar_store.read();
                 let mut result: Option<f64> = None;
                 for batch in store.batches_all(&table) {
+                    match batch.column(&col_name) {
+                        Some(
+                            crate::columnar::ColumnData::Int32(_)
+                            | crate::columnar::ColumnData::Int64(_)
+                            | crate::columnar::ColumnData::Float64(_),
+                        ) => {}
+                        Some(_) => {
+                            return Err(ExecError::Unsupported(format!(
+                                "{fname} requires numeric stored values; cast COLUMNAR_INSERT inputs explicitly",
+                            )));
+                        }
+                        None => return Err(ExecError::ColumnNotFound(col_name.clone())),
+                    }
                     let v = match crate::columnar::aggregate_min(&batch, &col_name) {
                         crate::columnar::AggValue::Float64(v) => Some(v),
                         crate::columnar::AggValue::Int64(v) => Some(v as f64),
@@ -4567,6 +4617,19 @@ impl Executor {
                 let store = self.columnar_store.read();
                 let mut result: Option<f64> = None;
                 for batch in store.batches_all(&table) {
+                    match batch.column(&col_name) {
+                        Some(
+                            crate::columnar::ColumnData::Int32(_)
+                            | crate::columnar::ColumnData::Int64(_)
+                            | crate::columnar::ColumnData::Float64(_),
+                        ) => {}
+                        Some(_) => {
+                            return Err(ExecError::Unsupported(format!(
+                                "{fname} requires numeric stored values; cast COLUMNAR_INSERT inputs explicitly",
+                            )));
+                        }
+                        None => return Err(ExecError::ColumnNotFound(col_name.clone())),
+                    }
                     let v = match crate::columnar::aggregate_max(&batch, &col_name) {
                         crate::columnar::AggValue::Float64(v) => Some(v),
                         crate::columnar::AggValue::Int64(v) => Some(v as f64),

@@ -1170,6 +1170,12 @@ const isolationProbes = [
         }, { isolation: "serializable" }),
       ]);
       const failures = outcomes.filter((o) => o.status === "rejected");
+      // A backend may explicitly refuse SERIALIZABLE (e.g. default Nucleus
+      // disk storage: 0A000). Preserve that server error as unsupported,
+      // rather than mislabelling every rejection a serialization failure.
+      // This is the capability under test, not a missing setup prerequisite.
+      const unexpected = failures.find((o) => o.reason?.sqlstate !== "40001");
+      if (unexpected) throw unexpected.reason;
       assert.equal(failures.length, 1, `expected exactly one serialization failure, got ${failures.length}`);
       assert.equal(failures[0].reason?.sqlstate, "40001", describeError(failures[0].reason));
     }),

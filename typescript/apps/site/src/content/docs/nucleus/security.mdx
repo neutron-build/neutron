@@ -121,7 +121,12 @@ Old keys are retained for decrypting data written before rotation.
 
 ### Encrypted Indexes
 
-Nucleus supports encrypted indexes that store index entries in ciphertext. Search operations decrypt at query time — the index file on disk contains no plaintext.
+Encrypted index modes are unavailable. `CREATE INDEX ... USING ENCRYPTED`,
+`ENCRYPTED_OPE`, `ENCRYPTED_RANDOM`, and `ENCRYPTED_LOOKUP` refuse with SQLSTATE
+`0A000`. The retired prototype did not provide secure cryptography. Recovery
+keeps historical catalog definitions and base rows but does not rebuild those
+sidecars. Base rows remain plaintext; this boundary is separate from page-level
+encryption at rest.
 
 ## Audit Logging
 

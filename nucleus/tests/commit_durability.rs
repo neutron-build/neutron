@@ -50,7 +50,7 @@ async fn boot(data: &Path) -> (Arc<Executor>, Arc<BufferedDiskEngine>) {
         Some(catalog_path),
         Some(data),
     ));
-    exec.restore_table_engines().await;
+    exec.restore_table_engines().await.unwrap();
     (exec, buffered)
 }
 
@@ -464,6 +464,8 @@ fn t_def(name: &str, epoch: u64) -> TableDef {
             default_expr: None,
             id: 1,
             analyzer: None,
+            generation: None,
+            max_len: None,
         }],
         constraints: Vec::new(),
         append_only: false,

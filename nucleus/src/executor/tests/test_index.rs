@@ -250,183 +250,57 @@ async fn test_btree_range_scan_explain_shows_index_range() {
     );
 }
 
-// Encrypted index integration tests
-// ================================================================
-
+// Retired insecure encrypted-index surface: refusal precedes metadata mutation.
 #[tokio::test]
-async fn test_encrypted_index_creation() {
-    unsafe {
-        std::env::set_var("NUCLEUS_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef");
-    }
+async fn test_encrypted_index_modes_refuse_without_mutating_rows_or_catalog() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE secrets (id INT, ssn TEXT)").await;
-    exec(&ex, "INSERT INTO secrets VALUES (1, '123-45-6789')").await;
-    exec(&ex, "INSERT INTO secrets VALUES (2, '987-65-4321')").await;
-
-    // Create encrypted index.
-    exec(&ex, "CREATE INDEX ssn_enc ON secrets USING encrypted (ssn)").await;
-
-    // Verify index was created.
-    let indexes = ex.encrypted_indexes.read();
-    assert!(indexes.contains_key("ssn_enc"));
-    let entry = indexes.get("ssn_enc").unwrap();
-    assert_eq!(entry.table_name, "secrets");
-    assert_eq!(entry.column_name, "ssn");
-    assert_eq!(entry.index.len(), 2);
-}
-
-#[tokio::test]
-async fn test_encrypted_index_lookup_function() {
-    unsafe {
-        std::env::set_var("NUCLEUS_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef");
+    exec(&ex, "CREATE TABLE secrets (id INT, token TEXT)").await;
+    exec(&ex, "INSERT INTO secrets VALUES (1, 'alpha'), (2, 'beta')").await;
+    for mode in ["encrypted", "encrypted_ope", "encrypted_random"] {
+        let error = ex
+            .execute(&format!(
+                "CREATE INDEX secret_{mode} ON secrets USING {mode} (token)"
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ExecError::Unsupported(ref message) if message == crate::storage::encrypted_index::UNSUPPORTED_ENCRYPTION)
+        );
+        assert!(ex.catalog.get_indexes("secrets").await.is_empty());
+        assert!(ex.encrypted_indexes.read().is_empty());
     }
-    let ex = test_executor();
-    exec(&ex, "CREATE TABLE patients (id INT, ssn TEXT)").await;
-    exec(&ex, "INSERT INTO patients VALUES (1, 'AAA')").await;
-    exec(&ex, "INSERT INTO patients VALUES (2, 'BBB')").await;
-    exec(&ex, "INSERT INTO patients VALUES (3, 'AAA')").await;
-
+    let error = ex
+        .execute("SELECT ENCRYPTED_LOOKUP('missing', 'alpha')")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, ExecError::Unsupported(ref message) if message == crate::storage::encrypted_index::UNSUPPORTED_ENCRYPTION)
+    );
+    let result = exec(&ex, "SELECT id, token FROM secrets ORDER BY id").await;
+    assert_eq!(
+        rows(&result[0]),
+        &vec![
+            vec![Value::Int32(1), Value::Text("alpha".into())],
+            vec![Value::Int32(2), Value::Text("beta".into())]
+        ]
+    );
+    // Ordinary mutations and rollback remain available; retirement is explicit.
     exec(
         &ex,
-        "CREATE INDEX pat_ssn_enc ON patients USING encrypted (ssn)",
+        "BEGIN; UPDATE secrets SET token = 'changed' WHERE id = 1; ROLLBACK",
     )
     .await;
-
-    // Lookup via ENCRYPTED_LOOKUP function.
-    let results = exec(
-        &ex,
-        "SELECT ENCRYPTED_LOOKUP('pat_ssn_enc', 'AAA') FROM patients LIMIT 1",
-    )
-    .await;
-    let r = rows(&results[0]);
-    // Should find row IDs for both rows with 'AAA'.
-    let ids_str = match &r[0][0] {
-        Value::Text(s) => s.clone(),
-        other => panic!("expected text, got {other:?}"),
-    };
-    assert!(!ids_str.is_empty(), "should find matching rows");
-}
-
-#[tokio::test]
-async fn test_encrypted_index_maintained_on_insert() {
-    unsafe {
-        std::env::set_var("NUCLEUS_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef");
-    }
-    let ex = test_executor();
-    exec(&ex, "CREATE TABLE enc_data (id INT, code TEXT)").await;
-
-    // Create index first (empty table).
-    exec(
-        &ex,
-        "CREATE INDEX code_enc ON enc_data USING encrypted (code)",
-    )
-    .await;
-    {
-        let indexes = ex.encrypted_indexes.read();
-        assert_eq!(indexes.get("code_enc").unwrap().index.len(), 0);
-    }
-
-    // Insert rows — encrypted index should be maintained.
-    exec(&ex, "INSERT INTO enc_data VALUES (1, 'alpha')").await;
-    exec(&ex, "INSERT INTO enc_data VALUES (2, 'beta')").await;
-    exec(&ex, "INSERT INTO enc_data VALUES (3, 'alpha')").await;
-    {
-        let indexes = ex.encrypted_indexes.read();
-        // len() counts unique encrypted keys: 'alpha' and 'beta' = 2 unique keys
-        assert_eq!(indexes.get("code_enc").unwrap().index.len(), 2);
-    }
-}
-
-/// Regression: the inline INSERT hook must assign each row its true scan
-/// position, not the count of distinct ciphertexts. Two consecutive duplicate
-/// values followed by a new value used to collide (the third row got the same
-/// id as the second) because the hook keyed on `index.len()` (distinct-key
-/// count) instead of the running posting count. Plain autocommit INSERT no
-/// longer rebuilds, so this stood as a silent wrong-position result from
-/// ENCRYPTED_LOOKUP.
-#[tokio::test]
-async fn test_encrypted_index_insert_hook_positions_duplicates() {
-    unsafe {
-        std::env::set_var("NUCLEUS_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef");
-    }
-    let ex = test_executor();
-    exec(&ex, "CREATE TABLE enc_dup (id INT, code TEXT)").await;
-    exec(
-        &ex,
-        "CREATE INDEX enc_dup_code ON enc_dup USING encrypted (code)",
-    )
-    .await;
-
-    // Order matters: two duplicates then a fresh value. Positions are 0, 1, 2.
-    exec(&ex, "INSERT INTO enc_dup VALUES (1, 'dup')").await;
-    exec(&ex, "INSERT INTO enc_dup VALUES (2, 'dup')").await;
-    exec(&ex, "INSERT INTO enc_dup VALUES (3, 'uniq')").await;
-
-    let lookup = |val: &str| {
-        let ex = &ex;
-        let sql = format!("SELECT ENCRYPTED_LOOKUP('enc_dup_code', '{val}') FROM enc_dup LIMIT 1");
-        async move {
-            let result = exec(ex, &sql).await;
-            match &rows(&result[0])[0][0] {
-                Value::Text(s) => s.clone(),
-                other => panic!("expected text, got {other:?}"),
-            }
-        }
-    };
-
-    // 'uniq' is the third row → scan position 2, not 1.
-    assert_eq!(lookup("uniq").await, "2");
-    // Both duplicates keep their distinct positions.
-    assert_eq!(lookup("dup").await, "0,1");
-}
-
-#[tokio::test]
-async fn test_encrypted_index_row_ids_rebuilt_after_delete_and_rollback() {
-    unsafe {
-        std::env::set_var("NUCLEUS_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef");
-    }
-    let ex = test_executor();
-    exec(&ex, "CREATE TABLE enc_shift (id INT, code TEXT)").await;
-    exec(
-        &ex,
-        "INSERT INTO enc_shift VALUES (1, 'a'), (2, 'b'), (3, 'c')",
-    )
-    .await;
-    exec(
-        &ex,
-        "CREATE INDEX enc_shift_code ON enc_shift USING encrypted (code)",
-    )
-    .await;
-
-    exec(&ex, "DELETE FROM enc_shift WHERE id = 1").await;
-    let result = exec(
-        &ex,
-        "SELECT ENCRYPTED_LOOKUP('enc_shift_code', 'c') FROM enc_shift LIMIT 1",
-    )
-    .await;
-    assert_eq!(rows(&result[0])[0][0], Value::Text("1".into()));
-
-    exec(&ex, "BEGIN").await;
-    exec(&ex, "DELETE FROM enc_shift WHERE id = 2").await;
-    exec(&ex, "ROLLBACK").await;
-    let result = exec(
-        &ex,
-        "SELECT ENCRYPTED_LOOKUP('enc_shift_code', 'c') FROM enc_shift LIMIT 1",
-    )
-    .await;
-    assert_eq!(rows(&result[0])[0][0], Value::Text("1".into()));
+    let result = exec(&ex, "SELECT token FROM secrets WHERE id = 1").await;
+    assert_eq!(rows(&result[0]), &vec![vec![Value::Text("alpha".into())]]);
 }
 
 #[tokio::test]
 async fn test_specialty_index_rebuilt_after_fk_cascade() {
-    unsafe {
-        std::env::set_var("NUCLEUS_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef");
-    }
     let ex = test_executor();
     exec(&ex, "CREATE TABLE enc_parent (id INT PRIMARY KEY)").await;
     exec(
         &ex,
-        "CREATE TABLE enc_child (id INT, pid INT REFERENCES enc_parent(id) ON DELETE CASCADE, code TEXT)",
+        "CREATE TABLE enc_child (id INT PRIMARY KEY, pid INT REFERENCES enc_parent(id) ON DELETE CASCADE, code TEXT)",
     )
     .await;
     exec(&ex, "INSERT INTO enc_parent VALUES (1), (2)").await;
@@ -437,17 +311,13 @@ async fn test_specialty_index_rebuilt_after_fk_cascade() {
     .await;
     exec(
         &ex,
-        "CREATE INDEX enc_child_code ON enc_child USING encrypted (code)",
+        "CREATE INDEX enc_child_code ON enc_child USING FTS (code)",
     )
     .await;
 
     exec(&ex, "DELETE FROM enc_parent WHERE id = 1").await;
-    let result = exec(
-        &ex,
-        "SELECT ENCRYPTED_LOOKUP('enc_child_code', 'kept') FROM enc_child LIMIT 1",
-    )
-    .await;
-    assert_eq!(rows(&result[0])[0][0], Value::Text("0".into()));
+    let result = exec(&ex, "SELECT id FROM enc_child WHERE code @@ 'kept'").await;
+    assert_eq!(rows(&result[0])[0][0], Value::Int32(20));
 }
 
 #[tokio::test]

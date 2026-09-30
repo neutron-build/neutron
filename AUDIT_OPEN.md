@@ -4,19 +4,14 @@ Unresolved findings for this repository from the ChatGPT-led audit series.
 Read this before treating related work as done; update it when you close,
 defer, or upstream-report an item.
 
-Open items: **2 deferral clusters** (5 and 6 below — WebAuthn and the
-versioned/CAS session store; both need external-library or public-API
-decisions). Everything else is fixed, partially fixed with the remainder
-scoped, or recorded as a false positive with evidence. The 2026-09-17
-round-2 re-verification repaired all five disputed closures and resolved
-the twelve new findings it raised; round 3 closed its partials; round 4
-(2026-09-18, below) closed the four WAL-format deferral clusters and the
-consumer-reported snapshot-capability gap under the founder-ratified
-"WAL format v2 + snapshot lease" direction; round 5 (2026-09-18, above)
-closed the three lease-scope defects reported from the observe backup
-session and landed NU-01's unblocked compaction subset. Separately, engine
-defects the ORM program reported upstream (N1-N16, N1 security-class) are
-listed at the end; N1 was closed 2026-09-28 (X07), the rest are open.
+The WebAuthn and versioned session-store deferrals were implemented on
+2026-09-30 with explicit migration requirements. Earlier audit findings are
+fixed, partially fixed with the remainder scoped, or recorded as false
+positives with evidence. The 2026-09-17 through 2026-09-18 re-verifications
+resolved the disputed closures, WAL-format and snapshot-lease defects, and
+NU-01's bounded compaction subset. The ORM program's N1–N16 findings are
+tracked below as verified bounded contracts and remaining unsupported
+behavior; their original blanket open status no longer describes the source.
 
 ## Resolved 2026-09-18 (round 5 — lease-scope closure + NU-01 compaction subset)
 
@@ -134,8 +129,8 @@ FALSE-POSITIVE (not reproducible in source; evidence cited).
 | TS-04 | FIXED — cache keys carry origin, Accept-Language, X-Neutron-Data/Routes | c31736eb |
 | TS-05 | FIXED — case-insensitive directive parsing, request no-store/no-cache honored, Vary checked against keyed set, TTL capped by s-maxage/max-age | c31736eb |
 | TS-06 | FIXED-PARTIAL — byte-exact bodies with per-entry budget and Content-Length validation; aggregate store budget + concurrent-fill cap not added (entry-count bound remains) | c31736eb |
-| TS-07 | FIXED-PARTIAL — epoch advances at mutation START and again at COMPLETION (round-2 dispute repaired); loader fills re-check a generation fence before publishing; for async EXTERNAL cache stores the fence is best-effort (check-then-set is not atomic across a network boundary) | r2 |
-| TS-08 | FIXED — segment-based traversal matching the serving path; invalidation matches exact cache-key path fields (no /user sweeping /users) | c31736eb |
+| TS-07 | FIXED — mutation start/completion invalidation advances the backing-store generation; response and loader fills publish only through atomic `setIfGeneration`. Custom server stores without the contract are refused before resources open. Completion always invalidates the mutation path, including actions without an invalidation header. Delayed external publication and during-action GET regressions cover already-published fills and fills through a second server sharing the backing store. | r2 + `cache-atomic-publication.e2e.test.ts` |
+| TS-08 | FIXED — segment-based traversal matching the serving path; invalidation matches exact cache-key path fields (no /user sweeping /users); canonical server paths are segment-encoded before passing the raw-path store contract, preserving residual percent signs in automatic and explicit mutation invalidation | c31736eb |
 | TS-09 | FIXED — static HTML cache never answers X-Neutron-Data/JSON requests | c31736eb |
 | TS-10 | FIXED — backslash/NUL rejected in URL paths; image source resolution is realpath-contained (escaping symlinks refused). @hono/node-server's serveStatic is library surface, not modified here | 67ff9c6b |
 | TS-11 | FIXED — remote fetch uses redirect:error and rejects URL credentials | 67ff9c6b |
@@ -146,7 +141,7 @@ FALSE-POSITIVE (not reproducible in source; evidence cited).
 | TS-16 | FIXED — eviction always makes progress (no floor(0.1n)=0 for n<10); replacement refreshes LRU recency | 67ff9c6b |
 | TS-17 | FIXED — session/CSRF middleware rewrap responses before appending Set-Cookie (immutable headers no longer throw post-persistence) | 67ff9c6b |
 | TS-18 | FIXED — Set-Cookie values appended (getSetCookie), parent/child cookies preserved | acf405c0 |
-| TS-19 | DEFERRED — revocation fencing needs a versioned/CAS session-store contract; that is a public API redesign (SessionStorage interface, store schema), not a patch | — |
+| TS-19 | FIXED — middleware requires atomic revision-conditional commit, rotation and revocation. Memory and SQL adapters implement the contract; stale persistence suppresses the original response/cookie with 503. Legacy custom stores are refused. This fences stored state, not already executing application work. | `session.test.ts`, `session-sql.integration.test.ts`; migration: `go/neutronauth/README.md` |
 | TS-20 | FIXED — memory session and loader-cache data deep-cloned at ingress and egress | 67ff9c6b |
 | TS-21 | FIXED-PARTIAL — live-key cap admits no new keys (controlled 429), options validated, first-request headers emitted; populating context.clientAddress from the transport remains a feature (the missing-address warning is already in place) | 67ff9c6b |
 | TS-22 | FIXED — DELETE bodies covered; Content-Length stays as the early check (middleware + adapter). Round 4 landed the actual-byte half: `maxRequestBodyBytes` makes the server adapter wrap every body-bearing request's stream so reading past the cap fails with 413 and cancels the sender — covering chunked (no Content-Length) bodies and lying declared lengths | 67ff9c6b + r4 |
@@ -173,8 +168,8 @@ FALSE-POSITIVE (not reproducible in source; evidence cited).
 | GO-13 | FIXED-PARTIAL — built-ins yield to method-equivalent user routes; OpenAPI regenerates on a registration-generation mismatch. Mount/Static route-record unification not redesigned (mounts stay opaque to OpenAPI by design) | 4f743588 |
 | GO-14 | FIXED — >=32-byte keys, pinned JOSE header, UseNumber decode, duplicate-key and trailing-JSON rejection, mandatory numeric exp checked at now>=exp, nbf honored | 086e0253 |
 | GO-15 | FIXED — caller's claims map copied; nil map works; positive-lifetime validation | 086e0253 |
-| GO-16 | DEFERRED — a complete WebAuthn registration ceremony requires a full CBOR/WebAuthn library integration (new dependency + store/API redesign). FinishRegistration carries an explicit unsafe-scaffold warning until then | — |
-| GO-17 | FIXED-PARTIAL — RP ID hash, minimum authData length, UP flag verified; failed counter persistence fails the login. Full ceremony validation rides the GO-16 deferral | 086e0253 |
+| GO-16 | FIXED — go-webauthn parses and verifies registration/assertion ceremonies with single-consume challenge state and versioned credentials. Legacy registrations require authenticated re-enrollment. Default none attestation does not establish hardware provenance. | `go/neutronauth/webauthn_test.go`; migration: `go/neutronauth/README.md` |
+| GO-17 | FIXED — library verification covers challenge, origin, RP ID, presence/verification, signature and counter semantics; failed credential CAS refuses login. Zero counters follow library semantics and are not proof against cloning. | `go/neutronauth/webauthn_test.go` |
 | GO-18 | FIXED — token-prefix identity fallback removed; verified userinfo endpoint required; numeric subjects decode with UseNumber; empty subject rejected | 086e0253 |
 | GO-19 | FIXED — bounded owned HTTP client, inbound-context outbound requests, trimmed body classification, limit+1 truncation rejection, >=32-byte state secrets, query-preserving authorization URL | 086e0253 |
 | GO-20 | FIXED — rotation/revocation failure replaces the response with 503, suppresses body and cookie; onCommitError retained for observability | 086e0253 |
@@ -222,9 +217,13 @@ FALSE-POSITIVE (not reproducible in source; evidence cited).
 2. ~~**Atomic cross-model commit record**~~ — resolved 2026-09-18 (round 4).
 3. ~~**Lossless WAL schema codec**~~ — resolved 2026-09-18 (round 4).
 4. ~~**Versioned WAL framing**~~ — resolved 2026-09-18 (round 4).
-5. **WebAuthn library integration** (GO-16): new dependency + ceremony/persistence API.
-6. **Versioned/CAS session store contract** (TS-19, and the fenced half of
-   GO-20/GO-21): public API redesign across the TS and Go SDKs.
+5. ~~**WebAuthn library integration**~~ (GO-16) — resolved 2026-09-30;
+   ceremony verification and credential persistence require the documented migration.
+6. ~~**Versioned/CAS session store contract**~~ (TS-19 and the fenced half of
+   GO-20/GO-21) — resolved 2026-09-30; unversioned stores are refused.
+
+The session/WebAuthn contract migration and operational limits are documented in
+[`go/neutronauth/README.md`](go/neutronauth/README.md).
 
 ## Resolved deferrals (2026-09-18, round 4 — WAL format v2 + snapshot lease)
 
@@ -431,43 +430,136 @@ them without that folder:
    from background tasks) are not lease-gated — a backup of those models
    still relies on their own snapshot/checkpoint paths.
 
-## Reported by the ORM program, open (2026-09-24, upstream engine defects)
+## ORM program findings and remaining boundaries (reported 2026-09-24)
 
-The ORM program's Nucleus conformance work (card X00 and the X01-X05 model
-legs) measured engine defects against Nucleus 1.0.2, `nucleus/` tree
-`3313729a`. They are recorded with reproducers in
-`conformance/live/orm/ORM_CONFORMANCE.md` ("Engine defects and upstream
-reproducers"); engine fixes are outside that program, and the ORM keeps
-every affected capability gated off or unadvertised on Nucleus. Listed here
-so engine sessions see them:
+The ORM program's Nucleus defects were originally measured on tree
+`3313729a`. X07–X12 repairs and the fresh X13 recording now distinguish
+verified bounded contracts from remaining limits. The canonical per-driver
+results and source identity are in
+`conformance/live/orm/capabilities.nucleus.json`; generated tables and
+reproducers are in `conformance/live/orm/ORM_CONFORMANCE.md`.
 
-- **N1 (security) — CLOSED 2026-09-28 (orm-program X07, commit `081183f9`)** —
-  `SET LOCAL ROLE` / `SET LOCAL` settings persisted after `COMMIT`/`ROLLBACK`,
-  and `RESET ROLE` was a no-op: a pooled connection kept an assumed role for
-  the next borrower. Transaction-scoped `SET` state is now restored at COMMIT,
-  ROLLBACK, aborted-transaction COMMIT, `ROLLBACK TO SAVEPOINT`, pool return;
-  `RESET ROLE`/`RESET ALL`/`DISCARD ALL` drop the role (RESET ALL
-  deliberately differs from PostgreSQL, fails closed); multi-statement messages get an
-  implicit block for SET state only (COMMIT/ROLLBACK in a message match
-  PostgreSQL for SET state, not data); `lock_timeout` is per session.
-  **Known divergence, candidate follow-up: multi-statement simple queries are
-  not atomic** (earlier statements' data persists when a later one fails, and
-  an in-message ROLLBACK does not undo data: `insert 1; rollback; insert 2;
-  select count(*)` gives 1 on PostgreSQL 17, 2 here). Regressions:
-  `nucleus/src/executor/tests/test_set_local_scope.rs`; live probes
-  `rls.set_local_*` / `rls.set_session_setting_transaction_scope`
-  (`conformance/live/orm/`). `set_config()` remains missing (N-list, unchanged).
-- **N3 (silent data corruption)** — timestamptz input ignores explicit
-  offsets and the session `TimeZone`.
-- **N2, N4-N13** — non-transactional DDL, catalog fidelity,
-  generated/identity columns, deferrable constraints, lock/cancel surface,
-  array wire codec, `UPDATE ... FROM`/`DELETE ... USING`, `jsonb_agg`,
-  isolation and `READ ONLY`, value-shape divergences, derived-table column
-  lists.
-- **N14** — columnar `SUM`/`MIN`/`MAX` over values bound without a type
-  answer 0/NULL instead of an error. **N15, N16** — stale columnar prose in
-  `nucleus/docs/MODEL_SEMANTICS.md` (durability and in-transaction insert).
+- **N1 (security) — closed bounded scope.** Transaction-scoped SET LOCAL,
+  role reset, rollback/savepoints and session cleanup were repaired in X07.
+  X08 additionally supplies implicit simple-message data rollback on the
+  server path and explicit COMMIT/ROLLBACK block separation. The old blanket
+  non-atomic-message claim is obsolete; transactional DDL and universal
+  cancellation/custom-engine parity are not established. set_config remains
+  unavailable. RESET ALL also drops the role, a deliberate fail-closed
+  PostgreSQL difference.
+- **N3 — repaired bounded temporal contracts.** Fresh X13 probes for
+  TIMESTAMPTZ explicit offsets and session zones pass on both drivers.
+  Ambiguous/nonexistent bare local DST inputs are refused; date infinity
+  remains unavailable.
+- **N5/N6 — verified bounded column and FK contracts.** Fresh generated,
+  identity and deferred-FK probes pass on both drivers after X10, with
+  integrated regression coverage. Generated expressions admit only the
+  documented scalar/row subset; unverified forms are refused. Deferred
+  PRIMARY KEY/UNIQUE remain refused; PostgreSQL 42P17 parity is not claimed.
+  DEFAULT VALUES and varchar/char write-length contracts also pass;
+  numeric(p,s) typemods remain unenforced.
+- **N8/N10/N13 — bounded repairs.** Integer-array result/ANY, JSONB_AGG,
+  correlated relational reads and positional derived aliases pass on both
+  drivers. Text-array parameters still fail through postgres.js while pg
+  passes. Stored multidimensional/interval/vector arrays and overlong alias
+  lists are refused. No universal array or scalar-OID parity is claimed.
+- **N11 — modes enforced, engine limits retained.** READ ONLY rejects
+  writes. Buffered storage supplies READ COMMITTED and explicitly refuses
+  REPEATABLE READ/SERIALIZABLE with 0A000; those isolation probes remain
+  unsupported. Higher isolation requires MVCC storage.
+- **N2/N4/N7/N9/N12 — remaining limits.** DDL catalog changes are not
+  transactional. Selected catalog queries pass, but full introspection
+  boolean shape, CHECK rendering, regclass output and scalar Text OID 1043
+  versus PostgreSQL 25 remain. Advisory locking, LOCK TABLE and SQL sleep/
+  cancellation functions are unavailable; the row-lock timeout probe still
+  returns XX000 after about 10 seconds. UPDATE FROM/DELETE USING refuse before
+  mutation. Numeric range/scale, enum sorting and row comparisons retain
+  their recorded limits. None are advertised as PostgreSQL parity.
+- **N14/N15/N16 — closed bounded findings in X13.** Fresh X03 checks
+  confirm SUM/AVG/MIN/MAX over untyped columnar values all refuse with 0A000;
+  typed numeric aggregates remain exact. Documentation correction df718e66
+  states attached-WAL/synchronous_commit=on fsync with memory/off and append
+  error limits. COLUMNAR_INSERT inside BEGIN refuses before mutation and
+  ROLLBACK leaves the fixture count unchanged. Clean restart and SIGKILL
+  recovery pass for the tested stores; SIGKILL alone does not prove power-loss
+  durability. Columnar-model writes remain outside SQL rollback.
+- **Concurrent derived state — bounded physical B-tree repair at X13.** Ordinary
+  DML preserves engine-maintained physical postings; controlled before/after
+  and structural physical-posting regressions passed. The later 2026-09-30
+  repair below adds writer-generation checks, a demonstrated FTS regression
+  and zone-map/transaction visibility invariants, and retires encrypted modes.
+  These bounded results do not certify universal vector, FTS or zone-map
+  scan/publication coherence; a selected passing soak does not do so either.
+
+Advertised family contracts are scoped in
+`conformance/live/orm/ORM_CONFORMANCE.md`: relational SQL, KV, documents,
+graph, time series, columnar, geo, blob, streams and Datalog retain their
+measured limits. CDC/Pub/Sub expose bounded notification or model inspection,
+not commit confirmation, replay or exactly-once delivery. pgvector columns
+and FTS function probes remain unsupported; native vector/FTS APIs were not
+verified by these model legs and are not advertised as verified.
 
 Out-of-repo note: Lullmail's vendored copies of the send.go / bearer-transport
 blobs (flagged in neutron-12/13/16 as affected consumers) are NOT fixed here —
 that is a separate repo and needs its own sync.
+
+## Cached-function privacy and bounded retention (2026-09-30)
+
+The core `cache()` previously keyed only on a prefix and arguments in a process
+map: different functions collided, and authenticated HTTP requests could receive
+another request's result. Function identities and Node request-local scopes now
+isolate results. Server calls outside a request have no implicit cache; public
+process sharing requires `scope: "shared"`. Entry ceilings and complete tag/timer
+cleanup bound retention. `request-cache-security.test.ts` checks sequential and
+concurrent authenticated requests over HTTP, including within-request
+single-flight behavior; `cache.test.ts` covers identity, limits and cleanup.
+The request provider, function identities and explicit shared scope are realm-wide
+so real SSR and HTTP adapter module graphs share tag invalidation.
+`request-cache-ssr.e2e.test.ts` exercises both request deduplication and shared
+tag invalidation through the real SSR runtime.
+
+## Durable override failures and retired crypto modes (2026-09-30)
+
+Declared disk-backed columnar and LSM engines now propagate open failures rather
+than silently selecting memory storage. CREATE opens its intended storage before
+publishing catalog metadata; startup refuses failed override recovery. A real
+filesystem obstruction regression verifies refusal and original-row recovery.
+
+Columnar append and checkpoint failures propagate to callers. Operations refused
+before WAL publication leave live state unchanged. An I/O failure after encoded
+bytes were written can have an uncertain outcome; the engine fences further
+reads, writes and durability acknowledgements until reopen. Fault tests distinguish
+these outcomes rather than claiming arbitrary-I/O failure atomicity or power-loss
+proof.
+
+Detached specialty publication uses writer generations, and readers decline
+stale or in-flight images. The FTS regression reproduces a completed concurrent
+INSERT missing from indexed results before the fix; generation checks preserve
+its authoritative result afterwards. Zone-map and cross-session transaction
+visibility tests are additional invariants, not separate demonstrated before
+failures.
+
+The encrypted-index prototype exposed plaintext under a chosen-zeroes query.
+Public construction and SQL admissions now refuse all legacy encrypted modes;
+recovery preserves base rows without rebuilding insecure sidecars. No secure
+replacement cryptographic format is implemented or advertised.
+
+
+Core-only and WASM derived-index generation scopes use poll-scoped thread-local
+values instead of requiring Tokio's server runtime. The value is restored after
+each poll, including pending, nested and unwinding polls, so suspended embedded
+executions do not inherit another future's reader or writer generation. Server
+builds retain Tokio task-local scopes. The core-only scope tests exercise
+interleaved polls, nesting, panic restoration and cancellation without a runtime.
+
+## Native FTS recovery refusal (2026-09-30)
+
+Native FTS recovery combines a checkpoint with its subsequent WAL tail. A corrupt
+or unreadable existing checkpoint, or an unopenable declared FTS WAL, now refuses
+persistent executor construction instead of serving an incomplete or volatile
+index. `try_new_with_persistence` returns the recovery error; the compatibility
+constructor refuses with a clear panic. The server and maintenance opener use
+the fallible constructor. Missing checkpoints remain valid for fresh/WAL-only
+recovery. Tests reproduce all three unsafe successes before the fix, preserve
+the failed files, and verify checkpoint-plus-tail recovery remains writable
+across a second reopen. This does not establish power-loss durability.

@@ -1091,6 +1091,75 @@ func WithoutInternalMetadata(doc *V2Document) (*V2Document, []V2Identity, error)
 	return out, removed, nil
 }
 
+// PreserveUnmanaged carries the managed: false markers of a previous
+// document onto a freshly introspected one. Introspection never infers scope
+// (every object it lists is managed), so without this a pull over a document
+// that marks tables as not neutron's would silently take them over. An
+// object the previous document marks managed: false and the pulled document
+// still lists keeps the marker (its content is the live catalog's); one the
+// database no longer has is dropped from the result. It returns the objects
+// that kept the marker, as "kind schema.name".
+func PreserveUnmanaged(pulled, previous *V2Document) (*V2Document, []string, error) {
+	var prev V2DocumentModel
+	if err := json.Unmarshal(previous.Canonical, &prev); err != nil {
+		return nil, nil, fmt.Errorf("decode previous schema document: %w", err)
+	}
+	type objectIdentity struct {
+		kind string
+		id   V2Identity
+	}
+	unmanaged := map[objectIdentity]bool{}
+	for _, t := range prev.Tables {
+		if !t.Managed {
+			unmanaged[objectIdentity{"tables", t.Identity}] = true
+		}
+	}
+	for _, v := range prev.Views {
+		if !v.Managed {
+			unmanaged[objectIdentity{"views", v.Identity}] = true
+		}
+	}
+	for _, e := range prev.Enums {
+		if !e.Managed {
+			unmanaged[objectIdentity{"enums", e.Identity}] = true
+		}
+	}
+	if len(unmanaged) == 0 {
+		return pulled, nil, nil
+	}
+	var root map[string]any
+	if err := json.Unmarshal(pulled.Canonical, &root); err != nil {
+		return nil, nil, fmt.Errorf("decode schema document: %w", err)
+	}
+	var kept []string
+	for _, key := range []string{"tables", "views", "enums"} {
+		list, _ := root[key].([]any)
+		for _, e := range list {
+			obj, _ := e.(map[string]any)
+			ident, _ := obj["identity"].(map[string]any)
+			schema, _ := ident["schema"].(string)
+			name, _ := ident["name"].(string)
+			id := V2Identity{Schema: schema, Name: name}
+			if unmanaged[objectIdentity{key, id}] {
+				obj["managed"] = false
+				kept = append(kept, strings.TrimSuffix(key, "s")+" "+id.String())
+			}
+		}
+	}
+	if len(kept) == 0 {
+		return pulled, nil, nil
+	}
+	raw, err := json.Marshal(root)
+	if err != nil {
+		return nil, nil, fmt.Errorf("encode schema document: %w", err)
+	}
+	out, err := ParseV2Document(raw)
+	if err != nil {
+		return nil, nil, fmt.Errorf("the pulled schema document with its managed: false markers is invalid: %w", err)
+	}
+	return out, kept, nil
+}
+
 // InternalReference is a user table's foreign key into a neutron-internal
 // table.
 type InternalReference struct {

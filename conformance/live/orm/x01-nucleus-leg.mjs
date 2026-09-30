@@ -8,6 +8,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const BIN = process.argv[2];
 if (!BIN) {
@@ -15,7 +16,7 @@ if (!BIN) {
   process.exit(2);
 }
 const PORT = 55931;
-const DIST = path.resolve(new URL("../../../typescript/packages/neutron-sql/dist", import.meta.url).pathname);
+const DIST = fileURLToPath(new URL("../../../typescript/packages/neutron-sql/dist", import.meta.url));
 
 const dataDir = mkdtempSync(path.join(tmpdir(), "x01-nucleus-"));
 const child = spawn(BIN, ["start", "--port", String(PORT), "--data", dataDir], {

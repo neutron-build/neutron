@@ -13,6 +13,11 @@ package db
 //     objects is an error (they keep their B03 protection).
 //   - Desired tables whose live counterpart is unrepresentable (opaque
 //     unsupported-table) block planning with the introspection reasons.
+//   - An object the desired document declares with managed: false (a table,
+//     enum or view) is not neutron's: it is never created, altered or
+//     dropped, and its state is not compared, whatever opts say. Managed
+//     tables may still reference it. A base entry recorded managed: false
+//     that the desired document omits stays protected the same way.
 //   - Drops need opts.AllowDestructive; neutron-internal names and
 //     extension/opaque objects are exempt from drops regardless.
 //   - Creates are dependency-ordered (enums -> tables topologically by
@@ -65,6 +70,10 @@ type DiffV2Options struct {
 // (migration history): informational, never drift.
 const InternalMetadataNote = "is neutron-internal metadata: always left untouched"
 
+// UnmanagedNote ends the plan note for an object the schema declares with
+// managed: false: informational, never drift.
+const UnmanagedNote = "is declared managed: false: neutron never creates, alters or drops it, and its state is not compared"
+
 // ColumnOrderUnplanned ends the plan note for a table whose declared column
 // order differs from the database's: informational, never drift.
 const ColumnOrderUnplanned = "PostgreSQL cannot reorder columns without rebuilding the table, so the database keeps its order and nothing is planned for it"
@@ -74,7 +83,7 @@ const ColumnOrderUnplanned = "PostgreSQL cannot reorder columns without rebuildi
 // column-order notes.
 func HasDrift(warnings []string) bool {
 	for _, w := range warnings {
-		if !strings.HasSuffix(w, InternalMetadataNote) && !strings.HasSuffix(w, ColumnOrderUnplanned) {
+		if !strings.HasSuffix(w, InternalMetadataNote) && !strings.HasSuffix(w, ColumnOrderUnplanned) && !strings.HasSuffix(w, UnmanagedNote) {
 			return true
 		}
 	}
@@ -144,6 +153,9 @@ func DiffV2Document(ctx context.Context, desired, actual *V2Document, opts DiffV
 	if err := pl.checkBlockers(); err != nil {
 		return pl.result, err
 	}
+	if err := pl.checkUnmanagedReferences(); err != nil {
+		return pl.result, err
+	}
 	if err := pl.validateRenames(); err != nil {
 		return pl.result, err
 	}
@@ -154,20 +166,49 @@ func DiffV2Document(ctx context.Context, desired, actual *V2Document, opts DiffV
 	if err := pl.planTables(); err != nil {
 		return pl.result, err
 	}
+	pl.reportUnmanaged()
 	pl.reportOutOfScope()
 	pl.reportUnverified()
 	return pl.result, nil
 }
 
 // The predicates below decide which objects --allow-destructive drops
-// (objects in the managed scope the schema does not declare as managed).
+// (objects in the managed scope the schema does not declare; managed: false
+// objects are not dropped).
 // The drop sites and flagScope both use them, so a refusal's list of what
 // the flag drops cannot drift from what the plan drops.
 
-// flagDropsTable: planTableDrops. A table declared with managed: false
-// drops too (it is not a managed desired table).
+// unmanagedTable: the table is not neutron's. The desired document declares
+// it with managed: false, or omits it while the base records it that way (a
+// snapshot chain keeps the marker; a live catalog never carries it).
+func (p *v2Planner) unmanagedTable(id V2Identity) bool {
+	if managed, declared := p.desiredTables[id]; declared {
+		return !managed
+	}
+	at := p.actual.Table(id)
+	return at != nil && !at.Managed
+}
+
+func (p *v2Planner) unmanagedEnum(id V2Identity) bool {
+	if managed, declared := p.desiredEnums[id]; declared {
+		return !managed
+	}
+	ae := p.actual.Enum(id)
+	return ae != nil && !ae.Managed
+}
+
+func (p *v2Planner) unmanagedView(id V2Identity) bool {
+	if managed, declared := p.desiredViews[id]; declared {
+		return !managed
+	}
+	av := p.actual.View(id)
+	return av != nil && !av.Managed
+}
+
+// flagDropsTable: planTableDrops. A table declared with managed: false is
+// not dropped: it is not neutron's.
 func (p *v2Planner) flagDropsTable(id V2Identity) bool {
-	return p.scope[id.Schema] && !p.desiredTables[id] && !isProtectedTableName(id.Name)
+	return p.scope[id.Schema] && !p.desiredTables[id] && !p.unmanagedTable(id) && !isProtectedTableName(id.Name)
 }
 
 // sharedTable: a managed desired table the base has; its undeclared columns
@@ -196,7 +237,7 @@ func (p *v2Planner) flagDropsIndex(desired *V2Table, index string) bool {
 
 // flagDropsView: planViewsAroundAlters.
 func (p *v2Planner) flagDropsView(id V2Identity) bool {
-	return p.scope[id.Schema] && !p.desiredViews[id]
+	return p.scope[id.Schema] && !p.desiredViews[id] && !p.unmanagedView(id)
 }
 
 // flagDropsEnum: planEnumDrops. It returns the column that keeps the enum
@@ -216,12 +257,12 @@ func (p *v2Planner) enumKeptBy(e V2Identity, droppedTables map[V2Identity]bool) 
 }
 
 func (p *v2Planner) flagDropsEnum(id V2Identity) bool {
-	return p.scope[id.Schema] && !p.desiredEnums[id]
+	return p.scope[id.Schema] && !p.desiredEnums[id] && !p.unmanagedEnum(id)
 }
 
 // flagScope completes a refusal that recommends --allow-destructive: the
-// flag also drops every managed-scope object the schema does not declare
-// as managed, so the refusal names them, with the drop sites' predicates.
+// flag also drops every managed-scope object the schema does not declare,
+// so the refusal names them, with the drop sites' predicates.
 func (p *v2Planner) flagScope() string {
 	if p.opts.AllowDestructive {
 		return ""
@@ -263,7 +304,7 @@ func (p *v2Planner) flagScope() string {
 		return " (with this schema, --allow-destructive drops nothing else)"
 	}
 	sort.Strings(objs)
-	return fmt.Sprintf(". Note that --allow-destructive also drops every object the schema does not declare as managed, which here is: %s; declare in the schema what must stay before using it", strings.Join(objs, ", "))
+	return fmt.Sprintf(". Note that --allow-destructive also drops every object the schema does not declare (an object declared managed: false is never dropped), which here is: %s; declare in the schema what must stay before using it", strings.Join(objs, ", "))
 }
 
 // v2Planner carries diff state between the per-collection planning passes.
@@ -2764,9 +2805,9 @@ func (p *v2Planner) refuseKeptForeignKeys(droppedKeys map[V2Identity][][]string)
 			}
 			var why, fix string
 			switch {
-			case p.scope[ut.Identity.Schema] && p.desired.Table(ut.Identity) != nil:
-				why = "a table the schema declares as not managed"
-				fix = fmt.Sprintf("Declare table %s as managed in the schema (the plan then drops and re-adds the foreign key around the change), or drop it: re-run with --allow-destructive, which drops tables the schema does not declare as managed%s", ut.Identity, p.flagScope())
+			case p.unmanagedTable(ut.Identity):
+				why = "a table the schema declares managed: false (neutron never alters or drops it)"
+				fix = fmt.Sprintf("Declare table %s as managed in the schema (the plan then drops and re-adds the foreign key around the change), or drop the foreign key by hand before applying and re-add it after; --allow-destructive does not drop a managed: false table", ut.Identity)
 			case p.scope[ut.Identity.Schema]:
 				why = "a table the schema does not declare"
 				fix = fmt.Sprintf("Declare table %s in the schema (the plan then drops and re-adds the foreign key around the change), or drop it: re-run with --allow-destructive, which drops tables the schema does not declare%s", ut.Identity, p.flagScope())
@@ -3215,6 +3256,51 @@ func (p *v2Planner) viewEqual(dv, av V2View) bool {
 		p.unverified = append(p.unverified, fmt.Sprintf(unverifiedFormat, fmt.Sprintf("view %s definition: %q (desired) vs %q (live) — compared textually without a catalog oracle", dv.Identity, dv.Definition, av.Definition), unverifiedFix))
 	}
 	return false
+}
+
+// checkUnmanagedReferences refuses a managed table whose foreign key points
+// at an unmanaged table the database does not have: neutron never creates
+// it, so the key could not be added. Snapshot planning has no catalog (the
+// table may exist where the migration runs), so only live plans check.
+func (p *v2Planner) checkUnmanagedReferences() error {
+	if p.opts.SnapshotBase {
+		return nil
+	}
+	for _, t := range p.desired.Tables {
+		if !t.Managed {
+			continue
+		}
+		for _, con := range t.Constraints {
+			if con.Type != "foreign-key" || con.References == nil {
+				continue
+			}
+			target := con.References.Table
+			if p.unmanagedTable(target) && !p.actualTables[target] {
+				return fmt.Errorf("table %s: foreign key %s references table %s, which the schema declares managed: false (neutron never creates it) and %s does not have — create the table yourself before applying, or declare it as managed", t.Identity, con.Name, target, p.baseNoun())
+			}
+		}
+	}
+	return nil
+}
+
+// reportUnmanaged notes each object the desired document declares with
+// managed: false: informational, never drift.
+func (p *v2Planner) reportUnmanaged() {
+	for _, t := range p.desired.Tables {
+		if !t.Managed {
+			p.warn("table %s %s", t.Identity, UnmanagedNote)
+		}
+	}
+	for _, v := range p.desired.Views {
+		if !v.Managed {
+			p.warn("view %s %s", v.Identity, UnmanagedNote)
+		}
+	}
+	for _, e := range p.desired.Enums {
+		if !e.Managed {
+			p.warn("enum %s %s", e.Identity, UnmanagedNote)
+		}
+	}
 }
 
 // reportOutOfScope reports objects living in schemas the desired document

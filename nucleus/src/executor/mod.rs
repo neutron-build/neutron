@@ -31,7 +31,7 @@ use crate::reactive::{ChangeEvent, ChangeNotifier, ChangeType, SubscriptionManag
 use crate::sql;
 #[cfg(feature = "server")]
 use crate::storage::STORAGE_SESSION_ID;
-use crate::storage::StorageEngine;
+use crate::storage::{StorageEngine, StorageError};
 use crate::types::{DataType, Row, Value};
 use crate::vector;
 
@@ -128,9 +128,13 @@ mod admin;
 mod admission;
 mod aggregate;
 mod cache;
+mod column_writes;
 pub(crate) mod copy;
 mod cross_model;
 mod ddl;
+mod deferred_fk;
+pub(crate) use deferred_fk::SET_CONSTRAINTS_SETTING;
+mod derived_coherence;
 mod dml;
 pub(crate) mod enlistment;
 mod expr;
@@ -145,6 +149,7 @@ mod hash_aggregate;
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 mod meta_persistence;
 pub mod param_subst;
+mod pg_catalog;
 mod policy;
 mod project;
 mod query;
@@ -157,7 +162,9 @@ mod session;
 #[cfg(feature = "server")]
 mod snapshot_lease;
 mod spill;
+mod timestamptz;
 mod txn;
+mod txn_modes;
 mod types;
 mod unique_gate;
 
@@ -229,13 +236,19 @@ impl Drop for StatementDepthGuard<'_> {
     }
 }
 
-/// The implicit SET block of a multi-statement simple query (see
-/// `execute_statements_dispatch`). Owns the block only while it holds a frame
-/// it opened itself, and closes it on every exit: `close` on normal completion
-/// or statement error, `Drop` when the future is cancelled at an await point.
-/// A frame that belongs to an explicit transaction (`txn_active`) is never
-/// touched here.
-struct ImplicitSetBlock<'a> {
+/// The implicit transaction of a multi-statement simple query (see
+/// `execute_statements_dispatch`). PostgreSQL runs such a message as one
+/// transaction: the data effects and the SET state of every statement commit
+/// together at the end of the message or none do. Owns the transaction only
+/// while it opened it itself, and closes it on every exit: `close` on normal
+/// completion or statement error, `Drop` when the future is cancelled at an
+/// await point. A transaction the client opened (`txn_active` and not
+/// `implicit_txn`) is never touched here.
+///
+/// Without the `server` feature there is no per-session storage scoping to
+/// roll a cancelled message back with, so the block covers SET state only
+/// (the pre-existing behaviour).
+struct ImplicitTxnBlock<'a> {
     executor: &'a Executor,
     session: std::sync::Arc<Session>,
     storage: Arc<dyn StorageEngine>,
@@ -244,7 +257,7 @@ struct ImplicitSetBlock<'a> {
     owned: bool,
 }
 
-impl<'a> ImplicitSetBlock<'a> {
+impl<'a> ImplicitTxnBlock<'a> {
     fn new(executor: &'a Executor, session: std::sync::Arc<Session>, enabled: bool) -> Self {
         Self {
             executor,
@@ -258,41 +271,98 @@ impl<'a> ImplicitSetBlock<'a> {
 
     /// Before each statement: a message that has ended its block (COMMIT,
     /// ROLLBACK) starts a new one for the rest of the message.
-    fn open_if_needed(&mut self) {
-        if self.enabled
-            && !self.session.txn_active.load(Ordering::SeqCst)
-            && self.session.guc_begin_implicit()
+    async fn open_if_needed(&mut self) -> Result<(), ExecError> {
+        if !self.enabled || self.session.txn_active.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        #[cfg(feature = "server")]
         {
+            self.executor.begin_transaction().await?;
+            self.session.implicit_txn.store(true, Ordering::SeqCst);
             self.owned = true;
         }
+        #[cfg(not(feature = "server"))]
+        if self.session.guc_begin_implicit() {
+            self.owned = true;
+        }
+        Ok(())
     }
 
-    fn close(&mut self, commit: bool) {
+    /// Whether the block still owns an open implicit transaction (an explicit
+    /// BEGIN converts it, COMMIT and ROLLBACK end it).
+    #[cfg(feature = "server")]
+    fn holds_txn(&self) -> bool {
+        self.session.txn_active.load(Ordering::SeqCst)
+            && self.session.implicit_txn.load(Ordering::SeqCst)
+    }
+
+    async fn close(&mut self, commit: bool) -> Result<(), ExecError> {
         if !self.owned {
-            return;
+            return Ok(());
         }
-        self.owned = false;
-        if self.session.txn_active.load(Ordering::SeqCst) {
-            return;
+        #[cfg(feature = "server")]
+        {
+            if !self.holds_txn() {
+                self.owned = false;
+                return Ok(());
+            }
+            // Keep Drop armed across every await, including COMMIT itself.
+            // A cancelled close still owns the unclosed implicit block.
+            if commit && let Err(e) = self.executor.commit_transaction().await {
+                // A failed COMMIT leaves the transaction open for a retry;
+                // the message is over, so roll it back.
+                let _ = self.executor.rollback_transaction().await;
+                return Err(e);
+            }
+            if !commit {
+                self.executor.rollback_transaction().await?;
+            }
+            self.owned = false;
+            Ok(())
         }
-        if commit {
-            self.session.guc_commit();
-        } else {
-            self.session.guc_rollback();
+        #[cfg(not(feature = "server"))]
+        {
+            self.owned = false;
+            if self.session.txn_active.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            if commit {
+                self.session.guc_commit();
+            } else {
+                self.session.guc_rollback();
+            }
+            self.executor.recompute_session_context(&self.session);
+            self.executor.sync_lock_timeout(&self.session);
+            Ok(())
         }
-        self.executor.recompute_session_context(&self.session);
-        self.executor.sync_lock_timeout(&self.session);
     }
 }
 
-impl Drop for ImplicitSetBlock<'_> {
+impl Drop for ImplicitTxnBlock<'_> {
     fn drop(&mut self) {
         // Reached still owning the block only when the future was dropped
-        // mid-flight (cancellation or a panic unwinding). Roll the SET state
-        // back and recompute the security context here, synchronously, so no
-        // stale context is visible before the next dispatch; the engine-side
-        // lock_timeout is re-derived here because no statement scope exists.
-        if !self.owned || self.session.txn_active.load(Ordering::SeqCst) {
+        // mid-flight (cancellation or a panic unwinding). The transaction is
+        // rolled back here, synchronously, so no uncommitted write or stale
+        // security context is visible to the next dispatch.
+        if !self.owned {
+            return;
+        }
+        #[cfg(feature = "server")]
+        if self.holds_txn() {
+            let restore = CURRENT_SESSION.scope(
+                self.session.clone(),
+                STORAGE_SESSION_ID
+                    .scope(self.storage_session, self.executor.rollback_transaction()),
+            );
+            if let Err(e) = block_on_session_teardown(restore) {
+                tracing::error!(
+                    "cancelled multi-statement message: rolling back its implicit \
+                     transaction failed: {e}"
+                );
+            }
+            return;
+        }
+        if self.session.txn_active.load(Ordering::SeqCst) {
             return;
         }
         self.session.guc_rollback();
@@ -801,6 +871,9 @@ pub struct Executor {
     /// Tracks min/max per column per 8K-row granule. Expected speedup: 5-10x on selective queries.
     #[allow(dead_code)]
     zone_map_index: crate::storage::granule_stats::ZoneMapIndex,
+    derived_coherence: derived_coherence::DerivedCoherence,
+    #[cfg(test)]
+    derived_publish_hook: parking_lot::Mutex<Option<derived_coherence::PublishHook>>,
     /// Memory pressure flag: set by the watchdog when RSS exceeds the critical
     /// threshold (90% of --max-memory). Write operations (INSERT, UPDATE, DELETE,
     /// TRUNCATE) are rejected while this flag is set. Cleared when RSS drops
@@ -1187,6 +1260,9 @@ impl Executor {
             plan_cache: parking_lot::RwLock::new(PlanCache::new(1024)),
             ast_cache: parking_lot::RwLock::new(AstCache::new(4096)),
             zone_map_index: crate::storage::granule_stats::ZoneMapIndex::new(),
+            derived_coherence: derived_coherence::DerivedCoherence::default(),
+            #[cfg(test)]
+            derived_publish_hook: parking_lot::Mutex::new(None),
             memory_critical: Arc::new(AtomicBool::new(false)),
             reject_writes_on_memory_critical: Arc::new(AtomicBool::new(false)),
             security: parking_lot::RwLock::new(crate::security::SecurityManager::new()),
@@ -1231,12 +1307,26 @@ impl Executor {
         }
     }
 
+    /// Compatibility constructor. Invalid persisted FTS checkpoints refuse
+    /// construction with a diagnostic panic; use `try_new_with_persistence`
+    /// to handle recovery errors without unwinding.
     pub fn new_with_persistence(
         catalog: Arc<Catalog>,
         storage: Arc<dyn StorageEngine>,
         catalog_path: Option<std::path::PathBuf>,
         data_dir: Option<&std::path::Path>,
     ) -> Self {
+        Self::try_new_with_persistence(catalog, storage, catalog_path, data_dir)
+            .unwrap_or_else(|error| panic!("executor recovery refused: {error}"))
+    }
+
+    /// Recover persistent model state, refusing an incomplete FTS checkpoint base.
+    pub fn try_new_with_persistence(
+        catalog: Arc<Catalog>,
+        storage: Arc<dyn StorageEngine>,
+        catalog_path: Option<std::path::PathBuf>,
+        data_dir: Option<&std::path::Path>,
+    ) -> Result<Self, ExecError> {
         let mut exec = Self::new(catalog, storage);
         exec.catalog_path = catalog_path;
         exec.data_dir = data_dir.map(|d| d.to_path_buf());
@@ -1307,18 +1397,14 @@ impl Executor {
             // FTS index: WAL-backed crash-recovery (open replays all logged operations)
             let fts_dir = dir.join("fts");
             std::fs::create_dir_all(&fts_dir).ok();
-            if let Some((idx, tail)) = Self::open_durable(
-                "FTS",
-                &fts_dir,
-                fts::InvertedIndex::open_with_tail(&fts_dir),
-            ) {
-                *exec.fts_index.write() = idx;
-                // Kept so `load_fts_index` can apply it on top of the
-                // `fts_index.json` checkpoint (NU-014). Without it the
-                // checkpoint would silently discard everything written since
-                // the last one.
-                exec.fts_wal_tail = Some(tail);
-            }
+            let (index, tail) = fts::InvertedIndex::open_with_tail(&fts_dir).map_err(|error| {
+                ExecError::Storage(StorageError::Io(format!(
+                    "FTS WAL at {} could not open: {error}; recovery refused because its tail is required for complete durable state",
+                    fts_dir.display()
+                )))
+            })?;
+            *exec.fts_index.write() = index;
+            exec.fts_wal_tail = Some(tail);
 
             // Vector indexes: WAL + snapshot recovery
             let vec_dir = dir.join("vector");
@@ -1552,8 +1638,8 @@ impl Executor {
             exec.stats_path = Some(sp);
         }
 
-        exec.load_fts_index();
-        exec
+        exec.load_fts_index()?;
+        Ok(exec)
     }
 
     /// Return the path used for persisting the FTS index alongside the catalog.
@@ -1614,108 +1700,40 @@ impl Executor {
         Ok(())
     }
 
-    /// Load the FTS index from disk at startup (called by new_with_persistence).
-    /// Load the legacy `fts_index.json`, which **overrides** the WAL-backed
-    /// index opened above.
-    ///
-    /// Two things about this are measured facts, not readings of the code, and
-    /// both matter before anyone "fixes" the override:
-    ///
-    /// 1. From the SECOND boot onward the FTS WAL receives nothing. Once this
-    ///    file exists, the index is replaced by a `from_json` one, and
-    ///    `InvertedIndex::wal` is `#[serde(skip)]`, so the live index has
-    ///    `wal: None` and all three WAL write sites are `if let Some(wal)`.
-    ///    Measured: WAL directory 64 bytes before a second session's write and
-    ///    64 bytes after it; the document was searchable only while the JSON
-    ///    was present.
-    /// 2. The obvious fix — let the WAL win — would DESTROY DATA on upgrade,
-    ///    because every existing deployment's WAL has been stale since its own
-    ///    second boot, and the JSON is the only copy of everything written
-    ///    since.
-    ///
-    /// And it cannot be migrated the easy way either: the WAL stores original
-    /// document text and replays it, while the JSON stores derived postings and
-    /// `DocInfo` keeps only a length. There is no text to rebuild a WAL from, so
-    /// JSON -> WAL is not a conversion, it is a re-index from base tables. That
-    /// is a product decision with a migration, not a bug fix, and it is filed
-    /// rather than taken here.
-    ///
-    /// What IS fixed here: the read and parse errors used to be swallowed
-    /// entirely — `if let Ok(..) && let Ok(..)` — so a corrupt legacy file
-    /// silently reverted FTS to whatever the stale WAL happened to hold, with
-    /// no message anywhere. Given this file is the authoritative store, that is
-    /// the same silent-empty-recovery shape as the rest of this class.
-    ///
-    /// **NU-014, 2026-08-19: the checkpoint/tail split above is now what
-    /// happens.** The two are no longer rivals. `fts_index.json` is loaded as
-    /// the base, the WAL handle is RE-ATTACHED to it (the `serde(skip)` is the
-    /// whole bug — a deserialized index had `wal: None` and every write site is
-    /// an `if let Some(wal)`), and the WAL's recovered state is applied on top
-    /// as a tail. `save_fts_index` then truncates the tail after each
-    /// checkpoint, so the two cannot diverge again.
-    ///
-    /// No migration: an existing deployment's JSON is the seed, exactly as
-    /// before, and its stale WAL contributes whatever it holds — which is a
-    /// subset of the JSON, so applying it is a no-op.
-    fn load_fts_index(&mut self) {
+    /// Load the checkpoint base, reattach its durable WAL, and replay the tail.
+    /// A missing checkpoint is valid on first boot. An existing unreadable or
+    /// malformed base cannot be replaced by the tail: successful checkpoints
+    /// truncate that tail, so doing so would silently lose checkpointed docs.
+    fn load_fts_index(&mut self) -> Result<(), ExecError> {
         let Some(path) = self.fts_persist_path() else {
-            return;
+            return Ok(());
         };
         let data = match std::fs::read_to_string(&path) {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-            Err(e) => {
-                tracing::error!(
-                    target: "nucleus::startup",
-                    "FTS index at {} exists but could not be read: {e}. Falling back to the \
-                     WAL-backed index, which has not been written to since this file was \
-                     first created — expect missing documents.",
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(ExecError::Storage(StorageError::Io(format!(
+                    "FTS checkpoint {} could not be read: {error}; recovery refused because the WAL tail may omit checkpointed documents. Preserve the checkpoint and restore a verified backup",
                     path.display()
-                );
-                return;
+                ))));
             }
         };
-        match fts::InvertedIndex::from_json(&data) {
-            Ok(mut idx) => {
-                // Carry the WAL handle across from the index the WAL built, so
-                // this session's writes are logged. Without this the
-                // checkpoint replaced a live index with a dead one.
-                let wal = self.fts_index.read().wal_handle();
-                match wal {
-                    Some(wal) => idx.attach_wal(wal),
-                    None => tracing::warn!(
-                        target: "nucleus::startup",
-                        "FTS: no WAL handle to re-attach after loading {}. Writes this session \
-                         will not be logged; the checkpoint file is the only durable copy.",
-                        path.display()
-                    ),
-                }
-                // Then the tail on top. Idempotent: re-applying an entry the
-                // checkpoint already holds re-indexes the same document.
-                if let Some(tail) = self.fts_wal_tail.take() {
-                    let (docs, removed) = (tail.docs.len(), tail.removed.len());
-                    idx.apply_wal_tail(&tail);
-                    if docs > 0 || removed > 0 {
-                        tracing::info!(
-                            target: "nucleus::startup",
-                            "FTS: applied a WAL tail of {docs} document(s) and {removed} \
-                             removal(s) on top of {}",
-                            path.display()
-                        );
-                    }
-                }
-                *self.fts_index.write() = idx;
-            }
-            Err(e) => {
-                tracing::error!(
-                    target: "nucleus::startup",
-                    "FTS index at {} did not parse: {e}. Falling back to the WAL-backed index, \
-                     which has not been written to since this file was first created — expect \
-                     missing documents.",
-                    path.display()
-                );
-            }
+        let mut index = fts::InvertedIndex::from_json(&data).map_err(|error| {
+            ExecError::Storage(StorageError::Io(format!(
+                "FTS checkpoint {} did not parse: {error}; recovery refused because the WAL tail may omit checkpointed documents. Preserve the checkpoint and restore a verified backup",
+                path.display()
+            )))
+        })?;
+        // A deserialized checkpoint has no handle (`serde(skip)`). Preserve the
+        // attached WAL opened earlier before publishing the reconstructed index.
+        if let Some(wal) = self.fts_index.read().wal_handle() {
+            index.attach_wal(wal);
         }
+        if let Some(tail) = self.fts_wal_tail.take() {
+            index.apply_wal_tail(&tail);
+        }
+        *self.fts_index.write() = index;
+        Ok(())
     }
 
     /// Synchronously persist only the sequence state to `sequences.json`.
@@ -2077,6 +2095,14 @@ impl Executor {
     /// HNSW and Graph indexes are handled by their own WAL-based recovery and do not
     /// need to be rebuilt here.
     pub async fn rebuild_specialty_indexes(&self) {
+        let writer = self.derived_coherence.begin_write();
+        derived_coherence::WRITER_GENERATION
+            .scope(writer.generation, self.rebuild_specialty_indexes_inner())
+            .await;
+    }
+
+    async fn rebuild_specialty_indexes_inner(&self) {
+        let generation = self.derived_coherence.generation();
         let all_indexes = self.catalog.get_all_indexes().await;
 
         // Snapshot the set of already-loaded HNSW vector indexes (don't overwrite them).
@@ -2168,73 +2194,9 @@ impl Executor {
                     );
                 }
                 crate::catalog::IndexType::BTree if idx.options.contains_key("encryption_mode") => {
-                    // Encrypted index: try to rebuild using env key.
-                    let key_bytes: Option<[u8; 32]> =
-                        std::env::var("NUCLEUS_ENCRYPTION_KEY").ok().and_then(|k| {
-                            let b = k.into_bytes();
-                            if b.len() == 32 {
-                                let mut arr = [0u8; 32];
-                                arr.copy_from_slice(&b);
-                                Some(arr)
-                            } else {
-                                None
-                            }
-                        });
-                    let Some(key) = key_bytes else {
-                        tracing::warn!(
-                            "Encrypted index '{}' not restored: NUCLEUS_ENCRYPTION_KEY not available",
-                            idx.name
-                        );
-                        continue;
-                    };
-
-                    let mode_str = idx
-                        .options
-                        .get("encryption_mode")
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
-                    let mode = if mode_str.contains("Order") || mode_str.contains("OPE") {
-                        crate::storage::encrypted_index::EncryptionMode::OrderPreserving
-                    } else if mode_str.contains("Random") {
-                        crate::storage::encrypted_index::EncryptionMode::Randomized
-                    } else {
-                        crate::storage::encrypted_index::EncryptionMode::Deterministic
-                    };
-
-                    let col_name = match idx.columns.first() {
-                        Some(c) => c.clone(),
-                        None => continue,
-                    };
-                    let table_def = match self.catalog.get_table(&idx.table_name).await {
-                        Some(d) => d,
-                        None => continue,
-                    };
-                    let col_idx = table_def.column_index(&col_name);
-
-                    let mut enc_idx =
-                        crate::storage::encrypted_index::EncryptedIndex::new(key, mode);
-                    if let Some(ci) = col_idx {
-                        let rows = self.storage.scan(&idx.table_name).await.unwrap_or_default();
-                        for (row_id, row) in rows.iter().enumerate() {
-                            if ci < row.len() {
-                                let plaintext = self.value_to_text_string(&row[ci]);
-                                enc_idx.insert(plaintext.as_bytes(), row_id as u64);
-                            }
-                        }
-                        tracing::info!(
-                            "Rebuilt encrypted index '{}' from {} rows",
-                            idx.name,
-                            rows.len()
-                        );
-                    }
-
-                    self.encrypted_indexes.write().insert(
-                        idx.name.clone(),
-                        EncryptedIndexEntry {
-                            table_name: idx.table_name.clone(),
-                            column_name: col_name,
-                            index: enc_idx,
-                        },
+                    tracing::warn!(
+                        "Legacy encrypted index '{}' is unavailable: no secure encryption mode is implemented; base table rows remain readable",
+                        idx.name
                     );
                 }
                 _ => {}
@@ -2300,6 +2262,26 @@ impl Executor {
         }
 
         self.rebuild_all_gin_indexes().await;
+        let vector_tables: Vec<_> = self
+            .vector_indexes
+            .read()
+            .values()
+            .map(|entry| entry.table_name.clone())
+            .collect();
+        let fts_tables: Vec<_> = self
+            .fts_column_indexes
+            .read()
+            .values()
+            .map(|entry| entry.table_name.clone())
+            .collect();
+        for table in vector_tables {
+            self.derived_coherence
+                .publish(generation, "position", &table, || {});
+        }
+        for table in fts_tables {
+            self.derived_coherence
+                .publish(generation, "fts", &table, || {});
+        }
     }
 
     /// Rebuild the live GIN indexes for one table from its current logical rows.
@@ -2450,6 +2432,7 @@ impl Executor {
             return;
         }
 
+        let generation = self.derived_coherence.generation();
         let Some(table_def) = self.catalog.get_table(table_name).await else {
             self.vector_indexes
                 .write()
@@ -2465,11 +2448,11 @@ impl Executor {
             .await
             .unwrap_or_default();
 
-        let key = std::env::var("NUCLEUS_ENCRYPTION_KEY")
-            .ok()
-            .and_then(|value| value.as_bytes().try_into().ok());
+        #[cfg(test)]
+        self.pause_derived_publish("position", table_name);
+
         let mut vectors = Vec::new();
-        let mut encrypted = Vec::new();
+        let encrypted: Vec<(String, EncryptedIndexEntry)> = Vec::new();
         for definition in definitions {
             let Some(column_name) = definition.columns.first().cloned() else {
                 continue;
@@ -2546,55 +2529,31 @@ impl Executor {
                 crate::catalog::IndexType::BTree
                     if definition.options.contains_key("encryption_mode") =>
                 {
-                    let Some(key) = key else {
-                        tracing::warn!(
-                            "encrypted index '{}' disabled during rebuild: NUCLEUS_ENCRYPTION_KEY is unavailable",
-                            definition.name
-                        );
-                        continue;
-                    };
-                    let mode = match definition
-                        .options
-                        .get("encryption_mode")
-                        .map(String::as_str)
-                    {
-                        Some(value) if value.contains("Order") || value.contains("OPE") => {
-                            crate::storage::encrypted_index::EncryptionMode::OrderPreserving
-                        }
-                        Some(value) if value.contains("Random") => {
-                            crate::storage::encrypted_index::EncryptionMode::Randomized
-                        }
-                        _ => crate::storage::encrypted_index::EncryptionMode::Deterministic,
-                    };
-                    let mut index = crate::storage::encrypted_index::EncryptedIndex::new(key, mode);
-                    for (row_id, row) in rows.iter().enumerate() {
-                        if let Some(value) = row.get(column_index) {
-                            let plaintext = self.value_to_text_string(value);
-                            index.insert(plaintext.as_bytes(), row_id as u64);
-                        }
-                    }
-                    encrypted.push((
-                        definition.name.clone(),
-                        EncryptedIndexEntry {
-                            table_name: table_name.to_string(),
-                            column_name,
-                            index,
-                        },
-                    ));
+                    tracing::warn!(
+                        "Legacy encrypted index '{}' is unavailable: no secure encryption mode is implemented",
+                        definition.name
+                    );
                 }
                 _ => {}
             }
         }
 
+        if !self
+            .derived_coherence
+            .publish(generation, "position", table_name, || {
+                {
+                    let mut live = self.vector_indexes.write();
+                    live.retain(|_, entry| entry.table_name != table_name);
+                    live.extend(vectors);
+                }
+                {
+                    let mut live = self.encrypted_indexes.write();
+                    live.retain(|_, entry| entry.table_name != table_name);
+                    live.extend(encrypted);
+                }
+            })
         {
-            let mut live = self.vector_indexes.write();
-            live.retain(|_, entry| entry.table_name != table_name);
-            live.extend(vectors);
-        }
-        {
-            let mut live = self.encrypted_indexes.write();
-            live.retain(|_, entry| entry.table_name != table_name);
-            live.extend(encrypted);
+            return;
         }
         self.save_vector_index_meta();
         if let Err(error) = self.checkpoint_vector_wal() {
@@ -4117,6 +4076,40 @@ impl Executor {
     /// and masking and produces the correct error or the masked result.
     // Only reachable from server-gated code, same as `table_is_fk_referenced`
     // above; without this the core-only clippy gate fails on dead_code.
+    /// A shared derived map cannot narrow another session's committed rows
+    /// while transaction-local hooks have changed it. A reader in an explicit
+    /// transaction may retain an older storage snapshot after other writers
+    /// commit; shared sidecars carry current epochs, not that reader's snapshot.
+    /// Busy active state also fails closed.
+    fn has_uncommitted_derived_writes(&self) -> bool {
+        if self.current_session().txn_active.load(Ordering::Acquire) {
+            return true;
+        }
+        let dirty = |session: &Session| match session.txn_state.try_read() {
+            Ok(txn) => txn.active && !txn.derived_dirty_tables.is_empty(),
+            Err(_) => session.txn_active.load(Ordering::Acquire),
+        };
+        dirty(&self.default_session) || self.sessions.read().values().any(|session| dirty(session))
+    }
+
+    #[cfg(feature = "server")]
+    fn table_has_specialty_relational_index(&self, table: &str) -> bool {
+        self.vector_indexes
+            .read()
+            .values()
+            .any(|entry| entry.table_name == table)
+            || self
+                .encrypted_indexes
+                .read()
+                .values()
+                .any(|entry| entry.table_name == table)
+            || self
+                .fts_column_indexes
+                .read()
+                .values()
+                .any(|entry| entry.table_name == table)
+    }
+
     #[cfg(feature = "server")]
     pub(super) fn fast_path_table_secured(&self, table: &str) -> bool {
         self.table_is_secured(table) || self.privileges_enforced_for_session()
@@ -6091,16 +6084,28 @@ impl Executor {
             return Some(Err(e));
         }
 
+        let _derived_writer = (!matches!(cmd, SqlFastPathCommand::PointSelect { .. }))
+            .then(|| self.derived_coherence.begin_write());
         match cmd {
             SqlFastPathCommand::PointSelect {
                 table,
                 where_col,
                 where_val,
             } => {
-                if self.fast_path_table_secured(table) {
+                if self.fast_path_table_secured(table)
+                    || self.table_has_specialty_relational_index(table)
+                {
                     return None;
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
+                // These searches/writes require session-aware casts.
+                if table_def
+                    .columns
+                    .iter()
+                    .any(|col| matches!(col.data_type, DataType::Array(_) | DataType::TimestampTz))
+                {
+                    return None;
+                }
                 let col_idx = table_def.column_index(where_col)?;
                 // Coerce the wire-parsed literal to the column's declared
                 // type. Without this, pgx's SimpleProtocol-style text
@@ -6154,10 +6159,20 @@ impl Executor {
             }
 
             SqlFastPathCommand::SimpleInsert { table, values } => {
-                if self.fast_path_table_secured(table) {
+                if self.fast_path_table_secured(table)
+                    || self.table_has_specialty_relational_index(table)
+                {
                     return None;
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
+                // These searches/writes require session-aware casts.
+                if table_def
+                    .columns
+                    .iter()
+                    .any(|col| matches!(col.data_type, DataType::Array(_) | DataType::TimestampTz))
+                {
+                    return None;
+                }
                 // Correctness gate: this fast path writes straight to storage and
                 // does NOT enforce constraints. Fall through to the full executor
                 // (execute_sql_session — which enforces PRIMARY KEY / UNIQUE /
@@ -6167,6 +6182,15 @@ impl Executor {
                 let has_enforceable_constraints = !table_def.constraints.is_empty()
                     || table_def.columns.iter().any(|col| !col.nullable);
                 if has_enforceable_constraints {
+                    return None;
+                }
+                // Generated columns, identity columns and declared lengths are
+                // enforced by the full INSERT path only.
+                if table_def
+                    .columns
+                    .iter()
+                    .any(|c| c.generation.is_some() || c.max_len.is_some())
+                {
                     return None;
                 }
                 // Column count must match exactly for a simple VALUES insert.
@@ -6233,10 +6257,21 @@ impl Executor {
                 where_col,
                 where_val,
             } => {
-                if self.fast_path_table_secured(table) {
+                if self.fast_path_table_secured(table)
+                    || self.table_has_specialty_relational_index(table)
+                {
                     return None;
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
+                // These columns require the full UPDATE path's casts,
+                // generated expressions and declared-length checks.
+                if table_def.columns.iter().any(|col| {
+                    matches!(col.data_type, DataType::Array(_) | DataType::TimestampTz)
+                        || col.generation.is_some()
+                        || col.max_len.is_some()
+                }) {
+                    return None;
+                }
                 // The fast path writes new column values WITHOUT constraint
                 // enforcement. Decline (fall back to the full UPDATE path,
                 // which enforces) whenever an assigned column participates in a
@@ -6327,7 +6362,9 @@ impl Executor {
                 where_col,
                 where_val,
             } => {
-                if self.fast_path_table_secured(table) {
+                if self.fast_path_table_secured(table)
+                    || self.table_has_specialty_relational_index(table)
+                {
                     return None;
                 }
                 // The fast path deletes without enforcing referential
@@ -6339,6 +6376,14 @@ impl Executor {
                     return None;
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
+                // These searches/writes require session-aware casts.
+                if table_def
+                    .columns
+                    .iter()
+                    .any(|col| matches!(col.data_type, DataType::Array(_) | DataType::TimestampTz))
+                {
+                    return None;
+                }
                 let col_idx = table_def.column_index(where_col)?;
                 // Coerce text literal to the column's declared type — see
                 // PointSelect for the pgx SimpleProtocol rationale.
@@ -6964,33 +7009,38 @@ impl Executor {
         // (tests, embedded, RESP, binary wire) still materializes because the
         // producer only emits a stream when the session opted in (stream_results).
         let single = statements.len() == 1;
-        // PostgreSQL runs a multi-statement simple query in an implicit
-        // transaction block, so `SET LOCAL ROLE x; SELECT ...` in one message
-        // applies the role to the SELECT and ends with the message. Only the
-        // SET state gets that block here: the block covers SET / SET LOCAL /
-        // SET ROLE and nothing else. Statements still autocommit one by one,
-        // so the data effects of earlier statements persist when a later one
-        // fails (a known divergence from PostgreSQL, where the whole message
-        // is one transaction). The SET values of a failed message are
-        // reverted, as the aborted block's would be.
+        // PostgreSQL runs a multi-statement simple query as one implicit
+        // transaction: `insert 1; insert 2; <failing insert>` keeps no row,
+        // `SET LOCAL ROLE x; SELECT ...` applies the role to the SELECT and
+        // ends with the message, and an in-message ROLLBACK undoes the data
+        // before it. The block is a real storage transaction (the same one a
+        // client BEGIN opens), committed at the end of the message and
+        // rolled back on the first error.
         //
-        // A COMMIT or ROLLBACK in the message ends the SET block and the next
-        // statement opens a new one, as in PostgreSQL. That parity is for SET
-        // state only: an in-message ROLLBACK does not undo data (`insert 1;
-        // rollback; insert 2; select count(*)` counts 2 here, 1 on
-        // PostgreSQL). A message that opens an
-        // explicit BEGIN hands the block to that transaction. The guard closes
-        // the block if this future is dropped mid-flight (statement timeout,
+        // A COMMIT or ROLLBACK in the message ends the block and the next
+        // statement opens a new one, as in PostgreSQL. A message that opens
+        // an explicit BEGIN converts the block into that transaction, earlier
+        // statements included, and leaves it open. The guard closes the block
+        // if this future is dropped mid-flight (statement timeout,
         // CancelRequest), so nothing leaks into the next message.
+        //
+        // Not covered: DDL is not transactional (N2), so a CREATE TABLE
+        // earlier in a failed message survives; the data written after it does
+        // not. Statements PostgreSQL refuses inside a transaction block
+        // (CREATE INDEX CONCURRENTLY, VACUUM) run here as they do inside an
+        // explicit transaction.
         let session = self.current_session();
-        let mut block = ImplicitSetBlock::new(self, session.clone(), !single);
+        let mut block = ImplicitTxnBlock::new(self, session.clone(), !single);
         let mut results = Vec::new();
         for stmt in statements {
-            block.open_if_needed();
+            if let Err(e) = block.open_if_needed().await {
+                let _ = block.close(false).await;
+                return Err(e);
+            }
             let r = match self.execute_statement(stmt).await {
                 Ok(r) => r,
                 Err(e) => {
-                    block.close(false);
+                    let _ = block.close(false).await;
                     return Err(e);
                 }
             };
@@ -7000,14 +7050,14 @@ impl Executor {
                 match r.materialize().await {
                     Ok(r) => r,
                     Err(e) => {
-                        block.close(false);
+                        let _ = block.close(false).await;
                         return Err(e);
                     }
                 }
             };
             results.push(r);
         }
-        block.close(true);
+        block.close(true).await?;
         Ok(results)
     }
 
@@ -7093,13 +7143,57 @@ impl Executor {
         // The guard (not a trailing fetch_sub) owns the decrement so a
         // cancelled statement future cannot leak the slot (A12).
         let session = self.current_session();
+        if !matches!(
+            &stmt,
+            Statement::Set(_)
+                | Statement::ShowVariable { .. }
+                | Statement::StartTransaction { .. }
+                | Statement::Commit { .. }
+                | Statement::Rollback { .. }
+                | Statement::Savepoint { .. }
+                | Statement::ReleaseSavepoint { .. }
+        ) {
+            // SET TRANSACTION is only allowed before the first query.
+            session.txn_stmts.fetch_add(1, Ordering::Relaxed);
+        }
+        if matches!(
+            &stmt,
+            Statement::AlterTable(_) | Statement::Drop { .. } | Statement::Truncate { .. }
+        ) && session.has_pending_deferred_fks()
+        {
+            return Err(ExecError::Unsupported("schema changes with pending deferred foreign keys are not supported; complete or roll back the transaction first".into()));
+        }
+        let outermost = derived_coherence::WRITER_GENERATION
+            .try_with(|_| ())
+            .is_err();
+        let mutates = admission::statement_mutates(&stmt)
+            || matches!(&stmt, Statement::Commit { .. } | Statement::Rollback { .. });
+        #[cfg(feature = "server")]
+        let mutates = mutates || admission::statement_carries_mutating_scalar_fn(&stmt);
+        let writer = (outermost && mutates).then(|| self.derived_coherence.begin_write());
+        let read_generation = self.derived_coherence.generation();
         session.statement_depth.fetch_add(1, Ordering::SeqCst);
         let mut guard = StatementDepthGuard {
             executor: self,
             session: session.clone(),
             completed: false,
         };
-        let result = self.execute_statement_inner(stmt).await;
+        let execution = derived_coherence::READ_GENERATION
+            .scope(read_generation, self.execute_statement_inner(stmt));
+        let result = if let Some(ref writer) = writer {
+            derived_coherence::WRITER_GENERATION
+                .scope(writer.generation, execution)
+                .await
+        } else {
+            execution.await
+        };
+
+        if result.is_ok()
+            && !session.txn_active.load(Ordering::Acquire)
+            && let Some(ref writer) = writer
+        {
+            self.derived_coherence.finish_success(writer.generation);
+        }
         guard.completed = true;
         drop(guard);
         if result.is_err() {
@@ -7117,6 +7211,7 @@ impl Executor {
         // durable state before it touches storage. One relaxed atomic load on
         // the healthy path.
         self.admit_statement(&stmt)?;
+        self.check_read_only(&stmt)?;
         self.recompute_session_context(&self.current_session());
         // Track whether this is a DDL statement that modifies the catalog or metadata.
         let is_ddl = matches!(
@@ -7373,20 +7468,11 @@ impl Executor {
             } => self.execute_drop(object_type, names, if_exists).await,
             Statement::CreateIndex(create_index) => self.execute_create_index(create_index).await,
             Statement::StartTransaction { ref modes, .. } => {
-                // Extract isolation level from BEGIN TRANSACTION ISOLATION LEVEL ...
-                for mode in modes {
-                    if let ast::TransactionMode::IsolationLevel(lvl) = mode {
-                        let level_str = match lvl {
-                            ast::TransactionIsolationLevel::ReadCommitted => "read committed",
-                            ast::TransactionIsolationLevel::RepeatableRead => "repeatable read",
-                            ast::TransactionIsolationLevel::Serializable => "serializable",
-                            ast::TransactionIsolationLevel::ReadUncommitted => "read committed",
-                            ast::TransactionIsolationLevel::Snapshot => "snapshot",
-                        };
-                        self.require_isolation_level(level_str)?;
-                    }
-                }
-                self.begin_transaction().await
+                // ISOLATION LEVEL and READ ONLY are applied to the transaction
+                // (`begin_transaction_with`); a level the engine cannot provide
+                // is refused there rather than run weaker than reported.
+                self.begin_transaction_with(txn_modes::TxnModes::from_ast(modes))
+                    .await
             }
             Statement::Commit { .. } => self.commit_transaction().await,
             Statement::Rollback {
@@ -7398,7 +7484,13 @@ impl Executor {
             Statement::ReleaseSavepoint { name } => {
                 self.execute_release_savepoint(&name.value).await
             }
-            Statement::Set(set) => self.execute_set(set),
+            Statement::Set(ast::Set::SetTransaction {
+                ref modes, session, ..
+            }) => self.execute_set_transaction(modes, session).await,
+            Statement::Set(set) => match crate::sql::set_constraints_spec(&set) {
+                Some(spec) => self.execute_set_constraints(&spec).await,
+                None => self.execute_set(set),
+            },
             Statement::ShowVariable { variable } => self.execute_show(variable).await,
             Statement::ShowTables { .. } => self.execute_show_tables().await,
             Statement::Truncate(truncate) => self.execute_truncate(truncate).await,
@@ -8003,6 +8095,9 @@ impl Executor {
         rows: &[Row],
         col_meta: &[ColMeta],
     ) -> Option<Vec<Row>> {
+        if self.has_uncommitted_derived_writes() {
+            return None;
+        }
         // Check vector subsystem health before attempting index scan.
         if self.check_subsystem("vector").is_err() {
             return None; // Fall back to full scan.
@@ -8075,6 +8170,7 @@ impl Executor {
         // column recorded on the index entry (recovery-safe: persisted in the
         // sidecar, independent of the live catalog's constraints) and located in
         // the scanned rows via col_meta. IvfFlat and no-PK indexes stay positional.
+        let coherence = self.derived_coherence.view();
         let vi = self.vector_indexes.read();
         let mut found: Option<(&VectorIndexEntry, Option<usize>)> = None;
         for entry in vi.values() {
@@ -8092,6 +8188,9 @@ impl Executor {
             }
         }
         let (entry, pk_col) = found?;
+        if !coherence.current("position", &entry.table_name) {
+            return None;
+        }
 
         // VEC-1: the metric argument must agree with the index's metric. An
         // absent args[2] means L2 — the same default scalar_fns
@@ -8696,34 +8795,41 @@ impl Executor {
         let Some(table_def) = self.catalog.get_table(table_name).await else {
             return;
         };
+        let generation = self.derived_coherence.generation();
         let rows = self
             .storage_for(table_name)
             .scan_for_maintenance(table_name)
             .await
             .unwrap_or_default();
 
-        let mut indexes = self.fts_column_indexes.write();
-        for entry in indexes.values_mut() {
-            if entry.table_name != table_name {
-                continue;
-            }
-            let (Some(col_idx), Some(pk_idx)) = (
-                table_def.column_index(&entry.column_name),
-                table_def.column_index(&entry.pk_column),
-            ) else {
-                continue;
-            };
-            let mut rebuilt = crate::fts::InvertedIndex::new();
-            for row in &rows {
-                let Some(doc_id) = Self::stable_row_id(row, pk_idx) else {
-                    continue;
-                };
-                if let Some(Value::Text(text)) = row.get(col_idx) {
-                    rebuilt.add_document(doc_id, text);
+        #[cfg(test)]
+        self.pause_derived_publish("fts", table_name);
+
+        self.derived_coherence
+            .publish(generation, "fts", table_name, || {
+                let mut indexes = self.fts_column_indexes.write();
+                for entry in indexes.values_mut() {
+                    if entry.table_name != table_name {
+                        continue;
+                    }
+                    let (Some(col_idx), Some(pk_idx)) = (
+                        table_def.column_index(&entry.column_name),
+                        table_def.column_index(&entry.pk_column),
+                    ) else {
+                        continue;
+                    };
+                    let mut rebuilt = crate::fts::InvertedIndex::new();
+                    for row in &rows {
+                        let Some(doc_id) = Self::stable_row_id(row, pk_idx) else {
+                            continue;
+                        };
+                        if let Some(Value::Text(text)) = row.get(col_idx) {
+                            rebuilt.add_document(doc_id, text);
+                        }
+                    }
+                    entry.index = rebuilt;
                 }
-            }
-            entry.index = rebuilt;
-        }
+            });
     }
 
     /// Candidate row ids for `column @@ query`, from the table-attached FTS
@@ -8737,6 +8843,13 @@ impl Executor {
         column: &str,
         query: &str,
     ) -> Option<(String, std::collections::HashSet<u64>)> {
+        if self.has_uncommitted_derived_writes() {
+            return None;
+        }
+        let coherence = self.derived_coherence.view();
+        if !coherence.current("fts", table_name) {
+            return None;
+        }
         let indexes = self.fts_column_indexes.read();
         let entry = indexes.values().find(|e| {
             e.table_name.eq_ignore_ascii_case(table_name)
@@ -8762,6 +8875,13 @@ impl Executor {
         column: &str,
         query: &str,
     ) -> Option<usize> {
+        if self.has_uncommitted_derived_writes() {
+            return None;
+        }
+        let coherence = self.derived_coherence.view();
+        if !coherence.current("fts", table_name) {
+            return None;
+        }
         let indexes = self.fts_column_indexes.read();
         let entry = indexes.values().find(|e| {
             e.table_name.eq_ignore_ascii_case(table_name)
@@ -8782,6 +8902,10 @@ impl Executor {
         column: &str,
         query: &str,
     ) -> Option<crate::fts::Bm25Stats> {
+        if self.has_uncommitted_derived_writes() {
+            return None;
+        }
+        let coherence = self.derived_coherence.view();
         let indexes = self.fts_column_indexes.read();
         let mut matches = indexes.values().filter(|e| {
             e.column_name.eq_ignore_ascii_case(column)
@@ -8790,6 +8914,9 @@ impl Executor {
         let entry = matches.next()?;
         // Ambiguous unqualified column: refuse rather than guess a corpus.
         if table.is_none() && matches.next().is_some() {
+            return None;
+        }
+        if !coherence.current("fts", &entry.table_name) {
             return None;
         }
         Some(entry.index.bm25_stats(query))
@@ -8841,13 +8968,6 @@ impl Executor {
                 entry.index.remove(plaintext.as_bytes(), row_pos as u64);
             }
         }
-    }
-
-    /// Look up rows via an encrypted index (equality match).
-    fn encrypted_index_lookup(&self, index_name: &str, value: &[u8]) -> Option<Vec<u64>> {
-        let indexes = self.encrypted_indexes.read();
-        let entry = indexes.get(index_name)?;
-        Some(entry.index.lookup_equal(value))
     }
 
     // ========================================================================
@@ -9308,6 +9428,9 @@ impl Executor {
         name: &str,
         label: &str,
     ) -> Result<Option<(Vec<ColMeta>, Vec<Row>)>, ExecError> {
+        if let Some(rel) = self.load_pg_catalog_table(name, label).await? {
+            return Ok(Some(rel));
+        }
         match name {
             "information_schema.tables" => {
                 let tables = self.catalog.list_tables().await;
@@ -9424,9 +9547,7 @@ impl Executor {
                         name: "datetime_precision".into(),
                         dtype: DataType::Int32,
                     },
-                    // Identity/generated-column facets (ORM introspection reads
-                    // them). Nucleus has neither feature: is_generated=NEVER,
-                    // is_identity=NO, every identity_* facet NULL.
+                    // Identity/generated-column facets from live column metadata.
                     ColMeta {
                         table: Some(label.into()),
                         name: "is_generated".into(),
@@ -9473,50 +9594,54 @@ impl Executor {
                         dtype: DataType::Text,
                     },
                 ];
+                let snap = self.pg_snapshot().await;
                 let mut rows = Vec::new();
                 for t in &tables {
                     for (i, c) in t.columns.iter().enumerate() {
+                        let f = snap.info_schema_type(t, c);
                         rows.push(vec![
                             Value::Text("nucleus".into()),
                             Value::Text("public".into()),
                             Value::Text(t.name.clone()),
                             Value::Text(c.name.clone()),
                             Value::Int32((i + 1) as i32),
-                            c.default_expr
-                                .as_ref()
-                                .map_or(Value::Null, |e| Value::Text(e.clone())),
+                            f.default,
                             Value::Text(if c.nullable { "YES" } else { "NO" }.into()),
-                            Value::Text(c.data_type.to_string()),
-                            Value::Text(datatype_to_udt_name(&c.data_type).into()),
-                            Value::Text("pg_catalog".into()),
-                            Value::Null,
-                            match &c.data_type {
-                                DataType::Int32 => Value::Int32(32),
-                                DataType::Int64 => Value::Int32(64),
-                                DataType::Float64 => Value::Int32(53),
-                                DataType::Numeric => Value::Null,
-                                _ => Value::Null,
-                            },
-                            match &c.data_type {
-                                DataType::Int32 | DataType::Int64 => Value::Int32(0),
-                                _ => Value::Null,
-                            },
-                            match &c.data_type {
-                                DataType::Int32 | DataType::Int64 | DataType::Float64 => {
-                                    Value::Int32(2)
+                            Value::Text(f.data_type),
+                            Value::Text(f.udt_name),
+                            Value::Text(f.udt_schema.into()),
+                            f.char_len,
+                            f.num_precision,
+                            f.num_scale,
+                            f.num_precision_radix,
+                            f.datetime_precision,
+                            Value::Text(
+                                if c.attgenerated().is_empty() {
+                                    "NEVER"
+                                } else {
+                                    "ALWAYS"
                                 }
-                                DataType::Numeric => Value::Int32(10),
+                                .into(),
+                            ),
+                            match &c.generation {
+                                Some(crate::catalog::ColumnGeneration::Stored(e)) => {
+                                    Value::Text(e.clone())
+                                }
                                 _ => Value::Null,
                             },
-                            match &c.data_type {
-                                DataType::Timestamp | DataType::TimestampTz => Value::Int32(6),
-                                DataType::Date => Value::Int32(0),
+                            Value::Text(
+                                if c.attidentity().is_empty() {
+                                    "NO"
+                                } else {
+                                    "YES"
+                                }
+                                .into(),
+                            ),
+                            match c.attidentity() {
+                                "a" => Value::Text("ALWAYS".into()),
+                                "d" => Value::Text("BY DEFAULT".into()),
                                 _ => Value::Null,
                             },
-                            Value::Text("NEVER".into()),
-                            Value::Null,
-                            Value::Text("NO".into()),
-                            Value::Null,
                             Value::Null,
                             Value::Null,
                             Value::Null,
@@ -9709,348 +9834,6 @@ impl Executor {
                     Value::Null,
                     Value::Null, // no ACLs — renders as default privileges
                 ]];
-                Ok(Some((cols, rows)))
-            }
-            "pg_catalog.pg_type" | "pg_type" => {
-                let tables = self.catalog.list_tables().await;
-                let cols = vec![
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "oid".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "typname".into(),
-                        dtype: DataType::Text,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "typnamespace".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "typlen".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "typtype".into(),
-                        dtype: DataType::Text,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "typcategory".into(),
-                        dtype: DataType::Text,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "typcollation".into(),
-                        dtype: DataType::Int32,
-                    },
-                    // JDBC's getColumns query joins on these: no domain types,
-                    // so typnotnull=false, typbasetype=0, typtypmod=-1.
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "typnotnull".into(),
-                        dtype: DataType::Bool,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "typbasetype".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "typtypmod".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "typrelid".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "typelem".into(),
-                        dtype: DataType::Int32,
-                    },
-                    // psycopg's TypeInfo query selects these: no array types
-                    // exposed (typarray=0), default delimiter ','.
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "typarray".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "typdelim".into(),
-                        dtype: DataType::Text,
-                    },
-                    // Input-function name (prisma's describe checks it to
-                    // detect array types via 'array_in'); scalar spelling.
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "typinput".into(),
-                        dtype: DataType::Text,
-                    },
-                    // Postgrex's type bootstrap selects typsend/typreceive/
-                    // typoutput alongside typinput, and no client option
-                    // avoids them. Their absence failed the bootstrap query,
-                    // which Postgrex retries forever — so every Elixir/Ecto/
-                    // Phoenix caller saw a DBConnection queue timeout and
-                    // never the missing column. Same scalar spelling as
-                    // typinput.
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "typoutput".into(),
-                        dtype: DataType::Text,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "typreceive".into(),
-                        dtype: DataType::Text,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "typsend".into(),
-                        dtype: DataType::Text,
-                    },
-                ];
-                let domain_cols = |rows: &mut Vec<Vec<Value>>| {
-                    for row in rows.iter_mut() {
-                        let typname = match &row[1] {
-                            Value::Text(n) => n.clone(),
-                            _ => String::new(),
-                        };
-                        let (tin, tout, trecv, tsend) = pg_type_io_names(&typname);
-                        row.extend([
-                            Value::Bool(false),
-                            Value::Int32(0),
-                            Value::Int32(-1),
-                            Value::Int32(0),
-                            Value::Int32(0),
-                            Value::Int32(0),
-                            Value::Text(",".into()),
-                            Value::Text(tin),
-                            Value::Text(tout),
-                            Value::Text(trecv),
-                            Value::Text(tsend),
-                        ]);
-                    }
-                };
-                let mut seen = std::collections::HashSet::new();
-                let mut rows = Vec::new();
-                for t in &tables {
-                    for c in &t.columns {
-                        let udt = datatype_to_udt_name(&c.data_type);
-                        if seen.insert(udt.to_string()) {
-                            let (oid, typlen, typtype, typcategory) = pg_type_info(&c.data_type);
-                            rows.push(vec![
-                                Value::Int32(oid),
-                                Value::Text(udt.into()),
-                                Value::Int32(11),
-                                Value::Int32(typlen),
-                                Value::Text(typtype.into()),
-                                Value::Text(typcategory.into()),
-                                // No collation support: 0 = not collatable.
-                                Value::Int32(0),
-                            ]);
-                        }
-                    }
-                }
-                for (oid, tname, len, tt, cat) in BASE_PG_TYPES {
-                    if seen.insert(tname.to_string()) {
-                        rows.push(vec![
-                            Value::Int32(*oid),
-                            Value::Text((*tname).into()),
-                            Value::Int32(11),
-                            Value::Int32(*len),
-                            Value::Text((*tt).into()),
-                            Value::Text((*cat).into()),
-                            Value::Int32(0),
-                        ]);
-                    }
-                }
-                domain_cols(&mut rows);
-                Ok(Some((cols, rows)))
-            }
-            "pg_catalog.pg_class" | "pg_class" => {
-                let tables = self.catalog.list_tables().await;
-                let indexes = self.catalog.get_all_indexes().await;
-                let cols = vec![
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "oid".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "relname".into(),
-                        dtype: DataType::Text,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "relnamespace".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "relkind".into(),
-                        dtype: DataType::Text,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "reltuples".into(),
-                        dtype: DataType::Float64,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "relowner".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "relam".into(),
-                        dtype: DataType::Int32,
-                    },
-                    // Detail columns psql's \d <relation> selects. Constant for
-                    // Nucleus (no TOAST/rules/partitions/tablespaces) except
-                    // relhasindex/relrowsecurity, which are computed truthfully.
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "relchecks".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "relhasindex".into(),
-                        dtype: DataType::Bool,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "relhasrules".into(),
-                        dtype: DataType::Bool,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "relhastriggers".into(),
-                        dtype: DataType::Bool,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "relrowsecurity".into(),
-                        dtype: DataType::Bool,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "relforcerowsecurity".into(),
-                        dtype: DataType::Bool,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "relispartition".into(),
-                        dtype: DataType::Bool,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "reltablespace".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "reloftype".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "relpersistence".into(),
-                        dtype: DataType::Text,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "relreplident".into(),
-                        dtype: DataType::Text,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "reltoastrelid".into(),
-                        dtype: DataType::Int32,
-                    },
-                    // Prisma's schema engine selects these two: no table
-                    // inheritance and no storage options exist, so false/NULL.
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "relhassubclass".into(),
-                        dtype: DataType::Bool,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "reloptions".into(),
-                        dtype: DataType::Text,
-                    },
-                ];
-                let rls_tables: std::collections::HashSet<String> = {
-                    let sec = self.security.read();
-                    sec.rls.enabled_tables().into_iter().collect()
-                };
-                let mut rows = Vec::new();
-                for (i, t) in tables.iter().enumerate() {
-                    let oid = 16384 + i as i32;
-                    let has_index = indexes.iter().any(|ix| ix.table_name == t.name);
-                    let rls_on = rls_tables.contains(&t.name);
-                    rows.push(vec![
-                        Value::Int32(oid),
-                        Value::Text(t.name.clone()),
-                        Value::Int32(2200),
-                        Value::Text("r".into()),
-                        Value::Float64(-1.0),
-                        Value::Int32(10),
-                        // Tables use the default (heap) access method.
-                        Value::Int32(2),
-                        Value::Int32(0),
-                        Value::Bool(has_index),
-                        Value::Bool(false),
-                        Value::Bool(false),
-                        Value::Bool(rls_on),
-                        Value::Bool(false),
-                        Value::Bool(false),
-                        Value::Int32(0),
-                        Value::Int32(0),
-                        Value::Text("p".into()),
-                        Value::Text("d".into()),
-                        Value::Int32(0),
-                        Value::Bool(false),
-                        Value::Null,
-                    ]);
-                }
-                for (i, idx) in indexes.iter().enumerate() {
-                    let oid = 16384 + tables.len() as i32 + i as i32;
-                    rows.push(vec![
-                        Value::Int32(oid),
-                        Value::Text(idx.name.clone()),
-                        Value::Int32(2200),
-                        Value::Text("i".into()),
-                        Value::Float64(0.0),
-                        Value::Int32(10),
-                        Value::Int32(403),
-                        Value::Int32(0),
-                        Value::Bool(false),
-                        Value::Bool(false),
-                        Value::Bool(false),
-                        Value::Bool(false),
-                        Value::Bool(false),
-                        Value::Bool(false),
-                        Value::Int32(0),
-                        Value::Int32(0),
-                        Value::Text("p".into()),
-                        Value::Text("n".into()),
-                        Value::Int32(0),
-                        Value::Bool(false),
-                        Value::Null,
-                    ]);
-                }
                 Ok(Some((cols, rows)))
             }
             "pg_catalog.pg_am" | "pg_am" => {
@@ -10463,44 +10246,6 @@ impl Executor {
                     .collect();
                 Ok(Some((cols, Vec::new())))
             }
-            // pg_enum: enum-label catalog. CREATE TYPE ... AS ENUM values live in
-            // the type catalog, not a pg_enum-shaped store; ORM introspection
-            // (drizzle-kit) only needs the relation to resolve on a fresh DB.
-            "pg_catalog.pg_enum" | "pg_enum" => {
-                let cols = [
-                    ("oid", DataType::Int32),
-                    ("enumtypid", DataType::Int32),
-                    ("enumsortorder", DataType::Float64),
-                    ("enumlabel", DataType::Text),
-                ]
-                .into_iter()
-                .map(|(n, dt)| ColMeta {
-                    table: Some(label.into()),
-                    name: n.into(),
-                    dtype: dt,
-                })
-                .collect();
-                Ok(Some((cols, Vec::new())))
-            }
-            // pg_opclass: operator classes — Nucleus indexes have no opclass
-            // concept; empty so index-introspection joins resolve.
-            "pg_catalog.pg_opclass" | "pg_opclass" => {
-                let cols = [
-                    ("oid", DataType::Int32),
-                    ("opcmethod", DataType::Int32),
-                    ("opcname", DataType::Text),
-                    ("opcnamespace", DataType::Int32),
-                    ("opcdefault", DataType::Bool),
-                ]
-                .into_iter()
-                .map(|(n, dt)| ColMeta {
-                    table: Some(label.into()),
-                    name: n.into(),
-                    dtype: dt,
-                })
-                .collect();
-                Ok(Some((cols, Vec::new())))
-            }
             // pg_views: view inventory. Nucleus views live in the view
             // registry; surface names so introspection sees them (definition
             // SQL is not stored in catalog form — NULL).
@@ -10793,167 +10538,17 @@ impl Executor {
                     .collect();
                 Ok(Some((cols, rows)))
             }
-            "pg_catalog.pg_attribute" | "pg_attribute" => {
-                let tables = self.catalog.list_tables().await;
-                let cols = vec![
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "attrelid".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "attname".into(),
-                        dtype: DataType::Text,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "atttypid".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "attnum".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "attnotnull".into(),
-                        dtype: DataType::Bool,
-                    },
-                    // Columns psql's \d <relation> selects. Nucleus has no
-                    // typmods, defaults-in-catalog, per-column collations,
-                    // identity/generated columns, or dropped-column slots.
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "atttypmod".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "atthasdef".into(),
-                        dtype: DataType::Bool,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "attcollation".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "attidentity".into(),
-                        dtype: DataType::Text,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "attgenerated".into(),
-                        dtype: DataType::Text,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "attisdropped".into(),
-                        dtype: DataType::Bool,
-                    },
-                    // Array dimensionality (drizzle-kit selects it) — Nucleus
-                    // arrays don't track declared dims; 0 matches "not an
-                    // array" for every scalar column.
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "attndims".into(),
-                        dtype: DataType::Int32,
-                    },
-                    // Fixed byte width of the column's type (JDBC getColumns).
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "attlen".into(),
-                        dtype: DataType::Int32,
-                    },
-                ];
-                let mut rows = Vec::new();
-                for (ti, t) in tables.iter().enumerate() {
-                    let rel_oid = 16384 + ti as i32;
-                    for (ci, c) in t.columns.iter().enumerate() {
-                        let (type_oid, typlen, _, _) = pg_type_info(&c.data_type);
-                        rows.push(vec![
-                            Value::Int32(rel_oid),
-                            Value::Text(c.name.clone()),
-                            Value::Int32(type_oid),
-                            Value::Int32((ci + 1) as i32),
-                            Value::Bool(!c.nullable),
-                            Value::Int32(match &c.data_type {
-                                // Encode vector dimension the way pgvector does
-                                // (typmod = dim), so format_type can render it.
-                                DataType::Vector(d) => *d as i32,
-                                _ => -1,
-                            }),
-                            Value::Bool(false),
-                            Value::Int32(0),
-                            Value::Text(String::new()),
-                            Value::Text(String::new()),
-                            Value::Bool(false),
-                            Value::Int32(0),
-                            Value::Int32(typlen),
-                        ]);
-                    }
-                }
-                Ok(Some((cols, rows)))
-            }
-            "pg_catalog.pg_depend" | "pg_depend" => {
-                // Object dependencies. Nucleus tracks none of the dependency
-                // classes clients inspect (extension membership etc.) — an
-                // empty relation lets pgcli's completion query run.
-                let cols = [
-                    ("classid", DataType::Int32),
-                    ("objid", DataType::Int32),
-                    ("objsubid", DataType::Int32),
-                    ("refclassid", DataType::Int32),
-                    ("refobjid", DataType::Int32),
-                    ("refobjsubid", DataType::Int32),
-                    ("deptype", DataType::Text),
-                ]
-                .into_iter()
-                .map(|(n, dt)| ColMeta {
-                    table: Some(label.into()),
-                    name: n.into(),
-                    dtype: dt,
-                })
-                .collect();
-                Ok(Some((cols, Vec::new())))
-            }
-            "pg_catalog.pg_attrdef" | "pg_attrdef" => {
-                // Column defaults. Nucleus stores defaults in table metadata,
-                // not a separate catalog — empty relation so \d's scalar
-                // subquery resolves (atthasdef=false keeps it unreached).
-                let cols = vec![
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "adrelid".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "adnum".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "adbin".into(),
-                        dtype: DataType::Text,
-                    },
-                ];
-                Ok(Some((cols, Vec::new())))
-            }
             "pg_catalog.pg_policy" | "pg_policy" => {
                 // Row-level-security policies, populated from the live RLS
                 // engine so \d on a policied table lists its policies. polqual
                 // renders NULL (predicates aren't stored as node trees) and
                 // polroles is always "{0}" (= all roles) — psql's role-name
                 // resolution path uses array machinery Nucleus doesn't have.
-                let tables = self.catalog.list_tables().await;
-                let table_oid: HashMap<String, i32> = tables
+                let snap = self.pg_snapshot().await;
+                let table_oid: HashMap<String, i32> = snap
+                    .tables
                     .iter()
-                    .enumerate()
-                    .map(|(i, t)| (t.name.clone(), 16384 + i as i32))
+                    .filter_map(|t| Some((t.name.clone(), snap.table_oid(&t.name)?)))
                     .collect();
                 let cols = [
                     ("oid", DataType::Int32),
@@ -11071,56 +10666,6 @@ impl Executor {
                 .collect();
                 Ok(Some((cols, Vec::new())))
             }
-            "pg_catalog.pg_inherits" | "pg_inherits" => {
-                // Table inheritance / partition parentage — none; empty so
-                // \d's child/parent listing resolves.
-                let cols = [
-                    ("inhrelid", DataType::Int32),
-                    ("inhparent", DataType::Int32),
-                    ("inhseqno", DataType::Int32),
-                    ("inhdetachpending", DataType::Bool),
-                ]
-                .into_iter()
-                .map(|(n, dt)| ColMeta {
-                    table: Some(label.into()),
-                    name: n.into(),
-                    dtype: dt,
-                })
-                .collect();
-                Ok(Some((cols, Vec::new())))
-            }
-            "pg_catalog.pg_constraint" | "pg_constraint" => {
-                // Constraints. Nucleus enforces PK/NOT NULL through table
-                // metadata, not a constraint catalog — empty relation so \d's
-                // LEFT JOIN resolves (index lines render without con* rows).
-                let names = [
-                    ("oid", DataType::Int32),
-                    ("conname", DataType::Text),
-                    ("connamespace", DataType::Int32),
-                    ("conrelid", DataType::Int32),
-                    ("contypid", DataType::Int32),
-                    ("conindid", DataType::Int32),
-                    ("confrelid", DataType::Int32),
-                    ("contype", DataType::Text),
-                    ("condeferrable", DataType::Bool),
-                    ("condeferred", DataType::Bool),
-                    ("convalidated", DataType::Bool),
-                    ("conkey", DataType::Text),
-                    ("confkey", DataType::Text),
-                    ("confupdtype", DataType::Text),
-                    ("confdeltype", DataType::Text),
-                    ("confmatchtype", DataType::Text),
-                ];
-                let cols = names
-                    .into_iter()
-                    .map(|(n, dt)| ColMeta {
-                        table: Some(label.into()),
-                        name: n.into(),
-                        dtype: dt,
-                    })
-                    .collect();
-                Ok(Some((cols, Vec::new())))
-            }
             "pg_catalog.pg_collation" | "pg_collation" => {
                 // Collations. Nucleus compares text bytewise; no per-column
                 // collations exist, so the catalog is empty.
@@ -11170,128 +10715,6 @@ impl Executor {
                 })
                 .collect::<Vec<_>>();
                 Ok(Some((cols, Vec::new())))
-            }
-            "pg_catalog.pg_index" | "pg_index" => {
-                let tables = self.catalog.list_tables().await;
-                let indexes = self.catalog.get_all_indexes().await;
-                let cols = vec![
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "indexrelid".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "indrelid".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "indisunique".into(),
-                        dtype: DataType::Bool,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "indisprimary".into(),
-                        dtype: DataType::Bool,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "indkey".into(),
-                        dtype: DataType::Text,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "indisclustered".into(),
-                        dtype: DataType::Bool,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "indisvalid".into(),
-                        dtype: DataType::Bool,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "indisreplident".into(),
-                        dtype: DataType::Bool,
-                    },
-                    // Index-reflection columns (SQLAlchemy autoload): per-key
-                    // option flags (all 0 — ASC NULLS LAST), key-column count,
-                    // no expression indexes, no partial-index predicates.
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "indoption".into(),
-                        dtype: DataType::Text,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "indnkeyatts".into(),
-                        dtype: DataType::Int32,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "indexprs".into(),
-                        dtype: DataType::Text,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "indpred".into(),
-                        dtype: DataType::Text,
-                    },
-                    ColMeta {
-                        table: Some(label.into()),
-                        name: "indnullsnotdistinct".into(),
-                        dtype: DataType::Bool,
-                    },
-                ];
-                let table_oid_map: HashMap<String, i32> = tables
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| (t.name.clone(), 16384 + i as i32))
-                    .collect();
-                let mut rows = Vec::new();
-                for (i, idx) in indexes.iter().enumerate() {
-                    let index_oid = 16384 + tables.len() as i32 + i as i32;
-                    let table_oid = table_oid_map.get(&idx.table_name).copied().unwrap_or(0);
-                    let indkey =
-                        if let Some(tdef) = tables.iter().find(|t| t.name == idx.table_name) {
-                            idx.columns
-                                .iter()
-                                .map(|col| {
-                                    tdef.columns
-                                        .iter()
-                                        .position(|c| c.name == *col)
-                                        .map(|p| (p + 1).to_string())
-                                        .unwrap_or_else(|| "0".into())
-                                })
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        } else {
-                            "0".into()
-                        };
-                    let is_primary = tables
-                        .iter()
-                        .find(|t| t.name == idx.table_name)
-                        .and_then(|t| t.primary_key_columns())
-                        .is_some_and(|pk_cols| pk_cols == idx.columns.as_slice());
-                    let ncols = idx.columns.len();
-                    rows.push(vec![
-                        Value::Int32(index_oid),
-                        Value::Int32(table_oid),
-                        Value::Bool(idx.unique),
-                        Value::Bool(is_primary),
-                        Value::Text(indkey),
-                        Value::Bool(false),
-                        Value::Bool(true),
-                        Value::Bool(false),
-                        Value::Text(vec!["0"; ncols].join(" ")),
-                        Value::Int32(ncols as i32),
-                        Value::Null,
-                        Value::Null,
-                        Value::Bool(false),
-                    ]);
-                }
-                Ok(Some((cols, rows)))
             }
             "pg_catalog.pg_settings" | "pg_settings" => {
                 let sess = self.current_session();

@@ -137,3 +137,32 @@ describe("memory loader cache store", () => {
     expect((await store.get("/c"))?.data).toBe(3);
   });
 });
+
+it('app cache publication atomically rejects generations invalidated while a fill was in flight', async () => {
+  const store = createMemoryAppCacheStore();
+  const entry = { status: 200, statusText: 'OK', headers: [] as [string, string][],
+    body: encoder.encode('old'), expiresAt: Date.now() + 5000 };
+  const old = await store.getGeneration!();
+  await store.deleteByPath('/missing'); // advances even with no existing entry
+  expect(await store.setIfGeneration!('html\nhttp://x\n/missing\n', entry, old)).toBe(false);
+  expect(await store.get('html\nhttp://x\n/missing\n')).toBeNull();
+  const fresh = await store.getGeneration!();
+  expect(await store.setIfGeneration!('html\nhttp://x\n/missing\n', entry, fresh)).toBe(true);
+  await store.clear();
+  expect(await store.setIfGeneration!('html\nhttp://x\n/missing\n', entry, fresh)).toBe(false);
+});
+
+it('loader cache publication atomically rejects stale generations and clones admitted data', async () => {
+  const store = createMemoryLoaderCacheStore();
+  const entry = { data: { version: 0 }, expiresAt: Date.now() + 5000 };
+  const old = await store.getGeneration!();
+  await store.deleteByPath('/missing');
+  expect(await store.setIfGeneration!('/missing::route', entry, old)).toBe(false);
+  expect(await store.get('/missing::route')).toBeNull();
+  const fresh = await store.getGeneration!();
+  expect(await store.setIfGeneration!('/missing::route', entry, fresh)).toBe(true);
+  entry.data.version = 9;
+  expect((await store.get('/missing::route'))?.data).toEqual({ version: 0 });
+  await store.clear();
+  expect(await store.setIfGeneration!('/missing::route', entry, fresh)).toBe(false);
+});

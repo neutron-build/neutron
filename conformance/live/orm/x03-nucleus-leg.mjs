@@ -5,23 +5,25 @@
 //      raw TS_RANGE exactness and TIME_BUCKET grid behavior, sub-ms
 //      timestamp-key precision.
 //   2. COLUMNAR_* store aggregate semantics per column, transaction
-//      behavior (rollback persistence is documented), pre-restart baseline.
+//      behavior (unsupported transaction writes must be refused), pre-restart baseline.
 //   3. engine='columnar' storage-engine DDL + CRUD + rollback round-trip.
 //   4. The neutron-nucleus CLIENT's probeTimeSeriesModel end-to-end through
 //      a real PgTransport, plus client query() if the probe passes.
 //   5. The SQL-side /timeseries capability verdicts (ts-bucketing, windows).
 //   6. RESTART durability: clean SIGTERM restart, then kill -9 mid-window —
-//      the documented durability split (TS fsync-at-commit vs columnar store
-//      checkpoint-only vs columnar engine table fsync-at-commit).
+//      process-restart durability for TS, columnar store and columnar engine
+//      tables; power loss is not simulated.
 //   7. RETENTION boundary last (destructive, global): old dropped / new
 //      kept at the tick, backfill destruction reproducer.
 //
 // Usage: node conformance/live/orm/x03-nucleus-leg.mjs <path-to-nucleus-binary>
 // Leaves no processes behind; data dir deleted at exit.
 import { spawn } from "node:child_process";
+import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
 
 const BIN = process.argv[2];
@@ -34,8 +36,8 @@ const PORT = 55932;
 // checkpoints fire within seconds — documented env knob (CONFIG_REFERENCE:
 // NUCLEUS_WAL_CHECKPOINT_INTERVAL_SECS).
 const CHECKPOINT_SECS = 2;
-const SQLDIST = path.resolve(new URL("../../../typescript/packages/neutron-sql/dist", import.meta.url).pathname);
-const NUCDIST = path.resolve(new URL("../../../typescript/packages/neutron-nucleus/dist", import.meta.url).pathname);
+const SQLDIST = fileURLToPath(new URL("../../../typescript/packages/neutron-sql/dist", import.meta.url));
+const NUCDIST = fileURLToPath(new URL("../../../typescript/packages/neutron-nucleus/dist", import.meta.url));
 
 const dataDir = mkdtempSync(path.join(tmpdir(), "x03-nucleus-"));
 writeFileSync(
@@ -88,7 +90,7 @@ try {
 
   const sql = await import(path.join(SQLDIST, "index.js"));
   const { createDatabase, capabilityGate } = sql;
-  const db = await createDatabase({ url, driverOptions: { driver: "pg" } });
+  const db = await createDatabase({ url, driverOptions: { driver: "pg", max: 1 } });
   const gate = capabilityGate(db.driver);
   out.engine = await gate.engine();
 
@@ -170,12 +172,19 @@ try {
       await val("SELECT COLUMNAR_INSERT($1, $2, $3, $4, $5, $6, $7, $8, $9)", [colTable, "a", 3, "b", 30, "c", 300, "d", 3000]);
       await val("SELECT COLUMNAR_INSERT($1, $2, $3, $4, $5, $6, $7, $8, $9)", [colTable, "a", 4, "b", 40, "c", 400, "d", 4000]);
       m.countExact = Number(await val("SELECT COLUMNAR_COUNT($1)", [colTable])) === 4;
-      // TYPING characterization (X03 finding): untyped params store as text
-      // and the numeric aggregates then answer a SILENT 0/NULL; explicitly
-      // cast values aggregate correctly. Both recorded.
-      m.untypedSumA = Number(await val("SELECT COLUMNAR_SUM($1, $2)", [colTable, "a"]));
-      m.untypedMinA = await val("SELECT COLUMNAR_MIN($1, $2)", [colTable, "a"]);
-      m.untypedAggregateSilentlyZero = m.untypedSumA === 0 && m.untypedMinA === null;
+      // Text-valued parameters are stored as text. Numeric aggregates must
+      // refuse them explicitly, then the typed fixture must still execute.
+      m.untypedAggregateRefusals = {};
+      for (const name of ["SUM", "AVG", "MIN", "MAX"]) {
+        let failure;
+        try {
+          await val(`SELECT COLUMNAR_${name}($1, $2)`, [colTable, "a"]);
+        } catch (err) {
+          failure = err;
+        }
+        assert.equal(failure?.sqlstate, "0A000", `untyped COLUMNAR_${name} must refuse numeric aggregation`);
+        m.untypedAggregateRefusals[name] = { sqlstate: failure.sqlstate, error: failure.message };
+      }
       const castTable = `${colTable}_cast`;
       for (const a of [1, 2, 3, 4]) {
         await db.driver.query("SELECT COLUMNAR_INSERT($1, $2, $3::double precision, $4, $5::double precision)", [castTable, "a", a, "b", a * 10]);
@@ -188,21 +197,30 @@ try {
       m.castMinA = Number(await val("SELECT COLUMNAR_MIN($1, $2)", [castTable, "a"]));
       m.castMaxA = Number(await val("SELECT COLUMNAR_MAX($1, $2)", [castTable, "a"]));
       m.castMinMaxExact = m.castMinA === 1 && m.castMaxA === 4;
-      // transactions: the engine REFUSES columnar inserts inside an explicit
-      // transaction (observed live; the older MODEL_SEMANTICS claim that
-      // rolled-back rows persist is stale — the refusal is safer).
+      // Pin the one-connection driver across BEGIN, refusal and ROLLBACK.
+      // A refusal must leave the previously committed store unchanged.
+      let insertFailure;
+      await db.driver.execute("BEGIN");
       try {
-        await db.driver.execute("BEGIN");
         await val("SELECT COLUMNAR_INSERT($1, $2, $3, $4, $5)", [colTable, "a", 99, "b", 990]);
-        await db.driver.execute("ROLLBACK");
-        m.inTxInsert = { rejected: false, countAfter: Number(await val("SELECT COLUMNAR_COUNT($1)", [colTable])) };
       } catch (err) {
-        m.inTxInsert = { rejected: true, error: String(err.message ?? err).slice(0, 200) };
+        insertFailure = err;
+      } finally {
+        await db.driver.execute("ROLLBACK");
       }
+      assert.equal(insertFailure?.sqlstate, "0A000", "transactional COLUMNAR_INSERT must be refused");
+      const countAfter = Number(await val("SELECT COLUMNAR_COUNT($1)", [colTable]));
+      assert.equal(countAfter, 4, "refused insert must not change committed store rows");
+      m.inTxInsert = { rejected: true, sqlstate: insertFailure.sqlstate, countAfter };
       m.baselineCount = Number(await val("SELECT COLUMNAR_COUNT($1)", [colTable]));
       m.baselineCastSumA = Number(await val("SELECT COLUMNAR_SUM($1, $2)", [castTable, "a"]));
+      assert.equal(m.countExact, true);
+      assert.equal(m.castAggregatesExact, true);
+      assert.equal(m.castAvgExact, true);
+      assert.equal(m.castMinMaxExact, true);
     } catch (err) {
       m.error = String(err.message ?? err).slice(0, 300);
+      process.exitCode = 1;
     }
     out.matrix.columnarStore = m;
   }
@@ -295,7 +313,7 @@ try {
   out.restart.restartedClean = await waitReady();
   if (!out.restart.restartedClean) throw new Error("engine did not restart cleanly:\n" + log.slice(-2000));
   {
-    const db2 = await createDatabase({ url, driverOptions: { driver: "pg" } });
+    const db2 = await createDatabase({ url, driverOptions: { driver: "pg", max: 1 } });
     const v2 = async (text, params = []) => {
       const rows = await db2.driver.query(text, params);
       return rows.length > 0 ? rows[0][Object.keys(rows[0])[0]] : null;
@@ -307,9 +325,12 @@ try {
       engineTableCount: Number(await v2("SELECT count(*) FROM x03_leg_eng")),
       engineTableV2: Number(await v2("SELECT v FROM x03_leg_eng WHERE id = 2")),
     };
+    assert.equal(out.restart.afterCleanRestart.columnarStoreCount, 4);
+    assert.equal(out.restart.afterCleanRestart.columnarStoreCastSumA, 10);
+    assert.equal(out.restart.afterCleanRestart.engineTableCount, 2);
+    assert.equal(out.restart.afterCleanRestart.engineTableV2, 9.5);
     // kill -9 INSIDE the checkpoint window: write, then kill immediately.
-    // fsync-at-commit stores keep the rows; checkpoint-only stores lose
-    // whatever no checkpoint captured.
+    // Record process-crash survival; this is not a power-cut simulation.
     await v2("SELECT TS_INSERT($1, $2, $3)", ["x03_leg_kill9", Date.now(), 42]);
     await v2("SELECT COLUMNAR_INSERT($1, $2, $3, $4, $5)", [`${colTable}_k9`, "a", 7, "b", 70]);
     await db2.driver.execute("INSERT INTO x03_leg_eng VALUES (10, 10.5)");
@@ -318,8 +339,9 @@ try {
   out.restart.kill9 = await stopEngine("SIGKILL");
   startEngine();
   out.restart.restartedAfterKill9 = await waitReady();
+  assert.equal(out.restart.restartedAfterKill9, true, "engine must restart after SIGKILL");
   if (out.restart.restartedAfterKill9) {
-    const db3 = await createDatabase({ url, driverOptions: { driver: "pg" } });
+    const db3 = await createDatabase({ url, driverOptions: { driver: "pg", max: 1 } });
     const v3 = async (text, params = []) => {
       const rows = await db3.driver.query(text, params);
       return rows.length > 0 ? rows[0][Object.keys(rows[0])[0]] : null;
@@ -329,12 +351,15 @@ try {
       columnarKill9Count: Number(await v3("SELECT COLUMNAR_COUNT($1)", [`${colTable}_k9`])),
       engineTableKill9HasId10: Number(await v3("SELECT count(*) FROM x03_leg_eng WHERE id = 10")),
     };
+    assert.equal(out.restart.afterKill9.tsKill9Count, 1);
+    assert.equal(out.restart.afterKill9.columnarKill9Count, 1);
+    assert.equal(out.restart.afterKill9.engineTableKill9HasId10, 1);
     await db3.driver.close();
   }
 
   // ------------------------------------------- 7. retention (LAST)
   {
-    const db4 = await createDatabase({ url, driverOptions: { driver: "pg" } });
+    const db4 = await createDatabase({ url, driverOptions: { driver: "pg", max: 1 } });
     const v4 = async (text, params = []) => {
       const rows = await db4.driver.query(text, params);
       return rows.length > 0 ? rows[0][Object.keys(rows[0])[0]] : null;
@@ -385,6 +410,7 @@ try {
   }
 } catch (err) {
   out.fatal = err?.stack ?? String(err);
+  process.exitCode = 1;
 } finally {
   await stopEngine("SIGKILL", 5000).catch(() => undefined);
   try { rmSync(dataDir, { recursive: true, force: true }); } catch {}

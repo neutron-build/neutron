@@ -58,7 +58,16 @@ fn table_name_to_id(name: &str) -> u64 {
 /// reaches an engine. Columnar batches choose one physical representation per
 /// column, so a single uncoerced UPDATE value can otherwise turn neighboring
 /// values into NULL while rebuilding a batch.
-fn coerce_value_for_write(
+pub(super) fn coerce_value_for_write(
+    value: &mut Value,
+    column: &ColumnDef,
+    session_time_zone: chrono_tz::Tz,
+) -> Result<(), ExecError> {
+    coerce_value_to_type(value, column, session_time_zone)?;
+    super::column_writes::enforce_max_len(value, column)
+}
+
+fn coerce_value_to_type(
     value: &mut Value,
     column: &ColumnDef,
     session_time_zone: chrono_tz::Tz,
@@ -78,14 +87,54 @@ fn coerce_value_for_write(
     // Postgres array-literal text (`{a,b}`) into a real Array. Without this an
     // ARRAY column can only be written from an ARRAY[...] expression — a text
     // literal, which is all COPY has, would fail the cast below.
-    if matches!(column.data_type, DataType::Array(_))
-        && let Value::Text(text) = value
-    {
-        let trimmed = text.trim();
-        if trimmed.starts_with('{') && trimmed.ends_with('}') {
-            *value = Value::Array(super::expr::parse_pg_array_literal(trimmed));
+    if let DataType::Array(element) = &column.data_type {
+        if matches!(
+            element.as_ref(),
+            DataType::Array(_) | DataType::Interval | DataType::Vector(_)
+        ) {
+            return Err(ExecError::Unsupported(
+                "stored arrays of this element type are not supported by the tuple codec".into(),
+            ));
+        }
+        let mut leaf = column.clone();
+        leaf.data_type = *element.clone();
+        if let Value::Text(text) = value {
+            let items = crate::types::parse_array_literal(text).map_err(ExecError::Runtime)?;
+            *value = crate::types::array_value_from_literal(&items, &mut |s| {
+                let mut item = Value::Text(s.to_string());
+                coerce_value_for_write(&mut item, &leaf, session_time_zone)
+                    .map_err(|error| error.to_string())?;
+                Ok(item)
+            })
+            .map_err(ExecError::Runtime)?;
+        }
+        if let Value::Array(items) = value {
+            if items.iter().any(|item| matches!(item, Value::Array(_))) {
+                return Err(ExecError::Unsupported(
+                    "stored multidimensional arrays are not supported by the tuple codec".into(),
+                ));
+            }
+            crate::types::validate_array_shape(items).map_err(ExecError::Runtime)?;
+            fn coerce(
+                items: &mut [Value],
+                leaf: &ColumnDef,
+                tz: chrono_tz::Tz,
+            ) -> Result<(), ExecError> {
+                for item in items {
+                    match item {
+                        Value::Array(inner) => coerce(inner, leaf, tz)?,
+                        other => coerce_value_for_write(other, leaf, tz)?,
+                    }
+                }
+                Ok(())
+            }
+            coerce(items, &leaf, session_time_zone)?;
             return Ok(());
         }
+        return Err(ExecError::Runtime(format!(
+            "invalid array value for column '{}'",
+            column.name
+        )));
     }
     if matches!(column.data_type, DataType::Interval)
         && let Value::Text(text) = value
@@ -94,15 +143,31 @@ fn coerce_value_for_write(
         return Ok(());
     }
     if matches!(column.data_type, DataType::TimestampTz) {
+        // Text: an explicit offset or zone name decides the instant, only a
+        // bare literal is wall time in the session zone.
+        if let Value::Text(text) = value {
+            let instant = super::timestamptz::parse_timestamptz_text(text, session_time_zone)
+                .map_err(|error| {
+                    ExecError::Runtime(format!(
+                        "invalid value for column '{}' ({}): {}",
+                        column.name,
+                        column.data_type,
+                        match error {
+                            ExecError::Runtime(message) => message,
+                            other => other.to_string(),
+                        }
+                    ))
+                })?;
+            *value = Value::TimestampTz(instant);
+            return Ok(());
+        }
         let local = match value {
-            Value::Text(text) => Some(crate::types::parse_timestamp(text).map_err(|error| {
-                ExecError::Runtime(format!(
-                    "invalid value for column '{}' ({}): {error}",
-                    column.name, column.data_type
-                ))
-            })?),
             Value::Timestamp(timestamp) => Some(*timestamp),
-            Value::TimestampTz(_) => None,
+            Value::Date(date) => Some(
+                i64::from(*date)
+                    .checked_mul(86_400_000_000)
+                    .ok_or_else(|| ExecError::Runtime("timestamp value out of range".into()))?,
+            ),
             _ => None,
         };
         if let Some(local) = local {
@@ -135,6 +200,7 @@ impl Executor {
         &self,
         insert: ast::Insert,
     ) -> Result<ExecResult, ExecError> {
+        let overriding = sql::insert_overriding(&insert);
         let table_name = match insert.table {
             ast::TableObject::TableName(name) => crate::sql::object_name_key(&name),
             _ => {
@@ -177,9 +243,21 @@ impl Executor {
         let insert_columns: Vec<String> = insert.columns.iter().map(|c| c.value.clone()).collect();
         let has_column_list = !insert_columns.is_empty();
 
-        let source = insert
-            .source
-            .ok_or_else(|| ExecError::Unsupported("INSERT without VALUES".into()))?;
+        let source = match insert.source {
+            Some(source) => source,
+            // `INSERT ... DEFAULT VALUES` is `VALUES (DEFAULT, ...)` over every column.
+            None if insert.assignments.is_empty() && !has_column_list => {
+                let defaults = vec!["DEFAULT"; table_def.columns.len()].join(", ");
+                let parsed = sql::parse(&format!("INSERT INTO t VALUES ({defaults})"))?;
+                match parsed.into_iter().next() {
+                    Some(Statement::Insert(synth)) => synth
+                        .source
+                        .ok_or_else(|| ExecError::Unsupported("INSERT without VALUES".into()))?,
+                    _ => return Err(ExecError::Unsupported("INSERT without VALUES".into())),
+                }
+            }
+            None => return Err(ExecError::Unsupported("INSERT without VALUES".into())),
+        };
 
         // Determine source type without consuming the Query yet
         enum InsertSourceKind {
@@ -234,9 +312,13 @@ impl Executor {
                     };
                     let mut vals: Vec<Value> = Vec::with_capacity(row_exprs.len());
                     for (i, expr) in row_exprs.iter().enumerate() {
-                        if Self::is_default_expr(expr) {
+                        let col = &table_def.columns[col_order[i]];
+                        let is_default = Self::is_default_expr(expr);
+                        let policy = super::column_writes::insert_column_policy(
+                            col, overriding, is_default,
+                        )?;
+                        if is_default || policy == super::column_writes::InsertColumn::UseDefault {
                             // Resolve DEFAULT for this column
-                            let col = &table_def.columns[col_order[i]];
                             vals.push(self.eval_column_default(col)?);
                         } else if let Expr::Value(val_with_span) = expr {
                             // Fast path: direct literal → Value (skip eval_const_expr overhead)
@@ -290,7 +372,17 @@ impl Executor {
                                         insert_columns.iter().position(|c| c == &col.name)
                                     {
                                         if pos < select_row.len() {
-                                            full_row.push(select_row[pos].clone());
+                                            let policy =
+                                                super::column_writes::insert_column_policy(
+                                                    col, overriding, false,
+                                                )?;
+                                            if policy
+                                                == super::column_writes::InsertColumn::UseDefault
+                                            {
+                                                full_row.push(self.eval_column_default(col)?);
+                                            } else {
+                                                full_row.push(select_row[pos].clone());
+                                            }
                                         } else {
                                             full_row.push(self.eval_column_default(col)?);
                                         }
@@ -301,6 +393,22 @@ impl Executor {
                                 mapped_rows.push(full_row);
                             }
                             mapped_rows
+                        } else if table_def.columns.iter().any(|c| c.generation.is_some()) {
+                            let mut rows = rows;
+                            for row in rows.iter_mut() {
+                                for (i, col) in table_def.columns.iter().enumerate() {
+                                    if i >= row.len() {
+                                        break;
+                                    }
+                                    let policy = super::column_writes::insert_column_policy(
+                                        col, overriding, false,
+                                    )?;
+                                    if policy == super::column_writes::InsertColumn::UseDefault {
+                                        row[i] = self.eval_column_default(col)?;
+                                    }
+                                }
+                            }
+                            rows
                         } else {
                             rows
                         }
@@ -338,6 +446,7 @@ impl Executor {
         let returning = &insert.returning;
 
         let col_meta = self.table_col_meta(&table_def);
+        let generated_exprs = self.generated_exprs(&table_def)?;
 
         // Pre-check: does this table have any INSERT triggers? (avoids 4N+2 async lock acquisitions)
         let has_triggers = {
@@ -417,6 +526,10 @@ impl Executor {
                 if let Some(value) = row.get_mut(i) {
                     coerce_value_for_write(value, col, self.session_time_zone()?)?;
                 }
+            }
+            if !generated_exprs.is_empty() {
+                row.resize(table_def.columns.len(), Value::Null);
+                self.apply_generated(&generated_exprs, &table_def, &col_meta, &mut row)?;
             }
 
             // WITH CHECK is evaluated after defaults/coercions have produced the
@@ -560,12 +673,33 @@ impl Executor {
                                             _ => continue,
                                         };
                                         if let Some(idx) = table_def.column_index(&col_name) {
-                                            updated[idx] = self.eval_row_expr(
-                                                &assign.value,
-                                                &combined_row,
-                                                &augmented_meta,
+                                            let col = &table_def.columns[idx];
+                                            let is_default = Self::is_default_expr(&assign.value);
+                                            super::column_writes::check_update_target(
+                                                col, is_default,
+                                            )?;
+                                            updated[idx] = if is_default {
+                                                self.eval_column_default(col)?
+                                            } else {
+                                                self.eval_row_expr(
+                                                    &assign.value,
+                                                    &combined_row,
+                                                    &augmented_meta,
+                                                )?
+                                            };
+                                            super::column_writes::enforce_max_len(
+                                                &mut updated[idx],
+                                                col,
                                             )?;
                                         }
+                                    }
+                                    if !generated_exprs.is_empty() {
+                                        self.apply_generated(
+                                            &generated_exprs,
+                                            &table_def,
+                                            &col_meta,
+                                            &mut updated,
+                                        )?;
                                     }
                                     self.enforce_rls_new_row(
                                         &table_name,
@@ -963,28 +1097,35 @@ impl Executor {
         &self,
         col: &crate::catalog::ColumnDef,
     ) -> Result<Value, ExecError> {
-        if let Some(ref default_expr) = col.default_expr {
-            let parsed = sql::parse(&format!("SELECT {default_expr}"));
-            if let Ok(stmts) = parsed
-                && let Some(Statement::Query(q)) = stmts.into_iter().next()
-                && let SetExpr::Select(sel) = *q.body
-                && let Some(SelectItem::UnnamedExpr(expr)) = sel.projection.first()
-            {
-                let empty_row: Row = Vec::new();
-                let empty_meta: Vec<ColMeta> = Vec::new();
-                if let Ok(val) = self.eval_row_expr(expr, &empty_row, &empty_meta) {
-                    // Coerce the default value to match the column's declared type.
-                    // This handles SERIAL (Int32) columns whose nextval() returns Int64.
-                    let coerced = match (&col.data_type, &val) {
-                        (DataType::Int32, Value::Int64(n)) => Value::Int32(*n as i32),
-                        (DataType::Int64, Value::Int32(n)) => Value::Int64(*n as i64),
-                        _ => val,
-                    };
-                    return Ok(coerced);
-                }
-            }
+        let Some(default_expr) = &col.default_expr else {
+            return Ok(Value::Null);
+        };
+        let parsed = sql::parse(&format!("SELECT {default_expr}"))?;
+        let Some(Statement::Query(q)) = parsed.into_iter().next() else {
+            return Err(ExecError::Runtime(
+                "invalid column default expression".into(),
+            ));
+        };
+        let SetExpr::Select(sel) = *q.body else {
+            return Err(ExecError::Runtime(
+                "invalid column default expression".into(),
+            ));
+        };
+        let Some(SelectItem::UnnamedExpr(expr)) = sel.projection.first() else {
+            return Err(ExecError::Runtime(
+                "invalid column default expression".into(),
+            ));
+        };
+        let val = self.eval_row_expr(expr, &Vec::new(), &Vec::new())?;
+        // SERIAL's nextval returns int8; narrowing must reject overflow rather
+        // than wrap, just as writing an explicit value does.
+        match (&col.data_type, val) {
+            (DataType::Int32, Value::Int64(n)) => i32::try_from(n)
+                .map(Value::Int32)
+                .map_err(|_| ExecError::Runtime("integer out of range in column default".into())),
+            (DataType::Int64, Value::Int32(n)) => Ok(Value::Int64(i64::from(n))),
+            (_, val) => Ok(val),
         }
-        Ok(Value::Null)
     }
 
     /// Get conflict target columns from ON CONFLICT clause.
@@ -1311,7 +1452,18 @@ impl Executor {
         table_def: &TableDef,
         new_row: &Row,
     ) -> Result<(), ExecError> {
-        self.check_fk_constraints_except(table_def, new_row, None)
+        self.check_fk_constraints_except(table_def, new_row, None, true)
+            .await
+    }
+
+    /// Like [`Self::check_fk_constraints`] but never defers to COMMIT: for
+    /// validating rows that already exist against a newly added constraint.
+    pub(super) async fn check_fk_constraints_now(
+        &self,
+        table_def: &TableDef,
+        new_row: &Row,
+    ) -> Result<(), ExecError> {
+        self.check_fk_constraints_except(table_def, new_row, None, false)
             .await
     }
 
@@ -1323,14 +1475,17 @@ impl Executor {
         table_def: &TableDef,
         new_row: &Row,
         skip: Option<(&str, &[String], &[String])>,
+        allow_defer: bool,
     ) -> Result<(), ExecError> {
         use crate::catalog::TableConstraint;
 
         for constraint in &table_def.constraints {
             if let TableConstraint::ForeignKey {
+                name,
                 columns,
                 ref_table,
                 ref_columns,
+                deferrable,
                 ..
             } = constraint
             {
@@ -1355,6 +1510,19 @@ impl Executor {
 
                 // If any FK column is NULL, the constraint is satisfied (SQL standard)
                 if fk_values.iter().any(|v| **v == Value::Null) {
+                    continue;
+                }
+
+                // A deferred foreign key is judged at COMMIT, on the key alone.
+                if allow_defer && self.fk_check_deferred(name.as_deref(), *deferrable) {
+                    self.defer_fk_check(super::deferred_fk::PendingFk {
+                        name: name.clone(),
+                        child_table: table_def.name.clone(),
+                        columns: columns.clone(),
+                        ref_table: ref_table.clone(),
+                        ref_columns: ref_columns.clone(),
+                        key: fk_values.iter().map(|v| (*v).clone()).collect(),
+                    });
                     continue;
                 }
 
@@ -1394,6 +1562,52 @@ impl Executor {
         Ok(())
     }
 
+    /// Check the final keys of a staged batch before any related table is
+    /// changed. Per-row snapshot checks cannot see another staged row's key.
+    fn check_staged_unique_constraints<'a>(
+        table_def: &TableDef,
+        rows: impl IntoIterator<Item = &'a Row>,
+    ) -> Result<(), ExecError> {
+        use crate::catalog::TableConstraint;
+        if crate::columnar::replacing_config(&table_def.name).is_some() {
+            return Ok(());
+        }
+        let rows: Vec<&Row> = rows.into_iter().collect();
+        for constraint in &table_def.constraints {
+            let columns = match constraint {
+                TableConstraint::PrimaryKey { columns, .. }
+                | TableConstraint::Unique { columns, .. } => columns,
+                _ => continue,
+            };
+            let indices: Vec<usize> = columns
+                .iter()
+                .filter_map(|c| table_def.column_index(c))
+                .collect();
+            if indices.len() != columns.len() {
+                return Err(ExecError::Runtime(
+                    "unique constraint references missing column".into(),
+                ));
+            }
+            let mut seen = HashSet::with_capacity(rows.len());
+            for row in &rows {
+                let key: Vec<Value> = indices
+                    .iter()
+                    .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                    .collect();
+                if key.iter().any(|v| matches!(v, Value::Null)) {
+                    continue;
+                }
+                if !seen.insert(key) {
+                    return Err(ExecError::ConstraintViolation(format!(
+                        "duplicate key value violates unique constraint on ({})",
+                        columns.join(", ")
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Validate the complete child-row constraint envelope before applying an
     /// implicit foreign-key action. Cascades are writes, so they must not bypass
     /// NOT NULL, CHECK, ENUM, UNIQUE, or unrelated foreign keys.
@@ -1408,7 +1622,7 @@ impl Executor {
         Self::check_not_null_constraints(child_table_def, row)?;
         self.check_check_constraints(child_table_def, row)?;
         self.check_enum_constraints(child_table_def, row).await?;
-        self.check_fk_constraints_except(child_table_def, row, skip_cascaded_fk)
+        self.check_fk_constraints_except(child_table_def, row, skip_cascaded_fk, true)
             .await?;
         self.check_unique_constraints(child_table, child_table_def, row, Some(old_position))
             .await
@@ -1450,12 +1664,13 @@ impl Executor {
 
                 for constraint in &child_table_def.constraints {
                     if let TableConstraint::ForeignKey {
+                        name: fk_name,
                         columns,
                         ref_table,
                         ref_columns,
                         on_delete,
                         on_update,
-                        ..
+                        deferrable,
                     } = constraint
                     {
                         if ref_table != parent_table {
@@ -1483,7 +1698,88 @@ impl Executor {
                         }
 
                         let child_table = &child_table_def.name;
+                        let child_generated = self.generated_exprs(child_table_def)?;
+                        let child_col_meta = self.table_col_meta(child_table_def);
                         let child_storage = self.storage_for_write(child_table).await;
+
+                        // Deterministic child actions can also collide across
+                        // different parent rows (for example abs(fk) UNIQUE).
+                        // Project all affected children together during the
+                        // read-only pass, including untouched rows, before the
+                        // apply pass changes the first child.
+                        if !apply
+                            && child_table_def.constraints.iter().any(|constraint| {
+                                matches!(
+                                    constraint,
+                                    TableConstraint::PrimaryKey { .. }
+                                        | TableConstraint::Unique { .. }
+                                )
+                            })
+                        {
+                            let action = if new_parent_rows.is_some() {
+                                on_update
+                            } else {
+                                on_delete
+                            };
+                            if matches!(action, FkAction::SetNull)
+                                || (new_parent_rows.is_some()
+                                    && matches!(action, FkAction::Cascade))
+                            {
+                                let mut final_children = child_storage.scan(child_table).await?;
+                                for row in &mut final_children {
+                                    let replacement = if let Some(pairs) = new_parent_rows {
+                                        pairs.iter().find_map(|(old, new)| {
+                                            let old_key: Vec<&Value> =
+                                                ref_col_indices.iter().map(|&i| &old[i]).collect();
+                                            let new_key: Vec<&Value> =
+                                                ref_col_indices.iter().map(|&i| &new[i]).collect();
+                                            (old_key != new_key
+                                                && !old_key
+                                                    .iter()
+                                                    .any(|v| matches!(v, Value::Null))
+                                                && child_col_indices
+                                                    .iter()
+                                                    .zip(&old_key)
+                                                    .all(|(&i, v)| row.get(i) == Some(*v)))
+                                            .then(|| {
+                                                new_key.into_iter().cloned().collect::<Vec<Value>>()
+                                            })
+                                        })
+                                    } else {
+                                        deleted_rows.iter().find_map(|old| {
+                                            let key: Vec<&Value> =
+                                                ref_col_indices.iter().map(|&i| &old[i]).collect();
+                                            (!key.iter().any(|v| matches!(v, Value::Null))
+                                                && child_col_indices
+                                                    .iter()
+                                                    .zip(&key)
+                                                    .all(|(&i, v)| row.get(i) == Some(*v)))
+                                            .then(|| vec![Value::Null; child_col_indices.len()])
+                                        })
+                                    };
+                                    if let Some(values) = replacement {
+                                        for (&index, value) in child_col_indices.iter().zip(values)
+                                        {
+                                            row[index] = if matches!(action, FkAction::SetNull) {
+                                                Value::Null
+                                            } else {
+                                                value
+                                            };
+                                        }
+                                        self.apply_generated(
+                                            &child_generated,
+                                            child_table_def,
+                                            &child_col_meta,
+                                            row,
+                                        )?;
+                                    }
+                                }
+                                Self::check_staged_unique_constraints(
+                                    child_table_def,
+                                    &final_children,
+                                )?;
+                            }
+                        }
 
                         if let Some(update_pairs) = new_parent_rows {
                             // -- ON UPDATE handling --
@@ -1534,6 +1830,19 @@ impl Executor {
                                 }
 
                                 match action {
+                                    FkAction::NoAction
+                                        if self
+                                            .fk_check_deferred(fk_name.as_deref(), *deferrable) =>
+                                    {
+                                        self.defer_fk_check(super::deferred_fk::PendingFk {
+                                            name: fk_name.clone(),
+                                            child_table: child_table.clone(),
+                                            columns: columns.clone(),
+                                            ref_table: ref_table.clone(),
+                                            ref_columns: ref_columns.clone(),
+                                            key: old_vals.iter().map(|v| (*v).clone()).collect(),
+                                        });
+                                    }
                                     FkAction::Restrict | FkAction::NoAction => {
                                         return Err(ExecError::ConstraintViolation(format!(
                                             "update on table \"{}\" violates foreign key constraint on table \"{}\"",
@@ -1559,6 +1868,12 @@ impl Executor {
                                             {
                                                 updated_row[ci] = new_vals[ci_idx].clone();
                                             }
+                                            self.apply_generated(
+                                                &child_generated,
+                                                child_table_def,
+                                                &child_col_meta,
+                                                &mut updated_row,
+                                            )?;
                                             self.enforce_rls_new_row(
                                                 child_table,
                                                 crate::security::PolicyCommand::Update,
@@ -1568,7 +1883,7 @@ impl Executor {
                                                 child_table,
                                                 child_table_def,
                                                 &updated_row,
-                                                pos,
+                                                child_positions[pos],
                                                 Some((parent_table, columns, ref_columns)),
                                             )
                                             .await?;
@@ -1616,6 +1931,12 @@ impl Executor {
                                             for &ci in &child_col_indices {
                                                 updated_row[ci] = Value::Null;
                                             }
+                                            self.apply_generated(
+                                                &child_generated,
+                                                child_table_def,
+                                                &child_col_meta,
+                                                &mut updated_row,
+                                            )?;
                                             self.enforce_rls_new_row(
                                                 child_table,
                                                 crate::security::PolicyCommand::Update,
@@ -1625,7 +1946,7 @@ impl Executor {
                                                 child_table,
                                                 child_table_def,
                                                 &updated_row,
-                                                pos,
+                                                child_positions[pos],
                                                 None,
                                             )
                                             .await?;
@@ -1675,6 +1996,12 @@ impl Executor {
                                                 )?;
                                                 updated_row[ci] = default_val;
                                             }
+                                            self.apply_generated(
+                                                &child_generated,
+                                                child_table_def,
+                                                &child_col_meta,
+                                                &mut updated_row,
+                                            )?;
                                             self.enforce_rls_new_row(
                                                 child_table,
                                                 crate::security::PolicyCommand::Update,
@@ -1702,7 +2029,7 @@ impl Executor {
                                                 child_table,
                                                 child_table_def,
                                                 &updated_row,
-                                                pos,
+                                                child_positions[pos],
                                                 references_pending_new_key.then_some((
                                                     parent_table,
                                                     columns,
@@ -1802,6 +2129,19 @@ impl Executor {
                                 }
 
                                 match action {
+                                    FkAction::NoAction
+                                        if self
+                                            .fk_check_deferred(fk_name.as_deref(), *deferrable) =>
+                                    {
+                                        self.defer_fk_check(super::deferred_fk::PendingFk {
+                                            name: fk_name.clone(),
+                                            child_table: child_table.clone(),
+                                            columns: columns.clone(),
+                                            ref_table: ref_table.clone(),
+                                            ref_columns: ref_columns.clone(),
+                                            key: parent_vals.iter().map(|v| (*v).clone()).collect(),
+                                        });
+                                    }
                                     FkAction::Restrict | FkAction::NoAction => {
                                         return Err(ExecError::ConstraintViolation(format!(
                                             "delete on table \"{}\" violates foreign key constraint on table \"{}\"",
@@ -1867,6 +2207,12 @@ impl Executor {
                                             for &ci in &child_col_indices {
                                                 updated_row[ci] = Value::Null;
                                             }
+                                            self.apply_generated(
+                                                &child_generated,
+                                                child_table_def,
+                                                &child_col_meta,
+                                                &mut updated_row,
+                                            )?;
                                             self.enforce_rls_new_row(
                                                 child_table,
                                                 crate::security::PolicyCommand::Update,
@@ -1876,7 +2222,7 @@ impl Executor {
                                                 child_table,
                                                 child_table_def,
                                                 &updated_row,
-                                                pos,
+                                                child_positions[pos],
                                                 None,
                                             )
                                             .await?;
@@ -1926,6 +2272,12 @@ impl Executor {
                                                 )?;
                                                 updated_row[ci] = default_val;
                                             }
+                                            self.apply_generated(
+                                                &child_generated,
+                                                child_table_def,
+                                                &child_col_meta,
+                                                &mut updated_row,
+                                            )?;
                                             self.enforce_rls_new_row(
                                                 child_table,
                                                 crate::security::PolicyCommand::Update,
@@ -1935,7 +2287,7 @@ impl Executor {
                                                 child_table,
                                                 child_table_def,
                                                 &updated_row,
-                                                pos,
+                                                child_positions[pos],
                                                 None,
                                             )
                                             .await?;
@@ -2048,6 +2400,7 @@ impl Executor {
     /// granules in scan order so they align with `apply_zone_map_pruning`'s
     /// chunking. On any failure, clear the map (pruning then safely no-ops).
     async fn rebuild_zone_map(&self, table_name: &str) {
+        let generation = self.derived_coherence.generation();
         let zm_table_id = table_name_to_id(table_name);
         let col_count = match self.get_table(table_name).await {
             Ok(def) => def.columns.len(),
@@ -2070,26 +2423,36 @@ impl Executor {
                 return;
             }
         };
-        self.zone_map_index.clear_table(zm_table_id);
-        if rows.is_empty() {
-            return;
-        }
-        let column_ids: Vec<u32> = (0..col_count as u32).collect();
-        for (granule_id, chunk) in rows.chunks(GRANULE_SIZE as usize).enumerate() {
-            let stats = crate::storage::granule_stats::compute_granule_stats(
-                chunk,
-                &column_ids,
-                zm_table_id,
-                granule_id as u32,
-            );
-            self.zone_map_index
-                .update_granule(zm_table_id, granule_id as u32, stats);
-        }
+        #[cfg(test)]
+        self.pause_derived_publish("zone", table_name);
+        self.derived_coherence
+            .publish(generation, "zone", table_name, || {
+                self.zone_map_index.clear_table(zm_table_id);
+                let column_ids: Vec<u32> = (0..col_count as u32).collect();
+                for (granule_id, chunk) in rows.chunks(GRANULE_SIZE as usize).enumerate() {
+                    let stats = crate::storage::granule_stats::compute_granule_stats(
+                        chunk,
+                        &column_ids,
+                        zm_table_id,
+                        granule_id as u32,
+                    );
+                    self.zone_map_index
+                        .update_granule(zm_table_id, granule_id as u32, stats);
+                }
+            });
     }
 
-    /// Repair every derived representation whose row IDs or values can become
-    /// stale after UPDATE/DELETE, FK actions, or a schema rewrite.
+    /// Refresh executor-owned representations after ordinary row mutations.
+    /// Storage engines already maintain their own B-tree postings.
     pub(super) async fn rebuild_table_derived_state(&self, table_name: &str) {
+        self.maintain_table_derived_state(table_name, false).await;
+    }
+
+    pub(super) async fn rebuild_table_storage_and_derived_state(&self, table_name: &str) {
+        self.maintain_table_derived_state(table_name, true).await;
+    }
+
+    async fn maintain_table_derived_state(&self, table_name: &str, rebuild_storage: bool) {
         // Inside an explicit transaction this is deferred to COMMIT/ROLLBACK,
         // which already rebuild every table in `derived_dirty_tables`.
         //
@@ -2111,48 +2474,64 @@ impl Executor {
             let mut txn = session.txn_state.write().await;
             if txn.active {
                 txn.derived_dirty_tables.insert(table_name.to_string());
+                if rebuild_storage {
+                    txn.storage_index_dirty_tables
+                        .insert(table_name.to_string());
+                }
                 return;
             }
         }
 
-        // TRUNCATE recreates the physical table and therefore removes its
-        // engine-local indexes while catalog definitions remain. Re-create any
-        // missing physical indexes before rebuilding their postings.
-        if let Some(table_def) = self.catalog.get_table(table_name).await {
-            for index in self.catalog.get_indexes(table_name).await {
-                if matches!(
-                    index.index_type,
-                    crate::catalog::IndexType::BTree | crate::catalog::IndexType::Hash
-                ) && !index.options.contains_key("encryption_mode")
-                    && let Some(column) = index.columns.first()
-                    && let Some(column_index) = table_def.column_index(column)
-                {
-                    let _ = self
-                        .storage_for(table_name)
-                        .create_index(table_name, &index.name, column_index)
-                        .await;
-                    self.btree_indexes
-                        .insert((table_name.to_string(), column.clone()), index.name.clone());
+        self.rebuild_committed_derived_state(table_name, rebuild_storage)
+            .await;
+    }
+
+    /// Rebuild from storage after a commit/abort decision, even while rollback
+    /// retains active transaction state and before-images for cancellation recovery.
+    pub(super) async fn rebuild_committed_table_derived_state(&self, table_name: &str) {
+        self.rebuild_committed_derived_state(table_name, true).await;
+    }
+
+    async fn rebuild_committed_derived_state(&self, table_name: &str, rebuild_storage: bool) {
+        // Ordinary DML already updates storage B-trees with its heap writes.
+        // Publishing a detached full rebuild here can overwrite postings from
+        // a concurrent writer that committed after the rebuild scanned them.
+        // Schema replacement and rollback still need physical reconstruction.
+        if rebuild_storage {
+            // TRUNCATE recreates the physical table and therefore removes its
+            // engine-local indexes while catalog definitions remain. Re-create any
+            // missing physical indexes before rebuilding their postings.
+            if let Some(table_def) = self.catalog.get_table(table_name).await {
+                for index in self.catalog.get_indexes(table_name).await {
+                    if matches!(
+                        index.index_type,
+                        crate::catalog::IndexType::BTree | crate::catalog::IndexType::Hash
+                    ) && !index.options.contains_key("encryption_mode")
+                        && let Some(column) = index.columns.first()
+                        && let Some(column_index) = table_def.column_index(column)
+                    {
+                        let _ = self
+                            .storage_for(table_name)
+                            .create_index(table_name, &index.name, column_index)
+                            .await;
+                        self.btree_indexes
+                            .insert((table_name.to_string(), column.clone()), index.name.clone());
+                    }
                 }
             }
-        }
-        if let Err(error) = self
-            .storage_for(table_name)
-            .rebuild_table_indexes(table_name)
-            .await
-        {
-            tracing::warn!("failed to rebuild storage indexes for '{table_name}': {error}");
+            if let Err(error) = self
+                .storage_for(table_name)
+                .rebuild_table_indexes(table_name)
+                .await
+            {
+                tracing::warn!("failed to rebuild storage indexes for '{table_name}': {error}");
+            }
         }
         self.rebuild_zone_map(table_name).await;
-        self.refresh_gin_after_write(table_name).await;
+        self.mark_gin_committed_write();
+        self.rebuild_gin_indexes_for_table(table_name).await;
         self.rebuild_position_indexes_for_table(table_name).await;
         self.rebuild_fts_indexes_for_table(table_name).await;
-
-        let session = self.current_session();
-        let mut txn = session.txn_state.write().await;
-        if txn.active {
-            txn.derived_dirty_tables.insert(table_name.to_string());
-        }
     }
 
     /// Write the rows an UPDATE resolved, re-reading and re-evaluating any that
@@ -2306,6 +2685,9 @@ impl Executor {
         &self,
         update: ast::Update,
     ) -> Result<ExecResult, ExecError> {
+        if update.from.is_some() {
+            return Err(ExecError::Unsupported("UPDATE FROM".into()));
+        }
         let table_name = match &update.table.relation {
             TableFactor::Table { name, .. } => crate::sql::object_name_key(name),
             _ => return Err(ExecError::Unsupported("complex UPDATE target".into())),
@@ -2396,10 +2778,18 @@ impl Executor {
             let idx = table_def
                 .column_index(&col_name)
                 .ok_or(ExecError::ColumnNotFound(col_name))?;
+            super::column_writes::check_update_target(
+                &table_def.columns[idx],
+                Self::is_default_expr(&a.value),
+            )?;
             assign_targets.push((idx, &a.value));
         }
-        let updated_col_indices: HashSet<usize> =
+        let generated_exprs = self.generated_exprs(&table_def)?;
+        let mut updated_col_indices: HashSet<usize> =
             assign_targets.iter().map(|(idx, _)| *idx).collect();
+        // A generated column changes with the columns it reads, so constraints
+        // over it are re-checked whenever the statement writes anything.
+        updated_col_indices.extend(generated_exprs.iter().map(|(i, _)| *i));
         let mut check_fk = false;
         let mut check_unique = false;
         let mut has_check_constraints = false;
@@ -2494,13 +2884,20 @@ impl Executor {
             if matches {
                 let mut new_row = row.clone();
                 for (col_idx, val_expr) in &assign_targets {
-                    let mut value = self.eval_row_expr(val_expr, row, &col_meta)?;
+                    let mut value = if Self::is_default_expr(val_expr) {
+                        self.eval_column_default(&table_def.columns[*col_idx])?
+                    } else {
+                        self.eval_row_expr(val_expr, row, &col_meta)?
+                    };
                     coerce_value_for_write(
                         &mut value,
                         &table_def.columns[*col_idx],
                         self.session_time_zone()?,
                     )?;
                     new_row[*col_idx] = value;
+                }
+                if !generated_exprs.is_empty() {
+                    self.apply_generated(&generated_exprs, &table_def, &col_meta, &mut new_row)?;
                 }
 
                 // Fire BEFORE UPDATE row-level triggers (old = current row, new = updated row)
@@ -2561,6 +2958,22 @@ impl Executor {
 
                 updates.push((*pos, new_row));
             }
+        }
+
+        // Validate the entire final parent state BEFORE applying child actions.
+        // Storage's atomic unique update runs later; discovering a duplicate
+        // there would leave a preceding cascade behind after this error.
+        if check_unique && !updates.is_empty() {
+            let staged: std::collections::HashMap<usize, &Row> = updates
+                .iter()
+                .map(|(position, row)| (*position, row))
+                .collect();
+            Self::check_staged_unique_constraints(
+                &table_def,
+                all_rows
+                    .iter()
+                    .map(|(position, old)| staged.get(position).copied().unwrap_or(old)),
+            )?;
         }
 
         // Build position→row lookup for FK enforcement and change notification
@@ -2809,6 +3222,13 @@ impl Executor {
         &self,
         delete: ast::Delete,
     ) -> Result<ExecResult, ExecError> {
+        if delete
+            .using
+            .as_ref()
+            .is_some_and(|tables| !tables.is_empty())
+        {
+            return Err(ExecError::Unsupported("DELETE USING".into()));
+        }
         let tables_with_joins = match delete.from {
             ast::FromTable::WithFromKeyword(t) | ast::FromTable::WithoutKeyword(t) => t,
         };

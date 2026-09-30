@@ -2,7 +2,49 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased]
+## [core 0.3.0, cli 0.3.0, create-neutron 0.1.7, nucleus 0.2.1, data 0.2.1, cache-redis 0.2.0, auth 0.1.5, ops 0.1.3, otel 0.1.3, security 0.1.4] - 2026-09-30
+
+Requires Node.js 22 or later.
+
+### Added
+
+- The core exports `createSQLSessionStorage` for application-provided PostgreSQL
+  pools. Session records carry unique revisions for atomic replacement,
+  ID rotation and revocation.
+
+### Fixed
+
+- Request-local function caches isolate authenticated requests, distinguish
+  function identities and bound retained entries. Real SSR and HTTP adapter
+  module graphs share request scopes and explicit shared-cache tag invalidation.
+- Response and loader fills publish atomically against a backing-store
+  generation. Mutation completion invalidates its path even without an explicit
+  invalidation header, including fills started while an action was running.
+  Percent signs and reserved characters survive canonical-path invalidation.
+- Redis Lua scripts atomically publish payloads and pathname indexes, advance
+  invalidation generations and switch epochs for clear. Missing pathname indexes
+  conservatively invalidate the store rather than leaving orphaned payloads.
+- Migration plans snapshot primitive inputs before waiting for ownership.
+  Adoption validates every checksum before upgrading history metadata.
+- Installed data SQL consumers no longer load optional libsql declarations
+  merely to import the default entry point. Strict application typing remains
+  supported; the documented upstream Drizzle full-library declaration profile
+  remains unsupported.
+- New TypeScript scaffolds pin core and CLI to `^0.3.0`. Go scaffolds require
+  Go 1.26 and SDK `v0.3.0`.
+
+### Breaking
+
+- Server cache stores must implement atomic `getGeneration`/`setIfGeneration`
+  publication and generation-advancing invalidation. Legacy custom stores are
+  refused before server resources open. Explicit public function-cache sharing
+  requires `scope: "shared"`.
+- Session middleware requires atomic revision-conditional `commitSession`.
+  Legacy stores fail closed; switching from unversioned stores requires fresh
+  login. See [authentication migration](../go/neutronauth/README.md).
+- Redis cache clients require `EVAL`. Earlier unversioned entries become cold
+  misses. Upgrade all writers sharing a prefix together or use a new prefix;
+  standalone Redis is supported, Redis Cluster is not.
 
 ## [core 0.2.3, cli 0.2.4, create-neutron 0.1.6, auth 0.1.4, cache-redis 0.1.3, security 0.1.3] - 2026-09-28
 
