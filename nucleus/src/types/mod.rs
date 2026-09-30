@@ -6,10 +6,12 @@ use std::hash::{Hash, Hasher};
 use rust_decimal::Decimal;
 
 mod array;
+mod jsonb;
 pub use array::{
     ArrayLit, array_element_text, array_value_from_literal, format_array, guess_array_element,
     parse_array_literal, validate_array_shape,
 };
+pub(crate) use jsonb::compare as compare_jsonb;
 mod timestamptz;
 pub use timestamptz::{format_timestamptz, zone_offset_seconds};
 
@@ -362,10 +364,8 @@ fn write_jsonb_text(v: &serde_json::Value, out: &mut String) {
         }
         serde_json::Value::Number(n) => {
             let text = n.to_string();
-            if text.contains(['e', 'E'])
-                && let Ok(decimal) = rust_decimal::Decimal::from_scientific(&text)
-            {
-                out.push_str(&decimal.to_string());
+            if let Some(expanded) = jsonb::expanded_text(&text) {
+                out.push_str(&expanded);
             } else {
                 out.push_str(&text);
             }
@@ -1032,7 +1032,7 @@ impl PartialEq for Value {
             // sorted or hashed container corrupts it.
             (Value::Float64(a), Value::Float64(b)) => a == b || (a.is_nan() && b.is_nan()),
             (Value::Text(a), Value::Text(b)) => a == b,
-            (Value::Jsonb(a), Value::Jsonb(b)) => a == b,
+            (Value::Jsonb(a), Value::Jsonb(b)) => compare_jsonb(a, b).is_eq(),
             (Value::Date(a), Value::Date(b)) => a == b,
             (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
             (Value::TimestampTz(a), Value::TimestampTz(b)) => a == b,
@@ -1125,7 +1125,7 @@ impl Hash for Value {
             Value::Numeric(s) => canonical_numeric(s)
                 .unwrap_or_else(|_| s.clone())
                 .hash(state),
-            Value::Jsonb(v) => format!("{v}").hash(state),
+            Value::Jsonb(v) => jsonb::hash(v, state),
             Value::Uuid(u) => u.hash(state),
             Value::Bytea(b) => b.hash(state),
             Value::Array(a) => a.hash(state),
@@ -1185,6 +1185,7 @@ impl Ord for Value {
                 }
             }
             (Value::Text(a), Value::Text(b)) => a.cmp(b),
+            (Value::Jsonb(a), Value::Jsonb(b)) => compare_jsonb(a, b),
             (Value::Numeric(a), Value::Numeric(b)) => match (parse_numeric(a), parse_numeric(b)) {
                 (Ok(a), Ok(b)) => a.cmp(&b),
                 _ => a.cmp(b),

@@ -213,3 +213,10 @@ This remains a compatibility catalog. Raw int2[] catalog fields use the engine's
 int4[] representation, and integer-vector casts accept space-separated catalog
 values. Unsupported PostgreSQL catalog features are not evidence of support
 for the corresponding engine feature.
+
+JSONB numeric equality and hashing compare exact values recursively, so numeric
+scale and exponent notation do not split DISTINCT or join keys. Display retains
+scale separately. Scientific JSONB numbers expand without rounding when the
+result fits 16,384 bytes; larger expansions retain the original exponent form.
+Internal ordering is consistent with these equality classes; full PostgreSQL
+JSONB ordering across unequal values is not established.

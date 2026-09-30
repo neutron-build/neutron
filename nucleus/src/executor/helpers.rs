@@ -577,11 +577,7 @@ pub(super) fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering>
         (Value::Float64(a), Value::Int64(b)) => a.partial_cmp(&(*b as f64)),
         (Value::Text(a), Value::Text(b)) => Some(a.cmp(b)),
         (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
-        (Value::Jsonb(a), Value::Jsonb(b)) => {
-            let sa = serde_json::to_string(a).unwrap_or_default();
-            let sb = serde_json::to_string(b).unwrap_or_default();
-            Some(sa.cmp(&sb))
-        }
+        (Value::Jsonb(a), Value::Jsonb(b)) => Some(crate::types::compare_jsonb(a, b)),
         (Value::Date(a), Value::Date(b)) => Some(a.cmp(b)),
         // Date ↔ Timestamp: a date compares as midnight of that day (PG:
         // `TIMESTAMP '2024-01-01 00:00:00' = DATE '2024-01-01'` is true). Both
