@@ -31,3 +31,38 @@ it('shares request scope with cached functions loaded through the real SSR runti
     }
   } finally { await running.close(); await fs.rm(root, { recursive: true, force: true }); }
 });
+
+
+it('invalidates shared cached SSR values through the HTTP adapter module graph', async () => {
+  const root = await fs.mkdtemp(path.join(process.cwd(), '.tmp-neutron-shared-scope-'));
+  await fs.mkdir(path.join(root, 'src/routes'), { recursive: true });
+  // Real Vite SSR evaluates this checkout's cache source in a separate graph.
+  const cacheModule = path.resolve('src/core/cache.ts');
+  await fs.writeFile(path.join(root, 'src/routes/value.ts'), `
+    import { cache } from ${JSON.stringify(cacheModule)};
+    let calls = 0;
+    const read = cache(async () => ++calls, { scope: 'shared', tags: () => ['ssr-public-value'] });
+    export const config = { mode: 'app' };
+    export async function loader() { return { value: await read() }; }
+    export default function Page() { return null; }
+  `);
+  const { revalidateTag, clearCache } = await import('../core/cache.js');
+  const running = await createServer({ rootDir: root, host: '127.0.0.1', port: 0, compress: false });
+  try {
+    if (!running.server.listening) await once(running.server, 'listening');
+    const address = running.server.address();
+    if (!address || typeof address === 'string') throw new Error('No HTTP port');
+    const read = async () => {
+      const response = await fetch(`http://127.0.0.1:${address.port}/value`, { headers: { Accept: 'application/json' } });
+      const payload = decodeSerializedPayload<Record<string, { value: number }>>(await response.json());
+      return Object.values(payload)[0].value;
+    };
+    expect(await read()).toBe(1);
+    expect(await read()).toBe(1);
+    revalidateTag('ssr-public-value', 'shared');
+    expect(await read()).toBe(2);
+  } finally {
+    clearCache('shared'); await running.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

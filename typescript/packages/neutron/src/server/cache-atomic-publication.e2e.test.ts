@@ -67,3 +67,47 @@ it('rejects an external cache without atomic publication before opening resource
   await expect(createServer({ mode: 'raw', port: 0, cache: { loader: legacy } }))
     .rejects.toThrow('atomic getGeneration/setIfGeneration');
 });
+
+
+it('evicts a GET fill published during an ordinary action when the mutation completes', { timeout: 30_000 }, async () => {
+  const root = await fs.mkdtemp(path.join(process.cwd(), '.tmp-neutron-action-cache-'));
+  await fs.mkdir(path.join(root, 'src/routes'), { recursive: true });
+  let started!: () => void;
+  let release!: () => void;
+  const waiting = new Promise<void>(resolve => { started = resolve; });
+  const released = new Promise<void>(resolve => { release = resolve; });
+  const key = `neutron-review-action-${root}`;
+  (globalThis as any)[key] = { started, released };
+  await fs.writeFile(path.join(root, 'src/routes/item.ts'), `
+    let version = 0;
+    export const config = { mode: 'app', cache: { loaderMaxAge: 120, maxAge: 120 } };
+    export async function loader() { return { version }; }
+    export async function action() {
+      const control = globalThis[${JSON.stringify(key)}];
+      control.started(); await control.released;
+      version++;
+      return { ok: true };
+    }
+    export default function Page() { return null; }
+  `);
+  const running = await createServer({ rootDir: root, host: '127.0.0.1', port: 0, compress: false });
+  try {
+    if (!running.server.listening) await once(running.server, 'listening');
+    const address = running.server.address();
+    if (!address || typeof address === 'string') throw new Error('No HTTP port');
+    const url = `http://127.0.0.1:${address.port}/item`;
+    const read = async () => {
+      const response = await fetch(url, { headers: { Accept: 'application/json' } });
+      const payload = decodeSerializedPayload<Record<string, { version: number }>>(await response.json());
+      return Object.values(payload)[0].version;
+    };
+    const mutation = fetch(url, { method: 'POST', headers: { Accept: 'application/json' } });
+    await waiting;
+    expect(await read()).toBe(0);
+    release(); expect((await mutation).status).toBe(200);
+    expect(await read()).toBe(1);
+  } finally {
+    release(); delete (globalThis as any)[key];
+    await running.close(); await fs.rm(root, { recursive: true, force: true });
+  }
+});
