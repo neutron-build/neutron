@@ -128,9 +128,12 @@ mod admin;
 mod admission;
 mod aggregate;
 mod cache;
+mod column_writes;
 pub(crate) mod copy;
 mod cross_model;
 mod ddl;
+mod deferred_fk;
+pub(crate) use deferred_fk::SET_CONSTRAINTS_SETTING;
 mod dml;
 pub(crate) mod enlistment;
 mod expr;
@@ -6249,6 +6252,15 @@ impl Executor {
                 if has_enforceable_constraints {
                     return None;
                 }
+                // Generated columns, identity columns and declared lengths are
+                // enforced by the full INSERT path only.
+                if table_def
+                    .columns
+                    .iter()
+                    .any(|c| c.generation.is_some() || c.max_len.is_some())
+                {
+                    return None;
+                }
                 // Column count must match exactly for a simple VALUES insert.
                 if values.len() != table_def.columns.len() {
                     return None; // Fall through to normal path for better error reporting.
@@ -6317,11 +6329,13 @@ impl Executor {
                     return None;
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
-                // These searches/writes require session-aware casts.
-                if table_def
-                    .columns
-                    .iter()
-                    .any(|col| matches!(col.data_type, DataType::Array(_) | DataType::TimestampTz))
+                // These columns require the full UPDATE path's casts,
+                // generated expressions and declared-length checks.
+                if table_def.columns.iter().any(|col| {
+                    matches!(col.data_type, DataType::Array(_) | DataType::TimestampTz)
+                        || col.generation.is_some()
+                        || col.max_len.is_some()
+                })
                 {
                     return None;
                 }
@@ -7204,8 +7218,15 @@ impl Executor {
                 | Statement::Savepoint { .. }
                 | Statement::ReleaseSavepoint { .. }
         ) {
-            // `SET TRANSACTION` is only allowed before the first query.
+            // SET TRANSACTION is only allowed before the first query.
             session.txn_stmts.fetch_add(1, Ordering::Relaxed);
+        }
+        if matches!(
+            &stmt,
+            Statement::AlterTable(_) | Statement::Drop { .. } | Statement::Truncate { .. }
+        ) && session.has_pending_deferred_fks()
+        {
+            return Err(ExecError::Unsupported("schema changes with pending deferred foreign keys are not supported; complete or roll back the transaction first".into()));
         }
         session.statement_depth.fetch_add(1, Ordering::SeqCst);
         let mut guard = StatementDepthGuard {
@@ -7507,7 +7528,10 @@ impl Executor {
             Statement::Set(ast::Set::SetTransaction {
                 ref modes, session, ..
             }) => self.execute_set_transaction(modes, session).await,
-            Statement::Set(set) => self.execute_set(set),
+            Statement::Set(set) => match crate::sql::set_constraints_spec(&set) {
+                Some(spec) => self.execute_set_constraints(&spec).await,
+                None => self.execute_set(set),
+            },
             Statement::ShowVariable { variable } => self.execute_show(variable).await,
             Statement::ShowTables { .. } => self.execute_show_tables().await,
             Statement::Truncate(truncate) => self.execute_truncate(truncate).await,
@@ -9591,14 +9615,17 @@ impl Executor {
                             Value::Text(t.name.clone()),
                             Value::Text(c.name.clone()),
                             Value::Int32((i + 1) as i32),
+                            // An identity column's nextval() is its backing
+                            // sequence, not a default (PostgreSQL reports NULL).
                             c.default_expr
                                 .as_ref()
+                                .filter(|_| c.attidentity().is_empty())
                                 .map_or(Value::Null, |e| Value::Text(e.clone())),
                             Value::Text(if c.nullable { "YES" } else { "NO" }.into()),
                             Value::Text(c.data_type.to_string()),
                             Value::Text(datatype_to_udt_name(&c.data_type).into()),
                             Value::Text("pg_catalog".into()),
-                            Value::Null,
+                            c.max_len.map_or(Value::Null, |n| Value::Int32(n as i32)),
                             match &c.data_type {
                                 DataType::Int32 => Value::Int32(32),
                                 DataType::Int64 => Value::Int32(64),
@@ -9622,10 +9649,33 @@ impl Executor {
                                 DataType::Date => Value::Int32(0),
                                 _ => Value::Null,
                             },
-                            Value::Text("NEVER".into()),
-                            Value::Null,
-                            Value::Text("NO".into()),
-                            Value::Null,
+                            Value::Text(
+                                if c.attgenerated().is_empty() {
+                                    "NEVER"
+                                } else {
+                                    "ALWAYS"
+                                }
+                                .into(),
+                            ),
+                            match &c.generation {
+                                Some(crate::catalog::ColumnGeneration::Stored(e)) => {
+                                    Value::Text(e.clone())
+                                }
+                                _ => Value::Null,
+                            },
+                            Value::Text(
+                                if c.attidentity().is_empty() {
+                                    "NO"
+                                } else {
+                                    "YES"
+                                }
+                                .into(),
+                            ),
+                            match c.attidentity() {
+                                "a" => Value::Text("ALWAYS".into()),
+                                "d" => Value::Text("BY DEFAULT".into()),
+                                _ => Value::Null,
+                            },
                             Value::Null,
                             Value::Null,
                             Value::Null,
@@ -10997,8 +11047,8 @@ impl Executor {
                             }),
                             Value::Bool(false),
                             Value::Int32(0),
-                            Value::Text(String::new()),
-                            Value::Text(String::new()),
+                            Value::Text(c.attidentity().into()),
+                            Value::Text(c.attgenerated().into()),
                             Value::Bool(false),
                             Value::Int32(0),
                             Value::Int32(typlen),

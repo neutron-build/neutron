@@ -144,6 +144,14 @@ impl Executor {
     /// COMMIT -- end the transaction, making all changes permanent.
     pub(super) async fn commit_transaction(&self) -> Result<ExecResult, ExecError> {
         let sess = self.current_session();
+        // Deferred foreign keys are checked while the transaction is still
+        // open, before its state lock is taken (the checks read tables). A
+        // violation rolls the transaction back and fails the COMMIT.
+        if sess.txn_active.load(std::sync::atomic::Ordering::SeqCst)
+            && !sess.txn_state.read().await.aborted
+        {
+            self.check_deferred_fks_at_commit().await?;
+        }
         let mut txn = sess.txn_state.write().await;
 
         if !txn.active {
@@ -267,6 +275,7 @@ impl Executor {
         txn.engine_snapshots.clear();
         txn.engine_savepoints.clear();
         *sess.cross_model.lock() = None; // Discard the write-set on commit
+        sess.reset_deferred_fks();
         // SET LOCAL ends with the transaction; session-level SET stays.
         sess.guc_commit();
         self.recompute_session_context(&sess);
@@ -363,6 +372,7 @@ impl Executor {
     /// invisible. Without MVCC, restores all tables from the cloned snapshot.
     pub(super) async fn rollback_transaction(&self) -> Result<ExecResult, ExecError> {
         let sess = self.current_session();
+        sess.reset_deferred_fks();
         let txn = sess.txn_state.write().await;
 
         // Snapshot lease (Consumer-2): ROLLBACK releases it too — the
@@ -491,6 +501,7 @@ impl Executor {
         };
         txn.security_savepoints.push(sp);
         sess.guc_savepoint(name);
+        sess.savepoint_deferred_fks(name);
 
         // Open a cross-model level for this savepoint. Its before-images are
         // captured lazily at the first write after this point, so a savepoint
@@ -532,6 +543,7 @@ impl Executor {
             txn.security_savepoints.truncate(pos);
         }
         sess.guc_release_savepoint(name);
+        sess.release_deferred_fks_savepoint(name);
         // Releasing keeps the writes; every level below already recorded them,
         // so the level is simply discarded.
         if let Some(cm) = sess.cross_model.lock().as_mut()
@@ -613,6 +625,7 @@ impl Executor {
         // fallible step is past by here; the reverts below are best-effort.
         txn.aborted = false;
         sess.guc_rollback_to_savepoint(name);
+        sess.rollback_deferred_fks_savepoint(name);
         self.recompute_session_context(&sess);
         self.sync_lock_timeout(&sess);
         drop(txn);

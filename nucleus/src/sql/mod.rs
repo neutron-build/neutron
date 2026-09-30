@@ -7,7 +7,7 @@ use sqlparser::ast::{Visit, Visitor};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::catalog::{ColumnDef, FkAction};
+use crate::catalog::{ColumnDef, ColumnGeneration, Deferrable, FkAction};
 use crate::types::DataType;
 
 /// Convert a sqlparser `ReferentialAction` to our internal `FkAction`.
@@ -349,7 +349,16 @@ pub fn parse(sql: &str) -> Result<Vec<ast::Statement>, ParseError> {
     // the load-bearing defense — the CAST cap sits below sqlparser's ~48 cliff,
     // which itself is below the default-50 recursion guard.
     let dialect = PostgreSqlDialect {};
-    let stmts = Parser::parse_sql(&dialect, sql)?;
+    let stmts = match Parser::parse_sql(&dialect, sql) {
+        Ok(stmts) => stmts,
+        // sqlparser has no grammar for `OVERRIDING {SYSTEM | USER} VALUE` or
+        // `SET CONSTRAINTS`; rewrite them into parseable statements that carry
+        // the same information (see the two helpers).
+        Err(error) => match parse_postgres_extensions(&dialect, sql) {
+            Some(stmts) => stmts,
+            None => return Err(error.into()),
+        },
+    };
 
     // Second DoS guard: paren-free constructs (long `AND`/`OR`/arithmetic
     // chains) build an arbitrarily deep tree that the scan above cannot see.
@@ -360,6 +369,185 @@ pub fn parse(sql: &str) -> Result<Vec<ast::Statement>, ParseError> {
     check_final_modifier(&stmts)?;
 
     Ok(stmts)
+}
+
+/// `OVERRIDING SYSTEM VALUE` / `OVERRIDING USER VALUE` on an INSERT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overriding {
+    System,
+    User,
+}
+
+/// The OVERRIDING clause of a parsed INSERT. sqlparser cannot represent it, so
+/// [`parse`] strips it and records it in the INSERT's (otherwise unused, MySQL)
+/// `priority` slot: `HIGH_PRIORITY` = SYSTEM VALUE, `LOW_PRIORITY` = USER VALUE.
+pub fn insert_overriding(insert: &ast::Insert) -> Option<Overriding> {
+    match insert.priority {
+        Some(ast::MysqlInsertPriority::HighPriority) => Some(Overriding::System),
+        Some(ast::MysqlInsertPriority::LowPriority) => Some(Overriding::User),
+        _ => None,
+    }
+}
+
+/// The `<ALL|name,...>|<DEFERRED|IMMEDIATE>` payload of a `SET CONSTRAINTS`
+/// statement that [`parse`] rewrote into `SET nucleus.set_constraints = '...'`.
+pub fn set_constraints_spec(set: &ast::Set) -> Option<String> {
+    let ast::Set::SingleAssignment {
+        variable, values, ..
+    } = set
+    else {
+        return None;
+    };
+    if variable.to_string() != crate::executor::SET_CONSTRAINTS_SETTING {
+        return None;
+    }
+    match values.first()? {
+        ast::Expr::Value(v) => match &v.value {
+            ast::Value::SingleQuotedString(text) => Some(text.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Parse SQL that uses PostgreSQL syntax sqlparser lacks: the OVERRIDING clause
+/// of INSERT and `SET CONSTRAINTS`. `None` when the text uses neither, so the
+/// caller reports the original parse error.
+fn parse_postgres_extensions(
+    dialect: &PostgreSqlDialect,
+    sql: &str,
+) -> Option<Vec<ast::Statement>> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let mut tokens = Tokenizer::new(dialect, sql).tokenize().ok()?;
+    let word = |t: &Token, w: &str| matches!(t, Token::Word(x) if x.value.eq_ignore_ascii_case(w));
+    let significant: Vec<usize> = (0..tokens.len())
+        .filter(|&i| !matches!(tokens[i], Token::Whitespace(_)))
+        .collect();
+
+    // SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }
+    if significant.len() >= 4
+        && word(&tokens[significant[0]], "SET")
+        && word(&tokens[significant[1]], "CONSTRAINTS")
+    {
+        let mut rest: Vec<&Token> = significant[2..].iter().map(|&i| &tokens[i]).collect();
+        if matches!(rest.last(), Some(Token::SemiColon)) {
+            rest.pop();
+        }
+        let mode = match rest.pop()? {
+            t if word(t, "DEFERRED") => "DEFERRED",
+            t if word(t, "IMMEDIATE") => "IMMEDIATE",
+            _ => return None,
+        };
+        let targets = if rest.len() == 1 && word(rest[0], "ALL") {
+            "ALL".to_string()
+        } else {
+            let mut names = Vec::new();
+            let mut expect_name = true;
+            for t in rest {
+                match (expect_name, t) {
+                    (true, Token::Word(w)) => {
+                        names.push(if w.quote_style.is_some() {
+                            w.value.clone()
+                        } else {
+                            w.value.to_lowercase()
+                        });
+                        expect_name = false;
+                    }
+                    (false, Token::Comma) => expect_name = true,
+                    _ => return None,
+                }
+            }
+            if expect_name {
+                return None;
+            }
+            names.join(",")
+        };
+        let rewritten = format!(
+            "SET {} = '{}|{}'",
+            crate::executor::SET_CONSTRAINTS_SETTING,
+            targets.replace('\'', "''"),
+            mode
+        );
+        return Parser::parse_sql(dialect, &rewritten).ok();
+    }
+
+    // OVERRIDING {SYSTEM | USER} VALUE, per `;`-separated statement.
+    let mut kinds: Vec<Option<Overriding>> = Vec::new();
+    let mut current: Option<Overriding> = None;
+    let mut segment_has_tokens = false;
+    let mut depth = 0i32;
+    let mut remove = vec![false; tokens.len()];
+    let mut found = false;
+    let mut k = 0;
+    while k < significant.len() {
+        let t = &tokens[significant[k]];
+        match t {
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            Token::SemiColon => {
+                if segment_has_tokens {
+                    kinds.push(current.take());
+                }
+                segment_has_tokens = false;
+                depth = 0;
+                k += 1;
+                continue;
+            }
+            _ => {}
+        }
+        segment_has_tokens = true;
+        if depth == 0
+            && word(t, "OVERRIDING")
+            && k + 2 < significant.len()
+            && word(&tokens[significant[k + 2]], "VALUE")
+        {
+            let which = &tokens[significant[k + 1]];
+            let kind = if word(which, "SYSTEM") {
+                Some(Overriding::System)
+            } else if word(which, "USER") {
+                Some(Overriding::User)
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                current = Some(kind);
+                found = true;
+                for &i in &significant[k..k + 3] {
+                    remove[i] = true;
+                }
+                k += 3;
+                continue;
+            }
+        }
+        k += 1;
+    }
+    if !found {
+        return None;
+    }
+    if segment_has_tokens {
+        kinds.push(current.take());
+    }
+    let mut idx = 0;
+    tokens.retain(|_| {
+        idx += 1;
+        !remove[idx - 1]
+    });
+    let rewritten: String = tokens.iter().map(|t| t.to_string()).collect();
+    let mut stmts = Parser::parse_sql(dialect, &rewritten).ok()?;
+    if stmts.len() != kinds.len() {
+        return None;
+    }
+    for (stmt, kind) in stmts.iter_mut().zip(kinds) {
+        let Some(kind) = kind else { continue };
+        let ast::Statement::Insert(insert) = stmt else {
+            return None;
+        };
+        insert.priority = Some(match kind {
+            Overriding::System => ast::MysqlInsertPriority::HighPriority,
+            Overriding::User => ast::MysqlInsertPriority::LowPriority,
+        });
+    }
+    Some(stmts)
 }
 
 /// Convert a sqlparser DataType to our internal DataType.
@@ -478,6 +666,13 @@ pub fn extract_columns(columns: &[ast::ColumnDef]) -> Result<Vec<ColumnDef>, Par
                 ast::ColumnOption::Default(expr) => Some(expr.to_string()),
                 _ => None,
             });
+            let generation = column_generation(&col.options);
+            // A stored generated column is computed, never defaulted.
+            let default_expr = if matches!(generation, Some(ColumnGeneration::Stored(_))) {
+                None
+            } else {
+                default_expr
+            };
             Ok(ColumnDef {
                 name: col.name.value.clone(),
                 data_type,
@@ -487,9 +682,55 @@ pub fn extract_columns(columns: &[ast::ColumnDef]) -> Result<Vec<ColumnDef>, Par
                 // columns read from a pre-id snapshot.
                 id: idx as u32 + 1,
                 analyzer: None,
+                generation,
+                max_len: declared_max_len(&col.data_type),
             })
         })
         .collect()
+}
+
+/// `varchar(n)` / `char(n)` length in characters, when the declaration has one.
+pub fn declared_max_len(dt: &ast::DataType) -> Option<u32> {
+    let size = match dt {
+        ast::DataType::Varchar(size)
+        | ast::DataType::CharVarying(size)
+        | ast::DataType::CharacterVarying(size)
+        | ast::DataType::Char(size)
+        | ast::DataType::Character(size) => size.as_ref()?,
+        _ => return None,
+    };
+    match size {
+        ast::CharacterLength::IntegerLength { length, .. } => u32::try_from(*length).ok(),
+        ast::CharacterLength::Max => None,
+    }
+}
+
+/// The generation clause among a column's options, if any.
+pub fn column_generation(options: &[ast::ColumnOptionDef]) -> Option<ColumnGeneration> {
+    options.iter().find_map(|opt| match &opt.option {
+        ast::ColumnOption::Generated {
+            generated_as,
+            generation_expr,
+            ..
+        } => Some(match (generation_expr, generated_as) {
+            (Some(expr), _) => ColumnGeneration::Stored(expr.to_string()),
+            (None, ast::GeneratedAs::ByDefault) => ColumnGeneration::IdentityByDefault,
+            (None, _) => ColumnGeneration::IdentityAlways,
+        }),
+        _ => None,
+    })
+}
+
+/// `DEFERRABLE` / `INITIALLY DEFERRED` of a constraint's characteristics.
+pub fn deferrable_from(characteristics: Option<&ast::ConstraintCharacteristics>) -> Deferrable {
+    let Some(c) = characteristics else {
+        return Deferrable::NotDeferrable;
+    };
+    match (c.deferrable, c.initially) {
+        (_, Some(ast::DeferrableInitial::Deferred)) => Deferrable::InitiallyDeferred,
+        (Some(true), _) => Deferrable::InitiallyImmediate,
+        _ => Deferrable::NotDeferrable,
+    }
 }
 
 /// Return which column names require an auto-sequence (SERIAL / BIGSERIAL / SMALLSERIAL /
@@ -641,6 +882,7 @@ pub fn extract_constraints(
                             .collect(),
                         on_delete: convert_fk_action(&fk.on_delete),
                         on_update: convert_fk_action(&fk.on_update),
+                        deferrable: deferrable_from(fk.characteristics.as_ref()),
                     });
                 }
                 _ => {}
@@ -682,6 +924,7 @@ pub fn extract_constraints(
                         .collect(),
                     on_delete: convert_fk_action(&fk.on_delete),
                     on_update: convert_fk_action(&fk.on_update),
+                    deferrable: deferrable_from(fk.characteristics.as_ref()),
                 });
             }
             _ => {}

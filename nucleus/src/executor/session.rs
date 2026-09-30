@@ -368,6 +368,11 @@ pub struct Session {
     /// back"; `None` was indeed safe, a stale `Some` from another session was
     /// not.
     pub(super) plan_cache_key_hint: parking_lot::Mutex<Option<String>>,
+    /// Deferred foreign-key state of the open transaction (see
+    /// `executor::deferred_fk`).
+    pub(super) deferred_fks: parking_lot::Mutex<super::deferred_fk::DeferredFks>,
+    pub(super) deferred_fk_savepoints:
+        parking_lot::Mutex<Vec<(String, super::deferred_fk::DeferredFks)>>,
 }
 
 impl Default for Session {
@@ -426,6 +431,8 @@ impl Session {
             cancel_requested: AtomicBool::new(false),
             statement_depth: AtomicU64::new(0),
             plan_cache_key_hint: parking_lot::Mutex::new(None),
+            deferred_fks: parking_lot::Mutex::new(Default::default()),
+            deferred_fk_savepoints: parking_lot::Mutex::new(Vec::new()),
         }
     }
 

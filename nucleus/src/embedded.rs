@@ -199,6 +199,8 @@ impl DatabaseBuilder {
                     default_expr: None,
                     id: 0,
                     analyzer: None,
+                    generation: None,
+                    max_len: None,
                 })
                 .collect();
             let epoch = recovered_epochs.get(&name).copied().unwrap_or(0);

@@ -58,7 +58,16 @@ fn table_name_to_id(name: &str) -> u64 {
 /// reaches an engine. Columnar batches choose one physical representation per
 /// column, so a single uncoerced UPDATE value can otherwise turn neighboring
 /// values into NULL while rebuilding a batch.
-fn coerce_value_for_write(
+pub(super) fn coerce_value_for_write(
+    value: &mut Value,
+    column: &ColumnDef,
+    session_time_zone: chrono_tz::Tz,
+) -> Result<(), ExecError> {
+    coerce_value_to_type(value, column, session_time_zone)?;
+    super::column_writes::enforce_max_len(value, column)
+}
+
+fn coerce_value_to_type(
     value: &mut Value,
     column: &ColumnDef,
     session_time_zone: chrono_tz::Tz,
@@ -186,6 +195,7 @@ impl Executor {
         &self,
         insert: ast::Insert,
     ) -> Result<ExecResult, ExecError> {
+        let overriding = sql::insert_overriding(&insert);
         let table_name = match insert.table {
             ast::TableObject::TableName(name) => crate::sql::object_name_key(&name),
             _ => {
@@ -228,9 +238,21 @@ impl Executor {
         let insert_columns: Vec<String> = insert.columns.iter().map(|c| c.value.clone()).collect();
         let has_column_list = !insert_columns.is_empty();
 
-        let source = insert
-            .source
-            .ok_or_else(|| ExecError::Unsupported("INSERT without VALUES".into()))?;
+        let source = match insert.source {
+            Some(source) => source,
+            // `INSERT ... DEFAULT VALUES` is `VALUES (DEFAULT, ...)` over every column.
+            None if insert.assignments.is_empty() && !has_column_list => {
+                let defaults = vec!["DEFAULT"; table_def.columns.len()].join(", ");
+                let parsed = sql::parse(&format!("INSERT INTO t VALUES ({defaults})"))?;
+                match parsed.into_iter().next() {
+                    Some(Statement::Insert(synth)) => synth
+                        .source
+                        .ok_or_else(|| ExecError::Unsupported("INSERT without VALUES".into()))?,
+                    _ => return Err(ExecError::Unsupported("INSERT without VALUES".into())),
+                }
+            }
+            None => return Err(ExecError::Unsupported("INSERT without VALUES".into())),
+        };
 
         // Determine source type without consuming the Query yet
         enum InsertSourceKind {
@@ -285,9 +307,13 @@ impl Executor {
                     };
                     let mut vals: Vec<Value> = Vec::with_capacity(row_exprs.len());
                     for (i, expr) in row_exprs.iter().enumerate() {
-                        if Self::is_default_expr(expr) {
+                        let col = &table_def.columns[col_order[i]];
+                        let is_default = Self::is_default_expr(expr);
+                        let policy = super::column_writes::insert_column_policy(
+                            col, overriding, is_default,
+                        )?;
+                        if is_default || policy == super::column_writes::InsertColumn::UseDefault {
                             // Resolve DEFAULT for this column
-                            let col = &table_def.columns[col_order[i]];
                             vals.push(self.eval_column_default(col)?);
                         } else if let Expr::Value(val_with_span) = expr {
                             // Fast path: direct literal → Value (skip eval_const_expr overhead)
@@ -341,7 +367,17 @@ impl Executor {
                                         insert_columns.iter().position(|c| c == &col.name)
                                     {
                                         if pos < select_row.len() {
-                                            full_row.push(select_row[pos].clone());
+                                            let policy =
+                                                super::column_writes::insert_column_policy(
+                                                    col, overriding, false,
+                                                )?;
+                                            if policy
+                                                == super::column_writes::InsertColumn::UseDefault
+                                            {
+                                                full_row.push(self.eval_column_default(col)?);
+                                            } else {
+                                                full_row.push(select_row[pos].clone());
+                                            }
                                         } else {
                                             full_row.push(self.eval_column_default(col)?);
                                         }
@@ -352,6 +388,22 @@ impl Executor {
                                 mapped_rows.push(full_row);
                             }
                             mapped_rows
+                        } else if table_def.columns.iter().any(|c| c.generation.is_some()) {
+                            let mut rows = rows;
+                            for row in rows.iter_mut() {
+                                for (i, col) in table_def.columns.iter().enumerate() {
+                                    if i >= row.len() {
+                                        break;
+                                    }
+                                    let policy = super::column_writes::insert_column_policy(
+                                        col, overriding, false,
+                                    )?;
+                                    if policy == super::column_writes::InsertColumn::UseDefault {
+                                        row[i] = self.eval_column_default(col)?;
+                                    }
+                                }
+                            }
+                            rows
                         } else {
                             rows
                         }
@@ -389,6 +441,7 @@ impl Executor {
         let returning = &insert.returning;
 
         let col_meta = self.table_col_meta(&table_def);
+        let generated_exprs = self.generated_exprs(&table_def)?;
 
         // Pre-check: does this table have any INSERT triggers? (avoids 4N+2 async lock acquisitions)
         let has_triggers = {
@@ -468,6 +521,10 @@ impl Executor {
                 if let Some(value) = row.get_mut(i) {
                     coerce_value_for_write(value, col, self.session_time_zone()?)?;
                 }
+            }
+            if !generated_exprs.is_empty() {
+                row.resize(table_def.columns.len(), Value::Null);
+                self.apply_generated(&generated_exprs, &table_def, &col_meta, &mut row)?;
             }
 
             // WITH CHECK is evaluated after defaults/coercions have produced the
@@ -611,12 +668,33 @@ impl Executor {
                                             _ => continue,
                                         };
                                         if let Some(idx) = table_def.column_index(&col_name) {
-                                            updated[idx] = self.eval_row_expr(
-                                                &assign.value,
-                                                &combined_row,
-                                                &augmented_meta,
+                                            let col = &table_def.columns[idx];
+                                            let is_default = Self::is_default_expr(&assign.value);
+                                            super::column_writes::check_update_target(
+                                                col, is_default,
+                                            )?;
+                                            updated[idx] = if is_default {
+                                                self.eval_column_default(col)?
+                                            } else {
+                                                self.eval_row_expr(
+                                                    &assign.value,
+                                                    &combined_row,
+                                                    &augmented_meta,
+                                                )?
+                                            };
+                                            super::column_writes::enforce_max_len(
+                                                &mut updated[idx],
+                                                col,
                                             )?;
                                         }
+                                    }
+                                    if !generated_exprs.is_empty() {
+                                        self.apply_generated(
+                                            &generated_exprs,
+                                            &table_def,
+                                            &col_meta,
+                                            &mut updated,
+                                        )?;
                                     }
                                     self.enforce_rls_new_row(
                                         &table_name,
@@ -1327,7 +1405,18 @@ impl Executor {
         table_def: &TableDef,
         new_row: &Row,
     ) -> Result<(), ExecError> {
-        self.check_fk_constraints_except(table_def, new_row, None)
+        self.check_fk_constraints_except(table_def, new_row, None, true)
+            .await
+    }
+
+    /// Like [`Self::check_fk_constraints`] but never defers to COMMIT: for
+    /// validating rows that already exist against a newly added constraint.
+    pub(super) async fn check_fk_constraints_now(
+        &self,
+        table_def: &TableDef,
+        new_row: &Row,
+    ) -> Result<(), ExecError> {
+        self.check_fk_constraints_except(table_def, new_row, None, false)
             .await
     }
 
@@ -1339,14 +1428,17 @@ impl Executor {
         table_def: &TableDef,
         new_row: &Row,
         skip: Option<(&str, &[String], &[String])>,
+        allow_defer: bool,
     ) -> Result<(), ExecError> {
         use crate::catalog::TableConstraint;
 
         for constraint in &table_def.constraints {
             if let TableConstraint::ForeignKey {
+                name,
                 columns,
                 ref_table,
                 ref_columns,
+                deferrable,
                 ..
             } = constraint
             {
@@ -1371,6 +1463,19 @@ impl Executor {
 
                 // If any FK column is NULL, the constraint is satisfied (SQL standard)
                 if fk_values.iter().any(|v| **v == Value::Null) {
+                    continue;
+                }
+
+                // A deferred foreign key is judged at COMMIT, on the key alone.
+                if allow_defer && self.fk_check_deferred(name.as_deref(), *deferrable) {
+                    self.defer_fk_check(super::deferred_fk::PendingFk {
+                        name: name.clone(),
+                        child_table: table_def.name.clone(),
+                        columns: columns.clone(),
+                        ref_table: ref_table.clone(),
+                        ref_columns: ref_columns.clone(),
+                        key: fk_values.iter().map(|v| (*v).clone()).collect(),
+                    });
                     continue;
                 }
 
@@ -1424,7 +1529,7 @@ impl Executor {
         Self::check_not_null_constraints(child_table_def, row)?;
         self.check_check_constraints(child_table_def, row)?;
         self.check_enum_constraints(child_table_def, row).await?;
-        self.check_fk_constraints_except(child_table_def, row, skip_cascaded_fk)
+        self.check_fk_constraints_except(child_table_def, row, skip_cascaded_fk, true)
             .await?;
         self.check_unique_constraints(child_table, child_table_def, row, Some(old_position))
             .await
@@ -1466,12 +1571,13 @@ impl Executor {
 
                 for constraint in &child_table_def.constraints {
                     if let TableConstraint::ForeignKey {
+                        name: fk_name,
                         columns,
                         ref_table,
                         ref_columns,
                         on_delete,
                         on_update,
-                        ..
+                        deferrable,
                     } = constraint
                     {
                         if ref_table != parent_table {
@@ -1499,6 +1605,8 @@ impl Executor {
                         }
 
                         let child_table = &child_table_def.name;
+                        let child_generated = self.generated_exprs(child_table_def)?;
+                        let child_col_meta = self.table_col_meta(child_table_def);
                         let child_storage = self.storage_for_write(child_table).await;
 
                         if let Some(update_pairs) = new_parent_rows {
@@ -1550,6 +1658,19 @@ impl Executor {
                                 }
 
                                 match action {
+                                    FkAction::NoAction
+                                        if self
+                                            .fk_check_deferred(fk_name.as_deref(), *deferrable) =>
+                                    {
+                                        self.defer_fk_check(super::deferred_fk::PendingFk {
+                                            name: fk_name.clone(),
+                                            child_table: child_table.clone(),
+                                            columns: columns.clone(),
+                                            ref_table: ref_table.clone(),
+                                            ref_columns: ref_columns.clone(),
+                                            key: old_vals.iter().map(|v| (*v).clone()).collect(),
+                                        });
+                                    }
                                     FkAction::Restrict | FkAction::NoAction => {
                                         return Err(ExecError::ConstraintViolation(format!(
                                             "update on table \"{}\" violates foreign key constraint on table \"{}\"",
@@ -1575,6 +1696,12 @@ impl Executor {
                                             {
                                                 updated_row[ci] = new_vals[ci_idx].clone();
                                             }
+                                            self.apply_generated(
+                                                &child_generated,
+                                                child_table_def,
+                                                &child_col_meta,
+                                                &mut updated_row,
+                                            )?;
                                             self.enforce_rls_new_row(
                                                 child_table,
                                                 crate::security::PolicyCommand::Update,
@@ -1632,6 +1759,12 @@ impl Executor {
                                             for &ci in &child_col_indices {
                                                 updated_row[ci] = Value::Null;
                                             }
+                                            self.apply_generated(
+                                                &child_generated,
+                                                child_table_def,
+                                                &child_col_meta,
+                                                &mut updated_row,
+                                            )?;
                                             self.enforce_rls_new_row(
                                                 child_table,
                                                 crate::security::PolicyCommand::Update,
@@ -1691,6 +1824,12 @@ impl Executor {
                                                 )?;
                                                 updated_row[ci] = default_val;
                                             }
+                                            self.apply_generated(
+                                                &child_generated,
+                                                child_table_def,
+                                                &child_col_meta,
+                                                &mut updated_row,
+                                            )?;
                                             self.enforce_rls_new_row(
                                                 child_table,
                                                 crate::security::PolicyCommand::Update,
@@ -1818,6 +1957,19 @@ impl Executor {
                                 }
 
                                 match action {
+                                    FkAction::NoAction
+                                        if self
+                                            .fk_check_deferred(fk_name.as_deref(), *deferrable) =>
+                                    {
+                                        self.defer_fk_check(super::deferred_fk::PendingFk {
+                                            name: fk_name.clone(),
+                                            child_table: child_table.clone(),
+                                            columns: columns.clone(),
+                                            ref_table: ref_table.clone(),
+                                            ref_columns: ref_columns.clone(),
+                                            key: parent_vals.iter().map(|v| (*v).clone()).collect(),
+                                        });
+                                    }
                                     FkAction::Restrict | FkAction::NoAction => {
                                         return Err(ExecError::ConstraintViolation(format!(
                                             "delete on table \"{}\" violates foreign key constraint on table \"{}\"",
@@ -1883,6 +2035,12 @@ impl Executor {
                                             for &ci in &child_col_indices {
                                                 updated_row[ci] = Value::Null;
                                             }
+                                            self.apply_generated(
+                                                &child_generated,
+                                                child_table_def,
+                                                &child_col_meta,
+                                                &mut updated_row,
+                                            )?;
                                             self.enforce_rls_new_row(
                                                 child_table,
                                                 crate::security::PolicyCommand::Update,
@@ -1942,6 +2100,12 @@ impl Executor {
                                                 )?;
                                                 updated_row[ci] = default_val;
                                             }
+                                            self.apply_generated(
+                                                &child_generated,
+                                                child_table_def,
+                                                &child_col_meta,
+                                                &mut updated_row,
+                                            )?;
                                             self.enforce_rls_new_row(
                                                 child_table,
                                                 crate::security::PolicyCommand::Update,
@@ -2412,10 +2576,18 @@ impl Executor {
             let idx = table_def
                 .column_index(&col_name)
                 .ok_or(ExecError::ColumnNotFound(col_name))?;
+            super::column_writes::check_update_target(
+                &table_def.columns[idx],
+                Self::is_default_expr(&a.value),
+            )?;
             assign_targets.push((idx, &a.value));
         }
-        let updated_col_indices: HashSet<usize> =
+        let generated_exprs = self.generated_exprs(&table_def)?;
+        let mut updated_col_indices: HashSet<usize> =
             assign_targets.iter().map(|(idx, _)| *idx).collect();
+        // A generated column changes with the columns it reads, so constraints
+        // over it are re-checked whenever the statement writes anything.
+        updated_col_indices.extend(generated_exprs.iter().map(|(i, _)| *i));
         let mut check_fk = false;
         let mut check_unique = false;
         let mut has_check_constraints = false;
@@ -2505,13 +2677,20 @@ impl Executor {
             if matches {
                 let mut new_row = row.clone();
                 for (col_idx, val_expr) in &assign_targets {
-                    let mut value = self.eval_row_expr(val_expr, row, &col_meta)?;
+                    let mut value = if Self::is_default_expr(val_expr) {
+                        self.eval_column_default(&table_def.columns[*col_idx])?
+                    } else {
+                        self.eval_row_expr(val_expr, row, &col_meta)?
+                    };
                     coerce_value_for_write(
                         &mut value,
                         &table_def.columns[*col_idx],
                         self.session_time_zone()?,
                     )?;
                     new_row[*col_idx] = value;
+                }
+                if !generated_exprs.is_empty() {
+                    self.apply_generated(&generated_exprs, &table_def, &col_meta, &mut new_row)?;
                 }
 
                 // Fire BEFORE UPDATE row-level triggers (old = current row, new = updated row)

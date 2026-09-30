@@ -4201,6 +4201,8 @@ mod tests {
                         default_expr: None,
                         id: 0,
                         analyzer: None,
+                        generation: None,
+                        max_len: None,
                     },
                     ColumnDef {
                         name: "name".into(),
@@ -4209,6 +4211,8 @@ mod tests {
                         default_expr: None,
                         id: 0,
                         analyzer: None,
+                        generation: None,
+                        max_len: None,
                     },
                 ],
                 constraints: vec![],
@@ -4881,6 +4885,8 @@ mod tests {
                         default_expr: None,
                         id: 0,
                         analyzer: None,
+                        generation: None,
+                        max_len: None,
                     },
                     ColumnDef {
                         name: "label".into(),
@@ -4889,6 +4895,8 @@ mod tests {
                         default_expr: None,
                         id: 0,
                         analyzer: None,
+                        generation: None,
+                        max_len: None,
                     },
                     ColumnDef {
                         name: "score".into(),
@@ -4897,6 +4905,8 @@ mod tests {
                         default_expr: None,
                         id: 0,
                         analyzer: None,
+                        generation: None,
+                        max_len: None,
                     },
                     ColumnDef {
                         name: "active".into(),
@@ -4905,6 +4915,8 @@ mod tests {
                         default_expr: None,
                         id: 0,
                         analyzer: None,
+                        generation: None,
+                        max_len: None,
                     },
                 ],
                 constraints: vec![],
@@ -5535,6 +5547,8 @@ mod tests {
                     default_expr: None,
                     id: 0,
                     analyzer: None,
+                    generation: None,
+                    max_len: None,
                 },
                 ColumnDef {
                     name: "b".into(),
@@ -5543,6 +5557,8 @@ mod tests {
                     default_expr: None,
                     id: 0,
                     analyzer: None,
+                    generation: None,
+                    max_len: None,
                 },
                 ColumnDef {
                     name: "c".into(),
@@ -5551,6 +5567,8 @@ mod tests {
                     default_expr: None,
                     id: 0,
                     analyzer: None,
+                    generation: None,
+                    max_len: None,
                 },
                 ColumnDef {
                     name: "d".into(),
@@ -5559,6 +5577,8 @@ mod tests {
                     default_expr: None,
                     id: 0,
                     analyzer: None,
+                    generation: None,
+                    max_len: None,
                 },
                 ColumnDef {
                     name: "e".into(),
@@ -5567,6 +5587,8 @@ mod tests {
                     default_expr: None,
                     id: 0,
                     analyzer: None,
+                    generation: None,
+                    max_len: None,
                 },
             ],
             constraints: vec![],

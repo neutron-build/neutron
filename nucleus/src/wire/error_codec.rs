@@ -52,6 +52,10 @@ pub enum ErrorCode {
     DivisionByZero,
     /// Numeric value out of range
     NumericValueOutOfRange,
+    /// Value too long for a `varchar(n)` / `char(n)` column (22001)
+    StringDataRightTruncation,
+    /// Explicit value for a generated column or GENERATED ALWAYS identity (428C9)
+    GeneratedAlways,
     /// Other data exception
     DataException,
     /// Internal server error
@@ -221,6 +225,12 @@ impl ErrorCodec for PgWireErrorCodec {
             ExecError::Runtime(msg) => {
                 let code = if msg.contains("division by zero") {
                     ErrorCode::DivisionByZero
+                } else if msg.contains("value too long for type") {
+                    ErrorCode::StringDataRightTruncation
+                } else if msg.contains("non-DEFAULT value into column")
+                    || msg.contains("can only be updated to DEFAULT")
+                {
+                    ErrorCode::GeneratedAlways
                 } else if msg.contains("out of range") {
                     ErrorCode::NumericValueOutOfRange
                 } else if msg.contains("current transaction is aborted") {
@@ -272,6 +282,8 @@ impl ErrorCodec for PgWireErrorCodec {
             ErrorCode::StorageError => "XX000".to_string(),
             ErrorCode::DivisionByZero => "22012".to_string(),
             ErrorCode::NumericValueOutOfRange => "22003".to_string(),
+            ErrorCode::StringDataRightTruncation => "22001".to_string(),
+            ErrorCode::GeneratedAlways => "428C9".to_string(),
             ErrorCode::DataException => "22000".to_string(),
             ErrorCode::InternalError => "XX000".to_string(),
             ErrorCode::RuntimeError => "22000".to_string(),
@@ -402,6 +414,12 @@ impl ErrorCodec for BinaryErrorCodec {
             ExecError::Runtime(msg) => {
                 let code = if msg.contains("division by zero") {
                     ErrorCode::DivisionByZero
+                } else if msg.contains("value too long for type") {
+                    ErrorCode::StringDataRightTruncation
+                } else if msg.contains("non-DEFAULT value into column")
+                    || msg.contains("can only be updated to DEFAULT")
+                {
+                    ErrorCode::GeneratedAlways
                 } else if msg.contains("out of range") {
                     ErrorCode::NumericValueOutOfRange
                 } else {
@@ -443,6 +461,8 @@ impl ErrorCodec for BinaryErrorCodec {
             ErrorCode::StorageError => "5001".to_string(),
             ErrorCode::DivisionByZero => "4001".to_string(),
             ErrorCode::NumericValueOutOfRange => "4002".to_string(),
+            ErrorCode::StringDataRightTruncation => "4003".to_string(),
+            ErrorCode::GeneratedAlways => "1009".to_string(),
             ErrorCode::DataException => "4000".to_string(),
             ErrorCode::InternalError => "5000".to_string(),
             ErrorCode::RuntimeError => "4999".to_string(),

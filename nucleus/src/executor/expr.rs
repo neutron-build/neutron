@@ -1818,6 +1818,18 @@ impl Executor {
     }
 
     pub(super) fn eval_cast(&self, val: Value, target: &ast::DataType) -> Result<Value, ExecError> {
+        let cast = self.eval_cast_to_type(val, target)?;
+        // An explicit cast to `varchar(n)` / `char(n)` cuts to n characters
+        // instead of failing (only a stored value is an error, SQLSTATE 22001).
+        match (crate::sql::declared_max_len(target), cast) {
+            (Some(limit), Value::Text(text)) if text.chars().count() > limit as usize => {
+                Ok(Value::Text(text.chars().take(limit as usize).collect()))
+            }
+            (_, cast) => Ok(cast),
+        }
+    }
+
+    fn eval_cast_to_type(&self, val: Value, target: &ast::DataType) -> Result<Value, ExecError> {
         // Casting NULL yields NULL of the target type, for EVERY target. This
         // has to be answered before the per-type arms because most of them
         // reject anything they cannot recognise, and `Value::Null` is not

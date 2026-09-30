@@ -146,3 +146,14 @@ These fixes do not establish full PostgreSQL scalar parity. Date infinity,
 enum declaration-order sorting and arbitrary numeric precision/scale remain
 limits. Large bare numeric literals may pass through floating-point parsing;
 use an exact text-to-NUMERIC cast within the engine's supported decimal range.
+
+### Deferred foreign keys and generated writes
+
+Deferred foreign keys are checked at COMMIT and when made IMMEDIATE. Checks
+remain recoverable across savepoints, and ROLLBACK TO restores constraint modes.
+Schema changes are refused while deferred checks remain pending; finish or
+roll back the transaction before changing the schema. Deferred UNIQUE and
+PRIMARY KEY enforcement is not supported.
+
+Foreign-key CASCADE, SET NULL and SET DEFAULT updates recompute stored generated
+columns and validate their resulting constraints before writing child rows.

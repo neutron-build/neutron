@@ -1028,10 +1028,25 @@ impl Executor {
             )
         {
             return Err(ExecError::Unsupported(
-                "deferrable constraints are not supported; constraints are immediate".into(),
+                "DEFERRABLE is supported for FOREIGN KEY constraints only; PRIMARY KEY and \
+                 UNIQUE constraints are checked at the end of each statement"
+                    .into(),
             ));
         }
         if characteristics.enforced == Some(false) {
+            return Err(ExecError::Unsupported(
+                "NOT ENFORCED constraints are not supported".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// A foreign key may be DEFERRABLE (checked at COMMIT, see `deferred_fk`);
+    /// only NOT ENFORCED is refused.
+    fn validate_fk_characteristics(
+        characteristics: Option<&ast::ConstraintCharacteristics>,
+    ) -> Result<(), ExecError> {
+        if characteristics.is_some_and(|c| c.enforced == Some(false)) {
             return Err(ExecError::Unsupported(
                 "NOT ENFORCED constraints are not supported".into(),
             ));
@@ -1045,6 +1060,7 @@ impl Executor {
     ) -> Result<ExecResult, ExecError> {
         let table_name = crate::sql::object_name_key(&create.name);
         let mut columns = sql::extract_columns(&create.columns)?;
+        super::column_writes::validate_generated_columns(&columns)?;
         Self::apply_analyzer_options(&create.table_options, &mut columns)?;
         let mut constraints = sql::extract_constraints(&create.columns, &create.constraints);
         let primary_key_declarations = create
@@ -1081,9 +1097,7 @@ impl Executor {
                     }
                 }
                 ast::TableConstraint::ForeignKey(foreign_key) => {
-                    Self::validate_immediate_constraint_characteristics(
-                        foreign_key.characteristics.as_ref(),
-                    )?;
+                    Self::validate_fk_characteristics(foreign_key.characteristics.as_ref())?;
                     if matches!(
                         foreign_key.match_kind,
                         Some(
@@ -1118,9 +1132,7 @@ impl Executor {
                         }
                     }
                     ast::ColumnOption::ForeignKey(foreign_key) => {
-                        Self::validate_immediate_constraint_characteristics(
-                            foreign_key.characteristics.as_ref(),
-                        )?;
+                        Self::validate_fk_characteristics(foreign_key.characteristics.as_ref())?;
                         if matches!(
                             foreign_key.match_kind,
                             Some(
@@ -3090,11 +3102,26 @@ impl Executor {
                             ast::ColumnOption::NotNull | ast::ColumnOption::PrimaryKey(_)
                         )
                     });
-                    let default_expr =
+                    let generation = sql::column_generation(&column_def.options);
+                    if matches!(
+                        generation,
+                        Some(
+                            crate::catalog::ColumnGeneration::IdentityAlways
+                                | crate::catalog::ColumnGeneration::IdentityByDefault
+                        )
+                    ) {
+                        return Err(ExecError::Unsupported(
+                            "ADD COLUMN ... GENERATED AS IDENTITY is not supported".into(),
+                        ));
+                    }
+                    let default_expr = if generation.is_some() {
+                        None
+                    } else {
                         column_def.options.iter().find_map(|opt| match &opt.option {
                             ast::ColumnOption::Default(expr) => Some(expr.to_string()),
                             _ => None,
-                        });
+                        })
+                    };
                     let new_col = crate::catalog::ColumnDef {
                         name: col_name.clone(),
                         data_type: dtype,
@@ -3106,10 +3133,15 @@ impl Executor {
                         // rename-then-re-add attack with extra steps.
                         id: table_def.next_column_id(),
                         analyzer: None,
+                        generation,
+                        max_len: sql::declared_max_len(&column_def.data_type),
                     };
                     let mut updated = (*table_def).clone();
                     updated.columns.push(new_col.clone());
-                    self.catalog.update_table(updated).await?;
+                    super::column_writes::validate_generated_columns(&updated.columns)?;
+                    let generated_exprs = self.generated_exprs(&updated)?;
+                    let updated_meta = self.table_col_meta(&updated);
+                    self.catalog.update_table(updated.clone()).await?;
 
                     let engine = self.storage_for(&table_name);
                     let _rewrite = RewriteGuard::new(engine.clone(), &table_name);
@@ -3129,8 +3161,17 @@ impl Executor {
                     let updates: Vec<(usize, Row)> = rows
                         .into_iter()
                         .map(|(vidx, mut r)| {
-                            let v = self.eval_column_default(&new_col)?;
+                            let mut v = self.eval_column_default(&new_col)?;
+                            super::column_writes::enforce_max_len(&mut v, &new_col)?;
                             r.push(v);
+                            if !generated_exprs.is_empty() {
+                                self.apply_generated(
+                                    &generated_exprs,
+                                    &updated,
+                                    &updated_meta,
+                                    &mut r,
+                                )?;
+                            }
                             Ok((vidx, r))
                         })
                         .collect::<Result<Vec<_>, ExecError>>()?;
@@ -3164,6 +3205,13 @@ impl Executor {
                     let cascade = matches!(drop_behavior, Some(ast::DropBehavior::Cascade));
                     for col_name in column_names {
                         let col_str = col_name.to_string();
+                        if let Some(dependent) =
+                            super::column_writes::generated_column_reading(&table_def, &col_str)
+                        {
+                            return Err(ExecError::ConstraintViolation(format!(
+                                "cannot drop column \"{col_str}\" because generated column \"{dependent}\" depends on it"
+                            )));
+                        }
                         let column_id = table_def.column_id(&col_str).unwrap_or(0);
                         let (dependents, masked_roles) = {
                             let security = self.security.read();
@@ -3361,6 +3409,15 @@ impl Executor {
                     new_column_name,
                 } => {
                     let mut updated = (*table_def).clone();
+                    if let Some(dependent) = super::column_writes::generated_column_reading(
+                        &table_def,
+                        &old_column_name.value,
+                    ) {
+                        return Err(ExecError::ConstraintViolation(format!(
+                            "cannot rename column \"{}\" while generated column \"{dependent}\" depends on it",
+                            old_column_name.value
+                        )));
+                    }
                     if updated.constraints.iter().any(|constraint| {
                         matches!(constraint, crate::catalog::TableConstraint::Check { expr, .. }
                             if expr.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
@@ -3556,6 +3613,19 @@ impl Executor {
                                 col.nullable = false;
                             }
                             ast::AlterColumnOperation::DropNotNull => col.nullable = true,
+                            ast::AlterColumnOperation::SetDefault { .. }
+                                if col.generation.is_some() =>
+                            {
+                                return Err(ExecError::Runtime(format!(
+                                    "column \"{}\" of relation \"{table_name}\" is {}",
+                                    col.name,
+                                    match col.generation {
+                                        Some(crate::catalog::ColumnGeneration::Stored(_)) =>
+                                            "a generated column",
+                                        _ => "an identity column",
+                                    }
+                                )));
+                            }
                             ast::AlterColumnOperation::SetDefault { value } => {
                                 col.default_expr = Some(value.to_string());
                             }
@@ -3568,11 +3638,24 @@ impl Executor {
                                     retype = Some(new_type.clone());
                                 }
                                 col.data_type = new_type;
+                                col.max_len = sql::declared_max_len(data_type);
                             }
                             _ => {
                                 return Err(ExecError::Unsupported(format!(
                                     "ALTER COLUMN operation not yet supported: {op}"
                                 )));
+                            }
+                        }
+                    }
+                    if matches!(op, ast::AlterColumnOperation::SetDataType { .. })
+                        && updated.columns[col_idx].max_len.is_some()
+                    {
+                        // Existing values must fit the new length (22001).
+                        let col = updated.columns[col_idx].clone();
+                        let rows = self.storage_for(&table_name).scan(&table_name).await?;
+                        for row in &rows {
+                            if let Some(mut value) = row.get(col_idx).cloned() {
+                                super::column_writes::enforce_max_len(&mut value, &col)?;
                             }
                         }
                     }
@@ -3800,9 +3883,7 @@ impl Executor {
                             self.catalog.update_table(updated).await?;
                         }
                         ast::TableConstraint::ForeignKey(fk) => {
-                            Self::validate_immediate_constraint_characteristics(
-                                fk.characteristics.as_ref(),
-                            )?;
+                            Self::validate_fk_characteristics(fk.characteristics.as_ref())?;
                             if matches!(
                                 fk.match_kind,
                                 Some(
@@ -3840,13 +3921,14 @@ impl Executor {
                                     ref_columns,
                                     on_delete: sql::convert_fk_action(&fk.on_delete),
                                     on_update: sql::convert_fk_action(&fk.on_update),
+                                    deferrable: sql::deferrable_from(fk.characteristics.as_ref()),
                                 });
                             Self::validate_constraint_names(&updated)?;
                             self.validate_foreign_key_definitions(&updated).await?;
                             let existing_rows =
                                 self.storage_for(&table_name).scan(&table_name).await?;
                             for row in &existing_rows {
-                                self.check_fk_constraints(&updated, row).await?;
+                                self.check_fk_constraints_now(&updated, row).await?;
                             }
                             self.catalog.update_table(updated).await?;
                         }

@@ -51,6 +51,7 @@ mod test_cache_coherence; // M2: cache + specialty-index invalidation oracle
 mod test_call_pipeline; // EXE-1/5 + PRC-1/3/4/5/7: the CALL pipeline end-to-end
 mod test_cluster_routing; // A14/A15: both execution entries route + fail closed
 mod test_collections;
+mod test_column_writes; // X10: generated/identity columns, deferrable FKs, DEFAULT VALUES, varchar(n)
 mod test_copy; // COPY FROM STDIN payload reconstruction
 mod test_cross_model;
 mod test_cross_model_atomicity; // S63 slice 1: SQL+streams discard-on-no-commit-record

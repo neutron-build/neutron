@@ -464,6 +464,8 @@ fn t_def(name: &str, epoch: u64) -> TableDef {
             default_expr: None,
             id: 1,
             analyzer: None,
+            generation: None,
+            max_len: None,
         }],
         constraints: Vec::new(),
         append_only: false,
