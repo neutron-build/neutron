@@ -347,7 +347,8 @@ limits above it; the commit bar says "atomic" only when the SQL limits say
   measured on the build recorded in
   `conformance/live/orm/capabilities.nucleus.json` (the capability report
   and the X01-X05 conformance legs). SQL is `partial`: DML commits and rolls
-  back, DDL does not, isolation levels and `READ ONLY` are not applied.
+  back, DDL does not; `READ COMMITTED` is supported, higher isolation levels
+  are refused, and `READ ONLY` rejects the measured writes.
   Documents and graph nodes roll back but are visible to other sessions
   before `COMMIT`; CDC and pub/sub are not transactional; COLUMNAR_* inserts
   are refused inside transactions. Anything not measured is `unknown`.

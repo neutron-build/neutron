@@ -37,13 +37,15 @@ all 14 Nucleus data models) as inspection and planning tools.
 
 Every tool is read-only by default: on PostgreSQL statements run inside a
 READ ONLY transaction that is rolled back, on a connection that is closed
-afterwards (advisory locks released); on Nucleus, which does not apply
-READ ONLY, a lexical guard refuses writes, the engine's mutating functions
-and write Cypher. The guard checks names and cannot see through a
-user-defined function or view that wraps a refused one: on PostgreSQL connect
-as a low-privilege role; on Nucleus the read-only default is best-effort (a
-wrapped write persists), so expose it only to agents you would trust with
-writes. Values under secret-looking names are redacted (--no-redact to
+afterwards (advisory locks released). Nucleus database reads also request a
+rolled-back READ ONLY transaction. The measured engine refuses NEXTVAL
+through views, scalar subqueries and WHERE predicates without advancing the
+sequence. An additional lexical guard refuses writes, the engine's mutating
+functions and write Cypher. Name checks cannot see through every user-defined
+wrapper: on PostgreSQL connect as a low-privilege role; unverified Nucleus
+specialty functions and their wrappers remain best-effort, so use a trusted
+principal and do not infer complete specialty protection from tested NEXTVAL
+paths. Values under secret-looking names are redacted (--no-redact to
 disable). Results carry the engine identity and the touched models' actual
 transaction/durability limits (engine_limits reports all of them).
 --allow-writes adds one explicit write tool, execute_sql; over HTTP it also
