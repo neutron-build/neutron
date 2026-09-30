@@ -177,11 +177,11 @@ fn detached_zone_map_rebuild_preserves_same_count_concurrent_update() {
     runtime.block_on(async {
         let heap = exec(
             &executor,
-            "SELECT id FROM zoned WHERE (val + 0) = 99 ORDER BY id",
+            "SELECT id FROM zoned WHERE (val + 0) > 98 ORDER BY id",
         )
         .await;
         assert_eq!(rows(&heap[0]), &vec![vec![Value::Int32(2)]]);
-        let pruned = exec(&executor, "SELECT id FROM zoned WHERE val = 99 ORDER BY id").await;
+        let pruned = exec(&executor, "SELECT id FROM zoned WHERE val > 98 ORDER BY id").await;
         assert_eq!(
             rows(&pruned[0]),
             rows(&heap[0]),
