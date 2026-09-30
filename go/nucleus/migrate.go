@@ -473,7 +473,11 @@ func (c *Client) AdoptMigrations(ctx context.Context, migrations []Migration) (*
 	if err != nil {
 		return nil, fmt.Errorf("nucleus: begin adoption tx: %w", err)
 	}
-	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = tx.Rollback(cleanupCtx)
+	}()
 
 	// A legacy TS table has no checksum column. Read it as NULL without
 	// upgrading the schema before all recorded content has been validated.
