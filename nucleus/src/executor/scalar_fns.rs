@@ -14,7 +14,7 @@ use crate::graph::cypher_executor::execute_cypher;
 #[cfg(feature = "server")]
 use crate::reactive::ChangeType;
 use crate::timeseries;
-use crate::types::{Row, Value};
+use crate::types::{DataType, Row, Value};
 use crate::vector;
 use sqlparser::ast;
 use std::collections::{HashMap, HashSet};
@@ -1145,6 +1145,9 @@ impl Executor {
             }
             "EXTRACT" | "DATE_PART" => {
                 require_args(fname, &args, 2)?;
+                if args.iter().any(|value| matches!(value, Value::Null)) {
+                    return Ok(Value::Null);
+                }
                 let field = match &args[0] {
                     Value::Text(s) => s.to_lowercase(),
                     _ => return Err(ExecError::Unsupported("EXTRACT field must be text".into())),
@@ -1158,14 +1161,13 @@ impl Executor {
                             "day" => Ok(Value::Int32(day as i32)),
                             "dow" | "dayofweek" => {
                                 // 0 = Sunday
-                                let jdn = *d + 2451545;
-                                Ok(Value::Int32(jdn.rem_euclid(7)))
+                                Ok(Value::Int32((*d + 6).rem_euclid(7)))
                             }
                             "doy" | "dayofyear" => {
                                 let jan1 = crate::types::ymd_to_days(y, 1, 1);
                                 Ok(Value::Int32(*d - jan1 + 1))
                             }
-                            "epoch" => Ok(Value::Int64(*d as i64 * 86400)),
+                            "epoch" => Ok(Value::Int64(*d as i64 * 86400 + 946_684_800)),
                             _ => Err(ExecError::Unsupported(format!(
                                 "EXTRACT({field}) from date"
                             ))),
@@ -1232,7 +1234,7 @@ impl Executor {
                                 "year" => Ok(Value::Int32(y)),
                                 "month" => Ok(Value::Int32(m as i32)),
                                 "day" => Ok(Value::Int32(day as i32)),
-                                "epoch" => Ok(Value::Int64(d as i64 * 86400)),
+                                "epoch" => Ok(Value::Int64(d as i64 * 86400 + 946_684_800)),
                                 _ => Err(ExecError::Unsupported(format!(
                                     "EXTRACT({field}) from text"
                                 ))),
@@ -1248,6 +1250,14 @@ impl Executor {
                         "EXTRACT requires date/timestamp".into(),
                     )),
                 }
+                .and_then(|value| {
+                    let result_type = if fname == "DATE_PART" {
+                        DataType::Float64
+                    } else {
+                        DataType::Numeric
+                    };
+                    value.cast(&result_type).map_err(ExecError::Runtime)
+                })
             }
             "DATE_TRUNC" => {
                 require_args(fname, &args, 2)?;
@@ -2023,6 +2033,9 @@ impl Executor {
             }
             "ENCODE" => {
                 require_args(fname, &args, 2)?;
+                if args.iter().any(|value| matches!(value, Value::Null)) {
+                    return Ok(Value::Null);
+                }
                 let data = match &args[0] {
                     Value::Null => return Ok(Value::Null),
                     Value::Bytea(bytes) => bytes.clone(),
@@ -2051,6 +2064,9 @@ impl Executor {
             }
             "DECODE" => {
                 require_args(fname, &args, 2)?;
+                if args.iter().any(|value| matches!(value, Value::Null)) {
+                    return Ok(Value::Null);
+                }
                 let encoded = match &args[0] {
                     Value::Null => return Ok(Value::Null),
                     Value::Text(s) => s.clone(),

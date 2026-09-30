@@ -163,6 +163,7 @@ fn coerce_value_to_type(
         }
         let local = match value {
             Value::Timestamp(timestamp) => Some(*timestamp),
+            Value::Date(date) => Some(i64::from(*date) * 86_400_000_000),
             _ => None,
         };
         if let Some(local) = local {

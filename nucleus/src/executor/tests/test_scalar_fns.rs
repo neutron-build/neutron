@@ -681,11 +681,11 @@ async fn test_date_trunc() {
 async fn test_date_part() {
     let ex = test_executor();
     let results = exec(&ex, "SELECT DATE_PART('year', MAKE_DATE(2024, 3, 15))").await;
-    assert_eq!(*scalar(&results[0]), Value::Int32(2024));
+    assert_eq!(*scalar(&results[0]), Value::Float64(2024.0));
     let results = exec(&ex, "SELECT DATE_PART('month', MAKE_DATE(2024, 3, 15))").await;
-    assert_eq!(*scalar(&results[0]), Value::Int32(3));
+    assert_eq!(*scalar(&results[0]), Value::Float64(3.0));
     let results = exec(&ex, "SELECT DATE_PART('day', MAKE_DATE(2024, 3, 15))").await;
-    assert_eq!(*scalar(&results[0]), Value::Int32(15));
+    assert_eq!(*scalar(&results[0]), Value::Float64(15.0));
 }
 
 #[tokio::test]
@@ -831,11 +831,11 @@ async fn test_bit_length() {
 async fn test_extract_from_date() {
     let ex = test_executor();
     let results = exec(&ex, "SELECT EXTRACT(YEAR FROM MAKE_DATE(2024, 6, 15))").await;
-    assert_eq!(*scalar(&results[0]), Value::Int32(2024));
+    assert_eq!(*scalar(&results[0]), Value::Numeric("2024".into()));
     let results = exec(&ex, "SELECT EXTRACT(MONTH FROM MAKE_DATE(2024, 6, 15))").await;
-    assert_eq!(*scalar(&results[0]), Value::Int32(6));
+    assert_eq!(*scalar(&results[0]), Value::Numeric("6".into()));
     let results = exec(&ex, "SELECT EXTRACT(DAY FROM MAKE_DATE(2024, 6, 15))").await;
-    assert_eq!(*scalar(&results[0]), Value::Int32(15));
+    assert_eq!(*scalar(&results[0]), Value::Numeric("15".into()));
 }
 
 // ======================================================================
@@ -1413,27 +1413,27 @@ async fn test_clock_timestamp() {
 async fn test_extract_year_from_text() {
     let ex = test_executor();
     let results = exec(&ex, "SELECT EXTRACT(YEAR FROM '2024-06-15')").await;
-    assert_eq!(*scalar(&results[0]), Value::Int32(2024));
+    assert_eq!(*scalar(&results[0]), Value::Numeric("2024".into()));
 }
 
 #[tokio::test]
 async fn test_extract_month_day_from_text() {
     let ex = test_executor();
     let results = exec(&ex, "SELECT EXTRACT(MONTH FROM '2024-06-15')").await;
-    assert_eq!(*scalar(&results[0]), Value::Int32(6));
+    assert_eq!(*scalar(&results[0]), Value::Numeric("6".into()));
     let results = exec(&ex, "SELECT EXTRACT(DAY FROM '2024-06-15')").await;
-    assert_eq!(*scalar(&results[0]), Value::Int32(15));
+    assert_eq!(*scalar(&results[0]), Value::Numeric("15".into()));
 }
 
 #[tokio::test]
 async fn test_extract_hour_minute_second_from_text() {
     let ex = test_executor();
     let results = exec(&ex, "SELECT EXTRACT(HOUR FROM '2024-06-15 14:30:45')").await;
-    assert_eq!(*scalar(&results[0]), Value::Int32(14));
+    assert_eq!(*scalar(&results[0]), Value::Numeric("14".into()));
     let results = exec(&ex, "SELECT EXTRACT(MINUTE FROM '2024-06-15 14:30:45')").await;
-    assert_eq!(*scalar(&results[0]), Value::Int32(30));
+    assert_eq!(*scalar(&results[0]), Value::Numeric("30".into()));
     let results = exec(&ex, "SELECT EXTRACT(SECOND FROM '2024-06-15 14:30:45')").await;
-    assert_eq!(*scalar(&results[0]), Value::Int32(45));
+    assert_eq!(*scalar(&results[0]), Value::Numeric("45".into()));
 }
 
 #[tokio::test]

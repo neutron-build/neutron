@@ -1568,6 +1568,7 @@ impl Executor {
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported(format!("EXTRACT from {val:?}"))),
                 }
+                .and_then(|value| value.cast(&DataType::Numeric).map_err(ExecError::Runtime))
             }
             // -- IS DISTINCT FROM --
             Expr::IsDistinctFrom(left, right) => {

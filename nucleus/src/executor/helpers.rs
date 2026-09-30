@@ -249,6 +249,7 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
             crate::sql::convert_data_type(data_type).unwrap_or(DataType::Text)
         }
         Expr::Interval(_) => DataType::Interval,
+        Expr::Extract { .. } => DataType::Numeric,
         Expr::Collate { expr, .. } => infer_expr_type(expr, col_meta),
         Expr::AtTimeZone { timestamp, .. } => match infer_expr_type(timestamp, col_meta) {
             DataType::TimestampTz => DataType::Timestamp,
@@ -264,7 +265,9 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
                 _ => None,
             };
             match name.as_str() {
-                "DECODE" => DataType::Bytea,
+                "DECODE" | "PG_CATALOG.DECODE" => DataType::Bytea,
+                "DATE_PART" | "PG_CATALOG.DATE_PART" => DataType::Float64,
+                "EXTRACT" | "PG_CATALOG.EXTRACT" => DataType::Numeric,
                 "MAKE_INTERVAL" | "PG_CATALOG.MAKE_INTERVAL" => DataType::Interval,
                 "COUNT" | "ROW_NUMBER" | "RANK" | "DENSE_RANK" => DataType::Int64,
                 "AVG"
