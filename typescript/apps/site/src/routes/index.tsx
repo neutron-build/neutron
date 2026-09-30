@@ -391,7 +391,7 @@ export default function HomePage() {
                     </span>
                   </div>
                   <p class="products__desc">
-                    Type-safe queries for all 14 models. Schema-in-code ORM planned.
+                    Modular APIs for 14 models, with documented maturity and transaction limits. Schema-in-code ORM planned.
                   </p>
                 </div>
               </a>
