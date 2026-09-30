@@ -2179,12 +2179,12 @@ mod tests {
                 "value".to_string(),
                 ColumnData::Float64(vec![Some(42.0)]),
             )]);
-            c.append("metrics", batch);
+            c.append("metrics", batch).unwrap();
             let batch2 = ColumnBatch::new(vec![(
                 "value".to_string(),
                 ColumnData::Float64(vec![Some(58.0)]),
             )]);
-            c.append("metrics", batch2);
+            c.append("metrics", batch2).unwrap();
         }
         {
             let c = col.read();

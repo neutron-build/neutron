@@ -129,6 +129,9 @@ pub struct ColumnarWal {
     /// checkpoint replaced the log but its reopen failed; cleared by the next
     /// successful reattach (or checkpoint reopen). See `reattach_if_stranded`.
     stranded: AtomicBool,
+    /// A write/flush failed after bytes may have reached the log. Never append
+    /// beyond an uncertain frame or acknowledge durability until reopening.
+    write_failed: AtomicBool,
     /// The highest coordinating transaction id recovered at open (S63).
     max_xact_id: u64,
     /// Test-only one-shot checkpoint-reopen fault; see `checkpoint_named`.
@@ -184,6 +187,7 @@ impl ColumnarWal {
                 synced: AtomicU64::new(0),
                 committer: GroupCommitter::new(),
                 stranded: AtomicBool::new(false),
+                write_failed: AtomicBool::new(false),
                 max_xact_id,
                 #[cfg(test)]
                 fail_reopen_once: AtomicBool::new(false),
@@ -214,6 +218,7 @@ impl ColumnarWal {
     /// and fsynced by this call.
     fn sync_covering(&self) -> io::Result<u64> {
         let mut w = self.writer.lock();
+        self.ensure_writable()?;
         let covered = self.appends.load(Ordering::Acquire);
         w.flush()?;
         w.get_ref().sync_all()?;
@@ -231,6 +236,7 @@ impl ColumnarWal {
     /// only returns once a completed sync covers every append made before
     /// this call.
     pub fn group_sync(&self) -> io::Result<()> {
+        self.ensure_writable()?;
         let mark = self.appends.load(Ordering::Acquire);
         if self.synced.load(Ordering::Acquire) >= mark {
             return Ok(());
@@ -311,6 +317,7 @@ impl ColumnarWal {
 
     /// `checkpoint`, preserving each table's column names.
     pub fn checkpoint_named(&self, tables: &[(&str, Vec<String>, &[Row])]) -> io::Result<()> {
+        self.ensure_writable()?;
         #[cfg(test)]
         if self.fail_checkpoint_once.swap(false, Ordering::AcqRel) {
             return Err(io::Error::other("injected columnar WAL checkpoint failure"));
@@ -385,6 +392,30 @@ impl ColumnarWal {
         Ok(())
     }
 
+    pub(crate) fn has_write_failure(&self) -> bool {
+        self.write_failed.load(Ordering::Acquire)
+    }
+
+    fn ensure_writable(&self) -> io::Result<()> {
+        if self.has_write_failure() {
+            return Err(io::Error::other(
+                "columnar WAL write outcome is uncertain; reopen required before further mutations or durability acknowledgements",
+            ));
+        }
+        Ok(())
+    }
+
+    /// A checkpoint published replacement bytes but could not reattach its writer.
+    /// Higher layers staging a new image must fence their old memory image.
+    pub(crate) fn is_stranded(&self) -> bool {
+        self.stranded.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_reopen(&self) {
+        self.fail_reopen_once.store(true, Ordering::Release);
+    }
+
     /// Per-instance fault, before the first WAL byte, for mutation atomicity tests.
     #[cfg(test)]
     pub(crate) fn fail_next_append(&self) {
@@ -407,13 +438,18 @@ impl ColumnarWal {
         payload: &[u8],
     ) -> io::Result<()> {
         let mut w = self.writer.lock();
+        self.ensure_writable()?;
         #[cfg(test)]
         if self.fail_append_once.swap(false, Ordering::AcqRel) {
             return Err(io::Error::other("injected columnar WAL append failure"));
         }
         self.reattach_if_stranded(&mut w)?;
-        write_entry(&mut *w, plain, xact_tagged, xact, name, payload)?;
-        w.flush()?;
+        if let Err(error) =
+            write_entry(&mut *w, plain, xact_tagged, xact, name, payload).and_then(|_| w.flush())
+        {
+            self.write_failed.store(true, Ordering::Release);
+            return Err(error);
+        }
         // Counted under the writer lock so sync_covering's mark is exact.
         self.appends.fetch_add(1, Ordering::AcqRel);
         Ok(())
