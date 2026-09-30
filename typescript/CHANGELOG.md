@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 Planned release: core 0.3.0, CLI 0.3.0, create-neutron 0.1.7, Nucleus SDK
-0.2.1 and data 0.2.1. Core-dependent adapters receive patch releases for the
+0.2.1, data 0.2.1 and cache-redis 0.2.0. Core-dependent adapters receive patch releases for the
 new dependency range. Requires Node.js 22 or later.
 
 - Request-local function caches separate authenticated requests, distinguish
@@ -13,6 +13,8 @@ new dependency range. Requires Node.js 22 or later.
   explicit `scope: "shared"`.
 - Response and loader cache stores must implement atomic generation-conditional
   publication. Custom server stores without that capability are refused.
+- Redis cache adapters require atomic EVAL support for generation-conditional
+  publication. Existing unversioned entries become cold misses on migration.
 - Session middleware requires atomic revision-conditional persistence for save,
   rotation and revocation. Legacy stores fail closed; switching stores requires
   fresh login. See [authentication migration](../go/neutronauth/README.md).
