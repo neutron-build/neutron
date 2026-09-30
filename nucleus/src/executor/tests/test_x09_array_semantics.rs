@@ -115,3 +115,110 @@ async fn x09_fractional_extract_and_bytea_encoding_preserve_values() {
         assert_eq!(scalar(&result[0]), &expected, "{sql}");
     }
 }
+
+#[tokio::test]
+async fn x09_date_assignment_to_timestamptz_uses_session_midnight() {
+    let ex = test_executor();
+    exec(&ex, "SET TIME ZONE 'America/Vancouver'").await;
+    exec(
+        &ex,
+        "CREATE TABLE x09_dates (id int, instant timestamptz, instants timestamptz[])",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO x09_dates VALUES (1, DATE '2026-01-02', ARRAY[DATE '2026-01-02'])",
+    )
+    .await;
+    let expected = Value::TimestampTz(
+        i64::from(crate::types::ymd_to_days(2026, 1, 2)) * 86_400_000_000 + 8 * 3_600_000_000,
+    );
+    for sql in [
+        "SELECT instant FROM x09_dates",
+        "SELECT instants[1] FROM x09_dates",
+    ] {
+        assert_eq!(scalar(&exec(&ex, sql).await[0]), &expected, "{sql}");
+    }
+    exec(&ex, "UPDATE x09_dates SET instant = DATE '2026-07-02', instants = ARRAY[DATE '2026-07-02'] WHERE id = 1").await;
+    let summer = Value::TimestampTz(
+        i64::from(crate::types::ymd_to_days(2026, 7, 2)) * 86_400_000_000 + 7 * 3_600_000_000,
+    );
+    for sql in [
+        "SELECT instant FROM x09_dates",
+        "SELECT instants[1] FROM x09_dates",
+    ] {
+        assert_eq!(scalar(&exec(&ex, sql).await[0]), &summer, "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn x09_temporal_extraction_describes_same_type_for_empty_results() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE x09_extract (value timestamp)").await;
+    for (expr, expected_type, expected_value) in [
+        (
+            "EXTRACT(SECOND FROM value)",
+            DataType::Numeric,
+            Value::Numeric("1.250000".into()),
+        ),
+        (
+            "DATE_PART('second', value)",
+            DataType::Float64,
+            Value::Float64(1.25),
+        ),
+        (
+            "EXTRACT(YEAR FROM value)",
+            DataType::Numeric,
+            Value::Numeric("2000".into()),
+        ),
+        (
+            "DATE_PART('year', value)",
+            DataType::Float64,
+            Value::Float64(2000.0),
+        ),
+    ] {
+        let result = exec(&ex, &format!("SELECT {expr} FROM x09_extract")).await;
+        match &result[0] {
+            ExecResult::Select { columns, rows, .. } => {
+                assert!(rows.is_empty());
+                assert_eq!(columns[0].1, expected_type, "{expr}");
+            }
+            other => panic!("{other:?}"),
+        }
+        exec(
+            &ex,
+            "INSERT INTO x09_extract VALUES (TIMESTAMP '2000-01-01 00:00:01.25')",
+        )
+        .await;
+        let result = exec(&ex, &format!("SELECT {expr} FROM x09_extract")).await;
+        match &result[0] {
+            ExecResult::Select { columns, rows, .. } => {
+                assert_eq!(columns[0].1, expected_type, "{expr}");
+                assert_eq!(rows[0][0], expected_value, "{expr}");
+            }
+            other => panic!("{other:?}"),
+        }
+        exec(&ex, "DELETE FROM x09_extract").await;
+    }
+    assert_eq!(
+        scalar(&exec(&ex, "SELECT DATE_PART('epoch', DATE '1970-01-01')").await[0]),
+        &Value::Float64(0.0)
+    );
+    assert_eq!(
+        scalar(&exec(&ex, "SELECT DATE_PART('dow', DATE '2000-01-02')").await[0]),
+        &Value::Float64(0.0)
+    );
+}
+
+#[tokio::test]
+async fn x09_bytea_encoding_functions_are_strict_for_both_arguments() {
+    let ex = test_executor();
+    for sql in [
+        "SELECT ENCODE(DECODE('00ff','hex'), NULL)",
+        "SELECT DECODE('00ff', NULL)",
+        "SELECT ENCODE(NULL, 'hex')",
+        "SELECT DECODE(NULL, 'hex')",
+    ] {
+        assert_eq!(scalar(&exec(&ex, sql).await[0]), &Value::Null, "{sql}");
+    }
+}
