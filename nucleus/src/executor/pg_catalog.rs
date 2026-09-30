@@ -2172,6 +2172,8 @@ pub(super) fn format_type_text(oid: i32, typmod: i32, names: Option<&PgSnapshot>
         return format!("{}[]", format_type_text(t.0, typmod, names));
     }
     match oid {
+        0 => "-".into(),
+        705 => "unknown".into(),
         16 => "boolean".into(),
         17 => "bytea".into(),
         19 => "name".into(),
@@ -2207,9 +2209,9 @@ pub(super) fn format_type_text(oid: i32, typmod: i32, names: Option<&PgSnapshot>
             Some(key) => match key.split_once(':') {
                 Some(("t", n)) => quote_ident(n),
                 Some(("_t", n)) => format!("{}[]", quote_ident(n)),
-                _ => "-".into(),
+                _ => "???".into(),
             },
-            None => "-".into(),
+            None => "???".into(),
         },
     }
 }

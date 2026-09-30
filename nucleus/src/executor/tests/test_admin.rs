@@ -219,7 +219,20 @@ async fn test_format_type() {
     assert_eq!(scalar(&results[0]), &Value::Text("double precision".into()));
 
     let results = exec(&ex, "SELECT format_type(99999, -1)").await;
-    assert_eq!(scalar(&results[0]), &Value::Text("unknown".into()));
+    assert_eq!(scalar(&results[0]), &Value::Text("???".into()));
+    let results = exec(
+        &ex,
+        "SELECT format_type(0, -1), format_type(705, -1), format_type(NULL, -1)",
+    )
+    .await;
+    assert_eq!(
+        rows(&results[0])[0],
+        vec![
+            Value::Text("-".into()),
+            Value::Text("unknown".into()),
+            Value::Null
+        ]
+    );
 }
 
 #[tokio::test]
