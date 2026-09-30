@@ -2387,6 +2387,8 @@ impl Executor {
                 return;
             }
         };
+        #[cfg(test)]
+        self.pause_derived_publish("zone", table_name);
         self.zone_map_index.clear_table(zm_table_id);
         if rows.is_empty() {
             return;

@@ -135,6 +135,7 @@ mod ddl;
 mod deferred_fk;
 pub(crate) use deferred_fk::SET_CONSTRAINTS_SETTING;
 mod dml;
+mod derived_coherence;
 pub(crate) mod enlistment;
 mod expr;
 mod helpers;
@@ -870,6 +871,8 @@ pub struct Executor {
     /// Tracks min/max per column per 8K-row granule. Expected speedup: 5-10x on selective queries.
     #[allow(dead_code)]
     zone_map_index: crate::storage::granule_stats::ZoneMapIndex,
+    #[cfg(test)]
+    derived_publish_hook: parking_lot::Mutex<Option<derived_coherence::PublishHook>>,
     /// Memory pressure flag: set by the watchdog when RSS exceeds the critical
     /// threshold (90% of --max-memory). Write operations (INSERT, UPDATE, DELETE,
     /// TRUNCATE) are rejected while this flag is set. Cleared when RSS drops
@@ -1256,6 +1259,8 @@ impl Executor {
             plan_cache: parking_lot::RwLock::new(PlanCache::new(1024)),
             ast_cache: parking_lot::RwLock::new(AstCache::new(4096)),
             zone_map_index: crate::storage::granule_stats::ZoneMapIndex::new(),
+            #[cfg(test)]
+            derived_publish_hook: parking_lot::Mutex::new(None),
             memory_critical: Arc::new(AtomicBool::new(false)),
             reject_writes_on_memory_critical: Arc::new(AtomicBool::new(false)),
             security: parking_lot::RwLock::new(crate::security::SecurityManager::new()),
@@ -2533,6 +2538,9 @@ impl Executor {
             .scan_for_maintenance(table_name)
             .await
             .unwrap_or_default();
+
+        #[cfg(test)]
+        self.pause_derived_publish("position", table_name);
 
         let key = std::env::var("NUCLEUS_ENCRYPTION_KEY")
             .ok()
@@ -8835,6 +8843,9 @@ impl Executor {
             .scan_for_maintenance(table_name)
             .await
             .unwrap_or_default();
+
+        #[cfg(test)]
+        self.pause_derived_publish("fts", table_name);
 
         let mut indexes = self.fts_column_indexes.write();
         for entry in indexes.values_mut() {

@@ -125,3 +125,6 @@ mod test_x12_review_regressions;
 
 mod test_x12_array_boundary;
 mod test_x12_recursive_cte;
+
+#[cfg(feature = "server")]
+mod test_derived_publication;
