@@ -186,3 +186,27 @@ async fn checkpoint_table_engines_is_lossless_for_lsm() {
     };
     assert_eq!(n, 100, "LSM checkpoint must not lose or duplicate rows");
 }
+
+#[tokio::test]
+async fn failed_durable_override_open_never_creates_an_ephemeral_table() {
+    for kind in ["columnar", "lsm"] {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = open_executor(dir.path()).await;
+        // A regular file in place of the parent directory forces a real,
+        // deterministic filesystem error without relying on permissions.
+        let blocked = dir.path().join("columnar_engines");
+        std::fs::write(&blocked, b"operator-owned obstruction").unwrap();
+        let result = ex.execute(&format!(
+            "CREATE TABLE blocked (id INT) WITH (engine='{kind}')"
+        )).await;
+        assert!(result.is_err(), "{kind} must refuse a failed durable open");
+        assert!(ex.catalog.get_table("blocked").await.is_none(),
+            "{kind} must not publish a table after the failed open");
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"operator-owned obstruction");
+        std::fs::remove_file(&blocked).unwrap();
+        exec(&ex, &format!("CREATE TABLE blocked (id INT) WITH (engine='{kind}')")).await;
+        exec(&ex, "INSERT INTO blocked VALUES (7)").await;
+        let selected = exec(&ex, "SELECT id FROM blocked").await;
+        assert_eq!(super::rows(&selected[0]).len(), 1);
+    }
+}
