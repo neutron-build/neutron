@@ -400,7 +400,10 @@ async fn pinned_read_transaction_fts_matches_its_visible_heap_after_writer_commi
     let writer_session = executor.create_session();
     assert_ne!(reader_session, writer_session);
     executor
-        .execute_with_session(reader_session, "BEGIN READ ONLY")
+        .execute_with_session(
+            reader_session,
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+        )
         .await
         .unwrap();
     let initial = executor
