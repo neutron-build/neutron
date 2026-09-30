@@ -8344,6 +8344,92 @@ mod tests {
         })
         .await;
     }
+    /// Dense secondary keys must remain complete after different rows on the
+    /// same heap pages are updated, deleted, and reinserted concurrently.
+    /// The heap is the oracle; compare identities rather than just counts.
+    #[test]
+    fn concurrent_secondary_index_churn_matches_heap() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = rt.block_on(setup_engine(tmp.path()));
+        rt.block_on(register_simple_table(&catalog, "t"));
+        rt.block_on(engine.create_table("t")).unwrap();
+        rt.block_on(engine.create_index("t", "secondary", 1))
+            .unwrap();
+        const WORKERS: i32 = 8;
+        const ROWS: i32 = 128;
+        for id in 0..WORKERS * ROWS {
+            rt.block_on(engine.insert("t", simple_row(id, &format!("v{:02}", id % 64))))
+                .unwrap();
+        }
+        let engine = Arc::new(engine);
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|worker| {
+                let engine = engine.clone();
+                let handle = rt.handle().clone();
+                std::thread::spawn(move || {
+                    for round in 0..16 {
+                        for row in 0..ROWS {
+                            let id = worker * ROWS + row;
+                            let found = handle
+                                .block_on(engine.scan_where_eq_positions("t", 0, &Value::Int32(id)))
+                                .unwrap();
+                            assert_eq!(found.len(), 1);
+                            let (position, old) = &found[0];
+                            let name = format!("v{:02}", (id + round * 17) % 64);
+                            if (id + round) % 3 == 0 {
+                                assert_eq!(
+                                    handle
+                                        .block_on(
+                                            engine.delete_if_unchanged(
+                                                "t",
+                                                &[(*position, old.clone())]
+                                            )
+                                        )
+                                        .unwrap(),
+                                    1
+                                );
+                                handle
+                                    .block_on(engine.insert("t", simple_row(id, &name)))
+                                    .unwrap();
+                            } else {
+                                assert_eq!(
+                                    handle
+                                        .block_on(engine.update_if_unchanged(
+                                            "t",
+                                            &[(*position, old.clone(), simple_row(id, &name))]
+                                        ))
+                                        .unwrap(),
+                                    1
+                                );
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let heap = rt.block_on(engine.scan("t")).unwrap();
+        assert_eq!(heap.len(), (WORKERS * ROWS) as usize);
+        for key in 0..64 {
+            let value = Value::Text(format!("v{key:02}"));
+            let mut expected: Vec<Row> =
+                heap.iter().filter(|row| row[1] == value).cloned().collect();
+            let mut actual = rt
+                .block_on(engine.index_lookup("t", "secondary", &value))
+                .unwrap()
+                .unwrap();
+            let sort = |a: &Row, b: &Row| a[0].to_string().cmp(&b[0].to_string());
+            expected.sort_by(sort);
+            actual.sort_by(sort);
+            assert_eq!(
+                actual, expected,
+                "secondary key {key} lost or duplicated row identities"
+            );
+        }
+    }
 }
 
 // ============================================================================
@@ -8785,92 +8871,5 @@ mod wal_recovery_tests {
             max_new > 5_000,
             "fresh backend minted LSN {max_new} at/below the recovered floor 5000"
         );
-    }
-
-    /// Dense secondary keys must remain complete after different rows on the
-    /// same heap pages are updated, deleted, and reinserted concurrently.
-    /// The heap is the oracle; compare identities rather than just counts.
-    #[test]
-    fn concurrent_secondary_index_churn_matches_heap() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, catalog) = rt.block_on(setup_engine(tmp.path()));
-        rt.block_on(register_simple_table(&catalog, "t"));
-        rt.block_on(engine.create_table("t")).unwrap();
-        rt.block_on(engine.create_index("t", "secondary", 1))
-            .unwrap();
-        const WORKERS: i32 = 8;
-        const ROWS: i32 = 128;
-        for id in 0..WORKERS * ROWS {
-            rt.block_on(engine.insert("t", simple_row(id, &format!("v{:02}", id % 64))))
-                .unwrap();
-        }
-        let engine = Arc::new(engine);
-        let workers: Vec<_> = (0..WORKERS)
-            .map(|worker| {
-                let engine = engine.clone();
-                let handle = rt.handle().clone();
-                std::thread::spawn(move || {
-                    for round in 0..16 {
-                        for row in 0..ROWS {
-                            let id = worker * ROWS + row;
-                            let found = handle
-                                .block_on(engine.scan_where_eq_positions("t", 0, &Value::Int32(id)))
-                                .unwrap();
-                            assert_eq!(found.len(), 1);
-                            let (position, old) = &found[0];
-                            let name = format!("v{:02}", (id + round * 17) % 64);
-                            if (id + round) % 3 == 0 {
-                                assert_eq!(
-                                    handle
-                                        .block_on(
-                                            engine.delete_if_unchanged(
-                                                "t",
-                                                &[(*position, old.clone())]
-                                            )
-                                        )
-                                        .unwrap(),
-                                    1
-                                );
-                                handle
-                                    .block_on(engine.insert("t", simple_row(id, &name)))
-                                    .unwrap();
-                            } else {
-                                assert_eq!(
-                                    handle
-                                        .block_on(engine.update_if_unchanged(
-                                            "t",
-                                            &[(*position, old.clone(), simple_row(id, &name))]
-                                        ))
-                                        .unwrap(),
-                                    1
-                                );
-                            }
-                        }
-                    }
-                })
-            })
-            .collect();
-        for worker in workers {
-            worker.join().unwrap();
-        }
-        let heap = rt.block_on(engine.scan("t")).unwrap();
-        assert_eq!(heap.len(), (WORKERS * ROWS) as usize);
-        for key in 0..64 {
-            let value = Value::Text(format!("v{key:02}"));
-            let mut expected: Vec<Row> =
-                heap.iter().filter(|row| row[1] == value).cloned().collect();
-            let mut actual = rt
-                .block_on(engine.index_lookup("t", "secondary", &value))
-                .unwrap()
-                .unwrap();
-            let sort = |a: &Row, b: &Row| a[0].to_string().cmp(&b[0].to_string());
-            expected.sort_by(sort);
-            actual.sort_by(sort);
-            assert_eq!(
-                actual, expected,
-                "secondary key {key} lost or duplicated row identities"
-            );
-        }
     }
 }
