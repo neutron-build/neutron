@@ -8430,6 +8430,128 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn concurrent_numeric_secondary_relocation_matches_heap() {
+        fn churn_row(id: i32, key: i32, wide: bool) -> Row {
+            vec![
+                Value::Int64(1_000_000_000 + id as i64),
+                Value::Int64(key as i64),
+                Value::Text(format!("k{id}{}", "x".repeat(if wide { 1536 } else { 8 }))),
+                Value::Vector(vec![key as f32, id as f32, 1.0, -1.0]),
+            ]
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = rt.block_on(setup_engine(tmp.path()));
+        let columns = [
+            ("id", DataType::Int64),
+            ("val", DataType::Int32),
+            ("code", DataType::Text),
+            ("v", DataType::Vector(4)),
+        ]
+        .into_iter()
+        .map(|(name, data_type)| ColumnDef {
+            name: name.into(),
+            data_type,
+            nullable: false,
+            default_expr: None,
+            id: 0,
+            analyzer: None,
+            generation: None,
+            max_len: None,
+        })
+        .collect();
+        rt.block_on(catalog.create_table(TableDef {
+            name: "t".into(),
+            columns,
+            constraints: vec![],
+            append_only: false,
+            epoch: 0,
+        }))
+        .unwrap();
+        rt.block_on(engine.create_table("t")).unwrap();
+        rt.block_on(engine.create_index("t", "primary", 0)).unwrap();
+        rt.block_on(engine.create_index("t", "secondary", 1))
+            .unwrap();
+        const WORKERS: i32 = 8;
+        const ROWS: i32 = 64;
+        for id in 0..WORKERS * ROWS {
+            rt.block_on(engine.insert("t", churn_row(id, id % 64, false)))
+                .unwrap();
+        }
+        let engine = Arc::new(engine);
+        let workers: Vec<_> =
+            (0..WORKERS)
+                .map(|worker| {
+                    let engine = engine.clone();
+                    let handle = rt.handle().clone();
+                    std::thread::spawn(move || {
+                        for round in 0..8 {
+                            for row in 0..ROWS {
+                                let id = worker * ROWS + row;
+                                let found = handle
+                                    .block_on(engine.scan_where_eq_positions(
+                                        "t",
+                                        0,
+                                        &Value::Int64(1_000_000_000 + id as i64),
+                                    ))
+                                    .unwrap();
+                                assert_eq!(found.len(), 1);
+                                let (position, old) = &found[0];
+                                let new = churn_row(id, (id + round * 17) % 64, round % 2 == 0);
+                                if (id + round) % 3 == 0 {
+                                    assert_eq!(
+                                        handle
+                                            .block_on(engine.delete_if_unchanged(
+                                                "t",
+                                                &[(*position, old.clone())]
+                                            ))
+                                            .unwrap(),
+                                        1
+                                    );
+                                    handle.block_on(engine.insert("t", new)).unwrap();
+                                } else {
+                                    assert_eq!(
+                                        handle
+                                            .block_on(engine.update_if_unchanged(
+                                                "t",
+                                                &[(*position, old.clone(), new)]
+                                            ))
+                                            .unwrap(),
+                                        1
+                                    );
+                                }
+                            }
+                        }
+                    })
+                })
+                .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let heap = rt.block_on(engine.scan("t")).unwrap();
+        assert_eq!(heap.len(), (WORKERS * ROWS) as usize);
+        for key in 0..64 {
+            let value = Value::Int64(key);
+            let mut expected: Vec<Row> = heap
+                .iter()
+                .filter(|row| row[1].loose_eq(&value))
+                .cloned()
+                .collect();
+            let mut actual = rt
+                .block_on(engine.index_lookup("t", "secondary", &value))
+                .unwrap()
+                .unwrap();
+            let sort = |a: &Row, b: &Row| a[0].to_string().cmp(&b[0].to_string());
+            expected.sort_by(sort);
+            actual.sort_by(sort);
+            assert_eq!(
+                actual, expected,
+                "numeric secondary key {key} lost or duplicated rows after relocation"
+            );
+        }
+    }
 }
 
 // ============================================================================
