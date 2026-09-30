@@ -466,12 +466,42 @@ back to the session zone only when no offset is present.
   `ddl.uncommitted_ddl_invisible`, `ddl.create_index_concurrently_in_tx_rejected`.
 - **N4 — catalog fidelity.** See blocker 1; every `catalog.*` probe except
   `catalog.pg_get_indexdef` and `catalog.current_schema_and_search_path`.
-- **N5 — generated/identity columns.** `GENERATED ALWAYS AS (expr) STORED`
-  reads 0; explicit values into `GENERATED ALWAYS AS IDENTITY` are accepted
-  instead of 428C9. Probes `dml.generated_stored_column`,
-  `dml.identity_column`.
-- **N6 — deferrable constraints rejected** ("constraints are immediate").
-  Probe `constraint.deferrable_fk`.
+- **N5 — generated/identity columns.** Source changes implemented in X10;
+  final integrated regression/live verification is pending. The recorded
+  verdicts above predate these changes and must be re-recorded.
+  `GENERATED ALWAYS AS (expr) STORED` is computed on INSERT and on every
+  UPDATE (`executor/column_writes.rs`); an explicit value into a generated
+  column, or into a `GENERATED ALWAYS AS IDENTITY` column without
+  `OVERRIDING SYSTEM VALUE`, fails with 428C9; `OVERRIDING {SYSTEM | USER}
+  VALUE`, `DEFAULT` and `BY DEFAULT` follow PostgreSQL 17. The metadata is in
+  the catalog (`ColumnDef.generation`, persisted, dumped and restored) and
+  reported by `information_schema.columns` and `pg_attribute`
+  (`attgenerated`, `attidentity`). Limits: a generation expression may not
+  read another generated column. Only a bounded set of verified scalar
+  builtins and row expressions is admitted (see `nucleus/docs/SQL_SEMANTICS.md`);
+  UDFs, unknown/stateful/qualified functions, casts, subqueries and windows are
+  refused. Validation does not promise PostgreSQL 42P17 SQLSTATE parity.
+  `ADD COLUMN ... GENERATED AS IDENTITY` and
+  `ALTER COLUMN ... ADD GENERATED` are refused; `VIRTUAL` generated columns
+  do not exist in PostgreSQL 17 either. Probes `dml.generated_stored_column`,
+  `dml.identity_column`. Regressions:
+  `nucleus/src/executor/tests/test_column_writes.rs`.
+- **N6 — deferrable constraints.** Foreign-key source changes implemented
+  in X10; final integrated regression/live verification is pending:
+  `DEFERRABLE [INITIALLY DEFERRED | IMMEDIATE]` is stored on the constraint
+  and, inside an explicit transaction, a deferred foreign key is checked at
+  COMMIT (a violation fails the COMMIT with 23503 and rolls the transaction
+  back); `SET CONSTRAINTS { ALL | name, ... } { DEFERRED | IMMEDIATE }`
+  moves the check and `IMMEDIATE` checks what is pending at once. Both the
+  child side (insert/update) and the parent side (delete/update of a
+  referenced key under NO ACTION) are deferred; RESTRICT and the CASCADE /
+  SET NULL / SET DEFAULT actions still act per statement, as in PostgreSQL.
+  Not deferred, and refused rather than accepted: `DEFERRABLE` on PRIMARY KEY
+  and UNIQUE constraints (their uniqueness is settled per statement by the
+  storage layer; 0A000 names this). Statements outside an explicit
+  transaction stay immediate (the statement is the transaction), including
+  the implicit block of a multi-statement simple-query message. Probe
+  `constraint.deferrable_fk`; regressions in `test_column_writes.rs`.
 - **N7 — no lock/cancel surface.** See blocker 3; every `lock.*` probe except
   the two `FOR UPDATE` probes and `lock.blocked_update_waits_then_applies`.
 - **N8 — array wire codec.** `int4[]` results arrive as the text
@@ -494,11 +524,13 @@ back to the session zone only when no offset is present.
 - **N12 — value-shape divergences, each low blast radius:** unconstrained
   `numeric` drops trailing zeros; `date 'infinity'` rejected;
   `encode(bytea, 'hex')` rejects bytea; enum `ORDER BY` sorts lexically;
-  interval renders `02:03:04.500000`; `INSERT ... DEFAULT VALUES` rejected;
-  row-value comparison unsupported (the ORM's keyset pagination expands the
-  predicate and stays correct); `row_number()` missing; `varchar(n)` overflow
-  not enforced (the documented typemod policy in
-  [`nucleus/docs/SQL_SEMANTICS.md`](../../../nucleus/docs/SQL_SEMANTICS.md)).
+  interval renders `02:03:04.500000`; `INSERT ... DEFAULT VALUES` rejected
+  (FIXED in X10); row-value comparison unsupported (the ORM's keyset
+  pagination expands the predicate and stays correct); `row_number()`
+  missing; `varchar(n)` overflow not enforced (FIXED in X10: `varchar(n)` /
+  `char(n)` lengths are enforced on write with 22001, see
+  [`nucleus/docs/SQL_SEMANTICS.md`](../../../nucleus/docs/SQL_SEMANTICS.md);
+  `numeric(p,s)` remains unenforced).
 - **N13 — derived-table column lists are not applied.**
   `select v from (values (1)) as t(v)` fails with `column "v" does not exist`
   (42703). This is the error `engine.capability.jsonb-functions` records: the

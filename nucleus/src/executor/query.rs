@@ -32,6 +32,33 @@ const GRANULE_SIZE: usize = 8192;
 
 /// Compute a stable table_id from a table name for zone map indexing.
 #[allow(dead_code)]
+/// Apply a derived-table column list (`... AS t(a, b)`) to the columns of the
+/// relation it names. PostgreSQL renames the leading columns and leaves the
+/// rest under their own names; naming more columns than exist is an error.
+pub(super) fn apply_alias_columns(
+    meta: &mut [ColMeta],
+    alias: Option<&ast::TableAlias>,
+) -> Result<(), ExecError> {
+    let Some(alias) = alias else {
+        return Ok(());
+    };
+    if alias.columns.is_empty() {
+        return Ok(());
+    }
+    if alias.columns.len() > meta.len() {
+        return Err(ExecError::Runtime(format!(
+            "table \"{}\" has {} columns available but {} columns specified",
+            alias.name.value,
+            meta.len(),
+            alias.columns.len()
+        )));
+    }
+    for (col, named) in meta.iter_mut().zip(alias.columns.iter()) {
+        col.name = named.name.value.clone();
+    }
+    Ok(())
+}
+
 fn table_name_to_id(name: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     name.hash(&mut hasher);
@@ -1298,10 +1325,10 @@ impl Executor {
                 let name = func.name.to_string().to_uppercase();
                 match name.as_str() {
                     "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "ARRAY_AGG" | "STRING_AGG"
-                    | "JSON_AGG" | "BOOL_AND" | "BOOL_OR" | "STDDEV" | "VARIANCE"
-                    | "STDDEV_POP" | "STDDEV_SAMP" | "VAR_POP" | "VAR_SAMP" | "ARGMAX"
-                    | "ARG_MAX" | "ARGMIN" | "ARG_MIN" | "PERCENTILE_CONT" | "PERCENTILE_DISC"
-                    | "MEDIAN" | "QUANTILE" => {
+                    | "JSON_AGG" | "JSONB_AGG" | "JSON_OBJECT_AGG" | "JSONB_OBJECT_AGG"
+                    | "BOOL_AND" | "BOOL_OR" | "STDDEV" | "VARIANCE" | "STDDEV_POP"
+                    | "STDDEV_SAMP" | "VAR_POP" | "VAR_SAMP" | "ARGMAX" | "ARG_MAX" | "ARGMIN"
+                    | "ARG_MIN" | "PERCENTILE_CONT" | "PERCENTILE_DISC" | "MEDIAN" | "QUANTILE" => {
                         out.push(format!("{expr}"));
                     }
                     _ => {}
@@ -5635,7 +5662,14 @@ impl Executor {
             }
             ast::DataType::Varchar(_)
             | ast::DataType::Text
-            | ast::DataType::CharacterVarying(_) => Value::Text(v.to_string()),
+            | ast::DataType::CharacterVarying(_) => match v {
+                // Rendered in the session TimeZone, as the AST cast does.
+                Value::TimestampTz(us) => Value::Text(crate::types::format_timestamptz(
+                    us,
+                    super::timestamptz::ambient_time_zone(),
+                )),
+                other => Value::Text(other.to_string()),
+            },
             ast::DataType::Boolean => match &v {
                 Value::Bool(_) => v,
                 Value::Int32(n) => Value::Bool(*n != 0),
@@ -6417,7 +6451,16 @@ impl Executor {
                         first
                             .iter()
                             .enumerate()
-                            .map(|(i, v)| (format!("column{}", i + 1), value_type(v)))
+                            .map(|(i, v)| {
+                                (
+                                    format!("column{}", i + 1),
+                                    super::helpers::projected_column_type(
+                                        &values.rows[0][i],
+                                        v,
+                                        &[],
+                                    ),
+                                )
+                            })
                             .collect()
                     } else {
                         Vec::new()
@@ -6491,11 +6534,14 @@ impl Executor {
     > {
         let with = with.clone();
         Box::pin(async move {
-            let mut cte_tables = HashMap::new();
+            // Nested WITH clauses inherit their enclosing CTE scope. Local names
+            // replace inherited names as their definitions become available.
+            let mut cte_tables = self.current_session().active_ctes.read().clone();
             for cte in &with.cte_tables {
                 let cte_name = cte.alias.name.value.clone();
 
-                // Check for recursive CTE (WITH RECURSIVE ... UNION ALL)
+                // UNION uses a visited set: only previously unseen rows enter
+                // the next working set. UNION ALL retains every produced row.
                 if with.recursive
                     && let SetExpr::SetOperation {
                         op: ast::SetOperator::Union,
@@ -6503,56 +6549,71 @@ impl Executor {
                         ref left,
                         ref right,
                     } = *cte.query.body
+                    && Self::cte_arm_references_name(right, &cte_name)
                 {
                     let is_all = matches!(
                         set_quantifier,
                         ast::SetQuantifier::All | ast::SetQuantifier::AllByName
                     );
-                    if is_all {
-                        // Execute base case (left side of UNION ALL)
-                        let base_result = self
-                            .execute_set_expr(*left.clone(), &cte_tables, &[], false)
-                            .await?;
-                        let (base_cols, base_rows) = self.select_result_to_rows(base_result)?;
-                        // Apply CTE alias column names if provided
-                        let cte_col_names: Vec<String> = cte
-                            .alias
-                            .columns
-                            .iter()
-                            .map(|c| c.name.value.clone())
-                            .collect();
-                        let col_meta: Vec<ColMeta> = base_cols
-                            .iter()
-                            .enumerate()
-                            .map(|(i, (name, dtype))| ColMeta {
-                                table: Some(cte_name.clone()),
-                                name: cte_col_names
-                                    .get(i)
-                                    .cloned()
-                                    .unwrap_or_else(|| name.clone()),
-                                dtype: dtype.clone(),
-                            })
-                            .collect();
-                        let mut all_rows = base_rows.clone();
-                        let mut working_rows = base_rows;
-                        const MAX_RECURSION: usize = 1000;
-                        for _iteration in 0..MAX_RECURSION {
-                            // Make current working set available as the CTE
-                            cte_tables.insert(cte_name.clone(), (col_meta.clone(), working_rows));
-                            // Execute recursive part (right side of UNION ALL)
-                            let rec_result = self
-                                .execute_set_expr(*right.clone(), &cte_tables, &[], false)
-                                .await?;
-                            let (_rec_cols, new_rows) = self.select_result_to_rows(rec_result)?;
-                            if new_rows.is_empty() {
-                                break; // fixpoint reached
-                            }
-                            all_rows.extend(new_rows.clone());
-                            working_rows = new_rows;
-                        }
-                        cte_tables.insert(cte_name, (col_meta, all_rows));
-                        continue;
+                    let base_result = self
+                        .execute_cte_set_expr(*left.clone(), &cte_tables)
+                        .await?;
+                    let (base_cols, mut base_rows) = self.select_result_to_rows(base_result)?;
+                    let cte_col_names: Vec<String> = cte
+                        .alias
+                        .columns
+                        .iter()
+                        .map(|c| c.name.value.clone())
+                        .collect();
+                    let col_meta: Vec<ColMeta> = base_cols
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (name, dtype))| ColMeta {
+                            table: Some(cte_name.clone()),
+                            name: cte_col_names
+                                .get(i)
+                                .cloned()
+                                .unwrap_or_else(|| name.clone()),
+                            dtype: dtype.clone(),
+                        })
+                        .collect();
+                    let mut visited = HashSet::new();
+                    if !is_all {
+                        base_rows.retain(|row| visited.insert(row.clone()));
                     }
+                    let mut all_rows = base_rows.clone();
+                    let mut working_rows = base_rows;
+                    const MAX_RECURSION: usize = 1000;
+                    let mut reached_fixpoint = working_rows.is_empty();
+                    for _iteration in 0..MAX_RECURSION {
+                        if reached_fixpoint {
+                            break;
+                        }
+                        cte_tables.insert(cte_name.clone(), (col_meta.clone(), working_rows));
+                        let rec_result = self
+                            .execute_cte_set_expr(*right.clone(), &cte_tables)
+                            .await?;
+                        let (rec_cols, mut new_rows) = self.select_result_to_rows(rec_result)?;
+                        if rec_cols.len() != base_cols.len() {
+                            return Err(ExecError::Unsupported(
+                                "each recursive UNION query must have the same number of columns"
+                                    .into(),
+                            ));
+                        }
+                        if !is_all {
+                            new_rows.retain(|row| visited.insert(row.clone()));
+                        }
+                        reached_fixpoint = new_rows.is_empty();
+                        all_rows.extend(new_rows.clone());
+                        working_rows = new_rows;
+                    }
+                    if !reached_fixpoint {
+                        return Err(ExecError::Unsupported(format!(
+                            "recursive CTE {cte_name} exceeded {MAX_RECURSION} iterations"
+                        )));
+                    }
+                    cte_tables.insert(cte_name, (col_meta, all_rows));
+                    continue;
                 }
 
                 // Non-recursive CTE.
@@ -6600,6 +6661,43 @@ impl Executor {
                 }
             }
             Ok(cte_tables)
+        })
+    }
+
+    // WITH RECURSIVE also permits ordinary, nonrecursive UNION CTEs.
+    // Only unqualified relation names can refer to the CTE itself. This
+    // structural walk is conservative for nested WITH clauses that shadow
+    // the same name; it is not a full lexical CTE name-resolution pass.
+    fn cte_arm_references_name(body: &SetExpr, cte_name: &str) -> bool {
+        ast::visit_relations(body, |relation| {
+            if relation.0.len() == 1
+                && relation.0[0]
+                    .as_ident()
+                    .is_some_and(|ident| ident.value.eq_ignore_ascii_case(cte_name))
+            {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        })
+        .is_break()
+    }
+
+    // Nested SELECTs in either arm must see the same working set and
+    // siblings as the direct SELECT path. Restore scope on errors as well.
+    fn execute_cte_set_expr<'a>(
+        &'a self,
+        body: SetExpr,
+        cte_tables: &'a CteTableMap,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<SelectResult, ExecError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let sess = self.current_session();
+            let saved = std::mem::replace(&mut *sess.active_ctes.write(), cte_tables.clone());
+            let result = self.execute_set_expr(body, cte_tables, &[], false).await;
+            *sess.active_ctes.write() = saved;
+            result
         })
     }
 
@@ -7586,6 +7684,13 @@ impl Executor {
             // so we share behavior with explicit CAST(...) expressions. On
             // parse failure, fall back to the original text — storage will
             // miss the row, the post-scan WHERE filter will catch it.
+            // A timestamptz literal reads its zone (or, bare, the session
+            // TimeZone) the same way a cast does.
+            (Value::Text(text), DataType::TimestampTz) => {
+                super::timestamptz::timestamptz_text_to_instant(text)
+                    .map(Value::TimestampTz)
+                    .unwrap_or_else(|| val.clone())
+            }
             (
                 Value::Text(_),
                 DataType::Int32
@@ -7595,7 +7700,6 @@ impl Executor {
                 | DataType::Numeric
                 | DataType::Date
                 | DataType::Timestamp
-                | DataType::TimestampTz
                 | DataType::Uuid,
             ) => val.cast(target).unwrap_or_else(|_| val.clone()),
             // NUMERIC is exact and stored as text, so an int/float literal never
@@ -7977,6 +8081,9 @@ impl Executor {
         );
         if already_matches {
             return Some(val);
+        }
+        if let (Value::Text(text), DataType::TimestampTz) = (&val, dtype) {
+            return super::timestamptz::timestamptz_text_to_instant(text).map(Value::TimestampTz);
         }
         // Cross-type: use the canonical Value::cast (text→numeric, int→bigint,
         // etc.). Errors are folded into None per the doc-comment contract.
@@ -8719,8 +8826,10 @@ impl Executor {
                 "window functions are not allowed in HAVING".into(),
             ));
         }
-        // Expression-only query: SELECT 1, SELECT 'hello', SELECT 1+1
-        if select.from.is_empty() {
+        // An unfiltered expression-only query can project its one implicit
+        // input row directly. WHERE must use the regular filtering path,
+        // including FALSE/NULL removing that row before projection or aggregates.
+        if select.from.is_empty() && select.selection.is_none() {
             return Ok(SelectResult::Projected(
                 self.execute_select_expressions(&select.projection)?,
             ));
@@ -8930,6 +9039,12 @@ impl Executor {
 
         let has_group_by = matches!(&select.group_by, ast::GroupByExpr::Expressions(exprs, _) if !exprs.is_empty());
 
+        if has_window && (has_aggregates || has_group_by || select.having.is_some()) {
+            return Err(ExecError::Unsupported(
+                "window functions combined with grouping or aggregates".into(),
+            ));
+        }
+
         if has_window {
             // Window function query -- evaluate projection with window context
             Ok(SelectResult::Projected(
@@ -9105,7 +9220,10 @@ impl Executor {
 
         for join in &first.joins {
             // Check for LATERAL derived table
-            if matches!(&join.relation, TableFactor::Derived { lateral: true, .. }) {
+            if matches!(
+                &join.relation,
+                TableFactor::Derived { lateral: true, .. } | TableFactor::UNNEST { .. }
+            ) {
                 let (new_meta, new_rows) = self
                     .execute_lateral_join(
                         &col_meta,
@@ -9385,17 +9503,19 @@ impl Executor {
                         .as_ref()
                         .and_then(|a| a.columns.first())
                         .map(|c| c.name.value.clone());
-                    return self.execute_table_function(
+                    let (mut meta, rows) = self.execute_table_function(
                         &func_name,
                         &arg_values,
                         &label,
                         col_alias.as_deref(),
-                    );
+                    )?;
+                    apply_alias_columns(&mut meta, alias.as_ref())?;
+                    return Ok((meta, rows));
                 }
 
                 // Check CTE first
                 if let Some((meta, rows)) = cte_tables.get(&table_name) {
-                    let relabeled: Vec<ColMeta> = meta
+                    let mut relabeled: Vec<ColMeta> = meta
                         .iter()
                         .map(|c| ColMeta {
                             table: Some(label.clone()),
@@ -9403,6 +9523,7 @@ impl Executor {
                             dtype: c.dtype.clone(),
                         })
                         .collect();
+                    apply_alias_columns(&mut relabeled, alias.as_ref())?;
                     return Ok((relabeled, rows.clone()));
                 }
 
@@ -9565,7 +9686,7 @@ impl Executor {
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| "subquery".into());
                 if let ExecResult::Select { columns, rows } = sub_result {
-                    let col_meta: Vec<ColMeta> = columns
+                    let mut col_meta: Vec<ColMeta> = columns
                         .iter()
                         .map(|(name, dtype)| ColMeta {
                             table: Some(alias_name.clone()),
@@ -9573,6 +9694,7 @@ impl Executor {
                             dtype: dtype.clone(),
                         })
                         .collect();
+                    apply_alias_columns(&mut col_meta, alias.as_ref())?;
                     Ok((col_meta, rows))
                 } else {
                     Err(ExecError::Unsupported("subquery must return rows".into()))
@@ -9602,32 +9724,117 @@ impl Executor {
                     .as_ref()
                     .and_then(|a| a.columns.first())
                     .map(|c| c.name.value.clone());
-                self.execute_table_function(&func_name, &fn_args, &alias_name, col_alias.as_deref())
+                let (mut meta, rows) = self.execute_table_function(
+                    &func_name,
+                    &fn_args,
+                    &alias_name,
+                    col_alias.as_deref(),
+                )?;
+                apply_alias_columns(&mut meta, alias.as_ref())?;
+                Ok((meta, rows))
             }
             TableFactor::UNNEST {
-                alias, array_exprs, ..
+                alias,
+                array_exprs,
+                with_ordinality,
+                with_offset,
+                ..
             } => {
-                let alias_name = alias
-                    .as_ref()
-                    .map(|a| a.name.value.clone())
-                    .unwrap_or_else(|| "unnest".into());
-                let col_meta = vec![ColMeta {
-                    table: Some(alias_name.clone()),
-                    name: "unnest".into(),
-                    dtype: DataType::Text,
-                }];
-                let mut rows = Vec::new();
-                for expr in array_exprs {
-                    if let Ok(Value::Array(vals)) = self.eval_const_expr(expr) {
-                        for v in vals {
-                            rows.push(vec![v]);
-                        }
-                    }
+                if *with_offset {
+                    return Err(ExecError::Unsupported(
+                        "UNNEST WITH OFFSET is not implemented".into(),
+                    ));
                 }
-                Ok((col_meta, rows))
+                self.unnest_rows(
+                    alias.as_ref(),
+                    array_exprs,
+                    *with_ordinality,
+                    Some(&Vec::new()),
+                    &[],
+                )
             }
             _ => Err(ExecError::Unsupported("unsupported table factor".into())),
         }
+    }
+
+    /// PostgreSQL zips multiple UNNEST inputs, padding shorter inputs with
+    /// NULL. Nested array values flatten in storage order; ordinality counts
+    /// emitted rows from one and always has bigint metadata.
+    fn unnest_rows(
+        &self,
+        alias: Option<&ast::TableAlias>,
+        exprs: &[Expr],
+        ordinal: bool,
+        outer_row: Option<&Row>,
+        outer_meta: &[ColMeta],
+    ) -> Result<(Vec<ColMeta>, Vec<Row>), ExecError> {
+        fn flatten(value: Value, values: &mut Vec<Value>) {
+            match value {
+                Value::Array(items) => {
+                    for item in items {
+                        flatten(item, values);
+                    }
+                }
+                value => values.push(value),
+            }
+        }
+        let label = alias
+            .map(|a| a.name.value.clone())
+            .unwrap_or_else(|| "unnest".into());
+        let mut meta = Vec::new();
+        let mut arrays = Vec::new();
+        for expr in exprs {
+            let value = match outer_row {
+                Some(row) => self.eval_row_expr(expr, row, outer_meta)?,
+                None => Value::Null,
+            };
+            let mut dtype = projected_column_type(expr, &value, outer_meta);
+            let mut values = Vec::new();
+            match value {
+                Value::Array(items) => {
+                    for item in items {
+                        flatten(item, &mut values);
+                    }
+                }
+                Value::Null if outer_row.is_none() || matches!(dtype, DataType::Array(_)) => {}
+                _ => {
+                    return Err(ExecError::Unsupported(
+                        "UNNEST requires array arguments".into(),
+                    ));
+                }
+            }
+            while let DataType::Array(element) = dtype {
+                dtype = *element;
+            }
+            meta.push(ColMeta {
+                table: Some(label.clone()),
+                name: "unnest".into(),
+                dtype,
+            });
+            arrays.push(values);
+        }
+        if ordinal {
+            meta.push(ColMeta {
+                table: Some(label),
+                name: "ordinality".into(),
+                dtype: DataType::Int64,
+            });
+        }
+        apply_alias_columns(&mut meta, alias)?;
+        let length = arrays.iter().map(Vec::len).max().unwrap_or(0);
+        let rows = (0..length)
+            .map(|i| {
+                let mut row: Row = arrays
+                    .iter()
+                    .map(|array| array.get(i).cloned().unwrap_or(Value::Null))
+                    .collect();
+                if ordinal {
+                    row.push(Value::Int64(i as i64 + 1));
+                }
+                row
+            })
+            .collect();
+        Ok((meta, rows))
     }
 
     /// Execute a LATERAL join: for each left row, substitute outer references
@@ -9640,6 +9847,55 @@ impl Executor {
         join_operator: &ast::JoinOperator,
         _cte_tables: &CteTableMap,
     ) -> Result<(Vec<ColMeta>, Vec<Row>), ExecError> {
+        if let TableFactor::UNNEST {
+            alias,
+            array_exprs,
+            with_ordinality,
+            with_offset,
+            ..
+        } = right_factor
+        {
+            if *with_offset
+                || matches!(
+                    join_operator,
+                    ast::JoinOperator::Right(_)
+                        | ast::JoinOperator::RightOuter(_)
+                        | ast::JoinOperator::FullOuter(_)
+                )
+            {
+                return Err(ExecError::Unsupported(
+                    "unsupported correlated UNNEST join".into(),
+                ));
+            }
+            let (empty_meta, _) = self.unnest_rows(
+                alias.as_ref(),
+                array_exprs,
+                *with_ordinality,
+                None,
+                left_meta,
+            )?;
+            let mut meta = left_meta.iter().chain(empty_meta.iter()).cloned().collect();
+            let mut rows = Vec::new();
+            for row in left_rows {
+                let (right_meta, right_rows) = self.unnest_rows(
+                    alias.as_ref(),
+                    array_exprs,
+                    *with_ordinality,
+                    Some(row),
+                    left_meta,
+                )?;
+                let (joined_meta, joined) = self.execute_join(
+                    left_meta,
+                    std::slice::from_ref(row),
+                    &right_meta,
+                    &right_rows,
+                    join_operator,
+                )?;
+                meta = joined_meta;
+                rows.extend(joined);
+            }
+            return Ok((meta, rows));
+        }
         let TableFactor::Derived {
             subquery, alias, ..
         } = right_factor
@@ -9672,7 +9928,7 @@ impl Executor {
                 continue;
             };
 
-            let right_meta: Vec<ColMeta> = sub_cols
+            let mut right_meta: Vec<ColMeta> = sub_cols
                 .iter()
                 .map(|(name, dtype)| ColMeta {
                     table: Some(alias_name.clone()),
@@ -9680,6 +9936,7 @@ impl Executor {
                     dtype: dtype.clone(),
                 })
                 .collect();
+            apply_alias_columns(&mut right_meta, alias.as_ref())?;
 
             if result_meta.is_none() {
                 let combined: Vec<ColMeta> =

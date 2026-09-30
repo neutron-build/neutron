@@ -1,7 +1,7 @@
 //! Regression for `snapshot_count`: `COUNT(*)` (and other aggregates) issued
-//! inside an explicit transaction must respect the executing transaction's MVCC
-//! snapshot, exactly like `SELECT *` does. This matches PostgreSQL's snapshot /
-//! REPEATABLE READ semantics (Nucleus runs explicit txns at IsolationLevel::Snapshot).
+//! inside a REPEATABLE READ transaction must respect the executing transaction's
+//! MVCC snapshot, exactly like `SELECT *` does. Plain BEGIN uses READ COMMITTED;
+//! the stable-snapshot regression requests REPEATABLE READ explicitly.
 //!
 //! Two properties must hold inside a `BEGIN ... <no COMMIT yet>` block:
 //!   1. read-your-own-writes — after INSERT/DELETE in the same txn, `COUNT(*)`
@@ -91,8 +91,8 @@ async fn count_repeatable_read_ignores_concurrent_commit() {
     run(&ex, a, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await;
     run(&ex, a, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)").await;
 
-    // A opens a txn and takes its snapshot via a first read.
-    run(&ex, a, "BEGIN").await;
+    // Request a stable snapshot through SQL; plain BEGIN is READ COMMITTED.
+    run(&ex, a, "BEGIN ISOLATION LEVEL REPEATABLE READ").await;
     let before = count_in(&ex, a).await;
     assert_eq!(before, 2);
 

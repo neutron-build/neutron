@@ -45,8 +45,9 @@ rejects** rather than silently using binary ordering.
 
 ## Constraints
 
-`PRIMARY KEY`, `UNIQUE`, `CHECK`, `NOT NULL` and `FOREIGN KEY` are immediate
-and persist across restart.
+`PRIMARY KEY`, `UNIQUE`, `CHECK` and `NOT NULL` are immediate and persist
+across restart. Foreign keys are immediate unless declared DEFERRABLE; see
+[deferred foreign keys](#deferred-foreign-keys-and-generated-writes) below.
 
 Foreign keys:
 
@@ -56,7 +57,7 @@ Foreign keys:
 - Cascades are preflighted as one logical operation and enforce the child
   table's full constraint **and RLS** envelope.
 
-Rejected explicitly rather than silently ignored: deferred constraints,
+Rejected explicitly rather than silently ignored: deferred PRIMARY KEY/UNIQUE,
 `MATCH FULL`, `MATCH PARTIAL`, `UNIQUE NULLS NOT DISTINCT`, and dependency
 `DROP ... CASCADE`.
 
@@ -96,3 +97,131 @@ persisted across restart — since 2026-08-23), and the executor enforces it on
 row-returning paths. See
 [`../RLS_SECURITY.md`](../RLS_SECURITY.md) for the predicate forms and
 coverage; the masking DDL surface is listed in `SQL_REFERENCE.md`.
+
+### Transaction modes and simple-query messages
+
+`BEGIN` applies READ COMMITTED by default, or the requested supported isolation
+level, to the storage engine. READ ONLY refuses DML, DDL, row locks and mutating
+scalar functions. `SET TRANSACTION` changes current modes before queries;
+`SET SESSION CHARACTERISTICS AS TRANSACTION` sets transaction-scoped session
+defaults. Engines that cannot supply the requested isolation level refuse it.
+The buffered disk engine supports READ COMMITTED only. REPEATABLE READ,
+SNAPSHOT and SERIALIZABLE are refused because other sessions' writers do not
+all participate in its locking protocol. Higher isolation levels require the
+MVCC engine. READ UNCOMMITTED currently uses and reports READ COMMITTED. Generic
+`SET transaction_isolation` and `SET transaction_read_only` are refused; use
+the dedicated `SET TRANSACTION` syntax.
+
+With the server feature, one multi-statement simple-query message has one
+implicit data transaction. An error or cancellation rolls its data back;
+COMMIT or ROLLBACK inside the message ends that block, and BEGIN converts it
+to an explicit transaction. Rollback keeps recovery images until restoration
+finishes, including cancellation during cleanup. Without the server feature,
+implicit message scoping covers settings only.
+
+DDL catalog changes remain outside data rollback. Do not use this behavior as
+an atomic-migration guarantee. PostgreSQL advisory-lock functions, `pg_sleep`
+and SQL `pg_cancel_backend` remain unavailable. Wire cancellation and row-lock
+timeouts have their existing surfaces; a deadlock timeout is not evidence of
+PostgreSQL deadlock detection. Cross-model rollback covers only the stores
+listed in MODEL_SEMANTICS.md, not every model in a message.
+
+### Arrays, temporal output and bytea
+
+Array casts and writes convert each leaf to the declared type. Empty arrays
+and arrays containing only NULL retain their declared result type. Array
+literals preserve escaped NULL text and escaped whitespace; ragged shapes,
+explicit dimension decorations and mixed numeric element types are refused.
+Stored multidimensional arrays, interval arrays and vector arrays are refused
+because the tuple codec cannot preserve their full representation. Binary
+array parameters support one dimension with lower bound 1; malformed payloads,
+other lower bounds and mismatched element OIDs are refused.
+
+TIMESTAMPTZ casts, scalar and array writes and output use the session time zone.
+DATE assignments use midnight in that zone. Ambiguous
+or nonexistent bare local times are refused; use an explicit offset. EXTRACT
+and DATE_PART preserve fractional seconds and epoch fractions for timestamp
+values. EXTRACT returns NUMERIC and DATE_PART returns DOUBLE PRECISION,
+including empty-result metadata. DECODE returns raw BYTEA for hex/base64 input,
+and ENCODE preserves those bytes. Both functions return NULL when either
+argument is NULL.
+
+These fixes do not establish full PostgreSQL scalar parity. Date infinity,
+enum declaration-order sorting and arbitrary numeric precision/scale remain
+limits. Large bare numeric literals may pass through floating-point parsing;
+use an exact text-to-NUMERIC cast within the engine's supported decimal range.
+
+### Deferred foreign keys and generated writes
+
+Deferred foreign keys are checked at COMMIT and when made IMMEDIATE. Checks
+remain recoverable across savepoints, and ROLLBACK TO restores constraint modes.
+Schema changes are refused while deferred checks remain pending; finish or
+roll back the transaction before changing the schema. Deferred UNIQUE and
+PRIMARY KEY enforcement is not supported.
+
+Foreign-key CASCADE, SET NULL and SET DEFAULT updates recompute stored generated
+columns and validate their resulting constraints before writing child rows.
+
+Stored generation expressions use a bounded row-expression language: arithmetic,
+comparisons, NULL tests, CASE, substring/trim, and the scalar builtins ABS,
+LOWER/UPPER, LENGTH/CHAR_LENGTH/CHARACTER_LENGTH, OCTET_LENGTH/BIT_LENGTH,
+TRIM/LTRIM/RTRIM, REPLACE, CONCAT/CONCAT_WS, COALESCE/NULLIF, GREATEST/LEAST,
+ROUND/CEIL/CEILING/FLOOR. UDFs, qualified function names, unknown or stateful
+functions, subqueries, windows, casts and other unverified expression forms are
+refused. This is a conservative subset; it does not implement PostgreSQL's
+function-volatility catalog. Refusal SQLSTATEs depend on the validation error;
+42P17 parity is not promised.
+
+Column default parse/evaluation errors propagate instead of becoming NULL;
+int8-to-int4 defaults reject overflow. Logical identity dumps retain the owned
+sequence's definition and current position. Final integrated regression and
+live verification of these column changes is pending; this source assessment
+is not an end-to-end compatibility certification.
+
+### Query behavior and explicit limits
+
+JSONB_AGG retains SQL NULL inputs as JSON null, returns SQL NULL for an empty
+input, and supports ordering, filtering and DISTINCT. JSON numbers retain
+number identity and decimal digits instead of becoming strings through an
+f64 conversion. JSONB text uses PostgreSQL spacing and key ordering; exponent
+expansion is bounded at 16,384 rendered bytes; larger expansions retain exact scientific notation. JSON_OBJECT_AGG is refused
+because JSONB storage cannot preserve JSON duplicate keys.
+
+Derived-table column alias lists rename columns positionally and reject lists
+longer than the source projection. Scalar expressions can wrap ROW_NUMBER,
+RANK and DENSE_RANK; empty wrapped results retain inferred types. Window
+functions combined with grouping, aggregates or HAVING are refused.
+UPDATE FROM and DELETE USING are refused before mutation. Row-value comparison
+remains unsupported.
+
+COLUMNAR_SUM, COLUMNAR_AVG, COLUMNAR_MIN and COLUMNAR_MAX require numeric stored
+values. Text or untyped inputs are refused rather than silently returning zero
+or NULL. Cast COLUMNAR_INSERT inputs explicitly; COLUMNAR_COUNT still reports
+the stored row count. COLUMNAR_INSERT is refused inside a SQL transaction
+because the store has no rollback mechanism.
+
+### Catalog metadata
+
+Catalog relations use a coherent snapshot of live schema objects. Declared
+varchar, numeric and array modifiers survive introspection and persistence;
+dropping a column clears its declaration before its identifier can be reused.
+Independent indexes are not inferred to belong to constraints merely because
+their columns match. Generated expressions and identity flags reflect live
+column metadata in pg_attribute, pg_attrdef and information_schema.columns.
+Named-user column privilege queries check the named role's table-level grants.
+
+This remains a compatibility catalog. Raw int2[] and pg_index vector fields use
+the engine's int4[] representation; this does not establish PostgreSQL
+int2vector/oidvector wire-type parity. Integer-vector casts accept
+space-separated catalog values. UNNEST supports typed arrays and WITH ORDINALITY
+for the CLI and Studio catalog queries, including implicit lateral references
+and LEFT JOIN padding. Scalar NULL arguments are refused. Unsupported
+PostgreSQL catalog features are not evidence of support for the corresponding
+engine feature.
+
+JSONB numeric equality and hashing compare exact values recursively, so numeric
+scale and exponent notation do not split DISTINCT or join keys. Display retains
+scale separately. Scientific JSONB numbers expand without rounding when the
+result fits 16,384 bytes; larger expansions retain exact scientific notation.
+Internal ordering is consistent with these equality classes; full PostgreSQL
+JSONB ordering across unequal values is not established.

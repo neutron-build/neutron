@@ -2,20 +2,23 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/neutron-build/neutron/cli/internal/db"
 	"github.com/neutron-build/neutron/cli/internal/inspect"
 )
 
-// TestMCPNucleusLive exercises the read-only guard where it is the ONLY
-// enforcement: Nucleus does not apply READ ONLY (capability report
-// txn.read_only_rejects_writes), and its models are written through
-// ordinary SELECTs. Runs against a disposable engine named by
+// TestMCPNucleusLive exercises the lexical guard in addition to the
+// measured engine READ ONLY protection. Specialty models are written through
+// ordinary SELECTs, so retain the guard for unverified mutation paths.
+// Runs against a disposable engine named by
 // NEUTRON_E2E_NUCLEUS_URL; skipped when unset.
 func TestMCPNucleusLive(t *testing.T) {
 	nurl := os.Getenv("NEUTRON_E2E_NUCLEUS_URL")
@@ -203,13 +206,10 @@ func TestMCPNucleusLive(t *testing.T) {
 	_ = oracle.Exec(ctx, "SELECT KV_DEL($1)", key)
 }
 
-// TestMCPNucleusWrappedMutatorGapIsDocumented pins a documented limitation
-// (review 2): Nucleus applies no READ ONLY and has no rollback or connection
-// reset covering the guard, so a view or routine that wraps a mutating
-// function is not caught by the name check and its write persists. The test
-// asserts the gap exists AND that the tool says so; if the engine or guard
-// ever closes it, this fails and the docs should be updated to match.
-func TestMCPNucleusWrappedMutatorGapIsDocumented(t *testing.T) {
+// READ ONLY protects NEXTVAL through these measured wrapper forms. Each
+// raw check begins a clean transaction: an old aborted state must not mask
+// whether the statement itself was refused before changing the sequence.
+func TestMCPNucleusReadOnlyRefusesWrappedNextval(t *testing.T) {
 	nurl := os.Getenv("NEUTRON_E2E_NUCLEUS_URL")
 	if nurl == "" {
 		if os.Getenv("NEUTRON_NUCLEUS_LIVE_REQUIRED") == "1" {
@@ -229,32 +229,78 @@ func TestMCPNucleusWrappedMutatorGapIsDocumented(t *testing.T) {
 	}
 	defer srv.Close()
 
-	name := fmt.Sprintf("x06gap_%d", time.Now().UnixNano())
-	seq, view := name+"_seq", name+"_v"
-	for _, stmt := range []string{"CREATE SEQUENCE " + seq, fmt.Sprintf("CREATE VIEW %s AS SELECT NEXTVAL('%s') AS n", view, seq)} {
-		if err := oracle.Exec(ctx, stmt); err != nil {
-			t.Fatal(err)
-		}
+	for _, kind := range []string{"view", "subquery", "where", "tool-view"} {
+		t.Run(kind, func(t *testing.T) {
+			name := fmt.Sprintf("x06readonly_%d", time.Now().UnixNano())
+			seq, view := name+"_seq", name+"_v"
+			if err := oracle.Exec(ctx, "CREATE SEQUENCE "+seq); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := oracle.Exec(ctx, "DROP SEQUENCE "+seq); err != nil {
+					t.Error(err)
+				}
+			}()
+			statement := fmt.Sprintf("SELECT (SELECT NEXTVAL('%s')) AS n", seq)
+			switch kind {
+			case "view", "tool-view":
+				if err := oracle.Exec(ctx, fmt.Sprintf("CREATE VIEW %s AS SELECT NEXTVAL('%s') AS n", view, seq)); err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					if err := oracle.Exec(ctx, "DROP VIEW "+view); err != nil {
+						t.Error(err)
+					}
+				}()
+				statement = "SELECT * FROM " + view
+			case "where":
+				statement = fmt.Sprintf("SELECT 1 AS n WHERE NEXTVAL('%s') > 0", seq)
+			}
+			if kind == "tool-view" {
+				_, err := callTool(ctx, srv.env, "query_sql", map[string]any{"sql": statement})
+				// pgx's extended path can expose the subsequent aborted-transaction
+				// refusal after Describe encounters the protected NEXTVAL. The raw
+				// checks above establish the original 25006 and the effect check below
+				// independently establishes that this tool call did not advance it.
+				if err == nil || (!strings.Contains(err.Error(), "25006") && !strings.Contains(err.Error(), "25P02")) {
+					t.Fatalf("wrapped NEXTVAL must be refused by READ ONLY, got %v", err)
+				}
+				if _, err := callTool(ctx, srv.env, "query_sql", map[string]any{"sql": "SELECT 1 AS n"}); err != nil {
+					t.Fatalf("clean read after refusal: %v", err)
+				}
+			} else {
+				conn, err := oracle.Acquire(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				tx, err := conn.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+				if err != nil {
+					conn.Release()
+					t.Fatal(err)
+				}
+				_, queryErr := tx.Exec(ctx, statement, pgx.QueryExecModeSimpleProtocol)
+				rollbackErr := tx.Rollback(ctx)
+				conn.Release()
+				if rollbackErr != nil {
+					t.Fatal(rollbackErr)
+				}
+				var pgErr *pgconn.PgError
+				if !errors.As(queryErr, &pgErr) || pgErr.Code != "25006" {
+					t.Fatalf("fresh READ ONLY must refuse NEXTVAL with 25006, got %v", queryErr)
+				}
+			}
+			var next int64
+			if err := oracle.QueryRow(ctx, fmt.Sprintf("SELECT NEXTVAL('%s')", seq)).Scan(&next); err != nil {
+				t.Fatal(err)
+			}
+			if next != 1 {
+				t.Fatalf("refused NEXTVAL changed sequence: next=%d, want1", next)
+			}
+		})
 	}
-	t.Cleanup(func() {
-		_ = oracle.Exec(context.Background(), "DROP VIEW IF EXISTS "+view)
-		_ = oracle.Exec(context.Background(), "DROP SEQUENCE IF EXISTS "+seq)
-	})
-
-	if _, err := callTool(ctx, srv.env, "query_sql", map[string]any{"sql": "SELECT * FROM " + view}); err != nil {
-		t.Fatalf("gap closed? the wrapped mutator is now refused (%v): update the Nucleus limitation docs", err)
-	}
-	var next int64
-	if err := oracle.QueryRow(ctx, fmt.Sprintf("SELECT NEXTVAL('%s')", seq)).Scan(&next); err != nil {
-		t.Fatal(err)
-	}
-	if next < 2 {
-		t.Fatalf("gap closed? the wrapped NEXTVAL did not persist (next=%d): update the Nucleus limitation docs", next)
-	}
-
-	for _, s := range toolSpecs() {
-		if s.def.Name == "query_sql" && !strings.Contains(s.def.Description, "best-effort") {
-			t.Fatalf("query_sql description must state the Nucleus read-only default is best-effort: %q", s.def.Description)
+	for _, spec := range toolSpecs() {
+		if spec.def.Name == "query_sql" && (!strings.Contains(spec.def.Description, "READ ONLY") || !strings.Contains(spec.def.Description, "unverified specialty")) {
+			t.Fatalf("query_sql must describe bounded READ ONLY protection: %q", spec.def.Description)
 		}
 	}
 }

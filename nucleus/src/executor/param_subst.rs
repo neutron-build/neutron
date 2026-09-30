@@ -13,13 +13,24 @@ use crate::types::Value;
 /// Walk `stmt` in place, replacing every `$N` placeholder with the corresponding
 /// literal value from `params` (1-indexed: `$1` → `params[0]`).
 pub fn substitute_params_in_stmt(stmt: &mut Statement, params: &[Value]) {
-    let mut substitutor = ParamSubstitutor { params };
+    substitute_params_with_types(stmt, params, &[]);
+}
+
+/// Wire parameters may carry authoritative array types even without a SQL
+/// cast. Keep their literal text until the executor applies session semantics.
+pub fn substitute_params_with_types(
+    stmt: &mut Statement,
+    params: &[Value],
+    types: &[Option<ast::DataType>],
+) {
+    let mut substitutor = ParamSubstitutor { params, types };
     // VisitorMut::visit walks all nested expressions automatically.
     let _ = stmt.visit(&mut substitutor);
 }
 
 struct ParamSubstitutor<'a> {
     params: &'a [Value],
+    types: &'a [Option<ast::DataType>],
 }
 
 impl<'a> VisitorMut for ParamSubstitutor<'a> {
@@ -34,6 +45,15 @@ impl<'a> VisitorMut for ParamSubstitutor<'a> {
             && idx <= self.params.len()
         {
             *expr = nucleus_value_to_ast(&self.params[idx - 1]);
+            if let Some(Some(target)) = self.types.get(idx - 1) {
+                *expr = Expr::Cast {
+                    kind: ast::CastKind::DoubleColon,
+                    expr: Box::new(expr.clone()),
+                    data_type: target.clone(),
+                    format: None,
+                    array: false,
+                };
+            }
         }
         ControlFlow::Continue(())
     }

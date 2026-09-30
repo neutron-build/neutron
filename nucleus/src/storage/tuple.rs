@@ -13,6 +13,46 @@
 
 use crate::types::{DataType, Row, Value};
 
+/// SQL writes coerce array leaves before persistence. A physical tag for a
+/// different declared leaf type is corruption, not a request for SQL casting.
+fn array_tag_matches_declared_type(tag: u8, element_type: &DataType) -> bool {
+    if tag == 5 {
+        return true;
+    } // NULL is valid for every declared leaf type.
+    let expected = match element_type {
+        DataType::Bool => 0,
+        DataType::Int32 => 1,
+        DataType::Int64 => 2,
+        DataType::Float64 => 3,
+        // Temporal, numeric and binary leaves use the encoder's text fallback
+        // and restore their declared logical type after decoding that text.
+        _ => 4,
+    };
+    tag == expected
+}
+
+/// Restore a typed array leaf without accepting a physical representation
+/// that the encoder cannot reproduce. SQL input casting accepts aliases, but
+/// persisted tuple decoding must not normalize damaged text into another value.
+fn restore_array_leaf(item: Value, element_type: &DataType) -> Option<Value> {
+    if let Value::Text(raw) = &item {
+        let restored = if matches!(element_type, DataType::Numeric) {
+            // Retain an exact, validated stored decimal spelling, including
+            // scale; the ordinary SQL cast would normalize trailing zeroes.
+            crate::types::parse_numeric(raw).ok()?;
+            Value::Numeric(raw.clone())
+        } else {
+            item.cast(element_type).ok()?
+        };
+        if restored.to_string() != *raw {
+            return None;
+        }
+        Some(restored)
+    } else {
+        item.cast(element_type).ok()
+    }
+}
+
 /// Serialize a row into bytes given the column types.
 pub fn serialize_row(row: &Row, col_types: &[DataType]) -> Vec<u8> {
     debug_assert_eq!(row.len(), col_types.len());
@@ -364,7 +404,7 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                 row.push(Value::Bytea(data[pos..pos + len].to_vec()));
                 pos += len;
             }
-            DataType::Array(_) => {
+            DataType::Array(element_type) => {
                 // Deserialize array: [total_len: u32] [elem_count: u32] [elements...]
                 if pos + 4 > data.len() {
                     return None;
@@ -392,6 +432,9 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                     }
                     let tag = data[pos];
                     pos += 1;
+                    if !array_tag_matches_declared_type(tag, element_type) {
+                        return None;
+                    }
                     match tag {
                         0 => {
                             // Bool
@@ -489,7 +532,11 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                 if pos != arr_end {
                     return None;
                 }
-                row.push(Value::Array(elems));
+                let typed = elems
+                    .into_iter()
+                    .map(|item| restore_array_leaf(item, element_type))
+                    .collect::<Option<Vec<_>>>()?;
+                row.push(Value::Array(typed));
             }
             DataType::Vector(_) => {
                 // Deserialize packed floats.
@@ -900,7 +947,7 @@ fn decode_column_at(data: &[u8], pos: usize, dtype: &DataType) -> Option<Value> 
             }
             Some(Value::Bytea(data[start..start + len].to_vec()))
         }
-        DataType::Array(_) => {
+        DataType::Array(element_type) => {
             if pos + 4 > data.len() {
                 return None;
             }
@@ -939,6 +986,9 @@ fn decode_column_at(data: &[u8], pos: usize, dtype: &DataType) -> Option<Value> 
                 }
                 let tag = data[apos];
                 apos += 1;
+                if !array_tag_matches_declared_type(tag, element_type) {
+                    return None;
+                }
                 match tag {
                     0 => {
                         if apos >= arr_end {
@@ -1026,7 +1076,11 @@ fn decode_column_at(data: &[u8], pos: usize, dtype: &DataType) -> Option<Value> 
             if apos != arr_end {
                 return None;
             }
-            Some(Value::Array(elems))
+            let typed = elems
+                .into_iter()
+                .map(|item| restore_array_leaf(item, element_type))
+                .collect::<Option<Vec<_>>>()?;
+            Some(Value::Array(typed))
         }
         DataType::Vector(_) => {
             // The stored count is authoritative; the declared dimension is not
@@ -1548,10 +1602,133 @@ mod tests {
         // And the honest case still decodes, so the guard is not just "always
         // refuse arrays".
         let good = serialize_row(
-            &vec![Value::Array(vec![Value::Text("a".into()), Value::Int32(2)])],
+            &vec![Value::Array(vec![
+                Value::Text("a".into()),
+                Value::Text("2".into()),
+            ])],
             &types,
         );
         assert!(deserialize_row(&good, &types).is_some());
         assert!(deserialize_row_projected(&good, &types, &[0]).is_some());
+    }
+}
+
+#[cfg(test)]
+mod x09_typed_array_roundtrip {
+    use super::*;
+
+    #[test]
+    fn x09_flat_arrays_retain_leaf_types_in_full_and_projected_decoding() {
+        for (dtype, value) in [
+            (DataType::TimestampTz, Value::TimestampTz(1234567)),
+            (DataType::Date, Value::Date(42)),
+            (DataType::Numeric, Value::Numeric("1234567890.25".into())),
+            (DataType::Bytea, Value::Bytea(vec![0, 255, 42])),
+        ] {
+            let types = vec![DataType::Int32, DataType::Array(Box::new(dtype))];
+            let row = vec![Value::Int32(7), Value::Array(vec![value, Value::Null])];
+            let bytes = serialize_row(&row, &types);
+            assert_eq!(deserialize_row(&bytes, &types), Some(row.clone()));
+            assert_eq!(
+                deserialize_row_projected(&bytes, &types, &[1]),
+                Some(vec![row[1].clone()])
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod x09_array_physical_tag_corruption {
+    use super::*;
+
+    #[test]
+    fn x09_array_same_width_wrong_tag_is_refused_in_both_read_paths() {
+        for (dtype, leaf, original_tag, wrong_tag) in [
+            (DataType::Float64, Value::Float64(1.5), 3, 2),
+            (DataType::Int64, Value::Int64(42), 2, 3),
+        ] {
+            let types = vec![DataType::Int32, DataType::Array(Box::new(dtype))];
+            let row = vec![Value::Int32(7), Value::Array(vec![leaf, Value::Null])];
+            let clean = serialize_row(&row, &types);
+            assert_eq!(deserialize_row(&clean, &types), Some(row.clone()));
+            assert_eq!(
+                deserialize_row_projected(&clean, &types, &[1]),
+                Some(vec![row[1].clone()])
+            );
+            // Bitmap (1), integer prefix column (4), array byte span (4),
+            // element count (4): the first element's physical tag is byte13.
+            assert_eq!(clean[13], original_tag);
+            let mut corrupt = clean;
+            corrupt[13] = wrong_tag;
+            assert_eq!(deserialize_row(&corrupt, &types), None);
+            assert_eq!(deserialize_row_projected(&corrupt, &types, &[1]), None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod x09_array_fallback_corruption {
+    use super::*;
+
+    #[test]
+    fn x09_array_fallback_text_must_preserve_its_physical_representation() {
+        for (dtype, leaf, needle, replacement) in [
+            (
+                DataType::Bytea,
+                Value::Bytea(vec![0, 255, 42]),
+                "\\x00ff2a",
+                b'y',
+            ),
+            (
+                DataType::TimestampTz,
+                Value::TimestampTz(-42),
+                "1999-12-31 23:59:59.999958+00",
+                b'1',
+            ),
+        ] {
+            let types = vec![DataType::Int32, DataType::Array(Box::new(dtype))];
+            let row = vec![Value::Int32(7), Value::Array(vec![leaf, Value::Null])];
+            let clean = serialize_row(&row, &types);
+            assert_eq!(deserialize_row(&clean, &types), Some(row.clone()));
+            assert_eq!(
+                deserialize_row_projected(&clean, &types, &[1]),
+                Some(vec![row[1].clone()])
+            );
+            let start = clean
+                .windows(needle.len())
+                .position(|w| w == needle.as_bytes())
+                .unwrap();
+            let mut corrupt = clean;
+            let offset = if replacement == b'y' {
+                1
+            } else {
+                needle.len() - 1
+            };
+            corrupt[start + offset] = replacement;
+            assert_eq!(deserialize_row(&corrupt, &types), None);
+            assert_eq!(deserialize_row_projected(&corrupt, &types, &[1]), None);
+        }
+    }
+
+    #[test]
+    fn x09_array_numeric_restoration_retains_exact_stored_scale() {
+        let types = vec![
+            DataType::Int32,
+            DataType::Array(Box::new(DataType::Numeric)),
+        ];
+        let clean = serialize_row(
+            &vec![
+                Value::Int32(7),
+                Value::Array(vec![Value::Numeric("1.00".into()), Value::Null]),
+            ],
+            &types,
+        );
+        let restored = deserialize_row(&clean, &types).unwrap();
+        assert_eq!(restored[1].to_string(), "{1.00,NULL}");
+        assert_eq!(serialize_row(&restored, &types), clean);
+        assert_eq!(
+            deserialize_row_projected(&clean, &types, &[1]),
+            Some(vec![restored[1].clone()])
+        );
     }
 }

@@ -206,7 +206,10 @@ impl Executor {
             Expr::Cast {
                 expr, data_type, ..
             } => {
-                let val = self.eval_const_expr(expr)?;
+                let val = match numeric_literal_text(expr, data_type) {
+                    Some(text) => Value::Text(text),
+                    None => self.eval_const_expr(expr)?,
+                };
                 self.eval_cast(val, data_type)
             }
             Expr::Function(func) => {
@@ -354,7 +357,7 @@ impl Executor {
         let result = self.eval_json_arrow(left, key)?;
         match result {
             Value::Jsonb(serde_json::Value::String(s)) => Ok(Value::Text(s)),
-            Value::Jsonb(v) => Ok(Value::Text(v.to_string())),
+            Value::Jsonb(v) => Ok(Value::Text(crate::types::jsonb_text(&v))),
             Value::Null => Ok(Value::Null),
             other => Ok(Value::Text(other.to_string())),
         }
@@ -414,7 +417,7 @@ impl Executor {
         let result = self.eval_json_path_arrow(left, path)?;
         match result {
             Value::Jsonb(serde_json::Value::String(s)) => Ok(Value::Text(s)),
-            Value::Jsonb(v) => Ok(Value::Text(v.to_string())),
+            Value::Jsonb(v) => Ok(Value::Text(crate::types::jsonb_text(&v))),
             Value::Null => Ok(Value::Null),
             other => Ok(Value::Text(other.to_string())),
         }
@@ -1064,13 +1067,16 @@ impl Executor {
                 };
                 match &ts.data_type {
                     ast::DataType::Timestamp(_, tz) => {
-                        let timestamp =
-                            crate::types::parse_timestamp(&s).map_err(ExecError::Runtime)?;
                         if matches!(tz, ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::Tz) {
-                            local_timestamp_at_time_zone(timestamp, self.session_time_zone()?)
-                                .map(Value::TimestampTz)
+                            super::timestamptz::parse_timestamptz_text(
+                                &s,
+                                self.session_time_zone()?,
+                            )
+                            .map(Value::TimestampTz)
                         } else {
-                            Ok(Value::Timestamp(timestamp))
+                            crate::types::parse_timestamp(&s)
+                                .map(Value::Timestamp)
+                                .map_err(ExecError::Runtime)
                         }
                     }
                     ast::DataType::TimestampNtz(_) => crate::types::parse_timestamp(&s)
@@ -1200,7 +1206,10 @@ impl Executor {
             Expr::Cast {
                 expr, data_type, ..
             } => {
-                let val = self.eval_row_expr(expr, row, col_meta)?;
+                let val = match numeric_literal_text(expr, data_type) {
+                    Some(text) => Value::Text(text),
+                    None => self.eval_row_expr(expr, row, col_meta)?,
+                };
                 self.eval_cast(val, data_type)
             }
             Expr::InList {
@@ -1475,7 +1484,28 @@ impl Executor {
                             ))),
                         }
                     }
-                    Value::Timestamp(ts) | Value::TimestampTz(ts) => {
+                    Value::Timestamp(_) | Value::TimestampTz(_) => {
+                        // The calendar fields of a timestamptz are those of
+                        // its wall clock in the session zone; the epoch is the
+                        // instant itself.
+                        let (ts, instant) = match val {
+                            Value::TimestampTz(instant) => (
+                                timestamptz_at_time_zone(instant, self.session_time_zone()?)?,
+                                instant,
+                            ),
+                            Value::Timestamp(ts) => (ts, ts),
+                            _ => unreachable!(),
+                        };
+                        if field_str == "second" || field_str == "epoch" {
+                            let micros = if field_str == "second" {
+                                i128::from(ts.rem_euclid(60_000_000))
+                            } else {
+                                i128::from(instant) + 946_684_800_000_000i128
+                            };
+                            return Ok(Value::Numeric(
+                                rust_decimal::Decimal::from_i128_with_scale(micros, 6).to_string(),
+                            ));
+                        }
                         let total_secs = ts.div_euclid(1_000_000);
                         let days = total_secs.div_euclid(86400) as i32;
                         let time_secs = total_secs.rem_euclid(86400);
@@ -1492,7 +1522,9 @@ impl Executor {
                                 let jan1 = crate::types::ymd_to_days(y, 1, 1);
                                 Ok(Value::Int32(days - jan1 + 1))
                             }
-                            "epoch" => Ok(Value::Int64(total_secs + PG_EPOCH_OFFSET_SECS)),
+                            "epoch" => Ok(Value::Int64(
+                                instant.div_euclid(1_000_000) + PG_EPOCH_OFFSET_SECS,
+                            )),
                             _ => Err(ExecError::Unsupported(format!(
                                 "EXTRACT({field_str}) from timestamp"
                             ))),
@@ -1536,6 +1568,7 @@ impl Executor {
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported(format!("EXTRACT from {val:?}"))),
                 }
+                .and_then(|value| value.cast(&DataType::Numeric).map_err(ExecError::Runtime))
             }
             // -- IS DISTINCT FROM --
             Expr::IsDistinctFrom(left, right) => {
@@ -1634,6 +1667,7 @@ impl Executor {
                 for e in elem {
                     vals.push(self.eval_row_expr(e, row, col_meta)?);
                 }
+                crate::types::validate_array_shape(&vals).map_err(ExecError::Runtime)?;
                 Ok(Value::Array(vals))
             }
             // -- Subquery expressions (with correlated subquery support) --
@@ -1708,6 +1742,23 @@ impl Executor {
                                 }
                             };
                             let key = self.eval_row_expr(key_expr, row, col_meta)?;
+                            // `arr[i]` is 1-based; out of range is NULL.
+                            if let Value::Array(items) = &base {
+                                let index = match &key {
+                                    Value::Int32(n) => Some(i64::from(*n)),
+                                    Value::Int64(n) => Some(*n),
+                                    Value::Null => None,
+                                    _ => {
+                                        return Err(ExecError::Runtime(
+                                            "array subscript must have type integer".into(),
+                                        ));
+                                    }
+                                };
+                                return Ok(index
+                                    .and_then(|i| usize::try_from(i - 1).ok())
+                                    .and_then(|i| items.get(i).cloned())
+                                    .unwrap_or(Value::Null));
+                            }
                             self.eval_json_arrow(&base, &key)
                         }
                         // Composite field access `(expr).field` — PostgreSQL
@@ -1755,8 +1806,7 @@ impl Executor {
     /// snapshot; fixed system-catalog OIDs resolve through the static map.
     fn regclass_name(&self, oid: i32) -> Option<String> {
         if oid >= 16384 {
-            let tables = self.catalog.list_tables_sync()?;
-            return tables.get((oid - 16384) as usize).map(|t| t.name.clone());
+            return self.regclass_by_oid(oid);
         }
         match oid {
             1247 => Some("pg_type".into()),
@@ -1774,6 +1824,18 @@ impl Executor {
     }
 
     pub(super) fn eval_cast(&self, val: Value, target: &ast::DataType) -> Result<Value, ExecError> {
+        let cast = self.eval_cast_to_type(val, target)?;
+        // An explicit cast to `varchar(n)` / `char(n)` cuts to n characters
+        // instead of failing (only a stored value is an error, SQLSTATE 22001).
+        match (crate::sql::declared_max_len(target), cast) {
+            (Some(limit), Value::Text(text)) if text.chars().count() > limit as usize => {
+                Ok(Value::Text(text.chars().take(limit as usize).collect()))
+            }
+            (_, cast) => Ok(cast),
+        }
+    }
+
+    fn eval_cast_to_type(&self, val: Value, target: &ast::DataType) -> Result<Value, ExecError> {
         // Casting NULL yields NULL of the target type, for EVERY target. This
         // has to be answered before the per-type arms because most of them
         // reject anything they cannot recognise, and `Value::Null` is not
@@ -1802,17 +1864,13 @@ impl Executor {
             // meta-command needs.
             ast::DataType::Regclass => Ok(match &val {
                 Value::Text(s) => regclass_oid(s).map(Value::Int32).unwrap_or_else(|| {
-                    // User table: resolve the synthetic OID (16384 + catalog
-                    // position — the same assignment the virtual pg_catalog
-                    // arms use). Quotes are stripped wholesale: real Nucleus
-                    // names never contain '"', but introspection SQL passes
-                    // spellings like '"public"."post_tags"'.
-                    let bare = s.replace('"', "");
-                    let bare = bare.strip_prefix("public.").unwrap_or(&bare);
-                    self.catalog
-                        .list_tables_sync()
-                        .and_then(|ts| ts.iter().position(|t| t.name == bare))
-                        .map(|i| Value::Int32(16384 + i as i32))
+                    // User relation: the OID is derived from the object's kind
+                    // and name (see pg_catalog.rs). Quotes are stripped
+                    // wholesale: real Nucleus names never contain '"', but
+                    // introspection SQL passes spellings like
+                    // '"public"."post_tags"'.
+                    self.regclass_by_name(s)
+                        .map(Value::Int32)
                         .unwrap_or(Value::Null)
                 }),
                 // OID -> regclass renders as the relation NAME (Postgres
@@ -1829,6 +1887,33 @@ impl Executor {
                     .unwrap_or(Value::Int32(*n as i32)),
                 _ => Value::Null,
             }),
+            // ::oid and ::name. sqlparser has no first-class OID/NAME, so they
+            // arrive as custom types. An OID is an unsigned 32-bit number,
+            // held in the engine's Int32; a relation name (what
+            // `regclass::text` produced) resolves to the relation's OID.
+            ast::DataType::Custom(name, _) if name.to_string().eq_ignore_ascii_case("oid") => {
+                match &val {
+                    Value::Int32(_) => Ok(val),
+                    Value::Int64(n) => u32::try_from(*n)
+                        .map(|u| Value::Int32(u as i32))
+                        .map_err(|_| ExecError::Runtime("OID out of range".into())),
+                    Value::Text(s) => match s.trim().parse::<i64>() {
+                        Ok(n) => u32::try_from(n)
+                            .map(|u| Value::Int32(u as i32))
+                            .map_err(|_| ExecError::Runtime("OID out of range".into())),
+                        Err(_) => Ok(regclass_oid(s)
+                            .or_else(|| self.regclass_by_name(s))
+                            .map(Value::Int32)
+                            .unwrap_or(Value::Null)),
+                    },
+                    _ => Err(ExecError::Unsupported(format!(
+                        "cannot cast {val:?} to OID"
+                    ))),
+                }
+            }
+            ast::DataType::Custom(name, _) if name.to_string().eq_ignore_ascii_case("name") => {
+                Ok(Value::Text(val.to_string()))
+            }
             // ::regproc — function-name pseudo-type. Nucleus renders regproc
             // values as their text name already, so the cast is the identity
             // on text (prisma casts pg_type.typinput::regproc::text).
@@ -1861,6 +1946,10 @@ impl Executor {
             },
             ast::DataType::Text | ast::DataType::Varchar(_) => match val {
                 Value::Null => Ok(Value::Null),
+                Value::TimestampTz(us) => Ok(Value::Text(crate::types::format_timestamptz(
+                    us,
+                    self.session_time_zone()?,
+                ))),
                 _ => Ok(Value::Text(val.to_string())),
             },
             ast::DataType::Int(_) | ast::DataType::Integer(_) | ast::DataType::Int4(_) => match val
@@ -1964,7 +2053,16 @@ impl Executor {
                 },
                 _ => Err(ExecError::Unsupported("cannot cast to BOOLEAN".to_string())),
             },
-            ast::DataType::Date => val.cast(&DataType::Date).map_err(ExecError::Runtime),
+            // The date of a timestamptz is the date on the session-zone clock.
+            ast::DataType::Date => match val {
+                Value::TimestampTz(us) => {
+                    let local = timestamptz_at_time_zone(us, self.session_time_zone()?)?;
+                    Value::Timestamp(local)
+                        .cast(&DataType::Date)
+                        .map_err(ExecError::Runtime)
+                }
+                other => other.cast(&DataType::Date).map_err(ExecError::Runtime),
+            },
             ast::DataType::Timestamp(_, timezone) => {
                 let with_timezone = matches!(
                     timezone,
@@ -1988,9 +2086,7 @@ impl Executor {
                     )
                     .map(Value::TimestampTz),
                     (Value::Text(text), true) => {
-                        let local =
-                            crate::types::parse_timestamp(&text).map_err(ExecError::Runtime)?;
-                        local_timestamp_at_time_zone(local, self.session_time_zone()?)
+                        super::timestamptz::parse_timestamptz_text(&text, self.session_time_zone()?)
                             .map(Value::TimestampTz)
                     }
                     (value, false) => value.cast(&DataType::Timestamp).map_err(ExecError::Runtime),
@@ -2050,22 +2146,56 @@ impl Executor {
                     ast::ArrayElemTypeDef::None => None,
                 };
                 match (&val, elem_type) {
-                    (Value::Text(s), Some(et)) if s.trim().starts_with('{') => {
-                        let inner = s.trim().trim_start_matches('{').trim_end_matches('}');
+                    // An int2vector / oidvector column (pg_index.indkey and
+                    // friends) is text of space-separated integers.
+                    (Value::Text(s), Some(et))
+                        if !s.trim().starts_with('{')
+                            && s.split_whitespace().all(|p| p.parse::<i64>().is_ok())
+                            && matches!(
+                                self.eval_cast(Value::Text("0".into()), et),
+                                Ok(Value::Int32(_)) | Ok(Value::Int64(_))
+                            ) =>
+                    {
                         let mut out = Vec::new();
-                        for part in inner.split(',') {
-                            let part = part.trim().trim_matches('"');
-                            if part.is_empty() {
-                                continue;
-                            }
+                        for part in s.split_whitespace() {
                             out.push(self.eval_cast(Value::Text(part.to_string()), et)?);
                         }
                         Ok(Value::Array(out))
                     }
-                    _ => match val {
-                        Value::Array(_) => Ok(val),
-                        _ => Ok(Value::Array(vec![val])),
-                    },
+                    (Value::Text(s), Some(et)) if s.trim().starts_with(['{', '[']) => {
+                        let items = crate::types::parse_array_literal(s).map_err(|error| {
+                            ExecError::Runtime(format!(
+                                "invalid input syntax for type array: {error}"
+                            ))
+                        })?;
+                        crate::types::array_value_from_literal(&items, &mut |element| {
+                            self.eval_cast(Value::Text(element.to_string()), et)
+                                .map_err(|error| error.to_string())
+                        })
+                        .map_err(ExecError::Runtime)
+                    }
+                    (Value::Array(items), Some(et)) => {
+                        crate::types::validate_array_shape(items).map_err(ExecError::Runtime)?;
+                        fn cast_items(
+                            ex: &Executor,
+                            items: &[Value],
+                            target: &ast::DataType,
+                        ) -> Result<Value, ExecError> {
+                            items
+                                .iter()
+                                .map(|item| match item {
+                                    Value::Array(inner) => cast_items(ex, inner, target),
+                                    other => ex.eval_cast(other.clone(), target),
+                                })
+                                .collect::<Result<Vec<_>, _>>()
+                                .map(Value::Array)
+                        }
+                        cast_items(self, items, et)
+                    }
+                    _ => Err(ExecError::Runtime(
+                        "invalid input syntax for array: expected an array literal or array value"
+                            .into(),
+                    )),
                 }
             }
             ast::DataType::Char(_) | ast::DataType::Character(_) => {
@@ -2229,61 +2359,35 @@ fn coerce_to_array(v: Value) -> Option<Vec<Value>> {
     match v {
         Value::Array(vals) => Some(vals),
         Value::Text(s) if s.trim().starts_with('{') && s.trim().ends_with('}') => {
-            Some(parse_pg_array_literal(s.trim()))
+            let items = crate::types::parse_array_literal(&s).ok()?;
+            match crate::types::array_value_from_literal(&items, &mut |e| {
+                Ok(crate::types::guess_array_element(e))
+            }) {
+                Ok(Value::Array(vals)) => Some(vals),
+                _ => None,
+            }
         }
         _ => None,
     }
 }
 
-/// Parse a one-dimensional Postgres array literal ('{a,"b,c",NULL}').
-pub(super) fn parse_pg_array_literal(s: &str) -> Vec<Value> {
-    let inner = &s[1..s.len() - 1];
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_quotes = false;
-    let mut was_quoted = false;
-    let mut chars = inner.chars().peekable();
-    let push = |cur: &mut String, was_quoted: bool, out: &mut Vec<Value>| {
-        let raw = std::mem::take(cur);
-        let trimmed = if was_quoted {
-            raw
-        } else {
-            raw.trim().to_string()
-        };
-        if trimmed.is_empty() && !was_quoted {
-            return;
-        }
-        if !was_quoted && trimmed.eq_ignore_ascii_case("null") {
-            out.push(Value::Null);
-        } else if !was_quoted && let Ok(n) = trimmed.parse::<i64>() {
-            out.push(Value::Int64(n));
-        } else if !was_quoted && let Ok(f) = trimmed.parse::<f64>() {
-            out.push(Value::Float64(f));
-        } else {
-            out.push(Value::Text(trimmed));
-        }
-    };
-    while let Some(c) = chars.next() {
-        match c {
-            '"' if !in_quotes => {
-                in_quotes = true;
-                was_quoted = true;
-            }
-            '"' if in_quotes => in_quotes = false,
-            '\\' if in_quotes => {
-                if let Some(esc) = chars.next() {
-                    cur.push(esc);
-                }
-            }
-            ',' if !in_quotes => {
-                push(&mut cur, was_quoted, &mut out);
-                was_quoted = false;
-            }
-            _ => cur.push(c),
-        }
+/// A numeric literal cast straight to numeric keeps its digits: evaluating the
+/// bare literal first would round it through f64 and lose everything past
+/// about 17 significant digits.
+fn numeric_literal_text(expr: &Expr, data_type: &ast::DataType) -> Option<String> {
+    if !matches!(
+        data_type,
+        ast::DataType::Numeric(_) | ast::DataType::Decimal(_) | ast::DataType::Dec(_)
+    ) {
+        return None;
     }
-    push(&mut cur, was_quoted, &mut out);
-    out
+    match expr {
+        Expr::Value(v) => match &v.value {
+            ast::Value::Number(s, _) => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 #[cfg(test)]

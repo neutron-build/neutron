@@ -390,9 +390,12 @@ async fn mutating_scalar_calls_in_where_pg_catalog_and_collections_also_gate() {
     let writes = {
         let ex = ex.clone();
         tokio::spawn(async move {
-            ex.execute_with_session(writer, "SELECT 1 WHERE PG_CATALOG.KV_SET('k2','v')")
-                .await
-                .expect("pg_catalog-qualified kv_set must proceed after release");
+            ex.execute_with_session(
+                writer,
+                "SELECT 1 WHERE PG_CATALOG.KV_SET('k2','v') IS NOT NULL",
+            )
+            .await
+            .expect("pg_catalog-qualified kv_set must proceed after release");
             ex.execute_with_session(writer, "SELECT KV_SADD('lease:s','m')")
                 .await
                 .expect("kv_sadd must proceed after release");

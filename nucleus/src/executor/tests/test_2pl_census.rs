@@ -1,30 +1,33 @@
-//! R6 — serializable anomaly census for the DISK engine (strict 2PL).
+//! Internal BufferedDiskEngine 2PL mechanism census, not public SQL isolation.
 //!
-//! `test_ssi_census` is the same census against `MvccStorageAdapter`, which
-//! gets serializability from SSI. This one covers `BufferedDiskEngine` — the
-//! engine `main.rs` actually builds for every server deployment — which has no
-//! versioning and gets serializability from table-level strict two-phase
-//! locking instead (`storage::lock_manager`).
-//!
-//! It is a separate file rather than a parameterization of the SSI census
-//! because the two mechanisms fail differently, and pretending otherwise would
-//! weaken both. SSI is optimistic: operations never block, and the loser finds
-//! out at commit. 2PL is pessimistic: the loser BLOCKS at the conflicting
-//! operation, and only dies if breaking a potential deadlock requires it. So
-//! the SSI census can drive both transactions from one sequential task, and
-//! this one cannot — a sequential harness would block on the first conflict and
-//! hang forever, having proved nothing. Each transaction here runs in its own
-//! task, which is also how a real client produces these interleavings.
-//!
-//! What is asserted throughout is the OUTCOME, not the mechanism: whichever way
-//! the engine resolves a conflict, the final state must be one a serial
-//! execution could have produced.
+//! The shipping engine refuses REPEATABLE READ / SERIALIZABLE: READ COMMITTED
+//! and autocommit writers bypass its table locks, so a higher-level reader
+//! cannot retain a stable image. The mixed-isolation counterexample below
+//! gates that refusal. The remaining census retains the data-integrity and
+//! lock-lifecycle assertions among participants explicitly enrolled in the
+//! internal storage mechanism. It must not be used as evidence that SQL
+//! SERIALIZABLE is supported on this engine.
 
 use super::*;
 use crate::storage::buffered_engine::BufferedDiskEngine;
 use crate::storage::disk_engine::DiskEngine;
 
-const BEGIN_SER: &str = "BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE";
+/// Enrol only this controlled census in the internal lock mechanism. Starting
+/// through the public executor first keeps all its transaction bookkeeping;
+/// reopening the empty storage transaction directly bypasses the *capability
+/// gate only in this test*, without advertising a production isolation level.
+async fn begin_2pl(ex: &Executor, sid: u64) -> Result<Vec<ExecResult>, ExecError> {
+    let result = ex.execute_with_session(sid, "BEGIN").await?;
+    crate::storage::STORAGE_SESSION_ID
+        .scope(sid, async {
+            ex.storage.abort_txn().await?;
+            ex.storage.set_next_isolation_level("serializable");
+            ex.storage.begin_txn().await?;
+            Ok::<(), ExecError>(())
+        })
+        .await?;
+    Ok(result)
+}
 
 /// A disk-backed executor, matching what `main.rs` constructs.
 fn disk_executor(dir: &std::path::Path) -> Arc<Executor> {
@@ -116,7 +119,7 @@ async fn write_skew_does_not_survive() {
         gate: Arc<tokio::sync::Barrier>,
     ) -> Result<(), ExecError> {
         let r = async {
-            ex.execute_with_session(s, BEGIN_SER).await?;
+            begin_2pl(&ex, s).await?;
             let res = ex
                 .execute_with_session(
                     s,
@@ -197,7 +200,7 @@ async fn no_update_is_lost() {
         let s = ex.create_session();
         handles.push(tokio::spawn(async move {
             let r = async {
-                ex.execute_with_session(s, BEGIN_SER).await?;
+                begin_2pl(&ex, s).await?;
                 let read = ex
                     .execute_with_session(s, "SELECT balance FROM accounts WHERE id = 1")
                     .await?;
@@ -264,7 +267,7 @@ async fn a_predicate_does_not_grow_underneath_a_reader() {
     let s2 = ex.create_session();
 
     // T1 opens first and reads, so it holds S and is the older transaction.
-    ex.execute_with_session(s1, BEGIN_SER).await.unwrap();
+    begin_2pl(&ex, s1).await.unwrap();
     let first = read_count(&ex, s1, "SELECT COUNT(*) FROM accounts WHERE balance > 50").await;
 
     // T2 tries to insert a matching row and runs to completion FIRST. Awaiting
@@ -277,7 +280,7 @@ async fn a_predicate_does_not_grow_underneath_a_reader() {
         let ex = ex.clone();
         tokio::spawn(async move {
             let r = async {
-                ex.execute_with_session(s2, BEGIN_SER).await?;
+                begin_2pl(&ex, s2).await?;
                 ex.execute_with_session(s2, "INSERT INTO accounts VALUES (3, 999)")
                     .await?;
                 ex.execute_with_session(s2, "COMMIT").await
@@ -335,7 +338,7 @@ async fn disjoint_tables_do_not_conflict() {
         let ex = ex.clone();
         tokio::spawn(async move {
             let r = async {
-                ex.execute_with_session(s1, BEGIN_SER).await?;
+                begin_2pl(&ex, s1).await?;
                 ex.execute_with_session(s1, "SELECT v FROM a").await?;
                 ex.execute_with_session(s1, "UPDATE a SET v = 2 WHERE id = 1")
                     .await?;
@@ -352,7 +355,7 @@ async fn disjoint_tables_do_not_conflict() {
         let ex = ex.clone();
         tokio::spawn(async move {
             let r = async {
-                ex.execute_with_session(s2, BEGIN_SER).await?;
+                begin_2pl(&ex, s2).await?;
                 ex.execute_with_session(s2, "SELECT v FROM b").await?;
                 ex.execute_with_session(s2, "UPDATE b SET v = 2 WHERE id = 1")
                     .await?;
@@ -378,7 +381,7 @@ async fn a_read_only_transaction_releases_its_locks() {
     seed_accounts(&ex).await;
 
     let s1 = ex.create_session();
-    ex.execute_with_session(s1, BEGIN_SER).await.unwrap();
+    begin_2pl(&ex, s1).await.unwrap();
     ex.execute_with_session(s1, "SELECT * FROM accounts")
         .await
         .unwrap();
@@ -386,7 +389,7 @@ async fn a_read_only_transaction_releases_its_locks() {
 
     // With s1 finished, a writer must proceed without waiting.
     let s2 = ex.create_session();
-    ex.execute_with_session(s2, BEGIN_SER).await.unwrap();
+    begin_2pl(&ex, s2).await.unwrap();
     ex.execute_with_session(s2, "UPDATE accounts SET balance = 5 WHERE id = 1")
         .await
         .expect("a released read lock must not block a later writer");
@@ -406,14 +409,14 @@ async fn rollback_releases_locks() {
     seed_accounts(&ex).await;
 
     let s1 = ex.create_session();
-    ex.execute_with_session(s1, BEGIN_SER).await.unwrap();
+    begin_2pl(&ex, s1).await.unwrap();
     ex.execute_with_session(s1, "UPDATE accounts SET balance = 1 WHERE id = 1")
         .await
         .unwrap();
     ex.execute_with_session(s1, "ROLLBACK").await.unwrap();
 
     let s2 = ex.create_session();
-    ex.execute_with_session(s2, BEGIN_SER).await.unwrap();
+    begin_2pl(&ex, s2).await.unwrap();
     ex.execute_with_session(s2, "UPDATE accounts SET balance = 7 WHERE id = 1")
         .await
         .expect("an aborted transaction's exclusive lock must be released");
@@ -425,31 +428,29 @@ async fn rollback_releases_locks() {
     );
 }
 
-/// A non-serializable session takes no locks at all, so the existing
-/// read-committed behaviour is untouched — including that it can still write a
-/// table a serializable transaction is reading. That is not a bug: PostgreSQL's
-/// serializable guarantee likewise holds only among serializable transactions.
+/// Counterexample: mixed traffic invalidates the internal 2PL reader's image.
+/// This deliberately asserts the observed unsupported mechanism boundary; the
+/// public refusal test above prevents clients from receiving a false guarantee.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn read_committed_sessions_are_not_slowed_by_the_lock_table() {
+async fn mixed_isolation_counterexample_requires_public_refusal() {
     let dir = tempfile::tempdir().unwrap();
     let ex = disk_executor(dir.path());
     seed_accounts(&ex).await;
-
-    let s1 = ex.create_session();
-    ex.execute_with_session(s1, BEGIN_SER).await.unwrap();
-    ex.execute_with_session(s1, "SELECT * FROM accounts")
+    let reader = ex.create_session();
+    let writer = ex.create_session();
+    begin_2pl(&ex, reader).await.unwrap();
+    let before = read_count(&ex, reader, "SELECT count(*) FROM accounts").await;
+    // Autocommit is the adversarial writer omitted by an all-2PL census.
+    ex.execute_with_session(writer, "INSERT INTO accounts VALUES (3, 50)")
         .await
         .unwrap();
-
-    // A plain (read-committed) session writes the same table without blocking.
-    let s2 = ex.create_session();
-    ex.execute_with_session(s2, "BEGIN").await.unwrap();
-    ex.execute_with_session(s2, "UPDATE accounts SET balance = 42 WHERE id = 1")
-        .await
-        .expect("a read-committed writer must not be blocked by 2PL locks");
-    ex.execute_with_session(s2, "COMMIT").await.unwrap();
-
-    ex.execute_with_session(s1, "COMMIT").await.unwrap();
+    let after = read_count(&ex, reader, "SELECT count(*) FROM accounts").await;
+    assert_eq!(
+        (before, after),
+        (2, 3),
+        "update the capability gate only after proving a stable image"
+    );
+    ex.execute_with_session(reader, "ROLLBACK").await.unwrap();
 }
 
 /// A transaction killed to break a deadlock must release its locks AT THE
@@ -475,12 +476,12 @@ async fn a_killed_transaction_releases_its_locks_without_waiting_for_rollback() 
     let younger = ex.create_session();
 
     // `older` reads first, so it gets the lower age and will WAIT rather than die.
-    ex.execute_with_session(older, BEGIN_SER).await.unwrap();
+    begin_2pl(&ex, older).await.unwrap();
     ex.execute_with_session(older, "SELECT * FROM accounts")
         .await
         .unwrap();
     // `younger` reads second: compatible shared lock, higher age.
-    ex.execute_with_session(younger, BEGIN_SER).await.unwrap();
+    begin_2pl(&ex, younger).await.unwrap();
     ex.execute_with_session(younger, "SELECT * FROM accounts")
         .await
         .unwrap();
@@ -539,13 +540,13 @@ async fn a_killed_transaction_cannot_commit_anyway() {
     let younger = ex.create_session();
 
     // `older` locks first, so it is the older transaction.
-    ex.execute_with_session(older, BEGIN_SER).await.unwrap();
+    begin_2pl(&ex, older).await.unwrap();
     ex.execute_with_session(older, "SELECT * FROM accounts")
         .await
         .unwrap();
 
     // `younger` buffers a write to an uncontended table...
-    ex.execute_with_session(younger, BEGIN_SER).await.unwrap();
+    begin_2pl(&ex, younger).await.unwrap();
     ex.execute_with_session(younger, "UPDATE side SET v = 555 WHERE id = 1")
         .await
         .unwrap();
@@ -592,11 +593,11 @@ async fn set_lock_timeout_bounds_the_wait() {
     ex.execute_with_session(waiter_s, "SET lock_timeout = '80ms'")
         .await
         .unwrap();
-    ex.execute_with_session(waiter_s, BEGIN_SER).await.unwrap();
+    begin_2pl(&ex, waiter_s).await.unwrap();
     ex.execute_with_session(waiter_s, "SELECT * FROM accounts")
         .await
         .unwrap();
-    ex.execute_with_session(holder_s, BEGIN_SER).await.unwrap();
+    begin_2pl(&ex, holder_s).await.unwrap();
     // holder is YOUNGER, so its write dies rather than waiting — take the
     // exclusive lock on a table waiter has not read, then have waiter want it.
     exec(&ex, "CREATE TABLE side (id INT, v INT)").await;
@@ -642,22 +643,36 @@ async fn an_invalid_lock_timeout_is_refused() {
     }
 }
 
-/// The disk engine now ACCEPTS serializable rather than refusing it (R1's
-/// refusal was explicitly the honest interim, not the destination).
+/// Reject stronger public modes before opening any engine/session transaction.
 #[tokio::test]
-async fn the_disk_engine_accepts_every_isolation_level() {
+async fn the_disk_engine_refuses_unverified_isolation_levels() {
     let dir = tempfile::tempdir().unwrap();
     let ex = disk_executor(dir.path());
-    for level in [
-        "SERIALIZABLE",
-        "REPEATABLE READ",
-        "READ COMMITTED",
-        "SNAPSHOT",
-    ] {
-        exec(&ex, &format!("BEGIN TRANSACTION ISOLATION LEVEL {level}")).await;
-        exec(&ex, "ROLLBACK").await;
+    let sid = ex.create_session();
+    for level in ["SERIALIZABLE", "REPEATABLE READ", "SNAPSHOT"] {
+        let err = ex
+            .execute_with_session(sid, &format!("BEGIN TRANSACTION ISOLATION LEVEL {level}"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ExecError::Unsupported(_)), "{level}: {err}");
+        assert!(err.to_string().contains("READ COMMITTED"), "{err}");
+        assert!(!ex.get_session(sid).txn_active.load(Ordering::SeqCst));
+        // A failed request must not contaminate the next supported transaction.
+        ex.execute_with_session(sid, "BEGIN").await.unwrap();
+        let modes = ex
+            .execute_with_session(sid, "SHOW transaction_isolation")
+            .await
+            .unwrap();
+        assert_eq!(scalar(&modes[0]), &Value::Text("read committed".into()));
+        ex.execute_with_session(sid, "ROLLBACK").await.unwrap();
     }
-    exec(&ex, "SET transaction_isolation = 'serializable'").await;
+    for sql in [
+        "SET default_transaction_isolation = 'serializable'",
+        "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+    ] {
+        let err = ex.execute_with_session(sid, sql).await.unwrap_err();
+        assert!(matches!(err, ExecError::Unsupported(_)), "{sql}: {err}");
+    }
 }
 
 /// N1-class: `lock_timeout` used to be one engine-global value, so one
@@ -672,12 +687,12 @@ async fn the_disk_engine_accepts_every_isolation_level() {
 async fn contended_wait(ex: &Arc<Executor>, waiter: u64, table: &str) -> Option<ExecError> {
     exec(ex, &format!("CREATE TABLE {table} (id INT, v INT)")).await;
     exec(ex, &format!("INSERT INTO {table} VALUES (1, 1)")).await;
-    ex.execute_with_session(waiter, BEGIN_SER).await.unwrap();
+    begin_2pl(ex, waiter).await.unwrap();
     ex.execute_with_session(waiter, "SELECT * FROM accounts")
         .await
         .unwrap();
     let holder = ex.create_session();
-    ex.execute_with_session(holder, BEGIN_SER).await.unwrap();
+    begin_2pl(ex, holder).await.unwrap();
     ex.execute_with_session(holder, &format!("UPDATE {table} SET v = 2 WHERE id = 1"))
         .await
         .unwrap();

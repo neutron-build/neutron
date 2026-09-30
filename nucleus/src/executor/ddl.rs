@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use sqlparser::ast::{self, Expr, Statement};
 
+use super::pg_catalog;
 use crate::catalog::TableDef;
 use crate::planner;
 use crate::sql;
@@ -1028,10 +1029,25 @@ impl Executor {
             )
         {
             return Err(ExecError::Unsupported(
-                "deferrable constraints are not supported; constraints are immediate".into(),
+                "DEFERRABLE is supported for FOREIGN KEY constraints only; PRIMARY KEY and \
+                 UNIQUE constraints are checked at the end of each statement"
+                    .into(),
             ));
         }
         if characteristics.enforced == Some(false) {
+            return Err(ExecError::Unsupported(
+                "NOT ENFORCED constraints are not supported".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// A foreign key may be DEFERRABLE (checked at COMMIT, see `deferred_fk`);
+    /// only NOT ENFORCED is refused.
+    fn validate_fk_characteristics(
+        characteristics: Option<&ast::ConstraintCharacteristics>,
+    ) -> Result<(), ExecError> {
+        if characteristics.is_some_and(|c| c.enforced == Some(false)) {
             return Err(ExecError::Unsupported(
                 "NOT ENFORCED constraints are not supported".into(),
             ));
@@ -1045,6 +1061,7 @@ impl Executor {
     ) -> Result<ExecResult, ExecError> {
         let table_name = crate::sql::object_name_key(&create.name);
         let mut columns = sql::extract_columns(&create.columns)?;
+        super::column_writes::validate_generated_columns(&columns)?;
         Self::apply_analyzer_options(&create.table_options, &mut columns)?;
         let mut constraints = sql::extract_constraints(&create.columns, &create.constraints);
         let primary_key_declarations = create
@@ -1081,9 +1098,7 @@ impl Executor {
                     }
                 }
                 ast::TableConstraint::ForeignKey(foreign_key) => {
-                    Self::validate_immediate_constraint_characteristics(
-                        foreign_key.characteristics.as_ref(),
-                    )?;
+                    Self::validate_fk_characteristics(foreign_key.characteristics.as_ref())?;
                     if matches!(
                         foreign_key.match_kind,
                         Some(
@@ -1118,9 +1133,7 @@ impl Executor {
                         }
                     }
                     ast::ColumnOption::ForeignKey(foreign_key) => {
-                        Self::validate_immediate_constraint_characteristics(
-                            foreign_key.characteristics.as_ref(),
-                        )?;
+                        Self::validate_fk_characteristics(foreign_key.characteristics.as_ref())?;
                         if matches!(
                             foreign_key.match_kind,
                             Some(
@@ -1241,6 +1254,17 @@ impl Executor {
 
         match self.catalog.create_table(table_def.clone()).await {
             Ok(()) => {
+                // Remember the declared PostgreSQL types the engine's DataType
+                // cannot express (varchar(n), numeric(p,s), smallint, ...), so
+                // the pg_catalog emulation reports what was written.
+                self.catalog.clear_declared_types(&table_name);
+                for col in &create.columns {
+                    if let Some(declared) = pg_catalog::declared_type_of(&col.data_type)
+                        && let Some(id) = table_def.column_id(&col.name.value)
+                    {
+                        self.catalog.set_declared_type(&table_name, id, declared);
+                    }
+                }
                 // Route to per-table engine if engine override was specified.
                 let is_mergetree = matches!(
                     engine_name.as_deref(),
@@ -1811,18 +1835,26 @@ impl Executor {
     /// Put `table` back to `original`, through the engine that actually serves
     /// it. Used to undo writes to a per-table engine on ROLLBACK.
     pub(super) async fn restore_table_from(&self, table: &str, original: &[Row]) {
+        if let Err(error) = self.restore_table_from_checked(table, original).await {
+            tracing::error!("restoring table {table} failed: {error}");
+        }
+    }
+
+    pub(super) async fn restore_table_from_checked(
+        &self,
+        table: &str,
+        original: &[Row],
+    ) -> Result<(), ExecError> {
         let engine = self.storage_for(table);
-        // Positions come from `scan_physical`, never `0..len` — an engine is
-        // free to address rows by something other than a dense scan ordinal.
-        if let Ok(current) = engine.scan_physical(table).await
-            && !current.is_empty()
-        {
+        let current = engine.scan_physical(table).await?;
+        if !current.is_empty() {
             let positions: Vec<usize> = current.iter().map(|(pos, _)| *pos).collect();
-            let _ = engine.delete(table, &positions).await;
+            engine.delete(table, &positions).await?;
         }
         for row in original {
-            let _ = engine.insert(table, row.clone()).await;
+            engine.insert(table, row.clone()).await?;
         }
+        Ok(())
     }
 
     pub(super) async fn execute_drop(
@@ -2149,6 +2181,16 @@ impl Executor {
                  Create the index without a WHERE clause if a full index is \
                  acceptable."
                     .into(),
+            ));
+        }
+
+        // IndexDef and the storage indexes retain ascending keys only. Refuse
+        // requested ordering rather than publishing different catalog metadata.
+        if create_index.columns.iter().any(|column| {
+            column.column.options.asc == Some(false) || column.column.options.nulls_first.is_some()
+        }) {
+            return Err(ExecError::Unsupported(
+                "index DESC and explicit NULLS ordering are not implemented".into(),
             ));
         }
 
@@ -2736,7 +2778,8 @@ impl Executor {
             // Index definitions survive TRUNCATE. Recreate engine-local index
             // structures and replace every in-memory posting map with the
             // authoritative empty-table image.
-            self.rebuild_table_derived_state(&table_name).await;
+            self.rebuild_table_storage_and_derived_state(&table_name)
+                .await;
         }
         Ok(ExecResult::Command {
             tag: "TRUNCATE TABLE".into(),
@@ -2936,7 +2979,7 @@ impl Executor {
                         table_name.hash(&mut hasher);
                         self.zone_map_index.clear_table(hasher.finish());
                     }
-                    self.rebuild_table_derived_state(&new).await;
+                    self.rebuild_table_storage_and_derived_state(&new).await;
                     {
                         let mut security = self.security.write();
                         security.rls.rename_table(&table_name, &new);
@@ -3082,11 +3125,26 @@ impl Executor {
                             ast::ColumnOption::NotNull | ast::ColumnOption::PrimaryKey(_)
                         )
                     });
-                    let default_expr =
+                    let generation = sql::column_generation(&column_def.options);
+                    if matches!(
+                        generation,
+                        Some(
+                            crate::catalog::ColumnGeneration::IdentityAlways
+                                | crate::catalog::ColumnGeneration::IdentityByDefault
+                        )
+                    ) {
+                        return Err(ExecError::Unsupported(
+                            "ADD COLUMN ... GENERATED AS IDENTITY is not supported".into(),
+                        ));
+                    }
+                    let default_expr = if generation.is_some() {
+                        None
+                    } else {
                         column_def.options.iter().find_map(|opt| match &opt.option {
                             ast::ColumnOption::Default(expr) => Some(expr.to_string()),
                             _ => None,
-                        });
+                        })
+                    };
                     let new_col = crate::catalog::ColumnDef {
                         name: col_name.clone(),
                         data_type: dtype,
@@ -3098,10 +3156,20 @@ impl Executor {
                         // rename-then-re-add attack with extra steps.
                         id: table_def.next_column_id(),
                         analyzer: None,
+                        generation,
+                        max_len: sql::declared_max_len(&column_def.data_type),
                     };
                     let mut updated = (*table_def).clone();
                     updated.columns.push(new_col.clone());
-                    self.catalog.update_table(updated).await?;
+                    super::column_writes::validate_generated_columns(&updated.columns)?;
+                    let generated_exprs = self.generated_exprs(&updated)?;
+                    let updated_meta = self.table_col_meta(&updated);
+                    self.catalog.update_table(updated.clone()).await?;
+                    self.catalog.remove_declared_type(&table_name, new_col.id);
+                    if let Some(declared) = pg_catalog::declared_type_of(&column_def.data_type) {
+                        self.catalog
+                            .set_declared_type(&table_name, new_col.id, declared);
+                    }
 
                     let engine = self.storage_for(&table_name);
                     let _rewrite = RewriteGuard::new(engine.clone(), &table_name);
@@ -3121,8 +3189,17 @@ impl Executor {
                     let updates: Vec<(usize, Row)> = rows
                         .into_iter()
                         .map(|(vidx, mut r)| {
-                            let v = self.eval_column_default(&new_col)?;
+                            let mut v = self.eval_column_default(&new_col)?;
+                            super::column_writes::enforce_max_len(&mut v, &new_col)?;
                             r.push(v);
+                            if !generated_exprs.is_empty() {
+                                self.apply_generated(
+                                    &generated_exprs,
+                                    &updated,
+                                    &updated_meta,
+                                    &mut r,
+                                )?;
+                            }
                             Ok((vidx, r))
                         })
                         .collect::<Result<Vec<_>, ExecError>>()?;
@@ -3156,6 +3233,13 @@ impl Executor {
                     let cascade = matches!(drop_behavior, Some(ast::DropBehavior::Cascade));
                     for col_name in column_names {
                         let col_str = col_name.to_string();
+                        if let Some(dependent) =
+                            super::column_writes::generated_column_reading(&table_def, &col_str)
+                        {
+                            return Err(ExecError::ConstraintViolation(format!(
+                                "cannot drop column \"{col_str}\" because generated column \"{dependent}\" depends on it"
+                            )));
+                        }
                         let column_id = table_def.column_id(&col_str).unwrap_or(0);
                         let (dependents, masked_roles) = {
                             let security = self.security.read();
@@ -3312,6 +3396,8 @@ impl Executor {
                     drop_indices.dedup();
                     drop_indices.reverse();
                     for idx in &drop_indices {
+                        self.catalog
+                            .remove_declared_type(&table_name, updated.columns[*idx].id);
                         updated.columns.remove(*idx);
                     }
                     self.catalog.update_table(updated).await?;
@@ -3353,6 +3439,15 @@ impl Executor {
                     new_column_name,
                 } => {
                     let mut updated = (*table_def).clone();
+                    if let Some(dependent) = super::column_writes::generated_column_reading(
+                        &table_def,
+                        &old_column_name.value,
+                    ) {
+                        return Err(ExecError::ConstraintViolation(format!(
+                            "cannot rename column \"{}\" while generated column \"{dependent}\" depends on it",
+                            old_column_name.value
+                        )));
+                    }
                     if updated.constraints.iter().any(|constraint| {
                         matches!(constraint, crate::catalog::TableConstraint::Check { expr, .. }
                             if expr.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
@@ -3539,6 +3634,8 @@ impl Executor {
                         .ok_or_else(|| ExecError::ColumnNotFound(column_name.value.clone()))?;
                     // Set when SetDataType changes the type: triggers a physical rewrite below.
                     let mut retype: Option<DataType> = None;
+                    let mut declared_change: Option<(u32, Option<crate::catalog::DeclaredType>)> =
+                        None;
                     let mut validate_not_null = false;
                     {
                         let col = &mut updated.columns[col_idx];
@@ -3548,6 +3645,19 @@ impl Executor {
                                 col.nullable = false;
                             }
                             ast::AlterColumnOperation::DropNotNull => col.nullable = true,
+                            ast::AlterColumnOperation::SetDefault { .. }
+                                if col.generation.is_some() =>
+                            {
+                                return Err(ExecError::Runtime(format!(
+                                    "column \"{}\" of relation \"{table_name}\" is {}",
+                                    col.name,
+                                    match col.generation {
+                                        Some(crate::catalog::ColumnGeneration::Stored(_)) =>
+                                            "a generated column",
+                                        _ => "an identity column",
+                                    }
+                                )));
+                            }
                             ast::AlterColumnOperation::SetDefault { value } => {
                                 col.default_expr = Some(value.to_string());
                             }
@@ -3560,11 +3670,26 @@ impl Executor {
                                     retype = Some(new_type.clone());
                                 }
                                 col.data_type = new_type;
+                                col.max_len = sql::declared_max_len(data_type);
+                                declared_change =
+                                    Some((col.id, pg_catalog::declared_type_of(data_type)));
                             }
                             _ => {
                                 return Err(ExecError::Unsupported(format!(
                                     "ALTER COLUMN operation not yet supported: {op}"
                                 )));
+                            }
+                        }
+                    }
+                    if matches!(op, ast::AlterColumnOperation::SetDataType { .. })
+                        && updated.columns[col_idx].max_len.is_some()
+                    {
+                        // Existing values must fit the new length (22001).
+                        let col = updated.columns[col_idx].clone();
+                        let rows = self.storage_for(&table_name).scan(&table_name).await?;
+                        for row in &rows {
+                            if let Some(mut value) = row.get(col_idx).cloned() {
+                                super::column_writes::enforce_max_len(&mut value, &col)?;
                             }
                         }
                     }
@@ -3663,6 +3788,14 @@ impl Executor {
                         storage.rebuild_table_indexes(&table_name).await?;
                     } else {
                         self.catalog.update_table(updated).await?;
+                    }
+                    // The declared type follows the column's new type: kept if
+                    // the new declaration is finer than the engine's type,
+                    // dropped otherwise.
+                    match declared_change {
+                        Some((id, Some(d))) => self.catalog.set_declared_type(&table_name, id, d),
+                        Some((id, None)) => self.catalog.remove_declared_type(&table_name, id),
+                        None => {}
                     }
                 }
                 // ── ADD CONSTRAINT ──────────────────────────────────────────────
@@ -3792,9 +3925,7 @@ impl Executor {
                             self.catalog.update_table(updated).await?;
                         }
                         ast::TableConstraint::ForeignKey(fk) => {
-                            Self::validate_immediate_constraint_characteristics(
-                                fk.characteristics.as_ref(),
-                            )?;
+                            Self::validate_fk_characteristics(fk.characteristics.as_ref())?;
                             if matches!(
                                 fk.match_kind,
                                 Some(
@@ -3832,13 +3963,14 @@ impl Executor {
                                     ref_columns,
                                     on_delete: sql::convert_fk_action(&fk.on_delete),
                                     on_update: sql::convert_fk_action(&fk.on_update),
+                                    deferrable: sql::deferrable_from(fk.characteristics.as_ref()),
                                 });
                             Self::validate_constraint_names(&updated)?;
                             self.validate_foreign_key_definitions(&updated).await?;
                             let existing_rows =
                                 self.storage_for(&table_name).scan(&table_name).await?;
                             for row in &existing_rows {
-                                self.check_fk_constraints(&updated, row).await?;
+                                self.check_fk_constraints_now(&updated, row).await?;
                             }
                             self.catalog.update_table(updated).await?;
                         }
@@ -3950,7 +4082,8 @@ impl Executor {
             self.table_columns
                 .write()
                 .insert(table_name.clone(), col_info);
-            self.rebuild_table_derived_state(&table_name).await;
+            self.rebuild_table_storage_and_derived_state(&table_name)
+                .await;
         } else {
             self.table_columns.write().remove(&table_name);
         }
@@ -4591,7 +4724,11 @@ impl Executor {
     ///
     /// Supports: ALTER SEQUENCE name RESTART [WITH n] | INCREMENT [BY] n | MINVALUE n | MAXVALUE n
     pub(super) fn execute_alter_sequence_raw(&self, sql: &str) -> Result<ExecResult, ExecError> {
-        let tokens: Vec<&str> = sql.split_whitespace().collect();
+        let tokens: Vec<&str> = sql
+            .trim()
+            .trim_end_matches(';')
+            .split_whitespace()
+            .collect();
         // tokens[0]="ALTER", tokens[1]="SEQUENCE", tokens[2]=name
         if tokens.len() < 4 {
             return Err(ExecError::Unsupported(
@@ -4631,6 +4768,26 @@ impl Executor {
                         seq.current = seq.start - seq.increment;
                         i += 1;
                     }
+                }
+                "START" => {
+                    let skip = if tokens
+                        .get(i + 1)
+                        .is_some_and(|t| t.eq_ignore_ascii_case("WITH"))
+                    {
+                        2
+                    } else {
+                        1
+                    };
+                    let value = tokens
+                        .get(i + skip)
+                        .and_then(|t| t.parse::<i64>().ok())
+                        .ok_or_else(|| {
+                            ExecError::Unsupported("START WITH requires a number".into())
+                        })?;
+                    // START sets the default for a later bare RESTART; it does
+                    // not reposition a sequence that has already been called.
+                    seq.start = value;
+                    i += skip + 1;
                 }
                 "CYCLE" => {
                     return Err(ExecError::Unsupported(

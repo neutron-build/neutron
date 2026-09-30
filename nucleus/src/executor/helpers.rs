@@ -15,28 +15,6 @@ use chrono_tz::Tz;
 use sqlparser::ast::{self, Expr};
 use std::collections::HashMap;
 
-/// Map a Nucleus DataType to its PostgreSQL `udt_name` (the short type name used in pg_type).
-pub(super) fn datatype_to_udt_name(dt: &DataType) -> &'static str {
-    match dt {
-        DataType::Bool => "bool",
-        DataType::Int32 => "int4",
-        DataType::Int64 => "int8",
-        DataType::Float64 => "float8",
-        DataType::Text => "text",
-        DataType::Jsonb => "jsonb",
-        DataType::Date => "date",
-        DataType::Timestamp => "timestamp",
-        DataType::TimestampTz => "timestamptz",
-        DataType::Numeric => "numeric",
-        DataType::Uuid => "uuid",
-        DataType::Bytea => "bytea",
-        DataType::Array(_) => "_text",
-        DataType::Vector(_) => "vector",
-        DataType::Interval => "interval",
-        DataType::UserDefined(_) => "text",
-    }
-}
-
 /// Return (oid, typlen, typtype, typcategory) for a Nucleus DataType,
 /// matching real PostgreSQL pg_type values.
 pub(super) fn pg_type_info(dt: &DataType) -> (i32, i32, &'static str, &'static str) {
@@ -60,26 +38,6 @@ pub(super) fn pg_type_info(dt: &DataType) -> (i32, i32, &'static str, &'static s
     }
 }
 
-/// Base PostgreSQL types that should always appear in pg_type.
-pub(super) const BASE_PG_TYPES: &[(i32, &str, i32, &str, &str)] = &[
-    (16, "bool", 1, "b", "B"),
-    (23, "int4", 4, "b", "N"),
-    (20, "int8", 8, "b", "N"),
-    (701, "float8", 8, "b", "N"),
-    (25, "text", -1, "b", "S"),
-    (3802, "jsonb", -1, "b", "U"),
-    (1082, "date", 4, "b", "D"),
-    (1114, "timestamp", 8, "b", "D"),
-    (1184, "timestamptz", 8, "b", "D"),
-    (1700, "numeric", -1, "b", "N"),
-    (2950, "uuid", 16, "b", "U"),
-    (17, "bytea", -1, "b", "U"),
-    (21, "int2", 2, "b", "N"),
-    (700, "float4", 4, "b", "N"),
-    (1043, "varchar", -1, "b", "S"),
-    (1042, "bpchar", -1, "b", "S"),
-];
-
 /// The four `pg_type` I/O function names for a type: `(in, out, recv, send)`.
 ///
 /// These are **not** derivable by concatenation, and clients match on them
@@ -100,6 +58,8 @@ pub(super) const BASE_PG_TYPES: &[(i32, &str, i32, &str, &str)] = &[
 pub(super) fn pg_type_io_names(typname: &str) -> (String, String, String, String) {
     // Types whose I/O functions carry an underscore in real PostgreSQL.
     const UNDERSCORED: &[&str] = &[
+        "array",
+        "enum",
         "json",
         "jsonb",
         "date",
@@ -189,11 +149,34 @@ pub(super) fn projected_column_type(
     value: &Value,
     col_meta: &[ColMeta],
 ) -> DataType {
-    if matches!(value, Value::Null) {
-        infer_expr_type(expr, col_meta)
+    let inferred = infer_expr_type(expr, col_meta);
+    if matches!(value, Value::Null) || matches!(inferred, DataType::Array(_)) {
+        inferred
     } else {
         value_type(value)
     }
+}
+
+/// Element type of a non-column array value: that of its non-NULL elements
+/// (integers of mixed width widen to bigint), nested arrays by their leaves,
+/// text when there is nothing to go on.
+fn array_element_type(items: &[Value]) -> DataType {
+    let mut found: Option<DataType> = None;
+    for item in items {
+        let ty = match item {
+            Value::Null => continue,
+            Value::Array(inner) => array_element_type(inner),
+            other => value_type(other),
+        };
+        found = Some(match (found, ty) {
+            (None, ty) => ty,
+            (Some(DataType::Int32), DataType::Int64) | (Some(DataType::Int64), DataType::Int32) => {
+                DataType::Int64
+            }
+            (Some(prev), _) => prev,
+        });
+    }
+    found.unwrap_or(DataType::Text)
 }
 
 pub(super) fn value_type(value: &Value) -> DataType {
@@ -211,7 +194,7 @@ pub(super) fn value_type(value: &Value) -> DataType {
         Value::Numeric(_) => DataType::Numeric,
         Value::Uuid(_) => DataType::Uuid,
         Value::Bytea(_) => DataType::Bytea,
-        Value::Array(_) => DataType::Array(Box::new(DataType::Text)),
+        Value::Array(items) => DataType::Array(Box::new(array_element_type(items))),
         Value::Vector(v) => DataType::Vector(v.len()),
         Value::Interval { .. } => DataType::Interval,
     }
@@ -268,6 +251,7 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
             crate::sql::convert_data_type(data_type).unwrap_or(DataType::Text)
         }
         Expr::Interval(_) => DataType::Interval,
+        Expr::Extract { .. } => DataType::Numeric,
         Expr::Collate { expr, .. } => infer_expr_type(expr, col_meta),
         Expr::AtTimeZone { timestamp, .. } => match infer_expr_type(timestamp, col_meta) {
             DataType::TimestampTz => DataType::Timestamp,
@@ -283,8 +267,11 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
                 _ => None,
             };
             match name.as_str() {
+                "DECODE" | "PG_CATALOG.DECODE" => DataType::Bytea,
+                "DATE_PART" | "PG_CATALOG.DATE_PART" => DataType::Float64,
+                "EXTRACT" | "PG_CATALOG.EXTRACT" => DataType::Numeric,
                 "MAKE_INTERVAL" | "PG_CATALOG.MAKE_INTERVAL" => DataType::Interval,
-                "COUNT" => DataType::Int64,
+                "COUNT" | "ROW_NUMBER" | "RANK" | "DENSE_RANK" => DataType::Int64,
                 "AVG"
                     if matches!(
                         arg_expr.map(|expr| infer_expr_type(expr, col_meta)),
@@ -314,7 +301,9 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
                         .unwrap_or(DataType::Text);
                     DataType::Array(Box::new(inner))
                 }
-                "JSON_AGG" => DataType::Jsonb,
+                "JSON_AGG" | "JSONB_AGG" | "JSON_OBJECT_AGG" | "JSONB_OBJECT_AGG" => {
+                    DataType::Jsonb
+                }
                 // Nucleus scalar extensions with integer/bool returns: without
                 // these the wire layer described e.g. KV_INCR's result as TEXT
                 // while the executor returned Int64, so pgx got binary int
@@ -467,7 +456,15 @@ pub(super) fn parse_lock_timeout(value: &str) -> Result<u64, ExecError> {
 pub(super) fn parse_time_zone(value: &str) -> Result<Tz, ExecError> {
     let name = value.trim().trim_matches(['\'', '"']);
     name.parse::<Tz>()
-        .map_err(|_| ExecError::Runtime(format!("time zone '{name}' is not recognized")))
+        .ok()
+        // PostgreSQL matches zone names case-insensitively ('asia/tokyo').
+        .or_else(|| {
+            chrono_tz::TZ_VARIANTS
+                .iter()
+                .find(|zone| zone.name().eq_ignore_ascii_case(name))
+                .copied()
+        })
+        .ok_or_else(|| ExecError::Runtime(format!("time zone '{name}' is not recognized")))
 }
 
 const POSTGRES_UNIX_EPOCH_SECONDS: i64 = 946_684_800;
@@ -580,11 +577,7 @@ pub(super) fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering>
         (Value::Float64(a), Value::Int64(b)) => a.partial_cmp(&(*b as f64)),
         (Value::Text(a), Value::Text(b)) => Some(a.cmp(b)),
         (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
-        (Value::Jsonb(a), Value::Jsonb(b)) => {
-            let sa = serde_json::to_string(a).unwrap_or_default();
-            let sb = serde_json::to_string(b).unwrap_or_default();
-            Some(sa.cmp(&sb))
-        }
+        (Value::Jsonb(a), Value::Jsonb(b)) => Some(crate::types::compare_jsonb(a, b)),
         (Value::Date(a), Value::Date(b)) => Some(a.cmp(b)),
         // Date ↔ Timestamp: a date compares as midnight of that day (PG:
         // `TIMESTAMP '2024-01-01 00:00:00' = DATE '2024-01-01'` is true). Both
@@ -697,8 +690,12 @@ fn coerce_text_and_compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         (Value::Date(d), Value::Text(s)) => parse_date_string(s).map(|v| d.cmp(&v)),
         (Value::Text(s), Value::Timestamp(t)) => text_to_timestamp_us(s).map(|v| v.cmp(t)),
         (Value::Timestamp(t), Value::Text(s)) => text_to_timestamp_us(s).map(|v| t.cmp(&v)),
-        (Value::Text(s), Value::TimestampTz(t)) => text_to_timestamp_us(s).map(|v| v.cmp(t)),
-        (Value::TimestampTz(t), Value::Text(s)) => text_to_timestamp_us(s).map(|v| t.cmp(&v)),
+        (Value::Text(s), Value::TimestampTz(t)) => {
+            super::timestamptz::timestamptz_text_to_instant(s).map(|v| v.cmp(t))
+        }
+        (Value::TimestampTz(t), Value::Text(s)) => {
+            super::timestamptz::timestamptz_text_to_instant(s).map(|v| t.cmp(&v))
+        }
         // text vs uuid — accept the canonical 8-4-4-4-12 hex form.
         (Value::Text(s), Value::Uuid(u)) => parse_uuid_text(s).map(|v| v.cmp(u)),
         (Value::Uuid(u), Value::Text(s)) => parse_uuid_text(s).map(|v| u.cmp(&v)),
@@ -874,6 +871,9 @@ pub(super) fn contains_aggregate(expr: &Expr) -> bool {
                     | "STRING_AGG"
                     | "ARRAY_AGG"
                     | "JSON_AGG"
+                    | "JSONB_AGG"
+                    | "JSON_OBJECT_AGG"
+                    | "JSONB_OBJECT_AGG"
                     | "BOOL_AND"
                     | "BOOL_OR"
                     | "EVERY"
@@ -932,13 +932,74 @@ pub(super) fn contains_aggregate(expr: &Expr) -> bool {
 
 pub(super) fn contains_window_function(expr: &Expr) -> bool {
     match expr {
-        Expr::Function(func) => func.over.is_some(),
-        Expr::BinaryOp { left, right, .. } => {
-            contains_window_function(left) || contains_window_function(right)
+        Expr::Function(func) if func.over.is_some() => true,
+        _ => {
+            let mut found = false;
+            // Children of a scalar wrapper (cast, arithmetic, CASE, a plain
+            // function call, ...). Subqueries are not entered: a window inside
+            // one belongs to that query.
+            let mut probe = expr.clone();
+            for_each_scalar_child_mut(&mut probe, &mut |child| {
+                found |= contains_window_function(child);
+            });
+            found
         }
-        Expr::UnaryOp { expr, .. } => contains_window_function(expr),
-        Expr::Nested(inner) => contains_window_function(inner),
-        _ => false,
+    }
+}
+
+/// Visit the direct scalar sub-expressions of `expr` (not subqueries).
+pub(super) fn for_each_scalar_child_mut(expr: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            f(left);
+            f(right);
+        }
+        Expr::UnaryOp { expr: e, .. }
+        | Expr::Nested(e)
+        | Expr::Cast { expr: e, .. }
+        | Expr::IsNull(e)
+        | Expr::IsNotNull(e)
+        | Expr::IsTrue(e)
+        | Expr::IsFalse(e) => f(e),
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            f(e);
+            f(low);
+            f(high);
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(o) = operand {
+                f(o);
+            }
+            for cw in conditions {
+                f(&mut cw.condition);
+                f(&mut cw.result);
+            }
+            if let Some(e) = else_result {
+                f(e);
+            }
+        }
+        Expr::Function(func) if func.over.is_none() => {
+            if let ast::FunctionArguments::List(list) = &mut func.args {
+                for arg in &mut list.args {
+                    if let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))
+                    | ast::FunctionArg::Named {
+                        arg: ast::FunctionArgExpr::Expr(e),
+                        ..
+                    } = arg
+                    {
+                        f(e);
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1959,7 +2020,7 @@ pub(super) fn value_to_csv_string_impl(value: &Value) -> String {
             u[14],
             u[15]
         ),
-        Value::Jsonb(j) => j.to_string(),
+        Value::Jsonb(j) => crate::types::jsonb_text(j),
         Value::Array(arr) => format!(
             "{{{}}}",
             arr.iter()
@@ -2016,7 +2077,7 @@ pub(super) fn value_to_text_string_impl(value: &Value) -> String {
             u[14],
             u[15]
         ),
-        Value::Jsonb(j) => j.to_string(),
+        Value::Jsonb(j) => crate::types::jsonb_text(j),
         Value::Array(arr) => format!(
             "{{{}}}",
             arr.iter()
@@ -2064,12 +2125,274 @@ pub(super) fn value_to_ast_expr(val: &Value) -> Expr {
         Value::Int64(n) => ast::Value::Number(n.to_string(), false),
         Value::Float64(f) => ast::Value::Number(f.to_string(), false),
         Value::Text(s) => ast::Value::SingleQuotedString(s.clone()),
-        _ => ast::Value::Null,
+        // Every remaining value round-trips through its text form under an
+        // explicit cast. This used to fall through to NULL, which silently
+        // turned a jsonb/date/timestamp/numeric/uuid outer reference or
+        // aggregate result into NULL.
+        Value::Jsonb(_)
+        | Value::Date(_)
+        | Value::Timestamp(_)
+        | Value::TimestampTz(_)
+        | Value::Numeric(_)
+        | Value::Uuid(_)
+        | Value::Bytea(_)
+        | Value::Interval { .. } => {
+            let data_type = match val {
+                Value::Jsonb(_) => ast::DataType::JSONB,
+                Value::Date(_) => ast::DataType::Date,
+                Value::Timestamp(_) => {
+                    ast::DataType::Timestamp(None, ast::TimezoneInfo::WithoutTimeZone)
+                }
+                Value::TimestampTz(_) => {
+                    ast::DataType::Timestamp(None, ast::TimezoneInfo::WithTimeZone)
+                }
+                Value::Numeric(_) => ast::DataType::Numeric(ast::ExactNumberInfo::None),
+                Value::Uuid(_) => ast::DataType::Uuid,
+                Value::Bytea(_) => ast::DataType::Bytea,
+                _ => ast::DataType::Interval {
+                    fields: None,
+                    precision: None,
+                },
+            };
+            return Expr::Cast {
+                kind: ast::CastKind::Cast,
+                expr: Box::new(Expr::value(ast::Value::SingleQuotedString(val.to_string()))),
+                data_type,
+                array: false,
+                format: None,
+            };
+        }
+        Value::Array(items) => {
+            return Expr::Array(ast::Array {
+                elem: items.iter().map(value_to_ast_expr).collect(),
+                named: true,
+            });
+        }
+        Value::Vector(_) => ast::Value::Null,
     };
     Expr::Value(ast::ValueWithSpan {
         value: v,
         span: sqlparser::tokenizer::Span::empty(),
     })
+}
+
+/// Preserve the declared element type when a correlated array value has no
+/// non-NULL elements from which a literal constructor could recover it.
+fn typed_value_to_ast_expr(value: &Value, dtype: &DataType) -> Expr {
+    let expr = value_to_ast_expr(value);
+    if !matches!(dtype, DataType::Array(_)) {
+        return expr;
+    }
+    let dialect = sqlparser::dialect::PostgreSqlDialect {};
+    let data_type = sqlparser::parser::Parser::new(&dialect)
+        .try_with_sql(&dtype.to_string())
+        .and_then(|mut parser| parser.parse_data_type());
+    match data_type {
+        Ok(data_type) => Expr::Cast {
+            kind: ast::CastKind::Cast,
+            expr: Box::new(expr),
+            data_type,
+            array: false,
+            format: None,
+        },
+        Err(_) => expr,
+    }
+}
+
+impl super::Executor {
+    /// Resolve scalar-subquery output metadata from its own relation scope.
+    /// This reads schemas and virtual catalog metadata, never evaluates the
+    /// subquery projection or its predicates to discover a type.
+    pub(super) fn infer_projection_type(&self, expr: &Expr, outer: &[ColMeta]) -> DataType {
+        let Expr::Subquery(query) = expr else {
+            return infer_expr_type(expr, outer);
+        };
+        self.infer_scalar_subquery_type(query, outer)
+            .unwrap_or(DataType::Text)
+    }
+
+    fn infer_scalar_subquery_type(
+        &self,
+        query: &ast::Query,
+        outer: &[ColMeta],
+    ) -> Option<DataType> {
+        use core::ops::ControlFlow;
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            return None;
+        };
+        // CTEs and derived relations need their own scope-aware metadata path.
+        if query.with.is_some() || select.projection.len() != 1 {
+            return None;
+        }
+        let mut local = Vec::new();
+        let mut labels = Vec::new();
+        for from in &select.from {
+            for factor in
+                std::iter::once(&from.relation).chain(from.joins.iter().map(|j| &j.relation))
+            {
+                let (label, mut meta) = match factor {
+                    ast::TableFactor::Table {
+                        name,
+                        alias,
+                        args: None,
+                        ..
+                    } => {
+                        let name = crate::sql::object_name_key(name);
+                        let label = alias
+                            .as_ref()
+                            .map(|a| a.name.value.clone())
+                            .unwrap_or_else(|| name.clone());
+                        let meta = if let Some(meta) = self.build_col_meta_from_cache(&name, &label)
+                        {
+                            meta
+                        } else {
+                            super::session::sync_block_on(
+                                self.load_virtual_table(&name.to_lowercase(), &label),
+                            )
+                            .ok()??
+                            .0
+                        };
+                        (label, meta)
+                    }
+                    ast::TableFactor::UNNEST {
+                        alias,
+                        array_exprs,
+                        with_ordinality,
+                        ..
+                    } => {
+                        let label = alias
+                            .as_ref()
+                            .map(|a| a.name.value.clone())
+                            .unwrap_or_else(|| "unnest".into());
+                        let mut meta = Vec::new();
+                        for expr in array_exprs {
+                            let mut dtype = infer_expr_type(expr, outer);
+                            if !matches!(dtype, DataType::Array(_)) {
+                                return None;
+                            }
+                            while let DataType::Array(inner) = dtype {
+                                dtype = *inner;
+                            }
+                            meta.push(ColMeta {
+                                table: Some(label.clone()),
+                                name: "unnest".into(),
+                                dtype,
+                            });
+                        }
+                        if *with_ordinality {
+                            meta.push(ColMeta {
+                                table: Some(label.clone()),
+                                name: "ordinality".into(),
+                                dtype: DataType::Int64,
+                            });
+                        }
+                        (label, meta)
+                    }
+                    _ => return None,
+                };
+                let alias = match factor {
+                    ast::TableFactor::Table { alias, .. }
+                    | ast::TableFactor::UNNEST { alias, .. } => alias,
+                    _ => unreachable!(),
+                };
+                if let Some(alias) = alias {
+                    for (col, alias_col) in meta.iter_mut().zip(&alias.columns) {
+                        col.name = alias_col.name.value.clone();
+                    }
+                }
+                labels.push(label);
+                local.extend(meta);
+            }
+        }
+        let mut expr = match &select.projection[0] {
+            ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } => {
+                expr.clone()
+            }
+            _ => return None,
+        };
+        let mut unresolved = false;
+        let _ = sqlparser::ast::visit_expressions_mut(&mut expr, |node| {
+            let (qualifier, name) = match node {
+                Expr::Identifier(id) => (None, id.value.clone()),
+                Expr::CompoundIdentifier(ids) if ids.len() == 2 => {
+                    (Some(ids[0].value.clone()), ids[1].value.clone())
+                }
+                Expr::Subquery(_) => {
+                    unresolved = true;
+                    return ControlFlow::<()>::Break(());
+                }
+                _ => return ControlFlow::<()>::Continue(()),
+            };
+            let matches = |col: &&ColMeta| {
+                col.name.eq_ignore_ascii_case(&name)
+                    && qualifier.as_ref().is_none_or(|q| {
+                        col.table
+                            .as_ref()
+                            .is_some_and(|t| t.eq_ignore_ascii_case(q))
+                    })
+            };
+            let mut candidates = local.iter().filter(matches);
+            let local_col = candidates.next();
+            if candidates.next().is_some() {
+                unresolved = true;
+                return ControlFlow::Break(());
+            }
+            let col = local_col.or_else(|| {
+                if qualifier
+                    .as_ref()
+                    .is_some_and(|q| labels.iter().any(|l| l.eq_ignore_ascii_case(q)))
+                {
+                    return None;
+                }
+                let mut candidates = outer.iter().filter(matches);
+                let col = candidates.next();
+                if candidates.next().is_some() {
+                    None
+                } else {
+                    col
+                }
+            });
+            if let Some(col) = col {
+                let dialect = sqlparser::dialect::PostgreSqlDialect {};
+                if let Ok(data_type) = sqlparser::parser::Parser::new(&dialect)
+                    .try_with_sql(&col.dtype.to_string())
+                    .and_then(|mut p| p.parse_data_type())
+                {
+                    *node = Expr::Cast {
+                        kind: ast::CastKind::Cast,
+                        expr: Box::new(Expr::value(ast::Value::Null)),
+                        data_type,
+                        array: false,
+                        format: None,
+                    };
+                } else {
+                    unresolved = true;
+                }
+            } else {
+                unresolved = true;
+            }
+            ControlFlow::Continue(())
+        });
+        if unresolved {
+            None
+        } else {
+            Some(infer_expr_type(&expr, &[]))
+        }
+    }
+
+    pub(super) fn projected_expr_type(
+        &self,
+        expr: &Expr,
+        value: &Value,
+        meta: &[ColMeta],
+    ) -> DataType {
+        let inferred = self.infer_projection_type(expr, meta);
+        if matches!(value, Value::Null) || matches!(inferred, DataType::Array(_)) {
+            inferred
+        } else {
+            value_type(value)
+        }
+    }
 }
 
 /// Substitute outer column references in an expression tree with literal values.
@@ -2103,7 +2426,7 @@ pub(super) fn substitute_outer_refs_in_query(
                             .is_some_and(|last| last.eq_ignore_ascii_case(&qual_last)))
                     && let Some(val) = outer_row.get(i)
                 {
-                    *node = value_to_ast_expr(val);
+                    *node = typed_value_to_ast_expr(val, &meta.dtype);
                     break;
                 }
             }
@@ -2251,24 +2574,27 @@ pub(super) fn value_to_json(val: &Value) -> serde_json::Value {
         Value::Float64(n) => serde_json::json!(*n),
         Value::Text(s) => serde_json::Value::String(s.clone()),
         Value::Jsonb(v) => v.clone(),
-        Value::Date(d) => serde_json::json!(d),
-        Value::Timestamp(us) => serde_json::json!(us),
-        Value::TimestampTz(us) => serde_json::json!(us),
-        Value::Numeric(s) => serde_json::Value::String(s.clone()),
+        // PostgreSQL's to_jsonb renders temporal values as ISO 8601 strings.
+        Value::Date(_) => serde_json::Value::String(val.to_string()),
+        Value::Timestamp(_) | Value::TimestampTz(_) => {
+            serde_json::Value::String(val.to_string().replacen(' ', "T", 1))
+        }
+        Value::Numeric(s) => numeric_to_json(s),
         Value::Uuid(b) => serde_json::Value::String(Value::Uuid(*b).to_string()),
         Value::Bytea(b) => serde_json::Value::String(Value::Bytea(b.clone()).to_string()),
         Value::Array(vals) => serde_json::Value::Array(vals.iter().map(value_to_json).collect()),
         Value::Vector(vec) => {
             serde_json::Value::Array(vec.iter().map(|f| serde_json::json!(f)).collect())
         }
-        Value::Interval {
-            months,
-            days,
-            microseconds,
-        } => {
-            serde_json::json!({ "months": months, "days": days, "microseconds": microseconds })
-        }
+        Value::Interval { .. } => serde_json::Value::String(val.to_string()),
     }
+}
+
+/// Preserve decimal digits and JSON number identity without an f64 conversion.
+fn numeric_to_json(s: &str) -> serde_json::Value {
+    s.parse::<serde_json::Number>()
+        .map(serde_json::Value::Number)
+        .unwrap_or_else(|_| serde_json::Value::String(s.to_string()))
 }
 
 /// Convert a Value (JSON array or text) to a Vector for vector operations.
@@ -2597,7 +2923,7 @@ pub(super) fn json_contains(left: &serde_json::Value, right: &serde_json::Value)
         (serde_json::Value::Array(a), serde_json::Value::Array(b)) => {
             b.iter().all(|bv| a.iter().any(|av| json_contains(av, bv)))
         }
-        (a, b) => a == b,
+        (a, b) => crate::types::compare_jsonb(a, b).is_eq(),
     }
 }
 

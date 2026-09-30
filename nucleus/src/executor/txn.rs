@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 
 use super::cross_model::{CrossModelLevel, CrossModelTxn};
+use super::txn_modes::TxnModes;
 use super::{ExecError, ExecResult, Executor};
 
 impl Executor {
@@ -27,15 +28,68 @@ impl Executor {
     /// When the storage engine supports MVCC, this delegates to the engine's
     /// snapshot-based transaction management. Otherwise, falls back to the
     /// legacy approach of cloning all table data for rollback.
+    #[cfg(feature = "server")]
     pub(super) async fn begin_transaction(&self) -> Result<ExecResult, ExecError> {
+        self.begin_transaction_with(TxnModes::default()).await
+    }
+
+    /// BEGIN with the modes the statement named (ISOLATION LEVEL, READ ONLY);
+    /// modes it left out come from the session defaults.
+    pub(super) async fn begin_transaction_with(
+        &self,
+        modes: TxnModes,
+    ) -> Result<ExecResult, ExecError> {
         let sess = self.current_session();
         let mut txn = sess.txn_state.write().await;
         if txn.active {
+            // A BEGIN inside a multi-statement message converts the message's
+            // implicit block into this explicit transaction (PostgreSQL): the
+            // earlier statements of the message belong to it and it stays
+            // open after the message.
+            if sess.implicit_txn.load(std::sync::atomic::Ordering::SeqCst) {
+                if let Some(level) = modes.isolation {
+                    if sess.txn_stmts.load(std::sync::atomic::Ordering::SeqCst) != 0
+                        && level != *sess.txn_isolation.lock()
+                    {
+                        return Err(ExecError::Runtime(
+                            "SET TRANSACTION ISOLATION LEVEL must be set before any query".into(),
+                        ));
+                    }
+                    self.require_isolation_level(level)?;
+                    if level != *sess.txn_isolation.lock() && self.storage.supports_mvcc() {
+                        self.storage.abort_txn().await?;
+                        self.storage.begin_txn().await?;
+                    }
+                    *sess.txn_isolation.lock() = level;
+                }
+                if let Some(read_only) = modes.read_only {
+                    if !read_only
+                        && sess.txn_read_only.load(std::sync::atomic::Ordering::SeqCst)
+                        && sess.txn_stmts.load(std::sync::atomic::Ordering::SeqCst) != 0
+                    {
+                        return Err(ExecError::Runtime(
+                            "transaction read-write mode must be set before any query".into(),
+                        ));
+                    }
+                    sess.txn_read_only
+                        .store(read_only, std::sync::atomic::Ordering::SeqCst);
+                }
+                sess.implicit_txn
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                return Ok(ExecResult::Command {
+                    tag: "BEGIN".into(),
+                    rows_affected: 0,
+                });
+            }
             return Ok(ExecResult::Command {
                 tag: "WARNING: already in a transaction".into(),
                 rows_affected: 0,
             });
         }
+
+        // Resolved before the engine transaction opens: the engine takes the
+        // level for its next BEGIN, and a level it cannot provide is refused.
+        let (isolation, read_only) = self.resolve_txn_modes(&modes)?;
 
         if self.storage.supports_mvcc() {
             // MVCC engine handles snapshot isolation internally.
@@ -67,11 +121,16 @@ impl Executor {
         txn.policy_dirty = false;
         txn.gin_dirty = false;
         txn.derived_dirty_tables.clear();
+        txn.storage_index_dirty_tables.clear();
         txn.engine_snapshots.clear();
         txn.engine_savepoints.clear();
         txn.aborted = false;
         sess.guc_begin();
 
+        *sess.txn_isolation.lock() = isolation;
+        sess.txn_read_only
+            .store(read_only, std::sync::atomic::Ordering::SeqCst);
+        sess.txn_stmts.store(0, std::sync::atomic::Ordering::SeqCst);
         txn.active = true;
         // Mirror kept in the same critical section — see `Session::txn_active`.
         sess.txn_active
@@ -87,6 +146,14 @@ impl Executor {
     /// COMMIT -- end the transaction, making all changes permanent.
     pub(super) async fn commit_transaction(&self) -> Result<ExecResult, ExecError> {
         let sess = self.current_session();
+        // Deferred foreign keys are checked while the transaction is still
+        // open, before its state lock is taken (the checks read tables). A
+        // violation rolls the transaction back and fails the COMMIT.
+        if sess.txn_active.load(std::sync::atomic::Ordering::SeqCst)
+            && !sess.txn_state.read().await.aborted
+        {
+            self.check_deferred_fks_at_commit().await?;
+        }
         let mut txn = sess.txn_state.write().await;
 
         if !txn.active {
@@ -168,6 +235,7 @@ impl Executor {
 
         let gin_dirty = txn.gin_dirty;
         let derived_dirty_tables: Vec<String> = txn.derived_dirty_tables.iter().cloned().collect();
+        let storage_index_dirty_tables = txn.storage_index_dirty_tables.clone();
         let policy_dirty = txn.policy_dirty;
         // Snapshot lease (Consumer-2): the lease's lifetime is the holding
         // transaction's — COMMIT releases it. Released AFTER the storage
@@ -196,6 +264,8 @@ impl Executor {
         txn.active = false;
         sess.txn_active
             .store(false, std::sync::atomic::Ordering::SeqCst);
+        sess.implicit_txn
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         txn.snapshot = None;
         txn.savepoints.clear();
         txn.engine_savepoints.clear();
@@ -205,9 +275,11 @@ impl Executor {
         txn.policy_dirty = false;
         txn.gin_dirty = false;
         txn.derived_dirty_tables.clear();
+        txn.storage_index_dirty_tables.clear();
         txn.engine_snapshots.clear();
         txn.engine_savepoints.clear();
         *sess.cross_model.lock() = None; // Discard the write-set on commit
+        sess.reset_deferred_fks();
         // SET LOCAL ends with the transaction; session-level SET stays.
         sess.guc_commit();
         self.recompute_session_context(&sess);
@@ -223,7 +295,11 @@ impl Executor {
             self.rebuild_all_gin_indexes().await;
         }
         for table in derived_dirty_tables {
-            self.rebuild_table_derived_state(&table).await;
+            if storage_index_dirty_tables.contains(&table) {
+                self.rebuild_committed_table_derived_state(&table).await;
+            } else {
+                self.rebuild_table_derived_state(&table).await;
+            }
         }
 
         // Policy publication is tied to the commit decision (A7): the staged
@@ -304,7 +380,8 @@ impl Executor {
     /// invisible. Without MVCC, restores all tables from the cloned snapshot.
     pub(super) async fn rollback_transaction(&self) -> Result<ExecResult, ExecError> {
         let sess = self.current_session();
-        let mut txn = sess.txn_state.write().await;
+        sess.reset_deferred_fks();
+        let txn = sess.txn_state.write().await;
 
         // Snapshot lease (Consumer-2): ROLLBACK releases it too — the
         // transaction is ending either way, and the lease's window must not
@@ -339,17 +416,30 @@ impl Executor {
         // Undo writes to tables served by a per-table engine. Those engines
         // provide no transaction of their own, so this is the only thing that
         // reverts them — see `storage_for_write`.
-        let engine_snapshots: Vec<(String, Vec<crate::types::Row>)> =
-            txn.engine_snapshots.drain().collect();
+        // Before-images stay recoverable until asynchronous restoration has
+        // completed. Cancellation can resume rollback instead of losing a
+        // snapshot that was moved into the dropped future.
+        let engine_snapshots: Vec<(String, Vec<crate::types::Row>)> = txn
+            .engine_snapshots
+            .iter()
+            .map(|(table, rows)| (table.clone(), rows.clone()))
+            .collect();
         let derived_dirty_tables: Vec<String> = txn.derived_dirty_tables.iter().cloned().collect();
-        // Rolled back: the rows this transaction was holding keys for no longer
-        // exist, so the keys are free.
+        drop(txn);
+        for (table, original) in &engine_snapshots {
+            self.restore_table_from_checked(table, original).await?;
+        }
+        for table in derived_dirty_tables {
+            self.rebuild_committed_table_derived_state(&table).await;
+        }
+        let mut txn = sess.txn_state.write().await;
         self.release_unique_slots(super::unique_gate::gate_session_id());
-        // Rolled back: the rows it locked with FOR UPDATE never changed, so
-        // they are claimable again immediately.
         self.release_row_locks(super::unique_gate::gate_session_id());
+        let was_active = txn.active;
         txn.active = false;
         sess.txn_active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        sess.implicit_txn
             .store(false, std::sync::atomic::Ordering::SeqCst);
         txn.snapshot = None;
         txn.savepoints.clear();
@@ -359,24 +449,14 @@ impl Executor {
         txn.policy_dirty = false;
         txn.gin_dirty = false;
         txn.derived_dirty_tables.clear();
+        txn.storage_index_dirty_tables.clear();
         txn.engine_snapshots.clear();
         txn.engine_savepoints.clear();
-        // Every SET, SET LOCAL and SET ROLE of the transaction is undone.
         sess.guc_rollback();
         self.recompute_session_context(&sess);
         self.sync_lock_timeout(&sess);
-
-        self.metrics.open_transactions.dec();
-        drop(txn);
-
-        for (table, original) in &engine_snapshots {
-            self.restore_table_from(table, original).await;
-        }
-
-        // Incremental index maintenance may have observed transaction-local
-        // rows. Rebuild after abort from the now-authoritative committed image.
-        for table in derived_dirty_tables {
-            self.rebuild_table_derived_state(&table).await;
+        if was_active {
+            self.metrics.open_transactions.dec();
         }
 
         Ok(ExecResult::Command {
@@ -430,6 +510,7 @@ impl Executor {
         };
         txn.security_savepoints.push(sp);
         sess.guc_savepoint(name);
+        sess.savepoint_deferred_fks(name);
 
         // Open a cross-model level for this savepoint. Its before-images are
         // captured lazily at the first write after this point, so a savepoint
@@ -471,6 +552,7 @@ impl Executor {
             txn.security_savepoints.truncate(pos);
         }
         sess.guc_release_savepoint(name);
+        sess.release_deferred_fks_savepoint(name);
         // Releasing keeps the writes; every level below already recorded them,
         // so the level is simply discarded.
         if let Some(cm) = sess.cross_model.lock().as_mut()
@@ -552,6 +634,7 @@ impl Executor {
         // fallible step is past by here; the reverts below are best-effort.
         txn.aborted = false;
         sess.guc_rollback_to_savepoint(name);
+        sess.rollback_deferred_fks_savepoint(name);
         self.recompute_session_context(&sess);
         self.sync_lock_timeout(&sess);
         drop(txn);

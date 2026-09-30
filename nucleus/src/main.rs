@@ -1197,7 +1197,7 @@ async fn cmd_start(cfg: StartConfig) {
         let buffered = Arc::new(BufferedDiskEngine::new(engine));
         tracing::info!(
             "Transaction support: buffered write-ahead (atomicity + rollback), \
-             SERIALIZABLE via table-level strict 2PL"
+             READ COMMITTED (higher isolation levels require MVCC)"
         );
         buffered_for_metrics = Some(buffered.clone());
         buffered as Arc<dyn StorageEngine>

@@ -99,6 +99,20 @@ fn panic_msg(p: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+/// Exact oracle adapter for EXTRACT, including its PostgreSQL result type.
+fn exact_numeric_matches(value: &Value, expected: &str) -> bool {
+    let Value::Numeric(text) = value else {
+        return false;
+    };
+    match (
+        rust_decimal::Decimal::from_str_exact(text),
+        rust_decimal::Decimal::from_str_exact(expected),
+    ) {
+        (Ok(actual), Ok(expected)) => actual == expected,
+        _ => false,
+    }
+}
+
 // ─── Value canonicalization ───────────────────────────────────────────────────
 /// Canonical float: round to 6dp string. Same for both engines.
 fn canon_f64(f: f64) -> String {
@@ -458,18 +472,15 @@ fn test_date(rng: &mut Rng, findings: &mut Vec<Finding>) {
             let sql = format!("SELECT EXTRACT({field} FROM DATE '{date_str}')");
             match nucleus_scalar(&ex, &sql) {
                 Ok(v) => {
-                    let got = match &v {
-                        Value::Int32(n) => *n as i64,
-                        Value::Int64(n) => *n,
-                        Value::Float64(f) => *f as i64,
-                        _ => -9999,
-                    };
-                    if got != *expected {
+                    let expected_text = expected.to_string();
+                    if !exact_numeric_matches(&v, &expected_text) {
                         findings.push(Finding {
-                            title: format!("DATE: EXTRACT({field}) wrong for {date_str}"),
+                            title: format!(
+                                "DATE: EXTRACT({field}) wrong value/type for {date_str}"
+                            ),
                             query: sql,
-                            nucleus: got.to_string(),
-                            expected: expected.to_string(),
+                            nucleus: format!("{v:?}"),
+                            expected: format!("NUMERIC {expected}"),
                             real_bug: true,
                         });
                     }
@@ -484,6 +495,30 @@ fn test_date(rng: &mut Rng, findings: &mut Vec<Finding>) {
                     });
                 }
             }
+        }
+    }
+
+    // Independent PostgreSQL values: do not truncate fractions or round via
+    // f64 when EXTRACT's result is the exact NUMERIC representation.
+    for (sql, expected) in [
+        (
+            "SELECT EXTRACT(SECOND FROM TIMESTAMP '2000-01-01 00:00:01.000001')",
+            "1.000001",
+        ),
+        (
+            "SELECT EXTRACT(EPOCH FROM TIMESTAMPTZ '1969-12-31 23:59:59.999999+00')",
+            "-0.000001",
+        ),
+    ] {
+        match nucleus_scalar(&ex, sql) {
+            Ok(value) if exact_numeric_matches(&value, expected) => {}
+            result => findings.push(Finding {
+                title: "DATE: fractional EXTRACT lost precision or result type".into(),
+                query: sql.into(),
+                nucleus: format!("{result:?}"),
+                expected: format!("NUMERIC {expected}"),
+                real_bug: true,
+            }),
         }
     }
 
@@ -1182,6 +1217,16 @@ fn main_impl() {
 
     println!("probe_types: extended column-type coverage harness");
     println!("seed={seed}  iterations={iterations}\n");
+
+    // Prove this oracle can see a one-microsecond change and a wrong wire
+    // type before allowing its comparisons to certify the engine.
+    if !exact_numeric_matches(&Value::Numeric("1.000001".into()), "1.000001")
+        || exact_numeric_matches(&Value::Numeric("1.000002".into()), "1.000001")
+        || exact_numeric_matches(&Value::Float64(1.000001), "1.000001")
+    {
+        eprintln!("EXTRACT oracle negative control failed");
+        std::process::exit(1);
+    }
 
     let mut all_findings: Vec<Finding> = Vec::new();
     let mut panics = 0usize;
