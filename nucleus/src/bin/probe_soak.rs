@@ -1248,7 +1248,7 @@ async fn run_soak(args: Args) -> bool {
         )));
     }
     for h in handles {
-        let _ = h.await;
+        h.await.expect("soak worker panicked or was cancelled");
     }
     shared.stop.store(true, Ordering::Relaxed);
     let series = sampler.await.unwrap_or_default();

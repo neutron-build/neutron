@@ -171,7 +171,6 @@ struct DiskTxnState {
     page_count_at_begin: u32,
 }
 
-/// Disk-backed storage engine.
 #[cfg(test)]
 struct IndexPublishHook {
     index_name: String,
@@ -179,6 +178,7 @@ struct IndexPublishHook {
     pause: Box<dyn FnOnce() + Send>,
 }
 
+/// Disk-backed storage engine.
 pub struct DiskEngine {
     /// Path of the primary data file (its `.wal` / `.wal.d` siblings hold the
     /// WAL). Needed by physical backup, which must copy this file through the
