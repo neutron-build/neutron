@@ -1,35 +1,6 @@
-// Reviewed reference API wire shapes, not generated OpenAPI types.
-export interface Project {
-    tenant_id: string;
-    id: string;
-    title: string;
-}
-export interface Document {
-    tenant_id: string;
-    id: string;
-    project_id: string;
-    content: string;
-    amount: string;
-    note: string | null;
-    payload: string;
-    version: string;
-    created_at: string;
-}
-export interface Job {
-    status: string;
-    attempts: number;
-    failure_code: string | null;
-    lease_until: string | null;
-}
-export interface Result {
-    content_digest: string;
-    word_count: number;
-    processed_at: string;
-}
-export interface Detail extends Document {
-    job: Job | null;
-    result: Result | null;
-}
+// API wire types come from the reviewed static spec; UI state remains local.
+import type { Project, Document, Detail } from "./api-types";
+export type { Project, Document, Job, Result, Detail } from "./api-types";
 export interface Draft {
     id: string;
     project_id: string;

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -29,6 +30,9 @@ import (
 	"github.com/neutron-build/neutron/go/neutronauth"
 	"github.com/neutron-build/neutron/go/nucleus"
 )
+
+//go:embed openapi.json
+var apiSpec []byte
 
 type tenantConfig struct {
 	URL  string `json:"url"`
@@ -138,6 +142,11 @@ func (s *service) app(secret string) *neutron.App {
 	app.Router().HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		respond(w, map[string]any{"status": "ok", "nucleus": false, "version": "1"})
 	})
+	app.Router().HandleFunc("GET /openapi.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(apiSpec)
+	})
+	app.Router().Handle("GET /docs", neutron.SwaggerUI(nil))
 	api := app.Router().Group("/api", neutronauth.JWTMiddleware(secret), s.authorize)
 	api.HandleFunc("POST /projects", s.wrap(s.createProject))
 	api.HandleFunc("GET /projects", s.wrap(s.listProjects))

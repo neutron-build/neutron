@@ -1,3 +1,4 @@
+import type { CreateProject, CreateDocument, UpdateNote } from "./api-types";
 import { randomUUID } from "node:crypto";
 import type { Project, Document, Detail, Draft, Outcome, Page } from "./models";
 const loopback = new Set(["127.0.0.1", "localhost", "[::1]"]);
@@ -88,17 +89,17 @@ export async function submit(request: Request): Promise<Outcome> {
             throw new Error("Unknown form field");
         if (intent === "project") {
             projectDraft = { id: id(field(form, "id")), title: field(form, "title") };
-            const project = await call<Project>("/api/projects", projectDraft);
+            const project = await call<Project>("/api/projects", projectDraft satisfies CreateProject);
             return { status: 200, kind: "success", message: `Project ${project.id} created` };
         }
         if (intent === "document") {
             draft = { id: id(field(form, "id")), project_id: id(field(form, "project_id")), content: field(form, "content"), amount: field(form, "amount"), note_kind: field(form, "note_kind"), note: field(form, "note"), payload: field(form, "payload"), idempotency_key: field(form, "idempotency_key") };
-            const document = await call<Document>("/api/documents", { id: draft.id, project_id: draft.project_id, content: draft.content, amount: draft.amount, note: nullable(form), payload: draft.payload, idempotency_key: draft.idempotency_key });
+            const document = await call<Document>("/api/documents", { id: draft.id, project_id: draft.project_id, content: draft.content, amount: draft.amount, note: nullable(form), payload: draft.payload, idempotency_key: draft.idempotency_key } satisfies CreateDocument);
             return { status: 200, kind: "success", draft, message: `Created or replayed document ${document.id}; version ${document.version}` };
         }
         if (intent === "note") {
             noteDraft = { id: id(field(form, "id")), expected_version: field(form, "expected_version"), note_kind: field(form, "note_kind"), note: field(form, "note") };
-            const document = await call<Document>("/api/documents/" + noteDraft.id + "/note", { expected_version: noteDraft.expected_version, note: nullable(form) });
+            const document = await call<Document>("/api/documents/" + noteDraft.id + "/note", { expected_version: noteDraft.expected_version, note: nullable(form) } satisfies UpdateNote);
             return { status: 200, kind: "success", message: `Note updated; version ${document.version}` };
         }
         throw new Error("Unknown form intent");

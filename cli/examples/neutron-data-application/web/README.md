@@ -31,9 +31,10 @@ Database setup is an explicit operator prerequisite: provision reviewed roles,
 then run `neutron project run migrate` with DATABASE_URL set only for that task
 to the migration-owner URL. Never carry that owner credential into runtime role
 configuration. The coordinator does not run migrations automatically.
-The current API has no /openapi.json and web returns HTML there; the coordinator
-reports these contract warnings. Readiness and address injection work, but this
-fixture does not claim complete framework-contract or generated-client support.
+The API serves its reviewed static `/openapi.json`; the web enables the native
+SSR discovery response and `/docs` through server.openapi. These remove the
+missing discovery warnings. This fixture does not claim automatic raw-handler
+schema generation or complete framework-contract compliance.
 
 The worker currently emits a readiness line rather than serving a probe. The
 coordinator understands HTTP/TCP probes, not that line, so the manifest honestly
@@ -58,6 +59,8 @@ version replacement occurs. Unknown outcomes display safe guidance.
 Form submission renders a result message within the SSR page; its status field
 is a UI outcome, not a replacement HTTP API status contract.
 
-API wire shapes in models.ts are reviewed handwritten types. They are not
-invented/generated OpenAPI. The full three-language workflow, release/restore,
+API wire shapes in api-types.ts are generated from the one reviewed static
+`../api/openapi.json` by `npm run generate:api`; `npm run check:api` detects
+stale output and runs before npm typecheck. models.ts contains local UI state.
+This bounded generator produces types, not runtime validation or typed handlers. The full three-language workflow, release/restore,
 public authentication and shipping gates are separate from this bounded UI.

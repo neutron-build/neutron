@@ -95,3 +95,91 @@ func TestApplicationPrincipalAndSecretRedaction(t *testing.T) {
 		t.Fatal(w.Body.String())
 	}
 }
+
+func TestStaticDiscoveryAndWireContract(t *testing.T) {
+	s := &service{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	var spec struct {
+		OpenAPI    string                                `json:"openapi"`
+		Paths      map[string]map[string]json.RawMessage `json:"paths"`
+		Components struct {
+			Schemas map[string]struct {
+				Required   []string                   `json:"required"`
+				Properties map[string]json.RawMessage `json:"properties"`
+			} `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(apiSpec, &spec); err != nil {
+		t.Fatal(err)
+	}
+	if spec.OpenAPI != "3.1.0" {
+		t.Fatal(spec.OpenAPI)
+	}
+	app := s.app(strings.Repeat("x", 32))
+	for _, path := range []string{"/openapi.json", "/docs"} {
+		w := httptest.NewRecorder()
+		app.Handler().ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		if w.Code != 200 {
+			t.Fatal(path, w.Code)
+		}
+		if path == "/openapi.json" && (w.Header().Get("Content-Type") != "application/json" || w.Body.String() != string(apiSpec)) {
+			t.Fatal("discovery differs from embedded spec")
+		}
+		if path == "/docs" && !strings.Contains(w.Body.String(), "/openapi.json") {
+			t.Fatal("docs points elsewhere")
+		}
+	}
+	for _, route := range app.Router().Routes() {
+		if strings.HasPrefix(route.Pattern, "/api/") {
+			if _, ok := spec.Paths[route.Pattern][strings.ToLower(route.Method)]; !ok {
+				t.Fatalf("missing route %s %s", route.Method, route.Pattern)
+			}
+		}
+	}
+	samples := map[string]any{"Project": Project{}, "Document": Document{Amount: "9999999999999999999999.123456789012345678", Version: "9007199254740993", Payload: []byte{0, 255}, CreatedAt: "2026-09-30T22:34:56.123456Z"}, "Job": Job{}, "Result": Result{}, "Detail": Detail{}}
+	for name, sample := range samples {
+		raw, _ := json.Marshal(sample)
+		var fields map[string]json.RawMessage
+		_ = json.Unmarshal(raw, &fields)
+		schema := spec.Components.Schemas[name]
+		if len(fields) != len(schema.Properties) {
+			t.Fatalf("%s wire field drift", name)
+		}
+		for _, field := range schema.Required {
+			if _, ok := fields[field]; !ok {
+				t.Fatalf("%s missing required %s", name, field)
+			}
+		}
+		for field := range fields {
+			if _, ok := schema.Properties[field]; !ok {
+				t.Fatalf("%s unknown %s", name, field)
+			}
+		}
+		if name == "Document" {
+			for _, field := range []string{"amount", "version", "payload", "created_at"} {
+				var v string
+				if json.Unmarshal(fields[field], &v) != nil {
+					t.Fatalf("%s must be string", field)
+				}
+			}
+			if string(fields["note"]) != "null" {
+				t.Fatal("note null lost")
+			}
+		}
+	}
+	for _, name := range []string{"CreateDocument", "UpdateNote"} {
+		schema := spec.Components.Schemas[name]
+		found := false
+		for _, field := range schema.Required {
+			found = found || field == "note"
+		}
+		if !found {
+			t.Fatal("note presence unspecified")
+		}
+		var value map[string]any
+		_ = json.Unmarshal(schema.Properties["note"], &value)
+		types := value["type"].([]any)
+		if len(types) != 2 || types[1] != "null" {
+			t.Fatal("nullable note drift")
+		}
+	}
+}

@@ -62,9 +62,21 @@ Business reads/writes use the actual Nucleus SQL/Tx API. Per-connection startup
 checks use the existing SDK `WithPoolConfig`/driver `AfterConnect` option because
 the SDK has no public checked-out-connection metadata hook. Neutron raw routes
 retain required-nullable presence and strict object validation; they do not
-claim generated typed-handler OpenAPI coverage. Worker execution, migration,
+claim generated typed-handler OpenAPI coverage. The reviewed static
+`openapi.json` is embedded and served publicly at `/openapi.json`; `/docs` uses
+the SDK Swagger UI (external CDN assets require connectivity). Every declared
+API operation remains an explicit raw handler with strict validation. Worker execution, migration,
 backup/restore and full application acceptance are separate steps.
 
 `go test ./...` checks exact boundary behavior and authentication. Actual HTTP
 and role/oracle tests run against disposable provisioned databases in the private
 application evidence harness; ordinary unit tests do not contact a database.
+
+The single static API spec supplies cross-service wire types via
+`node ../web/scripts/generate-api-types.mjs`; `--check` detects stale output.
+The bounded generator emits TypeScript shapes, not runtime validators or
+automatic typed handlers. API tests compare registered route coverage and
+actual marshaled response fields/types to the spec. Use
+`neutron project spec --check --service api` with private runtime configuration
+to compare the live embedded artifact with the canonical committed snapshot.
+The web has its own native SSR discovery document, not a second business API.
