@@ -52,16 +52,17 @@ type ExtendedWindow struct {
 	SampledRSSPeakKiB int64
 }
 type ExtendedPhase struct {
-	Trial       int
-	Position    int
-	Provider    string
-	Kind        string
-	Concurrency int
-	Start       int64
-	End         int64
-	Calls       []ExtendedCall
-	Windows     []ExtendedWindow
-	RSS         []RSSSample
+	HostUptimeBefore string
+	Trial            int
+	Position         int
+	Provider         string
+	Kind             string
+	Concurrency      int
+	Start            int64
+	End              int64
+	Calls            []ExtendedCall
+	Windows          []ExtendedWindow
+	RSS              []RSSSample
 }
 type ChildResult struct {
 	Provider                 string
@@ -218,7 +219,8 @@ func extendedPhase(ctx context.Context, f *Fixture, p Provider, trial, pos, n, c
 	if sustained {
 		kind = "sustained_mixed"
 	}
-	phase := ExtendedPhase{Trial: trial, Position: pos, Provider: p.Name(), Kind: kind, Concurrency: c, Start: time.Now().UnixNano()}
+	host, _ := exec.Command("uptime").Output()
+	phase := ExtendedPhase{HostUptimeBefore: strings.TrimSpace(string(host)), Trial: trial, Position: pos, Provider: p.Name(), Kind: kind, Concurrency: c, Start: time.Now().UnixNano()}
 	stop := make(chan struct{})
 	rs := make(chan []RSSSample, 1)
 	go sampleRSS(os.Getpid(), stop, rs)
