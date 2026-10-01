@@ -187,18 +187,18 @@ defmodule Nucleus.Migration do
 
       true ->
         Postgrex.transaction(Nucleus.Client.pool(client), fn conn ->
-          [[version]] = query(conn, "SELECT version()", []).rows
+          [[version]] = query(conn, "SELECT pg_catalog.version()", []).rows
 
           if not String.starts_with?(version, "PostgreSQL ") or
                String.contains?(version, "Nucleus"),
              do: Postgrex.rollback(conn, :migration_requires_postgresql)
 
-          query(conn, "SELECT pg_advisory_xact_lock($1)", [@lock_key])
+          query(conn, "SELECT pg_catalog.pg_advisory_xact_lock($1)", [@lock_key])
 
           {schema, schema_oid} =
             case query(
                    conn,
-                   "SELECT n.nspname, n.oid::bigint FROM pg_catalog.pg_namespace n WHERE n.nspname = current_schema()",
+                   "SELECT n.nspname, n.oid::bigint FROM pg_catalog.pg_namespace n WHERE n.nspname = pg_catalog.current_schema()",
                    []
                  ).rows do
               [[schema, schema_oid]] -> {schema, schema_oid}
@@ -217,7 +217,7 @@ defmodule Nucleus.Migration do
           if oid == nil do
             query(
               conn,
-              "CREATE TABLE #{table} (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at TIMESTAMPTZ DEFAULT NOW())",
+              "CREATE TABLE #{table} (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at TIMESTAMPTZ DEFAULT pg_catalog.now())",
               []
             )
           end
@@ -236,7 +236,7 @@ defmodule Nucleus.Migration do
     temp =
       query(
         conn,
-        "SELECT relname FROM pg_catalog.pg_class WHERE relnamespace = pg_my_temp_schema() AND relname = ANY($1::text[])",
+        "SELECT relname FROM pg_catalog.pg_class WHERE relnamespace = pg_catalog.pg_my_temp_schema() AND relname = ANY($1::text[])",
         [names]
       ).rows
 
@@ -258,7 +258,8 @@ defmodule Nucleus.Migration do
         [schema, @migrations_table]
       ).rows
 
-    [[resolved]] = query(conn, "SELECT to_regclass($1)::oid::bigint", [@migrations_table]).rows
+    [[resolved]] =
+      query(conn, "SELECT pg_catalog.to_regclass($1)::oid::bigint", [@migrations_table]).rows
 
     case own do
       [] ->

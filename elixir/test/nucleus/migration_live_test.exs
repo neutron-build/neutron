@@ -410,9 +410,17 @@ defmodule Nucleus.MigrationLiveTest do
     role = "v10_elixir_lock_" <> Integer.to_string(System.unique_integer([:positive]))
     sql(o, "CREATE ROLE #{role} LOGIN PASSWORD 'ephemeral_probe'")
     sql(o, "GRANT USAGE, CREATE ON SCHEMA public TO #{role}")
+
+    sql(
+      o,
+      "CREATE FUNCTION public.pg_advisory_xact_lock(bigint) RETURNS void LANGUAGE plpgsql AS 'BEGIN RETURN; END'"
+    )
+
     sql(o, "REVOKE EXECUTE ON FUNCTION pg_catalog.pg_advisory_xact_lock(bigint) FROM PUBLIC")
     url = URI.parse(@url) |> Map.put(:userinfo, role <> ":ephemeral_probe") |> URI.to_string()
     {:ok, c} = start_client(url)
+    assert {:ok, _} = Client.query(c, "SET search_path TO public, pg_catalog")
+    assert {:ok, _} = Client.query(c, "SELECT public.pg_advisory_xact_lock($1)", [@key])
 
     try do
       assert {:error, %Postgrex.Error{postgres: %{code: :insufficient_privilege}}} =
@@ -422,6 +430,7 @@ defmodule Nucleus.MigrationLiveTest do
       refute present(o, "migration_first")
     after
       GenServer.stop(c)
+      sql(o, "DROP FUNCTION public.pg_advisory_xact_lock(bigint)")
       sql(o, "GRANT EXECUTE ON FUNCTION pg_catalog.pg_advisory_xact_lock(bigint) TO PUBLIC")
       sql(o, "DROP OWNED BY #{role}")
       sql(o, "DROP ROLE #{role}")
@@ -461,5 +470,58 @@ defmodule Nucleus.MigrationLiveTest do
     assert {:error, :invalid_migration_plan} = Migration.run(c, [{1, First}, {1, First}])
     assert {:error, :invalid_migration_plan} = Migration.run(c, [{0, First}])
     refute present(o, "_neutron_migrations")
+  end
+
+  test "catalog functions cannot be shadowed by application search_path", %{client: c, oracle: o} do
+    sql(o, "CREATE SCHEMA v10_function_shadow")
+
+    sql(
+      o,
+      "CREATE FUNCTION v10_function_shadow.pg_advisory_xact_lock(bigint) RETURNS void LANGUAGE plpgsql AS 'BEGIN RETURN; END'"
+    )
+
+    for {name, args, result} <- [
+          {"version", "", "text"},
+          {"current_schema", "", "name"},
+          {"pg_my_temp_schema", "", "oid"},
+          {"to_regclass", "text", "regclass"},
+          {"now", "", "timestamptz"}
+        ] do
+      sql(
+        o,
+        "CREATE FUNCTION v10_function_shadow.#{name}(#{args}) RETURNS #{result} LANGUAGE plpgsql AS 'BEGIN RAISE EXCEPTION ''shadow function called''; END'"
+      )
+    end
+
+    sql(o, "CREATE TABLE v10_function_shadow.migration_effects(id INT)")
+    assert {:ok, _} = Client.query(c, "SET search_path TO v10_function_shadow, pg_catalog")
+    parent = self()
+
+    task =
+      Task.async(fn ->
+        Process.put(:migration_test_parent, parent)
+        Migration.run(c, [{1, Barrier}])
+      end)
+
+    try do
+      assert_receive {:callback, owner, pid}, 5_000
+
+      assert sql(
+               o,
+               "SELECT count(*) FROM pg_catalog.pg_locks WHERE pid=$1 AND locktype='advisory' AND granted AND classid::bigint*4294967296+objid::bigint=$2",
+               [pid, @key]
+             ).rows == [[1]]
+
+      assert sql(o, "SELECT pg_catalog.pg_try_advisory_xact_lock($1)", [@key]).rows == [[false]]
+      send(owner, :release)
+      assert Task.await(task, 5_000) == {:ok, 1}
+      assert sql(o, "SELECT version FROM v10_function_shadow._neutron_migrations").rows == [[1]]
+      assert sql(o, "SELECT count(*) FROM v10_function_shadow.migration_effects").rows == [[1]]
+      assert sql(o, "SELECT pg_catalog.pg_try_advisory_xact_lock($1)", [@key]).rows == [[true]]
+    after
+      Task.shutdown(task, :brutal_kill)
+      Client.query(c, "SET search_path TO public")
+      sql(o, "DROP SCHEMA v10_function_shadow CASCADE")
+    end
   end
 end
