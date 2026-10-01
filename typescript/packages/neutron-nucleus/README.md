@@ -224,3 +224,36 @@ connection, as measured:
 ## License
 
 MIT
+
+
+### PostgreSQL scalar read profile
+
+Generated `lossless-read-v1` TypeScript models require an explicit SQL-only
+transport. The default transport keeps safe-number int8 behavior for existing
+model count/ID APIs and rejects integers beyond JavaScript precision.
+
+```ts
+import { createClient, PgTransport } from '@neutron-build/nucleus';
+import { withSQL } from '@neutron-build/nucleus/sql';
+const transport = new PgTransport(process.env.DATABASE_URL!, {
+  valueProfile: 'lossless-read-v1',
+});
+const db = await createClient({ url: process.env.DATABASE_URL!, transport })
+  .use(withSQL).connect();
+// db.sql.query<GeneratedRow>('SELECT ...') preserves int8/numeric as strings.
+```
+
+This PostgreSQL text-protocol profile matches the generator's ten builtin scalar
+types: int2/int4 numbers, int8/numeric strings, boolean, text/varchar/bpchar,
+UUID string and bytea Buffer (a Uint8Array). NULL remains null. Bytea requires
+hexadecimal output. Non-null values of other types refuse; the generator rejects
+unsupported column types before writing models. In particular, temporal values,
+arrays, JSON and domains are outside the generated profile. A null field alone
+does not prove its database type. This option does not make generic query types
+runtime schema validation.
+
+Parser policy is local to the pool; creating a Neutron transport does not change
+node-postgres's process-wide parsers or another library's int8 reads. Transaction
+reads use the same pool policy. Use separate default transports for model plugins
+and SDK migration APIs; those compositions deliberately refuse the SQL read
+profile. This profile does not certify Nucleus, HTTP/mobile or temporal precision.

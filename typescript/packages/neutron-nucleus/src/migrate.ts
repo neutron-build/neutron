@@ -13,6 +13,7 @@ import { createHash } from "node:crypto";
 import { hostname } from "node:os";
 
 import type { Transport } from './types.js';
+import { PgTransport } from './transport.js';
 import { sqlState } from './retry.js';
 
 // ---------------------------------------------------------------------------
@@ -22,6 +23,7 @@ import { sqlState } from './retry.js';
 interface MigrationNamespace { schema: string; sql(statement: string): string }
 
 async function captureMigrationNamespace(transport: Transport): Promise<MigrationNamespace> {
+  if (transport instanceof PgTransport && transport.valueProfile === 'lossless-read-v1') throw new Error('lossless-read-v1 is a SQL read profile; use a separate default migration transport');
   let result;
   try {
     result = await transport.query<{ intended_schema: string | null; schema_oid: string | null; catalog_oid: string | null; name: string; relation_oid: string | null; resolved_schema: string | null; kind: string | null; persistence: string | null; version_oid: string | null; version_kind: string | null; version_namespace: string | null; version_name: string | null }>(`
