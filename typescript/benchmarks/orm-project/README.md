@@ -87,7 +87,7 @@ statement; calls per second means service cycles/reads, not SQL statements.
 Startup is **process cold**, with warm OS/filesystem and database caches.
 Parent wall time includes spawning through clean exit, including 1,000 subsequent verified point reads; child ready time starts
 inside Node before provider imports and ends after its first successful query.
-It excludes Node's pre-script startup and excludes disconnect. Each child's
+It excludes Node's pre-script startup and excludes disconnect. A separate parent launch-to-first-result marker includes process creation and Node's startup before the script. Each child's
 baseline/ready RSS, working RSS after 1,000 verified reads, and OS process-lifetime `maxRSS` are recorded. These include
 runtime, provider, adapters and pools, not just ORM-owned allocations. Only
 provider-specific imports run in that child. Four observations per provider
