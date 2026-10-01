@@ -1,0 +1,50 @@
+package main
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/neutron-build/neutron/go/nucleus"
+)
+
+type Temporal struct {
+	Happened time.Time `db:"happened"`
+}
+
+func main() {
+	ctx := context.Background()
+	db, err := nucleus.Connect(ctx, os.Getenv("DATABASE_URL"))
+	must(err)
+	defer db.Close()
+	rows, err := nucleus.Query[Scalars](ctx, db.SQL(), "SELECT * FROM fixture.scalars ORDER BY row_id")
+	must(err)
+	out := make([]map[string]any, 0, len(rows))
+	for _, r := range rows {
+		b, err := json.Marshal(r)
+		must(err)
+		var m map[string]any
+		must(json.Unmarshal(b, &m))
+		if r.I8 != nil {
+			m["i8"] = fmt.Sprint(*r.I8)
+		}
+		if r.Payload != nil {
+			m["payload"] = hex.EncodeToString(*r.Payload)
+		}
+		out = append(out, m)
+	}
+	t, err := nucleus.QueryOne[Temporal](ctx, db.SQL(), "SELECT happened FROM fixture.temporal")
+	must(err)
+	if t.Happened.Nanosecond() != 123456000 {
+		panic("microsecond loss")
+	}
+	must(json.NewEncoder(os.Stdout).Encode(map[string]any{"rows": out, "temporal": t.Happened.UTC().Format("2006-01-02T15:04:05.000000-07:00")}))
+}
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
