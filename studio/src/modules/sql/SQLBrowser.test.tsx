@@ -707,6 +707,22 @@ describe('SQLBrowser S01 binding, read-level state and composite FK follow', () 
     expect(tableData.mock.calls[0][8]).toEqual(match)
   })
 
+  it('column permissions suppress mutation affordances on a structurally writable table', async () => {
+    ordersSchema()
+    const metadata = docsMeta()
+    tableMeta.mockResolvedValue({ ...metadata, canDelete: false,
+      columns: metadata.columns.map(c => ({ ...c, editable: false, insertable: false })) })
+    tableData.mockResolvedValue(ordersResult([[1, 7n, 'o1']]))
+
+    render(<SQLBrowser schema="public" table="orders" />)
+    await waitFor(() => expect(screen.getByRole('note').textContent).toContain('no columns can be edited or inserted'))
+    expect(screen.queryByRole('button', { name: '+ Insert' })).toBeNull()
+    expect(screen.queryByText(/double-click a cell/)).toBeNull()
+    fireEvent.dblClick(cellAt(0, 'label'))
+    expect(document.querySelector('select[aria-label$=" value state"]')).toBeNull()
+    expect(stagedEdits.value).toEqual([])
+  })
+
   it('a read-only table read wins even if metadata says editable', async () => {
     ordersSchema()
     tableMeta.mockResolvedValue(docsMeta())

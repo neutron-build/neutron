@@ -162,10 +162,14 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
   const readOnlyReason = useComputed<string | null>(() => {
     if (meta.value?.readOnly) return meta.value.readOnlyReason ?? 'read-only'
     if (result.value?.readOnly) return result.value.readOnlyReason ?? 'read-only'
+    if (meta.value && !meta.value.canDelete && !meta.value.columns.some(c => c.editable === true || c.insertable === true)) {
+      return 'Read-only: no columns can be edited or inserted, and rows cannot be deleted.'
+    }
     return null
   })
   const metaColumns = useComputed(() => meta.value?.columns ?? [])
   const editable = useComputed(() => (meta.value !== null && !meta.value.readOnly && result.value?.readOnly !== true) || undefined)
+  const canUpdate = useComputed(() => editable.value === true && metaColumns.value.some(c => c.editable === true))
   const canDelete = useComputed(() => meta.value?.canDelete === true)
 
   /** Build the versioned full-key identity for one row of the current read. */
@@ -524,7 +528,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
           {info && <span class={s.rowCount}>{info.rowCount?.toLocaleString() ?? '?'} rows</span>}
         </div>
         <div class={s.toolbarActions}>
-          {editable.value && (
+          {canImport.value && (
             <button class={s.btnAction} onClick={openInsert} title="Stage a new row (typed editors; DEFAULT omits the column)">
               + Insert
             </button>
@@ -658,8 +662,8 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
         {!loading.value && res && (
           <DataGrid
             result={res}
-            columns={editable.value ? metaColumns.value : undefined}
-            onStageUpdate={editable.value ? stageUpdate : undefined}
+            columns={canUpdate.value ? metaColumns.value : undefined}
+            onStageUpdate={canUpdate.value ? stageUpdate : undefined}
             onStageDelete={canDelete.value ? stageDelete : undefined}
             canDelete={canDelete.value}
             stagedRows={stagedRows.value}
