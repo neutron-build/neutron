@@ -178,6 +178,9 @@ func createFixture(ctx context.Context, adminURL string) (*Fixture, error) {
 	if err := rows.Err(); err != nil {
 		return fail(err)
 	}
+	if err := validateNativeSeed(fixture); err != nil {
+		return fail(err)
+	}
 	fixture.Digest, err = nativeDigest(ctx, fixture.Oracle)
 	if err != nil {
 		return fail(err)
@@ -240,20 +243,71 @@ func oracleDocuments(ctx context.Context, pool *pgxpool.Pool) (map[string]Docume
 }
 
 func nativeDigest(ctx context.Context, pool *pgxpool.Pool) (string, error) {
-	rows, err := pool.Query(ctx, "SELECT row_to_json(x)::text FROM (SELECT tenant,id,project_id,version::text,amount::text,note,encode(payload,'hex') AS payload FROM documents ORDER BY tenant,id) x")
-	if err != nil {
-		return "", err
-	}
-	defer rows.Close()
 	h := sha256.New()
-	for rows.Next() {
-		var line string
-		if err := rows.Scan(&line); err != nil {
+	queries := []string{
+		"SELECT row_to_json(x)::text FROM (SELECT tenant,id,title FROM projects ORDER BY tenant,id) x",
+		"SELECT row_to_json(x)::text FROM (SELECT tenant,id,project_id,version::text,amount::text,note,encode(payload,'hex') AS payload FROM documents ORDER BY tenant,id) x",
+	}
+	for index, query := range queries {
+		fmt.Fprintln(h, index)
+		rows, err := pool.Query(ctx, query)
+		if err != nil {
 			return "", err
 		}
-		fmt.Fprintln(h, line)
+		for rows.Next() {
+			var line string
+			if err := rows.Scan(&line); err != nil {
+				rows.Close()
+				return "", err
+			}
+			fmt.Fprintln(h, line)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return "", err
+		}
 	}
-	return hex.EncodeToString(h.Sum(nil)), rows.Err()
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// Validate explicit expected seed properties before using native values as the
+// oracle. Agreement among providers must not hide a degraded fixture.
+func validateNativeSeed(f *Fixture) error {
+	if len(f.Docs) != 4000 || len(f.Projects) != 202 {
+		return errors.New("native fixture cardinality differs")
+	}
+	for _, tenant := range []string{"a", "b"} {
+		for _, id := range []int32{1, 101} {
+			p, ok := f.Projects[key(tenant, id)]
+			if !ok || p.Tenant != tenant || p.ID != id || p.Title != tenant+"-project-"+strconv.Itoa(int(id)) {
+				return errors.New("native project seed differs")
+			}
+		}
+		empty := ""
+		literal := tenant + "'\\\n2"
+		allBytes := make([]byte, 256)
+		for i := range allBytes {
+			allBytes[i] = byte(i)
+		}
+		anchors := []Document{
+			{Tenant: tenant, ID: 1, ProjectID: 1, Version: -9223372036854775808, Amount: Decimal(exactAmount), Note: &empty, Payload: []byte{}},
+			{Tenant: tenant, ID: 2, ProjectID: 1, Version: 9223372036854775807, Amount: Decimal(exactAmount), Note: &literal, Payload: []byte{0, 255, 2, 34, 92}},
+			{Tenant: tenant, ID: 3, ProjectID: 1, Version: largeVersion, Amount: Decimal(exactAmount), Note: nil, Payload: allBytes},
+			{Tenant: tenant, ID: 4, ProjectID: 1, Version: largeVersion, Amount: Decimal(exactAmount), Note: &empty, Payload: nil},
+		}
+		for _, want := range anchors {
+			got, ok := f.Docs[key(tenant, want.ID)]
+			if !ok || same(got, want) != nil {
+				return errors.New("native exact-value seed differs")
+			}
+		}
+	}
+	for _, d := range f.Docs {
+		if (d.Tenant != "a" && d.Tenant != "b") || d.ID < 1 || d.ID > 2000 || d.ProjectID != (d.ID-1)/20+1 || d.Amount != Decimal(exactAmount) {
+			return errors.New("native fixture row invariant differs")
+		}
+	}
+	return nil
 }
 
 func (f *Fixture) expectedPage(tenant string, after int32) []Document {

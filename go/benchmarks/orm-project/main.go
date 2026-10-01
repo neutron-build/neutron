@@ -171,6 +171,7 @@ func run(out string, samples, warmups, trials int, correctnessOnly bool) (return
 		}
 	}()
 	report.Provenance["ddl_sha256"], report.Provenance["initial_native_digest"] = f.DDLHash, f.Digest
+	report.Provenance["native_seed_validation"] = map[string]any{"documents": len(f.Docs), "projects": len(f.Projects), "explicit_exact_value_anchors": 8, "validated_before_provider_reads": true, "digest_tables": []string{"projects", "documents"}}
 	var serverVersion string
 	if err := f.Oracle.QueryRow(ctx, "SELECT version()").Scan(&serverVersion); err != nil {
 		return errors.New("server identity failed")

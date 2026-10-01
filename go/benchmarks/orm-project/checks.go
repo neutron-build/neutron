@@ -192,6 +192,13 @@ func correctness(ctx context.Context, f *Fixture, providers []Provider) ([]Check
 			if err != nil || n != 0 {
 				return errors.New("stale CAS changed a row")
 			}
+			stored, err = oracleDocuments(ctx, f.Oracle)
+			if err != nil {
+				return err
+			}
+			if err := same(stored[key(d.Tenant, d.ID)], expected); err != nil {
+				return errors.New("stale CAS altered native winner snapshot")
+			}
 			_, err = p.Write(ctx, "delete", d, false)
 			return err
 		}); err != nil {

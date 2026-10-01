@@ -52,6 +52,8 @@ versus empty bytes, and all 256 byte values. GORM's decimal field uses a configu
 `database/sql.Scanner`/`driver.Valuer` mapping to exact decimal text; this is not an
 out-of-the-box float mapping. Neutron's decimal uses a string-kind field. The
 independent oracle reads native `amount::text`, `version::text` and hex bytes.
+Before accepting that oracle, the runner verifies native fixture cardinalities
+and explicit signed-int64/decimal/NULL/empty/arbitrary-byte anchor values.
 
 Correctness covers point/miss, keyset boundaries, tenant-qualified composite
 relationships, empty/missing parents, create/read/delete, explicit rollback,
@@ -82,6 +84,8 @@ before oracle comparison. Report serialization occurs after timing. Phase
 throughput also includes dispatch, post-call validation and goroutine scheduling.
 Every measured result is checked against the preloaded native oracle. Native
 database digests must be unchanged after correctness and after measurement.
+Those ordered digests include both project and document rows. Stale CAS also
+must leave the native winning row unchanged before it is deleted for cleanup.
 Raw indexed latency samples, all error categories, nearest-rank p50/p95/p99,
 throughput, fixture DDL hash, candidate-source hashes, module build information,
 Go/runtime identity, PostgreSQL settings and revision are preserved in the report.
