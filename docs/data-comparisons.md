@@ -69,7 +69,7 @@ GORM/pgx's default prepared-statement caching. These are application API costs
 under documented configurations.
 
 Do not treat small differences or overlapping trial ranges as an overall winner.
-The timing fixtures do not measure cold start, memory, writes, sustained
+The read-only timing profiles do not measure cold start, memory, writes, sustained
 production capacity, migrations or developer adoption effort. Write and rollback
 correctness checks are not write-performance benchmarks. Run comparisons without
 competing builds or benchmarks, and keep enough raw samples for any statistical
@@ -108,3 +108,68 @@ profiling candidates. A faster raw-client path does not justify removing
 validation or adding a universal ORM runtime. Establish the target workload and
 required semantics, profile a demonstrated bottleneck, and rerun the affected
 correctness and measurement cases after a change.
+
+## Extended application experiments
+
+The extended profiles add transactional write timing, fresh-process startup,
+process memory observations, bounded mixed-load phases and an executable
+application service. Follow the language README for its exact commands and
+output contract; use a different output directory from the read comparison.
+
+Writes exercise actual provider transaction APIs and exact values. Python and
+TypeScript time a create/conditional-update/read/delete transaction. Go also
+measures separately committed create/update/delete operations, readback and
+stale updates, with native verification between steps. Compare providers within
+the same language profile; these are different transaction contracts across
+languages. A completed application operation is not a SQL statement or database
+transaction count.
+
+Fresh-process startup uses the existing PostgreSQL server and warm host caches.
+Record the distinction between first-result readiness and the total child
+lifecycle, which can include validation, memory probes, connection closure and
+process exit. This is process-cold behavior, not a cold database, filesystem,
+container or machine restart. Connection initialization policies can differ.
+
+RSS includes the language runtime, imports, pools and harness. Isolated child
+experiments execute 1,000 verified reads after the first result. Python imports
+all providers; Go uses a shared binary; TypeScript dynamically imports its chosen
+provider. These observations do not isolate library allocation or establish a
+cross-language memory ranking. Parent load-process RSS can include retained
+samples, allocator history and earlier providers. Treat that as diagnostic;
+separate current RSS, sampled peak and any OS process-lifetime high-water mark.
+Sampling and external memory probes add overhead and can miss short peaks.
+
+The final bounded load profile repeats 30-second closed-loop phases with four
+workers and balanced provider ordering. Retain raw operation timestamps, error
+categories and five-second windows. Throughput includes consumer scheduling and
+validation; independent oracle queries may also consume database resources.
+This is a reproducible local workload, not a maximum-capacity test or hours-long
+production soak. Read/write mixtures, transaction boundaries and working sets
+are recorded per language, so do not merge their rates into one leaderboard.
+
+The adoption scenario runs a tenant-scoped document or issue service through
+create, edit, stale-version conflict, keyset list, parent/children, rollback and
+delete. It checks tenant separation and persisted state using a native oracle.
+Inspect the provider-specific models, schema declarations, SQL, transaction code
+and setup steps. Passing this small service shows that integration works for
+those use cases; it is not a human usability study, productivity score, full
+framework certification or automatic-migration parity. The fixture owns schema
+DDL; an application must still nominate its migration authority.
+
+The fixture's integration requirements are concrete:
+
+| Provider | Application code and setup exercised |
+| --- | --- |
+| Neutron TypeScript | Table declarations, public query builders and callback transactions; explicit tenant predicates |
+| Drizzle | Table declarations, a node-postgres driver and query builders/callback transactions |
+| Prisma | A Prisma schema, generated client, PostgreSQL adapter and callback transactions |
+| Neutron Python | Pydantic result models, parameter-bound SQL and transaction context managers |
+| SQLAlchemy ORM | Declarative models, async Sessions and ORM statement/mutation APIs |
+| SQLAlchemy Core | Table metadata, statement builders and async Connections/transactions |
+| Neutron Go | Struct mappings, parameter-bound SQL and explicit transactions |
+| GORM | Model tags, configured exact decimal Scanner/Valuer, query builders and transactions |
+
+Raw driver baselines also require their own SQL and transaction lifecycle code.
+The examples run application services directly. They do not test a particular
+web framework, HTTP throughput, production authentication, or migration from an
+existing customer project.
