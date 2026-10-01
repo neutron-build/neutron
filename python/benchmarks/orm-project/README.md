@@ -45,6 +45,9 @@ able to create/drop a temporary database and terminate its own database sessions
 The comparison uses that same account inside its fixture; it **does not certify
 RLS, least privilege or application permission isolation**.
 
+Use `--correctness-only` to run correctness and SQL audit without any timed
+operations. The report records zero timed calls and measurement as not run.
+
 The output parent must exist. Each run creates a new private output directory
 and refuses reuse. It creates only a randomized `neutron_compare_py_<hex>`
 database, writes no migrations to an existing application database, and drops

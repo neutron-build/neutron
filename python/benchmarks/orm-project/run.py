@@ -306,10 +306,13 @@ async def run(args):
             await instance.close()
             active.remove(instance)
         write_json(output/"sql-audit.json", {"scope":"client execution callbacks, not wire messages or network roundtrips; asyncpg reset commands may appear; SQLAlchemy transaction protocol not fully represented", "operations":audits})
-        for factory in PROVIDERS:
-            instance = await factory.open(url)
-            active.append(instance)
-        measurement = await measure(active,oracle,output,args.trials,args.samples,args.warmups)
+        if args.correctness_only:
+            measurement = {"status":"NOT_RUN","reason":"--correctness-only", "total_timed_operations":0}
+        else:
+            for factory in PROVIDERS:
+                instance = await factory.open(url)
+                active.append(instance)
+            measurement = await measure(active,oracle,output,args.trials,args.samples,args.warmups)
         write_json(output/"measurement.json",measurement)
         versions = {name:metadata.version(name) for name in ("SQLAlchemy","greenlet","asyncpg","pydantic","typing_extensions","neutron-framework")}
         write_json(output/"environment.json", {"python":sys.version,"executable":sys.executable,"platform":platform.platform(),"machine":platform.machine(),"packages":versions,"database":database,"server":dict(server),"settings":dict(await oracle.fetchrow("SELECT current_setting('shared_buffers') AS shared_buffers,current_setting('max_connections') AS max_connections,current_setting('jit') AS jit")),"pool_max_each":4,"scope":"candidate source, local warm reads; SQLAlchemy ORM and Core separate; no cross-language ranking"})
@@ -345,8 +348,8 @@ async def run(args):
     disk_guard(output)
     if failure is not None:
         raise failure
-    write_json(output/"result.json",{"status":"PASS","source_revision":source["revision"],"timed_calls":args.trials*args.samples*4*3*2})
-    print("PASS: Python correctness, SQL audit, warm-read measurement and owned-database cleanup")
+    write_json(output/"result.json",{"status":"PASS","source_revision":source["revision"],"timed_calls":0 if args.correctness_only else args.trials*args.samples*4*3*2,"mode":"correctness-only" if args.correctness_only else "correctness-and-measurement"})
+    print("PASS: Python correctness, SQL audit and owned-database cleanup" + ("; measurement not requested" if args.correctness_only else "; warm-read measurement completed"))
 
 
 def main():
@@ -357,6 +360,7 @@ def main():
     parser.add_argument("--trials",type=int,default=4)
     parser.add_argument("--samples",type=int,default=100)
     parser.add_argument("--warmups",type=int,default=20)
+    parser.add_argument("--correctness-only",action="store_true",help="correctness and SQL audit only, with no timed operations")
     args = parser.parse_args()
     if args.trials<4 or args.trials%4 or args.samples<100 or args.warmups<1:
         parser.error("trials must be positive multiple of4; samples>=100; warmups>=1")
