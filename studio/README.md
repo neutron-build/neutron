@@ -457,3 +457,17 @@ Grid, D3-force, Cytoscape.js, and a Rust backend, described a file layout that
 does not match the tree, and ended with "Status: Planned — not yet
 implemented" — while `studio/src/modules/` already ships a browser for each of
 the 14 models and the Go backend runs in CI. Found by the S97 claims audit.*
+
+### Codegen read profiles
+
+The schema designer's **Codegen read profile** selector defaults to **Legacy**.
+Select **Lossless read v1** explicitly for PostgreSQL scalar TS/Python/Go read
+models. CLI and Studio use the same generator. Legacy numeric mappings can
+lose precision; selecting the new profile does not change migration ownership
+or generate insert/update contracts. Unsupported types/languages are refused
+with table/column/type context displayed in the code panel.
+
+See [the generated read contract](../contracts/data/GENERATED.md) for admitted
+catalog identities, native transports and language-specific null/presence
+limits. The new profile does not provide six-language lossless equivalence or
+support temporal/array/JSON/domain/enum/composite fields.

@@ -500,3 +500,19 @@ describe('api', () => {
     })
   })
 })
+
+describe('codegen selected read profile', () => {
+  afterEach(() => vi.unstubAllGlobals())
+  it('passes the explicit profile and preserves contextual server errors', async () => {
+    const fetch = vi.fn().mockResolvedValue({ok:false,status:400,text:async () => JSON.stringify({error:'python samples column stamp type pg_catalog.timestamp: unsupported identity'})})
+    vi.stubGlobal('fetch', fetch)
+    await expect(api.codegen('c1', 'public', 'samples', 'python', 'lossless-read-v1')).rejects.toThrow('column stamp')
+    expect(fetch.mock.calls[0][0]).toContain('profile=lossless-read-v1')
+  })
+  it('defaults to the legacy profile', async () => {
+    const fetch=vi.fn().mockResolvedValue({ok:true,json:async()=>({code:'legacy'})})
+    vi.stubGlobal('fetch',fetch)
+    await api.codegen('c1','public','samples','ts')
+    expect(fetch.mock.calls[0][0]).toContain('profile=legacy')
+  })
+})

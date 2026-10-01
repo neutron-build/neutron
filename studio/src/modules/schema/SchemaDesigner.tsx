@@ -119,6 +119,7 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
 
   // Codegen
   const codegenLang = useSignal<Lang>('go')
+  const codegenProfile = useSignal<'legacy' | 'lossless-read-v1'>('legacy')
   const codegenCode = useSignal('')
   const codegenLoading = useSignal(false)
 
@@ -168,12 +169,14 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
   // Load codegen when table or lang changes
   useEffect(() => {
     if (!selectedTable.value || !conn) return
+    let cancelled = false
     codegenLoading.value = true
-    api.codegen(conn.id, selectedSchema.value, selectedTable.value, codegenLang.value)
-      .then(r => { codegenCode.value = r.code })
-      .catch(() => { codegenCode.value = '// error generating code' })
-      .finally(() => { codegenLoading.value = false })
-  }, [selectedTable.value, selectedSchema.value, codegenLang.value, conn?.id])
+    api.codegen(conn.id, selectedSchema.value, selectedTable.value, codegenLang.value, codegenProfile.value)
+      .then(r => { if (!cancelled) codegenCode.value = r.code })
+      .catch(error => { if (!cancelled) codegenCode.value = `// ${error instanceof Error ? error.message : String(error)}` })
+      .finally(() => { if (!cancelled) codegenLoading.value = false })
+    return () => { cancelled = true }
+  }, [selectedTable.value, selectedSchema.value, codegenLang.value, codegenProfile.value, conn?.id])
 
   if (!conn) {
     return <div class={s.hint}>Connect to a database to use Schema Designer</div>
@@ -568,6 +571,11 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
                 <div class={s.section}>
                   <div class={s.codegenHeader}>
                     <span class={s.sectionTitle}>Codegen</span>
+                    <select aria-label="Codegen read profile" value={codegenProfile.value}
+                      onChange={e => { codegenProfile.value = e.currentTarget.value as 'legacy' | 'lossless-read-v1' }}>
+                      <option value="legacy">Legacy</option>
+                      <option value="lossless-read-v1">Lossless read v1 (PG scalar TS/Python/Go)</option>
+                    </select>
                     <div class={s.langTabs}>
                       {(['go', 'ts', 'rust', 'python'] as Lang[]).map(l => (
                         <button

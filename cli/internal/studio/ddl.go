@@ -106,11 +106,14 @@ type IndexDetail struct {
 
 // colInfo is used internally by the code generators.
 type colInfo struct {
-	name     string
-	dataType string
-	udtName  string
-	nullable bool
-	isPK     bool
+	name          string
+	dataType      string
+	udtName       string
+	nullable      bool
+	isPK          bool
+	typeOID       int64
+	typeNamespace string
+	typeKind      string
 }
 
 // --- /api/columns ---
@@ -326,6 +329,26 @@ func (s *Server) handleCodegen(w http.ResponseWriter, r *http.Request) {
 	client, ok := s.clientFor(connID)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "not connected")
+		return
+	}
+
+	profile := q.Get("profile")
+	if err := ValidateCodegenProfile(profile, lang); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if profile == LosslessReadProfile {
+		cols, err := FetchColsForProfile(r.Context(), client, schemaName, tableName, profile)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("%s %s.%s: %v", lang, schemaName, tableName, err))
+			return
+		}
+		code, err := GenerateCodeProfile(profile, lang, tableName, cols)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"code": code})
 		return
 	}
 
