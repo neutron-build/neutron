@@ -195,7 +195,7 @@ async def measure(providers, oracle, output, trials, samples, warmups):
     expected = {
         "point": (await oracle_rows(oracle, "WHERE tenant='a' AND id=17"))[0],
         "page": await oracle_rows(oracle, "WHERE tenant='a' AND id>20 ORDER BY id LIMIT 20"),
-        "relationship_children": await oracle_rows(oracle, "WHERE tenant='a' AND project_id=3 ORDER BY id LIMIT 20"),
+        "relationship": {"tenant":"a","id":3,"title":"a-3","documents":await oracle_rows(oracle, "WHERE tenant='a' AND project_id=3 ORDER BY id LIMIT 20")},
     }
     summary = []
     raw = output / "samples.jsonl"
@@ -207,10 +207,11 @@ async def measure(providers, oracle, output, trials, samples, warmups):
             for workload in expected:
                 for concurrency in (1,4):
                     for provider in order:
-                        method = {"point":provider.point,"page":provider.page,"relationship_children":provider.children}[workload]
-                        key = {"point":17,"page":20,"relationship_children":3}[workload]
+                        method = {"point":provider.point,"page":provider.page,"relationship":provider.relation}[workload]
+                        key = {"point":17,"page":20,"relationship":3}[workload]
                         def validate(result):
-                            same(normalize(result) if workload=="point" else [normalize(r) for r in result], expected[workload])
+                            actual = normalize(result) if workload=="point" else normalized_relation(result) if workload=="relationship" else [normalize(r) for r in result]
+                            same(actual, expected[workload])
                         for _ in range(warmups):
                             validate(await method("a",key))
                         latencies = []
