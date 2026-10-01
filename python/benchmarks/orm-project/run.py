@@ -314,7 +314,13 @@ async def run(args):
                 active.append(instance)
             measurement = await measure(active,oracle,output,args.trials,args.samples,args.warmups)
         write_json(output/"measurement.json",measurement)
-        versions = {name:metadata.version(name) for name in ("SQLAlchemy","greenlet","asyncpg","pydantic","typing_extensions","neutron-framework")}
+        versions = {name:metadata.version(name) for name in ("SQLAlchemy","greenlet","asyncpg","pydantic","typing_extensions")}
+        # The candidate source is intentionally imported via PYTHONPATH. It need
+        # not have an installed distribution; do not invent a wheel identity.
+        try:
+            versions["neutron-framework"] = metadata.version("neutron-framework")
+        except metadata.PackageNotFoundError:
+            versions["neutron-framework"] = None
         write_json(output/"environment.json", {"python":sys.version,"executable":sys.executable,"platform":platform.platform(),"machine":platform.machine(),"packages":versions,"database":database,"server":dict(server),"settings":dict(await oracle.fetchrow("SELECT current_setting('shared_buffers') AS shared_buffers,current_setting('max_connections') AS max_connections,current_setting('jit') AS jit")),"pool_max_each":4,"scope":"candidate source, local warm reads; SQLAlchemy ORM and Core separate; no cross-language ranking"})
     except BaseException as error:
         failure = error
