@@ -41,6 +41,7 @@ reuse and startup refusal. Without both variables they explicitly skip.
 
 Revision 2 adds the database-derived `documents.content_octets` column. Existing
 API/worker projections and writes remain valid on either supported revision.
-Unknown revisions are refused at startup/physical connection admission. This is
+Unknown revisions are refused by worker startup admission; the worker does not
+continuously recheck the marker or install a per-connection revision hook. This is
 an explicit compatibility range for this additive change, not arbitrary-schema
 compatibility or per-statement structural validation.
