@@ -143,9 +143,10 @@ export function ConnectionManager() {
 
   return (
     <div class={s.page}>
+      <h1 class={s.pageTitle}>Neutron Studio</h1>
       <div class={s.card}>
         <div class={s.cardHeader}>
-          <div><h1 class={s.cardTitle}>Connections</h1><p class={s.cardSubtitle}>Choose a database to open your workspace.</p></div>
+          <div><h2 class={s.cardTitle}>Connections</h2><p class={s.cardSubtitle}>Choose a database to open your workspace.</p></div>
           <button class={s.btnAdd} onClick={() => { showAdd.value = !showAdd.value }}>
             {showAdd.value ? 'Cancel' : '+ Add'}
           </button>
