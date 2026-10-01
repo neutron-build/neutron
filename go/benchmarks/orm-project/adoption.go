@@ -6,7 +6,8 @@ import (
 )
 
 // IssueService is an executable tiny application boundary, not a benchmark API.
-// Tenant is fixed by authenticated scope; callers cannot supply another tenant.
+// Tenant is fixed by the application service instance; this fixture does not
+// implement authentication. Callers cannot supply another tenant to its methods.
 type IssueService struct {
 	tenant string
 	data   Provider
