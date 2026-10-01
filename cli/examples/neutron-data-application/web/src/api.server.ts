@@ -59,10 +59,17 @@ export async function load(request: Request): Promise<Page> {
     const project = query.get("project_id") ? id(query.get("project_id")!) : "";
     const projectCursor = query.get("projects_after") ? id(query.get("projects_after")!) : "";
     const docCursor = query.get("documents_after") ? id(query.get("documents_after")!) : "";
-    const projects = await call<Project[]>("/api/projects" + (projectCursor ? "?after=" + projectCursor : ""));
-    const documents = project ? await call<Document[]>("/api/documents?project_id=" + project + (docCursor ? "&after=" + docCursor : "")) : [];
-    const detail = query.get("document_id") ? await call<Detail>("/api/documents/" + id(query.get("document_id")!)) : null;
-    return { projects, documents, project, detail, projectID: randomUUID(), draft: { id: randomUUID(), project_id: project, content: "", amount: "0.000000000000000000", note_kind: "null", note: "", payload: "", idempotency_key: randomUUID() } };
+    const fallback: Page = { projects: [], documents: [], project, detail: null, projectID: randomUUID(), draft: { id: randomUUID(), project_id: project, content: "", amount: "0.000000000000000000", note_kind: "null", note: "", payload: "", idempotency_key: randomUUID() } };
+    try {
+        const projects = await call<Project[]>("/api/projects" + (projectCursor ? "?after=" + projectCursor : ""));
+        const documents = project ? await call<Document[]>("/api/documents?project_id=" + project + (docCursor ? "&after=" + docCursor : "")) : [];
+        const detail = query.get("document_id") ? await call<Detail>("/api/documents/" + id(query.get("document_id")!)) : null;
+        return { ...fallback, projects, documents, detail };
+    } catch {
+        // Rendering actionData must not depend on a successful follow-up read.
+        // Empty fallback collections are unavailable data, never observed empty state.
+        return { ...fallback, readError: "Current state is unavailable. Your submitted values below are preserved; a failed refresh does not establish whether a write committed. No write was retried. Keep these values and inspect durable state before another action." };
+    }
 }
 function field(form: FormData, key: string): string { const values = form.getAll(key); if (values.length !== 1 || typeof values[0] !== "string")
     throw new Error("Required form value missing or repeated"); return values[0]; }
@@ -90,7 +97,7 @@ export async function submit(request: Request): Promise<Outcome> {
         if (intent === "project") {
             projectDraft = { id: id(field(form, "id")), title: field(form, "title") };
             const project = await call<Project>("/api/projects", projectDraft satisfies CreateProject);
-            return { status: 200, kind: "success", message: `Project ${project.id} created` };
+            return { status: 200, kind: "success", projectDraft, message: `Project ${project.id} created` };
         }
         if (intent === "document") {
             draft = { id: id(field(form, "id")), project_id: id(field(form, "project_id")), content: field(form, "content"), amount: field(form, "amount"), note_kind: field(form, "note_kind"), note: field(form, "note"), payload: field(form, "payload"), idempotency_key: field(form, "idempotency_key") };
@@ -100,7 +107,7 @@ export async function submit(request: Request): Promise<Outcome> {
         if (intent === "note") {
             noteDraft = { id: id(field(form, "id")), expected_version: field(form, "expected_version"), note_kind: field(form, "note_kind"), note: field(form, "note") };
             const document = await call<Document>("/api/documents/" + noteDraft.id + "/note", { expected_version: noteDraft.expected_version, note: nullable(form) } satisfies UpdateNote);
-            return { status: 200, kind: "success", message: `Note updated; version ${document.version}` };
+            return { status: 200, kind: "success", noteDraft, message: `Note updated; version ${document.version}` };
         }
         throw new Error("Unknown form intent");
     }

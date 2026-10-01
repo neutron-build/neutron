@@ -64,3 +64,10 @@ API wire shapes in api-types.ts are generated from the one reviewed static
 stale output and runs before npm typecheck. models.ts contains local UI state.
 This bounded generator produces types, not runtime validation or typed handlers. The full three-language workflow, release/restore,
 public authentication and shipping gates are separate from this bounded UI.
+
+If the post-action read fails, SSR renders an explicit unavailable-state notice
+and retains the action result and submitted document/project values. CAS
+receives a recovery form with the original expected version and note even when
+no current document can be loaded. These collections are unavailable, not
+observed empty state. Keep the displayed values and inspect durable state before
+choosing a further action; recovery never automatically retries a write.

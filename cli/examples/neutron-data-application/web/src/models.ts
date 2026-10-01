@@ -28,6 +28,7 @@ export interface Outcome {
     };
 }
 export interface Page {
+    readError?: string;
     projects: Project[];
     documents: Document[];
     project: string;
