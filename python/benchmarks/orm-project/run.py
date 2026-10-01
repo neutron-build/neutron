@@ -25,6 +25,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 
 GUARD = 6 * 1024**3
+WILLIAMS_ORDER = ((0,1,3,2),(1,2,0,3),(2,3,1,0),(3,0,2,1))
 SOURCE = Path(__file__).resolve().parent
 OWNED_OUTPUT = None
 DECIMAL = "1234567890123456789012.123456789012345679"
@@ -202,8 +203,8 @@ async def measure(providers, oracle, output, trials, samples, warmups):
     with raw.open("x", encoding="utf-8") as stream:
         os.chmod(raw,0o600)
         for trial in range(trials):
-            # Complete four-trial balanced cyclic order for four providers.
-            order = providers[trial%4:] + providers[:trial%4]
+            # Balance positions and all twelve directed adjacent predecessor pairs.
+            order = [providers[i] for i in WILLIAMS_ORDER[trial%4]]
             for workload in expected:
                 for concurrency in (1,4):
                     for provider in order:
@@ -230,7 +231,7 @@ async def measure(providers, oracle, output, trials, samples, warmups):
                         phase_ns = time.perf_counter_ns()-before_phase
                         summary.append({"provider":provider.name,"trial":trial,"workload":workload,"concurrency":concurrency,"samples":len(latencies),"phase_ns":phase_ns,"operations_per_second":samples*1e9/phase_ns,"p50_ns":percentile(latencies,.5),"p95_ns":percentile(latencies,.95),"p99_ns":percentile(latencies,.99),"min_ns":min(latencies),"max_ns":max(latencies)})
     same(await snapshot(oracle), initial)
-    return {"trials":trials,"samples_per_phase":samples,"warmups_per_phase":warmups,"total_timed_operations":sum(p["samples"] for p in summary),"rows":4000,"summary":summary,"oracle_snapshot_sha256":hashlib.sha256(json.dumps(initial,sort_keys=True).encode()).hexdigest(),"validation":"every timed result exact; entire native database snapshot unchanged", "timing_scope":"public operation including pool/session lease, SQLAlchemy implicit transaction close and mapping; excludes result validation and evidence serialization", "throughput_scope":"whole phase includes dispatch, validation and evidence serialization; not pure database throughput"}
+    return {"trials":trials,"samples_per_phase":samples,"warmups_per_phase":warmups,"total_timed_operations":sum(p["samples"] for p in summary),"rows":4000,"provider_order_names":[p.name for p in providers],"provider_order_indices":WILLIAMS_ORDER,"working_set":"fixed tenant a; point17, keyset after20, project3 relationship; hot repeated queries","summary":summary,"oracle_snapshot_sha256":hashlib.sha256(json.dumps(initial,sort_keys=True).encode()).hexdigest(),"validation":"every timed result exact; entire native database snapshot unchanged", "timing_scope":"public operation including pool/session lease, SQLAlchemy implicit transaction close and mapping; excludes result validation and evidence serialization", "throughput_scope":"whole phase includes dispatch, validation and evidence serialization; not pure database throughput"}
 
 
 async def run(args):

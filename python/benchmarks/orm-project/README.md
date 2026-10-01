@@ -78,7 +78,8 @@ counter**, and no callback is attached to a timed provider.
 
 ## Measurement and limits
 
-Default measurement runs four balanced cyclic trials, 100 measured calls per
+Default measurement runs four Williams-order trials balancing provider positions
+and all twelve directed adjacent predecessor pairs, 100 measured calls per
 phase, 20 warmups, concurrency 1 and 4, and point/20-row keyset/20-child relationship
 reads over 4,000 documents. This is 9,600 timed operations. More samples can be
 requested; trial counts must be positive multiples of four. Every result is
@@ -87,6 +88,12 @@ remain unchanged. Raw nanosecond samples and per-trial p50/p95/p99 are retained.
 The whole-phase throughput includes dispatch, assertions and evidence writing;
 it is not pure database throughput. Four local trials do not establish statistical
 significance or performance superiority.
+
+The timed queries use a **fixed hot working set**: tenant `a`, document17,
+keyset after20, and project3 with20children, repeated throughout each phase.
+This intentionally measures repeated-query behavior, not a varied or random
+application working set. Other language harnesses can use different access
+patterns; those results must not be compared as language performance rankings.
 
 Reports record source/SDK hashes and import origin, dependency/runtime versions,
 server configuration, fixture identity and cleanup. This harness compares a
