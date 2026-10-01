@@ -364,6 +364,8 @@ func runExtended(out string, n, trials, seconds int, correctnessOnly bool) (err 
 		return errors.New("fresh output required")
 	}
 	r := ExtendedReport{Status: "failed", Provenance: provenance()}
+	r.Provenance["read_profile_contract"] = r.Provenance["contract"]
+	delete(r.Provenance, "contract")
 	defer func() {
 		if err != nil {
 			r.Status = "failed"
