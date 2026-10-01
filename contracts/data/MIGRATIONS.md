@@ -42,8 +42,11 @@ in either direction. Moving between shapes is an explicit adoption.
 
 ## 2. History table
 
-`_neutron_migrations` is preserved in place. Protocol v2 adds (via
-`ADD COLUMN IF NOT EXISTS` on legacy tables, present from creation on new ones):
+`_neutron_migrations` is preserved in place. New histories include the following
+metadata from creation. Existing legacy histories gain these columns only during
+explicit adoption (`ADD COLUMN IF NOT EXISTS`); ordinary apply, down and status
+refuse incomplete metadata or any row without the supported v2 format. Lock
+bootstrap metadata can still be created before that refusal (§5).
 
 | Column | Meaning |
 |---|---|
