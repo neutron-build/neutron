@@ -148,6 +148,21 @@ async function ensureTable(transport: Transport): Promise<void> {
   await executeBootstrapDdl(transport, MIGRATIONS_ADD_FORMAT);
 }
 
+/** Ordinary runs create a fresh v2 table but never add columns to legacy history. */
+async function prepareMigrationHistory(transport: Transport): Promise<void> {
+  await checkHistoryShape(transport);
+  const result = await transport.query<{ column_name: string }>(`
+    SELECT column_name FROM information_schema.columns
+    WHERE table_schema = current_schema() AND table_name = '_neutron_migrations'`);
+  const columns = new Set(result.rows.map((row) => row.column_name));
+  if (columns.size > 0) {
+    for (const column of ['checksum', 'owner', 'format']) {
+      if (!columns.has(column)) throw new Error(`nucleus: legacy migration history lacks ${column}; call adoptMigrations explicitly before continuing`);
+    }
+  }
+  await executeBootstrapDdl(transport, MIGRATIONS_TABLE_SQL);
+}
+
 interface AppliedRow {
   version: number;
   checksum: string | null;
@@ -188,12 +203,12 @@ function prepareMigrations(migrations: Migration[]): Migration[] {
   return sorted;
 }
 
-/** Refuse a history this runner must not touch, before any mutation: a TEXT
+/** Refuse a history before history mutation (claim metadata may already exist): a TEXT
  * version column means the canonical CLI protocol owns the database. */
 async function checkHistoryShape(transport: Transport): Promise<void> {
   const result = await transport.query<{ data_type: string }>(`
     SELECT data_type FROM information_schema.columns
-    WHERE table_name = '_neutron_migrations' AND column_name = 'version'`);
+    WHERE table_schema = current_schema() AND table_name = '_neutron_migrations' AND column_name = 'version'`);
   if (result.rows.length === 0) return; // table absent: fresh database
   const t = String(result.rows[0].data_type).toLowerCase();
   if (t === 'integer' || t === 'smallint' || t === 'bigint') return;
@@ -201,26 +216,25 @@ async function checkHistoryShape(transport: Transport): Promise<void> {
     throw new Error(
       'nucleus: _neutron_migrations.version is a text column — this history belongs to the ' +
         'canonical CLI protocol (text IDs); the SDK runner refuses rather than mix formats. ' +
-        'Use `neutron migrate`, or re-adopt the history with the CLI to move it back to integer versions');
+        'Use `neutron migrate` for this text-ID history; moving it to SDK integer IDs requires explicit reconciliation');
   }
   throw new Error(`nucleus: _neutron_migrations.version has unsupported type "${t}"`);
 }
 
-/** Refuse rows this runner cannot trust, before any mutation: every row
+/** Refuse rows this runner cannot trust, before business-schema mutation: every row
  * must be protocol v2. NULL-format rows are legacy (TS history, or pre-M04
  * Go history) and graduate only through adoptMigrations. v2 rows with
  * checksums are enforced; adopted-unverified rows (NULL checksum) are
  * exempt — never silently baselined. */
 function verifyHistory(plan: Migration[], applied: Map<number, AppliedRow>): void {
+  for (const [version, rec] of [...applied].sort(([a], [b]) => a - b)) {
+    if (rec.format !== MIGRATION_HISTORY_FORMAT) {
+      throw new Error(`nucleus: migration ${version} is recorded without the supported v2 history format; reconcile and call adoptMigrations explicitly before continuing (unprovable rows stay unverified)`);
+    }
+  }
   for (const m of plan) {
     const rec = applied.get(m.version);
     if (!rec) continue;
-    if (rec.format !== MIGRATION_HISTORY_FORMAT) {
-      throw new Error(
-        `nucleus: migration ${m.version} (${m.name}) is recorded in a legacy history format and must be ` +
-          'adopted once before this runner continues — call adoptMigrations (explicit, transactional; ' +
-          'unprovable rows stay unverified)');
-    }
     if (rec.checksum == null) continue; // adopted-unverified: exempt
     const want = migrationChecksum(m.up);
     if (rec.checksum !== want) {
@@ -339,8 +353,7 @@ export async function migrate(
   const owner = options?.owner ?? defaultOwner();
 
   try {
-    await checkHistoryShape(transport);
-    await ensureTable(transport);
+    await prepareMigrationHistory(transport);
     const applied = await appliedRows(transport);
     verifyHistory(plan, applied);
 
@@ -389,8 +402,7 @@ export async function migrateDown(
   const token = await acquireMigrationLock(transport, options);
 
   try {
-    await checkHistoryShape(transport);
-    await ensureTable(transport);
+    await prepareMigrationHistory(transport);
     const applied = await appliedRows(transport);
     verifyHistory(plan, applied);
 
@@ -443,7 +455,7 @@ export async function adoptMigrations(
     await checkHistoryShape(transport);
 
     const exists = await transport.fetchval<number>(
-      'SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = \'_neutron_migrations\')');
+      'SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = \'_neutron_migrations\')');
     if (!exists) throw new Error('nucleus: nothing to adopt: no migration history exists');
 
     const byVersion = new Map(plan.map((m) => [m.version, m]));
@@ -452,7 +464,7 @@ export async function adoptMigrations(
     let tx = await transport.beginTransaction();
     try {
       const hasChecksum = await tx.fetchval<boolean>(
-        "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = '_neutron_migrations' AND column_name = 'checksum')");
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '_neutron_migrations' AND column_name = 'checksum')");
       const history = await tx.query<{ version: number; name: string; checksum: string | null }>(
         hasChecksum ? 'SELECT version, name, checksum FROM _neutron_migrations' :
           'SELECT version, name, NULL AS checksum FROM _neutron_migrations');
@@ -524,7 +536,8 @@ export async function adoptMigrations(
  * Return all previously applied migrations, ordered by version ascending.
  */
 export async function migrationStatus(transport: Transport): Promise<MigrationRecord[]> {
-  await ensureTable(transport);
+  await prepareMigrationHistory(transport);
+  verifyHistory([], await appliedRows(transport));
   const result = await transport.query<{ version: number; name: string; applied_at: string }>(
     'SELECT version, name, applied_at FROM _neutron_migrations ORDER BY version',
   );

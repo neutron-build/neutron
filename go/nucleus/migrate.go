@@ -319,14 +319,15 @@ func (c *Client) ensureMigrationsTable(ctx context.Context) error {
 }
 
 // checkHistoryShape refuses a history this runner must not touch, before
-// any mutation: a TEXT version column means the canonical CLI protocol owns
-// the database (the SDK's public API carries integer versions and cannot
+// history mutation (claim metadata may already exist). A TEXT version column
+// means the canonical CLI protocol owns the database (the SDK's public API
+// carries integer versions and cannot
 // represent its text IDs).
 func (c *Client) checkHistoryShape(ctx context.Context) error {
 	var versionType *string
 	err := c.pool.QueryRow(ctx, `
 		SELECT data_type FROM information_schema.columns
-		WHERE table_name = '_neutron_migrations' AND column_name = 'version'`).Scan(&versionType)
+		WHERE table_schema = current_schema() AND table_name = '_neutron_migrations' AND column_name = 'version'`).Scan(&versionType)
 	if err != nil {
 		if strings.Contains(err.Error(), "no rows") {
 			return nil // table absent: fresh database
@@ -343,10 +344,54 @@ func (c *Client) checkHistoryShape(ctx context.Context) error {
 		return fmt.Errorf(
 			"nucleus: _neutron_migrations.version is a text column — this history belongs to the " +
 				"canonical CLI protocol (text IDs); the SDK runner refuses rather than mix formats. " +
-				"Use `neutron migrate`, or re-adopt the history with the CLI to move it back to integer versions")
+				"Use `neutron migrate` for this text-ID history; moving it to SDK integer IDs requires explicit reconciliation")
 	default:
 		return fmt.Errorf("nucleus: _neutron_migrations.version has unsupported type %q", t)
 	}
+}
+
+// checkHistoryMetadata admits only complete v2 metadata shapes. Existing
+// legacy columns are added by explicit adoption, never by an ordinary run.
+func (c *Client) checkHistoryMetadata(ctx context.Context) error {
+	rows, err := c.pool.Query(ctx, `SELECT column_name FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = '_neutron_migrations'`)
+	if err != nil {
+		return fmt.Errorf("nucleus: inspect migration metadata: %w", err)
+	}
+	defer rows.Close()
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var column string
+		if err := rows.Scan(&column); err != nil {
+			return err
+		}
+		columns[column] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(columns) == 0 {
+		return nil
+	}
+	for _, column := range []string{"checksum", "owner", "format"} {
+		if !columns[column] {
+			return fmt.Errorf("nucleus: legacy migration history lacks %s; adopt explicitly with AdoptMigrations before continuing", column)
+		}
+	}
+	return nil
+}
+
+func (c *Client) prepareMigrationHistory(ctx context.Context) error {
+	if err := c.checkHistoryShape(ctx); err != nil {
+		return err
+	}
+	if err := c.checkHistoryMetadata(ctx); err != nil {
+		return err
+	}
+	if _, err := c.pool.Exec(ctx, migrationsTable); err != nil {
+		return fmt.Errorf("nucleus: prepare migrations table: %w", err)
+	}
+	return nil
 }
 
 // appliedVersion is one _neutron_migrations row as Migrate consumes it.
@@ -380,24 +425,29 @@ func (c *Client) appliedVersions(ctx context.Context) (map[int]appliedVersion, e
 	return applied, rows.Err()
 }
 
-// verifyHistory refuses rows this runner cannot trust, before any mutation
-// (the M04 transition): every row must be protocol v2. Rows with NULL
+// verifyHistory refuses rows this runner cannot trust before business-schema
+// mutation (the M04 transition): every row must be protocol v2. Rows with NULL
 // format are legacy — TS-SDK history (no checksum) or pre-M04 Go history
 // (legacy digest) — and graduate only through explicit adoption. Rows that
 // carry a v2 marker are checksum-enforced; adopted-unverified rows (NULL
 // checksum, v2 format) are exempt: there is nothing to compare against and
 // they are never silently baselined.
 func verifyHistory(plan []Migration, applied map[int]appliedVersion) error {
+	versions := make([]int, 0, len(applied))
+	for version := range applied {
+		versions = append(versions, version)
+	}
+	sort.Ints(versions)
+	for _, version := range versions {
+		rec := applied[version]
+		if rec.format == nil || *rec.format != MigrationHistoryFormat {
+			return fmt.Errorf("nucleus: migration %d is recorded without the supported v2 history format; reconcile and adopt explicitly with AdoptMigrations before continuing (unprovable rows stay unverified)", version)
+		}
+	}
 	for _, m := range plan {
 		rec, isApplied := applied[m.Version]
 		if !isApplied {
 			continue
-		}
-		if rec.format == nil || *rec.format != MigrationHistoryFormat {
-			return fmt.Errorf(
-				"nucleus: migration %d (%s) is recorded in a legacy history format and must be adopted "+
-					"once before this runner continues — call AdoptMigrations (explicit, transactional; "+
-					"unprovable rows stay unverified)", m.Version, m.Name)
 		}
 		if rec.checksum == nil {
 			continue // adopted-unverified: exempt, reported by adoption
@@ -461,7 +511,7 @@ func (c *Client) AdoptMigrations(ctx context.Context, migrations []Migration) (*
 	// Nothing to adopt on a fresh database (and no table to read).
 	var exists bool
 	if err := c.pool.QueryRow(ctx,
-		"SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = '_neutron_migrations')").Scan(&exists); err != nil {
+		"SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '_neutron_migrations')").Scan(&exists); err != nil {
 		return nil, fmt.Errorf("nucleus: check history existence: %w", err)
 	}
 	if !exists {
@@ -486,7 +536,7 @@ func (c *Client) AdoptMigrations(ctx context.Context, migrations []Migration) (*
 	// A legacy TS table has no checksum column. Read it as NULL without
 	// upgrading the schema before all recorded content has been validated.
 	var hasChecksum bool
-	if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = '_neutron_migrations' AND column_name = 'checksum')").Scan(&hasChecksum); err != nil {
+	if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '_neutron_migrations' AND column_name = 'checksum')").Scan(&hasChecksum); err != nil {
 		return nil, err
 	}
 	historySQL := "SELECT version, name, NULL AS checksum FROM _neutron_migrations"
@@ -627,10 +677,7 @@ func (c *Client) Migrate(ctx context.Context, migrations []Migration) error {
 	}
 	defer c.releaseMigrationLock(context.WithoutCancel(ctx), lockToken)
 
-	if err := c.checkHistoryShape(ctx); err != nil {
-		return err
-	}
-	if err := c.ensureMigrationsTable(ctx); err != nil {
+	if err := c.prepareMigrationHistory(ctx); err != nil {
 		return err
 	}
 
@@ -697,10 +744,7 @@ func (c *Client) MigrateDown(ctx context.Context, migrations []Migration, steps 
 	}
 	defer c.releaseMigrationLock(context.WithoutCancel(ctx), lockToken)
 
-	if err := c.checkHistoryShape(ctx); err != nil {
-		return err
-	}
-	if err := c.ensureMigrationsTable(ctx); err != nil {
+	if err := c.prepareMigrationHistory(ctx); err != nil {
 		return err
 	}
 
@@ -750,6 +794,20 @@ func (c *Client) MigrateDown(ctx context.Context, migrations []Migration, steps 
 
 // MigrationStatus returns all applied migrations.
 func (c *Client) MigrationStatus(ctx context.Context) ([]MigrationRecord, error) {
+	if err := c.checkHistoryShape(ctx); err != nil {
+		return nil, err
+	}
+	if err := c.checkHistoryMetadata(ctx); err != nil {
+		return nil, err
+	}
+	applied, err := c.appliedVersions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyHistory(nil, applied); err != nil {
+		return nil, err
+	}
+
 	rows, err := c.pool.Query(ctx, "SELECT version, name, applied_at FROM _neutron_migrations ORDER BY version")
 	if err != nil {
 		return nil, fmt.Errorf("nucleus: migration status: %w", err)
