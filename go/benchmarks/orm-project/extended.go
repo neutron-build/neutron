@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/neutron-build/neutron/go/nucleus"
 	"gorm.io/driver/postgres"
@@ -159,7 +161,7 @@ func issueLifecycle(ctx context.Context, f *Fixture, p Provider, worker, index i
 		return e
 	}
 	oracle := func(want []Document) error {
-		got, e := rawDocuments(ctx, f.Oracle, pointSQL, d.Tenant, d.ID)
+		got, e := extendedOracle(ctx, f, d.Tenant, d.ID)
 		if e != nil {
 			return e
 		}
@@ -498,4 +500,39 @@ func extendedWindows(p ExtendedPhase) []ExtendedWindow {
 		out = append(out, w)
 	}
 	return out
+}
+
+// Oracle casts exact scalar types to text and bytes to hex, independently of
+// provider row scanners and their SELECT projections.
+func extendedOracle(ctx context.Context, f *Fixture, tenant string, id int32) ([]Document, error) {
+	var d Document
+	var sid, project, version, amount string
+	var payload *string
+	err := f.Oracle.QueryRow(ctx, "SELECT tenant,id::text,project_id::text,version::text,amount::text,note,encode(payload,'hex') FROM documents WHERE tenant=$1 AND id=$2", tenant, id).Scan(&d.Tenant, &sid, &project, &version, &amount, &d.Note, &payload)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return []Document{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	d.ID, err = parseInt32(sid)
+	if err != nil {
+		return nil, err
+	}
+	d.ProjectID, err = parseInt32(project)
+	if err != nil {
+		return nil, err
+	}
+	d.Version, err = strconv.ParseInt(version, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	d.Amount = Decimal(amount)
+	if payload != nil {
+		d.Payload, err = hex.DecodeString(*payload)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return []Document{d}, nil
 }

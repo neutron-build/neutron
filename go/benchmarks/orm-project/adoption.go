@@ -92,7 +92,7 @@ func adoptionScenario(ctx context.Context, f *Fixture, p Provider) error {
 		return errors.New("application draft rollback failed")
 	}
 	for _, d := range append(rows, other...) {
-		got, e := rawDocuments(ctx, f.Oracle, pointSQL, d.Tenant, d.ID)
+		got, e := extendedOracle(ctx, f, d.Tenant, d.ID)
 		if e != nil {
 			return e
 		}
