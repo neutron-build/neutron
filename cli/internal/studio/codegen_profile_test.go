@@ -165,3 +165,31 @@ func TestReadProfileConditionalPythonImports(t *testing.T) {
 		t.Fatal(code, err)
 	}
 }
+
+func TestLosslessReadBatchCollisions(t *testing.T) {
+	for _, lang := range []string{"go", "ts", "python"} {
+		for _, tc := range []struct {
+			tables []string
+			detail string
+		}{
+			{[]string{"a_b", "a__b"}, "symbol \"AB\""},
+			{[]string{"alphaBeta", "alphabeta"}, "filenames"},
+		} {
+			err := ValidateCodegenBatch(LosslessReadProfile, lang, tc.tables)
+			if err == nil {
+				t.Fatalf("%s accepted %v", lang, tc.tables)
+			}
+			for _, part := range append(tc.tables, tc.detail) {
+				if !strings.Contains(err.Error(), part) {
+					t.Fatalf("missing %q in %v", part, err)
+				}
+			}
+		}
+		if err := ValidateCodegenBatch(LosslessReadProfile, lang, []string{"alpha", "beta"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := ValidateCodegenBatch(LegacyProfile, lang, []string{"a_b", "a__b"}); err != nil {
+			t.Fatal("legacy changed", err)
+		}
+	}
+}

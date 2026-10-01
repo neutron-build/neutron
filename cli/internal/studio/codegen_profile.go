@@ -28,6 +28,36 @@ func ValidateCodegenProfile(profile, lang string) error {
 	return fmt.Errorf("profile %q: unsupported language %q", profile, lang)
 }
 
+// ValidateCodegenBatch checks the shared namespace of selected-profile output
+// before callers write any files. All supported languages emit CamelCase types.
+func ValidateCodegenBatch(profile, lang string, tables []string) error {
+	if err := ValidateCodegenProfile(profile, lang); err != nil {
+		return err
+	}
+	if profile == "" || profile == LegacyProfile {
+		return nil
+	}
+	symbols, files := map[string]string{}, map[string]string{}
+	ext := map[string]string{"go": ".go", "ts": ".ts", "python": ".py"}[lang]
+	for _, table := range tables {
+		symbol := toCamelCase(table)
+		if !validReadName(table) || !validReadName(symbol) {
+			return fmt.Errorf("%s %s: invalid or reserved table identifier %q", lang, table, table)
+		}
+		if previous, ok := symbols[symbol]; ok {
+			return fmt.Errorf("%s tables %q and %q emit colliding symbol %q", lang, previous, table, symbol)
+		}
+		symbols[symbol] = table
+		filename := table + ext
+		folded := strings.ToLower(filename)
+		if previous, ok := files[folded]; ok {
+			return fmt.Errorf("%s tables %q and %q emit case-insensitive colliding filenames %q and %q", lang, previous, table, previous+ext, filename)
+		}
+		files[folded] = table
+	}
+	return nil
+}
+
 // FetchColsForProfile leaves the historical metadata path unchanged. Selected
 // lossless generation requires actual catalog identity, including domains.
 func FetchColsForProfile(ctx context.Context, q Querier, schema, table, profile string) ([]colInfo, error) {

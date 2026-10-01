@@ -113,7 +113,10 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 	}
 
 	if profile == studio.LosslessReadProfile {
-		// Prevalidate every table before touching any output destination.
+		// Prevalidate batch names and every table before touching any output destination.
+		if err := studio.ValidateCodegenBatch(profile, lang, tables); err != nil {
+			return err
+		}
 		codes := make([]string, len(tables))
 		for i, t := range tables {
 			cols, err := studio.FetchColsForProfile(ctx, client, schema, t, profile)
