@@ -58,7 +58,7 @@ func (c *Client) captureMigrationNamespace(ctx context.Context) (migrationNamesp
 		if catalogOID == nil || *catalogOID == "" {
 			return scope, fmt.Errorf("nucleus: unsupported migration namespace profile: catalog lookup identity required")
 		}
-		if schema == nil || schemaOID == nil || *schema == "" || *schemaOID == "" || strings.HasPrefix(*schema, "pg_temp_") {
+		if schema == nil || schemaOID == nil || *schema == "" || *schemaOID == "" || strings.HasPrefix(*schema, "pg_") || *schema == "information_schema" {
 			return scope, fmt.Errorf("nucleus: unsupported migration namespace profile: persistent current_schema required")
 		}
 		if scope.schema != "" && scope.schema != *schema {

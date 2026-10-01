@@ -354,3 +354,31 @@ func TestMigrationNamespaceBuiltinIntegerVersions(t *testing.T) {
 		})
 	}
 }
+
+func TestMigrationNamespaceSystemSchemasRefused(t *testing.T) {
+	c, o, _, _ := namespaceFixture(t)
+	ctx := context.Background()
+	for _, schema := range []string{"pg_catalog", "information_schema"} {
+		if _, err := c.Pool().Exec(ctx, "SET search_path TO "+pgx.Identifier{schema}.Sanitize()); err != nil {
+			t.Fatal(err)
+		}
+		plan := []Migration{{Version: 1, Name: "refused", Up: "SELECT 1"}}
+		operations := []func() error{
+			func() error { return c.Migrate(ctx, plan) },
+			func() error { return c.MigrateDown(ctx, plan, 1) },
+			func() error { _, e := c.AdoptMigrations(ctx, plan); return e },
+			func() error { _, e := c.MigrationStatus(ctx); return e },
+			func() error { _, e := c.MigrationLockInfo(ctx); return e },
+			func() error { return c.ForceUnlockMigrations(ctx) },
+		}
+		for i, operation := range operations {
+			if err := operation(); err == nil || !strings.Contains(err.Error(), "persistent current_schema required") {
+				t.Fatalf("system schema %s operation %d: %v", schema, i, err)
+			}
+			var count int
+			if err := o.QueryRow(ctx, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname IN ('_neutron_migrations','_neutron_migration_lock')", schema).Scan(&count); err != nil || count != 0 {
+				t.Fatalf("system metadata count=%d: %v", count, err)
+			}
+		}
+	}
+}

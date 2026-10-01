@@ -96,3 +96,14 @@ it('actual builtin int2/int4/int8 versions remain admitted', {skip:!url},async()
   await migrate(t,[{version:2,name:'new',up:'SELECT 2'}]);assert.equal((await migrationStatus(t)).length,2);
  });
 });
+
+it('system creation namespaces refuse all APIs before metadata', {skip:!url}, async()=>fixture(async(t,o)=>{
+ for(const schema of ['pg_catalog','information_schema']) {
+  await t.execute(`SET search_path TO ${quote(schema)}`);
+  const plan=[{version:1,name:'refused',up:'SELECT 1'}];
+  for(const operation of [()=>migrate(t,plan),()=>migrateDown(t,plan,1),()=>adoptMigrations(t,plan),()=>migrationStatus(t),()=>migrationLockInfo(t),()=>forceUnlockMigrations(t)]) {
+   await assert.rejects(operation,/persistent current_schema required/);
+   assert.equal(await o.fetchval("SELECT count(*)::int FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname IN ('_neutron_migrations','_neutron_migration_lock')",[schema]),0);
+  }
+ }
+}));

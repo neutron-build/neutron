@@ -43,7 +43,7 @@ async function captureMigrationNamespace(transport: Transport): Promise<Migratio
   const seen = new Set<string>();
   for (const row of result.rows) {
     if (typeof row.catalog_oid !== 'string' || !row.catalog_oid) throw new Error('nucleus: unsupported migration namespace profile: catalog lookup identity required');
-    if (typeof row.intended_schema !== 'string' || !row.intended_schema || typeof row.schema_oid !== 'string' || !row.schema_oid || row.intended_schema.startsWith('pg_temp_')) throw new Error('nucleus: unsupported migration namespace profile: persistent current_schema required');
+    if (typeof row.intended_schema !== 'string' || !row.intended_schema || typeof row.schema_oid !== 'string' || !row.schema_oid || (row.intended_schema.startsWith('pg_') || row.intended_schema === 'information_schema')) throw new Error('nucleus: unsupported migration namespace profile: persistent current_schema required');
     if (schema && schema !== row.intended_schema) throw new Error('nucleus: inconsistent migration namespace identity');
     schema = row.intended_schema;
     if (!['_neutron_migrations', '_neutron_migration_lock'].includes(row.name) || seen.has(row.name)) throw new Error('nucleus: unsupported migration namespace profile: incomplete catalog identity');
