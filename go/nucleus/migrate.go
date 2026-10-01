@@ -10,12 +10,88 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+// migrationNamespace freezes the metadata namespace, not user SQL session state.
+type migrationNamespace struct{ schema string }
+
+var migrationMetadataName = regexp.MustCompile(`_neutron_migration_lock|_neutron_migrations`)
+
+func (n migrationNamespace) sql(statement string) string {
+	quoted := `"` + strings.ReplaceAll(n.schema, `"`, `""`) + `".`
+	return migrationMetadataName.ReplaceAllStringFunc(statement, func(name string) string { return quoted + `"` + name + `"` })
+}
+
+const migrationNamespaceSQL = `SELECT current_schema(), ns.oid::text, pg_catalog.to_regclass('pg_catalog.pg_class')::oid::text, names.name,
+ c.oid::text, rn.nspname, c.relkind::text
+ FROM (VALUES ('_neutron_migrations'), ('_neutron_migration_lock')) AS names(name)
+ LEFT JOIN pg_catalog.pg_namespace ns ON ns.nspname = current_schema()
+ LEFT JOIN pg_catalog.pg_class c ON c.oid = pg_catalog.to_regclass(names.name)
+ LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid = c.relnamespace`
+
+func (c *Client) captureMigrationNamespace(ctx context.Context) (migrationNamespace, error) {
+	var scope migrationNamespace
+	rows, err := c.pool.Query(ctx, migrationNamespaceSQL)
+	if err != nil {
+		return scope, fmt.Errorf("nucleus: unsupported migration namespace profile: actual persistent catalog identity required: %w", err)
+	}
+	defer rows.Close()
+	seen := map[string]bool{}
+	for rows.Next() {
+		var schema, schemaOID, catalogOID, relationOID, resolved, kind *string
+		var name string
+		if err := rows.Scan(&schema, &schemaOID, &catalogOID, &name, &relationOID, &resolved, &kind); err != nil {
+			return scope, fmt.Errorf("nucleus: unsupported migration namespace profile: catalog identity scan: %w", err)
+		}
+		if catalogOID == nil || *catalogOID == "" {
+			return scope, fmt.Errorf("nucleus: unsupported migration namespace profile: catalog lookup identity required")
+		}
+		if schema == nil || schemaOID == nil || *schema == "" || *schemaOID == "" || strings.HasPrefix(*schema, "pg_temp_") {
+			return scope, fmt.Errorf("nucleus: unsupported migration namespace profile: persistent current_schema required")
+		}
+		if scope.schema != "" && scope.schema != *schema {
+			return scope, fmt.Errorf("nucleus: inconsistent migration namespace identity")
+		}
+		scope.schema = *schema
+		if name != "_neutron_migrations" && name != "_neutron_migration_lock" || seen[name] {
+			return scope, fmt.Errorf("nucleus: unsupported migration namespace profile: incomplete catalog identity")
+		}
+		seen[name] = true
+		if relationOID != nil {
+			if resolved == nil || kind == nil || *relationOID == "" {
+				return scope, fmt.Errorf("nucleus: unsupported migration namespace profile: incomplete relation identity")
+			}
+			if *resolved != scope.schema || strings.HasPrefix(*resolved, "pg_temp_") {
+				return scope, fmt.Errorf("nucleus: migration namespace ambiguity: %q resolves in %q instead of intended schema %q; remove temporary shadows or configure the intended schema first", name, *resolved, scope.schema)
+			}
+			if *kind != "r" {
+				return scope, fmt.Errorf("nucleus: migration metadata %q.%q is not an ordinary persistent table", scope.schema, name)
+			}
+		} else if resolved != nil || kind != nil {
+			return scope, fmt.Errorf("nucleus: unsupported migration namespace profile: inconsistent relation identity")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return scope, fmt.Errorf("nucleus: unsupported migration namespace profile: %w", err)
+	}
+	if len(seen) != 2 {
+		return scope, fmt.Errorf("nucleus: unsupported migration namespace profile: both metadata identities required")
+	}
+	return scope, nil
+}
+
+func (c *Client) migrationNamespaceFor(ctx context.Context, scopes []migrationNamespace) (migrationNamespace, error) {
+	if len(scopes) > 0 {
+		return scopes[0], nil
+	}
+	return c.captureMigrationNamespace(ctx)
+}
 
 // sqlParam converts a value to a string for use as a pgwire query parameter.
 // Nucleus pgwire reports TEXT (OID 25) for all parameter slots, so pgx
@@ -140,11 +216,15 @@ var migrationGate sync.Mutex
 //
 // A claim held by a dead runner blocks forever by design; the escape hatch
 // is ForceUnlockMigrations (diagnose first with MigrationLockInfo).
-func (c *Client) acquireMigrationLock(ctx context.Context) (int64, error) {
-	if _, err := c.pool.Exec(ctx, migrationLockTable); err != nil {
+func (c *Client) acquireMigrationLock(ctx context.Context, scopes ...migrationNamespace) (int64, error) {
+	namespace, scopeErr := c.migrationNamespaceFor(ctx, scopes)
+	if scopeErr != nil {
+		return 0, scopeErr
+	}
+	if _, err := c.pool.Exec(ctx, namespace.sql(migrationLockTable)); err != nil {
 		return 0, fmt.Errorf("nucleus: create migration lock table: %w", err)
 	}
-	if _, err := c.pool.Exec(ctx, migrationLockAddOwner); err != nil {
+	if _, err := c.pool.Exec(ctx, namespace.sql(migrationLockAddOwner)); err != nil {
 		return 0, fmt.Errorf("nucleus: add migration lock owner column: %w", err)
 	}
 
@@ -165,7 +245,7 @@ func (c *Client) acquireMigrationLock(ctx context.Context) (int64, error) {
 		}
 
 		ct, err := c.pool.Exec(ctx,
-			"INSERT INTO _neutron_migration_lock (id, token, owner) VALUES (1, $1, $2) ON CONFLICT (id) DO NOTHING",
+			namespace.sql("INSERT INTO _neutron_migration_lock (id, token, owner) VALUES (1, $1, $2) ON CONFLICT (id) DO NOTHING"),
 			sqlParam(token), migrationOwner())
 		if err != nil {
 			return 0, fmt.Errorf("nucleus: claim migration lock: %w", err)
@@ -177,7 +257,7 @@ func (c *Client) acquireMigrationLock(ctx context.Context) (int64, error) {
 		select {
 		case <-ctx.Done():
 			diagnosticCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			info, _ := c.MigrationLockInfo(diagnosticCtx)
+			info, _ := c.migrationLockInfo(diagnosticCtx, namespace)
 			cancel()
 			if info.Held {
 				return 0, fmt.Errorf(
@@ -199,11 +279,15 @@ func (c *Client) acquireMigrationLock(ctx context.Context) (int64, error) {
 // Failures are deliberately not returned to the caller: by the time Migrate
 // releases, its work is committed, and an unreleased claim is recoverable
 // via ForceUnlockMigrations (it does NOT self-heal by timeout anymore).
-func (c *Client) releaseMigrationLock(ctx context.Context, token int64) {
+func (c *Client) releaseMigrationLock(ctx context.Context, token int64, scopes ...migrationNamespace) {
+	namespace, scopeErr := c.migrationNamespaceFor(ctx, scopes)
+	if scopeErr != nil {
+		return
+	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	_, _ = c.pool.Exec(cleanupCtx,
-		"DELETE FROM _neutron_migration_lock WHERE id = 1 AND token = $1",
+		namespace.sql("DELETE FROM _neutron_migration_lock WHERE id = 1 AND token = $1"),
 		sqlParam(token))
 }
 
@@ -220,10 +304,18 @@ type MigrationLockInfo struct {
 // through a ::text cast because the engine ships timestamptz in a binary
 // wire format pgx cannot scan into Go time or string destinations.
 func (c *Client) MigrationLockInfo(ctx context.Context) (MigrationLockInfo, error) {
+	namespace, err := c.captureMigrationNamespace(ctx)
+	if err != nil {
+		return MigrationLockInfo{}, err
+	}
+	return c.migrationLockInfo(ctx, namespace)
+}
+
+func (c *Client) migrationLockInfo(ctx context.Context, namespace migrationNamespace) (MigrationLockInfo, error) {
 	var info MigrationLockInfo
 	var owner, heartbeat *string
 	err := c.pool.QueryRow(ctx,
-		"SELECT owner, locked_at::text FROM _neutron_migration_lock WHERE id = 1").Scan(&owner, &heartbeat)
+		namespace.sql("SELECT owner, locked_at::text FROM _neutron_migration_lock WHERE id = 1")).Scan(&owner, &heartbeat)
 	if err != nil {
 		if strings.Contains(err.Error(), "no rows") {
 			return info, nil
@@ -248,7 +340,11 @@ func (c *Client) MigrationLockInfo(ctx context.Context) (MigrationLockInfo, erro
 // exists. If the holder is alive, the two of you will interleave — the
 // thing the lock exists to prevent.
 func (c *Client) ForceUnlockMigrations(ctx context.Context) error {
-	if _, err := c.pool.Exec(ctx, "DELETE FROM _neutron_migration_lock WHERE id = 1"); err != nil {
+	namespace, err := c.captureMigrationNamespace(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := c.pool.Exec(ctx, namespace.sql("DELETE FROM _neutron_migration_lock WHERE id = 1")); err != nil {
 		return fmt.Errorf("nucleus: force unlock migrations: %w", err)
 	}
 	return nil
@@ -309,9 +405,13 @@ func prepareMigrations(input []Migration, descending bool) ([]Migration, error) 
 
 // ensureMigrationsTable creates or upgrades the history table to carry the
 // v2 columns (checksum from the GO-30 era, owner/format from M04).
-func (c *Client) ensureMigrationsTable(ctx context.Context) error {
+func (c *Client) ensureMigrationsTable(ctx context.Context, scopes ...migrationNamespace) error {
+	namespace, scopeErr := c.migrationNamespaceFor(ctx, scopes)
+	if scopeErr != nil {
+		return scopeErr
+	}
 	for _, stmt := range []string{migrationsTable, migrationsAddColumns, migrationsAddOwner, migrationsAddFormat} {
-		if _, err := c.pool.Exec(ctx, stmt); err != nil {
+		if _, err := c.pool.Exec(ctx, namespace.sql(stmt)); err != nil {
 			return fmt.Errorf("nucleus: prepare migrations table: %w", err)
 		}
 	}
@@ -323,11 +423,15 @@ func (c *Client) ensureMigrationsTable(ctx context.Context) error {
 // means the canonical CLI protocol owns the database (the SDK's public API
 // carries integer versions and cannot
 // represent its text IDs).
-func (c *Client) checkHistoryShape(ctx context.Context) error {
+func (c *Client) checkHistoryShape(ctx context.Context, scopes ...migrationNamespace) error {
+	namespace, scopeErr := c.migrationNamespaceFor(ctx, scopes)
+	if scopeErr != nil {
+		return scopeErr
+	}
 	var versionType *string
 	err := c.pool.QueryRow(ctx, `
 		SELECT data_type FROM information_schema.columns
-		WHERE table_schema = current_schema() AND table_name = '_neutron_migrations' AND column_name = 'version'`).Scan(&versionType)
+		WHERE table_schema = $1 AND table_name = '_neutron_migrations' AND column_name = 'version'`, namespace.schema).Scan(&versionType)
 	if err != nil {
 		if strings.Contains(err.Error(), "no rows") {
 			return nil // table absent: fresh database
@@ -352,9 +456,13 @@ func (c *Client) checkHistoryShape(ctx context.Context) error {
 
 // checkHistoryMetadata admits only complete v2 metadata shapes. Existing
 // legacy columns are added by explicit adoption, never by an ordinary run.
-func (c *Client) checkHistoryMetadata(ctx context.Context) error {
+func (c *Client) checkHistoryMetadata(ctx context.Context, scopes ...migrationNamespace) error {
+	namespace, scopeErr := c.migrationNamespaceFor(ctx, scopes)
+	if scopeErr != nil {
+		return scopeErr
+	}
 	rows, err := c.pool.Query(ctx, `SELECT column_name FROM information_schema.columns
-		WHERE table_schema = current_schema() AND table_name = '_neutron_migrations'`)
+		WHERE table_schema = $1 AND table_name = '_neutron_migrations'`, namespace.schema)
 	if err != nil {
 		return fmt.Errorf("nucleus: inspect migration metadata: %w", err)
 	}
@@ -381,14 +489,18 @@ func (c *Client) checkHistoryMetadata(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) prepareMigrationHistory(ctx context.Context) error {
-	if err := c.checkHistoryShape(ctx); err != nil {
+func (c *Client) prepareMigrationHistory(ctx context.Context, scopes ...migrationNamespace) error {
+	namespace, scopeErr := c.migrationNamespaceFor(ctx, scopes)
+	if scopeErr != nil {
+		return scopeErr
+	}
+	if err := c.checkHistoryShape(ctx, namespace); err != nil {
 		return err
 	}
-	if err := c.checkHistoryMetadata(ctx); err != nil {
+	if err := c.checkHistoryMetadata(ctx, namespace); err != nil {
 		return err
 	}
-	if _, err := c.pool.Exec(ctx, migrationsTable); err != nil {
+	if _, err := c.pool.Exec(ctx, namespace.sql(migrationsTable)); err != nil {
 		return fmt.Errorf("nucleus: prepare migrations table: %w", err)
 	}
 	return nil
@@ -406,8 +518,12 @@ type appliedVersion struct {
 // text-formatted ASCII under the engine's declared text format (the wire
 // contract is pinned by nucleus's tests_row_description integer-format
 // test), so pgx decodes them natively.
-func (c *Client) appliedVersions(ctx context.Context) (map[int]appliedVersion, error) {
-	rows, err := c.pool.Query(ctx, "SELECT version, checksum, format FROM _neutron_migrations")
+func (c *Client) appliedVersions(ctx context.Context, scopes ...migrationNamespace) (map[int]appliedVersion, error) {
+	namespace, scopeErr := c.migrationNamespaceFor(ctx, scopes)
+	if scopeErr != nil {
+		return nil, scopeErr
+	}
+	rows, err := c.pool.Query(ctx, namespace.sql("SELECT version, checksum, format FROM _neutron_migrations"))
 	if err != nil {
 		return nil, fmt.Errorf("nucleus: query applied versions: %w", err)
 	}
@@ -498,20 +614,25 @@ func (c *Client) AdoptMigrations(ctx context.Context, migrations []Migration) (*
 		return nil, err
 	}
 
-	lockToken, err := c.acquireMigrationLock(ctx)
+	namespace, err := c.captureMigrationNamespace(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer c.releaseMigrationLock(context.WithoutCancel(ctx), lockToken)
 
-	if err := c.checkHistoryShape(ctx); err != nil {
+	lockToken, err := c.acquireMigrationLock(ctx, namespace)
+	if err != nil {
+		return nil, err
+	}
+	defer c.releaseMigrationLock(context.WithoutCancel(ctx), lockToken, namespace)
+
+	if err := c.checkHistoryShape(ctx, namespace); err != nil {
 		return nil, err
 	}
 
 	// Nothing to adopt on a fresh database (and no table to read).
 	var exists bool
 	if err := c.pool.QueryRow(ctx,
-		"SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '_neutron_migrations')").Scan(&exists); err != nil {
+		"SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = '_neutron_migrations')", namespace.schema).Scan(&exists); err != nil {
 		return nil, fmt.Errorf("nucleus: check history existence: %w", err)
 	}
 	if !exists {
@@ -536,12 +657,12 @@ func (c *Client) AdoptMigrations(ctx context.Context, migrations []Migration) (*
 	// A legacy TS table has no checksum column. Read it as NULL without
 	// upgrading the schema before all recorded content has been validated.
 	var hasChecksum bool
-	if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '_neutron_migrations' AND column_name = 'checksum')").Scan(&hasChecksum); err != nil {
+	if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = '_neutron_migrations' AND column_name = 'checksum')", namespace.schema).Scan(&hasChecksum); err != nil {
 		return nil, err
 	}
-	historySQL := "SELECT version, name, NULL AS checksum FROM _neutron_migrations"
+	historySQL := namespace.sql("SELECT version, name, NULL AS checksum FROM _neutron_migrations")
 	if hasChecksum {
-		historySQL = "SELECT version, name, checksum FROM _neutron_migrations"
+		historySQL = namespace.sql("SELECT version, name, checksum FROM _neutron_migrations")
 	}
 	rows, err := tx.Query(ctx, historySQL)
 	if err != nil {
@@ -584,7 +705,7 @@ func (c *Client) AdoptMigrations(ctx context.Context, migrations []Migration) (*
 		if err := tx.Rollback(ctx); err != nil {
 			return nil, err
 		}
-		if err := c.ensureMigrationsTable(ctx); err != nil {
+		if err := c.ensureMigrationsTable(ctx, namespace); err != nil {
 			return nil, err
 		}
 		nextTx, err := c.pool.Begin(ctx)
@@ -594,7 +715,7 @@ func (c *Client) AdoptMigrations(ctx context.Context, migrations []Migration) (*
 		tx = nextTx
 	} else {
 		for _, stmt := range []string{migrationsAddColumns, migrationsAddOwner, migrationsAddFormat} {
-			if _, err := tx.Exec(ctx, stmt); err != nil {
+			if _, err := tx.Exec(ctx, namespace.sql(stmt)); err != nil {
 				return nil, fmt.Errorf("nucleus: prepare adoption table: %w", err)
 			}
 		}
@@ -611,14 +732,14 @@ func (c *Client) AdoptMigrations(ctx context.Context, migrations []Migration) (*
 		switch {
 		case hasPlan && r.checksum != nil && *r.checksum == legacyDigest:
 			if _, err := tx.Exec(ctx,
-				"UPDATE _neutron_migrations SET checksum = $1, owner = $2, format = $3 WHERE version = $4",
+				namespace.sql("UPDATE _neutron_migrations SET checksum = $1, owner = $2, format = $3 WHERE version = $4"),
 				newDigest, migrationOwner(), MigrationHistoryFormat, sqlParam(r.version)); err != nil {
 				return nil, fmt.Errorf("nucleus: adopt %d as verified: %w", r.version, err)
 			}
 			report.Verified = append(report.Verified, r.version)
 		case hasPlan && r.checksum != nil && *r.checksum == newDigest:
 			if _, err := tx.Exec(ctx,
-				"UPDATE _neutron_migrations SET owner = $1, format = $2 WHERE version = $3",
+				namespace.sql("UPDATE _neutron_migrations SET owner = $1, format = $2 WHERE version = $3"),
 				migrationOwner(), MigrationHistoryFormat, sqlParam(r.version)); err != nil {
 				return nil, fmt.Errorf("nucleus: adopt %d: %w", r.version, err)
 			}
@@ -632,7 +753,7 @@ func (c *Client) AdoptMigrations(ctx context.Context, migrations []Migration) (*
 			// No recorded checksum (TS-SDK legacy) or no matching plan
 			// entry: honest NULL, reported — never baselined.
 			if _, err := tx.Exec(ctx,
-				"UPDATE _neutron_migrations SET checksum = NULL, owner = $1, format = $2 WHERE version = $3",
+				namespace.sql("UPDATE _neutron_migrations SET checksum = NULL, owner = $1, format = $2 WHERE version = $3"),
 				migrationOwner(), MigrationHistoryFormat, sqlParam(r.version)); err != nil {
 				return nil, fmt.Errorf("nucleus: adopt %d as unverified: %w", r.version, err)
 			}
@@ -671,17 +792,22 @@ func (c *Client) Migrate(ctx context.Context, migrations []Migration) error {
 		return err
 	}
 
-	lockToken, err := c.acquireMigrationLock(ctx)
+	namespace, err := c.captureMigrationNamespace(ctx)
 	if err != nil {
 		return err
 	}
-	defer c.releaseMigrationLock(context.WithoutCancel(ctx), lockToken)
 
-	if err := c.prepareMigrationHistory(ctx); err != nil {
+	lockToken, err := c.acquireMigrationLock(ctx, namespace)
+	if err != nil {
+		return err
+	}
+	defer c.releaseMigrationLock(context.WithoutCancel(ctx), lockToken, namespace)
+
+	if err := c.prepareMigrationHistory(ctx, namespace); err != nil {
 		return err
 	}
 
-	applied, err := c.appliedVersions(ctx)
+	applied, err := c.appliedVersions(ctx, namespace)
 	if err != nil {
 		return err
 	}
@@ -705,7 +831,7 @@ func (c *Client) Migrate(ctx context.Context, migrations []Migration) error {
 		}
 
 		if _, err := tx.Exec(ctx,
-			"INSERT INTO _neutron_migrations (version, name, checksum, owner, format) VALUES ($1, $2, $3, $4, $5)",
+			namespace.sql("INSERT INTO _neutron_migrations (version, name, checksum, owner, format) VALUES ($1, $2, $3, $4, $5)"),
 			sqlParam(m.Version), m.Name, migrationChecksum(m), migrationOwner(), MigrationHistoryFormat); err != nil {
 			_ = tx.Rollback(ctx)
 			return fmt.Errorf("nucleus: record migration %d: %w", m.Version, err)
@@ -718,7 +844,7 @@ func (c *Client) Migrate(ctx context.Context, migrations []Migration) error {
 		// Heartbeat refresh: DIAGNOSTIC ONLY. Nothing steals based on it;
 		// it exists so MigrationLockInfo can report a live holder's age.
 		_, _ = c.pool.Exec(ctx,
-			"UPDATE _neutron_migration_lock SET locked_at = NOW() WHERE id = 1 AND token = $1",
+			namespace.sql("UPDATE _neutron_migration_lock SET locked_at = NOW() WHERE id = 1 AND token = $1"),
 			sqlParam(lockToken))
 	}
 
@@ -738,17 +864,22 @@ func (c *Client) MigrateDown(ctx context.Context, migrations []Migration, steps 
 		return err
 	}
 
-	lockToken, err := c.acquireMigrationLock(ctx)
+	namespace, err := c.captureMigrationNamespace(ctx)
 	if err != nil {
 		return err
 	}
-	defer c.releaseMigrationLock(context.WithoutCancel(ctx), lockToken)
 
-	if err := c.prepareMigrationHistory(ctx); err != nil {
+	lockToken, err := c.acquireMigrationLock(ctx, namespace)
+	if err != nil {
+		return err
+	}
+	defer c.releaseMigrationLock(context.WithoutCancel(ctx), lockToken, namespace)
+
+	if err := c.prepareMigrationHistory(ctx, namespace); err != nil {
 		return err
 	}
 
-	applied, err := c.appliedVersions(ctx)
+	applied, err := c.appliedVersions(ctx, namespace)
 	if err != nil {
 		return err
 	}
@@ -778,7 +909,7 @@ func (c *Client) MigrateDown(ctx context.Context, migrations []Migration, steps 
 			return fmt.Errorf("nucleus: migration %d (%s) down: %w", m.Version, m.Name, err)
 		}
 
-		if _, err := tx.Exec(ctx, "DELETE FROM _neutron_migrations WHERE version = $1", sqlParam(m.Version)); err != nil {
+		if _, err := tx.Exec(ctx, namespace.sql("DELETE FROM _neutron_migrations WHERE version = $1"), sqlParam(m.Version)); err != nil {
 			_ = tx.Rollback(ctx)
 			return fmt.Errorf("nucleus: remove migration record %d: %w", m.Version, err)
 		}
@@ -794,13 +925,17 @@ func (c *Client) MigrateDown(ctx context.Context, migrations []Migration, steps 
 
 // MigrationStatus returns all applied migrations.
 func (c *Client) MigrationStatus(ctx context.Context) ([]MigrationRecord, error) {
-	if err := c.checkHistoryShape(ctx); err != nil {
+	namespace, err := c.captureMigrationNamespace(ctx)
+	if err != nil {
 		return nil, err
 	}
-	if err := c.checkHistoryMetadata(ctx); err != nil {
+	if err := c.checkHistoryShape(ctx, namespace); err != nil {
 		return nil, err
 	}
-	applied, err := c.appliedVersions(ctx)
+	if err := c.checkHistoryMetadata(ctx, namespace); err != nil {
+		return nil, err
+	}
+	applied, err := c.appliedVersions(ctx, namespace)
 	if err != nil {
 		return nil, err
 	}
@@ -808,7 +943,7 @@ func (c *Client) MigrationStatus(ctx context.Context) ([]MigrationRecord, error)
 		return nil, err
 	}
 
-	rows, err := c.pool.Query(ctx, "SELECT version, name, applied_at FROM _neutron_migrations ORDER BY version")
+	rows, err := c.pool.Query(ctx, namespace.sql("SELECT version, name, applied_at FROM _neutron_migrations ORDER BY version"))
 	if err != nil {
 		return nil, fmt.Errorf("nucleus: migration status: %w", err)
 	}

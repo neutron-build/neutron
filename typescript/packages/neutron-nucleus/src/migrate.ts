@@ -19,6 +19,41 @@ import { sqlState } from './retry.js';
 // Types
 // ---------------------------------------------------------------------------
 
+interface MigrationNamespace { schema: string; sql(statement: string): string }
+
+async function captureMigrationNamespace(transport: Transport): Promise<MigrationNamespace> {
+  let result;
+  try {
+    result = await transport.query<{ intended_schema: string | null; schema_oid: string | null; catalog_oid: string | null; name: string; relation_oid: string | null; resolved_schema: string | null; kind: string | null }>(`
+      SELECT current_schema() AS intended_schema, ns.oid::text AS schema_oid, pg_catalog.to_regclass('pg_catalog.pg_class')::oid::text AS catalog_oid, names.name,
+        c.oid::text AS relation_oid, rn.nspname AS resolved_schema, c.relkind::text AS kind
+      FROM (VALUES ('_neutron_migrations'), ('_neutron_migration_lock')) AS names(name)
+      LEFT JOIN pg_catalog.pg_namespace ns ON ns.nspname = current_schema()
+      LEFT JOIN pg_catalog.pg_class c ON c.oid = pg_catalog.to_regclass(names.name)
+      LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid = c.relnamespace`);
+  } catch (error) {
+    throw new Error('nucleus: unsupported migration namespace profile: actual persistent catalog identity required', { cause: error });
+  }
+  let schema = '';
+  const seen = new Set<string>();
+  for (const row of result.rows) {
+    if (typeof row.catalog_oid !== 'string' || !row.catalog_oid) throw new Error('nucleus: unsupported migration namespace profile: catalog lookup identity required');
+    if (typeof row.intended_schema !== 'string' || !row.intended_schema || typeof row.schema_oid !== 'string' || !row.schema_oid || row.intended_schema.startsWith('pg_temp_')) throw new Error('nucleus: unsupported migration namespace profile: persistent current_schema required');
+    if (schema && schema !== row.intended_schema) throw new Error('nucleus: inconsistent migration namespace identity');
+    schema = row.intended_schema;
+    if (!['_neutron_migrations', '_neutron_migration_lock'].includes(row.name) || seen.has(row.name)) throw new Error('nucleus: unsupported migration namespace profile: incomplete catalog identity');
+    seen.add(row.name);
+    if (row.relation_oid != null) {
+      if (typeof row.relation_oid !== 'string' || !row.relation_oid || typeof row.resolved_schema !== 'string' || typeof row.kind !== 'string') throw new Error('nucleus: unsupported migration namespace profile: incomplete relation identity');
+      if (row.resolved_schema !== schema || row.resolved_schema.startsWith('pg_temp_')) throw new Error(`nucleus: migration namespace ambiguity: ${JSON.stringify(row.name)} resolves in ${JSON.stringify(row.resolved_schema)} instead of intended schema ${JSON.stringify(schema)}; remove temporary shadows or configure the intended schema first`);
+      if (row.kind !== 'r') throw new Error(`nucleus: migration metadata ${JSON.stringify(schema)}.${JSON.stringify(row.name)} is not an ordinary persistent table`);
+    } else if (row.resolved_schema != null || row.kind != null) throw new Error('nucleus: unsupported migration namespace profile: inconsistent relation identity');
+  }
+  if (seen.size !== 2) throw new Error('nucleus: unsupported migration namespace profile: both metadata identities required');
+  const prefix = '"' + schema.replaceAll('"', '""') + '".';
+  return { schema, sql: (statement) => statement.replace(/_neutron_migration_lock|_neutron_migrations/g, (name) => prefix + '"' + name + '"') };
+}
+
 /** A single migration definition. */
 export interface Migration {
   /** Monotonically increasing version number. */
@@ -141,26 +176,26 @@ async function executeBootstrapDdl(transport: Transport, sql: string): Promise<v
   }
 }
 
-async function ensureTable(transport: Transport): Promise<void> {
-  await executeBootstrapDdl(transport, MIGRATIONS_TABLE_SQL);
-  await executeBootstrapDdl(transport, MIGRATIONS_ADD_CHECKSUM);
-  await executeBootstrapDdl(transport, MIGRATIONS_ADD_OWNER);
-  await executeBootstrapDdl(transport, MIGRATIONS_ADD_FORMAT);
+async function ensureTable(transport: Transport, namespace: MigrationNamespace): Promise<void> {
+  await executeBootstrapDdl(transport, namespace.sql(MIGRATIONS_TABLE_SQL));
+  await executeBootstrapDdl(transport, namespace.sql(MIGRATIONS_ADD_CHECKSUM));
+  await executeBootstrapDdl(transport, namespace.sql(MIGRATIONS_ADD_OWNER));
+  await executeBootstrapDdl(transport, namespace.sql(MIGRATIONS_ADD_FORMAT));
 }
 
 /** Ordinary runs create a fresh v2 table but never add columns to legacy history. */
-async function prepareMigrationHistory(transport: Transport): Promise<void> {
-  await checkHistoryShape(transport);
+async function prepareMigrationHistory(transport: Transport, namespace: MigrationNamespace): Promise<void> {
+  await checkHistoryShape(transport, namespace);
   const result = await transport.query<{ column_name: string }>(`
     SELECT column_name FROM information_schema.columns
-    WHERE table_schema = current_schema() AND table_name = '_neutron_migrations'`);
+    WHERE table_schema = $1 AND table_name = '_neutron_migrations'`, [namespace.schema]);
   const columns = new Set(result.rows.map((row) => row.column_name));
   if (columns.size > 0) {
     for (const column of ['checksum', 'owner', 'format']) {
       if (!columns.has(column)) throw new Error(`nucleus: legacy migration history lacks ${column}; call adoptMigrations explicitly before continuing`);
     }
   }
-  await executeBootstrapDdl(transport, MIGRATIONS_TABLE_SQL);
+  await executeBootstrapDdl(transport, namespace.sql(MIGRATIONS_TABLE_SQL));
 }
 
 interface AppliedRow {
@@ -169,9 +204,9 @@ interface AppliedRow {
   format: string | null;
 }
 
-async function appliedRows(transport: Transport): Promise<Map<number, AppliedRow>> {
+async function appliedRows(transport: Transport, namespace: MigrationNamespace): Promise<Map<number, AppliedRow>> {
   const result = await transport.query<{ version: number; checksum: string | null; format: string | null }>(
-    'SELECT version, checksum, format FROM _neutron_migrations');
+    namespace.sql('SELECT version, checksum, format FROM _neutron_migrations'));
   const map = new Map<number, AppliedRow>();
   for (const row of result.rows) {
     map.set(Number(row.version), {
@@ -205,10 +240,10 @@ function prepareMigrations(migrations: Migration[]): Migration[] {
 
 /** Refuse a history before history mutation (claim metadata may already exist): a TEXT
  * version column means the canonical CLI protocol owns the database. */
-async function checkHistoryShape(transport: Transport): Promise<void> {
+async function checkHistoryShape(transport: Transport, namespace: MigrationNamespace): Promise<void> {
   const result = await transport.query<{ data_type: string }>(`
     SELECT data_type FROM information_schema.columns
-    WHERE table_schema = current_schema() AND table_name = '_neutron_migrations' AND column_name = 'version'`);
+    WHERE table_schema = $1 AND table_name = '_neutron_migrations' AND column_name = 'version'`, [namespace.schema]);
   if (result.rows.length === 0) return; // table absent: fresh database
   const t = String(result.rows[0].data_type).toLowerCase();
   if (t === 'integer' || t === 'smallint' || t === 'bigint') return;
@@ -270,10 +305,11 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
  */
 async function acquireMigrationLock(
   transport: Transport,
+  namespace: MigrationNamespace,
   options?: MigrateOptions,
 ): Promise<string> {
-  await executeBootstrapDdl(transport, MIGRATION_LOCK_TABLE_SQL);
-  await executeBootstrapDdl(transport, MIGRATION_LOCK_ADD_OWNER);
+  await executeBootstrapDdl(transport, namespace.sql(MIGRATION_LOCK_TABLE_SQL));
+  await executeBootstrapDdl(transport, namespace.sql(MIGRATION_LOCK_ADD_OWNER));
 
   // The claim table is shared with the Go SDK, whose schema predates this
   // module: token is BIGINT. A 15-hex-digit slice (60 bits, always positive
@@ -291,7 +327,7 @@ async function acquireMigrationLock(
   for (;;) {
     options?.signal?.throwIfAborted();
     const inserted = await transport.execute(
-      'INSERT INTO _neutron_migration_lock (id, token, owner) VALUES (1, $1, $2) ON CONFLICT (id) DO NOTHING',
+      namespace.sql('INSERT INTO _neutron_migration_lock (id, token, owner) VALUES (1, $1, $2) ON CONFLICT (id) DO NOTHING'),
       [token, owner],
     );
     if (inserted === 1) return token;
@@ -300,16 +336,17 @@ async function acquireMigrationLock(
   }
 }
 
-async function releaseMigrationLock(transport: Transport, token: string): Promise<void> {
-  await transport.execute('DELETE FROM _neutron_migration_lock WHERE id = 1 AND token = $1', [token]);
+async function releaseMigrationLock(transport: Transport, token: string, namespace: MigrationNamespace): Promise<void> {
+  await transport.execute(namespace.sql('DELETE FROM _neutron_migration_lock WHERE id = 1 AND token = $1'), [token]);
 }
 
 /** Read the current migration claim for diagnostics: who holds it and how
  * fresh the heartbeat is. Informational only — nothing here acts on
  * staleness. */
 export async function migrationLockInfo(transport: Transport): Promise<MigrationLockInfo> {
+  const namespace = await captureMigrationNamespace(transport);
   const result = await transport.query<{ owner: string | null; heartbeat: string | null }>(
-    'SELECT owner, locked_at::text AS heartbeat FROM _neutron_migration_lock WHERE id = 1');
+    namespace.sql('SELECT owner, locked_at::text AS heartbeat FROM _neutron_migration_lock WHERE id = 1'));
   if (result.rows.length === 0) return { held: false, owner: null, heartbeat: null };
   return {
     held: true,
@@ -326,7 +363,8 @@ export async function migrationLockInfo(transport: Transport): Promise<Migration
  * why no automatic takeover exists.
  */
 export async function forceUnlockMigrations(transport: Transport): Promise<void> {
-  await transport.execute('DELETE FROM _neutron_migration_lock WHERE id = 1');
+  const namespace = await captureMigrationNamespace(transport);
+  await transport.execute(namespace.sql('DELETE FROM _neutron_migration_lock WHERE id = 1'));
 }
 
 // ---------------------------------------------------------------------------
@@ -349,12 +387,13 @@ export async function migrate(
   options?: MigrateOptions,
 ): Promise<string[]> {
   const plan = prepareMigrations(migrations);
-  const token = await acquireMigrationLock(transport, options);
+  const namespace = await captureMigrationNamespace(transport);
+  const token = await acquireMigrationLock(transport, namespace, options);
   const owner = options?.owner ?? defaultOwner();
 
   try {
-    await prepareMigrationHistory(transport);
-    const applied = await appliedRows(transport);
+    await prepareMigrationHistory(transport, namespace);
+    const applied = await appliedRows(transport, namespace);
     verifyHistory(plan, applied);
 
     const ran: string[] = [];
@@ -365,14 +404,14 @@ export async function migrate(
       try {
         await tx.execute(m.up);
         await tx.execute(
-          'INSERT INTO _neutron_migrations (version, name, checksum, owner, format) VALUES ($1, $2, $3, $4, $5)',
+          namespace.sql('INSERT INTO _neutron_migrations (version, name, checksum, owner, format) VALUES ($1, $2, $3, $4, $5)'),
           [m.version, m.name, migrationChecksum(m.up), owner, MIGRATION_HISTORY_FORMAT],
         );
         await tx.commit();
         ran.push(m.name);
         // Heartbeat refresh: diagnostic only, never a lease.
         await transport
-          .execute('UPDATE _neutron_migration_lock SET locked_at = NOW() WHERE id = 1 AND token = $1', [token])
+          .execute(namespace.sql('UPDATE _neutron_migration_lock SET locked_at = NOW() WHERE id = 1 AND token = $1'), [token])
           .catch(() => {});
       } catch (err) {
         await tx.rollback().catch(() => {});
@@ -382,7 +421,7 @@ export async function migrate(
 
     return ran;
   } finally {
-    await releaseMigrationLock(transport, token).catch(() => {});
+    await releaseMigrationLock(transport, token, namespace).catch(() => {});
   }
 }
 
@@ -399,11 +438,12 @@ export async function migrateDown(
   options?: MigrateOptions,
 ): Promise<string[]> {
   const plan = [...prepareMigrations(migrations)].reverse();
-  const token = await acquireMigrationLock(transport, options);
+  const namespace = await captureMigrationNamespace(transport);
+  const token = await acquireMigrationLock(transport, namespace, options);
 
   try {
-    await prepareMigrationHistory(transport);
-    const applied = await appliedRows(transport);
+    await prepareMigrationHistory(transport, namespace);
+    const applied = await appliedRows(transport, namespace);
     verifyHistory(plan, applied);
 
     const rolled: string[] = [];
@@ -417,7 +457,7 @@ export async function migrateDown(
       const tx = await transport.beginTransaction();
       try {
         await tx.execute(m.down);
-        await tx.execute('DELETE FROM _neutron_migrations WHERE version = $1', [m.version]);
+        await tx.execute(namespace.sql('DELETE FROM _neutron_migrations WHERE version = $1'), [m.version]);
         await tx.commit();
         rolled.push(m.name);
       } catch (err) {
@@ -428,7 +468,7 @@ export async function migrateDown(
 
     return rolled;
   } finally {
-    await releaseMigrationLock(transport, token).catch(() => {});
+    await releaseMigrationLock(transport, token, namespace).catch(() => {});
   }
 }
 
@@ -448,14 +488,15 @@ export async function adoptMigrations(
   options?: MigrateOptions,
 ): Promise<MigrationAdoptionReport> {
   const plan = prepareMigrations(migrations);
-  const token = await acquireMigrationLock(transport, options);
+  const namespace = await captureMigrationNamespace(transport);
+  const token = await acquireMigrationLock(transport, namespace, options);
   const owner = options?.owner ?? defaultOwner();
 
   try {
-    await checkHistoryShape(transport);
+    await checkHistoryShape(transport, namespace);
 
     const exists = await transport.fetchval<number>(
-      'SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = \'_neutron_migrations\')');
+      'SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = \'_neutron_migrations\')', [namespace.schema]);
     if (!exists) throw new Error('nucleus: nothing to adopt: no migration history exists');
 
     const byVersion = new Map(plan.map((m) => [m.version, m]));
@@ -464,10 +505,10 @@ export async function adoptMigrations(
     let tx = await transport.beginTransaction();
     try {
       const hasChecksum = await tx.fetchval<boolean>(
-        "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '_neutron_migrations' AND column_name = 'checksum')");
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = '_neutron_migrations' AND column_name = 'checksum')", [namespace.schema]);
       const history = await tx.query<{ version: number; name: string; checksum: string | null }>(
-        hasChecksum ? 'SELECT version, name, checksum FROM _neutron_migrations' :
-          'SELECT version, name, NULL AS checksum FROM _neutron_migrations');
+        hasChecksum ? namespace.sql('SELECT version, name, checksum FROM _neutron_migrations') :
+          namespace.sql('SELECT version, name, NULL AS checksum FROM _neutron_migrations'));
       // Validate every digest before nullable-column DDL: catalog DDL is not
       // rolled back by Nucleus, whereas PostgreSQL rolls it back with this tx.
       for (const row of history.rows) {
@@ -482,12 +523,12 @@ export async function adoptMigrations(
         // Finish the old tuple-layout snapshot before nontransactional DDL.
         // The same ledger claim covers preflight, upgrade, and graduation.
         await tx.rollback();
-        await ensureTable(transport);
+        await ensureTable(transport, namespace);
         tx = await transport.beginTransaction();
       } else {
         // Do not retry a DDL error inside an aborted PostgreSQL transaction.
         for (const ddl of [MIGRATIONS_ADD_CHECKSUM, MIGRATIONS_ADD_OWNER, MIGRATIONS_ADD_FORMAT]) {
-          await tx.execute(ddl);
+          await tx.execute(namespace.sql(ddl));
         }
       }
       for (const row of history.rows) {
@@ -498,12 +539,12 @@ export async function adoptMigrations(
 
         if (m && row.checksum != null && row.checksum === legacyDigest) {
           await tx.execute(
-            'UPDATE _neutron_migrations SET checksum = $1, owner = $2, format = $3 WHERE version = $4',
+            namespace.sql('UPDATE _neutron_migrations SET checksum = $1, owner = $2, format = $3 WHERE version = $4'),
             [newDigest, owner, MIGRATION_HISTORY_FORMAT, version]);
           report.verified.push(version);
         } else if (m && row.checksum != null && row.checksum === newDigest) {
           await tx.execute(
-            'UPDATE _neutron_migrations SET owner = $1, format = $2 WHERE version = $3',
+            namespace.sql('UPDATE _neutron_migrations SET owner = $1, format = $2 WHERE version = $3'),
             [owner, MIGRATION_HISTORY_FORMAT, version]);
           report.verified.push(version);
         } else if (m && row.checksum != null) {
@@ -515,7 +556,7 @@ export async function adoptMigrations(
           // No recorded checksum or no matching plan entry: honest NULL,
           // reported — never baselined.
           await tx.execute(
-            'UPDATE _neutron_migrations SET checksum = NULL, owner = $1, format = $2 WHERE version = $3',
+            namespace.sql('UPDATE _neutron_migrations SET checksum = NULL, owner = $1, format = $2 WHERE version = $3'),
             [owner, MIGRATION_HISTORY_FORMAT, version]);
           report.unverified.push(version);
         }
@@ -528,7 +569,7 @@ export async function adoptMigrations(
 
     return report;
   } finally {
-    await releaseMigrationLock(transport, token).catch(() => {});
+    await releaseMigrationLock(transport, token, namespace).catch(() => {});
   }
 }
 
@@ -536,10 +577,11 @@ export async function adoptMigrations(
  * Return all previously applied migrations, ordered by version ascending.
  */
 export async function migrationStatus(transport: Transport): Promise<MigrationRecord[]> {
-  await prepareMigrationHistory(transport);
-  verifyHistory([], await appliedRows(transport));
+  const namespace = await captureMigrationNamespace(transport);
+  await prepareMigrationHistory(transport, namespace);
+  verifyHistory([], await appliedRows(transport, namespace));
   const result = await transport.query<{ version: number; name: string; applied_at: string }>(
-    'SELECT version, name, applied_at FROM _neutron_migrations ORDER BY version',
+    namespace.sql('SELECT version, name, applied_at FROM _neutron_migrations ORDER BY version'),
   );
   return result.rows.map((r) => ({
     version: r.version,

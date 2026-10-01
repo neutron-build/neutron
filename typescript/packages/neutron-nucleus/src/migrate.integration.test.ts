@@ -164,7 +164,7 @@ describe("Integration: migration protocol v2 (live engine)", { skip: !live() && 
       const tx = await begin(...args);
       const execute = tx.execute.bind(tx);
       tx.execute = async (sql, params, opts) => {
-        if (sql.startsWith('UPDATE _neutron_migrations') && ++updates === 2) {
+        if ((/^UPDATE (?:"(?:[^"]|"")+"\.)?"?_neutron_migrations"?\b/.test(sql)) && ++updates === 2) {
           throw new Error('injected adoption update failure');
         }
         return execute(sql, params, opts);
@@ -203,7 +203,7 @@ describe("Integration: migration protocol v2 (live engine)", { skip: !live() && 
     const queued = new Promise<void>(resolve => { entered = resolve; });
     t.execute = async (sql, params, opts) => {
       const count = await execute(sql, params, opts);
-      if (sql.startsWith('INSERT INTO _neutron_migration_lock') && count === 0) entered();
+      if ((/^INSERT INTO (?:"(?:[^"]|"")+"\.)?"?_neutron_migration_lock"?(?: |$)/.test(sql)) && count === 0) entered();
       return count;
     };
     const controller = new AbortController();
@@ -263,7 +263,7 @@ describe("Integration: migration protocol v2 (live engine)", { skip: !live() && 
     const execute = t.execute.bind(t);
     let creates = 0;
     t.execute = async (sql, params, opts) => {
-      if (/^\s*CREATE TABLE IF NOT EXISTS _neutron_migration_lock\b/.test(sql) && ++creates === 1) {
+      if (/^\s*CREATE TABLE IF NOT EXISTS (?:"(?:[^"]|"")+"\.)?"?_neutron_migration_lock"?(?:\s|$)/.test(sql) && ++creates === 1) {
         throw Object.assign(new Error('relation _neutron_migration_lock already exists'), { code: '42P07' });
       }
       return execute(sql, params, opts);
