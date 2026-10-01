@@ -419,6 +419,9 @@ func runExtended(out string, n, trials, seconds int, correctnessOnly bool) (err 
 		for trial := 0; trial < trials; trial++ {
 			for pos, id := range orders[trial%6] {
 				name := names[id]
+				if e := guard(filepath.Dir(out)); e != nil {
+					return e
+				}
 				cr, e := coldChild(ctx, f, name)
 				if e != nil {
 					return e
@@ -429,6 +432,10 @@ func runExtended(out string, n, trials, seconds int, correctnessOnly bool) (err 
 					return errors.New("provider failed")
 				}
 				for _, c := range []int{1, 4} {
+					if e := guard(filepath.Dir(out)); e != nil {
+						p.Close()
+						return e
+					}
 					phase, e := extendedPhase(ctx, f, p, trial, pos, n, c, seconds, false)
 					r.Phases = append(r.Phases, phase)
 					if pe := writeJSON(filepath.Join(out, "extended-report.json"), r); pe != nil {
@@ -439,6 +446,10 @@ func runExtended(out string, n, trials, seconds int, correctnessOnly bool) (err 
 						p.Close()
 						return errors.New("write phase failed")
 					}
+				}
+				if e := guard(filepath.Dir(out)); e != nil {
+					p.Close()
+					return e
 				}
 				phase, e := extendedPhase(ctx, f, p, trial, pos, n, 4, seconds, true)
 				r.Phases = append(r.Phases, phase)
