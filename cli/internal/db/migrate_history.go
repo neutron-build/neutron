@@ -176,7 +176,12 @@ func (c *Client) LockMigrations(ctx context.Context) (*MigrationSession, error) 
 	if err != nil {
 		return nil, fmt.Errorf("acquire migration connection: %w", err)
 	}
-	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", migrationAdvisoryLockKey); err != nil {
+	if _, err := conn.Exec(ctx, "SELECT pg_catalog.pg_advisory_lock($1)", migrationAdvisoryLockKey); err != nil {
+		// An interrupted acquisition can have an uncertain server-side outcome.
+		// Destroy the connection before its pool handle can be returned.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		_ = conn.Conn().Close(cleanupCtx)
+		cancel()
 		conn.Release()
 		return nil, fmt.Errorf("acquire migration lock (another runner may be holding it): %w", err)
 	}
@@ -186,8 +191,9 @@ func (c *Client) LockMigrations(ctx context.Context) (*MigrationSession, error) 
 // Release drops the advisory lock and returns the connection to the pool.
 // Safe to call more than once. The unlock uses a context that survives
 // cancellation of the run: a failed run must still release the lock. If the
-// session is already dead the unlock error is irrelevant — PostgreSQL
-// releases session advisory locks on disconnect, which is the crash story.
+// unlock cannot be confirmed, the physical connection is closed before pool
+// return. PostgreSQL releases remaining session locks on disconnect; an
+// uncertain session is never recycled for another caller.
 func (s *MigrationSession) Release() {
 	if s == nil || s.released {
 		return
@@ -195,7 +201,10 @@ func (s *MigrationSession) Release() {
 	s.released = true
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), 5*time.Second)
 	defer cancel()
-	_, _ = s.conn.Exec(ctx, "SELECT pg_advisory_unlock($1)", migrationAdvisoryLockKey)
+	var unlocked bool
+	if err := s.conn.QueryRow(ctx, "SELECT pg_catalog.pg_advisory_unlock($1)", migrationAdvisoryLockKey).Scan(&unlocked); err != nil || !unlocked {
+		_ = s.conn.Conn().Close(ctx)
+	}
 	s.conn.Release()
 }
 
