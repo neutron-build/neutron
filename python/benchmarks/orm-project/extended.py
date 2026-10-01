@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded local write/startup/RSS/load/adoption experiment; private raw evidence."""
 from __future__ import annotations
-import argparse, asyncio, hashlib, json, os, resource, secrets, stat, subprocess, sys, time
+import argparse, asyncio, hashlib, json, os, resource, secrets, stat, subprocess, sys, time, traceback
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -154,7 +154,7 @@ async def execute(args):
                         stdout, stderr = await asyncio.wait_for(proc.communicate(),timeout=30)
                         if proc.returncode: raise RuntimeError('startup child failed')
                         cold = json.loads(stdout)
-                        cold['process_wall_ns']=time.perf_counter_ns()-start
+                        cold['total_lifecycle_ns']=time.perf_counter_ns()-start
                     finally: child_file.unlink(missing_ok=True)
                     p = await PROVIDERS[index].open(url); active.append(p)
                     before = await run.snapshot(oracle)
@@ -168,6 +168,7 @@ async def execute(args):
                     # Closed-loop c4 workload, 3 reads then one transactional CRUD.
                     # All workers own distinct write IDs. Checks outside latency timer.
                     sustained = []
+                    oracle_lock=asyncio.Lock()
                     started=time.perf_counter_ns(); deadline=time.monotonic()+args.seconds
                     async def worker(worker_id):
                         count=0
@@ -179,7 +180,8 @@ async def execute(args):
                             elapsed=time.perf_counter_ns()-t
                             if write:
                                 validate(result,value)
-                                run.same(await run.oracle_rows(oracle,"WHERE tenant='a' AND id=$1",value['id']),[])
+                                async with oracle_lock:
+                                    run.same(await run.oracle_rows(oracle,"WHERE tenant='a' AND id=$1",value['id']),[])
                             else: run.same(run.normalize(result),expected)
                             sustained.append({'offset_ns':time.perf_counter_ns()-started,'worker':worker_id,'sequence':count,'operation':'transaction-crud' if write else 'point','elapsed_ns':elapsed})
                             count+=1
@@ -216,7 +218,7 @@ async def execute(args):
         run.write_json(args.output/'cleanup.json',{'database':database,'created':created,'removed':created and not errors,'errors':errors})
         if errors and failure is None: failure=RuntimeError('cleanup failed')
     if failure:
-        run.write_json(args.output/'failure.json',{'type':type(failure).__name__})
+        run.write_json(args.output/'failure.json',{'type':type(failure).__name__,'frames':[{'file':f.filename,'line':f.lineno,'function':f.name} for f in traceback.extract_tb(failure.__traceback__)]})
         raise failure
     run.disk_guard(args.output)
     run.write_json(args.output/'result.json',{'status':'PASS','mode':'correctness-only' if args.correctness_only else 'extended','phases':len(measurements),'errors':0})
