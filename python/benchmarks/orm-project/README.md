@@ -132,7 +132,7 @@ rate or a contention benchmark. Consumer throughput includes oracle checks,
 dispatch and memory-sampler overhead.
 
 Fresh subprocess trials record whole process launch/import/connect/first-read/
-close wall time, connection initialization and first-read latency, with warm OS
+close wall time, parent-observed first-result handoff, connection initialization and first-read latency, with warm OS
 and database caches. Each child imports the shared all-provider modules, so this
 is not a clean minimal-provider startup or package-footprint comparison.
 `ps` current RSS and `getrusage` OS high-water RSS are process measures, not heap
@@ -140,6 +140,10 @@ allocation or retained model sizes. Sustained parent RSS retains allocator/impor
 history across phases; raw arrays are saved and discarded per phase. Do not rank
 provider memory from that shared process. One-second sampling misses short peaks;
 OS high-water captures process history but cannot attribute it to one provider.
+Each fresh child separately completes1000 validated point reads and reports current
+RSS before/after and OS high-water; it has no prior-provider/sample-array history,
+but still imports the shared all-provider modules. The total lifecycle includes
+this1000-read memory probe and is not startup time. First-result handoff precedes it.
 
 `DocumentService` is an executable tiny tenant-scoped application slice: create,
 edit with optimistic conflict, keyset list, project detail and explicit abandoned

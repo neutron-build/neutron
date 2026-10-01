@@ -91,7 +91,11 @@ async def child(args):
         value = await provider.point('a',17)
         finished = time.perf_counter_ns()
         run.same(run.normalize(value), config['expected'])
-        print(json.dumps({'connect_ns':opened-start,'first_read_ns':finished-opened,'baseline_peak_rss_bytes':BASELINE_RSS*(1 if sys.platform=='darwin' else 1024),'current_rss_bytes':current_rss(),'peak_rss_bytes':rss()}))
+        print(json.dumps({'marker':'first-result','connect_ns':opened-start,'first_read_ns':finished-opened}),flush=True)
+        before_reads=current_rss()
+        for _ in range(1000):
+            run.same(run.normalize(await provider.point('a',17)),config['expected'])
+        print(json.dumps({'marker':'memory','reads':1000,'baseline_peak_rss_bytes':BASELINE_RSS*(1 if sys.platform=='darwin' else 1024),'before_reads_current_rss_bytes':before_reads,'after_reads_current_rss_bytes':current_rss(),'peak_rss_bytes':rss()}),flush=True)
     finally:
         await provider.close()
 
@@ -151,9 +155,14 @@ async def execute(args):
                     start = time.perf_counter_ns()
                     try:
                         proc = await asyncio.create_subprocess_exec(sys.executable,str(Path(__file__).resolve()),'--child-file',str(child_file),stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
+                        first_line=await asyncio.wait_for(proc.stdout.readline(),timeout=30)
+                        first_handoff=time.perf_counter_ns()
                         stdout, stderr = await asyncio.wait_for(proc.communicate(),timeout=30)
                         if proc.returncode: raise RuntimeError('startup child failed')
-                        cold = json.loads(stdout)
+                        cold = json.loads(first_line)
+                        run.same(cold.pop('marker'),'first-result')
+                        cold['launch_to_first_result_handoff_ns']=first_handoff-start
+                        cold['isolated_memory']=json.loads(stdout)
                         cold['total_lifecycle_ns']=time.perf_counter_ns()-start
                     finally: child_file.unlink(missing_ok=True)
                     p = await PROVIDERS[index].open(url); active.append(p)
