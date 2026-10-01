@@ -9,10 +9,12 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: var(--space-2) var(--space-3);
+  padding: 12px 16px;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   gap: var(--space-2);
+  min-height: 54px;
+  flex-wrap: wrap;
 }
 
 .hint {
@@ -24,6 +26,7 @@
   display: flex;
   align-items: center;
   gap: var(--space-2);
+  flex-wrap: wrap;
 }
 
 .panelBtn {
@@ -78,7 +81,6 @@
   opacity: 0.5;
 }
 
-/* Save dialog bar */
 .saveDialog {
   display: flex;
   align-items: center;
@@ -124,7 +126,6 @@
   color: var(--text-secondary);
 }
 
-/* Editor body: main + side panel */
 .editorBody {
   display: flex;
   flex: 1;
@@ -146,7 +147,6 @@
   min-height: 0;
 }
 
-/* Override CodeMirror to fill container */
 .cmWrap .cm-editor {
   height: 100%;
 }
@@ -158,7 +158,6 @@
   overflow: hidden;
 }
 
-/* Side panel */
 .sidePanel {
   width: 280px;
   flex-shrink: 0;
@@ -166,7 +165,7 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background: var(--bg-panel);
+  background: var(--bg-app);
 }
 
 .sidePanelTabs {
@@ -208,7 +207,6 @@
   text-align: center;
 }
 
-/* History items */
 .historyItem {
   display: flex;
   flex-direction: column;
@@ -238,7 +236,6 @@
   color: var(--text-tertiary);
 }
 
-/* Saved items */
 .savedItem {
   display: flex;
   align-items: stretch;
@@ -289,8 +286,6 @@
 .savedDelete:hover {
   color: var(--danger);
 }
-
-/* --- S04: completion schema, cancel, parameters, EXPLAIN --- */
 
 .toolbarLeft {
   display: flex;
@@ -510,8 +505,6 @@
   max-height: 240px;
 }
 
-/* --- S05: plan tree --- */
-
 .planViewToggle {
   display: flex;
   gap: var(--space-1);
@@ -527,6 +520,7 @@
   border-radius: var(--radius-sm);
   cursor: pointer;
 }
+
 .planViewTabActive {
   color: var(--text-primary);
   background: color-mix(in srgb, var(--model-sql) 10%, transparent);
@@ -544,7 +538,9 @@
   border-left: 1px solid var(--border);
 }
 
-.planTreeItem { margin: var(--space-1) 0; }
+.planTreeItem {
+  margin: var(--space-1) 0;
+}
 
 .planTreeNode {
   display: flex;
@@ -571,8 +567,14 @@
   font-size: 11px;
   color: var(--text-tertiary);
 }
-.planTreeMetric[data-kind='buffers'] { color: var(--model-sql); }
-.planTreeMetricK { opacity: 0.7; }
+
+.planTreeMetric[data-kind='buffers'] {
+  color: var(--model-sql);
+}
+
+.planTreeMetricK {
+  opacity: 0.7;
+}
 
 .planTreeExtras {
   background: none;
@@ -591,7 +593,36 @@
   border-radius: var(--radius-sm);
   font-size: 11px;
 }
-.planTreeExtrasList div { display: flex; gap: var(--space-2); }
-.planTreeExtrasList dt { color: var(--text-tertiary); min-width: 12em; }
-.planTreeExtrasList dd { margin: 0; }
-.planTreeExtrasList code { font-family: var(--font-mono); word-break: break-all; }
+
+.planTreeExtrasList div {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.planTreeExtrasList dt {
+  color: var(--text-tertiary);
+  min-width: 12em;
+}
+
+.planTreeExtrasList dd {
+  margin: 0;
+}
+
+.planTreeExtrasList code {
+  font-family: var(--font-mono);
+  word-break: break-all;
+}
+
+.panelBtn, .saveQueryBtn, .runBtn, .saveConfirmBtn {
+  min-height: 32px;
+  padding: 6px 12px;
+  border-radius: 7px;
+}
+
+@media (max-width: 900px) {
+.sidePanel { width: 220px; }
+}
+
+@media (max-width: 680px) {
+.editorBody { flex-direction: column; } .sidePanel { width: 100%; height: 180px; border-left: 0; border-top: 1px solid var(--border); } .hint { display: none; }
+}

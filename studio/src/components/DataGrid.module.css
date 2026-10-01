@@ -20,10 +20,10 @@
 .th {
   position: sticky;
   top: 0;
-  background: var(--bg-panel);
+  background: var(--bg-overlay);
   border-bottom: 1px solid var(--border);
   border-right: 1px solid var(--border);
-  padding: var(--space-2) var(--space-3);
+  padding: 8px 12px;
   text-align: left;
   font-weight: 600;
   color: var(--text-secondary);
@@ -32,6 +32,8 @@
   font-size: 11px;
   letter-spacing: 0.03em;
   z-index: 1;
+  height: 38px;
+  border-right-color: var(--border-subtle);
 }
 
 .th:last-child {
@@ -55,6 +57,10 @@
   max-width: 300px;
   overflow: hidden;
   text-overflow: ellipsis;
+  padding-top: 4px;
+  padding-bottom: 4px;
+  font-size: 12px;
+  line-height: 18px;
 }
 
 .td:last-child {
@@ -70,10 +76,13 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: var(--space-2) var(--space-3);
+  padding: 8px 16px;
   border-top: 1px solid var(--border);
   background: var(--bg-panel);
   flex-shrink: 0;
+  min-height: 42px;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
 .footerText {
@@ -87,12 +96,13 @@
 }
 
 .exportBtn {
-  padding: 2px var(--space-2);
+  padding: 4px 8px;
   font-size: var(--text-xs);
   color: var(--text-secondary);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   transition: background var(--transition), color var(--transition);
+  min-height: 28px;
 }
 
 .exportBtn:hover {
@@ -106,8 +116,6 @@
   font-family: var(--font-mono);
   font-size: var(--text-sm);
 }
-
-/* --- editing + FK follow + sort (SQL browser parity) --- */
 
 .stagedCell {
   display: inline-block;
@@ -186,7 +194,7 @@
   padding: 0;
   cursor: pointer;
   font: inherit;
-  color: var(--accent, #4da3ff);
+  color: var(--text-accent);
   text-decoration: underline dotted;
 }
 
@@ -222,13 +230,13 @@
 }
 
 .editHint {
-  padding: 4px 8px;
+  padding: 8px 12px;
   font-size: var(--text-xs);
-  opacity: 0.6;
+  opacity: 1;
   border-top: 1px solid var(--border, #333344);
+  color: var(--text-tertiary);
 }
 
-/* X01: read-only vector/tsvector cells (exact text render + copy). */
 .vectorCell {
   display: inline-flex;
   align-items: center;
@@ -258,9 +266,7 @@
   color: var(--accent, #4af);
 }
 
-/* --- S06: virtualized rows + keyboard grid --- */
-
-/* Fixed row height: the virtualizer's window math relies on it. */
+/* Fixed 28px geometry is required by the row virtualizer. */
 .tr {
   height: 28px;
 }

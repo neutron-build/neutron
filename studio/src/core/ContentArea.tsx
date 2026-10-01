@@ -1,5 +1,6 @@
 import { lazy, Suspense } from 'preact/compat'
-import { activeTab } from '../lib/store'
+import { Icon } from '../components/Icon'
+import { activeTab, openTab, openPalette, limitsFor, limitsReport } from '../lib/store'
 import { ModelLimits, modelForTabKind } from '../components/ModelLimits'
 import s from './ContentArea.module.css'
 
@@ -25,14 +26,21 @@ const DiagnosticsModule = lazy(() => import('../modules/diagnostics/DiagnosticsM
 const JourneyModule   = lazy(() => import('../modules/journey/JourneyModule').then(m => ({ default: m.JourneyModule })))
 
 function Fallback() {
-  return <div class={s.loading}>Loading…</div>
+  return <div class={s.loading} role="status">Loading workspace…</div>
 }
 
 function Empty() {
   return (
     <div class={s.empty}>
-      <div class={s.emptyIcon}>⬡</div>
-      <p class={s.emptyText}>Select a table or data store from the sidebar</p>
+      <div class={s.emptyIcon}><Icon name="database" size={36} /></div>
+      <span class={s.eyebrow}>DATABASE WORKSPACE</span>
+      <h1 class={s.emptyTitle}>Make sense of your data.</h1>
+      <p class={s.emptyText}>Select a table or data store from the sidebar.<br />Or start with a query and explore the shape of your schema.</p>
+      <div class={s.emptyActions}>
+        <button class={s.primaryAction} onClick={() => openTab({ id: `sql-editor-${Date.now()}`, kind: 'sql-editor', label: 'SQL query' })}><Icon name="query" />Write a query</button>
+        <button class={s.secondaryAction} onClick={() => openTab({ id: 'schema-designer', kind: 'schema-designer', label: 'Schema Designer' })}><Icon name="schema" />Explore schema</button>
+      </div>
+      <button class={s.shortcut} onClick={openPalette}>Find tables, queries and commands <kbd>⌘ K</kbd></button>
     </div>
   )
 }
@@ -109,13 +117,21 @@ export function ContentArea() {
   // X06: every surface that acts on a model shows that model's actual
   // transaction/durability limits above it.
   const model = modelForTabKind(tab.kind)
+  const limits = model ? limitsFor(model) : null
+  // Routine verified PostgreSQL status belongs below the data. Warnings,
+  // unknown reports and partial/unsupported engines remain above the action.
+  const routineStatus = limitsReport.value?.engine.product === 'postgres'
+    && limitsReport.value.current && limits?.availability === 'supported'
+    && limits.transaction === 'atomic' && limits.durability === 'engine-documented'
+    && limits.warnings.length === 0
 
   return (
     <div class={s.area}>
-      {model && <ModelLimits model={model} />}
+      {model && !routineStatus && <ModelLimits model={model} />}
       <Suspense fallback={<Fallback />}>
         {content}
       </Suspense>
+      {model && routineStatus && <ModelLimits model={model} />}
     </div>
   )
 }

@@ -2,10 +2,12 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   height: 100%;
-  padding: var(--space-6);
-  gap: var(--space-6);
+  padding: clamp(32px, 8vh, 88px) 24px 32px;
+  gap: 32px;
+  overflow-y: auto;
+  background: radial-gradient(ellipse at 50% 0%, var(--accent-subtle), transparent 65%);
 }
 
 .hero {
@@ -13,64 +15,76 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: var(--space-2);
+  gap: 12px;
+  max-width: 580px;
 }
 
 .logoMark {
-  width: 48px;
-  height: 48px;
-  border-radius: 12px;
-  background: var(--accent);
-  color: #fff;
+  width: 60px;
+  height: 60px;
+  border-radius: 18px;
+  background: var(--accent-subtle);
+  color: var(--text-accent);
   font-size: 24px;
   font-weight: 800;
   display: flex;
   align-items: center;
   justify-content: center;
   margin-bottom: var(--space-2);
+  border: 1px solid var(--accent-border);
 }
 
 .title {
-  font-size: 24px;
-  font-weight: 700;
+  font-size: clamp(28px, 4vw, 36px);
+  font-weight: 650;
   color: var(--text-primary);
+  letter-spacing: -1.2px;
+  line-height: 1.15;
 }
 
 .sub {
-  font-size: var(--text-sm);
-  color: var(--text-tertiary);
+  font-size: var(--text-md);
+  color: var(--text-secondary);
+  line-height: 1.7;
+  max-width: 470px;
 }
 
 .card {
   width: 100%;
-  max-width: 520px;
+  max-width: 620px;
   background: var(--bg-panel);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   overflow: hidden;
+  box-shadow: var(--shadow-md);
+  flex-shrink: 0;
 }
 
 .cardHeader {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: var(--space-3) var(--space-4);
+  padding: 20px 24px;
   border-bottom: 1px solid var(--border);
+  gap: 16px;
 }
 
 .cardTitle {
-  font-size: var(--text-sm);
-  font-weight: 600;
+  font-size: 15px;
+  font-weight: 650;
   color: var(--text-primary);
 }
 
 .btnAdd {
   font-size: var(--text-xs);
-  color: var(--accent);
+  color: var(--text-accent);
   padding: 2px var(--space-2);
   border: 1px solid var(--accent);
   border-radius: var(--radius-sm);
   transition: background var(--transition);
+  white-space: nowrap;
+  border-color: var(--accent-border);
+  background: var(--accent-subtle);
 }
 
 .btnAdd:hover {
@@ -78,14 +92,13 @@
   color: #fff;
 }
 
-/* Add form */
-
 .addForm {
-  padding: var(--space-4);
+  padding: 24px;
   border-bottom: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
+  gap: 16px;
+  background: var(--bg-app);
 }
 
 .field {
@@ -96,15 +109,16 @@
 
 .label {
   font-size: var(--text-xs);
-  color: var(--text-secondary);
-  font-weight: 500;
+  color: var(--text-primary);
+  font-weight: 600;
 }
 
 .input {
-  padding: var(--space-2) var(--space-3);
+  padding: 10px 12px;
   font-size: var(--text-sm);
   border-radius: var(--radius-sm);
   width: 100%;
+  min-height: 40px;
 }
 
 .testResult {
@@ -129,6 +143,11 @@
   font-size: var(--text-xs);
   color: var(--danger);
   padding: var(--space-2) var(--space-4);
+  margin: 12px;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
+  overflow-wrap: anywhere;
 }
 
 .formActions {
@@ -169,13 +188,15 @@
   opacity: 0.85;
 }
 
-/* Connection list */
-
 .empty {
-  padding: var(--space-4);
+  padding: 32px 24px;
   font-size: var(--text-xs);
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
   text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
 }
 
 .connList {
@@ -186,8 +207,8 @@
 .connRow {
   display: flex;
   align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-3) var(--space-4);
+  gap: 14px;
+  padding: 20px 24px;
   border-bottom: 1px solid var(--border);
 }
 
@@ -196,15 +217,19 @@
 }
 
 .connDot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--text-tertiary);
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  background: var(--bg-active);
   flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  color: var(--text-secondary);
 }
 
 .connDot[data-nucleus="true"] {
-  background: var(--accent);
+  background: var(--accent-subtle);
+  color: var(--text-accent);
 }
 
 .connInfo {
@@ -216,13 +241,13 @@
 }
 
 .connName {
-  font-size: var(--text-sm);
+  font-size: var(--text-md);
   font-weight: 600;
   color: var(--text-primary);
 }
 
 .connUrl {
-  font-size: var(--text-xs);
+  font-size: 11px;
   color: var(--text-tertiary);
   font-family: var(--font-mono);
   overflow: hidden;
@@ -262,9 +287,65 @@
   border-radius: var(--radius-sm);
   line-height: 1;
   transition: color var(--transition), background var(--transition);
+  display: grid;
+  place-items: center;
+  min-width: 34px;
+  min-height: 36px;
+  border-color: transparent;
 }
 
 .btnRemove:hover {
   color: var(--danger);
   background: var(--bg-hover);
+}
+
+.eyebrow {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .16em;
+  color: var(--text-accent);
+}
+
+.cardSubtitle {
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  margin-top: 3px;
+}
+
+.btnAdd, .btnSecondary, .btnPrimary, .btnConnect {
+  min-height: 36px;
+  padding: 8px 14px;
+  border-radius: var(--radius-md);
+}
+
+.fieldHelp {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+.empty strong {
+  font-size: var(--text-md);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.empty p {
+  max-width: 360px;
+  line-height: 1.6;
+}
+
+.connRow:hover {
+  background: var(--bg-hover);
+}
+
+.footnote {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  text-align: center;
+  max-width: 540px;
+}
+
+@media (max-width: 480px) {
+.page { padding: 32px 16px; gap: 24px; } .cardHeader, .connRow, .addForm { padding: 16px; } .cardSubtitle { display: none; } .connDot { display: none; } .connRow { flex-wrap: wrap; } .connInfo { flex-basis: 100%; } .connActions { width: 100%; } .btnConnect { flex: 1; }
 }

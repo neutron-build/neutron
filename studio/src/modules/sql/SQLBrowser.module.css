@@ -9,9 +9,11 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: var(--space-2) var(--space-3);
+  padding: 10px 16px;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
+  min-height: 52px;
+  gap: 16px;
 }
 
 .tableId {
@@ -32,9 +34,10 @@
 }
 
 .tableName {
-  font-size: var(--text-sm);
+  font-size: 16px;
   font-weight: 600;
   color: var(--text-primary);
+  letter-spacing: -.3px;
 }
 
 .rowCount {
@@ -47,6 +50,8 @@
 .toolbarActions {
   display: flex;
   gap: var(--space-2);
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .btnRefresh {
@@ -70,11 +75,12 @@
 .columnBar {
   display: flex;
   gap: var(--space-1);
-  padding: var(--space-2) var(--space-3);
+  padding: 8px 16px;
   overflow-x: auto;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   scrollbar-width: none;
+  background: var(--bg-app);
 }
 
 .columnBar::-webkit-scrollbar {
@@ -85,10 +91,10 @@
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 2px var(--space-2);
-  background: var(--bg-active);
+  padding: 4px 8px;
+  background: var(--bg-panel);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: 6px;
   white-space: nowrap;
   cursor: default;
 }
@@ -107,7 +113,7 @@
 }
 
 .colType {
-  font-size: 10px;
+  font-size: 11px;
   color: var(--text-tertiary);
 }
 
@@ -128,19 +134,27 @@
 }
 
 .error {
-  padding: var(--space-4);
+  padding: 16px;
   color: var(--danger);
   font-family: var(--font-mono);
   font-size: var(--text-sm);
+  margin: 16px;
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--danger) 6%, transparent);
+  overflow-wrap: anywhere;
 }
 
 .pagination {
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  padding: var(--space-2) var(--space-3);
+  padding: 8px 20px;
   border-top: 1px solid var(--border);
   flex-shrink: 0;
+  min-height: 48px;
+  background: var(--bg-panel);
+  flex-wrap: wrap;
 }
 
 .pageBtn {
@@ -167,15 +181,14 @@
   font-family: var(--font-mono);
 }
 
-/* --- filter bar --- */
-
 .filterBar {
   display: flex;
   gap: 8px;
   align-items: center;
-  padding: 8px 12px;
+  padding: 8px 16px;
   border-bottom: 1px solid var(--border, #333344);
   flex-wrap: wrap;
+  background: var(--bg-panel);
 }
 
 .filterSelect {
@@ -214,13 +227,15 @@
 }
 
 .readOnlyNote {
-  padding: 8px 10px;
+  padding: 10px 12px;
   margin-bottom: 8px;
   font-size: var(--text-sm);
   color: var(--warning, #f0c674);
   background: color-mix(in srgb, var(--warning, #f0c674) 8%, transparent);
   border: 1px solid color-mix(in srgb, var(--warning, #f0c674) 35%, transparent);
   border-radius: 4px;
+  margin: 8px 16px;
+  line-height: 1.6;
 }
 
 .lostWindowNote {
@@ -232,8 +247,6 @@
   border: 1px solid color-mix(in srgb, var(--warning, #f0c674) 35%, transparent);
   border-radius: 4px;
 }
-
-/* --- multi-filter --- */
 
 .filterRow {
   display: inline-flex;
@@ -256,8 +269,6 @@
 .filterRemove:hover {
   color: var(--danger, #ff6b6b);
 }
-
-/* --- insert form --- */
 
 .insertForm {
   margin: 8px 12px;
@@ -323,7 +334,6 @@
   color: var(--warning, #f0c674);
 }
 
-/* X01: table search panel (vector similarity + full-text). */
 .searchPanel {
   border-top: 1px solid var(--border, #333);
   padding: 10px 12px;
@@ -366,8 +376,6 @@
   margin-bottom: 4px;
 }
 
-/* --- S06: export / import / page size --- */
-
 .exportGroup {
   display: inline-flex;
   gap: 4px;
@@ -382,3 +390,23 @@
   font-size: var(--text-xs);
   color: var(--text-tertiary);
 }
+
+.btnAction, .btnRefresh, .filterBtn, .pageBtn {
+  min-height: 32px;
+  padding: 6px 10px;
+  border-radius: 7px;
+}
+
+.filterInput, .filterSelect {
+  min-height: 32px;
+  background: var(--bg-input);
+}
+
+@media (max-width: 900px) {
+.toolbar { align-items: flex-start; flex-wrap: wrap; padding: 12px; } .toolbarActions { justify-content: flex-start; } .tableId { flex-wrap: wrap; } .filterBar { padding: 10px 12px; } .filterInput { min-width: 0; width: 140px; } .columnBar { padding: 10px 12px; }
+}
+
+.permissions { position: relative; margin-left: 8px; font-family: var(--font-sans); font-size: 11px; color: var(--text-secondary); }
+.permissions summary { cursor: pointer; border: 1px solid var(--border); border-radius: 5px; padding: 3px 7px; white-space: nowrap; }
+.permissions summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.permissions p { position: absolute; top: calc(100% + 8px); left: 0; z-index: 20; width: min(320px, 70vw); padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--bg-overlay); box-shadow: var(--shadow-md); font-size: 12px; line-height: 1.6; }
