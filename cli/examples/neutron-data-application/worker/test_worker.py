@@ -243,11 +243,12 @@ asyncio.run(run())
             with self.assertRaises(ValueError): await self.worker.admit()
         finally:
             await self.oracle.execute('ALTER ROLE '+chr(34)+self.role+chr(34)+' NOCREATEDB')
-        await self.oracle.execute('UPDATE app_schema_revision SET revision=2')
+        previous = await self.oracle.fetchval('SELECT revision FROM app_schema_revision WHERE singleton')
+        await self.oracle.execute('UPDATE app_schema_revision SET revision=3')
         try:
             with self.assertRaises(ValueError): await self.worker.admit()
         finally:
-            await self.oracle.execute('UPDATE app_schema_revision SET revision=1')
+            await self.oracle.execute('UPDATE app_schema_revision SET revision=$1', previous)
         self.assertEqual(await self.oracle.fetchval('SELECT attempts FROM jobs WHERE document_id=$1', self.document), 0)
 
 

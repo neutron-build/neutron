@@ -8,6 +8,8 @@ from pathlib import Path
 import re
 import secrets
 import subprocess
+import shutil
+import tempfile
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import asyncpg
@@ -72,9 +74,15 @@ async def run(args):
             owner_url = connection_url(admin_url, args.database, owner, passwords[owner])
             env = dict(os.environ, DATABASE_URL=owner_url)
             # CLI errors can contain connection strings; never print captured diagnostics here.
-            result = await asyncio.to_thread(subprocess.run,
-                [str(args.cli.resolve()), 'migrate', '--dir', str(Path(__file__).parent / 'migrations')],
-                env=env, capture_output=True, text=True, timeout=120)
+            # One immutable source set; revision1 is an explicit old-consumer fixture.
+            with tempfile.TemporaryDirectory(prefix='neutron-reference-migrations-') as temporary:
+                migration_dir = Path(temporary)
+                for file in (Path(__file__).parent / 'migrations').glob('*.sql'):
+                    if int(file.name.split('_', 1)[0]) <= args.schema_revision:
+                        shutil.copyfile(file, migration_dir / file.name)
+                result = await asyncio.to_thread(subprocess.run,
+                    [str(args.cli.resolve()), 'migrate', '--dir', str(migration_dir)],
+                    env=env, capture_output=True, text=True, timeout=120)
             if result.returncode:
                 raise RuntimeError('CLI migration failed (captured diagnostics withheld because they may contain credentials)')
             database_admin_url = urlunsplit(urlsplit(admin_url)._replace(path='/' + args.database))
@@ -105,7 +113,7 @@ async def run(args):
                                 ' TO ' + r + " USING (tenant_id = '" + tenant + "') WITH CHECK (tenant_id = '" + tenant + "')")
             finally:
                 await db.close()
-            manifest = {'database': args.database, 'schema_revision': 1, 'migration_owner_url': owner_url,
+            manifest = {'database': args.database, 'schema_revision': args.schema_revision, 'migration_owner_url': owner_url,
                         'roles': {role: connection_url(admin_url, args.database, role, passwords[role]) for role in roles}}
             args.out.parent.mkdir(parents=True, exist_ok=True)
             fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -126,6 +134,7 @@ async def run(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--database', required=True)
+    parser.add_argument('--schema-revision', type=int, choices=(1, 2), default=2)
     parser.add_argument('--cli', type=Path, default=Path('neutron'))
     parser.add_argument('--out', type=Path, default=Path('.reference-credentials.local.json'))
     parser.add_argument('--drop', action='store_true')

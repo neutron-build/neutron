@@ -86,7 +86,7 @@ func connectTenant(ctx context.Context, tenant string, conf tenantConfig) (*nucl
 		if err = conn.QueryRow(ctx, `SELECT count(*)::int,coalesce(min(revision),0) FROM public.app_schema_revision`).Scan(&rows, &revision); err != nil {
 			return err
 		}
-		if rows != 1 || revision != 1 {
+		if rows != 1 || (revision != 1 && revision != 2) {
 			return errors.New("schema revision refused")
 		}
 		if err = conn.QueryRow(ctx, `SELECT count(*)::int FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname=ANY(ARRAY['projects','documents','processing_requests','jobs','results']) AND c.relkind='r' AND c.relrowsecurity AND c.relforcerowsecurity`).Scan(&managed); err != nil {

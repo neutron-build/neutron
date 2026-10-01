@@ -1,6 +1,6 @@
 # PostgreSQL reference API
 
-Provision schema revision 1 and the finite tenant roles using the separate
+Provision schema revisions 1 and 2 and the finite tenant roles using the separate
 `../database/provision.py` operator step before starting this service. The API
 never migrates a database. PostgreSQL 17 is the tested profile; Nucleus is refused.
 
@@ -23,7 +23,7 @@ configuration through the process environment:
 
 Every new connection verifies current/session role against the configured
 allowlist, nonprivileged flags, absence of role memberships and ownership,
-PostgreSQL 17, exact schema revision 1 and enabled/forced RLS on all five managed
+PostgreSQL 17, supported schema revisions 1 and 2 and enabled/forced RLS on all five managed
 tables. Request headers, bodies and URLs cannot select a connection string or
 role. JWT middleware verifies HS256/expiration, then application policy requires
 issuer `neutron-data-reference`, audience `neutron-data-reference-api`, a nonempty
@@ -80,3 +80,9 @@ actual marshaled response fields/types to the spec. Use
 `neutron project spec --check --service api` with private runtime configuration
 to compare the live embedded artifact with the canonical committed snapshot.
 The web has its own native SSR discovery document, not a second business API.
+
+Revision 2 adds the database-derived `documents.content_octets` column. Existing
+API/worker projections and writes remain valid on either supported revision.
+Unknown revisions are refused at startup/physical connection admission. This is
+an explicit compatibility range for this additive change, not arbitrary-schema
+compatibility or per-statement structural validation.

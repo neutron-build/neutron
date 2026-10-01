@@ -298,9 +298,15 @@ async def run(args):
         print('PASS ' + label, flush=True)
     try:
         result = await command([sys.executable, str(HERE / 'provision.py'), '--database', name,
-                                '--cli', str(args.cli.resolve()), '--out', str(credentials)], env)
+                                '--schema-revision', str(args.schema_revision), '--cli', str(args.cli.resolve()), '--out', str(credentials)], env)
         require(result.returncode == 0, 'fresh provision failed; native diagnostics withheld')
         manifest = json.loads(credentials.read_text())
+        original_revision = manifest['schema_revision']
+        migration_plan = directory / 'migration-plan'
+        migration_plan.mkdir()
+        for file in (HERE / 'migrations').glob('*.sql'):
+            if int(file.name.split('_', 1)[0]) <= original_revision:
+                shutil.copyfile(file, migration_plan / file.name)
         admin = await asyncpg.connect(admin_url)
         database_url = urlunsplit(urlsplit(admin_url)._replace(path='/' + name))
         db = await asyncpg.connect(database_url)
@@ -340,24 +346,24 @@ async def run(args):
         before_detail = {tenant: await api.request('/api/documents/' + document_id, tenant) for tenant in fixtures}
         require(all(detail['tenant_id'] == tenant and detail['content'].endswith(tenant) for tenant, detail in before_detail.items()), 'actual API tenant identity differs')
         require(before_detail['tenant-a']['version'] == '9007199254740993' and before_detail['tenant-a']['created_at'] == '2026-09-30T22:34:56.123456Z', 'exact API version/timestamp lost')
-        passed('original revision1 actual API and workers: exact values, both tenants, durable results')
+        passed('supported original revision actual API and workers: exact values, both tenants, durable results')
         # Additive fixture only; no pretend new binary/schema release is introduced.
         await db.execute('ALTER TABLE public.documents ADD COLUMN operator_annotation pg_catalog.text')
         await api.stop()
         await api.start()
         require(await api.request('/api/documents/' + document_id) == before_detail['tenant-a'], 'old consumer failed additive expansion')
         require((await worker())['outcome'] == 'done', 'old worker failed additive expansion')
-        passed('revision1 additive optional column remains compatible with existing API/worker')
+        passed('supported revision additive optional column remains compatible with existing API/worker')
         await api.stop()
-        await db.execute('UPDATE public.app_schema_revision SET revision=2')
+        await db.execute('UPDATE public.app_schema_revision SET revision=3')
         unchanged = await snapshot(db, name, list(manifest['roles']) + [owner])
         await api.start(admitted=False)
         await api.stop()
         await worker(admitted=False)
-        require(stable(await snapshot(db, name, list(manifest['roles']) + [owner])) == stable(unchanged), 'refused consumers mutated revision2 fixture')
-        await db.execute('UPDATE public.app_schema_revision SET revision=1')
+        require(stable(await snapshot(db, name, list(manifest['roles']) + [owner])) == stable(unchanged), 'refused consumers mutated unsupported revision3 fixture')
+        await db.execute('UPDATE public.app_schema_revision SET revision=$1', original_revision)
         await db.execute('ALTER TABLE public.documents DROP COLUMN operator_annotation')
-        passed('revision2 explicitly refuses old API/worker without row changes; fixture marker reverted')
+        passed('unsupported revision3 explicitly refuses API/worker without row changes; fixture marker reverted')
         # Leave an actual durable pending job for processing after restoration.
         pending_id = str(uuid4())
         await api.start()
@@ -366,9 +372,11 @@ async def run(args):
         await api.stop()
         expected = await snapshot(db, name, list(manifest['roles']) + [owner])
         history = expected['rows']['_neutron_migrations']
-        sql = (HERE / 'migrations/001_data.up.sql').read_bytes()
-        require(len(history) == 1 and history[0]['checksum'] == hashlib.sha256(sql).hexdigest()
-                and history[0]['owner'] == 'neutron-cli' and history[0]['format'] == 'v2', 'CLI history is not verified v2')
+        sources = {int(file.name.split('_', 1)[0]): hashlib.sha256(file.read_bytes()).hexdigest()
+                   for file in migration_plan.glob('*.up.sql')}
+        require(len(history) == len(sources) and all(row['checksum'] == sources.get(int(row['version']))
+                and row['owner'] == 'neutron-cli' and row['format'] == 'v2' for row in history),
+                'CLI history is not verified v2 for the selected profile')
         parts = urlsplit(admin_url)
         tool_env = dict(env, PGPASSWORD=unquote(parts.password or ''))
         docker = ['docker', '--context', args.docker_context, 'exec', '-i', '--env', 'PGPASSWORD', args.container]
@@ -419,11 +427,11 @@ async def run(args):
         if args.isolated_target:
             passed('independent PG17 system identity and exact seven least-privilege roles; source retained, target security/data match')
         passed('native PG17 custom dump/create restore preserves exact rows, owners, ACLs, policies, forced RLS and CLI history')
-        noop = await command([str(args.cli.resolve()), 'migrate', '--dir', str(HERE / 'migrations')],
+        noop = await command([str(args.cli.resolve()), 'migrate', '--dir', str(migration_plan)],
                              dict(runtime_env(env), DATABASE_URL=manifest['migration_owner_url']))
         require(noop.returncode == 0 and stable(await snapshot(db, name, list(manifest['roles']) + [owner])) == stable(expected), 'restored CLI migration was not a verified no-op')
         drift = directory / 'drift'
-        shutil.copytree(HERE / 'migrations', drift)
+        shutil.copytree(migration_plan, drift)
         with (drift / '001_data.up.sql').open('a') as stream:
             stream.write('\n-- deliberate operator drill drift\n')
         refused = await command([str(args.cli.resolve()), 'migrate', '--dir', str(drift)], dict(runtime_env(env), DATABASE_URL=manifest['migration_owner_url']))
@@ -466,9 +474,9 @@ async def run(args):
         report = {'target': target_identity, 'same_cluster_verified': True, 'python_package': python_identity.stdout.decode().strip(), 'python_executable': sys.executable, 'pg_dump_version': version.stdout.decode().strip(), 'result': 'PASS', 'checks': checks, 'archive_sha256': archive_hash,
                   'archive_bytes': archive.stat().st_size, 'database': name,
                   'identities': {key: {'path': str(path.resolve()), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
-                      for key, path in [('operations_source', Path(__file__)), ('api_binary', args.api_bin), ('worker_source', args.worker_script), ('cli_binary', args.cli), ('up_sql', HERE / 'migrations/001_data.up.sql')]},
+                      for key, path in [('operations_source', Path(__file__)), ('api_binary', args.api_bin), ('worker_source', args.worker_script), ('cli_binary', args.cli), *[(file.name, file) for file in sorted(migration_plan.glob('*.sql'))]]},
                   'limits': [('only seven recorded fixture roles recreated on independent target' if args.isolated_target else 'same-cluster roles retained') + '; database archive does not back up cluster roles/passwords',
-                             'existing revision1 binaries only; no artificial new consumer or rolling-upgrade guarantee',
+                             'bounded supported-revision consumers; no general rolling-upgrade guarantee',
                              'fixture-only drill; production quiescence, global-role recovery and storage retention are operator tasks']}
         private_json(args.out / ('report-' + name + '.json'), report)
     finally:
@@ -496,6 +504,7 @@ async def run(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--schema-revision', type=int, choices=(1,2), default=2)
     parser.add_argument('--api-bin', type=Path, required=True)
     parser.add_argument('--worker-script', type=Path, required=True)
     parser.add_argument('--cli', type=Path, required=True)

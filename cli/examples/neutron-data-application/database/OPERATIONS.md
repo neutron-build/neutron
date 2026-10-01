@@ -36,25 +36,24 @@ The archive and provisioning credential manifest are mode0600 in a private
 fixture directory and removed during cleanup. This is a restore exercise, not
 an archive retention policy.
 
-Both current API and worker require schema revision1 and PostgreSQL17 with
-reviewed runtime identities and enabled/forced RLS. The drill checks those
-existing binaries against original revision1 and an additive nullable-column
-expansion that keeps revision1; existing reads and worker execution still work.
-It then changes only the owned fixture marker to revision2 and proves both old
-consumers refuse startup without changing rows. It reverts that fixture marker
-and removes the unused fixture column. There is no new-version consumer here,
-no revision2 release implementation and no rolling-upgrade guarantee.
+Current API and worker accept schema revisions 1 and 2 and require PostgreSQL17,
+reviewed runtime identities and enabled/forced RLS. Provisioning defaults to
+revision2; `--schema-revision 1` selects the earlier fixture and freezes only
+its selected migration files for subsequent no-op/checksum checks. Supply
+consumers that actually support the selected revision. The drill verifies an
+additive nullable-column change while retaining that revision, then changes only
+the owned fixture marker to unsupported revision3 and proves startup refusal
+without row changes. It restores the original marker and removes that fixture
+column. This compatibility check does not certify arbitrary DDL.
 
-For a real expand-contract change, review backward-compatible DDL and an explicit
-old/new consumer compatibility matrix before migration. Deploy expansion before
-code requiring it; preserve old columns while old readers/writers or workers
-remain. Remove required fields only after those consumers are retired and a
-reviewed revision/consumer transition exists. The current revision gate is an
-exact marker check, not a complete structural schema validator: leaving revision1
-while removing required columns is not a supported transition. The drill does
-not certify arbitrary additive DDL, index-lock budgets or production downtime.
-Migrations remain an explicit operator step using the migration-owner role;
-API and worker runtime roles must never receive that owner credential.
+The separate [populated rollout drill](ROLLOUT.md) tests actual old/new consumers
+and committed migration002. Retire revision1-only consumers before applying
+marker2: their already-open physical connections have no continuous revision
+check. A controlled stop is required in that drill; no zero-downtime upgrade is
+claimed. The revision gate admits explicit markers, not every structural schema
+change. Removing required columns while keeping an admitted marker remains
+unsupported. Migrations are an explicit operator step using the migration-owner
+role; API and worker runtime roles must never receive that owner credential.
 
 The drill compares PostgreSQL system identifiers through the actual admin
 connection and container tools before taking the archive, refusing a mismatched

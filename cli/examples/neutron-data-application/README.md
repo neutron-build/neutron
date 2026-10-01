@@ -111,3 +111,19 @@ tests the selected TypeScript/Python/Go `lossless-read-v1` generated scalar
 profile. It refuses temporal columns; it is not a universal ORM or a promise
 that default JavaScript Date values retain microseconds. The application's
 explicit timestamp wire format is a separate contract.
+
+## Schema expansion
+
+Fresh provisioning applies revision 2 by default; `--schema-revision 1` provisions
+the explicit earlier-consumer fixture. The committed second migration adds
+`documents.content_octets`, a stored generated UTF-8 byte count, and advances
+the schema marker transactionally. It does not change existing writes or wire
+responses. Current API and worker accept revisions 1 and 2; earlier revision-1
+consumers refuse new connections to revision 2. Apply expansion with the sole
+CLI migration owner, preserve compatible existing fields during overlap, and
+retire earlier consumers before applying marker 2. Their existing physical
+connections do not continuously check that marker. Reverting
+this derived field requires consumers compatible with revision 1.
+
+The [populated rollout drill](database/ROLLOUT.md) tests actual old/new consumers,
+controlled retirement, migration, fresh startup refusal and derived-only rollback.

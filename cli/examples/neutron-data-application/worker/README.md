@@ -10,7 +10,7 @@ WORKER_DATABASE_URL="$PRIVATE_WORKER_ROLE_URL" WORKER_TENANT=tenant-a python mai
 WORKER_DATABASE_URL="$PRIVATE_WORKER_ROLE_URL" WORKER_TENANT=tenant-a python main.py --once
 ```
 
-The worker validates PostgreSQL 17, schema revision 1, its actual login role,
+The worker validates PostgreSQL 17, schema revisions 1 and 2, its actual login role,
 restrictive privileges and forced row security before claiming. It uses Neutron's
 native typed SQL and transaction APIs, two pooled connections, and five-second
 per-transaction statement deadlines. Normal leases last 30 seconds; `--lease-ms`
@@ -38,3 +38,9 @@ Tests seed and remove only their own fixture records. They verify exact native
 values, competing claims, locked-row skipping, token replacement, terminal
 attempts, expiry between result and acknowledgement, cancellation/rollback/pool
 reuse and startup refusal. Without both variables they explicitly skip.
+
+Revision 2 adds the database-derived `documents.content_octets` column. Existing
+API/worker projections and writes remain valid on either supported revision.
+Unknown revisions are refused at startup/physical connection admission. This is
+an explicit compatibility range for this additive change, not arbitrary-schema
+compatibility or per-statement structural validation.

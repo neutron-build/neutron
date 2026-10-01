@@ -87,7 +87,7 @@ class Worker:
                 or identity.superuser or identity.bypass or identity.owner or identity.createrole or identity.createdb
                 or identity.memberships or not identity.rls_valid
                 or (expected_role is not None and identity.role != expected_role)
-                or identity.revision != 1 or identity.server_major != 17):
+                or identity.revision not in (1, 2) or identity.server_major != 17):
             raise ValueError('runtime role or schema/profile is incompatible')
 
     async def claim(self) -> tuple[Claim, Document] | None:
