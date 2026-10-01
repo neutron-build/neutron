@@ -16,8 +16,8 @@ export function schemas(lib, core=lib) {
 }
 export async function open(name,url,audit,native=false) {
   if(name==='prisma') {
-    const db=new PrismaClient({adapter:new PrismaPg({connectionString:url,max:4}),log:[{emit:'event',level:'query'}]});
-    db.$on('query',e=>audit.push({provider:name,sql:e.query,duration:e.duration}));
+    const db=new PrismaClient({adapter:new PrismaPg({connectionString:url,max:4}),log:audit?[{emit:'event',level:'query'}]:[]});
+    if(audit)db.$on('query',e=>audit.push({provider:name,sql:e.query,duration:e.duration}));
     return {close:()=>db.$disconnect(),
       point:(tenant,id)=>db.document.findUnique({where:{tenant_id:{tenant,id}}}),
       list:(tenant,after,limit)=>db.document.findMany({where:{tenant,id:{gt:after}},orderBy:{id:'asc'},take:limit}),
@@ -29,7 +29,7 @@ export async function open(name,url,audit,native=false) {
   }
   const pool=new pg.Pool({connectionString:url,max:4});
   // Observe both pool and checked-out client commands once, at Client.query.
-  pool.on('connect',client=>{const original=client.query;client.query=function(...args){audit.push({provider:name,sql:typeof args[0]==='string'?args[0]:args[0]?.text});return original.apply(this,args);};});
+  if(audit)pool.on('connect',client=>{const original=client.query;client.query=function(...args){audit.push({provider:name,sql:typeof args[0]==='string'?args[0]:args[0]?.text});return original.apply(this,args);};});
   if(name==='raw-pg') return {
     close:()=>pool.end(), point:async(t,id)=>(await pool.query('SELECT tenant,id,project_id AS "projectId",version,amount,note,payload AS binary FROM documents WHERE tenant=$1 AND id=$2',[t,id])).rows[0]??null,
     list:async(t,after,limit)=>(await pool.query('SELECT tenant,id,project_id AS "projectId",version,amount,note,payload AS binary FROM documents WHERE tenant=$1 AND id>$2 ORDER BY id LIMIT $3',[t,after,limit])).rows,
@@ -39,7 +39,7 @@ export async function open(name,url,audit,native=false) {
     remove:async(t,id)=>(await pool.query('DELETE FROM documents WHERE tenant=$1 AND id=$2',[t,id])).rowCount,
     rollback:async r=>{const client=await pool.connect();try{await client.query('BEGIN');await client.query('INSERT INTO documents VALUES($1,$2,$3,$4,$5,$6,$7)',[r.tenant,r.id,r.projectId,r.version,r.amount,r.note,r.binary]);throw new Error('intentional rollback');}finally{await client.query('ROLLBACK');client.release();}}};
   const lib=name==='neutron'?n:d;const s=schemas(lib,name==='neutron'?n:c);
-  const db=name==='neutron'?await n.createDatabase({url,driverOptions:{driver:'pg',max:4},tables:{projects:s.projects,documents:s.documents},relations:native?{projects:s.projectRelations,documents:s.documentRelations}:undefined,logger:e=>{if(e.kind==='query-end'||e.kind==='query-error')audit.push({provider:name,...e});}}):drizzle(pool,{schema:s});
+  const db=name==='neutron'?await n.createDatabase({url,driverOptions:{driver:'pg',max:4},tables:{projects:s.projects,documents:s.documents},relations:native?{projects:s.projectRelations,documents:s.documentRelations}:undefined,logger:audit?e=>{if(e.kind==='query-end'||e.kind==='query-error')audit.push({provider:name,...e});}:undefined}):drizzle(pool,{schema:s});
   if(name==='neutron')await pool.end(); // Neutron owns its public driver pool.
   const where=(t,id)=>lib.and(lib.eq(s.documents.tenant,t),lib.eq(s.documents.id,id));
   return {close:()=>name==='neutron'?db.close():pool.end(),

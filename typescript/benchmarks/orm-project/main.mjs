@@ -25,7 +25,7 @@ try{
  const sourceHashes={};for(const file of ['main.mjs','providers.mjs','schema.prisma'])sourceHashes[file]=createHash('sha256').update(await readFile(new URL(file,import.meta.url))).digest('hex');
  const catalog=(await control.query("SELECT table_name,column_name,data_type,is_nullable FROM information_schema.columns WHERE table_schema='public' ORDER BY table_name,ordinal_position")).rows;
  await writeFile(`${out}/catalog.json`,JSON.stringify(catalog,null,2));
- await writeFile(`${out}/manifest.json`,JSON.stringify({database:name,node:process.version,platform:process.platform,arch:process.arch,server,ddlHash:createHash('sha256').update(ddl).digest('hex'),runtimeLockHash:createHash('sha256').update(await readFile(new URL('../package-lock.json',import.meta.url))).digest('hex'),packages:runtimePackage.dependencies,sourceHashes,poolMax:4,warmups:20,samples:100,profile:'correctness+sequential-smoke',timingClaim:'diagnostic only; not rankings'},null,2));
+ await writeFile(`${out}/manifest.json`,JSON.stringify({database:name,node:process.version,platform:process.platform,arch:process.arch,server,ddlHash:createHash('sha256').update(ddl).digest('hex'),runtimeLockHash:createHash('sha256').update(await readFile(new URL('../package-lock.json',import.meta.url))).digest('hex'),packages:runtimePackage.dependencies,neutronFixture:runtimePackage.neutronFixture??{kind:'published',version:'0.1.0'},sourceHashes,poolMax:4,warmups:20,samples:100,profile:'correctness+sequential-smoke',timingClaim:'diagnostic only; not rankings'},null,2));
  let failures=0;let expectedDigest;
  for(const provider of ['neutron','drizzle','prisma','raw-pg']){
   await seed();const audit=[];let db;
