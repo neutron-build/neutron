@@ -143,17 +143,9 @@ export function ConnectionManager() {
 
   return (
     <div class={s.page}>
-      <div class={s.hero}>
-        <div class={s.logoMark}><Icon name="database" size={28} /></div>
-        <span class={s.eyebrow}>YOUR DATA, IN FOCUS</span>
-        <h1 class={s.title}>Neutron Studio</h1>
-        <p class={s.sub}>Explore PostgreSQL and supported Nucleus connections.
-          Inspect your schema, query precisely, and review changes before applying them.</p>
-      </div>
-
       <div class={s.card}>
         <div class={s.cardHeader}>
-          <div><span class={s.cardTitle}>Your connections</span><p class={s.cardSubtitle}>Choose a database to open your workspace.</p></div>
+          <div><h1 class={s.cardTitle}>Connections</h1><p class={s.cardSubtitle}>Choose a database to open your workspace.</p></div>
           <button class={s.btnAdd} onClick={() => { showAdd.value = !showAdd.value }}>
             {showAdd.value ? 'Cancel' : '+ Add'}
           </button>
@@ -202,7 +194,7 @@ export function ConnectionManager() {
           ))}
         </div>
       </div>
-      <p class={s.footnote}>One workspace for your database. Permissions are enforced by the connected role.</p>
+      <p class={s.footnote}>Permissions are enforced by the connected database role.</p>
     </div>
   )
 }

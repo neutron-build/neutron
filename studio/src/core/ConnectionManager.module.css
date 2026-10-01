@@ -7,46 +7,7 @@
   padding: clamp(32px, 8vh, 88px) 24px 32px;
   gap: 32px;
   overflow-y: auto;
-  background: radial-gradient(ellipse at 50% 0%, var(--accent-subtle), transparent 65%);
-}
-
-.hero {
-  text-align: center;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 12px;
-  max-width: 580px;
-}
-
-.logoMark {
-  width: 60px;
-  height: 60px;
-  border-radius: 18px;
-  background: var(--accent-subtle);
-  color: var(--text-accent);
-  font-size: 24px;
-  font-weight: 800;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  margin-bottom: var(--space-2);
-  border: 1px solid var(--accent-border);
-}
-
-.title {
-  font-size: clamp(28px, 4vw, 36px);
-  font-weight: 650;
-  color: var(--text-primary);
-  letter-spacing: -1.2px;
-  line-height: 1.15;
-}
-
-.sub {
-  font-size: var(--text-md);
-  color: var(--text-secondary);
-  line-height: 1.7;
-  max-width: 470px;
+  background: var(--bg-app);
 }
 
 .card {
@@ -70,7 +31,7 @@
 }
 
 .cardTitle {
-  font-size: 15px;
+  font-size: 20px;
   font-weight: 650;
   color: var(--text-primary);
 }
@@ -297,13 +258,6 @@
 .btnRemove:hover {
   color: var(--danger);
   background: var(--bg-hover);
-}
-
-.eyebrow {
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: .16em;
-  color: var(--text-accent);
 }
 
 .cardSubtitle {
