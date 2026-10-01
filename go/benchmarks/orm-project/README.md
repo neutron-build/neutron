@@ -101,3 +101,35 @@ GORM configuration follows its official documentation:
 [PostgreSQL and pooling](https://gorm.io/docs/connecting_to_the_database.html),
 [Scanner/Valuer custom types](https://gorm.io/docs/data_types.html), and
 [native preloading](https://gorm.io/docs/preload.html).
+
+## Extended evaluation
+
+`--extended --duration-seconds 30` adds genuine committed create, optimistic CAS,
+read, stale CAS and delete calls, with a native pgx oracle after each operation.
+All providers retain their explicit transaction APIs; each write commits
+independently, rather than silently replacing the scenario with one batch. API
+latency excludes the oracle; consumer time and phase throughput include it.
+Six provider permutations balance order, with write concurrency one/four and
+30-second closed-loop mixed page/read/write phases at concurrency four. Raw
+per-call timestamps and 5-second windows are retained. This is a bounded soak,
+not hours of production reliability, fixed-rate overload or capacity testing.
+
+Fresh child processes open only the selected provider, execute a first exact
+read and 1,000 verified page reads. Process spawn-to-first-result includes a
+baseline `ps` probe; connect-to-first-query is separately recorded. OS executable
+cache and PostgreSQL are warm. This does not measure machine/server cold boot,
+build time, dependency installation or per-package import cost: one Go binary
+contains all three providers. RSS is sampled every 100 ms, and can miss peaks.
+Child baseline and observed peak describe the whole process, not library-only
+allocation or PostgreSQL memory. Parent phase RSS includes the orchestrator and
+retained raw samples; it is not a comparative provider memory footprint.
+
+`adoption.go` is a tenant-scoped issue service exercised against each provider:
+create/edit/list/project relationship, stale edit conflict, second-tenant
+isolation, discarded-draft rollback and delete. This is executable application
+integration evidence, not a user study or a subjective usability ranking.
+Neutron/raw pgx require explicit SQL and row mappings; GORM uses the existing
+models, exact Decimal Scanner/Valuer and builder/transaction configuration.
+Schema ownership remains harness-native SQL; no AutoMigrate or equivalence to a
+production migration workflow is claimed. `--extended --correctness-only`
+executes correctness and the adoption scenario without comparative timing.

@@ -78,7 +78,7 @@ func writeJSON(path string, value any) error {
 	return os.WriteFile(path, data, 0600)
 }
 func sourceHashes() (map[string]string, error) {
-	files := []string{"main.go", "providers.go", "fixture.go", "checks.go", "schema.sql", "go.mod", "go.sum", "README.md"}
+	files := []string{"main.go", "extended.go", "adoption.go", "providers.go", "fixture.go", "checks.go", "schema.sql", "go.mod", "go.sum", "README.md"}
 	// Include the actual candidate implementation, not only this harness.
 	more, err := filepath.Glob("../../nucleus/*.go")
 	if err != nil {
@@ -374,6 +374,15 @@ func measure(ctx context.Context, p Provider, workload string, trial, position, 
 	return m
 }
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "--extended-child" {
+		if err := extendedChild(); err != nil {
+			fmt.Fprintln(os.Stderr, errorCategory(err))
+			os.Exit(1)
+		}
+		return
+	}
+	extended := flag.Bool("extended", false, "write, process-cold, sampled RSS, sustained and adoption evaluation")
+	duration := flag.Int("duration-seconds", 30, "sustained duration per provider phase (minimum 10)")
 	out := flag.String("out", "", "fresh absolute private output directory")
 	samples := flag.Int("samples", 100, "calls per provider/workload/concurrency/trial (minimum 100)")
 	warmups := flag.Int("warmups", 100, "unmeasured verified warmup calls per phase (minimum 20)")
@@ -383,6 +392,13 @@ func main() {
 	if *out == "" || *samples < 100 || *warmups < 20 || *trials < 6 || *trials%6 != 0 {
 		fmt.Fprintln(os.Stderr, "require --out, samples >=100, warmups >=20, trials a positive multiple of 6")
 		os.Exit(2)
+	}
+	if *extended {
+		if err := runExtended(*out, *samples, *trials, *duration, *correctnessOnly); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
 	}
 	if err := run(*out, *samples, *warmups, *trials, *correctnessOnly); err != nil {
 		fmt.Fprintln(os.Stderr, err)
