@@ -134,3 +134,7 @@ models, exact Decimal Scanner/Valuer and builder/transaction configuration.
 Schema ownership remains harness-native SQL; no AutoMigrate or equivalence to a
 production migration workflow is claimed. `--extended --correctness-only`
 executes correctness and the adoption scenario without comparative timing.
+
+For a diagnostic smoke only, `--extended --diagnostic-one-trial --trials 1
+--duration-seconds 10` executes one unbalanced ordering. It cannot support a
+comparative ranking; retain the normal six-trial30-second run for evaluation.

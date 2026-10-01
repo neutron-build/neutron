@@ -381,6 +381,7 @@ func main() {
 		}
 		return
 	}
+	diagnostic := flag.Bool("diagnostic-one-trial", false, "extended diagnostic only: one trial,10 seconds, not a balanced comparison")
 	extended := flag.Bool("extended", false, "write, process-cold, sampled RSS, sustained and adoption evaluation")
 	duration := flag.Int("duration-seconds", 30, "sustained duration per provider phase (minimum 10)")
 	out := flag.String("out", "", "fresh absolute private output directory")
@@ -389,7 +390,7 @@ func main() {
 	trials := flag.Int("trials", 6, "balanced provider trials (multiple of 6)")
 	correctnessOnly := flag.Bool("correctness-only", false, "run actual correctness, SQL audit and association probes without timing")
 	flag.Parse()
-	if *out == "" || *samples < 100 || *warmups < 20 || *trials < 6 || *trials%6 != 0 {
+	if *out == "" || *samples < 100 || *warmups < 20 || ((!*diagnostic && (*trials < 6 || *trials%6 != 0)) || (*diagnostic && (!*extended || *trials != 1 || *duration != 10))) {
 		fmt.Fprintln(os.Stderr, "require --out, samples >=100, warmups >=20, trials a positive multiple of 6")
 		os.Exit(2)
 	}
