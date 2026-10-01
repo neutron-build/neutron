@@ -207,6 +207,13 @@ func issueLifecycle(ctx context.Context, f *Fixture, p Provider, worker, index i
 	return step("delete_commit", write("delete"), func() error { return oracle([]Document{}) })
 }
 func extendedPhase(ctx context.Context, f *Fixture, p Provider, trial, pos, n, c, seconds int, sustained bool) (ExtendedPhase, error) {
+	for worker := 0; worker < c; worker++ {
+		for warm := 0; warm < 5; warm++ {
+			if e := issueLifecycle(ctx, f, p, worker, warm, func(string, int64, int64, error) {}); e != nil {
+				return ExtendedPhase{}, e
+			}
+		}
+	}
 	kind := "write_lifecycle"
 	if sustained {
 		kind = "sustained_mixed"
@@ -395,7 +402,7 @@ func runExtended(out string, n, trials, seconds int, correctnessOnly bool) (err 
 		return errors.New("server version failed")
 	}
 	r.Provenance["postgres_version"] = version
-	r.Provenance["extended_contract"] = map[string]any{"duration_seconds": seconds, "sample_interval_ms": 100, "parent_RSS": "orchestrator including retained raw samples; not isolated provider footprint or suitable comparative library-memory ranking", "RSS": "sampled process RSS, not OS high water; shared binary includes all provider packages; no server memory", "cold": "fresh process, warm OS executable cache and PostgreSQL; parent spawn-to-first-result includes baseline ps probe", "writes": "independently committed CRUD and CAS transactions; oracle excluded from API timer, included in consumer time; five steps per lifecycle", "sustained": "closed-loop c4 one page plus five write lifecycle steps; no fixed arrival rate or saturation proof", "adoption": "executable project issue resolve and stale optimistic update workflow, not userstudy; fixture schema authority native SQL, no ORM AutoMigrate"}
+	r.Provenance["extended_contract"] = map[string]any{"duration_seconds": seconds, "fixed_write_lifecycles_per_worker": n, "untimed_warmup_lifecycles_per_worker": 5, "sample_interval_ms": 100, "parent_RSS": "orchestrator including retained raw samples; not isolated provider footprint or suitable comparative library-memory ranking", "RSS": "sampled process RSS, not OS high water; shared binary includes all provider packages; no server memory", "cold": "fresh process, warm OS executable cache and PostgreSQL; parent spawn-to-first-result includes baseline ps probe", "writes": "independently committed CRUD and CAS transactions; oracle excluded from API timer, included in consumer time; five steps per lifecycle", "sustained": "closed-loop c4 one page plus five write lifecycle steps; no fixed arrival rate or saturation proof", "adoption": "executable project issue resolve and stale optimistic update workflow, not userstudy; fixture schema authority native SQL, no ORM AutoMigrate"}
 	r.Provenance["initial_native_digest"] = f.Digest
 	names := []string{"neutron-native-sql", "raw-pgx", "gorm"}
 	for _, name := range names {

@@ -109,6 +109,7 @@ read, stale CAS and delete calls, with a native pgx oracle after each operation.
 All providers retain their explicit transaction APIs; each write commits
 independently, rather than silently replacing the scenario with one batch. API
 latency excludes the oracle; consumer time and phase throughput include it.
+Each phase first verifies five untimed warmup lifecycles per worker.
 Six provider permutations balance order, with write concurrency one/four and
 30-second closed-loop mixed page/read/write phases at concurrency four. Raw
 per-call timestamps and 5-second windows are retained. This is a bounded soak,
