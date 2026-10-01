@@ -23,6 +23,7 @@ class Identity(BaseModel):
     bypass: bool
     owner: bool
     createrole: bool
+    createdb: bool
     memberships: bool
     rls_valid: bool
     revision: int
@@ -69,7 +70,7 @@ class Worker:
             raise ValueError('this reference requires PostgreSQL 17')
         identity = await self.db.sql.query_one(Identity, '''
             SELECT current_user AS role, session_user AS login,
-              r.rolsuper AS superuser, r.rolbypassrls AS bypass, r.rolcreaterole AS createrole,
+              r.rolsuper AS superuser, r.rolbypassrls AS bypass, r.rolcreaterole AS createrole, r.rolcreatedb AS createdb,
               EXISTS(SELECT 1 FROM pg_catalog.pg_auth_members WHERE member=r.oid) AS memberships,
               (SELECT count(*)=5 AND bool_and(c.relrowsecurity AND c.relforcerowsecurity AND c.relowner<>r.oid)
                 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
@@ -83,7 +84,7 @@ class Worker:
             FROM pg_catalog.pg_roles r WHERE r.rolname=current_user''')
         suffix = '_worker_' + self.tenant[-1]
         if (identity.role != identity.login or not identity.role.endswith(suffix)
-                or identity.superuser or identity.bypass or identity.owner or identity.createrole
+                or identity.superuser or identity.bypass or identity.owner or identity.createrole or identity.createdb
                 or identity.memberships or not identity.rls_valid
                 or (expected_role is not None and identity.role != expected_role)
                 or identity.revision != 1 or identity.server_major != 17):

@@ -238,6 +238,11 @@ asyncio.run(run())
     async def test_schema_and_identity_refusal(self):
         with self.assertRaises(ValueError): await self.worker.admit('wrong_configured_role')
         with self.assertRaises(ValueError): await Worker(self.db, 'tenant-b').admit()
+        await self.oracle.execute('ALTER ROLE '+chr(34)+self.role+chr(34)+' CREATEDB')
+        try:
+            with self.assertRaises(ValueError): await self.worker.admit()
+        finally:
+            await self.oracle.execute('ALTER ROLE '+chr(34)+self.role+chr(34)+' NOCREATEDB')
         await self.oracle.execute('UPDATE app_schema_revision SET revision=2')
         try:
             with self.assertRaises(ValueError): await self.worker.admit()
