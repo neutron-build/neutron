@@ -35,11 +35,11 @@
   /* Status */
   --color-success: #22c55e;
   --color-warning: #f59e0b;
-  --color-error: #ef4444;
+  --color-error: #f87171;
   --color-info: #3b82f6;
   /* Aliases */
   --success: #22c55e;
-  --danger: #ef4444;
+  --danger: #f87171;
   --warning: #f59e0b;
 
   /* Model badge colors (full + short aliases) */
@@ -50,7 +50,7 @@
   --model-ts: #f97316;
   --model-document: #14b8a6;
   --model-doc: #14b8a6;
-  --model-graph: #ef4444;
+  --model-graph: #f87171;
   --model-fts: #eab308;
   --model-geo: #2dd4bf;
   --model-blob: #94a3b8;
@@ -132,7 +132,7 @@
   color-scheme: light;
 
   --border: #d6e0e8;
-  --border-focus: #2dd4bf;
+  --border-focus: #0f766e;
   --border-subtle: #e7edf2;
 
   --text-primary: #182635;
