@@ -53,12 +53,16 @@ func namespaceFixture(t *testing.T) (*Client, *pgx.Conn, string, string) {
 }
 
 func TestMigrationNamespaceRefusesBeforeMutation(t *testing.T) {
-	for _, kind := range []string{"temp-history", "temp-claim", "later-history", "later-claim", "view", "temp-schema", "empty-schema"} {
+	for _, kind := range []string{"temp-history", "temp-claim", "later-history", "later-claim", "view", "temp-schema", "empty-schema", "unlogged-history", "unlogged-claim"} {
 		t.Run(kind, func(t *testing.T) {
 			c, o, a, b := namespaceFixture(t)
 			ctx := context.Background()
 			stmt := ""
 			switch kind {
+			case "unlogged-history":
+				stmt = "CREATE UNLOGGED TABLE _neutron_migrations(version integer)"
+			case "unlogged-claim":
+				stmt = "CREATE UNLOGGED TABLE _neutron_migration_lock(id integer)"
 			case "temp-history":
 				stmt = "CREATE TEMP TABLE _neutron_migrations(version text)"
 			case "temp-claim":
@@ -85,6 +89,10 @@ func TestMigrationNamespaceRefusesBeforeMutation(t *testing.T) {
 			if _, err := c.Pool().Exec(ctx, stmt); err != nil {
 				t.Fatal(err)
 			}
+			var originalCount int
+			if err := o.QueryRow(ctx, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname IN ('effect','_neutron_migration_lock')", a).Scan(&originalCount); err != nil {
+				t.Fatal(err)
+			}
 			plan := []Migration{{Version: 1, Name: "pending", Up: "CREATE TABLE " + a + ".effect(id integer)", Down: "DROP TABLE " + a + ".effect"}}
 			for _, api := range []string{"up", "down", "adopt", "status", "info", "unlock"} {
 				var err error
@@ -105,13 +113,17 @@ func TestMigrationNamespaceRefusesBeforeMutation(t *testing.T) {
 				if err == nil {
 					t.Fatalf("%s accepted %s", api, kind)
 				}
+				if strings.HasPrefix(kind, "unlogged-") && !strings.Contains(err.Error(), "ordinary persistent table") {
+					t.Fatalf("%s did not refuse persistence before SQL effects: %v", api, err)
+				}
+
 			}
 			var count int
 			if err := o.QueryRow(ctx, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname IN ('effect','_neutron_migration_lock')", a).Scan(&count); err != nil {
 				t.Fatal(err)
 			}
-			if count != 0 {
-				t.Fatalf("metadata/application mutation count=%d", count)
+			if count != originalCount {
+				t.Fatalf("metadata/application mutation count=%d originally=%d", count, originalCount)
 			}
 		})
 	}

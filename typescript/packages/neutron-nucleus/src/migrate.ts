@@ -24,9 +24,9 @@ interface MigrationNamespace { schema: string; sql(statement: string): string }
 async function captureMigrationNamespace(transport: Transport): Promise<MigrationNamespace> {
   let result;
   try {
-    result = await transport.query<{ intended_schema: string | null; schema_oid: string | null; catalog_oid: string | null; name: string; relation_oid: string | null; resolved_schema: string | null; kind: string | null }>(`
+    result = await transport.query<{ intended_schema: string | null; schema_oid: string | null; catalog_oid: string | null; name: string; relation_oid: string | null; resolved_schema: string | null; kind: string | null; persistence: string | null }>(`
       SELECT pg_catalog.current_schema() AS intended_schema, ns.oid::text AS schema_oid, pg_catalog.to_regclass('pg_catalog.pg_class')::oid::text AS catalog_oid, names.name,
-        c.oid::text AS relation_oid, rn.nspname AS resolved_schema, c.relkind::text AS kind
+        c.oid::text AS relation_oid, rn.nspname AS resolved_schema, c.relkind::text AS kind, c.relpersistence::text AS persistence
       FROM (VALUES ('_neutron_migrations'), ('_neutron_migration_lock')) AS names(name)
       LEFT JOIN pg_catalog.pg_namespace ns ON ns.nspname = pg_catalog.current_schema()
       LEFT JOIN pg_catalog.pg_class c ON c.oid = pg_catalog.to_regclass(names.name)
@@ -44,10 +44,10 @@ async function captureMigrationNamespace(transport: Transport): Promise<Migratio
     if (!['_neutron_migrations', '_neutron_migration_lock'].includes(row.name) || seen.has(row.name)) throw new Error('nucleus: unsupported migration namespace profile: incomplete catalog identity');
     seen.add(row.name);
     if (row.relation_oid != null) {
-      if (typeof row.relation_oid !== 'string' || !row.relation_oid || typeof row.resolved_schema !== 'string' || typeof row.kind !== 'string') throw new Error('nucleus: unsupported migration namespace profile: incomplete relation identity');
+      if (typeof row.relation_oid !== 'string' || !row.relation_oid || typeof row.resolved_schema !== 'string' || typeof row.kind !== 'string' || typeof row.persistence !== 'string') throw new Error('nucleus: unsupported migration namespace profile: incomplete relation identity');
       if (row.resolved_schema !== schema || row.resolved_schema.startsWith('pg_temp_')) throw new Error(`nucleus: migration namespace ambiguity: ${JSON.stringify(row.name)} resolves in ${JSON.stringify(row.resolved_schema)} instead of intended schema ${JSON.stringify(schema)}; remove temporary shadows or configure the intended schema first`);
-      if (row.kind !== 'r') throw new Error(`nucleus: migration metadata ${JSON.stringify(schema)}.${JSON.stringify(row.name)} is not an ordinary persistent table`);
-    } else if (row.resolved_schema != null || row.kind != null) throw new Error('nucleus: unsupported migration namespace profile: inconsistent relation identity');
+      if (row.kind !== 'r' || row.persistence !== 'p') throw new Error(`nucleus: migration metadata ${JSON.stringify(schema)}.${JSON.stringify(row.name)} is not an ordinary persistent table`);
+    } else if (row.resolved_schema != null || row.kind != null || row.persistence != null) throw new Error('nucleus: unsupported migration namespace profile: inconsistent relation identity');
   }
   if (seen.size !== 2) throw new Error('nucleus: unsupported migration namespace profile: both metadata identities required');
   const prefix = '"' + schema.replaceAll('"', '""') + '".';

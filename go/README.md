@@ -55,7 +55,7 @@ at the start of each invocation and qualify all history and claim operations,
 including transaction writes, adoption, diagnostics and force-unlock. Configure
 the connection search path so that its first existing schema is the intended
 migration schema. Temporary shadows, a history or claim found in a later search
-path schema, and metadata views are refused before metadata mutation; remove the
+path schema, and metadata views or unlogged tables are refused before metadata mutation; remove the
 shadow or configure the intended schema first. Quoted schema identifiers are
 supported.
 

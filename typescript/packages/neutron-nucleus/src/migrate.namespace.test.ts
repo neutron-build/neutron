@@ -21,16 +21,19 @@ async function fixture(run: (t: PgTransport, oracle: PgTransport, a: string, b: 
 }
 
 it('migration namespaces refuse temporary/later/view/empty identity before mutation', { skip: !url }, async () => {
- for (const kind of ['temp-history','temp-claim','later-history','later-claim','view','temp-schema','empty']) await fixture(async(t,o,a,b)=>{
+ for (const kind of ['temp-history','temp-claim','later-history','later-claim','view','temp-schema','empty','unlogged-history','unlogged-claim']) await fixture(async(t,o,a,b)=>{
+  if(kind==='unlogged-history')await t.execute('CREATE UNLOGGED TABLE _neutron_migrations(version integer)');
+  if(kind==='unlogged-claim')await t.execute('CREATE UNLOGGED TABLE _neutron_migration_lock(id integer)');
   if(kind==='temp-history')await t.execute('CREATE TEMP TABLE _neutron_migrations(version text)');
   if(kind==='temp-claim')await t.execute('CREATE TEMP TABLE _neutron_migration_lock(id integer)');
   if(kind.startsWith('later')){await o.execute(`CREATE TABLE ${quote(b)}.${kind==='later-history'?'_neutron_migrations':'_neutron_migration_lock'}(id integer)`);await t.execute(`SET search_path TO ${quote(a)},${quote(b)}`);}
   if(kind==='view')await t.execute('CREATE VIEW _neutron_migrations AS SELECT 1 AS version');
   if(kind==='temp-schema')await t.execute('CREATE TEMP TABLE marker(id integer);SET search_path TO pg_temp');
   if(kind==='empty')await t.execute('SET search_path TO missing_namespace');
+  const originalCount=await o.fetchval("SELECT count(*)::int FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname IN ('effect','_neutron_migration_lock')",[a]);
   const plan=[{version:1,name:'pending',up:`CREATE TABLE ${quote(a)}.effect(id integer)`,down:`DROP TABLE ${quote(a)}.effect`}];
-  for(const operation of [()=>migrate(t,plan),()=>migrateDown(t,plan,1),()=>adoptMigrations(t,plan),()=>migrationStatus(t),()=>migrationLockInfo(t),()=>forceUnlockMigrations(t)])await assert.rejects(operation);
-  assert.equal(await o.fetchval(`SELECT count(*)::int FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname IN ('effect','_neutron_migration_lock')`,[a]),0);
+  for(const operation of [()=>migrate(t,plan),()=>migrateDown(t,plan,1),()=>adoptMigrations(t,plan),()=>migrationStatus(t),()=>migrationLockInfo(t),()=>forceUnlockMigrations(t)]){ if(kind.startsWith('unlogged-')) await assert.rejects(operation,/ordinary persistent table/); else await assert.rejects(operation); }
+  assert.equal(await o.fetchval(`SELECT count(*)::int FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname IN ('effect','_neutron_migration_lock')`,[a]),originalCount);
  });
 });
 

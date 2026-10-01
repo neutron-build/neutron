@@ -29,7 +29,7 @@ func (n migrationNamespace) sql(statement string) string {
 }
 
 const migrationNamespaceSQL = `SELECT pg_catalog.current_schema(), ns.oid::text, pg_catalog.to_regclass('pg_catalog.pg_class')::oid::text, names.name,
- c.oid::text, rn.nspname, c.relkind::text
+ c.oid::text, rn.nspname, c.relkind::text, c.relpersistence::text
  FROM (VALUES ('_neutron_migrations'), ('_neutron_migration_lock')) AS names(name)
  LEFT JOIN pg_catalog.pg_namespace ns ON ns.nspname = pg_catalog.current_schema()
  LEFT JOIN pg_catalog.pg_class c ON c.oid = pg_catalog.to_regclass(names.name)
@@ -44,9 +44,9 @@ func (c *Client) captureMigrationNamespace(ctx context.Context) (migrationNamesp
 	defer rows.Close()
 	seen := map[string]bool{}
 	for rows.Next() {
-		var schema, schemaOID, catalogOID, relationOID, resolved, kind *string
+		var schema, schemaOID, catalogOID, relationOID, resolved, kind, persistence *string
 		var name string
-		if err := rows.Scan(&schema, &schemaOID, &catalogOID, &name, &relationOID, &resolved, &kind); err != nil {
+		if err := rows.Scan(&schema, &schemaOID, &catalogOID, &name, &relationOID, &resolved, &kind, &persistence); err != nil {
 			return scope, fmt.Errorf("nucleus: unsupported migration namespace profile: catalog identity scan: %w", err)
 		}
 		if catalogOID == nil || *catalogOID == "" {
@@ -64,16 +64,16 @@ func (c *Client) captureMigrationNamespace(ctx context.Context) (migrationNamesp
 		}
 		seen[name] = true
 		if relationOID != nil {
-			if resolved == nil || kind == nil || *relationOID == "" {
+			if resolved == nil || kind == nil || persistence == nil || *relationOID == "" {
 				return scope, fmt.Errorf("nucleus: unsupported migration namespace profile: incomplete relation identity")
 			}
 			if *resolved != scope.schema || strings.HasPrefix(*resolved, "pg_temp_") {
 				return scope, fmt.Errorf("nucleus: migration namespace ambiguity: %q resolves in %q instead of intended schema %q; remove temporary shadows or configure the intended schema first", name, *resolved, scope.schema)
 			}
-			if *kind != "r" {
+			if *kind != "r" || *persistence != "p" {
 				return scope, fmt.Errorf("nucleus: migration metadata %q.%q is not an ordinary persistent table", scope.schema, name)
 			}
-		} else if resolved != nil || kind != nil {
+		} else if resolved != nil || kind != nil || persistence != nil {
 			return scope, fmt.Errorf("nucleus: unsupported migration namespace profile: inconsistent relation identity")
 		}
 	}
