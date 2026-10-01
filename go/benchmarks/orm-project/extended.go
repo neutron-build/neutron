@@ -381,9 +381,9 @@ func runExtended(out string, n, trials, seconds int, correctnessOnly bool) (err 
 		if f != nil {
 			r.Database = f.Database
 			c, cc := context.WithTimeout(context.Background(), 30*time.Second)
-			ce := f.Close(c)
+			_ = f.Close(c)
 			cc()
-			r.Cleaned = ce == nil
+			r.Cleaned = f.Cleaned
 		}
 		return errors.New("fixture failed")
 	}
