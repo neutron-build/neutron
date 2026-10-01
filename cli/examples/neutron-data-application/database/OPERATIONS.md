@@ -69,8 +69,8 @@ worker/Studio role reads and denied Studio writes are checked after restore;
 a durable pending job is processed by the actual worker into its expected
 SHA256 result.
 
-Database dumps do **not** contain cluster role definitions or passwords. This
-same-cluster drill retains its roles while replacing the fixture database.
+Database dumps do **not** contain cluster role definitions or passwords. The default
+same-cluster mode retains its roles while replacing the fixture database.
 Restoration into a different cluster requires separately secured role/ownership
 recovery and approved credentials before restoring owner/grant/policy names.
 Do not use `--no-owner` or `--no-acl` as a substitute: that changes the security
@@ -86,3 +86,42 @@ Changing a copied source file refuses without altering restored state. Never
 rewrite checksums or adopt/reset history to conceal mismatched migration files.
 The result demonstrates this exact candidate CLI and supplied files, not every
 published CLI/provider or disaster-recovery scenario.
+
+
+## Independent cluster option
+
+Add `--isolated-target` to the same command to restore the native archive into a
+second, independently initialized PostgreSQL17 cluster. The source fixture is
+retained unchanged throughout this restoration; only final fixture cleanup drops
+it. The script resolves the source container's immutable image ID and uses
+`--pull never`, so it neither downloads an image nor uses an engine build. It
+refuses a preexisting generated target name, requires a different PostgreSQL
+system identifier, and confirms the target is PostgreSQL17.
+
+The new target publishes only a random loopback port, caps memory at512MiB,
+CPU at1 and pids at128, and explicitly mounts PGDATA at
+`/var/lib/postgresql/data` on256MiB tmpfs. No persistent volume is created;
+cleanup verifies the owned fixture label before removing its container and data.
+Free disk must remain at least6GiB. Target shared_buffers32MB,
+max_connections40 and max_wal_size64MB are bounded fixture settings, not
+configuration or performance equivalence with the source. Native settings and
+container memory limits are checked.
+
+Only the exact six generated runtime roles and migration owner are recreated
+from the private provisioning manifest. Source login identity and nonprivileged
+flags/no-memberships are checked first. Password values remain private; the
+archive still contains no cluster passwords, and there is no global role dump
+of unrelated users. Restored ownership, schema/database ACLs, RLS policies,
+grants and role flags must match the source. Actual API and worker point to the
+new target, and native Studio read-role oracles verify isolation and exact data;
+this does not open a second Studio HTTP/browser instance. The same verified CLI
+migration no-op and changed-source checksum refusal run against the target.
+The source database/roles, target container/tmpfs, archives and manifests are
+removed at completion; only safe outcome/identity reports remain.
+
+This closes an independent-cluster restore check for this finite reference and
+these candidate consumers. It is not a complete cluster-role backup, HA/PITR,
+WAL archival/replay, production provisioning, storage durability, secrets
+rotation or an RPO/RTO guarantee. Real cluster recovery needs separately secured
+role identities/credentials and tested operator procedures appropriate to its
+actual dependencies.
