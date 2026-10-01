@@ -58,3 +58,54 @@ warm, read-only comparisons**, not production rankings, write performance,
 statistical confidence intervals or migration/Studio measurements. Run published
 and candidate profiles separately. Inspect errors and trial variation before
 interpreting differences; never merge failed operations into a successful result.
+
+## Extended writes, startup, memory and app adoption
+
+`node run.mjs --extended --correctness-only` executes a small document service
+(`adoption.mjs`) for each provider: tenant-scoped create, optimistic edit,
+stale-edit conflict, keyset page, parent/children, second-tenant isolation,
+rollback and removal. A separate raw PostgreSQL connection checks persisted
+create/CAS values, missing rollback rows, and both-table fixture snapshots.
+The service is an executable application boundary, not a user study or a claim
+that migration products or entire ORM feature sets are interchangeable.
+
+`node run.mjs --extended` runs four Williams counterbalanced orders. Each
+provider/trial gets a fresh Node child for import/connect/first-query startup,
+100 transactional create/CAS/read/delete cycles at concurrency four, then a
+30-second closed-loop mixed phase (alternating point reads and those write
+cycles) with four workers. Use `ORM_EXTENDED_SECONDS=10` only for smoke runs;
+30 seconds is the final bounded profile. Environment/runtime/artifact settings
+are the same as above. Output must be a fresh private directory. Do not run
+other builds or benchmarks concurrently. A 6 GiB guard applies between phases.
+
+Each write cycle uses the provider's actual transaction API and preserves
+int64, numeric(40,18), nullable text and bytea values. The checked read occurs
+inside the transaction before deletion; final independent native snapshots
+verify no lasting fixture changes. Writes are deliberately more than one SQL
+statement; calls per second means service cycles/reads, not SQL statements.
+
+Startup is **process cold**, with warm OS/filesystem and database caches.
+Parent wall time includes spawning through clean exit, including 1,000 subsequent verified point reads; child ready time starts
+inside Node before provider imports and ends after its first successful query.
+It excludes Node's pre-script startup and excludes disconnect. Each child's
+baseline/ready RSS, working RSS after 1,000 verified reads, and OS process-lifetime `maxRSS` are recorded. These include
+runtime, provider, adapters and pools, not just ORM-owned allocations. Only
+provider-specific imports run in that child. Four observations per provider
+show variation; they are not confidence intervals.
+
+Timed write/mixed phases share a process and retain dependencies and raw
+samples from preceding phases. Their 20 ms RSS sample peak is a lower bound,
+and OS `maxRSS` covers the entire process lifetime. These diagnostics **cannot
+rank provider memory footprints**. Sampling, validation and dispatch are part
+of throughput wall time; public API latency excludes validation. Raw starts,
+latencies, errors, RSS and five-second bins are retained. This short run is
+not a long soak, production capacity result or leak certification.
+
+The app setup remains provider-specific: Prisma requires the checked schema,
+client generation and PostgreSQL adapter; Drizzle requires explicit pg-core
+models and node-postgres integration; Neutron requires explicit table models
+and its public driver configuration; raw pg requires handwritten parameterized
+SQL and transaction lifecycle handling. These are visible in
+`extended-providers.mjs`, `schema.prisma` and `run.mjs`; source size is not used
+as a quality score. One harness-owned PostgreSQL DDL defines this test schema,
+so these runs do not compare migration generators or schema evolution.
