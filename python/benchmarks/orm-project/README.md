@@ -110,3 +110,46 @@ streaming, migrations, ORM change tracking parity, retries/cancellation, network
 faults, Nucleus, other databases or compatibility with historical framework
 artifacts. Do not rank Python against TypeScript/Go results. Do not infer that
 Neutron replaces all SQLAlchemy features from these finite checks.
+
+## Extended local experiment
+
+`extended.py` reuses these genuine providers and owned PostgreSQL17 fixtures.
+Set the same candidate-source `PYTHONPATH` and private pinned dependency path
+as above, then run:
+
+```sh
+python extended.py --admin-file /private/resources.local.json --output /private/new-output
+```
+
+Outputs refuse reuse. The default runs four Williams-order trials,100 sequential
+transactional CRUD samples and30 seconds of closed-loop c4 mixed load per
+provider/trial (three point reads then one transaction per worker). Each write
+creates a document, guarded-updates it, reads its exact native values and deletes
+it within one transaction. Every transaction result and final fixture is checked
+outside the API latency timer by an independent asyncpg oracle. This is a bounded
+local soak, not hours-long production capacity, throughput at a fixed arrival
+rate or a contention benchmark. Consumer throughput includes oracle checks,
+dispatch and memory-sampler overhead.
+
+Fresh subprocess trials record whole process launch/import/connect/first-read/
+close wall time, connection initialization and first-read latency, with warm OS
+and database caches. Each child imports the shared all-provider modules, so this
+is not a clean minimal-provider startup or package-footprint comparison.
+`ps` current RSS and `getrusage` OS high-water RSS are process measures, not heap
+allocation or retained model sizes. Sustained parent RSS retains allocator/import
+history across phases; raw arrays are saved and discarded per phase. Do not rank
+provider memory from that shared process. One-second sampling misses short peaks;
+OS high-water captures process history but cannot attribute it to one provider.
+
+`DocumentService` is an executable tiny tenant-scoped application slice: create,
+edit with optimistic conflict, keyset list, project detail and explicit abandoned
+write. Its scenario proves same-ID second-tenant isolation and exact persisted
+state. This is implementation acceptance, not a subjective usability study,
+external-user adoption, schema-migration parity or a production app. Provider
+setup uses four aligned pooled connections; Neutron needs Pydantic models and
+explicit SQL/transaction calls, SQLAlchemy ORM needs mapped models/session
+configuration, Core uses SQLAlchemy tables/builders/engine transactions, and
+rawasyncpg uses explicit SQL/pool/transaction calls. See `providers.py`,
+`extended_providers.py` and `DocumentService` for the actual required code.
+One harness-owned DDL authority creates the fixture; no provider runs migrations.
+`--correctness-only` runs the acceptance scenarios without performance phases.
