@@ -255,7 +255,7 @@ async def run(args):
         raise RuntimeError("administrative URL query/fragment not supported")
     import asyncpg
     from providers import PROVIDERS
-    for name, expected in (("SQLAlchemy","2.0.48"),("greenlet","3.3.2")):
+    for name, expected in (("SQLAlchemy","2.0.54"),("greenlet","3.3.2")):
         if metadata.version(name)!=expected:
             raise RuntimeError(f"dependency pin mismatch: {name}")
     source = source_identity()
