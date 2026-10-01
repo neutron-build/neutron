@@ -38,7 +38,26 @@ SDK-compatible shape stores canonical decimal text of an integer as its ID
 encoding; `001` is not representable in it. A runner refuses a history whose
 `version` column type is not its own shape **before any mutation** — that
 refusal is the mixed-runner rule; there is no implicit INTEGER-to-TEXT rewrite
-in either direction. Moving between shapes is an explicit adoption.
+in either direction. The CLI can explicitly adopt SDK integer history into its
+text shape (§6). SDK APIs refuse text history; moving a CLI ledger to an SDK
+runner requires separate operator reconciliation, not implicit SDK adoption.
+SDK admission checks actual builtin `pg_catalog` int2/int4/int8 type identity;
+domains and custom types with integer-looking names are unsupported.
+
+### Metadata namespace (Go/TypeScript SDKs)
+
+Before mutation, each SDK invocation captures one persistent intended schema
+from the actual catalog. History and claim must resolve to ordinary permanent
+tables in that schema. Temporary shadows, later-search-path metadata, views,
+unlogged tables, incomplete catalog identity and unsupported version types
+are refused. Internal metadata reads, DDL, claims, heartbeat, adoption and
+transaction bookkeeping use that quoted schema throughout the invocation.
+User migration SQL keeps its normal session semantics, including `SET LOCAL`;
+it cannot redirect the runner's bookkeeping through `search_path`.
+
+The migration endpoint must reach one database and principal consistently, with
+no concurrent privileged replacement of metadata objects. Arbitrary routing
+transports and missing catalog support are not certified profiles.
 
 ## 2. History table
 
@@ -120,15 +139,17 @@ pinned connection**, held from the history read through the final apply:
 - key: `7043516000858342567` (`0x61BF987C10F104A7` — first 8 bytes, big-endian
   signed, of `SHA-256("_neutron_migrations.runner")`);
 - the runner acquires one pooled connection, takes
-  `SELECT pg_advisory_lock(key)` **on that connection**, and runs everything —
+  `SELECT pg_catalog.pg_advisory_lock(key)` **on that connection**, and runs everything —
   history read, checksum verification, every migration transaction — on that
   same session; the lock and the work cannot be separated by pool checkout;
-- release is `pg_advisory_unlock` + connection release in a `finally`/defer
+- release is confirmed `pg_catalog.pg_advisory_unlock` + connection release in a `finally`/defer
   path; a dead session releases the lock automatically, which is the crash
   story: a killed holder's lock evaporates with its connection and the next
   runner re-reads durable history under the lock before doing anything;
 - acquiring honors the run's deadline/cancellation; a waiter that times out
-  fails cleanly without side effects.
+  fails cleanly without side effects. A canceled/failed acquisition or an
+  unconfirmed unlock discards the physical connection instead of returning an
+  uncertain lock holder to the pool.
 
 `schema baseline` also holds this lock across catalog introspection and
 history observation, while `db push` and Studio apply use it for their schema
