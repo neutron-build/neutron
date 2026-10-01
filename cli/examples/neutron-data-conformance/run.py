@@ -14,6 +14,7 @@ import asyncpg
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
+_OWNED_RUNTIME = None
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -27,6 +28,7 @@ def command(args, cwd, env, log, expect_failure=False):
     return result.stdout
 
 async def main():
+    global _OWNED_RUNTIME
     admin_url = os.environ['ADMIN_DATABASE_URL']
     cli = Path(os.environ['NEUTRON_CLI']).resolve()
     runtime = Path(os.environ['CONFORMANCE_RUNTIME']).resolve()
@@ -38,6 +40,7 @@ async def main():
     if shutil.disk_usage(ROOT).free < 6 * 1024**3:
         raise RuntimeError('6 GiB disk guard')
     runtime.mkdir(mode=0o700, parents=True)
+    _OWNED_RUNTIME = runtime
     os.umask(0o077)
     name = 'v10_conformance_' + uuid4().hex[:16]
     parts = urlsplit(admin_url)
@@ -139,8 +142,8 @@ if __name__ == '__main__':
     try:
         asyncio.run(main())
     except Exception as exc:
-        runtime = Path(os.environ.get('CONFORMANCE_RUNTIME', ''))
-        if runtime.is_dir():
+        runtime = _OWNED_RUNTIME
+        if runtime is not None and runtime.is_dir():
             detail = traceback.format_exc()
             for key in ('ADMIN_DATABASE_URL', 'DATABASE_URL'):
                 if os.environ.get(key):
