@@ -45,9 +45,12 @@ tenant predicates are correctness controls rather than a least-privilege test.
 
 Timed operations are warm point reads, 20-row keyset pages and parent/children
 reads, with a maximum pool size of four and concurrency one and four. Correctness
-must pass before timing. SQL logging uses separate untimed instances; validation
-and report serialization occur outside each public API latency measurement.
-Throughput includes dispatch and validation. Preserve raw errors, samples,
+must pass before timing. For the balanced read measurements, SQL logging uses
+separate untimed instances; validation and report serialization occur outside
+each public API latency measurement. Throughput includes dispatch and validation.
+The older TypeScript diagnostic smoke includes normalization and assertions in
+its timer and retains SQL auditing; interpret that diagnostic separately.
+Preserve raw errors, samples,
 source hashes, package/module identities, server settings and trial variation.
 
 Python uses a four-provider Williams ordering to balance positions and adjacent
@@ -81,8 +84,9 @@ the environment, and use fresh private output directories. Each runner has a
 6 GiB free-space guard and refuses output reuse.
 
 Fixtures create randomly named databases and drop only databases they created.
-Check the recorded cleanup result after success or failure. A forced process kill
-or machine failure can leave a fixture behind; verify its recorded identity before
+Python and Go record cleanup outcomes; check those after success or failure.
+For TypeScript, verify that the named fixture database was removed. A forced
+process kill or machine failure can leave a fixture behind; verify its identity before
 removing it. Never point cleanup at an application database.
 
 For a quick untimed check, Python and Go support `--correctness-only`. Run these
