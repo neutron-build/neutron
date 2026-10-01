@@ -1,6 +1,8 @@
 package studio
 
 import (
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -56,13 +58,17 @@ func TestStudioStateDirectoryRefusesInvalidConfiguration(t *testing.T) {
 
 func TestStudioSavedStoreRefusesCorruptState(t *testing.T) {
 	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("NEUTRON_STUDIO_DATA_DIR", dir)
 	file := filepath.Join(dir, "studio-saved.json")
 	if err := os.WriteFile(file, []byte("invalid JSON"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := newSavedQueryStore(); err == nil {
-		t.Fatal("corrupt saved queries silently ignored")
+	var syntax *json.SyntaxError
+	if _, err := newSavedQueryStore(); !errors.As(err, &syntax) {
+		t.Fatalf("expected corrupt saved JSON refusal, got %v", err)
 	}
 	data, _ := os.ReadFile(file)
 	if string(data) != "invalid JSON" {
