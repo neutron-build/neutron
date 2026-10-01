@@ -256,3 +256,38 @@ async fn foreign_and_native_type_identity_refuse_before_effects() -> TestResult 
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn fresh_bootstrap_uses_native_types_under_domain_shadow() -> TestResult {
+    let Some(url) = admin_url() else {
+        return Ok(());
+    };
+    for shadow in ["text", "timestamptz"] {
+        let fixture = Fixture::new(&url).await?;
+        let result: TestResult = async {
+            fixture.control.batch_execute(&format!(
+                "CREATE DOMAIN public.{shadow} AS pg_catalog.{shadow};ALTER DATABASE {} SET search_path TO public,pg_catalog", fixture.name
+            )).await?;
+            fs::write(fixture.dir.join("001_probe.sql"), "CREATE TABLE public.probe(id pg_catalog.int4)")?;
+            // The runner opens its own connection after the database default is changed.
+            migrate(&fixture.pool, &fixture.dir).await?;
+            ensure(fixture.business_exists().await?, "fresh native bootstrap did not run business SQL")?;
+            let columns = fixture.control.query(
+                "SELECT a.attname,a.atttypid,t.typtype::pg_catalog.text,n.nspname FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type t ON t.oid=a.atttypid JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace WHERE a.attrelid=pg_catalog.to_regclass($1) AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum",
+                &[&format!("public.{LEDGER}")]
+            ).await?;
+            ensure(columns.len()==2,"bootstrap column count changed")?;
+            for (row,(name,oid)) in columns.iter().zip([("name",25_u32),("applied_at",1184_u32)]) {
+                ensure(row.try_get::<_,String>(0)?==name && row.try_get::<_,u32>(1)?==oid && row.try_get::<_,String>(2)?=="b" && row.try_get::<_,String>(3)?=="pg_catalog", "bootstrap resolved an ambient domain instead of the native type")?;
+            }
+            let count: i64=fixture.control.query_one(&format!("SELECT count(*) FROM public.{LEDGER} WHERE name='001_probe.sql'"),&[]).await?.try_get(0)?;
+            ensure(count==1,"bootstrap did not record exactly one step")?;
+            // Re-running must admit its own history and skip the non-idempotent DDL.
+            migrate(&fixture.pool, &fixture.dir).await?;
+            Ok(())
+        }.await;
+        fixture.cleanup().await?;
+        result?;
+    }
+    Ok(())
+}

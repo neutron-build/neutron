@@ -160,7 +160,7 @@ pub async fn migrate(pool: &PgPool, dir: impl AsRef<Path>) -> Result<(), PgError
         .map_err(PgError::Query)?;
     admit_metadata(client, &mut metadata).await?;
     if metadata.ledger_oid.is_none() {
-        client.batch_execute(&format!("CREATE TABLE {} (name TEXT NOT NULL PRIMARY KEY,applied_at TIMESTAMPTZ NOT NULL DEFAULT pg_catalog.now())",metadata.table))
+        client.batch_execute(&format!("CREATE TABLE {} (name pg_catalog.text NOT NULL PRIMARY KEY,applied_at pg_catalog.timestamptz NOT NULL DEFAULT pg_catalog.now())",metadata.table))
             .await.map_err(PgError::Query)?;
         admit_metadata(client, &mut metadata).await?;
     }
