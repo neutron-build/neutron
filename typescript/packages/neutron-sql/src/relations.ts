@@ -37,7 +37,7 @@
 
 import { type Condition, type OrderExpression } from "./expr.js";
 import { collectRequirements } from "./ast.js";
-import { getTableColumns, getTableName } from "./schema.js";
+import { getTableColumns, getTableConstraints, getTableName } from "./schema.js";
 import type { AnyColumnBuilder, AnyPgTable, Relation, RelationOne, TableRelations } from "./schema.js";
 import type { ExecContext } from "./builder.js";
 import { run, whereItems } from "./builder.js";
@@ -138,10 +138,10 @@ export function resolveRelations(all: TableRelations[]): ResolvedRelations {
     for (const [key, rel] of Object.entries(r.entries)) {
       if (rel.kind !== "many") continue;
       const target = rel.targetTable;
-      if ((Object.values(getTableColumns(target)) as AnyColumnBuilder[]).every((c) => !c.isPrimaryKey)) {
-        throw new Error(
-          `relation "${key}" on ${getTableName(r.table)}: target table ${getTableName(target)} has no primary key; relation ordering undefined`,
-        );
+      try {
+        pkColumnsOf(target);
+      } catch (error) {
+        throw new Error(`relation "${key}" on ${getTableName(r.table)}: ${(error as Error).message}`);
       }
       const targetSet = byTable.get(getTableName(target));
       if (!targetSet) {
@@ -185,12 +185,39 @@ export function resolveRelations(all: TableRelations[]): ResolvedRelations {
   return { byTable: byTableEntries };
 }
 
+// Table constraints retain ordered physical names, while column declarations
+// retain flags. Resolve either representation without mutating schema metadata.
 function pkColumnsOf(table: AnyPgTable): AnyColumnBuilder[] {
-  const pks = (Object.values(getTableColumns(table)) as AnyColumnBuilder[]).filter((c) => c.isPrimaryKey);
-  if (pks.length === 0) {
-    throw new Error(`target table ${getTableName(table)} has no primary key; relation ordering undefined`);
+  const columns = Object.values(getTableColumns(table)) as AnyColumnBuilder[];
+  const columnPks = columns.filter((c) => c.isPrimaryKey);
+  const tablePks = getTableConstraints(table).filter((c) => c.kind === "primary-key");
+  const invalid = (reason: string): never => {
+    throw new Error(`target table ${getTableName(table)} has invalid primary-key metadata: ${reason}`);
+  };
+  if (tablePks.length > 1 || (tablePks.length > 0 && columnPks.length > 0)) {
+    return invalid("multiple or conflicting primary key declarations");
   }
-  return pks;
+  if (tablePks.length === 0) {
+    if (columnPks.length === 0) {
+      throw new Error(`target table ${getTableName(table)} has no primary key; relation ordering undefined`);
+    }
+    if (columnPks.some((c) => typeof c.columnName !== "string" || c.columnName.length === 0 || columns.filter((other) => other.columnName === c.columnName).length !== 1)) {
+      return invalid("empty or ambiguous physical primary key columns");
+    }
+    return columnPks;
+  }
+  const names = tablePks[0].columns;
+  if (names.length === 0) return invalid("empty primary key");
+  const seen = new Set<string>();
+  return names.map((name) => {
+    if (typeof name !== "string" || name.length === 0 || seen.has(name)) {
+      return invalid("empty or duplicate primary key column name");
+    }
+    seen.add(name);
+    const matches = columns.filter((c) => c.columnName === name);
+    if (matches.length !== 1) return invalid(`unknown or ambiguous primary key column ${JSON.stringify(name)}`);
+    return matches[0];
+  });
 }
 
 /** Nested JSON objects are labeled with declared property keys; values come

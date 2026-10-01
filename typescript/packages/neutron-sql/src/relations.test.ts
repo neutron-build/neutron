@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   pgTable,
+  primaryKey,
   serial,
   integer,
   text,
@@ -516,4 +517,35 @@ test("q05 unit: columns subset WITHOUT limit keeps the lean projection (no deriv
   assert.ok(!s.includes("'title',"), s);
   assert.ok(!s.includes("'views',"), s);
   assert.ok(!s.includes("'author_id',"), s);
+});
+
+
+test("table-level composite PK resolves and orders every declared physical key", () => {
+  const parents = pgTable("composite_parents", { tenant: text("tenant_key").notNull(), id: integer("local_id").notNull() }, t => [primaryKey({ columns: [t.tenant, t.id] })]);
+  const children = pgTable("composite_children", { tenant: text("tenant_key").notNull(), id: integer("local_id").notNull(), parentId: integer("parent_id").notNull() }, t => [primaryKey({ columns: [t.id, t.tenant] })]);
+  const pr = relations(parents, ({ many }) => ({ children: many(children) }));
+  const cr = relations(children, ({ one }) => ({ parent: one(parents, { fields: [children.parentId, children.tenant], references: [parents.id, parents.tenant] }) }));
+  const resolved = resolveRelations([pr, cr]);
+  for (const args of ([{ with: { children: true } }, { with: { children: { limit: 1, offset: 1, columns: ["parentId"] } } }] satisfies RQBArgs[])) {
+    const plan = buildRelationalPlan(parents, pr.entries, args, resolved.byTable);
+    assert.match(plan.sql, /"local_id"(?: asc)?, [^,)]*"tenant_key"(?: asc)?/);
+    assert.match(plan.sql, /"parent_id" = "composite_parents"\."local_id"/);
+    assert.match(plan.sql, /"tenant_key" = "composite_parents"\."tenant_key"/);
+  }
+});
+
+test("relation PK metadata fails closed for invalid table constraints", () => {
+  for (const kind of ["empty", "unknown", "duplicate", "multiple", "mixed", "empty-name", "ambiguous"]) {
+    const parent = pgTable("pk_parent", { id: integer("id").primaryKey() });
+    const child = pgTable("pk_child", { id: kind === "mixed" ? integer("id").primaryKey() : integer(kind === "empty-name" ? "" : "id").notNull(), parentId: integer(kind === "ambiguous" ? "id" : "parent_id").notNull() }, t => {
+      if (kind === "empty") return [primaryKey({ columns: [] })];
+      if (kind === "unknown") return [primaryKey({ columns: [integer("foreign_missing")] })];
+      if (kind === "duplicate") return [primaryKey({ columns: [t.id, t.id] })];
+      if (kind === "multiple") return [primaryKey({ columns: [t.id] }), primaryKey({ columns: [t.parentId] })];
+      return [primaryKey({ columns: [t.id] })];
+    });
+    const pr = relations(parent, ({ many }) => ({ children: many(child) }));
+    const cr = relations(child, ({ one }) => ({ parent: one(parent, { fields: [child.parentId], references: [parent.id] }) }));
+    assert.throws(() => resolveRelations([pr, cr]), /primary key|primary-key/);
+  }
 });
