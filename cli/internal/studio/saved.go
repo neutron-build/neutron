@@ -27,16 +27,14 @@ type savedQueryStore struct {
 }
 
 func newSavedQueryStore() (*savedQueryStore, error) {
-	home, err := os.UserHomeDir()
+	dir, err := studioStateDir()
 	if err != nil {
 		return nil, err
 	}
-	dir := filepath.Join(home, ".neutron")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	s := &savedQueryStore{path: filepath.Join(dir, "studio-saved.json")}
+	if err := s.load(); err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
-	s := &savedQueryStore{path: filepath.Join(dir, "studio-saved.json")}
-	_ = s.load() // ignore missing file on first run
 	return s, nil
 }
 

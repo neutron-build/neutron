@@ -277,3 +277,12 @@ migration authority or runtime TypeScript decoder. See the exact type,
 nullability and transport contract in
 [GENERATED.md](../contracts/data/GENERATED.md). Temporal, array, domain, enum,
 composite, JSON and floating-point types are outside this initial profile.
+
+
+Studio stores local connections and saved queries under `~/.neutron` by default.
+Set `NEUTRON_STUDIO_DATA_DIR` to an absolute private directory (mode 0700) to
+isolate an instance or disposable test profile. Connection and saved-query files
+stay in that directory; changing the setting does not copy or delete other
+profiles. Malformed saved-query state causes startup to fail rather than silently
+resetting it. Studio remains a local operator tool; use a database role with the
+permissions appropriate to that instance.
