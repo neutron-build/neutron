@@ -64,3 +64,12 @@ it('quoted metadata namespaces support explicit unverified adoption and canonica
   await assert.rejects(()=>migrate(t,[{version:3,name:'no',up:'SELECT 3'}]),/text column/);
  } finally {await o.execute(`DROP SCHEMA ${quote(name)} CASCADE`);}
 }));
+
+it('migration namespace capture ignores functions shadowing pg_catalog', { skip: !url }, async()=>fixture(async(t,o,a,b)=>{
+ await o.execute(`CREATE FUNCTION ${quote(a)}.current_schema() RETURNS name LANGUAGE sql AS $$ SELECT '${b}'::name $$`);
+ await t.execute(`SET search_path TO ${quote(a)},pg_catalog`);
+ assert.equal(await t.fetchval('SELECT current_schema()::text'),b);
+ await migrate(t,[{version:1,name:'original',up:'SELECT 1'}]);assert.equal((await migrationStatus(t))[0].name,'original');
+ assert.equal(await o.fetchval(`SELECT count(*)::int FROM ${quote(a)}._neutron_migrations`),1);
+ assert.equal(await o.fetchval("SELECT count(*)::int FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname IN ('_neutron_migrations','_neutron_migration_lock')",[b]),0);
+}));

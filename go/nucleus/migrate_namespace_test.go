@@ -237,3 +237,32 @@ func TestMigrationNamespaceQuotedAdoption(t *testing.T) {
 		t.Fatalf("canonical refusal %v", err)
 	}
 }
+
+func TestMigrationNamespaceFunctionShadow(t *testing.T) {
+	c, o, a, b := namespaceFixture(t)
+	ctx := context.Background()
+	if _, err := o.Exec(ctx, "CREATE FUNCTION "+a+".current_schema() RETURNS name LANGUAGE sql AS $$ SELECT '"+b+"'::name $$"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Pool().Exec(ctx, "SET search_path TO "+a+",pg_catalog"); err != nil {
+		t.Fatal(err)
+	}
+	var fake string
+	if err := c.Pool().QueryRow(ctx, "SELECT current_schema()::text").Scan(&fake); err != nil || fake != b {
+		t.Fatalf("shadow not active: %s %v", fake, err)
+	}
+	if err := c.Migrate(ctx, []Migration{{Version: 1, Name: "original", Up: "SELECT 1"}}); err != nil {
+		t.Fatal(err)
+	}
+	records, err := c.MigrationStatus(ctx)
+	if err != nil || len(records) != 1 || records[0].Name != "original" {
+		t.Fatalf("status %v %v", records, err)
+	}
+	var n int
+	if err := o.QueryRow(ctx, "SELECT count(*) FROM "+a+"._neutron_migrations").Scan(&n); err != nil || n != 1 {
+		t.Fatalf("original history %d %v", n, err)
+	}
+	if err := o.QueryRow(ctx, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname IN ('_neutron_migrations','_neutron_migration_lock')", b).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("spoof schema mutation %d %v", n, err)
+	}
+}

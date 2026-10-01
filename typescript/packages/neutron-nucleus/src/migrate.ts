@@ -25,10 +25,10 @@ async function captureMigrationNamespace(transport: Transport): Promise<Migratio
   let result;
   try {
     result = await transport.query<{ intended_schema: string | null; schema_oid: string | null; catalog_oid: string | null; name: string; relation_oid: string | null; resolved_schema: string | null; kind: string | null }>(`
-      SELECT current_schema() AS intended_schema, ns.oid::text AS schema_oid, pg_catalog.to_regclass('pg_catalog.pg_class')::oid::text AS catalog_oid, names.name,
+      SELECT pg_catalog.current_schema() AS intended_schema, ns.oid::text AS schema_oid, pg_catalog.to_regclass('pg_catalog.pg_class')::oid::text AS catalog_oid, names.name,
         c.oid::text AS relation_oid, rn.nspname AS resolved_schema, c.relkind::text AS kind
       FROM (VALUES ('_neutron_migrations'), ('_neutron_migration_lock')) AS names(name)
-      LEFT JOIN pg_catalog.pg_namespace ns ON ns.nspname = current_schema()
+      LEFT JOIN pg_catalog.pg_namespace ns ON ns.nspname = pg_catalog.current_schema()
       LEFT JOIN pg_catalog.pg_class c ON c.oid = pg_catalog.to_regclass(names.name)
       LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid = c.relnamespace`);
   } catch (error) {
@@ -131,7 +131,7 @@ const MIGRATIONS_TABLE_SQL = `
 CREATE TABLE IF NOT EXISTS _neutron_migrations (
   version     INTEGER PRIMARY KEY,
   name        TEXT NOT NULL,
-  applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  applied_at  TIMESTAMPTZ NOT NULL DEFAULT pg_catalog.now(),
   checksum    TEXT,
   owner       TEXT,
   format      TEXT
@@ -150,7 +150,7 @@ const MIGRATION_LOCK_TABLE_SQL = `
 CREATE TABLE IF NOT EXISTS _neutron_migration_lock (
   id        INTEGER PRIMARY KEY,
   token     BIGINT NOT NULL,
-  locked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  locked_at TIMESTAMPTZ NOT NULL DEFAULT pg_catalog.now(),
   owner     TEXT
 )`;
 
@@ -411,7 +411,7 @@ export async function migrate(
         ran.push(m.name);
         // Heartbeat refresh: diagnostic only, never a lease.
         await transport
-          .execute(namespace.sql('UPDATE _neutron_migration_lock SET locked_at = NOW() WHERE id = 1 AND token = $1'), [token])
+          .execute(namespace.sql('UPDATE _neutron_migration_lock SET locked_at = pg_catalog.now() WHERE id = 1 AND token = $1'), [token])
           .catch(() => {});
       } catch (err) {
         await tx.rollback().catch(() => {});
@@ -501,7 +501,7 @@ export async function adoptMigrations(
 
     const byVersion = new Map(plan.map((m) => [m.version, m]));
     const report: MigrationAdoptionReport = { verified: [], unverified: [] };
-    const isNucleus = String(await transport.fetchval('SELECT version()')).includes('Nucleus');
+    const isNucleus = String(await transport.fetchval('SELECT pg_catalog.version()')).includes('Nucleus');
     let tx = await transport.beginTransaction();
     try {
       const hasChecksum = await tx.fetchval<boolean>(

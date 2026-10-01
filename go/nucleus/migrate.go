@@ -28,10 +28,10 @@ func (n migrationNamespace) sql(statement string) string {
 	return migrationMetadataName.ReplaceAllStringFunc(statement, func(name string) string { return quoted + `"` + name + `"` })
 }
 
-const migrationNamespaceSQL = `SELECT current_schema(), ns.oid::text, pg_catalog.to_regclass('pg_catalog.pg_class')::oid::text, names.name,
+const migrationNamespaceSQL = `SELECT pg_catalog.current_schema(), ns.oid::text, pg_catalog.to_regclass('pg_catalog.pg_class')::oid::text, names.name,
  c.oid::text, rn.nspname, c.relkind::text
  FROM (VALUES ('_neutron_migrations'), ('_neutron_migration_lock')) AS names(name)
- LEFT JOIN pg_catalog.pg_namespace ns ON ns.nspname = current_schema()
+ LEFT JOIN pg_catalog.pg_namespace ns ON ns.nspname = pg_catalog.current_schema()
  LEFT JOIN pg_catalog.pg_class c ON c.oid = pg_catalog.to_regclass(names.name)
  LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid = c.relnamespace`
 
@@ -144,7 +144,7 @@ const migrationsTable = `
 CREATE TABLE IF NOT EXISTS _neutron_migrations (
     version     INTEGER PRIMARY KEY,
     name        TEXT NOT NULL,
-    applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    applied_at  TIMESTAMPTZ NOT NULL DEFAULT pg_catalog.now(),
     checksum    TEXT,
     owner       TEXT,
     format      TEXT
@@ -172,7 +172,7 @@ const migrationLockTable = `
 CREATE TABLE IF NOT EXISTS _neutron_migration_lock (
     id        INTEGER PRIMARY KEY,
     token     BIGINT NOT NULL,
-    locked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    locked_at TIMESTAMPTZ NOT NULL DEFAULT pg_catalog.now(),
     owner     TEXT
 )`
 
@@ -844,7 +844,7 @@ func (c *Client) Migrate(ctx context.Context, migrations []Migration) error {
 		// Heartbeat refresh: DIAGNOSTIC ONLY. Nothing steals based on it;
 		// it exists so MigrationLockInfo can report a live holder's age.
 		_, _ = c.pool.Exec(ctx,
-			namespace.sql("UPDATE _neutron_migration_lock SET locked_at = NOW() WHERE id = 1 AND token = $1"),
+			namespace.sql("UPDATE _neutron_migration_lock SET locked_at = pg_catalog.now() WHERE id = 1 AND token = $1"),
 			sqlParam(lockToken))
 	}
 
