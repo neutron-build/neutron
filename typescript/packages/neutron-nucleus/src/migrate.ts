@@ -24,13 +24,18 @@ interface MigrationNamespace { schema: string; sql(statement: string): string }
 async function captureMigrationNamespace(transport: Transport): Promise<MigrationNamespace> {
   let result;
   try {
-    result = await transport.query<{ intended_schema: string | null; schema_oid: string | null; catalog_oid: string | null; name: string; relation_oid: string | null; resolved_schema: string | null; kind: string | null; persistence: string | null }>(`
+    result = await transport.query<{ intended_schema: string | null; schema_oid: string | null; catalog_oid: string | null; name: string; relation_oid: string | null; resolved_schema: string | null; kind: string | null; persistence: string | null; version_oid: string | null; version_kind: string | null; version_namespace: string | null; version_name: string | null }>(`
       SELECT pg_catalog.current_schema() AS intended_schema, ns.oid::text AS schema_oid, pg_catalog.to_regclass('pg_catalog.pg_class')::oid::text AS catalog_oid, names.name,
-        c.oid::text AS relation_oid, rn.nspname AS resolved_schema, c.relkind::text AS kind, c.relpersistence::text AS persistence
+        c.oid::text AS relation_oid, rn.nspname AS resolved_schema, c.relkind::text AS kind, c.relpersistence::text AS persistence,
+        vt.oid::text AS version_oid, vt.typtype::text AS version_kind, vn.nspname AS version_namespace, vt.typname AS version_name
       FROM (VALUES ('_neutron_migrations'), ('_neutron_migration_lock')) AS names(name)
       LEFT JOIN pg_catalog.pg_namespace ns ON ns.nspname = pg_catalog.current_schema()
       LEFT JOIN pg_catalog.pg_class c ON c.oid = pg_catalog.to_regclass(names.name)
-      LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid = c.relnamespace`);
+      LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid = c.relnamespace
+      LEFT JOIN pg_catalog.pg_attribute va ON names.name = '_neutron_migrations'
+        AND va.attrelid = c.oid AND va.attname = 'version' AND va.attnum > 0 AND NOT va.attisdropped
+      LEFT JOIN pg_catalog.pg_type vt ON vt.oid = va.atttypid
+      LEFT JOIN pg_catalog.pg_namespace vn ON vn.oid = vt.typnamespace`);
   } catch (error) {
     throw new Error('nucleus: unsupported migration namespace profile: actual persistent catalog identity required', { cause: error });
   }
@@ -47,6 +52,15 @@ async function captureMigrationNamespace(transport: Transport): Promise<Migratio
       if (typeof row.relation_oid !== 'string' || !row.relation_oid || typeof row.resolved_schema !== 'string' || typeof row.kind !== 'string' || typeof row.persistence !== 'string') throw new Error('nucleus: unsupported migration namespace profile: incomplete relation identity');
       if (row.resolved_schema !== schema || row.resolved_schema.startsWith('pg_temp_')) throw new Error(`nucleus: migration namespace ambiguity: ${JSON.stringify(row.name)} resolves in ${JSON.stringify(row.resolved_schema)} instead of intended schema ${JSON.stringify(schema)}; remove temporary shadows or configure the intended schema first`);
       if (row.kind !== 'r' || row.persistence !== 'p') throw new Error(`nucleus: migration metadata ${JSON.stringify(schema)}.${JSON.stringify(row.name)} is not an ordinary persistent table`);
+      if (row.name === '_neutron_migrations') {
+        if (typeof row.version_oid !== 'string' || typeof row.version_kind !== 'string' || typeof row.version_namespace !== 'string' || typeof row.version_name !== 'string') throw new Error('nucleus: unsupported migration history version identity: version column required');
+        const integers: Record<string, string> = { '21': 'int2', '23': 'int4', '20': 'int8' };
+        const texts: Record<string, string> = { '25': 'text', '1043': 'varchar', '1042': 'bpchar' };
+        if (row.version_kind !== 'b' || row.version_namespace !== 'pg_catalog' || integers[row.version_oid] !== row.version_name) {
+          if (row.version_kind === 'b' && row.version_namespace === 'pg_catalog' && texts[row.version_oid] === row.version_name) throw new Error('nucleus: _neutron_migrations.version is a text column — this history belongs to the canonical CLI protocol (text IDs); the SDK runner refuses rather than mix formats. Use `neutron migrate` for this text-ID history; moving it to SDK integer IDs requires explicit reconciliation');
+          throw new Error(`nucleus: unsupported migration history version identity ${JSON.stringify(row.version_namespace)}.${JSON.stringify(row.version_name)} (OID ${JSON.stringify(row.version_oid)}, kind ${JSON.stringify(row.version_kind)}); actual pg_catalog int2/int4/int8 required`);
+        }
+      }
     } else if (row.resolved_schema != null || row.kind != null || row.persistence != null) throw new Error('nucleus: unsupported migration namespace profile: inconsistent relation identity');
   }
   if (seen.size !== 2) throw new Error('nucleus: unsupported migration namespace profile: both metadata identities required');

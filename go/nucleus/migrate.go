@@ -29,11 +29,16 @@ func (n migrationNamespace) sql(statement string) string {
 }
 
 const migrationNamespaceSQL = `SELECT pg_catalog.current_schema(), ns.oid::text, pg_catalog.to_regclass('pg_catalog.pg_class')::oid::text, names.name,
- c.oid::text, rn.nspname, c.relkind::text, c.relpersistence::text
+ c.oid::text, rn.nspname, c.relkind::text, c.relpersistence::text,
+ vt.oid::text, vt.typtype::text, vn.nspname, vt.typname
  FROM (VALUES ('_neutron_migrations'), ('_neutron_migration_lock')) AS names(name)
  LEFT JOIN pg_catalog.pg_namespace ns ON ns.nspname = pg_catalog.current_schema()
  LEFT JOIN pg_catalog.pg_class c ON c.oid = pg_catalog.to_regclass(names.name)
- LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid = c.relnamespace`
+ LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid = c.relnamespace
+ LEFT JOIN pg_catalog.pg_attribute va ON names.name = '_neutron_migrations'
+  AND va.attrelid = c.oid AND va.attname = 'version' AND va.attnum > 0 AND NOT va.attisdropped
+ LEFT JOIN pg_catalog.pg_type vt ON vt.oid = va.atttypid
+ LEFT JOIN pg_catalog.pg_namespace vn ON vn.oid = vt.typnamespace`
 
 func (c *Client) captureMigrationNamespace(ctx context.Context) (migrationNamespace, error) {
 	var scope migrationNamespace
@@ -45,8 +50,9 @@ func (c *Client) captureMigrationNamespace(ctx context.Context) (migrationNamesp
 	seen := map[string]bool{}
 	for rows.Next() {
 		var schema, schemaOID, catalogOID, relationOID, resolved, kind, persistence *string
+		var versionOID, versionKind, versionNamespace, versionName *string
 		var name string
-		if err := rows.Scan(&schema, &schemaOID, &catalogOID, &name, &relationOID, &resolved, &kind, &persistence); err != nil {
+		if err := rows.Scan(&schema, &schemaOID, &catalogOID, &name, &relationOID, &resolved, &kind, &persistence, &versionOID, &versionKind, &versionNamespace, &versionName); err != nil {
 			return scope, fmt.Errorf("nucleus: unsupported migration namespace profile: catalog identity scan: %w", err)
 		}
 		if catalogOID == nil || *catalogOID == "" {
@@ -73,6 +79,12 @@ func (c *Client) captureMigrationNamespace(ctx context.Context) (migrationNamesp
 			if *kind != "r" || *persistence != "p" {
 				return scope, fmt.Errorf("nucleus: migration metadata %q.%q is not an ordinary persistent table", scope.schema, name)
 			}
+			if name == "_neutron_migrations" {
+				if err := checkCapturedVersionIdentity(versionOID, versionKind, versionNamespace, versionName); err != nil {
+					return scope, err
+				}
+			}
+
 		} else if resolved != nil || kind != nil || persistence != nil {
 			return scope, fmt.Errorf("nucleus: unsupported migration namespace profile: inconsistent relation identity")
 		}
@@ -84,6 +96,25 @@ func (c *Client) captureMigrationNamespace(ctx context.Context) (migrationNamesp
 		return scope, fmt.Errorf("nucleus: unsupported migration namespace profile: both metadata identities required")
 	}
 	return scope, nil
+}
+
+// Check actual column identity before even creating claim metadata. Domains
+// report their base data_type in information_schema and must not be admitted.
+func checkCapturedVersionIdentity(oid, kind, namespace, name *string) error {
+	if oid == nil || kind == nil || namespace == nil || name == nil {
+		return fmt.Errorf("nucleus: unsupported migration history version identity: version column required")
+	}
+	if *kind == "b" && *namespace == "pg_catalog" {
+		integers := map[string]string{"21": "int2", "23": "int4", "20": "int8"}
+		if expected, ok := integers[*oid]; ok && *name == expected {
+			return nil
+		}
+		texts := map[string]string{"25": "text", "1043": "varchar", "1042": "bpchar"}
+		if expected, ok := texts[*oid]; ok && *name == expected {
+			return fmt.Errorf("nucleus: _neutron_migrations.version is a text column — this history belongs to the canonical CLI protocol (text IDs); the SDK runner refuses rather than mix formats. Use `neutron migrate` for this text-ID history; moving it to SDK integer IDs requires explicit reconciliation")
+		}
+	}
+	return fmt.Errorf("nucleus: unsupported migration history version identity %q.%q (OID %q, kind %q); actual pg_catalog int2/int4/int8 required", *namespace, *name, *oid, *kind)
 }
 
 func (c *Client) migrationNamespaceFor(ctx context.Context, scopes []migrationNamespace) (migrationNamespace, error) {

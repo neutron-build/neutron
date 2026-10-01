@@ -76,3 +76,23 @@ it('migration namespace capture ignores functions shadowing pg_catalog', { skip:
  assert.equal(await o.fetchval(`SELECT count(*)::int FROM ${quote(a)}._neutron_migrations`),1);
  assert.equal(await o.fetchval("SELECT count(*)::int FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname IN ('_neutron_migrations','_neutron_migration_lock')",[b]),0);
 }));
+
+it('actual version domains/custom type masquerades are refused before claims', {skip:!url},async()=>{
+ for(const kind of ['domain','domain-masquerade','enum-masquerade'])await fixture(async(t,o,a)=>{
+  const name=kind==='domain'?'sdk_version':'int4',typ=quote(a)+'.'+quote(name);
+  await o.execute(kind==='enum-masquerade'?`CREATE TYPE ${typ} AS ENUM ('1','2')`:`CREATE DOMAIN ${typ} AS integer`);
+  await o.execute(`CREATE TABLE ${quote(a)}._neutron_migrations(version ${typ} PRIMARY KEY,name text,applied_at timestamptz default pg_catalog.now(),checksum text,owner text,format text);INSERT INTO ${quote(a)}._neutron_migrations(version,name,format)VALUES('1','foreign','v2')`);
+  const plan=[{version:2,name:'must-not-run',up:`CREATE TABLE ${quote(a)}.effect(id integer)`,down:'SELECT 1'}];
+  for(const operation of [()=>migrate(t,plan),()=>migrateDown(t,plan,1),()=>adoptMigrations(t,plan),()=>migrationStatus(t),()=>migrationLockInfo(t),()=>forceUnlockMigrations(t)]){
+   await assert.rejects(operation,/unsupported migration history version identity/);
+   assert.equal(await o.fetchval("SELECT count(*)::int FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname IN ('effect','_neutron_migration_lock')",[a]),0);
+  }
+ });
+});
+
+it('actual builtin int2/int4/int8 versions remain admitted', {skip:!url},async()=>{
+ for(const typ of ['smallint','integer','bigint'])await fixture(async(t,o,a)=>{
+  await o.execute(`CREATE TABLE ${quote(a)}._neutron_migrations(version ${typ} PRIMARY KEY,name text,applied_at timestamptz default pg_catalog.now(),checksum text,owner text,format text);INSERT INTO ${quote(a)}._neutron_migrations(version,name,format)VALUES(1,'unverified','v2')`);
+  await migrate(t,[{version:2,name:'new',up:'SELECT 2'}]);assert.equal((await migrationStatus(t)).length,2);
+ });
+});

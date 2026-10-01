@@ -278,3 +278,79 @@ func TestMigrationNamespaceFunctionShadow(t *testing.T) {
 		t.Fatalf("spoof schema mutation %d %v", n, err)
 	}
 }
+
+func TestMigrationNamespaceVersionIdentityBeforeClaims(t *testing.T) {
+	for _, kind := range []string{"domain", "domain-masquerade", "enum-masquerade"} {
+		t.Run(kind, func(t *testing.T) {
+			c, o, a, _ := namespaceFixture(t)
+			ctx := context.Background()
+			typ := a + ".sdk_version"
+			switch kind {
+			case "domain":
+				_, err := o.Exec(ctx, "CREATE DOMAIN "+typ+" AS integer CHECK(VALUE>0)")
+				if err != nil {
+					t.Fatal(err)
+				}
+			case "domain-masquerade":
+				typ = a + ".int4"
+				_, err := o.Exec(ctx, "CREATE DOMAIN "+typ+" AS integer")
+				if err != nil {
+					t.Fatal(err)
+				}
+			case "enum-masquerade":
+				typ = a + ".int4"
+				_, err := o.Exec(ctx, "CREATE TYPE "+typ+" AS ENUM ('1','2')")
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := o.Exec(ctx, "CREATE TABLE "+a+"._neutron_migrations(version "+typ+" PRIMARY KEY,name text,applied_at timestamptz default pg_catalog.now(),checksum text,owner text,format text);INSERT INTO "+a+"._neutron_migrations(version,name,format)VALUES('1','foreign','v2')"); err != nil {
+				t.Fatal(err)
+			}
+			plan := []Migration{{Version: 2, Name: "must-not-run", Up: "CREATE TABLE " + a + ".effect(id integer)", Down: "SELECT 1"}}
+			for _, api := range []string{"up", "down", "adopt", "status", "info", "unlock"} {
+				var err error
+				switch api {
+				case "up":
+					err = c.Migrate(ctx, plan)
+				case "down":
+					err = c.MigrateDown(ctx, plan, 1)
+				case "adopt":
+					_, err = c.AdoptMigrations(ctx, plan)
+				case "status":
+					_, err = c.MigrationStatus(ctx)
+				case "info":
+					_, err = c.MigrationLockInfo(ctx)
+				case "unlock":
+					err = c.ForceUnlockMigrations(ctx)
+				}
+				if err == nil || !strings.Contains(err.Error(), "unsupported migration history version identity") {
+					t.Fatalf("%s admission: %v", api, err)
+				}
+				var count int
+				if err := o.QueryRow(ctx, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname IN ('effect','_neutron_migration_lock')", a).Scan(&count); err != nil || count != 0 {
+					t.Fatalf("%s metadata effects %d %v", api, count, err)
+				}
+			}
+		})
+	}
+}
+
+func TestMigrationNamespaceBuiltinIntegerVersions(t *testing.T) {
+	for _, typ := range []string{"smallint", "integer", "bigint"} {
+		t.Run(typ, func(t *testing.T) {
+			c, o, a, _ := namespaceFixture(t)
+			ctx := context.Background()
+			if _, err := o.Exec(ctx, "CREATE TABLE "+a+"._neutron_migrations(version "+typ+" PRIMARY KEY,name text,applied_at timestamptz default pg_catalog.now(),checksum text,owner text,format text);INSERT INTO "+a+"._neutron_migrations(version,name,format)VALUES(1,'unverified','v2')"); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Migrate(ctx, []Migration{{Version: 2, Name: "new", Up: "SELECT 2"}}); err != nil {
+				t.Fatal(err)
+			}
+			records, err := c.MigrationStatus(ctx)
+			if err != nil || len(records) != 2 {
+				t.Fatalf("builtin %s %v %v", typ, records, err)
+			}
+		})
+	}
+}

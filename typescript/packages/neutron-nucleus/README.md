@@ -27,7 +27,10 @@ the connection search path so that its first existing schema is the intended
 migration schema. Temporary shadows, a history or claim found in a later search
 path schema, and metadata views or unlogged tables are refused before metadata mutation; remove the
 shadow or configure the intended schema first. Quoted schema identifiers are
-supported.
+supported. Existing history version columns must have actual builtin
+`pg_catalog.int2`, `int4` or `int8` identity; domains and custom types are refused
+before claim metadata is created. Canonical CLI text-ID histories still require
+`neutron migrate`.
 
 This freezes metadata resolution across pooled connections and migration SQL
 using `SET LOCAL search_path`. Supplied up/down SQL retains its own name-resolution
