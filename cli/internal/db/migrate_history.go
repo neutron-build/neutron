@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -91,64 +90,19 @@ func (s HistoryShape) String() string {
 	}
 }
 
-// historyColumnTypes reads the version column type and v2 column presence
-// from information_schema.
-func (c *Client) historyColumnTypes(ctx context.Context) (versionType string, hasV2Columns bool, exists bool, err error) {
-	rows, err := c.pool.Query(ctx, `
-		SELECT column_name, data_type
-		FROM information_schema.columns
-		WHERE table_schema = current_schema() AND table_name = '_neutron_migrations'`)
-	if err != nil {
-		return "", false, false, err
-	}
-	defer rows.Close()
-
-	cols := make(map[string]string)
-	for rows.Next() {
-		var name, dataType string
-		if err := rows.Scan(&name, &dataType); err != nil {
-			return "", false, false, err
-		}
-		cols[strings.ToLower(name)] = strings.ToLower(dataType)
-	}
-	if err := rows.Err(); err != nil {
-		return "", false, false, err
-	}
-	if len(cols) == 0 {
-		return "", false, false, nil
-	}
-	vt, ok := cols["version"]
-	if !ok {
-		return "", false, true, errors.New("_neutron_migrations has no version column")
-	}
-	hasV2 := cols["checksum"] != "" && cols["owner"] != "" && cols["format"] != ""
-	return vt, hasV2, true, nil
-}
-
-// InspectMigrationHistory classifies the database's migration history shape.
+// InspectMigrationHistory classifies history using one admitted namespace
+// and one connection for the complete read-only operation.
 func (c *Client) InspectMigrationHistory(ctx context.Context) (HistoryShape, error) {
-	versionType, hasV2, exists, err := c.historyColumnTypes(ctx)
+	conn, err := c.pool.Acquire(ctx)
 	if err != nil {
 		return HistoryIncompatible, err
 	}
-	if !exists {
-		return HistoryAbsent, nil
+	defer conn.Release()
+	n, err := captureMigrationNamespace(ctx, conn)
+	if err != nil {
+		return HistoryIncompatible, err
 	}
-	integer := versionType == "integer" || versionType == "smallint" || versionType == "bigint"
-	text := versionType == "text" || versionType == "character varying" || versionType == "character"
-	switch {
-	case integer && hasV2:
-		return HistoryV2Integer, nil
-	case integer:
-		return HistoryLegacyInteger, nil
-	case text && hasV2:
-		return HistoryV2Text, nil
-	case text:
-		return HistoryLegacyText, nil
-	default:
-		return HistoryIncompatible, fmt.Errorf(
-			"_neutron_migrations.version has unsupported type %q", versionType)
-	}
+	return inspectMigrationShape(ctx, conn, n)
 }
 
 // ---------------------------------------------------------------------------
@@ -161,8 +115,9 @@ func (c *Client) InspectMigrationHistory(ctx context.Context) (HistoryShape, err
 // THIS session, so the lock and the work can never be separated by a pool
 // checkout — the failure mode of a pool-level pg_advisory_lock query.
 type MigrationSession struct {
-	conn     *pgxpool.Conn
-	released bool
+	conn      *pgxpool.Conn
+	released  bool
+	namespace *migrationNamespace
 }
 
 // LockMigrations acquires the migration advisory lock on a dedicated
@@ -176,6 +131,11 @@ func (c *Client) LockMigrations(ctx context.Context) (*MigrationSession, error) 
 	if err != nil {
 		return nil, fmt.Errorf("acquire migration connection: %w", err)
 	}
+	n, err := captureMigrationNamespace(ctx, conn)
+	if err != nil {
+		conn.Release()
+		return nil, err
+	}
 	if _, err := conn.Exec(ctx, "SELECT pg_catalog.pg_advisory_lock($1)", migrationAdvisoryLockKey); err != nil {
 		// An interrupted acquisition can have an uncertain server-side outcome.
 		// Destroy the connection before its pool handle can be returned.
@@ -185,7 +145,14 @@ func (c *Client) LockMigrations(ctx context.Context) (*MigrationSession, error) 
 		conn.Release()
 		return nil, fmt.Errorf("acquire migration lock (another runner may be holding it): %w", err)
 	}
-	return &MigrationSession{conn: conn}, nil
+	if err := n.validate(ctx, conn); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		_ = conn.Conn().Close(cleanupCtx)
+		cancel()
+		conn.Release()
+		return nil, err
+	}
+	return &MigrationSession{conn: conn, namespace: n}, nil
 }
 
 // Release drops the advisory lock and returns the connection to the pool.
@@ -228,22 +195,31 @@ func (s *MigrationSession) BeginTx(ctx context.Context) (pgx.Tx, error) {
 // EnsureMigrationTableV2 creates the protocol v2 history table. Only valid
 // when the table does not exist yet; existing tables graduate via adoption.
 func (s *MigrationSession) EnsureMigrationTableV2(ctx context.Context) error {
-	_, err := s.conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS _neutron_migrations (
+	if err := s.namespace.validate(ctx, s.conn); err != nil {
+		return err
+	}
+	_, err := s.conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+s.namespace.table()+` (
 		version    TEXT PRIMARY KEY,
 		name       TEXT NOT NULL,
-		applied_at TIMESTAMPTZ DEFAULT now(),
+		applied_at TIMESTAMPTZ DEFAULT pg_catalog.now(),
 		checksum   TEXT,
 		owner      TEXT,
 		format     TEXT
 	)`)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.namespace.validate(ctx, s.conn)
 }
 
 // AppliedMigrations reads the full history (v2 columns included) on the
 // pinned session. Requires a v2-shaped table.
 func (s *MigrationSession) AppliedMigrations(ctx context.Context) ([]MigrationRecord, error) {
+	if err := s.namespace.validate(ctx, s.conn); err != nil {
+		return nil, err
+	}
 	rows, err := s.conn.Query(ctx,
-		"SELECT version, name, applied_at, checksum, owner, format FROM _neutron_migrations ORDER BY version")
+		"SELECT version, name, applied_at, checksum, owner, format FROM "+s.namespace.table()+" ORDER BY version")
 	if err != nil {
 		return nil, err
 	}
@@ -293,8 +269,11 @@ func (s *MigrationSession) ApplyMigration(ctx context.Context, mf MigrationFile)
 		return fmt.Errorf("execute migration %s: %w", mf.Version, err)
 	}
 
+	if err := s.namespace.validate(ctx, tx); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx,
-		"INSERT INTO _neutron_migrations (version, name, checksum, owner, format) VALUES ($1, $2, $3, $4, $5)",
+		"INSERT INTO "+s.namespace.table()+" (version, name, checksum, owner, format) VALUES ($1, $2, $3, $4, $5)",
 		mf.Version, mf.Name, MigrationChecksum(mf.SQL), MigrationOwnerCLI, MigrationHistoryFormat,
 	); err != nil {
 		return fmt.Errorf("record migration %s: %w", mf.Version, err)
@@ -332,7 +311,10 @@ func (s *MigrationSession) RevertMigration(ctx context.Context, mf MigrationFile
 		return fmt.Errorf("execute down migration %s: %w", mf.Version, err)
 	}
 
-	if _, err := tx.Exec(ctx, "DELETE FROM _neutron_migrations WHERE version = $1", mf.Version); err != nil {
+	if err := s.namespace.validate(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM "+s.namespace.table()+" WHERE version = $1", mf.Version); err != nil {
 		return fmt.Errorf("delete migration record %s: %w", mf.Version, err)
 	}
 
@@ -486,7 +468,7 @@ func (s *MigrationSession) AdoptMigrationHistory(ctx context.Context, files []Mi
 	// Read history AS-IS inside the transaction.
 	switch shape {
 	case HistoryLegacyText, HistoryLegacyInteger, HistoryV2Text, HistoryV2Integer:
-		records, err = readHistoryTx(ctx, tx)
+		records, err = readHistoryTx(ctx, tx, s.namespace)
 		if err != nil {
 			return nil, err
 		}
@@ -505,20 +487,20 @@ func (s *MigrationSession) AdoptMigrationHistory(ctx context.Context, files []Mi
 	// convert the version column INTEGER -> TEXT explicitly. This is the
 	// ONLY place the conversion happens; ordinary runs never rewrite it.
 	if _, err := tx.Exec(ctx,
-		"ALTER TABLE _neutron_migrations ADD COLUMN IF NOT EXISTS checksum TEXT"); err != nil {
+		"ALTER TABLE "+s.namespace.table()+" ADD COLUMN IF NOT EXISTS checksum TEXT"); err != nil {
 		return nil, fmt.Errorf("add checksum column: %w", err)
 	}
 	if _, err := tx.Exec(ctx,
-		"ALTER TABLE _neutron_migrations ADD COLUMN IF NOT EXISTS owner TEXT"); err != nil {
+		"ALTER TABLE "+s.namespace.table()+" ADD COLUMN IF NOT EXISTS owner TEXT"); err != nil {
 		return nil, fmt.Errorf("add owner column: %w", err)
 	}
 	if _, err := tx.Exec(ctx,
-		"ALTER TABLE _neutron_migrations ADD COLUMN IF NOT EXISTS format TEXT"); err != nil {
+		"ALTER TABLE "+s.namespace.table()+" ADD COLUMN IF NOT EXISTS format TEXT"); err != nil {
 		return nil, fmt.Errorf("add format column: %w", err)
 	}
 	if shape == HistoryLegacyInteger || shape == HistoryV2Integer {
 		if _, err := tx.Exec(ctx,
-			"ALTER TABLE _neutron_migrations ALTER COLUMN version TYPE TEXT USING version::text"); err != nil {
+			"ALTER TABLE "+s.namespace.table()+" ALTER COLUMN version TYPE TEXT USING version::text"); err != nil {
 			return nil, fmt.Errorf("convert version column to text (explicit adoption step): %w", err)
 		}
 		res.ConvertedFromInteger = true
@@ -542,7 +524,7 @@ func (s *MigrationSession) AdoptMigrationHistory(ctx context.Context, files []Mi
 			// Legacy Go SDK digest reproduced from the supplied file: the
 			// content is proven identical to what was applied.
 			if _, err := tx.Exec(ctx,
-				"UPDATE _neutron_migrations SET checksum = $1, owner = $2, format = $3 WHERE version = $4",
+				"UPDATE "+s.namespace.table()+" SET checksum = $1, owner = $2, format = $3 WHERE version = $4",
 				newDigest, MigrationOwnerCLI, MigrationHistoryFormat, r.Version); err != nil {
 				return nil, fmt.Errorf("adopt %s as verified: %w", r.Version, err)
 			}
@@ -550,7 +532,7 @@ func (s *MigrationSession) AdoptMigrationHistory(ctx context.Context, files []Mi
 		case hasFile && r.Checksum != nil && *r.Checksum == newDigest:
 			// Already v2 content (e.g. adoption re-run): stamp the metadata.
 			if _, err := tx.Exec(ctx,
-				"UPDATE _neutron_migrations SET owner = $1, format = $2 WHERE version = $3",
+				"UPDATE "+s.namespace.table()+" SET owner = $1, format = $2 WHERE version = $3",
 				MigrationOwnerCLI, MigrationHistoryFormat, r.Version); err != nil {
 				return nil, fmt.Errorf("adopt %s: %w", r.Version, err)
 			}
@@ -570,7 +552,7 @@ func (s *MigrationSession) AdoptMigrationHistory(ctx context.Context, files []Mi
 			// v2 values), format/owner are stamped, the row is reported.
 			// Never baselined.
 			if _, err := tx.Exec(ctx,
-				"UPDATE _neutron_migrations SET checksum = NULL, owner = $1, format = $2 WHERE version = $3",
+				"UPDATE "+s.namespace.table()+" SET checksum = NULL, owner = $1, format = $2 WHERE version = $3",
 				MigrationOwnerCLI, MigrationHistoryFormat, r.Version); err != nil {
 				return nil, fmt.Errorf("adopt %s as unverified: %w", r.Version, err)
 			}
@@ -586,63 +568,28 @@ func (s *MigrationSession) AdoptMigrationHistory(ctx context.Context, files []Mi
 
 // inspectShape classifies history using the session's own connection.
 func (s *MigrationSession) inspectShape(ctx context.Context) (HistoryShape, error) {
-	var versionType string
-	var n int
-	err := s.QueryRow(ctx, `
-		SELECT count(*),
-		       coalesce(max(data_type) FILTER (WHERE column_name = 'version'), '')
-		FROM information_schema.columns
-		WHERE table_schema = current_schema() AND table_name = '_neutron_migrations'`).Scan(&n, &versionType)
-	if err != nil {
-		return HistoryIncompatible, err
-	}
-	if n == 0 {
-		return HistoryAbsent, nil
-	}
-	var hasChecksum, hasOwner, hasFormat bool
-	err = s.QueryRow(ctx, `
-		SELECT
-		  EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '_neutron_migrations' AND column_name = 'checksum'),
-		  EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '_neutron_migrations' AND column_name = 'owner'),
-		  EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '_neutron_migrations' AND column_name = 'format')
-	`).Scan(&hasChecksum, &hasOwner, &hasFormat)
-	if err != nil {
-		return HistoryIncompatible, err
-	}
-	hasV2 := hasChecksum && hasOwner && hasFormat
-	versionType = strings.ToLower(versionType)
-	integer := versionType == "integer" || versionType == "smallint" || versionType == "bigint"
-	text := versionType == "text" || versionType == "character varying" || versionType == "character"
-	switch {
-	case integer && hasV2:
-		return HistoryV2Integer, nil
-	case integer:
-		return HistoryLegacyInteger, nil
-	case text && hasV2:
-		return HistoryV2Text, nil
-	case text:
-		return HistoryLegacyText, nil
-	default:
-		return HistoryIncompatible, fmt.Errorf("_neutron_migrations.version has unsupported type %q", versionType)
-	}
+	return inspectMigrationShape(ctx, s.conn, s.namespace)
+}
+func (s *MigrationSession) InspectMigrationHistory(ctx context.Context) (HistoryShape, error) {
+	return s.inspectShape(ctx)
 }
 
 // readHistoryTx reads history rows inside the adoption transaction, using
 // the checksum column when the table has one (legacy Go SDK tables do; CLI
 // and TS SDK legacy tables do not).
-func readHistoryTx(ctx context.Context, tx pgx.Tx) ([]MigrationRecord, error) {
+func readHistoryTx(ctx context.Context, tx pgx.Tx, n *migrationNamespace) ([]MigrationRecord, error) {
 	var hasChecksum bool
 	if err := tx.QueryRow(ctx, `
 		SELECT EXISTS (
 			SELECT 1 FROM information_schema.columns
-			WHERE table_schema = current_schema()
+			WHERE table_schema = $1
 			  AND table_name = '_neutron_migrations' AND column_name = 'checksum'
-		)`).Scan(&hasChecksum); err != nil {
+		)`, n.schema).Scan(&hasChecksum); err != nil {
 		return nil, err
 	}
 
 	if !hasChecksum {
-		rows, err := tx.Query(ctx, "SELECT version, name, applied_at FROM _neutron_migrations ORDER BY version")
+		rows, err := tx.Query(ctx, "SELECT version, name, applied_at FROM "+n.table()+" ORDER BY version")
 		if err != nil {
 			return nil, err
 		}
@@ -658,7 +605,7 @@ func readHistoryTx(ctx context.Context, tx pgx.Tx) ([]MigrationRecord, error) {
 		return records, rows.Err()
 	}
 
-	rows, err := tx.Query(ctx, "SELECT version, name, applied_at, checksum FROM _neutron_migrations ORDER BY version")
+	rows, err := tx.Query(ctx, "SELECT version, name, applied_at, checksum FROM "+n.table()+" ORDER BY version")
 	if err != nil {
 		return nil, err
 	}

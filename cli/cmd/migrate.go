@@ -243,7 +243,7 @@ func migrateSessionGuard(ctx context.Context, dir string) (*db.Client, *migratio
 // identity-collision check runs before a fresh database's history table is
 // even created.
 func prepareHistoryRun(ctx context.Context, client *db.Client, sess *db.MigrationSession, files []db.MigrationFile) ([]db.MigrationRecord, error) {
-	shape, err := client.InspectMigrationHistory(ctx)
+	shape, err := sess.InspectMigrationHistory(ctx)
 	if err != nil {
 		return nil, err
 	}
