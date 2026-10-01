@@ -364,6 +364,7 @@ func runExtended(out string, n, trials, seconds int, correctnessOnly bool) (err 
 	r := ExtendedReport{Status: "failed", Provenance: provenance()}
 	defer func() {
 		if err != nil {
+			r.Status = "failed"
 			r.Failure = errorCategory(err)
 		}
 		if e := writeJSON(filepath.Join(out, "extended-report.json"), r); e != nil && err == nil {
