@@ -1,4 +1,4 @@
-# Native PostgreSQL read conformance
+# Native PostgreSQL scalar read/write conformance
 
 This standalone operator fixture creates a uniquely named disposable PostgreSQL
 database. It does not use the reference application's schema or migration ledger.
@@ -31,7 +31,8 @@ The fixture covers the ten builtin scalar type kinds admitted by
 and bytea. It checks signed integer boundaries, numeric(40,18), Unicode and empty
 text, NULL, native Python UUID/Decimal/bytes, and byte payloads against an
 independent SQL oracle. Generated models are read representations; this is not
-an insert/update model or an ORM comparison. All three CLI languages must refuse
+an insert/update model or an ORM comparison. Writes below use explicit native
+parameter binding, not generated write authority. All three CLI languages must refuse
 a batch containing an unsupported temporal column without overwriting an existing
 sentinel or producing partial outputs.
 
@@ -51,3 +52,29 @@ exact source into the private runtime and records every source hash. Go and
 Python always use the checkout containing this example. Provenance also records
 the CLI binary hash, generated source hashes before Go's required package header,
 compiler versions, runtime source hashes, and database cleanup outcome.
+
+
+## Native writes and cross-language updates
+
+The same runner also generates a selected-read model for a separate scalar
+`writes` table with a required positive bigint revision. Each of the three
+native clients parameter-binds all ten scalar kinds, reads back signed minima
+and the exact negative numeric boundary, creates a required-present NULL row,
+and conditionally updates the first row to signed maxima, the full-width
+positive decimal, UUID and empty text/bytes. A repeated stale revision changes
+zero rows. Transactions update an existing row, delete the NULL row and insert
+a temporary row; rollback must undo all three effects.
+
+After every language has written its two rows, each language reads and performs
+conditional revision updates on both other writers' rows. It then rejects the
+same stale revisions. All three read the final six rows. The runner compares
+every phase with independently constructed expected values and PostgreSQL
+text/hex oracle queries, including exact revisions beyond JavaScript's safe
+integer range, NULL versus empty, and rollback row absence. Provenance records
+the nine phases, six cross-writer update pairs and final state.
+
+This is a PostgreSQL scalar native-client contract, not equivalent rich ORMs,
+generated write models, temporal writes, Nucleus support, public authentication
+or released-artifact certification. Existing separate temporal read and type
+refusal checks still run. Connection URLs remain private; Go builds stay bounded
+and the 6 GiB free-space guard is checked before and after compilation/consumers.

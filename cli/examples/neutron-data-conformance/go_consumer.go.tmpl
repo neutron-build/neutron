@@ -24,16 +24,7 @@ func main() {
 	must(err)
 	out := make([]map[string]any, 0, len(rows))
 	for _, r := range rows {
-		b, err := json.Marshal(r)
-		must(err)
-		var m map[string]any
-		must(json.Unmarshal(b, &m))
-		if r.I8 != nil {
-			m["i8"] = fmt.Sprint(*r.I8)
-		}
-		if r.Payload != nil {
-			m["payload"] = hex.EncodeToString(*r.Payload)
-		}
+		m := normalize(r, r.I8, r.Payload)
 		out = append(out, m)
 	}
 	t, err := nucleus.QueryOne[Temporal](ctx, db.SQL(), "SELECT happened FROM fixture.temporal")
@@ -41,10 +32,28 @@ func main() {
 	if t.Happened.Nanosecond() != 123456000 {
 		panic("microsecond loss")
 	}
-	must(json.NewEncoder(os.Stdout).Encode(map[string]any{"rows": out, "temporal": t.Happened.UTC().Format("2006-01-02T15:04:05.000000-07:00")}))
+	response := map[string]any{"rows": out, "temporal": t.Happened.UTC().Format("2006-01-02T15:04:05.000000-07:00")}
+	if writes := writeConformance(ctx, db); writes != nil {
+		response["writes"] = writes
+	}
+	must(json.NewEncoder(os.Stdout).Encode(response))
 }
 func must(err error) {
 	if err != nil {
 		panic(err)
 	}
+}
+
+func normalize(row any, i8 *int64, payload *[]byte) map[string]any {
+	b, err := json.Marshal(row)
+	must(err)
+	var m map[string]any
+	must(json.Unmarshal(b, &m))
+	if i8 != nil {
+		m["i8"] = fmt.Sprint(*i8)
+	}
+	if payload != nil {
+		m["payload"] = hex.EncodeToString(*payload)
+	}
+	return m
 }

@@ -8,6 +8,7 @@ from uuid import UUID
 from pydantic import BaseModel, ValidationError
 from neutron.nucleus.client import NucleusClient
 from scalars import Scalars
+from write_conformance import writes
 
 class Temporal(BaseModel):
     happened: datetime
@@ -33,7 +34,8 @@ async def main():
             return {k: (v.hex() if isinstance(v, bytes) else str(v) if isinstance(v, (Decimal, UUID)) or k == "i8" and v is not None else v) for k, v in r.model_dump().items()}
         temporal = await db.sql.query_one(Temporal, "SELECT happened FROM fixture.temporal")
         assert temporal.happened.utcoffset().total_seconds() == 0
-        print(json.dumps({"rows": [norm(r) for r in rows], "temporal": temporal.happened.isoformat(timespec="microseconds")}))
+        write_rows = await writes(db)
+        print(json.dumps({**({"writes":write_rows} if write_rows is not None else {}), "rows": [norm(r) for r in rows], "temporal": temporal.happened.isoformat(timespec="microseconds")}))
     finally:
         await db.close()
 asyncio.run(main())
