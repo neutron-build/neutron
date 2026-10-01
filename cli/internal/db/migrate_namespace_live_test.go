@@ -222,3 +222,62 @@ func TestMigrationNamespaceIgnoresCatalogShadowsPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestMigrationNamespaceVersionDomainMasqueradePostgres(t *testing.T) {
+	c := lockNamespaceClient(t, false)
+	ctx := context.Background()
+	conn, err := c.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema string
+	if err = conn.QueryRow(ctx, "SELECT pg_catalog.current_schema()").Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	typ := pgx.Identifier{schema, "text"}.Sanitize()
+	table := pgx.Identifier{schema, "_neutron_migrations"}.Sanitize()
+	if _, err = conn.Exec(ctx, "CREATE DOMAIN "+typ+" AS pg_catalog.text; CREATE TABLE "+table+"(version "+typ+" PRIMARY KEY,name pg_catalog.text,applied_at timestamptz,checksum pg_catalog.text,owner pg_catalog.text,format pg_catalog.text);INSERT INTO "+table+"(version,name,format)VALUES('001','foreign','v2')"); err != nil {
+		t.Fatal(err)
+	}
+	// With pg_catalog explicitly after the application schema, format_type
+	// displays the domain as text. Actual OID/kind/namespace must still refuse.
+	var displayed, kind string
+	if err = conn.QueryRow(ctx, "SELECT pg_catalog.format_type(t.oid,NULL),t.typtype::text FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname=$1 AND t.typname='text'", schema).Scan(&displayed, &kind); err != nil || displayed != "text" || kind != "d" {
+		t.Fatalf("domain control %q %q: %v", displayed, kind, err)
+	}
+	conn.Release()
+	if _, err = c.InspectMigrationHistory(ctx); err == nil {
+		t.Fatal("inspect admitted domain")
+	}
+	if _, err = c.AppliedMigrations(ctx); err == nil {
+		t.Fatal("applied admitted domain")
+	}
+	if _, err = c.HasMigrationHistory(ctx); err == nil {
+		t.Fatal("has admitted domain")
+	}
+	if session, err := c.LockMigrations(ctx); err == nil {
+		session.Release()
+		t.Fatal("locked domain history")
+	}
+	var rows, locks int
+	if err = c.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&rows); err != nil || rows != 1 {
+		t.Fatalf("domain ledger changed: %d %v", rows, err)
+	}
+	if err = c.QueryRow(ctx, "SELECT count(*) FROM pg_catalog.pg_locks WHERE locktype='advisory' AND pid=pg_catalog.pg_backend_pid()").Scan(&locks); err != nil || locks != 0 {
+		t.Fatalf("domain took lock: %d %v", locks, err)
+	}
+	if err = c.Exec(ctx, "DROP TABLE "+table+";CREATE TABLE "+table+"(version pg_catalog.text PRIMARY KEY,name pg_catalog.text,applied_at timestamptz DEFAULT pg_catalog.now(),checksum pg_catalog.text,owner pg_catalog.text,format pg_catalog.text)"); err != nil {
+		t.Fatal(err)
+	}
+	if shape, err := c.InspectMigrationHistory(ctx); err != nil || shape != HistoryV2Text {
+		t.Fatalf("builtin type hidden by domain: %v %v", shape, err)
+	}
+	session, err := c.LockMigrations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Release()
+	if err = session.ApplyMigration(ctx, MigrationFile{Version: "002", Name: "builtin", SQL: "SELECT 1"}); err != nil {
+		t.Fatal(err)
+	}
+}

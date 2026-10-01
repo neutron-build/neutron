@@ -49,6 +49,11 @@ func captureMigrationNamespace(ctx context.Context, q migrationQuerier) (*migrat
 	if visible != nil && *visible != n.historyOID {
 		return nil, fmt.Errorf("migration history is shadowed by a temporary or later search_path relation")
 	}
+	if n.historyOID != 0 {
+		if _, err := inspectMigrationShape(ctx, q, n); err != nil {
+			return nil, err
+		}
+	}
 	return n, nil
 }
 func (n *migrationNamespace) validate(ctx context.Context, q migrationQuerier) error {
@@ -87,16 +92,24 @@ func inspectMigrationShape(ctx context.Context, q migrationQuerier, n *migration
 	if n.historyOID == 0 {
 		return HistoryAbsent, nil
 	}
-	rows, err := q.Query(ctx, "SELECT a.attname,pg_catalog.format_type(a.atttypid,NULL) FROM pg_catalog.pg_attribute a WHERE a.attrelid=$1 AND a.attnum>0 AND NOT a.attisdropped", n.historyOID)
+	rows, err := q.Query(ctx, "SELECT a.attname,pg_catalog.format_type(a.atttypid,NULL),t.oid,t.typtype::text,ns.nspname,t.typname FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type t ON t.oid=a.atttypid JOIN pg_catalog.pg_namespace ns ON ns.oid=t.typnamespace WHERE a.attrelid=$1 AND a.attnum>0 AND NOT a.attisdropped", n.historyOID)
 	if err != nil {
 		return HistoryIncompatible, err
 	}
 	defer rows.Close()
 	cols := map[string]string{}
 	for rows.Next() {
-		var name, typ string
-		if err := rows.Scan(&name, &typ); err != nil {
+		var name, typ, kind, namespace, typeName string
+		var oid uint32
+		if err := rows.Scan(&name, &typ, &oid, &kind, &namespace, &typeName); err != nil {
 			return HistoryIncompatible, err
+		}
+		if name == "version" {
+			allowed := map[uint32]string{20: "int8", 21: "int2", 23: "int4", 25: "text", 1042: "bpchar", 1043: "varchar"}
+			if expected, ok := allowed[oid]; !ok || kind != "b" || namespace != "pg_catalog" || typeName != expected {
+				return HistoryIncompatible, fmt.Errorf("_neutron_migrations.version requires an actual builtin integer/text type; got %q.%q (OID %d, kind %q)", namespace, typeName, oid, kind)
+			}
+			typ = map[uint32]string{20: "bigint", 21: "smallint", 23: "integer", 25: "text", 1042: "character", 1043: "character varying"}[oid]
 		}
 		cols[name] = typ
 	}
