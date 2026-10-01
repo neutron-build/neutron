@@ -99,6 +99,7 @@ class LiveWorker(unittest.IsolatedAsyncioTestCase):
         class GatedSQL:
             def __init__(self, sql): self.sql = sql
             async def query(self, *args): return await self.sql.query(*args)
+            async def query_one(self, *args): return await self.sql.query_one(*args)
             async def execute(self, sql, *args):
                 result = await self.sql.execute(sql, *args)
                 if 'INSERT INTO public.results' in sql:
@@ -133,6 +134,7 @@ class LiveWorker(unittest.IsolatedAsyncioTestCase):
         class GatedSQL:
             def __init__(self, sql): self.sql = sql
             async def query(self, *args): return await self.sql.query(*args)
+            async def query_one(self, *args): return await self.sql.query_one(*args)
             async def execute(self, sql, *args):
                 result = await self.sql.execute(sql, *args)
                 if 'INSERT INTO public.results' in sql:
@@ -151,6 +153,49 @@ class LiveWorker(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError): await finishing
         self.assertEqual(await self.oracle.fetchval('SELECT count(*) FROM results WHERE document_id=$1', self.document), 0)
         self.assertTrue(await asyncio.wait_for(self.worker.finish(*claimed), 2))
+
+    async def test_expiry_during_row_lock_wait_does_not_insert_result(self):
+        self.worker.lease_ms = 500
+        claimed = await self.worker.claim()
+        blocker = self.oracle.transaction()
+        await blocker.start()
+        await self.oracle.execute('SELECT 1 FROM public.jobs WHERE document_id=$1 FOR UPDATE', self.document)
+        self.assertTrue(await self.oracle.fetchval('SELECT pg_catalog.clock_timestamp()<$1::timestamptz', claimed[0].lease_until))
+        actual_transaction = self.db.transaction
+        insert_attempts = []
+        class TracedSQL:
+            def __init__(self, sql): self.sql = sql
+            async def query(self, *args): return await self.sql.query(*args)
+            async def query_one(self, *args): return await self.sql.query_one(*args)
+            async def execute(self, sql, *args):
+                if 'INSERT INTO public.results' in sql: insert_attempts.append(sql)
+                return await self.sql.execute(sql, *args)
+        @asynccontextmanager
+        async def traced_transaction():
+            async with actual_transaction() as tx:
+                tx.sql = TracedSQL(tx.sql)
+                yield tx
+        with patch.object(self.db, 'transaction', traced_transaction):
+            finishing = asyncio.create_task(self.worker.finish(*claimed))
+            try:
+                async def observe_wait():
+                    while True:
+                        await self.oracle.execute('SELECT pg_catalog.pg_stat_clear_snapshot()')
+                        waiting = await self.oracle.fetchval('''SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_stat_activity a
+                            WHERE a.datname=pg_catalog.current_database()
+                            AND $1=ANY(pg_catalog.pg_blocking_pids(a.pid)))''', self.oracle.get_server_pid())
+                        if waiting: return
+                        await asyncio.sleep(0.01)
+                await asyncio.wait_for(observe_wait(), 2)
+                async def observe_expiry():
+                    while await self.oracle.fetchval('SELECT pg_catalog.clock_timestamp()<$1::timestamptz', claimed[0].lease_until):
+                        await asyncio.sleep(0.01)
+                await asyncio.wait_for(observe_expiry(), 2)
+            finally:
+                await blocker.rollback()
+            self.assertFalse(await asyncio.wait_for(finishing, 2))
+        self.assertEqual(insert_attempts, [])
+        self.assertEqual(await self.oracle.fetchval('SELECT count(*) FROM results WHERE document_id=$1', self.document), 0)
 
     async def test_process_death_after_claim_reclaims_without_duplicate_result(self):
         child_code = """

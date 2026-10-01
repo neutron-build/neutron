@@ -45,9 +45,12 @@ class Document(BaseModel):
     created_at: datetime
 
 
-class FinishState(BaseModel):
+class LockedJob(BaseModel):
     claim_token: UUID | None
     status: str
+
+
+class FinishState(LockedJob):
     unexpired: bool
 
 
@@ -76,7 +79,7 @@ class Worker:
                 ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname='jobs'
                 AND c.relowner=r.oid) AS owner,
               (SELECT revision FROM public.app_schema_revision WHERE singleton) AS revision,
-              current_setting('server_version_num')::integer / 10000 AS server_major
+              pg_catalog.current_setting('server_version_num')::integer / 10000 AS server_major
             FROM pg_catalog.pg_roles r WHERE r.rolname=current_user''')
         suffix = '_worker_' + self.tenant[-1]
         if (identity.role != identity.login or not identity.role.endswith(suffix)
@@ -95,7 +98,7 @@ class Worker:
                 WITH exhausted AS (
                   SELECT tenant_id,document_id FROM public.jobs
                   WHERE tenant_id=$1 AND status='processing' AND attempts=3
-                    AND lease_until <= clock_timestamp()
+                    AND lease_until <= pg_catalog.clock_timestamp()
                   ORDER BY document_id LIMIT 1 FOR UPDATE SKIP LOCKED
                 ) UPDATE public.jobs j SET status='failed',claim_token=NULL,
                     lease_until=NULL,failure_code='attempts_exhausted'
@@ -105,10 +108,10 @@ class Worker:
                 WITH candidate AS (
                   SELECT tenant_id,document_id FROM public.jobs
                   WHERE tenant_id=$1 AND attempts<3
-                    AND (status='pending' OR (status='processing' AND lease_until <= clock_timestamp()))
+                    AND (status='pending' OR (status='processing' AND lease_until <= pg_catalog.clock_timestamp()))
                   ORDER BY document_id LIMIT 1 FOR UPDATE SKIP LOCKED
                 ) UPDATE public.jobs j SET status='processing',attempts=j.attempts+1,
-                    claim_token=$2,lease_until=clock_timestamp()+($3::integer*interval '1 millisecond'),
+                    claim_token=$2,lease_until=pg_catalog.clock_timestamp()+($3::integer*interval '1 millisecond'),
                     failure_code=NULL
                   FROM candidate c WHERE j.tenant_id=c.tenant_id AND j.document_id=c.document_id
                   RETURNING j.document_id,j.claim_token,j.attempts,j.lease_until''',
@@ -129,11 +132,20 @@ class Worker:
         try:
             async with self.db.transaction() as tx:
                 await tx.sql.execute("SET LOCAL statement_timeout = '5s'")
-                rows = await tx.sql.query(FinishState, '''
-                    SELECT claim_token,status,COALESCE(lease_until > clock_timestamp(), false) AS unexpired
+                rows = await tx.sql.query(LockedJob, '''
+                    SELECT claim_token,status
                     FROM public.jobs WHERE tenant_id=$1 AND document_id=$2 FOR UPDATE''',
                     self.tenant, claim.document_id)
-                if not rows or rows[0].claim_token != claim.claim_token or rows[0].status != 'processing' or not rows[0].unexpired:
+                if not rows or rows[0].claim_token != claim.claim_token or rows[0].status != 'processing':
+                    return False
+                # PostgreSQL may evaluate target expressions before a row-lock
+                # wait. Evaluate wall-clock expiry in a new statement AFTER the
+                # lock-only query has returned.
+                state = await tx.sql.query_one(FinishState, '''
+                    SELECT claim_token,status,COALESCE(lease_until > pg_catalog.clock_timestamp(), false) AS unexpired
+                    FROM public.jobs WHERE tenant_id=$1 AND document_id=$2''',
+                    self.tenant, claim.document_id)
+                if not state.unexpired:
                     return False
                 await tx.sql.execute('''
                     INSERT INTO public.results(tenant_id,document_id,content_digest,word_count)
@@ -144,7 +156,7 @@ class Worker:
                 acknowledged = await tx.sql.execute('''
                     UPDATE public.jobs SET status='done',claim_token=NULL,lease_until=NULL,failure_code=NULL
                     WHERE tenant_id=$1 AND document_id=$2 AND claim_token=$3
-                      AND status='processing' AND lease_until > clock_timestamp()''',
+                      AND status='processing' AND lease_until > pg_catalog.clock_timestamp()''',
                     self.tenant, claim.document_id, claim.claim_token)
                 if acknowledged != 1:
                     raise LeaseLost('lease expired before acknowledgement')
