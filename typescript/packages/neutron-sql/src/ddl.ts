@@ -82,7 +82,7 @@ export function sqlTypeOf(col: AnyColumnBuilder): string {
     case "real":
       return "real";
     case "numeric":
-      return "numeric";
+      return col.numericPrecision !== undefined ? `numeric(${col.numericPrecision},${col.numericScale})` : "numeric";
     case "text":
       return "text";
     case "varchar":

@@ -142,6 +142,10 @@ export class ColumnBuilder<
   canonicalText = false;
   varcharLength?: number;
   vectorDimensions?: number;
+  /** Declared NUMERIC(p,s) typmod on a numeric column (both set together;
+   *  precision-only normalizes to scale 0). Unset = unconstrained numeric. */
+  numericPrecision?: number;
+  numericScale?: number;
   nowDefault = false;
   foreignKey?: ForeignKeyRef;
   ownerTable?: AnyPgTable;
@@ -917,6 +921,8 @@ function cloneColumnForView(column: AnyColumnBuilder, view: AnyPgTable): AnyColu
   c.valueDecoder = column.valueDecoder;
   c.varcharLength = column.varcharLength;
   c.vectorDimensions = column.vectorDimensions;
+  c.numericPrecision = column.numericPrecision;
+  c.numericScale = column.numericScale;
   c.arrayDimensions = column.arrayDimensions;
   c.enumDef = column.enumDef;
   c.identityKind = column.identityKind;
@@ -1286,20 +1292,66 @@ export function double(name: string): ColumnBuilder<"double", false, false> {
 export function real(name: string): ColumnBuilder<"real", false, false> {
   return new ColumnBuilder(name, "real");
 }
+/** Options for the numeric() column factory: an optional declared typmod
+ *  (precision/scale — the emitted SQL type is NUMERIC(p,s)) alongside the
+ *  optional user decoder over the exact decimal string. Value semantics are
+ *  unchanged by the typmod: reads stay exact strings (or the decoder's
+ *  return value), and PostgreSQL coerces/rounds stored values to the
+ *  declared scale. */
+export interface NumericColumnOptions<D extends (raw: string) => unknown = (raw: string) => unknown> extends NumericOptions<D> {
+  /** Total digit count of NUMERIC(p,s): integer 1..1000. Precision-only
+   *  normalizes to scale 0. */
+  precision?: number;
+  /** Fractional digit count: integer 0..precision; requires precision. */
+  scale?: number;
+}
+
+/** Validate and apply the shared-contract numeric typmod: precision integer
+ *  1..1000, scale integer 0..precision, scale requires precision (the exact
+ *  subset the Go schema-v2 contract admits — PostgreSQL's wider domain,
+ *  negative scale and scale > precision, is deliberately excluded). Invalid
+ *  values are rejected here, before any SQL is produced: no clamping, no
+ *  silent coercion. */
+function applyNumericTypmod(
+  c: ColumnBuilder<"numeric", boolean, boolean, unknown>,
+  name: string,
+  precision: number | undefined,
+  scale: number | undefined,
+): void {
+  const who = `numeric("${name}")`;
+  if (precision === undefined && scale === undefined) return;
+  if (precision === undefined) {
+    throw new Error(`${who}: scale requires precision — declare { precision } (scale 0) or { precision, scale }; scale without precision has no SQL spelling`);
+  }
+  if (!Number.isInteger(precision) || precision < 1 || precision > 1000) {
+    throw new Error(`${who}: precision must be an integer within 1..1000, got ${String(precision)}`);
+  }
+  const effectiveScale = scale ?? 0;
+  if (!Number.isInteger(effectiveScale) || effectiveScale < 0 || effectiveScale > precision) {
+    throw new Error(`${who}: scale must be an integer within 0..precision (${precision}), got ${String(scale)}`);
+  }
+  c.numericPrecision = precision;
+  c.numericScale = effectiveScale;
+}
+
 /** Exact decimal column: reads as the exact decimal string (scale and
- *  trailing zeros preserved). An optional user decoder converts the exact
- *  string and owns any precision narrowing. */
-export function numeric(name: string, opts?: { decoder?: undefined }): ColumnBuilder<"numeric", false, false>;
+ *  trailing zeros preserved — with a declared typmod, the exact DATABASE
+ *  value after PostgreSQL coercion, not the input digits). An optional user
+ *  decoder converts the exact string and owns any precision narrowing. An
+ *  optional { precision, scale } declares the NUMERIC(p,s) typmod in DDL
+ *  and schema export v2. */
+export function numeric(name: string, opts?: { decoder?: undefined; precision?: number; scale?: number }): ColumnBuilder<"numeric", false, false>;
 export function numeric<D extends (raw: string) => unknown>(
   name: string,
-  opts: { decoder: D },
+  opts: { decoder: D; precision?: number; scale?: number },
 ): ColumnBuilder<"numeric", false, false, ReturnType<D>>;
-export function numeric(name: string, opts: NumericOptions = {}): ColumnBuilder<"numeric", false, false, unknown> {
+export function numeric(name: string, opts: NumericColumnOptions = {}): ColumnBuilder<"numeric", false, false, unknown> {
   const c = new ColumnBuilder<"numeric", false, false, string>(name, "numeric");
   if (opts.decoder !== undefined) {
     if (typeof opts.decoder !== "function") throw new Error(`numeric("${name}"): decoder must be a function`);
     c.valueDecoder = opts.decoder;
   }
+  applyNumericTypmod(c, name, opts.precision, opts.scale);
   return c as unknown as ColumnBuilder<"numeric", false, false, unknown>;
 }
 export function text(name: string): ColumnBuilder<"text", false, false> {
