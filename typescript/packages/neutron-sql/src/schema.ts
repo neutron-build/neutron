@@ -1248,6 +1248,21 @@ export function isTableRelations(value: unknown): value is TableRelations {
   );
 }
 
+/** Fail closed when a relation entry's TARGET table is schema-qualified:
+ *  relational reads resolve targets by bare table name and render unqualified
+ *  `from` entries, so a pgSchema-declared target would silently read the
+ *  search-path twin instead of the declared table. */
+export function rejectQualifiedRelationTargets(set: TableRelations, who: string): void {
+  for (const [key, rel] of Object.entries(set.entries)) {
+    const schema = getTableSchema(rel.targetTable);
+    if (schema !== undefined) {
+      throw new Error(
+        `${who}.${key}: target "${schema}"."${getTableName(rel.targetTable)}" declares a schema — relational reads on schema-qualified tables land with Q05/Q07`,
+      );
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Column helpers
 // ---------------------------------------------------------------------------

@@ -61,6 +61,7 @@ import {
   isPgTable,
   isTableRelations,
   rejectDerivedTable,
+  rejectQualifiedRelationTargets,
   type AnyColumnBuilder,
   type AnyPgTable,
   type ColumnBuilder,
@@ -539,6 +540,7 @@ export async function createDatabase<
         `relations.${key}: "${schema}"."${getTableName(value.table)}" declares a schema — relational reads on schema-qualified tables land with Q05/Q07`,
       );
     }
+    rejectQualifiedRelationTargets(value, `relations.${key}`);
     relationsByName.set(getTableName(value.table), value);
     relationSets.push(value);
   }
