@@ -118,7 +118,7 @@ Directive mapping:
 | `enum Role {...}` | `pgEnum("role", ["..."])` | runtime membership validation; `mySchema.enum(...)` inside a `pgSchema` |
 | `Json` | `json` / `jsonb` | SQL NULL vs JSON null distinguished on writes via the `jsonNull` sentinel |
 | `Bytes` | `bytea` | reads/writes `Uint8Array` |
-| `Decimal @db.Decimal(p, s)` | `numeric("col")` — **unconstrained** | see the numeric note below |
+| `Decimal @db.Decimal(p, s)` | `numeric("col", { precision: p, scale: s })` | see the numeric note below |
 | `DateTime` | `timestamp` / `timestamptz` | reads are canonical strings by default, not `Date` — see value semantics |
 | `@updatedAt` | **no equivalent** | set the value in your update calls, or create a DB-side trigger through your existing migration runner |
 
@@ -138,7 +138,9 @@ renaming imports and method spellings. The differences that bite:
   (the number mode is a checked safe-integer mode, not a silent cast).
 - **numeric reads as an exact decimal string** (scale and trailing zeros
   preserved); an optional `numeric("col", { decoder })` narrows it, and a
-  decoder that narrows to number owns the precision loss.
+  decoder that narrows to number owns the precision loss. An optional
+  `{ precision, scale }` declares the `NUMERIC(p,s)` typmod in DDL (see the
+  numeric note below).
 - Joins take `alias()` handles, not raw tables: ``const p = alias(posts, "p")``,
   then ``.leftJoin(p, sql`${p.userId} = ${users.id}`)``.
 - Nested reads are registered on the database (`relations` passed to
@@ -148,15 +150,17 @@ renaming imports and method spellings. The differences that bite:
 
 These are refusals, not gaps that silently degrade:
 
-- **`numeric(p, s)` is not declarable at the time of writing** (capability
-  matrix row 1.4: inspected absence). The current API is `numeric(name)` /
-  `numeric(name, { decoder })` — unconstrained `NUMERIC`, exact-string reads.
-  If your Prisma `@db.Decimal(10, 2)` or Drizzle `numeric("x", { precision:
-  10, scale: 2 })` constraint matters, keep it in the SQL DDL your existing
-  migration runner owns; a Neutron schema declaring plain `numeric("x")`
-  against that column still reads and writes it exactly. Do not put
-  precision/scale options into Neutron snippets — they do not exist at this
-  revision.
+- **`numeric(p, s)` declarable on the shared contract subset** (capability
+  matrix row 1.4, implemented): `numeric("col", { precision: 10, scale: 2 })`
+  emits `numeric(10,2)` DDL and exports the typmod in schema-v2 — precision
+  integer 1..1000, scale integer 0..precision, scale requires precision,
+  precision-only normalizes to scale 0, and invalid values are refused at
+  declaration (no clamping). `numeric("col")` stays unconstrained `NUMERIC`
+  with exact-string reads, and `{ decoder }` combines with the typmod.
+  PostgreSQL itself also allows negative scale and scale > precision; those are
+  deliberately outside the shared cross-language contract — if your existing
+  column uses them, keep that DDL with your existing migration runner and
+  declare plain `numeric("col")` against it (reads and writes stay exact).
 - **Arrays of temporal/bytea/vector/serial elements are refused**
   (row 1.13, deliberately outside scope): `.array()` supports a fixed set of
   scalar element kinds and throws for the rest, because no lossless
@@ -330,7 +334,7 @@ await db.transaction(
 |---|---|---|
 | int2/int4/serial | `number` | same as both |
 | int8/bigint | `bigint` (default) / `string` / safe-checked `number` via mode | Prisma `BigInt`, Drizzle `bigint({ mode })` |
-| numeric | exact decimal `string`; optional `decoder` | Prisma `Decimal` object, Drizzle `numeric` string |
+| numeric | exact decimal `string`; optional `decoder`; optional `{ precision, scale }` DDL typmod | Prisma `Decimal` object, Drizzle `numeric` string |
 | float4/float8 | `number` (non-finite rejected on write) | same |
 | timestamp/timestamptz | canonical microsecond string (default) or `Date` via `mode: "date"` (ms-truncated) | Prisma `DateTime` → `Date`; Drizzle `timestamp` → `Date` |
 | date | `YYYY-MM-DD` string (Dates rejected on write) | |
@@ -418,7 +422,7 @@ covers.
 
 | Row | Limitation | Status at this revision |
 |---|---|---|
-| 1.4 | `numeric(p, s)` not declarable; unconstrained `numeric(name)` / `numeric(name, { decoder })` only | inspected absence — declare precision in runner-owned SQL |
+| 1.4 | `numeric(p, s)` declarable on the shared-contract subset (precision 1..1000, scale 0..precision); negative scale / scale > precision remain outside the contract | implemented — declare via `numeric(name, { precision, scale })`; runner-owned SQL for the wider domain |
 | 1.13 | arrays of temporal/bytea/vector/serial elements refused | deliberately outside scope |
 | 1.16 | virtual generated columns refused | deliberately outside scope |
 | 1.20 | schema-qualified tables rejected by relational reads (`db.query`) | inspected absence — use CRUD/join builders |
