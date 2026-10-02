@@ -103,7 +103,7 @@
 
 .saveNameInput:focus {
   outline: none;
-  border-color: var(--accent);
+  border-color: var(--border-focus);
 }
 
 .saveConfirmBtn {
