@@ -408,5 +408,5 @@
 
 .permissions { position: relative; margin-left: 8px; font-family: var(--font-sans); font-size: 11px; color: var(--text-secondary); }
 .permissions summary { cursor: pointer; border: 1px solid var(--border); border-radius: 5px; padding: 3px 7px; white-space: nowrap; }
-.permissions summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.permissions summary:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 2px; }
 .permissions p { position: absolute; top: calc(100% + 8px); left: 0; z-index: 20; width: min(320px, 70vw); padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--bg-overlay); box-shadow: var(--shadow-md); font-size: 12px; line-height: 1.6; }
