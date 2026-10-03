@@ -5,6 +5,7 @@ import threading
 import inspect
 from typing import Any, Callable, Iterator, Mapping, Sequence, TypeVar, cast
 from .client import AsyncDatabase, Database
+from .observability import QueryObserver
 from .core import CardinalityError, OrmError, Predicate, SessionBusyError, delete, insert, select_row, update, Mutation, _bound_quote
 from .lifecycle import TransactionHandle
 from .events import EVENT_NAMES, EventName, SessionEvent, PostCommitError, PostCommitInterruptedError
@@ -430,8 +431,8 @@ class Session(_SessionState):
         self._owner=threading.get_ident();self._close_database=close_database
 
     @classmethod
-    def connect(cls,url: str,*,autobegin: bool=True,autoflush: bool=True,expire_on_commit: bool=False) -> Session:
-        return cls(Database.connect(url),autobegin=autobegin,autoflush=autoflush,close_database=True,expire_on_commit=expire_on_commit)
+    def connect(cls,url: str,*,autobegin: bool=True,autoflush: bool=True,expire_on_commit: bool=False,observer: QueryObserver|None=None) -> Session:
+        return cls(Database.connect(url,observer=observer),autobegin=autobegin,autoflush=autoflush,close_database=True,expire_on_commit=expire_on_commit)
 
     def listen(self,event: EventName,callback: Callable[[SessionEvent],None]) -> None:
         self._guard()

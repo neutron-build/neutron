@@ -4,6 +4,7 @@ import asyncio
 import inspect
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Sequence, TypeVar, cast
+from .observability import QueryObserver
 from .client import AsyncDatabase
 from .core import CardinalityError, OrmError, Predicate, SessionBusyError, delete, insert, select_row, update, Mutation
 from .lifecycle import AsyncTransactionHandle
@@ -27,8 +28,8 @@ class AsyncSession(_SessionState):
         if self._owner is None: raise SessionBusyError('AsyncSession requires an owning asyncio task')
 
     @classmethod
-    async def connect(cls,url: str,*,autobegin: bool=True,autoflush: bool=True,expire_on_commit: bool=False) -> AsyncSession:
-        return cls(await AsyncDatabase.connect(url),autobegin=autobegin,autoflush=autoflush,close_database=True,expire_on_commit=expire_on_commit)
+    async def connect(cls,url: str,*,autobegin: bool=True,autoflush: bool=True,expire_on_commit: bool=False,observer: QueryObserver|None=None) -> AsyncSession:
+        return cls(await AsyncDatabase.connect(url,observer=observer),autobegin=autobegin,autoflush=autoflush,close_database=True,expire_on_commit=expire_on_commit)
 
     def listen(self,event: EventName,callback: Callable[[SessionEvent],Awaitable[None] | None]) -> None:
         self._guard()

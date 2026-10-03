@@ -624,3 +624,22 @@ Typed equality/membership qualify the extension's operator schema, including
 when it is outside the search path. Sync/async mapping, replacement and rollback
 share the contract. Other extension families (`halfvec`, `sparsevec`, bit) and
 vector primary-key identity require separate qualification and are unsupported.
+
+Pass `observer=QueryObserver(capacity=256)` to native `Database.connect`,
+`AsyncDatabase.connect`, `Session.connect` or `AsyncSession.connect`. The shared
+observer holds a bounded queue (up to 4096 events), saturating counters and total
+duration; `drain()` returns immutable events and clears the queue. Dropped events
+have an explicit counter. Events contain only fixed operation/outcome labels,
+monotonic duration, decoded/fetched or consumed row count, sanitized SQLSTATE and
+whether execution used an owned transaction. They never store SQL text,
+identifiers, parameters, credentials, URLs, result objects or exception messages.
+No observer callbacks run inside native or commit boundaries.
+
+Counts cover dispatched public data reads/execute and one event per completed
+stream lifetime, including early stop, native failure and cancellation. Refused
+operations before dispatch do not count; implicit RETURNING ownership records
+one query. Startup probes, metadata admission and transaction-control statements
+are excluded from these data-operation counters. Stream duration includes its
+context lifetime and cleanup; each consumed row is counted once. Metrics/event
+export is explicit and can occur after commit. Request lifecycle/framework and
+OTel export examples are a separate required P34 slice.

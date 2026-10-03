@@ -292,3 +292,10 @@ def static_vector_consumer(db: Database) -> None:
 
 async def static_async_vector_consumer(db: AsyncDatabase) -> None:
     assert_type(await db.vector_spec('extensions'),ColumnSpec[PgVector])
+
+from neutron.orm import QueryEvent,QueryMetrics,QueryObserver
+
+def static_observer_consumer() -> None:
+    observer=QueryObserver(capacity=256)
+    assert_type(observer.drain(),tuple[QueryEvent,...])
+    assert_type(observer.metrics,QueryMetrics)

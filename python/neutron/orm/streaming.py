@@ -8,6 +8,7 @@ import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Generic, Iterator, TypeVar
 from uuid import uuid4
 from .client import AsyncDatabase, Database, _native, _check_result_oids
+from .observability import _Measurement
 from .core import OrmError, Select, SessionBusyError
 from .json_value import native_params
 from .query import Query
@@ -73,6 +74,7 @@ class Stream(Generic[T],Iterator[T]):
     def __init__(self,db: Database,query: Select[T] | Query[T],batch_size: int) -> None:
         _validate(query,batch_size)
         self._db=db;self._compiled=query.compile();validate_scope_sql(self._compiled.sql);self._batch_size=batch_size
+        self._measurement=_Measurement(db._observer,'stream');self._measurement.rows=0
         self._buffer: deque[Any]=deque();self._cursor: Any=None;self._tx: Any=None;self._lease: Any=None
         self._token: object | None=None;self._owner: int | None=None
         self._open=False;self._entered=False;self._drained=False;self._failed=False;self._acquired=False
@@ -88,9 +90,11 @@ class Stream(Generic[T],Iterator[T]):
             if self._tx is not None:
                 with self._db._conn.cursor() as control: control.execute('SET TRANSACTION READ ONLY')
             self._cursor=self._db._conn.cursor(name='neutron_stream_'+uuid4().hex,scrollable=False,withhold=False,**({'binary':True} if self._db._native_binary else {}))
+            self._measurement.dispatch(owned=self._db._owner is not None)
             self._cursor.execute(self._compiled.sql,native_params(self._compiled.params))
             return self
         except BaseException as exc:
+            self._measurement.note_error(exc)
             if self._acquired or self._tx is not None:
                 self._failed=True;self._db._rollback_only=True
                 try: self._finish(False)
@@ -115,13 +119,17 @@ class Stream(Generic[T],Iterator[T]):
                 if len(rows)>self._batch_size: raise OrmError('native cursor exceeded batch bound')
                 self._buffer.extend(rows)
                 if not rows: self._drained=True;raise StopIteration
-            return self._compiled.decode(self._buffer.popleft())
+            result=self._compiled.decode(self._buffer.popleft())
+            self._measurement.rows=(self._measurement.rows or 0)+1
+            return result
         except StopIteration:
             if not self._drained:
                 self._failed=True;self._db._rollback_only=True
+                self._measurement.note_error(OrmError('stream decoder cannot end iteration'))
                 raise OrmError('stream decoder cannot end iteration')
             raise
         except BaseException as exc:
+            self._measurement.note_error(exc)
             self._failed=True;self._db._rollback_only=True
             if isinstance(exc,Exception) and not isinstance(exc,(OrmError,ValueError,TypeError)): raise _native(exc) from exc
             raise
@@ -145,13 +153,15 @@ class Stream(Generic[T],Iterator[T]):
             except BaseException as exc:
                 error=exc
                 if self._db.closed and tx.state=='active': tx.rollback()
+        self._measurement.finish(error)
         if error is not None:
             if isinstance(error,Exception) and not isinstance(error,OrmError): raise _native(error) from error
             raise error
 
     def __exit__(self,kind: Any,error: Any,traceback: Any) -> None:
         if threading.get_ident()!=self._owner: raise SessionBusyError('stream belongs to another thread')
-        if error is not None: self._failed=True;self._db._rollback_only=True
+        if error is not None:
+            self._measurement.note_error(error);self._failed=True;self._db._rollback_only=True
         try: self._finish(error is None and self._drained and not self._failed)
         except BaseException as cleanup:
             if isinstance(error,KeyboardInterrupt): raise error from cleanup
@@ -162,6 +172,7 @@ class AsyncStream(Generic[T],AsyncIterator[T]):
     def __init__(self,db: AsyncDatabase,query: Select[T] | Query[T],batch_size: int) -> None:
         _validate(query,batch_size)
         self._db=db;self._compiled=query.compile();validate_scope_sql(self._compiled.sql);self._batch_size=batch_size
+        self._measurement=_Measurement(db._observer,'stream');self._measurement.rows=0
         self._buffer: deque[Any]=deque();self._cursor: Any=None;self._tx: Any=None;self._lease: Any=None
         self._token: object | None=None;self._owner: asyncio.Task[Any] | None=None
         self._open=False;self._entered=False;self._drained=False;self._failed=False;self._acquired=False
@@ -178,9 +189,11 @@ class AsyncStream(Generic[T],AsyncIterator[T]):
             if self._tx is not None:
                 async with self._db._conn.cursor() as control: await control.execute('SET TRANSACTION READ ONLY')
             self._cursor=self._db._conn.cursor(name='neutron_stream_'+uuid4().hex,scrollable=False,withhold=False,**({'binary':True} if self._db._native_binary else {}))
+            self._measurement.dispatch(owned=self._db._owner is not None)
             await self._cursor.execute(self._compiled.sql,native_params(self._compiled.params))
             return self
         except BaseException as exc:
+            self._measurement.note_error(exc)
             if self._acquired or self._tx is not None:
                 self._failed=True;self._db._rollback_only=True
                 try: await self._finish(False)
@@ -205,13 +218,17 @@ class AsyncStream(Generic[T],AsyncIterator[T]):
                 if len(rows)>self._batch_size: raise OrmError('native cursor exceeded batch bound')
                 self._buffer.extend(rows)
                 if not rows: self._drained=True;raise StopAsyncIteration
-            return self._compiled.decode(self._buffer.popleft())
+            result=self._compiled.decode(self._buffer.popleft())
+            self._measurement.rows=(self._measurement.rows or 0)+1
+            return result
         except StopAsyncIteration:
             if not self._drained:
                 self._failed=True;self._db._rollback_only=True
+                self._measurement.note_error(OrmError('stream decoder cannot end iteration'))
                 raise OrmError('stream decoder cannot end iteration')
             raise
         except BaseException as exc:
+            self._measurement.note_error(exc)
             self._failed=True;self._db._rollback_only=True
             if isinstance(exc,Exception) and not isinstance(exc,(OrmError,ValueError,TypeError)): raise _native(exc) from exc
             raise
@@ -235,13 +252,15 @@ class AsyncStream(Generic[T],AsyncIterator[T]):
             except BaseException as exc:
                 error=exc
                 if self._db.closed and tx.state=='active': await tx.rollback()
+        self._measurement.finish(error)
         if error is not None:
             if isinstance(error,Exception) and not isinstance(error,OrmError): raise _native(error) from error
             raise error
 
     async def __aexit__(self,kind: Any,error: Any,traceback: Any) -> None:
         if asyncio.current_task() is not self._owner: raise SessionBusyError('stream belongs to another task')
-        if error is not None: self._failed=True;self._db._rollback_only=True
+        if error is not None:
+            self._measurement.note_error(error);self._failed=True;self._db._rollback_only=True
         try: await self._finish(error is None and self._drained and not self._failed)
         except BaseException as cleanup:
             if isinstance(error,asyncio.CancelledError): raise error from cleanup

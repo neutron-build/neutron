@@ -5,6 +5,7 @@ from contextlib import contextmanager, asynccontextmanager
 import threading
 from typing import Any, AsyncIterator, Iterator, Mapping, Sequence, TypeVar, TYPE_CHECKING, cast
 from .endpoint import EndpointIdentity, admit, startup_version
+from .observability import QueryObserver,_Measurement,_measure
 from .json_value import load_document, native_params
 from .query import Query
 from .sql_admission import validate_scope_sql
@@ -58,7 +59,9 @@ def _admit_native_root(connection: Any) -> None:
 
 class Database:
     """One native connection. Concurrent active use rejected; no tracked objects."""
-    def __init__(self, connection: Any) -> None:
+    def __init__(self, connection: Any, *, observer: QueryObserver|None=None) -> None:
+        if observer is not None and type(observer) is not QueryObserver: raise ValueError('observer requires the bounded QueryObserver')
+        self._observer=observer
         self._catalog_owner=object()
         self._catalog_specs: dict[tuple[str,str],ColumnSpec[Any]]={}
         self._native_binary=False
@@ -77,7 +80,7 @@ class Database:
         return self._endpoint_identity
 
     @classmethod
-    def connect(cls, url: str, *, profile: str='postgres-direct') -> Database:
+    def connect(cls, url: str, *, profile: str='postgres-direct',observer: QueryObserver|None=None) -> Database:
         _profile(profile)
         try:
             import psycopg
@@ -97,7 +100,7 @@ class Database:
             set_json_loads(load_document,context=connection)
             from .pg_adapters import register_native_values
             register_native_values(connection)
-            result=cls(connection)
+            result=cls(connection,observer=observer)
             result._native_binary=True
             result._endpoint_identity=identity
             return result
@@ -187,8 +190,12 @@ class Database:
         finally: self._lock.release()
 
     def _read(self, query: Select[T] | Returning[T] | Query[T], cardinality: str) -> list[T]:
+        with _measure(self._observer,'query') as measurement:
+            result=self._read_impl(query,cardinality,measurement);measurement.rows=len(result);return result
+
+    def _read_impl(self, query: Select[T] | Returning[T] | Query[T], cardinality: str, measurement: _Measurement) -> list[T]:
         if isinstance(query,Returning) and self._owner is None:
-            with self.transaction(): return self._read(query,cardinality)
+            with self.transaction(): return self._read_impl(query,cardinality,measurement)
         if isinstance(query,Query) and cardinality != 'many' and (query.row_limit is not None or query.row_offset is not None):
             raise ValueError('exact-one reads refuse pagination')
         compiled=query.compile()
@@ -197,6 +204,7 @@ class Database:
         with self._use():
             try:
                 with self._conn.cursor(**({'binary':True} if self._native_binary else {})) as cur:
+                    measurement.dispatch(owned=self._owner is not None)
                     cur.execute(compiled.sql,native_params(compiled.params))
                     if self._native_binary: _check_result_oids(compiled,cur)
                     rows=cur.fetchall() if cardinality=='many' else cur.fetchmany(2)
@@ -206,6 +214,7 @@ class Database:
                 state=getattr(exc,"sqlstate",None)
                 if state is None or str(state).startswith("08"): self._discard()
                 raise _native(exc) from exc
+        measurement.rows=len(rows)
         return self._decode(query,compiled,rows,cardinality)
 
     def _decode(self,query: Select[T] | Returning[T] | Query[T],compiled: Compiled[T],rows: Sequence[Mapping[str,Any]],cardinality: str) -> list[T]:
@@ -220,11 +229,16 @@ class Database:
         rows=self._read(query,'optional'); return rows[0] if rows else None
 
     def execute(self, statement: Mutation) -> int:
+        with _measure(self._observer,'execute') as measurement:
+            result=self._execute_impl(statement,measurement);measurement.rows=result;return result
+
+    def _execute_impl(self, statement: Mutation, measurement: _Measurement) -> int:
         if statement.table is not None and statement.table._catalog_owner is not None and statement.table._catalog_owner is not self._catalog_owner: raise ValueError('catalog mutation belongs to another connection')
         validate_scope_sql(statement.sql,owned=self._owner is not None)
         with self._use():
             try:
                 with self._conn.cursor(**({'binary':True} if self._native_binary else {})) as cur:
+                    measurement.dispatch(owned=self._owner is not None)
                     cur.execute(statement.sql,native_params(statement.params))
                     return int(cur.rowcount)
             except BaseException as exc:
@@ -349,7 +363,9 @@ class Database:
 
 class AsyncDatabase:
     """One native async connection; operation/transaction task ownership explicit."""
-    def __init__(self, connection: Any) -> None:
+    def __init__(self, connection: Any, *, observer: QueryObserver|None=None) -> None:
+        if observer is not None and type(observer) is not QueryObserver: raise ValueError('observer requires the bounded QueryObserver')
+        self._observer=observer
         self._catalog_owner=object()
         self._catalog_specs: dict[tuple[str,str],ColumnSpec[Any]]={}
         self._native_binary=False
@@ -368,7 +384,7 @@ class AsyncDatabase:
         return self._endpoint_identity
 
     @classmethod
-    async def connect(cls,url: str,*,profile: str='postgres-direct') -> AsyncDatabase:
+    async def connect(cls,url: str,*,profile: str='postgres-direct',observer: QueryObserver|None=None) -> AsyncDatabase:
         _profile(profile)
         try:
             import psycopg
@@ -388,7 +404,7 @@ class AsyncDatabase:
             set_json_loads(load_document,context=connection)
             from .pg_adapters import register_native_values
             register_native_values(connection)
-            result=cls(connection)
+            result=cls(connection,observer=observer)
             result._native_binary=True
             result._endpoint_identity=identity
             return result
@@ -480,8 +496,12 @@ class AsyncDatabase:
         finally: self._busy=False
 
     async def _read(self,query: Select[T] | Returning[T] | Query[T],cardinality: str) -> list[T]:
+        with _measure(self._observer,'query') as measurement:
+            result=await self._read_impl(query,cardinality,measurement);measurement.rows=len(result);return result
+
+    async def _read_impl(self,query: Select[T] | Returning[T] | Query[T],cardinality: str,measurement: _Measurement) -> list[T]:
         if isinstance(query,Returning) and self._owner is None:
-            async with self.transaction(): return await self._read(query,cardinality)
+            async with self.transaction(): return await self._read_impl(query,cardinality,measurement)
         if isinstance(query,Query) and cardinality != 'many' and (query.row_limit is not None or query.row_offset is not None):
             raise ValueError('exact-one reads refuse pagination')
         compiled=query.compile()
@@ -490,6 +510,7 @@ class AsyncDatabase:
         async with self._use():
             try:
                 async with self._conn.cursor(**({'binary':True} if self._native_binary else {})) as cur:
+                    measurement.dispatch(owned=self._owner is not None)
                     await cur.execute(compiled.sql,native_params(compiled.params))
                     if self._native_binary: _check_result_oids(compiled,cur)
                     rows=await cur.fetchall() if cardinality=='many' else await cur.fetchmany(2)
@@ -506,6 +527,7 @@ class AsyncDatabase:
             except BaseException:
                 if self._owner is not None: self._rollback_only=True
                 raise
+        measurement.rows=len(rows)
         return self._decode(query,compiled,rows,cardinality)
 
     def _decode(self,query: Select[T] | Returning[T] | Query[T],compiled: Compiled[T],rows: Sequence[Mapping[str,Any]],cardinality: str) -> list[T]:
@@ -520,11 +542,16 @@ class AsyncDatabase:
         rows=await self._read(query,'optional'); return rows[0] if rows else None
 
     async def execute(self,statement: Mutation) -> int:
+        with _measure(self._observer,'execute') as measurement:
+            result=await self._execute_impl(statement,measurement);measurement.rows=result;return result
+
+    async def _execute_impl(self,statement: Mutation,measurement: _Measurement) -> int:
         if statement.table is not None and statement.table._catalog_owner is not None and statement.table._catalog_owner is not self._catalog_owner: raise ValueError('catalog mutation belongs to another connection')
         validate_scope_sql(statement.sql,owned=self._owner is not None)
         async with self._use():
             try:
                 async with self._conn.cursor(**({'binary':True} if self._native_binary else {})) as cur:
+                    measurement.dispatch(owned=self._owner is not None)
                     await cur.execute(statement.sql,native_params(statement.params))
                     return int(cur.rowcount)
             except asyncio.CancelledError:
