@@ -51,3 +51,28 @@ role/status mutations, hook failure rollback and record-not-found/RowsAffected
 translation. Root evidence must identify source/toolchain/artifact/native hashes.
 This bounded conversion does not replace the whole go-admin product, its Gin/JWT
 runtime, every service operation, its frontend, or its Casbin policy engine.
+
+
+The preparer adds only `original-native/neutron_corpus_native_test.go` to the full
+original API test package; every frozen product file and original test stays
+byte-identical. That added native harness runs the actual original models,
+service `GetPage`, `Preload`/`AfterFind`, password hooks and API `Update`, including
+Casbin's original ordinary-role denial. It independently queries PostgreSQL for
+credential preservation, privilege fields, zero-live millisecond deletion and
+transaction rollback after the real bcrypt failure. Its environment is a private
+`NEUTRON_GO_APP_DATABASE_URL` PostgreSQL URI; the harness does not print it.
+
+Run under the original Go >=1.27.1 toolchain in the reconstructed go-admin tree:
+
+```sh
+go test -mod=readonly ./app/admin/models -run TestEncrypt -count=1 -v
+go test -mod=readonly ./app/admin/apis -run 'TestUpdate_|TestNeutronCorpusOriginal' -count=1 -v
+```
+
+These are author commands pending coordinator execution, not pass claims. The
+native harness requires PostgreSQL and fails rather than skipping when its URL
+is absent. Original SQLite anti-privilege tests remain in the same test package.
+ModelTime's actual core contract is now frozen: `soft_delete.DeletedAt` with
+`softDelete:milli`, an unsigned zero-live marker stored natively as bigint, plus
+CreatedAt/UpdatedAt and creator/updater fields. It is not nullable datetime soft
+deletion. The native harness confirms this schema and behavior before conversion.

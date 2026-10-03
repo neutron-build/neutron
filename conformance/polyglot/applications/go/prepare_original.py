@@ -9,6 +9,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import shutil
 from verify_source import ROOT, verify
 
 
@@ -36,9 +37,12 @@ def prepare(destination: Path) -> None:
         if git(directory, "rev-parse", "HEAD") != commit:
             raise ValueError("public corpus commit mismatch")
     count = verify(destination)
+    harness = ROOT / "original-native/neutron_corpus_native_test.go"
+    shutil.copyfile(harness, destination / "go-admin/app/admin/apis/neutron_corpus_native_test.go")
     evidence = {"source_files_verified": count, "original_module_sha256": hashlib.sha256(
         (destination / "go-admin/go.mod").read_bytes()).hexdigest(),
         "required_original_go": "1.27.1", "executed": False,
+        "added_native_harness_sha256": hashlib.sha256(harness.read_bytes()).hexdigest(),
         "repositories": [{"repository": repo, "commit": commit} for repo, commit in sources]}
     (destination / "reconstruction.json").write_text(json.dumps(evidence, indent=2) + "\n")
     print(json.dumps(evidence))
