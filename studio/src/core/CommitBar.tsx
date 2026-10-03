@@ -52,7 +52,13 @@ export function CommitBar() {
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (!count) return
+      if (!count || e.defaultPrevented) return
+      const target = e.target instanceof Element ? e.target : null
+      // Modal controls own their shortcuts; a dialog must not commit or
+      // discard the staged workspace behind it. Text editing owns native
+      // undo even outside a dialog (typed text is not a staged operation).
+      if (target?.closest('[role="dialog"]')) return
+      if ((e.metaKey || e.ctrlKey) && e.key === 'z' && target?.closest('input, textarea, [contenteditable]')) return
       if ((e.metaKey || e.ctrlKey) && e.key === 's') {
         e.preventDefault()
         void commit()
