@@ -191,8 +191,10 @@ class Database:
         with self._use():
             native=self._conn.transaction()
             try: native.__enter__()
-            except BaseException:
-                self._discard();raise
+            except BaseException as exc:
+                self._discard()
+                if isinstance(exc,Exception) and not isinstance(exc,OrmError): raise _native(exc) from exc
+                raise
         previous=self._rollback_only;self._savepoint_depth+=1
         try:
             try:
@@ -202,14 +204,18 @@ class Database:
                 if self.closed: raise
                 try:
                     with self._use_cleanup(): native.__exit__(type(body),body,body.__traceback__)
-                except BaseException:
-                    self._discard();raise
+                except BaseException as exc:
+                    self._discard()
+                    if isinstance(exc,Exception) and not isinstance(exc,OrmError): raise _native(exc) from exc
+                    raise
                 raise
             else:
                 try:
                     with self._use(): native.__exit__(None,None,None)
-                except BaseException:
-                    self._discard();raise
+                except BaseException as exc:
+                    self._discard()
+                    if isinstance(exc,Exception) and not isinstance(exc,OrmError): raise _native(exc) from exc
+                    raise
         finally:
             self._savepoint_depth-=1;self._rollback_only=previous
 
@@ -411,8 +417,10 @@ class AsyncDatabase:
         async with self._use():
             native=self._conn.transaction()
             try: await native.__aenter__()
-            except BaseException:
-                self._discard();raise
+            except BaseException as exc:
+                self._discard()
+                if isinstance(exc,Exception) and not isinstance(exc,OrmError): raise _native(exc) from exc
+                raise
         previous=self._rollback_only;self._savepoint_depth+=1
         try:
             try:
@@ -422,14 +430,18 @@ class AsyncDatabase:
                 if self.closed: raise
                 try:
                     async with self._use_cleanup(): await native.__aexit__(type(body),body,body.__traceback__)
-                except BaseException:
-                    self._discard();raise
+                except BaseException as exc:
+                    self._discard()
+                    if isinstance(exc,Exception) and not isinstance(exc,OrmError): raise _native(exc) from exc
+                    raise
                 raise
             else:
                 try:
                     async with self._use(): await native.__aexit__(None,None,None)
-                except BaseException:
-                    self._discard();raise
+                except BaseException as exc:
+                    self._discard()
+                    if isinstance(exc,Exception) and not isinstance(exc,OrmError): raise _native(exc) from exc
+                    raise
         finally:
             self._savepoint_depth-=1;self._rollback_only=previous
 

@@ -5,7 +5,7 @@ import inspect
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Sequence, TypeVar
 from .client import AsyncDatabase
-from .core import CardinalityError, OrmError, SessionBusyError, delete, insert, select_row, update, Mutation
+from .core import CardinalityError, OrmError, Predicate, SessionBusyError, delete, insert, select_row, update, Mutation
 from .lifecycle import AsyncTransactionHandle
 from .events import EVENT_NAMES, EventName, SessionEvent
 from .mapping import ModelMapping
@@ -74,7 +74,11 @@ class AsyncSession(_SessionState):
             if self._database.closed:
                 self._store.uncertain();self._uncertain=True
             else:
-                self._store.restore_checkpoint(checkpoint);self._links=links;self._failed=False
+                try: self._store.restore_checkpoint(checkpoint)
+                except BaseException:
+                    self._database._discard();self._store.uncertain();self._uncertain=True
+                    raise
+                self._links=links;self._failed=False
             raise
         finally: self._savepoint_depth-=1
 

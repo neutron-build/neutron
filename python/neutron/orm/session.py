@@ -344,7 +344,11 @@ class Session(_SessionState):
             if self._database.closed:
                 self._store.uncertain();self._uncertain=True
             else:
-                self._store.restore_checkpoint(checkpoint);self._links=links;self._failed=False
+                try: self._store.restore_checkpoint(checkpoint)
+                except BaseException:
+                    self._database._discard();self._store.uncertain();self._uncertain=True
+                    raise
+                self._links=links;self._failed=False
             raise
         finally: self._savepoint_depth-=1
 
