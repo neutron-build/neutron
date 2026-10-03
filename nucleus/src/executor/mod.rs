@@ -3906,7 +3906,20 @@ impl Executor {
         if owner.is_none() {
             return Ok(false);
         }
-        let target_is_superuser = target.session_context.read().is_superuser;
+        // The protected target is the authenticated login role, not whichever
+        // effective role it later assumes. Consult committed attributes; if
+        // the catalog is busy or the login disappeared, fail closed.
+        let target_is_superuser = self
+            .roles
+            .try_read()
+            .map_err(|_| {
+                ExecError::PermissionDenied(
+                    "backend role catalog is busy; retry cancellation".into(),
+                )
+            })?
+            .get(owner.as_deref().expect("authenticated owner checked above"))
+            .map(|role| role.is_superuser)
+            .unwrap_or(true);
         if !caller_context.is_superuser
             && (target_is_superuser || owner.as_deref() != Some(caller_context.user.as_str()))
         {
