@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import signal
@@ -27,6 +28,8 @@ build_env = {key: value for key, value in os.environ.items()
 build_env.update({'GOWORK': 'off', 'GOTOOLCHAIN': 'local', 'GOFLAGS': ''})
 
 def run(argv, cwd=root, timeout=180, environment=None):
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError('positive finite subprocess timeout required')
     process = subprocess.Popen(argv, cwd=cwd, env=build_env if environment is None else environment, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
@@ -36,7 +39,20 @@ def run(argv, cwd=root, timeout=180, environment=None):
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        process.communicate()
+        # Do not repeat a failing decode/read path while reaping. Repeated
+        # interrupts cannot leave a killed child unreaped.
+        while True:
+            try:
+                process.wait()
+                break
+            except KeyboardInterrupt:
+                continue
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
         raise
 
     if process.returncode:
