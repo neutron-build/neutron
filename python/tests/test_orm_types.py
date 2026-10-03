@@ -258,3 +258,14 @@ def static_polymorphic_consumer(session: Session,mapping: PolymorphicMapping[Use
 async def static_async_polymorphic_consumer(session: AsyncSession,mapping: PolymorphicMapping[User]) -> None:
     assert_type(await session.get(mapping.subtype(SpecialUser),1),SpecialUser|None)
     assert_type(await session.select_polymorphic(mapping.subtype(SpecialUser),max_rows=10),tuple[SpecialUser,...])
+
+from neutron.orm import Inet,CIDR
+
+def static_network_consumer(db: Database) -> None:
+    table=Table('networks',{'host':ColumnSpec(Inet,'inet'),'network':ColumnSpec(CIDR,'cidr',nullable=True)})
+    assert_type(db.one(select(table.column('host',Inet))),Inet)
+    assert_type(db.one(select(table.nullable_column('network',CIDR))),CIDR|None)
+
+async def static_async_network_consumer(db: AsyncDatabase) -> None:
+    table=Table('networks',{'host':ColumnSpec(Inet,'inet')})
+    assert_type(await db.one(select(table.column('host',Inet))),Inet)

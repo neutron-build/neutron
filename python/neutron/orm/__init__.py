@@ -70,3 +70,6 @@ __all__ += ["PgEnum","PgDomain","CatalogType"]
 
 from .polymorphic import PolymorphicMapping,PolymorphicView
 __all__ += ["PolymorphicMapping","PolymorphicView"]
+
+from .network_value import Inet,CIDR
+__all__ += ["Inet","CIDR"]

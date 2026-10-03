@@ -8,6 +8,7 @@ from typing import Any, Callable, Generic, Iterable, Mapping, TypeVar, cast, get
 from uuid import UUID
 
 from .json_value import BoundJson, JsonDocument, MutableJson
+from .network_value import Inet,CIDR
 from .catalog_value import BoundCatalog, CatalogType, PgDomain, PgEnum
 from .pg_value import BoundArray, BoundRange, PgArray, PgRange, TimeOfDay, Interval
 
@@ -41,7 +42,7 @@ def _bound_quote(name: str) -> str:
     return quote(name).replace('%','%%')
 
 # Column families deliberately finite; custom SQL type text cannot become SQL.
-_TYPES: dict[str, type] = {'int2':int,'int4':int,'int8':int,'text':str,'varchar':str,'bool':bool,'numeric':Decimal,'uuid':UUID,'bytea':bytes,'timestamp':dt.datetime,'timestamptz':dt.datetime,'date':dt.date,'json':JsonDocument,'jsonb':JsonDocument,'time':TimeOfDay,'interval':Interval}
+_TYPES: dict[str, type] = {'int2':int,'int4':int,'int8':int,'text':str,'varchar':str,'bool':bool,'numeric':Decimal,'uuid':UUID,'bytea':bytes,'timestamp':dt.datetime,'timestamptz':dt.datetime,'date':dt.date,'json':JsonDocument,'jsonb':JsonDocument,'time':TimeOfDay,'interval':Interval,'inet':Inet,'cidr':CIDR}
 
 _RANGE_TYPES={'int4range':'int4','int8range':'int8','numrange':'numeric','daterange':'date','tsrange':'timestamp','tstzrange':'timestamptz'}
 _ARRAY_TYPES=frozenset({'int2','int4','int8','text','varchar','bool','numeric','uuid','bytea','date','timestamp','timestamptz','time','interval'})
@@ -88,6 +89,7 @@ class ColumnSpec(Generic[T]):
             return
         if not isinstance(value, self.python_type) or (self.python_type is int and isinstance(value, bool)) or (self.sql_type == 'date' and isinstance(value, dt.datetime)):
             raise ValueError('column value has wrong native type')
+        if self.python_type in {Inet,CIDR} and type(value) is not self.python_type: raise ValueError('exact native network family required')
         if isinstance(value,(PgEnum,PgDomain)):
             if value.identity is not self.native_type: raise ValueError('enum/domain qualified identity mismatch')
             if isinstance(value,PgDomain):

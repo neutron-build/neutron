@@ -3,10 +3,12 @@ from __future__ import annotations
 from functools import cache
 import struct
 from typing import Any
+from .network_value import Inet,CIDR
+from ipaddress import ip_address
 from .pg_value import ArrayDimension, BoundArray, BoundRange, Interval, MAX_ARRAY_ELEMENTS, PgArray, PgRange, TimeOfDay
 
 # PostgreSQL catalog builtin identities are stable, unlike user-defined OIDs.
-BUILTIN_OIDS={'int2':21,'int4':23,'int8':20,'text':25,'varchar':1043,'bool':16,'numeric':1700,'uuid':2950,'bytea':17,'date':1082,'timestamp':1114,'timestamptz':1184,'time':1083,'interval':1186,'json':114,'jsonb':3802}
+BUILTIN_OIDS={'int2':21,'int4':23,'int8':20,'text':25,'varchar':1043,'bool':16,'numeric':1700,'uuid':2950,'bytea':17,'date':1082,'timestamp':1114,'timestamptz':1184,'time':1083,'interval':1186,'json':114,'jsonb':3802,'inet':869,'cidr':650}
 ARRAY_OIDS={'int2[]':1005,'int4[]':1007,'int8[]':1016,'text[]':1009,'varchar[]':1015,'bool[]':1000,'numeric[]':1231,'uuid[]':2951,'bytea[]':1001,'date[]':1182,'timestamp[]':1115,'timestamptz[]':1185,'time[]':1183,'interval[]':1187}
 
 RANGE_OIDS={'int4range':(3904,23),'int8range':(3926,20),'numrange':(3906,1700),'daterange':(3912,1082),'tsrange':(3908,1114),'tstzrange':(3910,1184)}
@@ -130,6 +132,9 @@ def _adapter_classes() -> tuple[type[Any],...]:
 
 
 def register_native_values(connection: Any) -> None:
+    inet_load,cidr_load,inet_dump,cidr_dump=_network_adapter_classes()
+    connection.adapters.register_loader(869,inet_load);connection.adapters.register_loader(650,cidr_load)
+    connection.adapters.register_dumper(Inet,inet_dump);connection.adapters.register_dumper(CIDR,cidr_dump)
     classes=_adapter_classes();time_load,time_dump,interval_load,interval_dump,array_dump=classes[:5]
     for name,oid in BUILTIN_OIDS.items():
         info=connection.adapters.types.get(name)
@@ -145,3 +150,31 @@ def register_native_values(connection: Any) -> None:
         info=connection.adapters.types.get(name[:-2])
         if info is None or info.array_oid!=oid: raise ValueError('native array SQL type identity mismatch')
         connection.adapters.register_loader(oid,cls)
+
+
+@cache
+def _network_adapter_classes() -> tuple[type[Any],...]:
+    from psycopg.adapt import Dumper,Loader
+    from psycopg.pq import Format
+    class NetworkLoader(Loader):
+        format=Format.BINARY
+        model: type[Inet]|type[CIDR]
+        def load(self,data: Any) -> Inet|CIDR:
+            raw=bytes(data)
+            if len(raw)<4: raise ValueError('truncated native network header')
+            family,bits,is_cidr,size=raw[:4]
+            expected=4 if family==2 else 16 if family==3 else 0
+            if expected==0 or size!=expected or len(raw)!=4+expected or is_cidr!=int(self.model is CIDR):
+                raise ValueError('native network family/header mismatch')
+            return self.model(ip_address(raw[4:]),bits)
+    class InetLoader(NetworkLoader): model=Inet
+    class CIDRLoader(NetworkLoader): model=CIDR
+    class NetworkDumper(Dumper):
+        format=Format.BINARY
+        def dump(self,obj: Inet|CIDR) -> bytes:
+            # Value constructors reject scopes, host bits for CIDR and bad prefixes.
+            if type(obj) not in {Inet,CIDR}: raise ValueError('exact native network family required')
+            return bytes((2 if obj.address.version==4 else 3,obj.prefix_length,int(type(obj) is CIDR),len(obj.address.packed)))+obj.address.packed
+    class InetDumper(NetworkDumper): oid=869
+    class CIDRDumper(NetworkDumper): oid=650
+    return InetLoader,CIDRLoader,InetDumper,CIDRDumper

@@ -590,3 +590,12 @@ replacement. The authored conversion fixture at
 `conformance/polyglot/applications/python/polymorphic_sti.py` pins SQLAlchemy
 2.1.3 and compares independent native rows, base/subtype identity reuse, filtering
 and rollback. It is an authored application fixture, not a claimed external app.
+
+`Inet.parse('192.168.1.73/24')` preserves the address's host bits and prefix;
+`CIDR.parse('192.168.1.0/24')` requires a network address and rejects host bits.
+Both immutable values support IPv4 and IPv6, including IPv4-mapped IPv6 without
+changing families. Scoped IPv6 addresses refuse. `ColumnSpec(Inet, 'inet')` and
+`ColumnSpec(CIDR, 'cidr')` bind and decode native binary address components with
+exact builtin OIDs and header-family checks. SQL NULL remains `None`; `/0` and
+all-zero addresses remain actual values. Mapped replacement, identity reads,
+rollback, streaming and async APIs use the same component contracts.
