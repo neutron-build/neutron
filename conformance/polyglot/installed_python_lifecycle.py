@@ -59,6 +59,7 @@ async def execute(args,request):
         if marker!=('polyglot-installed-lifecycle-v1:'+request['ownership_token'],): raise ValueError('fixture ownership mismatch')
         native.execute(sql.SQL('CREATE TABLE {}.parents(id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,name text NOT NULL)').format(sql.Identifier(scope)))
         native.execute(sql.SQL('CREATE TABLE {}.children(id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,parent_id integer NOT NULL REFERENCES {}.parents(id),label text NOT NULL UNIQUE)').format(sql.Identifier(scope),sql.Identifier(scope)))
+        native.execute(sql.SQL('CREATE TABLE {}.poison(id integer PRIMARY KEY)').format(sql.Identifier(scope)))
         def counts():
             return native.execute(sql.SQL('SELECT (SELECT count(*) FROM {}.parents),(SELECT count(*) FROM {}.children)').format(sql.Identifier(scope),sql.Identifier(scope))).fetchone()
         async with context(await call(Session.connect,url)) as session:
@@ -126,6 +127,32 @@ async def execute(args,request):
             else: raise ValueError('terminal handle committed')
             if len(await call(db.all,query))!=2: raise ValueError('transaction fence affected native fixture')
             cases.append('manual-transaction-terminal-and-raw-control-fence')
+            poison=orm.Table('poison',{'id':orm.ColumnSpec(int,'int4')},schema=scope)
+            try:
+                async with context(db.transaction()):
+                    await call(db.execute,orm.insert(poison,{'id':1}))
+                    try: await call(db.execute,orm.insert(poison,{'id':1}))
+                    except orm.OrmError as error:
+                        if error.sqlstate!='23505': raise
+                    else: raise ValueError('duplicate insert succeeded')
+            except orm.OrmError as error:
+                if error.outcome!='aborted': raise ValueError('caught native failure claimed uncertain or committed outcome')
+            else: raise ValueError('swallowed native failure claimed commit')
+            if native.execute(sql.SQL('SELECT count(*) FROM {}.poison').format(sql.Identifier(scope))).fetchone()!=(0,): raise ValueError('poisoned transaction partial commit')
+            cases.append('swallowed-native-failure-known-aborted')
+            async with context(db.transaction()):
+                try:
+                    async with context(db.savepoint()):
+                        await call(db.execute,orm.insert(poison,{'id':1}))
+                        try: await call(db.execute,orm.insert(poison,{'id':1}))
+                        except orm.OrmError as error:
+                            if error.sqlstate!='23505': raise
+                        else: raise ValueError('savepoint duplicate insert succeeded')
+                except orm.OrmError: pass
+                else: raise ValueError('swallowed savepoint failure released successfully')
+                await call(db.execute,orm.insert(poison,{'id':2}))
+            if native.execute(sql.SQL('SELECT id FROM {}.poison').format(sql.Identifier(scope))).fetchall()!=[(2,)]: raise ValueError('successful savepoint rollback failed to recover parent')
+            cases.append('savepoint-native-rollback-recovers-parent-poison')
         final=native.execute(sql.SQL('SELECT p.name,c.label FROM {}.parents p JOIN {}.children c ON c.parent_id=p.id ORDER BY c.label').format(sql.Identifier(scope),sql.Identifier(scope))).fetchall()
     return {**request,'status':'pass','mode':args.mode,'cases':cases,'native_rows':final}
 

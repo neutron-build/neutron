@@ -21,7 +21,8 @@ from protocol import verify_artifacts
 CASES=['graph-generated-identity-rollback','prewrite-hooks-bound-values-known-commit',
     'graph-selectin-identity-reuse','aftercommit-failure-retains-native-commit',
     'late-graph-constraint-full-rollback','early-stream-close-and-escaped-lifetime',
-    'manual-transaction-terminal-and-raw-control-fence']
+    'manual-transaction-terminal-and-raw-control-fence','swallowed-native-failure-known-aborted',
+    'savepoint-native-rollback-recovers-parent-poison']
 
 def run(args):
     root=args.consumer.resolve()
@@ -75,6 +76,7 @@ def run(args):
                 # connection, without importing the installed ORM or its codecs.
                 final=native.execute(sql.SQL('SELECT p.name,c.label FROM {}.parents p JOIN {}.children c ON c.parent_id=p.id ORDER BY c.label').format(sql.Identifier(scope),sql.Identifier(scope))).fetchall()
                 if final!=[('committed-after-callback-failure','a'),('committed-after-callback-failure','b')]: raise ValueError('coordinator native lifecycle oracle differs')
+                if native.execute(sql.SQL('SELECT id FROM {}.poison').format(sql.Identifier(scope))).fetchall()!=[(2,)]: raise ValueError('coordinator native poisoned/savepoint oracle differs')
                 verify_artifacts(json.loads(manifest.read_text()),root)
                 report['modes'][mode]={'result':result,'command':command,'coordinator_native_oracle':'pass'}
                 report_path.write_text(json.dumps(report,indent=2)+'\n')
