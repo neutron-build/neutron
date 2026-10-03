@@ -24,8 +24,9 @@ func TestImmutableArrayDimensionsNullElementsAndBounds(t *testing.T) {
 	*exported[0] = 4
 	exportedDimensions := a.Dimensions()
 	exportedDimensions[0].LowerBound = 2
-	indexed := a.Index(0).(*int64)
-	*indexed = 9
+	if a.Index(0).(int64) != 9223372036854775807 || a.Index(1) != nil {
+		t.Fatal("native nullable index not flattened")
+	}
 	if *a.Elements()[0] != 9223372036854775807 || a.Dimensions()[0].LowerBound != -3 {
 		t.Fatal("array accessor alias")
 	}

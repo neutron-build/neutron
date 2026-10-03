@@ -123,8 +123,14 @@ func (a Array[T]) Elements() []T {
 	}
 	return result
 }
-func (a Array[T]) Index(i int) any               { return cloneElement(a.elements[i]) }
-func (a Array[T]) IndexType() any                { var zero T; return zero }
+func (a Array[T]) Index(i int) any { return snapshot(cloneElement(a.elements[i])) }
+func (a Array[T]) IndexType() any {
+	t := arrayElementType[T]()
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	return reflect.Zero(t).Interface()
+}
 func (a Array[T]) ormScalarValid() bool          { return a.valid }
 func (a Array[T]) ormScalarType() bool           { return validArrayElement(arrayElementType[T]()) }
 func (a Array[T]) ormArrayType()                 {}
