@@ -47,6 +47,7 @@ class _SessionState:
         if self._failed and not allow_failed: raise OrmError('mapped Session requires rollback')
 
     def _mapping(self,mapping: ModelMapping[T]) -> None:
+        if mapping.table._catalog_owner is not None and mapping.table._catalog_owner is not self._database._catalog_owner: raise OrmError('catalog mapping belongs to another connection')
         if self.expire_on_commit and not mapping.instrumented: raise OrmError('expire_on_commit requires instrumented mappings')
         key=(mapping.table.schema,mapping.table.name)
         previous=self._mappings.get(key)

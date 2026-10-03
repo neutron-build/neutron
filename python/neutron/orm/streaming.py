@@ -81,6 +81,7 @@ class Stream(Generic[T],Iterator[T]):
         if self._entered: raise OrmError('stream context cannot be reused')
         self._entered=True;self._owner=threading.get_ident()
         try:
+            if self._compiled.catalog_owner is not None and self._compiled.catalog_owner is not self._db._catalog_owner: raise ValueError('catalog stream belongs to another connection')
             if self._db._owner is None: self._tx=self._db.begin()
             self._lease=self._db._use();self._lease.__enter__();self._acquired=True;self._db._stream_lease=True
             self._token=self._db._tx_token;self._open=True
@@ -170,6 +171,7 @@ class AsyncStream(Generic[T],AsyncIterator[T]):
         self._entered=True;self._owner=asyncio.current_task()
         if self._owner is None: raise SessionBusyError('stream requires owning task')
         try:
+            if self._compiled.catalog_owner is not None and self._compiled.catalog_owner is not self._db._catalog_owner: raise ValueError('catalog stream belongs to another connection')
             if self._db._owner is None: self._tx=await self._db.begin()
             self._lease=self._db._use();await self._lease.__aenter__();self._acquired=True;self._db._stream_lease=True
             self._token=self._db._tx_token;self._open=True

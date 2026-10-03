@@ -64,3 +64,6 @@ __all__ += ["array_spec"]
 from .pg_value import PgRange
 from .core import range_spec
 __all__ += ["PgRange","range_spec"]
+
+from .catalog_value import PgEnum,PgDomain,CatalogType
+__all__ += ["PgEnum","PgDomain","CatalogType"]

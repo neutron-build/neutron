@@ -59,7 +59,8 @@ program expressions; do not construct their SQL strings from untrusted input.
 The supported metadata vocabulary is int2/int4/int8, bool, text/varchar,
 numeric/Decimal, uuid/UUID, bytea/bytes, timestamp/timestamptz/datetime and
 date/date. Local timestamps require naive datetime; instants require aware
-datetime. Arrays/domains/composites/ranges and schema migrations are unsupported here.
+datetime. Composite values and schema migrations remain unqualified; array, domain and
+range profiles are described below.
 Explicit JSON document support is described below. Database-generated column writes refuse. Existing canonical
 schema-v2 and migration protocols are not changed by this in-memory metadata.
 
@@ -531,3 +532,27 @@ explicit native subtype OIDs. Discrete PostgreSQL ranges can canonicalize writes
 for example `[1,3]` returns `[1,4)`, and mapped RETURNING adopts that native value.
 Range values are immutable and replacement edits use normal snapshot rollback;
 range primary identities and multiranges remain unqualified.
+
+Qualified enum/domain admission is explicit native I/O. `db.enum_spec(schema,
+name)` returns `ColumnSpec[PgEnum]`; `db.domain_spec(schema, name,
+ColumnSpec(Decimal, 'numeric'))` returns `ColumnSpec[PgDomain[Decimal]]` after
+following a bounded catalog domain chain and verifying its exact base OID.
+Async callers await these methods. Native enum labels, including empty strings,
+use `PgEnum(label, spec.native_type)`; domain values use
+`PgDomain(value, spec.native_type)`. The immutable CatalogType identity retains
+qualified namespace/name, original OID, effective base OID and owning client.
+The database enforces enum membership and domain constraints on native writes.
+
+Use `db.catalog_table(name, columns, schema=...)` to verify actual physical
+column OIDs and declared nonnullable profiles. Ordinary Table construction
+refuses enum/domain metadata lacking this admission. Domain result descriptions
+can expose their base OID; their original domain identity comes from the exact
+catalog column check, and decoding wraps the base value with that identity.
+Precision is retained through the declared base codec. Wrong schemas/types,
+unknown composites, incompatible bases and connection reuse of another client's
+catalog metadata refuse. Query aliases/derived sources and explicit subqueries
+retain this ownership. Catalog admission is a point-in-time contract: rebuild
+metadata after DDL. A Session can share the admitted Database via `Session(db)`
+or AsyncSession(db); metadata admission remains outside automatic flush/property
+access. Domain primary identities, domains over custom enum bases and user
+multirange/composite adapters remain unqualified.

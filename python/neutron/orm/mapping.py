@@ -9,11 +9,18 @@ from typing import Any, Generic, Mapping, TypeVar, get_args, get_origin, get_typ
 from .core import Column, ColumnSpec, OMIT, OrmError, Table, _column_type
 from .json_value import JsonDocument, MutableJson
 from .pg_value import PgArray, PgRange
+from .catalog_value import PgDomain
 from .instrumentation import _MappedField, instrument_model, raw_values, restore_values
 from decimal import Decimal
 import datetime as dt
 
 def same_value(left: Any,right: Any) -> bool:
+    if isinstance(left,PgDomain) and isinstance(right,PgDomain):
+        return left.identity is right.identity and same_value(left.value,right.value)
+    if isinstance(left,PgArray) and isinstance(right,PgArray):
+        return left.dimensions==right.dimensions and len(left.elements)==len(right.elements) and all(same_value(a,b) for a,b in zip(left.elements,right.elements))
+    if isinstance(left,PgRange) and isinstance(right,PgRange):
+        return (left.empty,left.lower_inclusive,left.upper_inclusive)==(right.empty,right.lower_inclusive,right.upper_inclusive) and same_value(left.lower,right.lower) and same_value(left.upper,right.upper)
     if isinstance(left,Decimal) and isinstance(right,Decimal) and left.is_nan() and right.is_nan(): return True
     return bool(left == right)
 
@@ -51,7 +58,7 @@ class ModelMapping(Generic[T]):
             if len(values)!=1: raise ValueError('dataclass field type disagrees with scalar column')
             annotation_type=next(iter(values))
             _column_type(column.spec,annotation_type)
-            if column.spec.python_type in {PgArray,PgRange} and get_origin(annotation_type) is not column.spec.python_type:
+            if column.spec.python_type in {PgArray,PgRange,PgDomain} and get_origin(annotation_type) is not column.spec.python_type:
                 raise ValueError('mapped arrays/ranges require a declared element type')
             if column.spec.nullable and type(None) not in alternatives:
                 raise ValueError('nullable column requires optional dataclass field')
@@ -61,8 +68,8 @@ class ModelMapping(Generic[T]):
         for name in primary_key:
             if name not in field_columns or field_columns[name].spec.nullable:
                 raise ValueError('primary-key fields must be mapped nonnullable columns')
-            if field_columns[name].spec.sql_type in {'json','jsonb'} or field_columns[name].spec.python_type in {PgArray,PgRange}:
-                raise ValueError('JSON/array/range primary keys unsupported')
+            if field_columns[name].spec.sql_type in {'json','jsonb'} or field_columns[name].spec.python_type in {PgArray,PgRange,PgDomain}:
+                raise ValueError('JSON/array/range/domain primary keys unsupported')
         if version_field is not None:
             if version_field not in field_columns or version_field in primary_key:
                 raise ValueError('version field must be mapped outside the primary key')
@@ -90,8 +97,8 @@ class ModelMapping(Generic[T]):
         return deepcopy(raw_values(obj,tuple(self.field_columns)))
 
     def key(self,values: Mapping[str,Any]) -> tuple[Any,...] | None:
-        if any(self.field_columns[name].spec.sql_type in {'json','jsonb'} or self.field_columns[name].spec.python_type in {PgArray,PgRange} for name in self.primary_key):
-            raise ValueError("JSON/array/range primary keys unsupported")
+        if any(self.field_columns[name].spec.sql_type in {'json','jsonb'} or self.field_columns[name].spec.python_type in {PgArray,PgRange,PgDomain} for name in self.primary_key):
+            raise ValueError("JSON/array/range/domain primary keys unsupported")
         key=[]
         for name in self.primary_key:
             value=values[name]

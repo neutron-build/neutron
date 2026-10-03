@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any, Callable, Generic, Mapping, TypeVar, cast
-from .core import Column, ColumnSpec, Compiled, Predicate, Table, _bound_quote
+from .core import Column, ColumnSpec, Compiled, Predicate, Table, _bound_quote, _compiled_owner
 
 T = TypeVar('T')
 U = TypeVar('U')
@@ -163,13 +163,16 @@ class Query(Generic[T]):
                 if operator not in {'UNION','UNION ALL','INTERSECT','EXCEPT'}: raise ValueError('invalid set operator')
                 replace(self,set_terms=(),ordering=(),row_limit=None,row_offset=None)._set(operator,other)
                 compiled=other.compile()
+                if compiled.catalog_owner is not None and compiled.catalog_owner is not first.catalog_owner:
+                    if first.catalog_owner is not None: raise ValueError('set query catalog ownership mismatch')
+                    first=replace(first,catalog_owner=compiled.catalog_owner)
                 # Parentheses preserve explicitly composed left-to-right set semantics.
                 sql='('+sql+' '+operator+' ('+compiled.sql+'))';set_params+=compiled.params
             if self.row_limit is not None:
                 _count(self.row_limit);sql+=' LIMIT %s';set_params+=(self.row_limit,)
             if self.row_offset is not None:
                 _count(self.row_offset);sql+=' OFFSET %s';set_params+=(self.row_offset,)
-            return Compiled(sql,set_params,self.decoder,first.result_oids)
+            return Compiled(sql,set_params,self.decoder,first.result_oids,first.catalog_owner)
         nullable = {join.table for join in self.scope.joins if join.left}
         if not self.fields: raise ValueError('empty projection')
         for item in self.fields:
@@ -225,7 +228,8 @@ class Query(Generic[T]):
                 definition_params+=compiled.params
         if definitions:
             sql='WITH '+', '.join(definitions)+' '+sql;params=definition_params+params
-        return Compiled(sql, params, self.decoder,tuple(("p"+str(i),item.result_spec.type_oid) for i,item in enumerate(self.fields)))
+        owner=_compiled_owner(self.scope.tables,self.predicate,self.having_predicate,*(join.condition for join in self.scope.joins))
+        return Compiled(sql, params, self.decoder,tuple(("p"+str(i),item.result_spec.result_oid) for i,item in enumerate(self.fields)),owner)
 
 
 def _count(count: int) -> None:
@@ -237,7 +241,7 @@ class AliasedTable(Table):
     source: Table
     def __init__(self,source: Table,name: str) -> None:
         if type(source) is not Table: raise ValueError('alias requires an ordinary physical Table')
-        super().__init__(name,{key:column.spec for key,column in source.columns.items()},schema=source.schema)
+        super().__init__(name,{key:column.spec for key,column in source.columns.items()},schema=source.schema,_catalog_owner=source._catalog_owner)
         object.__setattr__(self,'source',source)
 
     @property
@@ -259,7 +263,7 @@ def _source_key(table: Table) -> tuple[str,...]:
 def exists(query: Query[Any]) -> Predicate:
     if not isinstance(query,Query): raise ValueError('EXISTS requires a typed Query')
     compiled=query.compile()
-    return Predicate('EXISTS ('+compiled.sql+')',compiled.params,query.scope.correlated)
+    return Predicate('EXISTS ('+compiled.sql+')',compiled.params,query.scope.correlated,frozenset() if compiled.catalog_owner is None else frozenset({compiled.catalog_owner}))
 
 
 def in_query(column: Column[T],query: Query[T]) -> Predicate:
@@ -267,10 +271,10 @@ def in_query(column: Column[T],query: Query[T]) -> Predicate:
     if not isinstance(query,Query) or len(query.fields)!=1:
         raise ValueError('IN subquery requires exactly one typed projection')
     source=query.fields[0].result_spec
-    if source.sql_type!=column.spec.sql_type:
+    if source.sql_type!=column.spec.sql_type or source.native_type!=column.spec.native_type:
         raise ValueError('IN subquery column profiles must agree')
     compiled=query.compile()
-    return Predicate(column._bound_sql+' IN ('+compiled.sql+')',compiled.params,query.scope.correlated | {column.table})
+    return Predicate(column._bound_sql+' IN ('+compiled.sql+')',compiled.params,query.scope.correlated | {column.table},frozenset() if compiled.catalog_owner is None else frozenset({compiled.catalog_owner}))
 
 
 def _validate_order(order: Order) -> None:
@@ -359,7 +363,7 @@ class DerivedTable(Table):
         if len(labels)!=len(query.fields) or len(set(labels))!=len(labels):
             raise ValueError('derived labels must uniquely cover the projection')
         query.compile() # Validate source before exposing metadata.
-        super().__init__(name,{label:item.result_spec for label,item in zip(labels,query.fields)})
+        super().__init__(name,{label:item.result_spec for label,item in zip(labels,query.fields)},_catalog_owner=query.compile().catalog_owner)
         object.__setattr__(self,'source_query',query)
         object.__setattr__(self,'labels',labels)
 

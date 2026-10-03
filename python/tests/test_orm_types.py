@@ -214,3 +214,21 @@ def static_range_value_consumer(db: Database) -> None:
     assert_type(spec,ColumnSpec[PgRange[int]])
     table=Table('range_values',{'value':spec})
     assert_type(db.all(select(table.nullable_column('value',PgRange[int]))),list[PgRange[int]|None])
+
+from neutron.orm import PgDomain,PgEnum
+from decimal import Decimal
+
+def static_catalog_value_consumer(db: Database) -> None:
+    state=db.enum_spec('app','state')
+    amount=db.domain_spec('app','amount',ColumnSpec(Decimal,'numeric'))
+    assert_type(state,ColumnSpec[PgEnum])
+    assert_type(amount,ColumnSpec[PgDomain[Decimal]])
+    table=db.catalog_table('values',{'state':state,'amount':amount},schema='app')
+    assert_type(db.one(select(table.column('state',PgEnum))),PgEnum)
+    assert_type(db.one(select(table.column('amount',PgDomain[Decimal]))),PgDomain[Decimal])
+
+async def static_async_catalog_value_consumer(db: AsyncDatabase) -> None:
+    amount=await db.domain_spec('app','amount',ColumnSpec(Decimal,'numeric'))
+    assert_type(amount,ColumnSpec[PgDomain[Decimal]])
+    table=await db.catalog_table('values',{'amount':amount},schema='app')
+    assert_type(await db.one(select(table.column('amount',PgDomain[Decimal]))),PgDomain[Decimal])

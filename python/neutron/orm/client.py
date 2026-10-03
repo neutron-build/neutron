@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 from contextlib import contextmanager, asynccontextmanager
 import threading
-from typing import Any, AsyncIterator, Iterator, Mapping, Sequence, TypeVar, TYPE_CHECKING
+from typing import Any, AsyncIterator, Iterator, Mapping, Sequence, TypeVar, TYPE_CHECKING, cast
 from .endpoint import EndpointIdentity, admit, startup_version
 from .json_value import load_document, native_params
 from .query import Query
 from .sql_admission import validate_scope_sql
-from .core import CardinalityError, Compiled, Mutation, OrmError, Returning, Select, SessionBusyError
+from .catalog_value import CatalogType, PgDomain, PgEnum, TYPE_SQL, TABLE_SQL, admitted_type, register_catalog_values
+from .core import ColumnSpec, Table, quote, CardinalityError, Compiled, Mutation, OrmError, Returning, Select, SessionBusyError
 
 if TYPE_CHECKING:
     from .lifecycle import AsyncTransactionHandle, TransactionHandle
@@ -56,6 +57,8 @@ def _admit_native_root(connection: Any) -> None:
 class Database:
     """One native connection. Concurrent active use rejected; no tracked objects."""
     def __init__(self, connection: Any) -> None:
+        self._catalog_owner=object()
+        self._catalog_specs: dict[tuple[str,str],ColumnSpec[Any]]={}
         self._native_binary=False
         self._endpoint_identity: EndpointIdentity | None = None
         self._conn=connection
@@ -102,6 +105,48 @@ class Database:
             if not isinstance(exc,Exception): raise
             raise OrmError("Unable to connect to PostgreSQL",sqlstate=getattr(exc,"sqlstate",None)) from exc
 
+    def _catalog_read(self,sql: str,params: tuple[object,...]) -> list[dict[str,Any]]:
+        if not self._native_binary: raise OrmError('catalog admission requires a native connect client')
+        with self._use():
+            try:
+                with self._conn.cursor() as cur:
+                    cur.execute(sql,params);return list(cur.fetchall())
+            except BaseException as exc:
+                if self._owner is not None: self._rollback_only=True
+                if not isinstance(exc,Exception): raise
+                raise _native(exc) from exc
+
+    def enum_spec(self,schema: str,name: str,*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgEnum]:
+        quote(schema);quote(name)
+        identity=admitted_type(self._catalog_read(TYPE_SQL,(schema,name)),schema,name,'e',self._catalog_owner)
+        cached=self._catalog_specs.get((schema,name))
+        if cached is None or cached.native_type!=identity:
+            register_catalog_values(self._conn,self._catalog_owner,identity)
+            cached=ColumnSpec(PgEnum,'enum',native_type=identity);self._catalog_specs[(schema,name)]=cached
+        from dataclasses import replace
+        return cast(ColumnSpec[PgEnum],replace(cached,nullable=nullable,generated=generated))
+
+    def domain_spec(self,schema: str,name: str,base: ColumnSpec[T],*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgDomain[T]]:
+        quote(schema);quote(name)
+        identity=admitted_type(self._catalog_read(TYPE_SQL,(schema,name)),schema,name,'d',self._catalog_owner)
+        if base.native_type is not None or base.type_oid!=identity.base_oid: raise ValueError('domain declared base SQL type/OID mismatch')
+        cached=self._catalog_specs.get((schema,name))
+        if cached is None or cached.native_type!=identity:
+            register_catalog_values(self._conn,self._catalog_owner,identity)
+            cached=ColumnSpec(PgDomain,'domain',native_type=identity,domain_base=base);self._catalog_specs[(schema,name)]=cached
+        elif cached.domain_base!=base: raise ValueError('domain base profile changed; reconstruct metadata')
+        from dataclasses import replace
+        return cast(ColumnSpec[PgDomain[T]],replace(cached,nullable=nullable,generated=generated))
+
+    def catalog_table(self,name: str,columns: Mapping[str,ColumnSpec[Any]],*,schema: str='public') -> Table:
+        quote(schema);quote(name)
+        actual={row['name']:row for row in self._catalog_read(TABLE_SQL,(schema,name))}
+        for column,spec in columns.items():
+            row=actual.get(column)
+            if row is None or row['oid']!=spec.type_oid: raise ValueError('catalog table column SQL type/OID mismatch')
+            if not spec.nullable and not row['required'] and not (spec.native_type is not None and spec.native_type.required): raise ValueError('catalog nonnullable column requires native NOT NULL')
+        return Table(name,columns,schema=schema,_catalog_owner=self._catalog_owner)
+
     @contextmanager
     def _use(self) -> Iterator[None]:
         if self._closed: raise OrmError('connection closed')
@@ -120,6 +165,7 @@ class Database:
         if isinstance(query,Query) and cardinality != 'many' and (query.row_limit is not None or query.row_offset is not None):
             raise ValueError('exact-one reads refuse pagination')
         compiled=query.compile()
+        if compiled.catalog_owner is not None and compiled.catalog_owner is not self._catalog_owner: raise ValueError('catalog query belongs to another connection')
         validate_scope_sql(compiled.sql)
         with self._use():
             try:
@@ -147,6 +193,7 @@ class Database:
         rows=self._read(query,'optional'); return rows[0] if rows else None
 
     def execute(self, statement: Mutation) -> int:
+        if statement.table is not None and statement.table._catalog_owner is not None and statement.table._catalog_owner is not self._catalog_owner: raise ValueError('catalog mutation belongs to another connection')
         validate_scope_sql(statement.sql,owned=self._owner is not None)
         with self._use():
             try:
@@ -276,6 +323,8 @@ class Database:
 class AsyncDatabase:
     """One native async connection; operation/transaction task ownership explicit."""
     def __init__(self, connection: Any) -> None:
+        self._catalog_owner=object()
+        self._catalog_specs: dict[tuple[str,str],ColumnSpec[Any]]={}
         self._native_binary=False
         self._endpoint_identity: EndpointIdentity | None = None
         self._conn=connection
@@ -321,6 +370,48 @@ class AsyncDatabase:
             if isinstance(exc,OrmError) or not isinstance(exc,Exception): raise
             raise OrmError("Unable to connect to PostgreSQL",sqlstate=getattr(exc,"sqlstate",None)) from exc
 
+    async def _catalog_read(self,sql: str,params: tuple[object,...]) -> list[dict[str,Any]]:
+        if not self._native_binary: raise OrmError('catalog admission requires a native connect client')
+        async with self._use():
+            try:
+                async with self._conn.cursor() as cur:
+                    await cur.execute(sql,params);return list(await cur.fetchall())
+            except BaseException as exc:
+                if self._owner is not None: self._rollback_only=True
+                if not isinstance(exc,Exception): raise
+                raise _native(exc) from exc
+
+    async def enum_spec(self,schema: str,name: str,*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgEnum]:
+        quote(schema);quote(name)
+        identity=admitted_type(await self._catalog_read(TYPE_SQL,(schema,name)),schema,name,'e',self._catalog_owner)
+        cached=self._catalog_specs.get((schema,name))
+        if cached is None or cached.native_type!=identity:
+            register_catalog_values(self._conn,self._catalog_owner,identity)
+            cached=ColumnSpec(PgEnum,'enum',native_type=identity);self._catalog_specs[(schema,name)]=cached
+        from dataclasses import replace
+        return cast(ColumnSpec[PgEnum],replace(cached,nullable=nullable,generated=generated))
+
+    async def domain_spec(self,schema: str,name: str,base: ColumnSpec[T],*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgDomain[T]]:
+        quote(schema);quote(name)
+        identity=admitted_type(await self._catalog_read(TYPE_SQL,(schema,name)),schema,name,'d',self._catalog_owner)
+        if base.native_type is not None or base.type_oid!=identity.base_oid: raise ValueError('domain declared base SQL type/OID mismatch')
+        cached=self._catalog_specs.get((schema,name))
+        if cached is None or cached.native_type!=identity:
+            register_catalog_values(self._conn,self._catalog_owner,identity)
+            cached=ColumnSpec(PgDomain,'domain',native_type=identity,domain_base=base);self._catalog_specs[(schema,name)]=cached
+        elif cached.domain_base!=base: raise ValueError('domain base profile changed; reconstruct metadata')
+        from dataclasses import replace
+        return cast(ColumnSpec[PgDomain[T]],replace(cached,nullable=nullable,generated=generated))
+
+    async def catalog_table(self,name: str,columns: Mapping[str,ColumnSpec[Any]],*,schema: str='public') -> Table:
+        quote(schema);quote(name)
+        actual={row['name']:row for row in await self._catalog_read(TABLE_SQL,(schema,name))}
+        for column,spec in columns.items():
+            row=actual.get(column)
+            if row is None or row['oid']!=spec.type_oid: raise ValueError('catalog table column SQL type/OID mismatch')
+            if not spec.nullable and not row['required'] and not (spec.native_type is not None and spec.native_type.required): raise ValueError('catalog nonnullable column requires native NOT NULL')
+        return Table(name,columns,schema=schema,_catalog_owner=self._catalog_owner)
+
     @asynccontextmanager
     async def _use(self) -> AsyncIterator[None]:
         if self._closed: raise OrmError('connection closed')
@@ -337,6 +428,7 @@ class AsyncDatabase:
         if isinstance(query,Query) and cardinality != 'many' and (query.row_limit is not None or query.row_offset is not None):
             raise ValueError('exact-one reads refuse pagination')
         compiled=query.compile()
+        if compiled.catalog_owner is not None and compiled.catalog_owner is not self._catalog_owner: raise ValueError('catalog query belongs to another connection')
         validate_scope_sql(compiled.sql)
         async with self._use():
             try:
@@ -371,6 +463,7 @@ class AsyncDatabase:
         rows=await self._read(query,'optional'); return rows[0] if rows else None
 
     async def execute(self,statement: Mutation) -> int:
+        if statement.table is not None and statement.table._catalog_owner is not None and statement.table._catalog_owner is not self._catalog_owner: raise ValueError('catalog mutation belongs to another connection')
         validate_scope_sql(statement.sql,owned=self._owner is not None)
         async with self._use():
             try:

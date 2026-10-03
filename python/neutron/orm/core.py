@@ -8,6 +8,7 @@ from typing import Any, Callable, Generic, Iterable, Mapping, TypeVar, cast, get
 from uuid import UUID
 
 from .json_value import BoundJson, JsonDocument, MutableJson
+from .catalog_value import BoundCatalog, CatalogType, PgDomain, PgEnum
 from .pg_value import BoundArray, BoundRange, PgArray, PgRange, TimeOfDay, Interval
 
 T = TypeVar('T')
@@ -51,17 +52,33 @@ class ColumnSpec(Generic[T]):
     sql_type: str
     nullable: bool = False
     generated: bool = False
+    native_type: CatalogType|None=None
+    domain_base: ColumnSpec[Any]|None=None
 
     def __post_init__(self) -> None:
+        if self.native_type is not None:
+            if not isinstance(self.native_type,CatalogType): raise ValueError('catalog type admission required')
+            if self.sql_type=='enum' and self.python_type is PgEnum and self.native_type.kind=='e' and self.domain_base is None: return
+            if self.sql_type=='domain' and self.python_type is PgDomain and self.native_type.kind=='d' and isinstance(self.domain_base,ColumnSpec) and self.domain_base.type_oid==self.native_type.base_oid and self.domain_base.native_type is None: return
+            raise ValueError('catalog kind/base type mismatch')
+        if self.domain_base is not None: raise ValueError('domain base requires catalog identity')
         if _TYPES.get(self.sql_type) is not self.python_type and not (self.sql_type=='jsonb' and self.python_type is MutableJson) and not (self.python_type is PgRange and self.sql_type in _RANGE_TYPES) and not (self.python_type is PgArray and self.sql_type.endswith('[]') and self.sql_type[:-2] in _ARRAY_TYPES):
             raise ValueError('unsupported or mismatched column type profile')
 
     @property
     def type_oid(self) -> int:
+        if self.native_type is not None: return self.native_type.oid
         from .pg_adapters import ARRAY_OIDS, BUILTIN_OIDS
         return ARRAY_OIDS[self.sql_type] if self.sql_type.endswith('[]') else BUILTIN_OIDS[self.sql_type]
 
+    @property
+    def result_oid(self) -> int:
+        return self.domain_base.type_oid if self.domain_base is not None else self.type_oid
+
     def decode(self,value: object) -> object:
+        if self.domain_base is not None and value is not None and not isinstance(value,PgDomain):
+            assert self.native_type is not None
+            value=PgDomain(self.domain_base.decode(value),self.native_type)
         if self.python_type is MutableJson and isinstance(value,JsonDocument): value=MutableJson(value.parsed())
         self.check(value);return value
 
@@ -71,11 +88,18 @@ class ColumnSpec(Generic[T]):
             return
         if not isinstance(value, self.python_type) or (self.python_type is int and isinstance(value, bool)) or (self.sql_type == 'date' and isinstance(value, dt.datetime)):
             raise ValueError('column value has wrong native type')
+        if isinstance(value,(PgEnum,PgDomain)):
+            if value.identity is not self.native_type: raise ValueError('enum/domain qualified identity mismatch')
+            if isinstance(value,PgDomain):
+                assert self.domain_base is not None
+                self.domain_base.check(value.value)
         if isinstance(value,PgRange):
             element_type=_RANGE_TYPES[self.sql_type]
             range_element: ColumnSpec[Any]=ColumnSpec(_TYPES[element_type],element_type)
             for bound in (value.lower,value.upper):
-                if bound is not None: range_element.check(bound)
+                if bound is not None:
+                    range_element.check(bound)
+                    if isinstance(bound,Decimal) and not bound.is_finite(): raise ValueError('finite range numeric bounds required')
         if isinstance(value,PgArray):
             element: ColumnSpec[Any]=ColumnSpec(_TYPES[self.sql_type[:-2]],self.sql_type[:-2],nullable=True)
             for item in value.elements: element.check(item)
@@ -100,7 +124,10 @@ def range_spec(element_type: type[T],sql_type: str,*,nullable: bool=False,genera
 
 
 def _column_type(spec: ColumnSpec[Any],python_type: Any) -> None:
-    if get_origin(python_type) is PgRange:
+    if get_origin(python_type) is PgDomain:
+        if spec.python_type is not PgDomain or spec.domain_base is None: raise ValueError('domain column type mismatch')
+        _column_type(spec.domain_base,get_args(python_type)[0])
+    elif get_origin(python_type) is PgRange:
         if spec.python_type is not PgRange or get_args(python_type)!=(_TYPES[_RANGE_TYPES[spec.sql_type]],):
             raise ValueError('range column element type mismatch')
     elif get_origin(python_type) is PgArray:
@@ -114,10 +141,15 @@ class Table:
     name: str
     schema: str
     columns: Mapping[str, Column[Any]]
-    def __init__(self, name: str, columns: Mapping[str, ColumnSpec[Any]], *, schema: str = 'public') -> None:
+    _catalog_owner: object|None
+    def __init__(self, name: str, columns: Mapping[str, ColumnSpec[Any]], *, schema: str = 'public', _catalog_owner: object|None=None) -> None:
         quote(name); quote(schema)
         if not columns: raise ValueError('table requires columns')
-        for key in columns: quote(key)
+        for key,spec in columns.items():
+            quote(key)
+            if spec.native_type is not None and spec.native_type._owner is not _catalog_owner:
+                raise ValueError('enum/domain columns require owning Database.catalog_table admission')
+        object.__setattr__(self,"_catalog_owner",_catalog_owner)
         object.__setattr__(self,"name",name)
         object.__setattr__(self,"schema",schema)
         object.__setattr__(self,"columns",MappingProxyType({key:Column(self,key,spec) for key,spec in columns.items()}))
@@ -152,11 +184,12 @@ class Predicate:
     sql: str
     params: tuple[object,...] = ()
     owners: frozenset[Table] = frozenset()
+    catalog_owners: frozenset[object]=frozenset()
 
     def __and__(self, other: Predicate) -> Predicate:
-        return Predicate(f'({self.sql}) AND ({other.sql})',self.params+other.params,self.owners|other.owners)
+        return Predicate(f'({self.sql}) AND ({other.sql})',self.params+other.params,self.owners|other.owners,self.catalog_owners|other.catalog_owners)
     def __or__(self, other: Predicate) -> Predicate:
-        return Predicate(f'({self.sql}) OR ({other.sql})',self.params+other.params,self.owners|other.owners)
+        return Predicate(f'({self.sql}) OR ({other.sql})',self.params+other.params,self.owners|other.owners,self.catalog_owners|other.catalog_owners)
     def __bool__(self) -> bool: raise TypeError('SQL predicates cannot be Python booleans')
 
 @dataclass(frozen=True)
@@ -181,7 +214,7 @@ class Column(Generic[T]):
         if isinstance(value,Column):
             value._owned()
             if value.spec.sql_type == "json": raise ValueError("json equality unsupported")
-            if value.spec.python_type is not self.spec.python_type: raise ValueError('incompatible column comparison')
+            if value.spec.python_type is not self.spec.python_type or self.spec.native_type!=value.spec.native_type: raise ValueError('incompatible column comparison')
             return Predicate(f'{self._bound_sql} = {value._bound_sql}',(),frozenset({self.table,value.table}))
         if value is None: return Predicate(f'{self._bound_sql} IS NULL',(),frozenset({self.table}))
         self.spec.check(value)
@@ -201,6 +234,7 @@ class Compiled(Generic[T]):
     params: tuple[object,...]
     decode: Callable[[Mapping[str,Any]],T]
     result_oids: tuple[tuple[str,int],...]=()
+    catalog_owner: object|None=None
 
 @dataclass(frozen=True)
 class Select(Generic[T]):
@@ -219,7 +253,15 @@ class Select(Generic[T]):
         if self.predicate is not None: _condition(self.table,self.predicate)
         sql=f'SELECT {", ".join(c._bound_sql for c in self.columns)} FROM {self.table._bound_sql}'
         if self.predicate is not None: sql+=' WHERE '+self.predicate.sql
-        return Compiled(sql,self.predicate.params if self.predicate is not None else (),self.decoder,tuple((column.name,column.spec.type_oid) for column in self.columns))
+        return Compiled(sql,self.predicate.params if self.predicate is not None else (),self.decoder,tuple((column.name,column.spec.result_oid) for column in self.columns),_compiled_owner((self.table,),self.predicate))
+
+
+def _compiled_owner(tables: Iterable[Table],*conditions: Predicate|None) -> object|None:
+    owners={table._catalog_owner for table in tables if table._catalog_owner is not None}
+    for condition in conditions:
+        if condition is not None: owners.update(condition.catalog_owners)
+    if len(owners)>1: raise ValueError('query combines catalog metadata from different connections')
+    return next(iter(owners),None)
 
 
 def _condition(table: Table, condition: Predicate) -> None:
@@ -272,7 +314,7 @@ class Returning(Generic[T]):
         # Validate ownership using the ordinary projection compiler.
         self.projection.compile()
         fields=", ".join(_bound_quote(c.name) for c in self.projection.columns)
-        return Compiled(self.mutation.sql+' RETURNING '+fields,self.mutation.params,self.projection.decoder,tuple((column.name,column.spec.type_oid) for column in self.projection.columns))
+        return Compiled(self.mutation.sql+' RETURNING '+fields,self.mutation.params,self.projection.decoder,tuple((column.name,column.spec.result_oid) for column in self.projection.columns),self.projection.table._catalog_owner)
 
 
 def _writes(table: Table, values: Mapping[str,object]) -> list[tuple[Column[Any],object]]:
@@ -309,6 +351,8 @@ def delete(table: Table, *, where: Predicate) -> Mutation:
 
 
 def _parameter(column: Column[Any], value: object) -> object:
+    if isinstance(value,PgEnum): return BoundCatalog(value.label,value.identity)
+    if isinstance(value,PgDomain): return BoundCatalog(value.value,value.identity,column.spec.domain_base)
     if isinstance(value,PgRange): return BoundRange(value,column.spec.sql_type)
     if isinstance(value,PgArray): return BoundArray(value,column.spec.sql_type)
     if isinstance(value,MutableJson): return BoundJson(JsonDocument(value.text),True)
