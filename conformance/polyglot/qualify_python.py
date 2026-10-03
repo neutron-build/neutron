@@ -35,9 +35,12 @@ def command(argv: list[str], cwd: Path, timeout: float, capture: bool=False, liv
         # Repeated terminal interrupts must not abandon a still-unreaped child.
         while True:
             try:
-                proc.communicate()
+                proc.wait()
                 break
             except KeyboardInterrupt: continue
+        # Discard pipe data rather than retrying the operation that failed.
+        for pipe in (proc.stdout,proc.stderr):
+            if pipe is not None: pipe.close()
         message='qualification subprocess timed out' if isinstance(exc,subprocess.TimeoutExpired) else 'qualification subprocess interrupted'
         raise ValueError(message) from exc
     if proc.returncode:
