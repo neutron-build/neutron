@@ -944,5 +944,5 @@ declare function dimensionedInsert(value: typeof dimensionedArrays.$inferInsert)
 dimensionedInsert({ values: new PgArray([{ length: 1, lowerBound: -1 }], [9223372036854775807n]) });
 // @ts-expect-error native arrays require explicit dimensions rather than a plain JS array
 dimensionedInsert({ values: [1n] });
-// @ts-expect-error bigint native arrays do not accept text elements
-dimensionedInsert({ values: new PgArray([{ length: 1, lowerBound: 1 }], ["1"]) });
+// @ts-expect-error bigint native arrays do not accept boolean elements
+dimensionedInsert({ values: new PgArray([{ length: 1, lowerBound: 1 }], [true]) });
