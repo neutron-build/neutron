@@ -94,16 +94,27 @@ you care about.
 
 The **differential oracle** in `imap/live_test.go` is the one test that proves
 an adapter reads a real server correctly. It syncs, changes the mailbox from
-outside over SMTP, resyncs, and compares:
+outside over SMTP, resyncs, and compares. It needs a real IMAP server, so
+`mail/testdata/dovecot` ships a throwaway one (Dovecot 2.3 for IMAP, with
+QRESYNC and CONDSTORE; Postfix in front as the SMTP delivery path; one seeded
+user and mailbox with unread, flagged, Drafts, Sent and Trash mail; no real
+accounts), driven by `scripts/live-imap.sh`:
 
 ```bash
-docker run -d -p 13143:3143 -p 13025:3025 \
-  -e GREENMAIL_OPTS='-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.auth.disabled' \
-  greenmail/standalone:latest
+mail/scripts/live-imap.sh up          # docker build + run, waits until seeded
+eval "$(mail/scripts/live-imap.sh env)"
+(cd mail && go test -race ./imap/...)
+mail/scripts/live-imap.sh down
 
-NEUTRON_MAIL_TEST_IMAP=127.0.0.1:13143 NEUTRON_MAIL_TEST_SMTP=127.0.0.1:13025 \
-  go test ./imap/...
+mail/scripts/live-imap.sh test        # all of the above; a skipped live test fails
 ```
+
+`CONTAINER_CLI=podman` swaps the runtime. CI runs the same thing in
+`.github/workflows/mail.yml`. Without `NEUTRON_MAIL_TEST_IMAP` the live tests
+skip, so a plain `go test ./...` stays hermetic. Any other disposable server
+works for the core tests too (GreenMail: `NEUTRON_MAIL_TEST_IMAP` and
+`NEUTRON_MAIL_TEST_SMTP` only); the `Seeded` tests need the fixture and skip
+without `NEUTRON_MAIL_TEST_IMAP_SEEDED=1`.
 
 It has already earned its place: it caught `Apply` failing against every
 server, because syncing selects a mailbox with EXAMINE (read-only, so reading
