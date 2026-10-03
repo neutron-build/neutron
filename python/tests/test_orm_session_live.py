@@ -286,7 +286,7 @@ def test_native_raw_control_refusal_preserves_owned_transaction_rows(mapped):
         with Session(db) as session:
             obj=User(name='uncommitted');session.add(m,obj);session.flush()
             for sql in ('COMMIT','/* hide */ ROLLBACK','SELECT 1; COMMIT','SET LOCAL ROLE postgres'):
-                with pytest.raises(OrmError): db.execute(Mutation(sql))
+                with pytest.raises(OrmError): db.execute(Mutation(sql,()))
             assert native.execute(f'SELECT count(*) FROM {m.table.sql}').fetchone()==(0,)
             db.execute(Mutation(f'UPDATE {m.table.sql} SET name=%s WHERE id=%s',('raw',obj.id)))
             session.rollback();assert obj.id is None

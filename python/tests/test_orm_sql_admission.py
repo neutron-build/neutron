@@ -24,14 +24,14 @@ def test_single_data_sql_quotes_and_nested_comments_admit(sql): validate_scope_s
 def test_native_handle_guard_and_returning_compile_cannot_settle_raw_control():
     db=Database(Connection([]));tx=db.begin()
     for sql in ('COMMIT','ROLLBACK','SELECT 1;COMMIT'):
-        with pytest.raises(OrmError): db.execute(Mutation(sql))
+        with pytest.raises(OrmError): db.execute(Mutation(sql,()))
     with pytest.raises(OrmError): db.one(Q.where(Predicate('TRUE;COMMIT')))
     assert tx.state=='active';tx.rollback()
 
 @pytest.mark.asyncio
 async def test_async_native_handle_guard_cannot_settle_raw_control():
     db=AsyncDatabase(AsyncConnection([]));tx=await db.begin()
-    with pytest.raises(OrmError): await db.execute(Mutation('COMMIT'))
+    with pytest.raises(OrmError): await db.execute(Mutation('COMMIT',()))
     with pytest.raises(OrmError): await db.one(Q.where(Predicate('TRUE;COMMIT')))
     assert tx.state=='active';await tx.rollback()
 
