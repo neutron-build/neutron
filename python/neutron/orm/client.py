@@ -60,7 +60,10 @@ class Database:
                 with self._conn.cursor() as cur:
                     cur.execute(compiled.sql,compiled.params)
                     rows=cur.fetchall() if cardinality=='many' else cur.fetchmany(2)
-            except Exception as exc: raise _native(exc) from exc
+            except Exception as exc:
+                state=getattr(exc,"sqlstate",None)
+                if state is None or str(state).startswith("08"): self._discard()
+                raise _native(exc) from exc
         if cardinality != 'many' and len(rows)>1: raise CardinalityError('expected at most one row')
         if cardinality=='one' and not rows: raise CardinalityError('expected exactly one row')
         return [compiled.decode(row) for row in rows]
@@ -76,7 +79,10 @@ class Database:
                 with self._conn.cursor() as cur:
                     cur.execute(statement.sql,statement.params)
                     return int(cur.rowcount)
-            except Exception as exc: raise _native(exc) from exc
+            except Exception as exc:
+                state=getattr(exc,"sqlstate",None)
+                if state is None or str(state).startswith("08"): self._discard()
+                raise _native(exc) from exc
 
     def _discard(self) -> None:
         self._closed=True
@@ -116,7 +122,10 @@ class Database:
         with self._use():
             self._closed=True
             try: self._conn.close()
-            except Exception as exc: raise _native(exc) from exc
+            except Exception as exc:
+                state=getattr(exc,"sqlstate",None)
+                if state is None or str(state).startswith("08"): self._discard()
+                raise _native(exc) from exc
 
     def __enter__(self) -> Database: return self
     def __exit__(self, *_: object) -> None: self.close()
@@ -163,7 +172,10 @@ class AsyncDatabase:
                 task=asyncio.current_task()
                 if self._owner is None and task is not None and task.cancelling()>1: self._discard()
                 raise
-            except Exception as exc: raise _native(exc) from exc
+            except Exception as exc:
+                state=getattr(exc,"sqlstate",None)
+                if state is None or str(state).startswith("08"): self._discard()
+                raise _native(exc) from exc
         if cardinality!='many' and len(rows)>1: raise CardinalityError('expected at most one row')
         if cardinality=='one' and not rows: raise CardinalityError('expected exactly one row')
         return [compiled.decode(row) for row in rows]
@@ -183,7 +195,10 @@ class AsyncDatabase:
                 task=asyncio.current_task()
                 if self._owner is None and task is not None and task.cancelling()>1: self._discard()
                 raise
-            except Exception as exc: raise _native(exc) from exc
+            except Exception as exc:
+                state=getattr(exc,"sqlstate",None)
+                if state is None or str(state).startswith("08"): self._discard()
+                raise _native(exc) from exc
 
     def _discard(self) -> None:
         # Fencing is synchronous, before another cancellation can interrupt it.
