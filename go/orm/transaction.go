@@ -126,7 +126,9 @@ type transactionOwner struct {
 // identified or forbidden. Callbacks must not leave goroutines or rows behind.
 // A child savepoint suspends all parent operations until its callback finishes.
 // Raw statements are limited to a single data/query statement; explicit
-// transaction controls, CALL, DO, DDL and raw SAVEPOINT commands are refused.
+// transaction controls, CALL, DO, statement-leading DDL and raw SAVEPOINT
+// commands are refused. This keyword admission is not a complete SQL parser:
+// SELECT INTO may create a table and EXPLAIN ANALYZE may execute its data query.
 // Scope is not a SQL sandbox: trusted functions may still mutate session state.
 type Scope struct {
 	owner     *transactionOwner

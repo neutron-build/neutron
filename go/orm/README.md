@@ -95,10 +95,12 @@ it cannot terminate arbitrary application goroutines or blocking custom codecs.
 
 Raw Scope Query/Exec accept a single SELECT, INSERT, UPDATE, DELETE, WITH,
 VALUES, or EXPLAIN statement. Direct transaction controls, savepoint commands,
-DDL, CALL, DO, multiple statements, ambiguous ordinary-string backslashes and
+statement-leading CREATE/ALTER/DROP, CALL, DO, multiple statements, ambiguous ordinary-string backslashes and
 pgx QueryRewriter/NamedArgs arguments are refused. Typed query-core SQL uses
 positional bound parameters and is admitted. This guard prevents accidental
-lifecycle bypass; trusted functions can still change session state.
+lifecycle bypass; trusted functions can still change session state. This is
+keyword-based admission, not a complete SQL parser: SELECT INTO can create a
+table and EXPLAIN ANALYZE can execute the admitted data query.
 
 `TransactionError.Outcome` distinguishes `CommitNotAttempted`, `CommitRejected`,
 and `CommitUnknown`. Cancellation before calling COMMIT is not attempted;
