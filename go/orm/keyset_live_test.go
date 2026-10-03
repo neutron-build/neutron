@@ -19,15 +19,14 @@ func TestPostgresKeysetTiesAndNullOrdering(t *testing.T) {
 	if _, err := admin.Exec(ctx, "CREATE TABLE "+table.info.sqlName()+" (id bigint PRIMARY KEY,value text); INSERT INTO "+table.info.sqlName()+" VALUES (1,NULL),(2,'same'),(3,'same'),(4,'a'),(5,NULL),(6,'z')"); err != nil {
 		t.Fatal(err)
 	}
-	for _, order := range []Order[nullableRecord]{value.Asc(), value.Desc(), value.Asc().NullsFirst(), value.Desc().NullsLast()} {
-		base := Query[nullableRecord]{}.OrderBy(order, id.Asc())
-		compiled, err := CompileSelect(table, base)
-		if err != nil {
-			t.Fatal(err)
-		}
+	for _, scenario := range []struct {
+		order Order[nullableRecord]
+		sql   string
+	}{{value.Asc(), "value ASC,id ASC"}, {value.Desc(), "value DESC,id ASC"}, {value.Asc().NullsFirst(), "value ASC NULLS FIRST,id ASC"}, {value.Desc().NullsLast(), "value DESC NULLS LAST,id ASC"}} {
+		base := Query[nullableRecord]{}.OrderBy(scenario.order, id.Asc())
 		// Independent PostgreSQL native ordering is the oracle; pagination must
 		// reproduce it exactly without skipping/duplicating equal values or NULLs.
-		rows, err := admin.Query(ctx, compiled.SQL, compiled.Args...)
+		rows, err := admin.Query(ctx, "SELECT id,value FROM "+table.info.sqlName()+" ORDER BY "+scenario.sql)
 		if err != nil {
 			t.Fatal(err)
 		}
