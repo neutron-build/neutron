@@ -51,7 +51,9 @@ schema-v2 and migration protocols are not changed by this in-memory metadata.
 
 `one` requires exactly one result; `one_or_none` refuses multiple results.
 `OrmError.sqlstate` preserves native PostgreSQL SQLSTATE; the native exception is
-its cause. Error strings omit native values, but causes can contain them: log
+its cause. Native COMMIT failures carry `outcome` as aborted when the server
+returns SQLSTATE, or indeterminate when no definite server outcome is available.
+There is no automatic replay. Error strings omit native values, but causes can contain them: log
 with appropriate redaction. User exceptions inside transactions propagate after
 native rollback. PostgreSQL autocommit applies outside explicit transactions.
 Rows are validated against selected metadata; missing projections are not

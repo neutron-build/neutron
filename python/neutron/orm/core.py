@@ -10,7 +10,7 @@ from uuid import UUID
 T = TypeVar('T')
 
 class _WriteState:
-    def __init__(self, name: str): self.name = name
+    def __init__(self, name: str) -> None: self.name = name
     def __repr__(self) -> str: return self.name
 
 OMIT = _WriteState('OMIT')
@@ -18,9 +18,10 @@ DEFAULT = _WriteState('DEFAULT')
 
 class OrmError(Exception):
     """SQL core error retaining native PostgreSQL SQLSTATE and cause."""
-    def __init__(self, message: str, *, sqlstate: str | None = None):
+    def __init__(self, message: str, *, sqlstate: str | None = None, outcome: str | None = None) -> None:
         super().__init__(message)
         self.sqlstate = sqlstate
+        self.outcome = outcome
 
 class CardinalityError(OrmError): pass
 class SessionBusyError(OrmError): pass
@@ -65,7 +66,7 @@ class Table:
     name: str
     schema: str
     columns: Mapping[str, Column[Any]]
-    def __init__(self, name: str, columns: Mapping[str, ColumnSpec[Any]], *, schema: str = 'public'):
+    def __init__(self, name: str, columns: Mapping[str, ColumnSpec[Any]], *, schema: str = 'public') -> None:
         quote(name); quote(schema)
         if not columns: raise ValueError('table requires columns')
         for key in columns: quote(key)

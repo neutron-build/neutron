@@ -13,15 +13,16 @@ def _profile(profile: str) -> None:
     if profile != 'postgres-direct': raise OrmError('unsupported/unknown execution profile; operation refused')
 
 
-def _native(error: Exception) -> OrmError:
+def _native(error: Exception, *, committing: bool = False) -> OrmError:
     # Native error text may carry parameter values; retain original in cause,
     # but do not reproduce it in a generic public message.
-    return OrmError('PostgreSQL operation failed',sqlstate=getattr(error,'sqlstate',None))
+    state=getattr(error,'sqlstate',None)
+    return OrmError('PostgreSQL operation failed',sqlstate=state,outcome=('aborted' if state else 'indeterminate') if committing else None)
 
 
 class Database:
     """One native connection. Concurrent active use rejected; no tracked objects."""
-    def __init__(self, connection: Any):
+    def __init__(self, connection: Any) -> None:
         self._conn=connection
         self._lock=threading.Lock()
         self._closed=False
@@ -40,7 +41,9 @@ class Database:
         if self._owner is not None and self._owner != threading.get_ident():
             raise SessionBusyError('transaction belongs to another thread')
         if not self._lock.acquire(blocking=False): raise SessionBusyError('concurrent active session use refused')
-        try: yield
+        try:
+            if self._closed: raise OrmError("connection closed")
+            yield
         finally: self._lock.release()
 
     def _read(self, query: Select[T], cardinality: str) -> list[T]:
@@ -74,11 +77,14 @@ class Database:
         # Hold ownership across the entire native transaction; per-statement
         # guard rejects other threads even between queries.
         with self._use(): self._owner=threading.get_ident()
+        committing=False
         try:
-            with self._conn.transaction(): yield self
+            with self._conn.transaction():
+                yield self
+                committing=True
         except OrmError: raise
         except Exception as exc:
-            if hasattr(exc,"sqlstate"): raise _native(exc) from exc
+            if hasattr(exc,"sqlstate"): raise _native(exc,committing=committing) from exc
             raise
         finally: self._owner=None
 
@@ -94,7 +100,7 @@ class Database:
 
 class AsyncDatabase:
     """One native async connection; operation/transaction task ownership explicit."""
-    def __init__(self, connection: Any):
+    def __init__(self, connection: Any) -> None:
         self._conn=connection
         self._busy=False
         self._closed=False
@@ -145,11 +151,14 @@ class AsyncDatabase:
     async def transaction(self) -> AsyncIterator[AsyncDatabase]:
         if self._owner is not None: raise SessionBusyError('nested transaction unsupported in this slice')
         async with self._use(): self._owner=asyncio.current_task()
+        committing=False
         try:
-            async with self._conn.transaction(): yield self
+            async with self._conn.transaction():
+                yield self
+                committing=True
         except OrmError: raise
         except Exception as exc:
-            if hasattr(exc,"sqlstate"): raise _native(exc) from exc
+            if hasattr(exc,"sqlstate"): raise _native(exc,committing=committing) from exc
             raise
         finally: self._owner=None
 
