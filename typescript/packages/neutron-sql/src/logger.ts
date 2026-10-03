@@ -25,9 +25,8 @@ export type SqlEventKind =
 
 export type IsolationLevel = "read-committed" | "repeatable-read" | "serializable";
 
-/** One structured, redacted observability event. `sql` is the compiled
- * statement text (placeholders, never bound values) on query events; `params`
- * exists ONLY under NEUTRON_SQL_LOG_PARAMS=1. */
+/** One structured observability event. Resolved sinks omit `sql` and `params`
+ * unless NEUTRON_SQL_LOG_PARAMS=1 explicitly exposes diagnostic values. */
 export interface SqlEvent {
   readonly kind: SqlEventKind;
   /** Deterministic id of the statement (sha256 of its SQL text, 16 hex
@@ -54,6 +53,16 @@ export interface SqlEvent {
 export type Logger = (event: SqlEvent) => void;
 
 export type LoggerOption = boolean | Logger;
+
+/** Observe without changing an operation's outcome, including async sinks. */
+export function observeSafely(observer: Logger | undefined, event: SqlEvent): void {
+  try {
+    const result: unknown = observer?.(event);
+    if (result !== null && (typeof result === "object" || typeof result === "function") && typeof (result as { then?: unknown }).then === "function") {
+      void Promise.resolve(result).catch(() => {});
+    }
+  } catch { /* best-effort observation */ }
+}
 
 /** Deprecated pre-I02 name of SqlEvent. The shape changed with structured
  * events: `params` is now optional (populated only under
@@ -100,6 +109,6 @@ export function resolveLogger(option: LoggerOption | undefined): Logger | null {
     const { params, sql, ...rest } = event;
     const payload = paramsLoggingEnabled() ? { ...rest, sql, params } : rest;
     // Telemetry cannot turn an acknowledged write into an application failure.
-    try { sink(payload); } catch { /* best-effort observation */ }
+    observeSafely(sink, payload);
   };
 }

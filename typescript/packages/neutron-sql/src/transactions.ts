@@ -20,7 +20,7 @@ import {
   isFatalConnectionLoss,
   isRetriableTransactionError,
 } from "./errors.js";
-import { errorSummary, statementIdOf, type IsolationLevel, type SqlEvent } from "./logger.js";
+import { errorSummary, observeSafely, statementIdOf, type IsolationLevel, type SqlEvent } from "./logger.js";
 
 /** SQLSTATEs whose arrival during COMMIT means the outcome is UNKNOWN (the
  * session died or the statement was interrupted — the transaction may or may
@@ -184,7 +184,7 @@ export async function runTransaction<T>(
   const beginSql = renderBeginSql(modes);
   const txId = `tx-${++txSequence}`;
   const emit = (event: SqlEvent): void => {
-    try { hooks.onEvent?.(event); } catch { /* observation cannot change transaction outcome */ }
+    observeSafely(hooks.onEvent, event);
   };
   let savepointSeq = 0;
   let released = false;

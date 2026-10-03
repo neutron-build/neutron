@@ -113,3 +113,8 @@ test("redacted sinks omit literal secrets and native duplicate-key values", () =
     else process.env.NEUTRON_SQL_LOG_PARAMS = previous;
   }
 });
+
+test("async observer rejection is drained without process failure", async () => {
+  resolveLogger(async () => { throw new Error("async observer unavailable"); })!({ kind: "query-end", statementId: "fixed" });
+  await new Promise<void>(resolve => setImmediate(resolve));
+});

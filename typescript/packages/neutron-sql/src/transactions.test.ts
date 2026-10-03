@@ -661,3 +661,11 @@ test("transaction observer failures preserve commit, rollback and pin release", 
   assert.deepEqual(aborted.statements, ["begin", "rollback"]);
   assert.deepEqual(aborted.releasedWith, [undefined]);
 });
+
+test("async transaction observers preserve known commit and drain rejections", async () => {
+  const pin = fakePin();
+  assert.equal(await runTransaction(pin, async () => 9, {}, { onEvent: async () => { throw new Error("async observer unavailable"); } }), 9);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.deepEqual(pin.statements, ["begin", "commit"]);
+  assert.deepEqual(pin.releasedWith, [undefined]);
+});
