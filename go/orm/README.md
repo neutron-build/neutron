@@ -491,3 +491,20 @@ refuse duplicate physical tables without explicit aliases.
 ```sh
 go test ./orm -run 'Test(AliasedSelfJoinRoleBindings|PostgresAliasedSelfJoinRoleProjections)' -count=1 -v
 ```
+
+
+Application predicate scopes are query policy; PostgreSQL row-level security is
+a separate authorization boundary. The native gate below provisions an actual
+NOSUPERUSER/NOBYPASSRLS login and a size-one pool, binds an authenticated tenant
+through transaction-local `set_config`, and compares ORM reads with an independent
+native connection using that role. It covers alternating tenants, no-context
+reads, child rollback/release, idle callback cancellation, native query failure
+and denied tenant-changing writes, checking reuse of the same physical pooled
+connection. The application is trusted to select authenticated tenant context;
+this gate does not certify arbitrary tenant-spoofing SQL or external poolers.
+The fixture owns a disposable random role and schema; its generated password
+is never logged. The test database must permit fixture role provisioning.
+
+```sh
+go test ./orm -run TestPostgresLeastPrivilegeTenantRLSAndPoolReset -count=1 -v
+```
