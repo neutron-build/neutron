@@ -774,3 +774,20 @@ Constraint/codec metadata is point-in-time and must be rebuilt after DDL.
 ```sh
 go test ./orm -run 'Test(ConnectCreateNatural|PostgresNullableConnectCreate)' -count=1 -v
 ```
+
+`NewDeferredForeignKey` verifies a schema-unique native DEFERRABLE INITIALLY
+IMMEDIATE FK. `NewGraphNode` creates a sealed typed INSERT node; heterogeneous
+nodes with explicit preallocated keys can participate in `RunDeferredGraph`.
+The operation savepoint sets only selected constraints DEFERRED, runs bounded
+hook inserts, then forces IMMEDIATE validation before release. A missing cyclic
+target rolls back every node and drops events while unrelated parent work can
+continue. Successful nodes have exact typed `GraphNodeModel` handles; unrelated
+handles cannot read results. Node/core-statement budgets and complete static
+assignment validation precede effects. Initial/terminal selected constraint mode
+is explicitly IMMEDIATE. This supports explicit deferred-key cycles; it does not
+infer keys, discover arbitrary object graphs or allocate generated cross-node
+references. Native constraint metadata must be rebuilt after relevant DDL.
+
+```sh
+go test ./orm -run 'Test(DeferredGraphStatic|PostgresExplicitDeferred)' -count=1 -v
+```
