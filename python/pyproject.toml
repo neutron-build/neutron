@@ -23,6 +23,9 @@ Repository = "https://github.com/neutron-build/neutron"
 Issues = "https://github.com/neutron-build/neutron/issues"
 
 [project.optional-dependencies]
+orm = [
+    "psycopg[binary]>=3.2,<4",
+]
 test = [
     "editables>=0.5",
     "pytest>=8.0",
