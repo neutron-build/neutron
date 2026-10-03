@@ -860,3 +860,22 @@ observed data statements, not a full wire-level transaction trace.
 ```sh
 go test ./orm -run 'Test(QueryObserver|PostgresQueryObserver)' -count=1 -v
 ```
+
+The optional `github.com/neutron-build/neutron/go/orm/otel` adapter uses the
+OpenTelemetry trace API to add a redacted `neutron.orm.query` completion event to
+the span in each operation's context:
+
+```go
+observed := orm.ObserveExecutor(scope, otel.Observe)
+```
+
+It preserves the caller's request-span ownership: no global provider/exporter,
+span creation/end, raw native exception recording or parent-span status mutation.
+Duration and consumed/affected rows are bounded event attributes. The application
+owns tracing middleware, sampling/exporting and its provider shutdown. Combine
+metrics and OTel through a request-owned observer closure when both are needed.
+Context propagation follows the official [Span API](https://github.com/open-telemetry/opentelemetry-go/blob/v1.44.0/trace/span.go).
+
+```sh
+go test ./orm/otel -run TestOperationContextOTel -count=1 -v
+```
