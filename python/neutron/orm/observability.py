@@ -62,9 +62,13 @@ class _Measurement:
         from .core import OrmError
         # Read only owned error fields or a native class's fixed SQLSTATE. Never
         # invoke arbitrary exception property access, __str__ or repr callbacks.
-        state=vars(error).get('sqlstate') if type(error) is OrmError else vars(type(error)).get('sqlstate')
+        if self.observer is None: return
+        # The built-in class-dictionary descriptor bypasses both an exception
+        # metaclass's __getattribute__ and a custom __dict__ property.
+        native_class_dict=type.__dict__['__dict__'].__get__(type(error),type)
+        state=vars(error).get('sqlstate') if type(error) is OrmError else native_class_dict.get('sqlstate')
         self.sqlstate=state if type(state) is str and len(state)==5 and all(c in '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ' for c in state) else None
-        self.outcome='cancelled' if isinstance(error,(asyncio.CancelledError,KeyboardInterrupt,SystemExit)) else 'error'
+        self.outcome='cancelled' if self.sqlstate=='57014' or isinstance(error,(asyncio.CancelledError,KeyboardInterrupt,SystemExit)) else 'error'
     def finish(self,error: BaseException|None) -> None:
         if self.observer is None or self.started is None: return
         start=self.started;self.started=None

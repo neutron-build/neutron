@@ -56,3 +56,23 @@ async def test_async_observer_cancellation_and_stream_counts():
     async with stream_db.stream(Q,batch_size=1) as rows:
         assert [value async for value in rows]==[1,2]
     event,=observer.drain();assert event.operation=='stream' and event.row_count==2 and event.outcome=='ok'
+
+
+def test_observer_does_not_invoke_exception_metaclass_dictionary_access():
+    calls=[]
+    class HostileMeta(type):
+        def __getattribute__(cls,name):
+            if name=='__dict__': calls.append(name);raise AssertionError('exception metaclass callback invoked')
+            return super().__getattribute__(name)
+    class HostileFailure(Exception,metaclass=HostileMeta): pass
+    original=HostileFailure('private');observer=QueryObserver()
+    with pytest.raises(HostileFailure) as caught:
+        with _measure(observer,'query') as measurement:
+            measurement.dispatch(owned=True);raise original
+    assert caught.value is original and calls==[]
+    event,=observer.drain();assert event.outcome=='error' and event.sqlstate is None
+    class CancellationFailure(Exception): sqlstate='57014'
+    with pytest.raises(CancellationFailure):
+        with _measure(observer,'query') as measurement:
+            measurement.dispatch(owned=True);raise CancellationFailure()
+    event,=observer.drain();assert event.outcome=='cancelled' and event.sqlstate=='57014'
