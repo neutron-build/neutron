@@ -16,10 +16,12 @@ def run(argv, cwd=consumer, live=False):
     env = dict(os.environ)
     for key in ['NODE_OPTIONS','NODE_PATH','PYTHONPATH','PYTHONHOME']:
         env.pop(key,None)
-    if not live:
-        for key in list(env):
-            if key.endswith('DATABASE_URL') or key == 'NEUTRON_SQL_TEST_URL':
-                env.pop(key)
+    database_url = env.get('NEUTRON_TEST_DATABASE_URL')
+    for key in list(env):
+        if key.startswith('PG') or key.endswith(('DATABASE_URL','DB_URL')) or key == 'NEUTRON_SQL_TEST_URL':
+            env.pop(key)
+    if live and database_url:
+        env['NEUTRON_TEST_DATABASE_URL'] = database_url
     process = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
