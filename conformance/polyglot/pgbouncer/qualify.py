@@ -224,7 +224,6 @@ pidfile = {work/(mode+'.pid')}
                         save()
             for label,consumer in descriptor['clients'].items():
                 if verify_artifacts(json.loads(Path(consumer['artifact_manifest']).read_text()),Path(consumer['artifact_root']))!=artifacts[label]: raise ValueError('installed artifacts changed')
-            report['status']='pass'
         finally:
             if created_schema:
                 marker=native.execute('SELECT pg_catalog.obj_description(oid,%s) FROM pg_catalog.pg_namespace WHERE nspname=%s',('pg_namespace',scope)).fetchone()
@@ -240,6 +239,7 @@ pidfile = {work/(mode+'.pid')}
             # Userlist/config contain credentials. Leave only redacted evidence.
             for path in work.iterdir(): path.unlink(missing_ok=True)
             work.rmdir()
+    report['status']='pass';save()
     print(json.dumps({'status':report['status'],'result':str(report_path),'scope':report['scope']}))
 
 if __name__=='__main__':
