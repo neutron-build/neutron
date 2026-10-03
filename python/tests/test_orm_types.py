@@ -180,3 +180,15 @@ from neutron.orm import MutableJson
 def static_mutable_codec_consumer(db: Database) -> None:
     t=Table('documents',{'body':ColumnSpec(MutableJson,'jsonb',nullable=True)})
     assert_type(db.all(select(t.nullable_column('body',MutableJson))),list[MutableJson|None])
+
+from neutron.orm import ManyToMany, OwnedRelation
+
+def static_owned_graph_consumer(session: Session,root: OwnedRelation[User,User],descendant: OwnedRelation[User,User],parent: User,through: User,meta: ManyToMany[User,User,User]) -> None:
+    assert_type(session.delete_graph(root,parent,budget=LoadBudget(3,10,10),descendants=(descendant,),max_depth=2),None)
+    assert_type(session.connect_many_to_many(meta,parent,parent,through),None)
+    assert_type(session.disconnect_many_to_many(meta,parent,parent,through),None)
+
+async def static_async_owned_graph_consumer(session: AsyncSession,root: OwnedRelation[User,User],descendant: OwnedRelation[User,User],parent: User,through: User,meta: ManyToMany[User,User,User]) -> None:
+    assert_type(await session.delete_graph(root,parent,budget=LoadBudget(3,10,10),descendants=(descendant,),max_depth=2),None)
+    assert_type(session.connect_many_to_many(meta,parent,parent,through),None)
+    assert_type(session.disconnect_many_to_many(meta,parent,parent,through),None)
