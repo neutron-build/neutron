@@ -65,6 +65,9 @@ func writeParts[M any](table Table[M], assignments []Assignment[M]) ([]string, [
 		if a.value == nil && !a.field.nullable {
 			return nil, nil, nil, fmt.Errorf("orm: NULL for nonnullable column")
 		}
+		if err := validateScalarValue(a.value); err != nil {
+			return nil, nil, nil, err
+		}
 		args = append(args, a.value)
 		values = append(values, fmt.Sprintf("$%d", len(args)))
 	}

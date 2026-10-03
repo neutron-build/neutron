@@ -29,7 +29,8 @@ type Table[M any] struct{ info *modelInfo }
 // NewTable requires explicit db tags on exported, non-embedded mapped fields.
 // A nullable field uses a pointer and db:"column,nullable". db:"-" excludes a
 // field. Scalars supported by this core are string, bool, int, int32, int64,
-// float32, float64 and time.Time (or nullable pointers to them). Other codecs
+// float32, float64, time.Time, Decimal, UUID and JSON (or nullable pointers to
+// them). Other codecs
 // require separate qualification; numeric should not be mapped to float.
 func NewTable[M any](schema, name string) (Table[M], error) {
 	var table Table[M]
@@ -90,7 +91,7 @@ func NewTable[M any](schema, name string) (Table[M], error) {
 }
 
 func supportedScalar(t reflect.Type) bool {
-	if t == reflect.TypeOf(time.Time{}) {
+	if t == reflect.TypeOf(time.Time{}) || t == reflect.TypeOf(Decimal{}) || t == reflect.TypeOf(UUID{}) || t == reflect.TypeOf(JSON{}) {
 		return true
 	}
 	// Named user-defined scalar codecs are not implicitly certified.

@@ -78,6 +78,9 @@ func renderPredicate(info *modelInfo, e *expression, args *[]any) (string, error
 		}
 		return "", fmt.Errorf("orm: ordered NULL comparison is invalid")
 	}
+	if err := validateScalarValue(e.value); err != nil {
+		return "", err
+	}
 	*args = append(*args, e.value)
 	return fmt.Sprintf("%s %s $%d", quote(e.field.name), e.kind, len(*args)), nil
 }

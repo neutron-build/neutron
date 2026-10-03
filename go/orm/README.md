@@ -174,3 +174,49 @@ deferred-constraint and Serializable COMMIT rejection:
 ```sh
 go test ./orm -run 'TestPostgres(LostCommitAcknowledgment|DeferredCommitRejection|SerializationCommitRejection|ChildContextCancellation)' -count=1 -v
 ```
+
+Exact native scalar codecs
+--------------------------
+
+The mapped scalar set additionally admits the exact exported `Decimal`, `UUID`
+and `JSON` types and nullable pointers to them. Named user types with the same
+underlying representation are not implicitly certified. The caller's pgx
+registry and protocol remain unchanged; native numeric/UUID scanner and valuer
+interfaces and JSON bytes scanning drive these codecs.
+
+`ParseDecimal(text)` parses finite decimal/scientific text without float64.
+`Decimal.String()` emits exact base-ten text and retained fractional scale.
+Native numeric scanning snapshots the coefficient, and `NumericValue()` returns
+a detached native coefficient. Zero Decimal is invalid; `ParseDecimal("0")` is
+numeric zero; nil `*Decimal` is SQL NULL. NaN and both infinities are refused on
+input and native reads. PostgreSQL17 unconstrained numeric's documented maximum
+131072 integral digits and 16383 fractional digits bound formatting/allocation
+([PostgreSQL numeric types](https://www.postgresql.org/docs/17/datatype-numeric.html)).
+A column's declared numeric precision/scale can still round or reject values on
+the server; the library does not infer or override those declarations.
+
+`ParseUUID(text)` requires the standard hyphenated form and accepts upper/lower
+hex; `UUID.String()` emits lowercase. UUID's zero value is the valid all-zero
+UUID, while nil `*UUID` supplies SQL NULL. Parsing does not invent an ID or
+silently accept malformed separators.
+
+`ParseJSON(text)` validates an immutable document without decoding numbers into
+float64 or collapsing duplicate object keys. `JSON.String()` returns stored
+text. `ParseJSON("null")` is JSON null (`IsNull()` true); nil `*JSON` is SQL NULL.
+Zero JSON is invalid and refused. This distinction survives model reads,
+`SelectColumn` and `SelectPair` through a dedicated nullable bytes destination;
+generic `**T` JSON unmarshalling can conflate these cases and is not used.
+JSON values support both json and jsonb native columns; PostgreSQL jsonb may
+normalize whitespace/key ordering or collapse duplicate keys, while json retains
+text. Server validation/rejection remains authoritative. MarshalJSON emits a
+Decimal as a quoted exact string, UUID as a quoted UUID and JSON as its document.
+
+```sh
+go test ./orm -run 'Test(Decimal|UUID|JSON|Scalar)' -count=1
+go test ./orm -run TestPostgresExactScalarCodecs -count=1 -v
+```
+
+The native gate uses independent SQL text casts and microsecond epoch reads to
+check int8 extrema, exact long numeric/scientific writes, UUIDs, microsecond
+instants with offsets, json/jsonb, nullable numeric/UUID, SQL NULL versus JSON
+null, projection decoding, default/NULL writes and explicit non-finite refusal.

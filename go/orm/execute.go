@@ -80,7 +80,7 @@ func scanModels[M any](rows pgx.Rows, info *modelInfo) ([]M, error) {
 		v := reflect.ValueOf(&model).Elem()
 		dest := make([]any, len(info.fields))
 		for i, f := range info.fields {
-			dest[i] = v.Field(f.index).Addr().Interface()
+			dest[i] = scanDestination(v.Field(f.index))
 		}
 		if err := rows.Scan(dest...); err != nil {
 			return nil, err
@@ -151,7 +151,7 @@ func SelectColumn[M, T any](ctx context.Context, db Executor, column Column[M, T
 	result := []T{}
 	for rows.Next() {
 		var value T
-		if err := rows.Scan(&value); err != nil {
+		if err := rows.Scan(scanDestination(reflect.ValueOf(&value).Elem())); err != nil {
 			return nil, wrap("project", err)
 		}
 		result = append(result, value)
@@ -186,7 +186,7 @@ func SelectPair[M, A, B any](ctx context.Context, db Executor, first Column[M, A
 	result := []Pair[A, B]{}
 	for rows.Next() {
 		var value Pair[A, B]
-		if err := rows.Scan(&value.First, &value.Second); err != nil {
+		if err := rows.Scan(scanDestination(reflect.ValueOf(&value.First).Elem()), scanDestination(reflect.ValueOf(&value.Second).Elem())); err != nil {
 			return nil, wrap("project pair", err)
 		}
 		result = append(result, value)
