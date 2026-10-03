@@ -413,3 +413,38 @@ include its tenant/identity scope in the predicate; no primary key is inferred.
 ```sh
 go test ./orm -run 'Test(ImmutableScopedSoftDeletePolicy|VersionGuardPoisonAndValidation|PostgresScopedSoftDeleteAndVersionGuards)' -count=1 -v
 ```
+
+
+## Explicit bounded relation graph writes
+
+`CreateRelated`, `AppendRelated`, `SaveRelated`, `ReplaceRelated` and
+`DeleteRelated` accept the exact `Relation` binding and its parent/child
+`HookRepository` registrations inside a `WithHookTransaction` callback. Each
+operation owns a child savepoint. Failure rolls back the entire operation even
+if its error is swallowed; only acknowledged RELEASE merges post-commit events.
+The parent session stays reserved for the graph lifetime, including between
+statements. Additional unrelated parent work may continue after clean rollback.
+
+Create prevalidates every child assignment plan before any parent hook or write.
+Child foreign-key columns are derived from the actual returned or locked parent
+composite key; caller overrides are refused. Existing-parent operations lock and
+check exactly one matching composite identity. Save updates explicit non-key
+parent assignments, including empty/zero values, then appends newly inserted
+children. It does not infer tracked changes or child upserts. Replace explicitly
+deletes old children then inserts replacements; Delete explicitly deletes
+children then the parent. These operations perform orphan deletion rather than
+nullable disconnection or inferred database cascades. Parent keys are immutable
+in Save. Self/cyclic physical-table edges refuse before effects.
+
+`GraphBudget` bounds proposed and removed child rows and planned core SQL
+statements. Counts include parent locks, child budget reads and writes;
+savepoint/transaction control and hook extra SQL are separate overhead. A bounded
+child read precedes deletion, and actual DELETE count is checked again to catch
+external unconstrained writers. The schema must enforce the intended unique
+parent and composite FK constraints: relation metadata does not install or
+certify them. Arbitrary deep graphs, deferred cyclic key plans, nullable
+disconnection and implicit many-to-many mutation remain unimplemented.
+
+```sh
+go test ./orm -run 'Test(GraphPrevalidationAndCompositeKeyDerivation|PostgresOwnedRelationGraphMutations)' -count=1 -v
+```
