@@ -136,6 +136,16 @@ func TestPostgresExactScalarCodecs(t *testing.T) {
 	if err := admin.QueryRow(ctx, "SELECT number::text,document IS NULL FROM "+name+" WHERE id=3").Scan(&defaultNumber, &sqlIsNull); err != nil || defaultNumber != "0.00" || !sqlIsNull {
 		t.Fatal("SQL NULL/default oracle", err)
 	}
+	zero, err := SelectColumn(ctx, admin, number, Query[scalarModel]{}.Where(id.Eq(3)))
+	if err != nil || len(zero) != 1 || zero[0].String() != "0" {
+		t.Fatal("native numeric zero value", err)
+	}
+	// Pinned pgx normalizes binary numeric zero's scale; the exact numeric value
+	// is preserved, but representation 0.00 is not a round-trip scale guarantee.
+	var isZero bool
+	if err := admin.QueryRow(ctx, "SELECT number=0::numeric FROM "+name+" WHERE id=3").Scan(&isZero); err != nil || !isZero {
+		t.Fatal("native zero numeric oracle", err)
+	}
 	// Non-finite PostgreSQL values remain explicitly unsupported, including reads.
 	for _, special := range []string{"NaN", "Infinity", "-Infinity"} {
 		if _, err := admin.Exec(ctx, "UPDATE "+name+" SET number=$1::numeric WHERE id=3", special); err != nil {

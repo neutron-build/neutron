@@ -185,7 +185,10 @@ registry and protocol remain unchanged; native numeric/UUID scanner and valuer
 interfaces and JSON bytes scanning drive these codecs.
 
 `ParseDecimal(text)` parses finite decimal/scientific text without float64.
-`Decimal.String()` emits exact base-ten text and retained fractional scale.
+`Decimal.String()` emits exact base-ten text and the represented fractional scale.
+The pinned pgx binary decoder normalizes zero numeric to exponent zero, so a
+server value `0.00` reads as `0`; numeric value is exact, but original formatting
+or declared scale is not a general round-trip guarantee.
 Native numeric scanning snapshots the coefficient, and `NumericValue()` returns
 a detached native coefficient. Zero Decimal is invalid; `ParseDecimal("0")` is
 numeric zero; nil `*Decimal` is SQL NULL. NaN and both infinities are refused on
