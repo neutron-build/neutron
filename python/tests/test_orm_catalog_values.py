@@ -43,3 +43,17 @@ def test_primary_equality_profiles_and_domain_instant_normalization():
     utc=dt.datetime(2020,1,1,tzinfo=dt.timezone.utc)
     offset=utc.astimezone(dt.timezone(dt.timedelta(hours=3)))
     assert mapping.key({'id':PgDomain(utc,identity)})==mapping.key({'id':PgDomain(offset,identity)})
+
+
+def test_enum_domain_equality_binds_preserve_domain_with_qualified_base_cast():
+    owner=object();enum=CatalogType('hostile%"schema','kind',100010,'e',100010,False,owner)
+    domain=CatalogType('app','state_domain',100011,'d',100010,True,owner)
+    base=ColumnSpec(PgEnum,'enum',native_type=enum)
+    spec=ColumnSpec(PgDomain,'domain',native_type=domain,domain_base=base)
+    table=Table('records',{'state':spec},_catalog_owner=owner);column=table.column('state',PgDomain[PgEnum])
+    value=PgDomain(PgEnum('ready',enum),domain)
+    predicate=column.eq(value)
+    assert 'OPERATOR(pg_catalog.=)' in predicate.sql
+    assert predicate.sql.count('::"hostile%%""schema"."kind"')==2
+    assert predicate.params[0].identity is domain
+    assert 'ANY(ARRAY[' in column.in_((value,)).sql

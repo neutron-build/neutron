@@ -204,6 +204,23 @@ class Column(Generic[T]):
     @property
     def _bound_sql(self) -> str: return f'{self.table._bound_reference}.{_bound_quote(self.name)}'
 
+    @property
+    def _enum_comparison_type(self) -> CatalogType|None:
+        spec=self.spec.domain_base if self.spec.domain_base is not None else self.spec
+        return spec.native_type if spec.native_type is not None and spec.native_type.kind=='e' else None
+
+    @property
+    def _comparison_sql(self) -> str:
+        identity=self._enum_comparison_type
+        if identity is not None and self.spec.domain_base is not None:
+            return '('+self._bound_sql+')::'+_bound_quote(identity.schema)+'.'+_bound_quote(identity.name)
+        return self._bound_sql
+
+    @property
+    def _comparison_bind(self) -> str:
+        identity=self._enum_comparison_type
+        return '%s' if identity is None else '%s::'+_bound_quote(identity.schema)+'.'+_bound_quote(identity.name)
+
     def _owned(self) -> None:
         if self.table.columns.get(self.name) is not self:
             raise ValueError("predicate column is not owned by table")
@@ -215,10 +232,12 @@ class Column(Generic[T]):
             value._owned()
             if value.spec.sql_type == "json": raise ValueError("json equality unsupported")
             if value.spec.python_type is not self.spec.python_type or self.spec.native_type!=value.spec.native_type: raise ValueError('incompatible column comparison')
-            return Predicate(f'{self._bound_sql} = {value._bound_sql}',(),frozenset({self.table,value.table}))
+            operator='OPERATOR(pg_catalog.=)' if self._enum_comparison_type is not None else '='
+            return Predicate(f'{self._comparison_sql} {operator} {value._comparison_sql}',(),frozenset({self.table,value.table}))
         if value is None: return Predicate(f'{self._bound_sql} IS NULL',(),frozenset({self.table}))
         self.spec.check(value)
-        return Predicate(f'{self._bound_sql} = %s',(_parameter(self,value),),frozenset({self.table}))
+        operator='OPERATOR(pg_catalog.=)' if self._enum_comparison_type is not None else '='
+        return Predicate(f'{self._comparison_sql} {operator} {self._comparison_bind}',(_parameter(self,value),),frozenset({self.table}))
 
     def in_(self, values: Iterable[T]) -> Predicate:
         self._owned()
@@ -226,6 +245,8 @@ class Column(Generic[T]):
         values=tuple(values)
         if not values: return Predicate('FALSE',(),frozenset({self.table}))
         for value in values: self.spec.check(value)
+        if self._enum_comparison_type is not None:
+            return Predicate(f'{self._comparison_sql} OPERATOR(pg_catalog.=) ANY(ARRAY[{", ".join(self._comparison_bind for _ in values)}])',tuple(_parameter(self,value) for value in values),frozenset({self.table}))
         return Predicate(f'{self._bound_sql} IN ({", ".join("%s" for _ in values)})',tuple(_parameter(self,value) for value in values),frozenset({self.table}))
 
 @dataclass(frozen=True)
