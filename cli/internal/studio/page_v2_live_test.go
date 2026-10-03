@@ -147,9 +147,14 @@ func TestStudioKeysetPageNative(t *testing.T) {
 	if got := strings.Join(keys(first), ","); got != "-9223372036854775808,-1" {
 		t.Fatalf("first keys %s", got)
 	}
-	if first["hasNext"] != true || first["binding"] != "page-epoch:"+fmt.Sprint(uint32FromPageBinding(t, first["binding"].(string))) {
-		t.Fatal("missing binding/continuation")
+	var physicalOID uint32
+	if err = fixture.QueryRow(ctx, `SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='Odd Schema' AND c.relname='Odd Table'`).Scan(&physicalOID); err != nil || physicalOID == 0 {
+		t.Fatal("physical relation oracle failed")
 	}
+	if first["hasNext"] != true || first["binding"] != bindingFor("page-epoch", physicalOID) {
+		t.Fatal("binding differs from physical relation oracle")
+	}
+
 	if first["consistency"] != "live-keyset/request-repeatable-read" {
 		t.Fatal("consistency claim changed")
 	}
@@ -236,17 +241,4 @@ func TestStudioKeysetPageNative(t *testing.T) {
 	if status, _ = call(huge, s.sessionToken); status != 413 {
 		t.Fatalf("huge row status%d", status)
 	}
-}
-
-func uint32FromPageBinding(t *testing.T, binding string) uint32 {
-	t.Helper()
-	var oid uint32
-	parts := strings.Split(binding, ":")
-	if len(parts) != 2 {
-		t.Fatal("invalid binding")
-	}
-	if _, err := fmt.Sscan(parts[1], &oid); err != nil || oid == 0 {
-		t.Fatal("invalid relation OID")
-	}
-	return oid
 }
