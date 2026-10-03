@@ -13,7 +13,7 @@ func TestBackfillSpecificationBoundaries(t *testing.T) {
 	if err := backfillSpecValid(backfillFixtureSpec()); err != nil {
 		t.Fatal(err)
 	}
-	tests := []func(*BackfillSpec){func(s *BackfillSpec) { s.Transformation = "arbitrary-sql" }, func(s *BackfillSpec) { s.BatchRows = 10001 }, func(s *BackfillSpec) { s.TimeoutMilliseconds = 60001 }, func(s *BackfillSpec) { s.To = s.Key }, func(s *BackfillSpec) { s.To = s.From }, func(s *BackfillSpec) { s.Checkpoint = s.Source }, func(s *BackfillSpec) { s.WriterPolicySHA256 = "" }}
+	tests := []func(*BackfillSpec){func(s *BackfillSpec) { s.Checkpoint.Schema = "pg_catalog" }, func(s *BackfillSpec) { s.Transformation = "arbitrary-sql" }, func(s *BackfillSpec) { s.BatchRows = 10001 }, func(s *BackfillSpec) { s.TimeoutMilliseconds = 60001 }, func(s *BackfillSpec) { s.To = s.Key }, func(s *BackfillSpec) { s.To = s.From }, func(s *BackfillSpec) { s.Checkpoint = s.Source }, func(s *BackfillSpec) { s.WriterPolicySHA256 = "" }}
 	for _, bad := range tests {
 		s := backfillFixtureSpec()
 		bad(&s)

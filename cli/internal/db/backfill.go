@@ -98,6 +98,9 @@ func backfillSpecValid(s BackfillSpec) error {
 			return fmt.Errorf("invalid database identifier")
 		}
 	}
+	if strings.HasPrefix(s.Source.Schema, "pg_") || s.Source.Schema == "information_schema" || strings.HasPrefix(s.Checkpoint.Schema, "pg_") || s.Checkpoint.Schema == "information_schema" {
+		return fmt.Errorf("application namespaces required")
+	}
 	if s.From == s.To || s.Key == s.To || s.Source == s.Checkpoint {
 		return fmt.Errorf("source/target/checkpoint identities must be distinct")
 	}
@@ -203,12 +206,14 @@ func backfillColumnByName(r backfillRelation, name string) (backfillColumn, bool
 	return backfillColumn{}, false
 }
 func backfillValidateRelations(ctx context.Context, q pgQueryer, s BackfillSpec, source, checkpoint backfillRelation) error {
-	var keyIndexValid bool
-	if err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_index i ON i.indexrelid=c.conindid WHERE c.conrelid=$1 AND c.contype='p' AND i.indisvalid AND i.indisready AND i.indislive)`, source.OID).Scan(&keyIndexValid); err != nil {
-		return err
-	}
-	if !keyIndexValid {
-		return fmt.Errorf("valid ready primary index required")
+	for _, relation := range []backfillRelation{source, checkpoint} {
+		var keyIndexValid bool
+		if err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_index i ON i.indexrelid=c.conindid WHERE c.conrelid=$1 AND c.contype='p' AND i.indisvalid AND i.indisready AND i.indislive)`, relation.OID).Scan(&keyIndexValid); err != nil {
+			return err
+		}
+		if !keyIndexValid {
+			return fmt.Errorf("valid ready primary index required")
+		}
 	}
 	key, ok := backfillColumnByName(source, s.Key)
 	if !ok || key.TypeOID != 20 || key.Namespace != "pg_catalog" || key.Kind != "b" || !key.NotNull || len(source.PrimaryKey) != 1 || source.PrimaryKey[0] != key.Number {
@@ -409,6 +414,9 @@ func RunBackfillChunk(ctx context.Context, c *Client, job BackfillJob) (Backfill
 		return result, backfillError("checkpoint progress", err)
 	}
 	if err = tx.Commit(bounded); err != nil {
+		if errors.Is(err, pgx.ErrTxCommitRollback) {
+			return BackfillChunk{Status: "rolled-back", JobDigest: job.Digest}, backfillError("commit rollback", err)
+		}
 		return BackfillChunk{Status: "indeterminate", JobDigest: job.Digest}, &BackfillError{Operation: "commit", Cause: err, Indeterminate: true}
 	}
 	result.Status = "committed"
