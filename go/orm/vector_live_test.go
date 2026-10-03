@@ -1,6 +1,7 @@
 package orm
 
 import (
+	"context"
 	"errors"
 	"math"
 	"reflect"
@@ -27,9 +28,19 @@ func TestPostgresExtensionQualifiedVectorAndNativeDimensionChecks(t *testing.T) 
 	if err := admin.QueryRow(ctx, `SELECT n.nspname FROM pg_catalog.pg_extension e JOIN pg_catalog.pg_namespace n ON n.oid=e.extnamespace WHERE e.extname='vector'`).Scan(&extensionSchema); err != nil {
 		t.Fatal(err)
 	}
+	impostorSchema := schema + "_impostor"
+	impostorSQL := quote(impostorSchema)
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+impostorSQL); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := admin.Exec(context.Background(), "DROP SCHEMA "+impostorSQL+" CASCADE"); err != nil {
+			t.Error(err)
+		}
+	})
 	typeSQL := quote(extensionSchema) + ".vector"
 	name := schemaSQL + ".vector_values"
-	if _, err := admin.Exec(ctx, "CREATE TABLE "+name+" (id bigint PRIMARY KEY,embedding "+typeSQL+"(3) NOT NULL,optional "+typeSQL+"); CREATE TYPE "+schemaSQL+".vector AS (x bigint); CREATE TABLE "+schemaSQL+".vector_impostor (id bigint NOT NULL,embedding "+schemaSQL+".vector NOT NULL,optional "+schemaSQL+".vector)"); err != nil {
+	if _, err := admin.Exec(ctx, "CREATE TABLE "+name+" (id bigint PRIMARY KEY,embedding "+typeSQL+"(3) NOT NULL,optional "+typeSQL+"); CREATE TYPE "+impostorSQL+".vector AS (x bigint); CREATE TABLE "+impostorSQL+".vector_impostor (id bigint NOT NULL,embedding "+impostorSQL+".vector NOT NULL,optional "+impostorSQL+".vector)"); err != nil {
 		t.Fatal(err)
 	}
 	table, err := NewPostgresTable[vectorLiveModel](ctx, admin, schema, "vector_values")
@@ -67,7 +78,7 @@ func TestPostgresExtensionQualifiedVectorAndNativeDimensionChecks(t *testing.T) 
 	if _, err := InsertOne(ctx, admin, table, Set(id, Some(int64(2))), Set(embedding, Some(short)), Set(optional, Some(&vector))); err == nil {
 		t.Fatal("native vector typmod dimension bypass")
 	}
-	_, err = NewPostgresTable[vectorLiveModel](ctx, admin, schema, "vector_impostor")
+	_, err = NewPostgresTable[vectorLiveModel](ctx, admin, impostorSchema, "vector_impostor")
 	var refusal *CodecError
 	if !errors.Is(err, ErrCodecUnsupported) || !errors.As(err, &refusal) || refusal.TypeName != "vector" || refusal.OID == 0 {
 		t.Fatal("same-name vector impostor admitted", err)
