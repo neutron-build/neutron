@@ -101,6 +101,17 @@ class AsyncSession(_SessionState):
         except BaseException:
             self._failed=True;raise
 
+    async def merge(self,mapping: ModelMapping[T],obj: T,*,expected: Mapping[str,object]) -> T:
+        values,baseline=self._merge_input(mapping,obj,expected)
+        try:
+            await self._ensure_transaction()
+            query=select_row(mapping.table,*mapping.field_columns.values()).where(self._predicate(mapping,baseline))
+            try: row=await self._database.one(query)
+            except CardinalityError as exc: raise ConflictError('merge did not find exactly one existing row') from exc
+            return self._merge_row(mapping,obj,values,baseline,row)
+        except BaseException:
+            self._failed=True;raise
+
     async def refresh(self,obj: T,*,discard_changes: bool=False) -> T:
         record=self._refresh_record(obj,discard_changes)
         try:

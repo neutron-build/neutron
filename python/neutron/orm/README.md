@@ -386,3 +386,15 @@ callbacks are not emitted for bulk operations; these APIs explicitly bypass
 ordinary per-object optimistic matching and use the caller's predicate. Results
 are buffered, so this is a bounded-use API, not a streaming large-table update
 claim. AsyncSession requires await.
+
+`session.merge(mapping, detached_obj, expected=baseline)` applies a complete
+scalar detached edit onto the Session's authoritative existing identity and
+returns that tracked target; it does not attach the source object or insert a
+missing row. The complete expected baseline must match a fresh native read,
+including composite identity and optional version. Dirty/uncommitted cached
+targets, attached sources, generated-field edits and key/version patches refuse.
+This makes stale detached edits explicit conflicts. Flush performs the ordinary
+optimistic write; rollback restores the fetched/pretransaction target baseline
+while leaving the caller's detached edit intact. AsyncSession requires await.
+This explicit scalar merge contract does not implement SQLAlchemy graph merge
+or inference of an absent baseline.

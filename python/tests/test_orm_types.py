@@ -156,3 +156,10 @@ def static_bulk_consumer(session: Session,mapping: ModelMapping[User],where: Pre
 async def static_async_bulk_consumer(session: AsyncSession,mapping: ModelMapping[User],where: Predicate) -> None:
     assert_type(await session.bulk_update(mapping,{'name':'bulk'},where=where),int)
     assert_type(await session.bulk_delete(mapping,where=where),int)
+
+
+def static_merge_consumer(session: Session,mapping: ModelMapping[User],obj: User) -> None:
+    assert_type(session.merge(mapping,obj,expected=mapping.snapshot(obj)),User)
+
+async def static_async_merge_consumer(session: AsyncSession,mapping: ModelMapping[User],obj: User) -> None:
+    assert_type(await session.merge(mapping,obj,expected=mapping.snapshot(obj)),User)

@@ -56,6 +56,11 @@ class StateStore:
         if identity is not None: self.identities[identity]=record
         return record
 
+    def check_merge_source(self,obj: object) -> None:
+        with _OWNER_LOCK:
+            if _OWNERS.get(id(obj)) is not None:
+                raise OrmError('merge source must be detached from every Session')
+
     def check_existing_attach(self,mapping: ModelMapping[Any],obj: object,values: dict[str,Any]) -> None:
         if id(obj) in self.records: raise OrmError('object already tracked; use refresh')
         identity=self._identity(mapping,values)

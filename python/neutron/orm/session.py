@@ -152,6 +152,41 @@ class _SessionState:
             raise ConflictError('attach-existing scalar values differ; explicitly discard changes')
         self._store.attach_existing(mapping,obj,values)
 
+    def _merge_input(self,mapping: ModelMapping[T],obj: T,expected: Mapping[str,object]) -> tuple[dict[str,Any],dict[str,Any]]:
+        self._guard();self._mapping(mapping);self._store.check_merge_source(obj)
+        values=mapping.snapshot(obj);baseline=dict(expected)
+        if set(baseline)!=set(mapping.field_columns): raise ValueError('merge requires complete expected scalar baseline')
+        for name,column in mapping.field_columns.items():
+            column.spec.check(values[name]);column.spec.check(baseline[name])
+            if column.spec.generated and not same_column_value(column.spec,values[name],baseline[name]):
+                raise OrmError('merge cannot patch a generated field')
+        if mapping.key(values) is None or mapping.key(values)!=mapping.key(baseline):
+            raise OrmError('merge requires unchanged complete primary key')
+        if mapping.version_field is not None and values[mapping.version_field]!=baseline[mapping.version_field]:
+            raise OrmError('merge cannot patch the optimistic version')
+        return values,baseline
+
+    def _merge_row(self,mapping: ModelMapping[T],source: T,values: dict[str,Any],baseline: dict[str,Any],row: dict[str,Any]) -> T:
+        self._store.check_merge_source(source)
+        current=mapping.snapshot(source)
+        if any(not same_column_value(column.spec,current[name],values[name]) for name,column in mapping.field_columns.items()):
+            raise ConflictError('merge source changed during native read')
+        native={name:row[column.name] for name,column in mapping.field_columns.items()}
+        if any(not same_column_value(column.spec,native[name],baseline[name]) for name,column in mapping.field_columns.items()):
+            raise ConflictError('merge expected baseline differs from database')
+        key=mapping.key(native)
+        if key is None: raise OrmError('merge row lacks complete identity')
+        target=self._store.find(mapping,key)
+        if target is None:
+            target=mapping.construct(row);self._store.attach(mapping,target,new=False)
+        else:
+            record=self._store.records[id(target)]
+            if record.was_new or record.state is not ObjectState.PERSISTENT or self._store.dirty(record):
+                raise ConflictError('merge target has local/uncommitted changes')
+            self._store.refreshed(record,native)
+        mapping.restore(target,values)
+        return target
+
     def _refresh_record(self,obj: object,discard_changes: bool) -> Record[Any]:
         self._guard()
         if type(discard_changes) is not bool: raise ValueError('discard_changes requires a boolean')
@@ -330,6 +365,17 @@ class Session(_SessionState):
             except CardinalityError as exc: raise ConflictError('attach-existing did not find exactly one row') from exc
             self._adopt_existing(mapping,obj,values,row,discard_changes)
             return obj
+        except BaseException:
+            self._failed=True;raise
+
+    def merge(self,mapping: ModelMapping[T],obj: T,*,expected: Mapping[str,object]) -> T:
+        values,baseline=self._merge_input(mapping,obj,expected)
+        try:
+            self._ensure_transaction()
+            query=select_row(mapping.table,*mapping.field_columns.values()).where(self._predicate(mapping,baseline))
+            try: row=self._database.one(query)
+            except CardinalityError as exc: raise ConflictError('merge did not find exactly one existing row') from exc
+            return self._merge_row(mapping,obj,values,baseline,row)
         except BaseException:
             self._failed=True;raise
 

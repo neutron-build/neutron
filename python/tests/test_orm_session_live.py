@@ -349,3 +349,32 @@ async def test_native_async_bulk_sync_and_rollback(mapped):
         assert await session.bulk_delete(m,where=m.table.column('id',int).eq(obj.id))==1
         await session.rollback();assert session.object_state(obj) is ObjectState.PERSISTENT
         assert native.execute(f'SELECT count(*) FROM {m.table.sql}').fetchone()==(1,)
+
+
+def test_native_detached_merge_explicit_baseline_conflict_and_rollback(mapped):
+    url,m,native=mapped
+    with Session.connect(url) as session:
+        obj=User(name='original');session.add(m,obj);session.commit();expected=m.snapshot(obj);session.detach(obj)
+        obj.name='patch'
+        target=session.merge(m,obj,expected=expected)
+        assert target is not obj and target.name=='patch'
+        assert session.get(m,obj.id) is target
+        session.rollback();assert target.name=='original' and obj.name=='patch'
+        target=session.merge(m,obj,expected=expected);session.commit()
+        assert native.execute(f'SELECT name FROM {m.table.sql}').fetchone()==('patch',)
+        native.execute(f'UPDATE {m.table.sql} SET name=%s',('external',))
+        with pytest.raises(ConflictError): session.merge(m,obj,expected=expected)
+        session.rollback();assert target.name=='patch'
+        assert native.execute(f'SELECT name FROM {m.table.sql}').fetchone()==('external',)
+
+@pytest.mark.asyncio
+async def test_native_async_detached_merge_and_owner_refusal(mapped):
+    url,m,native=mapped
+    async with await AsyncSession.connect(url) as session:
+        obj=User(name='original');session.add(m,obj);await session.commit();expected=m.snapshot(obj)
+        with pytest.raises(OrmError,match='detached'): await session.merge(m,obj,expected=expected)
+        session.detach(obj);obj.name='async_patch'
+        target=await session.merge(m,obj,expected=expected)
+        assert target is not obj
+        await session.commit()
+        assert native.execute(f'SELECT name FROM {m.table.sql}').fetchone()==('async_patch',)
