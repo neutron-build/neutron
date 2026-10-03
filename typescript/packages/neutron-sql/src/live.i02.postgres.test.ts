@@ -821,3 +821,26 @@ test("live i02 (pg): pool fully quiescent after the battery (no stuck checkouts)
   assert.ok(pool.totalCount >= 1);
   assert.equal(pool.totalCount, pool.idleCount);
 });
+
+for (const driverKind of ["postgres", "pg"] as const) {
+  test(`live i02 (${driverKind}): escaped scope and prepared handles cannot mutate after pin release`, async () => {
+    const ctx = await ctxFor(driverKind);
+    if (!ctx) return;
+    let escaped!: Driver;
+    let prepared!: import("./drivers.js").PreparedStatement;
+    await ctx.driver.begin(async tx => {
+      escaped = tx;
+      prepared = tx.prepare!("insert into i02_notes(body) values ($1)");
+      await tx.execute("insert into i02_notes(body) values ($1)", ["terminal-owner-" + driverKind]);
+    });
+    await assert.rejects(escaped.execute("insert into i02_notes(body) values ($1)", ["terminal-forbidden-" + driverKind]), /scope is settled/);
+    await assert.rejects(escaped.query("select pg_backend_pid()"), /scope is settled/);
+    await assert.rejects(prepared.execute(["terminal-prepared-forbidden-" + driverKind]), /scope is settled/);
+    const native = new pg.Pool({ connectionString: ctx.dbUrl });
+    try {
+      const result = await native.query("select body from i02_notes where body like 'terminal-%' order by body");
+      assert.deepEqual(result.rows.map(row => row.body), ["terminal-owner-" + driverKind]);
+    } finally { await native.end(); }
+    await functionalPoolCheck(ctx);
+  });
+}
