@@ -64,3 +64,13 @@ async def test_async_crud_and_rollback(live_table):
             async with db.transaction():
                 await db.execute(insert(t,{'id':2}));raise ValueError('business failure')
         assert native.execute(f'SELECT count(*) FROM {t.sql} WHERE id=2').fetchone()==(0,)
+
+
+def test_percent_identifier_native_binding(live_table):
+    url,parent,native=live_table
+    odd=Table('odd%s',{'value%s':ColumnSpec(str,'text')},schema=parent.schema)
+    native.execute(f'CREATE TABLE {odd.sql} ("value%s" text NOT NULL)')
+    with Database.connect(url) as db:
+        assert db.execute(insert(odd,{'value%s':"'quoted"}))==1
+        assert db.one(select(odd.column('value%s',str)))=="'quoted"
+    assert native.execute(f'SELECT "value%s" FROM {odd.sql}').fetchone()==("'quoted",)

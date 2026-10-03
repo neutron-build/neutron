@@ -151,6 +151,9 @@ class Select(Generic[T]):
         return Select(self.table,self.columns,self.decoder,condition if self.predicate is None else self.predicate & condition)
 
     def compile(self) -> Compiled[T]:
+        if not self.columns or any(c.table is not self.table or self.table.columns.get(c.name) is not c for c in self.columns) or len({c.name for c in self.columns}) != len(self.columns):
+            raise ValueError("projection requires unique owned columns")
+        if self.predicate is not None: _condition(self.table,self.predicate)
         sql=f'SELECT {", ".join(c._bound_sql for c in self.columns)} FROM {self.table._bound_sql}'
         if self.predicate is not None: sql+=' WHERE '+self.predicate.sql
         return Compiled(sql,self.predicate.params if self.predicate is not None else (),self.decoder)
