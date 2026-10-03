@@ -523,3 +523,22 @@ owned transaction when one snapshot is required.
 ```sh
 go test ./orm -run 'Test(KeysetNullLexicographicAndUniqueAdmission|PostgresKeysetTiesAndNullOrdering)' -count=1 -v
 ```
+
+
+## Typed native aggregates
+
+`CountAll`, `CountColumn`, `CountDistinct`, `Min`, `Max`, `SumInt64`, `AvgInt64`,
+`SumInt32`, `AvgInt32`, `SumDecimal`, `AvgDecimal`, `SumFloat64` and `AvgFloat64`
+retain exact table/model and result types. PostgreSQL SUM/AVG(bigint) return exact
+Decimal results, not int64 or floating point. Empty nullable aggregates return
+Nullable.Valid=false; COUNT returns zero. `AggregateOne` refuses ungrouped
+ordering/pagination that could conceal its single-row contract. `SelectGrouped`
+returns typed group-key/aggregate pairs; Compare supplies a bound HAVING condition
+and only the group key can order results. Group/HAVING handles from another table
+binding are refused. Aggregate codec families unsupported by PostgreSQL retain
+native errors; this bounded API does not claim arbitrary multi-key grouping or
+universal expression algebra.
+
+```sh
+go test ./orm -run 'Test(TypedAggregateCompilationAndOwnership|PostgresExactTypedAggregatesAndHaving)' -count=1 -v
+```
