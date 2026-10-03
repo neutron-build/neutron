@@ -186,6 +186,30 @@ def select_row(table: Table, *columns: Column[Any]) -> Select[dict[str,Any]]:
 class Mutation:
     sql: str
     params: tuple[object,...]
+    table: Table | None = None
+
+    def returning(self, column: Column[T]) -> Returning[T]:
+        if self.table is None or column.table is not self.table:
+            raise ValueError("RETURNING requires a column of the mutation table")
+        projection=select(column)
+        return Returning(self,projection)
+
+    def returning_row(self, *columns: Column[Any]) -> Returning[dict[str,Any]]:
+        if self.table is None: raise ValueError("raw mutation has no owned projection metadata")
+        return Returning(self,select_row(self.table,*columns))
+
+@dataclass(frozen=True)
+class Returning(Generic[T]):
+    mutation: Mutation
+    projection: Select[T]
+
+    def compile(self) -> Compiled[T]:
+        if self.mutation.table is None or self.projection.table is not self.mutation.table or self.projection.predicate is not None:
+            raise ValueError("invalid RETURNING projection")
+        # Validate ownership using the ordinary projection compiler.
+        self.projection.compile()
+        fields=", ".join(_bound_quote(c.name) for c in self.projection.columns)
+        return Compiled(self.mutation.sql+' RETURNING '+fields,self.mutation.params,self.projection.decoder)
 
 
 def _writes(table: Table, values: Mapping[str,object]) -> list[tuple[Column[Any],object]]:
@@ -202,17 +226,17 @@ def _writes(table: Table, values: Mapping[str,object]) -> list[tuple[Column[Any]
 
 def insert(table: Table, values: Mapping[str,object]) -> Mutation:
     writes=_writes(table,values)
-    if not writes: return Mutation(f'INSERT INTO {table._bound_sql} DEFAULT VALUES',())
-    return Mutation(f'INSERT INTO {table._bound_sql} ({", ".join(_bound_quote(c.name) for c,_ in writes)}) VALUES ({", ".join("DEFAULT" if v is DEFAULT else "%s" for _,v in writes)})',tuple(v for _,v in writes if v is not DEFAULT))
+    if not writes: return Mutation(f'INSERT INTO {table._bound_sql} DEFAULT VALUES',(),table)
+    return Mutation(f'INSERT INTO {table._bound_sql} ({", ".join(_bound_quote(c.name) for c,_ in writes)}) VALUES ({", ".join("DEFAULT" if v is DEFAULT else "%s" for _,v in writes)})',tuple(v for _,v in writes if v is not DEFAULT),table)
 
 
 def update(table: Table, values: Mapping[str,object], *, where: Predicate) -> Mutation:
     _condition(table,where)
     writes=_writes(table,values)
     if not writes: raise ValueError('update needs at least one present/default/NULL assignment')
-    return Mutation(f'UPDATE {table._bound_sql} SET {", ".join(_bound_quote(c.name)+" = "+("DEFAULT" if v is DEFAULT else "%s") for c,v in writes)} WHERE {where.sql}',tuple(v for _,v in writes if v is not DEFAULT)+where.params)
+    return Mutation(f'UPDATE {table._bound_sql} SET {", ".join(_bound_quote(c.name)+" = "+("DEFAULT" if v is DEFAULT else "%s") for c,v in writes)} WHERE {where.sql}',tuple(v for _,v in writes if v is not DEFAULT)+where.params,table)
 
 
 def delete(table: Table, *, where: Predicate) -> Mutation:
     _condition(table,where)
-    return Mutation(f'DELETE FROM {table._bound_sql} WHERE {where.sql}',where.params)
+    return Mutation(f'DELETE FROM {table._bound_sql} WHERE {where.sql}',where.params,table)

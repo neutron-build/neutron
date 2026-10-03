@@ -74,3 +74,18 @@ def test_percent_identifier_native_binding(live_table):
         assert db.execute(insert(odd,{'value%s':"'quoted"}))==1
         assert db.one(select(odd.column('value%s',str)))=="'quoted"
     assert native.execute(f'SELECT "value%s" FROM {odd.sql}').fetchone()==("'quoted",)
+
+
+def test_returning_generated_defaults_and_cardinality_rollback(live_table):
+    url,t,native=live_table
+    with Database.connect(url) as db:
+        assert db.one(insert(t,{'id':1}).returning(t.nullable_column('n',int)))==17
+        db.execute(insert(t,{'id':2}))
+        with pytest.raises(CardinalityError):
+            db.one(update(t,{'label':'must rollback'},where=t.column('id',int).in_([1,2])).returning(t.column('id',int)))
+        assert native.execute(f'SELECT label FROM {t.sql} ORDER BY id').fetchall()==[('',),('',)]
+        with pytest.raises(OrmError):
+            with db.transaction():
+                try: db.one(update(t,{'label':'also rollback'},where=t.column('id',int).in_([1,2])).returning(t.column('id',int)))
+                except CardinalityError: pass
+        assert native.execute(f'SELECT label FROM {t.sql} ORDER BY id').fetchall()==[('',),('',)]

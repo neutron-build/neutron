@@ -4,9 +4,15 @@ import asyncio
 from contextlib import contextmanager, asynccontextmanager
 import threading
 from typing import Any, AsyncIterator, Iterator, TypeVar
-from .core import CardinalityError, Mutation, OrmError, Select, SessionBusyError
+from .core import CardinalityError, Mutation, OrmError, Returning, Select, SessionBusyError
 
 T=TypeVar('T')
+
+def _decode_rows(query: Select[T] | Returning[T], compiled: Any, rows: Any, cardinality: str) -> list[T]:
+    if cardinality!='many' and len(rows)>1: raise CardinalityError('expected at most one row')
+    if cardinality=='one' and not rows: raise CardinalityError('expected exactly one row')
+    return [compiled.decode(row) for row in rows]
+
 
 class CommitCancelledError(asyncio.CancelledError):
     """Cancellation during COMMIT; database outcome may be committed."""
@@ -32,6 +38,7 @@ class Database:
         self._conn=connection
         self._lock=threading.Lock()
         self._closed=False
+        self._rollback_only=False
         self._owner: int | None=None
 
     @classmethod
@@ -58,7 +65,9 @@ class Database:
             yield
         finally: self._lock.release()
 
-    def _read(self, query: Select[T], cardinality: str) -> list[T]:
+    def _read(self, query: Select[T] | Returning[T], cardinality: str) -> list[T]:
+        if isinstance(query,Returning) and self._owner is None:
+            with self.transaction(): return self._read(query,cardinality)
         compiled=query.compile()
         with self._use():
             try:
@@ -69,13 +78,17 @@ class Database:
                 state=getattr(exc,"sqlstate",None)
                 if state is None or str(state).startswith("08"): self._discard()
                 raise _native(exc) from exc
-        if cardinality != 'many' and len(rows)>1: raise CardinalityError('expected at most one row')
-        if cardinality=='one' and not rows: raise CardinalityError('expected exactly one row')
-        return [compiled.decode(row) for row in rows]
+        return self._decode(query,compiled,rows,cardinality)
 
-    def all(self, query: Select[T]) -> list[T]: return self._read(query,'many')
-    def one(self, query: Select[T]) -> T: return self._read(query,'one')[0]
-    def one_or_none(self, query: Select[T]) -> T | None:
+    def _decode(self,query: Select[T] | Returning[T],compiled: Any,rows: Any,cardinality: str) -> list[T]:
+        try: return _decode_rows(query,compiled,rows,cardinality)
+        except Exception:
+            if isinstance(query,Returning): self._rollback_only=True
+            raise
+
+    def all(self, query: Select[T] | Returning[T]) -> list[T]: return self._read(query,'many')
+    def one(self, query: Select[T] | Returning[T]) -> T: return self._read(query,'one')[0]
+    def one_or_none(self, query: Select[T] | Returning[T]) -> T | None:
         rows=self._read(query,'optional'); return rows[0] if rows else None
 
     def execute(self, statement: Mutation) -> int:
@@ -106,6 +119,7 @@ class Database:
                 self._discard(); raise _native(exc) from exc
             try:
                 yield self
+                if self._rollback_only: raise OrmError("transaction requires rollback after invalid RETURNING result")
             except BaseException as body:
                 try: native.__exit__(type(body),body,body.__traceback__)
                 except BaseException as cleanup:
@@ -121,7 +135,9 @@ class Database:
                         raise CommitCancelledError() from commit
                     if isinstance(commit,Exception): raise _native(commit,committing=True) from commit
                     raise
-        finally: self._owner=None
+        finally:
+            self._owner=None
+            self._rollback_only=False
 
     def close(self) -> None:
         if self._closed: return
@@ -144,6 +160,7 @@ class AsyncDatabase:
         self._conn=connection
         self._busy=False
         self._closed=False
+        self._rollback_only=False
         self._owner: asyncio.Task[Any] | None=None
 
     @classmethod
@@ -168,7 +185,9 @@ class AsyncDatabase:
         try: yield
         finally: self._busy=False
 
-    async def _read(self,query: Select[T],cardinality: str) -> list[T]:
+    async def _read(self,query: Select[T] | Returning[T],cardinality: str) -> list[T]:
+        if isinstance(query,Returning) and self._owner is None:
+            async with self.transaction(): return await self._read(query,cardinality)
         compiled=query.compile()
         async with self._use():
             try:
@@ -183,13 +202,17 @@ class AsyncDatabase:
                 state=getattr(exc,"sqlstate",None)
                 if state is None or str(state).startswith("08"): self._discard()
                 raise _native(exc) from exc
-        if cardinality!='many' and len(rows)>1: raise CardinalityError('expected at most one row')
-        if cardinality=='one' and not rows: raise CardinalityError('expected exactly one row')
-        return [compiled.decode(row) for row in rows]
+        return self._decode(query,compiled,rows,cardinality)
 
-    async def all(self,query: Select[T]) -> list[T]: return await self._read(query,'many')
-    async def one(self,query: Select[T]) -> T: return (await self._read(query,'one'))[0]
-    async def one_or_none(self,query: Select[T]) -> T | None:
+    def _decode(self,query: Select[T] | Returning[T],compiled: Any,rows: Any,cardinality: str) -> list[T]:
+        try: return _decode_rows(query,compiled,rows,cardinality)
+        except Exception:
+            if isinstance(query,Returning): self._rollback_only=True
+            raise
+
+    async def all(self,query: Select[T] | Returning[T]) -> list[T]: return await self._read(query,'many')
+    async def one(self,query: Select[T] | Returning[T]) -> T: return (await self._read(query,'one'))[0]
+    async def one_or_none(self,query: Select[T] | Returning[T]) -> T | None:
         rows=await self._read(query,'optional'); return rows[0] if rows else None
 
     async def execute(self,statement: Mutation) -> int:
@@ -236,6 +259,7 @@ class AsyncDatabase:
                 raise
             try:
                 yield self
+                if self._rollback_only: raise OrmError("transaction requires rollback after invalid RETURNING result")
             except BaseException as body:
                 try: await native.__aexit__(type(body),body,body.__traceback__)
                 except BaseException as cleanup:
@@ -251,7 +275,9 @@ class AsyncDatabase:
                         raise CommitCancelledError() from commit
                     if isinstance(commit,Exception): raise _native(commit,committing=True) from commit
                     raise
-        finally: self._owner=None
+        finally:
+            self._owner=None
+            self._rollback_only=False
 
     async def close(self) -> None:
         if self._closed: return
