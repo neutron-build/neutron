@@ -331,6 +331,16 @@ has it) — transactions pin their connection through it.
 shared runner on both drivers: `BEGIN` with validated modes, real savepoints
 for nesting, `COMMIT`/`ROLLBACK`, and honest failure classification.
 
+Await each operation before starting another on the same scope. A nested callback
+owns its connection until it settles; the parent is temporarily suspended, and
+escaped child scopes or prepared handles refuse use afterward. Returning with
+unfinished operations drains them before rollback and pool release. A caught
+native SQL failure still requires rollback: use a successful explicit
+`savepoint.rollbackTo()` to recover, or let the transaction roll back. Failed
+savepoint control forces the whole transaction to roll back. Raw SQL in an owned
+scope accepts one statement and refuses transaction control or persistent session
+changes; use the transaction API and `SET LOCAL` for transaction-local settings.
+
 ```ts
 await db.transaction(
   async (tx) => {

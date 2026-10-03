@@ -625,3 +625,26 @@ test('owned raw SQL refuses lifecycle escape before driver dispatch and preserve
   });
   assert.equal(pin.statements.at(-1), 'commit');
 });
+
+test('caught native SQL failures cannot turn an aborted transaction into a successful commit', async () => {
+  const error = new ServerSqlError('native refusal', { sqlstate: '23505' });
+  const pin = fakePin([{ match: /^insert/, error }]);
+  await assert.rejects(runTransaction(pin, async tx => {
+    await assert.rejects(tx.execute('insert fail'), err => err === error);
+  }), err => err === error);
+  assert.equal(pin.statements.at(-1), 'rollback');
+  assert.ok(!pin.statements.includes('commit'));
+});
+
+test('explicit rollback-to recovers a caught SQL failure without poisoning the parent', async () => {
+  const error = new ServerSqlError('native refusal', { sqlstate: '23505' });
+  const pin = fakePin([{ match: /^insert/, error }]);
+  await runTransaction(pin, async tx => {
+    const sp = await tx.savepoint();
+    await assert.rejects(tx.execute('insert fail'), err => err === error);
+    await sp.rollbackTo();
+    await tx.query('select recovered');
+    await sp.release();
+  });
+  assert.equal(pin.statements.at(-1), 'commit');
+});

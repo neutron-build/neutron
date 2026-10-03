@@ -191,7 +191,7 @@ export async function runTransaction<T>(
   let callbackSettled = false;
   let failure: unknown;
   let busy = false;
-  interface ScopeOwner { active: boolean; pending: Set<Promise<unknown>> }
+  interface ScopeOwner { active: boolean; pending: Set<Promise<unknown>>; failed?: unknown }
   let currentOwner: ScopeOwner;
   const savepoints: Array<{ name: string; owner: ScopeOwner; state: SavepointState }> = [];
   const releasePin = (err?: unknown): void => {
@@ -204,17 +204,18 @@ export async function runTransaction<T>(
     if (callbackSettled || released) throw new NeutronSqlError('transaction scope is settled; its pinned connection cannot be reused');
   };
 
-  const checkOwner = (owner: ScopeOwner): void => {
+  const checkOwner = (owner: ScopeOwner, allowFailed = false): void => {
     assertActive();
     if (!owner.active) throw new NeutronSqlError('transaction scope is settled; its savepoint cannot be reused');
     if (currentOwner !== owner) throw new NeutronSqlError('transaction scope is suspended while a nested transaction owns the connection');
     if (failure !== undefined) throw new NeutronSqlError('transaction cleanup failed; the transaction must roll back', { cause: failure });
+    if (!allowFailed && owner.failed !== undefined) throw owner.failed;
   };
-  const track = <R>(owner: ScopeOwner, body: () => Promise<R>): Promise<R> => {
-    checkOwner(owner);
+  const track = <R>(owner: ScopeOwner, body: () => Promise<R>, allowFailed = false): Promise<R> => {
+    checkOwner(owner, allowFailed);
     if (busy) throw new NeutronSqlError('concurrent transaction operations are not supported; await the current operation');
     busy = true;
-    const operation = Promise.resolve().then(body).finally(() => { busy = false; owner.pending.delete(operation); });
+    const operation = Promise.resolve().then(body).catch(err => { owner.failed = err; throw err; }).finally(() => { busy = false; owner.pending.delete(operation); });
     owner.pending.add(operation);
     // Preserve rejection for the caller while retaining a cleanup observer.
     void operation.catch(() => {});
@@ -225,6 +226,7 @@ export async function runTransaction<T>(
     const pending = [...owner.pending];
     await Promise.allSettled(pending);
     if (pending.length) throw new NeutronSqlError('transaction callback returned with pending operations; transaction rolled back');
+    if (owner.failed !== undefined) throw owner.failed;
   };
   const observe = <R>(body: () => Promise<R>): Promise<R> => {
     let operation: Promise<R>;
@@ -296,21 +298,22 @@ export async function runTransaction<T>(
       const record = { name: spName, owner, state: 'active' as SavepointState };
       savepoints.push(record);
       emit({ kind: "savepoint", statementId: statementIdOf(createSql), txId, savepointName: spName, savepointAction: "create" });
-      const checkHandle = (): void => {
-        checkOwner(owner);
+      const checkHandle = (allowFailed = false): void => {
+        checkOwner(owner, allowFailed);
         if (record.state === 'released') throw new NeutronSqlError(`savepoint "${spName}" was already released`);
       };
       return {
         name: spName,
         rollbackTo(): Promise<void> {
           return observe(() => {
-            checkHandle();
+            checkHandle(true);
             return track(owner, async () => {
               const sql = `rollback to savepoint "${spName}"`;
               await nativeControl(sql);
+              owner.failed = undefined;
               for (const removed of savepoints.splice(savepoints.indexOf(record) + 1)) removed.state = 'released';
               emit({ kind: "savepoint", statementId: statementIdOf(sql), txId, savepointName: spName, savepointAction: "rollback-to" });
-            });
+            }, true);
           });
         },
         release(): Promise<void> {
