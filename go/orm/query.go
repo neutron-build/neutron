@@ -186,6 +186,7 @@ type Query[M any] struct {
 	order             []Order[M]
 	limit, offset     int
 	limited, whereSet bool
+	distinct          bool
 }
 
 func (q Query[M]) Where(p Predicate[M]) Query[M] { q.predicate = p; q.whereSet = true; return q }
@@ -195,6 +196,7 @@ func (q Query[M]) OrderBy(order ...Order[M]) Query[M] {
 }
 func (q Query[M]) Limit(limit int) Query[M]   { q.limit = limit; q.limited = true; return q }
 func (q Query[M]) Offset(offset int) Query[M] { q.offset = offset; return q }
+func (q Query[M]) Distinct() Query[M]         { q.distinct = true; return q }
 
 func selectSQL[M any](table Table[M], columns string, q Query[M]) (string, []any, error) {
 	return selectSQLArgs(table, columns, q, nil)
@@ -207,7 +209,11 @@ func selectSQLArgs[M any](table Table[M], columns string, q Query[M], initial []
 		return "", nil, fmt.Errorf("orm: negative limit/offset")
 	}
 	args := append([]any{}, initial...)
-	sql := "SELECT " + columns + " FROM " + table.info.sqlName()
+	selectWord := "SELECT "
+	if q.distinct {
+		selectWord = "SELECT DISTINCT "
+	}
+	sql := selectWord + columns + " FROM " + table.info.sqlName()
 	if q.whereSet {
 		p, err := renderPredicate(table.info, q.predicate.expr, &args)
 		if err != nil {

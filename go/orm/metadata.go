@@ -111,8 +111,13 @@ func identifier(s string) error {
 	}
 	return nil
 }
-func quote(s string) string          { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }
-func (t *modelInfo) sqlName() string { return quote(t.schema) + "." + quote(t.name) }
+func quote(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }
+func (t *modelInfo) sqlName() string {
+	if t.schema == "" {
+		return quote(t.name)
+	} // internal CTE binding; NewTable refuses empty schema
+	return quote(t.schema) + "." + quote(t.name)
+}
 func (t *modelInfo) columns() string {
 	names := make([]string, len(t.fields))
 	for i, f := range t.fields {

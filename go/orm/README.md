@@ -571,3 +571,31 @@ accepted by these constructors.
 ```sh
 go test ./orm -run 'Test(LateralPerParentCompilationAndBinding|PostgresCompositeLateralPerParentPaging)' -count=1 -v
 ```
+
+
+## Typed CTE and set-operation handles
+
+`NewModelQuery(table, query)` represents a complete-model SELECT. `Union`,
+`UnionAll`, `Intersect` and `Except` require the same model type and compatible
+full projection metadata. Plans retain independently bound branch values and
+branch pagination. `SelectModels` returns complete models.
+
+`NewCTE(alias, plan)` returns a sealed derived binding. `DerivedColumn` creates
+typed columns for that binding; original table columns cannot silently filter
+its scope. `SelectDerived` and `SelectDerivedColumn` query the CTE with explicit
+typed filtering, ordering and pagination. `Query.Distinct` emits native DISTINCT
+for the actual projection; unsupported native equality codecs retain SQL errors.
+
+`NewRecursiveCTE(alias, anchor, relation, maxDepth, maxRows)` traverses exact
+relation edges from a complete-model anchor. Depth is explicit from 0 through
+128; maxRows bounds delivered results and rejects overflow without exposing
+partial models. UNION ALL preserves multiplicity, including cycles, which stop
+at the depth bound. It does not claim acyclic input or bound PostgreSQL internal
+execution/memory: appropriate statement deadlines remain necessary, especially
+for branching graphs or output sorting. No arbitrary raw recursive SQL is
+interpolated. These plans do not yet combine multiple independently named CTEs
+or arbitrary correlated subquery expression projections.
+
+```sh
+go test ./orm -run 'Test(TypedSetAndDerivedBindingCompilation|PostgresTypedCTESetAndBoundedRecursiveQueries)' -count=1 -v
+```
