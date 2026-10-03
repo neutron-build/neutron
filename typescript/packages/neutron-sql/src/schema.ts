@@ -406,7 +406,7 @@ export interface TableMetadata<
    *  search path, exported as public). Declared through pgSchema(); the
    *  query layer (CRUD + alias joins) renders qualified references and
    *  schema export v2 exports the table under its schema (Q07), while the
-   *  legacy TS DDL emitter and relational reads reject schema-declared
+   *  legacy TS DDL emitter rejects schema-declared
    *  tables. */
   readonly schema?: string;
   readonly columns: Cols;
@@ -816,7 +816,7 @@ function makeTable<Cols extends Record<string, AnyColumnBuilder>, N extends stri
  *  `alt.users`; `.enum(...)` declares `alt.<enum>`. The query layer (CRUD
  *  select/insert/update/delete and alias joins) renders qualified
  *  references and schema export v2 (Q07) exports these objects under their
- *  schema. The legacy TS DDL emitter (schemaToDDL) and relational reads
+ *  schema. The legacy TS DDL emitter (schemaToDDL)
  *  (db.query) reject schema-declared tables. */
 export interface PgSchemaBuilder {
   readonly schemaName: string;

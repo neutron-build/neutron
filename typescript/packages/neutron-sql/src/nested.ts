@@ -1580,6 +1580,8 @@ export function compileNestedCreate(
   args: NestedCreateInput,
   relationsByTable: Map<string, Record<string, Relation>>,
 ): CompiledNestedWrite {
+  rejectAliasHandle(table, "nested create");
+  rejectViewHandle(table, "nested create");
   const tableName = getTableName(table);
   if (typeof args !== "object" || args === null || !("data" in args)) {
     throw new NeutronSqlError(`create on ${tableName}: expected { data }`);
@@ -1598,6 +1600,8 @@ export function compileNestedUpdate(
   args: NestedUpdateInput,
   relationsByTable: Map<string, Record<string, Relation>>,
 ): CompiledNestedWrite {
+  rejectAliasHandle(table, "nested update");
+  rejectViewHandle(table, "nested update");
   const tableName = getTableName(table);
   if (typeof args !== "object" || args === null || !("where" in args) || !("data" in args)) {
     throw new NeutronSqlError(`update on ${tableName}: expected { where, data } — where names one unique key`);
@@ -1619,6 +1623,8 @@ export function compileNestedDelete(
   args: NestedDeleteInput,
   relationsByTable: Map<string, Record<string, Relation>>,
 ): CompiledNestedWrite {
+  rejectAliasHandle(table, "nested delete");
+  rejectViewHandle(table, "nested delete");
   const tableName = getTableName(table);
   if (typeof args !== "object" || args === null || !("where" in args)) {
     throw new NeutronSqlError(`delete on ${tableName}: expected { where, cascade? } — where names one unique key`);
