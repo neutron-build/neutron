@@ -215,6 +215,10 @@ func (c *Client) IntrospectV3(ctx context.Context) (*V3Document, error) {
 		}
 		model.Inventory = append(model.Inventory, entries...)
 	}
+	model.Inventory, err = attachV3Grants(ctx, tx, model.Inventory)
+	if err != nil {
+		return nil, err
+	}
 	for _, family := range v3Families {
 		status, detail := "not-inspected", "family not inventoried by this bounded reader; absence is unknown"
 		switch family {
@@ -224,6 +228,8 @@ func (c *Client) IntrospectV3(ctx context.Context) (*V3Document, error) {
 			status, detail = "identity-inventory", "all visible user-schema pg_proc identities and input signatures; aggregate/unknown definitions remain unmanaged and incomplete"
 		case "types":
 			status, detail = "identity-inventory", "all visible user-schema pg_type identities, domain constraints, composite attributes, enums and range type references; base I/O/storage and complete range semantics remain unmanaged and incomplete"
+		case "grants":
+			status, detail = "partial", "user-schema relation/schema/routine/type owner defaults and explicit ACL tuples including column grants; default ACL/database/global authority and inherited effective access remain uninspected; unmanaged"
 		case "policies":
 			status, detail = "identity-inventory", "all visible user-schema policies with qualified table parents, roles, expressions and RLS flags; authority/DDL planning unsupported"
 		case "triggers":

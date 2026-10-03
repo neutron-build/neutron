@@ -105,7 +105,24 @@ refuse the entire read rather than silently dropping a member. The native fixtur
 now includes repeated policy/trigger names, RLS expressions and a disabled
 trigger, plus installed vector-extension member addresses.
 
-Grant-family coverage remains `not-inspected`: selected routine/type ACL spelling
-is metadata, not a complete inventory of relation/column/schema/default/database
-privileges or role membership. That mandatory scope is still open. None of these
-additions provides policy/trigger/extension migration support.
+Grant-family coverage is now `partial`. User-schema table/view/materialized-view/
+foreign-table/partition/sequence, schema, routine-overload and defined-type ACLs
+retain grantor and grantee names, PUBLIC as a distinct pseudo-role, privilege,
+grantability and object/column scope. NULL ACLs retain `aclStorage=default` and
+are expanded with PostgreSQL's `acldefault`; explicit empty ACLs remain explicit
+and empty. These tuples describe stored/default object authority, not inherited
+or effective role access. Column grants preserve the exact column name.
+
+The required native ACL gate creates a unique temporary role, removes its
+owned-database dependencies before dropping it, and checks column privileges
+and grant options against PostgreSQL's independent `has_*_privilege` functions:
+
+```sh
+# cwd cli; owned PG17 test database requires CREATE DATABASE and CREATE ROLE
+NEUTRON_LIVE_REQUIRED=1 go test ./internal/db \
+  -run '^TestV3NativeExplicitDefaultAndColumnACLs$' -count=1
+```
+
+Default ACLs, database privileges and global authority/membership remain an
+explicit uninspected mandatory scope. None of these additions provides
+policy/trigger/extension/privilege migration support.
