@@ -17,7 +17,7 @@ that a version has been published; check the registry before releasing.
 | `@neutron-build/nucleus` | 0.2.1 |
 | `@neutron-build/data` | 0.2.1 |
 | `@neutron-build/agents` | 0.2.0 |
-| `@neutron-build/core` | 0.3.0 |
+| `@neutron-build/core` | 0.3.1 |
 | `@neutron-build/cli` | 0.3.1 |
 | `@neutron-build/create` | 0.1.8 |
 | `@neutron-build/auth` | 0.1.5 |
@@ -34,7 +34,9 @@ live: `npm view <package> version`.
 
 The former unscoped `create-neutron` package is deprecated. Do not publish new
 versions under that name. Version 0.1.7 of `@neutron-build/create` is published;
-0.1.8 and the CLI dependency migration are prepared for a future release.
+0.1.8 (with core 0.3.1 and cli 0.3.1, the Vite 8 release) is prepared and must be
+published together: `create` pins the `core`/`cli` pair, and the packed `cli`
+depends on `create`.
 
 ## Publish
 
