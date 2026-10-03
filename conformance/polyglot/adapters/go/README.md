@@ -24,3 +24,19 @@ does not establish a public Go module release, public registry installation,
 write/transaction/association conformance or general polyglot parity. Those
 remain independent gates. NaN/Infinity, arrays and arbitrary custom codecs are
 unsupported by this initial adapter's production scalar package.
+
+On coordinator archives without `.git`, the qualifier consumes the coordinator's
+`source-manifest.json` (a unique list of repository-relative paths) and
+`source-revision` (an exact 40-character lowercase commit SHA, with an optional
+final newline). It validates selected Go files as regular contained paths and
+refuses symlink ancestors or escaping path components. Local checkouts use
+tracked Go paths and HEAD instead. Provenance records and actual source bytes
+are hashed; a commit label alone is not used to establish source identity.
+Unexpected source-module replacement directives are refused. The execution
+command manifest is hashed before invocation as well.
+
+Build, Git and tooling subprocesses receive no database URL or PostgreSQL
+connection environment. Only the runner/oracle/adapter execution receives the
+private disposable URL. Interrupted subprocess groups are killed and reaped,
+including interruption exceptions; preserved artifacts remain available for
+review on both success and failure.
