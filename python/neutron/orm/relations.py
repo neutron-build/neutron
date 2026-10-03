@@ -2,7 +2,7 @@
 from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Generic, Mapping, Sequence, TypeVar
+from typing import Any, Generic, Mapping, Literal, Sequence, TypeVar
 from uuid import UUID
 from .client import AsyncDatabase, Database
 from .core import CardinalityError, OrmError, Predicate
@@ -182,3 +182,25 @@ async def _async_load(db: AsyncDatabase,relation: Relation[P,C],parents: Sequenc
     for start in range(0,len(state.distinct),budget.batch_size):
         batch,requested=state.batch(start);state.consume(await db.all(batch),requested)
     return state.finish()
+
+
+@dataclass(frozen=True)
+class OwnedRelation(Relation[P,C]):
+    """Explicit ORM deletion ownership, independent of database FK actions."""
+    on_delete: Literal['restrict','delete','nullify']='restrict'
+    orphan_delete: bool=False
+
+    def __post_init__(self) -> None:
+        if type(self.orphan_delete) is not bool: raise ValueError('orphan_delete requires boolean')
+        if self.on_delete not in {'restrict','delete','nullify'}: raise ValueError('unknown relation ownership policy')
+        if not isinstance(self.parent_fields,tuple) or not isinstance(self.child_fields,tuple) or self.parent_fields!=self.parent.primary_key:
+            raise ValueError('owned relation requires complete immutable parent primary key')
+        if not self.child_fields or len(self.parent_fields)!=len(self.child_fields) or len(set(self.child_fields))!=len(self.child_fields):
+            raise ValueError('owned relation requires unique paired child fields')
+        for left,right in zip(self.parent_fields,self.child_fields):
+            if left not in self.parent.field_columns or right not in self.child.field_columns: raise ValueError('owned relation field outside mapping')
+            a=self.parent.field_columns[left];b=self.child.field_columns[right]
+            if a.spec.nullable or a.spec.python_type is not b.spec.python_type or a.spec.sql_type!=b.spec.sql_type or a.spec.python_type not in {int,str,bool,UUID} or b.spec.generated:
+                raise UnsupportedRelationError('owned relation requires identical supported scalar key profiles')
+            if self.on_delete=='nullify' and (not b.spec.nullable or right in self.child.primary_key):
+                raise UnsupportedRelationError('nullify requires nullable non-primary child FK fields')

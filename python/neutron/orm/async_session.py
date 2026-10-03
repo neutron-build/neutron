@@ -12,7 +12,7 @@ from .instrumentation import expire_attributes
 from .mapping import ModelMapping
 from .session import ConflictError, _SessionState
 from .state import ObjectState
-from .relations import Association, LoadBudget, Relation, async_load_many, async_load_one
+from .relations import Association, LoadBudget, OwnedRelation, Relation, async_load_many, async_load_one
 T=TypeVar('T')
 P=TypeVar('P')
 C=TypeVar('C')
@@ -65,7 +65,7 @@ class AsyncSession(_SessionState):
     @asynccontextmanager
     async def savepoint(self) -> AsyncIterator[AsyncSession]:
         self._guard();await self.flush();await self._ensure_transaction()
-        checkpoint=self._store.checkpoint();links=self._links.copy()
+        checkpoint=self._store.checkpoint();links=self._links.copy();deletions=self._deletions.copy()
         self._savepoint_depth+=1
         try:
             async with self._database.savepoint():
@@ -80,7 +80,7 @@ class AsyncSession(_SessionState):
                 except BaseException:
                     self._database._discard();self._store.uncertain();self._uncertain=True
                     raise
-                self._links=links;self._failed=False
+                self._links=links;self._deletions=deletions;self._failed=False
             raise
         finally: self._savepoint_depth-=1
 
@@ -111,6 +111,15 @@ class AsyncSession(_SessionState):
             loader=async_load_one if singular else async_load_many
             associations=await loader(self._database,relation,parents,budget=budget)
             return self._attach_associations(relation,associations)
+        except BaseException:
+            self._failed=True;raise
+
+    async def delete_graph(self,relation: OwnedRelation[P,C],parent: P,*,budget: LoadBudget) -> None:
+        self._guard()
+        if not isinstance(relation,OwnedRelation): raise OrmError('delete_graph requires explicit ownership metadata')
+        try:
+            associations=await self.load_relation(relation,[parent],budget=budget)
+            self._mark_graph_delete(relation,parent,associations[0].children)
         except BaseException:
             self._failed=True;raise
 
@@ -212,7 +221,7 @@ class AsyncSession(_SessionState):
             self._failed=True;raise
         else:
             try:
-                self._store.committed();self._links.clear()
+                self._store.committed();self._links.clear();self._deletions.clear()
             except BaseException as exc:
                 self._store.fence_after_commit();self._postcommit_failed=True;self._failed=True;self._database._discard()
                 if isinstance(exc,KeyboardInterrupt): raise PostCommitInterruptedError() from exc
@@ -236,7 +245,7 @@ class AsyncSession(_SessionState):
             self._store.uncertain();self._uncertain=True;self._failed=True;raise
         else: self._store.rollback();self._failed=False
         finally: self._transaction=None
-        self._links.clear()
+        self._links.clear();self._deletions.clear()
         await self._emit('after_rollback')
 
     async def close(self) -> None:

@@ -11,7 +11,7 @@ from .events import EVENT_NAMES, EventName, SessionEvent, PostCommitError, PostC
 from .instrumentation import expire_attributes
 from .mapping import ModelMapping, same_column_value
 from .state import ObjectState, Record, StateStore
-from .relations import Association, LoadBudget, Relation, load_many, load_one
+from .relations import Association, LoadBudget, OwnedRelation, Relation, load_many, load_one
 T=TypeVar('T')
 P=TypeVar('P')
 C=TypeVar('C')
@@ -32,6 +32,7 @@ class _SessionState:
         self._emitting=False
         self._savepoint_depth=0
         self._links: list[tuple[Relation[Any,Any],object,object]]=[]
+        self._deletions: list[tuple[object,object]]=[]
 
     def _owner_check(self) -> None: raise NotImplementedError
 
@@ -113,6 +114,8 @@ class _SessionState:
             parent_id=id(parent);child_id=id(child)
             if parent_id in by_id and child_id in by_id and by_id[parent_id][1]=='insert':
                 dependencies[child_id].add(parent_id)
+        for parent,child in self._deletions:
+            if id(parent) in by_id and id(child) in by_id: dependencies[id(parent)].add(id(child))
         ordered=[];remaining=dict(by_id)
         while remaining:
             ready=[key for key in remaining if not dependencies[key] & remaining.keys()]
@@ -130,9 +133,47 @@ class _SessionState:
                 cached=self._store.find(relation.child,key)
                 if cached is None:
                     self._store.attach(relation.child,child,new=False);cached=child
+                elif self._store.records[id(cached)].state is ObjectState.EXPIRED:
+                    record=self._store.records[id(cached)]
+                    if self._store.dirty(record): raise ConflictError('expired related identity has local changes')
+                    self._store.refreshed(record,values)
                 children.append(cached)
             result.append(Association(association.parent,tuple(children)))
         return tuple(result)
+
+    def disconnect(self,relation: OwnedRelation[P,C],parent: P,child: C) -> None:
+        self._guard();self._validate_owned_children(relation,parent,(child,))
+        if any(not relation.child.field_columns[name].spec.nullable or name in relation.child.primary_key for name in relation.child_fields):
+            raise OrmError('disconnect requires nullable non-primary child FK fields')
+        self._links=[edge for edge in self._links if edge[2] is not child or edge[1] is not parent]
+        for name in relation.child_fields: setattr(child,name,None)
+
+    def remove_related(self,relation: OwnedRelation[P,C],parent: P,child: C) -> None:
+        self._guard();self._validate_owned_children(relation,parent,(child,))
+        if relation.orphan_delete:
+            self._links=[edge for edge in self._links if edge[2] is not child or edge[1] is not parent]
+            self.delete(child)
+        else: self.disconnect(relation,parent,child)
+
+    def _validate_owned_children(self,relation: OwnedRelation[P,C],parent: P,children: Sequence[C]) -> None:
+        if not isinstance(relation,OwnedRelation): raise OrmError('owned graph operation requires explicit OwnedRelation')
+        relation.__post_init__()
+        for mapping,obj in ((relation.parent,parent),*((relation.child,child) for child in children)):
+            record=self._store.records.get(id(obj))
+            if record is None or record.mapping is not mapping or record.state is not ObjectState.PERSISTENT or record.was_new:
+                raise OrmError('owned graph operation requires existing persistent tracked records')
+        expected=relation._key(relation.parent,relation.parent_fields,parent)
+        if any(relation._key(relation.child,relation.child_fields,child)!=expected for child in children):
+            raise ConflictError('child is not connected to the requested parent identity')
+
+    def _mark_graph_delete(self,relation: OwnedRelation[P,C],parent: P,children: Sequence[C]) -> None:
+        self._validate_owned_children(relation,parent,children)
+        if children and relation.on_delete=='restrict': raise OrmError('owned relation restricts deleting a parent with children')
+        for child in children:
+            if relation.on_delete=='delete': self.delete(child)
+            elif relation.on_delete=='nullify': self.disconnect(relation,parent,child)
+            self._deletions.append((parent,child))
+        self.delete(parent)
 
     def delete(self,obj: object) -> None:
         self._guard();record=self._store.records.get(id(obj))
@@ -350,7 +391,7 @@ class Session(_SessionState):
     @contextmanager
     def savepoint(self) -> Iterator[Session]:
         self._guard();self.flush();self._ensure_transaction()
-        checkpoint=self._store.checkpoint();links=self._links.copy()
+        checkpoint=self._store.checkpoint();links=self._links.copy();deletions=self._deletions.copy()
         self._savepoint_depth+=1
         try:
             with self._database.savepoint():
@@ -365,7 +406,7 @@ class Session(_SessionState):
                 except BaseException:
                     self._database._discard();self._store.uncertain();self._uncertain=True
                     raise
-                self._links=links;self._failed=False
+                self._links=links;self._deletions=deletions;self._failed=False
             raise
         finally: self._savepoint_depth-=1
 
@@ -395,6 +436,15 @@ class Session(_SessionState):
             self._ensure_transaction()
             associations=(load_one if singular else load_many)(self._database,relation,parents,budget=budget)
             return self._attach_associations(relation,associations)
+        except BaseException:
+            self._failed=True;raise
+
+    def delete_graph(self,relation: OwnedRelation[P,C],parent: P,*,budget: LoadBudget) -> None:
+        self._guard()
+        if not isinstance(relation,OwnedRelation): raise OrmError('delete_graph requires explicit ownership metadata')
+        try:
+            associations=self.load_relation(relation,[parent],budget=budget)
+            self._mark_graph_delete(relation,parent,associations[0].children)
         except BaseException:
             self._failed=True;raise
 
@@ -496,7 +546,7 @@ class Session(_SessionState):
             self._failed=True;raise
         else:
             try:
-                self._store.committed();self._links.clear()
+                self._store.committed();self._links.clear();self._deletions.clear()
             except BaseException as exc:
                 self._store.fence_after_commit();self._postcommit_failed=True;self._failed=True;self._database._discard()
                 if isinstance(exc,KeyboardInterrupt): raise PostCommitInterruptedError() from exc
@@ -518,7 +568,7 @@ class Session(_SessionState):
             self._store.uncertain();self._uncertain=True;self._failed=True;raise
         else: self._store.rollback();self._failed=False
         finally: self._transaction=None
-        self._links.clear()
+        self._links.clear();self._deletions.clear()
         self._emit('after_rollback')
 
     def close(self) -> None:

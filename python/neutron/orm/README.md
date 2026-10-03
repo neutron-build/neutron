@@ -447,3 +447,16 @@ notification carries explicit known `outcome='committed'` through PostCommitErro
 PostCommitCancelledError or PostCommitInterruptedError. Async cancellation and
 KeyboardInterrupt retain their respective exception families; the adopted
 committed baseline is never presented as rolled back.
+
+`OwnedRelation(..., on_delete='restrict'|'delete'|'nullify', orphan_delete=False)`
+adds explicit ORM ownership policy. Parent keys cover their complete primary
+identity; nullify requires nullable non-primary child FK fields.
+`session.disconnect(relation, parent, child)` clears those keys explicitly.
+`remove_related` deletes the child only when orphan_delete is declared, otherwise
+uses nullable disconnect. `delete_graph(relation, parent, budget=...)` loads and
+validates owned children, orders delete/nullify actions before the parent, and
+preserves ordinary optimistic snapshots and rollback. Async deletion is awaited.
+These are ORM actions independent of database ON DELETE clauses: concurrent
+unloaded children remain protected by the database FK, causing safe transaction
+failure rather than silently certifying an incomplete graph. Undeclared relation
+levels and many-to-many links are not inferred.

@@ -96,3 +96,44 @@ def test_native_required_fk_cycle_refuses_before_opening_transaction(live_table)
         assert session._transaction is None
         session.rollback();assert a.id is None and b.id is None
     assert native.execute(f'SELECT count(*) FROM {t.sql}').fetchone()==(0,)
+
+
+def test_native_owned_delete_cascade_orphan_and_rollback(graph):
+    from neutron.orm import OwnedRelation
+    url,read_relation,native=graph
+    relation=OwnedRelation(read_relation.parent,read_relation.child,read_relation.parent_fields,read_relation.child_fields,on_delete='delete',orphan_delete=True)
+    with Session.connect(url) as session:
+        parent=Parent();a=Child(label='a');b=Child(label='b');session.add_graph(relation,parent,[a,b]);session.commit()
+        session.remove_related(relation,parent,a);session.flush();session.rollback()
+        assert session.object_state(a) is ObjectState.PERSISTENT
+        assert native.execute(f'SELECT count(*) FROM {relation.child.table.sql}').fetchone()==(2,)
+        session.delete_graph(relation,parent,budget=LoadBudget(1,10,10));session.flush();session.rollback()
+        assert session.object_state(parent) is ObjectState.PERSISTENT
+        assert native.execute(f'SELECT count(*) FROM {relation.child.table.sql}').fetchone()==(2,)
+        session.delete_graph(relation,parent,budget=LoadBudget(1,10,10));session.commit()
+        assert native.execute(f'SELECT count(*) FROM {relation.parent.table.sql}').fetchone()==(0,)
+        assert native.execute(f'SELECT count(*) FROM {relation.child.table.sql}').fetchone()==(0,)
+
+@dataclass
+class NullableChild:
+    id: int|None=None
+    parent_id: int|None=None
+    label: str='child'
+
+@pytest.mark.asyncio
+async def test_native_async_nullable_disconnect_and_nullify_ownership(live_table):
+    from neutron.orm import OwnedRelation
+    url,base,native=live_table
+    p=Table('owned_parent',{'id':ColumnSpec(int,'int4',generated=True),'name':ColumnSpec(str,'text')},schema=base.schema)
+    c=Table('owned_nullable',{'id':ColumnSpec(int,'int4',generated=True),'parent_id':ColumnSpec(int,'int4',nullable=True),'label':ColumnSpec(str,'text')},schema=base.schema)
+    native.execute(f'CREATE TABLE {p.sql}(id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,name text NOT NULL)')
+    native.execute(f'CREATE TABLE {c.sql}(id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,parent_id int REFERENCES {p.sql}(id),label text NOT NULL)')
+    pm=ModelMapping(Parent,p,dict(p.columns),primary_key=('id',));cm=ModelMapping(NullableChild,c,dict(c.columns),primary_key=('id',))
+    rel=OwnedRelation(pm,cm,('id',),('parent_id',),on_delete='nullify')
+    async with await AsyncSession.connect(url) as session:
+        parent=Parent();child=NullableChild();session.add_graph(rel,parent,[child]);await session.commit()
+        session.disconnect(rel,parent,child);await session.flush();await session.rollback()
+        assert child.parent_id==parent.id
+        await session.delete_graph(rel,parent,budget=LoadBudget(1,10,10));await session.commit()
+        assert native.execute(f'SELECT parent_id FROM {c.sql}').fetchone()==(None,)
+        assert native.execute(f'SELECT count(*) FROM {p.sql}').fetchone()==(0,)

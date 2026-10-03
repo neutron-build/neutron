@@ -48,3 +48,6 @@ __all__ += ["MutableJson"]
 
 from .events import PostCommitCancelledError, PostCommitError, PostCommitInterruptedError
 __all__ += ["PostCommitCancelledError","PostCommitError","PostCommitInterruptedError"]
+
+from .relations import OwnedRelation
+__all__ += ["OwnedRelation"]
