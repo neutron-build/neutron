@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -26,6 +27,10 @@ type modelInfo struct {
 // PostgreSQL table. Each constructor creates a distinct binding scope.
 type Table[M any] struct{ info *modelInfo }
 
+// Go struct types/tags are immutable at runtime. Cache only the validated model
+// shape, never a table binding or mutable application state.
+var modelShapeCache sync.Map
+
 // NewTable requires explicit db tags on exported, non-embedded mapped fields.
 // A nullable field uses a pointer and db:"column,nullable". db:"-" excludes a
 // field. Scalars supported by this core are string, bool, int, int32, int64,
@@ -43,6 +48,10 @@ func NewTable[M any](schema, name string) (Table[M], error) {
 	t := reflect.TypeOf((*M)(nil)).Elem()
 	if t.Kind() != reflect.Struct {
 		return table, fmt.Errorf("orm: model must be a struct")
+	}
+	if cached, ok := modelShapeCache.Load(t); ok {
+		shape := cached.(*modelInfo)
+		return Table[M]{&modelInfo{schema: schema, name: name, fields: shape.fields, byGoName: shape.byGoName}}, nil
 	}
 	info := &modelInfo{schema: schema, name: name, byGoName: map[string]int{}}
 	seen := map[string]bool{}
@@ -86,6 +95,10 @@ func NewTable[M any](schema, name string) (Table[M], error) {
 	if len(info.fields) == 0 {
 		return table, fmt.Errorf("orm: model has no mapped fields")
 	}
+	shape, _ := modelShapeCache.LoadOrStore(t, &modelInfo{fields: info.fields, byGoName: info.byGoName})
+	blueprint := shape.(*modelInfo)
+	info.fields = blueprint.fields
+	info.byGoName = blueprint.byGoName
 	table.info = info
 	return table, nil
 }

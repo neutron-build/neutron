@@ -599,3 +599,28 @@ or arbitrary correlated subquery expression projections.
 ```sh
 go test ./orm -run 'Test(TypedSetAndDerivedBindingCompilation|PostgresTypedCTESetAndBoundedRecursiveQueries)' -count=1 -v
 ```
+
+## Distributed typed column generator
+
+The SDK module includes `cmd/neutron-ormgen`; install it from the same pinned
+module version as the runtime. Generation reads an explicit struct's `db` tags
+without connecting to a database. It produces a typed column bundle and a
+constructor that checks runtime field types and tags before creating a table.
+`-check` compares the deterministic generated source without writing it. The
+fingerprint describes Go mapped metadata; it does not certify live database DDL.
+
+```sh
+go run github.com/neutron-build/neutron/go/cmd/neutron-ormgen -dir . -type Record -out record_columns.gen.go
+go run github.com/neutron-build/neutron/go/cmd/neutron-ormgen -dir . -type Record -out record_columns.gen.go -check
+```
+
+Generated `NewRecordTable(schema, name)` returns the table and `RecordColumns`;
+`columns.Name.Eq(1)` and nonexistent column members fail compilation. Generic,
+embedded, untagged, conflicting and unqualified codec fields refuse generation.
+Ignored `db:"-"` fields have no column. Reflection construction caches immutable
+validated Go shapes while preserving independent table identity for every
+constructor, including concurrent calls.
+
+```sh
+go test ./cmd/neutron-ormgen ./orm -run 'Test(Generator|GeneratedOutside|MetadataCache)' -count=1 -v
+```
