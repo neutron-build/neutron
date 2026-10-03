@@ -910,3 +910,28 @@ async function sameShapeWithDynamicName(dynamicName: string): Promise<void> {
   void eqCat;
 }
 void sameShapeWithDynamicName;
+
+// Qualified relation typing retains the literal schema, even when table names
+// and all column types match in two schemas.
+const tenantA = pgSchema("typing_a");
+const tenantB = pgSchema("typing_b");
+const aUser = tenantA.table("users", { id: integer("id").primaryKey() });
+const bUser = tenantB.table("users", { id: integer("id").primaryKey() });
+const aPost = tenantA.table("posts", { id: integer("id").primaryKey(), userId: integer("user_id") });
+const bPost = tenantB.table("posts", { id: integer("id").primaryKey(), userId: integer("user_id") });
+const aUserEdges = relations(aUser, ({ many }) => ({ posts: many(aPost) }));
+const bUserEdges = relations(bUser, ({ many }) => ({ posts: many(bPost) }));
+const aPostEdges = relations(aPost, ({ one }) => ({ author: one(aUser, { fields: [aPost.userId], references: [aUser.id] }) }));
+const bPostEdges = relations(bPost, ({ one }) => ({ reviewer: one(bUser, { fields: [bPost.userId], references: [bUser.id] }) }));
+async function qualifiedRelationTypes() {
+  const db = await createDatabase({ url: "postgres://not-executed", tables: { aUser, bUser, aPost, bPost },
+    relations: { aUser: aUserEdges, bUser: bUserEdges, aPost: aPostEdges, bPost: bPostEdges } });
+  const result = await db.query.aUser.findMany({ with: { posts: { with: { author: true } } } });
+  const id: number | undefined = result[0]?.posts[0]?.author?.id;
+  void id;
+  // @ts-expect-error A's post has author, never B's reviewer edge.
+  db.query.aUser.findMany({ with: { posts: { with: { reviewer: true } } } });
+  // @ts-expect-error B's post has reviewer, never A's author edge.
+  db.query.bUser.findMany({ with: { posts: { with: { author: true } } } });
+}
+void qualifiedRelationTypes;
