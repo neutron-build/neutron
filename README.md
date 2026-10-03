@@ -13,7 +13,7 @@ Neutron is a modular, multi-language full-stack framework. Every component is in
 ## Quick start
 
 ```bash
-npm create neutron@latest
+npm create @neutron-build@latest
 ```
 
 Scaffolds a TypeScript app with file-based routing, SSR on Preact, and a typed Nucleus client. Then:

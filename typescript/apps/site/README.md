@@ -1,13 +1,13 @@
 # neutron.build
 
 This directory contains the public Neutron documentation and marketing site.
-The site is built locally and served as static files by Caddy through Teploy.
+The site is built before deployment and served as static files by Caddy through Teploy.
 
 From the `typescript/` directory:
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm --filter create-neutron build
+pnpm --filter @neutron-build/create build
 pnpm --filter @neutron-build/core build
 pnpm --filter @neutron-build/cli build
 pnpm --dir apps/site build

@@ -149,7 +149,7 @@ The framework's pitch expands from "Astro/Next.js competitor" to "Astro/Next.js 
 
 - Default behavior is byte-for-byte unchanged; every existing `createServer({...})` call and every existing test passes untouched.
 - New backends opt in with `mode` / `websocket`.
-- `npm create neutron@latest` still scaffolds an SSR app.
+- `npm create @neutron-build@latest` still scaffolds an SSR app.
 - `start.ts` / `preview.ts` forward `neutronConfig.server` wholesale, so the new options flow through config automatically — no CLI changes needed.
 
 ## 9. Risks & mitigations

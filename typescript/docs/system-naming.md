@@ -32,7 +32,7 @@ The current naming can blur these boundaries:
   - framework core: `@neutron-build/core` (bare `neutron` is owned by an unrelated npm author)
   - implementation extensions: `@neutron-build/*` (`@neutron-build/auth`, `@neutron-build/security`, etc.)
   - subsystem integrations: `@neutron-build/nucleus` (the bare `nucleus` is similarly unavailable on npm)
-  - project generator: `create-neutron` (unscoped; required by `npm create <name>` convention)
+  - project generator: `@neutron-build/create` (invoked with `npm create @neutron-build@latest`)
 - Rust crates (cargo):
   - implementation crates: `neutron-*`
   - subsystem crates: `nucleus-*`
@@ -79,7 +79,7 @@ TypeScript (npm) — the bare `neutron` and `nucleus` names are taken on npm by 
 - App-framework package: `@neutron-build/core` (would be `neutron` if available).
 - Scoped extensions: `@neutron-build/*` (`@neutron-build/auth`, `@neutron-build/security`, `@neutron-build/data`, etc.).
 - CLI: `@neutron-build/cli` (would be `neutron-cli`).
-- Project generator: `create-neutron` (unscoped — required for `npm create neutron@latest` to resolve; this name is free).
+- Project generator: `@neutron-build/create` (invoked with `npm create @neutron-build@latest`).
 - Nucleus client: `@neutron-build/nucleus` — the org-scoped *client* artifact; the layer rule still applies, since the package name within the scope is `nucleus`, not a `neutron`-`nucleus` composite.
 
 Rust (cargo):
