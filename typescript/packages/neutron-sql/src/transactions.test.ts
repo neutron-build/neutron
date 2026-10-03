@@ -131,7 +131,7 @@ test("I02: callback error rolls back and rethrows the original error; pin return
   const rollbackEvent = events.find((e) => e.kind === "tx-rollback");
   assert.ok(rollbackEvent);
   assert.equal(rollbackEvent.error?.name, "Error");
-  assert.equal(rollbackEvent.error?.message, "user failure");
+  assert.equal(rollbackEvent.error?.message, "SQL request failed");
 });
 
 test("I02: failed rollback marks the pin suspect (released with the error)", async () => {
@@ -647,4 +647,17 @@ test('explicit rollback-to recovers a caught SQL failure without poisoning the p
     await sp.release();
   });
   assert.equal(pin.statements.at(-1), 'commit');
+});
+
+test("transaction observer failures preserve commit, rollback and pin release", async () => {
+  const hooks = { onEvent: () => { throw new Error("observer unavailable"); } };
+  const committed = fakePin();
+  assert.equal(await runTransaction(committed, async tx => { await tx.execute("update fixture set value=1"); return 7; }, {}, hooks), 7);
+  assert.deepEqual(committed.statements, ["begin", "update fixture set value=1", "commit"]);
+  assert.deepEqual(committed.releasedWith, [undefined]);
+  const aborted = fakePin();
+  const original = new Error("application failure");
+  await assert.rejects(runTransaction(aborted, async () => { throw original; }, {}, hooks), error => error === original);
+  assert.deepEqual(aborted.statements, ["begin", "rollback"]);
+  assert.deepEqual(aborted.releasedWith, [undefined]);
 });

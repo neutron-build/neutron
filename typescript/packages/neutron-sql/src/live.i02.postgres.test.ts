@@ -623,6 +623,14 @@ for (const driverKind of ["postgres", "pg"] as const) {
       db = await createDatabase({ driver, tables: { i02_notes: notes }, logger: true });
       await db.insert(notes).values({ body: canaryValue });
       await db.select().from(notes).where(eq(notes.body, canaryValue));
+      await db.select({ literal: sql<string>`${sql.raw(`'${canaryValue}'`)}` }).from(notes).limit(1);
+      await assert.rejects(db.select({ invalid: sql<number>`${canaryValue}::integer` }).from(notes), (err: unknown) => getSqlState(err) === "22P02");
+      const observerDb = await createDatabase({ driver, tables: { i02_notes: notes }, logger: () => { throw new Error(canaryValue); } });
+      const committedBody = `${canaryValue}_committed`;
+      await observerDb.transaction(async tx => { await tx.insert(notes).values({ body: committedBody }); });
+      const observed = await ctx.driver.query<{ n: string }>('select count(*)::text as n from i02_notes where body=$1', [committedBody]);
+      assert.equal(observed[0].n, "1", "observer failure must retain acknowledged native commit");
+      await observerDb.close();
     } finally {
       console.log = originalLog;
       await db?.close();

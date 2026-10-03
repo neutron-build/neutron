@@ -184,7 +184,7 @@ export async function runTransaction<T>(
   const beginSql = renderBeginSql(modes);
   const txId = `tx-${++txSequence}`;
   const emit = (event: SqlEvent): void => {
-    hooks.onEvent?.(event);
+    try { hooks.onEvent?.(event); } catch { /* observation cannot change transaction outcome */ }
   };
   let savepointSeq = 0;
   let released = false;

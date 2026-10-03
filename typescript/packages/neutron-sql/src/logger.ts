@@ -9,7 +9,7 @@
 // query-end, query-error, tx-begin, tx-commit, tx-rollback, savepoint,
 // cancel. The default logger (`logger: true`) prints one JSON line per
 // event. Error entries carry {name, message, sqlstate} — the server's own
-// wording is preserved for diagnostics; parameters are never attached.
+// wording is omitted because native messages can contain bound values.
 
 import { createHash } from "node:crypto";
 
@@ -80,23 +80,26 @@ export function errorSummary(err: unknown): { name: string; message: string; sql
         ? (err as { code: string }).code
         : undefined;
   const sqlstate = candidate !== undefined && /^[0-9A-Z]{5}$/.test(candidate) ? candidate : undefined;
+  const name = err instanceof Error ? err.constructor.name : typeof err;
+  const safeNames = ["Error", "TypeError", "RangeError", "NeutronSqlError", "ServerSqlError", "QueryCanceledError", "ConnectionFailedError", "MissingDriverError", "CommitAmbiguityError"];
   return {
-    name: err instanceof Error ? err.constructor.name : typeof err,
-    message: err instanceof Error ? err.message : String(err),
+    name: err instanceof Error ? (safeNames.includes(name) ? name : "Error") : typeof err,
+    message: sqlstate ? `SQL request failed (${sqlstate})` : "SQL request failed",
     sqlstate,
   };
 }
 
 export function resolveLogger(option: LoggerOption | undefined): Logger | null {
   if (option === undefined || option === false) return null;
-  if (option === true) {
-    return (event) => {
-      // Defense in depth: even if an event somehow carries params, the
-      // default sink never prints them unless the process opted in.
-      const { params, ...rest } = event;
-      const payload = paramsLoggingEnabled() ? { ...rest, params } : rest;
-      console.log(`[neutron-sql] ${JSON.stringify(payload)}`);
-    };
-  }
-  return option;
+  const sink: Logger = option === true
+    ? (event) => console.log(`[neutron-sql] ${JSON.stringify(event)}`)
+    : option;
+  return (event) => {
+    // Raw SQL can contain literal secrets even when every bound parameter is
+    // omitted. Both sinks receive identifiers/counts/timing by default.
+    const { params, sql, ...rest } = event;
+    const payload = paramsLoggingEnabled() ? { ...rest, sql, params } : rest;
+    // Telemetry cannot turn an acknowledged write into an application failure.
+    try { sink(payload); } catch { /* best-effort observation */ }
+  };
 }

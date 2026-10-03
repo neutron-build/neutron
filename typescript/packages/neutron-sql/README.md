@@ -433,15 +433,12 @@ connections are removed from the pool instead of returning to the idle set.
 the same `SqlEvent`. Kinds: `query-begin`, `query-end`, `query-error`,
 `tx-begin`, `tx-commit`, `tx-rollback`, `savepoint`, `cancel` — with
 durations, 16-hex statement ids (sha256 of the SQL text), transaction ids
-and savepoint names. **Parameter values never appear**: the `params` field
-exists only when the process sets `NEUTRON_SQL_LOG_PARAMS=1`, an explicit
-redaction-free mode — the emitted values are then visible in whatever sink
-receives events, so do not enable it where logs are shared. Connection
-strings and passwords are never logged (events carry no connection
-information at all). Server error messages pass through verbatim in
-`error.message` — PostgreSQL itself may echo values there (e.g. duplicate-key
-details); that is the server's wording, not this package's emission. The
-pre-I02 logger (plain SQL lines that printed parameter values) is gone;
+and savepoint names. SQL text and bound values are omitted from default and
+custom sinks. `NEUTRON_SQL_LOG_PARAMS=1` explicitly exposes both fields for
+local diagnostics; SQL literals can contain secrets too. Error events retain
+bounded classification and SQLSTATE, while native wording stays on the original
+application error and its cause. Observer exceptions are ignored so logging
+cannot change a write or transaction outcome.
 `LogEvent` remains as a deprecated alias of `SqlEvent`.
 
 ### postgres.js 3.4.8 defects worked around (documented)
