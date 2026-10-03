@@ -31,16 +31,30 @@ def export_events(observer: QueryObserver,logger: Any,*,tracer: Any=None,meter: 
     events=observer.drain();failures=0
     for event in events:
         attributes=asdict(event)
-        try:
-            logger.info('postgres.operation',**attributes)
-            labels={'operation':event.operation,'outcome':event.outcome}
-            if counter is not None: counter.add(1,labels)
-            if duration is not None: duration.record(event.elapsed_ns/1_000_000_000,labels)
-            if tracer is not None:
+        labels={'operation':event.operation,'outcome':event.outcome}
+        # Each sink is isolated: one failing exporter must not suppress the others.
+        sinks=[lambda: logger.info('postgres.operation',extra={'neutron_orm':attributes})]
+        if counter is not None: sinks.append(lambda: counter.add(1,labels))
+        if duration is not None: sinks.append(lambda: duration.record(event.elapsed_ns/1_000_000_000,labels))
+        if tracer is not None:
+            def trace() -> None:
                 with tracer.start_as_current_span('postgres.operation') as span:
                     span.set_attributes({key:value for key,value in attributes.items() if value is not None})
-        except Exception: failures+=1 # Report export loss without changing a DB outcome.
+            sinks.append(trace)
+        for sink in sinks:
+            try: sink()
+            except Exception: failures+=1 # Report export loss without changing a DB outcome.
     return len(events),failures
+
+
+def _refusal(error: OrmError) -> JSONResponse:
+    # No SQLSTATE means admission, shutdown, connect or cleanup refusal: retryable 503.
+    return JSONResponse({'sqlstate':error.sqlstate},status_code=409 if error.sqlstate else 503)
+
+
+def _record(body: Any) -> Record | None:
+    if not isinstance(body,dict) or type(body.get('id')) is not int or type(body.get('label')) is not str: return None
+    return Record(body['id'],body['label'])
 
 
 def _mapping(table: Table) -> ModelMapping[Record]:
@@ -55,14 +69,16 @@ def create_async_app(url: str,table: Table,observer: QueryObserver,*,grace_secon
         try: yield
         finally: await app.state.requests.shutdown(grace_seconds=grace_seconds)
     async def create(request: Request):
-        body=await request.json()
+        obj=_record(await request.json())
+        if obj is None: return JSONResponse({},status_code=400)
         try:
-            async with request.app.state.requests.session() as session:
-                obj=Record(body['id'],body['label']);session.add(mapping,obj)
-        except OrmError as error: return JSONResponse({'sqlstate':error.sqlstate},status_code=409)
+            async with request.app.state.requests.session() as session: session.add(mapping,obj)
+        except OrmError as error: return _refusal(error)
         return JSONResponse({'id':obj.id},status_code=201)
     async def get(request: Request):
-        async with request.app.state.requests.session() as session: obj=await session.get(mapping,request.path_params['id'])
+        try:
+            async with request.app.state.requests.session() as session: obj=await session.get(mapping,request.path_params['id'])
+        except OrmError as error: return _refusal(error)
         return JSONResponse({'id':obj.id,'label':obj.label}) if obj is not None else JSONResponse({},status_code=404)
     return Starlette(routes=[Route('/records',create,methods=['POST']),Route('/records/{id:int}',get)],lifespan=lifespan)
 
@@ -74,17 +90,20 @@ def create_sync_app(url: str,table: Table,observer: QueryObserver) -> Starlette:
         app.state.requests=requests
         try: yield
         finally: await asyncio.to_thread(requests.shutdown)
-    def write_record(body: dict[str,Any]):
+    def write_record(body: Any):
+        obj=_record(body)
+        if obj is None: return JSONResponse({},status_code=400)
         try:
-            with requests.session() as session:
-                obj=Record(body['id'],body['label']);session.add(mapping,obj)
-        except OrmError as error: return JSONResponse({'sqlstate':error.sqlstate},status_code=409)
+            with requests.session() as session: session.add(mapping,obj)
+        except OrmError as error: return _refusal(error)
         return JSONResponse({'id':obj.id},status_code=201)
     async def create(request: Request):
         # Parse the JSON body on the event loop; keep every sync Session call in
         # one worker thread. Bound secrets never become URL query parameters.
         return await run_in_threadpool(write_record,await request.json())
     def get(request: Request):
-        with requests.session() as session: obj=session.get(mapping,request.path_params['id'])
+        try:
+            with requests.session() as session: obj=session.get(mapping,request.path_params['id'])
+        except OrmError as error: return _refusal(error)
         return JSONResponse({'id':obj.id,'label':obj.label}) if obj is not None else JSONResponse({},status_code=404)
     return Starlette(routes=[Route('/records',create,methods=['POST']),Route('/records/{id:int}',get)],lifespan=lifespan)

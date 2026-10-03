@@ -28,16 +28,23 @@ class SessionRequests:
         with self._lock:
             if self._stopping or owner in self._active or len(self._active)>=self._max: raise OrmError('request Session admission refused')
             self._active.add(owner);self._idle.clear()
-        session=None
+        session=None;body_error: BaseException|None=None
         try:
             session=Session.connect(self._url,observer=self._observer)
             with self._lock:
                 if self._stopping: raise OrmError('request factory stopped during connect')
             yield session
             session.commit()
+        except BaseException as exc:
+            body_error=exc;raise
         finally:
             try:
-                if session is not None: _sync_cleanup(session._database,session.close,self._cleanup)
+                if session is not None:
+                    try: _sync_cleanup(session._database,session.close,self._cleanup)
+                    except BaseException as cleanup:
+                        if body_error is not None and not isinstance(body_error,Exception): raise body_error from cleanup
+                        if isinstance(cleanup,OrmError) or not isinstance(cleanup,Exception): raise
+                        raise OrmError('request cleanup failed') from cleanup
             finally:
                 with self._lock:
                     self._active.remove(owner)
@@ -86,8 +93,10 @@ class AsyncSessionRequests:
                     except BaseException as cleanup:
                         assert db is not None
                         db._discard()
-                        if isinstance(body_error,asyncio.CancelledError): raise body_error from cleanup
-                        raise
+                        if body_error is not None and not isinstance(body_error,Exception): raise body_error from cleanup
+                        if isinstance(cleanup,OrmError) or not isinstance(cleanup,Exception): raise
+                        raise OrmError('request cleanup failed') from cleanup
+                elif db is not None: db._discard()
             finally:
                 self._active.pop(owner)
                 if not self._active: self._idle.set()
@@ -108,10 +117,10 @@ class AsyncSessionRequests:
             for task in tasks: task.cancel()
             if tasks:
                 done,pending=await asyncio.wait(tasks,timeout=self._cleanup)
-                for task in done:
-                    if not task.cancelled(): task.exception() # retrieve failure without rendering private causes
+                failed=sum(1 for task in done if not task.cancelled() and task.exception() is not None) # retrieve failures without rendering private causes
                 if pending:
                     self._fence_active();raise OrmError('async requests exhausted shutdown cleanup deadline')
+                if failed: raise OrmError(f'{failed} async request cleanups failed during shutdown')
             if self._active: raise OrmError('async request cleanup did not release ownership')
         except BaseException:
             self._fence_active();raise
