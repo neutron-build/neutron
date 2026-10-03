@@ -118,11 +118,3 @@ SDK that now ships 447 tests and a CI workflow. Found by the S97 claims audit.
 The module path is `github.com/neutron-build/neutron/go` (the `neutron-dev`
 path never existed as a GitHub org; the design doc used
 `github.com/neutron-build/nucleus-go`).*
-
-`Inet` uses the native inet codec and preserves address host bits as well as the
-prefix length, for IPv4 and IPv6. `CIDR` uses the distinct native cidr identity;
-`ParseCIDR` refuses addresses with host bits instead of silently masking them.
-Both expose immutable `netip.Prefix` values, refuse zones and invalid zero values,
-and distinguish a nullable pointer's SQL NULL from a valid all-zero address.
-`NewPostgresTable` checks the exact inet/cidr OID; these types are also supported
-by the distributed column generator. Network arrays are outside this profile.

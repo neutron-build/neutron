@@ -56,6 +56,7 @@ func (e Enum) ormScalarValid() bool { return e.valid }
 type catalogCodec struct {
 	oid, base, element uint32
 	schema, name, kind string
+	extension          string
 	required           bool
 }
 
@@ -144,6 +145,22 @@ func NewPostgresTable[M any](ctx context.Context, db Executor, schema, name stri
 		if typ.Kind() == reflect.Pointer {
 			typ = typ.Elem()
 		}
+		if typ == reflect.TypeOf(Vector{}) {
+			extensionRows, err := db.Query(ctx, `SELECT e.extname FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_extension e ON e.oid=d.refobjid WHERE d.classid='pg_catalog.pg_type'::pg_catalog.regclass AND d.objid=$1 AND d.refclassid='pg_catalog.pg_extension'::pg_catalog.regclass AND d.deptype='e'`, base.oid)
+			if err != nil {
+				return Table[M]{}, wrap("qualify extension", err)
+			}
+			if extensionRows.Next() {
+				err = extensionRows.Scan(&base.extension)
+			}
+			extensionRows.Close()
+			if err != nil {
+				return Table[M]{}, wrap("qualify extension", err)
+			}
+			if err := extensionRows.Err(); err != nil {
+				return Table[M]{}, wrap("qualify extension", err)
+			}
+		}
 		table.info.catalogOIDs[fieldIndex] = []uint32{codec.oid, base.oid}
 		if !qualifiedCatalogCodec(typ, base) {
 			if contract, ok := custom[fieldIndex]; ok && codec.oid == contract.oid && codec.schema == contract.typeSchema && codec.name == contract.typeName {
@@ -156,6 +173,9 @@ func NewPostgresTable[M any](ctx context.Context, db Executor, schema, name stri
 }
 
 func qualifiedCatalogCodec(t reflect.Type, c catalogCodec) bool {
+	if t == reflect.TypeOf(Vector{}) {
+		return c.kind == "b" && c.extension == "vector" && c.name == "vector" && c.oid != 0
+	}
 	if t == reflect.TypeOf(Enum{}) {
 		return c.kind == "e"
 	}

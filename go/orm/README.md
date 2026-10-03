@@ -668,7 +668,8 @@ mutation. No DDL, registry changes or search_path assumptions occur. This is
 point-in-time metadata for that database: rebuild it after DDL. Database-free
 `NewTable` validates Go shape and does not certify PostgreSQL catalog types.
 Preserving refusal leaves unsupported objects and values intact; it does not
-claim typed composite, network, pgvector or multirange support.
+claim unrestricted custom codecs or multirange support. Network and vector
+qualification are described below.
 
 ```sh
 go test ./orm -run 'Test(CatalogCodecMatrix|PostgresCatalogEnumDomain)' -count=1 -v
@@ -790,4 +791,27 @@ references. Native constraint metadata must be rebuilt after relevant DDL.
 
 ```sh
 go test ./orm -run 'Test(DeferredGraphStatic|PostgresExplicitDeferred)' -count=1 -v
+```
+
+`Inet` uses the native inet codec and preserves address host bits as well as the
+prefix length, for IPv4 and IPv6. `CIDR` uses the distinct native cidr identity;
+`ParseCIDR` refuses addresses with host bits instead of silently masking them.
+Both expose immutable `netip.Prefix` values, refuse zones and invalid zero values,
+and distinguish a nullable pointer's SQL NULL from a valid all-zero address.
+`NewPostgresTable` checks the exact inet/cidr OID; these types are also supported
+by the distributed column generator. Network arrays are outside this profile.
+
+`Vector` owns 1–16,000 finite float32 elements, matching the native pgvector
+`vector` storage profile ([native dimension limit](https://github.com/pgvector/pgvector/blob/master/src/vector.h)).
+Construction and `Elements` detach caller slices; zero/NaN/infinite values refuse,
+and SQL NULL uses `*Vector`. PostgreSQL still enforces per-column dimensions and
+index limits. `NewPostgresTable` checks actual `pg_extension` membership and the
+native type identity, so an unrelated type named vector cannot pass. Encoding
+and decoding use native text through Scanner/Valuer, without changing a caller's
+pgx registry. This profile includes vector columns and domain bases; halfvec,
+sparsevec, vector arrays and distance/index/query operators remain separate
+requirements. The native fixture requires a PostgreSQL image with pgvector.
+
+```sh
+go test ./orm -run 'Test(VectorImmutable|PostgresExtensionQualifiedVector)' -count=1 -v
 ```

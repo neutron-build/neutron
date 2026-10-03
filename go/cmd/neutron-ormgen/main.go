@@ -294,7 +294,7 @@ func validateType(value ast.Expr, imports, used map[string]string) error {
 			break
 		}
 		path := imports[alias.Name]
-		if (path == "time" && typ.Sel.Name == "Time") || (path == ormPath && (typ.Sel.Name == "Decimal" || typ.Sel.Name == "UUID" || typ.Sel.Name == "JSON" || typ.Sel.Name == "Bytea" || typ.Sel.Name == "Date" || typ.Sel.Name == "TimeOfDay" || typ.Sel.Name == "Interval" || typ.Sel.Name == "Enum" || typ.Sel.Name == "Inet" || typ.Sel.Name == "CIDR")) {
+		if (path == "time" && typ.Sel.Name == "Time") || (path == ormPath && (typ.Sel.Name == "Decimal" || typ.Sel.Name == "UUID" || typ.Sel.Name == "JSON" || typ.Sel.Name == "Bytea" || typ.Sel.Name == "Date" || typ.Sel.Name == "TimeOfDay" || typ.Sel.Name == "Interval" || typ.Sel.Name == "Enum" || typ.Sel.Name == "Inet" || typ.Sel.Name == "CIDR" || typ.Sel.Name == "Vector")) {
 			used[alias.Name] = path
 			return nil
 		}
