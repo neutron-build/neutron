@@ -142,8 +142,10 @@ an order it is unspecified. `LoadOne` refuses multiple matches for a key and
 does not conceal cardinality with a limit. Both methods may filter children.
 
 `LoadBudget{MaxParents, MaxRows, BatchSize}` is mandatory and positive.
-MaxParents counts input slots; MaxRows bounds actual child rows across distinct
-keys and batches; BatchSize bounds keys per statement. Excess rows return
+MaxParents counts input slots; MaxRows bounds expanded child output slots,
+including repeated attachments for duplicate parents; BatchSize bounds keys per
+statement. Each child consumes its parent-key multiplicity before any final
+output slice is allocated. Excess rows return
 `ErrLoadBudget` with no partial result, rather than truncating. Internal LIMIT
 fetches one row beyond the remaining total budget only to detect excess.
 PostgreSQL's parameter limit is checked before each query. Caller LIMIT/OFFSET

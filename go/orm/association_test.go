@@ -168,3 +168,58 @@ func (db *associationRefusingExecutor) Exec(context.Context, string, ...any) (pg
 	db.called = true
 	return pgconn.CommandTag{}, errors.New("unexpected exec")
 }
+
+type associationFixtureRows struct {
+	fixtureRows
+	rows []assocChild
+	next int
+}
+
+func (r *associationFixtureRows) Next() bool {
+	if r.closed || r.next >= len(r.rows) {
+		return false
+	}
+	r.next++
+	return true
+}
+func (r *associationFixtureRows) Scan(dest ...any) error {
+	value := reflect.ValueOf(r.rows[r.next-1])
+	for i, target := range dest {
+		reflect.ValueOf(target).Elem().Set(value.Field(i))
+	}
+	return nil
+}
+
+type associationFixtureExecutor struct {
+	associationRefusingExecutor
+	rows []assocChild
+}
+
+func (db *associationFixtureExecutor) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	db.called = true
+	return &associationFixtureRows{rows: db.rows}, nil
+}
+
+func TestAssociationExpandedAttachmentBudget(t *testing.T) {
+	relation, _ := associationMetadata(t, "owned")
+	parents := make([]assocParent, 1000)
+	for i := range parents {
+		parents[i] = assocParent{Tenant: "a", ID: 1}
+	}
+	children := []assocChild{{Tenant: "a", ParentID: 1, ID: 10}, {Tenant: "a", ParentID: 1, ID: 11}}
+	db := &associationFixtureExecutor{rows: children}
+	if result, err := LoadMany(context.Background(), db, relation, parents, Query[assocChild]{}, LoadBudget{1000, 1999, 1}); !errors.Is(err, ErrLoadBudget) || result != nil {
+		t.Fatal("expanded fanout budget exceeded without refusal", err)
+	}
+	result, err := LoadMany(context.Background(), db, relation, parents, Query[assocChild]{}, LoadBudget{1000, 2000, 1})
+	if err != nil || len(result) != 1000 {
+		t.Fatal("exact expanded budget refused", err)
+	}
+	total := 0
+	for _, item := range result {
+		total += len(item.Children)
+	}
+	if total != 2000 {
+		t.Fatal("expanded slot count", total)
+	}
+}

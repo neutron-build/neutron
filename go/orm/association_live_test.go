@@ -37,7 +37,7 @@ func TestPostgresCompositeAssociationLoading(t *testing.T) {
 		t.Fatal(err)
 	}
 	parents := []assocParent{{"a", 1, "input first"}, {"a", 1, "duplicate slot"}, {"b", 1, "input b"}, {"a", 2, "input a2"}, {"a", 9, "missing"}}
-	budget := LoadBudget{MaxParents: 5, MaxRows: 4, BatchSize: 1}
+	budget := LoadBudget{MaxParents: 5, MaxRows: 6, BatchSize: 1}
 	counted := &associationCountingExecutor{db: admin}
 	loaded, err := LoadMany(ctx, counted, relation, parents, Query[assocChild]{}.OrderBy(id.Desc()), budget)
 	if err != nil {
@@ -94,6 +94,9 @@ func TestPostgresCompositeAssociationLoading(t *testing.T) {
 			t.Fatal("native association mismatch", i, ids, expected)
 		}
 	}
+	if result, err := LoadMany(ctx, admin, relation, parents, Query[assocChild]{}, LoadBudget{5, 5, 2}); !errors.Is(err, ErrLoadBudget) || result != nil {
+		t.Fatal("native duplicate fanout budget not enforced", err)
+	}
 	if loaded[4].Children == nil {
 		t.Fatal("missing relation must have empty slice")
 	}
@@ -101,7 +104,7 @@ func TestPostgresCompositeAssociationLoading(t *testing.T) {
 	if loaded[1].Children[0].Name == "local edit" {
 		t.Fatal("duplicate inputs share mutable result slice")
 	}
-	filtered, err := LoadMany(ctx, admin, relation, parents, Query[assocChild]{}.Where(id.Gt(10)).OrderBy(id.Asc()), LoadBudget{5, 3, 2})
+	filtered, err := LoadMany(ctx, admin, relation, parents, Query[assocChild]{}.Where(id.Gt(10)).OrderBy(id.Asc()), LoadBudget{5, 4, 2})
 	if err != nil || len(filtered[0].Children) != 1 || filtered[0].Children[0].ID != 11 {
 		t.Fatal("bound child filter", err)
 	}
@@ -113,7 +116,7 @@ func TestPostgresCompositeAssociationLoading(t *testing.T) {
 	}
 	inverse := Inverse(relation)
 	childInputs := []assocChild{{Tenant: "a", ParentID: 1, ID: 10}, {Tenant: "a", ParentID: 1, ID: 11}, {Tenant: "b", ParentID: 1, ID: 20}, {Tenant: "a", ParentID: 99, ID: 99}}
-	owners, err := LoadOne(ctx, admin, inverse, childInputs, Query[assocParent]{}, LoadBudget{4, 2, 1})
+	owners, err := LoadOne(ctx, admin, inverse, childInputs, Query[assocParent]{}, LoadBudget{4, 3, 1})
 	if err != nil {
 		t.Fatal(err)
 	}

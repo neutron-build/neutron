@@ -70,7 +70,7 @@ func associationKeyType(t reflect.Type) bool {
 }
 
 // LoadBudget is mandatory. MaxParents counts all input slots, including
-// duplicate keys. MaxRows bounds returned child rows across all batches;
+// duplicate keys. MaxRows bounds expanded output child slots, including duplicates;
 // BatchSize bounds distinct composite keys in each PostgreSQL statement.
 type LoadBudget struct{ MaxParents, MaxRows, BatchSize int }
 
@@ -152,8 +152,10 @@ func loadAssociation[P, C any](ctx context.Context, db Executor, relation Relati
 	keys := make([]string, len(parents))
 	distinct := make([]int, 0, len(parents))
 	seen := map[string]bool{}
+	multiplicity := map[string]int{}
 	for i, parent := range parents {
 		keys[i] = relationKey(reflect.ValueOf(parent), parentFields)
+		multiplicity[keys[i]]++
 		if !seen[keys[i]] {
 			seen[keys[i]] = true
 			distinct = append(distinct, i)
@@ -200,12 +202,15 @@ func loadAssociation[P, C any](ctx context.Context, db Executor, relation Relati
 		if len(children) > budget.MaxRows-total {
 			return fail(ErrLoadBudget)
 		}
-		total += len(children)
 		for _, child := range children {
 			key := relationKey(reflect.ValueOf(child), childFields)
 			if !requested[key] {
 				return fail(fmt.Errorf("returned association key was not requested"))
 			}
+			if multiplicity[key] > budget.MaxRows-total {
+				return fail(ErrLoadBudget)
+			}
+			total += multiplicity[key]
 			byKey[key] = append(byKey[key], child)
 			if singular && len(byKey[key]) > 1 {
 				return fail(ErrCardinality)
