@@ -97,6 +97,7 @@ type transactionDriver interface {
 type operation struct {
 	owner           *transactionOwner
 	ctx, requestCtx context.Context
+	scope           *Scope
 	cancel          context.CancelFunc
 	stopParent      func() bool
 	done            chan struct{}
@@ -131,10 +132,13 @@ type transactionOwner struct {
 // SELECT INTO may create a table and EXPLAIN ANALYZE may execute its data query.
 // Scope is not a SQL sandbox: trusted functions may still mutate session state.
 type Scope struct {
-	owner     *transactionOwner
-	parent    *Scope
-	savepoint string
-	closed    bool
+	owner      *transactionOwner
+	parent     *Scope
+	savepoint  string
+	closed     bool
+	ctx        context.Context
+	cancel     context.CancelFunc
+	stopParent func() bool
 }
 
 var _ Executor = (*Scope)(nil)
@@ -170,9 +174,20 @@ func (s *Scope) acquire(ctx context.Context) (*operation, error) {
 	if err := o.ctx.Err(); err != nil {
 		return nil, err
 	}
+	for ancestor := s; ancestor != nil; ancestor = ancestor.parent {
+		if ancestor.ctx != nil {
+			if err := ancestor.ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+	}
 	opCtx, cancel := context.WithCancel(ctx)
-	op := &operation{owner: o, ctx: opCtx, requestCtx: ctx, cancel: cancel, done: make(chan struct{})}
-	op.stopParent = context.AfterFunc(o.ctx, cancel)
+	op := &operation{owner: o, ctx: opCtx, requestCtx: ctx, scope: s, cancel: cancel, done: make(chan struct{})}
+	parentCtx := s.ctx
+	if parentCtx == nil {
+		parentCtx = o.ctx
+	}
+	op.stopParent = context.AfterFunc(parentCtx, cancel)
 	o.op = op
 	return op, nil
 }
@@ -196,6 +211,13 @@ func operationError(err error, op *operation) error {
 	}
 	if cause := op.requestCtx.Err(); cause != nil {
 		return errors.Join(err, cause)
+	}
+	for ancestor := op.scope; ancestor != nil; ancestor = ancestor.parent {
+		if ancestor.ctx != nil {
+			if cause := ancestor.ctx.Err(); cause != nil {
+				return errors.Join(err, cause)
+			}
+		}
 	}
 	if cause := op.owner.ctx.Err(); cause != nil {
 		return errors.Join(err, cause)
@@ -309,7 +331,7 @@ func WithTransaction(ctx context.Context, pool *pgxpool.Pool, options Transactio
 		return &TransactionError{CommitNotAttempted, errors.Join(err, discard(clean, nil))}
 	}
 	o := &transactionOwner{ctx: ctx, driver: tx, cleanupTimeout: timeout, release: conn.Release, discard: discard}
-	scope := &Scope{owner: o}
+	scope := &Scope{owner: o, ctx: ctx}
 	o.current = scope
 	o.scopes = []*Scope{scope}
 	finished := false
@@ -377,6 +399,15 @@ func (o *transactionOwner) finishRoot(root *Scope, callbackErr error) error {
 	childActive := o.current != root
 	o.current = nil
 	broken := o.broken
+	for _, scope := range o.scopes {
+		scope.closed = true
+		if scope.stopParent != nil {
+			scope.stopParent()
+		}
+		if scope.cancel != nil {
+			scope.cancel()
+		}
+	}
 	o.scopes = nil
 	o.mu.Unlock()
 	leaked, pending, drainErr := o.drain()
@@ -468,10 +499,17 @@ func (s *Scope) Savepoint(ctx context.Context, callback func(*Scope) error) (res
 		op.finish()
 		return err
 	}
-	child := &Scope{owner: o, parent: s, savepoint: name}
+	childCtx, childCancel := context.WithCancel(ctx)
+	parentCtx := s.ctx
+	if parentCtx == nil {
+		parentCtx = o.ctx
+	}
+	child := &Scope{owner: o, parent: s, savepoint: name, ctx: childCtx, cancel: childCancel, stopParent: context.AfterFunc(parentCtx, childCancel)}
 	o.mu.Lock()
 	if o.closed || s.closed {
 		o.mu.Unlock()
+		child.stopParent()
+		child.cancel()
 		op.finish()
 		return ErrScopeClosed
 	}
@@ -479,6 +517,9 @@ func (s *Scope) Savepoint(ctx context.Context, callback func(*Scope) error) (res
 	o.scopes = append(o.scopes, child)
 	o.mu.Unlock()
 	op.finish()
+	if err := child.ctx.Err(); err != nil {
+		return child.finishChild(err)
+	}
 	finished := false
 	defer func() {
 		value := recover()
@@ -508,11 +549,22 @@ func (s *Scope) finishChild(callbackErr error) error {
 		o.mu.Unlock()
 		return errors.Join(callbackErr, ErrScopeClosed)
 	}
+	if s.ctx != nil {
+		callbackErr = errors.Join(callbackErr, s.ctx.Err())
+	}
 	o.finalizing = true
 	for _, candidate := range o.scopes {
 		for parent := candidate; parent != nil; parent = parent.parent {
 			if parent == s {
 				candidate.closed = true
+				if candidate != s {
+					if candidate.stopParent != nil {
+						candidate.stopParent()
+					}
+					if candidate.cancel != nil {
+						candidate.cancel()
+					}
+				}
 				break
 			}
 		}
@@ -526,6 +578,9 @@ func (s *Scope) finishChild(callbackErr error) error {
 	clean, done := context.WithTimeout(context.Background(), o.cleanupTimeout)
 	defer done()
 	callbackErr = errors.Join(callbackErr, o.ctx.Err())
+	if s.ctx != nil {
+		callbackErr = errors.Join(callbackErr, s.ctx.Err())
+	}
 	var cleanupErr error
 	if drainErr != nil {
 		cleanupErr = drainErr
@@ -536,8 +591,17 @@ func (s *Scope) finishChild(callbackErr error) error {
 		if cleanupErr == nil {
 			_, cleanupErr = o.driver.Exec(clean, "RELEASE SAVEPOINT "+quote(s.savepoint))
 		}
+		if cleanupErr == nil && callbackErr == nil && s.ctx != nil {
+			cleanupErr = s.ctx.Err()
+		}
 	}
 	o.mu.Lock()
+	if s.stopParent != nil {
+		s.stopParent()
+	}
+	if s.cancel != nil {
+		s.cancel()
+	}
 	if cleanupErr != nil {
 		o.broken = errors.Join(ErrTransactionBroken, cleanupErr)
 	}

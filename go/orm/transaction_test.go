@@ -39,7 +39,7 @@ func (retrySafeFailure) SafeToRetry() bool { return true }
 func fixtureOwner(ctx context.Context, driver transactionDriver) (*transactionOwner, *Scope, *int, *int) {
 	releases, discards := new(int), new(int)
 	o := &transactionOwner{ctx: ctx, driver: driver, cleanupTimeout: time.Second, release: func() { *releases++ }, discard: func(context.Context, <-chan struct{}) error { *discards++; return nil }}
-	s := &Scope{owner: o}
+	s := &Scope{owner: o, ctx: ctx}
 	o.current = s
 	o.scopes = []*Scope{s}
 	return o, s, releases, discards
