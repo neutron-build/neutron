@@ -131,7 +131,15 @@ its actual database name. That name remains a portable semantic identifier,
 not a renamable hash placeholder; equivalent schemas in differently named
 databases need an explicit comparison policy.
 
-Other databases, global role/membership authority and ACL-bearing families such
-as large objects, languages, foreign servers and parameter grants remain an
+Cluster `pg_roles` non-secret options and direct `pg_auth_members` memberships
+retain role/member/grantor names and separate ADMIN/INHERIT/SET options. Passwords
+and role configuration values are excluded, and inherited effective access is
+not calculated. Cluster identities use a descriptive `pg_catalog` address
+namespace. The native role fixture checks NOINHERIT/BYPASSRLS and a membership
+with ADMIN true, INHERIT false, SET true; its cleanup runs even if later setup
+fails. This is inventory, not an authority restore script.
+
+Other databases and ACL-bearing families such as large objects, languages,
+foreign servers and parameter grants remain an
 explicit uninspected mandatory scope. None of these additions provides
 policy/trigger/extension/privilege migration support.

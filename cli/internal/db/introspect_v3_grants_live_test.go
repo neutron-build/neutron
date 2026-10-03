@@ -11,6 +11,7 @@ func TestV3NativeExplicitDefaultAndColumnACLs(t *testing.T) {
 	h := newQ07Harness(t, "v3acl")
 	role := h.dbName + "_reader"
 	h.exec(fmt.Sprintf(`CREATE ROLE %q`, role))
+	parent := role + "_parent"
 	t.Cleanup(func() {
 		// Registered after harness cleanup: remove owned-database dependencies
 		// before removing this globally scoped, uniquely named role.
@@ -18,10 +19,15 @@ func TestV3NativeExplicitDefaultAndColumnACLs(t *testing.T) {
 		if err := h.client.Exec(ctx, fmt.Sprintf(`DROP OWNED BY %q`, role)); err != nil {
 			t.Errorf("ACL fixture dependency cleanup: %v", err)
 		}
+		if err := h.client.Exec(ctx, fmt.Sprintf(`DROP ROLE IF EXISTS %q`, parent)); err != nil {
+			t.Errorf("ACL fixture parent cleanup: %v", err)
+		}
 		if err := h.client.Exec(ctx, fmt.Sprintf(`DROP ROLE %q`, role)); err != nil {
 			t.Errorf("ACL fixture role cleanup: %v", err)
 		}
 	})
+	h.exec(fmt.Sprintf(`CREATE ROLE %q NOINHERIT BYPASSRLS`, parent))
+	h.exec(fmt.Sprintf(`GRANT %q TO %q WITH ADMIN TRUE, INHERIT FALSE, SET TRUE`, parent, role))
 	for _, sql := range []string{
 		`CREATE SCHEMA authority`,
 		`CREATE TABLE authority.docs (id int, "Case Column" text)`,
@@ -49,7 +55,17 @@ func TestV3NativeExplicitDefaultAndColumnACLs(t *testing.T) {
 	tableGrant, columnGrant, schemaGrant, sequenceGrant := false, false, false, false
 	routineIntPublic, routineTextPublic := false, false
 	defaultGlobal, defaultSchema, databaseGrant := false, false, false
+	membership := false
 	for _, e := range doc.Model.Inventory {
+		if e.Identity.Catalog == "pg_roles" && e.Identity.Name == parent {
+			if e.Attributes["inherit"] != "false" || e.Attributes["bypassRLS"] != "true" {
+				t.Fatal("role authority flags disappeared")
+			}
+			for _, part := range v3PartsOfKind(e.Parts, "role-membership") {
+				a := part.Attributes
+				membership = membership || (a["member"] == role && a["admin"] == "true" && a["inherit"] == "false" && a["set"] == "true" && a["grantor"] != "")
+			}
+		}
 		if e.Identity.Catalog == "pg_default_acl" || e.Identity.Catalog == "pg_database" {
 			for _, p := range v3PartsOfKind(e.Parts, "privilege") {
 				if p.Attributes["grantee"] != role {
@@ -83,6 +99,9 @@ func TestV3NativeExplicitDefaultAndColumnACLs(t *testing.T) {
 				}
 			}
 		}
+	}
+	if !membership {
+		t.Fatal("native direct membership options disappeared")
 	}
 	if !defaultGlobal || !defaultSchema || !databaseGrant {
 		t.Fatalf("default/database ACL inventory global=%v schema=%v database=%v", defaultGlobal, defaultSchema, databaseGrant)
