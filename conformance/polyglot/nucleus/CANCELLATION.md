@@ -1,4 +1,4 @@
-NP02 source candidate 49587357 + 7859f08b binds pgwire BackendKeyData, notification sender
+The cancellation implementation binds pgwire BackendKeyData, notification sender
 identity and `pg_backend_pid()` to one executor-owned live backend identity. SQL
 and wire cancellation share the cooperative flag and Notify wakeup. Unknown or
 disconnected backend IDs cannot target the embedded fallback session. IDs never
@@ -15,7 +15,7 @@ in this candidate. PostgreSQL's pgwire protocol alone establishes none of these
 facts. PostgreSQL 17 documents its signaling authority in
 [Server Signaling Functions](https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-ADMIN-SIGNAL)
 and [Predefined Roles](https://www.postgresql.org/docs/17/predefined-roles.html).
-This source implementation does not enable the P40 profile.
+The fixture establishes only its listed authority facts; it does not certify an engine profile.
 
 The bounded native fact fixture below runs separately against PostgreSQL 17 and
 the exact candidate Nucleus binary. It verifies SQL PID against native startup
@@ -31,11 +31,11 @@ Coordinator commands (isolated endpoints; role creation needs the admin role):
 ```sh
 python conformance/polyglot/nucleus/cancellation_authority.py \
   --engine postgres --admin-url-env NEUTRON_NATIVE_PG_ADMIN_URL \
-  --report /path/to/evidence/np02-postgres-authority.json
+  --report /path/to/evidence/postgres-cancellation-authority.json
 python conformance/polyglot/nucleus/cancellation_authority.py \
   --engine nucleus --admin-url-env NEUTRON_NUCLEUS_ADMIN_URL \
   --binary-sha256 EXACT_EXECUTED_BINARY_SHA256 \
-  --report /path/to/evidence/np02-nucleus-authority.json
+  --report /path/to/evidence/nucleus-cancellation-authority.json
 ```
 
 Run `cargo fmt --check` first, then `cargo test --lib --features server
