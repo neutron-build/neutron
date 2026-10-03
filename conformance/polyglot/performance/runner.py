@@ -179,10 +179,16 @@ def run(args):
                     if verify_artifacts(json.loads(Path(client['artifact_manifest']).read_text()),Path(client['artifact_root']))!=identities[label]:
                         raise ValueError('installed artifact identity changed during campaign')
             finally:
-                if created:
-                    ownership(conn, scope, token)
-                    conn.execute(sql.SQL('DROP SCHEMA {} CASCADE').format(sql.Identifier(scope)))
-                save()
+                try:
+                    if created:
+                        ownership(conn, scope, token)
+                        conn.execute(sql.SQL('DROP SCHEMA {} CASCADE').format(sql.Identifier(scope)))
+                    report['cleanup'] = 'pass'
+                except BaseException:
+                    report['cleanup'] = 'fail'
+                    report['accepted'] = False
+                    raise
+                finally: save()
     return 0 if report['accepted'] else 2
 
 def main():

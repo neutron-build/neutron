@@ -582,8 +582,10 @@ async function acquirePoolResource<T>(acquire: () => Promise<T>, recycle: (value
   if (preReason) throw new QueryCanceledError(`${kind}: canceled before pool checkout`, { reason: preReason, dispatched: false });
   return new Promise<T>((resolve, reject) => {
     let settled = false;
-    const disarm = armCancellation(options, reason => {
+    let disarm = (): void => {};
+    disarm = armCancellation(options, reason => {
       settled = true;
+      disarm();
       reject(new QueryCanceledError(`${kind}: canceled while waiting for pool checkout`, { reason, dispatched: false }));
     });
     // An injected pool can throw synchronously as well as reject.
@@ -597,6 +599,11 @@ async function acquirePoolResource<T>(acquire: () => Promise<T>, recycle: (value
       if (settled) return;
       settled = true;
       reject(classifyDriverError(error, kind));
+    }).catch((error: unknown) => {
+      // A third-party recycle hook can throw after cancellation. Observe the
+      // cleanup chain even when the caller's promise has already settled.
+      disarm();
+      if (!settled) { settled = true; reject(classifyDriverError(error, kind)); }
     });
     if (options?.signal?.aborted && !settled) {
       settled = true;
