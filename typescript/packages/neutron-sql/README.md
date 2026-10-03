@@ -1754,3 +1754,29 @@ general-purpose use.
   open items: `studio/README.md`.
 
 MIT.
+
+Use `.nativeArray()` for native multidimensional arrays or non-default lower
+bounds. `PgArray<T>` holds row-major flat elements and explicit dimensions:
+
+```ts
+const cells = pgTable("cells", { values: bigint("values").nativeArray() });
+const values = new PgArray(
+  [{ length: 2, lowerBound: -1 }, { length: 2, lowerBound: 0 }],
+  [9223372036854775807n, null, 0n, 1n],
+);
+await db.insert(cells).values({ values });
+```
+
+Both drivers acquire array text and apply the declared scalar codec to every
+member. Dimensions retain signed 32-bit lower bounds; at most six dimensions
+and one million elements are accepted. An empty array is `new PgArray([], [])`;
+a whole SQL NULL remains `null`. For JSON/JSONB arrays, a SQL NULL member is
+`null`, while a JSON null member is `jsonNull`; JSON array members are ordinary
+nested JavaScript arrays. Input values are snapshotted and element reads return
+detached snapshots. Sparse values, recursive JSON and accessors are refused.
+
+The accepted element families match `.array()`; temporal, bytea and vector
+array elements remain unsupported. `.array()` keeps its one-dimensional,
+default-bound representation. Dimensioned arrays require explicit native DDL:
+version-2 schema export refuses this declaration because its array contract
+cannot retain these dimensions and bounds.

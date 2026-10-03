@@ -8,6 +8,7 @@
 //
 // Never executed — `pnpm test:types` only type-checks it.
 import {
+  PgArray,
   pgTable,
   pgSchema,
   alias,
@@ -935,3 +936,13 @@ async function qualifiedRelationTypes() {
   db.query.bUser.findMany({ with: { posts: { with: { author: true } } } });
 }
 void qualifiedRelationTypes;
+
+const dimensionedArrays = pgTable("dimensioned_arrays", { values: bigint("values").nativeArray().notNull() });
+const exactArrayRead: AssertEq<(typeof dimensionedArrays.$inferSelect)["values"], PgArray<bigint>> = true;
+void exactArrayRead;
+declare function dimensionedInsert(value: typeof dimensionedArrays.$inferInsert): void;
+dimensionedInsert({ values: new PgArray([{ length: 1, lowerBound: -1 }], [9223372036854775807n]) });
+// @ts-expect-error native arrays require explicit dimensions rather than a plain JS array
+dimensionedInsert({ values: [1n] });
+// @ts-expect-error bigint native arrays do not accept text elements
+dimensionedInsert({ values: new PgArray([{ length: 1, lowerBound: 1 }], ["1"]) });

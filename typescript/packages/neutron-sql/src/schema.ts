@@ -5,6 +5,7 @@
 import type { BigintMode, BigintOptions, TemporalMode, TemporalOptions, NumericOptions } from "./codecs.js";
 import type { SchemaExpression } from "./ddl-text.js";
 import type { OrderSpec } from "./ast.js";
+import type { PgArray } from "./pg-array-value.js";
 
 export type ColumnDataType =
   | "serial"
@@ -152,6 +153,8 @@ export class ColumnBuilder<
   /** Q07: set to 1 by `.array()` — a one-dimensional array whose elements
    *  have type `dataType`. */
   arrayDimensions?: 1;
+  /** Opt-in flat values retaining native dimensions and lower bounds. */
+  arrayValueMode?: "dimensions";
   /** Q07: enum type of an enum column (dataType "enum"). */
   enumDef?: PgEnumDefinition;
   /** Q07c: identity kind of an identity column. */
@@ -234,6 +237,13 @@ export class ColumnBuilder<
     }
     this.arrayDimensions = 1;
     return this as unknown as ColumnBuilder<D, NN, HD, Array<RT | null>, Array<WT | null>>;
+  }
+
+  /** Same accepted element families as array(), with explicit native shape. */
+  nativeArray(): ColumnBuilder<D, NN, HD, PgArray<RT>, PgArray<WT>> {
+    this.array();
+    this.arrayValueMode = "dimensions";
+    return this as unknown as ColumnBuilder<D, NN, HD, PgArray<RT>, PgArray<WT>>;
   }
 
   /** GENERATED ALWAYS AS IDENTITY (Q07c): the database generates values;
@@ -937,6 +947,7 @@ function cloneColumnForView(column: AnyColumnBuilder, view: AnyPgTable): AnyColu
   c.numericPrecision = column.numericPrecision;
   c.numericScale = column.numericScale;
   c.arrayDimensions = column.arrayDimensions;
+  c.arrayValueMode = column.arrayValueMode;
   c.enumDef = column.enumDef;
   c.identityKind = column.identityKind;
   c.generatedExpr = column.generatedExpr;

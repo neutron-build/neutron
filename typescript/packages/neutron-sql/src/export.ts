@@ -381,6 +381,7 @@ function v2DefaultFor(tableId: V2Identity, column: AnyColumnBuilder): V2Default 
 
 function v2TypeFor(tableId: V2Identity, column: AnyColumnBuilder): V2TypeRef {
   const at = `tables[${tableId.schema}.${tableId.name}].columns[${column.columnName}].type`;
+  if (column.arrayValueMode === "dimensions") throw exportError("unknown-type", at, "nativeArray dimensions and lower bounds require an explicit native schema; exportSchemaV2 supports one-dimensional default-bound arrays");
   const typeName = column.dataType === "enum" ? "enum" : V2_TYPE_NAMES[column.dataType];
   if (typeName === undefined) {
     throw exportError("unknown-type", at, `unknown column type ${JSON.stringify(column.dataType)}`);

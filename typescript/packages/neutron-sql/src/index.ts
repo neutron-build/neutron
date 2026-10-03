@@ -108,6 +108,7 @@ export {
 // nodes/fragments/TrustedSql structurally — legacy {sql, params} fragments
 // are rejected (their $n text can never be renumbered here).
 export { sqlAst, sqlAst as sql } from "./ast.js";
+export { PgArray, MAX_PG_ARRAY_ELEMENTS, type PgArrayDimension } from "./pg-array-value.js";
 
 export {
   raw,
