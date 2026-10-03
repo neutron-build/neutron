@@ -1263,6 +1263,7 @@ export function isTableRelations(value: unknown): value is TableRelations {
 export function validateRelationTargets(set: TableRelations, who: string): void {
   for (const [key, rel] of Object.entries(set.entries)) {
     rejectDerivedTable(rel.targetTable, `${who}.${key}`);
+    rejectAliasHandle(rel.targetTable, `${who}.${key}`);
     getTableRelationKey(rel.targetTable);
   }
 }

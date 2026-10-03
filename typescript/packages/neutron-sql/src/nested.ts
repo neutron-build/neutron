@@ -77,7 +77,7 @@ import { compileStatement } from "./compile.js";
 import { NeutronSqlError } from "./errors.js";
 import type { IsolationLevel } from "./logger.js";
 import type { QueryExecutionOptions } from "./transactions.js";
-import { getTableColumns, getTableIndexes, getTableName, getTableRelationKey, tableRefParts } from "./schema.js";
+import { getTableColumns, getTableIndexes, getTableName, getTableRelationKey, rejectViewHandle, rejectAliasHandle, tableRefParts } from "./schema.js";
 import type { AnyColumnBuilder, AnyPgTable, Relation, RelationOne } from "./schema.js";
 
 // ---------------------------------------------------------------------------
@@ -317,6 +317,8 @@ function newDraft(
     seq?: number;
   },
 ): Draft {
+  rejectAliasHandle(init.table, init.path);
+  if (init.action !== "select") rejectViewHandle(init.table, init.path);
   const draft: Draft = {
     seq: init.seq ?? pc.nextSeq++,
     path: init.path,
@@ -350,17 +352,15 @@ function columnsOf(table: AnyPgTable): Record<string, AnyColumnBuilder> {
 }
 
 function tableId(table: AnyPgTable): string {
-  return tableRefParts(table).join(".");
+  return getTableRelationKey(table);
 }
 
-/** Property key of a column object on `table` (identity first, then the
- *  physical name — relation configs hold the table's own column objects). */
+/** Property key of a declared column object. Physical names alone cannot
+ *  prove ownership when same-named tables exist in different schemas. */
 function propertyKeyOf(table: AnyPgTable, column: AnyColumnBuilder, path: string): string {
   const entries = Object.entries(columnsOf(table));
   const byIdentity = entries.find(([, c]) => c === column);
   if (byIdentity) return byIdentity[0];
-  const byName = entries.filter(([, c]) => c.columnName === column.columnName);
-  if (byName.length === 1) return byName[0][0];
   throw planError(path, `relation column "${column.columnName}" is not a column of ${getTableName(table)}`);
 }
 

@@ -61,6 +61,7 @@ import {
   isPgTable,
   isTableRelations,
   rejectDerivedTable,
+  rejectAliasHandle,
   validateRelationTargets,
   type AnyColumnBuilder,
   type AnyPgTable,
@@ -518,6 +519,7 @@ export async function createDatabase<
   for (const [key, value] of Object.entries(options.tables ?? {})) {
     if (isPgTable(value)) {
       rejectDerivedTable(value, `tables.${key}`);
+      rejectAliasHandle(value, `tables.${key}`);
       const identity = getTableRelationKey(value);
       if (tables.has(identity)) throw new Error(`tables.${key}: table identity is registered more than once`);
       tables.set(identity, { key, table: value });
@@ -529,6 +531,7 @@ export async function createDatabase<
   for (const [key, value] of Object.entries(options.relations ?? {})) {
     if (!isTableRelations(value)) continue;
     rejectDerivedTable(value.table, `relations.${key}`);
+    rejectAliasHandle(value.table, `relations.${key}`);
     validateRelationTargets(value, `relations.${key}`);
     relationsByName.set(getTableRelationKey(value.table), value);
     relationSets.push(value);
