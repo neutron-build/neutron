@@ -1171,12 +1171,12 @@ const affected = await db.driver.prepare!("update users set seen = true where em
   pg_stat_activity). Verified on PG 17: statements survive transaction
   ROLLBACK and ABORT — the session is their only lifetime.
 - Transaction-scoped drivers (`db.transaction`) expose `prepare` pinned to
-  the transaction's connection. That pin **outlives the transaction**: on
-  `pg`, calling the scoped driver (or its prepared statements) after
-  `commit`/`rollback` still executes — on the released pooled client, which
-  the pool may hand to another caller. This is the same posture plain
-  `tx.query` already has, and it is **unsupported**: do not use a
-  transaction-scoped driver or statement after its transaction ends.
+  the transaction's connection. Queries, writes, prepared handles and savepoint
+  handles reject use after the callback settles, before COMMIT/ROLLBACK and
+  connection release. Both bundled drivers enforce this guard. Work already
+  started during the callback still requires the caller to await completion;
+  this guard does not certify unawaited-operation draining or separate nested
+  callback lifetimes.
 
 ## Advanced query controls (Q08)
 
