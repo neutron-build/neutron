@@ -347,3 +347,22 @@ semicolons are scanned without treating embedded text as commands. Ambiguous
 ordinary-string backslashes refuse. Parameterized single data/query statements
 remain supported. This contains direct state-machine escapes; trusted SQL
 functions and predicates are not a security sandbox.
+
+Session `add_graph(relation, parent, children)` supports explicit insert graphs
+whose relation references the parent's complete declared primary key. Child FK
+fields may start unset; flush resolves generated parent keys, orders dependent
+inserts and validates every other field before any SQL write. `link(relation,
+parent, child)` connects tracked pending/persistent records. Overlapping child
+FK ownership and generated FK targets refuse. Cyclic insert dependencies refuse
+before SQL; deferred-cycle execution is not certified. All graph statements share
+the Session transaction; rollback restores generated identities and original FK
+values. Database uniqueness/FK errors remain native failures requiring rollback.
+Implicit graph discovery, ownership cascades, nullable disconnects and automatic
+association deletion remain separate requirements.
+
+`session.load_relation(relation, parents, budget=...)` is a bounded explicit
+select-in read for this Session's tracked parents. AsyncSession requires await.
+Loaded children attach to its identity map, so duplicate parent slots and repeated
+loads reuse the same tracked child object. Existing cached values are not silently
+refreshed; use explicit refresh. `singular=True` refuses multiple matches.
+No relationship properties or hidden lazy I/O are installed.

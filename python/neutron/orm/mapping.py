@@ -93,10 +93,14 @@ class ModelMapping(Generic[T]):
         _validate_attribute_profile(self.model_type,tuple(self.field_columns))
         for name,value in values.items(): setattr(obj,name,value)
 
-    def writes(self,obj: T,*,inserting: bool) -> dict[str,Any]:
+    def writes(self,obj: T,*,inserting: bool,deferred_fields: frozenset[str]=frozenset()) -> dict[str,Any]:
+        if deferred_fields - self.field_columns.keys(): raise ValueError('deferred fields outside mapping')
         values=self.snapshot(obj);result={}
         for name,column in self.field_columns.items():
             value=values[name]
+            if name in deferred_fields:
+                if column.spec.generated: raise ValueError('generated child fields cannot be relation targets')
+                continue
             if column.spec.generated:
                 if inserting and value is not None and value is not OMIT:
                     raise ValueError('generated dataclass field must be unset for insert')

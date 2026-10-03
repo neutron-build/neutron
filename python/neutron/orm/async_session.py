@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar
+from typing import Any, AsyncIterator, Awaitable, Callable, Sequence, TypeVar
 from .client import AsyncDatabase
 from .core import CardinalityError, OrmError, SessionBusyError, delete, insert, select_row, update
 from .lifecycle import AsyncTransactionHandle
@@ -11,7 +11,10 @@ from .events import EVENT_NAMES, EventName, SessionEvent
 from .mapping import ModelMapping
 from .session import ConflictError, _SessionState
 from .state import ObjectState
+from .relations import Association, LoadBudget, Relation, async_load_many, async_load_one
 T=TypeVar('T')
+P=TypeVar('P')
+C=TypeVar('C')
 
 class AsyncSession(_SessionState):
     _database: AsyncDatabase
@@ -72,6 +75,20 @@ class AsyncSession(_SessionState):
         except BaseException:
             self._failed=True;raise
 
+    async def load_relation(self,relation: Relation[P,C],parents: Sequence[P],*,budget: LoadBudget,singular: bool=False) -> tuple[Association[P,C],...]:
+        self._guard();self._mapping(relation.parent);self._mapping(relation.child)
+        if type(singular) is not bool: raise ValueError('singular requires boolean')
+        if any(id(parent) not in self._store.records or self._store.records[id(parent)].mapping is not relation.parent for parent in parents):
+            raise OrmError('relation parents must belong to this Session')
+        if self.autoflush: await self.flush()
+        try:
+            await self._ensure_transaction()
+            loader=async_load_one if singular else async_load_many
+            associations=await loader(self._database,relation,parents,budget=budget)
+            return self._attach_associations(relation,associations)
+        except BaseException:
+            self._failed=True;raise
+
     async def attach_existing(self,mapping: ModelMapping[T],obj: T,*,discard_changes: bool=False) -> T:
         values=self._existing_input(mapping,obj,discard_changes)
         try:
@@ -113,6 +130,9 @@ class AsyncSession(_SessionState):
                 raise OrmError('row callbacks introduced new write actions; refuse before SQL')
             for record,action,values in plans:
                 mapping=record.mapping
+                if action=='insert':
+                    self._resolve_links(record,require_complete=True)
+                    values=mapping.writes(record.obj,inserting=True)
                 if action=='delete':
                     count=await self._database.execute(delete(mapping.table,where=self._predicate(mapping,record.baseline,all_fields=True)))
                     if count!=1: raise ConflictError('stale mapped delete')
@@ -137,6 +157,7 @@ class AsyncSession(_SessionState):
             self._failed=True;raise
         else: self._store.committed()
         finally: self._transaction=None
+        self._links.clear()
         await self._emit('after_commit')
 
     async def rollback(self) -> None:
@@ -147,6 +168,7 @@ class AsyncSession(_SessionState):
             self._store.uncertain();self._uncertain=True;self._failed=True;raise
         else: self._store.rollback();self._failed=False
         finally: self._transaction=None
+        self._links.clear()
         await self._emit('after_rollback')
 
     async def close(self) -> None:

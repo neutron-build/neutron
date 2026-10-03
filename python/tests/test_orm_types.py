@@ -136,3 +136,13 @@ def static_derived_consumer(db: Database) -> None:
     assert_type(db.all(query_from(projected).select(field(projected.column('id',int)))),list[int])
     named=cte(q,'named',labels=('id',))
     assert_type(db.all(query_from(named).select(field(named.column('id',int)))),list[int])
+
+from typing import Sequence
+
+def static_graph_consumer(session: Session,rel: Relation[User,User],parent: User,children: Sequence[User]) -> None:
+    assert_type(session.add_graph(rel,parent,children),None)
+    assert_type(session.link(rel,parent,parent),None)
+    assert_type(session.load_relation(rel,[parent],budget=LoadBudget(1,1,1)),tuple[Association[User,User],...])
+
+async def static_async_graph_consumer(session: AsyncSession,rel: Relation[User,User],parent: User) -> None:
+    assert_type(await session.load_relation(rel,[parent],budget=LoadBudget(1,1,1)),tuple[Association[User,User],...])

@@ -3,14 +3,17 @@ from __future__ import annotations
 from contextlib import contextmanager
 import threading
 import inspect
-from typing import Any, Callable, Iterator, TypeVar
+from typing import Any, Callable, Iterator, Sequence, TypeVar
 from .client import AsyncDatabase, Database
 from .core import CardinalityError, OrmError, Predicate, SessionBusyError, delete, insert, select_row, update
 from .lifecycle import TransactionHandle
 from .events import EVENT_NAMES, EventName, SessionEvent
 from .mapping import ModelMapping, same_column_value
 from .state import ObjectState, Record, StateStore
+from .relations import Association, LoadBudget, Relation, load_many, load_one
 T=TypeVar('T')
+P=TypeVar('P')
+C=TypeVar('C')
 
 class ConflictError(OrmError): pass
 
@@ -24,6 +27,7 @@ class _SessionState:
         self.autobegin=autobegin;self.autoflush=autoflush
         self._listeners: dict[EventName,list[Callable[[SessionEvent],Any]]]={}
         self._emitting=False
+        self._links: list[tuple[Relation[Any,Any],object,object]]=[]
 
     def _owner_check(self) -> None: raise NotImplementedError
 
@@ -44,6 +48,85 @@ class _SessionState:
     def add(self,mapping: ModelMapping[T],obj: T) -> None:
         self._guard();self._mapping(mapping);mapping.writes(obj,inserting=True)
         self._store.attach(mapping,obj,new=True)
+
+    def link(self,relation: Relation[P,C],parent: P,child: C) -> None:
+        """Connect two tracked records; pending generated keys resolve at flush."""
+        self._guard();relation.__post_init__()
+        if relation.parent_fields!=relation.parent.primary_key:
+            raise OrmError('graph link requires the complete declared parent primary key')
+        for mapping,obj in ((relation.parent,parent),(relation.child,child)):
+            record=self._store.records.get(id(obj))
+            if record is None or record.mapping is not mapping or record.state not in {ObjectState.PENDING,ObjectState.PERSISTENT}:
+                raise OrmError('graph link requires tracked pending/persistent mapped records')
+        if any(relation.child.field_columns[name].spec.generated for name in relation.child_fields):
+            raise OrmError('graph link cannot target generated child fields')
+        for old,old_parent,old_child in self._links:
+            if old_child is child and set(old.child_fields) & set(relation.child_fields):
+                if old is relation and old_parent is parent: return
+                raise OrmError('conflicting graph relationship ownership')
+        self._links.append((relation,parent,child))
+
+    def add_graph(self,relation: Relation[P,C],parent: P,children: Sequence[C]) -> None:
+        self._guard();relation.__post_init__()
+        if relation.parent_fields!=relation.parent.primary_key: raise OrmError('graph requires complete parent primary key')
+        items=tuple(children)
+        if len({id(obj) for obj in items})!=len(items): raise OrmError('duplicate graph child')
+        if id(parent) not in self._store.records: relation.parent.writes(parent,inserting=True)
+        for child in items:
+            relation.child.writes(child,inserting=True,deferred_fields=frozenset(relation.child_fields))
+        try:
+            if id(parent) not in self._store.records: self.add(relation.parent,parent)
+            for child in items:
+                self._mapping(relation.child)
+                self._store.attach(relation.child,child,new=True)
+                self.link(relation,parent,child)
+        except BaseException:
+            self._failed=True;raise
+
+    def _graph_fields(self,record: Record[Any]) -> frozenset[str]:
+        return frozenset(name for rel,_,child in self._links if child is record.obj for name in rel.child_fields)
+
+    def _resolve_links(self,record: Record[Any],*,require_complete: bool) -> None:
+        for relation,parent,child in self._links:
+            if child is not record.obj: continue
+            parent_record=self._store.records.get(id(parent))
+            if parent_record is None or parent_record.state not in {ObjectState.PENDING,ObjectState.PERSISTENT}:
+                raise OrmError('linked parent is unavailable')
+            values=relation.parent.snapshot(parent)
+            if relation.parent.key(values) is None:
+                if require_complete: raise OrmError('linked parent identity is unresolved')
+                continue
+            for left,right in zip(relation.parent_fields,relation.child_fields):
+                value=values[left];relation.child.field_columns[right].spec.check(value)
+                setattr(child,right,value)
+
+    def _graph_order(self,plans: list[tuple[Record[Any],str,dict[str,Any]]]) -> list[tuple[Record[Any],str,dict[str,Any]]]:
+        by_id={id(record.obj):(record,action,values) for record,action,values in plans}
+        dependencies: dict[int,set[int]]={key:set() for key in by_id}
+        for _,parent,child in self._links:
+            parent_id=id(parent);child_id=id(child)
+            if parent_id in by_id and child_id in by_id and by_id[parent_id][1]=='insert':
+                dependencies[child_id].add(parent_id)
+        ordered=[];remaining=dict(by_id)
+        while remaining:
+            ready=[key for key in remaining if not dependencies[key] & remaining.keys()]
+            if not ready: raise OrmError('cyclic graph dependencies refuse before SQL')
+            for key in ready: ordered.append(remaining.pop(key))
+        return ordered
+
+    def _attach_associations(self,relation: Relation[P,C],associations: tuple[Association[P,C],...]) -> tuple[Association[P,C],...]:
+        result=[]
+        for association in associations:
+            children=[]
+            for child in association.children:
+                values=relation.child.snapshot(child);key=relation.child.key(values)
+                if key is None: raise OrmError('related row requires complete identity')
+                cached=self._store.find(relation.child,key)
+                if cached is None:
+                    self._store.attach(relation.child,child,new=False);cached=child
+                children.append(cached)
+            result.append(Association(association.parent,tuple(children)))
+        return tuple(result)
 
     def delete(self,obj: object) -> None:
         self._guard();record=self._store.records.get(id(obj))
@@ -114,8 +197,9 @@ class _SessionState:
         # Validate every pending/dirty record before executing any SQL.
         for record in self._store.records.values():
             mapping=record.mapping
+            self._resolve_links(record,require_complete=record.state is not ObjectState.PENDING)
             if record.state is ObjectState.PENDING:
-                plans.append((record,'insert',mapping.writes(record.obj,inserting=True)))
+                plans.append((record,'insert',mapping.writes(record.obj,inserting=True,deferred_fields=self._graph_fields(record))))
             elif record.state is ObjectState.PERSISTENT:
                 dirty=self._store.dirty(record)
                 if dirty:
@@ -125,7 +209,7 @@ class _SessionState:
             elif record.state is ObjectState.DELETE_PENDING:
                 self._store.dirty(record) # reject changed primary key
                 plans.append((record,'delete',{}))
-        return plans
+        return self._graph_order(plans)
 
     def _flushed_row(self,record: Record[Any],row: dict[str,Any]) -> None:
         values={name:row[column.name] for name,column in record.mapping.field_columns.items()}
@@ -193,6 +277,19 @@ class Session(_SessionState):
         except BaseException:
             self._failed=True;raise
 
+    def load_relation(self,relation: Relation[P,C],parents: Sequence[P],*,budget: LoadBudget,singular: bool=False) -> tuple[Association[P,C],...]:
+        self._guard();self._mapping(relation.parent);self._mapping(relation.child)
+        if type(singular) is not bool: raise ValueError('singular requires boolean')
+        if any(id(parent) not in self._store.records or self._store.records[id(parent)].mapping is not relation.parent for parent in parents):
+            raise OrmError('relation parents must belong to this Session')
+        if self.autoflush: self.flush()
+        try:
+            self._ensure_transaction()
+            associations=(load_one if singular else load_many)(self._database,relation,parents,budget=budget)
+            return self._attach_associations(relation,associations)
+        except BaseException:
+            self._failed=True;raise
+
     def attach_existing(self,mapping: ModelMapping[T],obj: T,*,discard_changes: bool=False) -> T:
         values=self._existing_input(mapping,obj,discard_changes)
         try:
@@ -228,13 +325,15 @@ class Session(_SessionState):
             plans=self._plan()
             for record,action,_ in plans:
                 self._emit('before_insert' if action=='insert' else 'before_update' if action=='update' else 'before_delete',record.obj)
-            # Callbacks cannot silently introduce writes without their own event.
             expected={(id(record.obj),action) for record,action,_ in plans}
             plans=self._plan()
             if {(id(record.obj),action) for record,action,_ in plans} - expected:
                 raise OrmError('row callbacks introduced new write actions; refuse before SQL')
             for record,action,values in plans:
                 mapping=record.mapping
+                if action=='insert':
+                    self._resolve_links(record,require_complete=True)
+                    values=mapping.writes(record.obj,inserting=True)
                 if action=='delete':
                     count=self._database.execute(delete(mapping.table,where=self._predicate(mapping,record.baseline,all_fields=True)))
                     if count!=1: raise ConflictError('stale mapped delete')
@@ -259,6 +358,7 @@ class Session(_SessionState):
             self._failed=True;raise
         else: self._store.committed()
         finally: self._transaction=None
+        self._links.clear()
         self._emit('after_commit')
 
     def rollback(self) -> None:
@@ -269,6 +369,7 @@ class Session(_SessionState):
             self._store.uncertain();self._uncertain=True;self._failed=True;raise
         else: self._store.rollback();self._failed=False
         finally: self._transaction=None
+        self._links.clear()
         self._emit('after_rollback')
 
     def close(self) -> None:
