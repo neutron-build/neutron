@@ -98,3 +98,19 @@ SQL text observations. Unknown, missing, failed or unsupported cases fail.
 Results bind client commands, descriptor digests and verified artifact hashes.
 This fixture certifies only these scalar write/read combinations, not broad
 query, migration, relationship, pooler or engine parity.
+# Additional installed lifecycle qualification
+
+After `qualify_python.py` succeeds, run the broader wheel consumer against the
+same outside-origin environment and exact integrated source revision:
+
+```sh
+python3 -I conformance/polyglot/qualify_python_lifecycle.py --consumer PYTHON_CONSUMER --source-revision INTEGRATED_REVISION
+```
+
+Both sync and async consumers check generated graph rollback, bound prewrite
+callbacks, relation identity reuse, known-commit callback failure classification,
+late constraint rollback, stream cleanup and explicit transaction lifetime.
+Independent coordinator SQL verifies final rows. This is a bounded installed
+corpus, not full ORM certification. No timing is part of this qualification.
+Installed raw/ORM performance calibration is documented in
+[`performance/README.md`](performance/README.md).

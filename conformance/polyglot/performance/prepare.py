@@ -11,11 +11,22 @@ import os
 import platform
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from protocol import verify_artifacts
+
+def command(argv,cwd,env,timeout):
+    process=subprocess.Popen(argv,cwd=cwd,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
+    try: output,_=process.communicate(timeout=timeout)
+    except BaseException:
+        try: os.killpg(process.pid,signal.SIGKILL)
+        except ProcessLookupError: pass
+        process.wait();raise
+    if process.returncode: raise ValueError('performance preparation subprocess failed (diagnostics suppressed)')
+    return output
 
 def prepare(args):
     origin=args.source.resolve()
@@ -73,12 +84,9 @@ def prepare(args):
             binary=directory/'adapter'
             env={k:v for k,v in os.environ.items() if not k.startswith('PG') and not k.endswith('DATABASE_URL') and k not in ('DB_URL','PYTHONPATH','PYTHONHOME')}
             env.update({'GOWORK':'off','GOTOOLCHAIN':'local','GOFLAGS':''})
-            completed=subprocess.run(['go','build','-mod=readonly','-trimpath','-o',str(binary),'.'],cwd=directory,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=180)
-            if completed.returncode: raise ValueError('performance Go build failed (diagnostics suppressed)')
+            command(['go','build','-mod=readonly','-trimpath','-o',str(binary),'.'],directory,env,180)
             toolchain=directory/'toolchain.txt'
-            result=subprocess.run(['go','version','-m',str(binary)],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=30)
-            if result.returncode: raise ValueError('performance Go identity failed')
-            toolchain.write_bytes(result.stdout)
+            toolchain.write_bytes(command(['go','version','-m',str(binary)],directory,env,30))
             files.extend(directory/name for name in ('main.go','go.mod','go.sum','adapter','toolchain.txt'))
             manifest=extend(root,files)
             clients['go-pgx']={'command':[str(binary)],'artifact_root':str(root),'artifact_manifest':manifest}

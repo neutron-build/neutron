@@ -110,6 +110,11 @@ def run(args):
             raise ValueError('consumer command must be argv')
         manifest = Path(client['artifact_manifest'])
         identities[label] = verify_artifacts(json.loads(manifest.read_text()), Path(client['artifact_root']))
+        if label.startswith(('python-','typescript-')):
+            runtime=json.loads((Path(client['artifact_root'])/'performance/runtime-identity.json').read_text())
+            executable=Path(client['command'][0]).resolve()
+            if str(executable)!=runtime['executable'] or digest(executable)!=runtime['sha256']:
+                raise ValueError('consumer runtime bytes changed after preparation')
     binding = {'profile_sha256': digest(PROFILE), 'consumers_sha256': digest(args.consumers),
         'source_revision': descriptor['source_revision'], 'artifacts': identities}
     if args.phase == 'characterize':
@@ -168,6 +173,9 @@ def run(args):
                                 'median_orm_over_raw':statistics.median(orm)/statistics.median(raw)}
                         save()
                 report['accepted'] = all(g['accepted'] for g in report['gates'].values())
+                for label,client in descriptor['clients'].items():
+                    if verify_artifacts(json.loads(Path(client['artifact_manifest']).read_text()),Path(client['artifact_root']))!=identities[label]:
+                        raise ValueError('installed artifact identity changed during campaign')
             finally:
                 if created:
                     ownership(conn, scope, token)

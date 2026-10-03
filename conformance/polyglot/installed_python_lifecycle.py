@@ -87,8 +87,8 @@ async def execute(args,request):
             session.listen('after_commit',fail_after)
             parent.name='committed-after-callback-failure'
             try: await call(session.commit)
-            except RuntimeError as error:
-                if str(error)!='intentional-after-commit': raise
+            except orm.PostCommitError as error:
+                if error.outcome!='committed' or error.sqlstate is not None: raise
             else: raise ValueError('after_commit failure swallowed')
             actual=native.execute(sql.SQL('SELECT name FROM {}.parents WHERE id=%s').format(sql.Identifier(scope)),(parent.id,)).fetchone()
             if actual!=('committed-after-callback-failure',): raise ValueError('after_commit failure undid known commit')
