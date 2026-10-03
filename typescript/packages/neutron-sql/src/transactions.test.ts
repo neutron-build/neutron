@@ -669,3 +669,14 @@ test("async transaction observers preserve known commit and drain rejections", a
   assert.deepEqual(pin.statements, ["begin", "commit"]);
   assert.deepEqual(pin.releasedWith, [undefined]);
 });
+
+test("retry observer async failure does not escape the attempt wrapper", async () => {
+  let attempts = 0;
+  const value = await runRetriedTransaction(async () => {
+    attempts++;
+    return fakePin(attempts === 1 ? [{ match: /^update/, error: new ServerSqlError("conflict", { sqlstate: "40001" }) }] : []);
+  }, async tx => { await tx.execute("update fixture set value=1"); return attempts; }, {}, { ...RETRY_OK, backoffMs: 0 }, { onEvent: async () => { throw new Error("observer unavailable"); } });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(value, 2);
+  assert.equal(attempts, 2);
+});

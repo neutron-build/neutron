@@ -533,7 +533,7 @@ export async function runRetriedTransaction<T>(
         ? {}
         : {
             onEvent: (event) => {
-              hooks.onEvent!({ ...event, attempt });
+              observeSafely(hooks.onEvent, { ...event, attempt });
             },
           };
     const pin = await pinFactory();
