@@ -67,7 +67,7 @@ export class FieldRegistry {
     if (this.ids.has(field.id)) return
     // JSON fields may be discovered on every successive record; streaming
     // alone does not bound this retained, whole-file mapping inventory.
-    if (this.fields.length >= MAX_SOURCE_FIELDS) throw new Error(`source exceeds ${MAX_SOURCE_FIELDS} distinct fields`)
+    if (this.fields.length >= MAX_SOURCE_FIELDS) throw new Error(`source exceeds ${MAX_SOURCE_FIELDS} distinct fields; remove unused source columns before importing`)
     this.ids.add(field.id)
     this.fields.push(field)
   }

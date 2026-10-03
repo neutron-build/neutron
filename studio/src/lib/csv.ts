@@ -115,7 +115,7 @@ export class CsvParser {
 
   private pushField() {
     // Empty fields consume objects even though their text has zero length.
-    if (this.fields.length >= this.maxFields) throw new CsvParseError(`record exceeds ${this.maxFields} fields`, this.recordLine)
+    if (this.fields.length >= this.maxFields) throw new CsvParseError(`record exceeds ${this.maxFields} fields; remove unused source columns before importing`, this.recordLine)
     this.fields.push({ text: this.buf, quoted: this.quoted })
     this.buf = ''
     this.quoted = false

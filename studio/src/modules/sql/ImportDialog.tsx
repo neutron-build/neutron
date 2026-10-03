@@ -3,7 +3,7 @@ import { api } from '../../lib/api'
 import {
   FieldRegistry, readSourceRecords, blobTextChunks, autoMap, mappingProblems, importTargets,
   isRequired, encodeRecord, encodeSourceValue, newImportJournal, runImport, resolvePending,
-  retryPending, skipPending, skipFailedRow, markPendingCommitted, sameFile, journalKey,
+  retryPending, skipPending, skipFailedRow, markPendingCommitted, sameFile, journalKey, MAX_SOURCE_FIELDS,
   loadJournal, describeJournal, MAX_BATCH_ROWS,
   type ColumnMapping, type CsvSourceOptions, type ImportFormat, type ImportJournal,
   type ImportValueOptions, type JournalStorage, type SourceField, type SourceRecord,
@@ -416,7 +416,7 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
         )}
 
         <div class={s.row}>
-          <label class={s.label} for={`${titleId}-file`}>Source file (CSV, JSON array or NDJSON)</label>
+          <label class={s.label} for={`${titleId}-file`}>Source file (CSV, JSON array or NDJSON; up to {MAX_SOURCE_FIELDS.toLocaleString()} source fields)</label>
           <input
             id={`${titleId}-file`}
             ref={fileRef}
