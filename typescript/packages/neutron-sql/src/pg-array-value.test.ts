@@ -52,3 +52,14 @@ test("native array codec preserves int8 extremes and JSON null distinct from SQL
   assert.throws(() => encodeWriteValue(table.values, ctx, [1n]), /require PgArray/);
   assert.throws(() => decodeArrayText(table.legacy, ctx, "{{a},{b}}"), /multi-dimensional/);
 });
+
+test("native array snapshots refuse marker and dimension getters without invoking them", () => {
+  let calls = 0;
+  const marker = Object.defineProperty({}, Symbol.for("@neutron-build/sql.jsonNull"), { get() { calls++; return true; } });
+  assert.throws(() => new PgArray([{ length: 1, lowerBound: 1 }], [marker]), /accessors/);
+  const dimension = Object.defineProperty({ lowerBound: 1 }, "length", { get() { calls++; return 1; } });
+  assert.throws(() => new PgArray([dimension as { length: number; lowerBound: number }], [1]), /own data fields/);
+  const dimensions = Object.defineProperty(new Array(1), "0", { get() { calls++; return { length: 1, lowerBound: 1 }; } });
+  assert.throws(() => new PgArray(dimensions, [1]), /accessors/);
+  assert.equal(calls, 0);
+});

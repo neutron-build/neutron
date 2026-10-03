@@ -10,7 +10,9 @@ function snapshot<T>(value: T, depth = 0, ancestry = new Set<object>()): T {
     if (value === undefined || typeof value === "function" || typeof value === "symbol") throw new Error("array element requires a native scalar");
     return value;
   }
-  if ((value as Record<symbol, unknown>)[JSON_NULL] === true) return Object.freeze({ [JSON_NULL]: true }) as T;
+  const marker = Object.getOwnPropertyDescriptor(value, JSON_NULL);
+  if (marker && !Object.hasOwn(marker, "value")) throw new Error("array JSON elements cannot contain accessors");
+  if (marker?.value === true) return Object.freeze({ [JSON_NULL]: true }) as T;
   if (value instanceof Uint8Array) return new Uint8Array(value) as T;
   if (value instanceof Date) return new Date(value.getTime()) as T;
   if (ancestry.has(value)) throw new Error("array JSON elements cannot contain cycles");
@@ -39,12 +41,19 @@ export class PgArray<T> {
   readonly dimensions: readonly PgArrayDimension[];
   readonly #elements: readonly (T | null)[];
   constructor(dimensions: readonly PgArrayDimension[], elements: readonly (T | null)[]) {
+    if (!Array.isArray(dimensions) || !Array.isArray(elements)) throw new Error("array dimensions and elements require arrays");
     if (dimensions.length > 6) throw new Error("PostgreSQL arrays support at most six dimensions");
     let count = dimensions.length ? 1 : 0;
     this.dimensions = Object.freeze(Array.from({ length: dimensions.length }, (_, index) => {
       if (!Object.hasOwn(dimensions, index)) throw new Error("array dimensions cannot be sparse");
-      const dimension = dimensions[index];
-      const { length, lowerBound } = dimension;
+      const dimensionDescriptor = Object.getOwnPropertyDescriptor(dimensions, String(index))!;
+      if (!Object.hasOwn(dimensionDescriptor, "value")) throw new Error("array dimensions cannot contain accessors");
+      const dimension: unknown = dimensionDescriptor.value;
+      if (dimension === null || typeof dimension !== "object") throw new Error("invalid PostgreSQL array dimension");
+      const lengthDescriptor = Object.getOwnPropertyDescriptor(dimension, "length");
+      const boundDescriptor = Object.getOwnPropertyDescriptor(dimension, "lowerBound");
+      if (!lengthDescriptor || !boundDescriptor || !Object.hasOwn(lengthDescriptor, "value") || !Object.hasOwn(boundDescriptor, "value")) throw new Error("array dimensions require own data fields");
+      const length: number = lengthDescriptor.value, lowerBound: number = boundDescriptor.value;
       if (!Number.isInteger(length) || length <= 0 || length > 2147483647 || !Number.isInteger(lowerBound) || lowerBound < -2147483648 || lowerBound > 2147483647 || lowerBound + length - 1 > 2147483647) throw new Error("invalid PostgreSQL array dimension");
       count *= length;
       if (count > MAX_PG_ARRAY_ELEMENTS) throw new Error("array element budget exceeded");
