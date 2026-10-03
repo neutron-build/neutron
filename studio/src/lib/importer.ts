@@ -58,11 +58,16 @@ export interface SourceRecord {
 
 /** Fields discovered while reading (CSV: the header or first record;
  *  JSON: member names in first-seen order). */
+export const MAX_SOURCE_FIELDS = 4096
+
 export class FieldRegistry {
   fields: SourceField[] = []
   private ids = new Set<string>()
   add(field: SourceField) {
     if (this.ids.has(field.id)) return
+    // JSON fields may be discovered on every successive record; streaming
+    // alone does not bound this retained, whole-file mapping inventory.
+    if (this.fields.length >= MAX_SOURCE_FIELDS) throw new Error(`source exceeds ${MAX_SOURCE_FIELDS} distinct fields`)
     this.ids.add(field.id)
     this.fields.push(field)
   }

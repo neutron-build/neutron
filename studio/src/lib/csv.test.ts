@@ -191,3 +191,18 @@ describe('CSV dialect matches the server export (round-trip fixtures)', () => {
     expect(recs[2].fields[2].quoted).toBe(false)
   })
 })
+
+
+describe('CSV empty-field resource admission', () => {
+  it('refuses delimiter-only fields across chunk boundaries without relying on text size', () => {
+    const parser = new CsvParser({ maxFields: 4 })
+    expect(parser.push(',,')).toEqual([])
+    expect(parser.push(',')).toEqual([])
+    expect(parser.push(',')).toEqual([])
+    expect(() => parser.end()).toThrow(/exceeds 4 fields/)
+  })
+  it('accepts the exact field limit and refuses an extra quoted-empty field at EOF', () => {
+    expect(parseCsv('"","","",""', { maxFields: 4 })[0].fields).toHaveLength(4)
+    expect(() => parseCsv('"","","","",""', { maxFields: 4 })).toThrow(/exceeds 4 fields/)
+  })
+})
