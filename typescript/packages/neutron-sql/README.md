@@ -397,10 +397,15 @@ await db.query.users.findMany({ with: { posts: true } }, { deadlineMs: 250 }); /
 ```
 
 The cancel is delivered to the **server**, not just the caller's promise:
-the pg leg runs `pg_cancel_backend(pid)` on a second pooled connection (the
-backend pid is read from the connection running the query — one extra round
-trip on cancellation-armed statements; the side channel needs spare pool
-capacity, so a `max: 1` pool cannot service it); postgres.js uses its native
+the pg leg runs `pg_cancel_backend(pid)` through an independent cancellation
+pool, reserved before submission. URL-created adapters manage this pool,
+including with application pool `max: 1`. Injected pg adapters require
+`wrapPgPool(pool, { cancellationPool })` with a separate pool; borrowed
+wrappers close neither resource, owned wrappers close both. Without that
+channel, cancellation-armed statements fail before submission. The backend
+pid costs one extra round trip. Pending cancel dispatch completes before the
+target connection can be reused. PostgreSQL completion can race cancellation;
+a successful server result remains successful. postgres.js uses its native
 `Query.cancel()` (a dedicated cancel connection managed by the driver —
 installed 3.4.x has no AbortSignal support of its own). The canceled
 statement fails with `QueryCanceledError` (`reason: "deadline" | "signal"`,

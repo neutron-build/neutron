@@ -136,11 +136,13 @@ async function createCtx(driverKind: "postgres" | "pg"): Promise<Q08Ctx> {
   const statements = { count: 0 };
   const listeners: Array<(e: SqlEvent) => void> = [];
   let pool: pg.Pool | null = null;
+  let cancellationPool: pg.Pool | undefined;
   let pjs: { end(o?: { timeout?: number }): Promise<void> } | null = null;
   let driver: Driver;
   if (driverKind === "pg") {
     pool = new pg.Pool({ connectionString: url.toString(), max: 4 });
-    driver = wrapPgPool(pool as unknown as PgPoolLike);
+    cancellationPool = new pg.Pool({ connectionString: url.toString(), max: 4 });
+    driver = wrapPgPool(pool as unknown as PgPoolLike, { cancellationPool: cancellationPool as unknown as PgPoolLike });
   } else {
     const postgres = (await import("postgres")) as unknown as { default: (u: string, o?: object) => import("./index.js").PostgresJsClient };
     pjs = postgres.default(url.toString(), { max: 4 });
@@ -194,6 +196,7 @@ async function createCtx(driverKind: "postgres" | "pg"): Promise<Q08Ctx> {
     listeners,
     async close(): Promise<void> {
       await db.close();
+      await cancellationPool?.end();
       if (pool !== null) await pool.end();
       if (pjs !== null) await pjs.end({ timeout: 5 });
       await admin.query(`drop database if exists "${DB_NAME}"`);

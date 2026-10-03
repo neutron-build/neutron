@@ -12,6 +12,7 @@ import {
   eq,
   getSqlState,
   integer,
+  loadDriver,
   pgTable,
   serial,
   sql,
@@ -80,10 +81,12 @@ async function createCtx(driverKind: "postgres" | "pg"): Promise<I02Ctx> {
   // Borrowed wraps over a real driver resource we own, so tests can read
   // pool metrics (pg) and control teardown precisely.
   let raw: unknown;
+  let cancellationPool: pg.Pool | undefined;
   let driver: Driver;
   if (driverKind === "pg") {
     raw = new pg.Pool({ connectionString: url.toString(), max: 6 });
-    driver = wrapPgPool(raw as unknown as PgPoolLike);
+    cancellationPool = new pg.Pool({ connectionString: url.toString(), max: 6 });
+    driver = wrapPgPool(raw as unknown as PgPoolLike, { cancellationPool: cancellationPool as unknown as PgPoolLike });
   } else {
     const postgres = (await import("postgres")) as unknown as { default: (u: string, o?: object) => import("./index.js").PostgresJsClient };
     raw = postgres.default(url.toString(), { max: 6 });
@@ -104,6 +107,7 @@ async function createCtx(driverKind: "postgres" | "pg"): Promise<I02Ctx> {
     admin,
     async close(): Promise<void> {
       await db.close();
+      await cancellationPool?.end();
       if (driverKind === "pg") await (raw as pg.Pool).end();
       else await (raw as { end(o?: { timeout?: number }): Promise<void> }).end({ timeout: 5 });
       await admin.query(`drop database if exists "${DB_NAME}"`);
@@ -872,3 +876,17 @@ for (const driverKind of ['postgres', 'pg'] as const) {
     await runTransaction(await ctx.driver.pin!(), async tx => { await tx.execute('select 1'); });
   });
 }
+
+
+test("live i02 (pg): owned max-one pool cancels without targeting its next borrower", async () => {
+  if (!(await ensureLive())) return;
+  const driver = await loadDriver(TEST_URL, { driver: "pg", max: 1 });
+  try {
+    for (let i = 0; i < 3; i++) {
+      const before = await driver.query<{ pid: number }>("select pg_backend_pid() as pid");
+      await assert.rejects(driver.query("select pg_sleep(2)", [], { deadlineMs: 60 }), QueryCanceledError);
+      const after = await driver.query<{ pid: number }>("select pg_backend_pid() as pid from pg_sleep(0.1)");
+      assert.equal(after[0]!.pid, before[0]!.pid, "same pooled backend is reusable after cancellation settles");
+    }
+  } finally { await driver.close(); }
+});
