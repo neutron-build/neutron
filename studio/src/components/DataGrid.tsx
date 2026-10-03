@@ -460,9 +460,10 @@ export function DataGrid({
   // delete. Keys typed inside an open editor belong to the editor.
   function handleGridKey(e: KeyboardEvent) {
     const target = e.target as HTMLElement | null
-    // Sort controls own their keyboard input. A header key must never
-    // edit/delete the last active data row or pull focus into that row.
-    if (!target || target.closest('thead, [data-editor-cell]')) return
+    // Headers and embedded controls own their keyboard input. A delete,
+    // copy or FK button must never edit/delete another active data row or
+    // lose its native keyboard activation to grid navigation.
+    if (!target || target.closest('thead, [data-editor-cell], button, a, input, textarea, select, [contenteditable]')) return
     if (rowCount === 0 || colCount === 0) return
     const { row, col } = active
     const colName = result.columns[col]

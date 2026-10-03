@@ -301,3 +301,26 @@ describe('DataGrid renders decoded lossless values exactly', () => {
     expect(cellAt(0, 'doc').textContent).toBe('{"a":1}')
   })
 })
+
+
+describe('DataGrid embedded controls own keyboard activation', () => {
+  it('a row-delete button cannot edit or delete the previously active row', () => {
+    const onStageUpdate = vi.fn()
+    const onStageDelete = vi.fn()
+    render(<DataGrid result={gridResult()} columns={metaColumns()} onStageUpdate={onStageUpdate} onStageDelete={onStageDelete} canDelete />)
+    // With the action column present, locate the name cell by its data index.
+    const nameCell = document.querySelector('tr[data-row-index="0"] td[data-col-index="1"]') as HTMLElement
+    nameCell.focus()
+    const button = screen.getByRole('button', { name: 'Stage delete row 2' })
+    button.focus()
+    for (const key of ['Enter', 'F2', 'Delete', 'ArrowDown']) fireEvent.keyDown(button, { key })
+    expect(document.querySelector('input[aria-label$=" value"]')).toBeNull()
+    expect(onStageUpdate).not.toHaveBeenCalled()
+    expect(onStageDelete).not.toHaveBeenCalled()
+    expect(document.activeElement).toBe(button)
+    // Browser native Enter/Space activation becomes click; its row is correct.
+    fireEvent.click(button)
+    expect(onStageDelete).toHaveBeenCalledTimes(1)
+    expect(onStageDelete).toHaveBeenCalledWith(1)
+  })
+})
