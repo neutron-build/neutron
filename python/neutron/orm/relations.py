@@ -6,6 +6,7 @@ from typing import Any, Generic, Mapping, Literal, Sequence, TypeVar
 from uuid import UUID
 from .client import AsyncDatabase, Database
 from .core import CardinalityError, OrmError, Predicate
+from .catalog_value import PgDomain, PgEnum
 from .mapping import ModelMapping
 from .query import Field, Query, Scope, field
 
@@ -13,6 +14,11 @@ P=TypeVar('P')
 C=TypeVar('C')
 L=TypeVar('L')
 Key=tuple[tuple[type,object],...]
+
+def _relation_key_profile(spec: Any) -> bool:
+    if spec.python_type is PgDomain:
+        return spec.domain_base is not None and _relation_key_profile(spec.domain_base)
+    return spec.python_type in {int,str,bool,UUID,PgEnum}
 
 class RelationBudgetError(OrmError): pass
 class UnsupportedRelationError(OrmError): pass
@@ -55,7 +61,7 @@ class Relation(Generic[P,C]):
             if left not in self.parent.field_columns or right not in self.child.field_columns:
                 raise ValueError('relation field outside mapped scope')
             a=self.parent.field_columns[left];b=self.child.field_columns[right]
-            if a.spec.nullable or b.spec.nullable or a.spec.python_type is not b.spec.python_type or a.spec.sql_type!=b.spec.sql_type or a.spec.python_type not in {int,str,bool,UUID}:
+            if a.spec.nullable or b.spec.nullable or a.spec.python_type is not b.spec.python_type or a.spec.sql_type!=b.spec.sql_type or a.spec.native_type!=b.spec.native_type or not _relation_key_profile(a.spec):
                 raise UnsupportedRelationError('relation keys require identical nonnullable integer/string/bool/UUID columns')
 
     def inverse(self) -> Relation[C,P]:
@@ -201,7 +207,7 @@ class OwnedRelation(Relation[P,C]):
         for left,right in zip(self.parent_fields,self.child_fields):
             if left not in self.parent.field_columns or right not in self.child.field_columns: raise ValueError('owned relation field outside mapping')
             a=self.parent.field_columns[left];b=self.child.field_columns[right]
-            if a.spec.nullable or a.spec.python_type is not b.spec.python_type or a.spec.sql_type!=b.spec.sql_type or a.spec.python_type not in {int,str,bool,UUID} or b.spec.generated:
+            if a.spec.nullable or a.spec.python_type is not b.spec.python_type or a.spec.sql_type!=b.spec.sql_type or a.spec.native_type!=b.spec.native_type or not _relation_key_profile(a.spec) or b.spec.generated:
                 raise UnsupportedRelationError('owned relation requires identical supported scalar key profiles')
             if self.on_delete=='nullify' and (not b.spec.nullable or right in self.child.primary_key):
                 raise UnsupportedRelationError('nullify requires nullable non-primary child FK fields')

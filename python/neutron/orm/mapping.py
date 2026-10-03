@@ -9,7 +9,7 @@ from typing import Any, Generic, Mapping, TypeVar, get_args, get_origin, get_typ
 from .core import Column, ColumnSpec, OMIT, OrmError, Table, _column_type
 from .json_value import JsonDocument, MutableJson
 from .pg_value import PgArray, PgRange
-from .catalog_value import PgDomain
+from .catalog_value import PgDomain, PgEnum
 from .instrumentation import _MappedField, instrument_model, raw_values, restore_values
 from decimal import Decimal
 import datetime as dt
@@ -68,8 +68,8 @@ class ModelMapping(Generic[T]):
         for name in primary_key:
             if name not in field_columns or field_columns[name].spec.nullable:
                 raise ValueError('primary-key fields must be mapped nonnullable columns')
-            if field_columns[name].spec.sql_type in {'json','jsonb'} or field_columns[name].spec.python_type in {PgArray,PgRange,PgDomain}:
-                raise ValueError('JSON/array/range/domain primary keys unsupported')
+            if not _primary_profile(field_columns[name].spec):
+                raise ValueError('primary-key codec equality is outside qualified identity profile')
         if version_field is not None:
             if version_field not in field_columns or version_field in primary_key:
                 raise ValueError('version field must be mapped outside the primary key')
@@ -97,15 +97,14 @@ class ModelMapping(Generic[T]):
         return deepcopy(raw_values(obj,tuple(self.field_columns)))
 
     def key(self,values: Mapping[str,Any]) -> tuple[Any,...] | None:
-        if any(self.field_columns[name].spec.sql_type in {'json','jsonb'} or self.field_columns[name].spec.python_type in {PgArray,PgRange,PgDomain} for name in self.primary_key):
-            raise ValueError("JSON/array/range/domain primary keys unsupported")
+        if any(not _primary_profile(self.field_columns[name].spec) for name in self.primary_key):
+            raise ValueError('primary-key codec equality is outside qualified identity profile')
         key=[]
         for name in self.primary_key:
             value=values[name]
             if value is None or value is OMIT: return None
             column=self.field_columns[name];column.spec.check(value)
-            if isinstance(value,Decimal) and not value.is_finite(): raise ValueError("nonfinite numeric primary keys unsupported")
-            if column.spec.sql_type=='timestamptz': value=value.astimezone(dt.timezone.utc)
+            value=_identity_value(column.spec,value)
             key.append(value)
         return tuple(key)
 
@@ -140,6 +139,19 @@ class ModelMapping(Generic[T]):
             column.spec.check(value)
             result[column.name]=value
         return result
+
+
+def _primary_profile(spec: ColumnSpec[Any]) -> bool:
+    if spec.domain_base is not None: return _primary_profile(spec.domain_base)
+    return spec.sql_type not in {'json','jsonb','interval'} and spec.python_type not in {PgArray,PgRange,PgDomain}
+
+
+def _identity_value(spec: ColumnSpec[Any],value: Any) -> Any:
+    if isinstance(value,PgDomain):
+        assert spec.domain_base is not None
+        return PgDomain(_identity_value(spec.domain_base,value.value),value.identity)
+    if isinstance(value,Decimal) and not value.is_finite(): raise ValueError('nonfinite numeric primary keys unsupported')
+    return value.astimezone(dt.timezone.utc) if spec.sql_type=='timestamptz' else value
 
 
 def _json_equal(left: Any,right: Any) -> bool:

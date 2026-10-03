@@ -59,7 +59,7 @@ class ColumnSpec(Generic[T]):
         if self.native_type is not None:
             if not isinstance(self.native_type,CatalogType): raise ValueError('catalog type admission required')
             if self.sql_type=='enum' and self.python_type is PgEnum and self.native_type.kind=='e' and self.domain_base is None: return
-            if self.sql_type=='domain' and self.python_type is PgDomain and self.native_type.kind=='d' and isinstance(self.domain_base,ColumnSpec) and self.domain_base.type_oid==self.native_type.base_oid and self.domain_base.native_type is None: return
+            if self.sql_type=='domain' and self.python_type is PgDomain and self.native_type.kind=='d' and isinstance(self.domain_base,ColumnSpec) and self.domain_base.type_oid==self.native_type.base_oid and (self.domain_base.native_type is None or self.domain_base.native_type.kind=='e' and self.domain_base.native_type._owner is self.native_type._owner): return
             raise ValueError('catalog kind/base type mismatch')
         if self.domain_base is not None: raise ValueError('domain base requires catalog identity')
         if _TYPES.get(self.sql_type) is not self.python_type and not (self.sql_type=='jsonb' and self.python_type is MutableJson) and not (self.python_type is PgRange and self.sql_type in _RANGE_TYPES) and not (self.python_type is PgArray and self.sql_type.endswith('[]') and self.sql_type[:-2] in _ARRAY_TYPES):

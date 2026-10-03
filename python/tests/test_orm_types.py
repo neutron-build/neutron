@@ -232,3 +232,11 @@ async def static_async_catalog_value_consumer(db: AsyncDatabase) -> None:
     assert_type(amount,ColumnSpec[PgDomain[Decimal]])
     table=await db.catalog_table('values',{'amount':amount},schema='app')
     assert_type(await db.one(select(table.column('amount',PgDomain[Decimal]))),PgDomain[Decimal])
+
+from uuid import UUID
+
+def static_domain_identity_consumer(db: Database) -> None:
+    key=db.domain_spec('app','identity',ColumnSpec(UUID,'uuid'))
+    enum=db.enum_spec('app','state');domain=db.domain_spec('app','state_domain',enum)
+    assert_type(key,ColumnSpec[PgDomain[UUID]])
+    assert_type(domain,ColumnSpec[PgDomain[PgEnum]])

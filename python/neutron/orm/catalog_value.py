@@ -81,6 +81,7 @@ def register_catalog_values(connection: object,owner: object,identity: CatalogTy
             spec=obj.base_spec
             if not isinstance(spec,ColumnSpec) or spec.type_oid!=obj.identity.base_oid: raise ValueError('domain native base mismatch')
             value=obj.value
+            if isinstance(value,PgEnum): return value.label.encode(encoding)
             classes=_adapter_classes()
             if isinstance(value,PgArray):
                 data=classes[4](type(value),self.context).dump(BoundArray(value,spec.sql_type))

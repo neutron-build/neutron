@@ -129,7 +129,7 @@ class Database:
     def domain_spec(self,schema: str,name: str,base: ColumnSpec[T],*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgDomain[T]]:
         quote(schema);quote(name)
         identity=admitted_type(self._catalog_read(TYPE_SQL,(schema,name)),schema,name,'d',self._catalog_owner)
-        if base.native_type is not None or base.type_oid!=identity.base_oid: raise ValueError('domain declared base SQL type/OID mismatch')
+        if base.type_oid!=identity.base_oid or base.native_type is not None and (base.native_type.kind!='e' or base.native_type._owner is not self._catalog_owner): raise ValueError('domain declared base SQL type/OID mismatch')
         cached=self._catalog_specs.get((schema,name))
         if cached is None or cached.native_type!=identity:
             register_catalog_values(self._conn,self._catalog_owner,identity)
@@ -394,7 +394,7 @@ class AsyncDatabase:
     async def domain_spec(self,schema: str,name: str,base: ColumnSpec[T],*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgDomain[T]]:
         quote(schema);quote(name)
         identity=admitted_type(await self._catalog_read(TYPE_SQL,(schema,name)),schema,name,'d',self._catalog_owner)
-        if base.native_type is not None or base.type_oid!=identity.base_oid: raise ValueError('domain declared base SQL type/OID mismatch')
+        if base.type_oid!=identity.base_oid or base.native_type is not None and (base.native_type.kind!='e' or base.native_type._owner is not self._catalog_owner): raise ValueError('domain declared base SQL type/OID mismatch')
         cached=self._catalog_specs.get((schema,name))
         if cached is None or cached.native_type!=identity:
             register_catalog_values(self._conn,self._catalog_owner,identity)

@@ -19,3 +19,27 @@ def test_catalog_value_identity_and_snapshot_containment():
     with pytest.raises(ValueError): Table('t',{'state':enum_spec})
     with pytest.raises(ValueError): ColumnSpec(PgEnum,'enum')
     with pytest.raises(ValueError): ColumnSpec(PgDomain,'domain',native_type=domain,domain_base=ColumnSpec(str,'text'))
+
+from dataclasses import dataclass
+import datetime as dt
+from neutron.orm import Interval,ModelMapping
+
+@dataclass
+class IntervalKey:
+    id: Interval
+
+@dataclass
+class InstantDomainKey:
+    id: PgDomain[dt.datetime]
+
+
+def test_primary_equality_profiles_and_domain_instant_normalization():
+    table=Table('interval_keys',{'id':ColumnSpec(Interval,'interval')})
+    with pytest.raises(ValueError,match='identity profile'): ModelMapping(IntervalKey,table,dict(table.columns),primary_key=('id',))
+    owner=object();identity=CatalogType('app','instant_identity',100003,'d',1184,True,owner)
+    spec=ColumnSpec(PgDomain,'domain',native_type=identity,domain_base=ColumnSpec(dt.datetime,'timestamptz'))
+    table=Table('domain_keys',{'id':spec},_catalog_owner=owner)
+    mapping=ModelMapping(InstantDomainKey,table,dict(table.columns),primary_key=('id',))
+    utc=dt.datetime(2020,1,1,tzinfo=dt.timezone.utc)
+    offset=utc.astimezone(dt.timezone(dt.timedelta(hours=3)))
+    assert mapping.key({'id':PgDomain(utc,identity)})==mapping.key({'id':PgDomain(offset,identity)})

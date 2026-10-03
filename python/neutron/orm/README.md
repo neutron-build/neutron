@@ -554,5 +554,11 @@ catalog metadata refuse. Query aliases/derived sources and explicit subqueries
 retain this ownership. Catalog admission is a point-in-time contract: rebuild
 metadata after DDL. A Session can share the admitted Database via `Session(db)`
 or AsyncSession(db); metadata admission remains outside automatic flush/property
-access. Domain primary identities, domains over custom enum bases and user
-multirange/composite adapters remain unqualified.
+access. User multirange/composite adapters remain unqualified. Scalar domain primary
+identities retain their qualified tags and normalize underlying instant keys to
+UTC; nonfinite numeric keys refuse. PostgreSQL interval equality can equate
+different month/day representations, so interval, array, range and JSON primary
+profiles remain refused, including domains over those profiles. Domains over an
+explicit admitted enum base retain both domain and enum identities. Matching
+qualified enum/domain integer/string/bool/UUID keys can participate in explicit
+relation metadata; incompatible type identities refuse.

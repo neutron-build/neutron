@@ -85,3 +85,63 @@ async def test_native_async_catalog_values_empty_enum_and_rollback(catalog_fixtu
             await session.rollback();assert obj.state.label==''
         assert (await db.one(select_row(table)))['amount'].value==Decimal('1.0000000000000001')
     assert native.execute(f'SELECT state::text,amount::text FROM "{s}".catalog_values').fetchone()==('', '1.0000000000000001')
+
+from uuid import UUID,uuid4
+from neutron.orm import LoadBudget,OwnedRelation,ObjectState
+
+@dataclass
+class DomainParent:
+    id: PgDomain[UUID]
+    state: PgDomain[PgEnum]
+
+@dataclass
+class DomainChild:
+    id: int
+    parent_id: PgDomain[UUID]|None=None
+
+
+def test_native_domain_primary_identity_enum_base_and_owned_fk(catalog_fixture):
+    url,s,native=catalog_fixture
+    native.execute(f'CREATE DOMAIN "{s}".row_identity AS uuid NOT NULL')
+    native.execute(f'CREATE DOMAIN "{s}".state_domain AS "{s}".state_kind NOT NULL')
+    native.execute(f'CREATE TABLE "{s}".domain_parents(id "{s}".row_identity PRIMARY KEY,state "{s}".state_domain NOT NULL)')
+    native.execute(f'CREATE TABLE "{s}".domain_children(id int PRIMARY KEY,parent_id "{s}".row_identity NOT NULL REFERENCES "{s}".domain_parents(id))')
+    with Database.connect(url) as db:
+        key=db.domain_spec(s,'row_identity',ColumnSpec(UUID,'uuid'))
+        enum=db.enum_spec(s,'state_kind');state=db.domain_spec(s,'state_domain',enum)
+        assert key.native_type is not None and enum.native_type is not None and state.native_type is not None
+        p=db.catalog_table('domain_parents',{'id':key,'state':state},schema=s)
+        c=db.catalog_table('domain_children',{'id':ColumnSpec(int,'int4'),'parent_id':key},schema=s)
+        pm=ModelMapping(DomainParent,p,dict(p.columns),primary_key=('id',));cm=ModelMapping(DomainChild,c,dict(c.columns),primary_key=('id',))
+        rel=OwnedRelation(pm,cm,('id',),('parent_id',),on_delete='delete')
+        identity=uuid4();tagged=PgDomain(identity,key.native_type)
+        with Session(db) as session:
+            parent=DomainParent(tagged,PgDomain(PgEnum('',enum.native_type),state.native_type));child=DomainChild(1)
+            session.add_graph(rel,parent,[child]);session.commit()
+            assert session.get(pm,tagged) is parent
+            assert session.load_relation(rel,[parent],budget=LoadBudget(1,2,1))[0].children[0] is child
+            assert child.parent_id==tagged and parent.state.value.label==''
+            session.delete_graph(rel,parent,budget=LoadBudget(2,2,1));session.flush();session.rollback()
+            assert session.object_state(parent) is ObjectState.PERSISTENT and child.parent_id==tagged
+            assert native.execute(f'SELECT id::uuid,state::text FROM "{s}".domain_parents').fetchone()==(identity,'')
+            session.delete_graph(rel,parent,budget=LoadBudget(2,2,1));session.commit()
+        assert native.execute(f'SELECT count(*) FROM "{s}".domain_children').fetchone()==(0,)
+
+@pytest.mark.asyncio
+async def test_native_async_domain_primary_identity_and_enum_base(catalog_fixture):
+    url,s,native=catalog_fixture
+    native.execute(f'CREATE DOMAIN "{s}".row_identity AS uuid NOT NULL')
+    native.execute(f'CREATE DOMAIN "{s}".state_domain AS "{s}".state_kind NOT NULL')
+    native.execute(f'CREATE TABLE "{s}".domain_parents(id "{s}".row_identity PRIMARY KEY,state "{s}".state_domain NOT NULL)')
+    async with await AsyncDatabase.connect(url) as db:
+        key=await db.domain_spec(s,'row_identity',ColumnSpec(UUID,'uuid'))
+        enum=await db.enum_spec(s,'state_kind');state=await db.domain_spec(s,'state_domain',enum)
+        assert key.native_type is not None and enum.native_type is not None and state.native_type is not None
+        table=await db.catalog_table('domain_parents',{'id':key,'state':state},schema=s)
+        mapping=ModelMapping(DomainParent,table,dict(table.columns),primary_key=('id',))
+        tagged=PgDomain(uuid4(),key.native_type)
+        async with AsyncSession(db) as session:
+            obj=DomainParent(tagged,PgDomain(PgEnum('ready',enum.native_type),state.native_type));session.add(mapping,obj);await session.commit()
+            assert await session.get(mapping,tagged) is obj
+            obj.state=PgDomain(PgEnum("quoted'label",enum.native_type),state.native_type);await session.flush();await session.rollback()
+            assert obj.state.value.label=='ready'
