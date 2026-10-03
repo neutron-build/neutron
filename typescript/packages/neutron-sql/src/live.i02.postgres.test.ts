@@ -654,7 +654,7 @@ for (const driverKind of ["postgres", "pg"] as const) {
     // Statement identity is still observable: statement ids and kinds.
     const parsed = lines.map((l) => JSON.parse(l.slice("[neutron-sql] ".length))) as Array<Record<string, unknown>>;
     assert.ok(parsed.every((e) => typeof e.statementId === "string" && e.statementId.length === 16));
-    assert.ok(parsed.some((e) => e.kind === "query-begin" && /^[0-9a-f]{16}$/.test(e.statementId) && e.sql === undefined));
+    assert.ok(parsed.some((e) => e.kind === "query-begin" && typeof e.statementId === "string" && /^[0-9a-f]{16}$/.test(e.statementId) && e.sql === undefined));
     assert.ok(parsed.some((e) => e.kind === "query-end" && typeof e.durationMs === "number"));
 
     // Opt-in: NEUTRON_SQL_LOG_PARAMS=1 is the ONLY way parameters appear
