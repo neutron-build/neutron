@@ -106,9 +106,19 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
   const abortRef = useRef<AbortController | null>(null)
   const dialogRef = useRef<HTMLDivElement | null>(null)
   const fileRef = useRef<HTMLInputElement | null>(null)
+  const stopRef = useRef<HTMLButtonElement | null>(null)
 
   // Focus the first control on open; the opener restores focus on close.
   useEffect(() => { fileRef.current?.focus() }, [])
+
+  // Starting a batch disables/removes the focused setup control. Keep focus
+  // on the available stop action rather than leaving it on body or a disabled
+  // fieldset descendant while the modal is running.
+  useEffect(() => {
+    if (!running) return
+    const active = document.activeElement as HTMLElement | null
+    if (!active || !dialogRef.current?.contains(active) || active.matches(':disabled')) stopRef.current?.focus()
+  }, [running])
 
   function save(j: ImportJournal) {
     try {
@@ -349,7 +359,7 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
     }
     if (e.key !== 'Tab' || !dialogRef.current) return
     const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLElement>(
-      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex="0"]'))
+      'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex="0"]:not(:disabled)'))
     if (focusable.length === 0) return
     const first = focusable[0]
     const last = focusable[focusable.length - 1]
@@ -629,7 +639,7 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
             <button class={s.btnPrimary} onClick={() => void run({ ...journal })}>Resume import</button>
           )}
           {scan && !scan.done && !running && <button class={s.btn} onClick={stop}>Stop checking</button>}
-          {running && <button class={s.btn} onClick={stop}>Stop after this batch</button>}
+          {running && <button ref={stopRef} class={s.btn} onClick={stop}>Stop after this batch</button>}
           {!running && <button class={s.btn} onClick={onClose}>Close</button>}
         </div>
       </div>
