@@ -4,7 +4,7 @@ Install `neutron-framework[orm]`. Import from `neutron.orm`. Existing
 `neutron.nucleus` asyncpg clients are unchanged.
 
 This is a bounded native psycopg synchronous/asynchronous SQL core with
-explicit scalar dataclass Sessions. Associations and full SQLAlchemy parity
+explicit scalar dataclass Sessions. Associated writes, cascades and full SQLAlchemy parity
 remain outside this slice. Only `postgres-direct` is admitted.
 `Database.connect` and `AsyncDatabase.connect` compare the startup server
 version with `pg_catalog.version()` before handing out a usable client. Known
@@ -195,3 +195,27 @@ native errors retain SQLSTATE. Mapped fields support immutable replacement
 of `jsonb` documents, not in-place mutation tracking. `json` equality/mapping
 and JSON primary keys are refused. JSON operators/path queries remain future work.
 The adapter uses psycopg's [connection-local JSON loading and explicit wrappers](https://www.psycopg.org/psycopg3/docs/basic/adapt.html#json-adaptation).
+
+
+Explicit relation reads use `Relation(parent_mapping, child_mapping,
+parent_fields=('id', 'tenant'), child_fields=('parent_id', 'tenant'))`.
+Keys must be identical nonnullable integer/string/bool/UUID column profiles.
+`load_many(db, relation, parents, budget=LoadBudget(max_parents=100,
+max_rows=1000, batch_size=20), query=relation.query().order_by(Order(child_id)))`
+returns a tuple of typed `Association(parent, children)` values. Parent input
+order and duplicates are retained, missing matches have empty child tuples,
+and duplicate parent slots receive independently constructed child instances.
+`load_one` rejects multiple matches; async clients use `async_load_many` and
+`async_load_one`. `inverse()` explicitly reverses the relation.
+
+Parent budgets count every input slot; row budgets count expanded child slots,
+including duplicate parents. Key batches deduplicate input composites, bind
+parameters, and refuse PostgreSQL parameter overflow before dispatch. Native
+reads are limited to the remaining budget plus one overflow sentinel row.
+Filters and child ordering are supported through the relation's own mapped
+query. Without ordering, child order is unspecified. Global limits/offsets,
+joined/replaced child projections, nullable/custom keys, per-parent pagination,
+lazy loads, many-to-many inference, graph writes, cascades and Session identity
+attachment are unsupported. Multiple batches have no implicit shared snapshot;
+callers must arrange RepeatableRead/Serializable isolation when needed. Parent
+objects are never modified, and failures return no partial association result.

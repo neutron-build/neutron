@@ -55,3 +55,11 @@ from neutron.orm import EndpointIdentity
 
 def static_endpoint_evidence(db: Database) -> None:
     assert_type(db.endpoint_identity,EndpointIdentity|None)
+
+from neutron.orm import Association, LoadBudget, Relation, async_load_many, load_many
+
+def static_relation_consumer(db: Database,rel: Relation[User,User],parents: list[User]) -> None:
+    assert_type(load_many(db,rel,parents,budget=LoadBudget(10,20,5)),tuple[Association[User,User],...])
+
+async def static_async_relation_consumer(db: AsyncDatabase,rel: Relation[User,User],parents: list[User]) -> None:
+    assert_type(await async_load_many(db,rel,parents,budget=LoadBudget(10,20,5)),tuple[Association[User,User],...])
