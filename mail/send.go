@@ -5,12 +5,14 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"mime"
 	"mime/quotedprintable"
 	"net"
 	"net/mail"
 	"net/smtp"
+	"net/textproto"
 	"regexp"
 	"strings"
 	"time"
@@ -77,6 +79,22 @@ func NewSender(cfg SMTPConfig) *Sender {
 	return &Sender{cfg: cfg}
 }
 
+// NotSubmittedError marks a send failure that is known to have happened before
+// the server could have accepted the message: nothing was delivered and a
+// later retry cannot duplicate it. Any other Send error leaves the outcome
+// unknown, because the failure may have followed an acceptance the caller
+// never saw. A caller that persists work must treat the two differently.
+type NotSubmittedError struct{ Err error }
+
+func (e *NotSubmittedError) Error() string { return e.Err.Error() }
+func (e *NotSubmittedError) Unwrap() error { return e.Err }
+
+// IsNotSubmitted reports whether err is known to precede server acceptance.
+func IsNotSubmitted(err error) bool {
+	var n *NotSubmittedError
+	return errors.As(err, &n)
+}
+
 // ReplyTo builds a reply to an existing message.
 //
 // It carries the threading chain forward — In-Reply-To gets the parent's
@@ -123,16 +141,16 @@ func ReplyTo(parent *Envelope, from Address, text string) *Outgoing {
 // outlive the application's send timeout.
 func (s *Sender) Send(ctx context.Context, msg *Outgoing) (messageID string, raw []byte, err error) {
 	if msg.From.Email == "" {
-		return "", nil, fmt.Errorf("mail: outgoing message has no sender")
+		return "", nil, &NotSubmittedError{fmt.Errorf("mail: outgoing message has no sender")}
 	}
 	if len(msg.To)+len(msg.Cc)+len(msg.Bcc) == 0 {
-		return "", nil, fmt.Errorf("mail: outgoing message has no recipients")
+		return "", nil, &NotSubmittedError{fmt.Errorf("mail: outgoing message has no recipients")}
 	}
 
 	messageID = newMessageID(msg.From.Email)
 	body, err := msg.render(messageID, false)
 	if err != nil {
-		return "", nil, err
+		return "", nil, &NotSubmittedError{err}
 	}
 
 	// Bcc recipients receive the message but must not appear in the
@@ -164,6 +182,10 @@ func (s *Sender) Send(ctx context.Context, msg *Outgoing) (messageID string, raw
 //     server acknowledges DATA, the message is accepted whether or not it
 //     says goodbye politely.
 func (s *Sender) submit(ctx context.Context, from string, rcpts []string, body []byte) error {
+	// Everything up to and including the DATA command is provably before
+	// acceptance (see NotSubmittedError); only the message body and its
+	// terminating reply can leave the outcome unknown.
+	pre := func(err error) error { return &NotSubmittedError{err} }
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	addr := net.JoinHostPort(s.cfg.Host, fmt.Sprintf("%d", s.cfg.Port))
@@ -180,13 +202,13 @@ func (s *Sender) submit(ctx context.Context, from string, rcpts []string, body [
 		conn, err = dialer.DialContext(ctx, "tcp", addr)
 	}
 	if err != nil {
-		return fmt.Errorf("smtp dial: %w", err)
+		return pre(fmt.Errorf("smtp dial: %w", err))
 	}
 	defer conn.Close()
 	if s.cfg.Plaintext {
 		peer, ok := conn.RemoteAddr().(*net.TCPAddr)
 		if !ok || !peer.IP.IsLoopback() {
-			return fmt.Errorf("plaintext SMTP is restricted to loopback peers")
+			return pre(fmt.Errorf("plaintext SMTP is restricted to loopback peers"))
 		}
 	}
 
@@ -197,52 +219,59 @@ func (s *Sender) submit(ctx context.Context, from string, rcpts []string, body [
 	defer stop()
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := conn.SetDeadline(deadline); err != nil {
-			return fmt.Errorf("set deadline: %w", err)
+			return pre(fmt.Errorf("set deadline: %w", err))
 		}
 	}
 
 	c, err := smtp.NewClient(conn, s.cfg.Host)
 	if err != nil {
-		return err
+		return pre(err)
 	}
 	defer c.Close()
 
 	if err := c.Hello("localhost"); err != nil {
-		return err
+		return pre(err)
 	}
 	if !s.cfg.Plaintext && !implicitTLS {
 		if ok, _ := c.Extension("STARTTLS"); !ok {
-			return fmt.Errorf("SMTP server %s does not offer required STARTTLS", s.cfg.Host)
+			return pre(fmt.Errorf("SMTP server %s does not offer required STARTTLS", s.cfg.Host))
 		}
 		if err := c.StartTLS(tlsCfg); err != nil {
-			return err
+			return pre(err)
 		}
 	}
 	if s.cfg.Username != "" {
 		if ok, _ := c.Extension("AUTH"); !ok {
-			return fmt.Errorf("SMTP server %s does not offer required authentication", s.cfg.Host)
+			return pre(fmt.Errorf("SMTP server %s does not offer required authentication", s.cfg.Host))
 		}
 		if err := c.Auth(smtp.PlainAuth("", s.cfg.Username, s.cfg.Password, s.cfg.Host)); err != nil {
-			return err
+			return pre(err)
 		}
 	}
 	if err := c.Mail(from); err != nil {
-		return err
+		return pre(err)
 	}
 	for _, rcpt := range rcpts {
 		if err := c.Rcpt(rcpt); err != nil {
-			return err
+			return pre(err)
 		}
 	}
 	w, err := c.Data()
 	if err != nil {
-		return err
+		return pre(err)
 	}
 	if _, err := w.Write(body); err != nil {
-		return err
+		return err // body partly written: outcome unknown
 	}
 	if err := w.Close(); err != nil {
-		return err // the DATA acknowledgment is what makes it accepted
+		// The DATA acknowledgment is what makes it accepted. A 4xx/5xx reply
+		// to the end of data is the server explicitly declining; a transport
+		// error here is not, and stays an unknown outcome.
+		var reply *textproto.Error
+		if errors.As(err, &reply) && reply.Code >= 400 {
+			return pre(err)
+		}
+		return err
 	}
 	// Bound the goodbye so a server that stalls on QUIT cannot hold the
 	// connection past the point of acceptance.
