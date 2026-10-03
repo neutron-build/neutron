@@ -40,3 +40,18 @@ def test_forged_join_predicate_refused_before_dispatch(live_table):
         with pytest.raises(ValueError): forged.eq(1)
         with pytest.raises(ValueError): parent.column('id',int).eq(forged)
         assert native.execute(f'SELECT count(*) FROM {parent.sql}').fetchone()==(0,)
+
+
+def test_native_self_alias_correlated_exists_and_in_oracle(live_table):
+    from neutron.orm import alias,exists,in_query
+    url,parent,native=live_table
+    native.execute(f'INSERT INTO {parent.sql}(id) VALUES (1),(2),(3)')
+    a=alias(parent,'a%s');b=alias(parent,'b')
+    aid=a.column('id',int);bid=b.column('id',int)
+    sub=query_from(b).correlate(a).select(field(bid)).where(bid.eq(aid)).where(bid.in_([1,3]))
+    q=query_from(a).select(field(aid)).where(exists(sub)).order_by(Order(aid))
+    with Database.connect(url) as db:
+        assert db.all(q)==[row[0] for row in native.execute(f'SELECT a.id FROM {parent.sql} a WHERE EXISTS (SELECT 1 FROM {parent.sql} b WHERE b.id=a.id AND b.id IN (1,3)) ORDER BY a.id').fetchall()]==[1,3]
+        assert db.all(query_from(a).select(field(aid)).where(in_query(aid,sub)).order_by(Order(aid)))==[1,3]
+        joined=query_from(a).inner_join(b,on=aid.eq(bid)).select_pair(field(aid),field(bid)).order_by(Order(aid))
+        assert db.all(joined)==[(1,1),(2,2),(3,3)]

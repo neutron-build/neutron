@@ -23,6 +23,7 @@ class ModelMapping(Generic[T]):
     field_columns: Mapping[str,Column[Any]]
     primary_key: tuple[str,...]
     def __init__(self,model_type: type[T],table: Table,field_columns: Mapping[str,Column[Any]],*,primary_key: tuple[str,...]) -> None:
+        if type(table) is not Table: raise ValueError('mapping requires an ordinary physical Table')
         if not is_dataclass(model_type): raise ValueError('scalar mapping requires a dataclass type')
         _validate_attribute_profile(model_type,tuple(field_columns))
         if not hasattr(model_type,'__weakref__'): raise ValueError('mapped dataclass needs weak reference support')

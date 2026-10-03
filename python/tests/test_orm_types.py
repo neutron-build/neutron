@@ -105,3 +105,12 @@ def static_event_consumer(session: Session) -> None:
 async def static_async_event_consumer(session: AsyncSession) -> None:
     async def observe(event: SessionEvent) -> None: pass
     session.listen('before_flush',observe)
+
+from neutron.orm import alias,exists,in_query
+
+def static_correlated_alias_consumer(db: Database) -> None:
+    t=Table('t',{'id':ColumnSpec(int,'int4')})
+    a=alias(t,'a');b=alias(t,'b');aid=a.column('id',int);bid=b.column('id',int)
+    sub=query_from(b).correlate(a).select(field(bid)).where(bid.eq(aid))
+    assert_type(db.all(query_from(a).select(field(aid)).where(exists(sub))),list[int])
+    assert_type(db.all(query_from(a).select(field(aid)).where(in_query(aid,sub))),list[int])

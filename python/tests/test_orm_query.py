@@ -41,3 +41,18 @@ def test_forged_predicate_columns_refused():
     with pytest.raises(ValueError): forged.eq('wrong')
     with pytest.raises(ValueError): forged.in_(['wrong'])
     with pytest.raises(ValueError): aid.eq(Column(a,'id',ColumnSpec(int,'int4')))
+
+
+def test_self_alias_and_explicit_correlated_exists_parameter_order():
+    from neutron.orm import alias,exists,in_query,insert
+    a,_=tables();outer=alias(a,'outer%s');inner=alias(a,'inner')
+    outer_id=outer.column('id',int);inner_id=inner.column('id',int)
+    sub=query_from(inner).correlate(outer).select(field(inner_id)).where(inner_id.eq(outer_id)).where(inner_id.eq(7))
+    compiled=query_from(outer).select(field(outer_id)).where(exists(sub)).where(outer_id.eq(8)).compile()
+    assert 'AS "outer%%s"' in compiled.sql and '"outer%%s"."id"' in compiled.sql
+    assert compiled.params==(7,8)
+    assert query_from(outer).select(field(outer_id)).where(in_query(outer_id,sub)).compile().params==(7,)
+    with pytest.raises(ValueError): query_from(inner).select(field(inner_id)).where(inner_id.eq(outer_id))
+    with pytest.raises(ValueError): query_from(a).select(field(a.column('id',int))).where(exists(sub))
+    with pytest.raises(ValueError): query_from(outer).inner_join(alias(a,'outer%s'),on=outer_id.eq(outer_id))
+    with pytest.raises(ValueError): insert(outer,{'id':1})

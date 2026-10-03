@@ -302,3 +302,13 @@ cannot undo that commit. after_rollback runs after explicit reconciliation.
 Callbacks have no exactly-once external side-effect guarantee: use an outbox for
 external work. Relationship/attribute instrumentation is not provided by these
 scalar callbacks.
+
+`alias(table, name)` creates a distinct read source for self joins; alias columns
+are owned independently of the physical table. Aliases refuse mutation and mapped
+persistence. Scalar subqueries use `in_query(column, query)`; EXISTS predicates
+use `exists(query)`. Correlated subqueries must explicitly declare outer sources
+with `query_from(inner).correlate(outer)` before referencing their columns.
+The enclosing query validates that each declared outer source belongs to its
+scope. Native types for IN projections must agree exactly. Alias labels are
+quoted and all subquery values remain bound in SQL occurrence order. CTE/derived
+sources and universal SQL expressions remain separate requirements.

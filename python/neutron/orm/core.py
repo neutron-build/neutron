@@ -86,6 +86,9 @@ class Table:
     @property
     def _bound_sql(self) -> str: return f'{_bound_quote(self.schema)}.{_bound_quote(self.name)}'
 
+    @property
+    def _bound_reference(self) -> str: return self._bound_sql
+
     def column(self, name: str, python_type: type[T]) -> Column[T]:
         column = self.columns[name]
         if column.spec.python_type is not python_type or column.spec.nullable: raise ValueError('column type/nullability mismatch; use nullable_column for nullable fields')
@@ -119,7 +122,7 @@ class Column(Generic[T]):
     def sql(self) -> str: return f'{self.table.sql}.{quote(self.name)}'
 
     @property
-    def _bound_sql(self) -> str: return f'{self.table._bound_sql}.{_bound_quote(self.name)}'
+    def _bound_sql(self) -> str: return f'{self.table._bound_reference}.{_bound_quote(self.name)}'
 
     def _owned(self) -> None:
         if self.table.columns.get(self.name) is not self:
@@ -237,12 +240,14 @@ def _writes(table: Table, values: Mapping[str,object]) -> list[tuple[Column[Any]
 
 
 def insert(table: Table, values: Mapping[str,object]) -> Mutation:
+    if type(table) is not Table: raise ValueError('mutation requires an ordinary physical Table')
     writes=_writes(table,values)
     if not writes: return Mutation(f'INSERT INTO {table._bound_sql} DEFAULT VALUES',(),table)
     return Mutation(f'INSERT INTO {table._bound_sql} ({", ".join(_bound_quote(c.name) for c,_ in writes)}) VALUES ({", ".join("DEFAULT" if v is DEFAULT else "%s" for _,v in writes)})',tuple(_parameter(c,v) for c,v in writes if v is not DEFAULT),table)
 
 
 def update(table: Table, values: Mapping[str,object], *, where: Predicate) -> Mutation:
+    if type(table) is not Table: raise ValueError('mutation requires an ordinary physical Table')
     _condition(table,where)
     writes=_writes(table,values)
     if not writes: raise ValueError('update needs at least one present/default/NULL assignment')
@@ -250,6 +255,7 @@ def update(table: Table, values: Mapping[str,object], *, where: Predicate) -> Mu
 
 
 def delete(table: Table, *, where: Predicate) -> Mutation:
+    if type(table) is not Table: raise ValueError('mutation requires an ordinary physical Table')
     _condition(table,where)
     return Mutation(f'DELETE FROM {table._bound_sql} WHERE {where.sql}',where.params,table)
 

@@ -30,3 +30,6 @@ __all__ += ["AsyncStream","Stream"]
 
 from .events import EventName, SessionEvent
 __all__ += ["EventName","SessionEvent"]
+
+from .query import alias, exists, in_query
+__all__ += ["alias","exists","in_query"]
