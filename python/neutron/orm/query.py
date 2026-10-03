@@ -156,18 +156,18 @@ class Query(Generic[T]):
         if self.set_terms:
             if self.ordering: raise ValueError('set-operation source ordering unsupported')
             first=replace(self,set_terms=(),row_limit=None,row_offset=None).compile()
-            sql='('+first.sql+')';params=first.params
+            sql='('+first.sql+')';set_params=first.params
             for operator,other in self.set_terms:
                 if operator not in {'UNION','UNION ALL','INTERSECT','EXCEPT'}: raise ValueError('invalid set operator')
                 replace(self,set_terms=(),ordering=(),row_limit=None,row_offset=None)._set(operator,other)
                 compiled=other.compile()
                 # Parentheses preserve explicitly composed left-to-right set semantics.
-                sql='('+sql+' '+operator+' ('+compiled.sql+'))';params+=compiled.params
+                sql='('+sql+' '+operator+' ('+compiled.sql+'))';set_params+=compiled.params
             if self.row_limit is not None:
-                _count(self.row_limit);sql+=' LIMIT %s';params+=(self.row_limit,)
+                _count(self.row_limit);sql+=' LIMIT %s';set_params+=(self.row_limit,)
             if self.row_offset is not None:
-                _count(self.row_offset);sql+=' OFFSET %s';params+=(self.row_offset,)
-            return Compiled(sql,params,self.decoder)
+                _count(self.row_offset);sql+=' OFFSET %s';set_params+=(self.row_offset,)
+            return Compiled(sql,set_params,self.decoder)
         nullable = {join.table for join in self.scope.joins if join.left}
         if not self.fields: raise ValueError('empty projection')
         for item in self.fields:
@@ -232,6 +232,7 @@ def _count(count: int) -> None:
 
 class AliasedTable(Table):
     """Distinct read-only source identity; aliases never target ORM writes."""
+    source: Table
     def __init__(self,source: Table,name: str) -> None:
         if type(source) is not Table: raise ValueError('alias requires an ordinary physical Table')
         super().__init__(name,{key:column.spec for key,column in source.columns.items()},schema=source.schema)
@@ -348,6 +349,8 @@ def row_number(table: Table,*,partition_by: tuple[Column[Any], ...]=(),order_by:
 
 class DerivedTable(Table):
     """Read-only projected query source with owned result column labels."""
+    source_query: Query[Any]
+    labels: tuple[str,...]
     def __init__(self,query: Query[Any],name: str,labels: tuple[str,...]) -> None:
         if not isinstance(query,Query) or query.scope.correlated:
             raise ValueError('derived/CTE sources require an uncorrelated typed query')
