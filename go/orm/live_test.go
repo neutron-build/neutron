@@ -139,6 +139,35 @@ func TestPostgresCore(t *testing.T) {
 			t.Fatal("SQLSTATE lost", err)
 		}
 	}
+	// A BEFORE INSERT trigger may suppress the tuple without raising a server
+	// error. The single-row helper must report cardinality rather than success.
+	trigger := "CREATE FUNCTION " + quote(schema) + `.suppress_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.name='suppress' THEN RETURN NULL; END IF; RETURN NEW; END $$; CREATE TRIGGER suppress_insert BEFORE INSERT ON ` + quote(schema) + `.records FOR EACH ROW EXECUTE FUNCTION ` + quote(schema) + `.suppress_insert()`
+	if _, err := conn.Exec(ctx, trigger); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InsertOne(ctx, conn, table, Set(tenant, Some("owner")), Set(name, Some("suppress"))); !errors.Is(err, ErrCardinality) {
+		t.Fatal("suppressed insert cardinality", err)
+	}
+	var suppressed int
+	if err := conn.QueryRow(ctx, "SELECT count(*) FROM "+quote(schema)+".records WHERE name='suppress'").Scan(&suppressed); err != nil || suppressed != 0 {
+		t.Fatal("suppressed native insert", err)
+	}
+	// A deliberately incompatible return codec establishes an important
+	// borrowed-autocommit boundary: scan failure does not roll back insertion.
+	if _, err := conn.Exec(ctx, "CREATE TABLE "+quote(schema)+`.decode_failure (id bigint DEFAULT 1, tenant text DEFAULT 'owner', active text DEFAULT 'not-a-bool', score bigint DEFAULT 0, name text DEFAULT 'persisted', note text)`); err != nil {
+		t.Fatal(err)
+	}
+	bad, err := NewTable[testModel](schema, "decode_failure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InsertOne(ctx, conn, bad); err == nil {
+		t.Fatal("incompatible decode did not fail")
+	}
+	var persisted int
+	if err := conn.QueryRow(ctx, "SELECT count(*) FROM "+quote(schema)+".decode_failure WHERE name='persisted'").Scan(&persisted); err != nil || persisted != 1 {
+		t.Fatal("decode error incorrectly implied rollback", err)
+	}
 	// Canceled queries retain context classification and the connection remains
 	// usable for an independent native count afterwards.
 	canceled, stop := context.WithCancel(ctx)
