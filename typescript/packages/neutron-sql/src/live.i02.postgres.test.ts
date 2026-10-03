@@ -105,8 +105,7 @@ async function createCtx(driverKind: "postgres" | "pg"): Promise<I02Ctx> {
     dbUrl: url.toString(),
     db,
     driver,
-    trustSql,
-  TRUSTED_SQL_ACK,
+    raw,
     admin,
     async close(): Promise<void> {
       await db.close();
