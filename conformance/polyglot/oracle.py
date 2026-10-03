@@ -9,6 +9,8 @@ MARKER = 'neutron-polyglot-conformance-v1:'
 
 def execute(request: dict, connect=None) -> dict:
     validate_request(request)
+    if request['action'] == 'insert':
+        raise ValueError('independent oracle never performs adapter writes')
     if request['case_id'] != 'scalar-extremes':
         raise ValueError('unknown oracle case')
     url = os.environ.get('NEUTRON_TEST_DATABASE_URL')

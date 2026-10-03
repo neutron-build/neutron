@@ -9,7 +9,7 @@ let db;
 let response;
 try {
   const request = JSON.parse(readFileSync(0, 'utf8'));
-  if (request.protocol !== 'polyglot-conformance-v1' || request.case_id !== 'scalar-extremes' || request.action !== 'observe' || request.profile !== 'postgres-direct' || !/^neutron_polyglot_[0-9a-f]{32}$/.test(request.schema_scope)) throw new Error('unsupported adapter request');
+  if (request.protocol !== 'polyglot-conformance-v1' || request.case_id !== 'scalar-extremes' || !['observe', 'insert'].includes(request.action) || request.profile !== 'postgres-direct' || !/^neutron_polyglot_[0-9a-f]{32}$/.test(request.schema_scope)) throw new Error('unsupported adapter request');
   const position = process.argv.indexOf('--module');
   if (position < 0 || !process.argv[position + 1]) throw new Error('installed module entry required');
   const driver = process.argv.includes('--postgres-js') ? 'postgres' : 'pg';
@@ -22,6 +22,10 @@ try {
   const url = process.env.NEUTRON_TEST_DATABASE_URL;
   if (!url) throw new Error('disposable database environment required');
   db = await createDatabase({ url, driverOptions: { driver }, tables: { values: table } });
+  if (request.action === 'insert') {
+    await db.insert(table).values({ id: 2, big: '-9223372036854775808', precise: '-98765432109876543210.000000001',
+      moment: '2038-01-19T03:14:07.654321Z', sqlNull: null, document: null });
+  }
   // SQL NULL's predicate is observed independently of JSON's JS null decoder.
   const values = await db.select({ id: table.id, big: table.big, precise: table.precise,
     moment: table.moment, sqlNull: sql`${table.sqlNull} is null`, document: table.document }).from(table).orderBy(asc(table.id));

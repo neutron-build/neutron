@@ -24,7 +24,7 @@ def validate_request(request: dict) -> None:
         raise ValueError('invalid runner-owned schema scope')
     if request.get('profile') != 'postgres-direct':
         raise ValueError('unsupported oracle profile')
-    if request.get('action') not in {'setup', 'observe', 'cleanup'}:
+    if request.get('action') not in {'setup', 'observe', 'cleanup', 'insert'}:
         raise ValueError('unsupported oracle action')
 
 def verify_artifacts(manifest: dict, root: Path) -> dict:
