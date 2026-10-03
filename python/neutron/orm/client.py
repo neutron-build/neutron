@@ -4,7 +4,7 @@ import asyncio
 from contextlib import contextmanager, asynccontextmanager
 import threading
 from typing import Any, AsyncIterator, Iterator, Mapping, Sequence, TypeVar, TYPE_CHECKING, cast
-from .endpoint import EndpointIdentity, admit, startup_version
+from .endpoint import EndpointIdentity, admit, startup_version, validate_profile, require_profile_capability, guard_finite_operation
 from .observability import QueryObserver,_Measurement,_measure
 from .json_value import load_document, native_params
 from .query import Query
@@ -38,7 +38,7 @@ class CommitCancelledError(asyncio.CancelledError):
 
 
 def _profile(profile: str) -> None:
-    if profile != 'postgres-direct': raise OrmError('unsupported/unknown execution profile; operation refused')
+    validate_profile(profile)
 
 
 def _native(error: Exception, *, committing: bool = False) -> OrmError:
@@ -91,11 +91,11 @@ class Database:
         try:
             connection=psycopg.connect(url,autocommit=True,row_factory=dict_row)
             startup=connection.info.parameter_status('server_version')
-            startup_version(startup)
+            startup_version(startup,profile=profile)
             with connection.cursor() as cur:
                 cur.execute('SELECT pg_catalog.version() AS orm_endpoint_version')
                 row=cur.fetchone()
-            identity=admit(startup,row['orm_endpoint_version'] if row is not None else None)
+            identity=admit(startup,row['orm_endpoint_version'] if row is not None else None,profile=profile)
             from psycopg.types.json import set_json_loads
             set_json_loads(load_document,context=connection)
             from .pg_adapters import register_native_values
@@ -111,6 +111,7 @@ class Database:
             raise OrmError("Unable to connect to PostgreSQL",sqlstate=getattr(exc,"sqlstate",None)) from exc
 
     def _catalog_read(self,sql: str,params: tuple[object,...]) -> list[dict[str,Any]]:
+        require_profile_capability(self._endpoint_identity,'catalog-types')
         if not self._native_binary: raise OrmError('catalog admission requires a native connect client')
         with self._use():
             try:
@@ -194,6 +195,7 @@ class Database:
             result=self._read_impl(query,cardinality,measurement);measurement.rows=len(result);return result
 
     def _read_impl(self, query: Select[T] | Returning[T] | Query[T], cardinality: str, measurement: _Measurement) -> list[T]:
+        guard_finite_operation(self._endpoint_identity,query)
         if isinstance(query,Returning) and self._owner is None:
             with self.transaction(): return self._read_impl(query,cardinality,measurement)
         if isinstance(query,Query) and cardinality != 'many' and (query.row_limit is not None or query.row_offset is not None):
@@ -233,6 +235,7 @@ class Database:
             result=self._execute_impl(statement,measurement);measurement.rows=result;return result
 
     def _execute_impl(self, statement: Mutation, measurement: _Measurement) -> int:
+        guard_finite_operation(self._endpoint_identity,statement)
         if statement.table is not None and statement.table._catalog_owner is not None and statement.table._catalog_owner is not self._catalog_owner: raise ValueError('catalog mutation belongs to another connection')
         validate_scope_sql(statement.sql,owned=self._owner is not None)
         with self._use():
@@ -339,6 +342,7 @@ class Database:
         finally: self._rollback_only=previous
 
     def stream(self,query: Select[T] | Query[T],*,batch_size: int) -> Stream[T]:
+        require_profile_capability(self._endpoint_identity,'bounded-stream')
         from .streaming import Stream
         return Stream(self,query,batch_size)
 
@@ -395,11 +399,11 @@ class AsyncDatabase:
         try:
             connection=await psycopg.AsyncConnection.connect(url,autocommit=True,row_factory=dict_row)
             startup=connection.info.parameter_status('server_version')
-            startup_version(startup)
+            startup_version(startup,profile=profile)
             async with connection.cursor() as cur:
                 await cur.execute('SELECT pg_catalog.version() AS orm_endpoint_version')
                 row=await cur.fetchone()
-            identity=admit(startup,row['orm_endpoint_version'] if row is not None else None)
+            identity=admit(startup,row['orm_endpoint_version'] if row is not None else None,profile=profile)
             from psycopg.types.json import set_json_loads
             set_json_loads(load_document,context=connection)
             from .pg_adapters import register_native_values
@@ -414,6 +418,7 @@ class AsyncDatabase:
             raise OrmError("Unable to connect to PostgreSQL",sqlstate=getattr(exc,"sqlstate",None)) from exc
 
     async def _catalog_read(self,sql: str,params: tuple[object,...]) -> list[dict[str,Any]]:
+        require_profile_capability(self._endpoint_identity,'catalog-types')
         if not self._native_binary: raise OrmError('catalog admission requires a native connect client')
         async with self._use():
             try:
@@ -500,6 +505,7 @@ class AsyncDatabase:
             result=await self._read_impl(query,cardinality,measurement);measurement.rows=len(result);return result
 
     async def _read_impl(self,query: Select[T] | Returning[T] | Query[T],cardinality: str,measurement: _Measurement) -> list[T]:
+        guard_finite_operation(self._endpoint_identity,query)
         if isinstance(query,Returning) and self._owner is None:
             async with self.transaction(): return await self._read_impl(query,cardinality,measurement)
         if isinstance(query,Query) and cardinality != 'many' and (query.row_limit is not None or query.row_offset is not None):
@@ -546,6 +552,7 @@ class AsyncDatabase:
             result=await self._execute_impl(statement,measurement);measurement.rows=result;return result
 
     async def _execute_impl(self,statement: Mutation,measurement: _Measurement) -> int:
+        guard_finite_operation(self._endpoint_identity,statement)
         if statement.table is not None and statement.table._catalog_owner is not None and statement.table._catalog_owner is not self._catalog_owner: raise ValueError('catalog mutation belongs to another connection')
         validate_scope_sql(statement.sql,owned=self._owner is not None)
         async with self._use():
@@ -671,6 +678,7 @@ class AsyncDatabase:
         finally: self._rollback_only=previous
 
     def stream(self,query: Select[T] | Query[T],*,batch_size: int) -> AsyncStream[T]:
+        require_profile_capability(self._endpoint_identity,'bounded-stream')
         from .streaming import AsyncStream
         return AsyncStream(self,query,batch_size)
 

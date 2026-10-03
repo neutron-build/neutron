@@ -97,3 +97,89 @@ async def test_async_connect_hands_out_only_admitted_identity(monkeypatch):
     db=await AsyncDatabase.connect('unused')
     assert db.endpoint_identity is not None and db.endpoint_identity.version=='17.6'
     assert not connection.finished
+
+from neutron.orm.endpoint import NUCLEUS_CANDIDATE_PROFILE, guard_finite_operation
+
+NUCLEUS_REPORTED='PostgreSQL 16.0 (Nucleus 1.2.0 — The Definitive Database)'
+
+def candidate_identity():
+    return admit('16.0 (Nucleus)',NUCLEUS_REPORTED,profile=NUCLEUS_CANDIDATE_PROFILE)
+
+
+def test_nucleus_named_candidate_is_uncertified_and_exact():
+    from dataclasses import FrozenInstanceError
+    identity=candidate_identity()
+    assert identity.engine=='nucleus' and identity.version=='1.2.0'
+    assert identity.profile==NUCLEUS_CANDIDATE_PROFILE
+    assert not identity.package_enabled and identity.qualification=='uncertified-finite-candidate'
+    assert 'bounded-stream' not in identity.capabilities
+    with pytest.raises(FrozenInstanceError): identity.package_enabled=True
+    for startup,reported in [('16.0',NUCLEUS_REPORTED),('16.0 (Nucleus)','PostgreSQL 16.0'),
+        ('16.0 (Nucleus)',NUCLEUS_REPORTED.replace('1.2.0','1.2.1'))]:
+        with pytest.raises(OrmError): admit(startup,reported,profile=NUCLEUS_CANDIDATE_PROFILE)
+    with pytest.raises(OrmError): admit('16.0 (Nucleus)',NUCLEUS_REPORTED)
+
+
+def test_finite_guard_accepts_only_bound_scalar_point_crud():
+    from neutron.orm.core import Table,ColumnSpec,select,insert,update,delete
+    table=Table('docs',{'id':ColumnSpec(int,'int8'),'value':ColumnSpec(str,'text')})
+    key=table.column('id',int)
+    for operation in [select(key).where(key.eq(1)),insert(table,{'id':1,'value':''}),
+        insert(table,{'id':1}).returning(key),update(table,{'value':''},where=key.eq(1)),delete(table,where=key.eq(1))]:
+        guard_finite_operation(candidate_identity(),operation)
+
+
+@pytest.mark.parametrize('kind',['raw','numeric','no-point','forged-function','multiple','stream','catalog'])
+def test_finite_guard_refuses_before_native_dispatch(kind):
+    from decimal import Decimal
+    from neutron.orm.core import Table,ColumnSpec,Mutation,Predicate,select,insert
+    table=Table('docs',{'id':ColumnSpec(int,'int8')})
+    key=table.column('id',int)
+    connection=IdentityConnection('16.0 (Nucleus)',NUCLEUS_REPORTED)
+    db=Database(connection);db._endpoint_identity=candidate_identity()
+    with pytest.raises(OrmError):
+        if kind=='raw': db.execute(Mutation('CREATE TABLE surprise(id int)',()))
+        elif kind=='numeric': db.execute(insert(Table('n',{'v':ColumnSpec(Decimal,'numeric')}),{'v':Decimal('1.50')}))
+        elif kind=='no-point': db.all(select(key))
+        elif kind=='forged-function': db.all(select(key).where(Predicate('pg_cancel_backend(1)',(),frozenset({table}))))
+        elif kind=='multiple': db.execute(Mutation('DELETE FROM "public"."docs" WHERE "public"."docs"."id" = %s; DELETE FROM "public"."docs"',(1,),table))
+        elif kind=='stream': db.stream(select(key),batch_size=1)
+        else: db.enum_spec('public','kind')
+    assert connection.statements==[]
+
+
+@pytest.mark.asyncio
+async def test_async_finite_guard_refuses_before_transaction_or_dispatch():
+    from neutron.orm.core import Table,ColumnSpec,insert,Mutation
+    from decimal import Decimal
+    connection=AsyncIdentityConnection('16.0 (Nucleus)',NUCLEUS_REPORTED)
+    db=AsyncDatabase(connection);db._endpoint_identity=candidate_identity()
+    table=Table('n',{'v':ColumnSpec(Decimal,'numeric')})
+    with pytest.raises(OrmError): await db.all(insert(table,{'v':Decimal('1.50')}).returning(table.column('v',Decimal)))
+    with pytest.raises(OrmError): await db.execute(Mutation('CREATE TABLE surprise(id int)',()))
+    with pytest.raises(OrmError): db.stream(None,batch_size=1)
+    with pytest.raises(OrmError): await db.enum_spec('public','kind')
+    assert connection.statements==[]
+
+
+def test_sync_connect_binds_named_candidate_and_preserves_default_refusal(monkeypatch):
+    import psycopg
+    import psycopg.types.json
+    connection=IdentityConnection('16.0 (Nucleus)',NUCLEUS_REPORTED)
+    monkeypatch.setattr(psycopg,'connect',lambda *a,**kw: connection)
+    monkeypatch.setattr(psycopg.types.json,'set_json_loads',lambda *a,**kw: None)
+    db=Database.connect('unused',profile=NUCLEUS_CANDIDATE_PROFILE)
+    assert db.endpoint_identity==candidate_identity()
+    assert connection.statements==['SELECT pg_catalog.version() AS orm_endpoint_version']
+
+
+@pytest.mark.asyncio
+async def test_async_connect_binds_named_candidate(monkeypatch):
+    import psycopg
+    import psycopg.types.json
+    connection=AsyncIdentityConnection('16.0 (Nucleus)',NUCLEUS_REPORTED)
+    async def connect(*a,**kw): return connection
+    monkeypatch.setattr(psycopg.AsyncConnection,'connect',connect)
+    monkeypatch.setattr(psycopg.types.json,'set_json_loads',lambda *a,**kw: None)
+    db=await AsyncDatabase.connect('unused',profile=NUCLEUS_CANDIDATE_PROFILE)
+    assert db.endpoint_identity==candidate_identity()
