@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import secrets
@@ -15,15 +16,22 @@ ROOT = Path(__file__).resolve().parent
 EXPECTED = [['1', '9223372036854775807', '12345678901234567890.123456789', '2024-01-02 03:04:05.123456+00', True, 'null']]
 
 def invoke(command: list[str], request: dict, timeout: float) -> dict:
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError('finite positive timeout required')
     if not command or not all(isinstance(x, str) for x in command):
         raise ValueError('adapter command must be nonempty argv')
     proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
         stdout, stderr = proc.communicate(json.dumps(request), timeout=timeout)
-    except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)
+    except BaseException as exc:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         proc.communicate()
-        raise ValueError('adapter timeout')
+        if isinstance(exc, subprocess.TimeoutExpired):
+            raise ValueError('adapter timeout') from exc
+        raise
     if proc.returncode:
         raise ValueError(redact(stderr + stdout, os.environ.get('NEUTRON_TEST_DATABASE_URL', '')) or 'adapter failed')
     try:
@@ -98,8 +106,8 @@ def main():
     parser.add_argument('--timeout', type=float, default=30)
     args = parser.parse_args()
     try:
-        if args.timeout <= 0:
-            raise ValueError('positive timeout required')
+        if not math.isfinite(args.timeout) or args.timeout <= 0:
+            raise ValueError('finite positive timeout required')
         manifest = json.loads(args.manifest.read_text())
         validate_manifest(manifest)
         if args.validate_only:

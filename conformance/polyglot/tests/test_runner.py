@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from protocol import PROTOCOL, redact, verify_artifacts, validate_request
 from runner import EXPECTED, invoke, run, validate_manifest
@@ -31,6 +31,18 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn('secret', text); self.assertNotIn('user', text)
     def test_timeout(self):
         with self.assertRaisesRegex(ValueError, 'timeout'): invoke([sys.executable,'-c','import time; time.sleep(5)'], {}, .01)
+    def test_nonfinite_timeout_refuses_before_spawn(self):
+        for timeout in (float('nan'), float('inf'), -1, 0):
+            with patch('runner.subprocess.Popen') as spawn, self.assertRaises(ValueError):
+                invoke([sys.executable], {}, timeout)
+            spawn.assert_not_called()
+    def test_interrupt_kills_and_reaps_adapter(self):
+        process = Mock(pid=12345)
+        process.communicate.side_effect = [KeyboardInterrupt(), ('', '')]
+        with patch('runner.subprocess.Popen', return_value=process), patch('runner.os.killpg') as kill:
+            with self.assertRaises(KeyboardInterrupt): invoke(['adapter'], {}, 1)
+        kill.assert_called_once_with(12345, __import__('signal').SIGKILL)
+        self.assertEqual(process.communicate.call_count, 2)
     def test_unsupported_not_pass(self):
         command = [sys.executable,'-c', 'print(\'{"protocol":"polyglot-conformance-v1","case_id":"scalar-extremes","status":"unsupported"}\')']
         with self.assertRaises(ValueError): invoke(command, {'case_id':'scalar-extremes'}, 1)
