@@ -474,3 +474,12 @@ Session families; flush/commit are native sync/async as usual. Association paylo
 fields use ordinary mapped tracking/hooks, and explicit load_relation reads reuse
 through-object identity. Surrogate through keys without declared composite
 uniqueness and automatic target collection inference remain unsupported.
+
+Public Database SQL APIs globally refuse raw BEGIN/COMMIT/ROLLBACK/SAVEPOINT and
+session control, even outside an owned scope. Standalone supported single DDL
+statements remain available through Mutation outside a transaction; raw batches
+and procedural statements are not admitted. Root transaction entry requires an
+IDLE native connection with autocommit=True, preventing externally opened native
+transactions from being mistaken for an owned root. Borrowed constructors still
+skip endpoint identity admission, but callers must settle external transactions
+and configure autocommit before using ORM root lifecycle APIs.

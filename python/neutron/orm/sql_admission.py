@@ -5,7 +5,7 @@ from .core import OrmError
 
 _WORD = re.compile(r'[A-Za-z0-9_]')
 
-def validate_scope_sql(sql: str) -> None:
+def validate_scope_sql(sql: str,*,owned: bool=True) -> None:
     first='';terminated=False;i=0
     while i<len(sql):
         char=sql[i]
@@ -50,5 +50,7 @@ def validate_scope_sql(sql: str) -> None:
             if i==start: raise OrmError('data statement keyword required')
             first=sql[start:i].upper();continue
         i+=1
-    if first not in {'SELECT','INSERT','UPDATE','DELETE','WITH','VALUES','EXPLAIN'}:
-        raise OrmError('owned transaction admits single data/query statements only')
+    allowed={'SELECT','INSERT','UPDATE','DELETE','WITH','VALUES','EXPLAIN'}
+    if not owned: allowed|={'CREATE','ALTER','DROP','TRUNCATE','COMMENT','GRANT','REVOKE','ANALYZE','VACUUM','REINDEX','REFRESH'}
+    if first not in allowed:
+        raise OrmError('SQL lifecycle/session control refused; use owned ORM transaction APIs')

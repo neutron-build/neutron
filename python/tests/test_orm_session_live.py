@@ -530,3 +530,38 @@ async def test_native_caught_query_cancellation_cannot_report_commit(mapped):
         assert await task=='aborted'
         assert not db.closed
         async with db.transaction(): assert await db.execute(Mutation('SELECT 1',()))==1
+
+
+def test_native_externally_active_connection_cannot_be_adopted_as_root(mapped):
+    import psycopg
+    from psycopg.rows import dict_row
+    from neutron.orm import Mutation
+    url,m,native=mapped
+    with psycopg.connect(url,autocommit=True,row_factory=dict_row) as connection:
+        connection.execute('BEGIN')
+        connection.execute(f'INSERT INTO {m.table.sql}(name,active) VALUES(%s,true)',('external_pending',))
+        db=Database(connection)
+        with pytest.raises(OrmError,match='not IDLE'): db.begin()
+        assert db._owner is None
+        assert native.execute(f'SELECT count(*) FROM {m.table.sql}').fetchone()==(0,)
+        connection.execute('ROLLBACK')
+        with db.transaction(): db.execute(Mutation(f'INSERT INTO {m.table.sql}(name,active) VALUES(%s,true)',('owned',)))
+        assert native.execute(f'SELECT name FROM {m.table.sql}').fetchone()==('owned',)
+    with psycopg.connect(url,autocommit=False,row_factory=dict_row) as connection:
+        with pytest.raises(OrmError,match='autocommit'): Database(connection).begin()
+
+@pytest.mark.asyncio
+async def test_native_async_external_begin_refuses_root_adoption(mapped):
+    import psycopg
+    from psycopg.rows import dict_row
+    from neutron.orm import Mutation
+    url,m,native=mapped
+    async with await psycopg.AsyncConnection.connect(url,autocommit=True,row_factory=dict_row) as connection:
+        await connection.execute('BEGIN')
+        await connection.execute(f'INSERT INTO {m.table.sql}(name,active) VALUES(%s,true)',('external',))
+        db=AsyncDatabase(connection)
+        with pytest.raises(OrmError,match='not IDLE'): await db.begin()
+        assert native.execute(f'SELECT count(*) FROM {m.table.sql}').fetchone()==(0,)
+        await connection.execute('ROLLBACK')
+        async with db.transaction(): await db.execute(Mutation(f'INSERT INTO {m.table.sql}(name,active) VALUES(%s,true)',('owned',)))
+        assert native.execute(f'SELECT name FROM {m.table.sql}').fetchone()==('owned',)

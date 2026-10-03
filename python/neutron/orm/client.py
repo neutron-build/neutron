@@ -40,6 +40,14 @@ def _native(error: Exception, *, committing: bool = False) -> OrmError:
     return OrmError('PostgreSQL operation failed',sqlstate=state,outcome=('aborted' if definite else 'indeterminate') if committing else None)
 
 
+def _admit_native_root(connection: Any) -> None:
+    if getattr(connection,'autocommit',None) is False:
+        raise OrmError('native ORM root transactions require autocommit=True')
+    status=getattr(getattr(connection,'info',None),'transaction_status',None)
+    if status is not None and status!=0 and getattr(status,'name',None)!='IDLE':
+        raise OrmError('native connection is not IDLE; external transaction adoption refused')
+
+
 class Database:
     """One native connection. Concurrent active use rejected; no tracked objects."""
     def __init__(self, connection: Any) -> None:
@@ -103,7 +111,7 @@ class Database:
         if isinstance(query,Query) and cardinality != 'many' and (query.row_limit is not None or query.row_offset is not None):
             raise ValueError('exact-one reads refuse pagination')
         compiled=query.compile()
-        if self._owner is not None: validate_scope_sql(compiled.sql)
+        validate_scope_sql(compiled.sql)
         with self._use():
             try:
                 with self._conn.cursor() as cur:
@@ -129,7 +137,7 @@ class Database:
         rows=self._read(query,'optional'); return rows[0] if rows else None
 
     def execute(self, statement: Mutation) -> int:
-        if self._owner is not None: validate_scope_sql(statement.sql)
+        validate_scope_sql(statement.sql,owned=self._owner is not None)
         with self._use():
             try:
                 with self._conn.cursor() as cur:
@@ -153,7 +161,9 @@ class Database:
     @contextmanager
     def transaction(self) -> Iterator[Database]:
         if self._owner is not None: raise SessionBusyError('nested transaction unsupported in this slice')
-        with self._use(): self._owner=threading.get_ident();self._tx_token=object()
+        with self._use():
+            _admit_native_root(self._conn)
+            self._owner=threading.get_ident();self._tx_token=object()
         try:
             try:
                 native=self._conn.transaction()
@@ -313,7 +323,7 @@ class AsyncDatabase:
         if isinstance(query,Query) and cardinality != 'many' and (query.row_limit is not None or query.row_offset is not None):
             raise ValueError('exact-one reads refuse pagination')
         compiled=query.compile()
-        if self._owner is not None: validate_scope_sql(compiled.sql)
+        validate_scope_sql(compiled.sql)
         async with self._use():
             try:
                 async with self._conn.cursor() as cur:
@@ -346,7 +356,7 @@ class AsyncDatabase:
         rows=await self._read(query,'optional'); return rows[0] if rows else None
 
     async def execute(self,statement: Mutation) -> int:
-        if self._owner is not None: validate_scope_sql(statement.sql)
+        validate_scope_sql(statement.sql,owned=self._owner is not None)
         async with self._use():
             try:
                 async with self._conn.cursor() as cur:
@@ -387,7 +397,9 @@ class AsyncDatabase:
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[AsyncDatabase]:
         if self._owner is not None: raise SessionBusyError('nested transaction unsupported in this slice')
-        async with self._use(): self._owner=asyncio.current_task();self._tx_token=object()
+        async with self._use():
+            _admit_native_root(self._conn)
+            self._owner=asyncio.current_task();self._tx_token=object()
         try:
             try:
                 native=self._conn.transaction()

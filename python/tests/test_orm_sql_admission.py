@@ -42,3 +42,14 @@ def test_forged_returning_mutation_cannot_escape_implicit_transaction():
     forged=Mutation('COMMIT',(),T).returning(T.column('id',int))
     with pytest.raises(OrmError): db.one(forged)
     assert db._owner is None and not db.closed
+
+
+def test_control_is_globally_refused_while_standalone_single_ddl_admitted():
+    from .test_orm_stream import T
+    db=Database(Connection([]))
+    for sql in ('BEGIN','COMMIT','ROLLBACK','SAVEPOINT x','SET ROLE x','RESET ALL','CREATE TABLE x(id int);BEGIN'):
+        with pytest.raises(OrmError): db.execute(Mutation(sql,()))
+    assert db._owner is None
+    assert db.execute(Mutation('CREATE TABLE x(id integer)',()))==1
+    with pytest.raises(OrmError): db.all(Q.where(Predicate('TRUE;BEGIN')))
+    assert db._owner is None
