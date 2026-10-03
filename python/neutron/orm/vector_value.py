@@ -10,7 +10,7 @@ MAX_VECTOR_DIMENSIONS=16000
 
 def _float32(value: float) -> float:
     if type(value) is not float or not math.isfinite(value): raise ValueError('finite float32 vector elements required')
-    try: rounded=struct.unpack('!f',struct.pack('!f',value))[0]
+    try: rounded=float(struct.unpack('!f',struct.pack('!f',value))[0])
     except (OverflowError,struct.error) as exc: raise ValueError('vector element exceeds float32 range') from exc
     if not math.isfinite(rounded): raise ValueError('vector element exceeds finite float32 range')
     return rounded
@@ -25,7 +25,7 @@ class PgVector:
         if any(_float32(value)!=value for value in self.elements): raise ValueError('exact float32 components required; use from_values for explicit rounding')
     @classmethod
     def from_values(cls,values: Iterable[float],identity: CatalogType) -> PgVector:
-        result=[]
+        result: list[float]=[]
         for value in values:
             if len(result)>=MAX_VECTOR_DIMENSIONS: raise ValueError('vector dimension budget exceeded')
             result.append(_float32(value))
