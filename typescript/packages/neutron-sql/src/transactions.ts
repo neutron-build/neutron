@@ -11,6 +11,7 @@
 // a retried attempt re-executes the callback from the top.
 
 import type { Driver, PreparedStatement } from "./drivers.js";
+import { validateTransactionSql } from './transaction-sql.js';
 import {
   CommitAmbiguityError,
   ConnectionFailedError,
@@ -234,10 +235,10 @@ export async function runTransaction<T>(
   const makeScope = (owner: ScopeOwner): TransactionScope => {
     const scope: TransactionScope = {
       query<R>(sqlText: string, params: unknown[] = [], options?: QueryExecutionOptions): Promise<R[]> {
-        return observe(() => track(owner, () => pin.query<R>(sqlText, params, options)));
+        return observe(() => { validateTransactionSql(sqlText); return track(owner, () => pin.query<R>(sqlText, params, options)); });
       },
       execute(sqlText: string, params?: unknown[], options?: QueryExecutionOptions): Promise<number> {
-        return observe(() => track(owner, () => pin.execute(sqlText, params, options)));
+        return observe(() => { validateTransactionSql(sqlText); return track(owner, () => pin.execute(sqlText, params, options)); });
       },
       transaction: <Tx>(nested: (tx: TransactionScope) => Promise<Tx>): Promise<Tx> => observe(() => runSavepoint(owner, nested)),
       savepoint: (name?: string) => observe(() => createSavepoint(owner, name)),
@@ -259,6 +260,7 @@ export async function runTransaction<T>(
     };
     if (typeof pin.prepare === "function") scope.prepare = (sqlText: string) => {
       checkOwner(owner);
+      validateTransactionSql(sqlText);
       const prepared = pin.prepare!(sqlText);
       return { sql: prepared.sql, name: prepared.name,
         query<R>(params?: unknown[]): Promise<R[]> { return observe(() => track(owner, () => prepared.query<R>(params))); },

@@ -609,3 +609,19 @@ test('unawaited failed savepoint handles are observed and drained before root ro
     assert.equal(pin.statements.at(-1), 'rollback');
   }
 });
+
+test('owned raw SQL refuses lifecycle escape before driver dispatch and preserves bound/string literals', async () => {
+  const pin = fakePin();
+  pin.prepare = text => ({ sql: text, name: undefined, query: () => pin.query(text), execute: () => pin.execute(text) });
+  await runTransaction(pin, async tx => {
+    for (const sql of ['/*nested /* comment */ */ COMMIT', 'ROLLBACK', 'SELECT 1; COMMIT', 'SET ROLE admin', 'RESET ALL', 'PREPARE TRANSACTION \'escape\'', 'SELECT 1;/*safe*/END', 'SELECT \'unterminated', 'SELECT $body$unterminated']) {
+      const before = [...pin.statements];
+      await assert.rejects(tx.query(sql), /transaction SQL/);
+      assert.throws(() => tx.prepare!(sql), /transaction SQL/);
+      assert.deepEqual(pin.statements, before);
+    }
+    await tx.query("SELECT 'COMMIT;''END', $$ROLLBACK;$$, $tag$BEGIN;$tag$, $1", ['literal']);
+    await tx.execute('SET LOCAL statement_timeout = 1000');
+  });
+  assert.equal(pin.statements.at(-1), 'commit');
+});
