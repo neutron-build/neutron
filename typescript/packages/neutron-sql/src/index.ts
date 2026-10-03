@@ -519,3 +519,5 @@ export {
   type V2Index,
   type V2Table,
 } from "./export.js";
+export { createQueryTelemetry, type QueryMetrics, type SqlTelemetrySpan } from "./telemetry.js";
+export { SqlRequestLifecycle, RequestShutdownTimeoutError } from "./request-lifecycle.js";
