@@ -20,6 +20,7 @@ class TransactionHandle:
     def _check(self) -> None:
         if threading.get_ident()!=self._owner: raise SessionBusyError('transaction belongs to another thread')
         if self.state!='active': raise OrmError('transaction handle is terminal')
+        if self._database._savepoint_depth: raise SessionBusyError('transaction has an active savepoint')
         if self._database._stream_lease: raise SessionBusyError('transaction has an active stream lease')
 
     def commit(self) -> None:
@@ -55,6 +56,7 @@ class AsyncTransactionHandle:
     def _check(self) -> None:
         if asyncio.current_task() is not self._owner: raise SessionBusyError('transaction belongs to another task')
         if self.state!='active': raise OrmError('transaction handle is terminal')
+        if self._database._savepoint_depth: raise SessionBusyError('transaction has an active savepoint')
         if self._database._stream_lease: raise SessionBusyError('transaction has an active stream lease')
 
     async def commit(self) -> None:

@@ -27,6 +27,7 @@ class _SessionState:
         self.autobegin=autobegin;self.autoflush=autoflush
         self._listeners: dict[EventName,list[Callable[[SessionEvent],Any]]]={}
         self._emitting=False
+        self._savepoint_depth=0
         self._links: list[tuple[Relation[Any,Any],object,object]]=[]
 
     def _owner_check(self) -> None: raise NotImplementedError
@@ -262,7 +263,8 @@ class _SessionState:
             name=mapping.field_columns[mapping.version_field].name
             if name in values: raise OrmError('bulk application version mutation refused')
             quoted=_bound_quote(name)
-            statement=Mutation(statement.sql.replace(' WHERE ',f', {quoted} = {quoted} + 1 WHERE ',1),statement.params,mapping.table)
+            suffix=' WHERE '+where.sql
+            statement=Mutation(statement.sql[:-len(suffix)]+f', {quoted} = {quoted} + 1'+suffix,statement.params,mapping.table)
         return statement
 
     def _bulk_adopt(self,mapping: ModelMapping[Any],rows: list[dict[str,Any]],*,deleting: bool) -> int:
@@ -328,6 +330,23 @@ class Session(_SessionState):
         except BaseException:
             if self._transaction is not None and not self._uncertain: self.rollback()
             raise
+
+    @contextmanager
+    def savepoint(self) -> Iterator[Session]:
+        self._guard();self.flush();self._ensure_transaction()
+        checkpoint=self._store.checkpoint();links=self._links.copy()
+        self._savepoint_depth+=1
+        try:
+            with self._database.savepoint():
+                yield self
+                if self._failed: raise OrmError('failed mapped savepoint requires rollback')
+        except BaseException:
+            if self._database.closed:
+                self._store.uncertain();self._uncertain=True
+            else:
+                self._store.restore_checkpoint(checkpoint);self._links=links;self._failed=False
+            raise
+        finally: self._savepoint_depth-=1
 
     def get(self,mapping: ModelMapping[T],*key: Any) -> T | None:
         self._guard();self._mapping(mapping)
@@ -441,7 +460,9 @@ class Session(_SessionState):
             self._failed=True;raise
 
     def commit(self) -> None:
-        self._guard();self.flush()
+        self._guard()
+        if self._savepoint_depth: raise SessionBusyError('commit during savepoint refused')
+        self.flush()
         if self._transaction is None: return
         tx=self._transaction
         try: tx.commit()
@@ -456,6 +477,7 @@ class Session(_SessionState):
 
     def rollback(self) -> None:
         self._guard(allow_failed=True)
+        if self._savepoint_depth: raise SessionBusyError('rollback during savepoint refused')
         try:
             if self._transaction is not None: self._transaction.rollback()
         except BaseException:
@@ -467,7 +489,7 @@ class Session(_SessionState):
 
     def close(self) -> None:
         self._owner_check()
-        if self._emitting: raise SessionBusyError('Session close from event callback refused')
+        if self._emitting or self._savepoint_depth: raise SessionBusyError('Session close during event/savepoint refused')
         if self._closed: return
         try:
             if not self._uncertain: self.rollback()

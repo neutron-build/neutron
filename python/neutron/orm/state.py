@@ -143,6 +143,21 @@ class StateStore:
             record.original=deepcopy(record.baseline);record.was_new=False
         self._reindex()
 
+    def checkpoint(self) -> dict[int,tuple[Record[Any],ObjectState,dict[str,Any],dict[str,Any],bool,dict[str,Any]]]:
+        return {identity:(record,record.state,deepcopy(record.baseline),deepcopy(record.original),record.was_new,deepcopy(record.mapping.snapshot(record.obj))) for identity,record in self.records.items()}
+
+    def restore_checkpoint(self,checkpoint: dict[int,tuple[Record[Any],ObjectState,dict[str,Any],dict[str,Any],bool,dict[str,Any]]]) -> None:
+        for identity,record in list(self.records.items()):
+            if identity in checkpoint: continue
+            record.mapping.restore(record.obj,deepcopy(record.original))
+            state=ObjectState.TRANSIENT if record.was_new else ObjectState.DETACHED
+            self.records.pop(identity);self._remember(record.obj,state);self._release(record.obj)
+        for identity,(record,state,baseline,original,was_new,values) in checkpoint.items():
+            record.mapping.restore(record.obj,deepcopy(values))
+            record.state=state;record.baseline=deepcopy(baseline);record.original=deepcopy(original);record.was_new=was_new
+            self.records[identity]=record
+        self._reindex()
+
     def rollback(self) -> None:
         for record in list(self.records.values()):
             record.mapping.restore(record.obj,deepcopy(record.original))

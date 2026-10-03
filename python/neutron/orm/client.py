@@ -49,6 +49,7 @@ class Database:
         self._closed=False
         self._rollback_only=False
         self._stream_lease=False
+        self._savepoint_depth=0
         self._tx_token: object | None=None
         self._owner: int | None=None
 
@@ -157,13 +158,13 @@ class Database:
                 self._discard(); raise _native(exc) from exc
             try:
                 yield self
-                if self._stream_lease:
-                    self._discard();raise OrmError('transaction ended with an active stream lease',outcome='aborted')
+                if self._stream_lease or self._savepoint_depth:
+                    self._discard();raise OrmError('transaction ended with an active stream lease or savepoint',outcome='aborted')
                 if self._rollback_only: raise OrmError("transaction requires rollback after invalid RETURNING result")
             except BaseException as body:
                 if self._closed: raise
-                if self._stream_lease:
-                    self._discard();raise OrmError('transaction ended with an active stream lease',outcome='aborted') from body
+                if self._stream_lease or self._savepoint_depth:
+                    self._discard();raise OrmError('transaction ended with an active stream lease or savepoint',outcome='aborted') from body
                 try: native.__exit__(type(body),body,body.__traceback__)
                 except BaseException as cleanup:
                     self._discard()
@@ -183,6 +184,41 @@ class Database:
             self._owner=None
             self._tx_token=None
             self._rollback_only=False
+
+    @contextmanager
+    def savepoint(self) -> Iterator[Database]:
+        if self._owner is None: raise OrmError('savepoint requires an owned transaction')
+        with self._use():
+            native=self._conn.transaction()
+            try: native.__enter__()
+            except BaseException:
+                self._discard();raise
+        previous=self._rollback_only;self._savepoint_depth+=1
+        try:
+            try:
+                yield self
+                if self._rollback_only: raise OrmError('savepoint requires rollback')
+            except BaseException as body:
+                if self.closed: raise
+                try:
+                    with self._use_cleanup(): native.__exit__(type(body),body,body.__traceback__)
+                except BaseException:
+                    self._discard();raise
+                raise
+            else:
+                try:
+                    with self._use(): native.__exit__(None,None,None)
+                except BaseException:
+                    self._discard();raise
+        finally:
+            self._savepoint_depth-=1;self._rollback_only=previous
+
+    @contextmanager
+    def _use_cleanup(self) -> Iterator[None]:
+        previous=self._rollback_only;self._rollback_only=False
+        try:
+            with self._use(): yield
+        finally: self._rollback_only=previous
 
     def stream(self,query: Select[T] | Query[T],*,batch_size: int) -> Stream[T]:
         from .streaming import Stream
@@ -216,6 +252,7 @@ class AsyncDatabase:
         self._closed=False
         self._rollback_only=False
         self._stream_lease=False
+        self._savepoint_depth=0
         self._tx_token: object | None=None
         self._owner: asyncio.Task[Any] | None=None
 
@@ -341,13 +378,13 @@ class AsyncDatabase:
                 raise
             try:
                 yield self
-                if self._stream_lease:
-                    self._discard();raise OrmError('transaction ended with an active stream lease',outcome='aborted')
+                if self._stream_lease or self._savepoint_depth:
+                    self._discard();raise OrmError('transaction ended with an active stream lease or savepoint',outcome='aborted')
                 if self._rollback_only: raise OrmError("transaction requires rollback after invalid RETURNING result")
             except BaseException as body:
                 if self._closed: raise
-                if self._stream_lease:
-                    self._discard();raise OrmError('transaction ended with an active stream lease',outcome='aborted') from body
+                if self._stream_lease or self._savepoint_depth:
+                    self._discard();raise OrmError('transaction ended with an active stream lease or savepoint',outcome='aborted') from body
                 try: await native.__aexit__(type(body),body,body.__traceback__)
                 except BaseException as cleanup:
                     self._discard()
@@ -367,6 +404,41 @@ class AsyncDatabase:
             self._owner=None
             self._tx_token=None
             self._rollback_only=False
+
+    @asynccontextmanager
+    async def savepoint(self) -> AsyncIterator[AsyncDatabase]:
+        if self._owner is None: raise OrmError('savepoint requires an owned transaction')
+        async with self._use():
+            native=self._conn.transaction()
+            try: await native.__aenter__()
+            except BaseException:
+                self._discard();raise
+        previous=self._rollback_only;self._savepoint_depth+=1
+        try:
+            try:
+                yield self
+                if self._rollback_only: raise OrmError('savepoint requires rollback')
+            except BaseException as body:
+                if self.closed: raise
+                try:
+                    async with self._use_cleanup(): await native.__aexit__(type(body),body,body.__traceback__)
+                except BaseException:
+                    self._discard();raise
+                raise
+            else:
+                try:
+                    async with self._use(): await native.__aexit__(None,None,None)
+                except BaseException:
+                    self._discard();raise
+        finally:
+            self._savepoint_depth-=1;self._rollback_only=previous
+
+    @asynccontextmanager
+    async def _use_cleanup(self) -> AsyncIterator[None]:
+        previous=self._rollback_only;self._rollback_only=False
+        try:
+            async with self._use(): yield
+        finally: self._rollback_only=previous
 
     def stream(self,query: Select[T] | Query[T],*,batch_size: int) -> AsyncStream[T]:
         from .streaming import AsyncStream

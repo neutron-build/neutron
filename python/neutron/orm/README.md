@@ -398,3 +398,13 @@ optimistic write; rollback restores the fetched/pretransaction target baseline
 while leaving the caller's detached edit intact. AsyncSession requires await.
 This explicit scalar merge contract does not implement SQLAlchemy graph merge
 or inference of an absent baseline.
+
+`with session.savepoint()` and `async with session.savepoint()` flush existing
+work before creating a native PostgreSQL savepoint and a complete scalar object
+checkpoint. A body/flush failure rolls back that savepoint, restores saved
+values/baselines/states, clears identities created inside it and permits the
+outer transaction to continue. Nested savepoints are explicit. Session and raw
+transaction-handle commit/rollback/close refuse while a savepoint is open.
+Cleanup failure fences the connection and marks tracked outcomes indeterminate;
+no partial checkpoint is advertised as reconciled. The existing plain
+`transaction()` context still refuses implicit nested transactions.

@@ -378,3 +378,46 @@ async def test_native_async_detached_merge_and_owner_refusal(mapped):
         assert target is not obj
         await session.commit()
         assert native.execute(f'SELECT name FROM {m.table.sql}').fetchone()==('async_patch',)
+
+
+def test_native_savepoint_reconciles_partial_flush_and_outer_commit(mapped):
+    url,m,native=mapped
+    with Session.connect(url) as session:
+        anchor=User(name='anchor');session.add(m,anchor)
+        with pytest.raises(OrmError) as failed:
+            with session.savepoint():
+                first=User(name='duplicate');last=User(name='duplicate')
+                session.add(m,first);session.add(m,last);session.flush()
+        assert failed.value.sqlstate=='23505'
+        assert first.id is None and last.id is None
+        assert session.object_state(first) is ObjectState.TRANSIENT
+        assert anchor.id is not None
+        anchor.name='outer_survives';session.commit()
+        assert native.execute(f'SELECT name FROM {m.table.sql}').fetchall()==[('outer_survives',)]
+        with session.savepoint():
+            with pytest.raises(SessionBusyError): session.commit()
+            with pytest.raises(SessionBusyError): session.rollback()
+            with pytest.raises(SessionBusyError): session.close()
+            with pytest.raises(RuntimeError):
+                with session.savepoint():
+                    anchor.name='inner';session.flush();raise RuntimeError('rollback inner')
+            assert anchor.name=='outer_survives'
+            anchor.name='saved';session.flush()
+        session.rollback();assert anchor.name=='outer_survives'
+        assert native.execute(f'SELECT name FROM {m.table.sql}').fetchall()==[('outer_survives',)]
+
+@pytest.mark.asyncio
+async def test_native_async_savepoint_rollback_checkpoint_and_reuse(mapped):
+    url,m,native=mapped
+    async with await AsyncSession.connect(url) as session:
+        anchor=User(name='anchor');session.add(m,anchor);await session.commit()
+        with pytest.raises(RuntimeError):
+            async with session.savepoint():
+                anchor.name='inner';await session.flush()
+                extra=User(name='extra');session.add(m,extra);await session.flush()
+                with pytest.raises(SessionBusyError): await session.commit()
+                raise RuntimeError('rollback savepoint')
+        assert anchor.name=='anchor' and extra.id is None
+        assert session.object_state(extra) is ObjectState.TRANSIENT
+        anchor.name='survives';await session.commit()
+        assert native.execute(f'SELECT name FROM {m.table.sql}').fetchall()==[('survives',)]

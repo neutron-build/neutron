@@ -163,3 +163,10 @@ def static_merge_consumer(session: Session,mapping: ModelMapping[User],obj: User
 
 async def static_async_merge_consumer(session: AsyncSession,mapping: ModelMapping[User],obj: User) -> None:
     assert_type(await session.merge(mapping,obj,expected=mapping.snapshot(obj)),User)
+
+
+def static_savepoint_consumer(session: Session) -> None:
+    with session.savepoint() as nested: assert_type(nested,Session)
+
+async def static_async_savepoint_consumer(session: AsyncSession) -> None:
+    async with session.savepoint() as nested: assert_type(nested,AsyncSession)
