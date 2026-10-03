@@ -7,7 +7,7 @@ from uuid import UUID
 from .client import AsyncDatabase, Database
 from .core import CardinalityError, OrmError, Predicate
 from .mapping import ModelMapping
-from .query import Query, Scope, field
+from .query import Field, Query, Scope, field
 
 P=TypeVar('P')
 C=TypeVar('C')
@@ -133,10 +133,12 @@ def _prepare(relation: Relation[P,C],parents: Sequence[P],query: Query[C] | None
     query=relation.query() if query is None else query
     if query.row_limit is not None or query.row_offset is not None:
         raise UnsupportedRelationError('per-parent pagination unsupported; global limit/offset refused')
+    if query.grouping or query.having_predicate is not None or query.distinct_rows or query.set_terms or query.scope.correlated:
+        raise UnsupportedRelationError('relation load requires a plain mapped read without grouping/sets/correlation')
     if query.scope.table is not relation.child.table or query.scope.joins or not isinstance(query.decoder,_MappedDecoder) or query.decoder.mapping is not relation.child:
         raise UnsupportedRelationError('relation load requires its own mapped child query without joins')
     expected=tuple(relation.child.field_columns.values())
-    if len(query.fields)!=len(expected) or any(item.outer or item.column is not column for item,column in zip(query.fields,expected)):
+    if len(query.fields)!=len(expected) or any(type(item) is not Field or item.outer or item.column is not column for item,column in zip(query.fields,expected)):
         raise UnsupportedRelationError('relation mapped projection cannot be replaced')
     query.compile() # Validate filters/order even for an empty parent input.
     items=tuple(parents)

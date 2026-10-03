@@ -122,3 +122,11 @@ def test_nullable_and_custom_key_profiles_refused():
             key=table.nullable_column('key',typ) if spec.nullable else table.column('key',typ)
             return ModelMapping(model,table,{'id':table.column('id',int),'key':key},primary_key=('id',))
         with pytest.raises(UnsupportedRelationError): Relation(mapped(a),mapped(b),('key',),('key',))
+
+
+def test_richer_algebra_cannot_escape_mapped_relation_budget():
+    from neutron.orm import count
+    pm,cm=mappings();rel=Relation(pm,cm,('id','tenant'),('parent_id','tenant'));q=rel.query()
+    budget=LoadBudget(10,10,10)
+    for changed in (q.distinct(),q.union(q),q.group_by(cm.table.column('id',int)),replace(q,fields=(count(cm.table.column('id',int)),*q.fields[1:]))):
+        with pytest.raises(UnsupportedRelationError): _prepare(rel,[],changed,budget,False)
