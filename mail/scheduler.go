@@ -330,8 +330,10 @@ func (s *Scheduler) adapterFor(ctx context.Context, acct AccountID) (Adapter, fu
 func (s *Scheduler) handleFailure(ctx context.Context, acct AccountID, err error) {
 	switch {
 	case errors.Is(err, ErrReauthRequired):
-		// The engine has already marked the account; eligible() will skip
-		// it from here until a human reconnects it.
+		// Token admission and body prefetch can fail outside the engine
+		// classification path. Persist every permanent failure here too,
+		// so an invalid refresh grant is not retried on every tick.
+		s.eng.classify(ctx, acct, err)
 		s.log.WarnContext(ctx, "account needs reauthentication, pausing sync", "account", acct)
 
 	case errors.Is(err, ErrRateLimited):

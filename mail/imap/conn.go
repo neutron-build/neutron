@@ -25,6 +25,12 @@ type Conn struct {
 	tag  int
 	caps map[string]bool
 
+	// ioTimeout bounds every command and literal exchange, and the setup
+	// through greeting and authentication, even when the caller's context
+	// carries no deadline. Cancellation closes the socket so a stalled
+	// server cannot outlive the caller (audit IMAP-02).
+	ioTimeout time.Duration
+
 	// selected tracks the currently selected mailbox.
 	selected string
 
@@ -102,13 +108,24 @@ func Dial(ctx context.Context, cfg Config) (*Conn, error) {
 		if tlsCfg == nil {
 			tlsCfg = &tls.Config{ServerName: cfg.Host, MinVersion: tls.VersionTLS12}
 		}
-		raw, err = tls.DialWithDialer(dialer, "tcp", addr, tlsCfg)
+		// Context-aware TLS dialing: tls.DialWithDialer ignores the
+		// caller's context, so a cancelled sync could still block in the
+		// handshake (audit IMAP-02).
+		raw, err = (&tls.Dialer{NetDialer: dialer, Config: tlsCfg}).DialContext(ctx, "tcp", addr)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("imap: dial %s: %w", addr, err)
 	}
 
-	c := &Conn{raw: raw, dec: newDecoder(raw), caps: map[string]bool{}}
+	c := &Conn{raw: raw, dec: newDecoder(raw), caps: map[string]bool{}, ioTimeout: cfg.Timeout}
+
+	// Setup (greeting, capability, authentication) runs under one bounded
+	// budget; a server that stalls before the session is usable cannot
+	// hold the caller past it.
+	setup, cancelSetup := context.WithTimeout(ctx, cfg.Timeout)
+	defer cancelSetup()
+	stop := context.AfterFunc(setup, func() { raw.Close() })
+	defer stop()
 
 	// The server greets before any command; a greeting of BYE means it is
 	// refusing the connection outright.
@@ -122,29 +139,62 @@ func Dial(ctx context.Context, cfg Config) (*Conn, error) {
 		return nil, fmt.Errorf("imap: server refused connection: %v", greeting)
 	}
 
-	if err := c.capability(ctx); err != nil {
+	if err := c.capability(setup); err != nil {
 		raw.Close()
 		return nil, err
 	}
-	if err := c.authenticate(ctx, cfg); err != nil {
+	if err := c.authenticate(setup, cfg); err != nil {
 		raw.Close()
 		return nil, err
 	}
 	// Capabilities commonly change after login — CONDSTORE and QRESYNC are
 	// frequently advertised only to an authenticated session.
-	if err := c.capability(ctx); err != nil {
+	if err := c.capability(setup); err != nil {
 		raw.Close()
 		return nil, err
 	}
+	stop()
 	return c, nil
 }
 
+// Close tears the session down within a hard bound. LOGOUT is attempted
+// with a short deadline, but a server that stalls on goodbye cannot hold
+// the caller: the socket closes regardless (audit IMAP-02).
 func (c *Conn) Close() error {
 	if c.raw == nil {
 		return nil
 	}
-	_, _ = c.exec(context.Background(), "LOGOUT")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	stop := context.AfterFunc(ctx, func() { c.raw.SetDeadline(time.Now()) })
+	defer stop()
+	_, _ = c.exec(ctx, "LOGOUT")
 	return c.raw.Close()
+}
+
+// beginIO arms one bounded, cancellable I/O window: the socket deadline is
+// the sooner of the caller's deadline and now+ioTimeout, and a context
+// cancellation forces the deadline into the past so blocked reads release
+// immediately. The returned release clears the deadline and stops the
+// watcher; it must be called before the next window opens (audit IMAP-02).
+func (c *Conn) beginIO(ctx context.Context) (func(), error) {
+	timeout := c.ioTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	stop := context.AfterFunc(ctx, func() { c.raw.SetDeadline(time.Now()) })
+	deadline, _ := ctx.Deadline()
+	if err := c.raw.SetDeadline(deadline); err != nil {
+		stop()
+		cancel()
+		return nil, err
+	}
+	return func() {
+		stop()
+		cancel()
+		_ = c.raw.SetDeadline(time.Time{})
+	}, nil
 }
 
 // Append files a literal message into a mailbox, marked \Seen.
@@ -155,12 +205,14 @@ func (c *Conn) Close() error {
 // server confirms with a continuation before any message bytes cross the
 // wire — so a server that intends to refuse answers before the payload is
 // sent. A refusal can also arrive in place of the continuation as a tagged
-// NO/BAD; both shapes are handled.
+// NO/BAD; both shapes are handled. The whole exchange is bounded and
+// cancellable (audit IMAP-02).
 func (c *Conn) Append(ctx context.Context, mailbox string, message []byte) error {
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = c.raw.SetDeadline(deadline)
-		defer c.raw.SetDeadline(time.Time{})
+	release, err := c.beginIO(ctx)
+	if err != nil {
+		return err
 	}
+	defer release()
 
 	tag := c.nextTag()
 	cmd := tag + " " + fmt.Sprintf("APPEND %s (\\Seen) {%d}", quote(mailbox), len(message)) + "\r\n"
@@ -232,12 +284,14 @@ func (c *Conn) nextTag() string {
 }
 
 // exec sends a command and collects untagged responses until the tagged
-// completion arrives.
+// completion arrives. The exchange is bounded and cancellable
+// (audit IMAP-02).
 func (c *Conn) exec(ctx context.Context, format string, args ...any) ([][]token, error) {
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = c.raw.SetDeadline(deadline)
-		defer c.raw.SetDeadline(time.Time{})
+	release, err := c.beginIO(ctx)
+	if err != nil {
+		return nil, err
 	}
+	defer release()
 
 	tag := c.nextTag()
 	cmd := tag + " " + fmt.Sprintf(format, args...) + "\r\n"

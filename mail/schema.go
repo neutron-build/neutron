@@ -107,16 +107,110 @@ var Schema = []string{
 		ON mail_message_mailboxes (account_id, mailbox_id)`,
 }
 
+// ScanSchema adds staged reconciliation scans (audit SYNC-03/SYNC-02).
+// mirror_scans holds one durable scan per (account, mailbox) — its
+// continuation is the resume point after a crash or page-budget cut;
+// mirror_scan_seen accumulates the authoritative presence set page by
+// page. Deletion of anything live happens only in FinishScan's single
+// completion transaction, never against these tables' contents directly.
+//
+// No FK from mirror_scan_seen to mirror_scans: the rows are always
+// deleted together by the store, and the DDL stays portable to Nucleus.
+var ScanSchema = []string{
+	`CREATE TABLE IF NOT EXISTS mirror_scans (
+		id           TEXT PRIMARY KEY,
+		account_id   TEXT NOT NULL,
+		mailbox_id   TEXT NOT NULL,
+		continuation TEXT NOT NULL DEFAULT '',
+		started_at   TIMESTAMP,
+		UNIQUE (account_id, mailbox_id)
+	)`,
+	`CREATE TABLE IF NOT EXISTS mirror_scan_seen (
+		scan_id    TEXT NOT NULL,
+		message_id TEXT NOT NULL,
+		PRIMARY KEY (scan_id, message_id)
+	)`,
+}
+
+// GenerationSchema gives staged scans a policy-generation identity and a
+// per-generation completion marker (audit 5 SYNC-05). A reconciliation
+// retry used to call BeginScan for every mailbox, discarding the previous
+// attempt's durable progress and re-enumerating mailboxes that had already
+// finished. With generations:
+//
+//   - mirror_scans.generation tags each scan with the policy version it
+//     is enumerating for (0 = a policy-agnostic recovery scan).
+//   - mail_scan_done records, per (account, generation, mailbox), that
+//     this generation's scan of that mailbox FINISHED — the knowledge
+//     FinishScan used to lose when it dropped the scan rows. A retry of
+//     the same generation resumes in-progress scans and skips completed
+//     mailboxes instead of restarting them.
+var GenerationSchema = []string{
+	`ALTER TABLE mirror_scans ADD COLUMN generation BIGINT NOT NULL DEFAULT 0`,
+	`CREATE TABLE IF NOT EXISTS mail_scan_done (
+		account_id  TEXT NOT NULL,
+		generation  BIGINT NOT NULL,
+		mailbox_id  TEXT NOT NULL,
+		PRIMARY KEY (account_id, generation, mailbox_id)
+	)`,
+}
+
+// ReferentialSchema hardens the mirror against retention/write races
+// (audit SYNC-04): bodies and memberships may never reference a message
+// the mirror no longer holds. The orphan deletes run first so an existing
+// installation converges before the constraints land; NOT VALID makes the
+// ADD CONSTRAINT instant by skipping the existing-row scan while still
+// enforcing every NEW write, and VALIDATE then proves the back-catalogue
+// in the same migration. ON DELETE CASCADE keeps the manual child deletes
+// (retention, account deletion) correct rather than fighting them.
+//
+// This migration requires real PostgreSQL DDL support; the product runs
+// on PostgreSQL (see OPS-02), and deployments on engines without ALTER
+// TABLE ... ADD CONSTRAINT must not adopt this version blindly.
+var ReferentialSchema = []string{
+	`DELETE FROM mail_bodies b
+	  WHERE NOT EXISTS (
+	    SELECT 1 FROM mail_messages m
+	     WHERE m.account_id = b.account_id AND m.id = b.message_id)`,
+	`DELETE FROM mail_message_mailboxes mm
+	  WHERE NOT EXISTS (
+	    SELECT 1 FROM mail_messages m
+	     WHERE m.account_id = mm.account_id AND m.id = mm.message_id)`,
+	`ALTER TABLE mail_bodies ADD CONSTRAINT mail_bodies_message_fk
+		FOREIGN KEY (account_id, message_id)
+		REFERENCES mail_messages (account_id, id)
+		ON DELETE CASCADE NOT VALID`,
+	`ALTER TABLE mail_message_mailboxes ADD CONSTRAINT mail_membership_message_fk
+		FOREIGN KEY (account_id, message_id)
+		REFERENCES mail_messages (account_id, id)
+		ON DELETE CASCADE NOT VALID`,
+	`ALTER TABLE mail_bodies VALIDATE CONSTRAINT mail_bodies_message_fk`,
+	`ALTER TABLE mail_message_mailboxes VALIDATE CONSTRAINT mail_membership_message_fk`,
+}
+
+// Account lock order (audit SYNC-04): every transaction that writes or
+// deletes mirror rows — PutEnvelopes, PutBody, DeleteMessages,
+// RemoveFromMailbox, PutMailboxes, scan staging and completion on the
+// engine side; retention sweeps, orphan cleanup, and account deletion on
+// the product side — executes SELECT pg_advisory_xact_lock(
+// AccountLockKey(account_id)) as its FIRST statement. One lock per
+// transaction, acquired before any other resource: that is the whole
+// order, and it cannot deadlock across the two connection pools.
+
 // DropSchema tears the mirror down, in reverse dependency order.
 //
 // This exists for the rebuild-from-zero path, which is a supported operation
 // rather than a test fixture: when a provider reports that a cursor is no
 // longer usable, discarding and refetching is the correct recovery.
 var DropSchema = []string{
+	`DROP TABLE IF EXISTS mail_scan_done`,
+	`DROP TABLE IF EXISTS mirror_scan_seen`,
+	`DROP TABLE IF EXISTS mirror_scans`,
 	`DROP TABLE IF EXISTS mail_sync_state`,
 	`DROP TABLE IF EXISTS mail_bodies`,
 	`DROP TABLE IF EXISTS mail_message_mailboxes`,
 	`DROP TABLE IF EXISTS mail_messages`,
 	`DROP TABLE IF EXISTS mail_mailboxes`,
 	`DROP TABLE IF EXISTS mail_accounts`,
+	`DROP TABLE IF EXISTS mail_migrations`,
 }

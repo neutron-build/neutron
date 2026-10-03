@@ -1,10 +1,15 @@
 package dialer
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+
+	"google.golang.org/api/gmail/v1"
+	"google.golang.org/api/option"
 )
 
 // captureTransport records the Authorization header of every hop so a test
@@ -113,6 +118,76 @@ func TestBearerClientRedirectHandling(t *testing.T) {
 				t.Errorf("redirect was not followed; hops = %v", hops)
 			}
 		})
+	}
+}
+
+// The Gmail SDK dials the host named by its configured endpoint, and the
+// bearer transport only authorizes its allowlisted hosts. The two must agree:
+// pinning the endpoint while allowing a different host (the www.googleapis.com
+// root the allowlist used to name) strips the token from every SDK request
+// (audit 4 F01).
+func TestGmailEndpointMatchesBearerAllowlist(t *testing.T) {
+	endpoint, err := url.Parse(gmailAPIEndpoint)
+	if err != nil {
+		t.Fatalf("gmail endpoint does not parse: %v", err)
+	}
+	if endpoint.Scheme != "https" {
+		t.Fatalf("gmail endpoint scheme = %q, want https", endpoint.Scheme)
+	}
+
+	transport, ok := bearerClient("secret-token", gmailAPIHost).Transport.(bearerTransport)
+	if !ok {
+		t.Fatal("bearerClient transport is not a bearerTransport")
+	}
+	if !transport.hosts[endpoint.Hostname()] {
+		t.Fatalf("allowlist %v omits the endpoint host %q", transport.hosts, endpoint.Hostname())
+	}
+	if len(transport.hosts) != 1 {
+		t.Fatalf("allowlist = %v, want exactly the Gmail API host", transport.hosts)
+	}
+	// The old defect, pinned: the www root must NOT be the authorized host.
+	if transport.hosts["www.googleapis.com"] {
+		t.Fatal("allowlist authorizes www.googleapis.com; the Gmail API is served from gmail.googleapis.com")
+	}
+
+	// The real pinned SDK must actually dial the configured endpoint.
+	svc, err := gmail.NewService(context.Background(),
+		option.WithEndpoint(gmailAPIEndpoint),
+		option.WithHTTPClient(bearerClient("secret-token", gmailAPIHost)))
+	if err != nil {
+		t.Fatalf("gmail service construction failed: %v", err)
+	}
+	if svc.BasePath != gmailAPIEndpoint {
+		t.Fatalf("service BasePath = %q, want %q", svc.BasePath, gmailAPIEndpoint)
+	}
+
+	// And the transport authorizes exactly that host, not the www root.
+	capture := &captureTransport{}
+	client := &http.Client{Transport: bearerTransport{token: "secret-token", hosts: transport.hosts, base: capture}}
+	for _, target := range []string{
+		gmailAPIEndpoint + "gmail/v1/users/me/labels",
+		"https://www.googleapis.com/gmail/v1/users/me/labels",
+	} {
+		req, err := http.NewRequest(http.MethodGet, target, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client.Transport.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if len(capture.hops) == 0 {
+			t.Fatalf("no recorded hop for %s", target)
+		}
+		hop := capture.hops[len(capture.hops)-1]
+		got := hop[strings.LastIndex(hop, "| ")+2:]
+		if target == gmailAPIEndpoint+"gmail/v1/users/me/labels" && got != "Bearer secret-token" {
+			t.Errorf("Gmail API request carried %q, want the bearer token", got)
+		}
+		if target != gmailAPIEndpoint+"gmail/v1/users/me/labels" && got != "" {
+			t.Errorf("www root request carried %q, want no credential", got)
+		}
 	}
 }
 
