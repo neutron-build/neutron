@@ -26,3 +26,20 @@ from neutron.orm import AsyncSession, ModelMapping, Session
 @dataclass
 class User:
     id: int
+
+from neutron.orm import Order, field, outer_field, query_from
+
+def static_join_consumer(db: Database) -> None:
+    a=Table('a',{'id':ColumnSpec(int,'int4')})
+    b=Table('b',{'owner':ColumnSpec(int,'int4'),'label':ColumnSpec(str,'text')})
+    scope=query_from(a).left_join(b,on=a.column('id',int).eq(b.column('owner',int)))
+    result=db.all(scope.select_pair(field(a.column('id',int)),outer_field(b.column('label',str))))
+    assert_type(result,list[tuple[int,str|None]])
+    assert_type(db.all(scope.select(outer_field(b.column('label',str)))),list[str|None])
+
+def static_join_negative_contract(db: Database) -> None:
+    a=Table('a',{'id':ColumnSpec(int,'int4')})
+    b=Table('b',{'id':ColumnSpec(int,'int4')})
+    scope=query_from(a).left_join(b,on=a.column('id',int).eq(b.column('id',int)))
+    nonnullable: list[int] = db.all(scope.select(outer_field(b.column('id',int))))  # type: ignore[assignment]
+    a.column('id',int).eq('wrong')  # type: ignore[arg-type]

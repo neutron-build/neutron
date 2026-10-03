@@ -154,3 +154,14 @@ Additional remote checks include `tests/test_orm_returning.py`,
 `tests/test_orm_mapping_state.py`, and mandatory-live
 `tests/test_orm_session_live.py`. Check explicit ORM modules and typed consumers;
 unrelated package-root typing errors must be reported separately.
+
+Qualified queries can join distinct physical tables with `query_from(table)`.
+`inner_join(other, on=...)` and `left_join(other, on=...)` require a predicate
+connecting the existing scope to the new table. `select(field(column))` returns
+a scalar; `select_pair(field(first), outer_field(second))` returns a typed tuple.
+Every column projected from a left join's right side requires `outer_field`,
+which adds `None` to its result type. Projections use internal unique SQL aliases.
+`order_by(Order(column, descending=True))`, `limit(n)`, and `offset(n)` are
+immutable operations. `one` and `one_or_none` reject paginated queries.
+Self joins, aliases, arbitrary row shapes, aggregates, subqueries and relation
+loading are outside this bounded query API.

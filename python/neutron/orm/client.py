@@ -4,6 +4,7 @@ import asyncio
 from contextlib import contextmanager, asynccontextmanager
 import threading
 from typing import Any, AsyncIterator, Iterator, Mapping, Sequence, TypeVar, TYPE_CHECKING
+from .query import Query
 from .core import CardinalityError, Compiled, Mutation, OrmError, Returning, Select, SessionBusyError
 
 if TYPE_CHECKING:
@@ -11,7 +12,7 @@ if TYPE_CHECKING:
 
 T=TypeVar('T')
 
-def _decode_rows(query: Select[T] | Returning[T], compiled: Compiled[T], rows: Sequence[Mapping[str,Any]], cardinality: str) -> list[T]:
+def _decode_rows(query: Select[T] | Returning[T] | Query[T], compiled: Compiled[T], rows: Sequence[Mapping[str,Any]], cardinality: str) -> list[T]:
     if cardinality!='many' and len(rows)>1: raise CardinalityError('expected at most one row')
     if cardinality=='one' and not rows: raise CardinalityError('expected exactly one row')
     return [compiled.decode(row) for row in rows]
@@ -69,9 +70,11 @@ class Database:
             yield
         finally: self._lock.release()
 
-    def _read(self, query: Select[T] | Returning[T], cardinality: str) -> list[T]:
+    def _read(self, query: Select[T] | Returning[T] | Query[T], cardinality: str) -> list[T]:
         if isinstance(query,Returning) and self._owner is None:
             with self.transaction(): return self._read(query,cardinality)
+        if isinstance(query,Query) and cardinality != 'many' and (query.row_limit is not None or query.row_offset is not None):
+            raise ValueError('exact-one reads refuse pagination')
         compiled=query.compile()
         with self._use():
             try:
@@ -84,15 +87,15 @@ class Database:
                 raise _native(exc) from exc
         return self._decode(query,compiled,rows,cardinality)
 
-    def _decode(self,query: Select[T] | Returning[T],compiled: Compiled[T],rows: Sequence[Mapping[str,Any]],cardinality: str) -> list[T]:
+    def _decode(self,query: Select[T] | Returning[T] | Query[T],compiled: Compiled[T],rows: Sequence[Mapping[str,Any]],cardinality: str) -> list[T]:
         try: return _decode_rows(query,compiled,rows,cardinality)
         except Exception:
             if isinstance(query,Returning): self._rollback_only=True
             raise
 
-    def all(self, query: Select[T] | Returning[T]) -> list[T]: return self._read(query,'many')
-    def one(self, query: Select[T] | Returning[T]) -> T: return self._read(query,'one')[0]
-    def one_or_none(self, query: Select[T] | Returning[T]) -> T | None:
+    def all(self, query: Select[T] | Returning[T] | Query[T]) -> list[T]: return self._read(query,'many')
+    def one(self, query: Select[T] | Returning[T] | Query[T]) -> T: return self._read(query,'one')[0]
+    def one_or_none(self, query: Select[T] | Returning[T] | Query[T]) -> T | None:
         rows=self._read(query,'optional'); return rows[0] if rows else None
 
     def execute(self, statement: Mutation) -> int:
@@ -198,9 +201,11 @@ class AsyncDatabase:
         try: yield
         finally: self._busy=False
 
-    async def _read(self,query: Select[T] | Returning[T],cardinality: str) -> list[T]:
+    async def _read(self,query: Select[T] | Returning[T] | Query[T],cardinality: str) -> list[T]:
         if isinstance(query,Returning) and self._owner is None:
             async with self.transaction(): return await self._read(query,cardinality)
+        if isinstance(query,Query) and cardinality != 'many' and (query.row_limit is not None or query.row_offset is not None):
+            raise ValueError('exact-one reads refuse pagination')
         compiled=query.compile()
         async with self._use():
             try:
@@ -217,15 +222,15 @@ class AsyncDatabase:
                 raise _native(exc) from exc
         return self._decode(query,compiled,rows,cardinality)
 
-    def _decode(self,query: Select[T] | Returning[T],compiled: Compiled[T],rows: Sequence[Mapping[str,Any]],cardinality: str) -> list[T]:
+    def _decode(self,query: Select[T] | Returning[T] | Query[T],compiled: Compiled[T],rows: Sequence[Mapping[str,Any]],cardinality: str) -> list[T]:
         try: return _decode_rows(query,compiled,rows,cardinality)
         except Exception:
             if isinstance(query,Returning): self._rollback_only=True
             raise
 
-    async def all(self,query: Select[T] | Returning[T]) -> list[T]: return await self._read(query,'many')
-    async def one(self,query: Select[T] | Returning[T]) -> T: return (await self._read(query,'one'))[0]
-    async def one_or_none(self,query: Select[T] | Returning[T]) -> T | None:
+    async def all(self,query: Select[T] | Returning[T] | Query[T]) -> list[T]: return await self._read(query,'many')
+    async def one(self,query: Select[T] | Returning[T] | Query[T]) -> T: return (await self._read(query,'one'))[0]
+    async def one_or_none(self,query: Select[T] | Returning[T] | Query[T]) -> T | None:
         rows=await self._read(query,'optional'); return rows[0] if rows else None
 
     async def execute(self,statement: Mutation) -> int:

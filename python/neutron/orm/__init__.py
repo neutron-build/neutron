@@ -12,3 +12,6 @@ from .session import ConflictError, Session
 from .async_session import AsyncSession
 from .state import ObjectState
 __all__ += ["ModelMapping","ConflictError","Session","AsyncSession","ObjectState"]
+
+from .query import Field, Order, Query, Scope, field, outer_field, query_from
+__all__ += ["Field","Order","Query","Scope","field","outer_field","query_from"]
