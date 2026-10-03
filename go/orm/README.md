@@ -729,3 +729,16 @@ connections retain caller transaction policy and protocol choice.
 ```sh
 go test ./orm -run 'Test(BoundSQL|PostgresBoundSQL)' -count=1 -v
 ```
+
+`NewThroughRelation` joins explicit parent-to-link and link-to-target relations
+with the same intermediate binding. `LoadThrough` preserves composite tenant
+identity, parent input positions, link order and duplicate multiplicity. Each
+link must target at most one child; missing/filtered targets follow inner-join
+semantics. Separate parent/link/output/batch budgets count expanded duplicates;
+batched eager loading avoids one query per parent. Global paging refuses, and
+cross-batch consistency remains caller-owned snapshot isolation. Target deletion
+and join-table cascades are never inferred from this read mapping.
+
+```sh
+go test ./orm -run 'Test(ThroughRelation|PostgresCompositeManyToMany)' -count=1 -v
+```
