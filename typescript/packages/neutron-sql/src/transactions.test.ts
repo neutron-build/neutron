@@ -439,3 +439,25 @@ test("transaction terminal handles reject queries, writes, prepare and savepoint
   assert.throws(()=>scope.prepare!("select 3"),/scope is settled/);
   assert.deepEqual(pin.statements,before);
 });
+
+test("transaction callback settlement fences handles while COMMIT is still pending", async () => {
+  const pin = fakePin();
+  const execute = pin.execute.bind(pin);
+  let releaseCommit!: () => void;
+  let startedCommit!: () => void;
+  const commitStarted = new Promise<void>(resolve => { startedCommit=resolve; });
+  const commitGate = new Promise<void>(resolve => { releaseCommit=resolve; });
+  pin.execute = async sqlText => {
+    if (sqlText === "commit") { startedCommit(); await commitGate; }
+    return execute(sqlText);
+  };
+  let scope!: TransactionScope;
+  const completion=runTransaction(pin,async tx => { scope=tx; return 7; });
+  await commitStarted;
+  assert.equal(pin.releasedWith.length,0);
+  await assert.rejects(scope.query("select forbidden"), /scope is settled/);
+  await assert.rejects(scope.execute("insert forbidden"), /scope is settled/);
+  releaseCommit();
+  assert.equal(await completion,7);
+  assert.deepEqual(pin.statements,["begin","commit"]);
+});
