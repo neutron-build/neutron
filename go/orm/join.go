@@ -20,6 +20,8 @@ type joinedBinding[P, C any] struct {
 	relation                Relation[P, C]
 	left                    bool
 	parentAlias, childAlias string
+	lateral                 bool
+	childQuery              Query[C]
 }
 
 // JoinedScope is sealed to validated InnerJoin/LeftJoin handles in this package.
@@ -80,6 +82,37 @@ func NewAliasedInnerJoin[P, C any](relation Relation[P, C], parentAlias, childAl
 }
 func NewAliasedLeftJoin[P, C any](relation Relation[P, C], parentAlias, childAlias string) (LeftJoin[P, C], error) {
 	binding, err := newAliasedBinding(relation, true, parentAlias, childAlias)
+	return LeftJoin[P, C]{binding}, err
+}
+
+func newLateralBinding[P, C any](relation Relation[P, C], left bool, parentAlias, childAlias string, childQuery Query[C]) (*joinedBinding[P, C], error) {
+	binding, err := newAliasedBinding(relation, left, parentAlias, childAlias)
+	if err != nil {
+		return nil, err
+	}
+	if !childQuery.limited || childQuery.limit < 0 || childQuery.limit == int(^uint(0)>>1) {
+		return nil, fmt.Errorf("orm: lateral child query requires a finite explicit per-parent LIMIT")
+	}
+	if _, _, err := selectSQL(relation.child, relation.child.info.columns(), childQuery); err != nil {
+		return nil, err
+	}
+	binding.lateral = true
+	binding.childQuery = childQuery
+	return binding, nil
+}
+
+// NewLateralInnerJoin correlates exact composite child keys to each parent and
+// applies the child filter/order/LIMIT/OFFSET independently per parent.
+func NewLateralInnerJoin[P, C any](relation Relation[P, C], parentAlias, childAlias string, childQuery Query[C]) (InnerJoin[P, C], error) {
+	binding, err := newLateralBinding(relation, false, parentAlias, childAlias, childQuery)
+	return InnerJoin[P, C]{binding}, err
+}
+
+// NewLateralLeftJoin additionally preserves parents with no qualifying child;
+// every projected right field remains Nullable. Outer filters retain SQL WHERE
+// semantics and can deliberately exclude unmatched parents.
+func NewLateralLeftJoin[P, C any](relation Relation[P, C], parentAlias, childAlias string, childQuery Query[C]) (LeftJoin[P, C], error) {
+	binding, err := newLateralBinding(relation, true, parentAlias, childAlias, childQuery)
 	return LeftJoin[P, C]{binding}, err
 }
 
@@ -264,8 +297,54 @@ func joinedSQL[P, C any](q JoinQuery[P, C], fields []joinedProjection) (string, 
 		parentSQL += " AS " + quote(q.binding.parentAlias)
 		childSQL += " AS " + quote(q.binding.childAlias)
 	}
-	sql := "SELECT " + strings.Join(columns, ", ") + " FROM " + parentSQL + kind + childSQL + " ON (" + strings.Join(parts, " AND ") + ")"
 	args := []any{}
+	joinClause := childSQL + " ON (" + strings.Join(parts, " AND ") + ")"
+	if q.binding.lateral {
+		innerAlias := "__neutron_lateral_source"
+		for innerAlias == q.binding.parentAlias || innerAlias == q.binding.childAlias {
+			innerAlias += "x"
+		}
+		innerColumn := func(field fieldInfo) string { return quote(innerAlias) + "." + quote(field.name) }
+		innerFields := make([]string, len(child.fields))
+		for i, field := range child.fields {
+			innerFields[i] = innerColumn(field)
+		}
+		correlation := make([]string, len(q.binding.relation.parts))
+		for i, part := range q.binding.relation.parts {
+			correlation[i] = innerColumn(part.childField) + " = " + qualify(false, part.parentField)
+		}
+		subquery := "SELECT " + strings.Join(innerFields, ", ") + " FROM " + child.sqlName() + " AS " + quote(innerAlias) + " WHERE (" + strings.Join(correlation, " AND ") + ")"
+		childQuery := q.binding.childQuery
+		if childQuery.whereSet {
+			predicate, err := renderPredicateColumns(child, childQuery.predicate.expr, &args, innerColumn)
+			if err != nil {
+				return "", nil, err
+			}
+			subquery += " AND (" + predicate + ")"
+		}
+		childOrders := make([]string, len(childQuery.order))
+		for i, order := range childQuery.order {
+			if order.info != child {
+				return "", nil, fmt.Errorf("orm: lateral order outside child binding")
+			}
+			dir := " ASC"
+			if order.descending {
+				dir = " DESC"
+			}
+			childOrders[i] = innerColumn(order.field) + dir + order.nulls
+		}
+		if len(childOrders) > 0 {
+			subquery += " ORDER BY " + strings.Join(childOrders, ", ")
+		}
+		args = append(args, childQuery.limit)
+		subquery += fmt.Sprintf(" LIMIT $%d", len(args))
+		if childQuery.offset > 0 {
+			args = append(args, childQuery.offset)
+			subquery += fmt.Sprintf(" OFFSET $%d", len(args))
+		}
+		joinClause = "LATERAL (" + subquery + ") AS " + quote(q.binding.childAlias) + " ON TRUE"
+	}
+	sql := "SELECT " + strings.Join(columns, ", ") + " FROM " + parentSQL + kind + joinClause
 	where := make([]string, len(q.filters))
 	for i, filter := range q.filters {
 		expected := parent

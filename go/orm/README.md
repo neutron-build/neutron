@@ -556,3 +556,18 @@ support them. Native errors retain other invalid frame/type cases.
 ```sh
 go test ./orm -run 'Test(WindowFrameBindingsAndOwnership|PostgresTypedWindowsAndFrames)' -count=1 -v
 ```
+
+
+`NewLateralInnerJoin`/`NewLateralLeftJoin` correlate exact composite relation keys
+to each parent, with explicit quoted parent/child aliases. Their child Query
+requires a finite explicit per-parent LIMIT and independently applies bound
+filter, order and OFFSET. These are native LATERAL queries: every parent receives
+its own child paging policy. Left joins retain missing parents and require
+Nullable child projections; outer WHERE filters still follow ordinary SQL
+semantics. Filters/projections/order retain the sealed join/table binding,
+including same-metadata self relations. Arbitrary raw correlated SQL is not
+accepted by these constructors.
+
+```sh
+go test ./orm -run 'Test(LateralPerParentCompilationAndBinding|PostgresCompositeLateralPerParentPaging)' -count=1 -v
+```
