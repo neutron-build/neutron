@@ -61,5 +61,7 @@ async def test_native_async_vector_mapping_precision_and_rollback(vectors):
             assert await session.get(mapping,1) is obj
             obj.optional=PgVector((1.0,),spec.native_type);await session.flush();await session.rollback();assert obj.optional is None
         assert (await db.one(select_row(table)))['value']==exact
-    native_components=native.execute(f'SELECT value::real[] FROM "{s}".vectors').fetchone()[0]
+    with native.cursor(binary=True) as oracle:
+        oracle.execute(f'SELECT value::real[] FROM "{s}".vectors')
+        native_components=oracle.fetchone()[0]
     assert tuple(native_components)==exact.elements
