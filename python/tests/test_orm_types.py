@@ -170,3 +170,7 @@ def static_savepoint_consumer(session: Session) -> None:
 
 async def static_async_savepoint_consumer(session: AsyncSession) -> None:
     async with session.savepoint() as nested: assert_type(nested,AsyncSession)
+
+
+def static_expiration_consumer(session: Session,obj: User) -> None:
+    assert_type(session.expire(obj,'name'),None)

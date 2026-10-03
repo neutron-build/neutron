@@ -183,7 +183,11 @@ class StateStore:
         self._reindex()
 
     def uncertain(self) -> None:
-        for record in self.records.values(): record.state=ObjectState.INDETERMINATE
+        for record in self.records.values():
+            record.state=ObjectState.INDETERMINATE
+            if record.mapping.instrumented:
+                record.expired_fields=frozenset(record.mapping.field_columns)
+                expire_attributes(record.obj,record.expired_fields)
 
     def detach_all(self) -> None:
         for record in self.records.values():

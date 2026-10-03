@@ -8,6 +8,7 @@ from .client import AsyncDatabase
 from .core import CardinalityError, OrmError, Predicate, SessionBusyError, delete, insert, select_row, update, Mutation
 from .lifecycle import AsyncTransactionHandle
 from .events import EVENT_NAMES, EventName, SessionEvent
+from .instrumentation import expire_attributes
 from .mapping import ModelMapping
 from .session import ConflictError, _SessionState
 from .state import ObjectState
@@ -231,9 +232,13 @@ class AsyncSession(_SessionState):
         self._owner_check()
         if self._emitting or self._savepoint_depth: raise SessionBusyError('Session close during event/savepoint refused')
         if self._closed: return
+        expired={identity:record.expired_fields for identity,record in self._store.records.items() if record.state is ObjectState.EXPIRED}
         try:
             if not self._uncertain: await self.rollback()
         finally:
+            for identity,names in expired.items():
+                record=self._store.records.get(identity)
+                if record is not None: expire_attributes(record.obj,names)
             self._store.detach_all();self._closed=True
             if self._close_database: await self._database.close()
 

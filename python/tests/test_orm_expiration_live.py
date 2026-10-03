@@ -65,3 +65,15 @@ async def test_native_async_expire_on_commit_and_explicit_await_refresh(expirati
         assert native.execute(f'SELECT name FROM {m.table.sql}').fetchone()==('updated',)
         await session.refresh(obj);assert obj.name=='updated'
         await session.rollback()
+
+
+def test_native_closed_expired_object_requires_explicit_reattachment(expiration):
+    url,m,native=expiration
+    with Session.connect(url) as session:
+        obj=session.get(m,1);session.commit();session.expire(obj,'name')
+    with pytest.raises(ExpiredAttributeError): _=obj.name
+    assert obj.id==1
+    native.execute(f'UPDATE {m.table.sql} SET name=%s',('fresh',))
+    with Session.connect(url) as other:
+        assert other.attach_existing(m,obj,discard_changes=True) is obj
+        assert obj.name=='fresh'
