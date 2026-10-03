@@ -1,0 +1,61 @@
+{
+  "format": "neutron-execution-cases",
+  "version": 1,
+  "status": "normative-proposed-runtime-compliance-unverified",
+  "cases": [
+    {
+      "id": "cancel-before-acquire",
+      "from": "waiting-for-pool",
+      "event": "deadline/cancel",
+      "to": "closed-with-no-owned-session",
+      "assert": "no later checkout; pool capacity unchanged"
+    },
+    {
+      "id": "savepoint-rollback",
+      "from": "active-outer",
+      "steps": [
+        "insert parent",
+        "savepoint",
+        "insert child",
+        "rollback-to-savepoint",
+        "commit outer"
+      ],
+      "assert": "parent persists, child absent; explicit outer state usable"
+    },
+    {
+      "id": "native-error-dooms-tx",
+      "from": "active",
+      "event": "division-by-zero",
+      "to": "failed",
+      "assert": "subsequent query native 25P02 until rollback unless savepoint explicitly recovers"
+    },
+    {
+      "id": "ambiguous-commit",
+      "from": "committing",
+      "event": "disconnect after server may have committed",
+      "to": "indeterminate",
+      "assert": "no automatic replay; observer may see committed row; communicate uncertainty"
+    },
+    {
+      "id": "session-context-reset",
+      "from": "active-with-SET-LOCAL-role",
+      "event": "commit/rollback/cancel",
+      "to": "returned-clean-or-discarded",
+      "assert": "next tenant size1 pool gets no prior role/GUC state"
+    },
+    {
+      "id": "concurrent-session",
+      "from": "owned-by-task-A",
+      "event": "task-B query",
+      "to": "reject-or-explicit-serialized",
+      "assert": "chosen policy tested; no cross-task transaction ownership"
+    },
+    {
+      "id": "cleanup-error",
+      "from": "rolling-back",
+      "event": "socket-lost",
+      "to": "discarded",
+      "assert": "pool must never return dirty/failed connection"
+    }
+  ]
+}

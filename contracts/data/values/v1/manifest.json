@@ -1,0 +1,9 @@
+{
+  "format": "neutron-value-manifest",
+  "version": 1,
+  "files": [
+    "scalars.json",
+    "write-states.json",
+    "complex-containment.json"
+  ]
+}
