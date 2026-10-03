@@ -5,13 +5,13 @@ import {
   stagedEdits, stagedForTable, stageEdit, keyStringOf, failedEditFocus,
   tableDataRevision, type EditingBinding,
 } from '../../lib/store'
-import { api } from '../../lib/api'
+import { api, ApiError } from '../../lib/api'
 import { encodeCell, encodeEdit, formatCell, WireEncodeError } from '../../lib/wire'
 import { DataGrid, type FKTarget, type StagedRowState } from '../../components/DataGrid'
 import { TypedEditor } from '../../components/TypedEditor'
 import type {
   QueryResult, SqlColumn, FKDetail, TableMeta, KeyCell, MatchCell,
-  CellEdit, TableFilter, TableSort, TableMetaColumn, CommitOperation,
+  CellEdit, TableFilter, TableSort, TableMetaColumn, CommitOperation, TablePageResult,
 } from '../../lib/types'
 import { TableSearchPanel } from './TableSearchPanel'
 import { ImportDialog } from './ImportDialog'
@@ -26,6 +26,15 @@ interface SQLBrowserProps {
   /** Pre-applied full-tuple equality filter (FK follow, incl. composite FKs). */
   initialMatch?: MatchCell[]
 }
+
+interface PagePosition {
+  cursor: string
+  previous: string[]
+  ordinal: number
+  offset: number
+  trimmed: boolean
+}
+const firstPage = (): PagePosition => ({ cursor: '', previous: [], ordinal: 1, offset: 0, trimmed: false })
 
 /** Page sizes (S06): bounded by the server's 1000-row page limit; the grid
  *  virtualizes whatever it holds. */
@@ -69,7 +78,11 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
   const loading = useSignal(false)
   const error = useSignal<string | null>(null)
   const limit = useSignal(200)
-  const offset = useSignal(0)
+  const position = useSignal<PagePosition>(firstPage())
+  const pagingMode = useSignal<'pending' | 'keyset' | 'offset'>('pending')
+  const pagingReason = useSignal('')
+  const rejectedProfile = useRef<{ binding: string | undefined; reason: string } | null>(null)
+  const nucleusConnection = useRef(activeConnection.value?.isNucleus === true)
   const filters = useSignal<TableFilter[]>(
     initialFilter ? [{ column: initialFilter.column, op: initialFilter.op, value: initialFilter.value }] : [])
   const appliedFilters = useSignal<TableFilter[]>(filters.value)
@@ -103,45 +116,88 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
     (schema.value?.sql ?? []).find(t => t.schema === schemaName && t.name === table) ?? null
   )
 
-  async function loadMeta() {
-    try {
-      meta.value = await api.tableMeta(conn.id, schemaName, table)
-    } catch (err: unknown) {
-      // No authoritative metadata -> no editing (fail-safe direction).
-      meta.value = {
-        exists: false, keyColumns: [], versioned: false, readOnly: true,
-        readOnlyReason: `editing state unavailable (${err instanceof Error ? err.message : String(err)})`,
-        columns: [],
-      }
-    }
+  const loadSequence = useRef(0)
+  function resetPages() {
+    position.value = firstPage()
+    rejectedProfile.current = null
   }
 
-  const loadSequence = useRef(0)
-  async function load() {
+  function offsetReason(authoritative: TableMeta, active: TableFilter[]): string | null {
+    if (nucleusConnection.current) return 'Nucleus uses offset paging; keyset paging currently supports PostgreSQL-direct.'
+    if (active.length > 0 || sorts.value.length > 0 || (initialMatch?.length ?? 0) > 0) return 'Filters, custom sorting and reference matches use offset paging.'
+    const keys = authoritative.columns.filter(c => authoritative.keyColumns.includes(c.name))
+    if (!authoritative.exists || authoritative.keyColumns.length !== 1 || keys.length !== 1 || keys[0].tag !== 'int8') {
+      return 'This table uses offset paging; keyset paging requires one native bigint primary key.'
+    }
+    return null
+  }
+
+  async function load(proposed: PagePosition = position.value) {
     const sequence = ++loadSequence.current
     loading.value = true
     error.value = null
+    const pageLimit = limit.value
+    const active = appliedFilters.value.filter(f => f.column !== '')
+    const pageSorts = [...sorts.value]
     try {
-      const active = appliedFilters.value.filter(f => f.column !== '')
-      const fetched = await api.tableData(
-        conn.id, schemaName, table, limit.value, offset.value,
-        active.length > 0 ? active : undefined,
-        undefined,
-        sorts.value.length > 0 ? sorts.value : undefined,
-        initialMatch,
-      )
-      if (sequence === loadSequence.current) result.value = fetched
+      // Metadata and rows publish together, never old rows under a new shape.
+      const authoritative = await api.tableMeta(conn.id, schemaName, table)
+      if (sequence !== loadSequence.current) return
+      let reason = offsetReason(authoritative, active)
+      let fetched: QueryResult
+      let acceptedPosition = proposed
+      let mode: 'keyset' | 'offset' = reason ? 'offset' : 'keyset'
+      let refused: { binding: string | undefined; reason: string } | null = null
+      if (!reason && rejectedProfile.current && rejectedProfile.current.binding === authoritative.binding) reason = rejectedProfile.current.reason
+      if (!reason) {
+        try {
+          fetched = await api.tablePage(conn.id, schemaName, table, pageLimit, proposed.cursor)
+          if (authoritative.binding && fetched.binding !== authoritative.binding
+            || JSON.stringify(fetched.columns) !== JSON.stringify(authoritative.columns.map(c => c.name))
+            || JSON.stringify(fetched.keyColumns) !== JSON.stringify(authoritative.keyColumns)) {
+            throw new ApiError(409, 'Table metadata changed during the read; refresh rows.')
+          }
+        } catch (err: unknown) {
+          // Only an explicit first-page capability refusal permits fallback.
+          // Authentication, stale cursors, budgets and backend/network failures
+          // never masquerade as an unsupported table or change pagination mode.
+          if (!(err instanceof ApiError) || err.status !== 400 || err.state !== 'unsupported-profile' || proposed.cursor !== '') throw err
+          reason = `Offset paging: ${err.message}`
+          refused = { binding: authoritative.binding, reason }
+          acceptedPosition = firstPage()
+          mode = 'offset'
+        }
+      }
+      if (reason) {
+        mode = 'offset'
+        fetched = await api.tableData(conn.id, schemaName, table, pageLimit, acceptedPosition.offset,
+          active.length > 0 ? active : undefined, undefined, pageSorts.length > 0 ? pageSorts : undefined, initialMatch)
+      }
+      if (sequence === loadSequence.current) {
+        meta.value = authoritative
+        result.value = fetched!
+        position.value = acceptedPosition
+        pagingMode.value = mode
+        pagingReason.value = reason ?? 'Live keyset paging: each page is a new database snapshot; earlier inserts or key edits can be missed.'
+        if (refused) rejectedProfile.current = refused
+      }
     } catch (err: unknown) {
       if (sequence !== loadSequence.current) return
-      error.value = err instanceof Error ? err.message : String(err)
+      error.value = err instanceof ApiError && err.status === 409
+        ? `${err.message} Refresh rows to restart paging; staged drafts are preserved.`
+        : err instanceof Error ? err.message : String(err)
       toast('error', `Failed to load ${table}: ${error.value}`)
     } finally {
       if (sequence === loadSequence.current) loading.value = false
     }
   }
 
+  function refreshRows() {
+    resetPages()
+    load()
+  }
+
   useEffect(() => {
-    loadMeta()
     api.tableFKs(conn.id, schemaName, table)
       .then(r => {
         const map: Record<string, FKDetail> = {}
@@ -160,7 +216,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
   }, [schemaName, table])
 
   const rowsRevision = tableDataRevision.value[conn.id] ?? 0
-  useEffect(() => { load() }, [conn.id, schemaName, table, rowsRevision])
+  useEffect(() => { refreshRows() }, [conn.id, schemaName, table, rowsRevision])
   useEffect(() => () => { loadSequence.current++ }, [])
 
   // Read-only state is AUTHORITATIVE (server catalog): no PK, no row
@@ -176,9 +232,9 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
     return null
   })
   const metaColumns = useComputed(() => meta.value?.columns ?? [])
-  const editable = useComputed(() => (meta.value !== null && !meta.value.readOnly && result.value?.readOnly !== true) || undefined)
+  const editable = useComputed(() => !loading.value && ((meta.value !== null && !meta.value.readOnly && result.value?.readOnly !== true) || undefined))
   const canUpdate = useComputed(() => editable.value === true && metaColumns.value.some(c => c.editable === true))
-  const canDelete = useComputed(() => meta.value?.canDelete === true)
+  const canDelete = useComputed(() => !loading.value && meta.value?.canDelete === true)
 
   /** Build the versioned full-key identity for one row of the current read. */
   function identityFor(rowIndex: number): { key: KeyCell[]; version: string; binding: string } | null {
@@ -223,6 +279,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
     for (const e of stagedHere.value) {
       const op = e.operation
       if (op.op === 'insert') continue
+      if (op.binding !== res.binding) continue // retained draft cannot overlay a replacement relation
       const ks = keyStringOf(op.key ?? [])
       const idx = rowIndexByKey(ks)
       if (idx === undefined) continue // the row is not on this page; the draft survives globally
@@ -249,6 +306,10 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
     if (!edit) return
     const op = edit.operation
     if (op.op === 'insert') return // no row to focus; the bar carries the error
+    if (op.binding !== result.value?.binding) {
+      toast('info', 'The staged row belongs to an earlier table connection; review the draft before committing.')
+      return
+    }
     const idx = rowIndexByKey(keyStringOf(op.key ?? []))
     if (idx === undefined) {
       toast('info', 'the offending row is not on this page — clear or adjust filters to see it')
@@ -386,8 +447,9 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
   }
 
   function setPageSize(n: number) {
+    if (!PAGE_SIZES.includes(n)) return
     limit.value = n
-    offset.value = 0
+    resetPages()
     load()
   }
 
@@ -423,16 +485,29 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
     editable.value === true && (meta.value?.columns ?? []).some(c => c.insertable === true))
 
   function handlePrev() {
-    if (offset.value === 0) return
-    offset.value = Math.max(0, offset.value - limit.value)
-    load()
+    if (loading.value) return
+    const current = position.value
+    if (pagingMode.value === 'keyset') {
+      if (current.previous.length === 0) return
+      load({ ...current, cursor: current.previous[current.previous.length - 1], previous: current.previous.slice(0, -1), ordinal: current.ordinal - 1 })
+    } else {
+      if (current.offset === 0) return
+      load({ ...current, offset: Math.max(0, current.offset - limit.value) })
+    }
   }
 
   function handleNext() {
-    if (!result.value) return
-    if (result.value.rows.length < limit.value) return
-    offset.value = offset.value + limit.value
-    load()
+    if (loading.value || !result.value) return
+    const current = position.value
+    if (pagingMode.value === 'keyset') {
+      const page = result.value as TablePageResult
+      if (!page.hasNext) return
+      const history = [...current.previous, current.cursor]
+      load({ ...current, cursor: page.nextCursor, previous: history.slice(-64), ordinal: current.ordinal + 1, trimmed: current.trimmed || history.length > 64 })
+    } else {
+      if (result.value.rows.length < limit.value) return
+      load({ ...current, offset: current.offset + limit.value })
+    }
   }
 
   function applyFilters() {
@@ -447,14 +522,14 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
       return
     }
     appliedFilters.value = active
-    offset.value = 0
+    resetPages()
     load()
   }
 
   function clearFilters() {
     filters.value = []
     appliedFilters.value = []
-    offset.value = 0
+    resetPages()
     load()
   }
 
@@ -491,7 +566,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
         sorts.value = current.filter((_, i) => i !== idx)
       }
     }
-    offset.value = 0
+    resetPages()
     load()
   }
 
@@ -525,6 +600,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
   const res = result.value
   const shown = res?.rows.length ?? 0
   const stagedCount = stagedHere.value.length
+  const earlierDrafts = stagedHere.value.filter(e => e.operation.binding !== res?.binding).length
   const knownRowCount = res?.totalCount ?? info?.rowCount
   const ordinaryReadOnly = !!readOnlyReason.value && meta.value?.exists === true && !lostWindow.value
 
@@ -577,7 +653,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
               Import…
             </button>
           )}
-          <button class={s.btnRefresh} onClick={load} disabled={loading.value} title="Refresh" aria-label="Refresh rows">
+          <button class={s.btnRefresh} onClick={refreshRows} disabled={loading.value} title="Refresh" aria-label="Refresh rows">
             ↺
           </button>
         </div>
@@ -690,12 +766,12 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
         )}
       </div>
 
-      <div class={s.pagination}>
-        <button class={s.pageBtn} onClick={handlePrev} disabled={offset.value === 0}>
+      <div class={s.pagination} role="navigation" aria-label="Table pages">
+        <button class={s.pageBtn} onClick={handlePrev} disabled={loading.value || (pagingMode.value === 'keyset' ? position.value.previous.length === 0 : position.value.offset === 0)}>
           ← Prev
         </button>
         <span class={s.pageInfo}>
-          {offset.value + 1}–{offset.value + shown}
+          {pagingMode.value === 'keyset' ? <>Page {position.value.ordinal} · {shown} rows</> : <>{position.value.offset + 1}–{position.value.offset + shown}</>}
           {res?.filterCount !== undefined && <> of {res.filterCount.toLocaleString()} filtered</>}
           {res?.totalCount !== undefined && <> · {res.totalCount.toLocaleString()} total</>}
           {stagedCount > 0 && <> · <span class={s.stagedCount}>{stagedCount} staged</span></>}
@@ -703,7 +779,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
         <button
           class={s.pageBtn}
           onClick={handleNext}
-          disabled={!res || res.rows.length < limit.value}
+          disabled={loading.value || !res || (pagingMode.value === 'keyset' ? !(res as TablePageResult).hasNext : res.rows.length < limit.value)}
         >
           Next →
         </button>
@@ -711,12 +787,18 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
           rows per page
           <select
             class={s.filterSelect}
+            aria-label="Rows per page"
             value={String(limit.value)}
             onChange={e => setPageSize(Number((e.target as HTMLSelectElement).value))}
           >
             {PAGE_SIZES.map(n => <option key={n} value={String(n)}>{n}</option>)}
           </select>
         </label>
+        <span class={s.pageInfo} role="status" aria-live="polite">
+          {pagingReason.value}
+          {earlierDrafts > 0 && ' Drafts from an earlier table connection remain staged; review them before committing.'}
+          {pagingMode.value === 'keyset' && position.value.trimmed && ' Previous navigation retains the last 64 pages; refresh to restart.'}
+        </span>
       </div>
 
       {showImport.value && meta.value && (
@@ -726,7 +808,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
           table={table}
           meta={meta.value}
           onClose={closeImport}
-          onImported={load}
+          onImported={refreshRows}
         />
       )}
     </div>
