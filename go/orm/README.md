@@ -12,8 +12,9 @@ or changes `go/nucleus` behavior.
 `db:"column,nullable"`. Qualified identifiers are quoted, including embedded
 quotes; NUL/empty/overlong identifiers are refused. Current scalar support is
 string, bool, int/int32/int64, float32/float64 and time.Time, with nullable
-pointers. Exact decimal, JSON, arrays, domains and custom codecs are not yet
-implemented. Floating-point fields do not promise exact numeric semantics.
+pointers, plus the finite exact `Decimal`, native `UUID` and explicit-document
+`JSON` codecs described below. Arrays, domains and custom codecs still require
+separate qualification. Floating-point fields do not promise exact numeric semantics.
 
 `NewColumn[Model, Value](table, "GoField")` validates that `Value` matches the
 mapped field type. Columns from a distinct table scope cannot be mixed.
@@ -57,9 +58,11 @@ go test ./orm -run TestPostgresCore -count=1 -v
 The live test owns temporary schemas, uses a hostile shadow search_path,
 checks native pgx state and SQLSTATE, exercises typed projections and scoped
 CRUD, and cleans up its schemas. Without the URL it skips by default; required
-live mode fails rather than silently skipping. This first core does not include
-associations, hooks, model tracking, migration/introspection ownership,
-rich codec coverage, or GORM parity.
+live mode fails rather than silently skipping. Additional native suites cover
+owned transactions, bounded composite associations, exact scalar codecs, typed
+inner/left joins and explicit hook workflows. Model tracking, migration and
+introspection ownership, broader codec families and full GORM parity remain
+outside this package's implemented contract.
 
 ## Owned transactions and savepoints
 
@@ -309,3 +312,52 @@ oracles for qualified schemas/composite keys, left NULL versus real zero/false,
 JSON null, ordering/bound filtering/pagination, cardinality, Scope lease cleanup,
 SQLSTATE preservation and swallowed decoder rollback. Required-live mode and a
 disposable PostgreSQL URL remain necessary for native qualification.
+
+
+## Explicit owned hook workflows
+
+Construct `NewHookRepository(table, HookSet[Model]{...})` with immutable copied
+registration slices. `WithHookTransaction(ctx, pool, options, callback)` provides
+an owned `*WriteSession`; call `HookInsert`, `HookUpdate` or `HookDelete` explicitly.
+Borrowed executors and raw SQL never invoke hooks automatically.
+
+Each statement invokes BeforeWrite, its BeforeCreate/BeforeUpdate/BeforeDelete
+hooks, the validated core write, its AfterCreate/AfterUpdate/AfterDelete hooks,
+then AfterWrite. Registration order is preserved. Updates and deletes invoke
+statement hooks once, reporting the actual affected count including zero;
+there is no implicit per-row model loading. Insert events contain the INSERT
+RETURNING snapshot, which may differ from the final row after extra hook SQL.
+
+Before hooks receive a read-only `WriteIntent`. `InspectHookValue(intent, column)`
+returns a detached typed value and omission/supplied/default mode; it never
+replaces assignments or predicates. Each after/commit hook receives a detached
+model snapshot. Hooks can execute explicit extra SQL through their callback's
+`*HookContext` Executor. It enforces the owning Scope's native leases and
+cancellation; background operation contexts cannot bypass callback cancellation.
+The capability becomes terminal when its callback returns. Callback contexts
+and the session expose no raw native connection or transaction controls.
+
+Initial SQL/metadata validation happens before hooks and may be recovered by the
+application. Any error, panic, cancellation, ignored reentry or result decode
+failure after a workflow starts requires rollback even if the application
+swallows it. Captured-session reentry returns ErrHookReentry; overlapping session
+operations return ErrHookBusy. No mutex is held across user callbacks and no
+Go goroutine identity is inferred. Callbacks must join their goroutines and
+close results before returning; active rows/operations are treated as leaks.
+An arbitrary callback that ignores its context cannot be forcibly terminated.
+
+`session.Savepoint(ctx, callback)` creates an owned child write session.
+Successful child rollback drops its notification queue and allows the parent to
+resume. Events merge into the parent's statement order only after native RELEASE
+succeeds. Cleanup failure retains the Scope's whole-transaction discard policy.
+
+After PostgreSQL acknowledges COMMIT, the connection is released and the session
+is terminal before queued AfterCommit hooks run synchronously in statement and
+registration order. DispatchTimeout defaults to five seconds and cooperatively
+bounds dispatch; the first error stops subsequent callbacks. Errors return
+`CommittedDispatchError`; panics propagate as `CommittedHookPanic`. Both explicitly
+mean the database committed and side effects may be partial. Rejection, rollback
+and indeterminate COMMIT never dispatch. Nothing retries writes or notifications;
+crashes and lost acknowledgements require application reconciliation or a durable
+outbox. This is not exactly-once or durable notification delivery. Hook closures
+and external shared state remain application-owned synchronization responsibilities.
