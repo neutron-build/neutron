@@ -330,3 +330,12 @@ compose from left to right. Apply final limit/offset after composition; exact-on
 APIs reject pagination as usual. Set-result ordering by output labels and broader
 aggregate/window expression families require a subsequent API; raw source
 ordering over a set result refuses.
+
+Read queries become owned projected sources with `derived(query, name,
+labels=('id', ...))` or `cte(query, name, labels=...)`. Labels must uniquely cover
+all projected fields; callers retrieve columns with their declared native type
+and nullability. Derived/CTE writes and mapped persistence refuse. Sources must
+be uncorrelated: lateral sources and recursive CTEs require separate contracts.
+Their binds precede enclosing WHERE binds in SQL occurrence order. CTE source
+columns are explicitly named, preventing internal projection aliases leaking
+into the consumer's metadata.

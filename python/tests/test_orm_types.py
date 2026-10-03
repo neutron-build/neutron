@@ -127,3 +127,12 @@ def static_aggregate_consumer(db: Database) -> None:
     assert_type(db.all(query_from(t).select(row_number(t))),list[int])
     q=query_from(t).select(field(col))
     assert_type(db.all(q.union(q)),list[int])
+
+from neutron.orm import cte,derived
+
+def static_derived_consumer(db: Database) -> None:
+    t=Table('t',{'id':ColumnSpec(int,'int4')});q=query_from(t).select(field(t.column('id',int)))
+    projected=derived(q,'projected',labels=('id',))
+    assert_type(db.all(query_from(projected).select(field(projected.column('id',int)))),list[int])
+    named=cte(q,'named',labels=('id',))
+    assert_type(db.all(query_from(named).select(field(named.column('id',int)))),list[int])

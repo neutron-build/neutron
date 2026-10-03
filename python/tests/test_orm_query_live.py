@@ -84,3 +84,17 @@ def test_native_promoted_aggregate_group_window_and_set_oracle(live_table):
         assert db.all(first.intersect(second))==[1]
         assert db.all(second.except_(first))==[2]
         assert sorted(db.all(query_from(t).select(field(group)).distinct()))==[1,2]
+
+
+def test_native_derived_and_cte_projection_bind_oracle(live_table):
+    from neutron.orm import cte,derived
+    url,parent,native=live_table
+    native.execute(f'INSERT INTO {parent.sql}(id) VALUES (1),(2),(3)')
+    col=parent.column('id',int)
+    source=query_from(parent).select(field(col)).where(col.in_([1,3]))
+    with Database.connect(url) as db:
+        for factory in (derived,cte):
+            projected=factory(source,'result%s',labels=('identity',))
+            key=projected.column('identity',int)
+            q=query_from(projected).select(field(key)).where(key.eq(3))
+            assert db.all(q)==[row[0] for row in native.execute(f'SELECT id FROM {parent.sql} WHERE id IN (%s,%s) AND id=%s',(1,3,3)).fetchall()]==[3]

@@ -83,3 +83,20 @@ def test_promoted_aggregate_empty_window_group_and_set_contracts():
     assert 'SELECT DISTINCT' in first.distinct().compile().sql
     with pytest.raises(ValueError): first.union(query_from(a).select_pair(field(aid),field(aid)))
     with pytest.raises(ValueError): first.union(query_from(a).select(max_value(aid)))
+
+
+def test_derived_and_cte_projection_ownership_labels_and_parameter_order():
+    from neutron.orm import cte,derived,insert
+    a,_=tables();aid=a.column('id',int)
+    source=query_from(a).select(field(aid)).where(aid.eq(7))
+    for factory in (derived,cte):
+        projected=factory(source,'result%s',labels=('key',));key=projected.column('key',int)
+        compiled=query_from(projected).select(field(key)).where(key.eq(9)).compile()
+        assert compiled.params==(7,9)
+        assert '"result%%s"."key"' in compiled.sql
+        if factory is cte: assert compiled.sql.startswith('WITH "result%%s" ("key") AS (')
+        with pytest.raises(ValueError): insert(projected,{'key':1})
+        with pytest.raises(KeyError): projected.column('missing',int)
+        with pytest.raises(ValueError): query_from(a).select(field(key)).compile()
+    with pytest.raises(ValueError): derived(source,'bad',labels=())
+    with pytest.raises(ValueError): derived(query_from(a).select_pair(field(aid),field(aid)),'bad',labels=('x','x'))

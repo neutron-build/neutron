@@ -89,6 +89,9 @@ class Table:
     @property
     def _bound_reference(self) -> str: return self._bound_sql
 
+    @property
+    def _source_params(self) -> tuple[object,...]: return ()
+
     def column(self, name: str, python_type: type[T]) -> Column[T]:
         column = self.columns[name]
         if column.spec.python_type is not python_type or column.spec.nullable: raise ValueError('column type/nullability mismatch; use nullable_column for nullable fields')

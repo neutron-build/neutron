@@ -36,3 +36,6 @@ __all__ += ["alias","exists","in_query"]
 
 from .query import Aggregate, RowNumber, avg, count, max_value, min_value, row_number, sum_value
 __all__ += ["Aggregate","RowNumber","avg","count","max_value","min_value","row_number","sum_value"]
+
+from .query import cte, derived
+__all__ += ["cte","derived"]

@@ -125,6 +125,8 @@ class Query(Generic[T]):
     def _set(self,operator: str,other: Query[T]) -> Query[T]:
         if self.ordering or self.row_limit is not None or self.row_offset is not None:
             raise ValueError('apply set operations before final ordering/pagination')
+        if isinstance(other,Query) and self.scope.correlated!=other.scope.correlated:
+            raise ValueError('set operations require identical correlation scopes')
         if not isinstance(other,Query) or len(self.fields)!=len(other.fields):
             raise ValueError('set-operation projection arity mismatch')
         if any(a.result_spec!=b.result_spec for a,b in zip(self.fields,other.fields)):
@@ -191,10 +193,10 @@ class Query(Generic[T]):
         if type(self.distinct_rows) is not bool: raise ValueError('DISTINCT requires a boolean')
         sql = ('SELECT DISTINCT ' if self.distinct_rows else 'SELECT ') + ', '.join(f'{item.expression_sql} AS {_bound_quote("p" + str(i))}' for i, item in enumerate(self.fields))
         sql += ' FROM ' + self.scope.table._bound_sql
-        params: tuple[object, ...] = ()
+        params: tuple[object, ...] = self.scope.table._source_params
         for join in self.scope.joins:
             sql += (' LEFT JOIN ' if join.left else ' INNER JOIN ') + join.table._bound_sql + ' ON ' + join.condition.sql
-            params += join.condition.params
+            params += join.table._source_params + join.condition.params
         if self.predicate is not None:
             self.where(self.predicate)
             sql += ' WHERE ' + self.predicate.sql
@@ -213,6 +215,14 @@ class Query(Generic[T]):
             _count(self.row_limit); sql += ' LIMIT %s'; params += (self.row_limit,)
         if self.row_offset is not None:
             _count(self.row_offset); sql += ' OFFSET %s'; params += (self.row_offset,)
+        definitions=[];definition_params: tuple[object,...]=()
+        for table in (self.scope.table,*(join.table for join in self.scope.joins)):
+            if isinstance(table,CteTable):
+                compiled=table.source_query.compile()
+                definitions.append(_bound_quote(table.name)+' ('+', '.join(_bound_quote(label) for label in table.labels)+') AS ('+compiled.sql+')')
+                definition_params+=compiled.params
+        if definitions:
+            sql='WITH '+', '.join(definitions)+' '+sql;params=definition_params+params
         return Compiled(sql, params, self.decoder)
 
 
@@ -240,7 +250,7 @@ def alias(table: Table,name: str) -> Table:
 
 
 def _source_key(table: Table) -> tuple[str,...]:
-    return ('alias',table.name) if isinstance(table,AliasedTable) else ('physical',table.schema,table.name)
+    return ('alias',table.name) if isinstance(table,(AliasedTable,DerivedTable,CteTable)) else ('physical',table.schema,table.name)
 
 
 def exists(query: Query[Any]) -> Predicate:
@@ -334,3 +344,43 @@ class RowNumber(Field[int]):
 
 def row_number(table: Table,*,partition_by: tuple[Column[Any], ...]=(),order_by: tuple[Order, ...]=()) -> RowNumber:
     return RowNumber(next(iter(table.columns.values())),partition=partition_by,orders=order_by)
+
+
+class DerivedTable(Table):
+    """Read-only projected query source with owned result column labels."""
+    def __init__(self,query: Query[Any],name: str,labels: tuple[str,...]) -> None:
+        if not isinstance(query,Query) or query.scope.correlated:
+            raise ValueError('derived/CTE sources require an uncorrelated typed query')
+        if len(labels)!=len(query.fields) or len(set(labels))!=len(labels):
+            raise ValueError('derived labels must uniquely cover the projection')
+        query.compile() # Validate source before exposing metadata.
+        super().__init__(name,{label:item.result_spec for label,item in zip(labels,query.fields)})
+        object.__setattr__(self,'source_query',query)
+        object.__setattr__(self,'labels',labels)
+
+    @property
+    def _bound_sql(self) -> str:
+        compiled=self.source_query.compile()
+        return '('+compiled.sql+') AS '+_bound_quote(self.name)+' ('+', '.join(_bound_quote(label) for label in self.labels)+')'
+
+    @property
+    def _bound_reference(self) -> str: return _bound_quote(self.name)
+
+    @property
+    def _source_params(self) -> tuple[object,...]: return self.source_query.compile().params
+
+
+class CteTable(DerivedTable):
+    @property
+    def _bound_sql(self) -> str: return _bound_quote(self.name)
+
+    @property
+    def _source_params(self) -> tuple[object,...]: return ()
+
+
+def derived(query: Query[Any],name: str,*,labels: tuple[str,...]) -> Table:
+    return DerivedTable(query,name,labels)
+
+
+def cte(query: Query[Any],name: str,*,labels: tuple[str,...]) -> Table:
+    return CteTable(query,name,labels)
