@@ -239,8 +239,14 @@ func (s *Server) handleTablePageV2(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	// Actual HTTP sockets enforce the same budget while a client sends its
 	// body; test recorders do not implement deadlines.
-	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(5 * time.Second))
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(5 * time.Second))
+	controller := http.NewResponseController(w)
+	_ = controller.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = controller.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	defer func() {
+		// Deadlines belong to this request, not a later keep-alive request.
+		_ = controller.SetReadDeadline(time.Time{})
+		_ = controller.SetWriteDeadline(time.Time{})
+	}()
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, pageBodyBytes))
 	if err != nil {
 		writeError(w, 400, "page body exceeds 32 KiB or is unreadable")
