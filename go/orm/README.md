@@ -662,7 +662,7 @@ go test ./orm -run 'Test(RangeNative|FiniteTemporal|PostgresRangesAndFinite)' -c
 write-capable metadata: mapped types and nullability must match the accepted OID
 matrix. Domains retain their native identity and constraints while their base
 codec is qualified; `Enum` preserves exact labels with native membership checks.
-Unknown composites/custom base OIDs, enum-as-string, numeric-as-float and wrong
+Unqualified composites/custom base OIDs, enum-as-string, numeric-as-float and wrong
 range subtypes refuse with schema/table/column/type/OID identity before any
 mutation. No DDL, registry changes or search_path assumptions occur. This is
 point-in-time metadata for that database: rebuild it after DDL. Database-free
@@ -814,4 +814,25 @@ requirements. The native fixture requires a PostgreSQL image with pgvector.
 
 ```sh
 go test ./orm -run 'Test(VectorImmutable|PostgresExtensionQualifiedVector)' -count=1 -v
+```
+
+`Composite` preserves an ordered native record as immutable nullable field text.
+It retains int64 and arbitrary numeric precision without float conversion, and
+keeps empty text, field NULL, an all-NULL record and whole-column SQL NULL distinct.
+Constructors/accessors copy the field slice; the record parser handles native
+quoting/backslash escaping with 256-field and 1 MiB text bounds. A nullable mapped
+`*Composite` represents whole-column SQL NULL. PostgreSQL validates field arity
+and field input types on writes, rather than the ORM guessing a Go struct.
+
+`NewPostgresTable` admits actual composite catalog types only when every field
+has a qualified bool, integer, text/varchar/bpchar, numeric, UUID, JSON/JSONB or
+bytea native OID. Field domains, enums, nested records, arrays, floats and temporal
+fields refuse this record-text profile; callers can use separately explicit
+`SQLValue` contracts for custom semantics. This is structured field-text storage,
+not typed Go struct field projection or composite query operators. The generator
+emits Composite columns. Qualification and values never install codecs into the
+caller's pgx registry or alter protocol settings.
+
+```sh
+go test ./orm -run 'Test(CompositeExact|PostgresBoundedComposite)' -count=1 -v
 ```

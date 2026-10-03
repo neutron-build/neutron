@@ -57,6 +57,7 @@ type catalogCodec struct {
 	oid, base, element uint32
 	schema, name, kind string
 	extension          string
+	composite          bool
 	required           bool
 }
 
@@ -161,6 +162,31 @@ func NewPostgresTable[M any](ctx context.Context, db Executor, schema, name stri
 				return Table[M]{}, wrap("qualify extension", err)
 			}
 		}
+		if typ == reflect.TypeOf(Composite{}) && base.kind == "c" {
+			fieldRows, err := db.Query(ctx, `SELECT a.atttypid FROM pg_catalog.pg_type t JOIN pg_catalog.pg_attribute a ON a.attrelid=t.typrelid WHERE t.oid=$1 AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum`, base.oid)
+			if err != nil {
+				return Table[M]{}, wrap("qualify composite", err)
+			}
+			count, admitted := 0, true
+			for fieldRows.Next() {
+				var oid uint32
+				if err = fieldRows.Scan(&oid); err != nil {
+					break
+				}
+				count++
+				if count > MaxCompositeFields || !qualifiedCompositeField(oid) {
+					admitted = false
+				}
+			}
+			fieldRows.Close()
+			if err != nil {
+				return Table[M]{}, wrap("qualify composite", err)
+			}
+			if err := fieldRows.Err(); err != nil {
+				return Table[M]{}, wrap("qualify composite", err)
+			}
+			base.composite = admitted && count > 0
+		}
 		table.info.catalogOIDs[fieldIndex] = []uint32{codec.oid, base.oid}
 		if !qualifiedCatalogCodec(typ, base) {
 			if contract, ok := custom[fieldIndex]; ok && codec.oid == contract.oid && codec.schema == contract.typeSchema && codec.name == contract.typeName {
@@ -173,6 +199,9 @@ func NewPostgresTable[M any](ctx context.Context, db Executor, schema, name stri
 }
 
 func qualifiedCatalogCodec(t reflect.Type, c catalogCodec) bool {
+	if t == reflect.TypeOf(Composite{}) {
+		return c.kind == "c" && c.composite && c.oid != 0
+	}
 	if t == reflect.TypeOf(Vector{}) {
 		return c.kind == "b" && c.extension == "vector" && c.name == "vector" && c.oid != 0
 	}
@@ -245,6 +274,16 @@ func qualifiedCatalogCodec(t reflect.Type, c catalogCodec) bool {
 		return c.oid == pgtype.Float4OID
 	case reflect.Float64:
 		return c.oid == pgtype.Float4OID || c.oid == pgtype.Float8OID
+	}
+	return false
+}
+
+// Only session-independent native field text families are admitted. Nested,
+// domain, enum, array, float and temporal fields need separate qualification.
+func qualifiedCompositeField(oid uint32) bool {
+	switch oid {
+	case pgtype.BoolOID, pgtype.Int2OID, pgtype.Int4OID, pgtype.Int8OID, pgtype.TextOID, pgtype.VarcharOID, pgtype.BPCharOID, pgtype.NumericOID, pgtype.UUIDOID, pgtype.JSONOID, pgtype.JSONBOID, pgtype.ByteaOID:
+		return true
 	}
 	return false
 }
