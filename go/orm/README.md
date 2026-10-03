@@ -673,3 +673,18 @@ claim typed composite, network, pgvector or multirange support.
 ```sh
 go test ./orm -run 'Test(CatalogCodecMatrix|PostgresCatalogEnumDomain)' -count=1 -v
 ```
+
+`SQLValue[T]` adapts explicit database/sql Scanner+Valuer implementations. It
+freezes native driver values, detaches binary buffers, and reconstructs `T` only
+on explicit `Decode`; mutable custom objects cannot change earlier assignments.
+Nonnullable adapters reject Valuer SQL NULL and zero values. `CodecFor[M,T]`
+pins a mapped field to exact native schema/name/OID; pass that contract to
+`NewPostgresTable` to admit a custom type. Missing/wrong contracts refuse before
+mutation. Codec authors own semantic fidelity; supplying a contract does not
+certify an arbitrary parser. The tested opaque composite adapter preserves
+native text and int64 precision without claiming structured composite mapping.
+Native decode failures retain owned Scope rollback guarantees.
+
+```sh
+go test ./orm -run 'Test(CustomScanner|PostgresExplicitCustom)' -count=1 -v
+```

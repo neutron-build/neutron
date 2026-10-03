@@ -64,13 +64,28 @@ type catalogCodec struct {
 // changes the caller's registry or protocol. Qualification is a point-in-time
 // contract for this database; migrations must reconstruct metadata after DDL.
 // NewTable remains database-free reflection metadata and is not this certificate.
-func NewPostgresTable[M any](ctx context.Context, db Executor, schema, name string) (Table[M], error) {
+func NewPostgresTable[M any](ctx context.Context, db Executor, schema, name string, contracts ...CodecContract[M]) (Table[M], error) {
 	table, err := NewTable[M](schema, name)
 	if err != nil {
 		return Table[M]{}, err
 	}
 	if err := ready(ctx, db); err != nil {
 		return Table[M]{}, err
+	}
+	custom := map[int]CodecContract[M]{}
+	for _, contract := range contracts {
+		i, ok := table.info.byGoName[contract.field]
+		if !ok {
+			return Table[M]{}, fmt.Errorf("orm: codec contract field missing")
+		}
+		typ := table.info.fields[i].typ
+		if typ.Kind() == reflect.Pointer {
+			typ = typ.Elem()
+		}
+		if _, exists := custom[i]; exists || typ != contract.typ || contract.oid == 0 {
+			return Table[M]{}, fmt.Errorf("orm: codec contract type/field conflict")
+		}
+		custom[i] = contract
 	}
 	rows, err := db.Query(ctx, `SELECT a.attname,a.atttypid,a.attnotnull,t.typbasetype,t.typelem,n.nspname,t.typname,t.typtype::text,t.typnotnull FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid=a.attrelid JOIN pg_catalog.pg_namespace s ON s.oid=c.relnamespace JOIN pg_catalog.pg_type t ON t.oid=a.atttypid JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace WHERE s.nspname=$1 AND c.relname=$2 AND c.relkind IN ('r','p','v','m','f') AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum`, schema, name)
 	if err != nil {
@@ -93,7 +108,7 @@ func NewPostgresTable[M any](ctx context.Context, db Executor, schema, name stri
 	if err := rows.Err(); err != nil {
 		return Table[M]{}, wrap("qualify codecs", err)
 	}
-	for _, field := range table.info.fields {
+	for fieldIndex, field := range table.info.fields {
 		codec, ok := catalog[field.name]
 		if !ok {
 			return Table[M]{}, fmt.Errorf("orm: mapped catalog column %s is absent", quote(field.name))
@@ -129,6 +144,9 @@ func NewPostgresTable[M any](ctx context.Context, db Executor, schema, name stri
 			typ = typ.Elem()
 		}
 		if !qualifiedCatalogCodec(typ, base) {
+			if contract, ok := custom[fieldIndex]; ok && codec.oid == contract.oid && codec.schema == contract.typeSchema && codec.name == contract.typeName {
+				continue
+			}
 			return Table[M]{}, &CodecError{schema, name, field.name, codec.schema, codec.name, codec.oid}
 		}
 	}
