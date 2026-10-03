@@ -123,7 +123,10 @@ class Query(Generic[T]):
             self.where(self.predicate)
             sql += ' WHERE ' + self.predicate.sql
             params += self.predicate.params
-        for order in self.ordering: self._owned(order.column)
+        for order in self.ordering:
+            if not isinstance(order, Order) or type(order.descending) is not bool or type(order.nulls_first) is not bool:
+                raise ValueError('ordering requires explicit boolean direction/null placement')
+            self._owned(order.column)
         if self.ordering:
             sql += ' ORDER BY ' + ', '.join(order.column._bound_sql + (' DESC' if order.descending else ' ASC') + (' NULLS FIRST' if order.nulls_first else ' NULLS LAST') for order in self.ordering)
         if self.row_limit is not None:

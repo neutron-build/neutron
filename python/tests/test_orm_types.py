@@ -41,5 +41,6 @@ def static_join_negative_contract(db: Database) -> None:
     a=Table('a',{'id':ColumnSpec(int,'int4')})
     b=Table('b',{'id':ColumnSpec(int,'int4')})
     scope=query_from(a).left_join(b,on=a.column('id',int).eq(b.column('id',int)))
-    nonnullable: list[int] = db.all(scope.select(outer_field(b.column('id',int))))  # type: ignore[assignment]
+    nullable_result = db.all(scope.select(outer_field(b.column('id',int))))
+    nonnullable: list[int] = nullable_result  # type: ignore[assignment]
     a.column('id',int).eq('wrong')  # type: ignore[arg-type]
