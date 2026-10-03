@@ -6,7 +6,7 @@ SQL, Key-Value, Columnar, Vector, Timeseries, Document, Full-Text Search, Graph,
 
 Current size, re-measured by `scripts/metrics.sh` on every doc check:
 360,491 lines of Rust across 315 files, with 5,438 declared tests
-(4,925 unit + 459 integration). Declared counts are static declarations, not
+(5,153 unit + 460 integration). Declared counts are static declarations, not
 executed-run claims; the current full library run is recorded in
 [DATABASE_COMPLETION.md](DATABASE_COMPLETION.md).
 
