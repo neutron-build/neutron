@@ -759,3 +759,18 @@ self cycles and inferred cascading remain separate unsupported graph plans.
 ```sh
 go test ./orm -run 'Test(NullableRelation|PostgresNullableRelation)' -count=1 -v
 ```
+
+`NewUniqueConstraint` verifies an exact qualified native nondeferred UNIQUE/PK
+column contract. `ConnectOrCreateNullable` uses explicit non-NULL key assignments
+and create values under a bounded operation savepoint. It locks the parent,
+looks up a child, creates if missing, and recovers exactly one race on that named
+schema/table/constraint using an isolated insert savepoint and fresh lookup.
+Other constraints/hook errors refuse; existing different owners refuse rather
+than overwrite. Failed create events are discarded; only the released create or
+connect event reaches AfterCommit. Five core statements cover the worst race
+path; metadata qualification and transaction controls are separate overhead.
+Constraint/codec metadata is point-in-time and must be rebuilt after DDL.
+
+```sh
+go test ./orm -run 'Test(ConnectCreateNatural|PostgresNullableConnectCreate)' -count=1 -v
+```
