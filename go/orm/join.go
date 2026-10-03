@@ -17,8 +17,9 @@ type Nullable[T any] struct {
 }
 
 type joinedBinding[P, C any] struct {
-	relation Relation[P, C]
-	left     bool
+	relation                Relation[P, C]
+	left                    bool
+	parentAlias, childAlias string
 }
 
 // JoinedScope is sealed to validated InnerJoin/LeftJoin handles in this package.
@@ -38,11 +39,11 @@ func newJoinedBinding[P, C any](relation Relation[P, C], left bool) (*joinedBind
 	if parent.schema == child.schema && parent.name == child.name {
 		return nil, fmt.Errorf("orm: duplicate physical join table requires an explicit alias API, which is unsupported")
 	}
-	return &joinedBinding[P, C]{validated, left}, nil
+	return &joinedBinding[P, C]{relation: validated, left: left}, nil
 }
 
 // NewInnerJoin joins two distinct qualified physical tables using exact typed
-// relation keys. Explicit aliases, self joins and custom raw ON are unsupported.
+// relation keys. Use NewAliasedInnerJoin for aliases/self joins.
 func NewInnerJoin[P, C any](relation Relation[P, C]) (InnerJoin[P, C], error) {
 	binding, err := newJoinedBinding(relation, false)
 	return InnerJoin[P, C]{binding}, err
@@ -54,6 +55,34 @@ func NewLeftJoin[P, C any](relation Relation[P, C]) (LeftJoin[P, C], error) {
 	return LeftJoin[P, C]{binding}, err
 }
 
+func newAliasedBinding[P, C any](relation Relation[P, C], left bool, parentAlias, childAlias string) (*joinedBinding[P, C], error) {
+	validated, err := NewRelation(relation.parent, relation.child, relation.parts...)
+	if err != nil {
+		return nil, err
+	}
+	if err := identifier(parentAlias); err != nil {
+		return nil, err
+	}
+	if err := identifier(childAlias); err != nil {
+		return nil, err
+	}
+	if parentAlias == childAlias {
+		return nil, fmt.Errorf("orm: join aliases must differ")
+	}
+	return &joinedBinding[P, C]{relation: validated, left: left, parentAlias: parentAlias, childAlias: childAlias}, nil
+}
+
+// NewAliasedInnerJoin explicitly distinguishes parent/child roles, including
+// self relations using the same Table metadata. Aliases are quoted identifiers.
+func NewAliasedInnerJoin[P, C any](relation Relation[P, C], parentAlias, childAlias string) (InnerJoin[P, C], error) {
+	binding, err := newAliasedBinding(relation, false, parentAlias, childAlias)
+	return InnerJoin[P, C]{binding}, err
+}
+func NewAliasedLeftJoin[P, C any](relation Relation[P, C], parentAlias, childAlias string) (LeftJoin[P, C], error) {
+	binding, err := newAliasedBinding(relation, true, parentAlias, childAlias)
+	return LeftJoin[P, C]{binding}, err
+}
+
 // JoinedField retains scalar and model ownership at compile time and the exact
 // join/table binding at runtime. Fields from another equally named scope fail.
 type JoinedField[P, C, T any] struct {
@@ -61,6 +90,7 @@ type JoinedField[P, C, T any] struct {
 	info        *modelInfo
 	field       fieldInfo
 	outer       bool
+	child       bool
 	destination func(*T, bool) any
 }
 
@@ -87,7 +117,9 @@ func InnerChildField[P, C, T any](scope InnerJoin[P, C], column Column[C, T]) (J
 	if binding == nil || column.info != binding.relation.child.info {
 		return zero, fmt.Errorf("orm: child projection outside join binding")
 	}
-	return plainJoinedField[P, C](binding, Column[any, T]{column.info, column.field}), nil
+	field := plainJoinedField[P, C](binding, Column[any, T]{column.info, column.field})
+	field.child = true
+	return field, nil
 }
 
 // LeftChildField always wraps the right value as Nullable[T], including when
@@ -98,7 +130,7 @@ func LeftChildField[P, C, T any](scope LeftJoin[P, C], column Column[C, T]) (Joi
 	if binding == nil || column.info != binding.relation.child.info {
 		return zero, fmt.Errorf("orm: child projection outside join binding")
 	}
-	return JoinedField[P, C, Nullable[T]]{binding: binding, info: column.info, field: column.field, outer: true, destination: func(value *Nullable[T], sqlNull bool) any {
+	return JoinedField[P, C, Nullable[T]]{binding: binding, info: column.info, field: column.field, outer: true, child: true, destination: func(value *Nullable[T], sqlNull bool) any {
 		if sqlNull {
 			*value = Nullable[T]{}
 			return nil
@@ -109,8 +141,9 @@ func LeftChildField[P, C, T any](scope LeftJoin[P, C], column Column[C, T]) (Joi
 }
 
 type joinedFilter struct {
-	info *modelInfo
-	expr *expression
+	info  *modelInfo
+	expr  *expression
+	child bool
 }
 type joinedOrder struct {
 	info       *modelInfo
@@ -137,7 +170,7 @@ func (q JoinQuery[P, C]) WhereParent(predicate Predicate[P]) JoinQuery[P, C] {
 	if q.binding != nil {
 		info = q.binding.relation.parent.info
 	}
-	q.filters = append(append([]joinedFilter(nil), q.filters...), joinedFilter{info, predicate.expr})
+	q.filters = append(append([]joinedFilter(nil), q.filters...), joinedFilter{info, predicate.expr, false})
 	return q
 }
 func (q JoinQuery[P, C]) WhereChild(predicate Predicate[C]) JoinQuery[P, C] {
@@ -145,7 +178,7 @@ func (q JoinQuery[P, C]) WhereChild(predicate Predicate[C]) JoinQuery[P, C] {
 	if q.binding != nil {
 		info = q.binding.relation.child.info
 	}
-	q.filters = append(append([]joinedFilter(nil), q.filters...), joinedFilter{info, predicate.expr})
+	q.filters = append(append([]joinedFilter(nil), q.filters...), joinedFilter{info, predicate.expr, true})
 	return q
 }
 func (q JoinQuery[P, C]) OrderParent(order ...Order[P]) JoinQuery[P, C] {
@@ -180,6 +213,7 @@ type joinedProjection struct {
 	info  *modelInfo
 	field fieldInfo
 	outer bool
+	child bool
 }
 
 func joinedSQL[P, C any](q JoinQuery[P, C], fields []joinedProjection) (string, []any, error) {
@@ -193,32 +227,55 @@ func joinedSQL[P, C any](q JoinQuery[P, C], fields []joinedProjection) (string, 
 	if parent == nil || child == nil {
 		return "", nil, fmt.Errorf("orm: uninitialized join tables")
 	}
+	qualify := func(right bool, field fieldInfo) string {
+		info, alias := parent, q.binding.parentAlias
+		if right {
+			info, alias = child, q.binding.childAlias
+		}
+		if alias != "" {
+			return quote(alias) + "." + quote(field.name)
+		}
+		return qualifiedColumn(info, field)
+	}
 	columns := make([]string, len(fields))
 	for i, f := range fields {
-		if f.info != parent && f.info != child {
+		expected := parent
+		if f.child {
+			expected = child
+		}
+		if f.info != expected {
 			return "", nil, fmt.Errorf("orm: projection outside join tables")
 		}
-		if f.outer != (q.binding.left && f.info == child) {
+		if f.outer != (q.binding.left && f.child) {
 			return "", nil, fmt.Errorf("orm: left child projection requires Nullable wrapper only on the right")
 		}
-		columns[i] = qualifiedColumn(f.info, f.field)
+		columns[i] = qualify(f.child, f.field)
 	}
 	parts := make([]string, len(q.binding.relation.parts))
 	for i, p := range q.binding.relation.parts {
-		parts[i] = qualifiedColumn(parent, p.parentField) + " = " + qualifiedColumn(child, p.childField)
+		parts[i] = qualify(false, p.parentField) + " = " + qualify(true, p.childField)
 	}
 	kind := " INNER JOIN "
 	if q.binding.left {
 		kind = " LEFT JOIN "
 	}
-	sql := "SELECT " + strings.Join(columns, ", ") + " FROM " + parent.sqlName() + kind + child.sqlName() + " ON (" + strings.Join(parts, " AND ") + ")"
+	parentSQL, childSQL := parent.sqlName(), child.sqlName()
+	if q.binding.parentAlias != "" {
+		parentSQL += " AS " + quote(q.binding.parentAlias)
+		childSQL += " AS " + quote(q.binding.childAlias)
+	}
+	sql := "SELECT " + strings.Join(columns, ", ") + " FROM " + parentSQL + kind + childSQL + " ON (" + strings.Join(parts, " AND ") + ")"
 	args := []any{}
 	where := make([]string, len(q.filters))
 	for i, filter := range q.filters {
-		if filter.info != parent && filter.info != child {
+		expected := parent
+		if filter.child {
+			expected = child
+		}
+		if filter.info != expected {
 			return "", nil, fmt.Errorf("orm: predicate outside join tables")
 		}
-		rendered, err := renderPredicateColumns(filter.info, filter.expr, &args, func(field fieldInfo) string { return qualifiedColumn(filter.info, field) })
+		rendered, err := renderPredicateColumns(filter.info, filter.expr, &args, func(field fieldInfo) string { return qualify(filter.child, field) })
 		if err != nil {
 			return "", nil, err
 		}
@@ -240,7 +297,7 @@ func joinedSQL[P, C any](q JoinQuery[P, C], fields []joinedProjection) (string, 
 		if o.descending {
 			direction = " DESC"
 		}
-		order[i] = qualifiedColumn(o.info, o.order) + direction + o.nulls
+		order[i] = qualify(o.child, o.order) + direction + o.nulls
 	}
 	if len(order) > 0 {
 		sql += " ORDER BY " + strings.Join(order, ", ")
@@ -273,7 +330,7 @@ func SelectJoinedColumn[P, C, T any](ctx context.Context, db Executor, field Joi
 	if err := validateJoinedField(query, field); err != nil {
 		return nil, wrap("join project", err)
 	}
-	sql, args, err := joinedSQL(query, []joinedProjection{{field.info, field.field, field.outer}})
+	sql, args, err := joinedSQL(query, []joinedProjection{{field.info, field.field, field.outer, field.child}})
 	if err != nil {
 		return nil, wrap("join project", err)
 	}
@@ -308,7 +365,7 @@ func SelectJoinedPair[P, C, A, B any](ctx context.Context, db Executor, first Jo
 			return nil, wrap("join pair", err)
 		}
 	}
-	sql, args, err := joinedSQL(query, []joinedProjection{{first.info, first.field, first.outer}, {second.info, second.field, second.outer}})
+	sql, args, err := joinedSQL(query, []joinedProjection{{first.info, first.field, first.outer, first.child}, {second.info, second.field, second.outer, second.child}})
 	if err != nil {
 		return nil, wrap("join pair", err)
 	}

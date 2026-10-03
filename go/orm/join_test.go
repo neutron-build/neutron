@@ -34,7 +34,7 @@ func TestJoinedQualifiedBoundComposition(t *testing.T) {
 	}
 	base := scope.Query().WhereParent(parentTenant.Eq("a' OR true--")).OrderParent(parentID.Asc())
 	query := base.WhereChild(childID.Gt(0)).OrderChild(childID.Desc()).Limit(0).Offset(0)
-	sql, args, err := joinedSQL(query, []joinedProjection{{first.info, first.field, first.outer}, {second.info, second.field, second.outer}})
+	sql, args, err := joinedSQL(query, []joinedProjection{{first.info, first.field, first.outer, first.child}, {second.info, second.field, second.outer, second.child}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestJoinedLeftNullableProjectionPolicy(t *testing.T) {
 		t.Fatal("outer SQLNULL not reset")
 	}
 	// Compiler revalidates private AST invariants even for internal construction.
-	if _, _, err := joinedSQL(scope.Query(), []joinedProjection{{field.info, field.field, false}}); err == nil {
+	if _, _, err := joinedSQL(scope.Query(), []joinedProjection{{field.info, field.field, false, field.child}}); err == nil {
 		t.Fatal("nonnullable left child projection accepted")
 	}
 }
@@ -149,14 +149,14 @@ func TestJoinedOwnershipAndCardinalityPreflight(t *testing.T) {
 	if _, err := InnerChildField(scope, otherID); err == nil {
 		t.Fatal("same physical name foreign metadata accepted")
 	}
-	if _, _, err := joinedSQL(scope.Query().WhereChild(otherID.Eq(1)), []joinedProjection{{field.info, field.field, false}}); err == nil {
+	if _, _, err := joinedSQL(scope.Query().WhereChild(otherID.Eq(1)), []joinedProjection{{field.info, field.field, false, field.child}}); err == nil {
 		t.Fatal("foreign predicate accepted")
 	}
-	if _, _, err := joinedSQL(scope.Query().OrderChild(otherID.Asc()), []joinedProjection{{field.info, field.field, false}}); err == nil {
+	if _, _, err := joinedSQL(scope.Query().OrderChild(otherID.Asc()), []joinedProjection{{field.info, field.field, false, field.child}}); err == nil {
 		t.Fatal("foreign order accepted")
 	}
 	_ = other
-	if _, _, err := joinedSQL(scope.Query().Limit(-1), []joinedProjection{{field.info, field.field, false}}); err == nil {
+	if _, _, err := joinedSQL(scope.Query().Limit(-1), []joinedProjection{{field.info, field.field, false, field.child}}); err == nil {
 		t.Fatal("negative limit accepted")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -221,7 +221,7 @@ func TestJoinedRejectsSelfPhysicalTableAndWrongOrderingSlot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := joinedSQL(scope.Query().OrderChild(p.Asc()), []joinedProjection{{field.info, field.field, false}}); err == nil {
+	if _, _, err := joinedSQL(scope.Query().OrderChild(p.Asc()), []joinedProjection{{field.info, field.field, false, field.child}}); err == nil {
 		t.Fatal("same-model order escaped child slot")
 	}
 }

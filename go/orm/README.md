@@ -286,7 +286,7 @@ Typed two-table SQL joins
 relation between two distinct qualified physical tables. They support composite
 keys across schemas, including tables with the same basename in different
 schemas. Repeating the same physical schema/table is refused even through a
-separately created table handle; explicit self aliases remain unsupported.
+separately created table handle; use NewAliasedInnerJoin or NewAliasedLeftJoin for explicit aliases, including self relations.
 This API is additive: association loading and existing single-table queries
 retain their APIs.
 
@@ -318,7 +318,7 @@ Executor and the existing Scope lease. Actual Scope decoder errors poison that
 Scope as documented above; borrowed Executors retain caller lifecycle policy.
 
 The bounded slice excludes arbitrary ON expressions, OR across parent/child
-predicates, multiple joins, self aliases, aggregates, expression projections,
+predicates, multiple joins, aggregates, expression projections,
 joined full-model identity materialization and implicit per-parent pagination.
 Nullable[T] is a projection wrapper rather than a writable mapped codec.
 
@@ -478,4 +478,16 @@ It does not certify Nucleus COPY or automatically invoke hooks.
 
 ```sh
 go test ./orm -run 'Test(BulkAdmissionAndCopySourceBudgets|PostgresOwnedBulkUpsertAndCopy)' -count=1 -v
+```
+
+
+`NewAliasedInnerJoin` and `NewAliasedLeftJoin` validate two distinct quoted aliases
+and retain explicit parent/child roles even when both use the same Table metadata.
+Parent/child projection, filter and ordering methods always refer to their role;
+left-child fields still require Nullable results. Reusing a projected field from
+another aliased binding is refused. The original join constructors continue to
+refuse duplicate physical tables without explicit aliases.
+
+```sh
+go test ./orm -run 'Test(AliasedSelfJoinRoleBindings|PostgresAliasedSelfJoinRoleProjections)' -count=1 -v
 ```
