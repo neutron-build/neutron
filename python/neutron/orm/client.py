@@ -17,7 +17,8 @@ def _native(error: Exception, *, committing: bool = False) -> OrmError:
     # Native error text may carry parameter values; retain original in cause,
     # but do not reproduce it in a generic public message.
     state=getattr(error,'sqlstate',None)
-    return OrmError('PostgreSQL operation failed',sqlstate=state,outcome=('aborted' if state else 'indeterminate') if committing else None)
+    definite = isinstance(state,str) and state[:2] in {'22','23','25','2D','40','42'} and state != '40003'
+    return OrmError('PostgreSQL operation failed',sqlstate=state,outcome=('aborted' if definite else 'indeterminate') if committing else None)
 
 
 class Database:
@@ -31,9 +32,15 @@ class Database:
     @classmethod
     def connect(cls, url: str, *, profile: str='postgres-direct') -> Database:
         _profile(profile)
-        import psycopg
-        from psycopg.rows import dict_row
-        return cls(psycopg.connect(url,autocommit=True,row_factory=dict_row))
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise OrmError("Install neutron-framework[orm] for native PostgreSQL execution") from exc
+        try:
+            return cls(psycopg.connect(url,autocommit=True,row_factory=dict_row))
+        except Exception as exc:
+            raise OrmError("Unable to connect to PostgreSQL",sqlstate=getattr(exc,"sqlstate",None)) from exc
 
     @contextmanager
     def _use(self) -> Iterator[None]:
@@ -71,21 +78,35 @@ class Database:
                     return int(cur.rowcount)
             except Exception as exc: raise _native(exc) from exc
 
+    def _discard(self) -> None:
+        self._closed=True
+        try: self._conn.close()
+        except Exception: pass  # preserve the lifecycle failure, never reuse
+
     @contextmanager
     def transaction(self) -> Iterator[Database]:
         if self._owner is not None: raise SessionBusyError('nested transaction unsupported in this slice')
-        # Hold ownership across the entire native transaction; per-statement
-        # guard rejects other threads even between queries.
         with self._use(): self._owner=threading.get_ident()
-        committing=False
+        native=self._conn.transaction()
         try:
-            with self._conn.transaction():
+            try: native.__enter__()
+            except Exception as exc:
+                self._discard(); raise _native(exc) from exc
+            try:
                 yield self
-                committing=True
-        except OrmError: raise
-        except Exception as exc:
-            if hasattr(exc,"sqlstate"): raise _native(exc,committing=committing) from exc
-            raise
+            except BaseException as body:
+                try: native.__exit__(type(body),body,body.__traceback__)
+                except BaseException as cleanup:
+                    self._discard()
+                    if isinstance(cleanup,Exception): raise _native(cleanup) from cleanup
+                    raise
+                raise
+            else:
+                try: native.__exit__(None,None,None)
+                except BaseException as commit:
+                    self._discard()
+                    if isinstance(commit,Exception): raise _native(commit,committing=True) from commit
+                    raise
         finally: self._owner=None
 
     def close(self) -> None:
@@ -109,9 +130,15 @@ class AsyncDatabase:
     @classmethod
     async def connect(cls,url: str,*,profile: str='postgres-direct') -> AsyncDatabase:
         _profile(profile)
-        import psycopg
-        from psycopg.rows import dict_row
-        return cls(await psycopg.AsyncConnection.connect(url,autocommit=True,row_factory=dict_row))
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise OrmError("Install neutron-framework[orm] for native PostgreSQL execution") from exc
+        try:
+            return cls(await psycopg.AsyncConnection.connect(url,autocommit=True,row_factory=dict_row))
+        except Exception as exc:
+            raise OrmError("Unable to connect to PostgreSQL",sqlstate=getattr(exc,"sqlstate",None)) from exc
 
     @asynccontextmanager
     async def _use(self) -> AsyncIterator[None]:
@@ -129,6 +156,10 @@ class AsyncDatabase:
                 async with self._conn.cursor() as cur:
                     await cur.execute(compiled.sql,compiled.params)
                     rows=await cur.fetchall() if cardinality=='many' else await cur.fetchmany(2)
+            except asyncio.CancelledError:
+                task=asyncio.current_task()
+                if self._owner is None and task is not None and task.cancelling()>1: self._discard()
+                raise
             except Exception as exc: raise _native(exc) from exc
         if cardinality!='many' and len(rows)>1: raise CardinalityError('expected at most one row')
         if cardinality=='one' and not rows: raise CardinalityError('expected exactly one row')
@@ -145,21 +176,53 @@ class AsyncDatabase:
                 async with self._conn.cursor() as cur:
                     await cur.execute(statement.sql,statement.params)
                     return int(cur.rowcount)
+            except asyncio.CancelledError:
+                task=asyncio.current_task()
+                if self._owner is None and task is not None and task.cancelling()>1: self._discard()
+                raise
             except Exception as exc: raise _native(exc) from exc
+
+    def _discard(self) -> None:
+        # Fencing is synchronous, before another cancellation can interrupt it.
+        self._closed=True
+        pgconn=getattr(self._conn,"pgconn",None)
+        if pgconn is not None:
+            try: pgconn.finish()
+            except Exception: pass
+        else:
+            # Test/custom connections have no libpq handle. They stay fenced
+            # while best-effort asynchronous disposal completes.
+            task=asyncio.create_task(self._conn.close())
+            def consume(done: asyncio.Task[Any]) -> None:
+                if not done.cancelled(): done.exception()
+            task.add_done_callback(consume)
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[AsyncDatabase]:
         if self._owner is not None: raise SessionBusyError('nested transaction unsupported in this slice')
         async with self._use(): self._owner=asyncio.current_task()
-        committing=False
+        native=self._conn.transaction()
         try:
-            async with self._conn.transaction():
+            try: await native.__aenter__()
+            except BaseException as entry:
+                self._discard()
+                if isinstance(entry,Exception): raise _native(entry) from entry
+                raise
+            try:
                 yield self
-                committing=True
-        except OrmError: raise
-        except Exception as exc:
-            if hasattr(exc,"sqlstate"): raise _native(exc,committing=committing) from exc
-            raise
+            except BaseException as body:
+                try: await native.__aexit__(type(body),body,body.__traceback__)
+                except BaseException as cleanup:
+                    self._discard()
+                    if isinstance(cleanup,Exception): raise _native(cleanup) from cleanup
+                    raise
+                raise
+            else:
+                try: await native.__aexit__(None,None,None)
+                except BaseException as commit:
+                    self._discard()
+                    if isinstance(commit,Exception): raise _native(commit,committing=True) from commit
+                    raise
         finally: self._owner=None
 
     async def close(self) -> None:
