@@ -7,6 +7,8 @@ consumer directory; this is a local package qualification, not an npm release.
 from pathlib import Path
 import hashlib
 import json
+import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -16,11 +18,17 @@ consumer = Path(tempfile.mkdtemp(prefix='.polyglot-ts-consumer-', dir=root))
 package = root / 'typescript/packages/neutron-sql'
 
 def run(argv, cwd=root):
-    result = subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
-    if result.returncode:
+    process = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        stdout, _ = process.communicate(timeout=180)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+        raise RuntimeError('package qualification subprocess timed out')
+    if process.returncode:
         # Registry/driver subprocess diagnostics may include private URLs.
         raise RuntimeError('package qualification subprocess failed')
-    return result.stdout
+    return stdout
 
 try:
     packed = json.loads(run(['npm', 'pack', '--json', '--pack-destination', str(consumer)], package))[0]
@@ -32,7 +40,7 @@ try:
     run(['npm', 'install', '--no-audit', '--no-fund', str(archive), *[f'{k}@{v}' for k, v in versions.items()]], consumer)
     installed = consumer / 'node_modules/@neutron-build/sql'
     paths = [archive, consumer / 'package-lock.json', root / 'conformance/polyglot/adapters/typescript.mjs']
-    paths.extend(p for p in installed.rglob('*') if p.is_file())
+    paths.extend(p for p in (consumer / 'node_modules').rglob('*') if p.is_file())
     artifacts = consumer / 'artifacts.json'
     artifacts.write_text(json.dumps({'files': [{'path': str(p.relative_to(root)), 'sha256': hashlib.sha256(p.read_bytes()).hexdigest()} for p in sorted(paths)]}))
     results = []

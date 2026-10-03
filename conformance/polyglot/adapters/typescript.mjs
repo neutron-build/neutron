@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 
 let db;
+let response;
 try {
   const request = JSON.parse(readFileSync(0, 'utf8'));
   if (request.protocol !== 'polyglot-conformance-v1' || request.case_id !== 'scalar-extremes' || request.action !== 'observe' || request.profile !== 'postgres-direct' || !/^neutron_polyglot_[0-9a-f]{32}$/.test(request.schema_scope)) throw new Error('unsupported adapter request');
@@ -28,13 +29,18 @@ try {
     if (typeof row.moment !== 'string' || !/^\d{4}-\d\d-\d\dT.*Z$/.test(row.moment)) throw new Error('instant must preserve canonical string precision');
     return [String(row.id), row.big, row.precise, row.moment.replace('T', ' ').replace(/Z$/, '+00'), row.sqlNull, JSON.stringify(row.document)];
   });
-  console.log(JSON.stringify({ protocol: request.protocol, case_id: request.case_id,
+  response = { protocol: request.protocol, case_id: request.case_id,
     profile: request.profile, schema_scope: request.schema_scope,
-    artifact_hashes: request.artifact_hashes, status: 'pass', rows }));
+    artifact_hashes: request.artifact_hashes, status: 'pass', rows };
 } catch {
   // Native causes can contain values/credentials; diagnostics remain bounded.
-  console.log(JSON.stringify({ status: 'fail', diagnostics: 'TypeScript installed adapter refused or failed' }));
+  response = { status: 'fail', diagnostics: 'TypeScript installed adapter refused or failed' };
   process.exitCode = 1;
 } finally {
-  if (db) await db.close();
+  if (db) {
+    try { await db.close(); }
+    catch { response = { status: 'fail', diagnostics: 'TypeScript installed adapter cleanup failed' }; process.exitCode = 1; }
+  }
 }
+
+console.log(JSON.stringify(response));
