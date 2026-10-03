@@ -277,3 +277,17 @@ async def test_native_async_row_callback_cannot_introduce_unannounced_write(mapp
         with pytest.raises(OrmError,match='new write actions'): await session.flush()
         assert native.execute(f'SELECT name FROM {m.table.sql} ORDER BY id').fetchall()==[('a',),('b',)]
         await session.rollback();assert (a.name,b.name)==('a','b')
+
+
+def test_native_raw_control_refusal_preserves_owned_transaction_rows(mapped):
+    from neutron.orm import Mutation
+    url,m,native=mapped
+    with Database.connect(url) as db:
+        with Session(db) as session:
+            obj=User(name='uncommitted');session.add(m,obj);session.flush()
+            for sql in ('COMMIT','/* hide */ ROLLBACK','SELECT 1; COMMIT','SET LOCAL ROLE postgres'):
+                with pytest.raises(OrmError): db.execute(Mutation(sql))
+            assert native.execute(f'SELECT count(*) FROM {m.table.sql}').fetchone()==(0,)
+            db.execute(Mutation(f'UPDATE {m.table.sql} SET name=%s WHERE id=%s',('raw',obj.id)))
+            session.rollback();assert obj.id is None
+    assert native.execute(f'SELECT count(*) FROM {m.table.sql}').fetchone()==(0,)

@@ -11,6 +11,7 @@ from .client import AsyncDatabase, Database, _native
 from .core import OrmError, Select, SessionBusyError
 from .json_value import native_params
 from .query import Query
+from .sql_admission import validate_scope_sql
 
 T=TypeVar('T')
 CLEANUP_SECONDS=5.0
@@ -71,7 +72,7 @@ async def _async_cleanup(db: AsyncDatabase,operation: Callable[[],Awaitable[Any]
 class Stream(Generic[T],Iterator[T]):
     def __init__(self,db: Database,query: Select[T] | Query[T],batch_size: int) -> None:
         _validate(query,batch_size)
-        self._db=db;self._compiled=query.compile();self._batch_size=batch_size
+        self._db=db;self._compiled=query.compile();validate_scope_sql(self._compiled.sql);self._batch_size=batch_size
         self._buffer: deque[Any]=deque();self._cursor: Any=None;self._tx: Any=None;self._lease: Any=None
         self._token: object | None=None;self._owner: int | None=None
         self._open=False;self._entered=False;self._drained=False;self._failed=False;self._acquired=False
@@ -158,7 +159,7 @@ class Stream(Generic[T],Iterator[T]):
 class AsyncStream(Generic[T],AsyncIterator[T]):
     def __init__(self,db: AsyncDatabase,query: Select[T] | Query[T],batch_size: int) -> None:
         _validate(query,batch_size)
-        self._db=db;self._compiled=query.compile();self._batch_size=batch_size
+        self._db=db;self._compiled=query.compile();validate_scope_sql(self._compiled.sql);self._batch_size=batch_size
         self._buffer: deque[Any]=deque();self._cursor: Any=None;self._tx: Any=None;self._lease: Any=None
         self._token: object | None=None;self._owner: asyncio.Task[Any] | None=None
         self._open=False;self._entered=False;self._drained=False;self._failed=False;self._acquired=False

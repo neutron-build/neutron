@@ -7,6 +7,7 @@ from typing import Any, AsyncIterator, Iterator, Mapping, Sequence, TypeVar, TYP
 from .endpoint import EndpointIdentity, admit, startup_version
 from .json_value import load_document, native_params
 from .query import Query
+from .sql_admission import validate_scope_sql
 from .core import CardinalityError, Compiled, Mutation, OrmError, Returning, Select, SessionBusyError
 
 if TYPE_CHECKING:
@@ -101,6 +102,7 @@ class Database:
         if isinstance(query,Query) and cardinality != 'many' and (query.row_limit is not None or query.row_offset is not None):
             raise ValueError('exact-one reads refuse pagination')
         compiled=query.compile()
+        if self._owner is not None: validate_scope_sql(compiled.sql)
         with self._use():
             try:
                 with self._conn.cursor() as cur:
@@ -124,6 +126,7 @@ class Database:
         rows=self._read(query,'optional'); return rows[0] if rows else None
 
     def execute(self, statement: Mutation) -> int:
+        if self._owner is not None: validate_scope_sql(statement.sql)
         with self._use():
             try:
                 with self._conn.cursor() as cur:
@@ -263,6 +266,7 @@ class AsyncDatabase:
         if isinstance(query,Query) and cardinality != 'many' and (query.row_limit is not None or query.row_offset is not None):
             raise ValueError('exact-one reads refuse pagination')
         compiled=query.compile()
+        if self._owner is not None: validate_scope_sql(compiled.sql)
         async with self._use():
             try:
                 async with self._conn.cursor() as cur:
@@ -290,6 +294,7 @@ class AsyncDatabase:
         rows=await self._read(query,'optional'); return rows[0] if rows else None
 
     async def execute(self,statement: Mutation) -> int:
+        if self._owner is not None: validate_scope_sql(statement.sql)
         async with self._use():
             try:
                 async with self._conn.cursor() as cur:

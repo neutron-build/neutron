@@ -339,3 +339,11 @@ be uncorrelated: lateral sources and recursive CTEs require separate contracts.
 Their binds precede enclosing WHERE binds in SQL occurrence order. CTE source
 columns are explicitly named, preventing internal projection aliases leaking
 into the consumer's metadata.
+
+Inside an owned transaction, raw Mutation and compiled read/RETURNING SQL pass
+conservative single-statement admission. Transaction/session control commands
+are refused; comments, quoted strings/identifiers, dollar strings and trailing
+semicolons are scanned without treating embedded text as commands. Ambiguous
+ordinary-string backslashes refuse. Parameterized single data/query statements
+remain supported. This contains direct state-machine escapes; trusted SQL
+functions and predicates are not a security sandbox.
