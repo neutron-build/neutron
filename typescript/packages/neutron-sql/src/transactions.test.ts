@@ -539,7 +539,7 @@ test('caught explicit savepoint SQL failures force root rollback', async () => {
         if (match.source.startsWith('^rollback')) await sp.rollbackTo();
         else await sp.release();
       } catch { /* the callback intentionally swallows the server error */ }
-    }), /cleanup failed/);
+    }), /control failed/);
     assert.equal(pin.statements.at(-1), 'rollback');
     assert.ok(!pin.statements.includes('commit'));
   }
