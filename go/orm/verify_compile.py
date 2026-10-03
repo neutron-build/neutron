@@ -23,6 +23,7 @@ for name, expected in [
     ("wrong_write", "does not match inferred type"),
     ("wrong_projection", "as []int value"),
     ("wrong_model", "as orm.Predicate[Project] value"),
+    ("wrong_join", "does not match inferred type"),
 ]:
     result = run("./orm/testdata/" + name)
     source = root / "orm/testdata" / name / "main.go"
@@ -31,4 +32,4 @@ for name, expected in [
     location = f"orm/testdata/{name}/main.go:{line}:"
     if result.returncode == 0 or expected not in result.stdout or location not in result.stdout:
         sys.exit("intended type-check failure absent: " + name)
-print("PASS: public Go ORM core positive and four negative compile consumers")
+print("PASS: public Go ORM core positive and five negative compile consumers")

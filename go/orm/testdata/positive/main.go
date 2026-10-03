@@ -44,3 +44,20 @@ func consumer(ctx context.Context, db orm.Executor) error {
 	_, err = orm.InsertOne(ctx, db, table, orm.Set(name, orm.Some("")), orm.Set(note, orm.Some((*string)(nil))), orm.Set(id, orm.Default[int64]()))
 	return err
 }
+
+func associations(ctx context.Context, db orm.Executor, records []Record) error {
+	table, err := orm.NewTable[Record]("tenant", "records")
+	if err != nil {
+		return err
+	}
+	id, err := orm.NewColumn[Record, int64](table, "ID")
+	if err != nil {
+		return err
+	}
+	relation, err := orm.NewRelation(table, table, orm.Join(id, id))
+	if err != nil {
+		return err
+	}
+	_, err = orm.LoadOne(ctx, db, orm.Inverse(relation), records, orm.Query[Record]{}, orm.LoadBudget{MaxParents: 100, MaxRows: 100, BatchSize: 20})
+	return err
+}

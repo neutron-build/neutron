@@ -122,3 +122,53 @@ Fixture lifecycle tests separately exercise simulated lost COMMIT responses,
 SQLSTATE 08007/40003, cleanup failure and no-replay/discard decisions. Native
 tests establish actual savepoint rollback, pool reuse, cancellation and failed
 transaction recovery; fixture tests do not substitute for those database gates.
+
+Bounded explicit associations
+-----------------------------
+
+`Join(parentColumn, childColumn)` requires identical Go key types at compile
+time. `NewRelation(parentTable, childTable, joins...)` validates immutable table
+identity, nonempty composite keys and duplicate fields. Only nonnullable string,
+bool, int, int32 and int64 keys are supported. Nullable, floating-point, custom
+codec and implicit key conversion semantics remain unsupported. `Inverse`
+reverses ownership explicitly; this is not foreign-key inference or cascading.
+
+`LoadMany(ctx, executor, relation, parents, childQuery, budget)` returns one
+`Association` per input slot, preserving duplicate parent keys and each original
+parent value. Missing children use an empty slice. Distinct composite keys are
+deduplicated and loaded through qualified, bound OR-of-AND predicates. Each
+input slot owns a separate result slice. Child order follows `OrderBy`; absent
+an order it is unspecified. `LoadOne` refuses multiple matches for a key and
+does not conceal cardinality with a limit. Both methods may filter children.
+
+`LoadBudget{MaxParents, MaxRows, BatchSize}` is mandatory and positive.
+MaxParents counts input slots; MaxRows bounds actual child rows across distinct
+keys and batches; BatchSize bounds keys per statement. Excess rows return
+`ErrLoadBudget` with no partial result, rather than truncating. Internal LIMIT
+fetches one row beyond the remaining total budget only to detect excess.
+PostgreSQL's parameter limit is checked before each query. Caller LIMIT/OFFSET
+is refused because global pagination does not implement per-parent pagination.
+
+Multiple batches do not establish a consistent snapshot. Use an owned
+RepeatableRead or Serializable Scope when that guarantee is required. Exact Go
+identity is required on returned keys; database types or collations that equate
+distinct Go keys are not implicitly supported. No hooks, association writes,
+soft deletion, lazy loading or full GORM parity is claimed.
+
+```sh
+python3 orm/verify_compile.py
+go test ./orm -run TestPostgresCompositeAssociationLoading -count=1 -v
+```
+
+The native association gate compares independently fetched PostgreSQL rows,
+including tenants sharing IDs, composite keys, inverse ownership, an orphan,
+missing and duplicate inputs, a hostile search path, bounded batching, child
+filters and excess-row/cardinality rejection.
+
+Native COMMIT outcome gates also cover a real loopback wire proxy dropping the
+server's COMMIT acknowledgment while independently proving durable rows, plus
+deferred-constraint and Serializable COMMIT rejection:
+
+```sh
+go test ./orm -run 'TestPostgres(LostCommitAcknowledgment|DeferredCommitRejection|SerializationCommitRejection|ChildContextCancellation)' -count=1 -v
+```
