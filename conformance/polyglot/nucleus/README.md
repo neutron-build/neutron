@@ -84,10 +84,10 @@ profiles, text/binary results, native state, faults, source/toolchain/binary
 hashes and independent reviewer verdicts. Compatibility smoke harnesses that
 SKIP missing tools are not mandatory polyglot qualification.
 
-The documented `probe_recover_engines --skip-section catalog` holdout has expiry
-2026-09-30 and is still present in source. At this assessment's 2026-10-03 date,
-that requires current gate resolution or explicit remaining release blockage;
-silently extending or counting skipped catalog coverage as passing is forbidden.
+The `probe_recover_engines --skip-section catalog` holdout (expiry 2026-09-30)
+was removed 2026-10-03 after unskipped native baselines and negative controls
+passed on buffered-disk and durable-mvcc; skipped coverage must never be counted
+as passing.
 Historical SIGKILL recovery is not proof of power-loss durability. No native
 gate, engine build, fixture execution, performance run or certification occurred
 during this source assessment.

@@ -41,7 +41,7 @@ cargo run --release --features "server rusqlite" --bin fuzz -- --iterations 800 
 cargo run --release --features server --bin probe_engines
 cargo run --release --features server --bin probe_index_coherence
 cargo run --release --features server --bin probe_streams_oracle -- --iterations 120
-cargo run --release --features "server rusqlite" --bin probe_recover_engines -- --iterations 40 --ops 30 --skip-section catalog
+cargo run --release --features "server rusqlite" --bin probe_recover_engines -- --iterations 40 --ops 30
 cargo run --release --features "server rusqlite" --bin probe_io_faults
 cargo run --release --features "server rusqlite" --bin probe_blob
 cargo run --release --features server --bin probe_sessions
@@ -54,7 +54,7 @@ change to `storage/tuple.rs` — including one that looks like a pure
 refactor. `probe_ddl_recreate` opens all five engines, so run it after any
 change to DDL registration or to a `StorageEngine` implementation.
 
-**The `catalog` holdout remains open pending an exact-binary gate.** The
+**The `catalog` holdout was removed 2026-10-03 after an exact-binary gate.** The
 historical embedded metadata write-back defect has a source fix:
 `DatabaseBuilder::build` now calls `load_meta_sync` and refuses failed loading.
 The recovery probe formerly counted correct early startup refusal as a
@@ -62,17 +62,13 @@ finding, and its catalog negative control could pass with a dirty baseline.
 The repaired model accepts early refusal or a poisoned authority surface only
 with unchanged corrupt bytes, requires a clean negative-control baseline, and
 adds a healthy roles/grants/RLS/views/sequences reopen control followed by DDL.
-These source changes do not qualify the engine or close the holdout. Run the
-unskipped catalog campaign and its negative control on the same new binary
-before removing the skip. The `datalog` and `vector` sections remain gates.
-
-The gate line above therefore holds the `catalog` section out with
-`--skip-section`, and so does `scripts/probe.sh` (which CI runs). That is a
-deliberate, expiring holdout, not a mute: the probe prints a SKIPPED line for
-each held-out section on every run and reports it as `SKIPPED` rather than
-`0 divergence(s)` in the summary, so a green run can never be mistaken for
-full coverage. **Remove the flag when F2 is fixed** — `probe.sh` carries a
-hard expiry of 2026-09-30.
+Evidence: unskipped 40 iterations x 30 ops on buffered-disk and on
+durable-mvcc, zero divergences in every section, and the catalog negative
+control adding 6 divergences to a clean baseline of 0 on both engines. The
+probe refuses non-durable engines (`--engine mvcc` has no WAL, so a recovery
+round-trip against it is a harness error, not a finding). `--skip-section`
+still exists and still announces itself as `SKIPPED` in the summary, but no
+gate uses it.
 
 To see the findings, just drop the flags:
 
@@ -274,9 +270,8 @@ DDL could erase roles, RLS policies, views, triggers and sequence definitions.
 The builder now loads executor metadata synchronously and fails closed on
 corruption. The repaired `catalog` probe checks both corrupt-byte preservation
 and healthy authority retention across reopen and later DDL. The existing
-2026-09-30 holdout expiry remains an open obligation until unskipped native
-campaign and negative-control evidence is reviewed; no source-only change
-constitutes closure.
+2026-09-30 holdout expiry was resolved 2026-10-03 by the unskipped native
+campaign and negative controls described above, not by a source-only change.
 
 ### The S35 class map
 

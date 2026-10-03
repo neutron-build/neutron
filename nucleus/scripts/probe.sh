@@ -107,23 +107,13 @@ PROBES=(
   # for less wall clock than the calibrated 40 cost. `full` gets 1600 again,
   # which is now ~40s rather than the four and a half hours nobody ever ran.
   "probe_concurrency_threads|--seed 1 --rounds $((200 * M))"
-  # KNOWN-RED HOLDOUT, added 2026-08-18 with S35 (c9a6c893). The vector and
-  # catalog sections each report a real, open finding, so running them here
-  # would make this suite permanently red and teach everyone to ignore it:
-  #   catalog - historical embedded metadata write-back defect. Source now
-  #             loads metadata fail-closed; the repaired refusal model and
-  #             healthy reopen control still need exact-binary native gates.
-  # Written up in _internal/OPEN_WORK.md and nucleus/docs/PROBES.md.
-  # The vector holdout was removed 2026-08-22: HNSW tombstones serialize
-  # (S35 F1a) and the PK registry persists across reopen (F1b), and the
-  # section runs clean at 80 iterations x 40 ops with its negative control
-  # still discriminating. The datalog and vector sections gate.
-  # The skip is announced by the probe itself on every run, so a green suite
-  # cannot read as full coverage.
-  #
-  # EXPIRY: remove the remaining --skip-section flag when F2 is fixed.
-  # If it is still here after 2026-09-30, that is the bug, not the backlog.
-  "probe_recover_engines|--iterations $((300 * M)) --skip-section catalog"
+  # All four S35 sections gate. The vector holdout was removed 2026-08-22
+  # (HNSW tombstones serialize, PK registry persists across reopen). The
+  # catalog holdout was removed 2026-10-03: embedded metadata loads
+  # fail-closed, and the repaired refusal model ran unskipped with a clean
+  # baseline and a discriminating negative control on both buffered-disk and
+  # durable-mvcc (nucleus/docs/PROBES.md).
+  "probe_recover_engines|--iterations $((300 * M))"
   "probe_blob|"
   # ── S35 class probes (2026-08-18) ──
   # Both carry their own negative controls, and both are cheap, so the controls
