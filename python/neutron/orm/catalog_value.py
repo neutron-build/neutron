@@ -82,8 +82,14 @@ def register_catalog_values(connection: object,owner: object,identity: CatalogTy
             if not isinstance(spec,ColumnSpec) or spec.type_oid!=obj.identity.base_oid: raise ValueError('domain native base mismatch')
             value=obj.value
             classes=_adapter_classes()
-            if isinstance(value,PgArray): return classes[4](type(value),self.context).dump(BoundArray(value,spec.sql_type))
-            if isinstance(value,PgRange): return classes[5+len(ARRAY_OIDS)](type(value),self.context).dump(BoundRange(value,spec.sql_type))
+            if isinstance(value,PgArray):
+                data=classes[4](type(value),self.context).dump(BoundArray(value,spec.sql_type))
+                if data is None: raise ValueError('non-NULL array domain encoded NULL')
+                return bytes(data)
+            if isinstance(value,PgRange):
+                data=classes[5+len(ARRAY_OIDS)](type(value),self.context).dump(BoundRange(value,spec.sql_type))
+                if data is None: raise ValueError('non-NULL range domain encoded NULL')
+                return bytes(data)
             if isinstance(value,MutableJson): value=JsonDocument(value.text)
             if isinstance(value,JsonDocument): value=(Jsonb if spec.sql_type=='jsonb' else Json)(value.text,dumps=lambda text:text)
             cls=self.context.adapters.get_dumper_by_oid(spec.type_oid,Format.BINARY)
