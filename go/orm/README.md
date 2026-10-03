@@ -26,6 +26,27 @@ NULL comparisons are rejected. Query values use PostgreSQL placeholders.
 `Select` scans complete models; `SelectColumn` returns a typed slice and
 `SelectPair` returns typed `Pair` values. `SelectOne` verifies zero/one/multiple
 matches and refuses a caller-supplied limit/offset that could hide cardinality.
+`SelectOptional` retains that check, returning `Nullable[Model]{Valid:false}`
+for no row. `CompileSelect` validates and returns placeholder SQL and detached
+scalar arguments without a database connection.
+
+`In`/`NotIn` snapshot and bind finite lists; empty lists evaluate FALSE/TRUE.
+NULL list elements retain SQL three-valued membership semantics, unlike the
+explicit `Eq(nil)` NULL test. `CompareAny`/`CompareAll` accept the fixed
+`Comparison` constants and compile finite scalar lists to equivalent OR/AND
+comparisons; they do not require array codecs. `Not` negates a predicate.
+`Order.NullsFirst()`/`NullsLast()` set explicit NULL placement, including joins.
+
+`Stream(ctx, executor, table, query, maxRows, visit)` visits full models with
+one model of application buffering and a mandatory positive finite row budget.
+The first excess row returns `ErrStreamBudget` before delivery. Returning false
+from `visit` stops normally. Stop, failure, panic and cancellation close native
+rows; an owned Scope then releases its operation lease. This is native pgx
+result streaming rather than a server DECLARE cursor. Server execution and
+buffering are not bounded by this API; application query planning and timeouts
+remain necessary. Visitor errors do not independently poison a borrowed or owned
+transaction; return the error from the transaction callback when rollback is
+required. Native result decode failures retain the Scope poisoning policy.
 
 `Set(column, Some(value))` supplies a write value, including false/zero/empty
 string. `Some((*string)(nil))` supplies SQL NULL to a nullable string.

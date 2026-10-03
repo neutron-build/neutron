@@ -117,6 +117,7 @@ type joinedOrder struct {
 	order      fieldInfo
 	descending bool
 	child      bool
+	nulls      string
 }
 
 // JoinQuery is an immutable value-style two-table query. Child filters belong
@@ -150,14 +151,14 @@ func (q JoinQuery[P, C]) WhereChild(predicate Predicate[C]) JoinQuery[P, C] {
 func (q JoinQuery[P, C]) OrderParent(order ...Order[P]) JoinQuery[P, C] {
 	q.order = append([]joinedOrder(nil), q.order...)
 	for _, o := range order {
-		q.order = append(q.order, joinedOrder{o.info, o.field, o.descending, false})
+		q.order = append(q.order, joinedOrder{o.info, o.field, o.descending, false, o.nulls})
 	}
 	return q
 }
 func (q JoinQuery[P, C]) OrderChild(order ...Order[C]) JoinQuery[P, C] {
 	q.order = append([]joinedOrder(nil), q.order...)
 	for _, o := range order {
-		q.order = append(q.order, joinedOrder{o.info, o.field, o.descending, true})
+		q.order = append(q.order, joinedOrder{o.info, o.field, o.descending, true, o.nulls})
 	}
 	return q
 }
@@ -239,7 +240,7 @@ func joinedSQL[P, C any](q JoinQuery[P, C], fields []joinedProjection) (string, 
 		if o.descending {
 			direction = " DESC"
 		}
-		order[i] = qualifiedColumn(o.info, o.order) + direction
+		order[i] = qualifiedColumn(o.info, o.order) + direction + o.nulls
 	}
 	if len(order) > 0 {
 		sql += " ORDER BY " + strings.Join(order, ", ")

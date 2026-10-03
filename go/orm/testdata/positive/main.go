@@ -29,6 +29,19 @@ func consumer(ctx context.Context, db orm.Executor) error {
 		return err
 	}
 	query := orm.Query[Record]{}.Where(orm.And(id.Gt(0), name.Ne(""))).OrderBy(id.Asc()).Limit(20)
+	_, err = orm.CompileSelect(table, query.Where(orm.And(id.In(1, 2), id.CompareAny(orm.Greater, 0), orm.Not(note.NotIn(nil)))).OrderBy(note.Desc().NullsFirst()))
+	if err != nil {
+		return err
+	}
+	var optional orm.Nullable[Record]
+	optional, err = orm.SelectOptional(ctx, db, table, orm.Query[Record]{}.Where(id.Eq(1)))
+	_ = optional
+	if err != nil {
+		return err
+	}
+	if err = orm.Stream(ctx, db, table, query, 20, func(record Record) (bool, error) { _ = record.ID; return false, nil }); err != nil {
+		return err
+	}
 	var names []string
 	names, err = orm.SelectColumn(ctx, db, name, query)
 	_ = names
