@@ -542,3 +542,17 @@ universal expression algebra.
 ```sh
 go test ./orm -run 'Test(TypedAggregateCompilationAndOwnership|PostgresExactTypedAggregatesAndHaving)' -count=1 -v
 ```
+
+
+`Over(aggregate, partitionColumns, orders...)` preserves an aggregate's exact
+result/nullability for window queries. `RowNumber` yields int64. `RowsBetween`
+accepts explicit unbounded/current/preceding/following boundaries and binds finite
+nonnegative row offsets. `SelectWindowPair` returns an original typed scalar and
+typed window result; input WHERE precedes the window, output ordering/pagination
+follows it. PostgreSQL's default frame remains unchanged unless explicit.
+Distinct aggregate windows refuse before execution because PostgreSQL does not
+support them. Native errors retain other invalid frame/type cases.
+
+```sh
+go test ./orm -run 'Test(WindowFrameBindingsAndOwnership|PostgresTypedWindowsAndFrames)' -count=1 -v
+```

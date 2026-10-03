@@ -197,13 +197,16 @@ func (q Query[M]) Limit(limit int) Query[M]   { q.limit = limit; q.limited = tru
 func (q Query[M]) Offset(offset int) Query[M] { q.offset = offset; return q }
 
 func selectSQL[M any](table Table[M], columns string, q Query[M]) (string, []any, error) {
+	return selectSQLArgs(table, columns, q, nil)
+}
+func selectSQLArgs[M any](table Table[M], columns string, q Query[M], initial []any) (string, []any, error) {
 	if table.info == nil {
 		return "", nil, fmt.Errorf("orm: uninitialized table")
 	}
 	if q.limit < 0 || q.offset < 0 {
 		return "", nil, fmt.Errorf("orm: negative limit/offset")
 	}
-	args := []any{}
+	args := append([]any{}, initial...)
 	sql := "SELECT " + columns + " FROM " + table.info.sqlName()
 	if q.whereSet {
 		p, err := renderPredicate(table.info, q.predicate.expr, &args)
