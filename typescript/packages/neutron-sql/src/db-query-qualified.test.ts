@@ -67,3 +67,11 @@ test("a prototype-named query registration remains an own data property", async 
   assert.equal(Object.hasOwn(db.query, "__proto__"), true);
   assert.match(db.query["__proto__"].toSQL().sql, /"tenant\.left"\."users"/);
 });
+
+test("unregistered relation targets cannot disagree about one physical table", async () => {
+  const shadow = left.table("posts", { id: integer("id").primaryKey(), authorId: integer("author_id"), title: text("title") });
+  const edges = relations(leftUsers, ({ many }) => ({ first: many(leftPosts), second: many(shadow) }));
+  const driver = recordingDriver();
+  await assert.rejects(createDatabase({ driver, tables: { leftUsers }, relations: { leftUsers: edges } }), /conflicting table declarations/);
+  assert.equal(driver.statements.length, 0);
+});
