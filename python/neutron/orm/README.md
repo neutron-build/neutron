@@ -460,3 +460,17 @@ These are ORM actions independent of database ON DELETE clauses: concurrent
 unloaded children remain protected by the database FK, causing safe transaction
 failure rather than silently certifying an incomplete graph. Undeclared relation
 levels and many-to-many links are not inferred.
+
+`ManyToMany(parent_relation, target_relation)` declares an explicit through
+mapper shared by both relations. Both endpoints reference complete primary
+identities, and the through primary key covers all association FK fields.
+`connect_many_to_many(meta, parent, target, association)` attaches the supplied
+through object and orders generated endpoint identities before its INSERT.
+Shared composite tenant fields must agree; no last-write-wins overwrite is
+allowed. `disconnect_many_to_many` deletes only the exact tracked through row,
+preserving both targets. Duplicate associations remain database uniqueness
+errors with complete rollback. These state operations are synchronous for both
+Session families; flush/commit are native sync/async as usual. Association payload
+fields use ordinary mapped tracking/hooks, and explicit load_relation reads reuse
+through-object identity. Surrogate through keys without declared composite
+uniqueness and automatic target collection inference remain unsupported.

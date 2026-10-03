@@ -137,3 +137,78 @@ async def test_native_async_nullable_disconnect_and_nullify_ownership(live_table
         await session.delete_graph(rel,parent,budget=LoadBudget(1,10,10));await session.commit()
         assert native.execute(f'SELECT parent_id FROM {c.sql}').fetchone()==(None,)
         assert native.execute(f'SELECT count(*) FROM {p.sql}').fetchone()==(0,)
+
+@dataclass
+class Account:
+    tenant: str
+    id: int|None=None
+    name: str='account'
+
+@dataclass
+class Group:
+    tenant: str
+    id: int|None=None
+    name: str='group'
+
+@dataclass
+class Membership:
+    tenant: str|None=None
+    account_id: int|None=None
+    group_id: int|None=None
+    role: str='member'
+
+@pytest.fixture
+def many_graph(live_table):
+    from neutron.orm import ManyToMany
+    url,base,native=live_table
+    common={'tenant':ColumnSpec(str,'text'),'id':ColumnSpec(int,'int4',generated=True),'name':ColumnSpec(str,'text')}
+    a=Table('accounts',common,schema=base.schema);g=Table('groups',common,schema=base.schema)
+    t=Table('memberships',{'tenant':ColumnSpec(str,'text'),'account_id':ColumnSpec(int,'int4'),'group_id':ColumnSpec(int,'int4'),'role':ColumnSpec(str,'text')},schema=base.schema)
+    for table in (a,g): native.execute(f'CREATE TABLE {table.sql}(tenant text NOT NULL,id int GENERATED ALWAYS AS IDENTITY,name text NOT NULL,PRIMARY KEY(tenant,id))')
+    native.execute(f'CREATE TABLE {t.sql}(tenant text NOT NULL,account_id int NOT NULL,group_id int NOT NULL,role text NOT NULL,PRIMARY KEY(tenant,account_id,group_id),FOREIGN KEY(tenant,account_id) REFERENCES {a.sql}(tenant,id),FOREIGN KEY(tenant,group_id) REFERENCES {g.sql}(tenant,id))')
+    am=ModelMapping(Account,a,dict(a.columns),primary_key=('tenant','id'))
+    gm=ModelMapping(Group,g,dict(g.columns),primary_key=('tenant','id'))
+    tm=ModelMapping(Membership,t,dict(t.columns),primary_key=('tenant','account_id','group_id'))
+    meta=ManyToMany(Relation(am,tm,('tenant','id'),('tenant','account_id')),Relation(gm,tm,('tenant','id'),('tenant','group_id')))
+    return url,meta,native
+
+
+def test_native_many_to_many_generated_composite_identity_and_disconnect(many_graph):
+    from neutron.orm import ConflictError
+    url,meta,native=many_graph
+    with Session.connect(url) as session:
+        account=Account('a');group=Group('a');through=Membership()
+        session.add(meta.parent.parent,account);session.add(meta.target.parent,group)
+        session.connect_many_to_many(meta,account,group,through);session.flush();session.rollback()
+        assert account.id is None and group.id is None and through.tenant is None
+        session.add(meta.parent.parent,account);session.add(meta.target.parent,group)
+        session.connect_many_to_many(meta,account,group,through);session.commit()
+        assert (through.tenant,through.account_id,through.group_id)==('a',account.id,group.id)
+        assert native.execute(f'SELECT tenant,account_id,group_id,role FROM {meta.parent.child.table.sql}').fetchone()==('a',account.id,group.id,'member')
+        loaded=session.load_relation(meta.parent,[account],budget=LoadBudget(1,10,10))
+        assert loaded[0].children[0] is through
+        duplicate=Membership()
+        session.connect_many_to_many(meta,account,group,duplicate)
+        with pytest.raises(OrmError) as conflict: session.flush()
+        assert conflict.value.sqlstate=='23505'
+        session.rollback();assert duplicate.tenant is None
+        foreign=Group('b');session.add(meta.target.parent,foreign);session.commit()
+        with pytest.raises(ConflictError): session.connect_many_to_many(meta,account,foreign,Membership())
+        session.rollback()
+        assert native.execute(f'SELECT count(*) FROM {meta.parent.child.table.sql}').fetchone()==(1,)
+        session.disconnect_many_to_many(meta,account,group,through);session.flush();session.rollback()
+        assert session.object_state(through) is ObjectState.PERSISTENT
+        session.disconnect_many_to_many(meta,account,group,through);session.commit()
+        assert native.execute(f'SELECT count(*) FROM {meta.parent.child.table.sql}').fetchone()==(0,)
+        assert native.execute(f'SELECT count(*) FROM {meta.target.parent.table.sql}').fetchone()==(2,)
+
+@pytest.mark.asyncio
+async def test_native_async_many_to_many_new_targets_and_through_rows(many_graph):
+    url,meta,native=many_graph
+    async with await AsyncSession.connect(url) as session:
+        account=Account('a');group=Group('a');through=Membership()
+        session.add(meta.parent.parent,account);session.add(meta.target.parent,group)
+        session.connect_many_to_many(meta,account,group,through);await session.commit()
+        assert native.execute(f'SELECT tenant,account_id,group_id FROM {meta.parent.child.table.sql}').fetchone()==('a',account.id,group.id)
+        session.disconnect_many_to_many(meta,account,group,through);await session.commit()
+        assert native.execute(f'SELECT count(*) FROM {meta.parent.child.table.sql}').fetchone()==(0,)

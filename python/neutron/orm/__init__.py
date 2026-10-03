@@ -51,3 +51,6 @@ __all__ += ["PostCommitCancelledError","PostCommitError","PostCommitInterruptedE
 
 from .relations import OwnedRelation
 __all__ += ["OwnedRelation"]
+
+from .relations import ManyToMany
+__all__ += ["ManyToMany"]

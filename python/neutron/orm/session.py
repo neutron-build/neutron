@@ -11,10 +11,11 @@ from .events import EVENT_NAMES, EventName, SessionEvent, PostCommitError, PostC
 from .instrumentation import expire_attributes
 from .mapping import ModelMapping, same_column_value
 from .state import ObjectState, Record, StateStore
-from .relations import Association, LoadBudget, OwnedRelation, Relation, load_many, load_one
+from .relations import Association, LoadBudget, ManyToMany, OwnedRelation, Relation, load_many, load_one
 T=TypeVar('T')
 P=TypeVar('P')
 C=TypeVar('C')
+L=TypeVar('L')
 
 class ConflictError(OrmError): pass
 
@@ -68,10 +69,11 @@ class _SessionState:
         if any(relation.child.field_columns[name].spec.generated for name in relation.child_fields):
             raise OrmError('graph link cannot target generated child fields')
         for old,old_parent,old_child in self._links:
-            if old_child is child and set(old.child_fields) & set(relation.child_fields):
-                if old is relation and old_parent is parent: return
-                raise OrmError('conflicting graph relationship ownership')
+            if old_child is child and old is relation and old_parent is parent: return
         self._links.append((relation,parent,child))
+        try: self._resolve_links(self._store.records[id(child)],require_complete=False)
+        except BaseException:
+            self._links.pop();raise
 
     def add_graph(self,relation: Relation[P,C],parent: P,children: Sequence[C]) -> None:
         self._guard();relation.__post_init__()
@@ -90,22 +92,56 @@ class _SessionState:
         except BaseException:
             self._failed=True;raise
 
+    def connect_many_to_many(self,relation: ManyToMany[P,C,L],parent: P,target: C,association: L) -> None:
+        self._guard();relation.__post_init__()
+        for mapping,obj in ((relation.parent.parent,parent),(relation.target.parent,target)):
+            record=self._store.records.get(id(obj))
+            if record is None or record.mapping is not mapping or record.state not in {ObjectState.PENDING,ObjectState.PERSISTENT}:
+                raise OrmError('many-to-many parents must be tracked pending/persistent identities')
+        through=relation.parent.child
+        fields=frozenset(relation.parent.child_fields)|frozenset(relation.target.child_fields)
+        through.writes(association,inserting=True,deferred_fields=fields)
+        try:
+            self._mapping(through);self._store.attach(through,association,new=True)
+            self.link(relation.parent,parent,association);self.link(relation.target,target,association)
+        except BaseException:
+            self._failed=True;raise
+
+    def disconnect_many_to_many(self,relation: ManyToMany[P,C,L],parent: P,target: C,association: L) -> None:
+        self._guard();relation.__post_init__()
+        record=self._store.records.get(id(association))
+        if record is None or record.mapping is not relation.parent.child or record.state is not ObjectState.PERSISTENT:
+            raise OrmError('disconnect requires a tracked persisted through row')
+        for edge,obj in ((relation.parent,parent),(relation.target,target)):
+            owner=self._store.records.get(id(obj))
+            if owner is None or owner.mapping is not edge.parent or owner.state is not ObjectState.PERSISTENT:
+                raise OrmError('disconnect requires tracked parent and target')
+            if edge._key(edge.parent,edge.parent_fields,obj)!=edge._key(edge.child,edge.child_fields,association):
+                raise ConflictError('through row does not connect requested identities')
+        self._links=[edge for edge in self._links if edge[2] is not association]
+        self.delete(association)
+
     def _graph_fields(self,record: Record[Any]) -> frozenset[str]:
         return frozenset(name for rel,_,child in self._links if child is record.obj for name in rel.child_fields)
 
     def _resolve_links(self,record: Record[Any],*,require_complete: bool) -> None:
+        assignments: dict[str,Any]={}
         for relation,parent,child in self._links:
             if child is not record.obj: continue
             parent_record=self._store.records.get(id(parent))
             if parent_record is None or parent_record.state not in {ObjectState.PENDING,ObjectState.PERSISTENT}:
                 raise OrmError('linked parent is unavailable')
             values=relation.parent.snapshot(parent)
-            if relation.parent.key(values) is None:
-                if require_complete: raise OrmError('linked parent identity is unresolved')
-                continue
+            if relation.parent.key(values) is None and require_complete: raise OrmError('linked parent identity is unresolved')
             for left,right in zip(relation.parent_fields,relation.child_fields):
-                value=values[left];relation.child.field_columns[right].spec.check(value)
-                setattr(child,right,value)
+                value=values[left]
+                if value is None: continue # Unset generated parent identity.
+                spec=relation.child.field_columns[right].spec;spec.check(value)
+                if right in assignments and not same_column_value(spec,assignments[right],value):
+                    raise ConflictError('overlapping relation keys disagree, including tenant identity')
+                assignments[right]=value
+        # Validate all shared tenant/key assignments before modifying the child.
+        for name,value in assignments.items(): setattr(record.obj,name,value)
 
     def _graph_order(self,plans: list[tuple[Record[Any],str,dict[str,Any]]]) -> list[tuple[Record[Any],str,dict[str,Any]]]:
         by_id={id(record.obj):(record,action,values) for record,action,values in plans}

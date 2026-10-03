@@ -11,6 +11,7 @@ from .query import Field, Query, Scope, field
 
 P=TypeVar('P')
 C=TypeVar('C')
+L=TypeVar('L')
 Key=tuple[tuple[type,object],...]
 
 class RelationBudgetError(OrmError): pass
@@ -204,3 +205,21 @@ class OwnedRelation(Relation[P,C]):
                 raise UnsupportedRelationError('owned relation requires identical supported scalar key profiles')
             if self.on_delete=='nullify' and (not b.spec.nullable or right in self.child.primary_key):
                 raise UnsupportedRelationError('nullify requires nullable non-primary child FK fields')
+
+
+@dataclass(frozen=True)
+class ManyToMany(Generic[P,C,L]):
+    parent: Relation[P,L]
+    target: Relation[C,L]
+
+    def __post_init__(self) -> None:
+        self.parent.__post_init__();self.target.__post_init__()
+        if self.parent.child is not self.target.child:
+            raise ValueError('many-to-many relations must share the same through mapping')
+        if self.parent.parent_fields!=self.parent.parent.primary_key or self.target.parent_fields!=self.target.parent.primary_key:
+            raise ValueError('many-to-many references complete parent/target primary keys')
+        fields=set(self.parent.child_fields)|set(self.target.child_fields)
+        if fields!=set(self.parent.child.primary_key):
+            raise UnsupportedRelationError('through primary key must enforce the complete association identity')
+        if any(self.parent.child.field_columns[name].spec.generated or self.parent.child.field_columns[name].spec.nullable for name in fields):
+            raise UnsupportedRelationError('through keys must be nonnullable application fields')
