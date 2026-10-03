@@ -8,6 +8,11 @@ from .core import CardinalityError, Mutation, OrmError, Select, SessionBusyError
 
 T=TypeVar('T')
 
+class CommitCancelledError(asyncio.CancelledError):
+    """Cancellation during COMMIT; database outcome may be committed."""
+    outcome='indeterminate'
+    sqlstate=None
+
 
 def _profile(profile: str) -> None:
     if profile != 'postgres-direct': raise OrmError('unsupported/unknown execution profile; operation refused')
@@ -112,6 +117,8 @@ class Database:
                 try: native.__exit__(None,None,None)
                 except BaseException as commit:
                     self._discard()
+                    if isinstance(commit,asyncio.CancelledError):
+                        raise CommitCancelledError() from commit
                     if isinstance(commit,Exception): raise _native(commit,committing=True) from commit
                     raise
         finally: self._owner=None
@@ -240,6 +247,8 @@ class AsyncDatabase:
                 try: await native.__aexit__(None,None,None)
                 except BaseException as commit:
                     self._discard()
+                    if isinstance(commit,asyncio.CancelledError):
+                        raise CommitCancelledError() from commit
                     if isinstance(commit,Exception): raise _native(commit,committing=True) from commit
                     raise
         finally: self._owner=None

@@ -151,3 +151,24 @@ def test_sync_connect_sanitizes_driver_error(monkeypatch):
     with pytest.raises(OrmError) as exc: Database.connect('postgresql://user:secret@host/db')
     assert 'secret' not in str(exc.value)
     assert isinstance(exc.value.__cause__,ValueError)
+
+
+class SlowCommitConnection(AsyncConnection):
+    def __init__(self):
+        super().__init__([]);self.commit_started=asyncio.Event();self.never=asyncio.Event();self.pgconn=FakePGConn()
+    @asynccontextmanager
+    async def transaction(self):
+        yield
+        self.commit_started.set();await self.never.wait()
+
+@pytest.mark.asyncio
+async def test_commit_cancellation_preserves_cancel_semantics_and_unknown_outcome():
+    from neutron.orm import CommitCancelledError
+    conn=SlowCommitConnection();db=AsyncDatabase(conn)
+    async def work():
+        async with db.transaction(): pass
+    task=asyncio.create_task(work());await conn.commit_started.wait();task.cancel()
+    with pytest.raises(CommitCancelledError) as exc: await task
+    assert isinstance(exc.value,asyncio.CancelledError)
+    assert exc.value.outcome=='indeterminate'
+    assert conn.pgconn.finished
