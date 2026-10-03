@@ -128,3 +128,46 @@ func TestPageCursorFences(t *testing.T) {
 		t.Fatal("unexpected secret")
 	}
 }
+
+func TestPageScalarProfileAndReadOnly(t *testing.T) {
+	for _, oid := range []uint32{16, 17, 20, 21, 23, 25, 1042, 1043, 1700, 1082, 1114, 1184, 2950} {
+		if !pageColumnSupported(tableColumnMeta{TypeOID: oid, TypType: "b"}) {
+			t.Fatalf("builtin exact scalar OID %d refused", oid)
+		}
+	}
+	for _, col := range []tableColumnMeta{{TypeOID: 114, TypType: "b"}, {TypeOID: 3802, TypType: "b"}, {TypeOID: 1016, TypType: "b"}, {TypeOID: 701, TypType: "b"}, {TypeOID: 20, TypType: "d"}, {TypeOID: 999999, TypType: "e"}, {TypeOID: 999999, TypType: "c"}} {
+		if pageColumnSupported(col) {
+			t.Fatalf("uncertified wire family admitted: %#v", col)
+		}
+	}
+	meta := &tableMeta{Exists: true, PKCols: []string{"id"}, Columns: map[string]tableColumnMeta{"id": {Name: "id", TypeOID: 20, TypType: "b", IsPK: true}}, Order: []tableColumnMeta{{Name: "id", TypeOID: 20, TypType: "b", IsPK: true}, {Name: "body", TypeOID: 25, TypType: "b"}}}
+	if got := pageReadOnlyState(meta); !got.readOnly || got.reason == "" || !got.versioned {
+		t.Fatal("SELECT-only table did not retain read-only reason")
+	}
+	meta.CanDelete = true
+	if pageReadOnlyState(meta).readOnly {
+		t.Fatal("DELETE privilege refused")
+	}
+	meta.RuleEvents = "4"
+	if !pageReadOnlyState(meta).readOnly {
+		t.Fatal("refused DELETE rule falsely admitted")
+	}
+	meta.Order[1].CanUpdate = true
+	if pageReadOnlyState(meta).readOnly {
+		t.Fatal("admitted UPDATE privilege refused")
+	}
+	meta.ForeignDescendant = true
+	if got := pageReadOnlyState(meta); !got.readOnly || got.reason != foreignDescendantReason {
+		t.Fatal("existing guarded-state reason lost")
+	}
+	for _, v := range []string{"PostgreSQL 17.3", "postgresql 17.3"} {
+		if !pageEngineSupported(v) {
+			t.Fatal("native marker refused")
+		}
+	}
+	for _, v := range []string{"Nucleus 1", "PostgreSQL 17 NuClEuS", "PostgreSQL 17 CockroachDB", "PostgreSQL 17 Yugabyte", "PostgreSQL 17 Redshift", "PostgreSQL 17 Greenplum", "PostgreSQL 17 Materialize", "PostgreSQL 17 QuestDB", "PostgreSQL 17 CrateDB"} {
+		if pageEngineSupported(v) {
+			t.Fatalf("unsupported marker accepted %s", v)
+		}
+	}
+}

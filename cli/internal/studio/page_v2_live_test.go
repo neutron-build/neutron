@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"strings"
@@ -36,6 +37,8 @@ func TestStudioKeysetPageNative(t *testing.T) {
 	}
 	t.Cleanup(admin.Close)
 	name := fmt.Sprintf("page_v2_%d_%d", os.Getpid(), time.Now().UnixNano())
+	readerRole := name + "_reader"
+	roleCreated := false
 	if err = admin.Exec(ctx, "CREATE DATABASE "+quoteIdent(name)); err != nil {
 		t.Fatal("create disposable database failed")
 	}
@@ -48,6 +51,11 @@ func TestStudioKeysetPageNative(t *testing.T) {
 		}
 		if err := admin.Exec(cleanup, "DROP DATABASE "+quoteIdent(name)+" WITH (FORCE)"); err != nil {
 			t.Error("drop owned disposable database failed")
+		}
+		if roleCreated {
+			if err := admin.Exec(cleanup, "DROP ROLE "+quoteIdent(readerRole)); err != nil {
+				t.Error("drop owned reader role failed")
+			}
 		}
 	})
 	fixtureURL, err := url.Parse(deriveStudioDatabaseURL(t, base, name))
@@ -65,11 +73,18 @@ func TestStudioKeysetPageNative(t *testing.T) {
 	stmts := []string{
 		`CREATE SCHEMA "Odd Schema"`,
 		`CREATE DOMAIN public.text AS pg_catalog.text`,
-		`CREATE TABLE "Odd Schema"."Odd Table" ("Key" bigint PRIMARY KEY, exact numeric(30,4), body text, raw bytea)`,
+		`CREATE TABLE "Odd Schema"."Odd Table" ("Key" bigint PRIMARY KEY, exact numeric(30,4), body pg_catalog.text, raw bytea)`,
 		`INSERT INTO "Odd Schema"."Odd Table" VALUES (-9223372036854775808,123456789012345678901234.1234,'minimum',decode('00ff','hex')),(-1,NULL,'negative',NULL),(9007199254740993,42.0100,'above JS exact integer',decode('ff','hex')),(9223372036854775807,0.0001,'maximum',NULL)`,
-		`CREATE TABLE public."Odd Table" ("Key" bigint PRIMARY KEY, body text)`,
+		`CREATE TABLE public."Odd Table" ("Key" bigint PRIMARY KEY, body pg_catalog.text)`,
 		`INSERT INTO public."Odd Table" VALUES (1,'decoy')`,
 		`CREATE TABLE public.int_key (id int PRIMARY KEY)`,
+		`CREATE TABLE public.json_precision (id bigint PRIMARY KEY, payload jsonb)`,
+		`INSERT INTO public.json_precision VALUES(1,'{"large":9007199254740993}'::jsonb),(2,'null'::jsonb),(3,NULL)`,
+		`CREATE TABLE public.json_text (id bigint PRIMARY KEY, payload json)`,
+		`INSERT INTO public.json_text VALUES(1,'{"large":9007199254740993}'::json),(2,'null'::json),(3,NULL)`,
+		`CREATE TABLE public.array_value(id bigint PRIMARY KEY, payload bigint[])`,
+		`CREATE TABLE public.custom_value(id bigint PRIMARY KEY, payload public.text)`,
+
 		`CREATE DOMAIN public.int8 AS bigint`,
 		`CREATE TABLE public.domain_key (id public.int8 PRIMARY KEY)`,
 		`CREATE TABLE public.composite_key (a bigint,b bigint, PRIMARY KEY(a,b))`,
@@ -94,7 +109,11 @@ func TestStudioKeysetPageNative(t *testing.T) {
 	ts.Listener = ln
 	ts.Start()
 	t.Cleanup(ts.Close)
-	httpClient := &http.Client{Timeout: 10 * time.Second}
+	transport := &http.Transport{MaxConnsPerHost: 1, MaxIdleConnsPerHost: 1}
+	t.Cleanup(transport.CloseIdleConnections)
+	httpClient := &http.Client{Timeout: 10 * time.Second, Transport: transport}
+	var latestConn net.Conn
+	latestReused := false
 	call := func(p pageRequest, token string) (int, map[string]any) {
 		t.Helper()
 		b, _ := json.Marshal(p)
@@ -102,6 +121,7 @@ func TestStudioKeysetPageNative(t *testing.T) {
 		if err != nil {
 			t.Fatal("request failed")
 		}
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { latestConn = info.Conn; latestReused = info.Reused }}))
 		req.Header.Set(sessionHeader, token)
 		req.Header.Set("Origin", ts.URL)
 		res, err := httpClient.Do(req)
@@ -170,6 +190,78 @@ func TestStudioKeysetPageNative(t *testing.T) {
 	if err = fixture.QueryRow(ctx, `SELECT xmin::text FROM "Odd Schema"."Odd Table" WHERE "Key"=-9223372036854775808`).Scan(&xmin); err != nil || versions[0] != xmin {
 		t.Fatal("authoritative version mismatch")
 	}
+	// A real TCP keep-alive request after the old socket deadline must succeed
+	// on the SAME connection, not silently reconnect around a leaked deadline.
+	savedConn := latestConn
+	time.Sleep(5100 * time.Millisecond)
+	if status, _ = call(p, s.sessionToken); status != 200 || !latestReused || latestConn != savedConn {
+		t.Fatal("page deadline leaked or keep-alive connection was not reused")
+	}
+	// An actual SELECT-only role can browse but must never be advertised writable.
+	if err = admin.Exec(ctx, "CREATE ROLE "+quoteIdent(readerRole)+" NOLOGIN"); err != nil {
+		t.Fatal("create owned reader role failed")
+	}
+	roleCreated = true
+	for _, stmt := range []string{"GRANT USAGE ON SCHEMA \"Odd Schema\" TO " + quoteIdent(readerRole), "GRANT SELECT ON \"Odd Schema\".\"Odd Table\" TO " + quoteIdent(readerRole)} {
+		if err = fixture.Exec(ctx, stmt); err != nil {
+			t.Fatal("reader grant failed")
+		}
+	}
+	readerURL := *fixtureURL
+	readerOptions := readerURL.Query()
+	readerOptions.Set("options", "-c search_path=public,pg_catalog -c role="+readerRole)
+	readerURL.RawQuery = readerOptions.Encode()
+	reader, err := db.Connect(ctx, readerURL.String())
+	if err != nil {
+		t.Fatal("reader connect failed")
+	}
+	t.Cleanup(reader.Close)
+	s.mu.Lock()
+	s.clients["reader"] = reader
+	s.epochs["reader"] = "reader-epoch"
+	s.mu.Unlock()
+	readerPage := p
+	readerPage.ConnectionID = "reader"
+	if status, result := call(readerPage, s.sessionToken); status != 200 || result["readOnly"] != true || result["readOnlyReason"] == "" {
+		t.Fatalf("SELECT-only role advertised writable: status%d %v", status, result)
+	}
+	// A blocked physical relation exercises the real 5s request deadline and
+	// cancellation; a subsequent request must reuse the pool successfully.
+	blocker, err := fixture.BeginTx(ctx)
+	if err != nil {
+		t.Fatal("blocker begin failed")
+	}
+	defer func() {
+		cleanup, c := context.WithTimeout(context.Background(), time.Second)
+		defer c()
+		_ = blocker.Rollback(cleanup)
+	}()
+	if _, err = blocker.Exec(ctx, `LOCK TABLE "Odd Schema"."Odd Table" IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal("blocker lock failed")
+	}
+	cancelCtx, cancelRequest := context.WithTimeout(ctx, 100*time.Millisecond)
+	requestBody, _ := json.Marshal(p)
+	cancelReq, _ := http.NewRequestWithContext(cancelCtx, http.MethodPost, ts.URL+"/api/table/v2/page", bytes.NewReader(requestBody))
+	cancelReq.Header.Set(sessionHeader, s.sessionToken)
+	cancelReq.Header.Set("Origin", ts.URL)
+	canceledResponse, cancelErr := httpClient.Do(cancelReq)
+	cancelRequest()
+	if canceledResponse != nil {
+		canceledResponse.Body.Close()
+	}
+	if cancelErr == nil {
+		t.Fatal("canceled blocked request unexpectedly succeeded")
+	}
+	started := time.Now()
+	if status, _ = call(p, s.sessionToken); status != 502 || time.Since(started) < 4*time.Second || time.Since(started) > 8*time.Second {
+		t.Fatal("blocked relation did not honor bounded deadline")
+	}
+	if err = blocker.Rollback(ctx); err != nil {
+		t.Fatal("blocker release failed")
+	}
+	if status, _ = call(p, s.sessionToken); status != 200 {
+		t.Fatal("pool unusable after cancellation/deadline")
+	}
 	cursor := first["nextCursor"].(string)
 	p.Cursor = cursor
 	status, second := call(p, s.sessionToken)
@@ -209,7 +301,7 @@ func TestStudioKeysetPageNative(t *testing.T) {
 	s.mu.Lock()
 	s.epochs["native"] = "page-epoch"
 	s.mu.Unlock()
-	if err = fixture.Exec(ctx, `ALTER TABLE "Odd Schema"."Odd Table" ADD COLUMN new_column text`); err != nil {
+	if err = fixture.Exec(ctx, `ALTER TABLE "Odd Schema"."Odd Table" ADD COLUMN new_column pg_catalog.text`); err != nil {
 		t.Fatal("alter failed")
 	}
 	if status, _ = call(p, s.sessionToken); status != 409 {
@@ -221,20 +313,20 @@ func TestStudioKeysetPageNative(t *testing.T) {
 		t.Fatal("new plan after DDL failed")
 	}
 	oldCursor := fresh["nextCursor"].(string)
-	if err = fixture.Exec(ctx, `DROP TABLE "Odd Schema"."Odd Table";CREATE TABLE "Odd Schema"."Odd Table"("Key" bigint PRIMARY KEY,body text)`); err != nil {
+	if err = fixture.Exec(ctx, `DROP TABLE "Odd Schema"."Odd Table";CREATE TABLE "Odd Schema"."Odd Table"("Key" bigint PRIMARY KEY,body pg_catalog.text)`); err != nil {
 		t.Fatal("recreate failed")
 	}
 	p.Cursor = oldCursor
 	if status, _ = call(p, s.sessionToken); status != 409 {
 		t.Fatal("replacement relation cursor accepted")
 	}
-	for _, table := range []string{"int_key", "domain_key", "composite_key", "parent_key", "child_key"} {
+	for _, table := range []string{"int_key", "domain_key", "composite_key", "parent_key", "child_key", "json_precision", "json_text", "array_value", "custom_value"} {
 		changed := pageRequest{ConnectionID: "native", Schema: "public", Table: table, Profile: "postgres-direct", Limit: 2}
 		if status, _ = call(changed, s.sessionToken); status != 400 {
 			t.Fatalf("unsupported %s status%d", table, status)
 		}
 	}
-	if err = fixture.Exec(ctx, `CREATE TABLE public.huge(id bigint PRIMARY KEY, body text);INSERT INTO public.huge VALUES(1,repeat('x',8388609))`); err != nil {
+	if err = fixture.Exec(ctx, `CREATE TABLE public.huge(id bigint PRIMARY KEY, body pg_catalog.text);INSERT INTO public.huge VALUES(1,repeat('x',8388609))`); err != nil {
 		t.Fatal("huge fixture failed")
 	}
 	huge := pageRequest{ConnectionID: "native", Schema: "public", Table: "huge", Profile: "postgres-direct", Limit: 1}

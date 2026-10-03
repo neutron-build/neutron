@@ -8,6 +8,12 @@ package studio
 // The 8 MiB budget bounds transferred/retained row bytes and the JSON response,
 // not PostgreSQL's memory while evaluating a datum's text length. There is no
 // COUNT, OFFSET, Nucleus fallback, arbitrary SQL, or held cross-page transaction.
+// Only builtin exact scalar wire families are admitted. JSON/JSONB (including
+// JSON null versus SQL NULL), arrays, floats and custom/domain/enum/extension
+// families are not yet certified by this page profile and are refused.
+// The cursor binds the listed catalog definition, not all referenced RLS
+// function bodies, role memberships/ACLs or custom security GUCs. Fresh native
+// authorization and RLS remain authoritative on every request.
 
 import (
 	"bytes"
@@ -187,6 +193,52 @@ const pageDefinitionSQL = `SELECT current_user::text, pg_catalog.json_build_arra
  WHERE n.nspname=$1 AND c.relname=$2 AND c.relkind='r' AND c.relpersistence='p'
  AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_inherits h WHERE h.inhrelid=c.oid OR h.inhparent=c.oid)`
 
+// pageColumnSupported deliberately excludes JSON: pgx Rows.Values decodes JSON
+// numbers through float64 and collapses JSON null into SQL NULL. Unknown OIDs
+// and structs must never fall through as an unqualified plain JSON value.
+func pageColumnSupported(col tableColumnMeta) bool {
+	if col.TypType != "b" {
+		return false
+	}
+	switch col.TypeOID {
+	case 16, 17, 20, 21, 23, 25, 1042, 1043, 1700, 1082, 1114, 1184, 2950:
+		return true
+	default:
+		return false
+	}
+}
+
+func pageReadOnlyState(meta *tableMeta) readOnlyState {
+	state := tableReadOnlyState(meta, true)
+	if state.readOnly {
+		return state
+	}
+	if meta.CanDelete && !strings.Contains(meta.RuleEvents, "4") {
+		return state
+	}
+	for _, col := range meta.Order {
+		if (editableReason(col) == "" && !strings.Contains(meta.RuleEvents, "2")) || (insertableReason(col) == "" && !strings.Contains(meta.RuleEvents, "3")) {
+			return state
+		}
+	}
+	state.readOnly = true
+	state.reason = "has no admitted row mutation for the connected role and table rules"
+	return state
+}
+
+func pageEngineSupported(version string) bool {
+	version = strings.ToLower(version)
+	if !strings.HasPrefix(version, "postgresql ") {
+		return false
+	}
+	for _, marker := range []string{"nucleus", "cockroach", "yugabyte", "redshift", "greenplum", "materialize", "questdb", "cratedb"} {
+		if strings.Contains(version, marker) {
+			return false
+		}
+	}
+	return true
+}
+
 func pageMeta(ctx context.Context, tx pgx.Tx, p pageRequest) (*tableMeta, error) {
 	rows, err := tx.Query(ctx, tableMetaSQL, p.Schema, p.Table)
 	if err != nil {
@@ -202,6 +254,9 @@ func pageMeta(ctx context.Context, tx pgx.Tx, p pageRequest) (*tableMeta, error)
 		}
 		col.KeyPos = int(pos)
 		col.IsPK = pos > 0
+		if !pageColumnSupported(col) {
+			return nil, errors.New("page profile does not support this column wire family")
+		}
 		meta.Order = append(meta.Order, col)
 		meta.Columns[col.Name] = col
 	}
@@ -303,7 +358,14 @@ func (s *Server) handleTablePageV2(w http.ResponseWriter, r *http.Request) {
 		defer c()
 		_ = tx.Rollback(cleanup)
 	}()
-	fail := func() { writeError(w, 502, "page query failed or exceeded its deadline") }
+	fail := func() {
+		if ctx.Err() != nil {
+			// The query deadline and socket deadline coincide. Allow only a short,
+			// bounded error-response grace; no query or success may resume here.
+			_ = controller.SetWriteDeadline(time.Now().Add(250 * time.Millisecond))
+		}
+		writeError(w, 502, "page query failed or exceeded its deadline")
+	}
 	// Normalize operator/type/function resolution independently of saved
 	// connection startup options; every relation identifier remains qualified.
 	if _, err = tx.Exec(ctx, "SET LOCAL search_path = pg_catalog"); err != nil {
@@ -324,12 +386,16 @@ func (s *Server) handleTablePageV2(w http.ResponseWriter, r *http.Request) {
 		fail()
 		return
 	}
-	if !strings.HasPrefix(pgVersion, "PostgreSQL ") || strings.Contains(pgVersion, "Nucleus") {
+	if !pageEngineSupported(pgVersion) {
 		writeError(w, 400, "page profile requires PostgreSQL-direct")
 		return
 	}
 	var role, definition string
 	if err = tx.QueryRow(ctx, pageDefinitionSQL, p.Schema, p.Table).Scan(&role, &definition); err != nil {
+		if ctx.Err() != nil {
+			fail()
+			return
+		}
 		writeError(w, 400, "page profile requires an ordinary permanent non-inherited PostgreSQL table")
 		return
 	}
@@ -341,7 +407,11 @@ func (s *Server) handleTablePageV2(w http.ResponseWriter, r *http.Request) {
 	}
 	meta, err := pageMeta(ctx, tx, p)
 	if err != nil {
-		writeError(w, 400, "page profile requires a single native bigint primary key")
+		if ctx.Err() != nil {
+			fail()
+			return
+		}
+		writeError(w, 400, "page profile requires a single native bigint primary key and builtin exact scalar columns; JSON, arrays, floats and custom types are unsupported")
 		return
 	}
 	pk := quoteIdent(meta.PKCols[0])
@@ -448,7 +518,11 @@ func (s *Server) handleTablePageV2(w http.ResponseWriter, r *http.Request) {
 	for _, c := range meta.Order {
 		names = append(names, c.Name)
 	}
-	response := map[string]any{"columns": names, "rows": data, "versions": versions, "keyColumns": meta.PKCols, "binding": bindingFor(epoch, meta.RelOID), "versioned": true, "readOnly": false, "rowCount": len(data), "hasNext": hasNext, "nextCursor": next, "consistency": "live-keyset/request-repeatable-read"}
+	state := pageReadOnlyState(meta)
+	response := map[string]any{"columns": names, "rows": data, "versions": versions, "keyColumns": meta.PKCols, "binding": bindingFor(epoch, meta.RelOID), "versioned": true, "readOnly": state.readOnly, "rowCount": len(data), "hasNext": hasNext, "nextCursor": next, "consistency": "live-keyset/request-repeatable-read"}
+	if state.readOnly {
+		response["readOnlyReason"] = p.Schema + "." + p.Table + " " + state.reason
+	}
 	b, err := json.Marshal(response)
 	if err != nil {
 		fail()
