@@ -60,3 +60,7 @@ __all__ += ["ArrayDimension","PgArray","TimeOfDay","Interval"]
 
 from .core import array_spec
 __all__ += ["array_spec"]
+
+from .pg_value import PgRange
+from .core import range_spec
+__all__ += ["PgRange","range_spec"]

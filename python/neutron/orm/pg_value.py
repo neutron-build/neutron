@@ -51,3 +51,25 @@ class Interval:
 class BoundArray:
     value: PgArray[object]
     sql_type: str
+
+@dataclass(frozen=True)
+class PgRange(Generic[T]):
+    lower: T|None=None
+    upper: T|None=None
+    lower_inclusive: bool=False
+    upper_inclusive: bool=False
+    empty: bool=False
+    def __post_init__(self) -> None:
+        if any(type(flag) is not bool for flag in (self.lower_inclusive,self.upper_inclusive,self.empty)):
+            raise ValueError('range bound flags require booleans')
+        if self.empty and (self.lower is not None or self.upper is not None or self.lower_inclusive or self.upper_inclusive):
+            raise ValueError('empty range cannot carry bounds')
+        if self.lower is None and self.lower_inclusive or self.upper is None and self.upper_inclusive:
+            raise ValueError('unbounded range cannot be inclusive')
+        if any(isinstance(value,(dict,list,set,bytearray,PgArray,PgRange)) for value in (self.lower,self.upper)):
+            raise ValueError('range bounds require immutable scalars')
+
+@dataclass(frozen=True)
+class BoundRange:
+    value: PgRange[object]
+    sql_type: str

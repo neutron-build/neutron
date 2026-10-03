@@ -520,3 +520,14 @@ builtin SQL type OIDs, verified against native result descriptions before
 objects are decoded; binary arrays additionally verify their element OID.
 Qualified user enum/domain types require explicit catalog admission and are not
 silently decoded as builtin strings or scalars.
+
+`range_spec(int, 'int4range', nullable=True)` declares a `PgRange[int]` column.
+`PgRange(lower, upper, lower_inclusive=False, upper_inclusive=False)` preserves
+finite bound values and inclusivity; None at a bound is unbounded, while None at
+the column is SQL NULL. `PgRange(empty=True)` is a distinct empty range. Empty
+ranges cannot carry bounds and unbounded endpoints cannot be inclusive.
+Builtin int4/int8/numeric/date/local timestamp/instant timestamp ranges have
+explicit native subtype OIDs. Discrete PostgreSQL ranges can canonicalize writes:
+for example `[1,3]` returns `[1,4)`, and mapped RETURNING adopts that native value.
+Range values are immutable and replacement edits use normal snapshot rollback;
+range primary identities and multiranges remain unqualified.

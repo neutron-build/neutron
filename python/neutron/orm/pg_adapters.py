@@ -3,11 +3,14 @@ from __future__ import annotations
 from functools import cache
 import struct
 from typing import Any
-from .pg_value import ArrayDimension, BoundArray, Interval, MAX_ARRAY_ELEMENTS, PgArray, TimeOfDay
+from .pg_value import ArrayDimension, BoundArray, BoundRange, Interval, MAX_ARRAY_ELEMENTS, PgArray, PgRange, TimeOfDay
 
 # PostgreSQL catalog builtin identities are stable, unlike user-defined OIDs.
 BUILTIN_OIDS={'int2':21,'int4':23,'int8':20,'text':25,'varchar':1043,'bool':16,'numeric':1700,'uuid':2950,'bytea':17,'date':1082,'timestamp':1114,'timestamptz':1184,'time':1083,'interval':1186,'json':114,'jsonb':3802}
 ARRAY_OIDS={'int2[]':1005,'int4[]':1007,'int8[]':1016,'text[]':1009,'varchar[]':1015,'bool[]':1000,'numeric[]':1231,'uuid[]':2951,'bytea[]':1001,'date[]':1182,'timestamp[]':1115,'timestamptz[]':1185,'time[]':1183,'interval[]':1187}
+
+RANGE_OIDS={'int4range':(3904,23),'int8range':(3926,20),'numrange':(3906,1700),'daterange':(3912,1082),'tsrange':(3908,1114),'tstzrange':(3910,1184)}
+BUILTIN_OIDS.update({name:oids[0] for name,oids in RANGE_OIDS.items()})
 
 @cache
 def _adapter_classes() -> tuple[type[Any],...]:
@@ -78,8 +81,52 @@ def _adapter_classes() -> tuple[type[Any],...]:
                 if value is None: raise ValueError('non-NULL array scalar encoded NULL')
                 encoded=bytes(value);parts.extend((struct.pack('!i',len(encoded)),encoded))
             return b''.join(parts)
+    class RangeLoader(Loader):
+        format=Format.BINARY
+        element_oid: int
+        def __init__(self,oid: int,context: Any=None) -> None:
+            super().__init__(oid,context)
+            if context is None: raise ValueError('range codec requires connection context')
+            cls=context.adapters.get_loader(self.element_oid,Format.BINARY)
+            self.element_loader=cls(self.element_oid,context)
+        def load(self,data: Any) -> PgRange[Any]:
+            raw=bytes(data)
+            if not raw or raw[0]&~31: raise ValueError('invalid native range flags')
+            flags=raw[0]
+            if flags&1:
+                if flags!=1 or len(raw)!=1: raise ValueError('invalid empty native range')
+                return PgRange(empty=True)
+            bounds: list[Any]=[];offset=1
+            for unbounded in (8,16):
+                if flags&unbounded: bounds.append(None);continue
+                if len(raw)<offset+4: raise ValueError('truncated range bound')
+                size=struct.unpack_from('!i',raw,offset)[0];offset+=4
+                if size<0 or len(raw)<offset+size: raise ValueError('invalid range bound size')
+                bounds.append(self.element_loader.load(raw[offset:offset+size]));offset+=size
+            if offset!=len(raw): raise ValueError('trailing native range bytes')
+            return PgRange(bounds[0],bounds[1],bool(flags&2),bool(flags&4))
+    class RangeDumper(Dumper):
+        format=Format.BINARY
+        def __init__(self,cls: type[Any],context: Any=None) -> None:
+            super().__init__(cls,context);self.context=context
+        def get_key(self,obj: BoundRange,format: PyFormat) -> Any: return (type(obj),obj.sql_type)
+        def upgrade(self,obj: BoundRange,format: PyFormat) -> RangeDumper:
+            upgraded=RangeDumper(self.cls,self.context);upgraded.oid=RANGE_OIDS[obj.sql_type][0];return upgraded
+        def dump(self,obj: BoundRange) -> bytes:
+            value=obj.value
+            if value.empty: return bytes((1,))
+            flags=int(value.lower_inclusive)*2+int(value.upper_inclusive)*4+int(value.lower is None)*8+int(value.upper is None)*16
+            parts=[bytes((flags,))];oid=RANGE_OIDS[obj.sql_type][1]
+            for bound in (value.lower,value.upper):
+                if bound is None: continue
+                cls=self.context.adapters.get_dumper_by_oid(oid,Format.BINARY)
+                encoded=cls(type(bound),self.context).dump(bound)
+                if encoded is None: raise ValueError('finite range bound encoded NULL')
+                raw=bytes(encoded);parts.extend((struct.pack('!i',len(raw)),raw))
+            return b''.join(parts)
     arrays=tuple(type('Native'+name.replace('[]','Array'),(ArrayLoader,),{'element_oid':BUILTIN_OIDS[name[:-2]]}) for name in ARRAY_OIDS)
-    return TimeLoader,TimeDumper,IntervalLoader,IntervalDumper,ArrayDumper,*arrays
+    ranges=tuple(type('Native'+name.title(),(RangeLoader,),{'element_oid':oids[1]}) for name,oids in RANGE_OIDS.items())
+    return TimeLoader,TimeDumper,IntervalLoader,IntervalDumper,ArrayDumper,*arrays,RangeDumper,*ranges
 
 
 def register_native_values(connection: Any) -> None:
@@ -90,7 +137,11 @@ def register_native_values(connection: Any) -> None:
     connection.adapters.register_loader(1083,time_load);connection.adapters.register_dumper(TimeOfDay,time_dump)
     connection.adapters.register_loader(1186,interval_load);connection.adapters.register_dumper(Interval,interval_dump)
     connection.adapters.register_dumper(BoundArray,array_dump)
-    for (name,oid),cls in zip(ARRAY_OIDS.items(),classes[5:]):
+    range_start=5+len(ARRAY_OIDS)
+    connection.adapters.register_dumper(BoundRange,classes[range_start])
+    for (name,(oid,_)),cls in zip(RANGE_OIDS.items(),classes[range_start+1:]):
+        connection.adapters.register_loader(oid,cls)
+    for (name,oid),cls in zip(ARRAY_OIDS.items(),classes[5:range_start]):
         info=connection.adapters.types.get(name[:-2])
         if info is None or info.array_oid!=oid: raise ValueError('native array SQL type identity mismatch')
         connection.adapters.register_loader(oid,cls)

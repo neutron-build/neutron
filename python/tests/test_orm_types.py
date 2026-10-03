@@ -206,3 +206,11 @@ def static_component_value_consumer(db: Database) -> None:
 async def static_async_component_value_consumer(db: AsyncDatabase) -> None:
     table=Table('components',{'data':array_spec(int,'int4')})
     assert_type(await db.all(select(table.column('data',PgArray[int]))),list[PgArray[int]])
+
+from neutron.orm import PgRange,range_spec
+
+def static_range_value_consumer(db: Database) -> None:
+    spec=range_spec(int,'int4range',nullable=True)
+    assert_type(spec,ColumnSpec[PgRange[int]])
+    table=Table('range_values',{'value':spec})
+    assert_type(db.all(select(table.nullable_column('value',PgRange[int]))),list[PgRange[int]|None])

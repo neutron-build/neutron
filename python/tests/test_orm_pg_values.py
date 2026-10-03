@@ -45,3 +45,17 @@ def test_native_binary_array_decoder_refuses_element_oid_and_trailing_bytes():
     loader=cls(1007,Context())
     with pytest.raises(ValueError,match='OID'): loader.load(struct.pack('!iii',0,0,20))
     with pytest.raises(ValueError,match='trailing'): loader.load(struct.pack('!iii',0,0,23)+b'extra')
+
+from neutron.orm import PgRange,range_spec
+
+def test_range_bound_and_type_containment():
+    value=PgRange(1,9,True,False)
+    range_spec(int,'int4range').check(value)
+    assert PgRange(empty=True).empty and not PgRange().empty
+    with pytest.raises(ValueError): PgRange(empty=True,lower=1)
+    with pytest.raises(ValueError): PgRange(lower_inclusive=True)
+    with pytest.raises(ValueError): range_spec(int,'numrange')
+    with pytest.raises(ValueError): range_spec(int,'int4range').check(PgRange(2**40,3))
+    table=Table('ranges',{'value':range_spec(Decimal,'numrange')})
+    assert select(table.column('value',PgRange[Decimal])).compile().result_oids==(('value',3906),)
+    with pytest.raises(ValueError): table.column('value',PgRange[int])

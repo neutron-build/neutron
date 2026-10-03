@@ -8,7 +8,7 @@ from typing import Any, Callable, Generic, Iterable, Mapping, TypeVar, cast, get
 from uuid import UUID
 
 from .json_value import BoundJson, JsonDocument, MutableJson
-from .pg_value import BoundArray, PgArray, TimeOfDay, Interval
+from .pg_value import BoundArray, BoundRange, PgArray, PgRange, TimeOfDay, Interval
 
 T = TypeVar('T')
 
@@ -42,6 +42,7 @@ def _bound_quote(name: str) -> str:
 # Column families deliberately finite; custom SQL type text cannot become SQL.
 _TYPES: dict[str, type] = {'int2':int,'int4':int,'int8':int,'text':str,'varchar':str,'bool':bool,'numeric':Decimal,'uuid':UUID,'bytea':bytes,'timestamp':dt.datetime,'timestamptz':dt.datetime,'date':dt.date,'json':JsonDocument,'jsonb':JsonDocument,'time':TimeOfDay,'interval':Interval}
 
+_RANGE_TYPES={'int4range':'int4','int8range':'int8','numrange':'numeric','daterange':'date','tsrange':'timestamp','tstzrange':'timestamptz'}
 _ARRAY_TYPES=frozenset({'int2','int4','int8','text','varchar','bool','numeric','uuid','bytea','date','timestamp','timestamptz','time','interval'})
 
 @dataclass(frozen=True)
@@ -52,7 +53,7 @@ class ColumnSpec(Generic[T]):
     generated: bool = False
 
     def __post_init__(self) -> None:
-        if _TYPES.get(self.sql_type) is not self.python_type and not (self.sql_type=='jsonb' and self.python_type is MutableJson) and not (self.python_type is PgArray and self.sql_type.endswith('[]') and self.sql_type[:-2] in _ARRAY_TYPES):
+        if _TYPES.get(self.sql_type) is not self.python_type and not (self.sql_type=='jsonb' and self.python_type is MutableJson) and not (self.python_type is PgRange and self.sql_type in _RANGE_TYPES) and not (self.python_type is PgArray and self.sql_type.endswith('[]') and self.sql_type[:-2] in _ARRAY_TYPES):
             raise ValueError('unsupported or mismatched column type profile')
 
     @property
@@ -70,6 +71,11 @@ class ColumnSpec(Generic[T]):
             return
         if not isinstance(value, self.python_type) or (self.python_type is int and isinstance(value, bool)) or (self.sql_type == 'date' and isinstance(value, dt.datetime)):
             raise ValueError('column value has wrong native type')
+        if isinstance(value,PgRange):
+            element_type=_RANGE_TYPES[self.sql_type]
+            range_element: ColumnSpec[Any]=ColumnSpec(_TYPES[element_type],element_type)
+            for bound in (value.lower,value.upper):
+                if bound is not None: range_element.check(bound)
         if isinstance(value,PgArray):
             element: ColumnSpec[Any]=ColumnSpec(_TYPES[self.sql_type[:-2]],self.sql_type[:-2],nullable=True)
             for item in value.elements: element.check(item)
@@ -88,8 +94,16 @@ def array_spec(element_type: type[T],sql_type: str,*,nullable: bool=False,genera
     return cast(ColumnSpec[PgArray[T]],ColumnSpec(PgArray,sql_type+'[]',nullable,generated))
 
 
+def range_spec(element_type: type[T],sql_type: str,*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgRange[T]]:
+    if sql_type not in _RANGE_TYPES or _TYPES[_RANGE_TYPES[sql_type]] is not element_type: raise ValueError('unsupported range element profile')
+    return cast(ColumnSpec[PgRange[T]],ColumnSpec(PgRange,sql_type,nullable,generated))
+
+
 def _column_type(spec: ColumnSpec[Any],python_type: Any) -> None:
-    if get_origin(python_type) is PgArray:
+    if get_origin(python_type) is PgRange:
+        if spec.python_type is not PgRange or get_args(python_type)!=(_TYPES[_RANGE_TYPES[spec.sql_type]],):
+            raise ValueError('range column element type mismatch')
+    elif get_origin(python_type) is PgArray:
         if spec.python_type is not PgArray or get_args(python_type)!=(_TYPES[spec.sql_type[:-2]],):
             raise ValueError('array column element type mismatch')
     elif spec.python_type is not python_type: raise ValueError('column type mismatch')
@@ -295,6 +309,7 @@ def delete(table: Table, *, where: Predicate) -> Mutation:
 
 
 def _parameter(column: Column[Any], value: object) -> object:
+    if isinstance(value,PgRange): return BoundRange(value,column.spec.sql_type)
     if isinstance(value,PgArray): return BoundArray(value,column.spec.sql_type)
     if isinstance(value,MutableJson): return BoundJson(JsonDocument(value.text),True)
     if isinstance(value, JsonDocument): return BoundJson(value, column.spec.sql_type == 'jsonb')
