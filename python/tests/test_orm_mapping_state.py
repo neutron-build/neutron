@@ -127,3 +127,81 @@ def test_unknown_attach_baseline_semantics_preserve_json_types_and_instants():
     folded=dt.datetime(2024,11,3,1,30,tzinfo=ZoneInfo('America/New_York'),fold=1)
     assert same_column_value(spec,folded,folded.astimezone(dt.timezone.utc))
     assert not same_column_value(spec,folded,folded.replace(fold=0))
+
+
+def test_mapper_refuses_raising_normalizing_and_access_hooks_before_io():
+    touched=[]
+    @dataclass
+    class Raising:
+        id: int
+        name: str
+        def __setattr__(self,name,value):
+            touched.append('raising setter')
+            raise RuntimeError('custom setter')
+    @dataclass
+    class Normalizing:
+        id: int
+        name: str
+        def __setattr__(self,name,value):
+            touched.append('normalizing setter')
+            object.__setattr__(self,name,value.upper() if isinstance(value,str) else value)
+    @dataclass
+    class Reading:
+        id: int
+        name: str
+        def __getattribute__(self,name):
+            touched.append('getter')
+            return object.__getattribute__(self,name)
+    @dataclass
+    class Fallback:
+        id: int
+        name: str
+        def __getattr__(self,name):
+            touched.append('fallback getter')
+            return 'invented'
+    table=Table('users',{'id':ColumnSpec(int,'int4'),'name':ColumnSpec(str,'text')})
+    columns={'id':table.column('id',int),'name':table.column('name',str)}
+    for model in (Raising,Normalizing,Reading,Fallback):
+        with pytest.raises(ValueError,match='attribute'): ModelMapping(model,table,columns,primary_key=('id',))
+    assert touched==[]
+
+
+def test_mapper_refuses_property_and_custom_descriptor_without_executing_them():
+    touched=[]
+    @dataclass
+    class PropertyModel:
+        id: int
+        name: str
+    def getter(obj): touched.append('property read');return 'normalized'
+    def setter(obj,value): touched.append('property write');raise RuntimeError('no restore')
+    PropertyModel.name=property(getter,setter)
+    @dataclass
+    class DescriptorModel:
+        id: int
+        name: str
+    class NormalizingDescriptor:
+        def __get__(self,obj,owner=None): touched.append('descriptor read');return 'normalized'
+        def __set__(self,obj,value): touched.append('descriptor write');obj.__dict__['name']=value.upper()
+    DescriptorModel.name=NormalizingDescriptor()
+    table=Table('users',{'id':ColumnSpec(int,'int4'),'name':ColumnSpec(str,'text')})
+    columns={'id':table.column('id',int),'name':table.column('name',str)}
+    for model in (PropertyModel,DescriptorModel):
+        with pytest.raises(ValueError,match='descriptors'): ModelMapping(model,table,columns,primary_key=('id',))
+    assert touched==[]
+
+
+def test_standard_slots_supported_and_late_attribute_profile_changes_refused():
+    @dataclass(slots=True,weakref_slot=True)
+    class Slotted:
+        id: int
+        name: str
+    table=Table('users',{'id':ColumnSpec(int,'int4'),'name':ColumnSpec(str,'text')})
+    columns={'id':table.column('id',int),'name':table.column('name',str)}
+    mapper=ModelMapping(Slotted,table,columns,primary_key=('id',))
+    obj=mapper.construct({'id':1,'name':'original'})
+    mapper.restore(obj,{'id':1,'name':'restored'})
+    assert mapper.snapshot(obj)=={'id':1,'name':'restored'}
+    def changed_setter(obj,name,value): raise RuntimeError('late model mutation')
+    Slotted.__setattr__=changed_setter
+    with pytest.raises(ValueError,match='attribute'): mapper.restore(obj,{'id':1,'name':'forbidden'})
+    assert object.__getattribute__(obj,'name')=='restored'

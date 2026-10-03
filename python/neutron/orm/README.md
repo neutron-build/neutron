@@ -251,3 +251,11 @@ rollback retains persistent ownership and does not recover discarded caller
 changes. Another owner or cached object at that identity refuses; ownership is
 rechecked after I/O before mutation. Generated fields come from the database;
 PK mutation during the read refuses. Patch merging remains unsupported.
+
+The scalar mapping profile admits ordinary mutable dataclass attributes and
+standard weak-reference-capable slots. Custom attribute access/mutation hooks,
+field properties/descriptors and custom metaclasses are refused at mapper
+admission; snapshot/construct/restore recheck this profile. Model definitions
+must remain stable after mapping. This restriction also protects get, flush,
+refresh and attach-existing restoration; custom model instrumentation/hooks
+require a separately designed lifecycle profile.

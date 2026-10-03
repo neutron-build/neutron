@@ -2,6 +2,7 @@
 from __future__ import annotations
 from dataclasses import MISSING, dataclass, fields, is_dataclass
 import types
+import inspect
 from types import MappingProxyType
 from typing import Any, Generic, Mapping, TypeVar, get_args, get_origin, get_type_hints, Union
 from .core import Column, ColumnSpec, OMIT, OrmError, Table
@@ -23,6 +24,7 @@ class ModelMapping(Generic[T]):
     primary_key: tuple[str,...]
     def __init__(self,model_type: type[T],table: Table,field_columns: Mapping[str,Column[Any]],*,primary_key: tuple[str,...]) -> None:
         if not is_dataclass(model_type): raise ValueError('scalar mapping requires a dataclass type')
+        _validate_attribute_profile(model_type,tuple(field_columns))
         if not hasattr(model_type,'__weakref__'): raise ValueError('mapped dataclass needs weak reference support')
         if any(is_dataclass(base) for base in model_type.__bases__): raise ValueError('mapped inheritance unsupported in scalar profile')
         declared={f.name:f for f in fields(model_type)}
@@ -58,6 +60,7 @@ class ModelMapping(Generic[T]):
         object.__setattr__(self,"primary_key",tuple(primary_key))
 
     def snapshot(self,obj: T) -> dict[str,Any]:
+        _validate_attribute_profile(self.model_type,tuple(self.field_columns))
         if type(obj) is not self.model_type: raise ValueError('mapped model type mismatch; inheritance not implemented')
         return {name:getattr(obj,name) for name in self.field_columns}
 
@@ -75,15 +78,18 @@ class ModelMapping(Generic[T]):
         return tuple(key)
 
     def construct(self,row: Mapping[str,Any]) -> T:
+        _validate_attribute_profile(self.model_type,tuple(self.field_columns))
         values={}
         for name,column in self.field_columns.items():
             value=row[column.name];column.spec.check(value);values[name]=value
         obj=self.model_type(**values)
+        _validate_attribute_profile(self.model_type,tuple(self.field_columns))
         if any(not same_value(getattr(obj,name),value) for name,value in values.items()):
             raise ValueError("model constructor changed persisted field values")
         return obj
 
     def restore(self,obj: T,values: Mapping[str,Any]) -> None:
+        _validate_attribute_profile(self.model_type,tuple(self.field_columns))
         for name,value in values.items(): setattr(obj,name,value)
 
     def writes(self,obj: T,*,inserting: bool) -> dict[str,Any]:
@@ -114,8 +120,28 @@ def same_column_value(spec: ColumnSpec[Any],left: Any,right: Any) -> bool:
     spec.check(left);spec.check(right)
     if left is None or right is None: return left is right
     if type(left) is not spec.python_type or type(right) is not spec.python_type: return False
-    if spec.sql_type=='timestamptz': return left.astimezone(dt.timezone.utc)==right.astimezone(dt.timezone.utc)
+    if spec.sql_type=='timestamptz': return bool(left.astimezone(dt.timezone.utc)==right.astimezone(dt.timezone.utc))
     if spec.sql_type=='jsonb':
         if not isinstance(left,JsonDocument) or not isinstance(right,JsonDocument): return False
         return _json_equal(left.parsed(),right.parsed())
     return same_value(left,right)
+
+
+def _validate_attribute_profile(model_type: type[Any],names: tuple[str,...]) -> None:
+    """Finite scalar profile: attribute reads/restores cannot invoke user hooks."""
+    if type(model_type) is not type: raise ValueError('mapped custom metaclasses unsupported')
+    for name,expected in (('__getattribute__',object.__getattribute__),('__setattr__',object.__setattr__),('__delattr__',object.__delattr__)):
+        if inspect.getattr_static(model_type,name) is not expected:
+            raise ValueError('mapped custom attribute access/mutation hooks unsupported')
+    if any('__getattr__' in vars(base) for base in model_type.__mro__):
+        raise ValueError('mapped custom attribute access hooks unsupported')
+    missing=object()
+    for name in names:
+        descriptor=inspect.getattr_static(model_type,name,missing)
+        if descriptor is missing: continue
+        if isinstance(descriptor,types.MemberDescriptorType):
+            if descriptor.__objclass__ not in model_type.__mro__ or descriptor.__name__!=name:
+                raise ValueError('mapped foreign/aliased slot descriptor unsupported')
+            continue
+        if any(inspect.getattr_static(type(descriptor),method,missing) is not missing for method in ('__get__','__set__','__delete__')):
+            raise ValueError('mapped custom field descriptors unsupported')
