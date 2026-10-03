@@ -1,7 +1,7 @@
 import asyncio
 from dataclasses import asdict
 import pytest
-from neutron.orm import AsyncDatabase,ColumnSpec,Database,Mutation,QueryObserver,Table,select
+from neutron.orm import AsyncDatabase,ColumnSpec,Database,Mutation,OrmError,QueryObserver,Table,select
 from neutron.orm.observability import _measure
 from .test_orm_clients import AsyncConnection,Connection
 from .test_orm_stream import StreamConnection,AsyncStreamConnection,Q
@@ -19,7 +19,7 @@ def test_bounded_observer_redacts_values_identifiers_and_tracks_dispatch():
     events=observer.drain();assert len(events)==2 and observer.drain()==()
     assert all(event.elapsed_ns>=0 and event.row_count==1 and event.outcome=='ok' for event in events)
     assert secret not in repr([asdict(event) for event in events]) and secret not in repr(observer.metrics)
-    with pytest.raises(ValueError): db.execute(Mutation('COMMIT',()))
+    with pytest.raises(OrmError): db.execute(Mutation('COMMIT',()))
     assert observer.drain()==() and observer.metrics.executions==1
     for capacity in (0,4097,True):
         with pytest.raises(ValueError): QueryObserver(capacity=capacity)
