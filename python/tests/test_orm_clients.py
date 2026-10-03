@@ -70,3 +70,28 @@ async def test_transaction_task_ownership_even_between_queries():
         assert await db.one(QUERY)==1
         with pytest.raises(SessionBusyError): await db.close()
     await db.close()
+
+class NativeFailure(Exception):
+    def __init__(self,sqlstate): self.sqlstate=sqlstate
+
+class CommitFailureConnection(Connection):
+    def __init__(self,state): super().__init__([]);self.state=state
+    @contextmanager
+    def transaction(self):
+        yield
+        raise NativeFailure(self.state)
+
+@pytest.mark.parametrize('state,outcome',[(None,'indeterminate'),('40001','aborted')])
+def test_commit_failure_keeps_known_or_unknown_outcome(state,outcome):
+    db=Database(CommitFailureConnection(state))
+    with pytest.raises(OrmError) as exc:
+        with db.transaction(): pass
+    assert exc.value.outcome==outcome
+    assert exc.value.sqlstate==state
+    assert isinstance(exc.value.__cause__,NativeFailure)
+
+
+def test_transaction_does_not_mask_business_exception():
+    db=Database(Connection([]))
+    with pytest.raises(ValueError,match='business'):
+        with db.transaction(): raise ValueError('business')
