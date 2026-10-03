@@ -117,8 +117,9 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
   )
 
   const loadSequence = useRef(0)
+  const pendingReset = useRef(true)
   function resetPages() {
-    position.value = firstPage()
+    pendingReset.current = true
     rejectedProfile.current = null
   }
 
@@ -132,7 +133,8 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
     return null
   }
 
-  async function load(proposed: PagePosition = position.value) {
+  async function load(proposed?: PagePosition) {
+    const selected = pendingReset.current ? firstPage() : proposed ?? position.value
     const sequence = ++loadSequence.current
     loading.value = true
     error.value = null
@@ -145,13 +147,13 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
       if (sequence !== loadSequence.current) return
       let reason = offsetReason(authoritative, active)
       let fetched: QueryResult
-      let acceptedPosition = proposed
+      let acceptedPosition = selected
       let mode: 'keyset' | 'offset' = reason ? 'offset' : 'keyset'
       let refused: { binding: string | undefined; reason: string } | null = null
       if (!reason && rejectedProfile.current && rejectedProfile.current.binding === authoritative.binding) reason = rejectedProfile.current.reason
       if (!reason) {
         try {
-          fetched = await api.tablePage(conn.id, schemaName, table, pageLimit, proposed.cursor)
+          fetched = await api.tablePage(conn.id, schemaName, table, pageLimit, selected.cursor)
           if (authoritative.binding && fetched.binding !== authoritative.binding
             || JSON.stringify(fetched.columns) !== JSON.stringify(authoritative.columns.map(c => c.name))
             || JSON.stringify(fetched.keyColumns) !== JSON.stringify(authoritative.keyColumns)) {
@@ -161,7 +163,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
           // Only an explicit first-page capability refusal permits fallback.
           // Authentication, stale cursors, budgets and backend/network failures
           // never masquerade as an unsupported table or change pagination mode.
-          if (!(err instanceof ApiError) || err.status !== 400 || err.state !== 'unsupported-profile' || proposed.cursor !== '') throw err
+          if (!(err instanceof ApiError) || err.status !== 400 || err.state !== 'unsupported-profile' || selected.cursor !== '') throw err
           reason = `Offset paging: ${err.message}`
           refused = { binding: authoritative.binding, reason }
           acceptedPosition = firstPage()
@@ -177,6 +179,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
         meta.value = authoritative
         result.value = fetched!
         position.value = acceptedPosition
+        pendingReset.current = false
         pagingMode.value = mode
         pagingReason.value = reason ?? 'Live keyset paging: each page is a new database snapshot; earlier inserts or key edits can be missed.'
         if (refused) rejectedProfile.current = refused
@@ -198,8 +201,11 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
   }
 
   useEffect(() => {
+    let canceled = false
+    fks.value = {}
     api.tableFKs(conn.id, schemaName, table)
       .then(r => {
+        if (canceled) return
         const map: Record<string, FKDetail> = {}
         for (const fk of r.fks ?? []) {
           // Every column of a constraint links to the WHOLE tuple: following
@@ -213,10 +219,21 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
         fks.value = map
       })
       .catch(() => { /* FK links are optional polish */ })
-  }, [schemaName, table])
+    return () => { canceled = true }
+  }, [conn.id, schemaName, table])
 
   const rowsRevision = tableDataRevision.value[conn.id] ?? 0
-  useEffect(() => { refreshRows() }, [conn.id, schemaName, table, rowsRevision])
+  const inputPlan = JSON.stringify({ schemaName, table, initialFilter, initialMatch })
+  const loadedInputPlan = useRef<string | null>(null)
+  useEffect(() => {
+    if (loadedInputPlan.current !== inputPlan) {
+      loadedInputPlan.current = inputPlan
+      filters.value = initialFilter ? [{ ...initialFilter }] : []
+      appliedFilters.value = filters.value
+      sorts.value = []
+    }
+    refreshRows()
+  }, [conn.id, inputPlan, rowsRevision])
   useEffect(() => () => { loadSequence.current++ }, [])
 
   // Read-only state is AUTHORITATIVE (server catalog): no PK, no row
@@ -485,7 +502,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
     editable.value === true && (meta.value?.columns ?? []).some(c => c.insertable === true))
 
   function handlePrev() {
-    if (loading.value) return
+    if (loading.value || error.value) return
     const current = position.value
     if (pagingMode.value === 'keyset') {
       if (current.previous.length === 0) return
@@ -497,7 +514,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
   }
 
   function handleNext() {
-    if (loading.value || !result.value) return
+    if (loading.value || error.value || !result.value) return
     const current = position.value
     if (pagingMode.value === 'keyset') {
       const page = result.value as TablePageResult
@@ -767,7 +784,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
       </div>
 
       <div class={s.pagination} role="navigation" aria-label="Table pages">
-        <button class={s.pageBtn} onClick={handlePrev} disabled={loading.value || (pagingMode.value === 'keyset' ? position.value.previous.length === 0 : position.value.offset === 0)}>
+        <button class={s.pageBtn} onClick={handlePrev} disabled={loading.value || !!error.value || (pagingMode.value === 'keyset' ? position.value.previous.length === 0 : position.value.offset === 0)}>
           ← Prev
         </button>
         <span class={s.pageInfo}>
@@ -779,7 +796,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
         <button
           class={s.pageBtn}
           onClick={handleNext}
-          disabled={loading.value || !res || (pagingMode.value === 'keyset' ? !(res as TablePageResult).hasNext : res.rows.length < limit.value)}
+          disabled={loading.value || !!error.value || !res || (pagingMode.value === 'keyset' ? !(res as TablePageResult).hasNext : res.rows.length < limit.value)}
         >
           Next →
         </button>

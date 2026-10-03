@@ -104,6 +104,8 @@ describe('SQLBrowser native bigint keyset integration', () => {
       await waitFor(() => expect(toasts.value.some(t => t.message.includes(refusal.message))).toBe(true))
       expect(tableData).not.toHaveBeenCalled(); expect(stagedEdits.value[0]).toBe(draft)
       expect(screen.getByText(/Page 1 ·/)).toBeTruthy()
+      expect((screen.getByRole('button', { name: 'Next →' }) as HTMLButtonElement).disabled).toBe(true)
+      fireEvent.click(screen.getByRole('button', { name: 'Refresh rows' })); await screen.findByText('kept draft')
     }
     fireEvent.click(screen.getByRole('button', { name: 'Refresh rows' })); await screen.findByText('kept draft')
     expect(tablePage).toHaveBeenLastCalledWith('c1', 'public', 'notes', 200, '')
@@ -145,6 +147,28 @@ describe('SQLBrowser native bigint keyset integration', () => {
     await act(async () => { failOld(new Error('stale metadata failure')); await Promise.resolve() })
     expect(screen.getByText('page 1 body')).toBeTruthy()
     expect(toasts.value.some(t => t.message.includes('stale metadata failure'))).toBe(false)
+  })
+
+  it('retains the last successful page/history on a failed refresh until fresh rows publish', async () => {
+    render(<SQLBrowser schema="public" table="notes" />); await screen.findByText('page 1 body')
+    fireEvent.click(screen.getByRole('button', { name: 'Next →' })); await screen.findByText('page 2 body')
+    tablePage.mockRejectedValueOnce(new ApiError(502, 'refresh interrupted'))
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh rows' }))
+    await waitFor(() => expect(toasts.value.some(t => t.message.includes('refresh interrupted'))).toBe(true))
+    expect(screen.getByText(/Page 2 ·/)).toBeTruthy()
+    expect((screen.getByRole('button', { name: '← Prev' }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh rows' })); await screen.findByText('page 1 body')
+    expect(screen.getByText(/Page 1 ·/)).toBeTruthy()
+  })
+
+  it('resets paging for changed reference-match input', async () => {
+    const view = render(<SQLBrowser schema="public" table="notes" />); await screen.findByText('page 1 body')
+    fireEvent.click(screen.getByRole('button', { name: 'Next →' })); await screen.findByText('page 2 body')
+    view.rerender(<SQLBrowser schema="public" table="notes" initialMatch={[{ column: 'id', value: { t: 'int8', v: '1' } }]} />)
+    await screen.findByText('offset body')
+    expect(tableData).toHaveBeenLastCalledWith('c1', 'public', 'notes', 200, 0, undefined, undefined, undefined, [{ column: 'id', value: { t: 'int8', v: '1' } }])
+    expect(screen.getByRole('status').textContent).toContain('reference matches')
+    expect(screen.getByText('offset body')).toBeTruthy()
   })
 
   it('bounds previous navigation to 64 cursor starts and resets history with page size', async () => {
