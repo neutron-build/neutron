@@ -69,6 +69,7 @@ class AsyncSession(_SessionState):
         try:
             async with self._database.savepoint():
                 yield self
+                await self.flush()
                 if self._failed: raise OrmError('failed mapped savepoint requires rollback')
         except BaseException:
             if self._database.closed:

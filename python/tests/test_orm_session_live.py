@@ -421,3 +421,15 @@ async def test_native_async_savepoint_rollback_checkpoint_and_reuse(mapped):
         assert session.object_state(extra) is ObjectState.TRANSIENT
         anchor.name='survives';await session.commit()
         assert native.execute(f'SELECT name FROM {m.table.sql}').fetchall()==[('survives',)]
+
+
+def test_native_savepoint_exit_flushes_constraints_inside_boundary(mapped):
+    url,m,native=mapped
+    with Session.connect(url) as session:
+        with pytest.raises(OrmError) as duplicate:
+            with session.savepoint():
+                a=User(name='duplicate');b=User(name='duplicate')
+                session.add(m,a);session.add(m,b)
+        assert duplicate.value.sqlstate=='23505' and a.id is None and b.id is None
+        good=User(name='survives');session.add(m,good);session.commit()
+        assert native.execute(f'SELECT name FROM {m.table.sql}').fetchall()==[('survives',)]

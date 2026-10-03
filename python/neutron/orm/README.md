@@ -4,8 +4,8 @@ Install `neutron-framework[orm]`. Import from `neutron.orm`. Existing
 `neutron.nucleus` asyncpg clients are unchanged.
 
 This is a bounded native psycopg synchronous/asynchronous SQL core with
-explicit scalar dataclass Sessions. Associated writes, cascades and full SQLAlchemy parity
-remain outside this slice. Only `postgres-direct` is admitted.
+explicit scalar dataclass Sessions and dependency-ordered insert graphs. Cascades and
+full SQLAlchemy parity remain outside this slice. Only `postgres-direct` is admitted.
 `Database.connect` and `AsyncDatabase.connect` compare the startup server
 version with `pg_catalog.version()` before handing out a usable client. Known
 Nucleus and other identified incompatible engines, missing identity, and
@@ -40,8 +40,8 @@ with Database.connect(database_url) as db:
 APIs. Use `async with await AsyncDatabase.connect(url)` and
 `async with db.transaction()`. No hidden event-loop bridge or property-triggered
 I/O exists. Concurrent active use is rejected, and a transaction remains owned
-by its starting thread/task even between statements. Nested transactions are
-explicitly unsupported in this slice.
+by its starting thread/task even between statements. Implicit nested transaction contexts are
+unsupported; explicit savepoints are described below.
 
 `select(column)` has a typed scalar result; `select_row(table, *columns)` returns
 an explicitly selected dictionary. Nullable columns use
@@ -59,8 +59,8 @@ program expressions; do not construct their SQL strings from untrusted input.
 The supported metadata vocabulary is int2/int4/int8, bool, text/varchar,
 numeric/Decimal, uuid/UUID, bytea/bytes, timestamp/timestamptz/datetime and
 date/date. Local timestamps require naive datetime; instants require aware
-datetime. Arrays/domains/composites/JSON/ranges and schema migrations are
-unsupported here. Database-generated column writes refuse. Existing canonical
+datetime. Arrays/domains/composites/ranges and schema migrations are unsupported here.
+Explicit JSON document support is described below. Database-generated column writes refuse. Existing canonical
 schema-v2 and migration protocols are not changed by this in-memory metadata.
 
 `one` requires exactly one result; `one_or_none` refuses multiple results.
@@ -93,9 +93,9 @@ unit tests and declared exports are not full ORM certification.
 
 `ModelMapping`, `Session`, `AsyncSession`, `ObjectState` and `ConflictError` provide
 an initial scalar dataclass persistence lifecycle. This expands the SQL core;
-it still does not establish full SQLAlchemy replacement. Relations, inheritance,
-mutable JSON/collections, lazy/expired properties, merge, bulk synchronization,
-savepoints and automatic expiration on commit remain unsupported.
+it still does not establish full SQLAlchemy replacement. Inheritance, mutable JSON/collections, lazy/expired properties and automatic
+expiration on commit remain unsupported. Explicit graph, merge, bulk, event and
+savepoint APIs are described below.
 
 ```python
 from dataclasses import dataclass
@@ -177,8 +177,8 @@ Every column projected from a left join's right side requires `outer_field`,
 which adds `None` to its result type. Projections use internal unique SQL aliases.
 `order_by(Order(column, descending=True))`, `limit(n)`, and `offset(n)` are
 immutable operations. `one` and `one_or_none` reject paginated queries.
-Self joins, aliases, arbitrary row shapes, aggregates, subqueries and relation
-loading are outside this bounded query API.
+Additional typed query algebra is described below. Arbitrary statically keyed
+dictionary shapes and implicit model relation loading remain outside Query.
 
 `Predicate(sql, params, owners)` is an explicit trusted SQL escape hatch.
 Ownership checks on generated expressions do not make raw predicates a SQL sandbox.
@@ -250,7 +250,7 @@ The authoritative fetched row becomes both baseline and rollback original:
 rollback retains persistent ownership and does not recover discarded caller
 changes. Another owner or cached object at that identity refuses; ownership is
 rechecked after I/O before mutation. Generated fields come from the database;
-PK mutation during the read refuses. Patch merging remains unsupported.
+PK mutation during the read refuses. Detached edits use the explicit baseline-checked merge API described below.
 
 The scalar mapping profile admits ordinary mutable dataclass attributes and
 standard weak-reference-capable slots. Custom attribute access/mutation hooks,
@@ -401,7 +401,7 @@ or inference of an absent baseline.
 
 `with session.savepoint()` and `async with session.savepoint()` flush existing
 work before creating a native PostgreSQL savepoint and a complete scalar object
-checkpoint. A body/flush failure rolls back that savepoint, restores saved
+checkpoint. Successful exit flushes changes before releasing that savepoint. A body/flush failure rolls back that savepoint, restores saved
 values/baselines/states, clears identities created inside it and permits the
 outer transaction to continue. Nested savepoints are explicit. Session and raw
 transaction-handle commit/rollback/close refuse while a savepoint is open.

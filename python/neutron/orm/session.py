@@ -339,6 +339,7 @@ class Session(_SessionState):
         try:
             with self._database.savepoint():
                 yield self
+                self.flush()
                 if self._failed: raise OrmError('failed mapped savepoint requires rollback')
         except BaseException:
             if self._database.closed:
