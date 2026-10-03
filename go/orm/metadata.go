@@ -104,7 +104,7 @@ func NewTable[M any](schema, name string) (Table[M], error) {
 }
 
 func supportedScalar(t reflect.Type) bool {
-	if t == reflect.TypeOf(Bytea{}) {
+	if t == reflect.TypeOf(Bytea{}) || t == reflect.TypeOf(Date{}) || t == reflect.TypeOf(TimeOfDay{}) || t == reflect.TypeOf(Interval{}) {
 		return true
 	}
 	if value, ok := reflect.Zero(t).Interface().(interface{ ormScalarType() bool }); ok {

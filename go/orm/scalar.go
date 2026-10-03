@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -201,6 +202,9 @@ func (d nullableJSONDestination) ScanBytes(value []byte) error {
 	return nil
 }
 func scanDestination(value reflect.Value) any {
+	if value.Kind() == reflect.Pointer && value.Type().Elem().Implements(reflect.TypeOf((*interface{ ormRangeType() })(nil)).Elem()) {
+		return &nullableRangeDestination{target: value}
+	}
 	if value.Kind() == reflect.Pointer && value.Type().Elem().Implements(reflect.TypeOf((*interface{ ormArrayType() })(nil)).Elem()) {
 		return &nullableArrayDestination{target: value}
 	}
@@ -218,6 +222,10 @@ func validateScalarValue(value any) error {
 		return ErrScalarValue
 	}
 	switch v := value.(type) {
+	case time.Time:
+		if v.Nanosecond()%1000 != 0 {
+			return ErrScalarValue
+		}
 	case Bytea:
 		if !v.valid {
 			return ErrScalarValue

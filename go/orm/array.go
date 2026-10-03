@@ -50,7 +50,7 @@ func validArrayElement(t reflect.Type) bool {
 	}
 	// Nested PostgreSQL arrays use dimensions of a single flat array, never
 	// nested Array values. Only the immutable scalar family is admitted here.
-	if t == reflect.TypeOf(Bytea{}) {
+	if t == reflect.TypeOf(Bytea{}) || t == reflect.TypeOf(Date{}) || t == reflect.TypeOf(TimeOfDay{}) || t == reflect.TypeOf(Interval{}) {
 		return true
 	}
 	return supportedBuiltinScalar(t)

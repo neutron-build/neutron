@@ -229,7 +229,7 @@ func validateType(value ast.Expr, imports, used map[string]string) error {
 	switch typ := value.(type) {
 	case *ast.IndexExpr:
 		container, ok := typ.X.(*ast.SelectorExpr)
-		if !ok || container.Sel.Name != "Array" {
+		if !ok || (container.Sel.Name != "Array" && container.Sel.Name != "Range") {
 			break
 		}
 		alias, ok := container.X.(*ast.Ident)
@@ -237,6 +237,21 @@ func validateType(value ast.Expr, imports, used map[string]string) error {
 			break
 		}
 		element := typ.Index
+		if container.Sel.Name == "Range" {
+			allowed := false
+			switch bound := element.(type) {
+			case *ast.Ident:
+				allowed = bound.Name == "int32" || bound.Name == "int64"
+			case *ast.SelectorExpr:
+				if qualifier, ok := bound.X.(*ast.Ident); ok {
+					path := imports[qualifier.Name]
+					allowed = (path == "time" && bound.Sel.Name == "Time") || (path == ormPath && (bound.Sel.Name == "Decimal" || bound.Sel.Name == "Date"))
+				}
+			}
+			if !allowed {
+				break
+			}
+		}
 		if pointer, ok := element.(*ast.StarExpr); ok {
 			element = pointer.X
 		}
@@ -259,7 +274,7 @@ func validateType(value ast.Expr, imports, used map[string]string) error {
 			break
 		}
 		path := imports[alias.Name]
-		if (path == "time" && typ.Sel.Name == "Time") || (path == ormPath && (typ.Sel.Name == "Decimal" || typ.Sel.Name == "UUID" || typ.Sel.Name == "JSON" || typ.Sel.Name == "Bytea")) {
+		if (path == "time" && typ.Sel.Name == "Time") || (path == ormPath && (typ.Sel.Name == "Decimal" || typ.Sel.Name == "UUID" || typ.Sel.Name == "JSON" || typ.Sel.Name == "Bytea" || typ.Sel.Name == "Date" || typ.Sel.Name == "TimeOfDay" || typ.Sel.Name == "Interval")) {
 			used[alias.Name] = path
 			return nil
 		}

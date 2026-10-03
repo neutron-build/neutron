@@ -641,3 +641,19 @@ The distributed generator also emits Array and Bytea typed columns.
 ```sh
 go test ./orm -run 'Test(ImmutableArray|Bytea|PostgresDimensionPreserving)' -count=1 -v
 ```
+
+`Range[T]` preserves native inclusive/exclusive/unbounded/empty bounds for int32,
+int64, Decimal, time.Time and Date. PostgreSQL canonicalizes discrete ranges;
+reads and RETURNING reflect the native canonical value. SQL NULL uses a nullable
+pointer and remains distinct from empty and unbounded ranges. Zero Range values
+refuse writes. `Date` preserves finite Gregorian calendar parts in years 1–9999;
+date infinity and values outside that profile refuse. `TimeOfDay` retains integer
+microseconds including the distinct 24:00:00 endpoint; `Interval` keeps months,
+days and microseconds independently. timetz and multiranges remain unqualified.
+time.Time writes require whole microseconds, refusing silent submicrosecond
+truncation. Timestamp without zone follows native pgx wall-clock semantics;
+timestamptz retains the instant, not the original named zone/offset.
+
+```sh
+go test ./orm -run 'Test(RangeNative|FiniteTemporal|PostgresRangesAndFinite)' -count=1 -v
+```
