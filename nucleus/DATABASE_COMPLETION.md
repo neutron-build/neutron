@@ -28,8 +28,8 @@ Legacy encrypted-index modes are retired: new construction and SQL admissions
 refuse with `0A000`; base rows remain available. Earlier milestone sections are
 dated evidence, not a claim that those prototype modes remain supported.
 
-- Source LOC: 374339; Source Rust files: 334; Top-level modules: 53.
-- Declared unit tests: 5148; Declared integration tests: 460; Ignored tests: 53.
+- Source LOC: 374765; Source Rust files: 334; Top-level modules: 53.
+- Declared unit tests: 5152; Declared integration tests: 460; Ignored tests: 53.
   These are static declarations, not executed-test claims.
 - The previously recorded successful full library run executed 4,861 passing tests, 0 failing
   (8 ignored, all classified).
