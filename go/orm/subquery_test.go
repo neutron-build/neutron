@@ -41,3 +41,20 @@ func TestTypedSubqueryBindingsAndCompositeCorrelation(t *testing.T) {
 		t.Fatal("nested self correlation shadowed outer alias", compiled, err)
 	}
 }
+
+func TestRelatedScalarOrdersQualifiedParentWithSameNamedOutputs(t *testing.T) {
+	relation, childID := associationMetadata(t, "owned")
+	parentID, err := NewColumn[assocParent, int64](relation.parent, "ID")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentSQL := func(field fieldInfo) string { return relation.parent.info.sqlName() + "." + quote(field.name) }
+	inner, args, err := relatedSQL(relation, childID.field.name, Query[assocChild]{}.OrderBy(childID.Asc()).Limit(1), nil, parentSQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql, _, err := selectSQLFrom(relation.parent, parentSQL(parentID.field)+", ("+inner+")", Query[assocParent]{}.OrderBy(parentID.Asc()), args, relation.parent.info.sqlName(), parentSQL)
+	if err != nil || !strings.HasSuffix(sql, `ORDER BY "owned"."parents"."id" ASC`) {
+		t.Fatal("same-named scalar output made ORDER BY ambiguous", sql, err)
+	}
+}

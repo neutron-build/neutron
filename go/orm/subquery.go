@@ -141,11 +141,12 @@ func SelectRelatedScalar[P, C, A, T any](ctx context.Context, db Executor, relat
 	if parent.info == nil || parent.info != relation.parent.info || child.info == nil || child.info != relation.child.info {
 		return nil, wrap("related scalar", fmt.Errorf("orm: scalar projections outside relation binding"))
 	}
-	inner, args, err := relatedSQL(relation, child.field.name, childQuery, nil, func(field fieldInfo) string { return relation.parent.info.sqlName() + "." + quote(field.name) })
+	parentSQL := func(field fieldInfo) string { return relation.parent.info.sqlName() + "." + quote(field.name) }
+	inner, args, err := relatedSQL(relation, child.field.name, childQuery, nil, parentSQL)
 	if err != nil {
 		return nil, wrap("related scalar", err)
 	}
-	sql, args, err := selectSQLArgs(relation.parent, quote(parent.field.name)+", ("+inner+")", parentQuery, args)
+	sql, args, err := selectSQLFrom(relation.parent, parentSQL(parent.field)+", ("+inner+")", parentQuery, args, relation.parent.info.sqlName(), parentSQL)
 	if err != nil {
 		return nil, wrap("related scalar", err)
 	}
