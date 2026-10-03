@@ -240,3 +240,21 @@ def static_domain_identity_consumer(db: Database) -> None:
     enum=db.enum_spec('app','state');domain=db.domain_spec('app','state_domain',enum)
     assert_type(key,ColumnSpec[PgDomain[UUID]])
     assert_type(domain,ColumnSpec[PgDomain[PgEnum]])
+
+from neutron.orm import PolymorphicMapping,PolymorphicView
+
+@dataclass
+class SpecialUser(User):
+    detail: str='special'
+
+def static_polymorphic_consumer(session: Session,mapping: PolymorphicMapping[User]) -> None:
+    view=mapping.subtype(SpecialUser)
+    assert_type(view,PolymorphicView[SpecialUser])
+    assert_type(session.get(mapping,1),User|None)
+    assert_type(session.get(view,1),SpecialUser|None)
+    assert_type(session.select_polymorphic(view,max_rows=10),tuple[SpecialUser,...])
+    assert_type(session.select_polymorphic(mapping,max_rows=10),tuple[User,...])
+
+async def static_async_polymorphic_consumer(session: AsyncSession,mapping: PolymorphicMapping[User]) -> None:
+    assert_type(await session.get(mapping.subtype(SpecialUser),1),SpecialUser|None)
+    assert_type(await session.select_polymorphic(mapping.subtype(SpecialUser),max_rows=10),tuple[SpecialUser,...])

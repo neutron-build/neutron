@@ -3,13 +3,14 @@ from __future__ import annotations
 from contextlib import contextmanager
 import threading
 import inspect
-from typing import Any, Callable, Iterator, Mapping, Sequence, TypeVar
+from typing import Any, Callable, Iterator, Mapping, Sequence, TypeVar, cast
 from .client import AsyncDatabase, Database
 from .core import CardinalityError, OrmError, Predicate, SessionBusyError, delete, insert, select_row, update, Mutation, _bound_quote
 from .lifecycle import TransactionHandle
 from .events import EVENT_NAMES, EventName, SessionEvent, PostCommitError, PostCommitInterruptedError
 from .instrumentation import expire_attributes
 from .mapping import ModelMapping, same_column_value
+from .polymorphic import PolymorphicMapping, PolymorphicView
 from .state import ObjectState, Record, StateStore
 from .relations import Association, LoadBudget, ManyToMany, OwnedRelation, Relation, RelationBudgetError, load_many, load_one
 T=TypeVar('T')
@@ -192,6 +193,21 @@ class _SessionState:
             self.delete(child)
         else: self.disconnect(relation,parent,child)
 
+    def _adopt_polymorphic(self,mapping: PolymorphicMapping[T],objects: Sequence[T]) -> tuple[T,...]:
+        selected=[]
+        for obj in objects:
+            values=mapping.snapshot(obj);key=mapping.key(values)
+            if key is None: raise OrmError('native polymorphic selection lacks identity')
+            cached=self._store.find(mapping,key)
+            if cached is None: self._store.attach(mapping,obj,new=False);cached=obj
+            else:
+                record=self._store.records[id(cached)]
+                if type(cached) is not type(obj): raise ConflictError('native discriminator changed for a tracked base identity')
+                if record.state is ObjectState.PENDING: raise ConflictError('pending object conflicts with selected native identity')
+                if record.state is ObjectState.EXPIRED: self._store.refreshed(record,values)
+            selected.append(cached)
+        return tuple(selected)
+
     def _validate_owned_children(self,relation: OwnedRelation[P,C],parent: P,children: Sequence[C]) -> None:
         if not isinstance(relation,OwnedRelation): raise OrmError('owned graph operation requires explicit OwnedRelation')
         relation.__post_init__()
@@ -267,6 +283,8 @@ class _SessionState:
             raise OrmError('merge requires unchanged complete primary key')
         if mapping.version_field is not None and values[mapping.version_field]!=baseline[mapping.version_field]:
             raise OrmError('merge cannot patch the optimistic version')
+        if any(not same_column_value(mapping.field_columns[name].spec,values[name],baseline[name]) for name in getattr(mapping,'immutable_fields',())):
+            raise OrmError('merge cannot patch a polymorphic discriminator')
         return values,baseline
 
     def _merge_row(self,mapping: ModelMapping[T],source: T,values: dict[str,Any],baseline: dict[str,Any],row: dict[str,Any]) -> T:
@@ -305,8 +323,9 @@ class _SessionState:
         if type(discard_changes) is not bool: raise ValueError('discard_changes requires a boolean')
         record=self._store.records.get(id(obj))
         if record is None: raise OrmError('expire requires tracked object')
-        names=frozenset(fields) if fields else frozenset(record.mapping.field_columns)
-        if names-record.mapping.field_columns.keys(): raise ValueError('expired field outside mapping')
+        active=frozenset(record.mapping.active_fields(obj))
+        names=frozenset(fields) if fields else active
+        if names-active: raise ValueError('expired field outside mapping')
         self._store.expire(record,names,discard_changes=discard_changes)
 
     def detach(self,obj: object) -> None:
@@ -352,6 +371,7 @@ class _SessionState:
                 if dirty:
                     mapping.writes(record.obj,inserting=False)
                     if any(mapping.field_columns[name].spec.generated for name in dirty): raise OrmError('generated field mutation refused')
+                    if set(getattr(mapping,'immutable_fields',())) & dirty.keys(): raise OrmError('polymorphic discriminator mutation refused')
                     if mapping.version_field is not None:
                         name=mapping.version_field
                         if name in dirty: raise OrmError('application mutation of mapped version refused')
@@ -362,7 +382,8 @@ class _SessionState:
             elif record.state is ObjectState.EXPIRED:
                 if self._store.dirty(record): raise OrmError('expired object has edited fields; explicitly refresh')
             elif record.state is ObjectState.DELETE_PENDING:
-                self._store.dirty(record) # reject changed primary key
+                dirty=self._store.dirty(record) # reject changed primary key
+                if set(getattr(mapping,'immutable_fields',())) & dirty.keys(): raise OrmError('polymorphic discriminator mutation refused')
                 plans.append((record,'delete',{}))
         return self._graph_order(plans)
 
@@ -370,6 +391,7 @@ class _SessionState:
         self._guard();self._mapping(mapping)
         if values is None: return delete(mapping.table,where=where)
         forbidden={mapping.field_columns[name].name for name in mapping.primary_key}
+        forbidden.update(mapping.field_columns[name].name for name in getattr(mapping,'immutable_fields',()))
         if forbidden & values.keys(): raise OrmError('bulk primary-key mutation refused')
         statement=update(mapping.table,values,where=where)
         if mapping.version_field is not None:
@@ -382,6 +404,8 @@ class _SessionState:
 
     def _bulk_adopt(self,mapping: ModelMapping[Any],rows: list[dict[str,Any]],*,deleting: bool) -> int:
         for row in rows:
+            # Validate every family row, including identities outside the cache.
+            if isinstance(mapping,PolymorphicMapping): mapping.construct(row)
             values={name:row[column.name] for name,column in mapping.field_columns.items()}
             key=mapping.key(values)
             if key is None: raise OrmError('bulk returning requires complete identity')
@@ -466,19 +490,40 @@ class Session(_SessionState):
             raise
         finally: self._savepoint_depth-=1
 
-    def get(self,mapping: ModelMapping[T],*key: Any) -> T | None:
-        self._guard();self._mapping(mapping)
-        values=self._key_values(mapping,key)
+    def get(self,mapping: ModelMapping[T]|PolymorphicView[T],*key: Any) -> T | None:
+        view=mapping if isinstance(mapping,PolymorphicView) else None
+        family: ModelMapping[T]=cast(ModelMapping[T],view.family) if view is not None else cast(ModelMapping[T],mapping)
+        self._guard();self._mapping(family)
+        values=self._key_values(family,key)
         if self.autoflush: self.flush()
-        found=self._store.find(mapping,key)
+        found=self._store.find(family,key)
         if found is not None:
+            if view is not None and type(found) is not view.model_type: return None
             if self._store.records[id(found)].state is ObjectState.EXPIRED: return self.refresh(found)
             return found
         try:
             self._ensure_transaction()
-            row=self._database.one_or_none(select_row(mapping.table,*mapping.field_columns.values()).where(self._predicate(mapping,values)))
+            predicate=self._predicate(family,values)
+            if view is not None: predicate &= view.family.field_columns[view.family.discriminator].eq(view.tag)
+            row=self._database.one_or_none(select_row(family.table,*family.field_columns.values()).where(predicate))
             if row is None: return None
-            obj=mapping.construct(row);self._store.attach(mapping,obj,new=False);return obj
+            obj=family.construct(row)
+            if view is not None and type(obj) is not view.model_type: raise OrmError('native subtype selection returned a different class')
+            self._store.attach(family,obj,new=False);return obj
+        except BaseException:
+            self._failed=True;raise
+
+    def select_polymorphic(self,mapping: PolymorphicMapping[T]|PolymorphicView[T],*,where: Predicate|None=None,max_rows: int=1000) -> tuple[T,...]:
+        self._guard()
+        if type(max_rows) is not int or not 0<max_rows<2**31-1: raise ValueError('finite positive polymorphic row budget required')
+        family=cast(PolymorphicMapping[T],mapping.family) if isinstance(mapping,PolymorphicView) else mapping
+        self._mapping(family);query=mapping.query()
+        if where is not None: query=query.where(where)
+        if self.autoflush: self.flush()
+        try:
+            self._ensure_transaction();objects=self._database.all(query.limit(max_rows+1))
+            if len(objects)>max_rows: raise OrmError('polymorphic selection row budget exceeded')
+            return self._adopt_polymorphic(family,objects)
         except BaseException:
             self._failed=True;raise
 
@@ -626,7 +671,7 @@ class Session(_SessionState):
         finally: self._transaction=None
         try:
             if self.expire_on_commit:
-                for record in self._store.records.values(): self._store.expire(record,frozenset(record.mapping.field_columns),discard_changes=False)
+                for record in self._store.records.values(): self._store.expire(record,frozenset(record.mapping.active_fields(record.obj)),discard_changes=False)
             self._emit('after_commit')
         except KeyboardInterrupt as exc: raise PostCommitInterruptedError() from exc
         except Exception as exc: raise PostCommitError() from exc

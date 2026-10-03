@@ -562,3 +562,31 @@ profiles remain refused, including domains over those profiles. Domains over an
 explicit admitted enum base retain both domain and enum identities. Matching
 qualified enum/domain integer/string/bool/UUID keys can participate in explicit
 relation metadata; incompatible type identities refuse.
+
+`PolymorphicMapping(Base, table, all_field_columns, primary_key=('id',),
+discriminator='kind', variants={'base': Base, 'cat': Cat, 'dog': Dog})` declares a
+single-table dataclass hierarchy explicitly. Every variant owns one unique text
+discriminator. Base fields/identity/version are shared; subtype-only columns must
+be nullable and nongenerated, while each class's nonoptional active fields remain
+required. Native unknown tags, inactive column values and constructor coercion
+refuse. Classes choose their own matching discriminator defaults or supply them
+explicitly; the mapper does not change classes or tags to coerce an object.
+
+One family owns the table's Session identity. `session.get(family, key)` returns
+the registered subclass. `session.get(family.subtype(Cat), key)` is statically
+Cat|None, adds an exact discriminator SQL predicate and reuses that same object.
+`select_polymorphic(family_or_subtype, where=..., max_rows=1000)` performs a bounded
+mapped query with the same identity reuse; async methods are awaited. Family
+flushes retain ordinary generated keys, versions, events, rollback/savepoints,
+explicit library instrumentation and expiration. Readonly discriminator changes
+and discriminator bulk/merge patches refuse. Native subtype changes under an
+already tracked identity require a new Session; no in-place class replacement is
+performed. Ordinary independent same-table mappers still conflict.
+
+The selected capability is single-table discriminator mapping. Joined/concrete
+inheritance, implicit subtype discovery, arbitrary descriptors and third-party
+mapper plugins remain unsupported; it does not establish complete SQLAlchemy
+replacement. The authored conversion fixture at
+`conformance/polyglot/applications/python/polymorphic_sti.py` pins SQLAlchemy
+2.1.3 and compares independent native rows, base/subtype identity reuse, filtering
+and rollback. It is an authored application fixture, not a claimed external app.

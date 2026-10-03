@@ -187,14 +187,14 @@ class StateStore:
         for record in self.records.values():
             record.state=ObjectState.INDETERMINATE
             if record.mapping.instrumented:
-                record.expired_fields=frozenset(record.mapping.field_columns)
+                record.expired_fields=frozenset(record.mapping.active_fields(record.obj))
                 expire_attributes(record.obj,record.expired_fields)
 
     def fence_after_commit(self) -> None:
         for record in self.records.values():
             record.state=ObjectState.UNAVAILABLE_AFTER_COMMIT
             if record.mapping.instrumented:
-                record.expired_fields=frozenset(record.mapping.field_columns)
+                record.expired_fields=frozenset(record.mapping.active_fields(record.obj))
                 expire_attributes(record.obj,record.expired_fields)
 
     def detach_all(self) -> None:

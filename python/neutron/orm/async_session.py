@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import inspect
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Sequence, TypeVar
+from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Sequence, TypeVar, cast
 from .client import AsyncDatabase
 from .core import CardinalityError, OrmError, Predicate, SessionBusyError, delete, insert, select_row, update, Mutation
 from .lifecycle import AsyncTransactionHandle
 from .events import EVENT_NAMES, EventName, SessionEvent, PostCommitError, PostCommitCancelledError, PostCommitInterruptedError
 from .instrumentation import expire_attributes
 from .mapping import ModelMapping
+from .polymorphic import PolymorphicMapping, PolymorphicView
 from .session import ConflictError, _SessionState
 from .state import ObjectState
 from .relations import Association, LoadBudget, OwnedRelation, Relation, RelationBudgetError, async_load_many, async_load_one
@@ -84,19 +85,40 @@ class AsyncSession(_SessionState):
             raise
         finally: self._savepoint_depth-=1
 
-    async def get(self,mapping: ModelMapping[T],*key: Any) -> T | None:
-        self._guard();self._mapping(mapping)
-        values=self._key_values(mapping,key)
+    async def get(self,mapping: ModelMapping[T]|PolymorphicView[T],*key: Any) -> T | None:
+        view=mapping if isinstance(mapping,PolymorphicView) else None
+        family: ModelMapping[T]=cast(ModelMapping[T],view.family) if view is not None else cast(ModelMapping[T],mapping)
+        self._guard();self._mapping(family)
+        values=self._key_values(family,key)
         if self.autoflush: await self.flush()
-        found=self._store.find(mapping,key)
+        found=self._store.find(family,key)
         if found is not None:
+            if view is not None and type(found) is not view.model_type: return None
             if self._store.records[id(found)].state is ObjectState.EXPIRED: return await self.refresh(found)
             return found
         try:
             await self._ensure_transaction()
-            row=await self._database.one_or_none(select_row(mapping.table,*mapping.field_columns.values()).where(self._predicate(mapping,values)))
+            predicate=self._predicate(family,values)
+            if view is not None: predicate &= view.family.field_columns[view.family.discriminator].eq(view.tag)
+            row=await self._database.one_or_none(select_row(family.table,*family.field_columns.values()).where(predicate))
             if row is None: return None
-            obj=mapping.construct(row);self._store.attach(mapping,obj,new=False);return obj
+            obj=family.construct(row)
+            if view is not None and type(obj) is not view.model_type: raise OrmError('native subtype selection returned a different class')
+            self._store.attach(family,obj,new=False);return obj
+        except BaseException:
+            self._failed=True;raise
+
+    async def select_polymorphic(self,mapping: PolymorphicMapping[T]|PolymorphicView[T],*,where: Predicate|None=None,max_rows: int=1000) -> tuple[T,...]:
+        self._guard()
+        if type(max_rows) is not int or not 0<max_rows<2**31-1: raise ValueError('finite positive polymorphic row budget required')
+        family=cast(PolymorphicMapping[T],mapping.family) if isinstance(mapping,PolymorphicView) else mapping
+        self._mapping(family);query=mapping.query()
+        if where is not None: query=query.where(where)
+        if self.autoflush: await self.flush()
+        try:
+            await self._ensure_transaction();objects=await self._database.all(query.limit(max_rows+1))
+            if len(objects)>max_rows: raise OrmError('polymorphic selection row budget exceeded')
+            return self._adopt_polymorphic(family,objects)
         except BaseException:
             self._failed=True;raise
 
@@ -246,7 +268,7 @@ class AsyncSession(_SessionState):
         finally: self._transaction=None
         try:
             if self.expire_on_commit:
-                for record in self._store.records.values(): self._store.expire(record,frozenset(record.mapping.field_columns),discard_changes=False)
+                for record in self._store.records.values(): self._store.expire(record,frozenset(record.mapping.active_fields(record.obj)),discard_changes=False)
             await self._emit('after_commit')
         except asyncio.CancelledError as exc: raise PostCommitCancelledError() from exc
         except KeyboardInterrupt as exc: raise PostCommitInterruptedError() from exc

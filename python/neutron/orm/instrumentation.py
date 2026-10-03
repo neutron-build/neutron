@@ -55,10 +55,12 @@ class _MappedField:
         if self.slot is not None: self.slot.__set__(obj,value)
         else: object.__getattribute__(obj,'__dict__')[self.name]=value
 
-def instrument_model(model: type[Any],names: tuple[str,...]) -> None:
+def instrument_model(model: type[Any],names: tuple[str,...],*,own_inherited: bool=False) -> None:
     for name in names:
         existing=inspect.getattr_static(model,name,_MISSING)
-        if type(existing) is _MappedField: continue
+        if type(existing) is _MappedField:
+            if existing.owner is model or not own_inherited: continue
+            existing=existing.slot if existing.slot is not None else existing.default
         setattr(model,name,_MappedField(model,name,existing))
 
 def raw_values(obj: object,names: tuple[str,...]) -> dict[str,Any]:

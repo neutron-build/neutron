@@ -67,3 +67,6 @@ __all__ += ["PgRange","range_spec"]
 
 from .catalog_value import PgEnum,PgDomain,CatalogType
 __all__ += ["PgEnum","PgDomain","CatalogType"]
+
+from .polymorphic import PolymorphicMapping,PolymorphicView
+__all__ += ["PolymorphicMapping","PolymorphicView"]

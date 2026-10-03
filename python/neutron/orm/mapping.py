@@ -86,6 +86,12 @@ class ModelMapping(Generic[T]):
         object.__setattr__(self,"instrumented",instrumented)
         if instrumented: instrument_model(model_type,tuple(field_columns))
 
+    def accepts(self,obj: object) -> bool: return type(obj) is self.model_type
+
+    def active_fields(self,obj: object) -> tuple[str,...]:
+        if not self.accepts(obj): raise ValueError('object is outside mapping')
+        return tuple(self.field_columns)
+
     def snapshot(self,obj: T) -> dict[str,Any]:
         _validate_attribute_profile(self.model_type,tuple(self.field_columns))
         if type(obj) is not self.model_type: raise ValueError('mapped model type mismatch; inheritance not implemented')
@@ -176,7 +182,7 @@ def same_column_value(spec: ColumnSpec[Any],left: Any,right: Any) -> bool:
     return same_value(left,right)
 
 
-def _validate_attribute_profile(model_type: type[Any],names: tuple[str,...]) -> None:
+def _validate_attribute_profile(model_type: type[Any],names: tuple[str,...],*,allow_inherited_instrumentation: bool=False) -> None:
     """Finite scalar profile: attribute reads/restores cannot invoke user hooks."""
     if type(model_type) is not type: raise ValueError('mapped custom metaclasses unsupported')
     for name,expected in (('__getattribute__',object.__getattribute__),('__setattr__',object.__setattr__),('__delattr__',object.__delattr__)):
@@ -189,7 +195,7 @@ def _validate_attribute_profile(model_type: type[Any],names: tuple[str,...]) -> 
         descriptor=inspect.getattr_static(model_type,name,missing)
         if descriptor is missing: continue
         if type(descriptor) is _MappedField:
-            if descriptor.owner is not model_type or descriptor.name!=name: raise ValueError('foreign mapped instrumentation unsupported')
+            if (descriptor.owner is not model_type and not (allow_inherited_instrumentation and descriptor.owner in model_type.__mro__)) or descriptor.name!=name: raise ValueError('foreign mapped instrumentation unsupported')
             continue
         if isinstance(descriptor,types.MemberDescriptorType):
             if descriptor.__objclass__ not in model_type.__mro__ or descriptor.__name__!=name:

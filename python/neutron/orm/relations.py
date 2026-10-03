@@ -72,7 +72,7 @@ class Relation(Generic[P,C]):
         return Query(Scope(self.child.table),columns,_MappedDecoder(self.child))
 
     def _key(self,mapping: ModelMapping[Any],names: tuple[str,...],obj: object) -> Key:
-        if type(obj) is not mapping.model_type:
+        if not mapping.accepts(obj):
             raise ValueError('relation object type outside mapped model')
         key=[]
         for name in names:
