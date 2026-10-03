@@ -171,6 +171,48 @@ describe('SQLBrowser native bigint keyset integration', () => {
     expect(screen.getByText('offset body')).toBeTruthy()
   })
 
+  it('keeps retained rows read-only after a failed cursor read until refresh succeeds', async () => {
+    render(<SQLBrowser schema="public" table="notes" />)
+    await screen.findByText('page 1 body'); stage('preserved draft')
+    const draft = stagedEdits.value[0]
+    tablePage.mockRejectedValueOnce(new ApiError(409, 'expired cursor'))
+    fireEvent.click(screen.getByRole('button', { name: 'Next →' }))
+    await waitFor(() => expect(toasts.value.some(t => t.message.includes('expired cursor'))).toBe(true))
+    expect(screen.queryByRole('button', { name: '+ Insert' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Stage delete row 1' })).toBeNull()
+    fireEvent.dblClick(cell())
+    expect(document.querySelector('input[aria-label$=" value"]')).toBeNull()
+    expect(stagedEdits.value).toEqual([draft])
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh rows' }))
+    await screen.findByRole('button', { name: '+ Insert' })
+    expect(stagedEdits.value[0]).toBe(draft)
+    stage('freshly staged')
+    expect(stagedEdits.value[0].operation.table).toBe('notes')
+  })
+
+  it('never stages retained old-table rows or insert forms against a failed new-table read', async () => {
+    const view = render(<SQLBrowser schema="public" table="notes" />)
+    await screen.findByText('page 1 body'); stage('notes draft')
+    const draft = stagedEdits.value[0]
+    fireEvent.click(screen.getByRole('button', { name: '+ Insert' }))
+    expect(screen.getByRole('button', { name: 'Stage insert' })).toBeTruthy()
+    tableMeta.mockRejectedValueOnce(new Error('new table unavailable'))
+    view.rerender(<SQLBrowser schema="public" table="replacement" />)
+    await waitFor(() => expect(toasts.value.some(t => t.message.includes('new table unavailable'))).toBe(true))
+    expect(screen.queryByRole('button', { name: 'Stage insert' })).toBeNull()
+    expect(screen.queryByRole('button', { name: '+ Insert' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Stage delete row 1' })).toBeNull()
+    fireEvent.dblClick(cell())
+    expect(document.querySelector('input[aria-label$=" value"]')).toBeNull()
+    expect(stagedEdits.value).toEqual([draft])
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh rows' }))
+    await screen.findByRole('button', { name: '+ Insert' })
+    stage('replacement draft')
+    expect(stagedEdits.value).toHaveLength(2)
+    expect(stagedEdits.value[1].operation.table).toBe('replacement')
+    expect(stagedEdits.value[0]).toBe(draft)
+  })
+
   it('bounds previous navigation to 64 cursor starts and resets history with page size', async () => {
     render(<SQLBrowser schema="public" table="notes" />); await screen.findByText('page 1 body')
     for (let n = 2; n <= 66; n++) { fireEvent.click(screen.getByRole('button', { name: 'Next →' })); await screen.findByText(`page ${n} body`) }

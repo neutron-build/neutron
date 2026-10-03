@@ -130,11 +130,28 @@ The result grids virtualize: only the rows in the scroll viewport plus a
 fixed overscan exist in the DOM, whatever the result size, with spacer
 rows keeping the scroll height exact. Bounded reads are the contract, not
 a courtesy: one table page is at most 1,000 rows (larger limits are
-refused with 400, never silently clamped — page with offset or export
+refused with 400, never silently clamped — continue paging or export
 instead), and the SQL editor retains at most 10,000 rows of a result,
 marking it `truncated` with the limit named in the grid. Offset paging is
 deterministic: the primary key is the unique tail of every table read, so
 unchanged-data pages neither repeat nor skip rows.
+
+For direct PostgreSQL, the table browser first attempts live keyset paging
+when an ordinary permanent, non-inherited table has one native bigint
+primary key and only supported builtin scalar columns. Next follows an
+opaque server cursor; Previous retains up to 64 page starts, and Refresh
+restarts at the first page. Filters, custom sorts, reference matches,
+Nucleus and unsupported table/type profiles use offset paging with a visible
+reason. Authentication, expired or stale cursors, resource limits and backend
+errors require refresh rather than silently switching paging modes.
+
+Each keyset page uses its own read-only repeatable-read snapshot. The whole
+browsing session has no shared snapshot: inserts behind the cursor and
+changes to primary keys can be missed. Cursor history resets after a
+successful refresh, page-size or query change, or committed-edit reload.
+Failed reads retain the previous rows and staged drafts, but disable new
+edits until a fresh read succeeds. Staged drafts keep their exact table,
+connection, key and version identity when navigating.
 
 The grid is a WAI-ARIA `grid` usable without a mouse: one roving tab stop
 moves with the active cell, arrows/PageUp/PageDown/Home/End navigate,

@@ -74,6 +74,8 @@ function wireText(v: unknown): string {
 }
 
 export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMatch }: SQLBrowserProps) {
+  const inputPlan = JSON.stringify({ schemaName, table, initialFilter, initialMatch })
+  const publishedInputPlan = useSignal<string | null>(null)
   const result = useSignal<QueryResult | null>(null)
   const loading = useSignal(false)
   const error = useSignal<string | null>(null)
@@ -178,6 +180,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
       if (sequence === loadSequence.current) {
         meta.value = authoritative
         result.value = fetched!
+        publishedInputPlan.value = inputPlan
         position.value = acceptedPosition
         pendingReset.current = false
         pagingMode.value = mode
@@ -223,7 +226,6 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
   }, [conn.id, schemaName, table])
 
   const rowsRevision = tableDataRevision.value[conn.id] ?? 0
-  const inputPlan = JSON.stringify({ schemaName, table, initialFilter, initialMatch })
   const loadedInputPlan = useRef<string | null>(null)
   useEffect(() => {
     if (loadedInputPlan.current !== inputPlan) {
@@ -231,6 +233,11 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
       filters.value = initialFilter ? [{ ...initialFilter }] : []
       appliedFilters.value = filters.value
       sorts.value = []
+      // Unsubmitted forms belong to the previous view, unlike globally staged
+      // drafts whose exact relation identity is retained in the store.
+      showInsert.value = false
+      insertEdits.value = {}
+      showImport.value = false
     }
     refreshRows()
   }, [conn.id, inputPlan, rowsRevision])
@@ -249,9 +256,14 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
     return null
   })
   const metaColumns = useComputed(() => meta.value?.columns ?? [])
-  const editable = useComputed(() => !loading.value && ((meta.value !== null && !meta.value.readOnly && result.value?.readOnly !== true) || undefined))
+  // Props are not signals: compare the current render's input at action time
+  // as well, including the interval before its reset effect runs.
+  function currentRead() {
+    return !loading.value && !error.value && publishedInputPlan.value === inputPlan
+  }
+  const editable = useComputed(() => currentRead() && ((meta.value !== null && !meta.value.readOnly && result.value?.readOnly !== true) || undefined))
   const canUpdate = useComputed(() => editable.value === true && metaColumns.value.some(c => c.editable === true))
-  const canDelete = useComputed(() => !loading.value && meta.value?.canDelete === true)
+  const canDelete = useComputed(() => currentRead() && meta.value?.canDelete === true)
 
   /** Build the versioned full-key identity for one row of the current read. */
   function identityFor(rowIndex: number): { key: KeyCell[]; version: string; binding: string } | null {
@@ -338,6 +350,10 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
   }, [failedEditFocus.value])
 
   function guardBinding(): boolean {
+    if (!currentRead()) {
+      toast('error', 'Refresh rows successfully before editing this view; staged drafts are preserved.')
+      return false
+    }
     if (!bindingActive(binding)) {
       toast('error', `This view is bound to connection ${binding.connectionId}; connection switching never carries edits — switch back or reload the table on the active connection`)
       return false
@@ -818,7 +834,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
         </span>
       </div>
 
-      {showImport.value && meta.value && (
+      {showImport.value && currentRead() && meta.value && (
         <ImportDialog
           connectionId={conn.id}
           schema={schemaName}
