@@ -142,3 +142,45 @@ async def test_native_async_refresh_and_detach(mapped):
         with pytest.raises(ConflictError): await session.refresh(loaded)
         with pytest.raises(OrmError,match='requires rollback'): await session.get(m,obj.id)
         await session.rollback();assert loaded.name=='external'
+
+
+def test_native_attach_existing_match_discard_cache_and_no_insert(mapped):
+    url,m,native=mapped
+    row=native.execute(f'INSERT INTO {m.table.sql}(name,active) VALUES (%s,%s) RETURNING id',('stored',False)).fetchone()
+    obj=User(row[0],'stored',False)
+    with Session.connect(url) as session:
+        assert session.attach_existing(m,obj) is obj
+        assert session.get(m,obj.id) is obj
+        with pytest.raises(OrmError,match='identity'): session.attach_existing(m,User(obj.id,'stored',False))
+        session.rollback();session.detach(obj)
+    obj.name='unsaved'
+    with Session.connect(url) as session:
+        with pytest.raises(ConflictError): session.attach_existing(m,obj)
+        assert obj.name=='unsaved' and session.object_state(obj) is ObjectState.TRANSIENT
+        session.rollback()
+        assert session.attach_existing(m,obj,discard_changes=True) is obj
+        assert obj.name=='stored'
+        obj.name='changed';session.flush();session.rollback()
+        assert obj.name=='stored' and session.object_state(obj) is ObjectState.PERSISTENT
+        assert native.execute(f'SELECT count(*),min(name) FROM {m.table.sql}').fetchone()==(1,'stored')
+        session.detach(obj)
+        missing=User(9999,'absent')
+        with pytest.raises(ConflictError): session.attach_existing(m,missing)
+        assert session.object_state(missing) is ObjectState.TRANSIENT
+        session.rollback()
+
+@pytest.mark.asyncio
+async def test_native_async_attach_existing_and_cross_session_release(mapped):
+    url,m,native=mapped
+    ident=native.execute(f'INSERT INTO {m.table.sql}(name,active) VALUES (%s,%s) RETURNING id',('stored',True)).fetchone()[0]
+    obj=User(ident,'stored',True)
+    async with await AsyncSession.connect(url) as first:
+        assert await first.attach_existing(m,obj) is obj
+        await first.commit();first.detach(obj)
+    obj.name='local'
+    async with await AsyncSession.connect(url) as second:
+        with pytest.raises(ConflictError): await second.attach_existing(m,obj)
+        await second.rollback()
+        assert await second.attach_existing(m,obj,discard_changes=True) is obj
+        obj.active=False;await second.commit()
+        assert native.execute(f'SELECT name,active FROM {m.table.sql} WHERE id=%s',(ident,)).fetchone()==('stored',False)

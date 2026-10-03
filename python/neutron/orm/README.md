@@ -237,3 +237,17 @@ no uncommitted snapshot changes. It removes the identity entry, releases object
 ownership and records `DETACHED`; later `get` loads a separate instance. `add`
 continues to mean INSERT, not attach-existing. This API does not implement
 expiration, implicit attribute I/O or graph reconciliation.
+
+`session.attach_existing(mapping, obj, discard_changes=False)` (awaited for
+AsyncSession) verifies a complete primary key against exactly one native row,
+without INSERT, upsert or autoflush, then tracks the same object. Detached state
+alone does not prove a baseline. By default every supplied scalar must match
+the fetched row: instants compare in UTC, numeric values stay exact and JSONB
+compares structurally without equating booleans with numbers. A mismatch raises
+`ConflictError`, leaves the object unmodified, and requires rollback.
+`discard_changes=True` explicitly replaces caller values with the database row.
+The authoritative fetched row becomes both baseline and rollback original:
+rollback retains persistent ownership and does not recover discarded caller
+changes. Another owner or cached object at that identity refuses; ownership is
+rechecked after I/O before mutation. Generated fields come from the database;
+PK mutation during the read refuses. Patch merging remains unsupported.

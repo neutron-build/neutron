@@ -56,6 +56,33 @@ class StateStore:
         if identity is not None: self.identities[identity]=record
         return record
 
+    def check_existing_attach(self,mapping: ModelMapping[Any],obj: object,values: dict[str,Any]) -> None:
+        if id(obj) in self.records: raise OrmError('object already tracked; use refresh')
+        identity=self._identity(mapping,values)
+        if identity is None: raise OrmError('attach-existing requires a complete primary key')
+        if identity in self.identities: raise OrmError('mapped identity already tracked by another object')
+        with _OWNER_LOCK:
+            if _OWNERS.get(id(obj)) is not None: raise OrmError('object already attached to a Session')
+
+    def attach_existing(self,mapping: ModelMapping[T],obj: T,values: dict[str,Any]) -> Record[T]:
+        # Recheck and claim ownership atomically after native I/O, before any
+        # caller object mutation. No global primary-key identity cache exists.
+        with _OWNER_LOCK:
+            self.check_existing_attach(mapping,obj,mapping.snapshot(obj))
+            if set(values)!=set(mapping.field_columns): raise OrmError('incomplete attach-existing projection')
+            for name,column in mapping.field_columns.items(): column.spec.check(values[name])
+            if self._identity(mapping,values)!=self._identity(mapping,mapping.snapshot(obj)):
+                raise OrmError('attach-existing changed primary-key identity')
+            snapshot=deepcopy(values)
+            record=Record(mapping,obj,ObjectState.PERSISTENT,snapshot.copy(),snapshot,False)
+            _OWNERS[id(obj)]=self
+            self.records[id(obj)]=record
+            identity=self._identity(mapping,snapshot)
+            if identity is not None: self.identities[identity]=record
+            self._history.pop(id(obj),None)
+        mapping.restore(obj,deepcopy(snapshot))
+        return record
+
     def find(self,mapping: ModelMapping[T],key: tuple[Any,...]) -> T | None:
         if len(key)!=len(mapping.primary_key): raise ValueError('primary-key cardinality mismatch')
         normalized=mapping.key(dict(zip(mapping.primary_key,key)))

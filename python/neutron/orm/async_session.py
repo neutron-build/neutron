@@ -57,6 +57,18 @@ class AsyncSession(_SessionState):
         except BaseException:
             self._failed=True;raise
 
+    async def attach_existing(self,mapping: ModelMapping[T],obj: T,*,discard_changes: bool=False) -> T:
+        values=self._existing_input(mapping,obj,discard_changes)
+        try:
+            await self._ensure_transaction()
+            query=select_row(mapping.table,*mapping.field_columns.values()).where(self._predicate(mapping,values))
+            try: row=await self._database.one(query)
+            except CardinalityError as exc: raise ConflictError('attach-existing did not find exactly one row') from exc
+            self._adopt_existing(mapping,obj,values,row,discard_changes)
+            return obj
+        except BaseException:
+            self._failed=True;raise
+
     async def refresh(self,obj: T,*,discard_changes: bool=False) -> T:
         record=self._refresh_record(obj,discard_changes)
         try:

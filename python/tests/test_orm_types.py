@@ -72,3 +72,10 @@ def static_refresh_consumer(session: Session,obj: User) -> None:
 async def static_async_refresh_consumer(session: AsyncSession,obj: User) -> None:
     assert_type(await session.refresh(obj),User)
     assert_type(session.detach(obj),None)
+
+
+def static_attach_existing_consumer(session: Session,mapping: ModelMapping[User],obj: User) -> None:
+    assert_type(session.attach_existing(mapping,obj),User)
+
+async def static_async_attach_existing_consumer(session: AsyncSession,mapping: ModelMapping[User],obj: User) -> None:
+    assert_type(await session.attach_existing(mapping,obj,discard_changes=True),User)

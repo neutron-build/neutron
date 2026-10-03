@@ -59,3 +59,25 @@ def test_native_mapped_jsonb_replacement_rollback(live_table):
             assert obj.value==JSON_NULL
             obj.value=None;session.commit()
             assert native.execute(f'SELECT b IS NULL FROM {t.sql}').fetchone()==(True,)
+
+
+def test_native_attach_jsonb_structure_preserves_bool_number_distinction(live_table):
+    from dataclasses import dataclass
+    from neutron.orm import ConflictError,ModelMapping,Session
+    url,parent,native=live_table;t=setup_json(parent,native)
+    native.execute(f'INSERT INTO {t.sql}(id,b) VALUES (1,%s::jsonb)',('{"n":1}',))
+    @dataclass
+    class Document:
+        id: int
+        value: JsonDocument | None
+    mapping=ModelMapping(Document,t,{'id':t.column('id',int),'value':t.nullable_column('b',JsonDocument)},primary_key=('id',))
+    obj=Document(1,JsonDocument('{"n":1.0}'))
+    with Session.connect(url) as session:
+        assert session.attach_existing(mapping,obj) is obj
+        assert obj.value.text==native.execute(f'SELECT b::text FROM {t.sql} WHERE id=1').fetchone()[0]
+        session.commit();session.detach(obj)
+        native.execute(f'UPDATE {t.sql} SET b=%s::jsonb WHERE id=1',('true',))
+        obj.value=JsonDocument('1')
+        with pytest.raises(ConflictError): session.attach_existing(mapping,obj)
+        assert obj.value.text=='1'
+        session.rollback()

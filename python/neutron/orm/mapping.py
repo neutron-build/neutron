@@ -4,7 +4,8 @@ from dataclasses import MISSING, dataclass, fields, is_dataclass
 import types
 from types import MappingProxyType
 from typing import Any, Generic, Mapping, TypeVar, get_args, get_origin, get_type_hints, Union
-from .core import Column, OMIT, OrmError, Table
+from .core import Column, ColumnSpec, OMIT, OrmError, Table
+from .json_value import JsonDocument
 from decimal import Decimal
 import datetime as dt
 
@@ -96,3 +97,25 @@ class ModelMapping(Generic[T]):
             column.spec.check(value)
             result[column.name]=value
         return result
+
+
+def _json_equal(left: Any,right: Any) -> bool:
+    if isinstance(left,bool) or isinstance(right,bool): return type(left) is bool and type(right) is bool and left is right
+    if isinstance(left,(int,Decimal)) and isinstance(right,(int,Decimal)):
+        return Decimal(left)==Decimal(right)
+    if type(left) is not type(right): return False
+    if isinstance(left,list): return len(left)==len(right) and all(_json_equal(a,b) for a,b in zip(left,right))
+    if isinstance(left,dict): return left.keys()==right.keys() and all(_json_equal(left[key],right[key]) for key in left)
+    return bool(left==right)
+
+
+def same_column_value(spec: ColumnSpec[Any],left: Any,right: Any) -> bool:
+    """Exact native scalar semantics for validating an unknown attach baseline."""
+    spec.check(left);spec.check(right)
+    if left is None or right is None: return left is right
+    if type(left) is not spec.python_type or type(right) is not spec.python_type: return False
+    if spec.sql_type=='timestamptz': return left.astimezone(dt.timezone.utc)==right.astimezone(dt.timezone.utc)
+    if spec.sql_type=='jsonb':
+        if not isinstance(left,JsonDocument) or not isinstance(right,JsonDocument): return False
+        return _json_equal(left.parsed(),right.parsed())
+    return same_value(left,right)

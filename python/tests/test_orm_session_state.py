@@ -75,3 +75,34 @@ async def test_refresh_cancellation_fences_async_session_until_rollback(monkeypa
     await session.rollback();session.detach(obj)
     assert session.object_state(obj) is ObjectState.DETACHED
     await session.close()
+
+
+def test_attach_existing_preflight_conflicts_and_explicit_discard():
+    mapper=mapping();one=Session(Database(Connection([])));two=Session(Database(Connection([])))
+    obj=User(1,'local')
+    one._store.attach(mapper,obj,new=False)
+    with pytest.raises(OrmError,match='attached'): two._existing_input(mapper,obj,False)
+    duplicate=User(1,'same')
+    with pytest.raises(OrmError,match='identity'): one._existing_input(mapper,duplicate,False)
+    one.detach(obj)
+    values=two._existing_input(mapper,obj,False)
+    from neutron.orm import ConflictError
+    with pytest.raises(ConflictError): two._adopt_existing(mapper,obj,values,{'id':1,'name':'native'},False)
+    assert obj.name=='local' and two.object_state(obj) is ObjectState.TRANSIENT
+    two._adopt_existing(mapper,obj,values,{'id':1,'name':'native'},True)
+    assert obj.name=='native' and two.object_state(obj) is ObjectState.PERSISTENT
+    obj.name='changed';two.rollback();assert obj.name=='native'
+    two.detach(obj);one.close();two.close()
+
+@pytest.mark.asyncio
+async def test_attach_cancellation_never_claims_async_object(monkeypatch):
+    import asyncio
+    from neutron.orm import AsyncDatabase,AsyncSession
+    from .test_orm_clients import AsyncConnection
+    mapper=mapping();obj=User(1,'original');db=AsyncDatabase(AsyncConnection([]));session=AsyncSession(db)
+    async def cancelled(query): raise asyncio.CancelledError()
+    monkeypatch.setattr(db,'one',cancelled)
+    with pytest.raises(asyncio.CancelledError): await session.attach_existing(mapper,obj)
+    assert obj.name=='original' and session.object_state(obj) is ObjectState.TRANSIENT
+    with pytest.raises(OrmError,match='requires rollback'): await session.get(mapper,1)
+    await session.rollback();await session.close()

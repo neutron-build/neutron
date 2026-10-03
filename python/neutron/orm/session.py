@@ -6,7 +6,7 @@ from typing import Any, Iterator, TypeVar
 from .client import AsyncDatabase, Database
 from .core import CardinalityError, OrmError, Predicate, SessionBusyError, delete, insert, select_row, update
 from .lifecycle import TransactionHandle
-from .mapping import ModelMapping
+from .mapping import ModelMapping, same_column_value
 from .state import ObjectState, Record, StateStore
 T=TypeVar('T')
 
@@ -44,6 +44,25 @@ class _SessionState:
         self._guard();record=self._store.records.get(id(obj))
         if record is None or record.state is not ObjectState.PERSISTENT: raise OrmError('delete requires a persistent tracked object')
         record.state=ObjectState.DELETE_PENDING
+
+    def _existing_input(self,mapping: ModelMapping[T],obj: T,discard_changes: bool) -> dict[str,Any]:
+        self._guard();self._mapping(mapping)
+        if type(discard_changes) is not bool: raise ValueError('discard_changes requires a boolean')
+        values=mapping.snapshot(obj)
+        self._store.check_existing_attach(mapping,obj,values)
+        if not discard_changes:
+            for name,column in mapping.field_columns.items(): column.spec.check(values[name])
+        return values
+
+    def _adopt_existing(self,mapping: ModelMapping[T],obj: T,original: dict[str,Any],row: dict[str,Any],discard_changes: bool) -> None:
+        values={name:row[column.name] for name,column in mapping.field_columns.items()}
+        for name,column in mapping.field_columns.items(): column.spec.check(values[name])
+        # A caller or another task must not change input during the native read.
+        current=mapping.snapshot(obj)
+        if mapping.key(current)!=mapping.key(original): raise ConflictError('attach-existing primary key changed during read')
+        if not discard_changes and any(not same_column_value(column.spec,current[name],values[name]) for name,column in mapping.field_columns.items()):
+            raise ConflictError('attach-existing scalar values differ; explicitly discard changes')
+        self._store.attach_existing(mapping,obj,values)
 
     def _refresh_record(self,obj: object,discard_changes: bool) -> Record[Any]:
         self._guard()
@@ -151,6 +170,18 @@ class Session(_SessionState):
             row=self._database.one_or_none(select_row(mapping.table,*mapping.field_columns.values()).where(self._predicate(mapping,values)))
             if row is None: return None
             obj=mapping.construct(row);self._store.attach(mapping,obj,new=False);return obj
+        except BaseException:
+            self._failed=True;raise
+
+    def attach_existing(self,mapping: ModelMapping[T],obj: T,*,discard_changes: bool=False) -> T:
+        values=self._existing_input(mapping,obj,discard_changes)
+        try:
+            self._ensure_transaction()
+            query=select_row(mapping.table,*mapping.field_columns.values()).where(self._predicate(mapping,values))
+            try: row=self._database.one(query)
+            except CardinalityError as exc: raise ConflictError('attach-existing did not find exactly one row') from exc
+            self._adopt_existing(mapping,obj,values,row,discard_changes)
+            return obj
         except BaseException:
             self._failed=True;raise
 

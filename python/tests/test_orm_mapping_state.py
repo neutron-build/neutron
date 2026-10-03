@@ -100,3 +100,30 @@ def test_detach_removes_identity_and_releases_object_owner_without_reconciliatio
     obj.name='second session';store.rollback()
     assert obj.name=='second session'
     other.detach_all()
+
+
+def test_existing_attach_rechecks_ownership_before_mutation_and_uses_native_undo():
+    m=mapping();obj=User(1,'caller');first=StateStore();second=StateStore()
+    first.check_existing_attach(m,obj,m.snapshot(obj))
+    second.attach(m,obj,new=False)
+    with pytest.raises(OrmError): first.attach_existing(m,obj,{'id':1,'name':'native'})
+    assert obj.name=='caller' and first.object_state(obj) is ObjectState.TRANSIENT
+    second.detach_all();first.attach_existing(m,obj,{'id':1,'name':'native'})
+    obj.name='local';first.rollback()
+    assert obj.name=='native' and first.object_state(obj) is ObjectState.PERSISTENT
+    first.detach_all()
+
+
+def test_unknown_attach_baseline_semantics_preserve_json_types_and_instants():
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+    from neutron.orm import JsonDocument
+    from neutron.orm.mapping import same_column_value
+    json_spec=ColumnSpec(JsonDocument,'jsonb')
+    assert same_column_value(json_spec,JsonDocument('{"n":1.0,"v":null}'),JsonDocument('{"v":null,"n":1}'))
+    assert not same_column_value(json_spec,JsonDocument('true'),JsonDocument('1'))
+    assert not same_column_value(json_spec,JsonDocument('[false,0]'),JsonDocument('[0,false]'))
+    spec=ColumnSpec(dt.datetime,'timestamptz')
+    folded=dt.datetime(2024,11,3,1,30,tzinfo=ZoneInfo('America/New_York'),fold=1)
+    assert same_column_value(spec,folded,folded.astimezone(dt.timezone.utc))
+    assert not same_column_value(spec,folded,folded.replace(fold=0))
