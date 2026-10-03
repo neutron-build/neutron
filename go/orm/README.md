@@ -836,3 +836,27 @@ caller's pgx registry or alter protocol settings.
 ```sh
 go test ./orm -run 'Test(CompositeExact|PostgresBoundedComposite)' -count=1 -v
 ```
+
+`ObserveExecutor(scope, observer)` wraps one caller-owned request/transaction
+executor. Each completed physical Query/Exec call emits a `QueryEvent` with a
+bounded operation category, elapsed duration, row count and redacted error
+category/SQLSTATE. Events never include SQL text (including SQL literals), bound
+arguments, native error messages, credentials or connection details. Query
+completion occurs exactly once on result exhaustion/close and includes decode
+or projection/budget rejection; the wrapper forwards rejection to the owned
+Scope, preserving rollback even if callers swallow the ORM error. Original
+native errors and transaction ownership remain unchanged.
+
+Observers receive the original operation context, run synchronously and must
+return promptly without reusing the active transaction. Observer panics are
+isolated from writes and commit. No observer goroutines, global registrations,
+automatic replay or caller pool shutdown are introduced. `QueryMetrics` uses
+concurrent counters for physical calls/rows/errors/cancellation/duration; allocate
+one per request for isolated counts. Snapshot totals are exact after quiescence;
+concurrent snapshots may span adjacent individual counter updates. Transaction
+control statements bypass this borrowed Executor decorator; these counts cover
+observed data statements, not a full wire-level transaction trace.
+
+```sh
+go test ./orm -run 'Test(QueryObserver|PostgresQueryObserver)' -count=1 -v
+```
