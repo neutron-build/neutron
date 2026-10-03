@@ -299,3 +299,11 @@ def static_observer_consumer() -> None:
     observer=QueryObserver(capacity=256)
     assert_type(observer.drain(),tuple[QueryEvent,...])
     assert_type(observer.metrics,QueryMetrics)
+
+from neutron.orm import SessionRequests,AsyncSessionRequests
+
+def static_request_consumer(requests: SessionRequests) -> None:
+    with requests.session() as session: assert_type(session,Session)
+
+async def static_async_request_consumer(requests: AsyncSessionRequests) -> None:
+    async with requests.session() as session: assert_type(session,AsyncSession)

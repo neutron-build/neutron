@@ -82,3 +82,6 @@ __all__ += ["PgVector"]
 
 from .observability import QueryObserver,QueryEvent,QueryMetrics
 __all__ += ["QueryObserver","QueryEvent","QueryMetrics"]
+
+from .requests import SessionRequests,AsyncSessionRequests
+__all__ += ["SessionRequests","AsyncSessionRequests"]

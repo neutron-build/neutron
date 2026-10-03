@@ -643,3 +643,28 @@ are excluded from these data-operation counters. Stream duration includes its
 context lifetime and cleanup; each consumed row is counted once. Metrics/event
 export is explicit and can occur after commit. Request lifecycle/framework and
 OTel export examples are a separate required P34 slice.
+
+`SessionRequests(url, observer=...)` and `AsyncSessionRequests(url, observer=...)`
+create a fresh connection, Session and identity map per request. Each context
+commits on successful exit and closes on success, application failure or
+cancellation; sync calls stay in the request's worker thread, async calls stay in
+its task. Finite `max_active` admission defaults to 32 and refuses nested ownership.
+No global Session, model cache or tenant transaction is shared. Configure native
+connection timeouts in the private connection URL as part of the deployment.
+
+Shutdown stops admission and drains active requests within `grace_seconds`.
+Async shutdown then cancels request owners and gives cleanup a finite deadline;
+remaining native connections fence and shutdown reports failure. Sync shutdown
+expects the WSGI/ASGI server to drain request workers and reports failure if they
+exceed the deadline; Python cannot cancel an arbitrary worker thread. Sync owned
+close uses bounded native cleanup, async owned close uses a task deadline and
+fences on cleanup failure. Commit errors retain the existing known/indeterminate
+outcome classes. Request owners must not shut down their own factory.
+
+The authored Starlette factories in
+`conformance/polyglot/applications/python/framework_lifecycle.py` demonstrate
+sync worker and async task request scopes with lifespan shutdown, JSON body
+binding, bounded observer sharing and explicit optional OpenTelemetry/log/metric
+export after native boundaries. Export returns its event/failure counts; exporter
+failures cannot change a database outcome. These are integration examples, not
+an external application conversion proof or hosted application.
