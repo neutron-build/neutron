@@ -295,6 +295,7 @@ export async function commitStaged(connectionId: string): Promise<CommitResponse
     commitPhase.value = 'committed'
     lastCommit.value = { operationId, response: res, at: Date.now() }
     clearStaged(connectionId)
+    invalidateConnectionRows(connectionId)
     return res
   } catch (err: unknown) {
     return await resolveFailedCommit(connectionId, operationId, err, edits)
@@ -319,6 +320,7 @@ async function resolveFailedCommit(connectionId: string, operationId: string, er
       commitPhase.value = 'committed'
       lastCommit.value = { operationId, response: outcome.response, at: Date.now() }
       clearStaged(connectionId)
+      invalidateConnectionRows(connectionId)
       return outcome.response
     }
     if (!outcome || outcome.state === 'unknown') {
@@ -360,7 +362,16 @@ export async function revertLastCommit(connectionId: string): Promise<CommitResp
   })
   lastCommit.value = null
   commitPhase.value = 'idle'
+  invalidateConnectionRows(connectionId)
   return res
+}
+
+// Successful writes invalidate authoritative rows across this connection:
+// triggers may affect tables beyond the explicitly staged relation. Views
+// reload from the server; a cleared optimistic overlay is never a fresh read.
+export const tableDataRevision = signal<Record<string, number>>({})
+function invalidateConnectionRows(connectionId: string): void {
+  tableDataRevision.value = { ...tableDataRevision.value, [connectionId]: (tableDataRevision.value[connectionId] ?? 0) + 1 }
 }
 
 // --- Theme ---

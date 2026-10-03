@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'preact/hooks'
 import {
   activeConnection, schema, openTab, toast, bindingActive,
   stagedEdits, stagedForTable, stageEdit, keyStringOf, failedEditFocus,
-  type EditingBinding,
+  tableDataRevision, type EditingBinding,
 } from '../../lib/store'
 import { api } from '../../lib/api'
 import { encodeCell, encodeEdit, formatCell, WireEncodeError } from '../../lib/wire'
@@ -116,23 +116,27 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
     }
   }
 
+  const loadSequence = useRef(0)
   async function load() {
+    const sequence = ++loadSequence.current
     loading.value = true
     error.value = null
     try {
       const active = appliedFilters.value.filter(f => f.column !== '')
-      result.value = await api.tableData(
+      const fetched = await api.tableData(
         conn.id, schemaName, table, limit.value, offset.value,
         active.length > 0 ? active : undefined,
         undefined,
         sorts.value.length > 0 ? sorts.value : undefined,
         initialMatch,
       )
+      if (sequence === loadSequence.current) result.value = fetched
     } catch (err: unknown) {
+      if (sequence !== loadSequence.current) return
       error.value = err instanceof Error ? err.message : String(err)
       toast('error', `Failed to load ${table}: ${error.value}`)
     } finally {
-      loading.value = false
+      if (sequence === loadSequence.current) loading.value = false
     }
   }
 
@@ -155,7 +159,9 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
       .catch(() => { /* FK links are optional polish */ })
   }, [schemaName, table])
 
-  useEffect(() => { load() }, [schemaName, table])
+  const rowsRevision = tableDataRevision.value[conn.id] ?? 0
+  useEffect(() => { load() }, [schemaName, table, rowsRevision])
+  useEffect(() => () => { loadSequence.current++ }, [])
 
   // Read-only state is AUTHORITATIVE (server catalog): no PK, no row
   // versions, or unavailable metadata all mean read-only, with the reason
