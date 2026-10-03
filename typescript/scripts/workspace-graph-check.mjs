@@ -7,12 +7,11 @@ const snapshotPath = path.join(workspaceRoot, ".turbo-ls-normalized.json");
 const writeMode = process.argv.includes("--write");
 
 // Per the amended naming RFC (see docs/rfcs/naming.md "Reality note"), the
-// canonical npm scope is `@neutron-build/*` (with `create-neutron` as the
-// single unscoped exception required by `npm create <name>`).
+// canonical npm scope is `@neutron-build/*`, including the project generator.
 const requiredPackages = new Set([
   "@neutron-build/core",
   "@neutron-build/cli",
-  "create-neutron",
+  "@neutron-build/create",
   "@neutron-build/data",
 ]);
 

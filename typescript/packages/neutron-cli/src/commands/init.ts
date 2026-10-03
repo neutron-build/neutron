@@ -5,7 +5,7 @@ import {
   scaffoldProject,
   type RuntimeMode,
   type TemplateName,
-} from "create-neutron";
+} from "@neutron-build/create";
 
 interface InitOptions {
   targetDir: string;

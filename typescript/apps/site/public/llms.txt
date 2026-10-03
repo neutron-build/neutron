@@ -18,7 +18,7 @@ Modular async services and workers with Tokio and a Hyper HTTP core. Optional jo
 - Documentation: /docs/rust/overview
 
 ### typescript/ — Neutron TypeScript (UI Framework)
-SSR-first TypeScript UI framework on Preact: file-based routing, per-route loaders/actions, static + server (`app`) render modes, islands, signals, streaming. Published as `@neutron-build/core`. Monorepo: pnpm + Turbo. Packages include auth, data, nucleus, otel, security; scaffolding via `create-neutron`.
+SSR-first TypeScript UI framework on Preact: file-based routing, per-route loaders/actions, static + server (`app`) render modes, islands, signals, streaming. Published as `@neutron-build/core`. Monorepo: pnpm + Turbo. Packages include auth, data, nucleus, otel, security; scaffolding via `@neutron-build/create`.
 - Entry: `typescript/packages/neutron/src/` (package name: `@neutron-build/core`, v0.1.4)
 - Tests: `pnpm test` in `typescript/`
 - App authoring: routes in `src/routes/` (`index.tsx`→`/`, `[id].tsx`→dynamic, `_layout.tsx`→layout, `api/*`→API); per-route `export const config = { mode: "static" | "app", cache? }`; `export async function loader({ params, request }: LoaderArgs)` → `props.data`; `export async function action({ request }: ActionArgs)` → `props.actionData`. Client entry (`src/main.tsx`) is fixed glue: `registerRoutes(routes)` + `init()` from `@neutron-build/core/client` with `virtual:neutron/routes`. Preact, not React; no `App.tsx`.

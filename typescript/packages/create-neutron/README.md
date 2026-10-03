@@ -1,6 +1,9 @@
-# create-neutron
+# @neutron-build/create
 
 Scaffold a new Neutron project.
+
+Previously published as `create-neutron`; that package is deprecated. Use
+`@neutron-build/create` for new projects.
 
 Project scaffolding with templates for static sites, marketing pages, SaaS apps, and documentation.
 
@@ -9,11 +12,11 @@ Project scaffolding with templates for static sites, marketing pages, SaaS apps,
 ## Usage
 
 ```bash
-npm create @neutron-build
+npm create @neutron-build@latest
 # or
-pnpm create @neutron-build
+pnpm create @neutron-build@latest
 # or
-bun create @neutron-build
+bun create @neutron-build@latest
 ```
 
 ## Documentation

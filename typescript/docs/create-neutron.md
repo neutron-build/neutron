@@ -1,4 +1,4 @@
-# create-neutron
+# @neutron-build/create
 
 > **Terminology note:** This page documents **Neutron TypeScript**. In broader ecosystem docs, **Neutron** refers to the umbrella framework/platform across implementations.
 
@@ -8,7 +8,7 @@ Scaffold a new Neutron TypeScript app from templates.
 ## Usage
 
 ```bash
-pnpm create neutron my-app
+pnpm create @neutron-build@latest my-app
 ```
 
 Direct binary usage:
