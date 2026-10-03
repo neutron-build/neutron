@@ -9,7 +9,8 @@ def test_immutable_network_host_bits_family_prefix_and_scope_refusal():
     value=Inet.parse('192.168.1.73/24')
     assert value.address==IPv4Address('192.168.1.73') and value.prefix_length==24
     assert str(CIDR.parse('192.168.1.0/24'))=='192.168.1.0/24'
-    assert str(Inet.parse('::ffff:192.0.2.1/96'))=='::ffff:c000:201/96'
+    mapped=Inet.parse('::ffff:192.0.2.1/96')
+    assert mapped.address.packed==bytes.fromhex('00000000000000000000ffffc0000201') and mapped.address.version==6 and mapped.prefix_length==96
     with pytest.raises(FrozenInstanceError): value.prefix_length=8  # type: ignore[misc]
     for text in ('192.168.1.73/24','::1/0'):
         with pytest.raises(ValueError): CIDR.parse(text)
