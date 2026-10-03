@@ -55,3 +55,32 @@ def test_native_self_alias_correlated_exists_and_in_oracle(live_table):
         assert db.all(query_from(a).select(field(aid)).where(in_query(aid,sub)).order_by(Order(aid)))==[1,3]
         joined=query_from(a).inner_join(b,on=aid.eq(bid)).select_pair(field(aid),field(bid)).order_by(Order(aid))
         assert db.all(joined)==[(1,1),(2,2),(3,3)]
+
+
+def test_native_promoted_aggregate_group_window_and_set_oracle(live_table):
+    from decimal import Decimal
+    from neutron.orm import avg,count,max_value,min_value,row_number,sum_value
+    url,parent,native=live_table
+    native.execute(f'CREATE TABLE "{parent.schema}".metrics(group_id int NOT NULL,value int NOT NULL,wide bigint NOT NULL,exact numeric NOT NULL)')
+    t=Table('metrics',{'group_id':ColumnSpec(int,'int4'),'value':ColumnSpec(int,'int4'),'wide':ColumnSpec(int,'int8'),'exact':ColumnSpec(Decimal,'numeric')},schema=parent.schema)
+    native.execute(f'INSERT INTO {t.sql} VALUES (1,2147483647,9223372036854775807,0.1),(1,2147483647,9223372036854775807,0.2),(2,1,1,0.3)')
+    group=t.column('group_id',int);value=t.column('value',int);wide=t.column('wide',int);exact=t.column('exact',Decimal)
+    with Database.connect(url) as db:
+        assert db.one(query_from(t).select(sum_value(value)))==4294967295
+        assert db.one(query_from(t).select(sum_value(wide)))==Decimal(18446744073709551615)
+        assert db.one(query_from(t).select(sum_value(exact)))==Decimal('0.6')
+        assert db.one(query_from(t).select(avg(value)))==native.execute(f'SELECT avg(value) FROM {t.sql}').fetchone()[0]
+        for projection in (sum_value(value),min_value(value),max_value(value)):
+            assert db.one(query_from(t).select(projection).where(group.eq(999))) is None
+        assert db.one(query_from(t).select(count(value)).where(group.eq(999)))==0
+        total=sum_value(value)
+        grouped=query_from(t).select_pair(field(group),total).group_by(group).having(total.gt(2)).order_by(Order(group))
+        assert db.all(grouped)==native.execute(f'SELECT group_id,sum(value) FROM {t.sql} GROUP BY group_id HAVING sum(value)>2 ORDER BY group_id').fetchall()==[(1,4294967294)]
+        window=query_from(t).select_pair(field(group),row_number(t,partition_by=(group,),order_by=(Order(value),))).order_by(Order(group),Order(value))
+        assert db.all(window)==native.execute(f'SELECT group_id,row_number() OVER (PARTITION BY group_id ORDER BY value) FROM {t.sql} ORDER BY group_id,value').fetchall()
+        first=query_from(t).select(field(group)).where(group.eq(1));second=query_from(t).select(field(group)).where(group.in_([1,2]))
+        assert sorted(db.all(first.union(second)))==[1,2]
+        assert sorted(db.all(first.union(second,all=True)))==[1,1,1,1,2]
+        assert db.all(first.intersect(second))==[1]
+        assert db.all(second.except_(first))==[2]
+        assert sorted(db.all(query_from(t).select(field(group)).distinct()))==[1,2]

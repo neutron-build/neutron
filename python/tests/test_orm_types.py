@@ -114,3 +114,16 @@ def static_correlated_alias_consumer(db: Database) -> None:
     sub=query_from(b).correlate(a).select(field(bid)).where(bid.eq(aid))
     assert_type(db.all(query_from(a).select(field(aid)).where(exists(sub))),list[int])
     assert_type(db.all(query_from(a).select(field(aid)).where(in_query(aid,sub))),list[int])
+
+from decimal import Decimal
+from neutron.orm import avg,count,min_value,row_number,sum_value
+
+def static_aggregate_consumer(db: Database) -> None:
+    t=Table('t',{'id':ColumnSpec(int,'int4')});col=t.column('id',int)
+    assert_type(db.all(query_from(t).select(count(col))),list[int])
+    assert_type(db.all(query_from(t).select(sum_value(col))),list[int|Decimal|None])
+    assert_type(db.all(query_from(t).select(avg(col))),list[Decimal|None])
+    assert_type(db.all(query_from(t).select(min_value(col))),list[int|None])
+    assert_type(db.all(query_from(t).select(row_number(t))),list[int])
+    q=query_from(t).select(field(col))
+    assert_type(db.all(q.union(q)),list[int])

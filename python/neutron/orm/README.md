@@ -312,3 +312,21 @@ The enclosing query validates that each declared outer source belongs to its
 scope. Native types for IN projections must agree exactly. Alias labels are
 quoted and all subquery values remain bound in SQL occurrence order. CTE/derived
 sources and universal SQL expressions remain separate requirements.
+
+Typed query projections also admit `count(column)`, `sum_value(column)`,
+`avg(column)`, `min_value(column)` and `max_value(column)`. COUNT decodes int8;
+SUM(int2/int4) decodes int8 and SUM(int8/numeric) decodes Decimal. Because runtime
+column profiles do not encode integer widths in Python's type parameter,
+sum_value has static result `int | Decimal | None`; AVG is Decimal or None.
+Empty aggregates preserve NULL except COUNT's zero. Unsupported native profiles
+refuse before SQL. `group_by(*columns)` validates owned grouped projections;
+`having(aggregate.gt(value))` binds the predicate value. `distinct()` requests
+row DISTINCT. `row_number(table, partition_by=(...), order_by=(Order(...),))`
+produces an int8 window projection with validated source ownership.
+
+`union(other, all=False)`, `intersect(other)` and `except_(other)` require identical
+projection arity/native result profiles, retain bound parameter order, and
+compose from left to right. Apply final limit/offset after composition; exact-one
+APIs reject pagination as usual. Set-result ordering by output labels and broader
+aggregate/window expression families require a subsequent API; raw source
+ordering over a set result refuses.

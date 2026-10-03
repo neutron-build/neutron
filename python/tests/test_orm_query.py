@@ -56,3 +56,30 @@ def test_self_alias_and_explicit_correlated_exists_parameter_order():
     with pytest.raises(ValueError): query_from(a).select(field(a.column('id',int))).where(exists(sub))
     with pytest.raises(ValueError): query_from(outer).inner_join(alias(a,'outer%s'),on=outer_id.eq(outer_id))
     with pytest.raises(ValueError): insert(outer,{'id':1})
+
+
+def test_promoted_aggregate_empty_window_group_and_set_contracts():
+    from decimal import Decimal
+    from neutron.orm import avg,count,sum_value,min_value,max_value,row_number
+    a,b=tables();aid=a.column('id',int)
+    total=sum_value(aid)
+    assert total.decode(2**32)==2**32 and total.decode(None) is None
+    assert avg(aid).decode(Decimal('0.5'))==Decimal('0.5')
+    assert count(aid).decode(0)==0 and min_value(aid).decode(None) is None
+    with pytest.raises(ValueError): count(aid).decode(None)
+    q=query_from(a).select_pair(field(aid),total).group_by(aid).having(total.gt(5)).where(aid.in_([1,2]))
+    assert q.compile().params==(1,2,5)
+    assert ' GROUP BY ' in q.compile().sql and ' HAVING SUM(' in q.compile().sql
+    with pytest.raises(ValueError): query_from(a).select_pair(field(aid),total).compile()
+    with pytest.raises(ValueError): query_from(a).select(field(aid)).having(aid.eq(1)).compile()
+    window=query_from(a).select(row_number(a,order_by=(Order(aid),)))
+    assert 'ROW_NUMBER() OVER (ORDER BY' in window.compile().sql
+    assert window.compile().decode({'p0':2**32})==2**32
+    with pytest.raises(ValueError): query_from(a).select(row_number(a,partition_by=(b.column('id',int),))).compile()
+    first=query_from(a).select(field(aid)).where(aid.eq(1))
+    second=query_from(a).select(field(aid)).where(aid.eq(2))
+    assert first.union(second,all=True).limit(5).compile().params==(1,2,5)
+    assert 'UNION ALL' in first.union(second,all=True).compile().sql
+    assert 'SELECT DISTINCT' in first.distinct().compile().sql
+    with pytest.raises(ValueError): first.union(query_from(a).select_pair(field(aid),field(aid)))
+    with pytest.raises(ValueError): first.union(query_from(a).select(max_value(aid)))
