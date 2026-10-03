@@ -227,6 +227,27 @@ func generate(dir, model string) ([]byte, error) {
 
 func validateType(value ast.Expr, imports, used map[string]string) error {
 	switch typ := value.(type) {
+	case *ast.IndexExpr:
+		container, ok := typ.X.(*ast.SelectorExpr)
+		if !ok || container.Sel.Name != "Array" {
+			break
+		}
+		alias, ok := container.X.(*ast.Ident)
+		if !ok || imports[alias.Name] != ormPath {
+			break
+		}
+		element := typ.Index
+		if pointer, ok := element.(*ast.StarExpr); ok {
+			element = pointer.X
+		}
+		if _, nested := element.(*ast.IndexExpr); nested {
+			break
+		}
+		if err := validateType(element, imports, used); err != nil {
+			return err
+		}
+		used[alias.Name] = ormPath
+		return nil
 	case *ast.Ident:
 		switch typ.Name {
 		case "string", "bool", "int", "int32", "int64", "float32", "float64":
@@ -238,7 +259,7 @@ func validateType(value ast.Expr, imports, used map[string]string) error {
 			break
 		}
 		path := imports[alias.Name]
-		if (path == "time" && typ.Sel.Name == "Time") || (path == ormPath && (typ.Sel.Name == "Decimal" || typ.Sel.Name == "UUID" || typ.Sel.Name == "JSON")) {
+		if (path == "time" && typ.Sel.Name == "Time") || (path == ormPath && (typ.Sel.Name == "Decimal" || typ.Sel.Name == "UUID" || typ.Sel.Name == "JSON" || typ.Sel.Name == "Bytea")) {
 			used[alias.Name] = path
 			return nil
 		}

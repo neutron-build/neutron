@@ -624,3 +624,20 @@ constructor, including concurrent calls.
 ```sh
 go test ./cmd/neutron-ormgen ./orm -run 'Test(Generator|GeneratedOutside|MetadataCache)' -count=1 -v
 ```
+
+## Dimension-preserving arrays and binary values
+
+`NewBytea` owns binary bytes, including embedded NUL; empty and SQL NULL remain
+distinct. `NewArray[T]` owns flat scalar elements and explicit native PostgreSQL
+dimensions/lower bounds. Nullable element types such as `Array[*int64]` and
+`Array[*JSON]` preserve SQL NULL slots; JSON null remains a valid JSON document.
+`*Array[T]` represents a nullable column. Valid empty arrays have zero dimensions;
+zero codec values refuse writes. Constructors and accessors detach pointers and
+bytes from caller storage. Native pgx array scanning preserves up to six
+dimensions with a mandatory 1,000,000 element allocation bound. Flat Go slices,
+nested Array element types and uncertified element codecs refuse mapping.
+The distributed generator also emits Array and Bytea typed columns.
+
+```sh
+go test ./orm -run 'Test(ImmutableArray|Bytea|PostgresDimensionPreserving)' -count=1 -v
+```

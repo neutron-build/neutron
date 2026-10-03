@@ -104,6 +104,15 @@ func NewTable[M any](schema, name string) (Table[M], error) {
 }
 
 func supportedScalar(t reflect.Type) bool {
+	if t == reflect.TypeOf(Bytea{}) {
+		return true
+	}
+	if value, ok := reflect.Zero(t).Interface().(interface{ ormScalarType() bool }); ok {
+		return value.ormScalarType()
+	}
+	return supportedBuiltinScalar(t)
+}
+func supportedBuiltinScalar(t reflect.Type) bool {
 	if t == reflect.TypeOf(time.Time{}) || t == reflect.TypeOf(Decimal{}) || t == reflect.TypeOf(UUID{}) || t == reflect.TypeOf(JSON{}) {
 		return true
 	}

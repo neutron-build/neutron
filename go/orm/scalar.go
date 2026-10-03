@@ -201,6 +201,12 @@ func (d nullableJSONDestination) ScanBytes(value []byte) error {
 	return nil
 }
 func scanDestination(value reflect.Value) any {
+	if value.Kind() == reflect.Pointer && value.Type().Elem().Implements(reflect.TypeOf((*interface{ ormArrayType() })(nil)).Elem()) {
+		return &nullableArrayDestination{target: value}
+	}
+	if destination, ok := value.Addr().Interface().(interface{ ormDestination() any }); ok {
+		return destination.ormDestination()
+	}
 	if value.Type() == reflect.TypeOf((*JSON)(nil)) {
 		return nullableJSONDestination{value}
 	}
@@ -208,7 +214,14 @@ func scanDestination(value reflect.Value) any {
 }
 
 func validateScalarValue(value any) error {
+	if scalar, ok := value.(interface{ ormScalarValid() bool }); ok && !scalar.ormScalarValid() {
+		return ErrScalarValue
+	}
 	switch v := value.(type) {
+	case Bytea:
+		if !v.valid {
+			return ErrScalarValue
+		}
 	case Decimal:
 		if !v.valid {
 			return ErrScalarValue
