@@ -879,3 +879,27 @@ Context propagation follows the official [Span API](https://github.com/open-tele
 ```sh
 go test ./orm/otel -run TestOperationContextOTel -count=1 -v
 ```
+
+`orm/http.NewTransactions` integrates net/http and Neutron routes with a fresh
+transaction Scope and metrics instance per request. The callback receives an
+explicit `RequestSession`; no session is placed in global state. Its bounded
+Response is validated/copied before COMMIT and written afterward. Callback,
+response-bound and decoding failures roll back. Failure responses contain only
+generic text and make no rollback/retry promise for indeterminate commits.
+Streaming/hijacking are outside this buffered response contract.
+
+`Shutdown(ctx)` refuses new requests, cooperatively cancels existing request
+contexts and waits for scopes to settle within the supplied budget. If a callback
+ignores cancellation it returns the budget error and leaves pool ownership with
+the caller; retry Shutdown after settlement before closing that pool. The adapter
+creates no worker goroutines, closes no borrowed pools and can be mounted with
+`app.Router().Handle`. Neutron's server drains HTTP before its stop hooks; the
+[compiled lifecycle example](../examples/orm-request/main.go) closes the owned
+pool only after the adapter settles. The native acceptance fixture mounts an
+actual Neutron handler, verifies commit/rollback/oversized response refusal and
+retained scope expiry, cancels a backend observed in pg_sleep, proves pool reuse,
+and then requires zero application backends after owner close.
+
+```sh
+go test ./orm/http -count=1 -v
+```
