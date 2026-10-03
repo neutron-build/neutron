@@ -212,3 +212,83 @@ async def test_native_async_many_to_many_new_targets_and_through_rows(many_graph
         assert native.execute(f'SELECT tenant,account_id,group_id FROM {meta.parent.child.table.sql}').fetchone()==('a',account.id,group.id)
         session.disconnect_many_to_many(meta,account,group,through);await session.commit()
         assert native.execute(f'SELECT count(*) FROM {meta.parent.child.table.sql}').fetchone()==(0,)
+
+@dataclass
+class Leaf:
+    id: int|None=None
+    child_id: int|None=None
+    label: str='leaf'
+
+@pytest.fixture
+def deep_graph(graph):
+    from neutron.orm import OwnedRelation
+    url,relation,native=graph
+    table=Table('graph_leaves',{'id':ColumnSpec(int,'int4',generated=True),'child_id':ColumnSpec(int,'int4'),'label':ColumnSpec(str,'text')},schema=relation.parent.table.schema)
+    native.execute(f'CREATE TABLE {table.sql}(id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,child_id int NOT NULL REFERENCES {relation.child.table.sql}(id),label text NOT NULL)')
+    mapping=ModelMapping(Leaf,table,dict(table.columns),primary_key=('id',))
+    root=OwnedRelation(relation.parent,relation.child,('id',),('parent_id',),on_delete='delete')
+    descendant=OwnedRelation(relation.child,mapping,('id',),('child_id',),on_delete='delete')
+    return url,root,descendant,native
+
+
+def test_native_registered_multilevel_cascade_budgets_and_rollback(deep_graph):
+    from neutron.orm import RelationBudgetError,OwnedRelation
+    url,root,descendant,native=deep_graph
+    with Session.connect(url) as session:
+        parent=Parent();child=Child();leaf=Leaf()
+        session.add_graph(root,parent,[child]);session.add_graph(descendant,child,[leaf]);session.commit()
+        with pytest.raises(RelationBudgetError):
+            session.delete_graph(root,parent,budget=LoadBudget(2,10,10),descendants=(descendant,))
+        assert all(session.object_state(obj) is ObjectState.PERSISTENT for obj in (parent,child,leaf))
+        session.rollback()
+        with pytest.raises(RelationBudgetError):
+            session.delete_graph(root,parent,budget=LoadBudget(3,1,10),descendants=(descendant,))
+        assert all(session.object_state(obj) is ObjectState.PERSISTENT for obj in (parent,child,leaf))
+        session.rollback()
+        restricted=OwnedRelation(descendant.parent,descendant.child,descendant.parent_fields,descendant.child_fields)
+        with pytest.raises(OrmError,match='restricts'):
+            session.delete_graph(root,parent,budget=LoadBudget(3,10,10),descendants=(restricted,))
+        assert all(session.object_state(obj) is ObjectState.PERSISTENT for obj in (parent,child,leaf))
+        session.rollback()
+        session.delete_graph(root,parent,budget=LoadBudget(3,10,10),descendants=(descendant,));session.flush();session.rollback()
+        assert all(session.object_state(obj) is ObjectState.PERSISTENT for obj in (parent,child,leaf))
+        session.delete_graph(root,parent,budget=LoadBudget(3,10,10),descendants=(descendant,));session.commit()
+        assert all(native.execute(f'SELECT count(*) FROM {mapping.table.sql}').fetchone()==(0,) for mapping in (root.parent,root.child,descendant.child))
+
+@pytest.mark.asyncio
+async def test_native_async_registered_multilevel_cascade(deep_graph):
+    from neutron.orm import RelationBudgetError
+    url,root,descendant,native=deep_graph
+    async with await AsyncSession.connect(url) as session:
+        parent=Parent();child=Child();leaf=Leaf()
+        session.add_graph(root,parent,[child]);session.add_graph(descendant,child,[leaf]);await session.commit()
+        with pytest.raises(RelationBudgetError):
+            await session.delete_graph(root,parent,budget=LoadBudget(3,10,10),descendants=(descendant,),max_depth=1)
+        assert all(session.object_state(obj) is ObjectState.PERSISTENT for obj in (parent,child,leaf))
+        await session.rollback()
+        await session.delete_graph(root,parent,budget=LoadBudget(3,10,10),descendants=(descendant,));await session.commit()
+        assert all(native.execute(f'SELECT count(*) FROM {mapping.table.sql}').fetchone()==(0,) for mapping in (root.parent,root.child,descendant.child))
+
+@dataclass
+class CycleNode:
+    id: int
+    parent_id: int
+
+
+def test_native_owned_cycle_refuses_before_delete_marking(live_table):
+    from neutron.orm import OwnedRelation
+    url,base,native=live_table
+    table=Table('graph_cycle',{'id':ColumnSpec(int,'int4'),'parent_id':ColumnSpec(int,'int4')},schema=base.schema)
+    native.execute(f'CREATE TABLE {table.sql}(id int PRIMARY KEY,parent_id int NOT NULL REFERENCES {table.sql}(id) DEFERRABLE INITIALLY DEFERRED)')
+    with native.transaction():
+        native.execute(f'INSERT INTO {table.sql} VALUES (1,2),(2,1)')
+    mapping=ModelMapping(CycleNode,table,dict(table.columns),primary_key=('id',))
+    relation=OwnedRelation(mapping,mapping,('id',),('parent_id',),on_delete='delete')
+    with Session.connect(url) as session:
+        root=session.get(mapping,1);other=session.get(mapping,2)
+        assert root is not None and other is not None
+        with pytest.raises(OrmError,match='cyclic ownership'):
+            session.delete_graph(relation,root,budget=LoadBudget(10,10,10))
+        assert session.object_state(root) is ObjectState.PERSISTENT and session.object_state(other) is ObjectState.PERSISTENT
+        session.rollback()
+        assert native.execute(f'SELECT count(*) FROM {table.sql}').fetchone()==(2,)

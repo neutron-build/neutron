@@ -11,7 +11,7 @@ from .events import EVENT_NAMES, EventName, SessionEvent, PostCommitError, PostC
 from .instrumentation import expire_attributes
 from .mapping import ModelMapping, same_column_value
 from .state import ObjectState, Record, StateStore
-from .relations import Association, LoadBudget, ManyToMany, OwnedRelation, Relation, load_many, load_one
+from .relations import Association, LoadBudget, ManyToMany, OwnedRelation, Relation, RelationBudgetError, load_many, load_one
 T=TypeVar('T')
 P=TypeVar('P')
 C=TypeVar('C')
@@ -202,14 +202,33 @@ class _SessionState:
         if any(relation._key(relation.child,relation.child_fields,child)!=expected for child in children):
             raise ConflictError('child is not connected to the requested parent identity')
 
-    def _mark_graph_delete(self,relation: OwnedRelation[P,C],parent: P,children: Sequence[C]) -> None:
-        self._validate_owned_children(relation,parent,children)
-        if children and relation.on_delete=='restrict': raise OrmError('owned relation restricts deleting a parent with children')
-        for child in children:
-            if relation.on_delete=='delete': self.delete(child)
-            elif relation.on_delete=='nullify': self.disconnect(relation,parent,child)
-            self._deletions.append((parent,child))
-        self.delete(parent)
+    def _graph_registry(self,relation: OwnedRelation[Any,Any],descendants: tuple[OwnedRelation[Any,Any],...],budget: LoadBudget,max_depth: int) -> tuple[OwnedRelation[Any,Any],...]:
+        self._guard();budget.check()
+        if type(max_depth) is not int or not 0<max_depth<1024: raise ValueError('finite positive graph depth below 1024 required')
+        if not isinstance(descendants,tuple): raise ValueError('descendant ownership registry requires immutable tuple')
+        registry=(relation,*descendants)
+        if len({id(item) for item in registry})!=len(registry): raise ValueError('duplicate ownership relation')
+        for item in registry:
+            if not isinstance(item,OwnedRelation): raise OrmError('delete_graph requires explicit ownership metadata')
+            item.__post_init__();self._mapping(item.parent);self._mapping(item.child)
+        return registry
+
+    def _apply_graph_plan(self,plans: Sequence[tuple[OwnedRelation[Any,Any],Any,tuple[Any,...]]]) -> None:
+        # Discovery and policy admission finish before the first object mutation.
+        for relation,parent,children in plans: self._validate_owned_children(relation,parent,children)
+        delete_objects: dict[int,Any]={}
+        nullified: set[int]=set()
+        for relation,parent,children in plans:
+            delete_objects[id(parent)]=parent
+            for child in children:
+                if relation.on_delete=='delete': delete_objects[id(child)]=child
+                elif relation.on_delete=='nullify': nullified.add(id(child))
+        if nullified & delete_objects.keys(): raise OrmError('owned graph has conflicting delete/nullify ownership')
+        for relation,parent,children in plans:
+            for child in children:
+                if relation.on_delete=='nullify': self.disconnect(relation,parent,child)
+                self._deletions.append((parent,child))
+        for obj in delete_objects.values(): self.delete(obj)
 
     def delete(self,obj: object) -> None:
         self._guard();record=self._store.records.get(id(obj))
@@ -475,12 +494,28 @@ class Session(_SessionState):
         except BaseException:
             self._failed=True;raise
 
-    def delete_graph(self,relation: OwnedRelation[P,C],parent: P,*,budget: LoadBudget) -> None:
-        self._guard()
-        if not isinstance(relation,OwnedRelation): raise OrmError('delete_graph requires explicit ownership metadata')
+    def delete_graph(self,relation: OwnedRelation[P,C],parent: P,*,budget: LoadBudget,descendants: tuple[OwnedRelation[Any,Any],...]=(),max_depth: int=32) -> None:
+        registry=self._graph_registry(relation,descendants,budget,max_depth)
+        plans: list[tuple[OwnedRelation[Any,Any],Any,tuple[Any,...]]]=[]
+        seen: set[int]=set();rows=0
+        def visit(obj: Any,depth: int,edges: tuple[OwnedRelation[Any,Any],...]) -> None:
+            nonlocal rows
+            if id(obj) in seen: raise OrmError('owned graph contains repeated or cyclic ownership')
+            if depth>max_depth or len(seen)>=budget.max_parents: raise RelationBudgetError('owned graph traversal budget exceeded')
+            seen.add(id(obj))
+            for edge in edges:
+                result=self.load_relation(edge,[obj],budget=LoadBudget(1,max(1,budget.max_rows-rows),budget.batch_size))
+                children=result[0].children;rows+=len(children)
+                if rows>budget.max_rows: raise RelationBudgetError('owned graph row budget exceeded')
+                self._validate_owned_children(edge,obj,children)
+                if children and edge.on_delete=='restrict': raise OrmError('owned relation restricts deleting a parent with children')
+                plans.append((edge,obj,children))
+                if edge.on_delete=='delete':
+                    for child in children:
+                        visit(child,depth+1,tuple(item for item in registry if item.parent is edge.child))
         try:
-            associations=self.load_relation(relation,[parent],budget=budget)
-            self._mark_graph_delete(relation,parent,associations[0].children)
+            visit(parent,0,(relation,))
+            self._apply_graph_plan(plans)
         except BaseException:
             self._failed=True;raise
 

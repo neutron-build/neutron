@@ -215,8 +215,9 @@ reads are limited to the remaining budget plus one overflow sentinel row.
 Filters and child ordering are supported through the relation's own mapped
 query. Without ordering, child order is unspecified. Global limits/offsets,
 joined/replaced child projections, nullable/custom keys, per-parent pagination,
-lazy loads, many-to-many inference, graph writes, cascades and Session identity
-attachment are unsupported. Multiple batches have no implicit shared snapshot;
+lazy loads and many-to-many inference are unsupported by these standalone
+read functions. Explicit Session graph operations and identity attachment are
+described below. Multiple batches have no implicit shared snapshot;
 callers must arrange RepeatableRead/Serializable isolation when needed. Parent
 objects are never modified, and failures return no partial association result.
 
@@ -456,6 +457,14 @@ identity; nullify requires nullable non-primary child FK fields.
 uses nullable disconnect. `delete_graph(relation, parent, budget=...)` loads and
 validates owned children, orders delete/nullify actions before the parent, and
 preserves ordinary optimistic snapshots and rollback. Async deletion is awaited.
+Pass `descendants=(owned_child_relation, ...)` to register deeper ownership.
+Discovery and restrict admission finish before deletion/nullification marking.
+The same LoadBudget limits total visited parent/leaf objects (`max_parents`) and
+expanded relation rows (`max_rows`) across all levels; `max_depth=32` limits
+edge depth, with root at depth zero. Repeated/cyclic ownership and conflicting
+delete/nullify paths refuse. Only delete policies traverse descendants; nullify
+preserves their children. Budget failures require rollback, preserve persistent
+object states, and produce no graph deletion SQL.
 These are ORM actions independent of database ON DELETE clauses: concurrent
 unloaded children remain protected by the database FK, causing safe transaction
 failure rather than silently certifying an incomplete graph. Undeclared relation

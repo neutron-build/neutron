@@ -12,7 +12,7 @@ from .instrumentation import expire_attributes
 from .mapping import ModelMapping
 from .session import ConflictError, _SessionState
 from .state import ObjectState
-from .relations import Association, LoadBudget, OwnedRelation, Relation, async_load_many, async_load_one
+from .relations import Association, LoadBudget, OwnedRelation, Relation, RelationBudgetError, async_load_many, async_load_one
 T=TypeVar('T')
 P=TypeVar('P')
 C=TypeVar('C')
@@ -114,12 +114,28 @@ class AsyncSession(_SessionState):
         except BaseException:
             self._failed=True;raise
 
-    async def delete_graph(self,relation: OwnedRelation[P,C],parent: P,*,budget: LoadBudget) -> None:
-        self._guard()
-        if not isinstance(relation,OwnedRelation): raise OrmError('delete_graph requires explicit ownership metadata')
+    async def delete_graph(self,relation: OwnedRelation[P,C],parent: P,*,budget: LoadBudget,descendants: tuple[OwnedRelation[Any,Any],...]=(),max_depth: int=32) -> None:
+        registry=self._graph_registry(relation,descendants,budget,max_depth)
+        plans: list[tuple[OwnedRelation[Any,Any],Any,tuple[Any,...]]]=[]
+        seen: set[int]=set();rows=0
+        async def visit(obj: Any,depth: int,edges: tuple[OwnedRelation[Any,Any],...]) -> None:
+            nonlocal rows
+            if id(obj) in seen: raise OrmError('owned graph contains repeated or cyclic ownership')
+            if depth>max_depth or len(seen)>=budget.max_parents: raise RelationBudgetError('owned graph traversal budget exceeded')
+            seen.add(id(obj))
+            for edge in edges:
+                result=await self.load_relation(edge,[obj],budget=LoadBudget(1,max(1,budget.max_rows-rows),budget.batch_size))
+                children=result[0].children;rows+=len(children)
+                if rows>budget.max_rows: raise RelationBudgetError('owned graph row budget exceeded')
+                self._validate_owned_children(edge,obj,children)
+                if children and edge.on_delete=='restrict': raise OrmError('owned relation restricts deleting a parent with children')
+                plans.append((edge,obj,children))
+                if edge.on_delete=='delete':
+                    for child in children:
+                        await visit(child,depth+1,tuple(item for item in registry if item.parent is edge.child))
         try:
-            associations=await self.load_relation(relation,[parent],budget=budget)
-            self._mark_graph_delete(relation,parent,associations[0].children)
+            await visit(parent,0,(relation,))
+            self._apply_graph_plan(plans)
         except BaseException:
             self._failed=True;raise
 
