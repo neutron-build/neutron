@@ -90,6 +90,9 @@ func TestStudioKeysetPageNative(t *testing.T) {
 		`CREATE TABLE public.composite_key (a bigint,b bigint, PRIMARY KEY(a,b))`,
 		`CREATE TABLE public.parent_key (id bigint PRIMARY KEY)`,
 		`CREATE TABLE public.child_key () INHERITS(public.parent_key)`,
+		`CREATE TABLE public.large_sparse (id bigint PRIMARY KEY, body pg_catalog.text)`,
+		`INSERT INTO public.large_sparse SELECT 9007199254740993::bigint+g*100003::bigint,'row '||g FROM generate_series(1,20001) g`,
+		`ANALYZE public.large_sparse`,
 	}
 	for _, stmt := range stmts {
 		if err = fixture.Exec(ctx, stmt); err != nil {
@@ -190,6 +193,76 @@ func TestStudioKeysetPageNative(t *testing.T) {
 	if err = fixture.QueryRow(ctx, `SELECT xmin::text FROM "Odd Schema"."Odd Table" WHERE "Key"=-9223372036854775808`).Scan(&xmin); err != nil || versions[0] != xmin {
 		t.Fatal("authoritative version mismatch")
 	}
+	// Traverse real server-issued cursors into a large sparse relation. The
+	// expected rows come from a separate native text projection, not a decoder
+	// or cursor compiler shared with the route under test.
+	t.Run("large sparse deep traversal", func(t *testing.T) {
+		deep := pageRequest{ConnectionID: "native", Schema: "public", Table: "large_sparse", Profile: "postgres-direct", Limit: 1000}
+		for page := 1; page < 20; page++ {
+			status, result := call(deep, s.sessionToken)
+			if status != 200 || len(keys(result)) != 1000 || result["hasNext"] != true {
+				t.Fatalf("sparse page %d: status%d", page, status)
+			}
+			deep.Cursor = result["nextCursor"].(string)
+		}
+		const boundary int64 = 9007199254740993 + 19000*100003
+		var oracle []string
+		if err := fixture.QueryRow(ctx, `SELECT pg_catalog.array_agg(id::text ORDER BY id) FROM (SELECT id FROM public.large_sparse WHERE id>$1 ORDER BY id LIMIT 1000) expected`, boundary).Scan(&oracle); err != nil {
+			t.Fatal("deep sparse native oracle failed")
+		}
+		status, result := call(deep, s.sessionToken)
+		if status != 200 || strings.Join(keys(result), ",") != strings.Join(oracle, ",") || len(oracle) != 1000 || result["hasNext"] != true {
+			t.Fatal("deep sparse keys differ from independent native oracle")
+		}
+		// Delete the cursor anchor and insert behind it: continuation still uses
+		// its exact value, without looking up a surviving anchor or shifting an
+		// offset into the replacement row set.
+		if err := fixture.Exec(ctx, `DELETE FROM public.large_sparse WHERE id=$1`, boundary); err != nil {
+			t.Fatal("deep sparse anchor deletion failed")
+		}
+		if err := fixture.Exec(ctx, `INSERT INTO public.large_sparse VALUES (1,'inserted behind boundary')`); err != nil {
+			t.Fatal("deep sparse insertion failed")
+		}
+		if status, changed := call(deep, s.sessionToken); status != 200 || strings.Join(keys(changed), ",") != strings.Join(oracle, ",") {
+			t.Fatal("deep sparse continuation shifted after behind-boundary writes")
+		}
+		last := deep
+		last.Cursor = result["nextCursor"].(string)
+		if status, tail := call(last, s.sessionToken); status != 200 || len(keys(tail)) != 1 || tail["hasNext"] != false || tail["nextCursor"] != "" {
+			t.Fatal("deep sparse final page bounds incorrect")
+		}
+		// Native planner evidence for the profile's candidate-ID query. This
+		// establishes bounded range traversal on this fixture, not a timing win
+		// or a promise about every PostgreSQL data distribution.
+		var explained string
+		if err := fixture.QueryRow(ctx, `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT id FROM public.large_sparse WHERE id>$1 ORDER BY id ASC LIMIT 1001`, boundary).Scan(&explained); err != nil {
+			t.Fatal("deep sparse native EXPLAIN failed")
+		}
+		var plans []struct{ Plan map[string]any }
+		if err := json.Unmarshal([]byte(explained), &plans); err != nil || len(plans) != 1 {
+			t.Fatal("deep sparse native plan unavailable")
+		}
+		var hasBoundedRange func(map[string]any) bool
+		hasBoundedRange = func(plan map[string]any) bool {
+			kind, _ := plan["Node Type"].(string)
+			condition, _ := plan["Index Cond"].(string)
+			rows, _ := plan["Actual Rows"].(float64)
+			if (kind == "Index Scan" || kind == "Index Only Scan") && strings.Contains(condition, ">") && rows <= 1001 {
+				return true
+			}
+			children, _ := plan["Plans"].([]any)
+			for _, child := range children {
+				if node, ok := child.(map[string]any); ok && hasBoundedRange(node) {
+					return true
+				}
+			}
+			return false
+		}
+		if !hasBoundedRange(plans[0].Plan) {
+			t.Fatal("deep sparse candidate query did not use a bounded native index range")
+		}
+		t.Logf("deep sparse native candidate-ID plan: %s", explained)
+	})
 	// A real TCP keep-alive request after the old socket deadline must succeed
 	// on the SAME connection, not silently reconnect around a leaked deadline.
 	savedConn := latestConn
