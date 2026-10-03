@@ -93,9 +93,9 @@ unit tests and declared exports are not full ORM certification.
 
 `ModelMapping`, `Session`, `AsyncSession`, `ObjectState` and `ConflictError` provide
 an initial scalar dataclass persistence lifecycle. This expands the SQL core;
-it still does not establish full SQLAlchemy replacement. Inheritance, mutable JSON/collections, lazy/expired properties and automatic
-expiration on commit remain unsupported. Explicit graph, merge, bulk, event and
-savepoint APIs are described below.
+it still does not establish full SQLAlchemy replacement. Inheritance and implicit
+lazy I/O remain unsupported. Explicit graph, merge, bulk, event, savepoint,
+instrumented expiration and mutable JSON APIs are described below.
 
 ```python
 from dataclasses import dataclass
@@ -341,8 +341,8 @@ Their binds precede enclosing WHERE binds in SQL occurrence order. CTE source
 columns are explicitly named, preventing internal projection aliases leaking
 into the consumer's metadata.
 
-Inside an owned transaction, raw Mutation and compiled read/RETURNING SQL pass
-conservative single-statement admission. Transaction/session control commands
+Raw Mutation and compiled read/RETURNING SQL pass conservative single-statement
+admission globally; owned transactions permit only data/query statements. Transaction/session control commands
 are refused; comments, quoted strings/identifiers, dollar strings and trailing
 semicolons are scanned without treating embedded text as commands. Ambiguous
 ordinary-string backslashes refuse. Parameterized single data/query statements
@@ -459,9 +459,9 @@ validates owned children, orders delete/nullify actions before the parent, and
 preserves ordinary optimistic snapshots and rollback. Async deletion is awaited.
 Pass `descendants=(owned_child_relation, ...)` to register deeper ownership.
 Discovery and restrict admission finish before deletion/nullification marking.
-The same LoadBudget limits total visited parent/leaf objects (`max_parents`) and
+The same LoadBudget limits total traversed deletion objects (`max_parents`) and
 expanded relation rows (`max_rows`) across all levels; `max_depth=32` limits
-edge depth, with root at depth zero. Repeated/cyclic ownership and conflicting
+edge depth, with root at depth zero; accepted depth limits stay below 256. Repeated/cyclic ownership and conflicting
 delete/nullify paths refuse. Only delete policies traverse descendants; nullify
 preserves their children. Budget failures require rollback, preserve persistent
 object states, and produce no graph deletion SQL.

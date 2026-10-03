@@ -204,7 +204,7 @@ class _SessionState:
 
     def _graph_registry(self,relation: OwnedRelation[Any,Any],descendants: tuple[OwnedRelation[Any,Any],...],budget: LoadBudget,max_depth: int) -> tuple[OwnedRelation[Any,Any],...]:
         self._guard();budget.check()
-        if type(max_depth) is not int or not 0<max_depth<1024: raise ValueError('finite positive graph depth below 1024 required')
+        if type(max_depth) is not int or not 0<max_depth<256: raise ValueError('finite positive graph depth below 256 required')
         if not isinstance(descendants,tuple): raise ValueError('descendant ownership registry requires immutable tuple')
         registry=(relation,*descendants)
         if len({id(item) for item in registry})!=len(registry): raise ValueError('duplicate ownership relation')
