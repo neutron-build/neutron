@@ -107,6 +107,13 @@ func relationKey(value reflect.Value, fields []fieldInfo) string {
 	key := make([]byte, 0, len(fields)*9)
 	for _, field := range fields {
 		v := value.Field(field.index)
+		if v.Kind() == reflect.Pointer {
+			if v.IsNil() {
+				key = append(key, 0)
+				continue
+			}
+			v = v.Elem()
+		}
 		key = append(key, byte(v.Kind()))
 		if v.Type() == reflect.TypeOf(UUID{}) {
 			uuid := v.Interface().(UUID)

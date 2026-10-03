@@ -742,3 +742,20 @@ and join-table cascades are never inferred from this read mapping.
 ```sh
 go test ./orm -run 'Test(ThroughRelation|PostgresCompositeManyToMany)' -count=1 -v
 ```
+
+`NullableRelation` explicitly separates required shared identity fields
+(`JoinRequired`, e.g. tenant) from nullable FK components (`JoinNullable`).
+`LoadNullableMany/One` preserve exact nullable scalar key decoding. Owned
+`ConnectNullable`, `ReparentNullable`, `DisconnectNullable`, `UpdateNullable` and
+`DeleteNullableChild` lock exactly one parent/child in an operation savepoint.
+Connect permits unowned/same-owner children; changing owner requires explicit
+Reparent, which still cannot change required shared identity. Partially NULL
+composite keys refuse; disconnect clears nullable FK fields and retains the row.
+Update cannot override FK fields; delete is explicit orphan deletion. Each
+workflow enforces one-child/three-core-statement budgets, count-one mutations,
+native FK constraints and hook event rollback on operation failure. Nullable
+self cycles and inferred cascading remain separate unsupported graph plans.
+
+```sh
+go test ./orm -run 'Test(NullableRelation|PostgresNullableRelation)' -count=1 -v
+```
