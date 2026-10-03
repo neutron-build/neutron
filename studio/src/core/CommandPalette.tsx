@@ -62,12 +62,17 @@ const allItems = computed<PaletteItem[]>(() => {
   return items
 })
 
-const filtered = computed(() => {
+const MAX_VISIBLE_MATCHES = 20
+const matching = computed(() => {
   const q = paletteQuery.value.toLowerCase().trim()
-  if (!q) return allItems.value.slice(0, 20)
-  return allItems.value
-    .filter(i => i.label.toLowerCase().includes(q) || i.sub.toLowerCase().includes(q))
-    .slice(0, 20)
+  const items: PaletteItem[] = []
+  let total = 0
+  for (const item of allItems.value) {
+    if (q && !item.label.toLowerCase().includes(q) && !item.sub.toLowerCase().includes(q)) continue
+    total++
+    if (items.length < MAX_VISIBLE_MATCHES) items.push(item)
+  }
+  return { items, total }
 })
 
 export function CommandPalette() {
@@ -111,6 +116,7 @@ export function CommandPalette() {
   }, [isOpen])
 
   if (!isOpen) return null
+  const matches = matching.value
 
   function select(item: PaletteItem) {
     openTab(item.tab)
@@ -133,10 +139,12 @@ export function CommandPalette() {
           <kbd class={s.esc}>Esc</kbd>
         </div>
         <div class={s.list}>
-          {filtered.value.length === 0 && (
-            <div class={s.empty} role="status">No results</div>
-          )}
-          {filtered.value.map((item) => (
+          <div class={s.empty} role="status" aria-live="polite">
+            {matches.total === 0 ? 'No results' : matches.total > MAX_VISIBLE_MATCHES
+              ? `Showing first ${MAX_VISIBLE_MATCHES} of ${matches.total} matches. Narrow your search to see more.`
+              : `${matches.total} match${matches.total === 1 ? '' : 'es'}`}
+          </div>
+          {matches.items.map((item) => (
             <button key={item.id} class={s.item} onClick={() => select(item)}>
               <span class={s.itemIcon} aria-hidden="true">{item.icon}</span>
               <span class={s.itemLabel}>{item.label}</span>

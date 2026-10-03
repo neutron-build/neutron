@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/preact'
 import { activeConnection, closePalette, openPalette, paletteOpen, paletteQuery, schema } from '../lib/store'
 import type { Schema } from '../lib/types'
 import { CommandPalette } from './CommandPalette'
@@ -51,10 +51,28 @@ describe('command palette retained-component modal focus lifecycle', () => {
     input = await screen.findByRole('textbox', { name: 'Search database objects and commands' })
     await waitFor(() => expect(document.activeElement).toBe(input))
     fireEvent.input(input, { target: { value: 'no-such-object' } })
-    await screen.findByRole('status')
+    await screen.findByText('No results')
     fireEvent.keyDown(input, { key: 'Tab' })
     expect(document.activeElement).toBe(input)
     fireEvent.keyDown(input, { key: 'Tab', shiftKey: true })
     expect(document.activeElement).toBe(input)
+  })
+})
+
+
+describe('command palette bounded visible matches', () => {
+  it('announces truncation and narrower-search guidance while keeping at most twenty actions', async () => {
+    schema.value = { ...schema.value!, sql: Array.from({ length: 30 }, (_, index) => ({ schema: 'public', name: `notes-${index}`, columns: [] })) }
+    mountedPalette()
+    fireEvent.click(screen.getByRole('button', { name: 'Find objects' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Find database objects and commands' })
+    await screen.findByText('Showing first 20 of 31 matches. Narrow your search to see more.')
+    expect(within(dialog).getAllByRole('button')).toHaveLength(20)
+    const search = screen.getByRole('textbox', { name: 'Search database objects and commands' })
+    fireEvent.input(search, { target: { value: 'notes-29' } })
+    await screen.findByText('1 match')
+    expect(within(dialog).getAllByRole('button')).toHaveLength(1)
+    expect(within(dialog).getByRole('button', { name: /notes-29/ })).toBeTruthy()
+    expect(screen.getByRole('status').getAttribute('aria-live')).toBe('polite')
   })
 })
