@@ -1,0 +1,155 @@
+{
+  "version": 3,
+  "relational": {
+    "version": 2,
+    "dialect": "postgresql",
+    "capabilities": [],
+    "schemas": [
+      {
+        "name": "app"
+      }
+    ],
+    "tables": [],
+    "enums": [],
+    "views": [],
+    "opaque": []
+  },
+  "coverage": [
+    {
+      "family": "extensions",
+      "status": "not-inspected",
+      "detail": "fixture inventory; no migration authorization"
+    },
+    {
+      "family": "grants",
+      "status": "not-inspected",
+      "detail": "fixture inventory; no migration authorization"
+    },
+    {
+      "family": "policies",
+      "status": "not-inspected",
+      "detail": "fixture inventory; no migration authorization"
+    },
+    {
+      "family": "relations",
+      "status": "partial",
+      "detail": "fixture inventory; no migration authorization"
+    },
+    {
+      "family": "routines",
+      "status": "not-inspected",
+      "detail": "fixture inventory; no migration authorization"
+    },
+    {
+      "family": "triggers",
+      "status": "not-inspected",
+      "detail": "fixture inventory; no migration authorization"
+    },
+    {
+      "family": "types",
+      "status": "not-inspected",
+      "detail": "fixture inventory; no migration authorization"
+    }
+  ],
+  "inventory": [
+    {
+      "identity": {
+        "catalog": "pg_proc",
+        "schema": "app",
+        "name": "same name",
+        "arguments": []
+      },
+      "kind": "function",
+      "managed": false,
+      "owner": "app_owner",
+      "extension": "",
+      "reason": "preserve-only fixture; migration unsupported",
+      "definition": "",
+      "attributes": {},
+      "references": {},
+      "parts": []
+    },
+    {
+      "identity": {
+        "catalog": "pg_proc",
+        "schema": "app",
+        "name": "same name",
+        "arguments": [
+          {
+            "schema": "app",
+            "name": "int4"
+          }
+        ]
+      },
+      "kind": "function",
+      "managed": false,
+      "owner": "app_owner",
+      "extension": "",
+      "reason": "preserve-only fixture; migration unsupported",
+      "definition": "",
+      "attributes": {},
+      "references": {},
+      "parts": []
+    },
+    {
+      "identity": {
+        "catalog": "pg_proc",
+        "schema": "app",
+        "name": "same name",
+        "arguments": [
+          {
+            "schema": "pg_catalog",
+            "name": "int4"
+          }
+        ]
+      },
+      "kind": "function",
+      "managed": false,
+      "owner": "app_owner",
+      "extension": "",
+      "reason": "preserve-only fixture; migration unsupported",
+      "definition": "",
+      "attributes": {},
+      "references": {},
+      "parts": []
+    },
+    {
+      "identity": {
+        "catalog": "pg_proc",
+        "schema": "app",
+        "name": "same name",
+        "arguments": [
+          {
+            "schema": "pg_catalog",
+            "name": "text"
+          }
+        ]
+      },
+      "kind": "function",
+      "managed": false,
+      "owner": "app_owner",
+      "extension": "",
+      "reason": "preserve-only fixture; migration unsupported",
+      "definition": "",
+      "attributes": {},
+      "references": {},
+      "parts": []
+    },
+    {
+      "identity": {
+        "catalog": "pg_type",
+        "schema": "app",
+        "name": "int4"
+      },
+      "kind": "domain",
+      "managed": false,
+      "owner": "app_owner",
+      "extension": "",
+      "reason": "preserve-only fixture; migration unsupported",
+      "definition": "",
+      "attributes": {},
+      "references": {},
+      "parts": []
+    }
+  ]
+}
