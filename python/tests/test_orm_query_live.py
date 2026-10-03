@@ -98,3 +98,15 @@ def test_native_derived_and_cte_projection_bind_oracle(live_table):
             key=projected.column('identity',int)
             q=query_from(projected).select(field(key)).where(key.eq(3))
             assert db.all(q)==[row[0] for row in native.execute(f'SELECT id FROM {parent.sql} WHERE id IN (%s,%s) AND id=%s',(1,3,3)).fetchall()]==[3]
+
+
+def test_native_valid_correlation_no_match_is_empty_and_shadow_refuses(live_table):
+    from neutron.orm import alias,exists
+    url,parent,native=live_table
+    native.execute(f'INSERT INTO {parent.sql}(id) VALUES(1),(2)')
+    outer=alias(parent,'outer');inner=alias(parent,'inner')
+    aid=outer.column('id',int);bid=inner.column('id',int)
+    sub=query_from(inner).correlate(outer).select(field(bid)).where(bid.eq(aid)).where(bid.eq(99))
+    with Database.connect(url) as db:
+        assert db.all(query_from(outer).select(field(aid)).where(exists(sub)))==[]
+        with pytest.raises(ValueError): query_from(alias(parent,'outer')).correlate(outer)

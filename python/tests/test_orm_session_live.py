@@ -253,3 +253,27 @@ async def test_native_async_hooks_await_order_and_rollback(mapped):
         await session.rollback()
         assert obj.name=='async_hooks' and events[-1]=='after_rollback'
         assert native.execute(f'SELECT name FROM {m.table.sql}').fetchone()==('async_hooks',)
+
+
+def test_native_row_callback_cannot_introduce_unannounced_write(mapped):
+    url,m,native=mapped
+    with Session.connect(url) as session:
+        a=User(name='a');b=User(name='b');session.add(m,a);session.add(m,b);session.commit()
+        a.name='change_a'
+        def change_other(event): b.name='change_b'
+        session.listen('before_update',change_other)
+        with pytest.raises(OrmError,match='new write actions'): session.flush()
+        assert native.execute(f'SELECT name FROM {m.table.sql} ORDER BY id').fetchall()==[('a',),('b',)]
+        session.rollback();assert (a.name,b.name)==('a','b')
+
+@pytest.mark.asyncio
+async def test_native_async_row_callback_cannot_introduce_unannounced_write(mapped):
+    url,m,native=mapped
+    async with await AsyncSession.connect(url) as session:
+        a=User(name='a');b=User(name='b');session.add(m,a);session.add(m,b);await session.commit()
+        a.name='change_a'
+        async def change_other(event): b.name='change_b'
+        session.listen('before_update',change_other)
+        with pytest.raises(OrmError,match='new write actions'): await session.flush()
+        assert native.execute(f'SELECT name FROM {m.table.sql} ORDER BY id').fetchall()==[('a',),('b',)]
+        await session.rollback();assert (a.name,b.name)==('a','b')

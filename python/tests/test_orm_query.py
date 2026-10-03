@@ -112,3 +112,12 @@ def test_set_result_filter_and_rhs_free_scope_cannot_escape():
     right=query_from(inner).correlate(other).select(field(inner.column('id',int))).where(inner.column('id',int).eq(other.column('id',int)))
     with pytest.raises(ValueError,match='correlation'): left.union(right)
     with pytest.raises(ValueError): query_from(outer).select(field(outer.column('id',int))).where(exists(right))
+
+
+def test_correlated_sql_alias_shadowing_refuses_distinct_python_handles():
+    from neutron.orm import alias
+    a,b=tables();outer=alias(a,'shadow');inner=alias(a,'shadow')
+    with pytest.raises(ValueError): query_from(inner).correlate(outer)
+    scope=query_from(alias(a,'inner')).correlate(outer)
+    with pytest.raises(ValueError): scope.inner_join(inner,on=scope.table.column('id',int).eq(inner.column('id',int)))
+    with pytest.raises(ValueError): query_from(a).correlate(alias(b,a.name))

@@ -107,7 +107,10 @@ class AsyncSession(_SessionState):
             plans=self._plan()
             for record,action,_ in plans:
                 await self._emit('before_insert' if action=='insert' else 'before_update' if action=='update' else 'before_delete',record.obj)
+            expected={(id(record.obj),action) for record,action,_ in plans}
             plans=self._plan()
+            if {(id(record.obj),action) for record,action,_ in plans} - expected:
+                raise OrmError('row callbacks introduced new write actions; refuse before SQL')
             for record,action,values in plans:
                 mapping=record.mapping
                 if action=='delete':

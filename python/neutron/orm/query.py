@@ -57,8 +57,10 @@ class Scope:
         return frozenset((self.table, *(join.table for join in self.joins)))
 
     def _join(self, table: Table, on: Predicate, left: bool) -> Scope:
-        if any(_source_key(owner) == _source_key(table) for owner in self.tables):
+        if any(_source_key(owner) == _source_key(table) or _shadows(owner,table) for owner in self.tables):
             raise ValueError('duplicate source identity requires distinct aliases')
+        if any(_shadows(table,outer) for outer in self.correlated):
+            raise ValueError('join source shadows declared correlated source')
         if not isinstance(on, Predicate) or table not in on.owners or not (on.owners & self.tables) or on.owners - (self.tables | {table}):
             raise ValueError('join must connect the new table to the existing scope')
         return replace(self, joins=self.joins + (Join(table, on, left),))
@@ -70,7 +72,7 @@ class Scope:
         return self._join(table, on, True)
 
     def correlate(self,*tables: Table) -> Scope:
-        if not tables or any(table in self.tables for table in tables):
+        if not tables or any(any(_shadows(table,inner) for inner in self.tables | self.correlated) for table in tables):
             raise ValueError('correlation requires distinct declared outer tables')
         return replace(self,correlated=self.correlated | frozenset(tables))
 
@@ -388,3 +390,9 @@ def derived(query: Query[Any],name: str,*,labels: tuple[str,...]) -> Table:
 
 def cte(query: Query[Any],name: str,*,labels: tuple[str,...]) -> Table:
     return CteTable(query,name,labels)
+
+
+def _shadows(first: Table,second: Table) -> bool:
+    # SQL resolves aliases lexically, independently of Python object ownership.
+    alias_types=(AliasedTable,DerivedTable,CteTable)
+    return first._bound_reference==second._bound_reference or (first.name==second.name and (isinstance(first,alias_types) or isinstance(second,alias_types)))
