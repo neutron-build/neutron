@@ -8,8 +8,10 @@
 //
 // The parser is incremental: push() takes arbitrary chunks (a record, a
 // quoted field or a CRLF may straddle chunk boundaries) and returns the
-// records completed so far; end() flushes the last record. Memory is bounded
-// by the largest single record (maxRecordChars), never by the file.
+// records completed so far; end() flushes the last record. Retained record
+// state is bounded by maxRecordChars and maxFields. push() also returns an
+// array of records completed in that caller chunk; streaming consumers must
+// bound their chunk size and release completed records.
 //
 // Rules:
 //   - fields are separated by the delimiter (default ","); records end at
@@ -91,6 +93,7 @@ export class CsvParser {
     }
     this.delim = d.charCodeAt(0)
     this.maxChars = options.maxRecordChars ?? DEFAULT_MAX_RECORD_CHARS
+    if (!Number.isSafeInteger(this.maxChars) || this.maxChars < 1) throw new Error('CSV record limit must be a positive safe integer')
     this.maxFields = options.maxFields ?? DEFAULT_MAX_CSV_FIELDS
     if (!Number.isSafeInteger(this.maxFields) || this.maxFields < 1) throw new Error('CSV field limit must be a positive safe integer')
   }

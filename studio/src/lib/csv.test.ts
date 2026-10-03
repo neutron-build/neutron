@@ -206,3 +206,14 @@ describe('CSV empty-field resource admission', () => {
     expect(() => parseCsv('"","","","",""', { maxFields: 4 })).toThrow(/exceeds 4 fields/)
   })
 })
+
+
+describe('CSV record budget options', () => {
+  it('rejects nonfinite, fractional and nonpositive budgets instead of bypassing admission', () => {
+    for (const maxRecordChars of [NaN, Infinity, -Infinity, 0, -1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => new CsvParser({ maxRecordChars })).toThrow(/positive safe integer/)
+    }
+    expect(parseCsv('a', { maxRecordChars: 1 })[0].fields[0].text).toBe('a')
+    expect(() => parseCsv('ab', { maxRecordChars: 1 })).toThrow(/exceeds 1 characters/)
+  })
+})
