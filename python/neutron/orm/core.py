@@ -119,8 +119,14 @@ class Column(Generic[T]):
     @property
     def _bound_sql(self) -> str: return f'{self.table._bound_sql}.{_bound_quote(self.name)}'
 
+    def _owned(self) -> None:
+        if self.table.columns.get(self.name) is not self:
+            raise ValueError("predicate column is not owned by table")
+
     def eq(self, value: T | Column[T] | None) -> Predicate:
+        self._owned()
         if isinstance(value,Column):
+            value._owned()
             if value.spec.python_type is not self.spec.python_type: raise ValueError('incompatible column comparison')
             return Predicate(f'{self._bound_sql} = {value._bound_sql}',(),frozenset({self.table,value.table}))
         if value is None: return Predicate(f'{self._bound_sql} IS NULL',(),frozenset({self.table}))
@@ -128,6 +134,7 @@ class Column(Generic[T]):
         return Predicate(f'{self._bound_sql} = %s',(value,),frozenset({self.table}))
 
     def in_(self, values: Iterable[T]) -> Predicate:
+        self._owned()
         values=tuple(values)
         if not values: return Predicate('FALSE',(),frozenset({self.table}))
         for value in values: self.spec.check(value)

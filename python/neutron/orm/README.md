@@ -165,3 +165,6 @@ which adds `None` to its result type. Projections use internal unique SQL aliase
 immutable operations. `one` and `one_or_none` reject paginated queries.
 Self joins, aliases, arbitrary row shapes, aggregates, subqueries and relation
 loading are outside this bounded query API.
+
+`Predicate(sql, params, owners)` is an explicit trusted SQL escape hatch.
+Ownership checks on generated expressions do not make raw predicates a SQL sandbox.

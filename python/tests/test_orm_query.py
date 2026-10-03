@@ -32,3 +32,12 @@ def test_invalid_scope_and_nullability():
     with pytest.raises(ValueError): query_from(a).select(field(aid)).where(bid.eq(2))
     for value in (True,-1,1.5):
         with pytest.raises(ValueError): query_from(a).select(field(aid)).limit(value)
+
+
+def test_forged_predicate_columns_refused():
+    from neutron.orm import Column
+    a,b=tables(); aid=a.column('id',int)
+    forged=Column(a,'id',ColumnSpec(str,'text'))
+    with pytest.raises(ValueError): forged.eq('wrong')
+    with pytest.raises(ValueError): forged.in_(['wrong'])
+    with pytest.raises(ValueError): aid.eq(Column(a,'id',ColumnSpec(int,'int4')))

@@ -30,3 +30,13 @@ async def test_native_async_join_oracle(live_table):
     async with await AsyncDatabase.connect(url) as db:
         assert await db.all(q)==expected
         with pytest.raises(ValueError): await db.one(q.limit(1))
+
+
+def test_forged_join_predicate_refused_before_dispatch(live_table):
+    from neutron.orm import Column
+    url,parent,native=live_table
+    forged=Column(parent,'id',ColumnSpec(int,'int4'))
+    with Database.connect(url) as db:
+        with pytest.raises(ValueError): forged.eq(1)
+        with pytest.raises(ValueError): parent.column('id',int).eq(forged)
+        assert native.execute(f'SELECT count(*) FROM {parent.sql}').fetchone()==(0,)
