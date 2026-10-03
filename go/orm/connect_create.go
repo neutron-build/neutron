@@ -28,7 +28,7 @@ func NewUniqueConstraint[M any](ctx context.Context, db Executor, table Table[M]
 	if err != nil {
 		return UniqueConstraint[M]{}, err
 	}
-	rows, err := db.Query(ctx, `SELECT c.condeferrable,array_agg(a.attname::text ORDER BY k.ordinality) FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class t ON t.oid=c.conrelid JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY k(attnum,ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.attnum WHERE n.nspname=$1 AND t.relname=$2 AND c.conname=$3 AND c.contype IN ('p','u') GROUP BY c.oid,c.condeferrable`, table.info.schema, table.info.name, name)
+	rows, err := db.Query(ctx, `SELECT c.condeferrable,pg_catalog.array_agg(a.attname::pg_catalog.text ORDER BY k.ordinality) FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class t ON t.oid OPERATOR(pg_catalog.=) c.conrelid JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) t.relnamespace CROSS JOIN LATERAL pg_catalog.unnest(c.conkey) WITH ORDINALITY k(attnum,ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) t.oid AND a.attnum OPERATOR(pg_catalog.=) k.attnum WHERE n.nspname OPERATOR(pg_catalog.=) $1 AND t.relname OPERATOR(pg_catalog.=) $2 AND c.conname OPERATOR(pg_catalog.=) $3 AND c.contype  OPERATOR(pg_catalog.=)  ANY(ARRAY['p','u']::pg_catalog."char"[]) GROUP BY c.oid,c.condeferrable`, table.info.schema, table.info.name, name)
 	if err != nil {
 		return UniqueConstraint[M]{}, wrap("unique constraint", err)
 	}

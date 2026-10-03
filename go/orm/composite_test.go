@@ -44,3 +44,9 @@ func TestCompositeExactTextNullsEscapingAndBudgets(t *testing.T) {
 		t.Fatal("zero composite accepted")
 	}
 }
+
+func TestCompositeRefusesSessionDependentByteaFieldText(t *testing.T) {
+	if qualifiedCompositeField(17) {
+		t.Fatal("bytea_output-dependent field text admitted")
+	}
+}

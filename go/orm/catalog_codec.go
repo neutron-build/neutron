@@ -89,7 +89,7 @@ func NewPostgresTable[M any](ctx context.Context, db Executor, schema, name stri
 		}
 		custom[i] = contract
 	}
-	rows, err := db.Query(ctx, `SELECT a.attname,a.atttypid,a.attnotnull,t.typbasetype,t.typelem,n.nspname,t.typname,t.typtype::text,t.typnotnull FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid=a.attrelid JOIN pg_catalog.pg_namespace s ON s.oid=c.relnamespace JOIN pg_catalog.pg_type t ON t.oid=a.atttypid JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace WHERE s.nspname=$1 AND c.relname=$2 AND c.relkind IN ('r','p','v','m','f') AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum`, schema, name)
+	rows, err := db.Query(ctx, `SELECT a.attname,a.atttypid,a.attnotnull,t.typbasetype,t.typelem,n.nspname,t.typname,t.typtype::pg_catalog.text,t.typnotnull FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) a.attrelid JOIN pg_catalog.pg_namespace s ON s.oid OPERATOR(pg_catalog.=) c.relnamespace JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) a.atttypid JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) t.typnamespace WHERE s.nspname OPERATOR(pg_catalog.=) $1 AND c.relname OPERATOR(pg_catalog.=) $2 AND c.relkind  OPERATOR(pg_catalog.=)  ANY(ARRAY['r','p','v','m','f']::pg_catalog."char"[]) AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped ORDER BY a.attnum`, schema, name)
 	if err != nil {
 		return Table[M]{}, wrap("qualify codecs", err)
 	}
@@ -121,7 +121,7 @@ func NewPostgresTable[M any](ctx context.Context, db Executor, schema, name stri
 			if depth == 16 {
 				return Table[M]{}, fmt.Errorf("orm: domain base depth exceeded")
 			}
-			baseRows, err := db.Query(ctx, `SELECT t.oid,t.typbasetype,t.typelem,n.nspname,t.typname,t.typtype::text,t.typnotnull FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace WHERE t.oid=$1`, base.base)
+			baseRows, err := db.Query(ctx, `SELECT t.oid,t.typbasetype,t.typelem,n.nspname,t.typname,t.typtype::pg_catalog.text,t.typnotnull FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) t.typnamespace WHERE t.oid OPERATOR(pg_catalog.=) $1`, base.base)
 			if err != nil {
 				return Table[M]{}, wrap("qualify domain", err)
 			}
@@ -147,7 +147,7 @@ func NewPostgresTable[M any](ctx context.Context, db Executor, schema, name stri
 			typ = typ.Elem()
 		}
 		if typ == reflect.TypeOf(Vector{}) {
-			extensionRows, err := db.Query(ctx, `SELECT e.extname FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_extension e ON e.oid=d.refobjid WHERE d.classid='pg_catalog.pg_type'::pg_catalog.regclass AND d.objid=$1 AND d.refclassid='pg_catalog.pg_extension'::pg_catalog.regclass AND d.deptype='e'`, base.oid)
+			extensionRows, err := db.Query(ctx, `SELECT e.extname FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_extension e ON e.oid OPERATOR(pg_catalog.=) d.refobjid WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_type'::pg_catalog.regclass AND d.objid OPERATOR(pg_catalog.=) $1 AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_extension'::pg_catalog.regclass AND d.deptype OPERATOR(pg_catalog.=) 'e'`, base.oid)
 			if err != nil {
 				return Table[M]{}, wrap("qualify extension", err)
 			}
@@ -163,7 +163,7 @@ func NewPostgresTable[M any](ctx context.Context, db Executor, schema, name stri
 			}
 		}
 		if typ == reflect.TypeOf(Composite{}) && base.kind == "c" {
-			fieldRows, err := db.Query(ctx, `SELECT a.atttypid FROM pg_catalog.pg_type t JOIN pg_catalog.pg_attribute a ON a.attrelid=t.typrelid WHERE t.oid=$1 AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum`, base.oid)
+			fieldRows, err := db.Query(ctx, `SELECT a.atttypid FROM pg_catalog.pg_type t JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) t.typrelid WHERE t.oid OPERATOR(pg_catalog.=) $1 AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped ORDER BY a.attnum`, base.oid)
 			if err != nil {
 				return Table[M]{}, wrap("qualify composite", err)
 			}
@@ -282,7 +282,7 @@ func qualifiedCatalogCodec(t reflect.Type, c catalogCodec) bool {
 // domain, enum, array, float and temporal fields need separate qualification.
 func qualifiedCompositeField(oid uint32) bool {
 	switch oid {
-	case pgtype.BoolOID, pgtype.Int2OID, pgtype.Int4OID, pgtype.Int8OID, pgtype.TextOID, pgtype.VarcharOID, pgtype.BPCharOID, pgtype.NumericOID, pgtype.UUIDOID, pgtype.JSONOID, pgtype.JSONBOID, pgtype.ByteaOID:
+	case pgtype.BoolOID, pgtype.Int2OID, pgtype.Int4OID, pgtype.Int8OID, pgtype.TextOID, pgtype.VarcharOID, pgtype.BPCharOID, pgtype.NumericOID, pgtype.UUIDOID, pgtype.JSONOID, pgtype.JSONBOID:
 		return true
 	}
 	return false

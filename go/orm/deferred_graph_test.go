@@ -46,3 +46,29 @@ func TestDeferredGraphStaticBudgetAndTypedResultOwnership(t *testing.T) {
 		t.Fatal(model, err)
 	}
 }
+
+func TestDeferredConstraintControlsArePrivateAndRetainScopeOwnership(t *testing.T) {
+	ctx := context.Background()
+	driver := &lifecycleDriver{}
+	_, scope, _, _ := fixtureOwner(ctx, driver)
+	if _, err := scope.Exec(ctx, `SET CONSTRAINTS "owned"."fk" DEFERRED`); err == nil || driver.execs != 0 {
+		t.Fatal("raw public control admitted", err)
+	}
+	session := newWriteSession(scope)
+	keys := []DeferredForeignKey{{schema: "owned", table: "cycle_a", name: "fk", targetSchema: "owned", targetTable: "cycle_b"}}
+	if err := session.setConstraints(ctx, keys, true); err != nil {
+		t.Fatal("sealed defer refused", err)
+	}
+	if err := session.setConstraints(ctx, keys, false); err != nil {
+		t.Fatal("sealed validation refused", err)
+	}
+	if len(driver.statements) != 2 || driver.statements[0] != `SET CONSTRAINTS "owned"."fk" DEFERRED` || driver.statements[1] != `SET CONSTRAINTS "owned"."fk" IMMEDIATE` {
+		t.Fatal("sealed SQL changed", driver.statements)
+	}
+	scope.owner.mu.Lock()
+	scope.closed = true
+	scope.owner.mu.Unlock()
+	if err := session.setConstraints(ctx, keys, true); !errors.Is(err, ErrScopeClosed) || driver.execs != 2 {
+		t.Fatal("sealed control bypassed terminal ownership", err)
+	}
+}

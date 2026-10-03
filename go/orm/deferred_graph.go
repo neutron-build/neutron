@@ -21,7 +21,7 @@ func NewDeferredForeignKey[M any](ctx context.Context, db Executor, table Table[
 	if err := identifier(name); err != nil {
 		return DeferredForeignKey{}, err
 	}
-	rows, err := db.Query(ctx, `SELECT t.relname,c.contype::text,c.condeferrable,c.condeferred,rn.nspname,rt.relname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class t ON t.oid=c.conrelid JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace LEFT JOIN pg_catalog.pg_class rt ON rt.oid=c.confrelid LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid=rt.relnamespace WHERE n.nspname=$1 AND c.conname=$2`, table.info.schema, name)
+	rows, err := db.Query(ctx, `SELECT t.relname,c.contype::pg_catalog.text,c.condeferrable,c.condeferred,rn.nspname,rt.relname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class t ON t.oid OPERATOR(pg_catalog.=) c.conrelid JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) t.relnamespace LEFT JOIN pg_catalog.pg_class rt ON rt.oid OPERATOR(pg_catalog.=) c.confrelid LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid OPERATOR(pg_catalog.=) rt.relnamespace WHERE n.nspname OPERATOR(pg_catalog.=) $1 AND c.conname OPERATOR(pg_catalog.=) $2`, table.info.schema, name)
 	if err != nil {
 		return DeferredForeignKey{}, wrap("deferred FK", err)
 	}
@@ -140,9 +140,8 @@ func RunDeferredGraph(ctx context.Context, session *WriteSession, nodes []GraphS
 		}
 		seenConstraints[quoted[i]] = true
 	}
-	control := "SET CONSTRAINTS " + strings.Join(quoted, ", ")
 	err = session.Savepoint(ctx, func(owned *WriteSession) error {
-		if _, err := owned.Exec(ctx, control+" DEFERRED"); err != nil {
+		if err := owned.setConstraints(ctx, keys, true); err != nil {
 			return err
 		}
 		models := map[*graphNodeID]any{}
@@ -153,7 +152,7 @@ func RunDeferredGraph(ctx context.Context, session *WriteSession, nodes []GraphS
 			}
 			models[node.graphID()] = value
 		}
-		if _, err := owned.Exec(ctx, control+" IMMEDIATE"); err != nil {
+		if err := owned.setConstraints(ctx, keys, false); err != nil {
 			return err
 		}
 		result = DeferredGraphResult{models}
@@ -163,4 +162,38 @@ func RunDeferredGraph(ctx context.Context, session *WriteSession, nodes []GraphS
 		result = DeferredGraphResult{}
 	}
 	return result, wrap("deferred graph", err)
+}
+
+// setConstraints is a private sealed control operation. Its SQL is assembled
+// only from qualified immutable FK handles, never a caller-supplied statement.
+// Public Scope/WriteSession Exec retain their transaction-control refusal.
+func (s *WriteSession) setConstraints(ctx context.Context, keys []DeferredForeignKey, deferred bool) error {
+	if len(keys) == 0 {
+		return fmt.Errorf("orm: deferred FK controls require handles")
+	}
+	names := make([]string, len(keys))
+	for i, key := range keys {
+		if err := identifier(key.schema); err != nil {
+			return err
+		}
+		if err := identifier(key.name); err != nil {
+			return err
+		}
+		names[i] = quote(key.schema) + "." + quote(key.name)
+	}
+	if err := s.begin(ctx); err != nil {
+		return err
+	}
+	op, err := s.scope.acquire(ctx)
+	if err != nil {
+		return s.end(err)
+	}
+	mode := " IMMEDIATE"
+	if deferred {
+		mode = " DEFERRED"
+	}
+	_, err = s.scope.owner.driver.Exec(op.ctx, "SET CONSTRAINTS "+strings.Join(names, ", ")+mode)
+	err = operationError(err, op)
+	op.finish()
+	return s.end(err)
 }

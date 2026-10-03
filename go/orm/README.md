@@ -825,8 +825,8 @@ quoting/backslash escaping with 256-field and 1 MiB text bounds. A nullable mapp
 and field input types on writes, rather than the ORM guessing a Go struct.
 
 `NewPostgresTable` admits actual composite catalog types only when every field
-has a qualified bool, integer, text/varchar/bpchar, numeric, UUID, JSON/JSONB or
-bytea native OID. Field domains, enums, nested records, arrays, floats and temporal
+has a qualified bool, integer, text/varchar/bpchar, numeric, UUID or JSON/JSONB native OID. bytea field text depends on
+bytea_output and is refused. Field domains, enums, nested records, arrays, floats and temporal
 fields refuse this record-text profile; callers can use separately explicit
 `SQLValue` contracts for custom semantics. This is structured field-text storage,
 not typed Go struct field projection or composite query operators. The generator
