@@ -160,7 +160,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
   }, [schemaName, table])
 
   const rowsRevision = tableDataRevision.value[conn.id] ?? 0
-  useEffect(() => { load() }, [schemaName, table, rowsRevision])
+  useEffect(() => { load() }, [conn.id, schemaName, table, rowsRevision])
   useEffect(() => () => { loadSequence.current++ }, [])
 
   // Read-only state is AUTHORITATIVE (server catalog): no PK, no row

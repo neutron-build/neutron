@@ -370,6 +370,17 @@ export async function revertLastCommit(connectionId: string): Promise<CommitResp
 // triggers may affect tables beyond the explicitly staged relation. Views
 // reload from the server; a cleared optimistic overlay is never a fresh read.
 export const tableDataRevision = signal<Record<string, number>>({})
+function pruneRowRevisions(): void {
+  const retained = new Set(connections.peek().map(connection => connection.id))
+  const active = activeConnection.peek()
+  if (active) retained.add(active.id)
+  const previous = tableDataRevision.peek()
+  const next = Object.fromEntries(Object.entries(previous).filter(([id]) => retained.has(id)))
+  if (Object.keys(next).length !== Object.keys(previous).length) tableDataRevision.value = next
+}
+connections.subscribe(pruneRowRevisions)
+activeConnection.subscribe(pruneRowRevisions)
+
 function invalidateConnectionRows(connectionId: string): void {
   tableDataRevision.value = { ...tableDataRevision.value, [connectionId]: (tableDataRevision.value[connectionId] ?? 0) + 1 }
 }
