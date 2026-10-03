@@ -1,0 +1,15 @@
+# Accept mail for test.local over plain SMTP and hand it to Dovecot over LMTP.
+maillog_file = /dev/stdout
+myhostname = mail.test.local
+inet_interfaces = all
+inet_protocols = ipv4
+mydestination =
+mynetworks = 127.0.0.0/8
+smtpd_tls_security_level = none
+smtp_tls_security_level = none
+alias_maps =
+alias_database =
+virtual_mailbox_domains = test.local
+virtual_mailbox_maps = regexp:/etc/postfix/vmailbox
+virtual_transport = lmtp:inet:127.0.0.1:24
+smtpd_relay_restrictions = permit_auth_destination, reject

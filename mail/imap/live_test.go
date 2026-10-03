@@ -21,7 +21,15 @@ import (
 // FETCH round trip, its identity derivation, and its deletion detection agree
 // with a server that was never told what the client expected.
 //
-// Run it against a disposable IMAP server:
+// Run it against the Dovecot fixture (mail/testdata/dovecot), which also
+// seeds the mailbox the Seeded tests below assert on:
+//
+//	mail/scripts/live-imap.sh up
+//	eval "$(mail/scripts/live-imap.sh env)"
+//	go test -race ./imap/...
+//
+// or against any other disposable IMAP server, for example GreenMail (the
+// Seeded tests then skip, since they need the fixture's known contents):
 //
 //	docker run -d -p 13143:3143 -p 13025:3025 \
 //	  -e GREENMAIL_OPTS='-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.auth.disabled' \
@@ -192,19 +200,21 @@ func TestLiveFlagChangeIsObserved(t *testing.T) {
 	env := liveConfig(t)
 	ad := dialLive(t, env)
 
-	subject := fmt.Sprintf("flag test %d", time.Now().UnixNano())
-	deliver(t, env, subject, fmt.Sprintf("<flag-%d@test.local>", time.Now().UnixNano()), "body")
+	// Flag the message this test delivered, never "some unflagged message":
+	// the mailbox may hold other tests' (or the fixture's) mail, and
+	// changing it would leak state between tests.
+	stamp := time.Now().UnixNano()
+	msgID := fmt.Sprintf("<flag-%d@test.local>", stamp)
+	deliver(t, env, fmt.Sprintf("flag test %d", stamp), msgID, "body")
 
 	before := providerState(t, ad, "INBOX")
-	var target mail.MessageID
-	for id, kw := range before {
-		if !kw.Flagged {
-			target = id
-			break
-		}
+	target := mail.HeaderMessageID(msgID)
+	kwBefore, ok := before[target]
+	if !ok {
+		t.Fatalf("delivered message %s was not synced; got %v", target, ids(before))
 	}
-	if target == "" {
-		t.Skip("no unflagged message available to flag")
+	if kwBefore.Flagged {
+		t.Fatalf("a freshly delivered message %s arrived already flagged", target)
 	}
 
 	if err := ad.Apply(context.Background(), mail.Operation{
@@ -227,9 +237,10 @@ func TestLiveFlagChangeIsObserved(t *testing.T) {
 }
 
 func TestLiveDeletionIsDetected(t *testing.T) {
-	// GreenMail advertises neither QRESYNC nor CONDSTORE, which makes this
-	// the complete-listing sweep path — the one most IMAP servers use and
-	// the only way a deletion is observed there.
+	// Every read here starts from an empty cursor, so this exercises the
+	// complete-listing path — the one servers without QRESYNC (GreenMail)
+	// depend on for deletions. The VANISHED path on a QRESYNC server is
+	// TestLiveIncrementalSyncReportsChangesAndDeletions.
 	env := liveConfig(t)
 	ad := dialLive(t, env)
 
@@ -254,6 +265,81 @@ func TestLiveDeletionIsDetected(t *testing.T) {
 	}
 	if len(after) >= len(before) {
 		t.Errorf("message count did not drop after a delete: %d then %d", len(before), len(after))
+	}
+}
+
+func TestLiveIncrementalSyncReportsChangesAndDeletions(t *testing.T) {
+	// The QRESYNC path: resume from a cursor, let a different connection
+	// create, flag and expunge messages, and require the resumed sync to
+	// report exactly those — deletions via VANISHED rather than a sweep.
+	env := liveConfig(t)
+	ad := dialLive(t, env)
+	if !ad.conn.Supports("QRESYNC") || !ad.conn.Supports("CONDSTORE") {
+		t.Skip("server does not advertise QRESYNC and CONDSTORE")
+	}
+
+	stamp := time.Now().UnixNano()
+	doomedID := fmt.Sprintf("<inc-doomed-%d@test.local>", stamp)
+	flaggedID := fmt.Sprintf("<inc-flagged-%d@test.local>", stamp)
+	deliver(t, env, "incremental doomed", doomedID, "body")
+	deliver(t, env, "incremental flagged", flaggedID, "body")
+
+	first, err := ad.Sync(context.Background(), "INBOX", "")
+	if err != nil {
+		t.Fatalf("initial sync: %v", err)
+	}
+	doomed, flagged := mail.HeaderMessageID(doomedID), mail.HeaderMessageID(flaggedID)
+
+	// A second client changes the mailbox behind the first one's back.
+	other := dialLive(t, env)
+	if _, err := other.Sync(context.Background(), "INBOX", ""); err != nil {
+		t.Fatalf("second client sync: %v", err)
+	}
+	freshID := fmt.Sprintf("<inc-fresh-%d@test.local>", stamp)
+	deliver(t, env, "incremental fresh", freshID, "body")
+	if err := other.Apply(context.Background(), mail.Operation{
+		Kind: mail.OpAddKeyword, IDs: []mail.MessageID{flagged}, Keyword: "flagged",
+	}); err != nil {
+		t.Fatalf("flag: %v", err)
+	}
+	if err := other.Apply(context.Background(), mail.Operation{
+		Kind: mail.OpDelete, IDs: []mail.MessageID{doomed},
+	}); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	second, err := ad.Sync(context.Background(), "INBOX", first.Next)
+	if err != nil {
+		t.Fatalf("incremental sync: %v", err)
+	}
+	if second.Reset {
+		t.Fatal("an unchanged UIDVALIDITY produced a reset")
+	}
+	if second.EnumerationStart || second.Complete {
+		t.Error("an incremental sync claimed to be a full enumeration; the engine would sweep on it")
+	}
+
+	got := map[mail.MessageID]mail.ChangeKind{}
+	for _, c := range second.Changes {
+		got[c.ID] = c.Kind
+		if c.ID == flagged && (c.Envelope == nil || !c.Envelope.Keywords.Flagged) {
+			t.Errorf("update for %s does not carry the new flag", c.ID)
+		}
+	}
+	if k := got[doomed]; k != mail.ChangeDestroyed {
+		t.Errorf("expunged message %s reported as kind %d, want %d (ChangeDestroyed) (changes: %v)", doomed, k, mail.ChangeDestroyed, got)
+	}
+	if k := got[flagged]; k != mail.ChangeUpdated {
+		t.Errorf("flagged message %s reported as kind %d, want %d (ChangeUpdated) (changes: %v)", flagged, k, mail.ChangeUpdated, got)
+	}
+	fresh := mail.HeaderMessageID(freshID)
+	if _, ok := got[fresh]; !ok {
+		t.Errorf("new message %s missing from the incremental sync (changes: %v)", fresh, got)
+	}
+	for id, k := range got {
+		if id != doomed && id != flagged && id != fresh {
+			t.Errorf("unrelated message %s reported as kind %d", id, k)
+		}
 	}
 }
 
@@ -313,5 +399,119 @@ func TestLiveBodyFetchDoesNotMarkSeen(t *testing.T) {
 	after := providerState(t, ad, "INBOX")
 	if after[target].Seen {
 		t.Error("fetching a body marked the message seen at the provider")
+	}
+}
+
+// The Seeded tests assert on the fixed mailbox mail/testdata/dovecot/seed.sh
+// builds. NEUTRON_MAIL_TEST_IMAP_SEEDED=1 (printed by live-imap.sh env) says
+// the server is that fixture; against any other server they skip.
+func requireSeeded(t *testing.T) {
+	t.Helper()
+	if os.Getenv("NEUTRON_MAIL_TEST_IMAP_SEEDED") != "1" {
+		t.Skip("set NEUTRON_MAIL_TEST_IMAP_SEEDED=1 against the Dovecot fixture to assert on its seeded mailbox")
+	}
+}
+
+func TestLiveSeededSpecialUseRoles(t *testing.T) {
+	// Roles must come from the server's RFC 6154 SPECIAL-USE attributes,
+	// not from guessing at folder names: the fixture's folders carry
+	// attributes and the names are conventional, so a name-based guess and a
+	// correct one agree here — the test pins that the attribute path works
+	// and that nothing is mislabelled.
+	requireSeeded(t)
+	ad := dialLive(t, liveConfig(t))
+
+	boxes, err := ad.Mailboxes(context.Background())
+	if err != nil {
+		t.Fatalf("mailboxes: %v", err)
+	}
+	got := map[string]mail.Role{}
+	for _, b := range boxes {
+		got[b.Name] = b.Role
+	}
+	want := map[string]mail.Role{
+		"INBOX":   mail.RoleInbox,
+		"Drafts":  mail.RoleDrafts,
+		"Sent":    mail.RoleSent,
+		"Trash":   mail.RoleTrash,
+		"Junk":    mail.RoleJunk,
+		"Archive": mail.RoleArchive,
+	}
+	for name, role := range want {
+		if got[name] != role {
+			t.Errorf("mailbox %q has role %q, want %q (all: %v)", name, got[name], role, got)
+		}
+	}
+}
+
+func TestLiveSeededKeywordsAreMirrored(t *testing.T) {
+	requireSeeded(t)
+	ad := dialLive(t, liveConfig(t))
+
+	state := providerState(t, ad, "INBOX")
+	// seed.sh INBOX, in order: unread x3, read, flagged unread, flagged read.
+	want := map[int]mail.Keywords{
+		1: {},
+		2: {},
+		3: {},
+		4: {Seen: true},
+		5: {Flagged: true},
+		6: {Seen: true, Flagged: true},
+	}
+	for n, kw := range want {
+		id := mail.HeaderMessageID(fmt.Sprintf("<seed-%d@test.local>", n))
+		got, ok := state[id]
+		if !ok {
+			t.Errorf("seed message %d (%s) missing from INBOX; have %v", n, id, ids(state))
+			continue
+		}
+		if got.Seen != kw.Seen || got.Flagged != kw.Flagged || got.Draft || got.Answered {
+			t.Errorf("seed message %d keywords = %+v, want seen=%v flagged=%v and nothing else", n, got, kw.Seen, kw.Flagged)
+		}
+	}
+}
+
+func TestLiveSeededDraftsAndTrashHoldTheirMessages(t *testing.T) {
+	requireSeeded(t)
+	ad := dialLive(t, liveConfig(t))
+
+	boxes, err := ad.Mailboxes(context.Background())
+	if err != nil {
+		t.Fatalf("mailboxes: %v", err)
+	}
+	byRole := map[mail.Role]mail.MailboxID{}
+	for _, b := range boxes {
+		byRole[b.Role] = b.ID
+	}
+
+	// seed.sh numbers its messages 7 (Drafts), 8 (Sent), 9 (Trash).
+	cases := []struct {
+		role  mail.Role
+		n     int
+		draft bool
+	}{
+		{mail.RoleDrafts, 7, true},
+		{mail.RoleSent, 8, false},
+		{mail.RoleTrash, 9, false},
+	}
+	for _, c := range cases {
+		box, ok := byRole[c.role]
+		if !ok {
+			t.Errorf("no mailbox with role %q", c.role)
+			continue
+		}
+		state := providerState(t, ad, box)
+		id := mail.HeaderMessageID(fmt.Sprintf("<seed-%d@test.local>", c.n))
+		kw, found := state[id]
+		if !found {
+			t.Errorf("%s: seed message %d missing; have %v", c.role, c.n, ids(state))
+			continue
+		}
+		if kw.Draft != c.draft {
+			t.Errorf("%s: seed message %d draft = %v, want %v", c.role, c.n, kw.Draft, c.draft)
+		}
+		if !kw.Seen {
+			t.Errorf("%s: seed message %d should be seen", c.role, c.n)
+		}
 	}
 }

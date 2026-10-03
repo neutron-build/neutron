@@ -1,0 +1,87 @@
+name: Mail
+
+# The `mail/` module (github.com/neutron-build/neutron/mail) had no workflow
+# at all, and its six live IMAP tests skipped on every run because they need
+# a real server. `go.yml` is scoped to the `go/` SDK, a different module, so
+# this gets its own file.
+#
+# Two jobs:
+#   module     vet + the whole suite under -race, with the PgStore integration
+#              tests running against a real PostgreSQL 17 (NEUTRON_MAIL_TEST_
+#              DATABASE_URL), so none of them skip.
+#   live-imap  builds the disposable Dovecot fixture in mail/testdata/dovecot
+#              and runs the live oracle against it. mail/scripts/live-imap.sh
+#              fails the job if any live test skips.
+#
+# No real accounts, no secrets: the fixture's single user exists only inside
+# the throwaway container.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "mail/**"
+      - ".github/workflows/mail.yml"
+  pull_request:
+    paths:
+      - "mail/**"
+      - ".github/workflows/mail.yml"
+  workflow_dispatch:
+
+jobs:
+  module:
+    name: Vet and test (PostgreSQL 17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      NEUTRON_MAIL_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache-dependency-path: mail/go.sum
+
+      - name: Vet
+        run: go vet ./...
+        working-directory: mail
+
+      - name: Test
+        run: go test -race -count=1 ./...
+        working-directory: mail
+
+  live-imap:
+    name: Live IMAP oracle (Dovecot)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache-dependency-path: mail/go.sum
+
+      # Builds the image, starts it on loopback, waits for the seeded mailbox,
+      # runs `go test -race -run TestLive ./imap/...`, and tears down. A
+      # skipped live test fails the step; on failure the container log is
+      # printed before teardown.
+      - name: Run the live tests against Dovecot
+        run: mail/scripts/live-imap.sh test
