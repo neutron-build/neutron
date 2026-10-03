@@ -38,13 +38,13 @@ class BoundCatalog:
     base_spec: object|None=None
 
 TYPE_SQL='''WITH RECURSIVE chain AS (
- SELECT t.oid,t.typtype::text AS kind,t.typbasetype AS base,t.typnotnull AS required,n.nspname AS schema,t.typname AS name,0 AS depth
- FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname=%s AND t.typname=%s
+ SELECT t.oid,t.typtype::pg_catalog.text AS kind,t.typbasetype AS base,t.typnotnull AS required,n.nspname AS schema,t.typname AS name,0 AS depth
+ FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) t.typnamespace WHERE n.nspname OPERATOR(pg_catalog.=) %s AND t.typname OPERATOR(pg_catalog.=) %s
  UNION ALL
- SELECT t.oid,t.typtype::text,t.typbasetype,t.typnotnull,n.nspname,t.typname,c.depth+1
- FROM chain c JOIN pg_catalog.pg_type t ON t.oid=c.base JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace WHERE c.kind='d' AND c.depth<16)
+ SELECT t.oid,t.typtype::pg_catalog.text,t.typbasetype,t.typnotnull,n.nspname,t.typname,c.depth OPERATOR(pg_catalog.+) 1
+ FROM chain c JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) c.base JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) t.typnamespace WHERE c.kind OPERATOR(pg_catalog.=) 'd' AND c.depth OPERATOR(pg_catalog.<) 16)
  SELECT * FROM chain ORDER BY depth'''
-TABLE_SQL='''SELECT a.attname AS name,a.atttypid AS oid,a.attnotnull AS required FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid=a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=%s AND c.relname=%s AND c.relkind IN ('r','p','v','m','f') AND a.attnum>0 AND NOT a.attisdropped'''
+TABLE_SQL='''SELECT a.attname AS name,a.atttypid AS oid,a.attnotnull AS required FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace WHERE n.nspname OPERATOR(pg_catalog.=) %s AND c.relname OPERATOR(pg_catalog.=) %s AND c.relkind OPERATOR(pg_catalog.=) ANY(ARRAY['r'::pg_catalog."char",'p'::pg_catalog."char",'v'::pg_catalog."char",'m'::pg_catalog."char",'f'::pg_catalog."char"]) AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped'''
 
 
 def admitted_type(rows: list[dict[str,Any]],schema: str,name: str,kind: str,owner: object) -> CatalogType:

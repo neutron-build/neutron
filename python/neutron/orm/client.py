@@ -114,6 +114,8 @@ class Database:
             except BaseException as exc:
                 if self._owner is not None: self._rollback_only=True
                 if not isinstance(exc,Exception): raise
+                state=getattr(exc,'sqlstate',None)
+                if state is None or str(state).startswith('08'): self._discard()
                 raise _native(exc) from exc
 
     def enum_spec(self,schema: str,name: str,*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgEnum]:
@@ -376,9 +378,16 @@ class AsyncDatabase:
             try:
                 async with self._conn.cursor() as cur:
                     await cur.execute(sql,params);return list(await cur.fetchall())
+            except asyncio.CancelledError:
+                if self._owner is not None: self._rollback_only=True
+                task=asyncio.current_task()
+                if self._owner is None and task is not None and task.cancelling()>1: self._discard()
+                raise
             except BaseException as exc:
                 if self._owner is not None: self._rollback_only=True
                 if not isinstance(exc,Exception): raise
+                state=getattr(exc,'sqlstate',None)
+                if state is None or str(state).startswith('08'): self._discard()
                 raise _native(exc) from exc
 
     async def enum_spec(self,schema: str,name: str,*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgEnum]:

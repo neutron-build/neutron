@@ -145,3 +145,18 @@ async def test_native_async_domain_primary_identity_and_enum_base(catalog_fixtur
             assert await session.get(mapping,tagged) is obj
             obj.state=PgDomain(PgEnum("quoted'label",enum.native_type),state.native_type);await session.flush();await session.rollback()
             assert obj.state.value.label=='ready'
+
+
+def test_catalog_admission_ignores_shadowed_native_operators(catalog_fixture):
+    url,s,native=catalog_fixture
+    shadow=s+'_shadow'
+    native.execute(f'CREATE FUNCTION "{shadow}".false_eq(pg_catalog.text,pg_catalog.text) RETURNS pg_catalog.bool LANGUAGE sql IMMUTABLE AS $$ SELECT false $$')
+    native.execute(f'CREATE OPERATOR "{shadow}".= (PROCEDURE="{shadow}".false_eq,LEFTARG=pg_catalog.text,RIGHTARG=pg_catalog.text)')
+    native.execute('SELECT pg_catalog.set_config(\'search_path\',%s,false)',(shadow+',pg_catalog',))
+    assert native.execute("SELECT 'd'::pg_catalog.text='d'::pg_catalog.text").fetchone()==(False,)
+    with Database.connect(url) as db:
+        db.execute(Mutation("SELECT pg_catalog.set_config('search_path',%s,false)",(shadow+',pg_catalog',)))
+        state=db.enum_spec(s,'state_kind');amount=db.domain_spec(s,'nested_amount',ColumnSpec(Decimal,'numeric'))
+        assert amount.native_type is not None
+        table=db.catalog_table('catalog_values',{'id':ColumnSpec(int,'int4'),'state':state,'amount':amount},schema=s)
+        assert table.columns['amount'].spec.native_type is amount.native_type
