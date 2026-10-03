@@ -38,6 +38,14 @@ func TestNetworkNativeCodecHostBitsAndRefusal(t *testing.T) {
 			t.Fatal("invalid or unmasked CIDR", text, err)
 		}
 	}
+	for _, text := range []string{"fe80::1%en0", "fe80::%en0", "fe80::1%en0/64"} {
+		if _, err := ParseInet(text); !errors.Is(err, ErrScalarValue) {
+			t.Fatal("inet zone normalized away", err)
+		}
+		if _, err := ParseCIDR(text); !errors.Is(err, ErrScalarValue) {
+			t.Fatal("cidr zone normalized away", err)
+		}
+	}
 	cidr, err := ParseCIDR("2001:db8::/48")
 	if err != nil {
 		t.Fatal(err)

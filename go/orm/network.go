@@ -16,6 +16,11 @@ type Inet struct{ prefix netip.Prefix }
 type CIDR struct{ prefix netip.Prefix }
 
 func parseNetwork(text string) (netip.Prefix, error) {
+	// PrefixFrom strips an Addr zone. Refuse zones on the source address before
+	// constructing a prefix, instead of inspecting only the normalized prefix.
+	if strings.Contains(text, "%") {
+		return netip.Prefix{}, ErrScalarValue
+	}
 	var prefix netip.Prefix
 	var err error
 	if strings.Contains(text, "/") {
