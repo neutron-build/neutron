@@ -22,7 +22,8 @@ class ModelMapping(Generic[T]):
     table: Table
     field_columns: Mapping[str,Column[Any]]
     primary_key: tuple[str,...]
-    def __init__(self,model_type: type[T],table: Table,field_columns: Mapping[str,Column[Any]],*,primary_key: tuple[str,...]) -> None:
+    version_field: str | None
+    def __init__(self,model_type: type[T],table: Table,field_columns: Mapping[str,Column[Any]],*,primary_key: tuple[str,...],version_field: str | None=None) -> None:
         if type(table) is not Table: raise ValueError('mapping requires an ordinary physical Table')
         if not is_dataclass(model_type): raise ValueError('scalar mapping requires a dataclass type')
         _validate_attribute_profile(model_type,tuple(field_columns))
@@ -53,12 +54,19 @@ class ModelMapping(Generic[T]):
                 raise ValueError('primary-key fields must be mapped nonnullable columns')
             if field_columns[name].spec.sql_type in {'json','jsonb'}:
                 raise ValueError('JSON primary keys unsupported')
+        if version_field is not None:
+            if version_field not in field_columns or version_field in primary_key:
+                raise ValueError('version field must be mapped outside the primary key')
+            spec=field_columns[version_field].spec
+            if spec.sql_type not in {'int2','int4','int8'} or spec.nullable or spec.generated:
+                raise ValueError('version requires a nonnullable application integer column')
         params=getattr(model_type,'__dataclass_params__')
         if params.frozen: raise ValueError('mutable mapped dataclass required')
         object.__setattr__(self,"model_type",model_type)
         object.__setattr__(self,"table",table)
         object.__setattr__(self,"field_columns",MappingProxyType(dict(field_columns)))
         object.__setattr__(self,"primary_key",tuple(primary_key))
+        object.__setattr__(self,"version_field",version_field)
 
     def snapshot(self,obj: T) -> dict[str,Any]:
         _validate_attribute_profile(self.model_type,tuple(self.field_columns))

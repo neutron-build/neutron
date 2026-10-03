@@ -291,3 +291,29 @@ def test_native_raw_control_refusal_preserves_owned_transaction_rows(mapped):
             db.execute(Mutation(f'UPDATE {m.table.sql} SET name=%s WHERE id=%s',('raw',obj.id)))
             session.rollback();assert obj.id is None
     assert native.execute(f'SELECT count(*) FROM {m.table.sql}').fetchone()==(0,)
+
+@dataclass
+class Versioned:
+    id: int
+    value: str
+    version: int=1
+
+
+def test_native_versioned_flush_increment_rollback_and_stale_conflict(live_table):
+    url,base,native=live_table
+    t=Table('versioned',{'id':ColumnSpec(int,'int4'),'value':ColumnSpec(str,'text'),'version':ColumnSpec(int,'int4')},schema=base.schema)
+    native.execute(f'CREATE TABLE {t.sql}(id int PRIMARY KEY,value text NOT NULL,version int NOT NULL)')
+    m=ModelMapping(Versioned,t,dict(t.columns),primary_key=('id',),version_field='version')
+    with Session.connect(url) as session:
+        obj=Versioned(1,'first');session.add(m,obj);session.commit()
+        obj.value='second';session.flush();assert obj.version==2
+        session.rollback();assert (obj.value,obj.version)==('first',1)
+        obj.value='third';session.commit();assert obj.version==2
+        native.execute(f'UPDATE {t.sql} SET value=%s,version=version+1 WHERE id=1',('external',))
+        obj.value='stale'
+        with pytest.raises(ConflictError): session.flush()
+        session.rollback();assert (obj.value,obj.version)==('third',2)
+        obj.version=99
+        with pytest.raises(OrmError,match='mapped version'): session.flush()
+        session.rollback()
+        assert native.execute(f'SELECT value,version FROM {t.sql}').fetchone()==('external',3)

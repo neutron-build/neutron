@@ -366,3 +366,11 @@ Loaded children attach to its identity map, so duplicate parent slots and repeat
 loads reuse the same tracked child object. Existing cached values are not silently
 refreshed; use explicit refresh. `singular=True` refuses multiple matches.
 No relationship properties or hidden lazy I/O are installed.
+
+`ModelMapping(..., version_field='version')` opts into an application integer
+version column, outside the primary key and nonnullable/nongenerated. Dirty
+updates increment it with range validation before SQL; optimistic predicates
+include the prior version and scalar snapshot. Stale zero-row updates raise
+ConflictError. Native RETURNING adopts the new version, and rollback restores
+its prior value. Direct application edits to a tracked version refuse. This
+supports integer versions, not universal server-generated/concurrent bulk tokens.

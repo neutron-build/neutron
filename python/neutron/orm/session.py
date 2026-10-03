@@ -205,6 +205,12 @@ class _SessionState:
                 if dirty:
                     mapping.writes(record.obj,inserting=False)
                     if any(mapping.field_columns[name].spec.generated for name in dirty): raise OrmError('generated field mutation refused')
+                    if mapping.version_field is not None:
+                        name=mapping.version_field
+                        if name in dirty: raise OrmError('application mutation of mapped version refused')
+                        value=record.baseline[name]+1
+                        mapping.field_columns[name].spec.check(value)
+                        dirty[name]=value
                     plans.append((record,'update',{mapping.field_columns[name].name:value for name,value in dirty.items()}))
             elif record.state is ObjectState.DELETE_PENDING:
                 self._store.dirty(record) # reject changed primary key
