@@ -42,8 +42,13 @@ def qualify(args):
         raise ValueError('pinned binary hash differs')
     # Exact version output is retained; expected version must be pinned before
     # dispatch, rather than inferred as proof from whichever binary happens to run.
-    version=subprocess.run([str(binary),'--version'],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=10)
-    if version.returncode or version.stdout.strip()!=args.version: raise ValueError('pinned PgBouncer version differs')
+    tool_env=dict(os.environ)
+    library_hashes={}
+    if args.library_path:
+        tool_env['LD_LIBRARY_PATH']=str(args.library_path.resolve())
+        library_hashes={str(path.resolve()):hashlib.sha256(path.read_bytes()).hexdigest() for path in args.library_path.rglob('*') if path.is_file() and '.so' in path.name}
+    version=subprocess.run([str(binary),'--version'],env=tool_env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=10)
+    if version.returncode or not version.stdout.strip().splitlines() or version.stdout.strip().splitlines()[0]!=args.version: raise ValueError('pinned PgBouncer version differs')
     descriptor=json.loads(args.consumers.read_text())
     profile=json.loads((ROOT/'performance/profile.json').read_text())
     if set(descriptor['clients'])!=set(profile['clients']): raise ValueError('five qualified consumers required')
@@ -65,7 +70,7 @@ def qualify(args):
     console_password=uuid.uuid4().hex+uuid.uuid4().hex
     work=Path(tempfile.mkdtemp(prefix='neutron-pgbouncer-'));work.chmod(0o700)
     report={'protocol':'polyglot-pgbouncer-v1','status':'fail','binary_sha256':args.binary_sha256,
-        'version':args.version,'source_revision':descriptor['source_revision'],'artifact_hashes':artifacts,
+        'version':args.version,'native_toolchain':version.stdout.strip(),'local_library_hashes':library_hashes,'source_revision':descriptor['source_revision'],'artifact_hashes':artifacts,
         'configuration':{'auth':'plain on loopback only','default_pool_size':1,'prepare':'disabled in all five clients',
             'max_prepared_statements':0,'server_reset_query':'DISCARD ALL','server_reset_query_always':1},
         'scope':'pinned local session/transaction pooling with explicit unprepared clients; direct native migration DDL/advisory lock',
@@ -117,6 +122,7 @@ pidfile = {work/(mode+'.pid')}
 ''')
                 proxy_url=make_conninfo(host='127.0.0.1',port=listen_port,dbname='fixture',user=role,password=password,connect_timeout=2,sslmode='disable')
                 child_env={key:value for key,value in os.environ.items() if not key.startswith('PG') and not key.endswith(('DATABASE_URL','DB_URL'))}
+                if args.library_path: child_env['LD_LIBRARY_PATH']=str(args.library_path.resolve())
                 with open(work/(mode+'.private.log'),'wb') as log:
                     os.chmod(log.name,0o600)
                     process=subprocess.Popen([str(binary),str(config)],env=child_env,stdout=log,stderr=log,start_new_session=True)
@@ -237,7 +243,7 @@ pidfile = {work/(mode+'.pid')}
     print(json.dumps({'status':report['status'],'result':str(report_path),'scope':report['scope']}))
 
 if __name__=='__main__':
-    parser=argparse.ArgumentParser();parser.add_argument('--binary',type=Path,required=True);parser.add_argument('--binary-sha256',required=True);parser.add_argument('--version',required=True);parser.add_argument('--consumers',type=Path,required=True);parser.add_argument('--output',type=Path,required=True)
+    parser=argparse.ArgumentParser();parser.add_argument('--binary',type=Path,required=True);parser.add_argument('--binary-sha256',required=True);parser.add_argument('--version',required=True);parser.add_argument('--library-path',type=Path);parser.add_argument('--consumers',type=Path,required=True);parser.add_argument('--output',type=Path,required=True)
     try: qualify(parser.parse_args())
     except Exception:
         print(json.dumps({'status':'fail','diagnostics':'pinned PgBouncer qualification failed; native diagnostics suppressed'}));raise SystemExit(1)

@@ -7,11 +7,15 @@ private `NEUTRON_TEST_DATABASE_URL`, and five already qualified installed
 consumers prepared by `performance/prepare.py` at one exact source revision.
 
 ```sh
-python3 -I conformance/polyglot/pgbouncer/qualify.py --binary /home/tyler/neutron-polyglot-checks/.tools/pgbouncer/usr/sbin/pgbouncer --binary-sha256 REVIEWED_BINARY_SHA256 --version 'PgBouncer PINNED_VERSION' --consumers /tmp/neutron-perf-consumers.json --output /tmp/neutron-pgbouncer-qualification.json
+python3 -I conformance/polyglot/pgbouncer/qualify.py --binary /home/tyler/neutron-polyglot-checks/.tools/pgbouncer/usr/sbin/pgbouncer --binary-sha256 0c7d9a3a6d4e8f520e7383d43acaaa62bb73050359b8e3f87ec0ed03da6ccd5e --version 'PgBouncer 1.24.1' --library-path /home/tyler/neutron-polyglot-checks/.tools/pgbouncer/usr/lib/x86_64-linux-gnu --consumers /tmp/neutron-perf-consumers.json --output /tmp/neutron-pgbouncer-qualification.json
 ```
 
 Do not compute a hash of an arbitrary binary and treat that as independent
 acquisition approval. Freeze the package/version/source and binary digest first.
+The coordinator's pinned package is `pgbouncer_1.24.1-1+deb13u2` with deb SHA256
+`19a7df742f9c664ac88d04c5327ed97266844fd900ea7ccf0d8f6ddf27eca0db`.
+The helper records full native version output and local shared-library hashes;
+the library override applies only to the owned native tool processes.
 No installation, publication or system configuration changes happen here.
 Only loopback PostgreSQL is admitted; cloud/provider TLS is outside this profile.
 PgBouncer's `plain` authentication and backend TLS disable apply only to this
