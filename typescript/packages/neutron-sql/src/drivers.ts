@@ -358,14 +358,12 @@ async function execPostgresJs(
   }
   let cancelReason: "deadline" | "signal" | undefined;
   let dispatched = false;
+  let cancelPending: Promise<void> | undefined;
   const query = owner.unsafe(sqlText, (params ?? []) as unknown[]);
   const disarm = armCancellation(options, (reason) => {
     cancelReason = reason;
     dispatched = true;
-    query.cancel()?.catch(() => {
-      // cancel dispatch failure: the query itself will settle with its own
-      // error (or complete normally) — nothing further to do
-    });
+    cancelPending = Promise.resolve().then(() => query.cancel()).then(() => {}, () => {});
   });
   try {
     const res = await query;
@@ -374,6 +372,7 @@ async function execPostgresJs(
     throw wrapIfCanceled(classifyDriverError(err, driverKind), dispatched, cancelReason, driverKind);
   } finally {
     disarm();
+    await cancelPending;
   }
 }
 
@@ -414,8 +413,8 @@ export function wrapPostgresJs(client: PostgresJsClient, options: WrapAdapterOpt
     },
   });
 
-  const postgresJsPin = async (): Promise<PinnedExecutor> => {
-    const reserved = await client.reserve();
+  const postgresJsPin = async (execOptions?: QueryExecutionOptions): Promise<PinnedExecutor> => {
+    const reserved = await acquirePoolResource(() => client.reserve(), value => value.release(), execOptions, 'postgres');
     // postgres.js 3.4.8 bug dodge: reserved.release() unconditionally calls
     // onopen(c), which moves a connection back into the open pool — if the
     // socket died while reserved, that reopens a DEAD connection and the
@@ -454,10 +453,18 @@ export function wrapPostgresJs(client: PostgresJsClient, options: WrapAdapterOpt
 
   const driver: Driver = {
     async query<T>(sqlText: string, params: unknown[] = [], execOptions?: QueryExecutionOptions): Promise<T[]> {
-      return execPostgresJs(client, "postgres", "query", sqlText, params, execOptions) as Promise<T[]>;
+      if (execOptions === undefined) return execPostgresJs(client, "postgres", "query", sqlText, params, execOptions) as Promise<T[]>;
+      // The native pool releases a completed query before cancel transport
+      // completion; reserve explicitly until both have settled.
+      const pin = await postgresJsPin(execOptions);
+      try { return await pin.query<T>(sqlText, params, execOptions); }
+      finally { pin.release(); }
     },
     async execute(sqlText: string, params: unknown[] = [], execOptions?: QueryExecutionOptions): Promise<number> {
-      return (await execPostgresJs(client, "postgres", "execute", sqlText, params, execOptions)) as number;
+      if (execOptions === undefined) return (await execPostgresJs(client, "postgres", "execute", sqlText, params, execOptions)) as number;
+      const pin = await postgresJsPin(execOptions);
+      try { return await pin.execute(sqlText, params, execOptions); }
+      finally { pin.release(); }
     },
     async begin<T>(fn: (tx: Driver) => Promise<T>, modes?: TransactionModes): Promise<T> {
       const pin = await postgresJsPin();
@@ -466,7 +473,7 @@ export function wrapPostgresJs(client: PostgresJsClient, options: WrapAdapterOpt
     close: () => driver.lifecycle.terminate(),
     lifecycle,
     prepare: (sqlText: string): PreparedStatement => postgresJsPrepared(client, sqlText),
-    pin: postgresJsPin,
+    pin: () => postgresJsPin(),
   };
   return driver;
 }
@@ -570,33 +577,37 @@ const pgPrepared = (
 /** Cancel a queued checkout without ever submitting a statement. pg-pool
  * cannot remove its queued waiter, so a late checkout is immediately returned
  * and its rejection stays observed. */
-async function acquirePgClient(pool: PgPoolLike, options?: QueryExecutionOptions): Promise<PgPoolClientLike> {
+async function acquirePoolResource<T>(acquire: () => Promise<T>, recycle: (value: T) => void, options: QueryExecutionOptions | undefined, kind: string): Promise<T> {
   const preReason = preCancelCheck(options);
-  if (preReason) throw new QueryCanceledError('pg: canceled before pool checkout', { reason: preReason, dispatched: false });
-  return new Promise<PgPoolClientLike>((resolve, reject) => {
+  if (preReason) throw new QueryCanceledError(`${kind}: canceled before pool checkout`, { reason: preReason, dispatched: false });
+  return new Promise<T>((resolve, reject) => {
     let settled = false;
     const disarm = armCancellation(options, reason => {
       settled = true;
-      reject(new QueryCanceledError('pg: canceled while waiting for pool checkout', { reason, dispatched: false }));
+      reject(new QueryCanceledError(`${kind}: canceled while waiting for pool checkout`, { reason, dispatched: false }));
     });
     // An injected pool can throw synchronously as well as reject.
-    Promise.resolve().then(() => pool.connect()).then(client => {
+    Promise.resolve().then(() => acquire()).then(client => {
       disarm();
-      if (settled) { client.release(); return; }
+      if (settled) { recycle(client); return; }
       settled = true;
       resolve(client);
     }, (error: unknown) => {
       disarm();
       if (settled) return;
       settled = true;
-      reject(classifyDriverError(error, 'pg'));
+      reject(classifyDriverError(error, kind));
     });
     if (options?.signal?.aborted && !settled) {
       settled = true;
       disarm();
-      reject(new QueryCanceledError('pg: canceled while waiting for pool checkout', { reason: 'signal', dispatched: false }));
+      reject(new QueryCanceledError(`${kind}: canceled while waiting for pool checkout`, { reason: 'signal', dispatched: false }));
     }
   });
+}
+
+async function acquirePgClient(pool: PgPoolLike, options?: QueryExecutionOptions): Promise<PgPoolClientLike> {
+  return acquirePoolResource(() => pool.connect(), client => client.release(), options, 'pg');
 }
 
 /** Execute one statement on a checked-out pg client with server-side

@@ -568,3 +568,33 @@ test("pg aborted queued checkout settles before acquisition and returns the late
   assert.equal(submissions, 0);
   assert.equal(releases, 1);
 });
+
+
+test("postgres.js armed query reserves its backend through late cancellation dispatch", async () => {
+  type Client = Parameters<typeof wrapPostgresJs>[0];
+  let finishQuery!: (result: Awaited<ReturnType<Client['unsafe']>>) => void;
+  let finishCancel!: () => void;
+  let cancelStarted!: () => void;
+  const ready = new Promise<void>(resolve => { cancelStarted = resolve; });
+  let releases = 0;
+  const query = Object.assign(new Promise<Awaited<ReturnType<Client['unsafe']>>>(resolve => { finishQuery = resolve; }), {
+    cancel: () => new Promise<void>(resolve => { finishCancel = resolve; cancelStarted(); }),
+  });
+  const client: Client = {
+    unsafe: () => { throw Error('armed query must reserve instead of using auto-released pooled executor'); },
+    reserve: async () => ({ unsafe: () => query, release: () => { releases++; } }),
+    end: async () => {},
+    begin: async <T>(fn: (tx: Client) => Promise<T>): Promise<T> => fn(client),
+  };
+  const pending = wrapPostgresJs(client).query('select 1', [], { deadlineMs: 5 });
+  const keepAlive = setTimeout(() => {}, 2000);
+  try {
+    await ready;
+    finishQuery(Object.assign([{ ok: 1 }], { count: 1 }));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(releases, 0);
+    finishCancel();
+    assert.deepEqual([...(await pending)], [{ ok: 1 }]);
+    assert.equal(releases, 1);
+  } finally { clearTimeout(keepAlive); }
+});

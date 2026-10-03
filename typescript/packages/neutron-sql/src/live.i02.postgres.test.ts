@@ -878,9 +878,9 @@ for (const driverKind of ['postgres', 'pg'] as const) {
 }
 
 
-test("live i02 (pg): owned max-one pool cancels without targeting its next borrower", async () => {
-  if (!(await ensureLive("live i02 (pg) max-one cancellation"))) return;
-  const driver = await loadDriver(TEST_URL, { driver: "pg", max: 1 });
+for (const kind of ['pg', 'postgres'] as const) test(`live i02 (${kind}): owned max-one pool cancels without targeting its next borrower`, async () => {
+  if (!(await ensureLive(`live i02 (${kind}) max-one cancellation`))) return;
+  const driver = await loadDriver(TEST_URL, { driver: kind, max: 1 });
   try {
     for (let i = 0; i < 3; i++) {
       const before = await driver.query<{ pid: number }>("select pg_backend_pid() as pid");
