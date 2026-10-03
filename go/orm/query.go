@@ -13,6 +13,7 @@ type expression struct {
 	children []*expression
 	values   []any
 	operator string
+	subquery func(func(fieldInfo) string, *[]any) (string, error)
 }
 
 // Predicate is a bound expression with no public raw SQL interpolation.
@@ -83,9 +84,12 @@ func combine[M any](kind string, predicates []Predicate[M]) Predicate[M] {
 }
 
 func renderPredicate(info *modelInfo, e *expression, args *[]any) (string, error) {
-	return renderPredicateColumns(info, e, args, func(field fieldInfo) string { return quote(field.name) })
+	return renderPredicateContext(info, e, args, func(field fieldInfo) string { return quote(field.name) }, func(field fieldInfo) string { return info.sqlName() + "." + quote(field.name) })
 }
 func renderPredicateColumns(info *modelInfo, e *expression, args *[]any, columnSQL func(fieldInfo) string) (string, error) {
+	return renderPredicateContext(info, e, args, columnSQL, columnSQL)
+}
+func renderPredicateContext(info *modelInfo, e *expression, args *[]any, columnSQL, correlationSQL func(fieldInfo) string) (string, error) {
 	if e == nil {
 		return "", fmt.Errorf("orm: explicit nonempty predicate required")
 	}
@@ -93,7 +97,7 @@ func renderPredicateColumns(info *modelInfo, e *expression, args *[]any, columnS
 		if len(e.children) != 1 {
 			return "", fmt.Errorf("orm: invalid NOT predicate")
 		}
-		inner, err := renderPredicateColumns(info, e.children[0], args, columnSQL)
+		inner, err := renderPredicateContext(info, e.children[0], args, columnSQL, correlationSQL)
 		return "NOT (" + inner + ")", err
 	}
 	if e.kind == "AND" || e.kind == "OR" {
@@ -102,7 +106,7 @@ func renderPredicateColumns(info *modelInfo, e *expression, args *[]any, columnS
 		}
 		parts := make([]string, len(e.children))
 		for i, c := range e.children {
-			s, err := renderPredicateColumns(info, c, args, columnSQL)
+			s, err := renderPredicateContext(info, c, args, columnSQL, correlationSQL)
 			if err != nil {
 				return "", err
 			}
@@ -112,6 +116,9 @@ func renderPredicateColumns(info *modelInfo, e *expression, args *[]any, columnS
 	}
 	if e.info == nil || e.info != info {
 		return "", fmt.Errorf("orm: predicate belongs to another table scope")
+	}
+	if e.subquery != nil {
+		return e.subquery(correlationSQL, args)
 	}
 	if e.kind == "IN" || e.kind == "NOT IN" || e.kind == "ANY" || e.kind == "ALL" {
 		if e.kind == "ANY" || e.kind == "ALL" {
@@ -205,6 +212,12 @@ func selectSQLArgs[M any](table Table[M], columns string, q Query[M], initial []
 	if table.info == nil {
 		return "", nil, fmt.Errorf("orm: uninitialized table")
 	}
+	return selectSQLFrom(table, columns, q, initial, table.info.sqlName(), nil)
+}
+func selectSQLFrom[M any](table Table[M], columns string, q Query[M], initial []any, from string, fieldSQL func(fieldInfo) string) (string, []any, error) {
+	if table.info == nil {
+		return "", nil, fmt.Errorf("orm: uninitialized table")
+	}
 	if q.limit < 0 || q.offset < 0 {
 		return "", nil, fmt.Errorf("orm: negative limit/offset")
 	}
@@ -213,9 +226,15 @@ func selectSQLArgs[M any](table Table[M], columns string, q Query[M], initial []
 	if q.distinct {
 		selectWord = "SELECT DISTINCT "
 	}
-	sql := selectWord + columns + " FROM " + table.info.sqlName()
+	sql := selectWord + columns + " FROM " + from
 	if q.whereSet {
-		p, err := renderPredicate(table.info, q.predicate.expr, &args)
+		var p string
+		var err error
+		if fieldSQL == nil {
+			p, err = renderPredicate(table.info, q.predicate.expr, &args)
+		} else {
+			p, err = renderPredicateColumns(table.info, q.predicate.expr, &args, fieldSQL)
+		}
 		if err != nil {
 			return "", nil, err
 		}
@@ -231,7 +250,11 @@ func selectSQLArgs[M any](table Table[M], columns string, q Query[M], initial []
 			if o.descending {
 				dir = " DESC"
 			}
-			parts[i] = quote(o.field.name) + dir + o.nulls
+			name := quote(o.field.name)
+			if fieldSQL != nil {
+				name = fieldSQL(o.field)
+			}
+			parts[i] = name + dir + o.nulls
 		}
 		sql += " ORDER BY " + strings.Join(parts, ", ")
 	}

@@ -700,3 +700,17 @@ an unbounded FromCTE plan. No alias or source SQL is accepted as raw text.
 ```sh
 go test ./orm -run 'Test(MultipleCTE|PostgresMultipleCTE|TypedSet|PostgresTypedCTE)' -count=1 -v
 ```
+
+`NewScalarQuery` and `ScalarFromCTE` retain a one-column Go type. `InSubquery`,
+`NotInSubquery` and `CompareSubquery` require identical outer/inner value types,
+continuous bound parameters and native SQL NULL/cardinality semantics. `Exists`
+accepts a complete-model plan. `ExistsRelated` correlates exact composite/self
+relation keys with typed child filters and paging; nested self subqueries retain
+separate aliases. `SelectRelatedScalar` returns a parent value plus Nullable child
+scalar. Missing children and present SQL NULL share the SQL NULL result. Multiple
+unpaged children retain native SQLSTATE 21000; explicit LIMIT means explicit
+caller paging. Errors return no partial projections and keep Scope rollback.
+
+```sh
+go test ./orm -run 'Test(TypedSubquery|PostgresTypedScalar)' -count=1 -v
+```

@@ -229,7 +229,7 @@ func validateType(value ast.Expr, imports, used map[string]string) error {
 	switch typ := value.(type) {
 	case *ast.IndexExpr:
 		container, ok := typ.X.(*ast.SelectorExpr)
-		if !ok || (container.Sel.Name != "Array" && container.Sel.Name != "Range") {
+		if !ok || (container.Sel.Name != "Array" && container.Sel.Name != "Range" && container.Sel.Name != "SQLValue") {
 			break
 		}
 		alias, ok := container.X.(*ast.Ident)
@@ -237,6 +237,26 @@ func validateType(value ast.Expr, imports, used map[string]string) error {
 			break
 		}
 		element := typ.Index
+		if container.Sel.Name == "SQLValue" {
+			switch custom := element.(type) {
+			case *ast.Ident:
+				used[alias.Name] = ormPath
+				return nil
+			case *ast.SelectorExpr:
+				qualifier, ok := custom.X.(*ast.Ident)
+				if !ok {
+					break
+				}
+				path := imports[qualifier.Name]
+				if path == "" || qualifier.Name == "." || qualifier.Name == "_" {
+					break
+				}
+				used[qualifier.Name] = path
+				used[alias.Name] = ormPath
+				return nil
+			}
+			break
+		}
 		if container.Sel.Name == "Range" {
 			allowed := false
 			switch bound := element.(type) {
