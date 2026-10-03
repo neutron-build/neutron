@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Polyglot conformance request v1",
+  "type": "object",
+  "required": ["protocol", "case_id", "profile", "schema_scope", "ownership_token", "action", "artifact_hashes"],
+  "properties": {
+    "protocol": {"const": "polyglot-conformance-v1"},
+    "case_id": {"const": "scalar-extremes"},
+    "profile": {"const": "postgres-direct"},
+    "schema_scope": {"type": "string", "pattern": "^neutron_polyglot_[0-9a-f]{32}$"},
+    "ownership_token": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "action": {"enum": ["setup", "observe", "cleanup"]},
+    "artifact_hashes": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+  },
+  "additionalProperties": false
+}
