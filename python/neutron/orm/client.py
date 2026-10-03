@@ -4,6 +4,7 @@ import asyncio
 from contextlib import contextmanager, asynccontextmanager
 import threading
 from typing import Any, AsyncIterator, Iterator, Mapping, Sequence, TypeVar, TYPE_CHECKING
+from .json_value import load_document, native_params
 from .query import Query
 from .core import CardinalityError, Compiled, Mutation, OrmError, Returning, Select, SessionBusyError
 
@@ -54,7 +55,13 @@ class Database:
         except ImportError as exc:
             raise OrmError("Install neutron-framework[orm] for native PostgreSQL execution") from exc
         try:
-            return cls(psycopg.connect(url,autocommit=True,row_factory=dict_row))
+            connection=psycopg.connect(url,autocommit=True,row_factory=dict_row)
+            from psycopg.types.json import set_json_loads
+            try: set_json_loads(load_document,context=connection)
+            except BaseException:
+                connection.pgconn.finish()
+                raise
+            return cls(connection)
         except Exception as exc:
             raise OrmError("Unable to connect to PostgreSQL",sqlstate=getattr(exc,"sqlstate",None)) from exc
 
@@ -79,7 +86,7 @@ class Database:
         with self._use():
             try:
                 with self._conn.cursor() as cur:
-                    cur.execute(compiled.sql,compiled.params)
+                    cur.execute(compiled.sql,native_params(compiled.params))
                     rows=cur.fetchall() if cardinality=='many' else cur.fetchmany(2)
             except Exception as exc:
                 state=getattr(exc,"sqlstate",None)
@@ -102,7 +109,7 @@ class Database:
         with self._use():
             try:
                 with self._conn.cursor() as cur:
-                    cur.execute(statement.sql,statement.params)
+                    cur.execute(statement.sql,native_params(statement.params))
                     return int(cur.rowcount)
             except Exception as exc:
                 state=getattr(exc,"sqlstate",None)
@@ -187,7 +194,13 @@ class AsyncDatabase:
         except ImportError as exc:
             raise OrmError("Install neutron-framework[orm] for native PostgreSQL execution") from exc
         try:
-            return cls(await psycopg.AsyncConnection.connect(url,autocommit=True,row_factory=dict_row))
+            connection=await psycopg.AsyncConnection.connect(url,autocommit=True,row_factory=dict_row)
+            from psycopg.types.json import set_json_loads
+            try: set_json_loads(load_document,context=connection)
+            except BaseException:
+                connection.pgconn.finish()
+                raise
+            return cls(connection)
         except Exception as exc:
             raise OrmError("Unable to connect to PostgreSQL",sqlstate=getattr(exc,"sqlstate",None)) from exc
 
@@ -210,7 +223,7 @@ class AsyncDatabase:
         async with self._use():
             try:
                 async with self._conn.cursor() as cur:
-                    await cur.execute(compiled.sql,compiled.params)
+                    await cur.execute(compiled.sql,native_params(compiled.params))
                     rows=await cur.fetchall() if cardinality=='many' else await cur.fetchmany(2)
             except asyncio.CancelledError:
                 task=asyncio.current_task()
@@ -237,7 +250,7 @@ class AsyncDatabase:
         async with self._use():
             try:
                 async with self._conn.cursor() as cur:
-                    await cur.execute(statement.sql,statement.params)
+                    await cur.execute(statement.sql,native_params(statement.params))
                     return int(cur.rowcount)
             except asyncio.CancelledError:
                 task=asyncio.current_task()

@@ -7,6 +7,8 @@ from types import MappingProxyType
 from typing import Any, Callable, Generic, Iterable, Mapping, TypeVar, cast
 from uuid import UUID
 
+from .json_value import BoundJson, JsonDocument
+
 T = TypeVar('T')
 
 class _WriteState:
@@ -37,7 +39,7 @@ def _bound_quote(name: str) -> str:
     return quote(name).replace('%','%%')
 
 # Column families deliberately finite; custom SQL type text cannot become SQL.
-_TYPES: dict[str, type] = {'int2':int,'int4':int,'int8':int,'text':str,'varchar':str,'bool':bool,'numeric':Decimal,'uuid':UUID,'bytea':bytes,'timestamp':dt.datetime,'timestamptz':dt.datetime,'date':dt.date}
+_TYPES: dict[str, type] = {'int2':int,'int4':int,'int8':int,'text':str,'varchar':str,'bool':bool,'numeric':Decimal,'uuid':UUID,'bytea':bytes,'timestamp':dt.datetime,'timestamptz':dt.datetime,'date':dt.date,'json':JsonDocument,'jsonb':JsonDocument}
 
 @dataclass(frozen=True)
 class ColumnSpec(Generic[T]):
@@ -125,20 +127,23 @@ class Column(Generic[T]):
 
     def eq(self, value: T | Column[T] | None) -> Predicate:
         self._owned()
+        if self.spec.sql_type == "json" and value is not None: raise ValueError("json equality unsupported; use jsonb for equality semantics")
         if isinstance(value,Column):
             value._owned()
+            if value.spec.sql_type == "json": raise ValueError("json equality unsupported")
             if value.spec.python_type is not self.spec.python_type: raise ValueError('incompatible column comparison')
             return Predicate(f'{self._bound_sql} = {value._bound_sql}',(),frozenset({self.table,value.table}))
         if value is None: return Predicate(f'{self._bound_sql} IS NULL',(),frozenset({self.table}))
         self.spec.check(value)
-        return Predicate(f'{self._bound_sql} = %s',(value,),frozenset({self.table}))
+        return Predicate(f'{self._bound_sql} = %s',(_parameter(self,value),),frozenset({self.table}))
 
     def in_(self, values: Iterable[T]) -> Predicate:
         self._owned()
+        if self.spec.sql_type == "json": raise ValueError("json membership unsupported; use jsonb")
         values=tuple(values)
         if not values: return Predicate('FALSE',(),frozenset({self.table}))
         for value in values: self.spec.check(value)
-        return Predicate(f'{self._bound_sql} IN ({", ".join("%s" for _ in values)})',values,frozenset({self.table}))
+        return Predicate(f'{self._bound_sql} IN ({", ".join("%s" for _ in values)})',tuple(_parameter(self,value) for value in values),frozenset({self.table}))
 
 @dataclass(frozen=True)
 class Compiled(Generic[T]):
@@ -234,16 +239,21 @@ def _writes(table: Table, values: Mapping[str,object]) -> list[tuple[Column[Any]
 def insert(table: Table, values: Mapping[str,object]) -> Mutation:
     writes=_writes(table,values)
     if not writes: return Mutation(f'INSERT INTO {table._bound_sql} DEFAULT VALUES',(),table)
-    return Mutation(f'INSERT INTO {table._bound_sql} ({", ".join(_bound_quote(c.name) for c,_ in writes)}) VALUES ({", ".join("DEFAULT" if v is DEFAULT else "%s" for _,v in writes)})',tuple(v for _,v in writes if v is not DEFAULT),table)
+    return Mutation(f'INSERT INTO {table._bound_sql} ({", ".join(_bound_quote(c.name) for c,_ in writes)}) VALUES ({", ".join("DEFAULT" if v is DEFAULT else "%s" for _,v in writes)})',tuple(_parameter(c,v) for c,v in writes if v is not DEFAULT),table)
 
 
 def update(table: Table, values: Mapping[str,object], *, where: Predicate) -> Mutation:
     _condition(table,where)
     writes=_writes(table,values)
     if not writes: raise ValueError('update needs at least one present/default/NULL assignment')
-    return Mutation(f'UPDATE {table._bound_sql} SET {", ".join(_bound_quote(c.name)+" = "+("DEFAULT" if v is DEFAULT else "%s") for c,v in writes)} WHERE {where.sql}',tuple(v for _,v in writes if v is not DEFAULT)+where.params,table)
+    return Mutation(f'UPDATE {table._bound_sql} SET {", ".join(_bound_quote(c.name)+" = "+("DEFAULT" if v is DEFAULT else "%s") for c,v in writes)} WHERE {where.sql}',tuple(_parameter(c,v) for c,v in writes if v is not DEFAULT)+where.params,table)
 
 
 def delete(table: Table, *, where: Predicate) -> Mutation:
     _condition(table,where)
     return Mutation(f'DELETE FROM {table._bound_sql} WHERE {where.sql}',where.params,table)
+
+
+def _parameter(column: Column[Any], value: object) -> object:
+    if isinstance(value, JsonDocument): return BoundJson(value, column.spec.sql_type == 'jsonb')
+    return value

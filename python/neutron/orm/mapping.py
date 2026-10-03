@@ -33,6 +33,7 @@ class ModelMapping(Generic[T]):
             if name not in declared or column.table is not table or table.columns.get(column.name) is not column or column.name in physical:
                 raise ValueError('mapping requires unique declared fields and owned columns')
             if not declared[name].init: raise ValueError("mapped init=False dataclass fields unsupported")
+            if column.spec.sql_type == 'json': raise ValueError('mapped JSON requires jsonb equality semantics')
             physical.add(column.name)
             annotation=hints.get(name)
             alternatives=set(get_args(annotation)) if get_origin(annotation) in {types.UnionType,Union} else {annotation}
@@ -46,6 +47,8 @@ class ModelMapping(Generic[T]):
         for name in primary_key:
             if name not in field_columns or field_columns[name].spec.nullable:
                 raise ValueError('primary-key fields must be mapped nonnullable columns')
+            if field_columns[name].spec.sql_type in {'json','jsonb'}:
+                raise ValueError('JSON primary keys unsupported')
         params=getattr(model_type,'__dataclass_params__')
         if params.frozen: raise ValueError('mutable mapped dataclass required')
         object.__setattr__(self,"model_type",model_type)
@@ -58,6 +61,8 @@ class ModelMapping(Generic[T]):
         return {name:getattr(obj,name) for name in self.field_columns}
 
     def key(self,values: Mapping[str,Any]) -> tuple[Any,...] | None:
+        if any(self.field_columns[name].spec.sql_type in {'json','jsonb'} for name in self.primary_key):
+            raise ValueError("JSON primary keys unsupported")
         key=[]
         for name in self.primary_key:
             value=values[name]

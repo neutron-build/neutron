@@ -168,3 +168,16 @@ loading are outside this bounded query API.
 
 `Predicate(sql, params, owners)` is an explicit trusted SQL escape hatch.
 Ownership checks on generated expressions do not make raw predicates a SQL sandbox.
+
+For `json`/`jsonb`, use `ColumnSpec(JsonDocument, 'jsonb', nullable=True)`.
+`JsonDocument(text)` is immutable validated JSON text; `parsed()` returns a
+fresh tree with exact `Decimal` fractional numbers. `JSON_NULL` represents
+JSON `null`; Python `None` represents SQL NULL. Dicts/lists/floats are not
+implicitly serialized. Duplicate keys and nonfinite numbers are refused.
+Native connections install a connection-local loader, preserving this
+distinction without changing other psycopg connections. PostgreSQL `jsonb`
+normalizes formatting/order; PostgreSQL JSON restrictions still apply and
+native errors retain SQLSTATE. Mapped fields support immutable replacement
+of `jsonb` documents, not in-place mutation tracking. `json` equality/mapping
+and JSON primary keys are refused. JSON operators/path queries remain future work.
+The adapter uses psycopg's [connection-local JSON loading and explicit wrappers](https://www.psycopg.org/psycopg3/docs/basic/adapt.html#json-adaptation).
