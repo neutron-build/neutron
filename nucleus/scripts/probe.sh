@@ -11,8 +11,8 @@
 #   PROBE_SCALE=ci     (default) short — for CI / quick local checks (~1-2 min)
 #   PROBE_SCALE=full   thorough — many more iterations / seeds (minutes)
 #
-# Usage:  sh scripts/probe.sh            # ci scale
-#         PROBE_SCALE=full sh scripts/probe.sh
+# Usage:  bash scripts/probe.sh            # ci scale
+#         PROBE_SCALE=full bash scripts/probe.sh
 #
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 2   # -> nucleus/
@@ -36,6 +36,7 @@ mkdir -p "$LOG_DIR"
 # (iteration counts scale with M)
 PROBES=(
   "fuzz|--iterations $((1500 * M))|fuzz-mvcc"
+  "fuzz|--stream --iterations $((800 * M))|fuzz-stream"
   # The oracle above runs on the DEFAULT engine, which is mvcc. Its own banner
   # says so on every run: "this engine has no buffer pool or paged storage, so
   # nothing below covers DiskEngine." `nucleus serve` builds
@@ -73,6 +74,12 @@ PROBES=(
   "probe_concurrency|"
   "probe_efficiency|"
   "probe_security|"
+  "probe_sessions||sessions"
+  "probe_sessions|--negative-control authority|sessions-control-authority"
+  "probe_sessions|--negative-control guards|sessions-control-guards"
+  "probe_sessions|--negative-control cancellation|sessions-control-cancellation"
+  "probe_io_faults||io-faults"
+  "probe_io_faults|--negative-control|io-faults-control"
   "probe_recover|--iterations $((300 * M))"
   "probe_engines|--iterations $((1200 * M))"
   # ── Tier 1/2 harnesses (deeper coverage) ──
@@ -103,8 +110,9 @@ PROBES=(
   # KNOWN-RED HOLDOUT, added 2026-08-18 with S35 (c9a6c893). The vector and
   # catalog sections each report a real, open finding, so running them here
   # would make this suite permanently red and teach everyone to ignore it:
-  #   catalog - DatabaseBuilder::build never loads meta.json, so the first
-  #             post-reopen DDL writes emptied state back over it.
+  #   catalog - historical embedded metadata write-back defect. Source now
+  #             loads metadata fail-closed; the repaired refusal model and
+  #             healthy reopen control still need exact-binary native gates.
   # Written up in _internal/OPEN_WORK.md and nucleus/docs/PROBES.md.
   # The vector holdout was removed 2026-08-22: HNSW tombstones serialize
   # (S35 F1a) and the PK registry persists across reopen (F1b), and the
