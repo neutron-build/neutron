@@ -32,6 +32,19 @@ export interface ImportDialogProps {
   transport?: Pick<ImportDeps, 'sendBatch' | 'outcome'>
 }
 
+// A disabled fieldset disables descendants except its first legend subtree.
+// Explicitly account for that rule as well as direct disabled controls;
+// lightweight render DOMs do not consistently implement native :disabled.
+function disabledControl(element: HTMLElement): boolean {
+  if (element.hasAttribute('disabled')) return true
+  for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+    if (parent.tagName !== 'FIELDSET' || !parent.hasAttribute('disabled')) continue
+    const firstLegend = Array.from(parent.children).find(child => child.tagName === 'LEGEND')
+    if (!firstLegend?.contains(element)) return true
+  }
+  return false
+}
+
 const PREVIEW_RECORDS = 50
 const PREVIEW_SHOWN = 10
 
@@ -117,7 +130,7 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
   useEffect(() => {
     if (!running) return
     const active = document.activeElement as HTMLElement | null
-    if (!active || !dialogRef.current?.contains(active) || active.matches(':disabled')) stopRef.current?.focus()
+    if (!active || !dialogRef.current?.contains(active) || disabledControl(active)) stopRef.current?.focus()
   }, [running])
 
   function save(j: ImportJournal) {
@@ -359,7 +372,7 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
     }
     if (e.key !== 'Tab' || !dialogRef.current) return
     const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLElement>(
-      'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex="0"]:not(:disabled)'))
+      'button, input, select, textarea, [tabindex="0"]')).filter(element => !disabledControl(element))
     if (focusable.length === 0) return
     const first = focusable[0]
     const last = focusable[focusable.length - 1]

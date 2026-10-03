@@ -264,7 +264,7 @@ describe('ImportDialog running focus boundary', () => {
     await waitFor(() => expect(document.activeElement).toBe(stop))
     const format = document.querySelector('fieldset select') as HTMLSelectElement
     expect(format.hasAttribute('disabled')).toBe(false)
-    expect(format.matches(':disabled')).toBe(true)
+    expect((format.closest('fieldset') as HTMLFieldSetElement).disabled).toBe(true)
     fireEvent.keyDown(stop, { key: 'Tab' })
     expect(document.activeElement).toBe(stop)
     fireEvent.keyDown(stop, { key: 'Tab', shiftKey: true })
