@@ -448,3 +448,34 @@ disconnection and implicit many-to-many mutation remain unimplemented.
 ```sh
 go test ./orm -run 'Test(GraphPrevalidationAndCompositeKeyDerivation|PostgresOwnedRelationGraphMutations)' -count=1 -v
 ```
+
+
+## Bounded native batch, upsert and COPY
+
+`InsertBatch(ctx, scope, table, assignmentRows, maxRows)` validates all typed
+assignment rows before effects and executes bounded INSERT RETURNING statements
+in one child savepoint. A final-row failure rolls back earlier rows, even if
+the caller swallows the returned error. It is a bounded batch, not one SQL
+statement, and does not implicitly run repository hooks.
+
+`BindColumn(column)` retains model/table identity while erasing only its value
+type for explicit COPY column and conflict-key lists. `UpsertOne` targets an
+explicit server-enforced unique key. Nonempty update columns are assigned from
+EXCLUDED; key changes and updates of omitted insert columns are refused. Supplied
+zero/NULL values remain supplied. Empty updates mean DO NOTHING and return
+`Nullable[Model]{Valid:false}` on conflict. Successful insert/update returns its
+statement snapshot without claiming which branch occurred. The owned child
+savepoint protects failure/cardinality boundaries; no mutation is retried.
+
+`CopyInto(ctx, scope, table, boundColumns, maxRows, pgxSource)` uses native pgx
+COPY FROM on the pinned transaction with one row of validation buffering. Values
+must exactly match bound column Go scalar types; nullable NULL and dynamic shape
+are validated. Budget overflow, source/codec/native failures roll back every
+row in the operation-owned child savepoint and return count zero. Sources must
+cooperate with cancellation in their Next/Values methods. This API requires
+native COPY support and returns `ErrCopyUnsupported` for a driver lacking it.
+It does not certify Nucleus COPY or automatically invoke hooks.
+
+```sh
+go test ./orm -run 'Test(BulkAdmissionAndCopySourceBudgets|PostgresOwnedBulkUpsertAndCopy)' -count=1 -v
+```
