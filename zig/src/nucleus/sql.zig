@@ -1,9 +1,5 @@
-// Nucleus SQL Model — typed database access with comptime struct scanning
-//
-// The foundation model that enables typed query execution:
-// - query() returns results mapped to comptime-typed structs via @typeInfo
-// - queryOne() returns a single row or null
-// - execute() returns rows affected
+// Nucleus SQL Model — raw query, scalar and command-tag access.
+// Comptime helpers below expose struct field names; they do not scan rows.
 
 const std = @import("std");
 const NucleusClient = @import("client.zig").NucleusClient;
@@ -28,14 +24,17 @@ pub const SqlModel = struct {
     }
 
     /// Format a SQL string with arguments into a buffer, then execute it.
-    /// Uses bufPrint for simple parameter substitution.
+    /// This interpolates trusted SQL syntax; it does not escape or bind values.
+    /// Never pass untrusted input, NULL or binary values through formatting.
     pub fn executeFormatted(self: SqlModel, comptime fmt: []const u8, args: anytype) ![]const u8 {
         var buf: [4096]u8 = undefined;
         const sql = std.fmt.bufPrint(&buf, fmt, args) catch return error.BufferTooShort;
         return try self.client.exec(sql);
     }
 
-    /// Format a SQL string with arguments and return scalar result.
+    /// Format trusted SQL syntax and return a scalar result.
+    /// This is interpolation, not parameter binding. Never format untrusted
+    /// input, NULL or binary values into SQL.
     pub fn queryFormatted(self: SqlModel, comptime fmt: []const u8, args: anytype) !?[]const u8 {
         var buf: [4096]u8 = undefined;
         const sql = std.fmt.bufPrint(&buf, fmt, args) catch return error.BufferTooShort;

@@ -114,4 +114,17 @@ describe('ModelLimits (X06)', () => {
     }
     expect(modelForTabKind('journey')).toBeNull()
   })
+  it('keeps routine PostgreSQL detail accessible through Evidence without hiding warnings', () => {
+    limitsReport.value = pg
+    const first = render(<ModelLimits model="sql" />)
+    const explanation = screen.getByText(/fsync=on, synchronous_commit=on/)
+    expect(explanation.parentElement?.hidden).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Evidence' }))
+    expect(explanation.parentElement?.hidden).toBe(false)
+    first.unmount()
+    limitsReport.value = nucleus
+    render(<ModelLimits model="sql" />)
+    expect(screen.getByText(nucleus.models.find(m => m.model === 'sql')!.transactionNote).parentElement?.hidden).toBe(false)
+  })
+
 })

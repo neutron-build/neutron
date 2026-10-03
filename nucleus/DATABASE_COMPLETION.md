@@ -941,16 +941,16 @@ Goal: multi-model transactions remain atomic across process crash, not merely in
       SQL COMMIT record naming the enlisted models, transaction tags on specialty WAL
       records, and keep-if-committed replay with an id floor seeded from every tagged
       log — is built and crash-proven where a cross-model transaction can be entered:
-      streams, KV strings, documents, graph, timeseries, datalog, and blob are
-      ATOMIC, each with a three-direction crash proof in `probe_crossmodel_atomicity`
+      streams, KV strings, documents, graph, timeseries, datalog, blob, and
+      vector row writes are coordinated, each with a three-direction crash proof in `probe_crossmodel_atomicity`
       (discard, survive, autocommit-survive; 0 findings). Columnar and the KV
       collections store carry the same tagged plumbing live (Model bits 1<<10/1<<11,
       WAL-level filters unit-proven in `storage::columnar_wal::tests` and
       `kv::collections_wal::tests`) behind the M8 refusal boundary — SQL cannot
       produce an uncommitted record for them, so the crash window cannot be entered.
       Geo is out (zero non-test WAL writers), CDC is determined fire-and-forget
-      (NU-107: product call, not a plumbing gap), and vector and FTS carry no
-      transaction tags at HEAD — those remainders live in "Still open" below.
+      (NU-107: product call, not a plumbing gap), and FTS remains outside tagged
+      recovery; vector joined on 2026-08-26, as described below.
 - [x] Make prepare/commit/abort idempotent across every enlisted WAL.
       At HEAD every WAL that enlists replays idempotently: the keep-if-committed
       filter plus the `XactId` floor (seeded above every id any surviving tagged
@@ -1082,7 +1082,7 @@ Still open in this milestone:
   the id-floor seed, row-path enlistment (in-memory rollback stays the SQL
   layer's derived-state rebuild — no second undo mechanism), and the S7
   checkpoint gate; `Model::Vector` (bit 4) was pre-reserved so no on-disk
-  numbering changed. For those two the NU-006
+  numbering changed. For the remaining untagged surfaces the NU-006
   commit order still governs: specialty logs are fsynced BEFORE the SQL WAL, which
   makes the partial deterministically the safe half — an orphaned specialty write
   rather than a durable SQL commit referencing records that were never written — but
@@ -1121,22 +1121,19 @@ touching the heap. The control on the same tables -- an unindexed `plain > 10` -
 `src/executor/tests/test_temporal_range_cost.rs` is the gate, written to fail on the old
 behaviour, and it carries the control in the same test.
 
-### `BEGIN ISOLATION LEVEL SERIALIZABLE` was accepted and silently ignored on disk — FIXED
+### Buffered-disk isolation — current SQL boundary and historical 2PL census
 
-**Resolved. Verified 2026-08-19 (S64/N11), by running the census rather than reading the
-code.** `BufferedDiskEngine` implements `set_next_isolation_level`
-(`src/storage/buffered_engine.rs:1123`) and provides real SERIALIZABLE through **table-level
-strict two-phase locking** with wait-die deadlock prevention -- not SSI, which needs a stable
-read snapshot the paged engine has no versioning to provide. `test_2pl_census` is the anomaly
-census against that engine: 12 tests, including `no_update_is_lost` and
-`write_skew_does_not_survive`, the two anomalies the measurement below recorded. They pass.
-A losing transaction returns SQLSTATE 40001 and a lock wait that exceeds `lock_timeout`
-returns 55P03, deliberately distinct. `docs/MODEL_SEMANTICS.md` already describes both
-mechanisms accurately and needed no correction.
+**Current source [code]: READ COMMITTED only at the buffered-disk SQL boundary.**
+`BufferedDiskEngine::max_isolation_level` refuses REPEATABLE READ and SERIALIZABLE
+because read-committed and autocommit writers bypass its internal 2PL protocol.
+Executor admission rejects those requests rather than downgrading. See
+`src/storage/buffered_engine.rs` and `src/executor/txn.rs`.
 
-The contract chosen is therefore the first option below -- implement it -- and the third
-engine that cannot provide the level (`MemoryEngine`) refuses it, which
-`test_ssi_census::test_an_engine_refuses_isolation_it_cannot_provide` pins.
+**Historical evidence (2026-08-19, S64/N11):** internal table-level strict 2PL
+and wait-die were implemented and exercised by `test_2pl_census`. That scoped
+census does not establish serializability against writers outside the protocol.
+The MVCC adapter's SSI implementation is separate. No concurrency harness was
+rerun for this documentation correction.
 
 Original finding follows, kept because the defect SHAPE recurs: a trait method with a silent
 no-op default, overridden by exactly one engine, while `supports_mvcc()` advertised the
@@ -1175,19 +1172,11 @@ Not introduced by this branch — the no-op default is on `main`
 that asserts isolation ran on `MvccStorageAdapter`, the one engine that
 implements the method.
 
-- [x] Decide the contract: implement conflict detection on the paged engines, or
-      reject `SERIALIZABLE`/`REPEATABLE READ` with a clear error instead of
-      accepting and ignoring them. Silently downgrading is the one option that
-      loses data without telling anyone.
-      **Implemented, not refused.** Table-level strict 2PL on `BufferedDiskEngine`; SSI stays
-      on `MvccStorageAdapter`. An engine that can provide neither refuses the level.
-- [x] Reconcile `docs/MODEL_SEMANTICS.md:263-271` with whichever is chosen — it
-      currently calls `SHOW transaction_isolation` "advisory" but does not say a
-      requested level is discarded, or that lost updates follow.
-      Already reconciled: that section documents both mechanisms, that only SERIALIZABLE
-      transactions take locks, that the 2PL loser BLOCKS where the SSI loser fails at commit,
-      wait-die and its 40001, and the 55P03 timeout distinction. Verified against the code and
-      the census on 2026-08-19 rather than assumed.
+- [x] Refuse unsupported isolation at the public SQL boundary rather than
+      silently downgrading. Internal buffered 2PL remains available to storage
+      callers; it does not expand public admission.
+- [x] Reconcile `docs/MODEL_SEMANTICS.md` with the current READ COMMITTED
+      boundary and label the earlier 2PL census as historical scoped evidence.
 
 Exit gate:
 

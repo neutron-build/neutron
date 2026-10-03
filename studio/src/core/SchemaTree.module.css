@@ -1,21 +1,32 @@
 .tree {
-  padding: var(--space-2) 0;
+  padding: 10px 8px;
 }
 
 .designerBtn {
-  width: 100%; text-align: left;
-  padding: 6px var(--space-3);
-  font-size: var(--text-xs); font-weight: 600;
-  color: var(--model-sql);
-  background: color-mix(in srgb, var(--model-sql) 6%, transparent);
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  font-size: var(--text-xs);
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: transparent;
   border-bottom: 1px solid var(--border);
-  margin-bottom: var(--space-1);
+  margin-bottom: 6px;
   transition: background var(--transition);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
-.designerBtn:hover { background: color-mix(in srgb, var(--model-sql) 12%, transparent); }
+
+.designerBtn:hover {
+  background: color-mix(in srgb, var(--model-sql) 12%, transparent);
+}
 
 .section {
   margin-bottom: 2px;
+  margin-top: 10px;
 }
 
 .sectionHeader {
@@ -23,14 +34,16 @@
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  padding: 4px var(--space-3);
+  padding: 6px 8px;
   color: var(--text-secondary);
-  font-size: var(--text-xs);
+  font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: .1em;
   transition: background var(--transition), color var(--transition);
   text-align: left;
+  min-height: 32px;
+  border-radius: 6px;
 }
 
 .sectionHeader:hover {
@@ -63,12 +76,14 @@
   width: 100%;
   display: flex;
   align-items: center;
-  padding: 4px var(--space-3) 4px 32px;
+  padding: 6px 8px 6px 22px;
   font-size: var(--text-sm);
   color: var(--text-secondary);
   transition: background var(--transition), color var(--transition);
   text-align: left;
   gap: 0;
+  min-height: 32px;
+  border-radius: 6px;
 }
 
 .item:hover {
@@ -83,7 +98,7 @@
 
 .itemName {
   font-family: var(--font-mono);
-  font-size: var(--text-xs);
+  font-size: 12px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -96,29 +111,31 @@
 .emptyText {
   font-size: var(--text-xs);
   color: var(--text-tertiary);
-  font-style: italic;
+  font-style: normal;
 }
-
-/* --- S05: search, refresh, views, inspect --- */
 
 .tools {
   display: flex;
-  gap: var(--space-1);
-  padding: 0 var(--space-2) var(--space-2);
+  gap: 6px;
+  padding: 0 4px 10px;
 }
 
 .search {
   flex: 1;
   min-width: 0;
-  padding: 4px var(--space-2);
+  padding: 6px 10px;
   font-size: var(--text-xs);
-  font-family: var(--font-mono);
+  font-family: var(--font-sans);
   color: var(--text-primary);
   background: var(--bg-tertiary);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
+  min-height: 34px;
 }
-.search:focus { outline: 1px solid var(--model-sql); }
+
+.search:focus {
+  outline: 1px solid var(--model-sql);
+}
 
 .refreshBtn {
   padding: 4px var(--space-2);
@@ -126,11 +143,20 @@
   color: var(--text-secondary);
   background: var(--bg-tertiary);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
   cursor: pointer;
+  min-width: 34px;
+  min-height: 34px;
 }
-.refreshBtn:hover:not(:disabled) { color: var(--text-primary); }
-.refreshBtn:disabled { opacity: 0.5; cursor: default; }
+
+.refreshBtn:hover:not(:disabled) {
+  color: var(--text-primary);
+}
+
+.refreshBtn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
 
 .searchSummary {
   padding: 2px var(--space-3) var(--space-1);
@@ -141,9 +167,13 @@
 .itemRow {
   display: flex;
   align-items: stretch;
+  border-radius: 6px;
 }
 
-.itemRow .item { flex: 1; min-width: 0; }
+.itemRow .item {
+  flex: 1;
+  min-width: 0;
+}
 
 .inspectBtn {
   padding: 0 var(--space-2);
@@ -152,15 +182,44 @@
   background: transparent;
   border: none;
   cursor: pointer;
-  opacity: 0;
+  opacity: .55;
   transition: opacity var(--transition);
+  min-width: 32px;
 }
-.itemRow:hover .inspectBtn { opacity: 1; }
-.inspectBtn:hover { color: var(--model-sql); }
-.inspectBtn:focus-visible { opacity: 1; outline: 1px solid var(--model-sql); }
+
+.itemRow:hover .inspectBtn {
+  opacity: 1;
+}
+
+.inspectBtn:hover {
+  color: var(--model-sql);
+}
+
+.inspectBtn:focus-visible {
+  opacity: 1;
+  outline: 1px solid var(--model-sql);
+}
 
 .viewBadge {
   margin-right: 4px;
   color: var(--text-tertiary);
   font-size: 10px;
+}
+
+.itemRow:hover {
+  background: var(--bg-hover);
+}
+
+.itemRow[data-active="true"] {
+  background: var(--accent-subtle);
+  box-shadow: inset 2px 0 var(--accent);
+}
+
+.itemRow[data-active="true"] .item {
+  color: var(--text-accent);
+}
+
+.refreshBtn, .inspectBtn {
+  display: grid;
+  place-items: center;
 }

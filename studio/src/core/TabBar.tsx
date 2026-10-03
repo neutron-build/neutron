@@ -29,18 +29,13 @@ function TabItem({ tab }: { tab: Tab }) {
   }
 
   return (
-    <button
-      class={`${s.tab} ${isActive ? s.active : ''}`}
-      onClick={() => { activeTabId.value = tab.id }}
-      title={tab.label}
-    >
-      <span
-        class={s.tabDot}
-        data-kind={KIND_COLORS[tab.kind] ?? 'sql'}
-      />
-      <span class={s.tabLabel}>{tab.label}</span>
-      <span class={s.tabClose} onClick={handleClose} title="Close">×</span>
-    </button>
+    <div class={`${s.tab} ${isActive ? s.active : ''}`}>
+      <button class={s.tabSelect} onClick={() => { activeTabId.value = tab.id }} title={tab.label} aria-pressed={isActive}>
+        <span class={s.tabDot} data-kind={KIND_COLORS[tab.kind] ?? 'sql'} />
+        <span class={s.tabLabel}>{tab.label}</span>
+      </button>
+      <button class={s.tabClose} onClick={handleClose} title="Close" aria-label={`Close ${tab.label}`}>×</button>
+    </div>
   )
 }
 
@@ -57,7 +52,7 @@ export function TabBar() {
 
   return (
     <div class={s.tabBar}>
-      <div class={s.tabs}>
+      <div class={s.tabs} role="group" aria-label="Open workspace tabs">
         {list.map(tab => <TabItem key={tab.id} tab={tab} />)}
       </div>
     </div>

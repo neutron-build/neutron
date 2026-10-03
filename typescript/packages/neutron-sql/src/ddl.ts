@@ -82,7 +82,10 @@ export function sqlTypeOf(col: AnyColumnBuilder): string {
     case "real":
       return "real";
     case "numeric":
-      return "numeric";
+      // Defensive: the factory always pairs numericScale with numericPrecision
+      // (precision-only normalizes scale to 0), but half-set internal metadata
+      // must never render as numeric(p,undefined).
+      return col.numericPrecision !== undefined ? `numeric(${col.numericPrecision},${col.numericScale ?? 0})` : "numeric";
     case "text":
       return "text";
     case "varchar":

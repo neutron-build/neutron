@@ -626,7 +626,7 @@ await m.applyRetention("2026-09-24T12:00:00Z"); // pinned: exactly one statement
 
 - `timeBucket(col, unit, { timeZone })` builds `date_trunc(...)` as a
   structural node carrying the `ts-bucketing` capability (probe-resolved
-  with semantic controls, including the timezone argument — Nucleus 1.0.2
+  with semantic controls, including the timezone argument — the retained Nucleus recording
   resolves `unsupported` and every bucket statement fails closed before any
   SQL runs). Bucket results follow the lossless temporal wire form:
   microsecond precision survives, bucket labels are exact instants. The
@@ -1513,27 +1513,31 @@ drivers; nothing outside this table is claimed.
 | Runtimes | Node.js | edge and browser runtimes (no transport adapter) |
 | Engines | PostgreSQL | Nucleus and other Postgres-wire engines (below) |
 
-**Nucleus is not supported by this package.** What the ORM can rely on is
-measured, per driver, against a named build — Nucleus 1.0.2, `nucleus/` tree
-`3313729a` — in
-[`conformance/live/orm/ORM_CONFORMANCE.md`](https://github.com/neutron-build/neutron/blob/main/conformance/live/orm/ORM_CONFORMANCE.md)
-(`pg` / `postgres`: 71/70 of 140 probes supported). By area, supported
-out of probed with `pg`: engine 1/2, relational SQL 19/25, DML 9/14,
-constraints 7/9, codecs 9/19, catalog 2/14, DDL 3/11, RLS 3/9, locks 3/11,
-transactions 4/7, ORM paths 11/19. Relational `with` reads and lossless
-int8/numeric/temporal leaves fail closed there before any SQL runs, and the
-migration workflow is PostgreSQL-only. Engine defects N1–N16 in that report
-block these claims; N1 (`SET LOCAL ROLE` survives the transaction) is a
-security defect.
+**Nucleus is not supported by this package.** The retained
+[2026-09-30 ORM conformance recording](https://github.com/neutron-build/neutron/blob/main/conformance/live/orm/ORM_CONFORMANCE.md)
+and its capability JSON identify the exact binary, drivers, source commit
+`59fad7aed7889dff2d2efbb65c5aa4c6f14f8ea5` and engine tree
+`3c5c6035b5e6602cf65ba23c917fe83848888571`. That engine tree differs from the
+current documentation source; the recording is historical evidence, not a new
+execution or certification of this checkout. Consult the report for per-probe
+results instead of treating a duplicated count as a support guarantee.
+The migration workflow remains PostgreSQL-only.
 
-The optional model modules were measured on the same build and are not
-advertised for it:
+The former N1 transaction-local role/settings finding was repaired within the
+bounded X07/X08 contract recorded there. Remaining limits include unsupported
+`set_config` transaction-local semantics, catalog DDL and client SQL-plus-specialty
+atomicity/isolation. The bounded repair does not establish universal security
+or PostgreSQL parity; see the report and root `AUDIT_OPEN.md`.
 
-| Module | PostgreSQL | Nucleus 1.0.2 |
+The optional model modules remain unadvertised for Nucleus. Their recorded
+capability outcomes are in the same named report; this documentation correction
+does not rerun them:
+
+| Module | PostgreSQL | Nucleus retained recording (unsupported package profile) |
 |---|---|---|
 | `/pgvector`, `/fts` | verified on 15, 16, 17 and 18 | vector types unsupported; the FTS functions fail a negative control; queries are refused before any statement runs |
-| `/timeseries`, `/columnar` | verified on 15, 16, 17 and 18 | `ts-bucketing` resolves unsupported and bucket statements fail closed; the engine's own time-series and columnar model clients are in `@neutron-build/nucleus` ([below](#nucleus-time-series-and-columnar-model-clients)) |
-| `/listen-notify` | verified on 15, 16, 17 and 18 | delivers, with the divergences documented in [LISTEN/NOTIFY](#listennotify-neutron-buildsqllisten-notify) |
+| `/timeseries`, `/columnar` | verified on 15, 16, 17 and 18 | `ts-bucketing` resolves unsupported and bucket statements fail closed; the engine's own model clients are in `@neutron-build/nucleus` ([below](#nucleus-time-series-and-columnar-model-clients)) |
+| `/listen-notify` | verified on 15, 16, 17 and 18 | delivers, with the recorded divergences in [LISTEN/NOTIFY](#listennotify-neutron-buildsqllisten-notify) |
 
 ## Upgrading from earlier builds
 

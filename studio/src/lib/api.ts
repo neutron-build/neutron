@@ -370,9 +370,9 @@ export const api = {
   ddl: (connectionId: string, sql: string) =>
     mutationRequest<{ ok: boolean; duration: number; error?: string }>('POST', '/ddl', { connectionId, sql }),
 
-  codegen: (connectionId: string, schema: string, table: string, lang: string) =>
+  codegen: (connectionId: string, schema: string, table: string, lang: string, profile: 'legacy' | 'lossless-read-v1' = 'legacy') =>
     request<{ code: string }>('GET',
-      `/codegen?connectionId=${connectionId}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}&lang=${lang}`
+      `/codegen?connectionId=${connectionId}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}&lang=${encodeURIComponent(lang)}&profile=${encodeURIComponent(profile)}`
     ),
 
   // --- S05: schema navigation and planning ---

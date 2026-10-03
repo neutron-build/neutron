@@ -126,7 +126,20 @@ Nucleus.Models.Vector.insert(Nucleus.Client, "embeddings", "doc1", vec, %{title:
 {:ok, results} = Nucleus.Models.Vector.search(Nucleus.Client, "embeddings", query, limit: 10)
 ```
 
-All 14 models are reachable: **SQL** directly via the client, plus dedicated modules for **KV, Vector, TimeSeries, Document, Graph, FTS, Geo, Blob, Streams, Columnar, Datalog, CDC, and PubSub**. Non-SQL calls return a `nucleus_required` error when connected to plain PostgreSQL. Schema changes run through `Nucleus.Migration` with `up/1` / `down/1` callbacks and an applied-migrations table.
+All 14 models are reachable: **SQL** directly via the client, plus dedicated modules for **KV, Vector, TimeSeries, Document, Graph, FTS, Geo, Blob, Streams, Columnar, Datalog, CDC, and PubSub**. Non-SQL calls return a `nucleus_required` error when connected to plain PostgreSQL. `Nucleus.Migration` is a legacy **PostgreSQL-only** callback runner; it refuses
+Nucleus and incompatible or foreign migration histories before schema changes.
+Use the CLI's PostgreSQL migration workflow for new managed applications. The
+Elixir runner accepts its own three-column BIGINT-version history only; it does
+not adopt CLI/SDK histories or add checksum trust to existing callbacks.
+
+Each synchronous, same-process `up/1` or `down/1` callback and its history change
+share one PostgreSQL transaction and the CLI advisory lock key. Prior steps stay
+committed; competing runs may interleave **between steps**, and there is no
+whole-run atomicity or exclusivity promise. Callbacks must use
+`Nucleus.Client.query`; spawned work and external effects are not participants.
+Invoke the runner outside `Nucleus.Repo.transaction`. Callback `{:error, reason}`
+rolls the step back. Applied callbacks remain unverified: changing an already
+recorded version is skipped because this legacy history has no checksum.
 
 ## Real-Time — Channels & Presence
 

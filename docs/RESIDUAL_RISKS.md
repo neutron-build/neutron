@@ -18,42 +18,34 @@ tree.
 
 ---
 
-## 1. A transaction spanning SQL and a specialty model is not atomic — outside streams
+## 1. Cross-model recovery coordination does not provide client isolation
 
-**Status: implemented for streams (2026-08-21); designed, not implemented, for
-the other twelve models.**
+**Status: per-surface tagged recovery implemented; public SQL-plus-specialty
+client profile remains unsupported.**
 
-Nucleus has fourteen data models. SQL writes go through the page WAL with a
-commit record. The other thirteen each own an append log.
+Streams, scalar KV, documents, graph, timeseries, datalog, blob and HNSW vector
+row writes enlist in the SQL commit's recovery decision. Source and retained
+S63 evidence are described in
+[the model matrix](../nucleus/docs/MODEL_SEMANTICS.md) and
+[completion history](../nucleus/DATABASE_COMPLETION.md).
+`probe_crossmodel_atomicity` contains crash/commit/autocommit cases for these
+eight surfaces; `probe_crossmodel_commit_order` checks only that recovered SQL
+rows have recovered KV counterparts. This correction reruns neither harness.
 
-For **streams, KV strings, documents, graph, timeseries, datalog, blob, and
-vector** (vector since 2026-08-26: an HNSW-indexed VECTOR column's row writes
-commit or roll back with the SQL row, crash-probed both directions),
-the fix is implemented end to end: every enlisted write is tagged with the
-coordinating transaction id, the commit record is CRC-covered on both WAL
-backends and survives compaction, specialty checkpoints are ordered before
-the SQL checkpoint with a retention pin, and recovery discards tagged
-records whose transaction never committed — absence of a commit record means
-discard, so there is no in-doubt state and no operator call. A crash anywhere
-between the tagged append and the commit record leaves both writes or
-neither, and rollback retracts what the transaction appended. Pinned by
-`probe_crossmodel_commit_order` and `probe_crossmodel_atomicity`.
+Columnar-store and collections-KV writes are refused inside transactions.
+FTS document-store writes remain outside tagged recovery; geo functions have
+no stored state. CDC is deliberately emitted at statement time rather than
+COMMIT (2026-08-26, NU-107), so events can describe writes later rolled back.
 
-**Columnar and collections-KV** carry the full tagged plumbing but their
-in-transaction writes are refused outright (no rollback before-image yet),
-so no uncommitted record can be produced through SQL — atomic by refusal,
-not by mechanism, until a write-set design lands.
+Recovery coordination is distinct from cross-session isolation: specialty
+stores can expose another session's uncommitted writes. The
+[retained public-client report](../conformance/live/orm/ORM_CONFORMANCE.md)
+keeps SQL-plus-specialty atomicity/isolation unsupported. Do not infer a
+supported client-wide transaction contract from internal crash harnesses.
 
-The remaining models — FTS (design-never: the index snapshot beats the WAL
-at startup) and geo (writer-less — geo persists as SQL columns and its WAL
-receives no writes) — still append with no notion of the transaction that
-produced a record. CDC is **decided, not pending**: events fire at statement time and
-never enlist — fire-and-forget is the contract (2026-08-26; the NU-107
-product call resolved to keeping it), so a CDC consumer sees events for
-writes that a concurrent crash or rollback may then undo.
-
-**If this matters to you:** keep cross-model writes idempotent, or confine a
-transaction to SQL and the seven atomic specialty surfaces above.
+**If this matters to you:** use the supported PostgreSQL application profile;
+treat experimental specialty writes and CDC notifications with their explicit
+per-surface limits and make external effects idempotent.
 
 ## 2. Two index paths read the whole table and then narrow the answer
 

@@ -226,3 +226,14 @@ describe('SchemaDesigner plan flow (S05)', () => {
     expect(alert.textContent).toContain('gone from the live catalog')
   })
 })
+
+describe('SchemaDesigner read profile', () => {
+  it('selects lossless explicitly and displays the contextual refusal', async () => {
+    await openOrders()
+    expect(codegenMock).toHaveBeenCalledWith('c1', 'public', 'orders', 'go', 'legacy')
+    codegenMock.mockRejectedValueOnce(new Error('go orders column stamp type pg_catalog.timestamp: unsupported identity'))
+    fireEvent.change(screen.getByLabelText('Codegen read profile'), {target:{value:'lossless-read-v1'}})
+    await waitFor(() => expect(codegenMock).toHaveBeenCalledWith('c1','public','orders','go','lossless-read-v1'))
+    await waitFor(() => expect(screen.getByText(/column stamp type pg_catalog.timestamp/)).toBeTruthy())
+  })
+})

@@ -1,0 +1,986 @@
+{
+  "components": {
+    "schemas": {
+      "CreateDocument": {
+        "additionalProperties": false,
+        "properties": {
+          "amount": {
+            "description": "Exact decimal input, normalized to canonical18 fractional digits before digest.",
+            "pattern": "^-?[0-9]{1,22}(\\.[0-9]{1,18})?$",
+            "type": "string"
+          },
+          "content": {
+            "description": "At most 65536 UTF-8 bytes.",
+            "type": "string"
+          },
+          "id": {
+            "description": "ASCII UUID; canonicalized to lowercase.",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "note": {
+            "description": "Required member; null and empty text are distinct. Valid Unicode, no NUL or unpaired surrogate.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "payload": {
+            "contentEncoding": "base64",
+            "description": "Standard padded base64 encoding of exact bytes; strict decode then canonical re-encode.",
+            "type": "string"
+          },
+          "project_id": {
+            "description": "ASCII UUID; canonicalized to lowercase.",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "content",
+          "amount",
+          "note",
+          "payload",
+          "idempotency_key"
+        ],
+        "type": "object"
+      },
+      "CreateProject": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "ASCII UUID; canonicalized to lowercase.",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+            "type": "string"
+          },
+          "title": {
+            "description": "Nonblank after whitespace trimming; stored verbatim.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title"
+        ],
+        "type": "object"
+      },
+      "Detail": {
+        "additionalProperties": false,
+        "properties": {
+          "amount": {
+            "description": "Canonical numeric(40,18): eighteen fractional digits, normalized zeros/sign; no float.",
+            "pattern": "^-?[0-9]{1,22}\\.[0-9]{18}$",
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "created_at": {
+            "description": "UTC timestamp with six microsecond digits.",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{6}Z$",
+            "type": "string"
+          },
+          "id": {
+            "description": "ASCII UUID; canonicalized to lowercase.",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+            "type": "string"
+          },
+          "job": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Job"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "note": {
+            "description": "Required member; null and empty text are distinct. Valid Unicode, no NUL or unpaired surrogate.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "payload": {
+            "contentEncoding": "base64",
+            "description": "Standard padded base64 encoding of exact bytes; strict decode then canonical re-encode.",
+            "type": "string"
+          },
+          "project_id": {
+            "description": "ASCII UUID; canonicalized to lowercase.",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+            "type": "string"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Result"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "version": {
+            "description": "Canonical positive signed int64 decimal, \u003c=9223372036854775807; never a JSON number.",
+            "pattern": "^[1-9][0-9]{0,18}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "id",
+          "project_id",
+          "content",
+          "amount",
+          "note",
+          "payload",
+          "version",
+          "created_at",
+          "job",
+          "result"
+        ],
+        "type": "object"
+      },
+      "Document": {
+        "additionalProperties": false,
+        "properties": {
+          "amount": {
+            "description": "Canonical numeric(40,18): eighteen fractional digits, normalized zeros/sign; no float.",
+            "pattern": "^-?[0-9]{1,22}\\.[0-9]{18}$",
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "created_at": {
+            "description": "UTC timestamp with six microsecond digits.",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{6}Z$",
+            "type": "string"
+          },
+          "id": {
+            "description": "ASCII UUID; canonicalized to lowercase.",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+            "type": "string"
+          },
+          "note": {
+            "description": "Required member; null and empty text are distinct. Valid Unicode, no NUL or unpaired surrogate.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "payload": {
+            "contentEncoding": "base64",
+            "description": "Standard padded base64 encoding of exact bytes; strict decode then canonical re-encode.",
+            "type": "string"
+          },
+          "project_id": {
+            "description": "ASCII UUID; canonicalized to lowercase.",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+            "type": "string"
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "version": {
+            "description": "Canonical positive signed int64 decimal, \u003c=9223372036854775807; never a JSON number.",
+            "pattern": "^[1-9][0-9]{0,18}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "id",
+          "project_id",
+          "content",
+          "amount",
+          "note",
+          "payload",
+          "version",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "Job": {
+        "additionalProperties": false,
+        "properties": {
+          "attempts": {
+            "type": "integer"
+          },
+          "failure_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lease_until": {
+            "anyOf": [
+              {
+                "description": "UTC timestamp with six microsecond digits.",
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{6}Z$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "attempts",
+          "failure_code",
+          "lease_until"
+        ],
+        "type": "object"
+      },
+      "Problem": {
+        "additionalProperties": true,
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "instance": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer"
+          },
+          "title": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "Project": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "ASCII UUID; canonicalized to lowercase.",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+            "type": "string"
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "id",
+          "title"
+        ],
+        "type": "object"
+      },
+      "Result": {
+        "additionalProperties": false,
+        "properties": {
+          "content_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "processed_at": {
+            "description": "UTC timestamp with six microsecond digits.",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{6}Z$",
+            "type": "string"
+          },
+          "word_count": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "content_digest",
+          "word_count",
+          "processed_at"
+        ],
+        "type": "object"
+      },
+      "UpdateNote": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "description": "Canonical positive signed int64 decimal, \u003c=9223372036854775807; never a JSON number.",
+            "pattern": "^[1-9][0-9]{0,18}$",
+            "type": "string"
+          },
+          "note": {
+            "description": "Required member; null and empty text are distinct. Valid Unicode, no NUL or unpaired surrogate.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "expected_version",
+          "note"
+        ],
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "bearerFormat": "JWT",
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "Reviewed static contract for explicit raw handlers, not automatically generated handlers. JSON request bodies require all declared members; unknown and duplicate members rejected; max 1MiB; valid Unicode without NUL. Authentication validates issuer neutron-data-reference, audience neutron-data-reference-api, nonempty subject, configured tenant. No header or DSN tenant selection.",
+    "title": "Neutron data reference API",
+    "version": "1"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/documents": {
+      "get": {
+        "operationId": "listDocuments",
+        "parameters": [
+          {
+            "description": "Exclusive UUID keyset cursor; repeated after rejected. At most50 rows ordered by UUID.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "description": "ASCII UUID; canonicalized to lowercase.",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "description": "ASCII UUID; canonicalized to lowercase.",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/Document"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful operation (including explicit replay)."
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Existing-state, different idempotency digest, or stale/exhausted CAS conflict."
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Dependency unavailable or unknown commit outcome. An unknown-outcome problem requires inspecting durable state; never automatically retry."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "post": {
+        "description": "Atomically creates document, tenant-scoped idempotency request and job. Digest covers lowercase UUIDs, canonical18 decimal, nullable note and canonical bytes. Same key+digest returns current document; different digest409. Concurrent unique conflict rolls back and reads winner. Commit acknowledgement failure503 unknown-outcome; no automatic retry.",
+        "operationId": "createDocument",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDocument"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Document"
+                }
+              }
+            },
+            "description": "Successful operation (including explicit replay)."
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Existing-state, different idempotency digest, or stale/exhausted CAS conflict."
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Dependency unavailable or unknown commit outcome. An unknown-outcome problem requires inspecting durable state; never automatically retry."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/documents/{id}": {
+      "get": {
+        "operationId": "getDocument",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "description": "ASCII UUID; canonicalized to lowercase.",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Detail"
+                }
+              }
+            },
+            "description": "Successful operation (including explicit replay)."
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Existing-state, different idempotency digest, or stale/exhausted CAS conflict."
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Dependency unavailable or unknown commit outcome. An unknown-outcome problem requires inspecting durable state; never automatically retry."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/documents/{id}/note": {
+      "post": {
+        "description": "Atomic compare-and-swap note/version. One winner for expected_version, increment by1; no update at int64 maximum. Missing/stale version409. Commit acknowledgement loss has unknown outcome; inspect before another action.",
+        "operationId": "updateNote",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "description": "ASCII UUID; canonicalized to lowercase.",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateNote"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Document"
+                }
+              }
+            },
+            "description": "Successful operation (including explicit replay)."
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Existing-state, different idempotency digest, or stale/exhausted CAS conflict."
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Dependency unavailable or unknown commit outcome. An unknown-outcome problem requires inspecting durable state; never automatically retry."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/projects": {
+      "get": {
+        "operationId": "listProjects",
+        "parameters": [
+          {
+            "description": "Exclusive UUID keyset cursor; repeated after rejected. At most50 rows ordered by UUID.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "description": "ASCII UUID; canonicalized to lowercase.",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/Project"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful operation (including explicit replay)."
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Existing-state, different idempotency digest, or stale/exhausted CAS conflict."
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Dependency unavailable or unknown commit outcome. An unknown-outcome problem requires inspecting durable state; never automatically retry."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "post": {
+        "operationId": "createProject",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateProject"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Project"
+                }
+              }
+            },
+            "description": "Successful operation (including explicit replay)."
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RFC7807 safe problem."
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Existing-state, different idempotency digest, or stale/exhausted CAS conflict."
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Dependency unavailable or unknown commit outcome. An unknown-outcome problem requires inspecting durable state; never automatically retry."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "nucleus": {
+                      "type": "boolean"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "version": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "nucleus",
+                    "version"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Service startup health"
+          }
+        },
+        "security": []
+      }
+    }
+  }
+}

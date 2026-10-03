@@ -44,8 +44,17 @@ try client.connect();   // detects Nucleus vs plain PostgreSQL via VERSION()
 const k = client.kv();  // typed handle per model: .sql(), .vector(), .graph(), ...
 ```
 
-Query results decode into comptime-typed structs via `@typeInfo`; errors
-surface as RFC 7807 problem details. Layer 0 (codecs, parser, pgwire) is
+`client.sql()` exposes `queryRaw` (raw results), `queryScalar` (an optional
+string), and `execute` (a command tag). Its comptime struct helpers produce
+field names and column lists; they do not decode rows into typed structs.
+
+`executeFormatted` and `queryFormatted` interpolate arguments into trusted SQL
+syntax using `std.fmt.bufPrint`. They do not escape or bind parameter values.
+Do not use them with untrusted input, NULL or binary values. This SQL model
+does not currently expose a parameter-binding API; the lower-level prepared
+statement transport requires further validation before it can serve that role.
+
+Layer 0 (codecs, parser, pgwire) is
 zero-allocation throughout; the full SDK's client is allocator-backed (heap
 connection pool, default capacity 25).
 

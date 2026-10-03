@@ -1,0 +1,86 @@
+package main
+
+import (
+	bytespkg "bytes"
+	"context"
+	"fmt"
+	"github.com/neutron-build/neutron/go/nucleus"
+	"os"
+)
+
+func writeConformance(ctx context.Context, db *nucleus.Client) []map[string]any {
+	phase := os.Getenv("CONFORMANCE_WRITE_PHASE")
+	if phase == "" {
+		return nil
+	}
+	const base int32 = 200
+	const version int64 = 9007199254740993
+	const insert = "INSERT INTO fixture.writes VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)"
+	bytes := make([]byte, 256)
+	for i := range bytes {
+		bytes[i] = byte(i)
+	}
+	low := []any{int16(-32768), int32(-2147483648), int64(-9223372036854775808), "-9999999999999999999999.123456789012345678", true, "quotes ' Unicode λ", "short", "ABCD", "00000000-0000-0000-0000-000000000001", bytes}
+	high := []any{int16(32767), int32(2147483647), int64(9223372036854775807), "9999999999999999999999.999999999999999999", false, "", "", "WXYZ", "ffffffff-ffff-ffff-ffff-ffffffffffff", []byte{}}
+	args := func(id int32, values []any) []any {
+		out := []any{id}
+		out = append(out, values...)
+		return append(out, version)
+	}
+	count := func(got int64, err error, want int64) {
+		must(err)
+		if got != want {
+			panic(fmt.Sprintf("affected rows: got %d want %d", got, want))
+		}
+	}
+	if phase == "write" {
+		n, e := db.SQL().Exec(ctx, insert, args(base, low)...)
+		count(n, e, 1)
+		before, e := nucleus.QueryOne[Writes](ctx, db.SQL(), "SELECT * FROM fixture.writes WHERE row_id=$1", base)
+		must(e)
+		if before.I2 == nil || *before.I2 != -32768 || before.I4 == nil || *before.I4 != -2147483648 || before.I8 == nil || *before.I8 != -9223372036854775808 || before.Amount == nil || *before.Amount != low[3] || before.Ident == nil || *before.Ident != low[8] || before.Flag == nil || !*before.Flag || before.Label == nil || *before.Label != low[5] || before.ShortLabel == nil || *before.ShortLabel != low[6] || before.FixedLabel == nil || *before.FixedLabel != low[7] || before.Payload == nil || !bytespkg.Equal(*before.Payload, bytes) || before.Revision != version {
+			panic("native inserted boundary shape")
+		}
+		n, e = db.SQL().Exec(ctx, insert, args(base+1, make([]any, 10))...)
+		count(n, e, 1)
+		const update = "UPDATE fixture.writes SET i2=$2,i4=$3,i8=$4,amount=$5,flag=$6,label=$7,short_label=$8,fixed_label=$9,ident=$10,payload=$11,revision=revision+1 WHERE row_id=$1 AND revision=$12"
+		n, e = db.SQL().Exec(ctx, update, args(base, high)...)
+		count(n, e, 1)
+		n, e = db.SQL().Exec(ctx, update, args(base, low)...)
+		count(n, e, 0)
+		tx, e := db.Begin(ctx)
+		must(e)
+		func() {
+			defer func() { must(tx.Rollback(ctx)) }()
+			n, e := tx.SQL().Exec(ctx, "UPDATE fixture.writes SET label=$2 WHERE row_id=$1", base, "must rollback")
+			count(n, e, 1)
+			n, e = tx.SQL().Exec(ctx, "DELETE FROM fixture.writes WHERE row_id=$1", base+1)
+			count(n, e, 1)
+			n, e = tx.SQL().Exec(ctx, insert, args(base+2, low)...)
+			count(n, e, 1)
+		}()
+	} else if phase == "update" {
+		others, e := nucleus.Query[Writes](ctx, db.SQL(), "SELECT * FROM fixture.writes WHERE row_id<$1 OR row_id>$2 ORDER BY row_id", base, base+1)
+		must(e)
+		if len(others) != 4 {
+			panic("cross-writer row count")
+		}
+		for _, r := range others {
+			n, e := db.SQL().Exec(ctx, "UPDATE fixture.writes SET revision=revision+1 WHERE row_id=$1 AND revision=$2", r.RowId, r.Revision)
+			count(n, e, 1)
+			n, e = db.SQL().Exec(ctx, "UPDATE fixture.writes SET revision=revision+1 WHERE row_id=$1 AND revision=$2", r.RowId, r.Revision)
+			count(n, e, 0)
+		}
+	} else if phase != "read" {
+		panic("unknown conformance write phase")
+	}
+	rows, e := nucleus.Query[Writes](ctx, db.SQL(), "SELECT * FROM fixture.writes ORDER BY row_id")
+	must(e)
+	out := make([]map[string]any, 0, len(rows))
+	for _, r := range rows {
+		m := normalize(r, r.I8, r.Payload)
+		m["revision"] = fmt.Sprint(r.Revision)
+		out = append(out, m)
+	}
+	return out
+}

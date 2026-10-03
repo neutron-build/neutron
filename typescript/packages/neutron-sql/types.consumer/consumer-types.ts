@@ -403,6 +403,28 @@ async function q02Fixtures(): Promise<void> {
     { total: bigint | null; amount: string | null; mean: string | null; lo: string | null; hi: bigint | null }
   > = true;
 
+  // 1.4: a declared NUMERIC(p,s) typmod is DDL/export metadata only — value
+  // semantics are unchanged. Constrained columns keep SelectTypeOf string,
+  // precision-only normalizes to scale 0, and an explicit decoder keeps its
+  // inferred return type alongside the typmod.
+  const prices = pgTable("prices", {
+    id: serial("id").primaryKey(),
+    net: numeric("net", { precision: 10, scale: 2 }),
+    units: numeric("units", { precision: 10 }),
+    rate: numeric("rate", { precision: 8, scale: 4, decoder: (raw: string) => Number(raw) }),
+  });
+  const priced = db.select().from(prices);
+  const eqPriced: AssertEq<
+    Awaited<typeof priced>[number],
+    { id: number; net: string | null; units: string | null; rate: number | null }
+  > = true;
+  // @ts-expect-error a constrained numeric column still reads as exact string
+  const badNet: { net: number } = ({} as Awaited<typeof priced>[number]);
+  const netSum = db.select({ total: sum(prices.net) }).from(prices);
+  const eqNetSum: AssertEq<Awaited<typeof netSum>[number], { total: string | null }> = true;
+  // @ts-expect-error the decoder's return type is not silently widened
+  const badRate: { rate: string | null } = ({} as Awaited<typeof priced>[number]);
+
   // min/max over a derived/CTE timestamptz column keep the column's read
   // type through composition (the aggregate mirrors its argument column).
   const events = pgTable("events", { id: serial("id").primaryKey(), seen: timestamptz("seen") });

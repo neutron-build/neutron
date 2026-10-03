@@ -556,8 +556,13 @@ func (c *Client) evaluateIndexCreateIdentity(ctx context.Context, step *Journale
 // REFUSAL — without a schema the step's effect has no pinnable identity,
 // and no skip, drop or verdict may be derived from a bare name.
 func (c *Client) pinIndexTargetSchema(ctx context.Context, p StatementPostcondition) (string, uint32, error) {
+	conn, err := c.pool.Acquire(ctx)
+	if err != nil {
+		return "", 0, err
+	}
+	defer conn.Release()
 	var oid *uint32
-	if err := c.pool.QueryRow(ctx, "SELECT to_regclass($1)::oid", regclassRef(p.Schema, p.Table)).Scan(&oid); err != nil {
+	if err := conn.QueryRow(ctx, "SELECT pg_catalog.to_regclass($1)::oid", regclassRef(p.Schema, p.Table)).Scan(&oid); err != nil {
 		return "", 0, err
 	}
 	if oid == nil {
@@ -568,8 +573,8 @@ func (c *Client) pinIndexTargetSchema(ctx context.Context, p StatementPostcondit
 			"the unqualified table %q cannot be resolved through the search path, so this index step's effect has no pinnable identity (schema+table+name) — qualify the table (schema.table) in the statement, or make sure the table exists in a searchable schema; a bare index name must never decide skip, drop or verdict", p.Table)}
 	}
 	var schema string
-	if err := c.pool.QueryRow(ctx, `
-		SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+	if err := conn.QueryRow(ctx, `
+		SELECT n.nspname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 		WHERE c.oid = $1`, *oid).Scan(&schema); err != nil {
 		return "", 0, err
 	}
@@ -586,15 +591,15 @@ func (c *Client) pinIndexTargetSchema(ctx context.Context, p StatementPostcondit
 func (c *Client) indexStatusByIdentity(ctx context.Context, tableOid uint32, schema, name string) (exists, valid bool, err error) {
 	err = c.pool.QueryRow(ctx, `
 		SELECT EXISTS (
-			SELECT 1 FROM pg_index i
-			JOIN pg_class ic ON ic.oid = i.indexrelid
-			JOIN pg_namespace n ON n.oid = ic.relnamespace
+			SELECT 1 FROM pg_catalog.pg_index i
+			JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+			JOIN pg_catalog.pg_namespace n ON n.oid = ic.relnamespace
 			WHERE i.indrelid = $1 AND ic.relname = $3 AND n.nspname = $2
 		),
 		COALESCE((
-			SELECT i.indisvalid FROM pg_index i
-			JOIN pg_class ic ON ic.oid = i.indexrelid
-			JOIN pg_namespace n ON n.oid = ic.relnamespace
+			SELECT i.indisvalid FROM pg_catalog.pg_index i
+			JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+			JOIN pg_catalog.pg_namespace n ON n.oid = ic.relnamespace
 			WHERE i.indrelid = $1 AND ic.relname = $3 AND n.nspname = $2
 		), false)`, tableOid, schema, name).Scan(&exists, &valid)
 	return exists, valid, err
@@ -612,20 +617,20 @@ func (c *Client) indexStatusByIdentity(ctx context.Context, tableOid uint32, sch
 func (c *Client) IndexDebrisIdentity(ctx context.Context, tableOid uint32, schema, name string) (exists, extensionMember bool, err error) {
 	err = c.pool.QueryRow(ctx, `
 		SELECT EXISTS (
-			SELECT 1 FROM pg_index i
-			JOIN pg_class ic ON ic.oid = i.indexrelid
-			JOIN pg_namespace n ON n.oid = ic.relnamespace
+			SELECT 1 FROM pg_catalog.pg_index i
+			JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+			JOIN pg_catalog.pg_namespace n ON n.oid = ic.relnamespace
 			WHERE i.indrelid = $1 AND ic.relname = $3 AND n.nspname = $2
 			  AND NOT i.indisvalid
 		),
 		EXISTS (
-			SELECT 1 FROM pg_depend d
-			JOIN pg_index i ON i.indexrelid = d.objid
-			JOIN pg_class ic ON ic.oid = i.indexrelid
-			JOIN pg_namespace n ON n.oid = ic.relnamespace
+			SELECT 1 FROM pg_catalog.pg_depend d
+			JOIN pg_catalog.pg_index i ON i.indexrelid = d.objid
+			JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+			JOIN pg_catalog.pg_namespace n ON n.oid = ic.relnamespace
 			WHERE i.indrelid = $1 AND ic.relname = $3 AND n.nspname = $2
 			  AND NOT i.indisvalid
-			  AND d.classid = 'pg_class'::regclass AND d.deptype = 'e'
+			  AND d.classid = 'pg_catalog.pg_class'::regclass AND d.deptype = 'e'
 		)`, tableOid, schema, name).Scan(&exists, &extensionMember)
 	return exists, extensionMember, err
 }
@@ -643,10 +648,10 @@ func (c *Client) relationNameOwnerInSchema(ctx context.Context, schema, name str
 			WHEN 'I' THEN 'partitioned index'
 			ELSE 'relation ' || ic.relname || ' of kind ' || ic.relkind::text
 		END
-		FROM pg_class ic
-		JOIN pg_namespace n ON n.oid = ic.relnamespace
-		LEFT JOIN pg_index i ON i.indexrelid = ic.oid
-		LEFT JOIN pg_class ct ON ct.oid = i.indrelid
+		FROM pg_catalog.pg_class ic
+		JOIN pg_catalog.pg_namespace n ON n.oid = ic.relnamespace
+		LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = ic.oid
+		LEFT JOIN pg_catalog.pg_class ct ON ct.oid = i.indrelid
 		WHERE ic.relname = $2 AND n.nspname = $1`, schema, name).Scan(&owner)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", false, nil
@@ -691,7 +696,7 @@ func (c *Client) WatchCreateIndexProgress(ctx context.Context, table string, onP
 			SELECT p.relid::regclass::text, p.phase,
 			       p.blocks_done, p.blocks_total, p.tuples_done, p.tuples_total,
 			       p.lockers_done, p.lockers_total
-			FROM pg_stat_progress_create_index p
+			FROM pg_catalog.pg_stat_progress_create_index p
 			WHERE p.command = 'CREATE INDEX' AND ($1 = '' OR p.relid = $1::regclass)`, table)
 		if err != nil {
 			return

@@ -1,0 +1,33 @@
+[application]
+version = 1
+name = "neutron-data-reference"
+
+# Explicit operator prerequisite: run `neutron project run migrate` before dev.
+# DATABASE_URL is the private migration-owner URL for this task invocation only.
+[application.tasks.migrate]
+path = "database"
+command = ["neutron", "migrate", "--dir", "migrations"]
+timeout = "2m"
+
+[application.services.api]
+path = "api"
+command = ["go", "run", "."]
+contract = "neutron/v1"
+
+[application.services.web]
+path = "web"
+command = ["./node_modules/.bin/neutron-ts", "dev"]
+contract = "neutron/v1"
+depends_on = ["api"]
+
+# Finite native task, not an HTTP service or a claimed ready poll service.
+# Use private WORKER_DATABASE_URL/WORKER_TENANT and the validated Python package.
+[application.tasks.worker-once]
+path = "worker"
+command = ["python", "main.py", "--once"]
+timeout = "30s"
+
+[application.tasks.web-typecheck]
+path = "web"
+command = ["./node_modules/.bin/tsc", "--noEmit"]
+timeout = "2m"

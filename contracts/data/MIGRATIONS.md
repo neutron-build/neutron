@@ -3,8 +3,9 @@
 Status: implemented contract. Owners: CLI runner (`cli/internal/db/migrate.go`,
 `cli/internal/db/migrate_history.go`, Go), Nucleus Go SDK (`go/nucleus/migrate.go`),
 Nucleus TypeScript SDK (`typescript/packages/neutron-nucleus/src/migrate.ts`).
-This document is normative for the M04 protocol; where a runner deviates, the
-deviation is a compatibility shim recorded here, not a second format.
+This document is normative for the M04 protocol on the admitted PostgreSQL
+profile. Other language runners are not protocol-v2 implementations; a
+PostgreSQL-wire connection alone does not certify migration compatibility.
 
 The protocol answers four questions the pre-M04 runners answered differently or
 not at all: **which migrations are applied** (identity), **is the recorded
@@ -38,12 +39,41 @@ SDK-compatible shape stores canonical decimal text of an integer as its ID
 encoding; `001` is not representable in it. A runner refuses a history whose
 `version` column type is not its own shape **before any mutation** — that
 refusal is the mixed-runner rule; there is no implicit INTEGER-to-TEXT rewrite
-in either direction. Moving between shapes is an explicit adoption.
+in either direction. The CLI can explicitly adopt SDK integer history into its
+text shape (§6). SDK APIs refuse text history; moving a CLI ledger to an SDK
+runner requires separate operator reconciliation, not implicit SDK adoption.
+SDK admission checks actual builtin `pg_catalog` int2/int4/int8 type identity;
+domains and custom types with integer-looking names are unsupported.
+
+### Metadata namespace
+
+Before mutation, each Go/TypeScript SDK invocation captures one persistent intended schema
+from the actual catalog. History and claim must resolve to ordinary permanent
+tables in that schema. Temporary shadows, later-search-path metadata, views,
+unlogged tables, incomplete catalog identity and unsupported version types
+are refused. Creation namespaces named `pg_*` or `information_schema` are
+refused too. Catalog functions are explicitly `pg_catalog`-qualified so a
+search-path function cannot fabricate identity. Internal metadata reads,
+DDL, claims, heartbeat, adoption and transaction bookkeeping use that quoted schema throughout the invocation.
+User migration SQL keeps its normal session semantics, including `SET LOCAL`;
+it cannot redirect the runner's bookkeeping through `search_path`.
+
+The CLI captures its metadata namespace on its pinned migration session,
+quotes history references and requires actual builtin `pg_catalog` version
+types. Integer history requires explicit adoption into text; domains, custom
+lookalikes, temporary/unlogged metadata and system creation schemas are refused.
+
+The migration endpoint must reach one database and principal consistently, with
+no concurrent privileged replacement of metadata objects. Arbitrary routing
+transports and missing catalog support are not certified profiles.
 
 ## 2. History table
 
-`_neutron_migrations` is preserved in place. Protocol v2 adds (via
-`ADD COLUMN IF NOT EXISTS` on legacy tables, present from creation on new ones):
+`_neutron_migrations` is preserved in place. New histories include the following
+metadata from creation. Existing legacy histories gain these columns only during
+explicit adoption (`ADD COLUMN IF NOT EXISTS`); ordinary apply, down and status
+refuse incomplete metadata or any row without the supported v2 format. Lock
+bootstrap metadata can still be created before that refusal (§5).
 
 | Column | Meaning |
 |---|---|
@@ -117,15 +147,17 @@ pinned connection**, held from the history read through the final apply:
 - key: `7043516000858342567` (`0x61BF987C10F104A7` — first 8 bytes, big-endian
   signed, of `SHA-256("_neutron_migrations.runner")`);
 - the runner acquires one pooled connection, takes
-  `SELECT pg_advisory_lock(key)` **on that connection**, and runs everything —
+  `SELECT pg_catalog.pg_advisory_lock(key)` **on that connection**, and runs everything —
   history read, checksum verification, every migration transaction — on that
   same session; the lock and the work cannot be separated by pool checkout;
-- release is `pg_advisory_unlock` + connection release in a `finally`/defer
+- release is confirmed `pg_catalog.pg_advisory_unlock` + connection release in a `finally`/defer
   path; a dead session releases the lock automatically, which is the crash
   story: a killed holder's lock evaporates with its connection and the next
   runner re-reads durable history under the lock before doing anything;
 - acquiring honors the run's deadline/cancellation; a waiter that times out
-  fails cleanly without side effects.
+  fails cleanly without side effects. A canceled/failed acquisition or an
+  unconfirmed unlock discards the physical connection instead of returning an
+  uncertain lock holder to the pool.
 
 `schema baseline` also holds this lock across catalog introspection and
 history observation, while `db push` and Studio apply use it for their schema
@@ -150,19 +182,19 @@ Transaction-pooled proxies (PgBouncer transaction mode and equivalents) are
 a pooler that reassigns the session between statements. Use a direct connection
 or a session-pooled endpoint.
 
-### Nucleus (Go/TS SDKs)
+### Go/TypeScript SDK claims (PostgreSQL)
 
 SDK migration functions copy supplied version, name, up SQL, and down SQL into a
 private plan before the first asynchronous wait. Later caller edits cannot change
 the SQL executed or the checksum recorded by that invocation.
 
-The engine has no advisory locks (verified in engine source; the only advisory
-function is an honest `pg_advisory_unlock_all` no-op), so serialization is the
-`_neutron_migration_lock` ledger claim:
+These SDKs use the `_neutron_migration_lock` ledger claim, including on
+PostgreSQL. This is distinct from the CLI's pinned advisory lock:
 
 - one fixed row (`id = 1`); holding the claim means your random durable token
   is in it; the row also carries `owner TEXT` and `locked_at TIMESTAMPTZ`;
-- acquisition is `INSERT ... ON CONFLICT DO NOTHING` with a bounded poll;
+- acquisition is `INSERT ... ON CONFLICT DO NOTHING` with capped polling
+  backoff and cancellation, but no default total wait deadline;
   **there is no automatic time-based takeover**: a claim whose heartbeat has
   gone stale still blocks every new runner. The heartbeat (`locked_at`,
   refreshed after each applied migration) is diagnostic only;
@@ -175,6 +207,10 @@ function is an honest `pg_advisory_unlock_all` no-op), so serialization is the
   binaries cannot be made safe by any marker they do not understand:
   deployments mixing them with v2 runners are unsupported and must be excluded
   during upgrade.
+
+Go also serializes callers with a package mutex; waiting for that mutex is not
+context-aware. Configure explicit cancellation/deadlines for database claim
+waits and do not assume they interrupt a package-mutex waiter.
 
 `_neutron_migration_lock` and `_neutron_migrations` are protected metadata:
 schema diff/push never plans changes to them (B03 prefix rule).
@@ -205,16 +241,12 @@ history into protocol v2. It never fabricates trust:
    unverified versions are reported; partially applied histories are fine
    (pending files are simply not adoption's concern).
 
-PostgreSQL rolls back both the schema upgrade and history changes if adoption
-fails, including failures after the columns have been added. Nucleus does not
-support transactional catalog DDL rollback: after successful preflight, SDKs
-end the read transaction, add nullable columns outside a transaction, and
-graduate the captured history rows in a fresh transaction under the same claim.
-Idempotent nullable `checksum`, `owner`, and `format` additions can remain after a later execution failure. Those
-columns alone do not graduate any row; the history updates commit together or
-roll back, and a retry can reuse the upgraded shape. The SDK claim-lock table is
-bootstrapped outside adoption's transaction on both engines. Adoption therefore
-never promises to remove that serialization metadata on failure.
+On the admitted PostgreSQL profile, adoption rolls back both the schema upgrade
+and history changes if it fails, including failures after columns were added.
+The SDK claim-lock table is bootstrapped outside adoption's transaction;
+adoption does not promise to remove that serialization metadata on failure.
+Provider-specific branches do not bypass catalog admission: the published
+Nucleus 1.2.0 server is refused before this adoption path can run.
 
 Fixture families (V12): CLI legacy (TEXT table, no v2 columns), TS SDK legacy
 (INTEGER table, no checksum), Go SDK legacy (INTEGER + legacy digests +
@@ -250,9 +282,11 @@ next one:
   statements pipelined inside a transaction, after each pipelined batch,
   before commit — and refuses otherwise, so a database or role whose
   default is different is refused before anything runs. The runtime check
-  covers these two reported settings; `search_path` is kept fixed by the
-  allowlist (no `SET LOCAL search_path`, no `set_config`), not checked at
-  run time.
+  covers these two reported settings. The direct-statement allowlist does
+  not freeze `search_path`: a permitted call to a trusted database function
+  can change it indirectly. Captured, qualified bookkeeping on the pinned
+  session prevents that change from redirecting history; user SQL retains
+  PostgreSQL name-resolution semantics. Review called functions too.
 - **Expression fields.** A v2 document's expression fields (column
   defaults, generated expressions, check expressions, index key
   expressions and predicates) must each hold exactly one expression: a
@@ -287,6 +321,23 @@ Existing public SDK APIs keep their signatures. Behavior transitions are
 documented here, not deleted: Go `Migrate`/`MigrateDown` no longer baseline
 legacy checksums silently (GO-30's backfill is superseded by adoption) and no
 longer steal stale claims; TS `migrate`/`migrateDown` gain an optional options
-argument (owner/signal) and the same refusal rules. The CLI refuses
-`neutron migrate` against Nucleus servers: file migrations target PostgreSQL;
-Nucleus migration runners are the language SDKs and stay experimental.
+argument (owner/signal) and the same refusal rules.
+
+### Provider and other-language boundary
+
+The reviewed migration profile is PostgreSQL. The CLI refuses Nucleus file
+migrations. Actual public Go/TypeScript migration, down, adoption, status, lock
+inspection and force-unlock calls against the immutable published Nucleus 1.2.0
+server refuse missing catalog-identity support before creating metadata or
+applying SQL. These APIs are not a working experimental Nucleus migration route.
+
+Python and Elixir support separate strict legacy PostgreSQL integer history.
+They refuse known v2 or foreign shapes rather than adopting them, and do not
+verify SQL checksums. Rust's PostgreSQL and Nucleus-named clients admit only
+their strict legacy PostgreSQL filename ledgers (`__pg_migrations` /
+`__nucleus_migrations`): builtin TEXT filename keys and TIMESTAMPTZ application
+times in their captured namespace. Each file and its history insert share a
+transaction, but applied filenames remain checksum-blind: editing an applied
+file is not detected. These legacy runners do not provide v2 claims, checksum
+adoption or certified Nucleus migration support. Choose one ledger owner and
+reconcile explicitly before changing runners.

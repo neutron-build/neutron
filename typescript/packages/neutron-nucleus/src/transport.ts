@@ -50,6 +50,8 @@ export interface MobileTransportConfig extends TransportConfig {
  * rejected at construction — see `PgTransport`.
  */
 export interface PgTransportConfig {
+  /** Explicit PostgreSQL text-protocol scalar read shape for SQL-only clients. */
+  valueProfile?: 'lossless-read-v1';
   /** Not supported: the PostgreSQL wire protocol has no HTTP headers. */
   headers?: Record<string, string>;
   /** Request timeout in milliseconds, applied to the pool's native timeouts. */
@@ -692,8 +694,9 @@ type PgModule = {
     statement_timeout?: number;
     query_timeout?: number;
     connectionTimeoutMillis?: number;
+    types?: { getTypeParser(oid: number, format?: string): (value: string) => unknown };
   }) => PgPool;
-  types?: { setTypeParser(oid: number, parser: (value: string) => unknown): void };
+  types?: { getTypeParser(oid: number, format?: string): (value: string) => unknown };
 };
 interface PgPool {
   query(sql: string, params?: unknown[]): Promise<{ rows: unknown[]; rowCount: number | null }>;
@@ -725,37 +728,37 @@ async function loadPg(): Promise<PgModule> {
   return pgModulePromise;
 }
 
-// node-postgres hands back int8 (oid 20) as a STRING, because a 64-bit integer
-// does not fit a JS number in general. Nothing in this client coerced it, while
-// every signature said `Promise<number>` — so kv.incr() returned "5",
-// document.countIn() returned "2", graph.nodeCount() returned "24", and
-// `(await kv.incr(k)) + 1` evaluated to "51". Twenty-five Nucleus functions
-// return int8, including document ids and graph node/edge ids, so the defect
-// reached almost every model. It is precisely the class a mocked test cannot
-// see, because a mock returns a number.
-//
-// Coerced to Number, which is the right answer for what these values actually
-// are: counts, lengths, sequence numbers and ids. A count above 2^53 is not a
-// real quantity. The guard is there so the day one of them IS that large, the
-// client says so instead of silently rounding — a wrong number that looks
-// right is the failure this whole conformance effort exists to end.
-let typeParsersConfigured = false;
-function configureTypeParsers(pg: PgModule): void {
-  if (typeParsersConfigured || !pg.types) return;
-  typeParsersConfigured = true;
-  const INT8 = 20;
-  pg.types.setTypeParser(INT8, (value: string) => {
+// Decoder policy belongs to this pool. Never mutate pg's process-global types:
+// another SQL client in the same process may need native int8 strings.
+function poolTypeParsers(pg: PgModule, profile?: 'lossless-read-v1') {
+  if (!pg.types) throw new NucleusError('PG_TYPES_UNSUPPORTED', 'PostgreSQL type parser registry is required');
+  const native = pg.types;
+  const safeInt8 = (value: string) => {
     const n = Number(value);
-    if (!Number.isSafeInteger(n)) {
-      throw new NucleusError(
-        'INT8_PRECISION',
-        `int8 value ${value} exceeds Number.MAX_SAFE_INTEGER and cannot be ` +
-          `represented exactly. Read this column with an explicit ::text cast ` +
-          `and handle it as a BigInt.`
-      );
-    }
+    if (!Number.isSafeInteger(n)) throw new NucleusError('INT8_PRECISION',
+      `int8 value ${value} exceeds Number.MAX_SAFE_INTEGER. Use a separate SQL-only ` +
+      `PgTransport with valueProfile: 'lossless-read-v1', or explicitly read ::text.`);
     return n;
-  });
+  };
+  const identity = (value: string) => value;
+  const exact = new Map<number, (value: string) => unknown>([
+    [20, identity], [1700, identity], [25, identity], [1042, identity], [1043, identity], [2950, identity],
+    [21, value => Number(value)], [23, value => Number(value)],
+    [16, value => { if (value === 't') return true; if (value === 'f') return false;
+      throw new NucleusError('PG_VALUE_FORMAT', 'Unsupported PostgreSQL boolean encoding'); }],
+    [17, value => { if (!/^\\x(?:[0-9a-fA-F]{2})*$/.test(value))
+      throw new NucleusError('PG_VALUE_FORMAT', 'lossless-read-v1 requires hexadecimal bytea output');
+      return Buffer.from(value.slice(2), 'hex'); }],
+  ]);
+  return { getTypeParser(oid: number, format = 'text'): (value: string) => unknown {
+    if (profile === 'lossless-read-v1') {
+      if (format !== 'text' || !exact.has(oid)) return () => { throw new NucleusError('PG_VALUE_TYPE_UNSUPPORTED',
+        `lossless-read-v1 does not support PostgreSQL OID ${oid} in ${format} format`); };
+      return exact.get(oid)!;
+    }
+    if (format !== 'text') return native.getTypeParser(oid, format);
+    return oid === 20 ? safeInt8 : native.getTypeParser(oid, format);
+  }};
 }
 
 const ISOLATION_SQL: Record<IsolationLevel, string> = {
@@ -771,6 +774,7 @@ const ISOLATION_SQL: Record<IsolationLevel, string> = {
  * so construction stays synchronous and browser-safe.
  */
 export class PgTransport implements Transport {
+  readonly valueProfile: 'lossless-read-v1' | undefined;
   private readonly url: string;
   private readonly timeout: number | undefined;
   // The memoized promise is assigned synchronously, before any await: the
@@ -789,6 +793,10 @@ export class PgTransport implements Transport {
           'has no HTTP headers. Pass auth via the connection URL instead.',
       );
     }
+    if (config.valueProfile != null && config.valueProfile !== 'lossless-read-v1') {
+      throw new NucleusError('PG_VALUE_PROFILE_UNSUPPORTED', 'Unknown PostgreSQL value profile');
+    }
+    this.valueProfile = config.valueProfile;
     this.url = url;
     this.timeout = config.timeout;
   }
@@ -796,11 +804,12 @@ export class PgTransport implements Transport {
   private getPool(): Promise<PgPool> {
     if (!this.poolPromise) {
       const creation = loadPg().then((pg) => {
-        configureTypeParsers(pg);
+        const types = poolTypeParsers(pg, this.valueProfile);
         // `timeout` maps onto pg's native knobs: statement_timeout and
         // query_timeout per client, connectionTimeoutMillis for pool checkout.
         const pool = new pg.Pool({
           connectionString: this.url,
+          types,
           max: 8,
           ...(this.timeout != null && {
             statement_timeout: this.timeout,

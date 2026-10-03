@@ -56,6 +56,7 @@ export {
   type ColumnBuilder,
   type AnyColumnBuilder,
   type ColumnDataType,
+  type NumericColumnOptions,
   type JsTypeOf,
   type JsWriteTypeOf,
   type WriteTypeOf,

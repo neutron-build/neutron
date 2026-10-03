@@ -344,33 +344,27 @@ def migrate(
     module = importlib.import_module(module_name)
     neutron_app = getattr(module, attr_name)
 
-    async def _run() -> None:
+    async def _migrate() -> None:
         db = neutron_app.db
         if db is None:
-            print("Error: No database connection. Ensure app.db is set in lifespan.")
-            raise SystemExit(1)
-
+            raise RuntimeError("No database connection; configure App lifespan to create app.db")
+        pool = getattr(db, "pool", None)
+        if pool is not None and getattr(pool, "_loop", asyncio.get_running_loop()) is not asyncio.get_running_loop():
+            raise RuntimeError("Database pool belongs to another event loop; create it inside App lifespan")
         migrations_dir = Path(directory)
-        if not migrations_dir.exists():
-            print(f"Error: Migrations directory '{directory}' not found")
-            raise SystemExit(1)
-
-        sql_files = sorted(migrations_dir.glob("*.sql"))
-        if not sql_files:
-            print("No migration files found.")
-            return
-
-        applied = await db.migration_status()
-        for sql_file in sql_files:
-            name = sql_file.name
-            if name in applied:
-                print(f"  skip  {name}")
-                continue
-            sql = sql_file.read_text()
-            await db.migrate(name, sql)
-            print(f"  apply {name}")
-
+        if not migrations_dir.is_dir():
+            raise ValueError(f"Migrations directory '{directory}' not found")
+        for message in await db.migrate(str(migrations_dir)):
+            print(f"  {message}")
         print("Migrations complete.")
+
+    async def _run() -> None:
+        lifespan = neutron_app._user_lifespan
+        if lifespan is None:
+            await _migrate()
+        else:
+            async with lifespan(neutron_app):
+                await _migrate()
 
     asyncio.run(_run())
 

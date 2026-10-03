@@ -1,5 +1,6 @@
 import { useSignal } from '@preact/signals'
-import { schema, features, openTab, refreshSchema, schemaRefreshing, activeConnection } from '../lib/store'
+import { schema, features, openTab, refreshSchema, schemaRefreshing, activeConnection, activeTab } from '../lib/store'
+import { Icon } from '../components/Icon'
 import { Badge } from '../components/Badge'
 import type { TabKind } from '../lib/types'
 import s from './SchemaTree.module.css'
@@ -97,29 +98,31 @@ export function SchemaTree() {
             if (conn) void refreshSchema(conn.id)
           }}
         >
-          {schemaRefreshing.value ? '…' : '↻'}
+          {schemaRefreshing.value ? '…' : <Icon name="refresh" size={15} />}
         </button>
       </div>
       <button
         class={s.designerBtn}
+        data-workspace-navigation="true"
         onClick={() => openTab({
           id: 'schema-designer',
           kind: 'schema-designer',
           label: 'Schema Designer',
         })}
       >
-        ⬡ Schema Designer
+        <Icon name="schema" size={16} /> Schema Designer
       </button>
       {activeConnection.value && !activeConnection.value.isNucleus && (
         <button
           class={s.designerBtn}
+        data-workspace-navigation="true"
           onClick={() => openTab({
             id: 'diagnostics',
             kind: 'diagnostics',
             label: 'Diagnostics',
           })}
         >
-          ◷ Diagnostics
+          <Icon name="activity" size={16} /> Diagnostics
         </button>
       )}
       {searching && (
@@ -163,8 +166,8 @@ function TreeSection({ section, searching }: { section: Section; searching: bool
         aria-expanded={open.value}
       >
         <span class={s.chevron} data-open={open.value}>›</span>
-        <Badge kind={section.model as any} />
-        <span class={s.sectionLabel}>{section.label}</span>
+        {section.model === 'sql' ? <Icon name="table" size={14} /> : <Badge kind={section.model as any} />}
+        <span class={s.sectionLabel}>{section.model === 'sql' ? 'Tables & views' : section.label}</span>
         <span class={s.count}>{section.items.length}</span>
       </button>
 
@@ -175,9 +178,11 @@ function TreeSection({ section, searching }: { section: Section; searching: bool
       )}
 
       {open.value && items.map(item => (
-        <span key={`${item.sub ?? 'public'}.${item.name}${item.isView ? ':view' : ''}`} class={s.itemRow}>
+        <span key={`${item.sub ?? 'public'}.${item.name}${item.isView ? ':view' : ''}`} class={s.itemRow} data-active={activeTab.value?.objectName === item.name && activeTab.value?.objectSchema === (item.sub ?? 'public')}>
           <button
             class={s.item}
+            data-workspace-navigation="true"
+            aria-current={activeTab.value?.kind === section.kind && activeTab.value?.objectName === item.name && activeTab.value?.objectSchema === (item.sub ?? 'public') ? 'page' : undefined}
             title={`Browse ${item.sub ? item.sub + '.' : ''}${item.name}`}
             onClick={() => openTab({
               id: crypto.randomUUID(),
@@ -194,6 +199,7 @@ function TreeSection({ section, searching }: { section: Section; searching: bool
           {!item.isView && section.kind === 'sql-browser' && (
             <button
               class={s.inspectBtn}
+              data-workspace-navigation="true"
               title={`Structure of ${item.sub ? item.sub + '.' : ''}${item.name}`}
               aria-label={`Inspect structure of ${item.name}`}
               onClick={() => openTab({
@@ -204,12 +210,13 @@ function TreeSection({ section, searching }: { section: Section; searching: bool
                 objectName: item.name,
               })}
             >
-              ⓘ
+              <Icon name="info" size={14} />
             </button>
           )}
           {!item.isView && section.kind === 'sql-browser' && (
             <button
               class={s.inspectBtn}
+              data-workspace-navigation="true"
               title={`Journey: follow ${item.sub ? item.sub + '.' : ''}${item.name} through migrations, queries, plan, rows, models and change events`}
               aria-label={`Journey for ${item.name}`}
               onClick={() => openTab({
@@ -220,7 +227,7 @@ function TreeSection({ section, searching }: { section: Section; searching: bool
                 objectName: item.name,
               })}
             >
-              ⇢
+              <Icon name="arrow" size={14} />
             </button>
           )}
         </span>

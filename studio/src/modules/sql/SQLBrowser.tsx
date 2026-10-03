@@ -77,6 +77,8 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
   const fks = useSignal<Record<string, FKDetail>>({})
   const meta = useSignal<TableMeta | null>(null)
   const showInsert = useSignal(false)
+  const showColumns = useSignal(false)
+  const showSearch = useSignal(false)
   const insertEdits = useSignal<Record<string, CellEdit>>({})
   const exportFormat = useSignal<ExportFormat>('csv')
   const exporting = useSignal(false)
@@ -162,10 +164,14 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
   const readOnlyReason = useComputed<string | null>(() => {
     if (meta.value?.readOnly) return meta.value.readOnlyReason ?? 'read-only'
     if (result.value?.readOnly) return result.value.readOnlyReason ?? 'read-only'
+    if (meta.value && !meta.value.canDelete && !meta.value.columns.some(c => c.editable === true || c.insertable === true)) {
+      return 'Read-only: no columns can be edited or inserted, and rows cannot be deleted.'
+    }
     return null
   })
   const metaColumns = useComputed(() => meta.value?.columns ?? [])
   const editable = useComputed(() => (meta.value !== null && !meta.value.readOnly && result.value?.readOnly !== true) || undefined)
+  const canUpdate = useComputed(() => editable.value === true && metaColumns.value.some(c => c.editable === true))
   const canDelete = useComputed(() => meta.value?.canDelete === true)
 
   /** Build the versioned full-key identity for one row of the current read. */
@@ -513,6 +519,8 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
   const res = result.value
   const shown = res?.rows.length ?? 0
   const stagedCount = stagedHere.value.length
+  const knownRowCount = res?.totalCount ?? info?.rowCount
+  const ordinaryReadOnly = !!readOnlyReason.value && meta.value?.exists === true && !lostWindow.value
 
   return (
     <div class={s.browser}>
@@ -521,10 +529,14 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
           <span class={s.schemaName}>{schemaName}</span>
           <span class={s.sep}>.</span>
           <span class={s.tableName}>{table}</span>
-          {info && <span class={s.rowCount}>{info.rowCount?.toLocaleString() ?? '?'} rows</span>}
+          {knownRowCount !== undefined && <span class={s.rowCount}>{knownRowCount.toLocaleString()} row{knownRowCount === 1 ? '' : 's'}</span>}
+          {ordinaryReadOnly && <details class={s.permissions}><summary title={readOnlyReason.value ?? undefined}>Read-only</summary><p role="note">{readOnlyReason.value}</p></details>}
         </div>
         <div class={s.toolbarActions}>
-          {editable.value && (
+          <button class={s.btnAction} onClick={addFilterRow} title="Add an ANDed filter">+ Filter</button>
+          <button class={s.btnAction} aria-expanded={showColumns.value} onClick={() => { showColumns.value = !showColumns.value }}>Columns</button>
+          {meta.value?.exists && meta.value.columns.some(c => ['text', 'varchar', 'tsvector', 'vector'].includes(c.type)) && <button class={s.btnAction} aria-expanded={showSearch.value} onClick={() => { showSearch.value = !showSearch.value }}>Search data</button>}
+          {canImport.value && (
             <button class={s.btnAction} onClick={openInsert} title="Stage a new row (typed editors; DEFAULT omits the column)">
               + Insert
             </button>
@@ -572,8 +584,8 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
         </div>
       )}
 
-      {info && (
-        <div class={s.columnBar}>
+      {info && showColumns.value && (
+        <div class={s.columnBar} aria-label="Column types">
           {cols.map((col: SqlColumn) => (
             <span key={col.name} class={s.colPill} title={`${col.type}${col.nullable ? '' : ' NOT NULL'}${col.isPrimaryKey ? ' PK' : ''}`}>
               {col.isPrimaryKey && <span class={s.pkMark}>PK</span>}
@@ -584,7 +596,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
         </div>
       )}
 
-      <div class={s.filterBar}>
+      {(filters.value.length > 0 || appliedFilters.value.length > 0) && <div class={s.filterBar}>
         {filters.value.map((f, i) => (
           <span class={s.filterRow} key={i}>
             <select class={s.filterSelect} aria-label={`Filter column ${i + 1}`} value={f.column}
@@ -609,12 +621,11 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
             <button class={s.filterRemove} aria-label={`Remove filter ${i + 1}`} title="Remove this filter" onClick={() => removeFilterRow(i)}>×</button>
           </span>
         ))}
-        <button class={s.filterBtn} onClick={addFilterRow} title="Add an ANDed filter">+ Filter</button>
         <button class={s.filterBtn} onClick={applyFilters}>Apply</button>
         {(appliedFilters.value.length > 0 || filters.value.length > 0) && (
           <button class={s.filterBtn} onClick={clearFilters}>Clear</button>
         )}
-      </div>
+      </div>}
 
       {showInsert.value && (
         <div class={s.insertForm} role="form" aria-label={`Insert row into ${table}`}>
@@ -646,20 +657,20 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
         </div>
       )}
 
-      {meta.value && meta.value.exists && (
+      {showSearch.value && meta.value && meta.value.exists && (
         <TableSearchPanel schema={schemaName} table={table} meta={meta.value} />
       )}
       <div class={s.grid}>
         {loading.value && <div class={s.loading}>Loading…</div>}
         {!loading.value && error.value && <div class={s.error} role="alert">{error.value}</div>}
-        {!loading.value && readOnlyReason.value && (
+        {!loading.value && readOnlyReason.value && !ordinaryReadOnly && (
           <div class={s.readOnlyNote} role="note">{readOnlyReason.value}</div>
         )}
         {!loading.value && res && (
           <DataGrid
             result={res}
-            columns={editable.value ? metaColumns.value : undefined}
-            onStageUpdate={editable.value ? stageUpdate : undefined}
+            columns={canUpdate.value ? metaColumns.value : undefined}
+            onStageUpdate={canUpdate.value ? stageUpdate : undefined}
             onStageDelete={canDelete.value ? stageDelete : undefined}
             canDelete={canDelete.value}
             stagedRows={stagedRows.value}

@@ -13,6 +13,7 @@ import (
 // mockScanRows simulates Nucleus pgwire results for scanRow tests.
 // All column values are text strings, matching real Nucleus behavior.
 type mockScanRows struct {
+	oids   []uint32
 	cols   []string
 	vals   []*string
 	closed bool
@@ -22,6 +23,9 @@ func (m *mockScanRows) FieldDescriptions() []pgconn.FieldDescription {
 	fds := make([]pgconn.FieldDescription, len(m.cols))
 	for i, c := range m.cols {
 		fds[i] = pgconn.FieldDescription{Name: c}
+		if len(m.oids) > i {
+			fds[i].DataTypeOID = m.oids[i]
+		}
 	}
 	return fds
 }

@@ -19,6 +19,7 @@ func init() {
 	generateCmd.Flags().String("table", "", "table name to generate code for")
 	generateCmd.Flags().String("schema", "public", "database schema")
 	generateCmd.Flags().String("lang", "", "target language (go, ts, rust, python, elixir, zig)")
+	generateCmd.Flags().String("profile", "legacy", "read profile (legacy, lossless-read-v1; PostgreSQL scalar TS/Python/Go only)")
 	generateCmd.Flags().String("out", "-", "output file or directory (- for stdout)")
 	generateCmd.Flags().Bool("all", false, "generate code for all tables in schema")
 
@@ -38,6 +39,7 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 	lang, _ := cmd.Flags().GetString("lang")
 	out, _ := cmd.Flags().GetString("out")
 	all, _ := cmd.Flags().GetBool("all")
+	profile, _ := cmd.Flags().GetString("profile")
 
 	// Validate flags
 	if !all && table == "" {
@@ -58,6 +60,10 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 	validLangs := map[string]bool{"go": true, "ts": true, "rust": true, "python": true, "elixir": true, "zig": true}
 	if !validLangs[lang] {
 		return fmt.Errorf("unsupported language: %s", lang)
+	}
+
+	if err := studio.ValidateCodegenProfile(profile, lang); err != nil {
+		return err
 	}
 
 	url := config.DatabaseURL()
@@ -87,17 +93,48 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 		for rows.Next() {
 			var t string
 			if err := rows.Scan(&t); err != nil {
+				if profile == studio.LosslessReadProfile {
+					return fmt.Errorf("scan tables: %w", err)
+				}
 				continue
 			}
 			tables = append(tables, t)
 		}
 
+		if err := rows.Err(); err != nil && profile == studio.LosslessReadProfile {
+			return fmt.Errorf("query table rows: %w", err)
+		}
 		if len(tables) == 0 {
 			ui.Warnf("No tables found in schema %s", schema)
 			return nil
 		}
 	} else {
 		tables = []string{table}
+	}
+
+	if profile == studio.LosslessReadProfile {
+		// Prevalidate batch names and every table before touching any output destination.
+		if err := studio.ValidateCodegenBatch(profile, lang, tables); err != nil {
+			return err
+		}
+		codes := make([]string, len(tables))
+		for i, t := range tables {
+			cols, err := studio.FetchColsForProfile(ctx, client, schema, t, profile)
+			if err != nil {
+				return fmt.Errorf("%s %s.%s: %w", lang, schema, t, err)
+			}
+			codes[i], err = studio.GenerateCodeProfile(profile, lang, t, cols)
+			if err != nil {
+				return err
+			}
+		}
+		for i, t := range tables {
+			if err := writeGeneratedCode(t, lang, out, codes[i], len(tables)); err != nil {
+				return err
+			}
+			ui.Successf("Generated code for %s", t)
+		}
+		return nil
 	}
 
 	// Generate code for each table
@@ -135,6 +172,10 @@ func generateForTable(ctx context.Context, client *db.Client, schema, table, lan
 		return err
 	}
 
+	return writeGeneratedCode(table, lang, out, code, len(cols))
+}
+
+func writeGeneratedCode(table, lang, out, code string, count int) error {
 	// Write output
 	if out == "-" {
 		// Stdout
@@ -153,7 +194,7 @@ func generateForTable(ctx context.Context, client *db.Client, schema, table, lan
 				// Path ends with /, treat as directory
 				os.MkdirAll(out, 0755)
 				filePath = filepath.Join(out, table+extensionForLang(lang))
-			} else if len(cols) == 1 || out == table+extensionForLang(lang) {
+			} else if count == 1 || out == table+extensionForLang(lang) {
 				// Single table or exact filename match
 				filePath = out
 			} else {

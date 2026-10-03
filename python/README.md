@@ -99,3 +99,31 @@ pytest
 
 Live-database tests skip unless `NEUTRON_TEST_DATABASE_URL` points at a running
 Nucleus instance.
+
+## Legacy Python migrations
+
+`await db.migrate("migrations")` applies `NNN_description.sql` files, optionally
+split into up/down sections by `-- DOWN`. The Python runner now requires a
+PostgreSQL direct or session-pooled migration connection with working advisory
+locks. Nucleus and unknown providers are refused before history or application
+DDL changes. The CLI enters the configured `App` user lifespan on its own event
+loop, then calls this directory API once; create and close `app.db` inside that
+lifespan rather than supplying a pool from another event loop.
+
+Use this runner only for an exclusively Python-owned legacy scope. Its
+`_neutron_migrations` history has an INTEGER version primary key, name and
+applied_at; it has no checksum or owner metadata, so edits to applied SQL are
+not detected. Canonical CLI TEXT history, protocol-v2 columns, BIGINT histories
+and other shapes are refused without conversion. Identically shaped legacy
+histories from another runner cannot establish ownership and must not share a
+scope. Use the designated runner for existing foreign histories; there is no
+implicit adoption, checksum fabrication or reset.
+
+Up migrations commit as one PostgreSQL transaction. Status and up use the same
+advisory key as the canonical CLI. Down migrations hold that key on one pinned
+session while each down statement and history deletion commits separately:
+if a later down fails, earlier successful down steps remain committed. Every
+selected missing DOWN section is rejected before the first down runs. The
+runner qualifies history with its admitted schema, and an uncertain unlock
+terminates the session instead of returning a possibly locked pool connection.
+These locks do not make old SDK binaries or other migration protocols cooperate.

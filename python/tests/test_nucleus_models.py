@@ -1279,16 +1279,30 @@ class _FakeConn:
 
     async def execute(self, sql: str, *args):
         s = sql.strip()
-        if s.startswith("DELETE FROM _neutron_migrations"):
+        if s.startswith('DELETE FROM "public"."_neutron_migrations"'):
             self.applied.discard(args[0])
             self.executed.append(("delete", args[0]))
-        elif s.startswith("CREATE TABLE IF NOT EXISTS"):
-            pass  # _ensure_table
+        elif s.startswith(("CREATE TABLE IF NOT EXISTS", "SELECT pg_catalog.pg_advisory_lock")):
+            pass  # history creation and session serialization
         else:
             self.executed.append(("down", sql))
 
     async def fetch(self, sql: str):
         return [{"version": v} for v in self.applied]
+
+    async def fetchval(self, sql, *args):
+        if sql == "SELECT pg_catalog.version()":
+            return "PostgreSQL 17.0"
+        if sql == "SELECT pg_catalog.current_schema()":
+            return "public"
+        if "to_regclass" in sql:
+            return None
+        if "pg_advisory_unlock" in sql:
+            return True
+        raise AssertionError(sql)
+
+    async def fetchrow(self, sql, *args):
+        return None
 
     async def __aenter__(self):
         return self

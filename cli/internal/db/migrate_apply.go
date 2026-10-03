@@ -1510,7 +1510,7 @@ func regclassRef(schema, name string) string {
 // resolves unqualified names through the session search path.
 func (c *Client) RelationExists(ctx context.Context, schema, name string) (bool, error) {
 	var exists bool
-	err := c.pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", regclassRef(schema, name)).Scan(&exists)
+	err := c.pool.QueryRow(ctx, "SELECT pg_catalog.to_regclass($1) IS NOT NULL", regclassRef(schema, name)).Scan(&exists)
 	return exists, err
 }
 
@@ -1525,17 +1525,17 @@ func (c *Client) RelationExists(ctx context.Context, schema, name string) (bool,
 func (c *Client) IndexStatus(ctx context.Context, schema, name string) (exists, valid bool, err error) {
 	err = c.pool.QueryRow(ctx, `
 		SELECT EXISTS (
-			SELECT 1 FROM pg_class ic
-			JOIN pg_namespace n ON n.oid = ic.relnamespace
+			SELECT 1 FROM pg_catalog.pg_class ic
+			JOIN pg_catalog.pg_namespace n ON n.oid = ic.relnamespace
 			WHERE ic.relname = $2
 			  AND ic.relkind = 'i'
 			  AND ($1 = '' OR n.nspname = $1)
 		),
 		COALESCE((
 			SELECT bool_and(i.indisvalid)
-			FROM pg_class ic
-			JOIN pg_namespace n ON n.oid = ic.relnamespace
-			JOIN pg_index i ON i.indexrelid = ic.oid
+			FROM pg_catalog.pg_class ic
+			JOIN pg_catalog.pg_namespace n ON n.oid = ic.relnamespace
+			JOIN pg_catalog.pg_index i ON i.indexrelid = ic.oid
 			WHERE ic.relname = $2
 			  AND ic.relkind = 'i'
 			  AND ($1 = '' OR n.nspname = $1)
@@ -1548,8 +1548,8 @@ func (c *Client) TypeExists(ctx context.Context, schema, name string) (bool, err
 	var exists bool
 	err := c.pool.QueryRow(ctx, `
 		SELECT EXISTS (
-			SELECT 1 FROM pg_type t
-			JOIN pg_namespace n ON n.oid = t.typnamespace
+			SELECT 1 FROM pg_catalog.pg_type t
+			JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
 			WHERE t.typname = $2
 			  AND ($1 = '' OR n.nspname = $1)
 		)`, schema, name).Scan(&exists)
@@ -1560,7 +1560,7 @@ func (c *Client) TypeExists(ctx context.Context, schema, name string) (bool, err
 func (c *Client) SchemaExists(ctx context.Context, name string) (bool, error) {
 	var exists bool
 	err := c.pool.QueryRow(ctx,
-		"SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)", name).Scan(&exists)
+		"SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = $1)", name).Scan(&exists)
 	return exists, err
 }
 
@@ -1756,25 +1756,25 @@ func (c *Client) ProtectedTargetReasons(ctx context.Context, targets []GuardTarg
 	}{
 		{relationT, `
 			SELECT n.nspname, c.relname, e.extname
-			FROM pg_depend d
-			JOIN pg_extension e ON e.oid = d.refobjid
-			JOIN pg_class c ON c.oid = d.objid
-			JOIN pg_namespace n ON n.oid = c.relnamespace
-			WHERE d.deptype = 'e' AND d.classid = 'pg_class'::regclass`},
+			FROM pg_catalog.pg_depend d
+			JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid
+			JOIN pg_catalog.pg_class c ON c.oid = d.objid
+			JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+			WHERE d.deptype = 'e' AND d.classid = 'pg_catalog.pg_class'::regclass`},
 		{typeT, `
 			SELECT n.nspname, t.typname, e.extname
-			FROM pg_depend d
-			JOIN pg_extension e ON e.oid = d.refobjid
-			JOIN pg_type t ON t.oid = d.objid
-			JOIN pg_namespace n ON n.oid = t.typnamespace
-			WHERE d.deptype = 'e' AND d.classid = 'pg_type'::regclass`},
+			FROM pg_catalog.pg_depend d
+			JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid
+			JOIN pg_catalog.pg_type t ON t.oid = d.objid
+			JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+			WHERE d.deptype = 'e' AND d.classid = 'pg_catalog.pg_type'::regclass`},
 		{procT, `
 			SELECT n.nspname, p.proname, e.extname
-			FROM pg_depend d
-			JOIN pg_extension e ON e.oid = d.refobjid
-			JOIN pg_proc p ON p.oid = d.objid
-			JOIN pg_namespace n ON n.oid = p.pronamespace
-			WHERE d.deptype = 'e' AND d.classid = 'pg_proc'::regclass`},
+			FROM pg_catalog.pg_depend d
+			JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid
+			JOIN pg_catalog.pg_proc p ON p.oid = d.objid
+			JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+			WHERE d.deptype = 'e' AND d.classid = 'pg_catalog.pg_proc'::regclass`},
 	} {
 		if len(class.list) == 0 {
 			continue
@@ -1834,13 +1834,13 @@ func (c *Client) ProtectedTargetReasons(ctx context.Context, targets []GuardTarg
 		nsSelect, nsJoin := "'', ", ""
 		if cat.nsCol != "" {
 			nsSelect = "n.nspname, "
-			nsJoin = " JOIN pg_namespace n ON n.oid = o." + cat.nsCol
+			nsJoin = " JOIN pg_catalog.pg_namespace n ON n.oid = o." + cat.nsCol
 		}
 		rows, err := c.pool.Query(ctx, `SELECT `+nsSelect+`o.`+cat.nameCol+`, e.extname
-			FROM pg_depend d
-			JOIN pg_extension e ON e.oid = d.refobjid
-			JOIN `+cat.class+` o ON o.oid = d.objid`+nsJoin+`
-			WHERE d.deptype = 'e' AND d.classid = '`+cat.class+`'::regclass`)
+			FROM pg_catalog.pg_depend d
+			JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid
+			JOIN pg_catalog.`+cat.class+` o ON o.oid = d.objid`+nsJoin+`
+			WHERE d.deptype = 'e' AND d.classid = 'pg_catalog.`+cat.class+`'::regclass`)
 		if err != nil {
 			return nil, err
 		}
@@ -1872,7 +1872,7 @@ func (c *Client) ProtectedTargetReasons(ctx context.Context, targets []GuardTarg
 	for _, t := range extensionDrops {
 		var members int
 		if err := c.pool.QueryRow(ctx,
-			`SELECT count(*) FROM pg_depend d JOIN pg_extension e ON e.oid = d.refobjid WHERE d.deptype = 'e' AND e.extname = $1`,
+			`SELECT pg_catalog.count(*) FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid WHERE d.deptype = 'e' AND e.extname = $1`,
 			t.Name.Name).Scan(&members); err != nil {
 			return nil, err
 		}
@@ -1970,29 +1970,29 @@ func (c *Client) protectedObjectsInSchema(ctx context.Context, schema string) ([
 	rows, err := c.pool.Query(ctx, `
 		SELECT label FROM (
 			SELECT n.nspname || '.' || c.relname AS label
-			FROM pg_depend d
-			JOIN pg_extension e ON e.oid = d.refobjid
-			JOIN pg_class c ON c.oid = d.objid
-			JOIN pg_namespace n ON n.oid = c.relnamespace
-			WHERE d.deptype = 'e' AND d.classid = 'pg_class'::regclass AND n.nspname = $1
+			FROM pg_catalog.pg_depend d
+			JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid
+			JOIN pg_catalog.pg_class c ON c.oid = d.objid
+			JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+			WHERE d.deptype = 'e' AND d.classid = 'pg_catalog.pg_class'::regclass AND n.nspname = $1
 			UNION
 			SELECT n.nspname || '.' || t.typname
-			FROM pg_depend d
-			JOIN pg_extension e ON e.oid = d.refobjid
-			JOIN pg_type t ON t.oid = d.objid
-			JOIN pg_namespace n ON n.oid = t.typnamespace
-			WHERE d.deptype = 'e' AND d.classid = 'pg_type'::regclass AND n.nspname = $1
+			FROM pg_catalog.pg_depend d
+			JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid
+			JOIN pg_catalog.pg_type t ON t.oid = d.objid
+			JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+			WHERE d.deptype = 'e' AND d.classid = 'pg_catalog.pg_type'::regclass AND n.nspname = $1
 			UNION
 			SELECT n.nspname || '.' || p.proname
-			FROM pg_depend d
-			JOIN pg_extension e ON e.oid = d.refobjid
-			JOIN pg_proc p ON p.oid = d.objid
-			JOIN pg_namespace n ON n.oid = p.pronamespace
-			WHERE d.deptype = 'e' AND d.classid = 'pg_proc'::regclass AND n.nspname = $1
+			FROM pg_catalog.pg_depend d
+			JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid
+			JOIN pg_catalog.pg_proc p ON p.oid = d.objid
+			JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+			WHERE d.deptype = 'e' AND d.classid = 'pg_catalog.pg_proc'::regclass AND n.nspname = $1
 			UNION
 			SELECT n.nspname || '.' || c.relname
-			FROM pg_class c
-			JOIN pg_namespace n ON n.oid = c.relnamespace
+			FROM pg_catalog.pg_class c
+			JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 			WHERE c.relname LIKE '\_neutron%' AND n.nspname = $1
 		) q LIMIT 10`, schema)
 	if err != nil {
@@ -2033,26 +2033,26 @@ func (c *Client) protectedObjectsInSchema(ctx context.Context, schema string) ([
 //     projection below names the owning relation.
 const cascadeProtectedQueryHead = `
 	WITH RECURSIVE prot(oid, classid) AS (
-		SELECT d.objid, d.classid FROM pg_depend d WHERE d.deptype = 'e'
+		SELECT d.objid, d.classid FROM pg_catalog.pg_depend d WHERE d.deptype = 'e'
 		UNION
-		SELECT cl.oid, 'pg_class'::regclass FROM pg_class cl
-		JOIN pg_namespace n ON n.oid = cl.relnamespace
+		SELECT cl.oid, 'pg_catalog.pg_class'::regclass FROM pg_catalog.pg_class cl
+		JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace
 		WHERE cl.relname LIKE '\_neutron%'
 		UNION
-		SELECT ty.oid, 'pg_type'::regclass FROM pg_type ty
-		JOIN pg_namespace n ON n.oid = ty.typnamespace
+		SELECT ty.oid, 'pg_catalog.pg_type'::regclass FROM pg_catalog.pg_type ty
+		JOIN pg_catalog.pg_namespace n ON n.oid = ty.typnamespace
 		WHERE ty.typname LIKE '\_neutron%'
 		UNION
-		SELECT d.objid, d.classid FROM pg_depend d
-		WHERE d.refclassid = 'pg_class'::regclass
+		SELECT d.objid, d.classid FROM pg_catalog.pg_depend d
+		WHERE d.refclassid = 'pg_catalog.pg_class'::regclass
 			AND d.deptype IN ('a', 'i')
 			AND d.refobjid IN (
-				SELECT cl.oid FROM pg_class cl
-				JOIN pg_namespace n ON n.oid = cl.relnamespace
+				SELECT cl.oid FROM pg_catalog.pg_class cl
+				JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace
 				WHERE cl.relname LIKE '\_neutron%'
 				UNION
-				SELECT e.objid FROM pg_depend e
-				WHERE e.deptype = 'e' AND e.classid = 'pg_class'::regclass
+				SELECT e.objid FROM pg_catalog.pg_depend e
+				WHERE e.deptype = 'e' AND e.classid = 'pg_catalog.pg_class'::regclass
 			)
 	),
 	dep(oid, classid) AS (
@@ -2061,21 +2061,21 @@ const cascadeProtectedQueryHead = `
 const cascadeProtectedQueryTail = `
 		UNION
 		SELECT y.oid, y.classid FROM dep CROSS JOIN LATERAL (
-			SELECT d2.objid AS oid, d2.classid AS classid FROM pg_depend d2
+			SELECT d2.objid AS oid, d2.classid AS classid FROM pg_catalog.pg_depend d2
 			WHERE d2.refclassid = dep.classid AND d2.refobjid = dep.oid
 			UNION ALL
-			SELECT r.ev_class, 'pg_class'::regclass FROM pg_rewrite r
-			WHERE dep.classid = 'pg_rewrite'::regclass AND r.oid = dep.oid
+			SELECT r.ev_class, 'pg_catalog.pg_class'::regclass FROM pg_catalog.pg_rewrite r
+			WHERE dep.classid = 'pg_catalog.pg_rewrite'::regclass AND r.oid = dep.oid
 		) y
 	)
 	SELECT COALESCE(
-		(SELECT 'pg_class ' || n.nspname || '.' || cl.relname FROM pg_class cl JOIN pg_namespace n ON n.oid = cl.relnamespace WHERE cl.oid = p.oid AND p.classid = 'pg_class'::regclass),
-		(SELECT 'pg_proc ' || n.nspname || '.' || pr.proname FROM pg_proc pr JOIN pg_namespace n ON n.oid = pr.pronamespace WHERE pr.oid = p.oid AND p.classid = 'pg_proc'::regclass),
-		(SELECT 'pg_type ' || n.nspname || '.' || ty.typname FROM pg_type ty JOIN pg_namespace n ON n.oid = ty.typnamespace WHERE ty.oid = p.oid AND p.classid = 'pg_type'::regclass),
-		(SELECT 'pg_class ' || n.nspname || '.' || cl.relname || ' (attached constraint)' FROM pg_constraint cn JOIN pg_class cl ON cl.oid = cn.conrelid JOIN pg_namespace n ON n.oid = cl.relnamespace WHERE cn.oid = p.oid AND p.classid = 'pg_constraint'::regclass),
-		(SELECT 'pg_class ' || n.nspname || '.' || cl.relname || ' (attached default)' FROM pg_attrdef ad JOIN pg_class cl ON cl.oid = ad.adrelid JOIN pg_namespace n ON n.oid = cl.relnamespace WHERE ad.oid = p.oid AND p.classid = 'pg_attrdef'::regclass),
-		(SELECT 'pg_class ' || n.nspname || '.' || cl.relname || ' (attached trigger)' FROM pg_trigger tg JOIN pg_class cl ON cl.oid = tg.tgrelid JOIN pg_namespace n ON n.oid = cl.relnamespace WHERE tg.oid = p.oid AND p.classid = 'pg_trigger'::regclass),
-		(SELECT 'pg_class ' || n.nspname || '.' || cl.relname || ' (attached rule)' FROM pg_rewrite rw JOIN pg_class cl ON cl.oid = rw.ev_class JOIN pg_namespace n ON n.oid = cl.relnamespace WHERE rw.oid = p.oid AND p.classid = 'pg_rewrite'::regclass),
+		(SELECT 'pg_class ' || n.nspname || '.' || cl.relname FROM pg_catalog.pg_class cl JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace WHERE cl.oid = p.oid AND p.classid = 'pg_catalog.pg_class'::regclass),
+		(SELECT 'pg_proc ' || n.nspname || '.' || pr.proname FROM pg_catalog.pg_proc pr JOIN pg_catalog.pg_namespace n ON n.oid = pr.pronamespace WHERE pr.oid = p.oid AND p.classid = 'pg_catalog.pg_proc'::regclass),
+		(SELECT 'pg_type ' || n.nspname || '.' || ty.typname FROM pg_catalog.pg_type ty JOIN pg_catalog.pg_namespace n ON n.oid = ty.typnamespace WHERE ty.oid = p.oid AND p.classid = 'pg_catalog.pg_type'::regclass),
+		(SELECT 'pg_class ' || n.nspname || '.' || cl.relname || ' (attached constraint)' FROM pg_catalog.pg_constraint cn JOIN pg_catalog.pg_class cl ON cl.oid = cn.conrelid JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace WHERE cn.oid = p.oid AND p.classid = 'pg_catalog.pg_constraint'::regclass),
+		(SELECT 'pg_class ' || n.nspname || '.' || cl.relname || ' (attached default)' FROM pg_catalog.pg_attrdef ad JOIN pg_catalog.pg_class cl ON cl.oid = ad.adrelid JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace WHERE ad.oid = p.oid AND p.classid = 'pg_catalog.pg_attrdef'::regclass),
+		(SELECT 'pg_class ' || n.nspname || '.' || cl.relname || ' (attached trigger)' FROM pg_catalog.pg_trigger tg JOIN pg_catalog.pg_class cl ON cl.oid = tg.tgrelid JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace WHERE tg.oid = p.oid AND p.classid = 'pg_catalog.pg_trigger'::regclass),
+		(SELECT 'pg_class ' || n.nspname || '.' || cl.relname || ' (attached rule)' FROM pg_catalog.pg_rewrite rw JOIN pg_catalog.pg_class cl ON cl.oid = rw.ev_class JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace WHERE rw.oid = p.oid AND p.classid = 'pg_catalog.pg_rewrite'::regclass),
 		p.classid::regclass::text || ' ' || p.oid::text)
 	FROM dep JOIN prot p ON p.oid = dep.oid AND p.classid = dep.classid
 	LIMIT 10`
@@ -2104,15 +2104,15 @@ func (c *Client) queryCascadeProtected(ctx context.Context, seedSQL string, args
 // relations and types, and metadata attached to protected relations.
 func (c *Client) cascadeDependentsProtected(ctx context.Context, name QualifiedName) ([]string, error) {
 	var oid *uint32
-	if err := c.pool.QueryRow(ctx, "SELECT to_regclass($1)::oid", regclassRef(name.Schema, name.Name)).Scan(&oid); err != nil {
+	if err := c.pool.QueryRow(ctx, "SELECT pg_catalog.to_regclass($1)::oid", regclassRef(name.Schema, name.Name)).Scan(&oid); err != nil {
 		return nil, err
 	}
 	if oid == nil {
 		return nil, nil
 	}
 	return c.queryCascadeProtected(ctx,
-		`SELECT d.objid, d.classid FROM pg_depend d
-		WHERE d.refclassid = 'pg_class'::regclass AND d.refobjid = $1`, *oid)
+		`SELECT d.objid, d.classid FROM pg_catalog.pg_depend d
+		WHERE d.refclassid = 'pg_catalog.pg_class'::regclass AND d.refobjid = $1`, *oid)
 }
 
 // cascadeSeedCatalog is the catalog class a non-relation drop kind's named
@@ -2177,15 +2177,15 @@ func (c *Client) cascadeNamedKindDependentsProtected(ctx context.Context, kind s
 	join, match := "", ""
 	args := []any{name.Name}
 	if cat.nsCol != "" {
-		join = "JOIN pg_namespace n ON n.oid = o." + cat.nsCol
+		join = "JOIN pg_catalog.pg_namespace n ON n.oid = o." + cat.nsCol
 		match = " AND ($1 = '' OR n.nspname = $1)"
 		args = append([]any{name.Schema}, args...)
 	}
-	seed := `SELECT d.objid, d.classid FROM pg_depend d
+	seed := `SELECT d.objid, d.classid FROM pg_catalog.pg_depend d
 		WHERE EXISTS (
-			SELECT 1 FROM ` + cat.class + ` o ` + join + `
+			SELECT 1 FROM pg_catalog.` + cat.class + ` o ` + join + `
 			WHERE o.` + cat.nameCol + ` = $` + fmt.Sprint(len(args)) + match + `
-				AND d.refclassid = '` + cat.class + `'::regclass AND o.oid = d.refobjid
+				AND d.refclassid = 'pg_catalog.` + cat.class + `'::regclass AND o.oid = d.refobjid
 		)`
 	return c.queryCascadeProtected(ctx, seed, args...)
 }
@@ -2204,9 +2204,9 @@ func (c *Client) cascadeNamedKindDependentsProtected(ctx context.Context, kind s
 // the schema are protectedObjectsInSchema's business (message listing).
 func (c *Client) cascadeSchemaDependentsProtected(ctx context.Context, schema string) ([]string, error) {
 	return c.queryCascadeProtected(ctx,
-		`SELECT d.objid, d.classid FROM pg_depend d
-		WHERE d.refclassid = 'pg_namespace'::regclass
-			AND d.refobjid = (SELECT oid FROM pg_namespace WHERE nspname = $1)`, schema)
+		`SELECT d.objid, d.classid FROM pg_catalog.pg_depend d
+		WHERE d.refclassid = 'pg_catalog.pg_namespace'::regclass
+			AND d.refobjid = (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = $1)`, schema)
 }
 
 // ---------------------------------------------------------------------------
@@ -2402,8 +2402,11 @@ func (s *MigrationSession) RecordAppliedVersion(ctx context.Context, mf Migratio
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	if err := s.namespace.validate(ctx, tx); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx,
-		"INSERT INTO _neutron_migrations (version, name, checksum, owner, format) VALUES ($1, $2, $3, $4, $5)",
+		"INSERT INTO "+s.namespace.table()+" (version, name, checksum, owner, format) VALUES ($1, $2, $3, $4, $5)",
 		mf.Version, mf.Name, MigrationChecksum(mf.SQL), MigrationOwnerCLI, MigrationHistoryFormat,
 	); err != nil {
 		return fmt.Errorf("record migration %s: %w", mf.Version, err)

@@ -13,9 +13,9 @@
 .panel {
   width: 560px;
   max-width: calc(100vw - 48px);
-  background: var(--bg-panel);
+  background: var(--bg-overlay);
   border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
+  border-radius: 12px;
   box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
   overflow: hidden;
 }
@@ -24,7 +24,7 @@
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  padding: var(--space-3) var(--space-3);
+  padding: 16px;
   border-bottom: 1px solid var(--border);
 }
 
@@ -60,7 +60,7 @@
 .list {
   max-height: 360px;
   overflow-y: auto;
-  padding: var(--space-1) 0;
+  padding: 6px;
 }
 
 .item {
@@ -68,10 +68,12 @@
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
+  padding: 8px 10px;
   font-size: var(--text-sm);
   text-align: left;
   transition: background var(--transition);
+  border-radius: 6px;
+  min-height: 36px;
 }
 
 .item:hover {
@@ -105,4 +107,8 @@
   font-size: var(--text-sm);
   color: var(--text-tertiary);
   text-align: center;
+}
+
+@media (max-width: 680px) {
+.overlay { padding-top: 10vh; } .panel { max-width: calc(100vw - 24px); } .list { max-height: 60vh; }
 }

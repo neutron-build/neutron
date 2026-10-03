@@ -43,13 +43,9 @@ type connectionStore struct {
 }
 
 func newConnectionStore() (*connectionStore, error) {
-	home, err := os.UserHomeDir()
+	dir, err := studioStateDir()
 	if err != nil {
-		return nil, fmt.Errorf("home dir: %w", err)
-	}
-	dir := filepath.Join(home, ".neutron")
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return nil, fmt.Errorf("create ~/.neutron: %w", err)
+		return nil, err
 	}
 	path := filepath.Join(dir, "studio.json")
 	s := &connectionStore{path: path}

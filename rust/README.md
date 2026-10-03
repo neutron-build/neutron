@@ -348,3 +348,15 @@ deliberate, stated decisions rather than oversights:
 ## License
 
 MIT
+
+## Legacy SQL migration boundary
+
+`neutron_postgres::migrate` and `neutron_nucleusdb::migrate` retain their existing filename-only ledgers for legacy PostgreSQL applications. These histories are unverified and drift-blind: changing the SQL of an applied filename does not rerun it or detect drift. New managed applications should use the language-neutral Neutron CLI migration authority. The Rust runners refuse CLI or the other Rust runner's history in the admitted schema; they do not adopt or reset it.
+
+The filename runners require PostgreSQL catalog and transaction semantics and refuse Nucleus or unavailable catalog evidence before metadata creation. This restriction applies to migration runners; query clients remain independent. History must be an ordinary permanent table with native `TEXT` name primary key and native `TIMESTAMPTZ` applied time in a persistent application schema. Temporary shadows, later-schema history ambiguity and incompatible history shapes are refused.
+
+Regular UTF-8 `.sql` files are captured before a connection or migration lock is awaited, then applied in filename order. `.up.sql`/`.down.sql` naming is refused; use the CLI for paired migrations. A session advisory lock serializes the invocation with the CLI key. Each pending file commits separately; a failed step rolls back while earlier committed steps remain. Supplied SQL is trusted application migration SQL, not a hostile-author sandbox, and must not manage the runner's transactions or protected metadata.
+
+Cancellation or an unconfirmed unlock discards the checked-out connection instead of returning an uncertain session to the pool. PostgreSQL may finish an in-flight statement before its driver disconnects: cancellation does not prove immediate rollback, immediate lock release, or absence of committed effects. An unknown commit outcome is reported without automatic retry; inspect the database before deciding how to proceed.
+
+Optional live regressions use `NEUTRON_TEST_DATABASE_URL`, a disposable TCP PostgreSQL admin URL with permission to create databases. Run `cargo test -p neutron-postgres -p neutron-nucleusdb --no-default-features --test migration_containment -- --test-threads=1` from `rust/`. Tests create and drop their own `v10_rust_containment_*` databases; without the URL, they report that live coverage was skipped.
