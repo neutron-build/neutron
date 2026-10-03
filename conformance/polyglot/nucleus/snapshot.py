@@ -27,6 +27,8 @@ def snapshot(args):
         tree=args.nucleus_tree
         if not tree: raise ValueError('archive requires coordinator-captured nucleus tree')
     else:
+        if subprocess.check_output(['git','status','--porcelain','--','nucleus'],cwd=root,text=True).strip():
+            raise ValueError('dirty engine source cannot claim the assessed committed tree')
         revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
         tree=subprocess.check_output(['git','rev-parse','HEAD:nucleus'],cwd=root,text=True).strip()
     if not re.fullmatch('[0-9a-f]{40}',revision) or not re.fullmatch('[0-9a-f]{40}',tree): raise ValueError('exact source/tree identity required')
@@ -50,7 +52,8 @@ def snapshot(args):
         binary=args.binary.resolve();digest=sha(binary)
         if provenance.get('nucleus_tree')!=tree or provenance.get('binary_sha256')!=digest or not re.fullmatch('[0-9a-f]{40}',provenance.get('source_revision','')):
             raise ValueError('binary/provenance does not bind assessed engine tree')
-        report['binary']={'sha256':digest,'provenance_sha256':sha(args.binary_provenance),'provenance':provenance}
+        fields=('source_revision','nucleus_tree','binary_sha256','toolchain_sha256','build_config_sha256')
+        report['binary']={'sha256':digest,'provenance_sha256':sha(args.binary_provenance),'provenance':{name:provenance[name] for name in fields if name in provenance}}
     args.output.parent.mkdir(parents=True,exist_ok=True)
     args.output.write_text(json.dumps(report,indent=2)+'\n')
     print(json.dumps({'status':report['status'],'output':str(args.output),'profile':profile['profile'],'package_enabled':False}))

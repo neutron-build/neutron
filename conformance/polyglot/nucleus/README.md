@@ -12,7 +12,7 @@ The assessed engine tree is `315b1720f6e2292e7c85e8fec4805886340e0ff8`.
 The canonical historical TypeScript recording instead binds tree
 `3c5c6035b5e6602cf65ba23c917fe83848888571`, source `59fad7ae...`, binary
 `be4fc47554fd2be9d060d3221b14425b11db52dc3bfa0852e1be7943990e1c6a`,
-pg8.22.0/postgres.js3.4.8 and Node22.23.2. Its143 per-driver probes cover their
+pg 8.22.0/postgres.js 3.4.8 and Node 22.23.2. Its 143 per-driver probes cover their
 individual contracts. They cannot be relabeled as this tree's qualification,
 Python/Go evidence, or an arbitrary future binary's certificate. The original
 report remains authoritative for its own recording and is not edited here.
@@ -21,7 +21,7 @@ report remains authoritative for its own recording and is not edited here.
 
 | Current client shape | Source route / existing independent probe | Assessment boundary |
 |---|---|---|
-| Quoted schema/table + bound SELECT/WHERE/LIMIT | Go `orm/metadata.go:115`, `query.go:207`; Python `orm/core.py:87`; Nucleus wire parameter decoding and SQL parser; historical `orm.select_where`, scalar codec probes | Candidate must use actual installed compiler output and hostile-search_path fixture. A source implementation or one parser sample does not prove every query. |
+| Quoted schema/table + bound SELECT/WHERE/LIMIT | Go `orm/metadata.go:115`, `query.go:207`; Python `orm/core.py:87`; Nucleus wire parameter decoding and SQL parser; historical `orm.select_where_order_limit`, scalar codec probes | Candidate must use actual installed compiler output and hostile-search_path fixture. A source implementation or one parser sample does not prove every query. |
 | Bound INSERT/UPDATE/DELETE + RETURNING; explicit zero/false/empty | Python `core.py:249`; Go `write.go`, TS builders; engine DML/RETURNING; historical DML/ORM probes | Candidate excludes UPDATE FROM/DELETE USING and universal graph policy. Exact affected counts and native row oracles required. |
 | BEGIN READ COMMITTED / READ ONLY / SAVEPOINT / ROLLBACK TO / RELEASE | `nucleus/src/executor/txn.rs:495`, `txn_modes.rs`; historical `txn.read_committed_sees_commits`, `txn.read_only_rejects_writes`, both savepoint probes; `probe_sessions`, `probe_txn_atomicity` | Source supports bounded modes; buffered-disk refuses stronger isolation0A000. New Session/Scope lifetime, caught-failure poisoning and commit outcomes still need fresh clients. |
 | Integer/bool/text/jsonb/timestamptz fields; binary pgx/psycopg and text Node results | `wire/mod.rs:3888` numeric decode, `:5220` temporal binary values, `:5276` result OID map, `:5405` JSONB header; `tests_row_description.rs`, `probe_decode_honesty`, `probe_types` | Candidate int8/temporal precision/NULL distinctions need native PostgreSQL controls and both wire formats. Nucleus Text returns VARCHAR1043 rather than PostgreSQL TEXT25; record named-profile difference, never scalar-OID parity. |
@@ -56,7 +56,7 @@ python3 -I conformance/polyglot/nucleus/snapshot.py --source . --output /tmp/neu
 ```
 
 An archived source tree additionally needs the coordinator-captured
-`--nucleus-tree315b1720f6e2292e7c85e8fec4805886340e0ff8` as two argv words.
+`--nucleus-tree 315b1720f6e2292e7c85e8fec4805886340e0ff8`.
 The script hashes every referenced source and contract fixture. It refuses
 changed engine trees, package enablement or a fixture relabeled as executed.
 Optional `--binary` plus `--binary-provenance` binds a real binary SHA to a JSON
@@ -77,7 +77,7 @@ qualification fixture.
 Run the documented Rust format/lib/clippy/core-only/metrics checks and required
 independent probes after engine changes. The server production buffered-disk
 path must be exercised; default MVCC fuzzing cannot substitute for it. Run
-the ORM live suite against PostgreSQL17 as control first, then the exact named
+the ORM live suite against PostgreSQL 17 as control first, then the exact named
 Nucleus binary through both Node adapters, and freshly installed Python sync/
 async and Go clients once NP01 is implemented. Capture actual SQL/parameter
 profiles, text/binary results, native state, faults, source/toolchain/binary
@@ -85,7 +85,7 @@ hashes and independent reviewer verdicts. Compatibility smoke harnesses that
 SKIP missing tools are not mandatory polyglot qualification.
 
 The documented `probe_recover_engines --skip-section catalog` holdout has expiry
-2026-09-30 and is still present in source. At this assessment's2026-10-03 date,
+2026-09-30 and is still present in source. At this assessment's 2026-10-03 date,
 that requires current gate resolution or explicit remaining release blockage;
 silently extending or counting skipped catalog coverage as passing is forbidden.
 Historical SIGKILL recovery is not proof of power-loss durability. No native
