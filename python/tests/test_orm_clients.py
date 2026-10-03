@@ -81,7 +81,7 @@ class CommitFailureConnection(Connection):
         yield
         raise NativeFailure(self.state)
 
-@pytest.mark.parametrize('state,outcome',[(None,'indeterminate'),('40001','aborted')])
+@pytest.mark.parametrize('state,outcome',[(None,'indeterminate'),('40001','aborted'),('08006','indeterminate'),('08007','indeterminate'),('40003','indeterminate'),('XX000','indeterminate')])
 def test_commit_failure_keeps_known_or_unknown_outcome(state,outcome):
     db=Database(CommitFailureConnection(state))
     with pytest.raises(OrmError) as exc:
@@ -95,3 +95,59 @@ def test_transaction_does_not_mask_business_exception():
     db=Database(Connection([]))
     with pytest.raises(ValueError,match='business'):
         with db.transaction(): raise ValueError('business')
+
+
+class RollbackFailureConnection(Connection):
+    @contextmanager
+    def transaction(self):
+        try: yield
+        finally: raise NativeFailure('08006')
+
+def test_rollback_cleanup_failure_fences_connection():
+    conn=RollbackFailureConnection([]);db=Database(conn)
+    with pytest.raises(OrmError):
+        with db.transaction(): raise ValueError('business')
+    assert conn.closed
+    with pytest.raises(OrmError,match='closed'): db.all(QUERY)
+
+class FakePGConn:
+    def __init__(self): self.finished=False
+    def finish(self): self.finished=True
+
+class SlowRollbackConnection(AsyncConnection):
+    def __init__(self):
+        super().__init__([]);self.cleanup_started=asyncio.Event();self.never=asyncio.Event();self.pgconn=FakePGConn()
+    @asynccontextmanager
+    async def transaction(self):
+        try: yield
+        finally:
+            self.cleanup_started.set();await self.never.wait()
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_during_rollback_discards():
+    conn=SlowRollbackConnection();db=AsyncDatabase(conn);body=asyncio.Event()
+    async def work():
+        async with db.transaction():
+            body.set();await asyncio.Event().wait()
+    task=asyncio.create_task(work());await body.wait()
+    task.cancel();await conn.cleanup_started.wait();task.cancel()
+    with pytest.raises(asyncio.CancelledError): await task
+    assert conn.pgconn.finished
+    with pytest.raises(OrmError,match='closed'): await db.all(QUERY)
+
+@pytest.mark.asyncio
+async def test_async_connect_sanitizes_driver_error(monkeypatch):
+    import psycopg
+    async def broken(*args,**kwargs): raise ValueError('postgresql://user:secret@host/db')
+    monkeypatch.setattr(psycopg.AsyncConnection,'connect',broken)
+    with pytest.raises(OrmError) as exc: await AsyncDatabase.connect('postgresql://user:secret@host/db')
+    assert 'secret' not in str(exc.value)
+    assert isinstance(exc.value.__cause__,ValueError)
+
+def test_sync_connect_sanitizes_driver_error(monkeypatch):
+    import psycopg
+    def broken(*args,**kwargs): raise ValueError('postgresql://user:secret@host/db')
+    monkeypatch.setattr(psycopg,'connect',broken)
+    with pytest.raises(OrmError) as exc: Database.connect('postgresql://user:secret@host/db')
+    assert 'secret' not in str(exc.value)
+    assert isinstance(exc.value.__cause__,ValueError)

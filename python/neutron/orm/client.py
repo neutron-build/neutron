@@ -87,9 +87,10 @@ class Database:
     def transaction(self) -> Iterator[Database]:
         if self._owner is not None: raise SessionBusyError('nested transaction unsupported in this slice')
         with self._use(): self._owner=threading.get_ident()
-        native=self._conn.transaction()
         try:
-            try: native.__enter__()
+            try:
+                native=self._conn.transaction()
+                native.__enter__()
             except Exception as exc:
                 self._discard(); raise _native(exc) from exc
             try:
@@ -113,7 +114,9 @@ class Database:
         if self._closed: return
         if self._owner is not None: raise SessionBusyError('close during active transaction refused')
         with self._use():
-            self._conn.close(); self._closed=True
+            self._closed=True
+            try: self._conn.close()
+            except Exception as exc: raise _native(exc) from exc
 
     def __enter__(self) -> Database: return self
     def __exit__(self, *_: object) -> None: self.close()
@@ -201,9 +204,10 @@ class AsyncDatabase:
     async def transaction(self) -> AsyncIterator[AsyncDatabase]:
         if self._owner is not None: raise SessionBusyError('nested transaction unsupported in this slice')
         async with self._use(): self._owner=asyncio.current_task()
-        native=self._conn.transaction()
         try:
-            try: await native.__aenter__()
+            try:
+                native=self._conn.transaction()
+                await native.__aenter__()
             except BaseException as entry:
                 self._discard()
                 if isinstance(entry,Exception): raise _native(entry) from entry
@@ -229,7 +233,12 @@ class AsyncDatabase:
         if self._closed: return
         if self._owner is not None: raise SessionBusyError('close during active transaction refused')
         async with self._use():
-            await self._conn.close(); self._closed=True
+            self._closed=True
+            try: await self._conn.close()
+            except BaseException as cleanup:
+                self._discard()
+                if isinstance(cleanup,Exception): raise _native(cleanup) from cleanup
+                raise
 
     async def __aenter__(self) -> AsyncDatabase: return self
     async def __aexit__(self,*_: object) -> None: await self.close()
