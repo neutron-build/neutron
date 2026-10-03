@@ -38,3 +38,24 @@ async def test_native_async_json_null(live_table):
         assert await db.one(select(t.nullable_column('b',JsonDocument)))==JSON_NULL
         assert await db.one(select(t.nullable_column('j',JsonDocument))) is None
         assert native.execute(f'SELECT b IS NULL,b::text,j IS NULL FROM {t.sql}').fetchone()==(False,'null',True)
+
+
+def test_native_mapped_jsonb_replacement_rollback(live_table):
+    from dataclasses import dataclass
+    from neutron.orm import ModelMapping, Session
+    url,parent,native=live_table;t=setup_json(parent,native)
+    @dataclass
+    class Document:
+        id: int
+        value: JsonDocument | None
+    mapping=ModelMapping(Document,t,{'id':t.column('id',int),'value':t.nullable_column('b',JsonDocument)},primary_key=('id',))
+    with Database.connect(url) as db:
+        with Session(db) as session:
+            obj=Document(1,JSON_NULL)
+            session.add(mapping,obj);session.commit()
+            assert native.execute(f'SELECT b IS NULL,b::text FROM {t.sql}').fetchone()==(False,'null')
+            obj.value=JsonDocument('{"n":12345678901234567890.123456789}')
+            session.flush();session.rollback()
+            assert obj.value==JSON_NULL
+            obj.value=None;session.commit()
+            assert native.execute(f'SELECT b IS NULL FROM {t.sql}').fetchone()==(True,)
