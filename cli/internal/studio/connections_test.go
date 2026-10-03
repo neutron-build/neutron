@@ -27,6 +27,8 @@ func TestMaskedURL(t *testing.T) {
 			"postgres://localhost:5432/db",
 			"postgres://localhost:5432/db",
 		},
+		{"malformed path encoding", "postgres://localhost/%zz?password=secret", "[redacted invalid connection URI]"},
+		{"invalid authority", "postgres://[invalid/db?password=secret", "[redacted invalid connection URI]"},
 		{"query password", "postgres://user@localhost/db?password=secret", "postgres://user@localhost/db?password=%2A%2A%2A"},
 		{"encoded query password key", "postgres://localhost/db?%70assword=secret&password=second", "postgres://localhost/db?password=%2A%2A%2A"},
 		{"keyword password", "host=localhost user=admin password=secret dbname=app", "host=localhost user=admin password=*** dbname=app"},
@@ -80,6 +82,8 @@ func TestNucleusModels(t *testing.T) {
 func TestSavedConnectionResponseRedactsAlternatePasswordForms(t *testing.T) {
 	s := &Server{store: &connectionStore{connections: []SavedConnection{
 		{ID: "query", Name: "query", URL: "postgres://localhost/db?%70assword=secret_query&password=second_secret"},
+		{ID: "invalid-path", Name: "invalid-path", URL: "postgres://localhost/%zz?password=secret_invalid_path"},
+		{ID: "invalid-host", Name: "invalid-host", URL: "postgres://[invalid/db?password=secret_invalid_host"},
 		{ID: "keyword", Name: "keyword", URL: "host=localhost password='secret keyword' dbname=app"},
 	}}}
 	recorder := httptest.NewRecorder()
@@ -87,7 +91,7 @@ func TestSavedConnectionResponseRedactsAlternatePasswordForms(t *testing.T) {
 	if recorder.Code != 200 {
 		t.Fatalf("status %d", recorder.Code)
 	}
-	for _, secret := range []string{"secret_query", "second_secret", "secret keyword"} {
+	for _, secret := range []string{"secret_query", "second_secret", "secret keyword", "secret_invalid_path", "secret_invalid_host"} {
 		if strings.Contains(recorder.Body.String(), secret) {
 			t.Fatalf("saved connection response leaked a password")
 		}

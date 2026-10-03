@@ -59,6 +59,9 @@ func MaskedURL(raw string) string {
 				u.RawQuery = "redacted"
 				masked = u.String()
 			}
+		} else {
+			// Saved input need not be valid; never echo an unparseable URI.
+			return "[redacted invalid connection URI]"
 		}
 	}
 	return masked
