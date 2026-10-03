@@ -77,10 +77,10 @@ with tempfile.TemporaryDirectory(prefix="neutron-sdk-example-") as directory:
     package = json.loads(manifest.read_text())
     package["dependencies"]["@neutron-build/core"] = "file:" + glob.glob(str(packs / "neutron-build-core-*.tgz"))[0]
     package["dependencies"]["@neutron-build/cli"] = "file:" + glob.glob(str(packs / "neutron-build-cli-*.tgz"))[0]
-    # The packed cli depends on create-neutron at the same release; when that
+    # The packed CLI depends on @neutron-build/create at the same release; when that
     # version is not published yet npm cannot resolve it, so it is packed and
     # overridden too.
-    package["overrides"] = {"create-neutron": "file:" + glob.glob(str(packs / "create-neutron-*.tgz"))[0]}
+    package["overrides"] = {"@neutron-build/create": "file:" + glob.glob(str(packs / "neutron-build-create-*.tgz"))[0]}
     manifest.write_text(json.dumps(package, indent=2))
     subprocess.run(["npm", "install", "--no-audit", "--no-fund"], cwd=root / "web", check=True, capture_output=True)
     subprocess.run(["go", "mod", "download"], cwd=root / "api", check=True, capture_output=True)
