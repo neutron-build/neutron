@@ -106,6 +106,9 @@ class Database:
                 if state is None or str(state).startswith("08"): self._discard()
                 raise _native(exc) from exc
 
+    @property
+    def closed(self) -> bool: return self._closed
+
     def _discard(self) -> None:
         self._closed=True
         try: self._conn.close()
@@ -239,6 +242,9 @@ class AsyncDatabase:
                 state=getattr(exc,"sqlstate",None)
                 if state is None or str(state).startswith("08"): self._discard()
                 raise _native(exc) from exc
+
+    @property
+    def closed(self) -> bool: return self._closed
 
     def _discard(self) -> None:
         # Fencing is synchronous, before another cancellation can interrupt it.

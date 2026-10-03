@@ -48,10 +48,13 @@ class AsyncSession(_SessionState):
         if self.autoflush: await self.flush()
         found=self._store.find(mapping,key)
         if found is not None: return found
-        await self._ensure_transaction()
-        row=await self._database.one_or_none(select_row(mapping.table,*mapping.field_columns.values()).where(self._predicate(mapping,values)))
-        if row is None: return None
-        obj=mapping.construct(row);self._store.attach(mapping,obj,new=False);return obj
+        try:
+            await self._ensure_transaction()
+            row=await self._database.one_or_none(select_row(mapping.table,*mapping.field_columns.values()).where(self._predicate(mapping,values)))
+            if row is None: return None
+            obj=mapping.construct(row);self._store.attach(mapping,obj,new=False);return obj
+        except BaseException:
+            self._failed=True;raise
 
     async def flush(self) -> None:
         self._guard()

@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import threading
 from typing import Any, Iterator, TypeVar
-from .client import Database
+from .client import AsyncDatabase, Database
 from .core import CardinalityError, OrmError, Predicate, SessionBusyError, delete, insert, select_row, update
 from .lifecycle import TransactionHandle
 from .mapping import ModelMapping
@@ -13,6 +13,7 @@ T=TypeVar('T')
 class ConflictError(OrmError): pass
 
 class _SessionState:
+    _database: Database | AsyncDatabase
     def __init__(self,*,autobegin: bool=True,autoflush: bool=True) -> None:
         self._store=StateStore()
         self._mappings: dict[tuple[Any,...],ModelMapping[Any]]={}
@@ -24,11 +25,12 @@ class _SessionState:
     def _guard(self,*,allow_failed: bool=False) -> None:
         self._owner_check()
         if self._closed: raise OrmError('mapped Session closed')
+        if self._database.closed and not allow_failed: raise OrmError('mapped Session connection fenced; create a new Session')
         if self._uncertain: raise OrmError('mapped Session outcome indeterminate; use a new Session')
         if self._failed and not allow_failed: raise OrmError('mapped Session requires rollback')
 
     def _mapping(self,mapping: ModelMapping[T]) -> None:
-        key=(mapping.model_type,mapping.table.schema,mapping.table.name)
+        key=(mapping.table.schema,mapping.table.name)
         previous=self._mappings.get(key)
         if previous is not None and previous is not mapping: raise OrmError('mapping identity already registered with different metadata')
         self._mappings[key]=mapping
@@ -125,10 +127,13 @@ class Session(_SessionState):
         if self.autoflush: self.flush()
         found=self._store.find(mapping,key)
         if found is not None: return found
-        self._ensure_transaction()
-        row=self._database.one_or_none(select_row(mapping.table,*mapping.field_columns.values()).where(self._predicate(mapping,values)))
-        if row is None: return None
-        obj=mapping.construct(row);self._store.attach(mapping,obj,new=False);return obj
+        try:
+            self._ensure_transaction()
+            row=self._database.one_or_none(select_row(mapping.table,*mapping.field_columns.values()).where(self._predicate(mapping,values)))
+            if row is None: return None
+            obj=mapping.construct(row);self._store.attach(mapping,obj,new=False);return obj
+        except BaseException:
+            self._failed=True;raise
 
     def flush(self) -> None:
         self._guard()
