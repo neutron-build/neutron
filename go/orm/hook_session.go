@@ -25,6 +25,7 @@ type hookToken struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	valid  bool
+	active int
 }
 
 func newWriteSession(scope *Scope) *WriteSession { return &WriteSession{scope: scope} }
@@ -172,7 +173,7 @@ type HookContext struct {
 }
 
 func (h *HookContext) request(ctx context.Context) (context.Context, func(), error) {
-	if h == nil || h.session == nil || ctx == nil {
+	if h == nil || h.session == nil {
 		return nil, nil, ErrHookClosed
 	}
 	s := h.session
@@ -186,11 +187,19 @@ func (h *HookContext) request(ctx context.Context) (context.Context, func(), err
 		s.mu.Unlock()
 		return nil, nil, err
 	}
+	if ctx == nil {
+		err := errors.New("orm: nil hook SQL context")
+		s.failed = errors.Join(s.failed, ErrHookWorkflow, err)
+		s.mu.Unlock()
+		return nil, nil, err
+	}
+	h.token.active++
 	parent := h.token.ctx
 	s.mu.Unlock()
 	request, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(parent, cancel)
-	cleanup := func() { stop(); cancel() }
+	var once sync.Once
+	cleanup := func() { once.Do(func() { stop(); cancel(); s.mu.Lock(); h.token.active--; s.mu.Unlock() }) }
 	if err := parent.Err(); err != nil {
 		cleanup()
 		s.fail(err)
@@ -285,12 +294,13 @@ func (s *WriteSession) invoke(ctx context.Context, callback func(*HookContext) e
 		cancel()
 		s.mu.Lock()
 		token.valid = false
+		pending := token.active > 0
 		s.token = nil
 		s.mu.Unlock()
 		s.scope.owner.mu.Lock()
 		active := s.scope.owner.op != nil && s.scope.owner.op.scope == s.scope
 		s.scope.owner.mu.Unlock()
-		if active {
+		if active || pending {
 			result = errors.Join(result, ErrHookLeak)
 		}
 		result = errors.Join(result, contextErr)

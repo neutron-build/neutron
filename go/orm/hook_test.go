@@ -107,3 +107,27 @@ func TestHookCapturedContextAndChildEvents(t *testing.T) {
 		t.Fatal("released child event not merged")
 	}
 }
+
+// Request admission is reserved before native Scope.acquire: a callback cannot
+// return in that gap and permit a retained goroutine to escape leak detection.
+func TestHookAdmittedRequestLeakBeforeNativeAcquire(t *testing.T) {
+	driver := &lifecycleDriver{}
+	_, scope, _, _ := fixtureOwner(context.Background(), driver)
+	session := newWriteSession(scope)
+	table, _ := NewTable[hookTestModel]("public", "records")
+	id, _ := NewColumn[hookTestModel, int64](table, "ID")
+	var cleanup func()
+	repo, _ := NewHookRepository(table, HookSet[hookTestModel]{BeforeDelete: []BeforeHook[hookTestModel]{func(ctx context.Context, h *HookContext, _ WriteIntent[hookTestModel]) error {
+		_, finish, err := h.request(ctx)
+		cleanup = finish
+		return err
+	}}})
+	if _, err := HookDelete(context.Background(), session, repo, id.Eq(1)); !errors.Is(err, ErrHookLeak) {
+		t.Fatal("request gap escaped leak refusal", err)
+	}
+	cleanup()
+	cleanup()
+	if driver.execs != 0 {
+		t.Fatal("statement ran after request leak")
+	}
+}
