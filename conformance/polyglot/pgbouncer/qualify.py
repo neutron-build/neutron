@@ -121,7 +121,10 @@ log_disconnections = 0
 log_pooler_errors = 0
 pidfile = {work/(mode+'.pid')}
 ''')
-                proxy_url=make_conninfo(host='127.0.0.1',port=listen_port,dbname='fixture',user=role,password=password,connect_timeout=2,sslmode='disable')
+                # All consumers accept a PostgreSQL URI; node drivers do not
+                # accept psycopg's libpq key=value connection string. Role and
+                # password above are generated hex identifiers, never input.
+                proxy_url=f'postgresql://{role}:{password}@127.0.0.1:{listen_port}/fixture?connect_timeout=2&sslmode=disable'
                 child_env={key:value for key,value in os.environ.items() if not key.startswith('PG') and not key.endswith(('DATABASE_URL','DB_URL'))}
                 if args.library_path: child_env['LD_LIBRARY_PATH']=str(args.library_path.resolve())
                 with open(work/(mode+'.private.log'),'wb') as log:
