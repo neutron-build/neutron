@@ -47,8 +47,8 @@
       "id": "concurrent-session",
       "from": "owned-by-task-A",
       "event": "task-B query",
-      "to": "reject-or-explicit-serialized",
-      "assert": "chosen policy tested; no cross-task transaction ownership"
+      "to": "rejected",
+      "assert": "concurrent active session use rejected by default; independent sessions allowed"
     },
     {
       "id": "cleanup-error",
