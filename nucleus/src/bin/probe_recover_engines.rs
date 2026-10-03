@@ -1427,6 +1427,18 @@ fn main_impl() {
         }
         i += 1;
     }
+    // A recovery round-trip against an engine with no durable log can only
+    // report TableNotFound after the reopen; that is the harness being
+    // misconfigured, not a finding about the engine, and it must not be
+    // countable as one.
+    if !engine.is_durable() {
+        eprintln!(
+            "--engine {} is not durable (data does not survive reopen); \
+             use a durable engine: buffered-disk, disk, durable-mvcc",
+            engine.name()
+        );
+        std::process::exit(2);
+    }
     std::panic::set_hook(Box::new(|_| {}));
 
     // ── Negative control: prove the S35 sections can discriminate ──
