@@ -50,3 +50,8 @@ from neutron.orm import JsonDocument
 def static_json_consumer(db: Database) -> None:
     t=Table('documents',{'value':ColumnSpec(JsonDocument,'jsonb',nullable=True)})
     assert_type(db.all(select(t.nullable_column('value',JsonDocument))),list[JsonDocument|None])
+
+from neutron.orm import EndpointIdentity
+
+def static_endpoint_evidence(db: Database) -> None:
+    assert_type(db.endpoint_identity,EndpointIdentity|None)

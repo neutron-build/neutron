@@ -4,6 +4,7 @@ import asyncio
 from contextlib import contextmanager, asynccontextmanager
 import threading
 from typing import Any, AsyncIterator, Iterator, Mapping, Sequence, TypeVar, TYPE_CHECKING
+from .endpoint import EndpointIdentity, admit, startup_version
 from .json_value import load_document, native_params
 from .query import Query
 from .core import CardinalityError, Compiled, Mutation, OrmError, Returning, Select, SessionBusyError
@@ -40,11 +41,16 @@ def _native(error: Exception, *, committing: bool = False) -> OrmError:
 class Database:
     """One native connection. Concurrent active use rejected; no tracked objects."""
     def __init__(self, connection: Any) -> None:
+        self._endpoint_identity: EndpointIdentity | None = None
         self._conn=connection
         self._lock=threading.Lock()
         self._closed=False
         self._rollback_only=False
         self._owner: int | None=None
+
+    @property
+    def endpoint_identity(self) -> EndpointIdentity | None:
+        return self._endpoint_identity
 
     @classmethod
     def connect(cls, url: str, *, profile: str='postgres-direct') -> Database:
@@ -54,15 +60,24 @@ class Database:
             from psycopg.rows import dict_row
         except ImportError as exc:
             raise OrmError("Install neutron-framework[orm] for native PostgreSQL execution") from exc
+        connection=None
         try:
             connection=psycopg.connect(url,autocommit=True,row_factory=dict_row)
+            startup=connection.info.parameter_status('server_version')
+            startup_version(startup)
+            with connection.cursor() as cur:
+                cur.execute('SELECT pg_catalog.version() AS orm_endpoint_version')
+                row=cur.fetchone()
+            identity=admit(startup,row['orm_endpoint_version'] if row is not None else None)
             from psycopg.types.json import set_json_loads
-            try: set_json_loads(load_document,context=connection)
-            except BaseException:
-                connection.pgconn.finish()
-                raise
-            return cls(connection)
-        except Exception as exc:
+            set_json_loads(load_document,context=connection)
+            result=cls(connection)
+            result._endpoint_identity=identity
+            return result
+        except BaseException as exc:
+            if connection is not None: connection.pgconn.finish()
+            if isinstance(exc,(OrmError,KeyboardInterrupt,SystemExit)): raise
+            if not isinstance(exc,Exception): raise
             raise OrmError("Unable to connect to PostgreSQL",sqlstate=getattr(exc,"sqlstate",None)) from exc
 
     @contextmanager
@@ -179,11 +194,16 @@ class Database:
 class AsyncDatabase:
     """One native async connection; operation/transaction task ownership explicit."""
     def __init__(self, connection: Any) -> None:
+        self._endpoint_identity: EndpointIdentity | None = None
         self._conn=connection
         self._busy=False
         self._closed=False
         self._rollback_only=False
         self._owner: asyncio.Task[Any] | None=None
+
+    @property
+    def endpoint_identity(self) -> EndpointIdentity | None:
+        return self._endpoint_identity
 
     @classmethod
     async def connect(cls,url: str,*,profile: str='postgres-direct') -> AsyncDatabase:
@@ -193,15 +213,23 @@ class AsyncDatabase:
             from psycopg.rows import dict_row
         except ImportError as exc:
             raise OrmError("Install neutron-framework[orm] for native PostgreSQL execution") from exc
+        connection=None
         try:
             connection=await psycopg.AsyncConnection.connect(url,autocommit=True,row_factory=dict_row)
+            startup=connection.info.parameter_status('server_version')
+            startup_version(startup)
+            async with connection.cursor() as cur:
+                await cur.execute('SELECT pg_catalog.version() AS orm_endpoint_version')
+                row=await cur.fetchone()
+            identity=admit(startup,row['orm_endpoint_version'] if row is not None else None)
             from psycopg.types.json import set_json_loads
-            try: set_json_loads(load_document,context=connection)
-            except BaseException:
-                connection.pgconn.finish()
-                raise
-            return cls(connection)
-        except Exception as exc:
+            set_json_loads(load_document,context=connection)
+            result=cls(connection)
+            result._endpoint_identity=identity
+            return result
+        except BaseException as exc:
+            if connection is not None: connection.pgconn.finish()
+            if isinstance(exc,OrmError) or not isinstance(exc,Exception): raise
             raise OrmError("Unable to connect to PostgreSQL",sqlstate=getattr(exc,"sqlstate",None)) from exc
 
     @asynccontextmanager

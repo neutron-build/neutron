@@ -3,12 +3,24 @@
 Install `neutron-framework[orm]`. Import from `neutron.orm`. Existing
 `neutron.nucleus` asyncpg clients are unchanged.
 
-This is a bounded native psycopg synchronous/asynchronous SQL core. It does not
-implement mapped Session identity, dirty tracking, flush, associations or a full
-SQLAlchemy replacement. Only the caller-declared `postgres-direct` profile name is currently admitted.
-The client does not yet attest the server engine or intermediary topology;
-this declaration is not certification of Nucleus, poolers, or unknown endpoints.
-It owns one connection per Database instance, with no implicit connection pool.
+This is a bounded native psycopg synchronous/asynchronous SQL core with
+explicit scalar dataclass Sessions. Associations and full SQLAlchemy parity
+remain outside this slice. Only `postgres-direct` is admitted.
+`Database.connect` and `AsyncDatabase.connect` compare the startup server
+version with `pg_catalog.version()` before handing out a usable client. Known
+Nucleus and other identified incompatible engines, missing identity, and
+contradictory versions are refused and the native connection is discarded.
+`endpoint_identity` records the admitted reported PostgreSQL version.
+This checks reported engine identity, not authentication, TLS, feature parity,
+or absence of poolers. Direct topology remains a caller declaration; provider
+and pooling capability profiles require separate qualification. PostgreSQL
+compatibility markers can be spoofed and are not a security boundary.
+Wrapping an existing connection with `Database(connection)` or
+`AsyncDatabase(connection)` is a trusted low-level path without admission
+metadata (`endpoint_identity is None`).
+Each Database owns one connection, with no implicit connection pool.
+The startup probe uses psycopg's documented
+[connection parameter status](https://www.psycopg.org/psycopg3/docs/api/objects.html#psycopg.ConnectionInfo.parameter_status).
 
 ```python
 from neutron.orm import ColumnSpec, Database, Table, insert, select

@@ -89,3 +89,20 @@ def test_returning_generated_defaults_and_cardinality_rollback(live_table):
                 try: db.one(update(t,{'label':'also rollback'},where=t.column('id',int).in_([1,2])).returning(t.column('id',int)))
                 except CardinalityError: pass
         assert native.execute(f'SELECT label FROM {t.sql} ORDER BY id').fetchall()==[('',),('',)]
+
+
+def test_native_endpoint_admission_evidence(live_table):
+    url,table,native=live_table
+    expected=native.info.parameter_status('server_version').split()[0]
+    with Database.connect(url) as db:
+        assert db.endpoint_identity is not None
+        assert db.endpoint_identity.engine=='postgresql'
+        assert db.endpoint_identity.version==expected
+        assert db.endpoint_identity.topology=='caller-declared-direct'
+
+@pytest.mark.asyncio
+async def test_async_native_endpoint_admission_evidence(live_table):
+    url,table,native=live_table
+    async with await AsyncDatabase.connect(url) as db:
+        assert db.endpoint_identity is not None
+        assert db.endpoint_identity.version==native.info.parameter_status('server_version').split()[0]

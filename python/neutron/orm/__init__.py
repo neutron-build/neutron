@@ -18,3 +18,6 @@ __all__ += ["Field","Order","Query","Scope","field","outer_field","query_from"]
 
 from .json_value import JSON_NULL, JsonDocument
 __all__ += ["JSON_NULL","JsonDocument"]
+
+from .endpoint import EndpointIdentity
+__all__ += ["EndpointIdentity"]
