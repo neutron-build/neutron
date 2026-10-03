@@ -42,7 +42,7 @@ func TestIntrospectV2PreservesCatalogTypeIdentity(t *testing.T) {
 			if m.Table(id) != nil {
 				t.Fatalf("unsupported type flattened into managed table %s", name)
 			}
-			entry := m.OpaqueEntry("table", id)
+			entry := m.OpaqueEntry("unsupported-table", id)
 			if entry == nil || !strings.Contains(entry.Reason, "type identity") {
 				t.Fatalf("missing truthful opaque inventory for %s: %+v", name, entry)
 			}
