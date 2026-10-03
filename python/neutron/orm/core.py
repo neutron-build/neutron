@@ -71,7 +71,7 @@ class ColumnSpec(Generic[T]):
         if not isinstance(value, self.python_type) or (self.python_type is int and isinstance(value, bool)) or (self.sql_type == 'date' and isinstance(value, dt.datetime)):
             raise ValueError('column value has wrong native type')
         if isinstance(value,PgArray):
-            element=ColumnSpec(_TYPES[self.sql_type[:-2]],self.sql_type[:-2],nullable=True)
+            element: ColumnSpec[Any]=ColumnSpec(_TYPES[self.sql_type[:-2]],self.sql_type[:-2],nullable=True)
             for item in value.elements: element.check(item)
         if isinstance(value,MutableJson): value.text
         if isinstance(value, dt.datetime):
