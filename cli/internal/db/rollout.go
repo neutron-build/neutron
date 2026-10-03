@@ -185,6 +185,23 @@ func CanonicalRolloutArtifact(a RolloutArtifact) ([]byte, error) {
 		sort.Strings(p.RetiredVersions)
 		a.Phases[i] = p
 	}
+	final := a.Phases[len(a.Phases)-1]
+	allowed := map[string]bool{}
+	retired := map[string]bool{}
+	for _, app := range final.Applications {
+		allowed[app.Version] = true
+	}
+	for _, v := range final.RetiredVersions {
+		if _, ok := appDigests[v]; !ok {
+			return nil, fmt.Errorf("retired version was never declared")
+		}
+		retired[v] = true
+	}
+	for v := range appDigests {
+		if !allowed[v] && !retired[v] {
+			return nil, fmt.Errorf("removed application version needs explicit retirement")
+		}
+	}
 	return json.Marshal(a)
 }
 

@@ -66,6 +66,10 @@ func TestRolloutCanonicalBytesAndExactMigrationIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sum := sha256.Sum256(raw)
+	if hex.EncodeToString(sum[:]) != "125eb3196d13f75b903bc98b1482c10b34dc0c334565f02597cac13e65c6e96f" {
+		t.Fatal("version 1 canonical golden digest changed")
+	}
 	if bytes.HasSuffix(raw, []byte("\n")) || !bytes.Contains(raw, []byte(`"id":"001"`)) || !bytes.Contains(raw, []byte(`"workflowId":"unicode-é"`)) {
 		t.Fatal("canonical string/ID/newline contract")
 	}
@@ -128,6 +132,7 @@ func TestRolloutRejectsInvalidArtifacts(t *testing.T) {
 		"unbounded batch":    func(a *RolloutArtifact) { a.Phases[2].Backfill.MaxBatchRows = 1 << 62 },
 		"unbounded time":     func(a *RolloutArtifact) { a.Phases[2].Backfill.MaxBatchMilliseconds = 1 << 62 },
 		"missing validation": func(a *RolloutArtifact) { a.Phases[3].ValidationSHA256 = "" },
+		"unknown retired":    func(a *RolloutArtifact) { a.Phases[5].RetiredVersions = []string{"unknown"} },
 		"retired allowed":    func(a *RolloutArtifact) { a.Phases[5].RetiredVersions = []string{"new"} },
 		"not destructive":    func(a *RolloutArtifact) { a.Phases[5].Destructive = false },
 	}
