@@ -109,7 +109,9 @@ class Database:
                 with self._conn.cursor() as cur:
                     cur.execute(compiled.sql,native_params(compiled.params))
                     rows=cur.fetchall() if cardinality=='many' else cur.fetchmany(2)
-            except Exception as exc:
+            except BaseException as exc:
+                if self._owner is not None: self._rollback_only=True
+                if not isinstance(exc,Exception): raise
                 state=getattr(exc,"sqlstate",None)
                 if state is None or str(state).startswith("08"): self._discard()
                 raise _native(exc) from exc
@@ -133,7 +135,9 @@ class Database:
                 with self._conn.cursor() as cur:
                     cur.execute(statement.sql,native_params(statement.params))
                     return int(cur.rowcount)
-            except Exception as exc:
+            except BaseException as exc:
+                if self._owner is not None: self._rollback_only=True
+                if not isinstance(exc,Exception): raise
                 state=getattr(exc,"sqlstate",None)
                 if state is None or str(state).startswith("08"): self._discard()
                 raise _native(exc) from exc
@@ -160,7 +164,7 @@ class Database:
                 yield self
                 if self._stream_lease or self._savepoint_depth:
                     self._discard();raise OrmError('transaction ended with an active stream lease or savepoint',outcome='aborted')
-                if self._rollback_only: raise OrmError("transaction requires rollback after invalid RETURNING result")
+                if self._rollback_only: raise OrmError("transaction requires rollback after dispatched failure or invalid RETURNING result")
             except BaseException as body:
                 if self._closed: raise
                 if self._stream_lease or self._savepoint_depth:
@@ -316,13 +320,18 @@ class AsyncDatabase:
                     await cur.execute(compiled.sql,native_params(compiled.params))
                     rows=await cur.fetchall() if cardinality=='many' else await cur.fetchmany(2)
             except asyncio.CancelledError:
+                if self._owner is not None: self._rollback_only=True
                 task=asyncio.current_task()
                 if self._owner is None and task is not None and task.cancelling()>1: self._discard()
                 raise
             except Exception as exc:
+                if self._owner is not None: self._rollback_only=True
                 state=getattr(exc,"sqlstate",None)
                 if state is None or str(state).startswith("08"): self._discard()
                 raise _native(exc) from exc
+            except BaseException:
+                if self._owner is not None: self._rollback_only=True
+                raise
         return self._decode(query,compiled,rows,cardinality)
 
     def _decode(self,query: Select[T] | Returning[T] | Query[T],compiled: Compiled[T],rows: Sequence[Mapping[str,Any]],cardinality: str) -> list[T]:
@@ -344,13 +353,18 @@ class AsyncDatabase:
                     await cur.execute(statement.sql,native_params(statement.params))
                     return int(cur.rowcount)
             except asyncio.CancelledError:
+                if self._owner is not None: self._rollback_only=True
                 task=asyncio.current_task()
                 if self._owner is None and task is not None and task.cancelling()>1: self._discard()
                 raise
             except Exception as exc:
+                if self._owner is not None: self._rollback_only=True
                 state=getattr(exc,"sqlstate",None)
                 if state is None or str(state).startswith("08"): self._discard()
                 raise _native(exc) from exc
+            except BaseException:
+                if self._owner is not None: self._rollback_only=True
+                raise
 
     @property
     def closed(self) -> bool: return self._closed
@@ -386,7 +400,7 @@ class AsyncDatabase:
                 yield self
                 if self._stream_lease or self._savepoint_depth:
                     self._discard();raise OrmError('transaction ended with an active stream lease or savepoint',outcome='aborted')
-                if self._rollback_only: raise OrmError("transaction requires rollback after invalid RETURNING result")
+                if self._rollback_only: raise OrmError("transaction requires rollback after dispatched failure or invalid RETURNING result")
             except BaseException as body:
                 if self._closed: raise
                 if self._stream_lease or self._savepoint_depth:

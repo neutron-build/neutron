@@ -461,3 +461,43 @@ def test_native_acknowledged_commit_state_failure_remains_known_committed(mapped
         assert session.object_state(obj) is ObjectState.UNAVAILABLE_AFTER_COMMIT
         with pytest.raises(OrmError): session.rollback()
     assert session.object_state(obj) is ObjectState.UNAVAILABLE_AFTER_COMMIT
+
+
+def test_native_swallowed_driver_failure_cannot_claim_commit(mapped):
+    from neutron.orm import insert
+    url,m,native=mapped
+    with Database.connect(url) as db:
+        with pytest.raises(OrmError) as failed:
+            with db.transaction():
+                db.execute(insert(m.table,{'name':'duplicate','active':True}))
+                with pytest.raises(OrmError) as duplicate: db.execute(insert(m.table,{'name':'duplicate','active':True}))
+                assert duplicate.value.sqlstate=='23505'
+        assert failed.value.outcome=='aborted'
+        assert native.execute(f'SELECT count(*) FROM {m.table.sql}').fetchone()==(0,)
+        with db.transaction():
+            db.execute(insert(m.table,{'name':'outer','active':True}))
+            with pytest.raises(OrmError):
+                with db.savepoint():
+                    with pytest.raises(OrmError): db.execute(insert(m.table,{'name':'outer','active':True}))
+            db.execute(insert(m.table,{'name':'after_child','active':True}))
+        assert native.execute(f'SELECT name FROM {m.table.sql} ORDER BY name').fetchall()==[('after_child',),('outer',)]
+
+@pytest.mark.asyncio
+async def test_native_async_swallowed_failure_and_savepoint_poison_reset(mapped):
+    from neutron.orm import insert
+    url,m,native=mapped
+    async with await AsyncDatabase.connect(url) as db:
+        with pytest.raises(OrmError) as failed:
+            async with db.transaction():
+                await db.execute(insert(m.table,{'name':'duplicate','active':True}))
+                with pytest.raises(OrmError) as duplicate: await db.execute(insert(m.table,{'name':'duplicate','active':True}))
+                assert duplicate.value.sqlstate=='23505'
+        assert failed.value.outcome=='aborted'
+        assert native.execute(f'SELECT count(*) FROM {m.table.sql}').fetchone()==(0,)
+        async with db.transaction():
+            await db.execute(insert(m.table,{'name':'outer','active':True}))
+            with pytest.raises(OrmError):
+                async with db.savepoint():
+                    with pytest.raises(OrmError): await db.execute(insert(m.table,{'name':'outer','active':True}))
+            await db.execute(insert(m.table,{'name':'after_child','active':True}))
+        assert native.execute(f'SELECT name FROM {m.table.sql} ORDER BY name').fetchall()==[('after_child',),('outer',)]
