@@ -24,12 +24,17 @@ for name, expected in [
     ("wrong_projection", "as []int value"),
     ("wrong_model", "as orm.Predicate[Project] value"),
     ("wrong_join", "does not match inferred type"),
+    ("wrong_join_parent", "does not match inferred type"),
+    ("wrong_left_projection", "does not match inferred type"),
+    ("wrong_join_null_result", "as []int64 value"),
+    ("wrong_join_order", "as orm.Order[Child] value"),
+    ("wrong_join_filter", "as orm.Predicate[Child] value"),
 ]:
     result = run("./orm/testdata/" + name)
     source = root / "orm/testdata" / name / "main.go"
-    needle = "result, _ =" if name == "wrong_projection" else "var invalid"
+    needle = "result, _ =" if name in {"wrong_projection", "wrong_join_null_result"} else "var invalid"
     line = next(i for i, text in enumerate(source.read_text().splitlines(), 1) if needle in text)
     location = f"orm/testdata/{name}/main.go:{line}:"
     if result.returncode == 0 or expected not in result.stdout or location not in result.stdout:
         sys.exit("intended type-check failure absent: " + name)
-print("PASS: public Go ORM core positive and five negative compile consumers")
+print("PASS: public Go ORM core positive and ten negative compile consumers")

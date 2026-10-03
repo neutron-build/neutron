@@ -61,3 +61,40 @@ func associations(ctx context.Context, db orm.Executor, records []Record) error 
 	_, err = orm.LoadOne(ctx, db, orm.Inverse(relation), records, orm.Query[Record]{}, orm.LoadBudget{MaxParents: 100, MaxRows: 100, BatchSize: 20})
 	return err
 }
+
+func joined(ctx context.Context, db orm.Executor, relation orm.Relation[Record, Record], parentID, childID orm.Column[Record, int64]) error {
+	scope, err := orm.NewInnerJoin(relation)
+	if err != nil {
+		return err
+	}
+	first, err := orm.JoinParentField(scope, parentID)
+	if err != nil {
+		return err
+	}
+	second, err := orm.InnerChildField(scope, childID)
+	if err != nil {
+		return err
+	}
+	var inner []orm.Pair[int64, int64]
+	inner, err = orm.SelectJoinedPair(ctx, db, first, second, scope.Query().WhereParent(parentID.Gt(0)).OrderChild(childID.Asc()))
+	_ = inner
+	if err != nil {
+		return err
+	}
+	left, err := orm.NewLeftJoin(relation)
+	if err != nil {
+		return err
+	}
+	parent, err := orm.JoinParentField(left, parentID)
+	if err != nil {
+		return err
+	}
+	outer, err := orm.LeftChildField(left, childID)
+	if err != nil {
+		return err
+	}
+	var result []orm.Pair[int64, orm.Nullable[int64]]
+	result, err = orm.SelectJoinedPair(ctx, db, parent, outer, left.Query())
+	_ = result
+	return err
+}

@@ -46,6 +46,9 @@ func combine[M any](kind string, predicates []Predicate[M]) Predicate[M] {
 }
 
 func renderPredicate(info *modelInfo, e *expression, args *[]any) (string, error) {
+	return renderPredicateColumns(info, e, args, func(field fieldInfo) string { return quote(field.name) })
+}
+func renderPredicateColumns(info *modelInfo, e *expression, args *[]any, columnSQL func(fieldInfo) string) (string, error) {
 	if e == nil {
 		return "", fmt.Errorf("orm: explicit nonempty predicate required")
 	}
@@ -55,7 +58,7 @@ func renderPredicate(info *modelInfo, e *expression, args *[]any) (string, error
 		}
 		parts := make([]string, len(e.children))
 		for i, c := range e.children {
-			s, err := renderPredicate(info, c, args)
+			s, err := renderPredicateColumns(info, c, args, columnSQL)
 			if err != nil {
 				return "", err
 			}
@@ -71,10 +74,10 @@ func renderPredicate(info *modelInfo, e *expression, args *[]any) (string, error
 			return "", fmt.Errorf("orm: NULL for nonnullable column")
 		}
 		if e.kind == "=" {
-			return quote(e.field.name) + " IS NULL", nil
+			return columnSQL(e.field) + " IS NULL", nil
 		}
 		if e.kind == "<>" {
-			return quote(e.field.name) + " IS NOT NULL", nil
+			return columnSQL(e.field) + " IS NOT NULL", nil
 		}
 		return "", fmt.Errorf("orm: ordered NULL comparison is invalid")
 	}
@@ -82,7 +85,7 @@ func renderPredicate(info *modelInfo, e *expression, args *[]any) (string, error
 		return "", err
 	}
 	*args = append(*args, e.value)
-	return fmt.Sprintf("%s %s $%d", quote(e.field.name), e.kind, len(*args)), nil
+	return fmt.Sprintf("%s %s $%d", columnSQL(e.field), e.kind, len(*args)), nil
 }
 
 type Order[M any] struct {

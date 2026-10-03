@@ -254,3 +254,58 @@ Borrowed native Executors retain their caller-owned transaction policy.
 ```sh
 go test ./orm -run 'Test(ScopeDecodeFailureCannotCommitWhenSwallowed|ChildDecodeFailureRecoveredOnlyBySavepointRollback|PostgresScopeDecodeFailureRollbackAndChildRecovery)' -count=1 -v
 ```
+
+Typed two-table SQL joins
+-------------------------
+
+`NewInnerJoin(relation)` and `NewLeftJoin(relation)` validate an exact-key
+relation between two distinct qualified physical tables. They support composite
+keys across schemas, including tables with the same basename in different
+schemas. Repeating the same physical schema/table is refused even through a
+separately created table handle; explicit self aliases remain unsupported.
+This API is additive: association loading and existing single-table queries
+retain their APIs.
+
+`JoinParentField(scope, column)` projects the parent's original scalar type.
+`InnerChildField(innerScope, column)` projects the child's original type.
+`LeftChildField(leftScope, column)` necessarily projects `Nullable[T]`, including
+when the original mapped T is already a pointer. Its `Valid=false` means SQL
+NULL and its `Value` is then zero. That is not matched-row-presence detection:
+unmatched rows and matched nullable fields can both produce SQL NULL. An actual
+non-NULL zero/false remains Valid=true. JSON null remains a valid JSON document;
+SQL NULL remains invalid in the outer wrapper.
+
+`scope.Query()` builds a `JoinQuery[P,C]`. `WhereParent` and `WhereChild` accept
+predicates of the correct model and combine them with AND in call order.
+`WhereChild` is a WHERE filter, not an ON filter: a condition excluding NULL
+removes unmatched LEFT JOIN rows. `OrderParent`/`OrderChild` accept their model's
+orders, preserve call order and use PostgreSQL's default NULL placement.
+`Limit` and `Offset` bind nonnegative joined-row counts, not parent pagination.
+Fields/predicates/orders retain exact table and join binding checks even where
+different tables share a Go model or physical names. Equal metadata recreated
+for another binding does not silently enter the query.
+
+`SelectJoinedColumn` and `SelectJoinedPair` return typed scalar/pair slices.
+`SelectJoinedOne` and `SelectJoinedPairOne` require exactly one joined result;
+they refuse any explicit LIMIT/OFFSET, including zero, before database effects
+and internally fetch at most two rows. They preserve `ErrNotFound`,
+`ErrCardinality`, context and native SQLSTATE causes. Execution uses the caller's
+Executor and the existing Scope lease. Actual Scope decoder errors poison that
+Scope as documented above; borrowed Executors retain caller lifecycle policy.
+
+The bounded slice excludes arbitrary ON expressions, OR across parent/child
+predicates, multiple joins, self aliases, aggregates, expression projections,
+joined full-model identity materialization and implicit per-parent pagination.
+Nullable[T] is a projection wrapper rather than a writable mapped codec.
+
+```sh
+python3 orm/verify_compile.py
+go test ./orm -run 'Test(Joined|PostgresTypedInnerLeftJoinProjections)' -count=1 -v
+```
+
+Compile consumers verify model ownership, required nullable left-child results
+and correct scalar/pair result types. Native joins compare handwritten SQL row
+oracles for qualified schemas/composite keys, left NULL versus real zero/false,
+JSON null, ordering/bound filtering/pagination, cardinality, Scope lease cleanup,
+SQLSTATE preservation and swallowed decoder rollback. Required-live mode and a
+disposable PostgreSQL URL remain necessary for native qualification.
