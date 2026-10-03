@@ -129,8 +129,10 @@ Bounded explicit associations
 `Join(parentColumn, childColumn)` requires identical Go key types at compile
 time. `NewRelation(parentTable, childTable, joins...)` validates immutable table
 identity, nonempty composite keys and duplicate fields. Only nonnullable string,
-bool, int, int32 and int64 keys are supported. Nullable, floating-point, custom
-codec and implicit key conversion semantics remain unsupported. `Inverse`
+bool, int, int32, int64 and the native `UUID` codec keys are supported. UUID key
+identity uses its exact16 bytes, not formatted text; its all-zero UUID remains
+a legitimate key, distinct from SQL NULL. Nullable keys (including `*UUID`), floating-point, other custom codecs and
+implicit key conversion semantics remain unsupported. `Inverse`
 reverses ownership explicitly; this is not foreign-key inference or cascading.
 
 `LoadMany(ctx, executor, relation, parents, childQuery, budget)` returns one
@@ -223,3 +225,15 @@ The native gate uses independent SQL text casts and microsecond epoch reads to
 check int8 extrema, exact long numeric/scientific writes, UUIDs, microsecond
 instants with offsets, json/jsonb, nullable numeric/UUID, SQL NULL versus JSON
 null, projection decoding, default/NULL writes and explicit non-finite refusal.
+
+UUID association qualification extends the native composite-key gate:
+
+```sh
+go test ./orm -run 'Test(AssociationUUIDExactIdentityAndNullPolicy|PostgresUUIDCompositeAssociations)' -count=1 -v
+```
+
+It compares independently scanned native UUID bytes/rows under a hostile search
+path, including tenants sharing UUIDs, distinct UUIDs, zero UUID, duplicate
+input fanout budgets, inverse ownership, missing/orphan rows and nullable-key
+refusal. A mapped nullable UUID foreign key requires a future explicit nullable
+relation policy; this slice does not equate NULL values or infer that policy.

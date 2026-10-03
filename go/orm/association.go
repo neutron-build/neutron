@@ -38,7 +38,7 @@ func NewRelation[P, C any](parent Table[P], child Table[C], parts ...JoinPart[P,
 			return zero, fmt.Errorf("orm: relation key belongs to another table scope")
 		}
 		if part.parentField.typ != part.childField.typ || !associationKeyType(part.parentField.typ) || part.parentField.nullable || part.childField.nullable {
-			return zero, fmt.Errorf("orm: relation requires identical nonnullable integer, string or bool keys")
+			return zero, fmt.Errorf("orm: relation requires identical nonnullable integer, string, bool or UUID keys")
 		}
 		if seenParent[part.parentField.index] || seenChild[part.childField.index] {
 			return zero, fmt.Errorf("orm: duplicate relation key field")
@@ -59,6 +59,9 @@ func Inverse[P, C any](relation Relation[P, C]) Relation[C, P] {
 }
 
 func associationKeyType(t reflect.Type) bool {
+	if t == reflect.TypeOf(UUID{}) {
+		return true
+	}
 	if t == nil || t.PkgPath() != "" {
 		return false
 	}
@@ -105,6 +108,11 @@ func relationKey(value reflect.Value, fields []fieldInfo) string {
 	for _, field := range fields {
 		v := value.Field(field.index)
 		key = append(key, byte(v.Kind()))
+		if v.Type() == reflect.TypeOf(UUID{}) {
+			uuid := v.Interface().(UUID)
+			key = append(key, uuid.bytes[:]...)
+			continue
+		}
 		switch v.Kind() {
 		case reflect.String:
 			text := v.String()
