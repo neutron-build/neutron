@@ -55,13 +55,14 @@ def qualify(args):
     artifacts={label:verify_artifacts(json.loads(Path(client['artifact_manifest']).read_text()),Path(client['artifact_root'])) for label,client in descriptor['clients'].items()}
     admin_url=os.environ['NEUTRON_TEST_DATABASE_URL']
     direct=conninfo_to_dict(admin_url)
-    host=direct.get('host','127.0.0.1')
+    host=direct.get('host','')
     if host not in ('127.0.0.1','localhost','::1'): raise ValueError('this profile requires isolated loopback PostgreSQL')
-    database=direct.get('dbname',direct.get('user','postgres'))
+    database=direct.get('dbname','')
     # INI values are not SQL quoting contexts. Refuse ambiguous injected lines,
     # spaces, quotes or multi-host routing instead of weakening configuration.
     if not re.fullmatch('[A-Za-z0-9_.-]+',database): raise ValueError('simple isolated database name required')
     backend_port=int(direct.get('port','5432'))
+    if not 1<=backend_port<=65535: raise ValueError('valid direct PostgreSQL port required')
     scope='neutron_polyglot_'+uuid.uuid4().hex
     token=uuid.uuid4().hex+uuid.uuid4().hex
     role='neutron_pool_'+uuid.uuid4().hex
