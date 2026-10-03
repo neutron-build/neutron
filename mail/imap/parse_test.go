@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -392,5 +393,76 @@ func TestEmptyListParses(t *testing.T) {
 	}
 	if flags.kind != tokenList || len(flags.list) != 0 {
 		t.Errorf("FLAGS = %v, want an empty list", flags)
+	}
+}
+
+// IMAP INTERNALDATE may carry a space-padded single-digit day; "_2" accepts
+// both forms where "02" silently dropped the date (audit DATA-04).
+func TestInternalDateAcceptsSpacePaddedDay(t *testing.T) {
+	a := &Adapter{conn: &Conn{}, boxes: map[mail.MailboxID]string{}, locations: map[mail.MessageID]location{}}
+	for _, raw := range []string{
+		`(UID 7 INTERNALDATE "01-Jan-2026 09:00:00 +0000")`,
+		`(UID 8 INTERNALDATE " 1-Jan-2026 09:00:00 +0000")`,
+	} {
+		toks, err := tokenize(raw)
+		if err != nil {
+			t.Fatalf("tokenize %q: %v", raw, err)
+		}
+		env, ok := a.parseFetch("INBOX", toks[0])
+		if !ok {
+			t.Fatalf("parseFetch rejected %q", raw)
+		}
+		if env.ReceivedAt.IsZero() {
+			t.Errorf("INTERNALDATE in %q was dropped", raw)
+		}
+	}
+}
+
+// Custom keywords must survive as IMAP atoms; anything with CR/LF,
+// parentheses or spaces is refused before it can reach a command line
+// (audit IMAP-03).
+func TestKeywordAtomRejectsCommandInjection(t *testing.T) {
+	for _, ok := range []string{"custom", "Custom_Flag-2", "a.b"} {
+		if _, err := keywordAtom(ok); err != nil {
+			t.Errorf("keywordAtom(%q) rejected a legal atom: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "has space", "carriage\rreturn", "new\nline", "(paren)", strings.Repeat("x", 65)} {
+		if _, err := keywordAtom(bad); err == nil {
+			t.Errorf("keywordAtom(%q) accepted a hostile keyword", bad)
+		}
+	}
+}
+
+// ENVELOPE names only the parent. The References header, fetched beside it,
+// is what keeps the third message of a conversation in the first one's thread.
+func TestReferencesHeaderKeysTheThreadOnItsRoot(t *testing.T) {
+	refs := "References: <root@a.test>\r\n <reply@b.test>\r\n\r\n"
+	raw := "* 3 FETCH (UID 9 ENVELOPE (NIL \"Re: hi\" NIL NIL NIL NIL NIL NIL \"<reply@b.test>\" \"<third@a.test>\") " +
+		"BODY[HEADER.FIELDS (REFERENCES)] {" + strconv.Itoa(len(refs)) + "}\r\n" + refs + ")\r\n"
+	toks, err := newDecoder(strings.NewReader(raw)).readResponse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Adapter{conn: &Conn{uidValidity: 1}}
+	env, ok := a.parseFetch("INBOX", toks[3])
+	if !ok {
+		t.Fatal("parseFetch rejected the response")
+	}
+	if len(env.References) != 2 || string(env.ThreadID) != "root@a.test" {
+		t.Fatalf("references %v, thread %q; want the root's thread", env.References, env.ThreadID)
+	}
+
+	// No References header: the parent is the best link there is.
+	empty := "\r\n"
+	raw = "* 4 FETCH (UID 10 ENVELOPE (NIL \"Re: hi\" NIL NIL NIL NIL NIL NIL \"<root@a.test>\" \"<second@b.test>\") " +
+		"BODY[HEADER.FIELDS (REFERENCES)] {" + strconv.Itoa(len(empty)) + "}\r\n" + empty + ")\r\n"
+	toks, err = newDecoder(strings.NewReader(raw)).readResponse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, _ = a.parseFetch("INBOX", toks[3])
+	if string(env.ThreadID) != "root@a.test" {
+		t.Fatalf("thread %q without a References header; want the parent's", env.ThreadID)
 	}
 }

@@ -37,6 +37,13 @@ type memStore struct {
 	bodies    map[AccountID]map[MessageID]*Body
 	cursors   map[AccountID]map[MailboxID]Cursor
 
+	// Staged scan state (audit SYNC-03): the double mirrors PgStore's
+	// mirror_scans/mirror_scan_seen, including the resume semantics.
+	scanSeq int64
+	scans   map[AccountID]map[MailboxID]*Scan
+	scanSeen map[ScanID]map[MessageID]bool
+	scanDone map[AccountID]map[int64]map[MailboxID]bool
+
 	// failPutEnvelopes makes the next PutEnvelopes fail, to simulate a
 	// crash between storing data and advancing the cursor.
 	failPutEnvelopes bool
@@ -50,6 +57,9 @@ func newMemStore() *memStore {
 		members:   map[AccountID]map[MessageID]map[MailboxID]bool{},
 		bodies:    map[AccountID]map[MessageID]*Body{},
 		cursors:   map[AccountID]map[MailboxID]Cursor{},
+		scans:     map[AccountID]map[MailboxID]*Scan{},
+		scanSeen:  map[ScanID]map[MessageID]bool{},
+		scanDone: map[AccountID]map[int64]map[MailboxID]bool{},
 	}
 }
 
@@ -118,6 +128,14 @@ func (m *memStore) PutMailboxes(_ context.Context, acct AccountID, boxes []Mailb
 	for box := range m.cursors[acct] {
 		if box != "" && !wanted[box] {
 			delete(m.cursors[acct], box)
+		}
+	}
+	if m.scans[acct] != nil {
+		for box, scan := range m.scans[acct] {
+			if !wanted[box] {
+				delete(m.scanSeen, scan.ID)
+				delete(m.scans[acct], box)
+			}
 		}
 	}
 	for id, memberships := range m.members[acct] {
@@ -487,11 +505,13 @@ func TestProviderResetRefetchesWithoutDuplicating(t *testing.T) {
 		t.Fatalf("setup stored %d, want 2", store.count(acct))
 	}
 
-	// The provider now rejects the cursor and offers a fresh start.
+	// The provider now rejects the cursor and offers a fresh start. The
+	// replacement enumeration is staged, not destructive: message 2 is
+	// reconciled only once the full listing completed (audit SYNC-03).
 	ad.call = 0
 	ad.pages = []*Changes{
 		{Reset: true, Next: ""},
-		{Changes: []Change{created(envelope("1", "INBOX")), created(envelope("3", "INBOX"))}, Next: "c2"},
+		{Changes: []Change{created(envelope("1", "INBOX")), created(envelope("3", "INBOX"))}, Next: "c2", EnumerationStart: true, Complete: true},
 	}
 
 	rep, err := eng.SyncMailbox(context.Background(), acct, "INBOX", ad)
@@ -513,11 +533,13 @@ func TestProviderResetRefetchesWithoutDuplicating(t *testing.T) {
 }
 
 func TestRepeatedResetIsRefusedRatherThanLooping(t *testing.T) {
-	// A provider that always rejects its own cursor would otherwise spin
-	// forever, refetching the whole mailbox on each pass.
+	// A provider that always rejects its own cursor — including the fresh
+	// empty cursor of a replacement scan — must not loop. One bounded
+	// replacement per call, then an honest error (audit 5 SYNC-03).
 	eng, _, acct := setup(t)
 	ad := &scriptedAdapter{
 		pages: []*Changes{
+			{Reset: true, Next: ""},
 			{Reset: true, Next: ""},
 			{Reset: true, Next: ""},
 		},
@@ -525,10 +547,10 @@ func TestRepeatedResetIsRefusedRatherThanLooping(t *testing.T) {
 
 	_, err := eng.SyncMailbox(context.Background(), acct, "INBOX", ad)
 	if err == nil {
-		t.Fatal("expected an error on a second reset in one sync")
+		t.Fatal("expected an error after the fresh enumeration was rejected too")
 	}
-	if !strings.Contains(err.Error(), "reset twice") {
-		t.Errorf("error = %v, want it to name the repeated reset", err)
+	if !strings.Contains(err.Error(), "rejected a fresh recovery enumeration") {
+		t.Errorf("error = %v, want it to name the refused fresh enumeration", err)
 	}
 }
 
@@ -939,8 +961,11 @@ func TestSyncAccountContinuesPastOneUnreadableMailbox(t *testing.T) {
 	}
 
 	reports, err := eng.SyncAccount(context.Background(), acct, ad)
-	if err != nil {
-		t.Fatalf("account sync aborted: %v", err)
+	// The readable folders still sync, and the unreadable one is still
+	// reported: a partial account sync must not masquerade as success
+	// (audit SYNC-01).
+	if err == nil || !strings.Contains(err.Error(), "Restricted") {
+		t.Fatalf("account sync hid the failed mailbox (err=%v)", err)
 	}
 	if len(reports) != 2 {
 		t.Errorf("got %d reports, want 2 (INBOX and Archive)", len(reports))

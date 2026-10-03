@@ -5,12 +5,15 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
+	"mime/quotedprintable"
 	"net"
 	"net/mail"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestReplyCarriesTheThreadingChain(t *testing.T) {
@@ -302,7 +305,7 @@ func TestRenderMixedCarriesAttachments(t *testing.T) {
 	if plain < 0 || html < 0 || plain > html {
 		t.Fatalf("body part lost plain-before-html ordering:\n%s", s)
 	}
-	if !strings.Contains(s, `filename="invoice.pdf"`) {
+	if !strings.Contains(s, "filename=invoice.pdf") {
 		t.Fatalf("attachment filename missing:\n%s", s)
 	}
 	if !strings.Contains(s, base64.StdEncoding.EncodeToString([]byte("PDFBYTES"))) {
@@ -317,7 +320,7 @@ func TestRenderMixedCarriesAttachments(t *testing.T) {
 	if strings.Contains(s, "text/plainBcc") {
 		t.Fatalf("mangled content type shipped instead of falling back:\n%s", s)
 	}
-	if !strings.Contains(s, `filename="attachment"`) {
+	if !strings.Contains(s, "filename=attachment") {
 		t.Fatalf("empty filename did not fall back:\n%s", s)
 	}
 }
@@ -521,5 +524,157 @@ func TestSendStalledGreetingHonorsContextDeadline(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Send never returned against a stalled server")
+	}
+}
+
+// A server that offers neither STARTTLS nor a TLS port must receive no mail
+// when Plaintext is off: the old opportunistic path downgraded silently
+// (audit SEND-01).
+func TestSendRefusesServerWithoutSTARTTLS(t *testing.T) {
+	srv := newFakeSMTPServer(t)
+	srv.serve(t)
+	defer srv.close()
+
+	host, port := srv.addr()
+	s := NewSender(SMTPConfig{Host: host, Port: port, Username: "user", Password: "pass"})
+
+	_, _, err := s.Send(t.Context(), testOutgoing("alice@example.com", "bob@example.com"))
+	if err == nil {
+		t.Fatal("a server advertising neither STARTTLS nor AUTH accepted a send")
+	}
+	joined := strings.Join(srv.dialogue, "\n")
+	if strings.Contains(joined, "MAIL") {
+		t.Errorf("the dialogue reached MAIL despite missing STARTTLS:\n%s", joined)
+	}
+}
+
+// Once the server acknowledges DATA the message is accepted; a QUIT that
+// fails or a server that hangs up first must not turn acceptance into
+// failure (audit SEND-01).
+func TestSendSucceedsWhenServerDropsBeforeQUIT(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		fmt.Fprint(conn, "220 fake ESMTP\r\n")
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			cmd := strings.TrimSpace(strings.ToUpper(line))
+			switch {
+			case strings.HasPrefix(cmd, "EHLO"), strings.HasPrefix(cmd, "HELO"):
+				fmt.Fprint(conn, "250-fake\r\n250 8BITMIME\r\n")
+			case strings.HasPrefix(cmd, "MAIL"), strings.HasPrefix(cmd, "RCPT"):
+				fmt.Fprint(conn, "250 ok\r\n")
+			case strings.HasPrefix(cmd, "DATA"):
+				fmt.Fprint(conn, "354 go\r\n")
+				for {
+					line, err := reader.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if strings.TrimRight(line, "\r\n") == "." {
+						break
+					}
+				}
+				// Acknowledge, then hang up without answering QUIT.
+				fmt.Fprint(conn, "250 accepted\r\n")
+				return
+			default:
+				fmt.Fprint(conn, "250 ok\r\n")
+			}
+		}
+	}()
+
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+	s := NewSender(SMTPConfig{Host: "127.0.0.1", Port: port, Plaintext: true})
+	if _, _, err := s.Send(t.Context(), testOutgoing("a@x.com", "b@x.com")); err != nil {
+		t.Fatalf("a send acknowledged at DATA failed on QUIT: %v", err)
+	}
+}
+
+// Text parts are quoted-printable: emoji, non-Latin text and very long lines
+// must survive a round trip through a real MIME decoder with legal encoded
+// line lengths (audit SEND-02).
+func TestRenderedBodyPartsAreQuotedPrintableAndRoundTrip(t *testing.T) {
+	long := strings.Repeat("héllo wörld — ", 900) // >9000 chars, no newline
+	msg := &Outgoing{
+		From:    Address{Email: "alice@example.com"},
+		To:      []Address{{Email: "bob@example.com"}},
+		Subject: "qp",
+		Text:    "café ☕ trailing space   \n" + long,
+		HTML:    "<p>日本語テキスト " + long + "</p>",
+	}
+	raw, err := msg.Render()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "Content-Transfer-Encoding: quoted-printable") {
+		t.Fatal("text leaf carries no transfer encoding")
+	}
+	for _, line := range strings.Split(string(raw), "\r\n") {
+		if len(line) > 998 {
+			t.Fatalf("encoded line is %d bytes, exceeding the 998 transport limit", len(line))
+		}
+	}
+
+	msg2 := &Outgoing{
+		From:    Address{Email: "alice@example.com"},
+		To:      []Address{{Email: "bob@example.com"}},
+		Subject: "qp",
+		Text:    "café ☕ trailing space   \n" + long,
+	}
+	raw2, err := msg2.Render()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := mail.ReadMessage(strings.NewReader(string(raw2)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	qp := quotedprintable.NewReader(parsed.Body)
+	got, err := io.ReadAll(qp)
+	if err != nil {
+		t.Fatalf("decoding the quoted-printable body: %v", err)
+	}
+	// encodedTextPart closes the leaf with one CRLF of MIME framing, and
+	// the QP writer legitimately canonicalizes bare LF to CRLF; the
+	// decoded text is the composed text under that canonicalization.
+	got = []byte(strings.TrimSuffix(string(got), "\r\n"))
+	if want := strings.ReplaceAll(msg2.Text, "\n", "\r\n"); string(got) != want {
+		t.Fatalf("decoded body differs from the composed text (len %d vs %d)", len(got), len(want))
+	}
+}
+
+// A long non-ASCII filename must stay valid UTF-8 after the 200-byte cap:
+// the old tail slice cut into the middle of a multi-byte rune (audit 4 F17).
+func TestSanitizeFilenameLongUnicodeStaysValidUTF8(t *testing.T) {
+	for _, name := range []string{
+	 strings.Repeat("é", 150),
+	 strings.Repeat("邮", 120),
+	 strings.Repeat("📩", 80),
+	 strings.Repeat("a", 199) + "é",
+	} {
+		got := sanitizeFilename(name)
+		if !utf8.ValidString(got) {
+			t.Fatalf("sanitizeFilename(%q bytes) = %q, invalid UTF-8", name[:16], got)
+		}
+		if len(got) > 200 {
+			t.Fatalf("sanitizeFilename result len = %d, want <= 200", len(got))
+		}
+		if got == "" {
+			t.Fatal("sanitizeFilename returned an empty name")
+		}
 	}
 }

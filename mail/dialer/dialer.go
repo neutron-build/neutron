@@ -26,7 +26,15 @@ import (
 // the correct trade for OAuth accounts: the token arrives with the request
 // and authorises that request, so a pooled connection would outlive the
 // credential that permitted it.
-func New() mail.Resolver {
+func New() mail.Resolver { return NewWithGmailRefresh(nil) }
+
+// GmailRefresh renews a rejected access token using the application-owned
+// credential store. It must honor ctx and must not create new grants.
+type GmailRefresh func(context.Context, mail.AccountID, mail.Credential) (mail.Credential, error)
+
+// NewWithGmailRefresh permits one refresh/retry of a rejected Gmail GET.
+// Mutations never use this recovery path.
+func NewWithGmailRefresh(refresh GmailRefresh) mail.Resolver {
 	return func(ctx context.Context, acct mail.AccountID, cred mail.Credential) (mail.Adapter, func(), error) {
 		if cred.Zero() {
 			return nil, nil, fmt.Errorf("mail: no credential supplied for account %s", acct)
@@ -41,7 +49,7 @@ func New() mail.Resolver {
 		case mail.ProviderJMAP:
 			return dialJMAP(ctx, cred)
 		case mail.ProviderGmail:
-			return dialGmail(ctx, cred)
+			return dialGmailAccount(ctx, acct, cred, refresh)
 		case mail.ProviderGraph:
 			return dialGraph(cred)
 		default:
@@ -82,11 +90,30 @@ func dialJMAP(ctx context.Context, cred mail.Credential) (mail.Adapter, func(), 
 	return ad, func() { _ = ad.Close() }, nil
 }
 
+// The Gmail REST API is served from gmail.googleapis.com, not the
+// www.googleapis.com root the older generated clients used. The endpoint and
+// the bearer allowlist must name the SAME host: the pinned google.golang.org/api
+// Gmail client builds every request against its configured basePath, and a
+// transport that only authorizes a different host strips the token from every
+// request the SDK makes (audit 4 F01).
+const (
+	gmailAPIEndpoint = "https://gmail.googleapis.com/"
+	gmailAPIHost     = "gmail.googleapis.com"
+)
+
 func dialGmail(ctx context.Context, cred mail.Credential) (mail.Adapter, func(), error) {
-	// The token arrives already refreshed by the caller, so a fixed bearer
-	// is correct: this adapter must never attempt a refresh, having neither
-	// a refresh token nor a client secret.
-	ad, err := gmail.New(ctx, option.WithHTTPClient(bearerClient(cred.AccessToken, "www.googleapis.com")))
+	return dialGmailAccount(ctx, mail.AccountID(cred.Email), cred, nil)
+}
+
+func dialGmailAccount(ctx context.Context, acct mail.AccountID, cred mail.Credential, refresh GmailRefresh) (mail.Adapter, func(), error) {
+	limiter := gmailLimiterFor(acct)
+	client := bearerClient(cred.AccessToken, gmailAPIHost)
+	if refresh != nil {
+		client.Transport = &gmailRefreshTransport{acct: acct, cred: cred, refresh: refresh,
+			base: http.DefaultTransport, limiter: limiter, gate: make(chan struct{}, 1)}
+	}
+	ad, err := gmail.NewWithReadLimiter(ctx, limiter,
+		option.WithEndpoint(gmailAPIEndpoint), option.WithHTTPClient(client))
 	if err != nil {
 		return nil, nil, err
 	}

@@ -178,3 +178,68 @@ func TestConnAppendMapsReauthRefusal(t *testing.T) {
 		t.Fatalf("authentication failure not mapped to ErrReauthRequired: %v", err)
 	}
 }
+
+// stalledLogoutServer accepts the session then never answers LOGOUT; Close
+// must still return within its hard bound instead of hanging the caller
+// (audit IMAP-02).
+type stalledLogoutServer struct{ ln net.Listener }
+
+func startStalledLogoutServer(t *testing.T) *stalledLogoutServer {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &stalledLogoutServer{ln: ln}
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.WriteString(conn, "* OK stall ready\r\n")
+		r := bufio.NewReader(conn)
+		for {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				return
+			}
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				return
+			}
+			switch strings.ToUpper(fields[1]) {
+			case "CAPABILITY", "LOGIN":
+				_, _ = io.WriteString(conn, fields[0]+" OK\r\n")
+			case "LOGOUT":
+				<-t.Context().Done() // never answer the goodbye
+				return
+			default:
+				_, _ = io.WriteString(conn, fields[0]+" BAD\r\n")
+			}
+		}
+	}()
+	t.Cleanup(func() { _ = ln.Close() })
+	return s
+}
+
+func TestCloseIsBoundedWhenLogoutStalls(t *testing.T) {
+	s := startStalledLogoutServer(t)
+	host, portStr, _ := net.SplitHostPort(s.ln.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+	conn, err := Dial(t.Context(), Config{Host: host, Port: port, Username: "u", Password: "p", Plaintext: true, Timeout: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() { done <- conn.Close() }()
+	select {
+	case <-done:
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Fatalf("Close took %v against a stalled LOGOUT", elapsed)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close never returned against a stalled LOGOUT")
+	}
+}

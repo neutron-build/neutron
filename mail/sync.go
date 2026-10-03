@@ -33,6 +33,8 @@ type Engine struct {
 	// returning. A mailbox with more changes than this resumes from its
 	// stored cursor on the next call, so progress is never lost — the bound
 	// exists so one enormous mailbox cannot starve every other account.
+	// A staged scan cut short by it keeps its staged pages and resumes from
+	// the scan's stored continuation (audit SYNC-02).
 	MaxPages int
 
 	accountLocks sync.Map // AccountID -> *sync.Mutex
@@ -66,7 +68,9 @@ type SyncReport struct {
 	Pages    int
 
 	// Reset records that the provider invalidated the cursor and the
-	// mailbox was refetched from empty.
+	// mailbox is being refetched. With a staged-capable store the refetch
+	// is a non-destructive scan: the old contents stay readable until the
+	// replacement enumeration completes (audit SYNC-03).
 	Reset bool
 
 	Duration time.Duration
@@ -96,11 +100,15 @@ func (e *Engine) SyncAccount(ctx context.Context, acct AccountID, ad Adapter) ([
 	}
 
 	reports := make([]SyncReport, 0, len(boxes))
+	var folderErrors []error
 	for _, box := range boxes {
 		rep, err := e.SyncMailbox(ctx, acct, box.ID, ad)
 		if err != nil {
 			// One unreadable mailbox should not abandon the rest of the
 			// account; a permission-scoped folder is common and normal.
+			// The failure is still a failure: it is accumulated and
+			// returned so the caller cannot mistake a partial sync for a
+			// healthy one (which would clear the account's error state).
 			//
 			// Two conditions are account-wide rather than per-mailbox and
 			// must propagate: a rejected credential, and throttling.
@@ -112,17 +120,41 @@ func (e *Engine) SyncAccount(ctx context.Context, acct AccountID, ad Adapter) ([
 			}
 			e.log.WarnContext(ctx, "mailbox sync failed",
 				"account", acct, "mailbox", box.ID, "err", err)
+			folderErrors = append(folderErrors, fmt.Errorf("mailbox %s: %w", box.ID, err))
+			if ctx.Err() != nil {
+				break
+			}
 			continue
 		}
 		reports = append(reports, *rep)
 	}
-	return reports, nil
+	return reports, errors.Join(folderErrors...)
 }
 
 // SyncMailbox brings one mailbox up to date.
+//
+// A staged scan in progress takes precedence over the delta path: the scan
+// IS the recovery, and its pages are the authoritative enumeration. Without
+// one, the stored cursor drives ordinary deltas; a provider-invalidated
+// cursor or the first page of a full enumeration starts (or resumes) a
+// staged scan when the store supports one, so interruption at any phase
+// costs resumption, never the existing mirror (audit SYNC-03/SYNC-02).
 func (e *Engine) SyncMailbox(ctx context.Context, acct AccountID, box MailboxID, ad Adapter) (*SyncReport, error) {
 	start := time.Now()
 	rep := &SyncReport{Account: acct, Mailbox: box}
+	defer func() { rep.Duration = time.Since(start) }()
+
+	scans, scanCapable := e.store.(ScanStore)
+
+	if scanCapable {
+		scan, err := scans.RunningScan(ctx, acct, box)
+		if err != nil && !errors.Is(err, ErrNoStore) {
+			return nil, err
+		}
+		if scan != nil {
+			return e.resumeScan(ctx, acct, box, ad, scan, rep, nil)
+		}
+	}
 
 	cur, err := e.store.Cursor(ctx, acct, box)
 	if err != nil {
@@ -134,11 +166,10 @@ func (e *Engine) SyncMailbox(ctx context.Context, acct AccountID, box MailboxID,
 	// refetching the mailbox on every pass.
 	resetUsed := false
 
-	// A provider without a change feed reports what exists but never what
-	// stopped existing, so deletions are inferred by sweeping the store
-	// against a complete enumeration. seen accumulates across pages; the
-	// sweep runs only if the run finished, since a truncated run's listing
-	// is partial and sweeping on it would delete live mail.
+	// Stores without staged scans keep the in-memory enumeration sweep:
+	// seen accumulates across pages and the sweep runs only if the run
+	// finished, since a truncated run's listing is partial and sweeping
+	// on it would delete live mail.
 	var (
 		seen            = map[MessageID]bool{}
 		enumerating     bool
@@ -152,6 +183,9 @@ func (e *Engine) SyncMailbox(ctx context.Context, acct AccountID, box MailboxID,
 			if errors.Is(err, ErrCursorInvalid) && !resetUsed {
 				resetUsed = true
 				rep.Reset = true
+				if scanCapable {
+					return e.beginScanAndRun(ctx, acct, box, ad, rep)
+				}
 				if err := e.store.ResetMailbox(ctx, acct, box); err != nil {
 					return nil, err
 				}
@@ -169,11 +203,27 @@ func (e *Engine) SyncMailbox(ctx context.Context, acct AccountID, box MailboxID,
 			rep.Reset = true
 			e.log.InfoContext(ctx, "provider invalidated cursor, refetching mailbox",
 				"account", acct, "mailbox", box)
+			if scanCapable {
+				return e.beginScanAndRun(ctx, acct, box, ad, rep)
+			}
 			if err := e.store.ResetMailbox(ctx, acct, box); err != nil {
 				return nil, err
 			}
 			cur = changes.Next
 			continue
+		}
+
+		// The first page of a full enumeration enters a staged scan when
+		// the store supports one: the seen set, the staged envelopes, and
+		// the continuation become durable together, so MaxPages and
+		// restarts resume the enumeration instead of losing its
+		// bookkeeping (audit SYNC-02).
+		if scanCapable && changes.EnumerationStart {
+			scan, err := scans.BeginScan(ctx, acct, box)
+			if err != nil {
+				return nil, err
+			}
+			return e.resumeScan(ctx, acct, box, ad, scan, rep, changes)
 		}
 
 		rep.Pages++
@@ -207,15 +257,224 @@ func (e *Engine) SyncMailbox(ctx context.Context, acct AccountID, box MailboxID,
 		rep.Deleted += swept
 	}
 
-	rep.Duration = time.Since(start)
+	return rep, nil
+}
+
+// RequestRescan durably marks every mailbox of an account for a full,
+// non-destructive rescan (audit SYNC-05/DATA-09: widening the retention
+// window). The next SyncAccount calls resume the scans; pruning happens
+// only as each scan completes, and messages the provider still holds —
+// including older ones an incremental feed would never re-report — are
+// staged back into the mirror by the enumeration itself.
+func (e *Engine) RequestRescan(ctx context.Context, acct AccountID, ad Adapter) error {
+	return e.RequestRescanVersion(ctx, acct, ad, 0)
+}
+
+// RequestRescanVersion is the generation-aware rescan (audit 5 SYNC-05).
+// A retry used to re-BeginScan every mailbox, discarding the previous
+// attempt's durable staged progress and restarting mailboxes that had
+// already completed. With the policy version as the scan generation:
+//
+//   - a mailbox whose scan for THIS generation is already running keeps
+//     its staged pages and resumes;
+//   - a mailbox whose scan for this generation already completed (its
+//     mail_scan_done marker) is not restarted at all;
+//   - a mailbox with a stale-generation scan (a superseding policy) has
+//     it replaced, which is correct — the old enumeration answers a
+//     question nobody is asking anymore.
+func (e *Engine) RequestRescanVersion(ctx context.Context, acct AccountID, ad Adapter, generation int64) error {
+	unlock := e.lockAccount(acct)
+	defer unlock()
+	scans, ok := e.store.(ScanStore)
+	if !ok {
+		return fmt.Errorf("mail: store %T cannot stage reconciliation scans", e.store)
+	}
+	boxes, err := ad.Mailboxes(ctx)
+	if err != nil {
+		return e.classify(ctx, acct, err)
+	}
+	if err := e.store.PutMailboxes(ctx, acct, boxes); err != nil {
+		return err
+	}
+	// Done markers of other generations are stale the moment this one
+	// starts; drop them so the table stays bounded by the live generation.
+	if generation != 0 {
+		if err := scans.PruneScanDone(ctx, acct, generation); err != nil {
+			return err
+		}
+	}
+	for _, box := range boxes {
+		scan, err := scans.RunningScan(ctx, acct, box.ID)
+		if err != nil && !errors.Is(err, ErrNoStore) {
+			return err
+		}
+		if scan != nil {
+			if scan.Generation == generation {
+				continue // resume this generation's staged progress
+			}
+			// A superseding policy replaces the stale enumeration.
+			if _, err := scans.BeginScanGeneration(ctx, acct, box.ID, generation); err != nil {
+				return err
+			}
+			continue
+		}
+		done, err := scans.ScanDone(ctx, acct, box.ID, generation)
+		if err != nil {
+			return err
+		}
+		if done {
+			continue // this generation already finished this mailbox
+		}
+		if _, err := scans.BeginScanGeneration(ctx, acct, box.ID, generation); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// beginScanAndRun is the reset path for staged-capable stores: a durable
+// scan begins from empty and runs immediately. The live mirror is not
+// touched until the scan completes.
+func (e *Engine) beginScanAndRun(ctx context.Context, acct AccountID, box MailboxID, ad Adapter, rep *SyncReport) (*SyncReport, error) {
+	scan, err := e.store.(ScanStore).BeginScan(ctx, acct, box)
+	if err != nil {
+		return nil, err
+	}
+	return e.resumeScan(ctx, acct, box, ad, scan, rep, nil)
+}
+
+// resumeScan walks a staged scan's remaining pages. Every page is staged
+// in one transaction (envelopes + seen + continuation). With PgStore the
+// terminal page and completion share that transaction, so pruning absent
+// messages, publishing the cursor, and recording the generation cannot be
+// interrupted between commits. A failure or page-budget exhaustion between
+// pages leaves the scan durable and resumable without pruning absences.
+//
+// A provider that rejects the scan's stored continuation (typed
+// ErrCursorInvalid, or an explicit Reset) gets ONE bounded replacement:
+// the invalid scan bookkeeping is discarded and a fresh scan begins from
+// empty, retaining all live mail. The old behavior — return an error and
+// leave the same rejected continuation stored — retried that continuation
+// forever across calls (audit 5 SYNC-03). A provider that rejects even a
+// fresh empty cursor is an error, not a loop.
+func (e *Engine) resumeScan(ctx context.Context, acct AccountID, box MailboxID, ad Adapter, scan *Scan, rep *SyncReport, first *Changes) (*SyncReport, error) {
+	scans := e.store.(ScanStore)
+	restarted := false
+
+	for page := 0; page < e.MaxPages; page++ {
+		var changes *Changes
+		if first != nil {
+			changes, first = first, nil
+		} else {
+			var err error
+			changes, err = ad.Sync(ctx, box, scan.Continuation)
+			if err != nil {
+				if errors.Is(err, ErrCursorInvalid) && !restarted {
+					restarted = true
+					rep.Reset = true
+					fresh, berr := scans.BeginScanGeneration(ctx, acct, box, scan.Generation)
+					if berr != nil {
+						return nil, berr
+					}
+					scan = fresh
+					first = nil
+					continue
+				}
+				return nil, e.classify(ctx, acct, err)
+			}
+			if changes.Reset {
+				if restarted {
+					return nil, fmt.Errorf("mail: %s/%s provider rejected a fresh recovery enumeration; retrying later", acct, box)
+				}
+				restarted = true
+				rep.Reset = true
+				fresh, berr := scans.BeginScanGeneration(ctx, acct, box, scan.Generation)
+				if berr != nil {
+					return nil, berr
+				}
+				scan = fresh
+				first = nil
+				continue
+			}
+		}
+
+		rep.Pages++
+		for _, c := range changes.Changes {
+			switch c.Kind {
+			case ChangeCreated:
+				rep.Created++
+			case ChangeUpdated:
+				rep.Updated++
+			}
+			// Destroyed inside a scan is NEGATIVE evidence, not noise: a
+			// message seen on an earlier page and destroyed at the
+			// provider before completion must not ride the seen set into
+			// survival — it is removed from the staged set and the live
+			// membership by ApplyScanPage (audit 5 SYNC-04).
+		}
+
+		prepared, err := e.prepareUpserts(ctx, acct, box, ad, changes)
+		if err != nil {
+			return nil, err
+		}
+		if finalizer, ok := scans.(FinalScanPageStore); changes.Complete && ok {
+			// Persist completion with the terminal page. Neither a process
+			// interruption nor optional body-prefetch failure may strand a
+			// running scan at an incremental cursor that never says Complete.
+			pruned, err := finalizer.ApplyFinalScanPage(ctx, scan.ID, prepared.upsert, prepared.seen, prepared.destroy, changes.Next)
+			if err != nil {
+				return nil, err
+			}
+			rep.Deleted += pruned
+		} else {
+			if err := scans.ApplyScanPage(ctx, scan.ID, prepared.upsert, prepared.seen, prepared.destroy, changes.Next); err != nil {
+				return nil, err
+			}
+			if changes.Complete {
+				// Compatibility for older ScanStore implementations. Finish
+				// before ancillary work, but only FinalScanPageStore can close
+				// the crash window between these two store transactions.
+				pruned, err := scans.FinishScan(ctx, acct, box, scan.ID, changes.Next)
+				if err != nil {
+					return nil, err
+				}
+				rep.Deleted += pruned
+			}
+		}
+
+		// Old identities retire only after their replacements are staged
+		// (same ordering rule as the delta path; audit 3 SYNC-03).
+		if len(prepared.promoted) > 0 {
+			rep.Upgraded += len(prepared.promoted)
+			if err := e.store.DeleteMessages(ctx, acct, prepared.promoted); err != nil {
+				return nil, err
+			}
+		}
+
+		if err := e.prefetchBodies(ctx, acct, ad, prepared.upsert); err != nil {
+			return nil, err
+		}
+		scan.Continuation = changes.Next
+
+		if changes.Complete {
+			return rep, nil
+		}
+	}
+
+	// Page budget exhausted mid-scan. Progress is staged; the next
+	// SyncMailbox call resumes from the stored continuation. This is not
+	// an error, exactly like a bounded delta run.
+	e.log.InfoContext(ctx, "staged scan reached the page budget; resuming on the next sync",
+		"account", acct, "mailbox", box)
 	return rep, nil
 }
 
 // sweepAbsent deletes stored messages that a complete enumeration omitted.
 //
 // This is only ever called after a run that both enumerated the mailbox in
-// full and finished. Running it on a partial listing would delete live mail,
-// which is why the two conditions are tracked separately.
+// full and finished, and only on stores without staged scans. Running it on
+// a partial listing would delete live mail, which is why the two conditions
+// are tracked separately.
 func (e *Engine) sweepAbsent(ctx context.Context, acct AccountID, box MailboxID, seen map[MessageID]bool) (int, error) {
 	stored, err := e.store.EnvelopeIDs(ctx, acct, box)
 	if err != nil {
@@ -240,21 +499,30 @@ func (e *Engine) sweepAbsent(ctx context.Context, acct AccountID, box MailboxID,
 	return len(gone), nil
 }
 
-// apply writes one page of deltas.
-func (e *Engine) apply(ctx context.Context, acct AccountID, box MailboxID, ad Adapter, changes *Changes, rep *SyncReport, seen map[MessageID]bool) error {
-	var (
-		upsert  []Envelope
-		fetch   []MessageID
-		destroy []MessageID
-	)
+// pageUpserts is the prepared write set of one page: envelopes to upsert
+// (bare-ID deltas backfilled), their post-promotion identities to record
+// as present, and superseded identities to retire afterwards.
+type pageUpserts struct {
+	upsert   []Envelope
+	seen     []MessageID
+	promoted []MessageID
+	destroy  []MessageID
+}
+
+// prepareUpserts resolves one page of changes into its write set. It is
+// shared by the delta path and staged scans so identity promotion,
+// mailbox defaults, and thread keys behave identically in both.
+func (e *Engine) prepareUpserts(ctx context.Context, acct AccountID, box MailboxID, ad Adapter, changes *Changes) (*pageUpserts, error) {
+	out := &pageUpserts{}
+	var fetch []MessageID
 
 	for _, c := range changes.Changes {
 		switch c.Kind {
 		case ChangeDestroyed:
-			destroy = append(destroy, c.ID)
+			out.destroy = append(out.destroy, c.ID)
 		case ChangeCreated, ChangeUpdated:
 			if c.Envelope != nil {
-				upsert = append(upsert, *c.Envelope)
+				out.upsert = append(out.upsert, *c.Envelope)
 			} else {
 				fetch = append(fetch, c.ID)
 			}
@@ -266,24 +534,25 @@ func (e *Engine) apply(ctx context.Context, acct AccountID, box MailboxID, ad Ad
 	if len(fetch) > 0 {
 		envs, err := ad.Envelopes(ctx, fetch)
 		if err != nil {
-			return e.classify(ctx, acct, err)
+			return nil, e.classify(ctx, acct, err)
 		}
-		upsert = append(upsert, envs...)
+		out.upsert = append(out.upsert, envs...)
 	}
 
-	for i := range upsert {
-		env := &upsert[i]
+	for i := range out.upsert {
+		env := &out.upsert[i]
 
 		// A message first seen without its Message-ID header carries a
 		// positional identity, which the next UIDVALIDITY change would
 		// invalidate. Promoting it now, while the header is in hand, is
 		// what keeps that message from reappearing as a duplicate later.
+		// The OLD identity is deleted only after the replacement envelope
+		// is written: deleting first turned a failed write into the loss
+		// of the only readable copy (audit 3 SYNC-03). A failure between
+		// the two now leaves the old record intact; the next sync retries.
 		if upgraded, ok := UpgradeIdentity(env.ID, env.MessageIDHeader); ok {
-			if err := e.store.DeleteMessages(ctx, acct, []MessageID{env.ID}); err != nil {
-				return err
-			}
+			out.promoted = append(out.promoted, env.ID)
 			env.ID = upgraded
-			rep.Upgraded++
 		}
 
 		if len(env.MailboxIDs) == 0 {
@@ -293,19 +562,38 @@ func (e *Engine) apply(ctx context.Context, acct AccountID, box MailboxID, ad Ad
 			env.ThreadID = ThreadID(ThreadKey(env))
 		}
 
-		// Recorded after any identity upgrade, so the sweep compares
-		// against the identities actually written to the store.
-		seen[env.ID] = true
+		// Recorded after any identity upgrade, so a scan's seen set (and
+		// the legacy sweep) compare against the identities actually
+		// written to the store.
+		out.seen = append(out.seen, env.ID)
+	}
+	return out, nil
+}
+
+// apply writes one page of deltas.
+func (e *Engine) apply(ctx context.Context, acct AccountID, box MailboxID, ad Adapter, changes *Changes, rep *SyncReport, seen map[MessageID]bool) error {
+	prepared, err := e.prepareUpserts(ctx, acct, box, ad, changes)
+	if err != nil {
+		return err
 	}
 
-	if err := e.store.PutEnvelopes(ctx, acct, upsert); err != nil {
+	if err := e.store.PutEnvelopes(ctx, acct, prepared.upsert); err != nil {
 		return err
+	}
+
+	// Old identities retire only after their replacements are stored (see
+	// the promotion note in prepareUpserts).
+	if len(prepared.promoted) > 0 {
+		rep.Upgraded += len(prepared.promoted)
+		if err := e.store.DeleteMessages(ctx, acct, prepared.promoted); err != nil {
+			return err
+		}
 	}
 
 	// Destroyed means "gone from this mailbox", which for a multi-mailbox
 	// provider is not the same as deleted. RemoveFromMailbox deletes only
 	// once the last membership is gone.
-	if err := e.store.RemoveFromMailbox(ctx, acct, box, destroy); err != nil {
+	if err := e.store.RemoveFromMailbox(ctx, acct, box, prepared.destroy); err != nil {
 		return err
 	}
 
@@ -320,26 +608,57 @@ func (e *Engine) apply(ctx context.Context, acct AccountID, box MailboxID, ad Ad
 		}
 	}
 
-	if e.FetchBodies {
-		for i := range upsert {
-			// A body never changes, and an envelope is upserted again for
-			// every flag change — a read receipt, a star, a move. Without this
-			// check the first sync after someone reads their mail re-downloads
-			// each message they touched, which is most of the cost of having
-			// prefetch on at all.
-			if _, err := e.store.Body(ctx, acct, upsert[i].ID); err == nil {
-				continue
+	for _, id := range prepared.seen {
+		seen[id] = true
+	}
+
+	return e.prefetchBodies(ctx, acct, ad, prepared.upsert)
+}
+
+// prefetchBodies caches bodies for a staged page of envelopes when the
+// server enabled prefetch. Message-local failures are best-effort;
+// account-wide conditions are returned so the caller halts the sync.
+func (e *Engine) prefetchBodies(ctx context.Context, acct AccountID, ad Adapter, upsert []Envelope) error {
+	if !e.FetchBodies {
+		return nil
+	}
+	for i := range upsert {
+		// A body never changes, and an envelope is upserted again for
+		// every flag change — a read receipt, a star, a move. Without this
+		// check the first sync after someone reads their mail re-downloads
+		// each message they touched, which is most of the cost of having
+		// prefetch on at all.
+		if _, err := e.store.Body(ctx, acct, upsert[i].ID); err == nil {
+			continue
+		}
+		if err := e.fetchBody(ctx, acct, ad, upsert[i].ID); err != nil {
+			// Account-wide conditions stop the whole prefetch loop, not
+			// just this message: a provider already throttling must not
+			// receive one more request per remaining body, and a dead
+			// context means nobody is listening anyway. A message-local
+			// failure stays best-effort — one unreadable message must not
+			// stop the sync carrying every other one. With mirror foreign
+			// keys in force (audit SYNC-04) this is also the path where a
+			// body whose parent expired under a concurrent retention sweep
+			// is refused instead of becoming an orphan.
+			if stopPrefetch(err) {
+				return err
 			}
-			if err := e.fetchBody(ctx, acct, ad, upsert[i].ID); err != nil {
-				// Warn and continue: a body that will not fetch is served
-				// on demand later, and one unreadable message must not stop
-				// the sync that carries every other one.
-				e.log.WarnContext(ctx, "body fetch failed",
-					"account", acct, "message", upsert[i].ID, "err", err)
-			}
+			e.log.WarnContext(ctx, "body fetch failed",
+				"account", acct, "message", upsert[i].ID, "err", err)
 		}
 	}
 	return nil
+}
+
+// stopPrefetch reports whether a body-fetch failure is account-wide: the
+// provider rejected the credential, is throttling, or the caller went away.
+// These must halt the batch instead of being retried per message.
+func stopPrefetch(err error) bool {
+	return errors.Is(err, ErrReauthRequired) ||
+		errors.Is(err, ErrRateLimited) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded)
 }
 
 func (e *Engine) fetchBody(ctx context.Context, acct AccountID, ad Adapter, id MessageID) error {
@@ -396,6 +715,9 @@ func (e *Engine) Locate(ctx context.Context, acct AccountID, id MessageID, ad Ad
 	if err != nil {
 		return err
 	}
+	if len(boxes) == 0 {
+		return fmt.Errorf("mail: message %s is not filed in any mailbox", id)
+	}
 	return sel.SelectMailbox(ctx, boxes[0])
 }
 
@@ -409,6 +731,15 @@ func (e *Engine) Locate(ctx context.Context, acct AccountID, id MessageID, ad Ad
 func (e *Engine) Apply(ctx context.Context, acct AccountID, op Operation, ad Adapter) error {
 	unlock := e.lockAccount(acct)
 	defer unlock()
+	// Protocols that need a selected mailbox get one before mutating: a
+	// freshly resolved adapter has not selected anything, and resolution
+	// of identities inside Apply is only meaningful in the message's own
+	// mailbox (audit IMAP-03). No-op for adapters that do not care.
+	if len(op.IDs) > 0 {
+		if err := e.Locate(ctx, acct, op.IDs[0], ad); err != nil {
+			return err
+		}
+	}
 	if err := ad.Apply(ctx, op); err != nil {
 		return e.classify(ctx, acct, err)
 	}
