@@ -1339,6 +1339,7 @@ async fn backend_cancel_identity_authority_and_disconnect() {
     }
     let (pid, wakeup) = ex.register_session_backend(owner).unwrap();
     let (peer_pid, _) = ex.register_session_backend(peer).unwrap();
+    ex.register_session_backend(other).unwrap();
     let (admin_pid, _) = ex.register_session_backend(admin).unwrap();
     assert_ne!(pid, peer_pid);
     assert_ne!(pid, admin_pid);
@@ -1402,9 +1403,14 @@ async fn backend_cancel_identity_authority_and_disconnect() {
 async fn backend_cancel_unauthenticated_and_unregistered_are_not_targets() {
     let ex = test_executor();
     let caller = ex.create_unauthenticated_session();
+    ex.register_session_backend(caller).unwrap();
     let target = ex.create_unauthenticated_session();
     let (pid, wakeup) = ex.register_session_backend(target).unwrap();
     let sql = format!("SELECT pg_cancel_backend({pid})");
+    assert!(
+        matches!(ex.execute(&sql).await, Err(ExecError::PermissionDenied(_))),
+        "embedded or unknown-session fallback must not supply cancellation authority"
+    );
     assert!(matches!(
         ex.execute_with_session(caller, &sql).await,
         Err(ExecError::PermissionDenied(_))
@@ -1412,6 +1418,7 @@ async fn backend_cancel_unauthenticated_and_unregistered_are_not_targets() {
     ex.bind_authenticated_session(caller, "nucleus")
         .await
         .unwrap();
+    ex.register_session_backend(caller).unwrap();
     let result = ex.execute_with_session(caller, &sql).await.unwrap();
     assert_eq!(scalar(&result[0]), &Value::Bool(false));
     assert!(wakeup.notified().now_or_never().is_none());

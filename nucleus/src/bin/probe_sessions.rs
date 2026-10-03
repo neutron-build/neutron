@@ -380,6 +380,8 @@ async fn section_cancellation(perturb: bool, sec: &mut Sections) {
     let (peer_pid, _) = ex
         .register_session_backend(peer)
         .expect("peer backend registration");
+    ex.register_session_backend(other)
+        .expect("other-role backend registration");
     if pid == peer_pid || exec(&ex, owner, "SELECT pg_backend_pid()").await != Ok(pid.to_string()) {
         sec.push(
             "cancellation",

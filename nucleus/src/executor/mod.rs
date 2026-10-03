@@ -3889,9 +3889,11 @@ impl Executor {
             return Ok(false);
         }
         let caller = self.current_session();
-        if caller.authenticated_user.read().is_none() {
+        if caller.backend_pid.load(Ordering::Acquire) <= 0
+            || caller.authenticated_user.read().is_none()
+        {
             return Err(ExecError::PermissionDenied(
-                "unauthenticated cancellation refused".into(),
+                "unregistered or unauthenticated cancellation refused".into(),
             ));
         }
         let caller_context = caller.session_context.read().clone();
