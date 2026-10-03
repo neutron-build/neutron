@@ -567,6 +567,38 @@ const pgPrepared = (
   };
 };
 
+/** Cancel a queued checkout without ever submitting a statement. pg-pool
+ * cannot remove its queued waiter, so a late checkout is immediately returned
+ * and its rejection stays observed. */
+async function acquirePgClient(pool: PgPoolLike, options?: QueryExecutionOptions): Promise<PgPoolClientLike> {
+  const preReason = preCancelCheck(options);
+  if (preReason) throw new QueryCanceledError('pg: canceled before pool checkout', { reason: preReason, dispatched: false });
+  return new Promise<PgPoolClientLike>((resolve, reject) => {
+    let settled = false;
+    const disarm = armCancellation(options, reason => {
+      settled = true;
+      reject(new QueryCanceledError('pg: canceled while waiting for pool checkout', { reason, dispatched: false }));
+    });
+    // An injected pool can throw synchronously as well as reject.
+    Promise.resolve().then(() => pool.connect()).then(client => {
+      disarm();
+      if (settled) { client.release(); return; }
+      settled = true;
+      resolve(client);
+    }, (error: unknown) => {
+      disarm();
+      if (settled) return;
+      settled = true;
+      reject(classifyDriverError(error, 'pg'));
+    });
+    if (options?.signal?.aborted && !settled) {
+      settled = true;
+      disarm();
+      reject(new QueryCanceledError('pg: canceled while waiting for pool checkout', { reason: 'signal', dispatched: false }));
+    }
+  });
+}
+
 /** Execute one statement on a checked-out pg client with server-side
  *  cancellation armed (pg_cancel_backend on an independent connection). */
 async function execPg(
@@ -589,15 +621,27 @@ async function execPg(
   const onCancelError = (error: Error): void => { cancelFailed = error; };
   if (armed) {
     if (!cancellationPool) throw new NeutronSqlError('pg: deadlines/signals require an independent cancellationPool when wrapping a pool');
-    pid = await backendPid();
     // Reserve the independent transport before submitting the main query.
     // A saturated application pool (including max:1) cannot queue a cancel
     // until after its target connection has been returned to another caller.
-    cancelClient = await cancellationPool.connect();
+    cancelClient = await acquirePgClient(cancellationPool, options);
     cancelClient.once?.("error", onCancelError);
     if (preCancelCheck(options) !== undefined) {
       cancelClient.removeListener?.("error", onCancelError);
       cancelClient.release();
+      throw new QueryCanceledError('pg: query canceled (signal) before submission', { reason: 'signal', dispatched: false });
+    }
+  }
+  if (armed) {
+    try { pid = await backendPid(); }
+    catch (error) {
+      cancelClient!.removeListener?.("error", onCancelError);
+      cancelClient!.release(cancelFailed);
+      throw error;
+    }
+    if (options?.signal?.aborted) {
+      cancelClient!.removeListener?.("error", onCancelError);
+      cancelClient!.release(cancelFailed);
       throw new QueryCanceledError('pg: query canceled (signal) before submission', { reason: 'signal', dispatched: false });
     }
   }
@@ -631,10 +675,10 @@ async function execPg(
  *  cancellation-armed single query). Attaches an error listener for the
  *  pin lifetime: pg-pool detaches its own while the client is checked out,
  *  and a dying socket otherwise surfaces as an unhandled 'error' event. */
-async function pgPin(pool: PgPoolLike, cancellationPool?: PgPoolLike): Promise<PinnedExecutor> {
+async function pgPin(pool: PgPoolLike, cancellationPool?: PgPoolLike, options?: QueryExecutionOptions): Promise<PinnedExecutor> {
   let client: PgPoolClientLike;
   try {
-    client = await pool.connect();
+    client = await acquirePgClient(pool, options);
   } catch (err) {
     throw classifyDriverError(err, "pg");
   }
@@ -717,7 +761,7 @@ export function wrapPgPool(pool: PgPoolLike, options: WrapAdapterOptions = {}): 
           throw classifyDriverError(err, "pg");
         }
       }
-      const pin = await pgPin(pool, cancellationPool);
+      const pin = await pgPin(pool, cancellationPool, execOptions);
       try {
         return await pin.query<T>(sqlText, params, execOptions);
       } finally {
@@ -733,7 +777,7 @@ export function wrapPgPool(pool: PgPoolLike, options: WrapAdapterOptions = {}): 
           throw classifyDriverError(err, "pg");
         }
       }
-      const pin = await pgPin(pool, cancellationPool);
+      const pin = await pgPin(pool, cancellationPool, execOptions);
       try {
         return await pin.execute(sqlText, params, execOptions);
       } finally {

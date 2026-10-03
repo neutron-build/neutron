@@ -8,6 +8,7 @@ import {
 } from "./engine.js";
 import {
   NeutronSqlError,
+  QueryCanceledError,
   MissingDriverError,
   ConnectionFailedError,
   ServerSqlError,
@@ -543,4 +544,27 @@ test("pg cancellation waits for dispatch before returning its target to the pool
     assert.equal(releases, 1);
   } finally { clearTimeout(keepAlive); }
   await assert.rejects(wrapPgPool(pool).query("select 1", [], { deadlineMs: 5 }), /independent cancellationPool/);
+});
+
+
+test("pg aborted queued checkout settles before acquisition and returns the late client unused", async () => {
+  let checkout!: (client: { query: () => Promise<{ rows: Record<string, unknown>[]; rowCount: number }>; release: () => void }) => void;
+  let ready!: () => void;
+  const queued = new Promise<void>(resolve => { ready = resolve; });
+  let releases = 0;
+  let submissions = 0;
+  const pool = {
+    query: async () => ({ rows: [], rowCount: 0 }),
+    connect: () => new Promise<{ query: () => Promise<{ rows: Record<string, unknown>[]; rowCount: number }>; release: () => void }>(resolve => { checkout = resolve; ready(); }),
+    end: async () => {},
+  };
+  const controller = new AbortController();
+  const pending = wrapPgPool(pool).query("select 1", [], { signal: controller.signal });
+  await queued;
+  controller.abort();
+  await assert.rejects(pending, (error: unknown) => error instanceof QueryCanceledError && !error.dispatched);
+  checkout({ query: async () => { submissions++; return { rows: [], rowCount: 0 }; }, release: () => { releases++; } });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(submissions, 0);
+  assert.equal(releases, 1);
 });

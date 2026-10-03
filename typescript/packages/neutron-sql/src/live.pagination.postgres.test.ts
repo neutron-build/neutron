@@ -442,7 +442,7 @@ test(`live pagination: REPEATABLE READ transaction pins one snapshot across page
           await db.insert(conc).values({ k: 0, tag: "concurrent" });
           const after = await pager.page(txDb.select().from(conc), undefined, 100);
           assert.equal(after.rows.length, 25, "the repeatable-read snapshot never sees the concurrent insert");
-        }, { isolation: "repeatable read" });
+        }, { isolation: "repeatable-read" });
         assert.deepEqual(
           collected,
           Array.from({ length: 25 }, (_, i) => `snap-${i + 1}`),
