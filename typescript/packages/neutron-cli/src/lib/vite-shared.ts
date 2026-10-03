@@ -31,11 +31,13 @@ export function stripCliOwnedPlugins(plugins: unknown): unknown[] {
 }
 
 /**
- * The esbuild half of the runtime. Returned separately from aliases because
- * it applies to every pass — SSR render, client bundle and islands alike.
+ * The JSX half of the runtime, as Vite's `oxc` transform options. Returned
+ * separately from aliases because it applies to every pass — SSR render,
+ * client bundle and islands alike.
  */
-export function runtimeEsbuild(runtime: NeutronRuntime) {
-  return resolveRuntimeJsx(runtime);
+export function runtimeOxc(runtime: NeutronRuntime) {
+  const { jsxImportSource } = resolveRuntimeJsx(runtime);
+  return { jsx: { runtime: "automatic" as const, importSource: jsxImportSource } };
 }
 
 /**

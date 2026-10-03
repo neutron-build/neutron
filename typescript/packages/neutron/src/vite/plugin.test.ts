@@ -118,3 +118,31 @@ describe("generateRoutesModule", () => {
     expect(output).toContain('["route:index.tsx","route:about.tsx"]');
   });
 });
+
+describe("dep optimizer virtual-namespace externals", () => {
+  type ConfigHook = (this: unknown) => {
+    optimizeDeps: {
+      exclude: string[];
+      rolldownOptions?: { plugins: Array<{ resolveId(id: string): unknown }> };
+      esbuildOptions?: { plugins: unknown[] };
+    };
+  };
+  const config = neutronPlugin().config as unknown as ConfigHook;
+
+  it("hands Rolldown its plugin on Vite 8, without the deprecated esbuild option", () => {
+    const { optimizeDeps } = config.call({ meta: { rolldownVersion: "1.0.0" } });
+    expect(optimizeDeps.esbuildOptions).toBeUndefined();
+    const [plugin] = optimizeDeps.rolldownOptions!.plugins;
+    expect(plugin.resolveId("virtual:neutron-islands")).toEqual({
+      id: "virtual:neutron-islands",
+      external: true,
+    });
+    expect(plugin.resolveId("preact")).toBe(null);
+  });
+
+  it("keeps the esbuild plugin for Vite 6, which calls the hook without a context", () => {
+    const { optimizeDeps } = config.call(undefined);
+    expect(optimizeDeps.rolldownOptions).toBeUndefined();
+    expect(optimizeDeps.esbuildOptions!.plugins).toHaveLength(1);
+  });
+});

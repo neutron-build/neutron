@@ -18,8 +18,8 @@
     "preact-render-to-string": "^6.5.0"
   },
   "devDependencies": {
-    "@preact/preset-vite": "^2.9.4",
+    "@preact/preset-vite": "^2.10.4",
     "typescript": "^5.7.2",
-    "vite": "^6.0.7"
+    "vite": "^8.3.2"
   }
 }

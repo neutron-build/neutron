@@ -7,8 +7,8 @@
     "blog/static-vs-app-routes/index.html": "2daef8be5903c4d88e56139763da4abb81f847355d93b87dd72d7f56bd93c288",
     "error-demo/index.html": "9211d7929c0f36dce2c6b644be209baeafea59222ef77d8852a630df3749317a",
     "index.html": "e71ecbb7fae9a8878fb893c1047ab386f241fd82f8e37c36cee6508d0d9722ba",
-    "islands/index.html": "0df2ec60a60b1cee0fe426c695e0ccc947c7470db1a8ce7edab6ae843c2a9b1f",
+    "islands/index.html": "2796ebfb64d9d9f2e02cefe42202cf4f6518c4c8d6529bbccb55b5aa05c6c91d",
     "login/index.html": "f03c13512609ff42b5b9be32cfc0bf5868ec26152b6bcf612c254f3929fd9bd3"
   },
-  "serverBundleGzBytes": 42658
+  "serverBundleGzBytes": 50089
 }
