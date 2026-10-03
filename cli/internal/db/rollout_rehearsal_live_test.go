@@ -38,7 +38,7 @@ func rolloutBuildFixtureApp(t *testing.T, version, read, write string) rolloutFi
 	binary := filepath.Join(dir, "app")
 	code := fmt.Sprintf(`package main
 import("context";"crypto/sha256";"encoding/hex";"encoding/json"
- "errors";"os";"time";"github.com/jackc/pgx/v5")
+ "os";"time";"github.com/jackc/pgx/v5")
 func fail(){os.Stderr.WriteString("fixture application operation failed\n");os.Exit(1)}
 func main(){ctx,cancel:=context.WithTimeout(context.Background(),10*time.Second);defer cancel();if len(os.Args)!=3{fail()};c,e:=pgx.Connect(ctx,os.Getenv("NEUTRON_ROLLOUT_APP_DATABASE_URL"));if e!=nil{fail()};defer c.Close(ctx);if os.Args[1]=="write"{_,e=c.Exec(ctx,%q,os.Args[2]);if e!=nil{fail()}}else if os.Args[1]!="read"{fail()};var value string;if e=c.QueryRow(ctx,%q).Scan(&value);e!=nil{fail()};path,e:=os.Executable();if e!=nil{fail()};bytes,e:=os.ReadFile(path);if e!=nil{fail()};sum:=sha256.Sum256(bytes);json.NewEncoder(os.Stdout).Encode(map[string]string{"version":%q,"artifactSha256":hex.EncodeToString(sum[:]),"value":value})}
 `, write, read, version)
