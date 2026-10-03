@@ -20,7 +20,7 @@ export default function TypeScriptPage() {
             <p>Static HTML is the default. App routes add request-time rendering and client navigation; static pages can add interactive islands.</p>
           </div>
           <div class="hero__install" data-animate>
-            <Terminal command="npm create neutron@latest" />
+            <Terminal command="npm create @neutron-build@latest" />
           </div>
         </div>
       </section>

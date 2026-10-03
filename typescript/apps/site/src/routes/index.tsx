@@ -68,7 +68,7 @@ export default function HomePage() {
                 data-animate
                 style="--animate-delay: 0.4s"
               >
-                <Terminal command="npm create neutron@latest" />
+                <Terminal command="npm create @neutron-build@latest" />
               </div>
             </div>
             <NeutronAtom />
@@ -561,7 +561,7 @@ export default function HomePage() {
               Ready to build?
             </h2>
             <div data-animate style="--animate-delay: 0.1s">
-              <Terminal command="npm create neutron@latest" />
+              <Terminal command="npm create @neutron-build@latest" />
             </div>
             <div
               class="cta__steps"

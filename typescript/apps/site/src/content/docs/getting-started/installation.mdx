@@ -6,11 +6,14 @@ description: Create and run a Neutron TypeScript project.
 ## Create a project
 
 ```bash
-npm create neutron@latest my-app
+npm create @neutron-build@latest my-app
 cd my-app
 npm install
 npm run dev
 ```
+
+The scaffolder is published as `@neutron-build/create`. The previous
+`create-neutron` package is deprecated; use the scoped command above.
 
 The development server prints its local URL when it starts.
 
@@ -22,7 +25,7 @@ questions are asked.
 Pass `--template` when you need a different starting point:
 
 ```bash
-npm create neutron@latest my-docs -- --template docs
+npm create @neutron-build@latest my-docs -- --template docs
 ```
 
 Available templates are `basic`, `marketing`, `app`, `full`, and `docs`.
@@ -30,10 +33,10 @@ Available templates are `basic`, `marketing`, `app`, `full`, and `docs`.
 To use React compatibility instead of the default Preact runtime:
 
 ```bash
-npm create neutron@latest my-app -- --runtime react-compat
+npm create @neutron-build@latest my-app -- --runtime react-compat
 ```
 
-Run `npm create neutron@latest -- --help` for the complete option list.
+Run `npm create @neutron-build@latest -- --help` for the complete option list.
 
 ## What the scaffold installs
 

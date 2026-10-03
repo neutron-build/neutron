@@ -440,7 +440,7 @@ importers:
       '@neutron-build/core':
         specifier: workspace:^
         version: link:../neutron
-      create-neutron:
+      '@neutron-build/create':
         specifier: workspace:^
         version: link:../create-neutron
       preact:

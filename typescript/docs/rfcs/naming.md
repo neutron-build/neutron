@@ -1,6 +1,6 @@
 # RFC: Naming Convention Across Neutron
 
-- Status: Accepted (amended 2026-05-28 — see "Reality note" below)
+- Status: Accepted (amended 2026-10-02 — see "Reality note" below)
 - Date: 2026-02-20
 - Owners: Neutron maintainers
 
@@ -22,7 +22,7 @@ Adopt the following canonical naming model:
 1. Do not combine the platform name `Neutron` and the subsystem name `Nucleus` in one artifact name. (The org scope `@neutron-build` is a brand/org identifier, not the platform name itself; a package such as `@neutron-build/nucleus` is therefore acceptable — the artifact's package name is `nucleus`, distinct from `neutron` at the platform layer. On Cargo, the framework's integration crate `neutron-nucleusdb` is likewise acceptable — it is named after its dependency artifact `nucleusdb`, exactly as `neutron-redis` is named after `redis`.)
 2. Do not combine multiple implementation labels (`typescript`, `rust`, `zig`, `mojo`) in one artifact name.
 3. Keep implementation package prefixes as:
-   - npm: `@neutron-build/*` (plus `create-neutron` for the project generator) — see Reality note below
+   - npm: `@neutron-build/*` (including `@neutron-build/create` for the project generator) — see Reality note below
    - Cargo: `neutron` / `neutron-*`
    - Mojo projects: `neutron-mojo-*`
 4. Keep subsystem package prefixes as:
@@ -39,7 +39,7 @@ The amended npm rules above use the `@neutron-build/*` org scope, which:
 
 - Preserves the layer separation in spirit by treating `@neutron-build` as an org/brand identifier (not the platform name `Neutron`).
 - Keeps the artifact package name within the scope adherent to the layer rule (e.g. `@neutron-build/nucleus` for the Nucleus *client* — a distinct artifact from the subsystem itself).
-- Reserves `create-neutron` (unscoped) as the only required unscoped name (npm's `npm create <name>` convention demands a package literally named `create-<name>`).
+- Uses `@neutron-build/create` for the project generator: `npm create @neutron-build@latest` resolves this scoped package. The previous unscoped `create-neutron` package is deprecated.
 
 ~~Cargo and Mojo prefixes are unaffected — bare `neutron` / `nucleus` remain available in those ecosystems.~~ **Correction (2026-08-23): that claim was false for Cargo.** Both bare names are taken on crates.io too: `neutron` by a dormant Pulsar client (last publish 2024-04), `nucleus` by an abandoned 2020 Minecraft datapack generator. `nucleus-db` is additionally taken by an active third-party STM32 toolchain (since 2026-06). Decisions, verified free at correction time:
 
