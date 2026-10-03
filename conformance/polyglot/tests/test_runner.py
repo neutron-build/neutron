@@ -34,6 +34,12 @@ class RunnerTests(unittest.TestCase):
     def test_unsupported_not_pass(self):
         command = [sys.executable,'-c', 'print(\'{"protocol":"polyglot-conformance-v1","case_id":"scalar-extremes","status":"unsupported"}\')']
         with self.assertRaises(ValueError): invoke(command, {'case_id':'scalar-extremes'}, 1)
+    def test_swapped_scope_or_profile_fails(self):
+        request = {'case_id':'scalar-extremes','profile':'postgres-direct','schema_scope':'neutron_polyglot_'+'a'*32}
+        for changed in [{'profile':'other'}, {'schema_scope':'neutron_polyglot_'+'b'*32}]:
+            response = {'protocol':PROTOCOL, 'status':'pass', **request, **changed}
+            command = [sys.executable, '-c', 'print('+repr(json.dumps(response))+')']
+            with self.assertRaisesRegex(ValueError, 'identity mismatch'): invoke(command, request, 1)
     def test_native_mismatch_cleans(self):
         actions=[]
         def fake(command, request, timeout):

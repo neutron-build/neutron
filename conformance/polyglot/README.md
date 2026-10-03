@@ -49,7 +49,7 @@ assume no concurrent privileged object replacement. Abrupt runner termination
 can leave schemas; it never causes cleanup of unowned schemas.
 
 The native oracle imports psycopg, never Neutron. It reads exact decimal/int8
-and timestamp text directly from PostgreSQL, with explicit UTC, and compares
+and timestamp text directly from PostgreSQL, with explicit UTC and ISO/YMD DateStyle, and compares
 SQL NULL and JSON null separately. Its expected scalar record is independently
 specified in the runner. This first case does not cover arrays, domains, write
 omission, ORM lifecycle, or all cross-language permutations.

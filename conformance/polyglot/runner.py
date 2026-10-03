@@ -30,7 +30,7 @@ def invoke(command: list[str], request: dict, timeout: float) -> dict:
         result = json.loads(stdout)
     except ValueError as exc:
         raise ValueError('adapter stdout must contain one JSON envelope') from exc
-    if not isinstance(result, dict) or result.get('protocol') != PROTOCOL or result.get('case_id') != request['case_id']:
+    if not isinstance(result, dict) or result.get('protocol') != PROTOCOL or result.get('case_id') != request['case_id'] or result.get('profile') != request.get('profile') or result.get('schema_scope') != request.get('schema_scope'):
         raise ValueError('adapter envelope identity mismatch')
     if result.get('status') != 'pass':
         raise ValueError('required case failed or unsupported')

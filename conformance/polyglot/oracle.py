@@ -37,7 +37,7 @@ def execute(request: dict, connect=None) -> dict:
                 cur.execute('SELECT pg_catalog.obj_description(oid, %s) FROM pg_catalog.pg_namespace WHERE nspname = %s', ('pg_namespace', scope))
                 marker = cur.fetchone()
                 if marker is None and action == 'cleanup':
-                    return {'protocol': PROTOCOL, 'case_id': request['case_id'], 'status': 'pass', 'rows': [], 'oracle': 'native-postgresql-text-v1'}
+                    return {'protocol': PROTOCOL, 'case_id': request['case_id'], 'profile': request['profile'], 'schema_scope': scope, 'status': 'pass', 'rows': [], 'oracle': 'native-postgresql-text-v1'}
                 if marker is None or marker[0] != MARKER + token:
                     raise ValueError('schema ownership marker mismatch')
                 if action == 'cleanup':
@@ -46,9 +46,10 @@ def execute(request: dict, connect=None) -> dict:
                 else:
                     # SQL text output avoids Python/Neutron numeric and temporal codecs.
                     cur.execute("SET LOCAL TIME ZONE 'UTC'")
+                    cur.execute("SET LOCAL DateStyle = 'ISO, YMD'")
                     cur.execute(sql.SQL('SELECT id::text, big::text, precise::text, moment::text, sql_null IS NULL, document::text FROM {}.values_fixture ORDER BY id').format(sql.Identifier(scope)))
                     rows = [list(row) for row in cur.fetchall()]
-    return {'protocol': PROTOCOL, 'case_id': request['case_id'], 'status': 'pass', 'rows': rows, 'oracle': 'native-postgresql-text-v1'}
+    return {'protocol': PROTOCOL, 'case_id': request['case_id'], 'profile': request['profile'], 'schema_scope': scope, 'status': 'pass', 'rows': rows, 'oracle': 'native-postgresql-text-v1'}
 
 def main():
     try:
