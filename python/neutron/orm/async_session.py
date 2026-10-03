@@ -210,9 +210,15 @@ class AsyncSession(_SessionState):
             if tx.state=='aborted': self._store.rollback()
             else: self._store.uncertain();self._uncertain=True
             self._failed=True;raise
-        else: self._store.committed()
+        else:
+            try:
+                self._store.committed();self._links.clear()
+            except BaseException as exc:
+                self._store.fence_after_commit();self._postcommit_failed=True;self._failed=True;self._database._discard()
+                if isinstance(exc,KeyboardInterrupt): raise PostCommitInterruptedError() from exc
+                if isinstance(exc,asyncio.CancelledError): raise PostCommitCancelledError() from exc
+                raise PostCommitError() from exc
         finally: self._transaction=None
-        self._links.clear()
         try:
             if self.expire_on_commit:
                 for record in self._store.records.values(): self._store.expire(record,frozenset(record.mapping.field_columns),discard_changes=False)
@@ -239,7 +245,7 @@ class AsyncSession(_SessionState):
         if self._closed: return
         expired={identity:record.expired_fields for identity,record in self._store.records.items() if record.state is ObjectState.EXPIRED}
         try:
-            if not self._uncertain: await self.rollback()
+            if not self._uncertain and not self._postcommit_failed: await self.rollback()
         finally:
             for identity,names in expired.items():
                 record=self._store.records.get(identity)

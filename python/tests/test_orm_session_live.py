@@ -447,3 +447,17 @@ async def test_native_async_postcommit_cancel_has_known_committed_outcome(mapped
         assert caught.value.outcome=='committed'
         assert native.execute(f'SELECT name FROM {m.table.sql}').fetchone()==('durable',)
         assert session.object_state(obj) is ObjectState.PERSISTENT
+
+
+def test_native_acknowledged_commit_state_failure_remains_known_committed(mapped,monkeypatch):
+    url,m,native=mapped
+    with Session.connect(url) as session:
+        obj=User(name='durable');session.add(m,obj)
+        def fail(): raise RuntimeError('state adoption failed')
+        monkeypatch.setattr(session._store,'committed',fail)
+        with pytest.raises(PostCommitError) as caught: session.commit()
+        assert caught.value.outcome=='committed'
+        assert native.execute(f'SELECT name FROM {m.table.sql}').fetchone()==('durable',)
+        assert session.object_state(obj) is ObjectState.UNAVAILABLE_AFTER_COMMIT
+        with pytest.raises(OrmError): session.rollback()
+    assert session.object_state(obj) is ObjectState.UNAVAILABLE_AFTER_COMMIT

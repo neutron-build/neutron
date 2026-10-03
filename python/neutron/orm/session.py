@@ -26,7 +26,7 @@ class _SessionState:
         self.expire_on_commit=expire_on_commit
         self._store=StateStore()
         self._mappings: dict[tuple[Any,...],ModelMapping[Any]]={}
-        self._closed=False;self._failed=False;self._uncertain=False
+        self._closed=False;self._failed=False;self._uncertain=False;self._postcommit_failed=False
         self.autobegin=autobegin;self.autoflush=autoflush
         self._listeners: dict[EventName,list[Callable[[SessionEvent],Any]]]={}
         self._emitting=False
@@ -40,6 +40,7 @@ class _SessionState:
         if self._emitting: raise SessionBusyError('Session API reentrancy from event callback refused')
         if self._closed: raise OrmError('mapped Session closed')
         if self._database.closed and not allow_failed: raise OrmError('mapped Session connection fenced; create a new Session')
+        if self._postcommit_failed: raise OrmError('known commit state unavailable; use a new Session')
         if self._uncertain: raise OrmError('mapped Session outcome indeterminate; use a new Session')
         if self._failed and not allow_failed: raise OrmError('mapped Session requires rollback')
 
@@ -493,9 +494,14 @@ class Session(_SessionState):
             if tx.state=='aborted': self._store.rollback()
             else: self._store.uncertain();self._uncertain=True
             self._failed=True;raise
-        else: self._store.committed()
+        else:
+            try:
+                self._store.committed();self._links.clear()
+            except BaseException as exc:
+                self._store.fence_after_commit();self._postcommit_failed=True;self._failed=True;self._database._discard()
+                if isinstance(exc,KeyboardInterrupt): raise PostCommitInterruptedError() from exc
+                raise PostCommitError() from exc
         finally: self._transaction=None
-        self._links.clear()
         try:
             if self.expire_on_commit:
                 for record in self._store.records.values(): self._store.expire(record,frozenset(record.mapping.field_columns),discard_changes=False)
@@ -521,7 +527,7 @@ class Session(_SessionState):
         if self._closed: return
         expired={identity:record.expired_fields for identity,record in self._store.records.items() if record.state is ObjectState.EXPIRED}
         try:
-            if not self._uncertain: self.rollback()
+            if not self._uncertain and not self._postcommit_failed: self.rollback()
         finally:
             for identity,names in expired.items():
                 record=self._store.records.get(identity)

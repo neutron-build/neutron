@@ -22,6 +22,7 @@ class ObjectState(str,Enum):
     DELETED='deleted'
     DETACHED='detached'
     INDETERMINATE='indeterminate'
+    UNAVAILABLE_AFTER_COMMIT='unavailable-after-commit'
 
 @dataclass
 class Record(Generic[T]):
@@ -189,9 +190,16 @@ class StateStore:
                 record.expired_fields=frozenset(record.mapping.field_columns)
                 expire_attributes(record.obj,record.expired_fields)
 
+    def fence_after_commit(self) -> None:
+        for record in self.records.values():
+            record.state=ObjectState.UNAVAILABLE_AFTER_COMMIT
+            if record.mapping.instrumented:
+                record.expired_fields=frozenset(record.mapping.field_columns)
+                expire_attributes(record.obj,record.expired_fields)
+
     def detach_all(self) -> None:
         for record in self.records.values():
-            if record.state is not ObjectState.INDETERMINATE: record.state=ObjectState.DETACHED
+            if record.state not in {ObjectState.INDETERMINATE,ObjectState.UNAVAILABLE_AFTER_COMMIT}: record.state=ObjectState.DETACHED
             self._remember(record.obj,record.state)
             self._release(record.obj)
         self.records.clear();self.identities.clear()
