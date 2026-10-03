@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import { createHash } from "node:crypto";
 import { build as viteBuild, loadConfigFromFile, mergeConfig, createServer } from "vite";
 import { neutronPlugin, CLIENT_ROUTE_QUERY } from "@neutron-build/core/vite";
-import { runtimeEsbuild, warnOnDuplicateCorePlugin } from "../lib/vite-shared.js";
+import { runtimeOxc, warnOnDuplicateCorePlugin } from "../lib/vite-shared.js";
 import {
   discoverRoutes,
   adapterCloudflare,
@@ -54,7 +54,7 @@ export async function build(): Promise<void> {
   const runtime = resolveRuntime(neutronConfig);
   // JSX comes from the declared runtime, so a project needs no Vite plugin of
   // its own to compile it: the fact is stated once, in neutron.config.ts.
-  const esbuildJsx = runtimeEsbuild(runtime);
+  const oxcJsx = runtimeOxc(runtime);
   const runtimeAliases = resolveRuntimeAliases(runtime);
   const runtimeNoExternal = resolveRuntimeNoExternal(runtime);
   // Absolute preact / RTS paths so Vite SSR can resolve the renderer even when
@@ -187,7 +187,7 @@ export async function build(): Promise<void> {
   // Build client assets. For static-only sites (no app routes), create a
   // temporary CSS-only entry so Vite still extracts stylesheets without
   // requiring an index.html entry point. Static sites WITH islands take the
-  // same branch: neutronPlugin only supplies a Rollup entry for app routes,
+  // same branch: neutronPlugin only supplies a Rolldown entry for app routes,
   // so the app-bundle build below would fall back to Vite's default
   // `index.html` entry and die with UNRESOLVED_ENTRY. Their island code is
   // built by the dedicated islands pass further down, and going through the
@@ -197,7 +197,7 @@ export async function build(): Promise<void> {
     console.log("Building client bundle...");
     await viteBuild(
       mergeConfig(userConfig, {
-        esbuild: esbuildJsx,
+        oxc: oxcJsx,
         configFile: false,
         root: cwd,
         plugins: [
@@ -268,7 +268,7 @@ export async function build(): Promise<void> {
     );
     await viteBuild(
       mergeConfig(userConfig, {
-        esbuild: esbuildJsx,
+        oxc: oxcJsx,
         configFile: false,
         root: cwd,
         plugins: [
@@ -302,7 +302,7 @@ export async function build(): Promise<void> {
           outDir: outputDir,
           emptyOutDir: true,
           lib: { entry: cssEntryPath, formats: ["es"] as const },
-          rollupOptions: {
+          rolldownOptions: {
             output: { assetFileNames: "assets/[name]-[hash][extname]" },
           },
           cssCodeSplit: false,
@@ -340,15 +340,15 @@ export async function build(): Promise<void> {
     writeClientEntryMetadata(outputDir, clientEntryScriptSrc);
   }
 
-  // Standalone islands entry: a SEPARATE Rollup build (so the SPA/app client
+  // Standalone islands entry: a SEPARATE Rolldown build (so the SPA/app client
   // bundle stays byte-identical). It imports only the island runtime + the
-  // virtual islands manifest — never the SPA runtime — so Rollup code-splits
+  // virtual islands manifest — never the SPA runtime — so Rolldown code-splits
   // each island into its own chunk. Prerendered static pages with islands
   // reference THIS entry instead of the 34KB index-*.js.
   if (hasIslands) {
     await viteBuild(
       mergeConfig(userConfig, {
-        esbuild: esbuildJsx,
+        oxc: oxcJsx,
         configFile: false,
         root: cwd,
         plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
@@ -361,7 +361,7 @@ export async function build(): Promise<void> {
           outDir: outputDir,
           // Do NOT empty the output — the SPA/app client bundle is already there.
           emptyOutDir: false,
-          rollupOptions: {
+          rolldownOptions: {
             input: { "neutron-islands": "@neutron-build/core/client/islands-entry" },
             output: {
               entryFileNames: "assets/[name]-[hash].js",
@@ -398,7 +398,7 @@ export async function build(): Promise<void> {
   // Create a Vite SSR server for rendering
   const server = await createServer(
     mergeConfig(userConfig, {
-      esbuild: esbuildJsx,
+      oxc: oxcJsx,
       configFile: false,
       root: cwd,
       plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
@@ -970,7 +970,7 @@ function extractClientCssFiles(outputDir: string): string[] {
 
 /**
  * Find the standalone islands entry chunk emitted by the client build. Named
- * input "neutron-islands" → Rollup emits `assets/neutron-islands-[hash].js`.
+ * input "neutron-islands" → Rolldown emits `assets/neutron-islands-[hash].js`.
  */
 function extractIslandsEntryScriptSrc(outputDir: string): string | null {
   const assetsDir = path.join(outputDir, "assets");
@@ -1204,7 +1204,7 @@ async function buildRuntimeBundle(
           enforce: "pre" as const,
           resolveId(id: string) {
             if (id === "preact-render-to-string/stream") {
-              // Return the real file so rollup bundles it (Vite's SSR
+              // Return the real file so Rolldown bundles it (Vite's SSR
               // noExternal resolver otherwise yields a raw <pkgdir>/stream
               // path that fails to load — docker/node preset breakage).
               return createRequire(path.join(options.cwd, "package.json")).resolve(id);
@@ -1251,7 +1251,7 @@ async function buildRuntimeBundle(
         ssr: entryPath,
         outDir: bundleOutDir,
         emptyOutDir: true,
-        rollupOptions: {
+        rolldownOptions: {
           output: {
             format: "esm",
             entryFileNames: "entry.js",
