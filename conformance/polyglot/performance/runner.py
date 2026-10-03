@@ -116,7 +116,9 @@ def run(args):
             if str(executable)!=runtime['executable'] or digest(executable)!=runtime['sha256']:
                 raise ValueError('consumer runtime bytes changed after preparation')
     binding = {'profile_sha256': digest(PROFILE), 'consumers_sha256': digest(args.consumers),
-        'source_revision': descriptor['source_revision'], 'artifacts': identities}
+        'source_revision': descriptor['source_revision'], 'artifacts': identities,
+        'harness_sha256': {str(path.relative_to(Path(__file__).resolve().parents[1])): digest(path)
+            for path in (Path(__file__).resolve(), Path(__file__).with_name('prepare.py'), Path(__file__).resolve().parents[1] / 'protocol.py')}}
     if args.phase == 'characterize':
         if args.calibration is None or args.review is None: raise ValueError('separate calibration and review required')
         prior = json.loads(args.calibration.read_text())
