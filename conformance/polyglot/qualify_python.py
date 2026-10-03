@@ -14,6 +14,8 @@ import shutil
 import signal
 import subprocess
 import sys
+# Explicit trusted tooling directory works with Python's isolated (-I) entry.
+sys.path.insert(0,str(Path(__file__).resolve().parent))
 from protocol import PROTOCOL, redact
 
 ROOT=Path(__file__).resolve().parent
@@ -70,6 +72,9 @@ def qualify(source: Path, work: Path, timeout: float) -> dict:
     clients=list(wheels.glob('neutron_framework-*.whl'))
     if len(clients)!=1: raise ValueError('exactly one built client wheel required')
     command([str(python),'-I','-m','pip','install','--no-index','--find-links',str(wheels),str(clients[0])+'[orm]'],work,timeout)
+    runtime_program="import hashlib,json,pathlib,sys;binary=pathlib.Path(sys.executable).resolve();print(json.dumps({'version':sys.version,'implementation':sys.implementation.name,'executable':str(binary),'executable_sha256':hashlib.sha256(binary.read_bytes()).hexdigest()}))"
+    runtime=command([str(python),'-I','-B','-c',runtime_program],work,timeout,True)
+    (work/'runtime-identity.json').write_text(runtime)
     freeze=command([str(python),'-I','-m','pip','freeze','--all'],work,timeout,True)
     (work/'resolved-requirements.txt').write_text(freeze)
     shutil.copy2(source/'pyproject.toml',work/'direct-requirements.toml')
