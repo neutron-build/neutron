@@ -21,6 +21,7 @@ type modelInfo struct {
 	schema, name string
 	fields       []fieldInfo
 	byGoName     map[string]int
+	catalogOIDs  [][]uint32
 }
 
 // Table is immutable validated metadata for a struct mapped to a qualified

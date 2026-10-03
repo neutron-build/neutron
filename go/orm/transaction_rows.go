@@ -89,6 +89,15 @@ func (r *scopeRows) decodeFailure(err error) {
 	r.op.scope.failed = errors.Join(r.op.scope.failed, ErrScopeDecode, err)
 	owner.mu.Unlock()
 }
+func (r *scopeRows) rejectResult(err error) {
+	if !r.enter() {
+		return
+	}
+	defer r.mu.Unlock()
+	if !r.closed {
+		r.decodeFailure(err)
+	}
+}
 func (r *scopeRows) Values() ([]any, error) {
 	if !r.enter() {
 		return nil, ErrConcurrentUse

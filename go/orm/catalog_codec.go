@@ -108,6 +108,7 @@ func NewPostgresTable[M any](ctx context.Context, db Executor, schema, name stri
 	if err := rows.Err(); err != nil {
 		return Table[M]{}, wrap("qualify codecs", err)
 	}
+	table.info.catalogOIDs = make([][]uint32, len(table.info.fields))
 	for fieldIndex, field := range table.info.fields {
 		codec, ok := catalog[field.name]
 		if !ok {
@@ -143,6 +144,7 @@ func NewPostgresTable[M any](ctx context.Context, db Executor, schema, name stri
 		if typ.Kind() == reflect.Pointer {
 			typ = typ.Elem()
 		}
+		table.info.catalogOIDs[fieldIndex] = []uint32{codec.oid, base.oid}
 		if !qualifiedCatalogCodec(typ, base) {
 			if contract, ok := custom[fieldIndex]; ok && codec.oid == contract.oid && codec.schema == contract.typeSchema && codec.name == contract.typeName {
 				continue

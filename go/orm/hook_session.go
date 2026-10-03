@@ -249,6 +249,10 @@ func (r *hookRows) closeWithError(err error) {
 	})
 }
 func (r *hookRows) Close() { r.closeWithError(nil) }
+func (r *hookRows) rejectResult(err error) {
+	rejectResult(r.Rows, err)
+	r.closeWithError(err)
+}
 func (r *hookRows) Next() bool {
 	ok := r.Rows.Next()
 	if !ok {

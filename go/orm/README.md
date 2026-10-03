@@ -714,3 +714,18 @@ caller paging. Errors return no partial projections and keep Scope rollback.
 ```sh
 go test ./orm -run 'Test(TypedSubquery|PostgresTypedScalar)' -count=1 -v
 ```
+
+`NewBoundSQL` provides a trusted developer SQL escape hatch with immutable
+qualified scalar parameters. Values remain separate pgx arguments; SQL text is
+not constructed from them. `SelectBound` requires a positive result budget and
+validates every native result column's name, position and OID before returning
+complete models. Omitted, reordered, renamed and incompatible fields refuse;
+native catalog-qualified custom OIDs must retain their recorded identity.
+Overflow/errors return no partial models. Projection/budget rejection poisons an
+owned Scope even when swallowed. The SQL itself is trusted application code,
+may contain native writes/CTEs, and makes no read-only assertion. Borrowed native
+connections retain caller transaction policy and protocol choice.
+
+```sh
+go test ./orm -run 'Test(BoundSQL|PostgresBoundSQL)' -count=1 -v
+```
