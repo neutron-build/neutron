@@ -81,6 +81,29 @@ class StateStore:
         if other is not None and other is not record: raise OrmError('generated identity collision')
         self.identities[identity]=record
 
+    def refreshed(self,record: Record[Any],values: dict[str,Any]) -> None:
+        if self.records.get(id(record.obj)) is not record or record.state is not ObjectState.PERSISTENT or record.was_new:
+            raise OrmError('refresh requires an existing persistent tracked object')
+        if set(values)!=set(record.mapping.field_columns): raise OrmError('incomplete refresh projection')
+        for name,column in record.mapping.field_columns.items(): column.spec.check(values[name])
+        if self._identity(record.mapping,values)!=self._identity(record.mapping,record.baseline):
+            raise OrmError('refresh changed tracked primary-key identity')
+        snapshot=deepcopy(values)
+        record.mapping.restore(record.obj,snapshot)
+        record.baseline=snapshot
+        # Preserve original: rollback reconciles the pretransaction snapshot.
+
+    def detach(self,record: Record[Any]) -> None:
+        if self.records.get(id(record.obj)) is not record or record.state is not ObjectState.PERSISTENT or record.was_new:
+            raise OrmError('detach requires an existing persistent tracked object')
+        if self.dirty(record) or any(not same_value(value,record.original[name]) for name,value in record.baseline.items()):
+            raise OrmError('detach refuses dirty or uncommitted scalar state')
+        self.records.pop(id(record.obj))
+        record.state=ObjectState.DETACHED
+        self._remember(record.obj,ObjectState.DETACHED)
+        self._release(record.obj)
+        self._reindex()
+
     def committed(self) -> None:
         for record in list(self.records.values()):
             if record.state is ObjectState.DELETED:

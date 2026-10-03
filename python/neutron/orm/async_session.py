@@ -57,6 +57,20 @@ class AsyncSession(_SessionState):
         except BaseException:
             self._failed=True;raise
 
+    async def refresh(self,obj: T,*,discard_changes: bool=False) -> T:
+        record=self._refresh_record(obj,discard_changes)
+        try:
+            await self._ensure_transaction()
+            mapping=record.mapping
+            query=select_row(mapping.table,*mapping.field_columns.values()).where(self._predicate(mapping,record.baseline))
+            try: row=await self._database.one(query)
+            except CardinalityError as exc: raise ConflictError('refresh did not find exactly one existing row') from exc
+            values={name:row[column.name] for name,column in mapping.field_columns.items()}
+            self._store.refreshed(record,values)
+            return obj
+        except BaseException:
+            self._failed=True;raise
+
     async def flush(self) -> None:
         self._guard()
         try:

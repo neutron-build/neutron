@@ -79,3 +79,24 @@ def test_nonfinite_numeric_pk_refused():
     t=Table('numeric_keys',{'id':ColumnSpec(Decimal,'numeric')})
     m=ModelMapping(Numeric,t,{'id':t.column('id',Decimal)},primary_key=('id',))
     with pytest.raises(ValueError): StateStore().attach(m,Numeric(Decimal('NaN')),new=False)
+
+
+def test_refresh_retains_identity_validates_before_mutation_and_restores_original():
+    m=mapping();obj=User(1,'original');store=StateStore();record=store.attach(m,obj,new=False)
+    store.refreshed(record,{'id':1,'name':'external'})
+    assert obj.name=='external' and store.find(m,(1,)) is obj
+    assert record.original['name']=='original'
+    with pytest.raises(ValueError): store.refreshed(record,{'id':1,'name':17})
+    with pytest.raises(OrmError): store.refreshed(record,{'id':2,'name':'changed identity'})
+    assert obj.id==1 and obj.name=='external'
+    store.rollback();assert obj.name=='original'
+
+
+def test_detach_removes_identity_and_releases_object_owner_without_reconciliation():
+    m=mapping();obj=User(1,'original');store=StateStore();record=store.attach(m,obj,new=False)
+    store.detach(record)
+    assert store.find(m,(1,)) is None and store.object_state(obj) is ObjectState.DETACHED
+    other=StateStore();other.attach(m,obj,new=False)
+    obj.name='second session';store.rollback()
+    assert obj.name=='second session'
+    other.detach_all()

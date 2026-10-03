@@ -91,3 +91,49 @@ async def test_async_scalar_session_native_state_and_owner(mapped):
         with pytest.raises(SessionBusyError): await asyncio.create_task(foreign())
         session.delete(obj);await session.flush();await session.rollback()
         assert native.execute(f'SELECT count(*) FROM {m.table.sql}').fetchone()==(1,)
+
+
+def test_native_refresh_discard_rollback_and_detach_same_identity(mapped):
+    url,m,native=mapped
+    with Session.connect(url) as session:
+        obj=User(name='original');session.add(m,obj);session.commit()
+        native.execute(f'UPDATE {m.table.sql} SET name=%s,active=false WHERE id=%s',('external',obj.id))
+        obj.name='local'
+        with pytest.raises(OrmError,match='dirty'): session.refresh(obj)
+        assert session.refresh(obj,discard_changes=True) is obj
+        assert (obj.name,obj.active)==('external',False)
+        with pytest.raises(OrmError,match='active transaction'): session.detach(obj)
+        session.rollback();assert (obj.name,obj.active)==('original',True)
+        session.refresh(obj);session.commit()
+        identity=obj.id;session.detach(obj)
+        assert session.object_state(obj) is ObjectState.DETACHED
+        loaded=session.get(m,identity)
+        assert loaded is not None and loaded is not obj and loaded.name=='external'
+        session.rollback()
+        # add remains INSERT rather than attaching an existing row.
+        with pytest.raises(ValueError): session.add(m,obj)
+
+
+def test_native_refresh_missing_row_fences_until_rollback(mapped):
+    url,m,native=mapped
+    with Session.connect(url) as session:
+        obj=User(name='vanished');session.add(m,obj);session.commit()
+        native.execute(f'DELETE FROM {m.table.sql} WHERE id=%s',(obj.id,))
+        with pytest.raises(ConflictError): session.refresh(obj)
+        with pytest.raises(OrmError,match='requires rollback'): session.get(m,obj.id)
+        session.rollback();assert obj.name=='vanished'
+
+@pytest.mark.asyncio
+async def test_native_async_refresh_and_detach(mapped):
+    url,m,native=mapped
+    async with await AsyncSession.connect(url) as session:
+        obj=User(name='original');session.add(m,obj);await session.commit()
+        native.execute(f'UPDATE {m.table.sql} SET name=%s WHERE id=%s',('external',obj.id))
+        obj.name='local'
+        with pytest.raises(OrmError,match='dirty'): await session.refresh(obj)
+        assert await session.refresh(obj,discard_changes=True) is obj
+        await session.rollback();assert obj.name=='original'
+        await session.refresh(obj);await session.commit()
+        session.detach(obj)
+        assert session.object_state(obj) is ObjectState.DETACHED
+        assert await session.get(m,obj.id) is not obj

@@ -14,6 +14,7 @@ class ConflictError(OrmError): pass
 
 class _SessionState:
     _database: Database | AsyncDatabase
+    _transaction: object | None
     def __init__(self,*,autobegin: bool=True,autoflush: bool=True) -> None:
         self._store=StateStore()
         self._mappings: dict[tuple[Any,...],ModelMapping[Any]]={}
@@ -43,6 +44,23 @@ class _SessionState:
         self._guard();record=self._store.records.get(id(obj))
         if record is None or record.state is not ObjectState.PERSISTENT: raise OrmError('delete requires a persistent tracked object')
         record.state=ObjectState.DELETE_PENDING
+
+    def _refresh_record(self,obj: object,discard_changes: bool) -> Record[Any]:
+        self._guard()
+        if type(discard_changes) is not bool: raise ValueError('discard_changes requires a boolean')
+        record=self._store.records.get(id(obj))
+        if record is None or record.state is not ObjectState.PERSISTENT or record.was_new:
+            raise OrmError('refresh requires an existing persistent tracked object')
+        dirty=self._store.dirty(record) # Primary-key mutation always refuses.
+        if dirty and not discard_changes: raise OrmError('refresh refuses dirty scalar state; explicitly discard changes')
+        return record
+
+    def detach(self,obj: object) -> None:
+        self._guard()
+        if self._transaction is not None: raise OrmError('detach refuses an active transaction')
+        record=self._store.records.get(id(obj))
+        if record is None: raise OrmError('detach requires a tracked object')
+        self._store.detach(record)
 
     def object_state(self,obj: object) -> ObjectState:
         self._owner_check()
@@ -133,6 +151,20 @@ class Session(_SessionState):
             row=self._database.one_or_none(select_row(mapping.table,*mapping.field_columns.values()).where(self._predicate(mapping,values)))
             if row is None: return None
             obj=mapping.construct(row);self._store.attach(mapping,obj,new=False);return obj
+        except BaseException:
+            self._failed=True;raise
+
+    def refresh(self,obj: T,*,discard_changes: bool=False) -> T:
+        record=self._refresh_record(obj,discard_changes)
+        try:
+            self._ensure_transaction()
+            mapping=record.mapping
+            query=select_row(mapping.table,*mapping.field_columns.values()).where(self._predicate(mapping,record.baseline))
+            try: row=self._database.one(query)
+            except CardinalityError as exc: raise ConflictError('refresh did not find exactly one existing row') from exc
+            values={name:row[column.name] for name,column in mapping.field_columns.items()}
+            self._store.refreshed(record,values)
+            return obj
         except BaseException:
             self._failed=True;raise
 

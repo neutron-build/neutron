@@ -219,3 +219,21 @@ lazy loads, many-to-many inference, graph writes, cascades and Session identity
 attachment are unsupported. Multiple batches have no implicit shared snapshot;
 callers must arrange RepeatableRead/Serializable isolation when needed. Parent
 objects are never modified, and failures return no partial association result.
+
+`session.refresh(obj, discard_changes=False)` (awaited for AsyncSession) performs
+an explicit exact-one read onto the same tracked object, without autoflush.
+Only existing persistent objects are eligible; pending/newly flushed inserts,
+deleted/detached objects and primary-key mutations are refused. Dirty scalar
+fields require `discard_changes=True`. All returned values and the unchanged
+canonical key are validated before in-place replacement; generated fields come
+from the database. Missing/multiple rows, decoding failures or cancellation
+require rollback. Refresh preserves the pretransaction original snapshot:
+rollback restores it, which may be stale after external writes; explicitly
+refresh again to observe current state. Commit adopts the refreshed baseline.
+
+`session.detach(obj)` is synchronous for both Session classes and performs no
+I/O. It requires a clean existing persistent object, no active transaction and
+no uncommitted snapshot changes. It removes the identity entry, releases object
+ownership and records `DETACHED`; later `get` loads a separate instance. `add`
+continues to mean INSERT, not attach-existing. This API does not implement
+expiration, implicit attribute I/O or graph reconciliation.

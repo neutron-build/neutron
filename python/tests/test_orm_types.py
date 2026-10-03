@@ -63,3 +63,12 @@ def static_relation_consumer(db: Database,rel: Relation[User,User],parents: list
 
 async def static_async_relation_consumer(db: AsyncDatabase,rel: Relation[User,User],parents: list[User]) -> None:
     assert_type(await async_load_many(db,rel,parents,budget=LoadBudget(10,20,5)),tuple[Association[User,User],...])
+
+
+def static_refresh_consumer(session: Session,obj: User) -> None:
+    assert_type(session.refresh(obj),User)
+    assert_type(session.detach(obj),None)
+
+async def static_async_refresh_consumer(session: AsyncSession,obj: User) -> None:
+    assert_type(await session.refresh(obj),User)
+    assert_type(session.detach(obj),None)
