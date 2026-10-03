@@ -318,6 +318,7 @@ export class CursorStream<T> implements AsyncIterableIterator<T> {
     for (const k of Object.keys(modes) as Array<keyof TransactionModes>) if (modes[k] === undefined) delete modes[k];
 
     const state = transactionScopeState(ctx.driver);
+    if (state === 'suspended') throw new NeutronSqlError('stream: enclosing transaction is suspended while a nested transaction owns the connection');
     if (state === "settled") {
       throw new NeutronSqlError("stream: this query belongs to a transaction scope that has already settled — open the stream inside the transaction callback or on the database itself");
     }
@@ -423,6 +424,9 @@ export class CursorStream<T> implements AsyncIterableIterator<T> {
   }
 
   async #next(): Promise<IteratorResult<T>> {
+    if (!this.#done && transactionScopeState(this.#ctx.driver) === 'suspended') {
+      throw new NeutronSqlError('stream: enclosing transaction is suspended while a nested transaction owns the connection');
+    }
     if (this.#signal?.aborted === true && !this.#done) {
       await this.#stop().catch(() => {});
       this.#aborted = true;
@@ -491,6 +495,9 @@ export class CursorStream<T> implements AsyncIterableIterator<T> {
   }
 
   async #stop(): Promise<void> {
+    if (!this.#done && transactionScopeState(this.#ctx.driver) === 'suspended') {
+      throw new NeutronSqlError('stream: enclosing transaction is suspended; close the stream after the nested transaction settles');
+    }
     const session = this.#session;
     const wasDone = this.#done;
     this.#finish();

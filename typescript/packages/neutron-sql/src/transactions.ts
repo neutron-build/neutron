@@ -157,15 +157,16 @@ export interface TransactionHooks {
 // the transaction settles (on pg the released client may already serve
 // another borrower). Registration is by scope identity; non-runner drivers
 // are unregistered.
-const SCOPE_STATE = new WeakMap<object, () => boolean>();
+type ScopeState = 'active' | 'suspended' | 'settled';
+const SCOPE_STATE = new WeakMap<object, () => ScopeState>();
 
 /** Transaction state of a driver-level scope created by the shared runner:
  *  "active" while its callback runs, "settled" once the callback returned or
  *  threw (COMMIT/ROLLBACK follows), undefined for any other driver. */
-export function transactionScopeState(driver: object): "active" | "settled" | undefined {
+export function transactionScopeState(driver: object): ScopeState | undefined {
   const active = SCOPE_STATE.get(driver);
   if (active === undefined) return undefined;
-  return active() ? "active" : "settled";
+  return active();
 }
 
 let txSequence = 0;
@@ -264,7 +265,7 @@ export async function runTransaction<T>(
         execute(params?: unknown[]): Promise<number> { return observe(() => track(owner, () => prepared.execute(params))); },
       };
     };
-    SCOPE_STATE.set(scope, () => owner.active && currentOwner === owner && !callbackSettled && !released);
+    SCOPE_STATE.set(scope, () => !owner.active || callbackSettled || released ? 'settled' : currentOwner === owner ? 'active' : 'suspended');
     return scope;
   };
 

@@ -295,3 +295,26 @@ test("batch protocol: inside db.transaction the batch joins the scope (no BEGIN 
     ["begin", "select", "select", "commit"],
   );
 });
+
+test('parent streams and batches refuse suspended access without losing buffered rows', async () => {
+  const { driver, pins } = fakeDriver(5);
+  const database = await createDatabase({ driver, tables: { items } });
+  await database.transaction(async tx => {
+    const stream = tx.select().from(items).stream({ batchSize: 3 });
+    const batch = tx.batch([tx.select().from(items)]);
+    assert.equal((await stream.next()).value.id, 1);
+    await tx.transaction(async () => {
+      const before = [...pins[0]!.log];
+      await assert.rejects(stream.next(), /suspended/);
+      await assert.rejects(stream.return(), /suspended/);
+      await assert.rejects(batch.execute(), /suspended/);
+      assert.deepEqual(pins[0]!.log, before);
+    });
+    assert.equal((await stream.next()).value.id, 2);
+    assert.equal((await stream.next()).value.id, 3);
+    await stream.return();
+    assert.equal((await batch.execute())[0].length, 5);
+  });
+  assert.equal(pins[0]!.released, 1);
+  await database.close();
+});

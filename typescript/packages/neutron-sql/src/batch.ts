@@ -124,6 +124,7 @@ export class BatchQuery<T extends readonly unknown[]> implements PromiseLike<T> 
 
   #ownership(): "own" | "enclosing" {
     const state = transactionScopeState(this.#ctx.driver);
+    if (state === 'suspended') throw new NeutronSqlError('batch: enclosing transaction is suspended while a nested transaction owns the connection');
     if (state === "settled") {
       throw new NeutronSqlError("batch: this batch belongs to a transaction scope that has already settled — run it inside the transaction callback or on the database itself");
     }
