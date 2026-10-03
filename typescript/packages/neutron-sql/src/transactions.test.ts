@@ -571,3 +571,41 @@ test('unawaited failed public query promises remain observed through rollback', 
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(pin.statements.at(-1), 'rollback');
 });
+
+test('savepoint create bookkeeping fences reentrant event listeners before native name shadowing', async () => {
+  const pin = fakePin();
+  let tx!: TransactionScope;
+  let second!: Promise<Savepoint>;
+  await runTransaction(pin, async scope => {
+    tx = scope;
+    await tx.savepoint('same');
+    await assert.rejects(second, /already active/);
+  }, {}, { onEvent: event => {
+    if (event.kind === 'savepoint' && event.savepointAction === 'create') second = tx.savepoint('same');
+  } });
+  assert.equal(pin.statements.filter(text => text === 'savepoint "same"').length, 1);
+});
+
+test('unawaited failed savepoint handles are observed and drained before root rollback', async () => {
+  for (const action of ['rollbackTo', 'release'] as const) {
+    const pin = fakePin();
+    const execute = pin.execute.bind(pin);
+    let finish!: () => void;
+    const gate = new Promise<void>(resolve => { finish = resolve; });
+    pin.execute = async text => {
+      if (text.startsWith(action === 'release' ? 'release savepoint' : 'rollback to')) {
+        await gate; throw new Error('native control failure');
+      }
+      return execute(text);
+    };
+    const done = runTransaction(pin, async tx => {
+      const sp = await tx.savepoint();
+      void sp[action]();
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    finish();
+    await assert.rejects(done, /pending operations/);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(pin.statements.at(-1), 'rollback');
+  }
+});

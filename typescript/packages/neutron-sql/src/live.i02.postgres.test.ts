@@ -393,12 +393,10 @@ for (const driverKind of ["postgres", "pg"] as const) {
       // after sp_a survives, and sp_b itself stays usable. sp_c was nested
       // inside the rolled-back region, so PG discarded it.
       await spB.rollbackTo();
-      // Releasing the discarded savepoint fails — and the failure ABORTS
-      // the transaction (subsequent commands are ignored). ROLLBACK TO
-      // SAVEPOINT is exactly the recovery move: it works while aborted.
+      // The discarded handle now refuses locally without aborting the transaction.
       await spC.release().then(
         () => assert.fail("released a savepoint nested inside a rolled-back region"),
-        (e: unknown) => assert.match(String((e as Error).message), /does not exist|invalid savepoint|current transaction is aborted/i),
+        (e: unknown) => assert.match(String((e as Error).message), /already released/i),
       );
       await spB.rollbackTo();
       await tx.insert(notes).values({ body: "after-b3" });

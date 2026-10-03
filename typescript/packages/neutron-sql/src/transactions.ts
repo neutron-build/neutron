@@ -269,50 +269,61 @@ export async function runTransaction<T>(
   };
 
   const nextAutoName = (): string => {
-    const name = `neutron_sp_${++savepointSeq}`;
+    let name: string;
+    do { name = `neutron_sp_${++savepointSeq}`; } while (savepoints.some(sp => sp.state === 'active' && sp.name === name));
     // defensive: the generated shape always matches; keep the guard for
     // future format changes
     if (!SAVEPOINT_NAME.test(name)) throw new NeutronSqlError(`internal: generated savepoint name ${name} failed validation`);
     return name;
   };
 
-  const createSavepoint = async (owner: ScopeOwner, name?: string): Promise<Savepoint> => {
+  const createSavepoint = (owner: ScopeOwner, name?: string): Promise<Savepoint> => {
     checkOwner(owner);
     const spName = name === undefined ? nextAutoName() : name;
     if (!SAVEPOINT_NAME.test(spName)) {
       throw new NeutronSqlError(`savepoint name "${spName}" is not a plain identifier (letters, digits, underscore; must not start with a digit)`);
     }
     if (savepoints.some(sp => sp.state === 'active' && sp.name === spName)) throw new NeutronSqlError('savepoint name is already active');
-    const createSql = `savepoint "${spName}"`;
-    const control = (sql: string): Promise<number> => track(owner, async () => {
-      try { return await pin.execute(sql); } catch (err) { failure = err; throw err; }
-    });
-    await control(createSql);
-    emit({ kind: "savepoint", statementId: statementIdOf(createSql), txId, savepointName: spName, savepointAction: "create" });
-    const record = { name: spName, owner, state: 'active' as SavepointState };
-    savepoints.push(record);
-    return {
-      name: spName,
-      async rollbackTo(): Promise<void> {
-        checkOwner(owner);
-        if (record.state === "released") throw new NeutronSqlError(`savepoint "${spName}" was already released`);
-        const sql = `rollback to savepoint "${spName}"`;
-        await control(sql);
-        for (const removed of savepoints.splice(savepoints.indexOf(record) + 1)) removed.state = 'released';
-        emit({ kind: "savepoint", statementId: statementIdOf(sql), txId, savepointName: spName, savepointAction: "rollback-to" });
-      },
-      async release(): Promise<void> {
-        checkOwner(owner);
-        if (record.state === "released") throw new NeutronSqlError(`savepoint "${spName}" was already released`);
-        const sql = `release savepoint "${spName}"`;
-        try {
-          await control(sql);
-        } finally {
-          for (const removed of savepoints.splice(savepoints.indexOf(record))) removed.state = 'released';
-        }
-        emit({ kind: "savepoint", statementId: statementIdOf(sql), txId, savepointName: spName, savepointAction: "release" });
-      },
+    const nativeControl = async (sql: string): Promise<void> => {
+      try { await pin.execute(sql); } catch (err) { failure = err; throw err; }
     };
+    return track(owner, async () => {
+      const createSql = `savepoint "${spName}"`;
+      await nativeControl(createSql);
+      const record = { name: spName, owner, state: 'active' as SavepointState };
+      savepoints.push(record);
+      emit({ kind: "savepoint", statementId: statementIdOf(createSql), txId, savepointName: spName, savepointAction: "create" });
+      const checkHandle = (): void => {
+        checkOwner(owner);
+        if (record.state === 'released') throw new NeutronSqlError(`savepoint "${spName}" was already released`);
+      };
+      return {
+        name: spName,
+        rollbackTo(): Promise<void> {
+          return observe(() => {
+            checkHandle();
+            return track(owner, async () => {
+              const sql = `rollback to savepoint "${spName}"`;
+              await nativeControl(sql);
+              for (const removed of savepoints.splice(savepoints.indexOf(record) + 1)) removed.state = 'released';
+              emit({ kind: "savepoint", statementId: statementIdOf(sql), txId, savepointName: spName, savepointAction: "rollback-to" });
+            });
+          });
+        },
+        release(): Promise<void> {
+          return observe(() => {
+            checkHandle();
+            return track(owner, async () => {
+              const sql = `release savepoint "${spName}"`;
+              try { await nativeControl(sql); } finally {
+                for (const removed of savepoints.splice(savepoints.indexOf(record))) removed.state = 'released';
+              }
+              emit({ kind: "savepoint", statementId: statementIdOf(sql), txId, savepointName: spName, savepointAction: "release" });
+            });
+          });
+        },
+      };
+    });
   };
 
   const runSavepoint = <Tx>(parent: ScopeOwner, nested: (tx: TransactionScope) => Promise<Tx>): Promise<Tx> => {
