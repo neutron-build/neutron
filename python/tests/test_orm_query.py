@@ -100,3 +100,15 @@ def test_derived_and_cte_projection_ownership_labels_and_parameter_order():
         with pytest.raises(ValueError): query_from(a).select(field(key)).compile()
     with pytest.raises(ValueError): derived(source,'bad',labels=())
     with pytest.raises(ValueError): derived(query_from(a).select_pair(field(aid),field(aid)),'bad',labels=('x','x'))
+
+
+def test_set_result_filter_and_rhs_free_scope_cannot_escape():
+    from neutron.orm import alias,exists
+    a,_=tables();col=a.column('id',int)
+    q=query_from(a).select(field(col))
+    with pytest.raises(ValueError): q.union(q).where(col.eq(1))
+    outer=alias(a,'outer');other=alias(a,'other');inner=alias(a,'inner')
+    left=query_from(inner).correlate(outer).select(field(inner.column('id',int))).where(inner.column('id',int).eq(outer.column('id',int)))
+    right=query_from(inner).correlate(other).select(field(inner.column('id',int))).where(inner.column('id',int).eq(other.column('id',int)))
+    with pytest.raises(ValueError,match='correlation'): left.union(right)
+    with pytest.raises(ValueError): query_from(outer).select(field(outer.column('id',int))).where(exists(right))

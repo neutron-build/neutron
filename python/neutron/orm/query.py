@@ -99,6 +99,7 @@ class Query(Generic[T]):
     set_terms: tuple[tuple[str,Query[T]], ...] = ()
 
     def where(self, condition: Predicate) -> Query[T]:
+        if self.set_terms: raise ValueError('filter a set result through an explicit derived/CTE source')
         if not isinstance(condition, Predicate) or condition.owners - (self.scope.tables | self.scope.correlated):
             raise ValueError('predicate outside query scope')
         return replace(self, predicate=condition if self.predicate is None else self.predicate & condition)
