@@ -7,7 +7,7 @@ fixture creation, expected rows, raw SQL observations or oracle implementation.
 From the integrated repository root, on the execution box only:
 
 ```sh
-python3 conformance/polyglot/adapters/go/qualify.py
+python3 -I -B conformance/polyglot/adapters/go/qualify.py
 ```
 
 The existing runner/oracle must be present, psycopg installed, Go1.26+ available,
@@ -40,3 +40,8 @@ connection environment. Only the runner/oracle/adapter execution receives the
 private disposable URL. Interrupted subprocess groups are killed and reaped,
 including interruption exceptions; preserved artifacts remain available for
 review on both success and failure.
+
+The qualifier strips PYTHONPATH/PYTHONHOME before tooling or fixture subprocesses.
+It launches the copied coordinator through an isolated `-I -B` bootstrap with
+only its owned directory explicitly added for the runner's sibling imports.
+Invoke the qualifier itself with `-I -B` as shown above.

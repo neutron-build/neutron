@@ -24,7 +24,7 @@ consumer = Path(tempfile.mkdtemp(prefix='neutron-polyglot-go-consumer-')).resolv
 if consumer.is_relative_to(root):
     raise SystemExit('consumer must be outside the origin')
 build_env = {key: value for key, value in os.environ.items()
-             if not key.endswith('DATABASE_URL') and not key.startswith('PG') and key != 'DB_URL'}
+             if not key.endswith('DATABASE_URL') and not key.startswith('PG') and key not in {'DB_URL', 'PYTHONPATH', 'PYTHONHOME'}}
 build_env.update({'GOWORK': 'off', 'GOTOOLCHAIN': 'local', 'GOFLAGS': ''})
 
 def run(argv, cwd=root, timeout=180, environment=None):
@@ -160,7 +160,10 @@ try:
         {'path': str(p.relative_to(consumer)), 'sha256': hashlib.sha256(p.read_bytes()).hexdigest()}
         for p in sorted(artifact_paths)]}))
     runner_env = {**build_env, 'NEUTRON_TEST_DATABASE_URL': database_url}
-    result = json.loads(run([sys.executable, str(coordinator / 'runner.py'),
+    bootstrap = ('import runpy,sys; from pathlib import Path; '
+                 'target=Path(sys.argv[1]).resolve(); sys.path.insert(0,str(target.parent)); '
+                 'sys.argv=sys.argv[1:]; runpy.run_path(str(target),run_name=\"__main__\")')
+    result = json.loads(run([sys.executable, '-I', '-B', '-c', bootstrap, str(coordinator / 'runner.py'),
         '--manifest', str(manifest), '--artifact-manifest', str(artifacts),
         '--artifact-root', str(consumer), '--required'], environment=runner_env))
     report = {'status': 'pass', 'scope': 'outside-origin archived Go module scalar read only',
