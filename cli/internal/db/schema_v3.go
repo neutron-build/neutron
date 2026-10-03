@@ -343,7 +343,7 @@ func UpgradeSchemaDocumentV3(raw []byte) (*V3Document, error) {
 		if err := json.Unmarshal(raw, &schema); err != nil {
 			return nil, err
 		}
-		if err := ValidateSchema(&schema); err != nil {
+		if err := ValidateSchemaV1ForUpgrade(&schema); err != nil {
 			return nil, err
 		}
 		root, err := UpgradeV1Schema(&schema)

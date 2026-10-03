@@ -102,6 +102,10 @@ func TestV3UpgradeRetainsV2BytesAndUnknownCoverage(t *testing.T) {
 	if _, err := UpgradeSchemaDocumentV3(v1); err != nil {
 		t.Fatal(err)
 	}
+	legacyVector := []byte(`{"version":1,"tables":[{"name":"vectors","columns":[{"name":"embedding","type":"vector","vectorDimensions":3,"nucleusOnly":true}]}]}`)
+	if _, err := UpgradeSchemaDocumentV3(legacyVector); err != nil {
+		t.Fatalf("existing v1-for-upgrade pgvector compatibility lost: %v", err)
+	}
 	ambiguous := []byte(`{"version":1,"tables":[{"name":"t","columns":[{"name":"x","type":"integer","hasDefault":true}]}]}`)
 	if _, err := UpgradeSchemaDocumentV3(ambiguous); err == nil {
 		t.Fatal("v1 ambiguous-default refusal was bypassed")

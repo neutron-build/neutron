@@ -50,3 +50,41 @@ go test ./internal/db -run '^TestV2' -count=1
 
 These commands have not been run by the author. Native PostgreSQL qualification
 and independent review at the integration hash are required before acceptance.
+
+`Client.IntrospectV3` inventories visible user-schema routines and types using a
+single read-only repeatable-read transaction with a local `pg_catalog` deparser
+path. Function/procedure definitions, owners, settings, ACL spelling, input
+signatures, return types and all argument modes are preserved. Domains retain
+qualified base types, defaults and constraint definitions; composites retain
+physical attribute order and qualified types; enums retain value order; ranges
+retain qualified subtype/range/multirange/opclass/collation references. Extension
+membership is captured directly and through internal array/row-type dependencies.
+Undefined shell types retain only trustworthy identity and an explicit limitation.
+Aggregate definitions, base I/O/storage behavior and complete range semantics
+remain incomplete and unmanaged. Policies/grants/triggers/extensions as whole
+families still require further implementation; selected object ACL or extension
+fields are not whole-family coverage.
+
+PostgreSQL 17's [routine catalog](https://www.postgresql.org/docs/17/catalog-pg-proc.html)
+defines `proargtypes` as the input call signature and distinguishes full argument
+modes separately. Its [type catalog](https://www.postgresql.org/docs/17/catalog-pg-type.html)
+defines shell-type limitations and qualified type relationships; the
+[range catalog](https://www.postgresql.org/docs/17/catalog-pg-range.html) provides
+range references. The reader does not infer these catalog behaviors for Nucleus.
+
+Native acceptance requires an owned disposable PostgreSQL 17 database with
+CREATEDB and the installed `vector` extension available. The existing Q07 fixture
+creates/drops its isolated database and refuses to skip when required:
+
+```sh
+# cwd cli; coordinator supplies NEUTRON_E2E_DATABASE_URL without printing it
+NEUTRON_LIVE_REQUIRED=1 go test ./internal/db \
+  -run '^TestV3NativeQualifiedRoutinesTypesAndReadOnlyRoundTrip$' -count=1
+```
+
+The native oracle checks persisted domain data and function definitions unchanged,
+existing v2 snapshots unchanged, typed v3 export/import and repeated introspection
+stable, hostile search paths/catalog lookalikes unable to redirect reads, and a
+function drop/recreate receiving a new OID without changing the portable hash.
+Quoted names, zero/same-name/domain overloads, INOUT procedures, composite order,
+ranges, shell types and direct/internal extension ownership are mandatory cases.

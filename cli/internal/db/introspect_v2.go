@@ -334,7 +334,15 @@ type v2RelationInfo struct {
 
 // IntrospectV2 reads the connected database into a validated schema
 // document v2.
+// v2CatalogReader allows v3 to reuse the immutable relational-v2 reader on
+// one pinned read-only transaction. The public v2 reader retains its pool path.
+type v2CatalogReader struct{ pool pgQueryer }
+
 func (c *Client) IntrospectV2(ctx context.Context) (*V2Document, error) {
+	return (&v2CatalogReader{pool: c.pool}).introspect(ctx)
+}
+
+func (c *v2CatalogReader) introspect(ctx context.Context) (*V2Document, error) {
 	schemaNames, err := c.introspectV2Schemas(ctx)
 	if err != nil {
 		return nil, err
@@ -600,7 +608,7 @@ func sortV2Model(m *V2DocumentModel) {
 	sort.Strings(m.Capabilities)
 }
 
-func (c *Client) introspectV2Schemas(ctx context.Context) ([]string, error) {
+func (c *v2CatalogReader) introspectV2Schemas(ctx context.Context) ([]string, error) {
 	rows, err := c.pool.Query(ctx, introspectV2SchemasSQL)
 	if err != nil {
 		return nil, fmt.Errorf("introspect v2 schemas: %w", err)
@@ -617,7 +625,7 @@ func (c *Client) introspectV2Schemas(ctx context.Context) ([]string, error) {
 	return out, rows.Err()
 }
 
-func (c *Client) introspectV2Enums(ctx context.Context) (enums []V2EnumDecl, opaque []V2Opaque, err error) {
+func (c *v2CatalogReader) introspectV2Enums(ctx context.Context) (enums []V2EnumDecl, opaque []V2Opaque, err error) {
 	rows, err := c.pool.Query(ctx, introspectV2EnumsSQL)
 	if err != nil {
 		return nil, nil, fmt.Errorf("introspect v2 enums: %w", err)
@@ -679,7 +687,7 @@ func (c *Client) introspectV2Enums(ctx context.Context) (enums []V2EnumDecl, opa
 	return enums, opaque, nil
 }
 
-func (c *Client) introspectV2Relations(ctx context.Context) ([]v2RelationInfo, error) {
+func (c *v2CatalogReader) introspectV2Relations(ctx context.Context) ([]v2RelationInfo, error) {
 	rows, err := c.pool.Query(ctx, introspectV2RelationsSQL)
 	if err != nil {
 		return nil, fmt.Errorf("introspect v2 relations: %w", err)
@@ -706,7 +714,7 @@ func (c *Client) introspectV2Relations(ctx context.Context) ([]v2RelationInfo, e
 // view with check_option/security_invoker only, so user triggers (INSTEAD
 // OF or statement-level), security barriers and any other unmodeled
 // reloption must never be flattened into the plain shape.
-func (c *Client) introspectV2View(ctx context.Context, rel v2RelationInfo) (V2View, []string, error) {
+func (c *v2CatalogReader) introspectV2View(ctx context.Context, rel v2RelationInfo) (V2View, []string, error) {
 	view := V2View{
 		Identity: V2Identity{Schema: rel.schema, Name: rel.name},
 		Managed:  true,
@@ -752,7 +760,7 @@ func (c *Client) introspectV2View(ctx context.Context, rel v2RelationInfo) (V2Vi
 // introspectV2Table reads one candidate table. Returned reasons make the
 // table unrepresentable (opaque inventory); fkRefs are the qualified FK
 // target identities for the cascade pass.
-func (c *Client) introspectV2Table(ctx context.Context, rel v2RelationInfo, hasVector *bool) (V2Table, []string, []V2Identity, error) {
+func (c *v2CatalogReader) introspectV2Table(ctx context.Context, rel v2RelationInfo, hasVector *bool) (V2Table, []string, []V2Identity, error) {
 	return introspectV2TableOn(ctx, c.pool, rel, hasVector)
 }
 
@@ -1202,7 +1210,7 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 	return table, reasons, fkRefs, nil
 }
 
-func (c *Client) indexPartExpression(ctx context.Context, indexOID uint32, part int) (string, error) {
+func (c *v2CatalogReader) indexPartExpression(ctx context.Context, indexOID uint32, part int) (string, error) {
 	return indexPartExpressionOn(ctx, c.pool, indexOID, part)
 }
 
