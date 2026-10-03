@@ -13,7 +13,7 @@ try {
   const position = process.argv.indexOf('--module');
   if (position < 0 || !process.argv[position + 1]) throw new Error('installed module entry required');
   const driver = process.argv.includes('--postgres-js') ? 'postgres' : 'pg';
-  const { createDatabase, pgSchema, integer, bigint, numeric, timestamptz, text, jsonb, asc, sql } = await import(pathToFileURL(path.resolve(process.argv[position + 1])).href);
+  const { createDatabase, pgSchema, integer, bigint, numeric, timestamptz, text, jsonb, jsonNull, asc, sql } = await import(pathToFileURL(path.resolve(process.argv[position + 1])).href);
   const table = pgSchema(request.schema_scope).table('values_fixture', {
     id: integer('id').primaryKey(), big: bigint('big', { mode: 'string' }),
     precise: numeric('precise'), moment: timestamptz('moment'),
@@ -24,7 +24,7 @@ try {
   db = await createDatabase({ url, driverOptions: { driver }, tables: { values: table } });
   if (request.action === 'insert') {
     await db.insert(table).values({ id: 2, big: '-9223372036854775808', precise: '-98765432109876543210.000000001',
-      moment: '2038-01-19T03:14:07.654321Z', sqlNull: null, document: null });
+      moment: '2038-01-19T03:14:07.654321Z', sqlNull: null, document: jsonNull });
   }
   // SQL NULL's predicate is observed independently of JSON's JS null decoder.
   const values = await db.select({ id: table.id, big: table.big, precise: table.precise,
