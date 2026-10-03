@@ -14,7 +14,8 @@ import {
   integer,
   loadDriver,
   pgTable,
-  raw,
+  trustSql,
+  TRUSTED_SQL_ACK,
   serial,
   sql,
   text,
@@ -104,7 +105,8 @@ async function createCtx(driverKind: "postgres" | "pg"): Promise<I02Ctx> {
     dbUrl: url.toString(),
     db,
     driver,
-    raw,
+    trustSql,
+  TRUSTED_SQL_ACK,
     admin,
     async close(): Promise<void> {
       await db.close();
@@ -624,7 +626,7 @@ for (const driverKind of ["postgres", "pg"] as const) {
       db = await createDatabase({ driver, tables: { i02_notes: notes }, logger: true });
       await db.insert(notes).values({ body: canaryValue });
       await db.select().from(notes).where(eq(notes.body, canaryValue));
-      await db.select({ literal: sql`${raw(`'${canaryValue}'`)}` }).from(notes).limit(1);
+      await db.select({ literal: sql`${trustSql(`'${canaryValue}'`, TRUSTED_SQL_ACK)}` }).from(notes).limit(1);
       await assert.rejects(async () => db!.select({ invalid: sql`${canaryValue}::integer` }).from(notes), (err: unknown) => getSqlState(err) === "22P02");
       const observerDb = await createDatabase({ driver, tables: { i02_notes: notes }, logger: () => { throw new Error(canaryValue); } });
       const committedBody = `${canaryValue}_committed`;
