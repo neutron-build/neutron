@@ -29,6 +29,7 @@ export function validateTransactionSql(sql: string): void {
     }
     if (terminated) invalid('multiple statements are forbidden in an owned scope');
     if (char === ';') { terminated = true; index++; continue; }
+    if (char === '(' && !words.length) { index++; continue; }
     if (char === "'" || char === '"') {
       const escape = char === "'" && /[eE]/.test(sql[index - 1] ?? '') && !/[A-Za-z0-9_]/.test(sql[index - 2] ?? '');
       let closed = false;
