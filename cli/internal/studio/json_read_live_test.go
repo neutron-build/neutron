@@ -72,8 +72,8 @@ func TestStudioLosslessJSONNative(t *testing.T) {
 		if !ok || big.T != "int8" || big.V != "9223372036854775807" {
 			t.Fatal("mixed scalar decoding changed")
 		}
-		encoded, err := json.Marshal(result)
-		if err != nil || !json.Valid(encoded) {
+		encoded, err := json.Marshal(map[string]any{"columns": result.columns, "rows": result.data})
+		if err != nil || !json.Valid(encoded) || !strings.Contains(string(encoded), `"t":"jsonb"`) || !strings.Contains(string(encoded), "9007199254740993") {
 			t.Fatal("transport encoding failed")
 		}
 		var native string
