@@ -593,8 +593,8 @@ partial models. UNION ALL preserves multiplicity, including cycles, which stop
 at the depth bound. It does not claim acyclic input or bound PostgreSQL internal
 execution/memory: appropriate statement deadlines remain necessary, especially
 for branching graphs or output sorting. No arbitrary raw recursive SQL is
-interpolated. These plans do not yet combine multiple independently named CTEs
-or arbitrary correlated subquery expression projections.
+interpolated. Arbitrary correlated subquery expression projections are not
+accepted by these constructors.
 
 ```sh
 go test ./orm -run 'Test(TypedSetAndDerivedBindingCompilation|PostgresTypedCTESetAndBoundedRecursiveQueries)' -count=1 -v
@@ -687,4 +687,16 @@ Native decode failures retain owned Scope rollback guarantees.
 
 ```sh
 go test ./orm -run 'Test(CustomScanner|PostgresExplicitCustom)' -count=1 -v
+```
+
+`FromCTE` creates a complete-model plan over a derived binding and carries its
+definitions through later CTEs and set operations. Definitions are emitted once
+in dependency order with continuous parameter numbering. `WithCTEs` includes
+additional sealed definitions, including different mapped models; conflicting
+aliases, zero handles, cycles and more than 64 definitions refuse. Recursive
+CTEs retain `SelectDerived` result-budget ownership and cannot be converted into
+an unbounded FromCTE plan. No alias or source SQL is accepted as raw text.
+
+```sh
+go test ./orm -run 'Test(MultipleCTE|PostgresMultipleCTE|TypedSet|PostgresTypedCTE)' -count=1 -v
 ```

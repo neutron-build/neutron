@@ -15,6 +15,7 @@ type ModelQuery[M any] struct {
 	query       Query[M]
 	kind        string
 	left, right *ModelQuery[M]
+	ctes        []CTE
 }
 
 func NewModelQuery[M any](table Table[M], query Query[M]) (ModelQuery[M], error) {
@@ -73,7 +74,12 @@ func SelectModels[M any](ctx context.Context, db Executor, plan ModelQuery[M]) (
 	if err := ready(ctx, db); err != nil {
 		return nil, wrap("model query", err)
 	}
-	sql, args, err := plan.compile(nil)
+	prefix, initial, err := compileCTEs(plan.requiredCTEs(), nil)
+	if err != nil {
+		return nil, wrap("model query", err)
+	}
+	sql, args, err := plan.compile(initial)
+	sql = prefix + sql
 	if err != nil {
 		return nil, wrap("model query", err)
 	}
@@ -93,6 +99,7 @@ type Derived[M any] struct {
 	relation          *Relation[M, M]
 	maxDepth, maxRows int
 	depth             string
+	dependencies      []CTE
 }
 
 func NewCTE[M any](alias string, source ModelQuery[M]) (Derived[M], error) {
@@ -145,18 +152,21 @@ func NewRecursiveCTE[M any](alias string, anchor ModelQuery[M], relation Relatio
 	derived.relation = &relation
 	derived.maxDepth = maxDepth
 	derived.maxRows = maxRows
+	if err := identifier(depth); err != nil {
+		return Derived[M]{}, err
+	}
 	derived.depth = depth
 	return derived, nil
 }
-func (d Derived[M]) compile(columns string, query Query[M]) (string, []any, error) {
+func (d Derived[M]) cteDefinition(initial []any) (string, []any, error) {
 	if d.table.info == nil {
 		return "", nil, fmt.Errorf("orm: uninitialized derived query")
 	}
-	source, args, err := d.source.compile(nil)
+	source, args, err := d.source.compile(initial)
 	if err != nil {
 		return "", nil, err
 	}
-	prefix := "WITH " + quote(d.table.info.name) + " AS (" + source + ") "
+	prefix := quote(d.table.info.name) + " AS (" + source + ")"
 	if d.relation != nil {
 		// Distinct private aliases prevent correlation shadowing even when the
 		// user CTE alias equals a compiler's default internal alias.
@@ -187,10 +197,17 @@ func (d Derived[M]) compile(columns string, query Query[M]) (string, []any, erro
 		args = append(args, d.maxDepth)
 		recursive := "SELECT " + strings.Join(childFields, ", ") + ", " + quote(parentAlias) + "." + quote(d.depth) + " + 1 FROM " + quote(d.table.info.name) + " AS " + quote(parentAlias) + " INNER JOIN " + d.relation.child.info.sqlName() + " AS " + quote(childAlias) + " ON (" + strings.Join(parts, " AND ") + ") WHERE " + quote(parentAlias) + "." + quote(d.depth) + fmt.Sprintf(" < $%d", len(args))
 		anchor := "SELECT " + strings.Join(anchorFields, ", ") + ", 0 FROM (" + source + ") AS " + quote(anchorAlias)
-		prefix = "WITH RECURSIVE " + quote(d.table.info.name) + " (" + strings.Join(names, ", ") + ", " + quote(d.depth) + ") AS ((" + anchor + ") UNION ALL (" + recursive + ")) "
-		if !query.limited || query.limit > d.maxRows+1 {
-			query = query.Limit(d.maxRows + 1)
-		}
+		prefix = quote(d.table.info.name) + " (" + strings.Join(names, ", ") + ", " + quote(d.depth) + ") AS ((" + anchor + ") UNION ALL (" + recursive + "))"
+	}
+	return prefix, args, nil
+}
+func (d Derived[M]) compile(columns string, query Query[M]) (string, []any, error) {
+	prefix, args, err := compileCTEs([]CTE{d}, nil)
+	if err != nil {
+		return "", nil, err
+	}
+	if d.relation != nil && (!query.limited || query.limit > d.maxRows+1) {
+		query = query.Limit(d.maxRows + 1)
 	}
 	sql, args, err := selectSQLArgs(d.table, columns, query, args)
 	if err != nil {
@@ -198,6 +215,7 @@ func (d Derived[M]) compile(columns string, query Query[M]) (string, []any, erro
 	}
 	return prefix + sql, args, nil
 }
+
 func SelectDerived[M any](ctx context.Context, db Executor, derived Derived[M], query Query[M]) ([]M, error) {
 	if err := ready(ctx, db); err != nil {
 		return nil, wrap("derived", err)
