@@ -239,6 +239,13 @@ func pageEngineSupported(version string) bool {
 	return true
 }
 
+type pageProfileError struct{ message string }
+
+func (e pageProfileError) Error() string { return e.message }
+func writePageUnsupported(w http.ResponseWriter, message string) {
+	writeJSON(w, http.StatusBadRequest, map[string]string{"error": message, "state": "unsupported-profile"})
+}
+
 func pageMeta(ctx context.Context, tx pgx.Tx, p pageRequest) (*tableMeta, error) {
 	rows, err := tx.Query(ctx, tableMetaSQL, p.Schema, p.Table)
 	if err != nil {
@@ -255,7 +262,7 @@ func pageMeta(ctx context.Context, tx pgx.Tx, p pageRequest) (*tableMeta, error)
 		col.KeyPos = int(pos)
 		col.IsPK = pos > 0
 		if !pageColumnSupported(col) {
-			return nil, errors.New("page profile does not support this column wire family")
+			return nil, pageProfileError{"page profile does not support this column wire family"}
 		}
 		meta.Order = append(meta.Order, col)
 		meta.Columns[col.Name] = col
@@ -271,12 +278,12 @@ func pageMeta(ctx context.Context, tx pgx.Tx, p pageRequest) (*tableMeta, error)
 	}
 	meta.Exists = len(meta.Order) > 0
 	if len(meta.PKCols) != 1 {
-		return nil, errors.New("requires a single bigint primary key")
+		return nil, pageProfileError{"requires a single bigint primary key"}
 	}
 	pk := meta.Columns[meta.PKCols[0]]
 	// Native built-in OID, not a typename lookalike or a bigint domain.
 	if pk.TypeOID != 20 || pk.TypType != "b" || !pk.NotNull {
-		return nil, errors.New("requires a native bigint primary key")
+		return nil, pageProfileError{"requires a native bigint primary key"}
 	}
 	return meta, nil
 }
@@ -387,7 +394,7 @@ func (s *Server) handleTablePageV2(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !pageEngineSupported(pgVersion) {
-		writeError(w, 400, "page profile requires PostgreSQL-direct")
+		writePageUnsupported(w, "page profile requires PostgreSQL-direct")
 		return
 	}
 	var role, definition string
@@ -396,7 +403,11 @@ func (s *Server) handleTablePageV2(w http.ResponseWriter, r *http.Request) {
 			fail()
 			return
 		}
-		writeError(w, 400, "page profile requires an ordinary permanent non-inherited PostgreSQL table")
+		if errors.Is(err, pgx.ErrNoRows) {
+			writePageUnsupported(w, "page profile requires an ordinary permanent non-inherited PostgreSQL table")
+		} else {
+			fail()
+		}
 		return
 	}
 	definitionHash := sha256.Sum256([]byte(definition))
@@ -411,7 +422,12 @@ func (s *Server) handleTablePageV2(w http.ResponseWriter, r *http.Request) {
 			fail()
 			return
 		}
-		writeError(w, 400, "page profile requires a single native bigint primary key and builtin exact scalar columns; JSON, arrays, floats and custom types are unsupported")
+		var profileError pageProfileError
+		if errors.As(err, &profileError) {
+			writePageUnsupported(w, "page profile requires a single native bigint primary key and builtin exact scalar columns; JSON, arrays, floats and custom types are unsupported")
+		} else {
+			fail()
+		}
 		return
 	}
 	pk := quoteIdent(meta.PKCols[0])

@@ -171,3 +171,21 @@ func TestPageScalarProfileAndReadOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestPageUnsupportedCodeBoundaries(t *testing.T) {
+	w := httptest.NewRecorder()
+	writePageUnsupported(w, "exact profile refusal")
+	var refusal map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &refusal); err != nil || w.Code != 400 || refusal["state"] != "unsupported-profile" {
+		t.Fatal("profile capability code missing")
+	}
+	s := &Server{sessionToken: "session"}
+	r := httptest.NewRequest(http.MethodPost, "/api/table/v2/page", strings.NewReader(`{"profile":"postgres-direct","limit":0}`))
+	r.Header.Set(sessionHeader, "session")
+	w = httptest.NewRecorder()
+	s.handleTablePageV2(w, r)
+	var malformed map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &malformed); err != nil || w.Code != 400 || malformed["state"] != nil {
+		t.Fatal("malformed request was marked unsupported")
+	}
+}

@@ -225,6 +225,12 @@ func TestStudioKeysetPageNative(t *testing.T) {
 	if status, result := call(readerPage, s.sessionToken); status != 200 || result["readOnly"] != true || result["readOnlyReason"] == "" {
 		t.Fatalf("SELECT-only role advertised writable: status%d %v", status, result)
 	}
+	if err = fixture.Exec(ctx, "REVOKE SELECT ON \"Odd Schema\".\"Odd Table\" FROM "+quoteIdent(readerRole)); err != nil {
+		t.Fatal("revoke owned reader privilege failed")
+	}
+	if status, result := call(readerPage, s.sessionToken); status != 502 || result["state"] != nil {
+		t.Fatal("permission failure was misclassified as unsupported profile")
+	}
 	// A blocked physical relation exercises the real 5s request deadline and
 	// cancellation; a subsequent request must reuse the pool successfully.
 	blocker, err := fixture.BeginTx(ctx)
@@ -322,8 +328,8 @@ func TestStudioKeysetPageNative(t *testing.T) {
 	}
 	for _, table := range []string{"int_key", "domain_key", "composite_key", "parent_key", "child_key", "json_precision", "json_text", "array_value", "custom_value"} {
 		changed := pageRequest{ConnectionID: "native", Schema: "public", Table: table, Profile: "postgres-direct", Limit: 2}
-		if status, _ = call(changed, s.sessionToken); status != 400 {
-			t.Fatalf("unsupported %s status%d", table, status)
+		if status, result := call(changed, s.sessionToken); status != 400 || result["state"] != "unsupported-profile" {
+			t.Fatalf("unsupported %s status%d/state%v", table, status, result["state"])
 		}
 	}
 	if err = fixture.Exec(ctx, `CREATE TABLE public.huge(id bigint PRIMARY KEY, body pg_catalog.text);INSERT INTO public.huge VALUES(1,repeat('x',8388609))`); err != nil {
