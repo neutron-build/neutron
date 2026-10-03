@@ -17,6 +17,7 @@ var (
 	ErrScopeClosed       = errors.New("orm: transaction scope is terminal")
 	ErrParentSuspended   = errors.New("orm: parent scope is suspended by child savepoint")
 	ErrConcurrentUse     = errors.New("orm: transaction operation already active")
+	ErrScopeDecode       = errors.New("orm: transaction scope result decoding failed")
 	ErrScopeLeak         = errors.New("orm: callback returned with an active operation or rows")
 	ErrTransactionBroken = errors.New("orm: transaction cleanup failed")
 	ErrCommitAmbiguous   = errors.New("orm: commit outcome is indeterminate")
@@ -139,6 +140,7 @@ type Scope struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	stopParent func() bool
+	failed     error
 }
 
 var _ Executor = (*Scope)(nil)
@@ -164,6 +166,9 @@ func (s *Scope) acquire(ctx context.Context) (*operation, error) {
 	}
 	if o.broken != nil {
 		return nil, errors.Join(ErrTransactionBroken, o.broken)
+	}
+	if s.failed != nil {
+		return nil, errors.Join(ErrScopeDecode, s.failed)
 	}
 	if o.current != s {
 		return nil, ErrParentSuspended
@@ -420,7 +425,10 @@ func (o *transactionOwner) finishRoot(root *Scope, callbackErr error) error {
 		err := errors.Join(callbackErr, ErrTransactionBroken, drainErr, o.discard(clean, pending))
 		return &TransactionError{CommitNotAttempted, err}
 	}
-	callbackErr = errors.Join(callbackErr, broken, o.ctx.Err())
+	o.mu.Lock()
+	decodeErr := root.failed
+	o.mu.Unlock()
+	callbackErr = errors.Join(callbackErr, broken, decodeErr, o.ctx.Err())
 	if callbackErr != nil {
 		rollbackErr := o.driver.Rollback(clean)
 		if rollbackErr != nil {
@@ -577,7 +585,10 @@ func (s *Scope) finishChild(callbackErr error) error {
 	}
 	clean, done := context.WithTimeout(context.Background(), o.cleanupTimeout)
 	defer done()
-	callbackErr = errors.Join(callbackErr, o.ctx.Err())
+	o.mu.Lock()
+	decodeErr := s.failed
+	o.mu.Unlock()
+	callbackErr = errors.Join(callbackErr, decodeErr, o.ctx.Err())
 	if s.ctx != nil {
 		callbackErr = errors.Join(callbackErr, s.ctx.Err())
 	}
@@ -604,6 +615,8 @@ func (s *Scope) finishChild(callbackErr error) error {
 	}
 	if cleanupErr != nil {
 		o.broken = errors.Join(ErrTransactionBroken, cleanupErr)
+	} else {
+		s.failed = nil
 	}
 	o.current = s.parent
 	o.finalizing = false

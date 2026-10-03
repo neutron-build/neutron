@@ -237,3 +237,20 @@ path, including tenants sharing UUIDs, distinct UUIDs, zero UUID, duplicate
 input fanout budgets, inverse ownership, missing/orphan rows and nullable-key
 refusal. A mapped nullable UUID foreign key requires a future explicit nullable
 relation policy; this slice does not equate NULL values or infer that policy.
+
+Owned Scope result decoding failure
+-----------------------------------
+
+Actual `Scope` rows `Scan` or `Values` failures mark that Scope failed with
+`ErrScopeDecode`, retaining the original cause. Further operations on that
+Scope are refused. An outer callback swallowing the decode error still rolls
+back and reports `CommitNotAttempted`; it cannot silently commit earlier writes.
+A child savepoint swallowing its decoder error is rolled back to and released;
+the child error is returned, and the parent may resume after successful cleanup.
+Cleanup failure retains the separate transaction-broken/discard policy.
+Validation errors detected before query execution do not poison a Scope.
+Borrowed native Executors retain their caller-owned transaction policy.
+
+```sh
+go test ./orm -run 'Test(ScopeDecodeFailureCannotCommitWhenSwallowed|ChildDecodeFailureRecoveredOnlyBySavepointRollback|PostgresScopeDecodeFailureRollbackAndChildRecovery)' -count=1 -v
+```

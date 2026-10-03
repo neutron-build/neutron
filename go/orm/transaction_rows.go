@@ -75,7 +75,19 @@ func (r *scopeRows) Scan(dest ...any) error {
 	if r.closed {
 		return ErrScopeClosed
 	}
-	return r.rows.Scan(dest...)
+	err := r.rows.Scan(dest...)
+	r.decodeFailure(err)
+	return err
+}
+func (r *scopeRows) decodeFailure(err error) {
+	if err == nil {
+		return
+	}
+	r.record(err)
+	owner := r.op.owner
+	owner.mu.Lock()
+	r.op.scope.failed = errors.Join(r.op.scope.failed, ErrScopeDecode, err)
+	owner.mu.Unlock()
 }
 func (r *scopeRows) Values() ([]any, error) {
 	if !r.enter() {
@@ -85,7 +97,9 @@ func (r *scopeRows) Values() ([]any, error) {
 	if r.closed {
 		return nil, ErrScopeClosed
 	}
-	return r.rows.Values()
+	values, err := r.rows.Values()
+	r.decodeFailure(err)
+	return values, err
 }
 func (r *scopeRows) RawValues() [][]byte {
 	if !r.enter() {
