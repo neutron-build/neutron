@@ -6,3 +6,9 @@ __all__ = ['DEFAULT','OMIT','CardinalityError','Column','ColumnSpec','Compiled',
 
 from .lifecycle import AsyncTransactionHandle, TransactionHandle
 __all__ += ["AsyncTransactionHandle","TransactionHandle"]
+
+from .mapping import ModelMapping
+from .session import ConflictError, Session
+from .async_session import AsyncSession
+from .state import ObjectState
+__all__ += ["ModelMapping","ConflictError","Session","AsyncSession","ObjectState"]

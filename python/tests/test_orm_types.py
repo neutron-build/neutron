@@ -13,3 +13,16 @@ def static_sync_consumer(db: Database) -> None:
 async def static_async_consumer(db: AsyncDatabase) -> None:
     t=Table('t',{'id':ColumnSpec(int,'int4')})
     assert_type(await db.all(select(t.column('id',int))),list[int])
+
+
+def static_session_consumer(session: 'Session',mapping: 'ModelMapping[User]') -> None:
+    assert_type(session.get(mapping,1),User|None)
+
+async def static_async_session_consumer(session: 'AsyncSession',mapping: 'ModelMapping[User]') -> None:
+    assert_type(await session.get(mapping,1),User|None)
+
+from dataclasses import dataclass
+from neutron.orm import AsyncSession, ModelMapping, Session
+@dataclass
+class User:
+    id: int
