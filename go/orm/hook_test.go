@@ -131,3 +131,27 @@ func TestHookAdmittedRequestLeakBeforeNativeAcquire(t *testing.T) {
 		t.Fatal("statement ran after request leak")
 	}
 }
+
+func TestHookRowsDecodeFinalizesOnceWithCause(t *testing.T) {
+	for _, values := range []bool{false, true} {
+		failure := errors.New("hook decode failed")
+		native := &decodeFailureRows{failure: failure}
+		calls := 0
+		rows := &hookRows{Rows: native, finish: func(err error) {
+			calls++
+			if !errors.Is(err, failure) || !native.closed {
+				t.Fatal("decode cause or native cleanup lost", err)
+			}
+		}}
+		if values {
+			_, _ = rows.Values()
+		} else {
+			_ = rows.Scan(new(int64))
+		}
+		rows.Close()
+		rows.Close()
+		if calls != 1 {
+			t.Fatal("hook capability finalized more than once", calls)
+		}
+	}
+}

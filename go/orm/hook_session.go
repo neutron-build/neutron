@@ -242,7 +242,13 @@ type hookRows struct {
 	finish func(error)
 }
 
-func (r *hookRows) Close() { r.Rows.Close(); r.once.Do(func() { r.finish(r.Rows.Err()) }) }
+func (r *hookRows) closeWithError(err error) {
+	r.once.Do(func() {
+		r.Rows.Close()
+		r.finish(errors.Join(err, r.Rows.Err()))
+	})
+}
+func (r *hookRows) Close() { r.closeWithError(nil) }
 func (r *hookRows) Next() bool {
 	ok := r.Rows.Next()
 	if !ok {
@@ -253,16 +259,14 @@ func (r *hookRows) Next() bool {
 func (r *hookRows) Scan(dest ...any) error {
 	err := r.Rows.Scan(dest...)
 	if err != nil {
-		r.Close()
-		r.finish(err)
+		r.closeWithError(err)
 	}
 	return err
 }
 func (r *hookRows) Values() ([]any, error) {
 	values, err := r.Rows.Values()
 	if err != nil {
-		r.Close()
-		r.finish(err)
+		r.closeWithError(err)
 	}
 	return values, err
 }
