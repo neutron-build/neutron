@@ -60,7 +60,7 @@ func TestHookSwallowedReentryRollsBack(t *testing.T) {
 		}
 		return nil
 	}}})
-	if _, err := HookDelete(context.Background(), session, repo, Eq(id, int64(1))); !errors.Is(err, ErrHookReentry) {
+	if _, err := HookDelete(context.Background(), session, repo, id.Eq(int64(1))); !errors.Is(err, ErrHookReentry) {
 		t.Fatal(err)
 	}
 	if driver.execs != 0 {
@@ -78,7 +78,7 @@ func TestHookCapturedContextAndChildEvents(t *testing.T) {
 	id, _ := NewColumn[hookTestModel, int64](table, "ID")
 	var retained *HookContext
 	repo, _ := NewHookRepository(table, HookSet[hookTestModel]{BeforeDelete: []BeforeHook[hookTestModel]{func(_ context.Context, h *HookContext, _ WriteIntent[hookTestModel]) error { retained = h; return nil }}})
-	if _, err := HookDelete(context.Background(), session, repo, Eq(id, int64(1))); err != nil {
+	if _, err := HookDelete(context.Background(), session, repo, id.Eq(int64(1))); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := retained.Exec(context.Background(), "SELECT 1"); !errors.Is(err, ErrHookClosed) {
@@ -86,7 +86,7 @@ func TestHookCapturedContextAndChildEvents(t *testing.T) {
 	}
 	marker := errors.New("child rollback")
 	if err := session.Savepoint(context.Background(), func(child *WriteSession) error {
-		_, err := HookDelete(context.Background(), child, repo, Eq(id, int64(2)))
+		_, err := HookDelete(context.Background(), child, repo, id.Eq(int64(2)))
 		if err != nil {
 			return err
 		}
@@ -98,7 +98,7 @@ func TestHookCapturedContextAndChildEvents(t *testing.T) {
 		t.Fatal("rolled-back child event retained")
 	}
 	if err := session.Savepoint(context.Background(), func(child *WriteSession) error {
-		_, err := HookDelete(context.Background(), child, repo, Eq(id, int64(3)))
+		_, err := HookDelete(context.Background(), child, repo, id.Eq(int64(3)))
 		return err
 	}); err != nil {
 		t.Fatal(err)
