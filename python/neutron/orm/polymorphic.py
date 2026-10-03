@@ -107,10 +107,12 @@ class PolymorphicMapping(ModelMapping[B]):
 
     def construct(self,row: Mapping[str,Any]) -> B:
         values={name:column.spec.decode(row[column.name]) for name,column in self.field_columns.items()}
-        model=self.variants.get(values[self.discriminator])
+        tag=values[self.discriminator]
+        if not isinstance(tag,str): raise ValueError('native discriminator requires text')
+        model=self.variants.get(tag)
         if model is None: raise ValueError('unknown native discriminator value')
         self._shape(model,values);expected=deepcopy(values)
-        obj=model(**{name:deepcopy(values[name]) for name in self._roles[model]})
+        obj: B=model(**{name:deepcopy(values[name]) for name in self._roles[model]})
         actual=self.snapshot(obj)
         if any(not same_value(actual[name],value) for name,value in expected.items()): raise ValueError('subtype constructor changed persisted fields')
         return obj
