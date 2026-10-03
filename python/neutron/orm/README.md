@@ -5,7 +5,9 @@ Install `neutron-framework[orm]`. Import from `neutron.orm`. Existing
 
 This is a bounded native psycopg synchronous/asynchronous SQL core. It does not
 implement mapped Session identity, dirty tracking, flush, associations or a full
-SQLAlchemy replacement. Only the explicit PostgreSQL direct profile is admitted.
+SQLAlchemy replacement. Only the caller-declared `postgres-direct` profile name is currently admitted.
+The client does not yet attest the server engine or intermediary topology;
+this declaration is not certification of Nucleus, poolers, or unknown endpoints.
 It owns one connection per Database instance, with no implicit connection pool.
 
 ```python
