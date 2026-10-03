@@ -29,6 +29,8 @@ def run(args):
     if not re.fullmatch('[0-9a-f]{40}',args.source_revision): raise ValueError('exact revision required')
     original=json.loads((root/'artifacts.json').read_text())
     verify_artifacts(original,root)
+    if json.loads((root/'source-identity.json').read_text())['source_revision']!=args.source_revision:
+        raise ValueError('installed wheel source revision differs from requested qualification')
     directory=root/'lifecycle-qualification';directory.mkdir(exist_ok=False)
     adapter=directory/'installed_python_lifecycle.py'
     adapter.write_bytes(Path(__file__).with_name('installed_python_lifecycle.py').read_bytes())

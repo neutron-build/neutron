@@ -17,6 +17,7 @@ import sys
 # Explicit trusted tooling directory works with Python's isolated (-I) entry.
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from protocol import PROTOCOL, redact
+from provenance import capture
 
 ROOT=Path(__file__).resolve().parent
 
@@ -68,6 +69,7 @@ def qualify(source: Path, work: Path, timeout: float) -> dict:
         raise ValueError('owned work directory must be outside the package repository')
     # Never claim a preexisting environment/directory.
     work.mkdir(parents=True,exist_ok=False)
+    capture(repo,source,work/'source-identity.json')
     wheels=work/'wheels';wheels.mkdir()
     environment=work/'client-env'
     command([sys.executable,'-I','-m','venv',str(environment)],work,timeout)

@@ -49,6 +49,9 @@ def prepare(args):
         root=value.resolve()
         if root.is_relative_to(origin) or root==origin: raise ValueError('outside-origin consumers required')
         verify_artifacts(json.loads((root/'artifacts.json').read_text()),root)
+        if kind=='go': installed_revision=(root/'provenance/source-revision').read_text().strip()
+        else: installed_revision=json.loads((root/'source-identity.json').read_text())['source_revision']
+        if installed_revision!=args.revision: raise ValueError('installed source provenance differs from campaign revision')
         directory=root/'performance'
         directory.mkdir(exist_ok=False)
         profile=directory/'profile.json';profile.write_bytes(Path(__file__).with_name('profile.json').read_bytes())

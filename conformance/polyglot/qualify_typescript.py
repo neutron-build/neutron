@@ -8,6 +8,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+from provenance import capture
+
 root = Path.cwd().resolve()
 consumer = Path(tempfile.mkdtemp(prefix='neutron-polyglot-ts-consumer-')).resolve()
 package = root / 'typescript/packages/neutron-sql'
@@ -42,6 +45,7 @@ def run(argv, cwd=consumer, live=False):
 
 try:
     if consumer.is_relative_to(root): raise RuntimeError('outside-origin consumer required')
+    capture(root,package,consumer/'source-identity.json')
     packed = json.loads(run(['npm', 'pack', '--json', '--pack-destination', str(consumer)], package))[0]
     archive = consumer / packed['filename']
     (consumer / 'package.json').write_text(json.dumps({'private': True, 'type': 'module'}))
