@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- **The CLI runs on Vite 8** (`vite` `^8.3.2`; it was `^6.0.7`). Projects
+  that declare `vite` themselves should move to `^8.3.2` too, so npm installs
+  one copy instead of nesting the CLI's; projects that forced Vite 8 onto the
+  CLI with an `overrides` entry can drop it. New TypeScript scaffolds (both
+  `create` templates and the Go CLI's) pin `vite` `^8.3.2` and
+  `@preact/preset-vite` `^2.10.4`, the first release that accepts Vite 8.
+- The CLI requires Node.js 22.12 or later (`engines.node` is `">=22.12"`),
+  Vite 8's floor on the 22 line.
+- The CLI passes JSX settings as `oxc` and build input/output as
+  `build.rolldownOptions`, so Vite 8 prints no deprecation warnings for
+  Neutron's own config. A project `vite.config` that still sets `esbuild` is
+  ignored in favor of the runtime-derived `oxc` options, with Vite's warning.
+
+### Fixed
+
+- `neutronPlugin()` gives Vite 8's dependency optimizer a Rolldown plugin for
+  the `virtual:neutron*` externals instead of the esbuild one, which Vite 8
+  only converts with a deprecation warning. Vite 6 and 7 still get the esbuild
+  plugin.
+
 ## [core 0.3.0, cli 0.3.0, create-neutron 0.1.7, nucleus 0.2.1, data 0.2.1, cache-redis 0.2.0, auth 0.1.5, ops 0.1.3, otel 0.1.3, security 0.1.4] - 2026-09-30
 
 Requires Node.js 22 or later.

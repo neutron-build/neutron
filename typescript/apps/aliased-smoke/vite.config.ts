@@ -9,13 +9,14 @@ import { neutronPlugin } from "@neutron-build/core/vite";
 // monorepo-hostile environment does. `neutron dev` must survive the dep
 // optimizer seeing the aliased copy.
 //
-// The include entry forces the optimizer to bundle the aliased runtime. On
-// vite 6 a spec-preserving alias alone is kept out of the optimizer by the
+// The include entry forces the optimizer to bundle the aliased runtime. A
+// spec-preserving alias alone can be kept out of the optimizer by the
 // plugin's own exclude, but the moment the optimizer meets the runtime by any
 // other route (include entries, cross-package imports, other vite versions'
-// alias handling), esbuild — which runs without Vite plugins — cannot resolve
-// `virtual:neutron-islands` and the dev server dies. This config makes that
-// meeting deterministic instead of version-dependent.
+// alias handling), its bundler — Rolldown, or esbuild before Vite 8 — runs
+// without Vite plugins, cannot resolve `virtual:neutron-islands`, and the dev
+// server dies. This config makes that meeting deterministic instead of
+// version-dependent.
 const localCore = path.resolve(import.meta.dirname, "../../packages/neutron/dist");
 
 export default defineConfig({

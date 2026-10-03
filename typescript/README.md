@@ -192,7 +192,7 @@ export async function loader({ request }) {
 | Component | Choice | Why |
 |---|---|---|
 | Language | TypeScript | Type safety, industry standard |
-| Bundler | Vite 6 | Fast, framework-agnostic SSR, HMR <50ms — Rolldown (Rust) bridges dev-to-prod gap |
+| Bundler | Vite 8 | Fast, framework-agnostic SSR, HMR <50ms — Rolldown (Rust) bundles both dev and prod |
 | Routing | File-based nested | Layouts persist, parallel data loading, per-route errors |
 | Data loading | Loaders | One pattern, server-only, full type inference |
 | Mutations | Actions + `<Form>` | Progressive enhancement, auto-revalidation |
