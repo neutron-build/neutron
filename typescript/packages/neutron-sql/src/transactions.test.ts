@@ -12,6 +12,7 @@ import {
   runRetriedTransaction,
   runTransaction,
   validateRetryOptions,
+  transactionScopeState,
   type PinnedExecutor,
   type TransactionScope,
   type Savepoint,
@@ -460,4 +461,71 @@ test("transaction callback settlement fences handles while COMMIT is still pendi
   releaseCommit();
   assert.equal(await completion,7);
   assert.deepEqual(pin.statements,["begin","commit"]);
+});
+
+test('nested scope and prepared handles settle independently while the outer transaction survives', async () => {
+  const pin = fakePin();
+  pin.prepare = text => ({ sql: text, query: () => pin.query(text), execute: () => pin.execute(text) });
+  let child!: TransactionScope;
+  let prepared!: ReturnType<NonNullable<TransactionScope['prepare']>>;
+  await runTransaction(pin, async outer => {
+    await outer.transaction(async inner => {
+      child = inner;
+      prepared = inner.prepare!('select child');
+      await assert.rejects(outer.query('select parent'), /suspended/);
+      await inner.query('select inner');
+    });
+    assert.equal(transactionScopeState(child), 'settled');
+    const before = [...pin.statements];
+    await assert.rejects(child.query('select escaped'), /settled/);
+    await assert.rejects(prepared.execute(), /settled/);
+    assert.deepEqual(pin.statements, before);
+    await outer.query('select outer');
+  });
+  assert.equal(pin.statements.at(-1), 'commit');
+});
+
+test('an outstanding operation is drained before rollback and pool release, never committed', async () => {
+  const pin = fakePin();
+  let finish!: () => void;
+  let started!: () => void;
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  const dispatched = new Promise<void>(resolve => { started = resolve; });
+  pin.query = async <R>(text: string): Promise<R[]> => {
+    pin.statements.push(text); started(); await gate; return [];
+  };
+  const done = runTransaction(pin, async tx => { void tx.query('select outstanding'); });
+  await dispatched;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(pin.releasedWith.length, 0);
+  assert.deepEqual(pin.statements, ['begin', 'select outstanding']);
+  finish();
+  await assert.rejects(done, /pending operations/);
+  assert.deepEqual(pin.statements, ['begin', 'select outstanding', 'rollback']);
+  assert.equal(pin.releasedWith.length, 1);
+});
+
+test('swallowed nested cleanup failure poisons the outer transaction instead of committing partial work', async () => {
+  const pin = fakePin([{ match: /^rollback to/, error: new Error('cleanup failed') }]);
+  await assert.rejects(runTransaction(pin, async tx => {
+    await assert.rejects(tx.transaction(async () => { throw new Error('user failed'); }), /user failed/);
+    await assert.rejects(tx.query('select unsafe'), /cleanup failed/);
+  }), /cleanup failed/);
+  assert.equal(pin.statements.at(-1), 'rollback');
+  assert.ok(!pin.statements.includes('commit'));
+});
+
+test('unawaited nested callbacks settle before root rollback and cannot keep issuing SQL', async () => {
+  const pin = fakePin();
+  let finish!: () => void;
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  const done = runTransaction(pin, async tx => {
+    void tx.transaction(async child => { await gate; await child.query('select escaped'); });
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(pin.releasedWith.length, 0);
+  finish();
+  await assert.rejects(done, /pending operations/);
+  assert.ok(!pin.statements.includes('select escaped'));
+  assert.equal(pin.statements.at(-1), 'rollback');
 });

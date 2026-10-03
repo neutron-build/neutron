@@ -844,3 +844,34 @@ for (const driverKind of ["postgres", "pg"] as const) {
     await functionalPoolCheck(ctx);
   });
 }
+
+for (const driverKind of ['postgres', 'pg'] as const) {
+  test(`live i02 (${driverKind}): escaped child scopes refuse SQL while the parent remains usable`, async () => {
+    const ctx = await ctxFor(driverKind);
+    if (!ctx) return;
+    let escaped!: Parameters<Parameters<typeof ctx.db.transaction>[0]>[0];
+    await ctx.db.transaction(async tx => {
+      await tx.transaction(async child => { escaped = child; await child.execute(sql`select 1`); });
+      await assert.rejects(escaped.execute(sql`insert into i02_notes(body) values ('escaped-child')`), /settled/);
+      await tx.execute(sql`insert into i02_notes(body) values ('valid-parent')`);
+    });
+    const rows = await ctx.admin.query({ text: `select datname from pg_database where datname = current_database()` });
+    assert.equal(rows.rowCount, 1);
+    const result = await ctx.driver.query<{body: string}>(`select body from i02_notes where body in ('escaped-child','valid-parent')`);
+    assert.deepEqual(result.map(row => row.body), ['valid-parent']);
+  });
+
+  test(`live i02 (${driverKind}): unfinished callback SQL drains then rolls back before connection reuse`, async () => {
+    const ctx = await ctxFor(driverKind);
+    if (!ctx) return;
+    let outstanding!: Promise<unknown>;
+    await assert.rejects(ctx.db.transaction(async tx => {
+      await tx.execute(sql`insert into i02_notes(body) values ('unfinished-root')`);
+      outstanding = tx.execute(sql`select pg_sleep(0.03)`);
+    }), /pending operations/);
+    await outstanding;
+    const result = await ctx.driver.query<{n: string}>(`select count(*)::text as n from i02_notes where body = 'unfinished-root'`);
+    assert.equal(result[0]!.n, '0');
+    await ctx.db.transaction(async tx => { await tx.execute(sql`select 1`); });
+  });
+}
