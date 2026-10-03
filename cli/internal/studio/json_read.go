@@ -3,6 +3,7 @@ package studio
 import (
 	"encoding/json"
 	"errors"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -39,7 +40,7 @@ func collectLosslessRow(rows pgx.Rows) ([]any, error) {
 					values[index] = nil
 					continue
 				}
-				if !json.Valid(documents[index]) {
+				if !validNativeJSON(documents[index]) {
 					return nil, errors.New("invalid native JSON document")
 				}
 				tag := "json"
@@ -65,4 +66,10 @@ func collectLosslessRow(rows pgx.Rows) ([]any, error) {
 		}
 	}
 	return values, nil
+}
+
+// encoding/json accepts invalid UTF-8 and replaces it during marshaling. Refuse
+// that input rather than silently changing a document from a non-UTF8 source.
+func validNativeJSON(document []byte) bool {
+	return utf8.Valid(document) && json.Valid(document)
 }
