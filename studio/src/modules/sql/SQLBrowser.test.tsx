@@ -22,6 +22,7 @@ vi.mock('../../lib/api', async (importOriginal) => {
       operationOutcome: vi.fn(),
       revertOperation: vi.fn(),
       tableData: vi.fn(),
+      tablePage: vi.fn(),
       tableMeta: vi.fn(),
       tableFKs: vi.fn().mockResolvedValue({ fks: [] }),
     },
@@ -322,12 +323,17 @@ describe('SQLBrowser versioned identity editing (staged draft flow)', () => {
     // The read returns a tagged int8 cell; the UI decodes it to a bigint
     // (lib/api decodeRows) and re-tags it exactly on the way back.
     const decoded = keyedResult([[[{ t: 'int8', v: '9007199254740993' }], 'hello']], ['9'])
-    // simulate the decode layer (tableData is mocked)
+    // simulate the decode layer (the API boundary is mocked)
     ;(decoded.rows[0] as unknown[])[0] = 9007199254740993n
-    tableData.mockResolvedValue(decoded)
+    vi.mocked(api.tablePage).mockResolvedValue({
+      ...decoded, readOnly: false, hasNext: false, nextCursor: '',
+      consistency: 'live-keyset/request-repeatable-read',
+    })
 
     render(<SQLBrowser schema="public" table="memo" />)
     await waitFor(() => expect(cellAt(0, 'body').textContent).toBe('hello'))
+    expect(api.tablePage).toHaveBeenLastCalledWith('c1', 'public', 'memo', 200, '')
+    expect(tableData).not.toHaveBeenCalled()
 
     fireEvent.dblClick(cellAt(0, 'body'))
     fireEvent.input(editorInput(), { target: { value: 'big' } })
