@@ -224,6 +224,27 @@ describe('roving tabindex keyboard model', () => {
     expect(onStageDelete).toHaveBeenCalledWith(0)
   })
 
+  it('header keyboard input never edits or deletes the active data row', () => {
+    const onStageUpdate = vi.fn()
+    const onStageDelete = vi.fn()
+    const onSort = vi.fn()
+    render(<DataGrid result={result([[1, 'a', 2]])} columns={metaColumns()}
+      onStageUpdate={onStageUpdate} onStageDelete={onStageDelete} canDelete onSort={onSort} />)
+    fireEvent.focus(cell(0, 1))
+    const header = screen.getByRole('button', { name: /^Sort by name/ })
+    header.focus()
+    for (const key of ['Delete', 'Enter', 'F2', 'ArrowDown', 'Home', 'End']) {
+      fireEvent.keyDown(header, { key })
+      expect(document.activeElement).toBe(header)
+    }
+    expect(onStageDelete).not.toHaveBeenCalled()
+    expect(onStageUpdate).not.toHaveBeenCalled()
+    expect(document.querySelector('input[aria-label$=" value"]')).toBeNull()
+    // Native button activation still reaches the sorting action.
+    fireEvent.click(header)
+    expect(onSort).toHaveBeenCalledWith('name', false)
+  })
+
   it('keyboard movement scrolls far rows into the rendered window before focusing them', () => {
     render(<DataGrid result={bigResult(5000)} />)
     fireEvent.focus(cell(0, 0))
