@@ -10,6 +10,7 @@ from uuid import UUID
 from .json_value import BoundJson, JsonDocument, MutableJson
 from .network_value import Inet,CIDR
 from .composite_value import PgComposite,BoundComposite
+from .vector_value import PgVector,BoundVector
 from .catalog_value import BoundCatalog, CatalogType, PgDomain, PgEnum
 from .pg_value import BoundArray, BoundRange, PgArray, PgRange, TimeOfDay, Interval
 
@@ -61,6 +62,7 @@ class ColumnSpec(Generic[T]):
     def __post_init__(self) -> None:
         if self.native_type is not None:
             if not isinstance(self.native_type,CatalogType): raise ValueError('catalog type admission required')
+            if self.sql_type=='vector' and self.python_type is PgVector and self.native_type.kind=='b' and self.native_type.name=='vector' and not self.composite_fields and self.domain_base is None: return
             if self.sql_type=='composite' and self.python_type is PgComposite and self.native_type.kind=='c' and self.composite_fields and all(isinstance(spec,ColumnSpec) and spec.native_type is None for _,spec in self.composite_fields): return
             if self.sql_type=='enum' and self.python_type is PgEnum and self.native_type.kind=='e' and self.domain_base is None: return
             if self.sql_type=='domain' and self.python_type is PgDomain and self.native_type.kind=='d' and isinstance(self.domain_base,ColumnSpec) and self.domain_base.type_oid==self.native_type.base_oid and (self.domain_base.native_type is None or self.domain_base.native_type.kind=='e' and self.domain_base.native_type._owner is self.native_type._owner): return
@@ -93,6 +95,7 @@ class ColumnSpec(Generic[T]):
         if not isinstance(value, self.python_type) or (self.python_type is int and isinstance(value, bool)) or (self.sql_type == 'date' and isinstance(value, dt.datetime)):
             raise ValueError('column value has wrong native type')
         if self.python_type in {Inet,CIDR} and type(value) is not self.python_type: raise ValueError('exact native network family required')
+        if isinstance(value,PgVector) and value.identity is not self.native_type: raise ValueError('vector qualified identity mismatch')
         if isinstance(value,PgComposite):
             if value.identity is not self.native_type or len(value.fields)!=len(self.composite_fields): raise ValueError('composite qualified identity/field count mismatch')
             for (_,spec),item in zip(self.composite_fields,value.fields):
@@ -231,6 +234,13 @@ class Column(Generic[T]):
         identity=self._enum_comparison_type
         return '%s' if identity is None else '%s::'+_bound_quote(identity.schema)+'.'+_bound_quote(identity.name)
 
+    @property
+    def _comparison_operator(self) -> str:
+        if self.spec.sql_type=='vector':
+            assert self.spec.native_type is not None
+            return 'OPERATOR('+_bound_quote(self.spec.native_type.schema)+'.=)'
+        return 'OPERATOR(pg_catalog.=)' if self._enum_comparison_type is not None else '='
+
     def _owned(self) -> None:
         if self.table.columns.get(self.name) is not self:
             raise ValueError("predicate column is not owned by table")
@@ -242,11 +252,11 @@ class Column(Generic[T]):
             value._owned()
             if value.spec.sql_type == "json": raise ValueError("json equality unsupported")
             if value.spec.python_type is not self.spec.python_type or self.spec.native_type!=value.spec.native_type: raise ValueError('incompatible column comparison')
-            operator='OPERATOR(pg_catalog.=)' if self._enum_comparison_type is not None else '='
+            operator=self._comparison_operator
             return Predicate(f'{self._comparison_sql} {operator} {value._comparison_sql}',(),frozenset({self.table,value.table}))
         if value is None: return Predicate(f'{self._bound_sql} IS NULL',(),frozenset({self.table}))
         self.spec.check(value)
-        operator='OPERATOR(pg_catalog.=)' if self._enum_comparison_type is not None else '='
+        operator=self._comparison_operator
         return Predicate(f'{self._comparison_sql} {operator} {self._comparison_bind}',(_parameter(self,value),),frozenset({self.table}))
 
     def in_(self, values: Iterable[T]) -> Predicate:
@@ -255,8 +265,8 @@ class Column(Generic[T]):
         values=tuple(values)
         if not values: return Predicate('FALSE',(),frozenset({self.table}))
         for value in values: self.spec.check(value)
-        if self._enum_comparison_type is not None:
-            return Predicate(f'{self._comparison_sql} OPERATOR(pg_catalog.=) ANY(ARRAY[{", ".join(self._comparison_bind for _ in values)}])',tuple(_parameter(self,value) for value in values),frozenset({self.table}))
+        if self._enum_comparison_type is not None or self.spec.sql_type=='vector':
+            return Predicate(f'{self._comparison_sql} {self._comparison_operator} ANY(ARRAY[{", ".join(self._comparison_bind for _ in values)}])',tuple(_parameter(self,value) for value in values),frozenset({self.table}))
         return Predicate(f'{self._bound_sql} IN ({", ".join("%s" for _ in values)})',tuple(_parameter(self,value) for value in values),frozenset({self.table}))
 
 @dataclass(frozen=True)
@@ -382,6 +392,7 @@ def delete(table: Table, *, where: Predicate) -> Mutation:
 
 
 def _parameter(column: Column[Any], value: object) -> object:
+    if isinstance(value,PgVector): return BoundVector(value)
     if isinstance(value,PgComposite): return BoundComposite(value,column.spec.composite_fields)
     if isinstance(value,PgEnum): return BoundCatalog(value.label,value.identity)
     if isinstance(value,PgDomain): return BoundCatalog(value.value,value.identity,column.spec.domain_base)

@@ -76,3 +76,6 @@ __all__ += ["Inet","CIDR"]
 
 from .composite_value import PgComposite
 __all__ += ["PgComposite"]
+
+from .vector_value import PgVector
+__all__ += ["PgVector"]

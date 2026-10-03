@@ -612,3 +612,15 @@ Component specs explicitly select their NULL policy. Immutable builtin scalar,
 array and range components are admitted; nested user types, domain/enum members
 and mutable JSON require separate qualification and refuse in this slice.
 Composite primary-key identity is not qualified. Reconstruct admission after DDL.
+
+`db.vector_spec(extension_schema)` admits the native `vector` base type only
+when its qualified catalog identity belongs to the actual `vector` extension.
+`PgVector(exact_float32_tuple, spec.native_type)` owns finite float32 components;
+`PgVector.from_values(float_iterable, identity)` explicitly rounds Python floats
+to native float32. Empty vectors, nonfinite values and more than 16,000 dimensions
+refuse. Binary header/dimension checks preserve native precision, and PostgreSQL
+continues to enforce a column's dimension typmod. SQL NULL remains `None`.
+Typed equality/membership qualify the extension's operator schema, including
+when it is outside the search path. Sync/async mapping, replacement and rollback
+share the contract. Other extension families (`halfvec`, `sparsevec`, bit) and
+vector primary-key identity require separate qualification and are unsupported.

@@ -11,6 +11,7 @@ from .json_value import JsonDocument, MutableJson
 from .pg_value import PgArray, PgRange
 from .catalog_value import PgDomain, PgEnum
 from .composite_value import PgComposite
+from .vector_value import PgVector
 from .instrumentation import _MappedField, instrument_model, raw_values, restore_values
 from decimal import Decimal
 import datetime as dt
@@ -152,7 +153,7 @@ class ModelMapping(Generic[T]):
 
 def _primary_profile(spec: ColumnSpec[Any]) -> bool:
     if spec.domain_base is not None: return _primary_profile(spec.domain_base)
-    return spec.sql_type not in {'json','jsonb','interval'} and spec.python_type not in {PgArray,PgRange,PgDomain,PgComposite}
+    return spec.sql_type not in {'json','jsonb','interval'} and spec.python_type not in {PgArray,PgRange,PgDomain,PgComposite,PgVector}
 
 
 def _identity_value(spec: ColumnSpec[Any],value: Any) -> Any:

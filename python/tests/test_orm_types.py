@@ -281,3 +281,14 @@ def static_composite_consumer(db: Database) -> None:
 async def static_async_composite_consumer(db: AsyncDatabase) -> None:
     spec=await db.composite_spec('app','pair',{'id':ColumnSpec(int,'int8',nullable=True)})
     assert_type(spec,ColumnSpec[PgComposite])
+
+from neutron.orm import PgVector
+
+def static_vector_consumer(db: Database) -> None:
+    spec=db.vector_spec('extensions')
+    assert_type(spec,ColumnSpec[PgVector])
+    table=db.catalog_table('vectors',{'value':spec},schema='app')
+    assert_type(db.one(select(table.column('value',PgVector))),PgVector)
+
+async def static_async_vector_consumer(db: AsyncDatabase) -> None:
+    assert_type(await db.vector_spec('extensions'),ColumnSpec[PgVector])

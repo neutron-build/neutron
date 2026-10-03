@@ -8,6 +8,7 @@ from .endpoint import EndpointIdentity, admit, startup_version
 from .json_value import load_document, native_params
 from .query import Query
 from .sql_admission import validate_scope_sql
+from .vector_value import PgVector,VECTOR_SQL,admitted_vector,register_vector
 from .composite_value import PgComposite,COMPOSITE_SQL,admitted_components,register_composite
 from .catalog_value import CatalogType, PgDomain, PgEnum, TYPE_SQL, TABLE_SQL, admitted_type, register_catalog_values
 from .core import ColumnSpec, Table, quote, CardinalityError, Compiled, Mutation, OrmError, Returning, Select, SessionBusyError
@@ -128,6 +129,17 @@ class Database:
             cached=ColumnSpec(PgEnum,'enum',native_type=identity);self._catalog_specs[(schema,name)]=cached
         from dataclasses import replace
         return cast(ColumnSpec[PgEnum],replace(cached,nullable=nullable,generated=generated))
+
+    def vector_spec(self,schema: str,name: str='vector',*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgVector]:
+        quote(schema);quote(name)
+        identity=admitted_type(self._catalog_read(TYPE_SQL,(schema,name)),schema,name,'b',self._catalog_owner)
+        admitted_vector(self._catalog_read(VECTOR_SQL,(identity.oid,)),identity)
+        cached=self._catalog_specs.get((schema,name))
+        if cached is None or cached.native_type!=identity:
+            register_vector(self._conn,self._catalog_owner,identity)
+            cached=ColumnSpec(PgVector,'vector',native_type=identity);self._catalog_specs[(schema,name)]=cached
+        from dataclasses import replace
+        return cast(ColumnSpec[PgVector],replace(cached,nullable=nullable,generated=generated))
 
     def composite_spec(self,schema: str,name: str,fields: Mapping[str,ColumnSpec[Any]],*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgComposite]:
         quote(schema);quote(name)
@@ -412,6 +424,17 @@ class AsyncDatabase:
             cached=ColumnSpec(PgEnum,'enum',native_type=identity);self._catalog_specs[(schema,name)]=cached
         from dataclasses import replace
         return cast(ColumnSpec[PgEnum],replace(cached,nullable=nullable,generated=generated))
+
+    async def vector_spec(self,schema: str,name: str='vector',*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgVector]:
+        quote(schema);quote(name)
+        identity=admitted_type(await self._catalog_read(TYPE_SQL,(schema,name)),schema,name,'b',self._catalog_owner)
+        admitted_vector(await self._catalog_read(VECTOR_SQL,(identity.oid,)),identity)
+        cached=self._catalog_specs.get((schema,name))
+        if cached is None or cached.native_type!=identity:
+            register_vector(self._conn,self._catalog_owner,identity)
+            cached=ColumnSpec(PgVector,'vector',native_type=identity);self._catalog_specs[(schema,name)]=cached
+        from dataclasses import replace
+        return cast(ColumnSpec[PgVector],replace(cached,nullable=nullable,generated=generated))
 
     async def composite_spec(self,schema: str,name: str,fields: Mapping[str,ColumnSpec[Any]],*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgComposite]:
         quote(schema);quote(name)
