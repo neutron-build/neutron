@@ -3,10 +3,14 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Generic, TypeVar
+from weakref import WeakValueDictionary, ref
+from threading import RLock
+from typing import Any, Generic, TypeVar, cast
 from .core import OrmError
 from .mapping import ModelMapping, same_value
 T=TypeVar('T')
+_OWNERS: WeakValueDictionary[int,StateStore]=WeakValueDictionary()
+_OWNER_LOCK=RLock()
 
 class ObjectState(str,Enum):
     TRANSIENT='transient'
@@ -30,6 +34,7 @@ class StateStore:
     def __init__(self) -> None:
         self.records: dict[int,Record[Any]]={}
         self.identities: dict[tuple[Any,...],Record[Any]]={}
+        self._history: dict[int,tuple[Any,ObjectState]]={}
 
     def _identity(self,mapping: ModelMapping[Any],values: dict[str,Any]) -> tuple[Any,...] | None:
         key=mapping.key(values)
@@ -37,19 +42,29 @@ class StateStore:
 
     def attach(self,mapping: ModelMapping[T],obj: T,*,new: bool) -> Record[T]:
         if id(obj) in self.records: raise OrmError('object already tracked')
+        self._history.pop(id(obj),None)
         values=deepcopy(mapping.snapshot(obj))
         identity=self._identity(mapping,values)
         if identity is not None and identity in self.identities: raise OrmError('mapped identity already tracked')
+        if not new and identity is None: raise OrmError("persistent object requires a complete primary key")
+        with _OWNER_LOCK:
+            owner=_OWNERS.get(id(obj))
+            if owner is not None and owner is not self: raise OrmError("object attached to another Session")
+            _OWNERS[id(obj)]=self
         record=Record(mapping,obj,ObjectState.PENDING if new else ObjectState.PERSISTENT,values.copy(),values,new)
         self.records[id(obj)]=record
         if identity is not None: self.identities[identity]=record
         return record
 
     def find(self,mapping: ModelMapping[T],key: tuple[Any,...]) -> T | None:
-        record=self.identities.get((mapping.model_type,mapping.table.schema,mapping.table.name,*key))
+        if len(key)!=len(mapping.primary_key): raise ValueError('primary-key cardinality mismatch')
+        normalized=mapping.key(dict(zip(mapping.primary_key,key)))
+        if normalized is None: return None
+        record=self.identities.get((mapping.model_type,mapping.table.schema,mapping.table.name,*normalized))
         if record is None: return None
-        if record.state in {ObjectState.DELETED,ObjectState.INDETERMINATE}: raise OrmError('tracked identity unavailable')
-        return record.obj
+        if record.state is ObjectState.DELETED: return None
+        if record.state is ObjectState.INDETERMINATE: raise OrmError('tracked identity unavailable')
+        return cast(T,record.obj)
 
     def dirty(self,record: Record[Any]) -> dict[str,Any]:
         current=record.mapping.snapshot(record.obj)
@@ -69,7 +84,7 @@ class StateStore:
     def committed(self) -> None:
         for record in list(self.records.values()):
             if record.state is ObjectState.DELETED:
-                self.records.pop(id(record.obj));continue
+                self.records.pop(id(record.obj));self._remember(record.obj,ObjectState.DELETED);self._release(record.obj);continue
             record.original=deepcopy(record.baseline);record.was_new=False
         self._reindex()
 
@@ -78,7 +93,7 @@ class StateStore:
             record.mapping.restore(record.obj,deepcopy(record.original))
             record.baseline=deepcopy(record.original)
             if record.was_new:
-                record.state=ObjectState.TRANSIENT;self.records.pop(id(record.obj))
+                record.state=ObjectState.TRANSIENT;self.records.pop(id(record.obj));self._remember(record.obj,ObjectState.TRANSIENT);self._release(record.obj)
             else: record.state=ObjectState.PERSISTENT
         self._reindex()
 
@@ -86,8 +101,28 @@ class StateStore:
         for record in self.records.values(): record.state=ObjectState.INDETERMINATE
 
     def detach_all(self) -> None:
-        for record in self.records.values(): record.state=ObjectState.DETACHED
+        for record in self.records.values():
+            if record.state is not ObjectState.INDETERMINATE: record.state=ObjectState.DETACHED
+            self._remember(record.obj,record.state)
+            self._release(record.obj)
         self.records.clear();self.identities.clear()
+
+    def object_state(self,obj: object) -> ObjectState:
+        record=self.records.get(id(obj))
+        if record is not None: return record.state
+        previous=self._history.get(id(obj))
+        return previous[1] if previous is not None and previous[0]() is obj else ObjectState.TRANSIENT
+
+    def _remember(self,obj: object,state: ObjectState) -> None:
+        owner=ref(self);identity=id(obj)
+        def cleanup(reference: Any) -> None:
+            store=owner()
+            if store is not None and store._history.get(identity,(None,None))[0] is reference: store._history.pop(identity,None)
+        self._history[identity]=(ref(obj,cleanup),state)
+
+    def _release(self,obj: object) -> None:
+        with _OWNER_LOCK:
+            if _OWNERS.get(id(obj)) is self: _OWNERS.pop(id(obj),None)
 
     def _reindex(self) -> None:
         self.identities.clear()

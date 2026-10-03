@@ -1,11 +1,12 @@
 """Explicit scalar dataclass mapping; no inheritance or relationship instrumentation."""
 from __future__ import annotations
-from dataclasses import MISSING, fields, is_dataclass
+from dataclasses import MISSING, dataclass, fields, is_dataclass
 import types
 from types import MappingProxyType
 from typing import Any, Generic, Mapping, TypeVar, get_args, get_origin, get_type_hints, Union
 from .core import Column, OMIT, OrmError, Table
 from decimal import Decimal
+import datetime as dt
 
 def same_value(left: Any,right: Any) -> bool:
     if isinstance(left,Decimal) and isinstance(right,Decimal) and left.is_nan() and right.is_nan(): return True
@@ -13,9 +14,16 @@ def same_value(left: Any,right: Any) -> bool:
 
 T=TypeVar('T')
 
+@dataclass(frozen=True,eq=False,init=False)
 class ModelMapping(Generic[T]):
+    model_type: type[T]
+    table: Table
+    field_columns: Mapping[str,Column[Any]]
+    primary_key: tuple[str,...]
     def __init__(self,model_type: type[T],table: Table,field_columns: Mapping[str,Column[Any]],*,primary_key: tuple[str,...]) -> None:
         if not is_dataclass(model_type): raise ValueError('scalar mapping requires a dataclass type')
+        if not hasattr(model_type,'__weakref__'): raise ValueError('mapped dataclass needs weak reference support')
+        if any(is_dataclass(base) for base in model_type.__bases__): raise ValueError('mapped inheritance unsupported in scalar profile')
         declared={f.name:f for f in fields(model_type)}
         if not field_columns or not primary_key or len(primary_key)!=len(set(primary_key)):
             raise ValueError('mapping and unique primary-key fields required')
@@ -24,6 +32,7 @@ class ModelMapping(Generic[T]):
         for name,column in field_columns.items():
             if name not in declared or column.table is not table or table.columns.get(column.name) is not column or column.name in physical:
                 raise ValueError('mapping requires unique declared fields and owned columns')
+            if not declared[name].init: raise ValueError("mapped init=False dataclass fields unsupported")
             physical.add(column.name)
             annotation=hints.get(name)
             alternatives=set(get_args(annotation)) if get_origin(annotation) in {types.UnionType,Union} else {annotation}
@@ -39,16 +48,25 @@ class ModelMapping(Generic[T]):
                 raise ValueError('primary-key fields must be mapped nonnullable columns')
         params=getattr(model_type,'__dataclass_params__')
         if params.frozen: raise ValueError('mutable mapped dataclass required')
-        self.model_type=model_type;self.table=table
-        self.field_columns=MappingProxyType(dict(field_columns));self.primary_key=primary_key
+        object.__setattr__(self,"model_type",model_type)
+        object.__setattr__(self,"table",table)
+        object.__setattr__(self,"field_columns",MappingProxyType(dict(field_columns)))
+        object.__setattr__(self,"primary_key",tuple(primary_key))
 
     def snapshot(self,obj: T) -> dict[str,Any]:
         if type(obj) is not self.model_type: raise ValueError('mapped model type mismatch; inheritance not implemented')
         return {name:getattr(obj,name) for name in self.field_columns}
 
     def key(self,values: Mapping[str,Any]) -> tuple[Any,...] | None:
-        key=tuple(values[name] for name in self.primary_key)
-        return None if any(v is None or v is OMIT for v in key) else key
+        key=[]
+        for name in self.primary_key:
+            value=values[name]
+            if value is None or value is OMIT: return None
+            column=self.field_columns[name];column.spec.check(value)
+            if isinstance(value,Decimal) and not value.is_finite(): raise ValueError("nonfinite numeric primary keys unsupported")
+            if column.spec.sql_type=='timestamptz': value=value.astimezone(dt.timezone.utc)
+            key.append(value)
+        return tuple(key)
 
     def construct(self,row: Mapping[str,Any]) -> T:
         values={}
