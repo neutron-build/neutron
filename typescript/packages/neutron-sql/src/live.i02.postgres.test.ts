@@ -14,6 +14,7 @@ import {
   integer,
   loadDriver,
   pgTable,
+  raw,
   serial,
   sql,
   text,
@@ -623,8 +624,8 @@ for (const driverKind of ["postgres", "pg"] as const) {
       db = await createDatabase({ driver, tables: { i02_notes: notes }, logger: true });
       await db.insert(notes).values({ body: canaryValue });
       await db.select().from(notes).where(eq(notes.body, canaryValue));
-      await db.select({ literal: sql<string>`${sql.raw(`'${canaryValue}'`)}` }).from(notes).limit(1);
-      await assert.rejects(db.select({ invalid: sql<number>`${canaryValue}::integer` }).from(notes), (err: unknown) => getSqlState(err) === "22P02");
+      await db.select({ literal: sql`${raw(`'${canaryValue}'`)}` }).from(notes).limit(1);
+      await assert.rejects(async () => db!.select({ invalid: sql`${canaryValue}::integer` }).from(notes), (err: unknown) => getSqlState(err) === "22P02");
       const observerDb = await createDatabase({ driver, tables: { i02_notes: notes }, logger: () => { throw new Error(canaryValue); } });
       const committedBody = `${canaryValue}_committed`;
       await observerDb.transaction(async tx => { await tx.insert(notes).values({ body: committedBody }); });
