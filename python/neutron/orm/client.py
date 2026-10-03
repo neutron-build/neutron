@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 from contextlib import contextmanager, asynccontextmanager
 import threading
-from typing import Any, AsyncIterator, Iterator, TypeVar
-from .core import CardinalityError, Mutation, OrmError, Returning, Select, SessionBusyError
+from typing import Any, AsyncIterator, Iterator, Mapping, Sequence, TypeVar, TYPE_CHECKING
+from .core import CardinalityError, Compiled, Mutation, OrmError, Returning, Select, SessionBusyError
+
+if TYPE_CHECKING:
+    from .lifecycle import AsyncTransactionHandle, TransactionHandle
 
 T=TypeVar('T')
 
-def _decode_rows(query: Select[T] | Returning[T], compiled: Any, rows: Any, cardinality: str) -> list[T]:
+def _decode_rows(query: Select[T] | Returning[T], compiled: Compiled[T], rows: Sequence[Mapping[str,Any]], cardinality: str) -> list[T]:
     if cardinality!='many' and len(rows)>1: raise CardinalityError('expected at most one row')
     if cardinality=='one' and not rows: raise CardinalityError('expected exactly one row')
     return [compiled.decode(row) for row in rows]
@@ -57,6 +60,7 @@ class Database:
     @contextmanager
     def _use(self) -> Iterator[None]:
         if self._closed: raise OrmError('connection closed')
+        if self._rollback_only: raise OrmError('transaction requires rollback')
         if self._owner is not None and self._owner != threading.get_ident():
             raise SessionBusyError('transaction belongs to another thread')
         if not self._lock.acquire(blocking=False): raise SessionBusyError('concurrent active session use refused')
@@ -80,7 +84,7 @@ class Database:
                 raise _native(exc) from exc
         return self._decode(query,compiled,rows,cardinality)
 
-    def _decode(self,query: Select[T] | Returning[T],compiled: Any,rows: Any,cardinality: str) -> list[T]:
+    def _decode(self,query: Select[T] | Returning[T],compiled: Compiled[T],rows: Sequence[Mapping[str,Any]],cardinality: str) -> list[T]:
         try: return _decode_rows(query,compiled,rows,cardinality)
         except Exception:
             if isinstance(query,Returning): self._rollback_only=True
@@ -139,6 +143,10 @@ class Database:
             self._owner=None
             self._rollback_only=False
 
+    def begin(self) -> TransactionHandle:
+        from .lifecycle import TransactionHandle
+        return TransactionHandle(self)
+
     def close(self) -> None:
         if self._closed: return
         if self._owner is not None: raise SessionBusyError('close during active transaction refused')
@@ -179,6 +187,7 @@ class AsyncDatabase:
     @asynccontextmanager
     async def _use(self) -> AsyncIterator[None]:
         if self._closed: raise OrmError('connection closed')
+        if self._rollback_only: raise OrmError('transaction requires rollback')
         if self._owner is not None and self._owner is not asyncio.current_task(): raise SessionBusyError('transaction belongs to another task')
         if self._busy: raise SessionBusyError('concurrent active session use refused')
         self._busy=True
@@ -204,7 +213,7 @@ class AsyncDatabase:
                 raise _native(exc) from exc
         return self._decode(query,compiled,rows,cardinality)
 
-    def _decode(self,query: Select[T] | Returning[T],compiled: Any,rows: Any,cardinality: str) -> list[T]:
+    def _decode(self,query: Select[T] | Returning[T],compiled: Compiled[T],rows: Sequence[Mapping[str,Any]],cardinality: str) -> list[T]:
         try: return _decode_rows(query,compiled,rows,cardinality)
         except Exception:
             if isinstance(query,Returning): self._rollback_only=True
@@ -278,6 +287,10 @@ class AsyncDatabase:
         finally:
             self._owner=None
             self._rollback_only=False
+
+    async def begin(self) -> AsyncTransactionHandle:
+        from .lifecycle import AsyncTransactionHandle
+        return await AsyncTransactionHandle(self).open()
 
     async def close(self) -> None:
         if self._closed: return

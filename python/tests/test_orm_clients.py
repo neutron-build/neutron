@@ -172,3 +172,18 @@ async def test_commit_cancellation_preserves_cancel_semantics_and_unknown_outcom
     assert isinstance(exc.value,asyncio.CancelledError)
     assert exc.value.outcome=='indeterminate'
     assert conn.pgconn.finished
+
+
+def test_explicit_lifecycle_adapter_terminal_handles():
+    db=Database(Connection([]));tx=db.begin();assert tx.state=='active'
+    tx.rollback();assert tx.state=='aborted'
+    with pytest.raises(OrmError): tx.commit()
+    tx=db.begin();tx.commit();assert tx.state=='committed'
+
+@pytest.mark.asyncio
+async def test_async_lifecycle_adapter_owner_and_terminal():
+    db=AsyncDatabase(AsyncConnection([]));tx=await db.begin()
+    async def foreign(): await tx.commit()
+    with pytest.raises(SessionBusyError): await asyncio.create_task(foreign())
+    await tx.rollback();assert tx.state=='aborted'
+    with pytest.raises(OrmError): await tx.rollback()
