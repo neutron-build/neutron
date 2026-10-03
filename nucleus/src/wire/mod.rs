@@ -20,12 +20,11 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::sink::{Sink, SinkExt};
-use futures::{StreamExt, stream};
+use futures::{FutureExt, StreamExt, stream};
 use tokio::sync::broadcast;
 
 use pgwire::api::auth::sasl::{
@@ -361,9 +360,6 @@ pub struct NotificationRegistry {
     channels: DashMap<String, broadcast::Sender<PendingNotification>>,
     /// Default broadcast capacity per channel.
     capacity: usize,
-    /// Monotonic process ID counter (one per connection, exposed in
-    /// NotificationResponse as `pid`).
-    next_pid: AtomicI32,
 }
 
 impl NotificationRegistry {
@@ -371,13 +367,7 @@ impl NotificationRegistry {
         Self {
             channels: DashMap::new(),
             capacity,
-            next_pid: AtomicI32::new(1),
         }
-    }
-
-    /// Allocate a unique process ID for a new connection.
-    fn allocate_pid(&self) -> i32 {
-        self.next_pid.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Subscribe to a channel. Returns a receiver for notifications on that channel.
@@ -1307,7 +1297,20 @@ impl NucleusHandler {
                                 "canceling statement due to user request".to_owned(),
                             ),
                         ))),
-                        result = fut => result.map_err(exec_error_to_pgwire),
+                        result = fut => {
+                            // A synchronous executor poll may itself signal
+                            // cancellation (including SQL self-cancellation).
+                            // Recheck the shared permit before returning rows.
+                            if self.executor.session_cancel_pending(session_id)
+                                || notify.notified().now_or_never().is_some() {
+                                Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".to_owned(), "57014".to_owned(),
+                                    "canceling statement due to user request".to_owned(),
+                                ))))
+                            } else {
+                                result.map_err(exec_error_to_pgwire)
+                            }
+                        },
                     }
                 }
                 None => fut.await.map_err(exec_error_to_pgwire),
@@ -1759,13 +1762,17 @@ impl StartupHandler for NucleusHandler {
                 // finish_authentication) and register it so a later
                 // CancelRequest on a fresh connection can interrupt this
                 // session's running query.
-                let pid = self.connection_pid(&addr);
+                let (pid, cancel_notify) = self
+                    .executor
+                    .register_session_backend(session_id)
+                    .map_err(exec_error_to_pgwire)?;
+                self.connection_pids.write().insert(addr.clone(), pid);
                 let secret = SecretKey::I32(rand::random::<i32>());
                 client.set_pid_and_secret_key(pid, secret.clone());
                 self.cancel_keys.write().insert(pid, (secret, session_id));
                 self.cancel_notifies
                     .write()
-                    .insert(session_id, Arc::new(tokio::sync::Notify::new()));
+                    .insert(session_id, cancel_notify);
 
                 if !auth_required {
                     finish_authentication(client, &self.parameter_provider).await?;
@@ -2920,13 +2927,12 @@ impl NucleusHandler {
 
     /// Get (or allocate) the process ID assigned to this connection.
     fn connection_pid(&self, peer_addr: &str) -> i32 {
-        if let Some(&pid) = self.connection_pids.read().get(peer_addr) {
+        let mut pids = self.connection_pids.write();
+        if let Some(&pid) = pids.get(peer_addr) {
             return pid;
         }
-        let pid = self.notification_registry.allocate_pid();
-        self.connection_pids
-            .write()
-            .insert(peer_addr.to_string(), pid);
+        let pid = self.executor.allocate_backend_pid().unwrap_or(0);
+        pids.insert(peer_addr.to_string(), pid);
         pid
     }
 
@@ -3647,11 +3653,8 @@ impl CancelHandler for NucleusHandler {
                 // Cooperative flag: long compute loops poll it (rayon filters,
                 // cartesian products) — this is what interrupts CPU-bound work.
                 self.executor.request_session_cancel(session_id);
-                // Notify: wakes the wire-level race for executions parked at
-                // an await point.
-                if let Some(notify) = self.cancel_notifies.read().get(&session_id) {
-                    notify.notify_one();
-                }
+                // The shared executor signal also wakes the wire race at await
+                // points. A second notify would leave an extra stale permit.
             }
             None => {
                 tracing::debug!(
@@ -4782,6 +4785,7 @@ fn walk_expr_for_params(
             // mirrors the executor's scalar_fns signatures.
             let fname = func.name.to_string().to_uppercase();
             let sig: &[Type] = match fname.as_str() {
+                "PG_CANCEL_BACKEND" => &[Type::INT4],
                 "FTS_SEARCH" => &[Type::TEXT, Type::INT8],
                 "FTS_FUZZY_SEARCH" => &[Type::TEXT, Type::INT8, Type::INT8],
                 "FTS_SEARCH_FILTER" => &[Type::TEXT, Type::INT8, Type::TEXT, Type::TEXT],
@@ -7422,16 +7426,6 @@ mod security_tests {
     // ── Notification Registry tests ─────────────────────────────────
 
     #[test]
-    fn notification_registry_allocate_pid() {
-        let registry = NotificationRegistry::new(16);
-        let pid1 = registry.allocate_pid();
-        let pid2 = registry.allocate_pid();
-        assert_ne!(pid1, pid2);
-        assert!(pid1 > 0);
-        assert!(pid2 > 0);
-    }
-
-    #[test]
     fn notification_registry_listen_and_notify() {
         let registry = NotificationRegistry::new(16);
         let mut rx = registry.listen("test_channel");
@@ -7600,6 +7594,41 @@ mod security_tests {
             got.push(n.payload);
         }
         assert_eq!(got, vec!["m4", "m5", "m6", "m7"]);
+    }
+
+    #[tokio::test]
+    async fn backend_cancel_wakes_wait_and_fences_single_poll_completion() {
+        let executor = make_executor();
+        let handler = NucleusHandler::new(executor.clone());
+        let id = executor.create_session();
+        let (_, notify) = executor.register_session_backend(id).unwrap();
+        handler.cancel_notifies.write().insert(id, notify);
+        executor.request_session_cancel(id);
+        let blocked = handler
+            .run_with_session_limits(id, std::future::pending())
+            .await;
+        assert!(
+            blocked.is_err(),
+            "shared signal must interrupt a pending executor future"
+        );
+        executor.clear_session_cancel(id);
+        let completed = handler
+            .run_with_session_limits(id, async {
+                executor.request_session_cancel(id);
+                Ok(Vec::new())
+            })
+            .await;
+        assert!(
+            completed.is_err(),
+            "cancel during the winning execution poll must fence rows"
+        );
+        executor.clear_session_cancel(id);
+        assert!(
+            handler
+                .run_with_session_limits(id, async { Ok(Vec::new()) })
+                .await
+                .is_ok()
+        );
     }
 
     #[test]

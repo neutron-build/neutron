@@ -6,7 +6,7 @@ use crate::security::SecurityManager;
 use crate::types::Row;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use tokio::sync::RwLock;
 
 /// Wall-clock milliseconds since the Unix epoch (for idle tracking).
@@ -352,6 +352,11 @@ pub struct Session {
     /// executor's long loops check it cooperatively and abort with SQLSTATE
     /// 57014. Cleared at each statement start.
     pub(super) cancel_requested: AtomicBool,
+    /// Wire identity is immutable while registered; zero means no live backend.
+    pub(super) backend_pid: AtomicI32,
+    /// SQL and wire cancellation share the same wakeup and command boundary.
+    pub(super) cancel_notify: Arc<tokio::sync::Notify>,
+    pub(super) cancel_boundary: parking_lot::Mutex<()>,
     /// Nesting depth of `execute_statement` on this session. Statements run
     /// re-entrantly (stored procedures, triggers, function bodies execute
     /// statements inside statements); row locks taken by an autocommit
@@ -433,6 +438,9 @@ impl Session {
             executing: AtomicBool::new(false),
             stream_capable_consumer: AtomicBool::new(false),
             cancel_requested: AtomicBool::new(false),
+            backend_pid: AtomicI32::new(0),
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
+            cancel_boundary: parking_lot::Mutex::new(()),
             statement_depth: AtomicU64::new(0),
             plan_cache_key_hint: parking_lot::Mutex::new(None),
             deferred_fks: parking_lot::Mutex::new(Default::default()),

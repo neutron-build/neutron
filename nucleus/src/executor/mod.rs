@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
+use futures::FutureExt;
 
 use sqlparser::ast::{self, Expr, Statement};
 #[cfg(feature = "server")]
@@ -730,6 +731,8 @@ pub struct Executor {
     snapshot_leases: snapshot_lease::SnapshotLeaseRegistry,
     /// Counter for generating unique session IDs.
     next_session_id: AtomicU64,
+    #[cfg(feature = "server")]
+    next_backend_pid: std::sync::atomic::AtomicI32,
     /// Coordinator transaction-id counter (S63): minted at BEGIN, never
     /// derived from the SQL engine's own `next_txn_id` (minted at COMMIT, and
     /// reusable across restarts after segment pruning). Seeded at open above
@@ -1197,6 +1200,8 @@ impl Executor {
             #[cfg(feature = "server")]
             snapshot_leases: snapshot_lease::SnapshotLeaseRegistry::new(),
             next_session_id: AtomicU64::new(1),
+            #[cfg(feature = "server")]
+            next_backend_pid: std::sync::atomic::AtomicI32::new(1),
             next_xact_id: AtomicU64::new(1),
             specialty_horizon: AtomicU64::new(1),
             specialty_checkpoint_skips: AtomicU64::new(0),
@@ -3261,6 +3266,42 @@ impl Executor {
         id
     }
 
+    /// Trusted wire boundary: register a unique, never-reused backend identity.
+    /// Unauthenticated sessions have no SQL cancellation authority. Rebinding
+    /// the same live session returns its original identity and shared wakeup.
+    #[cfg(feature = "server")]
+    pub fn register_session_backend(
+        &self,
+        id: u64,
+    ) -> Result<(i32, Arc<tokio::sync::Notify>), ExecError> {
+        // Hold the map guard through registration so disconnect cannot remove
+        // the session and then have a stale caller register it afterward.
+        let sessions = self.sessions.read();
+        let session = sessions.get(&id).ok_or_else(|| {
+            ExecError::PermissionDenied("cannot register an unknown backend session".into())
+        })?;
+        let _boundary = session.cancel_boundary.lock();
+        let old = session.backend_pid.load(Ordering::Acquire);
+        let pid = if old > 0 {
+            old
+        } else {
+            let pid = self.allocate_backend_pid()?;
+            session.backend_pid.store(pid, Ordering::Release);
+            pid
+        };
+        Ok((pid, session.cancel_notify.clone()))
+    }
+
+    /// Refuse exhaustion rather than wrapping a stale PID onto a new borrower.
+    #[cfg(feature = "server")]
+    pub(crate) fn allocate_backend_pid(&self) -> Result<i32, ExecError> {
+        self.next_backend_pid
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pid| {
+                pid.checked_add(1)
+            })
+            .map_err(|_| ExecError::Unsupported("backend identity space exhausted".into()))
+    }
+
     /// Install/rotate the bootstrap role's SCRAM verifier. Used by the server
     /// startup flag before accepting connections.
     #[cfg(feature = "server")]
@@ -3404,6 +3445,7 @@ impl Executor {
     pub fn drop_session(&self, id: u64) {
         let session = self.sessions.write().remove(&id);
         if let Some(session) = session {
+            session.backend_pid.store(0, Ordering::Release);
             if session.txn_active.load(Ordering::SeqCst) {
                 #[cfg(feature = "server")]
                 {
@@ -3809,9 +3851,73 @@ impl Executor {
     /// cancellation (wire CancelRequest). Long compute loops observe the flag
     /// and abort with SQLSTATE 57014; the flag clears at the next statement.
     pub fn request_session_cancel(&self, session_id: u64) {
-        self.get_session(session_id)
-            .cancel_requested
-            .store(true, Ordering::Relaxed);
+        if let Some(session) = self.sessions.read().get(&session_id) {
+            Self::signal_session_cancel(session);
+        }
+    }
+
+    fn signal_session_cancel(session: &Session) {
+        let _boundary = session.cancel_boundary.lock();
+        session.cancel_requested.store(true, Ordering::Relaxed);
+        session.cancel_notify.notify_one();
+    }
+
+    /// Wire completion fence for a cancellation signaled during a single
+    /// non-yielding executor poll. Unknown/disconnected sessions never fall back.
+    #[cfg(feature = "server")]
+    pub(crate) fn session_cancel_pending(&self, session_id: u64) -> bool {
+        self.sessions
+            .read()
+            .get(&session_id)
+            .is_some_and(|session| session.cancel_requested.load(Ordering::Relaxed))
+    }
+
+    pub(super) fn current_backend_pid(&self) -> i32 {
+        let pid = self.current_session().backend_pid.load(Ordering::Acquire);
+        if pid > 0 {
+            pid
+        } else {
+            std::process::id() as i32
+        }
+    }
+
+    /// Finite authorization: same effective role as the authenticated target
+    /// owner, or an effective superuser. pg_signal_backend/membership authority
+    /// is not advertised here; BYPASSRLS never confers cancellation authority.
+    pub(super) fn cancel_backend(&self, pid: i32) -> Result<bool, ExecError> {
+        if pid <= 0 {
+            return Ok(false);
+        }
+        let caller = self.current_session();
+        if caller.authenticated_user.read().is_none() {
+            return Err(ExecError::PermissionDenied(
+                "unauthenticated cancellation refused".into(),
+            ));
+        }
+        let caller_context = caller.session_context.read().clone();
+        let sessions = self.sessions.read();
+        let Some(target) = sessions
+            .values()
+            .find(|session| session.backend_pid.load(Ordering::Acquire) == pid)
+        else {
+            return Ok(false);
+        };
+        let owner = target.authenticated_user.read().clone();
+        if owner.is_none() {
+            return Ok(false);
+        }
+        let target_is_superuser = target.session_context.read().is_superuser;
+        if !caller_context.is_superuser
+            && (target_is_superuser || owner.as_deref() != Some(caller_context.user.as_str()))
+        {
+            return Err(ExecError::PermissionDenied(
+                "permission to cancel target backend denied".into(),
+            ));
+        }
+        // Keep the map read lock until signaling: removal cannot recycle or
+        // detach the target between identity/authorization checks and wakeup.
+        Self::signal_session_cancel(target);
+        Ok(true)
     }
 
     /// Drop any pending cancel on the session. The wire layer calls this at
@@ -3820,9 +3926,11 @@ impl Executor {
     /// several internal statements (e.g. the Describe probe) and a cancel
     /// arriving during any of them targets the same client command.
     pub fn clear_session_cancel(&self, session_id: u64) {
-        self.get_session(session_id)
-            .cancel_requested
-            .store(false, Ordering::Relaxed);
+        if let Some(session) = self.sessions.read().get(&session_id) {
+            let _boundary = session.cancel_boundary.lock();
+            session.cancel_requested.store(false, Ordering::Relaxed);
+            while session.cancel_notify.notified().now_or_never().is_some() {}
+        }
     }
 
     /// Error out if the current session's statement has been cancelled.
@@ -7417,7 +7525,14 @@ impl Executor {
                 // cacheable: a replay serves rows without taking the locks the
                 // clause promises, from a snapshot the claim already consumed.
                 let sql_text = query.to_string();
+                // Backend identity is session-local; cancellation must execute
+                // on every call. Never replay either from a shared result cache.
+                let backend_control = {
+                    let upper = sql_text.to_ascii_uppercase();
+                    upper.contains("PG_BACKEND_PID") || upper.contains("PG_CANCEL_BACKEND")
+                };
                 let cacheable = !has_row_locks
+                    && !backend_control
                     && !in_txn
                     && !Self::query_cache_disabled()
                     && !self.any_table_secured()

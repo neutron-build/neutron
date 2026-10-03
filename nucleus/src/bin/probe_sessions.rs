@@ -1,6 +1,6 @@
 //! Session authority and guard-state probe (NU-217 / NU-218 class).
 //!
-//! Two sections, both about the same defect family: **a permissive default on
+//! Original two sections, both about the same defect family: **a permissive default on
 //! a failure path**. A lock-contention error was interpreted as "not in a
 //! transaction"; an unknown session id fell back to the bootstrap superuser —
 //! and the calls that install authority WROTE to that fallback.
@@ -27,6 +27,10 @@
 //! succeed; one guard observation expected to answer the unsafe direction).
 //! It passes only if the perturbation adds divergences to that section and
 //! none to the other. A check nobody has watched fail is not a check.
+//!
+//! NP02 adds `cancellation`: registered SQL identity, same-role wakeup,
+//! cross-role denial (including BYPASSRLS), boundary clearing and disconnect.
+//! It carries its own `--negative-control cancellation`.
 //!
 //! Build: `cargo run --release --features server --bin probe_sessions`
 //!        `... --bin probe_sessions -- --negative-control authority`
@@ -347,6 +351,86 @@ async fn section_guards(perturb: bool, sec: &mut Sections) {
     }
 }
 
+// NP02 finite backend cancellation contract. This exercises real SQL and the
+// session registry; it does not infer PostgreSQL wire/native parity.
+async fn section_cancellation(perturb: bool, sec: &mut Sections) {
+    use futures::FutureExt;
+    let ex = make_executor();
+    for sql in [
+        "CREATE ROLE cancel_owner LOGIN",
+        "CREATE ROLE cancel_other LOGIN BYPASSRLS",
+    ] {
+        ex.execute(sql).await.expect("cancellation fixture roles");
+    }
+    let owner = ex.create_unauthenticated_session();
+    let peer = ex.create_unauthenticated_session();
+    let other = ex.create_unauthenticated_session();
+    for (id, role) in [
+        (owner, "cancel_owner"),
+        (peer, "cancel_owner"),
+        (other, "cancel_other"),
+    ] {
+        ex.bind_authenticated_session(id, role)
+            .await
+            .expect("bind cancellation principal");
+    }
+    let (pid, notify) = ex
+        .register_session_backend(owner)
+        .expect("live backend registration");
+    let (peer_pid, _) = ex
+        .register_session_backend(peer)
+        .expect("peer backend registration");
+    if pid == peer_pid || exec(&ex, owner, "SELECT pg_backend_pid()").await != Ok(pid.to_string()) {
+        sec.push(
+            "cancellation",
+            "SQL backend identity differs from registered unique identity".into(),
+        );
+    }
+    let sql = format!("SELECT pg_cancel_backend({pid})");
+    let denied = matches!(
+        ex.execute_with_session(other, &sql).await,
+        Err(nucleus::executor::ExecError::PermissionDenied(_))
+    );
+    if denied == perturb {
+        sec.push(
+            "cancellation",
+            "other-role/BYPASSRLS cancellation authority differs from model".into(),
+        );
+    }
+    if notify.notified().now_or_never().is_some() {
+        sec.push(
+            "cancellation",
+            "denied cancellation woke another role's session".into(),
+        );
+    }
+    if exec(&ex, peer, &sql).await != Ok("true".into())
+        || notify.notified().now_or_never().is_none()
+    {
+        sec.push(
+            "cancellation",
+            "same-role cancellation did not return true and wake target".into(),
+        );
+    }
+    ex.clear_session_cancel(owner);
+    ex.request_session_cancel(owner);
+    ex.clear_session_cancel(owner);
+    if notify.notified().now_or_never().is_some() {
+        sec.push(
+            "cancellation",
+            "stale cancellation permit crossed command boundary".into(),
+        );
+    }
+    ex.drop_session(owner);
+    if exec(&ex, peer, &sql).await != Ok("false".into())
+        || ex.register_session_backend(owner).is_ok()
+    {
+        sec.push(
+            "cancellation",
+            "disconnected session remained a cancellation target".into(),
+        );
+    }
+}
+
 // ─── Driver ──────────────────────────────────────────────────────────────────
 
 fn run_sections(perturb: Option<&str>) -> Sections {
@@ -364,6 +448,15 @@ fn run_sections(perturb: Option<&str>) -> Sections {
     if r2.is_err() {
         sec.push("guards", "PANIC during section".to_string());
     }
+    let r3 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.block_on(section_cancellation(
+            perturb == Some("cancellation"),
+            &mut sec,
+        ));
+    }));
+    if r3.is_err() {
+        sec.push("cancellation", "PANIC during section".to_string());
+    }
     sec
 }
 
@@ -376,9 +469,9 @@ fn main_impl() {
             "--negative-control" => {
                 i += 1;
                 let section = args[i].clone();
-                if !["authority", "guards"].contains(&section.as_str()) {
+                if !["authority", "guards", "cancellation"].contains(&section.as_str()) {
                     eprintln!(
-                        "--negative-control takes one of: authority, guards (got {section:?})"
+                        "--negative-control takes one of: authority, guards, cancellation (got {section:?})"
                     );
                     std::process::exit(2);
                 }
@@ -400,7 +493,7 @@ fn main_impl() {
         let base = run_sections(None);
         let pert = run_sections(Some(section.as_str()));
         println!("\n════ SUMMARY (control) ════");
-        for s in ["authority", "guards"] {
+        for s in ["authority", "guards", "cancellation"] {
             println!(
                 "{s:<10}: {} divergence(s)  (clean baseline: {})",
                 pert.count(s),
@@ -408,12 +501,12 @@ fn main_impl() {
             );
         }
         let gained = pert.count(section) as i64 - base.count(section) as i64;
-        let spilled: i64 = ["authority", "guards"]
+        let spilled: i64 = ["authority", "guards", "cancellation"]
             .iter()
             .filter(|s| **s != section.as_str())
             .map(|s| pert.count(s) as i64 - base.count(s) as i64)
             .sum();
-        if gained > 0 && spilled == 0 {
+        if base.total() == 0 && gained > 0 && spilled == 0 {
             println!(
                 "\nNEGATIVE CONTROL PASSED: perturbing the {section} model added {gained} \
                  divergence(s) to {section} and none to the other section."
@@ -434,11 +527,11 @@ fn main_impl() {
         println!("─── [{section}] {detail}");
     }
     println!("\n════ SUMMARY ════");
-    for s in ["authority", "guards"] {
+    for s in ["authority", "guards", "cancellation"] {
         println!("{s:<10}: {} divergence(s)", sec.count(s));
     }
     if sec.total() == 0 {
-        println!("\nAuthority never fell back and the guards never answered the unsafe direction.");
+        println!("\nAuthority, guards, and finite backend cancellation invariants passed.");
     } else {
         std::process::exit(1);
     }

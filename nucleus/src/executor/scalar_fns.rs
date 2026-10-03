@@ -2229,7 +2229,16 @@ impl Executor {
             }
 
             // -- PostgreSQL system/catalog functions --
-            "PG_BACKEND_PID" => Ok(Value::Int32(std::process::id() as i32)),
+            "PG_BACKEND_PID" => {
+                require_args(fname, &args, 0)?;
+                Ok(Value::Int32(self.current_backend_pid()))
+            }
+            "PG_CANCEL_BACKEND" => {
+                require_args(fname, &args, 1)?;
+                let pid = i32::try_from(value_to_i64(&args[0])?)
+                    .map_err(|_| ExecError::Runtime("backend pid out of range".into()))?;
+                self.cancel_backend(pid).map(Value::Bool)
+            }
             // asyncpg runs `SELECT pg_advisory_unlock_all()` as part of the
             // reset it issues when a connection goes back to the pool. Without
             // this, RELEASING a pooled connection raised — so every Python
