@@ -36,6 +36,9 @@ func TestV3NativeExplicitDefaultAndColumnACLs(t *testing.T) {
 		fmt.Sprintf(`GRANT UPDATE ("Case Column") ON authority.docs TO %q`, role),
 		fmt.Sprintf(`GRANT USAGE ON SEQUENCE authority.seq TO %q`, role),
 		`REVOKE ALL ON TYPE authority.amount FROM PUBLIC`,
+		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES IN SCHEMA authority GRANT SELECT ON TABLES TO %q`, role),
+		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES GRANT USAGE ON TYPES TO %q`, role),
+		fmt.Sprintf(`GRANT CONNECT ON DATABASE %q TO %q WITH GRANT OPTION`, h.dbName, role),
 	} {
 		h.exec(sql)
 	}
@@ -45,7 +48,21 @@ func TestV3NativeExplicitDefaultAndColumnACLs(t *testing.T) {
 	}
 	tableGrant, columnGrant, schemaGrant, sequenceGrant := false, false, false, false
 	routineIntPublic, routineTextPublic := false, false
+	defaultGlobal, defaultSchema, databaseGrant := false, false, false
 	for _, e := range doc.Model.Inventory {
+		if e.Identity.Catalog == "pg_default_acl" || e.Identity.Catalog == "pg_database" {
+			for _, p := range v3PartsOfKind(e.Parts, "privilege") {
+				if p.Attributes["grantee"] != role {
+					continue
+				}
+				if e.Identity.Catalog == "pg_default_acl" {
+					defaultGlobal = defaultGlobal || (e.Attributes["namespaceScope"] == "global" && e.Attributes["defaultObjectKind"] == "T" && p.Attributes["privilege"] == "USAGE")
+					defaultSchema = defaultSchema || (e.Attributes["namespaceScope"] == "schema" && e.Identity.Schema == "authority" && e.Attributes["defaultObjectKind"] == "r" && p.Attributes["privilege"] == "SELECT")
+				} else {
+					databaseGrant = databaseGrant || (e.Identity.Name == h.dbName && p.Attributes["privilege"] == "CONNECT" && p.Attributes["grantable"] == "true")
+				}
+			}
+		}
 		if e.Identity.Schema != "authority" {
 			continue
 		}
@@ -66,6 +83,9 @@ func TestV3NativeExplicitDefaultAndColumnACLs(t *testing.T) {
 				}
 			}
 		}
+	}
+	if !defaultGlobal || !defaultSchema || !databaseGrant {
+		t.Fatalf("default/database ACL inventory global=%v schema=%v database=%v", defaultGlobal, defaultSchema, databaseGrant)
 	}
 	if !tableGrant || !columnGrant || !schemaGrant || !sequenceGrant || routineIntPublic || !routineTextPublic {
 		t.Fatalf("ACL inventory table=%v column=%v schema=%v sequence=%v intPublic=%v textPublic=%v", tableGrant, columnGrant, schemaGrant, sequenceGrant, routineIntPublic, routineTextPublic)

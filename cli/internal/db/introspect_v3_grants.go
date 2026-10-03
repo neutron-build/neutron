@@ -35,6 +35,17 @@ WITH objects AS (
         'type-authority',t.typowner,t.typacl,'T'::pg_catalog."char",0::pg_catalog.oid
  FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace
  WHERE t.typisdefined AND n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
+ UNION ALL
+ SELECT pg_catalog.jsonb_build_object('catalog','pg_default_acl','schema',COALESCE(n.nspname,'pg_catalog'),
+        'name',pg_catalog.jsonb_build_array(pg_catalog.pg_get_userbyid(d.defaclrole),d.defaclobjtype,
+             CASE WHEN d.defaclnamespace=0 THEN 'global' ELSE 'schema' END)::pg_catalog.text),
+        'default-authority',d.defaclrole,d.defaclacl,d.defaclobjtype,0::pg_catalog.oid
+ FROM pg_catalog.pg_default_acl d LEFT JOIN pg_catalog.pg_namespace n ON n.oid=d.defaclnamespace
+ WHERE d.defaclnamespace=0 OR (n.nspname <> 'information_schema' AND n.nspname !~ '^pg_')
+ UNION ALL
+ SELECT pg_catalog.jsonb_build_object('catalog','pg_database','schema','pg_catalog','name',d.datname),
+        'current-database-authority',d.datdba,d.datacl,'d'::pg_catalog."char",0::pg_catalog.oid
+ FROM pg_catalog.pg_database d WHERE d.datname=pg_catalog.current_database()
 )
 SELECT o.identity::pg_catalog.text,o.kind,pg_catalog.pg_get_userbyid(o.owner),
        CASE WHEN o.acl IS NULL THEN 'default' ELSE 'explicit' END,
@@ -97,6 +108,18 @@ func attachV3Grants(ctx context.Context, q pgQueryer, inventory []V3InventoryEnt
 			inventory = append(inventory, entry)
 		}
 		inventory[i].Attributes["aclStorage"] = storage
+		if identity.Catalog == "pg_default_acl" {
+			var tuple []string
+			if err := json.Unmarshal([]byte(identity.Name), &tuple); err != nil || len(tuple) != 3 {
+				return nil, fmt.Errorf("invalid default ACL portable identity")
+			}
+			inventory[i].Attributes["defaultOwner"] = tuple[0]
+			inventory[i].Attributes["defaultObjectKind"] = tuple[1]
+			inventory[i].Attributes["namespaceScope"] = tuple[2]
+		}
+		if identity.Catalog == "pg_database" {
+			inventory[i].Attributes["namespaceScope"] = "current-database; pg_catalog is catalog-address namespace, not a SQL schema"
+		}
 		inventory[i].Parts = append(inventory[i].Parts, parts...)
 	}
 	return inventory, rows.Err()

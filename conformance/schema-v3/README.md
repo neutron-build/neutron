@@ -123,6 +123,15 @@ NEUTRON_LIVE_REQUIRED=1 go test ./internal/db \
   -run '^TestV3NativeExplicitDefaultAndColumnACLs$' -count=1
 ```
 
-Default ACLs, database privileges and global authority/membership remain an
+Global and schema-specific `pg_default_acl` tuples retain owner, object kind
+and explicit namespace scope; global entries use `pg_catalog` as a descriptive
+catalog-address namespace and include scope in the identity, so a scoped
+`pg_catalog` entry cannot collide. The current database's ACL is retained under
+its actual database name. That name remains a portable semantic identifier,
+not a renamable hash placeholder; equivalent schemas in differently named
+databases need an explicit comparison policy.
+
+Other databases, global role/membership authority and ACL-bearing families such
+as large objects, languages, foreign servers and parameter grants remain an
 explicit uninspected mandatory scope. None of these additions provides
 policy/trigger/extension/privilege migration support.
