@@ -247,6 +247,16 @@ func ParseV3Document(raw []byte) (*V3Document, error) {
 				return nil, err
 			}
 		}
+		switch entry.Identity.Catalog {
+		case "pg_policy", "pg_trigger":
+			if entry.Identity.Parent == nil || entry.Identity.Parent.Schema != entry.Identity.Schema {
+				return nil, contractErr("missing-parent-identity", path+".identity.parent", "table-scoped object requires a parent in its qualified schema")
+			}
+		case "pg_proc", "pg_type", "pg_class", "pg_extension", "pg_namespace":
+			if entry.Identity.Parent != nil {
+				return nil, contractErr("invalid-parent-identity", path+".identity.parent", "this catalog namespace is not table-scoped")
+			}
+		}
 		if entry.Identity.Catalog == "pg_proc" {
 			if _, present := identity.(map[string]any)["arguments"]; !present {
 				return nil, contractErr("missing-signature", path+".identity.arguments", "routine identity requires ordered input argument types (including empty array)")

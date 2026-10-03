@@ -23,6 +23,14 @@ func TestV3NativeQualifiedRoutinesTypesAndReadOnlyRoundTrip(t *testing.T) {
 		`CREATE PROCEDURE beta."procedure name"(INOUT number pg_catalog.int4) LANGUAGE SQL AS 'SELECT number + 1'`,
 		`CREATE TABLE "Alpha"."select" (id pg_catalog.int4 PRIMARY KEY, value "Alpha".int4)`,
 		`INSERT INTO "Alpha"."select" VALUES (1, 42)`,
+		`CREATE TABLE beta."select" (id pg_catalog.int4 PRIMARY KEY, value pg_catalog.int4)`,
+		`CREATE POLICY "same policy" ON "Alpha"."select" TO PUBLIC USING (id > 0) WITH CHECK (value > 0)`,
+		`CREATE POLICY "same policy" ON beta."select" TO PUBLIC USING (id > 1)`,
+		`ALTER TABLE "Alpha"."select" ENABLE ROW LEVEL SECURITY`,
+		`CREATE FUNCTION beta.touch() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN NEW.value := NEW.value + 1; RETURN NEW; END;$$`,
+		`CREATE TRIGGER "same trigger" BEFORE UPDATE ON "Alpha"."select" FOR EACH ROW EXECUTE FUNCTION beta.touch()`,
+		`CREATE TRIGGER "same trigger" BEFORE UPDATE ON beta."select" FOR EACH ROW EXECUTE FUNCTION beta.touch()`,
+		`ALTER TABLE beta."select" DISABLE TRIGGER "same trigger"`,
 		`CREATE EXTENSION vector WITH SCHEMA beta`,
 		`CREATE TABLE "Alpha".pg_type (typname pg_catalog.text)`,
 		`INSERT INTO "Alpha".pg_type VALUES ('fabricated')`,
@@ -47,9 +55,37 @@ func TestV3NativeQualifiedRoutinesTypesAndReadOnlyRoundTrip(t *testing.T) {
 	overloads := 0
 	foundDomain, foundComposite, foundProcedure, foundExtension, foundRange, foundShell := false, false, false, false, false, false
 	foundExtensionArray := false
+	policies, triggers := 0, 0
+	foundExtensionMembers := false
 	for _, entry := range doc.Model.Inventory {
 		if entry.Managed {
 			t.Fatal("catalog inventory became managed")
+		}
+		if entry.Identity.Catalog == "pg_policy" && entry.Identity.Name == "same policy" {
+			policies++
+			if entry.Identity.Parent == nil || entry.Identity.Parent.Name != "select" || entry.Identity.Parent.Schema != entry.Identity.Schema {
+				t.Fatal("policy table scope lost")
+			}
+			if entry.Identity.Schema == "Alpha" && (entry.Attributes["rowSecurityEnabled"] != "true" || entry.Attributes["check"] == "") {
+				t.Fatal("policy RLS/check metadata lost")
+			}
+		}
+		if entry.Identity.Catalog == "pg_trigger" && entry.Identity.Name == "same trigger" {
+			triggers++
+			if entry.Identity.Parent == nil || entry.Identity.Parent.Name != "select" || entry.References["function"] != (V2Identity{Schema: "beta", Name: "touch"}) || entry.Definition == "" {
+				t.Fatal("trigger scope/function/definition lost")
+			}
+			if entry.Identity.Schema == "beta" && entry.Attributes["enabled"] != "D" {
+				t.Fatal("trigger disablement lost")
+			}
+		}
+		if entry.Identity.Catalog == "pg_extension" && entry.Identity.Name == "vector" {
+			foundExtensionMembers = entry.Attributes["version"] != "" && len(entry.Parts) > 0
+			for _, part := range entry.Parts {
+				if part.Kind == "extension-member" && (part.Attributes["objectNames"] == "" || part.Attributes["catalogName"] == "") {
+					t.Fatal("extension member address vanished")
+				}
+			}
 		}
 		if entry.Identity.Catalog == "pg_proc" && entry.Identity.Schema == "Alpha" && entry.Identity.Name == "Same Name" {
 			overloads++
@@ -99,6 +135,9 @@ func TestV3NativeQualifiedRoutinesTypesAndReadOnlyRoundTrip(t *testing.T) {
 	}
 	if overloads != 4 || !foundDomain || !foundComposite || !foundProcedure || !foundExtension || !foundExtensionArray || !foundRange || !foundShell {
 		t.Fatalf("incomplete inventory: overloads=%d domain=%v composite=%v procedure=%v extension=%v", overloads, foundDomain, foundComposite, foundProcedure, foundExtension)
+	}
+	if policies != 2 || triggers != 2 || !foundExtensionMembers {
+		t.Fatalf("table-scoped/extension inventory incomplete: policies=%d triggers=%d extension=%v", policies, triggers, foundExtensionMembers)
 	}
 	exported, err := json.Marshal(doc.Model)
 	if err != nil {

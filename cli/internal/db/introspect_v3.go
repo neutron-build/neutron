@@ -208,6 +208,13 @@ func (c *Client) IntrospectV3(ctx context.Context) (*V3Document, error) {
 		return nil, err
 	}
 	model := V3DocumentModel{Version: 3, Relational: relational.Canonical, Coverage: []V3Coverage{}, Inventory: append(routines, types...)}
+	for _, read := range []func(context.Context, pgQueryer) ([]V3InventoryEntry, error){introspectV3Policies, introspectV3Triggers, introspectV3Extensions} {
+		entries, err := read(ctx, tx)
+		if err != nil {
+			return nil, err
+		}
+		model.Inventory = append(model.Inventory, entries...)
+	}
 	for _, family := range v3Families {
 		status, detail := "not-inspected", "family not inventoried by this bounded reader; absence is unknown"
 		switch family {
@@ -217,6 +224,12 @@ func (c *Client) IntrospectV3(ctx context.Context) (*V3Document, error) {
 			status, detail = "identity-inventory", "all visible user-schema pg_proc identities and input signatures; aggregate/unknown definitions remain unmanaged and incomplete"
 		case "types":
 			status, detail = "identity-inventory", "all visible user-schema pg_type identities, domain constraints, composite attributes, enums and range type references; base I/O/storage and complete range semantics remain unmanaged and incomplete"
+		case "policies":
+			status, detail = "identity-inventory", "all visible user-schema policies with qualified table parents, roles, expressions and RLS flags; authority/DDL planning unsupported"
+		case "triggers":
+			status, detail = "identity-inventory", "all non-internal visible user-schema triggers with qualified table parents, function references, definitions and enablement; trigger DDL unsupported"
+		case "extensions":
+			status, detail = "identity-inventory", "all database extension records with version, owner and portable direct member/configuration addresses; install/update/member DDL unsupported"
 		}
 		model.Coverage = append(model.Coverage, V3Coverage{Family: family, Status: status, Detail: detail})
 	}

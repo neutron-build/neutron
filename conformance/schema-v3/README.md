@@ -88,3 +88,24 @@ stable, hostile search paths/catalog lookalikes unable to redirect reads, and a
 function drop/recreate receiving a new OID without changing the portable hash.
 Quoted names, zero/same-name/domain overloads, INOUT procedures, composite order,
 ranges, shell types and direct/internal extension ownership are mandatory cases.
+
+The next reader slice additionally inventories user-schema policies and
+non-internal triggers by qualified table parent plus local object name. Policy
+command/permissiveness, role sets, USING/WITH CHECK expressions and RLS flags are
+preserved; trigger definitions, referenced function, enablement and constraint
+flags are preserved. Same policy/trigger names on different tables cannot
+collapse. Known table-scoped identities require a parent; routine/type/relation
+identities cannot invent a parent to evade duplicate detection.
+
+All extension records retain owner, namespace, version, relocatability,
+configuration table/condition pairs, and portable member addresses returned by
+PostgreSQL's `pg_identify_object_as_address`. Unknown member kinds stay descriptive
+and unmanaged. Failed address extraction or missing configuration-table joins
+refuse the entire read rather than silently dropping a member. The native fixture
+now includes repeated policy/trigger names, RLS expressions and a disabled
+trigger, plus installed vector-extension member addresses.
+
+Grant-family coverage remains `not-inspected`: selected routine/type ACL spelling
+is metadata, not a complete inventory of relation/column/schema/default/database
+privileges or role membership. That mandatory scope is still open. None of these
+additions provides policy/trigger/extension migration support.

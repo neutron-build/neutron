@@ -149,3 +149,42 @@ func TestV3RefusesLossyOrAmbiguousInventory(t *testing.T) {
 		t.Fatal("duplicate keys accepted")
 	}
 }
+
+func TestV3TableScopedNamesAndUnknownObjectsRemainDistinct(t *testing.T) {
+	doc, err := ParseV3Document(v3Fixture(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := V3InventoryEntry{Identity: V3ObjectIdentity{Catalog: "pg_policy", Schema: "app", Name: "same", Parent: &V2Identity{Schema: "app", Name: "table.one"}}, Kind: "policy", Managed: false, Owner: "owner", Reason: "preserved only", Attributes: map[string]string{}, References: map[string]V2Identity{}, Parts: []V3InventoryPart{}}
+	second := policy
+	second.Identity.Parent = &V2Identity{Schema: "app", Name: "table two"}
+	unknown := policy
+	unknown.Identity = V3ObjectIdentity{Catalog: "future_catalog", Schema: "app", Name: "unknown"}
+	unknown.Kind = "unknown-future-shape"
+	unknown.Attributes = map[string]string{"futureShape": "preserved exactly"}
+	doc.Model.Inventory = append(doc.Model.Inventory, policy, second, unknown)
+	raw, _ := json.Marshal(doc.Model)
+	parsed, err := ParseV3Document(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Model.Inventory) != 8 {
+		t.Fatal("table-local or unknown object disappeared")
+	}
+	found := false
+	for _, entry := range parsed.Model.Inventory {
+		if entry.Identity.Catalog == "future_catalog" {
+			found = entry.Attributes["futureShape"] == "preserved exactly" && !entry.Managed
+		}
+	}
+	if !found {
+		t.Fatal("unknown shape was lost or managed")
+	}
+	doc.Model.Inventory[len(doc.Model.Inventory)-3].Identity.Parent = nil
+	raw, _ = json.Marshal(doc.Model)
+	_, err = ParseV3Document(raw)
+	var ce *ContractError
+	if !errors.As(err, &ce) || ce.Code != "missing-parent-identity" {
+		t.Fatalf("missing table scope should refuse, got %v", err)
+	}
+}
