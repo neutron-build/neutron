@@ -134,7 +134,7 @@ func TestV3NativeQualifiedRoutinesTypesAndReadOnlyRoundTrip(t *testing.T) {
 		}
 	}
 	if overloads != 4 || !foundDomain || !foundComposite || !foundProcedure || !foundExtension || !foundExtensionArray || !foundRange || !foundShell {
-		t.Fatalf("incomplete inventory: overloads=%d domain=%v composite=%v procedure=%v extension=%v", overloads, foundDomain, foundComposite, foundProcedure, foundExtension)
+		t.Fatalf("incomplete inventory: overloads=%d domain=%v composite=%v procedure=%v extension=%v extensionArray=%v range=%v shell=%v policies=%d triggers=%d extensionMembers=%v", overloads, foundDomain, foundComposite, foundProcedure, foundExtension, foundExtensionArray, foundRange, foundShell, policies, triggers, foundExtensionMembers)
 	}
 	if policies != 2 || triggers != 2 || !foundExtensionMembers {
 		t.Fatalf("table-scoped/extension inventory incomplete: policies=%d triggers=%d extension=%v", policies, triggers, foundExtensionMembers)
