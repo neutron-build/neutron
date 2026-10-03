@@ -12,7 +12,11 @@ def live_table():
     if not url:
         if os.environ.get('NEUTRON_LIVE_REQUIRED')=='1': pytest.fail('required PostgreSQL URL missing')
         pytest.skip('PostgreSQL live tests not configured')
-    psycopg=pytest.importorskip('psycopg')
+    try:
+        import psycopg
+    except ImportError:
+        if os.environ.get('NEUTRON_LIVE_REQUIRED')=='1': pytest.fail('required psycopg dependency missing')
+        pytest.skip('optional psycopg dependency missing')
     schema='neutron_orm_'+uuid.uuid4().hex
     with psycopg.connect(url,autocommit=True) as native:
         native.execute(f'CREATE SCHEMA "{schema}"')

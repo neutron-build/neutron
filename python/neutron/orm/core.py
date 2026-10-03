@@ -32,6 +32,10 @@ def quote(name: str) -> str:
         raise ValueError('identifier must be nonempty without control characters')
     return '"' + name.replace('"', '""') + '"'
 
+def _bound_quote(name: str) -> str:
+    # psycopg percent placeholders are parsed even inside quoted identifiers.
+    return quote(name).replace('%','%%')
+
 # Column families deliberately finite; custom SQL type text cannot become SQL.
 _TYPES: dict[str, type] = {'int2':int,'int4':int,'int8':int,'text':str,'varchar':str,'bool':bool,'numeric':Decimal,'uuid':UUID,'bytea':bytes,'timestamp':dt.datetime,'timestamptz':dt.datetime,'date':dt.date}
 
@@ -77,6 +81,9 @@ class Table:
     @property
     def sql(self) -> str: return f'{quote(self.schema)}.{quote(self.name)}'
 
+    @property
+    def _bound_sql(self) -> str: return f'{_bound_quote(self.schema)}.{_bound_quote(self.name)}'
+
     def column(self, name: str, python_type: type[T]) -> Column[T]:
         column = self.columns[name]
         if column.spec.python_type is not python_type or column.spec.nullable: raise ValueError('column type/nullability mismatch; use nullable_column for nullable fields')
@@ -109,19 +116,22 @@ class Column(Generic[T]):
     @property
     def sql(self) -> str: return f'{self.table.sql}.{quote(self.name)}'
 
+    @property
+    def _bound_sql(self) -> str: return f'{self.table._bound_sql}.{_bound_quote(self.name)}'
+
     def eq(self, value: T | Column[T] | None) -> Predicate:
         if isinstance(value,Column):
             if value.spec.python_type is not self.spec.python_type: raise ValueError('incompatible column comparison')
-            return Predicate(f'{self.sql} = {value.sql}',(),frozenset({self.table,value.table}))
-        if value is None: return Predicate(f'{self.sql} IS NULL',(),frozenset({self.table}))
+            return Predicate(f'{self._bound_sql} = {value._bound_sql}',(),frozenset({self.table,value.table}))
+        if value is None: return Predicate(f'{self._bound_sql} IS NULL',(),frozenset({self.table}))
         self.spec.check(value)
-        return Predicate(f'{self.sql} = %s',(value,),frozenset({self.table}))
+        return Predicate(f'{self._bound_sql} = %s',(value,),frozenset({self.table}))
 
     def in_(self, values: Iterable[T]) -> Predicate:
         values=tuple(values)
         if not values: return Predicate('FALSE',(),frozenset({self.table}))
         for value in values: self.spec.check(value)
-        return Predicate(f'{self.sql} IN ({", ".join("%s" for _ in values)})',values,frozenset({self.table}))
+        return Predicate(f'{self._bound_sql} IN ({", ".join("%s" for _ in values)})',values,frozenset({self.table}))
 
 @dataclass(frozen=True)
 class Compiled(Generic[T]):
@@ -141,7 +151,7 @@ class Select(Generic[T]):
         return Select(self.table,self.columns,self.decoder,condition if self.predicate is None else self.predicate & condition)
 
     def compile(self) -> Compiled[T]:
-        sql=f'SELECT {", ".join(c.sql for c in self.columns)} FROM {self.table.sql}'
+        sql=f'SELECT {", ".join(c._bound_sql for c in self.columns)} FROM {self.table._bound_sql}'
         if self.predicate is not None: sql+=' WHERE '+self.predicate.sql
         return Compiled(sql,self.predicate.params if self.predicate is not None else (),self.decoder)
 
@@ -189,17 +199,17 @@ def _writes(table: Table, values: Mapping[str,object]) -> list[tuple[Column[Any]
 
 def insert(table: Table, values: Mapping[str,object]) -> Mutation:
     writes=_writes(table,values)
-    if not writes: return Mutation(f'INSERT INTO {table.sql} DEFAULT VALUES',())
-    return Mutation(f'INSERT INTO {table.sql} ({", ".join(quote(c.name) for c,_ in writes)}) VALUES ({", ".join("DEFAULT" if v is DEFAULT else "%s" for _,v in writes)})',tuple(v for _,v in writes if v is not DEFAULT))
+    if not writes: return Mutation(f'INSERT INTO {table._bound_sql} DEFAULT VALUES',())
+    return Mutation(f'INSERT INTO {table._bound_sql} ({", ".join(_bound_quote(c.name) for c,_ in writes)}) VALUES ({", ".join("DEFAULT" if v is DEFAULT else "%s" for _,v in writes)})',tuple(v for _,v in writes if v is not DEFAULT))
 
 
 def update(table: Table, values: Mapping[str,object], *, where: Predicate) -> Mutation:
     _condition(table,where)
     writes=_writes(table,values)
     if not writes: raise ValueError('update needs at least one present/default/NULL assignment')
-    return Mutation(f'UPDATE {table.sql} SET {", ".join(quote(c.name)+" = "+("DEFAULT" if v is DEFAULT else "%s") for c,v in writes)} WHERE {where.sql}',tuple(v for _,v in writes if v is not DEFAULT)+where.params)
+    return Mutation(f'UPDATE {table._bound_sql} SET {", ".join(_bound_quote(c.name)+" = "+("DEFAULT" if v is DEFAULT else "%s") for c,v in writes)} WHERE {where.sql}',tuple(v for _,v in writes if v is not DEFAULT)+where.params)
 
 
 def delete(table: Table, *, where: Predicate) -> Mutation:
     _condition(table,where)
-    return Mutation(f'DELETE FROM {table.sql} WHERE {where.sql}',where.params)
+    return Mutation(f'DELETE FROM {table._bound_sql} WHERE {where.sql}',where.params)

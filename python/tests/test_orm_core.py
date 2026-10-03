@@ -59,3 +59,11 @@ def test_decode_rejects_missing_or_wrong_projection():
     with pytest.raises(KeyError): compiled.decode({})
     with pytest.raises(ValueError): compiled.decode({'id':'1'})
     assert compiled.decode({'id':0})=={'id':0}
+
+
+def test_percent_identifiers_cannot_be_driver_placeholders():
+    t=Table('odd%s',{'value%s':ColumnSpec(str,'text')},schema='scope%')
+    compiled=select(t.column('value%s',str)).where(t.column('value%s',str).eq('bound')).compile()
+    assert '"scope%%"."odd%%s"."value%%s"' in compiled.sql
+    assert compiled.params==('bound',)
+    assert t.sql=='"scope%"."odd%s"'
