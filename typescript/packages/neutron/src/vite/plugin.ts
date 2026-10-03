@@ -112,13 +112,14 @@ const ISLAND_SCRIPT_EXTENSIONS = [".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs"];
 // `virtual:neutron/dev-toolbar`) shares the `virtual:neutron` namespace.
 const VIRTUAL_NAMESPACE_FILTER = /^virtual:neutron/;
 
-// esbuild — used by Vite's dep optimizer for scanning and pre-bundling —
-// resolves without Vite plugins, so it cannot load this plugin's virtual
-// modules; an unresolvable id aborts the optimization and takes the dev
-// server down with it. Marking the whole namespace external makes esbuild
-// leave those imports in place, and Vite's import analysis resolves them
-// through this plugin when the module is served. Structurally typed: vite
-// passes this straight through to esbuild in both optimizer passes.
+// The bundler behind Vite's dep optimizer — esbuild up to Vite 7, Rolldown
+// from Vite 8 — scans and pre-bundles without Vite plugins, so it cannot load
+// this plugin's virtual modules; an unresolvable id aborts the optimization
+// and takes the dev server down with it. Marking the whole namespace external
+// makes the optimizer leave those imports in place, and Vite's import
+// analysis resolves them through this plugin when the module is served.
+// Structurally typed: vite passes these straight through to the optimizer's
+// bundler in both passes. One plugin per bundler, same rule.
 const virtualNamespaceExternalPlugin = {
   name: "neutron:virtual-namespace-external",
   setup(build: {
@@ -131,6 +132,13 @@ const virtualNamespaceExternalPlugin = {
       path: args.path,
       external: true,
     }));
+  },
+};
+
+const virtualNamespaceExternalRolldownPlugin = {
+  name: "neutron:virtual-namespace-external",
+  resolveId(id: string): { id: string; external: true } | null {
+    return VIRTUAL_NAMESPACE_FILTER.test(id) ? { id, external: true } : null;
   },
 };
 
@@ -282,15 +290,19 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
     //   once: whatever path esbuild enters the runtime by, it leaves
     //   `virtual:neutron*` imports unresolved-but-external instead of failing
     //   (Vite's import analysis resolves them through this plugin when the
-    //   chunk is served). Vite runs `optimizeDeps.esbuildOptions.plugins` in
-    //   both the dependency scanner and the pre-bundler.
+    //   chunk is served). Vite runs `optimizeDeps.rolldownOptions.plugins`
+    //   (Vite 8+) or `optimizeDeps.esbuildOptions.plugins` (Vite 6/7) in both
+    //   the dependency scanner and the pre-bundler. Vite 8 identifies itself
+    //   through `this.meta.rolldownVersion` and warns on the esbuild option;
+    //   Vite 6 calls this hook without a context.
     config() {
+      const rolldown = this?.meta?.rolldownVersion !== undefined;
       return {
         optimizeDeps: {
           exclude: ["@neutron-build/core"],
-          esbuildOptions: {
-            plugins: [virtualNamespaceExternalPlugin],
-          },
+          ...(rolldown
+            ? { rolldownOptions: { plugins: [virtualNamespaceExternalRolldownPlugin] } }
+            : { esbuildOptions: { plugins: [virtualNamespaceExternalPlugin] } }),
         },
       };
     },
