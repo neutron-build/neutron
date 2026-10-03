@@ -47,30 +47,30 @@ for (const kind of ['pg', 'postgres'] as const) {
       for (const [tenant, value] of [['a', 'alpha'], ['b', 'beta'], ['a', 'alpha']]) {
         await driver.begin(async tx => {
           await setTenant(tx, tenant!);
-          assert.deepEqual(await tx.query(read), [{ tenant, id: 1, value }]);
+          assert.deepEqual([...(await tx.query(read))], [{ tenant, id: 1, value }]);
           assert.equal((await tx.query<{ pid: number }>('select pg_backend_pid() as pid'))[0]!.pid, pid);
         });
         await assert.rejects(driver.begin(async tx => {
           await setTenant(tx, tenant!);
           await tx.execute(`insert into ${table} values ($1,9,'forbidden')`, [tenant === 'a' ? 'b' : 'a']);
         }), (error: unknown) => getSqlState(error) === '42501');
-        await driver.begin(async tx => { assert.deepEqual(await tx.query(read), []); });
+        await driver.begin(async tx => { assert.deepEqual([...(await tx.query(read))], []); });
       }
       await assert.rejects(driver.begin(async tx => {
         await setTenant(tx, 'b');
-        assert.deepEqual(await tx.query(read), [{ tenant: 'b', id: 1, value: 'beta' }]);
+        assert.deepEqual([...(await tx.query(read))], [{ tenant: 'b', id: 1, value: 'beta' }]);
         throw new Error('application abort');
       }), /application abort/);
-      await driver.begin(async tx => { assert.deepEqual(await tx.query(read), []); });
+      await driver.begin(async tx => { assert.deepEqual([...(await tx.query(read))], []); });
       await assert.rejects(driver.begin(async tx => {
         await setTenant(tx, 'a');
         await tx.query('select pg_sleep(2)', [], { deadlineMs: 60 });
       }), QueryCanceledError);
       await driver.begin(async tx => {
-        assert.deepEqual(await tx.query(read), []);
+        assert.deepEqual([...(await tx.query(read))], []);
         assert.equal((await tx.query<{ pid: number }>('select pg_backend_pid() as pid'))[0]!.pid, pid);
         await setTenant(tx, 'b');
-        assert.deepEqual(await tx.query(read), [{ tenant: 'b', id: 1, value: 'beta' }]);
+        assert.deepEqual([...(await tx.query(read))], [{ tenant: 'b', id: 1, value: 'beta' }]);
       });
       assert.deepEqual((await admin.query(read)).rows, [{ tenant: 'a', id: 1, value: 'alpha' }, { tenant: 'b', id: 1, value: 'beta' }]);
     } finally {
