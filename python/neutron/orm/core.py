@@ -7,7 +7,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Generic, Iterable, Mapping, TypeVar, cast
 from uuid import UUID
 
-from .json_value import BoundJson, JsonDocument
+from .json_value import BoundJson, JsonDocument, MutableJson
 
 T = TypeVar('T')
 
@@ -49,8 +49,12 @@ class ColumnSpec(Generic[T]):
     generated: bool = False
 
     def __post_init__(self) -> None:
-        if _TYPES.get(self.sql_type) is not self.python_type:
+        if _TYPES.get(self.sql_type) is not self.python_type and not (self.sql_type=='jsonb' and self.python_type is MutableJson):
             raise ValueError('unsupported or mismatched column type profile')
+
+    def decode(self,value: object) -> object:
+        if self.python_type is MutableJson and isinstance(value,JsonDocument): value=MutableJson(value.parsed())
+        self.check(value);return value
 
     def check(self, value: object) -> None:
         if value is None:
@@ -58,6 +62,7 @@ class ColumnSpec(Generic[T]):
             return
         if not isinstance(value, self.python_type) or (self.python_type is int and isinstance(value, bool)) or (self.sql_type == 'date' and isinstance(value, dt.datetime)):
             raise ValueError('column value has wrong native type')
+        if isinstance(value,MutableJson): value.text
         if isinstance(value, dt.datetime):
             aware = value.tzinfo is not None and value.utcoffset() is not None
             if aware != (self.sql_type == 'timestamptz'):
@@ -185,7 +190,7 @@ def _condition(table: Table, condition: Predicate) -> None:
 def select(column: Column[T]) -> Select[T]:
     if column.table.columns.get(column.name) is not column: raise ValueError("projection column is not owned by table")
     def decode(row: Mapping[str,Any]) -> T:
-        value=row[column.name]; column.spec.check(value); return cast(T,value)
+        value=column.spec.decode(row[column.name]); return cast(T,value)
     return Select(column.table,(column,),decode)
 
 
@@ -196,7 +201,7 @@ def select_row(table: Table, *columns: Column[Any]) -> Select[dict[str,Any]]:
     def decode(row: Mapping[str,Any]) -> dict[str,Any]:
         result={}
         for column in columns:
-            value=row[column.name]; column.spec.check(value); result[column.name]=value
+            value=column.spec.decode(row[column.name]); result[column.name]=value
         return result
     return Select(table,columns,decode)
 
@@ -264,5 +269,6 @@ def delete(table: Table, *, where: Predicate) -> Mutation:
 
 
 def _parameter(column: Column[Any], value: object) -> object:
+    if isinstance(value,MutableJson): return BoundJson(JsonDocument(value.text),True)
     if isinstance(value, JsonDocument): return BoundJson(value, column.spec.sql_type == 'jsonb')
     return value

@@ -22,8 +22,7 @@ class Field(Generic[T]):
 
     def decode(self, value: object) -> T:
         if value is None and self.outer: return cast(T, None)
-        self.column.spec.check(value)
-        return cast(T, value)
+        return cast(T, self.column.spec.decode(value))
 
 
 def field(column: Column[T]) -> Field[T]:

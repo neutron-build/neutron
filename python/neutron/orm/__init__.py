@@ -42,3 +42,6 @@ __all__ += ["cte","derived"]
 
 from .instrumentation import ExpiredAttributeError
 __all__ += ["ExpiredAttributeError"]
+
+from .json_value import MutableJson
+__all__ += ["MutableJson"]

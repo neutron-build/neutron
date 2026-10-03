@@ -174,3 +174,9 @@ async def static_async_savepoint_consumer(session: AsyncSession) -> None:
 
 def static_expiration_consumer(session: Session,obj: User) -> None:
     assert_type(session.expire(obj,'name'),None)
+
+from neutron.orm import MutableJson
+
+def static_mutable_codec_consumer(db: Database) -> None:
+    t=Table('documents',{'body':ColumnSpec(MutableJson,'jsonb',nullable=True)})
+    assert_type(db.all(select(t.nullable_column('body',MutableJson))),list[MutableJson|None])

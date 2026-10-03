@@ -1,12 +1,13 @@
 """Explicit scalar dataclass mapping; no inheritance or relationship instrumentation."""
 from __future__ import annotations
+from copy import deepcopy
 from dataclasses import MISSING, dataclass, fields, is_dataclass
 import types
 import inspect
 from types import MappingProxyType
 from typing import Any, Generic, Mapping, TypeVar, get_args, get_origin, get_type_hints, Union
 from .core import Column, ColumnSpec, OMIT, OrmError, Table
-from .json_value import JsonDocument
+from .json_value import JsonDocument, MutableJson
 from .instrumentation import _MappedField, instrument_model, raw_values, restore_values
 from decimal import Decimal
 import datetime as dt
@@ -76,12 +77,12 @@ class ModelMapping(Generic[T]):
     def snapshot(self,obj: T) -> dict[str,Any]:
         _validate_attribute_profile(self.model_type,tuple(self.field_columns))
         if type(obj) is not self.model_type: raise ValueError('mapped model type mismatch; inheritance not implemented')
-        return {name:getattr(obj,name) for name in self.field_columns}
+        return deepcopy({name:getattr(obj,name) for name in self.field_columns})
 
     def _snapshot(self,obj: T) -> dict[str,Any]:
         _validate_attribute_profile(self.model_type,tuple(self.field_columns))
         if type(obj) is not self.model_type: raise ValueError('mapped model type mismatch')
-        return raw_values(obj,tuple(self.field_columns))
+        return deepcopy(raw_values(obj,tuple(self.field_columns)))
 
     def key(self,values: Mapping[str,Any]) -> tuple[Any,...] | None:
         if any(self.field_columns[name].spec.sql_type in {'json','jsonb'} for name in self.primary_key):
@@ -100,16 +101,17 @@ class ModelMapping(Generic[T]):
         _validate_attribute_profile(self.model_type,tuple(self.field_columns))
         values={}
         for name,column in self.field_columns.items():
-            value=row[column.name];column.spec.check(value);values[name]=value
+            value=column.spec.decode(row[column.name]);values[name]=value
+        expected=deepcopy(values)
         obj=self.model_type(**values)
         _validate_attribute_profile(self.model_type,tuple(self.field_columns))
-        if any(not same_value(getattr(obj,name),value) for name,value in values.items()):
+        if any(not same_value(getattr(obj,name),value) for name,value in expected.items()):
             raise ValueError("model constructor changed persisted field values")
         return obj
 
     def restore(self,obj: T,values: Mapping[str,Any]) -> None:
         _validate_attribute_profile(self.model_type,tuple(self.field_columns))
-        restore_values(obj,dict(values))
+        restore_values(obj,deepcopy(dict(values)))
 
     def writes(self,obj: T,*,inserting: bool,deferred_fields: frozenset[str]=frozenset()) -> dict[str,Any]:
         if deferred_fields - self.field_columns.keys(): raise ValueError('deferred fields outside mapping')
@@ -145,7 +147,7 @@ def same_column_value(spec: ColumnSpec[Any],left: Any,right: Any) -> bool:
     if type(left) is not spec.python_type or type(right) is not spec.python_type: return False
     if spec.sql_type=='timestamptz': return bool(left.astimezone(dt.timezone.utc)==right.astimezone(dt.timezone.utc))
     if spec.sql_type=='jsonb':
-        if not isinstance(left,JsonDocument) or not isinstance(right,JsonDocument): return False
+        if not isinstance(left,(JsonDocument,MutableJson)) or not isinstance(right,(JsonDocument,MutableJson)): return False
         return _json_equal(left.parsed(),right.parsed())
     return same_value(left,right)
 

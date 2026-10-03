@@ -427,3 +427,16 @@ known commits, requiring instrumented mappings. The default remains False for
 compatibility with ordinary dataclass mappings. Custom descriptors/setters and
 implicit lazy loading are still refused; library instrumentation does not claim
 mutable JSON/collection or relationship-property tracking.
+
+`ColumnSpec(MutableJson, 'jsonb', nullable=True)` opts into explicit nested mutable
+collection tracking. `MutableJson(tree).value` holds dict/list/native JSON
+scalars; integers and Decimal numbers serialize exactly, floats/nonfinite values,
+nonstring object keys and cycles refuse. `MutableJson(None)` means JSON null;
+Python None means SQL NULL. Metadata converts the native immutable JSON document
+into this declared codec without changing other connection loaders. Compiled
+binds snapshot the document, and mapped snapshots/refresh/restore/merge deep-copy
+trees. Nested dict/list edits are detected at flush, including callback edits;
+rollback/savepoints replace them with independent baseline copies. Retained old
+tree references are not a persistent object handle after restoration. Plain
+unwrapped dict/list fields and PostgreSQL array/range collection codecs remain
+outside this JSONB profile.

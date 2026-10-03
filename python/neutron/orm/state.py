@@ -124,7 +124,7 @@ class StateStore:
         if self._identity(record.mapping,values)!=self._identity(record.mapping,record.baseline):
             raise OrmError('refresh changed tracked primary-key identity')
         snapshot=deepcopy(values)
-        record.mapping.restore(record.obj,snapshot)
+        record.mapping.restore(record.obj,deepcopy(snapshot))
         record.baseline=snapshot;record.state=ObjectState.PERSISTENT;record.expired_fields=frozenset()
         # Preserve original: rollback reconciles the pretransaction snapshot.
 
