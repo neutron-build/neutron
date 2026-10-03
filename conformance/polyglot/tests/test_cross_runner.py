@@ -7,7 +7,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from cross_runner import INSERTED, run_cross
 from runner import EXPECTED
 
-CLIENTS=[{'id':name,'command':[name],'hashes':{name:'a'*64}} for name in ['typescript','python','go']]
+CLIENTS=[{'id':name,'command':[name],'hashes':{name:'a'*64},'language':name,'descriptor_sha256':'b'*64,'artifact_manifest_sha256':'c'*64} for name in ['typescript','python','go']]
 
 class CrossRunnerTests(unittest.TestCase):
     def execute(self, bad_writer=False, bad_reader=False, setup_failure=False):

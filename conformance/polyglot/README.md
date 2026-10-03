@@ -2,8 +2,8 @@
 
 This bounded harness establishes independent PostgreSQL fixture/oracle behavior.
 The initial manifest is an **oracle self-check**, not evidence that a Neutron ORM
-has passed polyglot parity. There are no synthetic Neutron adapters. Future
-`adapter-read` cases must use actual packaged client APIs and return the exact
+has passed polyglot parity. Actual `adapter-read` implementations use installed TypeScript/Python packages
+and an archived Go module consumer outside the origin. These cases use real client APIs and return the exact
 artifact identities supplied by the runner. Unsupported required cases fail.
 
 Unit tests need only Python 3.11+:
@@ -79,3 +79,22 @@ It checks native typed scalar reads against an independent SQL-text oracle,
 actual query cancellation and subsequent same-connection reuse, followed by
 owned schema cleanup. It does not compare performance or certify ORM sessions,
 write codecs, pool acquisition, or the existing Neutron compatibility adapter.
+
+## Cross-language scalar writes
+
+`cross_runner.py --manifest /private/path/cross.json` requires all three language
+clients and runs every declared writer/reader pair in a separate owned fixture.
+The trusted manifest contains `protocol` and a `clients` list. Each client has
+`id`, `language` (`typescript`, `python`, or `go`), an argv `command`,
+`artifact_root`, and `artifact_manifest`. Every artifact is verified before
+fixture mutation. Client commands remain trusted executable configuration;
+the packaged qualification helpers establish installed origin separately.
+
+The adapter `insert` action adds row 2 through its actual ORM mutation API.
+The native oracle never writes on behalf of an adapter: it independently checks
+int8 minimum, an exact negative decimal, a UTC microsecond timestamp, SQL NULL
+and JSON null. A second client reads the resulting rows, which must match native
+SQL text observations. Unknown, missing, failed or unsupported cases fail.
+Results bind client commands, descriptor digests and verified artifact hashes.
+This fixture certifies only these scalar write/read combinations, not broad
+query, migration, relationship, pooler or engine parity.

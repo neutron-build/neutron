@@ -5,6 +5,7 @@ root/manifest; no source adapter fallback or skip-as-pass is permitted.
 """
 from __future__ import annotations
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -35,8 +36,11 @@ def descriptors(manifest: dict) -> list[dict]:
         command = client.get('command')
         if not isinstance(command, list) or not command or not all(isinstance(x,str) and x for x in command):
             raise ValueError('actual client command required')
-        artifacts = verify_artifacts(json.loads(Path(client['artifact_manifest']).read_text()),Path(client['artifact_root']))
-        result.append({**client,'hashes':artifacts})
+        raw_artifacts = Path(client['artifact_manifest']).read_bytes()
+        artifacts = verify_artifacts(json.loads(raw_artifacts),Path(client['artifact_root']))
+        descriptor_hash = hashlib.sha256(json.dumps(client,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+        result.append({**client,'hashes':artifacts,'descriptor_sha256':descriptor_hash,
+            'artifact_manifest_sha256':hashlib.sha256(raw_artifacts).hexdigest()})
     if {c['language'] for c in result} != {'typescript','python','go'}:
         raise ValueError('all three language clients required')
     return result
@@ -72,6 +76,7 @@ def run_cross(clients: list[dict], timeout: float) -> dict:
                 except Exception as exc:
                     raise ValueError('cross schema cleanup failed; manual reconciliation required: '+request['schema_scope']) from exc
     return {'status':'pass','kind':'cross-language-scalar-write-read','executed':len(results),'results':results,
+            'clients':[{k:c[k] for k in ('id','language','command','descriptor_sha256','artifact_manifest_sha256','hashes')} for c in clients],
             'scope':'declared scalar fixture only; not full ORM or engine certification'}
 
 def main() -> int:
