@@ -192,3 +192,17 @@ async def static_async_owned_graph_consumer(session: AsyncSession,root: OwnedRel
     assert_type(await session.delete_graph(root,parent,budget=LoadBudget(3,10,10),descendants=(descendant,),max_depth=2),None)
     assert_type(session.connect_many_to_many(meta,parent,parent,through),None)
     assert_type(session.disconnect_many_to_many(meta,parent,parent,through),None)
+
+from neutron.orm import PgArray, TimeOfDay, Interval, array_spec
+
+def static_component_value_consumer(db: Database) -> None:
+    spec=array_spec(int,'int4',nullable=True)
+    assert_type(spec,ColumnSpec[PgArray[int]])
+    table=Table('components',{'data':spec,'clock':ColumnSpec(TimeOfDay,'time'),'span':ColumnSpec(Interval,'interval')})
+    assert_type(db.all(select(table.nullable_column('data',PgArray[int]))),list[PgArray[int]|None])
+    assert_type(db.one(select(table.column('clock',TimeOfDay))),TimeOfDay)
+    assert_type(db.one(select(table.column('span',Interval))),Interval)
+
+async def static_async_component_value_consumer(db: AsyncDatabase) -> None:
+    table=Table('components',{'data':array_spec(int,'int4')})
+    assert_type(await db.all(select(table.column('data',PgArray[int]))),list[PgArray[int]])

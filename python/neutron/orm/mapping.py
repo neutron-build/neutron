@@ -6,8 +6,9 @@ import types
 import inspect
 from types import MappingProxyType
 from typing import Any, Generic, Mapping, TypeVar, get_args, get_origin, get_type_hints, Union
-from .core import Column, ColumnSpec, OMIT, OrmError, Table
+from .core import Column, ColumnSpec, OMIT, OrmError, Table, _column_type
 from .json_value import JsonDocument, MutableJson
+from .pg_value import PgArray
 from .instrumentation import _MappedField, instrument_model, raw_values, restore_values
 from decimal import Decimal
 import datetime as dt
@@ -46,8 +47,12 @@ class ModelMapping(Generic[T]):
             physical.add(column.name)
             annotation=hints.get(name)
             alternatives=set(get_args(annotation)) if get_origin(annotation) in {types.UnionType,Union} else {annotation}
-            if column.spec.python_type not in alternatives or alternatives - {column.spec.python_type,type(None)}:
-                raise ValueError('dataclass field type disagrees with scalar column')
+            values=alternatives-{type(None)}
+            if len(values)!=1: raise ValueError('dataclass field type disagrees with scalar column')
+            annotation_type=next(iter(values))
+            _column_type(column.spec,annotation_type)
+            if column.spec.python_type is PgArray and get_origin(annotation_type) is not PgArray:
+                raise ValueError('mapped arrays require a declared element type')
             if column.spec.nullable and type(None) not in alternatives:
                 raise ValueError('nullable column requires optional dataclass field')
         for name,field in declared.items():
@@ -56,8 +61,8 @@ class ModelMapping(Generic[T]):
         for name in primary_key:
             if name not in field_columns or field_columns[name].spec.nullable:
                 raise ValueError('primary-key fields must be mapped nonnullable columns')
-            if field_columns[name].spec.sql_type in {'json','jsonb'}:
-                raise ValueError('JSON primary keys unsupported')
+            if field_columns[name].spec.sql_type in {'json','jsonb'} or field_columns[name].spec.python_type is PgArray:
+                raise ValueError('JSON/array primary keys unsupported')
         if version_field is not None:
             if version_field not in field_columns or version_field in primary_key:
                 raise ValueError('version field must be mapped outside the primary key')
@@ -85,8 +90,8 @@ class ModelMapping(Generic[T]):
         return deepcopy(raw_values(obj,tuple(self.field_columns)))
 
     def key(self,values: Mapping[str,Any]) -> tuple[Any,...] | None:
-        if any(self.field_columns[name].spec.sql_type in {'json','jsonb'} for name in self.primary_key):
-            raise ValueError("JSON primary keys unsupported")
+        if any(self.field_columns[name].spec.sql_type in {'json','jsonb'} or self.field_columns[name].spec.python_type is PgArray for name in self.primary_key):
+            raise ValueError("JSON/array primary keys unsupported")
         key=[]
         for name in self.primary_key:
             value=values[name]

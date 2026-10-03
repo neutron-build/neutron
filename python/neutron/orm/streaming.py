@@ -7,7 +7,7 @@ import threading
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Generic, Iterator, TypeVar
 from uuid import uuid4
-from .client import AsyncDatabase, Database, _native
+from .client import AsyncDatabase, Database, _native, _check_result_oids
 from .core import OrmError, Select, SessionBusyError
 from .json_value import native_params
 from .query import Query
@@ -86,7 +86,7 @@ class Stream(Generic[T],Iterator[T]):
             self._token=self._db._tx_token;self._open=True
             if self._tx is not None:
                 with self._db._conn.cursor() as control: control.execute('SET TRANSACTION READ ONLY')
-            self._cursor=self._db._conn.cursor(name='neutron_stream_'+uuid4().hex,scrollable=False,withhold=False)
+            self._cursor=self._db._conn.cursor(name='neutron_stream_'+uuid4().hex,scrollable=False,withhold=False,**({'binary':True} if self._db._native_binary else {}))
             self._cursor.execute(self._compiled.sql,native_params(self._compiled.params))
             return self
         except BaseException as exc:
@@ -110,6 +110,7 @@ class Stream(Generic[T],Iterator[T]):
         try:
             if not self._buffer:
                 rows=self._cursor.fetchmany(self._batch_size)
+                if self._db._native_binary: _check_result_oids(self._compiled,self._cursor)
                 if len(rows)>self._batch_size: raise OrmError('native cursor exceeded batch bound')
                 self._buffer.extend(rows)
                 if not rows: self._drained=True;raise StopIteration
@@ -174,7 +175,7 @@ class AsyncStream(Generic[T],AsyncIterator[T]):
             self._token=self._db._tx_token;self._open=True
             if self._tx is not None:
                 async with self._db._conn.cursor() as control: await control.execute('SET TRANSACTION READ ONLY')
-            self._cursor=self._db._conn.cursor(name='neutron_stream_'+uuid4().hex,scrollable=False,withhold=False)
+            self._cursor=self._db._conn.cursor(name='neutron_stream_'+uuid4().hex,scrollable=False,withhold=False,**({'binary':True} if self._db._native_binary else {}))
             await self._cursor.execute(self._compiled.sql,native_params(self._compiled.params))
             return self
         except BaseException as exc:
@@ -198,6 +199,7 @@ class AsyncStream(Generic[T],AsyncIterator[T]):
         try:
             if not self._buffer:
                 rows=await self._cursor.fetchmany(self._batch_size)
+                if self._db._native_binary: _check_result_oids(self._compiled,self._cursor)
                 if len(rows)>self._batch_size: raise OrmError('native cursor exceeded batch bound')
                 self._buffer.extend(rows)
                 if not rows: self._drained=True;raise StopAsyncIteration

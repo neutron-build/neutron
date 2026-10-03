@@ -54,3 +54,9 @@ __all__ += ["OwnedRelation"]
 
 from .relations import ManyToMany
 __all__ += ["ManyToMany"]
+
+from .pg_value import ArrayDimension, PgArray, TimeOfDay, Interval
+__all__ += ["ArrayDimension","PgArray","TimeOfDay","Interval"]
+
+from .core import array_spec
+__all__ += ["array_spec"]

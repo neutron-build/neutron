@@ -22,6 +22,11 @@ def _decode_rows(query: Select[T] | Returning[T] | Query[T], compiled: Compiled[
     return [compiled.decode(row) for row in rows]
 
 
+def _check_result_oids(compiled: Compiled[Any],cursor: Any) -> None:
+    actual=tuple((item.name,item.type_code) for item in cursor.description or ())
+    if actual!=compiled.result_oids: raise ValueError('native result SQL type/OID identity mismatch')
+
+
 class CommitCancelledError(asyncio.CancelledError):
     """Cancellation during COMMIT; database outcome may be committed."""
     outcome='indeterminate'
@@ -51,6 +56,7 @@ def _admit_native_root(connection: Any) -> None:
 class Database:
     """One native connection. Concurrent active use rejected; no tracked objects."""
     def __init__(self, connection: Any) -> None:
+        self._native_binary=False
         self._endpoint_identity: EndpointIdentity | None = None
         self._conn=connection
         self._lock=threading.Lock()
@@ -84,7 +90,10 @@ class Database:
             identity=admit(startup,row['orm_endpoint_version'] if row is not None else None)
             from psycopg.types.json import set_json_loads
             set_json_loads(load_document,context=connection)
+            from .pg_adapters import register_native_values
+            register_native_values(connection)
             result=cls(connection)
+            result._native_binary=True
             result._endpoint_identity=identity
             return result
         except BaseException as exc:
@@ -114,8 +123,9 @@ class Database:
         validate_scope_sql(compiled.sql)
         with self._use():
             try:
-                with self._conn.cursor() as cur:
+                with self._conn.cursor(**({'binary':True} if self._native_binary else {})) as cur:
                     cur.execute(compiled.sql,native_params(compiled.params))
+                    if self._native_binary: _check_result_oids(compiled,cur)
                     rows=cur.fetchall() if cardinality=='many' else cur.fetchmany(2)
             except BaseException as exc:
                 if self._owner is not None: self._rollback_only=True
@@ -140,7 +150,7 @@ class Database:
         validate_scope_sql(statement.sql,owned=self._owner is not None)
         with self._use():
             try:
-                with self._conn.cursor() as cur:
+                with self._conn.cursor(**({'binary':True} if self._native_binary else {})) as cur:
                     cur.execute(statement.sql,native_params(statement.params))
                     return int(cur.rowcount)
             except BaseException as exc:
@@ -266,6 +276,7 @@ class Database:
 class AsyncDatabase:
     """One native async connection; operation/transaction task ownership explicit."""
     def __init__(self, connection: Any) -> None:
+        self._native_binary=False
         self._endpoint_identity: EndpointIdentity | None = None
         self._conn=connection
         self._busy=False
@@ -299,7 +310,10 @@ class AsyncDatabase:
             identity=admit(startup,row['orm_endpoint_version'] if row is not None else None)
             from psycopg.types.json import set_json_loads
             set_json_loads(load_document,context=connection)
+            from .pg_adapters import register_native_values
+            register_native_values(connection)
             result=cls(connection)
+            result._native_binary=True
             result._endpoint_identity=identity
             return result
         except BaseException as exc:
@@ -326,8 +340,9 @@ class AsyncDatabase:
         validate_scope_sql(compiled.sql)
         async with self._use():
             try:
-                async with self._conn.cursor() as cur:
+                async with self._conn.cursor(**({'binary':True} if self._native_binary else {})) as cur:
                     await cur.execute(compiled.sql,native_params(compiled.params))
+                    if self._native_binary: _check_result_oids(compiled,cur)
                     rows=await cur.fetchall() if cardinality=='many' else await cur.fetchmany(2)
             except asyncio.CancelledError:
                 if self._owner is not None: self._rollback_only=True
@@ -359,7 +374,7 @@ class AsyncDatabase:
         validate_scope_sql(statement.sql,owned=self._owner is not None)
         async with self._use():
             try:
-                async with self._conn.cursor() as cur:
+                async with self._conn.cursor(**({'binary':True} if self._native_binary else {})) as cur:
                     await cur.execute(statement.sql,native_params(statement.params))
                     return int(cur.rowcount)
             except asyncio.CancelledError:

@@ -492,3 +492,31 @@ IDLE native connection with autocommit=True, preventing externally opened native
 transactions from being mistaken for an owned root. Borrowed constructors still
 skip endpoint identity admission, but callers must settle external transactions
 and configure autocommit before using ORM root lifecycle APIs.
+
+`array_spec(int, 'int4', nullable=True)` declares an immutable `PgArray[int]`
+column. `PgArray(dimensions=(ArrayDimension(length=2, lower_bound=-3),),
+elements=(1, None))` retains flat row-major members and native dimensions/lower
+bounds. SQL NULL is None; an empty array is `PgArray((), ())`; NULL members stay
+inside elements. Up to six positive dimensions and one million members are
+admitted. Array profiles currently cover the qualified builtin scalar families,
+including text, exact numeric, UUID, bytes, finite date/timestamps, time and
+interval. Nested arrays use dimensions rather than nested PgArray objects;
+list/dict elements and unknown types refuse. `table.column('data', PgArray[int])`
+retains the declared element type for static consumers. Mapped dataclass fields
+must declare PgArray with its element type; arrays are replaced explicitly, and
+immutable snapshots preserve rollback. Array primary identities remain refused.
+
+`ColumnSpec(TimeOfDay, 'time')` preserves microseconds since midnight, including
+`TimeOfDay(86_400_000_000)` for 24:00:00. It has no timezone. `ColumnSpec(Interval,
+'interval')` preserves `Interval(months, days, microseconds)` components without
+converting months into fixed durations. Date remains Python datetime.date with
+finite years 1–9999; timestamps retain existing local/instant modes. Infinity,
+unsupported timetz and unknown type profiles refuse.
+
+Native connect APIs register component codecs only on the new connection and
+use binary result cursors, preserving array bounds and temporal components
+independently of server formatting settings. Compiler projections carry exact
+builtin SQL type OIDs, verified against native result descriptions before
+objects are decoded; binary arrays additionally verify their element OID.
+Qualified user enum/domain types require explicit catalog admission and are not
+silently decoded as builtin strings or scalars.

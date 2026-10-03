@@ -4,10 +4,11 @@ from dataclasses import dataclass
 import datetime as dt
 from decimal import Decimal
 from types import MappingProxyType
-from typing import Any, Callable, Generic, Iterable, Mapping, TypeVar, cast
+from typing import Any, Callable, Generic, Iterable, Mapping, TypeVar, cast, get_args, get_origin
 from uuid import UUID
 
 from .json_value import BoundJson, JsonDocument, MutableJson
+from .pg_value import BoundArray, PgArray, TimeOfDay, Interval
 
 T = TypeVar('T')
 
@@ -39,7 +40,9 @@ def _bound_quote(name: str) -> str:
     return quote(name).replace('%','%%')
 
 # Column families deliberately finite; custom SQL type text cannot become SQL.
-_TYPES: dict[str, type] = {'int2':int,'int4':int,'int8':int,'text':str,'varchar':str,'bool':bool,'numeric':Decimal,'uuid':UUID,'bytea':bytes,'timestamp':dt.datetime,'timestamptz':dt.datetime,'date':dt.date,'json':JsonDocument,'jsonb':JsonDocument}
+_TYPES: dict[str, type] = {'int2':int,'int4':int,'int8':int,'text':str,'varchar':str,'bool':bool,'numeric':Decimal,'uuid':UUID,'bytea':bytes,'timestamp':dt.datetime,'timestamptz':dt.datetime,'date':dt.date,'json':JsonDocument,'jsonb':JsonDocument,'time':TimeOfDay,'interval':Interval}
+
+_ARRAY_TYPES=frozenset({'int2','int4','int8','text','varchar','bool','numeric','uuid','bytea','date','timestamp','timestamptz','time','interval'})
 
 @dataclass(frozen=True)
 class ColumnSpec(Generic[T]):
@@ -49,8 +52,13 @@ class ColumnSpec(Generic[T]):
     generated: bool = False
 
     def __post_init__(self) -> None:
-        if _TYPES.get(self.sql_type) is not self.python_type and not (self.sql_type=='jsonb' and self.python_type is MutableJson):
+        if _TYPES.get(self.sql_type) is not self.python_type and not (self.sql_type=='jsonb' and self.python_type is MutableJson) and not (self.python_type is PgArray and self.sql_type.endswith('[]') and self.sql_type[:-2] in _ARRAY_TYPES):
             raise ValueError('unsupported or mismatched column type profile')
+
+    @property
+    def type_oid(self) -> int:
+        from .pg_adapters import ARRAY_OIDS, BUILTIN_OIDS
+        return ARRAY_OIDS[self.sql_type] if self.sql_type.endswith('[]') else BUILTIN_OIDS[self.sql_type]
 
     def decode(self,value: object) -> object:
         if self.python_type is MutableJson and isinstance(value,JsonDocument): value=MutableJson(value.parsed())
@@ -62,6 +70,9 @@ class ColumnSpec(Generic[T]):
             return
         if not isinstance(value, self.python_type) or (self.python_type is int and isinstance(value, bool)) or (self.sql_type == 'date' and isinstance(value, dt.datetime)):
             raise ValueError('column value has wrong native type')
+        if isinstance(value,PgArray):
+            element=ColumnSpec(_TYPES[self.sql_type[:-2]],self.sql_type[:-2],nullable=True)
+            for item in value.elements: element.check(item)
         if isinstance(value,MutableJson): value.text
         if isinstance(value, dt.datetime):
             aware = value.tzinfo is not None and value.utcoffset() is not None
@@ -70,6 +81,18 @@ class ColumnSpec(Generic[T]):
         if self.sql_type in {'int2','int4','int8'}:
             bits = {'int2':16,'int4':32,'int8':64}[self.sql_type]
             if not -(2**(bits-1)) <= cast(int,value) < 2**(bits-1): raise ValueError('integer out of PostgreSQL range')
+
+
+def array_spec(element_type: type[T],sql_type: str,*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgArray[T]]:
+    if sql_type not in _ARRAY_TYPES or _TYPES[sql_type] is not element_type: raise ValueError('unsupported array element profile')
+    return cast(ColumnSpec[PgArray[T]],ColumnSpec(PgArray,sql_type+'[]',nullable,generated))
+
+
+def _column_type(spec: ColumnSpec[Any],python_type: Any) -> None:
+    if get_origin(python_type) is PgArray:
+        if spec.python_type is not PgArray or get_args(python_type)!=(_TYPES[spec.sql_type[:-2]],):
+            raise ValueError('array column element type mismatch')
+    elif spec.python_type is not python_type: raise ValueError('column type mismatch')
 
 
 @dataclass(frozen=True, eq=False, init=False)
@@ -99,12 +122,14 @@ class Table:
 
     def column(self, name: str, python_type: type[T]) -> Column[T]:
         column = self.columns[name]
-        if column.spec.python_type is not python_type or column.spec.nullable: raise ValueError('column type/nullability mismatch; use nullable_column for nullable fields')
+        _column_type(column.spec,python_type)
+        if column.spec.nullable: raise ValueError('column type/nullability mismatch; use nullable_column for nullable fields')
         return cast(Column[T],column)
 
     def nullable_column(self, name: str, python_type: type[T]) -> Column[T | None]:
         column=self.columns[name]
-        if column.spec.python_type is not python_type or not column.spec.nullable: raise ValueError("nullable column type mismatch")
+        _column_type(column.spec,python_type)
+        if not column.spec.nullable: raise ValueError("nullable column type mismatch")
         return cast(Column[T | None],column)
 
 
@@ -161,6 +186,7 @@ class Compiled(Generic[T]):
     sql: str
     params: tuple[object,...]
     decode: Callable[[Mapping[str,Any]],T]
+    result_oids: tuple[tuple[str,int],...]=()
 
 @dataclass(frozen=True)
 class Select(Generic[T]):
@@ -179,7 +205,7 @@ class Select(Generic[T]):
         if self.predicate is not None: _condition(self.table,self.predicate)
         sql=f'SELECT {", ".join(c._bound_sql for c in self.columns)} FROM {self.table._bound_sql}'
         if self.predicate is not None: sql+=' WHERE '+self.predicate.sql
-        return Compiled(sql,self.predicate.params if self.predicate is not None else (),self.decoder)
+        return Compiled(sql,self.predicate.params if self.predicate is not None else (),self.decoder,tuple((column.name,column.spec.type_oid) for column in self.columns))
 
 
 def _condition(table: Table, condition: Predicate) -> None:
@@ -232,7 +258,7 @@ class Returning(Generic[T]):
         # Validate ownership using the ordinary projection compiler.
         self.projection.compile()
         fields=", ".join(_bound_quote(c.name) for c in self.projection.columns)
-        return Compiled(self.mutation.sql+' RETURNING '+fields,self.mutation.params,self.projection.decoder)
+        return Compiled(self.mutation.sql+' RETURNING '+fields,self.mutation.params,self.projection.decoder,tuple((column.name,column.spec.type_oid) for column in self.projection.columns))
 
 
 def _writes(table: Table, values: Mapping[str,object]) -> list[tuple[Column[Any],object]]:
@@ -269,6 +295,7 @@ def delete(table: Table, *, where: Predicate) -> Mutation:
 
 
 def _parameter(column: Column[Any], value: object) -> object:
+    if isinstance(value,PgArray): return BoundArray(value,column.spec.sql_type)
     if isinstance(value,MutableJson): return BoundJson(JsonDocument(value.text),True)
     if isinstance(value, JsonDocument): return BoundJson(value, column.spec.sql_type == 'jsonb')
     return value

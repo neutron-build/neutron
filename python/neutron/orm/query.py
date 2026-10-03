@@ -169,7 +169,7 @@ class Query(Generic[T]):
                 _count(self.row_limit);sql+=' LIMIT %s';set_params+=(self.row_limit,)
             if self.row_offset is not None:
                 _count(self.row_offset);sql+=' OFFSET %s';set_params+=(self.row_offset,)
-            return Compiled(sql,set_params,self.decoder)
+            return Compiled(sql,set_params,self.decoder,first.result_oids)
         nullable = {join.table for join in self.scope.joins if join.left}
         if not self.fields: raise ValueError('empty projection')
         for item in self.fields:
@@ -225,7 +225,7 @@ class Query(Generic[T]):
                 definition_params+=compiled.params
         if definitions:
             sql='WITH '+', '.join(definitions)+' '+sql;params=definition_params+params
-        return Compiled(sql, params, self.decoder)
+        return Compiled(sql, params, self.decoder,tuple(("p"+str(i),item.result_spec.type_oid) for i,item in enumerate(self.fields)))
 
 
 def _count(count: int) -> None:
