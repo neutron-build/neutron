@@ -40,7 +40,7 @@ def test_native_binary_array_decoder_refuses_element_oid_and_trailing_bytes():
     from neutron.orm.pg_adapters import _adapter_classes
     from psycopg import adapters
     class Context:
-        def __init__(self): self.adapters=adapters
+        def __init__(self): self.adapters=adapters;self.connection=None
     cls=_adapter_classes()[6]  # int4[]
     loader=cls(1007,Context())
     with pytest.raises(ValueError,match='OID'): loader.load(struct.pack('!iii',0,0,20))

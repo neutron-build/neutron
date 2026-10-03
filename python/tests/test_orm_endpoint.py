@@ -19,6 +19,9 @@ def test_identity_admission_is_conservative_and_not_topology_attestation():
 
 class IdentityConnection:
     def __init__(self,startup,reported):
+        from psycopg import adapters
+        from psycopg.adapt import AdaptersMap
+        self.adapters=AdaptersMap(adapters)
         self.info=SimpleNamespace(parameter_status=lambda name: startup)
         self.pgconn=SimpleNamespace(finish=self.finish)
         self.finished=False;self.reported=reported;self.statements=[]

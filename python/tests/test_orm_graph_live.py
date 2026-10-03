@@ -107,10 +107,10 @@ def test_native_owned_delete_cascade_orphan_and_rollback(graph):
         session.remove_related(relation,parent,a);session.flush();session.rollback()
         assert session.object_state(a) is ObjectState.PERSISTENT
         assert native.execute(f'SELECT count(*) FROM {relation.child.table.sql}').fetchone()==(2,)
-        session.delete_graph(relation,parent,budget=LoadBudget(1,10,10));session.flush();session.rollback()
+        session.delete_graph(relation,parent,budget=LoadBudget(3,10,10));session.flush();session.rollback()
         assert session.object_state(parent) is ObjectState.PERSISTENT
         assert native.execute(f'SELECT count(*) FROM {relation.child.table.sql}').fetchone()==(2,)
-        session.delete_graph(relation,parent,budget=LoadBudget(1,10,10));session.commit()
+        session.delete_graph(relation,parent,budget=LoadBudget(3,10,10));session.commit()
         assert native.execute(f'SELECT count(*) FROM {relation.parent.table.sql}').fetchone()==(0,)
         assert native.execute(f'SELECT count(*) FROM {relation.child.table.sql}').fetchone()==(0,)
 
