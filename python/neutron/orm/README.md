@@ -259,3 +259,29 @@ admission; snapshot/construct/restore recheck this profile. Model definitions
 must remain stable after mapping. This restriction also protects get, flush,
 refresh and attach-existing restoration; custom model instrumentation/hooks
 require a separately designed lifecycle profile.
+
+`with db.stream(query, batch_size=256) as rows` and
+`async with db.stream(query, batch_size=256) as rows` use native named PostgreSQL
+server cursors. `query` must be a Select or typed Query read projection; batch
+sizes are integers from 1 through 10000. Iterators retain their projected type
+and the existing exact Decimal, aware-time and SQL-NULL/JsonDocument codecs.
+One batch is buffered; fetching the entire result is never implicit. A stream
+leases the connection to its owning thread/task, including while buffered rows
+remain, and blocks other ORM operations and transaction-handle settlement.
+
+A stream outside a transaction owns a READ ONLY transaction. Exhausting the
+iterator through its final empty fetch commits on clean context exit; early
+exit or failure rolls back. A stream within an existing transaction closes
+only its cursor on clean exit, preserving the caller's transaction modes.
+Failures poison that transaction and require rollback. Explicit context exit
+is required after an early break; no generator finalizer or implicit close
+promise is made. Escaped iterators refuse after scope settlement.
+
+Native async Task cancellation and sync KeyboardInterrupt trigger cleanup;
+custom deadline/token cancellation is unsupported. Cursor/transaction cleanup
+is bounded to five seconds across close and settlement independently of the original caught
+cancellation; timeout or repeated cancellation fences the connection before
+reuse. COMMIT cancellation retains the existing indeterminate-outcome error.
+Raw Predicate SQL remains a trusted escape hatch, not a SQL sandbox; the owned
+READ ONLY transaction is enforced by PostgreSQL. Arbitrary custom connection
+implementations are outside the native-driver cleanup bound.

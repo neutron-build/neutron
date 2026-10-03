@@ -79,3 +79,18 @@ def static_attach_existing_consumer(session: Session,mapping: ModelMapping[User]
 
 async def static_async_attach_existing_consumer(session: AsyncSession,mapping: ModelMapping[User],obj: User) -> None:
     assert_type(await session.attach_existing(mapping,obj,discard_changes=True),User)
+
+from typing import Iterator,AsyncIterator
+from neutron.orm import Stream,AsyncStream
+
+def static_stream_consumer(db: Database) -> None:
+    t=Table('t',{'id':ColumnSpec(int,'int4')})
+    assert_type(db.stream(select(t.column('id',int)),batch_size=10),Stream[int])
+    with db.stream(select(t.column('id',int)),batch_size=10) as rows:
+        assert_type(rows,Iterator[int]);assert_type(next(rows),int)
+
+async def static_async_stream_consumer(db: AsyncDatabase) -> None:
+    t=Table('t',{'id':ColumnSpec(int,'int4')})
+    assert_type(db.stream(select(t.column('id',int)),batch_size=10),AsyncStream[int])
+    async with db.stream(select(t.column('id',int)),batch_size=10) as rows:
+        assert_type(rows,AsyncIterator[int]);assert_type(await anext(rows),int)

@@ -24,3 +24,6 @@ __all__ += ["EndpointIdentity"]
 
 from .relations import Association, LoadBudget, Relation, RelationBudgetError, UnsupportedRelationError, async_load_many, async_load_one, load_many, load_one
 __all__ += ["Association","LoadBudget","Relation","RelationBudgetError","UnsupportedRelationError","async_load_many","async_load_one","load_many","load_one"]
+
+from .streaming import AsyncStream, Stream
+__all__ += ["AsyncStream","Stream"]

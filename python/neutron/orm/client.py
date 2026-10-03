@@ -11,6 +11,7 @@ from .core import CardinalityError, Compiled, Mutation, OrmError, Returning, Sel
 
 if TYPE_CHECKING:
     from .lifecycle import AsyncTransactionHandle, TransactionHandle
+    from .streaming import AsyncStream, Stream
 
 T=TypeVar('T')
 
@@ -46,6 +47,8 @@ class Database:
         self._lock=threading.Lock()
         self._closed=False
         self._rollback_only=False
+        self._stream_lease=False
+        self._tx_token: object | None=None
         self._owner: int | None=None
 
     @property
@@ -142,7 +145,7 @@ class Database:
     @contextmanager
     def transaction(self) -> Iterator[Database]:
         if self._owner is not None: raise SessionBusyError('nested transaction unsupported in this slice')
-        with self._use(): self._owner=threading.get_ident()
+        with self._use(): self._owner=threading.get_ident();self._tx_token=object()
         try:
             try:
                 native=self._conn.transaction()
@@ -151,8 +154,13 @@ class Database:
                 self._discard(); raise _native(exc) from exc
             try:
                 yield self
+                if self._stream_lease:
+                    self._discard();raise OrmError('transaction ended with an active stream lease',outcome='aborted')
                 if self._rollback_only: raise OrmError("transaction requires rollback after invalid RETURNING result")
             except BaseException as body:
+                if self._closed: raise
+                if self._stream_lease:
+                    self._discard();raise OrmError('transaction ended with an active stream lease',outcome='aborted') from body
                 try: native.__exit__(type(body),body,body.__traceback__)
                 except BaseException as cleanup:
                     self._discard()
@@ -170,7 +178,12 @@ class Database:
                     raise
         finally:
             self._owner=None
+            self._tx_token=None
             self._rollback_only=False
+
+    def stream(self,query: Select[T] | Query[T],*,batch_size: int) -> Stream[T]:
+        from .streaming import Stream
+        return Stream(self,query,batch_size)
 
     def begin(self) -> TransactionHandle:
         from .lifecycle import TransactionHandle
@@ -199,6 +212,8 @@ class AsyncDatabase:
         self._busy=False
         self._closed=False
         self._rollback_only=False
+        self._stream_lease=False
+        self._tx_token: object | None=None
         self._owner: asyncio.Task[Any] | None=None
 
     @property
@@ -310,7 +325,7 @@ class AsyncDatabase:
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[AsyncDatabase]:
         if self._owner is not None: raise SessionBusyError('nested transaction unsupported in this slice')
-        async with self._use(): self._owner=asyncio.current_task()
+        async with self._use(): self._owner=asyncio.current_task();self._tx_token=object()
         try:
             try:
                 native=self._conn.transaction()
@@ -321,8 +336,13 @@ class AsyncDatabase:
                 raise
             try:
                 yield self
+                if self._stream_lease:
+                    self._discard();raise OrmError('transaction ended with an active stream lease',outcome='aborted')
                 if self._rollback_only: raise OrmError("transaction requires rollback after invalid RETURNING result")
             except BaseException as body:
+                if self._closed: raise
+                if self._stream_lease:
+                    self._discard();raise OrmError('transaction ended with an active stream lease',outcome='aborted') from body
                 try: await native.__aexit__(type(body),body,body.__traceback__)
                 except BaseException as cleanup:
                     self._discard()
@@ -340,7 +360,12 @@ class AsyncDatabase:
                     raise
         finally:
             self._owner=None
+            self._tx_token=None
             self._rollback_only=False
+
+    def stream(self,query: Select[T] | Query[T],*,batch_size: int) -> AsyncStream[T]:
+        from .streaming import AsyncStream
+        return AsyncStream(self,query,batch_size)
 
     async def begin(self) -> AsyncTransactionHandle:
         from .lifecycle import AsyncTransactionHandle

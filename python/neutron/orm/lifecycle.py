@@ -11,6 +11,7 @@ class _Rollback(Exception): pass
 
 class TransactionHandle:
     def __init__(self, database: Database) -> None:
+        self._database=database
         self._context=database.transaction()
         self._context.__enter__()
         self._owner=threading.get_ident()
@@ -19,6 +20,7 @@ class TransactionHandle:
     def _check(self) -> None:
         if threading.get_ident()!=self._owner: raise SessionBusyError('transaction belongs to another thread')
         if self.state!='active': raise OrmError('transaction handle is terminal')
+        if self._database._stream_lease: raise SessionBusyError('transaction has an active stream lease')
 
     def commit(self) -> None:
         self._check();self.state='committing'
@@ -38,6 +40,7 @@ class TransactionHandle:
 
 class AsyncTransactionHandle:
     def __init__(self, database: AsyncDatabase) -> None:
+        self._database=database
         self._context=database.transaction()
         self._owner=asyncio.current_task()
         self.state='new'
@@ -52,6 +55,7 @@ class AsyncTransactionHandle:
     def _check(self) -> None:
         if asyncio.current_task() is not self._owner: raise SessionBusyError('transaction belongs to another task')
         if self.state!='active': raise OrmError('transaction handle is terminal')
+        if self._database._stream_lease: raise SessionBusyError('transaction has an active stream lease')
 
     async def commit(self) -> None:
         self._check();self.state='committing'
