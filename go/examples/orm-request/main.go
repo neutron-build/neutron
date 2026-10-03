@@ -10,7 +10,6 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/neutron-build/neutron/go/neutron"
-	"github.com/neutron-build/neutron/go/orm"
 	ormhttp "github.com/neutron-build/neutron/go/orm/http"
 	ormotel "github.com/neutron-build/neutron/go/orm/otel"
 )
