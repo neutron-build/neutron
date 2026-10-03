@@ -317,3 +317,35 @@ def test_native_versioned_flush_increment_rollback_and_stale_conflict(live_table
         with pytest.raises(OrmError,match='mapped version'): session.flush()
         session.rollback()
         assert native.execute(f'SELECT value,version FROM {t.sql}').fetchone()==('external',3)
+
+
+def test_native_bulk_synchronizes_tracked_rows_and_rollback(mapped):
+    url,m,native=mapped
+    with Session.connect(url) as session:
+        a=User(name='a');b=User(name='b');session.add(m,a);session.add(m,b);session.commit()
+        identity=a.id
+        assert session.bulk_update(m,{'active':False},where=m.table.column('id',int).eq(identity))==1
+        assert a.active is False and b.active is True
+        session.rollback();assert a.active is True
+        assert native.execute(f'SELECT active FROM {m.table.sql} WHERE id=%s',(identity,)).fetchone()==(True,)
+        assert session.bulk_delete(m,where=m.table.column('id',int).eq(identity))==1
+        assert session.object_state(a) is ObjectState.DELETED
+        assert session.get(m,identity) is None
+        session.rollback();assert session.object_state(a) is ObjectState.PERSISTENT
+        assert session.get(m,identity) is a
+        with pytest.raises(OrmError,match='primary-key'): session.bulk_update(m,{'id':9},where=m.table.column('id',int).eq(identity))
+        assert session.bulk_delete(m,where=m.table.column('id',int).eq(identity))==1
+        session.commit();assert session.object_state(a) is ObjectState.DELETED
+        assert native.execute(f'SELECT count(*) FROM {m.table.sql}').fetchone()==(1,)
+
+@pytest.mark.asyncio
+async def test_native_async_bulk_sync_and_rollback(mapped):
+    url,m,native=mapped
+    async with await AsyncSession.connect(url) as session:
+        obj=User(name='async');session.add(m,obj);await session.commit()
+        assert await session.bulk_update(m,{'active':False},where=m.table.column('id',int).eq(obj.id))==1
+        assert obj.active is False
+        await session.rollback();assert obj.active is True
+        assert await session.bulk_delete(m,where=m.table.column('id',int).eq(obj.id))==1
+        await session.rollback();assert session.object_state(obj) is ObjectState.PERSISTENT
+        assert native.execute(f'SELECT count(*) FROM {m.table.sql}').fetchone()==(1,)

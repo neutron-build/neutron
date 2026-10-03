@@ -146,3 +146,13 @@ def static_graph_consumer(session: Session,rel: Relation[User,User],parent: User
 
 async def static_async_graph_consumer(session: AsyncSession,rel: Relation[User,User],parent: User) -> None:
     assert_type(await session.load_relation(rel,[parent],budget=LoadBudget(1,1,1)),tuple[Association[User,User],...])
+
+from neutron.orm import Predicate
+
+def static_bulk_consumer(session: Session,mapping: ModelMapping[User],where: Predicate) -> None:
+    assert_type(session.bulk_update(mapping,{'name':'bulk'},where=where),int)
+    assert_type(session.bulk_delete(mapping,where=where),int)
+
+async def static_async_bulk_consumer(session: AsyncSession,mapping: ModelMapping[User],where: Predicate) -> None:
+    assert_type(await session.bulk_update(mapping,{'name':'bulk'},where=where),int)
+    assert_type(await session.bulk_delete(mapping,where=where),int)

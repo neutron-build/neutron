@@ -374,3 +374,15 @@ include the prior version and scalar snapshot. Stale zero-row updates raise
 ConflictError. Native RETURNING adopts the new version, and rollback restores
 its prior value. Direct application edits to a tracked version refuse. This
 supports integer versions, not universal server-generated/concurrent bulk tokens.
+
+Session `bulk_update(mapping, values, where=...)` and `bulk_delete(mapping,
+where=...)` use an explicit native RETURNING synchronization boundary. They
+flush pending scalar changes first, then refresh affected tracked baselines or
+mark deleted objects inside the same transaction. Rollback restores original
+object state; commit removes deleted identities. Untracked returned rows are
+not implicitly attached. Primary-key edits refuse. Versioned bulk updates
+increment integer tokens in PostgreSQL and adopt returned tokens. Per-row
+callbacks are not emitted for bulk operations; these APIs explicitly bypass
+ordinary per-object optimistic matching and use the caller's predicate. Results
+are buffered, so this is a bounded-use API, not a streaming large-table update
+claim. AsyncSession requires await.

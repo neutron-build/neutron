@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Awaitable, Callable, Sequence, TypeVar
+from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Sequence, TypeVar
 from .client import AsyncDatabase
-from .core import CardinalityError, OrmError, SessionBusyError, delete, insert, select_row, update
+from .core import CardinalityError, OrmError, SessionBusyError, delete, insert, select_row, update, Mutation
 from .lifecycle import AsyncTransactionHandle
 from .events import EVENT_NAMES, EventName, SessionEvent
 from .mapping import ModelMapping
@@ -143,6 +143,22 @@ class AsyncSession(_SessionState):
                     except CardinalityError as exc: raise ConflictError('mapped write did not affect exactly one row') from exc
                     self._flushed_row(record,row)
             await self._emit('after_flush')
+        except BaseException:
+            self._failed=True;raise
+
+    async def bulk_update(self,mapping: ModelMapping[Any],values: Mapping[str,object],*,where: Predicate) -> int:
+        statement=self._bulk_mutation(mapping,values,where)
+        return await self._bulk(mapping,statement,deleting=False)
+
+    async def bulk_delete(self,mapping: ModelMapping[Any],*,where: Predicate) -> int:
+        statement=self._bulk_mutation(mapping,None,where)
+        return await self._bulk(mapping,statement,deleting=True)
+
+    async def _bulk(self,mapping: ModelMapping[Any],statement: Mutation,*,deleting: bool) -> int:
+        try:
+            await self.flush();await self._ensure_transaction()
+            rows=await self._database.all(statement.returning_row(*mapping.field_columns.values()))
+            return self._bulk_adopt(mapping,rows,deleting=deleting)
         except BaseException:
             self._failed=True;raise
 

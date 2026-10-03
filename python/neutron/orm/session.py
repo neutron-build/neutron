@@ -3,9 +3,9 @@ from __future__ import annotations
 from contextlib import contextmanager
 import threading
 import inspect
-from typing import Any, Callable, Iterator, Sequence, TypeVar
+from typing import Any, Callable, Iterator, Mapping, Sequence, TypeVar
 from .client import AsyncDatabase, Database
-from .core import CardinalityError, OrmError, Predicate, SessionBusyError, delete, insert, select_row, update
+from .core import CardinalityError, OrmError, Predicate, SessionBusyError, delete, insert, select_row, update, Mutation, _bound_quote
 from .lifecycle import TransactionHandle
 from .events import EVENT_NAMES, EventName, SessionEvent
 from .mapping import ModelMapping, same_column_value
@@ -217,6 +217,31 @@ class _SessionState:
                 plans.append((record,'delete',{}))
         return self._graph_order(plans)
 
+    def _bulk_mutation(self,mapping: ModelMapping[Any],values: Mapping[str,object] | None,where: Predicate) -> Mutation:
+        self._guard();self._mapping(mapping)
+        if values is None: return delete(mapping.table,where=where)
+        forbidden={mapping.field_columns[name].name for name in mapping.primary_key}
+        if forbidden & values.keys(): raise OrmError('bulk primary-key mutation refused')
+        statement=update(mapping.table,values,where=where)
+        if mapping.version_field is not None:
+            name=mapping.field_columns[mapping.version_field].name
+            if name in values: raise OrmError('bulk application version mutation refused')
+            quoted=_bound_quote(name)
+            statement=Mutation(statement.sql.replace(' WHERE ',f', {quoted} = {quoted} + 1 WHERE ',1),statement.params,mapping.table)
+        return statement
+
+    def _bulk_adopt(self,mapping: ModelMapping[Any],rows: list[dict[str,Any]],*,deleting: bool) -> int:
+        for row in rows:
+            values={name:row[column.name] for name,column in mapping.field_columns.items()}
+            key=mapping.key(values)
+            if key is None: raise OrmError('bulk returning requires complete identity')
+            obj=self._store.find(mapping,key)
+            if obj is None: continue
+            record=self._store.records[id(obj)]
+            if deleting: record.state=ObjectState.DELETED
+            else: self._flushed_row(record,row)
+        return len(rows)
+
     def _flushed_row(self,record: Record[Any],row: dict[str,Any]) -> None:
         values={name:row[column.name] for name,column in record.mapping.field_columns.items()}
         self._store.flushed(record,values)
@@ -350,6 +375,22 @@ class Session(_SessionState):
                     except CardinalityError as exc: raise ConflictError('mapped write did not affect exactly one row') from exc
                     self._flushed_row(record,row)
             self._emit('after_flush')
+        except BaseException:
+            self._failed=True;raise
+
+    def bulk_update(self,mapping: ModelMapping[Any],values: Mapping[str,object],*,where: Predicate) -> int:
+        statement=self._bulk_mutation(mapping,values,where)
+        return self._bulk(mapping,statement,deleting=False)
+
+    def bulk_delete(self,mapping: ModelMapping[Any],*,where: Predicate) -> int:
+        statement=self._bulk_mutation(mapping,None,where)
+        return self._bulk(mapping,statement,deleting=True)
+
+    def _bulk(self,mapping: ModelMapping[Any],statement: Mutation,*,deleting: bool) -> int:
+        try:
+            self.flush();self._ensure_transaction()
+            rows=self._database.all(statement.returning_row(*mapping.field_columns.values()))
+            return self._bulk_adopt(mapping,rows,deleting=deleting)
         except BaseException:
             self._failed=True;raise
 
