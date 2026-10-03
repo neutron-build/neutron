@@ -9,6 +9,7 @@ from uuid import UUID
 
 from .json_value import BoundJson, JsonDocument, MutableJson
 from .network_value import Inet,CIDR
+from .composite_value import PgComposite,BoundComposite
 from .catalog_value import BoundCatalog, CatalogType, PgDomain, PgEnum
 from .pg_value import BoundArray, BoundRange, PgArray, PgRange, TimeOfDay, Interval
 
@@ -55,14 +56,16 @@ class ColumnSpec(Generic[T]):
     generated: bool = False
     native_type: CatalogType|None=None
     domain_base: ColumnSpec[Any]|None=None
+    composite_fields: tuple[tuple[str,object],...]=()
 
     def __post_init__(self) -> None:
         if self.native_type is not None:
             if not isinstance(self.native_type,CatalogType): raise ValueError('catalog type admission required')
+            if self.sql_type=='composite' and self.python_type is PgComposite and self.native_type.kind=='c' and self.composite_fields and all(isinstance(spec,ColumnSpec) and spec.native_type is None for _,spec in self.composite_fields): return
             if self.sql_type=='enum' and self.python_type is PgEnum and self.native_type.kind=='e' and self.domain_base is None: return
             if self.sql_type=='domain' and self.python_type is PgDomain and self.native_type.kind=='d' and isinstance(self.domain_base,ColumnSpec) and self.domain_base.type_oid==self.native_type.base_oid and (self.domain_base.native_type is None or self.domain_base.native_type.kind=='e' and self.domain_base.native_type._owner is self.native_type._owner): return
             raise ValueError('catalog kind/base type mismatch')
-        if self.domain_base is not None: raise ValueError('domain base requires catalog identity')
+        if self.domain_base is not None or self.composite_fields: raise ValueError('component metadata requires catalog identity')
         if _TYPES.get(self.sql_type) is not self.python_type and not (self.sql_type=='jsonb' and self.python_type is MutableJson) and not (self.python_type is PgRange and self.sql_type in _RANGE_TYPES) and not (self.python_type is PgArray and self.sql_type.endswith('[]') and self.sql_type[:-2] in _ARRAY_TYPES):
             raise ValueError('unsupported or mismatched column type profile')
 
@@ -90,6 +93,11 @@ class ColumnSpec(Generic[T]):
         if not isinstance(value, self.python_type) or (self.python_type is int and isinstance(value, bool)) or (self.sql_type == 'date' and isinstance(value, dt.datetime)):
             raise ValueError('column value has wrong native type')
         if self.python_type in {Inet,CIDR} and type(value) is not self.python_type: raise ValueError('exact native network family required')
+        if isinstance(value,PgComposite):
+            if value.identity is not self.native_type or len(value.fields)!=len(self.composite_fields): raise ValueError('composite qualified identity/field count mismatch')
+            for (_,spec),item in zip(self.composite_fields,value.fields):
+                if not isinstance(spec,ColumnSpec): raise ValueError('composite component metadata required')
+                spec.check(item)
         if isinstance(value,(PgEnum,PgDomain)):
             if value.identity is not self.native_type: raise ValueError('enum/domain qualified identity mismatch')
             if isinstance(value,PgDomain):
@@ -374,6 +382,7 @@ def delete(table: Table, *, where: Predicate) -> Mutation:
 
 
 def _parameter(column: Column[Any], value: object) -> object:
+    if isinstance(value,PgComposite): return BoundComposite(value,column.spec.composite_fields)
     if isinstance(value,PgEnum): return BoundCatalog(value.label,value.identity)
     if isinstance(value,PgDomain): return BoundCatalog(value.value,value.identity,column.spec.domain_base)
     if isinstance(value,PgRange): return BoundRange(value,column.spec.sql_type)

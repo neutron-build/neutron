@@ -8,6 +8,7 @@ from .endpoint import EndpointIdentity, admit, startup_version
 from .json_value import load_document, native_params
 from .query import Query
 from .sql_admission import validate_scope_sql
+from .composite_value import PgComposite,COMPOSITE_SQL,admitted_components,register_composite
 from .catalog_value import CatalogType, PgDomain, PgEnum, TYPE_SQL, TABLE_SQL, admitted_type, register_catalog_values
 from .core import ColumnSpec, Table, quote, CardinalityError, Compiled, Mutation, OrmError, Returning, Select, SessionBusyError
 
@@ -127,6 +128,18 @@ class Database:
             cached=ColumnSpec(PgEnum,'enum',native_type=identity);self._catalog_specs[(schema,name)]=cached
         from dataclasses import replace
         return cast(ColumnSpec[PgEnum],replace(cached,nullable=nullable,generated=generated))
+
+    def composite_spec(self,schema: str,name: str,fields: Mapping[str,ColumnSpec[Any]],*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgComposite]:
+        quote(schema);quote(name)
+        identity=admitted_type(self._catalog_read(TYPE_SQL,(schema,name)),schema,name,'c',self._catalog_owner)
+        components=admitted_components(self._catalog_read(COMPOSITE_SQL,(identity.oid,)),fields)
+        cached=self._catalog_specs.get((schema,name))
+        if cached is None or cached.native_type!=identity:
+            register_composite(self._conn,self._catalog_owner,identity,components)
+            cached=ColumnSpec(PgComposite,'composite',native_type=identity,composite_fields=components);self._catalog_specs[(schema,name)]=cached
+        elif cached.composite_fields!=components: raise ValueError('composite component profile changed; reconstruct metadata')
+        from dataclasses import replace
+        return cast(ColumnSpec[PgComposite],replace(cached,nullable=nullable,generated=generated))
 
     def domain_spec(self,schema: str,name: str,base: ColumnSpec[T],*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgDomain[T]]:
         quote(schema);quote(name)
@@ -399,6 +412,18 @@ class AsyncDatabase:
             cached=ColumnSpec(PgEnum,'enum',native_type=identity);self._catalog_specs[(schema,name)]=cached
         from dataclasses import replace
         return cast(ColumnSpec[PgEnum],replace(cached,nullable=nullable,generated=generated))
+
+    async def composite_spec(self,schema: str,name: str,fields: Mapping[str,ColumnSpec[Any]],*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgComposite]:
+        quote(schema);quote(name)
+        identity=admitted_type(await self._catalog_read(TYPE_SQL,(schema,name)),schema,name,'c',self._catalog_owner)
+        components=admitted_components(await self._catalog_read(COMPOSITE_SQL,(identity.oid,)),fields)
+        cached=self._catalog_specs.get((schema,name))
+        if cached is None or cached.native_type!=identity:
+            register_composite(self._conn,self._catalog_owner,identity,components)
+            cached=ColumnSpec(PgComposite,'composite',native_type=identity,composite_fields=components);self._catalog_specs[(schema,name)]=cached
+        elif cached.composite_fields!=components: raise ValueError('composite component profile changed; reconstruct metadata')
+        from dataclasses import replace
+        return cast(ColumnSpec[PgComposite],replace(cached,nullable=nullable,generated=generated))
 
     async def domain_spec(self,schema: str,name: str,base: ColumnSpec[T],*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgDomain[T]]:
         quote(schema);quote(name)

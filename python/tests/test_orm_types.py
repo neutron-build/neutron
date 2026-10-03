@@ -269,3 +269,15 @@ def static_network_consumer(db: Database) -> None:
 async def static_async_network_consumer(db: AsyncDatabase) -> None:
     table=Table('networks',{'host':ColumnSpec(Inet,'inet')})
     assert_type(await db.one(select(table.column('host',Inet))),Inet)
+
+from neutron.orm import PgComposite
+
+def static_composite_consumer(db: Database) -> None:
+    spec=db.composite_spec('app','pair',{'id':ColumnSpec(int,'int8',nullable=True)},nullable=True)
+    assert_type(spec,ColumnSpec[PgComposite])
+    table=db.catalog_table('records',{'value':spec},schema='app')
+    assert_type(db.one(select(table.nullable_column('value',PgComposite))),PgComposite|None)
+
+async def static_async_composite_consumer(db: AsyncDatabase) -> None:
+    spec=await db.composite_spec('app','pair',{'id':ColumnSpec(int,'int8',nullable=True)})
+    assert_type(spec,ColumnSpec[PgComposite])

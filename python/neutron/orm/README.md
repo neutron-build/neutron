@@ -599,3 +599,16 @@ changing families. Scoped IPv6 addresses refuse. `ColumnSpec(Inet, 'inet')` and
 exact builtin OIDs and header-family checks. SQL NULL remains `None`; `/0` and
 all-zero addresses remain actual values. Mapped replacement, identity reads,
 rollback, streaming and async APIs use the same component contracts.
+
+`db.composite_spec(schema, type_name, ordered_component_specs)` admits an actual
+qualified composite against each declared field name and builtin SQL type/OID.
+`PgComposite(tuple_of_fields, spec.native_type)` owns immutable native components;
+SQL NULL (`None`), an all-NULL record, and empty text/bytea/arrays stay distinct.
+The binary codec validates each field OID and length, caps records at 256 fields
+and 1 MiB, and retains numeric precision, array dimensions and 24:00 time without
+text formatting or session settings. Async admission follows the same contract.
+Use `catalog_table` on the owning client; another client's metadata refuses.
+Component specs explicitly select their NULL policy. Immutable builtin scalar,
+array and range components are admitted; nested user types, domain/enum members
+and mutable JSON require separate qualification and refuse in this slice.
+Composite primary-key identity is not qualified. Reconstruct admission after DDL.

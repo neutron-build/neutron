@@ -10,11 +10,14 @@ from .core import Column, ColumnSpec, OMIT, OrmError, Table, _column_type
 from .json_value import JsonDocument, MutableJson
 from .pg_value import PgArray, PgRange
 from .catalog_value import PgDomain, PgEnum
+from .composite_value import PgComposite
 from .instrumentation import _MappedField, instrument_model, raw_values, restore_values
 from decimal import Decimal
 import datetime as dt
 
 def same_value(left: Any,right: Any) -> bool:
+    if isinstance(left,PgComposite) and isinstance(right,PgComposite):
+        return left.identity is right.identity and len(left.fields)==len(right.fields) and all(same_value(a,b) for a,b in zip(left.fields,right.fields))
     if isinstance(left,PgDomain) and isinstance(right,PgDomain):
         return left.identity is right.identity and same_value(left.value,right.value)
     if isinstance(left,PgArray) and isinstance(right,PgArray):
@@ -149,7 +152,7 @@ class ModelMapping(Generic[T]):
 
 def _primary_profile(spec: ColumnSpec[Any]) -> bool:
     if spec.domain_base is not None: return _primary_profile(spec.domain_base)
-    return spec.sql_type not in {'json','jsonb','interval'} and spec.python_type not in {PgArray,PgRange,PgDomain}
+    return spec.sql_type not in {'json','jsonb','interval'} and spec.python_type not in {PgArray,PgRange,PgDomain,PgComposite}
 
 
 def _identity_value(spec: ColumnSpec[Any],value: Any) -> Any:

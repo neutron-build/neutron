@@ -73,3 +73,6 @@ __all__ += ["PolymorphicMapping","PolymorphicView"]
 
 from .network_value import Inet,CIDR
 __all__ += ["Inet","CIDR"]
+
+from .composite_value import PgComposite
+__all__ += ["PgComposite"]
