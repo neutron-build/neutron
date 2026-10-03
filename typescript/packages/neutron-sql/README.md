@@ -1780,3 +1780,30 @@ array elements remain unsupported. `.array()` keeps its one-dimensional,
 default-bound representation. Dimensioned arrays require explicit native DDL:
 version-2 schema export refuses this declaration because its array contract
 cannot retain these dimensions and bounds.
+
+`createQueryTelemetry()` provides counters isolated by `AsyncLocalStorage`.
+Pass its `logger` to `createDatabase`, and wrap each fully awaited request in
+`telemetry.run(async () => ...)`. Its result includes query starts, successes,
+failures, cancellations and summed query duration. Transaction control is
+separate from query counts; retries count each physical attempt. Detached
+background work must own a separate scope and database lifetime.
+
+To attach redacted events to your application's active OpenTelemetry span,
+provide `() => trace.getSpan(context.active())` from your configured
+`@opentelemetry/api` context manager. The bridge emits event kinds, statement
+hashes, durations and validated SQLSTATE only, even when diagnostic SQL logging
+is enabled. It leaves span creation, status, ending and exporter shutdown with
+the application. This follows the [OpenTelemetry context API](https://github.com/open-telemetry/opentelemetry-js/blob/main/doc/context.md).
+
+For HTTP middleware, create one `SqlRequestLifecycle(db)` alongside the pool.
+Run each request with `lifetime.run((database, signal) =>
+database.transaction(async tx => { ... }))`; keep the transaction inside that
+callback and pass `signal` to each builder's `.execute({ signal })`. Await all
+work before sending the response. On server shutdown, stop HTTP admission,
+then await `lifetime.shutdown({ graceMs: 5000, cancelMs: 5000 })`, then flush
+your telemetry exporter. New SQL requests are refused as draining starts.
+After the grace period, active signals are aborted and drained before
+`db.close()`. If callbacks ignore cancellation past the second deadline,
+shutdown rejects and keeps the database open; after those callbacks settle,
+retry shutdown. An injected borrowed driver retains its documented ownership
+and must be closed separately by its owner.
