@@ -45,3 +45,13 @@ The qualifier strips PYTHONPATH/PYTHONHOME before tooling or fixture subprocesse
 It launches the copied coordinator through an isolated `-I -B` bootstrap with
 only its owned directory explicitly added for the runner's sibling imports.
 Invoke the qualifier itself with `-I -B` as shown above.
+
+For the independent cross-language runner, `action: "insert"` performs a real
+`orm.InsertOne` of the specified second scalar row: int8 minimum, the exact
+negative Decimal, the2038 UTC microsecond instant, SQL NULL text and JSON null.
+The adapter then returns only actual `orm.Select` observations, with the same
+artifact envelope. It does not fabricate expected rows or implement the native
+oracle. The read qualifier above remains read-only certification; write/read
+pair certification belongs to the independent cross runner and its native
+post-write oracle. A cross descriptor uses the preserved consumer's `adapter`
+binary, `artifacts.json` and consumer directory as its artifact root.

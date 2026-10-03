@@ -47,7 +47,7 @@ func observe() (map[string]any, bool) {
 	if decoder.Decode(&trailing) != io.EOF {
 		return failure, false
 	}
-	if r.Protocol != "polyglot-conformance-v1" || r.CaseID != "scalar-extremes" || r.Action != "observe" || r.Profile != "postgres-direct" || !scopePattern.MatchString(r.Schema) || !hashPattern.MatchString(r.Ownership) || len(r.Artifacts) == 0 {
+	if r.Protocol != "polyglot-conformance-v1" || r.CaseID != "scalar-extremes" || (r.Action != "observe" && r.Action != "insert") || r.Profile != "postgres-direct" || !scopePattern.MatchString(r.Schema) || !hashPattern.MatchString(r.Ownership) || len(r.Artifacts) == 0 {
 		return failure, false
 	}
 	for name, digest := range r.Artifacts {
@@ -79,6 +79,46 @@ func observe() (map[string]any, bool) {
 	id, err := orm.NewColumn[fixture, int32](table, "ID")
 	if err != nil {
 		return failure, false
+	}
+	if r.Action == "insert" {
+		bigColumn, err := orm.NewColumn[fixture, int64](table, "Big")
+		if err != nil {
+			return failure, false
+		}
+		preciseColumn, err := orm.NewColumn[fixture, orm.Decimal](table, "Precise")
+		if err != nil {
+			return failure, false
+		}
+		momentColumn, err := orm.NewColumn[fixture, time.Time](table, "Moment")
+		if err != nil {
+			return failure, false
+		}
+		sqlNullColumn, err := orm.NewColumn[fixture, *string](table, "SQLNull")
+		if err != nil {
+			return failure, false
+		}
+		documentColumn, err := orm.NewColumn[fixture, *orm.JSON](table, "Document")
+		if err != nil {
+			return failure, false
+		}
+		precise, err := orm.ParseDecimal("-98765432109876543210.000000001")
+		if err != nil {
+			return failure, false
+		}
+		document, err := orm.ParseJSON("null")
+		if err != nil {
+			return failure, false
+		}
+		_, err = orm.InsertOne(ctx, pool, table,
+			orm.Set(id, orm.Some(int32(2))),
+			orm.Set(bigColumn, orm.Some(int64(-9223372036854775808))),
+			orm.Set(preciseColumn, orm.Some(precise)),
+			orm.Set(momentColumn, orm.Some(time.Date(2038, 1, 19, 3, 14, 7, 654321000, time.UTC))),
+			orm.Set(sqlNullColumn, orm.Some((*string)(nil))),
+			orm.Set(documentColumn, orm.Some(&document)))
+		if err != nil {
+			return failure, false
+		}
 	}
 	values, err := orm.Select(ctx, pool, table, orm.Query[fixture]{}.OrderBy(id.Asc()))
 	if err != nil {
