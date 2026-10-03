@@ -197,6 +197,10 @@ func qualifiedCatalogCodec(t reflect.Type, c catalogCodec) bool {
 		return c.oid == pgtype.UUIDOID
 	case t == reflect.TypeOf(JSON{}):
 		return c.oid == pgtype.JSONOID || c.oid == pgtype.JSONBOID
+	case t == reflect.TypeOf(Inet{}):
+		return c.oid == pgtype.InetOID
+	case t == reflect.TypeOf(CIDR{}):
+		return c.oid == pgtype.CIDROID
 	case t == reflect.TypeOf(Bytea{}):
 		return c.oid == pgtype.ByteaOID
 	case t == reflect.TypeOf(Date{}):
