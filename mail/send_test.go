@@ -678,3 +678,122 @@ func TestSanitizeFilenameLongUnicodeStaysValidUTF8(t *testing.T) {
 		}
 	}
 }
+
+// scriptedSMTP answers one connection, then misbehaves at a chosen stage.
+// It exists to pin down which failures Send reports as provably before
+// acceptance (NotSubmittedError) and which leave the outcome unknown.
+func scriptedSMTP(t *testing.T, stage string) (port int) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		say := func(s string) { fmt.Fprint(conn, s+"\r\n") }
+		if stage == "greeting" {
+			return
+		}
+		say("220 fake")
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			cmd := strings.TrimSpace(strings.ToUpper(line))
+			switch {
+			case strings.HasPrefix(cmd, "EHLO"), strings.HasPrefix(cmd, "HELO"):
+				if stage == "ehlo" {
+					return
+				}
+				say("250-fake")
+				say("250 8BITMIME")
+			case strings.HasPrefix(cmd, "MAIL"):
+				if stage == "mail" {
+					say("550 sender refused")
+					continue
+				}
+				say("250 ok")
+			case strings.HasPrefix(cmd, "RCPT"):
+				if stage == "rcpt" {
+					say("550 no such user")
+					continue
+				}
+				say("250 ok")
+			case strings.HasPrefix(cmd, "DATA"):
+				switch stage {
+				case "data-refused":
+					say("554 transaction failed")
+					continue
+				case "data-drop":
+					return
+				}
+				say("354 go")
+				if stage == "body-drop" {
+					reader.ReadString('\n') // take part of the body, then vanish
+					return
+				}
+				for {
+					l, err := reader.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if strings.TrimRight(l, "\r\n") == "." {
+						break
+					}
+				}
+				switch stage {
+				case "end-silent":
+					return // took the whole message, never answered
+				case "end-5xx":
+					say("554 rejected after data")
+				case "end-4xx":
+					say("452 try later")
+				default:
+					say("250 accepted")
+				}
+				return
+			default:
+				say("250 ok")
+			}
+		}
+	}()
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	port, _ = strconv.Atoi(portStr)
+	return port
+}
+
+func TestSendReportsOnlyProvablyUnsubmittedFailures(t *testing.T) {
+	for _, tc := range []struct {
+		stage        string
+		notSubmitted bool
+	}{
+		{"greeting", true}, {"ehlo", true}, {"mail", true}, {"rcpt", true},
+		{"data-refused", true}, {"data-drop", true},
+		{"end-5xx", true}, {"end-4xx", true},
+		// The message body crossed the wire: acceptance is unknown.
+		{"body-drop", false}, {"end-silent", false},
+	} {
+		t.Run(tc.stage, func(t *testing.T) {
+			s := NewSender(SMTPConfig{Host: "127.0.0.1", Port: scriptedSMTP(t, tc.stage), Plaintext: true})
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			_, _, err := s.Send(ctx, testOutgoing("a@x.com", "b@x.com"))
+			if err == nil {
+				t.Fatal("a failing server produced a successful send")
+			}
+			if got := IsNotSubmitted(err); got != tc.notSubmitted {
+				t.Fatalf("IsNotSubmitted=%v want %v (err: %v)", got, tc.notSubmitted, err)
+			}
+		})
+	}
+	if _, _, err := NewSender(SMTPConfig{Host: "127.0.0.1", Plaintext: true}).Send(t.Context(), &Outgoing{From: Address{Email: "a@x.com"}}); !IsNotSubmitted(err) {
+		t.Fatalf("a message with no recipients never reaches the wire: %v", err)
+	}
+}
