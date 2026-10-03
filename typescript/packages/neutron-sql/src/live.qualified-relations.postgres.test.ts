@@ -51,7 +51,7 @@ for (const driver of ["pg", "postgres"] as const) {
       assert.equal((await native.query('SELECT count(*)::integer AS n FROM "tenant.left".posts WHERE id=3')).rows[0].n, 0);
     } finally {
       await db.close(); await native.end();
-      await admin.query(`DROP DATABASE "${name}" WITH (FORCE)`); await admin.end();
+      await admin.query(`DROP DATABASE "${name}"`); await admin.end();
     }
   });
 }
