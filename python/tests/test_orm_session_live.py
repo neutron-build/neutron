@@ -136,4 +136,9 @@ async def test_native_async_refresh_and_detach(mapped):
         await session.refresh(obj);await session.commit()
         session.detach(obj)
         assert session.object_state(obj) is ObjectState.DETACHED
-        assert await session.get(m,obj.id) is not obj
+        loaded=await session.get(m,obj.id)
+        assert loaded is not None and loaded is not obj and loaded.name=='external'
+        native.execute(f'DELETE FROM {m.table.sql} WHERE id=%s',(obj.id,))
+        with pytest.raises(ConflictError): await session.refresh(loaded)
+        with pytest.raises(OrmError,match='requires rollback'): await session.get(m,obj.id)
+        await session.rollback();assert loaded.name=='external'
