@@ -382,3 +382,34 @@ and indeterminate COMMIT never dispatch. Nothing retries writes or notifications
 crashes and lost acknowledgements require application reconciliation or a durable
 outbox. This is not exactly-once or durable notification delivery. Hook closures
 and external shared state remain application-owned synchronization responsibilities.
+
+
+## Explicit application scopes, soft deletion and version guards
+
+`NewScopedTable(table, predicate)` validates a fixed immutable application scope.
+Its `Query`, `Select`, `SelectOne`, `Update` and `Delete` retain that scope. Writes
+additionally require an explicit valid caller predicate; a tenant scope cannot
+hide a missing write condition. Core operations and raw SQL remain explicit.
+
+`NewSoftDelete(scoped, nullableTimeColumn)` opts into a nullable timestamp deletion
+marker. `Active` and `Select` include the application scope and IS NULL marker.
+`IncludingDeleted` includes the same application scope and permits deleted rows.
+`Remove` supplies an explicit timestamp; `Restore` sets NULL on deleted matches;
+`Update` only modifies active matches and refuses direct deletion-marker changes.
+Policies and query builders are values: administrator reads or restoration never
+mutate another caller's active policy. Relation loaders can accept `Active(query)`
+explicitly; hooks and core Delete are not automatically intercepted.
+
+`VersionedUpdate(ctx, scope, table, predicate, int64VersionColumn, expected,
+assignments...)` requires an owned Scope, an explicit predicate and nonempty
+zero-safe assignments. One statement matches the expected nonnegative int64
+version and increments it. Callers cannot assign the version column themselves.
+A missing/stale match returns `ErrVersionConflict`; multiple matches return
+`ErrCardinality`. Both poison the Scope with `ErrScopeMutation`, ensuring that
+swallowing the guard error cannot commit prior writes or a multi-row change.
+Successful child savepoint rollback permits parent recovery. The caller must
+include its tenant/identity scope in the predicate; no primary key is inferred.
+
+```sh
+go test ./orm -run 'Test(ImmutableScopedSoftDeletePolicy|VersionGuardPoisonAndValidation|PostgresScopedSoftDeleteAndVersionGuards)' -count=1 -v
+```

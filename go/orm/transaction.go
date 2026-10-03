@@ -168,7 +168,7 @@ func (s *Scope) acquire(ctx context.Context) (*operation, error) {
 		return nil, errors.Join(ErrTransactionBroken, o.broken)
 	}
 	if s.failed != nil {
-		return nil, errors.Join(ErrScopeDecode, s.failed)
+		return nil, s.failed
 	}
 	if o.current != s {
 		return nil, ErrParentSuspended
