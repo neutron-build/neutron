@@ -37,6 +37,13 @@ func TestV3QualifiedOverloadGoldenAndPortableHash(t *testing.T) {
 	if len(doc.Model.Inventory) != 5 {
 		t.Fatal("overloads or domain flattened")
 	}
+	check, err := ValidateSchemaDocument(v3Fixture(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if check.Version != 3 || check.SHA256 != doc.SHA256Hex || !bytes.Equal(check.Canonical, doc.Canonical) {
+		t.Fatal("v3 validation dispatch did not retain canonical representation")
+	}
 	var root map[string]any
 	if err := json.Unmarshal(v3Fixture(t), &root); err != nil {
 		t.Fatal(err)
