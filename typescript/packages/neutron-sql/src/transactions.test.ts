@@ -465,7 +465,7 @@ test("transaction callback settlement fences handles while COMMIT is still pendi
 
 test('nested scope and prepared handles settle independently while the outer transaction survives', async () => {
   const pin = fakePin();
-  pin.prepare = text => ({ sql: text, query: () => pin.query(text), execute: () => pin.execute(text) });
+  pin.prepare = text => ({ sql: text, name: undefined, query: () => pin.query(text), execute: () => pin.execute(text) });
   let child!: TransactionScope;
   let prepared!: ReturnType<NonNullable<TransactionScope['prepare']>>;
   await runTransaction(pin, async outer => {
@@ -527,5 +527,47 @@ test('unawaited nested callbacks settle before root rollback and cannot keep iss
   finish();
   await assert.rejects(done, /pending operations/);
   assert.ok(!pin.statements.includes('select escaped'));
+  assert.equal(pin.statements.at(-1), 'rollback');
+});
+
+test('caught explicit savepoint SQL failures force root rollback', async () => {
+  for (const match of [/^savepoint /, /^rollback to /, /^release savepoint /]) {
+    const pin = fakePin([{ match, error: new Error('control failed') }]);
+    await assert.rejects(runTransaction(pin, async tx => {
+      try {
+        const sp = await tx.savepoint();
+        if (match.source.startsWith('^rollback')) await sp.rollbackTo();
+        else await sp.release();
+      } catch { /* the callback intentionally swallows the server error */ }
+    }), /cleanup failed/);
+    assert.equal(pin.statements.at(-1), 'rollback');
+    assert.ok(!pin.statements.includes('commit'));
+  }
+});
+
+test('ancestor savepoint rollback/release invalidates descendant handles before SQL', async () => {
+  const pin = fakePin();
+  await runTransaction(pin, async tx => {
+    const first = await tx.savepoint('first');
+    const second = await tx.savepoint('second');
+    await assert.rejects(tx.savepoint('first'), /already active/);
+    await first.rollbackTo();
+    const before = [...pin.statements];
+    await assert.rejects(second.release(), /already released/);
+    assert.deepEqual(pin.statements, before);
+    await first.release();
+  });
+});
+
+test('unawaited failed public query promises remain observed through rollback', async () => {
+  const pin = fakePin();
+  let finish!: () => void;
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  pin.query = async () => { await gate; throw new Error('native failure'); };
+  const done = runTransaction(pin, async tx => { void tx.query('select fail'); });
+  await new Promise(resolve => setImmediate(resolve));
+  finish();
+  await assert.rejects(done, /pending operations/);
+  await new Promise(resolve => setImmediate(resolve));
   assert.equal(pin.statements.at(-1), 'rollback');
 });
