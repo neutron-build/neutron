@@ -29,13 +29,16 @@ if result.returncode:
 result = run(["go", "test", "./testdata/positive"])
 if result.returncode:
     sys.exit(result.returncode)
-for name, diagnostic in [
-    ("wrong_predicate", "cannot use"),
-    ("wrong_projection", "cannot use"),
-    ("wrong_write", "cannot use"),
-    ("null_nonnullable", "cannot use"),
+for name, target_type in [
+    ("wrong_predicate", "as int64 value"),
+    ("wrong_projection", "as []int value"),
+    ("wrong_write", "as typed.Optional[bool] value"),
+    ("null_nonnullable", "as typed.Optional[string] value"),
 ]:
     result = run(["go", "test", "./testdata/" + name])
-    if result.returncode == 0 or diagnostic not in result.stdout:
+    source = root / "testdata" / name / "main.go"
+    line = next(i for i, text in enumerate(source.read_text().splitlines(), 1) if "var invalid" in text)
+    location = f"testdata/{name}/main.go:{line}:"
+    if result.returncode == 0 or "cannot use" not in result.stdout or target_type not in result.stdout or location not in result.stdout:
         sys.exit("negative consumer did not fail with expected type error: " + name)
 print("PASS: deterministic generator, runtime contracts, four negative compile consumers")

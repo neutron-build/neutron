@@ -60,7 +60,7 @@ type Field struct {
 // ValidateModel checks generated metadata against the actual Go field types
 // and tags. It must run before a future ORM admits the model to execution.
 func ValidateModel(model reflect.Type, metadata []Field) error {
-	if model.Kind() != reflect.Struct {
+	if model == nil || model.Kind() != reflect.Struct {
 		return fmt.Errorf("model must be struct")
 	}
 	seen := make(map[string]bool)
@@ -68,7 +68,10 @@ func ValidateModel(model reflect.Type, metadata []Field) error {
 	for i := 0; i < model.NumField(); i++ {
 		f := model.Field(i)
 		tag, ok := f.Tag.Lookup("db")
-		if !ok || tag == "-" {
+		if !ok {
+			return fmt.Errorf("field %s requires explicit db tag", f.Name)
+		}
+		if tag == "-" {
 			continue
 		}
 		parts := strings.Split(tag, ",")
@@ -80,6 +83,9 @@ func ValidateModel(model reflect.Type, metadata []Field) error {
 		}
 		seen[parts[0]] = true
 		actual[f.Name] = f
+	}
+	if len(actual) == 0 {
+		return fmt.Errorf("model has no mapped fields")
 	}
 	if len(actual) != len(metadata) {
 		return fmt.Errorf("metadata field count mismatch")

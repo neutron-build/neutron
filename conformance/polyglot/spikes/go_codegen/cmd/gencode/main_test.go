@@ -42,6 +42,8 @@ func TestInvalidModelRejected(t *testing.T) {
 		{"untagged_pointer", "A *string `db:\"a\"`", "pointer/nullability mismatch"},
 		{"unknown_option", "A string `db:\"a,omit\"`", "unknown db option"},
 		{"unexported", "a string `db:\"a\"`", "unexported"},
+		{"grouped", "A, B string `db:\"a\"`", "grouped"},
+		{"embedded", "Other `db:\"other\"`", "embedded"},
 		{"unsupported_type", "A []string `db:\"a\"`", "unsupported field type"},
 		{"unsafe_identifier", "A string `db:\"a;drop\"`", "unsupported db identifier"},
 	}
