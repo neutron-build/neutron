@@ -12,7 +12,7 @@ try {
   const position = process.argv.indexOf('--module');
   if (position < 0 || !process.argv[position + 1]) throw new Error('installed module entry required');
   const driver = process.argv.includes('--postgres-js') ? 'postgres' : 'pg';
-  const { createDatabase, pgSchema, integer, bigint, numeric, timestamptz, text, jsonb, asc, isNull } = await import(pathToFileURL(path.resolve(process.argv[position + 1])).href);
+  const { createDatabase, pgSchema, integer, bigint, numeric, timestamptz, text, jsonb, asc, sql } = await import(pathToFileURL(path.resolve(process.argv[position + 1])).href);
   const table = pgSchema(request.schema_scope).table('values_fixture', {
     id: integer('id').primaryKey(), big: bigint('big', { mode: 'string' }),
     precise: numeric('precise'), moment: timestamptz('moment'),
@@ -23,7 +23,7 @@ try {
   db = await createDatabase({ url, driverOptions: { driver }, tables: { values: table } });
   // SQL NULL's predicate is observed independently of JSON's JS null decoder.
   const values = await db.select({ id: table.id, big: table.big, precise: table.precise,
-    moment: table.moment, sqlNull: isNull(table.sqlNull), document: table.document }).from(table).orderBy(asc(table.id));
+    moment: table.moment, sqlNull: sql`${table.sqlNull} is null`, document: table.document }).from(table).orderBy(asc(table.id));
   const rows = values.map(row => {
     if (typeof row.moment !== 'string' || !/^\d{4}-\d\d-\d\dT.*Z$/.test(row.moment)) throw new Error('instant must preserve canonical string precision');
     return [String(row.id), row.big, row.precise, row.moment.replace('T', ' ').replace(/Z$/, '+00'), row.sqlNull, JSON.stringify(row.document)];
