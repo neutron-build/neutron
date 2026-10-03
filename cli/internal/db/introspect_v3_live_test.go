@@ -54,6 +54,16 @@ func TestV3NativeQualifiedRoutinesTypesAndReadOnlyRoundTrip(t *testing.T) {
 	}
 	overloads := 0
 	foundDomain, foundComposite, foundProcedure, foundExtension, foundRange, foundShell := false, false, false, false, false, false
+	// Extension scripts may explicitly register the array, while PostgreSQL
+	// also auto-creates internal-dependent arrays. Assert the actual native
+	// membership edge, rather than assuming which pattern the vector package uses.
+	arrayDirect := h.queryOne(`SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_type t ON t.oid=d.objid JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace JOIN pg_catalog.pg_extension x ON x.oid=d.refobjid WHERE d.classid='pg_catalog.pg_type'::pg_catalog.regclass AND d.refclassid='pg_catalog.pg_extension'::pg_catalog.regclass AND d.deptype='e' AND n.nspname='beta' AND t.typname='_vector' AND x.extname='vector')::pg_catalog.text`) == "true"
+	arrayOwnership := "internal-dependent"
+	if arrayDirect {
+		arrayOwnership = "direct"
+	} else if h.queryOne(`SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_type a ON a.oid=d.objid JOIN pg_catalog.pg_namespace n ON n.oid=a.typnamespace JOIN pg_catalog.pg_type element ON element.oid=d.refobjid JOIN pg_catalog.pg_depend member ON member.classid=d.refclassid AND member.objid=element.oid JOIN pg_catalog.pg_extension x ON x.oid=member.refobjid WHERE d.classid='pg_catalog.pg_type'::pg_catalog.regclass AND d.refclassid='pg_catalog.pg_type'::pg_catalog.regclass AND d.deptype='i' AND member.deptype='e' AND member.refclassid='pg_catalog.pg_extension'::pg_catalog.regclass AND n.nspname='beta' AND a.typname='_vector' AND element.typname='vector' AND x.extname='vector')::pg_catalog.text`) != "true" {
+		t.Fatal("native vector array has neither direct nor internal extension ownership")
+	}
 	foundExtensionArray := false
 	policies, triggers := 0, 0
 	foundExtensionMembers := false
@@ -109,14 +119,16 @@ func TestV3NativeQualifiedRoutinesTypesAndReadOnlyRoundTrip(t *testing.T) {
 			}
 		}
 		if entry.Identity.Catalog == "pg_type" && entry.Identity.Schema == "Alpha" && entry.Identity.Name == "uuid" {
-			foundComposite = entry.Kind == "composite" && len(entry.Parts) == 2 && entry.Parts[0].Name == "Case Field" && entry.Parts[1].Name == "select"
-			if !foundComposite || entry.Parts[1].Type == nil || *entry.Parts[1].Type != (V2Identity{Schema: "Alpha", Name: "int4"}) {
+			attributes := v3PartsOfKind(entry.Parts, "attribute")
+			foundComposite = entry.Kind == "composite" && len(attributes) == 2 && attributes[0].Name == "Case Field" && attributes[1].Name == "select"
+			if !foundComposite || attributes[1].Type == nil || *attributes[1].Type != (V2Identity{Schema: "Alpha", Name: "int4"}) {
 				t.Fatal("composite physical order/domain identity lost")
 			}
 		}
 		if entry.Identity.Catalog == "pg_proc" && entry.Identity.Schema == "beta" && entry.Identity.Name == "procedure name" {
 			foundProcedure = entry.Kind == "procedure" && len(entry.Identity.Arguments) == 1 && entry.Identity.Arguments[0] == (V2Identity{Schema: "pg_catalog", Name: "int4"})
-			if len(entry.Parts) != 1 || entry.Parts[0].Attributes["mode"] != "b" {
+			arguments := v3PartsOfKind(entry.Parts, "argument")
+			if len(arguments) != 1 || arguments[0].Attributes["mode"] != "b" {
 				t.Fatal("INOUT mode disappeared")
 			}
 		}
@@ -124,7 +136,7 @@ func TestV3NativeQualifiedRoutinesTypesAndReadOnlyRoundTrip(t *testing.T) {
 			foundExtension = entry.Extension == "vector" && !entry.Managed
 		}
 		if entry.Identity.Catalog == "pg_type" && entry.Identity.Schema == "beta" && entry.Identity.Name == "_vector" {
-			foundExtensionArray = entry.Extension == "vector" && entry.Attributes["extensionOwnership"] == "internal-dependent"
+			foundExtensionArray = entry.Extension == "vector" && entry.Attributes["extensionOwnership"] == arrayOwnership
 		}
 		if entry.Identity.Catalog == "pg_type" && entry.Identity.Schema == "beta" && entry.Identity.Name == "custom_range" {
 			foundRange = entry.Kind == "range" && entry.References["rangeSubtype"] == (V2Identity{Schema: "pg_catalog", Name: "int4"}) && entry.References["multirange"].Name != ""
@@ -188,4 +200,14 @@ func TestV3NativeQualifiedRoutinesTypesAndReadOnlyRoundTrip(t *testing.T) {
 	if recreated.SHA256Hex != doc.SHA256Hex {
 		t.Fatal("ephemeral object OID changed portable hash")
 	}
+}
+
+func v3PartsOfKind(parts []V3InventoryPart, kind string) []V3InventoryPart {
+	selected := []V3InventoryPart{}
+	for _, part := range parts {
+		if part.Kind == kind {
+			selected = append(selected, part)
+		}
+	}
+	return selected
 }
