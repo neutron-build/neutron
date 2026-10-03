@@ -508,3 +508,18 @@ is never logged. The test database must permit fixture role provisioning.
 ```sh
 go test ./orm -run TestPostgresLeastPrivilegeTenantRLSAndPoolReset -count=1 -v
 ```
+
+
+`SeekAfter(table, query, uniqueColumns, cursorAssignments)` adds a bound
+lexicographic predicate for the complete query order. It handles ties, mixed
+ascending/descending order and explicit/default NULL placement without OFFSET.
+The cursor must supply every ordered column exactly in order; the declared
+nonnullable unique key must appear in that order. The database schema must
+enforce the declared uniqueness; metadata does not certify it. Values and query
+builders remain immutable. Ordinary READ COMMITTED keyset pages are not a
+consistent snapshot under concurrent insert/update/delete; use an appropriate
+owned transaction when one snapshot is required.
+
+```sh
+go test ./orm -run 'Test(KeysetNullLexicographicAndUniqueAdmission|PostgresKeysetTiesAndNullOrdering)' -count=1 -v
+```
