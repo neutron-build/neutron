@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased]
+## [core 0.3.1, cli 0.3.1, create-neutron 0.1.8] - 2026-10-03
 
 ### Changed
 
