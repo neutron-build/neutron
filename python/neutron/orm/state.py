@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Generic, TypeVar
 from .core import OrmError
-from .mapping import ModelMapping
+from .mapping import ModelMapping, same_value
 T=TypeVar('T')
 
 class ObjectState(str,Enum):
@@ -54,7 +54,7 @@ class StateStore:
     def dirty(self,record: Record[Any]) -> dict[str,Any]:
         current=record.mapping.snapshot(record.obj)
         if record.mapping.key(current)!=record.mapping.key(record.baseline): raise OrmError('primary-key mutation unsupported')
-        return {name:value for name,value in current.items() if value != record.baseline[name]}
+        return {name:value for name,value in current.items() if not same_value(value,record.baseline[name])}
 
     def flushed(self,record: Record[Any],values: dict[str,Any]) -> None:
         record.mapping.restore(record.obj,values)

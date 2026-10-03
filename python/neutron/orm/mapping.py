@@ -5,6 +5,11 @@ import types
 from types import MappingProxyType
 from typing import Any, Generic, Mapping, TypeVar, get_args, get_origin, get_type_hints, Union
 from .core import Column, OMIT, OrmError, Table
+from decimal import Decimal
+
+def same_value(left: Any,right: Any) -> bool:
+    if isinstance(left,Decimal) and isinstance(right,Decimal) and left.is_nan() and right.is_nan(): return True
+    return bool(left == right)
 
 T=TypeVar('T')
 
@@ -49,7 +54,10 @@ class ModelMapping(Generic[T]):
         values={}
         for name,column in self.field_columns.items():
             value=row[column.name];column.spec.check(value);values[name]=value
-        return self.model_type(**values)
+        obj=self.model_type(**values)
+        if any(not same_value(getattr(obj,name),value) for name,value in values.items()):
+            raise ValueError("model constructor changed persisted field values")
+        return obj
 
     def restore(self,obj: T,values: Mapping[str,Any]) -> None:
         for name,value in values.items(): setattr(obj,name,value)

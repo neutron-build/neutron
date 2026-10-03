@@ -130,6 +130,7 @@ class Database:
                     self._discard()
                     if isinstance(cleanup,Exception): raise _native(cleanup) from cleanup
                     raise
+                if isinstance(body,OrmError) and body.outcome is None: body.outcome="aborted"
                 raise
             else:
                 try: native.__exit__(None,None,None)
@@ -275,6 +276,7 @@ class AsyncDatabase:
                     self._discard()
                     if isinstance(cleanup,Exception): raise _native(cleanup) from cleanup
                     raise
+                if isinstance(body,OrmError) and body.outcome is None: body.outcome="aborted"
                 raise
             else:
                 try: await native.__aexit__(None,None,None)
