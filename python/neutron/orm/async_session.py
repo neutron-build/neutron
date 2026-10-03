@@ -12,6 +12,7 @@ from .state import ObjectState
 T=TypeVar('T')
 
 class AsyncSession(_SessionState):
+    _database: AsyncDatabase
     def __init__(self,database: AsyncDatabase,*,autobegin: bool=True,autoflush: bool=True,close_database: bool=False) -> None:
         super().__init__(autobegin=autobegin,autoflush=autoflush)
         self._database=database;self._transaction: AsyncTransactionHandle | None=None

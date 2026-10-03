@@ -91,6 +91,7 @@ class _SessionState:
 
 
 class Session(_SessionState):
+    _database: Database
     """Scalar dataclass identity/flush lifecycle. No relationships or lazy I/O."""
     def __init__(self,database: Database,*,autobegin: bool=True,autoflush: bool=True,close_database: bool=False) -> None:
         super().__init__(autobegin=autobegin,autoflush=autoflush)
