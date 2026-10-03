@@ -455,3 +455,21 @@ test("a malformed exit frame surfaces as a problem, not a raw SyntaxError", asyn
     },
   );
 });
+
+
+test("SandboxExecutor sends per-command environment without rewriting the command", async () => {
+  const bodies: Array<Record<string, unknown>> = [];
+  const fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body)));
+    return new Response('event: exit\ndata: {"exitCode":0,"timedOut":false}\n\n', {
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as typeof globalThis.fetch;
+  const sandbox = SandboxExecutor.attach("env-run", { baseURL: "http://127.0.0.1:7070", token: "test", fetch });
+  const env = { PREVIEW_URL: 'https://preview.example.test/a path?$literal=#quoted', EMPTY: "" };
+  const command = 'printf "%s" "$PREVIEW_URL"';
+  await sandbox.exec(command, { env, cwd: "/work", timeoutMs: 1250 });
+  assert.deepEqual(bodies[0], { cmd: command, env, cwd: "/work", timeoutSec: 2 });
+  await sandbox.exec("true");
+  assert.equal(Object.hasOwn(bodies[1]!, "env"), false, "legacy callers omit the field");
+});
