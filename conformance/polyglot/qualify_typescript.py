@@ -14,6 +14,8 @@ package = root / 'typescript/packages/neutron-sql'
 
 def run(argv, cwd=consumer, live=False):
     env = dict(os.environ)
+    for key in ['NODE_OPTIONS','NODE_PATH','PYTHONPATH','PYTHONHOME']:
+        env.pop(key,None)
     if not live:
         for key in list(env):
             if key.endswith('DATABASE_URL') or key == 'NEUTRON_SQL_TEST_URL':
@@ -58,12 +60,14 @@ try:
         manifest = consumer / f'{driver}-cases.json'
         manifest.write_text(json.dumps({'protocol': 'polyglot-conformance-v1', 'cases': [{'id': 'scalar-extremes', 'kind': 'adapter-read', 'command': command}]}))
         manifests.append(manifest)
+    (consumer / 'toolchain.txt').write_text(run(['node','--version']) + run([sys.executable,'-I','--version']))
     paths = [p for p in consumer.rglob('*') if p.is_file() and not p.is_symlink()]
     artifacts = consumer / 'artifacts.json'
     artifacts.write_text(json.dumps({'files': [{'path': str(p.relative_to(consumer)), 'sha256': hashlib.sha256(p.read_bytes()).hexdigest()} for p in sorted(paths)]}))
     results = []
     for driver, manifest in zip(versions, manifests):
-        output = run([sys.executable, '-B', str(tooling / 'runner.py'), '--manifest', str(manifest),
+        bootstrap = "import runpy,sys;sys.path.insert(0,sys.argv.pop(1));runpy.run_path(sys.argv.pop(1),run_name='__main__')"
+        output = run([sys.executable, '-I', '-B', '-c', bootstrap, str(tooling), str(tooling / 'runner.py'), '--manifest', str(manifest),
             '--artifact-manifest', str(artifacts), '--artifact-root', str(consumer), '--required'], live=True)
         result = json.loads(output)
         if result.get('status') != 'pass' or result.get('executed') != 1 or result.get('kind') != 'adapter-conformance':
