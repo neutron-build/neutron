@@ -25,7 +25,7 @@ func TestPostgresDimensionPreservingArraysAndBytea(t *testing.T) {
 	if _, err := admin.Exec(ctx, "CREATE TABLE "+name+` (id bigint PRIMARY KEY,"values" bigint[] NOT NULL,optional bigint[],documents jsonb[] NOT NULL,blob bytea NOT NULL,nullable_blob bytea); INSERT INTO `+name+` VALUES (1,'[-2:-1][5:6]={{9223372036854775807,NULL},{-9223372036854775808,0}}',NULL,ARRAY['null'::jsonb,NULL::jsonb,'{"n":9007199254740993}'::jsonb],decode('00ff5c01','hex'),NULL),(2,'{}','{}','{}',decode('','hex'),decode('','hex'))`); err != nil {
 		t.Fatal(err)
 	}
-	table, err := NewTable[arrayModel](schema, "array_values")
+	table, err := NewPostgresTable[arrayModel](ctx, admin, schema, "array_values")
 	if err != nil {
 		t.Fatal(err)
 	}

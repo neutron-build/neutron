@@ -657,3 +657,19 @@ timestamptz retains the instant, not the original named zone/offset.
 ```sh
 go test ./orm -run 'Test(RangeNative|FiniteTemporal|PostgresRangesAndFinite)' -count=1 -v
 ```
+
+`NewPostgresTable` adds native qualified catalog admission before returning
+write-capable metadata: mapped types and nullability must match the accepted OID
+matrix. Domains retain their native identity and constraints while their base
+codec is qualified; `Enum` preserves exact labels with native membership checks.
+Unknown composites/custom base OIDs, enum-as-string, numeric-as-float and wrong
+range subtypes refuse with schema/table/column/type/OID identity before any
+mutation. No DDL, registry changes or search_path assumptions occur. This is
+point-in-time metadata for that database: rebuild it after DDL. Database-free
+`NewTable` validates Go shape and does not certify PostgreSQL catalog types.
+Preserving refusal leaves unsupported objects and values intact; it does not
+claim typed composite, network, pgvector or multirange support.
+
+```sh
+go test ./orm -run 'Test(CatalogCodecMatrix|PostgresCatalogEnumDomain)' -count=1 -v
+```

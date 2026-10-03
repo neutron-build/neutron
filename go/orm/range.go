@@ -68,6 +68,7 @@ func (r Range[T]) Bounds() (any, any)                               { return r.l
 func (r Range[T]) ormScalarValid() bool                             { return r.valid }
 func (r Range[T]) ormScalarType() bool                              { return rangeElementType[T]() }
 func (r Range[T]) ormRangeType()                                    {}
+func (r Range[T]) ormRangeElement() reflect.Type                    { return reflect.TypeOf((*T)(nil)).Elem() }
 func (r *Range[T]) ormDestination() any                             { return &rangeDestination[T]{target: r} }
 
 type rangeDestination[T any] struct {

@@ -25,7 +25,7 @@ func TestPostgresRangesAndFiniteTemporalComponents(t *testing.T) {
 	if _, err := admin.Exec(ctx, "CREATE TABLE "+name+` (id bigint PRIMARY KEY,span int8range NOT NULL,exact numrange NOT NULL,calendar date NOT NULL,clock time NOT NULL,duration interval NOT NULL,optional int8range); INSERT INTO `+name+` VALUES (1,'[0,9223372036854775807)','[9007199254740993.123456789,9007199254740994.987654321)','2024-02-29','24:00:00','-14 months 3 days -00:02:03.456789',NULL),(2,'empty','(,)','2000-01-01','00:00:00.000001','0 seconds','empty')`); err != nil {
 		t.Fatal(err)
 	}
-	table, err := NewTable[rangeTemporalModel](schema, "range_temporal")
+	table, err := NewPostgresTable[rangeTemporalModel](ctx, admin, schema, "range_temporal")
 	if err != nil {
 		t.Fatal(err)
 	}
