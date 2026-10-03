@@ -501,3 +501,32 @@ async def test_native_async_swallowed_failure_and_savepoint_poison_reset(mapped)
                     with pytest.raises(OrmError): await db.execute(insert(m.table,{'name':'outer','active':True}))
             await db.execute(insert(m.table,{'name':'after_child','active':True}))
         assert native.execute(f'SELECT name FROM {m.table.sql} ORDER BY name').fetchall()==[('after_child',),('outer',)]
+
+
+def test_native_swallowed_read_failure_poisoned_known_aborted(mapped):
+    from neutron.orm import Predicate,select_row
+    url,m,native=mapped
+    with Database.connect(url) as db:
+        with pytest.raises(OrmError) as aborted:
+            with db.transaction():
+                with pytest.raises(OrmError) as read:
+                    db.all(select_row(m.table).where(Predicate('1/0=1',(),frozenset({m.table}))))
+                assert read.value.sqlstate=='22012'
+        assert aborted.value.outcome=='aborted' and not db.closed
+
+@pytest.mark.asyncio
+async def test_native_caught_query_cancellation_cannot_report_commit(mapped):
+    from neutron.orm import Mutation
+    url,m,native=mapped
+    async with await AsyncDatabase.connect(url) as db:
+        started=asyncio.Event()
+        async def request():
+            with pytest.raises(OrmError) as aborted:
+                async with db.transaction():
+                    started.set()
+                    with pytest.raises(asyncio.CancelledError): await db.execute(Mutation('SELECT pg_sleep(%s)',(2,)))
+            return aborted.value.outcome
+        task=asyncio.create_task(request());await started.wait();await asyncio.sleep(0.05);task.cancel()
+        assert await task=='aborted'
+        assert not db.closed
+        async with db.transaction(): assert await db.execute(Mutation('SELECT 1',()))==1

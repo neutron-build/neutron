@@ -187,3 +187,14 @@ async def test_async_lifecycle_adapter_owner_and_terminal():
     with pytest.raises(SessionBusyError): await asyncio.create_task(foreign())
     await tx.rollback();assert tx.state=='aborted'
     with pytest.raises(OrmError): await tx.rollback()
+
+
+def test_caught_dispatch_keyboard_interrupt_poisoned_before_handle_commit():
+    class Interrupted(Cursor):
+        def execute(self,*args): raise KeyboardInterrupt()
+    class InterruptedConnection(Connection):
+        def cursor(self): return Interrupted([])
+    db=Database(InterruptedConnection([]));tx=db.begin()
+    with pytest.raises(KeyboardInterrupt): db.all(QUERY)
+    with pytest.raises(OrmError) as caught: tx.commit()
+    assert caught.value.outcome=='aborted' and tx.state=='aborted'
