@@ -7,7 +7,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Sequence, T
 from .client import AsyncDatabase
 from .core import CardinalityError, OrmError, Predicate, SessionBusyError, delete, insert, select_row, update, Mutation
 from .lifecycle import AsyncTransactionHandle
-from .events import EVENT_NAMES, EventName, SessionEvent
+from .events import EVENT_NAMES, EventName, SessionEvent, PostCommitError, PostCommitCancelledError, PostCommitInterruptedError
 from .instrumentation import expire_attributes
 from .mapping import ModelMapping
 from .session import ConflictError, _SessionState
@@ -179,6 +179,7 @@ class AsyncSession(_SessionState):
                     except CardinalityError as exc: raise ConflictError('mapped write did not affect exactly one row') from exc
                     self._flushed_row(record,row)
             await self._emit('after_flush')
+            if self._plan(): raise OrmError('after_flush callback introduced unflushed state; rollback required')
         except BaseException:
             self._failed=True;raise
 
@@ -212,9 +213,13 @@ class AsyncSession(_SessionState):
         else: self._store.committed()
         finally: self._transaction=None
         self._links.clear()
-        if self.expire_on_commit:
-            for record in self._store.records.values(): self._store.expire(record,frozenset(record.mapping.field_columns),discard_changes=False)
-        await self._emit('after_commit')
+        try:
+            if self.expire_on_commit:
+                for record in self._store.records.values(): self._store.expire(record,frozenset(record.mapping.field_columns),discard_changes=False)
+            await self._emit('after_commit')
+        except asyncio.CancelledError as exc: raise PostCommitCancelledError() from exc
+        except KeyboardInterrupt as exc: raise PostCommitInterruptedError() from exc
+        except Exception as exc: raise PostCommitError() from exc
 
     async def rollback(self) -> None:
         self._guard(allow_failed=True)

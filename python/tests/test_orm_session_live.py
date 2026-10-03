@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import asyncio
 import pytest
-from neutron.orm import AsyncDatabase, AsyncSession, ColumnSpec, ConflictError, Database, ModelMapping, ObjectState, OrmError, Session, SessionBusyError, Table
+from neutron.orm import PostCommitError,AsyncDatabase, AsyncSession, ColumnSpec, ConflictError, Database, ModelMapping, ObjectState, OrmError, Session, SessionBusyError, Table
 from .test_orm_live import live_table
 
 @dataclass
@@ -225,7 +225,8 @@ def test_native_hook_exception_reentrancy_and_after_commit_outcome(mapped):
         obj=User(name='durable');session.add(m,obj)
         def fail(event): raise RuntimeError('application callback failed')
         session.listen('after_commit',fail)
-        with pytest.raises(RuntimeError): session.commit()
+        with pytest.raises(PostCommitError) as notification: session.commit()
+        assert notification.value.outcome=='committed'
         assert session.object_state(obj) is ObjectState.PERSISTENT
         assert native.execute(f'SELECT name FROM {m.table.sql}').fetchone()==('durable',)
         # A postcommit notification failure must never undo the known result.
@@ -433,3 +434,16 @@ def test_native_savepoint_exit_flushes_constraints_inside_boundary(mapped):
         assert duplicate.value.sqlstate=='23505' and a.id is None and b.id is None
         good=User(name='survives');session.add(m,good);session.commit()
         assert native.execute(f'SELECT name FROM {m.table.sql}').fetchall()==[('survives',)]
+
+@pytest.mark.asyncio
+async def test_native_async_postcommit_cancel_has_known_committed_outcome(mapped):
+    from neutron.orm import PostCommitCancelledError
+    url,m,native=mapped
+    async with await AsyncSession.connect(url) as session:
+        obj=User(name='durable');session.add(m,obj)
+        async def cancel(event): raise asyncio.CancelledError()
+        session.listen('after_commit',cancel)
+        with pytest.raises(PostCommitCancelledError) as caught: await session.commit()
+        assert caught.value.outcome=='committed'
+        assert native.execute(f'SELECT name FROM {m.table.sql}').fetchone()==('durable',)
+        assert session.object_state(obj) is ObjectState.PERSISTENT

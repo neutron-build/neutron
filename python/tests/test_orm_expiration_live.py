@@ -77,3 +77,15 @@ def test_native_closed_expired_object_requires_explicit_reattachment(expiration)
     with Session.connect(url) as other:
         assert other.attach_existing(m,obj,discard_changes=True) is obj
         assert obj.name=='fresh'
+
+
+def test_native_after_flush_edit_refuses_before_commit_with_expiration(expiration):
+    url,m,native=expiration
+    with Session.connect(url,expire_on_commit=True) as session:
+        obj=session.get(m,1)
+        def edit(event): obj.name='hook_edit'
+        session.listen('after_flush',edit)
+        obj.name='requested'
+        with pytest.raises(OrmError,match='unflushed'): session.commit()
+        assert native.execute(f'SELECT name FROM {m.table.sql}').fetchone()==('original',)
+        session.rollback();assert obj.name=='original'

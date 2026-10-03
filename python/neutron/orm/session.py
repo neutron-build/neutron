@@ -7,7 +7,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence, TypeVar
 from .client import AsyncDatabase, Database
 from .core import CardinalityError, OrmError, Predicate, SessionBusyError, delete, insert, select_row, update, Mutation, _bound_quote
 from .lifecycle import TransactionHandle
-from .events import EVENT_NAMES, EventName, SessionEvent
+from .events import EVENT_NAMES, EventName, SessionEvent, PostCommitError, PostCommitInterruptedError
 from .instrumentation import expire_attributes
 from .mapping import ModelMapping, same_column_value
 from .state import ObjectState, Record, StateStore
@@ -462,6 +462,7 @@ class Session(_SessionState):
                     except CardinalityError as exc: raise ConflictError('mapped write did not affect exactly one row') from exc
                     self._flushed_row(record,row)
             self._emit('after_flush')
+            if self._plan(): raise OrmError('after_flush callback introduced unflushed state; rollback required')
         except BaseException:
             self._failed=True;raise
 
@@ -495,9 +496,12 @@ class Session(_SessionState):
         else: self._store.committed()
         finally: self._transaction=None
         self._links.clear()
-        if self.expire_on_commit:
-            for record in self._store.records.values(): self._store.expire(record,frozenset(record.mapping.field_columns),discard_changes=False)
-        self._emit('after_commit')
+        try:
+            if self.expire_on_commit:
+                for record in self._store.records.values(): self._store.expire(record,frozenset(record.mapping.field_columns),discard_changes=False)
+            self._emit('after_commit')
+        except KeyboardInterrupt as exc: raise PostCommitInterruptedError() from exc
+        except Exception as exc: raise PostCommitError() from exc
 
     def rollback(self) -> None:
         self._guard(allow_failed=True)

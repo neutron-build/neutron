@@ -440,3 +440,10 @@ rollback/savepoints replace them with independent baseline copies. Retained old
 tree references are not a persistent object handle after restoration. Plain
 unwrapped dict/list fields and PostgreSQL array/range collection codecs remain
 outside this JSONB profile.
+
+Post-flush callbacks may observe state but cannot leave additional unflushed
+edits: those refuse before COMMIT and require rollback. Failure in a postcommit
+notification carries explicit known `outcome='committed'` through PostCommitError,
+PostCommitCancelledError or PostCommitInterruptedError. Async cancellation and
+KeyboardInterrupt retain their respective exception families; the adopted
+committed baseline is never presented as rolled back.
