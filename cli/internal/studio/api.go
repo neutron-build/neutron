@@ -272,7 +272,7 @@ type taggedResult struct {
 }
 
 // collectTaggedRows drains a pgx result, converting every cell of a tagged
-// type (int8/numeric/bytea/temporal) to its {t, v} wire form so precision
+// type (int8/numeric/bytea/temporal and JSON documents) to its {t, v} wire form so precision
 // survives JSON. Execution errors surface after iteration (pgx behavior).
 func collectTaggedRows(rows pgx.Rows) (*taggedResult, error) {
 	return collectTaggedRowsCapped(rows, 0)

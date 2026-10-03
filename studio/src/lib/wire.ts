@@ -1,7 +1,7 @@
 // Tagged wire values for lossless cells over the Studio HTTP transport.
 //
 // The master codec contract pins this format: bigint, decimal, binary and
-// temporal values cross HTTP as tagged strings so precision survives
+// temporal values and JSON documents cross HTTP as tagged strings so precision survives
 // JSON.parse (an int8 sent as a JSON number would arrive as a rounded
 // double). The backend emits tagged cells for those types (cli/internal/
 // studio, landed with the typed row-identity protocol); plain values pass

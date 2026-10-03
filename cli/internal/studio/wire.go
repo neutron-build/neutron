@@ -389,7 +389,7 @@ func taggedCellOf(v any) (taggedCell, bool) {
 //     passed on as their literal text, so PostgreSQL parses the exact digits
 //     into the column type (never a float64 detour). A tagged cell for an
 //     untagged column is a type mismatch and is refused;
-//   - json/jsonb accept only a string holding the JSON text. "null" is JSON
+//   - json/jsonb accept exact JSON text or a matching tagged JSON document. "null" is JSON
 //     null; SQL NULL is the request's explicit isNull / JSON null. Objects
 //     are refused so that a JSON document can never be mistaken for a
 //     tagged cell (or vice versa).
