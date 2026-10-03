@@ -18,9 +18,10 @@ from protocol import PROTOCOL, redact
 ROOT=Path(__file__).resolve().parent
 
 
-def command(argv: list[str], cwd: Path, timeout: float, capture: bool=False) -> str:
+def command(argv: list[str], cwd: Path, timeout: float, capture: bool=False, live: bool=False) -> str:
     env=dict(os.environ)
     for name in ('PYTHONPATH','PYTHONHOME'): env.pop(name,None)
+    if not live: env.pop('NEUTRON_TEST_DATABASE_URL',None)
     env['PIP_DISABLE_PIP_VERSION_CHECK']='1'
     proc=subprocess.Popen(argv,cwd=cwd,env=env,stdin=subprocess.DEVNULL,
                           stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
@@ -81,7 +82,7 @@ def qualify(source: Path, work: Path, timeout: float) -> dict:
         bootstrap="import runpy,sys;sys.path.insert(0,sys.argv.pop(1));runpy.run_path(sys.argv.pop(1),run_name='__main__')"
         output=command([sys.executable,'-I','-B','-c',bootstrap,str(tooling),str(tooling/'runner.py'),'--manifest',str(path),
                         '--artifact-manifest',str(work/'artifacts.json'),'--artifact-root',str(work),
-                        '--required','--timeout',str(timeout)],work,timeout*5,True)
+                        '--required','--timeout',str(timeout)],work,timeout*5,True,live=True)
         result=json.loads(output)
         if result.get('status')!='pass' or result.get('executed')!=1 or result.get('kind')!='adapter-conformance':
             raise ValueError('required packaged Python adapter failed')
