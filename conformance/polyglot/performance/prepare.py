@@ -77,9 +77,9 @@ def prepare(args):
             files.append(identity)
             manifest=extend(root,files)
             for driver in ('pg','postgres'):
-                command=[str(executable),str(adapter),'--module',str(entry)]
-                if driver=='postgres': command.append('--postgres-js')
-                clients['typescript-'+driver]={'command':command,'artifact_root':str(root),'artifact_manifest':manifest}
+                client_command=[str(executable),str(adapter),'--module',str(entry)]
+                if driver=='postgres': client_command.append('--postgres-js')
+                clients['typescript-'+driver]={'command':client_command,'artifact_root':str(root),'artifact_manifest':manifest}
         else:
             source=directory/'main.go';source.write_bytes((Path(__file__).with_name('go')/'main.go').read_bytes())
             for name in ('go.mod','go.sum'): (directory/name).write_bytes((root/'app'/name).read_bytes())
