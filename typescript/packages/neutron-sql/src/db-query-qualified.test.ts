@@ -27,7 +27,7 @@ const rightPostsRelations = relations(rightPosts, ({ one }) => ({ author: one(ri
 test("same-named tables retain qualified identity through nested reads and writes", async () => {
   const driver = recordingDriver();
   const db = await createDatabase({ driver, tables: { leftUsers, rightUsers, leftPosts, rightPosts },
-    relations: { leftUsersRelations, rightUsersRelations, leftPostsRelations, rightPostsRelations } });
+    relations: { leftUsers: leftUsersRelations, rightUsers: rightUsersRelations, leftPosts: leftPostsRelations, rightPosts: rightPostsRelations } });
   const plan = db.query.leftUsers.toSQL({ with: { posts: { where: eq(leftPosts.title, "left"), orderBy: [asc(leftPosts.id)], limit: 1, with: { author: true } } } });
   assert.match(plan.sql, /"tenant\.left"\."users"/);
   assert.match(plan.sql, /"tenant\.left"\."posts"/);
@@ -43,7 +43,7 @@ test("same-named tables retain qualified identity through nested reads and write
 });
 
 test("qualified relation filters cannot bind to a same-named foreign schema", async () => {
-  const db = await createDatabase({ driver: recordingDriver(), tables: { leftUsers, leftPosts }, relations: { leftUsersRelations, leftPostsRelations } });
+  const db = await createDatabase({ driver: recordingDriver(), tables: { leftUsers, leftPosts }, relations: { leftUsers: leftUsersRelations, leftPosts: leftPostsRelations } });
   assert.throws(() => db.query.leftUsers.toSQL({ with: { posts: { where: eq(rightPosts.title, "other tenant") } } }), /own table/);
 });
 

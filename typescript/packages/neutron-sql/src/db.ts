@@ -526,6 +526,15 @@ export async function createDatabase<
     }
   }
 
+  const declarations = new Map<string, AnyPgTable>();
+  for (const [identity, registration] of tables) declarations.set(identity, registration.table);
+  const registerDeclaration = (table: AnyPgTable, label: string): void => {
+    const identity = getTableRelationKey(table);
+    const prior = declarations.get(identity);
+    if (prior !== undefined && prior !== table) throw new Error(`${label}: conflicting table declarations for the same qualified identity`);
+    declarations.set(identity, table);
+  };
+
   const relationSets: TableRelations[] = [];
   const relationsByName = new Map<string, TableRelations>();
   for (const [key, value] of Object.entries(options.relations ?? {})) {
@@ -533,6 +542,8 @@ export async function createDatabase<
     rejectDerivedTable(value.table, `relations.${key}`);
     rejectAliasHandle(value.table, `relations.${key}`);
     validateRelationTargets(value, `relations.${key}`);
+    registerDeclaration(value.table, `relations.${key}`);
+    for (const [edge, relation] of Object.entries(value.entries)) registerDeclaration(relation.targetTable, `relations.${key}.${edge}`);
     relationsByName.set(getTableRelationKey(value.table), value);
     relationSets.push(value);
   }

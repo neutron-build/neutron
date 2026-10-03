@@ -21,7 +21,7 @@ for (const driver of ["pg", "postgres"] as const) {
     const ap = relations(aPosts, ({ one }) => ({ author: one(aUsers, { fields: [aPosts.authorId], references: [aUsers.id] }) }));
     const br = relations(bUsers, ({ many }) => ({ posts: many(bPosts) }));
     const bp = relations(bPosts, ({ one }) => ({ author: one(bUsers, { fields: [bPosts.authorId], references: [bUsers.id] }) }));
-    const db = await createDatabase({ url: url.toString(), driverOptions: { driver }, tables: { aUsers, bUsers, aPosts, bPosts }, relations: { ar, ap, br, bp } });
+    const db = await createDatabase({ url: url.toString(), driverOptions: { driver }, tables: { aUsers, bUsers, aPosts, bPosts }, relations: { aUsers: ar, aPosts: ap, bUsers: br, bPosts: bp } });
     try {
       for (const schema of ["public", "tenant.left", "tenant.right"]) {
         if (schema !== "public") await native.query(`CREATE SCHEMA "${schema}"`);

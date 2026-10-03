@@ -36,6 +36,7 @@ export {
   type PgTable,
   type PgTableCore,
   type PgSchemaBuilder,
+  type SchemaTable,
   type TableMetadata,
   type ViewDefinition,
   type ViewOptions,

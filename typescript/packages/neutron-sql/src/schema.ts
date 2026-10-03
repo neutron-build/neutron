@@ -817,16 +817,19 @@ function makeTable<Cols extends Record<string, AnyColumnBuilder>, N extends stri
  *  select/insert/update/delete and alias joins) renders qualified
  *  references and schema export v2 (Q07) exports these objects under their
  *  schema. The legacy TS DDL emitter (schemaToDDL)
- *  (db.query) reject schema-declared tables. */
-export interface PgSchemaBuilder {
-  readonly schemaName: string;
+ *  rejects schema-declared tables; relational reads/writes retain qualification. */
+export type SchemaTable<Cols extends Record<string, AnyColumnBuilder>, N extends string, S extends string> =
+  PgTable<Cols, N> & { readonly [TABLE_SYMBOL]: TableMetadata<Cols, N> & { readonly schema: S } };
+
+export interface PgSchemaBuilder<S extends string = string> {
+  readonly schemaName: S;
   table<Cols extends Record<string, AnyColumnBuilder>, N extends string = string>(
     name: N,
     columns: Cols,
     extras?: (t: PgTable<Cols, N>) => TableExtra[],
-  ): PgTable<Cols, N>;
+  ): SchemaTable<Cols, N, S>;
   enum<const V extends readonly [string, ...string[]]>(name: string, values: V): PgEnum<V>;
-  view<Cols extends Record<string, AnyColumnBuilder>>(name: string, columns: Cols, opts: ViewOptions): PgTable<Cols>;
+  view<Cols extends Record<string, AnyColumnBuilder>, N extends string = string>(name: N, columns: Cols, opts: ViewOptions): SchemaTable<Cols, N, S>;
 }
 
 function checkSchemaObjectName(value: unknown, who: string): string {
@@ -838,15 +841,15 @@ function checkSchemaObjectName(value: unknown, who: string): string {
   return value;
 }
 
-export function pgSchema(schema: string): PgSchemaBuilder {
+export function pgSchema<const S extends string>(schema: S): PgSchemaBuilder<S> {
   if (typeof schema !== "string" || schema.length === 0) throw new Error("pgSchema: schema must be a non-empty string");
   if (schema.includes("\0")) throw new Error("pgSchema: schema must not contain NUL bytes");
   checkSchemaObjectName(schema, "pgSchema: schema");
   return {
     schemaName: schema,
-    table: (name, columns, extras) => makeTable(name, columns, extras, schema),
+    table: (name, columns, extras) => makeTable(name, columns, extras, schema) as SchemaTable<typeof columns, typeof name, S>,
     enum: (name, values) => makeEnum(name, values, schema),
-    view: (name, columns, opts) => makeView(name, columns, opts, schema) as PgTable<never>,
+    view: (name, columns, opts) => makeView(name, columns, opts, schema) as SchemaTable<typeof columns, typeof name, S>,
   };
 }
 
