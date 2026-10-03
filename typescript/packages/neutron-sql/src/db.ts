@@ -57,11 +57,11 @@ import {
 import type { ValueNode } from "./ast.js";
 import {
   getTableName,
-  getTableSchema,
+  getTableRelationKey,
   isPgTable,
   isTableRelations,
   rejectDerivedTable,
-  rejectQualifiedRelationTargets,
+  validateRelationTargets,
   type AnyColumnBuilder,
   type AnyPgTable,
   type ColumnBuilder,
@@ -518,14 +518,9 @@ export async function createDatabase<
   for (const [key, value] of Object.entries(options.tables ?? {})) {
     if (isPgTable(value)) {
       rejectDerivedTable(value, `tables.${key}`);
-      const schema = getTableSchema(value);
-      if (schema !== undefined) {
-        throw new Error(
-          `tables.${key}: "${schema}"."${getTableName(value)}" declares a schema — relational reads (db.query) on schema-qualified tables land with Q05/Q07. ` +
-            `CRUD select/insert/update/delete and alias joins support them without registering them in \`tables\``,
-        );
-      }
-      tables.set(getTableName(value), { key, table: value });
+      const identity = getTableRelationKey(value);
+      if (tables.has(identity)) throw new Error(`tables.${key}: table identity is registered more than once`);
+      tables.set(identity, { key, table: value });
     }
   }
 
@@ -534,19 +529,13 @@ export async function createDatabase<
   for (const [key, value] of Object.entries(options.relations ?? {})) {
     if (!isTableRelations(value)) continue;
     rejectDerivedTable(value.table, `relations.${key}`);
-    const schema = getTableSchema(value.table);
-    if (schema !== undefined) {
-      throw new Error(
-        `relations.${key}: "${schema}"."${getTableName(value.table)}" declares a schema — relational reads on schema-qualified tables land with Q05/Q07`,
-      );
-    }
-    rejectQualifiedRelationTargets(value, `relations.${key}`);
-    relationsByName.set(getTableName(value.table), value);
+    validateRelationTargets(value, `relations.${key}`);
+    relationsByName.set(getTableRelationKey(value.table), value);
     relationSets.push(value);
   }
   const resolved = resolveRelations(relationSets);
   const relationsByTable = new Map<string, Record<string, Relation>>();
-  for (const r of relationSets) relationsByTable.set(getTableName(r.table), r.entries);
+  for (const r of relationSets) relationsByTable.set(getTableRelationKey(r.table), r.entries);
   void resolved;
 
   const ctx: ExecContext = { driver, logger, capabilities };
@@ -561,9 +550,9 @@ export async function createDatabase<
   });
 
   const makeQuery = (context: ExecContext, atomic: AtomicRunner): QueryApi => {
-    const api: QueryApi = {};
+    const api: QueryApi = Object.create(null);
     for (const { key, table } of tables.values()) {
-      const entries = relationsByTable.get(getTableName(table)) ?? {};
+      const entries = relationsByTable.get(getTableRelationKey(table)) ?? {};
       // Nested writes compile (and validate) BEFORE any connection is touched;
       // only a valid plan opens the transaction. The compile itself runs
       // inside an async entry so planning rejections surface as promise

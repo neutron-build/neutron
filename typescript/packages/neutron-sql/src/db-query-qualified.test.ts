@@ -1,115 +1,54 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
-  createDatabase,
-  integer,
-  pgSchema,
-  pgTable,
-  relations,
-  serial,
-  text,
-  type Driver,
-  type PinnedExecutor,
-} from "./index.js";
-
-// Gap 1.20 regression: relational reads (db.query) refuse schema-qualified
-// tables BY DESIGN — CRUD select/insert/update/delete and alias joins render
-// qualified references, nested reads do not (documented on pgSchema and the
-// TableMetadata schema field). This pins the two documented runtime refusal
-// paths (db.ts tables/relations registration) through the public setup API
-// so they cannot silently break: registering a pgSchema-declared table, or a
-// relation set owned by one, must fail closed inside createDatabase BEFORE
-// any statement reaches the driver — zero queries, zero mutation. The fake
-// driver below is the db-scope.test.ts recording pattern: it only proves no
-// statement was issued; no database behavior is claimed here.
+import { createDatabase, eq, asc, pgSchema, integer, text, relations, type Driver } from "./index.js";
 
 function recordingDriver(): Driver & { statements: string[] } {
   const statements: string[] = [];
-  const record = (sqlText: string): void => {
-    statements.push(sqlText);
-  };
-  const pin: PinnedExecutor = {
-    async query<T>(sqlText: string): Promise<T[]> {
-      record(sqlText);
-      return [] as T[];
-    },
-    async execute(sqlText: string): Promise<number> {
-      record(sqlText);
-      return 0;
-    },
-    release(): void {},
-  };
   const driver: Driver = {
-    async query<T>(sqlText: string): Promise<T[]> {
-      record(sqlText);
-      return [] as T[];
-    },
-    async execute(sqlText: string): Promise<number> {
-      record(sqlText);
-      return 0;
-    },
-    async begin<T>(fn: (tx: Driver) => Promise<T>): Promise<T> {
-      return fn(driver);
-    },
-    async close(): Promise<void> {},
-    lifecycle: { ownership: "borrowed", terminated: false, terminate: () => Promise.resolve() },
-    pin: () => Promise.resolve(pin),
+    async query<T>(sql: string): Promise<T[]> { statements.push(sql); return []; },
+    async execute(sql: string) { statements.push(sql); return 0; },
+    async begin<T>(fn: (tx: Driver) => Promise<T>) { return fn(driver); },
+    async close() {},
+    lifecycle: { ownership: "borrowed", terminated: false, async terminate() {} },
   };
   return Object.assign(driver, { statements });
 }
+const left = pgSchema("tenant.left");
+const right = pgSchema("tenant.right");
+const leftUsers = left.table("users", { id: integer("id").primaryKey(), name: text("name") });
+const rightUsers = right.table("users", { id: integer("id").primaryKey(), name: text("name") });
+const leftPosts = left.table("posts", { id: integer("id").primaryKey(), authorId: integer("author_id"), title: text("title") });
+const rightPosts = right.table("posts", { id: integer("id").primaryKey(), authorId: integer("author_id"), title: text("title") });
+const leftUsersRelations = relations(leftUsers, ({ many }) => ({ posts: many(leftPosts) }));
+const leftPostsRelations = relations(leftPosts, ({ one }) => ({ author: one(leftUsers, { fields: [leftPosts.authorId], references: [leftUsers.id] }) }));
+const rightUsersRelations = relations(rightUsers, ({ many }) => ({ posts: many(rightPosts) }));
+const rightPostsRelations = relations(rightPosts, ({ one }) => ({ author: one(rightUsers, { fields: [rightPosts.authorId], references: [rightUsers.id] }) }));
 
-const alt = pgSchema("alt");
-const altUsers = alt.table("users", {
-  id: serial("id").primaryKey(),
-  name: text("name").notNull(),
-});
-const altPosts = alt.table("posts", {
-  id: serial("id").primaryKey(),
-  authorId: integer("author_id").notNull(),
-});
-const users = pgTable("users", {
-  id: serial("id").primaryKey(),
-  name: text("name").notNull(),
-});
-const posts = pgTable("posts", {
-  id: serial("id").primaryKey(),
-  authorId: integer("author_id").notNull(),
-  title: text("title").notNull(),
-});
-const postsRelations = relations(posts, ({ one }) => ({
-  author: one(users, { fields: [posts.authorId], references: [users.id] }),
-}));
-const altPostsRelations = relations(altPosts, ({ one }) => ({
-  author: one(users, { fields: [altPosts.authorId], references: [users.id] }),
-}));
-
-test("db.query setup refuses a schema-qualified table before any driver statement", async () => {
+test("same-named tables retain qualified identity through nested reads and writes", async () => {
   const driver = recordingDriver();
-  await assert.rejects(
-    createDatabase({ driver, tables: { altUsers } }),
-    /tables\.altUsers: "alt"\."users" declares a schema — relational reads \(db\.query\) on schema-qualified tables/,
-  );
+  const db = await createDatabase({ driver, tables: { leftUsers, rightUsers, leftPosts, rightPosts },
+    relations: { leftUsersRelations, rightUsersRelations, leftPostsRelations, rightPostsRelations } });
+  const plan = db.query.leftUsers.toSQL({ with: { posts: { where: eq(leftPosts.title, "left"), orderBy: [asc(leftPosts.id)], limit: 1, with: { author: true } } } });
+  assert.match(plan.sql, /"tenant\.left"\."users"/);
+  assert.match(plan.sql, /"tenant\.left"\."posts"/);
+  assert.equal(plan.sql.includes('"tenant.right"'), false);
+  assert.deepEqual(plan.params, ["left"]);
+  const other = db.query.rightUsers.toSQL({ with: { posts: true } });
+  assert.match(other.sql, /"tenant\.right"\."posts"/);
+  assert.equal(other.sql.includes('"tenant.left"'), false);
+  const write = db.query.leftUsers.explainCreate({ data: { id: 1, name: "left", posts: { create: [{ id: 2, title: "child" }] } } });
+  assert.match(JSON.stringify(write), /tenant\.left/);
+  assert.equal(JSON.stringify(write).includes('tenant.right'), false);
   assert.equal(driver.statements.length, 0);
 });
 
-test("db.query setup refuses a relation set owned by a schema-qualified table before any driver statement", async () => {
-  const driver = recordingDriver();
-  await assert.rejects(
-    createDatabase({ driver, tables: { users }, relations: { altPosts: altPostsRelations } }),
-    /relations\.altPosts: "alt"\."posts" declares a schema — relational reads on schema-qualified tables/,
-  );
-  assert.equal(driver.statements.length, 0);
+test("qualified relation filters cannot bind to a same-named foreign schema", async () => {
+  const db = await createDatabase({ driver: recordingDriver(), tables: { leftUsers, leftPosts }, relations: { leftUsersRelations, leftPostsRelations } });
+  assert.throws(() => db.query.leftUsers.toSQL({ with: { posts: { where: eq(rightPosts.title, "other tenant") } } }), /own table/);
 });
 
-test("db.query setup control: the same driver accepts plain tables and compiles nested reads", async () => {
-  // Positive control proving the refusals above are the schema boundary,
-  // not the setup path generally: plain tables + a plain relation register
-  // fine, db.query compiles (toSQL never touches the driver), and still no
-  // statement has been issued.
+test("duplicate physical registration is refused before SQL", async () => {
   const driver = recordingDriver();
-  const db = await createDatabase({ driver, tables: { users, posts }, relations: { posts: postsRelations } });
-  const compiled = db.query.posts.toSQL({ with: { author: true } });
-  assert.ok(compiled.sql.includes('as "__rel_author"'), compiled.sql);
+  await assert.rejects(createDatabase({ driver, tables: { first: leftUsers, second: leftUsers } }), /registered more than once/);
   assert.equal(driver.statements.length, 0);
-  await db.close();
 });

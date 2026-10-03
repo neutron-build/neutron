@@ -451,6 +451,16 @@ export function getTableSchema(table: AnyPgTable): string | undefined {
   return tableMetaOf(table, "getTableSchema").schema;
 }
 
+/** Internal relational identity. Keep legacy bare keys for unqualified tables;
+ *  PostgreSQL forbids NUL in identifiers, so qualified keys cannot collide
+ *  with any legal unqualified table name (including names containing dots). */
+export function getTableRelationKey(table: AnyPgTable): string {
+  const name = getTableName(table);
+  const schema = getTableSchema(table);
+  if (name.includes("\0") || schema?.includes("\0")) throw new Error("table identifiers cannot contain NUL");
+  return schema === undefined ? name : `${schema}\0${name}`;
+}
+
 /** Reference parts for a table: `[name]` or `[schema, name]`. Every query
  *  layer site that builds a table-qualified reference funnels through here so
  *  same-name tables in different schemas can never address each other. */
@@ -1248,18 +1258,12 @@ export function isTableRelations(value: unknown): value is TableRelations {
   );
 }
 
-/** Fail closed when a relation entry's TARGET table is schema-qualified:
- *  relational reads resolve targets by bare table name and render unqualified
- *  `from` entries, so a pgSchema-declared target would silently read the
- *  search-path twin instead of the declared table. */
-export function rejectQualifiedRelationTargets(set: TableRelations, who: string): void {
+/** Resolve target metadata before compiling SQL. Derived/CTE identities remain
+ *  unsupported as relation targets; qualified base tables retain their schema. */
+export function validateRelationTargets(set: TableRelations, who: string): void {
   for (const [key, rel] of Object.entries(set.entries)) {
-    const schema = getTableSchema(rel.targetTable);
-    if (schema !== undefined) {
-      throw new Error(
-        `${who}.${key}: target "${schema}"."${getTableName(rel.targetTable)}" declares a schema — relational reads on schema-qualified tables land with Q05/Q07`,
-      );
-    }
+    rejectDerivedTable(rel.targetTable, `${who}.${key}`);
+    getTableRelationKey(rel.targetTable);
   }
 }
 

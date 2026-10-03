@@ -77,7 +77,7 @@ import { compileStatement } from "./compile.js";
 import { NeutronSqlError } from "./errors.js";
 import type { IsolationLevel } from "./logger.js";
 import type { QueryExecutionOptions } from "./transactions.js";
-import { getTableColumns, getTableIndexes, getTableName, tableRefParts } from "./schema.js";
+import { getTableColumns, getTableIndexes, getTableName, getTableRelationKey, tableRefParts } from "./schema.js";
 import type { AnyColumnBuilder, AnyPgTable, Relation, RelationOne } from "./schema.js";
 
 // ---------------------------------------------------------------------------
@@ -559,7 +559,7 @@ function splitData(pc: PlanCtx, table: AnyPgTable, data: unknown, mode: Mode, pa
     throw planError(path, `data must be an object of column values and relation operations for ${tableName}`);
   }
   const cols = columnsOf(table);
-  const entries = pc.relationsByTable.get(tableName) ?? {};
+  const entries = pc.relationsByTable.get(getTableRelationKey(table)) ?? {};
   const input = data as Record<string, unknown>;
   for (const key of Object.keys(input)) {
     const isColumn = Object.hasOwn(cols, key);
@@ -1163,7 +1163,7 @@ function planDependentLevel(
   const { pc, root } = dctx;
   const levelName = getTableName(levelTable);
   checkDepth(depth, `${levelName}.cascade`);
-  const entries = pc.relationsByTable.get(levelName) ?? {};
+  const entries = pc.relationsByTable.get(getTableRelationKey(levelTable)) ?? {};
   for (const [key, rel] of Object.entries(entries)) {
     if (rel.kind !== "many") continue;
     const source = rel.source;
@@ -1634,7 +1634,7 @@ export function compileNestedDelete(
   if (cascade !== undefined && (typeof cascade !== "object" || cascade === null || Array.isArray(cascade))) {
     throw new NeutronSqlError(`delete on ${tableName}: cascade must be an object keyed by relation names`);
   }
-  const entries = relationsByTable.get(tableName) ?? {};
+  const entries = relationsByTable.get(getTableRelationKey(table)) ?? {};
   if (cascade !== undefined) {
     for (const key of Object.keys(cascade).filter((k) => (cascade as Record<string, unknown>)[k] !== undefined)) {
       const rel = entries[key];
