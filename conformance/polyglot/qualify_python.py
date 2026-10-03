@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -19,6 +20,8 @@ ROOT=Path(__file__).resolve().parent
 
 
 def command(argv: list[str], cwd: Path, timeout: float, capture: bool=False, live: bool=False) -> str:
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError('finite positive subprocess timeout required')
     env=dict(os.environ)
     for name in ('PYTHONPATH','PYTHONHOME'): env.pop(name,None)
     if not live: env.pop('NEUTRON_TEST_DATABASE_URL',None)
@@ -26,9 +29,17 @@ def command(argv: list[str], cwd: Path, timeout: float, capture: bool=False, liv
     proc=subprocess.Popen(argv,cwd=cwd,env=env,stdin=subprocess.DEVNULL,
                           stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
     try: stdout,stderr=proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        os.killpg(proc.pid,signal.SIGKILL);proc.communicate()
-        raise ValueError('qualification subprocess timed out')
+    except BaseException as exc:
+        try: os.killpg(proc.pid,signal.SIGKILL)
+        except ProcessLookupError: pass
+        # Repeated terminal interrupts must not abandon a still-unreaped child.
+        while True:
+            try:
+                proc.communicate()
+                break
+            except KeyboardInterrupt: continue
+        message='qualification subprocess timed out' if isinstance(exc,subprocess.TimeoutExpired) else 'qualification subprocess interrupted'
+        raise ValueError(message) from exc
     if proc.returncode:
         # pip errors can contain private indexes, credentials and user parameters.
         # Preserve only bounded command identity and code, never arbitrary stderr.
@@ -99,7 +110,8 @@ def main() -> int:
     parser.add_argument('--timeout',type=float,default=180)
     args=parser.parse_args()
     try:
-        if args.timeout<=0: raise ValueError('positive subprocess timeout required')
+        if not math.isfinite(args.timeout) or args.timeout<=0:
+            raise ValueError('finite positive subprocess timeout required')
         print(json.dumps(qualify(args.source,args.work_directory,args.timeout)))
         return 0
     except Exception as exc:
