@@ -9,6 +9,22 @@ import (
 	"time"
 )
 
+// ResponseController delegates to these methods on a real connection writer.
+// Recording them verifies the handler releases its socket lease on early return.
+type pageDeadlineWriter struct {
+	*httptest.ResponseRecorder
+	reads, writes []time.Time
+}
+
+func (w *pageDeadlineWriter) SetReadDeadline(d time.Time) error {
+	w.reads = append(w.reads, d)
+	return nil
+}
+func (w *pageDeadlineWriter) SetWriteDeadline(d time.Time) error {
+	w.writes = append(w.writes, d)
+	return nil
+}
+
 func TestPageRequestAdmission(t *testing.T) {
 	valid := `{"connectionId":"c","schema":"public","table":"t","profile":"postgres-direct","limit":2}`
 	if _, err := parsePageRequest([]byte(valid)); err != nil {
@@ -26,6 +42,16 @@ func TestPageRequestAdmission(t *testing.T) {
 		}
 	}
 	s := &Server{sessionToken: "session"}
+	deadlineRequest := httptest.NewRequest(http.MethodPost, "/api/table/v2/page", strings.NewReader(valid))
+	deadlineRequest.Header.Set(sessionHeader, "session")
+	deadlineWriter := &pageDeadlineWriter{ResponseRecorder: httptest.NewRecorder()}
+	s.handleTablePageV2(deadlineWriter, deadlineRequest)
+	for _, history := range [][]time.Time{deadlineWriter.reads, deadlineWriter.writes} {
+		if len(history) != 2 || history[0].IsZero() || !history[1].IsZero() {
+			t.Fatal("request socket deadline leaked into keep-alive reuse")
+		}
+	}
+
 	wrongOrigin := httptest.NewRequest(http.MethodPost, "/api/table/v2/page", strings.NewReader(valid))
 	wrongOrigin.Header.Set(sessionHeader, "session")
 	wrongOrigin.Header.Set("Origin", "https://hostile.example")
