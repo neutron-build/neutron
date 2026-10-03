@@ -24,9 +24,14 @@ ROOT=Path(__file__).resolve().parent
 def command(argv: list[str], cwd: Path, timeout: float, capture: bool=False, live: bool=False) -> str:
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError('finite positive subprocess timeout required')
-    env=dict(os.environ)
+    env={name:value for name,value in os.environ.items()
+         if not name.startswith('PG') and not name.endswith('DATABASE_URL')
+         and not name.endswith('DB_URL') and name != 'NEUTRON_SQL_TEST_URL'}
     for name in ('PYTHONPATH','PYTHONHOME'): env.pop(name,None)
-    if not live: env.pop('NEUTRON_TEST_DATABASE_URL',None)
+    if live:
+        url=os.environ.get('NEUTRON_TEST_DATABASE_URL')
+        if not url: raise ValueError('required live PostgreSQL URL missing')
+        env['NEUTRON_TEST_DATABASE_URL']=url
     env['PIP_DISABLE_PIP_VERSION_CHECK']='1'
     proc=subprocess.Popen(argv,cwd=cwd,env=env,stdin=subprocess.DEVNULL,
                           stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
