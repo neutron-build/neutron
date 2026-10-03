@@ -95,7 +95,7 @@ unit tests and declared exports are not full ORM certification.
 an initial scalar dataclass persistence lifecycle. This expands the SQL core;
 it still does not establish full SQLAlchemy replacement. Relations, inheritance,
 mutable JSON/collections, lazy/expired properties, merge, bulk synchronization,
-hooks, savepoints and automatic expiration on commit remain unsupported.
+savepoints and automatic expiration on commit remain unsupported.
 
 ```python
 from dataclasses import dataclass
@@ -285,3 +285,20 @@ reuse. COMMIT cancellation retains the existing indeterminate-outcome error.
 Raw Predicate SQL remains a trusted escape hatch, not a SQL sandbox; the owned
 READ ONLY transaction is enforced by PostgreSQL. Arbitrary custom connection
 implementations are outside the native-driver cleanup bound.
+
+
+Scalar Session callbacks are registered in order with `session.listen(name,
+callback)`. `SessionEvent` carries the event name and affected object (or None
+for flush/settlement events). Supported names are `before_flush`, `before_insert`,
+`before_update`, `before_delete`, `after_flush`, `after_commit`, and
+`after_rollback`. Sync callbacks must return None; AsyncSession accepts native
+awaitable callbacks and awaits each in registration order. All callbacks for
+planned writes run before the final full-record validation and first SQL write.
+Scalar attributes may be edited in prewrite callbacks. Session API reentrancy,
+listener registration and close from callbacks refuse. Failure before commit
+requires rollback and emits no after_commit event. An after_commit callback runs
+only after a known successful commit and adopted object baseline; its exception
+cannot undo that commit. after_rollback runs after explicit reconciliation.
+Callbacks have no exactly-once external side-effect guarantee: use an outbox for
+external work. Relationship/attribute instrumentation is not provided by these
+scalar callbacks.

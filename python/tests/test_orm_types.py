@@ -94,3 +94,14 @@ async def static_async_stream_consumer(db: AsyncDatabase) -> None:
     assert_type(db.stream(select(t.column('id',int)),batch_size=10),AsyncStream[int])
     async with db.stream(select(t.column('id',int)),batch_size=10) as rows:
         assert_type(rows,AsyncIterator[int]);assert_type(await anext(rows),int)
+
+from neutron.orm import SessionEvent
+
+def static_event_consumer(session: Session) -> None:
+    def observe(event: SessionEvent) -> None:
+        assert_type(event.obj,object|None)
+    session.listen('before_flush',observe)
+
+async def static_async_event_consumer(session: AsyncSession) -> None:
+    async def observe(event: SessionEvent) -> None: pass
+    session.listen('before_flush',observe)

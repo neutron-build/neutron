@@ -27,3 +27,6 @@ __all__ += ["Association","LoadBudget","Relation","RelationBudgetError","Unsuppo
 
 from .streaming import AsyncStream, Stream
 __all__ += ["AsyncStream","Stream"]
+
+from .events import EventName, SessionEvent
+__all__ += ["EventName","SessionEvent"]

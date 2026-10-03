@@ -184,3 +184,72 @@ async def test_native_async_attach_existing_and_cross_session_release(mapped):
         assert await second.attach_existing(m,obj,discard_changes=True) is obj
         obj.active=False;await second.commit()
         assert native.execute(f'SELECT name,active FROM {m.table.sql} WHERE id=%s',(ident,)).fetchone()==('stored',False)
+
+
+def test_native_ordered_hooks_prevalidation_and_known_commit(mapped):
+    url,m,native=mapped
+    with Session.connect(url) as session:
+        events=[]
+        for name in ('before_flush','before_insert','before_update','before_delete','after_flush','after_commit'):
+            session.listen(name,lambda event: events.append((event.name,event.obj)))
+        first=User(name='first');second=User(name='second')
+        session.add(m,first);session.add(m,second);session.commit()
+        assert [name for name,_ in events]==['before_flush','before_insert','before_insert','after_flush','after_commit']
+        assert events[1][1] is first and events[2][1] is second
+        events.clear();first.name='updated';session.commit()
+        assert [name for name,_ in events]==['before_flush','before_update','after_flush','after_commit']
+        events.clear();session.delete(second);session.commit()
+        assert [name for name,_ in events]==['before_flush','before_delete','after_flush','after_commit']
+        assert native.execute(f'SELECT name FROM {m.table.sql}').fetchall()==[('updated',)]
+    with Session.connect(url) as session:
+        first=User(name='safe');second=User(name='invalid');session.add(m,first);session.add(m,second)
+        def invalidate(event):
+            if event.obj is second: second.name=123
+        session.listen('before_insert',invalidate)
+        with pytest.raises(ValueError): session.flush()
+        assert first.id is None
+        with pytest.raises(OrmError,match='requires rollback'): session.commit()
+        session.rollback()
+        assert native.execute(f'SELECT count(*) FROM {m.table.sql}').fetchone()==(1,)
+
+
+def test_native_hook_exception_reentrancy_and_after_commit_outcome(mapped):
+    url,m,native=mapped
+    with Session.connect(url) as session:
+        obj=User(name='refused');session.add(m,obj)
+        session.listen('before_insert',lambda event: session.flush())
+        with pytest.raises(SessionBusyError,match='reentrancy'): session.flush()
+        session.rollback();assert obj.id is None
+        assert native.execute(f'SELECT count(*) FROM {m.table.sql}').fetchone()==(0,)
+    with Session.connect(url) as session:
+        obj=User(name='durable');session.add(m,obj)
+        def fail(event): raise RuntimeError('application callback failed')
+        session.listen('after_commit',fail)
+        with pytest.raises(RuntimeError): session.commit()
+        assert session.object_state(obj) is ObjectState.PERSISTENT
+        assert native.execute(f'SELECT name FROM {m.table.sql}').fetchone()==('durable',)
+        # A postcommit notification failure must never undo the known result.
+        session.rollback();assert obj.name=='durable'
+
+
+@pytest.mark.asyncio
+async def test_native_async_hooks_await_order_and_rollback(mapped):
+    url,m,native=mapped
+    async with await AsyncSession.connect(url) as session:
+        events=[]
+        async def observe(event):
+            await asyncio.sleep(0)
+            events.append(event.name)
+        for name in ('before_flush','before_insert','after_flush','after_commit','after_rollback'):
+            session.listen(name,observe)
+        obj=User(name='async_hooks');session.add(m,obj);await session.commit()
+        assert events==['before_flush','before_insert','after_flush','after_commit']
+        obj.name='changed'
+        async def fail(event):
+            with pytest.raises(SessionBusyError): await session.commit()
+            raise RuntimeError('refuse before commit')
+        session.listen('after_flush',fail)
+        with pytest.raises(RuntimeError): await session.flush()
+        await session.rollback()
+        assert obj.name=='async_hooks' and events[-1]=='after_rollback'
+        assert native.execute(f'SELECT name FROM {m.table.sql}').fetchone()==('async_hooks',)

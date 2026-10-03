@@ -1,11 +1,13 @@
 """Native async scalar mapped lifecycle using the common pure state engine."""
 from __future__ import annotations
 import asyncio
+import inspect
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, TypeVar
+from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar
 from .client import AsyncDatabase
 from .core import CardinalityError, OrmError, SessionBusyError, delete, insert, select_row, update
 from .lifecycle import AsyncTransactionHandle
+from .events import EVENT_NAMES, EventName, SessionEvent
 from .mapping import ModelMapping
 from .session import ConflictError, _SessionState
 from .state import ObjectState
@@ -22,6 +24,19 @@ class AsyncSession(_SessionState):
     @classmethod
     async def connect(cls,url: str,*,autobegin: bool=True,autoflush: bool=True) -> AsyncSession:
         return cls(await AsyncDatabase.connect(url),autobegin=autobegin,autoflush=autoflush,close_database=True)
+
+    def listen(self,event: EventName,callback: Callable[[SessionEvent],Awaitable[None] | None]) -> None:
+        self._guard()
+        if event not in EVENT_NAMES or not callable(callback): raise ValueError('invalid Session event listener')
+        self._listeners.setdefault(event,[]).append(callback)
+
+    async def _emit(self,event: EventName,obj: object | None=None) -> None:
+        self._emitting=True
+        try:
+            for callback in tuple(self._listeners.get(event,())):
+                result=callback(SessionEvent(event,obj))
+                if inspect.isawaitable(result): await result
+        finally: self._emitting=False
 
     def _owner_check(self) -> None:
         if asyncio.current_task() is not self._owner: raise SessionBusyError('mapped Session belongs to another task')
@@ -86,9 +101,13 @@ class AsyncSession(_SessionState):
     async def flush(self) -> None:
         self._guard()
         try:
-            plans=self._plan()
-            if not plans: return
+            if not self._plan(): return
             await self._ensure_transaction()
+            await self._emit('before_flush')
+            plans=self._plan()
+            for record,action,_ in plans:
+                await self._emit('before_insert' if action=='insert' else 'before_update' if action=='update' else 'before_delete',record.obj)
+            plans=self._plan()
             for record,action,values in plans:
                 mapping=record.mapping
                 if action=='delete':
@@ -100,6 +119,7 @@ class AsyncSession(_SessionState):
                     try: row=await self._database.one(mutation.returning_row(*mapping.field_columns.values()))
                     except CardinalityError as exc: raise ConflictError('mapped write did not affect exactly one row') from exc
                     self._flushed_row(record,row)
+            await self._emit('after_flush')
         except BaseException:
             self._failed=True;raise
 
@@ -114,6 +134,7 @@ class AsyncSession(_SessionState):
             self._failed=True;raise
         else: self._store.committed()
         finally: self._transaction=None
+        await self._emit('after_commit')
 
     async def rollback(self) -> None:
         self._guard(allow_failed=True)
@@ -123,9 +144,11 @@ class AsyncSession(_SessionState):
             self._store.uncertain();self._uncertain=True;self._failed=True;raise
         else: self._store.rollback();self._failed=False
         finally: self._transaction=None
+        await self._emit('after_rollback')
 
     async def close(self) -> None:
         self._owner_check()
+        if self._emitting: raise SessionBusyError('Session close from event callback refused')
         if self._closed: return
         try:
             if not self._uncertain: await self.rollback()

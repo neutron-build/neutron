@@ -2,10 +2,12 @@
 from __future__ import annotations
 from contextlib import contextmanager
 import threading
-from typing import Any, Iterator, TypeVar
+import inspect
+from typing import Any, Callable, Iterator, TypeVar
 from .client import AsyncDatabase, Database
 from .core import CardinalityError, OrmError, Predicate, SessionBusyError, delete, insert, select_row, update
 from .lifecycle import TransactionHandle
+from .events import EVENT_NAMES, EventName, SessionEvent
 from .mapping import ModelMapping, same_column_value
 from .state import ObjectState, Record, StateStore
 T=TypeVar('T')
@@ -20,11 +22,14 @@ class _SessionState:
         self._mappings: dict[tuple[Any,...],ModelMapping[Any]]={}
         self._closed=False;self._failed=False;self._uncertain=False
         self.autobegin=autobegin;self.autoflush=autoflush
+        self._listeners: dict[EventName,list[Callable[[SessionEvent],Any]]]={}
+        self._emitting=False
 
     def _owner_check(self) -> None: raise NotImplementedError
 
     def _guard(self,*,allow_failed: bool=False) -> None:
         self._owner_check()
+        if self._emitting: raise SessionBusyError('Session API reentrancy from event callback refused')
         if self._closed: raise OrmError('mapped Session closed')
         if self._database.closed and not allow_failed: raise OrmError('mapped Session connection fenced; create a new Session')
         if self._uncertain: raise OrmError('mapped Session outcome indeterminate; use a new Session')
@@ -139,6 +144,21 @@ class Session(_SessionState):
     def connect(cls,url: str,*,autobegin: bool=True,autoflush: bool=True) -> Session:
         return cls(Database.connect(url),autobegin=autobegin,autoflush=autoflush,close_database=True)
 
+    def listen(self,event: EventName,callback: Callable[[SessionEvent],None]) -> None:
+        self._guard()
+        if event not in EVENT_NAMES or not callable(callback): raise ValueError('invalid Session event listener')
+        self._listeners.setdefault(event,[]).append(callback)
+
+    def _emit(self,event: EventName,obj: object | None=None) -> None:
+        self._emitting=True
+        try:
+            for callback in tuple(self._listeners.get(event,())):
+                result=callback(SessionEvent(event,obj))
+                if inspect.isawaitable(result):
+                    if inspect.iscoroutine(result): result.close()
+                    raise OrmError('synchronous Session listener returned an awaitable')
+        finally: self._emitting=False
+
     def _owner_check(self) -> None:
         if threading.get_ident()!=self._owner: raise SessionBusyError('mapped Session belongs to another thread')
 
@@ -202,9 +222,14 @@ class Session(_SessionState):
     def flush(self) -> None:
         self._guard()
         try:
-            plans=self._plan()
-            if not plans: return
+            if not self._plan(): return
             self._ensure_transaction()
+            self._emit('before_flush')
+            plans=self._plan()
+            for record,action,_ in plans:
+                self._emit('before_insert' if action=='insert' else 'before_update' if action=='update' else 'before_delete',record.obj)
+            # Revalidate all records after callbacks, before the first SQL write.
+            plans=self._plan()
             for record,action,values in plans:
                 mapping=record.mapping
                 if action=='delete':
@@ -216,6 +241,7 @@ class Session(_SessionState):
                     try: row=self._database.one(mutation.returning_row(*mapping.field_columns.values()))
                     except CardinalityError as exc: raise ConflictError('mapped write did not affect exactly one row') from exc
                     self._flushed_row(record,row)
+            self._emit('after_flush')
         except BaseException:
             self._failed=True;raise
 
@@ -230,6 +256,7 @@ class Session(_SessionState):
             self._failed=True;raise
         else: self._store.committed()
         finally: self._transaction=None
+        self._emit('after_commit')
 
     def rollback(self) -> None:
         self._guard(allow_failed=True)
@@ -239,9 +266,11 @@ class Session(_SessionState):
             self._store.uncertain();self._uncertain=True;self._failed=True;raise
         else: self._store.rollback();self._failed=False
         finally: self._transaction=None
+        self._emit('after_rollback')
 
     def close(self) -> None:
         self._owner_check()
+        if self._emitting: raise SessionBusyError('Session close from event callback refused')
         if self._closed: return
         try:
             if not self._uncertain: self.rollback()
