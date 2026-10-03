@@ -43,7 +43,7 @@
     "@neutron-build/create": "workspace:^",
     "preact": "^10.25.4",
     "preact-render-to-string": "^6.5.11",
-    "vite": "^6.0.7"
+    "vite": "^8.3.2"
   },
   "devDependencies": {
     "@types/node": "^22.10.7",
@@ -54,7 +54,7 @@
   },
   "peerDependencies": {},
   "engines": {
-    "node": ">=22"
+    "node": ">=22.12"
   },
   "sideEffects": false
 }
