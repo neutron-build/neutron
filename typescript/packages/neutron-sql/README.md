@@ -404,7 +404,9 @@ including with application pool `max: 1`. Injected pg adapters require
 wrappers close neither resource, owned wrappers close both. Without that
 channel, cancellation-armed statements fail before submission. The backend
 pid costs one extra round trip. Pending cancel dispatch completes before the
-target connection can be reused. PostgreSQL completion can race cancellation;
+target connection can be reused. A deadline bounds each pool acquisition and
+submitted execution separately; it is not a total request deadline. Backend
+PID lookup drains before submission. PostgreSQL completion can race cancellation;
 a successful server result remains successful. postgres.js uses its native
 `Query.cancel()` (a dedicated cancel connection managed by the driver —
 installed 3.4.x has no AbortSignal support of its own). The canceled

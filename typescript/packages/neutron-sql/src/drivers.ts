@@ -651,7 +651,7 @@ async function execPg(
   const disarm = armCancellation(options, (reason) => {
     cancelReason = reason;
     dispatched = true;
-    cancelPending = cancelClient!.query('select pg_cancel_backend($1) as canceled', [pid]).then(
+    cancelPending = Promise.resolve().then(() => cancelClient!.query('select pg_cancel_backend($1) as canceled', [pid])).then(
       () => {},
       (error: unknown) => { cancelFailed = error; },
     );
