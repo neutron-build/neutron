@@ -44,7 +44,7 @@ func run() error {
 	if err := json.NewDecoder(os.Stdin).Decode(&r); err != nil {
 		return err
 	}
-	if r.Protocol != "polyglot-performance-v1" || !regexp.MustCompile(`^neutron_polyglot_[0-9a-f]{32}$`).MatchString(r.Schema) || (r.Mode != "raw" && r.Mode != "orm") || (r.Workload != "read" && r.Workload != "transaction") || r.Warmup != 64 || r.Iterations != 256 {
+	if r.Protocol != "polyglot-performance-v1" || !regexp.MustCompile(`^neutron_polyglot_[0-9a-f]{32}$`).MatchString(r.Schema) || (r.Mode != "raw" && r.Mode != "orm") || (r.Workload != "read" && r.Workload != "transaction") || r.Warmup != 1024 || r.Iterations != 2048 {
 		return fmt.Errorf("frozen workload required")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Second)

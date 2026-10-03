@@ -21,7 +21,7 @@ def main():
     args = parser.parse_args()
     request = json.load(sys.stdin)
     if request['protocol'] != 'polyglot-performance-v1' or not re.fullmatch('neutron_polyglot_[0-9a-f]{32}', request['schema_scope']): raise ValueError('invalid scope')
-    if request['mode'] not in ('orm','raw') or request['workload'] not in ('read','transaction') or (request['warmup'],request['iterations']) != (64,256): raise ValueError('invalid frozen workload')
+    if request['mode'] not in ('orm','raw') or request['workload'] not in ('read','transaction') or (request['warmup'],request['iterations']) != (1024,2048): raise ValueError('invalid frozen workload')
     import neutron.orm as orm
     import psycopg
     from psycopg.rows import dict_row

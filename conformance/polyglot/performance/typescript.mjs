@@ -6,7 +6,7 @@ import path from 'node:path';
 let native, db, kind;
 try {
   const request=JSON.parse(readFileSync(0,'utf8'));
-  if(request.protocol!=='polyglot-performance-v1'||!/^neutron_polyglot_[0-9a-f]{32}$/.test(request.schema_scope)||!['raw','orm'].includes(request.mode)||!['read','transaction'].includes(request.workload)||request.warmup!==64||request.iterations!==256) throw Error('frozen workload required');
+  if(request.protocol!=='polyglot-performance-v1'||!/^neutron_polyglot_[0-9a-f]{32}$/.test(request.schema_scope)||!['raw','orm'].includes(request.mode)||!['read','transaction'].includes(request.workload)||request.warmup!==1024||request.iterations!==2048) throw Error('frozen workload required');
   const entry=path.resolve(process.argv[process.argv.indexOf('--module')+1]);
   kind=process.argv.includes('--postgres-js')?'postgres':'pg';
   const require=createRequire(entry);

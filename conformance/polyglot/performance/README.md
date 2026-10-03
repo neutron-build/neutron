@@ -7,8 +7,8 @@ There is no competitor result: a comparable pinned competitor corpus must be
 qualified separately before adding one.
 
 `profile.json` freezes the configuration and gates before execution. Each
-process uses one connection, no prepared statements, 64 warmup iterations and
-256 measured iterations. The read workload selects all three columns by a
+process uses one connection, no prepared statements, 1,024 warmup iterations and
+2,048 measured iterations. The read workload selects all three columns by a
 primary key cycling through 64 rows. The transaction workload performs that
 read and one text UPDATE inside a READ COMMITTED transaction. Every read checks
 the exact bigint (above JavaScript's safe integer range), and an independent
@@ -55,8 +55,15 @@ the coordinator must serialize other workloads separately.
 
 Exit 2 means noise or minimum-duration gates refused calibration. Retain this
 evidence. Do not tune gates after seeing a campaign or discard failing samples.
-If 256 iterations yield samples below 50 ms, a separately reviewed profile
-revision and consumer revision must freeze a larger workload before rerunning.
+Revision 1 used 64 warmup and 256 measured iterations. Its first full native
+calibration passed all correctness preflights but refused the TypeScript pg
+and Python sync read median-drift gates. That report remains evidence; it cannot
+approve characterization. Revision 2 increases warmup and measured work before
+another campaign, retaining every numeric acceptance limit. Longer samples are
+an attempt to reduce transient variation, not proof that the host is stable.
+All consumer bytes and installed provenance must be qualified again; results
+from these two profiles are separate campaigns.
+
 
 A separate reviewer must accept the passing calibration report and produce
 `review.json` with `calibration_sha256`, `reviewer`, and `verdict: "accepted"`.

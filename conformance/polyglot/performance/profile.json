@@ -1,18 +1,34 @@
 {
   "protocol": "polyglot-performance-v1",
   "rows": 64,
-  "warmup": 64,
-  "iterations": 256,
+  "warmup": 1024,
+  "iterations": 2048,
   "concurrency": 1,
   "isolation": "read committed",
-  "workloads": ["read", "transaction"],
-  "clients": ["typescript-pg", "typescript-postgres", "python-sync", "python-async", "go-pgx"],
+  "workloads": [
+    "read",
+    "transaction"
+  ],
+  "clients": [
+    "typescript-pg",
+    "typescript-postgres",
+    "python-sync",
+    "python-async",
+    "go-pgx"
+  ],
   "aa_pairs": 4,
   "abba_rounds": 4,
   "minimum_sample_ns": 50000000,
-  "aa_median_ratio": [0.95, 1.05],
-  "aa_pair_ratio": [0.85, 1.15],
-  "maximum_cv": 0.10,
+  "aa_median_ratio": [
+    0.95,
+    1.05
+  ],
+  "aa_pair_ratio": [
+    0.85,
+    1.15
+  ],
+  "maximum_cv": 0.1,
   "maximum_bracket_drift": 1.15,
-  "claims": "Calibration and bounded characterization only; no leadership claim."
+  "claims": "Calibration and bounded characterization only; no leadership claim.",
+  "revision": 2
 }
