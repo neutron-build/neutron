@@ -34,6 +34,10 @@ def validate(root: Path):
         data = json.loads((root/'execution/v1'/name).read_text())
         if data.get('format') != 'neutron-execution-cases' or data.get('version') != 1 or not data.get('cases'):
             raise ValueError('invalid execution fixture')
+    transitions = json.loads((root/'execution/v1/transitions.json').read_text())['cases']
+    ownership = [c for c in transitions if c.get('id') == 'concurrent-session']
+    if len(ownership) != 1 or ownership[0].get('to') != 'rejected':
+        raise ValueError('concurrent active session use must reject by default')
     return {'status':'validated','runtime_compliance':'unverified','value_cases':len(seen)}
 
 if __name__ == '__main__':

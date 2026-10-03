@@ -53,3 +53,29 @@ and timestamp text directly from PostgreSQL, with explicit UTC and ISO/YMD DateS
 SQL NULL and JSON null separately. Its expected scalar record is independently
 specified in the runner. This first case does not cover arrays, domains, write
 omission, ORM lifecycle, or all cross-language permutations.
+
+## Contract fixtures and native Python investigation
+
+Validate the independently versioned expectations with:
+
+```sh
+python3 conformance/polyglot/validate_contracts.py
+```
+
+See `contracts/data/VALUES.md` and `EXECUTION_CONTRACT.md`. Validation checks
+fixture structure, not runtime compliance.
+
+The bounded native transport spike requires both `psycopg[binary]>=3.2,<4`
+and `asyncpg>=0.29,<1` in the test virtual environment. With the same private
+`NEUTRON_TEST_DATABASE_URL`, run:
+
+```sh
+python3 conformance/polyglot/spikes/python_driver.py --driver psycopg --mode sync
+python3 conformance/polyglot/spikes/python_driver.py --driver psycopg --mode async
+python3 conformance/polyglot/spikes/python_driver.py --driver asyncpg --mode async
+```
+
+It checks native typed scalar reads against an independent SQL-text oracle,
+actual query cancellation and subsequent same-connection reuse, followed by
+owned schema cleanup. It does not compare performance or certify ORM sessions,
+write codecs, pool acquisition, or the existing Neutron compatibility adapter.
