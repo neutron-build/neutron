@@ -82,17 +82,20 @@ export function statementIdOf(sqlText: string): string {
 
 /** Redacted error summary for events. */
 export function errorSummary(err: unknown): { name: string; message: string; sqlstate?: string } {
-  const candidate =
-    typeof (err as { sqlstate?: unknown })?.sqlstate === "string"
-      ? (err as { sqlstate: string }).sqlstate
-      : typeof (err as { code?: unknown })?.code === "string"
-        ? (err as { code: string }).code
-        : undefined;
+  const read = (value: unknown, key: string): unknown => {
+    try { return value == null ? undefined : (value as Record<string, unknown>)[key]; }
+    catch { return undefined; }
+  };
+  const state = read(err, "sqlstate");
+  const code = read(err, "code");
+  const candidate = typeof state === "string" ? state : typeof code === "string" ? code : undefined;
   const sqlstate = candidate !== undefined && /^[0-9A-Z]{5}$/.test(candidate) ? candidate : undefined;
-  const name = err instanceof Error ? err.constructor.name : typeof err;
+  let isError = false;
+  try { isError = err instanceof Error; } catch { /* opaque application error */ }
+  const name = read(read(err, "constructor"), "name");
   const safeNames = ["Error", "TypeError", "RangeError", "NeutronSqlError", "ServerSqlError", "QueryCanceledError", "ConnectionFailedError", "MissingDriverError", "CommitAmbiguityError"];
   return {
-    name: err instanceof Error ? (safeNames.includes(name) ? name : "Error") : typeof err,
+    name: isError ? (typeof name === "string" && safeNames.includes(name) ? name : "Error") : typeof err,
     message: sqlstate ? `SQL request failed (${sqlstate})` : "SQL request failed",
     sqlstate,
   };

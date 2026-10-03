@@ -118,3 +118,9 @@ test("async observer rejection is drained without process failure", async () => 
   resolveLogger(async () => { throw new Error("async observer unavailable"); })!({ kind: "query-end", statementId: "fixed" });
   await new Promise<void>(resolve => setImmediate(resolve));
 });
+
+test("opaque application error accessors cannot change observation outcome", () => {
+  const error = new Error("private native detail");
+  for (const key of ["sqlstate", "code", "constructor"]) Object.defineProperty(error, key, { get() { throw new Error("private accessor detail"); } });
+  assert.deepEqual(errorSummary(error), { name: "Error", message: "SQL request failed", sqlstate: undefined });
+});
