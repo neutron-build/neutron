@@ -6145,6 +6145,27 @@ mod tests {
     #![allow(clippy::approx_constant)]
     use super::*;
 
+    #[test]
+    fn numeric_binary_cast_roundtrip_preserves_display_scale() {
+        for written in [
+            "1.500",
+            "0.000",
+            "-12.3400",
+            "0.1234567890123456789012345678",
+        ] {
+            let encoded = numeric_binary(written).unwrap();
+            let decoded = decode_binary_numeric(&encoded).unwrap();
+            let stored = Value::Text(decoded)
+                .cast(&crate::types::DataType::Numeric)
+                .unwrap();
+            let Value::Numeric(stored) = stored else {
+                panic!("lost numeric physical type")
+            };
+            assert_eq!(stored, written);
+            assert_eq!(numeric_binary(&stored).unwrap(), encoded);
+        }
+    }
+
     // ── Binary-parameter typed decoding (corruption-class regression) ──
 
     // ── statement_timeout parsing (M11: query-time limit) ──

@@ -43,6 +43,13 @@ pub(crate) fn parse_numeric(value: &str) -> Result<Decimal, String> {
 }
 
 pub(crate) fn canonical_numeric(value: &str) -> Result<String, String> {
+    // Display scale is part of the persisted/wire representation: 1.500 must
+    // remain 1.500 through a validated cast. Equality ignores that scale, so
+    // hashing below uses a separate normalized comparison key.
+    parse_numeric(value).map(|decimal| decimal.to_string())
+}
+
+fn numeric_comparison_key(value: &str) -> Result<String, String> {
     parse_numeric(value).map(|decimal| decimal.normalize().to_string())
 }
 
@@ -1127,7 +1134,7 @@ impl Hash for Value {
             Value::Float64(f) if f.is_nan() => f64::NAN.to_bits().hash(state),
             Value::Float64(f) => f.to_bits().hash(state),
             Value::Text(s) => s.hash(state),
-            Value::Numeric(s) => canonical_numeric(s)
+            Value::Numeric(s) => numeric_comparison_key(s)
                 .unwrap_or_else(|_| s.clone())
                 .hash(state),
             Value::Jsonb(v) => jsonb::hash(v, state),
@@ -1785,6 +1792,46 @@ mod tests {
         // Exactly 28 fractional digits is the ceiling and must round-trip exactly.
         let v = "0.1234567890123456789012345678";
         assert_eq!(canonical_numeric(v).unwrap(), v);
+    }
+
+    #[test]
+    fn numeric_cast_preserves_scale_without_changing_equality_hash() {
+        use std::collections::HashSet;
+        for written in ["1.500", "0.000", "-12.3400"] {
+            assert_eq!(canonical_numeric(written).unwrap(), written);
+            assert_eq!(
+                Value::Text(written.into())
+                    .cast(&DataType::Numeric)
+                    .unwrap(),
+                Value::Numeric(written.into())
+            );
+            if let Value::Numeric(stored) = Value::Numeric(written.into())
+                .cast(&DataType::Numeric)
+                .unwrap()
+            {
+                assert_eq!(stored, written);
+            } else {
+                panic!("numeric cast lost its physical type");
+            }
+        }
+        let mut equal_values = HashSet::new();
+        for written in ["1.5", "1.50", "1.500"] {
+            equal_values.insert(Value::Numeric(written.into()));
+        }
+        assert_eq!(
+            equal_values.len(),
+            1,
+            "equal numeric values must hash alike"
+        );
+        let mut zero_values = HashSet::new();
+        for written in ["0", "0.000", "-0.000"] {
+            zero_values.insert(Value::Numeric(written.into()));
+        }
+        assert_eq!(
+            zero_values.len(),
+            1,
+            "signed/scaled numeric zero hashes alike"
+        );
     }
 
     #[test]
