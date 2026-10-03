@@ -207,3 +207,25 @@ def test_sync_keyboard_interrupt_rolls_back_and_failed_second_lease_does_not_cle
     with pytest.raises(KeyboardInterrupt):
         with db.stream(Q,batch_size=1) as rows: next(rows)
     assert conn.outcomes==['rollback'] and not db.closed and not db._stream_lease
+
+
+def test_caught_decode_failure_terminalizes_buffered_sync_iterator():
+    conn=StreamConnection([{'id':'bad'},{'id':2}]);db=Database(conn)
+    tx=db.begin()
+    with db.stream(Q,batch_size=2) as rows:
+        with pytest.raises(ValueError): next(rows)
+        with pytest.raises(OrmError,match='terminal'): next(rows)
+    assert conn.server.fetches==[2]
+    with pytest.raises(OrmError,match='requires rollback'): tx.commit()
+    assert conn.outcomes==['rollback']
+
+@pytest.mark.asyncio
+async def test_caught_decode_failure_terminalizes_buffered_async_iterator():
+    conn=AsyncStreamConnection([{'id':'bad'},{'id':2}]);db=AsyncDatabase(conn)
+    tx=await db.begin()
+    async with db.stream(Q,batch_size=2) as rows:
+        with pytest.raises(ValueError): await anext(rows)
+        with pytest.raises(OrmError,match='terminal'): await anext(rows)
+    assert conn.server.fetches==[2]
+    with pytest.raises(OrmError,match='requires rollback'): await tx.commit()
+    assert conn.outcomes==['rollback']

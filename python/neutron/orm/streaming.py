@@ -100,7 +100,7 @@ class Stream(Generic[T],Iterator[T]):
 
     def _guard(self) -> None:
         if threading.get_ident()!=self._owner: raise SessionBusyError('stream belongs to another thread')
-        if not self._open or self._db.closed or self._token is not self._db._tx_token:
+        if self._failed or not self._open or self._db.closed or self._token is not self._db._tx_token:
             raise OrmError('stream scope is terminal')
 
     def __next__(self) -> T:
@@ -188,7 +188,7 @@ class AsyncStream(Generic[T],AsyncIterator[T]):
 
     def _guard(self) -> None:
         if asyncio.current_task() is not self._owner: raise SessionBusyError('stream belongs to another task')
-        if not self._open or self._db.closed or self._token is not self._db._tx_token:
+        if self._failed or not self._open or self._db.closed or self._token is not self._db._tx_token:
             raise OrmError('stream scope is terminal')
 
     async def __anext__(self) -> T:
