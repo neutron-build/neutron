@@ -408,3 +408,22 @@ transaction-handle commit/rollback/close refuse while a savepoint is open.
 Cleanup failure fences the connection and marks tracked outcomes indeterminate;
 no partial checkpoint is advertised as reconciled. The existing plain
 `transaction()` context still refuses implicit nested transactions.
+
+`ModelMapping(..., instrumented=True)` installs finite library-owned scalar
+field descriptors on the validated dataclass (ordinary attributes or native
+weak-reference-capable slots). `session.expire(obj, *fields)` marks an existing
+clean object EXPIRED; omitting fields expires all mapped fields. Dirty state
+requires explicit `discard_changes=True`. Expired property reads and writes
+raise ExpiredAttributeError without network I/O, including in AsyncSession.
+Explicit `refresh(obj)` or `get(mapping, key)` reloads the same identity; async
+callers await them. Rollback restores loaded pretransaction scalar values;
+savepoint rollback restores its checkpoint's expiration flags. Expired flags
+are weakly retained with the object, preventing detached expired objects from
+silently exposing a stale value. `attach_existing(..., discard_changes=True)`
+can explicitly rehydrate such a detached object.
+
+`Session(..., expire_on_commit=True)` and AsyncSession opt into expiration after
+known commits, requiring instrumented mappings. The default remains False for
+compatibility with ordinary dataclass mappings. Custom descriptors/setters and
+implicit lazy loading are still refused; library instrumentation does not claim
+mutable JSON/collection or relationship-property tracking.

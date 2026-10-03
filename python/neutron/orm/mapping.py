@@ -7,6 +7,7 @@ from types import MappingProxyType
 from typing import Any, Generic, Mapping, TypeVar, get_args, get_origin, get_type_hints, Union
 from .core import Column, ColumnSpec, OMIT, OrmError, Table
 from .json_value import JsonDocument
+from .instrumentation import _MappedField, instrument_model, raw_values, restore_values
 from decimal import Decimal
 import datetime as dt
 
@@ -23,7 +24,9 @@ class ModelMapping(Generic[T]):
     field_columns: Mapping[str,Column[Any]]
     primary_key: tuple[str,...]
     version_field: str | None
-    def __init__(self,model_type: type[T],table: Table,field_columns: Mapping[str,Column[Any]],*,primary_key: tuple[str,...],version_field: str | None=None) -> None:
+    instrumented: bool
+    def __init__(self,model_type: type[T],table: Table,field_columns: Mapping[str,Column[Any]],*,primary_key: tuple[str,...],version_field: str | None=None,instrumented: bool=False) -> None:
+        if type(instrumented) is not bool: raise ValueError('instrumented requires a boolean')
         if type(table) is not Table: raise ValueError('mapping requires an ordinary physical Table')
         if not is_dataclass(model_type): raise ValueError('scalar mapping requires a dataclass type')
         _validate_attribute_profile(model_type,tuple(field_columns))
@@ -67,11 +70,18 @@ class ModelMapping(Generic[T]):
         object.__setattr__(self,"field_columns",MappingProxyType(dict(field_columns)))
         object.__setattr__(self,"primary_key",tuple(primary_key))
         object.__setattr__(self,"version_field",version_field)
+        object.__setattr__(self,"instrumented",instrumented)
+        if instrumented: instrument_model(model_type,tuple(field_columns))
 
     def snapshot(self,obj: T) -> dict[str,Any]:
         _validate_attribute_profile(self.model_type,tuple(self.field_columns))
         if type(obj) is not self.model_type: raise ValueError('mapped model type mismatch; inheritance not implemented')
         return {name:getattr(obj,name) for name in self.field_columns}
+
+    def _snapshot(self,obj: T) -> dict[str,Any]:
+        _validate_attribute_profile(self.model_type,tuple(self.field_columns))
+        if type(obj) is not self.model_type: raise ValueError('mapped model type mismatch')
+        return raw_values(obj,tuple(self.field_columns))
 
     def key(self,values: Mapping[str,Any]) -> tuple[Any,...] | None:
         if any(self.field_columns[name].spec.sql_type in {'json','jsonb'} for name in self.primary_key):
@@ -99,7 +109,7 @@ class ModelMapping(Generic[T]):
 
     def restore(self,obj: T,values: Mapping[str,Any]) -> None:
         _validate_attribute_profile(self.model_type,tuple(self.field_columns))
-        for name,value in values.items(): setattr(obj,name,value)
+        restore_values(obj,dict(values))
 
     def writes(self,obj: T,*,inserting: bool,deferred_fields: frozenset[str]=frozenset()) -> dict[str,Any]:
         if deferred_fields - self.field_columns.keys(): raise ValueError('deferred fields outside mapping')
@@ -152,6 +162,9 @@ def _validate_attribute_profile(model_type: type[Any],names: tuple[str,...]) -> 
     for name in names:
         descriptor=inspect.getattr_static(model_type,name,missing)
         if descriptor is missing: continue
+        if type(descriptor) is _MappedField:
+            if descriptor.owner is not model_type or descriptor.name!=name: raise ValueError('foreign mapped instrumentation unsupported')
+            continue
         if isinstance(descriptor,types.MemberDescriptorType):
             if descriptor.__objclass__ not in model_type.__mro__ or descriptor.__name__!=name:
                 raise ValueError('mapped foreign/aliased slot descriptor unsupported')

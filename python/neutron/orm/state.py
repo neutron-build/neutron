@@ -8,6 +8,7 @@ from threading import RLock
 from typing import Any, Generic, TypeVar, cast
 from .core import OrmError
 from .mapping import ModelMapping, same_value
+from .instrumentation import expire_attributes
 T=TypeVar('T')
 _OWNERS: WeakValueDictionary[int,StateStore]=WeakValueDictionary()
 _OWNER_LOCK=RLock()
@@ -16,6 +17,7 @@ class ObjectState(str,Enum):
     TRANSIENT='transient'
     PENDING='pending'
     PERSISTENT='persistent'
+    EXPIRED='expired'
     DELETE_PENDING='delete-pending'
     DELETED='deleted'
     DETACHED='detached'
@@ -29,6 +31,7 @@ class Record(Generic[T]):
     baseline: dict[str,Any]
     original: dict[str,Any]
     was_new: bool=False
+    expired_fields: frozenset[str]=frozenset()
 
 class StateStore:
     def __init__(self) -> None:
@@ -73,10 +76,10 @@ class StateStore:
         # Recheck and claim ownership atomically after native I/O, before any
         # caller object mutation. No global primary-key identity cache exists.
         with _OWNER_LOCK:
-            self.check_existing_attach(mapping,obj,mapping.snapshot(obj))
+            self.check_existing_attach(mapping,obj,mapping._snapshot(obj))
             if set(values)!=set(mapping.field_columns): raise OrmError('incomplete attach-existing projection')
             for name,column in mapping.field_columns.items(): column.spec.check(values[name])
-            if self._identity(mapping,values)!=self._identity(mapping,mapping.snapshot(obj)):
+            if self._identity(mapping,values)!=self._identity(mapping,mapping._snapshot(obj)):
                 raise OrmError('attach-existing changed primary-key identity')
             snapshot=deepcopy(values)
             record=Record(mapping,obj,ObjectState.PERSISTENT,snapshot.copy(),snapshot,False)
@@ -99,14 +102,14 @@ class StateStore:
         return cast(T,record.obj)
 
     def dirty(self,record: Record[Any]) -> dict[str,Any]:
-        current=record.mapping.snapshot(record.obj)
+        current=record.mapping._snapshot(record.obj)
         if record.mapping.key(current)!=record.mapping.key(record.baseline): raise OrmError('primary-key mutation unsupported')
         return {name:value for name,value in current.items() if not same_value(value,record.baseline[name])}
 
     def flushed(self,record: Record[Any],values: dict[str,Any]) -> None:
         record.mapping.restore(record.obj,values)
         record.baseline=deepcopy(values)
-        record.state=ObjectState.PERSISTENT
+        record.state=ObjectState.PERSISTENT;record.expired_fields=frozenset()
         identity=self._identity(record.mapping,values)
         if identity is None: raise OrmError('flushed row has incomplete primary key')
         other=self.identities.get(identity)
@@ -114,7 +117,7 @@ class StateStore:
         self.identities[identity]=record
 
     def refreshed(self,record: Record[Any],values: dict[str,Any]) -> None:
-        if self.records.get(id(record.obj)) is not record or record.state is not ObjectState.PERSISTENT or record.was_new:
+        if self.records.get(id(record.obj)) is not record or record.state not in {ObjectState.PERSISTENT,ObjectState.EXPIRED} or record.was_new:
             raise OrmError('refresh requires an existing persistent tracked object')
         if set(values)!=set(record.mapping.field_columns): raise OrmError('incomplete refresh projection')
         for name,column in record.mapping.field_columns.items(): column.spec.check(values[name])
@@ -122,8 +125,19 @@ class StateStore:
             raise OrmError('refresh changed tracked primary-key identity')
         snapshot=deepcopy(values)
         record.mapping.restore(record.obj,snapshot)
-        record.baseline=snapshot
+        record.baseline=snapshot;record.state=ObjectState.PERSISTENT;record.expired_fields=frozenset()
         # Preserve original: rollback reconciles the pretransaction snapshot.
+
+    def expire(self,record: Record[Any],names: frozenset[str],*,discard_changes: bool) -> None:
+        if not record.mapping.instrumented: raise OrmError('expiration requires instrumented mapping')
+        if record.state not in {ObjectState.PERSISTENT,ObjectState.EXPIRED} or record.was_new:
+            raise OrmError('expire requires an existing persistent tracked object')
+        if self.dirty(record):
+            if not discard_changes: raise OrmError('expire refuses dirty state; explicitly discard changes')
+            record.mapping.restore(record.obj,deepcopy(record.baseline))
+        record.expired_fields=record.expired_fields | names
+        record.state=ObjectState.EXPIRED
+        expire_attributes(record.obj,record.expired_fields)
 
     def detach(self,record: Record[Any]) -> None:
         if self.records.get(id(record.obj)) is not record or record.state is not ObjectState.PERSISTENT or record.was_new:
@@ -143,25 +157,26 @@ class StateStore:
             record.original=deepcopy(record.baseline);record.was_new=False
         self._reindex()
 
-    def checkpoint(self) -> dict[int,tuple[Record[Any],ObjectState,dict[str,Any],dict[str,Any],bool,dict[str,Any]]]:
-        return {identity:(record,record.state,deepcopy(record.baseline),deepcopy(record.original),record.was_new,deepcopy(record.mapping.snapshot(record.obj))) for identity,record in self.records.items()}
+    def checkpoint(self) -> dict[int,tuple[Record[Any],ObjectState,dict[str,Any],dict[str,Any],bool,dict[str,Any],frozenset[str]]]:
+        return {identity:(record,record.state,deepcopy(record.baseline),deepcopy(record.original),record.was_new,deepcopy(record.mapping._snapshot(record.obj)),record.expired_fields) for identity,record in self.records.items()}
 
-    def restore_checkpoint(self,checkpoint: dict[int,tuple[Record[Any],ObjectState,dict[str,Any],dict[str,Any],bool,dict[str,Any]]]) -> None:
+    def restore_checkpoint(self,checkpoint: dict[int,tuple[Record[Any],ObjectState,dict[str,Any],dict[str,Any],bool,dict[str,Any],frozenset[str]]]) -> None:
         for identity,record in list(self.records.items()):
             if identity in checkpoint: continue
             record.mapping.restore(record.obj,deepcopy(record.original))
             state=ObjectState.TRANSIENT if record.was_new else ObjectState.DETACHED
             self.records.pop(identity);self._remember(record.obj,state);self._release(record.obj)
-        for identity,(record,state,baseline,original,was_new,values) in checkpoint.items():
+        for identity,(record,state,baseline,original,was_new,values,expired_fields) in checkpoint.items():
             record.mapping.restore(record.obj,deepcopy(values))
-            record.state=state;record.baseline=deepcopy(baseline);record.original=deepcopy(original);record.was_new=was_new
+            record.state=state;record.baseline=deepcopy(baseline);record.original=deepcopy(original);record.was_new=was_new;record.expired_fields=expired_fields
+            expire_attributes(record.obj,expired_fields)
             self.records[identity]=record
         self._reindex()
 
     def rollback(self) -> None:
         for record in list(self.records.values()):
             record.mapping.restore(record.obj,deepcopy(record.original))
-            record.baseline=deepcopy(record.original)
+            record.baseline=deepcopy(record.original);record.expired_fields=frozenset()
             if record.was_new:
                 record.state=ObjectState.TRANSIENT;self.records.pop(id(record.obj));self._remember(record.obj,ObjectState.TRANSIENT);self._release(record.obj)
             else: record.state=ObjectState.PERSISTENT

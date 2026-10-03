@@ -18,15 +18,15 @@ C=TypeVar('C')
 
 class AsyncSession(_SessionState):
     _database: AsyncDatabase
-    def __init__(self,database: AsyncDatabase,*,autobegin: bool=True,autoflush: bool=True,close_database: bool=False) -> None:
-        super().__init__(autobegin=autobegin,autoflush=autoflush)
+    def __init__(self,database: AsyncDatabase,*,autobegin: bool=True,autoflush: bool=True,close_database: bool=False,expire_on_commit: bool=False) -> None:
+        super().__init__(autobegin=autobegin,autoflush=autoflush,expire_on_commit=expire_on_commit)
         self._database=database;self._transaction: AsyncTransactionHandle | None=None
         self._owner=asyncio.current_task();self._close_database=close_database
         if self._owner is None: raise SessionBusyError('AsyncSession requires an owning asyncio task')
 
     @classmethod
-    async def connect(cls,url: str,*,autobegin: bool=True,autoflush: bool=True) -> AsyncSession:
-        return cls(await AsyncDatabase.connect(url),autobegin=autobegin,autoflush=autoflush,close_database=True)
+    async def connect(cls,url: str,*,autobegin: bool=True,autoflush: bool=True,expire_on_commit: bool=False) -> AsyncSession:
+        return cls(await AsyncDatabase.connect(url),autobegin=autobegin,autoflush=autoflush,close_database=True,expire_on_commit=expire_on_commit)
 
     def listen(self,event: EventName,callback: Callable[[SessionEvent],Awaitable[None] | None]) -> None:
         self._guard()
@@ -88,7 +88,9 @@ class AsyncSession(_SessionState):
         values=self._key_values(mapping,key)
         if self.autoflush: await self.flush()
         found=self._store.find(mapping,key)
-        if found is not None: return found
+        if found is not None:
+            if self._store.records[id(found)].state is ObjectState.EXPIRED: return await self.refresh(found)
+            return found
         try:
             await self._ensure_transaction()
             row=await self._database.one_or_none(select_row(mapping.table,*mapping.field_columns.values()).where(self._predicate(mapping,values)))
@@ -209,6 +211,8 @@ class AsyncSession(_SessionState):
         else: self._store.committed()
         finally: self._transaction=None
         self._links.clear()
+        if self.expire_on_commit:
+            for record in self._store.records.values(): self._store.expire(record,frozenset(record.mapping.field_columns),discard_changes=False)
         await self._emit('after_commit')
 
     async def rollback(self) -> None:

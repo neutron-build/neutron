@@ -20,7 +20,9 @@ class ConflictError(OrmError): pass
 class _SessionState:
     _database: Database | AsyncDatabase
     _transaction: object | None
-    def __init__(self,*,autobegin: bool=True,autoflush: bool=True) -> None:
+    def __init__(self,*,autobegin: bool=True,autoflush: bool=True,expire_on_commit: bool=False) -> None:
+        if type(expire_on_commit) is not bool: raise ValueError('expire_on_commit requires a boolean')
+        self.expire_on_commit=expire_on_commit
         self._store=StateStore()
         self._mappings: dict[tuple[Any,...],ModelMapping[Any]]={}
         self._closed=False;self._failed=False;self._uncertain=False
@@ -41,6 +43,7 @@ class _SessionState:
         if self._failed and not allow_failed: raise OrmError('mapped Session requires rollback')
 
     def _mapping(self,mapping: ModelMapping[T]) -> None:
+        if self.expire_on_commit and not mapping.instrumented: raise OrmError('expire_on_commit requires instrumented mappings')
         key=(mapping.table.schema,mapping.table.name)
         previous=self._mappings.get(key)
         if previous is not None and previous is not mapping: raise OrmError('mapping identity already registered with different metadata')
@@ -137,7 +140,7 @@ class _SessionState:
     def _existing_input(self,mapping: ModelMapping[T],obj: T,discard_changes: bool) -> dict[str,Any]:
         self._guard();self._mapping(mapping)
         if type(discard_changes) is not bool: raise ValueError('discard_changes requires a boolean')
-        values=mapping.snapshot(obj)
+        values=mapping._snapshot(obj) if discard_changes else mapping.snapshot(obj)
         self._store.check_existing_attach(mapping,obj,values)
         if not discard_changes:
             for name,column in mapping.field_columns.items(): column.spec.check(values[name])
@@ -147,7 +150,7 @@ class _SessionState:
         values={name:row[column.name] for name,column in mapping.field_columns.items()}
         for name,column in mapping.field_columns.items(): column.spec.check(values[name])
         # A caller or another task must not change input during the native read.
-        current=mapping.snapshot(obj)
+        current=mapping._snapshot(obj)
         if mapping.key(current)!=mapping.key(original): raise ConflictError('attach-existing primary key changed during read')
         if not discard_changes and any(not same_column_value(column.spec,current[name],values[name]) for name,column in mapping.field_columns.items()):
             raise ConflictError('attach-existing scalar values differ; explicitly discard changes')
@@ -192,11 +195,20 @@ class _SessionState:
         self._guard()
         if type(discard_changes) is not bool: raise ValueError('discard_changes requires a boolean')
         record=self._store.records.get(id(obj))
-        if record is None or record.state is not ObjectState.PERSISTENT or record.was_new:
+        if record is None or record.state not in {ObjectState.PERSISTENT,ObjectState.EXPIRED} or record.was_new:
             raise OrmError('refresh requires an existing persistent tracked object')
         dirty=self._store.dirty(record) # Primary-key mutation always refuses.
         if dirty and not discard_changes: raise OrmError('refresh refuses dirty scalar state; explicitly discard changes')
         return record
+
+    def expire(self,obj: object,*fields: str,discard_changes: bool=False) -> None:
+        self._guard()
+        if type(discard_changes) is not bool: raise ValueError('discard_changes requires a boolean')
+        record=self._store.records.get(id(obj))
+        if record is None: raise OrmError('expire requires tracked object')
+        names=frozenset(fields) if fields else frozenset(record.mapping.field_columns)
+        if names-record.mapping.field_columns.keys(): raise ValueError('expired field outside mapping')
+        self._store.expire(record,names,discard_changes=discard_changes)
 
     def detach(self,obj: object) -> None:
         self._guard()
@@ -248,6 +260,8 @@ class _SessionState:
                         mapping.field_columns[name].spec.check(value)
                         dirty[name]=value
                     plans.append((record,'update',{mapping.field_columns[name].name:value for name,value in dirty.items()}))
+            elif record.state is ObjectState.EXPIRED:
+                if self._store.dirty(record): raise OrmError('expired object has edited fields; explicitly refresh')
             elif record.state is ObjectState.DELETE_PENDING:
                 self._store.dirty(record) # reject changed primary key
                 plans.append((record,'delete',{}))
@@ -287,14 +301,14 @@ class _SessionState:
 class Session(_SessionState):
     _database: Database
     """Scalar dataclass identity/flush lifecycle. No relationships or lazy I/O."""
-    def __init__(self,database: Database,*,autobegin: bool=True,autoflush: bool=True,close_database: bool=False) -> None:
-        super().__init__(autobegin=autobegin,autoflush=autoflush)
+    def __init__(self,database: Database,*,autobegin: bool=True,autoflush: bool=True,close_database: bool=False,expire_on_commit: bool=False) -> None:
+        super().__init__(autobegin=autobegin,autoflush=autoflush,expire_on_commit=expire_on_commit)
         self._database=database;self._transaction: TransactionHandle | None=None
         self._owner=threading.get_ident();self._close_database=close_database
 
     @classmethod
-    def connect(cls,url: str,*,autobegin: bool=True,autoflush: bool=True) -> Session:
-        return cls(Database.connect(url),autobegin=autobegin,autoflush=autoflush,close_database=True)
+    def connect(cls,url: str,*,autobegin: bool=True,autoflush: bool=True,expire_on_commit: bool=False) -> Session:
+        return cls(Database.connect(url),autobegin=autobegin,autoflush=autoflush,close_database=True,expire_on_commit=expire_on_commit)
 
     def listen(self,event: EventName,callback: Callable[[SessionEvent],None]) -> None:
         self._guard()
@@ -358,7 +372,9 @@ class Session(_SessionState):
         values=self._key_values(mapping,key)
         if self.autoflush: self.flush()
         found=self._store.find(mapping,key)
-        if found is not None: return found
+        if found is not None:
+            if self._store.records[id(found)].state is ObjectState.EXPIRED: return self.refresh(found)
+            return found
         try:
             self._ensure_transaction()
             row=self._database.one_or_none(select_row(mapping.table,*mapping.field_columns.values()).where(self._predicate(mapping,values)))
@@ -478,6 +494,8 @@ class Session(_SessionState):
         else: self._store.committed()
         finally: self._transaction=None
         self._links.clear()
+        if self.expire_on_commit:
+            for record in self._store.records.values(): self._store.expire(record,frozenset(record.mapping.field_columns),discard_changes=False)
         self._emit('after_commit')
 
     def rollback(self) -> None:

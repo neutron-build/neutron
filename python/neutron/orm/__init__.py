@@ -39,3 +39,6 @@ __all__ += ["Aggregate","RowNumber","avg","count","max_value","min_value","row_n
 
 from .query import cte, derived
 __all__ += ["cte","derived"]
+
+from .instrumentation import ExpiredAttributeError
+__all__ += ["ExpiredAttributeError"]
