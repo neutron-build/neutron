@@ -193,15 +193,24 @@ export async function runTransaction<T>(
     pin.release(err);
   };
 
+  const assertActive = (): void => {
+    if (callbackSettled || released) throw new NeutronSqlError('transaction scope is settled; its pinned connection cannot be reused');
+  };
+
   const makeScope = (): TransactionScope => {
     const scope: TransactionScope = {
       async query<R>(sqlText: string, params: unknown[] = [], options?: QueryExecutionOptions): Promise<R[]> {
+        assertActive();
         return pin.query<R>(sqlText, params, options);
       },
-      execute: (sqlText: string, params?: unknown[], options?: QueryExecutionOptions) => pin.execute(sqlText, params, options),
+      async execute(sqlText: string, params?: unknown[], options?: QueryExecutionOptions): Promise<number> {
+        assertActive();
+        return pin.execute(sqlText, params, options);
+      },
       transaction: <Tx>(nested: (tx: TransactionScope) => Promise<Tx>): Promise<Tx> => runSavepoint(scope, nested),
       savepoint: (name?: string) => createSavepoint(name),
       async begin<Tx>(nested: (tx: TransactionScope) => Promise<Tx>, options?: TransactionModes): Promise<Tx> {
+        assertActive();
         if (options !== undefined && hasModes(options)) {
           throw new NeutronSqlError("isolation/read-only/deferrable are properties of the outer BEGIN — a nested transaction is a savepoint and takes no modes");
         }
@@ -214,7 +223,14 @@ export async function runTransaction<T>(
         terminate: () => Promise.resolve(),
       },
     };
-    if (typeof pin.prepare === "function") scope.prepare = (sqlText: string) => pin.prepare!(sqlText);
+    if (typeof pin.prepare === "function") scope.prepare = (sqlText: string) => {
+      assertActive();
+      const prepared = pin.prepare!(sqlText);
+      return { sql: prepared.sql, name: prepared.name,
+        async query<R>(params?: unknown[]): Promise<R[]> { assertActive(); return prepared.query<R>(params); },
+        async execute(params?: unknown[]): Promise<number> { assertActive(); return prepared.execute(params); },
+      };
+    };
     SCOPE_STATE.set(scope, () => !callbackSettled && !released);
     return scope;
   };
@@ -228,6 +244,7 @@ export async function runTransaction<T>(
   };
 
   const createSavepoint = async (name?: string): Promise<Savepoint> => {
+    assertActive();
     const spName = name === undefined ? nextAutoName() : name;
     if (!SAVEPOINT_NAME.test(spName)) {
       throw new NeutronSqlError(`savepoint name "${spName}" is not a plain identifier (letters, digits, underscore; must not start with a digit)`);
@@ -239,12 +256,14 @@ export async function runTransaction<T>(
     return {
       name: spName,
       async rollbackTo(): Promise<void> {
+        assertActive();
         if (state === "released") throw new NeutronSqlError(`savepoint "${spName}" was already released`);
         const sql = `rollback to savepoint "${spName}"`;
         await pin.execute(sql);
         emit({ kind: "savepoint", statementId: statementIdOf(sql), txId, savepointName: spName, savepointAction: "rollback-to" });
       },
       async release(): Promise<void> {
+        assertActive();
         if (state === "released") throw new NeutronSqlError(`savepoint "${spName}" was already released`);
         const sql = `release savepoint "${spName}"`;
         try {
@@ -258,6 +277,7 @@ export async function runTransaction<T>(
   };
 
   const runSavepoint = async <Tx>(scope: TransactionScope, nested: (tx: TransactionScope) => Promise<Tx>): Promise<Tx> => {
+    assertActive();
     const sp = await createSavepoint();
     try {
       const result = await nested(scope);

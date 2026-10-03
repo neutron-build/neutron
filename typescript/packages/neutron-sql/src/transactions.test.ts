@@ -13,6 +13,8 @@ import {
   runTransaction,
   validateRetryOptions,
   type PinnedExecutor,
+  type TransactionScope,
+  type Savepoint,
   type TransactionRetryOptions,
 } from "./transactions.js";
 import type { SqlEvent } from "./logger.js";
@@ -414,4 +416,26 @@ test("I02: retry annotates tx events with the attempt number", async () => {
   );
   const begins = events.filter((e) => e.kind === "tx-begin");
   assert.deepEqual(begins.map((e) => e.attempt), [1, 2]);
+});
+
+
+test("transaction terminal handles reject queries, writes, prepare and savepoints before touching a returned pin", async () => {
+  const pin = fakePin();
+  pin.prepare = sqlText => ({sql:sqlText,name:undefined,query:() => pin.query(sqlText),execute:() => pin.execute(sqlText)});
+  let scope!: TransactionScope;
+  let savepoint!: Savepoint;
+  let prepared!: ReturnType<NonNullable<TransactionScope["prepare"]>>;
+  await runTransaction(pin,async tx => { scope=tx; savepoint=await tx.savepoint(); prepared=tx.prepare!("select 1"); });
+  const before=[...pin.statements];
+  await assert.rejects(scope.query("select 2"),/scope is settled/);
+  await assert.rejects(scope.execute("insert into forbidden values(1)"),/scope is settled/);
+  await assert.rejects(scope.transaction(async()=>1),/scope is settled/);
+  await assert.rejects(scope.begin(async()=>1),/scope is settled/);
+  await assert.rejects(scope.savepoint(),/scope is settled/);
+  await assert.rejects(savepoint.rollbackTo(),/scope is settled/);
+  await assert.rejects(savepoint.release(),/scope is settled/);
+  await assert.rejects(prepared.query(),/scope is settled/);
+  await assert.rejects(prepared.execute(),/scope is settled/);
+  assert.throws(()=>scope.prepare!("select 3"),/scope is settled/);
+  assert.deepEqual(pin.statements,before);
 });
