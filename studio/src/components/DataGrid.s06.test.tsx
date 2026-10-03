@@ -272,3 +272,21 @@ describe('truncation notice and in-grid export', () => {
     expect(screen.queryByTitle(/^Download these rows as CSV/)).toBeNull()
   })
 })
+
+
+describe('grid action-column and read-only semantics', () => {
+  it('counts and indexes the action column without duplicating column one', () => {
+    render(<DataGrid result={result([[1, 'a', 2]])} columns={metaColumns()} onStageDelete={vi.fn()} canDelete />)
+    expect(gridElement().getAttribute('aria-colcount')).toBe('4')
+    expect(screen.getByRole('columnheader', { name: 'Row actions' }).getAttribute('aria-colindex')).toBe('1')
+    const headers = Array.from(document.querySelectorAll('thead th'))
+    expect(headers.map(header => header.getAttribute('aria-colindex'))).toEqual(['1', '2', '3', '4'])
+    const cells = Array.from(document.querySelectorAll('tbody td[role="gridcell"]'))
+    expect(cells.map(cell => cell.getAttribute('aria-colindex'))).toEqual(['1', '2', '3', '4'])
+  })
+
+  it('read-only query results explicitly announce that every cell is read-only', () => {
+    render(<DataGrid result={result([[1, 'a', 2]])} />)
+    for (const cell of document.querySelectorAll('td[role="gridcell"]')) expect(cell.getAttribute('aria-readonly')).toBe('true')
+  })
+})

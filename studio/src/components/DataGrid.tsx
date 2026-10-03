@@ -521,12 +521,12 @@ export function DataGrid({
           role="grid"
           aria-label={label ?? 'Result rows'}
           aria-rowcount={rowCount + 1}
-          aria-colcount={colCount}
+          aria-colcount={spanCols}
           onKeyDown={handleGridKey}
         >
           <thead ref={headRef}>
             <tr aria-rowindex={1}>
-              {deletable && <th class={`${s.th} ${s.thAction}`} scope="col"> </th>}
+              {deletable && <th class={`${s.th} ${s.thAction}`} scope="col" aria-colindex={1} aria-label="Row actions"> </th>}
               {result.columns.map((col, colIdx) => {
                 const meta = metaByCol.get(col)
                 const isPk = meta?.isKey ?? false
@@ -538,7 +538,7 @@ export function DataGrid({
                     key={col}
                     class={`${s.th}${isPk ? ` ${s.thPk}` : ''}${onSort ? ` ${s.thSortable}` : ''}`}
                     scope="col"
-                    aria-colindex={colIdx + 1}
+                    aria-colindex={colIdx + 1 + (deletable ? 1 : 0)}
                     aria-sort={ariaSort}
                     onClick={onSort ? (e => onSort(col, e.shiftKey)) : undefined}
                     title={onSort ? 'Click to sort by this column (asc → desc → off); Shift+click to add it to a multi-column sort' : undefined}
@@ -583,7 +583,7 @@ export function DataGrid({
                   tabIndex={-1}
                 >
                   {deletable && (
-                    <td class={s.tdAction}>
+                    <td class={s.tdAction} role="gridcell" aria-colindex={1} aria-readonly="true">
                       <button
                         class={s.deleteBtn}
                         tabIndex={-1}
@@ -608,8 +608,8 @@ export function DataGrid({
                         ref={isEditing ? (el => { editCellRef.current = el }) : undefined}
                         class={`${s.td}${cellFocused ? ` ${s.tdFocus}` : ''}${isActive ? ` ${s.tdActive}` : ''}${isEditing ? ` ${s.tdEditing}` : ''}`}
                         role="gridcell"
-                        aria-colindex={colIdx + 1}
-                        aria-readonly={editable ? !cellEditable(col) : undefined}
+                        aria-colindex={colIdx + 1 + (deletable ? 1 : 0)}
+                        aria-readonly={!cellEditable(col)}
                         data-col-index={colIdx}
                         data-editor-cell={isEditing ? '' : undefined}
                         tabIndex={isActive ? 0 : -1}
