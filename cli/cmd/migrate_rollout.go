@@ -193,6 +193,10 @@ func newRolloutOperatorCommand() *cobra.Command {
 		if err != nil {
 			return operatorFailure(cmd, "refused", "artifact_unreadable")
 		}
+		var exact db.RolloutArtifact
+		if operatorStrictJSON(raw, &exact) != nil {
+			return operatorFailure(cmd, "refused", "artifact_invalid")
+		}
 		artifact, err := db.ParseRolloutArtifact(raw)
 		if err != nil {
 			return operatorFailure(cmd, "refused", "artifact_invalid")
