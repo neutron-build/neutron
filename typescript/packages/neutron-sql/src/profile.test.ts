@@ -169,8 +169,8 @@ test("NP01: contradictory or unknown reported identities are refused and the ada
     [NUCLEUS_STARTUP, "PostgreSQL 16.0"],
     [NUCLEUS_STARTUP, NUCLEUS_VERSION.replace("1.2.0", "1.2.1")],
     ["17.6 (Debian 17.6-1)", "PostgreSQL 17.6 on x86_64"],
-    [undefined, NUCLEUS_VERSION],
-    [NUCLEUS_STARTUP, undefined],
+    [null, NUCLEUS_VERSION],
+    [NUCLEUS_STARTUP, null],
   ];
   for (const [startup, version] of cases) {
     const driver = fakeDriver(startup, version);
