@@ -531,7 +531,7 @@ Builtin int4/int8/numeric/date/local timestamp/instant timestamp ranges have
 explicit native subtype OIDs. Discrete PostgreSQL ranges can canonicalize writes:
 for example `[1,3]` returns `[1,4)`, and mapped RETURNING adopts that native value.
 Range values are immutable and replacement edits use normal snapshot rollback;
-range primary identities and multiranges remain unqualified.
+range primary identities remain unqualified; builtin multiranges are described below.
 
 Qualified enum/domain admission is explicit native I/O. `db.enum_spec(schema,
 name)` returns `ColumnSpec[PgEnum]`; `db.domain_spec(schema, name,
@@ -554,7 +554,7 @@ catalog metadata refuse. Query aliases/derived sources and explicit subqueries
 retain this ownership. Catalog admission is a point-in-time contract: rebuild
 metadata after DDL. A Session can share the admitted Database via `Session(db)`
 or AsyncSession(db); metadata admission remains outside automatic flush/property
-access. User multirange/composite adapters remain unqualified. Scalar domain primary
+access. User-defined multirange adapters and composite adapters beyond the declared builtin profile remain unqualified. Scalar domain primary
 identities retain their qualified tags and normalize underlying instant keys to
 UTC; nonfinite numeric keys refuse. PostgreSQL interval equality can equate
 different month/day representations, so interval, array, range and JSON primary
@@ -624,6 +624,21 @@ Typed equality/membership qualify the extension's operator schema, including
 when it is outside the search path. Sync/async mapping, replacement and rollback
 share the contract. Other extension families (`halfvec`, `sparsevec`, bit) and
 vector primary-key identity require separate qualification and are unsupported.
+
+`db.multirange_spec('int4multirange')` (awaited on `AsyncDatabase`) admits one of the six
+builtin PostgreSQL 14+ multirange types (int4/int8/num/ts/tstz/date) by proving its
+exact `pg_catalog` OID, `typtype 'm'`, range OID and subtype OID in `pg_type`/`pg_range`
+on the connection; older servers and every user-defined multirange refuse. Values are
+immutable `PgMultirange(ranges, spec.native_type)` tuples of non-empty `PgRange` members.
+The strict constructor accepts only the server's canonical form (ordered, disjoint, not
+touching, discrete types in `[lower,upper)` form) and refuses anything else;
+`PgMultirange.from_ranges(ranges, identity)` is the explicit normalizer that drops empty
+members, canonicalizes discrete bounds, sorts and merges. An empty multirange `{}` is a real
+value distinct from SQL NULL (`None`). The binary codec checks count, member lengths, flags,
+trailing bytes and finite budgets (4096 ranges, 1 MiB) and the dumper refuses another
+connection's identity. Multirange columns require `catalog_table` admission; enum/domain/
+composite/array wrappers around multiranges and multirange primary identities refuse.
+Equality and membership use `OPERATOR(pg_catalog.=)`.
 
 Pass `observer=QueryObserver(capacity=256)` to native `Database.connect`,
 `AsyncDatabase.connect`, `Session.connect` or `AsyncSession.connect`. The shared

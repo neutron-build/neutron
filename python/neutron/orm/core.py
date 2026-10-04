@@ -11,6 +11,7 @@ from .json_value import BoundJson, JsonDocument, MutableJson
 from .network_value import Inet,CIDR
 from .composite_value import PgComposite,BoundComposite
 from .vector_value import PgVector,BoundVector
+from .multirange_value import BoundMultirange,MULTIRANGE_OIDS,PgMultirange
 from .catalog_value import BoundCatalog, CatalogType, PgDomain, PgEnum
 from .pg_value import BoundArray, BoundRange, PgArray, PgRange, TimeOfDay, Interval
 
@@ -64,6 +65,7 @@ class ColumnSpec(Generic[T]):
             if not isinstance(self.native_type,CatalogType): raise ValueError('catalog type admission required')
             if self.sql_type=='vector' and self.python_type is PgVector and self.native_type.kind=='b' and self.native_type.name=='vector' and not self.composite_fields and self.domain_base is None: return
             if self.sql_type=='composite' and self.python_type is PgComposite and self.native_type.kind=='c' and self.composite_fields and all(isinstance(spec,ColumnSpec) and spec.native_type is None for _,spec in self.composite_fields): return
+            if self.python_type is PgMultirange and self.sql_type in MULTIRANGE_OIDS and self.native_type.kind=='m' and self.native_type.name==self.sql_type and self.native_type.schema=='pg_catalog' and self.native_type.oid==MULTIRANGE_OIDS[self.sql_type][0] and not self.composite_fields and self.domain_base is None: return
             if self.sql_type=='enum' and self.python_type is PgEnum and self.native_type.kind=='e' and self.domain_base is None: return
             if self.sql_type=='domain' and self.python_type is PgDomain and self.native_type.kind=='d' and isinstance(self.domain_base,ColumnSpec) and self.domain_base.type_oid==self.native_type.base_oid and (self.domain_base.native_type is None or self.domain_base.native_type.kind=='e' and self.domain_base.native_type._owner is self.native_type._owner): return
             raise ValueError('catalog kind/base type mismatch')
@@ -106,6 +108,10 @@ class ColumnSpec(Generic[T]):
             if isinstance(value,PgDomain):
                 assert self.domain_base is not None
                 self.domain_base.check(value.value)
+        if isinstance(value,PgMultirange):
+            if value.identity is not self.native_type: raise ValueError('multirange qualified identity mismatch')
+            member_spec: ColumnSpec[Any]=ColumnSpec(PgRange,MULTIRANGE_OIDS[value.identity.name][1])
+            for member in value.ranges: member_spec.check(member)
         if isinstance(value,PgRange):
             element_type=_RANGE_TYPES[self.sql_type]
             range_element: ColumnSpec[Any]=ColumnSpec(_TYPES[element_type],element_type)
@@ -239,7 +245,7 @@ class Column(Generic[T]):
         if self.spec.sql_type=='vector':
             assert self.spec.native_type is not None
             return 'OPERATOR('+_bound_quote(self.spec.native_type.schema)+'.=)'
-        return 'OPERATOR(pg_catalog.=)' if self._enum_comparison_type is not None else '='
+        return 'OPERATOR(pg_catalog.=)' if self._enum_comparison_type is not None or self.spec.python_type is PgMultirange else '='
 
     def _owned(self) -> None:
         if self.table.columns.get(self.name) is not self:
@@ -265,7 +271,7 @@ class Column(Generic[T]):
         values=tuple(values)
         if not values: return Predicate('FALSE',(),frozenset({self.table}))
         for value in values: self.spec.check(value)
-        if self._enum_comparison_type is not None or self.spec.sql_type=='vector':
+        if self._enum_comparison_type is not None or self.spec.sql_type=='vector' or self.spec.python_type is PgMultirange:
             return Predicate(f'{self._comparison_sql} {self._comparison_operator} ANY(ARRAY[{", ".join(self._comparison_bind for _ in values)}])',tuple(_parameter(self,value) for value in values),frozenset({self.table}))
         return Predicate(f'{self._bound_sql} IN ({", ".join("%s" for _ in values)})',tuple(_parameter(self,value) for value in values),frozenset({self.table}))
 
@@ -393,6 +399,7 @@ def delete(table: Table, *, where: Predicate) -> Mutation:
 
 def _parameter(column: Column[Any], value: object) -> object:
     if isinstance(value,PgVector): return BoundVector(value)
+    if isinstance(value,PgMultirange): return BoundMultirange(value)
     if isinstance(value,PgComposite): return BoundComposite(value,column.spec.composite_fields)
     if isinstance(value,PgEnum): return BoundCatalog(value.label,value.identity)
     if isinstance(value,PgDomain): return BoundCatalog(value.value,value.identity,column.spec.domain_base)

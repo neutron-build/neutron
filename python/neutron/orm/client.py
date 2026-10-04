@@ -10,6 +10,7 @@ from .json_value import load_document, native_params
 from .query import Query
 from .sql_admission import validate_scope_sql
 from .vector_value import PgVector,VECTOR_SQL,admitted_vector,register_vector
+from .multirange_value import MULTIRANGE_OIDS,MULTIRANGE_SQL,PgMultirange,admitted_multirange,register_multirange
 from .composite_value import PgComposite,COMPOSITE_SQL,admitted_components,register_composite
 from .catalog_value import CatalogType, PgDomain, PgEnum, TYPE_SQL, TABLE_SQL, admitted_type, register_catalog_values
 from .core import ColumnSpec, Table, quote, CardinalityError, Compiled, Mutation, OrmError, Returning, Select, SessionBusyError
@@ -144,6 +145,17 @@ class Database:
             cached=ColumnSpec(PgVector,'vector',native_type=identity);self._catalog_specs[(schema,name)]=cached
         from dataclasses import replace
         return cast(ColumnSpec[PgVector],replace(cached,nullable=nullable,generated=generated))
+
+    def multirange_spec(self,sql_type: str,*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgMultirange]:
+        entry=MULTIRANGE_OIDS.get(sql_type)
+        if entry is None: raise ValueError('only builtin PostgreSQL multirange types are admitted')
+        identity=admitted_multirange(self._catalog_read(MULTIRANGE_SQL,(entry[0],)),sql_type,self._catalog_owner)
+        cached=self._catalog_specs.get(('pg_catalog',sql_type))
+        if cached is None or cached.native_type!=identity:
+            register_multirange(self._conn,self._catalog_owner,identity)
+            cached=ColumnSpec(PgMultirange,sql_type,native_type=identity);self._catalog_specs[('pg_catalog',sql_type)]=cached
+        from dataclasses import replace
+        return cast(ColumnSpec[PgMultirange],replace(cached,nullable=nullable,generated=generated))
 
     def composite_spec(self,schema: str,name: str,fields: Mapping[str,ColumnSpec[Any]],*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgComposite]:
         quote(schema);quote(name)
@@ -456,6 +468,17 @@ class AsyncDatabase:
             cached=ColumnSpec(PgVector,'vector',native_type=identity);self._catalog_specs[(schema,name)]=cached
         from dataclasses import replace
         return cast(ColumnSpec[PgVector],replace(cached,nullable=nullable,generated=generated))
+
+    async def multirange_spec(self,sql_type: str,*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgMultirange]:
+        entry=MULTIRANGE_OIDS.get(sql_type)
+        if entry is None: raise ValueError('only builtin PostgreSQL multirange types are admitted')
+        identity=admitted_multirange(await self._catalog_read(MULTIRANGE_SQL,(entry[0],)),sql_type,self._catalog_owner)
+        cached=self._catalog_specs.get(('pg_catalog',sql_type))
+        if cached is None or cached.native_type!=identity:
+            register_multirange(self._conn,self._catalog_owner,identity)
+            cached=ColumnSpec(PgMultirange,sql_type,native_type=identity);self._catalog_specs[('pg_catalog',sql_type)]=cached
+        from dataclasses import replace
+        return cast(ColumnSpec[PgMultirange],replace(cached,nullable=nullable,generated=generated))
 
     async def composite_spec(self,schema: str,name: str,fields: Mapping[str,ColumnSpec[Any]],*,nullable: bool=False,generated: bool=False) -> ColumnSpec[PgComposite]:
         quote(schema);quote(name)

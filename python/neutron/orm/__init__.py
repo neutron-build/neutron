@@ -80,6 +80,9 @@ __all__ += ["PgComposite"]
 from .vector_value import PgVector
 __all__ += ["PgVector"]
 
+from .multirange_value import PgMultirange
+__all__ += ["PgMultirange"]
+
 from .observability import QueryObserver,QueryEvent,QueryMetrics
 __all__ += ["QueryObserver","QueryEvent","QueryMetrics"]
 
