@@ -1693,13 +1693,18 @@ async fn count_of(ex: &Executor, sql: &str) -> i64 {
 /// default engine and on mergetree.
 #[tokio::test]
 async fn unique_index_rejects_duplicate_insert_on_both_engines() {
-    for (table, engine) in [
-        ("ut", ""),
-        ("ut2", " engine=mergetree ORDER BY (k)"),
-    ] {
+    for (table, engine) in [("ut", ""), ("ut2", " engine=mergetree ORDER BY (k)")] {
         let ex = test_executor();
-        exec(&ex, &format!("CREATE TABLE {table} (k TEXT, v TEXT){engine}")).await;
-        exec(&ex, &format!("CREATE UNIQUE INDEX {table}_k ON {table} (k)")).await;
+        exec(
+            &ex,
+            &format!("CREATE TABLE {table} (k TEXT, v TEXT){engine}"),
+        )
+        .await;
+        exec(
+            &ex,
+            &format!("CREATE UNIQUE INDEX {table}_k ON {table} (k)"),
+        )
+        .await;
         exec(&ex, &format!("INSERT INTO {table} VALUES ('a','1')")).await;
 
         let err = ex
@@ -1728,17 +1733,18 @@ async fn unique_index_rejects_duplicate_insert_on_both_engines() {
 /// each other, on both engines.
 #[tokio::test]
 async fn unique_index_allows_multiple_nulls() {
-    for (table, engine) in [
-        ("utn", ""),
-        ("utn2", " engine=mergetree ORDER BY (k)"),
-    ] {
+    for (table, engine) in [("utn", ""), ("utn2", " engine=mergetree ORDER BY (k)")] {
         let ex = test_executor();
         exec(
             &ex,
             &format!("CREATE TABLE {table} (k INT, v TEXT){engine}"),
         )
         .await;
-        exec(&ex, &format!("CREATE UNIQUE INDEX {table}_k ON {table} (k)")).await;
+        exec(
+            &ex,
+            &format!("CREATE UNIQUE INDEX {table}_k ON {table} (k)"),
+        )
+        .await;
         exec(
             &ex,
             &format!("INSERT INTO {table} VALUES (NULL,'1'), (NULL,'2'), (1,'a')"),
@@ -1793,11 +1799,19 @@ async fn unique_index_failed_dup_then_other_insert_works() {
     exec(&ex, "CREATE TABLE utf (k TEXT, v TEXT)").await;
     exec(&ex, "CREATE UNIQUE INDEX utf_k ON utf (k)").await;
     exec(&ex, "INSERT INTO utf VALUES ('a','1')").await;
-    assert!(ex.execute("INSERT INTO utf VALUES ('a','2')").await.is_err());
+    assert!(
+        ex.execute("INSERT INTO utf VALUES ('a','2')")
+            .await
+            .is_err()
+    );
     exec(&ex, "INSERT INTO utf VALUES ('b','9')").await;
     assert_eq!(count_of(&ex, "SELECT count(*) FROM utf").await, 2);
     // And the rejected key is still occupiable by no one else.
-    assert!(ex.execute("INSERT INTO utf VALUES ('a','3')").await.is_err());
+    assert!(
+        ex.execute("INSERT INTO utf VALUES ('a','3')")
+            .await
+            .is_err()
+    );
 }
 
 /// Uniqueness across the transactional boundary the way the engine's DML

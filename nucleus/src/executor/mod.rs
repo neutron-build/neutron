@@ -6295,10 +6295,8 @@ impl Executor {
                 {
                     let assigned: std::collections::HashSet<&str> =
                         assignments.iter().map(|(c, _)| c.as_str()).collect();
-                    let touches_unique_index = self
-                        .catalog
-                        .get_indexes_cached(table)
-                        .is_none_or(|idxs| {
+                    let touches_unique_index =
+                        self.catalog.get_indexes_cached(table).is_none_or(|idxs| {
                             idxs.iter().any(|idx| {
                                 idx.unique
                                     && idx
