@@ -16,7 +16,7 @@ MULTIRANGE_OIDS={'int4multirange':(4451,'int4range',3904,23),'int8multirange':(4
 _DISCRETE=frozenset({'int4multirange','int8multirange','datemultirange'})
 
 def _cmp(left: Any,right: Any) -> int:
-    try: return (left>right)-(left<right)
+    try: return int(left>right)-int(left<right)
     except (TypeError,InvalidOperation) as exc: raise ValueError('multirange bounds require comparable finite values') from exc
 
 def _separated(previous: PgRange[Any],following: PgRange[Any]) -> bool:
@@ -112,14 +112,15 @@ def register_multirange(connection: Any,owner: object,identity: CatalogType) -> 
     from .pg_adapters import ARRAY_OIDS,RANGE_OIDS,_adapter_classes
     entry=MULTIRANGE_OIDS.get(identity.name)
     if entry is None or identity.kind!='m' or identity.oid!=entry[0]: raise ValueError('qualified builtin multirange identity required')
+    range_name,range_oid=entry[1],entry[2]
     classes=_adapter_classes();range_start=5+len(ARRAY_OIDS)
-    range_dumper=classes[range_start];range_loader=classes[range_start+1+list(RANGE_OIDS).index(entry[1])]
+    range_dumper=classes[range_start];range_loader=classes[range_start+1+list(RANGE_OIDS).index(range_name)]
     class MultirangeLoader(Loader):
         format=Format.BINARY
         def __init__(self,oid: int,context: Any=None) -> None:
             super().__init__(oid,context)
             if context is None: raise ValueError('multirange codec requires connection context')
-            self.range_loader=range_loader(entry[2],context)
+            self.range_loader=range_loader(range_oid,context)
         def load(self,data: Any) -> PgMultirange:
             raw=bytes(data)
             if len(raw)<4 or len(raw)>MAX_MULTIRANGE_BYTES: raise ValueError('native multirange header/byte budget mismatch')
@@ -143,10 +144,10 @@ def register_multirange(connection: Any,owner: object,identity: CatalogType) -> 
         def dump(self,obj: BoundMultirange) -> bytes:
             value=obj.value
             if not isinstance(value,PgMultirange) or value.identity._owner is not owner: raise ValueError('multirange binding belongs to another connection')
-            member_dumper=range_dumper(BoundRange,self.context);range_name=MULTIRANGE_OIDS[value.identity.name][1]
+            member_dumper=range_dumper(BoundRange,self.context);member_name=MULTIRANGE_OIDS[value.identity.name][1]
             parts=[struct.pack('!i',len(value.ranges))];total=4
             for member in value.ranges:
-                encoded=member_dumper.dump(BoundRange(member,range_name))
+                encoded=member_dumper.dump(BoundRange(member,member_name))
                 if encoded is None: raise ValueError('non-empty multirange member encoded NULL')
                 raw=bytes(encoded);total+=4+len(raw)
                 if total>MAX_MULTIRANGE_BYTES: raise ValueError('multirange native byte budget exceeded')

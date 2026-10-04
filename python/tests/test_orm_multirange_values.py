@@ -192,3 +192,21 @@ def test_mapping_identity_refusal_snapshot_equality_and_composite_domain_refusal
     assert same_value(one,PgMultirange((r(1,3),),identity)) and not same_value(one,PgMultirange((r(1,4),),identity)) and not same_value(one,PgMultirange((r(1,3),),ident(owner=owner)))
     from neutron.orm.composite_value import admitted_components
     with pytest.raises(ValueError): admitted_components([{'name':'m','oid':4451}],{'m':spec})
+
+
+def test_one_connection_dumps_every_admitted_multirange_type_with_its_own_range_profile():
+    from psycopg import adapters
+    from psycopg.adapt import AdaptersMap,PyFormat
+    from psycopg.pq import Format
+    owner=object();small,big=ident('int4multirange',owner),ident('int8multirange',owner)
+    class Context:
+        def __init__(self): self.adapters=AdaptersMap(adapters);self.connection=None
+    context=Context();register_multirange(context,owner,small);register_multirange(context,owner,big)
+    dumper=context.adapters.get_dumper(BoundMultirange,PyFormat.BINARY)(BoundMultirange,context)
+    first=PgMultirange((r(1,3),),small);second=PgMultirange((r(1,3),),big)
+    assert dumper.dump(BoundMultirange(first))==_multirange(_range(2,struct.pack('!i',1),struct.pack('!i',3)))
+    assert dumper.dump(BoundMultirange(second))==_multirange(_range(2,struct.pack('!q',1),struct.pack('!q',3)))
+    for identity,value in ((small,first),(big,second)):
+        loader=context.adapters.get_loader(identity.oid,Format.BINARY)(identity.oid,context)
+        assert loader.load(dumper.dump(BoundMultirange(value)))==value
+    assert dumper.upgrade(BoundMultirange(second),PyFormat.BINARY).oid==4536
