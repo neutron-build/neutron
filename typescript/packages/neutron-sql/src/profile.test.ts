@@ -112,7 +112,7 @@ async function nucleusDb(driver: Fake = fakeDriver()) {
   return createDatabase({ driver, profile: NUCLEUS_CANDIDATE_PROFILE, tables: { docs, plain } });
 }
 
-async function refused(driver: Fake, body: () => PromiseLike<unknown>): Promise<void> {
+async function refused(driver: Fake, body: () => unknown): Promise<void> {
   const before = userCalls(driver).length;
   await assert.rejects(
     async () => {
