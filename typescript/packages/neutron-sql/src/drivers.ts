@@ -38,6 +38,7 @@ import {
   isModuleNotFoundError,
 } from "./errors.js";
 import {
+  renderBeginSql,
   runTransaction,
   type PinnedExecutor,
   type QueryExecutionOptions,
@@ -467,6 +468,7 @@ export function wrapPostgresJs(client: PostgresJsClient, options: WrapAdapterOpt
       finally { pin.release(); }
     },
     async begin<T>(fn: (tx: Driver) => Promise<T>, modes?: TransactionModes): Promise<T> {
+      renderBeginSql(modes); // invalid modes must refuse before a connection is pinned
       const pin = await postgresJsPin();
       return runTransaction(pin, (scope: TransactionScope) => fn(scope), modes);
     },
@@ -803,6 +805,7 @@ export function wrapPgPool(pool: PgPoolLike, options: WrapAdapterOptions = {}): 
       }
     },
     async begin<T>(fn: (tx: Driver) => Promise<T>, modes?: TransactionModes): Promise<T> {
+      renderBeginSql(modes); // invalid modes must refuse before a connection is pinned
       const pin = await pgPin(pool, cancellationPool);
       return runTransaction(pin, (scope: TransactionScope) => fn(scope), modes);
     },
