@@ -8,12 +8,29 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/neutron-build/neutron/go/orm"
 )
 
 var ErrResponse = errors.New("ormhttp: response outside configured bounds")
+
+// ApplicationError is returned by a Handler to roll back the request
+// transaction and answer with an application-defined client error. Response
+// must carry an explicit status from 400 through 499 and satisfy the same
+// bounds as a committed Response; otherwise the request fails with the generic
+// 503. The response is written only after the rollback completed cleanly, so an
+// ApplicationError never reports success for a write. Its Error text is fixed
+// and generic. A Handler may wrap it (errors.As is used), but any other error
+// text is never sent to the client. Ordinary errors still answer a generic 503.
+type ApplicationError struct {
+	Response Response
+}
+
+func (e *ApplicationError) Error() string {
+	return "ormhttp: application response requires rollback"
+}
 
 // Response is validated and copied before committing. Streaming/hijacking and
 // arbitrary ResponseWriter access cannot precede the database commit boundary.
@@ -22,16 +39,26 @@ type Response struct {
 	Header http.Header
 	Body   []byte
 }
+
+// RequestSession is borrowed for one request. WriteSession is the one hook
+// write session bound to Scope: hooks, deferred graphs and the hook queue join
+// the request transaction. It becomes terminal when the Handler returns and
+// has no commit or rollback controls. AfterCommit hooks run only after the
+// request transaction committed and before the response is written.
 type RequestSession struct {
-	Scope    *orm.Scope
-	Executor orm.Executor
-	Metrics  *orm.QueryMetrics
+	Scope        *orm.Scope
+	Executor     orm.Executor
+	Metrics      *orm.QueryMetrics
+	WriteSession *orm.WriteSession
 }
 type Handler func(context.Context, RequestSession, *http.Request) (Response, error)
 type Options struct {
 	Transaction      orm.TransactionOptions
 	MaxResponseBytes int
 	Observer         orm.QueryObserver // shared callback must support concurrent requests
+	// HookDispatchTimeout cooperatively bounds AfterCommit dispatch; zero means
+	// five seconds and negative values are refused.
+	HookDispatchTimeout time.Duration
 }
 
 // Transactions leases one fresh Scope per admitted request. Shutdown stops new
@@ -45,13 +72,22 @@ type Transactions struct {
 	next    uint64
 	active  map[uint64]context.CancelFunc
 	drained chan struct{}
+	// transact is the owned transaction runner; tests substitute a fake.
+	transact func(context.Context, func(*orm.Scope, *orm.WriteSession) error) error
 }
 
 func NewTransactions(pool *pgxpool.Pool, options Options) (*Transactions, error) {
 	if pool == nil || options.MaxResponseBytes <= 0 || options.MaxResponseBytes > 64<<20 {
 		return nil, ErrResponse
 	}
-	return &Transactions{pool: pool, options: options, active: map[uint64]context.CancelFunc{}, drained: make(chan struct{})}, nil
+	if options.HookDispatchTimeout < 0 {
+		return nil, errors.New("ormhttp: negative hook dispatch timeout")
+	}
+	t := &Transactions{pool: pool, options: options, active: map[uint64]context.CancelFunc{}, drained: make(chan struct{})}
+	t.transact = func(ctx context.Context, callback func(*orm.Scope, *orm.WriteSession) error) error {
+		return orm.WithScopedHookTransaction(ctx, t.pool, orm.HookTransactionOptions{Transaction: t.options.Transaction, DispatchTimeout: t.options.HookDispatchTimeout}, callback)
+	}
+	return t, nil
 }
 func (t *Transactions) acquire(parent context.Context) (context.Context, func(), bool) {
 	t.mu.Lock()
@@ -131,6 +167,31 @@ func snapshotResponse(response Response, max int) (Response, error) {
 	response.Body = append([]byte(nil), response.Body...)
 	return response, nil
 }
+
+// snapshotApplicationResponse additionally requires an explicit 4xx status: the
+// zero Status of an ordinary Response means 200 and is not a client error.
+func snapshotApplicationResponse(response Response, max int) (Response, error) {
+	if response.Status < 400 || response.Status > 499 {
+		return Response{}, ErrResponse
+	}
+	return snapshotResponse(response, max)
+}
+
+// rolledBackCleanly reports that the transaction definitely rolled back, no
+// COMMIT was attempted, the connection was not left in a broken or leaking
+// state, and the request was not canceled or shut down.
+func rolledBackCleanly(ctx context.Context, err error) bool {
+	var transaction *orm.TransactionError
+	if !errors.As(err, &transaction) || transaction.Outcome != orm.CommitNotAttempted || ctx.Err() != nil {
+		return false
+	}
+	for _, refused := range []error{orm.ErrTransactionBroken, orm.ErrScopeLeak, orm.ErrHookLeak, orm.ErrCommitAmbiguous} {
+		if errors.Is(err, refused) {
+			return false
+		}
+	}
+	return true
+}
 func (t *Transactions) Handler(callback Handler) (http.Handler, error) {
 	if callback == nil {
 		return nil, errors.New("ormhttp: request callback required")
@@ -143,8 +204,9 @@ func (t *Transactions) Handler(callback Handler) (http.Handler, error) {
 		}
 		defer release()
 		var response Response
+		var refusal *Response
 		metrics := &orm.QueryMetrics{}
-		err := orm.WithTransaction(ctx, t.pool, t.options.Transaction, func(scope *orm.Scope) error {
+		err := t.transact(ctx, func(scope *orm.Scope, writes *orm.WriteSession) error {
 			observed := orm.ObserveExecutor(scope, func(ctx context.Context, event orm.QueryEvent) {
 				metrics.Observe(ctx, event)
 				// ObserveExecutor isolates this closure's optional callback panic.
@@ -152,25 +214,46 @@ func (t *Transactions) Handler(callback Handler) (http.Handler, error) {
 					t.options.Observer(ctx, event)
 				}
 			})
-			candidate, err := callback(ctx, RequestSession{Scope: scope, Executor: observed, Metrics: metrics}, r.WithContext(ctx))
+			candidate, err := callback(ctx, RequestSession{Scope: scope, Executor: observed, Metrics: metrics, WriteSession: writes}, r.WithContext(ctx))
 			if err != nil {
+				var application *ApplicationError
+				if errors.As(err, &application) && application != nil {
+					// Copied now, bounded before any rollback outcome is known. An
+					// invalid response leaves refusal nil and fails closed to 503.
+					if snapshot, snapshotErr := snapshotApplicationResponse(application.Response, t.options.MaxResponseBytes); snapshotErr == nil {
+						refusal = &snapshot
+					}
+				}
 				return err
 			}
 			response, err = snapshotResponse(candidate, t.options.MaxResponseBytes)
 			return err
 		})
 		if err != nil {
-			// Commit failure can be indeterminate: the generic response never promises
-			// rollback or recommends replay. Original errors remain in core APIs.
-			http.Error(w, "database request did not complete", http.StatusServiceUnavailable)
+			var committed *orm.CommittedDispatchError
+			switch {
+			case errors.As(err, &committed):
+				// COMMIT was acknowledged but AfterCommit dispatch failed. 503 would
+				// invite replay of a committed write, so this is a distinct 500.
+				http.Error(w, "database request committed; follow-up processing failed", http.StatusInternalServerError)
+			case refusal != nil && rolledBackCleanly(ctx, err):
+				writeResponse(w, *refusal)
+			default:
+				// Commit failure can be indeterminate: the generic response never promises
+				// rollback or recommends replay. Original errors remain in core APIs.
+				http.Error(w, "database request did not complete", http.StatusServiceUnavailable)
+			}
 			return
 		}
-		for key, values := range response.Header {
-			for _, value := range values {
-				w.Header().Add(key, value)
-			}
-		}
-		w.WriteHeader(response.Status)
-		_, _ = w.Write(response.Body)
+		writeResponse(w, response)
 	}), nil
+}
+func writeResponse(w http.ResponseWriter, response Response) {
+	for key, values := range response.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(response.Status)
+	_, _ = w.Write(response.Body)
 }
