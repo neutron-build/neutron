@@ -7062,7 +7062,7 @@ impl Executor {
                 let _ = block.close(false).await;
                 return Err(e);
             }
-            let r = match self.execute_statement(stmt).await {
+            let r = match Box::pin(self.execute_statement(stmt)).await {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = block.close(false).await;
@@ -7206,11 +7206,9 @@ impl Executor {
         let execution = derived_coherence::READ_GENERATION
             .scope(read_generation, self.execute_statement_inner(stmt));
         let result = if let Some(ref writer) = writer {
-            derived_coherence::WRITER_GENERATION
-                .scope(writer.generation, execution)
-                .await
+            Box::pin(derived_coherence::WRITER_GENERATION.scope(writer.generation, execution)).await
         } else {
-            execution.await
+            Box::pin(execution).await
         };
 
         if result.is_ok()
@@ -7402,7 +7400,9 @@ impl Executor {
                 // streamed query bypasses the materialized cache. Non-wire
                 // consumers collapse it at the materialization boundary.
                 #[cfg(feature = "server")]
-                if !has_row_locks && let Some(stream) = self.try_streaming_scan(&query).await? {
+                if !has_row_locks
+                    && let Some(stream) = Box::pin(self.try_streaming_scan(&query)).await?
+                {
                     return Ok(stream);
                 }
 
@@ -7412,7 +7412,8 @@ impl Executor {
                 // would return MemoryExceeded. Falls through (None) for every
                 // shape it does not handle, and never engages without a limit.
                 #[cfg(feature = "server")]
-                if !has_row_locks && let Some(stream) = self.try_streaming_aggregate(&query).await?
+                if !has_row_locks
+                    && let Some(stream) = Box::pin(self.try_streaming_aggregate(&query)).await?
                 {
                     return Ok(stream);
                 }
@@ -7422,7 +7423,9 @@ impl Executor {
                 // so a large SELECT DISTINCT completes under a budget. Falls
                 // through (None) for every shape it does not handle.
                 #[cfg(feature = "server")]
-                if !has_row_locks && let Some(stream) = self.try_streaming_distinct(&query).await? {
+                if !has_row_locks
+                    && let Some(stream) = Box::pin(self.try_streaming_distinct(&query)).await?
+                {
                     return Ok(stream);
                 }
 
@@ -7432,7 +7435,9 @@ impl Executor {
                 // materialized hash-join build would return MemoryExceeded. Falls
                 // through (None) for every shape it does not handle.
                 #[cfg(feature = "server")]
-                if !has_row_locks && let Some(stream) = self.try_streaming_join(&query).await? {
+                if !has_row_locks
+                    && let Some(stream) = Box::pin(self.try_streaming_join(&query)).await?
+                {
                     return Ok(stream);
                 }
 
@@ -7478,55 +7483,58 @@ impl Executor {
                 }
                 result
             }
-            Statement::CreateTable(create) => self.execute_create_table(create).await,
-            Statement::Insert(insert) => self.execute_insert(insert).await,
-            Statement::Update(update) => self.execute_update(update).await,
-            Statement::Delete(delete) => self.execute_delete(delete).await,
+            Statement::CreateTable(create) => Box::pin(self.execute_create_table(create)).await,
+            Statement::Insert(insert) => Box::pin(self.execute_insert(insert)).await,
+            Statement::Update(update) => Box::pin(self.execute_update(update)).await,
+            Statement::Delete(delete) => Box::pin(self.execute_delete(delete)).await,
             Statement::Explain {
                 statement, analyze, ..
-            } => self.execute_explain(*statement, analyze).await,
+            } => Box::pin(self.execute_explain(*statement, analyze)).await,
             Statement::Drop {
                 object_type,
                 names,
                 if_exists,
                 ..
-            } => self.execute_drop(object_type, names, if_exists).await,
-            Statement::CreateIndex(create_index) => self.execute_create_index(create_index).await,
+            } => Box::pin(self.execute_drop(object_type, names, if_exists)).await,
+            Statement::CreateIndex(create_index) => {
+                Box::pin(self.execute_create_index(create_index)).await
+            }
             Statement::StartTransaction { ref modes, .. } => {
                 // ISOLATION LEVEL and READ ONLY are applied to the transaction
                 // (`begin_transaction_with`); a level the engine cannot provide
                 // is refused there rather than run weaker than reported.
-                self.begin_transaction_with(txn_modes::TxnModes::from_ast(modes))
-                    .await
+                Box::pin(self.begin_transaction_with(txn_modes::TxnModes::from_ast(modes))).await
             }
-            Statement::Commit { .. } => self.commit_transaction().await,
+            Statement::Commit { .. } => Box::pin(self.commit_transaction()).await,
             Statement::Rollback {
                 savepoint: Some(ref sp),
                 ..
-            } => self.execute_rollback_to_savepoint(&sp.value).await,
-            Statement::Rollback { .. } => self.rollback_transaction().await,
-            Statement::Savepoint { name } => self.execute_savepoint(&name.value).await,
+            } => Box::pin(self.execute_rollback_to_savepoint(&sp.value)).await,
+            Statement::Rollback { .. } => Box::pin(self.rollback_transaction()).await,
+            Statement::Savepoint { name } => Box::pin(self.execute_savepoint(&name.value)).await,
             Statement::ReleaseSavepoint { name } => {
-                self.execute_release_savepoint(&name.value).await
+                Box::pin(self.execute_release_savepoint(&name.value)).await
             }
             Statement::Set(ast::Set::SetTransaction {
                 ref modes, session, ..
-            }) => self.execute_set_transaction(modes, session).await,
+            }) => Box::pin(self.execute_set_transaction(modes, session)).await,
             Statement::Set(set) => match crate::sql::set_constraints_spec(&set) {
-                Some(spec) => self.execute_set_constraints(&spec).await,
+                Some(spec) => Box::pin(self.execute_set_constraints(&spec)).await,
                 None => self.execute_set(set),
             },
-            Statement::ShowVariable { variable } => self.execute_show(variable).await,
-            Statement::ShowTables { .. } => self.execute_show_tables().await,
-            Statement::Truncate(truncate) => self.execute_truncate(truncate).await,
-            Statement::AlterTable(alter_table) => self.execute_alter_table(alter_table).await,
+            Statement::ShowVariable { variable } => Box::pin(self.execute_show(variable)).await,
+            Statement::ShowTables { .. } => Box::pin(self.execute_show_tables()).await,
+            Statement::Truncate(truncate) => Box::pin(self.execute_truncate(truncate)).await,
+            Statement::AlterTable(alter_table) => {
+                Box::pin(self.execute_alter_table(alter_table)).await
+            }
             Statement::CreateView(create_view) if create_view.materialized => {
                 self.require_security_admin("create materialized views")?;
                 let view_name = create_view.name.to_string();
                 let sql = create_view.query.to_string();
                 // Extract source table references for write-time MV refresh.
                 let source_tables = Self::extract_table_refs(&create_view.query);
-                let query_result = self.execute_query(*create_view.query).await?;
+                let query_result = Box::pin(self.execute_query(*create_view.query)).await?;
                 if let ExecResult::Select { columns, rows } = query_result {
                     let mv = MaterializedViewDef {
                         name: view_name.clone(),
@@ -7569,8 +7577,12 @@ impl Executor {
                         dep_names.remove(&view_name);
                     }
                 }
-                self.execute_create_view(view_name, *create_view.query, create_view.columns)
-                    .await
+                Box::pin(self.execute_create_view(
+                    view_name,
+                    *create_view.query,
+                    create_view.columns,
+                ))
+                .await
             }
             Statement::CreateSequence {
                 name,
@@ -7578,23 +7590,28 @@ impl Executor {
                 if_not_exists,
                 ..
             } => {
-                self.execute_create_sequence(&name.to_string(), &sequence_options, if_not_exists)
-                    .await
+                Box::pin(self.execute_create_sequence(
+                    &name.to_string(),
+                    &sequence_options,
+                    if_not_exists,
+                ))
+                .await
             }
             Statement::Grant(grant) => {
-                self.execute_grant(grant.privileges, grant.objects, grant.grantees)
-                    .await
+                Box::pin(self.execute_grant(grant.privileges, grant.objects, grant.grantees)).await
             }
             Statement::Revoke(revoke) => {
-                self.execute_revoke(revoke.privileges, revoke.objects, revoke.grantees)
+                Box::pin(self.execute_revoke(revoke.privileges, revoke.objects, revoke.grantees))
                     .await
             }
-            Statement::CreateRole(create_role) => self.execute_create_role(create_role).await,
+            Statement::CreateRole(create_role) => {
+                Box::pin(self.execute_create_role(create_role)).await
+            }
             Statement::CreatePolicy(policy) => self.execute_create_policy(policy),
             Statement::DropPolicy(policy) => self.execute_drop_policy(policy),
             Statement::AlterPolicy(alter) => self.execute_alter_policy(alter),
             Statement::AlterRole { name, operation } => {
-                self.execute_alter_role(&name.to_string(), operation).await
+                Box::pin(self.execute_alter_role(&name.to_string(), operation)).await
             }
             Statement::Copy {
                 source,
@@ -7603,38 +7620,40 @@ impl Executor {
                 options,
                 values,
                 ..
-            } => self.execute_copy(source, to, target, options, values).await,
+            } => Box::pin(self.execute_copy(source, to, target, options, values)).await,
             Statement::NOTIFY { channel, payload } => {
-                self.execute_notify(&channel.value, payload.as_deref())
-                    .await
+                Box::pin(self.execute_notify(&channel.value, payload.as_deref())).await
             }
-            Statement::LISTEN { channel } => self.execute_listen(&channel.value).await,
-            Statement::UNLISTEN { channel } => self.execute_unlisten(&channel.value).await,
+            Statement::LISTEN { channel } => Box::pin(self.execute_listen(&channel.value)).await,
+            Statement::UNLISTEN { channel } => {
+                Box::pin(self.execute_unlisten(&channel.value)).await
+            }
             Statement::Declare { stmts } => {
                 if let Some(stmt) = stmts.first() {
-                    self.execute_declare_cursor(stmt).await
+                    Box::pin(self.execute_declare_cursor(stmt)).await
                 } else {
                     Err(ExecError::Unsupported("empty DECLARE".into()))
                 }
             }
             Statement::Fetch {
                 name, direction, ..
-            } => self.execute_fetch_cursor(&name.value, &direction).await,
-            Statement::Close { cursor } => self.execute_close_cursor(cursor).await,
-            Statement::CreateFunction(create_fn) => self.execute_create_function(create_fn).await,
-            Statement::Analyze(analyze) => self.execute_analyze(&analyze).await,
+            } => Box::pin(self.execute_fetch_cursor(&name.value, &direction)).await,
+            Statement::Close { cursor } => Box::pin(self.execute_close_cursor(cursor)).await,
+            Statement::CreateFunction(create_fn) => {
+                Box::pin(self.execute_create_function(create_fn)).await
+            }
+            Statement::Analyze(analyze) => Box::pin(self.execute_analyze(&analyze)).await,
             Statement::DropFunction(drop_fn) => {
-                self.execute_drop_function(&drop_fn.func_desc, drop_fn.if_exists)
-                    .await
+                Box::pin(self.execute_drop_function(&drop_fn.func_desc, drop_fn.if_exists)).await
             }
             Statement::Prepare {
                 name, statement, ..
-            } => self.execute_prepare(&name.value, *statement).await,
+            } => Box::pin(self.execute_prepare(&name.value, *statement)).await,
             Statement::Execute {
                 name, parameters, ..
             } => {
                 let exec_name = name.map(|n| n.to_string()).unwrap_or_default();
-                self.execute_execute(&exec_name, &parameters).await
+                Box::pin(self.execute_execute(&exec_name, &parameters)).await
             }
             Statement::Deallocate { name, .. } => {
                 let sess = self.current_session();
@@ -7654,14 +7673,14 @@ impl Executor {
             }
             Statement::CreateExtension(ext) => self.execute_create_extension(&ext),
             Statement::DropExtension(ext) => self.execute_drop_extension(&ext),
-            Statement::Call(func) => self.execute_call(func).await,
-            Statement::Vacuum(ref vacuum_stmt) => self.execute_vacuum(vacuum_stmt).await,
-            Statement::Discard { object_type } => self.execute_discard(object_type).await,
-            Statement::Reset(reset_stmt) => self.execute_reset(reset_stmt).await,
+            Statement::Call(func) => Box::pin(self.execute_call(func)).await,
+            Statement::Vacuum(ref vacuum_stmt) => Box::pin(self.execute_vacuum(vacuum_stmt)).await,
+            Statement::Discard { object_type } => Box::pin(self.execute_discard(object_type)).await,
+            Statement::Reset(reset_stmt) => Box::pin(self.execute_reset(reset_stmt)).await,
             Statement::CreateType {
                 name,
                 representation,
-            } => self.execute_create_type(name, representation).await,
+            } => Box::pin(self.execute_create_type(name, representation)).await,
             Statement::CreateTrigger(ct) => {
                 let timing = match ct.period {
                     Some(ast::TriggerPeriod::Before) => TriggerTiming::Before,
@@ -7691,14 +7710,14 @@ impl Executor {
                 } else {
                     String::new()
                 };
-                self.execute_create_trigger(
+                Box::pin(self.execute_create_trigger(
                     &crate::sql::object_name_key(&ct.name),
                     &crate::sql::object_name_key(&ct.table_name),
                     timing,
                     events,
                     for_each_row,
                     body,
-                )
+                ))
                 .await
             }
             Statement::DropTrigger(dt) => {
@@ -7826,9 +7845,7 @@ impl Executor {
                 // "storage ahead of catalog" — a reclaimable orphan, not silent
                 // corruption. Unconditional (not synchronous_commit-gated),
                 // matching persist_catalog, so DDL is durable on both sides.
-                if let Err(e) = self
-                    .storage
-                    .flush_schema()
+                if let Err(e) = Box::pin(self.storage.flush_schema())
                     .await
                     .map_err(ExecError::Storage)
                 {
@@ -7838,7 +7855,7 @@ impl Executor {
                     }
                     return Err(e);
                 }
-                if let Err(e) = self.persist_catalog().await {
+                if let Err(e) = Box::pin(self.persist_catalog()).await {
                     if let Some(previous) = security_before.take() {
                         *self.security.write() = previous;
                         self.bump_policy_gen();
@@ -7897,7 +7914,7 @@ impl Executor {
         {
             // The write already applied in memory; if the WAL can't be made
             // durable the client must NOT get a success ack.
-            self.force_wal_durability().await?;
+            Box::pin(self.force_wal_durability()).await?;
         }
 
         result
