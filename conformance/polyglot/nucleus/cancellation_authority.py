@@ -149,9 +149,9 @@ def main() -> None:
         report["failureMessage"] = re.sub(r"\w+://\S+", "[url]", first_line)[:300]
         report["factsBeforeFailure"] = sorted(facts)
         try:
-            rows = admin.execute(sql.SQL("SELECT rolname, rolcanlogin, rolsuper FROM pg_roles WHERE rolname LIKE {}").format(
-                sql.Literal(prefix + "%"))).fetchall()
+            rows = admin.execute("SELECT rolname, rolcanlogin, rolsuper FROM pg_roles ORDER BY rolname LIMIT 40").fetchall()
             report["rolesAtFailure"] = [[str(row[0]), bool(row[1]), bool(row[2])] for row in rows]
+            report["createdRoleNames"] = list(created)
         except Exception as inspect_error:
             report["rolesAtFailureError"] = type(inspect_error).__name__
         raise
