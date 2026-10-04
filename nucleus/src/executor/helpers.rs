@@ -1125,10 +1125,41 @@ pub(super) fn sql_replacement_for_value(value: &Value) -> String {
         Value::Text(s) => format!("'{}'", sanitize_sql_text_literal(s)),
         Value::Int32(n) => n.to_string(),
         Value::Int64(n) => n.to_string(),
-        Value::Float64(f) => f.to_string(),
+        // A float stays a float and an exact decimal stays a decimal: a bare `5`
+        // would be an integer and the quoted text a string, so the body would
+        // compute in a different type than the argument had.
+        Value::Float64(f) if f.is_finite() => format!("({f}::double precision)"),
+        Value::Float64(f) if f.is_nan() => "'NaN'::double precision".to_string(),
+        Value::Float64(f) if *f > 0.0 => "'Infinity'::double precision".to_string(),
+        Value::Float64(_) => "'-Infinity'::double precision".to_string(),
+        Value::Numeric(text)
+            if !text.is_empty() && text.chars().all(|c| matches!(c, '0'..='9' | '.' | '-')) =>
+        {
+            format!("({text})")
+        }
+        Value::Numeric(text) => format!("'{}'::numeric", sanitize_sql_text_literal(text)),
         Value::Bool(b) => b.to_string(),
         Value::Null => "NULL".to_string(),
         _ => format!("'{}'", sanitize_sql_text_literal(&value.to_string())),
+    }
+}
+
+/// The implicit cast PostgreSQL applies to a function argument or result that
+/// is declared FLOAT: an integer or exact decimal becomes a float, so the body
+/// computes in FLOAT8. Any other declared type leaves the value unchanged.
+pub(super) fn coerce_to_declared_float(value: Value, declared: &DataType) -> Value {
+    if !matches!(declared, DataType::Float64) {
+        return value;
+    }
+    let parsed = match &value {
+        Value::Int32(n) => Some(f64::from(*n)),
+        Value::Int64(n) => Some(*n as f64),
+        Value::Numeric(text) => text.parse::<f64>().ok(),
+        _ => None,
+    };
+    match parsed {
+        Some(f) => Value::Float64(f),
+        None => value,
     }
 }
 

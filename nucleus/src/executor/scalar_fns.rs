@@ -6772,9 +6772,10 @@ impl Executor {
                     let mut positional = Vec::with_capacity(func_def.params.len());
                     let mut named = HashMap::new();
                     // Substitute parameters ($1, $2, ... or named parameters).
-                    for (i, (param_name, _)) in func_def.params.iter().enumerate() {
+                    for (i, (param_name, param_type)) in func_def.params.iter().enumerate() {
                         if let Some(val) = args.get(i) {
-                            let replacement = sql_replacement_for_value(val);
+                            let coerced = coerce_to_declared_float(val.clone(), param_type);
+                            let replacement = sql_replacement_for_value(&coerced);
                             positional.push(replacement.clone());
                             if !param_name.is_empty() {
                                 named.insert(param_name.clone(), replacement);
@@ -6801,7 +6802,11 @@ impl Executor {
                     match result {
                         Some(ExecResult::Select { rows, .. }) => {
                             if let Some(first_row) = rows.first() {
-                                Ok(first_row.first().cloned().unwrap_or(Value::Null))
+                                let value = first_row.first().cloned().unwrap_or(Value::Null);
+                                Ok(match &func_def.return_type {
+                                    Some(declared) => coerce_to_declared_float(value, declared),
+                                    None => value,
+                                })
                             } else {
                                 Ok(Value::Null)
                             }

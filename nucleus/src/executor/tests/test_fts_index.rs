@@ -621,6 +621,10 @@ async fn test_hybrid_rrf_over_one_table() {
         .iter()
         .map(|row| match row[1] {
             Value::Float64(s) => s,
+            // `1.0 / (60 + rank)` is a decimal expression, so the score is NUMERIC.
+            Value::Numeric(ref text) => text
+                .parse::<f64>()
+                .unwrap_or_else(|_| panic!("score is not a number: {text}")),
             ref other => panic!("unexpected score: {other:?}"),
         })
         .collect();

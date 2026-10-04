@@ -121,6 +121,7 @@ mod test_temporal_range_cost; // S66: TIMESTAMP/DATE range predicates must prune
 mod test_triggers; // EXE-2: row-binding tables must never touch user tables named _new/_old
 mod test_txn;
 mod test_txn_lazy_snapshot;
+mod test_udf_coercion;
 mod test_upstream_teploy_2026_09_18; // rename-in-txn visibility + replacing upsert loss (2026-09-18 upstream reports) // R8: BEGIN/SAVEPOINT do not clone the whole database // Phase 4: JSONB @> containment, GIN indexes, subscript syntax
 
 mod test_x09_array_semantics;
