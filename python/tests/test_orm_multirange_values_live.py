@@ -119,7 +119,7 @@ def test_native_multirange_server_refusal_rollback_session_and_owner_affinity(mu
         with Session(db) as session:
             obj=session.get(mapping,1);assert obj is not None and obj.i4==full['i4'] and obj.i8==full['i8']
             obj.i4=unbounded['i4'];obj.i8=None;session.flush()
-            assert native.execute(f"SELECT i4='{{(,3),[5,)}}'::int4multirange,i8 IS NULL FROM \"{s}\".mr WHERE id=1").fetchone()==(True,True)
+            assert db._conn.execute(f"SELECT i4='{{(,3),[5,)}}'::int4multirange AS i4_ok,i8 IS NULL AS i8_null FROM \"{s}\".mr WHERE id=1").fetchone()=={'i4_ok':True,'i8_null':True}
             session.rollback();assert obj.i4==full['i4'] and obj.i8==full['i8']
             obj.i4=PgMultirange((r(2000,3000),),i4)
             with pytest.raises(OrmError): session.flush()
