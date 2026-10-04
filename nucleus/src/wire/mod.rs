@@ -4579,46 +4579,30 @@ fn collect_referenced_tables(
         Statement::Query(q) => {
             if let SetExpr::Select(select) = q.body.as_ref() {
                 for tbl in &select.from {
-                    if let TableFactor::Table { name, .. } = &tbl.relation
-                        && let Some(part) = name.0.last()
-                        && let Some(ident) = part.as_ident()
-                    {
-                        push(&ident.value, out);
+                    if let TableFactor::Table { name, .. } = &tbl.relation {
+                        push(&crate::sql::object_name_key(name), out);
                     }
                     for join in &tbl.joins {
-                        if let TableFactor::Table { name, .. } = &join.relation
-                            && let Some(part) = name.0.last()
-                            && let Some(ident) = part.as_ident()
-                        {
-                            push(&ident.value, out);
+                        if let TableFactor::Table { name, .. } = &join.relation {
+                            push(&crate::sql::object_name_key(name), out);
                         }
                     }
                 }
             }
         }
         Statement::Insert(insert) => {
-            if let sqlparser::ast::TableObject::TableName(name) = &insert.table
-                && let Some(part) = name.0.last()
-                && let Some(ident) = part.as_ident()
-            {
-                push(&ident.value, out);
+            if let sqlparser::ast::TableObject::TableName(name) = &insert.table {
+                push(&crate::sql::object_name_key(name), out);
             }
         }
         Statement::Update(update) => {
-            if let TableFactor::Table { name, .. } = &update.table.relation
-                && let Some(part) = name.0.last()
-                && let Some(ident) = part.as_ident()
-            {
-                push(&ident.value, out);
+            if let TableFactor::Table { name, .. } = &update.table.relation {
+                push(&crate::sql::object_name_key(name), out);
             }
         }
         Statement::Delete(d) => {
             for tbl in &d.tables {
-                if let Some(part) = tbl.0.last()
-                    && let Some(ident) = part.as_ident()
-                {
-                    push(&ident.value, out);
-                }
+                push(&crate::sql::object_name_key(tbl), out);
             }
             let from = match &d.from {
                 sqlparser::ast::FromTable::WithFromKeyword(f)
@@ -4626,11 +4610,8 @@ fn collect_referenced_tables(
             };
             {
                 for t in from {
-                    if let TableFactor::Table { name, .. } = &t.relation
-                        && let Some(part) = name.0.last()
-                        && let Some(ident) = part.as_ident()
-                    {
-                        push(&ident.value, out);
+                    if let TableFactor::Table { name, .. } = &t.relation {
+                        push(&crate::sql::object_name_key(name), out);
                     }
                 }
             }
@@ -6907,6 +6888,50 @@ mod tests {
         assert_eq!(types[0], Type::INT4);
         assert_eq!(types[1], Type::TEXT);
         assert_eq!(types[2], Type::TEXT);
+    }
+
+    #[tokio::test]
+    async fn infer_types_resolve_schema_qualified_tables() {
+        // A table in a user schema is keyed `schema.table`; looking it up by its
+        // bare name left every parameter untyped (TEXT), which a typed client
+        // cannot encode a jsonb or timestamptz value against.
+        let executor = make_executor();
+        executor.execute("CREATE SCHEMA s1").await.unwrap();
+        executor
+            .execute(
+                "CREATE TABLE s1.docs (id BIGINT PRIMARY KEY, active BOOLEAN NOT NULL, \
+                 title TEXT NOT NULL, data JSONB, n INTEGER)",
+            )
+            .await
+            .unwrap();
+        let sql =
+            r#"INSERT INTO "s1"."docs" (id, active, title, data, n) VALUES ($1, $2, $3, $4, $5)"#;
+        let stmts =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)
+                .unwrap();
+        let types =
+            NucleusHandler::infer_parameter_types_with_ast(sql, &[], Some(&stmts), Some(&executor));
+        assert_eq!(
+            types,
+            vec![
+                Type::INT8,
+                Type::BOOL,
+                Type::VARCHAR,
+                Type::JSONB,
+                Type::INT4
+            ]
+        );
+        let update = r#"UPDATE "s1"."docs" SET data = $1 WHERE id = $2"#;
+        let stmts =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, update)
+                .unwrap();
+        let types = NucleusHandler::infer_parameter_types_with_ast(
+            update,
+            &[],
+            Some(&stmts),
+            Some(&executor),
+        );
+        assert_eq!(types, vec![Type::JSONB, Type::INT8]);
     }
 
     // ── NucleusQueryParser tests ───────────────────────────────────────
