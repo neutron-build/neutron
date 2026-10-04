@@ -152,7 +152,7 @@ func TestV3NativeExplicitDefaultAndColumnACLs(t *testing.T) {
 // apart and expand only the NULL case.
 func TestV3NativeDatabaseDefaultVersusExplicitEmptyACL(t *testing.T) {
 	h := newQ07Harness(t, "v3nullacl")
-	owner := h.queryOne(`SELECT pg_catalog.current_user::pg_catalog.text`)
+	owner := h.queryOne(`SELECT current_user::pg_catalog.text`)
 	for _, sql := range []string{
 		`CREATE SCHEMA authority`,
 		`CREATE TABLE authority.default_acl (id int)`,
