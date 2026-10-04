@@ -139,6 +139,30 @@ namespace. The native role fixture checks NOINHERIT/BYPASSRLS and a membership
 with ADMIN true, INHERIT false, SET true; its cleanup runs even if later setup
 fails. This is inventory, not an authority restore script.
 
+`pg_auth_members.inherit_option` and `set_option` exist from PostgreSQL 16. The
+role reader asks the pinned snapshot for `server_version_num` and, on PostgreSQL
+14 and 15, reads ADMIN only and records INHERIT and SET as the explicit value
+`unavailable-before-pg16` rather than a guessed boolean; each role also records
+which option columns were read (`membershipOptionColumns`). Servers below 14 are
+refused. The native fixture takes the same branch (`GRANT ... WITH ADMIN OPTION`
+and the sentinel on PostgreSQL 14/15). The gating itself is covered by a
+database-free unit test:
+
+```sh
+# cwd cli
+go test ./internal/db -run '^TestV3RolesSQL' -count=1
+NEUTRON_LIVE_REQUIRED=1 go test ./internal/db \
+  -run '^TestV3NativeDatabaseDefaultVersusExplicitEmptyACL$' -count=1
+```
+
+The second command is a native oracle: a freshly created database has a NULL
+ACL and is reported as `aclStorage=default`, expanded to the owner's
+CONNECT/CREATE/TEMPORARY and PUBLIC CONNECT/TEMPORARY; after
+`REVOKE CONNECT ... FROM PUBLIC` it is `explicit` without PUBLIC CONNECT; and a
+table whose every privilege was revoked (`relacl = {}`) is `explicit` with no
+privilege entries, distinct from an untouched NULL-ACL table. These commands have
+not been run by the author.
+
 Other databases and ACL-bearing families such as large objects, languages,
 foreign servers and parameter grants remain an
 explicit uninspected mandatory scope. None of these additions provides

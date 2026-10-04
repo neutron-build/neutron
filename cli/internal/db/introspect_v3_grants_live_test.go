@@ -27,7 +27,19 @@ func TestV3NativeExplicitDefaultAndColumnACLs(t *testing.T) {
 		}
 	})
 	h.exec(fmt.Sprintf(`CREATE ROLE %q NOINHERIT BYPASSRLS`, parent))
-	h.exec(fmt.Sprintf(`GRANT %q TO %q WITH ADMIN TRUE, INHERIT FALSE, SET TRUE`, parent, role))
+	major, err := h.client.ServerMajorVersion(context.Background())
+	if err != nil {
+		t.Fatalf("server version: %v", err)
+	}
+	// INHERIT and SET membership options exist from PostgreSQL 16. Older servers
+	// record ADMIN only, and the inventory must say so instead of guessing.
+	wantInherit, wantSet := "false", "true"
+	if major >= 16 {
+		h.exec(fmt.Sprintf(`GRANT %q TO %q WITH ADMIN TRUE, INHERIT FALSE, SET TRUE`, parent, role))
+	} else {
+		h.exec(fmt.Sprintf(`GRANT %q TO %q WITH ADMIN OPTION`, parent, role))
+		wantInherit, wantSet = "unavailable-before-pg16", "unavailable-before-pg16"
+	}
 	for _, sql := range []string{
 		`CREATE SCHEMA authority`,
 		`CREATE TABLE authority.docs (id int, "Case Column" text)`,
@@ -63,7 +75,7 @@ func TestV3NativeExplicitDefaultAndColumnACLs(t *testing.T) {
 			}
 			for _, part := range v3PartsOfKind(e.Parts, "role-membership") {
 				a := part.Attributes
-				membership = membership || (a["member"] == role && a["admin"] == "true" && a["inherit"] == "false" && a["set"] == "true" && a["grantor"] != "")
+				membership = membership || (a["member"] == role && a["admin"] == "true" && a["inherit"] == wantInherit && a["set"] == wantSet && a["grantor"] != "")
 			}
 		}
 		if e.Identity.Catalog == "pg_default_acl" || e.Identity.Catalog == "pg_database" {
@@ -132,5 +144,94 @@ func TestV3NativeExplicitDefaultAndColumnACLs(t *testing.T) {
 	}
 	if repeated.SHA256Hex != doc.SHA256Hex {
 		t.Fatal("unchanged ACL hash drift")
+	}
+}
+
+// A NULL ACL (PostgreSQL's owner/type default) and an explicit empty ACL both
+// have no stored entries but opposite meanings; the inventory must keep them
+// apart and expand only the NULL case.
+func TestV3NativeDatabaseDefaultVersusExplicitEmptyACL(t *testing.T) {
+	h := newQ07Harness(t, "v3nullacl")
+	owner := h.queryOne(`SELECT pg_catalog.current_user::pg_catalog.text`)
+	for _, sql := range []string{
+		`CREATE SCHEMA authority`,
+		`CREATE TABLE authority.default_acl (id int)`,
+		`CREATE TABLE authority.empty_acl (id int)`,
+		`REVOKE ALL ON authority.empty_acl FROM CURRENT_USER`,
+	} {
+		h.exec(sql)
+	}
+	if h.queryOne(`SELECT (datacl IS NULL)::pg_catalog.text FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()`) != "true" {
+		t.Fatal("native oracle: a freshly created database must have a NULL ACL")
+	}
+	if h.queryOne(`SELECT relacl::pg_catalog.text FROM pg_catalog.pg_class WHERE oid = 'authority.empty_acl'::pg_catalog.regclass`) != "{}" {
+		t.Fatal("native oracle: revoking every privilege must leave an explicit empty ACL")
+	}
+	if h.queryOne(`SELECT (relacl IS NULL)::pg_catalog.text FROM pg_catalog.pg_class WHERE oid = 'authority.default_acl'::pg_catalog.regclass`) != "true" {
+		t.Fatal("native oracle: an untouched table must have a NULL ACL")
+	}
+	find := func(doc *V3Document, catalog, schema, name string) V3InventoryEntry {
+		t.Helper()
+		for _, e := range doc.Model.Inventory {
+			if e.Identity.Catalog == catalog && e.Identity.Schema == schema && e.Identity.Name == name {
+				return e
+			}
+		}
+		t.Fatalf("no %s inventory entry for %s.%s", catalog, schema, name)
+		return V3InventoryEntry{}
+	}
+	privileges := func(e V3InventoryEntry) map[string]bool {
+		set := map[string]bool{}
+		for _, p := range v3PartsOfKind(e.Parts, "privilege") {
+			a := p.Attributes
+			if a["scope"] != "object" {
+				continue
+			}
+			set[a["granteeKind"]+":"+a["grantee"]+":"+a["privilege"]+":"+a["grantor"]] = true
+		}
+		return set
+	}
+	introspect := func() *V3Document {
+		t.Helper()
+		doc, err := h.client.IntrospectV3(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return doc
+	}
+
+	doc := introspect()
+	database := find(doc, "pg_database", "pg_catalog", h.dbName)
+	if database.Attributes["aclStorage"] != "default" {
+		t.Fatalf("NULL database ACL stored as %q", database.Attributes["aclStorage"])
+	}
+	granted := privileges(database)
+	for _, want := range []string{
+		"role:" + owner + ":CONNECT:" + owner, "role:" + owner + ":CREATE:" + owner, "role:" + owner + ":TEMPORARY:" + owner,
+		"public::CONNECT:" + owner, "public::TEMPORARY:" + owner,
+	} {
+		if !granted[want] {
+			t.Fatalf("default database ACL is missing %q (have %v)", want, granted)
+		}
+	}
+	if granted["public::CREATE:"+owner] {
+		t.Fatal("default database ACL must not grant PUBLIC CREATE")
+	}
+	if len(privileges(find(doc, "pg_class", "authority", "default_acl"))) == 0 || find(doc, "pg_class", "authority", "default_acl").Attributes["aclStorage"] != "default" {
+		t.Fatal("NULL table ACL was not expanded to the owner default")
+	}
+	empty := find(doc, "pg_class", "authority", "empty_acl")
+	if empty.Attributes["aclStorage"] != "explicit" || len(privileges(empty)) != 0 {
+		t.Fatalf("explicit empty ACL was reported as %q with %d privileges", empty.Attributes["aclStorage"], len(privileges(empty)))
+	}
+
+	h.exec(fmt.Sprintf(`REVOKE CONNECT ON DATABASE %q FROM PUBLIC`, h.dbName))
+	if h.queryOne(`SELECT (datacl IS NULL)::pg_catalog.text FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()`) != "false" {
+		t.Fatal("native oracle: a database REVOKE must store an explicit ACL")
+	}
+	database = find(introspect(), "pg_database", "pg_catalog", h.dbName)
+	granted = privileges(database)
+	if database.Attributes["aclStorage"] != "explicit" || granted["public::CONNECT:"+owner] || !granted["public::TEMPORARY:"+owner] || !granted["role:"+owner+":CONNECT:"+owner] {
+		t.Fatalf("explicit database ACL after REVOKE CONNECT FROM PUBLIC: storage=%q privileges=%v", database.Attributes["aclStorage"], granted)
 	}
 }
