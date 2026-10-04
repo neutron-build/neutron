@@ -69,8 +69,15 @@ jobs:
         run: sh scripts/report-build-size.sh
         working-directory: nucleus
 
+      # The executor's main async dispatch (execute_statement_inner) is one
+      # giant state machine; its debug poll frame is over 1 MiB and lands
+      # just past the default 2 MiB test-thread stack on some builds (seen
+      # on macos-latest since the 1.2.1 ALTER work). Give test threads
+      # headroom so a locally-green suite cannot stack-overflow in CI.
       - name: Test (lib only — skips slow stress tests)
         run: cargo test --lib -q
+        env:
+          RUST_MIN_STACK: 8388608
         working-directory: nucleus
 
   core:
