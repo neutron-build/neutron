@@ -22,7 +22,7 @@ def multiranges(live_table):
         pytest.skip('PostgreSQL 14+ required for multiranges')
     native.execute("SET TIME ZONE 'UTC'")
     native.execute(f'CREATE TABLE "{s}".mr(id int PRIMARY KEY,i4 int4multirange NOT NULL,i8 int8multirange,n nummultirange,ts tsmultirange,tstz tstzmultirange,d datemultirange,CONSTRAINT bounded_upper CHECK (coalesce(upper(i4),0)<1000))')
-    native.execute(f'CREATE TYPE "{s}".float_range AS RANGE (subtype=float8,multirange_type_name=float_multirange)')
+    native.execute(f'CREATE TYPE "{s}".float_range AS RANGE (subtype=float8,multirange_type_name="{s}".float_multirange)')
     native.execute(f'CREATE TABLE "{s}".user_mr(id int PRIMARY KEY,v "{s}".float_multirange)')
     native.execute(f'CREATE DOMAIN "{s}".int4_domain AS int4multirange')
     native.execute(f'CREATE TYPE "{s}".mr_composite AS (m int4multirange)')
