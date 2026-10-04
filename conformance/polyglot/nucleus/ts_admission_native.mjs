@@ -240,6 +240,8 @@ async function main() {
     }
     assert.deepStrictEqual(outputs['postgres:pg'].facts, outputs['postgres:postgres'].facts, 'pg and postgres.js control checkpoints disagree');
     assert.deepStrictEqual(outputs['nucleus:pg'].facts, outputs['nucleus:postgres'].facts, 'pg and postgres.js Nucleus checkpoints disagree');
+    assert.deepStrictEqual(outputs['nucleus:pg'].refusals, outputs['nucleus:postgres'].refusals, 'pg and postgres.js refusal lists disagree');
+    assert.ok(outputs['nucleus:pg'].refusals.length > 0, 'no refusal checks ran against the Nucleus candidate');
     report.facts = {
       checkpointAgreement: true, driverAgreement: true, defaultProfileRefusesNucleus: true,
       refusals: outputs['nucleus:pg'].refusals, unsupportedOperationsPreserveRows: true,
