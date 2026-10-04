@@ -5687,6 +5687,8 @@ impl Executor {
                     us,
                     super::timestamptz::ambient_time_zone(),
                 )),
+                // NULL stays NULL; `to_string` would render it as the text 'NULL'.
+                Value::Null => Value::Null,
                 other => Value::Text(other.to_string()),
             },
             ast::DataType::Boolean => match &v {
