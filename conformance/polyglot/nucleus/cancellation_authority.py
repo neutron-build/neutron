@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import sys
@@ -140,9 +141,13 @@ def main() -> None:
         facts["nonpositiveTargetIsAbsent"] = True
         report["status"] = "pass"
     except Exception as error:
-        # Exception strings can contain connection URLs or role passwords.
+        # Exception strings can contain connection URLs or role passwords, so
+        # keep only the first line with the password and any URL removed.
         report["failureType"] = type(error).__name__
         report["sqlstate"] = getattr(error, "sqlstate", None)
+        first_line = (str(error).splitlines() or [""])[0].replace(password, "[redacted]")
+        report["failureMessage"] = re.sub(r"\w+://\S+", "[url]", first_line)[:300]
+        report["factsBeforeFailure"] = sorted(facts)
         raise
     finally:
         cleanup_failed = False
