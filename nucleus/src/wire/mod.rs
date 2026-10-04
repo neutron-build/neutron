@@ -3888,7 +3888,7 @@ fn decode_binary_param_typed(oid: u32, bytes: &[u8]) -> Option<DecodedParam> {
         }
         // numeric: NBASE-10000 (ndigits, weight, sign, dscale, digit words).
         // Decoded exactly to a decimal string — no float round-trip.
-        1700 => decode_binary_numeric(bytes).map(DecodedParam::Numeric),
+        1700 => Some(decode_binary_numeric_param(bytes)),
         // interval: i64 μs, i32 days, i32 months → unit literal the interval
         // parser accepts.
         1186 => {
@@ -4024,9 +4024,21 @@ fn decode_binary_array(bytes: &[u8]) -> Option<String> {
     (off == bytes.len()).then(|| format!("{{{}}}", parts.join(",")))
 }
 
+/// Largest scale PostgreSQL's NUMERIC wire format can carry (`dscale` is 14
+/// bits).
+const NUMERIC_WIRE_MAX_DSCALE: usize = 0x3FFF;
+
 /// Decode PostgreSQL's binary NUMERIC wire format into an exact decimal
 /// string. Layout: u16 ndigits, i16 weight (in NBASE-10000 words), u16 sign
-/// (0x0000 +, 0x4000 -, 0xC000 NaN), u16 dscale, then ndigits u16 words.
+/// (0x0000 +, 0x4000 -, 0xC000 NaN, 0xD000 +Infinity, 0xF000 -Infinity), u16
+/// dscale, then ndigits u16 words.
+///
+/// Exact-or-`None`. Refused rather than guessed at: any sign other than
+/// positive or negative (the specials have no decimal text), a digit word of
+/// 10000 or more (it would render as five digits and silently change the
+/// value), a `dscale` past the format's 14 bits, a length that does not match
+/// `ndigits`, and digits present beyond `dscale` that are not zero (cutting
+/// them would round the value). A negative zero decodes as zero.
 fn decode_binary_numeric(bytes: &[u8]) -> Option<String> {
     if bytes.len() < 8 {
         return None;
@@ -4038,12 +4050,15 @@ fn decode_binary_numeric(bytes: &[u8]) -> Option<String> {
     if bytes.len() != 8 + ndigits * 2 {
         return None;
     }
-    if sign == 0xC000 {
-        return None; // NaN has no SQL literal Nucleus accepts; treat as undecodable
+    if (sign != 0x0000 && sign != 0x4000) || dscale > NUMERIC_WIRE_MAX_DSCALE {
+        return None;
     }
     let digits: Vec<u16> = (0..ndigits)
         .map(|i| u16::from_be_bytes([bytes[8 + i * 2], bytes[9 + i * 2]]))
         .collect();
+    if digits.iter().any(|word| *word >= 10_000) {
+        return None;
+    }
 
     // Integer part: words with index <= weight (each word = 4 decimal digits).
     let mut int_part = String::new();
@@ -4071,18 +4086,48 @@ fn decode_binary_numeric(bytes: &[u8]) -> Option<String> {
         frac_part.push_str(&format!("{:04}", digits[idx]));
         idx += 1;
     }
-    // Scale the fraction to dscale exactly (pad or trim trailing digits).
+    // Scale the fraction to dscale exactly: pad with zeros, or trim digits
+    // that are all zero. A nonzero digit past dscale cannot be trimmed without
+    // rounding the value, so the encoding is refused.
     if frac_part.len() < dscale {
         frac_part.push_str(&"0".repeat(dscale - frac_part.len()));
     } else {
+        if frac_part[dscale..].bytes().any(|b| b != b'0') {
+            return None;
+        }
         frac_part.truncate(dscale);
     }
-    let sign_str = if sign == 0x4000 { "-" } else { "" };
+    let is_zero = digits.iter().all(|word| *word == 0);
+    let sign_str = if sign == 0x4000 && !is_zero { "-" } else { "" };
     Some(if frac_part.is_empty() {
         format!("{sign_str}{int_part}")
     } else {
         format!("{sign_str}{int_part}.{frac_part}")
     })
+}
+
+/// A binary NUMERIC parameter as the statement will see it. Always produces a
+/// value, because the generic fallback for an undecodable binary parameter
+/// guesses an integer from its length, and an eight-byte NaN header would
+/// become the integer 3221225472.
+///
+/// An exact value is a number. NaN and the infinities become the text PostgreSQL
+/// spells them with, which the NUMERIC cast refuses by name. Any other encoding
+/// becomes a diagnostic string the NUMERIC cast refuses as invalid input, so a
+/// write fails loudly instead of storing a guess.
+fn decode_binary_numeric_param(bytes: &[u8]) -> DecodedParam {
+    if let Some(text) = decode_binary_numeric(bytes) {
+        return DecodedParam::Numeric(text);
+    }
+    let well_formed = bytes.len() >= 8
+        && bytes.len() == 8 + 2 * usize::from(u16::from_be_bytes([bytes[0], bytes[1]]));
+    let text = match well_formed.then(|| u16::from_be_bytes([bytes[4], bytes[5]])) {
+        Some(0xC000) => "NaN",
+        Some(0xD000) => "Infinity",
+        Some(0xF000) => "-Infinity",
+        _ => "invalid or unsupported binary numeric encoding",
+    };
+    DecodedParam::Text(text.to_string())
 }
 
 fn decode_pg_param(
@@ -6144,6 +6189,97 @@ mod tests {
     // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
     #![allow(clippy::approx_constant)]
     use super::*;
+
+    /// PostgreSQL binary NUMERIC bytes: ndigits, weight, sign, dscale, words.
+    fn numeric_wire(weight: i16, sign: u16, dscale: u16, words: &[u16]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(words.len() as u16).to_be_bytes());
+        out.extend_from_slice(&weight.to_be_bytes());
+        out.extend_from_slice(&sign.to_be_bytes());
+        out.extend_from_slice(&dscale.to_be_bytes());
+        for word in words {
+            out.extend_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
+    /// NaN and the infinities have no decimal text. They must neither decode
+    /// as a number nor fall through to the integer-by-length guess (an
+    /// eight-byte NaN header is the integer 3221225472); they become the text
+    /// PostgreSQL spells them with, which the NUMERIC cast refuses by name.
+    #[test]
+    fn binary_numeric_specials_are_refused_not_guessed() {
+        for (sign, spelled) in [
+            (0xC000u16, "NaN"),
+            (0xD000, "Infinity"),
+            (0xF000, "-Infinity"),
+        ] {
+            let bytes = numeric_wire(0, sign, 0, &[]);
+            assert_eq!(decode_binary_numeric(&bytes), None, "sign {sign:#x}");
+            match decode_binary_param_typed(1700, &bytes) {
+                Some(DecodedParam::Text(text)) => assert_eq!(text, spelled),
+                other => panic!("sign {sign:#x}: expected the special's text, got {other:?}"),
+            }
+            let refused = Value::Text(spelled.into())
+                .cast(&crate::types::DataType::Numeric)
+                .unwrap_err();
+            assert!(
+                refused.contains("numeric NaN and Infinity are not supported"),
+                "{refused}"
+            );
+        }
+    }
+
+    /// Malformed binary NUMERIC is refused as invalid input, never stored as
+    /// a different number: an unknown sign (decoded as positive before), a
+    /// digit word that does not fit base 10000 (rendered as five digits), a
+    /// length that disagrees with ndigits, and digits past dscale that cutting
+    /// would round.
+    #[test]
+    fn malformed_binary_numeric_is_refused() {
+        let malformed = [
+            numeric_wire(0, 0x1234, 0, &[1]),
+            numeric_wire(0, 0, 0, &[10_000]),
+            numeric_wire(0, 0, 0x4000, &[1]),
+            numeric_wire(0, 0, 2, &[1, 2345]),
+            {
+                let mut short = numeric_wire(0, 0, 0, &[1, 2]);
+                short.pop();
+                short
+            },
+            vec![0, 1, 2],
+        ];
+        for bytes in &malformed {
+            assert_eq!(decode_binary_numeric(bytes), None, "{bytes:?}");
+            match decode_binary_param_typed(1700, bytes) {
+                Some(DecodedParam::Text(text)) => {
+                    let refused = Value::Text(text)
+                        .cast(&crate::types::DataType::Numeric)
+                        .unwrap_err();
+                    assert!(
+                        refused.contains("invalid input syntax for type numeric"),
+                        "{refused}"
+                    );
+                }
+                other => panic!("{bytes:?}: expected a refusal text, got {other:?}"),
+            }
+        }
+        // Controls: the same shapes that are well formed decode exactly, and
+        // digits past dscale that are all zero are not a rounding.
+        assert_eq!(
+            decode_binary_numeric(&numeric_wire(0, 0, 2, &[1, 2300])).as_deref(),
+            Some("1.23")
+        );
+        assert_eq!(
+            decode_binary_numeric(&numeric_wire(0, 0x4000, 4, &[1, 2345])).as_deref(),
+            Some("-1.2345")
+        );
+        // A negative zero has no sign.
+        assert_eq!(
+            decode_binary_numeric(&numeric_wire(0, 0x4000, 3, &[])).as_deref(),
+            Some("0.000")
+        );
+    }
 
     #[test]
     fn numeric_binary_cast_roundtrip_preserves_display_scale() {

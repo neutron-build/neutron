@@ -91,6 +91,9 @@ pub enum ErrorCode {
     /// A parameter of the statement has an unusable value (a FETCH count that
     /// is not an integer): PostgreSQL `invalid_parameter_value` (22023)
     InvalidParameterValue,
+    /// Text that is not valid input for its type (`'abc'::numeric`):
+    /// PostgreSQL `invalid_text_representation` (22P02)
+    InvalidTextRepresentation,
 }
 
 /// Protocol-independent error details.
@@ -135,6 +138,24 @@ fn cursor_error_code(msg: &str) -> Option<ErrorCode> {
         Some(ErrorCode::NoActiveSqlTransaction)
     } else if msg.starts_with("invalid FETCH count") {
         Some(ErrorCode::InvalidParameterValue)
+    } else {
+        None
+    }
+}
+
+/// NUMERIC parse refusals arrive as `Runtime` messages (often wrapped in
+/// "invalid value for column ..."), so they are matched anywhere in the text.
+/// The three wordings come from `types::parse_numeric` and mean different
+/// things to a client: not a number (22P02), a number the bounded exact decimal
+/// cannot hold (22003), and NaN/Infinity, valid in PostgreSQL but unsupported
+/// here (0A000).
+fn numeric_error_code(msg: &str) -> Option<ErrorCode> {
+    if msg.contains("invalid input syntax for type numeric") {
+        Some(ErrorCode::InvalidTextRepresentation)
+    } else if msg.contains("exceeds NUMERIC precision ceiling") {
+        Some(ErrorCode::NumericValueOutOfRange)
+    } else if msg.contains("numeric NaN and Infinity are not supported") {
+        Some(ErrorCode::FeatureNotSupported)
     } else {
         None
     }
@@ -254,7 +275,9 @@ impl ErrorCodec for PgWireErrorCodec {
                 ErrorDetails::new(code, msg)
             }
             ExecError::Runtime(msg) => {
-                let code = if let Some(code) = cursor_error_code(msg) {
+                let code = if let Some(code) =
+                    cursor_error_code(msg).or_else(|| numeric_error_code(msg))
+                {
                     code
                 } else if msg.contains("division by zero") {
                     ErrorCode::DivisionByZero
@@ -331,6 +354,7 @@ impl ErrorCodec for PgWireErrorCodec {
             ErrorCode::ObjectNotInPrerequisiteState => "55000".to_string(),
             ErrorCode::InvalidCursorName => "34000".to_string(),
             ErrorCode::InvalidParameterValue => "22023".to_string(),
+            ErrorCode::InvalidTextRepresentation => "22P02".to_string(),
         }
     }
 }
@@ -451,7 +475,9 @@ impl ErrorCodec for BinaryErrorCodec {
                 ErrorDetails::new(code, msg)
             }
             ExecError::Runtime(msg) => {
-                let code = if let Some(code) = cursor_error_code(msg) {
+                let code = if let Some(code) =
+                    cursor_error_code(msg).or_else(|| numeric_error_code(msg))
+                {
                     code
                 } else if msg.contains("division by zero") {
                     ErrorCode::DivisionByZero
@@ -518,6 +544,7 @@ impl ErrorCodec for BinaryErrorCodec {
             ErrorCode::ObjectNotInPrerequisiteState => "3009".to_string(),
             ErrorCode::InvalidCursorName => "1010".to_string(),
             ErrorCode::InvalidParameterValue => "4004".to_string(),
+            ErrorCode::InvalidTextRepresentation => "4005".to_string(),
         }
     }
 }
@@ -790,6 +817,46 @@ mod tests {
         let control = PgWireErrorCodec.encode(&ExecError::Runtime(
             "something about a cursor went wrong".to_string(),
         ));
+        assert_eq!(PgWireErrorCodec.code_to_string(control.code), "22000");
+    }
+
+    /// NUMERIC refusals carry the SQLSTATE PostgreSQL uses for the same
+    /// situation, including when the message arrives wrapped in a column error.
+    /// Before this a malformed or oversized numeric was the 22000 catch-all.
+    #[test]
+    fn numeric_refusals_map_to_postgres_sqlstates() {
+        let ceiling = "numeric value '1e-29' exceeds NUMERIC precision ceiling: Nucleus stores \
+                       NUMERIC as a 96-bit coefficient with scale <= 28 (max 28 fractional digits)";
+        let cases = [
+            (ceiling.to_string(), "22003"),
+            (
+                format!("invalid value for column 'v' (NUMERIC): {ceiling}"),
+                "22003",
+            ),
+            (
+                "invalid input syntax for type numeric: \"1_000\"".to_string(),
+                "22P02",
+            ),
+            (
+                "numeric NaN and Infinity are not supported: 'NaN' cannot be held by Nucleus NUMERIC"
+                    .to_string(),
+                "0A000",
+            ),
+        ];
+        for (msg, state) in cases {
+            for codec in [&PgWireErrorCodec as &dyn ErrorCodec, &BinaryErrorCodec] {
+                let details = codec.encode(&ExecError::Runtime(msg.clone()));
+                assert_ne!(details.code, ErrorCode::DataException, "msg: {msg}");
+            }
+            let details = PgWireErrorCodec.encode(&ExecError::Runtime(msg.clone()));
+            assert_eq!(
+                PgWireErrorCodec.code_to_string(details.code),
+                state,
+                "{msg}"
+            );
+        }
+        // Control: an unrelated runtime error keeps the catch-all.
+        let control = PgWireErrorCodec.encode(&ExecError::Runtime("something else".into()));
         assert_eq!(PgWireErrorCodec.code_to_string(control.code), "22000");
     }
 

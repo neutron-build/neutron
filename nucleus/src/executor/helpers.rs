@@ -1152,8 +1152,7 @@ fn checked_numeric_aggregate<'a>(
             Value::Null => continue,
             Value::Numeric(raw) => {
                 let decimal = crate::types::parse_numeric(raw).map_err(ExecError::Runtime)?;
-                sum = sum
-                    .checked_add(decimal)
+                sum = crate::types::decimal_add_exact(sum, decimal)
                     .ok_or_else(|| ExecError::Runtime("numeric value out of range".into()))?;
                 count += 1;
             }
@@ -1225,9 +1224,9 @@ pub(super) fn eval_numeric_arithmetic(
         let left = as_decimal(left)?;
         let right = as_decimal(right)?;
         let value = match op {
-            ast::BinaryOperator::Plus => left.checked_add(right),
-            ast::BinaryOperator::Minus => left.checked_sub(right),
-            ast::BinaryOperator::Multiply => left.checked_mul(right),
+            ast::BinaryOperator::Plus => crate::types::decimal_add_exact(left, right),
+            ast::BinaryOperator::Minus => crate::types::decimal_sub_exact(left, right),
+            ast::BinaryOperator::Multiply => crate::types::decimal_mul_exact(left, right),
             ast::BinaryOperator::Divide => {
                 if right.is_zero() {
                     return Err(ExecError::Runtime("division by zero".into()));
@@ -1238,7 +1237,7 @@ pub(super) fn eval_numeric_arithmetic(
                 if right.is_zero() {
                     return Err(ExecError::Runtime("division by zero".into()));
                 }
-                left.checked_rem(right)
+                crate::types::decimal_rem_exact(left, right)
             }
             _ => {
                 return Err(ExecError::Unsupported(format!(

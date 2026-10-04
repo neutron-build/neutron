@@ -1216,9 +1216,10 @@ impl Executor {
                             is_numeric = true;
                             let decimal =
                                 crate::types::parse_numeric(&value).map_err(ExecError::Runtime)?;
-                            sum_numeric = sum_numeric.checked_add(decimal).ok_or_else(|| {
-                                ExecError::Runtime("numeric value out of range".into())
-                            })?;
+                            sum_numeric = crate::types::decimal_add_exact(sum_numeric, decimal)
+                                .ok_or_else(|| {
+                                    ExecError::Runtime("numeric value out of range".into())
+                                })?;
                         }
                         _ => return Err(ExecError::Unsupported("SUM on non-numeric".into())),
                     }
@@ -1229,8 +1230,7 @@ impl Executor {
                 if is_numeric {
                     let integer = crate::types::parse_numeric(&sum_int.to_string())
                         .map_err(|_| ExecError::Runtime("numeric value out of range".into()))?;
-                    let total = sum_numeric
-                        .checked_add(integer)
+                    let total = crate::types::decimal_add_exact(sum_numeric, integer)
                         .ok_or_else(|| ExecError::Runtime("numeric value out of range".into()))?;
                     Ok(Value::Numeric(total.normalize().to_string()))
                 } else if is_float {
@@ -1320,9 +1320,10 @@ impl Executor {
                             numeric = true;
                             let decimal =
                                 crate::types::parse_numeric(&value).map_err(ExecError::Runtime)?;
-                            numeric_sum = numeric_sum.checked_add(decimal).ok_or_else(|| {
-                                ExecError::Runtime("numeric value out of range".into())
-                            })?;
+                            numeric_sum = crate::types::decimal_add_exact(numeric_sum, decimal)
+                                .ok_or_else(|| {
+                                    ExecError::Runtime("numeric value out of range".into())
+                                })?;
                         }
                         _ => return Err(ExecError::Unsupported("AVG on non-numeric".into())),
                     }
@@ -2170,9 +2171,9 @@ impl Executor {
                                         ));
                                     }
                                 };
-                                sum = sum.checked_add(decimal).ok_or_else(|| {
-                                    ExecError::Runtime("numeric value out of range".into())
-                                })?;
+                                sum = crate::types::decimal_add_exact(sum, decimal).ok_or_else(
+                                    || ExecError::Runtime("numeric value out of range".into()),
+                                )?;
                             }
                             let result = if fname == "AVG" {
                                 sum.checked_div(Decimal::from(values.len() as u64))
