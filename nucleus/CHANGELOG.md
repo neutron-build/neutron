@@ -5,6 +5,42 @@ Notable changes to the Nucleus engine. Format follows
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-10-04
+
+### Fixed
+
+- **ALTER TABLE ADD/DROP COLUMN and ALTER COLUMN TYPE could corrupt populated
+  tables on the disk stack.** Two or more ALTERs (or any read after the first)
+  inside one transaction left every tuple unreadable
+  (`corrupt tuple … does not decode against the column types`): the catalog and
+  the engine's cached column layout took effect immediately while the row
+  rewrite was buffered until COMMIT, so after the first ALTER the engine
+  believed the table was wider than every tuple on disk. The rewrite is now one
+  all-or-nothing step (new `StorageEngine::rewrite_table`): the engine adopts
+  the new layout, rewrites every row, rebuilds the table's indexes, and then
+  proves every live tuple decodes; on any failure the engine restores the
+  pre-change directory and free list and the executor restores the catalog, so
+  a half-done ALTER is never recorded as applied (a retried
+  `ADD COLUMN IF NOT EXISTS` used to skip over the damage and report the
+  migration as done). One behavioural change: ALTERing the columns of a table
+  the same transaction has already written to now fails with
+  `cannot change the columns of '<t>' while this transaction has uncommitted
+  changes to it` instead of silently widening buffered rows — order the ALTER
+  before the DML, or split the migration.
+- **CREATE UNIQUE INDEX did not enforce uniqueness on tables that already had
+  rows.** It now counts as a unique constraint on insert, update and the
+  concurrent-insert gate, and creating it fails when existing rows already hold
+  duplicates.
+
+## [1.2.0] - 2026-09-30
+
+Audited persistence and index-coherence repairs: durable-engine opens and
+native FTS recovery refuse incomplete or unreadable state instead of silently
+selecting volatile or partial storage; WAL/columnar failures propagate and
+uncertain outcomes fence subsequent operations; detached derived images use
+writer generations with conservative transaction fallbacks; retired insecure
+encrypted-index modes fail closed while legacy base rows stay readable.
+
 ### Added
 
 - **Per-session resource limits — the memory-bounding pass.** An audit of
