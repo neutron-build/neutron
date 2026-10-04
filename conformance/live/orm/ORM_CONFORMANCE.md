@@ -50,13 +50,13 @@ is re-recorded and reviewed.
 
 | fact | value |
 |---|---|
-| engine | PostgreSQL 16.0 (Nucleus 1.2.0 — The Definitive Database) |
-| source commit (`--write` run) | `59fad7aed7889dff2d2efbb65c5aa4c6f14f8ea5` |
-| `nucleus/` tree SHA (the engine identity) | `3c5c6035b5e6602cf65ba23c917fe83848888571` |
-| binary SHA-256 (provenance only; release builds are not bit-reproducible) | `be4fc47554fd2be9d060d3221b14425b11db52dc3bfa0852e1be7943990e1c6a` |
+| engine | PostgreSQL 16.0 (Nucleus 1.2.1 — The Definitive Database) |
+| source commit (`--write` run) | `4bb54d9f2719aad720872bc115e222832bbf6c46` |
+| `nucleus/` tree SHA (the engine identity) | `16dba6a4b4685ad3ae00b15e8fd074bc48cb3dcc` |
+| binary SHA-256 (provenance only; release builds are not bit-reproducible) | `16163086f082c19b28b25852168f4f29aae2e0d8a7172536929ca9fe580ee753` |
 | drivers | `pg` 8.22.0, `postgres` 3.4.8 |
 | runtime | Node v22.23.2, `@neutron-build/sql` 0.1.0 |
-| recorded | 2026-09-30 |
+| recorded | 2026-10-04 |
 
 ### Totals
 
@@ -195,7 +195,7 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | `catalog.pg_index` | supported | supported |  |  |
 | `catalog.partial_index` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: partial indexes (CREATE INDEX ... WHERE) are not implemented. The predicate was previously parsed and discarded, which built a FULL index… |
 | `catalog.pg_get_indexdef` | supported | supported |  |  |
-| `catalog.regclass_cast` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected [ true, + '956476087' |
+| `catalog.regclass_cast` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected [ true, + '27334764' |
 | `catalog.pg_enum` | supported | supported |  |  |
 | `catalog.views` | supported | supported |  |  |
 | `catalog.current_schema_and_search_path` | supported | supported |  |  |
@@ -206,7 +206,7 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 |---|---|---|---|---|
 | `ddl.create_table_rollback` | unsupported | unsupported |  | wrong result: table must not survive ROLLBACK true !== false |
 | `ddl.alter_add_column_rollback` | unsupported | unsupported |  | wrong result: column must not survive ROLLBACK true !== false |
-| `ddl.drop_table_rollback` | unsupported | unsupported | 42P01 | server error: ServerSqlError [42P01]: pg: relation "x00d_a6699b_base" does not exist |
+| `ddl.drop_table_rollback` | unsupported | unsupported | 42P01 | server error: ServerSqlError [42P01]: pg: relation "x00d_89b461_base" does not exist |
 | `ddl.create_index_rollback` | unsupported | unsupported |  | wrong result: index relation must not survive ROLLBACK true !== false |
 | `ddl.rename_column_rollback` | unsupported | unsupported |  | wrong result: original column name must be back false !== true |
 | `ddl.failed_migration_all_or_nothing` | unsupported | unsupported |  | wrong result: first CREATE TABLE must be rolled back true !== false |
@@ -224,7 +224,7 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | `rls.current_user_policy` | supported | supported |  |  |
 | `rls.with_check_blocks_insert` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: unsupported row-security predicate 'current_setting('app.tenant')::INT'; supported forms are boolean constants, column equality to a lite… |
 | `rls.no_policy_default_deny` | supported | supported |  |  |
-| `rls.owner_bypass_unless_forced` | unknown | unknown |  | setup failed: ServerSqlError [0A000]: pg: ALTER TABLE operation not yet supported: OWNER TO x00s_ed4c52_app — in: alter table x00s_ed4c52_docs owner to x00s_ed4c52_app |
+| `rls.owner_bypass_unless_forced` | unknown | unknown |  | setup failed: ServerSqlError [0A000]: pg: ALTER TABLE operation not yet supported: OWNER TO x00s_521c56_app — in: alter table x00s_521c56_docs owner to x00s_521c56_app |
 | `rls.set_config_transaction_local` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: unknown function: SET_CONFIG |
 | `rls.pg_policies_introspection` | supported | supported |  |  |
 | `rls.set_local_role_transaction_local` | supported | supported |  |  |

@@ -166,9 +166,9 @@ type MeasuredBuild struct {
 // A version match over pgwire cannot prove a source tree match.
 var Measured = MeasuredBuild{
 	Report:         SrcCapabilityReport,
-	NucleusVersion: "1.2.0",
-	NucleusTree:    "3c5c6035b5e6602cf65ba23c917fe83848888571",
-	Recorded:       "2026-09-30",
+	NucleusVersion: "1.2.1",
+	NucleusTree:    "16dba6a4b4685ad3ae00b15e8fd074bc48cb3dcc",
+	Recorded:       "2026-10-04",
 }
 
 // LiveSettings are PostgreSQL settings read from the connection itself: the
