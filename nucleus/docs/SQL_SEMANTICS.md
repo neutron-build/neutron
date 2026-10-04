@@ -20,11 +20,58 @@ comparisons, arithmetic, and plain/grouped/window aggregates, across every
 table engine and across a durable restart.
 
 - Supported range: a **96-bit coefficient with at most 28 fractional digits**.
-- Larger values fail with `numeric value out of range` rather than rounding
-  through floating point. Failing is deliberate: silently degrading to `f64` is
-  how exactness bugs get shipped.
-- Declared precision and scale modifiers such as `NUMERIC(10,2)` are **parsed
-  but not enforced as column typemods**.
+- Larger values fail rather than rounding through floating point. Failing is
+  deliberate: silently degrading to `f64` is how exactness bugs get shipped.
+
+Input is exact-or-refused, with PostgreSQL's SQLSTATE for each refusal:
+
+| Input | Result |
+|---|---|
+| Valid number that does not fit (more than 28 fractional digits, magnitude of 2^96 or more, exponent past 1000) | `numeric value '...' exceeds NUMERIC precision ceiling` (22003) |
+| Text that is not a number: empty, underscores (`1_000`), hex, non-ASCII digits, two points, a bare sign or exponent | `invalid input syntax for type numeric` (22P02) |
+| `NaN`, `Infinity`, `-Infinity` (valid in PostgreSQL) | `numeric NaN and Infinity are not supported` (0A000) |
+| Leading and trailing ASCII whitespace, a leading `+`, `.5`, `5.`, leading zeros | accepted |
+| `-0`, `-0.000` | stored as `0`, `0.000` (PostgreSQL has no negative zero) |
+
+The accepted grammar is PostgreSQL's `numeric_in`. Scientific notation is
+expanded as text (`1.50e1` is `15.0`, `2.5E-3` is `0.0025`) and then parsed
+exactly; it is never computed, so no digit can round. An earlier version used
+`Decimal::from_scientific`, which parsed the mantissa with the rounding parser
+and silently dropped digits past the 28th. The written scale is kept through a
+cast (`1.500` stays `1.500`) and equal values hash alike. A written trailing
+zero past the 28th fractional digit is refused, because the scale cannot be
+kept. Binary parameters follow the same rule: NaN, the infinities, a digit word
+of 10000 or more, an unknown sign, a mismatched length, or nonzero digits past
+`dscale` are refused instead of decoded.
+
+Arithmetic (`+`, `-`, `*`, `%`, `SUM`, window `SUM`/`AVG`) returns the exact
+result or fails with `numeric value out of range` (22003). The underlying
+`Decimal` operations round instead: `MAX + 0.4` came back as a different
+number and `1e-28 * 0.5` as `1e-28`. A product whose unreduced coefficient
+exceeds `i128`, or a sum whose aligned coefficients do, is refused even when the
+reduced result would fit (a conservative refusal, not a rounding).
+
+Known deviations that are documented, not refused:
+
+- **Type modifiers are parsed but not enforced.** `NUMERIC(10,2)` stores
+  `1.005` as written; PostgreSQL rounds to `1.01` and raises 22003 when the
+  precision is exceeded. Enforcing them needs the precision and scale on the
+  column definition and the catalog format; neither exists yet.
+- **An unquoted decimal literal evaluates as FLOAT8**, so `INSERT ... VALUES
+  (0.1234567890123456789)` into a NUMERIC column passes through `f64` and keeps
+  about 17 significant digits. `CAST(literal AS NUMERIC)`, `literal::numeric`,
+  a quoted string, or a bound parameter keep every digit. PostgreSQL types the
+  literal as NUMERIC.
+- **Arithmetic results drop trailing zeros** (`1.10 + 1.10` is `2.2`, where
+  PostgreSQL shows `2.20`). The value is exact; only the display scale differs.
+  A cast keeps the written scale.
+- **Division and `AVG` round** to what fits the 96-bit coefficient and 28
+  fractional digits, as any finite decimal division must. PostgreSQL rounds at
+  a different scale, so the last digits can differ.
+- **Float to NUMERIC** uses the shortest `f64` text, so `0.1::float8::numeric`
+  is `0.1` but `0.30000000000000004::float8::numeric` keeps 17 digits where
+  PostgreSQL keeps 15. A float that needs more than 28 fractional digits
+  (`1e-30`) is refused (22003).
 
 ## Date, time, and time zones
 
