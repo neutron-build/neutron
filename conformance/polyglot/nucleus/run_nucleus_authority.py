@@ -49,10 +49,11 @@ def main() -> int:
     port, resp_port = free_port(), free_port()
     env = {key: value for key, value in os.environ.items() if not key.startswith(("NUCLEUS_", "NEUTRON_"))}
     env.update(NUCLEUS_ALLOW_INSECURE_AUTH="1", NUCLEUS_PASSWORD=password)
+    engine_log = (data / "engine.log").open("wb")
     server = subprocess.Popen(
         [str(binary), "start", "--host", "127.0.0.1", "--port", str(port), "--data", str(data / "db"),
          "--resp-port", str(resp_port), "--no-tls"],
-        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+        env=env, stdout=engine_log, stderr=subprocess.STDOUT, start_new_session=True,
     )
     report: dict[str, object] = {"status": "fail", "binarySha256": digest, "runnerSha256": sha256(Path(__file__))}
     code = 1
@@ -103,6 +104,14 @@ def main() -> int:
                 report["engineStopFailed"] = True
                 report["status"] = "fail"
                 code = 1
+        engine_log.close()
+        try:
+            lines = (data / "engine.log").read_text(errors="replace").splitlines()
+            # Drop any line that could carry a credential literal; keep a bounded tail.
+            kept = [line.replace(password, "[redacted]") for line in lines if "password" not in line.lower()]
+            report["engineLogTail"] = "\n".join(kept)[-3000:]
+        except OSError:
+            pass
         shutil.rmtree(data, ignore_errors=True)
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2) + "\n")
