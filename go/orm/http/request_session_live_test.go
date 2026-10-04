@@ -338,7 +338,7 @@ func TestPostgresRequestWriteSessionCommitRollbackAndRefusals(t *testing.T) {
 
 	// A 4xx application error rolls back both statement kinds and answers exactly
 	// the bounded response; AfterCommit hooks never run.
-	status, header, body = get("/app-refusal")
+	status, header, body := get("/app-refusal")
 	if status != http.StatusConflict || body != string(bounded) || header.Get("Content-Type") != "application/json" {
 		t.Fatal("application refusal response", status, header, body)
 	}
