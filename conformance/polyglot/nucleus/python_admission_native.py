@@ -29,7 +29,7 @@ def digest(path: Path) -> str:
 
 
 def normalized(row: dict[str, object]) -> dict[str, object]:
-    normalized_row={key: value.parsed() if isinstance(value, JsonDocument) else value.isoformat() if isinstance(value, dt.datetime) else value for key, value in row.items()}
+    normalized_row={key: value.parsed() if isinstance(value, JsonDocument) else value.astimezone(dt.timezone.utc).isoformat() if isinstance(value, dt.datetime) else value for key, value in row.items()}
     normalized_row['_data_is_sql_null']=row['data'] is None
     return normalized_row
 
