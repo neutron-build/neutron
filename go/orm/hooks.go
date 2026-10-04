@@ -178,6 +178,24 @@ func WithHookTransaction(ctx context.Context, pool *pgxpool.Pool, options HookTr
 	if callback == nil {
 		return fmt.Errorf("orm: hook transaction callback required")
 	}
+	return WithScopedHookTransaction(ctx, pool, options, func(_ *Scope, session *WriteSession) error { return callback(session) })
+}
+
+// WithScopedHookTransaction is WithHookTransaction for code that must also run
+// explicit statements or savepoints directly on the same transaction Scope, such
+// as a request adapter that hands that Scope to application code. The callback
+// receives the one root Scope and the one WriteSession bound to it. Both are
+// valid only during the callback: the session is terminal when the callback
+// returns, so a retained session refuses use, and the Scope is terminal once the
+// transaction completes. Commit and rollback remain exclusively owned by this
+// function. Callback error, panic, leak or failed hook workflow rolls back;
+// AfterCommit hooks dispatch only after acknowledged COMMIT, exactly as
+// WithHookTransaction. Directly interleaving Scope operations while a session
+// statement or hook is active is refused by the Scope's operation lease.
+func WithScopedHookTransaction(ctx context.Context, pool *pgxpool.Pool, options HookTransactionOptions, callback func(*Scope, *WriteSession) error) error {
+	if callback == nil {
+		return fmt.Errorf("orm: hook transaction callback required")
+	}
 	timeout := options.DispatchTimeout
 	if timeout < 0 {
 		return fmt.Errorf("orm: negative hook dispatch timeout")
@@ -186,19 +204,31 @@ func WithHookTransaction(ctx context.Context, pool *pgxpool.Pool, options HookTr
 		timeout = 5 * time.Second
 	}
 	events := []queuedHookEvent{}
-	err := WithTransaction(ctx, pool, options.Transaction, func(scope *Scope) (result error) {
-		session := newWriteSession(scope)
-		defer func() { session.closeCallback() }()
-		result = callback(session)
-		result = errors.Join(result, session.closeCallback())
-		session.mu.Lock()
-		events = append(events, session.events...)
-		session.mu.Unlock()
-		return result
+	err := WithTransaction(ctx, pool, options.Transaction, func(scope *Scope) error {
+		return runHookSession(scope, callback, &events)
 	})
 	if err != nil {
 		return err
 	}
+	return dispatchHookEvents(ctx, timeout, events)
+}
+
+// runHookSession binds one WriteSession to scope for the duration of callback,
+// terminalizes it on every exit path and collects its queued events.
+func runHookSession(scope *Scope, callback func(*Scope, *WriteSession) error, events *[]queuedHookEvent) (result error) {
+	session := newWriteSession(scope)
+	defer func() { session.closeCallback() }()
+	result = callback(scope, session)
+	result = errors.Join(result, session.closeCallback())
+	session.mu.Lock()
+	*events = append(*events, session.events...)
+	session.mu.Unlock()
+	return result
+}
+
+// dispatchHookEvents runs committed events in order. It must be called only
+// after the transaction's COMMIT was acknowledged.
+func dispatchHookEvents(ctx context.Context, timeout time.Duration, events []queuedHookEvent) error {
 	dispatch, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	for eventIndex, event := range events {
