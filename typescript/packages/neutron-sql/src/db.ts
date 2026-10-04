@@ -3,7 +3,8 @@
 // ---------------------------------------------------------------------------
 
 import { loadDriver, assertNodeRuntime, type Driver, type LoadDriverOptions } from "./drivers.js";
-import { capabilityGate, type CapabilityEvidence, type EngineIdentity } from "./engine.js";
+import { capabilityGate, type CapabilityEvidence, type CapabilityGate, type EngineIdentity } from "./engine.js";
+import { admitExecutionProfile, validateExecutionProfile, type AdmittedProfile, type EndpointIdentity, type ExecutionProfile } from "./profile.js";
 import type { StatementCapability } from "./codecs.js";
 import { resolveLogger, type Logger, type LoggerOption, type SqlEvent } from "./logger.js";
 import {
@@ -102,6 +103,14 @@ export interface DatabaseOptions<
   /** Driver kind and pool tuning when `url` is used (renamed from the
    *  pre-I01 `driver` option, which now injects an adapter). */
   driverOptions?: LoadDriverOptions;
+  /** Explicit endpoint profile (NP01). Omitted: behavior is unchanged and no
+   *  admission runs. `"postgres-direct"` admits only a reported PostgreSQL
+   *  identity. `"nucleus-relational-rc-v1-candidate"` is an UNCERTIFIED finite
+   *  Nucleus candidate: exact reported identity, immutable capabilities,
+   *  packageEnabled false, and only generated point CRUD over registered
+   *  schema-qualified int4/int8/bool/text/jsonb/timestamptz tables (see
+   *  profile.ts); everything else is refused before dispatch. */
+  profile?: ExecutionProfile;
   /** Tables; enables db.query.<name>. */
   tables?: T;
   /** Relations keyed by the same names as `tables`. */
@@ -461,6 +470,9 @@ export interface NeutronDatabase<
   /** Engine identity of the connected server (memoized SELECT VERSION();
    *  FRAMEWORK_CONTRACT.md §1 — product is tri-state, see engine.ts). */
   engine(): Promise<EngineIdentity>;
+  /** Admitted endpoint identity when `profile` was selected (immutable,
+   *  reported identity only — not binary or TLS attestation). */
+  readonly endpointIdentity?: EndpointIdentity;
   /** Tri-state capability status with evidence (supported / unsupported /
    *  unknown; unknown fails closed for statements that require it). */
   capability(name: StatementCapability): Promise<CapabilityEvidence>;
@@ -511,9 +523,9 @@ export async function createDatabase<
   if ((options.url === undefined) === (options.driver === undefined)) {
     throw new Error("createDatabase requires exactly one of `url` or `driver` (inject an adapter wrapped via wrapPgPool/wrapPostgresJs)");
   }
-  const driver = options.driver ?? (await loadDriver(options.url!, options.driverOptions));
+  const profile = options.profile === undefined ? undefined : validateExecutionProfile(options.profile);
+  const rawDriver = options.driver ?? (await loadDriver(options.url!, options.driverOptions));
   const logger = resolveLogger(options.logger);
-  const capabilities = capabilityGate(driver);
 
   const tables = new Map<string, { key: string; table: AnyPgTable }>();
   for (const [key, value] of Object.entries(options.tables ?? {})) {
@@ -551,6 +563,19 @@ export async function createDatabase<
   const relationsByTable = new Map<string, Record<string, Relation>>();
   for (const r of relationSets) relationsByTable.set(getTableRelationKey(r.table), r.entries);
   void resolved;
+
+  let admitted: AdmittedProfile | undefined;
+  if (profile !== undefined) {
+    try {
+      admitted = await admitExecutionProfile(rawDriver, profile, [...tables.values()].map((entry) => entry.table));
+    } catch (err) {
+      await rawDriver.close().catch(() => undefined);
+      throw err;
+    }
+  }
+  const driver: Driver = admitted?.driver ?? rawDriver;
+  const capabilities: CapabilityGate = admitted?.capabilities ?? capabilityGate(rawDriver);
+  const endpointIdentity: EndpointIdentity | undefined = admitted?.identity;
 
   const ctx: ExecContext = { driver, logger, capabilities };
 
@@ -710,6 +735,9 @@ export async function createDatabase<
     query,
   };
 
+  if (endpointIdentity !== undefined) {
+    Object.defineProperty(db, "endpointIdentity", { value: endpointIdentity, enumerable: true, writable: false, configurable: false });
+  }
   return db as unknown as NeutronDatabase<T, R>;
 }
 

@@ -485,6 +485,20 @@ export {
   type CapabilityGate,
 } from "./engine.js";
 
+// NP01: explicit, uncertified execution profiles. Omitting `profile` leaves
+// createDatabase unchanged; see profile.ts for the finite Nucleus contract.
+export {
+  POSTGRES_DIRECT_PROFILE,
+  NUCLEUS_CANDIDATE_PROFILE,
+  NUCLEUS_CANDIDATE_VERSION,
+  NUCLEUS_CAPABILITIES,
+  ProfileRefusedError,
+  admitEndpoint,
+  validateExecutionProfile,
+  type EndpointIdentity,
+  type ExecutionProfile,
+} from "./profile.js";
+
 export {
   resolveLogger,
   paramsLoggingEnabled,
