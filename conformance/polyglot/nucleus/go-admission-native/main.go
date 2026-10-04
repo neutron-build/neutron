@@ -382,6 +382,25 @@ func clean(text string) string {
 	return text
 }
 
+// rootCause names the innermost error and its SQLSTATE so a failure report
+// carries the server's reason rather than only the wrapper's text. Messages are
+// bounded and pass through clean() before reaching the report.
+func rootCause(err error) string {
+	inner := err
+	for next := errors.Unwrap(inner); next != nil; next = errors.Unwrap(inner) {
+		inner = next
+	}
+	text := inner.Error()
+	if len(text) > 300 {
+		text = text[:300]
+	}
+	var coded interface{ SQLState() string }
+	if errors.As(err, &coded) {
+		text += " (sqlstate " + coded.SQLState() + ")"
+	}
+	return text
+}
+
 func fail(r *report, path string, err error) {
 	r.Status = "fail"
 	if r.Failure == "" {
@@ -500,7 +519,7 @@ func main() {
 			}
 			facts, refusals, err := runEngine(ctx, engine, urls[engine], raw, schema)
 			if err != nil {
-				failure = fmt.Errorf("%s: %v", engine, err)
+				failure = fmt.Errorf("%s: %v [cause: %s]", engine, err, rootCause(err))
 				return
 			}
 			results[engine] = facts
@@ -553,7 +572,7 @@ func main() {
 	for i := len(raws) - 1; i >= 0; i-- {
 		if _, err := raws[i].Exec(cleanupCtx, `DROP SCHEMA IF EXISTS "`+schema+`" CASCADE`); err != nil {
 			r.Status = "fail"
-			r.CleanupFailure = fmt.Sprintf("%T", err)
+			r.CleanupFailure = fmt.Sprintf("%T: %s", err, rootCause(err))
 			failure = err
 		}
 		_ = raws[i].Close(cleanupCtx)

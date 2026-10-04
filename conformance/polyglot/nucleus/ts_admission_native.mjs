@@ -250,7 +250,9 @@ async function main() {
   } catch (error) {
     failure = error;
     report.failure = { class: error?.constructor?.name ?? typeof error, code: error?.code ?? null,
-      reason: error instanceof assert.AssertionError ? String(error.message) : null };
+      reason: error instanceof assert.AssertionError ? String(error.message) : null,
+      cause: error?.cause ? { class: error.cause?.constructor?.name ?? typeof error.cause, code: error.cause?.code ?? null,
+        message: String(error.cause?.message ?? '').split('\n')[0].slice(0, 300) } : null };
   } finally {
     for (const native of natives.reverse()) {
       try {
@@ -258,7 +260,7 @@ async function main() {
       } catch (error) {
         failure = error;
         report.status = 'fail';
-        report.cleanupFailure = { class: error?.constructor?.name ?? typeof error, code: error?.code ?? null };
+        report.cleanupFailure = { class: error?.constructor?.name ?? typeof error, code: error?.code ?? null, message: String(error?.message ?? '').split('\n')[0].slice(0, 300) };
       } finally {
         await native.end().catch(() => undefined);
       }
