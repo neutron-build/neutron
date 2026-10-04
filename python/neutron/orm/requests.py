@@ -5,8 +5,9 @@ from contextlib import asynccontextmanager,contextmanager
 import threading
 from typing import AsyncIterator,Iterator
 from .async_session import AsyncSession
-from .client import AsyncDatabase
+from .client import AsyncDatabase,Database
 from .core import OrmError
+from .endpoint import validate_profile
 from .observability import QueryObserver
 from .session import Session
 from .streaming import _sync_cleanup
@@ -17,10 +18,10 @@ def _seconds(value: float) -> None:
 
 class SessionRequests:
     """Thread-owned sync requests; the ASGI/WSGI server drains request workers."""
-    def __init__(self,url: str,*,observer: QueryObserver|None=None,max_active: int=32,cleanup_seconds: float=5.0) -> None:
+    def __init__(self,url: str,*,observer: QueryObserver|None=None,max_active: int=32,cleanup_seconds: float=5.0,profile: str='postgres-direct') -> None:
         if type(max_active) is not int or not 0<max_active<=4096: raise ValueError('finite request admission capacity required')
-        _seconds(cleanup_seconds)
-        self._url=url;self._observer=observer;self._max=max_active;self._cleanup=cleanup_seconds
+        _seconds(cleanup_seconds);validate_profile(profile)
+        self._url=url;self._profile=profile;self._observer=observer;self._max=max_active;self._cleanup=cleanup_seconds
         self._lock=threading.Lock();self._idle=threading.Event();self._idle.set();self._active: set[int]=set();self._stopping=False
     @contextmanager
     def session(self) -> Iterator[Session]:
@@ -30,7 +31,7 @@ class SessionRequests:
             self._active.add(owner);self._idle.clear()
         session=None;body_error: BaseException|None=None
         try:
-            session=Session.connect(self._url,observer=self._observer)
+            session=Session(Database.connect(self._url,profile=self._profile,observer=self._observer),close_database=True)
             with self._lock:
                 if self._stopping: raise OrmError('request factory stopped during connect')
             yield session
@@ -58,10 +59,10 @@ class SessionRequests:
 
 class AsyncSessionRequests:
     """One Session per owning request task; shared state contains no model cache."""
-    def __init__(self,url: str,*,observer: QueryObserver|None=None,max_active: int=32,cleanup_seconds: float=5.0) -> None:
+    def __init__(self,url: str,*,observer: QueryObserver|None=None,max_active: int=32,cleanup_seconds: float=5.0,profile: str='postgres-direct') -> None:
         if type(max_active) is not int or not 0<max_active<=4096: raise ValueError('finite request admission capacity required')
-        _seconds(cleanup_seconds)
-        self._url=url;self._observer=observer;self._max=max_active;self._cleanup=cleanup_seconds
+        _seconds(cleanup_seconds);validate_profile(profile)
+        self._url=url;self._profile=profile;self._observer=observer;self._max=max_active;self._cleanup=cleanup_seconds
         self._loop=asyncio.get_running_loop();self._active: dict[asyncio.Task[object],AsyncDatabase|None]={}
         self._idle=asyncio.Event();self._idle.set();self._stopping=False
     def _owner(self) -> asyncio.Task[object]:
@@ -78,7 +79,7 @@ class AsyncSessionRequests:
         if self._stopping or owner in self._active or len(self._active)>=self._max: raise OrmError('request Session admission refused')
         self._active[owner]=None;self._idle.clear();session=None;db=None;body_error: BaseException|None=None
         try:
-            db=await AsyncDatabase.connect(self._url,observer=self._observer);self._active[owner]=db
+            db=await AsyncDatabase.connect(self._url,profile=self._profile,observer=self._observer);self._active[owner]=db
             session=AsyncSession(db,close_database=True)
             if self._stopping: raise OrmError('request factory stopped during connect')
             yield session

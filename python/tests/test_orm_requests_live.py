@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import threading
 import pytest
 from neutron.orm import AsyncSessionRequests,ModelMapping,Mutation,OrmError,QueryObserver,SessionRequests
+from neutron.orm.endpoint import NUCLEUS_CANDIDATE_PROFILE
 from .test_orm_live import live_table
 
 @dataclass
@@ -135,3 +136,34 @@ async def test_native_async_request_admission_and_fresh_model_ownership(live_tab
         two=await third.get(mapping,1);assert two is not None and two is not one
     assert first._database.closed and second._database.closed and third._database.closed
     await requests.shutdown()
+
+
+def test_native_sync_requests_forward_profile_and_refuse_mismatched_engine_without_leaking_slot(live_table):
+    url,table,native=live_table;mapping=mapping_for(table)
+    explicit=SessionRequests(url,profile='postgres-direct',max_active=1)
+    with explicit.session() as session:
+        assert session._database.endpoint_identity is not None and session._database.endpoint_identity.profile=='postgres-direct'
+        session.add(mapping,RequestRow(1,'profile-default'))
+    candidate=SessionRequests(url,profile=NUCLEUS_CANDIDATE_PROFILE,max_active=1)  # valid name; a PostgreSQL endpoint is not the Nucleus candidate
+    for _ in range(2):
+        with pytest.raises(OrmError) as caught:
+            with candidate.session(): pass
+        assert 'admission refused' not in str(caught.value)
+    with SessionRequests(url,max_active=1).session() as after: assert after._database.endpoint_identity is not None
+    assert native.execute(f'SELECT label FROM {table.sql}').fetchone()==('profile-default',)
+
+@pytest.mark.asyncio
+async def test_native_async_requests_forward_profile_and_refuse_mismatched_engine_without_leaking_slot(live_table):
+    url,table,native=live_table;mapping=mapping_for(table)
+    explicit=AsyncSessionRequests(url,profile='postgres-direct',max_active=1)
+    async with explicit.session() as session:
+        assert session._database.endpoint_identity is not None and session._database.endpoint_identity.profile=='postgres-direct'
+        session.add(mapping,RequestRow(1,'profile-default'))
+    candidate=AsyncSessionRequests(url,profile=NUCLEUS_CANDIDATE_PROFILE,max_active=1)
+    for _ in range(2):
+        with pytest.raises(OrmError) as caught:
+            async with candidate.session(): pass
+        assert 'admission refused' not in str(caught.value) and candidate.active_count==0
+    async with AsyncSessionRequests(url,max_active=1).session() as after: assert after._database.endpoint_identity is not None
+    assert native.execute(f'SELECT label FROM {table.sql}').fetchone()==('profile-default',)
+    await explicit.shutdown();await candidate.shutdown()

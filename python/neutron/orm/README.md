@@ -666,6 +666,9 @@ cancellation; sync calls stay in the request's worker thread, async calls stay i
 its task. Finite `max_active` admission defaults to 32 and refuses nested ownership.
 No global Session, model cache or tenant transaction is shared. Configure native
 connection timeouts in the private connection URL as part of the deployment.
+Both managers accept an optional `profile=` (default `postgres-direct`), forwarded
+unchanged to `Database.connect`/`AsyncDatabase.connect` and validated at construction:
+an unknown profile refuses with `OrmError` before any connection is attempted.
 
 Shutdown stops admission and drains active requests within `grace_seconds`.
 Async shutdown then cancels request owners and gives cleanup a finite deadline;
