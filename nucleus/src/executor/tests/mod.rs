@@ -82,6 +82,7 @@ mod test_multimodel;
 mod test_mv_writetime; // Phase 3: Write-time materialized view refresh
 mod test_mvcc_gc_compaction; // NU-01 tail compaction: reclaim dead tails, ids never reused (WAL v2 subset)
 mod test_numeric_exact; // NP03: NUMERIC text, arithmetic and aggregates are exact-or-refused with PostgreSQL SQLSTATEs
+mod test_numeric_typmod; // NUMERIC(p,s) typmod: rounding, 22003 overflow, exact decimal literals, persistence
 mod test_observability; // M11: observability ledger surfaces (CHECKPOINT, WAL/txn state, health)
 mod test_password_lifecycle; // N16: password creation, rotation, expiry
 mod test_pk_write_cost;

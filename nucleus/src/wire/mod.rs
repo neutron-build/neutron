@@ -6334,6 +6334,24 @@ mod tests {
         }
     }
 
+    /// A zero keeps its display scale on the wire: PostgreSQL sends ndigits 0
+    /// with dscale 2 for `0.00`. The `rust_decimal` encoding that binary
+    /// result columns used sent a one-word zero with dscale 0. A value with a
+    /// declared NUMERIC(p, s) applied round-trips through the same encoder
+    /// unchanged.
+    #[test]
+    fn numeric_binary_zero_keeps_its_display_scale() {
+        let encoded = numeric_binary("0.00").unwrap();
+        assert_eq!(encoded, numeric_wire(0, 0, 2, &[]));
+        assert_eq!(decode_binary_numeric(&encoded).as_deref(), Some("0.00"));
+        let typmod = crate::types::NumericTypmod::new(10, 2).unwrap();
+        for written in ["1.5", "-1.005", "0.004", "99999999.99"] {
+            let stored = typmod.apply(written).unwrap();
+            let decoded = decode_binary_numeric(&numeric_binary(&stored).unwrap()).unwrap();
+            assert_eq!(decoded, stored, "{written}");
+        }
+    }
+
     // ── Binary-parameter typed decoding (corruption-class regression) ──
 
     // ── statement_timeout parsing (M11: query-time limit) ──
