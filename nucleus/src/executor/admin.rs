@@ -1297,6 +1297,14 @@ impl Executor {
             .as_ref()
             .ok_or_else(|| ExecError::Unsupported("DECLARE requires FOR query".into()))?;
 
+        // Rows come back in the connection's normal result format; a BINARY
+        // cursor would silently return text, so it is refused instead.
+        if stmt.binary == Some(true) {
+            return Err(ExecError::Unsupported(
+                "DECLARE BINARY cursors are not supported".into(),
+            ));
+        }
+
         let hold = stmt.hold == Some(true);
         let no_scroll = stmt.scroll == Some(false);
         let sess = self.current_session();

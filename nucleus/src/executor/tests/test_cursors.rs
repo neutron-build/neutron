@@ -230,6 +230,20 @@ async fn bad_counts_and_missing_cursors_are_errors() {
     }
 }
 
+/// BINARY would silently return text rows, so it is refused (0A000).
+#[tokio::test]
+async fn binary_cursors_are_refused() {
+    let ex = seeded(1).await;
+    exec(&ex, "BEGIN").await;
+    let err = ex
+        .execute(&format!("DECLARE c BINARY CURSOR FOR {DECLARE_ALL}"))
+        .await
+        .expect_err("BINARY cursors are not supported");
+    assert_eq!(sqlstate_of(&err), "0A000");
+    assert!(cursor_names(&ex).await.is_empty());
+    exec(&ex, "ROLLBACK").await;
+}
+
 // ── Lifetime ────────────────────────────────────────────────────────────
 
 /// Outside a transaction block only WITH HOLD is accepted (25P01 otherwise).

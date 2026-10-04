@@ -267,9 +267,10 @@ Not implemented, so the cursor is not a faithful PostgreSQL cursor:
   rolled-back work produced.
 - **Cancellation and timeout** act on `DECLARE` (the query) and on each `FETCH`
   as ordinary statements; there is no long-lived scan to cancel.
-- `BINARY`, `INSENSITIVE` and `ASENSITIVE` are parsed; `BINARY` is not honored
-  (rows are returned in the connection's normal result format). Redeclaring an
-  existing name replaces it instead of failing with 42P03.
+- `DECLARE BINARY` is refused (0A000) because rows are always returned in the
+  connection's normal result format; `INSENSITIVE` and `ASENSITIVE` are
+  accepted and ignored. Redeclaring an existing name replaces it instead of
+  failing with 42P03.
 
 A true lazy cursor needs a pinned snapshot plus a resumable plan or streaming
 operator tree that the executor can park between statements; the executor's
