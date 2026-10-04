@@ -527,13 +527,17 @@ pub struct LimitsConfig {
     /// SQL-level cursors (DECLARE) one session may hold.
     #[serde(default = "default_max_cursors_per_session")]
     pub max_cursors_per_session: usize,
-    /// Rows one DECLAREd cursor may hold. DECLARE materializes the query, so
-    /// the row set is capped at declaration; past the limit DECLARE fails with
-    /// 54000 and nothing is stored.
+    /// Rows one DECLAREd cursor may hold or return. A materialized cursor runs
+    /// its query at DECLARE, so the row set is capped at declaration; past the
+    /// limit DECLARE fails with 54000 and nothing is stored. A lazy cursor
+    /// (a bare generate_series) holds no rows, and this caps the rows one
+    /// FETCH may return; past the limit FETCH fails with 54000 and the
+    /// cursor does not move.
     #[serde(default = "default_max_cursor_rows")]
     pub max_cursor_rows: usize,
-    /// Estimated heap bytes one DECLAREd cursor may hold (64 MiB). Checked on
-    /// the materialized result before it is stored; past the limit DECLARE
+    /// Estimated heap bytes one DECLAREd cursor may hold or return (64 MiB).
+    /// Checked on a materialized result before it is stored, and on the rows
+    /// one FETCH of a lazy cursor returns; past the limit DECLARE or FETCH
     /// fails with 54000. Worst case per session is this times
     /// max_cursors_per_session.
     #[serde(default = "default_max_cursor_bytes")]

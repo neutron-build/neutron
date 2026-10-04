@@ -560,19 +560,22 @@ const SKIP_WARN_EVERY: u64 = 10;
 /// `limits.max_prepared_statements_per_session`.
 pub(crate) const DEFAULT_MAX_PREPARED_STMTS: usize = 1024;
 
-/// Default per-session cap on open cursors. Each cursor materializes its full
-/// row set, so this bounds both map growth and per-cursor memory pressure.
-/// Overridable via `limits.max_cursors_per_session`.
+/// Default per-session cap on open cursors. A materialized cursor holds its
+/// full row set (a lazy one holds a few integers), so this bounds both map
+/// growth and per-cursor memory pressure. Overridable via
+/// `limits.max_cursors_per_session`.
 pub(crate) const DEFAULT_MAX_CURSORS: usize = 1024;
 
-/// Default per-cursor cap on materialized rows. DECLARE runs the query to
-/// completion, so the cap is applied as a row limit on the query itself and
-/// re-checked on the result. Overridable via `limits.max_cursor_rows`.
+/// Default per-cursor cap on rows. A materialized cursor runs its query to
+/// completion at DECLARE, so the cap is applied as a row limit on the query
+/// itself and re-checked on the result; a lazy cursor holds no rows, so the
+/// same cap bounds the rows one FETCH may return. Overridable via
+/// `limits.max_cursor_rows`.
 pub(crate) const DEFAULT_MAX_CURSOR_ROWS: usize = 1_000_000;
 
-/// Default per-cursor cap on estimated materialized bytes (64 MiB). Checked on
-/// the materialized result before it is stored. Overridable via
-/// `limits.max_cursor_bytes`.
+/// Default per-cursor cap on estimated bytes (64 MiB). Checked on a
+/// materialized result before it is stored, and on the rows one FETCH of a lazy
+/// cursor returns. Overridable via `limits.max_cursor_bytes`.
 pub(crate) const DEFAULT_MAX_CURSOR_BYTES: usize = 64 * 1024 * 1024;
 
 /// The executor holds shared catalog/storage state and per-session state.
@@ -786,9 +789,11 @@ pub struct Executor {
     /// materializes its whole row set. Configurable via
     /// `limits.max_cursors_per_session`.
     max_cursors_per_session: AtomicUsize,
-    /// Per-cursor cap on materialized rows (`limits.max_cursor_rows`).
+    /// Per-cursor cap on rows (`limits.max_cursor_rows`): materialized at
+    /// DECLARE, or returned by one FETCH of a lazy cursor.
     max_cursor_rows: AtomicUsize,
-    /// Per-cursor cap on estimated materialized bytes (`limits.max_cursor_bytes`).
+    /// Per-cursor cap on estimated bytes (`limits.max_cursor_bytes`), applied
+    /// the same two ways.
     max_cursor_bytes: AtomicUsize,
     /// Default session for backward-compatible `execute()` (embedded mode).
     default_session: Arc<Session>,
@@ -2737,8 +2742,10 @@ impl Executor {
             .store(cursors, Ordering::Release);
     }
 
-    /// Set the per-cursor materialization budgets after construction. A DECLARE
-    /// whose result exceeds either is REFUSED (54000) and stores nothing.
+    /// Set the per-cursor budgets after construction. A DECLARE whose
+    /// materialized result exceeds either is REFUSED (54000) and stores nothing;
+    /// a FETCH on a lazy cursor that would return more is REFUSED (54000) and
+    /// does not move the cursor.
     pub fn set_cursor_budgets(&self, max_rows: usize, max_bytes: usize) {
         self.max_cursor_rows.store(max_rows, Ordering::Release);
         self.max_cursor_bytes.store(max_bytes, Ordering::Release);

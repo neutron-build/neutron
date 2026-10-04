@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use sqlparser::ast;
+use sqlparser::ast::{self, Visit};
 
 use crate::fault::SubsystemHealth;
 use crate::types::{DataType, Row, Value};
@@ -13,9 +13,20 @@ use crate::types::{DataType, Row, Value};
 use super::helpers::{
     grantee_name, parse_grant_objects, parse_lock_timeout, parse_privileges, parse_time_zone,
 };
-use super::schema_types::{CursorDef, RoleDef};
+use super::schema_types::{CursorDef, RoleDef, SeriesCursor};
 use super::session::Session;
+use super::types::ColMeta;
 use super::{ExecError, ExecResult, Executor};
+
+/// Rows a lazy FETCH produces and projects at a time. This bounds the working
+/// set of a large FETCH and is the stride at which its result size is checked
+/// against the cursor budgets.
+const SERIES_CHUNK_ROWS: usize = 256;
+
+/// Series values a lazy FETCH examines between polls of the session's cancel
+/// flag, counting values a WHERE clause throws away, so a selective filter over
+/// a long range stays cancellable.
+const SERIES_CANCEL_POLL: u32 = 1024;
 
 impl Executor {
     /// The principal an audit event should be attributed to: the effective
@@ -1271,17 +1282,28 @@ impl Executor {
 
     /// DECLARE [BINARY] cursor [NO] SCROLL CURSOR [WITH | WITHOUT HOLD] FOR query.
     ///
-    /// The query runs to completion here and its rows are held in the session,
-    /// so a cursor is a materialized snapshot taken at DECLARE, not a lazy scan.
-    /// What bounds it:
-    /// - the per-session cursor count (checked before any work is done);
-    /// - the per-cursor row budget, applied as a row limit on the query itself
-    ///   so a sort-free scan stops early, and re-checked on the result;
-    /// - the per-cursor byte budget, checked on the result before it is stored
-    ///   (the executor hands back a whole `Vec<Row>`, so bytes cannot be
-    ///   enforced mid-flight);
-    /// - transaction lifetime: outside a transaction block only WITH HOLD is
-    ///   accepted, and every other cursor is closed at COMMIT or ROLLBACK.
+    /// A cursor is one of two things, decided here:
+    ///
+    /// - **Lazy**, for a select over a single constant-argument
+    ///   `generate_series(...)` (see [`Self::plan_series_cursor`]). Nothing is
+    ///   executed at DECLARE: the cursor stores a few integers and the parsed
+    ///   select list, and each FETCH produces only the rows it returns. The
+    ///   source reads no table, so there is no snapshot to pin and the cursor
+    ///   is insensitive trivially. It is forward only, because the producer
+    ///   keeps no rows; an explicit `SCROLL` is never given one.
+    /// - **Materialized**, for everything else: the query runs to completion
+    ///   here and its rows are held in the session, a snapshot taken at
+    ///   DECLARE. What bounds it:
+    ///   - the per-cursor row budget, applied as a row limit on the query
+    ///     itself so a sort-free scan stops early, and re-checked on the result;
+    ///   - the per-cursor byte budget, checked on the result before it is
+    ///     stored (the executor hands back a whole `Vec<Row>`, so bytes cannot
+    ///     be enforced mid-flight).
+    ///
+    /// Both kinds share the per-session cursor count (checked before any work
+    /// is done) and transaction lifetime: outside a transaction block only
+    /// WITH HOLD is accepted, and every other cursor is closed at COMMIT or
+    /// ROLLBACK.
     pub(super) async fn execute_declare_cursor(
         &self,
         stmt: &ast::Declare,
@@ -1347,6 +1369,42 @@ impl Executor {
             .max_cursor_bytes
             .load(std::sync::atomic::Ordering::Acquire);
 
+        // The lazy path. An explicit SCROLL promises backward movement, which
+        // a producer that keeps no rows cannot give, so it is materialized.
+        if stmt.scroll != Some(true)
+            && let Some((series, columns)) = self.plan_series_cursor(query)
+        {
+            let seq = sess
+                .cursor_seq
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            sess.cursors.write().await.insert(
+                cursor_name.clone(),
+                CursorDef {
+                    name: cursor_name,
+                    rows: Vec::new(),
+                    columns,
+                    position: 0,
+                    // Forward only by construction: this is what makes the
+                    // shared FETCH check refuse a backward movement.
+                    no_scroll: true,
+                    hold,
+                    opened_in_txn: in_txn,
+                    bytes: 0,
+                    seq,
+                    lazy: Some(series),
+                },
+            );
+            return Ok(ExecResult::Command {
+                tag: "DECLARE CURSOR".into(),
+                rows_affected: 0,
+            });
+        }
+
+        // The executor materializes a table function whole before any LIMIT
+        // applies, so the row cap below cannot stop it. Refuse a series that
+        // is already over the budget instead of building it.
+        self.refuse_oversized_series(query, max_rows)?;
+
         let mut capped: ast::Query = (**query).clone();
         cap_cursor_query(&mut capped, max_rows);
         let result = self.execute_query(capped).await?;
@@ -1370,6 +1428,9 @@ impl Executor {
                         )));
                     }
                 }
+                let seq = sess
+                    .cursor_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mut cursors = sess.cursors.write().await;
                 cursors.insert(
                     cursor_name.clone(),
@@ -1382,6 +1443,8 @@ impl Executor {
                         hold,
                         opened_in_txn: in_txn,
                         bytes,
+                        seq,
+                        lazy: None,
                     },
                 );
                 Ok(ExecResult::Command {
@@ -1410,11 +1473,45 @@ impl Executor {
             ExecError::Runtime(format!("cursor \"{cursor_name}\" does not exist"))
         })?;
 
-        let fetched = apply_cursor_move(cursor, movement)?;
-        Ok(ExecResult::Select {
-            columns: cursor.columns.clone(),
-            rows: fetched,
-        })
+        let Some(mut series) = cursor.lazy.clone() else {
+            let fetched = apply_cursor_move(cursor, movement)?;
+            return Ok(ExecResult::Select {
+                columns: cursor.columns.clone(),
+                rows: fetched,
+            });
+        };
+
+        // A lazy cursor: advance a copy of the producer and keep it only if
+        // the whole FETCH succeeded. `cursor` is not used past this point.
+        let position = cursor.position;
+        let columns = cursor.columns.clone();
+        if !moves_forward_only(&movement, position) {
+            return Err(scan_forward_error());
+        }
+        let max_rows = self
+            .max_cursor_rows
+            .load(std::sync::atomic::Ordering::Acquire);
+        let max_bytes = self
+            .max_cursor_bytes
+            .load(std::sync::atomic::Ordering::Acquire);
+        match self.advance_series(&mut series, movement, max_rows, max_bytes) {
+            Ok(rows) => {
+                if let Some(cursor) = cursors.get_mut(cursor_name) {
+                    cursor.position = series.position();
+                    cursor.lazy = Some(series);
+                }
+                Ok(ExecResult::Select { columns, rows })
+            }
+            // Over budget: nothing was consumed, the cursor stays where it was.
+            Err(SeriesFetchError::Refused(err)) => Err(err),
+            // Cancelled or failed mid-stream: the producer's position is no
+            // longer one the client can reason about, so the cursor is closed
+            // and its state released with it.
+            Err(SeriesFetchError::Failed(err)) => {
+                cursors.remove(cursor_name);
+                Err(err)
+            }
+        }
     }
 
     pub(super) async fn execute_close_cursor(
@@ -1508,6 +1605,483 @@ impl Executor {
             tag: "UNLISTEN".into(),
             rows_affected: 0,
         })
+    }
+}
+
+/// How a lazy FETCH failed. A refusal leaves the cursor exactly where it was;
+/// any other failure (cancellation, an evaluation error) closes it.
+enum SeriesFetchError {
+    Refused(ExecError),
+    Failed(ExecError),
+}
+
+/// Stops at the first construct a lazy cursor will not evaluate at FETCH
+/// time: a function call (it could write, read a table or a store, or differ
+/// between calls), a subquery, or an unbound parameter. What is left is pure
+/// arithmetic, comparison and CASE over the series value and literals, whose
+/// result depends on nothing but the row it is evaluated against.
+struct NotLazyPure;
+
+impl ast::Visitor for NotLazyPure {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &ast::Expr) -> std::ops::ControlFlow<()> {
+        match expr {
+            ast::Expr::Function(_)
+            | ast::Expr::Subquery(_)
+            | ast::Expr::Exists { .. }
+            | ast::Expr::InSubquery { .. } => std::ops::ControlFlow::Break(()),
+            ast::Expr::Value(v) if matches!(&v.value, ast::Value::Placeholder(_)) => {
+                std::ops::ControlFlow::Break(())
+            }
+            _ => std::ops::ControlFlow::Continue(()),
+        }
+    }
+}
+
+fn lazy_pure(expr: &ast::Expr) -> bool {
+    expr.visit(&mut NotLazyPure).is_continue()
+}
+
+fn scan_forward_error() -> ExecError {
+    ExecError::Runtime(
+        "cursor can only scan forward; declare it with SCROLL option to enable backward scan"
+            .into(),
+    )
+}
+
+impl Executor {
+    /// The lazy producer for a cursor query, or `None` when the query is not
+    /// of the one shape that can be produced without a snapshot:
+    ///
+    /// ```text
+    /// SELECT <select list> FROM generate_series(a, b [, step]) [[AS] t[(c)]]
+    ///   [WHERE <predicate>] [LIMIT n] [OFFSET m]
+    /// ```
+    ///
+    /// with constant integer arguments and a select list and predicate built
+    /// from arithmetic, comparison, CASE and literals only (no function call,
+    /// subquery or parameter). No ORDER BY, DISTINCT, GROUP BY, HAVING,
+    /// window, join, CTE, set operation or locking clause: each of those needs
+    /// the whole input before it can emit a row, or reads something a
+    /// snapshot would have to pin. Anything outside the shape returns `None`
+    /// and is materialized under the budgets instead, which is also where its
+    /// errors are reported.
+    ///
+    /// The column types come from evaluating the select list once on the
+    /// first series value (or from its static type when that evaluation fails
+    /// or the series is empty), the way a materialized cursor types its
+    /// columns from its first row. That is the only evaluation DECLARE does.
+    fn plan_series_cursor(
+        &self,
+        query: &ast::Query,
+    ) -> Option<(SeriesCursor, Vec<(String, DataType)>)> {
+        if query.with.is_some()
+            || query.order_by.is_some()
+            || query.fetch.is_some()
+            || !query.locks.is_empty()
+            || query.for_clause.is_some()
+            || query.settings.is_some()
+            || query.format_clause.is_some()
+            || !query.pipe_operators.is_empty()
+        {
+            return None;
+        }
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            return None;
+        };
+        if select.optimizer_hint.is_some()
+            || select.distinct.is_some()
+            || select.select_modifiers.is_some()
+            || select.top.is_some()
+            || select.exclude.is_some()
+            || select.into.is_some()
+            || !select.lateral_views.is_empty()
+            || select.prewhere.is_some()
+            || !select.connect_by.is_empty()
+            || !select.cluster_by.is_empty()
+            || !select.distribute_by.is_empty()
+            || !select.sort_by.is_empty()
+            || select.having.is_some()
+            || !select.named_window.is_empty()
+            || select.qualify.is_some()
+            || select.value_table_mode.is_some()
+            || !matches!(
+                &select.group_by,
+                ast::GroupByExpr::Expressions(exprs, modifiers)
+                    if exprs.is_empty() && modifiers.is_empty()
+            )
+        {
+            return None;
+        }
+
+        if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+            return None;
+        }
+        let ast::TableFactor::Table {
+            name,
+            alias,
+            args: Some(fn_args),
+            with_hints,
+            version,
+            with_ordinality,
+            partitions,
+            json_path,
+            sample,
+            index_hints,
+        } = &select.from[0].relation
+        else {
+            return None;
+        };
+        if !with_hints.is_empty()
+            || version.is_some()
+            || *with_ordinality
+            || !partitions.is_empty()
+            || json_path.is_some()
+            || sample.is_some()
+            || !index_hints.is_empty()
+            || fn_args.settings.is_some()
+            || fn_args.args.len() < 2
+            || fn_args.args.len() > 3
+        {
+            return None;
+        }
+        let table_name = crate::sql::object_name_key(name);
+        if !table_name.eq_ignore_ascii_case("generate_series") {
+            return None;
+        }
+
+        // The label and column name the materialized table function gives its
+        // single output column.
+        let label = alias
+            .as_ref()
+            .map(|a| a.name.value.clone())
+            .unwrap_or_else(|| table_name.clone());
+        let column_name = match alias {
+            Some(a) => {
+                if a.columns.len() > 1 || a.columns.iter().any(|c| c.data_type.is_some()) {
+                    return None;
+                }
+                a.columns.first().map(|c| c.name.value.clone())
+            }
+            None => None,
+        };
+
+        let mut bounds: Vec<i64> = Vec::with_capacity(3);
+        for arg in &fn_args.args {
+            let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) = arg else {
+                return None;
+            };
+            if !lazy_pure(expr) {
+                return None;
+            }
+            match self.eval_const_expr(expr).ok()? {
+                Value::Int32(n) => bounds.push(i64::from(n)),
+                Value::Int64(n) => bounds.push(n),
+                _ => return None,
+            }
+        }
+        let step = bounds.get(2).copied().unwrap_or(1);
+        if step == 0 {
+            return None;
+        }
+
+        let (limit_expr, offset_expr): (Option<&ast::Expr>, Option<&ast::Expr>) =
+            match &query.limit_clause {
+                None => (None, None),
+                Some(ast::LimitClause::LimitOffset {
+                    limit,
+                    offset,
+                    limit_by,
+                }) => {
+                    if !limit_by.is_empty() {
+                        return None;
+                    }
+                    (limit.as_ref(), offset.as_ref().map(|o| &o.value))
+                }
+                Some(ast::LimitClause::OffsetCommaLimit { offset, limit }) => {
+                    (Some(limit), Some(offset))
+                }
+            };
+        let mut remaining: Option<usize> = None;
+        if let Some(expr) = limit_expr {
+            if !lazy_pure(expr) {
+                return None;
+            }
+            remaining = self.expr_to_usize(expr).ok()?;
+        }
+        let mut skip = 0usize;
+        if let Some(expr) = offset_expr {
+            if !lazy_pure(expr) {
+                return None;
+            }
+            skip = self.expr_to_usize(expr).ok()?.unwrap_or(0);
+        }
+
+        for item in &select.projection {
+            let pure = match item {
+                ast::SelectItem::UnnamedExpr(expr) => lazy_pure(expr),
+                ast::SelectItem::ExprWithAlias { expr, .. } => lazy_pure(expr),
+                ast::SelectItem::Wildcard(_) => true,
+                ast::SelectItem::QualifiedWildcard(..) => false,
+            };
+            if !pure {
+                return None;
+            }
+        }
+        if let Some(predicate) = &select.selection
+            && !lazy_pure(predicate)
+        {
+            return None;
+        }
+
+        let series = SeriesCursor {
+            next: bounds[0],
+            stop: bounds[1],
+            step,
+            finished: false,
+            col_meta: vec![ColMeta {
+                table: Some(label.clone()),
+                name: column_name.unwrap_or(label),
+                dtype: DataType::Int64,
+            }],
+            selection: select.selection.clone(),
+            projection: select.projection.clone(),
+            skip,
+            remaining,
+            emitted: 0,
+            after_last: false,
+            current: None,
+        };
+        let projected = match series.probe_row() {
+            Some(probe) => self
+                .project_columns(
+                    &series.projection,
+                    &series.col_meta,
+                    std::slice::from_ref(&probe),
+                )
+                .or_else(|_| self.project_columns(&series.projection, &series.col_meta, &[])),
+            None => self.project_columns(&series.projection, &series.col_meta, &[]),
+        };
+        let (columns, _) = projected.ok()?;
+        Some((series, columns))
+    }
+
+    /// Refuse a `generate_series` call in a materialized cursor's top-level
+    /// FROM whose length already exceeds the row budget. The table function is
+    /// built whole before LIMIT or the cursor cap can act, so without this a
+    /// `SCROLL` cursor (or an `ORDER BY`) over a huge range would allocate
+    /// the entire series before the budget check could refuse it. Only the
+    /// top-level FROM is inspected; a series nested in a subquery is bounded
+    /// by the executor's ordinary query memory budget like any other query.
+    fn refuse_oversized_series(
+        &self,
+        query: &ast::Query,
+        max_rows: usize,
+    ) -> Result<(), ExecError> {
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            return Ok(());
+        };
+        for from in &select.from {
+            let factors =
+                std::iter::once(&from.relation).chain(from.joins.iter().map(|j| &j.relation));
+            for factor in factors {
+                let ast::TableFactor::Table {
+                    name,
+                    args: Some(fn_args),
+                    ..
+                } = factor
+                else {
+                    continue;
+                };
+                if !crate::sql::object_name_key(name).eq_ignore_ascii_case("generate_series") {
+                    continue;
+                }
+                let mut bounds: Vec<i128> = Vec::with_capacity(3);
+                for arg in &fn_args.args {
+                    if let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) = arg {
+                        match self.eval_const_expr(expr) {
+                            Ok(Value::Int32(n)) => bounds.push(i128::from(n)),
+                            Ok(Value::Int64(n)) => bounds.push(i128::from(n)),
+                            _ => {}
+                        }
+                    }
+                }
+                if bounds.len() != fn_args.args.len() || bounds.len() < 2 || bounds.len() > 3 {
+                    continue;
+                }
+                let step = bounds.get(2).copied().unwrap_or(1);
+                if step == 0 {
+                    continue;
+                }
+                let span = if step > 0 {
+                    bounds[1] - bounds[0]
+                } else {
+                    bounds[0] - bounds[1]
+                };
+                let count = if span < 0 { 0 } else { span / step.abs() + 1 };
+                if count > max_rows as i128 {
+                    return Err(ExecError::Unsupported(format!(
+                        "too_many_cursor_rows: DECLARE would materialize a generate_series of \
+                         {count} rows (limit {max_rows}); a cursor over a bare \
+                         generate_series (no SCROLL, ORDER BY or aggregate) is produced \
+                         lazily instead, or raise limits.max_cursor_rows"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The next source row of a lazy cursor that passes the WHERE clause, after
+    /// the query's OFFSET and within its LIMIT; `None` once either runs out.
+    /// Polls the cancel flag every [`SERIES_CANCEL_POLL`] values examined.
+    fn series_next_row(
+        &self,
+        series: &mut SeriesCursor,
+        polled: &mut u32,
+    ) -> Result<Option<Row>, ExecError> {
+        loop {
+            if series.remaining == Some(0) {
+                return Ok(None);
+            }
+            let Some(value) = series.next_value() else {
+                return Ok(None);
+            };
+            *polled = polled.wrapping_add(1);
+            if (*polled).is_multiple_of(SERIES_CANCEL_POLL) {
+                self.check_cancelled()?;
+            }
+            let row: Row = vec![Value::Int64(value)];
+            if let Some(predicate) = series.selection.as_ref()
+                && !self.eval_where(predicate, &row, &series.col_meta)?
+            {
+                continue;
+            }
+            if series.skip > 0 {
+                series.skip -= 1;
+                continue;
+            }
+            if let Some(remaining) = series.remaining.as_mut() {
+                *remaining -= 1;
+            }
+            return Ok(Some(row));
+        }
+    }
+
+    /// Carry out one forward FETCH movement on a lazy cursor's producer and
+    /// return the rows it fetched, updating `series` to the new position.
+    ///
+    /// Memory is bounded independent of the series length: rows are produced
+    /// and projected [`SERIES_CHUNK_ROWS`] at a time and the result is checked
+    /// against the row and byte budgets after every chunk, so a FETCH that
+    /// would return more than `max_cursor_rows` rows or `max_cursor_bytes`
+    /// bytes is refused rather than built. `series` is a working copy: the
+    /// caller keeps it only on `Ok`.
+    fn advance_series(
+        &self,
+        series: &mut SeriesCursor,
+        movement: CursorMove,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<Row>, SeriesFetchError> {
+        use SeriesFetchError::{Failed, Refused};
+
+        // A zero count re-fetches the row the cursor is on; nothing is run.
+        if matches!(
+            movement,
+            CursorMove::Forward(0) | CursorMove::Backward(0) | CursorMove::Relative(0)
+        ) {
+            return Ok(series.current.iter().cloned().collect());
+        }
+        self.check_cancelled().map_err(Failed)?;
+        if series.after_last {
+            return Ok(Vec::new());
+        }
+
+        // (rows to discard, rows to return). The caller has already refused
+        // every movement that is not strictly forward.
+        let (discard, take): (usize, usize) = match movement {
+            CursorMove::Forward(k) => (0, k),
+            CursorMove::ForwardAll => (0, usize::MAX),
+            CursorMove::Absolute(t) => {
+                let target = usize::try_from(t).unwrap_or(usize::MAX);
+                (target.saturating_sub(series.emitted).saturating_sub(1), 1)
+            }
+            CursorMove::Relative(d) => {
+                let ahead = usize::try_from(d).unwrap_or(usize::MAX);
+                (ahead.saturating_sub(1), 1)
+            }
+            CursorMove::Backward(_) | CursorMove::BackwardAll => {
+                return Err(Refused(scan_forward_error()));
+            }
+        };
+        if take != usize::MAX && take > max_rows {
+            return Err(Refused(ExecError::Unsupported(format!(
+                "too_many_cursor_rows: FETCH would return {take} rows (limit {max_rows}); \
+                 fetch fewer rows at a time or raise limits.max_cursor_rows"
+            ))));
+        }
+
+        let mut polled: u32 = 0;
+        for _ in 0..discard {
+            match self.series_next_row(series, &mut polled).map_err(Failed)? {
+                Some(_) => series.emitted += 1,
+                None => {
+                    series.after_last = true;
+                    series.current = None;
+                    return Ok(Vec::new());
+                }
+            }
+        }
+
+        let mut out: Vec<Row> = Vec::new();
+        let mut bytes = 0usize;
+        while out.len() < take {
+            let want = (take - out.len()).min(SERIES_CHUNK_ROWS);
+            let mut source: Vec<Row> = Vec::with_capacity(want);
+            while source.len() < want {
+                match self.series_next_row(series, &mut polled).map_err(Failed)? {
+                    Some(row) => source.push(row),
+                    None => break,
+                }
+            }
+            let exhausted = source.len() < want;
+            if !source.is_empty() {
+                let (_, projected) = self
+                    .project_columns(&series.projection, &series.col_meta, &source)
+                    .map_err(Failed)?;
+                if out.len().saturating_add(projected.len()) > max_rows {
+                    return Err(Refused(ExecError::Unsupported(format!(
+                        "too_many_cursor_rows: FETCH would return more than {max_rows} rows \
+                         (limit {max_rows}); fetch fewer rows at a time or raise \
+                         limits.max_cursor_rows"
+                    ))));
+                }
+                for row in &projected {
+                    bytes = bytes.saturating_add(cursor_row_bytes(row));
+                }
+                if bytes > max_bytes {
+                    return Err(Refused(ExecError::Unsupported(format!(
+                        "too_many_cursor_bytes: FETCH would return more than {max_bytes} \
+                         bytes (limit {max_bytes}); fetch fewer rows at a time, select fewer \
+                         columns, or raise limits.max_cursor_bytes"
+                    ))));
+                }
+                series.emitted += projected.len();
+                out.extend(projected);
+            }
+            if exhausted {
+                series.after_last = true;
+                break;
+            }
+        }
+        series.current = if series.after_last {
+            None
+        } else {
+            out.last().cloned()
+        };
+        Ok(out)
     }
 }
 
@@ -1707,10 +2281,7 @@ fn apply_cursor_move(cursor: &mut CursorDef, movement: CursorMove) -> Result<Vec
     let n = cursor.rows.len();
     let pos = cursor.position;
     if cursor.no_scroll && !moves_forward_only(&movement, pos) {
-        return Err(ExecError::Runtime(
-            "cursor can only scan forward; declare it with SCROLL option to enable backward scan"
-                .into(),
-        ));
+        return Err(scan_forward_error());
     }
     let (fetched, new_pos): (Vec<Row>, usize) = match movement {
         CursorMove::Forward(0) | CursorMove::Backward(0) | CursorMove::Relative(0) => {
@@ -1811,6 +2382,8 @@ mod cursor_tests {
             hold: false,
             opened_in_txn: true,
             bytes: 0,
+            seq: 0,
+            lazy: None,
         }
     }
 
@@ -1913,5 +2486,69 @@ mod cursor_tests {
         assert!(err.to_string().contains("cursor can only scan forward"));
         assert_eq!(cursor.position, 2);
         assert_eq!(cursor.rows.len(), 3);
+    }
+
+    fn series(start: i64, stop: i64, step: i64) -> SeriesCursor {
+        SeriesCursor {
+            next: start,
+            stop,
+            step,
+            finished: false,
+            col_meta: Vec::new(),
+            selection: None,
+            projection: Vec::new(),
+            skip: 0,
+            remaining: None,
+            emitted: 0,
+            after_last: false,
+            current: None,
+        }
+    }
+
+    fn drain(series: &mut SeriesCursor) -> Vec<i64> {
+        std::iter::from_fn(|| series.next_value()).collect()
+    }
+
+    /// The producer yields exactly what `generate_series` builds, both ways.
+    #[test]
+    fn series_values_follow_generate_series_in_both_directions() {
+        assert_eq!(drain(&mut series(1, 5, 1)), vec![1, 2, 3, 4, 5]);
+        assert_eq!(drain(&mut series(0, 20, 5)), vec![0, 5, 10, 15, 20]);
+        assert_eq!(drain(&mut series(10, 1, -3)), vec![10, 7, 4, 1]);
+        assert!(drain(&mut series(5, 1, 1)).is_empty());
+        assert!(drain(&mut series(1, 5, -1)).is_empty());
+    }
+
+    /// A series that reaches the end of the integer range stops there; the
+    /// next value is not computed by wrapping around.
+    #[test]
+    fn a_series_at_the_integer_limit_stops_instead_of_wrapping() {
+        assert_eq!(
+            drain(&mut series(i64::MAX - 1, i64::MAX, 1)),
+            vec![i64::MAX - 1, i64::MAX]
+        );
+        assert_eq!(
+            drain(&mut series(i64::MIN + 1, i64::MIN, -1)),
+            vec![i64::MIN + 1, i64::MIN]
+        );
+        assert_eq!(
+            drain(&mut series(i64::MAX - 5, i64::MAX, 4)),
+            vec![i64::MAX - 5, i64::MAX - 1]
+        );
+    }
+
+    /// Position numbering matches the materialized cursor's, and the probe
+    /// row is the first value without consuming it.
+    #[test]
+    fn series_position_and_probe() {
+        let mut cursor = series(3, 4, 1);
+        assert_eq!(cursor.position(), 0);
+        assert_eq!(cursor.probe_row(), Some(vec![Value::Int64(3)]));
+        assert_eq!(cursor.next_value(), Some(3));
+        cursor.emitted = 1;
+        assert_eq!(cursor.position(), 1);
+        cursor.after_last = true;
+        assert_eq!(cursor.position(), 2);
+        assert_eq!(series(5, 1, 1).probe_row(), None);
     }
 }

@@ -320,6 +320,12 @@ pub struct Session {
     pub(super) cross_model: parking_lot::Mutex<Option<super::cross_model::CrossModelTxn>>,
     pub(super) prepared_stmts: RwLock<HashMap<String, Arc<PreparedStmt>>>,
     pub(super) cursors: RwLock<HashMap<String, CursorDef>>,
+    /// Next cursor declaration number (`CursorDef::seq`).
+    pub(super) cursor_seq: AtomicU64,
+    /// For each open savepoint, the value `cursor_seq` had when it was taken.
+    /// ROLLBACK TO SAVEPOINT closes every cursor declared since. Synchronous
+    /// like `deferred_fk_savepoints`: never held across an await.
+    pub(super) cursor_savepoints: parking_lot::Mutex<Vec<(String, u64)>>,
     pub(super) settings: parking_lot::RwLock<HashMap<String, String>>,
     /// Principal proven by the connection authentication handshake.
     pub(super) authenticated_user: parking_lot::RwLock<Option<String>>,
@@ -413,6 +419,8 @@ impl Session {
             cross_model: parking_lot::Mutex::new(None),
             prepared_stmts: RwLock::new(HashMap::new()),
             cursors: RwLock::new(HashMap::new()),
+            cursor_seq: AtomicU64::new(0),
+            cursor_savepoints: parking_lot::Mutex::new(Vec::new()),
             settings: parking_lot::RwLock::new(default_settings),
             authenticated_user: parking_lot::RwLock::new(Some("nucleus".to_string())),
             current_role: parking_lot::RwLock::new(None),
@@ -644,6 +652,7 @@ impl Session {
     /// Called after the transaction state lock is released, so this lock is
     /// never taken while that one is held.
     pub(super) async fn close_cursors_at_txn_end(&self, committed: bool) {
+        self.cursor_savepoints.lock().clear();
         let mut cursors = self.cursors.write().await;
         if committed {
             cursors.retain(|_, c| c.hold);
@@ -653,6 +662,40 @@ impl Session {
         } else {
             cursors.retain(|_, c| c.hold && !c.opened_in_txn);
         }
+    }
+
+    /// SAVEPOINT: remember how many cursors the session had declared, so a
+    /// later ROLLBACK TO can close exactly the ones declared after it.
+    pub(super) fn savepoint_cursors(&self, name: &str) {
+        let mark = self.cursor_seq.load(Ordering::SeqCst);
+        self.cursor_savepoints.lock().push((name.to_string(), mark));
+    }
+
+    /// RELEASE SAVEPOINT: forget the savepoint and every later one. Cursors
+    /// are kept; they now belong to the enclosing savepoint.
+    pub(super) fn release_cursors_savepoint(&self, name: &str) {
+        let mut marks = self.cursor_savepoints.lock();
+        if let Some(pos) = marks.iter().rposition(|(n, _)| n == name) {
+            marks.truncate(pos);
+        }
+    }
+
+    /// ROLLBACK TO SAVEPOINT: the savepoint stays (as in PostgreSQL), later
+    /// ones go. Returns the cursor mark to close back to, `None` for a name
+    /// this session never recorded.
+    pub(super) fn rollback_cursors_savepoint(&self, name: &str) -> Option<u64> {
+        let mut marks = self.cursor_savepoints.lock();
+        let pos = marks.iter().rposition(|(n, _)| n == name)?;
+        let mark = marks[pos].1;
+        marks.truncate(pos + 1);
+        Some(mark)
+    }
+
+    /// Close every cursor declared at or after `mark`, held or not: a cursor
+    /// created inside a rolled-back savepoint does not outlive it. Cursors
+    /// declared earlier keep the position their FETCHes left them at.
+    pub(super) async fn close_cursors_since(&self, mark: u64) {
+        self.cursors.write().await.retain(|_, c| c.seq < mark);
     }
 
     /// Reset session state for connection reuse.
@@ -681,6 +724,7 @@ impl Session {
         self.prepared_stmts.write().await.clear();
         // Clear cursors
         self.cursors.write().await.clear();
+        self.cursor_savepoints.lock().clear();
         // Clear CTEs
         self.active_ctes.write().clear();
         // Reset settings to defaults
