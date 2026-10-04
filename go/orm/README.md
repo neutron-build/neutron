@@ -383,6 +383,13 @@ crashes and lost acknowledgements require application reconciliation or a durabl
 outbox. This is not exactly-once or durable notification delivery. Hook closures
 and external shared state remain application-owned synchronization responsibilities.
 
+`WithScopedHookTransaction(ctx, pool, options, callback)` is the same owned
+workflow, but the callback also receives the one root `*Scope` that the
+`*WriteSession` writes through, for code that mixes direct statements, savepoints
+and hooked statements in one transaction. Commit and rollback stay with the
+function; the session is terminal when the callback returns and the Scope when
+the transaction completes. `WithHookTransaction` is a wrapper over it.
+
 
 ## Explicit application scopes, soft deletion and version guards
 
@@ -887,6 +894,35 @@ Response is validated/copied before COMMIT and written afterward. Callback,
 response-bound and decoding failures roll back. Failure responses contain only
 generic text and make no rollback/retry promise for indeterminate commits.
 Streaming/hijacking are outside this buffered response contract.
+
+`RequestSession.WriteSession` is the hook write session bound to the request
+Scope (built on `WithScopedHookTransaction`), so `HookInsert`/`HookUpdate`/
+`HookDelete`, deferred graphs and the hook queue join the request transaction
+with the same ordering, rollback and terminal-session rules. AfterCommit hooks
+dispatch after COMMIT, before the response is written, bounded by
+`Options.HookDispatchTimeout` (zero means five seconds). A dispatch failure
+after COMMIT answers a generic 500 rather than 503, because replaying a committed
+write is unsafe; panics in committed hooks propagate as `CommittedHookPanic`.
+
+Returning `*ApplicationError{Response: ...}` (directly, wrapped or joined) rolls
+the request transaction back and answers that response, which must have an
+explicit status from 400 through 499 and satisfy the response bounds. It is
+written only after the rollback completed cleanly with no leak, broken
+transaction or request cancellation; otherwise, and for any invalid response,
+the generic 503 is sent. Ordinary errors keep the generic 503 and never expose
+their text. Application panics roll back and propagate unchanged.
+
+## Known limitations
+
+- Hook intents are read-only: a BeforeCreate hook cannot mutate the assignment
+  set being written.
+- `NewRelation` requires non-nullable keys on both sides, so a belongs-to over a
+  nullable parent foreign key is not expressible.
+- `JoinQuery` projects columns or pairs only; full-model join filtering with
+  pagination is unavailable.
+- `InSubquery` requires identical Go types on both sides.
+- There is no public `FOR UPDATE` row locking.
+- `time.Time` values with sub-microsecond precision are refused.
 
 `Shutdown(ctx)` refuses new requests, cooperatively cancels existing request
 contexts and waits for scopes to settle within the supplied budget. If a callback
