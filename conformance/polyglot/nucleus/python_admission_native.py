@@ -165,7 +165,15 @@ def main() -> None:
         for native in reversed(connections):
             try: native.execute(sql.SQL('DROP SCHEMA IF EXISTS {} CASCADE').format(sql.Identifier(schema)))
             except BaseException as error:
-                failure=error;report['status']='fail';report['cleanupFailure']={'class':type(error).__name__,'sqlstate':getattr(error,'sqlstate',None),'message':(str(error).splitlines() or [''])[0][:300]}
+                if getattr(error,'sqlstate',None)=='0A000':
+                    # The engine has no DROP SCHEMA: remove the fixture tables and record the empty schema as residue.
+                    try:
+                        for mode in ('sync','async'): native.execute(sql.SQL('DROP TABLE IF EXISTS {}.{}').format(sql.Identifier(schema),sql.Identifier(mode)))
+                        report.setdefault('cleanupResidue',[]).append('schema '+schema+' remains: the engine does not support DROP SCHEMA')
+                        error=None
+                    except BaseException as table_error: error=table_error
+                if error is not None:
+                    failure=error;report['status']='fail';report['cleanupFailure']={'class':type(error).__name__,'sqlstate':getattr(error,'sqlstate',None),'message':(str(error).splitlines() or [''])[0][:300]}
             finally: native.close()
         args.report.parent.mkdir(parents=True,exist_ok=True)
         args.report.write_text(json.dumps(report,indent=2)+'\n')

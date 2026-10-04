@@ -360,6 +360,7 @@ type report struct {
 	Facts             map[string]any    `json:"facts"`
 	Failure           string            `json:"failure,omitempty"`
 	CleanupFailure    string            `json:"cleanupFailure,omitempty"`
+	CleanupResidue    string            `json:"cleanupResidue,omitempty"`
 }
 
 // sensitive holds the owned endpoint URLs; any driver error text that echoes a
@@ -571,9 +572,23 @@ func main() {
 	defer cleanupCancel()
 	for i := len(raws) - 1; i >= 0; i-- {
 		if _, err := raws[i].Exec(cleanupCtx, `DROP SCHEMA IF EXISTS "`+schema+`" CASCADE`); err != nil {
-			r.Status = "fail"
-			r.CleanupFailure = fmt.Sprintf("%T: %s", err, rootCause(err))
-			failure = err
+			// An engine without DROP SCHEMA (SQLSTATE 0A000): remove the fixture
+			// table instead and record the empty schema as residue; an owned
+			// engine's data directory is removed by its runner.
+			var coded interface{ SQLState() string }
+			if errors.As(err, &coded) && coded.SQLState() == "0A000" {
+				if _, tableErr := raws[i].Exec(cleanupCtx, `DROP TABLE IF EXISTS "`+schema+`".docs`); tableErr == nil {
+					r.CleanupResidue = "schema " + schema + " remains: the engine does not support DROP SCHEMA"
+					err = nil
+				} else {
+					err = tableErr
+				}
+			}
+			if err != nil {
+				r.Status = "fail"
+				r.CleanupFailure = fmt.Sprintf("%T: %s", err, rootCause(err))
+				failure = err
+			}
 		}
 		_ = raws[i].Close(cleanupCtx)
 	}

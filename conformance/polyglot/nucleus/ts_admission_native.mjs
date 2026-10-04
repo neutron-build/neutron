@@ -257,10 +257,25 @@ async function main() {
     for (const native of natives.reverse()) {
       try {
         await native.query('DROP SCHEMA IF EXISTS ' + quote(schema) + ' CASCADE');
-      } catch (error) {
-        failure = error;
-        report.status = 'fail';
-        report.cleanupFailure = { class: error?.constructor?.name ?? typeof error, code: error?.code ?? null, message: String(error?.message ?? '').split('\n')[0].slice(0, 300) };
+      } catch (dropError) {
+        let error = dropError;
+        if (dropError?.code === '0A000') {
+          // The engine has no DROP SCHEMA: remove the fixture tables instead and
+          // record the empty schema as residue (an owned engine's data directory
+          // is removed by its runner).
+          try {
+            for (const kind of DRIVERS) await native.query('DROP TABLE IF EXISTS ' + quote(schema) + '.' + quote(kind));
+            (report.cleanupResidue ??= []).push('schema ' + schema + ' remains: the engine does not support DROP SCHEMA');
+            error = null;
+          } catch (tableError) {
+            error = tableError;
+          }
+        }
+        if (error !== null) {
+          failure = error;
+          report.status = 'fail';
+          report.cleanupFailure = { class: error?.constructor?.name ?? typeof error, code: error?.code ?? null, message: String(error?.message ?? '').split('\n')[0].slice(0, 300) };
+        }
       } finally {
         await native.end().catch(() => undefined);
       }
