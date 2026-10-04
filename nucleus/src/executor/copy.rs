@@ -709,7 +709,15 @@ fn encode_binary_numeric(text: &str) -> Result<Vec<u8>, ExecError> {
     let mut out = Vec::with_capacity(8 + words.len() * 2);
     out.extend_from_slice(&(words.len() as u16).to_be_bytes());
     out.extend_from_slice(&weight.to_be_bytes());
-    out.extend_from_slice(&if neg { 0x4000u16 } else { 0u16 }.to_be_bytes());
+    // PostgreSQL has no negative zero: a zero carries no sign.
+    out.extend_from_slice(
+        &if neg && !words.is_empty() {
+            0x4000u16
+        } else {
+            0u16
+        }
+        .to_be_bytes(),
+    );
     out.extend_from_slice(&dscale.to_be_bytes());
     for w in words {
         out.extend_from_slice(&w.to_be_bytes());

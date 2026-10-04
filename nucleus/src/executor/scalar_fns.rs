@@ -681,6 +681,9 @@ impl Executor {
                         .map(Value::Int64)
                         .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
                     Value::Float64(n) => Ok(Value::Float64(n.abs())),
+                    Value::Numeric(t) => crate::types::parse_numeric(t)
+                        .map(|d| Value::Numeric(crate::types::decimal_to_numeric_text(d.abs())))
+                        .map_err(ExecError::Runtime),
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("ABS requires numeric".into())),
                 }
@@ -692,7 +695,7 @@ impl Executor {
                     ));
                 }
                 let decimals = if args.len() > 1 {
-                    value_to_i64(&args[1])? as i32
+                    scale_argument(&args[1])?
                 } else {
                     0
                 };
@@ -705,20 +708,22 @@ impl Executor {
                     // supporting negative scale.
                     Value::Numeric(t) => {
                         let d = crate::types::parse_numeric(t).map_err(ExecError::Runtime)?;
-                        Ok(Value::Numeric(
-                            round_decimal_scaled(d, decimals)?.to_string(),
-                        ))
+                        Ok(Value::Numeric(crate::types::decimal_to_numeric_text(
+                            round_decimal_scaled(d, decimals)?,
+                        )))
                     }
                     // PG rounds integers by scale too: round(123, -1) = 120.
                     // Non-negative scale is a no-op — keep the input type.
-                    Value::Int32(n) if decimals < 0 => Ok(Value::Numeric(
-                        round_decimal_scaled(rust_decimal::Decimal::from(*n), decimals)?
-                            .to_string(),
-                    )),
-                    Value::Int64(n) if decimals < 0 => Ok(Value::Numeric(
-                        round_decimal_scaled(rust_decimal::Decimal::from(*n), decimals)?
-                            .to_string(),
-                    )),
+                    Value::Int32(n) if decimals < 0 => {
+                        Ok(Value::Numeric(crate::types::decimal_to_numeric_text(
+                            round_decimal_scaled(rust_decimal::Decimal::from(*n), decimals)?,
+                        )))
+                    }
+                    Value::Int64(n) if decimals < 0 => {
+                        Ok(Value::Numeric(crate::types::decimal_to_numeric_text(
+                            round_decimal_scaled(rust_decimal::Decimal::from(*n), decimals)?,
+                        )))
+                    }
                     Value::Int32(_) | Value::Int64(_) => Ok(args[0].clone()),
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("ROUND requires numeric".into())),
@@ -729,7 +734,7 @@ impl Executor {
                 match &args[0] {
                     Value::Float64(n) => Ok(Value::Float64(n.ceil())),
                     Value::Numeric(t) => crate::types::parse_numeric(t)
-                        .map(|d| Value::Numeric(d.ceil().to_string()))
+                        .map(|d| Value::Numeric(crate::types::decimal_to_numeric_text(d.ceil())))
                         .map_err(ExecError::Runtime),
                     Value::Int32(_) | Value::Int64(_) => Ok(args[0].clone()),
                     Value::Null => Ok(Value::Null),
@@ -741,7 +746,7 @@ impl Executor {
                 match &args[0] {
                     Value::Float64(n) => Ok(Value::Float64(n.floor())),
                     Value::Numeric(t) => crate::types::parse_numeric(t)
-                        .map(|d| Value::Numeric(d.floor().to_string()))
+                        .map(|d| Value::Numeric(crate::types::decimal_to_numeric_text(d.floor())))
                         .map_err(ExecError::Runtime),
                     Value::Int32(_) | Value::Int64(_) => Ok(args[0].clone()),
                     Value::Null => Ok(Value::Null),
@@ -833,7 +838,7 @@ impl Executor {
                     ));
                 }
                 let decimals = if args.len() > 1 {
-                    value_to_i64(&args[1])? as i32
+                    scale_argument(&args[1])?
                 } else {
                     0
                 };
@@ -842,11 +847,19 @@ impl Executor {
                         let factor = 10f64.powi(decimals);
                         Ok(Value::Float64((n * factor).trunc() / factor))
                     }
-                    Value::Numeric(t) => crate::types::parse_numeric(t)
-                        .map(|d| {
-                            Value::Numeric(d.trunc_with_scale(decimals.max(0) as u32).to_string())
-                        })
-                        .map_err(ExecError::Runtime),
+                    // Exact, and a negative scale truncates to tens, hundreds,
+                    // ... as PostgreSQL does (it used to be treated as 0).
+                    Value::Numeric(t) => {
+                        let d = crate::types::parse_numeric(t).map_err(ExecError::Runtime)?;
+                        let truncated = if decimals >= 0 {
+                            d.trunc_with_scale(decimals as u32)
+                        } else {
+                            decimal_to_power_of_ten(d, decimals.unsigned_abs(), false)?
+                        };
+                        Ok(Value::Numeric(crate::types::decimal_to_numeric_text(
+                            truncated,
+                        )))
+                    }
                     Value::Int32(_) | Value::Int64(_) => Ok(args[0].clone()),
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("TRUNC requires numeric".into())),
@@ -7533,24 +7546,52 @@ fn round_decimal_scaled(
             rust_decimal::RoundingStrategy::MidpointAwayFromZero,
         ));
     }
-    let exp = -(dp as i64);
-    // 10^28 is the largest power of ten a Decimal mantissa (< 7.9e28) holds;
-    // from 10^29 on, checked_mul would error — but every representable value
-    // rounds to 0 at that scale (PG returns 0), so short-circuit there.
+    decimal_to_power_of_ten(d, dp.unsigned_abs(), true)
+}
+
+/// The scale argument of ROUND/TRUNC as an `i32`. A value outside `i32` is an
+/// error (SQLSTATE 22003), not wrapped into some other scale.
+fn scale_argument(value: &Value) -> Result<i32, ExecError> {
+    i32::try_from(value_to_i64(value)?)
+        .map_err(|_| ExecError::Runtime("integer out of range".into()))
+}
+
+/// `d` rounded half away from zero (`round`) or truncated toward zero to a
+/// multiple of `10^exp`, in exact 128-bit integer arithmetic. The previous
+/// version divided through `Decimal::checked_div`, which rounds past 28
+/// digits and so could round twice; and it returned 0 for every `exp > 28`
+/// although a magnitude of 5e28 or more rounds to 1e29 at `exp = 29`, which a
+/// `Decimal` cannot hold and is refused here instead.
+fn decimal_to_power_of_ten(
+    d: rust_decimal::Decimal,
+    exp: u32,
+    round: bool,
+) -> Result<rust_decimal::Decimal, ExecError> {
+    let out_of_range = || ExecError::Runtime("numeric value out of range".into());
     if exp > 28 {
+        let half_unit = rust_decimal::Decimal::from_i128_with_scale(5 * 10i128.pow(28), 0);
+        if round && exp == 29 && d.abs() >= half_unit {
+            return Err(out_of_range());
+        }
         return Ok(rust_decimal::Decimal::ZERO);
     }
-    let mut scale = rust_decimal::Decimal::ONE;
-    for _ in 0..exp {
-        scale = scale
-            .checked_mul(rust_decimal::Decimal::from(10u64))
-            .ok_or_else(|| ExecError::Runtime("numeric value out of range".into()))?;
+    let dropped = d.scale() + exp;
+    // |mantissa| < 2^96 < 10^29, so past 38 dropped digits it is below one
+    // unit of the target position and rounds or truncates to zero.
+    if dropped > 38 {
+        return Ok(rust_decimal::Decimal::ZERO);
     }
-    let scaled = d
-        .checked_div(scale)
-        .ok_or_else(|| ExecError::Runtime("numeric value out of range".into()))?;
-    scaled
-        .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
-        .checked_mul(scale)
-        .ok_or_else(|| ExecError::Runtime("numeric value out of range".into()))
+    let divisor = 10i128.pow(dropped);
+    let mantissa = d.mantissa();
+    let mut quotient = mantissa / divisor;
+    if round {
+        let remainder = (mantissa % divisor).unsigned_abs();
+        if remainder >= divisor.unsigned_abs() - remainder {
+            quotient += if mantissa < 0 { -1 } else { 1 };
+        }
+    }
+    let scaled = quotient
+        .checked_mul(10i128.pow(exp))
+        .ok_or_else(out_of_range)?;
+    rust_decimal::Decimal::try_from_i128_with_scale(scaled, 0).map_err(|_| out_of_range())
 }

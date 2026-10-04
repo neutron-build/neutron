@@ -5383,6 +5383,27 @@ fn encode_value_typed(
         }
         (Value::Int32(n), DataType::Float64) => return encoder.encode_field(&Some(*n as f64)),
         (Value::Int64(n), DataType::Float64) => return encoder.encode_field(&Some(*n as f64)),
+        // A statically inferred float8 or NUMERIC description that disagrees
+        // with the value's own type (a CASE with a decimal literal on one
+        // branch and a NUMERIC column on the other). A binary column is decoded
+        // by the advertised type, so NUMERIC words under a float8 description,
+        // or eight float bytes under a NUMERIC one, would be read as garbage.
+        // Text needs no repair: both spellings are valid text for either type.
+        (Value::Numeric(s), DataType::Float64) if matches!(fmt, FieldFormat::Binary) => {
+            return match s.parse::<f64>() {
+                Ok(n) => encoder.encode_field(&Some(n)),
+                Err(error) => Err(PgWireError::ApiError(error.to_string().into())),
+            };
+        }
+        (Value::Float64(n), DataType::Numeric) if matches!(fmt, FieldFormat::Binary) => {
+            return match Value::Float64(*n).cast(&DataType::Numeric) {
+                Ok(Value::Numeric(text)) => encode_numeric_binary(encoder, &text),
+                Ok(_) => Err(PgWireError::ApiError(
+                    "float8 to numeric conversion lost the numeric type".into(),
+                )),
+                Err(error) => Err(PgWireError::ApiError(error.into())),
+            };
+        }
         // Arrays carry the element type's own text/binary form under the
         // advertised array type OID.
         (Value::Array(vals), DataType::Array(element)) => {
@@ -5509,13 +5530,12 @@ fn encode_value(
         // BINARY-format NUMERIC must carry the NBASE-10000 wire encoding —
         // pgjdbc switches result transfer to binary once a statement is
         // server-prepared and rejects text bytes under a binary column.
+        //
+        // Built by `numeric_binary`, the same encoder arrays and COPY use. The
+        // `rust_decimal` encoding this replaced dropped the display scale of a
+        // zero (`0.00` was sent with dscale 0) and sent a one-word zero.
         Value::Numeric(s) if matches!(fmt, FieldFormat::Binary) => {
-            match rust_decimal::Decimal::from_str_exact(s) {
-                Ok(d) => encoder.encode_field(&Some(d)),
-                Err(_) => Err(PgWireError::ApiError(
-                    format!("numeric value not binary-encodable: {s}").into(),
-                )),
-            }
+            encode_numeric_binary(encoder, s)
         }
         // BINARY-format UUID is the 16 raw bytes (the &[u8] impl writes raw).
         Value::Uuid(b) if matches!(fmt, FieldFormat::Binary) => {
@@ -5529,6 +5549,18 @@ fn encode_value(
         | Value::Vector(_)
         | Value::Interval { .. } => encoder.encode_field(&Some(value.to_string().as_str())),
     }
+}
+
+/// A NUMERIC in its binary wire form (NBASE-10000 words), keeping the written
+/// scale. The payload is raw bytes, so it goes out as a binary field.
+fn encode_numeric_binary(encoder: &mut DataRowEncoder, text: &str) -> PgWireResult<()> {
+    let bytes = numeric_binary(text).map_err(|error| PgWireError::ApiError(error.into()))?;
+    encoder.encode_field_with_type_and_format(
+        &Some(bytes.as_slice()),
+        &Type::BYTEA,
+        FieldFormat::Binary,
+        &pgwire::types::format::FormatOptions::default(),
+    )
 }
 
 /// 2000-01-01T00:00:00 — the PostgreSQL timestamp epoch Nucleus stores
