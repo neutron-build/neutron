@@ -248,6 +248,231 @@ fn numeric_comparison_key(value: &str) -> Result<String, String> {
     parse_numeric(value).map(|decimal| decimal.normalize().to_string())
 }
 
+/// `d` as NUMERIC text with its scale kept and no negative zero (PostgreSQL has
+/// none, while `Decimal` keeps the sign of a zero that `ceil`, `trunc`, negation
+/// or rounding produced).
+pub(crate) fn decimal_to_numeric_text(mut d: Decimal) -> String {
+    if d.is_zero() {
+        d.set_sign_positive(true);
+    }
+    d.to_string()
+}
+
+/// `value` negated, keeping its written scale (`-(1.50)` is `-1.50`) and never
+/// producing a negative zero. A refusal is returned for text that is not an
+/// exact NUMERIC.
+pub(crate) fn numeric_negate_keep_scale(value: &str) -> Result<String, String> {
+    let d = parse_numeric(value)?;
+    Ok(decimal_to_numeric_text(-d))
+}
+
+/// A float8 as NUMERIC, the way PostgreSQL's `float8_numeric` does it: the
+/// value is first rendered with 15 significant digits (`DBL_DIG`, `%.15g`), so
+/// `0.1 + 0.2` becomes `0.3` and no digit beyond the 15th is invented. The
+/// shortest round-trip rendering (up to 17 digits) is NOT used: it would store
+/// digits PostgreSQL does not. NaN and the infinities are refused by name, a
+/// magnitude outside the 96-bit / scale-28 range is a precision-ceiling error.
+fn float_to_numeric_text(n: f64) -> Result<String, String> {
+    let rendered = format!("{n:.14e}");
+    let Some((mantissa, exponent)) = rendered.split_once('e') else {
+        // "NaN", "inf", "-inf": parse_numeric refuses these by name.
+        return canonical_numeric(&rendered);
+    };
+    let mantissa = if mantissa.contains('.') {
+        mantissa.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        mantissa
+    };
+    canonical_numeric(&format!("{mantissa}e{exponent}"))
+}
+
+/// Largest precision a declared `NUMERIC(p, s)` may carry (PostgreSQL's limit).
+pub const NUMERIC_MAX_PRECISION: u64 = 1000;
+
+/// Largest declared scale Nucleus can hold: the physical `Decimal` carries at
+/// most 28 fractional digits, so a wider declared scale could never be filled.
+pub const NUMERIC_MAX_SCALE: u32 = 28;
+
+/// Why a `NUMERIC(p, s)` declaration was refused. The two kinds carry different
+/// SQLSTATEs: a value PostgreSQL itself rejects is `invalid_parameter_value`
+/// (22023); a declaration PostgreSQL accepts but Nucleus cannot represent is
+/// `feature_not_supported` (0A000).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NumericTypmodError {
+    /// PostgreSQL rejects it too (precision outside 1..=1000, |scale| > 1000).
+    OutOfRange(String),
+    /// Valid in PostgreSQL, not representable here.
+    Unsupported(String),
+}
+
+impl fmt::Display for NumericTypmodError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NumericTypmodError::OutOfRange(message) | NumericTypmodError::Unsupported(message) => {
+                f.write_str(message)
+            }
+        }
+    }
+}
+
+/// A declared `NUMERIC(precision, scale)` / `DECIMAL(precision, scale)`.
+///
+/// Enforced on every write and on an explicit cast: the value is rounded half
+/// away from zero to `scale`, then refused with SQLSTATE 22003 when the result
+/// needs more than `precision - scale` integer digits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NumericTypmod {
+    pub precision: u32,
+    pub scale: u32,
+}
+
+impl NumericTypmod {
+    /// Validate a declaration. PostgreSQL 15+ also accepts a negative scale and
+    /// a scale larger than the precision; both are refused here as unsupported
+    /// rather than approximated, as is a scale past the 28 digits `Decimal`
+    /// holds.
+    pub fn new(precision: u64, scale: i64) -> Result<Self, NumericTypmodError> {
+        if !(1..=NUMERIC_MAX_PRECISION).contains(&precision) {
+            return Err(NumericTypmodError::OutOfRange(format!(
+                "NUMERIC precision {precision} must be between 1 and {NUMERIC_MAX_PRECISION}"
+            )));
+        }
+        if !(-1000..=1000).contains(&scale) {
+            return Err(NumericTypmodError::OutOfRange(format!(
+                "NUMERIC scale {scale} must be between -1000 and 1000"
+            )));
+        }
+        if scale < 0 || scale as u64 > precision {
+            return Err(NumericTypmodError::Unsupported(format!(
+                "NUMERIC({precision},{scale}): a negative scale or a scale larger than the \
+                 precision is not supported (Nucleus requires 0 <= scale <= precision)"
+            )));
+        }
+        if scale as u64 > u64::from(NUMERIC_MAX_SCALE) {
+            return Err(NumericTypmodError::Unsupported(format!(
+                "NUMERIC({precision},{scale}): scale exceeds the {NUMERIC_MAX_SCALE} fractional \
+                 digits Nucleus NUMERIC can hold"
+            )));
+        }
+        Ok(Self {
+            precision: precision as u32,
+            scale: scale as u32,
+        })
+    }
+
+    /// PostgreSQL's `atttypmod`: `((precision << 16) | scale) + 4`.
+    pub fn atttypmod(self) -> i32 {
+        (((self.precision << 16) | self.scale) + 4) as i32
+    }
+
+    /// The declaration behind an `atttypmod`, `None` for `-1` (unconstrained)
+    /// or any value that is not a valid declaration here.
+    pub fn from_atttypmod(typmod: i32) -> Option<Self> {
+        if typmod < 4 {
+            return None;
+        }
+        let packed = (typmod - 4) as u32;
+        Self::new(u64::from(packed >> 16), i64::from(packed & 0xFFFF)).ok()
+    }
+
+    /// Round `value` to this scale (half away from zero, as PostgreSQL's
+    /// `apply_typmod`), pad it to the scale, and refuse it when it needs more
+    /// than `precision - scale` integer digits (SQLSTATE 22003). The text
+    /// operates on decimal digits, so no digit passes through a float or a
+    /// 128-bit intermediate.
+    pub fn apply(self, value: &str) -> Result<String, String> {
+        let parsed = parse_numeric(value)?;
+        let rendered = parsed.to_string();
+        let (negative, body) = match rendered.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, rendered.as_str()),
+        };
+        let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
+        let scale = self.scale as usize;
+        let kept = frac_part.len().min(scale);
+        let mut digits: Vec<u8> = Vec::with_capacity(int_part.len() + scale + 1);
+        digits.extend_from_slice(int_part.as_bytes());
+        digits.extend_from_slice(&frac_part.as_bytes()[..kept]);
+        digits.extend(std::iter::repeat_n(b'0', scale - kept));
+        if frac_part
+            .as_bytes()
+            .get(scale)
+            .is_some_and(|dropped| *dropped >= b'5')
+        {
+            // Round half away from zero: the sign is applied afterwards, so
+            // rounding the magnitude up is the same thing.
+            let mut carried = true;
+            for digit in digits.iter_mut().rev() {
+                if *digit == b'9' {
+                    *digit = b'0';
+                } else {
+                    *digit += 1;
+                    carried = false;
+                    break;
+                }
+            }
+            if carried {
+                digits.insert(0, b'1');
+            }
+        }
+        let int_len = digits.len() - scale;
+        let significant = digits[..int_len]
+            .iter()
+            .skip_while(|digit| **digit == b'0')
+            .count();
+        if significant > (self.precision - self.scale) as usize {
+            return Err(format!(
+                "numeric field overflow: A field with precision {}, scale {} must round to an \
+                 absolute value less than 10^{}",
+                self.precision,
+                self.scale,
+                self.precision - self.scale
+            ));
+        }
+        let int_digits = std::str::from_utf8(&digits[..int_len])
+            .map_err(|_| numeric_syntax_error(value))?
+            .trim_start_matches('0');
+        let frac_digits =
+            std::str::from_utf8(&digits[int_len..]).map_err(|_| numeric_syntax_error(value))?;
+        let is_zero = int_digits.is_empty() && frac_digits.bytes().all(|digit| digit == b'0');
+        let mut out = String::with_capacity(digits.len() + 3);
+        if negative && !is_zero {
+            out.push('-');
+        }
+        out.push_str(if int_digits.is_empty() {
+            "0"
+        } else {
+            int_digits
+        });
+        if scale > 0 {
+            out.push('.');
+            out.push_str(frac_digits);
+        }
+        // Padding to the declared scale can need more than the 96-bit
+        // coefficient (a 29-digit value at scale 2): that is refused, never
+        // stored in a form the parser would later reject.
+        canonical_numeric(&out)
+    }
+
+    /// Apply this declaration to a stored value: a NUMERIC is rounded and
+    /// checked, an array of them element by element, anything else (NULL, or a
+    /// value the caller has not cast to NUMERIC) is left alone.
+    pub fn apply_to_value(self, value: &mut Value) -> Result<(), String> {
+        match value {
+            Value::Numeric(text) => {
+                *text = self.apply(text)?;
+            }
+            Value::Array(items) => {
+                for item in items {
+                    self.apply_to_value(item)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 /// Parse the text form of a BYTEA value. The PostgreSQL standard text/wire
 /// form is hex: `\x` followed by an even number of hex digits (this is also
 /// exactly what `Value::Bytea`'s Display emits, so casts round-trip). Malformed
@@ -1043,9 +1268,7 @@ impl Value {
                 Ok(Value::Int64(rounded as i64))
             }
             (Value::Float64(n), DataType::Text) => Ok(Value::Text(n.to_string())),
-            (Value::Float64(n), DataType::Numeric) => {
-                canonical_numeric(&n.to_string()).map(Value::Numeric)
-            }
+            (Value::Float64(n), DataType::Numeric) => float_to_numeric_text(*n).map(Value::Numeric),
             // Text conversions
             (Value::Text(s), DataType::Int32) => s
                 .parse::<i32>()
@@ -1599,6 +1822,12 @@ pub fn numeric_mul(a: &str, b: &str) -> Result<String, String> {
 }
 
 /// Divide two numeric strings (a / b), returning an error on division by zero.
+///
+/// Division is the one operation that cannot be exact (PostgreSQL rounds it
+/// too). The quotient is rounded by `Decimal::checked_div` to the 28
+/// significant digits a `Decimal` holds, so `1 / 3` is 28 threes where
+/// PostgreSQL's `select_div_scale` gives 20; a quotient that does not fit is
+/// refused.
 pub fn numeric_div(a: &str, b: &str) -> Result<String, String> {
     let divisor = parse_numeric(b)?;
     if divisor.is_zero() {

@@ -475,6 +475,7 @@ fn register_recovered(
                 analyzer: None,
                 generation: None,
                 max_len: None,
+                numeric_typmod: None,
             })
             .collect();
         let epoch = epochs.get(&name).copied().unwrap_or(0);

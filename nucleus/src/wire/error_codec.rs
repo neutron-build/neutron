@@ -145,15 +145,23 @@ fn cursor_error_code(msg: &str) -> Option<ErrorCode> {
 
 /// NUMERIC parse refusals arrive as `Runtime` messages (often wrapped in
 /// "invalid value for column ..."), so they are matched anywhere in the text.
-/// The three wordings come from `types::parse_numeric` and mean different
-/// things to a client: not a number (22P02), a number the bounded exact decimal
-/// cannot hold (22003), and NaN/Infinity, valid in PostgreSQL but unsupported
-/// here (0A000).
+/// The wordings come from `types::parse_numeric` and `NumericTypmod` and mean
+/// different things to a client: not a number (22P02), a number the bounded
+/// exact decimal cannot hold or a value that does not fit its declared
+/// `numeric(p, s)` (22003), a declared precision or scale PostgreSQL itself
+/// rejects (22023), and NaN/Infinity, valid in PostgreSQL but unsupported here
+/// (0A000).
 fn numeric_error_code(msg: &str) -> Option<ErrorCode> {
     if msg.contains("invalid input syntax for type numeric") {
         Some(ErrorCode::InvalidTextRepresentation)
-    } else if msg.contains("exceeds NUMERIC precision ceiling") {
+    } else if msg.contains("exceeds NUMERIC precision ceiling")
+        || msg.contains("numeric field overflow")
+    {
         Some(ErrorCode::NumericValueOutOfRange)
+    } else if (msg.contains("NUMERIC precision ") || msg.contains("NUMERIC scale "))
+        && msg.contains("must be between")
+    {
+        Some(ErrorCode::InvalidParameterValue)
     } else if msg.contains("numeric NaN and Infinity are not supported") {
         Some(ErrorCode::FeatureNotSupported)
     } else {

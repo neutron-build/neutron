@@ -4232,6 +4232,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                     ColumnDef {
                         name: "name".into(),
@@ -4242,6 +4243,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                 ],
                 constraints: vec![],
@@ -4916,6 +4918,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                     ColumnDef {
                         name: "label".into(),
@@ -4926,6 +4929,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                     ColumnDef {
                         name: "score".into(),
@@ -4936,6 +4940,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                     ColumnDef {
                         name: "active".into(),
@@ -4946,6 +4951,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                 ],
                 constraints: vec![],
@@ -5578,6 +5584,7 @@ mod tests {
                     analyzer: None,
                     generation: None,
                     max_len: None,
+                    numeric_typmod: None,
                 },
                 ColumnDef {
                     name: "b".into(),
@@ -5588,6 +5595,7 @@ mod tests {
                     analyzer: None,
                     generation: None,
                     max_len: None,
+                    numeric_typmod: None,
                 },
                 ColumnDef {
                     name: "c".into(),
@@ -5598,6 +5606,7 @@ mod tests {
                     analyzer: None,
                     generation: None,
                     max_len: None,
+                    numeric_typmod: None,
                 },
                 ColumnDef {
                     name: "d".into(),
@@ -5608,6 +5617,7 @@ mod tests {
                     analyzer: None,
                     generation: None,
                     max_len: None,
+                    numeric_typmod: None,
                 },
                 ColumnDef {
                     name: "e".into(),
@@ -5618,6 +5628,7 @@ mod tests {
                     analyzer: None,
                     generation: None,
                     max_len: None,
+                    numeric_typmod: None,
                 },
             ],
             constraints: vec![],
@@ -8732,6 +8743,7 @@ mod tests {
             analyzer: None,
             generation: None,
             max_len: None,
+            numeric_typmod: None,
         })
         .collect();
         rt.block_on(catalog.create_table(TableDef {
