@@ -358,7 +358,7 @@ test("NP01: stronger transaction modes and batch defaults are refused before any
   await assert.rejects(async () => {
     await db.batch([db.delete(docs).where(eq(docs.id, 1))]);
   }, ProfileRefusedError);
-  assert.deepEqual(driver.pinned, []);
+  assert.equal(driver.pinned.length, 0);
   assert.equal(driver.released, 4, "every pinned connection is released after the refused BEGIN");
   await db.transaction(async () => undefined, { isolation: "read-committed" });
   assert.deepEqual(driver.pinned.map((c) => c.sql), ["begin isolation level read committed", "commit"]);
