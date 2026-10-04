@@ -37,6 +37,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"runtime/debug"
 	"sort"
@@ -361,6 +362,26 @@ type report struct {
 	CleanupFailure    string            `json:"cleanupFailure,omitempty"`
 }
 
+// sensitive holds the owned endpoint URLs; any driver error text that echoes a
+// connection string is scrubbed before it can reach the report.
+var (
+	sensitive  []string
+	urlPattern = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.\-]*://[^\s"'<>]+`)
+)
+
+func clean(text string) string {
+	for _, secret := range sensitive {
+		if secret != "" {
+			text = strings.ReplaceAll(text, secret, "[redacted]")
+		}
+	}
+	text = urlPattern.ReplaceAllString(text, "[url]")
+	if len(text) > 500 {
+		text = text[:500]
+	}
+	return text
+}
+
 func fail(r *report, path string, err error) {
 	r.Status = "fail"
 	if r.Failure == "" {
@@ -371,6 +392,8 @@ func fail(r *report, path string, err error) {
 }
 
 func write(r *report, path string) {
+	r.Failure = clean(r.Failure)
+	r.CleanupFailure = clean(r.CleanupFailure)
 	data, _ := json.MarshalIndent(r, "", "  ")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err == nil {
 		_ = os.WriteFile(path, append(data, '\n'), 0o644)
@@ -444,6 +467,7 @@ func main() {
 			fail(r, *reportPath, fmt.Errorf("environment variable %s is not set", name))
 		}
 		urls[engine] = value
+		sensitive = append(sensitive, value)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -523,13 +547,16 @@ func main() {
 	} else {
 		r.Failure = failure.Error()
 	}
+	// Cleanup gets its own deadline: the run context may already be expired.
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cleanupCancel()
 	for i := len(raws) - 1; i >= 0; i-- {
-		if _, err := raws[i].Exec(ctx, `DROP SCHEMA IF EXISTS "`+schema+`" CASCADE`); err != nil {
+		if _, err := raws[i].Exec(cleanupCtx, `DROP SCHEMA IF EXISTS "`+schema+`" CASCADE`); err != nil {
 			r.Status = "fail"
 			r.CleanupFailure = fmt.Sprintf("%T", err)
 			failure = err
 		}
-		_ = raws[i].Close(ctx)
+		_ = raws[i].Close(cleanupCtx)
 	}
 	write(r, *reportPath)
 	if failure != nil {
