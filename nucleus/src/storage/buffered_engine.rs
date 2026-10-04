@@ -188,6 +188,68 @@ impl TxnBuffer {
         created
     }
 
+    /// Whether any buffered DML op in this transaction addresses `table`.
+    /// (DDL ops don't count: `created_in_txn` answers that separately.)
+    fn has_pending_rows_for(&self, table: &str) -> bool {
+        self.ops.iter().any(|op| match op {
+            BufferedOp::Insert { table: t, .. }
+            | BufferedOp::Delete { table: t, .. }
+            | BufferedOp::Update { table: t, .. }
+            | BufferedOp::UpdateIf { table: t, .. }
+            | BufferedOp::DeleteIf { table: t, .. } => t == table,
+            BufferedOp::CreateTable { .. } | BufferedOp::DropTable { .. } => false,
+        })
+    }
+
+    /// Re-base a table this transaction created onto a new column layout:
+    /// every buffered `CreateTable` for it adopts `schema`, and its row ops are
+    /// replaced by one `Insert` per surviving row in `rows` (already widened or
+    /// narrowed by the caller, keyed by their pending positions).
+    ///
+    /// Row ops are discarded rather than edited because the log is
+    /// append-only by design (savepoints truncate it). The rows they would have
+    /// produced are exactly `rows`, so nothing is lost. Savepoint marks that
+    /// pointed past the shortened log are clamped; a ROLLBACK TO SAVEPOINT
+    /// taken before the ALTER therefore keeps the re-based rows — which is the
+    /// only consistent answer, since the ALTER itself is not undone by it.
+    fn rebase_created_table(
+        &mut self,
+        table: &str,
+        schema: Option<super::disk_engine::TableSchemaSnapshot>,
+        rows: &[(usize, Row)],
+    ) {
+        self.ops.retain(|op| match op {
+            BufferedOp::Insert { table: t, .. }
+            | BufferedOp::Delete { table: t, .. }
+            | BufferedOp::Update { table: t, .. }
+            | BufferedOp::UpdateIf { table: t, .. }
+            | BufferedOp::DeleteIf { table: t, .. } => t != table,
+            BufferedOp::CreateTable { .. } | BufferedOp::DropTable { .. } => true,
+        });
+        for op in &mut self.ops {
+            if let BufferedOp::CreateTable {
+                table: t,
+                schema: snap,
+            } = op
+                && t == table
+            {
+                *snap = schema.clone();
+            }
+        }
+        for (pos, row) in rows {
+            self.ops.push(BufferedOp::Insert {
+                table: table.to_string(),
+                pending_pos: *pos,
+                row: row.clone(),
+            });
+        }
+        let len = self.ops.len();
+        for (_, mark) in &mut self.savepoints {
+            *mark = (*mark).min(len);
+        }
+        self.refold();
+    }
+
     fn take_pending_pos(&mut self) -> usize {
         let pos = self.next_pending;
         self.next_pending += 1;
@@ -1264,6 +1326,72 @@ impl StorageEngine for BufferedDiskEngine {
             return Ok(targets.len());
         }
         self.inner.delete_if_unchanged(table, targets).await
+    }
+
+    /// Schema change + row rewrite, applied to the committed engine NOW.
+    ///
+    /// `sync_schema` has always taken effect immediately (the catalog change
+    /// next to it is not transactional either), but `update` — which the
+    /// default `rewrite_table` would call — lands in the session's write
+    /// buffer until COMMIT. Between the two, the engine reads every old tuple
+    /// against the new column list: the next statement in the same
+    /// transaction (a second `ALTER … ADD COLUMN` in a migration file, or any
+    /// SELECT) fails with `corrupt tuple … does not decode`, and when the
+    /// transaction then aborts the widened rows are discarded while the
+    /// catalog and layout keep the new column. That is how a multi-statement
+    /// migration turned a healthy populated table into an unreadable one.
+    ///
+    /// Three cases, by what this transaction has already done to `table`:
+    /// * nothing (the usual case): rewrite the committed rows immediately and
+    ///   atomically, serialized with COMMITs and logged as its own page
+    ///   transaction so recovery can undo it if it was never acknowledged;
+    /// * it CREATEd the table: nothing exists in the engine yet, so re-base the
+    ///   buffered `CreateTable` and rows onto the new layout;
+    /// * it has uncommitted writes to an existing table: refuse. Those buffered
+    ///   rows are in the old shape and would be applied at COMMIT against the
+    ///   new one. Failing here is correct; widening them silently is not.
+    async fn rewrite_table(&self, table: &str, rows: &[(usize, Row)]) -> Result<(), StorageError> {
+        self.lock_write(table).await?;
+        let id = current_session_id();
+        enum Case {
+            Direct,
+            CreatedInTxn,
+            PendingWrites,
+        }
+        let case = match self.txn_bufs.read().get(&id) {
+            None => Case::Direct,
+            Some(txn) if txn.created_in_txn(table) => Case::CreatedInTxn,
+            Some(txn) if txn.has_pending_rows_for(table) => Case::PendingWrites,
+            Some(_) => Case::Direct,
+        };
+        match case {
+            Case::PendingWrites => Err(StorageError::Io(format!(
+                "cannot change the columns of '{table}' while this transaction has \
+                 uncommitted changes to it; COMMIT or ROLLBACK first"
+            ))),
+            Case::CreatedInTxn => {
+                // Snapshot before taking the guard: it awaits, and the guard
+                // is not Send.
+                let schema = self.inner.table_schema_snapshot(table).await;
+                if let Some(txn) = self.txn_bufs.write().get_mut(&id) {
+                    txn.rebase_created_table(table, schema, rows);
+                }
+                Ok(())
+            }
+            Case::Direct => {
+                let _apply = APPLY_LOCK.lock().await;
+                let page_txn = self
+                    .inner
+                    .begin_page_txn(crate::storage::current_storage_session());
+                match self.inner.rewrite_table(table, rows).await {
+                    Ok(()) => self.inner.commit_page_txn(page_txn, None),
+                    Err(e) => {
+                        let _ = self.inner.abort_page_txn(page_txn);
+                        Err(e)
+                    }
+                }
+            }
+        }
     }
 
     async fn sync_schema(&self, table: &str) -> Result<(), StorageError> {

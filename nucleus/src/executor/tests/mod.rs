@@ -43,6 +43,7 @@ pub(super) fn text_of(result: ExecResult) -> String {
 mod test_2pl_census; // R6: serializable anomaly census for the DISK engine (strict 2PL)
 mod test_admin;
 mod test_aggregate_overflow_checked; // QPP-4 family: aggregate overflow errors on every path
+mod test_alter_add_column_history;
 mod test_alter_policy; // N14: ALTER POLICY and policy introspection
 mod test_ast_cache_utf8; // AST-cache literal extraction must be UTF-8-safe (WIR-4 family)
 mod test_ast_route_plan_key; // the pre-parsed route must not inherit a plan-cache key

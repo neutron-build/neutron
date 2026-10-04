@@ -3117,6 +3117,53 @@ impl StorageEngine for DiskEngine {
         Ok(())
     }
 
+    /// All-or-nothing schema change + row rewrite. See
+    /// [`StorageEngine::rewrite_table`].
+    ///
+    /// Three things go wrong if the steps are left independent, and each one
+    /// has bitten a real store:
+    ///
+    /// * the cached column layout (and the persisted table directory) moves to
+    ///   the new shape while tuples are still the old width, so every read
+    ///   fails with `corrupt tuple … does not decode`;
+    /// * a failure part-way leaves some pages widened and some not, with no
+    ///   way to tell which, because a tuple carries no column count;
+    /// * the caller's catalog already says the column exists, so a retry of
+    ///   `ADD COLUMN IF NOT EXISTS` is skipped and the half-done change is
+    ///   recorded as applied.
+    ///
+    /// So: snapshot the directory and free list first, make the change, then
+    /// PROVE the whole table decodes under the new layout before declaring
+    /// success. Any failure restores the pre-call state — dirtied pages are
+    /// reloaded from the data file, the directory is put back and re-persisted,
+    /// and indexes are rebuilt against the restored layout — and returns the
+    /// error so the caller can undo its catalog change.
+    ///
+    /// If a storage transaction is already open (`begin_txn`), that
+    /// transaction owns rollback and this call leaves it alone.
+    async fn rewrite_table(&self, table: &str, rows: &[(usize, Row)]) -> Result<(), StorageError> {
+        let owns_undo = self.begin_rewrite_undo()?;
+        let applied = self.rewrite_table_steps(table, rows).await;
+        match applied {
+            Ok(()) => {
+                if owns_undo {
+                    *self.txn_state.lock() = None;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if owns_undo {
+                    self.rollback_open_txn_in_memory();
+                    // `sync_schema` persisted the new layout; put the old one
+                    // back so a restart does not resurrect the half-change.
+                    let _ = self.save_table_directory();
+                    let _ = StorageEngine::rebuild_table_indexes(self, table).await;
+                }
+                Err(e)
+            }
+        }
+    }
+
     async fn rebuild_table_indexes(&self, table: &str) -> Result<(), StorageError> {
         // Re-create each index on the table from its current tuples.
         // create_index_inner reads the (now widened) schema + rows and
@@ -3479,6 +3526,62 @@ impl StorageEngine for DiskEngine {
 }
 
 impl DiskEngine {
+    /// Take the undo base for [`StorageEngine::rewrite_table`]: flush so the
+    /// data file holds the pre-change pages, then record the directory and
+    /// free list. Returns `false` (and records nothing) when a storage
+    /// transaction is already open, since that one owns rollback.
+    fn begin_rewrite_undo(&self) -> Result<bool, StorageError> {
+        if self.txn_state.lock().is_some() {
+            return Ok(false);
+        }
+        self.flush()?;
+        let page_count_at_begin = self.pool.next_page_id();
+        let tables_snapshot = self.tables.read().clone();
+        let free_list_head = *self.free_list_head.lock();
+        let free_page_count = *self.free_page_count.lock();
+        let mut guard = self.txn_state.lock();
+        if guard.is_some() {
+            return Ok(false);
+        }
+        *guard = Some(DiskTxnState {
+            dirty_existing: HashSet::new(),
+            new_pages: HashSet::new(),
+            tables_snapshot,
+            free_list_head,
+            free_page_count,
+            page_count_at_begin,
+        });
+        Ok(true)
+    }
+
+    /// The mutating half of [`StorageEngine::rewrite_table`]: adopt the new
+    /// layout, rewrite the rows, rebuild indexes, then verify.
+    async fn rewrite_table_steps(
+        &self,
+        table: &str,
+        rows: &[(usize, Row)],
+    ) -> Result<(), StorageError> {
+        StorageEngine::sync_schema(self, table).await?;
+        if !rows.is_empty() {
+            StorageEngine::update(self, table, rows).await?;
+        }
+        StorageEngine::rebuild_table_indexes(self, table).await?;
+        // The check that would have caught this bug at ALTER time rather than
+        // at the next unrelated SELECT: every live tuple must decode under the
+        // layout we just installed, and no row we meant to rewrite may be
+        // missing. (>=, not ==: a concurrent insert lands already at the new
+        // width and is legitimately extra.)
+        let live = self.scan_addressed(table, None)?;
+        if live.len() < rows.len() {
+            return Err(StorageError::Corruption(format!(
+                "schema rewrite of '{table}' lost rows: expected at least {}, found {}",
+                rows.len(),
+                live.len()
+            )));
+        }
+        Ok(())
+    }
+
     /// Open a page-level transaction window and return its id.
     ///
     /// Everything the buffer pool dirties until [`DiskEngine::commit_page_txn`]
