@@ -1045,6 +1045,11 @@ impl Executor {
         create: ast::CreateTable,
     ) -> Result<ExecResult, ExecError> {
         let table_name = crate::sql::object_name_key(&create.name);
+        // An invalid numeric(p, s) is refused with its own SQLSTATE before
+        // `extract_columns` reads the declarations leniently.
+        for column in &create.columns {
+            super::column_writes::declared_numeric_typmod(&column.data_type)?;
+        }
         let mut columns = sql::extract_columns(&create.columns)?;
         super::column_writes::validate_generated_columns(&columns)?;
         Self::apply_analyzer_options(&create.table_options, &mut columns)?;
@@ -3101,6 +3106,8 @@ impl Executor {
                     }
 
                     let dtype = sql::convert_data_type(&column_def.data_type)?;
+                    let numeric_typmod =
+                        super::column_writes::declared_numeric_typmod(&column_def.data_type)?;
                     let nullable = !column_def.options.iter().any(|opt| {
                         matches!(
                             opt.option,
@@ -3140,6 +3147,7 @@ impl Executor {
                         analyzer: None,
                         generation,
                         max_len: sql::declared_max_len(&column_def.data_type),
+                        numeric_typmod,
                     };
                     let mut updated = (*table_def).clone();
                     updated.columns.push(new_col.clone());
@@ -3173,6 +3181,7 @@ impl Executor {
                         .map(|(vidx, mut r)| {
                             let mut v = self.eval_column_default(&new_col)?;
                             super::column_writes::enforce_max_len(&mut v, &new_col)?;
+                            super::column_writes::enforce_numeric_typmod(&mut v, &new_col)?;
                             r.push(v);
                             if !generated_exprs.is_empty() {
                                 self.apply_generated(
@@ -3648,11 +3657,18 @@ impl Executor {
                             }
                             ast::AlterColumnOperation::SetDataType { data_type, .. } => {
                                 let new_type = sql::convert_data_type(data_type)?;
-                                if col.data_type != new_type {
+                                let new_typmod =
+                                    super::column_writes::declared_numeric_typmod(data_type)?;
+                                // A changed numeric(p, s) rewrites the stored
+                                // values (rounded to the new scale, refused when
+                                // they no longer fit) even though the engine
+                                // type stays NUMERIC.
+                                if col.data_type != new_type || col.numeric_typmod != new_typmod {
                                     retype = Some(new_type.clone());
                                 }
                                 col.data_type = new_type;
                                 col.max_len = sql::declared_max_len(data_type);
+                                col.numeric_typmod = new_typmod;
                                 declared_change =
                                     Some((col.id, pg_catalog::declared_type_of(data_type)));
                             }
@@ -3742,6 +3758,11 @@ impl Executor {
                                     ))
                                 })?;
                                 row[col_idx] = cast;
+                                if let Some(typmod) = updated.columns[col_idx].numeric_typmod {
+                                    typmod
+                                        .apply_to_value(&mut row[col_idx])
+                                        .map_err(ExecError::Runtime)?;
+                                }
                             }
                             // Rewrite EVERY row, not just value-changed ones:
                             // PartialEq folds integer widths (Int32(100000) ==

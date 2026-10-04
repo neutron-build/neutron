@@ -64,7 +64,8 @@ pub(super) fn coerce_value_for_write(
     session_time_zone: chrono_tz::Tz,
 ) -> Result<(), ExecError> {
     coerce_value_to_type(value, column, session_time_zone)?;
-    super::column_writes::enforce_max_len(value, column)
+    super::column_writes::enforce_max_len(value, column)?;
+    super::column_writes::enforce_numeric_typmod(value, column)
 }
 
 fn coerce_value_to_type(
@@ -320,6 +321,13 @@ impl Executor {
                         if is_default || policy == super::column_writes::InsertColumn::UseDefault {
                             // Resolve DEFAULT for this column
                             vals.push(self.eval_column_default(col)?);
+                        } else if let Some(exact) =
+                            super::column_writes::exact_numeric_literal(expr, col)
+                        {
+                            // A decimal literal into a NUMERIC column keeps its
+                            // digits and written scale instead of passing
+                            // through f64.
+                            vals.push(exact?);
                         } else if let Expr::Value(val_with_span) = expr {
                             // Fast path: direct literal → Value (skip eval_const_expr overhead)
                             vals.push(self.eval_value(&val_with_span.value)?);
@@ -680,6 +688,13 @@ impl Executor {
                                             )?;
                                             updated[idx] = if is_default {
                                                 self.eval_column_default(col)?
+                                            } else if let Some(exact) =
+                                                super::column_writes::exact_numeric_literal(
+                                                    &assign.value,
+                                                    col,
+                                                )
+                                            {
+                                                exact?
                                             } else {
                                                 self.eval_row_expr(
                                                     &assign.value,
@@ -688,6 +703,10 @@ impl Executor {
                                                 )?
                                             };
                                             super::column_writes::enforce_max_len(
+                                                &mut updated[idx],
+                                                col,
+                                            )?;
+                                            super::column_writes::enforce_numeric_typmod(
                                                 &mut updated[idx],
                                                 col,
                                             )?;
@@ -1116,7 +1135,10 @@ impl Executor {
                 "invalid column default expression".into(),
             ));
         };
-        let val = self.eval_row_expr(expr, &Vec::new(), &Vec::new())?;
+        let val = match super::column_writes::exact_numeric_literal(expr, col) {
+            Some(exact) => exact?,
+            None => self.eval_row_expr(expr, &Vec::new(), &Vec::new())?,
+        };
         // SERIAL's nextval returns int8; narrowing must reject overflow rather
         // than wrap, just as writing an explicit value does.
         match (&col.data_type, val) {
@@ -2641,7 +2663,13 @@ impl Executor {
 
                 let mut new_row = current.clone();
                 for (col_idx, val_expr) in assign_targets {
-                    let mut value = self.eval_row_expr(val_expr, current, col_meta)?;
+                    let mut value = match super::column_writes::exact_numeric_literal(
+                        val_expr,
+                        &table_def.columns[*col_idx],
+                    ) {
+                        Some(exact) => exact?,
+                        None => self.eval_row_expr(val_expr, current, col_meta)?,
+                    };
                     coerce_value_for_write(
                         &mut value,
                         &table_def.columns[*col_idx],
@@ -2886,6 +2914,11 @@ impl Executor {
                 for (col_idx, val_expr) in &assign_targets {
                     let mut value = if Self::is_default_expr(val_expr) {
                         self.eval_column_default(&table_def.columns[*col_idx])?
+                    } else if let Some(exact) = super::column_writes::exact_numeric_literal(
+                        val_expr,
+                        &table_def.columns[*col_idx],
+                    ) {
+                        exact?
                     } else {
                         self.eval_row_expr(val_expr, row, &col_meta)?
                     };

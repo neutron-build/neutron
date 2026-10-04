@@ -6337,13 +6337,11 @@ impl Executor {
                 if has_enforceable_constraints {
                     return None;
                 }
-                // Generated columns, identity columns and declared lengths are
-                // enforced by the full INSERT path only.
-                if table_def
-                    .columns
-                    .iter()
-                    .any(|c| c.generation.is_some() || c.max_len.is_some())
-                {
+                // Generated columns, identity columns, declared lengths and declared
+                // numeric precisions are enforced by the full INSERT path only.
+                if table_def.columns.iter().any(|c| {
+                    c.generation.is_some() || c.max_len.is_some() || c.numeric_typmod.is_some()
+                }) {
                     return None;
                 }
                 // Column count must match exactly for a simple VALUES insert.
@@ -6417,11 +6415,12 @@ impl Executor {
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
                 // These columns require the full UPDATE path's casts,
-                // generated expressions and declared-length checks.
+                // generated expressions and declared-length / numeric-precision checks.
                 if table_def.columns.iter().any(|col| {
                     matches!(col.data_type, DataType::Array(_) | DataType::TimestampTz)
                         || col.generation.is_some()
                         || col.max_len.is_some()
+                        || col.numeric_typmod.is_some()
                 }) {
                     return None;
                 }

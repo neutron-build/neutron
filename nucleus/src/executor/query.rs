@@ -5128,10 +5128,8 @@ impl Executor {
                 ast::Value::Number(n, _) => {
                     if let Ok(i) = n.parse::<i64>() {
                         Ok(Value::Int64(i))
-                    } else if let Ok(f) = n.parse::<f64>() {
-                        Ok(Value::Float64(f))
                     } else {
-                        Ok(Value::Text(n.clone()))
+                        wide_number_literal(n)
                     }
                 }
                 ast::Value::SingleQuotedString(s) | ast::Value::EscapedStringLiteral(s) => {
@@ -5162,8 +5160,9 @@ impl Executor {
                 self.eval_expr_plan(time_zone, row, meta)?,
             ),
             Expr::BinaryOp { left, op, right } => {
-                let lv = self.eval_expr_plan(left, row, meta)?;
-                let rv = self.eval_expr_plan(right, row, meta)?;
+                let mut lv = self.eval_expr_plan(left, row, meta)?;
+                let mut rv = self.eval_expr_plan(right, row, meta)?;
+                adopt_decimal_literals(left, right, &mut lv, &mut rv)?;
                 // SQL 3-valued logic: comparisons with NULL yield NULL
                 if matches!(lv, Value::Null) || matches!(rv, Value::Null) {
                     match op {

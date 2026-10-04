@@ -198,8 +198,9 @@ impl Executor {
                 }
             }
             Expr::BinaryOp { left, op, right } => {
-                let l = self.eval_const_expr(left)?;
-                let r = self.eval_const_expr(right)?;
+                let mut l = self.eval_const_expr(left)?;
+                let mut r = self.eval_const_expr(right)?;
+                adopt_decimal_literals(left, right, &mut l, &mut r)?;
                 self.eval_binary_op(&l, op, &r)
             }
             Expr::Nested(inner) => self.eval_const_expr(inner),
@@ -302,10 +303,8 @@ impl Executor {
                     Ok(Value::Int32(i))
                 } else if let Ok(i) = n.parse::<i64>() {
                     Ok(Value::Int64(i))
-                } else if let Ok(f) = n.parse::<f64>() {
-                    Ok(Value::Float64(f))
                 } else {
-                    Err(ExecError::Unsupported(format!("number: {n}")))
+                    wide_number_literal(n)
                 }
             }
             ast::Value::SingleQuotedString(s) | ast::Value::DoubleQuotedString(s) => {
@@ -1093,8 +1092,9 @@ impl Executor {
                 }
             }
             Expr::BinaryOp { left, op, right } => {
-                let l = self.eval_row_expr(left, row, col_meta)?;
-                let r = self.eval_row_expr(right, row, col_meta)?;
+                let mut l = self.eval_row_expr(left, row, col_meta)?;
+                let mut r = self.eval_row_expr(right, row, col_meta)?;
+                adopt_decimal_literals(left, right, &mut l, &mut r)?;
                 self.eval_binary_op(&l, op, &r)
             }
             Expr::UnaryOp { op, expr } => {
@@ -1109,17 +1109,14 @@ impl Executor {
                         .map(Value::Int64)
                         .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
                     (ast::UnaryOperator::Minus, Value::Float64(n)) => Ok(Value::Float64(-n)),
-                    (ast::UnaryOperator::Minus, Value::Numeric(raw)) => Ok(Value::Numeric(
-                        parse_numeric(&raw)
-                            .map(|d| (-d).to_string())
-                            .unwrap_or_else(|_| {
-                                if let Some(stripped) = raw.strip_prefix('-') {
-                                    stripped.to_string()
-                                } else {
-                                    format!("-{raw}")
-                                }
-                            }),
-                    )),
+                    // Keeps the written scale and never yields a negative
+                    // zero; text that is not an exact NUMERIC is refused
+                    // rather than negated as a string.
+                    (ast::UnaryOperator::Minus, Value::Numeric(raw)) => {
+                        crate::types::numeric_negate_keep_scale(&raw)
+                            .map(Value::Numeric)
+                            .map_err(ExecError::Runtime)
+                    }
                     (
                         ast::UnaryOperator::Minus,
                         Value::Interval {
@@ -1395,6 +1392,10 @@ impl Executor {
                 let val = self.eval_row_expr(expr, row, col_meta)?;
                 match val {
                     Value::Float64(f) => Ok(Value::Float64(f.ceil())),
+                    // Exact, and never a negative zero (PostgreSQL has none).
+                    Value::Numeric(raw) => parse_numeric(&raw)
+                        .map(|d| Value::Numeric(crate::types::decimal_to_numeric_text(d.ceil())))
+                        .map_err(ExecError::Runtime),
                     Value::Int32(n) => Ok(Value::Float64((n as f64).ceil())),
                     Value::Int64(n) => Ok(Value::Float64((n as f64).ceil())),
                     Value::Null => Ok(Value::Null),
@@ -1405,6 +1406,9 @@ impl Executor {
                 let val = self.eval_row_expr(expr, row, col_meta)?;
                 match val {
                     Value::Float64(f) => Ok(Value::Float64(f.floor())),
+                    Value::Numeric(raw) => parse_numeric(&raw)
+                        .map(|d| Value::Numeric(crate::types::decimal_to_numeric_text(d.floor())))
+                        .map_err(ExecError::Runtime),
                     Value::Int32(n) => Ok(Value::Float64((n as f64).floor())),
                     Value::Int64(n) => Ok(Value::Float64((n as f64).floor())),
                     Value::Null => Ok(Value::Null),
@@ -1824,7 +1828,16 @@ impl Executor {
     }
 
     pub(super) fn eval_cast(&self, val: Value, target: &ast::DataType) -> Result<Value, ExecError> {
-        let cast = self.eval_cast_to_type(val, target)?;
+        // `CAST(x AS numeric(p, s))` rounds to the scale and refuses a value
+        // that needs more than p - s integer digits (22003); an invalid
+        // declaration is refused whatever the operand is.
+        let numeric_typmod = super::column_writes::declared_numeric_typmod(target)?;
+        let mut cast = self.eval_cast_to_type(val, target)?;
+        if let Some(typmod) = numeric_typmod {
+            typmod
+                .apply_to_value(&mut cast)
+                .map_err(ExecError::Runtime)?;
+        }
         // An explicit cast to `varchar(n)` / `char(n)` cuts to n characters
         // instead of failing (only a stored value is an error, SQLSTATE 22001).
         match (crate::sql::declared_max_len(target), cast) {
@@ -2386,6 +2399,23 @@ fn numeric_literal_text(expr: &Expr, data_type: &ast::DataType) -> Option<String
             ast::Value::Number(s, _) => Some(s.clone()),
             _ => None,
         },
+        // `CAST(-1.5 AS NUMERIC)`: the sign is a unary operator in the AST.
+        Expr::UnaryOp {
+            op: op @ (ast::UnaryOperator::Minus | ast::UnaryOperator::Plus),
+            expr: inner,
+        } => {
+            let Expr::Value(v) = &**inner else {
+                return None;
+            };
+            let ast::Value::Number(digits, _) = &v.value else {
+                return None;
+            };
+            Some(if matches!(op, ast::UnaryOperator::Minus) {
+                format!("-{digits}")
+            } else {
+                digits.clone()
+            })
+        }
         _ => None,
     }
 }
