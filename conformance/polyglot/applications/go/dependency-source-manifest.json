@@ -15,6 +15,38 @@
     {
       "repo": "go-admin",
       "commit": "386ddeae8207684d0df572a49ef180b700ddda74",
+      "path": "app/admin/models/sys_role.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/app/admin/models/sys_role.go",
+      "sha256": "d99687a7599a3c8f80f2de0a849a89bbe2efd6504aedfc91612196fbd354c2f5",
+      "bytes": 1451
+    },
+    {
+      "repo": "go-admin",
+      "commit": "386ddeae8207684d0df572a49ef180b700ddda74",
+      "path": "app/admin/models/sys_menu.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/app/admin/models/sys_menu.go",
+      "sha256": "1f35fc07b6c8d635f669899f252d4f49bd8f83c32407f603da31e2da7f70ead0",
+      "bytes": 3919
+    },
+    {
+      "repo": "go-admin",
+      "commit": "386ddeae8207684d0df572a49ef180b700ddda74",
+      "path": "app/admin/models/sys_api.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/app/admin/models/sys_api.go",
+      "sha256": "eccb4262acd07ded2c871211c69bf3d2f942e042c540be6c00681b59105cc9e8",
+      "bytes": 3028
+    },
+    {
+      "repo": "go-admin",
+      "commit": "386ddeae8207684d0df572a49ef180b700ddda74",
+      "path": "cmd/migrate/migration/models/role_dept.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/cmd/migrate/migration/models/role_dept.go",
+      "sha256": "dbda249035ef00b712f99d09f940169b7a6bdbd2ecf249d7a295885cb22b669d",
+      "bytes": 191
+    },
+    {
+      "repo": "go-admin",
+      "commit": "386ddeae8207684d0df572a49ef180b700ddda74",
       "path": "common/models/by.go",
       "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/common/models/by.go",
       "sha256": "baebb6424df696f9bf97165ddba4456e8026eae75246eb00c56f10bb73fb5654",
