@@ -838,6 +838,11 @@ impl Executor {
             // can't see another txn's uncommitted row); otherwise use the fast
             // batch path. ReplacingMergeTree-style tables keep multiple versions per
             // key, so they opt out of unique enforcement (see check_unique_constraints).
+            // `index_names` maps an index's column set to its name, for the
+            // in-statement duplicate message — same mapping as
+            // check_unique_constraints.
+            let mut index_names: std::collections::HashMap<Vec<usize>, String> =
+                std::collections::HashMap::new();
             let unique_col_sets: Vec<Vec<usize>> =
                 if crate::columnar::replacing_config(&table_name).is_some() {
                     Vec::new()
@@ -858,10 +863,11 @@ impl Executor {
                             _ => None,
                         })
                         .collect();
-                    for idxs in self.unique_index_col_sets(&table_name, &table_def).await {
+                    for (name, idxs) in self.unique_index_sources(&table_name, &table_def).await {
                         if !sets.contains(&idxs) {
-                            sets.push(idxs);
+                            sets.push(idxs.clone());
                         }
+                        index_names.entry(idxs).or_insert(name);
                     }
                     sets
                 };
@@ -886,18 +892,24 @@ impl Executor {
                             continue;
                         }
                         if !seen.insert(key.clone()) {
-                            let cols = col_indices
-                                .iter()
-                                .map(|&i| table_def.columns[i].name.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ");
+                            let constraint = match index_names.get(col_indices) {
+                                Some(name) => format!("\"{name}\""),
+                                None => {
+                                    let cols = col_indices
+                                        .iter()
+                                        .map(|&i| table_def.columns[i].name.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    format!("on ({cols})")
+                                }
+                            };
                             let vals = key
                                 .iter()
                                 .map(|v| v.to_string())
                                 .collect::<Vec<_>>()
                                 .join(", ");
                             return Err(ExecError::ConstraintViolation(format!(
-                                "duplicate key value violates unique constraint: ({cols}) = ({vals}) appears twice in the same statement"
+                                "duplicate key value violates unique constraint {constraint}: ({vals}) appears twice in the same statement"
                             )));
                         }
                     }
@@ -1148,13 +1160,15 @@ impl Executor {
         }
     }
 
-    /// Column sets of `CREATE UNIQUE INDEX` indexes on the table. They enforce
-    /// uniqueness exactly like a table UNIQUE constraint.
-    pub(super) async fn unique_index_col_sets(
+    /// Column sets of `CREATE UNIQUE INDEX` indexes on the table, with each
+    /// index's name. They enforce uniqueness exactly like a table UNIQUE
+    /// constraint; the name rides along so a violation can be reported the
+    /// way PostgreSQL reports it — against the index.
+    pub(super) async fn unique_index_sources(
         &self,
         table_name: &str,
         table_def: &TableDef,
-    ) -> Vec<Vec<usize>> {
+    ) -> Vec<(String, Vec<usize>)> {
         self.catalog
             .get_indexes(table_name)
             .await
@@ -1166,8 +1180,22 @@ impl Executor {
                     .iter()
                     .filter_map(|n| table_def.column_index(n))
                     .collect();
-                (idxs.len() == index.columns.len()).then_some(idxs)
+                (idxs.len() == index.columns.len()).then_some((index.name.clone(), idxs))
             })
+            .collect()
+    }
+
+    /// Column sets of `CREATE UNIQUE INDEX` indexes on the table. They enforce
+    /// uniqueness exactly like a table UNIQUE constraint.
+    pub(super) async fn unique_index_col_sets(
+        &self,
+        table_name: &str,
+        table_def: &TableDef,
+    ) -> Vec<Vec<usize>> {
+        self.unique_index_sources(table_name, table_def)
+            .await
+            .into_iter()
+            .map(|(_, idxs)| idxs)
             .collect()
     }
 
@@ -1214,10 +1242,19 @@ impl Executor {
             }
         }
 
-        for indices in self.unique_index_col_sets(table_name, table_def).await {
+        // Index names by column set, for the violation message: PostgreSQL
+        // names the constraint, and for `CREATE UNIQUE INDEX` the constraint
+        // IS the index. Table-level constraints keep their existing
+        // column-list message.
+        let mut index_names: std::collections::HashMap<Vec<usize>, String> =
+            std::collections::HashMap::new();
+        for (name, indices) in self.unique_index_sources(table_name, table_def).await {
             if !unique_col_sets.contains(&indices) {
-                unique_col_sets.push(indices);
+                unique_col_sets.push(indices.clone());
             }
+            // First name wins if a constraint already covers the same columns;
+            // the duplicate is reported against whichever set is checked first.
+            index_names.entry(indices).or_insert(name);
         }
 
         if unique_col_sets.is_empty() {
@@ -1231,6 +1268,21 @@ impl Executor {
         // wrong row — an UPDATE that rewrote a PK column to its own current
         // value reported a spurious duplicate.
         let mut existing_rows: Option<Vec<(usize, Row)>> = None;
+
+        // PostgreSQL reports `duplicate key value violates unique constraint
+        // "<name>"` — for an enforced index, the name is the index's.
+        let violation_label = |col_indices: &[usize]| -> String {
+            match index_names.get(col_indices) {
+                Some(name) => format!("\"{name}\""),
+                None => {
+                    let col_names: Vec<&str> = col_indices
+                        .iter()
+                        .map(|&i| table_def.columns[i].name.as_str())
+                        .collect();
+                    format!("on ({})", col_names.join(", "))
+                }
+            }
+        };
 
         for col_indices in &unique_col_sets {
             // Fast path for the common single-column unique/primary-key case.
@@ -1260,7 +1312,8 @@ impl Executor {
                         ) {
                             Ok(Some(rows)) if !rows.is_empty() => {
                                 return Err(ExecError::ConstraintViolation(format!(
-                                    "duplicate key value violates unique constraint on ({col_name})"
+                                    "duplicate key value violates unique constraint {}",
+                                    violation_label(col_indices)
                                 )));
                             }
                             // Empty result from an index-capable backend: no duplicate.
@@ -1289,13 +1342,9 @@ impl Executor {
                         continue;
                     }
                     if idx < existing.len() && existing[idx] == *new_val {
-                        let col_names: Vec<&str> = col_indices
-                            .iter()
-                            .map(|&i| table_def.columns[i].name.as_str())
-                            .collect();
                         return Err(ExecError::ConstraintViolation(format!(
-                            "duplicate key value violates unique constraint on ({})",
-                            col_names.join(", ")
+                            "duplicate key value violates unique constraint {}",
+                            violation_label(col_indices)
                         )));
                     }
                 }
@@ -1334,13 +1383,9 @@ impl Executor {
                     }
                 }
                 if equal {
-                    let col_names: Vec<&str> = col_indices
-                        .iter()
-                        .map(|&i| table_def.columns[i].name.as_str())
-                        .collect();
                     return Err(ExecError::ConstraintViolation(format!(
-                        "duplicate key value violates unique constraint on ({})",
-                        col_names.join(", ")
+                        "duplicate key value violates unique constraint {}",
+                        violation_label(col_indices)
                     )));
                 }
             }

@@ -6179,7 +6179,15 @@ impl Executor {
                 // NOT NULL / CHECK / FOREIGN KEY) for any table that has them, so a
                 // wire-level autocommit INSERT can never silently bypass a
                 // constraint. The fast path stays only for constraint-free tables.
-                let has_enforceable_constraints = !table_def.constraints.is_empty()
+                // UNIQUE indexes count: `check_unique_constraints` enforces
+                // `CREATE UNIQUE INDEX` exactly like a UNIQUE constraint, but only
+                // on the parsed path this gate falls back to (#69).
+                let has_unique_index = self
+                    .catalog
+                    .get_indexes_cached(table)
+                    .is_none_or(|idxs| idxs.iter().any(|idx| idx.unique));
+                let has_enforceable_constraints = has_unique_index
+                    || !table_def.constraints.is_empty()
                     || table_def.columns.iter().any(|col| !col.nullable);
                 if has_enforceable_constraints {
                     return None;
@@ -6278,17 +6286,34 @@ impl Executor {
                 // PRIMARY KEY / UNIQUE / FOREIGN KEY, or the table has any CHECK
                 // constraint — otherwise UPDATE silently bypassed CHECK and PK
                 // uniqueness (a duplicate PK could be produced by UPDATE).
+                // A unique INDEX's columns participate the same way: writing a
+                // key column through this path could produce a duplicate the
+                // full path's `check_unique_constraints` would have rejected
+                // (#69). `get_indexes_cached` returning None means the catalog
+                // could not be read — treat that as participation so the
+                // fallback is to the enforcing path, not around it.
                 {
                     let assigned: std::collections::HashSet<&str> =
                         assignments.iter().map(|(c, _)| c.as_str()).collect();
-                    let touches_keyed = table_def.constraints.iter().any(|c| match c {
-                        crate::catalog::TableConstraint::Check { .. } => true,
-                        crate::catalog::TableConstraint::PrimaryKey { columns, .. }
-                        | crate::catalog::TableConstraint::Unique { columns, .. }
-                        | crate::catalog::TableConstraint::ForeignKey { columns, .. } => {
-                            columns.iter().any(|col| assigned.contains(col.as_str()))
-                        }
-                    });
+                    let touches_unique_index =
+                        self.catalog.get_indexes_cached(table).is_none_or(|idxs| {
+                            idxs.iter().any(|idx| {
+                                idx.unique
+                                    && idx
+                                        .columns
+                                        .iter()
+                                        .any(|col| assigned.contains(col.as_str()))
+                            })
+                        });
+                    let touches_keyed = touches_unique_index
+                        || table_def.constraints.iter().any(|c| match c {
+                            crate::catalog::TableConstraint::Check { .. } => true,
+                            crate::catalog::TableConstraint::PrimaryKey { columns, .. }
+                            | crate::catalog::TableConstraint::Unique { columns, .. }
+                            | crate::catalog::TableConstraint::ForeignKey { columns, .. } => {
+                                columns.iter().any(|col| assigned.contains(col.as_str()))
+                            }
+                        });
                     if touches_keyed {
                         return None;
                     }
