@@ -1,0 +1,90 @@
+{
+  "status": "authored; statically inventoried only, not executed",
+  "files": [
+    {
+      "path": "README.md",
+      "bytes": 7320,
+      "sha256": "e3ed7d6996508189d61a2a98eaeac7eafa25a0042391af5e637e1c0ec3ef6065"
+    },
+    {
+      "path": "RUNBOOK.md",
+      "bytes": 10428,
+      "sha256": "e0d7d8a3155572e90f1faaaaa0ee14324a0ff12b2055d2440677a6a383198e3c"
+    },
+    {
+      "path": "compare_transcripts.py",
+      "bytes": 7541,
+      "sha256": "8249a8f682ac0d3367f4eae81cf1d5def42d331f5a191b399db092467d493171"
+    },
+    {
+      "path": "converted/api.go",
+      "bytes": 3243,
+      "sha256": "a10787b92cbfe2d46f49278f8f58a8fe2164da7e7f9296ea6ce53fad47144288"
+    },
+    {
+      "path": "converted/go.mod.tmpl",
+      "bytes": 233,
+      "sha256": "65080077f5b0561f7f3d26b949cee737735babfac8dae51eb299c4a1a0d8d0b1"
+    },
+    {
+      "path": "converted/neutron_corpus_converted_test.go",
+      "bytes": 22228,
+      "sha256": "68e0fe158d4c2474857306c405cecea04e77ff71290c3604cdfc085c2c8413ec"
+    },
+    {
+      "path": "converted/service.go",
+      "bytes": 26102,
+      "sha256": "40865231698a30b7658b99f7503db812daa463d5f590e5a5b3d59e8c708672a9"
+    },
+    {
+      "path": "corpus_harness.py",
+      "bytes": 1365,
+      "sha256": "3efba3d8336780407d965df749b779ec4ad886eddf8b289e916bf629997350d9"
+    },
+    {
+      "path": "original-native/neutron_corpus_native_test.go",
+      "bytes": 17112,
+      "sha256": "20428a7a9bcc9f4600ab5dbccec46b91539ddcdec974412ff2a629b2c5bf57d9"
+    },
+    {
+      "path": "prepare_converted.py",
+      "bytes": 4266,
+      "sha256": "6ad6a3fafee0ca1f5d2a92d741863ad6ed0d8ae6e3c45e21ae078059b67df593"
+    },
+    {
+      "path": "prepare_original.py",
+      "bytes": 3022,
+      "sha256": "2798dce2f8ebb3edb4e12c92652803dcda28bb1dca8099f1e85459397a2dabee"
+    },
+    {
+      "path": "run_comparison.py",
+      "bytes": 6250,
+      "sha256": "713cd5f65ae399f6b863d92f482f759250012689a74eaff578d02930004a1473"
+    },
+    {
+      "path": "scenario_oracle.py",
+      "bytes": 6819,
+      "sha256": "cc85f62e07612bf2fe0f9f5e6bf10d65fa5e10178e0b361c62c4bb2d8c4fcb66"
+    },
+    {
+      "path": "shared/neutron_corpus_scenario.json",
+      "bytes": 17429,
+      "sha256": "0218838dec8b61f1bc2fca556652c2c0d115a9e096e026adb46b0a96a0b8b90f"
+    },
+    {
+      "path": "shared/neutron_corpus_scenario_test.go.tmpl",
+      "bytes": 8074,
+      "sha256": "e01817f1cbcb2b4a6ee2b48e27e0963dfca103fd5d1cfc847c100243a9b78f7b"
+    },
+    {
+      "path": "verify_inventory.py",
+      "bytes": 6347,
+      "sha256": "d7f96fbda30f27bb6703e648ae1a439436027961d57c0269646be019ea2eea78"
+    },
+    {
+      "path": "verify_source.py",
+      "bytes": 1114,
+      "sha256": "a52188c3883c7ba3735187c63aeb2b9ef2f4caeb6863ba1b3d7cc89343254786"
+    }
+  ]
+}

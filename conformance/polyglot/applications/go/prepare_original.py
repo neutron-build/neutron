@@ -3,13 +3,15 @@
 
 This fetches public source; it does not build, install dependencies or execute
 application tests. Run native tests under the coordinator's serialized lease.
+The only additions are the authored harness files listed in reconstruction.json;
+every frozen product file and original test stays byte-identical.
 """
 import argparse
 import hashlib
 import json
 from pathlib import Path
 import subprocess
-import shutil
+from corpus_harness import ORIGINAL_DESTINATION, ORIGINAL_TEST, SCENARIO, render_shared, sha256_bytes
 from verify_source import ROOT, verify
 
 
@@ -37,12 +39,20 @@ def prepare(destination: Path) -> None:
         if git(directory, "rev-parse", "HEAD") != commit:
             raise ValueError("public corpus commit mismatch")
     count = verify(destination)
-    harness = ROOT / "original-native/neutron_corpus_native_test.go"
-    shutil.copyfile(harness, destination / "go-admin/app/admin/apis/neutron_corpus_native_test.go")
+    target = destination / "go-admin" / ORIGINAL_DESTINATION
+    harness = {
+        "neutron_corpus_native_test.go": ORIGINAL_TEST.read_bytes(),
+        "neutron_corpus_scenario_test.go": render_shared("apis"),
+        "neutron_corpus_scenario.json": SCENARIO.read_bytes(),
+    }
+    for name, data in harness.items():
+        if (target / name).exists():
+            raise ValueError("added harness file would overwrite an upstream file: " + name)
+        (target / name).write_bytes(data)
     evidence = {"source_files_verified": count, "original_module_sha256": hashlib.sha256(
         (destination / "go-admin/go.mod").read_bytes()).hexdigest(),
         "required_original_go": "1.27.1", "executed": False,
-        "added_native_harness_sha256": hashlib.sha256(harness.read_bytes()).hexdigest(),
+        "added_harness_sha256": {name: sha256_bytes(data) for name, data in sorted(harness.items())},
         "repositories": [{"repository": repo, "commit": commit} for repo, commit in sources]}
     (destination / "reconstruction.json").write_text(json.dumps(evidence, indent=2) + "\n")
     print(json.dumps(evidence))

@@ -9,9 +9,14 @@ remain beside the source. `source-manifest.json` records all ten selected
 corpus files and their frozen byte counts/SHA256; the dependency manifest
 records the additional original model/scope/DTO sources inspected for extraction.
 
-Status: original source is frozen and inspected. Unchanged application
-reconstruction, PostgreSQL baseline, Neutron conversion and independent native
-acceptance are still required. Source inspection is not an execution result.
+Status: original source is frozen and inspected (48 files, including the SysRole,
+SysMenu, SysApi and `role_dept.go` sources the baseline schema needs). The
+original-native harness, the bounded converted module (`converted/`), the shared
+scenario, an independent oracle and the comparison tooling are authored and
+statically checked only. Nothing has been run natively: no Go has been built,
+tested or vetted, so the converted module is not qualified and the application is
+not qualified. See `RUNBOOK.md` for the exact coordinator commands and the pass,
+partial and fail criteria.
 
 `python3 verify_source.py` verifies the selected and dependency bytes without
 executing Go. `python3 prepare_original.py /fresh/private/evidence/original`
@@ -53,9 +58,10 @@ This bounded conversion does not replace the whole go-admin product, its Gin/JWT
 runtime, every service operation, its frontend, or its Casbin policy engine.
 
 
-The preparer adds only `original-native/neutron_corpus_native_test.go` to the full
-original API test package; every frozen product file and original test stays
-byte-identical. That added native harness runs the actual original models,
+The preparer adds only authored harness files (`original-native/neutron_corpus_native_test.go`,
+the rendered `shared/neutron_corpus_scenario_test.go.tmpl` and
+`shared/neutron_corpus_scenario.json`) to the full original API test package;
+every frozen product file and original test stays byte-identical. That added native harness runs the actual original models,
 service `GetPage`, `Preload`/`AfterFind`, password hooks and API `Update`, including
 Casbin's original ordinary-role denial. It independently queries PostgreSQL for
 credential preservation, privilege fields, zero-live millisecond deletion and
@@ -76,3 +82,16 @@ ModelTime's actual core contract is now frozen: `soft_delete.DeletedAt` with
 `softDelete:milli`, an unsigned zero-live marker stored natively as bigint, plus
 CreatedAt/UpdatedAt and creator/updater fields. It is not nullable datetime soft
 deletion. The native harness confirms this schema and behavior before conversion.
+
+## Layout of the authored files
+
+| Path | Purpose |
+|---|---|
+| `original-native/` | Harness added to the unchanged original (baseline AutoMigrate now includes `SysRole`, so `sys_role_dept` exists). |
+| `shared/` | One scenario (seed, 32 queries, 17 operations) and one stdlib-only helper template used by both sides. |
+| `converted/` | Bounded Neutron conversion: `service.go`, `api.go` (request-owned `ormhttp` Scope), converted native test, `go.mod.tmpl`. |
+| `scenario_oracle.py` | Pure-Python reference for the scope matrix, transcribed from the frozen upstream sources. |
+| `prepare_original.py`, `prepare_converted.py` | Fresh-directory staging; neither edits the other nor a frozen file. |
+| `compare_transcripts.py`, `run_comparison.py` | Verdicts (pass/partial/fail) and the coordinator-only runner. |
+| `verify_source.py`, `verify_inventory.py`, `harness-manifest.json` | Static source, inventory and policy verification. |
+| `RUNBOOK.md` | Exact compute-2 commands and criteria. |
