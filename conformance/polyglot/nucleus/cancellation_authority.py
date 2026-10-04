@@ -148,6 +148,12 @@ def main() -> None:
         first_line = (str(error).splitlines() or [""])[0].replace(password, "[redacted]")
         report["failureMessage"] = re.sub(r"\w+://\S+", "[url]", first_line)[:300]
         report["factsBeforeFailure"] = sorted(facts)
+        try:
+            rows = admin.execute(sql.SQL("SELECT rolname, rolcanlogin, rolsuper FROM pg_roles WHERE rolname LIKE {}").format(
+                sql.Literal(prefix + "%"))).fetchall()
+            report["rolesAtFailure"] = [[str(row[0]), bool(row[1]), bool(row[2])] for row in rows]
+        except Exception as inspect_error:
+            report["rolesAtFailureError"] = type(inspect_error).__name__
         raise
     finally:
         cleanup_failed = False
