@@ -5,8 +5,8 @@ Multi-model database engine. One pgwire endpoint, multiple data models, unified 
 SQL, Key-Value, Columnar, Vector, Timeseries, Document, Full-Text Search, Graph, Geo, Blob, Datalog, Streams, CDC and Pub/Sub — all reached through standard SQL function calls over a single PostgreSQL-compatible connection. No secondary ports, no secondary protocols, no secondary clients. The RESP (Redis) wire protocol is also supported for KV.
 
 Current size, re-measured by `scripts/metrics.sh` on every doc check:
-360,491 lines of Rust across 315 files, with 5,438 declared tests
-(4,925 unit + 459 integration). Declared counts are static declarations, not
+375,554 lines of Rust across 335 files, with 5,625 declared tests
+(5,165 unit + 460 integration). Declared counts are static declarations, not
 executed-run claims; the current full library run is recorded in
 [DATABASE_COMPLETION.md](DATABASE_COMPLETION.md).
 

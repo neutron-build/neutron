@@ -1659,3 +1659,280 @@ async fn test_unique_index_created_after_rows_is_enforced() {
         "building a unique index over existing duplicates must fail"
     );
 }
+
+// ======================================================================
+// CREATE UNIQUE INDEX write-path enforcement (#69)
+// ======================================================================
+// v1.2.1 enforced uniqueness only at CREATE time and (unbeknownst to each
+// other) on the parsed executor path: a wire-level autocommit INSERT or
+// point UPDATE took the SQL OLTP fast path, which writes straight to
+// storage and declined only for tables with table-level constraints.
+// A table whose uniqueness came from CREATE UNIQUE INDEX had none, so
+// duplicates landed on every served engine (#69). These tests pin the
+// write-path behavior on both the default engine and mergetree.
+
+/// SQLSTATE an error surfaces as on the wire, so tests assert what a client
+/// actually branches on (23505 for unique violations).
+fn unique_sqlstate(err: &ExecError) -> String {
+    use crate::wire::error_codec::{ErrorCodec, PgWireErrorCodec};
+    let codec = PgWireErrorCodec;
+    codec.code_to_string(codec.encode(err).code)
+}
+
+async fn count_of(ex: &Executor, sql: &str) -> i64 {
+    let results = exec(ex, sql).await;
+    match scalar(&results[0]) {
+        Value::Int32(n) => i64::from(*n),
+        Value::Int64(n) => *n,
+        other => panic!("expected an int count, got {other:?}"),
+    }
+}
+
+/// The exact repro from #69: duplicate-key INSERTs must be rejected with
+/// SQLSTATE 23505 and the PostgreSQL message shape naming the index, on the
+/// default engine and on mergetree.
+#[tokio::test]
+async fn unique_index_rejects_duplicate_insert_on_both_engines() {
+    for (table, engine) in [
+        ("ut", ""),
+        ("ut2", " engine=mergetree ORDER BY (k)"),
+    ] {
+        let ex = test_executor();
+        exec(&ex, &format!("CREATE TABLE {table} (k TEXT, v TEXT){engine}")).await;
+        exec(&ex, &format!("CREATE UNIQUE INDEX {table}_k ON {table} (k)")).await;
+        exec(&ex, &format!("INSERT INTO {table} VALUES ('a','1')")).await;
+
+        let err = ex
+            .execute(&format!("INSERT INTO {table} VALUES ('a','2')"))
+            .await
+            .expect_err("duplicate-key INSERT must be rejected");
+        assert_eq!(
+            unique_sqlstate(&err),
+            "23505",
+            "{table}: wrong SQLSTATE for {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("unique constraint \"{table}_k\"")),
+            "{table}: message must name the index, got: {msg}"
+        );
+        assert_eq!(
+            count_of(&ex, &format!("SELECT count(*) FROM {table}")).await,
+            1,
+            "{table}: a rejected duplicate must not land"
+        );
+    }
+}
+
+/// Default NULLS DISTINCT semantics: several NULLs are not duplicates of
+/// each other, on both engines.
+#[tokio::test]
+async fn unique_index_allows_multiple_nulls() {
+    for (table, engine) in [
+        ("utn", ""),
+        ("utn2", " engine=mergetree ORDER BY (k)"),
+    ] {
+        let ex = test_executor();
+        exec(
+            &ex,
+            &format!("CREATE TABLE {table} (k INT, v TEXT){engine}"),
+        )
+        .await;
+        exec(&ex, &format!("CREATE UNIQUE INDEX {table}_k ON {table} (k)")).await;
+        exec(
+            &ex,
+            &format!("INSERT INTO {table} VALUES (NULL,'1'), (NULL,'2'), (1,'a')"),
+        )
+        .await;
+        // A NULL still does not conflict with a NULL landing later.
+        exec(&ex, &format!("INSERT INTO {table} VALUES (NULL,'3')")).await;
+        assert_eq!(
+            count_of(&ex, &format!("SELECT count(*) FROM {table}")).await,
+            4,
+            "{table}: NULLS DISTINCT must allow repeated NULLs"
+        );
+    }
+}
+
+/// An UPDATE that moves a row onto an existing key must be rejected and
+/// leave the table unchanged; an UPDATE that keeps the row's own key (even
+/// by rewriting it to the same value) must pass.
+#[tokio::test]
+async fn unique_index_update_collision_rejected() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE uut (k TEXT, v TEXT)").await;
+    exec(&ex, "CREATE UNIQUE INDEX uut_k ON uut (k)").await;
+    exec(&ex, "INSERT INTO uut VALUES ('a','1'), ('b','2')").await;
+
+    let err = ex
+        .execute("UPDATE uut SET k='a' WHERE k='b'")
+        .await
+        .expect_err("UPDATE onto an existing key must be rejected");
+    assert_eq!(unique_sqlstate(&err), "23505");
+    assert_eq!(
+        count_of(&ex, "SELECT count(*) FROM uut").await,
+        2,
+        "failed UPDATE must leave the table unchanged"
+    );
+    let got = exec(&ex, "SELECT v FROM uut ORDER BY v").await;
+    assert_eq!(
+        rows(&got[0]),
+        &vec![vec![Value::Text("1".into())], vec![Value::Text("2".into())]]
+    );
+
+    // Rewriting a row's own key to its current value is not a collision.
+    exec(&ex, "UPDATE uut SET k='a', v='1x' WHERE k='a'").await;
+    assert_eq!(count_of(&ex, "SELECT count(*) FROM uut").await, 2);
+}
+
+/// A failed duplicate INSERT must not poison the table: later inserts of
+/// other keys still land.
+#[tokio::test]
+async fn unique_index_failed_dup_then_other_insert_works() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE utf (k TEXT, v TEXT)").await;
+    exec(&ex, "CREATE UNIQUE INDEX utf_k ON utf (k)").await;
+    exec(&ex, "INSERT INTO utf VALUES ('a','1')").await;
+    assert!(ex.execute("INSERT INTO utf VALUES ('a','2')").await.is_err());
+    exec(&ex, "INSERT INTO utf VALUES ('b','9')").await;
+    assert_eq!(count_of(&ex, "SELECT count(*) FROM utf").await, 2);
+    // And the rejected key is still occupiable by no one else.
+    assert!(ex.execute("INSERT INTO utf VALUES ('a','3')").await.is_err());
+}
+
+/// Uniqueness across the transactional boundary the way the engine's DML
+/// model allows: a committed key blocks later inserts; a rolled-back key
+/// never existed; a duplicate inside one transaction is rejected and, being
+/// the transaction's abort point, discards its own rows at COMMIT. DDL
+/// itself is not transactional here, so the index is created outside the
+/// blocks.
+#[tokio::test]
+async fn unique_index_respects_commit_and_rollback() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE utx (k TEXT, v TEXT)").await;
+    exec(&ex, "CREATE UNIQUE INDEX utx_k ON utx (k)").await;
+
+    // Clean commit: the key becomes durable and blocks everyone.
+    exec(&ex, "BEGIN").await;
+    exec(&ex, "INSERT INTO utx VALUES ('c','1')").await;
+    exec(&ex, "COMMIT").await;
+    let err = ex
+        .execute("INSERT INTO utx VALUES ('c','3')")
+        .await
+        .expect_err("committed key must block later inserts");
+    assert_eq!(unique_sqlstate(&err), "23505");
+
+    // In-transaction duplicate: rejected, and as the transaction's abort
+    // point it takes the transaction's own rows with it.
+    exec(&ex, "BEGIN").await;
+    exec(&ex, "INSERT INTO utx VALUES ('d','1')").await;
+    let err = ex
+        .execute("INSERT INTO utx VALUES ('d','2')")
+        .await
+        .expect_err("in-transaction duplicate must be rejected");
+    assert_eq!(unique_sqlstate(&err), "23505");
+    exec(&ex, "COMMIT").await;
+    exec(&ex, "INSERT INTO utx VALUES ('d','3')").await;
+    assert_eq!(
+        count_of(&ex, "SELECT count(*) FROM utx").await,
+        2,
+        "the aborted transaction's rows must be gone"
+    );
+
+    // Rollback: the key never became durable, so it is free again.
+    exec(&ex, "BEGIN").await;
+    exec(&ex, "INSERT INTO utx VALUES ('r','1')").await;
+    exec(&ex, "ROLLBACK").await;
+    exec(&ex, "INSERT INTO utx VALUES ('r','2')").await;
+    assert_eq!(count_of(&ex, "SELECT count(*) FROM utx").await, 3);
+}
+
+/// COPY FROM STDIN goes through the same INSERT machinery: a payload key
+/// duplicating a stored row is rejected, and a payload duplicating itself
+/// is rejected without landing any of its rows.
+#[tokio::test]
+async fn unique_index_enforced_on_copy() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE utc (k TEXT, v TEXT)").await;
+    exec(&ex, "CREATE UNIQUE INDEX utc_k ON utc (k)").await;
+    exec(&ex, "INSERT INTO utc VALUES ('a','1')").await;
+
+    let err = ex
+        .execute("COPY utc FROM STDIN;\na\t2\n\\.")
+        .await
+        .expect_err("COPY duplicating a stored key must be rejected");
+    assert_eq!(unique_sqlstate(&err), "23505");
+
+    let err = ex
+        .execute("COPY utc FROM STDIN;\nx\t1\tx\t2\n\\.")
+        .await
+        .expect_err("COPY duplicating itself must be rejected");
+    assert_eq!(unique_sqlstate(&err), "23505");
+    assert_eq!(
+        count_of(&ex, "SELECT count(*) FROM utc").await,
+        1,
+        "a rejected COPY must land none of its rows"
+    );
+
+    exec(&ex, "COPY utc FROM STDIN;\nb\t1\n\\.").await;
+    assert_eq!(count_of(&ex, "SELECT count(*) FROM utc").await, 2);
+}
+
+/// The wire-level SQL OLTP fast path writes straight to storage, so it must
+/// decline tables whose uniqueness comes from an index — the fallback is the
+/// parsed INSERT path that enforces (#69 was exactly this gap).
+#[tokio::test]
+async fn sql_fast_path_declines_unique_index_tables() {
+    use crate::wire::kv_fast_path::try_parse_sql_fast_path;
+
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE fp (k TEXT, v TEXT)").await;
+    exec(&ex, "CREATE UNIQUE INDEX fp_k ON fp (k)").await;
+
+    let insert = try_parse_sql_fast_path("INSERT INTO fp VALUES ('a','1')")
+        .expect("fast path should recognise a simple INSERT");
+    assert!(
+        ex.execute_sql_fast_path(0, &insert).await.is_none(),
+        "fast-path INSERT must decline a unique-indexed table"
+    );
+
+    let update_key = try_parse_sql_fast_path("UPDATE fp SET k = 'b' WHERE k = 'a'")
+        .expect("fast path should recognise a point UPDATE");
+    assert!(
+        ex.execute_sql_fast_path(0, &update_key).await.is_none(),
+        "fast-path UPDATE assigning an indexed column must decline"
+    );
+}
+
+/// The fast path must not over-decline: with a unique index on k, an UPDATE
+/// that only touches OTHER columns (v) still takes the fast path, and a
+/// constraint-free table keeps the fast-path INSERT.
+#[tokio::test]
+async fn sql_fast_path_keeps_non_key_writes() {
+    use crate::wire::kv_fast_path::try_parse_sql_fast_path;
+
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE fpk (k TEXT, v TEXT)").await;
+    exec(&ex, "CREATE UNIQUE INDEX fpk_k ON fpk (k)").await;
+    exec(&ex, "INSERT INTO fpk VALUES ('a','1')").await;
+
+    let update_val = try_parse_sql_fast_path("UPDATE fpk SET v = '2' WHERE k = 'a'")
+        .expect("fast path should recognise a point UPDATE");
+    assert!(
+        ex.execute_sql_fast_path(0, &update_val)
+            .await
+            .expect("non-key UPDATE should stay on the fast path")
+            .is_ok(),
+        "UPDATE of a non-indexed column must keep the fast path"
+    );
+
+    exec(&ex, "CREATE TABLE fpk2 (a INT, b TEXT)").await;
+    let plain = try_parse_sql_fast_path("INSERT INTO fpk2 VALUES (1, 'x')")
+        .expect("fast path should recognise a simple INSERT");
+    assert!(
+        ex.execute_sql_fast_path(0, &plain)
+            .await
+            .expect("constraint-free table should stay on the fast path")
+            .is_ok()
+    );
+}
