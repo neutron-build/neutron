@@ -26,9 +26,12 @@ def export_events(observer: QueryObserver,logger: Any,*,tracer: Any=None,meter: 
     Tracer/meter are optional OpenTelemetry API objects; import their SDK only in
     the consuming application. Telemetry failures cannot change a DB outcome.
     """
-    counter=None if meter is None else meter.create_counter('neutron.orm.operations')
-    duration=None if meter is None else meter.create_histogram('neutron.orm.duration',unit='s')
-    events=observer.drain();failures=0
+    events=observer.drain();failures=0;counter=duration=None
+    if meter is not None:
+        try: counter=meter.create_counter('neutron.orm.operations')
+        except Exception: failures+=1
+        try: duration=meter.create_histogram('neutron.orm.duration',unit='s')
+        except Exception: failures+=1
     for event in events:
         attributes=asdict(event)
         labels={'operation':event.operation,'outcome':event.outcome}
@@ -52,6 +55,11 @@ def _refusal(error: OrmError) -> JSONResponse:
     return JSONResponse({'sqlstate':error.sqlstate},status_code=409 if error.sqlstate else 503)
 
 
+async def _json(request: Request) -> Any:
+    try: return await request.json()
+    except ValueError: return None
+
+
 def _record(body: Any) -> Record | None:
     if not isinstance(body,dict) or type(body.get('id')) is not int or type(body.get('label')) is not str: return None
     return Record(body['id'],body['label'])
@@ -69,7 +77,7 @@ def create_async_app(url: str,table: Table,observer: QueryObserver,*,grace_secon
         try: yield
         finally: await app.state.requests.shutdown(grace_seconds=grace_seconds)
     async def create(request: Request):
-        obj=_record(await request.json())
+        obj=_record(await _json(request))
         if obj is None: return JSONResponse({},status_code=400)
         try:
             async with request.app.state.requests.session() as session: session.add(mapping,obj)
@@ -100,7 +108,7 @@ def create_sync_app(url: str,table: Table,observer: QueryObserver) -> Starlette:
     async def create(request: Request):
         # Parse the JSON body on the event loop; keep every sync Session call in
         # one worker thread. Bound secrets never become URL query parameters.
-        return await run_in_threadpool(write_record,await request.json())
+        return await run_in_threadpool(write_record,await _json(request))
     def get(request: Request):
         try:
             with requests.session() as session: obj=session.get(mapping,request.path_params['id'])
