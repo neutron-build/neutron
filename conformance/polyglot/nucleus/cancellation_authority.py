@@ -26,6 +26,16 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def plain_role(name: str) -> sql.SQL:
+    # Nucleus keeps identifier quotes in a role name created with a quoted
+    # identifier, so a login by the bare name cannot find it. The generated
+    # names are plain lowercase identifiers, so emit them unquoted (valid and
+    # identical on PostgreSQL) and refuse anything else.
+    if re.fullmatch(r"[a-z_][a-z0-9_]*", name) is None:
+        raise ValueError("generated role name is not a plain identifier")
+    return sql.SQL(name)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", choices=("postgres", "nucleus"), required=True)
@@ -96,7 +106,7 @@ def main() -> None:
                 sql.SQL(" BYPASSRLS") if key == "other" else sql.SQL("")
             )
             admin.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}{}").format(
-                sql.Identifier(role), sql.Literal(password), attributes
+                plain_role(role), sql.Literal(password), attributes
             ))
             created.append(role)
         target, peer, other, privileged = connect("owner"), connect("owner"), connect("other"), connect("super")
@@ -128,7 +138,7 @@ def main() -> None:
         assert peer.execute("SELECT 1").fetchone()[0] == 1
         facts["selfCancellationAndReuse"] = True
         if args.engine == "postgres":
-            admin.execute(sql.SQL("GRANT pg_signal_backend TO {}").format(sql.Identifier(roles["other"])))
+            admin.execute(sql.SQL("GRANT pg_signal_backend TO {}").format(plain_role(roles["other"])))
             assert cancel(other, pid) is True
             idle_reuse(target)
             denied(other, privileged.info.backend_pid)
@@ -164,7 +174,7 @@ def main() -> None:
                 cleanup_failed = True
         for role in reversed(created):
             try:
-                admin.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
+                admin.execute(sql.SQL("DROP ROLE {}").format(plain_role(role)))
             except Exception:
                 cleanup_failed = True
         try:
