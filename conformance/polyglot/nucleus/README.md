@@ -80,7 +80,9 @@ their known gaps against the Python entry point and the qualifier commands. Each
 qualifier needs a fresh installed or freshly built consumer artifact, the exact
 Nucleus binary file and SHA-256, and URL environment variable names; its report
 is not binary attestation, so the coordinator must bind the running endpoint
-process to that binary. Mandatory work that remains open: all native runs (five
+process to that binary; [NP01_RUNBOOK.md](NP01_RUNBOOK.md) documents the
+`run_np01_qualifiers.py` orchestrator that starts and binds its own engine.
+Mandatory work that remains open: all native runs (five
 fresh clients against PostgreSQL 17 control and the exact Nucleus binary),
 independent review, NP02-NP06, and every excluded feature family. The
 assessment above, `profile.json` and its assessed engine tree are intentionally
