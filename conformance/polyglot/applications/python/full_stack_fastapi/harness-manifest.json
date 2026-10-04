@@ -1,0 +1,125 @@
+{
+  "status": "authored; statically inventoried only, not executed",
+  "files": [
+    {
+      "path": "README.md",
+      "bytes": 9464,
+      "sha256": "301dd24a189467499a701dcedb19ec2d67c136e44f1133b66fd01917c37c9491"
+    },
+    {
+      "path": "RUNBOOK.md",
+      "bytes": 9572,
+      "sha256": "9ff2527196d7d863716e5b961418334f8b0220bd7aecdf4edd96281f8fad1e6f"
+    },
+    {
+      "path": "compare_freeze.py",
+      "bytes": 1238,
+      "sha256": "910c852560855cb044d36f2d5134d7a1143a4d3794b69b1d2d3ad6c7dc726472"
+    },
+    {
+      "path": "compare_results.py",
+      "bytes": 4767,
+      "sha256": "019500bbc28e6d969e18113dda63765755acf884c2533c6f791814d693122843"
+    },
+    {
+      "path": "converted/app/api/deps.py",
+      "bytes": 2179,
+      "sha256": "277989de712d55a2520f61c54c6a25b581936aaf27b137e5e4d554cf5101fc23"
+    },
+    {
+      "path": "converted/app/api/routes/items.py",
+      "bytes": 3731,
+      "sha256": "2480678d1ec846b475d9023b317ba6ed0701e2169053b70ea74b5f8c5e50018e"
+    },
+    {
+      "path": "converted/app/api/routes/login.py",
+      "bytes": 4719,
+      "sha256": "af165581e7035e3900e6ec9c887a0be2cfc449a26265a0608cf4d8c4d65e0cdc"
+    },
+    {
+      "path": "converted/app/api/routes/private.py",
+      "bytes": 1218,
+      "sha256": "0dfbf254e5598fa7f943a0b904b5b0df606d50e64d1cdcb02a445d9f30f7ce63"
+    },
+    {
+      "path": "converted/app/api/routes/users.py",
+      "bytes": 7961,
+      "sha256": "c9b3a171b2d51139faa9a8c9a417a85a7baf6bca6eb63664649a45bdf089db0e"
+    },
+    {
+      "path": "converted/app/core/db.py",
+      "bytes": 821,
+      "sha256": "b1c324d1d2ee4090b4175d84d682f7b7b6a7d08b43c6cf65ff1da202511fc0dd"
+    },
+    {
+      "path": "converted/app/crud.py",
+      "bytes": 3874,
+      "sha256": "90603fed2a878b0bb0ef09eb645dcc0da2ecaa8ca0899f081c1116a7211dff71"
+    },
+    {
+      "path": "converted/app/initial_data.py",
+      "bytes": 607,
+      "sha256": "593288fdb5da310d79bbcee61a5db38524f0d1153c8ad9dc291c6193d9c40ec9"
+    },
+    {
+      "path": "converted/app/persistence.py",
+      "bytes": 7302,
+      "sha256": "da4c721fe35d85f2a9c266f36451d24b058294371377d6d37ac25df4c1a6062b"
+    },
+    {
+      "path": "converted/tests/conftest.py",
+      "bytes": 1635,
+      "sha256": "a39ac885373c23020f3c29c1e9a987ddd1c2d44a0cbe7c52dc03b56ceba51ea6"
+    },
+    {
+      "path": "harness_lib.py",
+      "bytes": 3860,
+      "sha256": "ff2da426c5dcbb1670c36e7f8003adf609c8fae0dc9a56d1496b880b8e4d7765"
+    },
+    {
+      "path": "prepare_converted.py",
+      "bytes": 3983,
+      "sha256": "3a0eaa4612b049ef782a0fba0755b94d7c744dcfdf008fb90b554e697b5d5bf2"
+    },
+    {
+      "path": "prepare_original.py",
+      "bytes": 2617,
+      "sha256": "4da33eeaf22909b4272624c0d8b4c5742d29220bcdd14b9dd1adc483b5c0a77e"
+    },
+    {
+      "path": "rewrites.py",
+      "bytes": 3624,
+      "sha256": "5a50972e4a21ae834b2873a38fa50e0f3c3a18b5606badad941fddd9aaa4c113"
+    },
+    {
+      "path": "run_comparison.py",
+      "bytes": 7490,
+      "sha256": "0482c50b4b0331727e1511e8dc9d035237414f4a47a13562b7e55b24df657978"
+    },
+    {
+      "path": "shared/catalog_check.py",
+      "bytes": 3130,
+      "sha256": "c0633d810142b2dfdc02c3af0b5ab5c37aca1e53f79a4794f71e101f220a00e7"
+    },
+    {
+      "path": "shared/scenario_test_source.py",
+      "bytes": 16349,
+      "sha256": "d7932b1cf01f78f65647624ec8a9fa340a6c4ab4c79af824b6643b52c98e5107"
+    },
+    {
+      "path": "smtp_sink.py",
+      "bytes": 1337,
+      "sha256": "52881eb021b1a39152b2f8a76adb44b6979f9378286a88b95051b0d0d5043c0e"
+    },
+    {
+      "path": "verify_inventory.py",
+      "bytes": 6348,
+      "sha256": "49d5e748462b2ed73c0a7b309b27984823d00d7f060bdfff8a7470852dc20ef9"
+    },
+    {
+      "path": "verify_source.py",
+      "bytes": 1252,
+      "sha256": "6df6fc294761ae32bc9968fb317cf53685f9a41edb83216d7f60894fedb737da"
+    }
+  ]
+}
