@@ -53,9 +53,9 @@ mod test_cluster_routing; // A14/A15: both execution entries route + fail closed
 mod test_collections;
 mod test_column_writes; // X10: generated/identity columns, deferrable FKs, DEFAULT VALUES, varchar(n)
 mod test_copy; // COPY FROM STDIN payload reconstruction
-mod test_cursors; // DECLARE/FETCH/CLOSE: budgets, transaction lifetime, FETCH position semantics
 mod test_cross_model;
 mod test_cross_model_atomicity; // S63 slice 1: SQL+streams discard-on-no-commit-record
+mod test_cursors; // DECLARE/FETCH/CLOSE: budgets, transaction lifetime, FETCH position semantics
 mod test_ddl;
 mod test_dml;
 mod test_doc_collections; // GO-055: `collection` must isolate, not decorate
@@ -79,9 +79,9 @@ mod test_memory_budget; // T1.2: query memory-budget enforcement (gating)
 mod test_meta_persistence;
 mod test_module_wiring;
 mod test_multimodel;
-mod test_numeric_exact; // NP03: NUMERIC text, arithmetic and aggregates are exact-or-refused with PostgreSQL SQLSTATEs
 mod test_mv_writetime; // Phase 3: Write-time materialized view refresh
 mod test_mvcc_gc_compaction; // NU-01 tail compaction: reclaim dead tails, ids never reused (WAL v2 subset)
+mod test_numeric_exact; // NP03: NUMERIC text, arithmetic and aggregates are exact-or-refused with PostgreSQL SQLSTATEs
 mod test_observability; // M11: observability ledger surfaces (CHECKPOINT, WAL/txn state, health)
 mod test_password_lifecycle; // N16: password creation, rotation, expiry
 mod test_pk_write_cost;
