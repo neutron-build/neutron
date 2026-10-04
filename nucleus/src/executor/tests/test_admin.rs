@@ -43,6 +43,8 @@ async fn test_declare_fetch_close_cursor() {
     exec(&ex, "INSERT INTO cur_t VALUES (1, 'alice')").await;
     exec(&ex, "INSERT INTO cur_t VALUES (2, 'bob')").await;
     exec(&ex, "INSERT INTO cur_t VALUES (3, 'charlie')").await;
+    // A non-holdable cursor only exists inside a transaction block.
+    exec(&ex, "BEGIN").await;
     exec(&ex, "DECLARE my_cursor CURSOR FOR SELECT * FROM cur_t").await;
 
     // Fetch 2 rows
@@ -61,6 +63,7 @@ async fn test_declare_fetch_close_cursor() {
         ExecResult::Command { tag, .. } => assert_eq!(tag, "CLOSE"),
         _ => panic!("expected command"),
     }
+    exec(&ex, "COMMIT").await;
 }
 
 // ======================================================================

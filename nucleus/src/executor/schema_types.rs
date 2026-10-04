@@ -115,9 +115,24 @@ pub(crate) enum Privilege {
 #[derive(Debug)]
 pub(crate) struct CursorDef {
     pub name: String,
+    /// The fully materialized result, taken from the DECLARE-time snapshot.
     pub rows: Vec<Row>,
     pub columns: Vec<(String, DataType)>,
+    /// PostgreSQL cursor position: 0 is before the first row, `1..=rows.len()`
+    /// is on that row, `rows.len() + 1` is after the last row.
     pub position: usize,
+    /// Declared `NO SCROLL`: any fetch that does not move strictly forward is
+    /// refused (55000). An unspecified or `SCROLL` cursor may move both ways
+    /// because the rows are held in memory.
+    pub no_scroll: bool,
+    /// Declared `WITH HOLD`: survives COMMIT. Every other cursor is closed
+    /// when its transaction ends.
+    pub hold: bool,
+    /// Declared inside the transaction that is still open. A `WITH HOLD`
+    /// cursor loses this at COMMIT and is dropped by ROLLBACK while it is set.
+    pub opened_in_txn: bool,
+    /// Estimated heap bytes held by `rows`, as charged against the budget.
+    pub bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]

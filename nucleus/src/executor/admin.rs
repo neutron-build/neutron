@@ -1269,6 +1269,19 @@ impl Executor {
     // Cursors
     // ========================================================================
 
+    /// DECLARE [BINARY] cursor [NO] SCROLL CURSOR [WITH | WITHOUT HOLD] FOR query.
+    ///
+    /// The query runs to completion here and its rows are held in the session,
+    /// so a cursor is a materialized snapshot taken at DECLARE, not a lazy scan.
+    /// What bounds it:
+    /// - the per-session cursor count (checked before any work is done);
+    /// - the per-cursor row budget, applied as a row limit on the query itself
+    ///   so a sort-free scan stops early, and re-checked on the result;
+    /// - the per-cursor byte budget, checked on the result before it is stored
+    ///   (the executor hands back a whole `Vec<Row>`, so bytes cannot be
+    ///   enforced mid-flight);
+    /// - transaction lifetime: outside a transaction block only WITH HOLD is
+    ///   accepted, and every other cursor is closed at COMMIT or ROLLBACK.
     pub(super) async fn execute_declare_cursor(
         &self,
         stmt: &ast::Declare,
@@ -1284,27 +1297,68 @@ impl Executor {
             .as_ref()
             .ok_or_else(|| ExecError::Unsupported("DECLARE requires FOR query".into()))?;
 
-        let result = self.execute_query(*query.clone()).await?;
+        let hold = stmt.hold == Some(true);
+        let no_scroll = stmt.scroll == Some(false);
+        let sess = self.current_session();
+
+        // PostgreSQL drops a non-holdable cursor at transaction end, so
+        // outside a transaction block it could never be fetched.
+        let in_txn = sess.txn_active.load(std::sync::atomic::Ordering::SeqCst);
+        if !in_txn && !hold {
+            return Err(ExecError::Runtime(
+                "DECLARE CURSOR can only be used in transaction blocks".into(),
+            ));
+        }
+
+        // Per-session cursor limit: cursors materialize their whole row set
+        // and live until CLOSE, transaction end or disconnect — the most
+        // memory-dense per-session object there is. Replacement of an
+        // existing name does not grow the map and is always allowed. Refused
+        // with the `too_many_cursors` wording the wire codec maps to SQLSTATE
+        // 54000 (program_limit_exceeded). Checked before the query runs so a
+        // refused DECLARE costs nothing.
+        {
+            let cursors = sess.cursors.read().await;
+            let limit = self
+                .max_cursors_per_session
+                .load(std::sync::atomic::Ordering::Acquire);
+            if !cursors.contains_key(&cursor_name) && cursors.len() >= limit {
+                return Err(ExecError::Unsupported(format!(
+                    "too_many_cursors: session already has {} open cursors (limit \
+                     {limit}); CLOSE one before declaring another, or raise \
+                     limits.max_cursors_per_session",
+                    cursors.len()
+                )));
+            }
+        }
+
+        let max_rows = self
+            .max_cursor_rows
+            .load(std::sync::atomic::Ordering::Acquire);
+        let max_bytes = self
+            .max_cursor_bytes
+            .load(std::sync::atomic::Ordering::Acquire);
+
+        let mut capped: ast::Query = (**query).clone();
+        cap_cursor_query(&mut capped, max_rows);
+        let result = self.execute_query(capped).await?;
         match result {
             ExecResult::Select { columns, rows } => {
-                let sess = self.current_session();
-                // Per-session cursor limit: cursors materialize their whole
-                // row set and live until CLOSE or disconnect — the most
-                // memory-dense per-session object there is. Replacement of an
-                // existing name does not grow the map and is always allowed.
-                // Refused with the `too_many_cursors` wording the wire codec
-                // maps to SQLSTATE 54000 (program_limit_exceeded).
-                {
-                    let cursors = sess.cursors.read().await;
-                    let limit = self
-                        .max_cursors_per_session
-                        .load(std::sync::atomic::Ordering::Acquire);
-                    if !cursors.contains_key(&cursor_name) && cursors.len() >= limit {
+                if rows.len() > max_rows {
+                    return Err(ExecError::Unsupported(format!(
+                        "too_many_cursor_rows: DECLARE would materialize more than {max_rows} \
+                         rows (limit {max_rows}); add a LIMIT, page with a keyset query, or \
+                         raise limits.max_cursor_rows"
+                    )));
+                }
+                let mut bytes = 0usize;
+                for row in &rows {
+                    bytes = bytes.saturating_add(cursor_row_bytes(row));
+                    if bytes > max_bytes {
                         return Err(ExecError::Unsupported(format!(
-                            "too_many_cursors: session already has {} open cursors (limit \
-                             {limit}); CLOSE one before declaring another, or raise \
-                             limits.max_cursors_per_session",
-                            cursors.len()
+                            "too_many_cursor_bytes: DECLARE would materialize more than \
+                             {max_bytes} bytes (limit {max_bytes}); add a LIMIT, select fewer \
+                             columns, or raise limits.max_cursor_bytes"
                         )));
                     }
                 }
@@ -1316,6 +1370,10 @@ impl Executor {
                         rows,
                         columns,
                         position: 0,
+                        no_scroll,
+                        hold,
+                        opened_in_txn: in_txn,
+                        bytes,
                     },
                 );
                 Ok(ExecResult::Command {
@@ -1334,27 +1392,17 @@ impl Executor {
         cursor_name: &str,
         direction: &ast::FetchDirection,
     ) -> Result<ExecResult, ExecError> {
-        let count = match direction {
-            ast::FetchDirection::Count {
-                limit: ast::Value::Number(n, _),
-            } => n.parse::<usize>().unwrap_or(1),
-            ast::FetchDirection::Next | ast::FetchDirection::Forward { .. } => 1,
-            ast::FetchDirection::All | ast::FetchDirection::ForwardAll => usize::MAX,
-            ast::FetchDirection::First => 1,
-            _ => 1,
-        };
+        // Parsed before the cursor is looked up so a malformed count is
+        // reported as such even for a cursor that does not exist.
+        let movement = cursor_move(direction)?;
 
         let sess = self.current_session();
         let mut cursors = sess.cursors.write().await;
-        let cursor = cursors
-            .get_mut(cursor_name)
-            .ok_or_else(|| ExecError::Unsupported(format!("cursor '{cursor_name}' not found")))?;
+        let cursor = cursors.get_mut(cursor_name).ok_or_else(|| {
+            ExecError::Runtime(format!("cursor \"{cursor_name}\" does not exist"))
+        })?;
 
-        let start = cursor.position;
-        let end = start.saturating_add(count).min(cursor.rows.len());
-        let fetched: Vec<Row> = cursor.rows[start..end].to_vec();
-        cursor.position = end;
-
+        let fetched = apply_cursor_move(cursor, movement)?;
         Ok(ExecResult::Select {
             columns: cursor.columns.clone(),
             rows: fetched,
@@ -1368,7 +1416,12 @@ impl Executor {
         let sess = self.current_session();
         match cursor {
             ast::CloseCursor::Specific { name } => {
-                sess.cursors.write().await.remove(&name.value);
+                if sess.cursors.write().await.remove(&name.value).is_none() {
+                    return Err(ExecError::Runtime(format!(
+                        "cursor \"{}\" does not exist",
+                        name.value
+                    )));
+                }
             }
             ast::CloseCursor::All => {
                 sess.cursors.write().await.clear();
@@ -1468,4 +1521,389 @@ fn parse_valid_until(expr: &ast::Expr) -> Result<Option<i64>, ExecError> {
     crate::types::parse_timestamptz(literal)
         .map(Some)
         .map_err(|e| ExecError::Unsupported(format!("VALID UNTIL {raw}: {e}")))
+}
+
+/// Estimated heap bytes a materialized row holds. Uses the same estimator as
+/// KV memory accounting (`Value::approx_heap_size`), which counts arrays and
+/// JSONB by content rather than by a flat guess.
+fn cursor_row_bytes(row: &Row) -> usize {
+    row.iter()
+        .map(Value::approx_heap_size)
+        .sum::<usize>()
+        .saturating_add(std::mem::size_of::<Row>())
+}
+
+/// The literal row count of a LIMIT expression: `Some(n)` for a number,
+/// `None` for anything else (parameter, expression, NULL, ALL).
+fn literal_limit(expr: &ast::Expr) -> Option<usize> {
+    match expr {
+        ast::Expr::Value(v) => match &v.value {
+            ast::Value::Number(n, _) => n.parse::<usize>().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `expr` unless it is absent, NULL, or a literal above `cap`, in which case
+/// the cap. A non-literal limit is left alone: the post-materialization row
+/// check still refuses it, it just cannot stop the scan early.
+fn capped_limit(limit: Option<ast::Expr>, cap: usize) -> ast::Expr {
+    let cap_expr = || ast::Expr::Value(ast::Value::Number(cap.to_string(), false).into());
+    match limit {
+        None => cap_expr(),
+        Some(expr) => {
+            if matches!(&expr, ast::Expr::Value(v) if matches!(v.value, ast::Value::Null)) {
+                return cap_expr();
+            }
+            match literal_limit(&expr) {
+                Some(n) if n > cap => cap_expr(),
+                _ => expr,
+            }
+        }
+    }
+}
+
+/// Bound a cursor's query to `max_rows + 1` rows so materialization stops one
+/// row past the budget (the extra row is what proves the budget was exceeded).
+/// A smaller user LIMIT is kept. Queries with a ClickHouse `LIMIT ... BY`, a
+/// `FETCH FIRST` clause or row locks are left alone; the result check still
+/// applies to them.
+fn cap_cursor_query(query: &mut ast::Query, max_rows: usize) {
+    if query.fetch.is_some() || !query.locks.is_empty() {
+        return;
+    }
+    let cap = max_rows.saturating_add(1);
+    query.limit_clause = Some(match query.limit_clause.take() {
+        None => ast::LimitClause::LimitOffset {
+            limit: Some(capped_limit(None, cap)),
+            offset: None,
+            limit_by: Vec::new(),
+        },
+        Some(ast::LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        }) => {
+            if limit_by.is_empty() {
+                ast::LimitClause::LimitOffset {
+                    limit: Some(capped_limit(limit, cap)),
+                    offset,
+                    limit_by,
+                }
+            } else {
+                ast::LimitClause::LimitOffset {
+                    limit,
+                    offset,
+                    limit_by,
+                }
+            }
+        }
+        Some(ast::LimitClause::OffsetCommaLimit { offset, limit }) => {
+            ast::LimitClause::OffsetCommaLimit {
+                offset,
+                limit: capped_limit(Some(limit), cap),
+            }
+        }
+    });
+}
+
+/// A FETCH direction reduced to the six movements a materialized cursor has.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CursorMove {
+    Forward(usize),
+    ForwardAll,
+    Backward(usize),
+    BackwardAll,
+    Absolute(i64),
+    Relative(i64),
+}
+
+fn invalid_fetch_count(text: &str) -> ExecError {
+    ExecError::Runtime(format!(
+        "invalid FETCH count \"{text}\": expected an integer that fits in 64 bits"
+    ))
+}
+
+fn parse_fetch_count(value: &ast::Value) -> Result<i64, ExecError> {
+    match value {
+        ast::Value::Number(n, _) => n.parse::<i64>().map_err(|_| invalid_fetch_count(n)),
+        other => Err(invalid_fetch_count(&other.to_string())),
+    }
+}
+
+/// A signed count: a negative count reverses the direction (PostgreSQL).
+fn signed_move(n: i64) -> CursorMove {
+    let count = usize::try_from(n.unsigned_abs()).unwrap_or(usize::MAX);
+    if n >= 0 {
+        CursorMove::Forward(count)
+    } else {
+        CursorMove::Backward(count)
+    }
+}
+
+fn cursor_move(direction: &ast::FetchDirection) -> Result<CursorMove, ExecError> {
+    use ast::FetchDirection as D;
+    Ok(match direction {
+        D::Count { limit } => signed_move(parse_fetch_count(limit)?),
+        D::Next => CursorMove::Forward(1),
+        D::Prior => CursorMove::Backward(1),
+        D::First => CursorMove::Absolute(1),
+        D::Last => CursorMove::Absolute(-1),
+        D::Absolute { limit } => CursorMove::Absolute(parse_fetch_count(limit)?),
+        D::Relative { limit } => CursorMove::Relative(parse_fetch_count(limit)?),
+        D::All | D::ForwardAll => CursorMove::ForwardAll,
+        D::Forward { limit: None } => CursorMove::Forward(1),
+        D::Forward { limit: Some(limit) } => signed_move(parse_fetch_count(limit)?),
+        D::Backward { limit: None } => CursorMove::Backward(1),
+        D::Backward { limit: Some(limit) } => match signed_move(parse_fetch_count(limit)?) {
+            CursorMove::Forward(n) => CursorMove::Backward(n),
+            CursorMove::Backward(n) => CursorMove::Forward(n),
+            other => other,
+        },
+        D::BackwardAll => CursorMove::BackwardAll,
+        #[allow(unreachable_patterns)]
+        other => {
+            return Err(ExecError::Unsupported(format!(
+                "FETCH direction {other:?} is not supported"
+            )));
+        }
+    })
+}
+
+/// Whether a movement only ever goes strictly forward from `pos`. The only
+/// movement allowed to stay put is a zero count (re-fetch the current row).
+/// Stricter than PostgreSQL in one edge: `FETCH ABSOLUTE k` to a row at or
+/// behind the current position is refused rather than rewinding.
+fn moves_forward_only(movement: &CursorMove, pos: usize) -> bool {
+    match *movement {
+        CursorMove::Forward(_) | CursorMove::ForwardAll => true,
+        CursorMove::Backward(_) | CursorMove::BackwardAll => false,
+        CursorMove::Absolute(t) => t > 0 && usize::try_from(t).unwrap_or(usize::MAX) > pos,
+        CursorMove::Relative(d) => d >= 0,
+    }
+}
+
+fn row_at(rows: &[Row], pos: usize) -> Vec<Row> {
+    if pos >= 1 && pos <= rows.len() {
+        vec![rows[pos - 1].clone()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Move the cursor and return the rows the movement fetched. `position` is
+/// PostgreSQL's: 0 before the first row, `1..=n` on a row, `n + 1` after the
+/// last. Nothing is changed when the movement is refused.
+fn apply_cursor_move(cursor: &mut CursorDef, movement: CursorMove) -> Result<Vec<Row>, ExecError> {
+    let n = cursor.rows.len();
+    let pos = cursor.position;
+    if cursor.no_scroll && !moves_forward_only(&movement, pos) {
+        return Err(ExecError::Runtime(
+            "cursor can only scan forward; declare it with SCROLL option to enable backward scan"
+                .into(),
+        ));
+    }
+    let (fetched, new_pos): (Vec<Row>, usize) = match movement {
+        CursorMove::Forward(0) | CursorMove::Backward(0) | CursorMove::Relative(0) => {
+            (row_at(&cursor.rows, pos), pos)
+        }
+        CursorMove::Forward(k) => {
+            let start = pos.min(n);
+            let end = start.saturating_add(k).min(n);
+            let new_pos = if start.saturating_add(k) > n {
+                n + 1
+            } else {
+                start + k
+            };
+            (cursor.rows[start..end].to_vec(), new_pos)
+        }
+        CursorMove::ForwardAll => {
+            let start = pos.min(n);
+            (cursor.rows[start..].to_vec(), n + 1)
+        }
+        CursorMove::Backward(k) => {
+            let take = k.min(pos.saturating_sub(1));
+            let out: Vec<Row> = (1..=take)
+                .map(|i| cursor.rows[pos - i - 1].clone())
+                .collect();
+            (out, if pos > k { pos - k } else { 0 })
+        }
+        CursorMove::BackwardAll => {
+            let take = pos.saturating_sub(1);
+            let out: Vec<Row> = (1..=take)
+                .map(|i| cursor.rows[pos - i - 1].clone())
+                .collect();
+            (out, 0)
+        }
+        CursorMove::Absolute(t) => {
+            if t > 0 {
+                let target = usize::try_from(t).unwrap_or(usize::MAX);
+                if target <= n {
+                    (row_at(&cursor.rows, target), target)
+                } else {
+                    (Vec::new(), n + 1)
+                }
+            } else if t == 0 {
+                (Vec::new(), 0)
+            } else {
+                let back = usize::try_from(t.unsigned_abs()).unwrap_or(usize::MAX);
+                if back <= n {
+                    let target = n - back + 1;
+                    (row_at(&cursor.rows, target), target)
+                } else {
+                    (Vec::new(), 0)
+                }
+            }
+        }
+        CursorMove::Relative(d) => {
+            if d > 0 {
+                let target = pos.saturating_add(usize::try_from(d).unwrap_or(usize::MAX));
+                if target <= n {
+                    (row_at(&cursor.rows, target), target)
+                } else {
+                    (Vec::new(), n + 1)
+                }
+            } else {
+                let back = usize::try_from(d.unsigned_abs()).unwrap_or(usize::MAX);
+                if pos > back {
+                    (row_at(&cursor.rows, pos - back), pos - back)
+                } else {
+                    (Vec::new(), 0)
+                }
+            }
+        }
+    };
+    cursor.position = new_pos;
+    Ok(fetched)
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    fn capped(sql: &str, max_rows: usize) -> String {
+        let mut stmts = crate::sql::parse(sql).expect("parse");
+        match stmts.remove(0) {
+            ast::Statement::Query(mut query) => {
+                cap_cursor_query(&mut query, max_rows);
+                query.to_string()
+            }
+            other => panic!("expected a query, got {other}"),
+        }
+    }
+
+    fn cursor_over(n: i32, no_scroll: bool) -> CursorDef {
+        CursorDef {
+            name: "c".into(),
+            rows: (1..=n).map(|i| vec![Value::Int32(i)]).collect(),
+            columns: vec![("id".into(), DataType::Int32)],
+            position: 0,
+            no_scroll,
+            hold: false,
+            opened_in_txn: true,
+            bytes: 0,
+        }
+    }
+
+    fn ids(rows: &[Row]) -> Vec<i32> {
+        rows.iter()
+            .map(|r| match &r[0] {
+                Value::Int32(n) => *n,
+                other => panic!("expected Int32, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// The row cap rides on the query as `max_rows + 1`; a smaller user LIMIT
+    /// survives, a larger or missing one is replaced, OFFSET and ORDER BY are
+    /// kept, and a row-locking query is left alone.
+    #[test]
+    fn cap_cursor_query_bounds_the_scan_without_changing_smaller_limits() {
+        assert_eq!(capped("SELECT id FROM t", 3), "SELECT id FROM t LIMIT 4");
+        assert_eq!(
+            capped("SELECT id FROM t ORDER BY id", 3),
+            "SELECT id FROM t ORDER BY id LIMIT 4"
+        );
+        assert_eq!(
+            capped("SELECT id FROM t LIMIT 2", 3),
+            "SELECT id FROM t LIMIT 2"
+        );
+        assert_eq!(
+            capped("SELECT id FROM t LIMIT 4", 3),
+            "SELECT id FROM t LIMIT 4"
+        );
+        assert_eq!(
+            capped("SELECT id FROM t LIMIT 100", 3),
+            "SELECT id FROM t LIMIT 4"
+        );
+        assert_eq!(
+            capped("SELECT id FROM t LIMIT 100 OFFSET 5", 3),
+            "SELECT id FROM t LIMIT 4 OFFSET 5"
+        );
+        assert!(!capped("SELECT id FROM t FOR UPDATE", 3).contains("LIMIT"));
+    }
+
+    #[test]
+    fn a_zero_count_refetches_the_current_row_and_empty_cursors_stay_empty() {
+        let mut cursor = cursor_over(3, false);
+        assert!(
+            apply_cursor_move(&mut cursor, CursorMove::Forward(0))
+                .unwrap()
+                .is_empty()
+        );
+        apply_cursor_move(&mut cursor, CursorMove::Forward(2)).unwrap();
+        let again = apply_cursor_move(&mut cursor, CursorMove::Forward(0)).unwrap();
+        assert_eq!(ids(&again), vec![2]);
+        assert_eq!(cursor.position, 2);
+
+        let mut empty = cursor_over(0, false);
+        assert!(
+            apply_cursor_move(&mut empty, CursorMove::Forward(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(empty.position, 1);
+        assert!(
+            apply_cursor_move(&mut empty, CursorMove::Absolute(-1))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(empty.position, 0);
+    }
+
+    /// Counts far beyond the row set must saturate, not overflow or panic.
+    #[test]
+    fn huge_counts_saturate() {
+        let mut cursor = cursor_over(3, false);
+        let all = apply_cursor_move(&mut cursor, CursorMove::Forward(usize::MAX)).unwrap();
+        assert_eq!(ids(&all), vec![1, 2, 3]);
+        assert_eq!(cursor.position, 4);
+        let back = apply_cursor_move(&mut cursor, CursorMove::Backward(usize::MAX)).unwrap();
+        assert_eq!(ids(&back), vec![3, 2, 1]);
+        assert_eq!(cursor.position, 0);
+        assert!(
+            apply_cursor_move(&mut cursor, CursorMove::Relative(i64::MAX))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(cursor.position, 4);
+        assert!(
+            apply_cursor_move(&mut cursor, CursorMove::Absolute(i64::MIN))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(cursor.position, 0);
+    }
+
+    /// A refused NO SCROLL fetch leaves rows and position untouched.
+    #[test]
+    fn no_scroll_refusal_leaves_the_cursor_untouched() {
+        let mut cursor = cursor_over(3, true);
+        apply_cursor_move(&mut cursor, CursorMove::Forward(2)).unwrap();
+        let err = apply_cursor_move(&mut cursor, CursorMove::Backward(1)).unwrap_err();
+        assert!(err.to_string().contains("cursor can only scan forward"));
+        assert_eq!(cursor.position, 2);
+        assert_eq!(cursor.rows.len(), 3);
+    }
 }

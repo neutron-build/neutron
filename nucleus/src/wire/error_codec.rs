@@ -80,6 +80,17 @@ pub enum ErrorCode {
     /// The session's backend was terminated by an administrator
     /// (`pg_terminate_backend`): PostgreSQL `admin_shutdown` (57P01)
     AdminShutdown,
+    /// A statement that requires an open transaction block ran outside one:
+    /// PostgreSQL `no_active_sql_transaction` (25P01)
+    NoActiveSqlTransaction,
+    /// The object is not in a state the operation needs (a backward fetch on a
+    /// NO SCROLL cursor): PostgreSQL `object_not_in_prerequisite_state` (55000)
+    ObjectNotInPrerequisiteState,
+    /// Named cursor does not exist: PostgreSQL `invalid_cursor_name` (34000)
+    InvalidCursorName,
+    /// A parameter of the statement has an unusable value (a FETCH count that
+    /// is not an integer): PostgreSQL `invalid_parameter_value` (22023)
+    InvalidParameterValue,
 }
 
 /// Protocol-independent error details.
@@ -109,6 +120,24 @@ pub trait ErrorCodec {
     /// For pgwire, returns SQLSTATE code (5 characters).
     /// For binary protocol, returns custom code (u16).
     fn code_to_string(&self, code: ErrorCode) -> String;
+}
+
+/// SQL cursor refusals arrive as `Runtime` messages with PostgreSQL's own
+/// wording; each gets the SQLSTATE PostgreSQL uses for it. Matched on the
+/// start (or exact tail) of the message so an unrelated runtime error that
+/// merely mentions a cursor keeps its ordinary classification.
+fn cursor_error_code(msg: &str) -> Option<ErrorCode> {
+    if msg.starts_with("cursor \"") && msg.ends_with("\" does not exist") {
+        Some(ErrorCode::InvalidCursorName)
+    } else if msg.starts_with("cursor can only scan forward") {
+        Some(ErrorCode::ObjectNotInPrerequisiteState)
+    } else if msg.starts_with("DECLARE CURSOR can only be used in transaction blocks") {
+        Some(ErrorCode::NoActiveSqlTransaction)
+    } else if msg.starts_with("invalid FETCH count") {
+        Some(ErrorCode::InvalidParameterValue)
+    } else {
+        None
+    }
 }
 
 /// PostgreSQL wire protocol error codec.
@@ -142,6 +171,8 @@ impl ErrorCodec for PgWireErrorCodec {
                 // prepared statements" and fall back to unparsed SQL forever.
                 let code = if msg.starts_with("too_many_prepared_statements")
                     || msg.starts_with("too_many_cursors")
+                    || msg.starts_with("too_many_cursor_rows")
+                    || msg.starts_with("too_many_cursor_bytes")
                     || msg.starts_with("too_many_listen_channels")
                     || msg.starts_with("too_many_large_objects")
                 {
@@ -223,7 +254,9 @@ impl ErrorCodec for PgWireErrorCodec {
                 ErrorDetails::new(code, msg)
             }
             ExecError::Runtime(msg) => {
-                let code = if msg.contains("division by zero") {
+                let code = if let Some(code) = cursor_error_code(msg) {
+                    code
+                } else if msg.contains("division by zero") {
                     ErrorCode::DivisionByZero
                 } else if msg.contains("value too long for type") {
                     ErrorCode::StringDataRightTruncation
@@ -294,6 +327,10 @@ impl ErrorCodec for PgWireErrorCodec {
             ErrorCode::ActiveSqlTransaction => "25001".to_string(),
             ErrorCode::AdminShutdown => "57P01".to_string(),
             ErrorCode::ProgramLimitExceeded => "54000".to_string(),
+            ErrorCode::NoActiveSqlTransaction => "25P01".to_string(),
+            ErrorCode::ObjectNotInPrerequisiteState => "55000".to_string(),
+            ErrorCode::InvalidCursorName => "34000".to_string(),
+            ErrorCode::InvalidParameterValue => "22023".to_string(),
         }
     }
 }
@@ -331,6 +368,8 @@ impl ErrorCodec for BinaryErrorCodec {
                 // prepared statements" and fall back to unparsed SQL forever.
                 let code = if msg.starts_with("too_many_prepared_statements")
                     || msg.starts_with("too_many_cursors")
+                    || msg.starts_with("too_many_cursor_rows")
+                    || msg.starts_with("too_many_cursor_bytes")
                     || msg.starts_with("too_many_listen_channels")
                     || msg.starts_with("too_many_large_objects")
                 {
@@ -412,7 +451,9 @@ impl ErrorCodec for BinaryErrorCodec {
                 ErrorDetails::new(code, msg)
             }
             ExecError::Runtime(msg) => {
-                let code = if msg.contains("division by zero") {
+                let code = if let Some(code) = cursor_error_code(msg) {
+                    code
+                } else if msg.contains("division by zero") {
                     ErrorCode::DivisionByZero
                 } else if msg.contains("value too long for type") {
                     ErrorCode::StringDataRightTruncation
@@ -473,6 +514,10 @@ impl ErrorCodec for BinaryErrorCodec {
             ErrorCode::ActiveSqlTransaction => "3006".to_string(),
             ErrorCode::AdminShutdown => "3007".to_string(),
             ErrorCode::ProgramLimitExceeded => "5005".to_string(),
+            ErrorCode::NoActiveSqlTransaction => "3008".to_string(),
+            ErrorCode::ObjectNotInPrerequisiteState => "3009".to_string(),
+            ErrorCode::InvalidCursorName => "1010".to_string(),
+            ErrorCode::InvalidParameterValue => "4004".to_string(),
         }
     }
 }
@@ -697,6 +742,8 @@ mod tests {
             "too_many_prepared_statements: session already holds 1024 prepared \
              statements (limit 1024)",
             "too_many_cursors: session already has 1024 open cursors (limit 1024)",
+            "too_many_cursor_rows: cursor result exceeds 1000000 rows (limit 1000000)",
+            "too_many_cursor_bytes: cursor result exceeds 67108864 bytes (limit 67108864)",
             "too_many_listen_channels: connection listens on 1024 channels (limit 1024)",
             "too_many_large_objects: session has 1024 large objects open (limit 1024)",
         ];
@@ -709,6 +756,41 @@ mod tests {
             "SELECT ... INTO is not implemented".to_string(),
         ));
         assert_eq!(codec.code_to_string(plain.code), "0A000");
+    }
+
+    /// Cursor refusals carry PostgreSQL's SQLSTATEs, not the 22000 catch-all a
+    /// plain `Runtime` error gets. Each case is paired with a control that
+    /// merely mentions a cursor and must keep the ordinary classification.
+    #[test]
+    fn cursor_refusals_map_to_postgres_sqlstates() {
+        let cases = [
+            ("cursor \"c1\" does not exist", "34000"),
+            (
+                "cursor can only scan forward; declare it with SCROLL option to enable backward scan",
+                "55000",
+            ),
+            (
+                "DECLARE CURSOR can only be used in transaction blocks",
+                "25P01",
+            ),
+            ("invalid FETCH count \"abc\": expected an integer", "22023"),
+        ];
+        for (msg, state) in cases {
+            for codec in [&PgWireErrorCodec as &dyn ErrorCodec, &BinaryErrorCodec] {
+                let details = codec.encode(&ExecError::Runtime(msg.to_string()));
+                assert_ne!(details.code, ErrorCode::DataException, "msg: {msg}");
+            }
+            let details = PgWireErrorCodec.encode(&ExecError::Runtime(msg.to_string()));
+            assert_eq!(
+                PgWireErrorCodec.code_to_string(details.code),
+                state,
+                "{msg}"
+            );
+        }
+        let control = PgWireErrorCodec.encode(&ExecError::Runtime(
+            "something about a cursor went wrong".to_string(),
+        ));
+        assert_eq!(PgWireErrorCodec.code_to_string(control.code), "22000");
     }
 
     /// Row-lock exhaustion is 53200 (out_of_memory) — PostgreSQL's class for

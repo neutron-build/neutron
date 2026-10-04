@@ -565,6 +565,16 @@ pub(crate) const DEFAULT_MAX_PREPARED_STMTS: usize = 1024;
 /// Overridable via `limits.max_cursors_per_session`.
 pub(crate) const DEFAULT_MAX_CURSORS: usize = 1024;
 
+/// Default per-cursor cap on materialized rows. DECLARE runs the query to
+/// completion, so the cap is applied as a row limit on the query itself and
+/// re-checked on the result. Overridable via `limits.max_cursor_rows`.
+pub(crate) const DEFAULT_MAX_CURSOR_ROWS: usize = 1_000_000;
+
+/// Default per-cursor cap on estimated materialized bytes (64 MiB). Checked on
+/// the materialized result before it is stored. Overridable via
+/// `limits.max_cursor_bytes`.
+pub(crate) const DEFAULT_MAX_CURSOR_BYTES: usize = 64 * 1024 * 1024;
+
 /// The executor holds shared catalog/storage state and per-session state.
 ///
 /// Session-specific state (transactions, cursors, prepared statements, settings)
@@ -776,6 +786,10 @@ pub struct Executor {
     /// materializes its whole row set. Configurable via
     /// `limits.max_cursors_per_session`.
     max_cursors_per_session: AtomicUsize,
+    /// Per-cursor cap on materialized rows (`limits.max_cursor_rows`).
+    max_cursor_rows: AtomicUsize,
+    /// Per-cursor cap on estimated materialized bytes (`limits.max_cursor_bytes`).
+    max_cursor_bytes: AtomicUsize,
     /// Default session for backward-compatible `execute()` (embedded mode).
     default_session: Arc<Session>,
     /// In-memory key-value store for KV SQL functions (kv_get, kv_set, kv_del, etc.).
@@ -1210,6 +1224,8 @@ impl Executor {
             default_slow_query_ms: AtomicU64::new(0),
             max_prepared_stmts_per_session: AtomicUsize::new(DEFAULT_MAX_PREPARED_STMTS),
             max_cursors_per_session: AtomicUsize::new(DEFAULT_MAX_CURSORS),
+            max_cursor_rows: AtomicUsize::new(DEFAULT_MAX_CURSOR_ROWS),
+            max_cursor_bytes: AtomicUsize::new(DEFAULT_MAX_CURSOR_BYTES),
             default_session: Arc::new(Session::new()),
             kv_store: Arc::new(crate::kv::KvStore::new()),
             columnar_store: parking_lot::RwLock::new(crate::columnar::ColumnarStore::new()),
@@ -2719,6 +2735,13 @@ impl Executor {
             .store(prepared, Ordering::Release);
         self.max_cursors_per_session
             .store(cursors, Ordering::Release);
+    }
+
+    /// Set the per-cursor materialization budgets after construction. A DECLARE
+    /// whose result exceeds either is REFUSED (54000) and stores nothing.
+    pub fn set_cursor_budgets(&self, max_rows: usize, max_bytes: usize) {
+        self.max_cursor_rows.store(max_rows, Ordering::Release);
+        self.max_cursor_bytes.store(max_bytes, Ordering::Release);
     }
 
     /// Record a weak self-reference so `&self` methods can recover an owned

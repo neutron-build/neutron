@@ -299,6 +299,7 @@ impl Executor {
         self.sync_lock_timeout(&sess);
         self.metrics.open_transactions.dec();
         drop(txn);
+        sess.close_cursors_at_txn_end(true).await;
 
         // GIN is shared across sessions, so DML deliberately leaves it on the
         // committed image while a transaction is open. Refresh only after the
@@ -484,6 +485,8 @@ impl Executor {
         if was_active {
             self.metrics.open_transactions.dec();
         }
+        drop(txn);
+        sess.close_cursors_at_txn_end(false).await;
 
         Ok(ExecResult::Command {
             tag: "ROLLBACK".into(),

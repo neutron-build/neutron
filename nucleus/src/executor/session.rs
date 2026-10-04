@@ -636,6 +636,25 @@ impl Session {
         self.executing.store(false, Ordering::Relaxed);
     }
 
+    /// Close the cursors a finished transaction owned. PostgreSQL drops every
+    /// non-holdable cursor at COMMIT or ROLLBACK. A WITH HOLD cursor survives
+    /// COMMIT (and stops counting as transaction-scoped) but a ROLLBACK drops
+    /// the ones declared in the rolled-back transaction.
+    ///
+    /// Called after the transaction state lock is released, so this lock is
+    /// never taken while that one is held.
+    pub(super) async fn close_cursors_at_txn_end(&self, committed: bool) {
+        let mut cursors = self.cursors.write().await;
+        if committed {
+            cursors.retain(|_, c| c.hold);
+            for cursor in cursors.values_mut() {
+                cursor.opened_in_txn = false;
+            }
+        } else {
+            cursors.retain(|_, c| c.hold && !c.opened_in_txn);
+        }
+    }
+
     /// Reset session state for connection reuse.
     ///
     /// Clears prepared statements, cursors, CTEs, and resets settings to

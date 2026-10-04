@@ -1469,6 +1469,10 @@ async fn cmd_start(cfg: StartConfig) {
         config.limits.max_prepared_statements_per_session,
         config.limits.max_cursors_per_session,
     );
+    executor.set_cursor_budgets(
+        config.limits.max_cursor_rows,
+        config.limits.max_cursor_bytes,
+    );
     let wire_limits = nucleus::wire::WireLimits {
         max_prepared_statements_per_session: config.limits.max_prepared_statements_per_session,
         max_portals_per_session: config.limits.max_portals_per_session,
