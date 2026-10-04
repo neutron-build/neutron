@@ -250,15 +250,63 @@ because the store has no rollback mechanism.
 
 ### Cursors (DECLARE / FETCH / CLOSE)
 
-A SQL cursor is a **materialized snapshot, not a lazy scan.** `DECLARE` runs
-the query to completion inside the executor and holds every row in the session
-until the cursor closes. Nothing is read from storage at `FETCH` time. This is
-the design limit, and the fixes below bound it rather than remove it: a client
-that issues `DECLARE ... NO SCROLL CURSOR` plus `FETCH FORWARD n` bounds its own
-buffering but does not bound server memory the way PostgreSQL's executor-driven
-cursors do.
+A cursor is one of two things, and `DECLARE` decides which from the query.
 
-What is bounded:
+**Lazy** (one shape). A select over a single `generate_series(a, b [, step])`
+call with constant integer arguments is produced lazily:
+
+```sql
+SELECT <select list> FROM generate_series(a, b [, step]) [[AS] t[(c)]]
+  [WHERE <predicate>] [LIMIT n] [OFFSET m]
+```
+
+The select list and predicate may use arithmetic, comparison, `AND`/`OR`,
+`CASE`, casts and literals over the series column. A function call, subquery,
+bind parameter, `ORDER BY`, `DISTINCT`, `GROUP BY`, `HAVING`, aggregate, window
+function, join, CTE, set operation, `FOR UPDATE` clause or `SELECT ... INTO`
+takes the query out of this shape, and so does an explicit `SCROLL`. For a lazy
+cursor `DECLARE` executes nothing (it evaluates the select list once on the
+first series value, only to type the columns) and stores a few integers plus
+the parsed select list; each `FETCH` produces exactly the rows it returns, so a
+cursor over `generate_series(1, 1000000000000)` costs the same as one over five
+rows. Because the source reads no table there is no snapshot to pin: the
+cursor is insensitive by construction, and `WITH HOLD` is safe because nothing
+in the producer belongs to the transaction. Rows are evaluated at `FETCH`
+time, so an expression that errors on a late row (`100 / (50 - g)`) fails the
+`FETCH` that reaches it, not the `DECLARE`.
+
+A lazy cursor is forward only: it keeps no rows, so `PRIOR`, `FIRST`, `LAST`,
+`BACKWARD`, a negative count, and `ABSOLUTE`/`RELATIVE` to a row at or behind
+the current position are refused with 55000 and leave the cursor where it was.
+Declare it `SCROLL` to get a materialized cursor that can move both ways.
+
+What bounds a lazy cursor, independent of the series length:
+
+- **Memory held**: one row (the current row, for `FETCH 0`) plus the state, at
+  any time. Nothing grows with `FETCH`.
+- **Rows and bytes per FETCH** (`limits.max_cursor_rows`,
+  `limits.max_cursor_bytes`): rows are produced and projected 256 at a time and
+  the result is checked against both budgets after each chunk, so a `FETCH`
+  that would return more (including `FETCH ALL` of a long series) is refused
+  with 54000 (`too_many_cursor_rows` / `too_many_cursor_bytes`) before it is
+  built. A refused `FETCH` consumes nothing: the cursor stays where it was.
+- **Cursors per session** (`limits.max_cursors_per_session`), refused with
+  54000 before any planning.
+- **Cancellation.** The cancel flag is read when a `FETCH` starts and every
+  1024 series values examined (so a selective `WHERE` over a long range is
+  still cancellable). A cancel, or any evaluation error, fails the `FETCH` with
+  its own SQLSTATE (57014 for a cancel) and closes the cursor, releasing its
+  state; like any statement error it also aborts the enclosing transaction. A
+  skipping `FETCH` (`ABSOLUTE`, `RELATIVE`) does work proportional to the rows
+  it skips, in constant memory.
+
+**Materialized** (everything else). `DECLARE` runs the query to completion and
+holds every row in the session until the cursor closes; nothing is read from
+storage at `FETCH` time. This is the design limit for any query that needs its
+whole input before it can emit a row (a sort, an aggregate, a join build) or
+that reads a table, because the executor's operators return whole row vectors
+and there is no snapshot that can be pinned across statements. It is bounded,
+not removed:
 
 - **Rows per cursor** (`limits.max_cursor_rows`, default 1,000,000). The cap is
   added to the query as `LIMIT max_rows + 1` (a smaller user `LIMIT` is kept),
@@ -273,13 +321,26 @@ What is bounded:
   is stored (54000, `too_many_cursor_bytes`). The executor returns a whole
   `Vec<Row>`, so bytes cannot be enforced mid-flight: the transient peak is at
   most `max_cursor_rows + 1` rows.
+- **A `generate_series` in the top-level FROM** of a materialized cursor whose
+  length already exceeds `max_cursor_rows` is refused with 54000 before it is
+  built, because the executor builds a table function whole before any `LIMIT`
+  applies. A series nested in a subquery is not inspected; it is bounded only
+  by the query-memory budget like any other query.
 - **Cursors per session** (`limits.max_cursors_per_session`, default 1024),
   refused with 54000 (`too_many_cursors`) before the query runs. The worst case
   for one session is therefore `max_cursors_per_session * max_cursor_bytes`;
   lower the byte budget where that product is too large. There is no separate
   per-session byte total.
 
-Lifetime follows PostgreSQL:
+Snapshot and visibility, for the materialized kind: the rows are the
+`DECLARE`-time result, so a cursor never sees later changes, whether made by
+the same transaction or another one (this is PostgreSQL's `INSENSITIVE`
+behaviour, which is also what an unspecified cursor gives there; `INSENSITIVE`
+and `ASENSITIVE` are accepted and treated the same). For a holdable cursor
+PostgreSQL materializes at `COMMIT`; Nucleus materializes at `DECLARE`, so rows
+committed or changed between `DECLARE` and `COMMIT` are not seen.
+
+Lifetime follows PostgreSQL, for both kinds:
 
 - `DECLARE` outside a transaction block is refused (25P01, `DECLARE CURSOR can
   only be used in transaction blocks`) unless the cursor is `WITH HOLD`.
@@ -288,43 +349,41 @@ Lifetime follows PostgreSQL:
   `COMMIT`; `ROLLBACK` drops a held cursor that was declared in the rolled-back
   transaction. A multi-statement simple-query message is one implicit
   transaction, so its cursors die when the message ends.
-- `DISCARD ALL` and session reset close everything. `CLOSE name` of an unknown
-  cursor is an error (34000).
+- `ROLLBACK TO SAVEPOINT` closes every cursor declared after that savepoint,
+  held or not, including ones declared in a nested savepoint. A cursor declared
+  before the savepoint stays open and keeps the position its `FETCH`es left it
+  at (cursor motion is not undone, as in PostgreSQL). The savepoint remains
+  usable, so a second rollback to it closes the cursors declared since.
+  `RELEASE SAVEPOINT` keeps the cursors; they belong to the enclosing savepoint.
+- `DISCARD ALL`, session reset and disconnect close everything. `CLOSE name` of
+  an unknown cursor is an error (34000).
 
 `FETCH` keeps PostgreSQL's position model (before-first, on a row, after-last):
 `NEXT`, `PRIOR`, `FIRST`, `LAST`, `ABSOLUTE n`, `RELATIVE n`, `n`, `ALL`,
 `FORWARD [n | ALL]`, `BACKWARD [n | ALL]`, with a zero count re-fetching the
 current row. A count that is not a 64-bit integer is refused (22023); a
 direction the engine does not recognize is refused (0A000) rather than treated
-as one row. An undeclared scroll mode allows backward movement, because the
-rows are in memory. `NO SCROLL` refuses any fetch that does not move strictly
-forward with 55000, which is stricter than PostgreSQL in one edge: `FETCH
-FIRST` or `ABSOLUTE k` to a row at or behind the current position is refused
-rather than rewinding.
+as one row. A materialized cursor with no scroll mode allows backward movement,
+because the rows are in memory; `NO SCROLL` refuses any fetch that does not
+move strictly forward with 55000, which is stricter than PostgreSQL in one edge:
+`FETCH FIRST` or `ABSOLUTE k` to a row at or behind the current position is
+refused rather than rewinding.
 
 Not implemented, so the cursor is not a faithful PostgreSQL cursor:
 
-- **Snapshot and visibility.** The rows are the DECLARE-time result. For a
-  holdable cursor PostgreSQL materializes at `COMMIT`; Nucleus materializes at
-  `DECLARE`, so rows committed or changed between `DECLARE` and `COMMIT` are not
-  seen. (Like PostgreSQL, a cursor does not see the declaring transaction's own
-  later writes.)
-- **Savepoints.** `ROLLBACK TO SAVEPOINT` does not close cursors declared after
-  the savepoint (PostgreSQL does), so such a cursor can still return rows the
-  rolled-back work produced.
-- **Cancellation and timeout** act on `DECLARE` (the query) and on each `FETCH`
-  as ordinary statements; there is no long-lived scan to cancel.
+- **Lazy cursors over tables.** A table scan is not lazy: the storage engines
+  read live pages per request and the executor has no statement-spanning
+  snapshot, so a lazily advanced scan would see concurrent changes and the
+  transaction's own later writes, which an insensitive cursor must not. Until
+  an engine offers a pinned scan, a table cursor is materialized under the
+  budgets above.
+- **Cancellation of a materialized `DECLARE`** acts on the query as an ordinary
+  statement; the later `FETCH`es read memory and are not long-running.
 - `DECLARE BINARY` is refused (0A000) because rows are always returned in the
-  connection's normal result format; `INSENSITIVE` and `ASENSITIVE` are
-  accepted and ignored. Redeclaring an existing name replaces it instead of
-  failing with 42P03.
-
-A true lazy cursor needs a pinned snapshot plus a resumable plan or streaming
-operator tree that the executor can park between statements; the executor's
-operators return materialized row vectors, so that is a redesign of the query
-executor, not a change to `DECLARE`. The streaming scan path
-(`SET stream_results = on`) is the nearest existing piece and does not yet
-cover joins, sorts or snapshot pinning across statements.
+  connection's normal result format. Redeclaring an existing name replaces it
+  instead of failing with 42P03; if the replacement is declared inside a
+  savepoint, rolling back to that savepoint closes it, and the original is not
+  restored.
 
 ### Catalog metadata
 
