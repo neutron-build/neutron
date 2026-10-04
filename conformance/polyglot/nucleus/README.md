@@ -30,7 +30,7 @@ report remains authoritative for its own recording and is not edited here.
 | Deadline through pg `pg_backend_pid`/`pg_cancel_backend`; postgres.js native CancelRequest | `scalar_fns.rs:2232` currently returns **process PID**; `wire/mod.rs:1762` allocates a **connection PID** and cancel secret; `:1282` races execution against cancellation | SQL cancellation bridge/target identity isNP02. Wire CancelRequest already exists. Historical cancellation probes fail on absent pg_sleep before proving cancel behavior; use a supported dispatched long query/lock wait and bystander controls. |
 | Python named DECLARE/FETCH stream | `python/orm/streaming.py:89`; `executor/admin.rs:1272` eagerly materializes cursor rows; `executor/mod.rs:562` documents whole-result cursor memory | NP05: client batch1 does not establish bounded server memory. `SET stream_results=on` has a different path and may fall back; probes must report actual streamed rows. |
 | Schema introspection, migration DDL/history, advisory lock, CIC | `executor/pg_catalog.rs`, `ddl.rs:1254` direct catalog registration; historical catalog/DDL/locks probes | NP04. DDL catalog rollback/visibility is not atomic; full introspection has bool/check/regclass differences; advisory locks absent and CIC-in-transaction refusal wrong. Autocommit fixture provisioning is not migration certification. |
-| SDK connection admission | Python `endpoint.py` rejects Nucleus markers; TS `engine.ts` recognizes Nucleus and probes capabilities; Go `Executor` is caller supplied | NP01: deliberately add an exact named-profile contract while preserving postgres-direct rejection. Transport acceptance or a borrowed native executor is not approved package support. |
+| SDK connection admission | Python `endpoint.py` rejects Nucleus markers; TS `engine.ts` recognizes Nucleus and probes capabilities; Go `Executor` is caller supplied | NP01: deliberately add an exact named-profile contract while preserving postgres-direct rejection. Transport acceptance or a borrowed native executor is not approved package support. Authored, unqualified, in all five clients; see "Authored versus qualified". |
 
 ## Selected bounded work
 
@@ -62,6 +62,29 @@ changed engine trees, package enablement or a fixture relabeled as executed.
 Optional `--binary` plus `--binary-provenance` binds a real binary SHA to a JSON
 build record containing `source_revision`, `nucleus_tree` and `binary_sha256`.
 This reads bytes only; it does not execute the binary or certify its behavior.
+
+## Authored versus qualified
+
+NP01 admission is **authored in source for Python, TypeScript and Go and
+qualified nowhere**. No native gate, engine build, installed-package run or
+independent review has happened for any of it.
+
+| Client | Authored source (uncertified profile, `packageEnabled` false) | Native qualifier authored | Executed |
+|---|---|---|---|
+| Python sync/async | `python/neutron/orm/endpoint.py`, `PYTHON_ADMISSION.md` | `python_admission_native.py` | no |
+| TypeScript `pg`/`postgres` | `typescript/packages/neutron-sql/src/profile.ts`, fake-driver unit tests in `profile.test.ts` | `ts_admission_native.mjs` | no |
+| Go `pgx` | `go/orm/nucleus_profile.go`, fake-executor unit tests in `nucleus_profile_test.go` | `go-admission-native/main.go` | no |
+
+[TS_GO_ADMISSION.md](TS_GO_ADMISSION.md) records the TypeScript and Go contracts,
+their known gaps against the Python entry point and the qualifier commands. Each
+qualifier needs a fresh installed or freshly built consumer artifact, the exact
+Nucleus binary file and SHA-256, and URL environment variable names; its report
+is not binary attestation, so the coordinator must bind the running endpoint
+process to that binary. Mandatory work that remains open: all native runs (five
+fresh clients against PostgreSQL 17 control and the exact Nucleus binary),
+independent review, NP02-NP06, and every excluded feature family. The
+assessment above, `profile.json` and its assessed engine tree are intentionally
+unchanged.
 
 ## Native gate still required
 
