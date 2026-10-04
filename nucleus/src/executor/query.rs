@@ -5391,6 +5391,11 @@ impl Executor {
                     Value::Int32(n) => Ok(Value::Int64(-(n as i64))),
                     Value::Int64(n) => Ok(Value::Int64(-n)),
                     Value::Float64(n) => Ok(Value::Float64(-n)),
+                    // It used to fall through to NULL: `-numeric_col` silently
+                    // evaluated to NULL on this path.
+                    Value::Numeric(raw) => crate::types::numeric_negate_keep_scale(&raw)
+                        .map(Value::Numeric)
+                        .map_err(ExecError::Runtime),
                     _ => Ok(Value::Null),
                 }
             }
@@ -5447,6 +5452,21 @@ impl Executor {
             Expr::Cast {
                 expr, data_type, ..
             } => {
+                // A cast to NUMERIC / NUMERIC(p, s) is the AST evaluator's, so
+                // the digits of a literal, the rounding to the scale and the
+                // 22003 overflow refusal are the same on both paths;
+                // `plan_cast_value` returns a value unchanged for a type it
+                // does not list, which skipped all three.
+                if matches!(
+                    data_type,
+                    ast::DataType::Numeric(_) | ast::DataType::Decimal(_) | ast::DataType::Dec(_)
+                ) {
+                    let v = match super::expr::numeric_literal_text(expr, data_type) {
+                        Some(text) => Value::Text(text),
+                        None => self.eval_expr_plan(expr, row, meta)?,
+                    };
+                    return self.eval_cast(v, data_type);
+                }
                 let v = self.eval_expr_plan(expr, row, meta)?;
                 Ok(self.plan_cast_value(v, data_type))
             }

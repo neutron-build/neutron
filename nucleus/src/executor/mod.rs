@@ -6348,6 +6348,19 @@ impl Executor {
                 if values.len() != table_def.columns.len() {
                     return None; // Fall through to normal path for better error reporting.
                 }
+                // The fast-path parser reads a decimal literal as an f64. A
+                // NUMERIC column must get its digits and written scale, which
+                // only the full INSERT path keeps.
+                if values
+                    .iter()
+                    .zip(table_def.columns.iter())
+                    .any(|(lit, col)| {
+                        matches!(lit, crate::wire::kv_fast_path::SqlLiteral::Float(_))
+                            && matches!(col.data_type, DataType::Numeric)
+                    })
+                {
+                    return None;
+                }
                 // Coerce each literal to its target column's declared type
                 // so pgx SimpleProtocol text-literal inserts land in the
                 // column's native representation. A literal that cannot be
@@ -6454,6 +6467,12 @@ impl Executor {
                 let mut col_updates: Vec<(usize, Value)> = Vec::with_capacity(assignments.len());
                 for (col_name, lit) in assignments {
                     let idx = table_def.column_index(col_name)?;
+                    // A decimal literal was read as f64; see SimpleInsert.
+                    if matches!(lit, crate::wire::kv_fast_path::SqlLiteral::Float(_))
+                        && matches!(table_def.columns[idx].data_type, DataType::Numeric)
+                    {
+                        return None;
+                    }
                     let v = lit
                         .to_value()
                         .cast(&table_def.columns[idx].data_type)

@@ -2387,7 +2387,7 @@ fn coerce_to_array(v: Value) -> Option<Vec<Value>> {
 /// A numeric literal cast straight to numeric keeps its digits: evaluating the
 /// bare literal first would round it through f64 and lose everything past
 /// about 17 significant digits.
-fn numeric_literal_text(expr: &Expr, data_type: &ast::DataType) -> Option<String> {
+pub(super) fn numeric_literal_text(expr: &Expr, data_type: &ast::DataType) -> Option<String> {
     if !matches!(
         data_type,
         ast::DataType::Numeric(_) | ast::DataType::Decimal(_) | ast::DataType::Dec(_)
