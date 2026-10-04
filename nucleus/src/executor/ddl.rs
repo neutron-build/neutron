@@ -238,7 +238,7 @@ impl Executor {
         match strategy {
             MergeStrategy::Default => MergeStrategy::Default,
             MergeStrategy::Replacing { version_column } => MergeStrategy::Replacing {
-                version_column: version_column.as_ref().map(&pos),
+                version_column: version_column.as_ref().map(pos),
             },
             MergeStrategy::Aggregating {
                 group_columns,

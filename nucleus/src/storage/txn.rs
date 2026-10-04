@@ -418,7 +418,7 @@ impl TransactionManager {
         let mut active = self.active.lock();
         let id = self
             .next_txn_id
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |next| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |next| {
                 next.checked_add(1)
             })
             .map_err(|_| TransactionIdExhausted)?;

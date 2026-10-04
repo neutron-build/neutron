@@ -5716,8 +5716,8 @@ impl Executor {
             let event = ChangeEvent {
                 table: table.to_string(),
                 change_type: change_type.clone(),
-                new_row: new_rows.first().map(&to_map),
-                old_row: old_rows.first().map(&to_map),
+                new_row: new_rows.first().map(to_map),
+                old_row: old_rows.first().map(to_map),
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
