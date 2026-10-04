@@ -104,6 +104,8 @@ falls back to its default.
 | `max_prepared_statements_per_session` | `usize` | `1024` | `NUCLEUS_LIMITS_MAX_PREPARED_STATEMENTS_PER_SESSION` | SQL-level PREPARE statements and extended-query named statements one session may hold. Past the limit, PREPARE / Parse fails with 54000. |
 | `max_portals_per_session` | `usize` | `1024` | `NUCLEUS_LIMITS_MAX_PORTALS_PER_SESSION` | Extended-query named portals (Bind) one connection may hold. |
 | `max_cursors_per_session` | `usize` | `1024` | `NUCLEUS_LIMITS_MAX_CURSORS_PER_SESSION` | SQL-level cursors (DECLARE) one session may hold. |
+| `max_cursor_rows` | `usize` | `1_000_000` | `NUCLEUS_LIMITS_MAX_CURSOR_ROWS` | Rows one DECLAREd cursor may hold. DECLARE materializes the query, so the row set is capped at declaration; past the limit DECLARE fails with 54000 and nothing is stored. |
+| `max_cursor_bytes` | `usize` | `64 * 1024 * 1024` | `NUCLEUS_LIMITS_MAX_CURSOR_BYTES` | Estimated heap bytes one DECLAREd cursor may hold (64 MiB). Checked on the materialized result before it is stored; past the limit DECLARE fails with 54000. Worst case per session is this times max_cursors_per_session. |
 | `max_listen_channels_per_session` | `usize` | `1024` | `NUCLEUS_LIMITS_MAX_LISTEN_CHANNELS_PER_SESSION` | Channels one connection may LISTEN on. |
 | `max_large_objects_per_session` | `usize` | `1024` | `NUCLEUS_LIMITS_MAX_LARGE_OBJECTS_PER_SESSION` | Large-object descriptors one connection may hold open (lo_open). |
 | `max_auth_failure_entries` | `usize` | `10_000` | `NUCLEUS_LIMITS_MAX_AUTH_FAILURE_ENTRIES` | Source IPs tracked in the failed-authentication table. |

@@ -201,6 +201,83 @@ or NULL. Cast COLUMNAR_INSERT inputs explicitly; COLUMNAR_COUNT still reports
 the stored row count. COLUMNAR_INSERT is refused inside a SQL transaction
 because the store has no rollback mechanism.
 
+### Cursors (DECLARE / FETCH / CLOSE)
+
+A SQL cursor is a **materialized snapshot, not a lazy scan.** `DECLARE` runs
+the query to completion inside the executor and holds every row in the session
+until the cursor closes. Nothing is read from storage at `FETCH` time. This is
+the design limit, and the fixes below bound it rather than remove it: a client
+that issues `DECLARE ... NO SCROLL CURSOR` plus `FETCH FORWARD n` bounds its own
+buffering but does not bound server memory the way PostgreSQL's executor-driven
+cursors do.
+
+What is bounded:
+
+- **Rows per cursor** (`limits.max_cursor_rows`, default 1,000,000). The cap is
+  added to the query as `LIMIT max_rows + 1` (a smaller user `LIMIT` is kept),
+  so a plain scan stops one row past the budget. A result over the budget is
+  refused with SQLSTATE 54000 (`too_many_cursor_rows`) and nothing is stored.
+  Queries with a non-literal `LIMIT`, `LIMIT ... BY`, `FETCH FIRST` or row locks
+  are not capped in flight; their result is still checked before it is stored.
+  A query that must read all its input first (sort, aggregate, join build) still
+  does so under the executor's own query-memory budget.
+- **Bytes per cursor** (`limits.max_cursor_bytes`, default 64 MiB), estimated
+  with `Value::approx_heap_size` and checked on the finished result before it
+  is stored (54000, `too_many_cursor_bytes`). The executor returns a whole
+  `Vec<Row>`, so bytes cannot be enforced mid-flight: the transient peak is at
+  most `max_cursor_rows + 1` rows.
+- **Cursors per session** (`limits.max_cursors_per_session`, default 1024),
+  refused with 54000 (`too_many_cursors`) before the query runs. The worst case
+  for one session is therefore `max_cursors_per_session * max_cursor_bytes`;
+  lower the byte budget where that product is too large. There is no separate
+  per-session byte total.
+
+Lifetime follows PostgreSQL:
+
+- `DECLARE` outside a transaction block is refused (25P01, `DECLARE CURSOR can
+  only be used in transaction blocks`) unless the cursor is `WITH HOLD`.
+- `COMMIT` and `ROLLBACK` close every non-holdable cursor, including a `COMMIT`
+  of an aborted transaction (which is a rollback). A `WITH HOLD` cursor survives
+  `COMMIT`; `ROLLBACK` drops a held cursor that was declared in the rolled-back
+  transaction. A multi-statement simple-query message is one implicit
+  transaction, so its cursors die when the message ends.
+- `DISCARD ALL` and session reset close everything. `CLOSE name` of an unknown
+  cursor is an error (34000).
+
+`FETCH` keeps PostgreSQL's position model (before-first, on a row, after-last):
+`NEXT`, `PRIOR`, `FIRST`, `LAST`, `ABSOLUTE n`, `RELATIVE n`, `n`, `ALL`,
+`FORWARD [n | ALL]`, `BACKWARD [n | ALL]`, with a zero count re-fetching the
+current row. A count that is not a 64-bit integer is refused (22023); a
+direction the engine does not recognize is refused (0A000) rather than treated
+as one row. An undeclared scroll mode allows backward movement, because the
+rows are in memory. `NO SCROLL` refuses any fetch that does not move strictly
+forward with 55000, which is stricter than PostgreSQL in one edge: `FETCH
+FIRST` or `ABSOLUTE k` to a row at or behind the current position is refused
+rather than rewinding.
+
+Not implemented, so the cursor is not a faithful PostgreSQL cursor:
+
+- **Snapshot and visibility.** The rows are the DECLARE-time result. For a
+  holdable cursor PostgreSQL materializes at `COMMIT`; Nucleus materializes at
+  `DECLARE`, so rows committed or changed between `DECLARE` and `COMMIT` are not
+  seen. (Like PostgreSQL, a cursor does not see the declaring transaction's own
+  later writes.)
+- **Savepoints.** `ROLLBACK TO SAVEPOINT` does not close cursors declared after
+  the savepoint (PostgreSQL does), so such a cursor can still return rows the
+  rolled-back work produced.
+- **Cancellation and timeout** act on `DECLARE` (the query) and on each `FETCH`
+  as ordinary statements; there is no long-lived scan to cancel.
+- `BINARY`, `INSENSITIVE` and `ASENSITIVE` are parsed; `BINARY` is not honored
+  (rows are returned in the connection's normal result format). Redeclaring an
+  existing name replaces it instead of failing with 42P03.
+
+A true lazy cursor needs a pinned snapshot plus a resumable plan or streaming
+operator tree that the executor can park between statements; the executor's
+operators return materialized row vectors, so that is a redesign of the query
+executor, not a change to `DECLARE`. The streaming scan path
+(`SET stream_results = on`) is the nearest existing piece and does not yet
+cover joins, sorts or snapshot pinning across statements.
+
 ### Catalog metadata
 
 Scalar `DataType::Text` currently emits PostgreSQL VARCHAR OID 1043, including
