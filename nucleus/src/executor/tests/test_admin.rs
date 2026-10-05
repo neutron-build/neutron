@@ -1476,13 +1476,16 @@ async fn quoted_role_names_stored_without_delimiter_quotes() {
     // rendering left roles callable only as '"name"' (sql-probe-03 finding).
     let ex = test_executor();
     let id = ex.create_session();
-    CURRENT_SESSION.scope(
-        ex.get_session(id),
-        async {
+    CURRENT_SESSION
+        .scope(ex.get_session(id), async {
             let session = ex.current_session();
             session.session_context.write().user = "root".to_string();
-            ex.execute("CREATE ROLE root SUPERUSER LOGIN").await.unwrap();
-            ex.execute(r#"CREATE ROLE "probe_quoted" LOGIN"#).await.unwrap();
+            ex.execute("CREATE ROLE root SUPERUSER LOGIN")
+                .await
+                .unwrap();
+            ex.execute(r#"CREATE ROLE "probe_quoted" LOGIN"#)
+                .await
+                .unwrap();
             let role = ex
                 .roles
                 .read()
@@ -1495,7 +1498,6 @@ async fn quoted_role_names_stored_without_delimiter_quotes() {
                 !ex.roles.read().await.contains_key("\"probe_quoted\""),
                 "the quoted rendering must not be a separate stored name"
             );
-        },
-    )
-    .await;
+        })
+        .await;
 }

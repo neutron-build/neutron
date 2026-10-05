@@ -3189,7 +3189,7 @@ impl Executor {
                             .map(|(vidx, mut r)| {
                                 let mut v = self.eval_column_default(&new_col)?;
                                 super::column_writes::enforce_max_len(&mut v, &new_col)?;
-                            super::column_writes::enforce_numeric_typmod(&mut v, &new_col)?;
+                                super::column_writes::enforce_numeric_typmod(&mut v, &new_col)?;
                                 r.push(v);
                                 if !generated_exprs.is_empty() {
                                     self.apply_generated(

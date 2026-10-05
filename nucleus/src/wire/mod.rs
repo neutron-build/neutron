@@ -6935,13 +6935,7 @@ mod tests {
             NucleusHandler::infer_parameter_types_with_ast(sql, &[], Some(&stmts), Some(&executor));
         assert_eq!(
             types,
-            vec![
-                Type::INT8,
-                Type::BOOL,
-                Type::TEXT,
-                Type::JSONB,
-                Type::INT4
-            ]
+            vec![Type::INT8, Type::BOOL, Type::TEXT, Type::JSONB, Type::INT4]
         );
         let update = r#"UPDATE "s1"."docs" SET data = $1 WHERE id = $2"#;
         let stmts =
