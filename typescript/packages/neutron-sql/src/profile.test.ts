@@ -30,7 +30,7 @@ import { assertFiniteTable, finiteStatementGuard } from "./profile.js";
 // qualifier (conformance/polyglot/nucleus/ts_admission_native.mjs).
 
 const NUCLEUS_STARTUP = "16.0 (Nucleus)";
-const NUCLEUS_VERSION = "PostgreSQL 16.0 (Nucleus 1.2.0 — The Definitive Database)";
+const NUCLEUS_VERSION = "PostgreSQL 16.0 (Nucleus 1.2.2 — The Definitive Database)";
 const STARTUP_SQL = "select current_setting('server_version') as server_version";
 const VERSION_SQL = "select version() as version";
 
@@ -146,7 +146,7 @@ test("NP01: the named Nucleus candidate is exact, uncertified and immutable", as
   const identity = db.endpointIdentity;
   assert.ok(identity !== undefined);
   assert.equal(identity.engine, "nucleus");
-  assert.equal(identity.version, "1.2.0");
+  assert.equal(identity.version, "1.2.2");
   assert.equal(identity.profile, NUCLEUS_CANDIDATE_PROFILE);
   assert.equal(identity.packageEnabled, false);
   assert.equal(identity.qualification, "uncertified-finite-candidate");
@@ -167,7 +167,7 @@ test("NP01: contradictory or unknown reported identities are refused and the ada
   const cases: Array<[unknown, unknown]> = [
     ["16.0", NUCLEUS_VERSION],
     [NUCLEUS_STARTUP, "PostgreSQL 16.0"],
-    [NUCLEUS_STARTUP, NUCLEUS_VERSION.replace("1.2.0", "1.2.1")],
+    [NUCLEUS_STARTUP, NUCLEUS_VERSION.replace("1.2.2", "1.2.1")],
     ["17.6 (Debian 17.6-1)", "PostgreSQL 17.6 on x86_64"],
     [null, NUCLEUS_VERSION],
     [NUCLEUS_STARTUP, null],

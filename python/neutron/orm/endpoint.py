@@ -49,7 +49,7 @@ def admit(startup: object, reported: object, *, profile: str='postgres-direct') 
 # An explicit qualification profile, never inferred from pgwire compatibility.
 # This does not attest a binary or enable a certified package support matrix.
 NUCLEUS_CANDIDATE_PROFILE = 'nucleus-relational-rc-v1-candidate'
-NUCLEUS_CANDIDATE_VERSION = '1.2.0'
+NUCLEUS_CANDIDATE_VERSION = '1.2.2'
 NUCLEUS_CAPABILITIES = frozenset({'point-crud','read-committed-transaction','savepoint'})
 
 

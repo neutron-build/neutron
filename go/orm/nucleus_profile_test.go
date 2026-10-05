@@ -18,7 +18,7 @@ import (
 
 const (
 	np01Startup  = "16.0 (Nucleus)"
-	np01Reported = "PostgreSQL 16.0 (Nucleus 1.2.0 — The Definitive Database)"
+	np01Reported = "PostgreSQL 16.0 (Nucleus 1.2.2 — The Definitive Database)"
 )
 
 type np01Model struct {
@@ -152,7 +152,7 @@ func TestNucleusCandidateIdentityIsExactUncertifiedAndImmutable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if identity.Engine() != "nucleus" || identity.Version() != "1.2.0" || identity.Profile() != NucleusCandidateProfile ||
+	if identity.Engine() != "nucleus" || identity.Version() != "1.2.2" || identity.Profile() != NucleusCandidateProfile ||
 		identity.PackageEnabled() || identity.Qualification() != "uncertified-finite-candidate" {
 		t.Fatal(identity)
 	}
@@ -167,7 +167,7 @@ func TestNucleusCandidateIdentityIsExactUncertifiedAndImmutable(t *testing.T) {
 	for _, pair := range [][2]string{
 		{"16.0", np01Reported},
 		{np01Startup, "PostgreSQL 16.0"},
-		{np01Startup, strings.Replace(np01Reported, "1.2.0", "1.2.1", 1)},
+		{np01Startup, strings.Replace(np01Reported, "1.2.2", "1.2.1", 1)},
 		{"17.6 (Debian 17.6-1)", "PostgreSQL 17.6 on x86_64"},
 		{"", ""},
 	} {

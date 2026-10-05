@@ -9,7 +9,7 @@
 //                                          are refused. No statement guard.
 //   "nucleus-relational-rc-v1-candidate"   an UNCERTIFIED finite Nucleus
 //                                          candidate (startup 16.0 (Nucleus),
-//                                          SQL 1.2.0). Immutable capabilities,
+//                                          SQL 1.2.2). Immutable capabilities,
 //                                          packageEnabled false. Only generated
 //                                          point CRUD over registered,
 //                                          schema-qualified tables whose every
@@ -45,7 +45,7 @@ import { renderBeginSql, runTransaction, type PinnedExecutor, type QueryExecutio
 
 export const POSTGRES_DIRECT_PROFILE = "postgres-direct" as const;
 export const NUCLEUS_CANDIDATE_PROFILE = "nucleus-relational-rc-v1-candidate" as const;
-export const NUCLEUS_CANDIDATE_VERSION = "1.2.0";
+export const NUCLEUS_CANDIDATE_VERSION = "1.2.2";
 export const NUCLEUS_CAPABILITIES: readonly string[] = Object.freeze(["point-crud", "read-committed-transaction", "savepoint"]);
 
 export type ExecutionProfile = typeof POSTGRES_DIRECT_PROFILE | typeof NUCLEUS_CANDIDATE_PROFILE;

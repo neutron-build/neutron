@@ -32,7 +32,7 @@ import (
 const (
 	PostgresDirectProfile   = "postgres-direct"
 	NucleusCandidateProfile = "nucleus-relational-rc-v1-candidate"
-	NucleusCandidateVersion = "1.2.0"
+	NucleusCandidateVersion = "1.2.2"
 )
 
 // ErrProfileRefused matches every refusal by an explicit execution profile.
