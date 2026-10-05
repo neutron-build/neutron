@@ -307,8 +307,9 @@ Driver differences remain: codec.text_array_param passes through pg but is
 refused through postgres.js with SQLSTATE 22000. Selected catalog queries
 pass, but catalog.introspect_relations_query still fails on a boolean value
 shape ('t' versus true). CHECK rendering and regclass output also differ.
-Scalar Text emits VARCHAR OID 1043 rather than PostgreSQL TEXT OID 25;
-correct TEXT[] OID 1009 does not establish scalar type identity.
+Scalar Text advertises TEXT OID 25 (PostgreSQL's identity) since engine
+commit 814332c9; earlier builds emitted VARCHAR 1043, which strict clients
+that verify compiled-vs-wire type identity refused.
 
 ## Remaining limits
 
@@ -325,8 +326,7 @@ Nucleus support remains bounded by the recorded contracts:
    SERIALIZABLE refuse with 0A000. The SERIALIZABLE write-skew contract is
    unsupported; refusal is not PostgreSQL SSI (N11).
 4. **Catalog compatibility is incomplete.** Full relation-introspection
-   boolean shape, CHECK definitions, regclass output and scalar Text OID
-   limits remain; partial indexes are explicitly refused (N4).
+   boolean shape, CHECK definitions and regclass output limits remain; partial indexes are explicitly refused (N4).
 5. **RLS and session forms are restricted.** The app.tenant current_setting
    policy idiom is rejected; only the documented predicate subset is
    admitted. set_config and ALTER TABLE OWNER TO are unavailable. Default

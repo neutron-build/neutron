@@ -190,13 +190,15 @@ these bound every claim above:
 2. Buffered storage supplies READ COMMITTED only; REPEATABLE READ and
    SERIALIZABLE are refused with 0A000.
 3. Catalog fidelity is incomplete: relation-introspection boolean shape,
-   CHECK definition rendering, regclass output and the scalar Text wire OID
-   differ from PostgreSQL; partial indexes are refused rather than built.
+   CHECK definition rendering and regclass output differ from PostgreSQL
+   (scalar Text advertises OID 25 since engine 814332c9); partial indexes
+   are refused rather than built.
 4. Row-level-security predicates are restricted to a documented subset;
    `set_config` and `ALTER TABLE ... OWNER TO` are unavailable.
 5. Advisory locks, `LOCK TABLE`, `pg_sleep` and `pg_cancel_backend` are
    unavailable; row-lock timeout behavior differs from PostgreSQL's 55P03.
 6. `UPDATE ... FROM`, `DELETE ... USING` and row-value comparison are refused;
-   NUMERIC has a 96-bit coefficient with at most 28 fractional digits and
-   does not enforce `numeric(p,s)`; date infinity is rejected; enum ORDER BY
+   NUMERIC has a 96-bit coefficient with at most 28 fractional digits
+   (`numeric(p,s)` IS enforced — rounding, padding and 22003 refusals, see
+   the numeric semantics document); date infinity is rejected; enum ORDER BY
    is lexical rather than declaration order.
