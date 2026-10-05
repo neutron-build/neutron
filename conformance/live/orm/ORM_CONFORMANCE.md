@@ -51,19 +51,19 @@ is re-recorded and reviewed.
 | fact | value |
 |---|---|
 | engine | PostgreSQL 16.0 (Nucleus 1.2.0 — The Definitive Database) |
-| source commit (`--write` run) | `59fad7aed7889dff2d2efbb65c5aa4c6f14f8ea5` |
-| `nucleus/` tree SHA (the engine identity) | `3c5c6035b5e6602cf65ba23c917fe83848888571` |
-| binary SHA-256 (provenance only; release builds are not bit-reproducible) | `be4fc47554fd2be9d060d3221b14425b11db52dc3bfa0852e1be7943990e1c6a` |
+| source commit (`--write` run) | `b62e7d2451924050559e050dc33d8a280859f6d8` |
+| `nucleus/` tree SHA (the engine identity) | `f17ef40489ea35e099ff07f36c77bc4749276dc9` |
+| binary SHA-256 (provenance only; release builds are not bit-reproducible) | `not recorded` |
 | drivers | `pg` 8.22.0, `postgres` 3.4.8 |
 | runtime | Node v22.23.2, `@neutron-build/sql` 0.1.0 |
-| recorded | 2026-09-30 |
+| recorded | 2026-10-05 |
 
 ### Totals
 
 | driver | probes | supported | unsupported | unknown |
 |---|---|---|---|---|
-| `pg` | 143 | 108 | 34 | 1 |
-| `postgres` | 143 | 107 | 35 | 1 |
+| `pg` | 143 | 104 | 38 | 1 |
+| `postgres` | 143 | 103 | 39 | 1 |
 
 Driver-divergent verdicts: `codec.text_array_param` (pg supported, postgres unsupported).
 
@@ -75,12 +75,12 @@ Driver-divergent verdicts: `codec.text_array_param` (pg supported, postgres unsu
 | relation-sql | 25 | 24 / 1 / 0 | 24 / 1 / 0 |
 | dml | 14 | 12 / 2 / 0 | 12 / 2 / 0 |
 | constraints | 9 | 9 / 0 / 0 | 9 / 0 / 0 |
-| codec | 19 | 15 / 4 / 0 | 14 / 5 / 0 |
+| codec | 19 | 16 / 3 / 0 | 15 / 4 / 0 |
 | catalog | 14 | 9 / 5 / 0 | 9 / 5 / 0 |
-| ddl | 11 | 3 / 8 / 0 | 3 / 8 / 0 |
-| rls | 12 | 8 / 3 / 1 | 8 / 3 / 1 |
+| ddl | 11 | 2 / 9 / 0 | 2 / 9 / 0 |
+| rls | 12 | 6 / 5 / 1 | 6 / 5 / 1 |
 | locks | 11 | 3 / 8 / 0 | 3 / 8 / 0 |
-| transactions | 7 | 4 / 3 / 0 | 4 / 3 / 0 |
+| transactions | 7 | 2 / 5 / 0 | 2 / 5 / 0 |
 | orm | 19 | 19 / 0 / 0 | 19 / 0 / 0 |
 
 ### Every probe
@@ -162,8 +162,8 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | probe | pg | postgres | SQLSTATE | evidence |
 |---|---|---|---|---|
 | `codec.int8_extremes` | supported | supported |  |  |
-| `codec.numeric_precision` | unsupported | unsupported | 22000 | server error: ServerSqlError [22000]: pg: invalid value for column 'v' (NUMERIC): numeric value '12345678901234567890.12345678901234567890' exceeds NUMERIC precision ceiling: Nucl… |
-| `codec.numeric_unconstrained` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected [ + '1.5', - '1.50', |
+| `codec.numeric_precision` | unsupported | unsupported | 22003 | server error: ServerSqlError [22003]: pg: invalid value for column 'v' (NUMERIC): numeric value '12345678901234567890.12345678901234567890' exceeds NUMERIC precision ceiling: Nucl… |
+| `codec.numeric_unconstrained` | supported | supported |  |  |
 | `codec.timestamp_microseconds` | supported | supported |  |  |
 | `codec.timestamptz_utc` | supported | supported |  |  |
 | `codec.timestamptz_session_timezone` | supported | supported |  |  |
@@ -195,7 +195,7 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | `catalog.pg_index` | supported | supported |  |  |
 | `catalog.partial_index` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: partial indexes (CREATE INDEX ... WHERE) are not implemented. The predicate was previously parsed and discarded, which built a FULL index… |
 | `catalog.pg_get_indexdef` | supported | supported |  |  |
-| `catalog.regclass_cast` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected [ true, + '956476087' |
+| `catalog.regclass_cast` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected [ true, + '592577847' |
 | `catalog.pg_enum` | supported | supported |  |  |
 | `catalog.views` | supported | supported |  |  |
 | `catalog.current_schema_and_search_path` | supported | supported |  |  |
@@ -206,12 +206,12 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 |---|---|---|---|---|
 | `ddl.create_table_rollback` | unsupported | unsupported |  | wrong result: table must not survive ROLLBACK true !== false |
 | `ddl.alter_add_column_rollback` | unsupported | unsupported |  | wrong result: column must not survive ROLLBACK true !== false |
-| `ddl.drop_table_rollback` | unsupported | unsupported | 42P01 | server error: ServerSqlError [42P01]: pg: relation "x00d_a6699b_base" does not exist |
+| `ddl.drop_table_rollback` | unsupported | unsupported | 42P01 | server error: ServerSqlError [42P01]: pg: relation "x00d_563629_base" does not exist |
 | `ddl.create_index_rollback` | unsupported | unsupported |  | wrong result: index relation must not survive ROLLBACK true !== false |
 | `ddl.rename_column_rollback` | unsupported | unsupported |  | wrong result: original column name must be back false !== true |
 | `ddl.failed_migration_all_or_nothing` | unsupported | unsupported |  | wrong result: first CREATE TABLE must be rolled back true !== false |
 | `ddl.ddl_and_history_commit_together` | supported | supported |  |  |
-| `ddl.error_aborts_transaction` | supported | supported |  |  |
+| `ddl.error_aborts_transaction` | unsupported | unsupported |  | wrong result: ServerSqlError [23505]: pg: duplicate key value violates unique constraint on (id) '23505' !== '25P02' |
 | `ddl.uncommitted_ddl_invisible` | unsupported | unsupported |  | wrong result: uncommitted table visible to another session true !== false |
 | `ddl.create_index_concurrently_in_tx_rejected` | unsupported | unsupported |  | wrong result: CIC in a transaction block: expected SQLSTATE 25001, statement succeeded |
 | `ddl.create_index_concurrently` | supported | supported |  |  |
@@ -224,13 +224,13 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | `rls.current_user_policy` | supported | supported |  |  |
 | `rls.with_check_blocks_insert` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: unsupported row-security predicate 'current_setting('app.tenant')::INT'; supported forms are boolean constants, column equality to a lite… |
 | `rls.no_policy_default_deny` | supported | supported |  |  |
-| `rls.owner_bypass_unless_forced` | unknown | unknown |  | setup failed: ServerSqlError [0A000]: pg: ALTER TABLE operation not yet supported: OWNER TO x00s_ed4c52_app — in: alter table x00s_ed4c52_docs owner to x00s_ed4c52_app |
+| `rls.owner_bypass_unless_forced` | unknown | unknown |  | setup failed: ServerSqlError [0A000]: pg: ALTER TABLE operation not yet supported: OWNER TO x00s_1cc78e_app — in: alter table x00s_1cc78e_docs owner to x00s_1cc78e_app |
 | `rls.set_config_transaction_local` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: unknown function: SET_CONFIG |
 | `rls.pg_policies_introspection` | supported | supported |  |  |
 | `rls.set_local_role_transaction_local` | supported | supported |  |  |
-| `rls.set_local_role_rolled_back` | supported | supported |  |  |
+| `rls.set_local_role_rolled_back` | unsupported | unsupported |  | error: NeutronSqlError: transaction SQL: persistent session changes and distributed transaction control are forbidden |
 | `rls.set_local_setting_transaction_local` | supported | supported |  |  |
-| `rls.set_session_setting_transaction_scope` | supported | supported |  |  |
+| `rls.set_session_setting_transaction_scope` | unsupported | unsupported |  | error: NeutronSqlError: transaction SQL: persistent session changes and distributed transaction control are forbidden |
 | `rls.privilege_denied_without_grant` | supported | supported |  |  |
 
 #### locks
@@ -242,12 +242,12 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | `lock.advisory_xact` | unsupported | unsupported | 25P02 | server error: ServerSqlError [25P02]: pg: current transaction is aborted, commands ignored until end of transaction block |
 | `lock.select_for_update_nowait` | supported | supported |  |  |
 | `lock.select_for_update_skip_locked` | supported | supported |  |  |
-| `lock.row_lock_timeout` | unsupported | unsupported |  | wrong result: update of a row locked by an open transaction: expected SQLSTATE 55P03, got ServerSqlError [XX000]: pg: I/O error: timed out after 10002ms waiting for another transa… |
+| `lock.row_lock_timeout` | unsupported | unsupported |  | wrong result: update of a row locked by an open transaction: expected SQLSTATE 55P03, got ServerSqlError [XX000]: pg: I/O error: timed out after 10000ms waiting for another transa… |
 | `lock.blocked_update_waits_then_applies` | supported | supported |  |  |
 | `lock.lock_table_nowait` | unsupported | unsupported | 42601 | server error: ServerSqlError [42601]: pg: parse error: SQL parse error: sql parser error: Expected: an SQL statement, found: lock at Line: 1, Column: 1 |
 | `lock.statement_timeout` | unsupported | unsupported |  | wrong result: pg_sleep past statement_timeout: expected SQLSTATE 57014, got ServerSqlError [0A000]: pg: unknown function: PG_SLEEP |
 | `lock.cancel_request` | unsupported | unsupported |  | wrong result: deadline on pg_sleep(4): expected SQLSTATE 57014, got ServerSqlError [0A000]: pg: unknown table function: pg_sleep |
-| `lock.pg_cancel_backend` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: unknown function: PG_CANCEL_BACKEND |
+| `lock.pg_cancel_backend` | unsupported | unsupported | XX000 | wrong result: pg_cancel_backend returned false false !== true |
 
 #### transactions
 
@@ -258,8 +258,8 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | `txn.repeatable_read_snapshot` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: isolation level REPEATABLE READ is not available on this storage engine, which provides READ COMMITTED. Accepting it would run your trans… |
 | `txn.read_committed_sees_commits` | supported | supported |  |  |
 | `txn.serializable_write_skew` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: isolation level SERIALIZABLE is not available on this storage engine, which provides READ COMMITTED. Accepting it would run your transact… |
-| `txn.savepoint_rollback` | supported | supported |  |  |
-| `txn.savepoint_recovers_error` | supported | supported |  |  |
+| `txn.savepoint_rollback` | unsupported | unsupported |  | error: NeutronSqlError: transaction SQL: transaction and session control belongs to the runner |
+| `txn.savepoint_recovers_error` | unsupported | unsupported |  | error: NeutronSqlError: transaction SQL: transaction and session control belongs to the runner |
 
 #### orm
 
