@@ -5323,7 +5323,7 @@ fn data_type_to_pg(dt: &DataType) -> Type {
         DataType::Int32 => Type::INT4,
         DataType::Int64 => Type::INT8,
         DataType::Float64 => Type::FLOAT8,
-        DataType::Text => Type::VARCHAR,
+        DataType::Text => Type::TEXT,
         DataType::Jsonb => Type::JSONB,
         DataType::Date => Type::DATE,
         DataType::Timestamp => Type::TIMESTAMP,
