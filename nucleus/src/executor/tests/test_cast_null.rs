@@ -17,8 +17,8 @@ async fn cast_of_a_null_value_to_text_stays_null() {
     .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
-    for column in 0..4 {
-        assert_eq!(r[0][column], Value::Null, "column {column} must stay NULL");
+    for (column, cell) in r[0].iter().take(4).enumerate() {
+        assert_eq!(*cell, Value::Null, "column {column} must stay NULL");
     }
     assert_eq!(r[0][4], Value::Bool(true));
 }
