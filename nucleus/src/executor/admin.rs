@@ -932,7 +932,7 @@ impl Executor {
             let granted_roles: Vec<String> = actions
                 .iter()
                 .filter_map(|action| match action {
-                    ast::Action::Role { role } => role.0.first().map(|i| i.value.clone()),
+                    ast::Action::Role { role } => Some(object_name_value(role)),
                     _ => None,
                 })
                 .collect();
@@ -1045,7 +1045,7 @@ impl Executor {
             let revoked: Vec<String> = actions
                 .iter()
                 .filter_map(|action| match action {
-                    ast::Action::Role { role } => role.0.first().map(|i| i.value.clone()),
+                    ast::Action::Role { role } => Some(object_name_value(role)),
                     _ => None,
                 })
                 .collect();
@@ -1119,7 +1119,22 @@ impl Executor {
         })
     }
 
-    pub(super) async fn execute_create_role(
+    
+/// The identifier value of a (possibly quoted) object name, without the
+/// delimiter quotes its Display rendering carries. Quotes delimit; they are
+/// not part of the name.
+fn object_name_value(name: &ast::ObjectName) -> String {
+    name.0
+        .iter()
+        .filter_map(|part| match part {
+            ast::ObjectNamePart::Identifier(ident) => Some(ident.value.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+pub(super) async fn execute_create_role(
         &self,
         create_role: ast::CreateRole,
     ) -> Result<ExecResult, ExecError> {
@@ -1133,7 +1148,7 @@ impl Executor {
         };
         let mut roles = self.roles.write().await;
         for name in &create_role.names {
-            let role_name = name.value.clone();
+            let role_name = object_name_value(name);
             // SEC-4, defence in depth. Authority is the bypass_rls attribute now,
             // so a role of this name confers nothing -- but policy TO-clauses
             // still address roles BY NAME, and a role called "superuser" is an
