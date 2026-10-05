@@ -152,10 +152,10 @@ def register_binary_param_dumpers(connection: psycopg.Connection) -> None:
     from psycopg.adapt import Dumper
     from psycopg.pq import Format
 
-    def by_oid(oid: int) -> type:
+    def by_oid(type_oid: int) -> type:
         class OidBinaryDumper(Dumper):
             format = Format.BINARY
-            oid = oid
+            oid = type_oid
 
             def __init__(self, cls: type, context: object = None) -> None:
                 super().__init__(cls, context)
