@@ -5,6 +5,37 @@ Notable changes to the Nucleus engine. Format follows
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-10-04
+
+### Fixed
+
+- **CREATE UNIQUE INDEX was still not enforced for wire-level autocommit
+  statements.** 1.2.1's enforcement (see its entry below) covered the parsed
+  INSERT/UPDATE path — but simple-protocol autocommit statements take the SQL
+  OLTP fast path, which writes straight to storage and only declined tables
+  with table-level constraints, so a table whose uniqueness came from a
+  `CREATE UNIQUE INDEX` accepted duplicate keys over the wire on every engine
+  (found from a live consumer, neutron#69). The fast path now declines any
+  table with a unique index for INSERT, and UPDATE declines when an assigned
+  column participates in one — both fall back to the enforcing parsed path and
+  both fail closed when the catalog cannot be read. Indexed keys also take
+  `UniqueGate` slots so two concurrent sessions cannot race check-then-write
+  on the same key, and index-sourced violations now report PostgreSQL's shape,
+  `duplicate key value violates unique constraint "<index>"` (SQLSTATE 23505),
+  instead of listing raw columns. ORM conformance verdicts are unchanged (the
+  extended protocol was already enforced).
+
+### Changed
+
+- **The statement dispatcher's debug stack cost is 27% smaller.** Every
+  heavyweight arm of `execute_statement_inner` now awaits a boxed sub-future,
+  so their state machines live on the heap instead of the enclosing poll
+  frame: the deepest executor test's stack requirement drops from ~1.94 MiB
+  to ~1.41 MiB (neutron#70). No behavior change. The remaining cost is the
+  view-expansion recursion tower (~540 KiB per view level, re-entering
+  top-level `execute()` once per level), mapped in PR #73 for any future
+  deeper fix; CI keeps its 8 MiB test-thread headroom.
+
 ## [1.2.1] - 2026-10-04
 
 ### Fixed
