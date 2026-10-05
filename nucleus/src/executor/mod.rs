@@ -7642,8 +7642,15 @@ impl Executor {
                 object_type,
                 names,
                 if_exists,
+                cascade,
                 ..
-            } => self.execute_drop(object_type, names, if_exists).await,
+            } => {
+                if object_type == ast::ObjectType::Schema {
+                    self.execute_drop_schema(names, if_exists, cascade).await
+                } else {
+                    self.execute_drop(object_type, names, if_exists).await
+                }
+            }
             Statement::CreateIndex(create_index) => self.execute_create_index(create_index).await,
             Statement::StartTransaction { ref modes, .. } => {
                 // ISOLATION LEVEL and READ ONLY are applied to the transaction
@@ -9593,6 +9600,104 @@ impl Executor {
         }
         Ok(ExecResult::Command {
             tag: "DROP EXTENSION".into(),
+            rows_affected: 0,
+        })
+    }
+
+    // ========================================================================
+    // Schemas (DROP SCHEMA)
+    // ========================================================================
+
+    /// `DROP SCHEMA [IF EXISTS] name [, ...]` — RESTRICT only.
+    ///
+    /// A schema is a name in the `schemas` registry; its objects are entries
+    /// keyed `schema.object` across the engine's flat-keyed stores: catalog
+    /// tables, indexes and enum types, views, materialized views, sequences
+    /// and functions. RESTRICT — the default, and the only mode implemented —
+    /// refuses while any such entry remains, naming the objects, so a drop can
+    /// never orphan keys under a schema that no longer exists. `IF EXISTS`
+    /// turns a missing schema into a no-op success, mirroring how
+    /// `DROP TABLE IF EXISTS` behaves. CASCADE is refused outright rather
+    /// than silently degraded to RESTRICT. `public` and the session's current
+    /// schema get no special case: unqualified DDL stores bare names, so an
+    /// empty `public` is droppable exactly like any other schema.
+    async fn execute_drop_schema(
+        &self,
+        names: Vec<ast::ObjectName>,
+        if_exists: bool,
+        cascade: bool,
+    ) -> Result<ExecResult, ExecError> {
+        if cascade {
+            return Err(ExecError::Unsupported(
+                "DROP SCHEMA CASCADE is not implemented; drop the schema's objects first".into(),
+            ));
+        }
+        // Same authority gate as every other DROP (see execute_drop).
+        self.require_security_admin("drop an object")?;
+        for name in &names {
+            let schema_name = name.to_string();
+            // Held across the member scan so two concurrent DROP SCHEMA calls
+            // cannot both pass the emptiness check for the same name. No
+            // other DDL path takes this lock, so no lock-order cycle is
+            // possible.
+            let mut schemas = self.schemas.write().await;
+            if !schemas.contains(&schema_name) {
+                if if_exists {
+                    continue;
+                }
+                return Err(ExecError::Unsupported(format!(
+                    "schema '{schema_name}' does not exist"
+                )));
+            }
+            let prefix = format!("{schema_name}.");
+            let mut members: Vec<String> = Vec::new();
+            for table in self.catalog.list_tables().await {
+                if table.name.starts_with(&prefix) {
+                    members.push(table.name.clone());
+                }
+            }
+            for index in self.catalog.get_all_indexes().await {
+                if index.name.starts_with(&prefix) {
+                    members.push(index.name.clone());
+                }
+            }
+            for type_name in self.catalog.list_enum_types().await {
+                if type_name.starts_with(&prefix) {
+                    members.push(type_name);
+                }
+            }
+            for view in self.views.read().await.keys() {
+                if view.starts_with(&prefix) {
+                    members.push(view.clone());
+                }
+            }
+            for mat_view in self.materialized_views.read().await.keys() {
+                if mat_view.starts_with(&prefix) {
+                    members.push(mat_view.clone());
+                }
+            }
+            for sequence in self.sequences.read().keys() {
+                if sequence.starts_with(&prefix) {
+                    members.push(sequence.clone());
+                }
+            }
+            for function in self.functions.read().keys() {
+                if function.starts_with(&prefix) {
+                    members.push(function.clone());
+                }
+            }
+            if !members.is_empty() {
+                members.sort();
+                return Err(ExecError::Unsupported(format!(
+                    "cannot drop schema \"{schema_name}\" because it contains {}; \
+                     drop those objects first",
+                    members.join(", ")
+                )));
+            }
+            schemas.remove(&schema_name);
+        }
+        Ok(ExecResult::Command {
+            tag: "DROP SCHEMA".into(),
             rows_affected: 0,
         })
     }
