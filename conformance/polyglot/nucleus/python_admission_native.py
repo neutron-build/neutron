@@ -13,8 +13,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import sys
+import traceback
 import psycopg
 from psycopg import sql
 from neutron.orm import AsyncDatabase, Database, ColumnSpec, JsonDocument, Mutation, OrmError, Table, insert, select_row, update
@@ -157,8 +159,10 @@ def main() -> None:
     except BaseException as error:
         failure=error
         cause=error.__cause__ or error.__context__
+        frames=[f'{Path(f.filename).name}:{f.lineno}:{f.name}' for f in traceback.extract_tb(error.__traceback__)][-8:]
+        message=re.sub(r'\w+://\S+','[url]',(str(error).splitlines() or [''])[0])[:300]
         report['failure']={'class':type(error).__name__,'sqlstate':getattr(error,'sqlstate',None),
-            'reason':str(error) if isinstance(error,AssertionError) else None,
+            'reason':str(error) if isinstance(error,AssertionError) else None,'message':message,'frames':frames,
             'cause':None if cause is None else {'class':type(cause).__name__,'sqlstate':getattr(cause,'sqlstate',None),
                 'message':(str(cause).splitlines() or [''])[0][:300]}}
     finally:

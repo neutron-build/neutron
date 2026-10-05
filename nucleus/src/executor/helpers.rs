@@ -1132,11 +1132,6 @@ pub(super) fn sql_replacement_for_value(value: &Value) -> String {
         Value::Float64(f) if f.is_nan() => "'NaN'::double precision".to_string(),
         Value::Float64(f) if *f > 0.0 => "'Infinity'::double precision".to_string(),
         Value::Float64(_) => "'-Infinity'::double precision".to_string(),
-        Value::Numeric(text)
-            if !text.is_empty() && text.chars().all(|c| matches!(c, '0'..='9' | '.' | '-')) =>
-        {
-            format!("({text})")
-        }
         Value::Numeric(text) => format!("'{}'::numeric", sanitize_sql_text_literal(text)),
         Value::Bool(b) => b.to_string(),
         Value::Null => "NULL".to_string(),
