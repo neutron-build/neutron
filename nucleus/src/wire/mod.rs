@@ -9012,7 +9012,20 @@ mod security_tests {
             "first append id must be <ms>-0, got {id}"
         );
 
-        // 2 + 3. Each failing statement: ONE error naming entry <ms>-0.
+        // 2 + 3. Each failing statement: ONE error naming the entry id that
+        // evaluation actually attempted. For SIMPLE (the second append to
+        // stream 'once'), once-ness is proven by ORDER, not by the literal
+        // seq: the attempted id must be the immediate successor of OK1's id.
+        // A literal `-0` requirement false-fails when both appends land in
+        // the same millisecond (OK1 `<ms>-0`, successor `<ms>-1`); a
+        // swallowed-and-rerun evaluation instead consumes TWO ids, so its
+        // error names the successor of the successor — which this still
+        // catches. EXTENDED appends to a fresh stream, so its first
+        // attempted id is always `<ms>-0`.
+        let (ok1_ms, ok1_seq) = id
+            .rsplit_once('-')
+            .and_then(|(ms, seq)| Some((ms.to_string(), seq.parse::<u64>().ok()?)))
+            .unwrap_or_else(|| panic!("unparseable OK1 id: {id}"));
         for marker in ["SIMPLE ", "EXTENDED "] {
             let line = stdout
                 .lines()
@@ -9029,10 +9042,28 @@ mod security_tests {
                 .nth(1)
                 .and_then(|s| s.split(" for stream").next())
                 .unwrap_or_else(|| panic!("no entry id in error: {msg}"));
-            assert!(
-                entry_id.ends_with("-0"),
-                "{marker}error names {entry_id} — a -1 suffix means an earlier \
-                 evaluation's error was swallowed and the statement re-run: {msg}"
+            let (ms, seq) = entry_id
+                .rsplit_once('-')
+                .and_then(|(ms, seq)| Some((ms, seq.parse::<u64>().ok()?)))
+                .unwrap_or_else(|| panic!("unparseable entry id in error: {msg}"));
+            let expected = match marker.trim() {
+                // Same millisecond: the next seq; later millisecond: seq 0.
+                "SIMPLE" => {
+                    if ms == ok1_ms {
+                        (ok1_ms.clone(), ok1_seq + 1)
+                    } else {
+                        (ms.clone(), 0)
+                    }
+                }
+                _ => (ms.clone(), 0),
+            };
+            assert_eq!(
+                (ms.as_str(), seq),
+                (expected.0.as_str(), expected.1),
+                "{marker}error names {entry_id} — the statement must consume \
+                 exactly one entry id after OK1's {id}; two ids mean an \
+                 earlier evaluation's error was swallowed and the statement \
+                 re-run: {msg}"
             );
         }
 
