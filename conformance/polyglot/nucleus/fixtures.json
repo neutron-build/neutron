@@ -1,22 +1,77 @@
 {
-  "protocol": "nucleus-profile-assessment-fixtures-v1",
-  "profile": "nucleus-relational-rc-v1-candidate",
-  "executed": false,
-  "placeholder_contract": {"typescript-and-go": "$1, $2, ...", "python-psycopg": "%s with quoted percent identifiers escaped as %%"},
-  "setup": "CREATE TABLE \"OWNED_SCHEMA\".\"profile_rows\" (id integer PRIMARY KEY, wide bigint NOT NULL, flag boolean NOT NULL, body text NOT NULL, moment timestamptz NOT NULL, document jsonb, sql_null text)",
+  "status": "complete",
+  "scope": "observed numeric outcomes from one exact binary and the PostgreSQL oracle; differences are reported for review, not judged",
+  "binarySha256": "5fc8388fa5dc0afaaa44ab6122473f8a1f58699516118d5f0e55df9c2c4cc5df",
+  "runnerSha256": "6e7c14ac9ebfdca03e2a6802cc3a90917abbb898398c35196ef669811c056737",
+  "fixturesSha256": "bf483c2eac96d6ee311b425c765b3e3ed7636926242e8531882f9b25d61dff50",
+  "postgresUrlEnv": "NEUTRON_TEST_DATABASE_URL",
+  "psycopgVersion": "3.3.6",
+  "caseCount": 2,
   "cases": [
-    {"id": "profile-bound-scalar-insert", "status": "candidate-unverified", "sql": "INSERT INTO \"OWNED_SCHEMA\".\"profile_rows\" (id,wide,flag,body,moment,document,sql_null) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id,wide,flag,body,moment,document,sql_null", "params": [1,"9007199254740993",false,"","2024-01-02T03:04:05.123456Z","null",null], "oracle": "Native independent text projections retain exact wide integer/microseconds, false and empty, SQL NULL and JSON null independently; actual ORM compiled SQL and native values must be captured per client."},
-    {"id": "profile-qualified-point-read", "status": "candidate-unverified", "sql": "SELECT id,wide,flag,body,moment,document,sql_null FROM \"OWNED_SCHEMA\".\"profile_rows\" WHERE id=$1 LIMIT $2", "params": [1,2], "oracle": "Create a second schema/table with same relation name and hostile search_path; every fresh ORM reads only the intended qualified row. LIMIT2 is Go exact-one shape; TS/Python exact-one differences must be retained."},
-    {"id": "profile-explicit-update", "status": "candidate-unverified", "sql": "UPDATE \"OWNED_SCHEMA\".\"profile_rows\" SET wide=$1,flag=$2,body=$3 WHERE id=$4", "params": ["0",false,"",1], "oracle": "Native affected count1, independently fetched exact zero/false/empty. No zero-value omission or fallback."},
-    {"id": "profile-savepoint-poison-recovery", "status": "candidate-unverified", "statements": ["BEGIN ISOLATION LEVEL READ COMMITTED", "SAVEPOINT owned_inner", "INSERT INTO \"OWNED_SCHEMA\".\"profile_rows\" SELECT * FROM \"OWNED_SCHEMA\".\"profile_rows\" WHERE id=1", "ROLLBACK TO SAVEPOINT owned_inner", "RELEASE SAVEPOINT owned_inner", "COMMIT"], "oracle": "Duplicate is23505, subsequent innerstatement25P02 untilrollback, parent remains usable; fresh Session/Scope handles and native persisted rows agree."},
-    {"id": "profile-read-only-refuses", "status": "candidate-unverified", "statements": ["BEGIN READ ONLY", "DELETE FROM \"OWNED_SCHEMA\".\"profile_rows\" WHERE id=1", "ROLLBACK"], "oracle": "Write is25006 before mutation, native row remains."},
-    {"id": "profile-higher-isolation-refuses", "status": "historical-source-refusal-unverified-current", "statements": ["BEGIN ISOLATION LEVEL REPEATABLE READ", "BEGIN ISOLATION LEVEL SERIALIZABLE"], "oracle": "Buffered-disk reports0A000 for each; never returns successful weaker isolation or switches storage engines without declaration."},
-    {"id": "profile-local-state-reset", "status": "candidate-unverified", "statements": ["BEGIN", "SET LOCAL app.tenant='owned'", "SAVEPOINT owned_local", "SET LOCAL app.tenant='inner'", "ROLLBACK TO SAVEPOINT owned_local", "ROLLBACK", "DISCARD ALL"], "oracle": "Separate sessions never inherit local role/settings; reset leaves no prepared/cursor authority. Required auth negative controls are independent."},
-    {"id": "mandatory-numeric-scale", "status": "known-semantic-mismatch-not-acceptance", "sql": "SELECT '1.50'::numeric::text", "postgres_oracle": "1.50", "historical_nucleus": "1.5", "blocker": "NP03"},
-    {"id": "mandatory-numeric-range", "status": "known-range-refusal-not-parity", "sql": "SELECT '12345678901234567890.12345678901234567890'::numeric::text", "postgres_oracle": "12345678901234567890.12345678901234567890", "historical_nucleus_sqlstate": "22000", "blocker": "NP03"},
-    {"id": "mandatory-transactional-ddl", "status": "known-semantic-mismatch-not-acceptance", "statements": ["BEGIN", "CREATE TABLE \"OWNED_SCHEMA\".\"rollback_catalog\"(id integer)", "ROLLBACK"], "postgres_oracle": "relation absent and never visible to independent session before commit", "historical_nucleus": "DDL catalog is not transactionally undone", "blocker": "NP04"},
-    {"id": "mandatory-sql-cancellation-identity", "status": "selected-blocker-unimplemented", "statements": ["SELECT pg_backend_pid()", "SELECT pg_cancel_backend($1)"], "oracle": "Wire BackendKeyData and SQL target identify same single session; authorized cancel gives target57014, bystander unchanged. Use actual long dispatched supported query/lock wait, not missing pg_sleep as a test substitute.", "blocker": "NP02"},
-    {"id": "mandatory-bounded-server-cursor", "status": "source-materialization-blocker", "statements": ["BEGIN READ ONLY", "DECLARE owned_stream NO SCROLL CURSOR FOR SELECT * FROM \"OWNED_SCHEMA\".\"profile_rows\"", "FETCH FORWARD 1 FROM owned_stream", "CLOSE owned_stream", "ROLLBACK"], "oracle": "Server memory and cancellation observed over independent large fixture; client fetchbatch1 alone does not prove server bounded memory.", "blocker": "NP05"}
+    {
+      "id": "mandatory-numeric-scale",
+      "sql": "SELECT '1.50'::numeric::text",
+      "recorded": {
+        "postgresOracle": "1.50",
+        "historicalNucleus": "1.5"
+      },
+      "postgres": {
+        "outcome": "ok",
+        "rows": [
+          [
+            "1.50"
+          ]
+        ],
+        "sqlstate": null,
+        "messageFirstLine": ""
+      },
+      "nucleus": {
+        "outcome": "ok",
+        "rows": [
+          [
+            "1.50"
+          ]
+        ],
+        "sqlstate": null,
+        "messageFirstLine": ""
+      },
+      "differences": [
+        "nucleus-changed-vs-recorded: recorded \"1.5\" | observed ok [[\"1.50\"]]"
+      ]
+    },
+    {
+      "id": "mandatory-numeric-range",
+      "sql": "SELECT '12345678901234567890.12345678901234567890'::numeric::text",
+      "recorded": {
+        "postgresOracle": "12345678901234567890.12345678901234567890",
+        "historicalNucleusSqlstate": "22000"
+      },
+      "postgres": {
+        "outcome": "ok",
+        "rows": [
+          [
+            "12345678901234567890.12345678901234567890"
+          ]
+        ],
+        "sqlstate": null,
+        "messageFirstLine": ""
+      },
+      "nucleus": {
+        "outcome": "error",
+        "rows": [],
+        "sqlstate": "22003",
+        "messageFirstLine": "NumericValueOutOfRange: numeric value '12345678901234567890.12345678901234567890' exceeds NUMERIC precision ceiling: Nucleus stores NUMERIC as a 96-bit coefficient with scale <= 28 (max 28 fractional digits)"
+      },
+      "differences": [
+        "postgres-vs-nucleus: postgres ok [[\"12345678901234567890.12345678901234567890\"]] | nucleus error 22003 NumericValueOutOfRange: numeric value '12345678901234567890.12345678901234567890' exceeds NUMERIC precision ceiling: Nucleus stores NUMERIC as a 96-bit coefficient with scale <= 28 (max 28 fractional digits)",
+        "nucleus-sqlstate-changed-vs-recorded: recorded \"22000\" | observed \"22003\""
+      ]
+    }
   ],
-  "qualification_rule": "Fixture examples are not execution evidence or universal SQL grammar admission. Every positive candidate requires actual newly installed ORM consumers and native independent oracle; known mismatches block their mandatory requirement rather than count as passing negative parity."
+  "runningImageSha256": "5fc8388fa5dc0afaaa44ab6122473f8a1f58699516118d5f0e55df9c2c4cc5df",
+  "differenceCount": 3,
+  "engineStopped": true,
+  "engineExitCode": 0,
+  "engineLogTail": ":13.201662Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mnucleus\u001b[0m\u001b[2m:\u001b[0m Query memory budget: 384 MB (75% of the 512 MB server limit)\n\u001b[2m2026-10-05T05:11:13.201685Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mnucleus\u001b[0m\u001b[2m:\u001b[0m Disk watermarks: warn<10.0% readonly<3.0% resume>6.0% min-free=256 MB \u2014 /tmp/neutron-numeric-record-8w3s0z3r/db has 74.25% free (2.9 GiB of 3.9 GiB); watermarks warn<10.00% readonly<3.00% min-free=256.0 MiB\n\u001b[2m2026-10-05T05:11:13.201754Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mnucleus\u001b[0m\u001b[2m:\u001b[0m Durability: synchronous_commit=on (commit-time WAL force)\n\u001b[2m2026-10-05T05:11:13.203982Z\u001b[0m \u001b[33m WARN\u001b[0m \u001b[2mnucleus\u001b[0m\u001b[2m:\u001b[0m TLS disabled -- connections will be unencrypted\n\u001b[2m2026-10-05T05:11:13.204085Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mnucleus::distributed::replicator\u001b[0m\u001b[2m:\u001b[0m raft: restored durable state from /tmp/neutron-numeric-record-8w3s0z3r/db/raft (term 0, voted_for None, log to 0)\n\u001b[2m2026-10-05T05:11:13.204178Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mnucleus\u001b[0m\u001b[2m:\u001b[0m Background workers started (2 workers)\n\u001b[2m2026-10-05T05:11:13.204199Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mnucleus\u001b[0m\u001b[2m:\u001b[0m Memory watchdog: monitoring RSS, pressure at 85% of 512 MB\n\u001b[2m2026-10-05T05:11:13.204204Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mnucleus\u001b[0m\u001b[2m:\u001b[0m Replication server listening on 127.0.0.1:5434\n\u001b[2m2026-10-05T05:11:13.204322Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mnucleus::replication\u001b[0m\u001b[2m:\u001b[0m Replication server listening on 127.0.0.1:5434\n\u001b[2m2026-10-05T05:11:13.204350Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mnucleus\u001b[0m\u001b[2m:\u001b[0m Runtime: 3 cores, round-robin connection routing\n\u001b[2m2026-10-05T05:11:13.204365Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mnucleus\u001b[0m\u001b[2m:\u001b[0m RESP server on port 45069 (redis-cli compatible)\n\u001b[2m2026-10-05T05:11:13.204370Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mnucleus\u001b[0m\u001b[2m:\u001b[0m Metrics HTTP endpoint disabled (metrics.enabled = false)\n\n  Nucleus is ready.\n  Listening on: 127.0.0.1:45711\n  Mode:         standalone\n  Cores:        3\n  Buffer pool:  16 MB\n  Cache:        8 MB\n  Log level:    info\n  Cluster port: 5433\n  Node ID:      0x762ad92c7dac0a10\n  Repl port:    5434\n  Metrics:      disabled\n  RESP port:    45069\n  Connect:      psql -h 127.0.0.1 -p 45711\n\n\u001b[2m2026-10-05T05:11:13.204437Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mnucleus::resp::server\u001b[0m\u001b[2m:\u001b[0m RESP server listening on 127.0.0.1:45069\n\u001b[2m2026-10-05T05:11:13.204441Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mnucleus\u001b[0m\u001b[2m:\u001b[0m Listening on 127.0.0.1:45711\n\u001b[2m2026-10-05T05:11:13.942234Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mnucleus\u001b[0m\u001b[2m:\u001b[0m Shutdown signal received, flushing data...\n\u001b[2m2026-10-05T05:11:13.942328Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mnucleus\u001b[0m\u001b[2m:\u001b[0m Runtime stats: 0 total tasks across 3 cores\n\u001b[2m2026-10-05T05:11:13.942388Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mnucleus\u001b[0m\u001b[2m:\u001b[0m Accept loop exiting due to shutdown\n\u001b[2m2026-10-05T05:11:13.942400Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mnucleus::resp::server\u001b[0m\u001b[2m:\u001b[0m RESP server shutting down\n\u001b[2m2026-10-05T05:11:13.942680Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mnucleus\u001b[0m\u001b[2m:\u001b[0m Data flushed to disk successfully\n\u001b[2m2026-10-05T05:11:13.942685Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mnucleus\u001b[0m\u001b[2m:\u001b[0m Nucleus stopped.",
+  "engineDataDirRemoved": true
 }
