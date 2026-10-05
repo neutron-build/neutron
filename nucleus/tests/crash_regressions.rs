@@ -32,8 +32,11 @@ async fn val(ex: &Executor, sql: &str) -> Result<String, String> {
 #[tokio::test]
 async fn pad_repeat_length_is_bounded() {
     let ex = fresh().await;
+    // -9223372036854775808 is exactly i64::MIN; since the numeric-literal
+    // work, 9223372036854775808 is beyond i64 and the literal is NUMERIC,
+    // which LPAD's integer parameter does not accept. Use a value in range.
     assert_eq!(
-        val(&ex, "SELECT LPAD('hi',-9223372036854775808)")
+        val(&ex, "SELECT LPAD('hi',-9223372036854775807)")
             .await
             .unwrap(),
         ""
