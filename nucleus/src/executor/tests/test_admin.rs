@@ -1468,3 +1468,35 @@ fn backend_cancel_pid_exhaustion_refuses_wraparound() {
     assert!(ex.allocate_backend_pid().is_err());
     assert_eq!(ex.next_backend_pid.load(Ordering::Relaxed), i32::MAX);
 }
+
+#[tokio::test]
+async fn quoted_role_names_stored_without_delimiter_quotes() {
+    // Postgres identifier semantics: quotes delimit, they are not part of
+    // the name. sqlparser's Ident Display renders them back; storing that
+    // rendering left roles callable only as '"name"' (sql-probe-03 finding).
+    let ex = test_executor();
+    let id = ex.create_session();
+    CURRENT_SESSION.scope(
+        ex.get_session(id),
+        async {
+            let session = ex.current_session();
+            session.session_context.write().user = "root".to_string();
+            ex.execute("CREATE ROLE root SUPERUSER LOGIN").await.unwrap();
+            ex.execute(r#"CREATE ROLE "probe_quoted" LOGIN"#).await.unwrap();
+            let role = ex
+                .roles
+                .read()
+                .await
+                .get("probe_quoted")
+                .cloned()
+                .expect("role must be stored under its identifier value");
+            assert!(role.can_login);
+            assert!(
+                !ex.roles.read().await.contains_key("\"probe_quoted\""),
+                "the quoted rendering must not be a separate stored name"
+            );
+            ex.execute(r#"GRANT "probe_quoted" TO root"#).await.unwrap();
+        }
+        .await,
+    );
+}

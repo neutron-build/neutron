@@ -932,7 +932,7 @@ impl Executor {
             let granted_roles: Vec<String> = actions
                 .iter()
                 .filter_map(|action| match action {
-                    ast::Action::Role { role } => Some(role.to_string()),
+                    ast::Action::Role { role } => Some(role.value.clone()),
                     _ => None,
                 })
                 .collect();
@@ -1045,7 +1045,7 @@ impl Executor {
             let revoked: Vec<String> = actions
                 .iter()
                 .filter_map(|action| match action {
-                    ast::Action::Role { role } => Some(role.to_string()),
+                    ast::Action::Role { role } => Some(role.value.clone()),
                     _ => None,
                 })
                 .collect();
@@ -1133,7 +1133,7 @@ impl Executor {
         };
         let mut roles = self.roles.write().await;
         for name in &create_role.names {
-            let role_name = name.to_string();
+            let role_name = name.value.clone();
             // SEC-4, defence in depth. Authority is the bypass_rls attribute now,
             // so a role of this name confers nothing -- but policy TO-clauses
             // still address roles BY NAME, and a role called "superuser" is an
