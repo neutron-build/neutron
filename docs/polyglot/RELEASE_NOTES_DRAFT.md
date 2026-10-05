@@ -48,8 +48,10 @@ recorded contracts is made anywhere in this document.
   contract and nothing wider.
 - Driver divergence is recorded and expected: `codec.text_array_param` is
   supported through `pg` and refused through postgres.js with SQLSTATE 22000.
-- Scalar Text arrives with wire OID 1043 (VARCHAR) rather than PostgreSQL's
-  TEXT OID 25; correct TEXT[] OID 1009 does not establish scalar type identity.
+- Scalar Text advertises wire OID 25 (TEXT), matching PostgreSQL, since
+  814332c9 (before that revision it arrived as 1043/VARCHAR; strict clients
+  verifying compiled-vs-wire type identity should qualify against a revision
+  at or after 814332c9).
 - The installed qualification covers the declared scalar corpus only; it does
   not cover migrations, relationships beyond the recorded probes, pooling or
   deployment topologies.
