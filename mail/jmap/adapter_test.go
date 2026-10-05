@@ -2,6 +2,7 @@ package jmap
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -19,29 +20,142 @@ func adapterFor(t *testing.T, handler http.HandlerFunc) *Adapter {
 }
 
 func TestInitialSyncPaginatesPastServerLimit(t *testing.T) {
-	page := 0
+	request := 0
 	a := adapterFor(t, func(w http.ResponseWriter, r *http.Request) {
-		page++
-		if page == 1 {
-			_, _ = w.Write([]byte(`{"methodResponses":[["Email/query",{"ids":["m1"],"position":0,"total":2},"0"],["Email/get",{"state":"s1","list":[{"id":"m1","threadId":"t","mailboxIds":{"box":true},"keywords":{}}]},"1"]]}`))
-			return
+		request++
+		switch request {
+		case 1:
+			// First page: baseline Email/get + query + page get.
+			_, _ = w.Write([]byte(`{"methodResponses":[
+				["Email/get",{"state":"s0","list":[]},"b"],
+				["Email/query",{"ids":["m1"],"position":0,"total":2,"queryState":"q1"},"q"],
+				["Email/get",{"state":"s1","list":[{"id":"m1","threadId":"t","mailboxIds":{"box":true},"keywords":{}}]},"g"]
+			]}`))
+		case 2:
+			// Final page: query + get.
+			_, _ = w.Write([]byte(`{"methodResponses":[
+				["Email/query",{"ids":["m2"],"position":1,"total":2,"queryState":"q1"},"q"],
+				["Email/get",{"state":"s2","list":[{"id":"m2","threadId":"t","mailboxIds":{"box":true},"keywords":{}}]},"g"]
+			]}`))
+		case 3:
+			// Baseline catch-up: m1 was modified and m3 destroyed while the
+			// enumeration paginated.
+			_, _ = w.Write([]byte(`{"methodResponses":[
+				["Email/changes",{"newState":"s9","hasMoreChanges":false,"created":[],"updated":["m1"],"destroyed":["m3"]},"0"]
+			]}`))
+		default:
+			// Catch-up envelope refetch for m1.
+			_, _ = w.Write([]byte(`{"methodResponses":[
+				["Email/get",{"state":"s9","list":[{"id":"m1","threadId":"t","mailboxIds":{"box":true},"keywords":{"$seen":true}}]},"0"]
+			]}`))
 		}
-		_, _ = w.Write([]byte(`{"methodResponses":[["Email/query",{"ids":["m2"],"position":1,"total":2},"0"],["Email/get",{"state":"s2","list":[{"id":"m2","threadId":"t","mailboxIds":{"box":true},"keywords":{}}]},"1"]]}`))
 	})
 
 	first, err := a.Sync(context.Background(), "box", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !first.More || first.Next != "jmap-initial:1" || len(first.Changes) != 1 {
+	if !first.More || len(first.Changes) != 1 {
 		t.Fatalf("first page = %+v", first)
+	}
+	state, isInitial, wellFormed := decodeInitialCursor(first.Next)
+	if !isInitial || !wellFormed || state.Position != 1 || state.Baseline != "s0" || state.QueryState != "q1" {
+		t.Fatalf("first cursor = %+v initial=%v wellFormed=%v, want position 1 baseline s0 queryState q1", state, isInitial, wellFormed)
 	}
 	second, err := a.Sync(context.Background(), "box", first.Next)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.More || second.Next != "s2" || len(second.Changes) != 1 {
+	if second.More || second.Next != "s9" || !second.Complete {
 		t.Fatalf("second page = %+v", second)
+	}
+	// The page's own message, the catch-up update, and the destroy all
+	// survive: the final cursor is past every change it never observed
+	// (audit JMAP-03).
+	var updated, destroyed int
+	for _, c := range second.Changes {
+		switch c.Kind {
+		case mail.ChangeCreated:
+		case mail.ChangeUpdated:
+			updated++
+		case mail.ChangeDestroyed:
+			destroyed++
+			if c.ID != mail.NativeMessageID(mail.ProviderJMAP, "m3") {
+				t.Errorf("destroyed id = %s, want m3", c.ID)
+			}
+		}
+	}
+	if len(second.Changes) != 3 || updated != 1 || destroyed != 1 {
+		t.Fatalf("second page changes = %+v", second.Changes)
+	}
+}
+
+// A 200 response with an empty, short, or out-of-order methodResponses
+// array must produce an error, never an index panic (audit JMAP-02).
+func TestCallRejectsMalformedResponses(t *testing.T) {
+	cases := []string{
+		`{"methodResponses":[]}`,
+		`{}`,
+		`{"methodResponses":[["Email/get",{"list":[]},"1"]]}`,                               // wrong call entirely
+		`{"methodResponses":[["error",{"type":"serverFail"},"0"]]}`,                         // error tuple
+		`{"methodResponses":[["Email/get",{"list":[]},"0"],["Email/get",{"list":[]},"0"]]}`, // duplicate
+	}
+	for _, body := range cases {
+		a := adapterFor(t, func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(body))
+		})
+		if _, err := a.call(context.Background(), [3]any{"Email/get", map[string]any{"ids": []string{"x"}}, "0"}); err == nil {
+			t.Errorf("malformed response %s produced no error", body)
+		}
+	}
+}
+
+// A method-level 200 whose Email/set payload reports per-message failures
+// is a failed mutation, not a success (audit JMAP-01).
+func TestApplyReportsSetFailures(t *testing.T) {
+	a := adapterFor(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"methodResponses":[
+			["Email/set",{"oldState":"s1","newState":"s2","updated":{"m1":null},"notUpdated":{"m2":{"type":"invalidPatch"}}},"0"]
+		]}`))
+	})
+	err := a.Apply(context.Background(), mail.Operation{
+		Kind:    mail.OpAddKeyword,
+		Keyword: "seen",
+		IDs:     []mail.MessageID{mail.NativeMessageID(mail.ProviderJMAP, "m1"), mail.NativeMessageID(mail.ProviderJMAP, "m2")},
+	})
+	if err == nil || !strings.Contains(err.Error(), "m2") {
+		t.Fatalf("notUpdated was swallowed: %v", err)
+	}
+
+	a = adapterFor(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"methodResponses":[
+			["Email/set",{"notDestroyed":{"m9":{"type":"notFound"}}},"0"]
+		]}`))
+	})
+	err = a.Apply(context.Background(), mail.Operation{
+		Kind: mail.OpDelete,
+		IDs:  []mail.MessageID{mail.NativeMessageID(mail.ProviderJMAP, "m9")},
+	})
+	if err == nil || !strings.Contains(err.Error(), "m9") {
+		t.Fatalf("notDestroyed was swallowed: %v", err)
+	}
+}
+
+// Body values the provider flags as truncated must not be cached as
+// complete content (audit JMAP-04).
+func TestBodyRefusesTruncatedBodyValues(t *testing.T) {
+	a := adapterFor(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"methodResponses":[
+			["Email/get",{"list":[{
+				"id":"m1",
+				"bodyValues":{"p1":{"value":"half a mes","isTruncated":true}},
+				"textBody":[{"partId":"p1","type":"text/plain"}],
+				"attachments":[]
+			}]},"0"]
+		]}`))
+	})
+	if _, err := a.Body(context.Background(), mail.NativeMessageID(mail.ProviderJMAP, "m1")); err == nil {
+		t.Fatal("a truncated body value was accepted as complete")
 	}
 }
 
@@ -336,5 +450,169 @@ func TestAttachmentUnknownPartIsNotFound(t *testing.T) {
 	_, err := a.Attachment(context.Background(), mail.NativeMessageID(mail.ProviderJMAP, "m1"), "nope")
 	if !isErr(err, mail.ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+// A changed queryState mid-enumeration means the positional contract is
+// broken: unchanged objects were skipped, and Email/changes cannot report
+// them. The safe answer is a typed cursor reset — never a prune around
+// the hole (audit 5 SYNC-04).
+func TestQueryStateShiftInvalidatesTheEnumeration(t *testing.T) {
+	request := 0
+	a := adapterFor(t, func(w http.ResponseWriter, r *http.Request) {
+		request++
+		switch request {
+		case 1:
+			_, _ = w.Write([]byte(`{"methodResponses":[
+				["Email/get",{"state":"s0","list":[]},"b"],
+				["Email/query",{"ids":["m1"],"position":0,"total":2,"queryState":"q1"},"q"],
+				["Email/get",{"state":"s1","list":[{"id":"m1","threadId":"t","mailboxIds":{"box":true},"keywords":{}}]},"g"]
+			]}`))
+		case 2:
+			// The result set shifted under the pagination.
+			_, _ = w.Write([]byte(`{"methodResponses":[
+				["Email/query",{"ids":["m2"],"position":1,"total":2,"queryState":"q2"},"q"],
+				["Email/get",{"state":"s2","list":[]},"g"]
+			]}`))
+		}
+	})
+	first, err := a.Sync(context.Background(), "box", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = a.Sync(context.Background(), "box", first.Next)
+	if err == nil || !errors.Is(err, mail.ErrCursorInvalid) {
+		t.Fatalf("err = %v, want ErrCursorInvalid on a shifted query state", err)
+	}
+}
+
+// A server answering the wrong position echo is unusable for positional
+// pagination (audit 5 SYNC-04).
+func TestQueryPositionEchoMismatchIsCursorInvalid(t *testing.T) {
+	a := adapterFor(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"methodResponses":[
+			["Email/query",{"ids":["m9"],"position":7,"total":9,"queryState":"q1"},"q"],
+			["Email/get",{"state":"s1","list":[]},"g"]
+		]}`))
+	})
+	if _, err := a.Sync(context.Background(), "box", encodeInitialCursor(3, "s0", "q1")); err == nil || !errors.Is(err, mail.ErrCursorInvalid) {
+		t.Fatalf("err = %v, want ErrCursorInvalid on a position echo mismatch", err)
+	}
+}
+
+// The terminal catch-up drains hasMoreChanges pages: a window busier than
+// one 500-change page must not have its tail silently adopted past
+// (audit 5 SYNC-04).
+func TestTerminalCatchUpDrainsHasMoreChanges(t *testing.T) {
+	request := 0
+	a := adapterFor(t, func(w http.ResponseWriter, r *http.Request) {
+		request++
+		switch request {
+		case 1:
+			_, _ = w.Write([]byte(`{"methodResponses":[
+				["Email/get",{"state":"s0","list":[]},"b"],
+				["Email/query",{"ids":["m1"],"position":0,"total":1,"queryState":"q1"},"q"],
+				["Email/get",{"state":"s1","list":[{"id":"m1","threadId":"t","mailboxIds":{"box":true},"keywords":{}}]},"g"]
+			]}`))
+		case 2:
+			_, _ = w.Write([]byte(`{"methodResponses":[
+				["Email/changes",{"newState":"s5","hasMoreChanges":true,"created":["m2"],"updated":[],"destroyed":[]},"0"]
+			]}`))
+		case 3:
+			// Envelope refetch for m2.
+			_, _ = w.Write([]byte(`{"methodResponses":[
+				["Email/get",{"state":"s5","list":[{"id":"m2","threadId":"t","mailboxIds":{"box":true},"keywords":{}}]},"0"]
+			]}`))
+		case 4:
+			_, _ = w.Write([]byte(`{"methodResponses":[
+				["Email/changes",{"newState":"s9","hasMoreChanges":false,"created":[],"updated":[],"destroyed":["m1"]},"0"]
+			]}`))
+		}
+	})
+	changes, err := a.Sync(context.Background(), "box", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changes.Complete || changes.Next != "s9" {
+		t.Fatalf("terminal page = complete=%v next=%q; want drained completion at s9", changes.Complete, changes.Next)
+	}
+	var created, destroyed int
+	for _, c := range changes.Changes {
+		switch c.Kind {
+		case mail.ChangeCreated:
+			created++
+		case mail.ChangeDestroyed:
+			destroyed++
+		}
+	}
+	if created != 2 || destroyed != 1 {
+		t.Fatalf("changes = created %d destroyed %d; want both pages' evidence (2 created, 1 destroyed)", created, destroyed)
+	}
+}
+
+// A referenced body part with NO bodyValues entry is as incomplete as a
+// truncated one — never cached as complete content (audit 5 JMAP-01). A
+// message with no parts at all is legitimately empty.
+func TestBodyRefusesMissingBodyValues(t *testing.T) {
+	a := adapterFor(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"methodResponses":[
+			["Email/get",{"list":[{
+				"id":"m1",
+				"textBody":[{"partId":"p1","type":"text/plain"}],
+				"htmlBody":[{"partId":"p2","type":"text/html"}],
+				"bodyValues":{}
+			}]},"0"]
+		]}`))
+	})
+	if _, err := a.Body(context.Background(), mail.NativeMessageID(mail.ProviderJMAP, "m1")); err == nil || !errors.Is(err, errIncompleteBody) {
+		t.Fatalf("err = %v, want errIncompleteBody for missing bodyValues", err)
+	}
+
+	empty := adapterFor(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"methodResponses":[["Email/get",{"list":[{"id":"m1","textBody":[],"htmlBody":[],"bodyValues":{}}]},"0"]]}`))
+	})
+	body, err := empty.Body(context.Background(), mail.NativeMessageID(mail.ProviderJMAP, "m1"))
+	if err != nil || body.Text != "" || body.HTML != "" {
+		t.Fatalf("genuinely empty body = %+v, %v; want an empty success", body, err)
+	}
+}
+
+// Credential-bearing JMAP endpoints must be HTTPS (loopback HTTP for
+// local fakes), with no userinfo/query/fragment — a poisoned session
+// document must not redirect the bearer token (audit 5 JMAP-02).
+func TestCredentialEndpointPolicy(t *testing.T) {
+	good := []string{"https://api.example.com/jmap", "http://127.0.0.1:9000/api"}
+	bad := []string{
+		"http://api.example.com/jmap",
+		"https://user:pw@api.example.com/jmap",
+		"https://api.example.com/jmap#frag",
+		"https://api.example.com/jmap?x=1",
+		"not-a-url",
+	}
+	for _, raw := range good {
+		if _, err := credentialEndpoint(raw, "apiUrl"); err != nil {
+			t.Errorf("%s rejected: %v", raw, err)
+		}
+	}
+	for _, raw := range bad {
+		if _, err := credentialEndpoint(raw, "apiUrl"); err == nil {
+			t.Errorf("%s accepted", raw)
+		}
+	}
+}
+
+// Dial refuses a session whose discovered apiUrl or downloadUrl would
+// carry the token over plain HTTP to a remote host.
+func TestDialRejectsInsecureDiscoveredEndpoints(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{
+			"apiUrl":"http://evil.example.com/api",
+			"downloadUrl":"https://ok.example.com/dl/{accountId}/{blobId}/{name}",
+			"primaryAccounts":{"urn:ietf:params:jmap:mail":"acct"}
+		}`))
+	}))
+	t.Cleanup(srv.Close)
+	if _, err := Dial(context.Background(), Config{SessionURL: srv.URL, Token: "t"}); err == nil {
+		t.Fatal("an HTTP discovered apiUrl was accepted")
 	}
 }

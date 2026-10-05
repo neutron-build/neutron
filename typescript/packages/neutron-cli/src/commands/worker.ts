@@ -76,7 +76,6 @@ export async function worker(): Promise<void> {
         ws: false,
       },
       optimizeDeps: {
-        disabled: true,
         noDiscovery: true,
         entries: [],
       },

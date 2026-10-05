@@ -508,6 +508,29 @@ pub trait StorageEngine: Send + Sync {
         Ok(())
     }
 
+    /// Move `table` to the catalog's CURRENT column list and rewrite every
+    /// physical row to match, as one step: `rows` is the complete set of
+    /// `(address, widened-or-narrowed row)` pairs from `scan_physical`.
+    ///
+    /// ALTER TABLE ADD/DROP COLUMN calls this after updating the catalog.
+    /// Engines that cache a column layout and write tuples against it MUST NOT
+    /// let the layout change take effect without the rows following it, and
+    /// must not leave half of each behind on failure: a tuple written at the
+    /// old width fails to decode against the new column list (`corrupt tuple:
+    /// … does not decode`), and the whole table stops being readable.
+    ///
+    /// The default is the legacy three-step sequence, correct for engines
+    /// whose rows carry no layout (the in-memory engines). The disk stack
+    /// overrides it to make the sequence all-or-nothing and to keep it out of
+    /// a transaction's write buffer.
+    async fn rewrite_table(&self, table: &str, rows: &[(usize, Row)]) -> Result<(), StorageError> {
+        self.sync_schema(table).await?;
+        if !rows.is_empty() {
+            self.update(table, rows).await?;
+        }
+        self.rebuild_table_indexes(table).await
+    }
+
     /// Scan returning only rows where column `col_idx` equals `value`, with
     /// their scan-order positions. Enables UPDATE/DELETE by PK without
     /// materialising the entire table. Default: full scan + filter.

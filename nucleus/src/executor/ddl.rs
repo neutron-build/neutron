@@ -238,7 +238,7 @@ impl Executor {
         match strategy {
             MergeStrategy::Default => MergeStrategy::Default,
             MergeStrategy::Replacing { version_column } => MergeStrategy::Replacing {
-                version_column: version_column.as_ref().map(&pos),
+                version_column: version_column.as_ref().map(pos),
             },
             MergeStrategy::Aggregating {
                 group_columns,
@@ -3163,51 +3163,66 @@ impl Executor {
 
                     let engine = self.storage_for(&table_name);
                     let _rewrite = RewriteGuard::new(engine.clone(), &table_name);
-                    // Read existing rows with the engine's pre-ALTER schema so
-                    // old tuples deserialize at their original width, then widen
-                    // each with the new column's default value. scan_physical:
-                    // update() addresses VERSION indices — a plain scan's
-                    // enumeration positions drift from them under concurrent
-                    // churn, and the rewrite then lands on the WRONG rows
-                    // (duplicated PKs under the concurrency probe).
-                    let rows = engine.scan_physical(&table_name).await?;
-                    // Evaluate the default PER ROW (INSERT-time defaults
-                    // already are — eval_column_default): a volatile default
-                    // (gen_random_uuid, nextval) evaluated once and cloned
-                    // would give every row the same value. Re-parsing per row
-                    // is acceptable: this is a one-time backfill.
-                    let updates: Vec<(usize, Row)> = rows
-                        .into_iter()
-                        .map(|(vidx, mut r)| {
-                            let mut v = self.eval_column_default(&new_col)?;
-                            super::column_writes::enforce_max_len(&mut v, &new_col)?;
+                    // Everything from here on can fail, and the catalog already
+                    // names the new column. A half-done ADD COLUMN must not
+                    // stay recorded: the next `ADD COLUMN IF NOT EXISTS` would
+                    // see the column, skip, and report a migration as applied
+                    // over rows that were never widened. So any failure puts
+                    // the catalog back exactly as it was.
+                    let rewrite: Result<(), ExecError> = async {
+                        // Read existing rows with the engine's pre-ALTER schema
+                        // so old tuples deserialize at their original width,
+                        // then widen each with the new column's default value.
+                        // scan_physical: update() addresses VERSION indices — a
+                        // plain scan's enumeration positions drift from them
+                        // under concurrent churn, and the rewrite then lands on
+                        // the WRONG rows (duplicated PKs under the concurrency
+                        // probe).
+                        let rows = engine.scan_physical(&table_name).await?;
+                        // Evaluate the default PER ROW (INSERT-time defaults
+                        // already are — eval_column_default): a volatile default
+                        // (gen_random_uuid, nextval) evaluated once and cloned
+                        // would give every row the same value. Re-parsing per
+                        // row is acceptable: this is a one-time backfill.
+                        let updates: Vec<(usize, Row)> = rows
+                            .into_iter()
+                            .map(|(vidx, mut r)| {
+                                let mut v = self.eval_column_default(&new_col)?;
+                                super::column_writes::enforce_max_len(&mut v, &new_col)?;
                             super::column_writes::enforce_numeric_typmod(&mut v, &new_col)?;
-                            r.push(v);
-                            if !generated_exprs.is_empty() {
-                                self.apply_generated(
-                                    &generated_exprs,
-                                    &updated,
-                                    &updated_meta,
-                                    &mut r,
-                                )?;
-                            }
-                            Ok((vidx, r))
-                        })
-                        .collect::<Result<Vec<_>, ExecError>>()?;
-                    // Sync the engine's cached column schema to the new shape
-                    // before writing the widened rows — otherwise an engine that
-                    // caches col_types (the disk engine) serializes them against
-                    // the stale count and corrupts the tuples. Also runs when the
-                    // table is empty so future INSERTs use the new shape.
-                    engine.sync_schema(&table_name).await?;
-                    if !updates.is_empty() {
-                        engine.update(&table_name, &updates).await?;
+                                r.push(v);
+                                if !generated_exprs.is_empty() {
+                                    self.apply_generated(
+                                        &generated_exprs,
+                                        &updated,
+                                        &updated_meta,
+                                        &mut r,
+                                    )?;
+                                }
+                                Ok((vidx, r))
+                            })
+                            .collect::<Result<Vec<_>, ExecError>>()?;
+                        // Adopt the new column list in the engine AND rewrite
+                        // every row to it as one all-or-nothing step. Done
+                        // separately, an engine that caches col_types (the disk
+                        // engine) either serializes the widened rows against the
+                        // stale count or — inside a transaction, where the row
+                        // writes are only buffered — reads old tuples against
+                        // the new list. Also runs when the table is empty so
+                        // future INSERTs use the new shape, and rebuilds the
+                        // table's indexes, which the rewrite maintains
+                        // incrementally against pre-widen tuples and can leave
+                        // stale.
+                        engine.rewrite_table(&table_name, &updates).await?;
+                        Ok(())
                     }
-                    // The row rewrite above maintains indexes incrementally
-                    // against the pre-widen tuples, which can leave stale
-                    // entries; rebuild the table's indexes from the widened
-                    // rows to keep lookups correct.
-                    engine.rebuild_table_indexes(&table_name).await?;
+                    .await;
+                    if let Err(err) = rewrite {
+                        self.catalog.remove_declared_type(&table_name, new_col.id);
+                        let _ = self.catalog.update_table((*table_def).clone()).await;
+                        let _ = engine.sync_schema(&table_name).await;
+                        return Err(err);
+                    }
                 }
                 ast::AlterTableOperation::DropColumn {
                     column_names,
@@ -3386,9 +3401,15 @@ impl Executor {
                     drop_indices.sort_unstable();
                     drop_indices.dedup();
                     drop_indices.reverse();
+                    // Declared types of the columns going away, kept so a failed
+                    // rewrite can put them back along with the catalog entry.
+                    let mut dropped_declared = Vec::new();
                     for idx in &drop_indices {
-                        self.catalog
-                            .remove_declared_type(&table_name, updated.columns[*idx].id);
+                        let column_id = updated.columns[*idx].id;
+                        if let Some(declared) = self.catalog.declared_type(&table_name, column_id) {
+                            dropped_declared.push((column_id, declared));
+                        }
+                        self.catalog.remove_declared_type(&table_name, column_id);
                         updated.columns.remove(*idx);
                     }
                     self.catalog.update_table(updated).await?;
@@ -3397,33 +3418,42 @@ impl Executor {
                     // version indices, not scan positions — see AddColumn).
                     let engine = self.storage_for(&table_name);
                     let _rewrite = RewriteGuard::new(engine.clone(), &table_name);
-                    let rows = engine.scan_physical(&table_name).await?;
-                    let updates: Vec<(usize, Row)> = rows
-                        .into_iter()
-                        .map(|(vidx, r)| {
-                            let new_row: Vec<Value> = r
-                                .into_iter()
-                                .enumerate()
-                                .filter(|(j, _)| !drop_indices.contains(j))
-                                .map(|(_, v)| v)
-                                .collect();
-                            (vidx, new_row)
-                        })
-                        .collect();
-                    // Sync the engine's cached column schema to the post-drop
-                    // shape before writing narrowed rows — same invariant as
-                    // AddColumn: an engine that caches col_types (the disk
-                    // engine) must not serialize N-1-wide rows against the
-                    // stale N-wide schema, or reads fail to deserialize and
-                    // every row silently vanishes until restart.
-                    engine.sync_schema(&table_name).await?;
-                    if !updates.is_empty() {
-                        engine.update(&table_name, &updates).await?;
+                    // Same invariant as AddColumn: the catalog change and the
+                    // row rewrite are one unit. On failure the catalog (and the
+                    // declared types stripped above) are restored, so the table
+                    // is not left half-dropped.
+                    let rewrite: Result<(), ExecError> = async {
+                        let rows = engine.scan_physical(&table_name).await?;
+                        let updates: Vec<(usize, Row)> = rows
+                            .into_iter()
+                            .map(|(vidx, r)| {
+                                let new_row: Vec<Value> = r
+                                    .into_iter()
+                                    .enumerate()
+                                    .filter(|(j, _)| !drop_indices.contains(j))
+                                    .map(|(_, v)| v)
+                                    .collect();
+                                (vidx, new_row)
+                            })
+                            .collect();
+                        // Adopt the post-drop column list and narrow every row to
+                        // it as one all-or-nothing step, then rebuild indexes (the
+                        // rewrite's deferred index maintenance reads pre-drop
+                        // tuples under the new schema and skips the Remove ops).
+                        // See AddColumn for why these must not be separate steps.
+                        engine.rewrite_table(&table_name, &updates).await?;
+                        Ok(())
                     }
-                    // The rewrite's deferred index maintenance reads pre-drop
-                    // tuples under the new schema and skips the Remove ops;
-                    // rebuild like AddColumn does.
-                    engine.rebuild_table_indexes(&table_name).await?;
+                    .await;
+                    if let Err(err) = rewrite {
+                        for (column_id, declared) in dropped_declared {
+                            self.catalog
+                                .set_declared_type(&table_name, column_id, declared);
+                        }
+                        let _ = self.catalog.update_table((*table_def).clone()).await;
+                        let _ = engine.sync_schema(&table_name).await;
+                        return Err(err);
+                    }
                 }
                 ast::AlterTableOperation::RenameColumn {
                     old_column_name,
@@ -3784,11 +3814,13 @@ impl Executor {
                         // persist the stale schema permanently.
                         self.catalog.update_table(updated).await?;
                         let _rewrite = RewriteGuard::new(storage.clone(), &table_name);
-                        storage.sync_schema(&table_name).await?;
-                        if !rewrites.is_empty() {
-                            storage.update(&table_name, &rewrites).await?;
+                        // One all-or-nothing step, and a failure restores the
+                        // catalog — see AddColumn.
+                        if let Err(err) = storage.rewrite_table(&table_name, &rewrites).await {
+                            let _ = self.catalog.update_table((*table_def).clone()).await;
+                            let _ = storage.sync_schema(&table_name).await;
+                            return Err(err.into());
                         }
-                        storage.rebuild_table_indexes(&table_name).await?;
                     } else {
                         self.catalog.update_table(updated).await?;
                     }

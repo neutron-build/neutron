@@ -5,14 +5,18 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"mime"
+	"mime/quotedprintable"
 	"net"
 	"net/mail"
 	"net/smtp"
+	"net/textproto"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Outgoing is a message to send.
@@ -75,6 +79,22 @@ func NewSender(cfg SMTPConfig) *Sender {
 	return &Sender{cfg: cfg}
 }
 
+// NotSubmittedError marks a send failure that is known to have happened before
+// the server could have accepted the message: nothing was delivered and a
+// later retry cannot duplicate it. Any other Send error leaves the outcome
+// unknown, because the failure may have followed an acceptance the caller
+// never saw. A caller that persists work must treat the two differently.
+type NotSubmittedError struct{ Err error }
+
+func (e *NotSubmittedError) Error() string { return e.Err.Error() }
+func (e *NotSubmittedError) Unwrap() error { return e.Err }
+
+// IsNotSubmitted reports whether err is known to precede server acceptance.
+func IsNotSubmitted(err error) bool {
+	var n *NotSubmittedError
+	return errors.As(err, &n)
+}
+
 // ReplyTo builds a reply to an existing message.
 //
 // It carries the threading chain forward — In-Reply-To gets the parent's
@@ -121,16 +141,16 @@ func ReplyTo(parent *Envelope, from Address, text string) *Outgoing {
 // outlive the application's send timeout.
 func (s *Sender) Send(ctx context.Context, msg *Outgoing) (messageID string, raw []byte, err error) {
 	if msg.From.Email == "" {
-		return "", nil, fmt.Errorf("mail: outgoing message has no sender")
+		return "", nil, &NotSubmittedError{fmt.Errorf("mail: outgoing message has no sender")}
 	}
 	if len(msg.To)+len(msg.Cc)+len(msg.Bcc) == 0 {
-		return "", nil, fmt.Errorf("mail: outgoing message has no recipients")
+		return "", nil, &NotSubmittedError{fmt.Errorf("mail: outgoing message has no recipients")}
 	}
 
 	messageID = newMessageID(msg.From.Email)
 	body, err := msg.render(messageID, false)
 	if err != nil {
-		return "", nil, err
+		return "", nil, &NotSubmittedError{err}
 	}
 
 	// Bcc recipients receive the message but must not appear in the
@@ -149,76 +169,119 @@ func (s *Sender) Send(ctx context.Context, msg *Outgoing) (messageID string, raw
 }
 
 // submit performs the SMTP transaction with cancellation at every stage.
-// It mirrors net/smtp.SendMail's dialogue (EHLO, opportunistic STARTTLS,
-// AUTH when the server advertises it, MAIL/RCPT/DATA) but over a
-// context-aware connection.
+// Transport policy is fail-closed (audit SEND-01):
+//
+//   - Port 465 without Plaintext dials implicit TLS before the greeting.
+//   - Every other non-Plaintext connection MUST upgrade via STARTTLS; a
+//     server that offers neither STARTTLS nor a TLS port gets no mail.
+//   - A configured username means authentication is required; a server
+//     that stops offering AUTH is a failure, not a silent skip.
+//   - Plaintext submission is restricted to loopback peers (local test
+//     servers); the config comment already promised this for passwords.
+//   - A failure of the final QUIT is not a delivery failure: once the
+//     server acknowledges DATA, the message is accepted whether or not it
+//     says goodbye politely.
 func (s *Sender) submit(ctx context.Context, from string, rcpts []string, body []byte) error {
+	// Everything up to and including the DATA command is provably before
+	// acceptance (see NotSubmittedError); only the message body and its
+	// terminating reply can leave the outcome unknown.
+	pre := func(err error) error { return &NotSubmittedError{err} }
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
 	addr := net.JoinHostPort(s.cfg.Host, fmt.Sprintf("%d", s.cfg.Port))
 
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	tlsCfg := &tls.Config{ServerName: s.cfg.Host, MinVersion: tls.VersionTLS12}
+
+	var conn net.Conn
+	var err error
+	implicitTLS := !s.cfg.Plaintext && s.cfg.Port == 465
+	if implicitTLS {
+		conn, err = (&tls.Dialer{NetDialer: dialer, Config: tlsCfg}).DialContext(ctx, "tcp", addr)
+	} else {
+		conn, err = dialer.DialContext(ctx, "tcp", addr)
+	}
 	if err != nil {
-		return fmt.Errorf("dial: %w", err)
+		return pre(fmt.Errorf("smtp dial: %w", err))
+	}
+	defer conn.Close()
+	if s.cfg.Plaintext {
+		peer, ok := conn.RemoteAddr().(*net.TCPAddr)
+		if !ok || !peer.IP.IsLoopback() {
+			return pre(fmt.Errorf("plaintext SMTP is restricted to loopback peers"))
+		}
 	}
 
 	// Cancellation-driven close: a read or write blocked on a stalled
-	// server is released by forcing the connection deadline into the past.
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-			conn.SetDeadline(time.Now())
-		case <-done:
-		}
-	}()
+	// server is released by closing the socket, and every stage inherits
+	// the caller's deadline.
+	stop := context.AfterFunc(ctx, func() { conn.SetDeadline(time.Now()) })
+	defer stop()
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := conn.SetDeadline(deadline); err != nil {
-			conn.Close()
-			return fmt.Errorf("set deadline: %w", err)
+			return pre(fmt.Errorf("set deadline: %w", err))
 		}
 	}
 
 	c, err := smtp.NewClient(conn, s.cfg.Host)
 	if err != nil {
-		conn.Close()
-		return err
+		return pre(err)
 	}
 	defer c.Close()
 
 	if err := c.Hello("localhost"); err != nil {
-		return err
+		return pre(err)
 	}
-	if ok, _ := c.Extension("STARTTLS"); ok && !s.cfg.Plaintext {
-		if err := c.StartTLS(&tls.Config{ServerName: s.cfg.Host}); err != nil {
-			return err
+	if !s.cfg.Plaintext && !implicitTLS {
+		if ok, _ := c.Extension("STARTTLS"); !ok {
+			return pre(fmt.Errorf("SMTP server %s does not offer required STARTTLS", s.cfg.Host))
+		}
+		if err := c.StartTLS(tlsCfg); err != nil {
+			return pre(err)
 		}
 	}
 	if s.cfg.Username != "" {
-		if ok, _ := c.Extension("AUTH"); ok {
-			if err := c.Auth(smtp.PlainAuth("", s.cfg.Username, s.cfg.Password, s.cfg.Host)); err != nil {
-				return err
-			}
+		if ok, _ := c.Extension("AUTH"); !ok {
+			return pre(fmt.Errorf("SMTP server %s does not offer required authentication", s.cfg.Host))
+		}
+		if err := c.Auth(smtp.PlainAuth("", s.cfg.Username, s.cfg.Password, s.cfg.Host)); err != nil {
+			return pre(err)
 		}
 	}
 	if err := c.Mail(from); err != nil {
-		return err
+		return pre(err)
 	}
 	for _, rcpt := range rcpts {
 		if err := c.Rcpt(rcpt); err != nil {
-			return err
+			return pre(err)
 		}
 	}
 	w, err := c.Data()
 	if err != nil {
-		return err
+		return pre(err)
 	}
 	if _, err := w.Write(body); err != nil {
-		return err
+		return err // body partly written: outcome unknown
 	}
 	if err := w.Close(); err != nil {
+		// The DATA acknowledgment is what makes it accepted. A 4xx/5xx reply
+		// to the end of data is the server explicitly declining; a transport
+		// error here is not, and stays an unknown outcome.
+		var reply *textproto.Error
+		if errors.As(err, &reply) && reply.Code >= 400 {
+			return pre(err)
+		}
 		return err
 	}
-	return c.Quit()
+	// Bound the goodbye so a server that stalls on QUIT cannot hold the
+	// connection past the point of acceptance.
+	quitDeadline := time.Now().Add(2 * time.Second)
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(quitDeadline) {
+		quitDeadline = deadline
+	}
+	_ = conn.SetDeadline(quitDeadline)
+	_ = c.Quit()
+	return nil
 }
 
 // Render builds the complete RFC 5322 bytes for this message with a freshly
@@ -307,7 +370,7 @@ func (msg *Outgoing) render(messageID string, includeBcc bool) ([]byte, error) {
 	for _, att := range msg.Attachments {
 		b.WriteString("--" + mixedBoundary + "\r\n")
 		b.WriteString("Content-Type: " + sanitizeMIMEValue(att.ContentType, "application/octet-stream") + "\r\n")
-		b.WriteString("Content-Disposition: attachment; filename=\"" + sanitizeFilename(att.Filename) + "\"\r\n")
+		b.WriteString("Content-Disposition: " + formatDisposition(att.Filename) + "\r\n")
 		b.WriteString("Content-Transfer-Encoding: base64\r\n\r\n")
 		enc := base64.StdEncoding.EncodeToString(att.Data)
 		for i := 0; i < len(enc); i += 76 {
@@ -324,36 +387,77 @@ func (msg *Outgoing) render(messageID string, includeBcc bool) ([]byte, error) {
 	return []byte(b.String()), nil
 }
 
-// renderBodyPart renders the textual body (plain, html, or alternative) as a
-// self-contained MIME part: its own Content-Type header plus content.
-func (msg *Outgoing) renderBodyPart() (string, error) {
+// formatDisposition builds the Content-Disposition value for an attachment.
+// Non-ASCII filenames travel as RFC 2047/2231 encoded parameters via
+// mime.FormatMediaType rather than raw UTF-8 bytes inside ad-hoc quotes.
+func formatDisposition(filename string) string {
+	name := sanitizeFilename(filename)
+	if formatted := mime.FormatMediaType("attachment", map[string]string{"filename": name}); formatted != "" {
+		return formatted
+	}
+	return `attachment; filename="` + name + `"`
+}
+
+// encodedTextPart renders one textual MIME leaf as quoted-printable.
+//
+// Raw UTF-8 text with no transfer encoding is implicitly 7bit, and long
+// unwrapped lines (HTML especially) exceed transport line limits; some
+// strict servers mangle or reject such messages (audit SEND-02).
+// quoted-printable keeps ASCII text readable, bounds every encoded line,
+// and is universally decodable.
+func encodedTextPart(mediaType, text string) (string, error) {
+	if mediaType != "text/plain" && mediaType != "text/html" {
+		return "", fmt.Errorf("unsupported text MIME type %q", mediaType)
+	}
 	var b strings.Builder
+	b.WriteString("Content-Type: " + mediaType + "; charset=utf-8\r\n")
+	b.WriteString("Content-Transfer-Encoding: quoted-printable\r\n\r\n")
+	enc := quotedprintable.NewWriter(&b)
+	if _, err := enc.Write([]byte(text)); err != nil {
+		return "", err
+	}
+	if err := enc.Close(); err != nil {
+		return "", err
+	}
+	b.WriteString("\r\n")
+	return b.String(), nil
+}
+
+// renderBodyPart renders the textual body (plain, html, or alternative) as a
+// self-contained MIME part: its own Content-Type header plus content, each
+// leaf transfer-encoded per encodedTextPart.
+func (msg *Outgoing) renderBodyPart() (string, error) {
 	switch {
 	case msg.HTML != "" && msg.Text != "":
 		boundary, err := newBoundary()
 		if err != nil {
 			return "", err
 		}
+		plain, err := encodedTextPart("text/plain", msg.Text)
+		if err != nil {
+			return "", err
+		}
+		html, err := encodedTextPart("text/html", msg.HTML)
+		if err != nil {
+			return "", err
+		}
+		var b strings.Builder
 		b.WriteString("Content-Type: multipart/alternative; boundary=\"" + boundary + "\"\r\n\r\n")
 		// Least-rich part first: a client picks the last part it can
 		// render, so plain text must precede HTML.
 		b.WriteString("--" + boundary + "\r\n")
-		b.WriteString("Content-Type: text/plain; charset=utf-8\r\n\r\n")
-		b.WriteString(msg.Text + "\r\n")
+		b.WriteString(plain)
 		b.WriteString("--" + boundary + "\r\n")
-		b.WriteString("Content-Type: text/html; charset=utf-8\r\n\r\n")
-		b.WriteString(msg.HTML + "\r\n")
+		b.WriteString(html)
 		b.WriteString("--" + boundary + "--\r\n")
+		return b.String(), nil
 
 	case msg.HTML != "":
-		b.WriteString("Content-Type: text/html; charset=utf-8\r\n\r\n")
-		b.WriteString(msg.HTML + "\r\n")
+		return encodedTextPart("text/html", msg.HTML)
 
 	default:
-		b.WriteString("Content-Type: text/plain; charset=utf-8\r\n\r\n")
-		b.WriteString(msg.Text + "\r\n")
+		return encodedTextPart("text/plain", msg.Text)
 	}
-	return b.String(), nil
 }
 
 // sanitizeMIMEValue strips header-hostile bytes and falls back to def when
@@ -389,7 +493,15 @@ func sanitizeFilename(name string) string {
 		name = name[:i]
 	}
 	if len(name) > 200 {
-		name = name[len(name)-200:]
+		// Keep the tail (the extension end of a long name), but back the
+		// cut up to a rune boundary: slicing into the middle of a
+		// multi-byte character produced invalid UTF-8 filenames (audit
+		// 4 F17).
+		start := len(name) - 200
+		for start < len(name) && !utf8.RuneStart(name[start]) {
+			start++
+		}
+		name = name[start:]
 	}
 	if strings.TrimSpace(name) == "" {
 		name = "attachment"

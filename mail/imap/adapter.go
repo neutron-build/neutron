@@ -145,7 +145,12 @@ func (a *Adapter) Sync(ctx context.Context, box mail.MailboxID, cur mail.Cursor)
 		return changes, nil
 	}
 
-	if a.conn.Supports("CONDSTORE") && prev.ModSeq > 0 {
+	// CHANGEDSINCE reports modifications but never expunges; only QRESYNC
+	// (paired with CONDSTORE) feeds VANISHED. Using the incremental path
+	// on a CONDSTORE-only server left expunged messages in the mirror
+	// forever, so the expunge-reconciling full scan is the fallback
+	// (audit IMAP-01).
+	if a.conn.Supports("QRESYNC") && a.conn.Supports("CONDSTORE") && prev.ModSeq > 0 {
 		changes, uids, err := a.incremental(ctx, box, prev)
 		if err != nil {
 			return nil, err
@@ -260,7 +265,10 @@ func (a *Adapter) fetchRange(ctx context.Context, box mail.MailboxID, set, modif
 	return envs, err
 }
 
-const fetchItems = "(UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE BODYSTRUCTURE)"
+// ENVELOPE has no References header, only In-Reply-To, and a thread is keyed
+// on its root: with the parent alone, every reply past the first opens a new
+// thread. The one header is fetched beside the envelope; PEEK leaves \Seen.
+const fetchItems = "(UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (REFERENCES)])"
 
 func (a *Adapter) fetchRangeWithVanished(ctx context.Context, box mail.MailboxID, set, modifier string) ([]mail.Envelope, map[uint32]mail.MessageID, []uint32, error) {
 	resp, err := a.conn.exec(ctx, "UID FETCH %s %s%s", set, fetchItems, modifier)
@@ -336,7 +344,9 @@ func (a *Adapter) parseFetch(box mail.MailboxID, items token) (mail.Envelope, bo
 		env.Keywords = parseFlags(flags)
 	}
 	if internal, ok := items.find("INTERNALDATE"); ok {
-		if t, err := time.Parse("02-Jan-2006 15:04:05 -0700", internal.text); err == nil {
+		// "_2" accepts the legal space-padded single-digit day (" 1-Jan")
+		// that "02" rejects (audit DATA-04).
+		if t, err := time.Parse("_2-Jan-2006 15:04:05 -0700", internal.text); err == nil {
 			env.ReceivedAt = t
 		}
 	}
@@ -346,6 +356,11 @@ func (a *Adapter) parseFetch(box mail.MailboxID, items token) (mail.Envelope, bo
 
 	if e, ok := items.find("ENVELOPE"); ok {
 		applyEnvelope(&env, e)
+	}
+	if h, ok := items.findPrefix("BODY[HEADER.FIELDS"); ok {
+		if refs := mail.ParseReferences(h.text); len(refs) > 0 {
+			env.References = refs
+		}
 	}
 
 	// Identity is chosen by what the server actually gave us. A
@@ -678,16 +693,40 @@ func uidForIdentity(id mail.MessageID, uids map[uint32]mail.MessageID) (uint32, 
 // so that reading never sets \Seen as a side effect, and a server refuses
 // STORE, COPY, and EXPUNGE against a read-only selection — without this every
 // mutation fails with "mailbox selected read only".
+//
+// Contract (audit IMAP-03): identities are resolved to UIDs BEFORE the
+// writable selection (resolution may itself select read-only mailboxes), a
+// batch spanning more than one mailbox is rejected rather than silently
+// misaddressing UIDs from the wrong namespace, targeted expunge requires
+// UIDPLUS up front, and custom keywords are validated as IMAP atoms so
+// nothing client-supplied can escape the command line.
 func (a *Adapter) Apply(ctx context.Context, op mail.Operation) error {
-	if err := a.selectWritable(ctx); err != nil {
-		return err
+	if op.Kind == mail.OpAddKeyword || op.Kind == mail.OpRemoveKeyword {
+		flag := imapFlag(op.Keyword)
+		if !strings.HasPrefix(flag, `\`) {
+			if _, err := keywordAtom(flag); err != nil {
+				return err
+			}
+		}
+	}
+	needsTargetedExpunge := op.Kind == mail.OpDelete ||
+		(op.Kind == mail.OpMove && !a.conn.Supports("MOVE"))
+	if needsTargetedExpunge && !a.conn.Supports("UIDPLUS") {
+		return fmt.Errorf("imap: targeted deletion requires UIDPLUS")
 	}
 
 	uids := make([]string, 0, len(op.IDs))
+	selectedBox := ""
 	for _, id := range op.IDs {
 		uid, err := a.uidFor(ctx, id)
 		if err != nil {
 			return err
+		}
+		if box := a.conn.selected; selectedBox != "" && box != selectedBox {
+			return fmt.Errorf("imap: mutation spans mailboxes %q and %q; issue one operation per source mailbox",
+				selectedBox, box)
+		} else if selectedBox == "" {
+			selectedBox = box
 		}
 		uids = append(uids, strconv.FormatUint(uint64(uid), 10))
 	}
@@ -695,6 +734,10 @@ func (a *Adapter) Apply(ctx context.Context, op mail.Operation) error {
 		return nil
 	}
 	set := strings.Join(uids, ",")
+
+	if err := a.selectWritable(ctx); err != nil {
+		return err
+	}
 
 	switch op.Kind {
 	case mail.OpAddKeyword:
@@ -726,6 +769,22 @@ func (a *Adapter) Apply(ctx context.Context, op mail.Operation) error {
 	default:
 		return fmt.Errorf("imap: unsupported operation %d", op.Kind)
 	}
+}
+
+// keywordAtom validates a custom IMAP keyword as a conservative atom:
+// IMAP atoms with CR, LF, parentheses or spaces would desynchronise or
+// escape the command stream.
+func keywordAtom(s string) (string, error) {
+	if len(s) == 0 || len(s) > 64 {
+		return "", fmt.Errorf("invalid IMAP keyword length")
+	}
+	for _, c := range []byte(s) {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
+			c >= '0' && c <= '9' || c == '_' || c == '-' || c == '.') {
+			return "", fmt.Errorf("invalid IMAP keyword %q", s)
+		}
+	}
+	return s, nil
 }
 
 // selectWritable re-opens the current mailbox read-write if it was opened

@@ -2,6 +2,7 @@ package gmail
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -262,5 +263,73 @@ func TestIncrementalHistoryPaginationPreservesTokenAndDefersCursor(t *testing.T)
 	}
 	if len(tokens) != 2 || tokens[1] != "next/token" {
 		t.Fatalf("page tokens sent = %v", tokens)
+	}
+}
+
+// Quoted display names containing commas are one mailbox, encoded display
+// names decode, and malformed headers yield nothing rather than invented
+// addresses (audit GMAIL-01).
+func TestParseAddrsHandlesQuotedCommasAndEncodings(t *testing.T) {
+	got := parseAddrs(`"Doe, Jane" <jane@example.invalid>`)
+	if len(got) != 1 || got[0].Email != "jane@example.invalid" || got[0].Name != "Doe, Jane" {
+		t.Fatalf("quoted comma name = %+v, want one intact mailbox", got)
+	}
+	got = parseAddrs("=?utf-8?q?J=C3=BCrgen?= <j@example.invalid>")
+	if len(got) != 1 || got[0].Name != "Jürgen" {
+		t.Fatalf("encoded display name = %+v", got)
+	}
+	if parseAddrs("not an address list <") != nil {
+		t.Fatal("a malformed header produced addresses")
+	}
+}
+
+// Date headers with named zones and one-digit days are legal mail and must
+// parse (audit GMAIL-01).
+func TestToEnvelopeParsesFlexibleDates(t *testing.T) {
+	m := &gmail.Message{Payload: &gmail.MessagePart{Headers: []*gmail.MessagePartHeader{
+		{Name: "Date", Value: "Thu, 7 Sep 2026 09:00:00 GMT"},
+	}}}
+	env := toEnvelope(m)
+	if env.SentAt.IsZero() {
+		t.Fatal("a valid GMT date header was dropped")
+	}
+}
+
+// partBytes-based text collection handles both legal representations:
+// inline Body.Data and AttachmentId-only parts (audit GMAIL-02).
+func TestBodyResolvesAttachmentBackedTextParts(t *testing.T) {
+	// The generated client cannot be stubbed without a fake endpoint;
+	// decodeURLBytes is the shared decoder both representations go through.
+	inline := &gmail.MessagePart{
+		MimeType: "text/plain",
+		PartId:   "t2",
+		Body:     &gmail.MessagePartBody{Data: base64.RawURLEncoding.EncodeToString([]byte("hi"))},
+	}
+	raw, err := decodeURLBytes(inline.Body.Data)
+	if err != nil || string(raw) != "hi" {
+		t.Fatalf("unpadded base64url decode: %q %v", raw, err)
+	}
+	padded, err := decodeURLBytes(base64.URLEncoding.EncodeToString([]byte("hi")))
+	if err != nil || string(padded) != "hi" {
+		t.Fatalf("padded base64url decode: %q %v", padded, err)
+	}
+	if _, err := decodeURLBytes("!!!not base64!!!"); err == nil {
+		t.Fatal("invalid encoding was accepted")
+	}
+}
+
+// Charsets other than UTF-8 decode; unknown ones error rather than being
+// misread (audit GMAIL-02).
+func TestDecodeCharset(t *testing.T) {
+	latin1 := []byte{0x46, 0xfc, 0x72} // "Für" in ISO-8859-1
+	got, err := decodeCharset(latin1, "iso-8859-1")
+	if err != nil || got != "Für" {
+		t.Fatalf("latin1 decode = %q %v", got, err)
+	}
+	if got, err := decodeCharset([]byte("plain"), "utf-8"); err != nil || got != "plain" {
+		t.Fatalf("utf-8 passthrough = %q %v", got, err)
+	}
+	if _, err := decodeCharset([]byte("x"), "x-unknown-charset"); err == nil {
+		t.Fatal("unknown charset was silently treated as UTF-8")
 	}
 }

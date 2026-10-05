@@ -8,9 +8,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 )
+
+// tokenJSONLimit bounds the token callback's JSON response (audit
+// OPS-01): token documents are small; anything large is a broken or
+// hostile endpoint.
+const tokenJSONLimit = 1 << 20
 
 // A background sync has no request to carry a credential on, which is the one
 // hole in per-request credentials: the engine can serve a user who is looking
@@ -130,7 +136,7 @@ func (s *CallbackTokenSource) Token(ctx context.Context, acct AccountID) (Creden
 	}
 
 	var out TokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, tokenJSONLimit)).Decode(&out); err != nil {
 		return Credential{}, fmt.Errorf("mail: decode token callback: %w", err)
 	}
 	if out.NeedsReauth {

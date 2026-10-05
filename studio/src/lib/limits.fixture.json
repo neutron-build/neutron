@@ -2,17 +2,17 @@
   "nucleus": {
     "engine": {
       "product": "nucleus",
-      "version": "1.2.0",
-      "raw": "PostgreSQL 16.0 (Nucleus 1.2.0 — The Definitive Database)"
+      "version": "1.2.2",
+      "raw": "PostgreSQL 16.0 (Nucleus 1.2.2 — The Definitive Database)"
     },
     "measured": {
       "report": "conformance/live/orm/capabilities.nucleus.json",
-      "nucleusVersion": "1.2.0",
-      "nucleusTree": "f17ef40489ea35e099ff07f36c77bc4749276dc9",
-      "recorded": "2026-10-05"
+      "nucleusVersion": "1.2.2",
+      "nucleusTree": "e8b92af142017f73a918325e40aeb48cac72b5e6",
+      "recorded": "2026-10-04"
     },
     "current": true,
-    "currentNote": "the connected engine reports Nucleus 1.2.0, the measured build; builds are matched by version string only (the nucleus/ tree cannot be read over the connection), so a different tree reporting the same version is treated as measured",
+    "currentNote": "the connected engine reports Nucleus 1.2.2, the measured build; builds are matched by version string only (the nucleus/ tree cannot be read over the connection), so a different tree reporting the same version is treated as measured",
     "models": [
       {
         "model": "sql",
@@ -727,22 +727,22 @@
     },
     "measured": {
       "report": "conformance/live/orm/capabilities.nucleus.json",
-      "nucleusVersion": "1.2.0",
-      "nucleusTree": "f17ef40489ea35e099ff07f36c77bc4749276dc9",
-      "recorded": "2026-10-05"
+      "nucleusVersion": "1.2.2",
+      "nucleusTree": "e8b92af142017f73a918325e40aeb48cac72b5e6",
+      "recorded": "2026-10-04"
     },
     "current": false,
-    "currentNote": "limits were measured on Nucleus 1.2.0 (nucleus/ tree f17ef40489ea); the connected build reports 9.9.9 and has not been measured, so every status below is unknown",
+    "currentNote": "limits were measured on Nucleus 1.2.2 (nucleus/ tree e8b92af14201); the connected build reports 9.9.9 and has not been measured, so every status below is unknown",
     "models": [
       {
         "model": "sql",
         "label": "SQL",
         "availability": "unknown",
-        "availabilityReason": "measured on Nucleus 1.2.0, not on 9.9.9: relational SQL over pgwire; the recorded ORM capability report lists the contracts verified through each driver",
+        "availabilityReason": "measured on Nucleus 1.2.2, not on 9.9.9: relational SQL over pgwire; the recorded ORM capability report lists the contracts verified through each driver",
         "transaction": "unknown",
-        "transactionNote": "measured on Nucleus 1.2.0, not on 9.9.9: DML commits and rolls back (savepoints included) and other sessions do not see uncommitted rows; DDL is NOT transactional (it survives ROLLBACK and is visible before COMMIT); READ ONLY is enforced; the default buffered disk engine supports READ COMMITTED and refuses higher isolation levels",
+        "transactionNote": "measured on Nucleus 1.2.2, not on 9.9.9: DML commits and rolls back (savepoints included) and other sessions do not see uncommitted rows; DDL is NOT transactional (it survives ROLLBACK and is visible before COMMIT); READ ONLY is enforced; the default buffered disk engine supports READ COMMITTED and refuses higher isolation levels",
         "durability": "unknown",
-        "durabilityNote": "measured on Nucleus 1.2.0, not on 9.9.9: committed rows survived a kill of the engine process and a restart in the X04 restart battery; the signal was not recorded (SIGKILL is not claimed) and power loss was not measured",
+        "durabilityNote": "measured on Nucleus 1.2.2, not on 9.9.9: committed rows survived a kill of the engine process and a restart in the X04 restart battery; the signal was not recorded (SIGKILL is not claimed) and power loss was not measured",
         "atomicWithSql": "unknown",
         "warnings": [
           "DDL runs outside the transaction: a failed migration leaves earlier statements applied",
@@ -863,11 +863,11 @@
         "model": "kv",
         "label": "Key-Value",
         "availability": "unknown",
-        "availabilityReason": "measured on Nucleus 1.2.0, not on 9.9.9: string/typed values, TTLs, namespaces and collections pass the X04 live battery",
+        "availabilityReason": "measured on Nucleus 1.2.2, not on 9.9.9: string/typed values, TTLs, namespaces and collections pass the X04 live battery",
         "transaction": "unknown",
-        "transactionNote": "measured on Nucleus 1.2.0, not on 9.9.9: not measured on this build; the engine documents that ROLLBACK undoes scalar KV writes without isolating them from other sessions, and that collection (list/hash/set) writes are refused inside a transaction",
+        "transactionNote": "measured on Nucleus 1.2.2, not on 9.9.9: not measured on this build; the engine documents that ROLLBACK undoes scalar KV writes without isolating them from other sessions, and that collection (list/hash/set) writes are refused inside a transaction",
         "durability": "unknown",
-        "durabilityNote": "measured on Nucleus 1.2.0, not on 9.9.9: a KV value and a TTL key's remaining lifetime survived a kill of the engine process and a restart in the X04 restart battery; the signal was not recorded (SIGKILL is not claimed) and power loss was not measured",
+        "durabilityNote": "measured on Nucleus 1.2.2, not on 9.9.9: a KV value and a TTL key's remaining lifetime survived a kill of the engine process and a restart in the X04 restart battery; the signal was not recorded (SIGKILL is not claimed) and power loss was not measured",
         "atomicWithSql": "unsupported",
         "warnings": [
           "one global keyspace: namespaces are key prefixes, not permissions",
@@ -907,11 +907,11 @@
         "model": "vector",
         "label": "Vector",
         "availability": "unknown",
-        "availabilityReason": "measured on Nucleus 1.2.0, not on 9.9.9: pgvector-style SQL columns are unsupported on this build (the ORM's vector capability resolves unsupported, 0A000); the Nucleus VECTOR_* function surface Studio browses is not measured",
+        "availabilityReason": "measured on Nucleus 1.2.2, not on 9.9.9: pgvector-style SQL columns are unsupported on this build (the ORM's vector capability resolves unsupported, 0A000); the Nucleus VECTOR_* function surface Studio browses is not measured",
         "transaction": "unknown",
-        "transactionNote": "measured on Nucleus 1.2.0, not on 9.9.9: not measured on this build",
+        "transactionNote": "measured on Nucleus 1.2.2, not on 9.9.9: not measured on this build",
         "durability": "unknown",
-        "durabilityNote": "measured on Nucleus 1.2.0, not on 9.9.9: not measured on this build",
+        "durabilityNote": "measured on Nucleus 1.2.2, not on 9.9.9: not measured on this build",
         "atomicWithSql": "unknown",
         "warnings": [
           "vector results are not verified against an independent oracle on this engine"
@@ -931,11 +931,11 @@
         "model": "timeseries",
         "label": "TimeSeries",
         "availability": "unknown",
-        "availabilityReason": "measured on Nucleus 1.2.0, not on 9.9.9: TS_* insert, count and range reads pass the X03 leg (range scoping checked against hand oracles)",
+        "availabilityReason": "measured on Nucleus 1.2.2, not on 9.9.9: TS_* insert, count and range reads pass the X03 leg (range scoping checked against hand oracles)",
         "transaction": "unknown",
-        "transactionNote": "measured on Nucleus 1.2.0, not on 9.9.9: not measured on this build",
+        "transactionNote": "measured on Nucleus 1.2.2, not on 9.9.9: not measured on this build",
         "durability": "unknown",
-        "durabilityNote": "measured on Nucleus 1.2.0, not on 9.9.9: points survived SIGKILL and restart in the X03 leg; power loss was not measured",
+        "durabilityNote": "measured on Nucleus 1.2.2, not on 9.9.9: points survived SIGKILL and restart in the X03 leg; power loss was not measured",
         "atomicWithSql": "unknown",
         "warnings": [
           "retention policies are global and retroactive: they delete existing and backfilled points of every series"
@@ -963,11 +963,11 @@
         "model": "document",
         "label": "Document",
         "availability": "unknown",
-        "availabilityReason": "measured on Nucleus 1.2.0, not on 9.9.9: collection-scoped DOC_* functions resolve supported (value-asserting probes, X02)",
+        "availabilityReason": "measured on Nucleus 1.2.2, not on 9.9.9: collection-scoped DOC_* functions resolve supported (value-asserting probes, X02)",
         "transaction": "unknown",
-        "transactionNote": "measured on Nucleus 1.2.0, not on 9.9.9: ROLLBACK removes the transaction's documents and COMMIT publishes them, but other sessions read them before COMMIT; Studio and the client run each document call as its own statement",
+        "transactionNote": "measured on Nucleus 1.2.2, not on 9.9.9: ROLLBACK removes the transaction's documents and COMMIT publishes them, but other sessions read them before COMMIT; Studio and the client run each document call as its own statement",
         "durability": "unknown",
-        "durabilityNote": "measured on Nucleus 1.2.0, not on 9.9.9: committed documents survived SIGKILL and restart; an open transaction's documents were gone (X02 leg); power loss was not measured",
+        "durabilityNote": "measured on Nucleus 1.2.2, not on 9.9.9: committed documents survived SIGKILL and restart; an open transaction's documents were gone (X02 leg); power loss was not measured",
         "atomicWithSql": "unsupported",
         "warnings": [
           "no isolation: other sessions see uncommitted documents",
@@ -1031,11 +1031,11 @@
         "model": "graph",
         "label": "Graph",
         "availability": "unknown",
-        "availabilityReason": "measured on Nucleus 1.2.0, not on 9.9.9: GRAPH_NODE/GRAPH_NEIGHBORS and property matching resolve supported (X02); traversal is bounded client-side",
+        "availabilityReason": "measured on Nucleus 1.2.2, not on 9.9.9: GRAPH_NODE/GRAPH_NEIGHBORS and property matching resolve supported (X02); traversal is bounded client-side",
         "transaction": "unknown",
-        "transactionNote": "measured on Nucleus 1.2.0, not on 9.9.9: ROLLBACK removes the transaction's nodes and COMMIT publishes them, but other sessions read them before COMMIT",
+        "transactionNote": "measured on Nucleus 1.2.2, not on 9.9.9: ROLLBACK removes the transaction's nodes and COMMIT publishes them, but other sessions read them before COMMIT",
         "durability": "unknown",
-        "durabilityNote": "measured on Nucleus 1.2.0, not on 9.9.9: committed nodes survived SIGKILL and restart (X02 leg); power loss was not measured",
+        "durabilityNote": "measured on Nucleus 1.2.2, not on 9.9.9: committed nodes survived SIGKILL and restart (X02 leg); power loss was not measured",
         "atomicWithSql": "unsupported",
         "warnings": [
           "one global graph: no tenant, namespace or permission boundary",
@@ -1099,11 +1099,11 @@
         "model": "fts",
         "label": "Full-Text",
         "availability": "unknown",
-        "availabilityReason": "measured on Nucleus 1.2.0, not on 9.9.9: PostgreSQL-style full-text functions are faked on this build (to_tsvector returns its argument, ts_rank is constant) and resolve unsupported; the FTS_* document index Studio browses is not measured",
+        "availabilityReason": "measured on Nucleus 1.2.2, not on 9.9.9: PostgreSQL-style full-text functions are faked on this build (to_tsvector returns its argument, ts_rank is constant) and resolve unsupported; the FTS_* document index Studio browses is not measured",
         "transaction": "unknown",
-        "transactionNote": "measured on Nucleus 1.2.0, not on 9.9.9: not measured on this build; the engine documents that FTS_* index writes happen at statement time and are only best-effort undone by ROLLBACK",
+        "transactionNote": "measured on Nucleus 1.2.2, not on 9.9.9: not measured on this build; the engine documents that FTS_* index writes happen at statement time and are only best-effort undone by ROLLBACK",
         "durability": "unknown",
-        "durabilityNote": "measured on Nucleus 1.2.0, not on 9.9.9: not measured on this build",
+        "durabilityNote": "measured on Nucleus 1.2.2, not on 9.9.9: not measured on this build",
         "atomicWithSql": "unsupported",
         "warnings": [
           "FTS_* index writes are not tied to the SQL transaction (engine semantics document)"
@@ -1133,7 +1133,7 @@
         "model": "geo",
         "label": "Geo",
         "availability": "unknown",
-        "availabilityReason": "measured on Nucleus 1.2.0, not on 9.9.9: GEO_* functions match hand oracles; layers are ordinary SQL tables (X04 live battery)",
+        "availabilityReason": "measured on Nucleus 1.2.2, not on 9.9.9: GEO_* functions match hand oracles; layers are ordinary SQL tables (X04 live battery)",
         "transaction": "not-applicable",
         "transactionNote": "pure functions hold no state; layer rows are SQL rows with SQL's limits",
         "durability": "not-applicable",
@@ -1163,11 +1163,11 @@
         "model": "blob",
         "label": "Blob",
         "availability": "unknown",
-        "availabilityReason": "measured on Nucleus 1.2.0, not on 9.9.9: byte-exact round trips, ranges and streaming pass the X04 live battery",
+        "availabilityReason": "measured on Nucleus 1.2.2, not on 9.9.9: byte-exact round trips, ranges and streaming pass the X04 live battery",
         "transaction": "unknown",
-        "transactionNote": "measured on Nucleus 1.2.0, not on 9.9.9: not measured on this build",
+        "transactionNote": "measured on Nucleus 1.2.2, not on 9.9.9: not measured on this build",
         "durability": "unknown",
-        "durabilityNote": "measured on Nucleus 1.2.0, not on 9.9.9: a blob's bytes and content type survived a kill of the engine process and a restart in the X04 restart battery; the signal was not recorded (SIGKILL is not claimed) and power loss was not measured",
+        "durabilityNote": "measured on Nucleus 1.2.2, not on 9.9.9: a blob's bytes and content type survived a kill of the engine process and a restart in the X04 restart battery; the signal was not recorded (SIGKILL is not claimed) and power loss was not measured",
         "atomicWithSql": "unsupported",
         "warnings": [
           "blob writes are separate statements from any SQL row that references them"
@@ -1195,11 +1195,11 @@
         "model": "streams",
         "label": "Streams",
         "availability": "unknown",
-        "availabilityReason": "measured on Nucleus 1.2.0, not on 9.9.9: STREAM_* append, range, consumer groups and acks pass the X05 leg",
+        "availabilityReason": "measured on Nucleus 1.2.2, not on 9.9.9: STREAM_* append, range, consumer groups and acks pass the X05 leg",
         "transaction": "unknown",
-        "transactionNote": "measured on Nucleus 1.2.0, not on 9.9.9: ROLLBACK removes a pending append (X05 leg); isolation from other sessions is not measured",
+        "transactionNote": "measured on Nucleus 1.2.2, not on 9.9.9: ROLLBACK removes a pending append (X05 leg); isolation from other sessions is not measured",
         "durability": "unknown",
-        "durabilityNote": "measured on Nucleus 1.2.0, not on 9.9.9: entries, groups, cursors and acks survived SIGKILL and restart (X05 leg); power loss was not measured",
+        "durabilityNote": "measured on Nucleus 1.2.2, not on 9.9.9: entries, groups, cursors and acks survived SIGKILL and restart (X05 leg); power loss was not measured",
         "atomicWithSql": "unknown",
         "warnings": [
           "resume with the last entry's full id: a bare millisecond cursor silently skips entries in that millisecond",
@@ -1252,11 +1252,11 @@
         "model": "columnar",
         "label": "Columnar",
         "availability": "unknown",
-        "availabilityReason": "measured on Nucleus 1.2.0, not on 9.9.9: COLUMNAR_* store and engine='columnar' tables pass the X03 leg",
+        "availabilityReason": "measured on Nucleus 1.2.2, not on 9.9.9: COLUMNAR_* store and engine='columnar' tables pass the X03 leg",
         "transaction": "unknown",
-        "transactionNote": "measured on Nucleus 1.2.0, not on 9.9.9: COLUMNAR_* store inserts are refused inside an explicit transaction and are append-only; engine='columnar' SQL tables honour ROLLBACK like SQL tables",
+        "transactionNote": "measured on Nucleus 1.2.2, not on 9.9.9: COLUMNAR_* store inserts are refused inside an explicit transaction and are append-only; engine='columnar' SQL tables honour ROLLBACK like SQL tables",
         "durability": "unknown",
-        "durabilityNote": "measured on Nucleus 1.2.0, not on 9.9.9: store rows survived SIGKILL and restart (X03 leg); power loss was not measured",
+        "durabilityNote": "measured on Nucleus 1.2.2, not on 9.9.9: store rows survived SIGKILL and restart (X03 leg); power loss was not measured",
         "atomicWithSql": "unsupported",
         "warnings": [
           "COLUMNAR_* inserts cannot join a transaction",
@@ -1311,11 +1311,11 @@
         "model": "datalog",
         "label": "Datalog",
         "availability": "unknown",
-        "availabilityReason": "measured on Nucleus 1.2.0, not on 9.9.9: DATALOG_* facts, rules and recursive queries pass the X05 leg",
+        "availabilityReason": "measured on Nucleus 1.2.2, not on 9.9.9: DATALOG_* facts, rules and recursive queries pass the X05 leg",
         "transaction": "unknown",
-        "transactionNote": "measured on Nucleus 1.2.0, not on 9.9.9: not measured on this build; the engine documents that a rolled-back DATALOG_ASSERT can return after a restart (its log is not compensated on rollback)",
+        "transactionNote": "measured on Nucleus 1.2.2, not on 9.9.9: not measured on this build; the engine documents that a rolled-back DATALOG_ASSERT can return after a restart (its log is not compensated on rollback)",
         "durability": "unknown",
-        "durabilityNote": "measured on Nucleus 1.2.0, not on 9.9.9: facts and rules survived SIGKILL and restart (X05 leg); power loss was not measured",
+        "durabilityNote": "measured on Nucleus 1.2.2, not on 9.9.9: facts and rules survived SIGKILL and restart (X05 leg); power loss was not measured",
         "atomicWithSql": "unsupported",
         "warnings": [
           "a rolled-back assertion can reappear after a restart (engine semantics document)"
@@ -1353,11 +1353,11 @@
         "model": "cdc",
         "label": "CDC",
         "availability": "unknown",
-        "availabilityReason": "measured on Nucleus 1.2.0, not on 9.9.9: CDC_READ / CDC_TABLE_READ pass the X05 leg (metadata-only events)",
+        "availabilityReason": "measured on Nucleus 1.2.2, not on 9.9.9: CDC_READ / CDC_TABLE_READ pass the X05 leg (metadata-only events)",
         "transaction": "unknown",
-        "transactionNote": "measured on Nucleus 1.2.0, not on 9.9.9: events are emitted at statement time, before COMMIT; a rolled-back transaction's events stay in the log with no compensating record",
+        "transactionNote": "measured on Nucleus 1.2.2, not on 9.9.9: events are emitted at statement time, before COMMIT; a rolled-back transaction's events stay in the log with no compensating record",
         "durability": "unknown",
-        "durabilityNote": "measured on Nucleus 1.2.0, not on 9.9.9: the log replayed and its sequence continued after SIGKILL and restart (X05 leg); per-event fsync is not measured",
+        "durabilityNote": "measured on Nucleus 1.2.2, not on 9.9.9: the log replayed and its sequence continued after SIGKILL and restart (X05 leg); per-event fsync is not measured",
         "atomicWithSql": "unsupported",
         "warnings": [
           "only INSERT statements emit events on this build: UPDATE and DELETE never reach the log",
@@ -1397,11 +1397,11 @@
         "model": "pubsub",
         "label": "PubSub",
         "availability": "unknown",
-        "availabilityReason": "measured on Nucleus 1.2.0, not on 9.9.9: LISTEN/NOTIFY cross-connection delivery and the PUBSUB_* publish surface pass the X05 leg, with divergences",
+        "availabilityReason": "measured on Nucleus 1.2.2, not on 9.9.9: LISTEN/NOTIFY cross-connection delivery and the PUBSUB_* publish surface pass the X05 leg, with divergences",
         "transaction": "unknown",
-        "transactionNote": "measured on Nucleus 1.2.0, not on 9.9.9: notifications sent inside a rolled-back transaction are still delivered",
+        "transactionNote": "measured on Nucleus 1.2.2, not on 9.9.9: notifications sent inside a rolled-back transaction are still delivered",
         "durability": "unknown",
-        "durabilityNote": "measured on Nucleus 1.2.0, not on 9.9.9: in-memory fan-out: nothing is persisted, and a message published with no subscriber is dropped (engine semantics document)",
+        "durabilityNote": "measured on Nucleus 1.2.2, not on 9.9.9: in-memory fan-out: nothing is persisted, and a message published with no subscriber is dropped (engine semantics document)",
         "atomicWithSql": "unsupported",
         "warnings": [
           "an idle listener receives nothing until it runs a statement",
@@ -1447,9 +1447,9 @@
     },
     "measured": {
       "report": "conformance/live/orm/capabilities.nucleus.json",
-      "nucleusVersion": "1.2.0",
-      "nucleusTree": "f17ef40489ea35e099ff07f36c77bc4749276dc9",
-      "recorded": "2026-10-05"
+      "nucleusVersion": "1.2.2",
+      "nucleusTree": "e8b92af142017f73a918325e40aeb48cac72b5e6",
+      "recorded": "2026-10-04"
     },
     "current": true,
     "live": {

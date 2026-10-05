@@ -30,9 +30,12 @@ const PLAYGROUND_DIR = join(process.cwd(), "apps", "playground");
 const DIST_DIR = join(PLAYGROUND_DIR, "dist");
 const SNAPSHOT_PATH = join(process.cwd(), "scripts", "render-guards.snapshot.json");
 
-// Gzipped server-bundle ceiling. Measured baseline is ~37 KB gz; the ceiling
-// leaves headroom for ordinary growth but trips on a step-change regression.
-const BUNDLE_GZ_BUDGET_BYTES = 48 * 1024;
+// Gzipped server-bundle ceiling. The server bundle is unminified. Vite 8's
+// Rolldown output is smaller raw than esbuild's (about 182 KB against 187 KB)
+// but tab-indented and region-commented, so it gzips about 7% larger (about
+// 50 KB against 46 KB). The ceiling leaves headroom for ordinary growth but
+// trips on a step-change regression.
+const BUNDLE_GZ_BUDGET_BYTES = 52 * 1024;
 
 const WRITE = process.argv.includes("--write");
 
