@@ -932,7 +932,7 @@ impl Executor {
             let granted_roles: Vec<String> = actions
                 .iter()
                 .filter_map(|action| match action {
-                    ast::Action::Role { role } => Some(role.value.clone()),
+                    ast::Action::Role { role } => role.0.first().map(|i| i.value.clone()),
                     _ => None,
                 })
                 .collect();
@@ -1045,7 +1045,7 @@ impl Executor {
             let revoked: Vec<String> = actions
                 .iter()
                 .filter_map(|action| match action {
-                    ast::Action::Role { role } => Some(role.value.clone()),
+                    ast::Action::Role { role } => role.0.first().map(|i| i.value.clone()),
                     _ => None,
                 })
                 .collect();
