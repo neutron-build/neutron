@@ -167,8 +167,8 @@ type MeasuredBuild struct {
 var Measured = MeasuredBuild{
 	Report:         SrcCapabilityReport,
 	NucleusVersion: "1.2.2",
-	NucleusTree:    "e8b92af142017f73a918325e40aeb48cac72b5e6",
-	Recorded:       "2026-10-04",
+	NucleusTree:    "cba383fd7db094b6d741fee4bcc8f75a28f1ae0f",
+	Recorded:       "2026-10-05",
 }
 
 // LiveSettings are PostgreSQL settings read from the connection itself: the
