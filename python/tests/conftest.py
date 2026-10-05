@@ -44,3 +44,16 @@ def mock_conn():
     conn.fetchrow = AsyncMock(return_value=None)
     conn.execute = AsyncMock(return_value="OK")
     return conn
+
+
+# Tests that import psycopg (an optional [orm] extra) skip cleanly when the
+# driver is not installed — the same contract as the live tests.
+try:
+    import psycopg  # noqa: F401
+except ImportError:
+    collect_ignore_glob = [
+        "test_orm_clients.py",
+        "test_orm_composite_values.py",
+        "test_orm_endpoint.py",
+        "test_orm_pg_values.py",
+    ]
