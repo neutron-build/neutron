@@ -9635,7 +9635,7 @@ impl Executor {
         // Same authority gate as every other DROP (see execute_drop).
         self.require_security_admin("drop an object")?;
         for name in &names {
-            let schema_name = super::admin::object_name_value(name);
+            let schema_name = admin::object_name_value(name);
             // Held across the member scan so two concurrent DROP SCHEMA calls
             // cannot both pass the emptiness check for the same name. No
             // other DDL path takes this lock, so no lock-order cycle is
