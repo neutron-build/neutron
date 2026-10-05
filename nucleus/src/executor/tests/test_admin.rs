@@ -1495,7 +1495,7 @@ async fn quoted_role_names_stored_without_delimiter_quotes() {
                 !ex.roles.read().await.contains_key("\"probe_quoted\""),
                 "the quoted rendering must not be a separate stored name"
             );
-            ex.execute(r#"GRANT "probe_quoted" TO root"#).await.unwrap();
+            ex.execute("GRANT probe_quoted TO root").await.unwrap();
         },
     )
     .await;
