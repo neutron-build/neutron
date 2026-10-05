@@ -262,14 +262,15 @@ async function main() {
         if (dropError?.code === '0A000') {
           // Older engines had no DROP SCHEMA; the current one refuses only
           // CASCADE. Remove the fixture tables, then drop the now-empty
-          // schema with RESTRICT; record residue only if that fails (an
+          // schema with RESTRICT. The CASCADE refusal is expected and
+          // handled; residue is recorded only when the fallback fails (an
           // owned engine's data directory is removed by its runner).
+          error = null;
           try {
             for (const kind of DRIVERS) await native.query('DROP TABLE IF EXISTS ' + quote(schema) + '.' + quote(kind));
             await native.query('DROP SCHEMA IF EXISTS ' + quote(schema));
           } catch (cleanupError) {
-            (report.cleanupResidue ??= []).push('schema ' + schema + ' remains: DROP SCHEMA failed');
-            error = null;
+            (report.cleanupResidue ??= []).push('schema ' + schema + ' remains: DROP SCHEMA failed: ' + String(cleanupError?.message ?? cleanupError).split('\n')[0].slice(0, 120));
           }
         }
         if (error !== null) {
