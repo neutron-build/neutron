@@ -28,6 +28,21 @@ const SERIES_CHUNK_ROWS: usize = 256;
 /// a long range stays cancellable.
 const SERIES_CANCEL_POLL: u32 = 1024;
 
+
+/// The identifier value of a (possibly quoted) object name, without the
+/// delimiter quotes its Display rendering carries. Quotes delimit; they are
+/// not part of the name.
+fn object_name_value(name: &ast::ObjectName) -> String {
+    name.0
+        .iter()
+        .filter_map(|part| match part {
+            ast::ObjectNamePart::Identifier(ident) => Some(ident.value.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 impl Executor {
     /// The principal an audit event should be attributed to: the effective
     /// role of the session running the statement.
