@@ -17,7 +17,8 @@ PostgreSQL. Companion documents:
 
 `NUMERIC`/`DECIMAL` uses checked exact decimal arithmetic for casts,
 comparisons, arithmetic, and plain/grouped/window aggregates, across every
-table engine and across a durable restart.
+table engine and across a durable restart. A declared `NUMERIC(p, s)` is
+enforced on every write and on an explicit cast.
 
 - Supported range: a **96-bit coefficient with at most 28 fractional digits**.
 - Larger values fail rather than rounding through floating point. Failing is
@@ -42,7 +43,11 @@ cast (`1.500` stays `1.500`) and equal values hash alike. A written trailing
 zero past the 28th fractional digit is refused, because the scale cannot be
 kept. Binary parameters follow the same rule: NaN, the infinities, a digit word
 of 10000 or more, an unknown sign, a mismatched length, or nonzero digits past
-`dscale` are refused instead of decoded.
+`dscale` are refused instead of decoded. The NaN and Infinity refusal (0A000)
+holds on every route into NUMERIC — a text cast with or without a type
+modifier, a float8 cast, and an INSERT into a constrained or unconstrained
+column — before any comparison, hash or arithmetic could see one, so a
+refused statement writes nothing.
 
 Arithmetic (`+`, `-`, `*`, `%`, `SUM`, window `SUM`/`AVG`) returns the exact
 result or fails with `numeric value out of range` (22003). The underlying
@@ -51,27 +56,100 @@ number and `1e-28 * 0.5` as `1e-28`. A product whose unreduced coefficient
 exceeds `i128`, or a sum whose aligned coefficients do, is refused even when the
 reduced result would fit (a conservative refusal, not a rounding).
 
+Scalar functions on NUMERIC operate on digits and never produce a negative
+zero: `TRUNC` accepts a negative scale (`1234.5678` at `-2` is `1200`) and
+truncates `-0.5` to `0`, `CEIL(-0.5)` is `0` where `FLOOR(-0.5)` is `-1`,
+`ROUND(-0.4)` is `0`, and `ABS` keeps the written scale (`-1.50` is `1.50`);
+unary minus keeps the written scale too and never negates zero (`0.00`
+negates to `0.00`). A `ROUND` whose result cannot be held is refused with
+22003 (`5e28` at scale `-29` would be `1e29`; `4e28` rounds to `0`), and so
+is a scale argument beyond i32, an error rather than a wrap to scale 0.
+Mixed NUMERIC and integer input to `SUM`/`AVG` aggregates exactly (`1.5`,
+`2` and `0.25` sum to `3.75` and average `1.25`); a float8 beside a NUMERIC
+in the same aggregate is an error, not a dropped operand.
+
+**Type modifiers.** `NUMERIC(p, s)` and `DECIMAL(p, s)` are enforced on every
+write — INSERT, UPDATE, `ON CONFLICT DO UPDATE` assignments, expression
+results, a DEFAULT backfill, and each element of an array column — and on an
+explicit cast. The value is rounded half away from zero to the scale and
+padded to it: `1.005` becomes `1.01`, `2.5` becomes `2.50`, `-0.001` becomes
+`0.00` (no negative zero). A value that needs more than `p - s` integer
+digits after rounding is `numeric field overflow` (22003); a refused
+statement writes nothing and a failed UPDATE keeps the row's old value. When
+`p = s` there is no integer digit (`0.995` into `NUMERIC(2,2)` rounds to
+`1.00` and is refused), and scale 0 rounds to an integer. The declaration
+never extends the range: the 96-bit coefficient still bounds the padded
+value, so the largest 29-digit value fits `NUMERIC(29)` and is refused for
+`NUMERIC(28)`, or padded to scale 2 for `NUMERIC(40,2)`; `1.5` fits
+`NUMERIC(30,28)` as 29 digits where `12.5` needs 30 and is refused.
+
+Declarations are validated wherever one can appear — `CREATE TABLE`,
+`ALTER TABLE ... ADD COLUMN`, `ALTER COLUMN TYPE`, and a cast — and a
+refused CREATE leaves no table behind:
+
+| Declaration | Result |
+|---|---|
+| `p` 1–1000, `s` 0–28, `s <= p` (`NUMERIC(1000,28)` is the widest) | enforced |
+| One PostgreSQL itself rejects: `p = 0`, `p > 1000`, `s > 1000` | 22023 |
+| A declaration the exact decimal cannot hold: `s < 0`, `s > p`, `s > 28` | 0A000 |
+| No modifier (`NUMERIC`) | unconstrained; nothing is rounded or padded |
+
+`ALTER COLUMN TYPE numeric(p, s)` rewrites the stored values to the new
+declaration; when a stored value no longer fits, the ALTER is refused (22003)
+and leaves every value and the old declaration untouched. Changing to
+unconstrained `numeric` stops the rounding. `ADD COLUMN ... DEFAULT` pads
+both the backfilled rows and later defaulted writes to the scale. A logical
+dump keeps the declaration and the written scale, so a restored column still
+rounds, pads and refuses. The catalog reports the enforced declaration:
+`format_type` returns `numeric(10,2)` and `information_schema.columns`
+returns `numeric_precision` and `numeric_scale`. The modifier's encoding is
+PostgreSQL's `atttypmod`, `((p << 16) | s) + 4` (`655366` for
+`NUMERIC(10,2)`); `-1` — anything below 4 — is unconstrained. It persists in
+`catalog.json` (`numeric_typmod`) and a restarted executor still rounds and
+refuses; a catalog written before modifiers existed loads as unconstrained
+and is saved back without the key, so old files stay compatible in both
+directions.
+
+**Literals.** A decimal literal keeps every digit where NUMERIC can hold it
+instead of passing through `f64`: written into a NUMERIC column,
+`0.1234567890123456789012345678`, `1.10`, `-0.50`, `1.5e1` (= `15`) and
+`12345678901234567890.123` arrive exactly, on INSERT and on UPDATE. A
+literal the exact decimal cannot hold — a 29th fractional digit, `1e29`,
+`1e400` — is refused with 22003 rather than rounded through a float. Beside
+a NUMERIC or integer operand a decimal literal is NUMERIC, so `3 * 0.1` is
+`0.3` and `CAST('1' AS NUMERIC) - 0.1234567890123456789` is
+`0.8765432109876543211`; beside a float8 operand it stays float8, and
+NUMERIC combined with float8 is float8 arithmetic. An integer literal beyond
+bigint is NUMERIC (`9223372036854775808` is exact), and past the 96-bit
+coefficient it is refused with 22003. Comparing a NUMERIC column with a
+decimal literal compares digits, so values that differ past the 17th
+significant digit are not collapsed into one double.
+
+**float8 to NUMERIC** uses fifteen significant digits with no invented digits
+beyond them: `0.30000000000000004::float8::numeric` is `0.3` and
+`123456789.123456789::float8::numeric` is `123456789.123457`. A magnitude
+outside the exact range is refused (22003): `1e300` overflows the
+coefficient and `1e-30` needs 30 fractional digits. A type modifier applies
+after the conversion (`CAST(CAST(2.675 AS DOUBLE PRECISION) AS NUMERIC(5,2))`
+is `2.68`).
+
 Known deviations that are documented, not refused:
 
-- **Type modifiers are parsed but not enforced.** `NUMERIC(10,2)` stores
-  `1.005` as written; PostgreSQL rounds to `1.01` and raises 22003 when the
-  precision is exceeded. Enforcing them needs the precision and scale on the
-  column definition and the catalog format; neither exists yet.
-- **An unquoted decimal literal evaluates as FLOAT8**, so `INSERT ... VALUES
-  (0.1234567890123456789)` into a NUMERIC column passes through `f64` and keeps
-  about 17 significant digits. `CAST(literal AS NUMERIC)`, `literal::numeric`,
-  a quoted string, or a bound parameter keep every digit. PostgreSQL types the
-  literal as NUMERIC.
 - **Arithmetic results drop trailing zeros** (`1.10 + 1.10` is `2.2`, where
   PostgreSQL shows `2.20`). The value is exact; only the display scale differs.
-  A cast keeps the written scale.
+  A cast keeps the written scale, and a type modifier re-pads the value on
+  write.
 - **Division and `AVG` round** to what fits the 96-bit coefficient and 28
   fractional digits, as any finite decimal division must. PostgreSQL rounds at
   a different scale, so the last digits can differ.
-- **Float to NUMERIC** uses the shortest `f64` text, so `0.1::float8::numeric`
-  is `0.1` but `0.30000000000000004::float8::numeric` keeps 17 digits where
-  PostgreSQL keeps 15. A float that needs more than 28 fractional digits
-  (`1e-30`) is refused (22003).
+
+## NULL casts
+
+A NULL operand stays NULL through a cast to text on every path: over NULL
+JSONB, TEXT and INT columns, `j::text`, `t::text`, `n::text` and
+`CAST(j AS VARCHAR)` all return SQL NULL (`j IS NULL` is true), never the
+string `NULL`. A cast of a present value still renders it (`n::text` of INT
+`5` is `'5'`).
 
 ## Date, time, and time zones
 
@@ -195,8 +273,7 @@ argument is NULL.
 
 These fixes do not establish full PostgreSQL scalar parity. Date infinity,
 enum declaration-order sorting and arbitrary numeric precision/scale remain
-limits. Large bare numeric literals may pass through floating-point parsing;
-use an exact text-to-NUMERIC cast within the engine's supported decimal range.
+limits.
 
 ### Deferred foreign keys and generated writes
 
@@ -415,3 +492,13 @@ scale separately. Scientific JSONB numbers expand without rounding when the
 result fits 16,384 bytes; larger expansions retain exact scientific notation.
 Internal ordering is consistent with these equality classes; full PostgreSQL
 JSONB ordering across unequal values is not established.
+
+## Parameter types for schema-qualified tables
+
+Describe reports the column types. Parameter type inference resolves
+schema-qualified table names, so an INSERT against `"s1"."docs"` (BIGINT,
+BOOLEAN, TEXT, JSONB, INTEGER columns) describes its `$1..$5` as INT8, BOOL,
+TEXT, JSONB, INT4, and `UPDATE "s1"."docs" SET data = $1 WHERE id = $2`
+describes `$1` as JSONB and `$2` as INT8. Types the client declared are
+reported as declared, and a parameter with neither a declared nor an
+inferred type is described as TEXT.
