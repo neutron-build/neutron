@@ -104,8 +104,8 @@ falls back to its default.
 | `max_prepared_statements_per_session` | `usize` | `1024` | `NUCLEUS_LIMITS_MAX_PREPARED_STATEMENTS_PER_SESSION` | SQL-level PREPARE statements and extended-query named statements one session may hold. Past the limit, PREPARE / Parse fails with 54000. |
 | `max_portals_per_session` | `usize` | `1024` | `NUCLEUS_LIMITS_MAX_PORTALS_PER_SESSION` | Extended-query named portals (Bind) one connection may hold. |
 | `max_cursors_per_session` | `usize` | `1024` | `NUCLEUS_LIMITS_MAX_CURSORS_PER_SESSION` | SQL-level cursors (DECLARE) one session may hold. |
-| `max_cursor_rows` | `usize` | `1_000_000` | `NUCLEUS_LIMITS_MAX_CURSOR_ROWS` | Rows one DECLAREd cursor may hold. DECLARE materializes the query, so the row set is capped at declaration; past the limit DECLARE fails with 54000 and nothing is stored. |
-| `max_cursor_bytes` | `usize` | `64 * 1024 * 1024` | `NUCLEUS_LIMITS_MAX_CURSOR_BYTES` | Estimated heap bytes one DECLAREd cursor may hold (64 MiB). Checked on the materialized result before it is stored; past the limit DECLARE fails with 54000. Worst case per session is this times max_cursors_per_session. |
+| `max_cursor_rows` | `usize` | `1_000_000` | `NUCLEUS_LIMITS_MAX_CURSOR_ROWS` | Rows one DECLAREd cursor may hold or return. A materialized cursor runs its query at DECLARE, so the row set is capped at declaration; past the limit DECLARE fails with 54000 and nothing is stored. A lazy cursor (a bare generate_series) holds no rows, and this caps the rows one FETCH may return; past the limit FETCH fails with 54000 and the cursor does not move. |
+| `max_cursor_bytes` | `usize` | `64 * 1024 * 1024` | `NUCLEUS_LIMITS_MAX_CURSOR_BYTES` | Estimated heap bytes one DECLAREd cursor may hold or return (64 MiB). Checked on a materialized result before it is stored, and on the rows one FETCH of a lazy cursor returns; past the limit DECLARE or FETCH fails with 54000. Worst case per session is this times max_cursors_per_session. |
 | `max_listen_channels_per_session` | `usize` | `1024` | `NUCLEUS_LIMITS_MAX_LISTEN_CHANNELS_PER_SESSION` | Channels one connection may LISTEN on. |
 | `max_large_objects_per_session` | `usize` | `1024` | `NUCLEUS_LIMITS_MAX_LARGE_OBJECTS_PER_SESSION` | Large-object descriptors one connection may hold open (lo_open). |
 | `max_auth_failure_entries` | `usize` | `10_000` | `NUCLEUS_LIMITS_MAX_AUTH_FAILURE_ENTRIES` | Source IPs tracked in the failed-authentication table. |
@@ -147,29 +147,31 @@ probe hooks, not supported configuration.
 | `NUCLEUS_CACHE_ORACLE_ITERS` | `src/executor/tests/test_cache_coherence.rs` |
 | `NUCLEUS_CLUSTER_LISTEN` | `src/main.rs` |
 | `NUCLEUS_CLUSTER_TOKEN` | `src/main.rs` |
-| `NUCLEUS_CRASHPOINT` | `src/bin/probe_crash_points.rs` |
-| `NUCLEUS_CRASHPOINT_HIT` | `src/bin/probe_crash_points.rs` |
-| `NUCLEUS_CRASHPOINT_SKIP` | `src/bin/probe_crash_points.rs` |
-| `NUCLEUS_DISABLE_QUERY_CACHE` | `src/bin/compete.rs` |
+| `NUCLEUS_CRASHPOINT` | `src/storage/crashpoint.rs` |
+| `NUCLEUS_CRASHPOINT_HIT` | `src/bin/probe_crossmodel_atomicity.rs` |
+| `NUCLEUS_CRASHPOINT_SKIP` | `src/storage/crashpoint.rs` |
+| `NUCLEUS_DISABLE_QUERY_CACHE` | `src/executor/mod.rs` |
 | `NUCLEUS_DISK_CHECK_INTERVAL_SECS` | `src/config/mod.rs` |
 | `NUCLEUS_DISK_MIN_FREE_MB` | `src/config/mod.rs` |
 | `NUCLEUS_DISK_READONLY_FREE_PCT` | `src/config/mod.rs` |
 | `NUCLEUS_DISK_RESUME_FREE_PCT` | `src/config/mod.rs` |
 | `NUCLEUS_DISK_WARN_FREE_PCT` | `src/config/mod.rs` |
+| `NUCLEUS_ENCRYPTION_KEY` | `src/bin/probe_soak.rs` |
 | `NUCLEUS_ENCRYPT_KEY` | `src/main.rs` |
 | `NUCLEUS_ENCRYPT_PASSPHRASE` | `src/main.rs` |
-| `NUCLEUS_ENCRYPTION_KEY` | `src/bin/probe_index_coherence.rs` |
 | `NUCLEUS_EXPERIMENTAL_REPLICATION` | `src/main.rs` |
 | `NUCLEUS_INTERNAL_TLS` | `src/main.rs` |
 | `NUCLEUS_INTERNAL_TLS_CA` | `src/main.rs` |
 | `NUCLEUS_INTERNAL_TLS_CERT` | `src/main.rs` |
 | `NUCLEUS_INTERNAL_TLS_KEY` | `src/main.rs` |
 | `NUCLEUS_INTERNAL_TLS_SERVER_NAME` | `src/main.rs` |
-| `NUCLEUS_IOFAULT` | `src/wire/mod.rs` |
-| `NUCLEUS_IOFAULT_KIND` | `src/wire/mod.rs` |
-| `NUCLEUS_IOFAULT_SKIP` | `src/wire/mod.rs` |
+| `NUCLEUS_IOFAULT` | `src/storage/crashpoint.rs` |
+| `NUCLEUS_IOFAULT_KIND` | `src/storage/crashpoint.rs` |
+| `NUCLEUS_IOFAULT_SKIP` | `src/storage/crashpoint.rs` |
 | `NUCLEUS_KV_MAX_HOT_MB` | `src/kv/mod.rs` |
 | `NUCLEUS_LIMITS_MAX_AUTH_FAILURE_ENTRIES` | `src/config/mod.rs` |
+| `NUCLEUS_LIMITS_MAX_CURSOR_BYTES` | `src/config/mod.rs` |
+| `NUCLEUS_LIMITS_MAX_CURSOR_ROWS` | `src/config/mod.rs` |
 | `NUCLEUS_LIMITS_MAX_CURSORS_PER_SESSION` | `src/config/mod.rs` |
 | `NUCLEUS_LIMITS_MAX_LARGE_OBJECTS_PER_SESSION` | `src/config/mod.rs` |
 | `NUCLEUS_LIMITS_MAX_LISTEN_CHANNELS_PER_SESSION` | `src/config/mod.rs` |
@@ -218,5 +220,5 @@ probe hooks, not supported configuration.
 | `NUCLEUS_WAL_ENABLED` | `src/config/mod.rs` |
 | `NUCLEUS_WAL_GROUP_COMMIT_INTERVAL_US` | `src/config/mod.rs` |
 | `NUCLEUS_WAL_SEGMENT_SIZE_MB` | `src/config/mod.rs` |
-| `NUCLEUS_WAL_SYNC_MODE` | `src/config/mod.rs` |
 | `NUCLEUS_WAL_SYNCHRONOUS_COMMIT` | `src/config/mod.rs` |
+| `NUCLEUS_WAL_SYNC_MODE` | `src/config/mod.rs` |
