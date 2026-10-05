@@ -6938,7 +6938,7 @@ mod tests {
             vec![
                 Type::INT8,
                 Type::BOOL,
-                Type::VARCHAR,
+                Type::TEXT,
                 Type::JSONB,
                 Type::INT4
             ]
@@ -7056,7 +7056,7 @@ mod tests {
     fn pg_type_roundtrip_text() {
         let dt = DataType::Text;
         let pg = data_type_to_pg(&dt);
-        assert_eq!(pg, Type::VARCHAR);
+        assert_eq!(pg, Type::TEXT);
         assert_eq!(pg_type_to_data_type(&pg), DataType::Text);
     }
 
@@ -7270,7 +7270,7 @@ mod tests {
         // Verify that core types map correctly
         assert_eq!(data_type_to_pg(&DataType::Int32), Type::INT4);
         assert_eq!(data_type_to_pg(&DataType::Int64), Type::INT8);
-        assert_eq!(data_type_to_pg(&DataType::Text), Type::VARCHAR);
+        assert_eq!(data_type_to_pg(&DataType::Text), Type::TEXT);
         assert_eq!(data_type_to_pg(&DataType::Bool), Type::BOOL);
         assert_eq!(data_type_to_pg(&DataType::Float64), Type::FLOAT8);
     }
@@ -8662,7 +8662,7 @@ mod security_tests {
         let fields = describe_static_fields("SELECT DOC_INSERT($1)", None).unwrap();
         assert_eq!(*fields[0].datatype(), Type::INT8);
         let fields = describe_static_fields("SELECT STREAM_XADD($1, $2, $3)", None).unwrap();
-        assert_eq!(*fields[0].datatype(), Type::VARCHAR);
+        assert_eq!(*fields[0].datatype(), Type::TEXT);
         let fields = describe_static_fields("SELECT KV_CDEL($1, $2) AS released", None).unwrap();
         assert_eq!(fields[0].name(), "released");
         assert_eq!(*fields[0].datatype(), Type::BOOL);
