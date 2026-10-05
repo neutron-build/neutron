@@ -32,7 +32,7 @@ const SERIES_CANCEL_POLL: u32 = 1024;
 /// The identifier value of a (possibly quoted) object name, without the
 /// delimiter quotes its Display rendering carries. Quotes delimit; they are
 /// not part of the name.
-fn object_name_value(name: &ast::ObjectName) -> String {
+pub(super) fn object_name_value(name: &ast::ObjectName) -> String {
     name.0
         .iter()
         .filter_map(|part| match part {
@@ -1138,7 +1138,7 @@ impl Executor {
 /// The identifier value of a (possibly quoted) object name, without the
 /// delimiter quotes its Display rendering carries. Quotes delimit; they are
 /// not part of the name.
-fn object_name_value(name: &ast::ObjectName) -> String {
+pub(super) fn object_name_value(name: &ast::ObjectName) -> String {
     name.0
         .iter()
         .filter_map(|part| match part {
