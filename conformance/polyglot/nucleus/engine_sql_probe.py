@@ -162,7 +162,7 @@ def register_binary_param_dumpers(connection: psycopg.Connection) -> None:
                 self.context = context
 
             def dump(self, obj: object) -> bytes:
-                native = self.context.adapters.get_dumper_by_oid(self.oid, Format.BINARY)
+                native = psycopg.adapters.get_dumper_by_oid(self.oid, Format.BINARY)
                 return bytes(native(type(obj), self.context).dump(obj))
 
         return OidBinaryDumper
