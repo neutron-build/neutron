@@ -652,9 +652,12 @@ struct ExtendedQueryCounts {
 /// admits an endpoint from the startup message and one that asks over SQL see
 /// one engine identity (pgwire's own default would advertise `16.6-pgwire-*`).
 fn startup_parameter_provider() -> DefaultServerParameterProvider {
-    DefaultServerParameterProvider {
-        server_version: "16.0 (Nucleus)".to_string(),
-        ..Default::default()
+    // The pgwire struct is non-exhaustive, so it cannot be built with a struct expression.
+    #[allow(clippy::field_reassign_with_default)]
+    {
+        let mut provider = DefaultServerParameterProvider::default();
+        provider.server_version = "16.0 (Nucleus)".to_string();
+        provider
     }
 }
 
