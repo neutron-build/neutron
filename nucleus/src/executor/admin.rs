@@ -1133,20 +1133,6 @@ impl Executor {
         })
     }
 
-    /// The identifier value of a (possibly quoted) object name, without the
-    /// delimiter quotes its Display rendering carries. Quotes delimit; they are
-    /// not part of the name.
-    pub(super) fn object_name_value(name: &ast::ObjectName) -> String {
-        name.0
-            .iter()
-            .filter_map(|part| match part {
-                ast::ObjectNamePart::Identifier(ident) => Some(ident.value.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join(".")
-    }
-
     pub(super) async fn execute_create_role(
         &self,
         create_role: ast::CreateRole,
@@ -2334,7 +2320,7 @@ fn apply_cursor_move(cursor: &mut CursorDef, movement: CursorMove) -> Result<Vec
             let out: Vec<Row> = (1..=take)
                 .map(|i| cursor.rows[pos - i - 1].clone())
                 .collect();
-            (out, if pos > k { pos - k } else { 0 })
+            (out, pos.saturating_sub(k))
         }
         CursorMove::BackwardAll => {
             let take = pos.saturating_sub(1);

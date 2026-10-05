@@ -3326,7 +3326,7 @@ impl Executor {
     #[cfg(feature = "server")]
     pub(crate) fn allocate_backend_pid(&self) -> Result<i32, ExecError> {
         self.next_backend_pid
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pid| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |pid| {
                 pid.checked_add(1)
             })
             .map_err(|_| ExecError::Unsupported("backend identity space exhausted".into()))
