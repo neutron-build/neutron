@@ -572,13 +572,16 @@ func main() {
 	defer cleanupCancel()
 	for i := len(raws) - 1; i >= 0; i-- {
 		if _, err := raws[i].Exec(cleanupCtx, `DROP SCHEMA IF EXISTS "`+schema+`" CASCADE`); err != nil {
-			// An engine without DROP SCHEMA (SQLSTATE 0A000): remove the fixture
-			// table instead and record the empty schema as residue; an owned
-			// engine's data directory is removed by its runner.
+			// Older engines had no DROP SCHEMA; the current one refuses only
+			// CASCADE (SQLSTATE 0A000). Remove the fixture table, then drop
+			// the now-empty schema with RESTRICT; record residue only if that
+			// fails. An owned engine's data directory is removed by its runner.
 			var coded interface{ SQLState() string }
 			if errors.As(err, &coded) && coded.SQLState() == "0A000" {
 				if _, tableErr := raws[i].Exec(cleanupCtx, `DROP TABLE IF EXISTS "`+schema+`".docs`); tableErr == nil {
-					r.CleanupResidue = "schema " + schema + " remains: the engine does not support DROP SCHEMA"
+					if _, schemaErr := raws[i].Exec(cleanupCtx, `DROP SCHEMA IF EXISTS "`+schema+`"`); schemaErr != nil {
+						r.CleanupResidue = "schema " + schema + " remains: DROP SCHEMA failed"
+					}
 					err = nil
 				} else {
 					err = tableErr

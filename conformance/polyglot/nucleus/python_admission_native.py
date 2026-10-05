@@ -170,10 +170,15 @@ def main() -> None:
             try: native.execute(sql.SQL('DROP SCHEMA IF EXISTS {} CASCADE').format(sql.Identifier(schema)))
             except BaseException as error:
                 if getattr(error,'sqlstate',None)=='0A000':
-                    # The engine has no DROP SCHEMA: remove the fixture tables and record the empty schema as residue.
+                    # Older engines had no DROP SCHEMA; the current one refuses
+                    # only CASCADE. Remove the fixture tables, then drop the
+                    # now-empty schema with RESTRICT; record residue only if
+                    # that fails.
                     try:
                         for mode in ('sync','async'): native.execute(sql.SQL('DROP TABLE IF EXISTS {}.{}').format(sql.Identifier(schema),sql.Identifier(mode)))
-                        report.setdefault('cleanupResidue',[]).append('schema '+schema+' remains: the engine does not support DROP SCHEMA')
+                        native.execute(sql.SQL('DROP SCHEMA IF EXISTS {}').format(sql.Identifier(schema)))
+                    except BaseException:
+                        report.setdefault('cleanupResidue',[]).append('schema '+schema+' remains: DROP SCHEMA failed')
                         error=None
                     except BaseException as table_error: error=table_error
                 if error is not None:
