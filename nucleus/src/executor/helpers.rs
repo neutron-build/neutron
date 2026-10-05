@@ -1140,22 +1140,24 @@ pub(super) fn sql_replacement_for_value(value: &Value) -> String {
 }
 
 /// The implicit cast PostgreSQL applies to a function argument or result that
-/// is declared FLOAT: an integer or exact decimal becomes a float, so the body
-/// computes in FLOAT8. Any other declared type leaves the value unchanged.
-pub(super) fn coerce_to_declared_float(value: Value, declared: &DataType) -> Value {
-    if !matches!(declared, DataType::Float64) {
-        return value;
-    }
-    let parsed = match &value {
-        Value::Int32(n) => Some(f64::from(*n)),
-        Value::Int64(n) => Some(*n as f64),
-        Value::Numeric(text) => text.parse::<f64>().ok(),
+/// is declared FLOAT or NUMERIC. FLOAT: an integer or exact decimal becomes a
+/// float, so the body computes in FLOAT8. NUMERIC: a float (what a bare decimal
+/// literal evaluates to here) becomes the decimal its shortest text denotes, as
+/// the float8-to-numeric cast does. Any other declared type leaves the value
+/// unchanged.
+pub(super) fn coerce_to_declared_number(value: Value, declared: &DataType) -> Value {
+    let converted = match (declared, &value) {
+        (DataType::Float64, Value::Int32(n)) => Some(Value::Float64(f64::from(*n))),
+        (DataType::Float64, Value::Int64(n)) => Some(Value::Float64(*n as f64)),
+        (DataType::Float64, Value::Numeric(text)) => text.parse::<f64>().ok().map(Value::Float64),
+        (DataType::Numeric, Value::Float64(f)) if f.is_finite() => {
+            crate::types::canonical_numeric(&f.to_string())
+                .ok()
+                .map(Value::Numeric)
+        }
         _ => None,
     };
-    match parsed {
-        Some(f) => Value::Float64(f),
-        None => value,
-    }
+    converted.unwrap_or(value)
 }
 
 /// Substitute positional (`$1`) and named (`$name`) placeholders in SQL text.

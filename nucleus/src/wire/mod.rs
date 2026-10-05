@@ -647,6 +647,17 @@ struct ExtendedQueryCounts {
     portals: usize,
 }
 
+/// The startup `server_version` a client sees in ParameterStatus. It is the same
+/// identity `SHOW server_version` and `version()` report, so a driver that
+/// admits an endpoint from the startup message and one that asks over SQL see
+/// one engine identity (pgwire's own default would advertise `16.6-pgwire-*`).
+fn startup_parameter_provider() -> DefaultServerParameterProvider {
+    DefaultServerParameterProvider {
+        server_version: "16.0 (Nucleus)".to_string(),
+        ..Default::default()
+    }
+}
+
 /// The Nucleus query handler. Implements startup authentication, simple query,
 /// and extended query (prepared statement) processing.
 ///
@@ -759,7 +770,7 @@ impl NucleusHandler {
             catalog_authenticator: None,
             auth_method: AuthMethod::default(),
             scram_auth: None,
-            parameter_provider: DefaultServerParameterProvider::default(),
+            parameter_provider: startup_parameter_provider(),
             query_parser,
             compressor: WireCompressor::new(1024),
             session_registry: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -832,7 +843,7 @@ impl NucleusHandler {
             catalog_authenticator: None,
             auth_method,
             scram_auth,
-            parameter_provider: DefaultServerParameterProvider::default(),
+            parameter_provider: startup_parameter_provider(),
             query_parser,
             compressor: WireCompressor::new(1024),
             session_registry: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -6888,6 +6899,11 @@ mod tests {
         assert_eq!(types[0], Type::INT4);
         assert_eq!(types[1], Type::TEXT);
         assert_eq!(types[2], Type::TEXT);
+    }
+
+    #[test]
+    fn startup_server_version_is_the_sql_reported_identity() {
+        assert_eq!(startup_parameter_provider().server_version, "16.0 (Nucleus)");
     }
 
     #[tokio::test]

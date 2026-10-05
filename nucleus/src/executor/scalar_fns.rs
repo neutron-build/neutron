@@ -6774,7 +6774,7 @@ impl Executor {
                     // Substitute parameters ($1, $2, ... or named parameters).
                     for (i, (param_name, param_type)) in func_def.params.iter().enumerate() {
                         if let Some(val) = args.get(i) {
-                            let coerced = coerce_to_declared_float(val.clone(), param_type);
+                            let coerced = coerce_to_declared_number(val.clone(), param_type);
                             let replacement = sql_replacement_for_value(&coerced);
                             positional.push(replacement.clone());
                             if !param_name.is_empty() {
@@ -6804,7 +6804,7 @@ impl Executor {
                             if let Some(first_row) = rows.first() {
                                 let value = first_row.first().cloned().unwrap_or(Value::Null);
                                 Ok(match &func_def.return_type {
-                                    Some(declared) => coerce_to_declared_float(value, declared),
+                                    Some(declared) => coerce_to_declared_number(value, declared),
                                     None => value,
                                 })
                             } else {
