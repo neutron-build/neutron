@@ -6903,7 +6903,10 @@ mod tests {
 
     #[test]
     fn startup_server_version_is_the_sql_reported_identity() {
-        assert_eq!(startup_parameter_provider().server_version, "16.0 (Nucleus)");
+        assert_eq!(
+            startup_parameter_provider().server_version,
+            "16.0 (Nucleus)"
+        );
     }
 
     #[tokio::test]
