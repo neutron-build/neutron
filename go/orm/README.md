@@ -806,7 +806,14 @@ prefix length, for IPv4 and IPv6. `CIDR` uses the distinct native cidr identity;
 Both expose immutable `netip.Prefix` values, refuse zones and invalid zero values,
 and distinguish a nullable pointer's SQL NULL from a valid all-zero address.
 `NewPostgresTable` checks the exact inet/cidr OID; these types are also supported
-by the distributed column generator. Network arrays are outside this profile.
+by the distributed column generator. `Array[Inet]` and `Array[CIDR]` (including
+nullable `*Inet`/`*CIDR` elements and a nullable `*Array[T]` column) reuse the
+dimension-preserving array machinery: host bits, prefix length, IPv4 and IPv6,
+NULL elements, empty arrays and the distinct SQL NULL of a nullable column are
+preserved, and `NewPostgresTable` checks the native inet[]/cidr[] element OIDs.
+`CIDR` elements with host bits are refused rather than masked, and
+multi-dimensional network arrays follow the same dimension-preserving rules as
+every other element type.
 
 `Vector` owns 1–16,000 finite float32 elements, matching the native pgvector
 `vector` storage profile ([native dimension limit](https://github.com/pgvector/pgvector/blob/master/src/vector.h)).
