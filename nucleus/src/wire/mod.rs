@@ -9044,22 +9044,18 @@ mod security_tests {
                 .unwrap_or_else(|| panic!("no entry id in error: {msg}"));
             let (ms, seq) = entry_id
                 .rsplit_once('-')
-                .and_then(|(ms, seq)| Some((ms, seq.parse::<u64>().ok()?)))
+                .and_then(|(ms, seq)| Some((ms.to_string(), seq.parse::<u64>().ok()?)))
                 .unwrap_or_else(|| panic!("unparseable entry id in error: {msg}"));
-            let expected = match marker.trim() {
-                // Same millisecond: the next seq; later millisecond: seq 0.
-                "SIMPLE" => {
-                    if ms == ok1_ms {
-                        (ok1_ms.clone(), ok1_seq + 1)
-                    } else {
-                        (ms.clone(), 0)
-                    }
-                }
-                _ => (ms.clone(), 0),
+            let expected: (String, u64) = if marker.trim() == "SIMPLE" && ms == ok1_ms {
+                // Same millisecond as OK1: the next seq in that millisecond.
+                (ok1_ms.clone(), ok1_seq + 1)
+            } else {
+                // Later millisecond, or EXTENDED on a fresh stream: seq 0.
+                (ms.clone(), 0)
             };
             assert_eq!(
-                (ms.as_str(), seq),
-                (expected.0.as_str(), expected.1),
+                (ms, seq),
+                expected,
                 "{marker}error names {entry_id} — the statement must consume \
                  exactly one entry id after OK1's {id}; two ids mean an \
                  earlier evaluation's error was swallowed and the statement \
