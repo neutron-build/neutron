@@ -50,10 +50,10 @@ is re-recorded and reviewed.
 
 | fact | value |
 |---|---|
-| engine | PostgreSQL 16.0 (Nucleus 1.2.1 — The Definitive Database) |
-| source commit (`--write` run) | `4bb54d9f2719aad720872bc115e222832bbf6c46` |
-| `nucleus/` tree SHA (the engine identity) | `16dba6a4b4685ad3ae00b15e8fd074bc48cb3dcc` |
-| binary SHA-256 (provenance only; release builds are not bit-reproducible) | `16163086f082c19b28b25852168f4f29aae2e0d8a7172536929ca9fe580ee753` |
+| engine | PostgreSQL 16.0 (Nucleus 1.2.2 — The Definitive Database) |
+| source commit (`--write` run) | `5c2357c705ca205178f22ebbb0138794d44542f4` |
+| `nucleus/` tree SHA (the engine identity) | `e8b92af142017f73a918325e40aeb48cac72b5e6` |
+| binary SHA-256 (provenance only; release builds are not bit-reproducible) | `b79190966923e3d1d2539b0e459c2d3067b364cee5905db58a5dde5cad277db8` |
 | drivers | `pg` 8.22.0, `postgres` 3.4.8 |
 | runtime | Node v22.23.2, `@neutron-build/sql` 0.1.0 |
 | recorded | 2026-10-04 |
@@ -195,7 +195,7 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | `catalog.pg_index` | supported | supported |  |  |
 | `catalog.partial_index` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: partial indexes (CREATE INDEX ... WHERE) are not implemented. The predicate was previously parsed and discarded, which built a FULL index… |
 | `catalog.pg_get_indexdef` | supported | supported |  |  |
-| `catalog.regclass_cast` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected [ true, + '27334764' |
+| `catalog.regclass_cast` | unsupported | unsupported |  | wrong result: Expected values to be strictly deep-equal: + actual - expected [ true, + '125674120' |
 | `catalog.pg_enum` | supported | supported |  |  |
 | `catalog.views` | supported | supported |  |  |
 | `catalog.current_schema_and_search_path` | supported | supported |  |  |
@@ -206,7 +206,7 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 |---|---|---|---|---|
 | `ddl.create_table_rollback` | unsupported | unsupported |  | wrong result: table must not survive ROLLBACK true !== false |
 | `ddl.alter_add_column_rollback` | unsupported | unsupported |  | wrong result: column must not survive ROLLBACK true !== false |
-| `ddl.drop_table_rollback` | unsupported | unsupported | 42P01 | server error: ServerSqlError [42P01]: pg: relation "x00d_89b461_base" does not exist |
+| `ddl.drop_table_rollback` | unsupported | unsupported | 42P01 | server error: ServerSqlError [42P01]: pg: relation "x00d_fc63e3_base" does not exist |
 | `ddl.create_index_rollback` | unsupported | unsupported |  | wrong result: index relation must not survive ROLLBACK true !== false |
 | `ddl.rename_column_rollback` | unsupported | unsupported |  | wrong result: original column name must be back false !== true |
 | `ddl.failed_migration_all_or_nothing` | unsupported | unsupported |  | wrong result: first CREATE TABLE must be rolled back true !== false |
@@ -224,7 +224,7 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | `rls.current_user_policy` | supported | supported |  |  |
 | `rls.with_check_blocks_insert` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: unsupported row-security predicate 'current_setting('app.tenant')::INT'; supported forms are boolean constants, column equality to a lite… |
 | `rls.no_policy_default_deny` | supported | supported |  |  |
-| `rls.owner_bypass_unless_forced` | unknown | unknown |  | setup failed: ServerSqlError [0A000]: pg: ALTER TABLE operation not yet supported: OWNER TO x00s_521c56_app — in: alter table x00s_521c56_docs owner to x00s_521c56_app |
+| `rls.owner_bypass_unless_forced` | unknown | unknown |  | setup failed: ServerSqlError [0A000]: pg: ALTER TABLE operation not yet supported: OWNER TO x00s_bf0fc0_app — in: alter table x00s_bf0fc0_docs owner to x00s_bf0fc0_app |
 | `rls.set_config_transaction_local` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: unknown function: SET_CONFIG |
 | `rls.pg_policies_introspection` | supported | supported |  |  |
 | `rls.set_local_role_transaction_local` | supported | supported |  |  |
@@ -242,7 +242,7 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | `lock.advisory_xact` | unsupported | unsupported | 25P02 | server error: ServerSqlError [25P02]: pg: current transaction is aborted, commands ignored until end of transaction block |
 | `lock.select_for_update_nowait` | supported | supported |  |  |
 | `lock.select_for_update_skip_locked` | supported | supported |  |  |
-| `lock.row_lock_timeout` | unsupported | unsupported |  | wrong result: update of a row locked by an open transaction: expected SQLSTATE 55P03, got ServerSqlError [XX000]: pg: I/O error: timed out after 10002ms waiting for another transa… |
+| `lock.row_lock_timeout` | unsupported | unsupported |  | wrong result: update of a row locked by an open transaction: expected SQLSTATE 55P03, got ServerSqlError [XX000]: pg: I/O error: timed out after 10001ms waiting for another transa… |
 | `lock.blocked_update_waits_then_applies` | supported | supported |  |  |
 | `lock.lock_table_nowait` | unsupported | unsupported | 42601 | server error: ServerSqlError [42601]: pg: parse error: SQL parse error: sql parser error: Expected: an SQL statement, found: lock at Line: 1, Column: 1 |
 | `lock.statement_timeout` | unsupported | unsupported |  | wrong result: pg_sleep past statement_timeout: expected SQLSTATE 57014, got ServerSqlError [0A000]: pg: unknown function: PG_SLEEP |
