@@ -614,7 +614,11 @@ test('owned raw SQL refuses lifecycle escape before driver dispatch and preserve
   const pin = fakePin();
   pin.prepare = text => ({ sql: text, name: undefined, query: () => pin.query(text), execute: () => pin.execute(text) });
   await runTransaction(pin, async tx => {
-    for (const sql of ['/*nested /* comment */ */ COMMIT', 'ROLLBACK', 'SELECT 1; COMMIT', 'SET ROLE admin', 'RESET ALL', 'PREPARE TRANSACTION \'escape\'', 'SELECT 1;/*safe*/END', 'SELECT \'unterminated', 'SELECT $body$unterminated']) {
+    // SET ROLE, SAVEPOINT, ROLLBACK TO, and RELEASE are now admitted
+    // (PostgreSQL enforces its own security; the runner owns top-level
+    // transaction control only). The refusal list below covers what the
+    // guard still blocks.
+    for (const sql of ['/*nested /* comment */ */ COMMIT', 'ROLLBACK', 'SELECT 1; COMMIT', 'RESET ALL', 'PREPARE TRANSACTION \'escape\'', 'SELECT 1;/*safe*/END', 'SELECT \'unterminated', 'SELECT $body$unterminated']) {
       const before = [...pin.statements];
       await assert.rejects(tx.query(sql), /transaction SQL/);
       assert.throws(() => tx.prepare!(sql), /transaction SQL/);
