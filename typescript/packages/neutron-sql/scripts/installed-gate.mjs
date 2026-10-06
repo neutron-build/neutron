@@ -114,7 +114,7 @@ const EXAMPLE_CONTEXT = {
     preamble: `declare const DATABASE_URL: string;\ndeclare const controller: AbortController;`,
   },
   "const cells = pgTable(\"cells\", { values: bigint(\"values\").nativeArray() });": {
-    preamble: `import { pgTable, bigint } from "@neutron-build/sql";\nimport { db } from "./fixture.js";`,
+    preamble: `import { pgTable, bigint, PgArray } from "@neutron-build/sql";\nimport { db } from "./fixture.js";`,
   },
   'import { timeBucket, tsBetween, timeSeries, hypertableSupport } from "@neutron-build/sql/timeseries";': {
     preamble: `import { pgTable, serial, text, timestamptz, double, cteTable, avg, over, lag, asc } from "@neutron-build/sql";\nimport { db } from "./fixture.js";`,

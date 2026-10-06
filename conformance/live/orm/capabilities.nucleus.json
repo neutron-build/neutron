@@ -5,7 +5,7 @@
   "engine": {
     "product": "nucleus",
     "version": "1.2.2",
-    "raw": "PostgreSQL 16.0 (Nucleus 1.2.2 — The Definitive Database)"
+    "raw": "PostgreSQL 16.0 (Nucleus 1.2.2 \u2014 The Definitive Database)"
   },
   "source": {
     "commit": "e12c33cce35c8dd699c3e3ca6b488c3cf45b3650",
@@ -33,7 +33,7 @@
     {
       "id": "engine.identity",
       "area": "engine",
-      "title": "SELECT VERSION() identifies the engine (FRAMEWORK_CONTRACT §1)",
+      "title": "SELECT VERSION() identifies the engine (FRAMEWORK_CONTRACT \u00a71)",
       "status": {
         "pg": "supported",
         "postgres": "supported"
@@ -1018,7 +1018,7 @@
     {
       "id": "catalog.pg_constraint",
       "area": "catalog",
-      "title": "pg_constraint: contype, conkey, confkey→names, confdeltype, pg_get_expr(conbin) (introspectV2ConstraintsSQL)",
+      "title": "pg_constraint: contype, conkey, confkey\u2192names, confdeltype, pg_get_expr(conbin) (introspectV2ConstraintsSQL)",
       "status": {
         "pg": "unsupported",
         "postgres": "unsupported"
@@ -1063,8 +1063,8 @@
         "postgres": "unsupported"
       },
       "detail": {
-        "pg": "server error: ServerSqlError [0A000]: pg: partial indexes (CREATE INDEX ... WHERE) are not implemented. The predicate was previously parsed and discarded, which built a FULL index under the requested name — larger than intended, and usable for queries the partial index was never meant to serve. Create the index without a WHERE clause if",
-        "postgres": "server error: ServerSqlError [0A000]: postgres: partial indexes (CREATE INDEX ... WHERE) are not implemented. The predicate was previously parsed and discarded, which built a FULL index under the requested name — larger than intended, and usable for queries the partial index was never meant to serve. Create the index without a WHERE cla"
+        "pg": "server error: ServerSqlError [0A000]: pg: partial indexes (CREATE INDEX ... WHERE) are not implemented. The predicate was previously parsed and discarded, which built a FULL index under the requested name \u2014 larger than intended, and usable for queries the partial index was never meant to serve. Create the index without a WHERE clause if",
+        "postgres": "server error: ServerSqlError [0A000]: postgres: partial indexes (CREATE INDEX ... WHERE) are not implemented. The predicate was previously parsed and discarded, which built a FULL index under the requested name \u2014 larger than intended, and usable for queries the partial index was never meant to serve. Create the index without a WHERE cla"
       },
       "sqlstate": {
         "pg": "0A000",
@@ -1236,12 +1236,12 @@
       "area": "ddl",
       "title": "after an error, the transaction rejects further statements (25P02)",
       "status": {
-        "pg": "unsupported",
-        "postgres": "unsupported"
+        "pg": "supported",
+        "postgres": "supported"
       },
       "detail": {
-        "pg": "wrong result: ServerSqlError [23505]: pg: duplicate key value violates unique constraint \"x00d_e70b78_base_pkey\"  '23505' !== '25P02' ",
-        "postgres": "wrong result: ServerSqlError [23505]: postgres: duplicate key value violates unique constraint \"x00d_c775dc_base_pkey\"  '23505' !== '25P02' "
+        "pg": "",
+        "postgres": ""
       }
     },
     {
@@ -1292,8 +1292,8 @@
         "postgres": "unsupported"
       },
       "detail": {
-        "pg": "server error: ServerSqlError [0A000]: pg: unsupported row-security predicate 'current_setting('app.tenant')::INT'; supported forms are boolean constants, column equality to a literal/CURRENT_USER/current_setting('nucleus.tenant_id'), column comparison to a literal with <, <=, >, >=, <>, column IN (literal, …), column IS [NOT] NULL, has_",
-        "postgres": "server error: ServerSqlError [0A000]: postgres: unsupported row-security predicate 'current_setting('app.tenant')::INT'; supported forms are boolean constants, column equality to a literal/CURRENT_USER/current_setting('nucleus.tenant_id'), column comparison to a literal with <, <=, >, >=, <>, column IN (literal, …), column IS [NOT] NULL"
+        "pg": "server error: ServerSqlError [0A000]: pg: unsupported row-security predicate 'current_setting('app.tenant')::INT'; supported forms are boolean constants, column equality to a literal/CURRENT_USER/current_setting('nucleus.tenant_id'), column comparison to a literal with <, <=, >, >=, <>, column IN (literal, \u2026), column IS [NOT] NULL, has_",
+        "postgres": "server error: ServerSqlError [0A000]: postgres: unsupported row-security predicate 'current_setting('app.tenant')::INT'; supported forms are boolean constants, column equality to a literal/CURRENT_USER/current_setting('nucleus.tenant_id'), column comparison to a literal with <, <=, >, >=, <>, column IN (literal, \u2026), column IS [NOT] NULL"
       },
       "sqlstate": {
         "pg": "0A000",
@@ -1322,8 +1322,8 @@
         "postgres": "unsupported"
       },
       "detail": {
-        "pg": "server error: ServerSqlError [0A000]: pg: unsupported row-security predicate 'current_setting('app.tenant')::INT'; supported forms are boolean constants, column equality to a literal/CURRENT_USER/current_setting('nucleus.tenant_id'), column comparison to a literal with <, <=, >, >=, <>, column IN (literal, …), column IS [NOT] NULL, has_",
-        "postgres": "server error: ServerSqlError [0A000]: postgres: unsupported row-security predicate 'current_setting('app.tenant')::INT'; supported forms are boolean constants, column equality to a literal/CURRENT_USER/current_setting('nucleus.tenant_id'), column comparison to a literal with <, <=, >, >=, <>, column IN (literal, …), column IS [NOT] NULL"
+        "pg": "server error: ServerSqlError [0A000]: pg: unsupported row-security predicate 'current_setting('app.tenant')::INT'; supported forms are boolean constants, column equality to a literal/CURRENT_USER/current_setting('nucleus.tenant_id'), column comparison to a literal with <, <=, >, >=, <>, column IN (literal, \u2026), column IS [NOT] NULL, has_",
+        "postgres": "server error: ServerSqlError [0A000]: postgres: unsupported row-security predicate 'current_setting('app.tenant')::INT'; supported forms are boolean constants, column equality to a literal/CURRENT_USER/current_setting('nucleus.tenant_id'), column comparison to a literal with <, <=, >, >=, <>, column IN (literal, \u2026), column IS [NOT] NULL"
       },
       "sqlstate": {
         "pg": "0A000",
@@ -1352,8 +1352,8 @@
         "postgres": "unknown"
       },
       "detail": {
-        "pg": "setup failed: ServerSqlError [0A000]: pg: ALTER TABLE operation not yet supported: OWNER TO x00s_3da110_app — in: alter table x00s_3da110_docs owner to x00s_3da110_app",
-        "postgres": "setup failed: ServerSqlError [0A000]: postgres: ALTER TABLE operation not yet supported: OWNER TO x00s_98bd34_app — in: alter table x00s_98bd34_docs owner to x00s_98bd34_app"
+        "pg": "setup failed: ServerSqlError [0A000]: pg: ALTER TABLE operation not yet supported: OWNER TO x00s_3da110_app \u2014 in: alter table x00s_3da110_docs owner to x00s_3da110_app",
+        "postgres": "setup failed: ServerSqlError [0A000]: postgres: ALTER TABLE operation not yet supported: OWNER TO x00s_98bd34_app \u2014 in: alter table x00s_98bd34_docs owner to x00s_98bd34_app"
       }
     },
     {
@@ -1622,8 +1622,8 @@
         "postgres": "unsupported"
       },
       "detail": {
-        "pg": "server error: ServerSqlError [0A000]: pg: isolation level REPEATABLE READ is not available on this storage engine, which provides READ COMMITTED. Accepting it would run your transaction at READ COMMITTED while reporting REPEATABLE READ — use the MVCC engine for serializable isolation.",
-        "postgres": "server error: ServerSqlError [0A000]: postgres: isolation level REPEATABLE READ is not available on this storage engine, which provides READ COMMITTED. Accepting it would run your transaction at READ COMMITTED while reporting REPEATABLE READ — use the MVCC engine for serializable isolation."
+        "pg": "server error: ServerSqlError [0A000]: pg: isolation level REPEATABLE READ is not available on this storage engine, which provides READ COMMITTED. Accepting it would run your transaction at READ COMMITTED while reporting REPEATABLE READ \u2014 use the MVCC engine for serializable isolation.",
+        "postgres": "server error: ServerSqlError [0A000]: postgres: isolation level REPEATABLE READ is not available on this storage engine, which provides READ COMMITTED. Accepting it would run your transaction at READ COMMITTED while reporting REPEATABLE READ \u2014 use the MVCC engine for serializable isolation."
       },
       "sqlstate": {
         "pg": "0A000",
@@ -1652,8 +1652,8 @@
         "postgres": "unsupported"
       },
       "detail": {
-        "pg": "server error: ServerSqlError [0A000]: pg: isolation level REPEATABLE READ is not available on this storage engine, which provides READ COMMITTED. Accepting it would run your transaction at READ COMMITTED while reporting REPEATABLE READ — use the MVCC engine for serializable isolation.",
-        "postgres": "server error: ServerSqlError [0A000]: postgres: isolation level REPEATABLE READ is not available on this storage engine, which provides READ COMMITTED. Accepting it would run your transaction at READ COMMITTED while reporting REPEATABLE READ — use the MVCC engine for serializable isolation."
+        "pg": "server error: ServerSqlError [0A000]: pg: isolation level REPEATABLE READ is not available on this storage engine, which provides READ COMMITTED. Accepting it would run your transaction at READ COMMITTED while reporting REPEATABLE READ \u2014 use the MVCC engine for serializable isolation.",
+        "postgres": "server error: ServerSqlError [0A000]: postgres: isolation level REPEATABLE READ is not available on this storage engine, which provides READ COMMITTED. Accepting it would run your transaction at READ COMMITTED while reporting REPEATABLE READ \u2014 use the MVCC engine for serializable isolation."
       },
       "sqlstate": {
         "pg": "0A000",
@@ -1682,8 +1682,8 @@
         "postgres": "unsupported"
       },
       "detail": {
-        "pg": "server error: ServerSqlError [0A000]: pg: isolation level SERIALIZABLE is not available on this storage engine, which provides READ COMMITTED. Accepting it would run your transaction at READ COMMITTED while reporting SERIALIZABLE — use the MVCC engine for serializable isolation.",
-        "postgres": "server error: ServerSqlError [0A000]: postgres: isolation level SERIALIZABLE is not available on this storage engine, which provides READ COMMITTED. Accepting it would run your transaction at READ COMMITTED while reporting SERIALIZABLE — use the MVCC engine for serializable isolation."
+        "pg": "server error: ServerSqlError [0A000]: pg: isolation level SERIALIZABLE is not available on this storage engine, which provides READ COMMITTED. Accepting it would run your transaction at READ COMMITTED while reporting SERIALIZABLE \u2014 use the MVCC engine for serializable isolation.",
+        "postgres": "server error: ServerSqlError [0A000]: postgres: isolation level SERIALIZABLE is not available on this storage engine, which provides READ COMMITTED. Accepting it would run your transaction at READ COMMITTED while reporting SERIALIZABLE \u2014 use the MVCC engine for serializable isolation."
       },
       "sqlstate": {
         "pg": "0A000",

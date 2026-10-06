@@ -62,8 +62,8 @@ is re-recorded and reviewed.
 
 | driver | probes | supported | unsupported | unknown |
 |---|---|---|---|---|
-| `pg` | 143 | 104 | 38 | 1 |
-| `postgres` | 143 | 103 | 39 | 1 |
+| `pg` | 143 | 105 | 37 | 1 |
+| `postgres` | 143 | 104 | 38 | 1 |
 
 Driver-divergent verdicts: `codec.text_array_param` (pg supported, postgres unsupported).
 
@@ -77,7 +77,7 @@ Driver-divergent verdicts: `codec.text_array_param` (pg supported, postgres unsu
 | constraints | 9 | 9 / 0 / 0 | 9 / 0 / 0 |
 | codec | 19 | 16 / 3 / 0 | 15 / 4 / 0 |
 | catalog | 14 | 9 / 5 / 0 | 9 / 5 / 0 |
-| ddl | 11 | 2 / 9 / 0 | 2 / 9 / 0 |
+| ddl | 11 | 3 / 8 / 0 | 3 / 8 / 0 |
 | rls | 12 | 6 / 5 / 1 | 6 / 5 / 1 |
 | locks | 11 | 3 / 8 / 0 | 3 / 8 / 0 |
 | transactions | 7 | 2 / 5 / 0 | 2 / 5 / 0 |
@@ -211,7 +211,7 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | `ddl.rename_column_rollback` | unsupported | unsupported |  | wrong result: original column name must be back false !== true |
 | `ddl.failed_migration_all_or_nothing` | unsupported | unsupported |  | wrong result: first CREATE TABLE must be rolled back true !== false |
 | `ddl.ddl_and_history_commit_together` | supported | supported |  |  |
-| `ddl.error_aborts_transaction` | unsupported | unsupported |  | wrong result: ServerSqlError [23505]: pg: duplicate key value violates unique constraint "x00d_e70b78_base_pkey" '23505' !== '25P02' |
+| `ddl.error_aborts_transaction` | supported | supported |  |  |
 | `ddl.uncommitted_ddl_invisible` | unsupported | unsupported |  | wrong result: uncommitted table visible to another session true !== false |
 | `ddl.create_index_concurrently_in_tx_rejected` | unsupported | unsupported |  | wrong result: CIC in a transaction block: expected SQLSTATE 25001, statement succeeded |
 | `ddl.create_index_concurrently` | supported | supported |  |  |

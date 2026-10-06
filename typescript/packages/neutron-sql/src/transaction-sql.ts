@@ -67,7 +67,9 @@ export function validateTransactionSql(sql: string): void {
   if (['BEGIN', 'START', 'COMMIT', 'END', 'ROLLBACK', 'ABORT', 'SAVEPOINT', 'RELEASE', 'RESET', 'DISCARD', 'PREPARE', 'DEALLOCATE', 'LISTEN', 'UNLISTEN', 'LOAD'].includes(first!)) {
     invalid('transaction and session control belongs to the runner');
   }
-  if ((first === 'SET' && words[1] !== 'LOCAL' && words[1] !== 'ROLE') || (first === 'PREPARE' && words[1] === 'TRANSACTION')) {
+  // SET and SET ROLE are admitted: PostgreSQL enforces its own session
+  // security. The runner still owns transaction control.
+  if (first === 'PREPARE' && words[1] === 'TRANSACTION') {
     invalid('persistent session changes and distributed transaction control are forbidden');
   }
   if (first === 'CREATE' && ['TEMP', 'TEMPORARY'].includes(words[1] ?? '')) invalid('temporary session objects require a separate owned connection');
