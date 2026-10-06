@@ -62,8 +62,8 @@ is re-recorded and reviewed.
 
 | driver | probes | supported | unsupported | unknown |
 |---|---|---|---|---|
-| `pg` | 143 | 108 | 34 | 1 |
-| `postgres` | 143 | 107 | 35 | 1 |
+| `pg` | 143 | 109 | 33 | 1 |
+| `postgres` | 143 | 108 | 34 | 1 |
 
 Driver-divergent verdicts: `codec.text_array_param` (pg supported, postgres unsupported).
 
@@ -80,7 +80,7 @@ Driver-divergent verdicts: `codec.text_array_param` (pg supported, postgres unsu
 | ddl | 11 | 3 / 8 / 0 | 3 / 8 / 0 |
 | rls | 12 | 8 / 3 / 1 | 8 / 3 / 1 |
 | locks | 11 | 3 / 8 / 0 | 3 / 8 / 0 |
-| transactions | 7 | 3 / 4 / 0 | 3 / 4 / 0 |
+| transactions | 7 | 4 / 3 / 0 | 4 / 3 / 0 |
 | orm | 19 | 19 / 0 / 0 | 19 / 0 / 0 |
 
 ### Every probe
@@ -259,7 +259,7 @@ Evidence is the observed engine behaviour for non-`supported` verdicts (first dr
 | `txn.read_committed_sees_commits` | supported | supported |  |  |
 | `txn.serializable_write_skew` | unsupported | unsupported | 0A000 | server error: ServerSqlError [0A000]: pg: isolation level SERIALIZABLE is not available on this storage engine, which provides READ COMMITTED. Accepting it would run your transact… |
 | `txn.savepoint_rollback` | supported | supported |  |  |
-| `txn.savepoint_recovers_error` | unsupported | unsupported |  | error: NeutronSqlError: transaction SQL: transaction and session control belongs to the runner |
+| `txn.savepoint_recovers_error` | supported | supported |  |  |
 
 #### orm
 
