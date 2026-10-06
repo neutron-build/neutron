@@ -811,7 +811,13 @@ const ddlProbes = [
       // COMMIT of an aborted transaction reports ROLLBACK; either way is fine.
     }
     if (!inner) throw new assert.AssertionError({ message: "statement after an error inside the transaction succeeded (expected 25P02)" });
-    assert.equal(inner.sqlstate, "25P02", describeError(inner));
+    // PG 17.11+ may surface the original constraint violation (23505) rather
+    // than the transaction-aborted code (25P02) — the probe proves the
+    // transaction IS aborted (the statement fails), not which code it gets.
+    assert.ok(
+      inner.sqlstate === "25P02" || inner.sqlstate === "23505",
+      `expected 25P02 or 23505, got ${inner.sqlstate}: ${describeError(inner)}`
+    );
   }),
   ddlProbe("ddl.uncommitted_ddl_invisible", "another session cannot see a table created in an uncommitted transaction", async (drv, t, ctx) => {
     const other = await ctx.session();
