@@ -1708,12 +1708,12 @@
       "area": "transactions",
       "title": "ROLLBACK TO SAVEPOINT recovers a transaction after a statement error",
       "status": {
-        "pg": "unsupported",
-        "postgres": "unsupported"
+        "pg": "supported",
+        "postgres": "supported"
       },
       "detail": {
-        "pg": "error: NeutronSqlError: transaction SQL: transaction and session control belongs to the runner",
-        "postgres": "error: NeutronSqlError: transaction SQL: transaction and session control belongs to the runner"
+        "pg": "",
+        "postgres": ""
       }
     },
     {
