@@ -1366,7 +1366,7 @@ async fn parameterized_cast_describes_one_column_of_the_cast_type() {
 
     // (sql, expected result column type)
     let cases: &[(&str, Type)] = &[
-        ("SELECT $1::text", Type::VARCHAR),
+        ("SELECT $1::text", Type::TEXT),
         ("SELECT $1::jsonb", Type::JSONB),
         ("SELECT $1::json", Type::JSONB),
         ("SELECT $1::uuid", Type::UUID),
@@ -1421,7 +1421,7 @@ async fn parameterized_cast_describes_its_parameter_as_the_cast_type() {
     let client = connect(port).await;
 
     let cases: &[(&str, Type)] = &[
-        ("SELECT $1::text", Type::VARCHAR),
+        ("SELECT $1::text", Type::TEXT),
         ("SELECT $1::int", Type::INT4),
         ("SELECT $1::int8", Type::INT8),
         ("SELECT $1::bool", Type::BOOL),
@@ -1592,9 +1592,8 @@ async fn computed_vector_columns_describe_their_real_type() {
         3,
         "a trailing-LIMIT statement must describe the rows Execute will send"
     );
-    // A TEXT column describes as VARCHAR — Nucleus's long-standing wire
-    // mapping, unchanged here, and indistinguishable to a client.
-    assert_eq!(*stmt.columns()[0].type_(), Type::VARCHAR);
+    // A TEXT column describes as TEXT (OID 25) since 814332c9
+    assert_eq!(*stmt.columns()[0].type_(), Type::TEXT);
     assert_eq!(
         *stmt.columns()[1].type_(),
         Type::FLOAT8,
