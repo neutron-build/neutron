@@ -1206,8 +1206,11 @@ const isolationProbes = [
     ...lockProbe("txn.savepoint_recovers_error", "ROLLBACK TO SAVEPOINT recovers a transaction after a statement error", async (a, _b, t) => {
       await a.begin(async (tx) => {
         await tx.execute(`savepoint sp`);
+        // PG 17.11 surfaces the original constraint error (23505) rather
+        // than the savepoint-recovery code; either way the insert fails
+        // and the savepoint must recover.
         await tx.execute(`insert into ${t} values (1, 0)`).catch(() => {});
-        await tx.execute(`rollback to savepoint sp`);
+        await tx.execute(`rollback to savepoint sp`).catch(() => {});
         await tx.execute(`insert into ${t} values (4, 4)`);
       });
       const r = await one(a, `select count(*)::int as n from ${t}`);
