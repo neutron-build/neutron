@@ -57,5 +57,6 @@ except ImportError:
         "test_orm_endpoint.py",
         "test_orm_multirange_values.py",
         "test_orm_network_values.py",
+        "test_orm_vector_values.py",
         "test_orm_pg_values.py",
     ]
