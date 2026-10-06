@@ -175,6 +175,20 @@ let txSequence = 0;
 /** Drive one transaction attempt on a pinned connection. Owns the pin: it is
  *  released exactly once, with the error attached when the connection is
  *  suspect. */
+
+/**
+ * When raw SQL `ROLLBACK TO SAVEPOINT` succeeds, clear the owner's failed
+ * state — savepoint recovery is a documented driver contract, whether
+ * accessed through the savepoint API or raw SQL. Without this, a statement
+ * error poisons the scope even after a successful savepoint rollback.
+ */
+const SAVEPOINT_RECOVERY_SQL = /^\s*ROLLBACK\s+TO\s+(?:SAVEPOINT\s+)?/i;
+function maybeRecoverFromSavepoint(owner: { failed?: unknown }, sqlText: string): void {
+  if (owner.failed !== undefined && SAVEPOINT_RECOVERY_SQL.test(sqlText)) {
+    owner.failed = undefined;
+  }
+}
+
 export async function runTransaction<T>(
   pin: PinnedExecutor,
   fn: (scope: TransactionScope) => Promise<T>,
@@ -237,10 +251,16 @@ export async function runTransaction<T>(
   const makeScope = (owner: ScopeOwner): TransactionScope => {
     const scope: TransactionScope = {
       query<R>(sqlText: string, params: unknown[] = [], options?: QueryExecutionOptions): Promise<R[]> {
-        return observe(() => { validateTransactionSql(sqlText); return track(owner, () => pin.query<R>(sqlText, params, options)); });
+        return observe(() => { validateTransactionSql(sqlText); return track(owner, () => pin.query<R>(sqlText, params, options).then(res => {
+          maybeRecoverFromSavepoint(owner, sqlText);
+          return res;
+        })); });
       },
       execute(sqlText: string, params?: unknown[], options?: QueryExecutionOptions): Promise<number> {
-        return observe(() => { validateTransactionSql(sqlText); return track(owner, () => pin.execute(sqlText, params, options)); });
+        return observe(() => { validateTransactionSql(sqlText); return track(owner, () => pin.execute(sqlText, params, options).then(res => {
+          maybeRecoverFromSavepoint(owner, sqlText);
+          return res;
+        })); });
       },
       transaction: <Tx>(nested: (tx: TransactionScope) => Promise<Tx>): Promise<Tx> => observe(() => runSavepoint(owner, nested)),
       savepoint: (name?: string) => observe(() => createSavepoint(owner, name)),
