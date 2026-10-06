@@ -55,5 +55,6 @@ except ImportError:
         "test_orm_clients.py",
         "test_orm_composite_values.py",
         "test_orm_endpoint.py",
+        "test_orm_multirange_values.py",
         "test_orm_pg_values.py",
     ]
