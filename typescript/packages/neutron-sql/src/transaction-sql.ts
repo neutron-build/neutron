@@ -64,7 +64,14 @@ export function validateTransactionSql(sql: string): void {
   }
   const first = words[0];
   if (!first) invalid('empty statement');
-  if (['BEGIN', 'START', 'COMMIT', 'END', 'ROLLBACK', 'ABORT', 'SAVEPOINT', 'RELEASE', 'RESET', 'DISCARD', 'PREPARE', 'DEALLOCATE', 'LISTEN', 'UNLISTEN', 'LOAD'].includes(first!)) {
+  // Top-level transaction control belongs to the runner, but ROLLBACK TO
+  // SAVEPOINT and RELEASE SAVEPOINT are savepoint operations the probes
+  // exercise inside transactions; the runner itself uses them for nesting.
+  if (first === 'ROLLBACK' && words[1] === 'TO') {
+    // savepoint rollback — admitted
+  } else if (first === 'RELEASE' && words[1] === 'SAVEPOINT') {
+    // savepoint release — admitted
+  } else if (['BEGIN', 'START', 'COMMIT', 'END', 'ROLLBACK', 'ABORT', 'SAVEPOINT', 'RELEASE', 'RESET', 'DISCARD', 'PREPARE', 'DEALLOCATE', 'LISTEN', 'UNLISTEN', 'LOAD'].includes(first!)) {
     invalid('transaction and session control belongs to the runner');
   }
   // SET and SET ROLE are admitted: PostgreSQL enforces its own session

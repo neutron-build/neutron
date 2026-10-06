@@ -1404,12 +1404,12 @@
       "area": "rls",
       "title": "SET LOCAL ROLE and a session SET ROLE made in a rolled-back transaction do not survive it",
       "status": {
-        "pg": "unsupported",
-        "postgres": "unsupported"
+        "pg": "supported",
+        "postgres": "supported"
       },
       "detail": {
-        "pg": "error: NeutronSqlError: transaction SQL: persistent session changes and distributed transaction control are forbidden",
-        "postgres": "error: NeutronSqlError: transaction SQL: persistent session changes and distributed transaction control are forbidden"
+        "pg": "",
+        "postgres": ""
       }
     },
     {
@@ -1430,12 +1430,12 @@
       "area": "rls",
       "title": "a session-level SET inside a transaction persists at COMMIT and reverts at ROLLBACK",
       "status": {
-        "pg": "unsupported",
-        "postgres": "unsupported"
+        "pg": "supported",
+        "postgres": "supported"
       },
       "detail": {
-        "pg": "error: NeutronSqlError: transaction SQL: persistent session changes and distributed transaction control are forbidden",
-        "postgres": "error: NeutronSqlError: transaction SQL: persistent session changes and distributed transaction control are forbidden"
+        "pg": "",
+        "postgres": ""
       }
     },
     {
