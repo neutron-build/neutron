@@ -1210,7 +1210,11 @@ const isolationProbes = [
         // than the savepoint-recovery code; either way the insert fails
         // and the savepoint must recover.
         await tx.execute(`insert into ${t} values (1, 0)`).catch(() => {});
-        await tx.execute(`rollback to savepoint sp`).catch(() => {});
+        // PG 17.11: the driver's runner may intercept the savepoint SQL;
+        // use try/catch so either path (raw SQL or runner-managed) works.
+        try {
+          await tx.execute(`rollback to savepoint sp`);
+        } catch { /* the runner manages savepoints internally */ }
         await tx.execute(`insert into ${t} values (4, 4)`);
       });
       const r = await one(a, `select count(*)::int as n from ${t}`);
