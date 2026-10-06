@@ -95,7 +95,12 @@ export class SandboxExecutor implements AgentExecutor {
       this.#options,
       "POST",
       `/v1/runs/${this.runId}/exec`,
-      JSON.stringify({ cmd: command, timeoutSec, ...(options.cwd !== undefined ? { cwd: options.cwd } : {}) }),
+      JSON.stringify({
+        cmd: command,
+        timeoutSec,
+        ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
+        ...(options.env !== undefined ? { env: options.env } : {}),
+      }),
       { "content-type": "application/json" },
       requestTimeoutMs,
     );
